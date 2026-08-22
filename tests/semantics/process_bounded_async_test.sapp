@@ -10,6 +10,11 @@ let status = PROCESS.bounded_status();
 require(not status.raw_fallback, "bounded facade never enables raw fallback");
 
 if status.available {
+    require(status.lifecycle.atomic_terminal_reservation
+        and status.lifecycle.canonical_terminal_cache
+        and status.lifecycle.immutable_terminal_expiry
+        and status.lifecycle.terminal_payload_budget_bytes == 16777216,
+        "status publishes the bounded terminal ownership contract");
     let started = PROCESS.start_fixed_bounded(["/usr/bin/printf"],
         ["%s", "opaque-lifecycle"], map{ timeout_secs: 3,
             max_output_bytes: 4096, max_file_bytes: 4096,
@@ -24,6 +29,9 @@ if status.available {
     let forged = map{ format: started.format, id: sha256("not-a-process-handle") };
     require(rejected(fn() { PROCESS.poll_bounded(forged); }),
         "forged lifecycle handle is rejected");
+    let oversized_forgery = map{ format: started.format, id: str_repeat("a", 4096) };
+    require(rejected(fn() { PROCESS.poll_bounded(oversized_forgery); }),
+        "oversized forged lifecycle identity is rejected before registry lookup");
     started.extra = map{ raw: "attacker-state" };
     let observed = PROCESS.poll_bounded(started);
     require(observed.ok and not observed.raw_state_exposed
@@ -59,7 +67,9 @@ if status.available {
         "maintenance preserves the terminal result behind the opaque handle");
     let cached_result = PROCESS.finish_bounded(abandoned, 0);
     require(cached_result.handle_closed and cached_result.result_was_cached
-        and cached_result.stdout == "auto-reap",
+        and cached_result.stdout == "auto-reap"
+        and cached_result.race_resistant_identity
+        and not map_has(cached_result, "process_group_id"),
         "the caller can claim output after opportunistic process cleanup");
     require(rejected(fn() { PROCESS.poll_bounded(abandoned); }),
         "claimed terminal handle cannot be reused");
@@ -73,6 +83,43 @@ if status.available {
     let capacity_after_failures = PROCESS.maintain_bounded();
     require(capacity_after_failures.active == 0,
         "failed launches release their pre-launch reservations");
+
+    let individually_oversized = PROCESS.start_fixed_bounded(["/usr/bin/printf"],
+        ["%s", "must-not-start"], map{ timeout_secs: 3,
+            max_output_bytes: 13000000, max_file_bytes: 13000000,
+            max_memory_bytes: 67108864, max_open_files: 32,
+            max_processes: 2048 });
+    require(not individually_oversized.ok and not individually_oversized.started,
+        "an individually uncacheable terminal reservation fails before spawn");
+
+    let reservation_one = PROCESS.start_fixed_bounded(["/usr/bin/sleep"], ["30"],
+        map{ timeout_secs: 30, max_output_bytes: 5000000,
+            max_file_bytes: 5000000, max_memory_bytes: 67108864,
+            max_open_files: 32, max_processes: 2048 });
+    let reservation_two = PROCESS.start_fixed_bounded(["/usr/bin/sleep"], ["30"],
+        map{ timeout_secs: 30, max_output_bytes: 5000000,
+            max_file_bytes: 5000000, max_memory_bytes: 67108864,
+            max_open_files: 32, max_processes: 2048 });
+    let reservation_three = PROCESS.start_fixed_bounded(["/usr/bin/sleep"], ["30"],
+        map{ timeout_secs: 30, max_output_bytes: 5000000,
+            max_file_bytes: 5000000, max_memory_bytes: 67108864,
+            max_open_files: 32, max_processes: 2048 });
+    require(reservation_one.ok and reservation_two.ok
+        and not reservation_three.ok and not reservation_three.started,
+        "aggregate terminal reservations reject work before exceeding the global budget");
+    PROCESS.request_cancel_bounded(reservation_one, 50);
+    PROCESS.request_cancel_bounded(reservation_two, 50);
+    require(PROCESS.finish_bounded(reservation_one, 2500).handle_closed
+        and PROCESS.finish_bounded(reservation_two, 2500).handle_closed,
+        "aggregate reservation fixtures release their complete ownership");
+    let budget_recovered = PROCESS.start_fixed_bounded(["/usr/bin/printf"],
+        ["%s", "budget-recovered"], map{ timeout_secs: 3,
+            max_output_bytes: 1024, max_file_bytes: 1024,
+            max_memory_bytes: 67108864, max_open_files: 32,
+            max_processes: 2048 });
+    require(budget_recovered.ok
+        and PROCESS.finish_bounded(budget_recovered, 3000).stdout == "budget-recovered",
+        "claiming saturated jobs restores terminal reservation capacity");
 
     let sleeping = PROCESS.start_fixed_bounded(["/usr/bin/sleep"], ["30"],
         map{ timeout_secs: 30, max_output_bytes: 128,
@@ -89,6 +136,19 @@ if status.available {
             + json_stringify(cancelled));
     require(rejected(fn() { PROCESS.finish_bounded(sleeping, 0); }),
         "cancelled terminal handle cannot be reused");
+
+    let expiring = PROCESS.start_fixed_bounded(["/usr/bin/printf"],
+        ["%s", "short-retention"], map{ timeout_secs: 3,
+            max_output_bytes: 1024, max_file_bytes: 1024,
+            max_memory_bytes: 67108864, max_open_files: 32,
+            max_processes: 2048, _terminal_retention_ms: 50 });
+    require(expiring.ok, "short-retention fixture starts");
+    recv_timeout(waiter.receiver, 50); PROCESS.maintain_bounded();
+    recv_timeout(waiter.receiver, 75);
+    require(rejected(fn() { PROCESS.poll_bounded(expiring); }),
+        "poll enforces immutable terminal expiry without extending the lease");
+    require(PROCESS.maintain_bounded().active == 0,
+        "expired terminal results release registry and payload capacity");
 } else {
     let unavailable = PROCESS.start_fixed_bounded(["/usr/bin/printf"], [], map{});
     require(not unavailable.ok and unavailable.unsupported

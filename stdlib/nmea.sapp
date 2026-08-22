@@ -1,0 +1,396 @@
+// Bounded NMEA-0183 GGA/RMC parser with checksum and privacy contracts.
+
+let FORMAT = "pblang.nmea.record.v1";
+let MAX_SENTENCE_CHARS = 82;
+let MAX_BATCH_SENTENCES = 128;
+let HEX = "0123456789ABCDEF";
+
+fn _bad(code, message) {
+    return map{ ok: false, format: FORMAT, code: code, error: message };
+}
+
+fn _finite_number(value) {
+    if type(value) != "number" { return false; }
+    let text = str_lower(str(value));
+    return text != "nan" and text != "+nan" and text != "-nan"
+        and not str_contains(text, "inf");
+}
+
+fn _strip_line_ending(value) {
+    let text = str(value);
+    if str_ends_with(text, "\r\n") { return str_slice(text, 0, len(text) - 2); }
+    if str_ends_with(text, "\n") or str_ends_with(text, "\r") {
+        return str_slice(text, 0, len(text) - 1);
+    }
+    return text;
+}
+
+fn _printable_ascii(text) {
+    let i = 0;
+    while i < len(text) {
+        let code = strcharcodeat(text, i);
+        if code < 32 or code > 126 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _hex_value(character) {
+    return str_index_of("0123456789abcdef", str_lower(character));
+}
+
+fn _hex_byte(text) {
+    if type(text) != "string" or len(text) != 2 { return nil; }
+    let high = _hex_value(str_slice(text, 0, 1));
+    let low = _hex_value(str_slice(text, 1, 2));
+    if high < 0 or low < 0 { return nil; }
+    return high * 16 + low;
+}
+
+fn _checksum_value(body) {
+    let value = 0;
+    let i = 0;
+    while i < len(body) {
+        value = bit_xor(value, strcharcodeat(body, i));
+        i = i + 1;
+    }
+    return value;
+}
+
+fn checksum(body) {
+    if type(body) != "string" or body == "" or len(body) > MAX_SENTENCE_CHARS - 4 {
+        return _bad("body-size", "NMEA body must contain 1..78 characters");
+    }
+    if not _printable_ascii(body) or str_contains(body, "$") or str_contains(body, "*") {
+        return _bad("body-characters", "NMEA body must be printable ASCII without framing characters");
+    }
+    let value = _checksum_value(body);
+    return map{
+        ok: true, format: "pblang.nmea.checksum.v1", value: value,
+        hex: str_slice(HEX, num_floor(value / 16), num_floor(value / 16) + 1)
+            + str_slice(HEX, value % 16, value % 16 + 1)
+    };
+}
+
+fn frame(body) {
+    let checked = checksum(body);
+    if not checked.ok { return checked; }
+    let sentence = "$" + body + "*" + checked.hex;
+    if len(sentence) > MAX_SENTENCE_CHARS {
+        return _bad("sentence-size", "framed NMEA sentence exceeds 82 characters");
+    }
+    return map{ ok: true, format: "pblang.nmea.frame.v1", sentence: sentence };
+}
+
+fn _numeric(text, minimum, maximum, allow_sign, label) {
+    if type(text) != "string" or text == "" or len(text) > 24 {
+        return _bad("number", label + " must be a bounded decimal number");
+    }
+    let digits = 0;
+    let dots = 0;
+    let i = 0;
+    while i < len(text) {
+        let character = str_slice(text, i, i + 1);
+        let code = strcharcodeat(character, 0);
+        if code >= 48 and code <= 57 { digits = digits + 1; }
+        else if character == "." and dots == 0 { dots = dots + 1; }
+        else if allow_sign and i == 0 and (character == "+" or character == "-") { }
+        else { return _bad("number", label + " contains a non-decimal character"); }
+        i = i + 1;
+    }
+    if digits == 0 { return _bad("number", label + " needs at least one digit"); }
+    let value = parse_number(text);
+    if not _finite_number(value) or value < minimum or value > maximum {
+        return _bad("number-range", label + " is outside its accepted range");
+    }
+    return map{ ok: true, value: value };
+}
+
+fn _optional_numeric(text, minimum, maximum, label) {
+    if text == "" { return map{ ok: true, available: false, value: 0 }; }
+    let parsed = _numeric(text, minimum, maximum, false, label);
+    if not parsed.ok { return parsed; }
+    return map{ ok: true, available: true, value: parsed.value };
+}
+
+fn _integer(text, minimum, maximum, label) {
+    let parsed = _numeric(text, minimum, maximum, false, label);
+    if not parsed.ok { return parsed; }
+    if parsed.value != num_floor(parsed.value) {
+        return _bad("integer", label + " must be a whole number");
+    }
+    return parsed;
+}
+
+fn _utc(text) {
+    if type(text) != "string" or len(text) < 6 or len(text) > 12 {
+        return _bad("utc", "UTC time must use hhmmss or hhmmss.sss format");
+    }
+    let hours = _integer(str_slice(text, 0, 2), 0, 23, "UTC hours");
+    if not hours.ok { return hours; }
+    let minutes = _integer(str_slice(text, 2, 4), 0, 59, "UTC minutes");
+    if not minutes.ok { return minutes; }
+    let seconds = _numeric(str_slice(text, 4, len(text)), 0, 60, false, "UTC seconds");
+    if not seconds.ok { return seconds; }
+    return map{
+        ok: true, raw: text, hours: hours.value,
+        minutes: minutes.value, seconds: seconds.value
+    };
+}
+
+fn _coordinate(raw, direction, degree_digits, maximum, label) {
+    if type(raw) != "string" or len(raw) < degree_digits + 2 {
+        return _bad("coordinate", label + " is missing degree/minute digits");
+    }
+    let degrees = _integer(str_slice(raw, 0, degree_digits), 0, maximum, label + " degrees");
+    if not degrees.ok { return degrees; }
+    let minutes = _numeric(str_slice(raw, degree_digits, len(raw)), 0, 59.999999999,
+        false, label + " minutes");
+    if not minutes.ok { return minutes; }
+    if degrees.value == maximum and minutes.value != 0 {
+        return _bad("coordinate-range", label + " exceeds its pole/dateline limit");
+    }
+    let sign = 1;
+    if label == "latitude" {
+        if direction == "S" { sign = -1; }
+        else if direction != "N" { return _bad("direction", "latitude direction must be N or S"); }
+    } else {
+        if direction == "W" { sign = -1; }
+        else if direction != "E" { return _bad("direction", "longitude direction must be E or W"); }
+    }
+    return map{ ok: true, value: sign * (degrees.value + minutes.value / 60) };
+}
+
+fn _position(latitude, latitude_direction, longitude, longitude_direction) {
+    let lat = _coordinate(latitude, latitude_direction, 2, 90, "latitude");
+    if not lat.ok { return lat; }
+    let lon = _coordinate(longitude, longitude_direction, 3, 180, "longitude");
+    if not lon.ok { return lon; }
+    return map{
+        ok: true, available: true,
+        latitude: lat.value, longitude: lon.value,
+        exact: true
+    };
+}
+
+fn _unavailable_position() {
+    return map{ ok: true, available: false, latitude: 0, longitude: 0, exact: false };
+}
+
+fn _leap_year(year) {
+    return year % 400 == 0 or (year % 4 == 0 and year % 100 != 0);
+}
+
+fn _days_in_month(month, year) {
+    if month == 2 { return if _leap_year(year) { 29 } else { 28 }; }
+    if month == 4 or month == 6 or month == 9 or month == 11 { return 30; }
+    return 31;
+}
+
+fn _date(text) {
+    if type(text) != "string" or len(text) != 6 {
+        return _bad("date", "RMC date must use ddmmyy format");
+    }
+    let day = _integer(str_slice(text, 0, 2), 1, 31, "date day");
+    if not day.ok { return day; }
+    let month = _integer(str_slice(text, 2, 4), 1, 12, "date month");
+    if not month.ok { return month; }
+    let short_year = _integer(str_slice(text, 4, 6), 0, 99, "date year");
+    if not short_year.ok { return short_year; }
+    let year = if short_year.value <= 79 { 2000 + short_year.value }
+        else { 1900 + short_year.value };
+    if day.value > _days_in_month(month.value, year) {
+        return _bad("date-range", "RMC date is not a real calendar date");
+    }
+    return map{
+        ok: true, raw: text, day: day.value, month: month.value, year: year
+    };
+}
+
+fn _parse_gga(fields, base) {
+    if len(fields) < 15 { return _bad("field-count", "GGA requires at least 15 fields"); }
+    let utc = _utc(fields[1]);
+    if not utc.ok { return utc; }
+    let quality = _integer(fields[6], 0, 8, "GGA fix quality");
+    if not quality.ok { return quality; }
+    let satellites = _integer(fields[7], 0, 99, "GGA satellite count");
+    if not satellites.ok { return satellites; }
+    let hdop = _numeric(fields[8], 0, 999, false, "GGA HDOP");
+    if not hdop.ok { return hdop; }
+    let position = _unavailable_position();
+    if fields[2] != "" or fields[3] != "" or fields[4] != "" or fields[5] != "" {
+        position = _position(fields[2], fields[3], fields[4], fields[5]);
+        if not position.ok { return position; }
+    } else if quality.value > 0 {
+        return _bad("position", "GGA with a valid fix requires coordinates");
+    }
+    let altitude = map{ ok: true, available: false, value: 0 };
+    if fields[9] != "" {
+        let parsed_altitude = _numeric(fields[9], -10000, 100000, true, "GGA altitude");
+        if not parsed_altitude.ok { return parsed_altitude; }
+        altitude = map{ ok: true, available: true, value: parsed_altitude.value };
+    }
+    if fields[10] != "" and fields[10] != "M" {
+        return _bad("altitude-unit", "GGA altitude unit must be metres");
+    }
+    if fields[12] != "" and fields[12] != "M" {
+        return _bad("geoid-unit", "GGA geoid separation unit must be metres");
+    }
+    base.utc = utc;
+    base.position = position;
+    base.fix = map{
+        valid: quality.value > 0, quality: quality.value,
+        satellites: satellites.value, hdop: hdop.value
+    };
+    base.altitude = map{ available: altitude.available, metres: altitude.value };
+    base.altitude_m = altitude.value;
+    return base;
+}
+
+fn _parse_rmc(fields, base) {
+    if len(fields) < 10 { return _bad("field-count", "RMC requires at least 10 fields"); }
+    let utc = _utc(fields[1]);
+    if not utc.ok { return utc; }
+    if fields[2] != "A" and fields[2] != "V" {
+        return _bad("status", "RMC status must be A or V");
+    }
+    let position = _unavailable_position();
+    if fields[3] != "" or fields[4] != "" or fields[5] != "" or fields[6] != "" {
+        position = _position(fields[3], fields[4], fields[5], fields[6]);
+        if not position.ok { return position; }
+    } else if fields[2] == "A" {
+        return _bad("position", "active RMC record requires coordinates");
+    }
+    let speed = _optional_numeric(fields[7], 0, 1000, "RMC speed");
+    if not speed.ok { return speed; }
+    let course = _optional_numeric(fields[8], 0, 359.999999999, "RMC course");
+    if not course.ok { return course; }
+    let date = _date(fields[9]);
+    if not date.ok { return date; }
+    base.utc = utc;
+    base.date = date;
+    base.position = position;
+    base.fix = map{ valid: fields[2] == "A", status: fields[2] };
+    base.speed_knots = speed.value;
+    base.speed_available = speed.available;
+    base.course_degrees = course.value;
+    base.course_available = course.available;
+    return base;
+}
+
+fn parse(sentence) {
+    if type(sentence) != "string" { return _bad("type", "NMEA sentence must be text"); }
+    let text = _strip_line_ending(sentence);
+    if len(text) < 10 or len(text) > MAX_SENTENCE_CHARS {
+        return _bad("sentence-size", "NMEA sentence must contain 10..82 characters");
+    }
+    if not _printable_ascii(text) {
+        return _bad("characters", "NMEA sentence must contain printable ASCII only");
+    }
+    if not str_starts_with(text, "$") {
+        return _bad("framing", "NMEA sentence must start with $");
+    }
+    let marker = str_index_of(text, "*");
+    if marker < 0 or marker != len(text) - 3 {
+        return _bad("framing", "NMEA sentence must end with * followed by two hex digits");
+    }
+    let body = str_slice(text, 1, marker);
+    if str_contains(body, "*") or str_contains(body, "$") {
+        return _bad("framing", "NMEA body contains an unexpected framing character");
+    }
+    let supplied = _hex_byte(str_slice(text, marker + 1, len(text)));
+    if supplied == nil { return _bad("checksum", "NMEA checksum must contain two hex digits"); }
+    let computed = _checksum_value(body);
+    if supplied != computed {
+        return _bad("checksum-mismatch", "NMEA checksum does not match the sentence body");
+    }
+    let fields = str_split(body, ",");
+    if len(fields) == 0 or len(fields) > 32 or len(fields[0]) != 5 {
+        return _bad("header", "NMEA header or field count is invalid");
+    }
+    let talker = str_slice(fields[0], 0, 2);
+    let sentence_type = str_slice(fields[0], 2, 5);
+    if not (talker == "GP" or talker == "GN" or talker == "GL"
+       or talker == "GA" or talker == "GB" or talker == "BD") {
+        return _bad("talker", "unsupported NMEA talker identifier");
+    }
+    if sentence_type != "GGA" and sentence_type != "RMC" {
+        return _bad("sentence-type", "only GGA and RMC sentences are supported");
+    }
+    let base = map{
+        ok: true, format: FORMAT, talker: talker, sentence_type: sentence_type,
+        checksum: map{ verified: true, value: computed },
+        source_length: len(text), raw_sentence_included: false
+    };
+    if sentence_type == "GGA" { return _parse_gga(fields, base); }
+    return _parse_rmc(fields, base);
+}
+
+fn parse_batch(sentences, limit = 128) {
+    if type(sentences) != "array" { return _bad("batch-type", "NMEA batch must be an array"); }
+    if type(limit) != "number" or limit != num_floor(limit)
+       or limit < 1 or limit > MAX_BATCH_SENTENCES {
+        return _bad("batch-limit", "NMEA batch limit must be a whole 1..128");
+    }
+    if len(sentences) > limit { return _bad("batch-size", "NMEA batch exceeds its work limit"); }
+    let records = [];
+    let valid = 0;
+    let invalid = 0;
+    for sentence in sentences {
+        let record = parse(sentence);
+        array_push(records, record);
+        if record.ok { valid = valid + 1; } else { invalid = invalid + 1; }
+    }
+    return map{
+        ok: true, format: "pblang.nmea.batch.v1", records: records,
+        count: len(records), valid: valid, invalid: invalid, bounded: true
+    };
+}
+
+fn _round_to(value, decimals) {
+    let scale = 1;
+    let i = 0;
+    while i < decimals { scale = scale * 10; i = i + 1; }
+    if value >= 0 { return num_floor(value * scale + 0.5) / scale; }
+    return 0 - num_floor((0 - value) * scale + 0.5) / scale;
+}
+
+fn privacy_view(record, coordinate_decimals = 2) {
+    if type(record) != "map" or not (try record.ok catch false) {
+        return _bad("privacy-record", "privacy view requires a parsed NMEA record");
+    }
+    if type(coordinate_decimals) != "number"
+       or coordinate_decimals != num_floor(coordinate_decimals)
+       or coordinate_decimals < 0 or coordinate_decimals > 4 {
+        return _bad("privacy-precision", "coordinate precision must be a whole 0..4");
+    }
+    let location = map{ available: record.position.available, latitude: 0, longitude: 0 };
+    if record.position.available {
+        location.latitude = _round_to(record.position.latitude, coordinate_decimals);
+        location.longitude = _round_to(record.position.longitude, coordinate_decimals);
+    }
+    return map{
+        ok: true, format: "pblang.nmea.privacy-view.v1",
+        sentence_type: record.sentence_type, talker: record.talker,
+        fix_valid: record.fix.valid, location: location,
+        coordinate_decimals: coordinate_decimals,
+        exact_position_exposed: false, raw_sentence_included: false,
+        device_identifier_included: false
+    };
+}
+
+fn adapter_status() {
+    return map{
+        format: "pblang.nmea.adapters.v1",
+        parser_ready: true, checksum_ready: true, batch_ready: true,
+        live_ble_ready: false, live_ip_geolocation_ready: false,
+        fail_closed: true,
+        blockers: [
+            "no reviewed native PBLang BLE discovery/GATT adapter",
+            "no permission-bound characteristic selection contract",
+            "public-IP geolocation would disclose network and location metadata"
+        ]
+    };
+}
+
+export FORMAT, checksum, frame, parse, parse_batch, privacy_view, adapter_status;

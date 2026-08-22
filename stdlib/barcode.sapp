@@ -1,0 +1,332 @@
+// Bounded linear barcode encoding and local rendering implemented in PBLang.
+
+let Image = import("stdlib:image_pipeline.sapp");
+
+let FORMAT = "pblang.barcode.symbol.v1";
+let MAX_CODE128B_CHARS = 48;
+let MAX_PNG_PIXELS = 1048576;
+
+let CODE128_PATTERNS = [
+    "212222", "222122", "222221", "121223", "121322", "131222",
+    "122213", "122312", "132212", "221213", "221312", "231212",
+    "112232", "122132", "122231", "113222", "123122", "123221",
+    "223211", "221132", "221231", "213212", "223112", "312131",
+    "311222", "321122", "321221", "312212", "322112", "322211",
+    "212123", "212321", "232121", "111323", "131123", "131321",
+    "112313", "132113", "132311", "211313", "231113", "231311",
+    "112133", "112331", "132131", "113123", "113321", "133121",
+    "313121", "211331", "231131", "213113", "213311", "213131",
+    "311123", "311321", "331121", "312113", "312311", "332111",
+    "314111", "221411", "431111", "111224", "111422", "121124",
+    "121421", "141122", "141221", "112214", "112412", "122114",
+    "122411", "142112", "142211", "241211", "221114", "413111",
+    "241112", "134111", "111242", "121142", "121241", "114212",
+    "124112", "124211", "411212", "421112", "421211", "212141",
+    "214121", "412121", "111143", "111341", "131141", "114113",
+    "114311", "411113", "411311", "113141", "114131", "311141",
+    "411131", "211412", "211214", "211232", "2331112"
+];
+
+let EAN_L = [
+    "0001101", "0011001", "0010011", "0111101", "0100011",
+    "0110001", "0101111", "0111011", "0110111", "0001011"
+];
+let EAN_G = [
+    "0100111", "0110011", "0011011", "0100001", "0011101",
+    "0111001", "0000101", "0010001", "0001001", "0010111"
+];
+let EAN_R = [
+    "1110010", "1100110", "1101100", "1000010", "1011100",
+    "1001110", "1010000", "1000100", "1001000", "1110100"
+];
+let EAN_PARITY = [
+    "LLLLLL", "LLGLGG", "LLGGLG", "LLGGGL", "LGLLGG",
+    "LGGLLG", "LGGGLL", "LGLGLG", "LGLGGL", "LGGLGL"
+];
+
+fn _bad(code, message) {
+    return map{ ok: false, format: FORMAT, code: code, error: message };
+}
+
+fn _digits(text) {
+    if type(text) != "string" or text == "" { return false; }
+    for i len(text) {
+        let code = strcharcodeat(text, i);
+        if code < 48 or code > 57 { return false; }
+    }
+    return true;
+}
+
+fn _digit(text, index) { return strcharcodeat(text, index) - 48; }
+
+fn _repeat(character, count) {
+    let out = "";
+    let i = 0;
+    while i < count { out = out + character; i = i + 1; }
+    return out;
+}
+
+fn _width_modules(widths) {
+    let modules = "";
+    let bar = true;
+    for i len(widths) {
+        let width = _digit(widths, i);
+        modules = modules + _repeat(if bar { "1" } else { "0" }, width);
+        bar = not bar;
+    }
+    return modules;
+}
+
+fn _width_sum(widths) {
+    let total = 0;
+    for i len(widths) { total = total + _digit(widths, i); }
+    return total;
+}
+
+fn _valid_symbol(symbol) {
+    return type(symbol) == "map" and (try symbol.ok catch false)
+        and (try symbol.format == FORMAT catch false)
+        and (try type(symbol.modules) == "string" catch false);
+}
+
+fn gtin_check_digit(data) {
+    if type(data) != "string" or len(data) < 1 or len(data) > 17 or not _digits(data) {
+        return _bad("gtin-data", "GTIN data must contain 1..17 decimal digits");
+    }
+    let sum = 0;
+    let weight = 3;
+    let i = len(data) - 1;
+    while i >= 0 {
+        sum = sum + _digit(data, i) * weight;
+        weight = if weight == 3 { 1 } else { 3 };
+        i = i - 1;
+    }
+    return map{
+        ok: true, format: "pblang.barcode.gtin-check.v1",
+        data_digits: len(data), weighted_sum: sum,
+        check_digit: num_mod(10 - num_mod(sum, 10), 10)
+    };
+}
+
+fn _normalize_gtin(data, data_digits, label) {
+    if type(data) != "string" or not _digits(data)
+       or (len(data) != data_digits and len(data) != data_digits + 1) {
+        return _bad("payload", label + " requires " + str(data_digits)
+            + " data digits or " + str(data_digits + 1) + " digits including the check digit");
+    }
+    let base = str_slice(data, 0, data_digits);
+    let checked = gtin_check_digit(base);
+    if not checked.ok { return checked; }
+    let generated = len(data) == data_digits;
+    if not generated and _digit(data, data_digits) != checked.check_digit {
+        return _bad("check-digit", label + " check digit is invalid");
+    }
+    return map{
+        ok: true, full: base + str(checked.check_digit),
+        check_digit: checked.check_digit, generated_check_digit: generated
+    };
+}
+
+fn _symbol(symbology, payload, modules, check_digit, code_values) {
+    return map{
+        ok: true, format: FORMAT, symbology: symbology,
+        payload: payload, modules: modules, module_count: len(modules),
+        check_digit: check_digit, code_values: code_values,
+        quiet_zone_modules: 10, remote_dependency: false,
+        metadata_included: false
+    };
+}
+
+fn _code128b(data) {
+    if type(data) != "string" or data == "" or len(data) > MAX_CODE128B_CHARS {
+        return _bad("payload", "Code 128 Set B requires 1..48 characters");
+    }
+    let values = [104];
+    let checksum = 104;
+    for i len(data) {
+        let code = strcharcodeat(data, i);
+        if code < 32 or code > 126 {
+            return _bad("character", "Code 128 Set B accepts printable ASCII characters only");
+        }
+        let value = code - 32;
+        array_push(values, value);
+        checksum = checksum + value * (i + 1);
+    }
+    checksum = num_mod(checksum, 103);
+    array_push(values, checksum);
+    array_push(values, 106);
+    let modules = "";
+    for value in values { modules = modules + _width_modules(CODE128_PATTERNS[value]); }
+    return _symbol("code128b", data, modules, checksum, values);
+}
+
+fn _ean13_modules(full) {
+    let modules = "101";
+    let parity = EAN_PARITY[_digit(full, 0)];
+    let i = 1;
+    while i <= 6 {
+        let digit = _digit(full, i);
+        let family = str_slice(parity, i - 1, i);
+        if family == "L" { modules = modules + EAN_L[digit]; }
+        else { modules = modules + EAN_G[digit]; }
+        i = i + 1;
+    }
+    modules = modules + "01010";
+    i = 7;
+    while i <= 12 { modules = modules + EAN_R[_digit(full, i)]; i = i + 1; }
+    return modules + "101";
+}
+
+fn _ean13(data) {
+    let normalized = _normalize_gtin(data, 12, "EAN-13");
+    if not normalized.ok { return normalized; }
+    return _symbol("ean13", normalized.full, _ean13_modules(normalized.full),
+        normalized.check_digit, []);
+}
+
+fn _upca(data) {
+    let normalized = _normalize_gtin(data, 11, "UPC-A");
+    if not normalized.ok { return normalized; }
+    let modules = _ean13_modules("0" + normalized.full);
+    return _symbol("upca", normalized.full, modules, normalized.check_digit, []);
+}
+
+fn encode(data, symbology = "code128") {
+    if type(symbology) != "string" { return _bad("symbology", "symbology must be text"); }
+    let selected = str_lower(str_trim(symbology));
+    if selected == "code128" or selected == "code128b" { return _code128b(data); }
+    if selected == "ean13" or selected == "ean-13" { return _ean13(data); }
+    if selected == "upc" or selected == "upca" or selected == "upc-a" { return _upca(data); }
+    return _bad("symbology", "supported symbologies are code128b, ean13 and upca");
+}
+
+fn bar_runs(symbol) {
+    if not _valid_symbol(symbol) { throw "barcode: a valid encoded symbol is required"; }
+    let runs = [];
+    let start = -1;
+    for i len(symbol.modules) {
+        let dark = str_slice(symbol.modules, i, i + 1) == "1";
+        if dark and start < 0 { start = i; }
+        if not dark and start >= 0 {
+            array_push(runs, map{ start: start, width: i - start });
+            start = -1;
+        }
+    }
+    if start >= 0 { array_push(runs, map{ start: start, width: len(symbol.modules) - start }); }
+    return runs;
+}
+
+fn render_plan(symbol, module_px = 3, bar_height = 96) {
+    if not _valid_symbol(symbol) { throw "barcode: a valid encoded symbol is required"; }
+    if type(module_px) != "number" or module_px != num_floor(module_px)
+       or module_px < 1 or module_px > 20 {
+        throw "barcode: module width must be a whole 1..20 pixels";
+    }
+    if type(bar_height) != "number" or bar_height != num_floor(bar_height)
+       or bar_height < 24 or bar_height > 512 {
+        throw "barcode: bar height must be a whole 24..512 pixels";
+    }
+    let bars = [];
+    for run in bar_runs(symbol) {
+        array_push(bars, map{
+            x: (run.start + symbol.quiet_zone_modules) * module_px,
+            y: 0, width: run.width * module_px, height: bar_height
+        });
+    }
+    return map{
+        ok: true, format: "pblang.barcode.render-plan.v1",
+        symbology: symbol.symbology, module_px: module_px,
+        width: (symbol.module_count + symbol.quiet_zone_modules * 2) * module_px,
+        height: bar_height, bars: bars, background: "#ffffff", foreground: "#111111"
+    };
+}
+
+fn _color(value, label) {
+    if type(value) != "string" or not regex_match(value, "^#[0-9A-Fa-f]{6}$") {
+        throw "barcode: " + label + " must be a six-digit hexadecimal color";
+    }
+    return value;
+}
+
+fn to_svg(symbol, module_px = 3, bar_height = 96,
+           foreground = "#111111", background = "#ffffff") {
+    foreground = _color(foreground, "foreground");
+    background = _color(background, "background");
+    let plan = render_plan(symbol, module_px, bar_height);
+    let bars = "";
+    for bar in plan.bars {
+        bars = bars + "<rect x=\"" + str(bar.x) + "\" y=\"0\" width=\""
+            + str(bar.width) + "\" height=\"" + str(bar.height) + "\"/>";
+    }
+    return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + str(plan.width)
+        + "\" height=\"" + str(plan.height) + "\" viewBox=\"0 0 " + str(plan.width)
+        + " " + str(plan.height) + "\" role=\"img\" aria-label=\"Linear barcode\">"
+        + "<rect width=\"100%\" height=\"100%\" fill=\"" + background + "\"/>"
+        + "<g fill=\"" + foreground + "\">" + bars + "</g></svg>";
+}
+
+fn to_png(symbol, module_px = 2, bar_height = 96) {
+    let plan = render_plan(symbol, module_px, bar_height);
+    if module_px > 4 or bar_height > 256 or plan.width > 4096
+       or plan.width * plan.height > MAX_PNG_PIXELS {
+        throw "barcode: PNG dimensions exceed the bounded raster budget";
+    }
+    let image = [];
+    let black = [17, 17, 17, 255];
+    let white = [255, 255, 255, 255];
+    let quiet = symbol.quiet_zone_modules * module_px;
+    let row = [];
+    for x plan.width {
+        let module_index = num_floor((x - quiet) / module_px);
+        let dark = x >= quiet and module_index >= 0 and module_index < symbol.module_count
+            and str_slice(symbol.modules, module_index, module_index + 1) == "1";
+        if dark { array_push(row, black); } else { array_push(row, white); }
+    }
+    let y = 0;
+    while y < plan.height { array_push(image, row); y = y + 1; }
+    return Image.encode_png(image);
+}
+
+fn to_text(symbol) {
+    if not _valid_symbol(symbol) { throw "barcode: a valid encoded symbol is required"; }
+    return _repeat(" ", symbol.quiet_zone_modules)
+        + str_replace_all(str_replace_all(symbol.modules, "1", "#"), "0", " ")
+        + _repeat(" ", symbol.quiet_zone_modules);
+}
+
+fn self_check() {
+    if len(CODE128_PATTERNS) != 107 { return _bad("table", "Code 128 table must have 107 entries"); }
+    for i 106 {
+        if len(CODE128_PATTERNS[i]) != 6 or _width_sum(CODE128_PATTERNS[i]) != 11 {
+            return _bad("table", "Code 128 data pattern is malformed");
+        }
+    }
+    if len(CODE128_PATTERNS[106]) != 7 or _width_sum(CODE128_PATTERNS[106]) != 13 {
+        return _bad("table", "Code 128 stop pattern is malformed");
+    }
+    for table in [EAN_L, EAN_G, EAN_R] {
+        if len(table) != 10 { return _bad("table", "EAN digit table must have 10 entries"); }
+        for pattern in table {
+            if len(pattern) != 7 { return _bad("table", "EAN digit pattern must have 7 modules"); }
+        }
+    }
+    return map{
+        ok: true, format: "pblang.barcode.self-check.v1",
+        code128_patterns: 107, ean_patterns: 30,
+        code128b_ready: true, ean13_ready: true, upca_ready: true,
+        gs1_128_ready: false, fnc1_ready: false
+    };
+}
+
+fn capabilities() {
+    return map{
+        format: "pblang.barcode.capabilities.v1",
+        symbologies: ["code128b", "ean13", "upca"],
+        svg: true, png: true, text_preview: true,
+        gs1_128: false, code_sets_a_c: false, fnc1: false,
+        remote_dependency: false, bounded: true
+    };
+}
+
+export FORMAT, gtin_check_digit, encode, bar_runs, render_plan,
+    to_svg, to_png, to_text, self_check, capabilities;

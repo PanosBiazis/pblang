@@ -1,0 +1,338 @@
+// stdlib/pdf_document.sapp -- bounded native writer/inspector for a safe PDF subset.
+
+let FORMAT = "pblang.pdf-document.v1";
+let MAX_PDF_BYTES = 2097152;
+let MAX_IMAGE_PIXELS = 65536;
+let MAX_ROWS = 16;
+let MAX_TEXT_CHARS = 4096;
+
+fn _fail(message) { throw "pdf_document: " + message; }
+
+fn _ascii(value, label, maximum) {
+    if type(value) != "string" or len(value) > maximum { _fail(label + " is invalid or too long"); }
+    let i = 0;
+    while i < len(value) {
+        let code = strcharcodeat(value, i);
+        if code < 32 or code > 126 { _fail(label + " must contain printable ASCII only"); }
+        i = i + 1;
+    }
+    return value;
+}
+
+fn _integer(value, label, minimum, maximum) {
+    if type(value) != "number" or num_floor(value) != value
+       or value < minimum or value > maximum { _fail(label + " is outside its integer bounds"); }
+    return value;
+}
+
+fn _pdf_string(value, label, maximum) {
+    value = _ascii(value, label, maximum);
+    let out = "";
+    let i = 0;
+    while i < len(value) {
+        let c = str_slice(value, i, i + 1);
+        if c == "(" or c == ")" or c == "\\" { out = out + "\\"; }
+        out = out + c;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _https_url(value) {
+    value = _ascii(value, "link URL", 512);
+    if not str_starts_with(value, "https://") { _fail("link URL must use HTTPS"); }
+    let i = 8;
+    while i < len(value) {
+        let c = str_slice(value, i, i + 1);
+        if str_index_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/?#[]@!$&'*+,;=%", c) < 0 {
+            _fail("link URL contains a character outside the bounded URI subset");
+        }
+        i = i + 1;
+    }
+    return value;
+}
+
+fn _append_bytes(target, values) {
+    let i = 0;
+    while i < len(values) {
+        array_push(target, values[i]);
+        i = i + 1;
+    }
+}
+
+fn _append_ascii(target, text) { _append_bytes(target, str_to_bytes(text)); }
+
+fn _hex_bytes(values) {
+    let digits = "0123456789ABCDEF";
+    let out = [];
+    for value in values {
+        array_push(out, strcharcodeat(digits, num_floor(value / 16)));
+        array_push(out, strcharcodeat(digits, value % 16));
+    }
+    array_push(out, 62);
+    return out;
+}
+
+fn _pad10(value) {
+    let text = str(value);
+    if len(text) > 10 { _fail("PDF object offset exceeds the supported range"); }
+    return str_repeat("0", 10 - len(text)) + text;
+}
+
+fn _object(number, body) {
+    let out = [];
+    _append_ascii(out, str(number) + " 0 obj\n");
+    _append_bytes(out, body);
+    _append_ascii(out, "\nendobj\n");
+    return out;
+}
+
+fn _stream_object(number, dictionary, data) {
+    let body = [];
+    _append_ascii(body, "<< " + dictionary + " /Length " + str(len(data)) + " >>\nstream\n");
+    _append_bytes(body, data);
+    _append_ascii(body, "\nendstream");
+    return _object(number, body);
+}
+
+fn _text_command(x, y, size, value) {
+    return "BT /F1 " + str(size) + " Tf " + str(x) + " " + str(y)
+        + " Td (" + _pdf_string(value, "rendered text", 256) + ") Tj ET\n";
+}
+
+fn _validate_rows(rows) {
+    if type(rows) != "array" or len(rows) > MAX_ROWS { _fail("table must contain at most 16 rows"); }
+    let out = [];
+    for row in rows {
+        if type(row) != "array" or len(row) != 2 { _fail("each table row must contain two cells"); }
+        array_push(out, [
+            _ascii(row[0], "table cell", 64),
+            _ascii(row[1], "table cell", 64)
+        ]);
+    }
+    return out;
+}
+
+fn _image(image) {
+    if image == nil {
+        return map{ present: false, width: 1, height: 1, rgb: [255, 255, 255] };
+    }
+    if type(image) != "map" { _fail("image must be a map"); }
+    let width = _integer(try image.width catch nil, "image width", 1, 256);
+    let height = _integer(try image.height catch nil, "image height", 1, 256);
+    if width * height > MAX_IMAGE_PIXELS { _fail("image exceeds the pixel budget"); }
+    let rgb = try image.rgb catch nil;
+    if type(rgb) != "array" or len(rgb) != width * height * 3 { _fail("image RGB data length is invalid"); }
+    let clean = [];
+    for byte in rgb { array_push(clean, _integer(byte, "image channel", 0, 255)); }
+    return map{ present: true, width: width, height: height, rgb: clean };
+}
+
+fn _content(spec, rows, image, link_label) {
+    let content = "";
+    content = content + _text_command(50, 790, 20, spec.heading);
+    content = content + _text_command(50, 760, 11, spec.summary);
+    let y = 710;
+    for row in rows {
+        content = content + "50 " + str(y - 5) + " 180 24 re S\n";
+        content = content + "230 " + str(y - 5) + " 180 24 re S\n";
+        content = content + _text_command(58, y + 2, 10, row[0]);
+        content = content + _text_command(238, y + 2, 10, row[1]);
+        y = y - 24;
+    }
+    if image.present {
+        content = content + "q 112 0 0 112 50 430 cm /Im1 Do Q\n";
+        content = content + _text_command(50, 414, 9,
+            "Embedded RGB image " + str(image.width) + "x" + str(image.height));
+    }
+    content = content + _text_command(50, 380, 11, link_label);
+    return str_to_bytes(content);
+}
+
+fn create(spec) {
+    if type(spec) != "map" { _fail("document specification must be a map"); }
+    let title = _ascii(try spec.title catch "PBLang Document", "title", 80);
+    let heading = _ascii(try spec.heading catch title, "heading", 120);
+    let summary = _ascii(try spec.summary catch "", "summary", 256);
+    if len(title) + len(heading) + len(summary) > MAX_TEXT_CHARS {
+        _fail("document text exceeds the character budget");
+    }
+    let rows = _validate_rows(try spec.rows catch []);
+    let image = _image(try spec.image catch nil);
+    let link = try spec.link catch map{ label: "Open reference", url: "https://example.com" };
+    if type(link) != "map" { _fail("link must be a map"); }
+    let link_label = _ascii(try link.label catch "Open reference", "link label", 96);
+    let link_url = _https_url(try link.url catch "https://example.com");
+    let normalized = map{
+        title: title, heading: heading, summary: summary,
+        rows: rows, image: image, link_label: link_label, link_url: link_url
+    };
+
+    let content = _content(normalized, rows, image, link_label);
+    let objects = [];
+    array_push(objects, _object(1, str_to_bytes("<< /Type /Catalog /Pages 2 0 R >>")));
+    array_push(objects, _object(2, str_to_bytes("<< /Type /Pages /Kids [3 0 R] /Count 1 >>")));
+    array_push(objects, _object(3, str_to_bytes("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        + "/Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R >> >> "
+        + "/Annots [7 0 R] /Contents 5 0 R >>")));
+    array_push(objects, _object(4, str_to_bytes("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")));
+    array_push(objects, _stream_object(5, "", content));
+    array_push(objects, _stream_object(6, "/Type /XObject /Subtype /Image /Width "
+        + str(image.width) + " /Height " + str(image.height)
+        + " /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /ASCIIHexDecode",
+        _hex_bytes(image.rgb)));
+    array_push(objects, _object(7, str_to_bytes("<< /Type /Annot /Subtype /Link /Rect [50 374 360 392] "
+        + "/Border [0 0 1] /A << /S /URI /URI ("
+        + _pdf_string(link_url, "link URL", 512) + ") >> >>")));
+    array_push(objects, _object(8, str_to_bytes("<< /Title ("
+        + _pdf_string(title, "title", 80) + ") >>")));
+
+    let pdf = [];
+    _append_ascii(pdf, "%PDF-1.4\n");
+    let offsets = [0];
+    for object in objects {
+        array_push(offsets, len(pdf));
+        _append_bytes(pdf, object);
+        if len(pdf) > MAX_PDF_BYTES { _fail("generated PDF exceeds the byte budget"); }
+    }
+    let xref_offset = len(pdf);
+    _append_ascii(pdf, "xref\n0 " + str(len(objects) + 1) + "\n");
+    _append_ascii(pdf, "0000000000 65535 f \n");
+    let i = 1;
+    while i < len(offsets) {
+        _append_ascii(pdf, _pad10(offsets[i]) + " 00000 n \n");
+        i = i + 1;
+    }
+    _append_ascii(pdf, "trailer\n<< /Size " + str(len(objects) + 1)
+        + " /Root 1 0 R /Info 8 0 R >>\nstartxref\n"
+        + str(xref_offset) + "\n%%EOF\n");
+    if len(pdf) > MAX_PDF_BYTES { _fail("generated PDF exceeds the byte budget"); }
+    return map{
+        format: FORMAT, bytes: pdf, byte_length: len(pdf), pages: 1,
+        title: title, rendered_text: [heading, summary], table_rows: len(rows),
+        image_embedded: image.present, link_count: 1,
+        privacy: map{ author_embedded: false, creator_embedded: false, source_path_embedded: false },
+        bounded: true
+    };
+}
+
+fn _count(source, needle) {
+    let count = 0;
+    let cursor = 0;
+    while cursor < len(source) {
+        let at = str_index_of(str_slice(source, cursor, len(source)), needle);
+        if at < 0 { break; }
+        count = count + 1;
+        cursor = cursor + at + len(needle);
+    }
+    return count;
+}
+
+fn _literal_at(source, start) {
+    let out = "";
+    let escaped = false;
+    let i = start + 1;
+    while i < len(source) {
+        let c = str_slice(source, i, i + 1);
+        if escaped { out = out + c; escaped = false; }
+        elif c == "\\" { escaped = true; }
+        elif c == ")" { return map{ ok: true, value: out, next: i + 1 }; }
+        else { out = out + c; }
+        i = i + 1;
+    }
+    return map{ ok: false, value: "", next: len(source) };
+}
+
+fn _title(source) {
+    let marker = "/Title (";
+    let at = str_index_of(source, marker);
+    if at < 0 { return nil; }
+    let literal = _literal_at(source, at + len(marker) - 1);
+    if not literal.ok { return nil; }
+    return literal.value;
+}
+
+fn _rendered_text(source) {
+    let out = [];
+    let cursor = 0;
+    while cursor < len(source) and len(out) < 128 {
+        let relative = str_index_of(str_slice(source, cursor, len(source)), "(");
+        if relative < 0 { break; }
+        let start = cursor + relative;
+        let literal = _literal_at(source, start);
+        if not literal.ok { break; }
+        let tail_end = literal.next + 3;
+        if tail_end <= len(source)
+           and str_slice(source, literal.next, tail_end) == " Tj" {
+            array_push(out, literal.value);
+        }
+        cursor = literal.next;
+    }
+    return out;
+}
+
+fn _decimal(source, start) {
+    let value = 0;
+    let digits = 0;
+    let i = start;
+    while i < len(source) {
+        let code = strcharcodeat(source, i);
+        if code < 48 or code > 57 { break; }
+        value = value * 10 + code - 48;
+        digits = digits + 1;
+        if digits > 10 { return nil; }
+        i = i + 1;
+    }
+    if digits == 0 { return nil; }
+    return value;
+}
+
+fn inspect(bytes) {
+    if type(bytes) != "array" or len(bytes) < 32 or len(bytes) > MAX_PDF_BYTES {
+        return map{ ok: false, error: "PDF bytes are absent or outside the supported bounds", bounded: true };
+    }
+    for byte in bytes {
+        if type(byte) != "number" or num_floor(byte) != byte or byte < 0 or byte > 255 {
+            return map{ ok: false, error: "PDF byte array contains an invalid value", bounded: true };
+        }
+    }
+    let source = bytes_to_str(bytes);
+    if not str_starts_with(source, "%PDF-1.") or not str_ends_with(source, "%%EOF\n") {
+        return map{ ok: false, error: "PDF header or end marker is invalid", bounded: true };
+    }
+    let start_marker = "startxref\n";
+    let marker_at = str_index_of(source, start_marker);
+    if marker_at < 0 {
+        return map{ ok: false, error: "PDF startxref is missing", bounded: true };
+    }
+    let xref_offset = _decimal(source, marker_at + len(start_marker));
+    if xref_offset == nil or xref_offset + 4 > len(source)
+       or str_slice(source, xref_offset, xref_offset + 4) != "xref" {
+        return map{ ok: false, error: "PDF startxref does not reference an xref table", bounded: true };
+    }
+    let pages = _count(source, "<< /Type /Page /Parent");
+    if pages < 1 { return map{ ok: false, error: "PDF contains no supported page object", bounded: true }; }
+    return map{
+        format: FORMAT, ok: true, version: str_slice(source, 5, 8),
+        pages: pages, objects: _count(source, " 0 obj\n"), title: _title(source),
+        rendered_text: _rendered_text(source),
+        images: _count(source, "/Subtype /Image"),
+        links: _count(source, "/Subtype /Link"),
+        encrypted: str_contains(source, "/Encrypt"),
+        xref_offset: xref_offset, byte_length: len(bytes), bounded: true
+    };
+}
+
+fn capabilities() {
+    return map{
+        format: "pblang.pdf-document.capabilities.v1",
+        native_writer: true, native_inspector: true, pages_per_document: 1,
+        text: "printable-ascii", table_columns: 2, rgb_image: true,
+        https_link: true, author_metadata: false, creator_metadata: false,
+        encryption: false, incremental_updates: false, object_streams: false,
+        max_pdf_bytes: MAX_PDF_BYTES, max_image_pixels: MAX_IMAGE_PIXELS,
+        max_rows: MAX_ROWS
+    };
+}
+
+export FORMAT, create, inspect, capabilities;

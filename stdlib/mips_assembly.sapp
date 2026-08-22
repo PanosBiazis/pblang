@@ -1,0 +1,251 @@
+// stdlib/mips_assembly.sapp -- bounded parser for a verified MIPS32 subset.
+
+let MIPS = import("stdlib:emulator_mips32.sapp");
+let Strings = import("stdlib:strings.sapp");
+
+let FORMAT = "pblang.mips32.assembly.v1";
+let HARD_MAX_SOURCE_CHARS = 262144;
+let HARD_MAX_LINES = 16384;
+let HARD_MAX_INSTRUCTIONS = 4096;
+
+fn _integer(value, minimum, maximum, label) {
+    if not is_number(value) or value != num_floor(value)
+        or value < minimum or value > maximum {
+        throw "mips_assembly " + label + " must be an integer from "
+            + str(minimum) + " to " + str(maximum);
+    }
+    return value;
+}
+
+fn _options(options) {
+    if options == nil { options = map{}; }
+    if not is_map(options) { throw "mips_assembly options must be a map"; }
+    let legacy = try options.legacy_shorthand catch false;
+    if not is_bool(legacy) { throw "mips_assembly legacy_shorthand must be a bool"; }
+    return map{
+        max_source_chars: _integer(try options.max_source_chars catch 65536,
+            1, HARD_MAX_SOURCE_CHARS, "max_source_chars"),
+        max_lines: _integer(try options.max_lines catch 4096,
+            1, HARD_MAX_LINES, "max_lines"),
+        max_instructions: _integer(try options.max_instructions catch 1024,
+            1, HARD_MAX_INSTRUCTIONS, "max_instructions"),
+        legacy_shorthand: legacy,
+        instruction_budget: _integer(try options.instruction_budget catch 100000,
+            1, MIPS.DEFAULT_BUDGET, "instruction_budget"),
+        max_memory_words: _integer(try options.max_memory_words catch 1024,
+            1, MIPS.MAX_MEMORY_WORDS, "max_memory_words")
+    };
+}
+
+fn _diagnostic(code, line, message, opcode = "") {
+    return map{ code: code, line: line, message: message, opcode: opcode };
+}
+
+fn _strip_comment(line) {
+    let hash_at = str_index_of(line, "#");
+    let semicolon_at = str_index_of(line, ";");
+    let end = len(line);
+    if hash_at >= 0 and hash_at < end { end = hash_at; }
+    if semicolon_at >= 0 and semicolon_at < end { end = semicolon_at; }
+    return str_trim(str_slice(line, 0, end));
+}
+
+fn _tokens(line) {
+    let normalized = Strings.replace_all(line, ",", " ");
+    normalized = Strings.replace_all(normalized, "(", " ");
+    normalized = Strings.replace_all(normalized, ")", " ");
+    normalized = Strings.replace_all(normalized, "\t", " ");
+    return Strings.words(normalized);
+}
+
+fn _register(token) {
+    let name = str_lower(str_trim(str(token)));
+    if str_starts_with(name, "$") { name = str_slice(name, 1, len(name)); }
+    let aliases = map{
+        zero: 0, at: 1, v0: 2, v1: 3,
+        a0: 4, a1: 5, a2: 6, a3: 7,
+        t0: 8, t1: 9, t2: 10, t3: 11, t4: 12, t5: 13, t6: 14, t7: 15,
+        s0: 16, s1: 17, s2: 18, s3: 19, s4: 20, s5: 21, s6: 22, s7: 23,
+        t8: 24, t9: 25, k0: 26, k1: 27, gp: 28, sp: 29, fp: 30, ra: 31
+    };
+    if map_has(aliases, name) { return aliases[name]; }
+    let number = try parse_number(name) catch nil;
+    if is_number(number) and number == num_floor(number) and number >= 0 and number <= 31 {
+        return number;
+    }
+    return nil;
+}
+
+fn _hex_digit(character) {
+    let code = strcharcodeat(str_lower(character), 0);
+    if code >= 48 and code <= 57 { return code - 48; }
+    if code >= 97 and code <= 102 { return code - 87; }
+    return -1;
+}
+
+fn _immediate(token) {
+    let text = str_lower(str_trim(str(token)));
+    if text == "" { return nil; }
+    let sign = 1;
+    if str_starts_with(text, "-") {
+        sign = -1;
+        text = str_slice(text, 1, len(text));
+    } elif str_starts_with(text, "+") {
+        text = str_slice(text, 1, len(text));
+    }
+    if str_starts_with(text, "0x") {
+        text = str_slice(text, 2, len(text));
+        if text == "" or len(text) > 8 { return nil; }
+        let value = 0;
+        let index = 0;
+        while index < len(text) {
+            let digit = _hex_digit(str_slice(text, index, index + 1));
+            if digit < 0 { return nil; }
+            value = value * 16 + digit;
+            index = index + 1;
+        }
+        return sign * value;
+    }
+    let value = try parse_number(text) catch nil;
+    if not is_number(value) or value != num_floor(value) { return nil; }
+    return sign * value;
+}
+
+fn _three_register(tokens, opcode, constructor) {
+    if len(tokens) != 4 {
+        return map{ ok: false, message: opcode + " requires three register operands" };
+    }
+    let destination = _register(tokens[1]);
+    let source = _register(tokens[2]);
+    let target = _register(tokens[3]);
+    if destination == nil or source == nil or target == nil {
+        return map{ ok: false, message: opcode + " contains an invalid register" };
+    }
+    return map{ ok: true, word: constructor(destination, source, target), warning: "" };
+}
+
+fn _immediate_instruction(tokens, opcode, constructor, legacy) {
+    let target = 0; let source = 0; let immediate = 0; let warning = "";
+    if len(tokens) == 4 {
+        target = _register(tokens[1]); source = _register(tokens[2]); immediate = _immediate(tokens[3]);
+    } elif len(tokens) == 3 and legacy {
+        target = _register(tokens[1]);
+        let second_register = _register(tokens[2]);
+        if second_register != nil and str_starts_with(str_trim(tokens[2]), "$") {
+            source = second_register; immediate = 0;
+        } else {
+            source = 0; immediate = _immediate(tokens[2]);
+        }
+        warning = opcode + " legacy two-operand shorthand normalized";
+    } else {
+        return map{ ok: false, message: opcode + " requires target, source and immediate" };
+    }
+    if target == nil or source == nil or immediate == nil {
+        return map{ ok: false, message: opcode + " contains an invalid operand" };
+    }
+    return map{ ok: true, word: constructor(target, source, immediate), warning: warning };
+}
+
+fn _instruction(tokens, legacy) {
+    if len(tokens) == 0 { return map{ ok: false, message: "empty instruction" }; }
+    let opcode = str_lower(tokens[0]);
+    if opcode == "add" { return _three_register(tokens, opcode, MIPS.add_signed); }
+    if opcode == "addu" { return _three_register(tokens, opcode, MIPS.add_unsigned); }
+    if opcode == "addi" { return _immediate_instruction(tokens, opcode, MIPS.add_immediate_signed, legacy); }
+    if opcode == "addiu" { return _immediate_instruction(tokens, opcode, MIPS.add_immediate_unsigned, legacy); }
+    if opcode == "sw" {
+        if len(tokens) != 4 { return map{ ok: false, message: "sw requires target, offset(base)" }; }
+        let target = _register(tokens[1]); let offset = _immediate(tokens[2]); let base = _register(tokens[3]);
+        if target == nil or offset == nil or base == nil {
+            return map{ ok: false, message: "sw contains an invalid operand" };
+        }
+        return map{ ok: true, word: MIPS.store_word(target, base, offset), warning: "" };
+    }
+    if opcode == "nop" and len(tokens) == 1 {
+        return map{ ok: true, word: MIPS.nop(), warning: "" };
+    }
+    if opcode == "syscall" and len(tokens) == 1 {
+        return map{ ok: true, word: MIPS.syscall_instruction(), warning: "" };
+    }
+    return map{ ok: false, message: "unsupported opcode" };
+}
+
+fn assemble(source, options = nil) {
+    let limits = _options(options);
+    if not is_string(source) {
+        return map{ ok: false, format: FORMAT, diagnostics: [
+            _diagnostic("source-type", 0, "source must be a string")
+        ], warnings: [], words: [], instructions: [] };
+    }
+    if len(source) > limits.max_source_chars {
+        return map{ ok: false, format: FORMAT, diagnostics: [
+            _diagnostic("source-limit", 0, "source exceeds configured character limit")
+        ], warnings: [], words: [], instructions: [] };
+    }
+    let lines = str_split(source, "\n");
+    if len(lines) > limits.max_lines {
+        return map{ ok: false, format: FORMAT, diagnostics: [
+            _diagnostic("line-limit", 0, "source exceeds configured line limit")
+        ], warnings: [], words: [], instructions: [] };
+    }
+    let diagnostics = []; let warnings = []; let words = []; let instructions = [];
+    let line_index = 0;
+    while line_index < len(lines) {
+        let clean = _strip_comment(lines[line_index]);
+        if clean != "" {
+            if len(words) >= limits.max_instructions {
+                array_push(diagnostics, _diagnostic("instruction-limit", line_index + 1,
+                    "source exceeds configured instruction limit"));
+                return map{ ok: false, format: FORMAT, diagnostics: diagnostics,
+                    warnings: warnings, words: words, instructions: instructions };
+            }
+            let tokens = _tokens(clean); let opcode = str_lower(tokens[0]);
+            let parsed = try _instruction(tokens, limits.legacy_shorthand)
+                catch error map{ ok: false, message: str(error) };
+            if parsed.ok {
+                array_push(words, parsed.word);
+                array_push(instructions, map{
+                    line: line_index + 1, opcode: opcode, word: parsed.word
+                });
+                if parsed.warning != "" {
+                    array_push(warnings, _diagnostic("legacy-shorthand", line_index + 1,
+                        parsed.warning, opcode));
+                }
+            } else {
+                array_push(diagnostics, _diagnostic("invalid-instruction", line_index + 1,
+                    parsed.message, opcode));
+            }
+        }
+        line_index = line_index + 1;
+    }
+    if len(words) == 0 and len(diagnostics) == 0 {
+        array_push(diagnostics, _diagnostic("empty-program", 0,
+            "source contains no instructions"));
+    }
+    return map{
+        ok: len(diagnostics) == 0, format: FORMAT, diagnostics: diagnostics,
+        warnings: warnings, words: words, instructions: instructions,
+        instruction_count: len(words), source_retained: false
+    };
+}
+
+fn execute(source, options = nil) {
+    let limits = _options(options);
+    let assembled = assemble(source, options);
+    if not assembled.ok {
+        return map{ ok: false, format: FORMAT, assembled: assembled, execution: nil };
+    }
+    let execution = MIPS.run(assembled.words, map{
+        allow_fallthrough: true, instruction_budget: limits.instruction_budget,
+        max_memory_words: limits.max_memory_words
+    });
+    return map{
+        ok: execution.ok, format: FORMAT, assembled: assembled, execution: execution,
+        boundary: "verified ADD/ADDU/ADDI/ADDIU/SW/NOP/SYSCALL subset; no labels, directives, macros or full ABI"
+    };
+}
+
+fn register_number(name) { return _register(name); }
+
+export FORMAT, HARD_MAX_SOURCE_CHARS, HARD_MAX_LINES, HARD_MAX_INSTRUCTIONS;
+export assemble, execute, register_number;

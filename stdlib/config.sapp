@@ -13,6 +13,12 @@
 
 let validate_mod = import("stdlib:validate.sapp");
 
+let STRICT_DOTENV_MAX_BYTES = 65536;
+let STRICT_DOTENV_MAX_LINES = 256;
+let STRICT_DOTENV_MAX_LINE_BYTES = 4096;
+let STRICT_DOTENV_MAX_KEY_BYTES = 128;
+let STRICT_DOTENV_MAX_VALUE_BYTES = 4096;
+
 // new() → config map
 fn new() {
     return map{
@@ -72,7 +78,7 @@ fn keys(cfg) {
     }
     let kk = map_keys(cfg._data);
     for i len(kk) {
-        if map_has(seen, kk[i]) == false {
+        if not map_has(seen, kk[i]) {
             seen[kk[i]] = true;
             array_push(out, kk[i]);
         }
@@ -247,7 +253,7 @@ fn typed_map(cfg, schema_def = nil) {
     for i len(names) {
         let name = names[i];
         let val = get(cfg, name, nil);
-        if schema_def != nil and type(schema_def) == "map" and (try schema_def.__schema catch false) == true {
+        if schema_def != nil and type(schema_def) == "map" and (try schema_def.__schema catch false) {
             let fdef = try schema_def.fields[name] catch nil;
             if fdef != nil {
                 let t = try fdef.type catch "string";
@@ -324,6 +330,162 @@ fn parse_dotenv(text) {
     return out;
 }
 
+fn _strict_dotenv_key(key) {
+    if type(key) != "string" or key == "" {
+        return false;
+    }
+    let bytes = str_to_bytes(key);
+    if len(bytes) > STRICT_DOTENV_MAX_KEY_BYTES { return false; }
+    let i = 0;
+    while i < len(bytes) {
+        if not ((bytes[i] >= 65 and bytes[i] <= 90)
+        or (bytes[i] >= 97 and bytes[i] <= 122)
+        or bytes[i] == 95 or (i > 0 and bytes[i] >= 48 and bytes[i] <= 57)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _strict_dotenv_control(value) {
+    let bytes = str_to_bytes(value);
+    let i = 0;
+    while i < len(bytes) {
+        if bytes[i] == 0 or bytes[i] == 127 { return true; }
+        if bytes[i] < 32 and bytes[i] != 9 and bytes[i] != 10 and bytes[i] != 13 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Strict, bounded and side-effect-free dotenv parsing. This complements the
+// legacy permissive parser without changing its established behavior.
+fn parse_dotenv_strict(text) {
+    if type(text) != "string" {
+        return map{ ok: false, values: map{}, errors: ["dotenv input must be text"],
+            warnings: [], entries: 0, sensitive_entries: 0, bounded: true };
+    }
+    if len(str_to_bytes(text)) > STRICT_DOTENV_MAX_BYTES {
+        return map{ ok: false, values: map{}, errors: ["dotenv input exceeds byte limit"],
+            warnings: [], entries: 0, sensitive_entries: 0, bounded: true };
+    }
+    let lines = str_split(text, "\n");
+    if len(lines) > STRICT_DOTENV_MAX_LINES {
+        return map{ ok: false, values: map{}, errors: ["dotenv input exceeds line limit"],
+            warnings: [], entries: 0, sensitive_entries: 0, bounded: true };
+    }
+
+    let values = map{};
+    let errors = [];
+    let warnings = [];
+    let sensitive_entries = 0;
+    let i = 0;
+    while i < len(lines) {
+        let number = i + 1;
+        let raw_line = lines[i];
+        i = i + 1;
+        if len(str_to_bytes(raw_line)) > STRICT_DOTENV_MAX_LINE_BYTES {
+            array_push(errors, "line " + str(number) + " exceeds byte limit");
+            continue;
+        }
+        let line = str_trim(raw_line);
+        if line == "" or str_starts_with(line, "#") { continue; }
+        if str_starts_with(line, "export ") {
+            line = str_trim(str_slice(line, 7, len(line)));
+        }
+        let eq = str_index_of(line, "=");
+        if eq <= 0 {
+            array_push(errors, "line " + str(number) + " must contain KEY=VALUE");
+            continue;
+        }
+        let key = str_trim(str_slice(line, 0, eq));
+        if not _strict_dotenv_key(key) {
+            array_push(errors, "line " + str(number) + " has an invalid key");
+            continue;
+        }
+        if map_has(values, key) {
+            array_push(errors, "line " + str(number) + " repeats key " + key);
+            continue;
+        }
+
+        let value = str_trim(str_slice(line, eq + 1, len(line)));
+        if str_starts_with(value, "\"") or str_starts_with(value, "'") {
+            let quote = str_slice(value, 0, 1);
+            if len(value) < 2 or str_slice(value, len(value) - 1, len(value)) != quote {
+                array_push(errors, "line " + str(number) + " has an unterminated quoted value");
+                continue;
+            }
+            value = str_slice(value, 1, len(value) - 1);
+            if quote == "\"" { value = _dotenv_unescape(value); }
+        } else {
+            let comment = str_index_of(value, " #");
+            if comment >= 0 { value = str_trim(str_slice(value, 0, comment)); }
+        }
+        if len(str_to_bytes(value)) > STRICT_DOTENV_MAX_VALUE_BYTES
+        or _strict_dotenv_control(value) {
+            array_push(errors, "line " + str(number) + " has an invalid or oversized value");
+            continue;
+        }
+        values[key] = value;
+        if is_sensitive_key(key) { sensitive_entries = sensitive_entries + 1; }
+    }
+    return map{ ok: len(errors) == 0, values: values, errors: errors,
+        warnings: warnings, entries: len(map_keys(values)),
+        sensitive_entries: sensitive_entries, bounded: true };
+}
+
+fn is_sensitive_key(key) {
+    if type(key) != "string" { return false; }
+    let name = _env_name(key);
+    let markers = ["PASSWORD", "PASSWD", "PASSPHRASE", "SECRET", "TOKEN",
+        "API_KEY", "PRIVATE_KEY", "CREDENTIAL", "AUTHORIZATION", "COOKIE",
+        "SESSION", "DATABASE_URL", "DB_URL", "DSN", "SIGNING_KEY",
+        "ENCRYPTION_KEY"];
+    let i = 0;
+    while i < len(markers) {
+        if str_contains(name, markers[i]) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Produces a serialization-safe view for diagnostics and UI. Sensitive values
+// are never copied into the returned structure, including their lengths.
+fn redacted_values(values) {
+    if type(values) != "map" { throw "config: redacted_values expects a map"; }
+    let names = array_sort(map_keys(values));
+    if len(names) > STRICT_DOTENV_MAX_LINES {
+        throw "config: redacted_values entry limit exceeded";
+    }
+    let out = map{};
+    let sensitive = [];
+    let i = 0;
+    while i < len(names) {
+        let name = names[i];
+        if not _strict_dotenv_key(name) {
+            throw "config: redacted_values contains an invalid key";
+        }
+        if is_sensitive_key(name) {
+            out[name] = "[redacted]";
+            array_push(sensitive, name);
+        } else {
+            let value = str(values[name]);
+            if len(str_to_bytes(value)) > STRICT_DOTENV_MAX_VALUE_BYTES
+            or _strict_dotenv_control(value) {
+                throw "config: redacted_values contains an invalid or oversized value";
+            }
+            out[name] = value;
+        }
+        i = i + 1;
+    }
+    return map{ values: out, keys: names, sensitive_keys: sensitive,
+        redacted_count: len(sensitive), sensitive_values_exposed: false,
+        bounded: true };
+}
+
 // load_dotenv(cfg, path) — read a .env file and merge it (no-op if unreadable).
 fn load_dotenv(cfg, path) {
     let txt = try fs_read(path) catch nil;
@@ -335,11 +497,10 @@ fn load_dotenv(cfg, path) {
 // parse_dotenv: whitespace/# content, quote or backslash characters, line
 // breaks, or edge whitespace that the parser's trim would eat.
 fn _dotenv_quote(v) {
-    let needs = str_contains(v, " ") or str_contains(v, "\t") or str_contains(v, "#")
+    if not (str_contains(v, " ") or str_contains(v, "\t") or str_contains(v, "#")
         or str_contains(v, "\"") or str_contains(v, "'") or str_contains(v, "\\")
         or str_contains(v, "\n") or str_contains(v, "\r")
-        or (v != "" and str_trim(v) != v);
-    if needs == false { return v; }
+        or (v != "" and str_trim(v) != v)) { return v; }
     let e = str_replace_all(v, "\\", "\\\\");
     e = str_replace_all(e, "\"", "\\\"");
     e = str_replace_all(e, "\n", "\\n");
@@ -390,4 +551,7 @@ export new, from_map, set, set_many, set_default, set_defaults, unset, has, keys
        get, get_int, get_number, get_bool, get_float, get_list,
        set_prefix, load_env, require, require_int, require_bool, merge, to_map,
        typed_map, validate, validate_with_defaults,
-       parse_dotenv, load_dotenv, dump_dotenv, get_json;
+       STRICT_DOTENV_MAX_BYTES, STRICT_DOTENV_MAX_LINES,
+       STRICT_DOTENV_MAX_LINE_BYTES, STRICT_DOTENV_MAX_KEY_BYTES,
+       STRICT_DOTENV_MAX_VALUE_BYTES, parse_dotenv, parse_dotenv_strict,
+       is_sensitive_key, redacted_values, load_dotenv, dump_dotenv, get_json;
