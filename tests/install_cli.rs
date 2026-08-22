@@ -3,7 +3,7 @@
 use pblang_pm::{fetch_url, parse_lockfile, write_lockfile};
 use sha2::Digest;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener};
 use std::thread;
 
 fn file_url_for_path(path: &std::path::Path) -> String {
@@ -2288,14 +2288,31 @@ fn fetch_url_reads_registry_index_over_http_when_explicitly_allowed() {
         br#"{"packages":{"@sapphire/http-pkg":{"1.0.0":{"url":"file:///noop","sha256":null}}}}"#;
     let handle = thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("set test HTTP read timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).expect("read test HTTP request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                assert!(request.len() <= 16 * 1024, "test HTTP request is too large");
+            }
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 String::from_utf8_lossy(body)
             );
-            let _ = stream.write_all(response.as_bytes());
-            let mut buf = [0u8; 64];
-            let _ = stream.read(&mut buf);
+            stream
+                .write_all(response.as_bytes())
+                .expect("write test HTTP response");
+            stream.flush().expect("flush test HTTP response");
+            stream
+                .shutdown(Shutdown::Write)
+                .expect("finish test HTTP response");
         }
     });
     let url = format!("http://{}/index.json", addr);
