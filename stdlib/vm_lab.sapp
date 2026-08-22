@@ -1,0 +1,279 @@
+// Cross-platform VM-lab contracts and deterministic execution plans.
+//
+// This module deliberately contains no credentials and executes no commands.
+// It validates the local-only manifest consumed by tools/pbvmtest.sapp and
+// produces an allowlisted, sequential plan. Platform adapters remain separate
+// so configuration can never become an arbitrary-command interface.
+
+let FORMAT = "pblang.vm-lab.v1";
+let PLAN_FORMAT = "pblang.vm-lab.plan.v1";
+let REPORT_FORMAT = "pblang.vm-lab.report.v1";
+let MAX_GUESTS = 24;
+let MAX_SUITES_PER_GUEST = 16;
+
+fn _contains(values, wanted) {
+    for i len(values) { if values[i] == wanted { return true; } }
+    return false;
+}
+
+fn _text(value, maximum, pattern) {
+    if type(value) != "string" or len(value) < 1 or len(value) > maximum { return false; }
+    return regex_match(value, pattern);
+}
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+
+fn _ipv4(value) {
+    if type(value) != "string" { return false; }
+    let parts = str_split(value, ".");
+    if len(parts) != 4 { return false; }
+    for i 4 {
+        if parts[i] == "" or len(parts[i]) > 3
+           or (len(parts[i]) > 1 and str_starts_with(parts[i], "0")) { return false; }
+        for j len(parts[i]) {
+            let c = strcharcodeat(parts[i], j);
+            if c < 48 or c > 57 { return false; }
+        }
+        let n = try parse_number(parts[i]) catch -1;
+        if n < 0 or n > 255 { return false; }
+    }
+    return true;
+}
+
+fn _private_ipv4(value) {
+    if not _ipv4(value) { return false; }
+    let p = str_split(value, ".");
+    let a = parse_number(p[0]); let b = parse_number(p[1]);
+    return a == 10 or (a == 172 and b >= 16 and b <= 31) or (a == 192 and b == 168);
+}
+
+fn _uuid(value) {
+    return type(value)=="string" and regex_match(value,
+        "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+}
+
+fn _mac(value) {
+    return type(value)=="string" and regex_match(value,
+        "^[0-9a-f]{2}(:[0-9a-f]{2}){5}$");
+}
+
+fn _absolute_disk(value) {
+    if type(value)!="string" or len(value)<2 or len(value)>4096 or not str_starts_with(value,"/") { return false; }
+    if str_contains(value,"\x00") or str_contains(value,"\\") { return false; }
+    let parts=str_split(value,"/");
+    for i len(parts) { if parts[i]==".." { return false; } }
+    return str_ends_with(value,".qcow2");
+}
+
+fn _known_kind(value) {
+    return _contains(["native-host", "libvirt-ssh", "android-emulator",
+        "hosted-runner", "qemu-reference"], value);
+}
+
+fn _known_os(value) {
+    return _contains(["linux-mint", "debian", "ubuntu", "windows", "freebsd",
+        "macos", "kali", "raspberry-pi-os", "android", "ios", "wasi",
+        "baremetal"], value);
+}
+
+fn _known_arch(value) {
+    return _contains(["x86_64", "x86", "arm64", "armv7", "riscv64", "mips32",
+        "powerpc32", "sparc32", "wasm32", "z80", "6502", "avr", "msp430"], value);
+}
+
+fn _known_evidence(value) {
+    return _contains(["native-host", "native-vm", "userspace-emulation", "simulator",
+        "hosted-vm", "reference-oracle", "adversarial-vm"], value);
+}
+
+fn suite_catalog() {
+    return [
+        map{id:"portable-smoke", class:"portable", maximum_seconds:600},
+        map{id:"workspace-tests", class:"portable", maximum_seconds:10800},
+        map{id:"semantics-portable", class:"portable", maximum_seconds:10800},
+        map{id:"emulator-matrix", class:"emulator", maximum_seconds:7200},
+        map{id:"platform-integration", class:"platform", maximum_seconds:3600},
+        map{id:"package-smoke", class:"packaging", maximum_seconds:1800},
+        map{id:"android-runtime", class:"mobile", maximum_seconds:1800},
+        map{id:"ios-simulator", class:"mobile", maximum_seconds:1800},
+        map{id:"raspberry-userspace", class:"platform", maximum_seconds:3600},
+        map{id:"emulator-differential", class:"emulator", maximum_seconds:7200}
+    ];
+}
+
+fn suite(id) {
+    let rows = suite_catalog();
+    for i len(rows) { if rows[i].id == id { return rows[i]; } }
+    return nil;
+}
+
+fn _validate_suites(raw, errors, prefix) {
+    if type(raw) != "array" or len(raw) < 1 or len(raw) > MAX_SUITES_PER_GUEST {
+        array_push(errors, prefix + ".suites must contain 1.." + str(MAX_SUITES_PER_GUEST) + " entries");
+        return [];
+    }
+    let out = []; let seen = map{};
+    for i len(raw) {
+        let id = try str(raw[i]) catch "";
+        if suite(id) == nil { array_push(errors, prefix + ".suites contains unknown suite " + id); }
+        elif map_has(seen, id) { array_push(errors, prefix + ".suites contains duplicate " + id); }
+        else { seen[id] = true; array_push(out, id); }
+    }
+    return out;
+}
+
+fn _validate_guest(raw, index, errors) {
+    let p = "guests[" + str(index) + "]";
+    if type(raw) != "map" { array_push(errors, p + " must be a map"); return nil; }
+    let id = try raw.id catch ""; let kind = try raw.kind catch "";
+    let os = try raw.os catch ""; let arch = try raw.arch catch "";
+    let evidence = try raw.evidence catch "";
+    if not _text(id, 64, "^[a-z0-9][a-z0-9-]{0,63}$") { array_push(errors, p + ".id is invalid"); }
+    if not _known_kind(kind) { array_push(errors, p + ".kind is invalid"); }
+    if not _known_os(os) { array_push(errors, p + ".os is invalid"); }
+    if not _known_arch(arch) { array_push(errors, p + ".arch is invalid"); }
+    if not _known_evidence(evidence) { array_push(errors, p + ".evidence is invalid"); }
+    let enabled = try raw.enabled catch false;
+    if type(enabled) != "bool" { array_push(errors, p + ".enabled must be boolean"); enabled = false; }
+    let suites = _validate_suites(try raw.suites catch nil, errors, p);
+    let result = map{id:id, kind:kind, os:os, arch:arch, evidence:evidence,
+        enabled:enabled, suites:suites};
+
+    if kind == "libvirt-ssh" {
+        let domain = try raw.domain catch ""; let host = try raw.host catch "";
+        let address = try raw.pinned_address catch ""; let user = try raw.user catch "";
+        let transfer_user=try raw.transfer_user catch "";
+        let control = try raw.control_credential_id catch "";
+        let transfer = try raw.transfer_credential_id catch ""; let port = try raw.port catch 22;
+        let domain_uuid=try raw.domain_uuid catch ""; let disk_path=try raw.disk_path catch "";
+        let mac=try raw.mac catch ""; let network_uuid=try raw.network_uuid catch "";
+        let baseline_id=try raw.baseline_id catch "";
+        if not _text(domain, 80, "^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$") { array_push(errors, p + ".domain is invalid"); }
+        if not _text(host, 253, "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$") { array_push(errors, p + ".host is invalid"); }
+        if not _private_ipv4(address) { array_push(errors, p + ".pinned_address must be private canonical IPv4"); }
+        if not _text(user, 64, "^[A-Za-z_][A-Za-z0-9_.-]{0,63}$") { array_push(errors, p + ".user is invalid"); }
+        if not _text(transfer_user,64,"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$") { array_push(errors,p + ".transfer_user is invalid"); }
+        if user==transfer_user { array_push(errors,p + ".control and transfer users must be distinct"); }
+        if not _text(control, 64, "^[a-z0-9][a-z0-9-]{0,63}$") { array_push(errors, p + ".control_credential_id is invalid"); }
+        if not _text(transfer, 64, "^[a-z0-9][a-z0-9-]{0,63}$") { array_push(errors, p + ".transfer_credential_id is invalid"); }
+        if control==transfer { array_push(errors,p + ".control and transfer credentials must be distinct"); }
+        if not _integer(port, 1, 65535) { array_push(errors, p + ".port is invalid"); }
+        if not _uuid(domain_uuid) { array_push(errors,p + ".domain_uuid is invalid"); }
+        if not _absolute_disk(disk_path) { array_push(errors,p + ".disk_path is invalid"); }
+        if not _mac(mac) { array_push(errors,p + ".mac is invalid"); }
+        if not _uuid(network_uuid) { array_push(errors,p + ".network_uuid is invalid"); }
+        if not _text(baseline_id,64,"^[0-9a-f]{64}$") { array_push(errors,p + ".baseline_id is invalid"); }
+        result.domain=domain; result.host=host; result.pinned_address=address;
+        result.user=user; result.transfer_user=transfer_user; result.control_credential_id=control;
+        result.transfer_credential_id=transfer; result.port=port;
+        result.domain_uuid=domain_uuid; result.disk_path=disk_path; result.mac=mac;
+        result.network_uuid=network_uuid; result.baseline_id=baseline_id;
+    } elif kind == "android-emulator" {
+        let avd = try raw.avd catch "";
+        if not _text(avd, 96, "^[A-Za-z0-9][A-Za-z0-9_. -]{0,95}$") { array_push(errors, p + ".avd is invalid"); }
+        result.avd=avd;
+    } elif kind == "hosted-runner" {
+        let runner = try raw.runner catch "";
+        if not _text(runner, 64, "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$") { array_push(errors, p + ".runner is invalid"); }
+        result.runner=runner;
+    } elif kind == "qemu-reference" {
+        let oracle = try raw.oracle catch "";
+        if not _text(oracle, 64, "^[a-z0-9][a-z0-9_.-]{0,63}$") { array_push(errors, p + ".oracle is invalid"); }
+        result.oracle=oracle;
+    }
+    return result;
+}
+
+fn validate_manifest(raw) {
+    let errors = [];
+    if type(raw) != "map" { return map{ok:false,format:FORMAT,errors:["manifest must be a map"],guests:[]}; }
+    if (try raw.format catch "") != FORMAT { array_push(errors, "unsupported manifest format"); }
+    let execution = try raw.execution catch nil;
+    if type(execution) != "map" { array_push(errors, "execution must be a map"); }
+    else {
+        if (try execution.sequential catch false) != true { array_push(errors, "execution.sequential must be true"); }
+        if (try execution.private_network catch false) != true { array_push(errors, "execution.private_network must be true"); }
+        if not _contains(["preserve", "shutdown-if-started", "revert-dedicated"],
+            try execution.restore_policy catch "") { array_push(errors, "execution.restore_policy is invalid"); }
+    }
+    let raw_guests = try raw.guests catch nil;
+    if type(raw_guests) != "array" or len(raw_guests) < 1 or len(raw_guests) > MAX_GUESTS {
+        array_push(errors, "guests must contain 1.." + str(MAX_GUESTS) + " entries"); raw_guests=[];
+    }
+    let guests=[]; let ids=map{}; let domains=map{};
+    for i len(raw_guests) {
+        let guest=_validate_guest(raw_guests[i],i,errors);
+        if guest != nil {
+            if map_has(ids,guest.id) { array_push(errors,"duplicate guest id " + guest.id); }
+            else { ids[guest.id]=true; }
+            if guest.kind == "libvirt-ssh" {
+                if map_has(domains,guest.domain) { array_push(errors,"duplicate libvirt domain " + guest.domain); }
+                else { domains[guest.domain]=true; }
+            }
+            array_push(guests,guest);
+        }
+    }
+    return map{ok:len(errors)==0,format:FORMAT,errors:errors,guests:guests,
+        execution:execution};
+}
+
+fn _stages(guest) {
+    let stages=["preflight"];
+    if guest.kind == "libvirt-ssh" {
+        stages=["preflight","start-if-stopped","wait-for-ssh","upload-source-bundle",
+            "extract-clean-workspace","guest-native-build","guest-suites","download-report",
+            "shutdown-if-started"];
+    } elif guest.kind == "android-emulator" {
+        stages=["preflight","start-emulator-if-needed","wait-for-adb","build-apk","install-apk",
+            "android-runtime-suite","collect-logcat","stop-if-started"];
+    } elif guest.kind == "hosted-runner" {
+        stages=["validate-workflow","hosted-runner-suites","collect-hosted-artifact"];
+    } elif guest.kind == "qemu-reference" {
+        stages=["preflight","generate-seeded-corpus","run-pblang-model","run-reference-oracle",
+            "compare-state","minimize-failures","write-regression-report"];
+    }
+    return stages;
+}
+
+fn plan(manifest, selector = "enabled") {
+    let checked=validate_manifest(manifest);
+    if not checked.ok { return map{ok:false,format:PLAN_FORMAT,errors:checked.errors,targets:[]}; }
+    let targets=[];
+    for i len(checked.guests) {
+        let g=checked.guests[i];
+        let selected=(selector=="all") or (selector=="enabled" and g.enabled) or selector==g.id;
+        if selected { array_push(targets,map{id:g.id,kind:g.kind,os:g.os,arch:g.arch,
+            evidence:g.evidence,suites:g.suites,stages:_stages(g)}); }
+    }
+    if len(targets)==0 { return map{ok:false,format:PLAN_FORMAT,errors:["selector matched no guests"],targets:[]}; }
+    return map{ok:true,format:PLAN_FORMAT,sequential:true,parallel_guests:1,
+        target_count:len(targets),targets:targets};
+}
+
+fn report(metadata, guest, suite_results) {
+    if type(metadata)!="map" or type(guest)!="map" or type(suite_results)!="array" {
+        throw "vm_lab.report requires metadata, guest, and suite results";
+    }
+    let clean=[]; let passed=0;
+    for i len(suite_results) {
+        let row=suite_results[i]; let id=try row.id catch "";
+        if suite(id)==nil { throw "vm_lab.report received unknown suite"; }
+        let ok=(try row.ok catch false)==true;
+        if ok { passed=passed+1; }
+        array_push(clean,map{id:id,ok:ok,duration_ms:try row.duration_ms catch 0,
+            report_sha256:try row.report_sha256 catch nil});
+    }
+    let out=map{format:REPORT_FORMAT,source_revision:try metadata.source_revision catch "unknown",
+        source_state_sha256:try metadata.source_state_sha256 catch nil,
+        source_bundle_sha256:try metadata.source_bundle_sha256 catch nil,
+        target:map{id:guest.id,kind:guest.kind,os:guest.os,arch:guest.arch,evidence:guest.evidence},
+        suites:clean,passed:passed,total:len(clean),ok:passed==len(clean)};
+    out.report_sha256=sha256(json_stringify(out));
+    return out;
+}
+
+export FORMAT, PLAN_FORMAT, REPORT_FORMAT, MAX_GUESTS, MAX_SUITES_PER_GUEST,
+       suite_catalog, suite, validate_manifest, plan, report;
