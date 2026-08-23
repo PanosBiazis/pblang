@@ -1,0 +1,227 @@
+// stdlib/wasm_module.sapp -- bounded high-level WebAssembly artifact facade.
+// Envelope validation is intentionally distinct from full WebAssembly semantic
+// validation. A production engine remains the independent execution oracle.
+
+let CODEGEN = import("stdlib:codegen_wasm.sapp");
+let EMULATOR = import("stdlib:emulator_wasm.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+let FORMAT = "pblang.wasm.module.v1";
+let DEFAULT_MAX_SOURCE_BYTES = 65536;
+let DEFAULT_MAX_MODULE_BYTES = 1048576;
+let HARD_MAX_SOURCE_BYTES = 16777216;
+let HARD_MAX_MODULE_BYTES = 67108864;
+let DEFAULT_MAX_SECTIONS = 256;
+let DEFAULT_MAX_EXPORTS = 4096;
+
+fn _option(options, key, fallback) {
+    if options != nil and is_map(options) and map_has(options, key) { return options[key]; }
+    return fallback;
+}
+
+fn _limit(options, key, fallback, hard_max) {
+    let value = _option(options, key, fallback);
+    if not is_number(value) or value != num_floor(value) or value < 1 or value > hard_max {
+        throw "wasm_module: " + key + " must be a positive integer <= " + str(hard_max);
+    }
+    return value;
+}
+
+fn limits(options = nil) {
+    if options != nil and not is_map(options) { throw "wasm_module: options must be a map"; }
+    return map{
+        max_source_bytes: _limit(options, "max_source_bytes", DEFAULT_MAX_SOURCE_BYTES, HARD_MAX_SOURCE_BYTES),
+        max_module_bytes: _limit(options, "max_module_bytes", DEFAULT_MAX_MODULE_BYTES, HARD_MAX_MODULE_BYTES),
+        max_sections: _limit(options, "max_sections", DEFAULT_MAX_SECTIONS, 4096),
+        max_exports: _limit(options, "max_exports", DEFAULT_MAX_EXPORTS, 65536)
+    };
+}
+
+fn _read_uleb32(bytes, start, finish) {
+    let value = 0;
+    let scale = 1;
+    let cursor = start;
+    let count = 0;
+    while count < 5 {
+        if cursor >= finish { return map{ ok: false, error: "truncated unsigned LEB128" }; }
+        let byte = bytes[cursor];
+        cursor = cursor + 1;
+        count = count + 1;
+        value = value + (byte % 128) * scale;
+        if byte < 128 {
+            if value > 4294967295 { return map{ ok: false, error: "unsigned LEB128 overflow" }; }
+            return map{ ok: true, value: value, next: cursor };
+        }
+        scale = scale * 128;
+    }
+    return map{ ok: false, error: "unsigned LEB128 exceeds five bytes" };
+}
+
+fn _section_name(id) {
+    let names = map{
+        "0": "custom", "1": "type", "2": "import", "3": "function",
+        "4": "table", "5": "memory", "6": "global", "7": "export",
+        "8": "start", "9": "element", "10": "code", "11": "data",
+        "12": "data-count", "13": "tag"
+    };
+    let key = str(id);
+    if map_has(names, key) { return names[key]; }
+    return "unknown-" + key;
+}
+
+fn _section_rank(id) {
+    if id == 1 { return 1; }
+    if id == 2 { return 2; }
+    if id == 3 { return 3; }
+    if id == 4 { return 4; }
+    if id == 5 { return 5; }
+    if id == 13 { return 6; }
+    if id == 6 { return 7; }
+    if id == 7 { return 8; }
+    if id == 8 { return 9; }
+    if id == 9 { return 10; }
+    if id == 12 { return 11; }
+    if id == 10 { return 12; }
+    if id == 11 { return 13; }
+    throw "wasm_module: unsupported section id " + str(id);
+}
+
+fn _parse_exports(bytes, start, finish, maximum) {
+    let count_value = _read_uleb32(bytes, start, finish);
+    if not count_value.ok { throw "wasm_module: malformed export count: " + count_value.error; }
+    if count_value.value > maximum { throw "wasm_module: export count limit exceeded"; }
+    let cursor = count_value.next;
+    let exports = [];
+    let i = 0;
+    while i < count_value.value {
+        let name_length = _read_uleb32(bytes, cursor, finish);
+        if not name_length.ok { throw "wasm_module: malformed export name length"; }
+        cursor = name_length.next;
+        let name_end = cursor + name_length.value;
+        if name_end > finish { throw "wasm_module: export name exceeds section"; }
+        let name = try bytes_to_str(slice(bytes, cursor, name_end)) catch nil;
+        if name == nil or str_contains(name, "\x00") { throw "wasm_module: export name is not valid UTF-8"; }
+        cursor = name_end;
+        if cursor >= finish { throw "wasm_module: export kind is missing"; }
+        let kind = bytes[cursor];
+        cursor = cursor + 1;
+        if kind < 0 or kind > 4 { throw "wasm_module: unsupported export kind"; }
+        let index = _read_uleb32(bytes, cursor, finish);
+        if not index.ok { throw "wasm_module: malformed export index"; }
+        cursor = index.next;
+        array_push(exports, map{ name: name, kind: kind, index: index.value });
+        i = i + 1;
+    }
+    if cursor != finish { throw "wasm_module: trailing bytes in export section"; }
+    return exports;
+}
+
+fn inspect(bytes, options = nil) {
+    let lim = limits(options);
+    if not is_array(bytes) { throw "wasm_module: module must be a byte array"; }
+    if len(bytes) < 8 { throw "wasm_module: module header is truncated"; }
+    if len(bytes) > lim.max_module_bytes { throw "wasm_module: module byte limit exceeded"; }
+    let i = 0;
+    while i < len(bytes) {
+        if not is_number(bytes[i]) or bytes[i] != num_floor(bytes[i]) or bytes[i] < 0 or bytes[i] > 255 {
+            throw "wasm_module: invalid byte at offset " + str(i);
+        }
+        i = i + 1;
+    }
+    if bytes[0] != 0 or bytes[1] != 97 or bytes[2] != 115 or bytes[3] != 109 {
+        throw "wasm_module: invalid WebAssembly magic";
+    }
+    if bytes[4] != 1 or bytes[5] != 0 or bytes[6] != 0 or bytes[7] != 0 {
+        throw "wasm_module: unsupported WebAssembly version";
+    }
+
+    let cursor = 8;
+    let sections = [];
+    let exports = [];
+    let seen = map{};
+    let last_rank = 0;
+    while cursor < len(bytes) {
+        if len(sections) >= lim.max_sections { throw "wasm_module: section count limit exceeded"; }
+        let id = bytes[cursor];
+        cursor = cursor + 1;
+        let size = _read_uleb32(bytes, cursor, len(bytes));
+        if not size.ok { throw "wasm_module: malformed section size: " + size.error; }
+        cursor = size.next;
+        let payload_start = cursor;
+        let payload_end = payload_start + size.value;
+        if payload_end > len(bytes) { throw "wasm_module: section payload exceeds module"; }
+        if id != 0 {
+            let rank = _section_rank(id);
+            if rank < last_rank { throw "wasm_module: non-custom sections are out of order"; }
+            last_rank = rank;
+            let key = str(id);
+            if map_has(seen, key) { throw "wasm_module: duplicate non-custom section " + key; }
+            seen[key] = true;
+        }
+        if id == 7 { exports = _parse_exports(bytes, payload_start, payload_end, lim.max_exports); }
+        array_push(sections, map{
+            id: id, name: _section_name(id), payload_offset: payload_start,
+            payload_bytes: size.value
+        });
+        cursor = payload_end;
+    }
+
+    let has_main = false;
+    for item in exports {
+        if item.name == "main" and item.kind == 0 { has_main = true; }
+    }
+    return map{
+        ok: true, format: FORMAT, version: 1, bytes: len(bytes),
+        sha256: SHA256.sha256_hex_bytes(bytes), digest_format: "sha256-bytes-v1",
+        sections: sections,
+        section_count: len(sections), exports: exports, has_main_function: has_main,
+        envelope_valid: true, section_order_valid: true,
+        semantic_validation: "requires-independent-wasm-engine",
+        bounded: true, limits: lim
+    };
+}
+
+fn compile(source, options = nil) {
+    let lim = limits(options);
+    if not is_string(source) { throw "wasm_module: source must be text"; }
+    if len(str_to_bytes(source)) > lim.max_source_bytes { throw "wasm_module: source byte limit exceeded"; }
+    let artifact = CODEGEN.compile_wasm(source);
+    let metadata = inspect(artifact, lim);
+    return map{
+        ok: true, format: FORMAT, artifact: artifact, metadata: metadata,
+        source_bytes: len(str_to_bytes(source)), executed: false,
+        boundary: "generated and envelope-validated; execute in an independent WebAssembly engine"
+    };
+}
+
+fn addition(left, right, options = nil) {
+    for value in [left, right] {
+        if not is_number(value) or value != num_floor(value)
+            or value < -2147483648 or value > 2147483647 {
+            throw "wasm_module: addition operands must be signed 32-bit integers";
+        }
+    }
+    let expected = left + right;
+    if expected < -2147483648 or expected > 2147483647 {
+        throw "wasm_module: signed 32-bit addition overflow";
+    }
+    let source = "fn add(a, b) { return a + b; } fn main() { return add("
+        + str(left) + ", " + str(right) + "); }";
+    let built = compile(source, options);
+    let modeled = EMULATOR.run(EMULATOR.program([
+        EMULATOR.i32_const(left), EMULATOR.i32_const(right),
+        EMULATOR.add_i32(), EMULATOR.return_instruction()
+    ]));
+    if not modeled.ok or modeled.value != expected {
+        throw "wasm_module: independent instruction model disagrees with expected addition";
+    }
+    return map{
+        ok: true, format: "pblang.wasm.addition.v1", left: left, right: right,
+        value: expected, modeled_value: modeled.value, model_instructions: modeled.instructions,
+        artifact: built.artifact, module: built.metadata, source_bytes: built.source_bytes,
+        cross_checked: true, foreign_compiler_used: false, generated_server_used: false
+    };
+}
+
+export FORMAT, DEFAULT_MAX_SOURCE_BYTES, DEFAULT_MAX_MODULE_BYTES;
+export limits, inspect, compile, addition;

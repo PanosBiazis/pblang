@@ -724,8 +724,13 @@ fn seed_builtin_prelude(env: &mut Env) {
         ("gfxdrawrect", fn1(nil.clone())),
         ("gfxdrawrects", fn1(nil.clone())),
         ("gfxdrawpoint", fn1(nil.clone())),
+        ("gfxdrawtextaa", fn1(any.clone())),
+        ("gfxtextprofile", fn0(any.clone())),
+        ("gfxbackendprofile", fn0(any.clone())),
         ("gfxpresent", fn1(nil.clone())),
         ("gfxpollevents", fn1(any.clone())),
+        ("gfxwindowopen", fn1(bool_ty.clone())),
+        ("gfxclosewindow", fn1(nil.clone())),
         ("parse", fn1(Ty::Fn(vec![], Box::new(any.clone())))),
         ("compile", fn1(Ty::Fn(vec![], Box::new(any.clone())))),
         // Numeric math builtins (all numeric args → number).
@@ -2218,6 +2223,28 @@ mod tests {
         assert!(
             undeclared.is_empty(),
             "common VM builtins must be known to the checker: {:?}",
+            undeclared
+        );
+    }
+
+    #[test]
+    fn test_graphics_extension_builtins_are_known() {
+        let diags = typecheck_source(
+            r#"
+            print gfxdrawtextaa(1, 2, 3, "text", [255, 255, 255], 16, "font.ttf", 8);
+            print gfxtextprofile();
+            print gfxbackendprofile();
+            print gfxwindowopen(1);
+            gfxclosewindow(1);
+            "#,
+        );
+        let undeclared: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("not declared"))
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "graphics extension builtins must be known to the checker: {:?}",
             undeclared
         );
     }

@@ -12,7 +12,7 @@ of monopolizing the host; the quantum checks use finite, fixed circuits.
 | Z80 | calculators, CP/M, retro systems | reusable bounded stdlib model; loads, arithmetic, flags, relative branches, malformed-stream rejection |
 | AVR/ATmega | Arduino, appliances | reusable bounded stdlib model; checked register encoding, arithmetic, multiply, branches, malformed-stream rejection |
 | MSP430 | sensors, low-power controllers | reusable bounded stdlib model; checked word operations, immediate mode, jumps, CPUOFF halt, malformed-stream rejection |
-| MIPS32 | routers, SGI, PlayStation | reusable bounded stdlib model; checked arithmetic, multiply, branch delay slots, malformed-control rejection |
+| MIPS32 | routers, SGI, PlayStation | reusable bounded stdlib model; checked signed/unsigned arithmetic, multiply, branch delay slots, aligned sparse word stores, snippet fallthrough, overflow and malformed-control rejection; bounded source assembly supports ADD/ADDU/ADDI/ADDIU/SW/NOP/SYSCALL |
 | PowerPC32 | classic Macs, consoles, embedded and space systems | reusable bounded stdlib model; checked encodings, arithmetic, multiply, CR branch, syscall, malformed-control rejection |
 | SPARC V8 | workstations, LEON/ERC32 satellites | arithmetic, traps, delay slots, annul |
 | RISC-V RV64I+M subset | open embedded through server CPUs | reusable bounded stdlib safe-integer model; checked arithmetic, branches, jump, ecall, malformed-control rejection |
