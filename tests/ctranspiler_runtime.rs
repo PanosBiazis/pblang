@@ -1,5 +1,9 @@
 use std::process::Command;
 
+fn normalized_stdout(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).replace("\r\n", "\n")
+}
+
 #[test]
 fn ctranspiler_runtime_json_parse_and_stringify_work() {
     if !pblang_ctranspiler::is_c_compiler_available() {
@@ -49,7 +53,7 @@ fn ctranspiler_runtime_json_parse_and_stringify_work() {
         "generated executable failed: stderr={}",
         String::from_utf8_lossy(&run.stderr)
     );
-    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stdout = normalized_stdout(&run.stdout);
     assert!(
         stdout.contains("2\n"),
         "array value should print, stdout={stdout:?}"
@@ -112,7 +116,7 @@ fn ctranspiler_runtime_sha256_bitops_and_str_to_bytes_work() {
         "generated executable failed: stderr={}",
         String::from_utf8_lossy(&run.stderr)
     );
-    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stdout = normalized_stdout(&run.stdout);
     // Canonical SHA-256("abc") — proves the real digest, not the zero stub.
     assert!(
         stdout.contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
@@ -148,7 +152,7 @@ fn ctranspiler_runtime_try_catch_catches_a_thrown_error() {
     let exe = if cfg!(target_os = "windows") { exe_base.with_extension("exe") } else { exe_base };
     let run = Command::new(&exe).output().expect("run");
     assert!(run.status.success(), "exe failed: stderr={}", String::from_utf8_lossy(&run.stderr));
-    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stdout = normalized_stdout(&run.stdout);
     assert!(stdout.contains("caught\n"), "thrown error must be caught, stdout={stdout:?}");
     assert!(stdout.contains("41\n"), "non-throwing try yields its value, stdout={stdout:?}");
     assert!(stdout.contains("caught-errval\n"), "error value must be caught too, stdout={stdout:?}");
@@ -186,7 +190,7 @@ fn ctranspiler_runtime_param_and_builtin_name_shadowing() {
     let run = Command::new(&exe).output().expect("run");
     assert!(run.status.success(), "exe failed: stderr={}", String::from_utf8_lossy(&run.stderr));
     // vals=[3,5,8]: sum=16, max=8 -> 24
-    assert!(String::from_utf8_lossy(&run.stdout).contains("24\n"), "expected 24");
+    assert!(normalized_stdout(&run.stdout).contains("24\n"), "expected 24");
 }
 
 #[test]
@@ -216,7 +220,7 @@ fn ctranspiler_runtime_tensor_matmul_argmax_and_spawn() {
     let exe = if cfg!(target_os = "windows") { exe_base.with_extension("exe") } else { exe_base };
     let run = Command::new(&exe).output().expect("run");
     assert!(run.status.success(), "exe failed: stderr={}", String::from_utf8_lossy(&run.stderr));
-    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stdout = normalized_stdout(&run.stdout);
     assert!(stdout.contains("58,64,139,154\n"), "matmul, stdout={stdout:?}"); // [[58,64],[139,154]]
     assert!(stdout.contains("1\n"), "argmax of [3,9,2,5] is 1, stdout={stdout:?}");
     assert!(stdout.contains("30\n"), "spawn/join_all run the thunks (10+20), stdout={stdout:?}");
@@ -250,7 +254,7 @@ fn ctranspiler_runtime_missing_key_throws_and_str_renders_containers() {
     let exe = if cfg!(target_os = "windows") { exe_base.with_extension("exe") } else { exe_base };
     let run = Command::new(&exe).output().expect("run");
     assert!(run.status.success(), "exe failed: stderr={}", String::from_utf8_lossy(&run.stderr));
-    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stdout = normalized_stdout(&run.stdout);
     assert!(stdout.contains("99\n"), "missing key must throw and be caught -> 99, stdout={stdout:?}");
     assert!(stdout.contains("5\n"), "caught fallback is a number (0+5), stdout={stdout:?}");
     assert!(stdout.contains("true\n"), "str() renders array-of-maps so str_contains finds the id, stdout={stdout:?}");
@@ -283,7 +287,7 @@ fn ctranspiler_runtime_str_split_empty_delim_and_slice() {
     let exe = if cfg!(target_os = "windows") { exe_base.with_extension("exe") } else { exe_base };
     let run = Command::new(&exe).output().expect("run");
     assert!(run.status.success(), "exe failed: stderr={}", String::from_utf8_lossy(&run.stderr));
-    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stdout = normalized_stdout(&run.stdout);
     assert!(stdout.contains("split=4:a|b| |c\n"), "str_split(s,\"\") splits into chars, stdout={stdout:?}");
     assert!(stdout.contains("sslice=ell\n"), "slice on a string, stdout={stdout:?}");
     assert!(stdout.contains("aslice=20,30:2\n"), "slice on an array, stdout={stdout:?}");

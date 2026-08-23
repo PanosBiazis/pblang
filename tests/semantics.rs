@@ -297,7 +297,7 @@ fn http_cookie_helpers_parse_and_get_values() {
 
 #[test]
 fn http_static_file_response_serves_text_file_under_root() {
-    let dir = std::env::temp_dir().join("pblang_tests_static");
+    let dir = std::env::temp_dir().join(format!("pblang_tests_static_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let hello = dir.join("hello.txt");
     std::fs::write(&hello, "hello").expect("write hello.txt");
@@ -313,7 +313,11 @@ fn http_static_file_response_serves_text_file_under_root() {
         "#,
     );
 
-    let out = run_collect(&src);
+    let config = StdlibConfig {
+        ffi: true,
+        ..StdlibConfig::default()
+    };
+    let out = run_collect_with_config(config, &src);
     assert_eq!(out.len(), 3);
     assert_eq!(out[0], Value::Number(200.0));
     assert_eq!(out[1].as_str().expect("body"), "hello");
@@ -321,6 +325,8 @@ fn http_static_file_response_serves_text_file_under_root() {
         out[2].as_str().expect("content_type"),
         "text/plain; charset=utf-8"
     );
+    std::fs::remove_file(&hello).expect("remove hello.txt");
+    std::fs::remove_dir(&dir).expect("remove static test directory");
 }
 
 #[test]
