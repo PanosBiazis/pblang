@@ -9,7 +9,8 @@ let _BOUNDED_HANDLES = map{};
 let BOUNDED_RECOVERY_GRACE_MS = 5000;
 let BOUNDED_TERMINAL_RETENTION_MS = 60000;
 let MAX_BOUNDED_TERMINAL_BYTES = 16777216;
-let BOUNDED_TERMINAL_OVERHEAD_BYTES = 4096;
+let BOUNDED_TERMINAL_METADATA_BYTES = 65536;
+let BOUNDED_TERMINAL_ENVELOPE_BYTES = 512;
 
 fn _bounded_token() {
     for attempt 8 {
@@ -20,14 +21,66 @@ fn _bounded_token() {
     throw "process: bounded lifecycle identity allocation failed";
 }
 
-fn _reserve_bounded() {
+fn _bounded_integer(value, fallback, minimum, maximum, label) {
+    let selected = if value == nil { fallback } else { value };
+    if type(selected) != "number" or selected != num_floor(selected)
+       or selected < minimum or selected > maximum {
+        throw "process: " + label + " must be an integer in "
+            + str(minimum) + ".." + str(maximum);
+    }
+    return selected;
+}
+
+fn _base64_bound(bytes) { return num_floor((bytes + 2) / 3) * 4; }
+
+fn _terminal_reservation(output_bytes) {
+    return _base64_bound(output_bytes) + BOUNDED_TERMINAL_METADATA_BYTES
+        + BOUNDED_TERMINAL_ENVELOPE_BYTES;
+}
+
+fn _terminal_budget_usage(current) {
+    let payload_bytes = 0; let entries = 0; let cached = 0; let expired = 0;
+    let ids = map_keys(_BOUNDED_HANDLES);
+    for i len(ids) {
+        let id = ids[i];
+        if map_has(_BOUNDED_HANDLES, id) {
+            let state = _BOUNDED_HANDLES[id];
+            if (try state.phase catch "") == "terminal_cached"
+               and current >= (try state.terminal_expires_ms catch 0) {
+                state.phase = "claimed"; state.terminal_compact = nil;
+                map_remove(_BOUNDED_HANDLES, id); expired = expired + 1;
+            } else {
+                entries = entries + 1;
+                if (try state.phase catch "") == "terminal_cached" {
+                    payload_bytes = payload_bytes + (try state.terminal_bytes catch 0);
+                    cached = cached + 1;
+                } else {
+                    payload_bytes = payload_bytes
+                        + (try state.terminal_reservation_bytes catch 0);
+                }
+            }
+        }
+    }
+    return map{ payload_bytes: payload_bytes, entries: entries,
+        cached: cached, expired: expired };
+}
+
+fn _reserve_bounded(reservation_bytes, retention_ms) {
+    let usage = _terminal_budget_usage(num_floor(now_ms()));
     if len(map_keys(_BOUNDED_HANDLES)) >= MAX_BOUNDED_HANDLES {
         throw "process: bounded lifecycle capacity reached";
+    }
+    if reservation_bytes > MAX_BOUNDED_TERMINAL_BYTES
+       or usage.payload_bytes + reservation_bytes > MAX_BOUNDED_TERMINAL_BYTES {
+        throw "process: bounded terminal-result budget reached";
     }
     let id = _bounded_token(); let current = num_floor(now_ms());
     _BOUNDED_HANDLES[id] = map{ raw: nil, created_ms: current,
         last_used_ms: current, launching: true, cancel_requested: false,
-        recovery_after_ms: current + BOUNDED_RECOVERY_GRACE_MS };
+        recovery_after_ms: current + BOUNDED_RECOVERY_GRACE_MS,
+        terminal_reservation_bytes: reservation_bytes,
+        terminal_retention_ms: retention_ms,
+        race_resistant_identity: false, phase: "reserved" };
     return id;
 }
 
@@ -35,11 +88,20 @@ fn _bounded_state(handle) {
     if type(handle) != "map"
        or (try handle.format catch "") != BOUNDED_HANDLE_FORMAT
        or type(try handle.id catch nil) != "string"
+       or len(handle.id) != 64
+       or not regex_match(handle.id, "^[a-f0-9]{64}$")
        or not map_has(_BOUNDED_HANDLES, handle.id) {
         throw "process: invalid or closed bounded lifecycle handle";
     }
     let state = _BOUNDED_HANDLES[handle.id];
-    state.last_used_ms = num_floor(now_ms()); return state;
+    let current = num_floor(now_ms());
+    if (try state.phase catch "") == "terminal_cached"
+       and current >= (try state.terminal_expires_ms catch 0) {
+        state.phase = "claimed"; state.terminal_compact = nil;
+        map_remove(_BOUNDED_HANDLES, handle.id);
+        throw "process: expired bounded lifecycle handle";
+    }
+    state.last_used_ms = current; return state;
 }
 
 fn _bounded_poll_view(status) {
@@ -66,73 +128,107 @@ fn _bounded_terminal_result(result) {
             and not (try result.cleanup_deferred catch false));
 }
 
-fn _terminal_result_bytes(result) {
-    let stdout_bytes = try len(str_to_bytes(result.stdout)) catch 0;
-    let stderr_bytes = try len(str_to_bytes(result.stderr)) catch 0;
-    return stdout_bytes + stderr_bytes + BOUNDED_TERMINAL_OVERHEAD_BYTES;
+fn _terminal_failure_result(message) {
+    return map{ ok: false, completed: true, command_ok: false,
+        exit_code: -1, signal: 0, signaled: false, core_dumped: false,
+        timed_out: false, stdout: "", stderr: "", stdout_bytes: [],
+        stderr_bytes: [], stdout_utf8: true, stderr_utf8: true,
+        output_truncated: true, returned_output_bytes: 0,
+        process_group_terminated: true, terminated: true,
+        terminal_normalization_failed: true, error: message };
 }
 
-fn _terminal_reservation_bytes(state) {
-    let output = try state.raw.max_output_bytes catch 0;
-    if type(output) != "number" or output < 0 { output = 0; }
-    return output + BOUNDED_TERMINAL_OVERHEAD_BYTES;
-}
-
-fn _terminal_cache_usage(current) {
-    let bytes = 0; let entries = 0; let expired = 0;
-    let ids = map_keys(_BOUNDED_HANDLES);
-    for i len(ids) {
-        let id = ids[i];
-        if map_has(_BOUNDED_HANDLES, id) {
-            let state = _BOUNDED_HANDLES[id];
-            if (try state.terminal_result catch nil) != nil {
-                if current >= (try state.terminal_expires_ms catch 0) {
-                    state.terminal_result = nil; map_remove(_BOUNDED_HANDLES, id);
-                    expired = expired + 1;
-                } else {
-                    bytes = bytes + (try state.terminal_bytes catch 0);
-                    entries = entries + 1;
-                }
-            }
+fn _compact_terminal_result(result) {
+    if type(result) != "map" { throw "terminal result must be a map"; }
+    let stdout_bytes = try result.stdout_bytes catch nil;
+    let stderr_bytes = try result.stderr_bytes catch nil;
+    if type(stdout_bytes) != "array" {
+        stdout_bytes = try str_to_bytes(result.stdout) catch [];
+    }
+    if type(stderr_bytes) != "array" {
+        stderr_bytes = try str_to_bytes(result.stderr) catch [];
+    }
+    let metadata = map{}; let keys = map_keys(result);
+    for i len(keys) {
+        let key = keys[i];
+        if key != "stdout" and key != "stderr" and key != "stdout_bytes"
+           and key != "stderr_bytes" and key != "process_group_id" {
+            metadata[key] = result[key];
         }
     }
-    return map{ bytes: bytes, entries: entries, expired: expired };
+    let metadata_json = json_stringify(metadata);
+    let stdout_b64 = base64_encode_bytes(stdout_bytes);
+    let stderr_b64 = base64_encode_bytes(stderr_bytes);
+    return map{ format: "pblang.process.terminal-compact.v1",
+        metadata_json: metadata_json, stdout_b64: stdout_b64,
+        stderr_b64: stderr_b64,
+        payload_bytes: len(str_to_bytes(metadata_json))
+            + len(str_to_bytes(stdout_b64)) + len(str_to_bytes(stderr_b64))
+            + BOUNDED_TERMINAL_ENVELOPE_BYTES };
+}
+
+fn _failure_compact(message) {
+    return _compact_terminal_result(_terminal_failure_result(message));
+}
+
+fn _expand_terminal_result(compact) {
+    if type(compact) != "map"
+       or (try compact.format catch "") != "pblang.process.terminal-compact.v1" {
+        throw "invalid compact terminal result";
+    }
+    let result = json_parse(compact.metadata_json);
+    if type(result) != "map" { throw "invalid terminal metadata"; }
+    let stdout_bytes = base64_decode_bytes(compact.stdout_b64);
+    let stderr_bytes = base64_decode_bytes(compact.stderr_b64);
+    result.stdout_bytes = stdout_bytes; result.stderr_bytes = stderr_bytes;
+    result.stdout = if (try result.stdout_utf8 catch false) {
+        try bytes_to_str(stdout_bytes) catch ""
+    } else { "" };
+    result.stderr = if (try result.stderr_utf8 catch false) {
+        try bytes_to_str(stderr_bytes) catch ""
+    } else { "" };
+    try map_remove(result, "process_group_id") catch nil;
+    return result;
 }
 
 fn _cache_terminal(state, result, current) {
-    let bytes = _terminal_result_bytes(result);
-    state.raw = nil; state.terminal_result = result; state.terminal_bytes = bytes;
+    let compact = try _compact_terminal_result(result) catch nil;
+    if compact == nil
+       or (try compact.payload_bytes catch MAX_BOUNDED_TERMINAL_BYTES + 1)
+            > state.terminal_reservation_bytes {
+        compact = _failure_compact("terminal result normalization exceeded its reserved budget");
+    }
+    state.raw = nil; state.terminal_compact = compact;
+    state.terminal_bytes = compact.payload_bytes;
     state.terminal_cached_ms = current;
-    state.terminal_expires_ms = current + BOUNDED_TERMINAL_RETENTION_MS;
+    state.terminal_expires_ms = current + state.terminal_retention_ms;
     state.launching = false; state.cancel_requested = false;
-    return bytes;
+    state.phase = "terminal_cached";
+    return compact.payload_bytes;
 }
 
 fn maintain_bounded() {
     let examined = 0; let closed = 0; let recovery_required = 0;
-    let results_cached = 0; let claim_required = 0;
+    let results_cached = 0;
     let current = num_floor(now_ms());
-    let usage = _terminal_cache_usage(current); let cached_bytes = usage.bytes;
+    let usage = _terminal_budget_usage(current);
+    let payload_bytes = usage.payload_bytes;
     let ids = map_keys(_BOUNDED_HANDLES);
     for i len(ids) {
         let id = ids[i];
         if map_has(_BOUNDED_HANDLES, id) {
             let state = _BOUNDED_HANDLES[id]; examined = examined + 1;
-            if (try state.terminal_result catch nil) != nil {
+            if (try state.phase catch "") == "terminal_cached" {
                 continue;
             }
             if not (try state.launching catch false) and state.raw != nil {
                 let observed = try _LINUX_PROCESS.poll(state.raw) catch nil;
                 if observed != nil and (try observed.complete catch false) {
-                    let reservation = _terminal_reservation_bytes(state);
-                    if cached_bytes + reservation <= MAX_BOUNDED_TERMINAL_BYTES {
-                        let result = try _LINUX_PROCESS.finish(state.raw, 0) catch nil;
-                        if _bounded_terminal_result(result) {
-                            cached_bytes = cached_bytes + _cache_terminal(state, result, current);
-                            closed = closed + 1; results_cached = results_cached + 1;
-                        }
-                    } else {
-                        claim_required = claim_required + 1;
+                    let result = try _LINUX_PROCESS.finish(state.raw, 0) catch nil;
+                    if _bounded_terminal_result(result) {
+                        payload_bytes = payload_bytes - state.terminal_reservation_bytes
+                            + _cache_terminal(state, result, current);
+                        closed = closed + 1; results_cached = results_cached + 1;
                     }
                 }
                 if state.raw != nil and current >= state.recovery_after_ms {
@@ -140,17 +236,12 @@ fn maintain_bounded() {
                         let requested = try _LINUX_PROCESS.request_cancel(state.raw, 250) catch nil;
                         state.cancel_requested = requested != nil;
                     }
-                    let reservation = _terminal_reservation_bytes(state);
-                    if cached_bytes + reservation <= MAX_BOUNDED_TERMINAL_BYTES {
-                        let result = try _LINUX_PROCESS.finish(state.raw, 0) catch nil;
-                        if _bounded_terminal_result(result) {
-                            cached_bytes = cached_bytes + _cache_terminal(state, result, current);
-                            closed = closed + 1; results_cached = results_cached + 1;
-                        } else { recovery_required = recovery_required + 1; }
-                    } else {
-                        claim_required = claim_required + 1;
-                        recovery_required = recovery_required + 1;
-                    }
+                    let result = try _LINUX_PROCESS.finish(state.raw, 0) catch nil;
+                    if _bounded_terminal_result(result) {
+                        payload_bytes = payload_bytes - state.terminal_reservation_bytes
+                            + _cache_terminal(state, result, current);
+                        closed = closed + 1; results_cached = results_cached + 1;
+                    } else { recovery_required = recovery_required + 1; }
                 }
             }
         }
@@ -158,10 +249,11 @@ fn maintain_bounded() {
     return map{ format: "pblang.process.bounded-maintenance.v1",
         examined: examined, closed: closed,
         active: len(map_keys(_BOUNDED_HANDLES)),
-        terminal_cached: usage.entries + results_cached,
-        terminal_expired: usage.expired, terminal_cached_bytes: cached_bytes,
+        terminal_cached: usage.cached + results_cached,
+        terminal_expired: usage.expired,
+        terminal_reserved_payload_bytes: payload_bytes,
         terminal_cache_limit_bytes: MAX_BOUNDED_TERMINAL_BYTES,
-        results_cached: results_cached, claim_required: claim_required,
+        results_cached: results_cached,
         recovery_required: recovery_required,
         raw_state_exposed: false };
 }
@@ -222,7 +314,15 @@ fn bounded_status() {
     }
     return map{ format: "pblang.process.bounded-status.v1", available: true,
         platform: platform(), backend: "linux-process", raw_fallback: false,
-        capabilities: status };
+        capabilities: status,
+        lifecycle: map{ format: "pblang.process.bounded-lifecycle-status.v1",
+            max_handles: MAX_BOUNDED_HANDLES,
+            terminal_payload_budget_bytes: MAX_BOUNDED_TERMINAL_BYTES,
+            default_terminal_retention_ms: BOUNDED_TERMINAL_RETENTION_MS,
+            atomic_terminal_reservation: true,
+            canonical_terminal_cache: true,
+            immutable_terminal_expiry: true,
+            raw_state_exposed: false } };
 }
 
 fn _bounded_unavailable() {
@@ -262,9 +362,35 @@ fn start_fixed_bounded(candidates, args, options) {
     }
     if not bounded_status().available { return _bounded_unavailable(); }
     maintain_bounded();
-    let id = _reserve_bounded();
+    let output_limit = try _bounded_integer(try options.max_output_bytes catch nil,
+        1048576, 1, 67108864, "max_output_bytes") catch nil;
+    let retention_ms = try _bounded_integer(
+        try options._terminal_retention_ms catch nil,
+        BOUNDED_TERMINAL_RETENTION_MS, 50,
+        BOUNDED_TERMINAL_RETENTION_MS, "_terminal_retention_ms") catch nil;
+    if output_limit == nil or retention_ms == nil {
+        return map{ format: "pblang.process.bounded-start.v1", ok: false,
+            started: false, bounded: true, raw_fallback: false,
+            raw_state_exposed: false, error: "invalid bounded lifecycle options" };
+    }
+    let reservation_bytes = _terminal_reservation(output_limit);
+    if reservation_bytes > MAX_BOUNDED_TERMINAL_BYTES {
+        return map{ format: "pblang.process.bounded-start.v1", ok: false,
+            started: false, bounded: true, raw_fallback: false,
+            raw_state_exposed: false,
+            error: "terminal result reservation exceeds the global payload budget" };
+    }
+    let id = try _reserve_bounded(reservation_bytes, retention_ms) catch nil;
+    if id == nil {
+        return map{ format: "pblang.process.bounded-start.v1", ok: false,
+            started: false, bounded: true, raw_fallback: false,
+            raw_state_exposed: false,
+            error: "bounded lifecycle capacity or terminal-result budget reached" };
+    }
     let launch_options = map{};
-    for key in map_keys(options) { launch_options[key] = options[key]; }
+    for key in map_keys(options) {
+        if key != "_terminal_retention_ms" { launch_options[key] = options[key]; }
+    }
     launch_options._require_pidfd = true;
     let raw = try _LINUX_PROCESS.start_fixed(candidates, args, launch_options) catch nil;
     if raw == nil {
@@ -276,9 +402,12 @@ fn start_fixed_bounded(candidates, args, options) {
     if not (try raw.ok catch false) {
         if (try raw.requires_recovery catch false) or (try raw.active catch false) {
             let current = num_floor(now_ms());
-            _BOUNDED_HANDLES[id] = map{ raw: raw, created_ms: current,
-                last_used_ms: current, launching: false, cancel_requested: false,
-                recovery_after_ms: current + BOUNDED_RECOVERY_GRACE_MS };
+            let state = _BOUNDED_HANDLES[id]; state.raw = raw;
+            state.last_used_ms = current; state.launching = false;
+            state.cancel_requested = false;
+            state.recovery_after_ms = current + BOUNDED_RECOVERY_GRACE_MS;
+            state.race_resistant_identity = try raw.race_resistant_identity catch false;
+            state.phase = "recovery";
             return map{ format: BOUNDED_HANDLE_FORMAT, id: id, ok: false,
                 started: true, bounded: true, raw_fallback: false,
                 requires_recovery: true, raw_state_exposed: false,
@@ -291,10 +420,13 @@ fn start_fixed_bounded(candidates, args, options) {
             error: try raw.error catch "bounded process start failed" };
     }
     let current = num_floor(now_ms());
-    _BOUNDED_HANDLES[id] = map{ raw: raw, created_ms: current,
-        last_used_ms: current, launching: false, cancel_requested: false,
-        recovery_after_ms: current + raw.timeout_secs * 1000
-            + BOUNDED_RECOVERY_GRACE_MS };
+    let state = _BOUNDED_HANDLES[id]; state.raw = raw;
+    state.last_used_ms = current; state.launching = false;
+    state.cancel_requested = false;
+    state.recovery_after_ms = current + raw.timeout_secs * 1000
+        + BOUNDED_RECOVERY_GRACE_MS;
+    state.race_resistant_identity = try raw.race_resistant_identity catch false;
+    state.phase = "running";
     return map{ format: BOUNDED_HANDLE_FORMAT, id: id, ok: true,
         started: true, bounded: true, raw_fallback: false,
         raw_state_exposed: false };
@@ -302,13 +434,14 @@ fn start_fixed_bounded(candidates, args, options) {
 
 fn poll_bounded(handle) {
     let state = _bounded_state(handle);
-    if (try state.terminal_result catch nil) != nil {
+    if (try state.phase catch "") == "terminal_cached" {
         return map{ format: "pblang.process.bounded-poll.v1", ok: true,
             complete: true, active: false, terminated: true,
             startup_pending: false, startup_failed: false,
             cancel_requested: false, term_sent: false, kill_sent: false,
             liveness: "absent", elapsed_ms: 0,
-            race_resistant_identity: true, terminal_cached: true,
+            race_resistant_identity: state.race_resistant_identity,
+            terminal_cached: true,
             raw_state_exposed: false };
     }
     let view = _bounded_poll_view(_LINUX_PROCESS.poll(state.raw));
@@ -318,11 +451,12 @@ fn poll_bounded(handle) {
 
 fn request_cancel_bounded(handle, grace_ms = 500) {
     let state = _bounded_state(handle);
-    if (try state.terminal_result catch nil) != nil {
+    if (try state.phase catch "") == "terminal_cached" {
         return map{ format: "pblang.process.bounded-cancel.v1",
             ok: true, requested: false, terminated: true,
             term_sent: false, kill_sent: false, liveness: "absent",
-            race_resistant_identity: true, terminal_cached: true,
+            race_resistant_identity: state.race_resistant_identity,
+            terminal_cached: true,
             raw_state_exposed: false };
     }
     let result = _LINUX_PROCESS.request_cancel(state.raw, grace_ms);
@@ -340,20 +474,45 @@ fn request_cancel_bounded(handle, grace_ms = 500) {
 fn finish_bounded(handle, wait_ms = nil) {
     let state = _bounded_state(handle);
     let result = nil; let result_was_cached = false;
-    if (try state.terminal_result catch nil) != nil {
-        result = state.terminal_result; state.terminal_result = nil;
+    if (try state.phase catch "") == "terminal_cached" {
+        result = try _expand_terminal_result(state.terminal_compact) catch nil;
+        if result == nil {
+            result = _terminal_failure_result("cached terminal result validation failed");
+        }
         result_was_cached = true;
     } else {
         result = _LINUX_PROCESS.finish(state.raw, wait_ms);
     }
+    if type(result) != "map" {
+        result = map{ ok: false, completed: false, command_ok: false,
+            process_group_terminated: false, cleanup_deferred: true,
+            error: "bounded process result is unavailable" };
+    }
     let terminal = _bounded_terminal_result(result);
-    if terminal { map_remove(_BOUNDED_HANDLES, handle.id); }
+    if terminal and not result_was_cached {
+        let compact = try _compact_terminal_result(result) catch nil;
+        if compact == nil or compact.payload_bytes > state.terminal_reservation_bytes {
+            result = _terminal_failure_result(
+                "terminal result normalization exceeded its reserved budget");
+        } else {
+            result = try _expand_terminal_result(compact) catch nil;
+            if result == nil {
+                result = _terminal_failure_result("terminal result validation failed");
+            }
+        }
+    }
+    try map_remove(result, "process_group_id") catch nil;
     result.format = "pblang.process.bounded-result.v1";
     result.bounded = true; result.raw_fallback = false;
-    result.race_resistant_identity = try state.raw.race_resistant_identity catch false;
+    result.race_resistant_identity = state.race_resistant_identity;
     result.raw_state_exposed = false; result.handle_closed = terminal;
     result.requires_recovery = not terminal;
     result.result_was_cached = result_was_cached;
+    result.lifecycle_phase = if terminal { "claimed" } else { state.phase };
+    if terminal {
+        state.phase = "claimed"; state.terminal_compact = nil;
+        map_remove(_BOUNDED_HANDLES, handle.id);
+    }
     return result;
 }
 

@@ -1,0 +1,254 @@
+let DataFrame = import("stdlib:dataframe.sapp");
+let Stat = import("stdlib:stat.sapp");
+let ML = import("stdlib:ml.sapp");
+
+let MAX_CSV_CHARS = 524288;
+let MAX_ROWS = 4096;
+let MAX_FEATURES = 32;
+let MAX_ABS_NUMBER = 1000000000000;
+
+fn _fail(message) { throw "vehicle_emissions_lab: " + message; }
+
+fn _option(options, name, fallback) {
+    if type(options) == "map" and map_has(options, name) { return options[name]; }
+    return fallback;
+}
+
+fn _bounded_number(value, label) {
+    if type(value) != "number" or json_stringify(value) == "null"
+       or num_abs(value) > MAX_ABS_NUMBER {
+        _fail(label + " must be a finite bounded number");
+    }
+    return value;
+}
+
+fn _validated_names(values, label, allow_empty = false) {
+    if type(values) != "array" or (not allow_empty and len(values) == 0)
+       or len(values) > MAX_FEATURES {
+        _fail(label + " must contain " + (if allow_empty { "0" } else { "1" })
+            + ".." + str(MAX_FEATURES) + " column names");
+    }
+    let out = [];
+    let seen = map{};
+    for value in values {
+        if type(value) != "string" or str_trim(value) == "" or len(value) > 128 {
+            _fail(label + " contains an invalid column name");
+        }
+        if map_has(seen, value) { _fail(label + " contains duplicate column " + value); }
+        seen[value] = true;
+        array_push(out, value);
+    }
+    return out;
+}
+
+fn _has_column(frame, name) {
+    for column in frame.columns { if column == name { return true; } }
+    return false;
+}
+
+fn _paired_numeric(frame, x_name, y_name) {
+    let xs = [];
+    let ys = [];
+    for row in frame.rows {
+        let x = try row[x_name] catch nil;
+        let y = try row[y_name] catch nil;
+        if x != nil and y != nil and type(x) == "number" and type(y) == "number" {
+            array_push(xs, _bounded_number(x, x_name));
+            array_push(ys, _bounded_number(y, y_name));
+        }
+    }
+    return map{ x: xs, y: ys };
+}
+
+fn _missing_counts(frame) {
+    let schema = DataFrame.schema(frame);
+    let out = map{};
+    for column in frame.columns { out[column] = schema[column].nil; }
+    return out;
+}
+
+fn _correlations(frame, features, target) {
+    let rows = [];
+    for feature in features {
+        let pair = _paired_numeric(frame, feature, target);
+        let coefficient = nil;
+        if len(pair.x) >= 2 { coefficient = Stat.correlation(pair.x, pair.y); }
+        array_push(rows, map{
+            feature: feature,
+            coefficient: coefficient,
+            sample_count: len(pair.x)
+        });
+    }
+    return rows;
+}
+
+fn _strongest(correlations) {
+    let best = nil;
+    let best_abs = -1;
+    for item in correlations {
+        if item.coefficient != nil {
+            let magnitude = num_abs(item.coefficient);
+            if magnitude > best_abs {
+                best = item.feature;
+                best_abs = magnitude;
+            }
+        }
+    }
+    if best == nil { _fail("no numeric feature has enough paired target values"); }
+    return best;
+}
+
+fn _deterministic_split(xs, ys, test_every) {
+    let train_x = []; let train_y = [];
+    let test_x = []; let test_y = [];
+    let i = 0;
+    while i < len(xs) {
+        if num_mod(i, test_every) == 0 {
+            array_push(test_x, xs[i]); array_push(test_y, ys[i]);
+        } else {
+            array_push(train_x, xs[i]); array_push(train_y, ys[i]);
+        }
+        i = i + 1;
+    }
+    if len(train_x) < 2 or len(test_x) < 1 {
+        _fail("dataset is too small for the deterministic train/test split");
+    }
+    return map{ train_x: train_x, train_y: train_y, test_x: test_x, test_y: test_y };
+}
+
+fn _category_profiles(frame, columns) {
+    let profiles = [];
+    for column in columns {
+        if not _has_column(frame, column) { _fail("missing categorical column " + column); }
+        let values = DataFrame.column(frame, column);
+        let encoded = ML.one_hot_encode(values);
+        array_push(profiles, map{
+            column: column,
+            category_count: len(encoded.categories),
+            encoded_width: len(encoded.categories),
+            row_count: len(values),
+            labels_disclosed: false
+        });
+    }
+    return profiles;
+}
+
+fn analyze_csv_text(csv_text, options = nil) {
+    if type(csv_text) != "string" or str_trim(csv_text) == "" {
+        _fail("CSV input must be a non-empty string");
+    }
+    if len(csv_text) > MAX_CSV_CHARS { _fail("CSV input exceeds the character budget"); }
+
+    let target = _option(options, "target", "co2_emissions");
+    if type(target) != "string" or target == "" or len(target) > 128 {
+        _fail("target must be a valid column name");
+    }
+    let features = _validated_names(_option(options, "numeric_features",
+        ["engine_l", "cylinders", "fuel_l_per_100km"]), "numeric_features");
+    let categories = _validated_names(_option(options, "categorical_features",
+        ["vehicle_class", "fuel_type"]), "categorical_features", true);
+    let test_every = _option(options, "test_every", 5);
+    if type(test_every) != "number" or test_every < 2 or test_every > 20
+       or num_floor(test_every) != test_every {
+        _fail("test_every must be an integer from 2 to 20");
+    }
+    let include_points = _option(options, "include_plot_points", false);
+    if type(include_points) != "bool" { _fail("include_plot_points must be boolean"); }
+
+    let frame = DataFrame.from_csv_string(csv_text);
+    let validation = DataFrame.validate(frame);
+    if not validation.ok { _fail("CSV did not produce a valid dataframe"); }
+    if validation.rows < 3 or validation.rows > MAX_ROWS {
+        _fail("CSV must contain 3.." + str(MAX_ROWS) + " data rows");
+    }
+    if validation.columns > 64 { _fail("CSV exceeds the column budget"); }
+    if not _has_column(frame, target) { _fail("missing target column " + target); }
+    for feature in features {
+        if not _has_column(frame, feature) { _fail("missing numeric feature " + feature); }
+    }
+
+    let correlations = _correlations(frame, features, target);
+    let predictor = _strongest(correlations);
+    let paired = _paired_numeric(frame, predictor, target);
+    if len(paired.x) < 5 { _fail("selected predictor needs at least five numeric pairs"); }
+    let split = _deterministic_split(paired.x, paired.y, test_every);
+    let model = ML.linreg_fit(split.train_x, split.train_y);
+    let predictions = [];
+    let points = [];
+    let i = 0;
+    while i < len(split.test_x) {
+        let predicted = ML.linreg_predict(model, split.test_x[i]);
+        array_push(predictions, predicted);
+        if include_points and len(points) < 256 {
+            array_push(points, map{ x: split.test_x[i], actual: split.test_y[i], predicted: predicted });
+        }
+        i = i + 1;
+    }
+
+    let numeric_summary = DataFrame.describe(frame);
+    return map{
+        format: "pblang.example.vehicle-emissions-analysis.v1",
+        row_count: validation.rows,
+        column_count: validation.columns,
+        target: target,
+        missing_by_column: _missing_counts(frame),
+        numeric_summary: numeric_summary,
+        categorical_profiles: _category_profiles(frame, categories),
+        correlations: correlations,
+        selected_predictor: predictor,
+        model: map{
+            kind: "ordinary-least-squares",
+            scope: "best-single-numeric-feature",
+            slope: model.slope,
+            intercept: model.intercept
+        },
+        metrics: map{
+            mse: ML.mse(split.test_y, predictions),
+            rmse: ML.rmse(split.test_y, predictions),
+            r2: ML.r2_score(split.test_y, predictions),
+            train_rows: len(split.train_x),
+            test_rows: len(split.test_x)
+        },
+        plot_points: points,
+        privacy: map{
+            raw_rows_included: false,
+            category_labels_included: false,
+            plot_points_opt_in: include_points
+        },
+        bounded: true
+    };
+}
+
+fn sample_csv() {
+    return "vehicle_class,fuel_type,engine_l,cylinders,fuel_l_per_100km,co2_emissions\n"
+        + "compact,gasoline,1.4,4,6.8,158\n"
+        + "compact,gasoline,1.6,4,7.2,169\n"
+        + "compact,hybrid,1.8,4,4.9,114\n"
+        + "midsize,gasoline,2.0,4,8.1,188\n"
+        + "midsize,diesel,2.0,4,6.5,171\n"
+        + "midsize,hybrid,2.5,4,5.3,124\n"
+        + "suv,gasoline,2.5,4,9.4,220\n"
+        + "suv,gasoline,3.0,6,10.8,253\n"
+        + "suv,diesel,3.0,6,8.7,229\n"
+        + "pickup,gasoline,3.5,6,12.2,286\n"
+        + "pickup,gasoline,4.0,8,14.1,331\n"
+        + "pickup,flex,5.0,8,15.8,370\n"
+        + "van,gasoline,2.4,4,10.1,236\n"
+        + "van,diesel,2.8,4,9.0,237\n"
+        + "sports,gasoline,3.0,6,11.4,267\n"
+        + "sports,gasoline,4.2,8,13.6,318\n"
+        + "compact,electric,0,0,0,0\n"
+        + "suv,electric,0,0,0,0\n"
+        + "midsize,gasoline,2.2,4,8.6,200\n"
+        + "suv,hybrid,2.5,4,6.1,143\n";
+}
+
+fn sample_report(include_points = false) {
+    return analyze_csv_text(sample_csv(), map{ include_plot_points: include_points });
+}
+
+fn source_sha256() {
+    return "7b12ac3eeca65e42a0d81f953ec6bb7af9a78ee7f9c26cc4d4a10b8be8f5ba60";
+}
+
+export analyze_csv_text, sample_csv, sample_report, source_sha256;

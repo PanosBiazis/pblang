@@ -1,0 +1,263 @@
+let TCP = import("stdlib:native_tcp.sapp");
+let Net = import("stdlib:net.sapp");
+
+let REQUEST_FORMAT = "pblang.loopback-service.request.v1";
+let RESPONSE_FORMAT = "pblang.loopback-service.response.v1";
+let SOURCE_SHA256 = "7a69f736e96c0ed7c576e7832e661eeee20961b5172b8244e86ebd93fde79b73";
+let MAX_FRAME_BYTES = 2048;
+let MAX_MESSAGE_BYTES = 512;
+let MAX_REQUEST_ID_BYTES = 64;
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and num_floor(value) == value
+        and value >= minimum and value <= maximum;
+}
+
+fn _identifier(value) {
+    if type(value) != "string" or value == ""
+    or len(str_to_bytes(value)) > MAX_REQUEST_ID_BYTES { return false; }
+    let bytes = str_to_bytes(value);
+    let i = 0;
+    while i < len(bytes) {
+        if not ((bytes[i] >= 65 and bytes[i] <= 90)
+        or (bytes[i] >= 97 and bytes[i] <= 122)
+        or (bytes[i] >= 48 and bytes[i] <= 57)
+        or bytes[i] == 45 or bytes[i] == 95) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _safe_text(value) {
+    if type(value) != "string" or len(str_to_bytes(value)) > MAX_MESSAGE_BYTES {
+        return false;
+    }
+    let bytes = str_to_bytes(value);
+    let i = 0;
+    while i < len(bytes) {
+        if bytes[i] == 0 or bytes[i] == 127
+        or (bytes[i] < 32 and bytes[i] != 9) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn options(overrides = nil) {
+    let out = map{ host: "127.0.0.1", port: 0, backlog: 8,
+        accept_timeout_ms: 500, read_timeout_ms: 500,
+        write_timeout_ms: 500, connect_timeout_ms: 500 };
+    if overrides != nil {
+        if type(overrides) != "map" { throw "loopback service options must be a map"; }
+        for key in map_keys(overrides) { out[key] = overrides[key]; }
+    }
+    if out.host != "127.0.0.1" { throw "loopback service requires host 127.0.0.1"; }
+    if not _integer(out.port, 0, 65535) or not _integer(out.backlog, 1, 128)
+    or not _integer(out.accept_timeout_ms, 1, 60000)
+    or not _integer(out.read_timeout_ms, 1, 60000)
+    or not _integer(out.write_timeout_ms, 1, 60000)
+    or not _integer(out.connect_timeout_ms, 1, 60000) {
+        throw "loopback service options exceed bounded ranges";
+    }
+    return out;
+}
+
+fn capabilities() {
+    let support = TCP.available();
+    return map{ format: "pblang.loopback-service.capabilities.v1",
+        platform: platform(), live_supported: support.ok,
+        loopback_only: true, bounded_accept: support.ok,
+        bounded_read: support.ok, bounded_write: support.ok,
+        peer_identity_logged: false, payload_logged: false,
+        max_frame_bytes: MAX_FRAME_BYTES, max_message_bytes: MAX_MESSAGE_BYTES };
+}
+
+fn make_request(request_id, message) {
+    if not _identifier(request_id) { throw "loopback service request id is invalid"; }
+    if not _safe_text(message) { throw "loopback service message is invalid or oversized"; }
+    let frame = json_stringify(map{ format: REQUEST_FORMAT,
+        request_id: request_id, message: message }) + "\n";
+    if len(str_to_bytes(frame)) > MAX_FRAME_BYTES {
+        throw "loopback service request frame exceeds quota";
+    }
+    return frame;
+}
+
+fn handle_frame(frame) {
+    if type(frame) != "string" or len(str_to_bytes(frame)) == 0
+    or len(str_to_bytes(frame)) > MAX_FRAME_BYTES {
+        return map{ ok: false, error: "request frame is empty or exceeds quota",
+            payload_exposed: false };
+    }
+    let request = try json_parse(str_trim(frame)) catch nil;
+    if type(request) != "map" or (try request.format catch "") != REQUEST_FORMAT {
+        return map{ ok: false, error: "invalid request envelope", payload_exposed: false };
+    }
+    let request_id = try request.request_id catch nil;
+    let message = try request.message catch nil;
+    if not _identifier(request_id) {
+        return map{ ok: false, error: "invalid request id", payload_exposed: false };
+    }
+    if not _safe_text(message) {
+        return map{ ok: false, error: "invalid request message", payload_exposed: false };
+    }
+    return map{ ok: true, request_id: request_id, accepted: true,
+        received_bytes: len(str_to_bytes(message)), payload_exposed: false };
+}
+
+fn _wire_response(result) {
+    return json_stringify(map{ format: RESPONSE_FORMAT, result: result }) + "\n";
+}
+
+fn open_listener(overrides = nil) {
+    let config = options(overrides);
+    let listener = TCP.listen_ipv4(config.host, config.port, config.backlog);
+    if not listener.ok { return listener; }
+    listener.service_options = config;
+    return listener;
+}
+
+fn serve_once(listener) {
+    if type(listener) != "map" or not (try listener.ok catch false)
+    or (try listener.closed catch true) {
+        return map{ ok: false, error: "invalid loopback listener",
+            listener_closed: false, payload_exposed: false };
+    }
+    let config = try listener.service_options catch options();
+    let accepted = TCP.accept_bounded(listener, config.accept_timeout_ms);
+    if not accepted.ok {
+        TCP.close(listener);
+        return map{ ok: false, timeout: try accepted.timeout catch false,
+            error: try accepted.error catch "accept failed", listener_closed: listener.closed,
+            socket_closed: true, payload_exposed: false };
+    }
+    let incoming = TCP.read_until(accepted, "\n", MAX_FRAME_BYTES,
+        config.read_timeout_ms);
+    if not incoming.ok {
+        TCP.close(accepted); TCP.close(listener);
+        return map{ ok: false, timeout: try incoming.timeout catch false,
+            error: try incoming.error catch "read failed", listener_closed: listener.closed,
+            socket_closed: accepted.closed, payload_exposed: false };
+    }
+    let handled = handle_frame(incoming.text);
+    let written = TCP.write_text(accepted, _wire_response(handled),
+        config.write_timeout_ms);
+    TCP.close(accepted); TCP.close(listener);
+    return map{ ok: handled.ok and written.ok,
+        request_id: try handled.request_id catch nil,
+        accepted: try handled.accepted catch false,
+        received_bytes: try handled.received_bytes catch 0,
+        response_written: written.ok, listener_closed: listener.closed,
+        socket_closed: accepted.closed, payload_exposed: false,
+        error: if handled.ok and written.ok { nil }
+            else { try handled.error catch try written.error catch "response failed" } };
+}
+
+fn client_exchange(port, request_id, message, overrides = nil) {
+    let config = options(overrides);
+    if not _integer(port, 1, 65535) {
+        return map{ ok: false, error: "invalid loopback port", payload_exposed: false };
+    }
+    let frame = try make_request(request_id, message) catch nil;
+    if frame == nil {
+        return map{ ok: false, error: "invalid client request", payload_exposed: false };
+    }
+    let socket = TCP.connect_ipv4(config.host, port, config.connect_timeout_ms);
+    if not socket.ok { return map{ ok: false, error: socket.error, payload_exposed: false }; }
+    let written = TCP.write_text(socket, frame, config.write_timeout_ms);
+    if not written.ok {
+        TCP.close(socket);
+        return map{ ok: false, error: written.error, socket_closed: socket.closed,
+            payload_exposed: false };
+    }
+    let response = TCP.read_until(socket, "\n", MAX_FRAME_BYTES,
+        config.read_timeout_ms);
+    TCP.close(socket);
+    if not response.ok {
+        return map{ ok: false, error: response.error, socket_closed: socket.closed,
+            payload_exposed: false };
+    }
+    let envelope = try json_parse(str_trim(response.text)) catch nil;
+    if type(envelope) != "map" or (try envelope.format catch "") != RESPONSE_FORMAT
+    or type(try envelope.result catch nil) != "map" {
+        return map{ ok: false, error: "invalid response envelope",
+            socket_closed: socket.closed, payload_exposed: false };
+    }
+    let result = envelope.result;
+    return map{ ok: try result.ok catch false,
+        request_id: try result.request_id catch nil,
+        accepted: try result.accepted catch false,
+        received_bytes: try result.received_bytes catch 0,
+        socket_closed: socket.closed, payload_exposed: false,
+        error: try result.error catch nil };
+}
+
+// A controlled portable client is used only by the local self-test because VM
+// workers intentionally do not inherit the parent's FFI capability. The native
+// listener still owns all deadlines and the worker receives no native handle.
+fn _portable_self_test_client(port) {
+    let socket = try Net.connect("127.0.0.1:" + str(port)) catch nil;
+    if socket == nil {
+        return map{ ok: false, error: "portable client connect failed",
+            socket_closed: true, payload_exposed: false };
+    }
+    let frame = make_request("self-test-1", "hello");
+    let sent = try map{ ok: true, value: Net.write(socket, frame) }
+        catch map{ ok: false, value: nil };
+    if sent.ok {
+        let incoming = try map{ ok: true,
+            text: Net.read_until(socket, "\n", MAX_FRAME_BYTES) }
+            catch map{ ok: false, text: "" };
+        try Net.close(socket) catch nil;
+        if not incoming.ok {
+            return map{ ok: false, error: "portable client read failed",
+                socket_closed: true, payload_exposed: false };
+        }
+        let envelope = try json_parse(str_trim(incoming.text)) catch nil;
+        if type(envelope) != "map" or (try envelope.format catch "") != RESPONSE_FORMAT
+        or type(try envelope.result catch nil) != "map" {
+            return map{ ok: false, error: "portable client response was invalid",
+                socket_closed: true, payload_exposed: false };
+        }
+        return map{ ok: try envelope.result.ok catch false,
+            request_id: try envelope.result.request_id catch nil,
+            accepted: try envelope.result.accepted catch false,
+            received_bytes: try envelope.result.received_bytes catch 0,
+            socket_closed: true, payload_exposed: false,
+            error: try envelope.result.error catch nil };
+    } else {
+        try Net.close(socket) catch nil;
+        return map{ ok: false, error: "portable client write failed",
+            socket_closed: true, payload_exposed: false };
+    }
+}
+
+fn live_self_test() {
+    if not capabilities().live_supported {
+        return map{ ok: false, executed: false, unsupported: true,
+            loopback_only: true, payload_exposed: false };
+    }
+    let listener = open_listener();
+    if not listener.ok {
+        return map{ ok: false, executed: true, error: listener.error,
+            loopback_only: true, payload_exposed: false };
+    }
+    let completed = channel();
+    let port = listener.port;
+    let worker = spawn(fn() {
+        send(completed.sender, _portable_self_test_client(port));
+    });
+    let server = serve_once(listener);
+    let client = recv_timeout(completed.receiver, 2000);
+    join(worker);
+    return map{ ok: server.ok and client != nil and client.ok,
+        executed: true, server: server, client: client,
+        loopback_only: true, payload_exposed: false };
+}
+
+fn source_sha256() { return SOURCE_SHA256; }
+
+export REQUEST_FORMAT, RESPONSE_FORMAT, MAX_FRAME_BYTES, MAX_MESSAGE_BYTES,
+       options, capabilities, make_request, handle_frame, open_listener,
+       serve_once, client_exchange, live_self_test, source_sha256;
