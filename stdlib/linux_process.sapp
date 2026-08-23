@@ -65,7 +65,9 @@ fn _cleanup(state) {
     if state == nil or not is_map(state) or (try state.cleaned catch true) { return false; }
     let names = ["argv-exec", "supervisor", "group-probe", "group-term", "group-kill", "group-cont",
         "session-launcher", "launcher-pid", "launcher-pid.pending",
-        "pid", "pid.pending", "status", "status.pending", "stdout", "stderr", "stdin", "input.fifo"];
+        "pid", "pid.pending", "status", "status.pending", "limits", "limits.pending",
+        "ready", "ready.pending", "startup-release",
+        "stdout", "stderr", "stdin", "input.fifo"];
     for i len(names) { try DIRFS.remove(state.fs, names[i]) catch nil; }
     DIRFS.close(state.fs);
     if (try state.pidfd catch nil) != nil {
@@ -114,6 +116,68 @@ fn _read_output(state, name, budget) {
     return map{ bytes: loaded.bytes, text: if text == nil { "" } else { text },
         returned_bytes: len(loaded.bytes), truncated: loaded.truncated,
         utf8: text != nil, source_size: loaded.source_size };
+}
+
+fn _u64le(bytes, offset) {
+    let value = 0; let scale = 1; let i = 0;
+    while i < 8 {
+        value = value + bytes[offset + i] * scale;
+        scale = scale * 256; i = i + 1;
+    }
+    return value;
+}
+
+fn _limit_record(requested, effective) {
+    return map{ requested: requested, effective_soft: effective,
+        effective_hard: effective,
+        clamped_by_inheritance: effective < requested,
+        verified: true, enforced: true, omitted: false };
+}
+
+fn _unverified_limit_record(requested, omitted = false) {
+    return map{ requested: requested, effective_soft: nil, effective_hard: nil,
+        clamped_by_inheritance: false, verified: false,
+        enforced: false, omitted: omitted };
+}
+
+fn _unverified_limits(state) {
+    let memory = try state.max_memory_bytes catch nil;
+    return map{ ok: false, format: "pblang.linux-process.resource-limits.v1",
+        file_size: _unverified_limit_record(state.max_file_bytes),
+        address_space: _unverified_limit_record(memory, memory == nil),
+        cpu_time: _unverified_limit_record(state.max_cpu_seconds),
+        processes: _unverified_limit_record(state.max_processes),
+        open_files: _unverified_limit_record(state.max_open_files) };
+}
+
+fn _read_limit_evidence(state) {
+    let raw = DIRFS.read_bytes(state.fs, "limits", 40);
+    if not raw.ok or len(raw.bytes) != 40 {
+        return _error("verified resource-limit evidence cannot be read");
+    }
+    let file_size = _u64le(raw.bytes, 0);
+    let address_space = _u64le(raw.bytes, 8);
+    let cpu_time = _u64le(raw.bytes, 16);
+    let processes = _u64le(raw.bytes, 24);
+    let open_files = _u64le(raw.bytes, 32);
+    let memory_request = try state.max_memory_bytes catch nil;
+    if file_size > state.max_file_bytes or cpu_time > state.max_cpu_seconds
+       or processes > state.max_processes or open_files > state.max_open_files
+       or (memory_request == nil and address_space != 0)
+       or (memory_request != nil and address_space > memory_request) {
+        return _error("resource-limit evidence exceeds the requested boundary");
+    }
+    let memory = if memory_request == nil {
+        map{ requested: nil, effective_soft: nil, effective_hard: nil,
+            clamped_by_inheritance: false, verified: true,
+            enforced: false, omitted: true }
+    } else { _limit_record(memory_request, address_space) };
+    return map{ ok: true, format: "pblang.linux-process.resource-limits.v1",
+        file_size: _limit_record(state.max_file_bytes, file_size),
+        address_space: memory,
+        cpu_time: _limit_record(state.max_cpu_seconds, cpu_time),
+        processes: _limit_record(state.max_processes, processes),
+        open_files: _limit_record(state.max_open_files, open_files) };
 }
 
 fn _group_liveness(state) {
@@ -358,7 +422,9 @@ fn start_deferred(program, args, options) {
     }
     let supervisor_options = map{
         fifo: base.path + "/input.fifo", pid_file: base.path + "/pid",
-        status_file: base.path + "/status", output: base.path + "/stdout",
+        status_file: base.path + "/status", limits_file: base.path + "/limits",
+        ready_file: base.path + "/ready",
+        output: base.path + "/stdout",
         stderr_output: base.path + "/stderr", argv_exec: base.path + "/argv-exec",
         max_seconds: seconds, max_output_bytes: output_limit, max_file_bytes: file_limit
     };
@@ -373,6 +439,20 @@ fn start_deferred(program, args, options) {
             DIRFS.close_child_descriptor(held_parent, executable_handoff);
         }
         _cleanup(state); return supervisor_file;
+    }
+    let release = try NATIVE.build_writer(base.path + "/input.fifo", "R") catch nil;
+    if type(release) != "array" {
+        if executable_handoff != nil {
+            DIRFS.close_child_descriptor(held_parent, executable_handoff);
+        }
+        _cleanup(state); return _error("startup release writer could not be generated");
+    }
+    let release_file = _write_executable(fs, "startup-release", release);
+    if not release_file.ok {
+        if executable_handoff != nil {
+            DIRFS.close_child_descriptor(held_parent, executable_handoff);
+        }
+        _cleanup(state); return release_file;
     }
     let session_launcher = try NATIVE.build_session_launcher(
         base.path + "/supervisor", base.path + "/launcher-pid") catch nil;
@@ -399,6 +479,7 @@ fn start_deferred(program, args, options) {
 
     state.active = true; state.startup_pending = true;
     state.startup_ready = false; state.startup_failed = false;
+    state.startup_released = false;
     state.startup_deadline_ms = now_ms() + startup_ms;
     state.deadline_ms = state.started_ms + seconds * 1000 + 2000;
     if held_executable != nil {
@@ -435,20 +516,62 @@ fn _advance_startup(state) {
             pending: false, failed: try state.startup_failed catch false,
             error: try state.startup_error catch nil };
     }
-    if not _contains_entry(state.fs, "pid") {
+    if try state.cancel_requested catch false {
+        return map{ ok: true, ready: false, pending: true, failed: false };
+    }
+    if not (try state.startup_released catch false) and
+       not _contains_entry(state.fs, "pid") {
+        let liveness = _group_liveness(state);
+        if liveness.absent {
+            return _startup_failure(state,
+                "process supervisor exited before publishing verified readiness");
+        }
         if now_ms() >= state.startup_deadline_ms {
             return _startup_failure(state, "process supervisor readiness timed out");
         }
         return map{ ok: true, ready: false, pending: true, failed: false };
     }
     let fs = state.fs;
-    let pid = DIRFS.read_bytes(fs, "pid", 16);
-    let pid_text = if pid.ok { try str_trim(bytes_to_str(pid.bytes)) catch "" } else { "" };
-    let pgid = try parse_number(pid_text) catch 0;
-    if len(pid_text) != 10 or pgid <= 1 or pgid > NATIVE.MAX_PROCESS_GROUP_ID or
-       pgid != state.process_group_id {
+    if not (try state.startup_released catch false) {
+        let pid = DIRFS.read_bytes(fs, "pid", 16);
+        let pid_text = if pid.ok { try str_trim(bytes_to_str(pid.bytes)) catch "" } else { "" };
+        let pgid = try parse_number(pid_text) catch 0;
+        if len(pid_text) != 10 or pgid <= 1 or pgid > NATIVE.MAX_PROCESS_GROUP_ID or
+           pgid != state.process_group_id {
+            return _startup_failure(state,
+                "process supervisor published a mismatched process group");
+        }
+        let limits = _read_limit_evidence(state);
+        if not limits.ok {
+            return _startup_failure(state, limits.error);
+        }
+        state.resource_limits = limits;
+        let base = DIRFS.descriptor_path(fs);
+        let released = if base.ok { _run(base.path + "/startup-release", []) }
+            else { base };
+        if not released.ok {
+            return _startup_failure(state,
+                "process supervisor could not be released after limit verification");
+        }
+        state.startup_released = true;
+        return map{ ok: true, ready: false, pending: true, failed: false };
+    }
+    if not _contains_entry(fs, "ready") {
+        let liveness = _group_liveness(state);
+        if liveness.absent {
+            return _startup_failure(state,
+                "process supervisor exited before publishing post-fork readiness");
+        }
+        if now_ms() >= state.startup_deadline_ms {
+            return _startup_failure(state,
+                "process supervisor post-fork readiness timed out");
+        }
+        return map{ ok: true, ready: false, pending: true, failed: false };
+    }
+    let ready = DIRFS.read_bytes(fs, "ready", 2);
+    if not ready.ok or len(ready.bytes) != 1 or ready.bytes[0] != 82 {
         return _startup_failure(state,
-            "process supervisor published a mismatched process group");
+            "process supervisor published invalid post-fork readiness");
     }
     state.startup_pending = false; state.startup_ready = true;
     return map{ ok: true, ready: true, pending: false, failed: false };
@@ -611,6 +734,7 @@ fn cancel(state, grace_ms = 500) {
 fn _cancelled_finish_result(state) {
     let signal = try state.cancel_signal catch 15;
     let elapsed = now_ms() - state.started_ms;
+    let limits = try state.resource_limits catch _unverified_limits(state);
     let result = map{ ok: true, completed: true, command_ok: false,
         exit_code: 128 + signal, signal: signal, signaled: true,
         core_dumped: false, timed_out: false, cancelled: true,
@@ -620,13 +744,15 @@ fn _cancelled_finish_result(state) {
         max_output_bytes: state.max_output_bytes, elapsed_ms: elapsed,
         max_file_bytes: state.max_file_bytes,
         max_memory_bytes: try state.max_memory_bytes catch nil,
-        memory_limit_enforced: (try state.max_memory_bytes catch nil) != nil,
+        resource_limits: limits,
+        memory_limit_enforced: limits.address_space.enforced,
         max_cpu_seconds: state.max_cpu_seconds,
         cpu_limit_explicit: state.cpu_limit_explicit,
         max_open_files: state.max_open_files,
         max_processes: state.max_processes,
-        cpu_limit_enforced: true, open_file_limit_enforced: true,
-        process_limit_enforced: true,
+        cpu_limit_enforced: limits.cpu_time.enforced,
+        open_file_limit_enforced: limits.open_files.enforced,
+        process_limit_enforced: limits.processes.enforced,
         process_group_id: state.process_group_id, process_group_terminated: true,
         shell_used: false, argv_encoded: true, private_process_group: true,
         fixed_candidate: try state.fixed_candidate catch nil,
@@ -643,6 +769,13 @@ fn _cancelled_finish_result(state) {
 fn finish(state, wait_ms = nil) {
     if state == nil or not is_map(state) or (try state.cleaned catch true) {
         return _error("process state is closed");
+    }
+    if (try state.startup_pending catch false) and
+       not (try state.cancel_requested catch false) {
+        let startup_waiter = channel(); let startup = poll(state);
+        while startup.ok and (try startup.startup_pending catch false) {
+            _sleep(startup_waiter, 5); startup = poll(state);
+        }
     }
     if try state.startup_failed catch false {
         let message = try state.startup_error catch "process supervisor startup failed";
@@ -717,13 +850,15 @@ fn finish(state, wait_ms = nil) {
         max_output_bytes: state.max_output_bytes, elapsed_ms: elapsed,
         max_file_bytes: state.max_file_bytes,
         max_memory_bytes: try state.max_memory_bytes catch nil,
-        memory_limit_enforced: (try state.max_memory_bytes catch nil) != nil,
+        resource_limits: state.resource_limits,
+        memory_limit_enforced: state.resource_limits.address_space.enforced,
         max_cpu_seconds: state.max_cpu_seconds,
         cpu_limit_explicit: state.cpu_limit_explicit,
         max_open_files: state.max_open_files,
         max_processes: state.max_processes,
-        cpu_limit_enforced: true, open_file_limit_enforced: true,
-        process_limit_enforced: true,
+        cpu_limit_enforced: state.resource_limits.cpu_time.enforced,
+        open_file_limit_enforced: state.resource_limits.open_files.enforced,
+        process_limit_enforced: state.resource_limits.processes.enforced,
         process_group_id: state.process_group_id, process_group_terminated: true,
         supervisor_forced_group_teardown: true,
         background_descendant_output_may_be_truncated: true,
