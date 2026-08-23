@@ -19,6 +19,32 @@
 // dedicated high-level gpiod adapter before this module can use it.
 
 let BASE = "/sys/class/gpio";
+let MAX_PIN = 1000000;
+let MAX_PLAN_CYCLES = 2048;
+let MAX_DURATION_MS = 60000;
+let MAX_SAFE_INTEGER = 9007199254740991;
+
+fn _finite(value, minimum, maximum, label) {
+    if type(value) != "number" {
+        throw "gpio: " + label + " must be in " + str(minimum) + ".." + str(maximum);
+    }
+    let normalized = value + 0;
+    if normalized != value or value < minimum or value > maximum {
+        throw "gpio: " + label + " must be in " + str(minimum) + ".." + str(maximum);
+    }
+    return value;
+}
+
+fn _whole(value, minimum, maximum, label) {
+    let checked = _finite(value, minimum, maximum, label);
+    if checked != num_floor(checked) { throw "gpio: " + label + " must be a whole number"; }
+    return checked;
+}
+
+fn _binary(value, label) {
+    if value != 0 and value != 1 { throw "gpio: " + label + " must be 0 or 1"; }
+    return value;
+}
 
 // new(backend) -> handle. backend: { read: fn(path)->text, write: fn(path, text) }.
 fn new(backend) { return map{ be: backend }; }
@@ -32,9 +58,7 @@ fn sysfs_backend() {
 }
 
 fn _check_pin(pin) {
-    if type(pin) != "number" or pin < 0 or pin != num_floor(pin) {
-        throw "gpio: pin must be a non-negative whole number, got " + str(pin);
-    }
+    _whole(pin, 0, MAX_PIN, "pin");
     return nil;
 }
 
@@ -88,11 +112,13 @@ fn read_pin(g, pin) {
 // that any executor (loop + sleep, watcher, wokwi-style simulator) can replay.
 fn blink_plan(pin, times, ms) {
     _check_pin(pin);
+    let bounded_times = _whole(times, 0, MAX_PLAN_CYCLES, "blink times");
+    let bounded_ms = _finite(ms, 0.001, MAX_DURATION_MS, "blink duration_ms");
     let out = [];
     let i = 0;
-    while i < times {
-        push(out, map{ pin: pin, value: 1, ms: ms });
-        push(out, map{ pin: pin, value: 0, ms: ms });
+    while i < bounded_times {
+        push(out, map{ pin: pin, value: 1, ms: bounded_ms });
+        push(out, map{ pin: pin, value: 0, ms: bounded_ms });
         i = i + 1;
     }
     return out;
@@ -104,14 +130,14 @@ fn blink_plan(pin, times, ms) {
 // sysfs interface (different files, same backend pattern).
 fn pwm_plan(pin, duty_pct, period_ms, cycles) {
     _check_pin(pin);
-    if duty_pct < 0 or duty_pct > 100 {
-        throw "gpio: duty_pct must be 0..100, got " + str(duty_pct);
-    }
-    let on_ms = period_ms * duty_pct / 100;
-    let off_ms = period_ms - on_ms;
+    let duty = _finite(duty_pct, 0, 100, "duty_pct");
+    let period = _finite(period_ms, 0.001, MAX_DURATION_MS, "PWM period_ms");
+    let bounded_cycles = _whole(cycles, 0, MAX_PLAN_CYCLES, "PWM cycles");
+    let on_ms = period * duty / 100;
+    let off_ms = period - on_ms;
     let out = [];
     let i = 0;
-    while i < cycles {
+    while i < bounded_cycles {
         push(out, map{ pin: pin, value: 1, ms: on_ms });
         push(out, map{ pin: pin, value: 0, ms: off_ms });
         i = i + 1;
@@ -124,23 +150,35 @@ fn pwm_plan(pin, duty_pct, period_ms, cycles) {
 // flips; shorter flickers (contact bounce) are ignored. Pure: step returns a
 // NEW state, so it composes with any polling loop or event source.
 fn debounce_new(initial, stable_ms) {
-    return map{ value: initial, candidate: initial, since_ms: 0, stable_ms: stable_ms };
+    let level = _binary(initial, "initial level");
+    let window = _finite(stable_ms, 0.001, MAX_DURATION_MS, "debounce stable_ms");
+    return map{ value: level, candidate: level, since_ms: 0,
+        stable_ms: window, last_ms: 0 };
 }
 
 fn debounce_step(state, raw, now_ms) {
+    if type(state) != "map" { throw "gpio: debounce state must be a map"; }
+    let level = _binary(raw, "raw level");
+    let now = _finite(now_ms, 0, MAX_SAFE_INTEGER, "debounce now_ms");
+    let last = try state.last_ms catch 0;
+    if now < last { throw "gpio: debounce time must be monotonic"; }
+    _binary(try state.value catch nil, "debounced level");
+    _binary(try state.candidate catch nil, "candidate level");
+    _finite(try state.stable_ms catch nil, 0.001, MAX_DURATION_MS, "debounce stable_ms");
     let value = state.value;
     let candidate = state.candidate;
     let since = state.since_ms;
-    if raw == value {
-        candidate = raw;
-        since = now_ms;
-    } else if raw != candidate {
-        candidate = raw;
-        since = now_ms;
-    } else if now_ms - since >= state.stable_ms {
-        value = raw;
+    if level == value {
+        candidate = level;
+        since = now;
+    } else if level != candidate {
+        candidate = level;
+        since = now;
+    } else if now - since >= state.stable_ms {
+        value = level;
     }
-    return map{ value: value, candidate: candidate, since_ms: since, stable_ms: state.stable_ms };
+    return map{ value: value, candidate: candidate, since_ms: since,
+        stable_ms: state.stable_ms, last_ms: now };
 }
 
 // servo_plan(pin, angle_deg, cycles) — standard hobby-servo schedule: 50Hz
@@ -148,13 +186,12 @@ fn debounce_step(state, raw, now_ms) {
 // sysfs is jittery — fine for rough positioning, not for precision.
 fn servo_plan(pin, angle_deg, cycles) {
     _check_pin(pin);
-    if angle_deg < 0 or angle_deg > 180 {
-        throw "gpio: angle must be 0..180, got " + str(angle_deg);
-    }
-    let pulse = 1.0 + angle_deg / 180.0;
+    let angle = _finite(angle_deg, 0, 180, "servo angle");
+    let bounded_cycles = _whole(cycles, 0, MAX_PLAN_CYCLES, "servo cycles");
+    let pulse = 1.0 + angle / 180.0;
     let out = [];
     let i = 0;
-    while i < cycles {
+    while i < bounded_cycles {
         push(out, map{ pin: pin, value: 1, ms: pulse });
         push(out, map{ pin: pin, value: 0, ms: 20.0 - pulse });
         i = i + 1;

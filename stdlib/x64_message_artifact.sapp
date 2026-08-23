@@ -1,0 +1,176 @@
+// Bounded PBLang-native Linux ELF and Windows PE32+ message artifacts.
+
+let X64 = import("stdlib:codegen_x64.sapp");
+let PE = import("stdlib:windows_pe.sapp");
+
+let FORMAT = "pblang.x64-message-artifact.v1";
+let MAX_MESSAGE_BYTES = 4096;
+let PE_IMAGE_BASE = 5368709120;
+let WINDOWS_CODE_CAPACITY = 256;
+
+fn _app(destination, source) {
+    let i = 0;
+    while i < len(source) {
+        array_push(destination, source[i]);
+        i = i + 1;
+    }
+    return destination;
+}
+
+fn _message(value) {
+    if type(value) != "string" { return map{ ok: false, error: "message must be text" }; }
+    let bytes = str_to_bytes(value);
+    if len(bytes) < 1 or len(bytes) > MAX_MESSAGE_BYTES {
+        return map{ ok: false, error: "message must contain 1..4096 UTF-8 bytes" };
+    }
+    let i = 0;
+    while i < len(bytes) {
+        let byte = bytes[i];
+        if byte == 0 or (byte < 32 and byte != 9 and byte != 10 and byte != 13) or byte == 127 {
+            return map{ ok: false, error: "message contains a disallowed control byte" };
+        }
+        i = i + 1;
+    }
+    return map{ ok: true, bytes: bytes };
+}
+
+fn _valid_calls(calls) {
+    if type(calls) != "array" or len(calls) < 1 or len(calls) > 16 { return false; }
+    let i = 0;
+    while i < len(calls) {
+        if type(calls[i]) != "string" or len(calls[i]) < 1 or len(calls[i]) > 64 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _finding(findings, id, message) {
+    array_push(findings, map{ id: id, message: message });
+}
+
+// review_abi checks normalized source behavior without parsing or retaining source text.
+fn review_abi(spec) {
+    if type(spec) != "map" { return map{ ok: false, format: FORMAT, error: "ABI specification must be a map" }; }
+    let platform = try spec.platform catch "";
+    let calls = try spec.calls catch [];
+    let arg1 = try spec.argument_1_register catch "";
+    let shadow = try spec.shadow_space_bytes catch 0;
+    let aligned = try spec.stack_aligned catch false;
+    let direct_syscalls = try spec.direct_syscalls catch false;
+    let external_calls = try spec.external_calls catch false;
+    if not _valid_calls(calls) {
+        return map{ ok: false, format: FORMAT, error: "calls must contain 1..16 bounded names" };
+    }
+    if type(arg1) != "string" or type(shadow) != "number" or shadow != num_floor(shadow)
+        or shadow < 0 or shadow > 4096 or type(aligned) != "bool"
+        or type(direct_syscalls) != "bool" or type(external_calls) != "bool" {
+        return map{ ok: false, format: FORMAT, error: "invalid ABI specification fields" };
+    }
+    let findings = [];
+    if platform == "linux-x86_64-syscall" {
+        if arg1 != "rdi" { _finding(findings, "linux-arg1", "Linux x86-64 syscall argument 1 must use rdi"); }
+        if not direct_syscalls { _finding(findings, "linux-syscall", "Linux raw-syscall mode requires explicit syscall instructions"); }
+        if external_calls { _finding(findings, "linux-external", "Raw-syscall mode must not claim external C-library calls"); }
+    }
+    elif platform == "windows-x86_64" {
+        if arg1 != "rcx" { _finding(findings, "windows-arg1", "Windows x64 argument 1 must use rcx"); }
+        if shadow < 32 { _finding(findings, "windows-shadow", "Windows x64 calls require at least 32 bytes of shadow space"); }
+        if not aligned { _finding(findings, "windows-alignment", "Windows x64 stack alignment must be established before calls"); }
+        if direct_syscalls { _finding(findings, "windows-syscall", "This portable Windows contract uses declared PE imports, not direct syscalls"); }
+        if not external_calls { _finding(findings, "windows-imports", "Windows message output requires declared imported functions"); }
+    }
+    else {
+        return map{ ok: false, format: FORMAT, error: "unsupported x86-64 ABI profile" };
+    }
+    return map{
+        ok: true, format: FORMAT, platform: platform, compatible: len(findings) == 0,
+        findings: findings, finding_count: len(findings), calls: len(calls),
+        source_text_retained: false
+    };
+}
+
+fn inspect_linux_x64(bytes) {
+    let ok = type(bytes) == "array" and len(bytes) >= 120
+        and bytes[0] == 0x7F and bytes[1] == 0x45 and bytes[2] == 0x4C and bytes[3] == 0x46
+        and bytes[4] == 2 and bytes[5] == 1
+        and bytes[16] == 2 and bytes[17] == 0
+        and bytes[18] == 0x3E and bytes[19] == 0
+        and bytes[68] == 5 and bytes[69] == 0 and bytes[70] == 0 and bytes[71] == 0;
+    return map{
+        ok: ok, format: if ok { "elf64" } else { "unknown" },
+        machine: if ok { "x86_64" } else { "unknown" },
+        little_endian: ok, static_exec: ok, segment_rx: ok, writable_code: false
+    };
+}
+
+fn linux_artifact(message) {
+    let checked = _message(message);
+    if not checked.ok { return map{ ok: false, format: FORMAT, error: checked.error }; }
+    let bytes = X64.build_print_exit(message);
+    let inspection = inspect_linux_x64(bytes);
+    return map{
+        ok: inspection.ok, format: FORMAT, platform: "linux", artifact_format: "elf64",
+        bytes: bytes, artifact_bytes: len(bytes), message_bytes: len(checked.bytes),
+        inspection: inspection, external_compiler: false, external_linker: false,
+        libc_required: false, executable_mapping: "rx", live_verified: false
+    };
+}
+
+fn _iat_call(code, layout, symbol) {
+    _app(code, PE.call_iat_x64(layout, "KERNEL32.dll", symbol, len(code)));
+}
+
+fn windows_artifact(message) {
+    let checked = _message(message);
+    if not checked.ok { return map{ ok: false, format: FORMAT, error: checked.error }; }
+    let extra = [];
+    _app(extra, checked.bytes);
+    _app(extra, [0, 0, 0, 0]);
+    let imports = [map{
+        dll: "KERNEL32.dll", symbols: ["GetStdHandle", "WriteFile", "ExitProcess"]
+    }];
+    let layout = PE.layout_x64(imports, len(extra), WINDOWS_CODE_CAPACITY);
+    let message_address = PE_IMAGE_BASE + layout.extra_rva;
+    let written_address = message_address + len(checked.bytes);
+    let code = [];
+    _app(code, [0x48, 0x83, 0xEC, 0x28]);                  // sub rsp, 40
+    _app(code, [0xB9]); _app(code, X64.le32(-11));         // ecx = STD_OUTPUT_HANDLE
+    _iat_call(code, layout, "GetStdHandle");
+    _app(code, [0x48, 0x89, 0xC1]);                        // rcx = returned handle
+    _app(code, X64.movabs_imm64("rdx", message_address));
+    _app(code, [0x41, 0xB8]); _app(code, X64.le32(len(checked.bytes)));
+    _app(code, [0x49, 0xB9]); _app(code, X64.le64(written_address));
+    _app(code, [0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // lpOverlapped = NULL
+    _iat_call(code, layout, "WriteFile");
+    _app(code, [0x31, 0xC9]);                              // ecx = exit code 0
+    _iat_call(code, layout, "ExitProcess");
+    _app(code, [0x48, 0x83, 0xC4, 0x28, 0xC3]);           // defensive return path
+    if len(code) > WINDOWS_CODE_CAPACITY {
+        return map{ ok: false, format: FORMAT, error: "Windows payload exceeded its declared capacity" };
+    }
+    let bytes = PE.assemble_x64(code, layout, extra);
+    let inspection = PE.inspect_x64(bytes);
+    return map{
+        ok: inspection.ok, format: FORMAT, platform: "windows", artifact_format: "pe32+",
+        bytes: bytes, artifact_bytes: len(bytes), code_bytes: len(code),
+        message_bytes: len(checked.bytes), inspection: inspection,
+        imports: ["KERNEL32.dll!GetStdHandle", "KERNEL32.dll!WriteFile", "KERNEL32.dll!ExitProcess"],
+        shadow_space_bytes: 32, stack_allocation_bytes: 40, stack_aligned: true,
+        wx_split: inspection.wx_split, nx_compatible: inspection.nx_compatible,
+        aslr_enabled: false, external_compiler: false, external_linker: false,
+        c_runtime_required: false, live_verified: false
+    };
+}
+
+fn build_pair(message) {
+    let linux = linux_artifact(message);
+    if not linux.ok { return map{ ok: false, format: FORMAT, error: linux.error }; }
+    let windows = windows_artifact(message);
+    if not windows.ok { return map{ ok: false, format: FORMAT, error: windows.error }; }
+    return map{ ok: true, format: FORMAT, linux: linux, windows: windows };
+}
+
+export FORMAT, MAX_MESSAGE_BYTES, review_abi, inspect_linux_x64;
+export linux_artifact, windows_artifact, build_pair;
