@@ -23,7 +23,8 @@ if not result.ok { print result.diagnostics[0].code + ": " + result.error; }
 
 `parse_safe`, `stringify_safe`, and `convert_safe` return
 `pblang.serialization.result.v1` maps with `ok`, `format`, `value`, `error`,
-and `diagnostics`. Caller limits are capped at hard ceilings (16 MiB input,
+and `diagnostics`. Non-finite, non-positive, and non-numeric limits fall back to safe
+defaults; valid caller limits are capped at hard ceilings (16 MiB input,
 32 MiB output, one million lines/items, 1 MiB per line/scalar, depth 256), so
 an accidental option cannot create an unbounded operation.
 
@@ -36,14 +37,20 @@ trust boundaries.
 
 | Format | Supported safe behavior |
 |---|---|
-| JSON | Strict builtin parse/stringify plus pre-parse depth/item/size guards |
+| JSON | Strict builtin parse/stringify plus byte-oriented pre-parse grammar, depth/item/size, and decoded duplicate-key guards |
 | TOML | Tables/dotted table names with plain keys, quoted strings, numbers, booleans, and flat scalar arrays |
 | YAML | Indented maps/sequences with plain keys, quoted/plain scalars, booleans/null/numbers, and flat flow arrays |
 | CSV | Quote-aware `csv.sapp` map parsing/stringifying under facade limits |
 | XML | Entity escape/unescape and text passthrough only; no DOM, DTD, entity expansion, or schema claim |
 | text | Bounded passthrough/string conversion |
 
-The strict TOML/YAML paths reject duplicate keys, malformed syntax, ambiguous
+The strict JSON/TOML/YAML paths reject duplicate keys and malformed syntax. JSON
+keys are compared after escape decoding, so literal and `\\u` spellings of the same
+key collide inside one object while separate nested objects keep independent scopes.
+Strict duplicate scanning is capped at 1 MiB even when a caller raises the general
+input ceiling; larger trusted JSON can opt into legacy last-key-wins parsing only with
+explicit `reject_duplicate_keys: false`, and the result then reports
+`duplicate_keys_checked: false`. TOML/YAML additionally reject ambiguous
 indentation, and constructs the native subset does not implement. In
 particular, TOML arrays of tables and inline tables, and YAML anchors, aliases,
 tags, merge keys, block scalars, flow maps, and multi-document markers are not

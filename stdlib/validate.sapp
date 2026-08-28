@@ -510,7 +510,271 @@ fn is_int(n) {
 // in_range(n, lo, hi) — inclusive range check
 fn in_range(n, lo, hi) { return n >= lo and n <= hi; }
 
+// ── Bounded JSON-like value inspection ──────────────────────────────────────
+//
+// These helpers are deliberately separate from schema()/check(). They validate
+// already-materialized values before a caller hashes or serializes them, return only
+// fixed content-free reason codes, and never invoke callbacks or echo input.
+let BOUNDED_VALUE_VERSION = "pblang.validate.bounded-value.v1";
+let _BOUND_DEFAULT = map{
+    max_depth: 32, max_nodes: 32768, max_map_entries: 256,
+    max_array_items: 2048, max_string_chars: 65536,
+    max_string_bytes: 262144, max_total_string_bytes: 1048576,
+    max_key_chars: 128, max_key_bytes: 512
+};
+let _BOUND_KEYS = ["max_depth", "max_nodes", "max_map_entries",
+    "max_array_items", "max_string_chars", "max_string_bytes",
+    "max_total_string_bytes", "max_key_chars", "max_key_bytes"];
+
+fn _bounded_hard_max(name) {
+    if name == "max_depth" { return 64; }
+    if name == "max_nodes" { return 65536; }
+    if name == "max_map_entries" { return 1024; }
+    if name == "max_array_items" { return 4096; }
+    if name == "max_string_chars" { return 262144; }
+    if name == "max_string_bytes" { return 1048576; }
+    if name == "max_total_string_bytes" { return 2097152; }
+    if name == "max_key_chars" { return 256; }
+    if name == "max_key_bytes" { return 1024; }
+    return -1;
+}
+
+fn _bounded_base(format) {
+    return map{ format: format, version: BOUNDED_VALUE_VERSION, ok: false,
+        safe_for_public_logging: false, input_returned: false,
+        content_hashed: false, canonicalized: false, authorizes_effects: false };
+}
+
+fn _bounded_fail(format, reason) {
+    let out = _bounded_base(format);
+    out.reason = reason;
+    return out;
+}
+
+fn _bounded_integer(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+
+fn _bounded_options(options = nil) {
+    let format = "pblang.validate.bounded-limits.v1";
+    if options == nil { options = map{}; }
+    if type(options) != "map" or len(options) > len(_BOUND_KEYS) {
+        return _bounded_fail(format, "invalid-options");
+    }
+    // Width is checked with len(map) before map_keys, which otherwise clones and sorts.
+    let keys = map_keys(options);
+    let i = 0;
+    while i < len(keys) {
+        let known = false;
+        let j = 0;
+        while j < len(_BOUND_KEYS) {
+            if keys[i] == _BOUND_KEYS[j] { known = true; }
+            j = j + 1;
+        }
+        if not known { return _bounded_fail(format, "invalid-options"); }
+        i = i + 1;
+    }
+    let out = _bounded_base(format);
+    out.ok = true;
+    out.reason = "valid";
+    i = 0;
+    while i < len(_BOUND_KEYS) {
+        let name = _BOUND_KEYS[i];
+        let value = _BOUND_DEFAULT[name];
+        if map_has(options, name) { value = options[name]; }
+        let minimum = 0;
+        if name == "max_nodes" { minimum = 1; }
+        if not _bounded_integer(value, minimum, _bounded_hard_max(name)) {
+            return _bounded_fail(format, "invalid-options");
+        }
+        out[name] = value;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn bounded_limits(options = nil) { return _bounded_options(options); }
+
+fn _finite_json_number(value) {
+    let same = value;
+    if type(value) != "number" or value != same { return false; }
+    return value - same == 0;
+}
+
+fn _take_node(state, limits) {
+    if state.nodes >= limits.max_nodes { return "node-limit"; }
+    state.nodes = state.nodes + 1;
+    return "";
+}
+
+fn _take_text_bytes(state, amount, limits) {
+    if amount > limits.max_total_string_bytes - state.total_string_bytes {
+        return "total-string-byte-limit";
+    }
+    state.total_string_bytes = state.total_string_bytes + amount;
+    return "";
+}
+
+fn _walk_bounded(value, depth, limits, state, root_keys = nil) {
+    if depth > limits.max_depth { return "depth-limit"; }
+    let node_reason = _take_node(state, limits);
+    if node_reason != "" { return node_reason; }
+    if value == nil { state.nils = state.nils + 1; return ""; }
+    let kind = type(value);
+    if kind == "bool" { state.bools = state.bools + 1; return ""; }
+    if kind == "number" {
+        if not _finite_json_number(value) { return "nonfinite-number"; }
+        state.numbers = state.numbers + 1;
+        return "";
+    }
+    if kind == "string" {
+        if len(value) > limits.max_string_chars { return "string-char-limit"; }
+        let byte_count = len(str_to_bytes(value));
+        if byte_count > limits.max_string_bytes { return "string-byte-limit"; }
+        let byte_reason = _take_text_bytes(state, byte_count, limits);
+        if byte_reason != "" { return byte_reason; }
+        state.strings = state.strings + 1;
+        return "";
+    }
+    if kind == "array" {
+        if len(value) > limits.max_array_items { return "array-item-limit"; }
+        state.arrays = state.arrays + 1;
+        let i = 0;
+        while i < len(value) {
+            let reason = _walk_bounded(value[i], depth + 1, limits, state);
+            if reason != "" { return reason; }
+            i = i + 1;
+        }
+        return "";
+    }
+    if kind == "map" {
+        if len(value) > limits.max_map_entries { return "map-entry-limit"; }
+        state.maps = state.maps + 1;
+        let keys = root_keys;
+        if keys == nil { keys = map_keys(value); }
+        let i = 0;
+        while i < len(keys) {
+            let key_reason = _take_node(state, limits);
+            if key_reason != "" { return key_reason; }
+            if type(keys[i]) != "string" { return "map-key-type"; }
+            if len(keys[i]) > limits.max_key_chars { return "key-char-limit"; }
+            let key_bytes = len(str_to_bytes(keys[i]));
+            if key_bytes > limits.max_key_bytes { return "key-byte-limit"; }
+            key_reason = _take_text_bytes(state, key_bytes, limits);
+            if key_reason != "" { return key_reason; }
+            state.keys = state.keys + 1;
+            let value_reason = _walk_bounded(value[keys[i]], depth + 1, limits, state);
+            if value_reason != "" { return value_reason; }
+            i = i + 1;
+        }
+        return "";
+    }
+    return "unsupported-type";
+}
+
+fn _bounded_state() {
+    return map{ nodes: 0, maps: 0, arrays: 0, keys: 0, strings: 0,
+        numbers: 0, bools: 0, nils: 0, total_string_bytes: 0 };
+}
+
+fn _bounded_success(format, state) {
+    let out = _bounded_base(format);
+    out.ok = true;
+    out.reason = "valid";
+    out.nodes = state.nodes;
+    out.maps = state.maps;
+    out.arrays = state.arrays;
+    out.keys = state.keys;
+    out.strings = state.strings;
+    out.numbers = state.numbers;
+    out.bools = state.bools;
+    out.nils = state.nils;
+    out.total_string_bytes = state.total_string_bytes;
+    return out;
+}
+
+fn inspect_bounded(value, options = nil) {
+    let format = "pblang.validate.bounded-inspection.v1";
+    let limits = _bounded_options(options);
+    if not limits.ok { return _bounded_fail(format, "invalid-options"); }
+    let state = _bounded_state();
+    let reason = _walk_bounded(value, 0, limits, state);
+    if reason != "" { return _bounded_fail(format, reason); }
+    return _bounded_success(format, state);
+}
+
+fn _schema_key(value, limits) {
+    if type(value) != "string" or value == "" or len(value) > limits.max_key_chars {
+        return false;
+    }
+    let bytes = str_to_bytes(value);
+    if len(bytes) > limits.max_key_bytes { return false; }
+    let i = 0;
+    while i < len(value) {
+        let code = strcharcodeat(value, i);
+        if code < 33 or code > 126 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn exact_map_bounded(value, allowed_keys, options = nil) {
+    let format = "pblang.validate.bounded-exact-map.v1";
+    let limits = _bounded_options(options);
+    if not limits.ok or type(allowed_keys) != "array"
+        or len(allowed_keys) > limits.max_map_entries {
+        return _bounded_fail(format, "invalid-schema-keys");
+    }
+    let allowed = map{};
+    let i = 0;
+    while i < len(allowed_keys) {
+        if not _schema_key(allowed_keys[i], limits) or map_has(allowed, allowed_keys[i]) {
+            return _bounded_fail(format, "invalid-schema-keys");
+        }
+        allowed[allowed_keys[i]] = true;
+        i = i + 1;
+    }
+    if type(value) != "map" { return _bounded_fail(format, "not-a-map"); }
+    if len(value) > limits.max_map_entries { return _bounded_fail(format, "map-entry-limit"); }
+    let value_keys = map_keys(value);
+    let state = _bounded_state();
+    let reason = _walk_bounded(value, 0, limits, state, value_keys);
+    if reason != "" { return _bounded_fail(format, reason); }
+    if len(value_keys) != len(allowed_keys) { return _bounded_fail(format, "exact-map-mismatch"); }
+    i = 0;
+    while i < len(value_keys) {
+        if not map_has(allowed, value_keys[i]) {
+            return _bounded_fail(format, "exact-map-mismatch");
+        }
+        i = i + 1;
+    }
+    let out = _bounded_success(format, state);
+    out.exact = true;
+    return out;
+}
+
+fn bounded_value_status() {
+    return map{
+        format: "pblang.validate.bounded-value-status.v1",
+        version: BOUNDED_VALUE_VERSION, ok: true,
+        implementation_language: "pblang", pure: true,
+        pre_enumeration_map_width_gate: true,
+        bounded_depth_nodes_arrays_maps_strings_and_keys: true,
+        finite_json_numbers_only: true, cycle_termination_bounded: true,
+        aliases_counted_per_occurrence: true, fixed_content_free_reasons: true,
+        post_materialization_only: true, bounds_parsing: false,
+        remote_hostile_ready: false, outer_serialized_request_cap_required: true,
+        prevents_already_materialized_input: false,
+        detects_duplicate_json_keys: false, canonicalizes_for_hashing: false,
+        content_safe: false, authorizes_effects: false,
+        safe_for_public_logging: false
+    };
+}
+
 export schema, check, check_field, apply_defaults, check_with_defaults,
        assert_valid, validate_all, explain, is_email, is_url, is_int, in_range,
        is_uuid, is_ipv4, is_ipv6, is_iso_date, is_iso_datetime, is_hostname,
-       is_port, is_hex, is_base64, is_slug, is_alnum;
+       is_port, is_hex, is_base64, is_slug, is_alnum,
+       BOUNDED_VALUE_VERSION, bounded_limits, inspect_bounded,
+       exact_map_bounded, bounded_value_status;

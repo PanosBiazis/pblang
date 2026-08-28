@@ -176,20 +176,24 @@ Do not migrate automatically:
   unsupported pairs, oversized input and oversized benchmarks fail before
   execution. Process, pipe-stage, and benchmark results distinguish caller
   acknowledgement from runtime authority and separately preserve observed
-  execution, timeout, truncation and boundedness state. `trusted_source:true`
-  is an explicit risk acknowledgement; it does not grant host capability or
+  execution, timeout, truncation and boundedness state. Every executable path
+  now also requires `unsafe_polyglot:true` plus a SHA-256 bound to the exact
+  source bytes. `trusted_source:true` remains a separate risk acknowledgement;
+  neither option grants host capability or
   prove sandbox isolation. The
   registry JSON planner uses the same size
   contract and `input_data` name as its bounded executor. Compatibility
   serializers publish canonical JSON data and never executable literals. Every
   public executor (`run_filter`, `call`, `pipe`, `benchmark_compare`, and
-  `cross_call`) requires the exact option `trusted_source: true` before it can
+  `cross_call`) requires the hash-bound unsafe acknowledgement and the exact
+  option `trusted_source: true` before it can
   reach a process. Missing, false, string, and numeric values fail before spawn.
 - `polyglot_registry.sapp` no longer uses shell availability probes, shared
   temporary source files, bare executable names, raw `proc_spawn_wait`, or
   generic in-process FFI. Public registry metadata is detached from the private
   executable database. Eight direct interpreter adapters and the executable
-  JSON bridge require an exact boolean `trusted_source: true` acknowledgement and use
+  JSON bridge require the exact hash-bound unsafe acknowledgement plus boolean
+  `trusted_source: true` and use
   fixed descriptor-held bounded processes;
   unsupported direct languages fail closed. Direct compilation requires
   explicit trusted-source and toolchain-effect acknowledgements, reuses the canonical

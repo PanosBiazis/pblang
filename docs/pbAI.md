@@ -182,6 +182,13 @@ program orchestrating these kernels.
   plus pblang-grounded skills (explain / find-bugs / improve / comment / knowledge),
   **no external model, no network**. It **backs the IDE 🤖 AI panel** via a pblang gateway
   (`editors/ide/tools/ai/gateway.sapp`). Locked by `tests/semantics/pbai_test.sapp`.
+- **Smart embedded dispatch (today)** — `stdlib/pbai_dispatch.sapp` selects the smallest
+  viable embedded/Nano/brain/retrieval/Max lane and guarantees one active interactive
+  expert with serial fallbacks. `stdlib/pbai.sapp::smart_respond` preserves the existing
+  string API while avoiding unconditional multi-model work; explicit parallelism remains
+  available for training and batch workloads. When generation/security needs independent
+  verification, the embedded response is marked pending and unauthorized for action; the
+  standalone `products/pbai` project owns the planner/verifier implementation.
 - **`stdlib/pbai_lm.sapp`** — pbAI's first **generative** model: a character-level neural
   **language model** (embedding → tanh hidden → vocab logits → softmax), trained on
   next-char prediction with **manual backprop** (the `tensor_*` kernels are forward-only),

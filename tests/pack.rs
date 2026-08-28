@@ -1,4 +1,7 @@
 use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_PROJECT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn registry_file_url(path: &std::path::Path) -> String {
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -6,7 +9,12 @@ fn registry_file_url(path: &std::path::Path) -> String {
 }
 
 fn make_temp_project() -> std::path::PathBuf {
-    let base = std::env::temp_dir().join("pblang_pack_test");
+    let sequence = TEMP_PROJECT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!(
+        "pblang_pack_test_{}_{}",
+        std::process::id(),
+        sequence
+    ));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
     let manifest = r#"[package]

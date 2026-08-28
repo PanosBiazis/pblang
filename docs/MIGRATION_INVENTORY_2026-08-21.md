@@ -341,6 +341,33 @@ and personal paths are excluded, while four SHA-256 digests preserve source
 identity. Windows structure is verified on this Linux host, but live Windows
 execution and ASLR are not claimed because the bounded PE has no relocations.
 
+`examples/machine_code_safety_lab` migrates six historical Windows batch
+recipes that attempted to execute raw machine-code bytes. The original intent
+(`return 42`, `return 100`, and `5 + 5`) is preserved through bounded shared IR
+and native PBLang artifact backends for DOS 8086 COM, Linux x86-64 ELF and
+Windows x86-64 PE. The migration identifies writable-executable memory,
+shell/reflection execution, temporary binaries, malformed hexadecimal data,
+an x86/x86-64 container mismatch, an incorrect DEBUG byte count and an `INT
+20h` exit-code mismatch. Historical recipes are inspected as data and never
+executed. Source identity uses six SHA-256 digests without retaining personal
+paths or original script text. Linux execution, the DOS bounded model and PE
+structure are covered by their existing backend gates; live Windows execution
+remains explicitly unverified.
+
+`products/pbspotit` is the first product-sized migration selected from the
+standalone SpotIt Android project. The completed slice moves its accelerometer
+decision logic into `stdlib:motion_detection.sapp` and improves it with
+caller-supplied monotonic nanoseconds, strict time ordering, bounded work,
+three-axis gravity-vector filtering, raw-sensor warmup and deterministic
+replay. The product adds monitoring/alarm state, stable local event IDs, a
+30-entry history ceiling and one responsive UI contract compiled for Web,
+native desktop and Android records. Two source SHA-256 digests retain
+provenance without storing source text, personal paths or author metadata.
+Android sensor registration, foreground execution, location, SMS,
+siren/vibration, secure settings persistence and package installation remain
+explicitly unavailable; cross-target UI compilation is not claimed as live
+platform execution.
+
 ## Candidate queue
 
 ### Small examples
@@ -367,15 +394,17 @@ execution and ASLR are not claimed because the bounded PE has no relocations.
 
 ### Product-sized candidates
 
-1. CRUD variants should become one reference product after their schemas,
+1. Continue PBSpotIt with one verified Android effect boundary at a time,
+   starting with sensor registration and lifecycle-safe foreground execution.
+2. CRUD variants should become one reference product after their schemas,
    validation rules, and workflows are compared.
-2. Additional word-detection and document utilities should extend PBOffice's
+3. Additional word-detection and document utilities should extend PBOffice's
    bounded reader and policy layers instead of carrying project-local parsers.
-3. Raspberry Pi and LED experiments should extend the existing embedded
+4. Raspberry Pi and LED experiments should extend the existing embedded
    examples and board descriptors rather than form a second hardware stack.
-4. Django, Laravel, Java, C#, and desktop-GUI projects require individual
+5. Django, Laravel, Java, C#, and desktop-GUI projects require individual
    behavioral baselines before native PBLang replacement.
-5. Large trees containing copied frameworks or generated sources require an
+6. Large trees containing copied frameworks or generated sources require an
    ownership/dependency split before application code can be selected.
 
 ## Per-slice acceptance gate

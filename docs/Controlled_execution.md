@@ -87,8 +87,11 @@ Accordingly, generic callback results report `sandbox_runner_used=true` but keep
 mode, limits, and allowlists are held in a bounded private registry behind opaque
 handles; returned descriptions are detached snapshots.
 
-The acknowledgement booleans on direct polyglot APIs record informed caller
-intent; they are not user authorization. Authority is scoped to the VM host's
+The direct polyglot APIs now require `unsafe_polyglot: true` together with an
+`unsafe_polyglot_sha256` that matches the exact foreign source bytes. This is an
+explicit, tamper-evident acknowledgement that foreign code is outside PBLang's
+memory-safety contract. It is still not user authorization. `trusted_source`
+and toolchain-effect acknowledgements remain separate, and authority is scoped to the VM host's
 capability profile. A service running mutually untrusted principals must use a
 separate least-privilege VM, or an external authenticated execution broker, for
 each principal. Results expose `authority_scope: "vm_capability"`,

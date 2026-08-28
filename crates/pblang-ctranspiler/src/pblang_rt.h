@@ -1208,8 +1208,25 @@ static PbVal pb_builtin_str_replace_all(PbVal s, PbVal from, PbVal to) {
     const char* found;
     while ((found = strstr(p, f)) != NULL) { count++; p = found + flen; }
     size_t slen = strlen(src);
-    size_t out_len = slen + count * (tlen > flen ? tlen - flen : 0) + count * (flen > tlen ? 0 : tlen) + 1;
-    char* out = (char*)malloc(slen * 4 + 64); /* generous estimate */
+    size_t out_len = 0;
+    if (tlen >= flen) {
+        size_t growth = tlen - flen;
+        if (growth != 0 && count > (SIZE_MAX - slen - 1) / growth) {
+            fputs("pblang: string replacement size overflow\n", stderr); exit(1);
+        }
+        out_len = slen + count * growth + 1;
+    } else {
+        size_t shrink = flen - tlen;
+        if (count > slen / shrink) {
+            fputs("pblang: invalid string replacement size\n", stderr); exit(1);
+        }
+        out_len = slen - count * shrink + 1;
+    }
+    if (out_len > PB_MAX_STR_ALLOC) {
+        fputs("pblang: string replacement exceeds allocation limit\n", stderr); exit(1);
+    }
+    char* out = (char*)malloc(out_len);
+    if (!out) { fputs("pblang: out of memory\n", stderr); exit(1); }
     char* op = out; p = src;
     while ((found = strstr(p, f)) != NULL) {
         size_t pre = found - p;
@@ -1217,8 +1234,12 @@ static PbVal pb_builtin_str_replace_all(PbVal s, PbVal from, PbVal to) {
         memcpy(op, t, tlen); op += tlen;
         p = found + flen;
     }
-    strcpy(op, p);
-    (void)out_len;
+    size_t tail = strlen(p);
+    memcpy(op, p, tail + 1);
+    op += tail;
+    if ((size_t)(op - out) != out_len - 1) {
+        free(out); fputs("pblang: inconsistent string replacement size\n", stderr); exit(1);
+    }
     PbVal v; v.tag = PB_TAG_STR; v.str = out; return v;
 }
 static PbVal pb_builtin_assert(PbVal cond, PbVal msg) {
@@ -1647,6 +1668,28 @@ static PbVal pb_builtin_fs_listdir(PbVal path) {
 }
 
 /* ─── Tensor kernels (a tensor is map{ shape:[...], data:[flat row-major], dtype }) ─── */
+#define PB_MAX_TENSOR_ELEMENTS ((size_t)16 * 1024 * 1024)
+
+static bool pb_tensor_dim(PbVal v, size_t* out) {
+    if (v.tag != PB_TAG_NUM || !isfinite(v.num) || v.num < 0.0 || floor(v.num) != v.num
+        || v.num > (double)SIZE_MAX) return false;
+    *out = (size_t)v.num;
+    return true;
+}
+
+static bool pb_size_mul(size_t a, size_t b, size_t* out) {
+    if (a != 0 && b > SIZE_MAX / a) return false;
+    *out = a * b;
+    return true;
+}
+
+static bool pb_numeric_array(PbVal value) {
+    if (value.tag != PB_TAG_ARR || value.arr == NULL) return false;
+    for (size_t i = 0; i < value.arr->len; i++)
+        if (value.arr->data[i].tag != PB_TAG_NUM || !isfinite(value.arr->data[i].num)) return false;
+    return true;
+}
+
 static PbVal pb_builtin_tensor_argmax(PbVal t) {
     if (t.tag != PB_TAG_MAP) return PB_NIL;
     PbVal d = pb_map_get(t, PB_STR("data"));
@@ -1662,11 +1705,20 @@ static PbVal pb_builtin_tensor_matmul(PbVal A, PbVal B) {
     PbVal sb = pb_map_get(B, PB_STR("shape")), db = pb_map_get(B, PB_STR("data"));
     if (sa.tag != PB_TAG_ARR || sb.tag != PB_TAG_ARR || da.tag != PB_TAG_ARR || db.tag != PB_TAG_ARR) return PB_NIL;
     if (sa.arr->len != 2 || sb.arr->len != 2) return PB_NIL;
-    size_t m = (size_t)sa.arr->data[0].num, k = (size_t)sa.arr->data[1].num;
-    size_t k2 = (size_t)sb.arr->data[0].num, n = (size_t)sb.arr->data[1].num;
+    size_t m = 0, k = 0, k2 = 0, n = 0;
+    if (!pb_tensor_dim(sa.arr->data[0], &m) || !pb_tensor_dim(sa.arr->data[1], &k)
+        || !pb_tensor_dim(sb.arr->data[0], &k2) || !pb_tensor_dim(sb.arr->data[1], &n)) return PB_NIL;
     if (k != k2) return PB_NIL;
-    size_t olen = m * n ? m * n : 1;
-    PbVal out = pb_arr_new(olen); out.arr->len = m * n;
+    size_t a_len = 0, b_len = 0, out_len = 0;
+    if (!pb_size_mul(m, k, &a_len) || !pb_size_mul(k, n, &b_len)
+        || !pb_size_mul(m, n, &out_len)) return PB_NIL;
+    if (a_len > PB_MAX_TENSOR_ELEMENTS || b_len > PB_MAX_TENSOR_ELEMENTS
+        || out_len > PB_MAX_TENSOR_ELEMENTS) return PB_NIL;
+    if (da.arr->len != a_len || db.arr->len != b_len
+        || !pb_numeric_array(da) || !pb_numeric_array(db)) return PB_NIL;
+    size_t olen = out_len ? out_len : 1;
+    PbVal out = pb_arr_new(olen); out.arr->len = out_len;
+    if (out.arr == NULL || out.arr->data == NULL) return PB_NIL;
     for (size_t i = 0; i < m; i++)
         for (size_t j = 0; j < n; j++) {
             double s = 0.0;

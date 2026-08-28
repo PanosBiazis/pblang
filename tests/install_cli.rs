@@ -77,11 +77,11 @@ fn make_tarball_with_entry(
 fn install_with_registry_index_resolves_registry_dep() {
     let temp = std::env::temp_dir().join("pblang_install_cli_test");
     let _ = std::fs::create_dir_all(&temp);
-    let (_tarball_path, tarball_url, _sha256) = make_tarball_and_sha256(&temp);
+    let (_tarball_path, tarball_url, sha256) = make_tarball_and_sha256(&temp);
     let index = serde_json::json!({
         "packages": {
             "@sapphire/cli-test": {
-                "1.0.0": { "url": tarball_url, "sha256": null }
+                "1.0.0": { "url": tarball_url, "sha256": sha256 }
             }
         }
     });
@@ -195,13 +195,13 @@ fn install_rejects_registry_tarball_when_hmac_sidecar_wrong() {
     let temp = std::env::temp_dir().join("pblang_install_hmac_reject");
     let _ = std::fs::remove_dir_all(&temp);
     std::fs::create_dir_all(&temp).unwrap();
-    let (tarball_path, tarball_url, _sha256) = make_tarball_and_sha256(&temp);
+    let (tarball_path, tarball_url, sha256) = make_tarball_and_sha256(&temp);
     let sidecar_path = tarball_path.with_extension("gz.sha256");
     std::fs::write(&sidecar_path, "wrong_hmac_signature_00000000").unwrap();
     let index = serde_json::json!({
         "packages": {
             "@sapphire/hmac-test": {
-                "1.0.0": { "url": tarball_url, "sha256": null }
+                "1.0.0": { "url": tarball_url, "sha256": sha256 }
             }
         }
     });
@@ -249,11 +249,11 @@ fn build_with_registry_index_generates_lockfile_for_registry_dep() {
     let temp = std::env::temp_dir().join("pblang_build_cli_registry_test");
     let _ = std::fs::remove_dir_all(&temp);
     std::fs::create_dir_all(&temp).unwrap();
-    let (_tarball_path, tarball_url, _sha256) = make_tarball_and_sha256(&temp);
+    let (_tarball_path, tarball_url, sha256) = make_tarball_and_sha256(&temp);
     let index = serde_json::json!({
         "packages": {
             "@sapphire/build-test": {
-                "1.0.0": { "url": tarball_url, "sha256": null }
+                "1.0.0": { "url": tarball_url, "sha256": sha256 }
             }
         }
     });

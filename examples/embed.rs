@@ -20,6 +20,7 @@ fn main() {
         ffi: false,
         exec: false,
         gfx: false,
+        import: false,
         spawn: false,
         env: false,
         // Embedded host: a script must not be able to call os_exit() and kill us.

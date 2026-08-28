@@ -124,6 +124,7 @@ pub extern "C" fn pblang_create_vm_sandboxed(
         ffi: allow_ffi != 0,
         exec: allow_exec != 0,
         gfx: false,
+        import: allow_fs != 0,
         spawn: true,
         // Embedders that haven't opted into env reads shouldn't leak host secrets;
         // tie it to the exec capability (the closest "host access" gate they set).

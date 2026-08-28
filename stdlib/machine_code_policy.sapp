@@ -1,0 +1,167 @@
+// Bounded policy and artifact facade for educational machine-code workflows.
+// Raw byte execution is deliberately absent: callers describe a small program
+// through validated IR and receive target artifacts plus honest verification metadata.
+
+let IR = import("stdlib:codegen_ir.sapp");
+let Target = import("stdlib:target_artifact.sapp");
+
+let FORMAT = "pblang.machine-code-policy.v1";
+let MAX_HEX_CHARS = 16384;
+let MAX_MACHINE_BYTES = 4096;
+
+fn _hex_nibble(byte) {
+    if byte >= 48 and byte <= 57 { return byte - 48; }
+    if byte >= 65 and byte <= 70 { return byte - 65 + 10; }
+    if byte >= 97 and byte <= 102 { return byte - 97 + 10; }
+    return -1;
+}
+
+fn _space(byte) { return byte == 9 or byte == 10 or byte == 13 or byte == 32; }
+
+// inspect_hex never throws. This makes it suitable for IDE diagnostics and for
+// reviewing historical input that is expected to contain mistakes.
+fn inspect_hex(text) {
+    if not is_string(text) { return map{ ok:false, error:"hex input must be text", bytes:[] }; }
+    if len(text) > MAX_HEX_CHARS {
+        return map{ ok:false, error:"hex input exceeds the bounded character limit", bytes:[] };
+    }
+    let source = str_to_bytes(text); let out = []; let pending = -1; let i = 0;
+    while i < len(source) {
+        let byte = source[i];
+        if not _space(byte) {
+            let nibble = _hex_nibble(byte);
+            if nibble < 0 {
+                return map{ ok:false, error:"non-hex character at byte " + str(i), bytes:[] };
+            }
+            if pending < 0 { pending = nibble; }
+            else {
+                if len(out) >= MAX_MACHINE_BYTES {
+                    return map{ ok:false, error:"decoded machine code exceeds 4096 bytes", bytes:[] };
+                }
+                array_push(out, pending * 16 + nibble); pending = -1;
+            }
+        }
+        i = i + 1;
+    }
+    if pending >= 0 { return map{ ok:false, error:"hex input has an odd digit count", bytes:[] }; }
+    if len(out) == 0 { return map{ ok:false, error:"hex input is empty", bytes:[] }; }
+    return map{ ok:true, error:"", bytes:out, size:len(out), sha256:sha256(base64_encode_bytes(out)) };
+}
+
+fn decode_hex(text) {
+    let result = inspect_hex(text);
+    if not result.ok { throw "machine_code_policy: " + result.error; }
+    return result.bytes;
+}
+
+fn _finding(findings, severity, code, message) {
+    array_push(findings, map{ severity:severity, code:code, message:message });
+}
+
+// review_recipe evaluates execution mechanics, not whether a byte sequence is
+// malicious. Unknown or unverifiable mechanics fail closed.
+fn review_recipe(spec) {
+    if not is_map(spec) { throw "machine_code_policy: recipe must be a map"; }
+    let findings = []; let decoded = nil;
+    let identifier = try str(spec.id) catch "unnamed";
+    let raw = try spec.executes_raw_bytes catch false;
+    let memory = str_lower(try str(spec.memory_mode) catch "none");
+    let shell = try spec.shell_or_script catch false;
+    let temporary = try spec.temporary_executable catch false;
+    let hex = try spec.hex catch nil;
+
+    if raw { _finding(findings, "high", "raw-byte-execution", "recipe executes bytes outside validated IR"); }
+    if memory == "rwx" or memory == "write-execute" {
+        _finding(findings, "high", "writable-executable-memory", "memory is writable and executable at the same time");
+    }
+    if shell { _finding(findings, "medium", "shell-dependency", "recipe depends on command-shell interpretation"); }
+    if temporary { _finding(findings, "medium", "temporary-executable", "recipe creates and executes a temporary program file"); }
+
+    if hex != nil {
+        decoded = inspect_hex(hex);
+        if not decoded.ok { _finding(findings, "high", "malformed-hex", decoded.error); }
+    }
+    let declared_length = try spec.declared_length catch nil;
+    if declared_length != nil and decoded != nil and decoded.ok and declared_length != decoded.size {
+        _finding(findings, "high", "length-mismatch",
+            "declared byte count " + str(declared_length) + " differs from decoded count " + str(decoded.size));
+    }
+    let declared_arch = str_lower(try str(spec.declared_arch) catch "");
+    let container_arch = str_lower(try str(spec.container_arch) catch declared_arch);
+    if declared_arch != "" and container_arch != "" and declared_arch != container_arch {
+        _finding(findings, "high", "architecture-mismatch",
+            "payload architecture " + declared_arch + " differs from container architecture " + container_arch);
+    }
+    let claims_exit_code = try spec.claims_exit_code catch false;
+    let dos_interrupt = try spec.dos_interrupt catch nil;
+    if claims_exit_code and dos_interrupt != nil and dos_interrupt != 0x21 {
+        _finding(findings, "high", "dos-exit-contract",
+            "DOS return-code exit requires INT 21h/AH=4Ch; the recipe uses interrupt " + str(dos_interrupt));
+    }
+
+    let high = 0; let medium = 0; let i = 0;
+    while i < len(findings) {
+        if findings[i].severity == "high" { high = high + 1; }
+        elif findings[i].severity == "medium" { medium = medium + 1; }
+        i = i + 1;
+    }
+    return map{
+        format:FORMAT, id:identifier, safe_to_execute:false,
+        accepted:high == 0 and not raw, findings:findings,
+        finding_count:len(findings), high:high, medium:medium,
+        decoded_size:if decoded != nil and decoded.ok { decoded.size } else { 0 },
+        decoded_sha256:if decoded != nil and decoded.ok { decoded.sha256 } else { "" },
+        note:"review reports mechanics only; it never executes supplied bytes"
+    };
+}
+
+fn blueprint(identifier) {
+    let id = str_lower(str_trim(str(identifier)));
+    if id == "return-42" { return map{ id:id, title:"Return 42", expected:42, ir:[["seti",0,42]] }; }
+    if id == "return-100" { return map{ id:id, title:"Return 100", expected:100, ir:[["seti",0,100]] }; }
+    if id == "add-5-5" {
+        return map{ id:id, title:"Add 5 + 5", expected:10,
+            ir:[["seti",0,5],["seti",1,5],["add",0,1]] };
+    }
+    throw "machine_code_policy: unknown safe blueprint " + id;
+}
+
+fn build_artifact(identifier, os, version, arch) {
+    let program = blueprint(identifier);
+    let plan = Target.plan(os, version, arch);
+    if not plan.ok { throw "machine_code_policy: " + plan.error; }
+    let artifact = Target.build_ir(plan, program.ir);
+    return map{
+        ok:true, format:FORMAT, blueprint:program.id, expected:program.expected,
+        target:plan, bytes:artifact.bytes, size:artifact.size,
+        sha256:artifact.sha256, detected_format:artifact.detected_format
+    };
+}
+
+fn verify_blueprint(identifier) {
+    let program = blueprint(identifier);
+    let evaluation = IR.eval_bounded(program.ir, map{ max_steps:64, max_stack:8, max_locals:8 });
+    let requests = [["dos","6.22","x86"],["linux","2.6","x86_64"],["windows","5.2","x86_64"]];
+    let artifacts = []; let i = 0;
+    while i < len(requests) {
+        let request = requests[i];
+        let built = build_artifact(program.id, request[0], request[1], request[2]);
+        array_push(artifacts, map{
+            os:built.target.os, arch:built.target.arch, artifact_format:built.detected_format,
+            verification:built.target.status, requirements:built.target.requirements,
+            size:built.size, sha256:built.sha256
+        });
+        i = i + 1;
+    }
+    return map{
+        ok:evaluation.value == program.expected, format:FORMAT,
+        blueprint:program, evaluated:evaluation.value, execution:evaluation,
+        artifacts:artifacts, raw_execution_used:false, shell_used:false,
+        writable_executable_memory_used:false, foreign_source_used:false
+    };
+}
+
+fn catalog() { return [blueprint("return-42"), blueprint("return-100"), blueprint("add-5-5")]; }
+
+export FORMAT, MAX_HEX_CHARS, MAX_MACHINE_BYTES;
+export inspect_hex, decode_hex, review_recipe, blueprint, build_artifact, verify_blueprint, catalog;

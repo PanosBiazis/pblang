@@ -1,0 +1,182 @@
+// Bounded, platform-neutral motion detection for monotonic sensor streams.
+
+let FORMAT = "pblang.motion-detector.v1";
+let RESULT_FORMAT = "pblang.motion-sample.v1";
+
+fn _option(options, key, fallback) {
+    if options != nil and type(options) == "map" and map_has(options, key) {
+        return options[key];
+    }
+    return fallback;
+}
+
+fn _finite(value, minimum, maximum) {
+    return type(value) == "number" and value >= minimum and value <= maximum;
+}
+
+fn _integer(value, minimum, maximum) {
+    return _finite(value, minimum, maximum) and num_floor(value) == value;
+}
+
+fn _error(code, message) {
+    return map{ ok: false, format: RESULT_FORMAT, code: code, error: message };
+}
+
+fn create(options = nil) {
+    if options != nil and type(options) != "map" {
+        return _error("invalid-options", "motion detector options must be a map");
+    }
+    let mode = str_lower(str(_option(options, "sensor_mode", "linear-acceleration")));
+    if mode != "linear-acceleration" and mode != "accelerometer" {
+        return _error("unsupported-sensor", "sensor_mode must be linear-acceleration or accelerometer");
+    }
+    let threshold = _option(options, "threshold", 0.8);
+    let cooldown_ms = _option(options, "cooldown_ms", 1500);
+    let gravity_alpha = _option(options, "gravity_alpha", 0.9);
+    let warmup_samples = _option(options, "warmup_samples", 8);
+    let max_samples = _option(options, "max_samples", 4096);
+    if not _finite(threshold, 0.01, 100) {
+        return _error("invalid-threshold", "threshold must be finite in 0.01..100 m/s^2");
+    }
+    if not _integer(cooldown_ms, 0, 600000) {
+        return _error("invalid-cooldown", "cooldown_ms must be an integer in 0..600000");
+    }
+    if not _finite(gravity_alpha, 0.5, 0.9999) {
+        return _error("invalid-gravity-filter", "gravity_alpha must be finite in 0.5..0.9999");
+    }
+    if not _integer(warmup_samples, 1, 10000) {
+        return _error("invalid-warmup", "warmup_samples must be an integer in 1..10000");
+    }
+    if not _integer(max_samples, 1, 1000000) {
+        return _error("invalid-budget", "max_samples must be an integer in 1..1000000");
+    }
+    return map{
+        ok: true, format: FORMAT, sensor_mode: mode, threshold: threshold,
+        cooldown_ns: cooldown_ms * 1000000, gravity_alpha: gravity_alpha,
+        warmup_samples: warmup_samples, max_samples: max_samples,
+        samples: 0, triggers: 0, last_timestamp_ns: nil,
+        last_trigger_ns: nil, gravity_initialized: false,
+        gravity: map{ x: 0.0, y: 0.0, z: 0.0 }
+    };
+}
+
+fn set_threshold(detector, threshold) {
+    if detector == nil or (try detector.format catch "") != FORMAT {
+        return _error("invalid-detector", "invalid motion detector");
+    }
+    if not _finite(threshold, 0.01, 100) {
+        return _error("invalid-threshold", "threshold must be finite in 0.01..100 m/s^2");
+    }
+    detector.threshold = threshold;
+    return map{ ok: true, format: FORMAT, threshold: threshold };
+}
+
+fn _magnitude(x, y, z) { return num_sqrt(x * x + y * y + z * z); }
+
+fn sample(detector, x, y, z, timestamp_ns) {
+    if detector == nil or (try detector.format catch "") != FORMAT
+       or not (try detector.ok catch false) {
+        return _error("invalid-detector", "invalid motion detector");
+    }
+    if not _finite(x, -200, 200) or not _finite(y, -200, 200)
+       or not _finite(z, -200, 200) {
+        return _error("invalid-sample", "sensor axes must be finite in -200..200 m/s^2");
+    }
+    if not _integer(timestamp_ns, 0, 9007199254740991) {
+        return _error("invalid-timestamp", "timestamp_ns must be a non-negative exact integer");
+    }
+    if detector.last_timestamp_ns != nil and timestamp_ns <= detector.last_timestamp_ns {
+        return _error("non-monotonic-timestamp", "sensor timestamps must increase strictly");
+    }
+    if detector.samples >= detector.max_samples {
+        return _error("sample-budget-exceeded", "motion detector sample budget exceeded");
+    }
+
+    detector.samples = detector.samples + 1;
+    detector.last_timestamp_ns = timestamp_ns;
+    let motion_x = x; let motion_y = y; let motion_z = z;
+    let warming = false;
+
+    if detector.sensor_mode == "accelerometer" {
+        if not detector.gravity_initialized {
+            detector.gravity = map{ x: x, y: y, z: z };
+            detector.gravity_initialized = true;
+            motion_x = 0.0; motion_y = 0.0; motion_z = 0.0;
+        } else {
+            let keep = detector.gravity_alpha;
+            let add = 1.0 - keep;
+            detector.gravity.x = keep * detector.gravity.x + add * x;
+            detector.gravity.y = keep * detector.gravity.y + add * y;
+            detector.gravity.z = keep * detector.gravity.z + add * z;
+            motion_x = x - detector.gravity.x;
+            motion_y = y - detector.gravity.y;
+            motion_z = z - detector.gravity.z;
+        }
+        warming = detector.samples <= detector.warmup_samples;
+    }
+
+    let magnitude = _magnitude(motion_x, motion_y, motion_z);
+    let above_threshold = not warming and magnitude > detector.threshold;
+    let cooldown_ready = detector.last_trigger_ns == nil
+        or timestamp_ns - detector.last_trigger_ns >= detector.cooldown_ns;
+    let triggered = above_threshold and cooldown_ready;
+    if triggered {
+        detector.last_trigger_ns = timestamp_ns;
+        detector.triggers = detector.triggers + 1;
+    }
+    let remaining_ns = 0;
+    if above_threshold and not cooldown_ready {
+        remaining_ns = detector.cooldown_ns - (timestamp_ns - detector.last_trigger_ns);
+    }
+    return map{
+        ok: true, format: RESULT_FORMAT, accepted: true,
+        sequence: detector.samples, trigger_sequence: detector.triggers,
+        timestamp_ns: timestamp_ns, sensor_mode: detector.sensor_mode,
+        motion: map{ x: motion_x, y: motion_y, z: motion_z, magnitude: magnitude },
+        threshold: detector.threshold, warming: warming,
+        above_threshold: above_threshold, cooldown_ready: cooldown_ready,
+        cooldown_remaining_ms: num_floor((remaining_ns + 999999) / 1000000),
+        triggered: triggered
+    };
+}
+
+fn replay(samples, options = nil) {
+    if type(samples) != "array" { return _error("invalid-replay", "samples must be an array"); }
+    if len(samples) > 4096 {
+        return _error("replay-budget-exceeded", "materialized replay is limited to 4096 samples");
+    }
+    let detector = create(options);
+    if not detector.ok { return detector; }
+    if len(samples) > detector.max_samples {
+        return _error("sample-budget-exceeded", "replay exceeds the configured sample budget");
+    }
+    let decisions = [];
+    for item in samples {
+        if type(item) != "map" {
+            return _error("invalid-sample", "every replay sample must be a map");
+        }
+        let result = sample(detector, try item.x catch nil, try item.y catch nil,
+            try item.z catch nil, try item.timestamp_ns catch nil);
+        if not result.ok { return result; }
+        array_push(decisions, result);
+    }
+    return map{
+        ok: true, format: "pblang.motion-replay.v1", decisions: decisions,
+        samples: detector.samples, triggers: detector.triggers,
+        sensor_mode: detector.sensor_mode, bounded: true
+    };
+}
+
+fn profile() {
+    return map{
+        format: "pblang.motion-detector.profile.v1",
+        source_motion_detector_sha256: "1c8f6f8f47b4c9783fe38b2f441db3dcdb37d53587573f8fcb9a4326e4fb9712",
+        source_models_sha256: "d451ba705f929e11df81197ff4ddc8ac44193f6addc04caf7860ee856949cb68",
+        clock: "caller-supplied monotonic nanoseconds",
+        sensor_modes: ["linear-acceleration", "accelerometer"],
+        android_adapter: false,
+        boundary: "pure bounded detection core; no sensor, location, SMS, alarm, persistence, or background-service effects"
+    };
+}
+
+export FORMAT, RESULT_FORMAT, create, set_threshold, sample, replay, profile;

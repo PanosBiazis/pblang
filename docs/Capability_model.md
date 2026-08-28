@@ -7,15 +7,16 @@ the secure defaults are.
 
 ## TL;DR
 
-* **Secure by default.** A `VM` created with `VM::new()` has no builtins
-  exposed at all. A `VM::with_stdlib(StdlibConfig::default())` enables the
-  pure-compute builtins but denies every capability that touches the OS:
-  `fs`, `net`, `http`, `sqlite`, `ffi`, `exec`, `spawn`.
-* **Trusted scripting** — your own tooling — should opt in to capabilities
-  it needs via `StdlibConfig { fs: true, http: true, .. }`.
-* **Untrusted scripting** — code you didn't write — should run with
-  `StdlibConfig::default()` (everything off) plus an explicit `VmLimits`
-  (instructions, stack, memory, IO timeout).
+* **Blank by default only with `VM::new()`.** It exposes no builtins at all.
+* **CLI-compatible, not an untrusted-code profile.**
+  `VM::with_stdlib(StdlibConfig::default())` keeps the historical standalone
+  defaults: `fs`, `net`, `http`, `sqlite`, `spawn`, `gfx`, `env`, `import`,
+  and `process_exit` are on; `exec` and `ffi` are off. Embedders must not use
+  that compatibility profile for hostile input.
+* **Untrusted scripting** must construct an explicit deny profile, grant only
+  the required pure-compute categories, and set `VmLimits`. The CLI's locked
+  `--sandbox` profile denies every host-effect category, including imports,
+  spawning, environment reads, graphics, and process exit.
 * **FFI** is gated by two layers: the `ffi` capability flag, and an
   optional `FfiPolicy` allowlist of library paths and symbol names.
 
@@ -41,22 +42,28 @@ filter that applies *after* the `ffi` flag is on.
 
 | Flag | Default | What turning it OFF denies |
 |------|---------|----------------------------|
-| `fs` | `false` | `fs_read`, `fs_write`, `fs_append`, `fs_exists`, `fs_mkdirs`, `fs_listdir`, `fs_remove`, `fs_rename`, `fs_copy`, `fs_read_bytes`, `fs_write_bytes` |
-| `net` | `false` | `tcp_listen`, `tcp_accept`, `tcp_connect`, `tcp_read`, `tcp_write`, `tcp_close`, `tcp_listen_tls`, `tcp_connect_tls`, `tcp_wrap_tls` |
-| `http` | `false` | `http_get`, `http_post`, `http_post_json`, `http_send_raw`, `http_status_reason`, plus all `ai_chat`/`ai_embed`/`onnx_infer` paths that hit the network |
-| `sqlite` | `false` | `db_open`, `db_close`, `db_exec`, `db_query`, `db_last_insert_rowid` |
+| `fs` | `true` | `fs_read`, `fs_write`, `fs_append`, `fs_exists`, `fs_mkdirs`, `fs_listdir`, `fs_remove`, `fs_rename`, `fs_copy`, `fs_read_bytes`, `fs_write_bytes` |
+| `net` | `true` | `tcp_listen`, `tcp_accept`, `tcp_connect`, `tcp_read`, `tcp_write`, `tcp_close`, `tcp_listen_tls`, `tcp_connect_tls`, `tcp_wrap_tls` |
+| `http` | `true` | `http_get`, `http_post`, `http_post_json`, `http_send_raw`, `http_status_reason`, plus all `ai_chat`/`ai_embed`/`onnx_infer` paths that hit the network |
+| `sqlite` | `true` | `db_open`, `db_close`, `db_exec`, `db_query`, `db_last_insert_rowid` |
 | `ffi` | `false` | `ffi_load`, `ffi_close`, `ffi_call`, `ffi_call_typed` |
 | `exec` | `false` | `exec`, `proc_spawn`, `proc_spawn_wait`, `env_set` (disabled regardless — see below) |
-| `spawn` | `false` | `spawn` builtin (per-VM thread creation), and therefore the higher-level `stdlib:thread.sapp` wrappers |
+| `spawn` | `true` | `spawn` builtin (per-VM thread creation), and therefore the higher-level `stdlib:thread.sapp` wrappers |
+| `gfx` | `true` | Graphics builtins, which are removed at registration time when denied. |
+| `env` | `true` | `env_get`, preventing reads of process secrets when denied. |
+| `import` | `true` | Source-module loading, before any path is resolved. |
+| `process_exit` | `true` | `os_exit`, preventing a script from terminating the host process when denied. |
 
-Capabilities are deny-by-default. A denied builtin returns a `RuntimeError`
+Capability decisions are enforced at the VM boundary, but the historical
+`StdlibConfig::default()` is a trusted-CLI compatibility profile rather than a
+deny profile. A denied builtin returns a `RuntimeError`
 with message `<capability> access denied` (e.g. `fs access denied`,
 `proc_spawn_wait access denied`). The error includes the source span so the
 script can `try { … } catch e { … }` and react.
 
 ### Non-capability builtins
 
-These remain available even at `StdlibConfig::default()`:
+These remain available when all host-effect capabilities are explicitly off:
 
 * `print`, `read_line`, `len`, `str`, `type`, `clock`, `now_ms`, `now_iso`
 * Math: `num_floor`, `num_ceil`, `num_sqrt`, `num_abs`, `num_pow`, `num_mod`, `parse_number`, `parse_bool`
@@ -157,7 +164,22 @@ let mut vm = VM::with_stdlib(StdlibConfig {
 ### Untrusted plugin (third-party script)
 
 ```rust
-let mut vm = VM::with_stdlib(StdlibConfig::default()); // all off
+let mut vm = VM::with_stdlib(StdlibConfig {
+    core: true,
+    json: true,
+    crypto: true,
+    fs: false,
+    net: false,
+    http: false,
+    sqlite: false,
+    ffi: false,
+    exec: false,
+    gfx: false,
+    import: false,
+    spawn: false,
+    env: false,
+    process_exit: false,
+});
 vm.set_limits(Some(VmLimits {
     max_instructions: Some(50_000_000),
     max_stack_depth: Some(256),

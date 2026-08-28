@@ -2,7 +2,7 @@
 
 **A fast, secure, embeddable programming language with a pblang-written self-hosted toolchain.**
 
-[![Version](https://img.shields.io/badge/version-0.5.7-blue)]() [![License](https://img.shields.io/badge/license-MIT-green)]() [![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-0.6.0--alpha-blue)]() [![License](https://img.shields.io/badge/license-MIT-green)]() [![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
 
 pblang is a general-purpose programming language and bytecode VM designed for embedded scripting and standalone tooling. The project includes a Rust compiler/VM toolchain, a pblang standard library, package tooling, LSP support, a native pblang IDE, and a self-hosted compiler written in pblang.
 
@@ -444,8 +444,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ffi: false,
         exec: false,
         gfx: false,
+        import: false,
         spawn: false,
         env: false,
+        process_exit: false,
     };
 
     let mut vm = VM::with_stdlib(config);
@@ -460,7 +462,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Use `fs`, `net`, `http`, `exec`, `ffi`, and `env` only for trusted scripts or inside an OS-level sandbox.
+Use `fs`, `net`, `http`, `exec`, `ffi`, `env`, `import`, `spawn`, `gfx`, and
+`process_exit` only when the script and its host boundary justify them. The
+historical `StdlibConfig::default()` is CLI-compatible, not an untrusted-code
+profile; construct the deny profile explicitly as above.
 
 The standard library also includes bounded native model-container support:
 `stdlib/onnx.sapp` executes a deterministic CPU subset of ONNX without Python

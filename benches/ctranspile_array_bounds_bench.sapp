@@ -1,0 +1,108 @@
+// Reproducible checked-array overhead benchmark for the self-hosted C99 backend.
+// The unsafe control differs by one exact generated expression only; compiler,
+// flags, workload, warmup, samples and output are otherwise identical.
+
+let C99 = import("stdlib/compiler/ctranspile.sapp");
+
+fn fail(message) { throw "ctranspile_array_bounds_bench: " + message; }
+
+fn sorted_copy(values) {
+    let out = [];
+    for i len(values) { array_push(out, values[i]); }
+    let i = 1;
+    while i < len(out) {
+        let value = out[i];
+        let j = i - 1;
+        while j >= 0 and out[j] > value { out[j + 1] = out[j]; j = j - 1; }
+        out[j + 1] = value;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn percentile(values, numerator, denominator) {
+    let ordered = sorted_copy(values);
+    let index = num_floor((len(ordered) - 1) * numerator / denominator);
+    return ordered[index];
+}
+
+fn run_sample(path) {
+    let started = now_ms();
+    let result = proc_spawn_wait(path, []);
+    let elapsed = now_ms() - started;
+    if result.exit_code != 0 or str_trim(result.stdout) != "180000000" {
+        fail("native workload failed: " + str(result));
+    }
+    return elapsed;
+}
+
+let compiler = C99.find_c_compiler();
+if compiler == nil { fail("no C99 compiler available"); }
+
+let iterations = 40000000;
+let samples = 7;
+let source = "fn measured() { let a = [1,2,3,4,5,6,7,8]; let i = 0; let sum = 0; "
+    + "while i < " + str(iterations)
+    + " { sum = sum + a[i % 8]; i = i + 1; } return sum; } print measured();";
+let checked_c = C99.transpile_program(source);
+let checked_expr = "pb_index_get_known(a, ((long)i % (long)8), 8)";
+let unchecked_expr = "((double*)(u64)a)[1 + ((long)i % (long)8)]";
+if not str_contains(checked_c, checked_expr) { fail("generated access expression drifted"); }
+let unchecked_c = str_replace_all(checked_c, checked_expr, unchecked_expr);
+
+let root = "/tmp/pblang-array-bench-" + str(now_ms());
+let checked_src = root + "-checked.c";
+let unchecked_src = root + "-unsafe-control.c";
+let checked_bin = root + "-checked";
+let unchecked_bin = root + "-unsafe-control";
+fs_write(checked_src, checked_c);
+fs_write(unchecked_src, unchecked_c);
+
+let checked_build = proc_spawn_wait(compiler,
+    ["-std=gnu99", "-O3", "-DNDEBUG", checked_src, "-o", checked_bin]);
+let unchecked_build = proc_spawn_wait(compiler,
+    ["-std=gnu99", "-O3", "-DNDEBUG", unchecked_src, "-o", unchecked_bin]);
+if checked_build.exit_code != 0 { fail("checked compile failed: " + checked_build.stderr); }
+if unchecked_build.exit_code != 0 { fail("control compile failed: " + unchecked_build.stderr); }
+
+// One unrecorded warmup per binary, then alternate order to reduce thermal bias.
+run_sample(checked_bin); run_sample(unchecked_bin);
+let checked_ms = [];
+let unchecked_ms = [];
+let i = 0;
+while i < samples {
+    if i % 2 == 0 {
+        array_push(checked_ms, run_sample(checked_bin));
+        array_push(unchecked_ms, run_sample(unchecked_bin));
+    } else {
+        array_push(unchecked_ms, run_sample(unchecked_bin));
+        array_push(checked_ms, run_sample(checked_bin));
+    }
+    i = i + 1;
+}
+
+let checked_median = percentile(checked_ms, 1, 2);
+let unchecked_median = percentile(unchecked_ms, 1, 2);
+let overhead_pct = if unchecked_median > 0 {
+    (checked_median - unchecked_median) * 100.0 / unchecked_median
+} else { 0 };
+let result = map{
+    format: "pblang.benchmark.ctranspile-array-bounds.v1",
+    compiler: compiler, compiler_flags: ["-std=gnu99", "-O3", "-DNDEBUG"],
+    iterations: iterations, warmups: 1, samples: samples,
+    checked_ms: checked_ms, unchecked_control_ms: unchecked_ms,
+    checked_median_ms: checked_median,
+    unchecked_control_median_ms: unchecked_median,
+    checked_p85_ms: percentile(checked_ms, 5, 6),
+    unchecked_control_p85_ms: percentile(unchecked_ms, 5, 6),
+    median_overhead_percent: overhead_pct,
+    checked_artifact_bytes: len(fs_read_bytes(checked_bin)),
+    unchecked_control_artifact_bytes: len(fs_read_bytes(unchecked_bin)),
+    control_is_intentionally_unsafe: true,
+    scope: "generated C99 array-read hot loop only; not whole-language performance"
+};
+print json_stringify(result);
+
+for path in [checked_src, unchecked_src, checked_bin, unchecked_bin] {
+    try fs_remove(path) catch nil;
+}

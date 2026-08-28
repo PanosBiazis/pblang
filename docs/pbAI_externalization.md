@@ -6,7 +6,7 @@ pbAI development is moving out of the pblang core repository and into the
 workspace-local external project:
 
 ```text
-../../ai/pbai
+../pbai
 ```
 
 The pblang repository should keep only the language/runtime primitives that pbAI needs:
@@ -17,7 +17,7 @@ The pblang repository should keep only the language/runtime primitives that pbAI
 - IDE hooks that call pbAI through a stable boundary
 - compatibility shims required by existing tests during the transition
 
-New pbAI model work should happen in the external `ai/pbai` folder. In particular,
+New pbAI model work should happen in the external `products/pbai` folder. In particular,
 do not grow the pblang repo with new pbAI checkpoints, tokenizer experiments,
 training corpora, model architecture code, or agent-brain implementation modules.
 
@@ -40,22 +40,9 @@ This keeps the ambition high while making progress measurable. A pbAI brain chan
 real only when it improves benchmarked behavior, passes deterministic regression tests,
 and stays inside the capability model.
 
-## Current Sync Patch
+## Compatibility Snapshot
 
-Because this session can write only inside the pblang workspace and `/tmp`, the
-current external-folder update is prepared as:
-
-```text
-/tmp/pbai-target-sync.patch
-```
-
-Apply that patch from the external pbAI root to bring it up to the current in-tree
-pbAI files:
-
-```sh
-cd ../../ai/pbai
-patch -p0 < /tmp/pbai-target-sync.patch
-```
-
-After applying it, continue implementation in the external folder and treat the
-pblang copy as transitional compatibility only.
+Continue implementation directly in `<AAP>/products/pbai`. The in-tree
+`stdlib/ai/pbai` tree is a transitional compatibility snapshot, not a second source
+of truth. Keep new model architecture, planner, verifier, training, checkpoint, and
+brain work in the external product and connect it through stable PBLang boundaries.
