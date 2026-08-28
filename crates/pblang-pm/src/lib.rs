@@ -2192,101 +2192,96 @@ pub fn resolve_import(
             let man_path = man_dir.join("pblang.toml");
             let man_bytes = std::fs::read(&man_path)
                 .map_err(|e| format!("failed to read manifest '{}': {e}", man_path.display()))?;
-            let man_sha = manifest_sha256(&man_bytes);
-
-            let mut dep_root: Option<PathBuf> = None;
-            let lock_path = man_dir.join("pblang.lock");
-            if lock_path.is_file() {
-                if let Ok(lock_bytes) = std::fs::read(&lock_path) {
-                    if let Ok(lock_str) = std::str::from_utf8(&lock_bytes) {
-                        match parse_lockfile(lock_str) {
-                            Ok(lock) => {
-                                if lock.manifest_sha256 != man_sha {
-                                    // FIX #9: Stale lockfile must be an error, not a silent
-                                    // fallback. A mismatch means pblang.toml changed after
-                                    // the lock was generated — run `pblang install` first.
-                                    return Err("pblang.lock is out of date (manifest has changed). Run `pblang install` to regenerate the lockfile.".to_string());
-                                }
-                                if let Some(dep) = lock.dependencies.get(pkg) {
-                                    dep_root = Some(resolve_dependency_root(&man_dir, pkg, dep)?);
-                                }
-                            }
-                            Err(e) => {
-                                return Err(format!("failed to parse pblang.lock: {e}"));
-                            }
-                        }
-                    }
-                }
+            let man_str = std::str::from_utf8(&man_bytes)
+                .map_err(|_| "package manifest is not UTF-8".to_string())?;
+            let manifest = parse_manifest(man_str)?;
+            if !manifest.dependencies.contains_key(pkg) {
+                return Err(format!("unknown dependency '{pkg}'"));
             }
-
-            let dep_root = if let Some(p) = dep_root {
-                p
-            } else {
-                let man = parse_manifest(
-                    std::str::from_utf8(&man_bytes).map_err(|_| "manifest not utf8")?,
-                )?;
-                let dep = man
-                    .dependencies
-                    .get(pkg)
-                    .ok_or_else(|| format!("unknown dependency '{pkg}'"))?;
-                if dep.git().is_some() {
-                    return Err(format!(
-                        "dependency '{pkg}' is not installed; run `pblang install` first"
-                    ));
-                }
-                let candidates = dep.path_candidates();
-                if candidates.is_empty() {
-                    return Err(format!("dependency '{pkg}' has no path"));
-                }
-                let mut resolved: Option<PathBuf> = None;
-                let mut tried: Vec<String> = Vec::new();
-                for rel in &candidates {
-                    let cand = man_dir.join(expand_dep_path(rel));
-                    if let Some(c) = canonicalize_existing(&cand) {
-                        resolved = Some(c);
-                        break;
-                    }
-                    tried.push(cand.display().to_string());
-                }
-                let root = resolved.ok_or_else(|| {
-                    format!(
-                        "dependency '{pkg}' path not found; tried: {}",
-                        tried.join(", ")
-                    )
-                })?;
-                verify_package_tree_for_path_dep(&root)?;
-                root
-            };
+            let man_sha = manifest_sha256(&man_bytes);
+            let lock_path = man_dir.join("pblang.lock");
+            if !lock_path.is_file() {
+                return Err(format!(
+                    "declared dependency '{pkg}' has no pblang.lock entry; run `pblang install`"
+                ));
+            }
+            let lock_bytes = std::fs::read(&lock_path)
+                .map_err(|e| format!("failed to read pblang.lock: {e}"))?;
+            let lock_str = std::str::from_utf8(&lock_bytes)
+                .map_err(|_| "pblang.lock is not UTF-8".to_string())?;
+            let lock = parse_lockfile(lock_str)
+                .map_err(|e| format!("failed to parse pblang.lock: {e}"))?;
+            if lock.manifest_sha256 != man_sha {
+                return Err("pblang.lock is out of date (manifest has changed). Run `pblang install` to regenerate the lockfile.".to_string());
+            }
+            let dep = lock.dependencies.get(pkg).ok_or_else(|| {
+                format!(
+                    "declared dependency '{pkg}' is missing from pblang.lock; run `pblang install`"
+                )
+            })?;
+            let dep_root = resolve_dependency_root(&man_dir, pkg, dep)?;
             return resolve_package_subpath(&dep_root, sub);
         }
     }
 
-    // 1b) bare locked package name: import("@scope/pkg") or import("gitdep")
+    // 1b) bare declared package name: import("@scope/pkg") or import("gitdep").
+    // A manifest declaration is a trust boundary: once a name is declared as a
+    // dependency it may never fall through to a same-named project/CWD file or
+    // PBLANG_PATH entry because the lock is missing, stale or malformed.
     {
         let base = base_dir.unwrap_or(cwd);
         if let Some(man_dir) = find_manifest_dir(base) {
             let man_path = man_dir.join("pblang.toml");
             let lock_path = man_dir.join("pblang.lock");
-            if man_path.is_file() && lock_path.is_file() {
-                if let (Ok(man_bytes), Ok(lock_bytes)) =
-                    (std::fs::read(&man_path), std::fs::read(&lock_path))
-                {
-                    if let (Ok(man_str), Ok(lock_str)) = (
-                        std::str::from_utf8(&man_bytes),
-                        std::str::from_utf8(&lock_bytes),
-                    ) {
-                        if parse_manifest(man_str).is_ok() {
-                            if let Ok(lock) = parse_lockfile(lock_str) {
-                                if lock.manifest_sha256 == manifest_sha256(&man_bytes) {
-                                    if let Some(dep) = lock.dependencies.get(import_str) {
-                                        let root =
-                                            resolve_dependency_root(&man_dir, import_str, dep)?;
-                                        return resolve_package_entry_in_dir(&root);
-                                    }
-                                }
-                            }
-                        }
+            if man_path.is_file() {
+                let explicit_relative = import_str.starts_with("./")
+                    || import_str.starts_with("../")
+                    || import_str.starts_with(".\\")
+                    || import_str.starts_with("..\\");
+                let man_bytes = std::fs::read(&man_path)
+                    .map_err(|e| format!("failed to read package manifest: {e}"))?;
+                let man_str = std::str::from_utf8(&man_bytes)
+                    .map_err(|_| "package manifest is not UTF-8".to_string())?;
+                let manifest = match parse_manifest(man_str) {
+                    Ok(manifest) => Some(manifest),
+                    Err(error) if explicit_relative => {
+                        // Explicit local source remains debuggable even while a
+                        // developer repairs an unrelated malformed manifest.
+                        let _ = error;
+                        None
                     }
+                    Err(error) => {
+                        return Err(format!(
+                            "cannot resolve non-relative import with invalid pblang.toml: {error}"
+                        ));
+                    }
+                };
+                if manifest
+                    .as_ref()
+                    .map(|manifest| manifest.dependencies.contains_key(import_str))
+                    .unwrap_or(false)
+                {
+                    if !lock_path.is_file() {
+                        return Err(format!(
+                            "declared dependency '{import_str}' has no pblang.lock entry; run `pblang install`"
+                        ));
+                    }
+                    let lock_bytes = std::fs::read(&lock_path)
+                        .map_err(|e| format!("failed to read pblang.lock: {e}"))?;
+                    let lock_str = std::str::from_utf8(&lock_bytes)
+                        .map_err(|_| "pblang.lock is not UTF-8".to_string())?;
+                    let lock = parse_lockfile(lock_str)
+                        .map_err(|e| format!("failed to parse pblang.lock: {e}"))?;
+                    if lock.manifest_sha256 != manifest_sha256(&man_bytes) {
+                        return Err("pblang.lock is out of date (manifest has changed). Run `pblang install` to regenerate the lockfile.".to_string());
+                    }
+                    let dep = lock.dependencies.get(import_str).ok_or_else(|| {
+                        format!(
+                            "declared dependency '{import_str}' is missing from pblang.lock; run `pblang install`"
+                        )
+                    })?;
+                    let root = resolve_dependency_root(&man_dir, import_str, dep)?;
+                    return resolve_package_entry_in_dir(&root);
                 }
             }
         }
@@ -3555,6 +3550,140 @@ version = "0.1.0"
             error.contains("missing/legacy") && error.contains("pblang install"),
             "unexpected migration error: {error}"
         );
+    }
+
+    #[test]
+    fn declared_bare_import_never_falls_through_a_broken_lock() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pblang_declared_import_fail_closed_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("vendor/dep")).expect("create dependency fixture");
+        std::fs::write(
+            tmp.join("pblang.toml"),
+            "[package]\nname=\"root\"\nversion=\"0.1.0\"\n\n[dependencies]\ndep={path=\"./vendor/dep\"}\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            tmp.join("vendor/dep/lib.sapp"),
+            "export fn trusted() { return 1; }",
+        )
+        .expect("write declared dependency");
+        std::fs::write(tmp.join("dep"), "print \"shadow\";")
+            .expect("write attacker-controlled shadow");
+
+        let missing = resolve_import("dep", Some(&tmp), &tmp)
+            .expect_err("declared dependency without lock must fail closed");
+        assert!(
+            missing.contains("no pblang.lock"),
+            "unexpected error: {missing}"
+        );
+
+        std::fs::write(tmp.join("pblang.lock"), "not valid lock syntax")
+            .expect("write malformed lock");
+        let malformed = resolve_import("dep", Some(&tmp), &tmp)
+            .expect_err("malformed lock must not fall through to shadow");
+        assert!(
+            malformed.contains("failed to parse pblang.lock"),
+            "unexpected error: {malformed}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn declared_subpath_import_requires_current_complete_lock_and_tree() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pblang_declared_subpath_fail_closed_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("vendor/dep")).expect("create dependency fixture");
+        std::fs::write(
+            tmp.join("pblang.toml"),
+            "[package]\nname=\"root\"\nversion=\"0.1.0\"\n\n[dependencies]\ndep={path=\"./vendor/dep\"}\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            tmp.join("vendor/dep/lib.sapp"),
+            "export fn trusted() { return 1; }",
+        )
+        .expect("write dependency module");
+
+        let missing = resolve_import("dep:lib.sapp", Some(&tmp), &tmp)
+            .expect_err("subpath import without lock must fail closed");
+        assert!(
+            missing.contains("no pblang.lock"),
+            "unexpected error: {missing}"
+        );
+
+        std::fs::write(tmp.join("pblang.lock"), [0xff, 0xfe]).expect("write non-UTF8 lock");
+        let non_utf8 = resolve_import("dep:lib.sapp", Some(&tmp), &tmp)
+            .expect_err("non-UTF8 lock must fail closed");
+        assert!(
+            non_utf8.contains("not UTF-8"),
+            "unexpected error: {non_utf8}"
+        );
+
+        let lock = generate_lockfile(&tmp).expect("generate current lock");
+        let mut incomplete_lock = lock.clone();
+        incomplete_lock.dependencies.remove("dep");
+        std::fs::write(
+            tmp.join("pblang.lock"),
+            write_lockfile(&incomplete_lock).expect("serialize incomplete lock"),
+        )
+        .expect("write incomplete lock");
+        let missing_entry = resolve_import("dep:lib.sapp", Some(&tmp), &tmp)
+            .expect_err("declared subpath missing from lock must fail closed");
+        assert!(
+            missing_entry.contains("missing from pblang.lock"),
+            "unexpected error: {missing_entry}"
+        );
+
+        std::fs::write(
+            tmp.join("pblang.lock"),
+            write_lockfile(&lock).expect("serialize current lock"),
+        )
+        .expect("write current lock");
+        let resolved = resolve_import("dep:lib.sapp", Some(&tmp), &tmp)
+            .expect("current locked subpath must resolve");
+        assert_eq!(
+            resolved,
+            tmp.join("vendor/dep/lib.sapp").canonicalize().unwrap()
+        );
+
+        std::fs::write(
+            tmp.join("vendor/dep/lib.sapp"),
+            "export fn changed() { return 2; }",
+        )
+        .expect("mutate dependency after lock");
+        let changed = resolve_import("dep:lib.sapp", Some(&tmp), &tmp)
+            .expect_err("tree hash mismatch must fail closed");
+        assert!(
+            changed.contains("hash mismatch"),
+            "unexpected error: {changed}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn undeclared_local_import_retains_compatibility() {
+        let tmp = std::env::temp_dir().join(format!(
+            "pblang_undeclared_local_import_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create import fixture");
+        std::fs::write(
+            tmp.join("pblang.toml"),
+            "[package]\nname=\"root\"\nversion=\"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(tmp.join("local.sapp"), "print 1;").expect("write local module");
+        let resolved = resolve_import("local.sapp", Some(&tmp), &tmp)
+            .expect("undeclared local source remains resolvable");
+        assert_eq!(resolved, tmp.join("local.sapp").canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

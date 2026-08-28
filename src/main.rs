@@ -1103,20 +1103,24 @@ fn show_help() {
 
     println!("CLI helpers (run without entering the REPL):");
     println!("  pblang init            Create pblang.toml in current directory");
-    println!("  pblang --ide [--allow-*]   Launch the pblang-native IDE (editors/ide/pbide.sapp): editor, terminal,");
-    println!("                          visual designer, AI panel (pbAI), and browser. Defaults to --allow-all (the");
-    println!("                          terminal panel needs exec); aliases: -ide, ide. Override path with PBLANG_IDE.");
+    println!("  pblang --ide [--allow-*]   Launch the trusted executable-relative pblang-native IDE: editor, terminal,");
+    println!("                          visual designer, AI panel (pbAI), and browser. Host effects are denied by");
+    println!("                          default; opt in explicitly (for example --allow-exec for the terminal).");
     println!("  pblang run [file.sapp|file.bpx|dir] [--allow-*] [--deny-*] [--allow-all|--sandbox] [-- script-args...]");
     println!("                          Execute a script, or run the package entry from a manifest dir/current dir.");
     println!("  pblang <file.sapp|file.bpx|dir> ...  Short alias for `pblang run ...`; never enters the REPL.");
     println!("                          Capability flags (all default to: fs+net+http+sqlite+spawn+gfx+core ON, exec+ffi OFF):");
     println!("                            --allow-exec    Enable proc_spawn_wait / exec / polyglot_exec*");
-    println!("                            --allow-ffi     Enable ffi_load / ffi_call_typed / polyglot_compile_cached");
+    println!("                            --allow-ffi     Enable FFI with an empty deny-by-default allowlist");
+    println!("                            --ffi-lib=PATH  Allow one canonical native library path (repeatable)");
+    println!("                            --ffi-symbol=NAME  Allow one native symbol (repeatable)");
+    println!("                            Raw FFI profiles are unsupported; grant exact libraries and symbols only");
     println!("                            --allow-all     Enable every capability (use only for trusted code)");
     println!("                            --sandbox       Locked deny profile: exec/ffi/net/fs/http/sqlite/spawn/gfx/env/import/process-exit OFF");
     println!("                            --allow-env / --deny-env  Allow/deny env_get reading process env vars (default allow; --sandbox denies)");
     println!("                            --allow-import / --deny-import  Allow/deny source-module loading (default allow; --sandbox denies)");
     println!("                            --deny-<cap>    Disable a specific capability (fs/net/http/sqlite/spawn/gfx/env/import)");
+    println!("                            --io-timeout-ms=N  Bound each VM filesystem/network I/O operation (100..120000 ms)");
     println!("                          Env-var equivalents: PBLANG_ALLOW_EXEC=1, PBLANG_ALLOW_FFI=1, PBLANG_ALLOW_ALL=1, PBLANG_SANDBOX=1, etc.");
     println!("  pblang test [dir|profile] [--profile semantics|llm] [--filter <substr>] [--exact <id>] [--skip <substr>] [--quiet] [--jobs N|auto|smart] [--cache] [--timings] [--slow N] [--fail-fast] [--list] [--allow-*]  Discover and run `fn test_*` functions in dir (default: tests); cargo-test style output. Profiles: `pblang test semantics` expands to `tests/semantics --allow-all --quiet --jobs smart`; `pblang test llm` adds `--filter llm --timings --slow=3`. Files with no test_* fns are run wholesale. Accepts the same capability flags as `run`. --quiet captures test print output instead of writing it to stdout; --jobs runs independent test files in isolated VM workers when cache/fail-fast are not active; --jobs smart caps workers by CPU plus available RAM (`PBLANG_TEST_MAX_JOBS`, `PBLANG_TEST_RAM_MB`, `PBLANG_TEST_WORKER_MB` override). --cache reuses unchanged passing tests; --timings prints per-test durations; --slow N prints the N slowest tests; --exact runs only the exact test id; --skip excludes matching test ids; --fail-fast stops after the first failure; --list prints discovered tests without executing them.");
     println!("  pblang fmt [--max-line-length=N] [--via-pblang] [file.sap|file.bpx …] Format .sap/.sapp/.bpx (trim, operator spacing, indent 4 spaces, optional line wrap, final newline). --via-pblang formats via the self-hosted stdlib/compiler/formatter.sapp instead of the Rust formatter.");
@@ -1585,30 +1589,34 @@ fn is_bare_runnable_path(arg: &str) -> bool {
 }
 
 fn is_capability_flag(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--allow-exec"
-            | "--allow-ffi"
-            | "--allow-net"
-            | "--allow-fs"
-            | "--allow-http"
-            | "--allow-sqlite"
-            | "--allow-spawn"
-            | "--allow-gfx"
-            | "--allow-env"
-            | "--deny-exec"
-            | "--deny-ffi"
-            | "--deny-net"
-            | "--deny-fs"
-            | "--deny-http"
-            | "--deny-sqlite"
-            | "--deny-spawn"
-            | "--deny-gfx"
-            | "--deny-env"
-            | "--allow-all"
-            | "--sandbox"
-            | "--mem-report"
-    )
+    arg.starts_with("--ffi-lib=")
+        || arg.starts_with("--ffi-symbol=")
+        || arg.starts_with("--ffi-profile=")
+        || arg.starts_with("--io-timeout-ms=")
+        || matches!(
+            arg,
+            "--allow-exec"
+                | "--allow-ffi"
+                | "--allow-net"
+                | "--allow-fs"
+                | "--allow-http"
+                | "--allow-sqlite"
+                | "--allow-spawn"
+                | "--allow-gfx"
+                | "--allow-env"
+                | "--deny-exec"
+                | "--deny-ffi"
+                | "--deny-net"
+                | "--deny-fs"
+                | "--deny-http"
+                | "--deny-sqlite"
+                | "--deny-spawn"
+                | "--deny-gfx"
+                | "--deny-env"
+                | "--allow-all"
+                | "--sandbox"
+                | "--mem-report"
+        )
 }
 
 fn normalize_bare_run(mut args: Vec<String>) -> Vec<String> {
@@ -2029,7 +2037,8 @@ fn prepend(name: &str, mut rest: Vec<String>) -> Vec<String> {
 /// not a safe profile for untrusted embedded code.
 ///
 /// Recognized flags (anywhere in `args`):
-///   --allow-exec, --allow-ffi, --allow-net, --allow-fs, --allow-http,
+///   --allow-exec, --allow-ffi, --ffi-lib=PATH, --ffi-symbol=NAME,
+///   --allow-net, --allow-fs, --allow-http,
 ///   --allow-sqlite, --allow-spawn, --allow-gfx, --allow-import
 ///   --deny-exec, --deny-ffi, --deny-net, --deny-fs, --deny-http,
 ///   --deny-sqlite, --deny-spawn, --deny-gfx, --deny-import
@@ -2101,6 +2110,7 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
         cfg.gfx = true;
         cfg.import = true;
         cfg.env = true;
+        cfg.ffi_allow_all = true;
     }
     let sandbox_requested = env_on("PBLANG_SANDBOX") || args.iter().any(|a| a == "--sandbox");
     if sandbox_requested {
@@ -2115,7 +2125,49 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
         cfg.import = false;
         cfg.env = false;
         cfg.process_exit = false;
+        cfg.ffi_allow_all = false;
+        cfg.ffi_allowed_libs.clear();
+        cfg.ffi_allowed_symbols.clear();
     }
+
+    // FFI authority is explicit and repeatable. Canonicalizing libraries here
+    // prevents spelling/symlink aliases from widening the runtime policy.
+    let mut retained = Vec::with_capacity(args.len());
+    for arg in args.drain(..) {
+        if let Some(raw) = arg.strip_prefix("--ffi-lib=") {
+            if raw.is_empty() {
+                retained.push(arg);
+                continue;
+            }
+            let canonical = std::fs::canonicalize(raw).unwrap_or_else(|_| {
+                eprintln!("pblang: rejected --ffi-lib path that cannot be canonicalized: {raw}");
+                std::process::exit(2);
+            });
+            cfg.ffi_allowed_libs
+                .insert(canonical.to_string_lossy().into_owned());
+            cfg.ffi = true;
+        } else if let Some(symbol) = arg.strip_prefix("--ffi-symbol=") {
+            let valid = !symbol.is_empty()
+                && symbol.len() <= 256
+                && symbol
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            if !valid {
+                eprintln!("pblang: rejected malformed --ffi-symbol value");
+                std::process::exit(2);
+            }
+            cfg.ffi_allowed_symbols.insert(symbol.to_string());
+            cfg.ffi = true;
+        } else if arg.starts_with("--ffi-profile=") {
+            eprintln!(
+                "pblang: raw FFI profiles are unsupported; use exact --ffi-lib and --ffi-symbol grants"
+            );
+            std::process::exit(2);
+        } else {
+            retained.push(arg);
+        }
+    }
+    *args = retained;
 
     // 2. CLI flag scan + strip.
     args.retain(|a| match a.as_str() {
@@ -2165,6 +2217,9 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
         }
         "--deny-ffi" => {
             cfg.ffi = false;
+            cfg.ffi_allow_all = false;
+            cfg.ffi_allowed_libs.clear();
+            cfg.ffi_allowed_symbols.clear();
             false
         }
         "--deny-net" => {
@@ -2210,6 +2265,7 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
             cfg.gfx = true;
             cfg.import = true;
             cfg.env = true;
+            cfg.ffi_allow_all = true;
             false
         }
         "--sandbox" => {
@@ -2244,16 +2300,20 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
         cfg.import = false;
         cfg.env = false;
         cfg.process_exit = false;
+        cfg.ffi_allow_all = false;
+        cfg.ffi_allowed_libs.clear();
+        cfg.ffi_allowed_symbols.clear();
     }
 
     cfg
 }
 
 /// Resolve the native IDE script (editors/ide/pbide.sapp): an absolute path if
-/// found, else None. Search order: `PBLANG_IDE` env override → CWD-relative (the
-/// repo root) → walking up from the executable's directory (installed/dev layouts)
-/// → standard share install locations. Release binaries intentionally do not
-/// embed a developer-machine build path.
+/// found, else None. Only executable-relative installed/development layouts and
+/// system share locations are trusted. In particular, the current working
+/// directory and environment variables are not IDE code sources: `pblang ide`
+/// is commonly launched from untrusted projects and must not turn a planted
+/// `./editors/ide/pbide.sapp` into privileged code execution.
 fn locate_ide() -> Option<std::path::PathBuf> {
     fn canonical_ide_candidate(base: impl AsRef<std::path::Path>) -> Option<std::path::PathBuf> {
         let cand = base.as_ref().join("editors/ide/pbide.sapp");
@@ -2263,15 +2323,6 @@ fn locate_ide() -> Option<std::path::PathBuf> {
         None
     }
 
-    if let Ok(p) = std::env::var("PBLANG_IDE") {
-        let pb = std::path::PathBuf::from(&p);
-        if pb.exists() {
-            return pb.canonicalize().ok();
-        }
-    }
-    if let Some(p) = canonical_ide_candidate(".") {
-        return Some(p);
-    }
     if let Ok(exe) = std::env::current_exe() {
         let mut dir = exe.parent().map(|p| p.to_path_buf());
         for _ in 0..6 {
@@ -2312,39 +2363,36 @@ fn locate_ide() -> Option<std::path::PathBuf> {
 /// as the entry point for the REPL when no subcommand was given.
 fn legacy_dispatch(args: Vec<String>) {
     // `pblang --ide` / `pblang -ide` / `pblang ide` — launch the pblang-native IDE
-    // (editors/ide/pbide.sapp). It needs gfx + (for the terminal panel) exec, so we
-    // run it with --allow-all. The IDE imports stdlib/* relative to the CWD, so we
-    // chdir to the repo root we resolved the script from; extra args pass through.
+    // (editors/ide/pbide.sapp). The shortcut never selects source from the CWD and
+    // never grants all host effects implicitly. Filesystem/import/graphics retain
+    // their normal IDE defaults; network, process and ambient-environment effects
+    // begin denied and can only be re-enabled by explicit caller flags.
     if matches!(
         args.first().map(|s| s.as_str()),
         Some("--ide") | Some("-ide") | Some("ide")
     ) {
         match locate_ide() {
             Some(script) => {
-                if let Some(root) = script.ancestors().nth(3) {
-                    if let Err(e) = std::env::set_current_dir(root) {
-                        eprintln!(
-                            "pblang --ide: warning: could not chdir to repo root {}: {e}\n  stdlib imports may fail to resolve; continuing with current directory.",
-                            root.display()
-                        );
-                    }
-                }
-                let mut run_args = vec!["run".to_string(), "editors/ide/pbide.sapp".to_string()];
-                let mut saw_caps = false;
+                let mut run_args = vec![
+                    "run".to_string(),
+                    script.to_string_lossy().into_owned(),
+                    "--deny-exec".to_string(),
+                    "--deny-ffi".to_string(),
+                    "--deny-net".to_string(),
+                    "--deny-http".to_string(),
+                    "--deny-sqlite".to_string(),
+                    "--deny-spawn".to_string(),
+                    "--deny-env".to_string(),
+                    "--deny-process-exit".to_string(),
+                ];
                 for a in args.iter().skip(1) {
-                    if a.starts_with("--allow") || a == "--sandbox" || a.starts_with("--deny") {
-                        saw_caps = true;
-                    }
                     run_args.push(a.clone());
-                }
-                if !saw_caps {
-                    run_args.push("--allow-all".to_string());
                 }
                 return legacy_dispatch(run_args);
             }
             None => {
                 eprintln!(
-                    "pblang --ide: could not find editors/ide/pbide.sapp.\n  Searched PBLANG_IDE, the current directory, executable-relative install paths,\n  /usr/local/share/pblang, and /usr/share/pblang.\n  Set PBLANG_IDE=/path/to/pbide.sapp to override."
+                    "pblang --ide: could not find a trusted editors/ide/pbide.sapp.\n  Searched executable-relative install paths, /usr/local/share/pblang, and /usr/share/pblang.\n  For an explicit development copy, run `pblang run /absolute/path/to/pbide.sapp` with reviewed capability flags."
                 );
                 std::process::exit(1);
             }
@@ -3838,6 +3886,9 @@ fn legacy_dispatch(args: Vec<String>) {
                                         let mut vm = pblang_vm::VM::with_stdlib(pblang_vm::StdlibConfig {
                                             core: true, fs: false, net: false, http: false,
                                             json: true, crypto: true, sqlite: false, ffi: false,
+                                            ffi_allow_all: false,
+                                            ffi_allowed_libs: Default::default(),
+                                            ffi_allowed_symbols: Default::default(),
                                             exec: false, gfx: false, import: false, spawn: false,
                                             env: false, process_exit: false,
                                         });
@@ -4271,7 +4322,30 @@ fn legacy_dispatch(args: Vec<String>) {
 
         async fn handle_index() -> Response {
             let html = include_str!("../editors/ide/index.html");
-            (StatusCode::OK, [(header::CONTENT_TYPE, "text/html")], html).into_response()
+            let headers = [
+                (header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8")),
+                (
+                    HeaderName::from_static("content-security-policy"),
+                    HeaderValue::from_static(
+                        "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; frame-src 'self'; connect-src 'self' http://127.0.0.1:8080 http://localhost:8080",
+                    ),
+                ),
+                (
+                    HeaderName::from_static("referrer-policy"),
+                    HeaderValue::from_static("no-referrer"),
+                ),
+                (
+                    HeaderName::from_static("x-content-type-options"),
+                    HeaderValue::from_static("nosniff"),
+                ),
+                (
+                    HeaderName::from_static("permissions-policy"),
+                    HeaderValue::from_static(
+                        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=()",
+                    ),
+                ),
+            ];
+            (StatusCode::OK, headers, html).into_response()
         }
 
         // Enforce explicit Content-Length on POST: the legacy hand-rolled
@@ -4635,10 +4709,44 @@ fn legacy_dispatch(args: Vec<String>) {
 
     // Run a script file and exit (no REPL)
     if args.first().map(|s| s.as_str()) == Some("run") {
-        // Pull capability flags out of args first so they don't interfere
-        // with the path/`--` script-args parsing below.
-        let mut args = args;
+        // `--` is a trust boundary. Only the host-option prefix may influence
+        // VM capabilities; the suffix is inert program data and is restored
+        // byte-for-byte after all host option parsing.
+        let mut host_args = args;
+        let separator = host_args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(host_args.len());
+        let script_suffix = if separator < host_args.len() {
+            host_args.split_off(separator)
+        } else {
+            Vec::new()
+        };
+        let mut args = host_args;
         let stdlib_cfg = parse_capability_flags(&mut args);
+        let timeout_positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| arg.starts_with("--io-timeout-ms=").then_some(index))
+            .collect();
+        if timeout_positions.len() > 1 {
+            eprintln!("pblang run: --io-timeout-ms may be specified only once");
+            std::process::exit(2);
+        }
+        let io_timeout_ms = timeout_positions.first().map(|index| {
+            let raw = args[*index].trim_start_matches("--io-timeout-ms=");
+            raw.parse::<u64>()
+                .ok()
+                .filter(|value| (100..=120_000).contains(value))
+                .unwrap_or_else(|| {
+                    eprintln!("pblang run: --io-timeout-ms must be an integer from 100 to 120000");
+                    std::process::exit(2);
+                })
+        });
+        if let Some(index) = timeout_positions.first() {
+            args.remove(*index);
+        }
+        args.extend(script_suffix);
         // `--mem-report`: after the program finishes, print a one-line memory /
         // resource summary (allocation counters + live memory-safety tracker) to
         // stderr. Works for any program — pblang's own or another project's.
@@ -4780,7 +4888,7 @@ fn legacy_dispatch(args: Vec<String>) {
             max_instructions: None,
             max_stack_depth: Some(16_384),
             max_memory_bytes: None,
-            io_timeout_ms: None,
+            io_timeout_ms,
             max_external_json_bytes: None,
         }));
         if let Err(e) = vm.run(chunk) {

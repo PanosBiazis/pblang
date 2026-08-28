@@ -19,6 +19,8 @@ let _par = import("stdlib/compiler/parser.sapp");
 // box matching how gui.sapp draws them (label/checkbox don't emit w/h in codegen).
 let _CW = 12;
 let _CH = 16;
+let MAX_SOURCE_CHARS = 262144;
+let MAX_WIDGETS = 512;
 
 fn _s(a) { if a != nil and (try a.kind catch "") == "string" { return a.value; } return ""; }
 // number-literal nodes store their value as the source TEXT (e.g. "500"), so coerce to a
@@ -173,22 +175,126 @@ fn _scan(stmts, res) {
     return 0;
 }
 
+fn _strict_error(state, code, message) {
+    if state.error == "" { state.error = str(code); }
+    if len(state.diagnostics) < 32 { array_push(state.diagnostics, str(message)); }
+    return 0;
+}
+
+fn _strict_widget_valid(widget, state) {
+    let name = str(try widget.name catch "");
+    if name == "" or len(name) > 128 {
+        _strict_error(state, "invalid-widget-name", "widget names must contain 1..128 characters");
+        return false;
+    }
+    let x = try widget.x catch nil; let y = try widget.y catch nil;
+    let w = try widget.w catch nil; let h = try widget.h catch nil;
+    for value in [x, y, w, h] {
+        if type(value) != "number" or value < -100000 or value > 100000 {
+            _strict_error(state, "invalid-widget-geometry", "widget geometry exceeds the bounded designer range");
+            return false;
+        }
+    }
+    if w < 0 or h < 0 {
+        _strict_error(state, "invalid-widget-geometry", "widget width and height cannot be negative");
+        return false;
+    }
+    let names = state.names;
+    if map_has(names, name) {
+        _strict_error(state, "duplicate-widget-name", "duplicate widget name: " + name);
+        return false;
+    }
+    names[name] = true;
+    return true;
+}
+
+fn _scan_strict(stmts, res, state) {
+    let i = 0;
+    while i < len(stmts) and state.error == "" {
+        let st = stmts[i]; let k = try st.kind catch "";
+        if k == "let" {
+            let value = try st.value catch nil;
+            if value != nil and _is_gui(value, "form") {
+                let args = try value.args catch [];
+                if len(args) < 3 {
+                    _strict_error(state, "invalid-form", "gui.form requires title, width and height");
+                } else {
+                    let title = _s(args[0]); let width = _n(args[1]); let height = _n(args[2]);
+                    if title == "" or len(title) > 256 or width < 64 or width > 16384 or height < 64 or height > 16384 {
+                        _strict_error(state, "invalid-form", "form title or dimensions are outside the bounded designer contract");
+                    } else {
+                        res.form = map{ title:title, w:width, h:height };
+                        state.form_found = true;
+                    }
+                }
+            }
+        } else if k == "expr_stmt" {
+            let expr = try st.expr catch nil;
+            if expr != nil and _is_gui(expr, "add") {
+                let args = try expr.args catch [];
+                if len(args) < 2 {
+                    _strict_error(state, "invalid-add", "gui.add requires a widget constructor");
+                } else {
+                    let widget = _widget_from_call(args[1]);
+                    if widget == nil {
+                        let method = str(try args[1].func.name catch "unknown");
+                        _strict_error(state, "unsupported-widget", "unsupported GUI constructor: " + method);
+                        array_push(state.unsupported, method);
+                    } else if len(res.widgets) >= MAX_WIDGETS {
+                        _strict_error(state, "too-many-widgets", "designer import exceeds " + str(MAX_WIDGETS) + " widgets");
+                    } else if _strict_widget_valid(widget, state) {
+                        array_push(res.widgets, widget);
+                    }
+                }
+            } else if expr != nil and _is_gui(expr, "set_model") {
+                let args = try expr.args catch [];
+                if len(args) > 1 { res.model = _map_from_node(args[1]); }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// parse_strict is the versioned, bounded Designer import boundary. Unlike the
+// compatibility parse() helper, it reports malformed/unsupported source and is
+// suitable for atomic UI state replacement.
+fn parse_strict(code) {
+    if type(code) != "string" { return map{ ok:false, error:"source-type", diagnostics:["source must be text"], unsupported:[] }; }
+    if len(code) > MAX_SOURCE_CHARS {
+        return map{ ok:false, error:"source-too-large", diagnostics:["source exceeds " + str(MAX_SOURCE_CHARS) + " characters"], unsupported:[] };
+    }
+    let ast = try _par.parse(_tok.tokenize(code)) catch nil;
+    if ast == nil { return map{ ok:false, error:"parse-failed", diagnostics:["source did not parse"], unsupported:[] }; }
+    let result = map{ form:map{title:"My App", w:480, h:320}, widgets:[], model:map{} };
+    let state = map{ error:"", diagnostics:[], unsupported:[], names:map{}, form_found:false };
+    let statements = try ast.stmts catch [];
+    let i = 0;
+    while i < len(statements) and state.error == "" {
+        if (try statements[i].kind catch "") == "fn" {
+            _scan_strict(try statements[i].body.stmts catch [], result, state);
+        }
+        i = i + 1;
+    }
+    if state.error == "" and not state.form_found {
+        _strict_error(state, "form-missing", "no bounded gui.form declaration was found");
+    }
+    if state.error != "" {
+        return map{ ok:false, format:"pbide.designer.import.v1", error:state.error,
+            diagnostics:state.diagnostics, unsupported:state.unsupported, widget_count:len(result.widgets) };
+    }
+    return map{ ok:true, format:"pbide.designer.import.v1", form:result.form,
+        widgets:result.widgets, model:result.model, widget_count:len(result.widgets),
+        diagnostics:[], unsupported:[] };
+}
+
 // parse(code) — generated pblang desktop code -> { form, widgets }. Scans every top-level
 // function body, so it tolerates the design living in build()/main()/anything. On a parse
 // error or no gui calls, returns the default empty form (never crashes).
 fn parse(code) {
-    let res = map{ form: map{ title: "My App", w: 480, h: 320 }, widgets: [], model: map{} };
-    let ast = try _par.parse(_tok.tokenize(code)) catch nil;
-    if ast == nil { return res; }
-    let stmts = try ast.stmts catch [];
-    let i = 0;
-    while i < len(stmts) {
-        if (try stmts[i].kind catch "") == "fn" {
-            _scan(try stmts[i].body.stmts catch [], res);
-        }
-        i = i + 1;
-    }
-    return res;
+    let strict = parse_strict(code);
+    if strict.ok { return map{ form:strict.form, widgets:strict.widgets, model:strict.model }; }
+    return map{ form: map{ title: "My App", w: 480, h: 320 }, widgets: [], model: map{} };
 }
 
 // find_widgets(design, kind) — all parsed widgets of the given kind.
@@ -237,4 +343,5 @@ fn get_widget(design, name) {
 // has_widget(design, name) — true if a widget with this name was parsed.
 fn has_widget(design, name) { return get_widget(design, name) != nil; }
 
-export parse, find_widgets, count_by_kind, widget_names, get_widget, has_widget;
+export MAX_SOURCE_CHARS, MAX_WIDGETS;
+export parse, parse_strict, find_widgets, count_by_kind, widget_names, get_widget, has_widget;
