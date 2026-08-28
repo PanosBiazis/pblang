@@ -1606,6 +1606,31 @@ if r == "GATE_DENIED" { print "ffi:denied"; } else { print "ffi:loaded"; }
     );
 }
 
+#[test]
+fn cap_sandbox_is_order_independent_and_denies_spawn_and_exit() {
+    let script = r#"
+let spawned = try spawn(fn() { return 1; }) catch "GATE_DENIED_SPAWN";
+let exited = try os_exit(7) catch "GATE_DENIED_EXIT";
+let imported = try import("./does-not-exist.sapp") catch "GATE_DENIED_IMPORT";
+let graphics = try gfxcreatewindow(1, 1, "sandbox") catch "GATE_DENIED_GFX";
+if spawned == "GATE_DENIED_SPAWN" { print "spawn:denied"; }
+if exited == "GATE_DENIED_EXIT" { print "exit:denied"; }
+if imported == "GATE_DENIED_IMPORT" { print "import:denied"; }
+if graphics == "GATE_DENIED_GFX" { print "gfx:denied"; }
+"#;
+    for args in [["--sandbox", "--allow-all"], ["--allow-all", "--sandbox"]] {
+        let (status, stdout, stderr) = run_pblang_script_with_args(script, &args);
+        assert_eq!(status, 0, "sandbox probe failed: {stderr}");
+        assert!(stdout.contains("spawn:denied"), "spawn widened: {stdout}");
+        assert!(
+            stdout.contains("exit:denied"),
+            "process exit widened: {stdout}"
+        );
+        assert!(stdout.contains("import:denied"), "import widened: {stdout}");
+        assert!(stdout.contains("gfx:denied"), "graphics widened: {stdout}");
+    }
+}
+
 /// Env var alone should enable ffi when no CLI flag is given.
 #[test]
 #[cfg(target_os = "linux")]

@@ -88,6 +88,40 @@ fn ffi_sandbox_denied() {
 }
 
 #[test]
+fn ffi_missing_policy_is_fail_closed() {
+    let mut vm = VM::with_stdlib(StdlibConfig {
+        ffi: true,
+        ..Default::default()
+    });
+    vm.set_ffi_policy(None);
+    let stmts = parse(r#"ffi_load("./libnope.so");"#).expect("parse");
+    let chunk = compile(stmts).expect("compile");
+    let err = vm
+        .run(chunk)
+        .expect_err("missing FFI policy must deny before attempting a load");
+    assert!(
+        err.message.contains("not in allowlist"),
+        "expected fail-closed allowlist error, got: {}",
+        err.message
+    );
+}
+
+#[test]
+fn import_sandbox_denied_before_path_resolution() {
+    let config = StdlibConfig {
+        import: false,
+        ..Default::default()
+    };
+    let result = run_with_config(config, r#"import("./does-not-exist.sapp");"#);
+    let err = result.expect_err("expected runtime error when import is disabled");
+    assert!(
+        err.message.contains("import access denied"),
+        "expected import capability denial, got: {}",
+        err.message
+    );
+}
+
+#[test]
 fn instruction_limit_exceeded() {
     let stmts = parse("for i 99999 { print 1; }").expect("parse");
     let chunk = compile(stmts).expect("compile");

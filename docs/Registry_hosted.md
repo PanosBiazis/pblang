@@ -8,7 +8,7 @@ Define the HTTP API and auth model for a **hosted** pblang package registry (as 
 
 ## API (target shape)
 
-- **GET** `/<base>/index.json` — Registry index: list of package names and versions (and optional `sha256` per tarball). Same JSON shape as the local index used by `pblang install --registry-index`.
+- **GET** `/<base>/index.json` — Registry index: list of package names and versions with a mandatory 64-hex `sha256` per tarball. Same JSON shape as the local index used by `pblang install --registry-index`.
 - **GET** `/<base>/tarball/<name>/<version>` — Download package tarball (e.g. `name-version.tar.gz`).
 - **GET** `/<base>/tarball/<name>/<version>.sha256` — Optional sidecar: HMAC-SHA256 of the tarball (for verify-on-install when `PBLANG_SIGNING_KEY` is set).
 - **POST** `/<base>/publish` — Publish a new package version. Body: tarball bytes or multipart; auth required. Idempotent for same name+version+content.

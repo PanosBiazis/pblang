@@ -411,7 +411,7 @@ fn has_resize_event(events) {
 // Keep one authoritative resize record per frame. Window managers can emit a
 // burst while maximizing, and the native backend can also observe a resize
 // between event polling and presentation. The live size always wins.
-fn coalesce_resize_events(events, live_size, force = false) {
+fn coalesce_resize_events(events, live_size, force = false, emit_resize = true) {
     let out = [];
     let saw_resize = false;
     let i = 0;
@@ -421,10 +421,40 @@ fn coalesce_resize_events(events, live_size, force = false) {
         i = i + 1;
     }
     let w = try live_size.w catch 0; let h = try live_size.h catch 0;
-    if (force or saw_resize) and type(w) == "number" and type(h) == "number" and w > 0 and h > 0 {
+    if emit_resize and (force or saw_resize) and type(w) == "number"
+        and type(h) == "number" and w > 0 and h > 0 {
         array_push(out, map{ type: "resize", w: w, h: h });
     }
     return out;
+}
+
+// A maximize/restore operation is usually a burst, not one atomic size. Keep
+// pumping input but wait for one unchanged poll before drawing into the new
+// framebuffer. This avoids presenting the freshly allocated black buffer and
+// bounds the delay to one event-loop iteration after geometry becomes stable.
+fn resize_settle(previous, current, stable_polls = 0, pending = false,
+    required_stable_polls = 1) {
+    let w = try current.w catch 0; let h = try current.h catch 0;
+    if type(w) != "number" or type(h) != "number" or w <= 0 or h <= 0 {
+        return map{ valid: false, target: previous, changed: false,
+            pending: pending, ready: false, stable_polls: stable_polls };
+    }
+    let changed = window_size_changed(previous, current);
+    if changed {
+        return map{ valid: true, target: map{ w: w, h: h }, changed: true,
+            pending: true, ready: false, stable_polls: 0 };
+    }
+    if not pending {
+        return map{ valid: true, target: map{ w: w, h: h }, changed: false,
+            pending: false, ready: false, stable_polls: 0 };
+    }
+    let required = num_floor(required_stable_polls);
+    if required < 1 { required = 1; }
+    if required > 4 { required = 4; }
+    let polls = stable_polls + 1;
+    let ready = polls >= required;
+    return map{ valid: true, target: map{ w: w, h: h }, changed: false,
+        pending: not ready, ready: ready, stable_polls: if ready { 0 } else { polls } };
 }
 
 fn run(win, state, updateFn, drawFn, fps) {
@@ -438,6 +468,7 @@ fn run(win, state, updateFn, drawFn, fps) {
     let idlePumpMs = _env_number("PBLANG_GRAPHICS_IDLE_PUMP_MS", 120);
     let knownSize = win.size();
     let pendingResize = false;
+    let resizeStablePolls = 0;
     let lastPresent = clock();
     while win.isOpen() {
         if maxMs > 0 and (clock() - started) * 1000 >= maxMs {
@@ -451,11 +482,21 @@ fn run(win, state, updateFn, drawFn, fps) {
         let t0 = clock();
         let events = win.pollEvents();
         let polledSize = win.size();
-        let observedResize = pendingResize or window_size_changed(knownSize, polledSize);
-        events = coalesce_resize_events(events, polledSize, observedResize);
-        let frameResize = observedResize or has_resize_event(events);
-        knownSize = polledSize;
-        pendingResize = false;
+        let nativeResize = has_resize_event(events);
+        // A backend can report a resize record whose dimensions already match
+        // gfxsize. Treat it as the start of a burst, not as an immediately safe
+        // present opportunity.
+        let settlePrevious = knownSize;
+        if nativeResize and not window_size_changed(knownSize, polledSize) {
+            settlePrevious = nil;
+        }
+        let settle = resize_settle(settlePrevious, polledSize,
+            resizeStablePolls, pendingResize, 1);
+        knownSize = settle.target;
+        pendingResize = settle.pending;
+        resizeStablePolls = settle.stable_polls;
+        let frameResize = settle.ready;
+        events = coalesce_resize_events(events, polledSize, frameResize, frameResize);
         let shouldDraw = true;
         if updateFn != nil {
             let updateResult = updateFn(state, events);
@@ -464,6 +505,10 @@ fn run(win, state, updateFn, drawFn, fps) {
         // A resize invalidates every framebuffer pixel even when an app's
         // update callback normally skips unchanged frames.
         if frameResize { shouldDraw = true; }
+        // While geometry is still moving, process input/close/tick callbacks but
+        // retain the compositor's last valid frame instead of drawing or
+        // presenting a partially resized framebuffer.
+        if pendingResize and not frameResize { shouldDraw = false; }
         // GUI backends can observe that the window manager already destroyed
         // the native window. Stop without issuing a second native close.
         if try state.graphics_stop catch false { break; }
@@ -481,6 +526,7 @@ fn run(win, state, updateFn, drawFn, fps) {
         if window_size_changed(knownSize, drawnSize) {
             knownSize = drawnSize;
             pendingResize = true;
+            resizeStablePolls = 0;
             shouldPresent = false;
         }
         if shouldPresent {
@@ -492,6 +538,7 @@ fn run(win, state, updateFn, drawFn, fps) {
             if window_size_changed(knownSize, presentedSize) {
                 knownSize = presentedSize;
                 pendingResize = true;
+                resizeStablePolls = 0;
             }
         }
         if len(events) == 0 and not shouldDraw { idleFrames = idleFrames + 1; }
@@ -1158,5 +1205,6 @@ export bezier_point, bezier_points, draw_polyline, polygon, bezier, draw_text, d
 export draw_text_aa, text_font_candidates, text_font_path, text_profile, text_render_plan, text_render_status;
 export Window, run, runGameLoop, backend_profile, backend_status, backend_event_status, render_route_plan, render_route_status, cpu_render_status, render_acceleration_plan, render_device_policy, render_device_policy_status, render_startup_profile, render_startup_env_lines, render_startup_profile_status;
 export dirty_region_plan, render_batch_plan, frame_schedule, frame_schedule_status,
-       idle_frame_delay, idle_event_pump_due, window_size_changed, coalesce_resize_events;
+       idle_frame_delay, idle_event_pump_due, window_size_changed, coalesce_resize_events,
+       resize_settle;
 

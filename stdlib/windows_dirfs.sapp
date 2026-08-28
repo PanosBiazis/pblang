@@ -23,7 +23,9 @@ let OBJ_CASE_INSENSITIVE = 0x40; let OBJ_DONT_REPARSE = 0x1000;
 let FILE_FLAG_BACKUP_SEMANTICS = 0x02000000; let FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
 let OPEN_EXISTING = 3; let FILE_ATTRIBUTE_TAG_INFO = 9;
 let FILE_ID_BOTH_DIRECTORY_INFO = 10; let FILE_ID_BOTH_DIRECTORY_RESTART_INFO = 11;
-let FILE_RENAME_INFO = 3; let FILE_DISPOSITION_INFO = 4;
+let NT_FILE_ID_BOTH_DIRECTORY_INFORMATION = 37;
+let STATUS_NO_MORE_FILES = -2147483642;
+let FILE_RENAME_INFORMATION = 10; let FILE_DISPOSITION_INFO = 4;
 let FILE_BEGIN = 0;
 let ERROR_NO_MORE_FILES = 18; let LOCKFILE_FAIL_IMMEDIATELY = 1; let LOCKFILE_EXCLUSIVE_LOCK = 2;
 let STATUS_OBJECT_NAME_NOT_FOUND = -1073741772; let STATUS_OBJECT_PATH_NOT_FOUND = -1073741766;
@@ -41,7 +43,8 @@ fn _i32(value) {
     if normalized >= 2147483648 { return normalized - 4294967296; }
     return normalized;
 }
-fn _bridge_path() {
+fn _bridge_path(provided = nil) {
+    if type(provided) == "string" and provided != "" { return provided; }
     let explicit = try env_get("PBLANG_WINDOWS_ABI_BRIDGE") catch nil;
     if type(explicit) == "string" and explicit != "" { return explicit; }
     let stdlib = try env_get("PBLANG_STDLIB_DIR") catch nil;
@@ -66,15 +69,8 @@ fn available() {
         root_handle: true, obj_dont_reparse: true, pathname_fallback: false };
 }
 
-fn _pad11(arguments) {
-    if type(arguments) != "array" or len(arguments) > 11 { return nil; }
-    let out = []; let i = 0; while i < len(arguments) { array_push(out, arguments[i]); i = i + 1; }
-    while len(out) < 11 { array_push(out, 0); } return out;
-}
 fn _call(fs, symbol, arguments) {
-    if not map_has(fs.api, symbol) or fs.api[symbol] <= 0 { return map{ ok: false, error: "missing API " + symbol }; }
-    let padded = _pad11(arguments); if padded == nil { return map{ ok: false, error: "too many Win64 arguments" }; }
-    return ABI.call_u64x11(fs.abi, fs.api[symbol], padded);
+    return ABI.call_dirfs(fs.abi, symbol, arguments);
 }
 fn _value(fs, symbol, arguments, fallback) {
     let result = _call(fs, symbol, arguments); return if result.ok { result.value } else { fallback };
@@ -111,7 +107,11 @@ fn _wide(fs, text) {
     if type(text) != "string" or str_contains(text, strfromcharcode(0)) { return _error("invalid UTF-8 path"); }
     let bytes = str_to_bytes(text); let source = ABI.allocate(fs.abi, len(bytes) + 1);
     if source == 0 { return _error("UTF-8 path allocation failed"); }
-    if ABI.copy_cstr(fs.abi, source, 0, text, len(bytes) + 1) != len(bytes) {
+    let copied = true; let i = 0;
+    while i < len(bytes) and copied {
+        copied = ABI.write_u8(fs.abi, source, i, bytes[i]); i = i + 1;
+    }
+    if not copied or not ABI.write_u8(fs.abi, source, len(bytes), 0) {
         ABI.free(fs.abi, source); return _error("UTF-8 path copy failed");
     }
     let capacity = len(bytes) + 1; let wide = ABI.allocate(fs.abi, capacity * 2);
@@ -126,30 +126,17 @@ fn _wide(fs, text) {
 }
 fn _free_wide(fs, wide) { if wide != nil and (try wide.pointer catch 0) > 0 { ABI.free(fs.abi, wide.pointer); } }
 
-fn _symbols(abi, kernel_module, ntdll_module) {
-    let api = map{};
-    let kernel = ["CloseHandle", "CreateFileW", "FlushFileBuffers", "GetFileInformationByHandleEx",
-        "GetFileSizeEx", "GetLastError", "LockFileEx", "MultiByteToWideChar", "ReadFile",
-        "SetFileInformationByHandle", "SetFilePointerEx", "UnlockFileEx", "WriteFile"];
-    let i = 0; while i < len(kernel) { api[kernel[i]] = ABI.symbol(abi, kernel_module, kernel[i]); i = i + 1; }
-    api.NtCreateFile = ABI.symbol(abi, ntdll_module, "NtCreateFile"); return api;
-}
-fn _all_symbols(api) { let keys = map_keys(api); let i = 0; while i < len(keys) { if api[keys[i]] <= 0 { return false; } i = i + 1; } return true; }
-
-fn open(root = ".", create = false) {
+fn open(root = ".", create = false, bridge_path = nil) {
     if create { return _error("Windows secure roots must exist before they are trusted"); }
     if type(root) != "string" or root == "" or len(root) > MAX_PATH or str_contains(root, strfromcharcode(0)) {
         return _error("invalid Windows root path");
     }
-    let bridge = _bridge_path(); if bridge == nil { return _error("packaged Win64 ABI bridge is not configured"); }
+    let bridge = _bridge_path(bridge_path); if bridge == nil { return _error("packaged Win64 ABI bridge is not configured"); }
     let abi = ABI.load_packaged(bridge); if not abi.ok { return _error(abi.error); }
-    let kernel_module = ABI.load_system_library(abi, "kernel32.dll");
-    let ntdll_module = ABI.load_system_library(abi, "ntdll.dll");
-    if kernel_module == 0 or ntdll_module == 0 { ABI.close(abi); return _error("Windows system modules cannot be held"); }
-    let fs = map{ ok: true, format: "pblang.windows-dirfs.v1", abi: abi, api: map{}, root_handle: 0,
+    let api = ABI.open_dirfs_api(abi);
+    if not api.ok { ABI.close(abi); return _error(api.error); }
+    let fs = map{ ok: true, format: "pblang.windows-dirfs.v1", abi: abi, root_handle: 0,
         root: root, closed: false, lock_handles: map{} };
-    fs.api = _symbols(abi, kernel_module, ntdll_module);
-    if not _all_symbols(fs.api) { ABI.close(abi); return _error("required Windows filesystem API is unavailable"); }
     let wide = _wide(fs, root); if not wide.ok { ABI.close(abi); return wide; }
     let access = SYNCHRONIZE + FILE_LIST_DIRECTORY + FILE_TRAVERSE + FILE_READ_ATTRIBUTES;
     let handle = _value(fs, "CreateFileW", [wide.pointer, access, SHARE_ALL, 0, OPEN_EXISTING,
@@ -167,8 +154,8 @@ fn open(root = ".", create = false) {
 fn _tag_info(fs, handle) {
     let info = ABI.allocate(fs.abi, 8); if info == 0 { return _error("attribute buffer allocation failed"); }
     let ok = _value(fs, "GetFileInformationByHandleEx", [handle, FILE_ATTRIBUTE_TAG_INFO, info, 8], 0);
-    let attributes = if ok != 0 { ABI.read_uint(fs.abi, info, 0, 4) } else { nil };
-    let tag = if ok != 0 { ABI.read_uint(fs.abi, info, 4, 4) } else { nil }; ABI.free(fs.abi, info);
+    let attributes = if ok != 0 { ABI.read_u32(fs.abi, info, 0) } else { nil };
+    let tag = if ok != 0 { ABI.read_u32(fs.abi, info, 4) } else { nil }; ABI.free(fs.abi, info);
     if ok == 0 or attributes == nil or tag == nil { return _error("file attributes cannot be read", _last_error(fs)); }
     return map{ ok: true, attributes: attributes, reparse_tag: tag };
 }
@@ -184,19 +171,19 @@ fn _open_relative(fs, path, access, disposition, options) {
         if iosb > 0 { ABI.free(fs.abi, iosb); } if output > 0 { ABI.free(fs.abi, output); }
         _free_wide(fs, wide); return _error("NtCreateFile structure allocation failed");
     }
-    let prepared = ABI.write_uint(fs.abi, unicode, 0, wide.bytes, 2)
-        and ABI.write_uint(fs.abi, unicode, 2, wide.capacity_bytes, 2)
-        and ABI.write_uint(fs.abi, unicode, 8, wide.pointer, 8)
-        and ABI.write_uint(fs.abi, object, 0, 48, 4)
-        and ABI.write_uint(fs.abi, object, 8, fs.root_handle, 8)
-        and ABI.write_uint(fs.abi, object, 16, unicode, 8)
-        and ABI.write_uint(fs.abi, object, 24, OBJ_CASE_INSENSITIVE + OBJ_DONT_REPARSE, 4);
+    let prepared = ABI.write_u16(fs.abi, unicode, 0, wide.bytes)
+        and ABI.write_u16(fs.abi, unicode, 2, wide.capacity_bytes)
+        and ABI.write_u64(fs.abi, unicode, 8, wide.pointer)
+        and ABI.write_u32(fs.abi, object, 0, 48)
+        and ABI.write_u64(fs.abi, object, 8, fs.root_handle)
+        and ABI.write_u64(fs.abi, object, 16, unicode)
+        and ABI.write_u32(fs.abi, object, 24, OBJ_CASE_INSENSITIVE + OBJ_DONT_REPARSE);
     let result = map{ ok: false, error: "NtCreateFile structure initialization failed" };
     if prepared {
         let called = _call(fs, "NtCreateFile", [output, access, object, iosb, 0, FILE_ATTRIBUTE_NORMAL,
             SHARE_ALL, disposition, options + FILE_OPEN_REPARSE_POINT, 0, 0]);
         let status = -1; if called.ok { status = _i32(called.value); }
-        let handle = if status >= 0 { ABI.read_uint(fs.abi, output, 0, 8) } else { nil };
+        let handle = if status >= 0 { ABI.read_u64(fs.abi, output, 0) } else { nil };
         if status >= 0 and handle != nil and handle != 0 and handle != INVALID_HANDLE {
             result = map{ ok: true, handle: handle, path: path, ntstatus: status,
                 root_relative: true, obj_dont_reparse: true, nofollow: true };
@@ -213,7 +200,7 @@ fn _open_relative(fs, path, access, disposition, options) {
 fn _size_handle(fs, handle) {
     let output = ABI.allocate(fs.abi, 8); if output == 0 { return _error("size buffer allocation failed"); }
     let ok = _value(fs, "GetFileSizeEx", [handle, output], 0);
-    let size = if ok != 0 { ABI.read_uint(fs.abi, output, 0, 8) } else { nil }; ABI.free(fs.abi, output);
+    let size = if ok != 0 { ABI.read_u64(fs.abi, output, 0) } else { nil }; ABI.free(fs.abi, output);
     if ok == 0 or size == nil or size < 0 or size > 9007199254740991 { return _error("file size cannot be represented safely", _last_error(fs)); }
     return map{ ok: true, size: size };
 }
@@ -230,7 +217,7 @@ fn _read_handle(fs, handle, maximum, prefix) {
         return _error("bounded read allocation failed");
     }
     let ok = _value(fs, "ReadFile", [handle, buffer, requested, count, 0], 0);
-    let got = if ok != 0 { ABI.read_uint(fs.abi, count, 0, 4) } else { nil };
+    let got = if ok != 0 { ABI.read_u32(fs.abi, count, 0) } else { nil };
     let bytes = nil;
     if got != nil { let retained = got; if retained > maximum { retained = maximum; } bytes = ABI.read_bytes(fs.abi, buffer, 0, retained); }
     ABI.free(fs.abi, count); ABI.free(fs.abi, buffer);
@@ -270,7 +257,7 @@ fn read_range_bytes(fs, path, offset, max_bytes = 65536) {
     }
     let ok = _value(fs, "ReadFile", [opened.handle, buffer, ceiling, count, 0], 0);
     let code = if ok == 0 { _last_error(fs) } else { 0 };
-    let got = if ok != 0 { ABI.read_uint(fs.abi, count, 0, 4) } else { nil };
+    let got = if ok != 0 { ABI.read_u32(fs.abi, count, 0) } else { nil };
     let bytes = if got != nil and got <= ceiling { ABI.read_bytes(fs.abi, buffer, 0, got) } else { nil };
     ABI.free(fs.abi, count); ABI.free(fs.abi, buffer); _close_handle(fs, opened.handle);
     if ok == 0 or got == nil or bytes == nil { return _error("bounded range read failed", code); }
@@ -311,15 +298,15 @@ fn mkdir(fs, path) {
     return map{ ok: true, path: path, descriptor_bound: true, nofollow: true };
 }
 
-fn _decode_utf16(fs, pointer, byte_length) {
+fn _decode_utf16(fs, pointer, start_offset, byte_length) {
     if num_mod(byte_length, 2) != 0 or byte_length < 0 or byte_length > MAX_COMPONENT * 4 { return nil; }
     let text = ""; let offset = 0;
     while offset < byte_length {
-        let first = ABI.read_uint(fs.abi, pointer, offset, 2); if first == nil { return nil; }
+        let first = ABI.read_u16(fs.abi, pointer, start_offset + offset); if first == nil { return nil; }
         let scalar = first;
         if first >= 0xD800 and first <= 0xDBFF {
             if offset + 3 >= byte_length { return nil; }
-            let second = ABI.read_uint(fs.abi, pointer, offset + 2, 2);
+            let second = ABI.read_u16(fs.abi, pointer, start_offset + offset + 2);
             if second == nil or second < 0xDC00 or second > 0xDFFF { return nil; }
             scalar = 0x10000 + (first - 0xD800) * 1024 + (second - 0xDC00); offset = offset + 2;
         } elif first >= 0xDC00 and first <= 0xDFFF { return nil; }
@@ -331,40 +318,55 @@ fn list(fs, path = "root", max_entries = 1024) {
     if not _integer(max_entries, 0, MAX_LIST_ENTRIES) { return _error("invalid directory entry limit"); }
     let opened = _directory_handle(fs, path, false); if not opened.ok { return opened; }
     let buffer = ABI.allocate(fs.abi, DIRECTORY_BUFFER_BYTES);
-    if buffer == 0 { if opened.owned { _close_handle(fs, opened.handle); } return _error("directory buffer allocation failed"); }
+    let iosb = ABI.allocate(fs.abi, 16);
+    if buffer == 0 or iosb == 0 {
+        if buffer > 0 { ABI.free(fs.abi, buffer); }
+        if iosb > 0 { ABI.free(fs.abi, iosb); }
+        if opened.owned { _close_handle(fs, opened.handle); }
+        return _error("directory buffer allocation failed");
+    }
     let entries = []; let restart = true; let done = false; let failed = nil;
     while not done and len(entries) < max_entries {
-        let info_class = if restart { FILE_ID_BOTH_DIRECTORY_RESTART_INFO } else { FILE_ID_BOTH_DIRECTORY_INFO };
+        let restart_flag = 0; if restart { restart_flag = 1; }
+        let called = _call(fs, "NtQueryDirectoryFile", [opened.handle, 0, 0, 0,
+            iosb, buffer, DIRECTORY_BUFFER_BYTES, NT_FILE_ID_BOTH_DIRECTORY_INFORMATION,
+            0, 0, restart_flag]);
         restart = false;
-        let ok = _value(fs, "GetFileInformationByHandleEx", [opened.handle, info_class, buffer, DIRECTORY_BUFFER_BYTES], 0);
-        if ok == 0 {
-            let code = _last_error(fs); if code != ERROR_NO_MORE_FILES { failed = _error("directory enumeration failed", code); }
+        let status = -1; if called.ok { status = _i32(called.value); }
+        if not called.ok {
+            failed = _error("directory enumeration ABI gate failed"); done = true;
+        } elif status == STATUS_NO_MORE_FILES {
             done = true;
+        } elif status < 0 {
+            failed = _error("directory enumeration failed", status); done = true;
         } else {
+            let used = ABI.read_u64(fs.abi, iosb, 8);
+            if used == nil or used < 0 or used > DIRECTORY_BUFFER_BYTES {
+                failed = _error("invalid Windows directory byte count"); done = true;
+            }
             let cursor = 0; let records = 0;
-            while not done and cursor + 104 <= DIRECTORY_BUFFER_BYTES and len(entries) < max_entries {
-                let next = ABI.read_uint(fs.abi, buffer, cursor, 4);
-                let name_bytes = ABI.read_uint(fs.abi, buffer, cursor + 60, 4);
+            while not done and cursor + 104 <= used and len(entries) < max_entries {
+                let next = ABI.read_u32(fs.abi, buffer, cursor);
+                let name_bytes = ABI.read_u32(fs.abi, buffer, cursor + 60);
                 if next == nil or name_bytes == nil or num_mod(name_bytes, 2) != 0
-                    or name_bytes > MAX_COMPONENT * 4 or cursor + 104 + name_bytes > DIRECTORY_BUFFER_BYTES {
+                    or name_bytes > MAX_COMPONENT * 4 or cursor + 104 + name_bytes > used {
                     failed = _error("invalid Windows directory information record"); done = true;
                 } else {
-                    let name = _decode_utf16(fs, buffer + cursor + 104, name_bytes);
+                    let name = _decode_utf16(fs, buffer, cursor + 104, name_bytes);
                     if name == nil { failed = _error("invalid UTF-16 directory name"); done = true; }
                     elif name != "." and name != ".." { array_push(entries, name); }
                     records = records + 1;
-                    if next == 0 { done = true; }
-                    elif next < 104 or cursor + next <= cursor or cursor + next >= DIRECTORY_BUFFER_BYTES {
+                    if next == 0 { cursor = used; }
+                    elif next < 104 or cursor + next <= cursor or cursor + next >= used {
                         failed = _error("invalid Windows directory continuation offset"); done = true;
                     } else { cursor = cursor + next; }
                 }
             }
-            // A zero continuation ends this buffer. A subsequent call advances
-            // the kernel enumeration; keep going unless the caller bound is hit.
-            if failed == nil and records > 0 and len(entries) < max_entries { done = false; }
+            if failed == nil and records == 0 { done = true; }
         }
     }
-    ABI.free(fs.abi, buffer); if opened.owned { _close_handle(fs, opened.handle); }
+    ABI.free(fs.abi, iosb); ABI.free(fs.abi, buffer);
+    if opened.owned { _close_handle(fs, opened.handle); }
     if failed != nil { return failed; }
     return map{ ok: true, path: path, entries: entries, truncated: len(entries) >= max_entries,
         descriptor_bound: true, race_resistant: true };
@@ -396,7 +398,7 @@ fn _write_handle(fs, handle, bytes) {
         return _error("bounded write buffer preparation failed");
     }
     let ok = _value(fs, "WriteFile", [handle, buffer, len(bytes), count, 0], 0);
-    let wrote = if ok != 0 { ABI.read_uint(fs.abi, count, 0, 4) } else { nil };
+    let wrote = if ok != 0 { ABI.read_u32(fs.abi, count, 0) } else { nil };
     ABI.free(fs.abi, count); ABI.free(fs.abi, buffer);
     if ok == 0 or wrote != len(bytes) { return _error("complete handle write failed", _last_error(fs)); }
     if _value(fs, "FlushFileBuffers", [handle], 0) == 0 { return _error("file flush failed", _last_error(fs)); }
@@ -404,22 +406,42 @@ fn _write_handle(fs, handle, bytes) {
 }
 fn _delete_handle(fs, handle) {
     let info = ABI.allocate(fs.abi, 1); if info == 0 { return false; }
-    let prepared = ABI.write_uint(fs.abi, info, 0, 1, 1);
+    let prepared = ABI.write_u8(fs.abi, info, 0, 1);
     let ok = prepared and _value(fs, "SetFileInformationByHandle", [handle, FILE_DISPOSITION_INFO, info, 1], 0) != 0;
     ABI.free(fs.abi, info); return ok;
 }
 fn _rename_handle(fs, handle, destination, replace) {
-    let relative = _relative(destination, false); if relative == nil { return false; }
-    let wide = _wide(fs, relative); if not wide.ok { return false; }
-    let size = 20 + wide.bytes; let info = ABI.allocate(fs.abi, size);
-    if info == 0 { _free_wide(fs, wide); return false; }
+    let relative = _relative(destination, false);
+    if relative == nil { return _error("invalid handle-relative rename destination"); }
+    let wide = _wide(fs, relative); if not wide.ok { return wide; }
+    // FILE_RENAME_INFO is 24 bytes on Win64 because FileName[1] and the
+    // structure tail are naturally aligned. Keep a UTF-16 terminator in the
+    // backing allocation even though FileNameLength excludes it.
+    let size = 24 + wide.bytes; let info = ABI.allocate(fs.abi, size);
+    let iosb = ABI.allocate(fs.abi, 16);
+    if info == 0 or iosb == 0 {
+        if info > 0 { ABI.free(fs.abi, info); }
+        if iosb > 0 { ABI.free(fs.abi, iosb); }
+        _free_wide(fs, wide); return _error("rename buffer allocation failed");
+    }
     let bytes = ABI.read_bytes(fs.abi, wide.pointer, 0, wide.bytes);
-    let prepared = bytes != nil and ABI.write_uint(fs.abi, info, 0, if replace { 1 } else { 0 }, 4)
-        and ABI.write_uint(fs.abi, info, 8, fs.root_handle, 8)
-        and ABI.write_uint(fs.abi, info, 16, wide.bytes, 4)
-        and ABI.write_bytes(fs.abi, info, 20, bytes);
-    let ok = prepared and _value(fs, "SetFileInformationByHandle", [handle, FILE_RENAME_INFO, info, size], 0) != 0;
-    ABI.free(fs.abi, info); _free_wide(fs, wide); return ok;
+    let replace_flag = 0; if replace { replace_flag = 1; }
+    let prepared = bytes != nil and ABI.write_u8(fs.abi, info, 0, replace_flag)
+        and ABI.write_u64(fs.abi, info, 8, fs.root_handle)
+        and ABI.write_u32(fs.abi, info, 16, wide.bytes)
+        and ABI.write_bytes(fs.abi, info, 20, bytes)
+        and ABI.write_u16(fs.abi, info, 20 + wide.bytes, 0);
+    let called = map{ ok: false, error: "rename buffer preparation failed" };
+    if prepared {
+        called = _call(fs, "NtSetInformationFile",
+            [handle, iosb, info, size, FILE_RENAME_INFORMATION]);
+    }
+    let status = -1; if called.ok { status = _i32(called.value); }
+    ABI.free(fs.abi, iosb); ABI.free(fs.abi, info); _free_wide(fs, wide);
+    if not prepared { return _error("rename buffer preparation failed"); }
+    if not called.ok { return _error("NtSetInformationFile rename gate failed"); }
+    if status < 0 { return _error("handle-relative rename failed", status); }
+    return map{ ok: true, atomic: true, root_relative: true, ntstatus: status };
 }
 fn _parent_stage(path) {
     let parts = _components(path, false); if parts == nil or len(parts) < 1 { return nil; }
@@ -459,10 +481,14 @@ fn write_atomic(fs, path, bytes, create_parents = true) {
         FILE_CREATE, FILE_SYNCHRONOUS_IO_NONALERT + FILE_NON_DIRECTORY_FILE);
     if not opened.ok { return _error("exclusive staging file cannot be created"); }
     let wrote = _write_handle(fs, opened.handle, bytes);
-    let published = wrote.ok and _rename_handle(fs, opened.handle, path, true);
+    let renamed = if wrote.ok { _rename_handle(fs, opened.handle, path, true) }
+        else { _error("write failed before atomic publication") };
+    let published = wrote.ok and renamed.ok;
     if not published { _delete_handle(fs, opened.handle); }
     _close_handle(fs, opened.handle);
-    if not wrote.ok { return wrote; } if not published { return _error("staged file cannot be published atomically", _last_error(fs)); }
+    if not wrote.ok { return wrote; }
+    if not published { return _error("staged file cannot be published atomically",
+        try renamed.os_error catch nil); }
     return map{ ok: true, path: path, size: len(bytes), atomic: true,
         descriptor_bound_parent: true, nofollow: true };
 }
@@ -475,6 +501,47 @@ fn remove_file(fs, path) {
     if not removed { return _error("file entry cannot be removed", code); }
     return map{ ok: true, path: path, directory_removal: false,
         descriptor_bound_parent: true, symlink_target_followed: false };
+}
+
+// Remove either one non-directory entry or one empty directory while holding
+// the source handle. Reparse targets are never followed by _open_relative.
+fn remove(fs, path) {
+    let file = remove_file(fs, path);
+    if file.ok { return file; }
+    let opened = _open_relative(fs, path,
+        SYNCHRONIZE + DELETE_ACCESS + FILE_READ_ATTRIBUTES,
+        FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT + FILE_DIRECTORY_FILE);
+    if not opened.ok { return opened; }
+    let removed = _delete_handle(fs, opened.handle);
+    let code = 0; if not removed { code = _last_error(fs); }
+    _close_handle(fs, opened.handle);
+    if not removed { return _error("empty directory entry cannot be removed", code); }
+    return map{ ok: true, path: path, directory_removal: true,
+        descriptor_bound_parent: true, symlink_target_followed: false };
+}
+
+// Rename a file or directory through its held handle. The destination is
+// interpreted relative to the same trusted root handle and may not traverse a
+// reparse point. FILE_RENAME_INFORMATION applies the replace policy atomically.
+fn move(fs, from, to, replace = true) {
+    if _relative(from, false) == nil or _relative(to, false) == nil {
+        return _error("invalid confined rename path");
+    }
+    let opened = _open_relative(fs, from,
+        SYNCHRONIZE + DELETE_ACCESS + FILE_READ_ATTRIBUTES,
+        FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT + FILE_NON_DIRECTORY_FILE);
+    if not opened.ok {
+        opened = _open_relative(fs, from,
+            SYNCHRONIZE + DELETE_ACCESS + FILE_READ_ATTRIBUTES + FILE_LIST_DIRECTORY + FILE_TRAVERSE,
+            FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT + FILE_DIRECTORY_FILE);
+    }
+    if not opened.ok { return opened; }
+    let renamed = _rename_handle(fs, opened.handle, to, replace);
+    _close_handle(fs, opened.handle);
+    if not renamed.ok { return renamed; }
+    return map{ ok: true, from: from, to: to, atomic: true,
+        replaced: replace, descriptor_bound_parent: true,
+        symlink_target_followed: false };
 }
 
 fn acquire_lock(fs, path, timeout_ms = 2000, poll_ms = 10) {
@@ -520,5 +587,5 @@ fn status(fs = nil) {
 }
 
 export profile, available, open, close, list, read_bytes, read_prefix_bytes, read_range_bytes;
-export file_size, metadata, mkdir, write_atomic, write_new_exclusive, remove_file;
+export file_size, metadata, mkdir, write_atomic, write_new_exclusive, remove_file, remove, move;
 export acquire_lock, release_lock, status;

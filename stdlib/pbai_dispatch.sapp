@@ -1,0 +1,190 @@
+// stdlib/pbai_dispatch.sapp — deterministic, single-expert pbAI routing policy.
+//
+// This module does not load a model and performs no I/O. It selects the smallest
+// available pbAI lane for a request and publishes an ordered, serial fallback
+// chain. Product code remains responsible for capability checks and execution.
+
+let MAX_PROMPT_CHARS = 65536;
+
+fn merge(options, overrides) {
+    let out = map{};
+    if options != nil {
+        let keys = map_keys(options);
+        let i = 0;
+        while i < len(keys) { out[keys[i]] = options[keys[i]]; i = i + 1; }
+    }
+    if overrides != nil {
+        let keys = map_keys(overrides);
+        let i = 0;
+        while i < len(keys) { out[keys[i]] = overrides[keys[i]]; i = i + 1; }
+    }
+    return out;
+}
+
+fn with_profile(options, profile) { return merge(options, map{ profile: str(profile) }); }
+
+fn _opt(options, key, fallback) {
+    if options == nil { return fallback; }
+    return try options[key] catch fallback;
+}
+
+fn _has(text, needle) { return str_contains(str_lower(text), needle); }
+
+fn _valid_task(task) {
+    return task == "grounded" or task == "generation" or task == "reasoning" or
+        task == "retrieval" or task == "tool" or task == "learning" or
+        task == "security" or task == "system";
+}
+
+fn infer_task(prompt, options = nil) {
+    let explicit = str_lower(str_trim(str(_opt(options, "task", ""))));
+    if _valid_task(explicit) { return explicit; }
+    let text = str_lower(str_trim(str(prompt)));
+    if str_starts_with(text, "learn:") or str_starts_with(text, "teach:")
+        or str_starts_with(text, "learn ") or str_starts_with(text, "teach ") {
+        return "learning";
+    }
+    if _has(text, "use tool") or _has(text, "call tool") { return "tool"; }
+    if _has(text, "search memory") or _has(text, "retrieve") or _has(text, "look up locally") { return "retrieval"; }
+    if _has(text, "security") or _has(text, "malware") or _has(text, "permission") or _has(text, "capability") { return "security"; }
+    if _has(text, "generate") or _has(text, "write code") or _has(text, "create code") { return "generation"; }
+    if _has(text, "make a plan") or _has(text, "reason about") or _has(text, "why did this fail") or _has(text, "think through") { return "reasoning"; }
+    return "grounded";
+}
+
+fn _confidence(value) {
+    let text = str_lower(str_trim(str(value)));
+    if text == "nan" or text == "inf" or text == "infinity" or text == "-inf" or text == "-infinity" { return 0; }
+    let number = try parse_number(text) catch 0;
+    if number < 0 { return 0; }
+    if number > 1 { return 1; }
+    return number;
+}
+
+fn _available(lane, profile, options) {
+    if lane == "embedded" { return true; }
+    if lane == "nano" { return _opt(options, "nano_available", profile == "embedded" or profile == "external"); }
+    if lane == "brain" { return _opt(options, "brain_available", profile == "external" or profile == "pbos"); }
+    if lane == "retrieval" { return _opt(options, "retrieval_available", profile == "external"); }
+    if lane == "max" { return _opt(options, "max_available", false) and _opt(options, "allow_max", false); }
+    if lane == "tool" { return _opt(options, "tool_available", profile == "external" or profile == "pbos") and _opt(options, "allow_tools", false); }
+    if lane == "learning" { return _opt(options, "learning_available", profile == "external") and _opt(options, "allow_learning", false); }
+    return false;
+}
+
+fn _fallbacks(desired) {
+    if desired == "max" { return ["brain", "nano", "embedded"]; }
+    if desired == "retrieval" { return ["brain", "embedded"]; }
+    if desired == "brain" { return ["embedded"]; }
+    if desired == "nano" { return ["embedded"]; }
+    return [];
+}
+
+fn _select(desired, profile, options) {
+    if _available(desired, profile, options) { return desired; }
+    let fallbacks = _fallbacks(desired);
+    let i = 0;
+    while i < len(fallbacks) {
+        if _available(fallbacks[i], profile, options) { return fallbacks[i]; }
+        i = i + 1;
+    }
+    return "embedded";
+}
+
+fn _capabilities(lane) {
+    if lane == "tool" { return ["ai:infer", "ai:tool"]; }
+    if lane == "learning" { return ["ai:infer", "ai:learn"]; }
+    if lane == "retrieval" { return ["ai:infer", "ai:memory:read"]; }
+    if lane == "max" { return ["ai:infer", "ai:model:max"]; }
+    return ["ai:infer"];
+}
+
+fn plan(prompt, confidence = 1, options = nil) {
+    let text = str(prompt);
+    let max_chars = _opt(options, "max_prompt_chars", MAX_PROMPT_CHARS);
+    if max_chars < 1 or max_chars > MAX_PROMPT_CHARS { max_chars = MAX_PROMPT_CHARS; }
+    if len(text) > max_chars {
+        return map{
+            format: "pbai.dispatch.plan.v1", ok: false, admitted: false,
+            error: "prompt exceeds the configured character limit",
+            prompt_chars: len(text), max_prompt_chars: max_chars,
+            parallel: false, max_active_experts: 0, selected_lane: "none"
+        };
+    }
+
+    let profile = str_lower(str_trim(str(_opt(options, "profile", "embedded"))));
+    if profile != "embedded" and profile != "external" and profile != "pbos" { profile = "embedded"; }
+    let task = infer_task(text, options);
+    let score = _confidence(confidence);
+    let desired = "embedded";
+    let reason = "the grounded embedded path is sufficient";
+
+    if task == "generation" {
+        desired = "nano";
+        reason = "generation needs a language-model lane";
+        let quality = str_lower(str(_opt(options, "quality", "balanced")));
+        if quality == "high" and _opt(options, "allow_max", false) {
+            desired = "max";
+            reason = "high-quality generation explicitly permits the Max lane";
+        }
+    }
+    if task == "reasoning" {
+        desired = "brain";
+        reason = "multi-step reasoning benefits from the bounded cognitive loop";
+    }
+    if task == "retrieval" {
+        desired = "retrieval";
+        reason = "the request explicitly needs provenance-linked local memory";
+    }
+    if task == "tool" {
+        desired = "tool";
+        reason = "tool execution must be explicit and capability-scoped";
+    }
+    if task == "learning" {
+        desired = "learning";
+        reason = "learning is an explicit persistence operation";
+    }
+    if task == "security" {
+        desired = "brain";
+        reason = "security output is advisory and requires independent verification";
+    }
+    if task == "grounded" and score < 0.58 {
+        desired = "brain";
+        reason = "low router confidence requires a bounded second-stage review";
+    }
+
+    let side_effect = _opt(options, "side_effect", false);
+    let explicit_gate = desired == "tool" or desired == "learning";
+    let admitted = true;
+    if side_effect and not _opt(options, "approved", false) { admitted = false; }
+    if desired == "tool" and not _available("tool", profile, options) { admitted = false; }
+    if desired == "learning" and not _available("learning", profile, options) { admitted = false; }
+
+    let selected = "none";
+    if admitted { selected = _select(desired, profile, options); }
+    let needs_verifier = task == "security" or task == "generation" or
+        task == "tool" or side_effect;
+    return map{
+        format: "pbai.dispatch.plan.v1",
+        ok: true,
+        admitted: admitted,
+        profile: profile,
+        task: task,
+        confidence: score,
+        desired_lane: desired,
+        selected_lane: selected,
+        reason: reason,
+        degraded: admitted and selected != desired,
+        parallel: false,
+        max_active_experts: if admitted { 1 } else { 0 },
+        fallbacks: _fallbacks(desired),
+        required_capabilities: _capabilities(desired),
+        requires_approval: side_effect or explicit_gate,
+        advisory_only: task == "security",
+        requires_independent_verifier: needs_verifier,
+        prompt_chars: len(text),
+        max_prompt_chars: max_chars
+    };
+}
+
+export plan, infer_task, merge, with_profile, MAX_PROMPT_CHARS;

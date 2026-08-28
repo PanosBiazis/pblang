@@ -295,3 +295,37 @@ fn channel_buffered_huge_capacity_does_not_oom() {
     );
     assert_eq!(out, vec![Value::Number(7.0)]);
 }
+
+#[test]
+fn spawned_vm_cannot_regain_parent_denied_host_capabilities() {
+    let stmts = parse(
+        r#"
+        let h = spawn(fn() {
+            let fs = try fs_exists(".") catch "denied";
+            let env = try env_get("PATH") catch "denied";
+            return [fs, env];
+        });
+        print join(h);
+        "#,
+    )
+    .expect("parse failed");
+    let mut chunk = compile(stmts).expect("compile failed");
+    chunk.source_name = Some(Rc::new("<test>".to_string()));
+    let config = StdlibConfig {
+        fs: false,
+        env: false,
+        spawn: true,
+        process_exit: false,
+        ..StdlibConfig::default()
+    };
+    let mut vm = VM::with_stdlib(config);
+    let out = vm.run_collect(chunk).expect("spawned denial probe");
+    assert_eq!(out.len(), 1);
+    let Value::Array(values) = &out[0] else {
+        panic!("expected child result array, got {:?}", out[0]);
+    };
+    let values = values.borrow();
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0].to_string(), "denied");
+    assert_eq!(values[1].to_string(), "denied");
+}

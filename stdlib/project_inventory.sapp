@@ -2,10 +2,16 @@
 //
 // This module walks directory names only. It never reads file contents. The
 // output is safe path metadata for stdlib:project_survey.sapp, which can then
-// produce cross-project readiness/action plans for pblang, pbAI, pbOS, PBIDE,
-// pb-mcp-server, and PBRemote.
+// produce cross-project readiness/action plans for every declared AAP product.
 
 let SURVEY = import("stdlib:project_survey.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
+
+let MAX_ROOTS_HARD = 64;
+let MAX_DEPTH_HARD = 32;
+let MAX_ENTRIES_HARD = 50000;
+let MAX_CHILDREN_HARD = 4096;
+let MAX_RUNTIME_MS_HARD = 300000;
 
 fn _str(x) { return str(x ?? ""); }
 
@@ -48,7 +54,11 @@ fn _skip_name(name) {
         or n == "venv" or str_ends_with(n, "-venv") or n == "site-packages" { return true; }
     if n == "vendor" or n == "pods" or n == ".gradle" or n == ".idea"
         or n == "deriveddata" { return true; }
-    if n == "cache" or n == "tmp" or n == "temp" or n == "build" or n == "dist" or n == "obj" or n == "bin" { return true; }
+    if n == ".obsidian" or n == ".next" or n == ".pytest_cache"
+        or n == ".mypy_cache" or n == ".ruff_cache" or n == ".tox" or n == ".nox" { return true; }
+    if n == "cache" or n == "tmp" or n == "temp" or n == "build" or n == "dist"
+        or n == "obj" or n == "bin" or n == "out" or n == "coverage"
+        or n == "artifacts" or n == "reports" or n == "logs" { return true; }
     if n == "graphify-out" { return true; }
     if str_contains(n, "credential") or str_contains(n, "password") or str_contains(n, "passwd") { return true; }
     if str_contains(n, "secret") or str_contains(n, "token") or str_contains(n, "openrouter") { return true; }
@@ -76,14 +86,15 @@ fn should_skip_path(path) {
 }
 
 fn _is_dir(path) {
-    let entries = try fs_listdir(path) catch nil;
-    return type(entries) == "array";
+    let listed = SECURE.list_directory(path, 1);
+    return try listed.ok catch false;
 }
 
 fn _bounded_listdir(path, max_children) {
-    let raw = try fs_listdir(path) catch nil;
-    if type(raw) != "array" { return nil; }
-    return _bounded_entries(raw, max_children);
+    let listed = SECURE.list_directory(path, max_children);
+    if not (try listed.ok catch false) { return nil; }
+    return map{ entries: _bounded_entries(listed.entries, max_children),
+        truncated: try listed.truncated catch false };
 }
 
 fn _bounded_entries(raw, max_children) {
@@ -119,11 +130,22 @@ fn inventory_roots(roots, options = nil) {
     let include_files = try options.include_files catch true;
     let include_dirs = try options.include_dirs catch true;
     let max_runtime_ms = try options.max_runtime_ms catch 30000;
-    if max_depth == nil or max_depth < 0 { max_depth = 4; }
-    if max_entries == nil or max_entries < 1 { max_entries = 1000; }
-    if max_children == nil or max_children < 1 { max_children = 200; }
-    if max_runtime_ms == nil or max_runtime_ms < 10 { max_runtime_ms = 30000; }
-    if max_runtime_ms > 300000 { max_runtime_ms = 300000; }
+    let valid_limits = type(roots) == "array" and len(roots) >= 1 and len(roots) <= MAX_ROOTS_HARD
+        and type(max_depth) == "number" and max_depth == num_floor(max_depth)
+        and max_depth >= 0 and max_depth <= MAX_DEPTH_HARD
+        and type(max_entries) == "number" and max_entries == num_floor(max_entries)
+        and max_entries >= 1 and max_entries <= MAX_ENTRIES_HARD
+        and type(max_children) == "number" and max_children == num_floor(max_children)
+        and max_children >= 1 and max_children <= MAX_CHILDREN_HARD
+        and type(max_runtime_ms) == "number" and max_runtime_ms == num_floor(max_runtime_ms)
+        and max_runtime_ms >= 10 and max_runtime_ms <= MAX_RUNTIME_MS_HARD;
+    if not valid_limits {
+        return map{ format: "pblang.project_inventory.report.v1", roots: [], records: [], paths: [],
+            record_count: 0, scanned_dirs: 0, scanned_entries: 0, skipped: [], skipped_count: 0,
+            errors: ["invalid bounded inventory request"], timed_out: false, duration_ms: 0,
+            max_runtime_ms: 0, truncated: true, complete: false,
+            policy: "invalid requests fail closed before filesystem access" };
+    }
     let started_ms = now_ms(); let deadline_ms = started_ms + max_runtime_ms;
 
     let records = [];
@@ -154,14 +176,16 @@ fn inventory_roots(roots, options = nil) {
         let path = _str(cur.path);
         let depth = try cur.depth catch 0;
         let parent = _str(try cur.parent catch "");
-        let entries = try cur.entries catch nil;
-        if type(entries) != "array" { entries = _bounded_listdir(path, max_children); }
-        if entries == nil {
+        let listing = try cur.listing catch nil;
+        if type(listing) != "map" { listing = _bounded_listdir(path, max_children); }
+        if listing == nil {
             if include_files {
                 array_push(records, _record(path, "file", depth, parent));
             }
             continue;
         }
+        let entries = listing.entries;
+        if try listing.truncated catch false { truncated = true; }
 
         scanned_dirs = scanned_dirs + 1;
         if include_dirs {
@@ -180,11 +204,11 @@ fn inventory_roots(roots, options = nil) {
                 i = i + 1;
                 continue;
             }
-            let child_entries = try fs_listdir(child) catch nil;
-            if type(child_entries) == "array" {
+            let child_listing = _bounded_listdir(child, max_children);
+            if type(child_listing) == "map" {
                 if depth + 1 < max_depth {
                     array_push(queue, map{ path: child, depth: depth + 1, parent: path,
-                        entries: _bounded_entries(child_entries, max_children) });
+                        listing: child_listing });
                 } else if include_dirs {
                     array_push(records, _record(child, "dir", depth + 1, path));
                 }
@@ -194,7 +218,7 @@ fn inventory_roots(roots, options = nil) {
             i = i + 1;
         }
         if now_ms() >= deadline_ms { timed_out = true; truncated = true; }
-        if len(entries) >= max_children { truncated = true; }
+        if try listing.truncated catch false { truncated = true; }
     }
     if now_ms() >= deadline_ms { timed_out = true; truncated = true; }
     if q < len(queue) { truncated = true; }
@@ -214,7 +238,8 @@ fn inventory_roots(roots, options = nil) {
         duration_ms: now_ms() - started_ms,
         max_runtime_ms: max_runtime_ms,
         truncated: truncated,
-        policy: "metadata-only directory inventory; no file contents are read; sensitive/cache/build/generated-output/local assistant and vendored dependency paths are skipped; traversal is cooperatively deadline bounded"
+        complete: not truncated and len(errors) == 0,
+        policy: "metadata-only no-follow directory inventory; no file contents are read; sensitive/cache/build/generated-output/local assistant and vendored dependency paths are skipped; traversal has hard entry/root/depth limits and a cooperative deadline"
     };
 }
 
@@ -243,7 +268,21 @@ fn inventory_lines(report, limit = 12) {
     let i = 0;
     while i < len(recs) and len(lines) < limit {
         let rec = recs[i];
-        array_push(lines, "- " + str(try rec.kind catch "?") + " " + str(try rec.category catch "?") + " " + str(try rec.path catch ""));
+        let raw_path = str(try rec.path catch "");
+        let safe_path = "";
+        let j = 0;
+        while j < len(raw_path) {
+            let c = strcharcodeat(raw_path, j);
+            // Strip terminal controls, C1 controls and Unicode bidi controls.
+            if c >= 32 and not (c >= 127 and c <= 159)
+               and not (c >= 8234 and c <= 8238)
+               and not (c >= 8294 and c <= 8297) {
+                safe_path = safe_path + str_slice(raw_path, j, j + 1);
+            }
+            j = j + 1;
+        }
+        array_push(lines, "- " + str(try rec.kind catch "?") + " "
+            + str(try rec.category catch "?") + " " + safe_path);
         i = i + 1;
     }
     return lines;

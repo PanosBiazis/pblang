@@ -244,6 +244,8 @@ pub struct StdlibConfig {
     pub ffi: bool,
     pub exec: bool,
     pub gfx: bool,
+    /// If true, source modules may be loaded from configured host paths.
+    pub import: bool,
     /// If true, spawn/join builtins are available; if false, spawn returns "spawn not allowed".
     pub spawn: bool,
     /// If true, `env_get` may read process environment variables; if false it is
@@ -268,6 +270,7 @@ impl Default for StdlibConfig {
             ffi: false,
             exec: false,
             gfx: true,
+            import: true,
             spawn: true,
             env: true,
             process_exit: true,
@@ -311,7 +314,6 @@ impl StdlibConfig {
             | "map_keys"
             | "map_has"
             | "map_remove"
-            | "import"
             | "gc_stats"
             | "gc_collect"
             | "str_contains"
@@ -420,6 +422,7 @@ impl StdlibConfig {
             | "sqlite_query"
             | "sqlite_last_insert_rowid" => self.sqlite,
             "spawn" | "join" => self.spawn,
+            "import" => self.import,
             _ => self.gfx, // gfx builtins from pblang_graphics use their own names
         }
     }
@@ -1015,6 +1018,16 @@ impl VM {
 
     /// Creates a VM with stdlib builtins enabled according to `config`. Use this for scripting and CLI.
     pub fn with_stdlib(config: StdlibConfig) -> Self {
+        // Enabling FFI is an explicit trusted-host opt-in. Keep a concrete
+        // policy in every VM so `None` can never silently mean allow-all.
+        let ffi_policy = if config.ffi {
+            Some(FfiPolicy {
+                allow_all: true,
+                ..FfiPolicy::default()
+            })
+        } else {
+            Some(FfiPolicy::default())
+        };
         let builtins = Rc::new(RefCell::new(Module::default()));
         gc_register_module(&builtins);
         VM::install_builtins_into(&builtins, Some(&config));
@@ -1040,7 +1053,7 @@ impl VM {
             thread_pool: None,
             handle_registry: VmHandleRegistry::new(),
             limits: None,
-            ffi_policy: None,
+            ffi_policy,
             stdin_lines: std::collections::VecDeque::new(),
             signal_handlers: Rc::new(RefCell::new(HashMap::new())),
             jit: None,
@@ -3050,15 +3063,22 @@ impl VmHost for VM {
             .unwrap_or(true)
     }
 
-    /// Library allowlist check. When no policy is set, behaves like the default
-    /// trait impl (allow all). When a policy is set, the path is canonicalised
+    fn allow_import(&self) -> bool {
+        self.stdlib_config
+            .as_ref()
+            .map(|c| c.import)
+            .unwrap_or(false)
+    }
+
+    /// Library allowlist check. A missing policy denies access. When a policy is
+    /// set, the path is canonicalised
     /// (best-effort) so `./lib.so` and `lib.so` resolve to the same entry, and
     /// matched against `policy.allowed_libs`. `policy.allow_all = true` bypasses
     /// the check.
     fn ffi_allowed_library(&self, path: &str) -> bool {
         let policy = match self.ffi_policy.as_ref() {
             Some(p) => p,
-            None => return true,
+            None => return false,
         };
         if policy.allow_all {
             return true;
@@ -3078,12 +3098,12 @@ impl VmHost for VM {
         false
     }
 
-    /// Symbol allowlist check. When no policy is set, allow all. Otherwise the
+    /// Symbol allowlist check. A missing policy denies access. Otherwise the
     /// symbol must appear in `policy.allowed_symbols` unless `allow_all = true`.
     fn ffi_allowed_symbol(&self, symbol: &str) -> bool {
         let policy = match self.ffi_policy.as_ref() {
             Some(p) => p,
-            None => return true,
+            None => return false,
         };
         if policy.allow_all {
             return true;

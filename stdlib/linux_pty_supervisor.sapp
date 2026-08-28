@@ -268,9 +268,10 @@ fn _install_inherited_limit(code, resource, requested, save_offset, errors) {
 
 fn _code(layout) {
     let code = []; let errors = []; let terminal_errors = [];
-    // Preserve the original environment for script and the selected shell.
-    _append(code, [0x49, 0x89, 0xE4, 0x4D, 0x8B, 0x2C, 0x24]);
-    _append(code, [0x4F, 0x8D, 0x74, 0xEC, 0x10]); // r14 = envp
+    // Never expose PBRemote's ambient process environment to the paired PTY.
+    // r14 points at the fixed environment encoded into this supervisor.
+    _append(code, X.movabs_imm64("rax", layout.envp));
+    _append(code, [0x49, 0x89, 0xC6]); // r14 = rax
 
     // Refuse to run unless setsid(1) made this process its own process-group
     // leader. Signals can then target the PTY tree without touching PBRemote.
@@ -526,6 +527,11 @@ fn build(options) {
     let pid_stage = _cstring((try options.pid_file catch nil) + ".pending", "pid staging path");
     let status_stage = _cstring((try options.status_file catch nil) + ".pending", "status staging path");
     let limits_stage = _cstring(limits_path + ".pending", "limits staging path");
+    let home = try options.home catch "/tmp";
+    if type(home) != "string" or not str_starts_with(home, "/")
+        or len(home) < 2 or len(home) > 4096 or str_contains(home, "\x00") {
+        throw "linux_pty_supervisor: home must be a bounded absolute path";
+    }
     let raw = [fifo, pid, status, pid_stage, status_stage, limits, limits_stage,
         _cstring("/dev/null", "null path"), timeout,
         _cstring_any("timeout", "argv0"), _cstring_any("--foreground", "timeout option"),
@@ -533,10 +539,18 @@ fn build(options) {
         duration, script, _cstring_any("-q", "script option"), _cstring_any("-f", "script option"),
         _cstring_any("-e", "script option"), _cstring_any("-c", "script option"), command, output,
         _cstring("/bin/sh", "command shell"), _cstring_any("-c", "command shell option"), stderr_output,
-        ready, _cstring(ready_path + ".pending", "ready staging path")];
+        ready, _cstring(ready_path + ".pending", "ready staging path"),
+        _cstring_any("PATH=/usr/bin:/bin", "environment"),
+        _cstring_any("HOME=" + home, "environment"),
+        _cstring_any("LANG=C.UTF-8", "environment"),
+        _cstring_any("TERM=xterm-256color", "environment")];
+    let argv_indices = [];
+    if map_has(options, "argv_exec") { argv_indices = [9, 10, 11, 12, 13, 19]; }
+    elif map_has(options, "command") { argv_indices = [9, 10, 11, 12, 13, 21, 22, 19]; }
+    else { argv_indices = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]; }
     let probe = map{ fifo: 0, pid: 0, status: 0, pid_stage: 0, status_stage: 0,
         limits: 0, limits_stage: 0, ready: 0, ready_stage: 0,
-        devnull: 0, output: 0, stderr_output: 0, timeout: 0, argv: 0,
+        devnull: 0, output: 0, stderr_output: 0, timeout: 0, argv: 0, envp: 0,
         max_output: max_output, max_file: max_file, max_memory: max_memory,
         max_cpu: max_cpu, max_open_files: max_open_files,
         max_processes: max_processes,
@@ -547,11 +561,13 @@ fn build(options) {
     let i = 0;
     while i < len(raw) { array_push(addresses, cursor); cursor = cursor + len(raw[i]); i = i + 1; }
     let argv_address = cursor;
+    let envp_address = argv_address + (len(argv_indices) + 1) * 8;
     let layout = map{ fifo: addresses[0], pid: addresses[1], status: addresses[2],
         pid_stage: addresses[3], status_stage: addresses[4], limits: addresses[5],
         limits_stage: addresses[6], ready: addresses[24], ready_stage: addresses[25],
         devnull: addresses[7],
-        output: addresses[20], stderr_output: addresses[23], timeout: addresses[8], argv: argv_address,
+        output: addresses[20], stderr_output: addresses[23], timeout: addresses[8],
+        argv: argv_address, envp: envp_address,
         max_output: max_output, max_file: max_file, max_memory: max_memory,
         max_cpu: max_cpu, max_open_files: max_open_files,
         max_processes: max_processes,
@@ -561,11 +577,9 @@ fn build(options) {
     i = 0; while i < len(raw) { _append(data, raw[i]); i = i + 1; }
     // timeout argv: options, duration, script command, script options, shell,
     // transcript, null terminator.
-    let argv_indices = [];
-    if map_has(options, "argv_exec") { argv_indices = [9, 10, 11, 12, 13, 19]; }
-    elif map_has(options, "command") { argv_indices = [9, 10, 11, 12, 13, 21, 22, 19]; }
-    else { argv_indices = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]; }
     i = 0; while i < len(argv_indices) { _append(data, X.le64(addresses[argv_indices[i]])); i = i + 1; }
+    _append(data, X.le64(0));
+    i = 26; while i < 30 { _append(data, X.le64(addresses[i])); i = i + 1; }
     _append(data, X.le64(0));
     return X.elf64_exec_rx(code, data);
 }
@@ -575,10 +589,11 @@ fn build(options) {
 // published. This gives the parent a cancellable kernel identity before the
 // supervisor performs readiness setup.
 fn _session_launcher_code(layout) {
-    let code = []; let errors = []; let parent_branch = [];
+    let code = []; let errors = []; let parent_errors = [];
+    let coordinator_branch = []; let watchdog_branch = [];
     _append(code, [0x49, 0x89, 0xE4, 0x4D, 0x8B, 0x2C, 0x24]);
     _append(code, [0x4F, 0x8D, 0x74, 0xEC, 0x10]);
-    _append(code, [0x48, 0x83, 0xEC, 0x40]);
+    _append(code, [0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00]);
     _append(code, X.mov_imm32("rax", 293)); _append(code, [0x48, 0x89, 0xE7]);
     _append(code, X.mov_imm32("rsi", 524288)); _append(code, X.syscall());
     _check_nonnegative(code, errors);
@@ -586,10 +601,15 @@ fn _session_launcher_code(layout) {
     _append(code, [0x44, 0x8B, 0x6C, 0x24, 0x04]);
     _append(code, X.mov_imm32("rax", 57)); _append(code, X.syscall());
     _check_nonnegative(code, errors); _append(code, [0x48, 0x85, 0xC0]);
-    _branch(code, [0x0F, 0x85], parent_branch);
+    _branch(code, [0x0F, 0x85], coordinator_branch);
 
     _append(code, X.mov_imm32("rax", 3)); _append(code, [0x44, 0x89, 0xE7]);
     _append(code, X.syscall());
+    // The first child is a watchdog. It forks the actual session leader so it
+    // can remain that exact child's parent until ownership is acknowledged.
+    _append(code, X.mov_imm32("rax", 57)); _append(code, X.syscall());
+    _check_nonnegative(code, errors); _append(code, [0x48, 0x85, 0xC0]);
+    _branch(code, [0x0F, 0x85], watchdog_branch);
     _append(code, X.mov_imm32("rax", 112)); _append(code, X.syscall());
     _check_nonnegative(code, errors);
     _append(code, X.mov_imm32("rax", 39)); _append(code, X.syscall());
@@ -647,8 +667,8 @@ fn _session_launcher_code(layout) {
     _append(code, [0x4C, 0x89, 0xF2]); _append(code, X.syscall());
     _branch(code, [0xE9], errors);
 
-    let parent = len(code); _set_rel32(code, parent_branch[0], parent);
-    // The launcher parent owns the readiness handshake. It reports success only
+    let watchdog = len(code); _set_rel32(code, watchdog_branch[0], watchdog);
+    // The watchdog owns the readiness handshake. It reports success only
     // after wait4 observes this exact fork child in a stopped state, closing the
     // write-before-SIGSTOP scheduling race.
     _append(code, [0x49, 0x89, 0xC6]);
@@ -656,21 +676,118 @@ fn _session_launcher_code(layout) {
     _append(code, [0x48, 0x8D, 0x74, 0x24, 0x30]);
     _append(code, X.mov_imm32("rdx", 2)); _append(code, [0x45, 0x31, 0xD2]);
     _append(code, X.syscall()); _append(code, [0x4C, 0x39, 0xF0]);
-    _branch(code, [0x0F, 0x85], errors);
+    _branch(code, [0x0F, 0x85], parent_errors);
     _append(code, [0x8B, 0x44, 0x24, 0x30, 0x25, 0xFF, 0x00, 0x00, 0x00]);
     _append(code, [0x3D, 0x7F, 0x00, 0x00, 0x00]);
-    _branch(code, [0x0F, 0x85], errors);
+    _branch(code, [0x0F, 0x85], parent_errors);
+
+    // Publish readiness to the short-lived coordinator as soon as wait4 has
+    // proved the exact target is stopped. The watchdog remains alive for ACK.
     _append(code, [0xC6, 0x44, 0x24, 0x20, 0x01]);
     _append(code, X.mov_imm32("rax", 1)); _append(code, [0x44, 0x89, 0xEF]);
     _append(code, [0x48, 0x8D, 0x74, 0x24, 0x20]);
     _append(code, X.mov_imm32("rdx", 1)); _append(code, X.syscall());
-    _append(code, [0x48, 0x83, 0xF8, 0x01]); _branch(code, [0x0F, 0x85], errors);
-    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x44, 0x89, 0xE7]);
-    _append(code, X.syscall());
+    _append(code, [0x48, 0x83, 0xF8, 0x01]);
+    _branch(code, [0x0F, 0x85], parent_errors);
     _append(code, X.mov_imm32("rax", 3)); _append(code, [0x44, 0x89, 0xEF]);
+    _append(code, X.syscall());
+    // Do not keep proc_spawn_wait's capture pipes alive while waiting for ACK.
+    _append(code, X.mov_imm32("rax", 3)); _append(code, X.mov_imm32("rdi", 1));
+    _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 3)); _append(code, X.mov_imm32("rdi", 2));
+    _append(code, X.syscall());
+
+    if layout.require_ack {
+        // Keep owning the stopped child until the PBLang caller has registered
+        // and identity-checked it. Poll one private ACK for at most five seconds;
+        // timeout or any parent-side failure kills and reaps the exact fork child.
+        _append(code, [0x41, 0xBF]); _append(code, X.le32(500));
+        let ack_poll = len(code);
+        _append(code, X.mov_imm32("rax", 257));
+        _append(code, X.mov_imm32("rdi", -100));
+        _append(code, X.movabs_imm64("rsi", layout.ack));
+        _append(code, X.mov_imm32("rdx", 657408));
+        _append(code, [0x45, 0x31, 0xD2]); _append(code, X.syscall());
+        _append(code, [0x48, 0x85, 0xC0]);
+        let ack_found = []; _branch(code, [0x0F, 0x89], ack_found);
+        // timespec { 0 seconds, 10,000,000 nanoseconds }
+        _append(code, [0x48, 0xC7, 0x44, 0x24, 0x20]);
+        _append(code, X.le32(0));
+        _append(code, [0x48, 0xC7, 0x44, 0x24, 0x28]);
+        _append(code, X.le32(10000000));
+        _append(code, X.mov_imm32("rax", 35));
+        _append(code, [0x48, 0x8D, 0x7C, 0x24, 0x20]);
+        _append(code, [0x48, 0x31, 0xF6]); _append(code, X.syscall());
+        _append(code, [0x49, 0xFF, 0xCF]);
+        _append(code, [0x0F, 0x85]); let ack_back = len(code);
+        _append(code, [0, 0, 0, 0]); _set_rel32(code, ack_back, ack_poll);
+        _branch(code, [0xE9], parent_errors);
+        let acknowledged = len(code); _set_rel32(code, ack_found[0], acknowledged);
+        _append(code, [0x48, 0x89, 0xC3]);
+        _append(code, X.mov_imm32("rax", 5)); _append(code, [0x48, 0x89, 0xDF]);
+        _append(code, [0x48, 0x8D, 0x74, 0x24, 0x40]); _append(code, X.syscall());
+        _append(code, [0x48, 0x85, 0xC0]); _branch(code, [0x0F, 0x88], parent_errors);
+        _append(code, [0x0F, 0xB7, 0x44, 0x24, 0x58]);
+        _append(code, [0x25, 0x00, 0xF0, 0x00, 0x00]);
+        _append(code, [0x3D, 0x00, 0x80, 0x00, 0x00]);
+        _branch(code, [0x0F, 0x85], parent_errors);
+        _append(code, X.mov_imm32("rax", 0)); _append(code, [0x48, 0x89, 0xDF]);
+        _append(code, [0x48, 0x8D, 0x74, 0x24, 0x20]);
+        _append(code, X.mov_imm32("rdx", 17)); _append(code, X.syscall());
+        _append(code, [0x48, 0x83, 0xF8, 0x10]);
+        _branch(code, [0x0F, 0x85], parent_errors);
+        let token = str_to_bytes("PBREMOTE-PTY-ACK"); let ti = 0;
+        while ti < len(token) {
+            _append(code, [0x80, 0x7C, 0x24, 0x20 + ti, token[ti]]);
+            _branch(code, [0x0F, 0x85], parent_errors); ti = ti + 1;
+        }
+        _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xDF]);
+        _append(code, X.syscall());
+        _append(code, X.mov_imm32("rax", 87));
+        _append(code, X.movabs_imm64("rdi", layout.ack)); _append(code, X.syscall());
+    }
+    _append(code, X.mov_imm32("rax", 60)); _append(code, [0x48, 0x31, 0xFF]);
+    _append(code, X.syscall());
+
+    let coordinator = len(code); _set_rel32(code, coordinator_branch[0], coordinator);
+    // proc_spawn_wait observes only this coordinator. The watchdog keeps the
+    // stopped child parented while this process returns one bounded readiness
+    // byte to PBLang without waiting for the ownership ACK.
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x44, 0x89, 0xEF]);
+    _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 0)); _append(code, [0x44, 0x89, 0xE7]);
+    _append(code, [0x48, 0x8D, 0x74, 0x24, 0x20]);
+    _append(code, X.mov_imm32("rdx", 1)); _append(code, X.syscall());
+    _append(code, [0x48, 0x83, 0xF8, 0x01]);
+    _branch(code, [0x0F, 0x85], errors);
+    _append(code, [0x80, 0x7C, 0x24, 0x20, 0x01]);
+    _branch(code, [0x0F, 0x85], errors);
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x44, 0x89, 0xE7]);
     _append(code, X.syscall());
     _append(code, X.mov_imm32("rax", 60)); _append(code, [0x48, 0x31, 0xFF]);
     _append(code, X.syscall());
+
+    let parent_error = len(code);
+    _append(code, X.mov_imm32("rax", 62));
+    _append(code, [0x4C, 0x89, 0xF7]);
+    _append(code, X.mov_imm32("rsi", 9)); _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 61));
+    _append(code, [0x4C, 0x89, 0xF7, 0x48, 0x31, 0xF6,
+        0x48, 0x31, 0xD2, 0x4D, 0x31, 0xD2]);
+    _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 87));
+    _append(code, X.movabs_imm64("rdi", layout.pid)); _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 87));
+    _append(code, X.movabs_imm64("rdi", layout.pid_stage)); _append(code, X.syscall());
+    if layout.require_ack {
+        _append(code, X.mov_imm32("rax", 87));
+        _append(code, X.movabs_imm64("rdi", layout.ack)); _append(code, X.syscall());
+    }
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 126));
+    _append(code, X.syscall());
+    let pe = 0; while pe < len(parent_errors) {
+        _set_rel32(code, parent_errors[pe], parent_error); pe = pe + 1;
+    }
 
     let error = len(code);
     _append(code, X.mov_imm32("rax", 87));
@@ -681,23 +798,31 @@ fn _session_launcher_code(layout) {
     return code;
 }
 
-fn build_session_launcher(supervisor_path, pid_path) {
+fn build_session_launcher(supervisor_path, pid_path, ack_path = nil) {
     let supervisor = _cstring(supervisor_path, "session supervisor path");
     let pid = _cstring(pid_path, "session pid path");
     let pid_stage = _cstring(pid_path + ".pending", "session pid staging path");
+    let require_ack = type(ack_path) == "string" and ack_path != "";
+    let ack = if require_ack {
+        _cstring(ack_path, "session ownership acknowledgement path")
+    } else { [] };
     let devnull = _cstring("/dev/null", "null path");
-    let probe = map{ supervisor: 0, pid: 0, pid_stage: 0, devnull: 0, argv: 0 };
+    let probe = map{ supervisor: 0, pid: 0, pid_stage: 0, ack: 0,
+        require_ack: require_ack, devnull: 0, argv: 0 };
     let code_len = len(_session_launcher_code(probe));
     let base = LOAD_BASE + ELF_HEADER_BYTES + code_len;
     let supervisor_address = base;
     let pid_address = supervisor_address + len(supervisor);
     let stage_address = pid_address + len(pid);
-    let devnull_address = stage_address + len(pid_stage);
+    let ack_address = stage_address + len(pid_stage);
+    let devnull_address = ack_address + len(ack);
     let argv_address = devnull_address + len(devnull);
     let layout = map{ supervisor: supervisor_address, pid: pid_address,
-        pid_stage: stage_address, devnull: devnull_address, argv: argv_address };
+        pid_stage: stage_address, ack: ack_address,
+        require_ack: require_ack, devnull: devnull_address, argv: argv_address };
     let code = _session_launcher_code(layout); let data = [];
     _append(data, supervisor); _append(data, pid); _append(data, pid_stage);
+    _append(data, ack);
     _append(data, devnull);
     _append(data, X.le64(supervisor_address)); _append(data, X.le64(0));
     return X.elf64_exec_rx(code, data);
@@ -743,6 +868,52 @@ fn build_writer(fifo_path, payload) {
     let code = _writer_code(map{ fifo: fifo_address, payload: payload_address,
         payload_len: len(payload_bytes) });
     let data = []; _append(data, fifo); _append(data, payload_bytes);
+    return X.elf64_exec_rx(code, data);
+}
+
+fn _ownership_ack_writer_code(layout) {
+    let code = []; let errors = [];
+    _append(code, X.mov_imm32("rax", 257)); _append(code, X.mov_imm32("rdi", -100));
+    _append(code, X.movabs_imm64("rsi", layout.stage));
+    _append(code, X.mov_imm32("rdx", 655553));
+    _append(code, [0x41, 0xBA]); _append(code, X.le32(384));
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, [0x48, 0x89, 0xC3]);
+    _append(code, X.mov_imm32("rax", 1)); _append(code, [0x48, 0x89, 0xDF]);
+    _append(code, X.movabs_imm64("rsi", layout.payload));
+    _append(code, X.mov_imm32("rdx", 16)); _append(code, X.syscall());
+    _append(code, [0x48, 0x83, 0xF8, 0x10]); _branch(code, [0x0F, 0x85], errors);
+    _append(code, X.mov_imm32("rax", 74)); _append(code, [0x48, 0x89, 0xDF]);
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, X.mov_imm32("rax", 3)); _append(code, [0x48, 0x89, 0xDF]);
+    _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 82));
+    _append(code, X.movabs_imm64("rdi", layout.stage));
+    _append(code, X.movabs_imm64("rsi", layout.target));
+    _append(code, X.syscall()); _check_nonnegative(code, errors);
+    _append(code, X.mov_imm32("rax", 60)); _append(code, [0x48, 0x31, 0xFF]);
+    _append(code, X.syscall());
+    let error = len(code);
+    _append(code, X.mov_imm32("rax", 87));
+    _append(code, X.movabs_imm64("rdi", layout.stage)); _append(code, X.syscall());
+    _append(code, X.mov_imm32("rax", 60)); _append(code, X.mov_imm32("rdi", 75));
+    _append(code, X.syscall());
+    let i = 0; while i < len(errors) { _set_rel32(code, errors[i], error); i = i + 1; }
+    return code;
+}
+
+fn build_ownership_ack_writer(ack_path) {
+    let target = _cstring(ack_path, "ownership acknowledgement path");
+    let stage = _cstring(ack_path + ".pending", "ownership acknowledgement staging path");
+    let payload = str_to_bytes("PBREMOTE-PTY-ACK");
+    let probe = map{ stage: 0, target: 0, payload: 0 };
+    let code_len = len(_ownership_ack_writer_code(probe));
+    let stage_address = LOAD_BASE + ELF_HEADER_BYTES + code_len;
+    let target_address = stage_address + len(stage);
+    let payload_address = target_address + len(target);
+    let code = _ownership_ack_writer_code(map{ stage: stage_address,
+        target: target_address, payload: payload_address });
+    let data = []; _append(data, stage); _append(data, target); _append(data, payload);
     return X.elf64_exec_rx(code, data);
 }
 
@@ -812,4 +983,4 @@ export MAX_PATH_BYTES, MAX_SECONDS, MAX_OUTPUT_BYTES, MIN_MEMORY_BYTES, MAX_MEMO
     MAX_OPEN_FILES, MAX_PROCESSES, MAX_WRITE_BYTES,
     MAX_PROCESS_GROUP_ID, MAX_EXEC_ARGS, MAX_EXEC_ARG_BYTES, MAX_EXEC_TOTAL_BYTES,
     build, build_session_launcher, build_argv_exec, build_argv_exec_env,
-    build_writer, build_group_signal, build_group_probe;
+    build_writer, build_ownership_ack_writer, build_group_signal, build_group_probe;

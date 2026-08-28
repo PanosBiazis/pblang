@@ -452,9 +452,9 @@ pub struct RuntimeError {
 /// untrusted pblang code, override `io_timeout_ms` to bound network
 /// stalls, override `max_external_json_bytes` to cap untrusted-JSON
 /// ingress, or override the `mem_*` hooks to plug in memory-safety
-/// tracking. The default trait impls grant full access — the
-/// **`pblang-ffi`** embedding crate provides a sandbox-by-default
-/// wrapper. See `docs/Capability_model.md` for the host-contract.
+/// tracking. Effectful default trait implementations deny access; concrete
+/// hosts must opt in explicitly. See `docs/Capability_model.md` for the
+/// host-contract.
 pub trait VmHost {
     fn err(&self, msg: String) -> RuntimeError;
     /// Downcast hook used by the VM for host-specific subsystems (concurrency handles, etc.).
@@ -469,16 +469,16 @@ pub trait VmHost {
 
     /// Capability flags for sandboxing. When embedding, set these to restrict what builtins can do.
     fn allow_fs(&self) -> bool {
-        true
+        false
     }
     fn allow_net(&self) -> bool {
-        true
+        false
     }
     fn allow_http(&self) -> bool {
-        true
+        false
     }
     fn allow_sqlite(&self) -> bool {
-        true
+        false
     }
     fn allow_ffi(&self) -> bool {
         false
@@ -487,27 +487,28 @@ pub trait VmHost {
         false
     }
     /// Whether reading process environment variables (`env_get`) is allowed.
-    /// Defaults to true (env reads are benign — PATH/HOME/etc.), but a sandbox
-    /// can disable it to prevent secret exfiltration (e.g. `OPENAI_API_KEY`).
+    /// Defaults to false because process environments commonly contain secrets.
     fn allow_env(&self) -> bool {
-        true
+        false
     }
 
     /// Whether `os_exit()` may call `std::process::exit` and terminate the whole
-    /// process. Defaults to true (correct for the `pblang` CLI, where the script
-    /// *is* the process). Embedders (e.g. `pblang-ffi`) set this false so an
-    /// untrusted script cannot kill the host application; `os_exit` then returns
-    /// a recoverable error instead.
+    /// process. Defaults to false; the trusted CLI opts in explicitly.
     fn allow_process_exit(&self) -> bool {
-        true
+        false
     }
 
-    /// FFI guardrails: when not overridden, allow all (no allowlist). Override to restrict libraries/symbols.
+    /// Whether source modules may be loaded from host paths.
+    fn allow_import(&self) -> bool {
+        false
+    }
+
+    /// FFI guardrails are fail-closed unless a concrete host supplies policy.
     fn ffi_allowed_library(&self, _path: &str) -> bool {
-        true
+        false
     }
     fn ffi_allowed_symbol(&self, _symbol: &str) -> bool {
-        true
+        false
     }
 
     /// IO timeout in milliseconds for network (and optionally fs) builtins. When set, http_get/http_post
@@ -518,7 +519,7 @@ pub trait VmHost {
 
     /// Whether spawn() is allowed (sandbox). When false, spawn builtin returns a runtime error.
     fn allow_spawn(&self) -> bool {
-        true
+        false
     }
 
     /// Limits to apply to the child VM when spawn is used. None = no limits in child.

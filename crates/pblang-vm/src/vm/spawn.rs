@@ -43,7 +43,7 @@ use super::spawn_wire::{
     spawn_closure_from_wire, spawn_function_to_wire, spawn_value_from_json, spawn_value_from_wire,
     spawn_value_to_json, spawn_value_to_wire,
 };
-use super::{alloc_array, alloc_map, StdlibConfig, VmLimits, VM};
+use super::{alloc_array, alloc_map, VM};
 use crate::concurrency::{SpawnWireClosure, SpawnWireValue, VmChannelBuf};
 
 /// Stack size for spawned VM threads. Plain `thread::spawn` gives ~2 MiB, far less
@@ -113,7 +113,20 @@ pub(super) fn spawn_builtin(
         }
         out
     };
-    let spawn_limits = host.spawn_limits();
+    // Snapshot the exact parent authority before starting the child. A child
+    // must never regain ambient defaults merely because it runs in a fresh VM.
+    let (config, spawn_limits, spawn_ffi_policy) = host
+        .as_any_mut()
+        .downcast_mut::<VM>()
+        .map(|vm| {
+            (
+                vm.stdlib_config.clone(),
+                vm.limits.clone(),
+                vm.ffi_policy.clone(),
+            )
+        })
+        .ok_or_else(|| host.err("spawn: internal host error".into()))?;
+    let config = config.ok_or_else(|| host.err("spawn: parent has no stdlib authority".into()))?;
 
     let handles = vm_handles(host)?;
     let id = handles.spawn_next.fetch_add(1, Ordering::SeqCst);
@@ -125,7 +138,6 @@ pub(super) fn spawn_builtin(
         .insert(id, rx);
 
     let child_handles = Arc::clone(&handles);
-    let config = StdlibConfig::default();
     let spawn_result = thread::Builder::new()
         .name("pblang-spawn".into())
         .stack_size(spawn_stack_size())
@@ -136,17 +148,9 @@ pub(super) fn spawn_builtin(
             exports: Default::default(),
         }));
         let mut vm = VM::with_stdlib(config);
+        vm.set_ffi_policy(spawn_ffi_policy);
         vm.handle_registry = child_handles;
-        if let Some(lim) = spawn_limits {
-            vm.set_limits(Some(VmLimits {
-                max_instructions: lim.max_instructions,
-                max_stack_depth: lim.max_stack_depth,
-                max_memory_bytes: lim.max_memory_bytes,
-                io_timeout_ms: lim.io_timeout_ms,
-                // Child inherits parent's cap by default.
-                max_external_json_bytes: None,
-            }));
-        }
+        vm.set_limits(spawn_limits);
         // Connect the child closure's module to the VM's builtins
         // so that builtin globals (recv, send, etc.) are accessible.
         {

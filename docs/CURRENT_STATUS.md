@@ -1,7 +1,7 @@
 # pblang — Current Status
 
 **Last Updated**: 2026-08-13
-**Status**: v0.5.7 — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
+**Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
 
 `stdlib:speech_catalog.sapp` adds deterministic bounded discovery of installed
 Whisper model artifacts and eSpeak voice data. It reads only fixed system roots
@@ -1016,7 +1016,7 @@ active until its differential exit criteria pass.
 | `RateLimiter` | Token-bucket rate limiter with auto-refill ticker | Go `rate.Limiter` |
 | `FanOut`/`FanIn` | Channel distribution (round-robin fan-out) and merging (fan-in) | Go pipeline patterns |
 
-## 🛡️ v0.5.7 Runtime Memory Safety (VM builtins)
+## 🛡️ v0.6.0 Runtime Memory Safety (VM builtins)
 
 | Feature | Description |
 |---------|-------------|
@@ -1112,12 +1112,12 @@ and product suites in pbAI, pbOS, and pb-mcp-server.
 | Memory Safety | ✅ Wired | Runtime builtins + `MemoryTracker`; not compile-time for all values |
 | Async/Await | ✅ Added | `async_spawn`, `await`, `await_all`, `await_any`, `map`, `then` via `stdlib/async_await.sapp` |
 | Quantum Computing | ✅ Bridge | `pblang-quantum` crate: Qiskit, Cirq, Braket via Python subprocess; `quantum_run`, `quantum_statevector`, `quantum_backends` builtins |
-| Polyglot Execution | 🛡️ Bounded bridge | `stdlib:polyglot.sapp` requires explicit trusted-source approval and routes supported interpreters through the bounded registry. Raw `polyglot_*` VM builtins are retained bootstrap internals and are blocked by the PBLang security analyzer. Compile-and-run and in-process cached-library loading remain fail-closed pending isolated brokers. |
+| Polyglot Execution | 🛡️ Bounded bridge, not production-safe | The PBLang facade requires a hash-bound `unsafe_polyglot` acknowledgement plus trusted-source approval and routes supported interpreters through the bounded registry. Raw VM builtins and legacy Rust CLI warming/build paths remain reachable bootstrap blockers; full hostile-code isolation is not complete. |
 | WASM Backend | ✅ Prototype | `pblang-wasm` crate: compile pblang AST → WAT (.wat); functions, arithmetic, strings, exports |
 | LLVM Backend | ✅ Prototype | `pblang-llvm` crate: LLVM IR text emitter → compile with clang; `pblang compile --llvm`; functions, if/else, while, for, comparisons |
 | Self-Hosting | ✅ **Complete** | `stdlib/compiler/` (tokenizer→parser→semantic→typeck→ir→optimizer→codegen + `selfhost_frontend.sapp` entry + `vm.sapp` interpreter, ~5,300 lines) tokenizes, parses, compiles **and runs** pblang end-to-end. All language features self-host (incl. `match`, `struct`/`enum`, `class`+colon-call, closures, nil-safe ops). Frontier is now breadth/perf |
 | Self-host VM direct builtins | ✅ Optimized | Shared pure-pblang builtin registry plus optional call-site descriptors remove per-call descriptor allocation and registry lookup without changing opcodes, global shadowing, first-class builtin mutability, or Rust VM/PBCK compatibility |
-| Polyglot Build | ✅ Bridge | `pblang build-polyglot`: extracts @python/@rust/@js blocks from .sapp files, compiles to .so/.pyc, generates manifest |
+| Polyglot Build | ⚠️ Migration | PBLang-native generic builds require hash-bound unsafe/trust/toolchain acknowledgements and private verified artifacts. The legacy `pblang build-polyglot` command is not a production path. |
 | Math Library | ✅ Enhanced | `math.sapp`: trig (sin/cos/tan), hyperbolic, exported `math.stats` (sum/mean/median/stddev/variance/min/max/range), native tensor-backed large vector/matrix routes, constants (PI/E/TAU/PHI), number theory (gcd/lcm/is_prime) |
 | New Stdlib | ✅ Added | `units.sapp` (150+ conversions), `functional.sapp` (map/filter/reduce/compose/pipe/curry/memoize), `encoding.sapp` (hex/URL/CSV/base64/JSON), `colors.sapp` (HEX/RGB/HSL/blending/palettes) |
 | Array Helpers | ✅ Enhanced | `array.sapp`: clamped slice, native-backed flatten/unique/zip/chunk/take/drop, numeric min/max, find/find_index/count/partition helpers |

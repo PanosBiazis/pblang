@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.6.0-alpha] — 2026
+
+- Corrected the canonical PBLang numeric version to `0.6.0` and kept the
+  non-production `alpha` channel explicit.
+- Added independent optional application release channels. Application
+  versions and metadata never inherit the PBLang toolchain version; toolchain
+  provenance is a separate concern.
+
+- Added bounded JSON-like value inspection to `stdlib:validate.sapp`. The new pure
+  `inspect_bounded` and `exact_map_bounded` helpers enforce depth, occurrence-node,
+  pre-enumeration map-width, array-width, string/key character and UTF-8 byte, and
+  cumulative text budgets; reject non-finite or non-JSON scalar types; terminate cycles;
+  return fixed content-free reasons; and explicitly remain post-materialization guards,
+  not remote parser or effect authorization boundaries.
+
 - `linux_dirfs.open_absolute("/", false, false)` can now hold the filesystem
   root as one no-follow descriptor. Fixed-path security audits can reuse that
   handle for component-safe metadata and bounded reads instead of repeatedly
@@ -13,6 +28,18 @@
 
 ## Unreleased
 
+- Hardened registry installation: every release now requires a well-formed
+  SHA-256, streamed responses and compressed/unpacked archive work are bounded,
+  special/link entries fail closed, and failed extraction removes the partial
+  cache tree. The legacy strict-checksum flag remains syntax-compatible but the
+  integrity policy can no longer be disabled.
+- Locked `--sandbox` against flag-order widening, added an independent import
+  capability, made missing FFI policy fail closed, and propagated the exact
+  capabilities, limits, and FFI policy into spawned VMs.
+
+- Android application verification no longer clears the device-wide logcat
+  buffer. Crash and completion evidence remains bounded to the newly launched
+  package PID, preserving unrelated diagnostic evidence on personal devices.
 - Added the PBLang-native embedded architecture/MCU/board/pin model, portable
   GPIO/time/ADC/DAC/PWM IR validation, a direct AVR8/Intel HEX backend, a
   RAM-only classic ESP32 image backend, privacy-safe Linux discovery, bounded

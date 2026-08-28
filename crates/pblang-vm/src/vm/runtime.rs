@@ -168,6 +168,9 @@ pub(super) fn exec(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Run
 }
 
 pub(super) fn import(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    if !host.allow_import() {
+        return Err(host.err("import access denied".into()));
+    }
     if args.len() != 1 {
         return Err(host.err(format!("import() expects 1 argument, got {}", args.len())));
     }

@@ -15,7 +15,7 @@ See also:
 | Constructor | Builtins exposed | Use case |
 |-------------|------------------|----------|
 | `VM::new()` | **None.** A blank slate; even `print` is undefined. | Embedders that want to expose only their own bespoke builtins by overriding `VmHost`. |
-| `VM::with_stdlib(StdlibConfig::default())` | The pure-compute set (math, strings, arrays, maps, JSON, regex, quantum simulator, tensors, channels). Capability builtins (`fs`, `net`, `http`, `sqlite`, `ffi`, `exec`, `spawn`) **denied** at the gate. | Untrusted scripting — the secure default. |
+| `VM::with_stdlib(StdlibConfig::default())` | Historical standalone/CLI-compatible profile: most host effects are enabled, while `exec` and `ffi` are denied. | Trusted local scripting only; not an untrusted-code profile. |
 | `VM::with_stdlib(StdlibConfig { fs: true, http: true, .. })` | Pure-compute + the capabilities you turn on. | Trusted scripting / your own tooling. |
 
 ```rust
@@ -31,8 +31,23 @@ let mut vm = VM::with_stdlib(StdlibConfig {
     ..Default::default()
 });
 
-// Untrusted plugin runner
-let mut vm = VM::with_stdlib(StdlibConfig::default());
+// Untrusted plugin runner: start with an explicit deny profile.
+let mut vm = VM::with_stdlib(StdlibConfig {
+    core: true,
+    json: true,
+    crypto: true,
+    fs: false,
+    net: false,
+    http: false,
+    sqlite: false,
+    ffi: false,
+    exec: false,
+    gfx: false,
+    import: false,
+    spawn: false,
+    env: false,
+    process_exit: false,
+});
 vm.set_limits(Some(VmLimits {
     max_instructions: Some(50_000_000),
     max_stack_depth: Some(256),
@@ -172,7 +187,8 @@ Most-overridden methods:
 | Method | Default | When to override |
 |--------|---------|-----------------|
 | `allow_fs / allow_net / allow_http / allow_sqlite / allow_ffi / allow_exec / allow_spawn` | `false` (or read from `StdlibConfig` on the concrete `VM`) | Custom capability-resolution logic (e.g. per-user RBAC) instead of a flat `StdlibConfig`. |
-| `ffi_allowed_library(path)` / `ffi_allowed_symbol(symbol)` | `true` (or read from `FfiPolicy` on the concrete `VM`) | Dynamic allowlist computation (regex match, signature verification of the .so file, etc.). |
+| `ffi_allowed_library(path)` / `ffi_allowed_symbol(symbol)` | `false` (or read from `FfiPolicy` on the concrete `VM`) | Dynamic allowlist computation (regex match, signature verification of the .so file, etc.). |
+| `allow_import()` | `false` (or read from `StdlibConfig` on the concrete `VM`) | Virtual/content-addressed module loading without granting arbitrary source-path imports. |
 | `import_module(path)` | Reads disk via `pblang_pm::resolve_import` | Load modules from memory, from an embedded TAR/ZIP, from a remote CDN; or implement content-addressed module pinning. |
 | `io_timeout_ms()` | Reads `VmLimits.io_timeout_ms` | Per-call dynamic timeouts (e.g. tighter during interactive REPL idle). |
 | `err(msg)` | Builds a `RuntimeError` with current span + stack | Add embedder-specific telemetry (Sentry breadcrumbs, trace ids). |
@@ -204,7 +220,22 @@ use std::collections::HashSet;
 
 fn run_untrusted(source: &str) -> Result<Vec<String>> {
     // Capability config: deny everything dangerous.
-    let mut vm = VM::with_stdlib(StdlibConfig::default());
+    let mut vm = VM::with_stdlib(StdlibConfig {
+        core: true,
+        json: true,
+        crypto: true,
+        fs: false,
+        net: false,
+        http: false,
+        sqlite: false,
+        ffi: false,
+        exec: false,
+        gfx: false,
+        import: false,
+        spawn: false,
+        env: false,
+        process_exit: false,
+    });
 
     // Resource limits.
     vm.set_limits(Some(VmLimits {
@@ -214,8 +245,7 @@ fn run_untrusted(source: &str) -> Result<Vec<String>> {
         io_timeout_ms: Some(1_000),
     }));
 
-    // FFI is already off via StdlibConfig::default(), but pin the policy
-    // just in case some future code path enables ffi:
+    // Pin a deny policy as a second FFI layer.
     vm.set_ffi_policy(Some(FfiPolicy {
         allow_all: false,
         allowed_libs: HashSet::new(),

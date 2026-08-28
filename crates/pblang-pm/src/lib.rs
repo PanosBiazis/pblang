@@ -471,7 +471,11 @@ impl RegistryClient {
         version: &str,
     ) -> Result<(PackageMetadata, Vec<u8>), String> {
         let index_url = format!("{}/index.json", self.base_url);
-        let index_bytes = fetch_url(&index_url)?;
+        let index_bytes = fetch_url_with_limit(
+            &index_url,
+            MAX_REGISTRY_INDEX_BYTES,
+            "registry index",
+        )?;
         let index = parse_registry_index(&index_bytes)?;
 
         let releases = index
@@ -484,17 +488,26 @@ impl RegistryClient {
             )
         })?;
 
-        let release_fetch_url = resolve_registry_release_url(&index_url, &release.url);
-        let tarball_bytes = fetch_url(&release_fetch_url)?;
+        let expected = release.sha256.as_deref().ok_or_else(|| {
+            format!(
+                "registry: sha256 required for {} {} but index has no sha256",
+                package_name, version
+            )
+        })?;
 
-        if let Some(ref expected) = release.sha256 {
-            let actual = hex::encode(Sha256::digest(&tarball_bytes));
-            if !expected.eq_ignore_ascii_case(&actual) {
-                return Err(format!(
-                    "registry: checksum mismatch for {} {}: expected {} got {}",
-                    package_name, version, expected, actual
-                ));
-            }
+        let release_fetch_url = resolve_registry_release_url(&index_url, &release.url);
+        let tarball_bytes = fetch_url_with_limit(
+            &release_fetch_url,
+            MAX_REGISTRY_ARCHIVE_BYTES,
+            "registry archive",
+        )?;
+
+        let actual = hex::encode(Sha256::digest(&tarball_bytes));
+        if !expected.eq_ignore_ascii_case(&actual) {
+            return Err(format!(
+                "registry: checksum mismatch for {} {}: expected {} got {}",
+                package_name, version, expected, actual
+            ));
         }
 
         let metadata = PackageMetadata {
@@ -559,6 +572,10 @@ impl RegistryClient {
 /// into the relative path `tmp/foo/index.json`. This caused all file:// registry
 /// tests to fail. Now the path is preserved verbatim after the `file://` prefix.
 pub fn fetch_url(url: &str) -> Result<Vec<u8>, String> {
+    fetch_url_with_limit(url, MAX_REGISTRY_ARCHIVE_BYTES, "registry response")
+}
+
+fn fetch_url_with_limit(url: &str, limit: usize, label: &str) -> Result<Vec<u8>, String> {
     if let Some(path) = url.strip_prefix("file://") {
         // On Unix: file:///tmp/foo → strip "file://" → "/tmp/foo" (absolute, correct)
         // On Unix: file://tmp/foo  → strip "file://" → "tmp/foo"  (relative, user intent)
@@ -569,7 +586,26 @@ pub fn fetch_url(url: &str) -> Result<Vec<u8>, String> {
             p.strip_prefix("?/").unwrap_or(p)
         };
         // NOTE: On non-Windows we do NOT strip the leading slash — the path is absolute.
-        return std::fs::read(path).map_err(|e| format!("read file {}: {e}", path));
+        let file = std::fs::File::open(path).map_err(|e| format!("read file {}: {e}", path))?;
+        let size = file
+            .metadata()
+            .map_err(|e| format!("stat file {}: {e}", path))?
+            .len();
+        if size > limit as u64 {
+            return Err(format!(
+                "{label}: payload of {size} bytes exceeds cap of {limit} bytes"
+            ));
+        }
+        let mut bytes = Vec::with_capacity(size as usize);
+        file.take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("read file {}: {e}", path))?;
+        if bytes.len() > limit {
+            return Err(format!(
+                "{label}: payload exceeds cap of {limit} bytes while reading"
+            ));
+        }
+        return Ok(bytes);
     }
     if url.starts_with("http://")
         && std::env::var("PBLANG_ALLOW_INSECURE_HTTP").ok().as_deref() != Some("1")
@@ -582,16 +618,30 @@ pub fn fetch_url(url: &str) -> Result<Vec<u8>, String> {
     let resp = ureq::get(url)
         .call()
         .map_err(|e| format!("GET {}: {e}", url))?;
-    let mut bytes = vec![];
+    let mut bytes = Vec::new();
     resp.into_reader()
+        .take(limit as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("read body: {e}"))?;
+    if bytes.len() > limit {
+        return Err(format!(
+            "{label}: payload exceeds cap of {limit} bytes while reading"
+        ));
+    }
     Ok(bytes)
 }
 
 /// Default cap on registry-index JSON payload size (10 MB). Bounds memory
 /// consumption when fetching from untrusted/networked registries.
 pub const MAX_REGISTRY_INDEX_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum accepted compressed registry package size (64 MiB).
+pub const MAX_REGISTRY_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum total regular-file content extracted from one package (256 MiB).
+pub const MAX_REGISTRY_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum size of one extracted regular file (64 MiB).
+pub const MAX_REGISTRY_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum number of archive entries, including directories.
+pub const MAX_REGISTRY_ENTRIES: usize = 4096;
 
 /// Parse registry index JSON. Bytes longer than `MAX_REGISTRY_INDEX_BYTES`
 /// are rejected before the parse to bound memory consumption.
@@ -628,6 +678,13 @@ pub fn parse_registry_index(json: &[u8]) -> Result<RegistryIndex, String> {
                 .get("sha256")
                 .and_then(|s| s.as_str())
                 .map(String::from);
+            if let Some(ref digest) = sha256 {
+                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(format!(
+                        "index: release {pkg_name}/{ver} has malformed sha256"
+                    ));
+                }
+            }
             let description = release_obj
                 .get("description")
                 .and_then(|s| s.as_str())
@@ -663,6 +720,14 @@ pub fn parse_registry_index(json: &[u8]) -> Result<RegistryIndex, String> {
 /// with `../` components that would escape dest_dir.
 pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
     use std::path::Component;
+    if tar_gz.len() > MAX_REGISTRY_ARCHIVE_BYTES {
+        return Err(format!(
+            "registry archive: compressed payload of {} bytes exceeds cap of {} bytes",
+            tar_gz.len(),
+            MAX_REGISTRY_ARCHIVE_BYTES
+        ));
+    }
+    let dest_existed = dest_dir.exists();
     let dest_dir = std::fs::canonicalize(dest_dir)
         .or_else(|_| {
             std::fs::create_dir_all(dest_dir).map_err(|e| format!("create_dir_all: {e}"))?;
@@ -670,44 +735,91 @@ pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
         })
         .map_err(|e: String| e)?;
 
-    let dec = flate2::read::GzDecoder::new(tar_gz);
-    let mut archive = tar::Archive::new(dec);
+    let extraction = (|| {
+        let dec = flate2::read::GzDecoder::new(tar_gz);
+        let mut archive = tar::Archive::new(dec);
+        let mut entry_count = 0usize;
+        let mut unpacked_bytes = 0u64;
 
-    for entry in archive.entries().map_err(|e| format!("tar entries: {e}"))? {
-        let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
-        let entry_path = entry.path().map_err(|e| format!("tar path: {e}"))?;
-        let entry_type = entry.header().entry_type();
-        if matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
-            return Err(format!(
-                "SECURITY: tarball link entries are not allowed: {}",
-                entry_path.display()
-            ));
-        }
-
-        // Validate: reject any path that would escape dest_dir
-        for component in entry_path.components() {
-            match component {
-                Component::ParentDir => {
-                    return Err(format!(
-                        "SECURITY: tarball entry '{}' contains '..', rejected (Zip Slip)",
-                        entry_path.display()
-                    ));
-                }
-                Component::RootDir | Component::Prefix(_) => {
-                    return Err(format!(
-                        "SECURITY: tarball entry '{}' is absolute, rejected",
-                        entry_path.display()
-                    ));
-                }
-                _ => {}
+        for entry in archive.entries().map_err(|e| format!("tar entries: {e}"))? {
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or_else(|| "registry archive: entry count overflow".to_string())?;
+            if entry_count > MAX_REGISTRY_ENTRIES {
+                return Err(format!(
+                    "registry archive: entry count exceeds cap of {MAX_REGISTRY_ENTRIES}"
+                ));
             }
-        }
 
-        entry
-            .unpack_in(&dest_dir)
-            .map_err(|e| format!("tar unpack entry: {e}"))?;
+            let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
+            let entry_path = entry.path().map_err(|e| format!("tar path: {e}"))?;
+            let entry_type = entry.header().entry_type();
+            if matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
+                return Err(format!(
+                    "SECURITY: tarball link entries are not allowed: {}",
+                    entry_path.display()
+                ));
+            }
+            if !matches!(entry_type, tar::EntryType::Regular | tar::EntryType::Directory) {
+                return Err(format!(
+                    "SECURITY: tarball entry type is not allowed: {}",
+                    entry_path.display()
+                ));
+            }
+
+            // Validate: reject any path that would escape dest_dir.
+            for component in entry_path.components() {
+                match component {
+                    Component::ParentDir => {
+                        return Err(format!(
+                            "SECURITY: tarball entry '{}' contains '..', rejected (Zip Slip)",
+                            entry_path.display()
+                        ));
+                    }
+                    Component::RootDir | Component::Prefix(_) => {
+                        return Err(format!(
+                            "SECURITY: tarball entry '{}' is absolute, rejected",
+                            entry_path.display()
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+
+            let entry_bytes = if entry_type == tar::EntryType::Regular {
+                entry.header().size().map_err(|e| format!("tar size: {e}"))?
+            } else {
+                0
+            };
+            if entry_bytes > MAX_REGISTRY_ENTRY_BYTES {
+                return Err(format!(
+                    "registry archive: entry '{}' is {} bytes, cap is {} bytes",
+                    entry_path.display(),
+                    entry_bytes,
+                    MAX_REGISTRY_ENTRY_BYTES
+                ));
+            }
+            unpacked_bytes = unpacked_bytes
+                .checked_add(entry_bytes)
+                .ok_or_else(|| "registry archive: unpacked size overflow".to_string())?;
+            if unpacked_bytes > MAX_REGISTRY_UNPACKED_BYTES {
+                return Err(format!(
+                    "registry archive: unpacked content exceeds cap of {} bytes",
+                    MAX_REGISTRY_UNPACKED_BYTES
+                ));
+            }
+
+            entry
+                .unpack_in(&dest_dir)
+                .map_err(|e| format!("tar unpack entry: {e}"))?;
+        }
+        Ok(())
+    })();
+
+    if extraction.is_err() && !dest_existed {
+        let _ = std::fs::remove_dir_all(&dest_dir);
     }
-    Ok(())
+    extraction
 }
 
 /// Default cache root.
@@ -901,7 +1013,11 @@ pub fn resolve_dependency_root(
                 let archive_sha256 = dep.archive_sha256.as_deref().unwrap_or(dep.sha256.as_str());
                 let cache_entry = cache.join(archive_sha256);
                 if !cache_entry.is_dir() {
-                    let tarball_bytes = fetch_url(tarball_url)?;
+                    let tarball_bytes = fetch_url_with_limit(
+                        tarball_url,
+                        MAX_REGISTRY_ARCHIVE_BYTES,
+                        "registry archive",
+                    )?;
                     verify_tarball_hmac_sidecar(tarball_url, &tarball_bytes)?;
                     unpack_tarball_gz(&tarball_bytes, &cache_entry)?;
                 }
@@ -1030,9 +1146,10 @@ pub fn resolve_registry_dep(
     cache_root: &Path,
     name: &str,
     version: &str,
-    require_registry_sha256: bool,
+    _require_registry_sha256: bool,
 ) -> Result<(PathBuf, String, String, String), String> {
-    let index_bytes = fetch_url(index_url)?;
+    let index_bytes =
+        fetch_url_with_limit(index_url, MAX_REGISTRY_INDEX_BYTES, "registry index")?;
     let index = parse_registry_index(&index_bytes)?;
     let releases = index
         .get(name)
@@ -1040,14 +1157,18 @@ pub fn resolve_registry_dep(
     let release = releases
         .get(version)
         .ok_or_else(|| format!("registry: version {} not found for '{}'", version, name))?;
-    if require_registry_sha256 && release.sha256.is_none() {
+    if release.sha256.is_none() {
         return Err(format!(
-            "registry: sha256 required for {} {} but index has no sha256 (set REQUIRE_REGISTRY_SHA256=0 to allow)",
+            "registry: sha256 required for {} {} but index has no sha256",
             name, version
         ));
     }
     let release_fetch_url = resolve_registry_release_url(index_url, &release.url);
-    let tarball_bytes = fetch_url(&release_fetch_url)?;
+    let tarball_bytes = fetch_url_with_limit(
+        &release_fetch_url,
+        MAX_REGISTRY_ARCHIVE_BYTES,
+        "registry archive",
+    )?;
     verify_tarball_hmac_sidecar(&release_fetch_url, &tarball_bytes)?;
     let archive_sha256 = hex::encode(Sha256::digest(&tarball_bytes));
     if let Some(ref expected) = release.sha256 {
@@ -1860,14 +1981,7 @@ pub fn search_registry(registry_url: &str, query: &str) -> Result<Vec<SearchResu
         percent_encode(query)
     );
     // Try fetching as a JSON array of {name, version, description}.
-    let bytes = fetch_url(&url)?;
-    if bytes.len() > MAX_REGISTRY_INDEX_BYTES {
-        return Err(format!(
-            "search response: {} bytes exceeds cap of {} bytes",
-            bytes.len(),
-            MAX_REGISTRY_INDEX_BYTES
-        ));
-    }
+    let bytes = fetch_url_with_limit(&url, MAX_REGISTRY_INDEX_BYTES, "search response")?;
     let val: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("search response JSON: {e}"))?;
     let arr = val.as_array().cloned().unwrap_or_else(|| {
@@ -1971,7 +2085,27 @@ pub fn compute_tarball_hmac(bytes: &[u8], key: &[u8]) -> String {
 /// Verify a pack tarball: checks it contains pblang.toml and at least one .sapp/.sap file.
 /// If a .sha256 sidecar exists alongside the tarball and PBLANG_SIGNING_KEY is set, also verifies HMAC.
 pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
-    let bytes = std::fs::read(tarball_path).map_err(|e| format!("read tarball: {e}"))?;
+    let file = std::fs::File::open(tarball_path).map_err(|e| format!("read tarball: {e}"))?;
+    let size = file
+        .metadata()
+        .map_err(|e| format!("stat tarball: {e}"))?
+        .len();
+    if size > MAX_REGISTRY_ARCHIVE_BYTES as u64 {
+        return Err(format!(
+            "tarball: compressed payload of {size} bytes exceeds cap of {} bytes",
+            MAX_REGISTRY_ARCHIVE_BYTES
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(MAX_REGISTRY_ARCHIVE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read tarball: {e}"))?;
+    if bytes.len() > MAX_REGISTRY_ARCHIVE_BYTES {
+        return Err(format!(
+            "tarball: compressed payload exceeds cap of {} bytes",
+            MAX_REGISTRY_ARCHIVE_BYTES
+        ));
+    }
     let dec = flate2::read::GzDecoder::new(&bytes[..]);
     let mut archive = tar::Archive::new(dec);
     let entries = archive
@@ -1979,9 +2113,50 @@ pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
         .map_err(|e| format!("tarball entries: {e}"))?;
     let mut has_manifest = false;
     let mut has_entry = false;
+    let mut entry_count = 0usize;
+    let mut unpacked_bytes = 0u64;
     for entry in entries {
         let entry = entry.map_err(|e| format!("tarball entry: {e}"))?;
+        entry_count = entry_count
+            .checked_add(1)
+            .ok_or_else(|| "tarball entry count overflow".to_string())?;
+        if entry_count > MAX_REGISTRY_ENTRIES {
+            return Err(format!(
+                "tarball entry count exceeds cap of {MAX_REGISTRY_ENTRIES}"
+            ));
+        }
         let path = entry.path().map_err(|e| format!("entry path: {e}"))?;
+        let entry_type = entry.header().entry_type();
+        if !matches!(entry_type, tar::EntryType::Regular | tar::EntryType::Directory) {
+            return Err(format!(
+                "tarball entry type is not allowed: {}",
+                path.display()
+            ));
+        }
+        let entry_bytes = if entry_type == tar::EntryType::Regular {
+            entry
+                .header()
+                .size()
+                .map_err(|e| format!("entry size: {e}"))?
+        } else {
+            0
+        };
+        if entry_bytes > MAX_REGISTRY_ENTRY_BYTES {
+            return Err(format!(
+                "tarball entry '{}' exceeds cap of {} bytes",
+                path.display(),
+                MAX_REGISTRY_ENTRY_BYTES
+            ));
+        }
+        unpacked_bytes = unpacked_bytes
+            .checked_add(entry_bytes)
+            .ok_or_else(|| "tarball unpacked size overflow".to_string())?;
+        if unpacked_bytes > MAX_REGISTRY_UNPACKED_BYTES {
+            return Err(format!(
+                "tarball unpacked content exceeds cap of {} bytes",
+                MAX_REGISTRY_UNPACKED_BYTES
+            ));
+        }
         let path_str = path.to_string_lossy();
         if path_str.ends_with("pblang.toml") || path_str == "pblang.toml" {
             has_manifest = true;
@@ -2148,6 +2323,9 @@ mod tests {
             enc.finish().unwrap();
         }
         let tarball_abs = canonicalize_existing(&tarball_path).unwrap_or(tarball_path.clone());
+        let archive_sha256 = hex::encode(Sha256::digest(
+            std::fs::read(&tarball_path).expect("read registry fixture"),
+        ));
         let tarball_url = format!(
             "file:///{}",
             tarball_abs.to_string_lossy().replace('\\', "/")
@@ -2156,7 +2334,7 @@ mod tests {
         let index = serde_json::json!({
             "packages": {
                 "@pblang/test": {
-                    "1.0.0": { "url": tarball_url, "sha256": null }
+                    "1.0.0": { "url": tarball_url, "sha256": archive_sha256 }
                 }
             }
         });
@@ -2280,7 +2458,7 @@ version = "0.1.0"
     }
 
     #[test]
-    fn registry_sha256_required_fails_when_missing() {
+    fn registry_sha256_is_required_even_when_legacy_flag_is_false() {
         let temp = std::env::temp_dir().join("pblang_registry_required_sha");
         let _ = std::fs::create_dir_all(&temp);
         let (_tarball_path, tarball_url, _sha256) = make_tarball_and_sha256(&temp);
@@ -2296,7 +2474,7 @@ version = "0.1.0"
         let index_abs = canonicalize_existing(&index_path).unwrap_or(index_path.clone());
         let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
         let cache = temp.join("cache");
-        let r = resolve_registry_dep(&index_url, &cache, "@pblang/nosha", "1.0.0", true);
+        let r = resolve_registry_dep(&index_url, &cache, "@pblang/nosha", "1.0.0", false);
         assert!(r.is_err(), "expected sha256 required error");
         let err = r.unwrap_err();
         assert!(
@@ -2305,6 +2483,53 @@ version = "0.1.0"
             err
         );
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn registry_index_rejects_malformed_sha256() {
+        let index = br#"{
+            "packages": {
+                "@pblang/bad-digest": {
+                    "1.0.0": { "url": "pkg.tar.gz", "sha256": "not-a-digest" }
+                }
+            }
+        }"#;
+        let err = parse_registry_index(index).expect_err("malformed digest must fail closed");
+        assert!(err.contains("malformed sha256"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn registry_unpack_entry_cap_is_transactional() {
+        let mut encoder = flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        );
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            for index in 0..=MAX_REGISTRY_ENTRIES {
+                let mut header = tar::Header::new_gnu();
+                header
+                    .set_path(format!("entries/{index}.sapp"))
+                    .expect("set bounded fixture path");
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append(&header, std::io::empty())
+                    .expect("append bounded fixture entry");
+            }
+            builder.finish().expect("finish bounded fixture tar");
+        }
+        let archive = encoder.finish().expect("finish bounded fixture gzip");
+        let dest = std::env::temp_dir().join("pblang_registry_entry_cap_transactional");
+        let _ = std::fs::remove_dir_all(&dest);
+
+        let err = unpack_tarball_gz(&archive, &dest).expect_err("entry cap must reject archive");
+        assert!(err.contains("entry count exceeds cap"), "unexpected error: {err}");
+        assert!(
+            !dest.exists(),
+            "failed extraction must not leave a partial cache tree"
+        );
     }
 
     #[test]

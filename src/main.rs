@@ -1113,9 +1113,10 @@ fn show_help() {
     println!("                            --allow-exec    Enable proc_spawn_wait / exec / polyglot_exec*");
     println!("                            --allow-ffi     Enable ffi_load / ffi_call_typed / polyglot_compile_cached");
     println!("                            --allow-all     Enable every capability (use only for trusted code)");
-    println!("                            --sandbox       Disable exec/ffi/net/fs/http/sqlite (paranoid mode)");
+    println!("                            --sandbox       Locked deny profile: exec/ffi/net/fs/http/sqlite/spawn/gfx/env/import/process-exit OFF");
     println!("                            --allow-env / --deny-env  Allow/deny env_get reading process env vars (default allow; --sandbox denies)");
-    println!("                            --deny-<cap>    Disable a specific capability (fs/net/http/sqlite/spawn/gfx/env)");
+    println!("                            --allow-import / --deny-import  Allow/deny source-module loading (default allow; --sandbox denies)");
+    println!("                            --deny-<cap>    Disable a specific capability (fs/net/http/sqlite/spawn/gfx/env/import)");
     println!("                          Env-var equivalents: PBLANG_ALLOW_EXEC=1, PBLANG_ALLOW_FFI=1, PBLANG_ALLOW_ALL=1, PBLANG_SANDBOX=1, etc.");
     println!("  pblang test [dir|profile] [--profile semantics|llm] [--filter <substr>] [--exact <id>] [--skip <substr>] [--quiet] [--jobs N|auto|smart] [--cache] [--timings] [--slow N] [--fail-fast] [--list] [--allow-*]  Discover and run `fn test_*` functions in dir (default: tests); cargo-test style output. Profiles: `pblang test semantics` expands to `tests/semantics --allow-all --quiet --jobs smart`; `pblang test llm` adds `--filter llm --timings --slow=3`. Files with no test_* fns are run wholesale. Accepts the same capability flags as `run`. --quiet captures test print output instead of writing it to stdout; --jobs runs independent test files in isolated VM workers when cache/fail-fast are not active; --jobs smart caps workers by CPU plus available RAM (`PBLANG_TEST_MAX_JOBS`, `PBLANG_TEST_RAM_MB`, `PBLANG_TEST_WORKER_MB` override). --cache reuses unchanged passing tests; --timings prints per-test durations; --slow N prints the N slowest tests; --exact runs only the exact test id; --skip excludes matching test ids; --fail-fast stops after the first failure; --list prints discovered tests without executing them.");
     println!("  pblang fmt [--max-line-length=N] [--via-pblang] [file.sap|file.bpx …] Format .sap/.sapp/.bpx (trim, operator spacing, indent 4 spaces, optional line wrap, final newline). --via-pblang formats via the self-hosted stdlib/compiler/formatter.sapp instead of the Rust formatter.");
@@ -1127,9 +1128,9 @@ fn show_help() {
     println!(
         "  pblang --doc <file> [--html]  Print module docs (exports, functions, polyglot blocks)"
     );
-    println!("  pblang --lock [--registry-index <url>] [--require-registry-sha256] [path]  Generate pblang.lock from pblang.toml (path optional)");
-    println!("  pblang build [--registry-index <url>] [--require-registry-sha256] [path]  Generate lockfile + typecheck main entry (main.sap/main.bpx or src/main.sap/src/main.bpx)");
-    println!("  pblang install [--registry-index <url>] [--require-registry-sha256] [path | <name>@<version>]  Resolve deps and generate pblang.lock (manifest path) or install a single registry package into cache (name@version).");
+    println!("  pblang --lock [--registry-index <url>] [--require-registry-sha256] [path]  Generate pblang.lock; registry SHA-256 is always required (legacy flag retained)");
+    println!("  pblang build [--registry-index <url>] [--require-registry-sha256] [path]  Generate lockfile + typecheck main entry; registry SHA-256 is always required");
+    println!("  pblang install [--registry-index <url>] [--require-registry-sha256] [path | <name>@<version>]  Install into cache; registry SHA-256 is always required");
     println!("  pblang manifest-check [path]  Validate pblang.toml using pblang stdlib validator and print JSON report");
     println!("  pblang manifest-parity [path]  Compare Rust and pblang manifest parsing/validation and print parity JSON report");
     println!("  env PBLANG_STRICT_MANIFEST_VALIDATOR=1  Fail manifest-based commands when pblang-side validator reports errors");
@@ -2023,23 +2024,26 @@ fn prepend(name: &str, mut rest: Vec<String>) -> Vec<String> {
 
 /// Strip `--allow-*` / `--deny-*` / `--allow-all` / `--sandbox` flags from
 /// `args` and return a corresponding `StdlibConfig`. The default config
-/// already enables fs / net / http / crypto / json / sqlite / gfx / spawn
-/// but denies exec and ffi (secure-by-default for embedded contexts).
+/// already enables fs / net / http / crypto / json / sqlite / gfx / import /
+/// spawn but denies exec and ffi. This is a standalone compatibility profile,
+/// not a safe profile for untrusted embedded code.
 ///
 /// Recognized flags (anywhere in `args`):
 ///   --allow-exec, --allow-ffi, --allow-net, --allow-fs, --allow-http,
-///   --allow-sqlite, --allow-spawn, --allow-gfx
+///   --allow-sqlite, --allow-spawn, --allow-gfx, --allow-import
 ///   --deny-exec, --deny-ffi, --deny-net, --deny-fs, --deny-http,
-///   --deny-sqlite, --deny-spawn, --deny-gfx
+///   --deny-sqlite, --deny-spawn, --deny-gfx, --deny-import
 ///   --allow-all       — enable every capability (use only for trusted code)
-///   --sandbox         — disable exec/ffi/net/http/sqlite (paranoid mode)
+///   --sandbox         — locked deny profile for every host-effect capability
 ///
 /// Also consults env vars as fallback overrides (set any to "1"/"true"):
 ///   PBLANG_ALLOW_EXEC, PBLANG_ALLOW_FFI, PBLANG_ALLOW_NET,
 ///   PBLANG_ALLOW_FS, PBLANG_ALLOW_HTTP, PBLANG_ALLOW_SQLITE,
-///   PBLANG_ALLOW_SPAWN, PBLANG_ALLOW_GFX, PBLANG_ALLOW_ALL, PBLANG_SANDBOX
+///   PBLANG_ALLOW_SPAWN, PBLANG_ALLOW_GFX, PBLANG_ALLOW_IMPORT,
+///   PBLANG_DENY_IMPORT, PBLANG_ALLOW_ALL, PBLANG_SANDBOX
 ///
-/// CLI flags take precedence over env vars; later flags override earlier ones.
+/// CLI flags take precedence over env vars. Sandbox is a locked profile: when
+/// requested by either source, later allow flags cannot widen it.
 pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
     let mut cfg = StdlibConfig::default();
 
@@ -2074,6 +2078,12 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
     if env_on("PBLANG_ALLOW_GFX") {
         cfg.gfx = true;
     }
+    if env_on("PBLANG_ALLOW_IMPORT") {
+        cfg.import = true;
+    }
+    if env_on("PBLANG_DENY_IMPORT") {
+        cfg.import = false;
+    }
     if env_on("PBLANG_ALLOW_ENV") {
         cfg.env = true;
     }
@@ -2089,16 +2099,22 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
         cfg.sqlite = true;
         cfg.spawn = true;
         cfg.gfx = true;
+        cfg.import = true;
         cfg.env = true;
     }
-    if env_on("PBLANG_SANDBOX") {
+    let sandbox_requested = env_on("PBLANG_SANDBOX") || args.iter().any(|a| a == "--sandbox");
+    if sandbox_requested {
         cfg.exec = false;
         cfg.ffi = false;
         cfg.net = false;
         cfg.fs = false;
         cfg.http = false;
         cfg.sqlite = false;
+        cfg.spawn = false;
+        cfg.gfx = false;
+        cfg.import = false;
         cfg.env = false;
+        cfg.process_exit = false;
     }
 
     // 2. CLI flag scan + strip.
@@ -2133,6 +2149,10 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
         }
         "--allow-gfx" => {
             cfg.gfx = true;
+            false
+        }
+        "--allow-import" => {
+            cfg.import = true;
             false
         }
         "--allow-env" => {
@@ -2171,6 +2191,10 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
             cfg.gfx = false;
             false
         }
+        "--deny-import" => {
+            cfg.import = false;
+            false
+        }
         "--deny-env" => {
             cfg.env = false;
             false
@@ -2184,6 +2208,7 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
             cfg.sqlite = true;
             cfg.spawn = true;
             cfg.gfx = true;
+            cfg.import = true;
             cfg.env = true;
             false
         }
@@ -2194,11 +2219,32 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
             cfg.fs = false;
             cfg.http = false;
             cfg.sqlite = false;
+            cfg.spawn = false;
+            cfg.gfx = false;
+            cfg.import = false;
             cfg.env = false;
+            cfg.process_exit = false;
             false
         }
         _ => true,
     });
+
+    // Re-apply the locked profile after the order-sensitive flag scan. This
+    // prevents `--sandbox --allow-all` and the reverse order from producing
+    // different authority, and prevents allow env vars from widening it.
+    if sandbox_requested {
+        cfg.exec = false;
+        cfg.ffi = false;
+        cfg.net = false;
+        cfg.fs = false;
+        cfg.http = false;
+        cfg.sqlite = false;
+        cfg.spawn = false;
+        cfg.gfx = false;
+        cfg.import = false;
+        cfg.env = false;
+        cfg.process_exit = false;
+    }
 
     cfg
 }
@@ -2206,7 +2252,8 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
 /// Resolve the native IDE script (editors/ide/pbide.sapp): an absolute path if
 /// found, else None. Search order: `PBLANG_IDE` env override → CWD-relative (the
 /// repo root) → walking up from the executable's directory (installed/dev layouts)
-/// → build-time repo root → standard share install locations.
+/// → standard share install locations. Release binaries intentionally do not
+/// embed a developer-machine build path.
 fn locate_ide() -> Option<std::path::PathBuf> {
     fn canonical_ide_candidate(base: impl AsRef<std::path::Path>) -> Option<std::path::PathBuf> {
         let cand = base.as_ref().join("editors/ide/pbide.sapp");
@@ -2247,11 +2294,6 @@ fn locate_ide() -> Option<std::path::PathBuf> {
                     return Some(p);
                 }
             }
-        }
-    }
-    if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
-        if let Some(p) = canonical_ide_candidate(manifest_dir) {
-            return Some(p);
         }
     }
     for base in ["/usr/local/share/pblang", "/usr/share/pblang"] {
@@ -2302,7 +2344,7 @@ fn legacy_dispatch(args: Vec<String>) {
             }
             None => {
                 eprintln!(
-                    "pblang --ide: could not find editors/ide/pbide.sapp.\n  Searched PBLANG_IDE, the current directory, executable-relative install paths,\n  the build-time repo path, /usr/local/share/pblang, and /usr/share/pblang.\n  Set PBLANG_IDE=/path/to/pbide.sapp to override."
+                    "pblang --ide: could not find editors/ide/pbide.sapp.\n  Searched PBLANG_IDE, the current directory, executable-relative install paths,\n  /usr/local/share/pblang, and /usr/share/pblang.\n  Set PBLANG_IDE=/path/to/pbide.sapp to override."
                 );
                 std::process::exit(1);
             }

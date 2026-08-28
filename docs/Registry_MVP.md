@@ -35,7 +35,7 @@
 - **Απλό index**: στατικό JSON (ή TOML) που περιέχει για κάθε package name λίστα versions με:
   - version
   - tarball URL (ή checksum + URL)
-  - optional sha256
+  - mandatory 64-hex sha256
 - **Πηγή**: αρχικά GitHub Releases ή απλό HTTP server που σερβίρει index + tarballs.
 - **Fetch**: το CLI κατεβάζει το tarball, το ξεπακετάρει σε cache dir (π.χ. `~/.pblang/cache` ή `./.pblang/cache`), και ενημερώνει το lockfile με path + sha256 + name + version + source. Για static registries, το `url` μπορεί πλέον να είναι είτε absolute URL είτε path relative προς το `index.json`.
 
@@ -48,7 +48,7 @@
 - **Git**: `"github.com/user/repo" = { git = "https://github.com/user/repo", rev = "abc123" }`.
 - **Package entrypoint**: στο `[package]` μπορεί προαιρετικά να υπάρχει **`entry = "src/lib.sapp"`** ώστε τα bare imports (`import("@scope/pkg")`, `import("depname")`) να μη βασίζονται μόνο στο root heuristic `lib/main.*`. Προαιρετικά **`description = "..."`** για packaging/shipping UX: εμφανίζεται στην έξοδο επιτυχίας του `pack`/`bundle` μαζί με name@version.
 
-Το `pblang install` (ή `--lock`) κάνει resolve: για registry entries κάνει lookup στο index, fetch tarball, unpack σε cache, και γράφει στο lockfile το resolved path (στο cache) + sha256 + name + version + source. Το unpack γίνεται πλέον με safe-entry policy: archive paths πρέπει να είναι relative μέσα στο destination και symlink/hardlink entries απορρίπτονται.
+Το `pblang install` (ή `--lock`) κάνει resolve: για registry entries κάνει lookup στο index, απαιτεί και επαληθεύει το sha256, fetch tarball, unpack σε cache, και γράφει στο lockfile το resolved path (στο cache) + sha256 + name + version + source. Το unpack είναι bounded και transactional: archive paths πρέπει να είναι relative μέσα στο destination, μόνο regular files/directories γίνονται δεκτά, symlink/hardlink/special entries απορρίπτονται και κάθε partial cache tree αφαιρείται μετά από αποτυχία.
 
 Registry/git packages δεν θεωρούνται installable μόνο επειδή unpacked/cloned successfully: αν ένα third-party package δηλώνει `[package].entry`, αυτό πρέπει να είναι valid file μέσα στο package root· αν δεν δηλώνει explicit entry, το package πρέπει παρ' όλα αυτά να περιέχει τουλάχιστον ένα `.sap`/`.sapp` module. Έτσι broken packages απορρίπτονται στο install-time αντί να αφήνουν misleading lock entries.
 
