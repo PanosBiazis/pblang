@@ -1656,6 +1656,19 @@ fn run_pblang_script_with_args(script: &str, extra_args: &[&str]) -> (i32, Strin
     (out.status.code().unwrap_or(-1), stdout, stderr)
 }
 
+#[test]
+fn run_io_timeout_is_bounded_and_does_not_become_a_script_argument() {
+    let (status, stdout, stderr) =
+        run_pblang_script_with_args("print \"io-timeout-ok\";", &["--io-timeout-ms=1000"]);
+    assert_eq!(status, 0, "stderr={stderr}");
+    assert!(stdout.contains("io-timeout-ok"), "stdout={stdout}");
+
+    let (bad_status, _bad_stdout, bad_stderr) =
+        run_pblang_script_with_args("print \"must-not-run\";", &["--io-timeout-ms=99"]);
+    assert_eq!(bad_status, 2, "stderr={bad_stderr}");
+    assert!(bad_stderr.contains("100 to 120000"), "stderr={bad_stderr}");
+}
+
 /// The default `pblang run` config denies `ffi`. ffi_load on a valid system
 /// library should hit the capability gate and the catch block should fire.
 #[test]
@@ -1672,10 +1685,11 @@ if r == "GATE_DENIED" { print "ffi:denied"; } else { print "ffi:loaded"; }
     );
 }
 
-/// `--allow-ffi` should switch the same script over to actually loading libc.
+/// `--allow-ffi` enables the capability but keeps an empty deny-by-default
+/// library/symbol policy.
 #[test]
 #[cfg(target_os = "linux")]
-fn cap_allow_ffi_loads_libc() {
+fn cap_allow_ffi_still_requires_an_allowlist() {
     let script = r#"
 let r = try ffi_load("libc.so.6") catch "GATE_DENIED";
 if r == "GATE_DENIED" { print "ffi:denied"; } else { print "ffi:loaded"; }
@@ -1683,8 +1697,32 @@ if r == "GATE_DENIED" { print "ffi:denied"; } else { print "ffi:loaded"; }
     let (status, stdout, stderr) = run_pblang_script_with_args(script, &["--allow-ffi"]);
     assert_eq!(status, 0, "expected exit 0 (got {status}). stderr={stderr}");
     assert!(
+        stdout.contains("ffi:denied"),
+        "expected empty FFI allowlist to deny libc, got stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn cap_exact_ffi_library_grant_loads_only_the_selected_library() {
+    let libc = [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/aarch64-linux-gnu/libc.so.6",
+        "/lib/aarch64-linux-gnu/libc.so.6",
+    ]
+    .into_iter()
+    .find(|path| std::path::Path::new(path).exists())
+    .expect("supported libc path");
+    let script = format!(
+        "let r = try ffi_load({libc:?}) catch \"GATE_DENIED\";\nif r == \"GATE_DENIED\" {{ print \"ffi:denied\"; }} else {{ print \"ffi:loaded\"; }}"
+    );
+    let grant = format!("--ffi-lib={libc}");
+    let (status, stdout, stderr) = run_pblang_script_with_args(&script, &[grant.as_str()]);
+    assert_eq!(status, 0, "expected exit 0 (got {status}). stderr={stderr}");
+    assert!(
         stdout.contains("ffi:loaded"),
-        "expected ffi:loaded with --allow-ffi, got stdout={stdout} stderr={stderr}"
+        "expected exact library grant to load, got stdout={stdout} stderr={stderr}"
     );
 }
 
@@ -1759,10 +1797,10 @@ if graphics == "GATE_DENIED_GFX" { print "gfx:denied"; }
     }
 }
 
-/// Env var alone should enable ffi when no CLI flag is given.
+/// Env var alone enables the FFI capability but cannot bypass its allowlist.
 #[test]
 #[cfg(target_os = "linux")]
-fn cap_env_var_alone_enables_ffi() {
+fn cap_env_var_alone_does_not_bypass_ffi_allowlist() {
     let script = r#"
 let r = try ffi_load("libc.so.6") catch "GATE_DENIED";
 if r == "GATE_DENIED" { print "ffi:denied"; } else { print "ffi:loaded"; }
@@ -1779,8 +1817,8 @@ if r == "GATE_DENIED" { print "ffi:denied"; } else { print "ffi:loaded"; }
     let _ = std::fs::remove_file(&tmp);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("ffi:loaded"),
-        "expected PBLANG_ALLOW_FFI=1 to enable ffi, got: {stdout}"
+        stdout.contains("ffi:denied"),
+        "expected PBLANG_ALLOW_FFI=1 to retain the empty allowlist, got: {stdout}"
     );
 }
 
@@ -1802,6 +1840,46 @@ print "ok";
     assert!(
         stdout.contains("ok"),
         "expected 'ok' output, got: stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn script_args_after_separator_cannot_escalate_host_capabilities() {
+    let script = r#"
+let raw = try env_get("PBLANG_SCRIPT_ARGS") catch "";
+print raw;
+let result = try exec("/bin/true") catch "HOST_DENIED";
+if result == "HOST_DENIED" { print "exec:denied"; } else { print "exec:ran"; }
+"#;
+    let (status, stdout, stderr) = run_pblang_script_with_args(
+        script,
+        &[
+            "--",
+            "--allow-all",
+            "--ffi-lib=/lib/x86_64-linux-gnu/libc.so.6",
+            "--io-timeout-ms=99",
+        ],
+    );
+    assert_eq!(status, 0, "stderr={stderr}");
+    assert!(
+        stdout.contains("--allow-all"),
+        "script args were stripped: {stdout}"
+    );
+    assert!(
+        stdout.contains("--ffi-lib="),
+        "FFI arg was stripped: {stdout}"
+    );
+    assert!(
+        stdout.contains("--io-timeout-ms=99"),
+        "timeout arg was parsed: {stdout}"
+    );
+    assert!(
+        stdout.contains("exec:denied"),
+        "post-separator flag escalated exec: {stdout}"
+    );
+    assert!(
+        !stdout.contains("exec:ran"),
+        "host capability escalation: {stdout}"
     );
 }
 

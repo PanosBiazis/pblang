@@ -122,6 +122,12 @@ pub extern "C" fn pblang_create_vm_sandboxed(
         crypto: true,
         sqlite: allow_sqlite != 0,
         ffi: allow_ffi != 0,
+        // Enabling the builtin category is not authority to load arbitrary
+        // libraries. Embedders that need native calls must use the VM policy
+        // API to install exact library and symbol allowlists.
+        ffi_allow_all: false,
+        ffi_allowed_libs: Default::default(),
+        ffi_allowed_symbols: Default::default(),
         exec: allow_exec != 0,
         gfx: false,
         import: allow_fs != 0,

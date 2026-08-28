@@ -242,6 +242,13 @@ pub struct StdlibConfig {
     pub crypto: bool,
     pub sqlite: bool,
     pub ffi: bool,
+    /// Explicitly bypass the FFI library/symbol allowlists. This is never
+    /// implied by `ffi: true`; only fully trusted embedding profiles set it.
+    pub ffi_allow_all: bool,
+    /// Exact/canonical library paths allowed when FFI is enabled.
+    pub ffi_allowed_libs: HashSet<String>,
+    /// Exact exported symbols allowed when FFI is enabled.
+    pub ffi_allowed_symbols: HashSet<String>,
     pub exec: bool,
     pub gfx: bool,
     /// If true, source modules may be loaded from configured host paths.
@@ -268,6 +275,9 @@ impl Default for StdlibConfig {
             crypto: true,
             sqlite: true,
             ffi: false,
+            ffi_allow_all: false,
+            ffi_allowed_libs: HashSet::new(),
+            ffi_allowed_symbols: HashSet::new(),
             exec: false,
             gfx: true,
             import: true,
@@ -1020,14 +1030,19 @@ impl VM {
     pub fn with_stdlib(config: StdlibConfig) -> Self {
         // Enabling FFI is an explicit trusted-host opt-in. Keep a concrete
         // policy in every VM so `None` can never silently mean allow-all.
-        let ffi_policy = if config.ffi {
-            Some(FfiPolicy {
-                allow_all: true,
-                ..FfiPolicy::default()
-            })
-        } else {
-            Some(FfiPolicy::default())
-        };
+        let ffi_policy = Some(FfiPolicy {
+            allow_all: config.ffi && config.ffi_allow_all,
+            allowed_libs: if config.ffi {
+                config.ffi_allowed_libs.clone()
+            } else {
+                HashSet::new()
+            },
+            allowed_symbols: if config.ffi {
+                config.ffi_allowed_symbols.clone()
+            } else {
+                HashSet::new()
+            },
+        });
         let builtins = Rc::new(RefCell::new(Module::default()));
         gc_register_module(&builtins);
         VM::install_builtins_into(&builtins, Some(&config));

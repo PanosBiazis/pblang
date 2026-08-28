@@ -9,45 +9,84 @@
 //   POST /mcp/tool    -> { tool, arguments:{ prompt, language } }
 //                        routed to pbAI (`respond_tool`) and returned as
 //                        { result, tool, model:"pbAI" }.
-//   POST /browse      -> { url }  ->  the pblang web browser engine (browser.sapp)
-//                        fetches + parses the page: { url, ok, title, text, links, forms, html }.
-//   POST /submit      -> { action, method, fields } -> submit a form (GET query / POST body)
-//                        via the pblang browser engine; returns the resulting page record.
+//   POST /browse      -> 503 until post-DNS destination pinning is available.
+//   POST /submit      -> 503 until post-DNS destination pinning is available.
 //   POST /parse-ui    -> { code } -> { ok, tree }            (designer web round-trip, D1)
 //   POST /parse-gui   -> { code } -> { ok, form, widgets }   (designer desktop round-trip, D3)
 //
-// CORS defaults to loopback/file IDE origins only. Add explicit comma-separated
+// CORS defaults to exact loopback IDE origins only. Add explicit comma-separated
 // origins with PB_AI_GATEWAY_ALLOWED_ORIGINS when embedding the gateway elsewhere.
 //
-// Run from the repo root (imports resolve from the working directory):
-//   ./target/debug/pblang run editors/ide/tools/ai/gateway.sapp --allow-all
-//   # optional env: PB_AI_GATEWAY_BIND (default 127.0.0.1:8080).
+// Create a random token inside a current-user-owned mode-0700 directory, then run:
+//   PB_AI_GATEWAY_MODE=developer-loopback \
+//   PB_AI_GATEWAY_TOKEN_FILE=/private/dir/token \
+//   ./target/release/pblang run editors/ide/tools/ai/gateway.sapp \
+//     --allow-import --allow-env --allow-fs --allow-net \
+//     --io-timeout-ms=1000 \
+//     --deny-http --deny-exec --deny-ffi --deny-sqlite --deny-spawn --deny-process-exit
 //
 // Then set the IDE AI panel endpoint to http://127.0.0.1:8080 (the default).
 
+fn _require_developer_mode() {
+    let mode = try env_get("PB_AI_GATEWAY_MODE") catch "";
+    if mode != "developer-loopback" {
+        throw "PBIDE AI gateway is developer-only until portable pre-auth connection isolation is available";
+    }
+}
+
+// Fail before importing the model, parsers or server and before any bind.
+_require_developer_mode();
+
 let pbai = import("stdlib/pbai.sapp");
-let browser = import("stdlib/browser.sapp");
 let uiparse = import("stdlib/ui_parse.sapp");
 let guiparse = import("stdlib/gui_parse.sapp");
 let server = import("stdlib/http_server.sapp");
+
+// NativeTcp's 1 MiB text envelope also carries up to 16 KiB of headers.
+let MAX_BODY_CHARS = 1000000;
+let MAX_PROMPT_CHARS = 65536;
+let MAX_SOURCE_CHARS = 262144;
+let ALLOWED_TOOLS = ["ai_ollama_generate", "ai_self_critique", "ai_structured_extract"];
+let BIND = "127.0.0.1:8080";
+let BROWSER_NETWORK_EFFECTS_ENABLED = false;
+
+fn _load_token() {
+    let path = try env_get("PB_AI_GATEWAY_TOKEN_FILE") catch nil;
+    if type(path) != "string" or str_trim(path) == "" {
+        throw "PB_AI_GATEWAY_TOKEN_FILE is required";
+    }
+    // The operator must create this file in a private 0700 directory with mode
+    // 0600. The gateway deliberately avoids raw FFI and process execution; a
+    // future opaque host primitive will add descriptor-bound no-follow reads.
+    let token = str_trim(try fs_read(str_trim(path)) catch "");
+    if len(token) < 32 or len(token) > 512 {
+        throw "gateway token must contain 32..512 non-whitespace characters";
+    }
+    return token;
+}
+
+let GATEWAY_TOKEN = _load_token();
+let RATE_GATE = server.mw_rate_limit(120, 60000);
 
 fn _configured_origin_allowed(origin) {
     let raw = try env_get("PB_AI_GATEWAY_ALLOWED_ORIGINS") catch "";
     let parts = str_split(str(raw ?? ""), ",");
     let i = 0;
     while i < len(parts) {
-        if str_trim(parts[i]) == origin { return true; }
+        let configured = str_trim(parts[i]);
+        if len(configured) <= 256 and configured == origin { return true; }
         i = i + 1;
     }
     return false;
 }
 
 fn _origin_allowed(origin) {
-    if origin == nil or origin == "" { return true; }
+    if origin == nil or origin == "" { return false; }
     let o = str(origin);
-    if o == "null" { return true; }
-    if str_starts_with(o, "http://127.0.0.1:") or str_starts_with(o, "http://localhost:") or str_starts_with(o, "http://[::1]:") { return true; }
-    if str_starts_with(o, "https://127.0.0.1:") or str_starts_with(o, "https://localhost:") or str_starts_with(o, "https://[::1]:") { return true; }
+    if o == "http://127.0.0.1:8090" or o == "http://localhost:8090"
+       or o == "https://127.0.0.1:8090" or o == "https://localhost:8090" {
+        return true;
+    }
     return _configured_origin_allowed(o);
 }
 
@@ -74,6 +113,30 @@ fn json_resp(status, obj, req = nil) {
     return map{ status: status, body: json_stringify(obj), content_type: "application/json", headers: cors(req) };
 }
 
+fn _authenticated(req) {
+    let auth = server.req_header(req, "Authorization");
+    if type(auth) != "string" { return false; }
+    return constant_time_eq(auth, "Bearer " + GATEWAY_TOKEN);
+}
+
+fn _payload(req) {
+    let body = try req.body catch "";
+    if type(body) != "string" or len(body) > MAX_BODY_CHARS {
+        return map{ ok: false, status: 413, error: "request body exceeds limit" };
+    }
+    let value = try json_parse(body) catch nil;
+    if type(value) != "map" {
+        return map{ ok: false, status: 400, error: "invalid JSON object body" };
+    }
+    return map{ ok: true, value: value };
+}
+
+fn _tool_allowed(tool) {
+    if type(tool) != "string" { return false; }
+    for allowed in ALLOWED_TOOLS { if tool == allowed { return true; } }
+    return false;
+}
+
 fn handle(req) {
     let method = try req.method catch "GET";
     let path = try req.path catch "/";
@@ -84,7 +147,19 @@ fn handle(req) {
 
     // CORS preflight
     if method == "OPTIONS" {
+        if not _origin_allowed(origin) {
+            return map{ status: 403, body: "origin not allowed", content_type: "text/plain", headers: cors(nil) };
+        }
         return map{ status: 204, body: "", content_type: "text/plain", headers: cors(req) };
+    }
+
+    let limited = RATE_GATE(req);
+    if limited != nil {
+        limited.headers = cors(req);
+        return limited;
+    }
+    if not _authenticated(req) {
+        return json_resp(401, map{ error: "authentication required" }, req);
     }
 
     // Health — drives the panel's live status indicator.
@@ -94,51 +169,45 @@ fn handle(req) {
 
     // Tool call — answered by pbAI, entirely in-process.
     if path == "/mcp/tool" and method == "POST" {
-        let body = try req.body catch "";
-        let payload = try json_parse(body) catch nil;
-        if payload == nil { return json_resp(400, map{ error: "invalid JSON body" }, req); }
+        let parsed = _payload(req);
+        if not parsed.ok { return json_resp(parsed.status, map{ error: parsed.error }, req); }
+        let payload = parsed.value;
 
-        let tool = try payload.tool catch "ai_ollama_generate";
+        let tool = try payload.tool catch "";
+        if not _tool_allowed(tool) { return json_resp(400, map{ error: "tool is not allowed" }, req); }
         let args = try payload.arguments catch map{};
         let prompt = try args.prompt catch "";
-        if prompt == "" { return json_resp(400, map{ error: "missing arguments.prompt" }, req); }
+        if type(prompt) != "string" or prompt == "" or len(prompt) > MAX_PROMPT_CHARS {
+            return json_resp(400, map{ error: "arguments.prompt is missing or exceeds limit" }, req);
+        }
 
         let text = try pbai.respond_tool(tool, prompt) catch nil;
         if text == nil { return json_resp(500, map{ error: "pbAI failed to produce a response" }, req); }
         return json_resp(200, map{ result: text, tool: tool, model: "pbAI" }, req);
     }
 
-    // Browser — the IDE's pblang web browser fetches + parses a page via browser.sapp.
+    // Browser network effects remain fail-closed. Textual URL filtering cannot
+    // prevent DNS rebinding or validate every redirect after name resolution.
     if path == "/browse" and method == "POST" {
-        let payload = try json_parse(try req.body catch "") catch nil;
-        if payload == nil { return json_resp(400, map{ error: "invalid JSON body" }, req); }
-        let url = try payload.url catch "";
-        if url == "" { return json_resp(400, map{ error: "missing url" }, req); }
-        let tor = try payload.tor catch false;          // opt-in Tor routing (default off)
-        let page = try browser.fetch_page(url, tor) catch nil;
-        if page == nil { return json_resp(502, map{ error: "browser engine failed" }, req); }
-        return json_resp(200, page, req);
+        if not BROWSER_NETWORK_EFFECTS_ENABLED {
+            return json_resp(503, map{ error: "browser network effects disabled until post-resolution destination verification is available" }, req);
+        }
     }
 
-    // Form submission — the pblang browser submits a form (GET query or POST body).
+    // Form submission shares the same destination-verification boundary.
     if path == "/submit" and method == "POST" {
-        let payload = try json_parse(try req.body catch "") catch nil;
-        if payload == nil { return json_resp(400, map{ error: "invalid JSON body" }, req); }
-        let action = try payload.action catch "";
-        if action == "" { return json_resp(400, map{ error: "missing action" }, req); }
-        let fmethod = try payload.method catch "get";
-        let fields = try payload.fields catch map{};
-        let tor = try payload.tor catch false;          // opt-in Tor routing (default off)
-        let page = try browser.submit(action, fmethod, fields, tor) catch nil;
-        if page == nil { return json_resp(502, map{ error: "form submit failed" }, req); }
-        return json_resp(200, page, req);
+        if not BROWSER_NETWORK_EFFECTS_ENABLED {
+            return json_resp(503, map{ error: "form network effects disabled until post-resolution destination verification is available" }, req);
+        }
     }
 
     // Designer round-trip — parse generated pblang web code back into a component tree.
     if path == "/parse-ui" and method == "POST" {
-        let payload = try json_parse(try req.body catch "") catch nil;
-        if payload == nil { return json_resp(400, map{ error: "invalid JSON body" }, req); }
+        let parsed = _payload(req);
+        if not parsed.ok { return json_resp(parsed.status, map{ error: parsed.error }, req); }
+        let payload = parsed.value;
         let code = try payload.code catch "";
+        if type(code) != "string" or len(code) > MAX_SOURCE_CHARS { return json_resp(400, map{ error: "source exceeds limit" }, req); }
         let tree = try uiparse.parse(code) catch nil;
         if tree == nil { return json_resp(502, map{ error: "ui parse failed" }, req); }
         return json_resp(200, map{ ok: true, tree: tree }, req);
@@ -147,21 +216,22 @@ fn handle(req) {
     // Designer round-trip (desktop, D3) — parse generated gui.sapp code back into a
     // form + widget list (the D1 analogue for the desktop GUI kind).
     if path == "/parse-gui" and method == "POST" {
-        let payload = try json_parse(try req.body catch "") catch nil;
-        if payload == nil { return json_resp(400, map{ error: "invalid JSON body" }, req); }
+        let parsed = _payload(req);
+        if not parsed.ok { return json_resp(parsed.status, map{ error: parsed.error }, req); }
+        let payload = parsed.value;
         let code = try payload.code catch "";
-        let design = try guiparse.parse(code) catch nil;
-        if design == nil { return json_resp(502, map{ error: "gui parse failed" }, req); }
+        if type(code) != "string" or len(code) > MAX_SOURCE_CHARS { return json_resp(400, map{ error: "source exceeds limit" }, req); }
+        let design = try guiparse.parse_strict(code) catch nil;
+        if design == nil or not design.ok { return json_resp(422, map{ error: "gui source is unsupported or malformed" }, req); }
         return json_resp(200, map{ ok: true, form: design.form, widgets: design.widgets, model: design.model }, req);
     }
 
     return json_resp(404, map{ error: "not found: " + method + " " + path }, req);
 }
 
-let bind = try env_get("PB_AI_GATEWAY_BIND") catch nil;
-if bind == nil { bind = "127.0.0.1:8080"; }
 print "pblang AI gateway — backed by pbAI (stdlib/pbai.sapp), no external model";
 print "endpoints: GET /health, OPTIONS *, POST /mcp/tool";
-print "CORS: loopback/file origins by default; set PB_AI_GATEWAY_ALLOWED_ORIGINS for more";
-print "set the IDE AI panel endpoint to http://" + bind;
-server.serve_forever(bind, handle);
+print "CORS: exact loopback IDE origins by default; explicit additions only";
+print "set the IDE AI panel endpoint to http://" + BIND;
+server.set_max_body(MAX_BODY_CHARS);
+server.serve_forever(BIND, handle);
