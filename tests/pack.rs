@@ -3,6 +3,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_PROJECT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn pblang_pack_fixture_command(bin: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(bin);
+    // Registry-backed pack/bundle cases in this module generate unsigned local
+    // fixtures. Scope the explicit development exception to child test commands.
+    command.env("PBLANG_ALLOW_UNSIGNED_REGISTRY_DEV", "1");
+    command
+}
+
 fn registry_file_url(path: &std::path::Path) -> String {
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     format!("file:///{}", abs.to_string_lossy().replace('\\', "/"))
@@ -107,7 +115,7 @@ fn pack_fails_when_path_dependency_missing() {
     let out_path = proj.join("app.tar.gz");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg(&proj)
         .arg(&out_path)
@@ -133,7 +141,7 @@ fn bundle_fails_when_path_dependency_missing() {
     let bundle_dir = proj.join("bundle-out");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("bundle")
         .arg(".")
         .arg(&bundle_dir)
@@ -178,7 +186,7 @@ min_runtime = "0.3.0"
     );
     let out_path = proj.join("out.tar.gz");
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg(&proj)
         .arg(&out_path)
@@ -207,7 +215,7 @@ target_platform = "solaris"
     );
     let out_path = proj.join("out.tar.gz");
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg(&proj)
         .arg(&out_path)
@@ -241,7 +249,7 @@ min_runtime = "not-a-version"
     );
     let out_path = proj.join("out.tar.gz");
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg(&proj)
         .arg(&out_path)
@@ -266,7 +274,7 @@ fn pack_then_run_works() {
     let out_path = proj.join("app.tar.gz");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let status = std::process::Command::new(bin)
+    let status = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg(&proj)
         .arg(&out_path)
@@ -288,7 +296,7 @@ fn pack_then_run_works() {
     archive.unpack(&unpack_dir).unwrap();
 
     // Run the unpacked project with the installed pblang binary.
-    let output = std::process::Command::new(bin)
+    let output = pblang_pack_fixture_command(bin)
         .arg("run")
         .arg("main.sapp")
         .current_dir(&unpack_dir)
@@ -324,7 +332,7 @@ fn verify_succeeds_on_valid_pack_tarball() {
     let out_path = base.join("out.tar.gz");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let status = std::process::Command::new(bin)
+    let status = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg(&base)
         .arg(&out_path)
@@ -333,7 +341,7 @@ fn verify_succeeds_on_valid_pack_tarball() {
     assert!(status.success(), "pack should succeed");
     assert!(out_path.is_file(), "tarball should exist");
 
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("verify")
         .arg(&out_path)
         .output()
@@ -364,7 +372,7 @@ fn verify_fails_when_tarball_missing_manifest() {
     }
     std::fs::write(&bad, &buf).unwrap();
 
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("verify")
         .arg(&bad)
         .output()
@@ -397,7 +405,7 @@ fn pack_tarball_contains_manifest_and_entry_file() {
     let out_path = proj.join("app.tar.gz");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let status = std::process::Command::new(bin)
+    let status = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg(&proj)
         .arg(&out_path)
@@ -445,7 +453,7 @@ fn pack_then_run_from_manifest_dir_uses_package_entry() {
     let out_path = proj.join("app.tar.gz");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let pack = std::process::Command::new(bin)
+    let pack = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg(&proj)
         .arg(&out_path)
@@ -475,7 +483,7 @@ fn pack_then_run_from_manifest_dir_uses_package_entry() {
     let mut archive = tar::Archive::new(dec);
     archive.unpack(&unpack_dir).unwrap();
 
-    let output = std::process::Command::new(bin)
+    let output = pblang_pack_fixture_command(bin)
         .arg("run")
         .current_dir(&unpack_dir)
         .output()
@@ -505,7 +513,7 @@ fn bundle_self_extract_flag_accepted() {
     let bundle_dir = proj.join("bundle-out-self-extract");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("bundle")
         .arg("--self-extract")
         .arg(&proj)
@@ -530,7 +538,7 @@ fn bundle_then_run_from_manifest_dir_uses_package_entry() {
     let bundle_dir = proj.join("bundle-out");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let bundle = std::process::Command::new(bin)
+    let bundle = pblang_pack_fixture_command(bin)
         .arg("bundle")
         .arg(&proj)
         .arg(&bundle_dir)
@@ -596,7 +604,7 @@ fn bundle_dir_contains_manifest_and_entry_file() {
     let bundle_dir = proj.join("bundle-out");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let status = std::process::Command::new(bin)
+    let status = pblang_pack_fixture_command(bin)
         .arg("bundle")
         .arg(&proj)
         .arg(&bundle_dir)
@@ -641,7 +649,7 @@ version = "1.0.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let publish = std::process::Command::new(bin)
+    let publish = pblang_pack_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -665,7 +673,7 @@ version = "0.1.0"
     std::fs::write(consumer.join("main.sapp"), "print 42;\n").unwrap();
     let bundle_dir = consumer.join("bundle-out");
 
-    let bundle = std::process::Command::new(bin)
+    let bundle = pblang_pack_fixture_command(bin)
         .arg("bundle")
         .arg("--registry-index")
         .arg(registry_file_url(&registry_dir.join("index.json")))
@@ -723,7 +731,7 @@ version = "1.0.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let publish = std::process::Command::new(bin)
+    let publish = pblang_pack_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -748,7 +756,7 @@ version = "0.1.0"
     let index_url = registry_file_url(&registry_dir.join("index.json"));
     let out_path = consumer.join("dist").join("registry-pack.tar.gz");
 
-    let pack = std::process::Command::new(bin)
+    let pack = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg("--registry-index")
         .arg(&index_url)
@@ -828,7 +836,7 @@ version = "0.1.0"
     std::fs::write(consumer.join("main.sapp"), "print 42;\n").unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg("--registry-index")
         .arg(registry_file_url(&registry_dir.join("index.json")))
@@ -873,7 +881,7 @@ fn pack_output_includes_package_name_version_and_description() {
     let out_path = std::env::temp_dir().join("pblang_pack_metadata_out.tar.gz");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg(&proj)
         .arg(&out_path)
@@ -912,7 +920,7 @@ fn bundle_output_includes_package_name_version_and_description() {
     let bundle_dir = std::env::temp_dir().join("pblang_bundle_metadata_out");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("bundle")
         .arg(&proj)
         .arg(&bundle_dir)
@@ -950,7 +958,7 @@ fn pack_rejects_out_of_package_path_dependency() {
     let out_path = proj.join("app.tar.gz");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg(&proj)
         .arg(&out_path)
@@ -978,7 +986,7 @@ fn bundle_rejects_out_of_package_path_dependency() {
     let bundle_dir = proj.join("bundle-out");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("bundle")
         .arg(&proj)
         .arg(&bundle_dir)
@@ -1048,7 +1056,7 @@ version = "0.1.0"
     std::fs::write(consumer.join("main.sapp"), "print 42;\n").unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_pack_fixture_command(bin)
         .arg("bundle")
         .arg("--registry-index")
         .arg(registry_file_url(&registry_dir.join("index.json")))
@@ -1090,7 +1098,7 @@ fn self_extract_sentinel_in_stub_binary() {
     let tarball_path = proj.join("sentinel_test.tar.gz");
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let status = std::process::Command::new(bin)
+    let status = pblang_pack_fixture_command(bin)
         .arg("pack")
         .arg(&proj)
         .arg(&tarball_path)
@@ -1178,7 +1186,7 @@ fn bundle_self_extract_produces_executable_with_sentinel() {
     let bin = std::path::Path::new(env!("CARGO_BIN_EXE_pblang"));
     ensure_pblang_stub_built(bin);
 
-    let bundle = std::process::Command::new(bin)
+    let bundle = pblang_pack_fixture_command(bin)
         .arg("bundle")
         .arg("--self-extract")
         .arg("--output")
@@ -1211,7 +1219,7 @@ fn self_extract_runs_without_pblang_on_path() {
     let bin = std::path::Path::new(env!("CARGO_BIN_EXE_pblang"));
     ensure_pblang_stub_built(bin);
 
-    let bundle = std::process::Command::new(bin)
+    let bundle = pblang_pack_fixture_command(bin)
         .arg("bundle")
         .arg("--self-extract")
         .arg("--output")
@@ -1266,7 +1274,7 @@ fn self_extract_with_dot_cwd_includes_package_files() {
     let bin = std::path::Path::new(env!("CARGO_BIN_EXE_pblang"));
     ensure_pblang_stub_built(bin);
 
-    let bundle = std::process::Command::new(bin)
+    let bundle = pblang_pack_fixture_command(bin)
         .arg("bundle")
         .arg("--self-extract")
         .arg("--output")
@@ -1309,7 +1317,7 @@ fn self_extract_extract_only_includes_embedded_runtime() {
     let bin = std::path::Path::new(env!("CARGO_BIN_EXE_pblang"));
     ensure_pblang_stub_built(bin);
 
-    let bundle = std::process::Command::new(bin)
+    let bundle = pblang_pack_fixture_command(bin)
         .arg("bundle")
         .arg("--self-extract")
         .arg("--output")

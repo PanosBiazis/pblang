@@ -1010,14 +1010,27 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
 }
 
 fn http_post_json(port: u16, path: &str, body: &str) -> Result<String, String> {
+    http_post_json_with_token(port, path, body, None)
+}
+
+fn http_post_json_with_token(
+    port: u16,
+    path: &str,
+    body: &str,
+    token: Option<&str>,
+) -> Result<String, String> {
     let mut stream =
         TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
     stream
         .set_read_timeout(Some(Duration::from_millis(1200)))
         .map_err(|e| format!("set read timeout: {e}"))?;
+    let auth = token
+        .map(|value| format!("X-PBLang-Token: {value}\r\n"))
+        .unwrap_or_default();
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "POST {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         path,
+        auth,
         body.len(),
         body
     );
@@ -1029,6 +1042,121 @@ fn http_post_json(port: u16, path: &str, body: &str) -> Result<String, String> {
         .read_to_string(&mut s)
         .map_err(|e| format!("read resp: {e}"))?;
     Ok(s)
+}
+
+#[test]
+fn serve_run_is_disabled_without_token_and_cannot_exit_host() {
+    let bin = require_pblang_bin();
+    let port = pick_free_port();
+    let mut child = Command::new(&bin)
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn pblang serve");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if http_get(port, "/health")
+            .map(|r| r.contains("\"ok\":true"))
+            .unwrap_or(false)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let payload = serde_json::json!({"code": "os_exit(7);"}).to_string();
+    let denied = http_post_json(port, "/run", &payload).expect("POST disabled /run");
+    assert!(denied.contains("404 Not Found") && denied.contains("execution endpoint is disabled"));
+    let health = http_get(port, "/health").expect("health after denied os_exit");
+    assert!(
+        health.contains("\"ok\":true"),
+        "server must remain alive: {health}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_run_requires_token_and_uses_deny_profile() {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = require_pblang_bin();
+    let token = "0123456789abcdef0123456789abcdef";
+    let token_path = std::env::temp_dir().join(format!("pblang-ide-token-{}", std::process::id()));
+    std::fs::write(&token_path, token).expect("write token");
+    std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod token");
+    let port = pick_free_port();
+    let mut child = Command::new(&bin)
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--run-token-file")
+        .arg(&token_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn protected pblang serve");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if http_get(port, "/health")
+            .map(|r| r.contains("\"ok\":true"))
+            .unwrap_or(false)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let payload = serde_json::json!({"code": "os_exit(7);"}).to_string();
+    let unauth = http_post_json(port, "/run", &payload).expect("POST unauthenticated /run");
+    assert!(unauth.contains("401 Unauthorized"));
+    let denied = http_post_json_with_token(port, "/run", &payload, Some(token))
+        .expect("POST authenticated /run");
+    assert!(
+        !denied.contains("\"ok\":true"),
+        "os_exit must be denied: {denied}"
+    );
+    let health = http_get(port, "/health").expect("health after denied authenticated os_exit");
+    assert!(
+        health.contains("\"ok\":true"),
+        "server must remain alive: {health}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(token_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_run_rejects_group_readable_token_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = require_pblang_bin();
+    let token_path =
+        std::env::temp_dir().join(format!("pblang-insecure-ide-token-{}", std::process::id()));
+    std::fs::write(&token_path, "0123456789abcdef0123456789abcdef").expect("write token");
+    std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o640))
+        .expect("chmod token");
+    let output = Command::new(&bin)
+        .arg("serve")
+        .arg("--port")
+        .arg(pick_free_port().to_string())
+        .arg("--run-token-file")
+        .arg(&token_path)
+        .output()
+        .expect("run pblang serve with insecure token");
+    let _ = std::fs::remove_file(token_path);
+    assert!(
+        !output.status.success(),
+        "insecure token file must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mode 0600 or stricter"),
+        "unexpected error: {stderr}"
+    );
 }
 
 fn http_send_raw(port: u16, request: &str) -> Result<String, String> {

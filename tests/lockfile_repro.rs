@@ -1,7 +1,7 @@
 //! Lockfile reproducibility (v0.3): regenerating the lockfile from the same manifest
 //! must produce the same output.
 
-use pblang_pm::{generate_lockfile, generate_lockfile_with_registry, write_lockfile};
+use pblang_pm::{generate_lockfile, generate_lockfile_with_registry_policy, write_lockfile};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,9 +83,9 @@ version = "0.1.0"
     )
     .unwrap();
 
-    let lock1 = generate_lockfile_with_registry(&consumer, Some(&index_url), false)
+    let lock1 = generate_lockfile_with_registry_policy(&consumer, Some(&index_url), false, true)
         .expect("first generate");
-    let lock2 = generate_lockfile_with_registry(&consumer, Some(&index_url), false)
+    let lock2 = generate_lockfile_with_registry_policy(&consumer, Some(&index_url), false, true)
         .expect("second generate");
 
     let s1 = write_lockfile(&lock1).expect("serialize 1");

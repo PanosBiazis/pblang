@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -209,9 +210,13 @@ fn expand_dep_path(raw: &str) -> String {
 // Lockfile structs
 // ──────────────────────────────────────────────────────────────
 
+pub const LOCKFILE_CONTENT_HASH_ALGORITHM: &str = "pblang-package-tree-v2";
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Lockfile {
     pub manifest_sha256: String,
+    #[serde(default)]
+    pub content_hash_algorithm: String,
     pub dependencies: std::collections::BTreeMap<String, LockedDep>,
 }
 
@@ -285,8 +290,9 @@ impl LockedDep {
     }
 }
 
-/// Read a lockfile from disk and attempt v1→v2 migration if needed.
-/// Returns the lockfile and whether migration was performed.
+/// Read a current hash-v2 lockfile and enrich legacy per-dependency metadata.
+/// Lockfiles without an explicit content-hash algorithm require an auditable
+/// refresh and are rejected by `parse_lockfile` before metadata migration.
 pub fn read_lockfile_with_migration(
     lock_path: &Path,
     manifest_dir: &Path,
@@ -433,6 +439,7 @@ pub struct PackageMetadata {
 pub struct RegistryClient {
     base_url: String,
     token: Option<String>,
+    allow_unsigned_registry_dev: bool,
 }
 
 impl RegistryClient {
@@ -441,6 +448,7 @@ impl RegistryClient {
         RegistryClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             token: None,
+            allow_unsigned_registry_dev: unsigned_registry_dev_enabled(),
         }
     }
 
@@ -449,7 +457,14 @@ impl RegistryClient {
         RegistryClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             token: Some(token),
+            allow_unsigned_registry_dev: unsigned_registry_dev_enabled(),
         }
+    }
+
+    /// Explicit development-only compatibility for unsigned registries.
+    /// Never enable this for release, CI publication, or multi-user installs.
+    pub fn allow_unsigned_registry_for_development(&mut self) {
+        self.allow_unsigned_registry_dev = true;
     }
 
     /// Set or replace the auth token.
@@ -471,11 +486,8 @@ impl RegistryClient {
         version: &str,
     ) -> Result<(PackageMetadata, Vec<u8>), String> {
         let index_url = format!("{}/index.json", self.base_url);
-        let index_bytes = fetch_url_with_limit(
-            &index_url,
-            MAX_REGISTRY_INDEX_BYTES,
-            "registry index",
-        )?;
+        let index_bytes =
+            fetch_authenticated_registry_index(&index_url, self.allow_unsigned_registry_dev)?;
         let index = parse_registry_index(&index_bytes)?;
 
         let releases = index
@@ -544,12 +556,8 @@ impl RegistryClient {
         let (metadata, tarball_bytes) = self.fetch(package_name, version)?;
 
         let archive_sha256 = hex::encode(Sha256::digest(&tarball_bytes));
-        let cache_entry = cache_dir.join(&archive_sha256);
-        if !cache_entry.is_dir() {
-            unpack_tarball_gz(&tarball_bytes, &cache_entry)?;
-        }
-
-        validate_package_tree(&cache_entry)?;
+        let (cache_entry, _) =
+            install_verified_registry_archive(cache_dir, &archive_sha256, &tarball_bytes)?;
 
         let mut meta = metadata;
         meta.checksum = Some(archive_sha256);
@@ -576,20 +584,14 @@ pub fn fetch_url(url: &str) -> Result<Vec<u8>, String> {
 }
 
 fn fetch_url_with_limit(url: &str, limit: usize, label: &str) -> Result<Vec<u8>, String> {
-    if let Some(path) = url.strip_prefix("file://") {
-        // On Unix: file:///tmp/foo → strip "file://" → "/tmp/foo" (absolute, correct)
-        // On Unix: file://tmp/foo  → strip "file://" → "tmp/foo"  (relative, user intent)
-        // On Windows: file:///C:/foo → strip "file://" → "/C:/foo" → trim ONE slash → "C:/foo"
-        #[cfg(windows)]
-        let path = {
-            let p = path.trim_start_matches('/');
-            p.strip_prefix("?/").unwrap_or(p)
-        };
-        // NOTE: On non-Windows we do NOT strip the leading slash — the path is absolute.
-        let file = std::fs::File::open(path).map_err(|e| format!("read file {}: {e}", path))?;
+    if url.starts_with("file:") {
+        let path = local_file_registry_path(url)
+            .ok_or_else(|| format!("{label}: file URL is not an absolute local path"))?;
+        let file =
+            std::fs::File::open(&path).map_err(|e| format!("read file {}: {e}", path.display()))?;
         let size = file
             .metadata()
-            .map_err(|e| format!("stat file {}: {e}", path))?
+            .map_err(|e| format!("stat file {}: {e}", path.display()))?
             .len();
         if size > limit as u64 {
             return Err(format!(
@@ -599,7 +601,7 @@ fn fetch_url_with_limit(url: &str, limit: usize, label: &str) -> Result<Vec<u8>,
         let mut bytes = Vec::with_capacity(size as usize);
         file.take(limit as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|e| format!("read file {}: {e}", path))?;
+            .map_err(|e| format!("read file {}: {e}", path.display()))?;
         if bytes.len() > limit {
             return Err(format!(
                 "{label}: payload exceeds cap of {limit} bytes while reading"
@@ -615,9 +617,21 @@ fn fetch_url_with_limit(url: &str, limit: usize, label: &str) -> Result<Vec<u8>,
                 .to_string(),
         );
     }
-    let resp = ureq::get(url)
+    // Registry fetches never follow redirects. A redirect changes the trust
+    // boundary after policy has classified the original URL, so callers must
+    // resolve and authorize the final URL explicitly.
+    let agent = ureq::AgentBuilder::new().redirects(0).build();
+    let resp = agent
+        .get(url)
         .call()
         .map_err(|e| format!("GET {}: {e}", url))?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(format!(
+            "GET {}: unexpected HTTP status {} (redirects are not allowed)",
+            url,
+            resp.status()
+        ));
+    }
     let mut bytes = Vec::new();
     resp.into_reader()
         .take(limit as u64 + 1)
@@ -634,6 +648,8 @@ fn fetch_url_with_limit(url: &str, limit: usize, label: &str) -> Result<Vec<u8>,
 /// Default cap on registry-index JSON payload size (10 MB). Bounds memory
 /// consumption when fetching from untrusted/networked registries.
 pub const MAX_REGISTRY_INDEX_BYTES: usize = 10 * 1024 * 1024;
+/// Detached publisher signature sidecars are small, bounded metadata.
+pub const MAX_REGISTRY_SIGNATURE_BYTES: usize = 16 * 1024;
 /// Maximum accepted compressed registry package size (64 MiB).
 pub const MAX_REGISTRY_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum total regular-file content extracted from one package (256 MiB).
@@ -642,6 +658,217 @@ pub const MAX_REGISTRY_UNPACKED_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_REGISTRY_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum number of archive entries, including directories.
 pub const MAX_REGISTRY_ENTRIES: usize = 4096;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RegistryIndexSignature {
+    pub schema: String,
+    pub publisher: String,
+    pub key_id: String,
+    pub algorithm: String,
+    pub index_sha256: String,
+    pub signature: String,
+}
+
+fn trusted_registry_keys_from_bytes(
+    bytes: &[u8],
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    if bytes.len() > MAX_REGISTRY_SIGNATURE_BYTES {
+        return Err("registry trust store exceeds 16 KiB cap".to_string());
+    }
+    let keys: std::collections::BTreeMap<String, String> =
+        serde_json::from_slice(bytes).map_err(|e| format!("registry trust store JSON: {e}"))?;
+    if keys.is_empty() {
+        return Err("registry trust store contains no publisher keys".to_string());
+    }
+    Ok(keys)
+}
+
+/// Verify a detached Ed25519 registry-index signature against an operator-owned
+/// publisher trust store. The signature is over the exact index bytes, so even
+/// whitespace changes require a new publisher signature.
+pub fn verify_registry_index_signature(
+    index_bytes: &[u8],
+    signature_bytes: &[u8],
+    trust_store_bytes: &[u8],
+) -> Result<String, String> {
+    if signature_bytes.len() > MAX_REGISTRY_SIGNATURE_BYTES {
+        return Err("registry signature sidecar exceeds 16 KiB cap".to_string());
+    }
+    let sidecar: RegistryIndexSignature = serde_json::from_slice(signature_bytes)
+        .map_err(|e| format!("registry signature JSON: {e}"))?;
+    if sidecar.schema != "pblang-registry-signature-v1" || sidecar.algorithm != "ed25519" {
+        return Err("registry signature uses an unsupported schema or algorithm".to_string());
+    }
+    if sidecar.publisher.is_empty() || sidecar.publisher.len() > 128 {
+        return Err("registry signature has an invalid publisher identity".to_string());
+    }
+    let actual_index_sha = hex::encode(Sha256::digest(index_bytes));
+    if !sidecar.index_sha256.eq_ignore_ascii_case(&actual_index_sha) {
+        return Err("registry signature does not match the fetched index digest".to_string());
+    }
+    let trusted = trusted_registry_keys_from_bytes(trust_store_bytes)?;
+    let public_key_hex = trusted
+        .get(&sidecar.publisher)
+        .ok_or_else(|| format!("registry publisher '{}' is not trusted", sidecar.publisher))?;
+    let public_key = hex::decode(public_key_hex)
+        .map_err(|_| "registry trust store contains malformed public key hex".to_string())?;
+    if public_key.len() != 32 {
+        return Err("registry Ed25519 public key must be exactly 32 bytes".to_string());
+    }
+    let actual_key_id = hex::encode(Sha256::digest(&public_key));
+    if !sidecar.key_id.eq_ignore_ascii_case(&actual_key_id) {
+        return Err(
+            "registry signature key id does not match the trusted publisher key".to_string(),
+        );
+    }
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(sidecar.signature.as_bytes())
+        .map_err(|_| "registry signature is not valid base64".to_string())?;
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &public_key)
+        .verify(index_bytes, &signature)
+        .map_err(|_| "registry publisher signature verification failed".to_string())?;
+    Ok(sidecar.publisher)
+}
+
+fn registry_trust_store_bytes() -> Result<Vec<u8>, String> {
+    let path = std::env::var("PBLANG_REGISTRY_TRUSTED_KEYS_FILE").map_err(|_| {
+        "signed registry required: set PBLANG_REGISTRY_TRUSTED_KEYS_FILE to an operator-owned publisher trust store (or explicitly opt into development-only unsigned mode)".to_string()
+    })?;
+    let path = PathBuf::from(path);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|e| {
+        format!(
+            "cannot inspect registry trust store {}: {e}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("registry trust store must be a regular non-symlink file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner = metadata.uid();
+        let current = unsafe { libc::geteuid() };
+        if (owner != current && owner != 0) || metadata.permissions().mode() & 0o022 != 0 {
+            return Err("registry trust store must be owned by the current user or root and not group/world writable".to_string());
+        }
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|e| format!("cannot read registry trust store {}: {e}", path.display()))?;
+    if bytes.len() > MAX_REGISTRY_SIGNATURE_BYTES {
+        return Err("registry trust store exceeds 16 KiB cap".to_string());
+    }
+    Ok(bytes)
+}
+
+fn fetch_authenticated_registry_index(
+    index_url: &str,
+    allow_unsigned_registry_dev: bool,
+) -> Result<Vec<u8>, String> {
+    let unsigned_local_fixture =
+        unsigned_registry_dev_allowed(index_url, allow_unsigned_registry_dev)?;
+    let index_bytes = fetch_url_with_limit(index_url, MAX_REGISTRY_INDEX_BYTES, "registry index")?;
+    if unsigned_local_fixture {
+        return Ok(index_bytes);
+    }
+    let signature_url = format!("{index_url}.sig.json");
+    let signature_bytes = fetch_url_with_limit(
+        &signature_url,
+        MAX_REGISTRY_SIGNATURE_BYTES,
+        "registry signature",
+    )
+    .map_err(|e| format!("signed registry required; cannot fetch {signature_url}: {e}"))?;
+    let trust_store = registry_trust_store_bytes()?;
+    verify_registry_index_signature(&index_bytes, &signature_bytes, &trust_store)?;
+    Ok(index_bytes)
+}
+
+fn loopback_registry_url(raw: &str) -> bool {
+    // Backslashes have parser-dependent authority semantics. Reject them
+    // before using the same standards-compliant parser for policy decisions.
+    if raw.contains('\\') {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(host)) => host.is_loopback(),
+        Some(url::Host::Ipv6(host)) => host.is_loopback(),
+        None => false,
+    }
+}
+
+fn local_file_registry_path(raw: &str) -> Option<PathBuf> {
+    if raw.contains('\\') {
+        return None;
+    }
+    #[cfg(windows)]
+    if raw.to_ascii_lowercase().starts_with("file:////") {
+        return None;
+    }
+    let parsed = url::Url::parse(raw).ok()?;
+    if parsed.scheme() != "file"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.host().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path().starts_with("//")
+    {
+        return None;
+    }
+    let path = parsed.to_file_path().ok()?;
+    if !path.is_absolute() {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let allowed_local_disk = path.components().next().is_some_and(|component| {
+            matches!(
+                component,
+                Component::Prefix(prefix)
+                    if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+            )
+        });
+        if !allowed_local_disk {
+            return None;
+        }
+    }
+    Some(path)
+}
+
+fn unsigned_registry_dev_allowed(index_url: &str, requested: bool) -> Result<bool, String> {
+    if !requested {
+        return Ok(false);
+    }
+    if !cfg!(debug_assertions) {
+        return Err("unsigned registry development mode is disabled in release builds".to_string());
+    }
+    if local_file_registry_path(index_url).is_some() || loopback_registry_url(index_url) {
+        return Ok(true);
+    }
+    Err(
+        "unsigned registry development mode is restricted to file:// and loopback fixtures"
+            .to_string(),
+    )
+}
+
+fn unsigned_registry_dev_enabled() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("PBLANG_ALLOW_UNSIGNED_REGISTRY_DEV")
+            .ok()
+            .as_deref()
+            == Some("1")
+}
 
 /// Parse registry index JSON. Bytes longer than `MAX_REGISTRY_INDEX_BYTES`
 /// are rejected before the parse to bound memory consumption.
@@ -760,7 +987,10 @@ pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
                     entry_path.display()
                 ));
             }
-            if !matches!(entry_type, tar::EntryType::Regular | tar::EntryType::Directory) {
+            if !matches!(
+                entry_type,
+                tar::EntryType::Regular | tar::EntryType::Directory
+            ) {
                 return Err(format!(
                     "SECURITY: tarball entry type is not allowed: {}",
                     entry_path.display()
@@ -787,7 +1017,10 @@ pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
             }
 
             let entry_bytes = if entry_type == tar::EntryType::Regular {
-                entry.header().size().map_err(|e| format!("tar size: {e}"))?
+                entry
+                    .header()
+                    .size()
+                    .map_err(|e| format!("tar size: {e}"))?
             } else {
                 0
             };
@@ -820,6 +1053,182 @@ pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
         let _ = std::fs::remove_dir_all(&dest_dir);
     }
     extraction
+}
+
+struct RegistryCacheInstallLock {
+    file: std::fs::File,
+}
+
+impl Drop for RegistryCacheInstallLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+fn private_registry_cache_root(cache_root: &Path) -> Result<(), String> {
+    if cache_root.as_os_str().is_empty() {
+        return Err("registry cache root is empty".to_string());
+    }
+    let existed = cache_root.exists();
+    if !existed {
+        std::fs::create_dir_all(cache_root)
+            .map_err(|e| format!("create private registry cache root: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(cache_root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("protect registry cache root: {e}"))?;
+        }
+    }
+    let mut metadata = std::fs::symlink_metadata(cache_root)
+        .map_err(|e| format!("inspect registry cache root: {e}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("registry cache root must be a regular directory, not a symlink".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let current = unsafe { libc::geteuid() };
+        if metadata.uid() != current {
+            return Err("registry cache root must be owned by the current user".to_string());
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(cache_root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("tighten registry cache root permissions: {e}"))?;
+            metadata = std::fs::symlink_metadata(cache_root)
+                .map_err(|e| format!("reinspect registry cache root: {e}"))?;
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err("registry cache root permissions could not be tightened".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn lock_registry_cache(cache_root: &Path) -> Result<RegistryCacheInstallLock, String> {
+    use std::fs::OpenOptions;
+    let path = cache_root.join(".registry-install.lock");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|e| format!("cannot open registry cache install lock safely: {e}"))?;
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|e| format!("cannot inspect registry cache install lock: {e}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("registry cache install lock must be a regular non-symlink file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(
+                "registry cache install lock must be current-user-owned and mode 0600".to_string(),
+            );
+        }
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(RegistryCacheInstallLock { file }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(
+                        "registry cache remained busy beyond the 10 second lock deadline"
+                            .to_string(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("lock registry cache install state: {error}")),
+        }
+    }
+}
+
+fn registry_cache_staging(cache_root: &Path, archive_sha256: &str) -> Result<PathBuf, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_string())?
+        .as_nanos();
+    for attempt in 0..16u32 {
+        let path = cache_root.join(format!(
+            ".{archive_sha256}.staging-{}-{epoch}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .map_err(|e| format!("protect registry cache staging: {e}"))?;
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create registry cache staging: {error}")),
+        }
+    }
+    Err("cannot allocate unique registry cache staging directory".to_string())
+}
+
+fn install_verified_registry_archive(
+    cache_root: &Path,
+    archive_sha256: &str,
+    tarball_bytes: &[u8],
+) -> Result<(PathBuf, String), String> {
+    if archive_sha256.len() != 64 || !archive_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("registry archive cache identity is malformed".to_string());
+    }
+    private_registry_cache_root(cache_root)?;
+    let _lock = lock_registry_cache(cache_root)?;
+    let staging = registry_cache_staging(cache_root, archive_sha256)?;
+    let staged_result = (|| {
+        unpack_tarball_gz(tarball_bytes, &staging)?;
+        validate_package_tree(&staging)?;
+        hash_dir(&staging)
+    })();
+    let staged_hash = match staged_result {
+        Ok(hash) => hash,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
+    let cache_entry = cache_root.join(archive_sha256.to_ascii_lowercase());
+    if cache_entry.exists() {
+        let existing = validate_package_tree(&cache_entry).and_then(|_| hash_dir(&cache_entry));
+        let _ = std::fs::remove_dir_all(&staging);
+        let existing_hash = existing?;
+        if existing_hash != staged_hash {
+            return Err(
+                "registry cache collision: existing content does not match verified archive"
+                    .to_string(),
+            );
+        }
+        return Ok((cache_entry, existing_hash));
+    }
+    if let Err(error) = std::fs::rename(&staging, &cache_entry) {
+        let existing = validate_package_tree(&cache_entry).and_then(|_| hash_dir(&cache_entry));
+        let _ = std::fs::remove_dir_all(&staging);
+        let existing_hash = existing
+            .map_err(|_| format!("atomically publish verified registry cache entry: {error}"))?;
+        if existing_hash != staged_hash {
+            return Err(
+                "registry cache collision during publication: content mismatch".to_string(),
+            );
+        }
+    }
+    Ok((cache_entry, staged_hash))
 }
 
 /// Default cache root.
@@ -903,27 +1312,52 @@ fn verify_tarball_hmac_sidecar(tarball_url: &str, tarball_bytes: &[u8]) -> Resul
 pub fn package_has_module_files(package_dir: &Path) -> bool {
     let mut entries = vec![];
     let _ = collect_files(package_dir, package_dir, &mut entries);
-    entries.iter().any(|(rel, _)| has_module_extension(rel))
+    entries
+        .iter()
+        .any(|entry| entry.kind == b'f' && has_module_extension(&entry.relative_path))
 }
 
 /// Validate a package directory before publish/install (modules + optional entry).
 pub fn validate_package_tree(package_dir: &Path) -> Result<(), String> {
+    // Validate the complete tree before trusting manifest paths or scanning for
+    // modules. This rejects symlinks and special files anywhere in the package,
+    // including hidden and generated-looking directories.
+    let _ = hash_dir(package_dir)?;
     let man_path = package_dir.join("pblang.toml");
     if man_path.is_file() {
-        let man_bytes = std::fs::read(&man_path)
+        let man_bytes = read_regular_file_nofollow(&man_path)
             .map_err(|e| format!("read manifest {}: {e}", man_path.display()))?;
         let man =
             parse_manifest(std::str::from_utf8(&man_bytes).map_err(|_| "manifest not utf8")?)?;
         if let Some(entry) = man.package.as_ref().and_then(|p| p.entry.as_deref()) {
+            let entry_rel = Path::new(entry);
+            if entry_rel.as_os_str().is_empty()
+                || entry_rel.components().any(|component| {
+                    !matches!(
+                        component,
+                        std::path::Component::Normal(_) | std::path::Component::CurDir
+                    )
+                })
+            {
+                return Err(format!(
+                    "package entry must stay within the package: {entry}"
+                ));
+            }
             let entry_path = package_dir.join(entry);
-            if !entry_path.is_file() {
-                if entry_path.is_dir() {
-                    return Err(format!(
-                        "package entry is not a file: {}",
-                        entry_path.display()
-                    ));
-                }
-                return Err(format!("package entry not found: {}", entry_path.display()));
+            let entry_meta = std::fs::symlink_metadata(&entry_path)
+                .map_err(|_| format!("package entry not found: {}", entry_path.display()))?;
+            if entry_meta.file_type().is_symlink() || !entry_meta.is_file() {
+                return Err(format!(
+                    "package entry is not a file (regular non-symlink required): {}",
+                    entry_path.display()
+                ));
+            }
+            let root = std::fs::canonicalize(package_dir)
+                .map_err(|e| format!("canonicalize package root: {e}"))?;
+            let canonical_entry = std::fs::canonicalize(&entry_path)
+                .map_err(|e| format!("canonicalize package entry: {e}"))?;
+            if !canonical_entry.starts_with(&root) {
+                return Err(format!("package entry escapes package root: {entry}"));
             }
         }
     }
@@ -957,42 +1391,106 @@ pub fn resolve_git_dep(
     rev: &str,
     cache_root: &Path,
 ) -> Result<(PathBuf, String, String), String> {
-    if rev.is_empty() {
-        return Err("git dependency requires a pinned rev".to_string());
+    if !matches!(rev.len(), 40 | 64) || !rev.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("git dependency requires a full 40- or 64-hex commit id".to_string());
     }
+    private_registry_cache_root(cache_root)?;
     let cache_key = hex::encode(Sha256::digest(format!("{git_url}#{rev}").as_bytes()));
-    let checkout = cache_root.join("git").join(&cache_key);
-    if !checkout.is_dir() {
-        if let Some(parent) = checkout.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("create git cache dir: {e}"))?;
+    let git_cache = cache_root.join("git");
+    if !git_cache.exists() {
+        std::fs::create_dir(&git_cache).map_err(|e| format!("create git cache dir: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&git_cache, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("protect git cache dir: {e}"))?;
         }
-        if checkout.exists() {
-            std::fs::remove_dir_all(&checkout).map_err(|e| format!("reset git cache dir: {e}"))?;
-        }
+    }
+    let git_cache_meta =
+        std::fs::symlink_metadata(&git_cache).map_err(|e| format!("inspect git cache dir: {e}"))?;
+    if git_cache_meta.file_type().is_symlink() || !git_cache_meta.is_dir() {
+        return Err("git cache path must be a regular non-symlink directory".to_string());
+    }
+
+    let checkout = git_cache.join(&cache_key);
+    let staging = registry_cache_staging(cache_root, &format!("git-{cache_key}"))?;
+    let prepared = (|| {
         let status = Command::new("git")
-            .args([
-                "clone",
-                git_url,
-                checkout.to_str().ok_or("invalid checkout path")?,
-            ])
+            .args(["clone", "--no-checkout", git_url])
+            .arg(&staging)
             .status()
             .map_err(|e| format!("git clone failed to start: {e}"))?;
         if !status.success() {
             return Err(format!("git clone failed for {git_url}"));
         }
         let status = Command::new("git")
-            .args(["checkout", rev])
-            .current_dir(&checkout)
+            .args(["checkout", "--detach", rev])
+            .current_dir(&staging)
             .status()
             .map_err(|e| format!("git checkout failed to start: {e}"))?;
         if !status.success() {
             return Err(format!("git checkout {rev} failed for {git_url}"));
         }
+        let resolved = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&staging)
+            .output()
+            .map_err(|e| format!("git rev-parse failed to start: {e}"))?;
+        if !resolved.status.success() {
+            return Err("git could not resolve the checked-out commit".to_string());
+        }
+        let resolved = std::str::from_utf8(&resolved.stdout)
+            .map_err(|_| "git resolved commit is not UTF-8")?
+            .trim();
+        if !resolved.eq_ignore_ascii_case(rev) {
+            return Err(format!(
+                "git resolved commit mismatch: requested {rev}, resolved {resolved}"
+            ));
+        }
+        let git_metadata = staging.join(".git");
+        let metadata = std::fs::symlink_metadata(&git_metadata)
+            .map_err(|e| format!("inspect cloned git metadata: {e}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("cloned git metadata is not a regular directory".to_string());
+        }
+        std::fs::remove_dir_all(&git_metadata)
+            .map_err(|e| format!("freeze git dependency source snapshot: {e}"))?;
+        validate_package_tree(&staging)?;
+        hash_dir(&staging)
+    })();
+    let staged_hash = match prepared {
+        Ok(hash) => hash,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
+
+    let _lock = lock_registry_cache(cache_root)?;
+    if checkout.exists() {
+        let existing_hash = validate_package_tree(&checkout).and_then(|_| hash_dir(&checkout));
+        let _ = std::fs::remove_dir_all(&staging);
+        let existing_hash = existing_hash?;
+        if existing_hash != staged_hash {
+            return Err(
+                "git cache collision: existing content does not match the pinned commit"
+                    .to_string(),
+            );
+        }
+    } else if let Err(error) = std::fs::rename(&staging, &checkout) {
+        let existing_hash = validate_package_tree(&checkout).and_then(|_| hash_dir(&checkout));
+        let _ = std::fs::remove_dir_all(&staging);
+        let existing_hash = existing_hash
+            .map_err(|_| format!("atomically publish verified git cache entry: {error}"))?;
+        if existing_hash != staged_hash {
+            return Err(
+                "git cache collision: concurrently published content does not match the pinned commit"
+                    .to_string(),
+            );
+        }
     }
-    validate_package_tree(&checkout)?;
-    let content_sha256 = hash_dir(&checkout)?;
     let resolved = format!("{git_url}#{rev}");
-    Ok((checkout, content_sha256, resolved))
+    Ok((checkout, staged_hash, resolved))
 }
 
 /// Rehydrate or verify a locked dependency root (registry, git, or path).
@@ -1019,7 +1517,13 @@ pub fn resolve_dependency_root(
                         "registry archive",
                     )?;
                     verify_tarball_hmac_sidecar(tarball_url, &tarball_bytes)?;
-                    unpack_tarball_gz(&tarball_bytes, &cache_entry)?;
+                    let (installed, _) =
+                        install_verified_registry_archive(&cache, archive_sha256, &tarball_bytes)?;
+                    if installed != cache_entry {
+                        return Err(
+                            "registry cache identity mismatch after rehydration".to_string()
+                        );
+                    }
                 }
                 cache_entry
             } else {
@@ -1146,10 +1650,29 @@ pub fn resolve_registry_dep(
     cache_root: &Path,
     name: &str,
     version: &str,
-    _require_registry_sha256: bool,
+    require_registry_sha256: bool,
 ) -> Result<(PathBuf, String, String, String), String> {
-    let index_bytes =
-        fetch_url_with_limit(index_url, MAX_REGISTRY_INDEX_BYTES, "registry index")?;
+    resolve_registry_dep_with_policy(
+        index_url,
+        cache_root,
+        name,
+        version,
+        require_registry_sha256,
+        unsigned_registry_dev_enabled(),
+    )
+}
+
+/// Development-compatible resolver. `allow_unsigned_registry_dev` must only be
+/// set by an explicit operator choice for local fixtures or migration work.
+pub fn resolve_registry_dep_with_policy(
+    index_url: &str,
+    cache_root: &Path,
+    name: &str,
+    version: &str,
+    _require_registry_sha256: bool,
+    allow_unsigned_registry_dev: bool,
+) -> Result<(PathBuf, String, String, String), String> {
+    let index_bytes = fetch_authenticated_registry_index(index_url, allow_unsigned_registry_dev)?;
     let index = parse_registry_index(&index_bytes)?;
     let releases = index
         .get(name)
@@ -1179,12 +1702,8 @@ pub fn resolve_registry_dep(
             ));
         }
     }
-    let cache_entry = cache_root.join(&archive_sha256);
-    if !cache_entry.is_dir() {
-        unpack_tarball_gz(&tarball_bytes, &cache_entry)?;
-    }
-    validate_package_tree(&cache_entry)?;
-    let content_sha256 = hash_dir(&cache_entry)?;
+    let (cache_entry, content_sha256) =
+        install_verified_registry_archive(cache_root, &archive_sha256, &tarball_bytes)?;
     Ok((
         cache_entry,
         content_sha256,
@@ -1216,7 +1735,19 @@ pub fn parse_manifest(toml_str: &str) -> Result<Manifest, String> {
 }
 
 pub fn parse_lockfile(toml_str: &str) -> Result<Lockfile, String> {
-    toml::from_str::<Lockfile>(toml_str).map_err(|e| format!("lockfile parse error: {e}"))
+    let lock =
+        toml::from_str::<Lockfile>(toml_str).map_err(|e| format!("lockfile parse error: {e}"))?;
+    if lock.content_hash_algorithm != LOCKFILE_CONTENT_HASH_ALGORITHM {
+        let found = if lock.content_hash_algorithm.is_empty() {
+            "missing/legacy"
+        } else {
+            lock.content_hash_algorithm.as_str()
+        };
+        return Err(format!(
+            "lockfile content hash algorithm is {found}; expected {LOCKFILE_CONTENT_HASH_ALGORITHM}. Review dependency provenance and run `pblang install` to refresh it"
+        ));
+    }
+    Ok(lock)
 }
 
 pub fn write_lockfile(lock: &Lockfile) -> Result<String, String> {
@@ -1409,6 +1940,22 @@ pub fn generate_lockfile_with_registry(
     registry_index_url: Option<&str>,
     require_registry_sha256: bool,
 ) -> Result<Lockfile, String> {
+    generate_lockfile_with_registry_policy(
+        manifest_dir,
+        registry_index_url,
+        require_registry_sha256,
+        unsigned_registry_dev_enabled(),
+    )
+}
+
+/// Generate a lockfile with an explicit development-only unsigned-registry
+/// compatibility choice. Release callers must use `generate_lockfile_with_registry`.
+pub fn generate_lockfile_with_registry_policy(
+    manifest_dir: &Path,
+    registry_index_url: Option<&str>,
+    require_registry_sha256: bool,
+    allow_unsigned_registry_dev: bool,
+) -> Result<Lockfile, String> {
     let man_path = manifest_dir.join("pblang.toml");
     let man_bytes = std::fs::read(&man_path)
         .map_err(|e| format!("failed to read manifest '{}': {e}", man_path.display()))?;
@@ -1452,13 +1999,15 @@ pub fn generate_lockfile_with_registry(
                         name
                     )
                 })?;
-                let (dep_root, content_hash, archive_hash, fetch_url) = resolve_registry_dep(
-                    index_url,
-                    &cache_root_path,
-                    name,
-                    version,
-                    require_registry_sha256,
-                )?;
+                let (dep_root, content_hash, archive_hash, fetch_url) =
+                    resolve_registry_dep_with_policy(
+                        index_url,
+                        &cache_root_path,
+                        name,
+                        version,
+                        require_registry_sha256,
+                        allow_unsigned_registry_dev,
+                    )?;
                 deps.insert(
                     name.clone(),
                     LockedDep {
@@ -1508,48 +2057,114 @@ pub fn generate_lockfile_with_registry(
 
     Ok(Lockfile {
         manifest_sha256: man_sha,
+        content_hash_algorithm: LOCKFILE_CONTENT_HASH_ALGORITHM.to_string(),
         dependencies: deps,
     })
 }
 
+struct PackageTreeEntry {
+    relative_path: String,
+    kind: u8,
+    content: Vec<u8>,
+}
+
 fn hash_dir(root: &Path) -> Result<String, String> {
+    let root_meta = std::fs::symlink_metadata(root)
+        .map_err(|e| format!("metadata '{}': {e}", root.display()))?;
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return Err(format!(
+            "package root is not a regular non-symlink directory: {}",
+            root.display()
+        ));
+    }
     let mut entries = vec![];
     collect_files(root, root, &mut entries)?;
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
     let mut h = Sha256::new();
-    for (rel, bytes) in entries {
-        h.update(rel.as_bytes());
-        h.update([0u8]);
-        h.update(&bytes);
-        h.update([0u8]);
+    h.update(b"pblang-package-tree-v2\0");
+    for entry in entries {
+        let path = entry.relative_path.as_bytes();
+        h.update([entry.kind]);
+        h.update((path.len() as u64).to_be_bytes());
+        h.update(path);
+        h.update((entry.content.len() as u64).to_be_bytes());
+        h.update(&entry.content);
     }
     Ok(hex::encode(h.finalize()))
 }
 
-fn collect_files(root: &Path, cur: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<(), String> {
+fn read_regular_file_nofollow(path: &Path) -> Result<Vec<u8>, String> {
+    let link_meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("metadata '{}': {e}", path.display()))?;
+    if link_meta.file_type().is_symlink() || !link_meta.is_file() {
+        return Err(format!(
+            "package path is not a regular non-symlink file: {}",
+            path.display()
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| format!("open '{}': {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("metadata '{}': {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "package path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| format!("read '{}': {e}", path.display()))?;
+    Ok(bytes)
+}
+
+fn collect_files(root: &Path, cur: &Path, out: &mut Vec<PackageTreeEntry>) -> Result<(), String> {
     let rd = std::fs::read_dir(cur).map_err(|e| format!("read_dir '{}': {e}", cur.display()))?;
     for ent in rd {
         let ent = ent.map_err(|e| format!("read_dir entry: {e}"))?;
         let p = ent.path();
-        let name = ent.file_name();
-        let name = name.to_string_lossy();
-        if name == "target" || name.starts_with('.') {
-            continue;
-        }
-        let meta = ent
-            .metadata()
+        let meta = std::fs::symlink_metadata(&p)
             .map_err(|e| format!("metadata '{}': {e}", p.display()))?;
-        if meta.is_dir() {
+        let rel = p
+            .strip_prefix(root)
+            .unwrap_or(&p)
+            .to_str()
+            .ok_or_else(|| format!("package path is not valid UTF-8: {}", p.display()))?
+            .replace('\\', "/");
+        if meta.file_type().is_symlink() {
+            return Err(format!("package tree contains symlink: {}", p.display()));
+        } else if meta.is_dir() {
+            // Include directory identities so empty directories and file/dir
+            // type changes are part of the deterministic content digest.
+            out.push(PackageTreeEntry {
+                relative_path: rel,
+                kind: b'd',
+                content: Vec::new(),
+            });
             collect_files(root, &p, out)?;
         } else if meta.is_file() {
-            let rel = p
-                .strip_prefix(root)
-                .unwrap_or(&p)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let bytes = std::fs::read(&p).map_err(|e| format!("read '{}': {e}", p.display()))?;
-            out.push((rel, bytes));
+            let bytes = read_regular_file_nofollow(&p)?;
+            out.push(PackageTreeEntry {
+                relative_path: rel,
+                kind: b'f',
+                content: bytes,
+            });
+        } else {
+            return Err(format!(
+                "package tree contains unsupported special file: {}",
+                p.display()
+            ));
         }
     }
     Ok(())
@@ -1749,11 +2364,19 @@ fn build_tarball_bytes(mut entries: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, S
     Ok(out)
 }
 
-/// Build .tar.gz bytes of a package directory (excludes target/ and dotfiles).
+fn package_tree_tar_entries(entries: Vec<PackageTreeEntry>) -> Vec<(String, Vec<u8>)> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.kind == b'f')
+        .map(|entry| (entry.relative_path, entry.content))
+        .collect()
+}
+
+/// Build .tar.gz bytes of the complete regular-file package tree.
 pub fn create_package_tarball(package_dir: &Path) -> Result<Vec<u8>, String> {
     let mut entries = vec![];
     collect_files(package_dir, package_dir, &mut entries)?;
-    build_tarball_bytes(entries)
+    build_tarball_bytes(package_tree_tar_entries(entries))
 }
 
 /// Like [`create_package_tarball`], but embeds the pblang runtime at `bin/pblang` (or `bin/pblang.exe`).
@@ -1771,8 +2394,9 @@ pub fn create_package_tarball_with_runtime(
     };
     let bytes = std::fs::read(runtime_exe)
         .map_err(|e| format!("read runtime executable '{}': {e}", runtime_exe.display()))?;
-    entries.push((rel, bytes));
-    build_tarball_bytes(entries)
+    let mut tar_entries = package_tree_tar_entries(entries);
+    tar_entries.push((rel, bytes));
+    build_tarball_bytes(tar_entries)
 }
 
 fn validate_publish_package(package_dir: &Path) -> Result<(), String> {
@@ -2127,7 +2751,10 @@ pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
         }
         let path = entry.path().map_err(|e| format!("entry path: {e}"))?;
         let entry_type = entry.header().entry_type();
-        if !matches!(entry_type, tar::EntryType::Regular | tar::EntryType::Directory) {
+        if !matches!(
+            entry_type,
+            tar::EntryType::Regular | tar::EntryType::Directory
+        ) {
             return Err(format!(
                 "tarball entry type is not allowed: {}",
                 path.display()
@@ -2354,8 +2981,9 @@ version = "0.1.0"
 "#;
         std::fs::write(project_dir.join("pblang.toml"), manifest).unwrap();
 
-        let lock = generate_lockfile_with_registry(&project_dir, Some(&index_url), false)
-            .expect("generate");
+        let lock =
+            generate_lockfile_with_registry_policy(&project_dir, Some(&index_url), false, true)
+                .expect("generate");
         let dep = lock.dependencies.get("@pblang/test").expect("dep");
         assert_eq!(dep.source.as_deref(), Some("registry"));
         assert_eq!(dep.version.as_deref(), Some("1.0.0"));
@@ -2421,7 +3049,14 @@ version = "0.1.0"
         let index_abs = canonicalize_existing(&index_path).unwrap_or(index_path.clone());
         let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
         let cache = temp.join("cache");
-        let r = resolve_registry_dep(&index_url, &cache, "@pblang/pkg", "1.0.0", false);
+        let r = resolve_registry_dep_with_policy(
+            &index_url,
+            &cache,
+            "@pblang/pkg",
+            "1.0.0",
+            false,
+            true,
+        );
         assert!(r.is_err(), "expected checksum mismatch error");
         let err = r.unwrap_err();
         assert!(
@@ -2449,11 +3084,78 @@ version = "0.1.0"
         let index_abs = canonicalize_existing(&index_path).unwrap_or(index_path.clone());
         let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
         let cache = temp.join("cache");
-        let r = resolve_registry_dep(&index_url, &cache, "@pblang/ok", "1.0.0", false);
+        let r = resolve_registry_dep_with_policy(
+            &index_url,
+            &cache,
+            "@pblang/ok",
+            "1.0.0",
+            false,
+            true,
+        );
         let (path, _content_sha, archive_sha, _url) =
             r.expect("resolve should succeed with correct sha256");
         assert_eq!(archive_sha, sha256);
         assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn registry_cache_rejects_preseeded_mismatched_content() {
+        let temp = std::env::temp_dir().join(format!(
+            "pblang_registry_preseed_rejected_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let (_tarball_path, tarball_url, sha256) = make_tarball_and_sha256(&temp);
+        let index = serde_json::json!({
+            "packages": {
+                "@pblang/preseed": {
+                    "1.0.0": { "url": tarball_url, "sha256": sha256 }
+                }
+            }
+        });
+        let index_path = temp.join("index.json");
+        std::fs::write(&index_path, index.to_string()).unwrap();
+        let index_url = format!("file://{}", index_path.to_string_lossy());
+        let cache = temp.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let seeded = cache.join(&sha256);
+        std::fs::create_dir(&seeded).unwrap();
+        std::fs::write(
+            seeded.join("lib.sapp"),
+            "print \"preseeded attacker content\";",
+        )
+        .unwrap();
+        std::fs::write(
+            seeded.join("pblang.toml"),
+            "[package]\nname=\"preseed\"\nversion=\"1.0.0\"\n",
+        )
+        .unwrap();
+
+        let error = resolve_registry_dep_with_policy(
+            &index_url,
+            &cache,
+            "@pblang/preseed",
+            "1.0.0",
+            false,
+            true,
+        )
+        .expect_err("mismatched pre-seeded content must fail closed");
+        assert!(
+            error.contains("cache collision"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(seeded.join("lib.sapp")).unwrap(),
+            "print \"preseeded attacker content\";",
+            "failed install must not overwrite the existing cache entry"
+        );
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -2474,7 +3176,14 @@ version = "0.1.0"
         let index_abs = canonicalize_existing(&index_path).unwrap_or(index_path.clone());
         let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
         let cache = temp.join("cache");
-        let r = resolve_registry_dep(&index_url, &cache, "@pblang/nosha", "1.0.0", false);
+        let r = resolve_registry_dep_with_policy(
+            &index_url,
+            &cache,
+            "@pblang/nosha",
+            "1.0.0",
+            false,
+            true,
+        );
         assert!(r.is_err(), "expected sha256 required error");
         let err = r.unwrap_err();
         assert!(
@@ -2499,11 +3208,246 @@ version = "0.1.0"
     }
 
     #[test]
-    fn registry_unpack_entry_cap_is_transactional() {
-        let mut encoder = flate2::write::GzEncoder::new(
-            Vec::new(),
-            flate2::Compression::fast(),
+    fn registry_index_requires_publisher_signature_by_default() {
+        let temp = std::env::temp_dir().join(format!(
+            "pblang_registry_unsigned_rejected_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let index_path = temp.join("index.json");
+        std::fs::write(&index_path, br#"{"packages":{}}"#).unwrap();
+        let index_url = format!("file://{}", index_path.to_string_lossy());
+        let err = fetch_authenticated_registry_index(&index_url, false)
+            .expect_err("unsigned registry must fail closed");
+        assert!(
+            err.contains("signed registry required"),
+            "unexpected error: {err}"
         );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn unsigned_registry_development_mode_rejects_remote_urls_before_fetch() {
+        for url in [
+            "https://example.invalid/index.json",
+            "http://localhost.example.invalid/index.json",
+            "https://127.0.0.1.example.invalid/index.json",
+            "http://evil.example\\@localhost/index.json",
+            "http://user@localhost/index.json",
+            "http://user:password@127.0.0.1/index.json",
+        ] {
+            let err = fetch_authenticated_registry_index(url, true)
+                .expect_err("remote unsigned registry must fail before network access");
+            assert!(
+                err.contains("restricted to file:// and loopback"),
+                "{url}: {err}"
+            );
+        }
+        assert!(unsigned_registry_dev_allowed("file:///tmp/index.json", true).unwrap());
+        assert!(unsigned_registry_dev_allowed("http://127.0.0.1:8080/index.json", true).unwrap());
+        assert!(unsigned_registry_dev_allowed("https://[::1]/index.json", true).unwrap());
+        assert!(local_file_registry_path("file:///tmp/index.json").is_some());
+        for url in [
+            "file://server/share/index.json",
+            "file://\\\\server\\share\\index.json",
+            "file:///tmp/index.json?redirect=remote",
+        ] {
+            assert!(
+                local_file_registry_path(url).is_none(),
+                "remote or ambiguous file URL must fail: {url}"
+            );
+            assert!(
+                unsigned_registry_dev_allowed(url, true).is_err(),
+                "unsigned remote file URL must fail: {url}"
+            );
+        }
+        #[cfg(windows)]
+        {
+            let unc = "file:////server/share/index.json";
+            assert!(local_file_registry_path(unc).is_none());
+            assert!(unsigned_registry_dev_allowed(unc, true).is_err());
+        }
+    }
+
+    #[test]
+    fn registry_fetch_does_not_follow_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirect fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept redirect fixture");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: https://example.invalid/remote\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write redirect response");
+        });
+
+        std::env::set_var("PBLANG_ALLOW_INSECURE_HTTP", "1");
+        let result = fetch_url_with_limit(
+            &format!("http://{address}/index.json"),
+            MAX_REGISTRY_INDEX_BYTES,
+            "redirect fixture",
+        );
+        std::env::remove_var("PBLANG_ALLOW_INSECURE_HTTP");
+        server.join().expect("redirect fixture server");
+        let error = result.expect_err("registry redirects must fail closed");
+        assert!(error.contains("302"), "unexpected redirect error: {error}");
+    }
+
+    #[test]
+    fn package_digest_covers_hidden_and_target_paths() {
+        let temp = std::env::temp_dir().join(format!(
+            "pblang_package_complete_digest_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(temp.join("lib.sapp"), "export fn ok() { return true; }").unwrap();
+        let base = hash_dir(&temp).expect("base digest");
+
+        std::fs::write(
+            temp.join(".hidden.sapp"),
+            "export fn hidden() { return 1; }",
+        )
+        .unwrap();
+        let hidden = hash_dir(&temp).expect("hidden digest");
+        assert_ne!(base, hidden, "hidden package content must affect digest");
+
+        std::fs::create_dir_all(temp.join("target")).unwrap();
+        std::fs::write(
+            temp.join("target/payload.sapp"),
+            "export fn payload() { return 2; }",
+        )
+        .unwrap();
+        let target = hash_dir(&temp).expect("target digest");
+        assert_ne!(hidden, target, "target package content must affect digest");
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn package_digest_encoding_is_structurally_unambiguous() {
+        let base = std::env::temp_dir().join(format!(
+            "pblang_package_digest_domain_separation_{}",
+            std::process::id()
+        ));
+        let first = base.join("first");
+        let second = base.join("second");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        std::fs::write(
+            first.join("a.sapp"),
+            b"safe\0lib.sapp\0malicious".as_slice(),
+        )
+        .unwrap();
+        std::fs::write(second.join("a.sapp"), b"safe".as_slice()).unwrap();
+        std::fs::write(second.join("lib.sapp"), b"malicious".as_slice()).unwrap();
+
+        assert_ne!(
+            hash_dir(&first).expect("first digest"),
+            hash_dir(&second).expect("second digest"),
+            "distinct package structures must never share a serialized digest input"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn package_validation_rejects_entry_escape() {
+        let temp = std::env::temp_dir().join(format!(
+            "pblang_package_entry_escape_{}",
+            std::process::id()
+        ));
+        let outside = temp.with_extension("sapp");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(&outside, "export fn outside() { return 1; }").unwrap();
+        std::fs::write(temp.join("lib.sapp"), "export fn ok() { return true; }").unwrap();
+        std::fs::write(
+            temp.join("pblang.toml"),
+            "[package]\nname = \"escape\"\nversion = \"0.1.0\"\nentry = \"../outside.sapp\"\n",
+        )
+        .unwrap();
+        let error = validate_package_tree(&temp).expect_err("entry traversal must fail");
+        assert!(error.contains("stay within"), "unexpected error: {error}");
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_digest_and_entry_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = std::env::temp_dir().join(format!(
+            "pblang_package_symlink_rejected_{}",
+            std::process::id()
+        ));
+        let outside = temp.with_extension("outside.sapp");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(&outside, "export fn outside() { return 1; }").unwrap();
+        std::fs::write(
+            temp.join("pblang.toml"),
+            "[package]\nname = \"links\"\nversion = \"0.1.0\"\nentry = \"main.sapp\"\n",
+        )
+        .unwrap();
+        symlink(&outside, temp.join("main.sapp")).unwrap();
+
+        let digest_error = hash_dir(&temp).expect_err("symlink must not be hashed by target");
+        assert!(
+            digest_error.contains("symlink"),
+            "unexpected error: {digest_error}"
+        );
+        let validation_error =
+            validate_package_tree(&temp).expect_err("symlink manifest entry must fail");
+        assert!(
+            validation_error.contains("symlink"),
+            "unexpected error: {validation_error}"
+        );
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn registry_index_accepts_trusted_ed25519_publisher_and_rejects_tampering() {
+        use ring::signature::KeyPair as _;
+
+        let index = br#"{"packages":{"@pblang/signed":{"1.0.0":{"url":"signed.tar.gz","sha256":"0000000000000000000000000000000000000000000000000000000000000000"}}}}"#;
+        let seed = [7u8; 32];
+        let key_pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        let public_key = key_pair.public_key().as_ref();
+        let publisher = "pblang-test-publisher";
+        let sidecar = serde_json::to_vec(&RegistryIndexSignature {
+            schema: "pblang-registry-signature-v1".to_string(),
+            publisher: publisher.to_string(),
+            key_id: hex::encode(Sha256::digest(public_key)),
+            algorithm: "ed25519".to_string(),
+            index_sha256: hex::encode(Sha256::digest(index)),
+            signature: base64::engine::general_purpose::STANDARD
+                .encode(key_pair.sign(index).as_ref()),
+        })
+        .unwrap();
+        let trust = serde_json::to_vec(&serde_json::json!({
+            publisher: hex::encode(public_key)
+        }))
+        .unwrap();
+
+        let verified = verify_registry_index_signature(index, &sidecar, &trust).unwrap();
+        assert_eq!(verified, publisher);
+        let mut tampered = index.to_vec();
+        tampered.push(b' ');
+        let err = verify_registry_index_signature(&tampered, &sidecar, &trust)
+            .expect_err("tampered index must fail");
+        assert!(err.contains("digest"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn registry_unpack_entry_cap_is_transactional() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         {
             let mut builder = tar::Builder::new(&mut encoder);
             for index in 0..=MAX_REGISTRY_ENTRIES {
@@ -2525,7 +3469,10 @@ version = "0.1.0"
         let _ = std::fs::remove_dir_all(&dest);
 
         let err = unpack_tarball_gz(&archive, &dest).expect_err("entry cap must reject archive");
-        assert!(err.contains("entry count exceeds cap"), "unexpected error: {err}");
+        assert!(
+            err.contains("entry count exceeds cap"),
+            "unexpected error: {err}"
+        );
         assert!(
             !dest.exists(),
             "failed extraction must not leave a partial cache tree"
@@ -2595,6 +3542,19 @@ version = "0.1.0"
         let s2 = write_lockfile(&lock2).expect("write2");
         assert_eq!(s1, s2, "lockfile output should be deterministic");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn legacy_lockfile_hash_algorithm_requires_explicit_refresh() {
+        let legacy = r#"manifest_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[dependencies]
+"#;
+        let error = parse_lockfile(legacy).expect_err("legacy lock must not be silently rehashed");
+        assert!(
+            error.contains("missing/legacy") && error.contains("pblang install"),
+            "unexpected migration error: {error}"
+        );
     }
 
     #[test]

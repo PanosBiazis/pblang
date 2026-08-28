@@ -1148,7 +1148,7 @@ fn show_help() {
     println!("  pblang --annotate <file>   Compile file and print annotated bytecode (source line + instruction side-by-side)");
     println!("  pblang --symbols <file>    Print a simple symbol table for top-level functions and globals (name, arity, bytecode offset)");
     println!("  pblang lsp             Start LSP server on stdin/stdout (parse/typecheck diagnostics, hover, goto-def)");
-    println!("  pblang serve [--port N] [--cert <pem> --key <pem>]  Start local IDE backend server (default: 8090, plaintext). Pass --cert + --key to enable HTTPS via rustls.");
+    println!("  pblang serve [--port N] [--run-token-file <path>] [--cert <pem> --key <pem>]  Start local IDE backend; /run is disabled unless a protected token file is supplied.");
     println!();
 
     println!("Language quick tour (examples):");
@@ -3066,7 +3066,11 @@ fn legacy_dispatch(args: Vec<String>) {
                 format!("{base}.pbck")
             });
         let src = std::fs::read_to_string(&file_path).unwrap_or_else(|e| {
-            eprintln!("pblang emit-pbck: failed to read {}: {}", file_path.display(), e);
+            eprintln!(
+                "pblang emit-pbck: failed to read {}: {}",
+                file_path.display(),
+                e
+            );
             std::process::exit(1);
         });
         let src_for_parse = mask_for_parse_or_exit(&src, None);
@@ -3492,6 +3496,7 @@ fn legacy_dispatch(args: Vec<String>) {
         let mut port: u16 = 8090;
         let mut tls_cert: Option<std::path::PathBuf> = None;
         let mut tls_key: Option<std::path::PathBuf> = None;
+        let mut run_token_file: Option<std::path::PathBuf> = None;
         let mut i = 1usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -3500,7 +3505,7 @@ fn legacy_dispatch(args: Vec<String>) {
                     if i >= args.len() {
                         eprintln!("pblang serve: --port requires a value");
                         eprintln!(
-                            "usage: pblang serve [--port <1-65535>] [--cert <pem>] [--key <pem>]"
+                            "usage: pblang serve [--port <1-65535>] [--run-token-file <path>] [--cert <pem>] [--key <pem>]"
                         );
                         std::process::exit(2);
                     }
@@ -3508,7 +3513,7 @@ fn legacy_dispatch(args: Vec<String>) {
                         Ok(p) if p > 0 => port = p,
                         _ => {
                             eprintln!("pblang serve: invalid port '{}'", args[i]);
-                            eprintln!("usage: pblang serve [--port <1-65535>] [--cert <pem>] [--key <pem>]");
+                            eprintln!("usage: pblang serve [--port <1-65535>] [--run-token-file <path>] [--cert <pem>] [--key <pem>]");
                             std::process::exit(2);
                         }
                     }
@@ -3529,16 +3534,22 @@ fn legacy_dispatch(args: Vec<String>) {
                     }
                     tls_key = Some(std::path::PathBuf::from(&args[i]));
                 }
-                other => {
-                    match other.parse::<u16>() {
-                        Ok(p) if p > 0 => port = p,
-                        _ => {
-                            eprintln!("pblang serve: unrecognized argument '{}'", other);
-                            eprintln!("usage: pblang serve [--port <1-65535>] [--cert <pem>] [--key <pem>]");
-                            std::process::exit(2);
-                        }
+                "--run-token-file" => {
+                    i += 1;
+                    if i >= args.len() {
+                        eprintln!("pblang serve: --run-token-file requires a path");
+                        std::process::exit(2);
                     }
+                    run_token_file = Some(std::path::PathBuf::from(&args[i]));
                 }
+                other => match other.parse::<u16>() {
+                    Ok(p) if p > 0 => port = p,
+                    _ => {
+                        eprintln!("pblang serve: unrecognized argument '{}'", other);
+                        eprintln!("usage: pblang serve [--port <1-65535>] [--run-token-file <path>] [--cert <pem>] [--key <pem>]");
+                        std::process::exit(2);
+                    }
+                },
             }
             i += 1;
         }
@@ -3552,6 +3563,34 @@ fn legacy_dispatch(args: Vec<String>) {
             }
         };
         let scheme = if tls_pair.is_some() { "https" } else { "http" };
+        let run_token = run_token_file.map(|path| {
+            let metadata = std::fs::symlink_metadata(&path).unwrap_or_else(|e| {
+                eprintln!("pblang serve: cannot inspect run token file {}: {e}", path.display());
+                std::process::exit(2);
+            });
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                eprintln!("pblang serve: run token path must be a regular non-symlink file");
+                std::process::exit(2);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+                    eprintln!("pblang serve: run token file must be owned by the current user and mode 0600 or stricter");
+                    std::process::exit(2);
+                }
+            }
+            let value = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                eprintln!("pblang serve: cannot read run token file {}: {e}", path.display());
+                std::process::exit(2);
+            });
+            let value = value.trim().to_string();
+            if !(32..=256).contains(&value.len()) {
+                eprintln!("pblang serve: run token must contain 32..256 bytes");
+                std::process::exit(2);
+            }
+            value
+        });
         println!("pblang IDE Server starting on {scheme}://localhost:{port}");
         println!("Open editors/ide/index.html in your browser");
 
@@ -3587,7 +3626,7 @@ fn legacy_dispatch(args: Vec<String>) {
                 ws::{Message, WebSocket, WebSocketUpgrade},
                 Path as AxPath, State,
             },
-            http::{header, HeaderValue, Method, Request, StatusCode},
+            http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
             middleware::{self, Next},
             response::{IntoResponse, Response},
             routing::{get, post},
@@ -3598,11 +3637,17 @@ fn legacy_dispatch(args: Vec<String>) {
         use tower_http::limit::RequestBodyLimitLayer;
 
         const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+        const MAX_RUN_CODE_BYTES: usize = 1024 * 1024;
+        const MAX_RUN_STDIN_LINES: usize = 256;
+        const MAX_RUN_STDIN_BYTES: usize = 256 * 1024;
+        const MAX_RUN_OUTPUT_BYTES: usize = 1024 * 1024;
 
         #[derive(Clone)]
         struct ServeState {
             ide_examples: &'static [(&'static str, &'static str, &'static str)],
             manual_docs: &'static [(&'static str, &'static str, &'static str)],
+            run_token: Option<Arc<str>>,
+            run_slots: Arc<tokio::sync::Semaphore>,
         }
 
         static IDE_EXAMPLES: &[(&str, &str, &str)] = &[
@@ -3675,10 +3720,57 @@ fn legacy_dispatch(args: Vec<String>) {
             (status, [(header::CONTENT_TYPE, "application/json")], s).into_response()
         }
 
-        async fn handle_run(Json(req): Json<serde_json::Value>) -> Response {
+        fn token_eq(expected: &str, supplied: &str) -> bool {
+            let a = expected.as_bytes();
+            let b = supplied.as_bytes();
+            let mut diff = a.len() ^ b.len();
+            let width = a.len().max(b.len());
+            for i in 0..width {
+                diff |= usize::from(*a.get(i).unwrap_or(&0) ^ *b.get(i).unwrap_or(&0));
+            }
+            diff == 0
+        }
+
+        async fn handle_run(
+            State(state): State<Arc<ServeState>>,
+            headers: HeaderMap,
+            Json(req): Json<serde_json::Value>,
+        ) -> Response {
+            let Some(expected) = state.run_token.as_deref() else {
+                return json_with_status(
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({"ok": false, "error": "IDE execution endpoint is disabled"}),
+                );
+            };
+            let supplied = headers
+                .get("X-PBLang-Token")
+                .and_then(|v| v.to_str().ok())
+                .or_else(|| {
+                    headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                })
+                .unwrap_or("");
+            if !token_eq(expected, supplied) {
+                return json_with_status(
+                    StatusCode::UNAUTHORIZED,
+                    serde_json::json!({"ok": false, "error": "missing or invalid IDE run token"}),
+                );
+            }
+            let permit = match state.run_slots.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return json_with_status(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        serde_json::json!({"ok": false, "error": "IDE execution slot is busy"}),
+                    )
+                }
+            };
             // Heavy CPU + I/O: parse, typecheck, compile, spin up a VM and run.
             // Hop to a blocking thread so the async runtime stays responsive.
             tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 let started = std::time::Instant::now();
                 let mut json_resp = serde_json::json!({
                     "ok": false,
@@ -3689,6 +3781,10 @@ fn legacy_dispatch(args: Vec<String>) {
                     "duration_ms": 0
                 });
                 if let Some(code) = req.get("code").and_then(|c| c.as_str()) {
+                    if code.len() > MAX_RUN_CODE_BYTES {
+                        return json_with_status(StatusCode::PAYLOAD_TOO_LARGE,
+                            serde_json::json!({"ok": false, "error": "IDE source exceeds 1 MiB limit"}));
+                    }
                     let code = normalize_ide_source(code);
                     let stdin_lines: Vec<String> = req
                         .get("stdin_lines")
@@ -3699,6 +3795,11 @@ fn legacy_dispatch(args: Vec<String>) {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let stdin_bytes: usize = stdin_lines.iter().map(|line| line.len()).sum();
+                    if stdin_lines.len() > MAX_RUN_STDIN_LINES || stdin_bytes > MAX_RUN_STDIN_BYTES {
+                        return json_with_status(StatusCode::PAYLOAD_TOO_LARGE,
+                            serde_json::json!({"ok": false, "error": "IDE stdin exceeds bounded limits"}));
+                    }
                     match pblang_core::parse_with_polyglot(&code) {
                         Ok((stmts, _)) => {
                             let type_diags = type_check(&stmts);
@@ -3734,9 +3835,12 @@ fn legacy_dispatch(args: Vec<String>) {
                             } else {
                                 match pblang_compiler::compile(stmts) {
                                     Ok(chunk) => {
-                                        let mut vm = pblang_vm::VM::with_stdlib(
-                                            pblang_vm::StdlibConfig::default(),
-                                        );
+                                        let mut vm = pblang_vm::VM::with_stdlib(pblang_vm::StdlibConfig {
+                                            core: true, fs: false, net: false, http: false,
+                                            json: true, crypto: true, sqlite: false, ffi: false,
+                                            exec: false, gfx: false, import: false, spawn: false,
+                                            env: false, process_exit: false,
+                                        });
                                         vm.set_limits(Some(VmLimits {
                                             max_instructions: Some(5_000_000),
                                             max_stack_depth: Some(2048),
@@ -3751,14 +3855,22 @@ fn legacy_dispatch(args: Vec<String>) {
                                             Ok(values) => {
                                                 let mut output = String::new();
                                                 for v in values {
-                                                    output.push_str(&format!("{}\n", v));
+                                                    let line = format!("{}\n", v);
+                                                    if output.len().saturating_add(line.len()) > MAX_RUN_OUTPUT_BYTES {
+                                                        json_resp = serde_json::json!({
+                                                            "ok": false, "stage": "runtime", "output": "",
+                                                            "error": "IDE output exceeds 1 MiB limit", "diagnostics": []
+                                                        });
+                                                        break;
+                                                    }
+                                                    output.push_str(&line);
                                                 }
-                                                json_resp = serde_json::json!({
-                                                    "ok": true,
-                                                    "stage": "ok",
-                                                    "output": output.trim(),
-                                                    "diagnostics": []
-                                                });
+                                                if json_resp.get("error").and_then(|v| v.as_str()) != Some("IDE output exceeds 1 MiB limit") {
+                                                    json_resp = serde_json::json!({
+                                                        "ok": true, "stage": "ok",
+                                                        "output": output.trim(), "diagnostics": []
+                                                    });
+                                                }
                                             }
                                             Err(e) => {
                                                 let mut diagnostics = Vec::new();
@@ -4193,6 +4305,8 @@ fn legacy_dispatch(args: Vec<String>) {
         let state = Arc::new(ServeState {
             ide_examples: IDE_EXAMPLES,
             manual_docs: MANUAL_DOCS,
+            run_token: run_token.map(Arc::<str>::from),
+            run_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         });
 
         let cors_origin = format!("{scheme}://localhost:{port}");
@@ -4206,7 +4320,11 @@ fn legacy_dispatch(args: Vec<String>) {
         let cors = CorsLayer::new()
             .allow_origin(AllowOrigin::exact(cors_origin_hv))
             .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-            .allow_headers([header::CONTENT_TYPE]);
+            .allow_headers([
+                header::CONTENT_TYPE,
+                header::AUTHORIZATION,
+                HeaderName::from_static("x-pblang-token"),
+            ]);
 
         let app = Router::new()
             .route("/", get(handle_index))
@@ -4589,7 +4707,11 @@ fn legacy_dispatch(args: Vec<String>) {
         // from pblang bytecode without the Rust front-end" path.
         let (chunk, src) = if path_str.ends_with(".pbck") {
             let bytes = std::fs::read(&script_path).unwrap_or_else(|e| {
-                eprintln!("pblang run: failed to read '{}': {}", script_path.display(), e);
+                eprintln!(
+                    "pblang run: failed to read '{}': {}",
+                    script_path.display(),
+                    e
+                );
                 std::process::exit(1);
             });
             let mut c = pblang_ir::pbck_deserialize(&bytes).unwrap_or_else(|e| {
@@ -4765,7 +4887,10 @@ fn legacy_dispatch(args: Vec<String>) {
                     .arg(&script_path)
                     .arg("--target")
                     .arg(tgt);
-                if let Some(o) = args.iter().position(|a| a == "--out").and_then(|i| args.get(i + 1))
+                if let Some(o) = args
+                    .iter()
+                    .position(|a| a == "--out")
+                    .and_then(|i| args.get(i + 1))
                 {
                     cmd.arg("--out").arg(o);
                 }

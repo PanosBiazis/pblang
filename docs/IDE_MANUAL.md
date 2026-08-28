@@ -15,9 +15,26 @@ This manual covers the **code-first** browser IDE in `editors/ide/index.html` an
 
 Start backend:
 
+Create a private token file, then start the backend with protected execution:
+
 ```bash
-cargo run -- serve --port 8090
+umask 077
+openssl rand -hex 32 > /tmp/pblang-ide-token
+cargo run -- serve --port 8090 --run-token-file /tmp/pblang-ide-token
 ```
+
+The token file must be a regular non-symlink file owned by the current user,
+with no group/world permissions, and contain 32–256 bytes. Use **🔑 Run access**
+in the browser IDE to load its value into the current tab's memory. The token is
+not persisted in browser storage, URLs, source files, or run history.
+
+Without `--run-token-file`, `POST /run` returns `404` and code execution is
+disabled. An invalid or missing token returns `401`. Authenticated IDE code runs
+under a deny-by-default profile: filesystem, network/HTTP, SQLite, FFI, imports,
+process creation, environment access, graphics, task spawning, and host process
+exit remain disabled. Source, stdin, output, and concurrent-run bounds are also
+enforced. This is application-level containment; it is not yet an outer
+hostile-code sandbox with process-level hard preemption.
 
 Open:
 
