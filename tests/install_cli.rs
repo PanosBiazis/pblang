@@ -6,6 +6,15 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
 use std::thread;
 
+fn pblang_registry_fixture_command(bin: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(bin);
+    // Every registry in this integration-test module is a locally generated,
+    // unsigned fixture. Declare the development exception on the child only;
+    // the production CLI process remains fail-closed by default.
+    command.env("PBLANG_ALLOW_UNSIGNED_REGISTRY_DEV", "1");
+    command
+}
+
 fn file_url_for_path(path: &std::path::Path) -> String {
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     format!("file:///{}", abs.to_string_lossy().replace('\\', "/"))
@@ -99,7 +108,7 @@ version = "0.1.0"
     std::fs::write(temp.join("pblang.toml"), manifest).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let status = std::process::Command::new(bin)
+    let status = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -147,7 +156,7 @@ version = "1.2.0"
     std::fs::write(pkg_dir.join("lib.sapp"), "export fn id(x) { return x; }").unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let publish_status = std::process::Command::new(bin)
+    let publish_status = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -167,7 +176,7 @@ version = "1.2.0"
     );
     let index_url = file_url_for_path(&index_path);
 
-    let install_out = std::process::Command::new(bin)
+    let install_out = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -223,7 +232,7 @@ version = "0.1.0"
         std::env::set_var("PBLANG_SIGNING_KEY", "testkey")
     };
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -272,7 +281,7 @@ version = "0.1.0"
     std::fs::write(temp.join("main.sapp"), "print 41;\n").unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("build")
         .arg("--registry-index")
         .arg(&index_url)
@@ -321,7 +330,7 @@ version = "0.1.0"
     std::fs::write(temp.join("pblang.toml"), manifest).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg(&temp)
         .output()
@@ -366,7 +375,7 @@ version = "0.1.0"
     std::fs::write(temp.join("pblang.toml"), manifest).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("--lock")
         .arg("--registry-index")
         .arg(&index_url)
@@ -423,7 +432,7 @@ version = "0.1.0"
     std::fs::write(temp.join("pblang.toml"), manifest).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -480,7 +489,7 @@ version = "0.1.0"
     std::fs::write(temp.join("pblang.toml"), manifest).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -538,7 +547,7 @@ version = "0.1.0"
     std::fs::write(temp.join("pblang.toml"), manifest).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -579,7 +588,7 @@ version = "1.0.0"
     std::fs::write(pkg_a.join("lib.sapp"), "export fn id(x) { return x; }").unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let status = std::process::Command::new(bin)
+    let status = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -608,7 +617,7 @@ version = "0.1.0"
 
     let index_abs = std::fs::canonicalize(&index_path).unwrap_or(index_path);
     let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
-    let status2 = std::process::Command::new(bin)
+    let status2 = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -656,7 +665,7 @@ version = "2.0.0"
     let registry_dir = reg_dir.path().to_string_lossy().to_string();
     let index_url = file_url_for_path(reg_dir.path());
 
-    let pub_out = std::process::Command::new(bin)
+    let pub_out = pblang_registry_fixture_command(bin)
         .args([
             "publish",
             "--registry-dir",
@@ -671,7 +680,7 @@ version = "2.0.0"
         String::from_utf8_lossy(&pub_out.stderr)
     );
 
-    let search_out = std::process::Command::new(bin)
+    let search_out = pblang_registry_fixture_command(bin)
         .env("PBLANG_REGISTRY_INDEX", &index_url)
         .args(["search", "pblang_m4b"])
         .output()
@@ -726,7 +735,7 @@ version = "0.1.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -773,7 +782,7 @@ version = "1.0.0"
     std::fs::write(pkg.join("lib.sapp"), "export fn id() { return 1; }\n").unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let first = std::process::Command::new(bin)
+    let first = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -787,7 +796,7 @@ version = "1.0.0"
     );
 
     std::fs::write(pkg.join("lib.sapp"), "export fn id() { return 2; }\n").unwrap();
-    let second = std::process::Command::new(bin)
+    let second = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -826,7 +835,7 @@ version = "1.0.0"
     std::fs::write(pkg.join("lib.sapp"), "export fn id() { return 1; }\n").unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let first = std::process::Command::new(bin)
+    let first = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -839,7 +848,7 @@ version = "1.0.0"
         String::from_utf8_lossy(&first.stderr)
     );
 
-    let second = std::process::Command::new(bin)
+    let second = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -873,7 +882,7 @@ entry = "src/app.sapp"
     std::fs::write(pkg.join("pblang.toml"), manifest).unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -927,7 +936,7 @@ entry = "src"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -977,7 +986,7 @@ version = "1.0.0"
     std::fs::write(pkg.join("README.txt"), "not a Sapphire module\n").unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -1032,7 +1041,7 @@ version = "1.0.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let publish_status = std::process::Command::new(bin)
+    let publish_status = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -1062,7 +1071,7 @@ version = "0.1.0"
     let index_abs = std::fs::canonicalize(&index_path).unwrap_or(index_path);
     let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
 
-    let install_status = std::process::Command::new(bin)
+    let install_status = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -1071,7 +1080,7 @@ version = "0.1.0"
         .expect("run sapphire install");
     assert!(install_status.success(), "sapphire install should exit 0");
 
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("run")
         .arg("main.sapp")
         .current_dir(&pkg_b)
@@ -1095,6 +1104,7 @@ version = "0.1.0"
 #[test]
 fn installed_registry_package_uses_manifest_entry_for_package_import() {
     let base = std::env::temp_dir().join("pblang_registry_import_manifest_entry");
+    let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::create_dir_all(&base);
     let registry_dir = base.join("registry");
     let pkg_a = base.join("pkg_a");
@@ -1117,7 +1127,7 @@ entry = "src/entry.sapp"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let publish_status = std::process::Command::new(bin)
+    let publish_status = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -1147,7 +1157,7 @@ version = "0.1.0"
     let index_abs = std::fs::canonicalize(&index_path).unwrap_or(index_path);
     let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
 
-    let install_status = std::process::Command::new(bin)
+    let install_status = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -1156,7 +1166,7 @@ version = "0.1.0"
         .expect("run sapphire install");
     assert!(install_status.success(), "sapphire install should exit 0");
 
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("run")
         .arg("main.sapp")
         .current_dir(&pkg_b)
@@ -1180,6 +1190,7 @@ version = "0.1.0"
 #[test]
 fn installed_registry_package_subpath_import_works_within_package_root() {
     let base = std::env::temp_dir().join("pblang_registry_subpath_import_ok");
+    let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::create_dir_all(&base);
     let registry_dir = base.join("registry");
     let pkg_a = base.join("pkg_a");
@@ -1201,7 +1212,7 @@ version = "1.0.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let publish_status = std::process::Command::new(bin)
+    let publish_status = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -1231,7 +1242,7 @@ version = "0.1.0"
     let index_abs = std::fs::canonicalize(&index_path).unwrap_or(index_path);
     let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
 
-    let install_status = std::process::Command::new(bin)
+    let install_status = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -1240,7 +1251,7 @@ version = "0.1.0"
         .expect("run sapphire install");
     assert!(install_status.success(), "sapphire install should exit 0");
 
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("run")
         .arg("main.sapp")
         .current_dir(&pkg_b)
@@ -1263,6 +1274,7 @@ version = "0.1.0"
 #[test]
 fn installed_registry_package_subpath_import_rejects_directory_target() {
     let base = std::env::temp_dir().join("pblang_registry_subpath_import_directory");
+    let _ = std::fs::remove_dir_all(&base);
     let _ = std::fs::create_dir_all(&base);
     let registry_dir = base.join("registry");
     let pkg_a = base.join("pkg_a");
@@ -1284,7 +1296,7 @@ version = "1.0.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let publish_status = std::process::Command::new(bin)
+    let publish_status = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -1314,7 +1326,7 @@ version = "0.1.0"
     let index_abs = std::fs::canonicalize(&index_path).unwrap_or(index_path);
     let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
 
-    let install_status = std::process::Command::new(bin)
+    let install_status = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -1323,7 +1335,7 @@ version = "0.1.0"
         .expect("run sapphire install");
     assert!(install_status.success(), "sapphire install should exit 0");
 
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("run")
         .arg("main.sapp")
         .current_dir(&pkg_b)
@@ -1370,7 +1382,7 @@ version = "1.0.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let publish_status = std::process::Command::new(bin)
+    let publish_status = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -1400,7 +1412,7 @@ version = "0.1.0"
     let index_abs = std::fs::canonicalize(&index_path).unwrap_or(index_path);
     let index_url = format!("file:///{}", index_abs.to_string_lossy().replace('\\', "/"));
 
-    let install_status = std::process::Command::new(bin)
+    let install_status = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -1422,7 +1434,7 @@ version = "0.1.0"
     )
     .unwrap();
 
-    let out = std::process::Command::new(bin)
+    let out = pblang_registry_fixture_command(bin)
         .arg("run")
         .arg("main.sapp")
         .current_dir(&pkg_b)
@@ -1471,7 +1483,7 @@ version = "1.0.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let publish = std::process::Command::new(bin)
+    let publish = pblang_registry_fixture_command(bin)
         .arg("publish")
         .arg("--registry-dir")
         .arg(&registry_dir)
@@ -1505,7 +1517,7 @@ version = "0.1.0"
     .unwrap();
 
     let index_url = file_url_for_path(&registry_dir.join("index.json"));
-    let install = std::process::Command::new(bin)
+    let install = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg("--registry-index")
         .arg(&index_url)
@@ -1532,7 +1544,7 @@ version = "0.1.0"
         "dependency cache path should be removed before rehydration test"
     );
 
-    let run = std::process::Command::new(bin)
+    let run = pblang_registry_fixture_command(bin)
         .arg("run")
         .arg("main.sapp")
         .current_dir(&pkg_b)
@@ -1645,7 +1657,7 @@ version = "0.1.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let install = std::process::Command::new(bin)
+    let install = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg(&consumer)
         .output()
@@ -1668,7 +1680,7 @@ version = "0.1.0"
         lock_content
     );
 
-    let run = std::process::Command::new(bin)
+    let run = pblang_registry_fixture_command(bin)
         .arg("run")
         .arg("main.sapp")
         .current_dir(&consumer)
@@ -1759,7 +1771,7 @@ version = "0.1.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let install = std::process::Command::new(bin)
+    let install = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg(&consumer)
         .output()
@@ -1857,7 +1869,7 @@ version = "0.1.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let install = std::process::Command::new(bin)
+    let install = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg(&consumer)
         .env("PBLANG_CACHE", &cache_dir)
@@ -1882,7 +1894,7 @@ version = "0.1.0"
         "git checkout path should be removed before rehydration test"
     );
 
-    let run = std::process::Command::new(bin)
+    let run = pblang_registry_fixture_command(bin)
         .arg("run")
         .arg("main.sapp")
         .current_dir(&consumer)
@@ -1904,6 +1916,81 @@ version = "0.1.0"
         "rehydration should recreate git checkout path"
     );
 
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn git_dependency_rejects_preseeded_predictable_cache_content() {
+    let base = std::env::temp_dir().join("pblang_git_dep_preseed_rejected");
+    let _ = std::fs::remove_dir_all(&base);
+    let repo = base.join("gitdep");
+    let consumer = base.join("consumer");
+    let cache_dir = base.join("cache");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&consumer).unwrap();
+
+    std::fs::write(
+        repo.join("pblang.toml"),
+        "[package]\nname = \"gitdep\"\nversion = \"0.1.0\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("lib.sapp"),
+        "fn value() { return 42; }\nexport value;\n",
+    )
+    .unwrap();
+    assert!(run_git(&repo, &["init"]).status.success());
+    assert!(run_git(&repo, &["add", "."]).status.success());
+    assert!(run_git(&repo, &["commit", "-m", "init"]).status.success());
+    let rev = String::from_utf8_lossy(&run_git(&repo, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    let repo_url = std::fs::canonicalize(&repo)
+        .unwrap_or(repo.clone())
+        .to_string_lossy()
+        .to_string();
+
+    let cache_key = hex::encode(sha2::Sha256::digest(format!("{repo_url}#{rev}").as_bytes()));
+    let preseed = cache_dir.join("git").join(cache_key);
+    std::fs::create_dir_all(&preseed).unwrap();
+    std::fs::write(
+        preseed.join("pblang.toml"),
+        "[package]\nname = \"gitdep\"\nversion = \"0.1.0\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        preseed.join("lib.sapp"),
+        "fn value() { return 666; }\nexport value;\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        consumer.join("pblang.toml"),
+        format!(
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n\n[dependencies]\ngitdep = {{ git = \"{repo_url}\", rev = \"{rev}\" }}\n"
+        ),
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_pblang");
+    let install = pblang_registry_fixture_command(bin)
+        .arg("install")
+        .arg(&consumer)
+        .env("PBLANG_CACHE", &cache_dir)
+        .output()
+        .expect("run preseeded git dependency install");
+    assert!(
+        !install.status.success(),
+        "preseeded cache must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&install.stderr);
+    assert!(
+        stderr.contains("git cache collision"),
+        "unexpected preseed rejection: {stderr}"
+    );
+    assert!(
+        !consumer.join("pblang.lock").exists(),
+        "failed preseed verification must not publish a lockfile"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -1984,7 +2071,7 @@ version = "0.1.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let install = std::process::Command::new(bin)
+    let install = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg(&consumer)
         .output()
@@ -1995,7 +2082,7 @@ version = "0.1.0"
         String::from_utf8_lossy(&install.stderr)
     );
 
-    let run = std::process::Command::new(bin)
+    let run = pblang_registry_fixture_command(bin)
         .arg("run")
         .arg("main.sapp")
         .current_dir(&consumer)
@@ -2091,7 +2178,7 @@ version = "0.1.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let install = std::process::Command::new(bin)
+    let install = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg(&consumer)
         .output()
@@ -2102,7 +2189,7 @@ version = "0.1.0"
         String::from_utf8_lossy(&install.stderr)
     );
 
-    let run = std::process::Command::new(bin)
+    let run = pblang_registry_fixture_command(bin)
         .arg("run")
         .arg("main.sapp")
         .current_dir(&consumer)
@@ -2198,7 +2285,7 @@ version = "0.1.0"
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_pblang");
-    let install = std::process::Command::new(bin)
+    let install = pblang_registry_fixture_command(bin)
         .arg("install")
         .arg(&consumer)
         .output()
@@ -2209,7 +2296,7 @@ version = "0.1.0"
         String::from_utf8_lossy(&install.stderr)
     );
 
-    let run = std::process::Command::new(bin)
+    let run = pblang_registry_fixture_command(bin)
         .arg("run")
         .arg("main.sapp")
         .current_dir(&consumer)
@@ -2256,7 +2343,7 @@ version = "0.1.0"
 
     let bin = env!("CARGO_BIN_EXE_pblang");
     for _ in 0..2 {
-        let out = std::process::Command::new(bin)
+        let out = pblang_registry_fixture_command(bin)
             .arg("install")
             .arg("--registry-index")
             .arg(&index_url)

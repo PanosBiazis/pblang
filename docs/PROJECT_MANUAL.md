@@ -46,7 +46,7 @@ cargo run -- run .
 - `pblang fmt [files...]`: format source
 - `pblang lint [files...]`: diagnostics-oriented checks
 - `pblang lsp`: start language server on stdio
-- `pblang serve [--port N]`: start local IDE backend
+- `pblang serve [--port N] [--run-token-file PATH]`: start the local IDE backend; `/run` stays disabled unless a protected token file is supplied
 - `pblang --doc <file> [--html] [out_dir]`: docs generation
 - `pblang --lock [path]`: generate lockfile
 - `pblang install [path | <name>@<version>]`: resolve/install dependencies
