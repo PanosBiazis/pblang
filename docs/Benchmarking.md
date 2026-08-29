@@ -133,6 +133,21 @@ cache hit, 7.61 us/op for LRU hit, 9.29 us/op for the unified memory-store get,
 and 23.89 us/op for in-memory SQLite get. Redis remained explicitly conditional
 because no equivalent provisioned service was available.
 
+## Product contract benchmark
+
+`bench/product_contract_stages.sapp` measures the digest-bound release-evidence
+pipeline and the renderer-neutral UI document pipeline independently:
+
+```sh
+./target/release/pblang bench/product_contract_stages.sapp
+```
+
+Every phase uses three warmups and nine retained samples, reports raw timings,
+median and p95, and rejects a sample set whose correctness checksum changes.
+The UI workload contains exactly 512 widgets, the current public contract
+limit. Release-evidence results remain consistency checks only: benchmark
+success is not trust verification and never authorizes publication.
+
 ## Interpretation limits
 
 - PBLang C99 compilation is end-to-end transpilation plus C compilation. A
