@@ -1,0 +1,457 @@
+// Strict, effect-free Delphi text DFM importer.
+//
+// This module accepts a deliberately small VCL-compatible subset and produces
+// the renderer-neutral pblang.ui-document.v1 shape. It never reads files,
+// resolves resources, invokes Delphi tooling, or executes event handlers.
+
+let UI = import("stdlib:ui_document.sapp");
+
+let FORMAT = "pblang.delphi-dfm-import.v1";
+let MAX_SOURCE_BYTES = 1048576;
+let MAX_SOURCE_CHARS = 262144;
+let MAX_LINES = 16384;
+let MAX_LINE_CHARS = 16384;
+let MAX_OBJECTS = 513;
+let MAX_DEPTH = 32;
+let MAX_PROPERTIES_PER_OBJECT = 256;
+let MAX_ASSIGNMENTS = 16384;
+let MAX_VALUE_CHARS = 8192;
+let MAX_COLLECTION_ITEMS = 256;
+let MAX_DECODED_CHARS = 524288;
+
+fn _result_error(code) {
+    return map{ok:false, format:FORMAT, error:code, diagnostics:[code],
+        effects:false, embedded_code:false, handlers_executed:false};
+}
+
+fn _identifier(value) {
+    return type(value) == "string"
+        and regex_match(value, "^[A-Za-z_][A-Za-z0-9_]{0,127}$");
+}
+
+fn _class_token(value) {
+    return type(value) == "string"
+        and regex_match(value, "^T[A-Za-z_][A-Za-z0-9_]{0,62}$");
+}
+
+fn _property_token(value) {
+    return type(value) == "string"
+        and regex_match(value, "^[A-Za-z_][A-Za-z0-9_.]{0,127}$");
+}
+
+fn _source_name(value) {
+    return type(value) == "string" and value != "" and len(value) <= 255
+        and not str_contains(value, "/") and not str_contains(value, "\\")
+        and not str_contains(value, ":") and not str_contains(value, strfromcharcode(0));
+}
+
+fn _normalize_source(source) {
+    if type(source) != "string" { return _result_error("source-type"); }
+    let bytes = str_to_bytes(source);
+    if len(bytes) > MAX_SOURCE_BYTES or len(source) > MAX_SOURCE_CHARS {
+        return _result_error("source-too-large");
+    }
+    if len(bytes) >= 4 and bytes[0] == 84 and bytes[1] == 80
+       and bytes[2] == 70 and bytes[3] == 48 {
+        return _result_error("binary-dfm-unsupported");
+    }
+    if len(bytes) >= 3 and bytes[0] == 239 and bytes[1] == 187 and bytes[2] == 191 {
+        bytes = slice(bytes, 3, len(bytes));
+    }
+    let i = 0;
+    while i < len(bytes) {
+        let value = bytes[i];
+        if value == 0 or (value < 32 and value != 9 and value != 10 and value != 13)
+           or value == 127 {
+            return _result_error("source-control-character");
+        }
+        i = i + 1;
+    }
+    let text = try bytes_to_str(bytes) catch nil;
+    if text == nil { return _result_error("encoding-unsupported"); }
+    let decoded = str(text);
+    if len(str_to_bytes(decoded)) != len(bytes) {
+        return _result_error("encoding-unsupported");
+    }
+    decoded = str_replace_all(str_replace_all(decoded, "\r\n", "\n"), "\r", "\n");
+    return map{ok:true, text:decoded};
+}
+
+fn _object_declaration(line) {
+    let keyword = "";
+    if str_starts_with(line, "object ") { keyword = "object"; }
+    else if str_starts_with(line, "inherited ") { keyword = "inherited"; }
+    else if str_starts_with(line, "inline ") { keyword = "inline"; }
+    else { return nil; }
+    let body = str_trim(str_slice(line, len(keyword) + 1, len(line)));
+    let colon = str_index_of(body, ":");
+    if colon <= 0 { return nil; }
+    let name = str_trim(str_slice(body, 0, colon));
+    let class_name = str_trim(str_slice(body, colon + 1, len(body)));
+    if not _identifier(name) or not _class_token(class_name) { return nil; }
+    return map{keyword:keyword, name:name, class_name:class_name};
+}
+
+fn _sensitive_property(name) {
+    let key = str_lower(name);
+    if key == "passwordchar" { return false; }
+    for marker in ["filename", "filepath", "path", "url", "uri", "sql", "command",
+        "script", "picture", "connection", "password", "credential"] {
+        if str_contains(key, marker) { return true; }
+    }
+    return key == "data" or str_ends_with(key, ".data");
+}
+
+fn _append_codepoint(output, digits, budget) {
+    if digits == "" or len(digits) > 7 or not regex_match(digits, "^[0-9]+$") {
+        return map{ok:false,error:"invalid-codepoint"};
+    }
+    let code = try parse_number(digits) catch nil;
+    if code == nil or code <= 0 or code > 1114111 or (code >= 55296 and code <= 57343) {
+        return map{ok:false,error:"invalid-codepoint"};
+    }
+    budget.decoded = budget.decoded + 1;
+    if budget.decoded > MAX_DECODED_CHARS { return map{ok:false,error:"decoded-text-too-large"}; }
+    return map{ok:true,value:output + strfromcharcode(code)};
+}
+
+fn _parse_string_expression(value, budget) {
+    let out = ""; let i = 0; let atoms = 0;
+    while i < len(value) {
+        let ch = str_slice(value, i, i + 1);
+        if ch == " " or ch == "\t" or ch == "\n" or ch == "+" { i = i + 1; }
+        else if ch == "'" {
+            atoms = atoms + 1; i = i + 1; let closed = false;
+            while i < len(value) and not closed {
+                ch = str_slice(value, i, i + 1);
+                if ch == "'" {
+                    if i + 1 < len(value) and str_slice(value, i + 1, i + 2) == "'" {
+                        out = out + "'"; budget.decoded = budget.decoded + 1; i = i + 2;
+                    } else { closed = true; i = i + 1; }
+                } else {
+                    out = out + ch; budget.decoded = budget.decoded + 1; i = i + 1;
+                }
+                if budget.decoded > MAX_DECODED_CHARS or len(out) > MAX_VALUE_CHARS {
+                    return map{ok:false,error:"decoded-text-too-large"};
+                }
+            }
+            if not closed { return map{ok:false,error:"unterminated-string"}; }
+        } else if ch == "#" {
+            atoms = atoms + 1; i = i + 1; let start = i;
+            while i < len(value) and regex_match(str_slice(value, i, i + 1), "^[0-9]$") {
+                i = i + 1;
+            }
+            let appended = _append_codepoint(out, str_slice(value, start, i), budget);
+            if not appended.ok { return appended; }
+            out = appended.value;
+        } else { return map{ok:false,error:"unsupported-expression"}; }
+    }
+    if atoms == 0 { return map{ok:false,error:"empty-string-expression"}; }
+    return map{ok:true,value:out};
+}
+
+fn _parse_scalar(value, budget) {
+    let text = str_trim(value);
+    if text == "" or len(text) > MAX_VALUE_CHARS { return map{ok:false,error:"invalid-value"}; }
+    if str_contains(text, "{") or str_contains(text, "}") {
+        return map{ok:false,error:"binary-blob-unsupported"};
+    }
+    if str_contains(text, "@") or str_contains(text, ";") {
+        return map{ok:false,error:"unsupported-expression"};
+    }
+    let lower = str_lower(text);
+    if lower == "true" { return map{ok:true,value:true}; }
+    if lower == "false" { return map{ok:true,value:false}; }
+    if regex_match(text, "^-?[0-9]+(\\.[0-9]+)?$") {
+        let number = try parse_number(text) catch nil;
+        if number == nil or number < -1000000000000 or number > 1000000000000 {
+            return map{ok:false,error:"numeric-out-of-range"};
+        }
+        return map{ok:true,value:number};
+    }
+    if str_starts_with(text, "'") or str_starts_with(text, "#") {
+        return _parse_string_expression(text, budget);
+    }
+    if _identifier(text) { return map{ok:true,value:text}; }
+    return map{ok:false,error:"unsupported-expression"};
+}
+
+fn _parse_set(value) {
+    if not str_starts_with(value, "[") or not str_ends_with(value, "]") {
+        return map{ok:false,error:"malformed-set"};
+    }
+    let inner = str_trim(str_slice(value, 1, len(value) - 1));
+    if inner == "" { return map{ok:true,value:[]}; }
+    let parts = str_split(inner, ",");
+    if len(parts) > MAX_COLLECTION_ITEMS { return map{ok:false,error:"collection-too-large"}; }
+    let out = [];
+    for part in parts {
+        let item = str_trim(part);
+        if not _identifier(item) { return map{ok:false,error:"malformed-set"}; }
+        array_push(out, item);
+    }
+    return map{ok:true,value:out};
+}
+
+fn _parse_list(value, budget) {
+    if not str_starts_with(value, "(") or not str_ends_with(value, ")") {
+        return map{ok:false,error:"malformed-list"};
+    }
+    let inner = str_slice(value, 1, len(value) - 1);
+    let lines = str_split(inner, "\n"); let out = [];
+    for line in lines {
+        let item = str_trim(line);
+        if item != "" {
+            if len(out) >= MAX_COLLECTION_ITEMS { return map{ok:false,error:"collection-too-large"}; }
+            let parsed = _parse_scalar(item, budget);
+            if not parsed.ok { return parsed; }
+            array_push(out, parsed.value);
+        }
+    }
+    return map{ok:true,value:out};
+}
+
+fn _parse_value(value, budget) {
+    let text = str_trim(value);
+    if text == "<>" { return map{ok:true,value:[]}; }
+    if str_starts_with(text, "<") { return map{ok:false,error:"collection-unsupported"}; }
+    if str_starts_with(text, "[") { return _parse_set(text); }
+    if str_starts_with(text, "(") { return _parse_list(text, budget); }
+    return _parse_scalar(text, budget);
+}
+
+fn _collect_value(lines, index, initial) {
+    let value = str_trim(initial); let opener = ""; let closer = "";
+    if str_starts_with(value, "(") { opener = "("; closer = ")"; }
+    else if str_starts_with(value, "[") { opener = "["; closer = "]"; }
+    else if str_starts_with(value, "<") { opener = "<"; closer = ">"; }
+    if opener == "" or str_ends_with(value, closer) { return map{ok:true,value:value,index:index}; }
+    let out = value; let i = index + 1;
+    while i < len(lines) and not str_ends_with(str_trim(out), closer) {
+        if len(out) > MAX_VALUE_CHARS { return map{ok:false,error:"value-too-large"}; }
+        out = out + "\n" + str_trim(lines[i]); i = i + 1;
+    }
+    if not str_ends_with(str_trim(out), closer) { return map{ok:false,error:"unterminated-collection"}; }
+    if len(out) > MAX_VALUE_CHARS { return map{ok:false,error:"value-too-large"}; }
+    return map{ok:true,value:out,index:i - 1};
+}
+
+fn _widget_kind(class_name) {
+    let classes = map{tpanel:"panel", tbutton:"button", tlabel:"label", tedit:"textbox",
+        tmemo:"textarea", trichedit:"textarea", tcheckbox:"checkbox", tradiobutton:"radio",
+        tcombobox:"select", ttrackbar:"slider", tprogressbar:"progress"};
+    return try classes[str_lower(class_name)] catch nil;
+}
+
+fn _event_name(property_name) {
+    let names = map{onclick:"click", onchange:"change"};
+    return try names[str_lower(property_name)] catch nil;
+}
+
+fn _number_property(object, name, fallback) {
+    let value = try object.properties[str_lower(name)] catch fallback;
+    if type(value) != "number" { return fallback; }
+    return value;
+}
+
+fn _property(object, name, fallback) {
+    return try object.properties[str_lower(name)] catch fallback;
+}
+
+fn _map_widget(object) {
+    let kind = _widget_kind(object.class_name);
+    if kind == nil { return map{ok:false,error:"unsupported-component-class"}; }
+    let width = _number_property(object, "Width", if kind == "label" { 80 } else { 96 });
+    let height = _number_property(object, "Height", if kind == "panel" { 100 } else { 24 });
+    let props = map{};
+    let visible = _property(object, "Visible", true);
+    let enabled = _property(object, "Enabled", true);
+    if type(visible) != "bool" or type(enabled) != "bool" {
+        return map{ok:false,error:"invalid-behavior-property"};
+    }
+    props.visible = visible; props.enabled = enabled;
+    let caption = _property(object, "Caption", nil);
+    if caption != nil and (kind == "button" or kind == "label" or kind == "checkbox" or kind == "radio") {
+        props.text = str(caption);
+    } else if caption != nil and kind == "panel" { props.title = str(caption); }
+    if kind == "textbox" {
+        props.value = str(_property(object, "Text", ""));
+        let read_only = _property(object, "ReadOnly", false);
+        if type(read_only) != "bool" { return map{ok:false,error:"invalid-behavior-property"}; }
+        props.read_only = read_only;
+        let hint = _property(object, "TextHint", nil); if hint != nil { props.hint = str(hint); }
+        let password_char = _property(object, "PasswordChar", 0);
+        if type(password_char) != "number" { return map{ok:false,error:"invalid-password-property"}; }
+        if password_char != 0 {
+            props.input_type = "password"; props.sensitive_input = true;
+        }
+    }
+    if kind == "textarea" {
+        let line_values = _property(object, "Lines.Strings", []);
+        if type(line_values) == "array" { props.value = str_join(line_values, "\n"); }
+        else { props.value = str(line_values); }
+        let read_only = _property(object, "ReadOnly", false);
+        if type(read_only) != "bool" { return map{ok:false,error:"invalid-behavior-property"}; }
+        props.read_only = read_only;
+    }
+    if kind == "checkbox" { props.checked = _property(object, "Checked", false); }
+    if kind == "select" {
+        props.options = _property(object, "Items.Strings", []);
+        props.selected = _number_property(object, "ItemIndex", 0 - 1);
+    }
+    if kind == "slider" or kind == "progress" {
+        props.min = _number_property(object, "Min", 0);
+        props.max = _number_property(object, "Max", 100);
+        props.value = _number_property(object, "Position", 0);
+        if props.max < props.min or props.value < props.min or props.value > props.max {
+            return map{ok:false,error:"invalid-control-range"};
+        }
+    }
+    return map{ok:true,widget:map{name:object.name,kind:kind,parent:object.parent,
+        x:_number_property(object, "Left", 0), y:_number_property(object, "Top", 0),
+        w:width,h:height,props:props,events:object.events}};
+}
+
+fn _canonical_document(objects, source_name, state) {
+    let root = objects[0];
+    let width = _number_property(root, "ClientWidth", _number_property(root, "Width", 480));
+    let height = _number_property(root, "ClientHeight", _number_property(root, "Height", 320));
+    let title = str(_property(root, "Caption", root.name));
+    let design = map{form:map{title:title,w:width,h:height},widgets:[],model:map{}};
+    let i = 1;
+    while i < len(objects) {
+        let mapped = _map_widget(objects[i]);
+        if not mapped.ok { return _result_error(mapped.error); }
+        array_push(design.widgets, mapped.widget); i = i + 1;
+    }
+    let document = try UI.from_design(design, "delphi-dfm") catch nil;
+    if document == nil { return _result_error("canonical-validation-failed"); }
+    let checked = UI.validate(document);
+    if not checked.ok { return _result_error("canonical-validation-failed"); }
+    return map{ok:true,format:FORMAT,source_name:source_name,document:checked.document,
+        object_count:len(objects),widget_count:len(design.widgets),
+        lossy:state.unmapped_properties > 0 or state.unmapped_events > 0
+            or state.external_reference_present,
+        unmapped_property_count:state.unmapped_properties,
+        unmapped_event_count:state.unmapped_events,
+        external_reference_present:state.external_reference_present,
+        effects:false,embedded_code:false,handlers_executed:false,atomic:true};
+}
+
+fn sniff_text(source) {
+    let normalized = _normalize_source(source); if not normalized.ok { return normalized; }
+    let lines = str_split(normalized.text, "\n");
+    if len(lines) > MAX_LINES { return _result_error("too-many-lines"); }
+    for raw_line in lines {
+        if len(raw_line) > MAX_LINE_CHARS { return _result_error("line-too-large"); }
+        let line = str_trim(raw_line);
+        if line != "" {
+            if _object_declaration(line) == nil { return _result_error("content-signature-mismatch"); }
+            return map{ok:true,format:"pblang.delphi-dfm-signature.v1",text_dfm:true};
+        }
+    }
+    return _result_error("content-signature-mismatch");
+}
+
+fn import_text(source, logical_name = "form.dfm") {
+    if not _source_name(logical_name) { return _result_error("invalid-source-name"); }
+    let normalized = _normalize_source(source); if not normalized.ok { return normalized; }
+    let lines = str_split(normalized.text, "\n");
+    if len(lines) > MAX_LINES { return _result_error("too-many-lines"); }
+    let objects = []; let stack = []; let ids = map{};
+    let state = map{assignments:0,decoded:0,root_closed:false,
+        unmapped_properties:0,unmapped_events:0,external_reference_present:false};
+    let i = 0;
+    while i < len(lines) {
+        let raw_line = lines[i];
+        if len(raw_line) > MAX_LINE_CHARS { return _result_error("line-too-large"); }
+        let line = str_trim(raw_line);
+        if line == "" { i = i + 1; }
+        else if state.root_closed { return _result_error("trailing-data"); }
+        else {
+            let declaration = _object_declaration(line);
+            if declaration != nil {
+                if len(stack) >= MAX_DEPTH { return _result_error("object-depth-exceeded"); }
+                if len(objects) >= MAX_OBJECTS { return _result_error("too-many-objects"); }
+                let folded = str_lower(declaration.name);
+                if map_has(ids, folded) { return _result_error("duplicate-object-id"); }
+                if len(stack) > 0 and folded == "root" { return _result_error("reserved-object-id"); }
+                ids[folded] = true;
+                let parent = if len(stack) <= 1 { "root" } else { stack[len(stack) - 1].name };
+                let object = map{name:declaration.name,class_name:declaration.class_name,
+                    parent:parent,properties:map{},property_names:map{},events:map{},property_count:0};
+                array_push(objects, object); array_push(stack, object);
+            } else if line == "end" {
+                if len(stack) == 0 { return _result_error("unexpected-end"); }
+                array_pop(stack);
+                if len(stack) == 0 { state.root_closed = true; }
+            } else {
+                if len(stack) == 0 { return _result_error("root-declaration-required"); }
+                let equal = str_index_of(line, "=");
+                if equal <= 0 { return _result_error("unsupported-syntax"); }
+                let name = str_trim(str_slice(line, 0, equal));
+                if not _property_token(name) { return _result_error("invalid-property-name"); }
+                let object = stack[len(stack) - 1]; let folded = str_lower(name);
+                if map_has(object.property_names, folded) { return _result_error("duplicate-property"); }
+                if object.property_count >= MAX_PROPERTIES_PER_OBJECT { return _result_error("too-many-properties"); }
+                if state.assignments >= MAX_ASSIGNMENTS { return _result_error("too-many-assignments"); }
+                let collected = _collect_value(lines, i, str_slice(line, equal + 1, len(line)));
+                if not collected.ok { return _result_error(collected.error); }
+                i = collected.index;
+                let parsed = _parse_value(collected.value, state);
+                if not parsed.ok { return _result_error(parsed.error); }
+                let numeric_properties = ["left","top","width","height","clientwidth","clientheight",
+                    "taborder","itemindex","min","max","position","passwordchar"];
+                for expected in numeric_properties {
+                    if folded == expected and type(parsed.value) != "number" {
+                        return _result_error("invalid-numeric-property");
+                    }
+                }
+                let boolean_properties = ["visible","enabled","readonly","checked"];
+                for expected in boolean_properties {
+                    if folded == expected and type(parsed.value) != "bool" {
+                        return _result_error("invalid-boolean-property");
+                    }
+                }
+                object.property_names[folded] = true; object.property_count = object.property_count + 1;
+                state.assignments = state.assignments + 1;
+                if str_starts_with(folded, "on") {
+                    if type(parsed.value) != "string" or not _identifier(parsed.value) {
+                        return _result_error("invalid-event-handler");
+                    }
+                    if len(stack) == 1 { state.unmapped_events = state.unmapped_events + 1; }
+                    else {
+                        let event_name = _event_name(name);
+                        if event_name == nil { state.unmapped_events = state.unmapped_events + 1; }
+                        else { object.events[event_name] = parsed.value; }
+                    }
+                } else if _sensitive_property(name) {
+                    state.external_reference_present = true;
+                } else {
+                    object.properties[folded] = parsed.value;
+                    let known = ["left","top","width","height","caption","clientwidth","clientheight",
+                        "visible","enabled","taborder","align","anchors","text","texthint","readonly","passwordchar",
+                        "lines.strings","items.strings","itemindex","checked","min","max","position"];
+                    let recognized = false; for item in known { if item == folded { recognized = true; } }
+                    if not recognized { state.unmapped_properties = state.unmapped_properties + 1; }
+                }
+            }
+            i = i + 1;
+        }
+    }
+    if len(objects) == 0 { return _result_error("root-declaration-required"); }
+    if len(stack) != 0 or not state.root_closed { return _result_error("unterminated-object"); }
+    return _canonical_document(objects, logical_name, state);
+}
+
+fn status() {
+    return map{ok:true,format:"pblang.delphi-dfm-import.status.v1",adapter:"delphi-dfm",
+        evidence:"preview",text_only:true,binary_supported:false,strict_unknown_components:true,
+        max_source_bytes:MAX_SOURCE_BYTES,max_source_chars:MAX_SOURCE_CHARS,max_lines:MAX_LINES,
+        max_objects:MAX_OBJECTS,max_depth:MAX_DEPTH,max_properties_per_object:MAX_PROPERTIES_PER_OBJECT,
+        canonical_model:"pblang.ui-document.v1",filesystem:false,network:false,process:false,
+        ffi:false,effects:false,embedded_code:false,handlers_executed:false,production_ready:false};
+}
+
+export FORMAT, MAX_SOURCE_BYTES, MAX_SOURCE_CHARS, MAX_LINES, MAX_OBJECTS, MAX_DEPTH;
+export sniff_text, import_text, status;
