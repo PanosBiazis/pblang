@@ -1,0 +1,248 @@
+// Renderer-neutral PBIDE workspace state. This module models editor data only;
+// it performs no filesystem, process, network, credential or publication effect.
+
+let FORMAT = "pbide.workspace-document.v1";
+let FILE_FORMAT = "pbide.workspace-file.v1";
+let DIAGNOSTIC_FORMAT = "pbide.workspace-diagnostic.v1";
+let MAX_TABS = 64;
+let MAX_FILE_BYTES = 1048576;
+let MAX_TOTAL_BYTES = 8388608;
+let MAX_DIAGNOSTICS_PER_FILE = 512;
+let MAX_SERIALIZED_BYTES = 10485760;
+
+fn _has(values, expected) {
+    for value in values { if value == expected { return true; } }
+    return false;
+}
+
+fn _strict_keys(value, allowed, label) {
+    if type(value) != "map" { throw "pbide workspace: " + label + " must be a map"; }
+    let keys = map_keys(value);
+    let i = 0;
+    while i < len(keys) {
+        if not _has(allowed, keys[i]) {
+            throw "pbide workspace: unknown " + label + " field " + str(keys[i]);
+        }
+        i = i + 1;
+    }
+}
+
+fn _integer(value, label, minimum, maximum) {
+    if type(value) != "number" or value != num_floor(value)
+        or value < minimum or value > maximum {
+        throw "pbide workspace: invalid " + label;
+    }
+    return value;
+}
+
+fn _boolean(value, label) {
+    if type(value) != "bool" { throw "pbide workspace: " + label + " must be boolean"; }
+    return value;
+}
+
+fn _relative_path(value) {
+    if type(value) != "string" or value == "" or len(value) > 4096 {
+        throw "pbide workspace: path must contain 1..4096 characters";
+    }
+    let normalized = str_replace_all(value, "\\", "/");
+    if str_starts_with(normalized, "/") or str_contains(normalized, ":") {
+        throw "pbide workspace: paths must be workspace-relative";
+    }
+    let parts = str_split(normalized, "/");
+    let safe = [];
+    for part in parts {
+        if part == "" or part == "." or part == ".." {
+            throw "pbide workspace: path contains an unsafe segment";
+        }
+        let i = 0;
+        while i < len(part) {
+            let code = strcharcodeat(part, i);
+            if code < 32 or code == 127 { throw "pbide workspace: path contains a control character"; }
+            i = i + 1;
+        }
+        array_push(safe, part);
+    }
+    return str_join(safe, "/");
+}
+
+fn _source(value) {
+    if type(value) != "string" { throw "pbide workspace: source must be text"; }
+    if len(str_to_bytes(value)) > MAX_FILE_BYTES { throw "pbide workspace: source byte limit exceeded"; }
+    return value;
+}
+
+fn _point(value, lines, label) {
+    _strict_keys(value, ["row", "col"], label);
+    let row = _integer(try value.row catch nil, label + " row", 0, len(lines) - 1);
+    let col = _integer(try value.col catch nil, label + " col", 0, len(lines[row]));
+    return map{row:row,col:col};
+}
+
+fn _selection(value, lines) {
+    if value == nil { return nil; }
+    _strict_keys(value, ["start", "end"], "selection");
+    return map{start:_point(try value.start catch nil, lines, "selection start"),
+        end:_point(try value.end catch nil, lines, "selection end")};
+}
+
+fn _diagnostic(value, lines) {
+    _strict_keys(value, ["format", "kind", "line", "col", "message", "code"], "diagnostic");
+    let incoming_format = try value.format catch DIAGNOSTIC_FORMAT;
+    if incoming_format != DIAGNOSTIC_FORMAT { throw "pbide workspace: unsupported diagnostic format"; }
+    let kind = str_lower(str(try value.kind catch "info"));
+    if not _has(["error", "warning", "info", "hint"], kind) {
+        throw "pbide workspace: unsupported diagnostic kind";
+    }
+    let message = try value.message catch "";
+    let code = try value.code catch "";
+    if type(message) != "string" or message == "" or len(message) > 2048 {
+        throw "pbide workspace: invalid diagnostic message";
+    }
+    if type(code) != "string" or len(code) > 128 { throw "pbide workspace: invalid diagnostic code"; }
+    return map{format:DIAGNOSTIC_FORMAT,kind:kind,
+        line:_integer(try value.line catch 1, "diagnostic line", 1, len(lines)),
+        col:_integer(try value.col catch 1, "diagnostic col", 1, len(lines[_integer(try value.line catch 1, "diagnostic line", 1, len(lines)) - 1]) + 1),
+        message:message,code:code};
+}
+
+fn document(path, text = "", options = nil) {
+    if options == nil { options = map{}; }
+    _strict_keys(options, ["dirty", "cursor", "selection", "diagnostics"], "document options");
+    let source = _source(text);
+    let lines = str_split(source, "\n");
+    let diagnostics = try options.diagnostics catch [];
+    if type(diagnostics) != "array" or len(diagnostics) > MAX_DIAGNOSTICS_PER_FILE {
+        throw "pbide workspace: diagnostics limit exceeded";
+    }
+    let normalized_diagnostics = [];
+    for diagnostic in diagnostics { array_push(normalized_diagnostics, _diagnostic(diagnostic, lines)); }
+    return map{format:FILE_FORMAT,path:_relative_path(path),text:source,digest:sha256(source),
+        dirty:_boolean(try options.dirty catch false, "dirty"),
+        cursor:_point(try options.cursor catch map{row:0,col:0}, lines, "cursor"),
+        selection:_selection(try options.selection catch nil, lines),
+        diagnostics:normalized_diagnostics};
+}
+
+fn create(tabs, active_index = 0, revision = 0) {
+    if type(tabs) != "array" or len(tabs) < 1 or len(tabs) > MAX_TABS {
+        throw "pbide workspace: tabs must contain 1.." + str(MAX_TABS) + " documents";
+    }
+    let normalized = [];
+    let paths = [];
+    let total = 0;
+    for tab in tabs {
+        if type(tab) != "map" or (try tab.format catch "") != FILE_FORMAT {
+            throw "pbide workspace: invalid document";
+        }
+        let rebuilt = document(tab.path, tab.text, map{dirty:tab.dirty,cursor:tab.cursor,
+            selection:tab.selection,diagnostics:tab.diagnostics});
+        if tab.digest != rebuilt.digest { throw "pbide workspace: source digest mismatch"; }
+        if _has(paths, rebuilt.path) { throw "pbide workspace: duplicate tab path"; }
+        array_push(paths, rebuilt.path); array_push(normalized, rebuilt);
+        total = total + len(str_to_bytes(rebuilt.text));
+        if total > MAX_TOTAL_BYTES { throw "pbide workspace: total source byte limit exceeded"; }
+    }
+    return map{format:FORMAT,revision:_integer(revision, "revision", 0, 9007199254740991),
+        tabs:normalized,active_index:_integer(active_index, "active index", 0, len(normalized) - 1),
+        total_source_bytes:total,effects:[]};
+}
+
+fn _rebuild(workspace) {
+    return create(workspace.tabs, workspace.active_index, workspace.revision);
+}
+
+fn select_tab(workspace, active_index) {
+    let out = _rebuild(workspace);
+    out.active_index = _integer(active_index, "active index", 0, len(out.tabs) - 1);
+    out.revision = out.revision + 1;
+    return out;
+}
+
+fn replace_text(workspace, path, text, cursor = nil, selection = nil) {
+    let out = _rebuild(workspace);
+    let expected = _relative_path(path);
+    let found = false;
+    let i = 0;
+    while i < len(out.tabs) {
+        let tab = out.tabs[i];
+        if tab.path == expected {
+            let options = map{dirty:true,cursor:if cursor == nil { tab.cursor } else { cursor },
+                selection:selection,diagnostics:[]};
+            out.tabs[i] = document(tab.path, text, options);
+            found = true;
+        }
+        i = i + 1;
+    }
+    if not found { throw "pbide workspace: tab not found"; }
+    out.revision = out.revision + 1;
+    return create(out.tabs, out.active_index, out.revision);
+}
+
+fn set_diagnostics(workspace, path, diagnostics) {
+    let out = _rebuild(workspace);
+    let expected = _relative_path(path);
+    let found = false;
+    let i = 0;
+    while i < len(out.tabs) {
+        let tab = out.tabs[i];
+        if tab.path == expected {
+            out.tabs[i] = document(tab.path, tab.text, map{dirty:tab.dirty,cursor:tab.cursor,
+                selection:tab.selection,diagnostics:diagnostics});
+            found = true;
+        }
+        i = i + 1;
+    }
+    if not found { throw "pbide workspace: tab not found"; }
+    out.revision = out.revision + 1;
+    return create(out.tabs, out.active_index, out.revision);
+}
+
+fn encode(workspace) {
+    let normalized = _rebuild(workspace);
+    let encoded = json_stringify(normalized);
+    if len(str_to_bytes(encoded)) > MAX_SERIALIZED_BYTES {
+        throw "pbide workspace: serialized byte limit exceeded";
+    }
+    return encoded;
+}
+
+fn decode(encoded) {
+    if type(encoded) != "string" or len(str_to_bytes(encoded)) > MAX_SERIALIZED_BYTES {
+        throw "pbide workspace: invalid serialized input";
+    }
+    let value = json_parse(encoded);
+    _strict_keys(value, ["format", "revision", "tabs", "active_index", "total_source_bytes", "effects"], "workspace");
+    if (try value.format catch "") != FORMAT { throw "pbide workspace: unsupported format"; }
+    if type(try value.effects catch nil) != "array" or len(value.effects) != 0 {
+        throw "pbide workspace: effect-bearing workspaces are forbidden";
+    }
+    let tabs = try value.tabs catch nil;
+    if type(tabs) != "array" { throw "pbide workspace: tabs must be an array"; }
+    let rebuilt_tabs = [];
+    for tab in tabs {
+        _strict_keys(tab, ["format", "path", "text", "digest", "dirty", "cursor", "selection", "diagnostics"], "document");
+        if (try tab.format catch "") != FILE_FORMAT { throw "pbide workspace: invalid document format"; }
+        let rebuilt = document(try tab.path catch nil, try tab.text catch nil,
+            map{dirty:try tab.dirty catch nil,cursor:try tab.cursor catch nil,
+                selection:try tab.selection catch nil,diagnostics:try tab.diagnostics catch nil});
+        if (try tab.digest catch "") != rebuilt.digest { throw "pbide workspace: source digest mismatch"; }
+        array_push(rebuilt_tabs, rebuilt);
+    }
+    let out = create(rebuilt_tabs, try value.active_index catch nil, try value.revision catch nil);
+    if (try value.total_source_bytes catch nil) != out.total_source_bytes {
+        throw "pbide workspace: total source byte evidence mismatch";
+    }
+    return out;
+}
+
+fn contract() {
+    return map{ok:true,format:"pbide.workspace-contract.v1",document_format:FORMAT,
+        max_tabs:MAX_TABS,max_file_bytes:MAX_FILE_BYTES,max_total_bytes:MAX_TOTAL_BYTES,
+        max_diagnostics_per_file:MAX_DIAGNOSTICS_PER_FILE,
+        relative_paths_only:true,digest_checked:true,strict_decode:true,
+        credentials:false,effects:false,production_ready:false};
+}
+
+export FORMAT, FILE_FORMAT, DIAGNOSTIC_FORMAT;
+export MAX_TABS, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_DIAGNOSTICS_PER_FILE, MAX_SERIALIZED_BYTES;
+export document, create, select_tab, replace_text, set_diagnostics, encode, decode, contract;
