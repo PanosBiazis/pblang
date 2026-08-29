@@ -4,92 +4,10 @@
 // pblang-side validator for core pblang.toml package fields.
 
 let RELEASE_CHANNEL = import("stdlib:release_channel.sapp");
-
-fn _parse_quoted_value(line) {
-    let first_q = -1;
-    let i = 0;
-    while i < len(line) {
-        if strcharcodeat(line, i) == 34 { // "
-            first_q = i;
-            break;
-        }
-        i = i + 1;
-    }
-    if first_q < 0 { return nil; }
-
-    let second_q = -1;
-    let j = first_q + 1;
-    while j < len(line) {
-        if strcharcodeat(line, j) == 34 { // "
-            second_q = j;
-            break;
-        }
-        j = j + 1;
-    }
-    if second_q <= first_q { return nil; }
-
-    let out = "";
-    let k = first_q + 1;
-    while k < second_q {
-        out = out + strfromcharcode(strcharcodeat(line, k));
-        k = k + 1;
-    }
-    return out;
-}
-
-fn _is_digits(s) {
-    if s == nil or s == "" { return false; }
-    let i = 0;
-    while i < len(s) {
-        let c = strcharcodeat(s, i);
-        if c < 48 or c > 57 { return false; }
-        i = i + 1;
-    }
-    return true;
-}
-
-fn _is_semver_basic(v) {
-    let parts = str_split(v, ".");
-    if len(parts) != 3 { return false; }
-    return _is_digits(str_trim(parts[0]))
-        and _is_digits(str_trim(parts[1]))
-        and _is_digits(str_trim(parts[2]));
-}
-
-fn _extract_quoted_after(text, prefix) {
-    if text == nil or prefix == nil { return nil; }
-    let i = 0;
-    while i < len(text) {
-        // prefix match at i
-        let ok = true;
-        let j = 0;
-        while j < len(prefix) {
-            if i + j >= len(text) {
-                return nil;
-            }
-            if strcharcodeat(text, i + j) != strcharcodeat(prefix, j) {
-                ok = false;
-                break;
-            }
-            j = j + 1;
-        }
-        if ok {
-            let start = i + len(prefix);
-            let out = "";
-            let k = start;
-            while k < len(text) {
-                if strcharcodeat(text, k) == 34 { // closing "
-                    return out;
-                }
-                out = out + strfromcharcode(strcharcodeat(text, k));
-                k = k + 1;
-            }
-            return nil;
-        }
-        i = i + 1;
-    }
-    return nil;
-}
+let SEMVER = import("stdlib:semver.sapp");
+let MAX_MANIFEST_BYTES = 1048576;
+let MAX_MANIFEST_LINES = 16384;
+let MAX_MANIFEST_LINE_CHARS = 16384;
 
 fn _lhs_before_equals(line) {
     let i = 0;
@@ -159,39 +77,116 @@ fn _detect_dep_kind(rhs) {
     return "unknown";
 }
 
-fn _find_substr(text, needle, start_at = nil) {
-    if text == nil or needle == nil { return -1; }
-    if start_at == nil { start_at = 0; }
-    if len(needle) == 0 { return start_at; }
-    let i = start_at;
-    while i + len(needle) <= len(text) {
-        let ok = true;
-        let j = 0;
-        while j < len(needle) {
-            if strcharcodeat(text, i + j) != strcharcodeat(needle, j) {
-                ok = false;
-                break;
-            }
-            j = j + 1;
-        }
-        if ok { return i; }
+fn _strip_comment(line) {
+    let out = ""; let quoted = false; let escaped = false; let i = 0;
+    while i < len(line) {
+        let c = strcharcodeat(line, i);
+        if c == 35 and not quoted { return map{ok:true,text:out}; }
+        if c == 34 and not escaped { quoted = not quoted; }
+        out = out + strfromcharcode(c);
+        if quoted and c == 92 and not escaped { escaped = true; }
+        else { escaped = false; }
         i = i + 1;
     }
-    return -1;
+    if quoted { return map{ok:false,error:"manifest contains an unterminated quoted value"}; }
+    return map{ok:true,text:out};
 }
 
-fn _extract_bool_after(text, prefix, fallback) {
-    let index = _find_substr(text, prefix, 0);
-    if index < 0 { return map{ ok:true, value:fallback }; }
-    let cursor = index + len(prefix);
-    while cursor < len(text) {
-        let c = strcharcodeat(text, cursor);
-        if c == 32 or c == 9 { cursor = cursor + 1; } else { break; }
+fn _exact_quoted(rhs) {
+    let value = str_trim(rhs);
+    if len(value) < 2 or strcharcodeat(value, 0) != 34
+       or strcharcodeat(value, len(value) - 1) != 34 { return nil; }
+    let out = ""; let i = 1;
+    while i < len(value) - 1 {
+        let c = strcharcodeat(value, i);
+        if c == 34 or c == 92 or c < 32 or c == 127 { return nil; }
+        out = out + strfromcharcode(c); i = i + 1;
     }
-    let tail = str_slice(text, cursor, len(text));
-    if str_starts_with(tail, "true") { return map{ ok:true, value:true }; }
-    if str_starts_with(tail, "false") { return map{ ok:true, value:false }; }
-    return map{ ok:false, value:fallback };
+    return out;
+}
+
+fn _valid_package_name(value) {
+    if type(value) != "string" or len(value) < 1 or len(value) > 128
+       or not regex_match(value, "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+       or value == "." or value == ".." or str_contains(value, "..") {
+        return false;
+    }
+    return true;
+}
+
+fn _scan_manifest(text) {
+    let errors = []; let package = map{}; let package_keys = map{};
+    let dependency_items = []; let dependency_keys = map{};
+    if type(text) != "string" or len(str_to_bytes(text)) > MAX_MANIFEST_BYTES
+       or str_contains(text, strfromcharcode(0)) {
+        return map{ok:false,errors:["manifest exceeds bounded UTF-8 text contract"],
+            package:package,dependency_items:dependency_items};
+    }
+    let normalized = str_replace_all(str_replace_all(text, "\r\n", "\n"), "\r", "\n");
+    let lines = str_split(normalized, "\n");
+    if len(lines) > MAX_MANIFEST_LINES {
+        return map{ok:false,errors:["manifest exceeds line limit"],
+            package:package,dependency_items:dependency_items};
+    }
+    let section = ""; let sections = map{}; let i = 0;
+    while i < len(lines) {
+        if len(lines[i]) > MAX_MANIFEST_LINE_CHARS {
+            array_push(errors, "manifest line exceeds limit"); return map{ok:false,errors:errors,
+                package:package,dependency_items:dependency_items};
+        }
+        let stripped = _strip_comment(lines[i]);
+        if not stripped.ok { array_push(errors, stripped.error); }
+        else {
+            let line = str_trim(stripped.text);
+            if line == "" { }
+            else if str_starts_with(line, "[") {
+                if not str_ends_with(line, "]") or not regex_match(line, "^\\[[A-Za-z0-9_.-]+\\]$") {
+                    array_push(errors, "manifest contains an invalid section header");
+                } else {
+                    section = str_lower(str_slice(line, 1, len(line) - 1));
+                    if map_has(sections, section) {
+                        array_push(errors, "manifest contains a duplicate section: " + section);
+                    } else { sections[section] = true; }
+                }
+            } else if section == "package" or section == "dependencies" {
+                let lhs_raw = _lhs_before_equals(line); let rhs = _rhs_after_equals(line);
+                if lhs_raw == nil or rhs == nil { array_push(errors, "manifest assignment is malformed"); }
+                else if section == "package" {
+                    let lhs = str_lower(str_trim(lhs_raw));
+                    if not regex_match(lhs, "^[a-z][a-z0-9_]*$") {
+                        array_push(errors, "[package] contains an invalid key");
+                    } else if map_has(package_keys, lhs) {
+                        array_push(errors, "[package] contains duplicate key: " + lhs);
+                    } else {
+                        package_keys[lhs] = true;
+                        if lhs == "name" or lhs == "version" or lhs == "entry" or lhs == "release_channel" {
+                            let parsed = _exact_quoted(rhs);
+                            if parsed == nil { array_push(errors, "[package]." + lhs + " must be an exact quoted string"); }
+                            else { package[lhs] = parsed; }
+                        } else if lhs == "show_release_channel" or lhs == "release_channel_in_artifact" {
+                            let bool_text = str_trim(rhs);
+                            if bool_text == "true" { package[lhs] = true; }
+                            else if bool_text == "false" { package[lhs] = false; }
+                            else { array_push(errors, "[package]." + lhs + " must be true or false"); }
+                        }
+                    }
+                } else {
+                    let name = _normalize_dep_key(lhs_raw);
+                    if name == "" { array_push(errors, "dependencies entry has empty key"); }
+                    else if map_has(dependency_keys, name) {
+                        array_push(errors, "dependencies contains duplicate key: " + name);
+                    } else {
+                        dependency_keys[name] = true; let kind = _detect_dep_kind(rhs);
+                        if kind == "unknown" { array_push(errors, "dependency '" + name + "' has unsupported spec"); }
+                        else { array_push(dependency_items, map{name:name,kind:kind}); }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return map{ok:len(errors) == 0,errors:errors,package:package,
+        dependency_items:dependency_items};
 }
 
 fn validate_manifest_text(text) {
@@ -201,71 +196,30 @@ fn validate_manifest_text(text) {
         return map{ ok: false, errors: errors };
     }
 
-    let package_name = _extract_quoted_after(text, "name = \"");
-    let package_version = _extract_quoted_after(text, "version = \"");
-    let package_entry = _extract_quoted_after(text, "entry = \"");
-    let release_channel = _extract_quoted_after(text, "release_channel = \"");
+    let scanned = _scan_manifest(text);
+    for issue in scanned.errors { array_push(errors, issue); }
+    let fields = scanned.package;
+    let package_name = try fields.name catch nil;
+    let package_version = try fields.version catch nil;
+    let package_entry = try fields.entry catch nil;
+    let release_channel = try fields.release_channel catch nil;
     if release_channel == nil { release_channel = ""; }
-    let show_release_channel = _extract_bool_after(text, "show_release_channel =", false);
-    let channel_in_artifact = _extract_bool_after(text, "release_channel_in_artifact =", false);
-
-    let dependency_items = [];
-    let deps_marker = "[dependencies]";
-    if str_contains(text, deps_marker) {
-        let deps_idx = _find_substr(text, deps_marker, 0);
-        if deps_idx >= 0 {
-            let cursor = deps_idx + len(deps_marker);
-            while cursor < len(text) {
-                while cursor < len(text) {
-                    let ch = strcharcodeat(text, cursor);
-                    if ch == 10 or ch == 13 {
-                        cursor = cursor + 1;
-                    } else {
-                        break;
-                    }
-                }
-                if cursor >= len(text) { break; }
-                let line = "";
-                while cursor < len(text) {
-                    let ch2 = strcharcodeat(text, cursor);
-                    if ch2 == 10 {
-                        break;
-                    }
-                    if ch2 != 13 {
-                        line = line + strfromcharcode(ch2);
-                    }
-                    cursor = cursor + 1;
-                }
-                let tline = str_trim(line);
-                if tline == "" or str_starts_with(tline, "#") {
-                    continue;
-                }
-                if str_starts_with(tline, "[") {
-                    break;
-                }
-                let lhs = _normalize_dep_key(_lhs_before_equals(tline));
-                let rhs = _rhs_after_equals(tline);
-                if lhs == "" {
-                    array_push(errors, "dependencies entry has empty key");
-                    continue;
-                }
-                let kind = _detect_dep_kind(rhs);
-                if kind == "unknown" {
-                    array_push(errors, "dependency '" + lhs + "' has unsupported spec");
-                } else {
-                    array_push(dependency_items, map{ name: lhs, kind: kind });
-                }
-            }
-        }
-    }
+    let show_release_channel = map{ok:true,value:try fields.show_release_channel catch false};
+    let channel_in_artifact = map{ok:true,value:try fields.release_channel_in_artifact catch false};
+    let dependency_items = scanned.dependency_items;
 
     if package_name == nil or package_name == "" {
         array_push(errors, "[package].name is required");
+    } else if not _valid_package_name(package_name) {
+        array_push(errors, "[package].name must be a safe 1..128 character package identifier");
     }
     if package_version == nil or package_version == "" {
         array_push(errors, "[package].version is required");
-    } else if not _is_semver_basic(package_version) {
-        array_push(errors, "[package].version must be basic semver: X.Y.Z");
+    } else {
+        let parsed_version = SEMVER.parse_strict(package_version);
+        if parsed_version == nil or SEMVER.format(parsed_version) != package_version {
+            array_push(errors, "[package].version must be canonical SemVer 2.0.0");
+        }
     }
     if package_entry != nil and not str_contains(package_entry, ".sapp") {
         array_push(errors, "[package].entry should point to a .sapp file");
@@ -293,6 +247,10 @@ fn validate_manifest_text(text) {
             release_channel: release_channel,
             display_version: if release.ok { release.application_version } else { package_version },
             artifact_suffix: if release.ok { release.artifact_suffix } else { "" },
+            exact_version_identity: package_version,
+            version_is_independent: true,
+            channel_changes_package_identity: false,
+            contradictory_stability: if release.ok { release.contradictory_stability } else { false },
         },
         dependency_items: dependency_items,
         dependency_count: len(dependency_items),
@@ -310,4 +268,5 @@ fn validate_manifest_file(path) {
     return validate_manifest_text(text);
 }
 
+export MAX_MANIFEST_BYTES, MAX_MANIFEST_LINES, MAX_MANIFEST_LINE_CHARS;
 export validate_manifest_text, validate_manifest_file;
