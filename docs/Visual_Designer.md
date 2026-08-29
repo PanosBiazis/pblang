@@ -283,6 +283,39 @@ in `docs/CURRENT_STATUS.md` as it ships.
 - **Multi-backend codegen** — ship Studio projects as native / web / WASM / C / CLI.
 - **`docs/pbAI.md`** — the optional in-designer AI assistant.
 
+## 12. External form interchange (preview)
+
+The shared `pblang.ui-document.v1` model is now the renderer-neutral boundary for
+external form work. `stdlib/ui_form_interchange.sapp` catalogs Delphi DFM/FMX,
+Android XML/Kotlin/Java, Qt, Unreal, Godot, Unity, Swift, web templates, XAML and
+Flutter without claiming that catalog entries are already implemented.
+
+The first real external importer is `stdlib/ui_form_delphi_dfm.sapp`:
+
+- strict UTF-8 **text DFM only**; binary `TPF0`, blobs and arbitrary expressions fail closed;
+- bounded source, line, object, nesting, property, collection and decoded-text budgets;
+- VCL form/panel/button/label/edit/memo/checkbox/radio/combo/track/progress mapping;
+- nested ownership, Delphi `#nnn` Unicode strings and bounded string lists;
+- `OnClick`/`OnChange` preserved only as inert handler identifiers, never executed;
+- paths, URLs, SQL/command/script/picture/connection values omitted and never opened;
+- unknown visual or effect-bearing component classes reject the atomic import.
+
+This adapter is deliberately **preview**, import-only and potentially lossy. Unsupported
+properties and events are counted, `production_ready` remains false, and the conversion
+planner does not mark Delphi→PBLang export executable. FMX remains a separate contract;
+its dotted geometry and runtime semantics are not accepted as DFM by accident.
+
+Run the focused correctness gates with:
+
+```
+pblang tests/semantics/ui_form_delphi_dfm_test.sapp
+pblang tests/semantics/ui_form_interchange_test.sapp
+```
+
+The reproducible parser workload is
+`examples/ui_form_delphi_dfm_benchmark/main.sapp`; it performs five warmups and reports
+nine raw samples plus median and p95 for the same validated 40-widget form.
+
 ---
 
 *pblang Studio: drag interactive elements to build desktop GUI, web, CLI, circuit,
