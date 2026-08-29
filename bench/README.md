@@ -117,9 +117,9 @@ target/release/pblang run bench/linux_process_stages.sapp --allow-all
 ```
 
 `pbide_surface_manifest_stages.sapp` correctness-gates and measures the shared
-target-aware PBIDE action/panel projection plus Web renderer compilation. It
-reports warm in-process median/p95 separately from cold process startup and
-locked-module verification.
+target-aware PBIDE action/panel projection, Web renderer compilation and strict
+digest-bound workspace decoding. It reports warm in-process median/p95
+separately from cold process startup and locked-module verification.
 
 `linux_process_stages.sapp` measures the complete warm supervised-process path,
 including generation of argv/supervisor ELF images, private-directory setup,
