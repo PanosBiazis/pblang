@@ -1,0 +1,481 @@
+// Digest-bound, fail-closed release evidence shared by AAP products.
+//
+// This module checks the structural consistency of untrusted evidence claims.
+// It deliberately performs no filesystem, cryptographic verification, signing,
+// network, process, publication, or installation effects. Its result is never
+// sufficient by itself to authorize publication or installation.
+
+let Channels = import("stdlib:release_channel.sapp");
+
+let FORMAT = "pblang.product-release-evidence.v1";
+let MAX_ARTIFACTS = 64;
+let MAX_REPORTS = 128;
+let MAX_PLATFORMS = 32;
+let MAX_CHECKS = 128;
+let MAX_BYTES = 1099511627776;
+
+fn _has(xs, value) {
+    if type(xs) != "array" { return false; }
+    for item in xs { if str(item) == str(value) { return true; } }
+    return false;
+}
+
+fn _text(value, name, limit) {
+    if type(value) != "string" or value == "" or len(value) > limit {
+        throw "product_release_evidence: " + name + " must contain 1.." + str(limit) + " characters";
+    }
+    return value;
+}
+
+fn _bool(options, name, fallback = false) {
+    let value = try options[name] catch fallback;
+    if type(value) != "bool" {
+        throw "product_release_evidence: " + name + " must be boolean";
+    }
+    return value;
+}
+
+fn _integer(value, name, minimum, maximum) {
+    if type(value) != "number" or value != num_floor(value)
+       or value < minimum or value > maximum {
+        throw "product_release_evidence: invalid " + name;
+    }
+    return value;
+}
+
+fn _hex(value, size, name) {
+    if type(value) != "string" or len(value) != size {
+        throw "product_release_evidence: " + name + " must be " + str(size) + " hexadecimal characters";
+    }
+    let out = ""; let i = 0;
+    while i < len(value) {
+        let code = strcharcodeat(value, i);
+        if code >= 65 and code <= 70 { code = code + 32; }
+        if not ((code >= 48 and code <= 57) or (code >= 97 and code <= 102)) {
+            throw "product_release_evidence: invalid hexadecimal " + name;
+        }
+        out = out + strfromcharcode(code); i = i + 1;
+    }
+    return out;
+}
+
+fn _sha256(value, name) { return _hex(value, 64, name); }
+
+fn _commit(value) {
+    if type(value) != "string" or (len(value) != 40 and len(value) != 64) {
+        throw "product_release_evidence: commit_id must be a 40 or 64 character Git object id";
+    }
+    return _hex(value, len(value), "commit_id");
+}
+
+fn _texts(values, name, maximum, allow_empty = false) {
+    if type(values) != "array" or len(values) > maximum or (not allow_empty and len(values) == 0) {
+        throw "product_release_evidence: invalid " + name;
+    }
+    let out = [];
+    for value in values {
+        let text = _text(value, name + " item", 128);
+        if _has(out, text) { throw "product_release_evidence: duplicate " + name + " item " + text; }
+        array_push(out, text);
+    }
+    return out;
+}
+
+fn _exact_fields(record, allowed, name) {
+    if type(record) != "map" { throw "product_release_evidence: invalid " + name; }
+    let keys = map_keys(record); let index = 0;
+    while index < len(keys) {
+        if not _has(allowed, keys[index]) {
+            throw "product_release_evidence: unknown " + name + " field " + str(keys[index]);
+        }
+        index = index + 1;
+    }
+    index = 0;
+    while index < len(allowed) {
+        if not map_has(record, allowed[index]) {
+            throw "product_release_evidence: missing " + name + " field " + allowed[index];
+        }
+        index = index + 1;
+    }
+    return record;
+}
+
+fn _source(record) {
+    if type(record) != "map" or (try record.format catch "") != "pblang.release-source.v1" {
+        throw "product_release_evidence: invalid source record";
+    }
+    return record;
+}
+
+fn _artifact(record) {
+    if type(record) != "map" or (try record.format catch "") != "pblang.release-artifact.v1" {
+        throw "product_release_evidence: invalid artifact record";
+    }
+    return record;
+}
+
+fn _validated_source(record) {
+    let row = _source(record);
+    _exact_fields(row, ["format", "product", "application_version", "release_channel",
+        "built_with_pblang", "source_sha256", "manifest_sha256", "lock_sha256",
+        "commit_id", "clean_tree", "reproducible_inputs", "version_is_independent"], "source");
+    let version = _text(row.application_version, "application version", 64);
+    let channel = Channels.resolve(version, map{release_channel:row.release_channel});
+    if not channel.ok or channel.release_channel != row.release_channel {
+        throw "product_release_evidence: invalid canonical source release channel";
+    }
+    if type(row.clean_tree) != "bool" or type(row.reproducible_inputs) != "bool"
+       or not (try row.version_is_independent catch false) {
+        throw "product_release_evidence: invalid source guarantees";
+    }
+    _text(row.product, "product", 128); _text(row.built_with_pblang, "built_with_pblang", 64);
+    _sha256(row.source_sha256, "source_sha256"); _sha256(row.manifest_sha256, "manifest_sha256");
+    _sha256(row.lock_sha256, "lock_sha256"); _commit(row.commit_id);
+    return row;
+}
+
+fn _validated_artifact(record, source_row) {
+    let row = _artifact(record);
+    _exact_fields(row, ["format", "name", "artifact_sha256", "byte_count", "source_sha256",
+        "application_version", "release_channel", "targets", "signed_artifact",
+        "signature_sha256", "sbom_sha256", "attestation_sha256", "install_verified",
+        "upgrade_verified", "rollback_verified", "uninstall_verified"], "artifact");
+    _text(row.name, "artifact name", 128); _sha256(row.artifact_sha256, "artifact_sha256");
+    _integer(row.byte_count, "artifact byte_count", 1, MAX_BYTES);
+    _sha256(row.source_sha256, "artifact source_sha256");
+    _text(row.application_version, "artifact version", 64);
+    let channel = Channels.resolve(row.application_version, map{release_channel:row.release_channel});
+    if not channel.ok or channel.release_channel != row.release_channel {
+        throw "product_release_evidence: invalid canonical artifact release channel";
+    }
+    _texts(row.targets, "artifact targets", MAX_PLATFORMS);
+    for field in ["signed_artifact", "install_verified", "upgrade_verified", "rollback_verified", "uninstall_verified"] {
+        if type(row[field]) != "bool" { throw "product_release_evidence: " + field + " must be boolean"; }
+    }
+    if type(row.signature_sha256) != "string" or type(row.sbom_sha256) != "string"
+       or type(row.attestation_sha256) != "string" {
+        throw "product_release_evidence: invalid artifact evidence digests";
+    }
+    if row.signed_artifact { _sha256(row.signature_sha256, "signature_sha256"); }
+    elif row.signature_sha256 != "" { throw "product_release_evidence: unsigned artifact cannot carry a signature digest"; }
+    if row.sbom_sha256 != "" { _sha256(row.sbom_sha256, "sbom_sha256"); }
+    if row.attestation_sha256 != "" { _sha256(row.attestation_sha256, "attestation_sha256"); }
+    if row.source_sha256 != source_row.source_sha256
+       or row.application_version != source_row.application_version
+       or row.release_channel != source_row.release_channel {
+        throw "product_release_evidence: artifact source/version/channel binding mismatch";
+    }
+    return row;
+}
+
+fn _validated_report(record, source_row, artifact_row) {
+    if type(record) != "map" or (try record.format catch "") != "pblang.release-test-report.v1" {
+        throw "product_release_evidence: invalid test report record";
+    }
+    _exact_fields(record, ["format", "suite", "report_sha256", "source_sha256",
+        "artifact_name", "artifact_sha256", "passed", "failed", "skipped", "platforms",
+        "complete_suite", "process_isolated", "successful"], "test report");
+    _text(record.suite, "suite", 128); _sha256(record.report_sha256, "report_sha256");
+    _sha256(record.source_sha256, "test source_sha256");
+    _text(record.artifact_name, "test artifact name", 128);
+    _sha256(record.artifact_sha256, "test artifact_sha256");
+    _integer(record.passed, "passed count", 0, 1000000000);
+    _integer(record.failed, "failed count", 0, 1000000000);
+    _integer(record.skipped, "skipped count", 0, 1000000000);
+    _texts(record.platforms, "test platforms", MAX_PLATFORMS);
+    if type(record.complete_suite) != "bool" or type(record.process_isolated) != "bool"
+       or type(record.successful) != "bool" {
+        throw "product_release_evidence: invalid test guarantees";
+    }
+    let expected_success = record.passed > 0 and record.failed == 0 and record.complete_suite;
+    if record.successful != expected_success { throw "product_release_evidence: inconsistent test success state"; }
+    if record.source_sha256 != source_row.source_sha256
+       or record.artifact_name != artifact_row.name
+       or record.artifact_sha256 != artifact_row.artifact_sha256 {
+        throw "product_release_evidence: test report release binding mismatch";
+    }
+    return record;
+}
+
+fn _validated_platform(record, source_row, artifact_row) {
+    if type(record) != "map" or (try record.format catch "") != "pblang.release-platform-evidence.v1" {
+        throw "product_release_evidence: invalid platform evidence record";
+    }
+    _exact_fields(record, ["format", "platform", "arch", "runner", "report_sha256",
+        "source_sha256", "artifact_sha256", "artifact_name", "checks", "physical",
+        "current_artifact"], "platform evidence");
+    _text(record.platform, "platform", 64); _text(record.arch, "architecture", 64);
+    _text(record.runner, "runner", 128); _text(record.artifact_name, "artifact name", 128);
+    _sha256(record.report_sha256, "platform report_sha256");
+    _sha256(record.source_sha256, "platform source_sha256");
+    _sha256(record.artifact_sha256, "platform artifact_sha256");
+    _texts(record.checks, "platform checks", MAX_CHECKS);
+    if type(record.physical) != "bool" or not (try record.current_artifact catch false) {
+        throw "product_release_evidence: invalid platform guarantees";
+    }
+    if record.source_sha256 != source_row.source_sha256
+       or record.artifact_name != artifact_row.name
+       or record.artifact_sha256 != artifact_row.artifact_sha256 {
+        throw "product_release_evidence: platform evidence is not bound to the release artifact";
+    }
+    if not _has(artifact_row.targets, record.platform + ":" + record.arch) {
+        throw "product_release_evidence: platform evidence target is absent from artifact targets";
+    }
+    return record;
+}
+
+fn target_requirement(artifact_name, platform, arch, checks) {
+    return map{format:"pblang.release-target-requirement.v1",
+        artifact_name:_text(artifact_name, "required artifact name", 128),
+        platform:_text(platform, "required platform", 64), arch:_text(arch, "required architecture", 64),
+        checks:_texts(checks, "required platform checks", MAX_CHECKS)};
+}
+
+fn _validated_requirement(record) {
+    if type(record) != "map" or (try record.format catch "") != "pblang.release-target-requirement.v1" {
+        throw "product_release_evidence: invalid target requirement";
+    }
+    _exact_fields(record, ["format", "artifact_name", "platform", "arch", "checks"], "target requirement");
+    _text(record.artifact_name, "required artifact name", 128);
+    _text(record.platform, "required platform", 64); _text(record.arch, "required architecture", 64);
+    _texts(record.checks, "required platform checks", MAX_CHECKS);
+    return record;
+}
+
+fn policy(name, revision, required_artifacts, required_suites, target_requirements) {
+    let artifacts = _texts(required_artifacts, "policy artifacts", MAX_ARTIFACTS);
+    let suites = _texts(required_suites, "policy suites", MAX_REPORTS);
+    if type(target_requirements) != "array" or len(target_requirements) == 0
+       or len(target_requirements) > MAX_REPORTS {
+        throw "product_release_evidence: policy target requirements must not be empty";
+    }
+    let targets = []; let identities = map{};
+    for row in target_requirements {
+        row = _validated_requirement(row);
+        let identity = row.artifact_name + "\n" + row.platform + "\n" + row.arch;
+        if map_has(identities, identity) { throw "product_release_evidence: duplicate policy target"; }
+        identities[identity] = true; array_push(targets, row);
+    }
+    return map{format:"pblang.release-evidence-policy.v1", name:_text(name, "policy name", 128),
+        revision:_integer(revision, "policy revision", 1, 1000000000), required_artifacts:artifacts,
+        required_suites:suites, target_requirements:targets};
+}
+
+fn _validated_policy(record) {
+    if type(record) != "map" or (try record.format catch "") != "pblang.release-evidence-policy.v1" {
+        throw "product_release_evidence: an explicit release evidence policy is required";
+    }
+    _exact_fields(record, ["format", "name", "revision", "required_artifacts",
+        "required_suites", "target_requirements"], "policy");
+    return policy(record.name, record.revision, record.required_artifacts,
+        record.required_suites, record.target_requirements);
+}
+
+fn source(product, version, release_channel, built_with_pblang, source_sha256,
+          manifest_sha256, lock_sha256, commit_id, options = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { throw "product_release_evidence: source options must be a map"; }
+    let version_text = _text(version, "application version", 64);
+    let channel_plan = Channels.resolve(version_text, map{release_channel:release_channel});
+    if not channel_plan.ok { throw "product_release_evidence: " + channel_plan.error; }
+    return map{
+        format:"pblang.release-source.v1",
+        product:_text(product, "product", 128), application_version:version_text,
+        release_channel:channel_plan.release_channel,
+        built_with_pblang:_text(built_with_pblang, "built_with_pblang", 64),
+        source_sha256:_sha256(source_sha256, "source_sha256"),
+        manifest_sha256:_sha256(manifest_sha256, "manifest_sha256"),
+        lock_sha256:_sha256(lock_sha256, "lock_sha256"), commit_id:_commit(commit_id),
+        clean_tree:_bool(options, "clean_tree"), reproducible_inputs:_bool(options, "reproducible_inputs"),
+        version_is_independent:true
+    };
+}
+
+fn test_report(source_record, artifact_record, suite, report_sha256, input_source_sha256,
+               input_artifact_sha256, passed, failed, skipped, platforms, options = nil) {
+    let source_row = _validated_source(source_record);
+    let artifact_row = _validated_artifact(artifact_record, source_row);
+    if options == nil { options = map{}; }
+    if type(options) != "map" { throw "product_release_evidence: test options must be a map"; }
+    let input_digest = _sha256(input_source_sha256, "input_source_sha256");
+    if input_digest != source_row.source_sha256 {
+        throw "product_release_evidence: test report source digest mismatch";
+    }
+    let artifact_digest = _sha256(input_artifact_sha256, "test artifact_sha256");
+    if artifact_digest != artifact_row.artifact_sha256 {
+        throw "product_release_evidence: test report artifact digest mismatch";
+    }
+    let passed_count = _integer(passed, "passed count", 0, 1000000000);
+    let failed_count = _integer(failed, "failed count", 0, 1000000000);
+    let skipped_count = _integer(skipped, "skipped count", 0, 1000000000);
+    return map{
+        format:"pblang.release-test-report.v1", suite:_text(suite, "suite", 128),
+        report_sha256:_sha256(report_sha256, "report_sha256"), source_sha256:input_digest,
+        artifact_name:artifact_row.name, artifact_sha256:artifact_digest,
+        passed:passed_count, failed:failed_count, skipped:skipped_count,
+        platforms:_texts(platforms, "test platforms", MAX_PLATFORMS),
+        complete_suite:_bool(options, "complete_suite"),
+        process_isolated:_bool(options, "process_isolated"),
+        successful:passed_count > 0 and failed_count == 0 and _bool(options, "complete_suite")
+    };
+}
+
+fn artifact(source_record, name, artifact_sha256, byte_count, source_sha256,
+            version, release_channel, targets, options = nil) {
+    let source_row = _validated_source(source_record);
+    if options == nil { options = map{}; }
+    if type(options) != "map" { throw "product_release_evidence: artifact options must be a map"; }
+    let input_digest = _sha256(source_sha256, "artifact source_sha256");
+    let version_text = _text(version, "artifact version", 64);
+    let channel = Channels.resolve(version_text, map{release_channel:release_channel});
+    if not channel.ok { throw "product_release_evidence: " + channel.error; }
+    if input_digest != source_row.source_sha256 { throw "product_release_evidence: artifact source digest mismatch"; }
+    if version_text != source_row.application_version { throw "product_release_evidence: artifact version mismatch"; }
+    if channel.release_channel != source_row.release_channel { throw "product_release_evidence: artifact channel mismatch"; }
+
+    let signed = _bool(options, "signed_artifact");
+    let signature = try options.signature_sha256 catch "";
+    if signed { signature = _sha256(signature, "signature_sha256"); }
+    elif signature != "" { throw "product_release_evidence: unsigned artifact cannot carry a signature digest"; }
+
+    let sbom = try options.sbom_sha256 catch "";
+    if sbom != "" { sbom = _sha256(sbom, "sbom_sha256"); }
+    let attestation = try options.attestation_sha256 catch "";
+    if attestation != "" { attestation = _sha256(attestation, "attestation_sha256"); }
+    return map{
+        format:"pblang.release-artifact.v1", name:_text(name, "artifact name", 128),
+        artifact_sha256:_sha256(artifact_sha256, "artifact_sha256"),
+        byte_count:_integer(byte_count, "artifact byte_count", 1, MAX_BYTES),
+        source_sha256:input_digest, application_version:version_text,
+        release_channel:channel.release_channel, targets:_texts(targets, "artifact targets", MAX_PLATFORMS),
+        signed_artifact:signed, signature_sha256:signature,
+        sbom_sha256:sbom, attestation_sha256:attestation,
+        install_verified:_bool(options, "install_verified"),
+        upgrade_verified:_bool(options, "upgrade_verified"),
+        rollback_verified:_bool(options, "rollback_verified"),
+        uninstall_verified:_bool(options, "uninstall_verified")
+    };
+}
+
+fn platform_evidence(source_record, artifact_record, platform, arch, runner,
+                     report_sha256, artifact_sha256, checks, options = nil) {
+    let source_row = _validated_source(source_record); let artifact_row = _validated_artifact(artifact_record, source_row);
+    if options == nil { options = map{}; }
+    if type(options) != "map" { throw "product_release_evidence: platform options must be a map"; }
+    if artifact_row.source_sha256 != source_row.source_sha256 {
+        throw "product_release_evidence: platform artifact source mismatch";
+    }
+    let digest = _sha256(artifact_sha256, "platform artifact_sha256");
+    if digest != artifact_row.artifact_sha256 {
+        throw "product_release_evidence: platform artifact digest mismatch";
+    }
+    return map{
+        format:"pblang.release-platform-evidence.v1",
+        platform:_text(platform, "platform", 64), arch:_text(arch, "architecture", 64),
+        runner:_text(runner, "runner", 128), report_sha256:_sha256(report_sha256, "platform report_sha256"),
+        source_sha256:source_row.source_sha256, artifact_sha256:digest,
+        artifact_name:artifact_row.name, checks:_texts(checks, "platform checks", MAX_CHECKS),
+        physical:_bool(options, "physical"), current_artifact:true
+    };
+}
+
+fn evaluate(source_record, evidence_policy, artifacts, reports, platform_rows) {
+    let source_row = _validated_source(source_record);
+    let selected_policy = _validated_policy(evidence_policy);
+    if type(artifacts) != "array" or len(artifacts) == 0 or len(artifacts) > MAX_ARTIFACTS {
+        throw "product_release_evidence: invalid artifacts";
+    }
+    if type(reports) != "array" or len(reports) == 0 or len(reports) > MAX_REPORTS {
+        throw "product_release_evidence: invalid test reports";
+    }
+    if type(platform_rows) != "array" or len(platform_rows) > MAX_REPORTS {
+        throw "product_release_evidence: invalid platform evidence";
+    }
+    let blockers = []; let artifact_names = map{}; let artifact_rows = map{};
+    let suites = map{}; let platform_identities = map{}; let platform_rows_by_identity = map{};
+
+    if not source_row.clean_tree { array_push(blockers, "source tree is not clean"); }
+    if not source_row.reproducible_inputs { array_push(blockers, "source inputs are not reproducibly locked"); }
+
+    for row in artifacts {
+        let artifact_row = _validated_artifact(row, source_row);
+        if map_has(artifact_names, artifact_row.name) { throw "product_release_evidence: duplicate artifact " + artifact_row.name; }
+        artifact_names[artifact_row.name] = true; artifact_rows[artifact_row.name] = artifact_row;
+        if not artifact_row.signed_artifact { array_push(blockers, artifact_row.name + ": unsigned artifact"); }
+        if artifact_row.sbom_sha256 == "" { array_push(blockers, artifact_row.name + ": missing SBOM digest"); }
+        if artifact_row.attestation_sha256 == "" { array_push(blockers, artifact_row.name + ": missing provenance attestation digest"); }
+        if not artifact_row.install_verified { array_push(blockers, artifact_row.name + ": install not verified"); }
+        if not artifact_row.upgrade_verified { array_push(blockers, artifact_row.name + ": upgrade not verified"); }
+        if not artifact_row.rollback_verified { array_push(blockers, artifact_row.name + ": rollback not verified"); }
+        if not artifact_row.uninstall_verified { array_push(blockers, artifact_row.name + ": uninstall not verified"); }
+    }
+
+    for row in reports {
+        if type(row) != "map" { throw "product_release_evidence: invalid test report record"; }
+        let artifact_name = try row.artifact_name catch "";
+        if not map_has(artifact_rows, artifact_name) {
+            throw "product_release_evidence: test report artifact is outside release set";
+        }
+        row = _validated_report(row, source_row, artifact_rows[artifact_name]);
+        if map_has(suites, row.suite) { throw "product_release_evidence: duplicate test suite " + row.suite; }
+        suites[row.suite] = true;
+        if not row.complete_suite { array_push(blockers, row.suite + ": incomplete suite"); }
+        if row.failed > 0 or row.passed == 0 { array_push(blockers, row.suite + ": tests did not pass"); }
+        if not row.process_isolated { array_push(blockers, row.suite + ": process isolation not evidenced"); }
+    }
+
+    for row in platform_rows {
+        if type(row) != "map" { throw "product_release_evidence: invalid platform evidence record"; }
+        let artifact_name = try row.artifact_name catch "";
+        if not map_has(artifact_rows, artifact_name) {
+            throw "product_release_evidence: platform artifact is outside release set";
+        }
+        row = _validated_platform(row, source_row, artifact_rows[artifact_name]);
+        let identity = row.artifact_name + "\n" + row.platform + "\n" + row.arch;
+        if map_has(platform_identities, identity) {
+            throw "product_release_evidence: duplicate platform evidence identity";
+        }
+        platform_identities[identity] = true; platform_rows_by_identity[identity] = row;
+        if not row.physical { array_push(blockers, row.platform + ": physical evidence required"); }
+    }
+
+    for name in selected_policy.required_artifacts {
+        if not map_has(artifact_names, name) { array_push(blockers, name + ": required artifact missing"); }
+    }
+    for suite in selected_policy.required_suites {
+        if not map_has(suites, suite) { array_push(blockers, suite + ": required suite missing"); }
+    }
+    for requirement in selected_policy.target_requirements {
+        if not map_has(artifact_rows, requirement.artifact_name) {
+            array_push(blockers, requirement.artifact_name + ": policy artifact missing");
+        } elif not _has(artifact_rows[requirement.artifact_name].targets,
+                        requirement.platform + ":" + requirement.arch) {
+            array_push(blockers, requirement.artifact_name + ": required target absent from artifact");
+        }
+        if not map_has(platform_rows_by_identity,
+                requirement.artifact_name + "\n" + requirement.platform + "\n" + requirement.arch) {
+            array_push(blockers, requirement.platform + ":" + requirement.arch + ": missing platform evidence");
+        } else {
+            for check in requirement.checks {
+                if not _has(platform_rows_by_identity[
+                        requirement.artifact_name + "\n" + requirement.platform + "\n" + requirement.arch].checks, check) {
+                    array_push(blockers, requirement.platform + ":" + requirement.arch + ": missing check " + check);
+                }
+            }
+        }
+    }
+    return map{
+        ok:len(blockers) == 0, format:FORMAT, product:source_row.product,
+        application_version:source_row.application_version, release_channel:source_row.release_channel,
+        source_sha256:source_row.source_sha256, artifact_count:len(artifacts),
+        test_report_count:len(reports), platform_evidence_count:len(platform_rows),
+        policy_name:selected_policy.name, policy_revision:selected_policy.revision,
+        blockers:blockers, structurally_complete:len(blockers) == 0,
+        trust_verified:false, production_ready:false,
+        authorization_scope:"consistency-only; never publish or install from this result"
+    };
+}
+
+export FORMAT, MAX_ARTIFACTS, MAX_REPORTS, MAX_PLATFORMS, MAX_CHECKS;
+export source, artifact, test_report, platform_evidence;
+export target_requirement, policy, evaluate;
