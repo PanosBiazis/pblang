@@ -112,8 +112,14 @@ taskset -c 3 target/release/pblang run bench/app_facade_stages.sapp --allow-all
 taskset -c 3 target/release/pblang run bench/polyglot_control_plane_stages.sapp --allow-all
 taskset -c 3 target/release/pblang run bench/ecosystem_vertical_stages.sapp --allow-all
 taskset -c 3 target/release/pblang run bench/stdlib_hotpaths_stages.sapp --allow-all
+target/release/pblang run bench/pbide_surface_manifest_stages.sapp --allow-all
 target/release/pblang run bench/linux_process_stages.sapp --allow-all
 ```
+
+`pbide_surface_manifest_stages.sapp` correctness-gates and measures the shared
+target-aware PBIDE action/panel projection plus Web renderer compilation. It
+reports warm in-process median/p95 separately from cold process startup and
+locked-module verification.
 
 `linux_process_stages.sapp` measures the complete warm supervised-process path,
 including generation of argv/supervisor ELF images, private-directory setup,
