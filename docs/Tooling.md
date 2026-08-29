@@ -747,3 +747,12 @@ The protocol and responsive Web/native/Android status model are portable. The
 current live adapter is Linux-only and requires `--allow-ffi`; remote TLS,
 authentication, authorization, discovery and multi-client service operation
 remain separate higher-level responsibilities.
+# Digest-bound product release evidence
+
+`stdlib/product_release_evidence.sapp` provides a PBLang-only, effect-free consistency contract for untrusted release-evidence claims. It binds a source snapshot to its application version and channel, test reports, built artifacts, claimed signatures, SBOMs, provenance attestations, lifecycle checks, and current physical-platform reports through exact SHA-256 identities. A separate, nonempty policy owns the required artifact names, suites, target architectures and checks, so evidence cannot lower its own acceptance requirements.
+
+The evaluator fails closed on version/channel/source drift, stale device reports, incomplete or failing suites, missing claimed signing/provenance, unverified install/upgrade/rollback/uninstall paths, and missing policy coverage. It does not read bytes, verify signatures or trusted identities, sign, publish, install, or invent evidence. Its strongest result is therefore `structurally_complete`; `trust_verified` and `production_ready` are always false. A future trusted orchestrator must independently hash real bytes, verify scoped publisher/verifier signatures and enforce expiry/rollback state before authorizing any external effect.
+
+# Canonical UI document
+
+`stdlib/ui_document.sapp` owns the renderer-neutral `pblang.ui-document.v1` contract referenced by PBLang, PBIDE and the form-interchange registry. It bounds widgets and nested property data, requires unique IDs and explicit parent references, and accepts only inert event-handler identifiers. It never embeds or executes source code and grants no renderer, filesystem, network or platform effect. `gui_parse.parse_document()` now upgrades strict PBLang GUI imports into this common validation boundary; Delphi/Qt/Web/Android importers can target the same document in later isolated adapters.
