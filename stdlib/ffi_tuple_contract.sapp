@@ -5,8 +5,12 @@
 
 let FORMAT = "pblang.ffi-tuple.v1";
 let REGISTRY_FORMAT = "pblang.ffi-tuple-registry.v1";
+let REQUEST_FORMAT = "pblang.ffi-admission-request.v1";
+let ADMISSION_FORMAT = "pblang.ffi-admission.v1";
 let MAX_METHODS = 256;
 let MAX_TEXT = 128;
+let MAX_SAFE_INTEGER = 9007199254740991;
+let F32_MAX = (2 - num_pow(2, 0 - 23)) * num_pow(2, 127);
 
 fn _contains(values, target) {
     for value in values { if value == target { return true; } }
@@ -14,8 +18,9 @@ fn _contains(values, target) {
 }
 
 fn _exact_fields(value, expected) {
-    return type(value) == "map"
-        and array_sort(map_keys(value)) == array_sort(expected);
+    if type(value) != "map" or len(value) != len(expected) { return false; }
+    for field in expected { if not map_has(value, field) { return false; } }
+    return true;
 }
 
 fn _token(value, pattern) {
@@ -26,6 +31,11 @@ fn _token(value, pattern) {
 fn _bounded_integer(value, low, high) {
     return type(value) == "number" and value == num_floor(value)
         and value >= low and value <= high;
+}
+
+fn _finite_number(value) {
+    let same = value;
+    return type(value) == "number" and value == same and value - same == 0;
 }
 
 fn _signature(value) {
@@ -96,6 +106,41 @@ fn _canonical(row) {
         strfromcharcode(0));
 }
 
+fn _signature_arguments(signature) {
+    let left = str_split(signature, "->")[0];
+    return if left == "" { [] } else { str_split(left, ",") };
+}
+
+fn _argument_token(value, expected) {
+    if expected == "bool" {
+        if type(value) != "bool" { return nil; }
+        return if value { "bool:1" } else { "bool:0" };
+    }
+    if not _finite_number(value) { return nil; }
+    if expected == "i32" {
+        if not _bounded_integer(value, -2147483648, 2147483647) { return nil; }
+        return "i32:" + str(value);
+    }
+    if expected == "i64" {
+        if not _bounded_integer(value, 0 - MAX_SAFE_INTEGER, MAX_SAFE_INTEGER) { return nil; }
+        return "i64:" + str(value);
+    }
+    if expected == "f32" and num_abs(value) > F32_MAX { return nil; }
+    if expected != "f32" and expected != "f64" { return nil; }
+    if value == 0 { return expected + ":0"; }
+    return expected + ":" + str(value);
+}
+
+fn _admission_error(reason) {
+    return map{ ok: false, format: ADMISSION_FORMAT, error: reason,
+        authorizes_execution: false, grants_capability: false,
+        loads_libraries: false, calls_symbols: false,
+        runtime_signature_tuple_enforced: false,
+        raw_ffi_builtin_bypass_blocked: false,
+        immutable_library_identity_enforced: false,
+        production_execution_ready: false };
+}
+
 fn build(rows) {
     if type(rows) != "array" or len(rows) < 1 or len(rows) > MAX_METHODS {
         return map{ ok: false, format: REGISTRY_FORMAT, error: "invalid-method-count" };
@@ -127,6 +172,88 @@ fn build(rows) {
         production_execution_ready: false };
 }
 
+// Validate a fixed-method request without returning caller-owned values or
+// granting execution. A future external broker may consume the digests only
+// after independently enforcing runtime identity and raw-FFI isolation.
+fn admit(rows, request, target) {
+    if not _exact_fields(request, ["format", "registry_sha256", "method_id", "args"]) {
+        return _admission_error("exact-request-schema-required");
+    }
+    if not _exact_fields(target, ["platform", "architecture"]) {
+        return _admission_error("exact-target-schema-required");
+    }
+    if request.format != REQUEST_FORMAT {
+        return _admission_error("request-format-mismatch");
+    }
+    if type(request.registry_sha256) != "string"
+        or not regex_match(request.registry_sha256, "^[0-9a-f]{64}$") {
+        return _admission_error("invalid-request-registry-digest");
+    }
+    if not _token(request.method_id, "^[a-z][a-z0-9._-]{2,63}$") {
+        return _admission_error("invalid-request-method-id");
+    }
+    if type(request.args) != "array" or len(request.args) > 4 {
+        return _admission_error("invalid-request-arguments");
+    }
+    if not _contains(["linux", "macos", "windows"], target.platform)
+        or not _contains(["x86_64", "aarch64"], target.architecture) {
+        return _admission_error("unsupported-target");
+    }
+
+    let registry = build(rows);
+    if not registry.ok { return _admission_error("invalid-registry:" + registry.error); }
+    if request.registry_sha256 != registry.registry_sha256 {
+        return _admission_error("registry-digest-mismatch");
+    }
+    let descriptor = nil;
+    for row in rows {
+        if row.method_id == request.method_id { descriptor = row; }
+    }
+    if descriptor == nil { return _admission_error("unknown-method-id"); }
+    if descriptor.platform != target.platform or descriptor.architecture != target.architecture {
+        return _admission_error("target-tuple-mismatch");
+    }
+
+    let expected = _signature_arguments(descriptor.signature);
+    if len(request.args) != len(expected) or len(request.args) != descriptor.max_args {
+        return _admission_error("argument-arity-mismatch");
+    }
+    let canonical_args = [];
+    for i len(expected) {
+        let token = _argument_token(request.args[i], expected[i]);
+        if token == nil { return _admission_error("argument-type-or-range-mismatch"); }
+        array_push(canonical_args, token);
+    }
+    let separator = strfromcharcode(0);
+    let canonical_argument_bytes = len(str_to_bytes(str_join(canonical_args, separator)));
+    if canonical_argument_bytes > descriptor.max_input_bytes {
+        return _admission_error("canonical-argument-byte-bound-exceeded");
+    }
+    let canonical_request = str_join([request.format, request.registry_sha256,
+        request.method_id, target.platform, target.architecture,
+        str_join(canonical_args, separator)], separator);
+    return map{ ok: true, format: ADMISSION_FORMAT,
+        request_sha256: sha256(canonical_request),
+        descriptor_sha256: sha256(_canonical(descriptor)),
+        registry_sha256: registry.registry_sha256,
+        method_id: descriptor.method_id, platform: descriptor.platform,
+        architecture: descriptor.architecture, argument_count: len(expected),
+        canonical_argument_bytes: canonical_argument_bytes,
+        exact_request_schema: true, exact_target_schema: true,
+        registry_revalidated: true, scalar_arguments_validated: true,
+        canonical_input_bound_enforced: true,
+        native_abi_input_bound_enforced: false,
+        native_abi_output_bound_enforced: false,
+        f32_runtime_rounding_verified: false,
+        target_claim_only: true, target_runtime_verified: false,
+        caller_values_returned: false, authorizes_execution: false,
+        grants_capability: false, loads_libraries: false, calls_symbols: false,
+        runtime_signature_tuple_enforced: false,
+        raw_ffi_builtin_bypass_blocked: false,
+        immutable_library_identity_enforced: false,
+        production_execution_ready: false };
+}
+
 fn readiness(registry) {
     let valid = type(registry) == "map" and (try registry.ok catch false)
         and (try registry.format catch "") == REGISTRY_FORMAT
@@ -142,4 +269,5 @@ fn readiness(registry) {
             else { "invalid-contract-registry" } };
 }
 
-export FORMAT, REGISTRY_FORMAT, validate, build, readiness;
+export FORMAT, REGISTRY_FORMAT, REQUEST_FORMAT, ADMISSION_FORMAT,
+    validate, build, admit, readiness;

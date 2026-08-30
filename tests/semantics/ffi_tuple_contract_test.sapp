@@ -7,6 +7,24 @@ fn rejected(row, reason) {
     require(not result.ok and result.error == reason, reason);
 }
 
+fn request(registry, values = nil) {
+    if values == nil { values = [7, 8]; }
+    return map{ format: FFI.REQUEST_FORMAT, registry_sha256: registry.registry_sha256,
+        method_id: "math.add", args: values };
+}
+
+fn target() { return map{ platform: "linux", architecture: "x86_64" }; }
+fn divide(a, b) { return a / b; }
+
+fn scalar_admission(signature, value, method_id) {
+    let row = base(); row.signature = signature; row.max_args = 1;
+    row.method_id = method_id; row.symbol = "pb_scalar_probe" + str(len(method_id));
+    let scalar_registry = FFI.build([row]);
+    let scalar_request = map{ format: FFI.REQUEST_FORMAT,
+        registry_sha256: scalar_registry.registry_sha256, method_id: method_id, args: [value] };
+    return FFI.admit([row], scalar_request, target());
+}
+
 fn base() {
     return map{ format: FFI.FORMAT, method_id: "math.add", library_id: "math.fixed",
         library_sha256: str_repeat("a", 64), symbol: "pb_math_add",
@@ -27,6 +45,89 @@ require(ready.contract_shape_valid and not ready.runtime_signature_tuple_enforce
     and not ready.immutable_library_identity_enforced
     and not ready.production_execution_ready,
     "raw FFI bypass keeps runtime readiness false");
+
+let admitted = FFI.admit([first], request(registry), target());
+require(admitted.ok and admitted.exact_request_schema and admitted.exact_target_schema
+    and admitted.registry_revalidated and admitted.scalar_arguments_validated
+    and admitted.canonical_input_bound_enforced
+    and not admitted.native_abi_input_bound_enforced
+    and not admitted.native_abi_output_bound_enforced
+    and not admitted.f32_runtime_rounding_verified
+    and admitted.target_claim_only and not admitted.target_runtime_verified
+    and not admitted.caller_values_returned and not admitted.authorizes_execution
+    and not admitted.grants_capability and not admitted.loads_libraries
+    and not admitted.calls_symbols and not admitted.runtime_signature_tuple_enforced
+    and not admitted.raw_ffi_builtin_bypass_blocked
+    and not admitted.immutable_library_identity_enforced
+    and not admitted.production_execution_ready,
+    "admission is exact, effect-free metadata rather than FFI authority");
+require(regex_match(admitted.request_sha256, "^[0-9a-f]{64}$")
+    and regex_match(admitted.descriptor_sha256, "^[0-9a-f]{64}$"),
+    "admission binds canonical request and descriptor digests");
+
+let original_args = [7, 8];
+let stable_request = request(registry, original_args);
+let stable = FFI.admit([first], stable_request, target());
+original_args[0] = 999;
+stable_request.method_id = "math.changed";
+first.symbol = "caller_mutated_symbol";
+require(stable.ok and stable.method_id == "math.add"
+    and stable.request_sha256 == admitted.request_sha256
+    and stable.descriptor_sha256 == admitted.descriptor_sha256,
+    "admission result retains no mutable caller values");
+first = base(); registry = FFI.build([first]);
+
+let forged_digest = request(registry); forged_digest.registry_sha256 = str_repeat("b", 64);
+require(FFI.admit([first], forged_digest, target()).error == "registry-digest-mismatch",
+    "forged registry digest fails closed");
+let forged_flag = request(registry); forged_flag.authorizes_execution = true;
+require(FFI.admit([first], forged_flag, target()).error == "exact-request-schema-required",
+    "forged authority flag fails the exact request schema");
+let extra_target = target(); extra_target.runtime = "untrusted";
+require(FFI.admit([first], request(registry), extra_target).error == "exact-target-schema-required",
+    "extra target claims fail the exact target schema");
+let wrong_target = target(); wrong_target.architecture = "aarch64";
+require(FFI.admit([first], request(registry), wrong_target).error == "target-tuple-mismatch",
+    "target must match the registered platform tuple");
+require(FFI.admit([first], request(registry, [7]), target()).error == "argument-arity-mismatch",
+    "wrong argument arity fails closed");
+require(FFI.admit([first], request(registry, ["7", 8]), target()).error
+    == "argument-type-or-range-mismatch", "wrong scalar type fails closed");
+require(FFI.admit([first], request(registry, [divide(0, 0), 8]), target()).error
+    == "argument-type-or-range-mismatch", "NaN argument fails closed");
+require(FFI.admit([first], request(registry, [divide(1, 0), 8]), target()).error
+    == "argument-type-or-range-mismatch", "infinite argument fails closed");
+require(FFI.admit([first], request(registry, [9007199254740992, 8]), target()).error
+    == "argument-type-or-range-mismatch", "inexact i64 argument fails closed");
+
+let byte_limited = base(); byte_limited.max_input_bytes = 10;
+let byte_registry = FFI.build([byte_limited]);
+require(FFI.admit([byte_limited], request(byte_registry), target()).error
+    == "canonical-argument-byte-bound-exceeded",
+    "canonical argument input bytes enforce an undersized descriptor bound");
+byte_limited.max_input_bytes = 11; byte_registry = FFI.build([byte_limited]);
+require(FFI.admit([byte_limited], request(byte_registry), target()).canonical_argument_bytes == 11,
+    "canonical argument input bytes accept the exact boundary");
+byte_limited.max_input_bytes = 0; byte_registry = FFI.build([byte_limited]);
+require(FFI.admit([byte_limited], request(byte_registry), target()).error
+    == "canonical-argument-byte-bound-exceeded", "zero input bytes reject non-empty arguments");
+
+let zero_args = base(); zero_args.signature = "->void"; zero_args.max_args = 0;
+zero_args.max_input_bytes = 0; zero_args.method_id = "probe.zero"; zero_args.symbol = "pb_probe_zero";
+let zero_registry = FFI.build([zero_args]);
+let zero_request = map{ format: FFI.REQUEST_FORMAT,
+    registry_sha256: zero_registry.registry_sha256, method_id: "probe.zero", args: [] };
+let zero_admitted = FFI.admit([zero_args], zero_request, target());
+require(zero_admitted.ok and zero_admitted.argument_count == 0
+    and zero_admitted.canonical_argument_bytes == 0, "zero-argument tuple has zero input bytes");
+
+require(scalar_admission("bool->bool", true, "probe.bool").ok, "bool scalar admitted");
+require(scalar_admission("i32->i32", -2147483648, "probe.i32").ok, "i32 boundary admitted");
+require(scalar_admission("f32->f32", 1.25, "probe.f32").ok, "bounded f32 admitted");
+require(scalar_admission("f64->f64", 1.25, "probe.f64").ok, "finite f64 admitted");
+let f32_overflow = num_pow(10, 38) * 3.5;
+require(scalar_admission("f32->f32", f32_overflow, "probe.f32-overflow").error
+    == "argument-type-or-range-mismatch", "f32 overflow fails before native conversion");
 
 let reordered = base(); reordered.method_id = "alpha.sum";
 let second = base(); second.method_id = "zeta.sum"; second.symbol = "pb_math_sum";
@@ -53,5 +154,12 @@ require(not tuple_duplicate.ok and tuple_duplicate.error == "duplicate-ffi-tuple
     "duplicate tuples fail closed even under another method ID");
 let confusable = base(); confusable.method_id = "math.\u0430dd";
 rejected(confusable, "invalid-method-id");
+let nul = base(); nul.method_id = "math" + strfromcharcode(0) + "add";
+rejected(nul, "invalid-method-id");
+
+let huge = map{}; let huge_i = 0;
+while huge_i < 20000 { huge["untrusted_" + str(huge_i)] = true; huge_i = huge_i + 1; }
+require(FFI.validate(huge).error == "exact-schema-required",
+    "huge attacker map is rejected before key sorting or enumeration");
 
 print "ffi_tuple_contract_pass";
