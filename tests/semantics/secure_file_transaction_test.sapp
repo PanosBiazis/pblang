@@ -1,0 +1,148 @@
+let Secure = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn require(value, message) { if not value { throw "FAIL secure_file_transaction: " + message; } }
+
+if platform() == "linux" {
+    let suffix = str_slice(SHA256.sha256_hex(str(now_ms()) + str(random_bytes(16))), 0, 24);
+    let root = "/tmp/pblang-private-transaction-" + suffix;
+    let outside = "/tmp/pblang-private-transaction-outside-" + suffix;
+    let created = Secure.create_private_directory_new(root);
+    require(created.ok and created.mode == "700", "transaction root is newly created and private");
+
+    let target = root + "/state.bin";
+    let missing = map{kind:"missing",algorithm:"none",sha256:""};
+    let first_bytes = str_to_bytes("first-state");
+    let first = Secure.private_compare_and_swap(target, missing, first_bytes, 1024, 1000);
+    require(first.ok and first.published and first.readback_verified
+        and first.digest_algorithm == Secure.RAW_SHA256_ALGORITHM
+        and not first.retry_safe and first.durability_verified,
+        "missing-to-present CAS is durable and read back before success");
+    let duplicate = Secure.private_compare_and_swap(target, missing,
+        str_to_bytes("must-not-win"), 1024, 1000);
+    require(not duplicate.ok and duplicate.retry_safe
+        and Secure.read_text(target, 64, true).text == "first-state",
+        "a stale missing expectation cannot replace existing state");
+
+    let expected = map{kind:"present",algorithm:Secure.RAW_SHA256_ALGORITHM,
+        sha256:SHA256.sha256_hex_bytes(first_bytes)};
+    let second_bytes = str_to_bytes("second-state");
+    let replaced = Secure.private_compare_and_swap(target, expected, second_bytes, 1024, 1000);
+    require(replaced.ok and replaced.readback_verified
+        and Secure.read_text(target, 64, true).text == "second-state",
+        "matching raw-byte digest permits exactly one cooperative replacement");
+    let stale = Secure.private_compare_and_swap(target, expected,
+        str_to_bytes("third-state"), 1024, 1000);
+    require(not stale.ok and stale.retry_safe
+        and Secure.read_text(target, 64, true).text == "second-state",
+        "stale present digest fails without changing the published value");
+    let algorithm_swap = map{kind:"present",algorithm:"sha256(base64(bytes))",
+        sha256:SHA256.sha256_hex_bytes(second_bytes)};
+    require(not Secure.private_compare_and_swap(target, algorithm_swap,
+        str_to_bytes("no"), 1024, 1000).ok,
+        "algorithm substitution cannot reinterpret a digest");
+    require(not Secure.private_compare_and_swap(target,
+        map{kind:"present",algorithm:Secure.RAW_SHA256_ALGORITHM,sha256:str_repeat("0", 64)},
+        str_to_bytes("no"), 1024, 1000).ok,
+        "wrong digest cannot change the target");
+    require(not Secure.private_compare_and_swap(target,
+        map{kind:"present",algorithm:Secure.RAW_SHA256_ALGORITHM,
+            sha256:SHA256.sha256_hex_bytes(second_bytes)},
+        str_to_bytes(str_repeat("x", 65)), 64, 1000).ok,
+        "replacement size is bounded before publication");
+    for invalid_bytes in [[-1], [256], [1.5], ["1"]] {
+        let invalid_target = root + "/invalid-" + str(len(invalid_bytes)) + "-" + str(invalid_bytes[0]);
+        require(not Secure.private_compare_and_swap(invalid_target, missing,
+            invalid_bytes, 64, 1000).ok
+            and not (try fs_exists(invalid_target) catch false)
+            and not (try fs_exists(invalid_target + ".lock") catch false),
+            "invalid byte arrays are rejected before lock or publication");
+    }
+
+    let lock_victim = outside + "-lock-victim";
+    fs_write(lock_victim, "lock-victim");
+    let lock_mode_before = proc_spawn_wait("/usr/bin/stat", ["-c", "%a|%s", lock_victim]);
+    let poisoned_target = root + "/poisoned.bin";
+    let poisoned_lock = proc_spawn_wait("/bin/ln", [lock_victim, poisoned_target + ".lock"]);
+    require(poisoned_lock.exit_code == 0, "hard-link lock attack fixture is available");
+    let poisoned = Secure.private_compare_and_swap(poisoned_target, missing,
+        str_to_bytes("must-not-publish"), 64, 1000);
+    let lock_mode_after = proc_spawn_wait("/usr/bin/stat", ["-c", "%a|%s", lock_victim]);
+    require(not poisoned.ok and not (try fs_exists(poisoned_target) catch false)
+        and lock_mode_before.exit_code == 0 and lock_mode_after.exit_code == 0
+        and str_trim(lock_mode_before.stdout) == str_trim(lock_mode_after.stdout)
+        and fs_read(lock_victim) == "lock-victim",
+        "a preseeded hard-link lock is rejected without chmod or content mutation");
+
+    fs_write(outside, "outside");
+    let linked_path = root + "/linked.bin";
+    let linked = proc_spawn_wait("/bin/ln", [outside, linked_path]);
+    require(linked.exit_code == 0, "hard-link target attack fixture is available");
+    let linked_expected = map{kind:"present",algorithm:Secure.RAW_SHA256_ALGORITHM,
+        sha256:SHA256.sha256_hex("outside")};
+    require(not Secure.private_compare_and_swap(linked_path, linked_expected,
+        str_to_bytes("changed"), 64, 1000).ok and fs_read(outside) == "outside",
+        "multi-link targets are rejected without modifying an outside inode");
+    let symlink_path = root + "/symlink.bin";
+    let symlinked = proc_spawn_wait("/bin/ln", ["-s", outside, symlink_path]);
+    require(symlinked.exit_code == 0, "symlink target attack fixture is available");
+    require(not Secure.private_compare_and_swap(symlink_path,
+        map{kind:"present",algorithm:Secure.RAW_SHA256_ALGORITHM,
+            sha256:SHA256.sha256_hex("outside")}, str_to_bytes("changed"), 64, 1000).ok
+        and fs_read(outside) == "outside",
+        "symlink targets are rejected without following them");
+
+    let nonce = str_repeat("a", 64); let request_sha = str_repeat("b", 64);
+    let consumed = Secure.consume_nonce_once(root, nonce, request_sha, 1000);
+    require(consumed.ok and consumed.consumed and consumed.at_most_once
+        and consumed.nonce_burned_before_effect and consumed.receipt_verified
+        and not consumed.retry_safe,
+        "nonce receipt is durably burned before any target effect");
+    // Simulate a crash or denial after admission by deliberately performing no
+    // target effect. A retry must still fail closed because the nonce is spent.
+    let replay = Secure.consume_nonce_once(root, nonce, request_sha, 1000);
+    require(not replay.ok and replay.consumed and replay.published and not replay.retry_safe,
+        "a post-admission failure cannot replay the same nonce");
+    require(not Secure.consume_nonce_once(root, "short", request_sha, 1000).ok,
+        "malformed nonces are rejected before touching state");
+
+    let forged_nonce = str_repeat("c", 64);
+    let forged_name = "nonce-" + SHA256.sha256_hex(forged_nonce) + ".json";
+    require(Secure.write_text_new_exclusive(root + "/" + forged_name,
+        "forged-receipt", true, true).ok, "malformed nonce receipt fixture is published privately");
+    let forged_result = Secure.consume_nonce_once(root, forged_nonce, request_sha, 1000);
+    require(not forged_result.ok and not forged_result.consumed
+        and not forged_result.published and forged_result.evidence_indeterminate
+        and forged_result.namespace_occupied and not forged_result.retry_safe,
+        "occupied malformed receipt denies replay without claiming durable consumption evidence");
+
+    let concurrent_nonce = str_repeat("d", 64);
+    let first_nonce = spawn(fn() {
+        let S = import("stdlib:secure_file.sapp");
+        return S.consume_nonce_once(root, concurrent_nonce, request_sha, 2000);
+    });
+    let second_nonce = spawn(fn() {
+        let S = import("stdlib:secure_file.sapp");
+        return S.consume_nonce_once(root, concurrent_nonce, request_sha, 2000);
+    });
+    let first_nonce_result = join(first_nonce); let second_nonce_result = join(second_nonce);
+    require((first_nonce_result.ok and not second_nonce_result.ok and second_nonce_result.consumed)
+        or (second_nonce_result.ok and not first_nonce_result.ok and first_nonce_result.consumed),
+        "concurrent same-nonce admission produces exactly one durable winner");
+
+    let nonce_name = "nonce-" + SHA256.sha256_hex(nonce) + ".json";
+    for path in [target, target + ".lock", linked_path, linked_path + ".lock",
+                 symlink_path, symlink_path + ".lock",
+                 poisoned_target + ".lock", root + "/.pbide-broker.lock",
+                 root + "/" + nonce_name, root + "/" + forged_name,
+                 root + "/nonce-" + SHA256.sha256_hex(concurrent_nonce) + ".json"] {
+        try Secure.remove_file(path, true) catch nil;
+    }
+    require(Secure.remove(root, false).ok, "private transaction fixture is removed");
+    try Secure.remove_file(outside, false) catch nil;
+    try Secure.remove_file(lock_victim, false) catch nil;
+}
+
+require(not Secure.status().path_fallback_on_linux,
+    "transaction failures never downgrade to unsafe path I/O");
+print "secure_file_transaction_pass";
