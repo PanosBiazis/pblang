@@ -182,6 +182,26 @@ flag AND an allowlist is precisely because once a script can load
 arbitrary `.so`/`.dll` files, every line of host-side memory safety is
 trust-extended to the foreign code.
 
+## Fixed-method tuple contracts
+
+`stdlib/ffi_tuple_contract.sapp` provides a capability-free declaration format
+for future fixed-method brokers. It binds one method ID to a library identity
+and a `sha256-raw-library-bytes-v1` digest (SHA-256 over the exact complete raw
+library file bytes, with no text conversion, framing, metadata, or path),
+symbol, exact scalar-only signature, C calling mode,
+platform, architecture, and input/output bounds. The registry rejects unknown
+fields, duplicate IDs or tuples, non-ASCII/confusable IDs, pointer types,
+callbacks, and variadic signatures, and produces an order-independent digest.
+
+This is a metadata and readiness contract, not runtime enforcement. The current
+VM still authorizes libraries and symbols independently and accepts the typed
+signature from the caller. Therefore the module always reports
+`runtime_signature_tuple_enforced=false`,
+`raw_ffi_builtin_bypass_blocked=false`, and
+`production_execution_ready=false`. A worker must not be enabled from this
+registry until the runtime enforces the complete tuple and loads the verified
+library identity without reopening a mutable pathname.
+
 ## Error model
 
 Every error from the FFI surface is a `RuntimeError` with a span pointing
