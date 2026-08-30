@@ -116,9 +116,29 @@ fn _open_parent(path, create, private_parent) {
         return _error("absolute secure roots are not supported by this platform backend");
     }
     if _backend_name() == "unavailable" { return _error("secure file backend is unavailable"); }
+    if platform() == "linux" and private_parent {
+        let private_fs = if parts.absolute {
+            LinuxDirFS.open_absolute(parts.parent, false, false)
+        } else { LinuxDirFS.open(parts.parent, false, false) };
+        if not private_fs.ok and create {
+            let created = create_private_directory_new(parts.parent);
+            if not created.ok { return _error("private parent must exist or be exclusively creatable"); }
+            private_fs = if parts.absolute {
+                LinuxDirFS.open_absolute(parts.parent, false, false)
+            } else { LinuxDirFS.open(parts.parent, false, false) };
+        }
+        if not private_fs.ok { return _error("private parent directory is unavailable"); }
+        let policy = LinuxDirFS.private_root_status(private_fs);
+        if not policy.ok {
+            _close(private_fs);
+            return _error("private parent must already be current-user-owned mode 0700");
+        }
+        return map{ ok: true, fs: private_fs, name: parts.name,
+            private_parent_verified: true };
+    }
     let fs = nil;
-    if parts.absolute { fs = LinuxDirFS.open_absolute(parts.parent, create, private_parent); }
-    elif platform() == "linux" { fs = LinuxDirFS.open(parts.parent, create, private_parent); }
+    if parts.absolute { fs = LinuxDirFS.open_absolute(parts.parent, create, false); }
+    elif platform() == "linux" { fs = LinuxDirFS.open(parts.parent, create, false); }
     else { fs = PosixDirFS.open(parts.parent, create); }
     if not fs.ok {
         return _error("secure parent directory is unavailable: "
@@ -406,6 +426,26 @@ fn create_private_directory_new(path) {
         descriptor_bound:true,owned_by_current_uid:true,mode:"700"};
 }
 
+fn private_directory_status(path) {
+    if platform() != "linux" or type(path) != "string" or path == ""
+       or path == "." or path == "/" or len(path) > MAX_PATH
+       or not str_starts_with(path, "/") or str_contains(path, strfromcharcode(0)) {
+        return map{ ok: false, ready: false, reason: "invalid-private-directory-path" };
+    }
+    let fs = LinuxDirFS.open_absolute(path, false, false);
+    if not fs.ok {
+        return map{ ok: false, ready: false, reason: "private-directory-unavailable" };
+    }
+    let policy = LinuxDirFS.private_root_status(fs);
+    let closed = LinuxDirFS.close(fs);
+    if not policy.ok or not closed {
+        return map{ ok: false, ready: false,
+            reason: "private-directory-ownership-or-mode-unverified" };
+    }
+    return map{ ok: true, ready: true, reason: "verified",
+        owned_by_current_uid: true, mode: "700", path_exposed: false };
+}
+
 fn close_immutable_reader(reader) {
     if type(reader) != "map"
        or (try reader.format catch "") != "pblang.secure-file.immutable-reader.v1" {
@@ -449,6 +489,102 @@ fn write_text_new_exclusive(path, text, create_parent = true, private_parent = f
     return write_new_exclusive(path, str_to_bytes(text), create_parent, private_parent);
 }
 
+// Cooperating local writers append one complete UTF-8 record by holding a
+// stable sibling flock, reading the old value within a byte ceiling, and
+// atomically replacing the target. The private parent is mandatory: this API
+// is for persistent application state, not shared/removable filesystems.
+fn append_text_bounded_locked(path, text, max_bytes = 4194304, timeout_ms = 2000) {
+    if platform() != "linux" { return _error("locked atomic append requires Linux"); }
+    if type(text) != "string" or text == "" { return _error("append text must be non-empty UTF-8"); }
+    if type(max_bytes) != "number" or max_bytes != num_floor(max_bytes)
+       or max_bytes < 1 or max_bytes > 67108864 {
+        return _error("invalid locked append byte limit");
+    }
+    if type(timeout_ms) != "number" or timeout_ms != num_floor(timeout_ms)
+       or timeout_ms < 0 or timeout_ms > 300000 {
+        return _error("invalid locked append timeout");
+    }
+    let parts = _parts(path);
+    if parts == nil or not parts.absolute or len(parts.name) + len(".lock") > 255 {
+        return _error("locked append requires a bounded absolute application-state path");
+    }
+    let addition = str_to_bytes(text);
+    if len(addition) > max_bytes { return _error("append text exceeds the byte limit"); }
+
+    let parent = _open_parent(path, true, true);
+    if not parent.ok { return parent; }
+    let lock = LinuxDirFS.acquire_lock(parent.fs, parent.name + ".lock", timeout_ms, 10);
+    if not lock.ok {
+        let closed_without_lock = _close(parent.fs);
+        return map{ ok: false, error: try lock.error catch "exclusive lock unavailable",
+            timeout: try lock.timeout catch false, published: false,
+            retry_safe: closed_without_lock, target_unchanged: true };
+    }
+
+    let operation = LinuxDirFS.write_new_atomic(parent.fs, parent.name, addition, false);
+    if operation.ok {
+        operation.published = true;
+        operation.retry_safe = false;
+        operation.locked_atomic_replacement = true;
+        operation.cooperative_local_lock = true;
+        operation.final_bytes = len(addition);
+    } elif try operation.published catch false {
+        operation.retry_safe = false;
+        operation.locked_atomic_replacement = true;
+        operation.cooperative_local_lock = true;
+        operation.final_bytes = len(addition);
+    } else {
+        let metadata = LinuxDirFS.metadata(parent.fs, parent.name);
+        if not metadata.ok or metadata.kind != "file"
+           or not metadata.owner_current_user or metadata.link_count != 1 {
+            operation = map{ ok: false,
+                error: "existing state must be an owned single-link regular file",
+                published: false, retry_safe: true };
+        } else {
+            let loaded = _read_backend(parent.fs, parent.name, max_bytes);
+            if not loaded.ok {
+                operation = map{ ok: false,
+                    error: try loaded.error catch "bounded state read failed",
+                    published: false, retry_safe: true };
+            } else {
+                let decoded = try bytes_to_str(loaded.bytes) catch nil;
+                if decoded == nil {
+                    operation = map{ ok: false, error: "existing state is not valid UTF-8",
+                        published: false, retry_safe: true };
+                } else {
+                    let old = str(decoded);
+                let combined = str_to_bytes(old + text);
+                if len(combined) > max_bytes {
+                        operation = map{ ok: false,
+                            error: "locked append would exceed the byte limit",
+                            published: false, retry_safe: true };
+                } else {
+                    operation = _write_atomic_backend(parent.fs, parent.name, combined);
+                    operation.published = operation.ok or (try operation.published catch false);
+                    operation.retry_safe = not operation.published;
+                    operation.locked_atomic_replacement = true;
+                    operation.cooperative_local_lock = true;
+                    operation.final_bytes = len(combined);
+                }
+                }
+            }
+        }
+    }
+
+    let released = LinuxDirFS.release_lock(parent.fs, lock);
+    let closed = _close(parent.fs);
+    if not released or not closed {
+        let was_published = try operation.published catch false;
+        return map{ ok: false, error: "locked append cleanup could not be verified",
+            published: was_published, retry_safe: not was_published and closed,
+            lock_released: released, root_closed: closed,
+            final_bytes: try operation.final_bytes catch nil };
+    }
+    operation.lock_released = true;
+    operation.root_closed = true;
+    return operation;
+}
+
 fn remove(path, private_parent = false) {
     if _backend_name() == "unavailable" { return _error("secure file backend is unavailable"); }
     let opened_parent = _open_parent(path, false, private_parent);
@@ -477,11 +613,16 @@ fn remove_file(path, private_parent = false) {
 }
 
 fn status() {
-    return map{ format: "pblang.secure-file.status.v1", available: available().ok,
+    let backend_state = available();
+    let linux_state = if platform() == "linux" { LinuxDirFS.available() }
+        else { map{ ok: false, library_ready: false,
+            ffi_library_authority: false, ffi_symbol_contract_verified: false,
+            reason: "linux-required" } };
+    return map{ format: "pblang.secure-file.status.v1", available: backend_state.ok,
                 component_openat: true, nofollow: true, exclusive_stage: true,
                 atomic_renameat: true, exclusive_no_replace_openat: true,
                 path_fallback: false, path_fallback_on_linux: false,
-                backend: available().backend,
+                backend: backend_state.backend,
                 linux_backend: platform() == "linux", macos_backend: platform() == "macos",
                 windows_backend: platform() == "windows",
                 immutable_reader_linux: platform() == "linux",
@@ -489,6 +630,15 @@ fn status() {
                 immutable_reader_atomic_range_publication: platform() == "linux",
                 immutable_reader_private_parent_publication: platform() == "linux",
                 immutable_reader_private_sticky_temp_publication: platform() == "linux",
+                locked_atomic_first_publication_linux_x86_64: platform() == "linux",
+                locked_atomic_first_publication_requires_exec: platform() == "linux",
+                operations_attemptable: if platform() == "linux" {
+                        try linux_state.library_ready catch false
+                    } else { backend_state.ok },
+                ffi_library_authority: try linux_state.ffi_library_authority catch false,
+                ffi_symbol_contract_verified: try linux_state.ffi_symbol_contract_verified catch false,
+                unavailable_reason: if backend_state.ok { "" }
+                    else { try linux_state.reason catch "backend-unavailable" },
                 global_handle_backends: ["linux", "macos", "windows"] };
 }
 
@@ -497,6 +647,7 @@ export available, read_bytes, read_text, read_text_prefix, read_optional_text,
        immutable_reader_range, immutable_reader_magic_offsets,
        publish_immutable_reader_range, publish_immutable_reader_range_private,
        publish_immutable_reader_range_private_temp,
-       create_private_directory_new, close_immutable_reader,
+       create_private_directory_new, private_directory_status, close_immutable_reader,
        write_atomic, write_text_atomic, write_new_exclusive, write_text_new_exclusive,
+       append_text_bounded_locked,
        list_directory, remove, remove_file, status;

@@ -32,11 +32,13 @@ Both layers must allow the call or it errors with `ffi access denied` /
 | Layer | Default | Set via |
 |-------|---------|---------|
 | `StdlibConfig.ffi` | `false` (deny) | `VM::with_stdlib(StdlibConfig { ffi: true, .. })` |
-| `FfiPolicy` allowlist | `None` (allow all when `ffi: true`) | `vm.set_ffi_policy(Some(FfiPolicy { allow_all: false, allowed_libs, allowed_symbols }))` |
+| `FfiPolicy` allowlist | empty deny-by-default | `vm.set_ffi_policy(Some(FfiPolicy { allow_all: false, allowed_libs, allowed_symbols }))` |
 
-For untrusted code, set both: enable the `ffi` capability and pin the
-allowlist so the script can only reach libraries and symbols the embedder
-named. Errors **name the rejected entity** so embedders can debug
+For reviewed code that needs FFI, set both: enable the `ffi` capability and pin
+the allowlist so the script can only reach libraries and symbols the embedder
+named. The current policy binds symbol names but not typed-call signatures, so
+even an exact symbol allowlist is not a hostile-code sandbox; a mismatched
+signature can cause undefined behavior. Errors **name the rejected entity** so embedders can debug
 quickly:
 
 ```
