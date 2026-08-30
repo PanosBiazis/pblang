@@ -1,4 +1,5 @@
 let S = import("stdlib:secure_file.sapp");
+let D = import("stdlib:linux_dirfs.sapp");
 
 fn fail(message) { throw "FAIL secure_file: " + message; }
 fn require(value, message) { if not value { fail(message); } }
@@ -20,6 +21,77 @@ if platform() == "linux" {
     let loaded = S.read_text(path, 16);
     require(loaded.ok and loaded.text == "safe" and loaded.size == 4,
         "secure descriptor-relative bounded read reports snapshot size");
+
+    let live_root = root + "/private-live";
+    let capped_live = live_root + "/capped.txt";
+    let tmp_mode_before = try proc_spawn_wait("/usr/bin/stat", ["-c", "%a", "/tmp"]) catch nil;
+    let shared_parent_probe = "/tmp/pblang-private-parent-refusal-" +
+        str_slice(sha256(base64_encode_bytes(random_bytes(24))), 0, 24) + ".txt";
+    require(not S.append_text_bounded_locked(shared_parent_probe, "no", 64, 100).ok
+        and not (try fs_exists(shared_parent_probe) catch false),
+        "locked append refuses an existing shared parent without creating a target");
+    let tmp_mode_after = try proc_spawn_wait("/usr/bin/stat", ["-c", "%a", "/tmp"]) catch nil;
+    require(tmp_mode_before != nil and tmp_mode_after != nil
+        and str_trim(tmp_mode_before.stdout) == str_trim(tmp_mode_after.stdout),
+        "private-state refusal never chmods an arbitrary operator path");
+    require(not S.append_text_bounded_locked(capped_live, "", 2, 100).ok,
+        "locked append rejects empty records before creating state");
+    require(S.append_text_bounded_locked(capped_live, "a", 2, 100).ok
+        and S.append_text_bounded_locked(capped_live, "b", 2, 100).ok,
+        "locked append admits cap-1 and exact-cap publications");
+    require(not S.append_text_bounded_locked(capped_live, "c", 2, 100).ok
+        and S.read_text(capped_live, 2, true).text == "ab",
+        "locked append rejects cap overflow without changing the old state");
+    require(try fs_exists(capped_live + ".lock") catch false,
+        "the stable sibling lock file is retained to prevent split-lock races");
+    let live_root_status = S.private_directory_status(live_root);
+    require(live_root_status.ok and live_root_status.ready
+        and live_root_status.owned_by_current_uid and live_root_status.mode == "700",
+        "private state root becomes usable only after ownership and mode verification");
+
+    let concurrent_live = live_root + "/concurrent.txt";
+    let first = spawn(fn() {
+        let secure = import("stdlib:secure_file.sapp");
+        return secure.append_text_bounded_locked(concurrent_live, "writer-one\n", 1024, 2000);
+    });
+    let second = spawn(fn() {
+        let secure = import("stdlib:secure_file.sapp");
+        return secure.append_text_bounded_locked(concurrent_live, "writer-two\n", 1024, 2000);
+    });
+    let first_result = join(first); let second_result = join(second);
+    let concurrent_text = S.read_text(concurrent_live, 1024, true);
+    require(first_result.ok and second_result.ok and concurrent_text.ok
+        and len(str_split(concurrent_text.text, "writer-one")) == 2
+        and len(str_split(concurrent_text.text, "writer-two")) == 2,
+        "cooperating concurrent writers are each retained exactly once");
+
+    let held = D.open_absolute(live_root, false, true);
+    require(held.ok, "private live root can be held for lock contention test");
+    let busy_lock = D.acquire_lock(held, "busy.txt.lock", 100, 10);
+    require(busy_lock.ok, "contention fixture owns the sibling lock");
+    let busy_result = S.append_text_bounded_locked(live_root + "/busy.txt", "blocked", 64, 0);
+    require(not busy_result.ok and busy_result.timeout and busy_result.target_unchanged
+        and not (try fs_exists(live_root + "/busy.txt") catch false),
+        "pre-held lock timeout creates or modifies no target");
+    require(D.release_lock(held, busy_lock) and D.close(held),
+        "contention fixture releases its descriptor-bound lock");
+
+    let external_hardlink = outside + "/hardlink-source.txt";
+    fs_write(external_hardlink, "outside-unchanged");
+    let hardlink_path = live_root + "/hardlink.txt";
+    let hardlinked = try proc_spawn_wait("/bin/ln", [external_hardlink, hardlink_path]) catch nil;
+    if hardlinked != nil and hardlinked.exit_code == 0 {
+        require(not S.append_text_bounded_locked(hardlink_path, "no", 64, 100).ok
+            and fs_read(external_hardlink) == "outside-unchanged",
+            "pre-planted hard link is rejected without mutating its external inode");
+    }
+    let final_symlink = live_root + "/final-link.txt";
+    let final_linked = try proc_spawn_wait("/bin/ln", ["-s", external_hardlink, final_symlink]) catch nil;
+    if final_linked != nil and final_linked.exit_code == 0 {
+        require(not S.append_text_bounded_locked(final_symlink, "no", 64, 100).ok
+            and fs_read(external_hardlink) == "outside-unchanged",
+            "final symlink is rejected without following or replacing its target");
+    }
 
     let binary = [];
     let binary_index = 0;

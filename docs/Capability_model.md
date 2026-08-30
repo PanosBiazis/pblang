@@ -78,8 +78,10 @@ These remain available when all host-effect capabilities are explicitly off:
 
 ## FfiPolicy — fine-grained FFI control
 
-When `StdlibConfig::ffi == true`, the VM by default allows loading **any**
-library and calling **any** symbol. To narrow that, set an `FfiPolicy`:
+`StdlibConfig::ffi == true` enables the FFI surface but does not grant a library
+or symbol by itself. The current runtime installs an empty deny-by-default
+`FfiPolicy`; an embedder must explicitly allow exact libraries and symbols, or
+set `allow_all` only for fully reviewed trusted source:
 
 ```rust
 let mut allowed_libs = HashSet::new();
@@ -108,6 +110,26 @@ Behaviour:
   both work.
 * Denied loads / calls produce errors that name the rejected entity:
   `ffi_load: library "./libnope.so" not in allowlist (set FfiPolicy.allowed_libs or allow_all=true)`.
+
+Linux descriptor-backed stdlib modules expose library readiness separately
+from operational verification. `ffi_library_authority` means the reviewed
+library could be loaded and closed; `ffi_symbol_contract_verified` remains
+false until the runtime can bind every allowed symbol to an approved typed
+signature. `operations_attemptable` permits trusted maintenance code to try a
+postcondition-checked operation, but is not a sandbox or security attestation.
+
+`secure_file.append_text_bounded_locked(...)` is the private application-state
+primitive for cooperating Linux writers. It requires a current-user-owned
+mode-0700 native-filesystem parent: an absent final leaf is created exclusively,
+while an existing leaf is verified without changing its mode. It rejects
+symlinks and multi-link targets,
+bounds the complete UTF-8 value, and publishes through fsynced atomic
+replacement. Its stable sibling `flock` coordinates local cooperating writers
+only; it is not a distributed-filesystem lock and does not constrain code that
+ignores the lock contract. First publication currently uses a sealed generated
+no-replace syscall helper and therefore requires Linux x86-64/amd64 plus the
+reviewed exec capability. A `published:true, retry_safe:false` error must never
+be retried automatically because the complete record may already be visible.
 
 ## VmLimits — resource limits
 

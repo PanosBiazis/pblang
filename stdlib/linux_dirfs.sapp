@@ -43,9 +43,30 @@ fn _first_existing(paths) {
 }
 fn available() {
     let libc = _first_existing(LIBC_PATHS);
-    return map{ ok: platform() == "linux" and libc != nil and (try fs_exists("/proc/self/fd") catch false),
-                libc: libc, proc_fd: try fs_exists("/proc/self/fd") catch false,
-                contract: "pblang.linux-dirfs.v1" };
+    let proc_fd = try fs_exists("/proc/self/fd") catch false;
+    let ffi_library_authority = false;
+    if platform() == "linux" and libc != nil {
+        let probe = try ffi_load(libc) catch nil;
+        if probe != nil {
+            ffi_library_authority = try { ffi_close(probe); true } catch false;
+        }
+    }
+    // Loading and closing libc proves only the library-level grant. The VM's
+    // current FFI policy does not expose a safe way to prove the complete
+    // symbol + typed-signature contract required by this backend.
+    let ffi_symbol_contract_verified = false;
+    let library_ready = platform() == "linux" and libc != nil and proc_fd
+        and ffi_library_authority;
+    let reason = "ffi-symbol-contract-unverified";
+    if platform() != "linux" { reason = "linux-required"; }
+    elif libc == nil { reason = "trusted-libc-unavailable"; }
+    elif not proc_fd { reason = "proc-fd-unavailable"; }
+    elif not ffi_library_authority { reason = "ffi-library-authority-unavailable"; }
+    return map{ ok: library_ready and ffi_symbol_contract_verified,
+                library_ready: library_ready, libc: libc, proc_fd: proc_fd,
+                ffi_library_authority: ffi_library_authority,
+                ffi_symbol_contract_verified: ffi_symbol_contract_verified,
+                reason: reason, contract: "pblang.linux-dirfs.v1" };
 }
 
 fn _components(path, allow_root = true) {
@@ -280,12 +301,16 @@ fn _descriptor_metadata(fs, fd, path) {
     let stat = _stat_program();
     if stat == nil { return _error("descriptor metadata requires the stat utility"); }
     let held = sanitize_path("/proc/" + str(pid) + "/fd/" + str(fd));
-    let checked = try proc_spawn_wait(stat, ["-L", "-c", "%f|%s|%Y", held]) catch nil;
+    let checked = try proc_spawn_wait(stat, ["-L", "-c", "%f|%s|%Y|%u|%h", held]) catch nil;
     if checked == nil or checked.exit_code != 0 { return _error("held descriptor metadata is unavailable"); }
     let fields = str_split(str_trim(checked.stdout), "|");
-    if len(fields) != 3 { return _error("held descriptor metadata is malformed"); }
+    if len(fields) != 5 { return _error("held descriptor metadata is malformed"); }
     let mode = _hex(fields[0]); let size = _decimal(fields[1]); let modified = _decimal(fields[2]);
-    if mode == nil or size == nil or size < 0 or modified == nil {
+    let owner_uid = _decimal(fields[3]); let link_count = _decimal(fields[4]);
+    let current_uid = _i32(_call(fs, "getuid", "->i32", []));
+    if mode == nil or size == nil or size < 0 or modified == nil
+       or owner_uid == nil or owner_uid < 0 or link_count == nil or link_count < 1
+       or current_uid < 0 {
         return _error("held descriptor metadata contains invalid numeric fields");
     }
     if modified < 0 { modified = 0; }
@@ -296,12 +321,14 @@ fn _descriptor_metadata(fs, fd, path) {
     return map{
         ok: true, path: path, kind: kind, size: size,
         mtime_unix: modified, mtime_ms: modified * 1000,
-        mode: mode, race_resistant: true, descriptor_bound: true
+        mode: mode, owner_uid: owner_uid, current_uid: current_uid,
+        owner_current_user: owner_uid == current_uid, link_count: link_count,
+        race_resistant: true, descriptor_bound: true
     };
 }
 
 fn open(root, create = true, protect_root = false) {
-    let host = available(); if not host.ok { return _error("Linux libc and /proc/self/fd are required"); }
+    let host = available(); if not host.library_ready { return _error(host.reason); }
     let parts = _root_components(root); if parts == nil { return _error("root must be a safe relative path"); }
     let libc = try ffi_load(host.libc) catch nil;
     if libc == nil { return _error("trusted libc cannot be loaded"); }
@@ -326,10 +353,10 @@ fn open(root, create = true, protect_root = false) {
         current = next; i = i + 1;
     }
     if protect_root and len(parts) > 0 {
-        let protected = _i32(_call(holder, "fchmod", "i32,i32->i32", [current, MODE_DIR]));
-        if protected != 0 or not _mode_verified(holder, current, "700") {
+        if not _mode_verified(holder, current, "700")
+           or not _owner_verified(holder, current).ok {
             _close_fd(holder, current); ffi_close(libc);
-            return _error("relative root permissions cannot be protected and verified");
+            return _error("relative root must already be current-user-owned mode 0700");
         }
     }
     return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: current,
@@ -339,9 +366,10 @@ fn open(root, create = true, protect_root = false) {
 
 // Open a trusted absolute application-data root component-by-component. No
 // component may be a symlink, and newly created directories are private from
-// their first observable state. The final root is forced to mode 0700.
+// their first observable state. An existing protected root is verified without
+// mutating its ownership or mode.
 fn open_absolute(root, create = true, protect_root = true) {
-    let host = available(); if not host.ok { return _error("Linux libc and /proc/self/fd are required"); }
+    let host = available(); if not host.library_ready { return _error(host.reason); }
     let parts = _absolute_components(root); if parts == nil { return _error("root must be a safe absolute path"); }
     let libc = try ffi_load(host.libc) catch nil;
     if libc == nil { return _error("trusted libc cannot be loaded"); }
@@ -360,10 +388,10 @@ fn open_absolute(root, create = true, protect_root = true) {
         current = next; i = i + 1;
     }
     if protect_root {
-        let protected = _i32(_call(holder, "fchmod", "i32,i32->i32", [current, MODE_DIR]));
-        if protected != 0 or not _mode_verified(holder, current, "700") {
+        if not _mode_verified(holder, current, "700")
+           or not _owner_verified(holder, current).ok {
             _close_fd(holder, current); ffi_close(libc);
-            return _error("application root permissions cannot be protected and verified");
+            return _error("application root must already be current-user-owned mode 0700");
         }
     }
     return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: current,
@@ -377,7 +405,7 @@ fn open_absolute(root, create = true, protect_root = true) {
 // O_NOFOLLOW. This is the safe root for bounded `/proc/net`-style inspection
 // in a process-specific network namespace.
 fn open_current_process_net() {
-    let host = available(); if not host.ok { return _error("Linux libc and procfs are required"); }
+    let host = available(); if not host.library_ready { return _error(host.reason); }
     let libc = try ffi_load(host.libc) catch nil;
     if libc == nil { return _error("trusted libc cannot be loaded"); }
     let holder = map{ libc: libc, libc_path: host.libc };
@@ -566,7 +594,7 @@ fn adopt_inherited_directory(fd, protect_root = true) {
         return _error("inherited directory descriptor is invalid");
     }
     let host = available();
-    if not host.ok { return _error("Linux libc and /proc/self/fd are required"); }
+    if not host.library_ready { return _error(host.reason); }
     let libc = try ffi_load(host.libc) catch nil;
     if libc == nil { return _error("trusted libc cannot be loaded"); }
     let holder = map{ libc: libc, libc_path: host.libc };
@@ -1582,18 +1610,32 @@ fn write_new_atomic(fs, path, bytes, create_parents = true) {
         O_WRONLY + O_CREAT + O_EXCL + O_NOFOLLOW + O_CLOEXEC, MODE_FILE);
     if fd < 0 { _close_fd(fs, parent.fd); return _error("cannot create an exclusive atomic-new stage"); }
     let write_failed = try { fs_write_bytes(_fd_path(fd), bytes); false } catch true;
-    _close_fd(fs, fd);
     if write_failed {
+        _close_fd(fs, fd);
         _unlinkat(fs, parent.fd, stage, 0); _close_fd(fs, parent.fd);
         return _error("cannot populate atomic-new stage");
     }
+    let file_synced = _i32(_call(fs, "fsync", "i32->i32", [fd])) == 0;
+    let stage_closed = _close_fd(fs, fd);
+    if not file_synced or not stage_closed {
+        _unlinkat(fs, parent.fd, stage, 0); _close_fd(fs, parent.fd);
+        return _error("cannot synchronize and close atomic-new stage");
+    }
     let published = _rename_noreplace_parents(fs, parent.fd, stage, parent.fd, parent.name);
     if published.ok {
-        _close_fd(fs, parent.fd);
+        let directory_synced = _i32(_call(fs, "fsync", "i32->i32", [parent.fd])) == 0;
+        let parent_closed = _close_fd(fs, parent.fd);
+        if not directory_synced or not parent_closed {
+            return map{ ok: false, error: "published atomic-new directory could not be synchronized",
+                published: true, retry_safe: false, path: path, size: len(bytes),
+                atomic: true, atomic_visibility: true, durability_verified: false };
+        }
         return map{
             ok: true, path: path, size: len(bytes), no_replace: true,
             atomic: true, atomic_visibility: true, exclusive_stage: true,
-            descriptor_bound_parent: true, generated_pblang_syscall_helper: true
+            descriptor_bound_parent: true, generated_pblang_syscall_helper: true,
+            fsync_before_publish: true, parent_fsync_after_publish: true,
+            durability_verified: true
         };
     } else {
         _unlinkat(fs, parent.fd, stage, 0); _close_fd(fs, parent.fd);
