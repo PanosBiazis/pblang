@@ -1,0 +1,145 @@
+// Exact, capability-free metadata contract for future fixed-method FFI brokers.
+//
+// This module validates and hashes declarations. It never loads a library,
+// calls a symbol, grants FFI, or claims that the VM enforces the tuple.
+
+let FORMAT = "pblang.ffi-tuple.v1";
+let REGISTRY_FORMAT = "pblang.ffi-tuple-registry.v1";
+let MAX_METHODS = 256;
+let MAX_TEXT = 128;
+
+fn _contains(values, target) {
+    for value in values { if value == target { return true; } }
+    return false;
+}
+
+fn _exact_fields(value, expected) {
+    return type(value) == "map"
+        and array_sort(map_keys(value)) == array_sort(expected);
+}
+
+fn _token(value, pattern) {
+    return type(value) == "string" and len(value) >= 1 and len(value) <= MAX_TEXT
+        and regex_match(value, pattern);
+}
+
+fn _bounded_integer(value, low, high) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= low and value <= high;
+}
+
+fn _signature(value) {
+    if type(value) != "string" or len(value) < 6 or len(value) > MAX_TEXT
+        or str_contains(value, " ") or str_contains(value, "...")
+        or str_contains(str_lower(value), "callback")
+        or str_contains(str_lower(value), "variadic") { return false; }
+    let sides = str_split(value, "->");
+    if len(sides) != 2 { return false; }
+    let args = if sides[0] == "" { [] } else { str_split(sides[0], ",") };
+    if len(args) > 4 { return false; }
+    let scalar = ["i64", "i32", "f64", "f32", "bool"];
+    for arg in args {
+        if not _contains(scalar, arg) { return false; }
+    }
+    return _contains(["i64", "i32", "f64", "f32", "bool", "void"], sides[1]);
+}
+
+fn validate(row) {
+    let fields = ["format", "method_id", "library_id", "library_sha256",
+        "library_digest_algorithm",
+        "symbol", "signature", "call_mode", "platform", "architecture",
+        "max_args", "max_input_bytes", "max_output_bytes"];
+    if not _exact_fields(row, fields) { return map{ ok: false, error: "exact-schema-required" }; }
+    if row.format != FORMAT { return map{ ok: false, error: "format-mismatch" }; }
+    if not _token(row.method_id, "^[a-z][a-z0-9._-]{2,63}$") {
+        return map{ ok: false, error: "invalid-method-id" };
+    }
+    if not _token(row.library_id, "^[a-z][a-z0-9._-]{2,63}$") {
+        return map{ ok: false, error: "invalid-library-id" };
+    }
+    if type(row.library_sha256) != "string"
+        or not regex_match(row.library_sha256, "^[0-9a-f]{64}$") {
+        return map{ ok: false, error: "invalid-library-digest" };
+    }
+    if row.library_digest_algorithm != "sha256-raw-library-bytes-v1" {
+        return map{ ok: false, error: "unsupported-library-digest-algorithm" };
+    }
+    if not _token(row.symbol, "^[A-Za-z_][A-Za-z0-9_]{0,127}$") {
+        return map{ ok: false, error: "invalid-symbol" };
+    }
+    if not _signature(row.signature) { return map{ ok: false, error: "unsafe-or-invalid-signature" }; }
+    if row.call_mode != "c" { return map{ ok: false, error: "unsupported-call-mode" }; }
+    if not _contains(["linux", "macos", "windows"], row.platform) {
+        return map{ ok: false, error: "unsupported-platform" };
+    }
+    if not _contains(["x86_64", "aarch64"], row.architecture) {
+        return map{ ok: false, error: "unsupported-architecture" };
+    }
+    if not _bounded_integer(row.max_args, 0, 4)
+        or row.max_args != len(if str_starts_with(row.signature, "->") {
+            []
+        } else { str_split(str_split(row.signature, "->")[0], ",") }) {
+        return map{ ok: false, error: "argument-bound-mismatch" };
+    }
+    if not _bounded_integer(row.max_input_bytes, 0, 1048576)
+        or not _bounded_integer(row.max_output_bytes, 0, 1048576) {
+        return map{ ok: false, error: "invalid-byte-bound" };
+    }
+    return map{ ok: true, format: FORMAT };
+}
+
+fn _canonical(row) {
+    return str_join([row.method_id, row.library_id, row.library_sha256,
+        row.library_digest_algorithm,
+        row.symbol, row.signature, row.call_mode, row.platform, row.architecture,
+        str(row.max_args), str(row.max_input_bytes), str(row.max_output_bytes)],
+        strfromcharcode(0));
+}
+
+fn build(rows) {
+    if type(rows) != "array" or len(rows) < 1 or len(rows) > MAX_METHODS {
+        return map{ ok: false, format: REGISTRY_FORMAT, error: "invalid-method-count" };
+    }
+    let by_id = map{}; let tuple_ids = map{};
+    for row in rows {
+        let checked = validate(row);
+        if not checked.ok { return map{ ok: false, format: REGISTRY_FORMAT, error: checked.error }; }
+        if map_has(by_id, row.method_id) {
+            return map{ ok: false, format: REGISTRY_FORMAT, error: "duplicate-method-id" };
+        }
+        let tuple_id = str_join([row.library_sha256, row.symbol, row.signature,
+            row.call_mode, row.platform, row.architecture], strfromcharcode(0));
+        if map_has(tuple_ids, tuple_id) {
+            return map{ ok: false, format: REGISTRY_FORMAT, error: "duplicate-ffi-tuple" };
+        }
+        by_id[row.method_id] = row; tuple_ids[tuple_id] = true;
+    }
+    let ids = array_sort(map_keys(by_id)); let canonical_rows = [];
+    for id in ids { array_push(canonical_rows, _canonical(by_id[id])); }
+    let canonical = str_join(canonical_rows, strfromcharcode(0) + strfromcharcode(0));
+    return map{ ok: true, format: REGISTRY_FORMAT, method_count: len(ids),
+        method_ids: ids, registry_sha256: sha256(canonical),
+        exact_schema: true, pointer_types_allowed: false,
+        variadic_allowed: false, callbacks_allowed: false,
+        grants_capability: false, loads_libraries: false, calls_symbols: false,
+        runtime_signature_tuple_enforced: false,
+        raw_ffi_builtin_bypass_blocked: false,
+        production_execution_ready: false };
+}
+
+fn readiness(registry) {
+    let valid = type(registry) == "map" and (try registry.ok catch false)
+        and (try registry.format catch "") == REGISTRY_FORMAT
+        and type(try registry.registry_sha256 catch nil) == "string"
+        and regex_match(registry.registry_sha256, "^[0-9a-f]{64}$");
+    return map{ format: "pblang.ffi-tuple-readiness.v1",
+        contract_shape_valid: valid,
+        runtime_signature_tuple_enforced: false,
+        raw_ffi_builtin_bypass_blocked: false,
+        immutable_library_identity_enforced: false,
+        production_execution_ready: false,
+        reason: if valid { "runtime-tuple-enforcement-unavailable" }
+            else { "invalid-contract-registry" } };
+}
+
+export FORMAT, REGISTRY_FORMAT, validate, build, readiness;
