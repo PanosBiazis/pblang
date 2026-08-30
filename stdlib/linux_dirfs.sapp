@@ -444,9 +444,12 @@ fn close(fs) {
 }
 
 // Acquire an advisory exclusive lock on a descriptor-bound private file.
-// The lock file itself is resolved beneath the held root with O_NOFOLLOW, and
-// the kernel releases ownership even if the process exits unexpectedly.
-fn acquire_lock(fs, path, timeout_ms = 2000, poll_ms = 10) {
+// A new inode is created mode-0600 with O_EXCL. An existing inode is never
+// chmodded: it must be an owned, single-link regular file and, when the caller
+// requires private state, must already be mode-0600.
+// This prevents a preseeded hard link from turning lock setup into an external
+// inode mutation. The kernel releases ownership if the process exits.
+fn acquire_lock(fs, path, timeout_ms = 2000, poll_ms = 10, require_private = false) {
     if fs == nil or not is_map(fs) or (try fs.closed catch true) {
         return _error("directory root is closed");
     }
@@ -458,20 +461,31 @@ fn acquire_lock(fs, path, timeout_ms = 2000, poll_ms = 10) {
        or poll_ms < 1 or poll_ms > 2000 {
         return _error("lock poll_ms must be an integer in 1..2000");
     }
+    if type(require_private) != "bool" { return _error("lock require_private must be boolean"); }
     let parent = _parent(fs, path, true); if not parent.ok { return parent; }
     let fd = _openat(fs, parent.fd, parent.name,
-        O_RDWR + O_CREAT + O_NOFOLLOW + O_CLOEXEC, MODE_FILE);
+        O_RDWR + O_CREAT + O_EXCL + O_NOFOLLOW + O_CLOEXEC, MODE_FILE);
+    let created = fd >= 0;
+    if fd < 0 {
+        fd = _openat(fs, parent.fd, parent.name,
+            O_RDWR + O_NOFOLLOW + O_CLOEXEC, 0);
+    }
     _close_fd(fs, parent.fd);
     if fd < 0 { return _error("lock file cannot be opened without following links"); }
-    let protected = _i32(_call(fs, "fchmod", "i32,i32->i32", [fd, MODE_FILE]));
-    if protected != 0 {
-        _close_fd(fs, fd); return _error("lock file permissions cannot be requested");
+    if created {
+        let protected = _i32(_call(fs, "fchmod", "i32,i32->i32", [fd, MODE_FILE]));
+        if protected != 0 {
+            _close_fd(fs, fd); return _error("new lock file permissions cannot be requested");
+        }
     }
-    // Some removable/shared filesystems accept fchmod but intentionally do not
-    // persist Unix mode bits. A lock file contains no payload, so this does not
-    // weaken flock ownership; expose the postcondition for callers that require
-    // a private-mode filesystem for adjacent state.
-    let private_mode_verified = _mode_verified(fs, fd, "600");
+    let lock_metadata = _descriptor_metadata(fs, fd, path);
+    let safe_inode = lock_metadata.ok and lock_metadata.kind == "file"
+        and lock_metadata.owner_current_user and lock_metadata.link_count == 1;
+    let private_mode_verified = safe_inode and bit_and(lock_metadata.mode, 511) == MODE_FILE;
+    if not safe_inode or (require_private and not private_mode_verified) {
+        _close_fd(fs, fd);
+        return _error("lock file does not satisfy owned single-link regular private policy");
+    }
     let started = try now_ms() catch 0;
     let attempts = 0;
     // timeout_ms was admitted in 0..300000 above and remains immutable. Keeping
@@ -491,6 +505,8 @@ fn acquire_lock(fs, path, timeout_ms = 2000, poll_ms = 10) {
                 fd: fd, owner_fd: fs.root_fd, active: true, exclusive: true,
                 descriptor_bound: true, attempts: attempts,
                 private_mode_verified: private_mode_verified,
+                private_mode_required: require_private,
+                exclusive_create: created, existing_inode_mutated: false,
                 waited_ms: waited_ms
             };
         }

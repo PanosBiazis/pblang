@@ -1,0 +1,169 @@
+// Pure, fail-closed request planning for a future external PBIDE file broker.
+//
+// This module grants no filesystem or process authority. It binds the exact
+// request shape and reports why execution remains disabled until an external
+// immutable worker verifies publisher/runtime identity and performs the Linux
+// transaction through descriptor-held roots.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let BUNDLE = import("stdlib:immutable_broker_bundle.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+let REQUEST_FORMAT = "pbide.file-broker-request.v1";
+let PLAN_FORMAT = "pbide.file-broker-plan.v1";
+let RAW_SHA256_ALGORITHM = "sha256(raw-bytes)";
+let MAX_PATH_CHARS = 1024;
+let MAX_PATH_DEPTH = 64;
+let MAX_INPUT_BYTES = 1048576;
+let MAX_OUTPUT_BYTES = 1048576;
+let MAX_LIFETIME_SECONDS = 300;
+
+let REQUEST_FIELDS = [
+    "format", "request_id", "operation", "workspace_handle", "state_handle",
+    "relative_path", "payload_algorithm", "payload_sha256", "expected_kind",
+    "expected_algorithm", "expected_sha256", "input_bytes", "max_output_bytes",
+    "runtime_algorithm", "runtime_sha256", "bundle_algorithm", "bundle_sha256",
+    "publisher_id", "publisher_key_id", "nonce", "issued_epoch", "expires_epoch"
+];
+
+fn _has(values, expected) {
+    for value in values { if value == expected { return true; } }
+    return false;
+}
+
+fn _exact(value, fields) {
+    if type(value) != "map" or len(value) != len(fields) { return false; }
+    for field in fields { if not map_has(value, field) { return false; } }
+    return true;
+}
+
+fn _id(value) {
+    return type(value) == "string" and regex_match(value, "^[A-Za-z][A-Za-z0-9._-]{2,95}$");
+}
+
+fn _hex(value) {
+    return type(value) == "string" and regex_match(value, "^[0-9a-f]{64}$");
+}
+
+fn _finite_integer(value, minimum, maximum) {
+    if type(value) != "number" { return false; }
+    let rendered = str_lower(str(value));
+    if rendered == "nan" or str_contains(rendered, "inf") { return false; }
+    return value == num_floor(value) and value >= minimum and value <= maximum;
+}
+
+fn _relative_path(value) {
+    if type(value) != "string" or value == "" or len(value) > MAX_PATH_CHARS
+       or str_starts_with(value, "/") or str_contains(value, "\\")
+       or str_contains(value, ":") or not regex_match(value, "^[A-Za-z0-9._/-]+$") {
+        return nil;
+    }
+    let parts = str_split(value, "/");
+    if len(parts) < 1 or len(parts) > MAX_PATH_DEPTH { return nil; }
+    let seen = map{}; let normalized = [];
+    for part in parts {
+        if part == "" or part == "." or part == ".." or map_has(seen, part) { return nil; }
+        seen[part] = true; array_push(normalized, part);
+    }
+    return str_join(normalized, "/");
+}
+
+fn _error(reason) {
+    return map{ok:false,format:PLAN_FORMAT,error:reason,execution_enabled:false,
+        file_effect_enabled:false,run_enabled:false,terminal_enabled:false,
+        network_enabled:false,ffi_enabled:false,production_ready:false};
+}
+
+fn _expected_valid(request) {
+    if request.expected_kind == "missing" {
+        return request.expected_algorithm == "none" and request.expected_sha256 == "";
+    }
+    return request.expected_kind == "present"
+        and request.expected_algorithm == RAW_SHA256_ALGORITHM
+        and _hex(request.expected_sha256);
+}
+
+fn plan(request) {
+    if not _exact(request, REQUEST_FIELDS) { return _error("exact-request-schema-required"); }
+    if request.format != REQUEST_FORMAT { return _error("request-format-mismatch"); }
+    if not _id(request.request_id) or not _id(request.workspace_handle)
+       or not _id(request.state_handle) or not _id(request.publisher_id)
+       or not _hex(request.publisher_key_id) or not _hex(request.nonce) {
+        return _error("invalid-request-identity");
+    }
+    if not _has(["open", "save"], request.operation) {
+        return _error("file-operation-only");
+    }
+    let path = _relative_path(request.relative_path);
+    if path == nil { return _error("unsafe-relative-path"); }
+    if request.payload_algorithm != RAW_SHA256_ALGORITHM or not _hex(request.payload_sha256)
+       or request.runtime_algorithm != RAW_SHA256_ALGORITHM or not _hex(request.runtime_sha256)
+       or request.bundle_algorithm != RAW_SHA256_ALGORITHM or not _hex(request.bundle_sha256)
+       or not _expected_valid(request) {
+        return _error("digest-algorithm-or-value-mismatch");
+    }
+    if not _finite_integer(request.input_bytes, 0, MAX_INPUT_BYTES)
+       or not _finite_integer(request.max_output_bytes, 0, MAX_OUTPUT_BYTES) {
+        return _error("invalid-resource-bound");
+    }
+    if request.operation == "open" and request.input_bytes != 0 {
+        return _error("open-cannot-carry-input");
+    }
+    if request.operation == "save" and request.max_output_bytes != 0 {
+        return _error("save-cannot-request-output");
+    }
+    if request.operation == "open" and request.expected_kind != "present" {
+        return _error("open-requires-existing-CAS");
+    }
+    if not _finite_integer(request.issued_epoch, 0, 9007199254740991)
+       or not _finite_integer(request.expires_epoch, 0, 9007199254740991)
+       or request.expires_epoch <= request.issued_epoch
+       or request.expires_epoch - request.issued_epoch > MAX_LIFETIME_SECONDS {
+        return _error("invalid-request-lifetime");
+    }
+    let canonical = str_join([
+        request.format, request.request_id, request.operation,
+        request.workspace_handle, request.state_handle, path,
+        request.payload_algorithm, request.payload_sha256,
+        request.expected_kind, request.expected_algorithm, request.expected_sha256,
+        str(request.input_bytes), str(request.max_output_bytes),
+        request.runtime_algorithm, request.runtime_sha256,
+        request.bundle_algorithm, request.bundle_sha256,
+        request.publisher_id, request.publisher_key_id, request.nonce,
+        str(request.issued_epoch), str(request.expires_epoch)
+    ], strfromcharcode(0));
+    return map{ok:true,format:PLAN_FORMAT,request_sha256:SHA256.sha256_hex(canonical),
+        request_digest_algorithm:RAW_SHA256_ALGORITHM,
+        operation:request.operation,relative_path:path,
+        workspace_handle:request.workspace_handle,state_handle:request.state_handle,
+        payload_sha256:request.payload_sha256,expected_kind:request.expected_kind,
+        expected_sha256:request.expected_sha256,runtime_sha256:request.runtime_sha256,
+        bundle_sha256:request.bundle_sha256,nonce:request.nonce,
+        exact_schema:true,path_policy_validated:true,digest_algorithms_bound:true,
+        resource_bounds_validated:true,expiry_bound:true,
+        publisher_claim_bound:true,publisher_authenticity_verified:false,
+        runtime_identity_verified:false,immutable_runtime_handoff_verified:false,
+        workspace_descriptor_resolved:false,nonce_consumed:false,CAS_verified:false,
+        execution_enabled:false,file_effect_enabled:false,run_enabled:false,
+        terminal_enabled:false,network_enabled:false,ffi_enabled:false,
+        external_broker_required:true,production_ready:false};
+}
+
+fn status() {
+    let secure = SECURE.status(); let bundle = BUNDLE.status();
+    return map{format:"pbide.file-broker.status.v1",platform:platform(),
+        request_planning:true,open_save_only:true,run_denied:true,terminal_denied:true,
+        private_cooperative_cas_supported:try secure.private_cooperative_cas_supported_linux catch false,
+        durable_nonce_consumption_supported:try secure.durable_nonce_consumption_supported_linux catch false,
+        ffi_symbol_contract_verified:try secure.ffi_symbol_contract_verified catch false,
+        immutable_bundle_planning:try bundle.bounded_in_memory_link_supported catch false,
+        immutable_runtime_handoff_verified:false,publisher_authenticity_verified:false,
+        external_process_verified:false,execution_enabled:false,production_ready:false,
+        blockers:["typed-ffi-runtime-enforcement", "publisher-authenticity",
+            "immutable-runtime-handoff", "external-process-evidence",
+            "workspace-descriptor-resolution"]};
+}
+
+export REQUEST_FORMAT, PLAN_FORMAT, RAW_SHA256_ALGORITHM;
+export MAX_PATH_CHARS, MAX_PATH_DEPTH, MAX_INPUT_BYTES, MAX_OUTPUT_BYTES;
+export plan, status;
