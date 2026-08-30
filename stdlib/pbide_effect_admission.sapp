@@ -1,0 +1,312 @@
+// Pure, fail-closed admission contract for PBIDE effects.
+//
+// This module never reads or writes a file, starts a process, opens a network
+// connection, loads FFI, authenticates a principal, or consumes a lease. A
+// trusted broker must independently verify and execute a bound request.
+
+let REQUEST_FORMAT = "pbide.effect-request.v1";
+let LEASE_FORMAT = "pbide.effect-lease.v1";
+let EVALUATION_FORMAT = "pbide.effect-evaluation.v1";
+let GATE_FORMAT = "pbide.effect-gate.v1";
+let UNTRUSTED_MODE = "untrusted";
+let UNSAFE_COMPAT_MODE = "unsafe-local-compat";
+let MAX_PATH_CHARS = 1024;
+let MAX_INPUT_BYTES = 1048576;
+let MAX_OUTPUT_BYTES = 1048576;
+let MAX_TIMEOUT_MS = 30000;
+let MAX_LEASE_LIFETIME = 300;
+
+let REQUEST_FIELDS = [
+    "format", "request_id", "workspace_sha256", "document_sha256",
+    "runtime_sha256", "operation", "relative_path", "payload_sha256",
+    "expected_sha256", "input_bytes", "max_output_bytes", "timeout_ms",
+    "nonce", "issued_epoch", "expires_epoch", "action_scope"
+];
+
+let LEASE_FIELDS = [
+    "format", "lease_id", "request_sha256", "workspace_sha256",
+    "document_sha256", "runtime_sha256", "operation", "path_sha256",
+    "expected_sha256", "max_output_bytes", "timeout_ms", "nonce",
+    "issued_epoch", "expires_epoch", "action_scope", "broker_id",
+    "revoked", "single_use", "consumed"
+];
+
+fn _has(values, expected) {
+    for value in values { if value == expected { return true; } }
+    return false;
+}
+
+fn _exact(value, fields) {
+    if type(value) != "map" or len(value) != len(fields) { return false; }
+    for field in fields { if not map_has(value, field) { return false; } }
+    return true;
+}
+
+fn _hex(value) {
+    return type(value) == "string" and regex_match(value, "^[0-9a-f]{64}$");
+}
+
+fn _id(value) {
+    return type(value) == "string"
+        and regex_match(value, "^[A-Za-z][A-Za-z0-9._-]{2,95}$");
+}
+
+fn _integer(value, minimum, maximum) {
+    if type(value) != "number" { return false; }
+    let rendered = str_lower(str(value));
+    if str_contains(rendered, "inf") or rendered == "nan" { return false; }
+    return value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+
+fn _replay_ledger(value) {
+    if type(value) != "array" or len(value) > 4096 { return false; }
+    let unique = map{};
+    for nonce in value {
+        if not _hex(nonce) or map_has(unique, nonce) { return false; }
+        unique[nonce] = true;
+    }
+    return true;
+}
+
+fn _operation(value) {
+    return type(value) == "string" and _has(["open", "save", "run", "terminal"], value);
+}
+
+fn _relative_path(value) {
+    if type(value) != "string" or value == "" or len(value) > MAX_PATH_CHARS
+        or not regex_match(value, "^[A-Za-z0-9._/-]+$")
+        or str_starts_with(value, "/") or str_contains(value, "\\")
+        or str_contains(value, ":") { return nil; }
+    let parts = str_split(value, "/");
+    let normalized = [];
+    for part in parts {
+        if part == "" or part == "." or part == ".." { return nil; }
+        array_push(normalized, part);
+    }
+    return str_join(normalized, "/");
+}
+
+fn _canonical_request(value, path) {
+    return str_join([value.format, value.request_id, value.workspace_sha256,
+        value.document_sha256, value.runtime_sha256, value.operation, path,
+        value.payload_sha256, value.expected_sha256, str(value.input_bytes),
+        str(value.max_output_bytes), str(value.timeout_ms), value.nonce,
+        str(value.issued_epoch), str(value.expires_epoch), value.action_scope],
+        strfromcharcode(0));
+}
+
+fn _request_error(reason) {
+    return map{ ok:false, format:REQUEST_FORMAT, error:reason,
+        broker_required:true, structurally_valid:false,
+        authorizes_effect:false, invokes_filesystem:false,
+        invokes_process:false, invokes_network:false, invokes_ffi:false,
+        production_ready:false };
+}
+
+fn prepare(value) {
+    if not _exact(value, REQUEST_FIELDS) {
+        return _request_error("exact-request-schema-required");
+    }
+    if value.format != REQUEST_FORMAT { return _request_error("request-format-mismatch"); }
+    if not _id(value.request_id) { return _request_error("invalid-request-id"); }
+    if not _hex(value.workspace_sha256) or not _hex(value.document_sha256)
+        or not _hex(value.runtime_sha256) or not _hex(value.payload_sha256)
+        or not _hex(value.expected_sha256) or not _hex(value.nonce) {
+        return _request_error("invalid-digest-or-nonce");
+    }
+    if not _operation(value.operation) { return _request_error("unsupported-operation"); }
+    if value.action_scope != value.operation { return _request_error("wrong-action-scope"); }
+    let path = _relative_path(value.relative_path);
+    if path == nil { return _request_error("unsafe-relative-path"); }
+    if not _integer(value.input_bytes, 0, MAX_INPUT_BYTES)
+        or not _integer(value.max_output_bytes, 0, MAX_OUTPUT_BYTES)
+        or not _integer(value.timeout_ms, 1, MAX_TIMEOUT_MS) {
+        return _request_error("invalid-resource-bound");
+    }
+    if not _integer(value.issued_epoch, 0, 9007199254740991)
+        or not _integer(value.expires_epoch, 0, 9007199254740991)
+        or value.expires_epoch <= value.issued_epoch
+        or value.expires_epoch - value.issued_epoch > MAX_LEASE_LIFETIME {
+        return _request_error("invalid-request-lifetime");
+    }
+    let canonical = _canonical_request(value, path);
+    return map{ ok:true, format:REQUEST_FORMAT,
+        request_sha256:sha256(canonical), path_sha256:sha256(path),
+        operation:value.operation, action_scope:value.action_scope,
+        workspace_sha256:value.workspace_sha256,
+        document_sha256:value.document_sha256,
+        runtime_sha256:value.runtime_sha256,
+        payload_sha256:value.payload_sha256,
+        expected_sha256:value.expected_sha256,
+        max_output_bytes:value.max_output_bytes, timeout_ms:value.timeout_ms,
+        nonce:value.nonce, issued_epoch:value.issued_epoch,
+        expires_epoch:value.expires_epoch,
+        exact_schema:true, relative_path_validated:true,
+        path_resolution_verified:false, symlink_or_reparse_verified:false,
+        cas_verified:false, principal_verified:false,
+        publisher_verified:false, runtime_verified:false,
+        lease_consumed:false, broker_required:true,
+        authorizes_effect:false, invokes_filesystem:false,
+        invokes_process:false, invokes_network:false, invokes_ffi:false,
+        production_ready:false };
+}
+
+fn _evaluation_error(reason) {
+    return map{ ok:false, format:EVALUATION_FORMAT, error:reason,
+        broker_required:true, lease_claim_complete:false,
+        authorizes_effect:false, invokes_filesystem:false,
+        invokes_process:false, invokes_network:false, invokes_ffi:false,
+        production_ready:false };
+}
+
+fn evaluate(request, lease, evaluation_epoch, seen_nonces = nil) {
+    let prepared = prepare(request);
+    if not prepared.ok { return _evaluation_error("invalid-request:" + prepared.error); }
+    if not _exact(lease, LEASE_FIELDS) { return _evaluation_error("exact-lease-schema-required"); }
+    if lease.format != LEASE_FORMAT { return _evaluation_error("lease-format-mismatch"); }
+    if not _id(lease.lease_id) or not _id(lease.broker_id) {
+        return _evaluation_error("invalid-lease-identity");
+    }
+    if not _hex(lease.request_sha256) or not _hex(lease.workspace_sha256)
+        or not _hex(lease.document_sha256) or not _hex(lease.runtime_sha256)
+        or not _hex(lease.path_sha256) or not _hex(lease.expected_sha256)
+        or not _hex(lease.nonce) {
+        return _evaluation_error("invalid-lease-digest-or-nonce");
+    }
+    if type(lease.revoked) != "bool" or type(lease.single_use) != "bool"
+        or type(lease.consumed) != "bool" or not lease.single_use {
+        return _evaluation_error("single-use-lease-required");
+    }
+    if not _integer(evaluation_epoch, 0, 9007199254740991)
+        or not _integer(lease.issued_epoch, 0, 9007199254740991)
+        or not _integer(lease.expires_epoch, 0, 9007199254740991)
+        or lease.expires_epoch <= lease.issued_epoch
+        or lease.expires_epoch - lease.issued_epoch > MAX_LEASE_LIFETIME {
+        return _evaluation_error("expired-or-invalid-lease-lifetime");
+    }
+    if lease.issued_epoch < prepared.issued_epoch
+        or lease.expires_epoch > prepared.expires_epoch {
+        return _evaluation_error("lease-outside-request-lifetime");
+    }
+    if evaluation_epoch < prepared.issued_epoch
+        or evaluation_epoch >= prepared.expires_epoch {
+        return _evaluation_error("expired-request");
+    }
+    if evaluation_epoch < lease.issued_epoch or evaluation_epoch >= lease.expires_epoch {
+        return _evaluation_error("expired-lease");
+    }
+    if lease.revoked { return _evaluation_error("revoked-lease"); }
+    if lease.consumed { return _evaluation_error("consumed-lease"); }
+    if not _replay_ledger(seen_nonces) {
+        return _evaluation_error("bounded-replay-ledger-required");
+    }
+    if _has(seen_nonces, lease.nonce) { return _evaluation_error("replayed-lease-nonce"); }
+    if lease.request_sha256 != prepared.request_sha256
+        or lease.workspace_sha256 != prepared.workspace_sha256
+        or lease.document_sha256 != prepared.document_sha256
+        or lease.runtime_sha256 != prepared.runtime_sha256
+        or lease.path_sha256 != prepared.path_sha256
+        or lease.expected_sha256 != prepared.expected_sha256
+        or lease.nonce != prepared.nonce {
+        return _evaluation_error("lease-request-binding-mismatch");
+    }
+    if lease.operation != prepared.operation or lease.action_scope != prepared.action_scope {
+        return _evaluation_error("wrong-lease-action");
+    }
+    if lease.max_output_bytes != prepared.max_output_bytes
+        or lease.timeout_ms != prepared.timeout_ms {
+        return _evaluation_error("lease-resource-bound-mismatch");
+    }
+    return map{ ok:true, format:EVALUATION_FORMAT,
+        request_sha256:prepared.request_sha256,
+        lease_id:lease.lease_id, broker_id:lease.broker_id,
+        operation:prepared.operation,
+        lease_claim_complete:true, exact_schema:true,
+        digest_bindings_match:true, cas_claim_matches:true,
+        action_scope_matches:true, resource_bounds_match:true,
+        replay_claim_clear:true, path_resolution_verified:false,
+        symlink_or_reparse_verified:false, signature_verified:false,
+        principal_verified:false, publisher_verified:false,
+        runtime_verified:false, broker_required:true,
+        authorizes_effect:false, invokes_filesystem:false,
+        invokes_process:false, invokes_network:false, invokes_ffi:false,
+        production_ready:false };
+}
+
+fn mode(value) {
+    return if value == UNSAFE_COMPAT_MODE { UNSAFE_COMPAT_MODE } else { UNTRUSTED_MODE };
+}
+
+fn gate(mode_value, operation) {
+    if not _operation(operation) {
+        return map{ ok:false, format:GATE_FORMAT, mode:mode(mode_value),
+            operation:str(operation), allowed:false, reason:"unsupported-operation",
+            broker_required:true, unsafe_compatibility:false,
+            authorizes_effect:false, production_ready:false };
+    }
+    let selected = mode(mode_value);
+    if selected == UNTRUSTED_MODE {
+        return map{ ok:true, format:GATE_FORMAT, mode:selected,
+            operation:operation, allowed:false, reason:"broker_required",
+            broker_required:true, unsafe_compatibility:false,
+            authorizes_effect:false, production_ready:false };
+    }
+    return map{ ok:true, format:GATE_FORMAT, mode:selected,
+        operation:operation, allowed:true,
+        reason:"explicit_unsafe_local_compatibility",
+        broker_required:false, unsafe_compatibility:true,
+        authorizes_effect:true, production_ready:false };
+}
+
+// Executable test seam and explicit local-compatibility dispatcher. In the
+// default mode it returns without invoking the supplied callback. The callback
+// is accepted only for the visibly unsafe compatibility mode; this is not a
+// broker, authentication, or production authorization mechanism.
+fn dispatch(mode_value, operation, callback) {
+    let decision = gate(mode_value, operation);
+    if not decision.allowed {
+        return map{ ok:decision.ok, format:"pbide.effect-dispatch.v1",
+            mode:decision.mode, operation:decision.operation,
+            effect_attempted:false, effect_invoked:false,
+            effect_completion_verified:false,
+            broker_required:decision.broker_required,
+            unsafe_compatibility:false, production_ready:false,
+            reason:decision.reason };
+    }
+    let called = try map{ ok:true, value:callback() } catch map{ ok:false };
+    if not called.ok {
+        return map{ ok:false, format:"pbide.effect-dispatch.v1",
+            mode:decision.mode, operation:decision.operation,
+            effect_attempted:true, effect_invoked:true,
+            effect_completion_verified:false, broker_required:false,
+            unsafe_compatibility:true, production_ready:false,
+            reason:"unsafe-compatibility-callback-failed" };
+    }
+    return map{ ok:true, format:"pbide.effect-dispatch.v1",
+        mode:decision.mode, operation:decision.operation,
+        effect_attempted:true, effect_invoked:true,
+        effect_completion_verified:true, broker_required:false,
+        unsafe_compatibility:true, production_ready:false,
+        reason:decision.reason, value:called.value };
+}
+
+fn status() {
+    return map{ format:"pbide.effect-admission.status.v1",
+        default_mode:UNTRUSTED_MODE,
+        unsafe_compatibility_mode:UNSAFE_COMPAT_MODE,
+        guarded_operations:["open", "save", "run", "terminal"],
+        exact_request_binding:true, cas_claim_binding:true,
+        expiry_binding:true, replay_nonce_binding:true,
+        external_broker_required:true, same_vm_authorization:false,
+        path_resolution_verified:false, symlink_or_reparse_verified:false,
+        hard_preemption_verified:false, hostile_code_sandbox_verified:false,
+        immutable_runtime_handoff_verified:false,
+        publisher_authenticity_verified:false,
+        production_ready:false };
+}
+
+export REQUEST_FORMAT, LEASE_FORMAT, EVALUATION_FORMAT, GATE_FORMAT;
+export UNTRUSTED_MODE, UNSAFE_COMPAT_MODE;
+export MAX_PATH_CHARS, MAX_INPUT_BYTES, MAX_OUTPUT_BYTES, MAX_TIMEOUT_MS;
+export prepare, evaluate, mode, gate, dispatch, status;

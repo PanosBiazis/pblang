@@ -20,6 +20,24 @@ The browser IDE (`editors/ide/index.html`) is convenient, but a web IDE brings b
 
 A pblang-native IDE removes those layers. The whole IDE is a native window, a pixel buffer, input events, and pblang code under pblang's capability model. There is no DOM, no JS runtime, and no HTML renderer to exploit.
 
+This reduction in browser attack surface is not a complete hostile-code sandbox.
+PBIDE now starts in `untrusted` effect mode: direct Open, Save, Run, and Terminal
+actions fail closed before their filesystem or process builtin. The pure
+`stdlib/pbide_effect_admission.sapp` contract can prepare a digest-bound,
+bounded, expiring request, but it deliberately cannot authorize or execute it.
+A future out-of-process broker must independently authenticate the operator,
+verify the publisher and runtime/import closure, resolve paths without following
+symlinks or reparse points, enforce compare-and-swap, consume a single-use nonce,
+apply process containment, and execute the effect.
+
+For local compatibility only, an operator who launches the source directly with
+environment capability may set `PBIDE_UNSAFE_LOCAL_EFFECTS=1`. That restores the
+legacy direct actions and is explicitly unsafe: the setting is not authentication,
+does not provide hard preemption, and must not be used as release evidence. The
+canonical `pblang ide` launcher denies environment access, so it remains in the
+fail-closed mode. Other ambient PBIDE surfaces and startup reads still require a
+complete broker/sandbox migration before the IDE is production-ready.
+
 ---
 
 ## Architecture
@@ -30,6 +48,7 @@ A pblang-native IDE removes those layers. The whole IDE is a native window, a pi
         │  code editor | terminal | designer | AI | browser      │
         │  self-hosted run/check + toolchain status               │
         │  history snapshots + restore                           │
+        │  fail-closed effect admission (external broker needed) │
         ├───────────────────────────────────────────────────────┤
         │  stdlib/editor_model.sapp   buffer + cursor + edits   │
         │  stdlib/graphics.sapp       AA text + window/present   │
@@ -48,7 +67,7 @@ A pblang-native IDE removes those layers. The whole IDE is a native window, a pi
 ## Current native panels
 
 - **Code / document / media editor** — editor-style file tabs, syntax highlighting, selection, undo/redo, find, save, run, check, output pane, watcher, file preview, and a visible toolchain block showing the self-hosted pblang frontend plus native VM boundary. PBIDE now profiles TXT/CSV/DOC/DOCX/ODT/RTF/PPT/PPTX/XLS/XLSX/PDF/image/audio/video assets, shows active editor/player mode in the status bar, cycles preview modes, exposes tool palettes plus structured decoder/export/player backend readiness for document/spreadsheet/slides/PDF/image/audio/video workflows, and blocks unsafe direct Save for binary assets with explicit backend requirements.
-- **Terminal** — runs real PC commands through `proc_spawn_wait` when launched with `--allow-exec` or `--allow-all`.
+- **Terminal** — defaults to broker-required and performs no process launch. The legacy `proc_spawn_wait` path is available only when the source is launched with process/environment capability and the explicit `PBIDE_UNSAFE_LOCAL_EFFECTS=1` compatibility opt-in; that path is not sandboxed or production-ready.
 - **Design** — native visual designer with label/button/textbox/checkbox/radio/select/slider/panel plus document page/rich-text/image/table/media palette, app target mode (`gui` / `web` / `both` / `doc`), 2D chart, runnable 3D cube/ball widgets, scanner placeholders, N-dimensional item placeholders, custom/web component placeholders, and game-engine-style placeholders for camera, light, material, terrain, particles, physics body, prefab, and OpenGL/Vulkan-style render backend targets. It supports responsive layout cycling, bounded drag/move/edit behavior, snapped placement/drag/keyboard nudging/resizing, selection cycling, duplication, layer ordering, selected-widget property inspection, reusable component-library suggestions, document-output/export planning, and parse-checked `->CODE` generation into the editor.
 - **AI** — local pbAI assistant with quick actions: explain, bugs, improve, quality, comment. The assistant exposes structured analysis metadata, prompt-history recall, draft restoration, and raw scan metrics.
 - **Browser** — pblang-native safe Live/Reader/Source/Inspect view using `stdlib/browser.sapp` to enforce an HTTP/HTTPS URL policy, block unsafe schemes/private hosts/credential URLs/CRLF input/non-web service ports plus known ad/tracker/malicious URL patterns by default, fetch pages, decode entities, strip scripts/styles, extract page blocks/images/links/forms, create deterministic native layout boxes for Live mode, hit-test Live boxes for link navigation/image selection/form editing, clean noisy reader lines, deduplicate repeated navigation text, list discovered forms, show numbered HTML source, show F12-style details, resolve address-bar search queries through selectable search engines, keep local bookmarks, create policy-checked download plans, navigate back/forward/home, show page stats, and search visible page text. The Browser panel also has editor-style tabs: examples can seed several URLs, `Ctrl+T` opens a new tab, and `Ctrl+PageDown` / `Ctrl+PageUp` switch tabs while preserving per-tab mode, URL, scroll, page, reader, source, inspect, and form state. The Browser header now shows both the security policy and a native-interaction boundary line: links/forms/images are interactive, but full JavaScript/DOM execution is not native yet. `Host` is an explicit opt-in external snapshot fallback through `stdlib/browser_render.sapp`, and `JS/DOM` is an explicit host-render security profile rather than the default pblang-native renderer.
