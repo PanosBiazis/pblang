@@ -1,0 +1,185 @@
+let Effects = import("stdlib:pbide_effect_admission.sapp");
+
+fn require(value, message) {
+    if not value { throw "FAIL pbide effect admission: " + message; }
+}
+
+fn request(operation = "save") {
+    return map{ format:Effects.REQUEST_FORMAT, request_id:"request-001",
+        workspace_sha256:str_repeat("1", 64), document_sha256:str_repeat("2", 64),
+        runtime_sha256:str_repeat("3", 64), operation:operation,
+        relative_path:"src/main.sapp", payload_sha256:str_repeat("4", 64),
+        expected_sha256:str_repeat("5", 64), input_bytes:128,
+        max_output_bytes:4096, timeout_ms:5000, nonce:str_repeat("6", 64),
+        issued_epoch:1000, expires_epoch:1100, action_scope:operation };
+}
+
+fn lease(prepared, operation = "save") {
+    return map{ format:Effects.LEASE_FORMAT, lease_id:"lease-001",
+        request_sha256:prepared.request_sha256,
+        workspace_sha256:prepared.workspace_sha256,
+        document_sha256:prepared.document_sha256,
+        runtime_sha256:prepared.runtime_sha256,
+        operation:operation, path_sha256:prepared.path_sha256,
+        expected_sha256:prepared.expected_sha256,
+        max_output_bytes:prepared.max_output_bytes, timeout_ms:prepared.timeout_ms,
+        nonce:prepared.nonce, issued_epoch:1000, expires_epoch:1100,
+        action_scope:operation, broker_id:"broker-local-001",
+        revoked:false, single_use:true, consumed:false };
+}
+
+let untrusted = Effects.gate("untrusted", "save");
+require(untrusted.ok and not untrusted.allowed and untrusted.reason == "broker_required"
+    and not untrusted.authorizes_effect and not untrusted.production_ready,
+    "untrusted mode fails before filesystem effects");
+for operation in ["open", "save", "run", "terminal"] {
+    let denied = Effects.gate("unknown-mode", operation);
+    require(denied.mode == Effects.UNTRUSTED_MODE and not denied.allowed
+        and denied.broker_required, "unknown modes fail closed for " + operation);
+}
+for operation in ["shell", "ffi", "network", "publish"] {
+    require(not Effects.gate(Effects.UNSAFE_COMPAT_MODE, operation).allowed,
+        "out-of-contract operation fails even in unsafe compatibility mode: " + operation);
+}
+let unsafe = Effects.gate(Effects.UNSAFE_COMPAT_MODE, "save");
+require(unsafe.allowed and unsafe.unsafe_compatibility and unsafe.authorizes_effect
+    and not unsafe.production_ready,
+    "direct local behavior requires an explicit unsafe compatibility label");
+
+let effects = map{ count:0 };
+for operation in ["open", "save", "run", "terminal", "run"] {
+    let denied_dispatch = Effects.dispatch(Effects.UNTRUSTED_MODE, operation, fn() {
+        effects.count = effects.count + 1;
+        return "unexpected";
+    });
+    require(not denied_dispatch.effect_attempted and not denied_dispatch.effect_invoked
+        and not denied_dispatch.effect_completion_verified and denied_dispatch.broker_required,
+        "denied action never invokes its effect callback: " + operation);
+}
+require(effects.count == 0, "denied Open/Save/Run/preview/Terminal have zero callback effects");
+let unsafe_dispatch = Effects.dispatch(Effects.UNSAFE_COMPAT_MODE, "save", fn() {
+    effects.count = effects.count + 1;
+    return "compat";
+});
+require(unsafe_dispatch.effect_invoked and unsafe_dispatch.value == "compat"
+    and unsafe_dispatch.effect_attempted and unsafe_dispatch.effect_completion_verified
+    and effects.count == 1 and not unsafe_dispatch.production_ready,
+    "instrumentation distinguishes explicit unsafe compatibility execution");
+let throwing_dispatch = Effects.dispatch(Effects.UNSAFE_COMPAT_MODE, "run", fn() {
+    effects.count = effects.count + 1;
+    throw "expected callback failure";
+});
+require(not throwing_dispatch.ok and throwing_dispatch.effect_attempted
+    and throwing_dispatch.effect_invoked and not throwing_dispatch.effect_completion_verified
+    and effects.count == 2,
+    "a throwing callback never produces false no-effect evidence");
+
+let base = request();
+let prepared = Effects.prepare(base);
+require(prepared.ok and prepared.exact_schema and prepared.relative_path_validated
+    and not prepared.path_resolution_verified and not prepared.symlink_or_reparse_verified
+    and prepared.broker_required and not prepared.authorizes_effect
+    and not prepared.invokes_filesystem and not prepared.invokes_process
+    and not prepared.invokes_network and not prepared.invokes_ffi,
+    "request preparation is bounded metadata and grants no effect");
+
+let claim = lease(prepared);
+let evaluated = Effects.evaluate(base, claim, 1050, []);
+require(evaluated.ok and evaluated.lease_claim_complete
+    and evaluated.digest_bindings_match and evaluated.cas_claim_matches
+    and evaluated.action_scope_matches and evaluated.replay_claim_clear
+    and not evaluated.signature_verified and not evaluated.principal_verified
+    and not evaluated.runtime_verified and evaluated.broker_required
+    and not evaluated.authorizes_effect and not evaluated.production_ready,
+    "complete caller claims still require an external broker");
+
+let traversal = request(); traversal.relative_path = "../escape.sapp";
+require(Effects.prepare(traversal).error == "unsafe-relative-path",
+    "parent traversal fails closed");
+let absolute = request(); absolute.relative_path = "/private/main.sapp";
+require(Effects.prepare(absolute).error == "unsafe-relative-path",
+    "absolute paths fail closed");
+let windows = request(); windows.relative_path = "C:/private/main.sapp";
+require(Effects.prepare(windows).error == "unsafe-relative-path",
+    "drive-qualified paths fail closed");
+let control = request(); control.relative_path = "src/ma" + strfromcharcode(0) + "in.sapp";
+require(Effects.prepare(control).error == "unsafe-relative-path",
+    "NUL paths fail closed");
+let confusable = request(); confusable.relative_path = "src/m\u0430in.sapp";
+require(Effects.prepare(confusable).error == "unsafe-relative-path",
+    "non-ASCII confusable paths fail closed");
+
+let oversized = request(); oversized.input_bytes = Effects.MAX_INPUT_BYTES + 1;
+require(Effects.prepare(oversized).error == "invalid-resource-bound",
+    "oversized input fails closed");
+let output_bomb = request(); output_bomb.max_output_bytes = Effects.MAX_OUTPUT_BYTES + 1;
+require(Effects.prepare(output_bomb).error == "invalid-resource-bound",
+    "oversized output fails closed");
+let timeout = request(); timeout.timeout_ms = Effects.MAX_TIMEOUT_MS + 1;
+require(Effects.prepare(timeout).error == "invalid-resource-bound",
+    "oversized timeout fails closed");
+let infinity = num_pow(2.0, 1100.0);
+let not_a_number = request(); not_a_number.timeout_ms = infinity + (0.0 - infinity);
+require(Effects.prepare(not_a_number).error == "invalid-resource-bound",
+    "NaN resource bounds fail closed");
+let positive_infinity = request(); positive_infinity.input_bytes = infinity;
+require(Effects.prepare(positive_infinity).error == "invalid-resource-bound",
+    "positive infinity resource bounds fail closed");
+let negative_infinity = request(); negative_infinity.max_output_bytes = 0.0 - infinity;
+require(Effects.prepare(negative_infinity).error == "invalid-resource-bound",
+    "negative infinity resource bounds fail closed");
+let wrong_scope = request(); wrong_scope.action_scope = "run";
+require(Effects.prepare(wrong_scope).error == "wrong-action-scope",
+    "wrong request action scope fails closed");
+let extra = request(); extra.shell = "rm";
+require(Effects.prepare(extra).error == "exact-request-schema-required",
+    "shell-like extra fields fail exact schema");
+
+let stale = lease(prepared); stale.expected_sha256 = str_repeat("7", 64);
+require(Effects.evaluate(base, stale, 1050, []).error == "lease-request-binding-mismatch",
+    "stale CAS expectation fails closed");
+let replay = lease(prepared);
+require(Effects.evaluate(base, replay, 1050, [prepared.nonce]).error
+    == "replayed-lease-nonce", "replay nonce fails closed");
+let malformed_replay = lease(prepared);
+require(Effects.evaluate(base, malformed_replay, 1050, [map{nonce:prepared.nonce}]).error
+    == "bounded-replay-ledger-required", "nested replay-ledger entries fail closed");
+let uppercase_replay = lease(prepared);
+require(Effects.evaluate(base, uppercase_replay, 1050, [str_repeat("A", 64)]).error
+    == "bounded-replay-ledger-required", "non-canonical replay-ledger entries fail closed");
+let duplicate_replay = lease(prepared);
+require(Effects.evaluate(base, duplicate_replay, 1050,
+    [str_repeat("7", 64), str_repeat("7", 64)]).error
+    == "bounded-replay-ledger-required", "duplicate replay-ledger entries fail closed");
+let expired = lease(prepared);
+require(Effects.evaluate(base, expired, 1100, []).error
+    == "expired-request", "expired request fails even when a lease reaches the same boundary");
+let lease_outlives_request = lease(prepared); lease_outlives_request.expires_epoch = 1200;
+require(Effects.evaluate(base, lease_outlives_request, 1050, []).error
+    == "lease-outside-request-lifetime", "lease lifetime must be contained by the request");
+let shorter_lease = lease(prepared); shorter_lease.issued_epoch = 1020; shorter_lease.expires_epoch = 1040;
+require(Effects.evaluate(base, shorter_lease, 1050, []).error
+    == "expired-lease", "lease expiry is enforced inside a still-valid request");
+let revoked = lease(prepared); revoked.revoked = true;
+require(Effects.evaluate(base, revoked, 1050, []).error == "revoked-lease",
+    "revoked lease fails closed");
+let consumed = lease(prepared); consumed.consumed = true;
+require(Effects.evaluate(base, consumed, 1050, []).error == "consumed-lease",
+    "consumed single-use lease fails closed");
+let wrong_action = lease(prepared, "run");
+require(Effects.evaluate(base, wrong_action, 1050, []).error == "wrong-lease-action",
+    "wrong lease action fails closed");
+let missing_replay_ledger = lease(prepared);
+require(Effects.evaluate(base, missing_replay_ledger, 1050).error
+    == "bounded-replay-ledger-required", "external replay ledger is mandatory");
+
+let status = Effects.status();
+require(status.default_mode == "untrusted" and status.external_broker_required
+    and not status.same_vm_authorization and not status.hard_preemption_verified
+    and not status.hostile_code_sandbox_verified
+    and not status.immutable_runtime_handoff_verified
+    and not status.publisher_authenticity_verified
+    and not status.production_ready,
+    "status preserves every unverified VM and OS boundary");
+
+print "pbide_effect_admission_pass";
