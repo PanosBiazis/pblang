@@ -1,0 +1,207 @@
+// Capability-free, bounded evaluator for a narrow PBFP/PBCK subset.
+//
+// This is not a hostile-code sandbox. It runs in-process, has no hard wall
+// timeout, and cannot prove a cumulative heap ceiling. The only public input is
+// an integrity-checked byte array; caller options, globals, adapters, paths and
+// prepared programs are never accepted.
+
+let Binary = import("stdlib:host_pbck_frame_binary.sapp");
+let FrameVM = import("stdlib:host_pbck_frame_vm.sapp");
+let Plan = import("stdlib:host_pbck_frame_plan.sapp");
+
+let FORMAT = "pblang.host-pbck.pure-evaluator.v1";
+let REQUEST_FORMAT = "pblang.host-pbck.pure-evaluator.request.v1";
+let SCHEMA_VERSION = 1;
+let MAX_ASSET_BYTES = 262144;
+let MAX_TEXT_BYTES = 65536;
+let MAX_FUNCTIONS = 256;
+let MAX_INSTRUCTIONS = 32768;
+let MAX_CONSTANTS = 4096;
+let MAX_CAPTURES = 4096;
+let MAX_PARAMETERS = 256;
+let MAX_DEPTH = 16;
+let MAX_STEPS = 32768;
+let MAX_FRAMES = 32;
+let MAX_STACK = 512;
+let MAX_LOCALS = 512;
+let MAX_OUTPUT = 32;
+let MAX_COLLECTION_ITEMS = 256;
+let MAX_RESULT_DEPTH = 24;
+let MAX_RESULT_NODES = 4096;
+let MAX_RESULT_TEXT_BYTES = 65536;
+let MAX_RESULT_ENTRIES = 4096;
+
+let PURE_BUILTINS = [
+    "constant_time_eq", "is_array", "is_fn", "is_map", "is_number",
+    "is_string", "len", "num_abs", "num_floor", "num_max", "num_min",
+    "num_mod", "bit_and", "bit_not", "bit_or", "bit_shl", "bit_shr",
+    "bit_xor", "str_contains", "str_ends_with", "str_index_of",
+    "str_starts_with", "strcharcodeat", "type"
+];
+let _PURE_INDEX = map{};
+for name in PURE_BUILTINS { _PURE_INDEX[name] = true; }
+
+let SAFE_OPCODES = [
+    0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 19, 21,
+    25, 26, 27, 28, 30, 31, 32, 33, 35, 36, 37, 38, 39, 40,
+    43, 45, 46
+];
+let _OPCODE_INDEX = map{};
+for opcode in SAFE_OPCODES { _OPCODE_INDEX[str(opcode)] = true; }
+
+let OPTIONS = map{
+    max_asset_bytes: MAX_ASSET_BYTES, max_text_bytes: MAX_TEXT_BYTES,
+    max_slots: 4096, max_functions: MAX_FUNCTIONS,
+    max_instructions: MAX_INSTRUCTIONS, max_constants: MAX_CONSTANTS,
+    max_captures: MAX_CAPTURES, max_parameters: MAX_PARAMETERS,
+    max_depth: MAX_DEPTH, max_steps: MAX_STEPS, max_frames: MAX_FRAMES,
+    max_stack: MAX_STACK, max_locals: MAX_LOCALS, max_output: MAX_OUTPUT,
+    max_collection_items: MAX_COLLECTION_ITEMS,
+    pure_builtin_allowlist: PURE_BUILTINS
+};
+
+fn _failure(code) { return map{ ok: false, format: FORMAT, code: code }; }
+
+fn _exact_request(request) {
+    return is_map(request)
+        and len(request) == 3
+        and map_has(request, "asset_bytes")
+        and map_has(request, "format")
+        and map_has(request, "schema_version")
+        and (try request.format catch "") == REQUEST_FORMAT
+        and (try request.schema_version catch 0) == SCHEMA_VERSION;
+}
+
+fn _validated_bytes(value) {
+    if not is_array(value) or len(value) < 1 or len(value) > MAX_ASSET_BYTES { return false; }
+    for byte in value {
+        if not is_number(byte) or byte != num_floor(byte) or byte < 0 or byte > 255 {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn _finite(value) {
+    return not str_contains(str_lower(str(value)), "nan")
+        and not str_contains(str_lower(str(value)), "inf");
+}
+
+fn _allowed_global(value) {
+    return is_string(value) and map_has(_PURE_INDEX, value);
+}
+
+fn _preflight(plan) {
+    if not Plan.validate(plan).ok or plan.artifact_bytes > MAX_ASSET_BYTES { return false; }
+    for function in plan.functions { if function.is_vararg { return false; } }
+    let i = 0;
+    while i < len(plan.constant_kinds) {
+        let kind = plan.constant_kinds[i];
+        if kind == 4 or kind == 5 { return false; }
+        if kind == 0 and not _finite(plan.constant_numbers[i]) { return false; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(plan.opcodes) {
+        let opcode = plan.opcodes[i];
+        if not map_has(_OPCODE_INDEX, str(opcode)) { return false; }
+        if opcode == 14 and not _allowed_global(
+            try Plan.value_at(plan, plan.operands[i]) catch nil) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _copy_result(value, budget, depth) {
+    if depth > MAX_RESULT_DEPTH { throw "result-depth"; }
+    budget.nodes = budget.nodes + 1;
+    if budget.nodes > MAX_RESULT_NODES { throw "result-nodes"; }
+    if value == nil or is_bool(value) { return value; }
+    if is_number(value) {
+        if not _finite(value) { throw "result-number"; }
+        return value;
+    }
+    if is_string(value) {
+        budget.text_bytes = budget.text_bytes + len(str_to_bytes(value));
+        if budget.text_bytes > MAX_RESULT_TEXT_BYTES { throw "result-text"; }
+        return str_slice(value, 0, len(value));
+    }
+    if is_array(value) {
+        budget.entries = budget.entries + len(value);
+        if len(value) > MAX_COLLECTION_ITEMS or budget.entries > MAX_RESULT_ENTRIES {
+            throw "result-entries";
+        }
+        let out = [];
+        for item in value { array_push(out, _copy_result(item, budget, depth + 1)); }
+        return out;
+    }
+    if is_map(value) {
+        for marker in ["__pbck_adapter", "__pbck_closure", "__pbck_function", "__pbck_numeric"] {
+            if map_has(value, marker) { throw "result-marker"; }
+        }
+        let keys = array_sort(map_keys(value));
+        budget.entries = budget.entries + len(keys);
+        if len(keys) > MAX_COLLECTION_ITEMS or budget.entries > MAX_RESULT_ENTRIES {
+            throw "result-entries";
+        }
+        let out = map{};
+        for key in keys {
+            if not is_string(key) or str_starts_with(key, "__pbck_") { throw "result-key"; }
+            budget.text_bytes = budget.text_bytes + len(str_to_bytes(key));
+            if budget.text_bytes > MAX_RESULT_TEXT_BYTES { throw "result-text"; }
+            out[key] = _copy_result(value[key], budget, depth + 1);
+        }
+        return out;
+    }
+    throw "result-type";
+}
+
+fn _evaluate_bytes(bytes) {
+    let before = sha256(base64_encode_bytes(bytes));
+    let plan = Binary.decode(bytes, OPTIONS);
+    if not _preflight(plan) { throw "preflight"; }
+    let prepared = FrameVM.prepare(plan, OPTIONS);
+    let executed = FrameVM.run_prepared(prepared, OPTIONS, nil);
+    if before != sha256(base64_encode_bytes(bytes)) { throw "input-mutated"; }
+    let budget = map{ nodes: 0, text_bytes: 0, entries: 0 };
+    let value = _copy_result(executed.value, budget, 0);
+    let output = _copy_result(executed.output, budget, 0);
+    return map{ ok: true, format: FORMAT, code: "ok",
+        value: value, output: output,
+        asset_base64_sha256: before,
+        asset_digest_algorithm: "sha256-of-canonical-base64-v1",
+        runtime: map{ steps: executed.runtime.steps,
+            peak_frames: executed.runtime.peak_frames,
+            peak_stack: executed.runtime.peak_stack,
+            peak_locals: executed.runtime.peak_locals,
+            tail_calls: executed.runtime.tail_calls,
+            host_calls: executed.runtime.host_calls },
+        deterministic: true, grants_authority: false,
+        bounded_pure_evaluator: true, hostile_code_sandbox: false };
+}
+
+fn evaluate(request) {
+    if not _exact_request(request) { return _failure("invalid-request"); }
+    if not _validated_bytes(request.asset_bytes) { return _failure("invalid-asset"); }
+    let attempted = try map{ ok: true, value: _evaluate_bytes(request.asset_bytes) }
+        catch map{ ok: false };
+    if not attempted.ok { return _failure("evaluation-rejected"); }
+    return attempted.value;
+}
+
+fn status() {
+    return map{ format: "pblang.host-pbck.pure-evaluator.status.v1",
+        bounded_pure_evaluator: true, exact_request_schema: true,
+        byte_input_only: true, caller_options: false, caller_globals: false,
+        caller_adapters: false, filesystem_input: false,
+        evaluator_owned_builtin_allowlist: true,
+        bounded_result_projection: true, deterministic: true,
+        hard_wall_timeout: false, cumulative_heap_bound_verified: false,
+        process_isolation: false, hostile_code_sandbox: false,
+        artifact_integrity: "sha256-canonical-base64-payload",
+        artifact_authenticity: false, grants_authority: false };
+}
+
+export FORMAT, REQUEST_FORMAT, SCHEMA_VERSION, evaluate, status;

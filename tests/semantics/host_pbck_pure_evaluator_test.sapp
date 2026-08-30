@@ -1,0 +1,122 @@
+let Evaluator = import("stdlib:host_pbck_pure_evaluator.sapp");
+let Binary = import("stdlib:host_pbck_frame_binary.sapp");
+let Plan = import("stdlib:host_pbck_frame_plan.sapp");
+
+fn fail(message) { throw "FAIL host PBCK pure evaluator: " + message; }
+fn require(value, message) { if not value { fail(message); } }
+
+fn bytes_for(instructions, constants) {
+    let decoded = map{ format: "host-pbck-v1", version: 1, artifact_bytes: 128,
+        chunk: map{ instructions: instructions, constants: constants, source_name: nil } };
+    return Binary.encode_plan(Plan.build_decoded(decoded));
+}
+fn request(bytes) { return map{ format: Evaluator.REQUEST_FORMAT,
+    schema_version: Evaluator.SCHEMA_VERSION, asset_bytes: bytes }; }
+fn rejected(bytes) { return not Evaluator.evaluate(request(bytes)).ok; }
+
+let scalar = bytes_for([
+    map{ op: 0, operand: 0 }, map{ op: 0, operand: 1 },
+    map{ op: 3 }, map{ op: 33 }
+], [6, 7]);
+let original = slice(scalar, 0, len(scalar));
+let first = Evaluator.evaluate(request(scalar));
+let second = Evaluator.evaluate(request(scalar));
+require(first.ok and first.value == 42 and first == second and scalar == original,
+    "deterministic scalar result preserves caller bytes");
+require(first.asset_digest_algorithm == "sha256-of-canonical-base64-v1"
+    and len(first.asset_base64_sha256) == 64 and not map_has(first, "asset_sha256"),
+    "artifact digest names the exact representation and algorithm");
+require(not map_has(first, "globals") and not map_has(first, "exports")
+    and not first.grants_authority and not first.hostile_code_sandbox,
+    "internal state and authority are not exposed");
+
+let allowed_builtin = bytes_for([
+    map{ op: 14, operand: 0 }, map{ op: 0, operand: 1 },
+    map{ op: 31, operand: 1 }, map{ op: 33 }
+], ["num_abs", -9]);
+require(Evaluator.evaluate(request(allowed_builtin)).value == 9,
+    "evaluator-owned scalar builtin allowlist works");
+
+let extra = request(scalar); extra.adapters = map{};
+require(Evaluator.evaluate(extra).code == "invalid-request", "extra request field rejected");
+let globals = request(scalar); globals.globals = map{};
+require(Evaluator.evaluate(globals).code == "invalid-request", "caller globals rejected");
+require(Evaluator.evaluate(map{}).code == "invalid-request", "missing schema rejected");
+let bad_byte = request(scalar); bad_byte.asset_bytes = [256];
+require(Evaluator.evaluate(bad_byte).code == "invalid-asset", "invalid byte rejected");
+
+let tampered = slice(scalar, 0, len(scalar)); tampered[12] = bit_xor(tampered[12], 1);
+require(rejected(tampered), "bad digest rejected");
+let trailing = slice(scalar, 0, len(scalar)); array_push(trailing, 0);
+require(rejected(trailing), "trailing byte rejected");
+let bad_magic = slice(scalar, 0, len(scalar)); bad_magic[0] = 0;
+require(rejected(bad_magic), "bad magic rejected");
+let bad_version = slice(scalar, 0, len(scalar)); bad_version[4] = 2;
+require(rejected(bad_version), "bad version rejected");
+
+for name in ["json_parse", "regex_match", "http_response", "str_repeat",
+    "fs_read", "http_get", "proc_spawn_wait", "ffi_load", "env_get", "now_ms", "random_bytes"] {
+    let denied = bytes_for([
+        map{ op: 14, operand: 0 }, map{ op: 0, operand: 1 },
+        map{ op: 31, operand: 1 }, map{ op: 33 }
+    ], [name, "x"]);
+    require(rejected(denied), "forbidden host name rejected: " + name);
+}
+
+let forged_adapter = bytes_for([
+    map{ op: 0, operand: 0 }, map{ op: 0, operand: 1 },
+    map{ op: 20, operand: 1 }, map{ op: 31, operand: 0 }, map{ op: 33 }
+], ["__pbck_adapter", "len"]);
+require(rejected(forged_adapter), "forged adapter marker rejected");
+let map_growth = bytes_for([
+    map{ op: 0, operand: 0 }, map{ op: 0, operand: 1 },
+    map{ op: 20, operand: 1 }, map{ op: 0, operand: 2 },
+    map{ op: 0, operand: 3 }, map{ op: 22 }, map{ op: 33 }
+], ["x", 1, "y", 2]);
+require(rejected(map_growth), "map growth opcodes rejected");
+let defer_growth = bytes_for([
+    map{ op: 0, operand: 0 }, map{ op: 34 }, map{ op: 0, operand: 1 }, map{ op: 33 }
+], [nil, 1]);
+require(rejected(defer_growth), "defer growth opcode rejected");
+
+let loop = bytes_for([map{ op: 35, operand: 0 }], []);
+require(rejected(loop), "step-bounded infinite loop rejected");
+let output_ops = []; let output_constants = [];
+let oi = 0; while oi < 33 {
+    array_push(output_constants, oi); array_push(output_ops, map{ op: 0, operand: oi });
+    array_push(output_ops, map{ op: 12 }); oi = oi + 1;
+}
+array_push(output_constants, nil); array_push(output_ops, map{ op: 0, operand: 33 });
+array_push(output_ops, map{ op: 33 });
+require(rejected(bytes_for(output_ops, output_constants)), "output item ceiling enforced");
+
+let too_many = []; let ci = 0;
+while ci < 257 { array_push(too_many, ci); ci = ci + 1; }
+let collection_ops = []; ci = 0;
+while ci < len(too_many) { array_push(collection_ops, map{ op: 0, operand: ci }); ci = ci + 1; }
+array_push(collection_ops, map{ op: 19, operand: len(too_many) });
+array_push(collection_ops, map{ op: 33 });
+require(rejected(bytes_for(collection_ops, too_many)), "collection ceiling enforced");
+
+let deep_ops = []; let deep_constants = [1];
+array_push(deep_ops, map{ op: 0, operand: 0 });
+let di = 0; while di < 25 { array_push(deep_ops, map{ op: 19, operand: 1 }); di = di + 1; }
+array_push(deep_ops, map{ op: 33 });
+require(rejected(bytes_for(deep_ops, deep_constants)), "deep result rejected");
+let overflow = num_exp(10000);
+let second_overflow = num_exp(9999);
+let nan = bytes_for([map{ op: 0, operand: 0 }, map{ op: 33 }], [overflow - second_overflow]);
+let inf = bytes_for([map{ op: 0, operand: 0 }, map{ op: 33 }], [overflow]);
+require(rejected(nan) and rejected(inf), "non-finite constants rejected");
+let bigint = bytes_for([map{ op: 0, operand: 0 }, map{ op: 33 }],
+    [map{ __pbck_numeric: "bigint", text: "9007199254740993" }]);
+require(rejected(bigint), "bigint constant rejected");
+
+let state = Evaluator.status();
+require(state.bounded_pure_evaluator and state.evaluator_owned_builtin_allowlist
+    and not state.hard_wall_timeout and not state.cumulative_heap_bound_verified
+    and not state.process_isolation and not state.hostile_code_sandbox
+    and not state.artifact_authenticity and not state.grants_authority,
+    "status preserves honest isolation limits");
+
+print "host_pbck_pure_evaluator_pass";
