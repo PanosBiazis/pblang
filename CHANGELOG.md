@@ -28,6 +28,18 @@
 
 ## Unreleased
 
+- Made the AAP portfolio CLI and PBIDE Management board fail closed with
+  `status=unavailable` and no reports, findings, focus queue, portfolio actions
+  or ideas while their content collector still depends on post-materialization
+  `fs_listdir` enumeration. Bounded one-root strict metadata shards remain the
+  only admitted scan path.
+- Extended irreversible strict-scan cleanup poisoning across every failed
+  descriptor, allocation and libc-handle cleanup primitive. Successful outer
+  aborts cannot erase an incoming cleanup ambiguity, component walks stop after
+  failed cleanup, and a child descriptor is never retried after its first close
+  attempt. Two isolated child probes cover operation-resource failure and an
+  incoming cleanup-failed result; repeated clean admitted cycles remain
+  reusable. Direct-VFS wording no longer implies physical storage locality.
 - Added fail-closed held-root VFS policy admission to the experimental Linux
   strict inventory. A bounded preflight validates mount-table byte/line/field
   ceilings before row allocation, the held descriptor's split-u64 mount ID must

@@ -1,7 +1,56 @@
 # pblang — Current Status
 
-**Last Updated**: 2026-08-31
+**Last Updated**: 2026-09-01
 **Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
+
+## 2026-09-01 - Terminal cleanup poison across strict enumeration
+
+Every failed Linux `close`, `free`, or libc-handle cleanup in `linux_dirfs` now
+sets one irreversible process-local poison before any later strict mount
+admission. Structured cleanup errors retain the exact poison code and cannot be
+downgraded by a successful outer abort. Root opening, component walks,
+enumeration restart, normal enumeration, handle closure and transient FFI
+fallbacks all propagate the same terminal state.
+
+A child descriptor is removed from the private operation state immediately
+after its single close attempt, regardless of the reported result. Linux may
+consume descriptor ownership even when close reports an error, so the same
+numeric fd is never retried. Isolated disposable-child regressions cover both
+an invalid tracked operation resource and an incoming cleanup-failed result;
+both must clear the operation registry and deny the next admission before it
+opens a root. Eight clean open/enumerate/recheck/close cycles prove that
+successful cleanup does not poison or consume reusable capacity.
+
+This closes the known long-lived cleanup-ambiguity P1, but does not change the
+scanner's deployment contract: each root still runs in a fresh disposable
+process under external limits. Direct-VFS admission is not physical-locality,
+mount-namespace-trust or procfs-authenticity evidence. Hard heap enforcement,
+VM-level hard preemption, snapshot consistency, VM-enforced typed FFI/raw
+bypass closure, hostile-code sandboxing, publisher authenticity and physical
+Windows/macOS verification remain blockers. Scan-derived ideas, training and
+repository creation remain disabled while `idea_admission_eligible=false`.
+
+Sixteen fresh one-root metadata shards then covered every declared product
+root under `AAP/products`. Fifteen completed two stable passes immediately.
+The first `pb-mcp-server` shard failed closed with six
+`entry-identity-race` observations; one new disposable-process retry completed
+two stable passes with 27 records and no entry errors. Across the successful
+final observations, no shard exposed paths, records, mount identities or
+filesystem types in its public evidence. Empty/planned roots remained visible
+as one root-directory record rather than being mistaken for implemented
+products. Every shard still reported `hard_heap_bound=false`,
+`hard_wall_timeout=false`, `snapshot_consistent=false`,
+`ffi_symbol_contract_verified=false`, `production_ready=false` and
+`idea_admission_eligible=false`.
+
+The compatibility `pbaap_status` content audit and PBIDE Management board are
+now fail-closed as `status=unavailable`. Their legacy `fs_listdir` inventory
+materializes a host directory listing before applying its entry ceiling;
+missing FFI authority also previously collapsed into synthetic zero-record
+project blockers. Strict mode therefore emits no reports, findings, ranked
+focus, portfolio actions or ideas until text collection uses
+descriptor-streaming enumeration. This is a real content-audit blocker, not
+documentation-only debt.
 
 ## 2026-08-31 - Held-root VFS policy admission
 
