@@ -3,6 +3,31 @@
 **Last Updated**: 2026-08-31
 **Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
 
+## 2026-08-31 - Two-pass namespace observation
+
+The Linux strict inventory can now observe one held, caller-approved root twice.
+It permits exactly one generation restart, preserves the cumulative call quota,
+requires all child traversal tokens to be consumed first, rechecks the root
+identity, rewinds the held directory stream, and rotates the private token
+secret. The comparison uses exact private tuples for relative path, quad-state,
+error state, depth, and parent; these tuples, sensitive names, absolute roots,
+mount identities, inodes, and traversal tokens are removed from public reports.
+
+Matching complete passes plus successful handle cleanup produce only
+`two_pass_stability_observed=true`. A difference produces
+`namespace_change_observed=true`; operational, partial, or cleanup failure
+produces `observation_inconclusive=true`. The measured total duration includes
+both passes, but their budgets remain cooperative and exclude setup/restart/
+cleanup overhead from preemptive enforcement, so `hard_wall_timeout=false` and
+`total_wall_runtime_bounded=false` remain explicit.
+
+This closes neither namespace snapshot consistency nor any wider production
+blocker. VM-enforced typed FFI/raw bypass closure, hard wall-clock preemption,
+hard heap enforcement, hostile-code sandboxing, publisher authenticity, and
+physical Windows/macOS verification remain required. Scan evidence still has
+`idea_admission_eligible=false`; it cannot feed pbAI/PBLang training, automatic
+implementation, repository creation, or PBOS external effects.
+
 ## 2026-08-31 - Strict inventory cleanup authority and denial regressions
 
 The Linux strict inventory slice now rejects invalid native pointers before
