@@ -44,6 +44,10 @@ let _enumeration_contexts = map{};
 let _strict_enum_operations = map{};
 
 fn _error(message) { return map{ ok: false, error: message }; }
+fn _cleanup_error(message) {
+    return map{ ok: false, error: message, cleanup_failed: true,
+        invalidate_handle: true };
+}
 fn _first_existing(paths) {
     let i = 0;
     while i < len(paths) { if try fs_exists(paths[i]) catch false { return paths[i]; } i = i + 1; }
@@ -156,13 +160,13 @@ fn _call(fs, symbol, signature, args) {
         return try _typed_call(fs, "close", "i32->i32", args) catch -1;
     }
     if symbol == "strdup" and signature == "string->ptr" {
-        return try _typed_call(fs, "strdup", "string->ptr", args) catch -1;
+        return try _typed_call(fs, "strdup", "string->ptr", args) catch nil;
     }
     if symbol == "free" and signature == "ptr->void" {
         return try _typed_call(fs, "free", "ptr->void", args) catch -1;
     }
     if symbol == "calloc" and signature == "i64,i64->ptr" {
-        return try _typed_call(fs, "calloc", "i64,i64->ptr", args) catch -1;
+        return try _typed_call(fs, "calloc", "i64,i64->ptr", args) catch nil;
     }
     if symbol == "read" and signature == "i32,ptr,i64->i64" {
         return try _typed_call(fs, "read", "i32,ptr,i64->i64", args) catch -1;
@@ -247,29 +251,65 @@ fn sanitize_path(value) {
     }
     return value;
 }
-fn _cstring(fs, value) { return _call(fs, "strdup", "string->ptr", [value]); }
-fn _free(fs, pointer) { if pointer != nil and pointer != 0 { _call(fs, "free", "ptr->void", [pointer]); } }
+fn _positive_pointer(pointer) {
+    return type(pointer) == "number" and pointer == num_floor(pointer) and pointer > 0;
+}
+fn _cstring(fs, value) {
+    let pointer = _call(fs, "strdup", "string->ptr", [value]);
+    if not _positive_pointer(pointer) { return nil; }
+    return pointer;
+}
+fn _free(fs, pointer) {
+    if pointer == nil or pointer == 0 { return true; }
+    if not _positive_pointer(pointer) { return false; }
+    return try { _typed_call(fs, "free", "ptr->void", [pointer]); true } catch false;
+}
+fn _cleanup_authority_available(fs) {
+    // Probe symbol invocation before acquiring any descriptor or allocation.
+    // free(NULL) is a defined no-op; close(-1) returns EBADF but still proves
+    // that the cleanup symbol was admitted by the VM's exact FFI policy.
+    let free_invoked = try {
+        _typed_call(fs, "free", "ptr->void", [0]);
+        true
+    } catch false;
+    let close_invoked = try {
+        _typed_call(fs, "close", "i32->i32", [-1]);
+        true
+    } catch false;
+    return free_invoked and close_invoked;
+}
 fn _openat(fs, dirfd, name, flags, mode = 0) {
-    let pointer = _cstring(fs, name); if pointer == nil or pointer == 0 { return -1; }
+    let pointer = _cstring(fs, name); if not _positive_pointer(pointer) { return -1; }
     let result = _i32(_call(fs, "openat", "i32,ptr,i32,i32->i32", [dirfd, pointer, flags, mode]));
-    _free(fs, pointer); return result;
+    if not _free(fs, pointer) {
+        if result >= 0 { _close_fd(fs, result); }
+        return -1;
+    }
+    return result;
 }
 fn _mkdirat(fs, dirfd, name, mode) {
-    let pointer = _cstring(fs, name); if pointer == nil or pointer == 0 { return -1; }
+    let pointer = _cstring(fs, name); if not _positive_pointer(pointer) { return -1; }
     let result = _i32(_call(fs, "mkdirat", "i32,ptr,i32->i32", [dirfd, pointer, mode]));
-    _free(fs, pointer); return result;
+    if not _free(fs, pointer) { return -1; }
+    return result;
 }
 fn _unlinkat(fs, dirfd, name, flags) {
-    let pointer = _cstring(fs, name); if pointer == nil or pointer == 0 { return -1; }
+    let pointer = _cstring(fs, name); if not _positive_pointer(pointer) { return -1; }
     let result = _i32(_call(fs, "unlinkat", "i32,ptr,i32->i32", [dirfd, pointer, flags]));
-    _free(fs, pointer); return result;
+    if not _free(fs, pointer) { return -1; }
+    return result;
 }
 fn _renameat(fs, from_fd, from_name, to_fd, to_name) {
-    let from_pointer = _cstring(fs, from_name); if from_pointer == nil or from_pointer == 0 { return -1; }
+    let from_pointer = _cstring(fs, from_name);
+    if not _positive_pointer(from_pointer) { return -1; }
     let to_pointer = _cstring(fs, to_name);
-    if to_pointer == nil or to_pointer == 0 { _free(fs, from_pointer); return -1; }
+    if not _positive_pointer(to_pointer) {
+        _free(fs, from_pointer); return -1;
+    }
     let result = _i32(_call(fs, "renameat", "i32,ptr,i32,ptr->i32", [from_fd, from_pointer, to_fd, to_pointer]));
-    _free(fs, to_pointer); _free(fs, from_pointer); return result;
+    let to_freed = _free(fs, to_pointer); let from_freed = _free(fs, from_pointer);
+    if not to_freed or not from_freed { return -1; }
+    return result;
 }
 
 fn _mode_verified(fs, fd, expected) {
@@ -417,7 +457,7 @@ fn _read_descriptor_bounded(fs, fd, maximum) {
     if maximum < 1 or maximum > FDINFO_MAX_BYTES { return _error("invalid descriptor text limit"); }
     let ceiling = maximum + 1;
     let buffer = _call(fs, "calloc", "i64,i64->ptr", [1, ceiling]);
-    if buffer == nil or buffer == 0 { return _error("descriptor text buffer is unavailable"); }
+    if not _positive_pointer(buffer) { return _error("descriptor text buffer is unavailable"); }
     let total = 0; let eof = false; let failed = false;
     while total < ceiling and not eof and not failed {
         let count = _call(fs, "read", "i32,ptr,i64->i64", [fd, buffer + total, ceiling - total]);
@@ -426,14 +466,19 @@ fn _read_descriptor_bounded(fs, fd, maximum) {
         else { total = total + count; }
     }
     if failed or total > maximum {
-        _free(fs, buffer);
+        let freed = _free(fs, buffer);
+        if not freed { return _cleanup_error("descriptor text buffer cleanup failed"); }
         return _error(if failed { "descriptor text read failed" } else { "descriptor text exceeds limit" });
     }
     let snapshot = _i32(_call(fs, "memfd_create", "string,i32->i32",
         ["pblang-bounded-fdinfo", MFD_CLOEXEC]));
-    if snapshot < 0 { _free(fs, buffer); return _error("descriptor text snapshot is unavailable"); }
+    if snapshot < 0 {
+        if not _free(fs, buffer) { return _cleanup_error("descriptor text buffer cleanup failed"); }
+        return _error("descriptor text snapshot is unavailable");
+    }
     let bytes = _load_native_batch(fs, snapshot, buffer, total);
-    _close_fd(fs, snapshot); _free(fs, buffer);
+    let snapshot_closed = _close_fd(fs, snapshot); let freed = _free(fs, buffer);
+    if not snapshot_closed or not freed { return _cleanup_error("descriptor text cleanup failed"); }
     if not is_array(bytes) { return _error("descriptor text snapshot failed"); }
     return map{ ok: true, bytes: bytes };
 }
@@ -448,7 +493,8 @@ fn _fd_identity(fs, fd) {
     let info_fd = _openat(fs, AT_FDCWD, fdinfo_path, O_RDONLY + O_NOFOLLOW + O_CLOEXEC, 0);
     if info_fd < 0 { return _error("descriptor identity record cannot be opened"); }
     let loaded = _read_descriptor_bounded(fs, info_fd, FDINFO_MAX_BYTES);
-    _close_fd(fs, info_fd);
+    let info_closed = _close_fd(fs, info_fd);
+    if not info_closed { return _cleanup_error("descriptor identity record cleanup failed"); }
     if not loaded.ok { return loaded; }
     let text = try bytes_to_str(loaded.bytes) catch nil;
     if type(text) != "string" { return _error("descriptor identity record is not UTF-8"); }
@@ -516,7 +562,11 @@ fn _enumeration_context(fs) {
         return _error("bounded enumeration context capacity reached");
     }
     let root_identity = _fd_identity(fs, fs.root_fd);
-    if not root_identity.ok { return _error("scan root identity is unavailable"); }
+    if not root_identity.ok {
+        let identity_cleanup_failed = try root_identity.cleanup_failed catch false;
+        if identity_cleanup_failed { return root_identity; }
+        return _error("scan root identity is unavailable");
+    }
     let id = str_slice(sha256(base64_encode_bytes(random_bytes(32)) + ":" + str(now_ms())), 0, 48);
     if map_has(_enumeration_contexts, id) { return _error("enumeration context collision"); }
     let context = map{ root_fd: fs.root_fd, root_identity: root_identity,
@@ -588,7 +638,10 @@ fn _begin_bounded_enumeration(fs) {
     if not associated { return _error("strict enumeration owner cannot be associated"); }
     let registered = try { _strict_enum_operations[id] = state; true } catch false;
     if not registered {
-        try fs.strict_enum_operation_id = "" catch nil;
+        let owner_reset = try { fs.strict_enum_operation_id = ""; true } catch false;
+        if not owner_reset {
+            return _error("strict enumeration owner registration rollback failed");
+        }
         return _error("strict enumeration operation cannot be registered");
     }
     return map{ ok: true, id: id, state: state };
@@ -611,9 +664,19 @@ fn abort_bounded_enumeration(fs) {
     let buffer = try state.buffer catch nil;
     if child_fd >= 0 and not _close_fd(fs, child_fd) { ok = false; }
     if snapshot_fd >= 0 and not _close_fd(fs, snapshot_fd) { ok = false; }
-    if buffer != nil and buffer != 0 { _free(fs, buffer); }
+    if buffer != nil and buffer != 0 and not _free(fs, buffer) { ok = false; }
     if dir_fd >= 0 and not _close_fd(fs, dir_fd) { ok = false; }
     return ok;
+}
+
+// Preserve the operation's original structured result only when every native
+// resource tracked by the private operation registry was released. A cleanup
+// failure is a different security state: the public handle must be invalidated
+// so the caller cannot retry against potentially live native resources.
+fn _abort_result(fs, result) {
+    let cleaned = try abort_bounded_enumeration(fs) catch false;
+    if not cleaned { return _cleanup_error("strict enumeration cleanup failed"); }
+    return result;
 }
 
 fn _entry_error(name, available, code) {
@@ -627,6 +690,11 @@ fn open(root, create = true, protect_root = false) {
     let libc = try ffi_load(host.libc) catch nil;
     if libc == nil { return _error("trusted libc cannot be loaded"); }
     let holder = map{ libc: libc, libc_path: host.libc };
+    if not _cleanup_authority_available(holder) {
+        ffi_close(libc);
+        return map{ ok: false, error: "native cleanup authority is unavailable",
+            error_code: "native-cleanup-authority-unavailable" };
+    }
     // Hold the current directory first, then resolve every caller-controlled
     // component relative to a held descriptor. O_NOFOLLOW on one multi-part
     // open protects only its final component and would leave intermediate
@@ -668,6 +736,11 @@ fn open_absolute(root, create = true, protect_root = true) {
     let libc = try ffi_load(host.libc) catch nil;
     if libc == nil { return _error("trusted libc cannot be loaded"); }
     let holder = map{ libc: libc, libc_path: host.libc };
+    if not _cleanup_authority_available(holder) {
+        ffi_close(libc);
+        return map{ ok: false, error: "native cleanup authority is unavailable",
+            error_code: "native-cleanup-authority-unavailable" };
+    }
     let current = _openat(holder, AT_FDCWD, "/", O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
     if current < 0 { ffi_close(libc); return _error("filesystem root cannot be opened"); }
     let i = 0;
@@ -1093,8 +1166,9 @@ fn read_held_range_bytes(fs, held, offset, count) {
     let snapshot = _i32(_call(fs, "memfd_create", "string,i32->i32",
         ["pblang-held-range", MFD_CLOEXEC]));
     let buffer = _call(fs, "calloc", "i64,i64->ptr", [1, count]);
-    if snapshot < 0 or buffer == nil or buffer == 0 {
-        _close_fd(fs, snapshot); _free(fs, buffer);
+    if snapshot < 0 or not _positive_pointer(buffer) {
+        _close_fd(fs, snapshot);
+        if _positive_pointer(buffer) { _free(fs, buffer); }
         return _error("held range buffer is unavailable");
     }
     let loaded = 0; let failed = false;
@@ -1111,7 +1185,7 @@ fn read_held_range_bytes(fs, held, offset, count) {
         if n <= 0 or n > count - written { failed = true; }
         else { written = written + n; }
     }
-    _free(fs, buffer);
+    if not _free(fs, buffer) { failed = true; }
     if failed or _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 0]) != 0 {
         _close_fd(fs, snapshot); return _error("held range could not be copied completely");
     }
@@ -1439,51 +1513,52 @@ fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
     if not operation.ok { return operation; }
     let operation_state = operation.state;
     let parts = _strict_components(path);
-    if parts == nil { abort_bounded_enumeration(fs); return _error("invalid strict enumeration path"); }
+    if parts == nil { return _abort_result(fs, _error("invalid strict enumeration path")); }
     let canonical_path = if len(parts) == 0 { "" } else { str_join(parts, "/") };
     let context_result = _enumeration_context(fs);
-    if not context_result.ok { abort_bounded_enumeration(fs); return context_result; }
+    if not context_result.ok { return _abort_result(fs, context_result); }
     let context = context_result.context;
     if context.calls >= ENUM_MAX_CALLS {
-        abort_bounded_enumeration(fs); return _error("bounded enumeration call capacity reached");
+        return _abort_result(fs, _error("bounded enumeration call capacity reached"));
     }
     context.calls = context.calls + 1;
     context.expires_ms = now_ms() + ENUM_CONTEXT_TTL_MS;
 
     let dir = _walk_dir(fs, parts, false);
-    if not dir.ok { abort_bounded_enumeration(fs); return _error("strict enumeration directory cannot be held"); }
+    if not dir.ok {
+        return _abort_result(fs, _error("strict enumeration directory cannot be held"));
+    }
     operation_state.dir_fd = dir.fd;
     let identity_outcome = try { map{ ok: true, value: _fd_identity(fs, dir.fd) } }
         catch map{ ok: false };
     if not identity_outcome.ok or not (try identity_outcome.value.ok catch false) {
-        abort_bounded_enumeration(fs);
-        return _error("strict enumeration directory identity is unavailable");
+        let identity_error = if identity_outcome.ok { identity_outcome.value }
+            else { _error("strict enumeration directory identity is unavailable"); };
+        return _abort_result(fs, identity_error);
     }
     let directory_identity = identity_outcome.value;
     let admission_outcome = try { map{ ok: true, value: _consume_enumeration_token(
         context, canonical_path, directory_identity, traversal_token, len(parts) == 0) } }
         catch map{ ok: false };
     if not admission_outcome.ok or not (try admission_outcome.value.ok catch false) {
-        abort_bounded_enumeration(fs);
-        if admission_outcome.ok { return admission_outcome.value; }
-        return _error("strict enumeration admission failed safely");
+        let admission_error = if admission_outcome.ok { admission_outcome.value }
+            else { _error("strict enumeration admission failed safely"); };
+        return _abort_result(fs, admission_error);
     }
     let admitted = admission_outcome.value;
     if not _pair_equal(directory_identity.mount_id, context.root_identity.mount_id) {
-        abort_bounded_enumeration(fs);
-        return _error("strict enumeration crossed the scan-root mount");
+        return _abort_result(fs, _error("strict enumeration crossed the scan-root mount"));
     }
 
     let buffer = try _call(fs, "calloc", "i64,i64->ptr", [1, ENUM_BATCH_BYTES]) catch nil;
-    if buffer == nil or buffer == 0 {
-        abort_bounded_enumeration(fs); return _error("strict enumeration buffer is unavailable");
+    if not _positive_pointer(buffer) {
+        return _abort_result(fs, _error("strict enumeration buffer is unavailable"));
     }
     operation_state.buffer = buffer;
     let snapshot = try _i32(_call(fs, "memfd_create", "string,i32->i32",
         ["pblang-getdents-page", MFD_CLOEXEC])) catch -1;
     if snapshot < 0 {
-        abort_bounded_enumeration(fs);
-        return _error("strict enumeration page bridge is unavailable");
+        return _abort_result(fs, _error("strict enumeration page bridge is unavailable"));
     }
     operation_state.snapshot_fd = snapshot;
 
@@ -1552,10 +1627,13 @@ fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
                                     } else {
                                         operation_state.child_fd = child_fd;
                                         let identity = _fd_identity(fs, child_fd);
-                                        _close_fd(fs, child_fd);
-                                        operation_state.child_fd = -1;
+                                        let child_closed = _close_fd(fs, child_fd);
+                                        if child_closed { operation_state.child_fd = -1; }
                                         let dirent_inode = _u64_le_pair(page, offset);
-                                        if not identity.ok {
+                                        if not child_closed {
+                                            fatal_error = "entry-descriptor-cleanup-failed";
+                                            entry = _entry_error(name, true, fatal_error);
+                                        } elif not identity.ok {
                                             entry = _entry_error(name, true, "entry-identity-unavailable");
                                         } elif not _pair_equal(identity.mount_id, context.root_identity.mount_id) {
                                             entry = _entry_error(name, true, "mount-boundary");
@@ -1615,9 +1693,7 @@ fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
         snapshot_consistent: false, hard_heap_enforced: false,
         traversal_tokens_opaque: true, traversal_tokens_exposed_to_handle_holder: true,
         raw_identity_exposed: false, production_ready: false };
-    let cleaned = abort_bounded_enumeration(fs);
-    if not cleaned { return _error("strict enumeration cleanup failed"); }
-    return result;
+    return _abort_result(fs, result);
 }
 
 // One outer cleanup boundary covers every unexpected PBLang exception in the
@@ -1629,7 +1705,7 @@ fn enumerate_bounded(fs, path = "", max_entries = 512, traversal_token = nil) {
         catch map{ ok: false };
     if attempted.ok { return attempted.value; }
     let cleaned = try abort_bounded_enumeration(fs) catch false;
-    if not cleaned { return _error("strict enumeration cleanup failed"); }
+    if not cleaned { return _cleanup_error("strict enumeration cleanup failed"); }
     return _error("strict enumeration failed safely");
 }
 
@@ -1803,7 +1879,7 @@ fn read_stream_bytes(fs, path, max_bytes = 1048576) {
         ["pblang-bounded-stream", MFD_CLOEXEC]));
     if snapshot < 0 { _close_fd(fs, fd); return _error("bounded stream snapshot is unavailable"); }
     let chunk = 65536; let buffer = _call(fs, "calloc", "i64,i64->ptr", [1, chunk]);
-    if buffer == nil or buffer == 0 {
+    if not _positive_pointer(buffer) {
         _close_fd(fs, snapshot); _close_fd(fs, fd); return _error("bounded stream buffer is unavailable");
     }
     let ceiling = max_bytes + 1; let copied = 0; let eof = false; let failed = false;
@@ -1822,7 +1898,8 @@ fn read_stream_bytes(fs, path, max_bytes = 1048576) {
             copied = copied + written;
         }
     }
-    _free(fs, buffer); _close_fd(fs, fd);
+    if not _free(fs, buffer) { failed = true; }
+    if not _close_fd(fs, fd) { failed = true; }
     if failed { _close_fd(fs, snapshot); return _error("bounded stream snapshot failed"); }
     if _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 0]) < 0 {
         _close_fd(fs, snapshot); return _error("bounded stream snapshot cannot be rewound");
@@ -2196,7 +2273,7 @@ fn copy_held_range_new_atomic(source_fs, held, dest_fs, path, offset, count,
     }
     let chunk = 65536;
     let buffer = _call(dest_fs, "calloc", "i64,i64->ptr", [1, chunk]);
-    let copied = 0; let failed = buffer == nil or buffer == 0;
+    let copied = 0; let failed = not _positive_pointer(buffer);
     while copied < count and not failed {
         let wanted = count - copied; if wanted > chunk { wanted = chunk; }
         let loaded = 0;
@@ -2215,7 +2292,7 @@ fn copy_held_range_new_atomic(source_fs, held, dest_fs, path, offset, count,
         }
         if not failed { copied = copied + wanted; }
     }
-    _free(dest_fs, buffer);
+    if _positive_pointer(buffer) and not _free(dest_fs, buffer) { failed = true; }
     let requested_mode = if executable { MODE_DIR } else { MODE_FILE };
     let expected_mode = if executable { "700" } else { "600" };
     if failed or copied != count {

@@ -3,6 +3,32 @@
 **Last Updated**: 2026-08-31
 **Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
 
+## 2026-08-31 - Strict inventory cleanup authority and denial regressions
+
+The Linux strict inventory slice now rejects invalid native pointers before
+pointer arithmetic or `free`, verifies every descriptor/buffer cleanup path,
+and distinguishes cleanup failure from ordinary structured failure. A cleanup
+failure invalidates the opaque `secure_file` enumerator handle. Before `open`
+or `open_absolute` acquires its first allocation or filesystem descriptor, a
+side-effect-free `free(NULL)` and expected-`EBADF` `close(-1)` preflight proves
+that the exact cleanup symbols are callable under the current VM FFI policy.
+
+Isolated child regressions deny `strdup`, `calloc`, `free`, and `close` one at a
+time. They require `free`/`close` rejection at the cleanup preflight, `strdup`
+rejection before `openat`, and `calloc` rejection inside bounded enumeration
+followed by successful closure of every opened root. Focused Linux directory,
+bounded enumerator, secure-file, project-inventory, lint and denial tests pass.
+This closes the concrete pointer/cleanup resource-exhaustion findings for the
+bounded read-only Linux slice; it does not make the FFI or scanner production
+ready.
+
+VM-enforced typed FFI and raw-FFI bypass closure, hard wall-clock preemption,
+hard heap enforcement, a hostile-code sandbox, namespace snapshot consistency,
+publisher authenticity, and physical Windows/macOS verification remain real
+production blockers. Scan evidence is still ineligible for pbAI training,
+automatic implementation, repository creation, or other external effects while
+the hard-heap and snapshot gates are false.
+
 ## 2026-08-31 - Canonical process admission and private polyglot publication
 
 OpenSSH, hosted C99, JavaScript and polyglot toolchain adapters now share
@@ -24,7 +50,7 @@ also requires an already verified private parent and never creates its parent.
 The process facade binds one deep-detached admission snapshot into every result
 rather than re-probing it later or sharing a mutable map with the public async
 handle. The
-full explicitly authorized serial semantic suite passed **893/893**
+full explicitly authorized serial semantic suite passed **894/894**
 with zero failures, ignored tests or filters. A separate `--jobs smart` run
 passed 844/893 but lost FFI/private-root/network authority in concurrent workers
 and watchdog-timed one test; representative failures and the timed test passed
@@ -48,7 +74,7 @@ through held directory descriptors, distinguishes callable engines from
 data-only installations, caps results at 512 entries, and exposes neither
 absolute paths nor model/voice file contents. It is inventory infrastructure,
 not a speech recognition or synthesis engine.
-The latest complete pblang semantic run on 2026-08-31 passed **893/893 tests**
+The latest complete pblang semantic run on 2026-08-31 passed **894/894 tests**
 serially with zero failures, ignored tests, or filtered tests. The separate release Rust
 semantics harness passed 203 tests with zero failures and one documented
 security ignore; these runner counts are not combined.

@@ -28,6 +28,15 @@
 
 ## Unreleased
 
+- Hardened the experimental Linux strict inventory FFI boundary. Pointer-return
+  failures are represented as `nil` and validated before arithmetic or cleanup;
+  native cleanup failure is now a distinct handle-invalidating state; every
+  post-admission enumeration exit verifies descriptor/buffer cleanup; and
+  `free(NULL)` plus `close(-1)` preflight cleanup authority before the first
+  allocation or filesystem descriptor is acquired. Child-process regressions
+  deny `strdup`, `calloc`, `free`, and `close` independently and assert the exact
+  open/enumerate/close phase reached without treating a crash or capacity leak
+  as an acceptable failure.
 - Closed a low-level OpenSSH process-admission bypass. SSH/SFTP now use the
   canonical bounded-process facade, refuse unverified typed-FFI readiness before
   opening temporary key material, and expose explicit execution-admission and
