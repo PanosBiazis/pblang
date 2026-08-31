@@ -40,7 +40,9 @@ fn runtime_limits(options = nil) {
         max_stack: _positive_limit(options, "max_stack", 4096, 1048576),
         max_locals: _positive_limit(options, "max_locals", 65536, 1048576),
         max_output: _positive_limit(options, "max_output", 65536, 1048576),
-        max_collection_items: _positive_limit(options, "max_collection_items", 1048576, 16777216)
+        max_collection_items: _positive_limit(options, "max_collection_items", 1048576, 16777216),
+        max_guest_allocation_units: _positive_limit(options,
+            "max_guest_allocation_units", 16777216, 100000000)
     };
 }
 
@@ -69,11 +71,37 @@ fn _state(options, globals) {
         limits: limits, globals: globals, exports: map{}, adapters: adapters,
         pure_allowlist: _pure_allowlist(options),
         output: [], steps: 0, frames: 0, peak_frames: 0, peak_stack: 0,
-        peak_locals: 0, tail_calls: 0, host_calls: 0
+        peak_locals: 0, tail_calls: 0, host_calls: 0,
+        guest_allocation_units: 0, peak_guest_allocation_units: 0
     };
 }
 
 fn _fault(message) { throw "host_pbck_vm: " + message; }
+
+// Allocation units are a deterministic VM accounting model, not native heap
+// bytes. The subtraction-first check cannot overflow before rejecting, and the
+// counter is deliberately never reset by frame return, tail calls or handlers.
+fn _charge(state, units) {
+    if not is_number(units) or units < 0 or units != num_floor(units) {
+        _fault("invalid guest allocation charge");
+    }
+    let limit = state.limits.max_guest_allocation_units;
+    let used = state.guest_allocation_units;
+    if units > limit or used > limit - units {
+        _fault("guest allocation unit limit exceeded");
+    }
+    state.guest_allocation_units = used + units;
+    if state.guest_allocation_units > state.peak_guest_allocation_units {
+        state.peak_guest_allocation_units = state.guest_allocation_units;
+    }
+}
+
+fn _shallow_value_units(value) {
+    if is_string(value) { return 1 + len(str_to_bytes(value)); }
+    if is_array(value) { return 1 + len(value); }
+    if is_map(value) { return 1 + (2 * len(map_keys(value))); }
+    return 1;
+}
 
 fn _tick(state, stack) {
     if state.steps >= state.limits.max_steps { _fault("step limit exceeded"); }
@@ -96,10 +124,13 @@ fn _peek(stack) {
 
 fn _push(state, stack, value) {
     if len(stack) >= state.limits.max_stack { _fault("stack limit exceeded"); }
-    array_push(stack, _cell(value));
+    array_push(stack, _cell(state, value));
 }
 
-fn _cell(value) { return map{ value: value }; }
+fn _cell(state, value) {
+    _charge(state, 1 + _shallow_value_units(value));
+    return map{ value: value };
+}
 
 fn _ensure_local(state, stack, slot) {
     if slot < 0 or slot >= len(stack) or slot >= state.limits.max_locals {
@@ -133,11 +164,11 @@ fn _truncate(stack, size) {
     while len(stack) > size { array_pop(stack); }
 }
 
-fn _raise_in_frame(handlers, stack, value) {
+fn _raise_in_frame(state, handlers, stack, value) {
     if len(handlers) == 0 { return _raised(value); }
     let handler = array_pop(handlers);
     _truncate(stack, handler.stack_size);
-    array_push(stack, _cell(value));
+    array_push(stack, _cell(state, value));
     return map{ kind: "handled", target: handler.target };
 }
 
@@ -201,6 +232,7 @@ fn _host_call(state, name, args) {
         // details are intentionally not exposed to guest code.
         let attempted = try map{ ok: true, value: adapter(args) } catch map{ ok: false };
         if not attempted.ok { return _raised("host adapter failed: " + name); }
+        _charge(state, _shallow_value_units(attempted.value));
         return _normal(attempted.value);
     }
     if name == "print" {
@@ -208,6 +240,7 @@ fn _host_call(state, name, args) {
         let i = 0;
         while i < len(args) {
             if len(state.output) >= state.limits.max_output { _fault("output limit exceeded"); }
+            _charge(state, _shallow_value_units(args[i]));
             array_push(state.output, args[i]); i = i + 1;
         }
         return _normal(nil);
@@ -228,6 +261,7 @@ fn _host_call(state, name, args) {
             value: Pure.call(name, args, state.limits.max_collection_items)
         } catch map{ ok: false };
         if not attempted.ok { return _raised("builtin failed: " + name); }
+        _charge(state, _shallow_value_units(attempted.value));
         return _normal(attempted.value);
     }
     _fault("host adapter is unavailable: " + name);
@@ -238,6 +272,7 @@ fn _call_value(state, callee, args, depth) {
         return _invoke(state, callee, args, depth + 1);
     }
     if is_map(callee) and map_has(callee, "__pbck_function") {
+        _charge(state, 4);
         return _invoke(state, map{
             __pbck_closure: true, function: callee, upvalues: [], globals: state.globals
         }, args, depth + 1);
@@ -252,6 +287,7 @@ fn _normalized_stack(state, function, args) {
     let argc = len(args);
     if argc < function.min_arity { _fault("too few call arguments"); }
     if not function.is_vararg and argc > function.arity { _fault("too many call arguments"); }
+    _charge(state, 1);
     let stack = [];
     let fixed = function.arity;
     let i = 0;
@@ -262,17 +298,20 @@ fn _normalized_stack(state, function, args) {
             let default_start = fixed - len(function.defaults);
             if i >= default_start { value = function.defaults[i - default_start]; }
         }
-        array_push(stack, _cell(value));
+        array_push(stack, _cell(state, value));
         i = i + 1;
     }
     if function.is_vararg {
+        let extra_count = 0;
+        if argc > fixed { extra_count = argc - fixed; }
+        _charge(state, 1 + extra_count);
         let extra = [];
         i = fixed;
         while i < argc {
             if len(extra) >= state.limits.max_collection_items { _fault("vararg limit exceeded"); }
             array_push(extra, args[i]); i = i + 1;
         }
-        array_push(stack, _cell(extra));
+        array_push(stack, _cell(state, extra));
     }
     return stack;
 }
@@ -347,9 +386,15 @@ fn _frame(state, closure, args, depth) {
         elif op == 11 { _pop(stack); }
         elif op == 12 {
             if len(state.output) >= state.limits.max_output { _fault("output limit exceeded"); }
-            array_push(state.output, _pop(stack));
+            let emitted = _pop(stack);
+            _charge(state, _shallow_value_units(emitted));
+            array_push(state.output, emitted);
         }
-        elif op == 13 { state.globals[constants[ins.operand]] = _pop(stack); }
+        elif op == 13 {
+            let name = constants[ins.operand];
+            if not map_has(state.globals, name) { _charge(state, 1); }
+            state.globals[name] = _pop(stack);
+        }
         elif op == 14 {
             let name = constants[ins.operand];
             if map_has(state.globals, name) { _push(state, stack, state.globals[name]); }
@@ -358,7 +403,11 @@ fn _frame(state, closure, args, depth) {
             }
             else { _push(state, stack, nil); }
         }
-        elif op == 15 { state.globals[constants[ins.operand]] = _pop(stack); }
+        elif op == 15 {
+            let name = constants[ins.operand];
+            if not map_has(state.globals, name) { _charge(state, 1); }
+            state.globals[name] = _pop(stack);
+        }
         elif op == 16 {
             let obj = _pop(stack); let name = constants[ins.operand];
             if is_map(obj) and map_has(obj, name) { _push(state, stack, obj[name]); }
@@ -367,18 +416,22 @@ fn _frame(state, closure, args, depth) {
         elif op == 17 {
             let value = _pop(stack); let obj = _pop(stack);
             if not is_map(obj) { _fault("attribute target must be a map"); }
-            obj[constants[ins.operand]] = value; _push(state, stack, value);
+            let name = constants[ins.operand];
+            if not map_has(obj, name) { _charge(state, 1); }
+            obj[name] = value; _push(state, stack, value);
         }
         elif op == 18 {
             let name = constants[ins.operand];
             if not is_string(name) { _fault("export name must be a string"); }
             if not map_has(state.globals, name) { _fault("cannot export undefined global: " + name); }
+            if not map_has(state.exports, name) { _charge(state, 1); }
             state.exports[name] = state.globals[name];
         }
         elif op == 19 {
             if ins.operand > state.limits.max_collection_items or ins.operand > len(stack) {
                 _fault("array allocation limit exceeded");
             }
+            _charge(state, 1 + ins.operand);
             let array = []; let n = ins.operand; let i = 0;
             while i < n { array_push(array, nil); i = i + 1; }
             i = n - 1; while i >= 0 { array[i] = _pop(stack); i = i - 1; }
@@ -388,6 +441,7 @@ fn _frame(state, closure, args, depth) {
             if ins.operand > state.limits.max_collection_items or ins.operand * 2 > len(stack) {
                 _fault("map allocation limit exceeded");
             }
+            _charge(state, 2 + (3 * ins.operand));
             let pairs = []; let n = ins.operand; let i = 0;
             while i < n * 2 { array_push(pairs, nil); i = i + 1; }
             i = n * 2 - 1; while i >= 0 { pairs[i] = _pop(stack); i = i - 1; }
@@ -406,12 +460,14 @@ fn _frame(state, closure, args, depth) {
                 obj[index] = value;
             } elif is_map(obj) {
                 if not is_string(index) { _fault("map key must be a string"); }
+                if not map_has(obj, index) { _charge(state, 1); }
                 obj[index] = value;
             } else { _fault("value is not indexable"); }
             _push(state, stack, value);
         }
         elif op == 23 {
             if len(handlers) >= state.limits.max_frames { _fault("handler limit exceeded"); }
+            _charge(state, 1);
             array_push(handlers, map{ target: ins.operand, stack_size: len(stack) });
         }
         elif op == 24 { if len(handlers) == 0 { _fault("handler stack underflow"); } array_pop(handlers); }
@@ -425,10 +481,11 @@ fn _frame(state, closure, args, depth) {
                 or ins.operand >= state.limits.max_locals {
                 _fault("local slot out of bounds");
             }
-            if ins.operand == len(stack) { array_push(stack, _cell(value)); }
+            if ins.operand == len(stack) { array_push(stack, _cell(state, value)); }
             else { stack[ins.operand].value = value; }
         }
         elif op == 27 {
+            _charge(state, 2 + len(ins.captures));
             let captured = []; let i = 0;
             while i < len(ins.captures) {
                 let descriptor = ins.captures[i];
@@ -458,6 +515,7 @@ fn _frame(state, closure, args, depth) {
         elif op == 31 or op == 32 {
             let argc = ins.operand;
             if argc + 1 > len(stack) { _fault("call stack underflow"); }
+            _charge(state, 1 + argc);
             let call_args = []; let i = 0;
             while i < argc { array_push(call_args, nil); i = i + 1; }
             i = argc - 1; while i >= 0 { call_args[i] = _pop(stack); i = i - 1; }
@@ -465,13 +523,13 @@ fn _frame(state, closure, args, depth) {
             if op == 32 and len(defers) == 0 { return _tail(callee, call_args); }
             let call_result = _call_value(state, callee, call_args, depth);
             if call_result.kind == "throw" {
-                let routed = _raise_in_frame(handlers, stack, call_result.value);
+                let routed = _raise_in_frame(state, handlers, stack, call_result.value);
                 if routed.kind == "throw" { return routed; }
                 ip = routed.target;
             } else { _push(state, stack, call_result.value); }
         }
         elif op == 33 { return _finish_frame(state, defers, _pop(stack), depth); }
-        elif op == 34 { array_push(defers, _pop(stack)); }
+        elif op == 34 { _charge(state, 1); array_push(defers, _pop(stack)); }
         elif op == 35 { ip = ins.operand; }
         elif op == 36 { if not _truthy(_peek(stack)) { ip = ins.operand; } }
         elif op == 37 { if _truthy(_peek(stack)) { ip = ins.operand; } }
@@ -505,7 +563,7 @@ fn _frame(state, closure, args, depth) {
                 }
             } elif not failed { _push(state, stack, wrapped); }
             if failed {
-                let routed = _raise_in_frame(handlers, stack, failure);
+                let routed = _raise_in_frame(state, handlers, stack, failure);
                 if routed.kind == "throw" { return routed; }
                 ip = routed.target;
             }
@@ -513,7 +571,7 @@ fn _frame(state, closure, args, depth) {
         elif op == 45 { _push(state, stack, _pop(stack) == nil); }
         elif op == 46 { _push(state, stack, _peek(stack)); }
         elif op == 47 {
-            let routed = _raise_in_frame(handlers, stack, _pop(stack));
+            let routed = _raise_in_frame(state, handlers, stack, _pop(stack));
             if routed.kind == "throw" { return routed; }
             ip = routed.target;
         }
@@ -536,6 +594,7 @@ fn _invoke(state, initial_closure, initial_args, depth) {
         let next = result.callee;
         if is_map(next) and map_has(next, "__pbck_closure") { closure = next; }
         elif is_map(next) and map_has(next, "__pbck_function") {
+            _charge(state, 4);
             closure = map{ __pbck_closure: true, function: next, upvalues: [], globals: state.globals };
         } else {
             let fallback = _call_value(state, next, result.args, depth);
@@ -554,6 +613,7 @@ fn run_decoded(decoded, options = nil, globals = nil) {
         seeded = globals;
     }
     let state = _state(options, seeded);
+    _charge(state, 8);
     let root_function = map{
         __pbck_function: true, name: "<root>", arity: 0, min_arity: 0,
         defaults: [], is_vararg: false, parameter_types_present: false,
@@ -567,7 +627,12 @@ fn run_decoded(decoded, options = nil, globals = nil) {
         exports: state.exports, runtime: map{
             steps: state.steps, peak_frames: state.peak_frames,
             peak_stack: state.peak_stack, peak_locals: state.peak_locals,
-            tail_calls: state.tail_calls, host_calls: state.host_calls
+            tail_calls: state.tail_calls, host_calls: state.host_calls,
+            guest_allocation_units: state.guest_allocation_units,
+            peak_guest_allocation_units: state.peak_guest_allocation_units,
+            max_guest_allocation_units: state.limits.max_guest_allocation_units,
+            guest_cumulative_allocation_units_enforced: true,
+            hard_heap_enforced: false
         }
     };
 }
