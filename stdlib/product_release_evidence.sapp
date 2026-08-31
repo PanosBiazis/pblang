@@ -13,6 +13,22 @@ let MAX_REPORTS = 128;
 let MAX_PLATFORMS = 32;
 let MAX_CHECKS = 128;
 let MAX_BYTES = 1099511627776;
+let RUNTIME_SECURITY_FORMAT = "pblang.runtime-security-evidence.v1";
+let RUNTIME_SECURITY_POLICY_FORMAT = "pblang.runtime-security-policy.v1";
+let RUNTIME_PLATFORM_FORMAT = "pblang.runtime-platform-evidence.v1";
+let RUNTIME_SECURITY_GATE_FORMAT = "pblang.runtime-security-gate.v1";
+let MAX_RUNTIME_EVIDENCE_LIFETIME = 604800;
+
+// Never store or export a mutable canonical array. Every trust boundary gets a
+// fresh list so caller mutation cannot weaken later validation.
+fn _runtime_security_checks() {
+    return ["vm_enforced_typed_ffi", "raw_ffi_builtin_bypass_blocked",
+        "hard_preemption", "cumulative_heap_enforcement",
+        "cross_vm_handle_isolation", "hostile_code_sandbox",
+        "publisher_authenticity", "immutable_runtime_handoff"];
+}
+
+fn runtime_security_checks() { return _runtime_security_checks(); }
 
 fn _has(xs, value) {
     if type(xs) != "array" { return false; }
@@ -77,6 +93,28 @@ fn _texts(values, name, maximum, allow_empty = false) {
         let text = _text(value, name + " item", 128);
         if _has(out, text) { throw "product_release_evidence: duplicate " + name + " item " + text; }
         array_push(out, text);
+    }
+    return out;
+}
+
+fn _same_texts(left, right) {
+    if type(left) != "array" or type(right) != "array" or len(left) != len(right) {
+        return false;
+    }
+    let index = 0;
+    while index < len(left) {
+        if type(left[index]) != "string" or left[index] != right[index] { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+fn _framed(values) {
+    if type(values) != "array" { throw "product_release_evidence: invalid hash frame"; }
+    let out = "pblang-release-frame-v1|";
+    for value in values {
+        let text = str(value); let bytes = len(str_to_bytes(text));
+        out = out + str(bytes) + ":" + text;
     }
     return out;
 }
@@ -379,6 +417,279 @@ fn platform_evidence(source_record, artifact_record, platform, arch, runner,
     };
 }
 
+// Construct a bounded claim set for the runtime guarantees that must exist
+// before hostile code or production artifacts can be admitted. The report is
+// digest-bound but deliberately remains unauthenticated metadata.
+fn runtime_security_evidence(source_record, artifact_record, report_sha256,
+                             artifact_sha256, verifier_id, issued_epoch,
+                             expires_epoch, results) {
+    let source_row = _validated_source(source_record);
+    let artifact_row = _validated_artifact(artifact_record, source_row);
+    let artifact_digest = _sha256(artifact_sha256, "runtime artifact_sha256");
+    if artifact_digest != artifact_row.artifact_sha256 {
+        throw "product_release_evidence: runtime evidence artifact digest mismatch";
+    }
+    let checks = _runtime_security_checks();
+    _exact_fields(results, checks, "runtime security results");
+    let detached_results = map{};
+    let canonical = [RUNTIME_SECURITY_FORMAT, source_row.source_sha256,
+        artifact_row.name, artifact_digest,
+        _sha256(report_sha256, "runtime report_sha256"),
+        _text(verifier_id, "runtime verifier id", 128)];
+    for check in checks {
+        if type(results[check]) != "bool" {
+            throw "product_release_evidence: runtime security result must be boolean";
+        }
+        detached_results[check] = results[check];
+        array_push(canonical, check); array_push(canonical, str(results[check]));
+    }
+    let issued = _integer(issued_epoch, "runtime issued_epoch", 0, 9007199254740991);
+    let expires = _integer(expires_epoch, "runtime expires_epoch", 0, 9007199254740991);
+    if expires <= issued or expires - issued > MAX_RUNTIME_EVIDENCE_LIFETIME {
+        throw "product_release_evidence: invalid runtime evidence lifetime";
+    }
+    array_push(canonical, str(issued)); array_push(canonical, str(expires));
+    return map{format:RUNTIME_SECURITY_FORMAT, source_sha256:source_row.source_sha256,
+        artifact_name:artifact_row.name, artifact_sha256:artifact_digest,
+        report_sha256:_sha256(report_sha256, "runtime report_sha256"),
+        verifier_id:_text(verifier_id, "runtime verifier id", 128),
+        issued_epoch:issued, expires_epoch:expires, results:detached_results,
+        evidence_sha256:sha256(_framed(canonical)),
+        exact_check_set:true, verifier_signature_verified:false,
+        trusted_clock_verified:false, authorizes_execution:false};
+}
+
+fn runtime_security_policy(name, revision, artifact_name, macos_arch = "aarch64") {
+    if not _has(["x86_64", "aarch64"], macos_arch) {
+        throw "product_release_evidence: unsupported physical macOS architecture";
+    }
+    let policy_name = _text(name, "runtime policy name", 128);
+    let policy_revision = _integer(revision, "runtime policy revision", 1, 1000000000);
+    let policy_artifact = _text(artifact_name, "runtime policy artifact", 128);
+    let checks = _runtime_security_checks();
+    let targets = ["windows:x86_64", "macos:" + macos_arch];
+    let canonical = [RUNTIME_SECURITY_POLICY_FORMAT, policy_name,
+        str(policy_revision), policy_artifact];
+    for check in checks { array_push(canonical, "check:" + check); }
+    for target in targets { array_push(canonical, "target:" + target); }
+    return map{format:RUNTIME_SECURITY_POLICY_FORMAT, name:policy_name,
+        revision:policy_revision, artifact_name:policy_artifact,
+        required_checks:checks, required_physical_targets:targets,
+        policy_sha256:sha256(_framed(canonical))};
+}
+
+fn _validated_runtime_policy(record) {
+    _exact_fields(record, ["format", "name", "revision", "artifact_name",
+        "required_checks", "required_physical_targets", "policy_sha256"],
+        "runtime security policy");
+    if record.format != RUNTIME_SECURITY_POLICY_FORMAT
+       or not _same_texts(record.required_checks, _runtime_security_checks()) {
+        throw "product_release_evidence: canonical runtime security policy required";
+    }
+    let targets = _texts(record.required_physical_targets,
+        "runtime physical targets", 2);
+    if len(targets) != 2 or targets[0] != "windows:x86_64"
+       or not _has(["macos:x86_64", "macos:aarch64"], targets[1]) {
+        throw "product_release_evidence: Windows and macOS physical targets are mandatory";
+    }
+    let macos_parts = str_split(targets[1], ":");
+    if len(macos_parts) != 2 { throw "product_release_evidence: invalid macOS runtime target"; }
+    let rebuilt = runtime_security_policy(record.name, record.revision,
+        record.artifact_name, macos_parts[1]);
+    if type(record.policy_sha256) != "string"
+       or record.policy_sha256 != rebuilt.policy_sha256 {
+        throw "product_release_evidence: runtime policy digest mismatch";
+    }
+    return rebuilt;
+}
+
+fn _validated_runtime_evidence(record, source_row, artifact_row) {
+    _exact_fields(record, ["format", "source_sha256", "artifact_name",
+        "artifact_sha256", "report_sha256", "verifier_id", "issued_epoch",
+        "expires_epoch", "results", "evidence_sha256", "exact_check_set",
+        "verifier_signature_verified", "trusted_clock_verified",
+        "authorizes_execution"], "runtime security evidence");
+    if record.format != RUNTIME_SECURITY_FORMAT
+       or record.source_sha256 != source_row.source_sha256
+       or record.artifact_name != artifact_row.name
+       or record.artifact_sha256 != artifact_row.artifact_sha256 {
+        throw "product_release_evidence: runtime evidence release binding mismatch";
+    }
+    let rebuilt = runtime_security_evidence(source_row, artifact_row,
+        record.report_sha256, record.artifact_sha256, record.verifier_id,
+        record.issued_epoch, record.expires_epoch, record.results);
+    if type(record.exact_check_set) != "bool"
+       or type(record.verifier_signature_verified) != "bool"
+       or type(record.trusted_clock_verified) != "bool"
+       or type(record.authorizes_execution) != "bool"
+       or record.evidence_sha256 != rebuilt.evidence_sha256
+       or not record.exact_check_set
+       or record.verifier_signature_verified
+       or record.trusted_clock_verified
+       or record.authorizes_execution {
+        throw "product_release_evidence: invalid runtime evidence guarantees";
+    }
+    return rebuilt;
+}
+
+// Dedicated platform report. Generic release platform rows are intentionally
+// not accepted by the runtime gate: each row binds the exact runtime evidence,
+// policy revision/digest, complete check set, artifact, and capture lifetime.
+fn runtime_platform_evidence(source_record, artifact_record, policy_record,
+                             runtime_record, platform, arch, report_sha256,
+                             verifier_id, captured_epoch, expires_epoch, results) {
+    let source_row = _validated_source(source_record);
+    let artifact_row = _validated_artifact(artifact_record, source_row);
+    let selected = _validated_runtime_policy(policy_record);
+    let runtime = _validated_runtime_evidence(runtime_record, source_row, artifact_row);
+    if selected.artifact_name != artifact_row.name {
+        throw "product_release_evidence: runtime platform policy artifact mismatch";
+    }
+    let platform_name = _text(platform, "runtime platform", 64);
+    let architecture = _text(arch, "runtime platform architecture", 64);
+    let target = platform_name + ":" + architecture;
+    if not _has(selected.required_physical_targets, target) {
+        throw "product_release_evidence: runtime platform is outside policy targets";
+    }
+    let checks = _runtime_security_checks();
+    _exact_fields(results, checks, "runtime platform results");
+    let detached_results = map{};
+    let captured = _integer(captured_epoch, "runtime platform captured_epoch",
+        0, 9007199254740991);
+    let expires = _integer(expires_epoch, "runtime platform expires_epoch",
+        0, 9007199254740991);
+    if expires <= captured or expires - captured > MAX_RUNTIME_EVIDENCE_LIFETIME
+       or captured < runtime.issued_epoch or expires > runtime.expires_epoch {
+        throw "product_release_evidence: invalid runtime platform evidence lifetime";
+    }
+    let report = _sha256(report_sha256, "runtime platform report_sha256");
+    let verifier = _text(verifier_id, "runtime platform verifier id", 128);
+    let canonical = [RUNTIME_PLATFORM_FORMAT, source_row.source_sha256,
+        artifact_row.name, artifact_row.artifact_sha256,
+        selected.name, str(selected.revision), selected.policy_sha256,
+        runtime.evidence_sha256, target, report, verifier,
+        str(captured), str(expires)];
+    for check in checks {
+        if type(results[check]) != "bool" {
+            throw "product_release_evidence: runtime platform result must be boolean";
+        }
+        detached_results[check] = results[check];
+        array_push(canonical, check); array_push(canonical, str(results[check]));
+    }
+    return map{format:RUNTIME_PLATFORM_FORMAT,
+        source_sha256:source_row.source_sha256,
+        artifact_name:artifact_row.name, artifact_sha256:artifact_row.artifact_sha256,
+        policy_name:selected.name, policy_revision:selected.revision,
+        policy_sha256:selected.policy_sha256,
+        runtime_evidence_sha256:runtime.evidence_sha256,
+        platform:platform_name, arch:architecture, report_sha256:report,
+        verifier_id:verifier, captured_epoch:captured, expires_epoch:expires,
+        results:detached_results,
+        evidence_sha256:sha256(_framed(canonical)),
+        exact_check_set:true, physical_claimed:true,
+        physical_authenticity_verified:false, verifier_signature_verified:false,
+        trusted_clock_verified:false, authorizes_execution:false};
+}
+
+fn _validated_runtime_platform(record, source_row, artifact_row, policy_row, runtime_row) {
+    _exact_fields(record, ["format", "source_sha256", "artifact_name",
+        "artifact_sha256", "policy_name", "policy_revision", "policy_sha256",
+        "runtime_evidence_sha256", "platform", "arch", "report_sha256",
+        "verifier_id", "captured_epoch", "expires_epoch", "results",
+        "evidence_sha256", "exact_check_set", "physical_claimed",
+        "physical_authenticity_verified", "verifier_signature_verified",
+        "trusted_clock_verified", "authorizes_execution"],
+        "runtime platform evidence");
+    if record.format != RUNTIME_PLATFORM_FORMAT
+       or record.source_sha256 != source_row.source_sha256
+       or record.artifact_name != artifact_row.name
+       or record.artifact_sha256 != artifact_row.artifact_sha256
+       or record.policy_name != policy_row.name
+       or record.policy_revision != policy_row.revision
+       or record.policy_sha256 != policy_row.policy_sha256
+       or record.runtime_evidence_sha256 != runtime_row.evidence_sha256 {
+        throw "product_release_evidence: runtime platform binding mismatch";
+    }
+    let rebuilt = runtime_platform_evidence(source_row, artifact_row, policy_row,
+        runtime_row, record.platform, record.arch, record.report_sha256,
+        record.verifier_id, record.captured_epoch, record.expires_epoch,
+        record.results);
+    if type(record.exact_check_set) != "bool"
+       or type(record.physical_claimed) != "bool"
+       or type(record.physical_authenticity_verified) != "bool"
+       or type(record.verifier_signature_verified) != "bool"
+       or type(record.trusted_clock_verified) != "bool"
+       or type(record.authorizes_execution) != "bool"
+       or record.evidence_sha256 != rebuilt.evidence_sha256
+       or not record.exact_check_set or not record.physical_claimed
+       or record.physical_authenticity_verified
+       or record.verifier_signature_verified or record.trusted_clock_verified
+       or record.authorizes_execution {
+        throw "product_release_evidence: invalid runtime platform guarantees";
+    }
+    return rebuilt;
+}
+
+fn evaluate_runtime_security(source_record, artifact_record, policy_record,
+                             evidence_record, platform_rows, evaluation_epoch) {
+    let source_row = _validated_source(source_record);
+    let artifact_row = _validated_artifact(artifact_record, source_row);
+    let selected = _validated_runtime_policy(policy_record);
+    let evidence = _validated_runtime_evidence(evidence_record, source_row, artifact_row);
+    let now = _integer(evaluation_epoch, "runtime evaluation_epoch", 0, 9007199254740991);
+    if selected.artifact_name != artifact_row.name {
+        throw "product_release_evidence: runtime policy artifact mismatch";
+    }
+    if type(platform_rows) != "array" or len(platform_rows) > MAX_REPORTS {
+        throw "product_release_evidence: invalid runtime platform evidence";
+    }
+    let blockers = [];
+    if now < evidence.issued_epoch or now >= evidence.expires_epoch {
+        array_push(blockers, "runtime security evidence is not currently valid");
+    }
+    for check in selected.required_checks {
+        if not evidence.results[check] { array_push(blockers, check + ": not verified"); }
+    }
+    let physical = map{};
+    for row in platform_rows {
+        row = _validated_runtime_platform(row, source_row, artifact_row,
+            selected, evidence);
+        let identity = row.platform + ":" + row.arch;
+        if map_has(physical, identity) {
+            throw "product_release_evidence: duplicate runtime physical target";
+        }
+        let row_current = now >= row.captured_epoch and now < row.expires_epoch;
+        if not row_current {
+            array_push(blockers, identity + ": runtime platform evidence is not currently valid");
+        }
+        let row_complete = true;
+        for check in selected.required_checks {
+            if not row.results[check] {
+                row_complete = false;
+                array_push(blockers, identity + ": " + check + " not verified");
+            }
+        }
+        if row_current and row_complete { physical[identity] = true; }
+    }
+    for target in selected.required_physical_targets {
+        if not map_has(physical, target) {
+            array_push(blockers, target + ": current physical evidence missing");
+        }
+    }
+    return map{ok:len(blockers) == 0, format:RUNTIME_SECURITY_GATE_FORMAT,
+        policy_name:selected.name, policy_revision:selected.revision,
+        source_sha256:source_row.source_sha256, artifact_name:artifact_row.name,
+        artifact_sha256:artifact_row.artifact_sha256,
+        runtime_evidence_sha256:evidence.evidence_sha256,
+        required_checks:selected.required_checks,
+        required_physical_targets:selected.required_physical_targets,
+        blockers:blockers, structurally_complete:len(blockers) == 0,
+        evidence_authenticity_verified:false, physical_authenticity_verified:false,
+        trusted_clock_verified:false,
+        trust_verified:false, authorizes_execution:false, production_ready:false,
+        authorization_scope:"consistency-only runtime exit gate; independent signature, clock and runtime verification required"};
+}
+
 fn evaluate(source_record, evidence_policy, artifacts, reports, platform_rows) {
     let source_row = _validated_source(source_record);
     let selected_policy = _validated_policy(evidence_policy);
@@ -477,5 +788,11 @@ fn evaluate(source_record, evidence_policy, artifacts, reports, platform_rows) {
 }
 
 export FORMAT, MAX_ARTIFACTS, MAX_REPORTS, MAX_PLATFORMS, MAX_CHECKS;
+export RUNTIME_SECURITY_FORMAT, RUNTIME_SECURITY_POLICY_FORMAT,
+       RUNTIME_PLATFORM_FORMAT, RUNTIME_SECURITY_GATE_FORMAT,
+       MAX_RUNTIME_EVIDENCE_LIFETIME;
 export source, artifact, test_report, platform_evidence;
 export target_requirement, policy, evaluate;
+export runtime_security_checks, runtime_security_evidence, runtime_security_policy,
+       runtime_platform_evidence,
+       evaluate_runtime_security;
