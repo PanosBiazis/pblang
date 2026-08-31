@@ -12,6 +12,16 @@ let MAX_DEPTH_HARD = 32;
 let MAX_ENTRIES_HARD = 50000;
 let MAX_CHILDREN_HARD = 4096;
 let MAX_RUNTIME_MS_HARD = 300000;
+let MAX_VISITED_HARD = 50000;
+let MAX_PENDING_HARD = 8192;
+let MAX_PAGE_RECORDS_HARD = 256;
+let MAX_SESSIONS_HARD = 8;
+let MAX_GLOBAL_PENDING_HARD = 16384;
+let MAX_SESSION_TTL_MS = 600000;
+let SESSION_FORMAT = "pblang.project_inventory.session.v1";
+let CURSOR_FORMAT = "pblang.project_inventory.cursor.v1";
+let _sessions = map{};
+let _session_busy = false;
 
 fn _str(x) { return str(x ?? ""); }
 
@@ -41,6 +51,97 @@ fn _contains_any(text, needles) {
         i = i + 1;
     }
     return false;
+}
+
+fn _exact_option_fields(options, allowed) {
+    if type(options) != "map" { return false; }
+    for key in map_keys(options) {
+        let known = false;
+        for field in allowed { if key == field { known = true; } }
+        if not known { return false; }
+    }
+    return true;
+}
+
+fn _safe_root(root) {
+    if type(root) != "string" or root == "" or len(root) > 4096
+       or str_contains(root, strfromcharcode(0)) { return false; }
+    let i = 0;
+    while i < len(root) {
+        let c = strcharcodeat(root, i);
+        if c < 32 or (c >= 127 and c <= 159)
+           or (c >= 8234 and c <= 8238) or (c >= 8294 and c <= 8297) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _framed(values) {
+    let parts = [];
+    for value in values {
+        let bytes = str_to_bytes(_str(value));
+        array_push(parts, str(len(bytes)) + ":" + _str(value));
+    }
+    return str_join(parts, "|");
+}
+
+fn _root_digest(roots) { return sha256("roots-v1|" + _framed(roots)); }
+
+fn _option_digest(options) {
+    return sha256(_framed(["inventory-options-v1", options.max_depth,
+        options.max_entries, options.max_children_per_dir, options.include_files,
+        options.include_dirs, options.max_runtime_ms, options.page_records,
+        options.max_pending, options.session_ttl_ms]));
+}
+
+fn _validated_request(roots, options, session_mode = false) {
+    if roots == nil { roots = ["."]; }
+    if options == nil { options = map{}; }
+    let allowed = ["max_depth", "max_entries", "max_children_per_dir",
+        "include_files", "include_dirs", "max_runtime_ms"];
+    if session_mode {
+        array_push(allowed, "page_records"); array_push(allowed, "max_pending");
+        array_push(allowed, "session_ttl_ms");
+    }
+    let max_depth = try options.max_depth catch 4;
+    let max_entries = try options.max_entries catch 1000;
+    let max_children = try options.max_children_per_dir catch 200;
+    let include_files = try options.include_files catch true;
+    let include_dirs = try options.include_dirs catch true;
+    let max_runtime_ms = try options.max_runtime_ms catch 30000;
+    let page_records = try options.page_records catch 128;
+    let max_pending = try options.max_pending catch 4096;
+    let session_ttl_ms = try options.session_ttl_ms catch 300000;
+    let valid_roots = type(roots) == "array" and len(roots) >= 1 and len(roots) <= MAX_ROOTS_HARD;
+    if valid_roots { for root in roots { if not _safe_root(root) { valid_roots = false; } } }
+    let valid = valid_roots and _exact_option_fields(options, allowed)
+        and type(max_depth) == "number" and max_depth == num_floor(max_depth)
+        and max_depth >= 0 and max_depth <= MAX_DEPTH_HARD
+        and type(max_entries) == "number" and max_entries == num_floor(max_entries)
+        and max_entries >= 1 and max_entries <= MAX_ENTRIES_HARD
+        and type(max_children) == "number" and max_children == num_floor(max_children)
+        and max_children >= 1 and max_children <= MAX_CHILDREN_HARD
+        and type(include_files) == "bool" and type(include_dirs) == "bool"
+        and (include_files or include_dirs)
+        and type(max_runtime_ms) == "number" and max_runtime_ms == num_floor(max_runtime_ms)
+        and max_runtime_ms >= 10 and max_runtime_ms <= MAX_RUNTIME_MS_HARD;
+    if session_mode {
+        valid = valid and type(page_records) == "number" and page_records == num_floor(page_records)
+            and page_records >= 1 and page_records <= MAX_PAGE_RECORDS_HARD
+            and type(max_pending) == "number" and max_pending == num_floor(max_pending)
+            and max_pending >= 1 and max_pending <= MAX_PENDING_HARD
+            and type(session_ttl_ms) == "number" and session_ttl_ms == num_floor(session_ttl_ms)
+            and session_ttl_ms >= 1000 and session_ttl_ms <= MAX_SESSION_TTL_MS;
+    }
+    if not valid { return map{ ok:false, error:"invalid bounded inventory request" }; }
+    let normalized = map{max_depth:max_depth,max_entries:max_entries,
+        max_children_per_dir:max_children,include_files:include_files,
+        include_dirs:include_dirs,max_runtime_ms:max_runtime_ms,
+        page_records:page_records,max_pending:max_pending,session_ttl_ms:session_ttl_ms};
+    return map{ok:true,roots:roots,options:normalized,
+        roots_digest:_root_digest(roots),options_digest:_option_digest(normalized)};
 }
 
 fn _skip_name(name) {
@@ -122,30 +223,19 @@ fn _record(path, kind, depth, parent) {
 }
 
 fn inventory_roots(roots, options = nil) {
-    if roots == nil { roots = ["."]; }
-    if options == nil { options = map{}; }
-    let max_depth = try options.max_depth catch 4;
-    let max_entries = try options.max_entries catch 1000;
-    let max_children = try options.max_children_per_dir catch 200;
-    let include_files = try options.include_files catch true;
-    let include_dirs = try options.include_dirs catch true;
-    let max_runtime_ms = try options.max_runtime_ms catch 30000;
-    let valid_limits = type(roots) == "array" and len(roots) >= 1 and len(roots) <= MAX_ROOTS_HARD
-        and type(max_depth) == "number" and max_depth == num_floor(max_depth)
-        and max_depth >= 0 and max_depth <= MAX_DEPTH_HARD
-        and type(max_entries) == "number" and max_entries == num_floor(max_entries)
-        and max_entries >= 1 and max_entries <= MAX_ENTRIES_HARD
-        and type(max_children) == "number" and max_children == num_floor(max_children)
-        and max_children >= 1 and max_children <= MAX_CHILDREN_HARD
-        and type(max_runtime_ms) == "number" and max_runtime_ms == num_floor(max_runtime_ms)
-        and max_runtime_ms >= 10 and max_runtime_ms <= MAX_RUNTIME_MS_HARD;
-    if not valid_limits {
+    let checked = _validated_request(roots, options, false);
+    if not checked.ok {
         return map{ format: "pblang.project_inventory.report.v1", roots: [], records: [], paths: [],
             record_count: 0, scanned_dirs: 0, scanned_entries: 0, skipped: [], skipped_count: 0,
             errors: ["invalid bounded inventory request"], timed_out: false, duration_ms: 0,
             max_runtime_ms: 0, truncated: true, complete: false,
             policy: "invalid requests fail closed before filesystem access" };
     }
+    roots = checked.roots; let normalized = checked.options;
+    let max_depth = normalized.max_depth; let max_entries = normalized.max_entries;
+    let max_children = normalized.max_children_per_dir;
+    let include_files = normalized.include_files; let include_dirs = normalized.include_dirs;
+    let max_runtime_ms = normalized.max_runtime_ms;
     let started_ms = now_ms(); let deadline_ms = started_ms + max_runtime_ms;
 
     let records = [];
@@ -168,9 +258,12 @@ fn inventory_roots(roots, options = nil) {
     let q = 0;
     let scanned_dirs = 0;
     let scanned_entries = 0;
+    let visited = 0;
+    let enqueued = len(queue);
     let truncated = false;
     let timed_out = false;
-    while q < len(queue) and len(records) < max_entries and now_ms() < deadline_ms {
+    while q < len(queue) and len(records) < max_entries and visited < MAX_VISITED_HARD
+          and now_ms() < deadline_ms {
         let cur = queue[q];
         q = q + 1;
         let path = _str(cur.path);
@@ -179,12 +272,14 @@ fn inventory_roots(roots, options = nil) {
         let listing = try cur.listing catch nil;
         if type(listing) != "map" { listing = _bounded_listdir(path, max_children); }
         if listing == nil {
+            visited = visited + 1;
             if include_files {
                 array_push(records, _record(path, "file", depth, parent));
             }
             continue;
         }
         let entries = listing.entries;
+        visited = visited + 1;
         if try listing.truncated catch false { truncated = true; }
 
         scanned_dirs = scanned_dirs + 1;
@@ -195,10 +290,12 @@ fn inventory_roots(roots, options = nil) {
         if depth >= max_depth { continue; }
 
         let i = 0;
-        while i < len(entries) and len(records) < max_entries and now_ms() < deadline_ms {
+        while i < len(entries) and len(records) < max_entries
+              and visited < MAX_VISITED_HARD and now_ms() < deadline_ms {
             let name = _str(entries[i]);
             let child = _join(path, name);
             scanned_entries = scanned_entries + 1;
+            visited = visited + 1;
             if should_skip_path(child) {
                 array_push(skipped, map{ path: SURVEY.path_record(child).path, reason: "sensitive/pruned path" });
                 i = i + 1;
@@ -207,8 +304,13 @@ fn inventory_roots(roots, options = nil) {
             let child_listing = _bounded_listdir(child, max_children);
             if type(child_listing) == "map" {
                 if depth + 1 < max_depth {
-                    array_push(queue, map{ path: child, depth: depth + 1, parent: path,
-                        listing: child_listing });
+                    if enqueued >= MAX_VISITED_HARD or len(queue) - q >= MAX_PENDING_HARD {
+                        truncated = true;
+                    } else {
+                        array_push(queue, map{ path: child, depth: depth + 1, parent: path,
+                            listing: child_listing });
+                        enqueued = enqueued + 1;
+                    }
                 } else if include_dirs {
                     array_push(records, _record(child, "dir", depth + 1, path));
                 }
@@ -222,6 +324,7 @@ fn inventory_roots(roots, options = nil) {
     }
     if now_ms() >= deadline_ms { timed_out = true; truncated = true; }
     if q < len(queue) { truncated = true; }
+    if visited >= MAX_VISITED_HARD { truncated = true; }
 
     return map{
         format: "pblang.project_inventory.report.v1",
@@ -231,6 +334,8 @@ fn inventory_roots(roots, options = nil) {
         record_count: len(records),
         scanned_dirs: scanned_dirs,
         scanned_entries: scanned_entries,
+        visited_entries: visited,
+        enqueued_directories: enqueued,
         skipped: skipped,
         skipped_count: len(skipped),
         errors: errors,
@@ -239,8 +344,243 @@ fn inventory_roots(roots, options = nil) {
         max_runtime_ms: max_runtime_ms,
         truncated: truncated,
         complete: not truncated and len(errors) == 0,
-        policy: "metadata-only no-follow directory inventory; no file contents are read; sensitive/cache/build/generated-output/local assistant and vendored dependency paths are skipped; traversal has hard entry/root/depth limits and a cooperative deadline"
+        hard_wall_timeout: false,
+        hard_heap_bound: false,
+        directory_enumerator_allocation_bounded: false,
+        policy: "metadata-only no-follow directory inventory; no file contents are read; sensitive/cache/build/generated-output/local assistant and vendored dependency paths are skipped; traversal has hard visited/enqueued/pending/root/depth ceilings and a cooperative deadline; the underlying directory enumerator is not proven allocation-bounded"
     };
+}
+
+fn _purge_sessions() {
+    let now = now_ms();
+    for id in map_keys(_sessions) {
+        if now >= (try _sessions[id].expires_ms catch 0) { map_remove(_sessions, id); }
+    }
+}
+
+fn _pending_total() {
+    let total=0;
+    for id in map_keys(_sessions) {
+        let state=_sessions[id];
+        total=total+(len(state.queue)-state.q);
+    }
+    return total;
+}
+
+fn _cursor(state) {
+    return map{format:CURSOR_FORMAT,scan_id:state.scan_id,generation:state.generation,
+        options_digest:state.options_digest,
+        expires_ms:state.expires_ms,complete:state.complete,
+        contains_paths:false,persistable:false};
+}
+
+fn _session_error(reason) {
+    return map{ok:false,format:"pblang.project_inventory.page.v1",error:reason,
+        roots:[],records:[],paths:[],record_count:0,complete:false,resumable:false,
+        cursor:nil,hard_wall_timeout:false,hard_heap_bound:false,
+        directory_enumerator_allocation_bounded:false};
+}
+
+fn _session_page(state) {
+    let started = now_ms(); let deadline = started + state.options.max_runtime_ms;
+    let records=[]; let skipped=[]; let timed_out=false; let page_truncated=false;
+    while len(records) < state.options.page_records and not state.complete
+          and state.visited < MAX_VISITED_HARD and state.emitted < state.options.max_entries
+          and now_ms() < deadline {
+        if state.current == nil {
+            if state.q >= len(state.queue) {
+                if state.enumerator_truncated {
+                    state.limit_exhausted=true; state.complete=false; page_truncated=true;
+                } else { state.complete=true; }
+                break;
+            }
+            let item=state.queue[state.q]; state.q=state.q+1;
+            let listing=_bounded_listdir(item.path,state.options.max_children_per_dir);
+            state.visited=state.visited+1;
+            if listing == nil {
+                if state.options.include_files {
+                    array_push(records,_record(item.path,"file",item.depth,item.parent));
+                    state.emitted=state.emitted+1;
+                }
+            } else {
+                state.scanned_dirs=state.scanned_dirs+1;
+                if listing.truncated { state.enumerator_truncated=true; page_truncated=true; }
+                state.current=map{path:item.path,depth:item.depth,parent:item.parent,
+                    entries:listing.entries,index:0};
+                if state.options.include_dirs {
+                    array_push(records,_record(item.path,"dir",item.depth,item.parent));
+                    state.emitted=state.emitted+1;
+                }
+            }
+        } else {
+            let cur=state.current;
+            if cur.index >= len(cur.entries) { state.current=nil; }
+            else {
+                let name=_str(cur.entries[cur.index]); cur.index=cur.index+1;
+                let child=_join(cur.path,name); state.scanned_entries=state.scanned_entries+1;
+                state.visited=state.visited+1;
+                if should_skip_path(child) {
+                    array_push(skipped,map{path:SURVEY.path_record(child).path,
+                        reason:"sensitive/pruned path"});
+                } else {
+                    let child_listing=_bounded_listdir(child,1);
+                    if type(child_listing)=="map" {
+                        if cur.depth+1 < state.options.max_depth {
+                            if state.enqueued >= MAX_VISITED_HARD
+                               or len(state.queue)-state.q >= state.options.max_pending {
+                                state.limit_exhausted=true; page_truncated=true;
+                            } elif _pending_total() >= MAX_GLOBAL_PENDING_HARD {
+                                state.limit_exhausted=true; page_truncated=true;
+                            } else {
+                                array_push(state.queue,map{path:child,depth:cur.depth+1,parent:cur.path});
+                                state.enqueued=state.enqueued+1;
+                            }
+                        } elif state.options.include_dirs {
+                            array_push(records,_record(child,"dir",cur.depth+1,cur.path));
+                            state.emitted=state.emitted+1;
+                        }
+                    } elif state.options.include_files {
+                        array_push(records,_record(child,"file",cur.depth+1,cur.path));
+                        state.emitted=state.emitted+1;
+                    }
+                }
+            }
+        }
+        if state.limit_exhausted { break; }
+    }
+    if now_ms() >= deadline { timed_out=true; page_truncated=true; }
+    if state.visited >= MAX_VISITED_HARD or state.emitted >= state.options.max_entries
+       or state.limit_exhausted { state.complete=false; page_truncated=true; }
+    if not state.complete and not state.limit_exhausted and state.visited < MAX_VISITED_HARD
+       and state.emitted < state.options.max_entries {
+        state.generation=state.generation+1;
+    }
+    state.expires_ms=now_ms()+state.options.session_ttl_ms;
+    if state.q>0 and (state.q>=1024 or state.q*2>=len(state.queue)) {
+        state.queue=slice(state.queue,state.q,len(state.queue)); state.q=0;
+    }
+    let cursor=_cursor(state);
+    if state.complete or state.limit_exhausted or state.visited >= MAX_VISITED_HARD
+       or state.emitted >= state.options.max_entries { map_remove(_sessions,state.scan_id); }
+    return map{ok:true,format:"pblang.project_inventory.page.v1",records:records,
+        paths:inventory_paths(map{records:records}),record_count:len(records),
+        skipped:skipped,skipped_count:len(skipped),scanned_dirs:state.scanned_dirs,
+        scanned_entries:state.scanned_entries,visited_entries:state.visited,
+        enqueued_directories:state.enqueued,timed_out:timed_out,
+        truncated:page_truncated or not state.complete,complete:state.complete,
+        resumable:not state.complete and not state.limit_exhausted
+            and state.visited < MAX_VISITED_HARD and state.emitted < state.options.max_entries,
+        cursor:cursor,contains_private_paths:true,cursor_contains_paths:false,
+        cursor_persistable:false,snapshot_consistent:false,
+        cursor_path_binding_private:true,session_serialized_by_in_flight_guard:true,
+        hard_wall_timeout:false,hard_heap_bound:false,
+        directory_enumerator_allocation_bounded:false,
+        policy:"ephemeral process-local paging; public cursor is opaque and path-free; no persistence or snapshot-consistency claim"};
+}
+
+fn _inventory_open(roots, options) {
+    _purge_sessions();
+    let checked=_validated_request(roots,options,true);
+    if not checked.ok { return _session_error(checked.error); }
+    if len(map_keys(_sessions)) >= MAX_SESSIONS_HARD { return _session_error("inventory session capacity reached"); }
+    if len(checked.roots)>checked.options.max_pending
+       or _pending_total()+len(checked.roots)>MAX_GLOBAL_PENDING_HARD {
+        return _session_error("inventory pending capacity reached");
+    }
+    let scan_id=str_slice(sha256(base64_encode_bytes(random_bytes(32))+":"+str(now_ms())),0,48);
+    let queue=[];
+    for root in checked.roots {
+        if not should_skip_path(root) { array_push(queue,map{path:root,depth:0,parent:""}); }
+    }
+    let state=map{format:SESSION_FORMAT,scan_id:scan_id,generation:0,
+        roots_digest:checked.roots_digest,options_digest:checked.options_digest,
+        options:checked.options,queue:queue,q:0,current:nil,visited:0,
+        emitted:0,enqueued:len(queue),scanned_dirs:0,scanned_entries:0,
+        enumerator_truncated:false,limit_exhausted:false,complete:false,
+        expires_ms:now_ms()+checked.options.session_ttl_ms};
+    _sessions[scan_id]=state;
+    return _session_page(state);
+}
+
+fn _inventory_resume(cursor, roots, options) {
+    _purge_sessions();
+    if type(cursor)!="map" or len(cursor)!=8 or cursor.format!=CURSOR_FORMAT
+       or type(cursor.scan_id)!="string" or not regex_match(cursor.scan_id,"^[0-9a-f]{48}$")
+       or type(cursor.generation)!="number" or cursor.generation!=num_floor(cursor.generation)
+       or type(cursor.options_digest)!="string"
+       or type(cursor.expires_ms)!="number" or type(cursor.complete)!="bool"
+       or cursor.contains_paths or cursor.persistable {
+        return _session_error("invalid opaque inventory cursor");
+    }
+    let checked=_validated_request(roots,options,true);
+    if not checked.ok { return _session_error(checked.error); }
+    if not map_has(_sessions,cursor.scan_id) { return _session_error("inventory session unavailable or expired"); }
+    let state=_sessions[cursor.scan_id];
+    if cursor.complete or cursor.generation!=state.generation
+       or checked.roots_digest!=state.roots_digest
+       or cursor.options_digest!=checked.options_digest
+       or cursor.options_digest!=state.options_digest
+       or cursor.expires_ms!=state.expires_ms {
+        return _session_error("stale, replayed, or mismatched inventory cursor");
+    }
+    return _session_page(state);
+}
+
+fn _inventory_close(cursor) {
+    if type(cursor)!="map" or type(try cursor.scan_id catch nil)!="string" { return false; }
+    if map_has(_sessions,cursor.scan_id) { map_remove(_sessions,cursor.scan_id); return true; }
+    return false;
+}
+
+fn _serialized(operation) {
+    if _session_busy { return _session_error("inventory session operation already in flight"); }
+    _session_busy=true;
+    let outcome=try { map{ok:true,value:operation()} } catch map{ok:false};
+    _session_busy=false;
+    if not outcome.ok { return _session_error("inventory session operation failed"); }
+    return outcome.value;
+}
+
+fn _inventory_collect_pages(roots, options, max_pages) {
+    if type(max_pages)!="number" or max_pages!=num_floor(max_pages)
+       or max_pages<1 or max_pages>64 {
+        return _session_error("invalid inventory page count");
+    }
+    let page=_inventory_open(roots,options);
+    if not page.ok { return page; }
+    let records=[]; let skipped=[]; let pages=0; let last=page;
+    while pages<max_pages {
+        for record in last.records { array_push(records,record); }
+        for row in last.skipped {
+            if len(skipped)<1024 { array_push(skipped,row); }
+        }
+        pages=pages+1;
+        if last.complete or not last.resumable or pages>=max_pages { break; }
+        last=_inventory_resume(last.cursor,roots,options);
+        if not last.ok { break; }
+    }
+    if last.resumable { _inventory_close(last.cursor); }
+    return map{ok:last.ok,format:"pblang.project_inventory.collected.v1",
+        roots:roots,records:records,paths:inventory_paths(map{records:records}),
+        record_count:len(records),skipped:skipped,skipped_count:len(skipped),
+        pages_collected:pages,scanned_dirs:try last.scanned_dirs catch 0,
+        scanned_entries:try last.scanned_entries catch 0,
+        visited_entries:try last.visited_entries catch 0,
+        enqueued_directories:try last.enqueued_directories catch 0,
+        complete:try last.complete catch false,
+        resumable_after_collection:false,
+        truncated:not (try last.complete catch false),
+        timed_out:try last.timed_out catch false,
+        cursor:nil,checkpoint_persisted:false,snapshot_consistent:false,
+        contains_private_paths:true,safe_to_log:false,
+        public_cursor_api:false,internal_session_serialized:true,
+        hard_wall_timeout:false,hard_heap_bound:false,
+        directory_enumerator_allocation_bounded:false,
+        policy:"bounded ephemeral multi-page metadata collection; the collector closes unfinished sessions and never persists cursors or paths"};
+}
+
+fn inventory_collect_pages(roots, options = nil, max_pages = 4) {
+    return _serialized(fn(){return _inventory_collect_pages(roots,options,max_pages);});
 }
 
 fn inventory_paths(report) {
@@ -290,7 +630,20 @@ fn inventory_lines(report, limit = 12) {
 
 fn portfolio_action_from_roots(roots, options = nil) {
     if options == nil { options = map{}; }
-    let inv = inventory_roots(roots, options);
+    let inventory_options=map{};
+    for key in ["max_depth","max_entries","max_children_per_dir","include_files","include_dirs","max_runtime_ms"] {
+        if map_has(options,key) { inventory_options[key]=options[key]; }
+    }
+    let pages=try options.pages catch 1;
+    let inv=nil;
+    if type(pages)!="number" or pages!=num_floor(pages) or pages<1 or pages>64 {
+        inv=_session_error("invalid inventory page count");
+    } elif pages>1 {
+        for key in ["page_records","max_pending","session_ttl_ms"] {
+            if map_has(options,key) { inventory_options[key]=options[key]; }
+        }
+        inv=inventory_collect_pages(roots,inventory_options,pages);
+    } else { inv=inventory_roots(roots,inventory_options); }
     let projects = try options.projects catch nil;
     let limit = try options.limit_per_project catch 5;
     let plan = SURVEY.portfolio_action_plan(inv.paths, projects, limit);
@@ -303,4 +656,6 @@ fn portfolio_action_from_roots(roots, options = nil) {
     };
 }
 
-export should_skip_path, inventory_roots, inventory_paths, inventory_lines, portfolio_action_from_roots;
+export should_skip_path, inventory_roots, inventory_collect_pages,
+       inventory_paths, inventory_lines,
+       portfolio_action_from_roots;
