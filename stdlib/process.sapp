@@ -325,10 +325,24 @@ fn bounded_status() {
             raw_state_exposed: false } };
 }
 
-fn _bounded_unavailable() {
-    let status = bounded_status();
+// Status maps are mutable language values. Crossing the public/private lifecycle
+// boundary therefore requires a structural copy, not a second reference.
+fn _detached_status_snapshot(status) {
+    let snapshot = try json_parse(json_stringify(status)) catch nil;
+    if type(snapshot) != "map"
+       or (try snapshot.format catch "") != "pblang.process.bounded-status.v1"
+       or type(try snapshot.available catch nil) != "bool"
+       or (try snapshot.raw_fallback catch true) {
+        throw "process: canonical admission snapshot cannot be detached";
+    }
+    return snapshot;
+}
+
+fn _bounded_unavailable(status = nil) {
+    if status == nil { status = bounded_status(); }
     return map{ ok: false, command_ok: false, exit_code: -1, stdout: "", stderr: "",
         error: status.reason, unsupported: true, bounded: false,
+        execution_admitted: false, executed: false,
         raw_fallback: false, process_status: status };
 }
 
@@ -336,9 +350,12 @@ fn run_bounded(program, args, options) {
     if type(program) != "string" or type(args) != "array" or type(options) != "map" {
         throw "process.run_bounded requires a program, argv array, and options map";
     }
-    if not bounded_status().available { return _bounded_unavailable(); }
+    let admission = bounded_status();
+    if not admission.available { return _bounded_unavailable(admission); }
     let result = _LINUX_PROCESS.run(program, args, options);
     result.bounded = true;
+    result.execution_admitted = true;
+    result.process_status = admission;
     result.raw_fallback = false;
     result.process_backend = "linux-process";
     return result;
@@ -348,9 +365,12 @@ fn run_fixed_bounded(candidates, args, options) {
     if type(candidates) != "array" or type(args) != "array" or type(options) != "map" {
         throw "process.run_fixed_bounded requires candidates, argv, and options";
     }
-    if not bounded_status().available { return _bounded_unavailable(); }
+    let admission = bounded_status();
+    if not admission.available { return _bounded_unavailable(admission); }
     let result = _LINUX_PROCESS.run_fixed(candidates, args, options);
     result.bounded = true;
+    result.execution_admitted = true;
+    result.process_status = admission;
     result.raw_fallback = false;
     result.process_backend = "linux-process";
     return result;
@@ -360,7 +380,8 @@ fn start_fixed_bounded(candidates, args, options) {
     if type(candidates) != "array" or type(args) != "array" or type(options) != "map" {
         throw "process.start_fixed_bounded requires candidates, argv, and options";
     }
-    if not bounded_status().available { return _bounded_unavailable(); }
+    let admission = bounded_status();
+    if not admission.available { return _bounded_unavailable(admission); }
     maintain_bounded();
     let output_limit = try _bounded_integer(try options.max_output_bytes catch nil,
         1048576, 1, 67108864, "max_output_bytes") catch nil;
@@ -387,6 +408,15 @@ fn start_fixed_bounded(candidates, args, options) {
             raw_state_exposed: false,
             error: "bounded lifecycle capacity or terminal-result budget reached" };
     }
+    let private_admission = try _detached_status_snapshot(admission) catch nil;
+    if private_admission == nil {
+        map_remove(_BOUNDED_HANDLES, id);
+        return map{ format: "pblang.process.bounded-start.v1", ok: false,
+            started: false, bounded: true, raw_fallback: false,
+            raw_state_exposed: false,
+            error: "canonical admission snapshot cannot be retained privately" };
+    }
+    _BOUNDED_HANDLES[id].process_status = private_admission;
     let launch_options = map{};
     for key in map_keys(options) {
         if key != "_terminal_retention_ms" { launch_options[key] = options[key]; }
@@ -429,6 +459,8 @@ fn start_fixed_bounded(candidates, args, options) {
     state.phase = "running";
     return map{ format: BOUNDED_HANDLE_FORMAT, id: id, ok: true,
         started: true, bounded: true, raw_fallback: false,
+        execution_admitted: true,
+        process_status: _detached_status_snapshot(private_admission),
         raw_state_exposed: false };
 }
 
@@ -473,7 +505,7 @@ fn request_cancel_bounded(handle, grace_ms = 500) {
 
 fn finish_bounded(handle, wait_ms = nil) {
     let state = _bounded_state(handle);
-    let result = nil; let result_was_cached = false;
+    let result = map{}; let result_was_cached = false;
     if (try state.phase catch "") == "terminal_cached" {
         result = try _expand_terminal_result(state.terminal_compact) catch nil;
         if result == nil {
@@ -504,6 +536,8 @@ fn finish_bounded(handle, wait_ms = nil) {
     try map_remove(result, "process_group_id") catch nil;
     result.format = "pblang.process.bounded-result.v1";
     result.bounded = true; result.raw_fallback = false;
+    result.execution_admitted = true;
+    result.process_status = _detached_status_snapshot(state.process_status);
     result.race_resistant_identity = state.race_resistant_identity;
     result.raw_state_exposed = false; result.handle_closed = terminal;
     result.requires_recovery = not terminal;

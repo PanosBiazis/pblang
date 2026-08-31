@@ -28,6 +28,23 @@
 
 ## Unreleased
 
+- Closed a low-level OpenSSH process-admission bypass. SSH/SFTP now use the
+  canonical bounded-process facade, refuse unverified typed-FFI readiness before
+  opening temporary key material, and expose explicit execution-admission and
+  no-fallback evidence.
+- Repaired source-only polyglot publication by exclusively creating or
+  descriptor-verifying a current-user-owned mode-0700 output root before its
+  private build session. Until publication stays on one held directory
+  descriptor, caller roots are restricted to direct children of verified sticky,
+  root/current-user-owned `/tmp`; roots below shared non-sticky parents,
+  including pre-existing mode-0700 roots, and symbolic roots fail closed.
+- Preserved canonical bounded-process diagnostics and execution/cleanup evidence
+  through hosted C99 build failures. Security tests now separate the operational
+  success lane from the unavailable lane instead of treating host tool presence
+  as execution authority, and process results retain deep-detached exact
+  admission snapshots so public async-handle mutation cannot rewrite private
+  evidence. Unavailable AES/digest C99 differentials emit explicit skip evidence.
+
 - Hardened registry installation: every release now requires a well-formed
   SHA-256, streamed responses and compressed/unpacked archive work are bounded,
   special/link entries fail closed, and failed extraction removes the partial
