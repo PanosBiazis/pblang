@@ -22,6 +22,7 @@ let O_RDONLY = 0; let O_WRONLY = 1; let O_RDWR = 2;
 let O_CREAT = 64; let O_EXCL = 128;
 let O_NONBLOCK = 2048;
 let O_DIRECTORY = 65536; let O_NOFOLLOW = 131072; let O_CLOEXEC = 524288;
+let O_PATH = 2097152;
 let O_TMPFILE = 4259840;
 let MFD_CLOEXEC = 1; let MFD_ALLOW_SEALING = 2;
 let F_GETFD = 1; let F_SETFD = 2; let FD_CLOEXEC = 1;
@@ -32,8 +33,15 @@ let IMMUTABLE_SEALS = F_SEAL_SEAL + F_SEAL_SHRINK + F_SEAL_GROW + F_SEAL_WRITE;
 let LOCK_EX = 2; let LOCK_NB = 4; let LOCK_UN = 8;
 let MODE_FILE = 384; let MODE_DIR = 448;
 let MAX_PATH = 4096; let MAX_COMPONENT = 255;
+let ENUM_BATCH_BYTES = 16384; let ENUM_MAX_ENTRIES = 4096;
+let FDINFO_MAX_BYTES = 4096; let ENUM_MAX_CALLS = 32768;
+let ENUM_CONTEXT_TTL_MS = 600000;
+let ENUM_MAX_CONTEXTS = 16; let ENUM_MAX_PENDING_TOKENS = 1024;
+let ENUM_MAX_BATCHES = 4096;
 let _rename_noreplace_x64_cache = map{ known: false, supported: false };
 let _linkat_empty_x64_cache = map{ known: false, supported: false };
+let _enumeration_contexts = map{};
+let _strict_enum_operations = map{};
 
 fn _error(message) { return map{ ok: false, error: message }; }
 fn _first_existing(paths) {
@@ -73,6 +81,22 @@ fn _components(path, allow_root = true) {
     if type(path) != "string" or len(path) > MAX_PATH or str_starts_with(path, "/") or
        str_contains(path, strfromcharcode(0)) { return nil; }
     if path == "" or path == "." or path == "root" { if allow_root { return []; } return nil; }
+    let raw = str_split(path, "/"); let out = []; let i = 0;
+    while i < len(raw) {
+        let part = raw[i];
+        if part == "" or part == "." or part == ".." or len(part) > MAX_COMPONENT { return nil; }
+        array_push(out, part); i = i + 1;
+    }
+    return out;
+}
+
+// The strict enumerator uses only the empty string as its root sentinel. This
+// keeps a real top-level directory named "root" addressable and removes the
+// legacy list() aliases from the security-sensitive traversal contract.
+fn _strict_components(path) {
+    if type(path) != "string" or len(path) > MAX_PATH or str_starts_with(path, "/") or
+       str_contains(path, strfromcharcode(0)) { return nil; }
+    if path == "" { return []; }
     let raw = str_split(path, "/"); let out = []; let i = 0;
     while i < len(raw) {
         let part = raw[i];
@@ -190,6 +214,12 @@ fn _call(fs, symbol, signature, args) {
     }
     if symbol == "lseek" and signature == "i32,i64,i32->i64" {
         return try _typed_call(fs, "lseek", "i32,i64,i32->i64", args) catch -1;
+    }
+    if symbol == "ftruncate" and signature == "i32,i64->i32" {
+        return try _typed_call(fs, "ftruncate", "i32,i64->i32", args) catch -1;
+    }
+    if symbol == "getdents64" and signature == "i32,ptr,i64->i64" {
+        return try _typed_call(fs, "getdents64", "i32,ptr,i64->i64", args) catch -1;
     }
     return -1;
 }
@@ -324,7 +354,264 @@ fn _descriptor_metadata(fs, fd, path) {
         mode: mode, owner_uid: owner_uid, current_uid: current_uid,
         owner_current_user: owner_uid == current_uid, link_count: link_count,
         race_resistant: true, descriptor_bound: true
-    };
+    }
+}
+
+fn _pair_equal(a, b) {
+    return is_array(a) and is_array(b) and len(a) == 2 and len(b) == 2
+        and a[0] == b[0] and a[1] == b[1];
+}
+
+fn _u16_le(bytes, offset) {
+    return bytes[offset] + bytes[offset + 1] * 256;
+}
+
+fn _u32_le(bytes, offset) {
+    return bytes[offset] + bytes[offset + 1] * 256
+        + bytes[offset + 2] * 65536 + bytes[offset + 3] * 16777216;
+}
+
+fn _u64_le_pair(bytes, offset) {
+    return [_u32_le(bytes, offset + 4), _u32_le(bytes, offset)];
+}
+
+// Parse a decimal unsigned 64-bit identifier without ever placing the whole
+// value in PBLang's f64 number representation. Each limb stays exactly within
+// 32 bits, so inode and mount identifiers above 2^53 remain comparable.
+fn _decimal_u64_pair(value) {
+    if type(value) != "string" or len(value) < 1 or len(value) > 20 { return nil; }
+    let hi = 0; let lo = 0; let i = 0;
+    while i < len(value) {
+        let code = strcharcodeat(value, i);
+        if code < 48 or code > 57 { return nil; }
+        let expanded = lo * 10 + code - 48;
+        let carry = num_floor(expanded / 4294967296);
+        lo = expanded - carry * 4294967296;
+        hi = hi * 10 + carry;
+        if hi > 4294967295 { return nil; }
+        i = i + 1;
+    }
+    return [hi, lo];
+}
+
+fn _load_native_batch(fs, snapshot, buffer, count) {
+    if count < 0 or count > ENUM_BATCH_BYTES { return nil; }
+    if _i32(_call(fs, "ftruncate", "i32,i64->i32", [snapshot, 0])) != 0
+       or _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 0]) < 0 {
+        return nil;
+    }
+    let written = 0;
+    while written < count {
+        let step = _call(fs, "write", "i32,ptr,i64->i64",
+            [snapshot, buffer + written, count - written]);
+        if step <= 0 { return nil; }
+        written = written + step;
+    }
+    if _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 0]) < 0 { return nil; }
+    let bytes = try fs_read_bytes(_fd_path(snapshot)) catch nil;
+    if not is_array(bytes) or len(bytes) != count { return nil; }
+    return bytes;
+}
+
+fn _read_descriptor_bounded(fs, fd, maximum) {
+    if maximum < 1 or maximum > FDINFO_MAX_BYTES { return _error("invalid descriptor text limit"); }
+    let ceiling = maximum + 1;
+    let buffer = _call(fs, "calloc", "i64,i64->ptr", [1, ceiling]);
+    if buffer == nil or buffer == 0 { return _error("descriptor text buffer is unavailable"); }
+    let total = 0; let eof = false; let failed = false;
+    while total < ceiling and not eof and not failed {
+        let count = _call(fs, "read", "i32,ptr,i64->i64", [fd, buffer + total, ceiling - total]);
+        if count < 0 { failed = true; }
+        elif count == 0 { eof = true; }
+        else { total = total + count; }
+    }
+    if failed or total > maximum {
+        _free(fs, buffer);
+        return _error(if failed { "descriptor text read failed" } else { "descriptor text exceeds limit" });
+    }
+    let snapshot = _i32(_call(fs, "memfd_create", "string,i32->i32",
+        ["pblang-bounded-fdinfo", MFD_CLOEXEC]));
+    if snapshot < 0 { _free(fs, buffer); return _error("descriptor text snapshot is unavailable"); }
+    let bytes = _load_native_batch(fs, snapshot, buffer, total);
+    _close_fd(fs, snapshot); _free(fs, buffer);
+    if not is_array(bytes) { return _error("descriptor text snapshot failed"); }
+    return map{ ok: true, bytes: bytes };
+}
+
+fn _fd_identity(fs, fd) {
+    let pid = _i32(_call(fs, "getpid", "->i32", []));
+    if pid <= 0 or fd < 0 { return _error("descriptor identity is unavailable"); }
+    let fdinfo_path = "/proc/" + str(pid) + "/fdinfo/" + str(fd);
+    if len(fdinfo_path) > 96 or not regex_match(fdinfo_path, "^/proc/[0-9]+/fdinfo/[0-9]+$") {
+        return _error("descriptor identity path is invalid");
+    }
+    let info_fd = _openat(fs, AT_FDCWD, fdinfo_path, O_RDONLY + O_NOFOLLOW + O_CLOEXEC, 0);
+    if info_fd < 0 { return _error("descriptor identity record cannot be opened"); }
+    let loaded = _read_descriptor_bounded(fs, info_fd, FDINFO_MAX_BYTES);
+    _close_fd(fs, info_fd);
+    if not loaded.ok { return loaded; }
+    let text = try bytes_to_str(loaded.bytes) catch nil;
+    if type(text) != "string" { return _error("descriptor identity record is not UTF-8"); }
+    let mount_id = nil; let inode = nil; let mount_count = 0; let inode_count = 0;
+    let lines = str_split(text, "\n");
+    let i = 0;
+    while i < len(lines) {
+        if str_starts_with(lines[i], "mnt_id:") {
+            mount_count = mount_count + 1;
+            let fields = str_split(lines[i], ":");
+            if len(fields) != 2 { return _error("descriptor mount identity is malformed"); }
+            mount_id = _decimal_u64_pair(str_trim(fields[1]));
+        } elif str_starts_with(lines[i], "ino:") {
+            inode_count = inode_count + 1;
+            let fields = str_split(lines[i], ":");
+            if len(fields) != 2 { return _error("descriptor inode identity is malformed"); }
+            inode = _decimal_u64_pair(str_trim(fields[1]));
+        }
+        i = i + 1;
+    }
+    if mount_count != 1 or inode_count != 1 or mount_id == nil or inode == nil {
+        return _error("descriptor identity fields are missing or duplicated");
+    }
+    return map{ ok: true, mount_id: mount_id, inode: inode };
+}
+
+fn _purge_enumeration_contexts() {
+    let now = now_ms();
+    for id in map_keys(_enumeration_contexts) {
+        if now >= (try _enumeration_contexts[id].expires_ms catch 0) {
+            map_remove(_enumeration_contexts, id);
+        }
+    }
+}
+
+fn _identity_text(identity) {
+    return str(identity.mount_id[0]) + ":" + str(identity.mount_id[1]) + ":"
+        + str(identity.inode[0]) + ":" + str(identity.inode[1]);
+}
+
+fn _frame_text(value) {
+    let text = str(value);
+    return str(len(str_to_bytes(text))) + ":" + text;
+}
+
+fn _enumeration_token(context, parent_token, path, identity) {
+    let message = _frame_text("pblang.linux-dirfs.traversal-token.v1")
+        + _frame_text(_identity_text(context.root_identity))
+        + _frame_text(parent_token) + _frame_text(path)
+        + _frame_text(_identity_text(identity)) + _frame_text("directory")
+        + _frame_text(context.generation);
+    return hmac_sha256(message, context.secret);
+}
+
+fn _enumeration_context(fs) {
+    _purge_enumeration_contexts();
+    let existing_id = try fs.enumeration_context_id catch nil;
+    if type(existing_id) == "string" and map_has(_enumeration_contexts, existing_id) {
+        let existing = _enumeration_contexts[existing_id];
+        if existing.root_fd == fs.root_fd and now_ms() < existing.expires_ms {
+            return map{ ok: true, id: existing_id, context: existing };
+        }
+    }
+    if len(map_keys(_enumeration_contexts)) >= ENUM_MAX_CONTEXTS {
+        return _error("bounded enumeration context capacity reached");
+    }
+    let root_identity = _fd_identity(fs, fs.root_fd);
+    if not root_identity.ok { return _error("scan root identity is unavailable"); }
+    let id = str_slice(sha256(base64_encode_bytes(random_bytes(32)) + ":" + str(now_ms())), 0, 48);
+    if map_has(_enumeration_contexts, id) { return _error("enumeration context collision"); }
+    let context = map{ root_fd: fs.root_fd, root_identity: root_identity,
+        secret: base64_encode_bytes(random_bytes(32)), generation: id,
+        expires_ms: now_ms() + ENUM_CONTEXT_TTL_MS, calls: 0,
+        root_consumed: false, pending: map{}, pending_count: 0 };
+    _enumeration_contexts[id] = context;
+    fs.enumeration_context_id = id;
+    return map{ ok: true, id: id, context: context };
+}
+
+fn _consume_enumeration_token(context, path, identity, token, root_path) {
+    if root_path {
+        if token != nil and token != "" { return _error("root enumeration does not accept a traversal token"); }
+        if context.root_consumed { return _error("root enumeration token was already consumed"); }
+        if not _pair_equal(identity.mount_id, context.root_identity.mount_id)
+           or not _pair_equal(identity.inode, context.root_identity.inode) {
+            return _error("scan root identity changed");
+        }
+        context.root_consumed = true;
+        return map{ ok: true, parent_token: "" };
+    }
+    if type(token) != "string" or len(token) != 64 or not map_has(context.pending, token) {
+        return _error("missing or invalid traversal token");
+    }
+    let expected = context.pending[token];
+    if expected.path != path or not _pair_equal(expected.identity.mount_id, identity.mount_id)
+       or not _pair_equal(expected.identity.inode, identity.inode) {
+        return _error("directory identity changed before traversal");
+    }
+    let recomputed = _enumeration_token(context, expected.parent_token, path, identity);
+    if not constant_time_eq(token, recomputed) { return _error("traversal token authentication failed"); }
+    map_remove(context.pending, token);
+    context.pending_count = context.pending_count - 1;
+    return map{ ok: true, parent_token: token };
+}
+
+fn discard_enumeration_token(fs, token) {
+    if fs == nil or not is_map(fs) or (try fs.closed catch true)
+       or type(token) != "string" or len(token) != 64 {
+        return false;
+    }
+    let context_id = try fs.enumeration_context_id catch nil;
+    if type(context_id) != "string" or not map_has(_enumeration_contexts, context_id) {
+        return false;
+    }
+    let context = _enumeration_contexts[context_id];
+    if not map_has(context.pending, token) { return false; }
+    map_remove(context.pending, token);
+    context.pending_count = context.pending_count - 1;
+    return true;
+}
+
+fn _begin_bounded_enumeration(fs) {
+    let current_id = try fs.strict_enum_operation_id catch nil;
+    if type(current_id) == "string" and map_has(_strict_enum_operations, current_id) {
+        return _error("another strict enumeration operation is active");
+    }
+    if len(map_keys(_strict_enum_operations)) >= ENUM_MAX_CONTEXTS {
+        return _error("strict enumeration operation capacity reached");
+    }
+    let id = str_slice(sha256(base64_encode_bytes(random_bytes(32)) + ":operation:" + str(now_ms())), 0, 48);
+    if map_has(_strict_enum_operations, id) { return _error("strict enumeration operation collision"); }
+    let state = map{ owner_root_fd: fs.root_fd, dir_fd: -1, snapshot_fd: -1,
+        child_fd: -1, buffer: nil };
+    _strict_enum_operations[id] = state;
+    fs.strict_enum_operation_id = id;
+    return map{ ok: true, id: id, state: state };
+}
+
+fn abort_bounded_enumeration(fs) {
+    if fs == nil or not is_map(fs) {
+        return true;
+    }
+    let id = try fs.strict_enum_operation_id catch nil;
+    if type(id) != "string" or not map_has(_strict_enum_operations, id) { return true; }
+    let state = _strict_enum_operations[id];
+    if (try state.owner_root_fd catch -1) != (try fs.root_fd catch -2) { return false; }
+    map_remove(_strict_enum_operations, id);
+    fs.strict_enum_operation_id = "";
+    let ok = true;
+    let child_fd = try state.child_fd catch -1;
+    let snapshot_fd = try state.snapshot_fd catch -1;
+    let dir_fd = try state.dir_fd catch -1;
+    let buffer = try state.buffer catch nil;
+    if child_fd >= 0 and not _close_fd(fs, child_fd) { ok = false; }
+    if snapshot_fd >= 0 and not _close_fd(fs, snapshot_fd) { ok = false; }
+    if buffer != nil and buffer != 0 { _free(fs, buffer); }
+    if dir_fd >= 0 and not _close_fd(fs, dir_fd) { ok = false; }
+    return ok;
+}
+
+fn _entry_error(name, available, code) {
+    return map{ name: name, name_available: available, kind: "error",
+        error_code: code, traversable: false, traversal_token: "" };
 }
 
 fn open(root, create = true, protect_root = false) {
@@ -420,6 +707,12 @@ fn open_current_process_net() {
 fn close(fs) {
     if fs == nil or not is_map(fs) or (try fs.closed catch true) { return false; }
     let closed = true;
+    if not abort_bounded_enumeration(fs) { closed = false; }
+    let enumeration_context_id = try fs.enumeration_context_id catch nil;
+    if type(enumeration_context_id) == "string"
+       and map_has(_enumeration_contexts, enumeration_context_id) {
+        map_remove(_enumeration_contexts, enumeration_context_id);
+    }
     let children = try fs.child_fds catch map{};
     let keys = map_keys(children);
     for i len(keys) {
@@ -598,7 +891,7 @@ fn child_descriptor(fs) {
         ok: true, format: "pblang.linux-dirfs.child-descriptor.v1",
         fd: fd, owner_fd: fs.root_fd, active: true,
         inheritable: true, descriptor_bound: true
-    };
+    }
 }
 
 // Adopt a directory descriptor inherited from a trusted parent process. The
@@ -1120,6 +1413,204 @@ fn list(fs, path = "root", max_entries = 512) {
     let limit = num_floor(max_entries); if limit < 1 { limit = 1; } if limit > 4096 { limit = 4096; }
     let out = []; let i = 0; while i < len(entries) and i < limit { array_push(out, entries[i]); i = i + 1; }
     return map{ ok: true, path: path, entries: out, truncated: len(entries) > limit };
+}
+
+// Strict Linux-only enumerator for bounded inventory shards. Unlike list(), it
+// never calls fs_listdir: getdents64 fills one fixed native buffer and at most
+// max_entries+1 names become PBLang objects. Directory traversal is authorized
+// by a one-use, root-bound HMAC token and every entry is checked against the
+// held root mount identity before it can become traversable.
+fn enumerate_bounded(fs, path = "", max_entries = 512, traversal_token = nil) {
+    if fs == nil or not is_map(fs) or (try fs.closed catch true) {
+        return _error("directory root is closed");
+    }
+    if type(max_entries) != "number" or max_entries != num_floor(max_entries)
+       or max_entries < 1 or max_entries > ENUM_MAX_ENTRIES {
+        return _error("invalid strict enumeration entry limit");
+    }
+    let operation = _begin_bounded_enumeration(fs);
+    if not operation.ok { return operation; }
+    let operation_state = operation.state;
+    let parts = _strict_components(path);
+    if parts == nil { abort_bounded_enumeration(fs); return _error("invalid strict enumeration path"); }
+    let canonical_path = if len(parts) == 0 { "" } else { str_join(parts, "/") };
+    let context_result = _enumeration_context(fs);
+    if not context_result.ok { abort_bounded_enumeration(fs); return context_result; }
+    let context = context_result.context;
+    if context.calls >= ENUM_MAX_CALLS {
+        abort_bounded_enumeration(fs); return _error("bounded enumeration call capacity reached");
+    }
+    context.calls = context.calls + 1;
+    context.expires_ms = now_ms() + ENUM_CONTEXT_TTL_MS;
+
+    let dir = _walk_dir(fs, parts, false);
+    if not dir.ok { abort_bounded_enumeration(fs); return _error("strict enumeration directory cannot be held"); }
+    operation_state.dir_fd = dir.fd;
+    let identity_outcome = try { map{ ok: true, value: _fd_identity(fs, dir.fd) } }
+        catch map{ ok: false };
+    if not identity_outcome.ok or not (try identity_outcome.value.ok catch false) {
+        abort_bounded_enumeration(fs);
+        return _error("strict enumeration directory identity is unavailable");
+    }
+    let directory_identity = identity_outcome.value;
+    let admission_outcome = try { map{ ok: true, value: _consume_enumeration_token(
+        context, canonical_path, directory_identity, traversal_token, len(parts) == 0) } }
+        catch map{ ok: false };
+    if not admission_outcome.ok or not (try admission_outcome.value.ok catch false) {
+        abort_bounded_enumeration(fs);
+        if admission_outcome.ok { return admission_outcome.value; }
+        return _error("strict enumeration admission failed safely");
+    }
+    let admitted = admission_outcome.value;
+    if not _pair_equal(directory_identity.mount_id, context.root_identity.mount_id) {
+        abort_bounded_enumeration(fs);
+        return _error("strict enumeration crossed the scan-root mount");
+    }
+
+    let buffer = try _call(fs, "calloc", "i64,i64->ptr", [1, ENUM_BATCH_BYTES]) catch nil;
+    if buffer == nil or buffer == 0 {
+        abort_bounded_enumeration(fs); return _error("strict enumeration buffer is unavailable");
+    }
+    operation_state.buffer = buffer;
+    let snapshot = try _i32(_call(fs, "memfd_create", "string,i32->i32",
+        ["pblang-getdents-page", MFD_CLOEXEC])) catch -1;
+    if snapshot < 0 {
+        abort_bounded_enumeration(fs);
+        return _error("strict enumeration page bridge is unavailable");
+    }
+    operation_state.snapshot_fd = snapshot;
+
+    let entries = []; let observed = 0; let batches = 0;
+    let eof = false; let truncated = false; let fatal_error = ""; let entry_errors = 0;
+    while not eof and not truncated and fatal_error == "" and batches < ENUM_MAX_BATCHES {
+        let count = _call(fs, "getdents64", "i32,ptr,i64->i64",
+            [dir.fd, buffer, ENUM_BATCH_BYTES]);
+        batches = batches + 1;
+        if count < 0 or count > ENUM_BATCH_BYTES {
+            fatal_error = "getdents64-unavailable";
+        } elif count == 0 {
+            eof = true;
+        } else {
+            let page = _load_native_batch(fs, snapshot, buffer, count);
+            if not is_array(page) {
+                fatal_error = "directory-page-bridge-failed";
+            } else {
+                let offset = 0;
+                while offset < len(page) and not truncated and fatal_error == "" {
+                    if offset + 20 > len(page) {
+                        fatal_error = "malformed-dirent-header";
+                        continue;
+                    }
+                    let record_length = _u16_le(page, offset + 16);
+                    if record_length < 20 or num_mod(record_length, 8) != 0
+                       or offset + record_length > len(page) {
+                        fatal_error = "malformed-dirent-length";
+                        continue;
+                    }
+                    let name_end = offset + 19;
+                    while name_end < offset + record_length and page[name_end] != 0 {
+                        name_end = name_end + 1;
+                    }
+                    if name_end >= offset + record_length {
+                        fatal_error = "malformed-dirent-name";
+                        continue;
+                    }
+                    let name_bytes = slice(page, offset + 19, name_end);
+                    let dot = len(name_bytes) == 1 and name_bytes[0] == 46;
+                    let dotdot = len(name_bytes) == 2 and name_bytes[0] == 46 and name_bytes[1] == 46;
+                    if not dot and not dotdot {
+                        observed = observed + 1;
+                        if observed > max_entries {
+                            truncated = true;
+                        } else {
+                            let name = try bytes_to_str(name_bytes) catch nil;
+                            let entry = map{};
+                            if type(name) != "string" or len(name_bytes) < 1 or len(name_bytes) > MAX_COMPONENT
+                               or (type(name) == "string" and str_to_bytes(name) != name_bytes) {
+                                entry = _entry_error(nil, false, "invalid-name-encoding");
+                            } else {
+                                let dirent_type = page[offset + 18];
+                                let kind = "error";
+                                if dirent_type == 8 { kind = "file"; }
+                                elif dirent_type == 4 { kind = "directory"; }
+                                elif dirent_type == 10 { kind = "symlink"; }
+                                if kind == "error" {
+                                    entry = _entry_error(name, true, "unsupported-or-unknown-type");
+                                } else {
+                                    let flags = O_PATH + O_NOFOLLOW + O_CLOEXEC;
+                                    if kind == "directory" { flags = flags + O_DIRECTORY; }
+                                    let child_fd = _openat(fs, dir.fd, name, flags, 0);
+                                    if child_fd < 0 {
+                                        entry = _entry_error(name, true, "entry-open-race");
+                                    } else {
+                                        operation_state.child_fd = child_fd;
+                                        let identity = _fd_identity(fs, child_fd);
+                                        _close_fd(fs, child_fd);
+                                        operation_state.child_fd = -1;
+                                        let dirent_inode = _u64_le_pair(page, offset);
+                                        if not identity.ok {
+                                            entry = _entry_error(name, true, "entry-identity-unavailable");
+                                        } elif not _pair_equal(identity.mount_id, context.root_identity.mount_id) {
+                                            entry = _entry_error(name, true, "mount-boundary");
+                                        } elif not _pair_equal(identity.inode, dirent_inode) {
+                                            entry = _entry_error(name, true, "entry-identity-race");
+                                        } else {
+                                            let token = ""; let traversable = false;
+                                            if kind == "directory" {
+                                                if context.pending_count >= ENUM_MAX_PENDING_TOKENS {
+                                                    entry = _entry_error(name, true, "traversal-token-capacity");
+                                                } else {
+                                                    let child_path = if path == "" {
+                                                        name
+                                                    } else { path + "/" + str(name) };
+                                                    token = _enumeration_token(context, admitted.parent_token,
+                                                        child_path, identity);
+                                                    if map_has(context.pending, token) {
+                                                        entry = _entry_error(name, true, "traversal-token-collision");
+                                                    } else {
+                                                        context.pending[token] = map{ path: child_path,
+                                                            parent_token: admitted.parent_token,
+                                                            identity: identity };
+                                                        context.pending_count = context.pending_count + 1;
+                                                        traversable = true;
+                                                    }
+                                                }
+                                            }
+                                            if len(map_keys(entry)) == 0 {
+                                                entry = map{ name: name, name_available: true, kind: kind,
+                                                    error_code: "", traversable: traversable,
+                                                    traversal_token: token };
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if entry.kind == "error" { entry_errors = entry_errors + 1; }
+                            array_push(entries, entry);
+                        }
+                    }
+                    offset = offset + record_length;
+                }
+            }
+        }
+    }
+    if batches >= ENUM_MAX_BATCHES and not eof and not truncated and fatal_error == "" {
+        fatal_error = "directory-batch-limit";
+    }
+    let complete = fatal_error == "" and not truncated and entry_errors == 0;
+    let result = map{ ok: fatal_error == "", format: "pblang.linux-dirfs.enumeration.v1",
+        path: canonical_path, entries: entries, entry_count: len(entries),
+        observed_at_least: observed, truncated: truncated, complete: complete,
+        error_code: fatal_error, entry_errors: entry_errors,
+        descriptor_streaming: true, allocation_bounded_algorithmically: true,
+        native_buffer_bytes: ENUM_BATCH_BYTES, pblang_entry_limit: max_entries,
+        stay_on_device: true, kind_states: ["file", "directory", "symlink", "error"],
+        snapshot_consistent: false, hard_heap_enforced: false,
+        traversal_tokens_opaque: true, traversal_tokens_exposed_to_handle_holder: true,
+        raw_identity_exposed: false, production_ready: false };
+    let cleaned = abort_bounded_enumeration(fs);
+    if not cleaned { return _error("strict enumeration cleanup failed"); }
+    return result;
 }
 
 fn read_bytes(fs, path, max_bytes = 4194304) {
@@ -1821,6 +2312,14 @@ fn status(fs) {
                 anonymous_mutable_snapshot: true,
                 anonymous_mutable_child_handoff: true,
                 bounded_descriptor_locks: true,
+                strict_descriptor_streaming_enumerator: true,
+                strict_enumerator_batch_bytes: ENUM_BATCH_BYTES,
+                strict_enumerator_max_entries: ENUM_MAX_ENTRIES,
+                strict_enumerator_stay_on_device: true,
+                strict_enumerator_quad_state: true,
+                strict_enumerator_snapshot_consistent: false,
+                strict_enumerator_hard_heap_enforced: false,
+                strict_enumerator_production_ready: false,
                 relative_root_component_walk: true,
                 mkdir_race_reopen: true, permission_postcondition_verified: true,
                 libc: try fs.libc_path catch nil };
@@ -1834,7 +2333,8 @@ export available, open, open_absolute, open_current_process_net, close, descript
        duplicate_child_file_descriptor,
        sealed_child_bytes, mutable_snapshot_bytes, close_child_descriptor,
        acquire_lock, release_lock,
-       mkdir, mkdir_new, list,
+       mkdir, mkdir_new, list, enumerate_bounded, discard_enumeration_token,
+       abort_bounded_enumeration,
        read_bytes, read_prefix_bytes, read_range_bytes, read_stream_bytes, file_size, metadata,
        protect_file, protect_executable, write_atomic, append_bytes_bounded,
        write_new_exclusive, write_new_atomic, copy_held_range_new_atomic,
