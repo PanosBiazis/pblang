@@ -28,3 +28,15 @@ per-session and aggregate ceilings, and consumed queue prefixes are compacted.
 Collected reports still contain caller-requested raw paths and are explicitly
 `safe_to_log=false`; neither cursor nor internal continuation/queue path state is
 returned or persisted, although the requested final report still contains raw paths.
+The aggregate portfolio entry point rebuilds a path-free result with canonical
+project names and reports `contains_raw_paths=false`. Counts and category presence
+can still fingerprint a private workspace, so it deliberately remains
+`safe_to_log=false`; `terminal_text_safe=true` means only that its fixed text is
+control-sanitized, not that it is approved for publication.
+
+Proposal reviews now reconstruct one of the four canonical proposal definitions,
+compare every scalar plus ordered array, and bind the exact definition with a
+domain-separated, type-tagged, byte-length-framed SHA-256 digest. This is an
+integrity/definition binding only; the review carries the explicit
+`sha256-pblang-project-proposal-v1` algorithm ID. Both proposal-definition and publisher
+authentication remain false until an independent trust mechanism exists.
