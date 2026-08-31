@@ -129,9 +129,11 @@ complete broker/sandbox migration before the IDE is production-ready.
   choosing the next focused implementation slice, especially PBIDE GPU-present
   rendering, pbAI curated training, pbOS capability layers, and pb-mcp tool
   classification, without scanning private file contents. `stdlib:project_inventory.sapp`
-  and `tools/pbportfolio.sapp` can now feed this board from bounded metadata-only
-  directory inventories of AAP, `/media`, or `~` while pruning secret/cache/build
-  locations.
+  and `tools/pbportfolio.sapp` expose metadata-only coverage while pruning
+  secret/cache/build locations. Scan-derived tasks are currently fail-closed:
+  they cannot feed this board until the inventory proves allocation bounds,
+  mount confinement and tri-state entry identity. Broad `/media` or home scans
+  therefore remain blocked rather than being treated as trustworthy idea input.
 - **AAP category health matrix** — Management also exposes
   `ide_features.project_category_health_board(...)`, backed by
   `project_survey.portfolio_category_health(...)`. It shows every focus category
