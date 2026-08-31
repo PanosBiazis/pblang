@@ -613,21 +613,60 @@ fn _cas_expectation(value) {
     return nil;
 }
 
-fn _entry_exists(fs, name) {
-    let listed = LinuxDirFS.list(fs, "root", 4096);
-    if not listed.ok or listed.truncated { return nil; }
-    for entry in listed.entries { if entry == name { return true; } }
-    return false;
-}
-
-fn _valid_bytes(value) {
-    if type(value) != "array" { return false; }
+fn _byte_snapshot(value, max_bytes) {
+    if type(value) != "array" or len(value) > max_bytes { return nil; }
+    let snapshot = [];
     for byte in value {
         if type(byte) != "number" or byte != num_floor(byte) or byte < 0 or byte > 255 {
-            return false;
+            return nil;
         }
+        array_push(snapshot, byte);
     }
-    return true;
+    return snapshot;
+}
+
+// One opened descriptor supplies bytes and every identity/property check.
+// Path substitution cannot make metadata describe a different inode.
+fn _inspect_private_file(fs, name, expected_bytes, max_bytes) {
+    let held = LinuxDirFS.read_prefix_bytes(fs, name, max_bytes);
+    if not held.ok { return map{ok:false,error:"private held snapshot unavailable"}; }
+    let exact = not held.truncated and held.source_size == len(expected_bytes)
+        and held.bytes == expected_bytes;
+    let policy = held.kind == "file" and held.owner_current_user
+        and held.link_count == 1 and bit_and(held.mode, 511) == 384;
+    return map{ok:exact and policy,exact_content:exact,private_policy:policy,
+        descriptor_bound_metadata:held.descriptor_bound_metadata,
+        source_size:held.source_size,truncated:held.truncated,bytes:held.bytes};
+}
+
+// Pure state machine for injected failure tests and broker callers. Only a
+// definite successful write plus exact held readback and durability can admit
+// a subsequent effect. Every ambiguous state is non-retryable.
+fn classify_nonce_publication_evidence(write_ok, explicit_published,
+                                       receipt_verified, durability_verified) {
+    if type(write_ok) != "bool" or type(explicit_published) != "bool"
+       or type(receipt_verified) != "bool" or type(durability_verified) != "bool" {
+        return _error("invalid nonce publication evidence");
+    }
+    if write_ok and receipt_verified and durability_verified {
+        return map{ok:true,consumed:true,published:true,current_attempt_publication_verified:true,
+            receipt_verified:true,evidence_indeterminate:false,retry_safe:false,
+            effect_admitted:true,durability_verified:true,at_most_once:true,
+            nonce_burned_before_effect:true,independent_authority_evidence:false};
+    }
+    if not write_ok and not explicit_published and receipt_verified {
+        return map{ok:false,consumed:true,published:false,current_attempt_publication_verified:false,
+            receipt_verified:true,evidence_indeterminate:false,retry_safe:false,
+            effect_admitted:false,durability_verified:false,at_most_once:false,
+            nonce_burned_before_effect:false,independent_authority_evidence:false,
+            error:"nonce already spent"};
+    }
+    return map{ok:false,consumed:false,published:explicit_published or write_ok,
+        current_attempt_publication_verified:explicit_published or write_ok,
+        evidence_indeterminate:true,retry_safe:false,effect_admitted:false,
+        durability_verified:false,at_most_once:false,
+        nonce_burned_before_effect:false,independent_authority_evidence:false,
+        error:"nonce publication outcome is indeterminate"};
 }
 
 fn _finish_locked(fs, lock, result) {
@@ -637,8 +676,9 @@ fn _finish_locked(fs, lock, result) {
         return map{ ok:false, error:"private transaction cleanup unverified",
             published:try result.published catch false,
             consumed:try result.consumed catch false,
-            retry_safe:not (try result.published catch false)
-                and not (try result.consumed catch false) and closed,
+            retry_safe:false,effect_admitted:false,effect_completed:false,
+            evidence_indeterminate:true,durability_verified:false,
+            at_most_once:false,
             lock_released:released, root_closed:closed };
     }
     result.lock_released = true; result.root_closed = true;
@@ -651,14 +691,15 @@ fn _finish_locked(fs, lock, result) {
 fn private_compare_and_swap(path, expectation, replacement,
                             max_bytes = 4194304, timeout_ms = 2000) {
     if platform() != "linux" or type(path) != "string" or not str_starts_with(path, "/")
-       or not _valid_bytes(replacement)
+       or type(replacement) != "array"
        or type(max_bytes) != "number" or max_bytes != num_floor(max_bytes)
        or max_bytes < 1 or max_bytes > 67108864
        or type(timeout_ms) != "number" or timeout_ms != num_floor(timeout_ms)
        or timeout_ms < 0 or timeout_ms > 300000 {
         return _error("invalid private CAS request");
     }
-    if len(replacement) > max_bytes { return _error("private CAS replacement exceeds byte limit"); }
+    let payload = _byte_snapshot(replacement, max_bytes);
+    if payload == nil { return _error("private CAS replacement is not a bounded byte array"); }
     let expected = _cas_expectation(expectation);
     if expected == nil { return _error("invalid private CAS expectation"); }
     let parts = _parts(path);
@@ -673,57 +714,44 @@ fn private_compare_and_swap(path, expectation, replacement,
         LinuxDirFS.close(parent.fs);
         return _error("private CAS lock unavailable or not mode-0600");
     }
-    let exists = _entry_exists(parent.fs, parts.name);
-    if exists == nil {
-        return _finish_locked(parent.fs, lock,
-            map{ok:false,error:"private CAS namespace cannot be enumerated",published:false,retry_safe:true});
-    }
-    if expected.kind == "missing" and exists {
-        return _finish_locked(parent.fs, lock,
-            map{ok:false,error:"private CAS expected missing target",published:false,retry_safe:true});
-    }
-    if expected.kind == "present" and not exists {
-        return _finish_locked(parent.fs, lock,
-            map{ok:false,error:"private CAS expected existing target",published:false,retry_safe:true});
-    }
     if expected.kind == "present" {
-        let metadata = LinuxDirFS.metadata(parent.fs, parts.name);
-        if not metadata.ok or metadata.kind != "file"
-           or not metadata.owner_current_user or metadata.link_count != 1 {
+        let loaded = LinuxDirFS.read_prefix_bytes(parent.fs, parts.name, max_bytes);
+        if not loaded.ok or loaded.truncated or loaded.kind != "file"
+           or not loaded.owner_current_user or loaded.link_count != 1
+           or bit_and(loaded.mode, 511) != 384 {
             return _finish_locked(parent.fs, lock,
-                map{ok:false,error:"private CAS target is not an owned single-link regular file",published:false,retry_safe:true});
-        }
-        let loaded = LinuxDirFS.read_bytes(parent.fs, parts.name, max_bytes);
-        if not loaded.ok {
-            return _finish_locked(parent.fs, lock,
-                map{ok:false,error:"private CAS bounded read failed",published:false,retry_safe:true});
+                map{ok:false,error:"private CAS held source policy failed",published:false,
+                    retry_safe:true,effect_completed:false,evidence_indeterminate:false});
         }
         let current = SHA256.sha256_hex_bytes(loaded.bytes);
         if current != expected.sha256 {
             return _finish_locked(parent.fs, lock,
                 map{ok:false,error:"private CAS digest mismatch",published:false,retry_safe:true,
+                    effect_completed:false,evidence_indeterminate:false,
                     digest_algorithm:RAW_SHA256_ALGORITHM});
         }
     }
     let written = if expected.kind == "missing" {
-        LinuxDirFS.write_new_atomic(parent.fs, parts.name, replacement, false)
-    } else { LinuxDirFS.write_atomic(parent.fs, parts.name, replacement, false) };
+        LinuxDirFS.write_new_atomic(parent.fs, parts.name, payload, false)
+    } else { LinuxDirFS.write_atomic(parent.fs, parts.name, payload, false) };
     let published = (try written.ok catch false) or (try written.published catch false);
-    if not published {
+    let verified = _inspect_private_file(parent.fs, parts.name, payload, max_bytes);
+    let replacement_sha256 = SHA256.sha256_hex_bytes(payload);
+    if not (try written.ok catch false) {
         return _finish_locked(parent.fs, lock,
-            map{ok:false,error:"private CAS publication failed",published:false,retry_safe:true});
+            map{ok:false,error:"private CAS publication outcome is not provable",
+                published:try written.published catch false,retry_safe:false,
+                effect_completed:false,evidence_indeterminate:true,
+                current_content_matches:try verified.ok catch false,
+                digest_algorithm:RAW_SHA256_ALGORITHM,
+                replacement_sha256:replacement_sha256});
     }
-    let verified = LinuxDirFS.read_bytes(parent.fs, parts.name, max_bytes);
-    let replacement_metadata = LinuxDirFS.metadata(parent.fs, parts.name);
-    let replacement_sha256 = SHA256.sha256_hex_bytes(replacement);
-    let readback_ok = verified.ok and verified.size == len(replacement)
-        and SHA256.sha256_hex_bytes(verified.bytes) == replacement_sha256
-        and replacement_metadata.ok and replacement_metadata.kind == "file"
-        and replacement_metadata.owner_current_user and replacement_metadata.link_count == 1
-        and bit_and(replacement_metadata.mode, 511) == 384;
-    let result = map{ok:written.ok and readback_ok,
-        error:if readback_ok { try written.error catch "" } else { "private CAS readback verification failed" },
-        published:true,retry_safe:false,cooperative_only:true,private_parent_verified:true,
+    let readback_ok = try verified.ok catch false;
+    let result = map{ok:readback_ok,
+        error:if readback_ok { "" } else { "private CAS held readback verification failed" },
+        published:published,retry_safe:false,effect_completed:readback_ok,
+        evidence_indeterminate:not readback_ok,
+        cooperative_only:true,private_parent_verified:true,
         digest_algorithm:RAW_SHA256_ALGORITHM,replacement_sha256:replacement_sha256,
         readback_verified:readback_ok,durability_verified:try written.durability_verified catch false};
     return _finish_locked(parent.fs, lock, result);
@@ -754,52 +782,21 @@ fn consume_nonce_once(state_root, nonce, request_sha256, timeout_ms = 2000) {
     }
     let nonce_digest = SHA256.sha256_hex(nonce);
     let name = "nonce-" + nonce_digest + ".json";
-    let exists = _entry_exists(fs, name);
-    if exists == nil {
-        return _finish_locked(fs, lock,
-            map{ok:false,error:"nonce namespace cannot be enumerated",consumed:false,published:false,retry_safe:true});
-    }
     let receipt = json_stringify(map{format:"pbide.nonce-receipt.v1",
         nonce_digest:nonce_digest,request_sha256:request_sha256,
         digest_algorithm:RAW_SHA256_ALGORITHM});
-    if exists {
-        let prior_metadata = LinuxDirFS.metadata(fs, name);
-        let prior = LinuxDirFS.read_bytes(fs, name, len(str_to_bytes(receipt)));
-        let prior_text = if prior.ok { try bytes_to_str(prior.bytes) catch nil } else { nil };
-        let receipt_verified = prior_metadata.ok and prior_metadata.kind == "file"
-            and prior_metadata.owner_current_user and prior_metadata.link_count == 1
-            and bit_and(prior_metadata.mode, 511) == 384 and prior.ok
-            and prior_text == receipt;
-        if receipt_verified {
-            return _finish_locked(fs, lock,
-                map{ok:false,error:"nonce already consumed",consumed:true,published:true,
-                    receipt_verified:true,evidence_indeterminate:false,retry_safe:false,
-                    nonce_digest:nonce_digest,digest_algorithm:RAW_SHA256_ALGORITHM});
-        }
-        return _finish_locked(fs, lock,
-            map{ok:false,error:"nonce namespace occupied by unverifiable receipt",
-                consumed:false,published:false,receipt_verified:false,
-                evidence_indeterminate:true,namespace_occupied:true,retry_safe:false,
-                nonce_digest:nonce_digest,digest_algorithm:RAW_SHA256_ALGORITHM});
-    }
-    let written = LinuxDirFS.write_new_atomic(fs, name, str_to_bytes(receipt), false);
+    let receipt_bytes = str_to_bytes(receipt);
+    let written = LinuxDirFS.write_new_atomic(fs, name, receipt_bytes, false);
     let published = (try written.ok catch false) or (try written.published catch false);
-    if not published {
-        return _finish_locked(fs, lock,
-            map{ok:false,error:"nonce receipt publication failed",consumed:false,published:false,retry_safe:true});
-    }
-    let metadata = LinuxDirFS.metadata(fs, name);
-    let loaded = LinuxDirFS.read_bytes(fs, name, len(str_to_bytes(receipt)));
-    let loaded_text = if loaded.ok { try bytes_to_str(loaded.bytes) catch nil } else { nil };
-    let verified = metadata.ok and metadata.kind == "file" and metadata.owner_current_user
-        and metadata.link_count == 1 and bit_and(metadata.mode, 511) == 384 and loaded.ok
-        and loaded_text == receipt;
-    let result = map{ok:written.ok and verified,
-        error:if verified { try written.error catch "" } else { "nonce receipt verification failed" },
-        consumed:true,published:true,retry_safe:false,at_most_once:true,
-        nonce_burned_before_effect:true,receipt_verified:verified,
-        durability_verified:try written.durability_verified catch false,
-        nonce_digest:nonce_digest,digest_algorithm:RAW_SHA256_ALGORITHM};
+    let inspected = _inspect_private_file(fs, name, receipt_bytes, len(receipt_bytes));
+    let receipt_verified = try inspected.ok catch false;
+    let result = classify_nonce_publication_evidence(
+        try written.ok catch false, try written.published catch false,
+        receipt_verified, try written.durability_verified catch false);
+    result.namespace_occupied = not (try written.ok catch false) and not receipt_verified;
+    result.observed_publication = published;
+    result.nonce_digest = nonce_digest;
+    result.digest_algorithm = RAW_SHA256_ALGORITHM;
     return _finish_locked(fs, lock, result);
 }
 
@@ -865,6 +862,9 @@ fn status() {
                 locked_atomic_first_publication_requires_exec: platform() == "linux",
                 private_cooperative_cas_supported_linux: platform() == "linux",
                 durable_nonce_consumption_supported_linux: platform() == "linux",
+                nonce_directory_enumeration_required: false,
+                receipt_single_descriptor_verification_supported_linux: platform() == "linux",
+                nonce_effect_admission_evidence_supported_linux: platform() == "linux",
                 raw_byte_digest_algorithm: RAW_SHA256_ALGORITHM,
                 operations_attemptable: if platform() == "linux" {
                         try linux_state.library_ready catch false
@@ -883,5 +883,6 @@ export available, read_bytes, read_text, read_text_prefix, read_optional_text,
        create_private_directory_new, private_directory_status, close_immutable_reader,
        write_atomic, write_text_atomic, write_new_exclusive, write_text_new_exclusive,
        append_text_bounded_locked, private_compare_and_swap, consume_nonce_once,
+       classify_nonce_publication_evidence,
        list_directory, remove, remove_file, status;
 export RAW_SHA256_ALGORITHM;

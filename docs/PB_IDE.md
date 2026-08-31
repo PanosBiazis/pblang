@@ -74,6 +74,10 @@ complete broker/sandbox migration before the IDE is production-ready.
   a short-lived nonce; and a strict relative path. `stdlib/secure_file.sapp` supplies a
   Linux-only private-root cooperative CAS and durable consume-once nonce receipt. The
   nonce is burned before a target effect, and uncertain publication is non-retryable.
+  Receipt admission and missing-CAS now use atomic no-replace directly rather than
+  enumerating the directory, so unrelated ledger entries do not create a 4,096-name
+  correctness ceiling. Metadata and content verification come from one held descriptor;
+  only exact, durable, newly published evidence sets `effect_admitted=true`.
   This is deliberately not wired into PBIDE yet: publisher authenticity, immutable
   runtime handoff, external process evidence, and descriptor resolution remain false,
   so planning grants no file/process/network/FFI authority. The CAS protects cooperating

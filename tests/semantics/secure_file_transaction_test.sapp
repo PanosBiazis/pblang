@@ -2,6 +2,12 @@ let Secure = import("stdlib:secure_file.sapp");
 let SHA256 = import("stdlib:sha256_pb.sapp");
 
 fn require(value, message) { if not value { throw "FAIL secure_file_transaction: " + message; } }
+fn nonce_name(nonce) { return "nonce-" + SHA256.sha256_hex(nonce) + ".json"; }
+fn receipt_text(nonce, request_sha) {
+    return json_stringify(map{format:"pbide.nonce-receipt.v1",
+        nonce_digest:SHA256.sha256_hex(nonce),request_sha256:request_sha,
+        digest_algorithm:Secure.RAW_SHA256_ALGORITHM});
+}
 
 if platform() == "linux" {
     let suffix = str_slice(SHA256.sha256_hex(str(now_ms()) + str(random_bytes(16))), 0, 24);
@@ -20,9 +26,15 @@ if platform() == "linux" {
         "missing-to-present CAS is durable and read back before success");
     let duplicate = Secure.private_compare_and_swap(target, missing,
         str_to_bytes("must-not-win"), 1024, 1000);
-    require(not duplicate.ok and duplicate.retry_safe
+    require(not duplicate.ok and not duplicate.retry_safe and duplicate.evidence_indeterminate
         and Secure.read_text(target, 64, true).text == "first-state",
         "a stale missing expectation cannot replace existing state");
+    let duplicate_same = Secure.private_compare_and_swap(target, missing,
+        first_bytes, 1024, 1000);
+    require(not duplicate_same.ok and not duplicate_same.retry_safe
+        and duplicate_same.evidence_indeterminate
+        and Secure.read_text(target, 64, true).text == "first-state",
+        "same-content missing-CAS collision is never reported as this attempt's success");
 
     let expected = map{kind:"present",algorithm:Secure.RAW_SHA256_ALGORITHM,
         sha256:SHA256.sha256_hex_bytes(first_bytes)};
@@ -101,7 +113,8 @@ if platform() == "linux" {
     // Simulate a crash or denial after admission by deliberately performing no
     // target effect. A retry must still fail closed because the nonce is spent.
     let replay = Secure.consume_nonce_once(root, nonce, request_sha, 1000);
-    require(not replay.ok and replay.consumed and replay.published and not replay.retry_safe,
+    require(not replay.ok and replay.consumed and not replay.published
+        and replay.receipt_verified and not replay.effect_admitted and not replay.retry_safe,
         "a post-admission failure cannot replay the same nonce");
     require(not Secure.consume_nonce_once(root, "short", request_sha, 1000).ok,
         "malformed nonces are rejected before touching state");
@@ -130,17 +143,118 @@ if platform() == "linux" {
         or (second_nonce_result.ok and not first_nonce_result.ok and first_nonce_result.consumed),
         "concurrent same-nonce admission produces exactly one durable winner");
 
-    let nonce_name = "nonce-" + SHA256.sha256_hex(nonce) + ".json";
+    let wrong_mode_nonce = str_repeat("e", 64);
+    let wrong_mode_path = root + "/" + nonce_name(wrong_mode_nonce);
+    require(Secure.write_text_new_exclusive(wrong_mode_path,
+        receipt_text(wrong_mode_nonce, request_sha), true, true).ok,
+        "wrong-mode receipt fixture starts as an exact private file");
+    require(proc_spawn_wait("/bin/chmod", ["0644", wrong_mode_path]).exit_code == 0,
+        "wrong-mode receipt fixture changes mode");
+    let wrong_mode = Secure.consume_nonce_once(root, wrong_mode_nonce, request_sha, 1000);
+    require(not wrong_mode.ok and wrong_mode.evidence_indeterminate
+        and not wrong_mode.consumed and not wrong_mode.effect_admitted,
+        "exact receipt content with wrong mode cannot prove nonce consumption");
+
+    let oversized_nonce = str_repeat("f", 64);
+    let oversized_path = root + "/" + nonce_name(oversized_nonce);
+    require(Secure.write_text_new_exclusive(oversized_path, str_repeat("x", 1024), true, true).ok,
+        "oversized receipt fixture is published");
+    let oversized_receipt = Secure.consume_nonce_once(root, oversized_nonce, request_sha, 1000);
+    require(not oversized_receipt.ok and oversized_receipt.evidence_indeterminate
+        and not oversized_receipt.effect_admitted,
+        "oversized receipt is rejected by a bounded held snapshot");
+
+    let directory_nonce = str_repeat("1", 64);
+    let directory_path = root + "/" + nonce_name(directory_nonce);
+    fs_mkdirs(directory_path);
+    let directory_receipt = Secure.consume_nonce_once(root, directory_nonce, request_sha, 1000);
+    require(not directory_receipt.ok and directory_receipt.evidence_indeterminate
+        and not directory_receipt.effect_admitted,
+        "directory namespace collision cannot masquerade as a receipt");
+
+    let receipt_victim = outside + "-receipt-victim";
+    fs_write(receipt_victim, "receipt-victim");
+    let hard_nonce = str_repeat("2", 64);
+    let hard_path = root + "/" + nonce_name(hard_nonce);
+    require(proc_spawn_wait("/bin/ln", [receipt_victim, hard_path]).exit_code == 0,
+        "hard-link receipt fixture is available");
+    let hard_receipt = Secure.consume_nonce_once(root, hard_nonce, request_sha, 1000);
+    require(not hard_receipt.ok and hard_receipt.evidence_indeterminate
+        and not hard_receipt.effect_admitted and fs_read(receipt_victim) == "receipt-victim",
+        "hard-link receipt collision is denied without external mutation");
+
+    let symlink_nonce = str_repeat("3", 64);
+    let symlink_receipt_path = root + "/" + nonce_name(symlink_nonce);
+    require(proc_spawn_wait("/bin/ln", ["-s", receipt_victim, symlink_receipt_path]).exit_code == 0,
+        "symlink receipt fixture is available");
+    let symlink_receipt = Secure.consume_nonce_once(root, symlink_nonce, request_sha, 1000);
+    require(not symlink_receipt.ok and symlink_receipt.evidence_indeterminate
+        and not symlink_receipt.effect_admitted,
+        "symlink receipt collision is denied without following it");
+
+    let unreadable_nonce = str_repeat("4", 64);
+    let unreadable_path = root + "/" + nonce_name(unreadable_nonce);
+    require(Secure.write_text_new_exclusive(unreadable_path,
+        receipt_text(unreadable_nonce, request_sha), true, true).ok,
+        "unreadable receipt fixture starts exact");
+    require(proc_spawn_wait("/bin/chmod", ["0000", unreadable_path]).exit_code == 0,
+        "unreadable receipt fixture removes read permission");
+    let unreadable = Secure.consume_nonce_once(root, unreadable_nonce, request_sha, 1000);
+    require(not unreadable.ok and not unreadable.effect_admitted and not unreadable.retry_safe,
+        "unreadable receipt never admits an effect");
+
+    let noise_i = 0;
+    while noise_i < 4100 {
+        fs_write(root + "/unrelated-" + str(noise_i), "");
+        noise_i = noise_i + 1;
+    }
+    let large_ledger_nonce = str_repeat("5", 64);
+    let large_ledger = Secure.consume_nonce_once(root, large_ledger_nonce, request_sha, 2000);
+    require(large_ledger.ok and large_ledger.effect_admitted and large_ledger.at_most_once,
+        "nonce admission no longer depends on enumerating a directory capped at 4096 entries");
+
+    let pre_failure = Secure.classify_nonce_publication_evidence(false, false, false, false);
+    let ambiguous = Secure.classify_nonce_publication_evidence(false, true, true, false);
+    let fsync_failure = Secure.classify_nonce_publication_evidence(true, false, true, false);
+    let prior_spent = Secure.classify_nonce_publication_evidence(false, false, true, false);
+    let definite = Secure.classify_nonce_publication_evidence(true, false, true, true);
+    require(pre_failure.evidence_indeterminate and not pre_failure.retry_safe
+        and not pre_failure.effect_admitted and not pre_failure.durability_verified,
+        "injected pre-publication failure remains conservatively indeterminate");
+    require(ambiguous.evidence_indeterminate and ambiguous.published
+        and ambiguous.current_attempt_publication_verified
+        and not ambiguous.effect_admitted and not ambiguous.at_most_once,
+        "injected ambiguous publication makes no at-most-once claim");
+    require(fsync_failure.evidence_indeterminate and fsync_failure.published
+        and fsync_failure.current_attempt_publication_verified
+        and not fsync_failure.effect_admitted and not fsync_failure.durability_verified,
+        "published but unsynchronized evidence cannot admit an effect");
+    require(prior_spent.consumed and not prior_spent.published
+        and not prior_spent.effect_admitted and not prior_spent.at_most_once,
+        "exact prior receipt is spent without claiming current publication");
+    require(definite.ok and definite.effect_admitted and definite.at_most_once
+        and definite.durability_verified and not definite.independent_authority_evidence,
+        "only definite durable exact evidence admits the next effect");
+
+    let noise_cleanup = 0;
+    while noise_cleanup < 4100 {
+        try fs_remove(root + "/unrelated-" + str(noise_cleanup)) catch nil;
+        noise_cleanup = noise_cleanup + 1;
+    }
     for path in [target, target + ".lock", linked_path, linked_path + ".lock",
                  symlink_path, symlink_path + ".lock",
                  poisoned_target + ".lock", root + "/.pbide-broker.lock",
-                 root + "/" + nonce_name, root + "/" + forged_name,
-                 root + "/nonce-" + SHA256.sha256_hex(concurrent_nonce) + ".json"] {
+                 root + "/" + nonce_name(nonce), root + "/" + forged_name,
+                 root + "/" + nonce_name(concurrent_nonce), wrong_mode_path,
+                 oversized_path, hard_path, symlink_receipt_path, unreadable_path,
+                 root + "/" + nonce_name(large_ledger_nonce)] {
         try Secure.remove_file(path, true) catch nil;
     }
+    try Secure.remove(directory_path, true) catch nil;
     require(Secure.remove(root, false).ok, "private transaction fixture is removed");
     try Secure.remove_file(outside, false) catch nil;
     try Secure.remove_file(lock_victim, false) catch nil;
+    try Secure.remove_file(receipt_victim, false) catch nil;
 }
 
 require(not Secure.status().path_fallback_on_linux,
