@@ -34,6 +34,16 @@ can still fingerprint a private workspace, so it deliberately remains
 `safe_to_log=false`; `terminal_text_safe=true` means only that its fixed text is
 control-sanitized, not that it is approved for publication.
 
+Inventory coverage is now separated from idea admission. Both portfolio entry
+points suppress derived tasks and proposals unless the scan is complete,
+non-truncated, allocation-bounded, hard-heap-bounded, confined to one filesystem,
+and able to distinguish files, directories, symlinks and enumeration errors.
+The current directory backend does not yet prove the last four guarantees, so
+`idea_admission.eligible=false`: counts remain observable, while PBOS, pbAI,
+training, repository creation, implementation and external effects receive no
+scan-derived ideas. BACKUP replicas and boot/remediation media must additionally
+remain non-corroborating even after the lower-level prerequisites are implemented.
+
 Proposal reviews now reconstruct one of the four canonical proposal definitions,
 compare every scalar plus ordered array, and bind the exact definition with a
 domain-separated, type-tagged, byte-length-framed SHA-256 digest. This is an
