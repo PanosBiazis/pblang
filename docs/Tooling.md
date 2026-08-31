@@ -526,7 +526,15 @@ TLS client verification uses trust roots from `webpki-roots` plus best-effort na
   private artifact only after exact `trusted_source=true` and
   `allow_toolchain_effects=true` acknowledgements plus the required host
   capability. It does not load or execute the artifact, and neither option is
-  published as authorization.
+  published as authorization. Until source and tool output publication stays on
+  one opaque held directory descriptor, the approved output root must be `/tmp`
+  or one current-user-owned mode-`0700` direct child of that exact container.
+  The held `/tmp` container must be sticky and root- or current-user-owned. A
+  missing direct child may be created exclusively after this verification;
+  deeper or shared namespaces are rejected even when their leaf is mode `0700`.
+  Every build then creates a separate private `build-<token>` session. Source-only
+  languages use the same rule without pretending that publication compiled or
+  executed their source.
 - **`polyglot.exec_compiled`** and **`polyglot.compile_cached`** — legacy
   in-process compile/run/load entrypoints are fail-closed until an isolated typed
   FFI broker exists. Native library allowlists alone do not isolate constructors
@@ -766,6 +774,27 @@ unauthenticated physical claims. Evidence digests detect mutable claim drift,
 but verifier signatures, a trusted clock/replay ledger, real runtime enforcement,
 and genuine physical capture must be checked independently before any release
 decision.
+
+# Canonical bounded-process admission
+
+Hosted C99, JavaScript, polyglot toolchains and the OpenSSH adapter use
+`stdlib:process.sapp` as their single operational admission point. Seeing an
+installed executable, usable directory descriptors or pidfd support is only
+inventory evidence. If the backend has not established its VM-enforced typed
+FFI symbol contract and operational verification, these adapters return
+`execution_admitted=false`, `executed=false`, `raw_fallback=false`, preserve the
+canonical process status and publish no executable artifact. OpenSSH performs
+this check before opening temporary key or known-host material. C99 failures
+retain a nonempty canonical diagnostic plus private-stage cleanup evidence.
+The process facade binds the exact admission snapshot into synchronous and
+opaque asynchronous results; the async registry and public handle receive
+separate deep-detached maps, so caller mutation cannot rewrite later canonical
+evidence. Consumers do not infer authority from a later status probe.
+
+This is implemented fail-closed wiring, not completion of the production exit
+gate. VM-enforced typed FFI, raw-FFI bypass closure, hard preemption and heap
+enforcement, hostile-code isolation, publisher authenticity, and physical
+Windows/macOS verification remain real blockers.
 
 # Canonical UI document
 

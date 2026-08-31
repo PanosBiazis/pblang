@@ -1,7 +1,46 @@
 # pblang — Current Status
 
-**Last Updated**: 2026-08-13
+**Last Updated**: 2026-08-31
 **Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
+
+## 2026-08-31 - Canonical process admission and private polyglot publication
+
+OpenSSH, hosted C99, JavaScript and polyglot toolchain adapters now share
+`stdlib:process.sapp::bounded_status()` as their single operational admission
+gate. Installed tools, descriptor probes and pidfd support do not authorize
+execution. When VM-enforced typed-FFI symbol and operational verification are
+false, adapters preserve the canonical reason and return zero execution, zero
+publication and `raw_fallback=false`. OpenSSH checks this gate before opening
+temporary credential material, while C99 failure reports preserve a nonempty
+diagnostic and verified private-stage cleanup.
+
+Polyglot source publication creates a dedicated private session only at `/tmp`
+or below a current-UID/mode-0700 direct child of the exact system `/tmp` path,
+after the container's sticky bit and root/current-user ownership are verified.
+This restriction remains until every publication and tool output can stay on
+one opaque held descriptor. Existing mode-0700 roots under replaceable shared
+parents, other unverified namespaces and links fail closed. The session marker
+also requires an already verified private parent and never creates its parent.
+The process facade binds one deep-detached admission snapshot into every result
+rather than re-probing it later or sharing a mutable map with the public async
+handle. The
+full explicitly authorized serial semantic suite passed **893/893**
+with zero failures, ignored tests or filters. A separate `--jobs smart` run
+passed 844/893 but lost FFI/private-root/network authority in concurrent workers
+and watchdog-timed one test; representative failures and the timed test passed
+individually, so parallel authority isolation remains a test-runner blocker and
+is not used as canonical product evidence.
+
+This slice does not implement VM-enforced typed FFI, raw-FFI bypass closure,
+hard wall-clock preemption, hard heap enforcement, a hostile-code sandbox,
+publisher authenticity, or physical Windows/macOS verification. Broad scan
+evidence and derived project ideas remain ineligible while the strict inventory
+gate reports `hard_heap_bound=false` or `snapshot_consistent=false`.
+
+The current negative C99 lane verifies zero execution/publication and cleanup.
+Because canonical process admission is unavailable on this host, the retained
+AES/digest C99 known-answer differentials are explicitly skipped and are not
+claimed as current operational C99 evidence.
 
 `stdlib:speech_catalog.sapp` adds deterministic bounded discovery of installed
 Whisper model artifacts and eSpeak voice data. It reads only fixed system roots
@@ -9,8 +48,8 @@ through held directory descriptors, distinguishes callable engines from
 data-only installations, caps results at 512 entries, and exposes neither
 absolute paths nor model/voice file contents. It is inventory infrastructure,
 not a speech recognition or synthesis engine.
-The latest complete pblang semantic run on 2026-08-02 passed **748/748 tests**
-with zero failures, ignored tests, or filtered tests. The separate release Rust
+The latest complete pblang semantic run on 2026-08-31 passed **893/893 tests**
+serially with zero failures, ignored tests, or filtered tests. The separate release Rust
 semantics harness passed 203 tests with zero failures and one documented
 security ignore; these runner counts are not combined.
 Product suites also passed: pbAI 23/23 (the two training-heavy tests required
@@ -1752,6 +1791,13 @@ cargo run -- doc examples/
 - The focused runtime and isolated real-`sshd` contracts pass. OpenSSH supplies
   the SSH cryptography; this status does not claim a PBLang-native SSH protocol
   or cryptographic implementation.
+- **2026-08-31 correction:** OpenSSH now admits execution only through
+  `stdlib:process.sapp::bounded_status()` and checks that gate before creating
+  any temporary credential material. The current backend reports its typed-FFI
+  symbol contract and operational verification as false, so OpenSSH correctly
+  reports unavailable with zero execution and no raw fallback. Earlier real
+  `sshd` results are historical bootstrap evidence, not current production
+  readiness.
 
 ## 2026-08-13 bounded classic-PCAP slice
 
