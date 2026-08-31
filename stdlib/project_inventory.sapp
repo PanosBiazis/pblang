@@ -163,6 +163,7 @@ fn _skip_name(name) {
     if n == "graphify-out" { return true; }
     if str_contains(n, "credential") or str_contains(n, "password") or str_contains(n, "passwd") { return true; }
     if str_contains(n, "secret") or str_contains(n, "token") or str_contains(n, "openrouter") { return true; }
+    if str_contains(n, "api_key") or str_contains(n, "access_key") { return true; }
     if str_starts_with(n, "id_ed25519") or str_starts_with(n, "id_rsa") { return true; }
     if str_ends_with(n, ".pem") or str_ends_with(n, ".p12") or str_ends_with(n, ".pfx") or str_ends_with(n, ".key") { return true; }
     return false;
@@ -220,6 +221,227 @@ fn _record(path, kind, depth, parent) {
         category: SURVEY.path_category(path),
         safe_for_ideas: not SURVEY.sensitive_path(path)
     };
+}
+
+fn _strict_record(path, kind, depth, parent, error_code = "") {
+    return map{
+        format: "pblang.project_inventory.strict-path.v1",
+        path: path, name: _base(path), kind: kind, error_code: error_code,
+        depth: depth, parent: parent, category: SURVEY.path_category(path),
+        root_relative: true, contains_absolute_path: false,
+        safe_for_ideas: false
+    };
+}
+
+fn _strict_root_sensitive(root) {
+    if type(root) != "string" { return true; }
+    let parts = str_split(root, "/");
+    for part in parts {
+        let name = _lower(part);
+        if name == ".ssh" or name == ".gnupg" or name == ".codex" or name == ".claude"
+           or name == ".cache" or str_contains(name, "credential")
+           or str_contains(name, "password") or str_contains(name, "passwd")
+           or str_contains(name, "secret") or str_contains(name, "token")
+           or str_contains(name, "openrouter") or str_contains(name, "api_key")
+           or str_contains(name, "access_key") or str_starts_with(name, "id_ed25519")
+           or str_starts_with(name, "id_rsa") or str_ends_with(name, ".pem")
+           or str_ends_with(name, ".p12") or str_ends_with(name, ".pfx")
+           or str_ends_with(name, ".key") { return true; }
+    }
+    return false;
+}
+
+fn _discard_strict_entry(handle, entry) {
+    if (try entry.kind catch "") != "directory" or not (try entry.traversable catch false) {
+        return true;
+    }
+    return SECURE.discard_bounded_traversal(handle, try entry.traversal_token catch "");
+}
+
+fn _discard_strict_entries(handle, entries, start) {
+    let ok = true; let i = start;
+    while i < len(entries) {
+        if not _discard_strict_entry(handle, entries[i]) { ok = false; }
+        i = i + 1;
+    }
+    return ok;
+}
+
+fn _inventory_strict_owned(handle, normalized) {
+    let started = now_ms(); let deadline = started + normalized.max_runtime_ms;
+    let queue = [map{ enum_path: "", report_path: ".", depth: 0,
+        parent: "", traversal_token: nil }];
+    let q = 0; let records = []; let skipped = []; let errors = [];
+    let scanned_dirs = 0; let scanned_entries = 0; let visited = 0;
+    let enqueued = 1; let truncated = false; let timed_out = false;
+    while q < len(queue) and len(records) < normalized.max_entries
+    and visited < MAX_VISITED_HARD and now_ms() < deadline {
+        let item = queue[q]; q = q + 1; visited = visited + 1;
+        let listing = SECURE.enumerate_bounded(handle, item.enum_path,
+            normalized.max_children_per_dir, item.traversal_token);
+        if not (try listing.ok catch false) {
+            array_push(errors, map{ path: item.report_path,
+                code: try listing.error catch "strict-enumeration-failed" });
+            array_push(records, _strict_record(item.report_path, "error",
+                item.depth, item.parent, "strict-enumeration-failed"));
+            truncated = true;
+            continue;
+        }
+        scanned_dirs = scanned_dirs + 1;
+        if listing.truncated or not listing.complete { truncated = true; }
+        if normalized.include_dirs and len(records) < normalized.max_entries {
+            array_push(records, _strict_record(item.report_path, "directory",
+                item.depth, item.parent));
+        }
+        if item.depth >= normalized.max_depth {
+            if not _discard_strict_entries(handle, listing.entries, 0) {
+                array_push(errors, map{ path: item.report_path, code: "traversal-token-discard-failed" });
+                truncated = true;
+            }
+            continue;
+        }
+        let i = 0;
+        while i < len(listing.entries) and len(records) < normalized.max_entries
+        and visited < MAX_VISITED_HARD and now_ms() < deadline {
+            let entry = listing.entries[i]; i = i + 1;
+            scanned_entries = scanned_entries + 1; visited = visited + 1;
+            let child_path = if item.report_path == "." {
+                str(try entry.name catch "")
+            } else { _join(item.report_path, try entry.name catch "") };
+            let token_retained = false;
+            if not (try entry.name_available catch false) or child_path == "" {
+                array_push(errors, map{ path: item.report_path,
+                    code: try entry.error_code catch "invalid-entry-name" });
+                array_push(records, _strict_record(item.report_path, "error",
+                    item.depth + 1, item.report_path, "invalid-entry-name"));
+                truncated = true;
+            } elif entry.kind == "error" {
+                array_push(errors, map{ path: child_path, code: entry.error_code });
+                array_push(records, _strict_record(child_path, "error",
+                    item.depth + 1, item.report_path, entry.error_code));
+                truncated = true;
+            } elif _skip_name(entry.name) {
+                array_push(skipped, map{ path: child_path, reason: "sensitive/pruned name" });
+            } elif entry.kind == "symlink" {
+                array_push(records, _strict_record(child_path, "symlink",
+                    item.depth + 1, item.report_path));
+            } elif entry.kind == "file" {
+                if normalized.include_files {
+                    array_push(records, _strict_record(child_path, "file",
+                        item.depth + 1, item.report_path));
+                }
+            } elif entry.kind == "directory" and entry.traversable {
+                if item.depth + 1 < normalized.max_depth {
+                    if len(queue) - q >= MAX_PENDING_HARD or enqueued >= MAX_VISITED_HARD {
+                        truncated = true;
+                    } else {
+                        array_push(queue, map{ enum_path: child_path, report_path: child_path,
+                            depth: item.depth + 1, parent: item.report_path,
+                            traversal_token: entry.traversal_token });
+                        enqueued = enqueued + 1; token_retained = true;
+                    }
+                } elif normalized.include_dirs {
+                    array_push(records, _strict_record(child_path, "directory",
+                        item.depth + 1, item.report_path));
+                }
+            } else {
+                array_push(errors, map{ path: child_path, code: "invalid-entry-state" });
+                array_push(records, _strict_record(child_path, "error",
+                    item.depth + 1, item.report_path, "invalid-entry-state"));
+                truncated = true;
+            }
+            if not token_retained and not _discard_strict_entry(handle, entry) {
+                array_push(errors, map{ path: child_path, code: "traversal-token-discard-failed" });
+                truncated = true;
+            }
+        }
+        if not _discard_strict_entries(handle, listing.entries, i) {
+            array_push(errors, map{ path: item.report_path, code: "traversal-token-discard-failed" });
+            truncated = true;
+        }
+    }
+    if now_ms() >= deadline { timed_out = true; truncated = true; }
+    if q < len(queue) or visited >= MAX_VISITED_HARD
+       or len(records) >= normalized.max_entries { truncated = true; }
+    let pending = q;
+    while pending < len(queue) {
+        let token = try queue[pending].traversal_token catch nil;
+        if type(token) == "string" and token != ""
+           and not SECURE.discard_bounded_traversal(handle, token) {
+            array_push(errors, map{ path: ".", code: "queued-traversal-token-discard-failed" });
+            truncated = true;
+        }
+        pending = pending + 1;
+    }
+    return map{ ok: true, format: "pblang.project_inventory.strict-report.v1",
+        roots: [], records: records, paths: [], record_count: len(records),
+        scanned_dirs: scanned_dirs, scanned_entries: scanned_entries,
+        visited_entries: visited, enqueued_directories: enqueued,
+        skipped: skipped, skipped_count: len(skipped), errors: errors,
+        timed_out: timed_out, duration_ms: now_ms() - started,
+        max_runtime_ms: normalized.max_runtime_ms, truncated: truncated,
+        complete: not truncated and not timed_out and len(errors) == 0,
+        hard_wall_timeout: false, hard_heap_bound: false,
+        directory_enumerator_allocation_bounded: true,
+        stay_on_device_enforced: true, entry_kind_tristate_enforced: true,
+        entry_kind_states: ["file", "directory", "symlink", "error"],
+        snapshot_consistent: false, namespace_stability_verified: false,
+        vm_typed_ffi_enforced: false, hostile_code_sandbox: false,
+        contains_absolute_paths: false, contains_traversal_tokens: false,
+        safe_to_log: false, production_ready: false,
+        policy: "one approved Linux root; descriptor-streamed N+1 enumeration; one-use root-bound traversal tokens; same-mount identity checks; relative metadata only; any error, truncation, timeout, or namespace ambiguity makes evidence incomplete" };
+}
+
+// Linux-only strict inventory of one caller-approved root. The absolute root is
+// never reported or digested; traversal uses only root-relative paths plus
+// one-use tokens returned by secure_file's descriptor enumerator.
+fn inventory_strict_root(root, options = nil) {
+    let checked = _validated_request([root], options, false);
+    if platform() != "linux" or not checked.ok or type(root) != "string"
+       or not str_starts_with(root, "/") or _strict_root_sensitive(root) {
+        return map{ ok: false, format: "pblang.project_inventory.strict-report.v1",
+            roots: [], records: [], paths: [], record_count: 0,
+            errors: ["strict inventory requires one non-sensitive absolute Linux root"],
+            complete: false, truncated: true, timed_out: false,
+            hard_wall_timeout: false, hard_heap_bound: false,
+            directory_enumerator_allocation_bounded: false,
+            stay_on_device_enforced: false, entry_kind_tristate_enforced: false,
+            snapshot_consistent: false, contains_absolute_paths: false,
+            contains_traversal_tokens: false, safe_to_log: false };
+    }
+    let normalized = checked.options;
+    let handle = SECURE.open_bounded_enumerator(root, 600000);
+    if not handle.ok {
+        return map{ ok: false, format: "pblang.project_inventory.strict-report.v1",
+            roots: [], records: [], paths: [],
+            record_count: 0, errors: ["strict scan root could not be held"],
+            complete: false, truncated: true, timed_out: false,
+            hard_wall_timeout: false, hard_heap_bound: false,
+            directory_enumerator_allocation_bounded: false,
+            stay_on_device_enforced: false, entry_kind_tristate_enforced: false,
+            snapshot_consistent: false, contains_absolute_paths: false,
+            contains_traversal_tokens: false, safe_to_log: false };
+    }
+    let outcome = try { map{ ok: true, value: _inventory_strict_owned(handle, normalized) } }
+        catch map{ ok: false };
+    let closed = SECURE.close_bounded_enumerator(handle);
+    if not outcome.ok {
+        return map{ ok: false, format: "pblang.project_inventory.strict-report.v1",
+            roots: [], records: [], paths: [], record_count: 0,
+            errors: ["strict inventory failed safely"], complete: false,
+            truncated: true, timed_out: false, hard_wall_timeout: false,
+            hard_heap_bound: false, directory_enumerator_allocation_bounded: true,
+            stay_on_device_enforced: true, entry_kind_tristate_enforced: true,
+            snapshot_consistent: false, contains_absolute_paths: false,
+            contains_traversal_tokens: false, safe_to_log: false,
+            enumerator_closed: closed, production_ready: false };
+    }
+    let report = outcome.value;
+    if not closed { array_push(report.errors, map{ path: ".", code: "enumerator-close-failed" }); }
+    report.ok = closed;
+    report.complete = report.complete and closed;
+    report.enumerator_closed = closed;
+    return report;
 }
 
 fn inventory_roots(roots, options = nil) {
@@ -673,6 +895,7 @@ fn _idea_admission(inv) {
     let enumerator=_bool_claim(inv,"directory_enumerator_allocation_bounded",false);
     let same_device=_bool_claim(inv,"stay_on_device_enforced",false);
     let tristate=_bool_claim(inv,"entry_kind_tristate_enforced",false);
+    let snapshot=_bool_claim(inv,"snapshot_consistent",false);
     if not complete { array_push(blockers, "inventory is incomplete"); }
     if truncated { array_push(blockers, "inventory is truncated"); }
     if timed_out { array_push(blockers, "inventory timed out"); }
@@ -680,12 +903,14 @@ fn _idea_admission(inv) {
     if not enumerator { array_push(blockers, "directory enumeration allocation is unbounded"); }
     if not same_device { array_push(blockers, "stay-on-device traversal is not enforced"); }
     if not tristate { array_push(blockers, "file-directory-symlink-error identity is not enforced"); }
+    if not snapshot { array_push(blockers, "namespace snapshot consistency is not verified"); }
     return map{format:"pblang.project_inventory.idea-admission.v1",
         eligible:len(blockers) == 0, complete:complete, truncated:truncated,
         timed_out:timed_out, hard_heap_bound:hard_heap,
         directory_enumerator_allocation_bounded:enumerator,
         stay_on_device_enforced:same_device,
-        entry_kind_tristate_enforced:tristate, blockers:blockers,
+        entry_kind_tristate_enforced:tristate, snapshot_consistent:snapshot,
+        blockers:blockers,
         repository_creation_allowed:false, implementation_allowed:false,
         training_allowed:false, external_effects_allowed:false};
 }
@@ -827,6 +1052,7 @@ fn portfolio_action_summary_from_roots(roots, options = nil) {
         directory_enumerator_allocation_bounded:try inv.directory_enumerator_allocation_bounded catch false,
         stay_on_device_enforced:try inv.stay_on_device_enforced catch false,
         entry_kind_tristate_enforced:try inv.entry_kind_tristate_enforced catch false,
+        snapshot_consistent:try inv.snapshot_consistent catch false,
         contains_raw_paths:false,
         terminal_text_safe:true, safe_to_log:false};
     return map{format:"pblang.project_inventory.portfolio_summary.v1",
@@ -840,6 +1066,6 @@ fn portfolio_action_summary_from_roots(roots, options = nil) {
         policy:"path-free aggregate remains private because counts and category presence can fingerprint projects"};
 }
 
-export should_skip_path, inventory_roots, inventory_collect_pages,
+export should_skip_path, inventory_roots, inventory_strict_root, inventory_collect_pages,
 inventory_paths, inventory_lines,
 portfolio_action_from_roots, portfolio_action_summary_from_roots;

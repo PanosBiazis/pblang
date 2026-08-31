@@ -1,0 +1,153 @@
+let S = import("stdlib:secure_file.sapp");
+let INV = import("stdlib:project_inventory.sapp");
+let LinuxDirFS = import("stdlib:linux_dirfs.sapp");
+
+fn fail(message) { throw "FAIL linux_bounded_enumerator: " + message; }
+fn require(value, message) { if not value { fail(message); } }
+
+fn entry_named(entries, name) {
+    let i = 0;
+    while i < len(entries) {
+        if (try entries[i].name catch nil) == name { return entries[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn open_and_list(root, maximum) {
+    let handle = S.open_bounded_enumerator(root, 60000);
+    require(handle.ok and not handle.contains_paths and not handle.contains_descriptors,
+        "strict handle is opaque and path-free");
+    let result = S.enumerate_bounded(handle, "", maximum);
+    require(S.close_bounded_enumerator(handle), "strict handle closes");
+    return result;
+}
+
+if platform() == "linux" {
+    require(LinuxDirFS.abort_bounded_enumeration(map{
+        strict_enum_active: true, strict_enum_dir_fd: 1,
+        strict_enum_snapshot_fd: 2, strict_enum_child_fd: 3,
+        strict_enum_buffer: 1, strict_enum_operation_id: "forged" }),
+        "forged public cleanup fields are ignored because resources live in a private registry");
+    let root = "/tmp/pblang-bounded-enumerator-" +
+        str_slice(sha256(base64_encode_bytes(random_bytes(16))), 0, 20);
+    let under = root + "/under";
+    let exact = root + "/exact";
+    let over = root + "/over";
+    let tokens = root + "/tree";
+    fs_mkdirs(under); fs_mkdirs(exact); fs_mkdirs(over);
+    fs_mkdirs(tokens + "/child"); fs_mkdirs(tokens + "/root");
+    fs_mkdirs(tokens + "/discarded");
+    fs_write(under + "/a", "a");
+    fs_write(exact + "/a", "a"); fs_write(exact + "/b", "b");
+    fs_write(over + "/a", "a"); fs_write(over + "/b", "b"); fs_write(over + "/c", "c");
+    fs_write(tokens + "/file", "f"); fs_write(tokens + "/child/nested", "n");
+    fs_write(tokens + "/root/marker", "r");
+
+    let under_result = open_and_list(under, 2);
+    require(under_result.ok and under_result.complete and not under_result.truncated
+        and under_result.entry_count == 1,
+        "N-1 entries are complete without truncation");
+    let exact_result = open_and_list(exact, 2);
+    require(exact_result.ok and exact_result.complete and not exact_result.truncated
+        and exact_result.entry_count == 2,
+        "exactly N entries require an EOF proof and are not truncated");
+    let over_result = open_and_list(over, 2);
+    require(over_result.ok and not over_result.complete and over_result.truncated
+        and over_result.entry_count == 2 and over_result.observed_at_least == 3,
+        "N+1 sentinel proves truncation while returning at most N entries");
+
+    let handle = S.open_bounded_enumerator(tokens, 60000);
+    let top = S.enumerate_bounded(handle, "", 8);
+    let child = entry_named(top.entries, "child");
+    let file = entry_named(top.entries, "file");
+    let literal_root = entry_named(top.entries, "root");
+    let discarded = entry_named(top.entries, "discarded");
+    require(top.ok and top.complete and child != nil and child.kind == "directory"
+        and child.traversable and len(child.traversal_token) == 64
+        and file != nil and file.kind == "file" and not file.traversable
+        and file.traversal_token == "",
+        "quad-state entries distinguish traversable directories from files");
+    require(literal_root != nil and literal_root.traversable,
+        "a literal top-level directory named root is not confused with the root sentinel");
+    let root_page = S.enumerate_bounded(handle, "root", 8, literal_root.traversal_token);
+    require(root_page.ok and entry_named(root_page.entries, "marker").kind == "file",
+        "the literal root directory remains addressable");
+    require(not S.enumerate_bounded(handle, "root", 8, child.traversal_token).ok,
+        "a traversal token is bound to its expected relative path");
+    let other_handle = S.open_bounded_enumerator(tokens, 60000);
+    require(other_handle.ok and S.enumerate_bounded(other_handle, "", 8).ok
+        and not S.enumerate_bounded(other_handle, "child", 8, child.traversal_token).ok,
+        "a traversal token cannot cross opaque enumerator handles");
+    require(S.close_bounded_enumerator(other_handle), "cross-handle test closes");
+    let child_page = S.enumerate_bounded(handle, "child", 8, child.traversal_token);
+    require(child_page.ok and child_page.complete and entry_named(child_page.entries, "nested").kind == "file",
+        "one-use root-bound token authorizes the expected held child identity");
+    require(not S.enumerate_bounded(handle, "child", 8, child.traversal_token).ok,
+        "a consumed traversal token cannot be replayed");
+    require(S.discard_bounded_traversal(handle, discarded.traversal_token)
+        and not S.enumerate_bounded(handle, "discarded", 8, discarded.traversal_token).ok,
+        "discarded directory capabilities cannot be consumed later");
+    require(S.close_bounded_enumerator(handle), "token test handle closes");
+
+    let strict_inventory = INV.inventory_strict_root(tokens, map{
+        max_depth: 3, max_entries: 32, max_children_per_dir: 8,
+        include_files: true, include_dirs: true, max_runtime_ms: 30000 });
+    require(strict_inventory.ok and strict_inventory.complete
+        and strict_inventory.directory_enumerator_allocation_bounded
+        and strict_inventory.stay_on_device_enforced
+        and strict_inventory.entry_kind_tristate_enforced
+        and not strict_inventory.hard_heap_bound
+        and not strict_inventory.snapshot_consistent
+        and len(strict_inventory.roots) == 0 and not strict_inventory.contains_absolute_paths
+        and not strict_inventory.contains_traversal_tokens,
+        "strict inventory consumes typed entries while keeping the approved root private");
+    let strict_json = json_stringify(strict_inventory);
+    require(not str_contains(strict_json, tokens) and not str_contains(strict_json, "mnt_id")
+        and not str_contains(strict_json, "\"traversal_token\":")
+        and not str_contains(strict_json, "root_digest"),
+        "strict inventory strips absolute roots, stable root digests, raw identities, and traversal tokens");
+
+    let sensitive = INV.inventory_strict_root(tokens + "/.ssh", map{
+        max_depth: 1, max_entries: 8, max_children_per_dir: 8,
+        include_files: true, include_dirs: true, max_runtime_ms: 30000 });
+    require(not sensitive.ok and not str_contains(json_stringify(sensitive), tokens),
+        "sensitive roots are rejected without echoing or digesting their absolute path");
+    require((try INV.idea_admission catch nil) == nil,
+        "callers cannot submit forged inventory booleans to the private idea gate");
+
+    let root_result = open_and_list("/", 4096);
+    let proc_entry = entry_named(root_result.entries, "proc");
+    require(root_result.ok and proc_entry != nil and proc_entry.kind == "error"
+        and proc_entry.error_code == "mount-boundary" and not proc_entry.traversable,
+        "stay_on_device rejects the procfs mount before traversal");
+    let root_json = json_stringify(root_result);
+    require(not str_contains(root_json, "mnt_id") and not str_contains(root_json, "inode"),
+        "raw mount and inode identity never enters enumeration output");
+
+    let proc_result = open_and_list("/proc", 4096);
+    let self_entry = entry_named(proc_result.entries, "self");
+    require(proc_result.ok and self_entry != nil and self_entry.kind == "symlink"
+        and not self_entry.traversable,
+        "symlinks are a distinct non-traversable state");
+    let dev_result = open_and_list("/dev", 4096);
+    let null_entry = entry_named(dev_result.entries, "null");
+    require(dev_result.ok and null_entry != nil and null_entry.kind == "error"
+        and null_entry.error_code == "unsupported-or-unknown-type",
+        "special files fail closed into the error state");
+
+    fs_remove(tokens + "/child/nested"); fs_remove(tokens + "/child");
+    fs_remove(tokens + "/root/marker"); fs_remove(tokens + "/root");
+    fs_remove(tokens + "/discarded");
+    fs_remove(tokens + "/file"); fs_remove(tokens);
+    fs_remove(over + "/a"); fs_remove(over + "/b"); fs_remove(over + "/c"); fs_remove(over);
+    fs_remove(exact + "/a"); fs_remove(exact + "/b"); fs_remove(exact);
+    fs_remove(under + "/a"); fs_remove(under); fs_remove(root);
+}
+
+let status = S.bounded_enumerator_status();
+require(not status.snapshot_consistent and not status.hard_heap_enforced
+    and not status.vm_typed_ffi_enforced and not status.hostile_code_ready
+    and not status.production_ready,
+    "strict functional slice does not claim unresolved runtime guarantees");
+print "linux_bounded_enumerator_pass";

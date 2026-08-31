@@ -12,6 +12,9 @@ let SHA256 = import("stdlib:sha256_pb.sapp");
 
 let MAX_PATH = 4096;
 let RAW_SHA256_ALGORITHM = "sha256(raw-bytes)";
+let STRICT_ENUMERATOR_TTL_MS = 600000;
+let STRICT_ENUMERATOR_MAX_HANDLES = 16;
+let _strict_enumerators = map{};
 
 fn _error(message) { return map{ ok: false, error: message }; }
 
@@ -186,6 +189,116 @@ fn list_directory(path, max_entries = 512) {
     let result = _list_backend(fs, "root", max_entries);
     _close(fs);
     return result;
+}
+
+fn _purge_bounded_enumerators() {
+    let now = now_ms();
+    for id in map_keys(_strict_enumerators) {
+        if now >= (try _strict_enumerators[id].expires_ms catch 0) {
+            try LinuxDirFS.close(_strict_enumerators[id].fs) catch nil;
+            map_remove(_strict_enumerators, id);
+        }
+    }
+}
+
+// Open one caller-approved Linux scan root and keep its descriptor private to
+// this module. The public value is an opaque, expiring capability; raw fds,
+// mount IDs and inode IDs never enter reports, cursors or caller-owned maps.
+fn open_bounded_enumerator(root, ttl_ms = 600000) {
+    if platform() != "linux" { return _error("strict bounded enumeration is Linux-only"); }
+    if type(root) != "string" or not str_starts_with(root, "/") or len(root) > MAX_PATH
+       or str_contains(root, strfromcharcode(0)) {
+        return _error("strict enumeration requires one safe absolute root");
+    }
+    if type(ttl_ms) != "number" or ttl_ms != num_floor(ttl_ms)
+       or ttl_ms < 1000 or ttl_ms > STRICT_ENUMERATOR_TTL_MS {
+        return _error("invalid strict enumerator lifetime");
+    }
+    _purge_bounded_enumerators();
+    if len(map_keys(_strict_enumerators)) >= STRICT_ENUMERATOR_MAX_HANDLES {
+        return _error("strict enumerator handle capacity reached");
+    }
+    let fs = LinuxDirFS.open_absolute(root, false, false);
+    if fs == nil or not fs.ok { return _error("strict scan root cannot be held without following links"); }
+    let id = try str_slice(sha256(base64_encode_bytes(random_bytes(32)) + ":" + str(now_ms())), 0, 48)
+        catch nil;
+    if type(id) != "string" { LinuxDirFS.close(fs); return _error("strict enumerator handle creation failed safely"); }
+    if map_has(_strict_enumerators, id) {
+        LinuxDirFS.close(fs); return _error("strict enumerator handle collision");
+    }
+    let expires_ms = now_ms() + ttl_ms;
+    let public_handle = try map{ ok: true, format: "pblang.secure-file.bounded-enumerator.v1",
+        id: id, contains_paths: false, contains_descriptors: false,
+        persistable: false, expires_ms: expires_ms } catch nil;
+    if public_handle == nil { LinuxDirFS.close(fs); return _error("strict enumerator handle creation failed safely"); }
+    let stored = try {
+        _strict_enumerators[id] = map{ fs: fs, expires_ms: expires_ms, ttl_ms: ttl_ms };
+        true
+    } catch false;
+    if not stored { LinuxDirFS.close(fs); return _error("strict enumerator handle creation failed safely"); }
+    return public_handle;
+}
+
+fn enumerate_bounded(handle, relative_path = "", max_entries = 512,
+    traversal_token = nil) {
+    _purge_bounded_enumerators();
+    if type(handle) != "map"
+       or (try handle.format catch "") != "pblang.secure-file.bounded-enumerator.v1"
+       or type(try handle.id catch nil) != "string"
+       or not map_has(_strict_enumerators, handle.id) {
+        return _error("strict enumerator handle is invalid or expired");
+    }
+    let state = _strict_enumerators[handle.id];
+    state.expires_ms = now_ms() + state.ttl_ms;
+    let outcome = try { map{ ok: true, value: LinuxDirFS.enumerate_bounded(
+        state.fs, relative_path, max_entries, traversal_token) } } catch map{ ok: false };
+    if not outcome.ok {
+        map_remove(_strict_enumerators, handle.id);
+        try LinuxDirFS.abort_bounded_enumeration(state.fs) catch false;
+        try LinuxDirFS.close(state.fs) catch false;
+        return _error("strict enumeration failed safely and invalidated its handle");
+    }
+    let result = outcome.value;
+    if type(result) == "map" {
+        result.root_path_exposed = false;
+        result.handle_descriptor_exposed = false;
+    }
+    return result;
+}
+
+fn discard_bounded_traversal(handle, traversal_token) {
+    _purge_bounded_enumerators();
+    if type(handle) != "map"
+       or (try handle.format catch "") != "pblang.secure-file.bounded-enumerator.v1"
+       or type(try handle.id catch nil) != "string"
+       or not map_has(_strict_enumerators, handle.id) {
+        return false;
+    }
+    let state = _strict_enumerators[handle.id];
+    state.expires_ms = now_ms() + state.ttl_ms;
+    return LinuxDirFS.discard_enumeration_token(state.fs, traversal_token);
+}
+
+fn close_bounded_enumerator(handle) {
+    if type(handle) != "map" or type(try handle.id catch nil) != "string"
+       or not map_has(_strict_enumerators, handle.id) {
+        return false;
+    }
+    let state = _strict_enumerators[handle.id];
+    map_remove(_strict_enumerators, handle.id);
+    return LinuxDirFS.close(state.fs);
+}
+
+fn bounded_enumerator_status() {
+    return map{ format: "pblang.secure-file.bounded-enumerator.status.v1",
+        linux_functional_slice: platform() == "linux",
+        macos_supported: false, windows_supported: false,
+        descriptor_streaming: platform() == "linux",
+        stay_on_device: platform() == "linux",
+        quad_state: platform() == "linux",
+        snapshot_consistent: false, hard_heap_enforced: false,
+        vm_typed_ffi_enforced: false, hostile_code_ready: false,
+        production_ready: false };
 }
 
 fn read_bytes(path, max_bytes, private_parent = false) {
@@ -863,6 +976,11 @@ fn status() {
                 private_cooperative_cas_supported_linux: platform() == "linux",
                 durable_nonce_consumption_supported_linux: platform() == "linux",
                 nonce_directory_enumeration_required: false,
+                strict_bounded_enumerator_linux: platform() == "linux",
+                strict_bounded_enumerator_windows: false,
+                strict_bounded_enumerator_macos: false,
+                strict_bounded_enumerator_hard_heap_enforced: false,
+                strict_bounded_enumerator_vm_typed_ffi_enforced: false,
                 receipt_single_descriptor_verification_supported_linux: platform() == "linux",
                 nonce_effect_admission_evidence_supported_linux: platform() == "linux",
                 raw_byte_digest_algorithm: RAW_SHA256_ALGORITHM,
@@ -884,5 +1002,8 @@ export available, read_bytes, read_text, read_text_prefix, read_optional_text,
        write_atomic, write_text_atomic, write_new_exclusive, write_text_new_exclusive,
        append_text_bounded_locked, private_compare_and_swap, consume_nonce_once,
        classify_nonce_publication_evidence,
-       list_directory, remove, remove_file, status;
+       list_directory, open_bounded_enumerator, enumerate_bounded,
+       discard_bounded_traversal,
+       close_bounded_enumerator, bounded_enumerator_status,
+       remove, remove_file, status;
 export RAW_SHA256_ALGORITHM;
