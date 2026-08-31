@@ -14,6 +14,16 @@ fn entry_named(entries, name) {
     return nil;
 }
 
+fn entry_names(entries) {
+    let names = [];
+    for entry in entries {
+        if try entry.name_available catch false {
+            array_push(names, entry.name);
+        }
+    }
+    return array_sort(names);
+}
+
 fn open_and_list(root, maximum) {
     let handle = S.open_bounded_enumerator(root, 60000);
     require(handle.ok and not handle.contains_paths and not handle.contains_descriptors,
@@ -42,11 +52,13 @@ if platform() == "linux" {
     let exact = root + "/exact";
     let over = root + "/over";
     let tokens = root + "/tree";
+    let stability = tokens + "/stability";
     fs_mkdirs(under); fs_mkdirs(exact); fs_mkdirs(over);
     fs_mkdirs(tokens + "/child"); fs_mkdirs(tokens + "/root");
     fs_mkdirs(tokens + "/discarded");
     fs_mkdirs(tokens + "/Api_Key_Private");
     fs_mkdirs(tokens + "/ACCESS_KEY_Backup");
+    fs_mkdirs(stability + "/sub");
     fs_write(under + "/a", "a");
     fs_write(exact + "/a", "a"); fs_write(exact + "/b", "b");
     fs_write(over + "/a", "a"); fs_write(over + "/b", "b"); fs_write(over + "/c", "c");
@@ -54,6 +66,7 @@ if platform() == "linux" {
     fs_write(tokens + "/root/marker", "r");
     fs_write(tokens + "/Api_Key_Private/hidden", "x");
     fs_write(tokens + "/ACCESS_KEY_Backup/hidden", "x");
+    fs_write(stability + "/a", "a"); fs_write(stability + "/sub/one", "1");
 
     let under_result = open_and_list(under, 2);
     require(under_result.ok and under_result.complete and not under_result.truncated
@@ -112,6 +125,60 @@ if platform() == "linux" {
         "discarded directory capabilities cannot be consumed later");
     require(S.close_bounded_enumerator(handle), "token test handle closes");
 
+    let restart_handle = S.open_bounded_enumerator(stability, 60000);
+    let before_restart = S.enumerate_bounded(restart_handle, "", 8);
+    let old_sub = entry_named(before_restart.entries, "sub");
+    require(before_restart.ok and before_restart.complete and old_sub != nil
+        and old_sub.traversable,
+        "restart fixture obtains one generation-bound subtree token");
+    let old_token = old_sub.traversal_token;
+    let pending_restart = S.restart_bounded_enumerator(restart_handle);
+    require(not pending_restart.ok
+        and not (try pending_restart.handle_invalidated catch false),
+        "restart rejects a pending traversal token without invalidating its owner");
+    let old_subtree = S.enumerate_bounded(restart_handle, "sub", 8, old_token);
+    require(old_subtree.ok and old_subtree.complete
+        and entry_named(old_subtree.entries, "one") != nil,
+        "the rejected restart leaves the pending token usable and consumes it once");
+    let restarted = S.restart_bounded_enumerator(restart_handle);
+    require(restarted.ok and restarted.generation_advanced
+        and restarted.previous_tokens_invalidated
+        and not restarted.snapshot_consistent
+        and not restarted.namespace_stability_verified,
+        "held-root generation restarts without claiming a namespace snapshot");
+    require((try restarted.generation catch nil) == nil
+        and (try restarted.token catch nil) == nil,
+        "generation restart exposes neither generation secret nor token");
+    require(try { fs_rename(stability + "/a", stability + "/b"); true } catch false,
+        "same-count rename mutation succeeds between observations");
+    require(try { fs_rename(stability + "/sub", stability + "/old-sub"); true } catch false,
+        "subtree replacement moves the first observed inode");
+    fs_mkdirs(stability + "/sub"); fs_write(stability + "/sub/two", "2");
+    fs_remove(stability + "/old-sub/one"); fs_remove(stability + "/old-sub");
+    require(not S.enumerate_bounded(restart_handle, "sub", 8, old_token).ok,
+        "a discarded prior-generation token cannot replay after subtree replacement");
+    let after_restart = S.enumerate_bounded(restart_handle, "", 8);
+    let fresh_sub = entry_named(after_restart.entries, "sub");
+    require(after_restart.ok and after_restart.complete
+        and entry_names(before_restart.entries) != entry_names(after_restart.entries),
+        "same-count different-name observations remain distinguishable");
+    require(fresh_sub != nil, "fresh observation contains the replacement subtree");
+    require(fresh_sub.kind == "directory",
+        "fresh replacement subtree retains the directory quad-state");
+    require(fresh_sub.traversable,
+        "fresh replacement subtree publishes a traversal capability");
+    require(fresh_sub.traversal_token != old_token,
+        "fresh subtree receives a different generation-bound token");
+    require(S.enumerate_bounded(restart_handle, "sub", 8,
+        fresh_sub.traversal_token).ok,
+        "fresh generation token traverses the replacement subtree");
+    let repeated_restart = S.restart_bounded_enumerator(restart_handle);
+    require(not repeated_restart.ok
+        and not (try repeated_restart.handle_invalidated catch false),
+        "one held enumerator permits exactly two cumulative observation generations");
+    require(S.close_bounded_enumerator(restart_handle),
+        "generation restart fixture closes its held root");
+
     let strict_inventory = INV.inventory_strict_root(tokens, map{
         max_depth: 3, max_entries: 32, max_children_per_dir: 8,
         include_files: true, include_dirs: true, max_runtime_ms: 30000 });
@@ -132,6 +199,31 @@ if platform() == "linux" {
         and not str_contains(strict_json, "ACCESS_KEY_Backup")
         and strict_inventory.skipped_count >= 2,
         "strict inventory strips roots, identities, tokens, and ordinary sensitive names");
+
+    let stable_inventory = INV.inventory_strict_root_stability(tokens, map{
+        max_depth: 3, max_entries: 32, max_children_per_dir: 8,
+        include_files: true, include_dirs: true, max_runtime_ms: 5000 });
+    let stable_json = json_stringify(stable_inventory);
+    require(stable_inventory.ok and stable_inventory.complete
+        and stable_inventory.passes_completed == 2
+        and stable_inventory.two_pass_stability_observed
+        and not stable_inventory.namespace_change_observed
+        and not stable_inventory.observation_inconclusive
+        and not stable_inventory.snapshot_consistent
+        and not stable_inventory.namespace_stability_verified
+        and not stable_inventory.hard_heap_bound
+        and stable_inventory.enumerator_closed,
+        "two complete matching observations remain explicitly weaker than a snapshot");
+    require(not str_contains(stable_json, "_private_observation_keys")
+        and not str_contains(stable_json, tokens)
+        and not str_contains(stable_json, "Api_Key_Private")
+        and not str_contains(stable_json, "ACCESS_KEY_Backup"),
+        "two-pass stability report strips private comparison keys and sensitive names");
+    let excessive_stability = INV.inventory_strict_root_stability(tokens, map{
+        max_depth: 9, max_entries: 32, max_children_per_dir: 8,
+        include_files: true, include_dirs: true, max_runtime_ms: 5000 });
+    require(not excessive_stability.ok and excessive_stability.passes_completed == 0,
+        "two-pass observation enforces its tighter dedicated depth ceiling");
 
     require(proc_spawn_wait("/usr/bin/mkfifo", [tokens + "/Api_Key_Error"]).exit_code == 0,
         "sensitive error-state fixture created after the complete baseline scan");
@@ -182,6 +274,8 @@ if platform() == "linux" {
     fs_remove(tokens + "/discarded");
     fs_remove(tokens + "/Api_Key_Private/hidden"); fs_remove(tokens + "/Api_Key_Private");
     fs_remove(tokens + "/ACCESS_KEY_Backup/hidden"); fs_remove(tokens + "/ACCESS_KEY_Backup");
+    fs_remove(stability + "/sub/two"); fs_remove(stability + "/sub");
+    fs_remove(stability + "/b"); fs_remove(stability);
     fs_remove(tokens + "/Api_Key_Error");
     fs_remove(tokens + "/file"); fs_remove(tokens);
     fs_remove(over + "/a"); fs_remove(over + "/b"); fs_remove(over + "/c"); fs_remove(over);
@@ -192,6 +286,7 @@ if platform() == "linux" {
 let status = S.bounded_enumerator_status();
 require(not status.snapshot_consistent and not status.hard_heap_enforced
     and not status.vm_typed_ffi_enforced and not status.hostile_code_ready
+    and status.generation_restart and status.two_pass_observation_supported
     and not status.production_ready,
     "strict functional slice does not claim unresolved runtime guarantees");
 print "linux_bounded_enumerator_pass";

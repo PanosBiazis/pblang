@@ -18,6 +18,10 @@ let MAX_PAGE_RECORDS_HARD = 256;
 let MAX_SESSIONS_HARD = 8;
 let MAX_GLOBAL_PENDING_HARD = 16384;
 let MAX_SESSION_TTL_MS = 600000;
+let STABILITY_MAX_DEPTH = 8;
+let STABILITY_MAX_ENTRIES = 1024;
+let STABILITY_MAX_CHILDREN = 256;
+let STABILITY_PASS_RUNTIME_MS = 5000;
 let SESSION_FORMAT = "pblang.project_inventory.session.v1";
 let CURSOR_FORMAT = "pblang.project_inventory.cursor.v1";
 let _sessions = map{};
@@ -272,6 +276,7 @@ fn _inventory_strict_owned(handle, normalized) {
     let queue = [map{ enum_path: "", report_path: ".", depth: 0,
         parent: "", traversal_token: nil }];
     let q = 0; let records = []; let skipped = []; let errors = [];
+    let private_observations = [json_stringify([".", "directory", "", 0, ""])];
     let scanned_dirs = 0; let scanned_entries = 0; let visited = 0;
     let enqueued = 1; let truncated = false; let timed_out = false;
     while q < len(queue) and len(records) < normalized.max_entries
@@ -289,6 +294,22 @@ fn _inventory_strict_owned(handle, normalized) {
         }
         scanned_dirs = scanned_dirs + 1;
         if listing.truncated or not listing.complete { truncated = true; }
+        let observation_i = 0;
+        while observation_i < len(listing.entries) {
+            let observed = listing.entries[observation_i];
+            let observed_name = str(try observed.name catch "");
+            let observed_path = if item.report_path == "." { observed_name }
+                else { _join(item.report_path, observed_name) };
+            let observed_kind = str(try observed.kind catch "error");
+            let observed_error = str(try observed.error_code catch "");
+            if not (try observed.name_available catch false) or observed_path == "" {
+                observed_path = item.report_path + "/<unavailable>"
+                    + str(observation_i);
+            }
+            array_push(private_observations, json_stringify([observed_path,
+                observed_kind, observed_error, item.depth + 1, item.report_path]));
+            observation_i = observation_i + 1;
+        }
         if normalized.include_dirs and len(records) < normalized.max_entries {
             array_push(records, _strict_record(item.report_path, "directory",
                 item.depth, item.parent));
@@ -395,6 +416,7 @@ fn _inventory_strict_owned(handle, normalized) {
         snapshot_consistent: false, namespace_stability_verified: false,
         vm_typed_ffi_enforced: false, hostile_code_sandbox: false,
         contains_absolute_paths: false, contains_traversal_tokens: false,
+        _private_observation_keys: private_observations,
         safe_to_log: false, production_ready: false,
         policy: "one approved Linux root; descriptor-streamed N+1 enumeration; one-use root-bound traversal tokens; same-mount identity checks; relative metadata only; any error, truncation, timeout, or namespace ambiguity makes evidence incomplete" };
 }
@@ -444,11 +466,178 @@ fn inventory_strict_root(root, options = nil) {
             enumerator_closed: closed, production_ready: false };
     }
     let report = outcome.value;
+    if map_has(report, "_private_observation_keys") {
+        map_remove(report, "_private_observation_keys");
+    }
     if not closed { array_push(report.errors, map{ path: ".", code: "enumerator-close-failed" }); }
     report.ok = closed;
     report.complete = report.complete and closed;
     report.enumerator_closed = closed;
     return report;
+}
+
+// Observe one held namespace twice with a fresh traversal-token generation.
+// Matching observations are useful change-detection evidence only: mutations
+// can occur between passes and return to the same names (ABA), so snapshot and
+// namespace-stability guarantees deliberately remain false.
+fn inventory_strict_root_stability(root, options = nil) {
+    let total_started = now_ms();
+    let checked = _validated_request([root], options, false);
+    if platform() != "linux" or not checked.ok or type(root) != "string"
+       or not str_starts_with(root, "/") or _strict_root_sensitive(root) {
+        return map{ ok: false, format: "pblang.project_inventory.stability-report.v1",
+            roots: [], records: [], paths: [], record_count: 0,
+            errors: ["strict stability observation requires one non-sensitive absolute Linux root"],
+            complete: false, truncated: true, timed_out: false,
+            passes_completed: 0, two_pass_stability_observed: false,
+            namespace_change_observed: false, snapshot_consistent: false,
+            namespace_stability_verified: false, hard_heap_bound: false,
+            observation_inconclusive: true,
+            hard_wall_timeout: false, total_wall_runtime_bounded: false,
+            contains_absolute_paths: false, contains_traversal_tokens: false,
+            safe_to_log: false, production_ready: false };
+    }
+    let normalized = checked.options;
+    if normalized.max_depth > STABILITY_MAX_DEPTH
+       or normalized.max_entries > STABILITY_MAX_ENTRIES
+       or normalized.max_children_per_dir > STABILITY_MAX_CHILDREN {
+        return map{ ok: false, format: "pblang.project_inventory.stability-report.v1",
+            roots: [], records: [], paths: [], record_count: 0,
+            errors: ["strict stability observation bounds exceed the dedicated ceiling"],
+            complete: false, truncated: true, timed_out: false,
+            passes_completed: 0, two_pass_stability_observed: false,
+            namespace_change_observed: false, snapshot_consistent: false,
+            namespace_stability_verified: false, hard_heap_bound: false,
+            observation_inconclusive: true,
+            hard_wall_timeout: false, total_wall_runtime_bounded: false,
+            contains_absolute_paths: false, contains_traversal_tokens: false,
+            safe_to_log: false, production_ready: false };
+    }
+    let pass_options = map{};
+    for key in ["max_depth", "max_entries", "max_children_per_dir",
+        "include_files", "include_dirs", "max_runtime_ms"] {
+        pass_options[key] = normalized[key];
+    }
+    if pass_options.max_runtime_ms > STABILITY_PASS_RUNTIME_MS {
+        pass_options.max_runtime_ms = STABILITY_PASS_RUNTIME_MS;
+    }
+    let total_pass_runtime_budget_ms = pass_options.max_runtime_ms * 2;
+    let handle = SECURE.open_bounded_enumerator(root, 600000);
+    if not handle.ok {
+        return map{ ok: false, format: "pblang.project_inventory.stability-report.v1",
+            roots: [], records: [], paths: [], record_count: 0,
+            errors: ["strict stability root could not be held"], complete: false,
+            truncated: true, timed_out: false, passes_completed: 0,
+            two_pass_stability_observed: false, namespace_change_observed: false,
+            snapshot_consistent: false, namespace_stability_verified: false,
+            hard_heap_bound: false, contains_absolute_paths: false,
+            observation_inconclusive: true,
+            hard_wall_timeout: false, total_wall_runtime_bounded: false,
+            duration_ms: now_ms() - total_started,
+            max_runtime_ms: total_pass_runtime_budget_ms,
+            contains_traversal_tokens: false, safe_to_log: false,
+            production_ready: false };
+    }
+    let first_outcome = try { map{ ok: true,
+        value: _inventory_strict_owned(handle, pass_options) } } catch map{ ok: false };
+    if not first_outcome.ok {
+        let closed = SECURE.close_bounded_enumerator(handle);
+        return map{ ok: false, format: "pblang.project_inventory.stability-report.v1",
+            roots: [], records: [], paths: [], record_count: 0,
+            errors: ["first stability observation failed safely"], complete: false,
+            truncated: true, timed_out: false, passes_completed: 0,
+            two_pass_stability_observed: false, namespace_change_observed: false,
+            snapshot_consistent: false, namespace_stability_verified: false,
+            hard_heap_bound: false, contains_absolute_paths: false,
+            observation_inconclusive: true,
+            hard_wall_timeout: false, total_wall_runtime_bounded: false,
+            duration_ms: now_ms() - total_started,
+            max_runtime_ms: total_pass_runtime_budget_ms,
+            contains_traversal_tokens: false, safe_to_log: false,
+            enumerator_closed: closed, production_ready: false };
+    }
+    let first = first_outcome.value;
+    let first_keys = try first._private_observation_keys catch [];
+    map_remove(first, "_private_observation_keys");
+    if not first.complete {
+        let closed = SECURE.close_bounded_enumerator(handle);
+        first.format = "pblang.project_inventory.stability-report.v1";
+        first.passes_completed = 1; first.two_pass_stability_observed = false;
+        first.namespace_change_observed = false; first.enumerator_closed = closed;
+        first.observation_inconclusive = true;
+        first.hard_wall_timeout = false; first.total_wall_runtime_bounded = false;
+        first.duration_ms = now_ms() - total_started;
+        first.max_runtime_ms = total_pass_runtime_budget_ms;
+        first.ok = first.ok and closed; first.complete = false;
+        return first;
+    }
+    let restarted = SECURE.restart_bounded_enumerator(handle);
+    if not restarted.ok {
+        let closed = if try restarted.handle_invalidated catch false {
+            try restarted.enumerator_closed catch false
+        } else { SECURE.close_bounded_enumerator(handle) };
+        first.format = "pblang.project_inventory.stability-report.v1";
+        array_push(first.errors, map{ path: ".", code: "enumeration-generation-restart-failed" });
+        first.passes_completed = 1; first.two_pass_stability_observed = false;
+        first.namespace_change_observed = false; first.observation_inconclusive = true;
+        first.enumerator_closed = closed;
+        first.hard_wall_timeout = false; first.total_wall_runtime_bounded = false;
+        first.duration_ms = now_ms() - total_started;
+        first.max_runtime_ms = total_pass_runtime_budget_ms;
+        first.ok = false; first.complete = false; first.truncated = true;
+        return first;
+    }
+    let second_outcome = try { map{ ok: true,
+        value: _inventory_strict_owned(handle, pass_options) } } catch map{ ok: false };
+    let closed = SECURE.close_bounded_enumerator(handle);
+    if not second_outcome.ok {
+        first.format = "pblang.project_inventory.stability-report.v1";
+        array_push(first.errors, map{ path: ".", code: "second-stability-observation-failed" });
+        first.passes_completed = 1; first.two_pass_stability_observed = false;
+        first.namespace_change_observed = false; first.observation_inconclusive = true;
+        first.enumerator_closed = closed;
+        first.hard_wall_timeout = false; first.total_wall_runtime_bounded = false;
+        first.duration_ms = now_ms() - total_started;
+        first.max_runtime_ms = total_pass_runtime_budget_ms;
+        first.ok = false; first.complete = false; first.truncated = true;
+        return first;
+    }
+    let second = second_outcome.value;
+    let second_keys = try second._private_observation_keys catch [];
+    map_remove(second, "_private_observation_keys");
+    let observations_equal = first.complete and second.complete
+        and array_sort(first_keys) == array_sort(second_keys);
+    let stable = observations_equal and closed;
+    let namespace_changed = first.complete and second.complete
+        and not observations_equal and closed;
+    second.format = "pblang.project_inventory.stability-report.v1";
+    second.passes_completed = 2;
+    second.two_pass_stability_observed = stable;
+    second.namespace_change_observed = namespace_changed;
+    second.observation_inconclusive = not closed
+        or not first.complete or not second.complete;
+    second.snapshot_consistent = false;
+    second.namespace_stability_verified = false;
+    second.hard_heap_bound = false;
+    second.hard_wall_timeout = false;
+    second.total_wall_runtime_bounded = false;
+    second.enumerator_closed = closed;
+    second.duration_ms = now_ms() - total_started;
+    second.max_runtime_ms = total_pass_runtime_budget_ms;
+    if not closed {
+        array_push(second.errors, map{ path: ".", code: "stability-enumerator-cleanup-failed" });
+        second.complete = false; second.truncated = true;
+    } elif namespace_changed {
+        array_push(second.errors, map{ path: ".", code: "namespace-changed-between-observations" });
+        second.complete = false; second.truncated = true;
+    } elif not stable {
+        array_push(second.errors, map{ path: ".", code: "stability-observation-inconclusive" });
+        second.complete = false; second.truncated = true;
+    }
+    second.ok = second.ok and closed;
+    second.complete = second.complete and closed;
+    second.production_ready = false;
+    return second;
 }
 
 fn inventory_roots(roots, options = nil) {
@@ -1074,5 +1263,6 @@ fn portfolio_action_summary_from_roots(roots, options = nil) {
 }
 
 export should_skip_path, inventory_roots, inventory_strict_root, inventory_collect_pages,
+inventory_strict_root_stability,
 inventory_paths, inventory_lines,
 portfolio_action_from_roots, portfolio_action_summary_from_roots;

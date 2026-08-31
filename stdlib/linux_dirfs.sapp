@@ -571,6 +571,7 @@ fn _enumeration_context(fs) {
     if map_has(_enumeration_contexts, id) { return _error("enumeration context collision"); }
     let context = map{ root_fd: fs.root_fd, root_identity: root_identity,
         secret: base64_encode_bytes(random_bytes(32)), generation: id,
+        generation_counter: 0,
         expires_ms: now_ms() + ENUM_CONTEXT_TTL_MS, calls: 0,
         root_consumed: false, pending: map{}, pending_count: 0 };
     _enumeration_contexts[id] = context;
@@ -618,6 +619,72 @@ fn discard_enumeration_token(fs, token) {
     map_remove(context.pending, token);
     context.pending_count = context.pending_count - 1;
     return true;
+}
+
+// Start a fresh observation generation on the same held root. Rotation is
+// allowed only after the caller consumed or explicitly discarded every child
+// token from the previous pass. No namespace-snapshot guarantee is implied.
+fn restart_bounded_enumeration(fs) {
+    if fs == nil or not is_map(fs) or (try fs.closed catch true) {
+        return _error("directory root is closed");
+    }
+    let operation_id = try fs.strict_enum_operation_id catch nil;
+    if type(operation_id) == "string" and map_has(_strict_enum_operations, operation_id) {
+        return _error("strict enumeration operation is active");
+    }
+    let context_id = try fs.enumeration_context_id catch nil;
+    if type(context_id) != "string" or not map_has(_enumeration_contexts, context_id) {
+        return map{ ok: false, error: "strict enumeration context is unavailable",
+            invalidate_handle: true };
+    }
+    let context = _enumeration_contexts[context_id];
+    if context.root_fd != fs.root_fd {
+        return map{ ok: false, error: "strict enumeration context owner changed",
+            invalidate_handle: true };
+    }
+    if context.pending_count != 0 or len(map_keys(context.pending)) != 0 {
+        return _error("strict enumeration generation still has pending traversal tokens");
+    }
+    let generation_counter = try context.generation_counter catch -1;
+    if type(generation_counter) != "number"
+       or generation_counter != num_floor(generation_counter)
+       or generation_counter != 0 {
+        return _error("strict enumeration restart limit reached");
+    }
+    let identity = _fd_identity(fs, fs.root_fd);
+    if not identity.ok { return identity; }
+    if not _pair_equal(identity.mount_id, context.root_identity.mount_id)
+       or not _pair_equal(identity.inode, context.root_identity.inode) {
+        return map{ ok: false, error: "scan root identity changed between observations",
+            invalidate_handle: true };
+    }
+    if _call(fs, "lseek", "i32,i64,i32->i64", [fs.root_fd, 0, 0]) != 0 {
+        return map{ ok: false, error: "scan root directory stream cannot be rewound",
+            invalidate_handle: true };
+    }
+    let next_secret = ""; let next_generation = ""; let attempts = 0;
+    while attempts < 4 and (next_secret == "" or next_secret == context.secret
+       or next_generation == "" or next_generation == context.generation) {
+        next_secret = try base64_encode_bytes(random_bytes(32)) catch "";
+        next_generation = try str_slice(sha256(next_secret + ":generation:"
+            + str(now_ms()) + ":" + str(attempts)), 0, 48) catch "";
+        attempts = attempts + 1;
+    }
+    if next_secret == "" or next_secret == context.secret
+       or next_generation == "" or next_generation == context.generation {
+        return _error("strict enumeration generation rotation failed safely");
+    }
+    context.secret = next_secret;
+    context.generation = next_generation;
+    context.generation_counter = generation_counter + 1;
+    context.root_identity = identity;
+    context.root_consumed = false;
+    context.pending = map{}; context.pending_count = 0;
+    context.expires_ms = now_ms() + ENUM_CONTEXT_TTL_MS;
+    return map{ ok: true, format: "pblang.linux-dirfs.enumeration-restart.v1",
+        generation_advanced: true, previous_tokens_invalidated: true,
+        snapshot_consistent: false, namespace_stability_verified: false,
+        contains_paths: false, contains_tokens: false };
 }
 
 fn _begin_bounded_enumeration(fs) {
@@ -2431,6 +2498,7 @@ export available, open, open_absolute, open_current_process_net, close, descript
        sealed_child_bytes, mutable_snapshot_bytes, close_child_descriptor,
        acquire_lock, release_lock,
        mkdir, mkdir_new, list, enumerate_bounded, discard_enumeration_token,
+       restart_bounded_enumeration,
        abort_bounded_enumeration,
        read_bytes, read_prefix_bytes, read_range_bytes, read_stream_bytes, file_size, metadata,
        protect_file, protect_executable, write_atomic, append_bytes_bounded,

@@ -28,6 +28,15 @@
 
 ## Unreleased
 
+- Added an experimental Linux-only two-pass namespace observation for one held,
+  caller-approved root. It rotates opaque traversal-token generations exactly
+  once, preserves cumulative enumeration quotas, rejects restart while child
+  tokens remain pending, and compares private typed relative-entry tuples
+  without exposing paths or capabilities. Matching passes are reported only as
+  `two_pass_stability_observed`; snapshot consistency, hard wall/heap limits,
+  hostile-code readiness, production readiness, and idea admission remain
+  false. Cleanup or operational failure produces an inconclusive observation,
+  never a stability claim.
 - Hardened the experimental Linux strict inventory FFI boundary. Pointer-return
   failures are represented as `nil` and validated before arithmetic or cleanup;
   native cleanup failure is now a distinct handle-invalidating state; every
