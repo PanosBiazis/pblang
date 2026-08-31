@@ -160,10 +160,12 @@ complete broker/sandbox migration before the IDE is production-ready.
 - **AAP one-command status** — Management exposes an on-demand `AAP project
   status` row backed by `ide_features.project_aap_status_board(...)` and
   `stdlib:aap_status.sapp`. The row is deliberately lazy so normal Management
-  redraws stay fast; pressing Enter runs a capped source/docs status pass for
-  pblang/PBIDE, pbAI, pbOS, pb-mcp-server, and PBRemote, then prints a
-  redacted pass / needs-review / blocked summary plus a ranked `next focus`
-  queue and safe drill-down detail for the next project/category to improve.
+  redraws stay fast. It currently fails closed as `unavailable`, with no
+  findings, focus queue, portfolio actions or ideas, because the compatibility
+  content collector still materializes host directory listings before its
+  entry cap. One-root strict metadata shards remain separate evidence; the
+  Management content board will resume only after descriptor-streaming text
+  enumeration is implemented.
 - **Project gap delta board** — `ide_features.project_gap_delta_board(...)`
   compares before/after bounded audit records and reports fixed/new/unchanged
   counts through the shared `progress_gate`. This gives Watchers/Management a

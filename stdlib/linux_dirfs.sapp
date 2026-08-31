@@ -55,8 +55,10 @@ let _mount_admission_cleanup_poisoned = false;
 
 fn _error(message) { return map{ ok: false, error: message }; }
 fn _cleanup_error(message) {
+    _mount_admission_cleanup_poisoned = true;
     return map{ ok: false, error: message, cleanup_failed: true,
-        invalidate_handle: true };
+        invalidate_handle: true, process_admission_poisoned: true,
+        error_code: "scan-mount-cleanup-poisoned" };
 }
 fn _mount_cleanup_error(message) {
     _mount_admission_cleanup_poisoned = true;
@@ -64,6 +66,18 @@ fn _mount_cleanup_error(message) {
     result.process_admission_poisoned = true;
     result.error_code = "scan-mount-cleanup-poisoned";
     return result;
+}
+fn _close_library(libc) {
+    let closed = try { ffi_close(libc); true } catch false;
+    if not closed { _mount_admission_cleanup_poisoned = true; }
+    return closed;
+}
+fn _error_after_library_close(libc, message) {
+    let closed = _close_library(libc);
+    if not closed or _mount_admission_cleanup_poisoned {
+        return _cleanup_error(message + " with ambiguous native cleanup");
+    }
+    return _error(message);
 }
 fn _first_existing(paths) {
     let i = 0;
@@ -77,7 +91,7 @@ fn available() {
     if platform() == "linux" and libc != nil {
         let probe = try ffi_load(libc) catch nil;
         if probe != nil {
-            ffi_library_authority = try { ffi_close(probe); true } catch false;
+            ffi_library_authority = _close_library(probe);
         }
     }
     // Loading and closing libc proves only the library-level grant. The VM's
@@ -164,8 +178,10 @@ fn _typed_call(fs, symbol, signature, args) {
     let fallback = try map{ ok: true,
         value: ffi_call_typed(transient, symbol, signature, args) }
         catch map{ ok: false };
-    try ffi_close(transient) catch nil;
-    if not fallback.ok { throw "linux_dirfs: typed libc call unavailable"; }
+    let transient_closed = _close_library(transient);
+    if not fallback.ok or not transient_closed {
+        throw "linux_dirfs: typed libc call or cleanup unavailable";
+    }
     return fallback.value;
 }
 
@@ -253,7 +269,9 @@ fn _i32(value) {
 }
 fn _close_fd(fs, fd) {
     if fd < 0 { return true; }
-    return _i32(_call(fs, "close", "i32->i32", [fd])) == 0;
+    let closed = try _i32(_call(fs, "close", "i32->i32", [fd])) == 0 catch false;
+    if not closed { _mount_admission_cleanup_poisoned = true; }
+    return closed;
 }
 fn _fd_path(fd) { return "/proc/self/fd/" + str(fd); }
 fn _stat_program() {
@@ -278,8 +296,13 @@ fn _cstring(fs, value) {
 }
 fn _free(fs, pointer) {
     if pointer == nil or pointer == 0 { return true; }
-    if not _positive_pointer(pointer) { return false; }
-    return try { _typed_call(fs, "free", "ptr->void", [pointer]); true } catch false;
+    if not _positive_pointer(pointer) {
+        _mount_admission_cleanup_poisoned = true; return false;
+    }
+    let freed = try { _typed_call(fs, "free", "ptr->void", [pointer]); true }
+        catch false;
+    if not freed { _mount_admission_cleanup_poisoned = true; }
+    return freed;
 }
 fn _cleanup_authority_available(fs) {
     // Probe symbol invocation before acquiring any descriptor or allocation.
@@ -785,8 +808,8 @@ fn _current_mountinfo(fs) {
     return attempted.value;
 }
 
-// Admit only a held root whose descriptor mount identity maps to an exact,
-// kernel-backed local filesystem row in this process' bounded mount table.
+// Admit only a held root whose descriptor mount identity maps to an exact
+// direct-VFS allowlist row in this process' bounded mount table.
 // The private row fingerprint remains in the enumeration registry.
 fn admit_scan_mount(fs) {
     if _mount_admission_cleanup_poisoned {
@@ -811,7 +834,7 @@ fn admit_scan_mount(fs) {
     let policy = _mountinfo_policy(loaded.text, context.root_identity.mount_id);
     if not policy.ok or not policy.admitted {
         return map{ ok: false,
-            error: "held root is not on an admitted local kernel filesystem",
+            error: "held root does not match an admitted direct VFS type",
             error_code: "scan-mount-not-admitted",
             contains_paths: false, contains_mount_identity: false };
     }
@@ -891,22 +914,40 @@ fn scan_mount_admission_status() {
     };
 }
 
-// Isolated-regression hook. It closes an invalid descriptor (which owns no
-// resource) to exercise the ambiguous-cleanup terminal state. Call only in a
-// disposable test process: the poison is intentionally irreversible.
-fn exercise_mount_cleanup_failure_for_test() {
+// Isolated-regression hook. It injects either one invalid, non-owned operation
+// descriptor or an incoming cleanup-failed result into the real strict abort
+// boundary. Call only in a disposable test process: poison is irreversible.
+fn exercise_cleanup_poison_for_test(mode) {
+    if mode != "abort-resource" and mode != "incoming-cleanup" {
+        return _error("invalid cleanup poison test mode");
+    }
     let host = available();
     if not host.library_ready { return _error("trusted libc is unavailable"); }
     let libc = try ffi_load(host.libc) catch nil;
     if libc == nil { return _error("trusted libc cannot be loaded"); }
-    let holder = map{ libc: libc, libc_path: host.libc };
-    let state = map{ source_fd: 2147483647, snapshot_fd: -1, buffer: 0 };
-    let cleaned = _mountinfo_cleanup(holder, state);
-    let library_closed = try { ffi_close(libc); true } catch false;
-    return map{ ok: not cleaned and _mount_admission_cleanup_poisoned
+    let id = str_slice(sha256("strict-cleanup-probe:" + mode), 0, 48);
+    let fs = map{ libc: libc, libc_path: host.libc, root_fd: -7,
+        closed: false, strict_enum_operation_id: id };
+    let child_fd = -1;
+    if mode == "abort-resource" { child_fd = 2147483647; }
+    _strict_enum_operations[id] = map{ owner_root_fd: -7, child_fd: child_fd,
+        snapshot_fd: -1, dir_fd: -1, buffer: nil };
+    let incoming = _error("injected strict operation abort");
+    if mode == "incoming-cleanup" {
+        incoming = map{ ok: false, error: "injected incoming cleanup ambiguity",
+            cleanup_failed: true, invalidate_handle: true };
+    }
+    let outcome = _abort_result(fs, incoming);
+    let registry_cleared = not map_has(_strict_enum_operations, id)
+        and (try fs.strict_enum_operation_id catch "") == "";
+    let library_closed = _close_library(libc);
+    return map{ ok: not outcome.ok and (try outcome.cleanup_failed catch false)
+            and _mount_admission_cleanup_poisoned and registry_cleared
             and library_closed,
-        cleanup_failed: not cleaned,
+        mode: mode, cleanup_failed: try outcome.cleanup_failed catch false,
+        registry_cleared: registry_cleared,
         process_admission_poisoned: _mount_admission_cleanup_poisoned,
+        error_code: try outcome.error_code catch "",
         authorizes_scan: false };
 }
 
@@ -917,7 +958,7 @@ fn inspect_mountinfo_policy(text, target_mount_id_text) {
         else { _mountinfo_policy(text, target) };
     return map{ ok: try result.ok catch false,
         matched_once: try result.ok catch false,
-        local_filesystem_allowlisted: try result.admitted catch false,
+        direct_vfs_type_allowlisted: try result.admitted catch false,
         authorizes_scan: false, contains_paths: false,
         contains_mount_identity: false, contains_filesystem_type: false };
 }
@@ -1040,6 +1081,9 @@ fn discard_enumeration_token(fs, token) {
 // allowed only after the caller consumed or explicitly discarded every child
 // token from the previous pass. No namespace-snapshot guarantee is implied.
 fn restart_bounded_enumeration(fs) {
+    if _mount_admission_cleanup_poisoned {
+        return _cleanup_error("strict enumeration restart is disabled after ambiguous cleanup");
+    }
     if fs == nil or not is_map(fs) or (try fs.closed catch true) {
         return _error("directory root is closed");
     }
@@ -1067,7 +1111,12 @@ fn restart_bounded_enumeration(fs) {
         return _error("strict enumeration restart limit reached");
     }
     let identity = _fd_identity(fs, fs.root_fd);
-    if not identity.ok { return identity; }
+    if not identity.ok {
+        if try identity.cleanup_failed catch false {
+            return _cleanup_error("strict enumeration restart identity cleanup failed");
+        }
+        return identity;
+    }
     if not _pair_equal(identity.mount_id, context.root_identity.mount_id)
        or not _pair_equal(identity.inode, context.root_identity.inode) {
         return map{ ok: false, error: "scan root identity changed between observations",
@@ -1156,8 +1205,11 @@ fn abort_bounded_enumeration(fs) {
 // failure is a different security state: the public handle must be invalidated
 // so the caller cannot retry against potentially live native resources.
 fn _abort_result(fs, result) {
+    let incoming_cleanup_failed = try result.cleanup_failed catch false;
     let cleaned = try abort_bounded_enumeration(fs) catch false;
-    if not cleaned { return _cleanup_error("strict enumeration cleanup failed"); }
+    if not cleaned or incoming_cleanup_failed or _mount_admission_cleanup_poisoned {
+        return _cleanup_error("strict enumeration cleanup failed or remained ambiguous");
+    }
     return result;
 }
 
@@ -1173,16 +1225,23 @@ fn open(root, create = true, protect_root = false) {
     if libc == nil { return _error("trusted libc cannot be loaded"); }
     let holder = map{ libc: libc, libc_path: host.libc };
     if not _cleanup_authority_available(holder) {
-        ffi_close(libc);
+        let library_closed = _close_library(libc);
+        let poisoned = _mount_admission_cleanup_poisoned;
+        let code = "native-cleanup-authority-unavailable";
+        if poisoned { code = "scan-mount-cleanup-poisoned"; }
         return map{ ok: false, error: "native cleanup authority is unavailable",
-            error_code: "native-cleanup-authority-unavailable" };
+            error_code: code, cleanup_failed: poisoned,
+            process_admission_poisoned: poisoned,
+            primary_library_closed: library_closed };
     }
     // Hold the current directory first, then resolve every caller-controlled
     // component relative to a held descriptor. O_NOFOLLOW on one multi-part
     // open protects only its final component and would leave intermediate
     // symlinks vulnerable to a check/use race.
     let current = _openat(holder, AT_FDCWD, ".", O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
-    if current < 0 { ffi_close(libc); return _error("current directory cannot be opened"); }
+    if current < 0 {
+        return _error_after_library_close(libc, "current directory cannot be opened");
+    }
     let i = 0;
     while i < len(parts) {
         let next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
@@ -1192,15 +1251,24 @@ fn open(root, create = true, protect_root = false) {
             // descriptor open still rejects links and non-directories.
             next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
         }
-        _close_fd(holder, current);
-        if next < 0 { ffi_close(libc); return _error("root component is missing, not a directory, or a symbolic link"); }
+        let previous_closed = _close_fd(holder, current); current = -1;
+        if not previous_closed {
+            if next >= 0 { _close_fd(holder, next); }
+            return _error_after_library_close(libc,
+                "root component cleanup failed");
+        }
+        if next < 0 {
+            return _error_after_library_close(libc,
+                "root component is missing, not a directory, or a symbolic link");
+        }
         current = next; i = i + 1;
     }
     if protect_root and len(parts) > 0 {
         if not _mode_verified(holder, current, "700")
            or not _owner_verified(holder, current).ok {
-            _close_fd(holder, current); ffi_close(libc);
-            return _error("relative root must already be current-user-owned mode 0700");
+            _close_fd(holder, current); current = -1;
+            return _error_after_library_close(libc,
+                "relative root must already be current-user-owned mode 0700");
         }
     }
     return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: current,
@@ -1219,12 +1287,19 @@ fn open_absolute(root, create = true, protect_root = true) {
     if libc == nil { return _error("trusted libc cannot be loaded"); }
     let holder = map{ libc: libc, libc_path: host.libc };
     if not _cleanup_authority_available(holder) {
-        ffi_close(libc);
+        let library_closed = _close_library(libc);
+        let poisoned = _mount_admission_cleanup_poisoned;
+        let code = "native-cleanup-authority-unavailable";
+        if poisoned { code = "scan-mount-cleanup-poisoned"; }
         return map{ ok: false, error: "native cleanup authority is unavailable",
-            error_code: "native-cleanup-authority-unavailable" };
+            error_code: code, cleanup_failed: poisoned,
+            process_admission_poisoned: poisoned,
+            primary_library_closed: library_closed };
     }
     let current = _openat(holder, AT_FDCWD, "/", O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
-    if current < 0 { ffi_close(libc); return _error("filesystem root cannot be opened"); }
+    if current < 0 {
+        return _error_after_library_close(libc, "filesystem root cannot be opened");
+    }
     let i = 0;
     while i < len(parts) {
         let next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
@@ -1232,15 +1307,24 @@ fn open_absolute(root, create = true, protect_root = true) {
             _mkdirat(holder, current, parts[i], MODE_DIR);
             next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
         }
-        _close_fd(holder, current);
-        if next < 0 { ffi_close(libc); return _error("absolute path component is missing, not a directory, or a symbolic link"); }
+        let previous_closed = _close_fd(holder, current); current = -1;
+        if not previous_closed {
+            if next >= 0 { _close_fd(holder, next); }
+            return _error_after_library_close(libc,
+                "absolute path component cleanup failed");
+        }
+        if next < 0 {
+            return _error_after_library_close(libc,
+                "absolute path component is missing, not a directory, or a symbolic link");
+        }
         current = next; i = i + 1;
     }
     if protect_root {
         if not _mode_verified(holder, current, "700")
            or not _owner_verified(holder, current).ok {
-            _close_fd(holder, current); ffi_close(libc);
-            return _error("application root must already be current-user-owned mode 0700");
+            _close_fd(holder, current); current = -1;
+            return _error_after_library_close(libc,
+                "application root must already be current-user-owned mode 0700");
         }
     }
     return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: current,
@@ -1259,7 +1343,9 @@ fn open_current_process_net() {
     if libc == nil { return _error("trusted libc cannot be loaded"); }
     let holder = map{ libc: libc, libc_path: host.libc };
     let pid = _i32(_call(holder, "getpid", "->i32", []));
-    ffi_close(libc);
+    if not _close_library(libc) {
+        return _cleanup_error("current-process libc cleanup failed");
+    }
     if pid <= 0 { return _error("current process identity is unavailable"); }
     let result = open_absolute("/proc/" + str(pid) + "/net", false, false);
     if result.ok { result.procfs_current_process = true; result.pid_exposed = false; }
@@ -1269,7 +1355,9 @@ fn open_current_process_net() {
 fn close(fs) {
     if fs == nil or not is_map(fs) or (try fs.closed catch true) { return false; }
     let closed = true;
-    if not abort_bounded_enumeration(fs) { closed = false; }
+    if not abort_bounded_enumeration(fs) {
+        _mount_admission_cleanup_poisoned = true; closed = false;
+    }
     let enumeration_context_id = try fs.enumeration_context_id catch nil;
     if type(enumeration_context_id) == "string"
        and map_has(_enumeration_contexts, enumeration_context_id) {
@@ -1293,7 +1381,8 @@ fn close(fs) {
     }
     fs.lock_fds = map{};
     if not _close_fd(fs, fs.root_fd) { closed = false; }
-    let library_closed = try { ffi_close(fs.libc); true } catch false;
+    let library_closed = _close_library(fs.libc);
+    if not library_closed { _mount_admission_cleanup_poisoned = true; }
     fs.closed = true; fs.root_fd = -1;
     return closed and library_closed;
 }
@@ -1471,7 +1560,8 @@ fn adopt_inherited_directory(fd, protect_root = true) {
     let holder = map{ libc: libc, libc_path: host.libc };
     let owned = _i32(_call(holder, "dup", "i32->i32", [fd]));
     if owned < 0 {
-        ffi_close(libc); return _error("inherited directory descriptor cannot be duplicated");
+        return _error_after_library_close(libc,
+            "inherited directory descriptor cannot be duplicated");
     }
     let flags = _i32(_call(holder, "fcntl", "i32,i32,i32->i32", [owned, F_GETFD, 0]));
     let cloexec_flags = if flags >= 0 and bit_and(flags, FD_CLOEXEC) == 0 {
@@ -1479,21 +1569,24 @@ fn adopt_inherited_directory(fd, protect_root = true) {
     } else { flags };
     if flags < 0 or _i32(_call(holder, "fcntl", "i32,i32,i32->i32",
         [owned, F_SETFD, cloexec_flags])) != 0 {
-        _close_fd(holder, owned); ffi_close(libc);
-        return _error("adopted directory descriptor cannot be made close-on-exec");
+        _close_fd(holder, owned); owned = -1;
+        return _error_after_library_close(libc,
+            "adopted directory descriptor cannot be made close-on-exec");
     }
     let verified_flags = _i32(_call(holder, "fcntl", "i32,i32,i32->i32", [owned, F_GETFD, 0]));
     let metadata = _descriptor_metadata(holder, owned, ".");
     if verified_flags < 0 or bit_and(verified_flags, FD_CLOEXEC) == 0
        or not metadata.ok or metadata.kind != "directory" {
-        _close_fd(holder, owned); ffi_close(libc);
-        return _error("inherited descriptor is not a verified directory");
+        _close_fd(holder, owned); owned = -1;
+        return _error_after_library_close(libc,
+            "inherited descriptor is not a verified directory");
     }
     if protect_root {
         let protected = _i32(_call(holder, "fchmod", "i32,i32->i32", [owned, MODE_DIR]));
         if protected != 0 or not _mode_verified(holder, owned, "700") {
-            _close_fd(holder, owned); ffi_close(libc);
-            return _error("adopted directory permissions cannot be protected and verified");
+            _close_fd(holder, owned); owned = -1;
+            return _error_after_library_close(libc,
+                "adopted directory permissions cannot be protected and verified");
         }
     }
     return map{
@@ -1928,8 +2021,14 @@ fn _walk_dir(fs, parts, create) {
             _mkdirat(fs, current, parts[i], MODE_DIR);
             next = _openat(fs, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
         }
-        _close_fd(fs, current);
-        if next < 0 { return _error("path component is missing, not a directory, or a symbolic link"); }
+        let previous_closed = _close_fd(fs, current); current = -1;
+        if not previous_closed {
+            if next >= 0 { _close_fd(fs, next); }
+            return _cleanup_error("path-component descriptor cleanup failed");
+        }
+        if next < 0 {
+            return _error("path component is missing, not a directory, or a symbolic link");
+        }
         current = next; i = i + 1;
     }
     return map{ ok: true, fd: current };
@@ -1984,6 +2083,9 @@ fn list(fs, path = "root", max_entries = 512) {
 // by a one-use, root-bound HMAC token and every entry is checked against the
 // held root mount identity before it can become traversable.
 fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
+    if _mount_admission_cleanup_poisoned {
+        return _cleanup_error("strict enumeration is disabled after ambiguous cleanup");
+    }
     if fs == nil or not is_map(fs) or (try fs.closed catch true) {
         return _error("directory root is closed");
     }
@@ -2110,10 +2212,16 @@ fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
                                         operation_state.child_fd = child_fd;
                                         let identity = _fd_identity(fs, child_fd);
                                         let child_closed = _close_fd(fs, child_fd);
-                                        if child_closed { operation_state.child_fd = -1; }
+                                        // A close attempt consumes ownership even when Linux
+                                        // reports an error. Never retry this numeric fd.
+                                        operation_state.child_fd = -1;
                                         let dirent_inode = _u64_le_pair(page, offset);
                                         if not child_closed {
                                             fatal_error = "entry-descriptor-cleanup-failed";
+                                            entry = _entry_error(name, true, fatal_error);
+                                        } elif not identity.ok
+                                           and (try identity.cleanup_failed catch false) {
+                                            fatal_error = "entry-identity-cleanup-failed";
                                             entry = _entry_error(name, true, fatal_error);
                                         } elif not identity.ok {
                                             entry = _entry_error(name, true, "entry-identity-unavailable");
@@ -2182,12 +2290,17 @@ fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
 // low-level implementation. Callers therefore cannot consume the fixed
 // operation registry by repeatedly triggering an unanticipated failure path.
 fn enumerate_bounded(fs, path = "", max_entries = 512, traversal_token = nil) {
+    if _mount_admission_cleanup_poisoned {
+        return _cleanup_error("strict enumeration is disabled after ambiguous cleanup");
+    }
     let attempted = try map{ ok: true,
         value: _enumerate_bounded_owned(fs, path, max_entries, traversal_token) }
         catch map{ ok: false };
     if attempted.ok { return attempted.value; }
     let cleaned = try abort_bounded_enumeration(fs) catch false;
-    if not cleaned { return _cleanup_error("strict enumeration cleanup failed"); }
+    if not cleaned or _mount_admission_cleanup_poisoned {
+        return _cleanup_error("strict enumeration cleanup failed or remained ambiguous");
+    }
     return _error("strict enumeration failed safely");
 }
 
@@ -2914,7 +3027,7 @@ export available, open, open_absolute, open_current_process_net, close, descript
        acquire_lock, release_lock,
        mkdir, mkdir_new, list, enumerate_bounded, discard_enumeration_token,
        restart_bounded_enumeration, admit_scan_mount, recheck_scan_mount,
-       scan_mount_admission_status, exercise_mount_cleanup_failure_for_test,
+       scan_mount_admission_status, exercise_cleanup_poison_for_test,
        inspect_mountinfo_policy, inspect_mountinfo_transition,
        abort_bounded_enumeration,
        read_bytes, read_prefix_bytes, read_range_bytes, read_stream_bytes, file_size, metadata,

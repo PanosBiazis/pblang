@@ -4602,6 +4602,13 @@ Fixes:
 | Regression coverage | **ADDED** | `aap_status_test.sapp` builds a small AAP-like fixture tree and verifies blocked/needs-review/passed aggregation, portfolio inclusion, raw-source redaction, and optional portfolio disablement. |
 | Documentation | **UPDATED** | `docs/Tooling.md` documents the CLI and reusable stdlib module. |
 
+> **Current correction (2026-09-01):** the compatibility CLI and PBIDE
+> Management surface now fail closed as `unavailable`. Their legacy
+> `fs_listdir` collector materializes directory listings before applying the
+> entry ceiling, so it cannot produce trustworthy bounded findings, ranked
+> focus or portfolio ideas. Historical rows below describe the original
+> implementation, not the current admitted scan path.
+
 Verification:
 
 ```sh
