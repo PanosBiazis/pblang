@@ -38,15 +38,32 @@ let FDINFO_MAX_BYTES = 4096; let ENUM_MAX_CALLS = 32768;
 let ENUM_CONTEXT_TTL_MS = 600000;
 let ENUM_MAX_CONTEXTS = 16; let ENUM_MAX_PENDING_TOKENS = 1024;
 let ENUM_MAX_BATCHES = 4096;
+let MOUNTINFO_MAX_BYTES = 1048576;
+let MOUNTINFO_MAX_LINES = 4096;
+let MOUNTINFO_MAX_FIELDS = 64;
+let MOUNTINFO_MAX_LINE_BYTES = 16384;
+let SCAN_LOCAL_FILESYSTEMS = map{
+    ext2: true, ext3: true, ext4: true, xfs: true, btrfs: true,
+    exfat: true, f2fs: true, jfs: true, nilfs2: true, reiserfs: true,
+    ntfs3: true, zfs: true
+};
 let _rename_noreplace_x64_cache = map{ known: false, supported: false };
 let _linkat_empty_x64_cache = map{ known: false, supported: false };
 let _enumeration_contexts = map{};
 let _strict_enum_operations = map{};
+let _mount_admission_cleanup_poisoned = false;
 
 fn _error(message) { return map{ ok: false, error: message }; }
 fn _cleanup_error(message) {
     return map{ ok: false, error: message, cleanup_failed: true,
         invalidate_handle: true };
+}
+fn _mount_cleanup_error(message) {
+    _mount_admission_cleanup_poisoned = true;
+    let result = _cleanup_error(message);
+    result.process_admission_poisoned = true;
+    result.error_code = "scan-mount-cleanup-poisoned";
+    return result;
 }
 fn _first_existing(paths) {
     let i = 0;
@@ -519,6 +536,404 @@ fn _fd_identity(fs, fd) {
         return _error("descriptor identity fields are missing or duplicated");
     }
     return map{ ok: true, mount_id: mount_id, inode: inode };
+}
+
+fn _mount_pair_key(pair) {
+    if not is_array(pair) or len(pair) != 2 { return ""; }
+    return str(pair[0]) + ":" + str(pair[1]);
+}
+
+fn _mountinfo_text_safe(text) {
+    if type(text) != "string" { return false; }
+    let bytes = str_to_bytes(text);
+    if len(bytes) > MOUNTINFO_MAX_BYTES { return false; }
+    let i = 0;
+    while i < len(bytes) {
+        let code = bytes[i];
+        if code == 0 or code == 127 or (code < 32 and code != 10) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Count rows, row bytes and fields directly over the bounded byte string before
+// allocating arrays with str_split. This is an allocation-admission pre-pass,
+// not a hard VM heap guarantee.
+fn _mountinfo_preflight(text) {
+    if not _mountinfo_text_safe(text) { return _error("mount table text is unsafe"); }
+    let bytes = str_to_bytes(text);
+    let lines = 0; let line_bytes = 0; let fields = 1;
+    let previous_space = false; let i = 0;
+    while i < len(bytes) {
+        let value = bytes[i];
+        if value == 10 {
+            if line_bytes == 0 or previous_space {
+                return _error("mount table contains an empty or malformed row");
+            }
+            lines = lines + 1;
+            if lines > MOUNTINFO_MAX_LINES {
+                return _error("mount table exceeds its line ceiling");
+            }
+            line_bytes = 0; fields = 1; previous_space = false;
+        } else {
+            line_bytes = line_bytes + 1;
+            if line_bytes > MOUNTINFO_MAX_LINE_BYTES {
+                return _error("mount table row exceeds its byte ceiling");
+            }
+            if value == 32 {
+                if line_bytes == 1 or previous_space {
+                    return _error("mount table row contains empty fields");
+                }
+                fields = fields + 1; previous_space = true;
+                if fields > MOUNTINFO_MAX_FIELDS {
+                    return _error("mount table row exceeds its field ceiling");
+                }
+            } else { previous_space = false; }
+        }
+        i = i + 1;
+    }
+    if line_bytes > 0 {
+        if previous_space { return _error("mount table final row is malformed"); }
+        lines = lines + 1;
+    }
+    if lines < 1 or lines > MOUNTINFO_MAX_LINES {
+        return _error("mount table has an invalid line count");
+    }
+    return map{ ok: true, line_count: lines };
+}
+
+fn _mountinfo_field_safe(value) {
+    if type(value) != "string" or value == "" or len(str_to_bytes(value)) > 4096 {
+        return false;
+    }
+    let i = 0;
+    while i < len(value) {
+        if str_slice(value, i, i + 1) == "\\" {
+            if i + 4 > len(value) { return false; }
+            let escaped = str_slice(value, i + 1, i + 4);
+            if escaped != "040" and escaped != "011"
+               and escaped != "012" and escaped != "134" { return false; }
+            i = i + 4;
+        } else { i = i + 1; }
+    }
+    return true;
+}
+
+fn _mountinfo_policy(text, target_mount_id) {
+    let preflight = _mountinfo_preflight(text);
+    if not preflight.ok or not is_array(target_mount_id) or len(target_mount_id) != 2 {
+        return _error("mount table input is invalid or exceeds its byte ceiling");
+    }
+    let lines = str_split(text, "\n");
+    if len(lines) < 1 or len(lines) > MOUNTINFO_MAX_LINES + 1 {
+        return _error("mount table exceeds its line ceiling");
+    }
+    let seen = map{}; let match = map{}; let matches = 0; let rows = 0;
+    let i = 0;
+    while i < len(lines) {
+        let line = lines[i];
+        if line == "" {
+            if i != len(lines) - 1 { return _error("mount table contains an empty row"); }
+            i = i + 1; continue;
+        }
+        if len(str_to_bytes(line)) > MOUNTINFO_MAX_LINE_BYTES {
+            return _error("mount table row exceeds its byte ceiling");
+        }
+        let fields = str_split(line, " ");
+        if len(fields) < 10 or len(fields) > MOUNTINFO_MAX_FIELDS {
+            return _error("mount table row has an invalid field count");
+        }
+        let field_i = 0;
+        while field_i < len(fields) {
+            if not _mountinfo_field_safe(fields[field_i]) {
+                return _error("mount table row contains an invalid field");
+            }
+            field_i = field_i + 1;
+        }
+        let separator = -1; let separators = 0; let j = 0;
+        while j < len(fields) {
+            if fields[j] == "-" { separator = j; separators = separators + 1; }
+            j = j + 1;
+        }
+        if separators != 1 or separator < 6 or separator + 4 != len(fields) {
+            return _error("mount table row has an invalid separator layout");
+        }
+        let mount_id = _decimal_u64_pair(fields[0]);
+        let parent_id = _decimal_u64_pair(fields[1]);
+        if mount_id == nil or parent_id == nil
+           or not regex_match(fields[2], "^[0-9]+:[0-9]+$") {
+            return _error("mount table identity is malformed");
+        }
+        let device_parts = str_split(fields[2], ":");
+        if len(device_parts) != 2
+           or _decimal_u64_pair(device_parts[0]) == nil
+           or _decimal_u64_pair(device_parts[1]) == nil {
+            return _error("mount table device identity is malformed");
+        }
+        let key = _mount_pair_key(mount_id);
+        if key == "" or map_has(seen, key) {
+            return _error("mount table contains a duplicate mount identity");
+        }
+        seen[key] = true; rows = rows + 1;
+        let filesystem = fields[separator + 1];
+        if len(filesystem) > 64
+           or not regex_match(filesystem, "^[A-Za-z0-9._-]+$") {
+            return _error("mount table filesystem field is malformed");
+        }
+        if _pair_equal(mount_id, target_mount_id) {
+            matches = matches + 1;
+            match = map{
+                mount_id: mount_id,
+                admitted: map_has(SCAN_LOCAL_FILESYSTEMS, filesystem),
+                fingerprint: sha256(line)
+            };
+        }
+        i = i + 1;
+    }
+    if rows == 0 or matches != 1 {
+        return _error("held root mount identity is missing or ambiguous");
+    }
+    return map{ ok: true, admitted: match.admitted,
+        mount_id: match.mount_id, fingerprint: match.fingerprint,
+        row_count: rows };
+}
+
+fn _mountinfo_cleanup(fs, state) {
+    let ok = true;
+    if (try state.buffer catch 0) != 0 {
+        let freed = _free(fs, state.buffer); state.buffer = 0;
+        if not freed { ok = false; }
+    }
+    if (try state.snapshot_fd catch -1) >= 0 {
+        let closed = _close_fd(fs, state.snapshot_fd); state.snapshot_fd = -1;
+        if not closed { ok = false; }
+    }
+    if (try state.source_fd catch -1) >= 0 {
+        let closed = _close_fd(fs, state.source_fd); state.source_fd = -1;
+        if not closed { ok = false; }
+    }
+    if not ok { _mount_admission_cleanup_poisoned = true; }
+    return ok;
+}
+
+fn _current_mountinfo_owned(fs, state) {
+    let pid = _i32(_call(fs, "getpid", "->i32", []));
+    if pid <= 0 { return _error("current process identity is unavailable"); }
+    let path = "/proc/" + str(pid) + "/mountinfo";
+    if len(path) > 64 or not regex_match(path, "^/proc/[0-9]+/mountinfo$") {
+        return _error("current mount table path is invalid");
+    }
+    state.source_fd = _openat(fs, AT_FDCWD, path,
+        O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
+    if state.source_fd < 0 { return _error("current mount table cannot be opened"); }
+    state.snapshot_fd = _i32(_call(fs, "memfd_create", "string,i32->i32",
+        ["pblang-mountinfo", MFD_CLOEXEC]));
+    if state.snapshot_fd < 0 { return _error("mount table snapshot is unavailable"); }
+    let chunk = 65536;
+    state.buffer = _call(fs, "calloc", "i64,i64->ptr", [1, chunk]);
+    if not _positive_pointer(state.buffer) {
+        state.buffer = 0; return _error("mount table buffer is unavailable");
+    }
+    let ceiling = MOUNTINFO_MAX_BYTES + 1;
+    let copied = 0; let eof = false;
+    while copied < ceiling and not eof {
+        let wanted = ceiling - copied; if wanted > chunk { wanted = chunk; }
+        let count = _call(fs, "read", "i32,ptr,i64->i64",
+            [state.source_fd, state.buffer, wanted]);
+        if count < 0 { return _error("mount table read failed"); }
+        if count == 0 { eof = true; }
+        else {
+            let written = 0;
+            while written < count {
+                let amount = _call(fs, "write", "i32,ptr,i64->i64",
+                    [state.snapshot_fd, state.buffer + written, count - written]);
+                if amount <= 0 { return _error("mount table snapshot write failed"); }
+                written = written + amount;
+            }
+            copied = copied + written;
+        }
+    }
+    if copied > MOUNTINFO_MAX_BYTES {
+        return _error("current mount table exceeds its byte ceiling");
+    }
+    let freed = _free(fs, state.buffer); state.buffer = 0;
+    let source_closed = _close_fd(fs, state.source_fd); state.source_fd = -1;
+    if not freed or not source_closed {
+        return _mount_cleanup_error("mount table read cleanup failed");
+    }
+    if _call(fs, "lseek", "i32,i64,i32->i64", [state.snapshot_fd, 0, 0]) < 0 {
+        return _error("mount table snapshot cannot be rewound");
+    }
+    let bytes = try fs_read_bytes(_fd_path(state.snapshot_fd)) catch nil;
+    let snapshot_closed = _close_fd(fs, state.snapshot_fd); state.snapshot_fd = -1;
+    if not snapshot_closed { return _mount_cleanup_error("mount table snapshot cleanup failed"); }
+    if not is_array(bytes) or len(bytes) != copied {
+        return _error("mount table snapshot cannot be loaded consistently");
+    }
+    let text = try bytes_to_str(bytes) catch nil;
+    if type(text) != "string" { return _error("current mount table is not UTF-8"); }
+    return map{ ok: true, text: text };
+}
+
+fn _current_mountinfo(fs) {
+    let state = map{ source_fd: -1, snapshot_fd: -1, buffer: 0 };
+    let attempted = try map{ ok: true, value: _current_mountinfo_owned(fs, state) }
+        catch map{ ok: false };
+    let cleaned = _mountinfo_cleanup(fs, state);
+    if not cleaned { return _mount_cleanup_error("mount table outer cleanup failed"); }
+    if not attempted.ok { return _error("mount table read failed safely"); }
+    return attempted.value;
+}
+
+// Admit only a held root whose descriptor mount identity maps to an exact,
+// kernel-backed local filesystem row in this process' bounded mount table.
+// The private row fingerprint remains in the enumeration registry.
+fn admit_scan_mount(fs) {
+    if _mount_admission_cleanup_poisoned {
+        return _mount_cleanup_error("scan mount admission is terminally disabled after ambiguous cleanup");
+    }
+    if fs == nil or not is_map(fs) or (try fs.closed catch true) {
+        return _error("directory root is closed");
+    }
+    let context_result = _enumeration_context(fs);
+    if not context_result.ok {
+        if try context_result.cleanup_failed catch false {
+            return _mount_cleanup_error("scan root identity cleanup failed");
+        }
+        return context_result;
+    }
+    let context = context_result.context;
+    if map_has(context, "mount_admission") {
+        return _error("scan mount admission already exists");
+    }
+    let loaded = _current_mountinfo(fs);
+    if not loaded.ok { return loaded; }
+    let policy = _mountinfo_policy(loaded.text, context.root_identity.mount_id);
+    if not policy.ok or not policy.admitted {
+        return map{ ok: false,
+            error: "held root is not on an admitted local kernel filesystem",
+            error_code: "scan-mount-not-admitted",
+            contains_paths: false, contains_mount_identity: false };
+    }
+    context.mount_admission = map{
+        mount_id: policy.mount_id, fingerprint: policy.fingerprint
+    };
+    return map{ ok: true, format: "pblang.linux-dirfs.scan-mount-admission.v1",
+        held_root_vfs_policy_admitted: true, mount_binding_rechecked: false,
+        direct_vfs_type_allowlisted: true,
+        direct_virtual_vfs_type_rejected: true,
+        direct_network_vfs_type_rejected: true,
+        direct_fuse_vfs_type_rejected: true, unknown_vfs_type_rejected: true,
+        backing_storage_locality_verified: false,
+        trusted_mount_namespace_verified: false,
+        procfs_authenticity_verified: false,
+        corroborating_source: false,
+        contains_paths: false, contains_mount_identity: false,
+        contains_filesystem_type: false, authorizes_idea_admission: false };
+}
+
+fn recheck_scan_mount(fs) {
+    if _mount_admission_cleanup_poisoned {
+        return _mount_cleanup_error("scan mount recheck is terminally disabled after ambiguous cleanup");
+    }
+    if fs == nil or not is_map(fs) or (try fs.closed catch true) {
+        return _error("directory root is closed");
+    }
+    let context_id = try fs.enumeration_context_id catch nil;
+    if type(context_id) != "string" or not map_has(_enumeration_contexts, context_id) {
+        return map{ ok: false, error: "scan mount admission context is unavailable",
+            invalidate_handle: true };
+    }
+    let context = _enumeration_contexts[context_id];
+    let admission = try context.mount_admission catch nil;
+    if type(admission) != "map" {
+        return map{ ok: false, error: "scan mount was not admitted from its held descriptor",
+            invalidate_handle: true };
+    }
+    let identity = _fd_identity(fs, fs.root_fd);
+    if not identity.ok and (try identity.cleanup_failed catch false) {
+        return _mount_cleanup_error("scan root identity recheck cleanup failed");
+    }
+    if not identity.ok or not _pair_equal(identity.mount_id, admission.mount_id) {
+        return map{ ok: false, error: "held root mount identity changed",
+            invalidate_handle: true };
+    }
+    let loaded = _current_mountinfo(fs);
+    if not loaded.ok {
+        return map{ ok: false, error: "scan mount table recheck failed",
+            invalidate_handle: true };
+    }
+    let policy = _mountinfo_policy(loaded.text, admission.mount_id);
+    if not policy.ok or not policy.admitted
+       or not constant_time_eq(policy.fingerprint, admission.fingerprint) {
+        return map{ ok: false, error: "scan mount binding changed after observation",
+            invalidate_handle: true };
+    }
+    return map{ ok: true, format: "pblang.linux-dirfs.scan-mount-recheck.v1",
+        held_root_vfs_policy_admitted: true, mount_binding_rechecked: true,
+        direct_vfs_type_allowlisted: true,
+        backing_storage_locality_verified: false,
+        trusted_mount_namespace_verified: false,
+        procfs_authenticity_verified: false,
+        corroborating_source: false, contains_paths: false,
+        contains_mount_identity: false, contains_filesystem_type: false,
+        authorizes_idea_admission: false };
+}
+
+fn scan_mount_admission_status() {
+    return map{
+        ok: not _mount_admission_cleanup_poisoned,
+        ready: not _mount_admission_cleanup_poisoned,
+        process_admission_poisoned: _mount_admission_cleanup_poisoned,
+        error_code: if _mount_admission_cleanup_poisoned
+            { "scan-mount-cleanup-poisoned" } else { "" },
+        authorizes_scan: false
+    };
+}
+
+// Isolated-regression hook. It closes an invalid descriptor (which owns no
+// resource) to exercise the ambiguous-cleanup terminal state. Call only in a
+// disposable test process: the poison is intentionally irreversible.
+fn exercise_mount_cleanup_failure_for_test() {
+    let host = available();
+    if not host.library_ready { return _error("trusted libc is unavailable"); }
+    let libc = try ffi_load(host.libc) catch nil;
+    if libc == nil { return _error("trusted libc cannot be loaded"); }
+    let holder = map{ libc: libc, libc_path: host.libc };
+    let state = map{ source_fd: 2147483647, snapshot_fd: -1, buffer: 0 };
+    let cleaned = _mountinfo_cleanup(holder, state);
+    let library_closed = try { ffi_close(libc); true } catch false;
+    return map{ ok: not cleaned and _mount_admission_cleanup_poisoned
+            and library_closed,
+        cleanup_failed: not cleaned,
+        process_admission_poisoned: _mount_admission_cleanup_poisoned,
+        authorizes_scan: false };
+}
+
+// Fixture-only policy inspection. It never creates or upgrades a scan handle.
+fn inspect_mountinfo_policy(text, target_mount_id_text) {
+    let target = _decimal_u64_pair(target_mount_id_text);
+    let result = if target == nil { _error("invalid target mount identity") }
+        else { _mountinfo_policy(text, target) };
+    return map{ ok: try result.ok catch false,
+        matched_once: try result.ok catch false,
+        local_filesystem_allowlisted: try result.admitted catch false,
+        authorizes_scan: false, contains_paths: false,
+        contains_mount_identity: false, contains_filesystem_type: false };
+}
+
+fn inspect_mountinfo_transition(before, after, target_mount_id_text) {
+    let target = _decimal_u64_pair(target_mount_id_text);
+    let first = if target == nil { _error("invalid target mount identity") }
+        else { _mountinfo_policy(before, target) };
+    let second = if target == nil { _error("invalid target mount identity") }
+        else { _mountinfo_policy(after, target) };
+    let unchanged = first.ok and second.ok and first.admitted and second.admitted
+        and constant_time_eq(first.fingerprint, second.fingerprint);
+    return map{ ok: first.ok and second.ok,
+        binding_unchanged: unchanged, authorizes_scan: false,
+        contains_paths: false, contains_mount_identity: false,
+        contains_filesystem_type: false };
 }
 
 fn _purge_enumeration_contexts() {
@@ -2498,7 +2913,9 @@ export available, open, open_absolute, open_current_process_net, close, descript
        sealed_child_bytes, mutable_snapshot_bytes, close_child_descriptor,
        acquire_lock, release_lock,
        mkdir, mkdir_new, list, enumerate_bounded, discard_enumeration_token,
-       restart_bounded_enumeration,
+       restart_bounded_enumeration, admit_scan_mount, recheck_scan_mount,
+       scan_mount_admission_status, exercise_mount_cleanup_failure_for_test,
+       inspect_mountinfo_policy, inspect_mountinfo_transition,
        abort_bounded_enumeration,
        read_bytes, read_prefix_bytes, read_range_bytes, read_stream_bytes, file_size, metadata,
        protect_file, protect_executable, write_atomic, append_bytes_bounded,

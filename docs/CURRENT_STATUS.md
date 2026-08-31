@@ -3,6 +3,45 @@
 **Last Updated**: 2026-08-31
 **Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
 
+## 2026-08-31 - Held-root VFS policy admission
+
+The experimental Linux strict inventory no longer accepts an arbitrary absolute
+root solely because it opened successfully. It reads the bounded current-process
+mount table through a dedicated tracked-cleanup boundary, matches the split-u64
+mount identity of the already-held root descriptor, and admits only an exact
+direct-VFS allowlist. Byte, line, row and field ceilings are checked before
+allocation-amplifying row/field splits. Virtual, network, FUSE and unknown VFS
+types fail closed; the same private mount row is fingerprinted and rechecked
+after the second observation and before handle closure.
+
+This is deliberately named `held_root_vfs_policy_admitted`, not a locality or
+trust proof. Backing-storage locality, mount-namespace trust and procfs
+authenticity remain explicitly unverified. Public evidence contains no mount
+identity, filesystem type, device path or absolute scan root. Repeated rejection
+regressions verify that failed admissions do not consume later enumerator
+capacity. Any ambiguous native cleanup irreversibly poisons strict mount
+admission for that process; an isolated fault-injection regression proves that
+the next admission is rejected before it acquires a root. One process still
+accepts exactly one explicitly selected, already
+mounted root, and external hard wall/RSS supervision is still required.
+
+One disposable-process validation shard completed under a 20-second external
+kill deadline, a 1 GiB address-space ceiling and a 256-descriptor ceiling. It
+observed one repository root twice: 59 path-free records (32 directories and 27
+files), eight policy skips, no entry errors, no observed namespace change, and
+a successful post-observation mount-binding recheck. The report still correctly
+states `hard_heap_bound=false`, `hard_wall_timeout=false`,
+`snapshot_consistent=false`, `ffi_symbol_contract_verified=false`,
+`production_ready=false` and `idea_admission_eligible=false`; external process
+limits are not upgraded into VM-enforced guarantees.
+
+Hard heap enforcement, hard wall-clock preemption, namespace snapshot
+consistency, VM-enforced typed FFI/raw-bypass closure, hostile-code sandboxing,
+publisher authenticity and physical Windows/macOS verification remain genuine
+production blockers. Consequently `idea_admission_eligible=false` remains
+mandatory: inventory observations cannot directly become training data,
+implementation work, repositories or PBOS external effects.
+
 ## 2026-08-31 - Two-pass namespace observation
 
 The Linux strict inventory can now observe one held, caller-approved root twice.

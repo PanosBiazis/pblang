@@ -28,6 +28,18 @@
 
 ## Unreleased
 
+- Added fail-closed held-root VFS policy admission to the experimental Linux
+  strict inventory. A bounded preflight validates mount-table byte/line/field
+  ceilings before row allocation, the held descriptor's split-u64 mount ID must
+  match exactly one allowlisted direct-VFS row, and a private row fingerprint is
+  rechecked before closure. Virtual, network, FUSE and unknown VFS types are
+  rejected. Public reports expose no mount identity, filesystem type, device
+  path or root and explicitly do not claim backing-storage locality, namespace
+  trust or procfs authenticity. Repeated rejection tests cover cleanup capacity.
+  Ambiguous cleanup irreversibly poisons mount admission for the current
+  process, and an isolated fault-injection child proves that no later root is
+  acquired. Hard heap/wall enforcement, snapshot consistency and idea admission remain
+  false.
 - Added an experimental Linux-only two-pass namespace observation for one held,
   caller-approved root. It rotates opaque traversal-token generations exactly
   once, preserves cumulative enumeration quotas, rejects restart while child
