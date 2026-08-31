@@ -753,6 +753,19 @@ remain separate higher-level responsibilities.
 
 The evaluator fails closed on version/channel/source drift, stale device reports, incomplete or failing suites, missing claimed signing/provenance, unverified install/upgrade/rollback/uninstall paths, and missing policy coverage. It does not read bytes, verify signatures or trusted identities, sign, publish, install, or invent evidence. Its strongest result is therefore `structurally_complete`; `trust_verified` and `production_ready` are always false. A future trusted orchestrator must independently hash real bytes, verify scoped publisher/verifier signatures and enforce expiry/rollback state before authorizing any external effect.
 
+The same module now owns a canonical runtime-security exit gate. Private,
+freshly reconstructed policy lists prevent callers from omitting VM-enforced
+typed FFI, raw-FFI bypass closure, hard preemption, cumulative heap enforcement,
+cross-VM handle isolation, hostile-code sandboxing, publisher authenticity, or
+immutable runtime handoff. Dedicated Windows x86-64 and macOS x86-64/arm64
+runtime-platform rows must bind the exact artifact, runtime-evidence digest,
+policy digest/revision, complete check set, report digest, and bounded capture
+lifetime; generic release-platform rows cannot substitute for them. These remain
+unauthenticated physical claims. Evidence digests detect mutable claim drift,
+but verifier signatures, a trusted clock/replay ledger, real runtime enforcement,
+and genuine physical capture must be checked independently before any release
+decision.
+
 # Canonical UI document
 
 `stdlib/ui_document.sapp` owns the renderer-neutral `pblang.ui-document.v1` contract referenced by PBLang, PBIDE and the form-interchange registry. It bounds widgets and nested property data, requires unique IDs and explicit parent references, and accepts only inert event-handler identifiers. It never embeds or executes source code and grants no renderer, filesystem, network or platform effect. `gui_parse.parse_document()` now upgrades strict PBLang GUI imports into this common validation boundary; Delphi/Qt/Web/Android importers can target the same document in later isolated adapters.
