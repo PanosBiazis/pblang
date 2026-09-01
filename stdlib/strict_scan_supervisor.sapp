@@ -1,0 +1,411 @@
+// Linux-only hard process envelope for one trusted strict metadata scanner.
+// This proves per-process RLIMIT_AS and external wall supervision. It does not
+// claim VM-wide enforcement, hostile-code isolation, immutable imports,
+// publisher authenticity, snapshot consistency, or idea admission.
+
+let PROCESS = import("stdlib:linux_process.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
+
+let FORMAT = "pblang.strict-scan.supervised-envelope.v1";
+let SCANNER_MAX_BYTES = 131072;
+let RUNTIME_MAX_BYTES = 268435456;
+let MEMORY_BYTES = 536870912;
+let WALL_SECONDS = 15;
+let OUTPUT_BYTES = 131072;
+let FILE_BYTES = 1048576;
+let OPEN_FILES = 256;
+let PROCESSES = 2048;
+let _RECOVERIES = map{};
+
+let CHILD_KEYS = [
+    "format", "ok", "record_count", "scanned_dirs", "scanned_entries",
+    "skipped_count", "kinds", "error_codes", "complete", "truncated",
+    "timed_out", "duration_ms", "directory_enumerator_allocation_bounded",
+    "stay_on_device_enforced", "entry_kind_tristate_enforced",
+    "snapshot_consistent", "two_pass_stability_observed",
+    "namespace_change_observed", "observation_inconclusive",
+    "held_root_vfs_policy_admitted", "mount_binding_rechecked",
+    "direct_vfs_type_allowlisted", "direct_virtual_vfs_type_rejected",
+    "direct_network_vfs_type_rejected", "direct_fuse_vfs_type_rejected",
+    "unknown_vfs_type_rejected", "backing_storage_locality_verified",
+    "trusted_mount_namespace_verified", "procfs_authenticity_verified",
+    "corroborating_source", "passes_completed", "hard_wall_timeout",
+    "total_wall_runtime_bounded", "hard_heap_bound",
+    "idea_admission_eligible", "idea_admission_blockers",
+    "one_root_per_process", "shard_root_count", "contains_absolute_paths",
+    "contains_records", "enumerator_closed", "contains_traversal_tokens",
+    "contains_content_tokens", "contains_mount_identity",
+    "contains_filesystem_type", "root_bound", "safe_to_log",
+    "ffi_symbol_contract_verified", "production_ready"
+];
+
+let FFI_SYMBOLS = [
+    "strdup", "free", "openat", "close", "dup", "calloc", "read",
+    "memfd_create", "ftruncate", "lseek", "write", "getdents64", "getpid"
+];
+
+fn _failure(code, evidence = nil) {
+    let address_bound = try evidence.address_bound catch false;
+    let wall_bound = try evidence.wall_bound catch false;
+    let group_terminated = try evidence.group_terminated catch false;
+    let timed_out = try evidence.timed_out catch false;
+    let exit_code = try evidence.exit_code catch -1;
+    return map{
+        format: FORMAT, ok: false, scan_admitted: false, failure_code: code,
+        envelope_hard_address_space_bound: address_bound,
+        envelope_hard_wall_timeout: wall_bound,
+        envelope_wall_seconds: WALL_SECONDS,
+        process_group_terminated: group_terminated, child_timed_out: timed_out,
+        child_exit_code: exit_code,
+        recovery_pending: false, lifecycle_recovered: false,
+        child_stdout_exposed: false, child_stderr_exposed: false,
+        contains_absolute_paths: false, contains_records: false,
+        hard_heap_bound: false, hard_wall_timeout: false,
+        snapshot_consistent: false, ffi_symbol_contract_verified: false,
+        hostile_code_sandbox_verified: false,
+        publisher_authenticity_verified: false,
+        scanner_import_graph_digest_verified: false,
+        trusted_scanner_only: true, caller_policy_trusted_required: true,
+        process_exit_denied: false,
+        production_ready: false, idea_admission_eligible: false,
+        safe_to_log: false
+    };
+}
+
+fn _recovery_handle(id) {
+    return map{ format: "pblang.strict-scan.private-recovery-handle.v1", id: id };
+}
+
+fn _pending_recovery(id, code) {
+    let result = _failure(code);
+    result.recovery_pending = true;
+    result._recovery_handle = _recovery_handle(id);
+    return result;
+}
+
+// A process state and its canonical runtime descriptor remain private and
+// reachable until kernel disappearance and cleanup are both verified. The
+// opaque handle contains no PID or filesystem path and is removed by the CLI.
+fn _retain_or_recover(state, prepared, code) {
+    let recovered = PROCESS.recover(state, 5000);
+    if recovered.ok and recovered.recovered {
+        let closed = PROCESS.close_prepared_verified(prepared);
+        let result = _failure(if closed.ok { code } else { "cleanup-rejected" },
+            map{ group_terminated: true });
+        result.lifecycle_recovered = closed.ok;
+        return result;
+    }
+    let id = sha256(base64_encode_bytes(random_bytes(32)));
+    while map_has(_RECOVERIES, id) {
+        id = sha256(base64_encode_bytes(random_bytes(32)));
+    }
+    _RECOVERIES[id] = map{ state: state, prepared: prepared, failure_code: code };
+    return _pending_recovery(id, code);
+}
+
+fn recover(handle, wait_ms = 5000) {
+    if type(handle) != "map"
+       or (try handle.format catch nil) != "pblang.strict-scan.private-recovery-handle.v1"
+       or type(try handle.id catch nil) != "string"
+       or not regex_match(handle.id, "^[0-9a-f]{64}$")
+       or not map_has(_RECOVERIES, handle.id) {
+        return _failure("invalid-recovery-handle");
+    }
+    let binding = _RECOVERIES[handle.id];
+    let recovered = PROCESS.recover(binding.state, wait_ms);
+    if not recovered.ok or not recovered.recovered {
+        return _pending_recovery(handle.id, binding.failure_code);
+    }
+    let closed = PROCESS.close_prepared_verified(binding.prepared);
+    map_remove(_RECOVERIES, handle.id);
+    let result = _failure(if closed.ok { binding.failure_code } else { "cleanup-rejected" },
+        map{ group_terminated: true });
+    result.lifecycle_recovered = closed.ok;
+    return result;
+}
+
+fn _absolute(value) {
+    return type(value) == "string" and len(value) >= 2 and len(value) <= 4096
+        and str_starts_with(value, "/") and not str_contains(value, strfromcharcode(0));
+}
+
+fn _digest(value) {
+    return type(value) == "string" and regex_match(value, "^[0-9a-f]{64}$");
+}
+
+fn _exact_schema(value, keys) {
+    if type(value) != "map" or len(map_keys(value)) != len(keys) { return false; }
+    for i len(keys) { if not map_has(value, keys[i]) { return false; } }
+    return true;
+}
+
+fn _bool(value, key, expected) {
+    return type(value) == "map" and map_has(value, key)
+        and type(value[key]) == "bool" and value[key] == expected;
+}
+
+fn _integer(value, key, minimum, maximum) {
+    if type(value) != "map" or not map_has(value, key) { return false; }
+    let number = value[key];
+    return type(number) == "number" and number == num_floor(number)
+        and number >= minimum and number <= maximum;
+}
+
+fn _number(value, key, minimum, maximum) {
+    if type(value) != "map" or not map_has(value, key) { return false; }
+    let number = value[key];
+    return type(number) == "number" and number >= minimum and number <= maximum;
+}
+
+fn _valid_error_codes(value) {
+    if type(value) != "map" or len(map_keys(value)) > 64 { return false; }
+    let keys = map_keys(value);
+    for i len(keys) {
+        let key = keys[i]; let count = value[key];
+        if type(key) != "string" or len(key) < 1 or len(key) > 64
+           or not regex_match(key, "^[a-z0-9-]+$")
+           or type(count) != "number" or count != num_floor(count)
+           or count < 0 or count > 1000000 { return false; }
+    }
+    return true;
+}
+
+fn _has_blocker(rows, expected) {
+    if type(rows) != "array" { return false; }
+    for i len(rows) { if rows[i] == expected { return true; } }
+    return false;
+}
+
+fn _valid_child(child) {
+    if not _exact_schema(child, CHILD_KEYS)
+       or child.format != "pblang.project_inventory.path-free-scan-evidence.v1"
+       or not _bool(child, "ok", true)
+       or not _integer(child, "record_count", 1, 1000000)
+       or not _integer(child, "scanned_dirs", 1, 1000000)
+       or not _integer(child, "scanned_entries", 0, 1000000)
+       or not _integer(child, "skipped_count", 0, 1000000)
+       or not _number(child, "duration_ms", 0, WALL_SECONDS * 1000)
+       or not _integer(child, "passes_completed", 2, 2)
+       or not _integer(child, "shard_root_count", 1, 1)
+       or not _exact_schema(child.kinds, ["file", "directory", "symlink", "error"])
+       or not _integer(child.kinds, "file", 0, 1000000)
+       or not _integer(child.kinds, "directory", 0, 1000000)
+       or not _integer(child.kinds, "symlink", 0, 1000000)
+       or not _integer(child.kinds, "error", 0, 1000000)
+       or child.kinds.file + child.kinds.directory + child.kinds.symlink
+            + child.kinds.error != child.record_count
+       or not _valid_error_codes(child.error_codes) {
+        return false;
+    }
+    let true_keys = [
+        "complete", "directory_enumerator_allocation_bounded",
+        "stay_on_device_enforced", "entry_kind_tristate_enforced",
+        "two_pass_stability_observed", "held_root_vfs_policy_admitted",
+        "mount_binding_rechecked", "direct_vfs_type_allowlisted",
+        "direct_virtual_vfs_type_rejected", "direct_network_vfs_type_rejected",
+        "direct_fuse_vfs_type_rejected", "unknown_vfs_type_rejected",
+        "one_root_per_process", "enumerator_closed", "root_bound"
+    ];
+    for i len(true_keys) { if not _bool(child, true_keys[i], true) { return false; } }
+    let false_keys = [
+        "truncated", "timed_out", "snapshot_consistent",
+        "namespace_change_observed", "observation_inconclusive",
+        "backing_storage_locality_verified", "trusted_mount_namespace_verified",
+        "procfs_authenticity_verified", "corroborating_source",
+        "hard_wall_timeout", "total_wall_runtime_bounded", "hard_heap_bound",
+        "idea_admission_eligible", "contains_absolute_paths", "contains_records",
+        "contains_traversal_tokens", "contains_content_tokens",
+        "contains_mount_identity", "contains_filesystem_type", "safe_to_log",
+        "ffi_symbol_contract_verified", "production_ready"
+    ];
+    for i len(false_keys) { if not _bool(child, false_keys[i], false) { return false; } }
+    let blockers = child.idea_admission_blockers;
+    return type(blockers) == "array" and len(blockers) == 3
+        and _has_blocker(blockers, "hard heap enforcement is absent")
+        and _has_blocker(blockers, "hard wall-clock preemption is absent")
+        and _has_blocker(blockers, "namespace snapshot consistency is not verified");
+}
+
+fn _address_bound(result) {
+    let limits = try result.resource_limits catch nil;
+    let address = try limits.address_space catch nil;
+    return type(address) == "map" and _bool(address, "enforced", true)
+        and _bool(address, "verified", true)
+        and _integer(address, "requested", MEMORY_BYTES, MEMORY_BYTES)
+        and type(try address.effective_hard catch nil) == "number"
+        and address.effective_hard > 0 and address.effective_hard <= MEMORY_BYTES;
+}
+
+fn _wall_bound(result) {
+    return _bool(result, "wall_timeout_enforced", true)
+        and _integer(result, "wall_timeout_seconds", WALL_SECONDS, WALL_SECONDS)
+        and _bool(result, "process_group_terminated", true)
+        and not (try result.cleanup_deferred catch false);
+}
+
+fn _command_failure_code(result, timed_out) {
+    if timed_out { return "child-timeout"; }
+    let diagnostic = try result.stderr catch "";
+    if str_contains(diagnostic, "could not find pblang.toml") {
+        return "child-import-root-unavailable";
+    }
+    if str_contains(diagnostic, "content hash mismatch") {
+        return "child-import-digest-rejected";
+    }
+    if str_contains(diagnostic, "FFI") or str_contains(diagnostic, "ffi") {
+        return "child-ffi-policy-rejected";
+    }
+    if str_contains(diagnostic, "parse failed") or str_contains(diagnostic, "parse error") {
+        return "child-source-rejected";
+    }
+    return "child-command-failed";
+}
+
+fn _child_args(root, libc_path) {
+    let args = [
+        "run", "/proc/self/fd/0", "--allow-fs", "--allow-import", "--allow-env",
+        "--allow-ffi", "--deny-exec", "--deny-net", "--deny-http",
+        "--deny-sqlite", "--deny-spawn", "--deny-gfx", "--ffi-lib=" + libc_path
+    ];
+    for i len(FFI_SYMBOLS) { array_push(args, "--ffi-symbol=" + FFI_SYMBOLS[i]); }
+    array_push(args, "--"); array_push(args, root); return args;
+}
+
+fn run(root, policy) {
+    if len(map_keys(_RECOVERIES)) != 0 { return _failure("recovery-pending"); }
+    if platform() != "linux" { return _failure("unsupported-platform"); }
+    if not _absolute(root) or type(policy) != "map"
+       or type(try policy.runtime_candidates catch nil) != "array"
+       or len(policy.runtime_candidates) < 1 or len(policy.runtime_candidates) > 4
+       or not _digest(try policy.runtime_sha256 catch nil)
+       or not _absolute(try policy.scanner_path catch nil)
+       or not _digest(try policy.scanner_sha256 catch nil)
+       or not _absolute(try policy.libc_path catch nil)
+       or not _absolute(try policy.import_root catch nil) {
+        return _failure("invalid-policy");
+    }
+    for i len(policy.runtime_candidates) {
+        if not _absolute(policy.runtime_candidates[i]) { return _failure("invalid-policy"); }
+    }
+    let scanner = SECURE.read_bytes(policy.scanner_path, SCANNER_MAX_BYTES);
+    if not scanner.ok or scanner.size < 1
+       or sha256(base64_encode_bytes(scanner.bytes)) != policy.scanner_sha256
+       or (try bytes_to_str(scanner.bytes) catch nil) == nil {
+        return _failure("scanner-digest-rejected");
+    }
+    let prepared = PROCESS.prepare_fixed_verified(policy.runtime_candidates,
+        policy.runtime_sha256, RUNTIME_MAX_BYTES);
+    if not prepared.ok { return _failure("runtime-digest-rejected"); }
+    let state = PROCESS.start_prepared_verified(prepared,
+        _child_args(root, policy.libc_path), map{
+            timeout_secs: WALL_SECONDS, max_output_bytes: OUTPUT_BYTES,
+            max_file_bytes: FILE_BYTES, max_memory_bytes: MEMORY_BYTES,
+            max_open_files: OPEN_FILES, max_processes: PROCESSES,
+            startup_timeout_ms: 3000, inherit_environment: false,
+            environment: map{ PBLANG_STRICT_IMPORT_ROOT: policy.import_root },
+            stdin_bytes: scanner.bytes
+        });
+    if not state.ok {
+        if (try state.requires_recovery catch false) or not (try state.cleaned catch true) {
+            return _retain_or_recover(state, prepared, "child-start-rejected");
+        }
+        let closed = PROCESS.close_prepared_verified(prepared);
+        return _failure(if closed.ok { "child-start-rejected" } else { "cleanup-rejected" });
+    }
+    let result = PROCESS.finish(state, WALL_SECONDS * 1000 + 3000);
+    if (try result.cleanup_deferred catch false)
+       or not (try result.process_group_terminated catch false)
+       or not (try state.cleaned catch false) {
+        return _retain_or_recover(state, prepared, "child-lifecycle-rejected");
+    }
+    let closed = PROCESS.close_prepared_verified(prepared);
+    let address_bound = _address_bound(result);
+    let wall_bound = _wall_bound(result);
+    let group_terminated = _bool(result, "process_group_terminated", true);
+    let timed_out = try result.timed_out catch false;
+    if not closed.ok {
+        return _failure("cleanup-rejected", map{
+            group_terminated: group_terminated, timed_out: timed_out });
+    }
+    if not address_bound or not wall_bound {
+        return _failure("enforcement-evidence-rejected", map{
+            group_terminated: group_terminated, timed_out: timed_out });
+    }
+    if not result.ok or not result.command_ok {
+        return _failure(_command_failure_code(result, timed_out), map{
+            address_bound: true, wall_bound: true,
+            group_terminated: group_terminated, timed_out: timed_out,
+            exit_code: try result.exit_code catch -1 });
+    }
+    if not (try result.stdout_utf8 catch false) or not (try result.stderr_utf8 catch false)
+       or (try result.output_truncated catch true) or (try result.stderr catch "") != ""
+       or type(try result.stdout catch nil) != "string"
+       or len(str_to_bytes(result.stdout)) > OUTPUT_BYTES {
+        return _failure("child-output-rejected", map{
+            address_bound: true, wall_bound: true,
+            group_terminated: group_terminated });
+    }
+    let raw_child = str_trim(result.stdout);
+    let child = try json_parse(raw_child) catch nil;
+    if child == nil or json_stringify(child) != raw_child or not _valid_child(child) {
+        return _failure("child-evidence-rejected", map{
+            address_bound: true, wall_bound: true,
+            group_terminated: group_terminated });
+    }
+    return map{
+        format: FORMAT, ok: true, scan_admitted: true,
+        record_count: child.record_count, scanned_dirs: child.scanned_dirs,
+        scanned_entries: child.scanned_entries, skipped_count: child.skipped_count,
+        kinds: child.kinds, passes_completed: child.passes_completed,
+        two_pass_stability_observed: true, namespace_change_observed: false,
+        observation_inconclusive: false, enumerator_closed: true,
+        root_bound: true, stay_on_device_enforced: true,
+        entry_kind_tristate_enforced: true, held_root_vfs_policy_admitted: true,
+        mount_binding_rechecked: true,
+        envelope_hard_address_space_bound: true,
+        envelope_hard_wall_timeout: true, envelope_wall_seconds: WALL_SECONDS,
+        process_group_terminated: true, runtime_digest_verified: true,
+        scanner_digest_verified: true, scanner_snapshot_bounded: true,
+        child_stdout_exposed: false, child_stderr_exposed: false,
+        contains_absolute_paths: false, contains_records: false,
+        contains_mount_identity: false, contains_filesystem_type: false,
+        contains_traversal_tokens: false, contains_content_tokens: false,
+        hard_heap_bound: false, hard_wall_timeout: false,
+        snapshot_consistent: false, ffi_symbol_contract_verified: false,
+        hostile_code_sandbox_verified: false,
+        publisher_authenticity_verified: false,
+        scanner_import_graph_digest_verified: false,
+        trusted_scanner_only: true, caller_policy_trusted_required: true,
+        process_exit_denied: false, recovery_pending: false,
+        production_ready: false, idea_admission_eligible: false,
+        idea_admission_blockers: [
+            "VM-wide hard heap enforcement is not proven",
+            "VM-wide hard wall-clock preemption is not proven",
+            "namespace snapshot consistency is not verified",
+            "VM-enforced typed FFI and raw-bypass closure are absent"
+        ],
+        safe_to_log: false
+    };
+}
+
+fn status() {
+    let process = try PROCESS.status() catch map{};
+    let architecture = try process.architecture catch "";
+    let supported = platform() == "linux"
+        and (architecture == "x86_64" or architecture == "amd64")
+        and (try process.operations_attemptable catch false)
+        and (try process.descriptor_open_probe_verified catch false)
+        and (try process.pidfd_probe_verified catch false);
+    return map{ format: "pblang.strict-scan.supervisor.status.v1",
+        linux_x86_64_trusted_scanner_envelope: supported,
+        process_address_space_limit: supported, external_wall_timeout: supported,
+        descriptor_bound_runtime: true, bounded_scanner_snapshot: true,
+        explicit_trusted_import_root: true, descriptor_bound_import_root: false,
+        trusted_scanner_only: true, caller_policy_trusted_required: true,
+        process_exit_denied: false,
+        immutable_import_graph: false, vm_wide_enforcement: false,
+        hostile_code_sandbox: false, publisher_authenticity: false,
+        production_ready: false };
+}
+
+export run, recover, status;
