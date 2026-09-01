@@ -3,6 +3,50 @@
 **Last Updated**: 2026-09-01
 **Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
 
+## 2026-09-01 - Runtime security regression baseline restored
+
+The three failures left by the previous broad semantic run were independently
+reproduced and resolved without weakening their production contracts. The
+distribution identity regression was exercising a stale debug bootstrap that
+still reported `0.6.0-alpha`; rebuilding it from the current manifest restored
+the required exact `0.6.0` identity. No version assertion or manifest check was
+relaxed.
+
+The pidfd regression now sends a non-destructive `CONT` signal through the held
+leader identity before asking the owning process supervisor to cancel the
+entire group. The former test sent `TERM` first and could remove the group
+leader before the supervisor pinned it, correctly forcing an indeterminate
+fail-closed result. The revised assertion additionally requires the exact
+identity to remain live after signalling and still requires verified whole-
+group termination by the supervisor.
+
+The polyglot broker regression now assigns fresh bounded timestamps to its
+independent unsupported-language and revoked-credential cases. Earlier pure-
+PBLang frame and MAC checks can exceed the original ten-second window on this
+host, so reusing the first timestamp tested expiry instead of the intended
+policy branch. Time validation still precedes intent validation and expired
+requests still fail closed. All three focused regressions pass. The subsequent
+broad semantic run completed 895/895 with zero failures, restoring the
+previously incomplete 892/895 repository baseline.
+
+Fresh disposable depth-one metadata shards completed two stable passes for the
+PBLang repository (59 path-free records), AAP root (18), SPSSDT7 root (8) and
+ExtHD root (7). Each process retained the 512 MiB external address-space limit,
+256-descriptor ceiling and 20-second external deadline. These are operational
+guards, not VM-enforced hard heap or preemption guarantees. Every report still
+states `hard_heap_bound=false`, `hard_wall_timeout=false`,
+`snapshot_consistent=false`, `ffi_symbol_contract_verified=false`,
+`production_ready=false` and `idea_admission_eligible=false`.
+
+No content was collected and no observation was converted into an idea,
+training input, repository or external effect. Boot, backup and remediation
+media remained excluded; VTOYEFI was not mounted, Android private application
+data was not accessed and virtual machines were not started. Hard heap and
+wall-clock enforcement, snapshot/ABA consistency, VM-enforced typed FFI and
+raw-bypass closure, hostile-code sandboxing, publisher authenticity, safe
+test-only cleanup fault injection and physical Windows/macOS verification
+remain real blockers.
+
 ## 2026-09-01 - Forgeable blockchain authenticity API quarantined
 
 The legacy `blockchain` compatibility module no longer presents symmetric HMAC
@@ -1348,12 +1392,12 @@ and product suites in pbAI, pbOS, and pb-mcp-server.
 | Native Bitwise Opcodes | `OpBitAnd/Or/Xor/Not/Shl/Shr` in VM for 10-50x speedup |
 | `systems.sapp` Enhanced | OS groundwork: inline asm stubs, port I/O, MMIO, raw pointers, interrupts, page tables, GDT, multiboot, hardware detection |
 
-## ✅ What Works (Production-Ready)
+## ✅ Implemented and validated capabilities (not blanket production readiness)
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Core VM | ✅ Stable | Bytecode, GC, sandboxing, error handling |
-| Package Manager | ✅ Functional | Lockfile, semver, file/hosted registry, HMAC verify |
+| Core VM | ✅ Functional core | Bytecode, GC and error handling; hostile-code isolation, hard heap enforcement and hard preemption remain incomplete |
+| Package Manager | ✅ Functional bootstrap | Lockfile, semver, file/hosted registry and HMAC integrity; publisher authenticity remains incomplete |
 | Stdlib | ✅ 313 top-level `.sapp` files | HTTP, WebSocket, SQLite, crypto, threads, quantum, AI, tensor, graphics, blocks, machine optimization, linker, LLM offload, category benchmarks, platform emulation, cross-language helpers |
 | Threading | ✅ Working | VM-per-thread, channels, select, thread pool |
 | OOP/Types | ✅ Working | class, struct, enum modules with full test coverage |
