@@ -3,6 +3,29 @@
 **Last Updated**: 2026-09-01
 **Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
 
+## 2026-09-01 - Forgeable blockchain authenticity API quarantined
+
+The legacy `blockchain` compatibility module no longer presents symmetric HMAC
+values as public-key signatures. Its former verifier used the caller-visible
+public value as the HMAC secret, so any observer could construct an accepted
+result. Wallet generation, signing, signature verification and signed
+transaction creation now fail closed; hashing, Merkle, proof-of-work and chain
+consistency helpers remain available because they do not claim publisher
+identity.
+
+The new regression constructs the exact public-value HMAC forgery and requires
+rejection. The module reports `algorithm=none`,
+`public_key_signatures_verified=false` and
+`publisher_authenticity_verified=false`. This removes one latent authentication
+bypass but does not implement Ed25519, trusted-key provisioning, release
+attestation or publisher authenticity. Those remain production blockers.
+
+The focused self-hosted checks, lint and forgery regression pass. The broad
+parallel semantic run completed 892/895: the new authenticity regression passed,
+while the unrelated `dist_runtime_resolution_test`, `linux_pidfd_test` and
+`polyglot_broker_protocol_test` failed. Serial reruns did not clear the latter
+two failures, so this slice does not claim a fully green repository baseline.
+
 ## 2026-09-01 - Enumeration-bound file content capabilities
 
 The strict Linux enumerator now issues a separate one-use HMAC content
@@ -1306,7 +1329,7 @@ and product suites in pbAI, pbOS, and pb-mcp-server.
 |---------|-------------|
 | Generic Type Resolution | `TypeEnv` with generic binding/substitution, `is_subtype_of()` variance rules, `TraitDef` + `TraitRegistry` |
 | `machine_learning.sapp` | 10 functions: normalize, train_test_split, accuracy, confusion_matrix, kfold, one_hot, euclidean/manhattan distance |
-| `blockchain.sapp` | 10 functions: sha256d, merkle_root, mine_block, verify_block, create_wallet, sign/verify, transactions |
+| `blockchain.sapp` | Hash, Merkle, proof-of-work and chain-consistency helpers; legacy wallet, sign/verify and transaction-authenticity exports are fail-closed compatibility stubs and unavailable |
 | `networking_advanced.sapp` | 12 functions: ping, dns_lookup, whois, port_scan, ssl_expiry, http_download, url parse/encode/decode |
 | `data_structures.sapp` | 28 functions: Stack, Queue, PriorityQueue, LinkedList, Trie, LRU Cache, DisjointSet (Union-Find) |
 | `image_processing.sapp` | 10 functions: grayscale, ASCII art, bilinear resize, box blur, Sobel edges, threshold, invert, brightness/contrast |
