@@ -15,6 +15,7 @@ let LIBC_PATHS = [
 let RENAME_NOREPLACE = import("stdlib:linux_rename_noreplace.sapp");
 let LINKAT_HELD = import("stdlib:linux_linkat_held.sapp");
 let NATIVE_CRYPTO = import("stdlib:native_crypto_accel.sapp");
+let CLEANUP = import("stdlib:strict_cleanup_transition.sapp");
 
 let AT_FDCWD = -100;
 let AT_REMOVEDIR = 512;
@@ -1197,7 +1198,7 @@ fn restart_bounded_enumeration(fs) {
         contains_paths: false, contains_tokens: false };
 }
 
-fn _begin_bounded_enumeration(fs) {
+fn _begin_bounded_enumeration(fs, operation_name = "enumeration") {
     let current_id = try fs.strict_enum_operation_id catch nil;
     if type(current_id) == "string" and map_has(_strict_enum_operations, current_id) {
         return _error("another strict enumeration operation is active");
@@ -1208,7 +1209,7 @@ fn _begin_bounded_enumeration(fs) {
     let id = str_slice(sha256(base64_encode_bytes(random_bytes(32)) + ":operation:" + str(now_ms())), 0, 48);
     if map_has(_strict_enum_operations, id) { return _error("strict enumeration operation collision"); }
     let state = map{ owner_root_fd: fs.root_fd, dir_fd: -1, snapshot_fd: -1,
-        child_fd: -1, buffer: nil };
+        child_fd: -1, buffer: nil, cleanup: CLEANUP.begin(operation_name) };
     // Associate the owner before publishing the private registry entry. If a
     // frozen/hostile map rejects the write, no orphaned global slot exists.
     let associated = try { fs.strict_enum_operation_id = id; true } catch false;
@@ -1224,6 +1225,52 @@ fn _begin_bounded_enumeration(fs) {
     return map{ ok: true, id: id, state: state };
 }
 
+fn _cleanup_fd_slot(fs, state, field, slot) {
+    let value = try state[field] catch -1;
+    if value < 0 { return true; }
+    let taken = CLEANUP.take_for_cleanup(state.cleanup, slot);
+    state.cleanup = taken.state;
+    if not taken.ok or not taken.invoke_cleanup {
+        // The registry remains private, but a VM/internal invariant failure
+        // must not silently discard the last native identity. Consume it once
+        // through a terminally-poisoned emergency path; no payload may escape.
+        state[field] = -1;
+        _close_fd(fs, value);
+        _mount_admission_cleanup_poisoned = true;
+        return false;
+    }
+    state[field] = -1;
+    let closed = _close_fd(fs, value);
+    state.cleanup = CLEANUP.settle_cleanup(state.cleanup, slot, closed);
+    return closed;
+}
+
+fn _cleanup_buffer_slot(fs, state) {
+    let value = try state.buffer catch nil;
+    if value == nil or value == 0 { return true; }
+    let taken = CLEANUP.take_for_cleanup(state.cleanup, "buffer");
+    state.cleanup = taken.state;
+    if not taken.ok or not taken.invoke_cleanup {
+        state.buffer = nil;
+        _free(fs, value);
+        _mount_admission_cleanup_poisoned = true;
+        return false;
+    }
+    state.buffer = nil;
+    let freed = _free(fs, value);
+    state.cleanup = CLEANUP.settle_cleanup(state.cleanup, "buffer", freed);
+    return freed;
+}
+
+fn _acquire_cleanup_slot(state, slot) {
+    state.cleanup = CLEANUP.acquire(state.cleanup, slot);
+    let resource = try state.cleanup.resources[slot] catch nil;
+    return try state.cleanup.phase == "active"
+        and not state.cleanup.terminal_poison
+        and resource != nil and resource.owned and not resource.pending
+        and resource.attempts == 0 and resource.outcome == "none" catch false;
+}
+
 fn abort_bounded_enumeration(fs) {
     if fs == nil or not is_map(fs) {
         return true;
@@ -1232,17 +1279,18 @@ fn abort_bounded_enumeration(fs) {
     if type(id) != "string" or not map_has(_strict_enum_operations, id) { return true; }
     let state = _strict_enum_operations[id];
     if (try state.owner_root_fd catch -1) != (try fs.root_fd catch -2) { return false; }
+    let ok = true;
+    if not _cleanup_fd_slot(fs, state, "child_fd", "child") { ok = false; }
+    if not _cleanup_fd_slot(fs, state, "snapshot_fd", "snapshot") { ok = false; }
+    if not _cleanup_buffer_slot(fs, state) { ok = false; }
+    if not _cleanup_fd_slot(fs, state, "dir_fd", "directory") { ok = false; }
+    let verdict = CLEANUP.finalize(state.cleanup);
+    state.cleanup = verdict.state;
     map_remove(_strict_enum_operations, id);
     fs.strict_enum_operation_id = "";
-    let ok = true;
-    let child_fd = try state.child_fd catch -1;
-    let snapshot_fd = try state.snapshot_fd catch -1;
-    let dir_fd = try state.dir_fd catch -1;
-    let buffer = try state.buffer catch nil;
-    if child_fd >= 0 and not _close_fd(fs, child_fd) { ok = false; }
-    if snapshot_fd >= 0 and not _close_fd(fs, snapshot_fd) { ok = false; }
-    if buffer != nil and buffer != 0 and not _free(fs, buffer) { ok = false; }
-    if dir_fd >= 0 and not _close_fd(fs, dir_fd) { ok = false; }
+    if not verdict.cleanup_complete or not verdict.payload_releasable {
+        _mount_admission_cleanup_poisoned = true; ok = false;
+    }
     return ok;
 }
 
@@ -2140,7 +2188,7 @@ fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
        or max_entries < 1 or max_entries > ENUM_MAX_ENTRIES {
         return _error("invalid strict enumeration entry limit");
     }
-    let operation = _begin_bounded_enumeration(fs);
+    let operation = _begin_bounded_enumeration(fs, "enumeration");
     if not operation.ok { return operation; }
     let operation_state = operation.state;
     let parts = _strict_components(path);
@@ -2160,6 +2208,10 @@ fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
         return _abort_result(fs, _error("strict enumeration directory cannot be held"));
     }
     operation_state.dir_fd = dir.fd;
+    if not _acquire_cleanup_slot(operation_state, "directory") {
+        return _abort_result(fs,
+            _cleanup_error("strict enumeration directory ownership registration failed"));
+    }
     let identity_outcome = try { map{ ok: true, value: _fd_identity(fs, dir.fd) } }
         catch map{ ok: false };
     if not identity_outcome.ok or not (try identity_outcome.value.ok catch false) {
@@ -2186,12 +2238,20 @@ fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
         return _abort_result(fs, _error("strict enumeration buffer is unavailable"));
     }
     operation_state.buffer = buffer;
+    if not _acquire_cleanup_slot(operation_state, "buffer") {
+        return _abort_result(fs,
+            _cleanup_error("strict enumeration buffer ownership registration failed"));
+    }
     let snapshot = try _i32(_call(fs, "memfd_create", "string,i32->i32",
         ["pblang-getdents-page", MFD_CLOEXEC])) catch -1;
     if snapshot < 0 {
         return _abort_result(fs, _error("strict enumeration page bridge is unavailable"));
     }
     operation_state.snapshot_fd = snapshot;
+    if not _acquire_cleanup_slot(operation_state, "snapshot") {
+        return _abort_result(fs,
+            _cleanup_error("strict enumeration snapshot ownership registration failed"));
+    }
 
     let entries = []; let observed = 0; let batches = 0;
     let eof = false; let truncated = false; let fatal_error = ""; let entry_errors = 0;
@@ -2257,11 +2317,13 @@ fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
                                         entry = _entry_error(name, true, "entry-open-race");
                                     } else {
                                         operation_state.child_fd = child_fd;
+                                        if not _acquire_cleanup_slot(operation_state, "child") {
+                                            return _abort_result(fs,
+                                                _cleanup_error("entry descriptor ownership registration failed"));
+                                        }
                                         let identity = _fd_identity(fs, child_fd);
-                                        let child_closed = _close_fd(fs, child_fd);
-                                        // A close attempt consumes ownership even when Linux
-                                        // reports an error. Never retry this numeric fd.
-                                        operation_state.child_fd = -1;
+                                        let child_closed = _cleanup_fd_slot(fs,
+                                            operation_state, "child_fd", "child");
                                         let dirent_inode = _u64_le_pair(page, offset);
                                         if not child_closed {
                                             fatal_error = "entry-descriptor-cleanup-failed";
@@ -2382,7 +2444,7 @@ fn _read_enumerated_file_owned(fs, token, max_bytes) {
        or max_bytes < 1 or max_bytes > 1048576 {
         return _error("invalid strict content read policy");
     }
-    let operation = _begin_bounded_enumeration(fs);
+    let operation = _begin_bounded_enumeration(fs, "content");
     if not operation.ok { return operation; }
     let state = operation.state;
     let context_id = try fs.enumeration_context_id catch nil;
@@ -2408,6 +2470,10 @@ fn _read_enumerated_file_owned(fs, token, max_bytes) {
             "observed file parent registry publication failed"
         } else { "observed file parent publication and cleanup failed" }));
     }
+    if not _acquire_cleanup_slot(state, "directory") {
+        return _abort_result(fs,
+            _cleanup_error("observed file parent ownership registration failed"));
+    }
     let source = _openat(fs, parent.fd, parent.name,
         O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
     if source >= 0 {
@@ -2418,9 +2484,12 @@ fn _read_enumerated_file_owned(fs, token, max_bytes) {
                 "observed file registry publication failed"
             } else { "observed file publication and cleanup failed" }));
         }
+        if not _acquire_cleanup_slot(state, "child") {
+            return _abort_result(fs,
+                _cleanup_error("observed file ownership registration failed"));
+        }
     }
-    let parent_closed = _close_fd(fs, parent.fd);
-    state.dir_fd = -1;
+    let parent_closed = _cleanup_fd_slot(fs, state, "dir_fd", "directory");
     if not parent_closed {
         return _abort_result(fs, _cleanup_error("observed file parent cleanup failed"));
     }
@@ -2451,6 +2520,10 @@ fn _read_enumerated_file_owned(fs, token, max_bytes) {
         return _abort_result(fs, _cleanup_error(if snapshot_closed {
             "strict content snapshot registry publication failed"
         } else { "strict content snapshot publication and cleanup failed" }));
+    }
+    if not _acquire_cleanup_slot(state, "snapshot") {
+        return _abort_result(fs,
+            _cleanup_error("strict content snapshot ownership registration failed"));
     }
     let ceiling = max_bytes + 1; let copied = 0; let eof = false;
     let failed = false;
@@ -3201,6 +3274,12 @@ fn status(fs) {
                 strict_enumerator_max_entries: ENUM_MAX_ENTRIES,
                 strict_enumerator_stay_on_device: true,
                 strict_enumerator_quad_state: true,
+                cleanup_transition_contract_enforced: true,
+                cleanup_transition_exactly_once_model_verified: true,
+                cleanup_failure_projection_no_bytes_verified: true,
+                native_cleanup_fault_injection_verified: false,
+                post_acquisition_cleanup_failure_runtime_verified: false,
+                terminal_cleanup_poison_runtime_verified: false,
                 strict_enumerator_snapshot_consistent: false,
                 strict_enumerator_hard_heap_enforced: false,
                 strict_enumerator_production_ready: false,

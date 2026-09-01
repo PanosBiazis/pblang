@@ -1,0 +1,150 @@
+let C = import("stdlib:strict_cleanup_transition.sapp");
+
+fn require(value, message) {
+    if not value { throw "FAIL strict cleanup transition: " + message; }
+}
+
+let slots = ["directory", "snapshot", "child", "buffer"];
+for subset 16 {
+    let state = C.begin(if subset % 2 == 0 { "enumeration" } else { "content" });
+    for index 4 {
+        if bit_and(subset, 2 ** index) != 0 { state = C.acquire(state, slots[index]); }
+    }
+    let reverse = 3;
+    while reverse >= 0 {
+        if bit_and(subset, 2 ** reverse) != 0 {
+            let taken = C.take_for_cleanup(state, slots[reverse]);
+            require(taken.ok and taken.invoke_cleanup,
+                "owned resources request exactly one cleanup");
+            state = C.settle_cleanup(taken.state, slots[reverse], true);
+        }
+        reverse = reverse - 1;
+    }
+    let verdict = C.finalize(state);
+    require(verdict.cleanup_complete and verdict.payload_releasable
+        and not verdict.terminal_poison and not verdict.contains_bytes
+        and not verdict.contains_paths and not verdict.contains_tokens,
+        "every clean resource subset finalizes without exposing payload metadata");
+    for slot in slots {
+        require(not verdict.state.resources[slot].owned
+            and not verdict.state.resources[slot].pending
+            and verdict.state.resources[slot].attempts <= 1,
+            "clean final state has no ownership and at most one attempt");
+    }
+}
+
+let original = C.begin("content");
+let detached = C.acquire(original, "directory");
+original.resources.snapshot.owned = true;
+original.resources.snapshot.attempts = 1;
+original.resources.snapshot.outcome = "failed";
+require(detached.resources.directory.owned
+    and not detached.resources.snapshot.owned,
+    "returned state is detached from later caller mutation");
+
+let unknown = C.begin("unknown");
+require(unknown.terminal_poison and unknown.phase == "poisoned"
+    and not unknown.payload_releasable,
+    "unknown operation names fail closed instead of silently coercing");
+
+let sequential = C.begin("enumeration");
+for epoch 3 {
+    sequential = C.acquire(sequential, "child");
+    let sequential_take = C.take_for_cleanup(sequential, "child");
+    require(sequential_take.ok and sequential_take.invoke_cleanup,
+        "each non-overlapping child acquisition receives one cleanup attempt");
+    let sequential_duplicate = C.take_for_cleanup(sequential_take.state, "child");
+    require(not sequential_duplicate.ok and not sequential_duplicate.invoke_cleanup,
+        "each acquisition epoch rejects a duplicate native cleanup request");
+    sequential = C.settle_cleanup(sequential_take.state, "child", true);
+}
+let sequential_verdict = C.finalize(sequential);
+require(sequential_verdict.cleanup_complete
+    and sequential_verdict.state.resources.child.attempts == 1
+    and sequential_verdict.state.resources.child.outcome == "ok",
+    "a settled slot may be re-armed without overlapping ownership");
+
+let first = C.take_for_cleanup(detached, "directory");
+let duplicate_take = C.take_for_cleanup(first.state, "directory");
+require(not duplicate_take.ok and not duplicate_take.invoke_cleanup
+    and duplicate_take.state.terminal_poison,
+    "duplicate cleanup take poisons without requesting a second native call");
+
+let settled = C.settle_cleanup(first.state, "directory", true);
+let duplicate_settle = C.settle_cleanup(settled, "directory", true);
+require(duplicate_settle.terminal_poison,
+    "duplicate cleanup settlement is terminally poisoned");
+
+let settle_without_take = C.settle_cleanup(C.begin("content"), "child", true);
+require(settle_without_take.terminal_poison,
+    "settlement without ownership transfer is terminally poisoned");
+
+let owned_verdict = C.finalize(C.acquire(C.begin("content"), "snapshot"));
+require(owned_verdict.terminal_poison and not owned_verdict.payload_releasable,
+    "finalize refuses an owned resource");
+
+let pending = C.take_for_cleanup(C.acquire(C.begin("content"), "buffer"), "buffer");
+let pending_verdict = C.finalize(pending.state);
+require(pending_verdict.terminal_poison and not pending_verdict.payload_releasable,
+    "finalize refuses a pending cleanup");
+
+let failed = C.settle_cleanup(pending.state, "buffer", false);
+let failed_verdict = C.finalize(failed);
+require(failed_verdict.terminal_poison and not failed_verdict.payload_releasable,
+    "reported cleanup failure remains terminal");
+
+let cascading = C.acquire(C.acquire(C.begin("enumeration"), "child"), "directory");
+let failed_child = C.take_for_cleanup(cascading, "child");
+cascading = C.settle_cleanup(failed_child.state, "child", false);
+let remaining_directory = C.take_for_cleanup(cascading, "directory");
+require(remaining_directory.ok and remaining_directory.invoke_cleanup
+    and remaining_directory.state.terminal_poison,
+    "terminal poison still permits one cleanup attempt for remaining ownership");
+cascading = C.settle_cleanup(remaining_directory.state, "directory", true);
+let cascading_retry = C.take_for_cleanup(cascading, "directory");
+let cascading_verdict = C.finalize(cascading_retry.state);
+require(not cascading_retry.ok and not cascading_retry.invoke_cleanup
+    and cascading_verdict.terminal_poison
+    and cascading_verdict.state.resources.child.attempts == 1
+    and cascading_verdict.state.resources.directory.attempts == 1,
+    "cleanup continues after failure without retrying either native resource");
+
+for failing_index 4 {
+    let remaining_index = num_mod(failing_index + 1, 4);
+    let per_slot = C.acquire(C.acquire(C.begin("enumeration"),
+        slots[failing_index]), slots[remaining_index]);
+    let failing_take = C.take_for_cleanup(per_slot, slots[failing_index]);
+    per_slot = C.settle_cleanup(failing_take.state, slots[failing_index], false);
+    let remaining_take = C.take_for_cleanup(per_slot, slots[remaining_index]);
+    require(remaining_take.ok and remaining_take.invoke_cleanup,
+        "cleanup failure in every slot preserves one attempt for remaining ownership");
+    per_slot = C.settle_cleanup(remaining_take.state, slots[remaining_index], true);
+    require(C.finalize(per_slot).terminal_poison,
+        "every cleanup failure remains terminal after remaining resources settle");
+}
+
+let malformed = C.begin("enumeration"); malformed.extra = true;
+let malformed_take = C.take_for_cleanup(malformed, "directory");
+require(not malformed_take.ok and not malformed_take.invoke_cleanup
+    and malformed_take.state.terminal_poison,
+    "extra or malformed fields fail closed without a cleanup request");
+
+let projection = json_stringify(failed_verdict);
+require(not str_contains(projection, "\"bytes\":")
+    and not str_contains(projection, "\"path\":")
+    and not str_contains(projection, "\"token\":")
+    and not str_contains(projection, "\"fd\":")
+    and not str_contains(projection, "\"pointer\":"),
+    "failure projection never contains native resources or payload");
+
+let status = C.status();
+require(status.cleanup_transition_contract_available
+    and status.cleanup_transition_exactly_once_model_available
+    and status.cleanup_failure_projection_no_bytes
+    and not status.native_cleanup_fault_injection_verified
+    and not status.post_acquisition_cleanup_failure_runtime_verified
+    and not status.terminal_cleanup_poison_runtime_verified
+    and not status.production_ready and not status.idea_admission_eligible,
+    "status separates pure transition proof from missing native fault evidence");
+
+print "strict_cleanup_transition_pass";

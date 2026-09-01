@@ -3,10 +3,48 @@
 **Last Updated**: 2026-09-01
 **Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
 
+## 2026-09-01 - Strict cleanup ownership transitions
+
+Strict Linux enumeration and one-use content reads now attach a pure PBLang
+ownership-transition state to their private operation registry. Directory,
+snapshot, child and native-buffer acquisitions must pass through
+acquire → take-for-cleanup → settle → finalize. Each non-overlapping acquisition
+epoch can request at most one native cleanup call. A failed cleanup irreversibly
+poisons payload release while still permitting one cleanup attempt for every
+other already-owned resource; it never authorizes a retry of the failed slot.
+
+The transition module receives no descriptors, pointers, paths, payload bytes,
+tokens, callbacks, environment controls or fault-injection authority. Its
+regression covers every resource subset, sequential child-slot reuse, duplicate
+take/settle, malformed states, unfinished ownership and cleanup continuation
+after a failed settlement. The Linux enumerator, bounded content reader and
+secure-file status surfaces expose this as a verified transition model only.
+`native_cleanup_fault_injection_verified`,
+`post_acquisition_cleanup_failure_runtime_verified` and
+`terminal_cleanup_poison_runtime_verified` remain false.
+
+The immutable strict-scanner graph now contains seventeen modules, including
+the cleanup-transition contract. The contract, Linux integration, secure-file
+capability, project-inventory and scanner-supervisor focused regressions pass.
+The subsequent complete semantic corpus passed 897/897 with zero failures or
+ignored tests.
+This does not establish VM-enforced typed FFI, hard heap enforcement, hard
+wall-clock preemption, hostile-code sandboxing, publisher authenticity,
+snapshot/ABA consistency or physical Windows/macOS verification.
+
+A separate CLI review found that `--deny-process-exit` is not a currently
+enforced runtime capability, so `process_exit_denied` remains false. It also
+found a P1 test-runner composition issue: combining `--sandbox` with the
+`semantics` or `llm` profile can allow the profile expansion to restore host
+effects after sandbox selection. Fixing that parser/runtime behavior requires
+the retained Rust bootstrap and is therefore outside this PBLang-only slice;
+the finding remains a production blocker rather than a documentation-only
+item.
+
 ## 2026-09-01 - Immutable scanner-scoped import graph
 
 The Linux x86-64 strict metadata supervisor no longer gives its child a mutable
-source import root. It loads one canonical manifest with exactly sixteen
+source import root. It loads one canonical manifest with exactly seventeen
 scanner modules through bounded descriptor-held snapshots, verifies every
 module digest, reconstructs the exact reachable graph, verifies both graph and
 linked-source digests, and supplies only the linked bytes on standard input.
@@ -26,15 +64,15 @@ linked-source digests; changed, missing and unreachable modules; unresolved,
 cyclic and nested dynamic imports; duplicate manifest keys, traversal paths and
 digest-matching symlinks; nontermination, allocation pressure, output flooding,
 trailing JSON and duplicate evidence keys. The committed graph manifest is
-reproduced exactly from the current sixteen-file graph, and the portable lock
-test passes. The subsequent complete semantic corpus passed 896/896 with zero
+reproduced exactly from the current seventeen-file graph, and the portable lock
+test passes. The subsequent complete semantic corpus passed 897/897 with zero
 failures or ignored tests.
 
 After an independent security GO and a final focused 1/1 rerun, new disposable
 processes completed two stable depth-one passes for PBLang (59 path-free
-records), AAP (18), ExtHD (7) and SPSSDT7 (8). One earlier AAP attempt was
+records), AAP (18), ExtHD (7) and SPSSDT7 (8). One earlier SPSSDT7 attempt was
 discarded in full as `child-evidence-rejected`; a new process then completed the
-stable admitted result. Every admitted result verified the sixteen-module
+stable admitted result. Every admitted result verified the seventeen-module
 manifest, reconstructed graph, linked source, runtime, enumerator closure,
 stay-on-device policy, four-state kind handling and final mount binding. No
 result exposed paths, records, tokens, mount identity, filesystem type, child

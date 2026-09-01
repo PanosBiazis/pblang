@@ -1,0 +1,202 @@
+// Pure ownership-transition contract for strict enumeration/content cleanup.
+// This module never receives native handles, pointers, paths, tokens, bytes,
+// callbacks or fault-injection controls. It models exactly-once intent only;
+// native cleanup failure injection and runtime poison proof remain separate.
+
+let FORMAT = "pblang.strict-cleanup-transition.v1";
+let TAKE_FORMAT = "pblang.strict-cleanup-take.v1";
+let VERDICT_FORMAT = "pblang.strict-cleanup-verdict.v1";
+let SLOTS = ["directory", "snapshot", "child", "buffer"];
+
+fn _exact(value, keys) {
+    if type(value) != "map" or len(map_keys(value)) != len(keys) { return false; }
+    for key in keys { if not map_has(value, key) { return false; } }
+    return true;
+}
+
+fn _slot(name) {
+    return type(name) == "string"
+        and (name == "directory" or name == "snapshot"
+            or name == "child" or name == "buffer");
+}
+
+fn _resource_valid(resource) {
+    if not _exact(resource, ["attempts", "outcome", "owned", "pending"])
+       or type(resource.attempts) != "number"
+       or resource.attempts != num_floor(resource.attempts)
+       or resource.attempts < 0 or resource.attempts > 1
+       or type(resource.outcome) != "string"
+       or type(resource.owned) != "bool" or type(resource.pending) != "bool" {
+        return false;
+    }
+    if resource.attempts == 0 {
+        return resource.outcome == "none" and not resource.pending;
+    }
+    if resource.owned { return false; }
+    if resource.pending { return resource.outcome == "none"; }
+    return resource.outcome == "ok" or resource.outcome == "failed"
+        or resource.outcome == "ambiguous";
+}
+
+fn _copy_resource(resource) {
+    return map{ attempts: resource.attempts, outcome: resource.outcome,
+        owned: resource.owned, pending: resource.pending };
+}
+
+fn _state_valid(state) {
+    if not _exact(state, ["format", "operation", "payload_releasable",
+            "phase", "resources", "terminal_poison"])
+       or state.format != FORMAT
+       or (state.operation != "enumeration" and state.operation != "content")
+       or (state.phase != "active" and state.phase != "clean"
+            and state.phase != "poisoned")
+       or type(state.payload_releasable) != "bool"
+       or type(state.terminal_poison) != "bool"
+       or not _exact(state.resources, SLOTS) {
+        return false;
+    }
+    let outstanding = false; let failed = false;
+    for slot in SLOTS {
+        let resource = state.resources[slot];
+        if not _resource_valid(resource) { return false; }
+        if resource.owned or resource.pending { outstanding = true; }
+        if resource.outcome == "failed" or resource.outcome == "ambiguous" {
+            failed = true;
+        }
+    }
+    if state.phase == "active" {
+        return not state.payload_releasable and not state.terminal_poison;
+    }
+    if state.phase == "clean" {
+        return state.payload_releasable and not state.terminal_poison
+            and not outstanding and not failed;
+    }
+    return state.terminal_poison and not state.payload_releasable;
+}
+
+fn _copy_state(state) {
+    let resources = map{};
+    for slot in SLOTS { resources[slot] = _copy_resource(state.resources[slot]); }
+    return map{ format: FORMAT, operation: state.operation,
+        payload_releasable: state.payload_releasable, phase: state.phase,
+        resources: resources, terminal_poison: state.terminal_poison };
+}
+
+fn _fresh(operation) {
+    let resources = map{};
+    for slot in SLOTS {
+        resources[slot] = map{ attempts: 0, outcome: "none",
+            owned: false, pending: false };
+    }
+    return map{ format: FORMAT, operation: operation,
+        payload_releasable: false, phase: "active", resources: resources,
+        terminal_poison: false };
+}
+
+fn begin(operation) {
+    if operation != "enumeration" and operation != "content" {
+        return _poison(_fresh("enumeration"));
+    }
+    return _fresh(operation);
+}
+
+fn _poison(state) {
+    let poisoned = if _state_valid(state) { _copy_state(state) }
+        else { _fresh(if (try state.operation catch "") == "content" {
+            "content"
+        } else { "enumeration" }) };
+    poisoned.phase = "poisoned";
+    poisoned.terminal_poison = true;
+    poisoned.payload_releasable = false;
+    return poisoned;
+}
+
+fn acquire(state, slot) {
+    if not _state_valid(state) or state.phase != "active" or not _slot(slot) {
+        return _poison(state);
+    }
+    let next = _copy_state(state); let resource = next.resources[slot];
+    if resource.owned or resource.pending {
+        return _poison(next);
+    }
+    // One logical slot may represent a sequence of non-overlapping native
+    // acquisitions (for example, each child entry). A proven successful
+    // settlement closes the previous epoch before the slot is re-armed.
+    if resource.attempts == 1 and resource.outcome == "ok" {
+        resource.attempts = 0; resource.outcome = "none";
+    }
+    if resource.attempts != 0 or resource.outcome != "none" {
+        return _poison(next);
+    }
+    resource.owned = true;
+    return next;
+}
+
+fn take_for_cleanup(state, slot) {
+    if not _state_valid(state)
+       or (state.phase != "active" and state.phase != "poisoned")
+       or not _slot(slot) {
+        return map{ format: TAKE_FORMAT, invoke_cleanup: false, ok: false,
+            state: _poison(state) };
+    }
+    let next = _copy_state(state); let resource = next.resources[slot];
+    if not resource.owned or resource.pending or resource.attempts != 0
+       or resource.outcome != "none" {
+        return map{ format: TAKE_FORMAT, invoke_cleanup: false, ok: false,
+            state: _poison(next) };
+    }
+    resource.owned = false; resource.pending = true; resource.attempts = 1;
+    return map{ format: TAKE_FORMAT, invoke_cleanup: true, ok: true,
+        state: next };
+}
+
+fn settle_cleanup(state, slot, ok) {
+    if not _state_valid(state)
+       or (state.phase != "active" and state.phase != "poisoned")
+       or not _slot(slot)
+       or type(ok) != "bool" {
+        return _poison(state);
+    }
+    let next = _copy_state(state); let resource = next.resources[slot];
+    if resource.owned or not resource.pending or resource.attempts != 1
+       or resource.outcome != "none" {
+        return _poison(next);
+    }
+    resource.pending = false;
+    resource.outcome = if ok { "ok" } else { "failed" };
+    if not ok or state.phase == "poisoned" { return _poison(next); }
+    return next;
+}
+
+fn finalize(state) {
+    let current = if _state_valid(state) { _copy_state(state) }
+        else { _poison(state) };
+    let clean = current.phase == "active" and not current.terminal_poison;
+    for slot in SLOTS {
+        let resource = current.resources[slot];
+        if resource.owned or resource.pending
+           or resource.outcome == "failed" or resource.outcome == "ambiguous" {
+            clean = false;
+        }
+    }
+    if clean {
+        current.phase = "clean"; current.payload_releasable = true;
+    } else { current = _poison(current); }
+    return map{ cleanup_complete: clean, contains_bytes: false,
+        contains_paths: false, contains_tokens: false, format: VERDICT_FORMAT,
+        payload_releasable: clean, state: current,
+        terminal_poison: not clean };
+}
+
+fn status() {
+    return map{ format: "pblang.strict-cleanup-transition.status.v1",
+        cleanup_transition_contract_available: true,
+        cleanup_transition_exactly_once_model_available: true,
+        cleanup_failure_projection_no_bytes: true,
+        native_cleanup_fault_injection_verified: false,
+        post_acquisition_cleanup_failure_runtime_verified: false,
+        terminal_cleanup_poison_runtime_verified: false,
+        production_ready: false, idea_admission_eligible: false };
+}
+
+export begin, acquire, take_for_cleanup, settle_cleanup, finalize, status;
