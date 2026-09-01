@@ -731,6 +731,63 @@ fn cancel(state, grace_ms = 500) {
         process_group_id: state.process_group_id };
 }
 
+// Recover ownership after a startup/liveness helper failure without trusting a
+// numeric process-group ID on its own. The held pidfd still pins the original
+// leader generation; helpers are regenerated only inside the already-private
+// process directory. Indeterminate identity remains pending and the caller
+// must retain this state rather than discard it.
+fn recover(state, wait_ms = 5000) {
+    wait_ms = _integer(wait_ms, 5000, 0, 30000, "wait_ms");
+    if state == nil or not is_map(state) {
+        return map{ ok: false, recovered: false, recovery_pending: false,
+            error: "process recovery state is invalid" };
+    }
+    if try state.cleaned catch false {
+        return map{ ok: true, recovered: true, recovery_pending: false,
+            process_group_terminated: true, state_cleaned: true };
+    }
+    if (try state.process_group_id catch 0) > 1 and (try state.pidfd catch nil) != nil {
+        let fs = state.fs; let pgid = state.process_group_id;
+        let probe = _write_executable(fs, "group-probe", NATIVE.build_group_probe(pgid));
+        let term = _write_executable(fs, "group-term", NATIVE.build_group_signal(pgid, "TERM"));
+        let kill = _write_executable(fs, "group-kill", NATIVE.build_group_signal(pgid, "KILL"));
+        let cont = _write_executable(fs, "group-cont", NATIVE.build_group_signal(pgid, "CONT"));
+        if not probe.ok or not term.ok or not kill.ok or not cont.ok {
+            state.requires_recovery = true;
+            return map{ ok: false, recovered: false, recovery_pending: true,
+                process_group_terminated: false, state_retained: true,
+                error: "process recovery helpers could not be restored" };
+        }
+    }
+    let waiter = channel(); let deadline = now_ms() + wait_ms;
+    let status = poll(state);
+    if not (try status.terminated catch false) {
+        try request_cancel(state, 100) catch nil;
+        status = poll(state);
+    }
+    while status.ok and not (try status.terminated catch false)
+          and now_ms() < deadline {
+        _sleep(waiter, 5); status = poll(state);
+    }
+    if not (try status.terminated catch false) {
+        state.requires_recovery = true;
+        return map{ ok: false, recovered: false, recovery_pending: true,
+            process_group_terminated: false, state_retained: true,
+            liveness: try status.liveness catch "indeterminate",
+            error: "process group recovery remains indeterminate" };
+    }
+    let terminal = finish(state, 0);
+    let cleaned = try state.cleaned catch false;
+    if not cleaned or not (try terminal.process_group_terminated catch false) {
+        state.requires_recovery = true;
+        return map{ ok: false, recovered: false, recovery_pending: true,
+            process_group_terminated: false, state_retained: true,
+            error: "terminal process recovery cleanup is incomplete" };
+    }
+    return map{ ok: true, recovered: true, recovery_pending: false,
+        process_group_terminated: true, state_cleaned: true };
+}
+
 fn _cancelled_finish_result(state) {
     let signal = try state.cancel_signal catch 15;
     let elapsed = now_ms() - state.started_ms;
@@ -742,6 +799,7 @@ fn _cancelled_finish_result(state) {
         stdout_bytes: [], stderr_bytes: [], stdout_utf8: true, stderr_utf8: true,
         output_truncated: false, returned_output_bytes: 0,
         max_output_bytes: state.max_output_bytes, elapsed_ms: elapsed,
+        wall_timeout_enforced: false, wall_timeout_seconds: state.timeout_secs,
         max_file_bytes: state.max_file_bytes,
         max_memory_bytes: try state.max_memory_bytes catch nil,
         resource_limits: limits,
@@ -848,6 +906,10 @@ fn finish(state, wait_ms = nil) {
             or (try decoded.signal catch 0) == 25,
         returned_output_bytes: stdout.returned_bytes + stderr.returned_bytes,
         max_output_bytes: state.max_output_bytes, elapsed_ms: elapsed,
+        // Every normally completed supervisor result passed through the
+        // generated GNU timeout argv and retained ownership until the complete
+        // process group disappeared. Cancellation-only results publish false.
+        wall_timeout_enforced: true, wall_timeout_seconds: state.timeout_secs,
         max_file_bytes: state.max_file_bytes,
         max_memory_bytes: try state.max_memory_bytes catch nil,
         resource_limits: state.resource_limits,
@@ -1102,7 +1164,8 @@ fn status() {
         ffi_symbol_contract_verified: false,
         operationally_verified: false,
         architecture: machine, argv_exec: true, shell_free: true, bounded_output: true,
-        timeout: true, descriptor_cwd: true, bounded_stdin: true,
+        timeout: true, external_wall_timeout_evidence: true,
+        descriptor_cwd: true, bounded_stdin: true,
         explicit_environment: true,
         address_space_limit: true, descendant_memory_limit: true,
         cpu_time_limit: true, open_file_limit: true, process_count_limit: true,
@@ -1127,4 +1190,4 @@ fn status() {
 
 export start, start_deferred, start_fixed, start_fixed_verified,
        prepare_fixed_verified, start_prepared_verified, close_prepared_verified,
-       poll, request_cancel, cancel, finish, run, run_fixed, status;
+       poll, request_cancel, cancel, recover, finish, run, run_fixed, status;

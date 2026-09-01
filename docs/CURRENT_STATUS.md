@@ -3,6 +3,46 @@
 **Last Updated**: 2026-09-01
 **Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
 
+## 2026-09-01 - Hard-supervised trusted metadata shards
+
+One trusted strict metadata scanner can now run inside a Linux x86-64 process
+envelope with a digest-verified descriptor-bound PBLang runtime, bounded scanner
+source snapshot, clean explicit environment, exact FFI allowlist, verified
+512 MiB address-space ceiling and externally enforced 15-second wall deadline.
+The parent retains the process state and prepared runtime descriptor until the
+whole process group is verified absent. If startup or cleanup liveness becomes
+indeterminate, private recovery regenerates only the already-private helpers,
+retains ownership and prevents another shard from starting until recovery is
+terminal.
+
+Child evidence is accepted only as one exact canonical JSON document with an
+exact schema. Regressions cover wrong runtime digest, nonterminating child,
+allocation pressure independent of timeout, parent survival, output flooding,
+trailing documents, duplicate keys and recovery after removal of the private
+liveness helper. The focused supervisor, lifecycle and bounded-enumerator tests
+pass, and an independent security review approved real metadata-only shards
+within this narrow trusted-scanner scope. The subsequent broad semantic run
+completed 896/896 with zero failures.
+
+Fresh one-root disposable processes completed two stable depth-one passes for
+the PBLang repository (59 path-free records), AAP root (18), ExtHD root (7) and
+SPSSDT7 root (8). Each result verified enumerator closure, stay-on-device,
+four-state file/directory/symlink/error classification, mount-binding recheck,
+the process address-space envelope and external wall supervision. No result
+contained paths, records, traversal/content tokens, mount identity, filesystem
+type, stdout, stderr, PID or raw diagnostics.
+
+This is not a hostile-code sandbox or a VM-wide hard heap/preemption guarantee.
+The scanner and its mutable import root remain trusted caller-supplied TCB,
+`process_exit_denied=false`, and caller-supplied digests prove consistency rather
+than publisher identity. `hard_heap_bound`, `hard_wall_timeout`,
+`snapshot_consistent`, `ffi_symbol_contract_verified`,
+`hostile_code_sandbox_verified`, `publisher_authenticity_verified`,
+`production_ready` and `idea_admission_eligible` therefore remain false. No
+content, idea, training input or repository was produced. BACKUP, Ventoy,
+TESTER, VTOYEFI, Android private data and all six powered-off VMs remained
+excluded.
+
 ## 2026-09-01 - Runtime security regression baseline restored
 
 The three failures left by the previous broad semantic run were independently
