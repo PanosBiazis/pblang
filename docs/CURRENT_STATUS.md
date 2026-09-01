@@ -3,6 +3,48 @@
 **Last Updated**: 2026-09-01
 **Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
 
+## 2026-09-01 - Enumeration-bound file content capabilities
+
+The strict Linux enumerator now issues a separate one-use HMAC content
+capability for each verified regular-file observation. The capability is bound
+to the held root identity, parent observation, relative path, mount, inode and
+enumeration generation. `secure_file.read_bounded_enumerator_file` accepts no
+path, consumes the capability before reopening anything, then requires the
+reopened descriptor to retain the observed mount and inode. It copies at most
+the caller's one-MiB-or-smaller limit plus one sentinel byte into a tracked
+anonymous snapshot and returns no path, identity or token.
+
+The read uses the original `DT_REG` plus same-inode proof and no longer launches
+an external metadata process. Every acquired descriptor is published to the
+private operation registry before the next throwable operation; publication or
+cleanup ambiguity poisons the process and removes bytes from the result. The
+metadata inventory explicitly discards every unused file capability and keeps
+both traversal and content tokens out of its public JSON. Regressions cover
+wrong token type, replay, repeated invalid tokens, cross-handle use, low-level
+root-context substitution, inode replacement and a functional child with
+process execution denied.
+
+This is a capability bridge, not authorization for content scans. Disposable
+fault injections for parent/source/snapshot/library cleanup are still required
+before the strict content reader is admitted into a text-audit process. The
+legacy text audit still uses allocation-unbounded listing, path reopen and
+path/content-derived public reports and therefore remains unavailable.
+
+Fresh disposable depth-one metadata shards for the PBLang repository and AAP
+root each failed closed once on transient `entry-identity-race`, then completed
+two stable observations on a new process. Final PBLang evidence contained 59
+path-free records and final AAP evidence contained 18; both retained
+`hard_heap_bound=false`, `hard_wall_timeout=false`,
+`snapshot_consistent=false`, `ffi_symbol_contract_verified=false`,
+`production_ready=false` and `idea_admission_eligible=false`.
+
+Hard heap enforcement, hard wall-clock preemption, namespace snapshot/ABA
+consistency, VM-enforced typed FFI and raw-bypass closure, hostile-code
+sandboxing, publisher authenticity, allocation-bounded strict text-audit
+integration, cleanup fault-injection coverage and physical Windows/macOS
+verification remain real blockers. No scan observation may become an idea,
+training input, repository or external effect while admission is false.
+
 ## 2026-09-01 - Terminal cleanup poison across strict enumeration
 
 Every failed Linux `close`, `free`, or libc-handle cleanup in `linux_dirfs` now
