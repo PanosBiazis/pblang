@@ -119,7 +119,8 @@ if platform() == "linux" {
     fs_write(under + "/a", "a");
     fs_write(exact + "/a", "a"); fs_write(exact + "/b", "b");
     fs_write(over + "/a", "a"); fs_write(over + "/b", "b"); fs_write(over + "/c", "c");
-    fs_write(tokens + "/file", "f"); fs_write(tokens + "/child/nested", "n");
+    fs_write(tokens + "/file", "f"); fs_write(tokens + "/replace-file", "old");
+    fs_write(tokens + "/child/nested", "n");
     fs_write(tokens + "/root/marker", "r");
     fs_write(tokens + "/Api_Key_Private/hidden", "x");
     fs_write(tokens + "/ACCESS_KEY_Backup/hidden", "x");
@@ -218,8 +219,29 @@ if platform() == "linux" {
     require(top.ok and top.complete and child != nil and child.kind == "directory"
         and child.traversable and len(child.traversal_token) == 64
         and file != nil and file.kind == "file" and not file.traversable
-        and file.traversal_token == "",
+        and file.traversal_token == "" and len(file.content_token) == 64,
         "quad-state entries distinguish traversable directories from files");
+    require(not S.read_bounded_enumerator_file(handle,
+        child.traversal_token, 16).ok,
+        "a directory traversal capability cannot authorize content");
+    require(not S.enumerate_bounded(handle, "child", 8,
+        file.content_token).ok,
+        "a file content capability cannot authorize directory traversal");
+    let file_read = S.read_bounded_enumerator_file(handle, file.content_token, 16);
+    require(file_read.ok and file_read.bytes == str_to_bytes("f")
+        and file_read.token_consumed and not file_read.contains_path
+        and not file_read.contains_identity and not file_read.contains_token,
+        "one-use file capability returns only bounded descriptor-verified bytes");
+    require(not S.read_bounded_enumerator_file(handle, file.content_token, 16).ok,
+        "a consumed file capability cannot be replayed");
+    let invalid_i = 0;
+    while invalid_i < 20 {
+        require(not S.read_bounded_enumerator_file(handle,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            16).ok,
+            "invalid content tokens leave no stale operation registry slots");
+        invalid_i = invalid_i + 1;
+    }
     require(literal_root != nil and literal_root.traversable,
         "a literal top-level directory named root is not confused with the root sentinel");
     let root_page = S.enumerate_bounded(handle, "root", 8, literal_root.traversal_token);
@@ -232,6 +254,36 @@ if platform() == "linux" {
         and not S.enumerate_bounded(other_handle, "child", 8, child.traversal_token).ok,
         "a traversal token cannot cross opaque enumerator handles");
     require(S.close_bounded_enumerator(other_handle), "cross-handle test closes");
+    let cross_source = S.open_bounded_enumerator(tokens, 60000);
+    let cross_target = S.open_bounded_enumerator(tokens, 60000);
+    let cross_source_page = S.enumerate_bounded(cross_source, "", 8);
+    let cross_target_page = S.enumerate_bounded(cross_target, "", 8);
+    let cross_file = entry_named(cross_source_page.entries, "file");
+    require(cross_source_page.ok and cross_target_page.ok and cross_file != nil
+        and not S.read_bounded_enumerator_file(cross_target,
+            cross_file.content_token, 16).ok
+        and S.read_bounded_enumerator_file(cross_source,
+            cross_file.content_token, 16).ok,
+        "a file capability cannot cross opaque enumerator handles");
+    require(S.close_bounded_enumerator(cross_source)
+        and S.close_bounded_enumerator(cross_target),
+        "content cross-handle fixtures close");
+
+    let low_owner = LinuxDirFS.open_absolute(tokens, false, false);
+    let low_substitute = LinuxDirFS.open_absolute(tokens + "/child", false, false);
+    let low_page = LinuxDirFS.enumerate_bounded(low_owner, "", 8);
+    let low_file = entry_named(low_page.entries, "file");
+    require(low_owner.ok and low_substitute.ok and low_page.ok and low_file != nil,
+        "low-level context substitution fixture obtains distinct held roots");
+    low_substitute.enumeration_context_id = low_owner.enumeration_context_id;
+    require(not LinuxDirFS.read_enumerated_file(low_substitute,
+        low_file.content_token, 16).ok,
+        "low-level context identifiers cannot substitute a different held root");
+    low_substitute.enumeration_context_id = "";
+    require(LinuxDirFS.discard_enumeration_token(low_owner,
+        low_file.content_token)
+        and LinuxDirFS.close(low_owner) and LinuxDirFS.close(low_substitute),
+        "low-level context substitution fixture cleans both owners");
     let child_page = S.enumerate_bounded(handle, "child", 8, child.traversal_token);
     require(child_page.ok and child_page.complete and entry_named(child_page.entries, "nested").kind == "file",
         "one-use root-bound token authorizes the expected held child identity");
@@ -242,11 +294,48 @@ if platform() == "linux" {
         "discarded directory capabilities cannot be consumed later");
     require(S.close_bounded_enumerator(handle), "token test handle closes");
 
+    let replacement_handle = S.open_bounded_enumerator(tokens, 60000);
+    let replacement_page = S.enumerate_bounded(replacement_handle, "", 8);
+    let replacement_file = entry_named(replacement_page.entries, "replace-file");
+    require(replacement_page.ok and replacement_file != nil,
+        "replacement fixture obtains a file capability");
+    fs_rename(tokens + "/replace-file", tokens + "/replace-file-old");
+    fs_write(tokens + "/replace-file", "new");
+    require(not S.read_bounded_enumerator_file(replacement_handle,
+        replacement_file.content_token, 16).ok
+        and not S.read_bounded_enumerator_file(replacement_handle,
+            replacement_file.content_token, 16).ok,
+        "inode replacement fails closed and consumes the observation capability");
+    fs_remove(tokens + "/replace-file-old");
+    require(S.close_bounded_enumerator(replacement_handle),
+        "replacement fixture closes");
+
+    let ffi_status = LinuxDirFS.available();
+    require(ffi_status.library_ready,
+        "deny-exec content probe requires the trusted libc boundary");
+    let deny_exec_args = ["run",
+        path_join(cwd(), "tests/fixtures/linux_bounded_content_deny_exec_probe.sapp"),
+        "--allow-ffi", "--deny-exec", "--ffi-lib=" + ffi_status.libc];
+    for symbol in ["strdup", "free", "openat", "close", "dup", "calloc",
+        "read", "memfd_create", "ftruncate", "lseek", "write",
+        "getdents64", "getpid", "sendfile"] {
+        array_push(deny_exec_args, "--ffi-symbol=" + symbol);
+    }
+    array_push(deny_exec_args, "--"); array_push(deny_exec_args, tokens);
+    let deny_exec_probe = proc_spawn_wait(
+        path_join(cwd(), "target/release/pblang"), deny_exec_args);
+    require(deny_exec_probe.exit_code == 0
+        and str_contains(deny_exec_probe.stdout,
+            "linux_bounded_content_deny_exec_pass"),
+        "capability-bound content read works with process execution denied");
+
     let restart_handle = S.open_bounded_enumerator(stability, 60000);
     let before_restart = S.enumerate_bounded(restart_handle, "", 8);
     let old_sub = entry_named(before_restart.entries, "sub");
+    let old_file = entry_named(before_restart.entries, "a");
     require(before_restart.ok and before_restart.complete and old_sub != nil
-        and old_sub.traversable,
+        and old_sub.traversable and old_file != nil
+        and S.discard_bounded_content(restart_handle, old_file.content_token),
         "restart fixture obtains one generation-bound subtree token");
     let old_token = old_sub.traversal_token;
     let pending_restart = S.restart_bounded_enumerator(restart_handle);
@@ -254,8 +343,10 @@ if platform() == "linux" {
         and not (try pending_restart.handle_invalidated catch false),
         "restart rejects a pending traversal token without invalidating its owner");
     let old_subtree = S.enumerate_bounded(restart_handle, "sub", 8, old_token);
+    let old_nested = entry_named(old_subtree.entries, "one");
     require(old_subtree.ok and old_subtree.complete
-        and entry_named(old_subtree.entries, "one") != nil,
+        and old_nested != nil and S.discard_bounded_content(
+            restart_handle, old_nested.content_token),
         "the rejected restart leaves the pending token usable and consumes it once");
     let restarted = S.restart_bounded_enumerator(restart_handle);
     require(restarted.ok and restarted.generation_advanced
@@ -286,8 +377,15 @@ if platform() == "linux" {
         "fresh replacement subtree publishes a traversal capability");
     require(fresh_sub.traversal_token != old_token,
         "fresh subtree receives a different generation-bound token");
-    require(S.enumerate_bounded(restart_handle, "sub", 8,
-        fresh_sub.traversal_token).ok,
+    let fresh_root_file = entry_named(after_restart.entries, "b");
+    require(fresh_root_file != nil and S.discard_bounded_content(
+        restart_handle, fresh_root_file.content_token),
+        "fresh root file capability is explicitly discarded");
+    let fresh_subtree = S.enumerate_bounded(restart_handle, "sub", 8,
+        fresh_sub.traversal_token);
+    let fresh_nested = entry_named(fresh_subtree.entries, "two");
+    require(fresh_subtree.ok and fresh_nested != nil
+        and S.discard_bounded_content(restart_handle, fresh_nested.content_token),
         "fresh generation token traverses the replacement subtree");
     let repeated_restart = S.restart_bounded_enumerator(restart_handle);
     require(not repeated_restart.ok
@@ -306,11 +404,13 @@ if platform() == "linux" {
         and not strict_inventory.hard_heap_bound
         and not strict_inventory.snapshot_consistent
         and len(strict_inventory.roots) == 0 and not strict_inventory.contains_absolute_paths
-        and not strict_inventory.contains_traversal_tokens,
+        and not strict_inventory.contains_traversal_tokens
+        and not strict_inventory.contains_content_tokens,
         "strict inventory consumes typed entries while keeping the approved root private");
     let strict_json = json_stringify(strict_inventory);
     require(not str_contains(strict_json, tokens) and not str_contains(strict_json, "mnt_id")
         and not str_contains(strict_json, "\"traversal_token\":")
+        and not str_contains(strict_json, "\"content_token\":")
         and not str_contains(strict_json, "root_digest")
         and not str_contains(strict_json, "Api_Key_Private")
         and not str_contains(strict_json, "ACCESS_KEY_Backup")
@@ -419,7 +519,8 @@ if platform() == "linux" {
     fs_remove(stability + "/sub/two"); fs_remove(stability + "/sub");
     fs_remove(stability + "/b"); fs_remove(stability);
     fs_remove(tokens + "/Api_Key_Error");
-    fs_remove(tokens + "/file"); fs_remove(tokens);
+    fs_remove(tokens + "/file"); fs_remove(tokens + "/replace-file");
+    fs_remove(tokens);
     fs_remove(over + "/a"); fs_remove(over + "/b"); fs_remove(over + "/c"); fs_remove(over);
     fs_remove(exact + "/a"); fs_remove(exact + "/b"); fs_remove(exact);
     fs_remove(under + "/a"); fs_remove(under); fs_remove(root);

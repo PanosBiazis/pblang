@@ -1005,6 +1005,15 @@ fn _enumeration_token(context, parent_token, path, identity) {
     return hmac_sha256(message, context.secret);
 }
 
+fn _content_token(context, parent_token, path, identity) {
+    let message = _frame_text("pblang.linux-dirfs.content-token.v1")
+        + _frame_text(_identity_text(context.root_identity))
+        + _frame_text(parent_token) + _frame_text(path)
+        + _frame_text(_identity_text(identity)) + _frame_text("file")
+        + _frame_text(context.generation);
+    return hmac_sha256(message, context.secret);
+}
+
 fn _enumeration_context(fs) {
     _purge_enumeration_contexts();
     let existing_id = try fs.enumeration_context_id catch nil;
@@ -1050,7 +1059,8 @@ fn _consume_enumeration_token(context, path, identity, token, root_path) {
         return _error("missing or invalid traversal token");
     }
     let expected = context.pending[token];
-    if expected.path != path or not _pair_equal(expected.identity.mount_id, identity.mount_id)
+    if (try expected.kind catch "") != "directory" or expected.path != path
+       or not _pair_equal(expected.identity.mount_id, identity.mount_id)
        or not _pair_equal(expected.identity.inode, identity.inode) {
         return _error("directory identity changed before traversal");
     }
@@ -1059,6 +1069,25 @@ fn _consume_enumeration_token(context, path, identity, token, root_path) {
     map_remove(context.pending, token);
     context.pending_count = context.pending_count - 1;
     return map{ ok: true, parent_token: token };
+}
+
+fn _consume_content_token(context, token) {
+    if type(token) != "string" or len(token) != 64
+       or not map_has(context.pending, token) {
+        return _error("missing or invalid content token");
+    }
+    let expected = context.pending[token];
+    if (try expected.kind catch "") != "file" {
+        return _error("content token does not authorize a regular file");
+    }
+    let recomputed = _content_token(context, expected.parent_token,
+        expected.path, expected.identity);
+    if not constant_time_eq(token, recomputed) {
+        return _error("content token authentication failed");
+    }
+    map_remove(context.pending, token);
+    context.pending_count = context.pending_count - 1;
+    return map{ ok: true, expected: expected };
 }
 
 fn discard_enumeration_token(fs, token) {
@@ -1215,7 +1244,8 @@ fn _abort_result(fs, result) {
 
 fn _entry_error(name, available, code) {
     return map{ name: name, name_available: available, kind: "error",
-        error_code: code, traversable: false, traversal_token: "" };
+        error_code: code, traversable: false, traversal_token: "",
+        content_token: "" };
 }
 
 fn open(root, create = true, protect_root = false) {
@@ -2230,7 +2260,8 @@ fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
                                         } elif not _pair_equal(identity.inode, dirent_inode) {
                                             entry = _entry_error(name, true, "entry-identity-race");
                                         } else {
-                                            let token = ""; let traversable = false;
+                                            let token = ""; let content_token = "";
+                                            let traversable = false;
                                             if kind == "directory" {
                                                 if context.pending_count >= ENUM_MAX_PENDING_TOKENS {
                                                     entry = _entry_error(name, true, "traversal-token-capacity");
@@ -2245,16 +2276,36 @@ fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
                                                     } else {
                                                         context.pending[token] = map{ path: child_path,
                                                             parent_token: admitted.parent_token,
-                                                            identity: identity };
+                                                            identity: identity, kind: "directory" };
                                                         context.pending_count = context.pending_count + 1;
                                                         traversable = true;
+                                                    }
+                                                }
+                                            } elif kind == "file" {
+                                                if context.pending_count >= ENUM_MAX_PENDING_TOKENS {
+                                                    entry = _entry_error(name, true, "content-token-capacity");
+                                                } else {
+                                                    let child_path = if path == "" { name }
+                                                        else { path + "/" + str(name) };
+                                                    content_token = _content_token(context,
+                                                        admitted.parent_token, child_path, identity);
+                                                    if map_has(context.pending, content_token) {
+                                                        entry = _entry_error(name, true,
+                                                            "content-token-collision");
+                                                    } else {
+                                                        context.pending[content_token] = map{
+                                                            path: child_path,
+                                                            parent_token: admitted.parent_token,
+                                                            identity: identity, kind: "file" };
+                                                        context.pending_count = context.pending_count + 1;
                                                     }
                                                 }
                                             }
                                             if len(map_keys(entry)) == 0 {
                                                 entry = map{ name: name, name_available: true, kind: kind,
                                                     error_code: "", traversable: traversable,
-                                                    traversal_token: token };
+                                                    traversal_token: token,
+                                                    content_token: content_token };
                                             }
                                         }
                                     }
@@ -2282,6 +2333,7 @@ fn _enumerate_bounded_owned(fs, path, max_entries, traversal_token) {
         stay_on_device: true, kind_states: ["file", "directory", "symlink", "error"],
         snapshot_consistent: false, hard_heap_enforced: false,
         traversal_tokens_opaque: true, traversal_tokens_exposed_to_handle_holder: true,
+        content_tokens_opaque: true, content_tokens_exposed_to_handle_holder: true,
         raw_identity_exposed: false, production_ready: false };
     return _abort_result(fs, result);
 }
@@ -2302,6 +2354,129 @@ fn enumerate_bounded(fs, path = "", max_entries = 512, traversal_token = nil) {
         return _cleanup_error("strict enumeration cleanup failed or remained ambiguous");
     }
     return _error("strict enumeration failed safely");
+}
+
+fn _read_enumerated_file_owned(fs, token, max_bytes) {
+    if _mount_admission_cleanup_poisoned {
+        return _cleanup_error("strict content reads are disabled after ambiguous cleanup");
+    }
+    if fs == nil or not is_map(fs) or (try fs.closed catch true)
+       or type(max_bytes) != "number" or max_bytes != num_floor(max_bytes)
+       or max_bytes < 1 or max_bytes > 1048576 {
+        return _error("invalid strict content read policy");
+    }
+    let operation = _begin_bounded_enumeration(fs);
+    if not operation.ok { return operation; }
+    let state = operation.state;
+    let context_id = try fs.enumeration_context_id catch nil;
+    if type(context_id) != "string" or not map_has(_enumeration_contexts, context_id) {
+        return _abort_result(fs, _error("content token context is unavailable"));
+    }
+    let context = _enumeration_contexts[context_id];
+    if (try context.root_fd catch -1) != fs.root_fd {
+        return _abort_result(fs, _error("content token context owner changed"));
+    }
+    let consumed = _consume_content_token(context, token);
+    if not consumed.ok { return _abort_result(fs, consumed); }
+    let expected = consumed.expected;
+
+    let parent = _parent(fs, expected.path, false);
+    if not parent.ok {
+        return _abort_result(fs, _error("observed file parent is unavailable"));
+    }
+    let parent_registered = try { state.dir_fd = parent.fd; true } catch false;
+    if not parent_registered {
+        let parent_closed = _close_fd(fs, parent.fd);
+        return _abort_result(fs, _cleanup_error(if parent_closed {
+            "observed file parent registry publication failed"
+        } else { "observed file parent publication and cleanup failed" }));
+    }
+    let source = _openat(fs, parent.fd, parent.name,
+        O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
+    if source >= 0 {
+        let source_registered = try { state.child_fd = source; true } catch false;
+        if not source_registered {
+            let source_closed = _close_fd(fs, source);
+            return _abort_result(fs, _cleanup_error(if source_closed {
+                "observed file registry publication failed"
+            } else { "observed file publication and cleanup failed" }));
+        }
+    }
+    let parent_closed = _close_fd(fs, parent.fd);
+    state.dir_fd = -1;
+    if not parent_closed {
+        return _abort_result(fs, _cleanup_error("observed file parent cleanup failed"));
+    }
+    if source < 0 {
+        return _abort_result(fs,
+            _error("observed file cannot be reopened without following links"));
+    }
+    let identity = _fd_identity(fs, source);
+    if not identity.ok { return _abort_result(fs, identity); }
+    // The token is issued only after a DT_REG dirent and a held O_PATH inode
+    // agree. Reopening the same mount+inode therefore preserves that regular
+    // file proof without spawning an external metadata utility.
+    if not _pair_equal(identity.mount_id, context.root_identity.mount_id)
+       or not _pair_equal(identity.mount_id, expected.identity.mount_id)
+       or not _pair_equal(identity.inode, expected.identity.inode) {
+        return _abort_result(fs,
+            _error("observed file identity changed before content read"));
+    }
+
+    let snapshot = _i32(_call(fs, "memfd_create", "string,i32->i32",
+        ["pblang-enumerated-file", MFD_CLOEXEC]));
+    if snapshot < 0 {
+        return _abort_result(fs, _error("strict content snapshot is unavailable"));
+    }
+    let snapshot_registered = try { state.snapshot_fd = snapshot; true } catch false;
+    if not snapshot_registered {
+        let snapshot_closed = _close_fd(fs, snapshot);
+        return _abort_result(fs, _cleanup_error(if snapshot_closed {
+            "strict content snapshot registry publication failed"
+        } else { "strict content snapshot publication and cleanup failed" }));
+    }
+    let ceiling = max_bytes + 1; let copied = 0; let eof = false;
+    let failed = false;
+    while copied < ceiling and not eof and not failed {
+        let count = _call(fs, "sendfile", "i32,i32,ptr,i64->i64",
+            [snapshot, source, 0, ceiling - copied]);
+        if count < 0 or count > ceiling - copied { failed = true; }
+        elif count == 0 { eof = true; }
+        else { copied = copied + count; }
+    }
+    if failed or copied > max_bytes {
+        return _abort_result(fs, _error(if failed {
+            "strict content snapshot failed"
+        } else { "observed file exceeds the strict byte limit" }));
+    }
+    if _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 0]) != 0 {
+        return _abort_result(fs, _error("strict content snapshot cannot be rewound"));
+    }
+    let bytes = try fs_read_bytes(_fd_path(snapshot)) catch nil;
+    if not is_array(bytes) or len(bytes) != copied {
+        return _abort_result(fs,
+            _error("strict content snapshot cannot be loaded consistently"));
+    }
+    return _abort_result(fs, map{ ok: true,
+        format: "pblang.linux-dirfs.enumerated-file.v1",
+        bytes: bytes, size: copied, descriptor_bound: true,
+        token_consumed: true, nofollow: true, same_mount: true,
+        same_inode: true, contains_path: false, contains_identity: false,
+        contains_token: false, allocation_bounded_algorithmically: true,
+        hard_heap_enforced: false, snapshot_consistent: false,
+        production_ready: false });
+}
+
+fn read_enumerated_file(fs, token, max_bytes = 1048576) {
+    let attempted = try map{ ok: true,
+        value: _read_enumerated_file_owned(fs, token, max_bytes) }
+        catch map{ ok: false };
+    if attempted.ok { return attempted.value; }
+    let cleaned = try abort_bounded_enumeration(fs) catch false;
+    if not cleaned or _mount_admission_cleanup_poisoned {
+        return _cleanup_error("strict content read cleanup failed or remained ambiguous");
+    }
+    return _error("strict content read failed safely");
 }
 
 fn read_bytes(fs, path, max_bytes = 4194304) {
@@ -3025,7 +3200,8 @@ export available, open, open_absolute, open_current_process_net, close, descript
        duplicate_child_file_descriptor,
        sealed_child_bytes, mutable_snapshot_bytes, close_child_descriptor,
        acquire_lock, release_lock,
-       mkdir, mkdir_new, list, enumerate_bounded, discard_enumeration_token,
+       mkdir, mkdir_new, list, enumerate_bounded, read_enumerated_file,
+       discard_enumeration_token,
        restart_bounded_enumeration, admit_scan_mount, recheck_scan_mount,
        scan_mount_admission_status, exercise_cleanup_poison_for_test,
        inspect_mountinfo_policy, inspect_mountinfo_transition,
