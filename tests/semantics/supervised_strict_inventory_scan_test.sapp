@@ -1,36 +1,104 @@
 let SUP = import("stdlib:strict_scan_supervisor.sapp");
 let SECURE = import("stdlib:secure_file.sapp");
 let PROCESS = import("stdlib:linux_process.sapp");
+let LINK = import("stdlib:source_inliner.sapp");
 
 fn expect(value, message) {
     if not value { throw "FAIL supervised strict inventory: " + message; }
 }
 
-fn measured(path, maximum) {
+fn measured(path, maximum, label) {
     let loaded = SECURE.read_bytes(path, maximum);
-    expect(loaded.ok and loaded.size > 0, "fixture must load through a bounded snapshot");
+    expect(loaded.ok and loaded.size > 0,
+        label + " fixture must load through a bounded snapshot");
     return sha256(base64_encode_bytes(loaded.bytes));
 }
 
-fn policy(runtime, scanner, libc, repository) {
+fn measured_runtime(path, maximum) {
+    let bytes = fs_read_bytes(path);
+    expect(type(bytes) == "array" and len(bytes) > 0 and len(bytes) <= maximum,
+        "runtime test fixture must fit its explicit byte ceiling");
+    return sha256(base64_encode_bytes(bytes));
+}
+
+fn manifest_policy(runtime, manifest_path, libc, repository) {
+    let raw = fs_read(manifest_path); let manifest = json_parse(raw);
     return map{
-        runtime_candidates: [runtime], runtime_sha256: measured(runtime, 67108864),
-        scanner_path: scanner, scanner_sha256: measured(scanner, 131072),
-        libc_path: libc, import_root: repository
+        runtime_candidates: [runtime], runtime_sha256: measured_runtime(runtime, 67108864),
+        graph_manifest_path: manifest_path,
+        graph_manifest_sha256: measured(manifest_path, 16384, "manifest"),
+        scanner_graph_sha256: manifest.input_graph_sha256,
+        linked_scanner_sha256: manifest.linked_source_sha256,
+        libc_path: libc, project_root: repository
     };
+}
+
+fn virtual_path(path) {
+    if str_starts_with(path, "stdlib/") {
+        return "stdlib:" + str_slice(path, 7, len(path));
+    }
+    return path;
+}
+
+fn write_graph_policy(runtime, libc, root, sources) {
+    let entry = "tools/strict_inventory_scan.sapp";
+    fs_mkdirs(root + "/tools"); fs_mkdirs(root + "/stdlib");
+    let modules = map{}; let rows = [];
+    for path in array_sort(map_keys(sources)) {
+        fs_write(root + "/" + path, sources[path]);
+        array_push(rows, map{ path: path,
+            sha256: sha256(base64_encode_bytes(str_to_bytes(sources[path]))) });
+        if path != entry { modules[virtual_path(path)] = sources[path]; }
+    }
+    let linked = try LINK.link_modules(sources[entry], modules, map{
+        entry_path: entry, max_modules: 32, max_module_depth: 32,
+        max_module_source_bytes: 1048576, max_total_source_bytes: 1048576,
+        max_linked_source_bytes: 2097152, max_path_bytes: 1024
+    }) catch map{ ok: false };
+    let graph_digest = if try linked.ok catch false {
+        linked.input_graph_sha256
+    } else { sha256("deliberately-invalid-graph") };
+    let linked_digest = if try linked.ok catch false {
+        sha256(linked.source)
+    } else { sha256("deliberately-invalid-linked-source") };
+    let manifest_path = root + "/graph.json";
+    fs_write(manifest_path, json_stringify(map{
+        format: "pblang.strict-scan.graph-manifest.v1", entry_path: entry,
+        input_graph_sha256: graph_digest, linked_source_sha256: linked_digest,
+        modules: rows
+    }));
+    return manifest_policy(runtime, manifest_path, libc, root);
+}
+
+fn fixture_policy(runtime, libc, root, fixture) {
+    return write_graph_policy(runtime, libc, root, map{
+        "tools/strict_inventory_scan.sapp": fs_read(fixture)
+    });
+}
+
+fn graph_refused(result, message) {
+    expect(not result.ok and not result.scan_admitted
+        and result.failure_code == "scanner-graph-rejected"
+        and not result.envelope_hard_address_space_bound
+        and not result.scanner_import_graph_digest_verified, message);
 }
 
 let repository = cwd();
 let runtime = path_join(repository, "target/release/pblang");
-let scanner = path_join(repository, "tools/strict_inventory_scan.sapp");
+let manifest_path = path_join(repository, "tools/strict_scan_graph_manifest.json");
 let libc = "/usr/lib/x86_64-linux-gnu/libc.so.6";
-expect(fs_exists(runtime) and fs_exists(scanner) and fs_exists(libc),
-    "runtime, scanner and libc fixtures must exist");
-let admitted = SUP.run(repository, policy(runtime, scanner, libc, repository));
+expect(fs_exists(runtime) and fs_exists(manifest_path) and fs_exists(libc),
+    "runtime, graph manifest and libc fixtures must exist");
+let production = manifest_policy(runtime, manifest_path, libc, repository);
+let admitted = SUP.run(repository, production);
 expect(admitted.ok and admitted.scan_admitted and admitted.record_count > 0
     and admitted.envelope_hard_address_space_bound
     and admitted.envelope_hard_wall_timeout and admitted.process_group_terminated
     and admitted.runtime_digest_verified and admitted.scanner_digest_verified
+    and admitted.scanner_manifest_digest_verified
+    and admitted.scanner_import_graph_digest_verified
+    and admitted.scanner_linked_source_digest_verified
+    and admitted.scanner_graph_module_count == 16
     and admitted.enumerator_closed and admitted.root_bound
     and admitted.two_pass_stability_observed and not admitted.namespace_change_observed
     and not admitted.contains_absolute_paths and not admitted.contains_records
@@ -40,31 +108,111 @@ expect(admitted.ok and admitted.scan_admitted and admitted.record_count > 0
     and not admitted.snapshot_consistent and not admitted.ffi_symbol_contract_verified
     and not admitted.hostile_code_sandbox_verified
     and not admitted.publisher_authenticity_verified
-    and not admitted.scanner_import_graph_digest_verified
+    and not admitted.process_exit_denied
     and not admitted.production_ready and not admitted.idea_admission_eligible,
-    "positive shard must separate process-envelope proof from unresolved VM and snapshot gates");
+    "positive shard must admit only the immutable scanner graph and process envelope: "
+        + json_stringify(admitted));
 let public = json_stringify(admitted);
 expect(not str_contains(public, repository) and not str_contains(public, runtime)
-    and not str_contains(public, scanner) and not str_contains(public, libc)
-    and not str_contains(public, "/tmp/") and not str_contains(public, "process_group_id"),
-    "public envelope must not expose roots, runtime paths, library paths or process identity");
+    and not str_contains(public, manifest_path) and not str_contains(public, libc)
+    and not str_contains(public, "/tmp/") and not str_contains(public, "process_group_id")
+    and not str_contains(public, production.linked_scanner_sha256),
+    "public envelope must not expose roots, paths, source, libraries or process identity");
 
-let wrong = policy(runtime, scanner, libc, repository); wrong.runtime_sha256 = sha256("wrong runtime");
+let test_root = "/tmp/pblang-strict-graph-" +
+    str_slice(sha256(base64_encode_bytes(random_bytes(24))), 0, 24);
+try proc_spawn_wait("/bin/rm", ["-rf", "--", test_root]) catch nil;
+let harmless = path_join(repository, "tests/fixtures/strict_scan_trailing_json.sapp");
+let wrong = fixture_policy(runtime, libc, test_root, harmless);
+wrong.runtime_sha256 = sha256("wrong runtime");
 let refused = SUP.run(repository, wrong);
 expect(not refused.ok and not refused.scan_admitted
-    and refused.failure_code == "runtime-digest-rejected"
-    and not refused.envelope_hard_address_space_bound,
+    and refused.failure_code == "runtime-digest-rejected",
     "wrong runtime digest must fail before launch");
 
+let wrong_manifest = manifest_policy(runtime, manifest_path, libc, repository);
+wrong_manifest.graph_manifest_sha256 = sha256("wrong manifest");
+graph_refused(SUP.run(repository, wrong_manifest),
+    "wrong manifest digest must fail before module reads");
+let wrong_graph = manifest_policy(runtime, manifest_path, libc, repository);
+wrong_graph.scanner_graph_sha256 = sha256("wrong graph");
+graph_refused(SUP.run(repository, wrong_graph), "wrong graph digest must fail closed");
+let wrong_linked = manifest_policy(runtime, manifest_path, libc, repository);
+wrong_linked.linked_scanner_sha256 = sha256("wrong linked source");
+graph_refused(SUP.run(repository, wrong_linked), "wrong linked-source digest must fail closed");
+
+let duplicate_key = fixture_policy(runtime, libc, test_root, harmless);
+let canonical_manifest = fs_read(duplicate_key.graph_manifest_path);
+fs_write(duplicate_key.graph_manifest_path, str_replace_all(canonical_manifest,
+    "{\"entry_path\":", "{\"format\":\"duplicate\",\"entry_path\":"));
+duplicate_key.graph_manifest_sha256 = measured(
+    duplicate_key.graph_manifest_path, 16384, "duplicate-key manifest");
+graph_refused(SUP.run(repository, duplicate_key),
+    "duplicate manifest keys must fail canonical admission");
+
+let traversal = fixture_policy(runtime, libc, test_root, harmless);
+let traversal_doc = json_parse(fs_read(traversal.graph_manifest_path));
+traversal_doc.modules[0].path = "tools/../tools/strict_inventory_scan.sapp";
+fs_write(traversal.graph_manifest_path, json_stringify(traversal_doc));
+let traversal_policy = manifest_policy(
+    runtime, traversal.graph_manifest_path, libc, test_root);
+graph_refused(SUP.run(repository, traversal_policy),
+    "traversal module paths must fail before source reads");
+
+let symlinked = fixture_policy(runtime, libc, test_root, harmless);
+let symlink_entry = test_root + "/tools/strict_inventory_scan.sapp";
+fs_write(test_root + "/tools/real-scanner.sapp", fs_read(harmless));
+fs_remove(symlink_entry);
+let link_result = proc_spawn_wait("/bin/ln", ["-s", "real-scanner.sapp", symlink_entry]);
+expect(link_result.exit_code == 0, "symlink attack fixture must be created");
+graph_refused(SUP.run(repository, symlinked),
+    "digest-matching symlink modules must fail at the no-follow boundary");
+fs_remove(symlink_entry);
+
+let drift = fixture_policy(runtime, libc, test_root, harmless);
+fs_write(test_root + "/tools/strict_inventory_scan.sapp", "print \"mutated\";");
+graph_refused(SUP.run(repository, drift), "module digest drift must fail closed");
+
+let missing = fixture_policy(runtime, libc, test_root, harmless);
+fs_remove(test_root + "/tools/strict_inventory_scan.sapp");
+graph_refused(SUP.run(repository, missing), "missing declared module must fail closed");
+
+let extra = write_graph_policy(runtime, libc, test_root, map{
+    "tools/strict_inventory_scan.sapp": "print \"{}\";",
+    "stdlib/unused.sapp": "fn value() { return 1; } export value;"
+});
+graph_refused(SUP.run(repository, extra), "unreachable extra module must fail closed");
+
+let unresolved = write_graph_policy(runtime, libc, test_root, map{
+    "tools/strict_inventory_scan.sapp":
+        "let X = import(\"stdlib:missing.sapp\"); print X.value();"
+});
+graph_refused(SUP.run(repository, unresolved), "unresolved import must fail closed");
+
+let cyclic = write_graph_policy(runtime, libc, test_root, map{
+    "tools/strict_inventory_scan.sapp":
+        "let A = import(\"stdlib:a.sapp\"); print A.value();",
+    "stdlib/a.sapp": "let B = import(\"stdlib:b.sapp\"); fn value(){ return B.value(); } export value;",
+    "stdlib/b.sapp": "let A = import(\"stdlib:a.sapp\"); fn value(){ return A.value(); } export value;"
+});
+graph_refused(SUP.run(repository, cyclic), "import cycle must fail closed");
+
+let dynamic = write_graph_policy(runtime, libc, test_root, map{
+    "tools/strict_inventory_scan.sapp":
+        "fn load(){ let A = import(\"stdlib:a.sapp\"); return A.value(); } print load();",
+    "stdlib/a.sapp": "fn value(){ return 1; } export value;"
+});
+graph_refused(SUP.run(repository, dynamic), "nested dynamic import must fail closed");
+
 let hang = path_join(repository, "tests/fixtures/strict_scan_hang.sapp");
-let hung = SUP.run(repository, policy(runtime, hang, libc, repository));
+let hung = SUP.run(repository, fixture_policy(runtime, libc, test_root, hang));
 expect(not hung.ok and not hung.scan_admitted and hung.failure_code == "child-timeout"
     and hung.child_timed_out and hung.envelope_hard_address_space_bound
     and hung.envelope_hard_wall_timeout and hung.process_group_terminated,
     "nonterminating scanner must be killed by the verified external wall envelope");
 
 let pressure = path_join(repository, "tests/fixtures/strict_scan_memory_pressure.sapp");
-let exhausted = SUP.run(repository, policy(runtime, pressure, libc, repository));
+let exhausted = SUP.run(repository, fixture_policy(runtime, libc, test_root, pressure));
 expect(not exhausted.ok and not exhausted.scan_admitted
     and exhausted.failure_code == "child-command-failed"
     and not exhausted.child_timed_out and exhausted.child_exit_code != 124
@@ -80,36 +228,46 @@ expect(parent_probe.ok and parent_probe.command_ok and parent_probe.stdout == "p
     "memory-pressure child must not compromise the parent process supervisor");
 
 let flood = path_join(repository, "tests/fixtures/strict_scan_output_flood.sapp");
-let flooded = SUP.run(repository, policy(runtime, flood, libc, repository));
+let flooded = SUP.run(repository, fixture_policy(runtime, libc, test_root, flood));
 expect(not flooded.ok and not flooded.scan_admitted
     and flooded.failure_code == "child-output-rejected"
     and flooded.envelope_hard_address_space_bound and flooded.envelope_hard_wall_timeout,
     "oversized scanner output must be discarded rather than parsed");
 
 let trailing = path_join(repository, "tests/fixtures/strict_scan_trailing_json.sapp");
-let malformed = SUP.run(repository, policy(runtime, trailing, libc, repository));
+let malformed = SUP.run(repository, fixture_policy(runtime, libc, test_root, trailing));
 expect(not malformed.ok and not malformed.scan_admitted
     and malformed.failure_code == "child-evidence-rejected"
     and malformed.envelope_hard_address_space_bound and malformed.envelope_hard_wall_timeout,
     "trailing JSON must not become scan evidence");
 
 let duplicate = path_join(repository, "tests/fixtures/strict_scan_duplicate_key.sapp");
-let ambiguous = SUP.run(repository, policy(runtime, duplicate, libc, repository));
+let ambiguous = SUP.run(repository, fixture_policy(runtime, libc, test_root, duplicate));
 expect(not ambiguous.ok and not ambiguous.scan_admitted
     and ambiguous.failure_code == "child-evidence-rejected"
     and ambiguous.envelope_hard_address_space_bound
     and ambiguous.envelope_hard_wall_timeout,
     "duplicate JSON keys must fail the canonical evidence comparison");
 
+try proc_spawn_wait("/bin/rm", ["-rf", "--", test_root]) catch nil;
 let status = SUP.status();
 expect(status.linux_x86_64_trusted_scanner_envelope
     and status.process_address_space_limit and status.external_wall_timeout
     and status.descriptor_bound_runtime and status.bounded_scanner_snapshot
-    and status.explicit_trusted_import_root and not status.descriptor_bound_import_root
+    and not status.scanner_manifest_digest_verified
+    and not status.scanner_import_graph_digest_verified
+    and not status.scanner_linked_source_digest_verified
+    and status.scanner_manifest_digest_verification_supported
+    and status.scanner_import_graph_digest_verification_supported
+    and status.scanner_linked_source_digest_verification_supported
+    and status.runtime_import_denial_supported
+    and status.scanner_scoped_immutable_import_graph_supported
+    and not status.explicit_trusted_import_root
+    and not status.descriptor_bound_import_root
     and status.trusted_scanner_only and status.caller_policy_trusted_required
     and not status.process_exit_denied
-    and not status.immutable_import_graph and not status.vm_wide_enforcement
+    and not status.vm_wide_enforcement
     and not status.hostile_code_sandbox and not status.publisher_authenticity
     and not status.production_ready,
-    "status must preserve every wider blocker");
+    "status must publish the immutable graph while preserving every wider blocker");
 print "supervised_strict_inventory_scan_pass";

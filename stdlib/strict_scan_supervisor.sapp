@@ -1,14 +1,20 @@
 // Linux-only hard process envelope for one trusted strict metadata scanner.
 // This proves per-process RLIMIT_AS and external wall supervision. It does not
-// claim VM-wide enforcement, hostile-code isolation, immutable imports,
-// publisher authenticity, snapshot consistency, or idea admission.
+// claim VM-wide enforcement, hostile-code isolation, general immutable imports,
+// publisher authenticity, snapshot consistency, or idea admission. It verifies
+// only one scanner-scoped, digest-pinned linked source snapshot.
 
 let PROCESS = import("stdlib:linux_process.sapp");
 let SECURE = import("stdlib:secure_file.sapp");
+let LINK = import("stdlib:source_inliner.sapp");
 
 let FORMAT = "pblang.strict-scan.supervised-envelope.v1";
-let SCANNER_MAX_BYTES = 131072;
 let RUNTIME_MAX_BYTES = 268435456;
+let MANIFEST_MAX_BYTES = 16384;
+let GRAPH_MAX_MODULES = 32;
+let GRAPH_MAX_MODULE_BYTES = 1048576;
+let GRAPH_MAX_TOTAL_BYTES = 1048576;
+let GRAPH_MAX_LINKED_BYTES = 2097152;
 let MEMORY_BYTES = 536870912;
 let WALL_SECONDS = 15;
 let OUTPUT_BYTES = 131072;
@@ -64,7 +70,9 @@ fn _failure(code, evidence = nil) {
         snapshot_consistent: false, ffi_symbol_contract_verified: false,
         hostile_code_sandbox_verified: false,
         publisher_authenticity_verified: false,
+        scanner_manifest_digest_verified: false,
         scanner_import_graph_digest_verified: false,
+        scanner_linked_source_digest_verified: false,
         trusted_scanner_only: true, caller_policy_trusted_required: true,
         process_exit_denied: false,
         production_ready: false, idea_admission_eligible: false,
@@ -131,6 +139,103 @@ fn _absolute(value) {
 
 fn _digest(value) {
     return type(value) == "string" and regex_match(value, "^[0-9a-f]{64}$");
+}
+
+fn _relative_module_path(value) {
+    if type(value) != "string" or len(value) < 6 or len(value) > 1024
+       or str_starts_with(value, "/") or str_contains(value, "\\")
+       or str_contains(value, strfromcharcode(0))
+       or not regex_match(value, "^(stdlib|tools)/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*[.]sapp$") {
+        return false;
+    }
+    let parts = str_split(value, "/");
+    for i len(parts) {
+        if parts[i] == "" or parts[i] == "." or parts[i] == ".." { return false; }
+    }
+    return true;
+}
+
+fn _virtual_module_path(path) {
+    if str_starts_with(path, "stdlib/") {
+        return "stdlib:" + str_slice(path, 7, len(path));
+    }
+    return path;
+}
+
+fn _load_linked_graph(policy) {
+    let rejected = map{ ok: false };
+    let loaded = SECURE.read_bytes(policy.graph_manifest_path, MANIFEST_MAX_BYTES);
+    if not loaded.ok or loaded.size < 1
+       or sha256(base64_encode_bytes(loaded.bytes)) != policy.graph_manifest_sha256 {
+        return rejected;
+    }
+    let raw = try str_trim(bytes_to_str(loaded.bytes)) catch nil;
+    let manifest = try json_parse(raw) catch nil;
+    if type(raw) != "string" or type(manifest) != "map"
+       or json_stringify(manifest) != raw
+       or not _exact_schema(manifest, ["entry_path", "format", "input_graph_sha256",
+            "linked_source_sha256", "modules"])
+       or manifest.format != "pblang.strict-scan.graph-manifest.v1"
+       or manifest.entry_path != "tools/strict_inventory_scan.sapp"
+       or not _digest(manifest.input_graph_sha256)
+       or not _digest(manifest.linked_source_sha256)
+       or manifest.input_graph_sha256 != policy.scanner_graph_sha256
+       or manifest.linked_source_sha256 != policy.linked_scanner_sha256
+       or type(manifest.modules) != "array"
+       or len(manifest.modules) < 1 or len(manifest.modules) > GRAPH_MAX_MODULES {
+        return rejected;
+    }
+    let sources = map{}; let seen_paths = map{}; let total = 0;
+    let entry_source = ""; let entry_found = false;
+    for i len(manifest.modules) {
+        let row = manifest.modules[i];
+        if not _exact_schema(row, ["path", "sha256"])
+           or not _relative_module_path(try row.path catch nil)
+           or not _digest(try row.sha256 catch nil)
+           or map_has(seen_paths, row.path) {
+            return rejected;
+        }
+        seen_paths[row.path] = true;
+        let source = SECURE.read_bytes(policy.project_root + "/" + row.path,
+            GRAPH_MAX_MODULE_BYTES);
+        if not source.ok or source.size < 1
+           or sha256(base64_encode_bytes(source.bytes)) != row.sha256 {
+            return rejected;
+        }
+        let decoded = try map{ ok: true, text: bytes_to_str(source.bytes) }
+            catch map{ ok: false, text: "" };
+        if not decoded.ok { return rejected; }
+        let text = decoded.text;
+        total = total + source.size;
+        if total > GRAPH_MAX_TOTAL_BYTES { return rejected; }
+        if row.path == manifest.entry_path {
+            entry_source = text; entry_found = true;
+        }
+        else {
+            let virtual = _virtual_module_path(row.path);
+            if map_has(sources, virtual) { return rejected; }
+            sources[virtual] = text;
+        }
+    }
+    if not entry_found { return rejected; }
+    let linked = try LINK.link_modules(entry_source, sources, map{
+        entry_path: manifest.entry_path, max_modules: GRAPH_MAX_MODULES,
+        max_module_depth: GRAPH_MAX_MODULES,
+        max_module_source_bytes: GRAPH_MAX_MODULE_BYTES,
+        max_total_source_bytes: GRAPH_MAX_TOTAL_BYTES,
+        max_linked_source_bytes: GRAPH_MAX_LINKED_BYTES,
+        max_path_bytes: 1024
+    }) catch rejected;
+    if not (try linked.ok catch false)
+       or linked.modules != len(map_keys(sources))
+       or linked.input_graph_sha256 != manifest.input_graph_sha256
+       or sha256(linked.source) != manifest.linked_source_sha256
+       or len(str_to_bytes(linked.source)) > GRAPH_MAX_LINKED_BYTES {
+        return rejected;
+    }
+    return map{ ok: true, source_bytes: str_to_bytes(linked.source),
+        module_count: len(manifest.modules), manifest_digest_verified: true,
+        graph_digest_verified: true, linked_source_digest_verified: true };
 }
 
 fn _exact_schema(value, keys) {
@@ -263,7 +368,7 @@ fn _command_failure_code(result, timed_out) {
 
 fn _child_args(root, libc_path) {
     let args = [
-        "run", "/proc/self/fd/0", "--allow-fs", "--allow-import", "--allow-env",
+        "run", "/proc/self/fd/0", "--allow-fs", "--deny-import", "--allow-env",
         "--allow-ffi", "--deny-exec", "--deny-net", "--deny-http",
         "--deny-sqlite", "--deny-spawn", "--deny-gfx", "--ffi-lib=" + libc_path
     ];
@@ -278,21 +383,20 @@ fn run(root, policy) {
        or type(try policy.runtime_candidates catch nil) != "array"
        or len(policy.runtime_candidates) < 1 or len(policy.runtime_candidates) > 4
        or not _digest(try policy.runtime_sha256 catch nil)
-       or not _absolute(try policy.scanner_path catch nil)
-       or not _digest(try policy.scanner_sha256 catch nil)
+       or not _absolute(try policy.project_root catch nil)
+       or not _absolute(try policy.graph_manifest_path catch nil)
+       or not _digest(try policy.graph_manifest_sha256 catch nil)
+       or not _digest(try policy.scanner_graph_sha256 catch nil)
+       or not _digest(try policy.linked_scanner_sha256 catch nil)
        or not _absolute(try policy.libc_path catch nil)
-       or not _absolute(try policy.import_root catch nil) {
+       or str_ends_with(policy.project_root, "/") {
         return _failure("invalid-policy");
     }
     for i len(policy.runtime_candidates) {
         if not _absolute(policy.runtime_candidates[i]) { return _failure("invalid-policy"); }
     }
-    let scanner = SECURE.read_bytes(policy.scanner_path, SCANNER_MAX_BYTES);
-    if not scanner.ok or scanner.size < 1
-       or sha256(base64_encode_bytes(scanner.bytes)) != policy.scanner_sha256
-       or (try bytes_to_str(scanner.bytes) catch nil) == nil {
-        return _failure("scanner-digest-rejected");
-    }
+    let graph = _load_linked_graph(policy);
+    if not graph.ok { return _failure("scanner-graph-rejected"); }
     let prepared = PROCESS.prepare_fixed_verified(policy.runtime_candidates,
         policy.runtime_sha256, RUNTIME_MAX_BYTES);
     if not prepared.ok { return _failure("runtime-digest-rejected"); }
@@ -302,8 +406,7 @@ fn run(root, policy) {
             max_file_bytes: FILE_BYTES, max_memory_bytes: MEMORY_BYTES,
             max_open_files: OPEN_FILES, max_processes: PROCESSES,
             startup_timeout_ms: 3000, inherit_environment: false,
-            environment: map{ PBLANG_STRICT_IMPORT_ROOT: policy.import_root },
-            stdin_bytes: scanner.bytes
+            environment: map{}, stdin_bytes: graph.source_bytes
         });
     if not state.ok {
         if (try state.requires_recovery catch false) or not (try state.cleaned catch true) {
@@ -366,6 +469,7 @@ fn run(root, policy) {
         envelope_hard_wall_timeout: true, envelope_wall_seconds: WALL_SECONDS,
         process_group_terminated: true, runtime_digest_verified: true,
         scanner_digest_verified: true, scanner_snapshot_bounded: true,
+        scanner_manifest_digest_verified: true,
         child_stdout_exposed: false, child_stderr_exposed: false,
         contains_absolute_paths: false, contains_records: false,
         contains_mount_identity: false, contains_filesystem_type: false,
@@ -374,7 +478,9 @@ fn run(root, policy) {
         snapshot_consistent: false, ffi_symbol_contract_verified: false,
         hostile_code_sandbox_verified: false,
         publisher_authenticity_verified: false,
-        scanner_import_graph_digest_verified: false,
+        scanner_import_graph_digest_verified: true,
+        scanner_linked_source_digest_verified: true,
+        scanner_graph_module_count: graph.module_count,
         trusted_scanner_only: true, caller_policy_trusted_required: true,
         process_exit_denied: false, recovery_pending: false,
         production_ready: false, idea_admission_eligible: false,
@@ -400,7 +506,15 @@ fn status() {
         linux_x86_64_trusted_scanner_envelope: supported,
         process_address_space_limit: supported, external_wall_timeout: supported,
         descriptor_bound_runtime: true, bounded_scanner_snapshot: true,
-        explicit_trusted_import_root: true, descriptor_bound_import_root: false,
+        scanner_manifest_digest_verified: false,
+        scanner_import_graph_digest_verified: false,
+        scanner_linked_source_digest_verified: false,
+        scanner_manifest_digest_verification_supported: supported,
+        scanner_import_graph_digest_verification_supported: supported,
+        scanner_linked_source_digest_verification_supported: supported,
+        runtime_import_denial_supported: supported,
+        scanner_scoped_immutable_import_graph_supported: supported,
+        explicit_trusted_import_root: false, descriptor_bound_import_root: false,
         trusted_scanner_only: true, caller_policy_trusted_required: true,
         process_exit_denied: false,
         immutable_import_graph: false, vm_wide_enforcement: false,
