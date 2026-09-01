@@ -493,11 +493,35 @@ fn _load_native_batch(fs, snapshot, buffer, count) {
     return bytes;
 }
 
-fn _read_descriptor_bounded(fs, fd, maximum) {
+fn _descriptor_identity_cleanup(fs, state) {
+    let ok = true;
+    if (try state.snapshot_fd catch -1) >= 0 {
+        let closed = _close_fd(fs, state.snapshot_fd); state.snapshot_fd = -1;
+        if not closed { ok = false; }
+    }
+    if (try state.buffer catch 0) != 0 {
+        let freed = _free(fs, state.buffer); state.buffer = 0;
+        if not freed { ok = false; }
+    }
+    if (try state.info_fd catch -1) >= 0 {
+        let closed = _close_fd(fs, state.info_fd); state.info_fd = -1;
+        if not closed { ok = false; }
+    }
+    return ok;
+}
+
+fn _read_descriptor_bounded_owned(fs, fd, maximum, state) {
     if maximum < 1 or maximum > FDINFO_MAX_BYTES { return _error("invalid descriptor text limit"); }
     let ceiling = maximum + 1;
     let buffer = _call(fs, "calloc", "i64,i64->ptr", [1, ceiling]);
     if not _positive_pointer(buffer) { return _error("descriptor text buffer is unavailable"); }
+    let buffer_registered = try { state.buffer = buffer; true } catch false;
+    if not buffer_registered {
+        let freed = _free(fs, buffer);
+        return _cleanup_error(if freed {
+            "descriptor identity buffer registry publication failed"
+        } else { "descriptor identity buffer publication and cleanup failed" });
+    }
     let total = 0; let eof = false; let failed = false;
     while total < ceiling and not eof and not failed {
         let count = _call(fs, "read", "i32,ptr,i64->i64", [fd, buffer + total, ceiling - total]);
@@ -506,24 +530,33 @@ fn _read_descriptor_bounded(fs, fd, maximum) {
         else { total = total + count; }
     }
     if failed or total > maximum {
-        let freed = _free(fs, buffer);
+        let freed = _free(fs, buffer); state.buffer = 0;
         if not freed { return _cleanup_error("descriptor text buffer cleanup failed"); }
         return _error(if failed { "descriptor text read failed" } else { "descriptor text exceeds limit" });
     }
     let snapshot = _i32(_call(fs, "memfd_create", "string,i32->i32",
         ["pblang-bounded-fdinfo", MFD_CLOEXEC]));
     if snapshot < 0 {
-        if not _free(fs, buffer) { return _cleanup_error("descriptor text buffer cleanup failed"); }
+        let freed = _free(fs, buffer); state.buffer = 0;
+        if not freed { return _cleanup_error("descriptor text buffer cleanup failed"); }
         return _error("descriptor text snapshot is unavailable");
     }
+    let snapshot_registered = try { state.snapshot_fd = snapshot; true } catch false;
+    if not snapshot_registered {
+        let snapshot_closed = _close_fd(fs, snapshot);
+        return _cleanup_error(if snapshot_closed {
+            "descriptor identity snapshot registry publication failed"
+        } else { "descriptor identity snapshot publication and cleanup failed" });
+    }
     let bytes = _load_native_batch(fs, snapshot, buffer, total);
-    let snapshot_closed = _close_fd(fs, snapshot); let freed = _free(fs, buffer);
+    let snapshot_closed = _close_fd(fs, snapshot); state.snapshot_fd = -1;
+    let freed = _free(fs, buffer); state.buffer = 0;
     if not snapshot_closed or not freed { return _cleanup_error("descriptor text cleanup failed"); }
     if not is_array(bytes) { return _error("descriptor text snapshot failed"); }
     return map{ ok: true, bytes: bytes };
 }
 
-fn _fd_identity(fs, fd) {
+fn _fd_identity_owned(fs, fd, state) {
     let pid = _i32(_call(fs, "getpid", "->i32", []));
     if pid <= 0 or fd < 0 { return _error("descriptor identity is unavailable"); }
     let fdinfo_path = "/proc/" + str(pid) + "/fdinfo/" + str(fd);
@@ -532,8 +565,16 @@ fn _fd_identity(fs, fd) {
     }
     let info_fd = _openat(fs, AT_FDCWD, fdinfo_path, O_RDONLY + O_NOFOLLOW + O_CLOEXEC, 0);
     if info_fd < 0 { return _error("descriptor identity record cannot be opened"); }
-    let loaded = _read_descriptor_bounded(fs, info_fd, FDINFO_MAX_BYTES);
-    let info_closed = _close_fd(fs, info_fd);
+    let info_registered = try { state.info_fd = info_fd; true } catch false;
+    if not info_registered {
+        let info_closed = _close_fd(fs, info_fd);
+        return _cleanup_error(if info_closed {
+            "descriptor identity registry publication failed"
+        } else { "descriptor identity publication and cleanup failed" });
+    }
+    let loaded = _read_descriptor_bounded_owned(fs, info_fd,
+        FDINFO_MAX_BYTES, state);
+    let info_closed = _close_fd(fs, info_fd); state.info_fd = -1;
     if not info_closed { return _cleanup_error("descriptor identity record cleanup failed"); }
     if not loaded.ok { return loaded; }
     let text = try bytes_to_str(loaded.bytes) catch nil;
@@ -559,6 +600,19 @@ fn _fd_identity(fs, fd) {
         return _error("descriptor identity fields are missing or duplicated");
     }
     return map{ ok: true, mount_id: mount_id, inode: inode };
+}
+
+fn _fd_identity(fs, fd) {
+    let state = map{ info_fd: -1, snapshot_fd: -1, buffer: 0 };
+    let attempted = try map{ ok: true,
+        value: _fd_identity_owned(fs, fd, state) } catch map{ ok: false };
+    let cleaned = _descriptor_identity_cleanup(fs, state);
+    if not cleaned or _mount_admission_cleanup_poisoned
+       or (attempted.ok and (try attempted.value.cleanup_failed catch false)) {
+        return _cleanup_error("descriptor identity cleanup failed or remained ambiguous");
+    }
+    if not attempted.ok { return _error("descriptor identity failed safely"); }
+    return attempted.value;
 }
 
 fn _mount_pair_key(pair) {
@@ -912,43 +966,6 @@ fn scan_mount_admission_status() {
             { "scan-mount-cleanup-poisoned" } else { "" },
         authorizes_scan: false
     };
-}
-
-// Isolated-regression hook. It injects either one invalid, non-owned operation
-// descriptor or an incoming cleanup-failed result into the real strict abort
-// boundary. Call only in a disposable test process: poison is irreversible.
-fn exercise_cleanup_poison_for_test(mode) {
-    if mode != "abort-resource" and mode != "incoming-cleanup" {
-        return _error("invalid cleanup poison test mode");
-    }
-    let host = available();
-    if not host.library_ready { return _error("trusted libc is unavailable"); }
-    let libc = try ffi_load(host.libc) catch nil;
-    if libc == nil { return _error("trusted libc cannot be loaded"); }
-    let id = str_slice(sha256("strict-cleanup-probe:" + mode), 0, 48);
-    let fs = map{ libc: libc, libc_path: host.libc, root_fd: -7,
-        closed: false, strict_enum_operation_id: id };
-    let child_fd = -1;
-    if mode == "abort-resource" { child_fd = 2147483647; }
-    _strict_enum_operations[id] = map{ owner_root_fd: -7, child_fd: child_fd,
-        snapshot_fd: -1, dir_fd: -1, buffer: nil };
-    let incoming = _error("injected strict operation abort");
-    if mode == "incoming-cleanup" {
-        incoming = map{ ok: false, error: "injected incoming cleanup ambiguity",
-            cleanup_failed: true, invalidate_handle: true };
-    }
-    let outcome = _abort_result(fs, incoming);
-    let registry_cleared = not map_has(_strict_enum_operations, id)
-        and (try fs.strict_enum_operation_id catch "") == "";
-    let library_closed = _close_library(libc);
-    return map{ ok: not outcome.ok and (try outcome.cleanup_failed catch false)
-            and _mount_admission_cleanup_poisoned and registry_cleared
-            and library_closed,
-        mode: mode, cleanup_failed: try outcome.cleanup_failed catch false,
-        registry_cleared: registry_cleared,
-        process_admission_poisoned: _mount_admission_cleanup_poisoned,
-        error_code: try outcome.error_code catch "",
-        authorizes_scan: false };
 }
 
 // Fixture-only policy inspection. It never creates or upgrades a scan handle.
@@ -3203,7 +3220,7 @@ export available, open, open_absolute, open_current_process_net, close, descript
        mkdir, mkdir_new, list, enumerate_bounded, read_enumerated_file,
        discard_enumeration_token,
        restart_bounded_enumeration, admit_scan_mount, recheck_scan_mount,
-       scan_mount_admission_status, exercise_cleanup_poison_for_test,
+       scan_mount_admission_status,
        inspect_mountinfo_policy, inspect_mountinfo_transition,
        abort_bounded_enumeration,
        read_bytes, read_prefix_bytes, read_range_bytes, read_stream_bytes, file_size, metadata,

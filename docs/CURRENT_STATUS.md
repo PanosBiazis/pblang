@@ -24,6 +24,16 @@ wrong token type, replay, repeated invalid tokens, cross-handle use, low-level
 root-context substitution, inode replacement and a functional child with
 process execution denied.
 
+Descriptor-identity reads now keep their `/proc` info descriptor, native buffer
+and bridge memfd in one structured cleanup state that survives unexpected VM
+exceptions. Normal and exceptional exits attempt each cleanup exactly once,
+clear ownership and terminally poison the process on ambiguity before an
+identity result can escape. Structured strict-content cleanup failures also
+retain terminal poison telemetry and its exact error code. The public
+poison-injection test hook was deleted rather than expanded: without a
+VM-enforced test-only capability it was itself an in-process denial-of-service
+surface.
+
 This is a capability bridge, not authorization for content scans. Disposable
 fault injections for parent/source/snapshot/library cleanup are still required
 before the strict content reader is admitted into a text-audit process. The
@@ -57,11 +67,12 @@ fallbacks all propagate the same terminal state.
 A child descriptor is removed from the private operation state immediately
 after its single close attempt, regardless of the reported result. Linux may
 consume descriptor ownership even when close reports an error, so the same
-numeric fd is never retried. Isolated disposable-child regressions cover both
-an invalid tracked operation resource and an incoming cleanup-failed result;
-both must clear the operation registry and deny the next admission before it
-opens a root. Eight clean open/enumerate/recheck/close cycles prove that
-successful cleanup does not poison or consume reusable capacity.
+numeric fd is never retried. The former exported poison-injection hook was
+removed because arbitrary runtime code could use it as a process-local denial
+of service. Eight clean open/enumerate/recheck/close cycles still prove that
+successful cleanup does not poison or consume reusable capacity. Deterministic
+post-acquisition cleanup-failure injection remains blocked until the VM exposes
+a genuinely test-only, non-forgeable capability boundary.
 
 This closes the known long-lived cleanup-ambiguity P1, but does not change the
 scanner's deployment contract: each root still runs in a fresh disposable
@@ -111,9 +122,10 @@ authenticity remain explicitly unverified. Public evidence contains no mount
 identity, filesystem type, device path or absolute scan root. Repeated rejection
 regressions verify that failed admissions do not consume later enumerator
 capacity. Any ambiguous native cleanup irreversibly poisons strict mount
-admission for that process; an isolated fault-injection regression proves that
-the next admission is rejected before it acquires a root. One process still
-accepts exactly one explicitly selected, already
+admission for that process. The earlier exported fault-injection regression was
+removed because its public hook could itself permanently deny admissions;
+equivalent deterministic injection now requires a VM-enforced test-only
+capability. One process still accepts exactly one explicitly selected, already
 mounted root, and external hard wall/RSS supervision is still required.
 
 One disposable-process validation shard completed under a 20-second external
