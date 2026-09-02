@@ -6,6 +6,8 @@
 // sufficient by itself to authorize publication or installation.
 
 let Channels = import("stdlib:release_channel.sapp");
+let Ed25519 = import("stdlib:ed25519_verify.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
 
 let FORMAT = "pblang.product-release-evidence.v1";
 let MAX_ARTIFACTS = 64;
@@ -18,6 +20,9 @@ let RUNTIME_SECURITY_POLICY_FORMAT = "pblang.runtime-security-policy.v1";
 let RUNTIME_PLATFORM_FORMAT = "pblang.runtime-platform-evidence.v1";
 let RUNTIME_SECURITY_GATE_FORMAT = "pblang.runtime-security-gate.v1";
 let MAX_RUNTIME_EVIDENCE_LIFETIME = 604800;
+let PUBLISHER_POLICY_FORMAT = "pblang.publisher-policy.v1";
+let PUBLISHER_ATTESTATION_FORMAT = "pblang.publisher-attestation.v1";
+let PUBLISHER_VERIFICATION_FORMAT = "pblang.publisher-attestation-verification.v1";
 
 // Never store or export a mutable canonical array. Every trust boundary gets a
 // fresh list so caller mutation cannot weaken later validation.
@@ -107,6 +112,26 @@ fn _same_texts(left, right) {
         index = index + 1;
     }
     return true;
+}
+
+fn _sorted_texts(values) {
+    let out = [];
+    for value in values { array_push(out, value); }
+    return array_sort(out);
+}
+
+fn _bytes(value, size, name) {
+    if type(value) != "array" or len(value) != size {
+        throw "product_release_evidence: " + name + " must contain exactly " + str(size) + " bytes";
+    }
+    let out = [];
+    for byte in value {
+        if type(byte) != "number" or byte != num_floor(byte) or byte < 0 or byte > 255 {
+            throw "product_release_evidence: invalid " + name + " byte";
+        }
+        array_push(out, byte);
+    }
+    return out;
 }
 
 fn _framed(values) {
@@ -392,6 +417,143 @@ fn artifact(source_record, name, artifact_sha256, byte_count, source_sha256,
         upgrade_verified:_bool(options, "upgrade_verified"),
         rollback_verified:_bool(options, "rollback_verified"),
         uninstall_verified:_bool(options, "uninstall_verified")
+    };
+}
+
+// Pin a publisher identity to an independently configured raw Ed25519 public
+// key. The key id is derived, never accepted from the caller.
+fn publisher_policy(publisher_id, revision, public_key) {
+    let key = _bytes(public_key, 32, "publisher public key");
+    return map{
+        format:PUBLISHER_POLICY_FORMAT,
+        publisher_id:_text(publisher_id, "publisher id", 128),
+        revision:_integer(revision, "publisher policy revision", 1, 1000000000),
+        algorithm:"ed25519",
+        public_key:key,
+        key_id:SHA256.sha256_hex_bytes(key)
+    };
+}
+
+fn _validated_publisher_policy(record) {
+    _exact_fields(record, ["format", "publisher_id", "revision", "algorithm",
+        "public_key", "key_id"], "publisher policy");
+    if record.format != PUBLISHER_POLICY_FORMAT or record.algorithm != "ed25519" {
+        throw "product_release_evidence: unsupported publisher policy";
+    }
+    let rebuilt = publisher_policy(record.publisher_id, record.revision, record.public_key);
+    if type(record.key_id) != "string" or record.key_id != rebuilt.key_id {
+        throw "product_release_evidence: publisher key id mismatch";
+    }
+    return rebuilt;
+}
+
+fn _publisher_message(source_row, artifact_row, selected, package_id, release_sequence) {
+    let package = _text(package_id, "publisher package id", 128);
+    let sequence = _integer(release_sequence, "publisher release sequence", 1, 9007199254740991);
+    if artifact_row.sbom_sha256 == "" {
+        throw "product_release_evidence: publisher attestation requires an SBOM digest";
+    }
+    let canonical = [PUBLISHER_ATTESTATION_FORMAT, selected.publisher_id,
+        selected.key_id, str(selected.revision), source_row.product, package,
+        source_row.application_version, source_row.release_channel, str(sequence),
+        artifact_row.name, artifact_row.artifact_sha256, str(artifact_row.byte_count),
+        source_row.source_sha256, source_row.manifest_sha256, source_row.lock_sha256,
+        source_row.commit_id, artifact_row.sbom_sha256];
+    let targets = _sorted_texts(artifact_row.targets);
+    for target in targets { array_push(canonical, "target:" + target); }
+    return map{bytes:str_to_bytes(_framed(canonical)), package_id:package,
+        release_sequence:sequence, targets:targets};
+}
+
+// Canonical bytes for an offline or independently isolated signer. The public
+// API returns a fresh array so callers cannot mutate an internal trust object.
+fn publisher_attestation_message(source_record, artifact_record, policy_record,
+                                 package_id, release_sequence) {
+    let source_row = _validated_source(source_record);
+    let artifact_row = _validated_artifact(artifact_record, source_row);
+    let selected = _validated_publisher_policy(policy_record);
+    let message = _publisher_message(source_row, artifact_row, selected,
+        package_id, release_sequence);
+    let out = [];
+    for byte in message.bytes { array_push(out, byte); }
+    return out;
+}
+
+fn publisher_attestation(source_record, artifact_record, policy_record,
+                         package_id, release_sequence, signature) {
+    let source_row = _validated_source(source_record);
+    let artifact_row = _validated_artifact(artifact_record, source_row);
+    let selected = _validated_publisher_policy(policy_record);
+    let message = _publisher_message(source_row, artifact_row, selected,
+        package_id, release_sequence);
+    return map{
+        format:PUBLISHER_ATTESTATION_FORMAT,
+        publisher_id:selected.publisher_id, key_id:selected.key_id,
+        policy_revision:selected.revision, algorithm:selected.algorithm,
+        product:source_row.product, package_id:message.package_id,
+        application_version:source_row.application_version,
+        release_channel:source_row.release_channel,
+        release_sequence:message.release_sequence,
+        artifact_name:artifact_row.name, artifact_sha256:artifact_row.artifact_sha256,
+        byte_count:artifact_row.byte_count, source_sha256:source_row.source_sha256,
+        manifest_sha256:source_row.manifest_sha256, lock_sha256:source_row.lock_sha256,
+        commit_id:source_row.commit_id, sbom_sha256:artifact_row.sbom_sha256,
+        targets:message.targets,
+        signature:_bytes(signature, 64, "publisher signature")
+    };
+}
+
+fn _validated_publisher_attestation(record, source_row, artifact_row, selected) {
+    _exact_fields(record, ["format", "publisher_id", "key_id", "policy_revision",
+        "algorithm", "product", "package_id", "application_version",
+        "release_channel", "release_sequence", "artifact_name", "artifact_sha256",
+        "byte_count", "source_sha256", "manifest_sha256", "lock_sha256",
+        "commit_id", "sbom_sha256", "targets", "signature"],
+        "publisher attestation");
+    let rebuilt = publisher_attestation(source_row, artifact_row, selected,
+        record.package_id, record.release_sequence, record.signature);
+    for field in ["format", "publisher_id", "key_id", "policy_revision", "algorithm",
+                  "product", "package_id", "application_version", "release_channel",
+                  "release_sequence", "artifact_name", "artifact_sha256", "byte_count",
+                  "source_sha256", "manifest_sha256", "lock_sha256", "commit_id",
+                  "sbom_sha256"] {
+        if record[field] != rebuilt[field] {
+            throw "product_release_evidence: publisher attestation binding mismatch for " + field;
+        }
+    }
+    if not _same_texts(record.targets, rebuilt.targets) {
+        throw "product_release_evidence: publisher attestation targets are not canonical";
+    }
+    return rebuilt;
+}
+
+fn verify_publisher_attestation(source_record, artifact_record, policy_record,
+                                attestation_record) {
+    let source_row = _validated_source(source_record);
+    let artifact_row = _validated_artifact(artifact_record, source_row);
+    let selected = _validated_publisher_policy(policy_record);
+    let attestation = _validated_publisher_attestation(attestation_record,
+        source_row, artifact_row, selected);
+    let message = _publisher_message(source_row, artifact_row, selected,
+        attestation.package_id, attestation.release_sequence);
+    let verified = Ed25519.verify(selected.public_key, message.bytes,
+        attestation.signature);
+    return map{
+        format:PUBLISHER_VERIFICATION_FORMAT,
+        publisher_id:selected.publisher_id, key_id:selected.key_id,
+        policy_revision:selected.revision,
+        attestation_message_sha256:SHA256.sha256_hex_bytes(message.bytes),
+        ed25519_signature_verified:verified,
+        release_binding_verified:verified,
+        configured_publisher_key_matched:true,
+        operator_trust_anchor_origin_verified:false,
+        artifact_bytes_measured:false,
+        same_verified_artifact_handoff:false,
+        rollback_protection_enforced:false,
+        publisher_authenticity_verified:false,
+        authorizes_execution:false,
+        production_ready:false,
+        authorization_scope:"cryptographic verification of supplied release claims only; no artifact measurement or execution authorization"
     };
 }
 
@@ -791,8 +953,12 @@ export FORMAT, MAX_ARTIFACTS, MAX_REPORTS, MAX_PLATFORMS, MAX_CHECKS;
 export RUNTIME_SECURITY_FORMAT, RUNTIME_SECURITY_POLICY_FORMAT,
        RUNTIME_PLATFORM_FORMAT, RUNTIME_SECURITY_GATE_FORMAT,
        MAX_RUNTIME_EVIDENCE_LIFETIME;
+export PUBLISHER_POLICY_FORMAT, PUBLISHER_ATTESTATION_FORMAT,
+       PUBLISHER_VERIFICATION_FORMAT;
 export source, artifact, test_report, platform_evidence;
 export target_requirement, policy, evaluate;
+export publisher_policy, publisher_attestation_message, publisher_attestation,
+       verify_publisher_attestation;
 export runtime_security_checks, runtime_security_evidence, runtime_security_policy,
        runtime_platform_evidence,
        evaluate_runtime_security;

@@ -1,0 +1,236 @@
+// Pure PBLang Ed25519 signature verification (RFC 8032, pure Ed25519 mode).
+//
+// This module is deliberately verification-only. It accepts byte arrays, never
+// handles private keys, rejects non-canonical/torsion encodings, and bounds the
+// message so hostile input cannot request unbounded hashing or curve work.
+
+let SHA512 = import("stdlib:sha512_pb.sapp");
+
+let MAX_MESSAGE_BYTES = 16384;
+let ZERO = bigint(0);
+let ONE = bigint(1);
+let TWO = bigint(2);
+let P = bigint("57896044618658097711785492504343953926634992332820282019728792003956564819949");
+let L = bigint("7237005577332262213973186563042994240857116359379907606001950938285454250989");
+let D = bigint("37095705934669439343138083508754565189542113879843219016388785533085940283555");
+let SQRT_M1 = bigint("19681161376707505956807079304988542015446066515923890162744021073123829784752");
+let BASE_X = bigint("15112221349535400772501151409588531511454012693041857206046113283949847762202");
+let BASE_Y = bigint("46316835694926478169428394003475163141307993866256225615783033603165251855960");
+let HEX = "0123456789abcdef";
+
+fn _mod(value) {
+    let out = value % P;
+    if out < ZERO { out = out + P; }
+    return out;
+}
+
+fn _pow_mod(base, exponent) {
+    let result = ONE;
+    let factor = _mod(base);
+    let remaining = exponent;
+    while remaining > ZERO {
+        if remaining % TWO == ONE { result = _mod(result * factor); }
+        factor = _mod(factor * factor);
+        remaining = remaining / TWO;
+    }
+    return result;
+}
+
+fn _valid_bytes(value, exact_length) {
+    if type(value) != "array" or len(value) != exact_length { return false; }
+    for byte in value {
+        if type(byte) != "number" or num_floor(byte) != byte or byte < 0 or byte > 255 {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn _valid_message(value) {
+    if type(value) != "array" or len(value) > MAX_MESSAGE_BYTES { return false; }
+    for byte in value {
+        if type(byte) != "number" or num_floor(byte) != byte or byte < 0 or byte > 255 {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn _copy_bytes(value) {
+    let out = [];
+    for byte in value { array_push(out, byte); }
+    return out;
+}
+
+fn _little_endian_integer(bytes) {
+    let value = ZERO;
+    let factor = ONE;
+    for byte in bytes {
+        value = value + bigint(byte) * factor;
+        factor = factor * bigint(256);
+    }
+    return value;
+}
+
+fn _hex_nibble(ch) {
+    let i = 0;
+    while i < 16 {
+        if str_slice(HEX, i, i + 1) == ch { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn _hex_bytes(text) {
+    if type(text) != "string" or len(text) % 2 != 0 { return nil; }
+    let out = [];
+    let i = 0;
+    while i < len(text) {
+        let hi = _hex_nibble(str_slice(text, i, i + 1));
+        let lo = _hex_nibble(str_slice(text, i + 1, i + 2));
+        if hi < 0 or lo < 0 { return nil; }
+        array_push(out, hi * 16 + lo);
+        i = i + 2;
+    }
+    return out;
+}
+
+fn _identity() { return map{ x: ZERO, y: ONE, z: ONE, t: ZERO }; }
+
+fn _affine(x, y) {
+    return map{ x: x, y: y, z: ONE, t: _mod(x * y) };
+}
+
+fn _base() { return _affine(BASE_X, BASE_Y); }
+
+fn _add(left, right) {
+    let a = _mod((left.y - left.x) * (right.y - right.x));
+    let b = _mod((left.y + left.x) * (right.y + right.x));
+    let c = _mod(TWO * D * left.t * right.t);
+    let d2 = _mod(TWO * left.z * right.z);
+    let e = _mod(b - a);
+    let f = _mod(d2 - c);
+    let g = _mod(d2 + c);
+    let h = _mod(b + a);
+    return map{
+        x: _mod(e * f),
+        y: _mod(g * h),
+        z: _mod(f * g),
+        t: _mod(e * h)
+    };
+}
+
+fn _double(point) {
+    let a = _mod(point.x * point.x);
+    let b = _mod(point.y * point.y);
+    let c = _mod(TWO * point.z * point.z);
+    let d2 = _mod(ZERO - a);
+    let e = _mod((point.x + point.y) * (point.x + point.y) - a - b);
+    let g = _mod(d2 + b);
+    let f = _mod(g - c);
+    let h = _mod(d2 - b);
+    return map{
+        x: _mod(e * f),
+        y: _mod(g * h),
+        z: _mod(f * g),
+        t: _mod(e * h)
+    };
+}
+
+fn _scalar_multiply(point, scalar) {
+    let result = _identity();
+    let addend = point;
+    let remaining = scalar;
+    while remaining > ZERO {
+        if remaining % TWO == ONE { result = _add(result, addend); }
+        addend = _double(addend);
+        remaining = remaining / TWO;
+    }
+    return result;
+}
+
+fn _equal(left, right) {
+    return _mod(left.x * right.z) == _mod(right.x * left.z)
+    and _mod(left.y * right.z) == _mod(right.y * left.z);
+}
+
+fn _is_identity(point) { return _equal(point, _identity()); }
+
+fn _decode_point(encoded) {
+    let y_bytes = _copy_bytes(encoded);
+    let sign = 0;
+    if y_bytes[31] >= 128 {
+        sign = 1;
+        y_bytes[31] = y_bytes[31] - 128;
+    }
+    let y = _little_endian_integer(y_bytes);
+    if y >= P { return nil; }
+
+    let y_squared = _mod(y * y);
+    let numerator = _mod(y_squared - ONE);
+    let denominator = _mod(D * y_squared + ONE);
+    if denominator == ZERO { return nil; }
+    let x_squared = _mod(numerator * _pow_mod(denominator, P - TWO));
+    let x = _pow_mod(x_squared, (P + bigint(3)) / bigint(8));
+    if _mod(x * x) != x_squared { x = _mod(x * SQRT_M1); }
+    if _mod(x * x) != x_squared { return nil; }
+    if x == ZERO and sign == 1 { return nil; }
+    if x % TWO != bigint(sign) { x = P - x; }
+    return _affine(x, y);
+}
+
+fn _prime_order_non_identity(point) {
+    if _is_identity(point) { return false; }
+    return _is_identity(_scalar_multiply(point, L));
+}
+
+fn verify(public_key, message, signature) {
+    if not _valid_bytes(public_key, 32) or not _valid_message(message)
+    or not _valid_bytes(signature, 64) {
+        return false;
+    }
+
+    let r_encoded = [];
+    let s_encoded = [];
+    let i = 0;
+    while i < 32 {
+        array_push(r_encoded, signature[i]);
+        array_push(s_encoded, signature[i + 32]);
+        i = i + 1;
+    }
+    let scalar_s = _little_endian_integer(s_encoded);
+    if scalar_s >= L { return false; }
+
+    let public_point = _decode_point(public_key);
+    let r_point = _decode_point(r_encoded);
+    if public_point == nil or r_point == nil { return false; }
+    if not _prime_order_non_identity(public_point) or not _prime_order_non_identity(r_point) {
+        return false;
+    }
+
+    let challenge_input = [];
+    for byte in r_encoded { array_push(challenge_input, byte); }
+    for byte in public_key { array_push(challenge_input, byte); }
+    for byte in message { array_push(challenge_input, byte); }
+    let digest = _hex_bytes(SHA512.sha512_hex_bytes(challenge_input));
+    if digest == nil or len(digest) != 64 { return false; }
+    let challenge = _little_endian_integer(digest) % L;
+
+    let left = _scalar_multiply(_base(), scalar_s);
+    let right = _add(r_point, _scalar_multiply(public_point, challenge));
+    return _equal(left, right);
+}
+
+fn limits() {
+    return map{
+        algorithm: "ed25519",
+        mode: "pure-ed25519",
+        verification_only: true,
+        max_message_bytes: MAX_MESSAGE_BYTES,
+        canonical_scalar_required: true,
+        canonical_points_required: true,
+        prime_order_points_required: true
+    };
+}
+
+export verify, limits;
