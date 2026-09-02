@@ -1,7 +1,39 @@
 # pblang — Current Status
 
-**Last Updated**: 2026-09-01
+**Last Updated**: 2026-09-02
 **Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
+
+## 2026-09-02 - Strict Ed25519 release-attestation prerequisite
+
+PBLang now has a pure, verification-only Ed25519 module. It accepts exactly a
+32-byte public key and 64-byte signature, bounds messages to 16 KiB, enforces a
+canonical scalar, canonical point decoding and prime-order non-identity public
+and nonce points, and handles no private keys. RFC 8032 vectors, changed inputs,
+noncanonical scalars/points, identity points, malformed sizes and an independent
+OpenSSL multi-block fixture pass.
+
+`product_release_evidence.sapp` can now pin a raw Ed25519 public key in an
+explicit publisher policy, derive its key id with raw-byte SHA-256, construct a
+domain-separated byte-length-framed message and verify a publisher signature.
+The signed message binds the publisher/key/policy revision, product/package,
+version/channel/sequence, artifact digest and exact claimed size, source,
+manifest and lock digests, commit, SBOM and canonical target set. Exact schemas,
+detached arrays and field-mutation regressions prevent callers from adding trust
+booleans, substituting a self-chosen key or changing a signed release field.
+
+This closes a real cryptographic prerequisite over supplied claims, not the
+complete operational publisher-authenticity blocker. The module does not prove
+that its key came from an operator-owned trust store, measure immutable artifact
+bytes, hand the same verified object to installation/execution, enforce
+revocation or monotonic rollback state, or authorize an external effect.
+Accordingly `publisher_authenticity_verified`, `authorizes_execution` and
+`production_ready` remain false even after a valid signature. The separate
+`process_exit_denied=false` and sandbox/test-profile P1 also remain unresolved
+because their non-bypassable fix belongs to the retained Rust CLI/VM boundary.
+The three focused release/crypto regressions pass. Two attempts to run the full
+899-test semantic corpus were externally interrupted before a final result; all
+resulting temporary fixtures were removed, so this slice does not claim a new
+complete-suite baseline.
 
 ## 2026-09-01 - Strict cleanup ownership transitions
 
