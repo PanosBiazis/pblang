@@ -1,0 +1,74 @@
+// Pure local HTTP reverse-proxy configuration export; never starts a proxy.
+// Deliberately excludes TLS, DNS, public listeners, raw directives and secrets.
+fn _keys(value,keys) {
+    if type(value)!="map" or len(map_keys(value))!=len(keys) { return false; }
+    for key in keys { if not map_has(value,key) { return false; } }
+    return true;
+}
+fn _integer(value,low,high) {
+    return type(value)=="number" and value>=low and value<=high and value==num_floor(value);
+}
+fn _id(value) {
+    if type(value)!="string" or len(value)<1 or len(value)>32 { return false; }
+    for i in range(0,len(value)) {
+        if str_index_of("abcdefghijklmnopqrstuvwxyz0123456789_",str_slice(value,i,i+1))<0 { return false; }
+    }
+    return true;
+}
+// Only explicit loopback backends in this preview; no dynamic DNS/SSRF policy.
+fn validate(config) {
+    if not _keys(config,["listen_port","upstreams","connect_timeout_ms","io_timeout_ms"])
+        or not _integer(config.listen_port,1024,65535)
+        or not _integer(config.connect_timeout_ms,1,60000)
+        or not _integer(config.io_timeout_ms,1,60000)
+        or type(config.upstreams)!="array" or len(config.upstreams)<1 or len(config.upstreams)>16 {
+        throw "proxy_config: invalid configuration";
+    }
+    let ids=map{}; let ports=map{};
+    for upstream in config.upstreams {
+        if not _keys(upstream,["id","port"]) or not _id(upstream.id)
+            or not _integer(upstream.port,1024,65535) or upstream.port==config.listen_port
+            or map_has(ids,upstream.id) or map_has(ports,str(upstream.port)) {
+            throw "proxy_config: invalid upstream";
+        }
+        ids[upstream.id]=true; ports[str(upstream.port)]=true;
+    }
+    return true;
+}
+fn create(listen_port,upstreams) {
+    let config=map{listen_port:listen_port,upstreams:upstreams,connect_timeout_ms:1000,io_timeout_ms:5000};
+    validate(config); let copied=[];
+    for upstream in upstreams { array_push(copied,map{id:upstream.id,port:upstream.port}); }
+    config.upstreams=copied; return config;
+}
+// One deterministic round-robin decision over caller-supplied health states.
+// Not active health checking, freshness proof or a network admission decision.
+fn select(config,healthy,cursor=0) {
+    validate(config);
+    if type(healthy)!="array" or len(healthy)!=len(config.upstreams)
+        or not _integer(cursor,0,len(config.upstreams)-1) { throw "proxy_config: invalid selection state"; }
+    for value in healthy { if type(value)!="bool" { throw "proxy_config: invalid health state"; } }
+    for offset in range(0,len(healthy)) {
+        let index=(cursor+offset)%len(healthy);
+        if healthy[index] {
+            let upstream=config.upstreams[index];
+            return map{available:true,upstream:map{id:upstream.id,port:upstream.port},
+                next_cursor:(index+1)%len(healthy)};
+        }
+    }
+    return map{available:false,upstream:nil,next_cursor:cursor};
+}
+fn nginx(config) {
+    validate(config);
+    let out="# Generated preview: review and validate before use. Loopback HTTP only.\nworker_processes 1;\nerror_log stderr warn;\nevents { worker_connections 128; }\nhttp {\n  access_log off;\n  upstream pb_pool {\n";
+    for upstream in config.upstreams { out=out+"    server 127.0.0.1:"+str(upstream.port)+";\n"; }
+    out=out+"  }\n  server {\n    listen 127.0.0.1:"+str(config.listen_port)+";\n    server_name localhost;\n    client_max_body_size 64k;\n    location / {\n      proxy_pass http://pb_pool;\n      proxy_http_version 1.1;\n      proxy_pass_request_headers off;\n      proxy_set_header Host localhost;\n      proxy_set_header Connection close;\n      proxy_set_header Content-Type $http_content_type;\n      proxy_connect_timeout "+str(config.connect_timeout_ms)+"ms;\n      proxy_read_timeout "+str(config.io_timeout_ms)+"ms;\n      proxy_send_timeout "+str(config.io_timeout_ms)+"ms;\n      proxy_buffering off;\n      proxy_request_buffering off;\n      proxy_next_upstream off;\n    }\n  }\n}\n";
+    return out;
+}
+fn haproxy(config) {
+    validate(config);
+    let out="# Generated preview: review and validate before use. Loopback HTTP only.\nglobal\n  maxconn 128\ndefaults\n  mode http\n  timeout connect "+str(config.connect_timeout_ms)+"ms\n  timeout client "+str(config.io_timeout_ms)+"ms\n  timeout server "+str(config.io_timeout_ms)+"ms\n  retries 0\nfrontend pb_local\n  bind 127.0.0.1:"+str(config.listen_port)+"\n  default_backend pb_pool\nbackend pb_pool\n  balance roundrobin\n";
+    for upstream in config.upstreams { out=out+"  server "+upstream.id+" 127.0.0.1:"+str(upstream.port)+"\n"; }
+    return out;
+}
+export create,validate,select,nginx,haproxy;
