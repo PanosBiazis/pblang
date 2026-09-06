@@ -1,4 +1,4 @@
-# PBLang and retained Rust: comparative audit, 2026-09-06
+# PBLang 1.0.0 release-readiness assessment and comparative audit, 2026-09-06
 
 ## Decision and scope
 
@@ -18,6 +18,74 @@ Inventory is not coverage: `crates/` plus `src/` contain 90 Rust source files,
 totalling 13,114 lines; 972 semantic `*_test.sapp` files are discoverable. These
 are current local filename/line counts, not assertions, executed tests or audited
 percentages. Other examples/tools/tests and generated foreign code also matter.
+
+## 1.0.0 readiness decision
+
+Assessment criteria updated 2026-09-07; underlying audit evidence is dated above.
+
+**Current decision: NOT READY.** This is an evidence-based assessment of the
+production scope in [`ROADMAP.md`](../ROADMAP.md#current-060-alpha-channel--working-toward-100),
+including its mandatory final compatibility gate. It is not a release approval.
+The readiness section was added after audit commit `f481c0a`; no implementation
+fixes, new test results or version changes accompanied this documentation update.
+The package remains `0.6.0`, channel `alpha`.
+
+Status meanings:
+
+- **FAIL**: a supported finding contradicts the acceptance criterion.
+- **NOT ESTABLISHED**: required evidence is absent or insufficient. This is not
+  proof the feature fails, and it is not a pass.
+- **PASS**: the exact release candidate meets the criterion with reviewed evidence.
+
+No gate below currently has enough evidence for PASS. Individual working features
+and passing targeted tests remain positive evidence in the audit; their success
+does not compensate for an unrelated failing release gate. Readiness is not an
+average score or a percentage derived from test-file counts.
+
+### Acceptance and evidence matrix
+
+| Gate | Required acceptance for 1.0.0 | Available evidence and current status | Evidence needed to close |
+| --- | --- | --- | --- |
+| R1 Release scope and stable contracts | Explicit supported OS/architecture/backend/API matrix; frozen syntax, bytecode and stable-library contracts; documented previews and migration rules | **NOT ESTABLISHED**: implementations/subsets are mapped below, but a reviewed candidate-wide stability/support contract is not established | Versioned compatibility contract, stable/preview inventory and reviewed deprecation/migration policy bound to the candidate |
+| R2 Compiler/runtime correctness | Supported programs preserve values, types, effects, errors and control flow across applicable execution routes; unsupported constructs reject explicitly | **FAIL**: C1, C2, C4, C5 and prior A5–A7 demonstrate miscompilation, checker/diagnostic divergence and partial execution | Fix commits plus previously failing regression cases; exact differential results for baseline, candidate and each claimed backend; no unexplained release-blocking divergence |
+| R3 Memory, lifecycle and isolation | Safety guarantees hold at each reachable authoritative boundary; cleanup on all exits; per-VM ownership; FFI/embedding contracts enforced | **FAIL**: C3, S1–S3, S5–S6 and prior A3; native safety limits in the preceding audit remain open | Reviewed fixes and positive/negative lifecycle, ownership, ABI and isolation tests; opaque authority or verified isolation where hostile callers are supported; no unresolved critical/high finding in shipped reachable scope |
+| R4 Resource and input enforcement | Enforce declared source/decode/heap/stack/time/output/child limits before effects or excessive allocation; cancellation and cleanup work | **FAIL**: S4, P6 and prior A1, A2, A4, A6 contradict parts of that guarantee | Exact N/N+1 bounds, aggregate child/import accounting, supervised cancellation and cleanup evidence; measured hard limits at the runtime/process boundary actually shipped |
+| R5 Trusted packaging and deployment | Publisher/operator trust, integrity, immutable artifact handoff, revocation/rollback and secure transport hold through install/update/launch | **FAIL**: P1–P5, P7; experimental publisher modules explicitly retain unverified authorization claims | Sidecar/path/transport regressions, trust/substitution/rehydration tests, same-object handoff and reviewed revocation/rollback evidence; install/upgrade/recovery tests on disposable fixtures |
+| R6 Compatibility and test reliability | Candidate passes the reviewed historical/application/product corpus and stable-slice broader tests; test failures/skips/timeouts remain distinguishable | **NOT ESTABLISHED**: focused successes below are narrow; test-quality gaps remain and the selected Rust build timed out | Exact candidate/baseline/corpus identities, reviewed assertions and owned fixtures, expected-versus-observed results, isolated repeat/soak results, migration notes for intentional changes; no unresolved release-blocking regression |
+| R7 Platform and device qualification | Every advertised target/surface runs the actual candidate or independently built adapter; host/model/emulator/device evidence is distinguished | **NOT ESTABLISHED**: CI definitions are not successful runs; iOS simulator boot is not PBLang app execution | Per-target build/install/run/interaction/shutdown/upgrade evidence, including physical checks required by the supported-target contract; explicit unavailable/unsupported entries |
+| R8 Performance and efficiency | Meets predefined workload-specific startup/compile/run/memory/latency targets without changing semantics; deterministic fallbacks remain valid | **NOT ESTABLISHED**: no new reproducible benchmark campaign is in this audit | Reviewed targets before measurement; identical workloads and baselines, warmups, multiple samples, median/tail latency, peak memory and applicable energy/thermal data; correctness checks for accelerated and fallback paths |
+| R9 Reproducible, reviewable release | Exact source, dependencies, toolchain and artifacts are bound to the release evidence; documentation/examples match; dependency security and release review are current | **NOT ESTABLISHED**: live dirty-tree analysis is not a qualified release artifact; fresh dependency/advisory and independent bootstrap evidence is absent | Clean identified candidate, relative lockfiles, reproducible build evidence, dated dependency review, accurate tutorials/limitations, artifact digests and named operator/reviewer approval |
+
+The earlier A identifiers refer to
+[`PBLANG_ANALYSIS_CONTINUATION_2026-09-06.md`](PBLANG_ANALYSIS_CONTINUATION_2026-09-06.md).
+C/S/P identifiers refer to the findings below. A single finding may affect more
+than one gate; it must not be counted as multiple independent defects.
+
+### What a positive readiness conclusion must contain
+
+Each gate's evidence record must identify the gate/finding, exact source and fix
+revision, candidate artifact identity, baseline/corpus revision where applicable,
+logical target/backend, test/build command, limits, expected and observed result,
+exit status, pass/fail/skip/unavailable/timeout status, cleanup result, date and
+reviewer. Keep reproducible synthetic fixtures and sanitized evidence references;
+never commit credentials, personal paths or private application data.
+
+An individual finding can be **fixed but unverified**. It becomes **closed** only
+after the relevant regression and boundary tests succeed on the candidate and the
+evidence is reviewed. A documentation edit, disabled test, missing tool, retry,
+fallback to a different backend or version-number change is not closure.
+
+The report may say **READY FOR 1.0.0** only when all required gates PASS for the
+same identified candidate and its explicitly approved scope, with no unresolved
+release blocker. Restricting scope requires an explicit maintainer decision,
+updated promises, and evidence the excluded path cannot still be reached through
+a shipped entrypoint. This assessment neither narrows scope automatically nor
+approves publication. Readiness never means proof of zero possible vulnerabilities
+or compatibility with every conceivable program and device.
+
+Daily work stays focused, as requested. The broader compatibility/soak campaign
+runs on isolated release hosts after a stable slice; it is not triggered by this
+report update. Version, release tag and publication remain unchanged.
 
 ## Architecture: where the implementation actually lives
 
