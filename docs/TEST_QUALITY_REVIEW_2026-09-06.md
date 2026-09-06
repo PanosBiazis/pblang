@@ -34,9 +34,26 @@ and deliberate negative tests also match these patterns.
   from a conditional verified-font/fallback behavior test. Source-string checks
   elsewhere in that test are structural evidence, not live rendering evidence.
 
-These pre-existing tests were not rewritten or run indiscriminately. Only the
-diagnostic regression was implemented here; fixture ownership, child status and
-parallel completion fixes remain work items.
+These pre-existing tests were not rewritten or run indiscriminately. The
+diagnostic regression was implemented in the initial slice; the listed semantic
+fixture ownership, child status and parallel completion fixes remain work items.
+
+## Follow-up: PBCK test isolation and adversarial coverage
+
+`tests/pbck_cli.rs` had another fixed shared temporary directory, recursively
+deleted at test startup. It now uses a unique `tempfile::TempDir` with owned
+cleanup and compares raw stdout bytes. Existing child exit-status assertions are
+retained. New integration tests assert the specific failure codes/diagnostics
+and empty stdout for trailing bytes and oversized input. They run against the
+Cargo-selected freshly built binary, not an arbitrary PATH installation.
+
+Native flag/trailing-data regressions reproduced the defects before the fix.
+The bounded-reader tests use small limits and controlled readers to cover exact
+EOF, overflow, short reads, interrupted reads, zero limits and I/O errors without
+large in-memory fixtures. The CLI oversize regression uses a private sparse file.
+The PBLang byte-array regression reproduces non-byte values hidden in skipped
+numeric payloads and tests both compact and noncompact decoders plus inspection.
+See `LOW_LEVEL_REVIEW_2026-09-06.md` for limits not established by these tests.
 
 ## Required follow-through
 
