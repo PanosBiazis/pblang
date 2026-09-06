@@ -125,12 +125,64 @@ Package build and portable-lock publication passed. No full suite or native
 rebuild was needed. This follow-up's Graphify update also hit the 20-second
 deadline, so graph freshness remains unverified.
 
-Unresolved: chunk `constants` counters do not count default-value nodes, so an
-aggregate decoded-value/heap budget is still needed for wide default trees.
-The inaccurate every-allocation-is-budgeted comment was removed. Unbounded
+At this stage chunk `constants` counters did not count default-value nodes;
+the next follow-up adds a separate value-count budget without reinterpreting
+those report fields. The inaccurate every-allocation-is-budgeted comment was removed. Unbounded
 PBLang file reads, snapshot consistency, execution budgets and the linker's
 different depth-accounting model are not changed by this slice. No Rust source
 or language catch semantics were modified.
+
+## Follow-up: aggregate decoded-value budget
+
+Both PBLang readers now have a default/hard ceiling of 1,000,000 decoded values.
+Each scalar constant, function constant, function default and nested chunk
+constant consumes one unit before its tag/payload is read. Constant-table and
+default counts receive an additional remaining-budget preflight before loops.
+The per-value check remains authoritative because a function can contain more
+values than its immediate table counts reveal. Counters are private and reset
+per read, not per chunk or function.
+
+`decode_bytes_with_options(bytes, options)` now accepts `max_values`. Inspection
+adds `inspect_bytes_with_options(bytes, options)` while preserving the exact
+one-argument `inspect_bytes(bytes)` wrapper. Nil/absent options or an absent key
+use the hard ceiling. An explicit `max_values` must be an integer in
+`0..1000000`; explicit nil, booleans, strings, NaN/infinities, fractions and
+out-of-range values are rejected without echoing the input. Unknown option keys
+remain ignored for compatibility. `Inspect.MAX_TOTAL_VALUES` and the shared
+`value_limit_from_options` validator keep the two paths aligned.
+
+Example (one nil constant; no instructions, spans or source metadata):
+
+```pblang
+let Decode = import("stdlib:host_pbck_decode.sapp");
+let Inspect = import("stdlib:host_pbck_inspect.sapp");
+let bytes = [80,66,67,75,1,0,0,0,0,1,0,0,0,2,0,0,0,0,0];
+let decoded = Decode.decode_bytes_with_options(bytes, map{ max_values: 1, compact: true });
+let requirements = Inspect.inspect_bytes_with_options(bytes, map{ max_values: 1 });
+```
+
+The public `constants` field still counts aggregate constant-table entries,
+not defaults. No budget fields were added to output schemas. Format/layout is
+unchanged; previously admitted artifacts exceeding the new combined value
+ceiling are intentionally rejected. File wrappers and the byte wrappers use
+the fixed default; tighter limits are explicitly selected through these options
+APIs, not automatically forwarded from separate VM/linker options.
+
+`host_pbck_value_budget_test.sapp` covers exact small limits, nested defaults,
+nested tables, siblings, scalar tags, invalid configuration and exact wrapper
+result parity. It first demonstrated ignored `max_values`, then passed after
+the fix. Tests use tiny artifacts rather than allocating a million-node tree.
+Five selected semantic tests (value budget, default depth, byte input, decoder,
+inspector) and the nine existing exact-diagnostic subprocess cases passed in
+the working tree and curated commit snapshot. Package build and portable lock
+publication passed. Three source checks found zero errors/warnings; lint kept
+existing style/unused-binding warnings. No full suite or native rebuild was run.
+Graphify update reached its 20-second limit again and is not marked complete.
+
+This limits decoded value count, not bytes of heap: variable-sized payloads,
+map/object overhead, instructions/captures, input-array allocation, unbounded
+`fs_read_bytes`, native PBCK decoding and execution budgets remain separate.
+It is not an immutable snapshot, sandbox, publisher check or 1.0 readiness claim.
 
 ## Publisher boundary: measurement is not authorization
 
