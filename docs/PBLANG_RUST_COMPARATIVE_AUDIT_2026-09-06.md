@@ -10,8 +10,8 @@ completed line-by-line audit of every file, all tests, dependencies or hardware.
 
 Base commit: `30a450a` (full identity available in repository history). Analysis
 used the live working tree, which already had 41 modified tracked paths and 152
-untracked status entries. That work was preserved. This continuation changes only
-this report; it does not fix or retire either implementation.
+untracked status entries. That work was preserved. The original continuation
+changed only this report. Subsequent source fixes are recorded separately below.
 
 Inventory is not coverage: `crates/` plus `src/` contain 90 Rust source files,
 58,519 lines; `stdlib/` contains 639 `.sapp` files, including 19 compiler modules
@@ -41,6 +41,9 @@ No gate below currently has enough evidence for PASS. Individual working feature
 and passing targeted tests remain positive evidence in the audit; their success
 does not compensate for an unrelated failing release gate. Readiness is not an
 average score or a percentage derived from test-file counts.
+
+The matrix records the original gate evidence. The remediation ledger below
+supersedes individual finding status; no whole release gate has been promoted.
 
 ### Acceptance and evidence matrix
 
@@ -88,6 +91,9 @@ runs on isolated release hosts after a stable slice; it is not triggered by this
 report update. Version, release tag and publication remain unchanged.
 
 ## Architecture: where the implementation actually lives
+
+The source observations below preserve the original audit evidence. See the
+dated remediation ledger at the end for current closure/partial-fix status.
 
 | Route | Owning code | Meaning of its result |
 | --- | --- | --- |
@@ -339,3 +345,69 @@ To close this audit rather than relabel partial coverage as complete:
 Source review alone cannot provide these absent executions or prove zero future
 vulnerabilities. No version bump, universal support declaration or safety-model
 replacement is authorized or justified by this report.
+
+## Remediation ledger — 2026-09-07, first implementation slice
+
+The maintainer explicitly authorized repairing the retained Rust implementation
+for these findings, then returning it to maintenance only for concrete issues.
+New language/product development remains PBLang-first/PBLang-only. This is not
+authorization for unrelated Rust features, a release or a version bump.
+
+Source baseline: `268a274`, plus preserved existing working-tree changes. The
+fix identity is the commit containing this ledger. The live tree is not a clean
+release candidate; unrelated files and the pre-existing lock change are excluded
+from this scoped commit. The local lock was refreshed after standard-library
+changes, then made repository-relative with `tools/pblock.sapp`.
+
+| Finding | Current disposition | Fix and evidence |
+| --- | --- | --- |
+| C1 | Fixed and focused regressions passed | `compiler/optimizer.sapp` no longer rewrites unknown `x op 0`. The public pass only evaluates numeric literal pairs within one basic block and remaps all supported jump targets after compaction. Tests cover the original wrong-branch result, loops, overloaded add/subtract/multiply effects, output types/values, input preservation, incoming edges and jump-to-end. |
+| C2 | Partial fix; remains open | Optional-to-optional payload comparison now precedes destination unwrapping. Positive/negative numeric, array, map and result tests pass. Nil arithmetic and retained Rust call/index checking discrepancies remain. |
+| C3 | Legacy lifecycle defect fixed; focused regressions passed | Legacy handle-returning APIs are unchanged. `release(handle)` releases one active borrow of any supported kind; exact ID APIs were added. Tests cover shared/mutable/unique cleanup, conflicts, dropped/unborrowed handles, active-count balance and idempotent exact release without consuming a newer borrow. Raw numeric IDs remain guessable; this does not establish hostile-caller isolation. |
+| P2 | Source/library fix verified; deployment qualification pending | Retained Rust publisher rejects non-HTTPS/ambiguous URLs before package access and derives both endpoints on the same origin/base path. TLS is explicit, redirects are disabled, only `2xx` succeeds, requests have a 30-second timeout and a refresh retries once. Four admission/response/redirect tests plus two positive refresh/retry tests pass. No live registry or updated host executable was deployed. |
+| P4 | Partial sink repair only; remains open | Hosted publication now serializes metadata with `serde_json` rather than string interpolation. Filename admission and the other manifest-validation concerns were not repaired in this slice. |
+
+Security review approved the narrow C3 and P2 changes after inspecting their
+actual diff. That review is not a certification of the whole VM or installer.
+P1, P3, P5–P7, C4–C5, S1–S6 and prior A1–A7 remain open; the broader readiness,
+compatibility, performance, dependency and physical-platform evidence is still
+required. **Overall decision remains NOT READY for 1.0.0.**
+
+### Executed evidence and limits
+
+- The new C1, optional C2 and C3 tests each failed before their source fix, then
+  passed after it. The new P2 public HTTP rejection test likewise failed before
+  the Rust fix (package access occurred before URL admission), then passed.
+- PBLang runner: `target/release/pblang` version `0.6.0`, SHA-256
+  `74ca877f685c16a27804ab9e9310d0b94ef2151d32fd9dce7ae5018aef7a00e4`.
+  It loads the changed PBLang modules, but is not a rebuilt host containing the
+  new Rust package-manager code. That code was compiled/tested as its own crate.
+- `bash scripts/t --trusted selfhost_optimizer_strength selfhost_optimizer_fold
+  selfhost_typeck_optional selfhost_typeck_parity memory_safety_legacy_release
+  memory_safety_stdlib memory_safety_builtins`: **7/7 passed**, exit 0, with
+  20 seconds/test, 2 GiB address-space cap and capped temporary output.
+- `cargo test --offline --locked -j 1 -p pblang-pm --lib authenticated_ --
+  --test-threads=1`: **4/4 passed**. Separate exact-name selections for
+  `publish_retries_on_401_with_refresh_token` and
+  `refresh_access_token_json_escapes_refresh_token`: **1/1 each passed**.
+  Each invocation had a 45-second external deadline and 3 GiB address-space cap.
+  Network effects were local synthetic fixtures only, with dummy tokens; no
+  process-global token environment mutation and no real publication occurred.
+- Local `pblang build .`, portable lock publication, and a second build after
+  refresh: exit 0. The initial stale-hash manifest-validator warning was not a
+  successful validation; the subsequent build used the refreshed lock.
+- PBLang lint on all seven touched PBLang source/test files: exit 0 with existing
+  owner-module warnings plus the linter's `a != a` NaN-test false positive and
+  an explicit-boolean style warning. The differential helper no longer converts
+  unexpected exceptions into a `"THREW"` success sentinel or stringifies values
+  for equality. Numeric NaN equivalence is explicit: runtime `% 0` yields NaN,
+  not the exception implied by the old test comment.
+- `rustfmt --check --edition 2021 crates/pblang-pm/src/lib.rs`: exit 0.
+  `cargo clippy --offline --locked -j 1 -p pblang-pm --lib --no-deps`: exit 0,
+  three pre-existing dead-code warnings. No full workspace suite was run.
+- `graphify update .` reached its external 20-second deadline (exit 124), with
+  no completion output. The graph update is not claimed as completed.
+
+Reproduction uses the reviewed live dependency tree, not unrelated generated
+product artifacts. A clean candidate rebuild and broad compatibility campaign
+remain separate requirements; these targeted successes do not replace them.

@@ -480,6 +480,32 @@ The runtime's memory safety (no leaks, no cycles) is already handled by the RC +
 
 ## 13. Bounded memory and device-facing work
 
+### Borrow API compatibility (2026-09-07)
+
+`memory_safety.borrow`, `borrow_mut`, `move_val`, `try_borrow`, and
+`try_borrow_mut` retain their legacy ownership-handle return values.
+`release(handle)` now releases one matching shared, mutable, or unique borrow;
+it rejects an unborrowed or dropped handle. Releasing a unique borrow does not
+revive a moved value.
+
+For individual borrow identity, prefer `borrow_id`, `borrow_mut_id`, `move_id`,
+`try_borrow_id`, and `try_borrow_mut_id`, paired with `release_id(id)`. The try
+forms return `{some: id}` or `{none: true}`. ID release follows the runtime's
+idempotent cleanup contract: repeating an old release cannot consume a newer
+borrow. Do not mix ownership handles and borrow IDs, even when numeric values
+happen to coincide. These IDs are not unforgeable capabilities against other
+code in the same VM. Cleanup after exhausted budgets/process abort is not proved
+by these helpers.
+
+```pblang
+let mem = import("stdlib:memory_safety.sapp");
+let value = mem.own(10);
+let id = mem.borrow_mut_id(value);
+mem.release_id(id);
+mem.write(value, 11);
+mem.drop(value);
+```
+
 The runtime ownership tracker is complemented by pblang-only admission APIs:
 
 ```pblang

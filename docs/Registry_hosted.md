@@ -97,26 +97,26 @@ rollback/expiry/namespace delegation are also still required for production.
 
 ### `pblang publish`
 
-- Reads **`PBLANG_REGISTRY_INDEX`** (env) as the registry base URL.
-- For **file-based registries**, `PBLANG_REGISTRY_INDEX=file:///path/to/registry_dir`:
-  - `pblang publish` behaves as a hosted-style wrapper around the existing local registry:
-    it packages the current manifest dir, validates that the package is self-contained and
-    has at least one pblang module entry, and delegates to the same logic as
-    `pblang publish --registry-dir /path/to/registry_dir`.
-  - This updates `<registry_dir>/index.json` and writes a tarball named
-    `<name>-<version>.tar.gz` under the registry directory.
-- For **hosted registries** (http/https), `PBLANG_REGISTRY_INDEX=https://registry.example.com`:
-  - `pblang publish` builds a tarball from the current package root (same file set as
-    `create_package_tarball`), computes its sha256, and POSTs a multipart/form-data body
-    to `PBLANG_REGISTRY_INDEX + "/publish"`.
-  - Multipart fields:
-    - `tarball` — raw tar.gz bytes, filename `<name>-<version>.tar.gz`, `Content-Type: application/gzip`.
-    - `sha256` — hex-encoded sha256 of the tarball.
-    - `metadata` — JSON object `{ "name": "<name>", "version": "<version>", "description": "<desc>" }`.
-  - Auth: bearer token via the request auth header, where the token is read from
-    `PBLANG_REGISTRY_TOKEN` or optional CLI flag `--registry-token=<token>`.
-  - Server is expected to enforce immutability per `<name> + <version>` and may reject
-    mismatched content.
+- Reads **`PBLANG_REGISTRY_INDEX`** as the hosted registry base URL and
+  **`PBLANG_REGISTRY_TOKEN`** as the bearer token. Token CLI flags are disabled.
+- The public `publish_package` client accepts **HTTPS only**, at most 8192 URL
+  bytes, with no userinfo, query, fragment, backslashes or control characters.
+  Invalid URLs reject before package reads and refresh-token lookup. An optional
+  base path is retained for both `publish` and `auth/refresh` endpoints.
+- The request is JSON `{ "name": string, "version": string, "tarball": string }`,
+  where `tarball` is base64-encoded gzip-tar bytes. Metadata is JSON-escaped;
+  this is not the multipart design previously proposed above.
+- The client explicitly enables TLS, follows no redirects, accepts only `2xx`,
+  and applies a 30-second request timeout. `PBLANG_ALLOW_INSECURE_HTTP` does not
+  enable authenticated HTTP publication, including loopback destinations.
+- A `401` may read `PBLANG_REGISTRY_REFRESH_TOKEN`, POST JSON to the validated
+  refresh endpoint, then retry publication once. Refresh and retry use the same
+  no-redirect agent. No token is passed on a command line by this flow.
+- Local registries use the explicit `pblang publish --registry-dir` path, not
+  an implicit `file://` escape through the hosted HTTP client.
+- Unit tests use a private transport seam and local dummy tokens. They do not
+  establish a successful live TLS registry deployment, publisher authenticity,
+  revocation, rollback protection or immutable artifact handoff.
 
 ### `pblang search <query>`
 

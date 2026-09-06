@@ -2479,15 +2479,96 @@ pub fn publish_to_registry_dir(package_dir: &Path, registry_dir: &Path) -> Resul
     Ok(())
 }
 
-/// Publish a package to a hosted registry via HTTP.
+fn authenticated_registry_endpoints(registry_url: &str) -> Result<(url::Url, url::Url), String> {
+    let rejected = || "publish: registry URL must be unambiguous HTTPS".to_string();
+    if registry_url.len() > 8192
+        || registry_url.trim() != registry_url
+        || registry_url.contains('\\')
+        || registry_url.chars().any(char::is_control)
+        || !registry_url
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+    {
+        return Err(rejected());
+    }
+    let authority = registry_url
+        .split_once("://")
+        .ok_or_else(rejected)?
+        .1
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(rejected());
+    }
+    let mut base = url::Url::parse(registry_url).map_err(|_| rejected())?;
+    if base.scheme() != "https"
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return Err(rejected());
+    }
+    if !base.path().ends_with('/') {
+        base.set_path(&format!("{}/", base.path()));
+    }
+    Ok((
+        base.join("publish").map_err(|_| rejected())?,
+        base.join("auth/refresh").map_err(|_| rejected())?,
+    ))
+}
+
+fn authenticated_registry_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+}
+
+fn publish_response(result: Result<ureq::Response, ureq::Error>) -> Result<(), String> {
+    match result {
+        Ok(response) if (200..300).contains(&response.status()) => Ok(()),
+        // With redirects disabled, ureq returns 3xx as Ok: never call it success.
+        Ok(_) => Err("publish: non-success HTTP status".into()),
+        Err(_) => Err("publish: HTTP request failed".into()),
+    }
+}
+
+/// Publish a package to a hosted registry via HTTPS only, without redirects.
 /// Sends the tarball as a JSON POST to `{registry_url}/publish`.
 ///
 /// ## Token refresh (M4-gamma)
 /// If the server returns **401 Unauthorized** the function checks for the
 /// `PBLANG_REGISTRY_REFRESH_TOKEN` environment variable.  When present it
-/// calls [`refresh_access_token`] and retries the publish exactly once with
+/// calls the same validated registry's refresh endpoint and retries exactly once with
 /// the new token.  A successful retry prints `Refreshed token and retried`.
 pub fn publish_package(registry_url: &str, package_dir: &Path, token: &str) -> Result<(), String> {
+    // Admission precedes package access and refresh-token lookup. The download
+    // development HTTP switch deliberately cannot weaken authenticated publishing.
+    let (publish_url, refresh_url) = authenticated_registry_endpoints(registry_url)?;
+    let agent = authenticated_registry_agent();
+    publish_package_to_endpoints(
+        &agent,
+        publish_url.as_str(),
+        refresh_url.as_str(),
+        package_dir,
+        token,
+        || std::env::var("PBLANG_REGISTRY_REFRESH_TOKEN").unwrap_or_default(),
+    )
+}
+
+// Private transport seam lets local fixture tests exercise retry behavior without
+// adding an HTTP escape hatch to the public production API.
+fn publish_package_to_endpoints(
+    agent: &ureq::Agent,
+    publish_url: &str,
+    refresh_url: &str,
+    package_dir: &Path,
+    token: &str,
+    refresh_token: impl FnOnce() -> String,
+) -> Result<(), String> {
     validate_publish_package(package_dir)?;
     let tarball = create_package_tarball(package_dir)?;
     let b64 = base64_encode(&tarball);
@@ -2504,10 +2585,9 @@ pub fn publish_package(registry_url: &str, package_dir: &Path, token: &str) -> R
         .as_ref()
         .and_then(|p| p.version.as_deref())
         .unwrap_or("");
-    let body = format!(r#"{{"name":"{name}","version":"{version}","tarball":"{b64}"}}"#);
-    let url = format!("{}/publish", registry_url.trim_end_matches('/'));
+    let body = serde_json::json!({"name": name, "version": version, "tarball": b64}).to_string();
 
-    let mut req = ureq::post(&url);
+    let mut req = agent.post(publish_url);
     if !token.is_empty() {
         req = req.set("Authorization", &format!("Bearer {token}"));
     }
@@ -2516,10 +2596,9 @@ pub fn publish_package(registry_url: &str, package_dir: &Path, token: &str) -> R
         .send_string(&body);
 
     match result {
-        Ok(_) => Ok(()),
         Err(ureq::Error::Status(401, _)) => {
             // On 401: attempt a token refresh if PBLANG_REGISTRY_REFRESH_TOKEN is set.
-            let refresh_tok = std::env::var("PBLANG_REGISTRY_REFRESH_TOKEN").unwrap_or_default();
+            let refresh_tok = refresh_token();
             if refresh_tok.is_empty() {
                 return Err(
                     "publish failed: 401 Unauthorized                      (set PBLANG_REGISTRY_REFRESH_TOKEN to enable auto-refresh)"
@@ -2527,20 +2606,21 @@ pub fn publish_package(registry_url: &str, package_dir: &Path, token: &str) -> R
                 );
             }
             // Obtain a new access token.
-            let new_token = refresh_access_token(registry_url, &refresh_tok)?;
+            let new_token = refresh_access_token_at(agent, refresh_url, &refresh_tok)?;
             // Retry publish once with the refreshed token.
-            let mut retry_req = ureq::post(&url);
+            let mut retry_req = agent.post(publish_url);
             if !new_token.is_empty() {
                 retry_req = retry_req.set("Authorization", &format!("Bearer {new_token}"));
             }
-            retry_req
-                .set("Content-Type", "application/json")
-                .send_string(&body)
-                .map_err(|e| format!("publish HTTP error (after token refresh): {e}"))?;
+            publish_response(
+                retry_req
+                    .set("Content-Type", "application/json")
+                    .send_string(&body),
+            )?;
             println!("Refreshed token and retried");
             Ok(())
         }
-        Err(e) => Err(format!("publish HTTP error: {e}")),
+        other => publish_response(other),
     }
 }
 
@@ -2548,13 +2628,20 @@ pub fn publish_package(registry_url: &str, package_dir: &Path, token: &str) -> R
 ///
 /// Expects the server to respond with `{"token": "<new_access_token>"}`.
 /// Returns the new access token string on success.
-fn refresh_access_token(registry_url: &str, refresh_token: &str) -> Result<String, String> {
-    let refresh_url = format!("{}/auth/refresh", registry_url.trim_end_matches('/'));
+fn refresh_access_token_at(
+    agent: &ureq::Agent,
+    refresh_url: &str,
+    refresh_token: &str,
+) -> Result<String, String> {
     let refresh_body = serde_json::json!({ "refresh_token": refresh_token }).to_string();
-    let resp = ureq::post(&refresh_url)
+    let resp = agent
+        .post(refresh_url)
         .set("Content-Type", "application/json")
         .send_string(&refresh_body)
-        .map_err(|e| format!("token refresh HTTP error: {e}"))?;
+        .map_err(|_| "token refresh: HTTP request failed".to_string())?;
+    if !(200..300).contains(&resp.status()) {
+        return Err("token refresh: non-success HTTP status".into());
+    }
     let resp_str = resp
         .into_string()
         .map_err(|e| format!("token refresh: read response body: {e}"))?;
@@ -3782,13 +3869,127 @@ version = "0.1.0"
         stream.flush().expect("flush response");
     }
 
+    fn accept_publish_fixture(listener: &TcpListener) -> TcpStream {
+        listener.set_nonblocking(true).expect("nonblocking fixture");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture accept timed out"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("fixture accept failed: {error}"),
+            }
+        }
+    }
+
+    struct PublishFixture(PathBuf);
+    impl Drop for PublishFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn authenticated_registry_url_policy() {
+        for invalid in [
+            "http://registry.invalid",
+            "file:///registry",
+            "https:registry.invalid",
+            "https://user@registry.invalid",
+            "https://user:secret@registry.invalid",
+            "https://registry.invalid?token=secret",
+            "https://registry.invalid#fragment",
+            "https://registry.invalid\\@other.invalid",
+            " https://registry.invalid",
+            "https://registry.invalid\n",
+            "https://registry.invalid/\tpath",
+            "https://",
+            "https://@registry.invalid",
+            "https:////registry.invalid",
+        ] {
+            assert_eq!(
+                authenticated_registry_endpoints(invalid).unwrap_err(),
+                "publish: registry URL must be unambiguous HTTPS"
+            );
+        }
+        for (base, publish, refresh) in [
+            (
+                "https://registry.invalid",
+                "https://registry.invalid/publish",
+                "https://registry.invalid/auth/refresh",
+            ),
+            (
+                "https://registry.invalid/api/v1",
+                "https://registry.invalid/api/v1/publish",
+                "https://registry.invalid/api/v1/auth/refresh",
+            ),
+            (
+                "https://registry.invalid/api/v1/",
+                "https://registry.invalid/api/v1/publish",
+                "https://registry.invalid/api/v1/auth/refresh",
+            ),
+            (
+                "https://[::1]:8443/api",
+                "https://[::1]:8443/api/publish",
+                "https://[::1]:8443/api/auth/refresh",
+            ),
+        ] {
+            let endpoints = authenticated_registry_endpoints(base).unwrap();
+            assert_eq!(endpoints.0.as_str(), publish);
+            assert_eq!(endpoints.1.as_str(), refresh);
+        }
+    }
+
+    #[test]
+    fn authenticated_publish_response_requires_2xx() {
+        for status in [200, 201, 204] {
+            assert!(
+                publish_response(Ok(ureq::Response::new(status, "fixture", "").unwrap())).is_ok()
+            );
+        }
+        for status in [301, 302, 307, 308] {
+            assert!(
+                publish_response(Ok(ureq::Response::new(status, "fixture", "").unwrap())).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_refresh_rejects_redirect_without_following() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut stream = accept_publish_fixture(&listener);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let _ = read_http_request(&mut stream);
+            stream.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/never-follow\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let result = refresh_access_token_at(
+            &authenticated_registry_agent(),
+            &format!("http://{address}/auth/refresh"),
+            "fixture-token",
+        );
+        server.join().unwrap();
+        assert_eq!(
+            result.unwrap_err(),
+            "token refresh: non-success HTTP status"
+        );
+    }
+
     #[test]
     fn refresh_access_token_json_escapes_refresh_token() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let addr = listener.local_addr().expect("server addr");
 
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut stream = accept_publish_fixture(&listener);
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("set read timeout");
@@ -3800,11 +4001,21 @@ version = "0.1.0"
             write_http_response(&mut stream, 200, r#"{"token":"escaped-token"}"#);
         });
 
-        let token =
-            refresh_access_token(&format!("http://{addr}"), "refresh\"token\\with\\slashes")
-                .expect("refresh should succeed");
+        let token = refresh_access_token_at(
+            &authenticated_registry_agent(),
+            &format!("http://{addr}/auth/refresh"),
+            "refresh\"token\\with\\slashes",
+        )
+        .expect("refresh should succeed");
         assert_eq!(token, "escaped-token");
         server.join().expect("join test server thread");
+    }
+
+    #[test]
+    fn authenticated_publish_rejects_http_before_package_access() {
+        let error = publish_package("http://127.0.0.1:1", Path::new(""), "fixture-token")
+            .expect_err("HTTP publication must reject before package reads or network");
+        assert_eq!(error, "publish: registry URL must be unambiguous HTTPS");
     }
 
     #[test]
@@ -3817,11 +4028,8 @@ version = "0.1.0"
         let publish_calls_server = Arc::clone(&publish_calls);
         let refresh_calls_server = Arc::clone(&refresh_calls);
         let server = thread::spawn(move || {
-            listener
-                .set_nonblocking(false)
-                .expect("set blocking mode for test server");
             for _ in 0..3 {
-                let (mut stream, _) = listener.accept().expect("accept connection");
+                let mut stream = accept_publish_fixture(&listener);
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .expect("set read timeout");
@@ -3858,9 +4066,10 @@ version = "0.1.0"
             }
         });
 
-        let package_dir = std::env::temp_dir().join("pblang_publish_retry_pkg");
-        let _ = std::fs::remove_dir_all(&package_dir);
-        std::fs::create_dir_all(&package_dir).expect("create package dir");
+        // Exclusively create an owned fixture; never clear a predictable shared path.
+        let package_dir = registry_cache_staging(&std::env::temp_dir(), "publish-retry-fixture")
+            .expect("create owned package fixture");
+        let _fixture = PublishFixture(package_dir.clone());
         std::fs::write(
             package_dir.join("pblang.toml"),
             r#"[package]
@@ -3875,18 +4084,15 @@ version = "0.1.0"
         )
         .expect("write source");
 
-        // SAFETY: this test controls process env and restores it before exit.
-        #[allow(unused_unsafe)]
-        unsafe {
-            std::env::set_var("PBLANG_REGISTRY_REFRESH_TOKEN", "refresh-token");
-        }
         let registry_url = format!("http://{}", addr);
-        let result = publish_package(&registry_url, &package_dir, "stale-token");
-        // SAFETY: restore env mutation from this test.
-        #[allow(unused_unsafe)]
-        unsafe {
-            std::env::remove_var("PBLANG_REGISTRY_REFRESH_TOKEN");
-        }
+        let result = publish_package_to_endpoints(
+            &authenticated_registry_agent(),
+            &format!("{registry_url}/publish"),
+            &format!("{registry_url}/auth/refresh"),
+            &package_dir,
+            "stale-token",
+            || "refresh-token".into(),
+        );
 
         assert!(
             result.is_ok(),
@@ -3903,7 +4109,6 @@ version = "0.1.0"
             "expected exactly one token refresh request"
         );
 
-        let _ = std::fs::remove_dir_all(&package_dir);
         server.join().expect("join test server thread");
     }
 }
