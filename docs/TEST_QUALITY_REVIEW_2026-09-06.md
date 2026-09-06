@@ -57,6 +57,22 @@ See `LOW_LEVEL_REVIEW_2026-09-06.md` for limits not established by these tests.
 
 ## Required follow-through
 
+Follow-up testing found that the retained compiler's `ExprKind::Try` emits
+`OpPop` for the caught value before evaluating the fallback expression. The
+native parser models `try expression catch expression`, without a named error
+binding. Consequently `catch error { ... }` / `catch str(error)` must not be
+used as proof that the actual exception detail was inspected: `error` can refer
+to the builtin instead. This is particularly relevant to older privacy/error
+detail checks. Language/docs parity and those older assertions need a separate
+review; their correctness is not established here.
+
+The new PBCK default-depth supervisor checks uncaught child stderr and exact
+exit status instead. An any-error assertion alone would pass the old late
+truncation behavior, hiding the missing early recursion guard. Semantic boundary
+tests separately preserve valid 64-level decoding and reject 65 levels. The
+supervisor checks nine cases across all three readers, never treats timeout or
+an unexpected failure as success, and does not print captured paths/source logs.
+
 Classify every test by purpose (unit/contract/integration/physical), effects,
 owned fixtures, platform, dependencies, time/memory budget and cleanup. Distinguish
 unsupported/skipped/unavailable from passed. Review broad exception catches for

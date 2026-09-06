@@ -93,6 +93,45 @@ claimed. The normal optimized binary build had completed, and all four PBLang
 regressions passed using that binary. Both timed-out builds were terminated;
 timeouts were not retried into a reported test success.
 
+## Follow-up: PBLang default-value recursion
+
+Both PBLang PBCK readers checked depth in `_chunk`, but function-valued defaults
+recurse through `_value` before any body chunk is reached. A deeply nested
+encoded prefix could therefore grow the parser's call stack past the intended
+64-level bound before a later truncation/body check rejected it. This is an
+availability/correctness finding, not demonstrated native memory corruption.
+
+`_value` now checks depth on entry, before reading another tag, in both modules.
+The existing `depth > MAX_DEPTH` boundary is preserved. The decoder also checks
+default/type counts against remaining bytes before their loops, matching the
+inspector's preflight. Bytecode format and returned report schemas are unchanged.
+
+`host_pbck_default_depth_test.sapp` verifies complete 64-function default chains,
+the retained table-count semantics, both decoder layouts and rejection at 65.
+`tests/tooling/host_pbck_default_errors.sh` checks nine exact exit/diagnostic cases
+against a pinned local release executable, with bounded child time/memory/output
+and private temporary logs. The 66-level truncated prefix produced the wrong
+late error before the fix; it now produces the nesting-limit error. These are
+small parsing-only fixtures; no guest program or host-crashing input is executed.
+The source test is portable; the supervisor requires Bash and GNU timeout and
+has been exercised on Linux only.
+
+Validation: run `bash tests/tooling/host_pbck_default_errors.sh` for the nine
+diagnostic cases. The `host_pbck_default_depth`, `host_pbck_byte_input`,
+`host_pbck_decode` and `host_pbck_inspect` semantic tests all passed, both in the
+working tree and in a curated commit snapshot. Three source checks found no
+errors/warnings; native lint retained existing style/unused-binding warnings.
+Package build and portable-lock publication passed. No full suite or native
+rebuild was needed. This follow-up's Graphify update also hit the 20-second
+deadline, so graph freshness remains unverified.
+
+Unresolved: chunk `constants` counters do not count default-value nodes, so an
+aggregate decoded-value/heap budget is still needed for wide default trees.
+The inaccurate every-allocation-is-budgeted comment was removed. Unbounded
+PBLang file reads, snapshot consistency, execution budgets and the linker's
+different depth-accounting model are not changed by this slice. No Rust source
+or language catch semantics were modified.
+
 ## Publisher boundary: measurement is not authorization
 
 `publisher_artifact_admission` and `publisher_trust_store` accept caller-selected
