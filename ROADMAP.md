@@ -1,11 +1,68 @@
 # pblang Roadmap
 
-## Current: v0.5 — "Powerful Prototype / Early-Stage Platform"
+## Current: 0.6.0, alpha channel — working toward 1.0.0
 
-The core VM, package manager, and CLI are production-quality. The type system and
-native executable bundler are in early stages.
+Updated 2026-09-06. Version/channel come from `pblang.toml`; neither the
+presence of a feature nor a passing focused test establishes production readiness.
+The older schedules and checkboxes below are historical planning notes, not
+current completion evidence. No release date or automatic version bump is set.
 
-**Current test status**: semantics suite **160 passed, 2 ignored** (see `docs/CURRENT_STATUS.md` for details).
+### Required order
+
+1. Fix reproducible correctness/data-preservation defects (including diagnostic
+   suggestions and autofix), with negative and compatibility regressions.
+2. Close native safety and resource boundaries: exact FFI ABI enforcement/raw
+   bypass closure, bytecode admission, hard heap/preemption and isolation.
+3. Freeze the supported language, bytecode and stable-library contracts; define
+   migration/deprecation rules. Keep preview modules explicitly separate.
+4. Measure startup, compilation, execution, memory and latency on identical
+   workloads before optimizing; preserve correctness and deterministic fallbacks.
+5. Verify each supported OS/architecture/backend independently; distinguish
+   metadata models, emulators, hosted VMs and physical device evidence.
+6. Qualify the release candidate using the compatibility gate below, and publish
+   only with verified operator trust, artifact identity and rollback policy.
+
+### Mandatory final compatibility gate before 1.0.0
+
+The final release must check existing applications, PBLang products, examples
+and historical source against the candidate, not just the language's unit tests.
+
+- Create an explicit, reviewed inventory of accessible code/projects. Record
+  excluded, unavailable, private or unsupported cases separately; untested is
+  not passing. Do not silently scan private data or execute discovered code.
+- Bind each corpus snapshot and test result to the exact candidate and baseline
+  artifacts. Compare the 0.6.0 baseline plus available supported interim releases;
+  retain baseline defects as defects, not new regressions or required behavior.
+- Check parsing, typing, compilation, runtime results/errors, public APIs,
+  imports/packages, file-format round trips, install/upgrade and persistence.
+  Use disposable fixtures/copies, never live user documents or databases.
+- Exercise CLI, GUI, web and mobile surfaces where implemented, plus each
+  independently implemented polyglot adapter and supported emulator/backend.
+  Unsupported targets remain explicit, not silently substituted.
+- Include focused security, malformed-input, cleanup/cancellation and resource
+  tests plus scheduled broader regression/soak coverage on isolated release hosts.
+  Daily local work stays targeted; do not run all suites on connected user devices.
+- Record every incompatible change with severity, migration guidance and exact
+  evidence. No unexplained release-blocking regression may remain. Security fixes
+  need not preserve unsafe behavior, but must document the compatibility impact.
+- Require a reviewed report listing passed, failed, skipped, unavailable and
+  not-tested cases. Do not claim compatibility with all possible programs/devices.
+
+This gate is a release requirement, not a background automation or proof that it
+has already run. Current evidence and blockers live in
+[`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md),
+[`docs/LOW_LEVEL_REVIEW_2026-09-06.md`](docs/LOW_LEVEL_REVIEW_2026-09-06.md) and
+[`docs/DIAGNOSTICS_AUTOFIX.md`](docs/DIAGNOSTICS_AUTOFIX.md).
+
+---
+
+## Historical v0.5 planning notes — not current readiness claims
+
+The former plan described the core as production-quality. That statement is
+superseded by the explicit current blockers above; it is not a safety guarantee.
+
+**Historical test count only**: 160 passed, 2 ignored. This is not a current run
+or an inventory of the current suite.
 
 ---
 
@@ -121,7 +178,7 @@ native executable bundler are in early stages.
 | `http_response` missing 50+ status codes | 🟡 Medium | ✅ **Fixed** — full RFC 7231 reason phrase table via `http_status_reason()` |
 | `serve_once_timeout()` ignored timeout_ms | 🟡 Low | ✅ **Fixed** — now passes timeout intent through |
 | MIME types missing charset and modern types | 🟡 Low | ✅ **Fixed** — 30+ MIME types with proper charset annotations |
-| `env_get` gated behind exec capability | 🟡 Low | ✅ **Fixed** — env reads are always safe; exec gate removed from `env_get` |
+| Historical `env_get` policy | Review required | Environment reads can expose secrets; do not treat them as always safe or infer current capability enforcement from this historical table. |
 
 ### New Standard Library Modules
 | Module | Description |

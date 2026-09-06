@@ -11,6 +11,12 @@ is granted.
 
 ## Quickstart
 
+**Development/trusted-code only.** The 2026-09-06 source review confirmed
+ABI-width and pointer/string marshalling defects in the retained bootstrap.
+Do not grant FFI to untrusted scripts. See
+[low-level findings and required fixes](LOW_LEVEL_REVIEW_2026-09-06.md).
+The examples below describe the API, not production safety certification.
+
 ```pblang
 // 1. Open a library. Returns an opaque numeric handle.
 let lib = ffi_load("./libmylib.so");
@@ -83,17 +89,19 @@ let lib = ffi_load(lib_path);
 
 ### `ffi_call(handle, symbol: string, args: array<number>) -> number`
 
-The **numeric-only fast path**. All arguments must be numbers; the return
-value is always a `Number`. Useful for math libraries where every arg
-fits in an `i64` or `f64`.
+The **raw numeric path** calls the symbol through an `f64` argument/return
+signature. A numeric PBLang value does not make an integer C ABI compatible.
+This path does not enforce a host-owned signature and can cause undefined
+behavior for a mismatched declaration or arity.
 
 If you need anything richer (strings, pointers, void returns), use
 `ffi_call_typed` below.
 
 ### `ffi_call_typed(handle, symbol: string, sig: string, args: array) -> Value`
 
-Full signature dispatch. The `sig` string says what the C function looks
-like; the VM picks the matching `unsafe extern "C"` trampoline.
+Caller-declared signature dispatch. Accepted type labels do not establish
+exact C ABI marshalling: the current implementation collapses several distinct
+types into the same trampoline shape, as described below.
 
 #### Signature grammar
 
@@ -104,17 +112,21 @@ type := "i64" | "i32" | "f64" | "f32" | "bool" | "string" | "ptr"
 ret  := type | "void"
 ```
 
-`i32`/`f32` are passed/returned as `i64`/`f64` at the pblang Value level
-(everything is a Number) but the trampoline casts to the right C width.
+**Known defect:** `i32`/`f32` collapse to `i64`/`f64` trampoline shapes; the
+current trampoline does not restore the correct C width. Numeric conversion
+also needs finite, integral and range checks. Do not treat accepted signatures
+as evidence that narrow-width foreign calls are safe.
 
 `string` arguments are passed as `const char*` (null-terminated UTF-8);
-`string` returns are copied into a Rust `String` immediately and returned
-as a pblang string (null pointers become `nil`).
+`string` returns currently use an unbounded `CStr::from_ptr` scan before copying
+(null pointers become `nil`). Invalid or unterminated pointers can cause memory
+faults; bounded buffers, ownership and lifetime enforcement remain required.
 
-`ptr` and `i64` share the same trampoline shape (both 8-byte integer
-words). The grammar accepts both for documentation purposes.
+`ptr`, `bool` and `i64` currently share an integer trampoline shape. This is not
+a portable ABI equivalence. Pointer values also round through PBLang `Number`
+and can lose exact bits above 2^53; opaque host-owned pointer handles are needed.
 
-#### Supported shapes
+#### Currently dispatched shapes — not a safety guarantee
 
 The dispatch table is explicit to keep the `unsafe extern "C"` surface
 bounded. Adding a shape is local to `crates/pblang-vm/src/vm/ffi_dispatch.rs`.
@@ -204,8 +216,9 @@ library identity without reopening a mutable pathname.
 
 ## Error model
 
-Every error from the FFI surface is a `RuntimeError` with a span pointing
-at the call site, so a script can `try { ... } catch e { ... }`:
+Detected validation errors from the FFI surface are `RuntimeError` values with a span pointing
+at the call site. ABI undefined behavior and memory faults are not reliably
+catchable PBLang errors. The table below covers reported validation failures:
 
 | Error message | Cause |
 |---------------|-------|
