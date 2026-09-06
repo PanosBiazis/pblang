@@ -1,9 +1,9 @@
 # Bounded low-level review — 2026-09-06
 
-Source-only defensive review of the retained native FFI dispatch/policy and
-PBCK load/deserialization paths. No unsafe foreign call, exploit, native build
-or device test was executed. Findings remain open; documentation changes are
-not runtime remediation. JIT, allocator internals, dependency advisories and
+Initial source-only defensive review of the retained native FFI dispatch/policy
+and PBCK load/deserialization paths, followed by the scoped PBCK remediation
+below. No unsafe foreign call, exploit or device test was executed. FFI findings
+remain open. JIT, allocator internals, dependency advisories and
 all platform implementations were not exhaustively reviewed.
 
 ## High: caller-controlled ABI within an FFI grant
@@ -35,17 +35,63 @@ ownership and lifetime contracts. Verify later with isolated native fixtures.
 
 ## Medium: PBCK allocation and canonicality
 
-`src/main.rs` reads PBCK using whole-file `std::fs::read` before parsing;
-`crates/pblang-ir/src/lib.rs::Chunk` deserialization does not require consuming
-all input. CLI instruction/memory budgets also default to unset on the reviewed
-path. Untrusted bytecode therefore needs bounded admission and execution; this
+Originally `src/main.rs` read PBCK using whole-file `std::fs::read` before
+parsing, and native deserialization accepted trailing bytes/noncanonical flags.
+The follow-up replaces that read with `pbck_read_bounded`: at most 64 MiB of
+payload, an 8 KiB scratch buffer, and one excess byte consumed only to detect
+overflow. Growth requests are fallible and geometrically bounded; file metadata
+is not trusted. The slice deserializer independently checks the same byte cap,
+requires full consumption, and accepts exactly 0/1 at all six flag sites.
+
+Serializer-produced PBCK v1 layouts are unchanged. Previously accepted trailing
+bytes/noncanonical flags and artifacts above 64 MiB are intentionally rejected.
+The writer remains unbounded and can still produce an oversized artifact that
+the reader refuses; checked serialization/publication is a follow-up.
+
+CLI instruction/memory budgets still default to unset on the reviewed path.
+Decoded allocation amplification, allocator overhead, blocking-stream deadlines,
+namespace/snapshot consistency and structural bytecode verification are not
+solved by the input byte cap. Untrusted bytecode needs bounded execution; this
 review found a DoS/canonicality risk, not demonstrated native out-of-bounds
 corruption in the checked-reader bytecode path.
 
-Required fix: enforce byte limits before allocation, reject trailing bytes and
-noncanonical encodings, validate structural references/control flow, and apply
-explicit untrusted-execution budgets. Regression fixtures must never run a
-hostile program in the agent/user process.
+Remaining: validate structural references/control flow and apply explicit
+untrusted-execution budgets. Regression fixtures never execute hostile programs.
+
+## PBLang-only byte-array admission
+
+`host_pbck_inspect.sapp` and `host_pbck_decode.sapp` now share a complete byte-array
+validation pass before parsing. This rejects non-numbers, NaN/infinity,
+fractions, negative values and values above 255, including bytes in payloads
+the inspector skips (numeric constants/source spans). The pass is O(n), retains
+no copied payload, and follows the existing 64 MiB length gate. Decoder `compact`
+must be a boolean; absent/nil options retain normal decoding. Valid arrays and
+both compact/noncompact output schemas remain compatible.
+
+This is not an immutable concurrent-array snapshot. Their `decode_file` and
+`inspect_file` wrappers still call `fs_read_bytes` before admission, so they do
+not inherit the native CLI's bounded file-read guarantee.
+
+Focused regression evidence: native PBCK tests first reproduced trailing-byte
+and noncanonical-flag acceptance, then passed after remediation. The new
+`host_pbck_byte_input_test.sapp` first reproduced skipped-payload non-byte
+acceptance, then passed with decoder/inspector/PBCS hardening regressions.
+CLI fixtures now use unique auto-cleaned directories and compare raw output
+bytes, not lossy UTF-8 conversions. Validation on Linux x86-64: 11 focused IR
+tests, 3 freshly built native CLI integration tests and 4 PBLang regressions
+passed. The four PBLang tests and three source checks also passed against the
+curated commit snapshot, independent of unrelated working-tree changes. Debug
+and optimized native builds completed. No full suite or physical-platform
+verification was performed. Native/PBLang lint completed without errors, with
+style/unused-binding warnings retained. Graphify update reached its 20-second
+deadline; the graph update is not claimed complete.
+
+The 3 CLI integration tests above ran in the debug test profile. A separate
+optimized CLI test build hit 60-second and then 90-second limits while compiling
+test dependencies/the binary; no optimized CLI integration-test result is
+claimed. The normal optimized binary build had completed, and all four PBLang
+regressions passed using that binary. Both timed-out builds were terminated;
+timeouts were not retried into a reported test success.
 
 ## Publisher boundary: measurement is not authorization
 
@@ -62,8 +108,10 @@ experimental operation success, never as installation/launch permission.
 
 ## Implementation constraint and release gate
 
-Current project instructions forbid new Rust source. These native fixes require
-an explicit change to that constraint or a genuinely implemented PBLang native
-boundary—not a library claim or a version bump. Hard heap/preemption, isolation,
+The user explicitly authorized targeted retained-native fixes for this review;
+new product functionality remains PBLang-first. The self-hosted compiler/VM and
+native emitters coexist with the retained `src/main.rs` / native VM path used
+by `pblang run file.pbck`; self-hosting does not imply every installed executable
+uses the same implementation. Hard heap/preemption, isolation,
 revocation freshness and physical platform evidence remain release requirements.
 See the final compatibility gate in `ROADMAP.md` before any 1.0.0 release.

@@ -1428,6 +1428,46 @@ pub const PBCK_V1_VERSION: u8 = 1;
 /// file can't overflow the native stack. Far above any realistic compiler output.
 pub const PBCK_MAX_DEPTH: u32 = 256;
 
+/// Maximum encoded payload accepted by the native PBCK reader (64 MiB).
+/// This is not a decoded-heap budget or an execution/snapshot guarantee.
+pub const PBCK_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read one bounded payload without trusting file metadata. A blocking reader
+/// still requires an external deadline. At most one excess byte is consumed.
+pub fn pbck_read_bounded(reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    pbck_read_with_limit(reader, PBCK_MAX_BYTES)
+}
+
+fn pbck_read_with_limit(mut reader: impl std::io::Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind};
+    let mut out = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let remaining = limit - out.len();
+        let request = buffer.len().min(remaining.saturating_add(1));
+        let n = match reader.read(&mut buffer[..request]) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if n > request {
+            return Err(Error::new(ErrorKind::InvalidData, "pbck: invalid reader byte count"));
+        }
+        if n == 0 { return Ok(out); }
+        if n > remaining {
+            return Err(Error::new(ErrorKind::InvalidData, "pbck: artifact byte limit exceeded"));
+        }
+        let needed = out.len() + n;
+        if needed > out.capacity() {
+            // Geometric growth avoids a realloc/copy on every 8KiB read. The
+            // requested capacity never exceeds limit (allocator overhead may).
+            let target = needed.max(out.capacity().saturating_mul(2)).min(limit);
+            out.try_reserve_exact(target - out.len())
+                .map_err(|_| Error::new(ErrorKind::Other, "pbck: cannot reserve input buffer"))?;
+        }
+        out.extend_from_slice(&buffer[..n]);
+    }
+}
+
 #[inline]
 fn pbck_w_u32(out: &mut Vec<u8>, v: usize) {
     out.extend_from_slice(&(v as u32).to_le_bytes());
@@ -1598,6 +1638,13 @@ impl<'a> PbckReader<'a> {
         self.pos += 1;
         Ok(b)
     }
+    fn flag(&mut self, label: &str) -> Result<bool, String> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(format!("pbck: invalid {label} flag (expected 0 or 1)")),
+        }
+    }
     fn u32(&mut self) -> Result<usize, String> {
         let end = self.pos.checked_add(4).ok_or("pbck: offset overflow")?;
         let s = self.buf.get(self.pos..end).ok_or("pbck: truncated u32")?;
@@ -1657,7 +1704,7 @@ fn pbck_r_opcode(r: &mut PbckReader) -> Result<OpCode, String> {
             let n = r.u32()?;
             let mut captures = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
-                let is_local = r.u8()? != 0;
+                let is_local = r.flag("capture")?;
                 let idx = r.u32()?;
                 captures.push((is_local, idx));
             }
@@ -1692,7 +1739,7 @@ fn pbck_r_value(r: &mut PbckReader, depth: u32) -> Result<Value, String> {
     let tag = r.u8()?;
     Ok(match tag {
         0 => Value::Number(r.f64()?),
-        1 => Value::Bool(r.u8()? != 0),
+        1 => Value::Bool(r.flag("boolean")?),
         2 => Value::Nil,
         3 => alloc_string(r.str()?),
         4 => {
@@ -1715,7 +1762,7 @@ fn pbck_r_function(r: &mut PbckReader, depth: u32) -> Result<Function, String> {
             "pbck: function nesting too deep (exceeds {PBCK_MAX_DEPTH}): refusing to parse to avoid a stack overflow"
         ));
     }
-    let name = if r.u8()? != 0 { Some(r.str()?) } else { None };
+    let name = if r.flag("function-name")? { Some(r.str()?) } else { None };
     let arity = r.u32()?;
     let min_arity = r.u32()?;
     let n_defaults = r.u32()?;
@@ -1723,8 +1770,8 @@ fn pbck_r_function(r: &mut PbckReader, depth: u32) -> Result<Function, String> {
     for _ in 0..n_defaults {
         defaults.push(pbck_r_value(r, depth + 1)?);
     }
-    let is_vararg = r.u8()? != 0;
-    let param_types = if r.u8()? != 0 {
+    let is_vararg = r.flag("vararg")?;
+    let param_types = if r.flag("parameter-types")? {
         let n = r.u32()?;
         let mut pts = Vec::with_capacity(r.cap(n));
         for _ in 0..n {
@@ -1769,7 +1816,7 @@ fn pbck_r_chunk(r: &mut PbckReader, depth: u32) -> Result<Chunk, String> {
         let end = r.u32()?;
         spans.push(crate::chunk::Span { start, end });
     }
-    let source_name = if r.u8()? != 0 {
+    let source_name = if r.flag("source-name")? {
         Some(Rc::new(r.str()?))
     } else {
         None
@@ -1784,7 +1831,11 @@ fn pbck_r_chunk(r: &mut PbckReader, depth: u32) -> Result<Chunk, String> {
 }
 
 /// Load a [`Chunk`] from a PBCK v1 container produced by [`pbck_serialize`].
+/// Requires a single complete container, canonical flags, and <=64 MiB input.
 pub fn pbck_deserialize(buf: &[u8]) -> Result<Chunk, String> {
+    if buf.len() > PBCK_MAX_BYTES {
+        return Err("pbck: artifact byte limit exceeded".to_string());
+    }
     if buf.len() < 5 || &buf[0..4] != b"PBCK" {
         return Err("pbck: bad magic (not a PBCK file)".to_string());
     }
@@ -1795,7 +1846,9 @@ pub fn pbck_deserialize(buf: &[u8]) -> Result<Chunk, String> {
         ));
     }
     let mut r = PbckReader { buf, pos: 5 };
-    pbck_r_chunk(&mut r, 0)
+    let chunk = pbck_r_chunk(&mut r, 0)?;
+    if r.remaining() != 0 { return Err("pbck: trailing bytes".to_string()); }
+    Ok(chunk)
 }
 
 #[cfg(test)]
@@ -1869,6 +1922,107 @@ mod pbck_roundtrip_tests {
     #[test]
     fn pbck_rejects_bad_magic() {
         assert!(pbck_deserialize(b"NOPE.....").is_err());
+    }
+
+    #[test]
+    fn pbck_rejects_trailing_bytes() {
+        let mut bytes = pbck_serialize(&sample_chunk());
+        bytes.push(0);
+        assert_eq!(pbck_deserialize(&bytes).unwrap_err(), "pbck: trailing bytes");
+    }
+
+    #[test]
+    fn pbck_bounded_reader_limits_and_short_reads() {
+        use std::io::{Cursor, Read};
+        for length in [0, 1, 31, 32] {
+            let bytes = vec![42; length];
+            assert_eq!(pbck_read_with_limit(Cursor::new(&bytes), 32).unwrap(), bytes);
+        }
+        let mut oversized = Cursor::new(vec![42; 100]);
+        assert!(pbck_read_with_limit(&mut oversized, 32).is_err());
+        assert_eq!(oversized.position(), 33, "consume only one excess byte");
+        assert_eq!(pbck_read_with_limit(Cursor::new([]), 0).unwrap(), Vec::<u8>::new());
+        assert!(pbck_read_with_limit(Cursor::new([0]), 0).is_err());
+
+        struct ShortReader { interrupted: bool, inner: Cursor<Vec<u8>> }
+        impl Read for ShortReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let count = buf.len().min(3);
+                self.inner.read(&mut buf[..count])
+            }
+        }
+        let expected = vec![42; 33_000];
+        let actual = pbck_read_with_limit(ShortReader {
+            interrupted: false, inner: Cursor::new(expected.clone())
+        }, expected.len()).unwrap();
+        assert_eq!(actual, expected);
+        let payload = pbck_serialize(&sample_chunk());
+        assert_eq!(pbck_read_bounded(Cursor::new(&payload)).unwrap(), payload);
+    }
+
+    #[test]
+    fn pbck_bounded_reader_propagates_io_errors() {
+        struct BrokenReader(bool);
+        impl std::io::Read for BrokenReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 { Ok(buf.len() + 1) }
+                else { Err(std::io::ErrorKind::PermissionDenied.into()) }
+            }
+        }
+        assert_eq!(pbck_read_with_limit(BrokenReader(false), 32).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied);
+        assert_eq!(pbck_read_with_limit(BrokenReader(true), 32).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn pbck_flags_accept_only_zero_and_one() {
+        for byte in 0..=255u8 {
+            let buf = [byte];
+            let result = PbckReader { buf: &buf, pos: 0 }.flag("test");
+            match byte {
+                0 => assert_eq!(result.unwrap(), false),
+                1 => assert_eq!(result.unwrap(), true),
+                _ => assert!(result.is_err()),
+            }
+        }
+    }
+
+    #[test]
+    fn pbck_rejects_noncanonical_flags() {
+        // Construct each flag through its writer, so malformed fixtures are
+        // otherwise complete. Exercise every permissive reader site.
+        for bad in [2, 127, 255] {
+            let mut value = Vec::new();
+            pbck_w_value(&mut value, &Value::Bool(true));
+            value[1] = bad;
+            assert!(pbck_r_value(&mut PbckReader { buf: &value, pos: 0 }, 0).is_err());
+
+            let mut op = Vec::new();
+            pbck_w_opcode(&mut op, &OpCode::OpClosure { fn_const: 0, captures: vec![(true, 0)] });
+            op[9] = bad;
+            assert!(pbck_r_opcode(&mut PbckReader { buf: &op, pos: 0 }).is_err());
+
+            let f = Function { name: None, arity: 0, min_arity: 0,
+                defaults: vec![], is_vararg: false, param_types: None, chunk: Chunk::default() };
+            for (offset, suffix) in [(0, vec![0, 0, 0, 0]), (13, vec![]), (14, vec![0, 0, 0, 0])] {
+                let mut bytes = Vec::new();
+                pbck_w_function(&mut bytes, &f);
+                bytes[offset] = bad;
+                // Present name/types need a zero length for the old permissive
+                // reader to accept them; insertion avoids truncation-only tests.
+                bytes.splice(offset + 1..offset + 1, suffix);
+                assert!(pbck_r_function(&mut PbckReader { buf: &bytes, pos: 0 }, 0).is_err());
+            }
+            let mut chunk = pbck_serialize(&Chunk::default());
+            *chunk.last_mut().unwrap() = bad;
+            chunk.extend_from_slice(&0u32.to_le_bytes());
+            assert!(pbck_deserialize(&chunk).is_err());
+        }
     }
 
     // ── adversarial / malformed input (untrusted .pbck is a DoS surface) ──

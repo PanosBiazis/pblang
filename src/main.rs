@@ -4814,7 +4814,8 @@ fn legacy_dispatch(args: Vec<String>) {
         // directly, no parsing or compiling. This is the "regenerate the program
         // from pblang bytecode without the Rust front-end" path.
         let (chunk, src) = if path_str.ends_with(".pbck") {
-            let bytes = std::fs::read(&script_path).unwrap_or_else(|e| {
+            let bytes = std::fs::File::open(&script_path)
+                .and_then(pblang_ir::pbck_read_bounded).unwrap_or_else(|e| {
                 eprintln!(
                     "pblang run: failed to read '{}': {}",
                     script_path.display(),
