@@ -21,6 +21,8 @@ let FE = import("stdlib:compiler/selfhost_frontend.sapp");
 let SEM = import("stdlib:compiler/semantic.sapp");
 let BL = import("stdlib:compiler/builtins_list.sapp");
 let DS = import("stdlib:compiler/diagnostic_suggestions.sapp");
+let TOK = import("stdlib:compiler/tokenizer.sapp");
+let PAR = import("stdlib:compiler/parser.sapp");
 
 // ── edit distance (Levenshtein), the core of "did you mean?" ──────────────────────
 fn edit_distance(a, b) {
@@ -60,20 +62,8 @@ fn suggest_name(name, candidates) {
 }
 
 // ── candidate gathering from the semantic symbol table + builtins ─────────────────
-fn _collect_scope_names(scope, acc) {
-    if scope == nil { return; }
-    let ks = map_keys(scope.symbols);
-    let i = 0;
-    while i < len(ks) { array_push(acc, ks[i]); i = i + 1; }
-    let ch = try scope.children catch [];
-    let c = 0;
-    while c < len(ch) { _collect_scope_names(ch[c], acc); c = c + 1; }
-}
-
-fn _candidates(table) {
-    let acc = [];
-    _collect_scope_names(table.global_scope, acc);
-    let bset = try BL.builtin_set() catch map{};
+fn _candidates(table, name, bset) {
+    let acc = map_keys(try table.free_contexts[name] catch map{});
     let bks = map_keys(bset);
     let i = 0;
     while i < len(bks) { array_push(acc, bks[i]); i = i + 1; }
@@ -374,8 +364,13 @@ fn _extern_names(source) {
 }
 
 // ── main entry: diagnose(source) ─────────────────────────────────────────────────
-fn diagnose(source) {
+fn _diagnose(source, source_spans = false) {
     let parsed = FE.frontend_parse_safe(source);
+    if source_spans and parsed.ok {
+        // The normal frontend already checked lexer termination and grammar.
+        // Reparse opt-in token offsets without changing default AST schemas.
+        parsed.ast = PAR.parse(TOK.tokenize(source, true));
+    }
     let diags = [];
 
     let perrs = try parsed.errors catch [];
@@ -390,8 +385,7 @@ fn diagnose(source) {
 
     let ast = try parsed.ast catch nil;
     if ast != nil {
-        let table = SEM.analyze(ast);
-        let cands = _candidates(table);
+        let table = SEM.analyze(ast, true);
 
         let fv = try table.free_variables catch [];
         let bset = try BL.builtin_set() catch map{};
@@ -407,7 +401,7 @@ fn diagnose(source) {
             // opt-in pragmas: ctranspile intrinsics / declared cross-unit names
             if kern and (try kset[name] catch nil) == true { i = i + 1; continue; }
             if (try externs[name] catch nil) == true { i = i + 1; continue; }
-            let s = suggest_name(name, cands);
+            let s = suggest_name(name, _candidates(table, name, bset));
             let help: any = nil;
             let fix: any = nil;
             if s != nil {
@@ -424,10 +418,18 @@ fn diagnose(source) {
 
         _collect_unused(table.global_scope, diags);
         _extra_lints(ast, diags);
+        if source_spans {
+            let result = _result(diags);
+            result.autofix_sites = table.free_sites;
+            result.autofix_truncated = table.free_sites_truncated;
+            return result;
+        }
     }
 
     return _result(diags);
 }
+
+fn diagnose(source) { return _diagnose(source); }
 
 // suggest(source) — just the actionable did-you-mean items: [{name, suggestion}].
 fn suggest(source) {
@@ -444,22 +446,46 @@ fn suggest(source) {
     return out;
 }
 
-// autofix(source) — apply every safe, unambiguous fix; returns { fixed, applied, count }.
+// Bounded, all-or-nothing source edits. Offsets are Unicode scalar indexes,
+// not byte offsets. No source execution or filesystem effects occur here.
 fn autofix(source) {
-    let r = diagnose(source);
-    let fixed = source;
-    let applied = [];
-    let i = 0;
-    while i < len(r.diagnostics) {
-        let d = r.diagnostics[i];
+    let unchanged = map{fixed:source, applied:[], count:0};
+    if type(source)!="string" or len(source)>65536 { return unchanged; }
+    let r = _diagnose(source, true);
+    if r.ok or len(r.errors)>256 or (try r.autofix_truncated catch true) { return unchanged; }
+    let fixes = map{};
+    for d in r.errors {
         let fix = try d.fix catch nil;
-        if fix != nil and fix.kind == "replace_identifier" {
-            fixed = regex_replace_all(fixed, "\\b" + fix.from + "\\b", fix.to);
-            array_push(applied, map{ kind: "replace_identifier", from: fix.from, to: fix.to });
-        }
-        i = i + 1;
+        if d.code!="undefined-name" or fix==nil or fix.kind!="replace_identifier" { return unchanged; }
+        fixes[fix.from] = fix.to;
     }
-    return map{ fixed: fixed, applied: applied, count: len(applied) };
+    let positions = []; let edits = map{}; let covered = map{};
+    for site in r.autofix_sites {
+        if map_has(fixes, site.name) {
+            if type(site.start)!="number" or type(site.end)!="number" { return unchanged; }
+            if site.start<0 or site.end<=site.start or site.end>len(source)
+                or str_slice(source,site.start,site.end)!=site.name { return unchanged; }
+            let key = str(site.start);
+            if not map_has(edits,key) { array_push(positions,site.start); }
+            edits[key] = map{end:site.end, from:site.name, to:fixes[site.name]};
+            covered[site.name] = true;
+        }
+    }
+    if len(map_keys(covered))!=len(map_keys(fixes)) { return unchanged; }
+    positions = array_sort(positions);
+    let pieces = []; let cursor = 0;
+    for start in positions {
+        let edit = edits[str(start)];
+        if start<cursor { return unchanged; }
+        array_push(pieces,str_slice(source,cursor,start)); array_push(pieces,edit.to);
+        cursor=edit.end;
+    }
+    array_push(pieces,str_slice(source,cursor,len(source)));
+    let fixed = str_join(pieces,"");
+    if not diagnose(fixed).ok { return unchanged; }
+    let applied = [];
+    for d in r.errors { array_push(applied,map{kind:"replace_identifier",from:d.name,to:fixes[d.name]}); }
+    return map{fixed:fixed, applied:applied, count:len(applied)};
 }
 
 // format(result) — Rust-style human-readable rendering of a diagnose() result.
