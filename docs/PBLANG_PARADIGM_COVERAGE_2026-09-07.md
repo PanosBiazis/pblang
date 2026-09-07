@@ -19,7 +19,7 @@ inventory with explicitly partial inspection, not whole-module certification.
 | Model | Concrete implementation | Evidence and limits in this slice |
 | --- | --- | --- |
 | Imperative / procedural / structured | Functions, mutable bindings, branches and loops in `compiler/parser.sapp`, `codegen.sapp`, `vm.sapp` | Focused count/range/for-in, scope, try and closure tests pass on plain/optimized PBLang VM paths; not every control-transfer/backend path. |
-| Functional | `functional.sapp`: map/filter/folds, compose/pipe, partial/curry, memoization, declarative combinators | Selected combinator and composition tests pass. These are eager array operations, not proof of universal lazy evaluation or enforced purity. `f_apply` handles 0–3 args explicitly then calls with exactly four: arities above four are not general application. Memoization identity is now repaired below; stringified unique/grouping semantics still need separate tests. |
+| Functional | `functional.sapp`: map/filter/folds, compose/pipe, partial/curry, memoization, declarative combinators | Selected combinator and composition tests pass. These are eager array operations, not proof of universal lazy evaluation or enforced purity. Positional curry now rejects arities outside 0–4; `curry_args` adds explicit vector-callback collection for 0–256 values, not general positional spread. Memoization identity is repaired below; stringified unique/grouping semantics still need separate tests. |
 | Object-oriented | `class.sapp`: single inheritance, overrides, super helpers, mixins, statics, bound methods and operator bridges | `oop_complete` and mixed-library tests pass. `call`/`call1..4` and `bind0..2` are finite adapters, not arbitrary arity. Single-parent extension is not multiple inheritance; mixins merge methods with later values winning. Inherited super-calls through deeper subclasses still need dedicated resolution tests. |
 | Class syntax | `compiler/parser.sapp::parse_class` builds a class table and constructor | Separate from the class library API. Selected source review shows method type/default syntax is parsed but discarded by this lowering; comment documents no `__call`/new0..new3 parity. Full constructor/method/default/type equivalence remains open. |
 | Generic / parametric / structural | `generics.sapp`: composable type predicates, typed lists/maps/boxes/options, interface-predicate bridge | `generics` and composition tests pass for runtime checks, negative mapper results and preserved input. This library is runtime-parametric, not evidence of static higher-kinded/dependent-type support or all native generic syntax. |
@@ -87,3 +87,18 @@ source also passed plain, optimized and in-memory bytecode round-trip checks
 as one unit, without claiming independent import-loader qualification.
 This fixes the identified memoization collision, not `unique`, generic arity,
 class-default semantics, full paradigm composition or the release blockers.
+
+## Curried argument preservation — 2026-09-07
+
+Baseline `92354d8`. The new regression reproduced acceptance of an unsupported
+positional arity before the repair. `curry` now admits only integral 0–4
+arities, preserving nil/default 2 and immediate zero invocation. Its internal
+dispatcher rejects oversized arrays instead of dropping values.
+
+The new `curry_args(f, n)` collects up to 256 values for one array-taking
+callback. Tests cover exact order, reusable prefixes, callback exceptions,
+bound methods and runtime generic validation. A separate bounded frontend test
+imports the actual functional library and exercises both conventions.
+See `FUNCTIONAL_CURRY.md` for limits and migration. General positional
+apply/spread, callback signature inference and full composition remain open;
+this is not a claim that arbitrary-arity positional functions now work.

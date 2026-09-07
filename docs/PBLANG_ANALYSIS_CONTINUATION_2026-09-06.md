@@ -437,3 +437,16 @@ retention. The contract and compatibility change are documented in
 `FUNCTIONAL_MEMOIZATION.md`; broader heap/work limits are not claimed.
 No Rust or compiler/VM changes. The paradigm report's memoization follow-up is
 updated; generic arity, grouping/unique keys and broader 1.0.0 work remain open.
+
+## Remediation update — 2026-09-07, curried arguments
+
+Baseline `92354d8`. Positional curry now rejects invalid/unsupported arities
+before effects and its dispatcher no longer silently drops arguments.
+Valid 0–4/default behavior is preserved. `curry_args` adds an explicit
+array-taking callback convention for 0–256 collected values, with independent
+prefix arrays. Focused tests cover errors, boundaries, reuse, mixed-model
+composition and actual library import through the PBLang frontend/VM.
+
+No Rust or compiler/VM edits. This does not implement general positional
+spread or close the retained checker's arity finding. The contract and remaining
+limits are in `FUNCTIONAL_CURRY.md`; overall 1.0.0 readiness stays NOT READY.
