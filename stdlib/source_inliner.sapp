@@ -789,6 +789,29 @@ fn link_limits(options = nil) {
     };
 }
 
+// Bounded APIs use UTF-8 units. Reject an excessive scalar count before
+// materializing the byte array; nil means rejection, while empty text is 0.
+fn _bounded_text_bytes(text, cap) {
+    if not is_string(text) or len(text) > cap { return nil; }
+    let size = len(str_to_bytes(text));
+    if size > cap { return nil; }
+    return size;
+}
+
+fn _bounded_module_path(raw, importer, cap) {
+    if _bounded_text_bytes(raw, cap) == nil { return nil; }
+    let path = _canonical_module_path(raw, importer);
+    if path == nil or _bounded_text_bytes(path, cap) == nil { return nil; }
+    return path;
+}
+
+fn _resolve_bounded_module_path(raw, importer, candidates, cap) {
+    if _bounded_text_bytes(raw, cap) == nil { return nil; }
+    let path = _resolve_module_path(raw, importer, candidates);
+    if path == nil or _bounded_text_bytes(path, cap) == nil { return nil; }
+    return path;
+}
+
 fn _virtual_dir(path) {
     let slash = _last_index_of(path, "/");
     if slash < 0 { return ""; }
@@ -859,23 +882,25 @@ fn _canonical_module_path(raw, importer) {
 
 fn _canonical_modules(modules, limits) {
     if not is_map(modules) { return _err("modules must be a map of virtual path -> source text"); }
-    let out = map{};
+    let out = map{}; let sizes = map{};
     let keys = map_keys(modules);
     if len(keys) > limits.max_modules { return _err("supplied module count limit exceeded"); }
     let supplied_bytes = 0;
     let i = 0;
     while i < len(keys) {
-        let path = _canonical_module_path(keys[i], "");
-        if path == nil or len(path) > limits.max_path_bytes { return _err("invalid module path: " + str(keys[i])); }
+        let path = _bounded_module_path(keys[i], "", limits.max_path_bytes);
+        if path == nil { return _err("invalid module path: " + str(keys[i])); }
         if map_has(out, path) { return _err("duplicate canonical module path: " + path); }
         if not is_string(modules[keys[i]]) { return _err("module source must be text: " + path); }
-        if len(modules[keys[i]]) > limits.max_module_source_bytes { return _err("module source limit exceeded: " + path); }
-        supplied_bytes = supplied_bytes + len(modules[keys[i]]);
+        let size = _bounded_text_bytes(modules[keys[i]], limits.max_module_source_bytes);
+        if size == nil { return _err("module source limit exceeded: " + path); }
+        supplied_bytes = supplied_bytes + size;
         if supplied_bytes > limits.max_total_source_bytes { return _err("supplied module source limit exceeded"); }
         out[path] = modules[keys[i]];
+        sizes[path] = size;
         i = i + 1;
     }
-    return map{ ok: true, modules: out, supplied_bytes: supplied_bytes };
+    return map{ ok: true, modules: out, sizes: sizes, supplied_bytes: supplied_bytes };
 }
 
 // Bare imports are project-rooted for deterministic new projects. Older
@@ -899,8 +924,8 @@ fn _resolve_module_path(raw, importer, candidates) {
 fn _collect_bounded(raw_path, importer, modules, limits, state, depth) {
     if state.err != nil { return; }
     if depth > limits.max_module_depth { state.err = "module depth limit exceeded"; return; }
-    let path = _resolve_module_path(raw_path, importer, modules);
-    if path == nil or len(path) > limits.max_path_bytes { state.err = "invalid or escaping import path: " + str(raw_path); return; }
+    let path = _resolve_bounded_module_path(raw_path, importer, modules, limits.max_path_bytes);
+    if path == nil { state.err = "invalid or escaping import path: " + str(raw_path); return; }
     if map_has(state.reg, path) { return; }
     if try state.visiting[path] catch false { state.err = "import cycle at " + path; return; }
     if not map_has(state.discovered, path) {
@@ -910,9 +935,10 @@ fn _collect_bounded(raw_path, importer, modules, limits, state, depth) {
     }
     let src = try modules[path] catch nil;
     if src == nil { state.err = "cannot resolve import: " + path; return; }
-    if len(src) > limits.max_module_source_bytes { state.err = "module source limit exceeded: " + path; return; }
-    if state.total_bytes + len(src) > limits.max_total_source_bytes { state.err = "total module source limit exceeded"; return; }
-    state.total_bytes = state.total_bytes + len(src);
+    let size = state.supplied_sizes[path];
+    if size > limits.max_module_source_bytes { state.err = "module source limit exceeded: " + path; return; }
+    if state.total_bytes + size > limits.max_total_source_bytes { state.err = "total module source limit exceeded"; return; }
+    state.total_bytes = state.total_bytes + size;
     state.visiting[path] = true;
     for imp in _find_import_bindings(src) {
         _collect_bounded(imp.path, path, modules, limits, state, depth + 1);
@@ -920,7 +946,7 @@ fn _collect_bounded(raw_path, importer, modules, limits, state, depth) {
     }
     state.visiting[path] = false;
     state.reg[path] = src;
-    state.module_bytes[path] = len(src);
+    state.module_bytes[path] = size;
     array_push(state.order, path);
 }
 
@@ -950,17 +976,18 @@ fn _reserved_toplevel(scan) {
 fn link_modules(main_source, modules, options = nil) {
     if not is_string(main_source) { return _err("main source must be text"); }
     let limits = link_limits(options);
-    if len(main_source) > limits.max_module_source_bytes { return _err("main source limit exceeded"); }
+    let main_bytes = _bounded_text_bytes(main_source, limits.max_module_source_bytes);
+    if main_bytes == nil { return _err("main source limit exceeded"); }
     let prepared = _canonical_modules(modules, limits);
     if not prepared.ok { return prepared; }
-    if len(main_source) + prepared.supplied_bytes > limits.max_total_source_bytes {
+    if main_bytes + prepared.supplied_bytes > limits.max_total_source_bytes {
         return _err("total project source limit exceeded");
     }
-    let entry_path = _canonical_module_path(_link_option(options, "entry_path", "main.sapp"), "");
-    if entry_path == nil or len(entry_path) > limits.max_path_bytes { return _err("invalid entry_path"); }
+    let entry_path = _bounded_module_path(_link_option(options, "entry_path", "main.sapp"), "", limits.max_path_bytes);
+    if entry_path == nil { return _err("invalid entry_path"); }
 
     let state = map{ err: nil, reg: map{}, visiting: map{}, discovered: map{}, order: [],
-        module_bytes: map{}, module_count: 0, total_bytes: len(main_source) };
+        module_bytes: map{}, supplied_sizes: prepared.sizes, module_count: 0, total_bytes: main_bytes };
     for imp in _find_import_bindings(main_source) {
         _collect_bounded(imp.path, entry_path, prepared.modules, limits, state, 1);
         if state.err != nil { return _err(state.err); }
@@ -983,8 +1010,10 @@ fn link_modules(main_source, modules, options = nil) {
         for name in scan.toplevel { top[name] = true; }
         let body = _transform_prefixed(src, path2pref[path], _var2pref_canonical(src, path, path2pref), top);
         if _contains(body, "\x00BARE\x00") { return _err("import variable used without .member access (in " + path + ")"); }
-        linked_bytes = linked_bytes + len(body) + 1;
-        if linked_bytes > limits.max_linked_source_bytes { return _err("linked source limit exceeded"); }
+        // Reserve exactly one LF before the next module or always-present root.
+        let body_bytes = _bounded_text_bytes(body, limits.max_linked_source_bytes - linked_bytes - 1);
+        if body_bytes == nil { return _err("linked source limit exceeded"); }
+        linked_bytes = linked_bytes + body_bytes + 1;
         array_push(pieces, body);
         i = i + 1;
     }
@@ -995,8 +1024,9 @@ fn link_modules(main_source, modules, options = nil) {
     if main_reserved != nil { return _err("main uses reserved linker namespace: " + main_reserved); }
     let main_body = _transform_prefixed(main_source, "", _var2pref_canonical(main_source, entry_path, path2pref), map{});
     if _contains(main_body, "\x00BARE\x00") { return _err("import variable used without .member access (in <main>)"); }
-    linked_bytes = linked_bytes + len(main_body);
-    if linked_bytes > limits.max_linked_source_bytes { return _err("linked source limit exceeded"); }
+    let main_body_bytes = _bounded_text_bytes(main_body, limits.max_linked_source_bytes - linked_bytes);
+    if main_body_bytes == nil { return _err("linked source limit exceeded"); }
+    linked_bytes = linked_bytes + main_body_bytes;
     array_push(pieces, main_body);
     let identity = ["pblang.source.graph.v2", entry_path, sha256(main_source)];
     for path in state.order { array_push(identity, path); array_push(identity, sha256(state.reg[path])); }
@@ -1014,12 +1044,14 @@ fn link_modules(main_source, modules, options = nil) {
 fn _select_snapshot_module(raw_path, importer, available, selected, state, limits, depth) {
     if state.error != nil { return; }
     if depth > limits.max_module_depth { state.error = "module depth limit exceeded"; return; }
-    let path = _resolve_module_path(raw_path, importer, available);
+    let path = _resolve_bounded_module_path(raw_path, importer, available, limits.max_path_bytes);
     if path == nil { state.error = "invalid or escaping import path: " + str(raw_path); return; }
     if map_has(selected, path) or (try state.visiting[path] catch false) { return; }
     let source = try available[path] catch nil;
     if source == nil { state.error = "cannot resolve import: " + path; return; }
-    state.count = state.count + 1; state.bytes = state.bytes + len(source);
+    let size = _bounded_text_bytes(source, limits.max_module_source_bytes);
+    if size == nil { state.error = "module source limit exceeded"; return; }
+    state.count = state.count + 1; state.bytes = state.bytes + size;
     if state.count > limits.max_modules { state.error = "reachable module count limit exceeded"; return; }
     if state.bytes > limits.max_total_source_bytes { state.error = "reachable source byte limit exceeded"; return; }
     state.visiting[path] = true;
@@ -1033,15 +1065,19 @@ fn _select_snapshot_module(raw_path, importer, available, selected, state, limit
 fn inline_project_file_prefixed(main_path, project_root = ".", options = nil) {
     let snapshot = _locked_snapshot.load(project_root);
     if not snapshot.ok { return _err("locked project snapshot failed: " + snapshot.error); }
-    let entry = _canonical_module_path(main_path, "");
+    let opts = if options == nil { map{} } else { options };
+    if not is_map(opts) { return _err("project linker options must be a map"); }
+    let limits = link_limits(opts);
+    let entry = _bounded_module_path(main_path, "", limits.max_path_bytes);
     if entry == nil { return _err("invalid project entry path"); }
     let source = try snapshot.modules[entry] catch nil;
     if source == nil { return _err("project entry is absent from the locked snapshot: " + entry); }
-    let opts = if options == nil { map{} } else { options };
-    if not is_map(opts) { return _err("project linker options must be a map"); }
     opts.entry_path = entry;
-    let limits = link_limits(opts); let selected = map{};
-    let selection = map{ error: nil, visiting: map{}, count: 0, bytes: len(source) };
+    let source_bytes = _bounded_text_bytes(source, limits.max_module_source_bytes);
+    if source_bytes == nil { return _err("main source limit exceeded"); }
+    if source_bytes > limits.max_total_source_bytes { return _err("reachable source byte limit exceeded"); }
+    let selected = map{};
+    let selection = map{ error: nil, visiting: map{}, count: 0, bytes: source_bytes };
     for binding in _find_import_bindings(source) {
         _select_snapshot_module(binding.path, entry, snapshot.modules, selected, selection, limits, 1);
         if selection.error != nil { return _err(selection.error); }

@@ -211,3 +211,22 @@ their named byte budgets; do not claim end-to-end UTF-8 project bounds until
 these owning-module policies and tests are corrected. This is source-reviewed,
 not a newly executed project-snapshot exploit. A1/A2/A5/A7 remain separate work;
 the A3/A4 remediation scope is recorded in the comparative audit ledger.
+
+## Remediation update — 2026-09-07, A6-L bounded module linking
+
+Baseline `11e8d1a`. A6-L's bounded-linker byte-accounting defect is now repaired
+in PBLang. Raw/canonical virtual paths, main and module sources, supplied and
+reachable totals, and transformed output all use UTF-8 units. Module sizes are
+cached at admission; shared dependencies are counted once. Output accounting
+includes LF separators and admits empty text without confusing zero with failure.
+The file-backed wrapper and reachable-snapshot selection now check the same units
+before import scanning, but their initial snapshot loading is not newly bounded.
+
+The new in-memory test failed against the unchanged module on Unicode root-byte
+metadata and passed after correction. Exact/minus-one source, module, total,
+output, raw-path and canonical-expansion boundaries are exercised, along with
+unused modules, a diamond dependency graph and the hosted-C99 pipeline consumer.
+No file-backed snapshot execution or universal safety claim follows from these
+tests. Legacy resolver implementations are unchanged. Unicode closure evidence
+whose identity incorporates `output_bytes` must be regenerated; see the canonical
+source-linker contract. Other open findings and 1.0.0 release gates remain.

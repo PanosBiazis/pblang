@@ -29,9 +29,9 @@ and performs no filesystem or network I/O. Absolute paths, backslashes, foreign
 schemes, root traversal, cycles, duplicate canonical paths, nested imports, bare
 module values, and the reserved `__pbi*` namespace fail closed. Module count,
 depth, per-module bytes, total supplied bytes, linked-output bytes, and path
-length all have configurable defaults and immutable hard ceilings. However,
-the linker's current byte-named text/path limits still count Unicode characters;
-they are not yet UTF-8 byte guarantees for non-ASCII module snapshots. See
+length all have configurable defaults and immutable hard ceilings. The bounded
+snapshot linker now measures UTF-8 bytes for sources, paths and linked output,
+including both raw and canonical path spelling. See
 `docs/Source_linker.md` for the complete contract.
 
 ```sapp
@@ -91,8 +91,9 @@ limits, target selection and successful program semantics are unchanged.
 Artifact rejection happens after backend generation. Text measurement also
 materializes a UTF-8 byte array, after its preliminary character check. Neither
 step enforces peak heap usage or prevents allocation inside a backend. The
-separate snapshot linker's module/aggregate/linked-output/path byte accounting
-remains unresolved; the direct-source fix must not be interpreted as closing it.
+snapshot linker's module/aggregate/linked-output/path byte accounting is now
+corrected as well; its file-backed loader's pre-admission reads and allocations
+remain a separate boundary. See `Source_linker.md` for evidence compatibility.
 
 The `c99-hosted` source target is build-only and returns C source, not an
 executed process. Unsupported AST nodes, unresolved imports, profile-invalid
