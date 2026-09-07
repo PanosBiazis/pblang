@@ -755,3 +755,46 @@ checks and `git diff --check` passed. The pre-existing frontend diff is byte-for
 byte unchanged and unrelated work, including the dirty lockfile, is excluded.
 Graphify reached its 20-second deadline (124) without retained processes;
 graph freshness is not claimed.
+
+## Remediation ledger — 2026-09-07, C2 concrete nil arithmetic
+
+Baseline `b16aaf9`; fix identity is this ledger's commit. The new targeted
+regression first failed on the unchanged checker. `typeck.sapp` now emits
+`nil-arithmetic` for binary `+`, `-`, `*`, `/`, `%` when a known nil is paired
+with a numeric type or nil, and for unary negation of nil. Both operands are
+visited; a failing expression returns `any` after recording its diagnostic,
+avoiding a fabricated numeric result and redundant outer type errors.
+
+The C2 `nil - 1` finding is closed for the PBLang checked route. C2 overall
+remains partial: retained Rust call-arity/index discrepancies are not changed.
+Gradual `any`, generics, optional types, string-addition inference and custom
+forward/reflected operators retain existing behavior. They are not newly
+certified. In particular, globally rejecting all nil operands would break
+valid map overloads; an executable reflected-subtraction test protects this.
+Exponentiation already uses the `num_pow` call checker, not this binary path.
+
+Compatibility correction: previously accepted concrete nil arithmetic now
+fails checked compilation, including inside `try`. The existing frontend run
+gate refuses execution before earlier statements can produce output. The
+inspectable-bytecode contract for type errors is unchanged. No Rust, parser,
+VM, optimizer or frontend source was changed; pre-existing dirty work remains
+excluded. This is a correctness repair, not a memory-safety, sandbox, complete
+type-soundness or 1.0.0 readiness certification. **NOT READY** remains unchanged.
+
+Validation: twelve targeted suites passed (`selfhost_typeck_nil_arithmetic`,
+`selfhost_typeck`, `selfhost_typeck_parity`, `selfhost_typeck_optional`,
+`selfhost_operator_overload`, `selfhost_diagnostic_suggestions`, `selfhost_lint`,
+`guard_preprocessor_results`, `guard_preprocessor_bootstrap`,
+`selfhost_compile_lexical`, `selfhost_project_lexical`, `selfhost_vm_bounded`).
+The new test covers left/right/both nil, numeric precision types, nested
+diagnostic counts, unary negation, source-span/category preservation, no source
+echo, malformed AST, unchanged gradual cases, valid execution, reflected
+overloads and rejection before output. Each target uses the bounded trusted
+20-second/2-GiB/capped-output harness; new execution probes additionally use
+1,000 VM steps/eight frames. Lint exited zero with existing unused/style
+warnings; no lint-clean or full-suite claim.
+The expanded new regression passed again after adding span/privacy and nested
+controls. Final build and portable-lock publication passed; the dirty lockfile
+is excluded. Added-line privacy checks and `git diff --check` passed. The
+pre-existing frontend diff is unchanged. Graphify reached its 20-second limit
+(124); no graph freshness is claimed and no test/Graphify process remained.
