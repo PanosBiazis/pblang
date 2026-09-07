@@ -798,3 +798,55 @@ controls. Final build and portable-lock publication passed; the dirty lockfile
 is excluded. Added-line privacy checks and `git diff --check` passed. The
 pre-existing frontend diff is unchanged. Graphify reached its 20-second limit
 (124); no graph freshness is claimed and no test/Graphify process remained.
+
+## Remediation ledger — 2026-09-07, native match guards and enum coverage
+
+Baseline `b8d9cfc`; fix identity is this ledger's commit. Further review of the
+PBLang match path found two related correctness defects: enum exhaustiveness
+credited conditional arms as guaranteed coverage, and native code generation
+omitted guards entirely for literal patterns. The enum regression failed
+before the change on a false guarded catchall. The literal-emitter finding was
+established from its complete control flow; its initial test attempt was
+invalidated by a stale dependency lock, not counted as behavioral evidence.
+
+The checker now credits only absent guards or exact boolean-true literal ASTs.
+Conditional literal/bind/wildcard arms cannot hide a missing enum variant.
+Complementary conditions and calls are deliberately not proven or executed.
+Malformed arm metadata does not grant coverage; ordinary AST validation remains
+responsible for its diagnostics. This check retains its existing scope: a known
+enum instance's `__variant` member, not every possible match expression.
+
+The emitter now generates the guard for every pattern kind. Pattern mismatch
+and guard failure have separate jumps to the following arm; literal mismatch
+skips the guard, guard failure skips the body, and successful arms jump to the
+shared end. No opcode, parser, VM, optimizer, frontend or Rust changes were
+made. The complete owning codegen module and relevant parser/checker/caller
+paths were reviewed. Existing dirty frontend changes remain excluded.
+
+Compatibility correction: formerly accepted conditional-only enum coverage can
+now require an unguarded fallback. Literal guards now affect execution as the
+source requests. Tests explicitly parenthesize call bodies around the existing
+colon/method-call parser ambiguity; this is a recorded limitation, not a claim
+that arbitrary native syntax is repaired. Native helper-name/binding-scope
+issues and general match/type soundness are outside this slice. No universal
+compatibility or 1.0.0 readiness claim; **NOT READY** remains unchanged.
+
+Validation: fourteen targeted suites passed (`selfhost_enum_guard_coverage`,
+`selfhost_literal_match_guard`, `selfhost_type_system_parity`,
+`selfhost_typeck_parity`, `selfhost_typeck_optional`,
+`selfhost_typeck_nil_arithmetic`, `guard_preprocessor_results`,
+`guard_preprocessor_activation`, `guard_preprocessor_native_match`,
+`selfhost_optimizer_strength`, `selfhost_closure`, `selfhost_loop_kw`,
+`selfhost_compile_lexical`, `selfhost_vm_bounded`). New tests cover literal,
+bind and wildcard coverage, true/false/dynamic guards, duplicate conditions,
+fallbacks, malformed metadata, source-error preservation, ordered effects,
+exceptions and no-output rejection. Runtime probes use 2,000 or 3,000 VM steps
+and eight frames; all targets use the trusted 20-second/2-GiB/capped-output
+harness. No whole-suite or physical-platform test was run.
+
+Final build and portable-lock publication passed. Lint exited zero with
+existing unused/style reports plus an intentional exact-boolean comparison.
+Added-line privacy and `git diff --check` checks passed; pre-existing frontend
+diff remained unchanged, and the dirty lockfile is excluded. Graphify timed out
+at 20 seconds (124), so graph freshness is not claimed. No test/Graphify worker
+or temporary test-output directory remained.

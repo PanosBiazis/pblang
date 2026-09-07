@@ -283,6 +283,27 @@ When those concerns matter, treat them as separate workstreams.
 
 ## Strict frontend compilation boundary (2026-09-07)
 
+Native colon-syntax match guards are emitted after pattern success for all
+pattern kinds, including literals. Literal mismatch skips the guard; false
+guards skip the body; both continue to the next arm. Matching guard exceptions
+propagate normally. This corrects previously ignored literal guards without
+changing opcodes or the bytecode format.
+
+The existing enum `value.__variant` coverage check only credits unguarded arms
+or literal boolean-true guards. Conditional bind/wildcard arms are not catchalls,
+and conditional literals do not guarantee their variant. Calls, truthy values
+and complementary guards are not evaluated/proved during checking. Add an
+unguarded arm or `else` where guaranteed coverage is required. Guard and body
+errors are still checked even when a fallback establishes coverage. Other
+non-enum match expressions remain outside this enum-specific check.
+
+Compatibility: guarded enum matches formerly misclassified as exhaustive may
+now fail checked compilation. Literal-guard behavior now follows the source
+condition instead of ignoring it. Tests use parenthesized call-expression
+bodies to avoid the existing colon-method-call parser ambiguity. This slice
+does not fix that ambiguity, native generated-name/binding-scope issues or
+establish whole-language/retained-host parity.
+
 The PBLang typechecker diagnoses proven scalar nil arithmetic with code
 `nil-arithmetic`: binary `+`, `-`, `*`, `/`, `%` between a known nil and a
 numeric type (or another nil), and unary `-nil`. It returns `any` for the

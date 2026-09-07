@@ -347,3 +347,20 @@ reflected-overload test confirms that a valid `nil - object` still works.
 No general type-soundness or host-parity claim follows; remaining C2 host
 discrepancies and the broader 1.0.0 blockers remain open. See the comparative
 audit's dated C2 ledger and `Bootstrap_safety.md` for the exact scope.
+
+## Remediation update — 2026-09-07, native match guards
+
+Baseline `b8d9cfc`. A new enum regression exposed false coverage from guarded
+catchalls/literals. Only absent or literal-true guards now establish guaranteed
+coverage in the existing enum `__variant` checker. Other conditions remain
+checked but cannot substitute for an unconditional fallback.
+
+Tracing the runtime path also found that the native emitter skipped literal
+guards. It now emits separate pattern/guard failure jumps, preserving guard
+order, selected-body-only effects and exception propagation. Plain and safely
+optimized bounded execution agree in the new tests. No Rust or VM changes.
+
+This corrects behavior and tightens mistaken enum acceptance; it does not
+establish global match soundness. Colon-method-call parsing ambiguity and
+native helper/binding scope remain separate limitations. Release readiness
+stays **NOT READY**; the comparative ledger records exact coverage and checks.
