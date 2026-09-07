@@ -411,3 +411,59 @@ required. **Overall decision remains NOT READY for 1.0.0.**
 Reproduction uses the reviewed live dependency tree, not unrelated generated
 product artifacts. A clean candidate rebuild and broad compatibility campaign
 remain separate requirements; these targeted successes do not replace them.
+
+## Remediation ledger — 2026-09-07, PBLang guest cleanup and admission
+
+Baseline `0e61bce`; fix identity is the commit containing this ledger section.
+This slice changes only PBLang implementation/tests and documentation, not Rust
+source. Existing unrelated changes remain excluded from the commit. The detailed
+contract and intentional budget compatibility correction are documented in
+[`HOST_PBCK_RUNTIME_LIMITS.md`](HOST_PBCK_RUNTIME_LIMITS.md).
+
+- **A3 guest-exception paths fixed, focused verification passed.** Explicit
+  throws, failed unwraps and escaping child exceptions now unwind frame defers
+  in LIFO order. Nested cleanup throws do not replace the original result or
+  stop older cleanups. Same-frame catches do not unwind early. Direct engine
+  and resource-budget faults are deliberately not swallowed. Direct faults in
+  a frame body still bypass this unwind path: universal runtime-fault cleanup
+  remains open, so this is not full closure of every defer guarantee.
+- **Related tail-handler correctness fixed.** Tail reuse now requires both an
+  empty defer list and an empty handler list. A child exception cannot discard
+  the caller's active catch. Existing unguarded tail reuse remains verified.
+- **A4 identified admission defects fixed.** Parameter cells, including default
+  and empty-varargs cells, are checked against stack and local ceilings before
+  materialization. Admission counts simultaneous live frames, including root.
+  `max_frames=N` intentionally no longer permits the accidental N+1 frame.
+  Cleanup guest calls count as live frames too. This closes the specific
+  parameter/frame defects, not every resource-enforcement gap in the report.
+
+Both new regression suites failed against the applicable pre-fix behavior and
+passed after correction. During test development, a named `catch error` helper
+was found to read the builtin named `error`, not the caught exception, matching
+the earlier test-quality report. The final helper uses boolean rejection with
+identical-artifact positive boundary controls and adapter-effect counts. It
+does not claim exact error-message validation. Pre-allocation ordering is
+source-reviewed; no native allocation telemetry was collected.
+
+Final security review approved this scoped diff without blockers. On the same
+retained `0.6.0` host recorded above, the targeted command was:
+
+```sh
+bash scripts/t --trusted host_pbck_defer_unwind host_pbck_frame_admission \
+  host_pbck_vm_full host_pbck_vm host_pbck_frame_vm
+```
+
+**5/5 passed**, with 20 seconds per test, 2 GiB address-space ceiling, bounded
+temporary output, and synthetic in-memory fixtures only. This covers guest
+exception identity/order, ordinary and exceptional cleanup, same-frame catches,
+step/allocation N/N-1 cases, frame 1/2 boundaries, stack/local admission, empty
+bodies/defaults/varargs, tail reuse and absence of denied callback effects.
+No full suite, independent-backend, live-device or production qualification is
+claimed. The overall **NOT READY for 1.0.0** decision remains unchanged.
+
+Final `pblang build .` and portable lock publication succeeded. Lint on the
+four touched PBLang files exited 0 with three pre-existing owner-module warnings
+(exported opcode constant reported unused, boolean style, unconditional loop
+style). `git diff --check` passed. `graphify update .` reached the external
+20-second deadline, exit 124, without completion output; graph freshness is not
+claimed. No persistent application, VM, device, or server was started.
