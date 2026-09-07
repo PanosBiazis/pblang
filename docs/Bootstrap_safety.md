@@ -298,9 +298,9 @@ make the naive import scanner syntax-aware.
 
 CLI and pipeline consumers must check `ok` before serialization/execution.
 Type-only diagnostics intentionally retain inspectable bytecode with
-`ok=false`. Numeric legacy guard arms still encounter the existing rewrite's
-`_guard_val` nil-versus-number type mismatch. Native colon-syntax match is
-unchanged; general legacy guard semantics are not newly certified.
+`ok=false`. The legacy adapter now returns selected values directly, removing
+the synthetic `_guard_val` nil-versus-value assignment mismatch. Native
+colon-syntax match is unchanged; general legacy semantics are not certified.
 The escaped-quote/semicolon corruption is repaired in the legacy string walkers.
 One exclusive-end scanner preserves quoted source slices in scrutinees, guards,
 arms, defaults and keyword/brace searches; identifier substitution does not
@@ -324,7 +324,21 @@ This intentionally narrows the older permissive adapter, which could silently
 emit partial or always-true arms. Leaving source unchanged is not a successful
 compile: callers must still check frontend diagnostics. Nested candidates may
 be processed independently; general nested legacy support is not established.
-Generated-name collisions and result/bind typing remain separate limitations.
+Each arm binds its identifier in a statement-if scope shared by its guard and
+value. The condition is retained verbatim: a field such as `item.n` is not
+rewritten when `n` is the binding. Successful arms return from the single outer
+IIFE; guards run in order, the subject runs once, and only the selected value
+runs. The optional default sees the outer scope; no match/default returns nil.
+Bare braces are not used as scopes here: the parser lowers value blocks into
+another IIFE, which would intercept the return.
+
+The subject helper name is deterministic and absent from identifier tokens in
+the admitted match span. Tokenization failure or unterminated tokens decline
+the transformation; the candidate search is capped at token count plus one.
+This covers lexical capture, not reflective/eval lookup. Tokenization still
+allocates proportionally to input and does not establish a hard memory limit.
+The existing function-literal return type remains `any`; this repair is not
+precise result-union inference or general expression hygiene.
 
 `guard_preprocessor_activation` checks exact native-text preservation, actual
 branch selection with independent legacy siblings in either order, misleading
@@ -333,8 +347,14 @@ not establish a whole-source heap or wall-clock limit.
 
 `guard_preprocessor_strings` compares fixed synthetic values in the bounded VM,
 including escapes, separator-like text and literal identifier preservation.
-It deliberately inspects bytecode despite the documented type-only legacy
-diagnostics; this testing path is not a production execution recommendation.
+It now requires successful checked compilation before executing bytecode.
+`guard_preprocessor_results` additionally covers numeric/string/boolean/array
+results, nil/defaults, bound values, outer shadowing, helper collisions,
+side-effect order, exceptions, independent matches and the optimized frontend.
+`guard_preprocessor_bootstrap` checks all five focused bootstrap guard checks;
+the first two now validate compilation and bounded execution instead of old
+generated helper names. These are targeted checks, not a complete language or
+physical-platform certification.
 
 Focused tests: `selfhost_compile_lexical`, `selfhost_project_lexical`.
 Their static malformed fixtures are input text, not runnable/lint-clean
