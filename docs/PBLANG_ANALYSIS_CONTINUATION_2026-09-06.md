@@ -230,3 +230,34 @@ No file-backed snapshot execution or universal safety claim follows from these
 tests. Legacy resolver implementations are unchanged. Unicode closure evidence
 whose identity incorporates `output_bytes` must be regenerated; see the canonical
 source-linker contract. Other open findings and 1.0.0 release gates remain.
+
+## Remediation update — 2026-09-07, A5 lexical admission
+
+Baseline `4fb0f12`. The new regression first failed because direct compilation
+accepted an unfinished block comment. A5 is repaired at the PBLang frontend
+compilation boundary: shared checked parsing surfaces tokenizer flags; lexical/
+parser errors stop codegen, file type/semantic analysis and project name
+publication. Raw validation precedes legacy guard rewriting and imported
+dependency scanning; processed imported syntax is checked before cache lookup.
+
+Eight focused suites passed: `selfhost_compile_lexical`,
+`selfhost_project_lexical`, `selfhost_tokenizer_unterminated`,
+`selfhost_parse_safe`, `execution_pipeline`, `execution_pipeline_byte_limits`,
+`selfhost_vm_bounded`, `guard_preprocessor_native_match`. Coverage includes
+CLI/pipeline/file/run/import/batch routes, Unicode line metadata, trailing
+escapes, legacy guard masking, lexical lint rejection and a two-file project
+whose broken provider must not authorize another file's names.
+
+A narrow lint lexical gate is independent of unrelated editor lint changes
+that remain unstaged. Existing empty module exports and inspection bytecode
+for type-only diagnostics are preserved. Numeric legacy guard arms still
+produce a pre-existing nil-versus-number type diagnostic after rewriting;
+successful nil-arm/native-match controls do not imply that issue is fixed.
+
+A1/A2/A7, pre-admission allocation, cache authenticity, raw parser consumers
+outside this frontend and broader 1.0.0 gates remain open. No full suite,
+device test or retained executable rebuild. See the bootstrap-safety contract.
+An additional confirmed legacy-rewriter issue remains: a valid escaped-quote/
+semicolon string arm can become lexically malformed after transformation. The
+new regression verifies rejection in compiler and lint, not successful support
+for that valid source. This is a separate follow-up correction.

@@ -18,6 +18,36 @@ let _VM = import("stdlib:compiler/vm.sapp");
 let _SEMANTIC = import("stdlib:compiler/semantic.sapp");
 let _BUILTINS_LIST = import("stdlib:compiler/builtins_list.sapp");
 
+// Keep recovery ASTs available to editors, but attach lexical failures to the
+// same error list every compiler route uses to decide whether codegen is allowed.
+fn _lexical_errors(tokens) {
+    let errors = [];
+    for token in tokens {
+        if (try token.unterminated catch nil) == true {
+            array_push(errors, "unterminated " + token.kind + " starting at line " + str(token.line));
+        }
+    }
+    return errors;
+}
+
+fn _parse_tokens_checked(tokens) {
+    let ast = _PARSER.parse(tokens);
+    for message in _lexical_errors(tokens) { array_push(ast.errors, message); }
+    return ast;
+}
+
+// A text rewrite must never erase malformed raw input. Leave it untouched so
+// checked parsing reports the original lexical diagnostic instead.
+fn _preprocess_checked(source) {
+    if len(_lexical_errors(_TOKENIZER.tokenize(source))) > 0 { return source; }
+    return _GUARD_PREPROCESSOR.preprocess(source);
+}
+
+fn _preprocess_stats_checked(source) {
+    let out = _preprocess_checked(source);
+    return map{ source: out, changed: out != source, size_before: len(source), size_after: len(out) };
+}
+
 fn frontend_analyze(source) {
     if source == nil {
         return map{
@@ -41,7 +71,7 @@ fn frontend_analyze(source) {
     }
 
     let tokens = _TOKENIZER.tokenize(source);
-    let ast = _PARSER.parse(tokens);
+    let ast = _parse_tokens_checked(tokens);
     let errors = ast.errors;
     let stmt_count = len(ast.stmts);
     let ok = len(tokens) > 0 and stmt_count > 0 and len(errors) == 0;
@@ -100,22 +130,9 @@ fn frontend_parse_full(source) {
     }
 
     let tokens = _TOKENIZER.tokenize(source);
-    let ast = _PARSER.parse(tokens);
+    let ast = _parse_tokens_checked(tokens);
 
-    // Surface tokenizer-level "unterminated string / block comment" flags as real
-    // errors. Without this they were silently accepted as complete tokens (the
-    // silent data-loss class the Rust frontend was hardened against).
     let errors = ast.errors;
-    let unterminated = 0;
-    let ti = 0;
-    while ti < len(tokens) {
-        let t = tokens[ti];
-        if (try t.unterminated catch nil) == true {
-            unterminated = unterminated + 1;
-            array_push(errors, "unterminated " + t.kind + " starting at line " + str(t.line));
-        }
-        ti = ti + 1;
-    }
 
     return map{
         // `ok` requires a non-empty AST AND zero diagnostics — previously it
@@ -202,7 +219,7 @@ fn frontend_compile(source) {
     }
 
     let tokens = _TOKENIZER.tokenize(source);
-    let ast = _PARSER.parse(tokens);
+    let ast = _parse_tokens_checked(tokens);
     let diagnostics = [];
     if ast.errors != nil {
         let ei = 0;
@@ -375,13 +392,17 @@ fn _resolve_module(path, cache, runtime_options = nil, bytecode_cache = nil) {
     if len(str_to_bytes(src)) > source_limit {
         throw "frontend_run_bounded: imported module source limit exceeded";
     }
+    if len(_lexical_errors(_TOKENIZER.tokenize(src))) > 0 { return cache[path]; }
     let deps = _find_imports(src);
     let di = 0;
     while di < len(deps) {
         if not map_has(cache, deps[di]) { _resolve_module(deps[di], cache, runtime_options, bytecode_cache); }
         di = di + 1;
     }
-    let processed = _GUARD_PREPROCESSOR.preprocess(src);
+    let processed = _preprocess_checked(src);
+    // Revalidate before a cache hit too: older caches may contain recovered ASTs.
+    let checked = _parse_tokens_checked(_TOKENIZER.tokenize(processed));
+    if len(checked.errors) > 0 { return cache[path]; }
     let chunk = nil;
     let key = nil;
     if bytecode_cache != nil {
@@ -560,7 +581,17 @@ fn _lint_name_candidates(builtins, decls, table) {
 
 // frontend_lint(source) — returns { ok, diagnostics:[{kind,message}], count }.
 fn frontend_lint(source) {
-    let ast = _PARSER.parse(_TOKENIZER.tokenize(_GUARD_PREPROCESSOR.preprocess(source)));
+    // Lexical rejection is independent of the optional editor recovery path.
+    if is_string(source) {
+        let lexical_diags = [];
+        for message in _lexical_errors(_TOKENIZER.tokenize(_preprocess_checked(source))) {
+            array_push(lexical_diags, map{ kind: "error", code: "parse-error", message: message });
+        }
+        if len(lexical_diags) > 0 {
+            return map{ ok: false, diagnostics: lexical_diags, count: len(lexical_diags) };
+        }
+    }
+    let ast = _parse_tokens_checked(_TOKENIZER.tokenize(_preprocess_checked(source)));
     let diags = [];
     let stmts = try ast.stmts catch nil;
     if stmts != nil { _lint_stmt_list(stmts, diags); }
@@ -629,7 +660,7 @@ fn frontend_run_file(path) {
     if src == nil or src == "" {
         return map{ ok: false, error: "frontend_run_file: cannot read file: " + path };
     }
-    return frontend_run(_GUARD_PREPROCESSOR.preprocess(src));
+    return frontend_run(_preprocess_checked(src));
 }
 
 fn frontend_run(source) {
@@ -687,7 +718,7 @@ fn frontend_run_file_bounded(path, options = nil) {
     if path == nil or path == "" { return map{ ok: false, error: "frontend_run_file_bounded: path is empty" }; }
     let src = fs_read(path);
     if src == nil or src == "" { return map{ ok: false, error: "frontend_run_file_bounded: cannot read file: " + path }; }
-    return frontend_run_bounded(_GUARD_PREPROCESSOR.preprocess(src), options);
+    return frontend_run_bounded(_preprocess_checked(src), options);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -712,10 +743,10 @@ fn frontend_compile_file(path, type_options = nil) {
     }
 
     // Run guard preprocessor on source before compilation
-    let processed_src = _GUARD_PREPROCESSOR.preprocess(src);
+    let processed_src = _preprocess_checked(src);
 
     let tokens = _TOKENIZER.tokenize(processed_src);
-    let ast = _PARSER.parse(tokens);
+    let ast = _parse_tokens_checked(tokens);
 
     let diagnostics = [];
     if ast.errors != nil {
@@ -726,7 +757,7 @@ fn frontend_compile_file(path, type_options = nil) {
         }
     }
 
-    if ast.stmts != nil {
+    if len(ast.errors) == 0 and ast.stmts != nil {
         // The checker returns structured diagnostics, including malformed-AST and
         // resource-limit failures. Do not turn an internal failure into success.
         let type_diags = _TYPECHECK.type_check(ast.stmts, type_options);
@@ -737,11 +768,11 @@ fn frontend_compile_file(path, type_options = nil) {
         }
     }
 
-    let chunk = _CODEGEN.compile_stmts(ast.stmts);
+    let chunk = if len(ast.errors) == 0 { _CODEGEN.compile_stmts(ast.stmts) } else { _CODEGEN.Chunk() };
 
     // Run semantic analysis (advisory: the self-hosted analyzer is partial, so a gap
     // in it must not abort compilation of an otherwise-valid file).
-    let sym_table = try _SEMANTIC.analyze(ast) catch nil;
+    let sym_table = if len(ast.errors) == 0 { try _SEMANTIC.analyze(ast) catch nil } else { nil };
 
     return map{
         ok: len(diagnostics) == 0,
@@ -828,8 +859,8 @@ fn _project_external_names(paths) {
     while i < len(paths) {
         let source = try fs_read(paths[i]) catch nil;
         if source != nil and source != "" {
-            let ast = try _PARSER.parse(_TOKENIZER.tokenize(_GUARD_PREPROCESSOR.preprocess(source))) catch nil;
-            if ast != nil {
+            let ast = try _parse_tokens_checked(_TOKENIZER.tokenize(_preprocess_checked(source))) catch nil;
+            if ast != nil and len(ast.errors) == 0 {
                 let declarations = _collect_global_decls(try ast.stmts catch []);
                 let declared = map_keys(declarations); let j = 0;
                 while j < len(declared) {
@@ -931,10 +962,10 @@ fn frontend_analyze_file(path) {
         };
     }
 
-    let processed_src = _GUARD_PREPROCESSOR.preprocess(src);
+    let processed_src = _preprocess_checked(src);
 
     let tokens = _TOKENIZER.tokenize(processed_src);
-    let ast = _PARSER.parse(tokens);
+    let ast = _parse_tokens_checked(tokens);
 
     let diagnostics = [];
 
@@ -952,7 +983,7 @@ fn frontend_analyze_file(path) {
     }
 
     // Type errors
-    if ast.stmts != nil {
+    if len(ast.errors) == 0 and ast.stmts != nil {
         let type_diags = _TYPECHECK.type_check(ast.stmts);
         let ti = 0;
         while ti < len(type_diags) {
@@ -968,9 +999,9 @@ fn frontend_analyze_file(path) {
     }
 
     // Semantic analysis diagnostics
-    let sym_table = _SEMANTIC.analyze(ast);
+    let sym_table = if len(ast.errors) == 0 { _SEMANTIC.analyze(ast) } else { nil };
     let si = 0;
-    while si < len(sym_table.diagnostics) {
+    while sym_table != nil and si < len(sym_table.diagnostics) {
         let sd = sym_table.diagnostics[si];
         array_push(diagnostics, map{
             stage: "semantic",
@@ -1004,11 +1035,11 @@ fn frontend_analyze_file(path) {
 
 /// Run the guard preprocessor as part of the pipeline and compile.
 fn frontend_compile_with_guard_prep(source) {
-    let stats = _GUARD_PREPROCESSOR.preprocess_with_stats(source);
+    let stats = _preprocess_stats_checked(source);
     let processed = stats.source;
 
     let tokens = _TOKENIZER.tokenize(processed);
-    let ast = _PARSER.parse(tokens);
+    let ast = _parse_tokens_checked(tokens);
     let diagnostics = [];
 
     if ast.errors != nil {
@@ -1019,7 +1050,7 @@ fn frontend_compile_with_guard_prep(source) {
         }
     }
 
-    if ast.stmts != nil {
+    if len(ast.errors) == 0 and ast.stmts != nil {
         let type_diags = _TYPECHECK.type_check(ast.stmts);
         let ti = 0;
         while ti < len(type_diags) {
@@ -1028,7 +1059,7 @@ fn frontend_compile_with_guard_prep(source) {
         }
     }
 
-    let chunk = _CODEGEN.compile_stmts(ast.stmts);
+    let chunk = if len(ast.errors) == 0 { _CODEGEN.compile_stmts(ast.stmts) } else { _CODEGEN.Chunk() };
 
     return map{
         ok: len(diagnostics) == 0,

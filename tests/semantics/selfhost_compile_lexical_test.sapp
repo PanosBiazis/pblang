@@ -1,0 +1,106 @@
+let F = import("stdlib:compiler/selfhost_frontend.sapp");
+let CLI = import("stdlib:compiler/selfhost_cli.sapp");
+let PIPE = import("stdlib:execution_pipeline.sapp");
+let T = import("stdlib:compiler/tokenizer.sapp");
+fn expect(value, message) { if not value { throw "FAIL selfhost_compile_lexical: " + message; } }
+fn messages(diags) {
+    let result = [];
+    for d in diags { array_push(result, if is_string(d) { d } else { d.message }); }
+    return result;
+}
+fn lexical_count(diags) {
+    let n = 0;
+    for message in messages(diags) {
+        if str_contains(message, "unterminated") { n = n + 1; }
+    }
+    return n;
+}
+fn no_code(result, message) {
+    expect(not result.ok, message + " rejected");
+    expect(result.chunk != nil and len(result.chunk.instructions) == 0, message + " has no instructions");
+    expect(lexical_count(result.diagnostics) == 1, message + " has one lexical diagnostic");
+}
+
+for source in [
+    "let answer = 42; /* unfinished",
+    "let answer = 42; let label = \"unfinished",
+    "let answer = 42; let label = \"trailing\\",
+    "/* unfinished",
+    "let answer = 42;\n/* λ😀 unfinished"
+] {
+    let parsed = F.frontend_parse_safe(source);
+    expect(not parsed.ok and lexical_count(parsed.errors) == 1, "safe parser rejection");
+    no_code(F.frontend_compile(source), "direct compilation");
+    no_code(F.frontend_compile_with_guard_prep(source), "guard compilation");
+    let lint = F.frontend_lint(source);
+    expect(not lint.ok and lexical_count(lint.diagnostics) == 1, "lint lexical rejection");
+    let analyzed = F.frontend_analyze(source);
+    expect(not analyzed.ok and lexical_count(analyzed.errors) == 1, "analysis agrees with compile");
+    let serialized = CLI.compile_source(source);
+    expect(not serialized.ok and serialized.stage == "compile" and not map_has(serialized, "bytes"), "CLI does not serialize invalid source");
+    let built = PIPE.build_source(source, "interpreter");
+    expect(not built.ok and not map_has(built, "artifact"), "pipeline does not return an artifact");
+    let run = F.frontend_run_bounded(source);
+    expect(not run.ok and len(run.output) == 0, "invalid source is not executed");
+}
+
+// Static repository-owned fixtures are only read; no temporary writes.
+for filename in ["unclosed_comment.sapp", "unclosed_string.sapp"] {
+    let path = "tests/fixtures/frontend_lexical/" + filename;
+    let result = F.frontend_compile_file(path);
+    no_code(result, "file compilation");
+    expect(result.symbol_table == nil, "no semantic analysis on rejected file");
+    let analysis = F.frontend_analyze_file(path);
+    expect(not analysis.ok and analysis.error_count > 0 and lexical_count(analysis.diagnostics) == 1,
+        "file analysis surfaces lexical diagnostic");
+    let batch = F.frontend_compile_file_many([path]);
+    no_code(batch[0], "single-file batch");
+    expect(not F.frontend_run_file(path).ok, "file execution rejected");
+    expect(not F.frontend_run_file_bounded(path).ok, "bounded file execution rejected");
+    let imported = F.frontend_run_bounded("let m = import(\"" + path + "\"); let count = len(map_keys(m));", map{ max_modules: 1 });
+    expect(imported.ok and imported.globals.count == 0, "invalid import retains empty exports");
+}
+let good_file = F.frontend_compile_file("tests/fixtures/frontend_lexical/valid.sapp");
+expect(good_file.ok and len(good_file.chunk.instructions) > 0, "valid file still compiles");
+expect(F.frontend_analyze_file("tests/fixtures/frontend_lexical/valid.sapp").ok, "valid file analysis");
+
+for source in [
+    "let answer = 42; /* closed */",
+    "let label = \"/* not a comment\";",
+    "let label = \"quote: \\\"\";",
+    "let answer = 42; // valid at EOF",
+    "let answer = 42; /* \"ignored quote */"
+] {
+    expect(F.frontend_compile(source).ok, "valid direct compilation");
+    expect(F.frontend_compile_with_guard_prep(source).ok, "valid guard compilation");
+    expect(CLI.compile_source(source).ok, "valid CLI serialization");
+}
+let error = F.frontend_compile("let answer = 42;\n/* unfinished");
+expect(error.diagnostics[0].message == "unterminated comment starting at line 2", "stable line diagnostic");
+let malformed = F.frontend_compile_with_guard_prep("let = ;");
+expect(not malformed.ok and len(malformed.chunk.instructions) == 0, "ordinary syntax errors also block codegen");
+let single = F.frontend_compile_many(["let answer = 42; /* unfinished"]);
+no_code(single[0], "single-source batch");
+let legacy = "let result = match 1 { case n if n > 0 ~ 42; /* unfinished } ;";
+no_code(F.frontend_compile_with_guard_prep(legacy), "raw legacy guard cannot erase comment error");
+let legacy_lint = F.frontend_lint(legacy);
+expect(not legacy_lint.ok and lexical_count(legacy_lint.diagnostics) == 1, "raw legacy lint rejection");
+let legacy_file = F.frontend_compile_file("tests/fixtures/frontend_lexical/legacy_comment.sapp");
+no_code(legacy_file, "raw file guard cannot erase comment error");
+let good_legacy = F.frontend_compile_with_guard_prep("let result = match 1 { case n if n > 0 ~ 42; else: 0; };");
+// The existing legacy rewrite initializes _guard_val to nil; numeric arms still
+// trigger type-only diagnostics. Do not hide that separate compatibility issue.
+expect(good_legacy.preprocess_stats.changed and lexical_count(good_legacy.diagnostics) == 0
+    and len(good_legacy.chunk.instructions) > 0, "complete legacy guard retains inspectable bytecode");
+let nil_legacy = F.frontend_compile_with_guard_prep("let result = match 1 { case n if n > 0 ~ nil; else: nil; };");
+expect(nil_legacy.ok and nil_legacy.preprocess_stats.changed, "type-compatible legacy guard compiles");
+// Raw input is lexically complete, but the legacy rewrite mishandles an escaped
+// quote followed by a semicolon. Both compile and lint must reject its output.
+let escaped_legacy = "let result = match 1 { case n if n > 0 ~ \"a\\\";b\"; else: \"z\"; };";
+for token in T.tokenize(escaped_legacy) {
+    expect((try token.unterminated catch false) != true, "raw escaped legacy tokens are complete");
+}
+no_code(F.frontend_compile_with_guard_prep(escaped_legacy), "malformed transformed legacy source");
+let escaped_lint = F.frontend_lint(escaped_legacy);
+expect(not escaped_lint.ok and lexical_count(escaped_lint.diagnostics) == 1, "lint checks transformed lexical errors");
+print "selfhost_compile_lexical_pass";
