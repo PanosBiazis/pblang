@@ -280,3 +280,34 @@ address:
   we're solving the practical "can I keep shipping?" problem here.
 
 When those concerns matter, treat them as separate workstreams.
+
+## Strict frontend compilation boundary (2026-09-07)
+
+One checked-token parser now feeds direct, file, guard and project compilation.
+Unterminated strings/block comments become parse errors with their token line.
+Recovery ASTs remain inspectable, but lexical/parser errors produce an empty
+instruction chunk. File analysis skips type/semantic passes on rejected ASTs;
+project name discovery ignores their recovered declarations.
+
+Raw lexical validation precedes legacy guard rewriting, so rewrites cannot
+erase unfinished tokens. Imported modules reject raw lexical errors before
+dependency scanning, retain the existing empty-exports failure contract, and
+validate processed syntax before cached bytecode lookup. Lint checks lexical
+errors after the guarded rewrite too. This does not authenticate caches or
+make the naive import scanner syntax-aware.
+
+CLI and pipeline consumers must check `ok` before serialization/execution.
+Type-only diagnostics intentionally retain inspectable bytecode with
+`ok=false`. Numeric legacy guard arms still encounter the existing rewrite's
+`_guard_val` nil-versus-number type mismatch. Native colon-syntax match is
+unchanged; general legacy guard semantics are not newly certified.
+An escaped quote followed by a semicolon in a legacy arm can still be rewritten
+into an unterminated string. Compile and lint now reject that transformed text;
+repairing the legacy rewriter itself is a separate compatibility task.
+
+Focused tests: `selfhost_compile_lexical`, `selfhost_project_lexical`.
+Their static malformed fixtures are input text, not runnable/lint-clean
+programs. The project fixture has two files and may start two compile workers.
+The targeted harness bounds time, address space and captured output.
+Whole-file reads, token allocation and preprocessing before byte admission on
+bounded file-run routes remain separate resource issues.

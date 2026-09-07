@@ -595,3 +595,41 @@ checked rejection result. Added-line privacy checks and `git diff --check`
 passed. Graphify reached its 20-second deadline (exit 124); graph freshness is
 not claimed. No test/analyzer workers or temporary test-output directories
 remained. No full suite, device or native-artifact execution was performed.
+
+## Remediation ledger — 2026-09-07, A5 strict lexical compilation
+
+Baseline `4fb0f12`; fix identity is this ledger's commit. PBLang-only frontend
+change, no Rust changes or host executable rebuild. The baseline regression
+accepted an unfinished comment; the correction rejects lexical/parser errors
+across direct/file/guard/batch compilation, CLI serialization and the execution
+pipeline. Recovery ASTs no longer produce instructions or file semantic/type
+analysis on those errors.
+
+Raw tokenizer flags are checked before guard rewriting and imported dependency
+scanning. Imported processed syntax is checked before cache lookup. Project
+indexing ignores errored files. The committed lint lexical gate is independent
+of preserved, excluded user editor-lint changes (35 additions/4 deletions).
+Type-only diagnostic bytecode remains inspectable, with `ok=false`.
+
+Eight targeted suites passed: `selfhost_compile_lexical`,
+`selfhost_project_lexical`, `selfhost_tokenizer_unterminated`,
+`selfhost_parse_safe`, `execution_pipeline`, `execution_pipeline_byte_limits`,
+`selfhost_vm_bounded`, `guard_preprocessor_native_match`. The existing harness
+uses 20 seconds/test, a 2-GiB address-space ceiling and capped output. Static
+repository-owned project fixtures bound compiler fan-out to two workers.
+
+Scope limits: source loading/preprocessing allocation, naive import discovery,
+cache authenticity, raw parser consumers outside this frontend and hard VM
+resource enforcement are not repaired here. Numeric legacy guard arms retain
+their pre-existing nil-versus-number type diagnostic. General editor lint
+parser recovery remains separate uncommitted work. **NOT READY for 1.0.0**.
+
+The escaped-quote/semicolon legacy-arm control also confirms a remaining
+rewriter defect: raw-complete text can become an unterminated processed string.
+Compiler and lint now reject it; source compatibility needs a separate repair.
+Four lexical lint checks also passed against an exact staged frontend snapshot,
+without the user's pending lint recovery changes. Its temporary copy was removed.
+Final build and portable-lock publication passed; the pre-existing dirty lock
+is excluded. Touched-file lint exited 0 with style/unused warnings, not a clean
+warning count. Graphify reached the 20-second deadline (exit 124); no graph
+freshness claim. No full suite or native/device artifact execution.
