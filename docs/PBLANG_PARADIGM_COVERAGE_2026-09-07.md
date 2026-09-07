@@ -19,7 +19,7 @@ inventory with explicitly partial inspection, not whole-module certification.
 | Model | Concrete implementation | Evidence and limits in this slice |
 | --- | --- | --- |
 | Imperative / procedural / structured | Functions, mutable bindings, branches and loops in `compiler/parser.sapp`, `codegen.sapp`, `vm.sapp` | Focused count/range/for-in, scope, try and closure tests pass on plain/optimized PBLang VM paths; not every control-transfer/backend path. |
-| Functional | `functional.sapp`: map/filter/folds, compose/pipe, partial/curry, memoization, declarative combinators | Selected combinator and composition tests pass. These are eager array operations, not proof of universal lazy evaluation or enforced purity. `f_apply` handles 0–3 args explicitly then calls with exactly four: arities above four are not general application. Stringified memoization/unique keys also need typed-key collision tests. |
+| Functional | `functional.sapp`: map/filter/folds, compose/pipe, partial/curry, memoization, declarative combinators | Selected combinator and composition tests pass. These are eager array operations, not proof of universal lazy evaluation or enforced purity. `f_apply` handles 0–3 args explicitly then calls with exactly four: arities above four are not general application. Memoization identity is now repaired below; stringified unique/grouping semantics still need separate tests. |
 | Object-oriented | `class.sapp`: single inheritance, overrides, super helpers, mixins, statics, bound methods and operator bridges | `oop_complete` and mixed-library tests pass. `call`/`call1..4` and `bind0..2` are finite adapters, not arbitrary arity. Single-parent extension is not multiple inheritance; mixins merge methods with later values winning. Inherited super-calls through deeper subclasses still need dedicated resolution tests. |
 | Class syntax | `compiler/parser.sapp::parse_class` builds a class table and constructor | Separate from the class library API. Selected source review shows method type/default syntax is parsed but discarded by this lowering; comment documents no `__call`/new0..new3 parity. Full constructor/method/default/type equivalence remains open. |
 | Generic / parametric / structural | `generics.sapp`: composable type predicates, typed lists/maps/boxes/options, interface-predicate bridge | `generics` and composition tests pass for runtime checks, negative mapper results and preserved input. This library is runtime-parametric, not evidence of static higher-kinded/dependent-type support or all native generic syntax. |
@@ -72,3 +72,18 @@ The canonical value/discard rule must be reconciled before release-wide parity.
 This report supplements, and does not close, the remaining-work matrix in
 `PBLANG_RUST_COMPARATIVE_AUDIT_2026-09-06.md`. No 1.0.0 readiness or universal
 paradigm/platform support claim follows from the passing focused tests.
+
+## Memoization identity remediation — 2026-09-07
+
+Baseline `81768c6`. A new regression reproduced number/string cache aliasing.
+`functional.memoize` and `pipe.memoize` now delegate to one PBLang module,
+using type-tagged scalar buckets with exact input comparison. Mutable/callable,
+non-finite, zero and oversized text inputs bypass caching. Retention is capped
+at 1024 entries with 4096-character text keys; this is not a hard heap limit.
+Successful nil values cache; exceptions retry. See `FUNCTIONAL_MEMOIZATION.md`.
+
+Both public APIs passed the new identity/capacity tests. The helper's compiled
+source also passed plain, optimized and in-memory bytecode round-trip checks
+as one unit, without claiming independent import-loader qualification.
+This fixes the identified memoization collision, not `unique`, generic arity,
+class-default semantics, full paradigm composition or the release blockers.

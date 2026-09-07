@@ -426,3 +426,14 @@ the report's resource/cleanup/isolation blockers remain open. The companion
 `PBLANG_PARADIGM_COVERAGE_2026-09-07.md` starts the requested programming-model
 composition audit; it explicitly distinguishes tested library combinations
 from full language/backend coverage. NOT READY for 1.0.0 remains unchanged.
+
+## Remediation update — 2026-09-07, memoization identity
+
+Baseline `81768c6`. The new regression reproduced number/string aliasing in
+string-key memoization. Both functional and pipe APIs now share a PBLang
+implementation with typed scalar identity, exact hit validation, conservative
+non-scalar bypass, successful-result-only publication and finite entry/key
+retention. The contract and compatibility change are documented in
+`FUNCTIONAL_MEMOIZATION.md`; broader heap/work limits are not claimed.
+No Rust or compiler/VM changes. The paradigm report's memoization follow-up is
+updated; generic arity, grouping/unique keys and broader 1.0.0 work remain open.
