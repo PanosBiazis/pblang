@@ -1147,7 +1147,7 @@ fn show_help() {
     println!("  pblang bundle [--registry-index <url>] [--require-registry-sha256] [path] [out_dir]  Create portable folder (default dist/) with executable + manifest + entry + deps");
     println!("  pblang transpile <file> [-o <output.c>]  Transpile .sapp/.bpx to self-contained C99 source (uses pblang-ctranspiler)");
     println!("  pblang build <file> [-o <output>] [--cc <compiler>]  Compile .sapp/.bpx to native executable via C transpiler (requires cc/gcc/clang)");
-    println!("  pblang verify <tarball>  Verify pack tarball structure and optional HMAC (set PBLANG_SIGNING_KEY when .sha256 sidecar present)");
+    println!("  pblang verify <tarball>  Report structure-only or verified HMAC; a present .sha256 sidecar requires PBLANG_SIGNING_KEY (not publisher authentication)");
     println!("  pblang --dump-bytecode <file>   Compile file and print bytecode (disassembly) for debugging / reverse engineering");
     println!("  pblang --annotate <file>   Compile file and print annotated bytecode (source line + instruction side-by-side)");
     println!("  pblang --symbols <file>    Print a simple symbol table for top-level functions and globals (name, arity, bytecode offset)");
@@ -2957,13 +2957,7 @@ fn legacy_dispatch(args: Vec<String>) {
                 eprintln!("pblang pack: skipping signing because PBLANG_SIGNING_KEY is empty");
             } else {
                 let hmac_hex = pblang_pm::compute_tarball_hmac(&bytes, key.as_bytes());
-                let sidecar = out_path.parent().unwrap_or(std::path::Path::new(".")).join(
-                    out_path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                        + ".sha256",
-                );
+                let sidecar = pblang_pm::tarball_hmac_sidecar_path(&out_path);
                 if let Err(e) = std::fs::write(&sidecar, hmac_hex) {
                     eprintln!(
                         "pblang pack: failed to write HMAC sidecar {}: {}",
@@ -2991,8 +2985,16 @@ fn legacy_dispatch(args: Vec<String>) {
             eprintln!("pblang verify: not a file: {}", tarball_path.display());
             std::process::exit(1);
         }
-        match pblang_pm::verify_tarball(&tarball_path) {
-            Ok(()) => println!("verify ok: {}", tarball_path.display()),
+        match pblang_pm::verify_tarball_detailed(&tarball_path) {
+            Ok(status) => {
+                let assurance = match status {
+                    pblang_pm::TarballVerification::StructureOnly => "structure only; unsigned",
+                    pblang_pm::TarballVerification::HmacVerified => {
+                        "HMAC verified; not publisher authentication"
+                    }
+                };
+                println!("verify ok ({assurance}): {}", tarball_path.display());
+            }
             Err(e) => {
                 eprintln!("pblang verify: {}", e);
                 std::process::exit(1);

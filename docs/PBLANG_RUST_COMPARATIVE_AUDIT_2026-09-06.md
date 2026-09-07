@@ -467,3 +467,49 @@ four touched PBLang files exited 0 with three pre-existing owner-module warnings
 style). `git diff --check` passed. `graphify update .` reached the external
 20-second deadline, exit 124, without completion output; graph freshness is not
 claimed. No persistent application, VM, device, or server was started.
+
+## Remediation ledger — 2026-09-07, package verification P1
+
+Baseline `ce151cc`; fix identity is the commit containing this section. This is
+an explicitly authorized repair of existing Rust package-manager behavior,
+not a change to the PBLang-first development policy. Unrelated working-tree
+changes remain excluded. See [package verification contract](PACKAGE_ARCHIVE_VERIFICATION.md).
+
+**P1 identified source defects repaired, focused library verification passed.**
+Pack, verify and local-registry HMAC now use the identical lossless sidecar name.
+Present sidecars require a nonblank key, bounded no-follow regular-file reads
+and exact hex syntax; HMAC failures no longer echo signatures. Encoded file URLs
+use the same decoding/admission as fetch. Detailed verification and CLI output
+distinguish unsigned structural checks from HMAC verification; the legacy
+unit-result API remains available. Neither result proves publisher authenticity.
+
+Verify and unpack now share relative-path and duplicate-path admission. Only an
+exact root regular manifest and a regular module satisfy verification. Harmless
+dot-prefixed paths remain supported. Nonempty directory payloads are rejected;
+extraction no longer ignores an unsuccessful `unpack_in` result. Effective PAX
+sizes are counted, and a shared decoded-byte budget is applied before tar parsing
+so GNU/PAX preprocessing cannot allocate from an unlimited decompressed stream.
+One metadata allocation can still approach that budget; this is not a hard
+process-memory or wall-clock guarantee.
+
+The 17 new targeted package-manager tests passed on the local Linux host. The
+central CLI passed `cargo check --offline --locked -j 1 -p pblang --bin pblang`.
+These are source/library results, not evidence that the retained release binary
+has been rebuilt or that CLI end-to-end, Windows/macOS or full-suite testing
+has passed. Tests use synthetic data and owned disposable directories without
+global environment mutation. The overall **NOT READY for 1.0.0** remains.
+
+Outstanding packaging requirements include mandatory publisher trust, immutable
+handoff, revocation/rollback, atomic signed publication, full cross-platform
+filename policy, and parser-wide resource enforcement. An absent sidecar remains
+explicitly unsigned, not fail-closed authentication; high-assurance callers must
+reject `StructureOnly`. The source repair does not close these broader gates.
+
+Final scoped security review found no remaining P1 blocker. Package-manager
+Clippy (library and tests), package-manager rustfmt checks and `git diff --check`
+passed. Existing dead-code and filesystem hard-link-cache warnings remain;
+whole-CLI rustfmt also reports pre-existing formatting outside the changed hunks,
+which was left untouched. Added-line privacy checks found no machine paths or
+credential material. The final Graphify update reached its 20-second deadline
+(exit 124), so graph freshness is not claimed. No test or analyzer processes or
+owned archive-test temporary directories remained. No full suite was run.
