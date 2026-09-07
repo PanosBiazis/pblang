@@ -550,3 +550,48 @@ the pre-existing dirty lockfile remains excluded from this commit. Added-line
 privacy checks and `git diff --check` passed. Graphify reached its 20-second
 deadline (exit 124), so graph freshness is not claimed. No test/analyzer workers
 or temporary test-output directories remained.
+
+## Remediation ledger — 2026-09-07, bounded linker UTF-8 admission
+
+Baseline `11e8d1a`; fix identity is the commit containing this ledger. This is a
+PBLang-only change with no Rust changes or retained-executable rebuild. Existing
+unrelated changes remain excluded.
+
+**A6-L bounded source/linker accounting repaired.** All bounded-linker source,
+path and output ceilings use UTF-8 bytes, including raw and canonical virtual
+paths. Cached admission sizes feed per-module and reachable totals; all supplied
+modules, even unused ones, count toward project admission. Output includes one
+LF per dependency. Snapshot selection and the file wrapper apply matching units
+after loading and before import scanning. Legacy resolver behavior is unchanged.
+
+The regression failed against unchanged source and passed with the correction.
+Six distinct focused suites passed: `source_linker_byte_limits`,
+`source_linker_bounded`, `source_inliner_prefixed`, `source_inliner_package`,
+`execution_pipeline_byte_limits`, and `execution_pipeline`. Each ran with a
+20-second deadline, 2-GiB address-space cap and synthetic in-memory fixtures.
+The existing comment-import test was not executed because it writes predictable
+temporary paths and starts a PATH-resolved subprocess; that harness issue remains.
+
+The complete owning module, relevant consumers/contracts and selected tests were
+reviewed. Scoped security review found no blocker. File-backed snapshot selection
+changes are source-reviewed, not exercised against live files in this slice.
+Full-array UTF-8 measurement, transformed-body allocation before output admission,
+and pre-admission snapshot loading remain resource boundaries. Byte counts are
+not heap usage or VM-wide hard enforcement. **NOT READY for 1.0.0** is unchanged.
+
+Compatibility: Unicode byte limits are intentionally stricter; raw aliases that
+exceed the configured cap are rejected even when they normalize to short paths.
+`immutable_broker_bundle` includes output length in its closure identity, so
+persisted Unicode closure evidence must be regenerated without weakening the
+verifier. With identical source/manifest/dependency inputs, ASCII byte-count
+contributions to identity are unchanged; dependency/lock updates independently
+affect identity. The source-graph hash algorithm is unchanged. See
+[source linker contract](Source_linker.md).
+
+Final project build and portable-lock publication passed. The pre-existing
+dirty lockfile is excluded from the commit. Lint exited 0 with two existing
+owner-module warnings and a false unused-variable warning on the new test's
+checked rejection result. Added-line privacy checks and `git diff --check`
+passed. Graphify reached its 20-second deadline (exit 124); graph freshness is
+not claimed. No test/analyzer workers or temporary test-output directories
+remained. No full suite, device or native-artifact execution was performed.

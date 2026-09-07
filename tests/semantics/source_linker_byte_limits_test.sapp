@@ -1,0 +1,90 @@
+let LINK = import("stdlib:source_inliner.sapp");
+let PIPE = import("stdlib:execution_pipeline.sapp");
+fn expect(value, message) { if not value { throw "FAIL source_linker_byte_limits: " + message; } }
+fn bytes(text) { return len(str_to_bytes(text)); }
+fn denied(result, reason) {
+    expect(not result.ok and str_contains(result.reason, reason), "expected rejection: " + reason);
+}
+
+for marker in ["A", "é", "λ", "中", "😀", "é"] {
+    let root = "/* " + marker + " */ print 1;";
+    let size = bytes(root);
+    let exact = LINK.link_modules(root, map{}, map{ max_module_source_bytes: size });
+    expect(exact.ok and exact.input_bytes == size, "root exact byte count");
+    denied(LINK.link_modules(root, map{}, map{ max_module_source_bytes: size - 1 }), "main source limit");
+    expect(LINK.link_modules(root, map{}, map{ max_total_source_bytes: size }).ok, "root total exact");
+    denied(LINK.link_modules(root, map{}, map{ max_total_source_bytes: size - 1 }), "total project");
+}
+
+let dependency = "/* λ😀 */ fn value() { return 42; } export value;";
+let unused = "/* 中é */ fn unused() { return 7; } export unused;";
+let root = "let M = import(\"lib/λ.sapp\"); print M.value();";
+let modules = map{ "lib/λ.sapp": dependency, "unused.sapp": unused };
+let before = str(modules);
+let linked = LINK.link_modules(root, modules);
+expect(linked.ok, "Unicode graph links");
+expect(linked.module_bytes["lib/λ.sapp"] == bytes(dependency), "per-module bytes");
+expect(linked.input_bytes == bytes(root) + bytes(dependency), "reachable bytes exclude unused module");
+expect(linked.supplied_bytes == bytes(dependency) + bytes(unused), "supplied bytes include unused module");
+expect(linked.output_bytes == bytes(linked.source), "transformed output includes separator bytes");
+expect(str(modules) == before, "linking preserves input map");
+let total = bytes(root) + bytes(dependency) + bytes(unused);
+expect(LINK.link_modules(root, modules, map{ max_total_source_bytes: total }).ok, "project total exact");
+denied(LINK.link_modules(root, modules, map{ max_total_source_bytes: total - 1 }), "total project");
+expect(LINK.link_modules(root, modules, map{ max_linked_source_bytes: linked.output_bytes }).ok, "output exact");
+denied(LINK.link_modules(root, modules, map{ max_linked_source_bytes: linked.output_bytes - 1 }), "linked source");
+let per = bytes(dependency);
+expect(LINK.link_modules("print 1;", map{ "unused.sapp": dependency }, map{ max_module_source_bytes: per }).ok, "unused module exact");
+denied(LINK.link_modules("print 1;", map{ "unused.sapp": dependency }, map{ max_module_source_bytes: per - 1 }), "module source limit");
+denied(LINK.link_modules("print 1;", modules, map{ max_total_source_bytes: linked.supplied_bytes - 1 }), "supplied module");
+
+let path = "lib/λ😀.sapp";
+let path_modules = map{}; path_modules[path] = "print 1;";
+expect(LINK.link_modules("print 1;", path_modules, map{ max_path_bytes: bytes(path), entry_path: "m" }).ok, "Unicode module path exact");
+denied(LINK.link_modules("print 1;", path_modules, map{ max_path_bytes: bytes(path) - 1, entry_path: "m" }), "module path");
+expect(LINK.link_modules("print 1;", map{}, map{ entry_path: path, max_path_bytes: bytes(path) }).ok, "Unicode entry path exact");
+denied(LINK.link_modules("print 1;", map{}, map{ entry_path: path, max_path_bytes: bytes(path) - 1 }), "entry_path");
+
+// Both raw spelling and the canonical result are charged to the configured cap.
+let alias = "é/../x.sapp";
+let aliases = map{}; aliases[alias] = dependency;
+expect(LINK.link_modules("print 1;", aliases, map{ entry_path: "m", max_path_bytes: bytes(alias) }).ok, "normalized alias exact");
+denied(LINK.link_modules("print 1;", aliases, map{ entry_path: "m", max_path_bytes: bytes(alias) - 1 }), "module path");
+let import_root = "let M = import(\"" + alias + "\"); print M.value();";
+expect(LINK.link_modules(import_root, map{ "x.sapp": dependency }, map{ entry_path: "m", max_path_bytes: bytes(alias) }).ok, "raw import exact");
+denied(LINK.link_modules(import_root, map{ "x.sapp": dependency }, map{ entry_path: "m", max_path_bytes: bytes(alias) - 1 }), "import path");
+
+// Canonical relative expansion is longer than either raw import spelling.
+let parent = "λ/main.sapp";
+let child = "λ/longname.sapp";
+let relative_modules = map{}; relative_modules[child] = dependency;
+let relative = LINK.link_modules("let M = import(\"./longname.sapp\"); print M.value();", relative_modules,
+    map{ entry_path: parent, max_path_bytes: bytes(child) });
+expect(relative.ok and relative.module_order[0] == child, "relative Unicode resolution");
+let expanded_root = "let M = import(\"./long.sapp\");";
+denied(LINK.link_modules(expanded_root, map{}, map{ entry_path: "λ/a.sapp", max_path_bytes: 11 }), "import path");
+denied(LINK.link_modules(expanded_root, map{}, map{ entry_path: "λ/a.sapp", max_path_bytes: 12 }), "cannot resolve");
+
+let empty = LINK.link_modules("", map{}, map{ max_linked_source_bytes: 1 });
+expect(empty.ok and empty.output_bytes == 0 and empty.input_bytes == 0, "zero-byte text is valid");
+let separator = LINK.link_modules("let M = import(\"x.sapp\");", map{ "x.sapp": "" }, map{ max_linked_source_bytes: 1 });
+expect(separator.ok and separator.source == "\n" and separator.output_bytes == 1,
+    "empty module and root still require one separator byte");
+
+// A diamond graph counts a shared module once, with one LF per emitted module.
+let diamond = map{
+    "a.sapp": "let C = import(\"c.sapp\"); fn a() { return C.value(); } export a;",
+    "b.sapp": "let C = import(\"c.sapp\"); fn b() { return C.value(); } export b;",
+    "c.sapp": dependency
+};
+let diamond_root = "let A = import(\"a.sapp\"); let B = import(\"b.sapp\"); print A.a() + B.b();";
+let shared = LINK.link_modules(diamond_root, diamond);
+expect(shared.ok and shared.modules == 3, "shared dependency counted once");
+expect(shared.input_bytes == bytes(diamond_root) + bytes(diamond["a.sapp"]) + bytes(diamond["b.sapp"]) + bytes(dependency), "diamond input bytes");
+expect(shared.output_bytes == bytes(shared.source), "diamond output bytes");
+
+let built = PIPE.build_source(root, "c99-hosted", map{ modules: modules, max_total_source_bytes: total });
+expect(built.ok and built.link.input_bytes == linked.input_bytes, "pipeline propagates corrected link metrics");
+let rejected = PIPE.build_source(root, "c99-hosted", map{ modules: modules, max_total_source_bytes: total - 1 });
+expect(not rejected.ok, "pipeline propagates project-byte rejection");
+print "source_linker_byte_limits_pass";
