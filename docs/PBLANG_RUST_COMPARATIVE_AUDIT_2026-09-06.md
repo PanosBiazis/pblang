@@ -1073,3 +1073,45 @@ and diff checks passed; the pre-existing frontend diff remains unchanged and
 the dirty lock is excluded. Graphify reached its 20-second timeout (124);
 no graph freshness is claimed. No test/Graphify process or owned temporary
 output directory remained.
+
+## Remediation ledger — 2026-09-07, typed memoization identity
+
+Baseline `81768c6`; fix identity is this ledger's commit. The new regression
+failed before the change because numeric 1 and string "1" returned the same
+cached result. Both complete owning modules (`functional.sapp`, `pipe.sapp`)
+and discovered callers/tests were reviewed. Their duplicate string-only
+implementations now delegate to `functional_memo.sapp`.
+
+The shared helper admits immutable scalar keys with type tags and compares
+the stored scalar before every cache hit. Mutable/callable inputs are not
+serialized or compared; they recompute. Zero/non-finite numbers are bypassed.
+An entry is published only after callback success, with at most 1024 entries
+and 4096-character string keys. At capacity new keys recompute while old hits
+remain available. Callback/result memory and execution are not bounded by
+these retention limits; the report's hard-resource blockers remain open.
+No Rust, compiler, VM, serializer or existing frontend edits.
+
+Ten targeted suites passed: `memoize_identity`, `selfhost_memoize_identity`,
+`pipe_stdlib`, `pipe_enrich`, `functional_combinators`,
+`multi_paradigm_composition`, `oop_complete`, `generics`,
+`selfhost_try_scope`, `selfhost_try_capture`. The new host test checks both
+public APIs, type distinctions, exact results/counts, nil caching, exceptions,
+mutable/callable and zero bypass, and entry/key N/N+1 boundaries.
+The self-hosted test compiles the reviewed helper source as one unit, checking
+plain, optimized and in-memory serialized results at 10,000 steps/16 frames.
+This is not independent module-loader, backend or physical-platform evidence.
+All tests use the 20-second/2-GiB/capped-output trusted harness.
+
+The public API is unchanged, but bypass/capacity cases deliberately execute
+more often. The pure-callback contract and shared-result limitation are in
+`FUNCTIONAL_MEMOIZATION.md`. This closes the memoization identity follow-up
+only: unique/grouping, general arity and paradigm composition remain partial.
+The overall 1.0.0 assessment remains NOT READY; no full suite was run.
+
+Final build and portable-lock publication passed. Lint on all five touched
+PBLang files exited zero, with equal-operand warnings on intentional
+non-finite guards plus existing/fixture unused-variable reports. Added-line
+privacy and diff checks passed. The unrelated frontend diff is unchanged;
+the dirty lock remains excluded. Graphify stopped at 20 seconds (124), so
+graph freshness is not claimed. No test/Graphify process or owned temporary
+test-output directory remained.
