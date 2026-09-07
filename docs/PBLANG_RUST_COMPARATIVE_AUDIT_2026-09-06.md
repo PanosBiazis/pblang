@@ -1115,3 +1115,46 @@ privacy and diff checks passed. The unrelated frontend diff is unchanged;
 the dirty lock remains excluded. Graphify stopped at 20 seconds (124), so
 graph freshness is not claimed. No test/Graphify process or owned temporary
 test-output directory remained.
+
+## Remediation ledger — 2026-09-07, curried argument preservation
+
+Baseline `92354d8`; fix identity is this ledger's commit. The full functional
+module, discovered curry callers and relevant tests were reviewed. The previous
+dispatcher called with four values for any argument vector of length >=4.
+The new regression failed before the change because `curry(f, 5)` accepted
+an unsupported positional arity instead of rejecting it before collection.
+
+`curry` now validates integer 0–4 arity, preserving nil/default 2 and immediate
+zero invocation. The internal dispatcher rejects excess arguments rather than
+dropping them. Negative/fractional/non-number arities also reject before effects.
+The additive `curry_args(f, n)` accepts integral 0–256 and invokes an array-taking
+callback with all values in order. Every step copies only the outer prefix
+array; element references remain shared. Exceptions do not consume a reusable
+prefix. This is a vector convention, not arbitrary positional apply/spread.
+
+Ten targeted suites passed: `functional_curry_contract`,
+`functional_curry_args`, `selfhost_curry_args`, `functional_combinators`,
+`multi_paradigm_composition`, `memoize_identity`, `pipe_stdlib`,
+`pipe_enrich`, `oop_complete`, `generics`. New cases cover malformed
+admission without effects, 0–4/default behavior, 256/257 boundaries, order,
+prefix reuse/mutation, exception retry and object/generic/functional composition.
+The self-hosted probe imports the actual functional library through
+`frontend_run_bounded` with 15,000 steps, 24 frames, eight modules and
+32-KiB per-source admission. These are the existing frontend limits, not proof
+of aggregate import/heap enforcement. Each host test is capped at 20 seconds,
+2 GiB address space and bounded output. No broad suite or device execution.
+
+Only PBLang library/tests/docs changed; no Rust, compiler, VM or existing
+frontend changes. `FUNCTIONAL_CURRY.md` records migration and the quadratic
+prefix-copy cost. General positional calls, callback signature inference,
+retained checker C2, class/block semantics and remaining resource/FFI/package/
+platform evidence remain open. This does not promote any release gate to PASS;
+the 1.0.0 assessment remains NOT READY.
+
+Final build and repository-relative lock publication passed. Lint on the four
+touched PBLang files exited zero, with existing/fixture unused-variable warnings.
+Added-line/new-file privacy checks and `git diff --check` passed. The pre-existing
+frontend diff is unchanged; unrelated work and the dirty lock are excluded from
+this commit. Graphify reached its 20-second deadline (124), so the graph update
+is incomplete. No test/Graphify worker or temporary test-output directory
+remained after the checks.
