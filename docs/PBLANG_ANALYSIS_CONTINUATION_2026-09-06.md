@@ -261,3 +261,24 @@ An additional confirmed legacy-rewriter issue remains: a valid escaped-quote/
 semicolon string arm can become lexically malformed after transformation. The
 new regression verifies rejection in compiler and lint, not successful support
 for that valid source. This is a separate follow-up correction.
+
+## Remediation update — 2026-09-07, legacy quoted spans
+
+Baseline `f4dc392`. The quoted-span defect above is now repaired in PBLang's
+legacy guard adapter. The new value-based regression first failed on the
+unchanged escaped-quote/semicolon case. A shared scanner now consumes escape
+pairs and preserves the original quoted slice throughout scrutinee, guard,
+arm/default and keyword/brace handling. Guard identifier substitution leaves
+quoted literals unchanged. Empty replacement names return without looping.
+
+Malformed quote spans return failure/unchanged text rather than invented ends.
+The A5 compiler gates remain unchanged; the previous escaped-case regression
+now requires parseable output instead of requiring corruption and rejection.
+Separate tests retain malformed raw-input rejection and check actual synthetic
+results with step/frame-limited VM execution. Type-only legacy diagnostics are
+explicitly not treated as a successful production compile.
+
+Still open: nil-initialized guard-result typing, source-wide rewrite activation
+(including accidental native-match rewrites), comments/nesting, generated-name
+hygiene and ASCII-only identifier/keyword boundaries. No universal legacy
+syntax support, resource guarantee or 1.0.0 readiness follows from this repair.
