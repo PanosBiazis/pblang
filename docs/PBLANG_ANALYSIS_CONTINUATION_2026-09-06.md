@@ -394,3 +394,19 @@ semantics remain separate follow-ups. The comparative audit now ends with a
 reconciled remaining-work table: earlier fixed defects are not counted as
 open, partial fixes retain their remaining scope, and release evidence is
 separate from source implementation. Overall status remains NOT READY.
+
+## Remediation update — 2026-09-07, count/range loop lowering
+
+Baseline `3f81b2c`. Both new regressions reproduced outer-binding leakage.
+PBLang count/range emitters now isolate the binder, evaluate bounds once before
+binding it, and use unnamed counter/bound slots. Assigning the body binder
+cannot change the iteration sequence. Range bounds evaluate start then end;
+exceptions prevent later bounds/body from executing. Continue/break, nested
+and sibling loops, Unicode and by-value captures are covered.
+
+Fourteen targeted suites passed; the exact list and limits are in the
+comparative audit. This closes the earlier count/range scope and repeated-bound
+follow-up for the reviewed scalar lowering, not every numeric edge case,
+backend or resource guarantee. Existing repeated-bound or binder-driven-loop
+code should express that behavior with `while`. No Rust, VM, parser,
+typechecker or frontend source changes. Overall release status stays NOT READY.
