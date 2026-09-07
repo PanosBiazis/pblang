@@ -305,3 +305,29 @@ brace expressions and comments inside legacy expressions are no longer lowered.
 They remain available to the checked frontend, which may reject them. Numeric
 result typing, generated-name hygiene, full nested lowering and hard resource
 enforcement remain open. The frontend and Rust implementations are unchanged.
+
+## Remediation update — 2026-09-07, legacy result values and scoped bindings
+
+Baseline `6d8b484`. The new numeric regression first failed because the legacy
+emitter initialized its result with nil. Selected arms now return directly
+from the existing IIFE. Each arm binds its subject in a statement-if lexical
+scope; this deliberately avoids the parser's separate value-block IIFE for
+bare braces. Guards remain verbatim, so bindings work in both guards and values
+without corrupting field names or quoted strings. The subject runs once,
+guards run in order, and only the selected value executes. Defaults use the
+outer scope, while no matching arm/default returns nil.
+
+A deterministic helper identifier is absent from tokens in the admitted match
+span. Tokenization failures decline lowering; candidate selection is capped at
+token count plus one. This closes lexical helper capture, not reflective/eval
+hygiene or global resource limits. The earlier result/bind and generated-name
+limitations are superseded only within the admitted legacy subset. Precise
+union inference, general grammar/nesting, host parity and production readiness
+remain unproven. No frontend, typechecker, VM or Rust changes were made.
+
+All twelve targeted suites listed in the comparative audit passed, including
+new result and focused bootstrap checks. They require checked compilation and
+bounded execution, verify helper collisions, side effects and exceptions, and
+cover the optimized path. The previous tests no longer tolerate false legacy
+type diagnostics. No full-suite or physical-device claim; **NOT READY for
+1.0.0** remains the evidence-based release status.

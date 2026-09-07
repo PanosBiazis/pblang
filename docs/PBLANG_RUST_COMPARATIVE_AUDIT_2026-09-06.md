@@ -704,3 +704,54 @@ the pre-existing dirty lock is excluded. Lint exited 0 with two warnings
 (an unused-variable report on the checked local `code` and existing `while true`
 style). Graphify timed out cleanly at 20 seconds (124), so graph freshness is
 not claimed. No full suite, device scan or retained executable rebuild.
+
+## Remediation ledger — 2026-09-07, legacy result values and scoped bindings
+
+Baseline `6d8b484`; fix identity is this ledger's commit. A numeric-result
+regression first failed checked compilation because the old emitter assigned
+a number to a synthetic nil-initialized result variable. The PBLang adapter
+now returns selected values directly from its existing outer IIFE. Each arm
+gets a lexical statement-if scope containing its binding, original guard and
+value. Bare braces cannot serve this purpose: the parser lowers those to a
+separate value-block IIFE, which would intercept returns. No parser, frontend,
+typechecker, VM, optimizer or Rust source changes were made in this slice.
+
+The subject is evaluated once; guards run in order; later guards and unselected
+values do not run. Bindings work in values as well as guards without rewriting
+member names or strings. Repeated bindings are isolated; the default sees the
+outer scope; a missing default returns nil. A deterministic helper name avoids
+all canonical identifier tokens in the admitted match span. Tokenization
+failure/unterminated tokens decline lowering; candidate search is bounded by
+token count plus one, not a hard global memory/time guarantee.
+
+This entry supersedes earlier open nil-result assignment, missing body-binding
+and lexical helper-collision limitations **only for the admitted legacy subset**.
+It does not establish reflective/eval hygiene, precise union/result inference
+(function literals retain the existing `any` return type), general expression
+or nested grammar support, native/Rust parity or universal compatibility.
+The admission grammar and raw/processed compilation gates remain unchanged.
+Broader resource, runtime security and physical-platform evidence gaps remain;
+**NOT READY for 1.0.0** is unchanged.
+
+Validation: twelve focused suites passed (`guard_preprocessor_results`,
+`guard_preprocessor_bootstrap`, `guard_preprocessor_activation`,
+`guard_preprocessor_strings`, `guard_preprocessor_native_match`,
+`selfhost_compile_lexical`, `selfhost_project_lexical`,
+`selfhost_tokenizer_unterminated`, `selfhost_parse_safe`, `selfhost_vm_bounded`,
+`execution_pipeline`, `execution_pipeline_byte_limits`). Results cover numeric,
+string, boolean and array values; defaults/nil; bindings/shadowing; member and
+literal preservation; two helper-candidate collisions; deterministic sibling
+matches; side-effect order; exceptions; optimized execution and genuine name
+errors. Bootstrap's five guard checks now use checked bounded execution for
+value cases, not old helper substrings. Existing string/native/lexical controls
+now require successful compilation instead of tolerating legacy type errors.
+The harness bounds each target to 20 seconds, 2 GiB and capped output; new VM
+probes additionally use 4,000 steps/12 frames (bootstrap: 2,000/eight).
+Lint exited zero with ten warnings, including existing unused/style reports
+and deliberate exact-boolean checks; no lint-clean claim. Security postreview
+approved this scoped change. No full suite, hardware scan or runtime rebuild.
+Final project build and portable-lock publication passed. Added-line privacy
+checks and `git diff --check` passed. The pre-existing frontend diff is byte-for-
+byte unchanged and unrelated work, including the dirty lockfile, is excluded.
+Graphify reached its 20-second deadline (124) without retained processes;
+graph freshness is not claimed.
