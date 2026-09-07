@@ -9,8 +9,8 @@ Register IR can be evaluated through the bounded correctness oracle or built as
 x86-64 ELF, i386 ELF, ARM64 ELF, or portable C99. Full pblang source can be
 compiled to checked self-hosted bytecode, executed in the bounded self-hosted
 VM, lowered by the pblang-written hosted C99 backend with `c99-hosted`, or
-compiled to WebAssembly. Backend modules load
-only when selected, keeping read-only planning and reference evaluation small.
+compiled to WebAssembly. Backend modules are statically imported so the module
+graph is visible to freezing; backend compilation is selected by target.
 
 `c99-hosted` also accepts an immutable in-memory project snapshot:
 
@@ -29,7 +29,9 @@ and performs no filesystem or network I/O. Absolute paths, backslashes, foreign
 schemes, root traversal, cycles, duplicate canonical paths, nested imports, bare
 module values, and the reserved `__pbi*` namespace fail closed. Module count,
 depth, per-module bytes, total supplied bytes, linked-output bytes, and path
-length all have configurable defaults and immutable hard ceilings. See
+length all have configurable defaults and immutable hard ceilings. However,
+the linker's current byte-named text/path limits still count Unicode characters;
+they are not yet UTF-8 byte guarantees for non-ASCII module snapshots. See
 `docs/Source_linker.md` for the complete contract.
 
 ```sapp
@@ -56,15 +58,41 @@ ABI integration exists. WASI uses the WebAssembly backend.
 
 ## Fail-closed limits
 
-Every call has finite source, IR instruction, artifact, evaluator-step, frame,
-stack, locals, output, module-count/depth/source/path, and individual-value-size limits. Hard
-ceilings prevent callers from turning configuration
-into an unbounded request. Register-IR syscalls are denied unless
+The facade validates finite source, IR instruction, artifact, evaluator-step,
+frame, stack, locals, output, module-count/depth/source/path, and value-size
+options with immutable maxima. These are distinct admission/runtime controls,
+not a complete process-memory or wall-clock guarantee. Register-IR syscalls are denied unless
 `allow_syscalls: true` is explicit. Native artifacts are built but never
 executed by this library. `eval` uses `codegen_ir.eval_bounded`; source preview
 uses `selfhost_frontend.frontend_run_bounded`. A single sticky runtime budget is
 threaded through calls, closures, operator overloads, and try/catch sub-chunks,
-so language exception handling cannot clear a resource-limit failure.
+so language exception handling cannot clear that VM budget's resource-limit
+failure. This does not establish a single aggregate budget across imported
+modules and the main chunk; that frontend limitation remains open.
+
+### Byte units and output representation
+
+`build_source` and `run_source` reject source above `max_source_bytes` using
+UTF-8 bytes before dispatching to the frontend or selected backend. A preliminary
+character-count rejection avoids encoding text already known to exceed the
+ceiling. For example, `λ` is one Unicode scalar but two UTF-8 bytes; `😀` is one
+scalar but four bytes. Exact N-byte input is admitted at N, and rejected at N-1.
+This correction intentionally tightens admission of non-ASCII source; ASCII
+limits, target selection and successful program semantics are unchanged.
+
+`artifact_bytes`, `max_artifact_bytes` and optimization-matrix byte metrics use:
+
+- UTF-8 bytes for text artifacts such as C source.
+- Element count for the byte vectors produced by current ELF/WASM backends.
+- UTF-8 bytes of the existing diagnostic `str()` representation for checked
+  bytecode maps and scalar evaluation results. This is **not serialized PBCK
+  size**, a canonical interchange encoding, or an in-memory heap measurement.
+
+Artifact rejection happens after backend generation. Text measurement also
+materializes a UTF-8 byte array, after its preliminary character check. Neither
+step enforces peak heap usage or prevents allocation inside a backend. The
+separate snapshot linker's module/aggregate/linked-output/path byte accounting
+remains unresolved; the direct-source fix must not be interpreted as closing it.
 
 The `c99-hosted` source target is build-only and returns C source, not an
 executed process. Unsupported AST nodes, unresolved imports, profile-invalid
@@ -128,6 +156,7 @@ firmware trust, hardware protections, and deployment-specific controls.
 
 - `tests/semantics/codegen_ir_test.sapp`
 - `tests/semantics/execution_pipeline_test.sapp`
+- `tests/semantics/execution_pipeline_byte_limits_test.sapp`
 - `tests/semantics/source_linker_bounded_test.sapp`
 - `tests/semantics/selfhost_vm_bounded_test.sapp`
 - `tests/semantics/ctranspile_hosted_test.sapp`

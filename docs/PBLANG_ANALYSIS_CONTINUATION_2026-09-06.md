@@ -181,3 +181,33 @@ Windows/macOS/mobile evidence remains unavailable in this continuation.
 
 Release 1.0 readiness, zero vulnerabilities and universal compatibility are not
 established. Findings above remain open: recording them is not fixing them.
+
+## Remediation update — 2026-09-07, A6 direct-source byte admission
+
+At baseline `c3b0ace`, the A6 direct-source defect remained reproducible. The new
+`execution_pipeline_byte_limits` regression failed on the unchanged pipeline:
+the interpreter build accepted the Unicode source with a byte ceiling one below
+its actual UTF-8 size. It passed after the PBLang-only correction.
+
+Both `build_source` and `run_source` now share source validation: reject non-text,
+reject an excessive character count before encoding, then enforce UTF-8 byte
+length before backend dispatch. Text artifacts and diagnostic map/scalar
+representations also use UTF-8 byte lengths, while binary byte vectors retain
+their element-count metric. Exact N/N-1 tests cover ASCII, two-/three-/four-byte
+characters, combining marks, all three source-build targets and bounded preview.
+Artifact boundary tests and malformed numeric-limit tests are included.
+
+This repairs **A6 direct source admission** and the adjacent artifact-unit
+mismatch; it does not establish serialized-bytecode or hard-heap enforcement.
+Artifact checks happen after generation, and UTF-8 measurement allocates an
+array. Map/scalar metrics describe diagnostic rendering, not serialized PBCK.
+
+**Related open finding, A6-L:** the in-memory module linker in
+`stdlib/source_inliner.sapp` still uses character counts for byte-named virtual
+path, module-source, aggregate-source and linked-output ceilings. Relevant
+reviewed paths include `_canonical_module_path`, `_canonical_modules`,
+`_collect_bounded` and `link_modules`. Unicode project snapshots can exceed
+their named byte budgets; do not claim end-to-end UTF-8 project bounds until
+these owning-module policies and tests are corrected. This is source-reviewed,
+not a newly executed project-snapshot exploit. A1/A2/A5/A7 remain separate work;
+the A3/A4 remediation scope is recorded in the comparative audit ledger.
