@@ -364,3 +364,17 @@ This corrects behavior and tightens mistaken enum acceptance; it does not
 establish global match soundness. Colon-method-call parsing ambiguity and
 native helper/binding scope remain separate limitations. Release readiness
 stays **NOT READY**; the comparative ledger records exact coverage and checks.
+
+## Remediation update — 2026-09-07, native match lexical scope
+
+Baseline `fc35a31`. The new regression reproduced a failed arm binding leaking
+into the default. Native codegen now mirrors the typechecker's per-arm lexical
+scopes. Its subject is kept in an unnamed internal slot, preventing capture of
+the legal user name `__match_scrut`. Runtime slots remain monotonic and closures
+retain existing by-value capture behavior.
+
+Default/later-arm lookup, nested matches, repeated and Unicode binders,
+helper-like outer names and closures are checked in plain and safely optimized
+bounded execution. This closes the two native match limitations recorded in
+the previous update; the parser's colon ambiguity, other compiler temporaries
+and broader release blockers are not claimed fixed. No Rust or VM changes.

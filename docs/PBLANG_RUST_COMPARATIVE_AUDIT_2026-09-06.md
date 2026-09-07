@@ -850,3 +850,54 @@ Added-line privacy and `git diff --check` checks passed; pre-existing frontend
 diff remained unchanged, and the dirty lockfile is excluded. Graphify timed out
 at 20 seconds (124), so graph freshness is not claimed. No test/Graphify worker
 or temporary test-output directory remained.
+
+## Remediation ledger — 2026-09-07, native match lexical scope
+
+Baseline `fc35a31`; fix identity is this ledger's commit. The new regression
+first failed because `let n=99; match 2 { case n if false: n; else: n; }`
+selected the failed arm's `n` rather than the outer value. Codegen kept every
+arm's binding in a shared match scope, unlike the typechecker. Its named
+`__match_scrut` temporary also shadowed legal source references in guards,
+values and closures.
+
+Codegen now opens/closes one lexical scope per arm. Name resolution entries
+are removed before compiling the next arm/default; monotonic physical slots
+are not reclaimed, so existing captured closure values remain valid. The
+subject reserves an internal slot without any source-name entry, eliminating
+that temporary's lexical capture without name scanning or renaming. Subject
+evaluation still precedes storage reservation. Previous pattern/guard failure
+jumps, first-match order and opcode/bytecode formats remain unchanged.
+
+This supersedes the previous native match helper-name and inter-arm binding
+limitations for this lowering path. It does not fix the colon-method-call
+parser ambiguity, other synthesized loop/try temporaries, arbitrary malformed
+AST handling, reflection or every backend. The PBLang owning module was fully
+reviewed in the preceding slice and its live scope/slot/closure consumers were
+rechecked here. No Rust, VM, typechecker or frontend source changes. Existing
+frontend and unrelated dirty work remain excluded. **NOT READY for 1.0.0**
+remains the release assessment, not overturned by this targeted correction.
+
+Validation: fourteen targeted suites passed (`selfhost_match_scope`,
+`selfhost_literal_match_guard`, `selfhost_enum_guard_coverage`,
+`selfhost_type_system_parity`, `selfhost_typeck_parity`,
+`selfhost_typeck_nil_arithmetic`, `guard_preprocessor_results`,
+`guard_preprocessor_activation`, `guard_preprocessor_native_match`,
+`selfhost_optimizer_strength`, `selfhost_closure`, `selfhost_loop_kw`,
+`selfhost_compile_lexical`, `selfhost_vm_bounded`). The new test compares plain
+and safely optimized values for defaults, later literal/wildcard/bind arms,
+outer locals, repeated and Unicode binders, helper-like names, nested/sibling
+matches and selected/fallback/loop closures. Undefined outer names remain
+checked errors. New runtime probes use 4,000 steps/12 frames; the trusted
+harness caps each target at 20 seconds/2 GiB with bounded output.
+
+The expanded new test initially used a parenthesized nested subject, which the
+parser classifies as a call to the contextual identifier `match`. It now uses
+the supported unparenthesized nested form and passed on rerun; thirteen other
+targets passed in the original batch. That syntax limitation is recorded,
+not claimed fixed. This is not a full-suite or physical-device verification.
+
+Final build and portable-lock publication passed; the pre-existing dirty lock
+is excluded. Lint exited zero with one unused-variable warning in the new test.
+Privacy checks on added lines and `git diff --check` passed. The pre-existing
+frontend diff is unchanged. Graphify hit its 20-second timeout (124), so graph
+freshness is not claimed; no test/Graphify process or temporary output remained.
