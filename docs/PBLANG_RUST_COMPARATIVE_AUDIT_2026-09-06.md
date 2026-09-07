@@ -1158,3 +1158,51 @@ frontend diff is unchanged; unrelated work and the dirty lock are excluded from
 this commit. Graphify reached its 20-second deadline (124), so the graph update
 is incomplete. No test/Graphify worker or temporary test-output directory
 remained after the checks.
+
+## Remediation ledger — 2026-09-08, extrema effects and bounded comparisons
+
+Baseline `d4a2c11`; fix identity is this ledger's commit. Full functional/pipe
+modules, discovered extrema callers and relevant tests were reviewed. The new
+singleton regression reproduced two key calls for one element. `max_by` and
+`min_by` now compare from the second element, with one evaluation per element,
+first-tie retention and immediate error propagation. Numeric ordering and
+borrowed references remain explicit in `FUNCTIONAL_EXTREMA.md`; callbacks must
+not structurally mutate input. No new general comparator or purity guarantee.
+
+Ten targeted suites passed: `functional_extrema`, `selfhost_extrema`,
+`functional_combinators`, `multi_paradigm_composition`,
+`functional_curry_contract`, `functional_curry_args`, `selfhost_curry_args`,
+`memoize_identity`, `pipe_stdlib`, `benchmark_enrich`. Tests cover exact effects,
+empty/singleton inputs, stateful selection, ties, exceptions, nonnumeric
+comparison rejection and bound-method/generic composition. The self-hosted
+probe imports the actual library at 15,000 steps, 24 frames, eight modules and
+32-KiB source limits. This is not aggregate-resource or all-backend evidence.
+
+The PBLang-only `bench/session_compare.sapp` reuses the existing competitor
+harness with one bounded row per external process. All twelve local rows passed
+exact checksums; raw measurements and limitations are in
+`BENCHMARK_SESSION_2026-09-08.md` and `bench/results/session-2026-09-08.jsonl`.
+Invalid language/workload selections both reject. No device, VM, GUI or broad
+test suite was launched; no cross-platform or all-application benchmark claim.
+
+Final build and portable-lock publication passed; lint on four touched PBLang
+files exited zero with existing/fixture unused-variable warnings. Graphify
+reached its 20-second deadline (124), so graph freshness is not claimed.
+The initial post-edit test attempts rejected the stale dependency hash; after
+normal build/lock refresh the tests ran. An initial string-order assertion was
+corrected to reflect the runtime's existing numeric-only comparisons, not hidden
+as a supported feature. The implementation did not change comparison semantics.
+
+Remaining work: general call/arity support, class/default/type and block-tail
+semantics, unique/grouping identity, once failure/reentrancy consistency, full
+model composition, compiler/LLVM/JIT findings, import/file resource accounting,
+runtime cleanup/isolation and hard heap/preemption, typed FFI/sandbox,
+publisher/package trust and delivery, reproducible builds, broad compatibility
+and physical platform/device evidence. The overall 1.0.0 decision is NOT READY.
+
+Added-line/new-file privacy and diff checks passed. The pre-existing frontend
+diff is unchanged, and unrelated dirty work/lock changes remain excluded from
+this commit. No test, benchmark or Graphify worker or temporary test/benchmark
+directory remained. `BENCHMARK_COVERAGE_PROGRAM.md` records the expanded
+all-category/language/backend and multi-fragment polyglot target separately from
+today's measured subset; it does not claim that target is implemented.

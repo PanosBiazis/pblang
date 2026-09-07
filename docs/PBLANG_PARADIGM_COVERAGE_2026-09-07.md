@@ -102,3 +102,18 @@ imports the actual functional library and exercises both conventions.
 See `FUNCTIONAL_CURRY.md` for limits and migration. General positional
 apply/spread, callback signature inference and full composition remain open;
 this is not a claim that arbitrary-arity positional functions now work.
+
+## Extrema callback evaluation — 2026-09-08
+
+Baseline `d4a2c11`. The new singleton regression reproduced duplicate first-key
+evaluation. `max_by` and `min_by` now start comparison at the second element,
+retaining the first computed key. Exact callback-order/count tests include
+stateful selection, exception effects and bound-method/generic composition.
+The actual functional library also passed a bounded PBLang frontend import/run
+probe. See `FUNCTIONAL_EXTREMA.md`; numeric comparison, first-tie and borrowed
+result semantics are explicit. General callable/paradigm coverage remains open.
+
+Inspection also found different existing exception behavior in `functional.once`
+(marks called before callback) and `pipe.once` (marks after success). Their
+failure/reentrancy contract needs a separate compatibility decision and tests;
+neither implementation was changed or qualified by this extrema slice.

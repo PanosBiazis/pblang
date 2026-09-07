@@ -450,3 +450,19 @@ composition and actual library import through the PBLang frontend/VM.
 No Rust or compiler/VM edits. This does not implement general positional
 spread or close the retained checker's arity finding. The contract and remaining
 limits are in `FUNCTIONAL_CURRY.md`; overall 1.0.0 readiness stays NOT READY.
+
+## Remediation update — 2026-09-08, extrema callback effects
+
+Baseline `d4a2c11`. `max_by`/`min_by` evaluated the initial key twice. The new
+singleton regression failed before the fix; selection now starts at index one
+after initializing the first key. Focused tests verify order/count, stateful
+selection, ties, borrowed references, errors and object/generic composition.
+An actual-library import probe also passed on the bounded PBLang frontend/VM.
+See `FUNCTIONAL_EXTREMA.md`. No Rust, compiler or VM source changes.
+
+`BENCHMARK_SESSION_2026-09-08.md` adds twelve local competitor measurements
+using the existing unchanged startup/integer fixtures: interpreter, PBLang
+C99/direct-x64, C, Python and Node. It keeps raw samples, build/run/resource
+separation and platform/measurement limits. These are not a before/after
+measurement of this library fix or readiness evidence for untested devices.
+The once failure/reentrancy discrepancy is recorded for follow-up, not repaired.
