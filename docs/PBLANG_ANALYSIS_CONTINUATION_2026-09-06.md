@@ -378,3 +378,19 @@ helper-like outer names and closures are checked in plain and safely optimized
 bounded execution. This closes the two native match limitations recorded in
 the previous update; the parser's colon ambiguity, other compiler temporaries
 and broader release blockers are not claimed fixed. No Rust or VM changes.
+
+## Remediation update — 2026-09-07, array for-in lexical scope
+
+Baseline `5470c0c`. A new regression failed when an iteration binder replaced
+the enclosing name after the loop. PBLang codegen now gives `for name in
+iterable` its own scope and stores collection/index state in unnamed slots.
+The iterable is evaluated before introducing the binder; helper-like user
+names remain ordinary lexical references. Fourteen targeted suites passed,
+including plain/optimized checks for empty/nested/sibling loops, closures,
+Unicode binders, early return, break/continue and single iterable evaluation.
+
+No Rust, frontend, VM or opcode changes. Count/range-loop scope and bound
+semantics remain separate follow-ups. The comparative audit now ends with a
+reconciled remaining-work table: earlier fixed defects are not counted as
+open, partial fixes retain their remaining scope, and release evidence is
+separate from source implementation. Overall status remains NOT READY.
