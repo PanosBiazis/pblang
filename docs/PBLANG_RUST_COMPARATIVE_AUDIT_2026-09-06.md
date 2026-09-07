@@ -633,3 +633,35 @@ Final build and portable-lock publication passed; the pre-existing dirty lock
 is excluded. Touched-file lint exited 0 with style/unused warnings, not a clean
 warning count. Graphify reached the 20-second deadline (exit 124); no graph
 freshness claim. No full suite or native/device artifact execution.
+
+## Remediation ledger — 2026-09-07, legacy guard string preservation
+
+Baseline `f4dc392`; fix identity is this ledger's commit. The escaped-string
+rewriter defect recorded above is repaired in PBLang only. The new regression
+failed before the change on a quoted semicolon and passed after correction.
+Shared exclusive-end scanning preserves escape parity and exact source slices
+in scrutinees, guards, arms/defaults and keyword/brace searches. Identifier
+replacement skips strings and treats an empty old name as a no-op. Malformed
+spans fail without advancing beyond a fabricated terminator.
+
+The tests compare bounded-VM values, not merely successful parsing. Only fixed
+synthetic chunks are explicitly executed despite existing type-only legacy
+diagnostics. A5 raw-input rejection remains covered; its previously corrupted
+escaped-string control now expects correct parsing. No frontend source or Rust
+source was changed. Unrelated user changes remain excluded.
+
+Open legacy limitations: nil-versus-value type checking, coarse source-wide
+activation (which can rewrite unrelated native matches), incomplete comments
+and nesting, generated-name collisions and ASCII-only keyword/identifier
+boundaries. No global compatibility/performance claim. **NOT READY for 1.0.0**.
+
+Validation: nine focused suites passed (`guard_preprocessor_strings`,
+`guard_preprocessor_native_match`, `selfhost_compile_lexical`,
+`selfhost_project_lexical`, `selfhost_tokenizer_unterminated`,
+`selfhost_parse_safe`, `selfhost_vm_bounded`, `execution_pipeline`,
+`execution_pipeline_byte_limits`). Each uses the targeted 20-second, 2-GiB,
+capped-output harness; value probes additionally use 2,000 VM steps/eight
+frames. Final project build and portable-lock publication passed. Lint exited
+0 with existing style/unused warnings. The dirty lockfile is excluded.
+Graphify hit its 20-second deadline (124); freshness is not claimed. No broad
+suite, device execution, temporary fixture writes or retained-host rebuild.

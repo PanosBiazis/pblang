@@ -301,9 +301,22 @@ Type-only diagnostics intentionally retain inspectable bytecode with
 `ok=false`. Numeric legacy guard arms still encounter the existing rewrite's
 `_guard_val` nil-versus-number type mismatch. Native colon-syntax match is
 unchanged; general legacy guard semantics are not newly certified.
-An escaped quote followed by a semicolon in a legacy arm can still be rewritten
-into an unterminated string. Compile and lint now reject that transformed text;
-repairing the legacy rewriter itself is a separate compatibility task.
+The escaped-quote/semicolon corruption is repaired in the legacy string walkers.
+One exclusive-end scanner preserves quoted source slices in scrutinees, guards,
+arms, defaults and keyword/brace searches; identifier substitution does not
+rewrite quoted literals. Unterminated spans abort the affected transformation.
+The A5 raw/processed lexical gates remain mandatory and unchanged.
+
+The legacy rewriter is still partial. Its source-wide `has_guards` trigger can
+rewrite an unrelated native match when any legacy separator occurs elsewhere,
+even inside a string/comment. Comment handling, nested expressions, generated
+name collisions and Unicode/keyword boundaries remain incomplete. Do not infer
+general mixed-native/legacy compatibility from the focused string repair.
+
+`guard_preprocessor_strings` compares fixed synthetic values in the bounded VM,
+including escapes, separator-like text and literal identifier preservation.
+It deliberately inspects bytecode despite the documented type-only legacy
+diagnostics; this testing path is not a production execution recommendation.
 
 Focused tests: `selfhost_compile_lexical`, `selfhost_project_lexical`.
 Their static malformed fixtures are input text, not runnable/lint-clean
