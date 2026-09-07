@@ -321,6 +321,21 @@ The parser also treats `match (` as a call to the contextual identifier `match`;
 the nested-subject regression uses the supported unparenthesized `match match`
 form. Parenthesized scrutinee disambiguation is not repaired here.
 
+Array-style `for name in iterable` lowering now opens a dedicated lexical
+scope. The iterable is evaluated once before the loop binder is introduced,
+so `for x in x` reads the enclosing `x`. Collection/index storage uses unnamed
+internal slots; legal user names `__forin_arr` and `__forin_idx` are not
+captured. After empty, ordinary or interrupted iteration, subsequent code
+resolves the enclosing name. Nested/sibling loops and by-value closures retain
+their own bindings. The continue target remains the increment and break still
+targets the loop end. `selfhost_forin_scope` checks plain and safely optimized
+bounded results, including Unicode binders and early return.
+
+This corrects lexical behavior without changing bytecode or VM instructions.
+It does not repair count/range-loop scopes, their bound-evaluation rules, or
+other generated temporaries. The regression uses arrays, not a claim of
+support for every iterable kind or backend.
+
 The PBLang typechecker diagnoses proven scalar nil arithmetic with code
 `nil-arithmetic`: binary `+`, `-`, `*`, `/`, `%` between a known nil and a
 numeric type (or another nil), and unary `-nil`. It returns `any` for the

@@ -901,3 +901,74 @@ is excluded. Lint exited zero with one unused-variable warning in the new test.
 Privacy checks on added lines and `git diff --check` passed. The pre-existing
 frontend diff is unchanged. Graphify hit its 20-second timeout (124), so graph
 freshness is not claimed; no test/Graphify process or temporary output remained.
+
+## Remediation ledger — 2026-09-07, array for-in lexical scope
+
+Baseline `5470c0c`; fix identity is this ledger's commit. The new
+`selfhost_forin_scope` regression first failed on restoration of an enclosing
+name after iteration. `codegen_for_in` now opens/closes a lexical scope and
+allocates collection/index slots without source-name entries. The iterable
+runs once before the binder is introduced, including `for x in x` and legal
+helper-like names. Slots remain monotonic, preserving by-value captures.
+Break/continue targets and instruction/bytecode formats are unchanged.
+
+Fourteen targeted suites passed: `selfhost_forin_scope`, `selfhost_match_scope`,
+`selfhost_literal_match_guard`, `selfhost_enum_guard_coverage`,
+`selfhost_type_system_parity`, `selfhost_typeck_parity`,
+`selfhost_typeck_nil_arithmetic`, `guard_preprocessor_results`,
+`guard_preprocessor_activation`, `guard_preprocessor_native_match`,
+`selfhost_optimizer_strength`, `selfhost_closure`, `selfhost_loop_kw`,
+`selfhost_vm_bounded`. The new test compares plain and safely optimized
+results for empty/nested/sibling loops, shadowed locals, iterable-before-binder
+lookup, synthetic-name collisions, Unicode, closures, single evaluation,
+break/continue and early return. An undefined outer binder still rejects.
+New probes use 5,000 steps/12 frames and the trusted harness's per-target
+20-second/2-GiB/capped-output limits. No full-suite or hardware run.
+
+Only PBLang codegen, its new regression and documentation changed in this
+slice. Count/range-loop scopes and bound evaluation, other synthetic
+temporaries and existing parser ambiguities are not repaired. No Rust, VM or
+frontend edits; unrelated dirty work remains outside the change.
+
+Final build and portable-lock publication passed. Lint exited zero; the new
+test has an unused-variable warning for `missing` despite the following
+member access. Added-line privacy checks and `git diff --check` passed. The
+pre-existing frontend diff is unchanged and the dirty lock remains excluded.
+Graphify reached its 20-second deadline (124), so freshness is not claimed.
+No test/Graphify worker or temporary test-output directory remained.
+
+## Reconciled remaining work toward 1.0.0 — 2026-09-07
+
+This snapshot reconciles the dated remediation ledgers above with the
+original findings and A1–A7 continuation; it is not a fresh exhaustive audit
+of all files or platforms. Later scoped fixes supersede older descriptions
+only where explicitly stated. **NOT READY for 1.0.0** remains the decision;
+no R1–R9 gate is promoted to PASS by this slice, and no completion percentage
+is justified by the current coverage.
+
+Already repaired with focused evidence: C1 optimizer behavior, C3's legacy
+borrow-release lifecycle, A4's identified frame/parameter admission defects,
+A5 lexical admission, A6/A6-L UTF-8 accounting, and the dated legacy/native
+match and array for-in corrections. C2's optional-assignment and concrete nil
+arithmetic repairs are complete within their described scope, not all of C2.
+A3 guest-exception cleanup and P4 JSON serialization are partial repairs.
+P1/P2 source/library fixes are not an updated, qualified deployed host.
+
+| Area / finding | Remaining implementation or evidence | Status |
+| --- | --- | --- |
+| C2, C4, C5; compiler follow-ups | Retained checker call arity/index-expression checks; LLVM unsupported-subset rejection, continue/increment and scoped locals; JIT observable print parity. Separately resolve count/range-loop scopes and bound semantics, parser ambiguities, and review remaining synthetic temporaries. | Open; no general compiler/backend parity claim |
+| A7 diagnostics | Visibility-aware name suggestions across analysis/lint surfaces; exclude function-local candidates outside their scope. Existing unrelated frontend edits are not certified by this slice. | Open |
+| A1, A2 imports and file entrypoints | Syntax-aware import discovery, aggregate import/child budgets including cache paths, and descriptor-held bounded reads before whole-file allocation with file-kind/identity policy. | Open |
+| A3 cleanup; S1, S2 ownership/concurrency | Unwind on direct engine/resource faults; gate timer/spawn paths before allocation; VM-owned handle authority and cross-VM lifecycle tests. Existing guest-exception and legacy borrow fixes must be retained. | Partial overall; these listed paths remain open |
+| S3–S6 and safety boundaries | Exact host-enforced typed FFI and bounded returns; hard aggregate heap/work/wall limits; same-object library loading; serialized or owner-enforced C embedding. Preserve PBLang safety abstractions while supplying private authoritative state/opaque capabilities where hostile callers are supported. Check integer bounds, array freezing and channel atomicity follow-ups; establish the claimed hostile-code isolation boundary. | Open; memory safety is not equivalent to resource enforcement or an OS sandbox |
+| P1, P2 deployment | Rebuild the retained executable with the verified library repairs and qualify CLI install/publish/verify behavior on disposable fixtures and declared targets. | Source/library fixed; deployment evidence pending |
+| P3–P7; publisher/operator trust | Secure bounded trust-store loading, remaining manifest/name/version admission, immutable hash-to-import handoff, bounded clone/hash traversal, archive-identity verification on rehydration. Complete pinned operator trust, revocation freshness/rollback and authenticated publication/handoff. P4's JSON sink repair does not close filename admission. | Open or partial as noted; publisher authenticity not established |
+| R1, R2, R6 scope and compatibility | Freeze stable/preview syntax, bytecode, API and target contracts; complete the remaining owning-module/caller ledger. Review assertion quality, distinguish errors/skips/timeouts, isolate fixtures and cleanup, add missing negative/resource tests. Run the historical/product corpus and broader repeat/soak tests once a stable identified candidate exists. | Evidence and implementation work remain; focused passes are not a whole-corpus result |
+| R7 platforms/devices | Build/install/run/interact/shutdown/upgrade the actual candidate or independent adapter for each advertised target. Obtain required physical-platform evidence; an iOS simulator boot or host test is not iOS application execution. Mark unavailable targets explicitly. | Not established; no universal device support claim |
+| R8, R9 release qualification | Reproducible baseline/candidate measurements (warmups, samples, median/tails, peak memory and applicable energy), clean candidate/artifact identity, independent bootstrap and build reproducibility, fresh dependency review, relative lockfiles, matching documentation and release approval. | Not established |
+
+The next bounded PBLang correctness slice can address count/range loops;
+security-boundary repairs require the mandated defensive review first.
+Unavailable hardware and release-wide evidence cannot be replaced by
+documentation or model/emulator results. Graph freshness is a separate tooling
+limitation, not proof for or against language semantics.
