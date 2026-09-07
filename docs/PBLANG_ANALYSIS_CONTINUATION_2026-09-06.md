@@ -282,3 +282,26 @@ Still open: nil-initialized guard-result typing, source-wide rewrite activation
 (including accidental native-match rewrites), comments/nesting, generated-name
 hygiene and ASCII-only identifier/keyword boundaries. No universal legacy
 syntax support, resource guarantee or 1.0.0 readiness follows from this repair.
+
+## Remediation update — 2026-09-07, per-match legacy admission
+
+Baseline `0738f0a`. The new activation regression first failed because a string
+containing ` ~ ` changed a native match. Source-wide candidate detection is now
+only a fast path: each transform admits every guarded ASCII identifier arm and
+its own top-level tilde/hash separator before emitting code. Native colon and
+literal patterns, partial arms, comments/unsupported nesting and misleading
+keywords leave the outer match unchanged. Parenthesis/bracket grouping is
+balanced and limited to 64 levels. The canonical tokenizer rejects keyword
+bind names; it was already part of the module cache's dependency list.
+
+Comment-aware discovery and whole-word checks preserve unrelated native forms.
+Bind substitution also stops splitting adjacent Unicode/combining-mark names.
+Tests verify exact preservation and bounded-VM branch values with native/legacy
+siblings in either order, as well as malformed and boundary inputs. This is a
+correction to a partial legacy adapter, not new universal syntax support.
+
+Compatibility: formerly permissive colon catchalls, missing semicolons, nested
+brace expressions and comments inside legacy expressions are no longer lowered.
+They remain available to the checked frontend, which may reject them. Numeric
+result typing, generated-name hygiene, full nested lowering and hard resource
+enforcement remain open. The frontend and Rust implementations are unchanged.
