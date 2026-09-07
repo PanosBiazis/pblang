@@ -1253,3 +1253,48 @@ warnings. Both invalid benchmark selections reject. Added-line/new-file privacy
 and diff checks passed. No test/benchmark/Graphify worker or owned temporary
 directory remained. Graphify stopped at its 20-second deadline (124); graph
 freshness is not claimed. Unrelated dirty source and lock changes stay excluded.
+
+## Remediation ledger — 2026-09-08, PBLang VM small calls
+
+Baseline `ee97db2`; this commit changes only the PBLang-written VM call path,
+not the retained Rust interpreter or opcode format. The owning VM module and
+callers/tests/contracts were reviewed before edits. Security delegation identified
+malformed raw OP_CALL count handling and ambiguous builtin/closure descriptors.
+Count/stack admission now precedes indexing, popping and argument allocation;
+the existing sticky bounded limit remains. Builtin tags take precedence, including
+the formerly inconsistent two-argument import case.
+
+Pure closures with arities 0–3 use fixed-shape arrays, preserving argument order,
+arity validation, lexical globals, cache propagation and shared runtime/depth.
+Nine focused suites passed on the final source. Exact measured bounded step
+counts match baseline across all six workloads; serialized/optimized paths and
+exact budget boundaries are tested. No full suite ran. `VM_SMALL_CALLS.md` lists
+coverage and remaining descriptor-boundary gaps. Final security review found
+no blocker in this diff; mutable descriptors are not an unforgeable capability.
+
+The final lint has warnings but no new type errors. An initial nil-initialized
+argument array caused type diagnostics; an if-expression alternative also failed
+lint and was discarded. The retained array-initialized branch passed. Build and
+portable-lock publication passed; build initially noted a stale dependency hash
+before lock refresh. This is not reproducible-bootstrap qualification.
+
+All four self-host VM measurement batches and a separate nine-language/backend
+integer-kernel batch are retained in `BENCHMARK_SESSION_2026-09-08_VM_CALLS.md`.
+Timings are mixed and controls drift: no general speedup is demonstrated. The
+retained-host PBLang interpreter still trails Python/Node on the measured kernel.
+This does not test all languages/categories/platforms or embedded polyglot.
+
+Remaining: general arity/class/default/block semantics and paradigm composition;
+compiler/LLVM/JIT; import/file limits; descriptor validation, runtime cleanup and
+isolation, hard heap/preemption, typed FFI/raw bypass closure and hostile-code
+sandbox; package trust/artifact delivery/revocation/rollback; reproducibility,
+broad product compatibility and physical-platform verification. PBLang 1.0.0
+remains NOT READY. Benchmark leadership remains a target, not an established fact.
+
+Final validation also passed portable_lock_current, manifest_validate and
+benchmark_enrich (twelve targeted suites total), a fresh build without the stale
+hash note, relative-lock publication, lint with recorded warnings, and diff/privacy
+checks. The pre-existing frontend diff is unchanged. Graphify timed out cleanly
+at 20 seconds (124), so graph freshness is not claimed. No owned test/benchmark/
+Graphify worker or benchmark temporary directory remained. Unrelated dirty work
+and local lock changes are excluded from the commit.

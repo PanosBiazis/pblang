@@ -482,3 +482,21 @@ The nine-row numeric competitor batch adds C++, Go and Rust using existing
 fixtures. It does not exercise embedded polyglot, every application category or
 other devices. See `BENCHMARK_SESSION_2026-09-08_SUPER_OWNER.md`. No Rust
 product/compiler source changes; overall 1.0.0 readiness remains NOT READY.
+
+## Remediation update — 2026-09-08, VM call admission and small arities
+
+Baseline `ee97db2`. The PBLang VM now validates raw OP_CALL counts and stack
+availability before consuming operands and keeps builtin precedence for dual-tag
+descriptors. Pure closures with 0–3 arguments use a fixed-shape dispatch path.
+Nine focused suites pass, including lexical globals/caches, captures, defaults,
+serialization and sticky resource boundaries. The security review found no
+blocking regression, without extending the mutable-descriptor trust boundary.
+See `VM_SMALL_CALLS.md` and the comparative audit's newest remediation ledger.
+
+The dedicated PBLang-written VM benchmark now records bounded/unbounded call
+arity workloads and unchanged instruction counts. Measurements remain mixed;
+no general speedup is claimed. The separate retained-host interpreter still
+trails Python/Node on the existing integer kernel. Full raw evidence is in
+`BENCHMARK_SESSION_2026-09-08_VM_CALLS.md`. No Rust source change, full suite,
+universal-language benchmark or new physical-device qualification. Overall
+1.0.0 readiness remains NOT READY.
