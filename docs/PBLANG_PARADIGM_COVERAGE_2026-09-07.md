@@ -20,7 +20,7 @@ inventory with explicitly partial inspection, not whole-module certification.
 | --- | --- | --- |
 | Imperative / procedural / structured | Functions, mutable bindings, branches and loops in `compiler/parser.sapp`, `codegen.sapp`, `vm.sapp` | Focused count/range/for-in, scope, try and closure tests pass on plain/optimized PBLang VM paths; not every control-transfer/backend path. |
 | Functional | `functional.sapp`: map/filter/folds, compose/pipe, partial/curry, memoization, declarative combinators | Selected combinator and composition tests pass. These are eager array operations, not proof of universal lazy evaluation or enforced purity. Positional curry now rejects arities outside 0–4; `curry_args` adds explicit vector-callback collection for 0–256 values, not general positional spread. Memoization identity is repaired below; stringified unique/grouping semantics still need separate tests. |
-| Object-oriented | `class.sapp`: single inheritance, overrides, super helpers, mixins, statics, bound methods and operator bridges | `oop_complete` and mixed-library tests pass. `call`/`call1..4` and `bind0..2` are finite adapters, not arbitrary arity. Single-parent extension is not multiple inheritance; mixins merge methods with later values winning. Inherited super-calls through deeper subclasses still need dedicated resolution tests. |
+| Object-oriented | `class.sapp`: single inheritance, overrides, super helpers, mixins, statics, bound methods and operator bridges | `oop_complete` and mixed-library tests pass. `call`/`call1..4` and `bind0..2` are finite adapters, not arbitrary arity. Single-parent extension is not multiple inheritance; mixins merge methods with later values winning. Explicit-owner super calls now have four-level inheritance tests; legacy omitted-owner dispatch still needs migration for inheritable overrides. |
 | Class syntax | `compiler/parser.sapp::parse_class` builds a class table and constructor | Separate from the class library API. Selected source review shows method type/default syntax is parsed but discarded by this lowering; comment documents no `__call`/new0..new3 parity. Full constructor/method/default/type equivalence remains open. |
 | Generic / parametric / structural | `generics.sapp`: composable type predicates, typed lists/maps/boxes/options, interface-predicate bridge | `generics` and composition tests pass for runtime checks, negative mapper results and preserved input. This library is runtime-parametric, not evidence of static higher-kinded/dependent-type support or all native generic syntax. |
 | Ad-hoc polymorphism / typeclasses | `typeclass.sapp` runtime registration and predicate-selected instances | Entry points inventoried; whole-module laws, overlap/coherence and combinations not revalidated here. |
@@ -117,3 +117,17 @@ Inspection also found different existing exception behavior in `functional.once`
 (marks called before callback) and `pipe.once` (marks after success). Their
 failure/reentrancy contract needs a separate compatibility decision and tests;
 neither implementation was changed or qualified by this extrema slice.
+
+## Explicit super owner — 2026-09-08
+
+Baseline `bcf223e`. `super_method`, `super_call`, `super1` and `super2` accept an
+optional final owner class. Selection begins at that owner's parent and passes
+the unchanged dynamic instance. Four-level inheritance, raw/bound methods,
+functional composition, mixins, parent redispatch, errors and existing nil/
+omitted-owner behavior pass focused tests. A separate probe imports the actual
+class library through the PBLang frontend/VM.
+
+See `CLASS_SUPER_OWNER.md`: predeclare a class binding before referencing it
+inside its initializer's methods. This explicit selector does not infer lexical
+ownership, prove ancestry or fix old omitted-owner calls automatically. Native
+class syntax/defaults/types and broader paradigm composition remain open.

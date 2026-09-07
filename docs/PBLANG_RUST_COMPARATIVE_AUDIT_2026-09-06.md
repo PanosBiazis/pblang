@@ -1206,3 +1206,50 @@ this commit. No test, benchmark or Graphify worker or temporary test/benchmark
 directory remained. `BENCHMARK_COVERAGE_PROGRAM.md` records the expanded
 all-category/language/backend and multi-fragment polyglot target separately from
 today's measured subset; it does not claim that target is implemented.
+
+## Remediation ledger — 2026-09-08, explicit class super owner
+
+Baseline `bcf223e`; fix identity is this ledger's commit. The full owning class
+module, discovered super callers and relevant tests were reviewed. Legacy
+super selects the parent of the dynamic class, so an inherited override can
+resolve itself again. The additive final owner argument selects the declaring
+class's parent instead, without mutating the instance or global dispatch state.
+Omitted/nil-owner behavior is preserved; this does not automatically repair old
+inheritable overrides. Class definitions remain mutable maps, and explicit
+ownership is not verified as an ancestor/nominal-identity guarantee.
+
+The pre-change new-API regression failed with arity mismatch. An initial actual
+frontend import test rejected the self-referential class initializer; explicitly
+predeclaring the owner binding resolved the fixture, not that compiler
+restriction. `CLASS_SUPER_OWNER.md` documents this portable idiom and migration.
+No Rust, compiler or VM source change. The pre-existing frontend diff is unchanged.
+
+Ten targeted suites passed: `class_super_owner`, `selfhost_super_owner`,
+`class_stdlib`, `oop_complete`, `multi_paradigm_composition`,
+`functional_extrema`, `functional_curry_args`, `generics`, `operator_overload`,
+`benchmark_enrich`. Coverage includes four-level dispatch/order, raw and bound
+methods, zero/one/two argument forwarding, mixins, parent redispatch, failures
+and preserved dynamic identity. The actual class-library frontend/VM import
+uses 20,000 steps, 32 frames, eight modules and 32-KiB source limits; this is not
+all-backend or aggregate runtime-resource qualification.
+
+Nine sequential local integer-kernel benchmark rows passed exact checksums:
+three PBLang execution paths plus C, C++, Go, Rust, Python and Node. Existing
+foreign fixtures and algorithms were unchanged. Build/run/RSS/artifact metrics,
+raw samples, noise, flags and cache limitations are recorded in
+`BENCHMARK_SESSION_2026-09-08_SUPER_OWNER.md`. This is neither an OOP performance
+benchmark nor evidence of embedded polyglot or physical-platform support.
+
+Remaining: automatic lexical super and old-call migration, class/default/type
+semantics, general arity, block semantics, unique/grouping and once contracts,
+full paradigm composition; retained compiler/LLVM/JIT, import/file limits,
+runtime cleanup/isolation and hard heap/preemption, typed FFI/sandbox,
+package/publisher authenticity and delivery, reproducibility, broad compatibility
+and actual platform/device verification. The 1.0.0 assessment stays NOT READY.
+
+Final build/portable-lock publication and lint on four touched PBLang files
+passed; lint retains existing style/shadowing and fixture unused-variable
+warnings. Both invalid benchmark selections reject. Added-line/new-file privacy
+and diff checks passed. No test/benchmark/Graphify worker or owned temporary
+directory remained. Graphify stopped at its 20-second deadline (124); graph
+freshness is not claimed. Unrelated dirty source and lock changes stay excluded.

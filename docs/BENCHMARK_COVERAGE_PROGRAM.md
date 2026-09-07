@@ -10,8 +10,9 @@ or every possible combination has been implemented or measured.
 
 The existing `repro_benchmark` registry has twelve language/toolchain entries
 and twenty-two category records, many explicitly partial or not comparable.
-The first session driver deliberately selects six entries and two workloads.
-Its whitelist is a bounded session selection, not the final coverage scope.
+The initial session driver selected six entries and two workloads; the current
+driver additionally admits C++, Go and Rust from the existing fixture registry.
+Its nine-entry whitelist is a bounded session selection, not the final scope.
 See `BENCHMARK_SESSION_2026-09-08.md` for actual evidence. All other combinations
 below are pending unless a linked report records execution and exact results.
 
@@ -87,3 +88,7 @@ The current data is local startup/integer microbenchmark evidence only. Native
 and C99 GUI/mobile applications, actual mixed-language execution matrices,
 historical/future language toolchains and the full platform/category program
 remain incomplete. Benchmark success does not itself establish 1.0.0 readiness.
+
+The second local batch is in `BENCHMARK_SESSION_2026-09-08_SUPER_OWNER.md`:
+nine numeric-workload rows, including standalone C++, Go and Rust. These do
+not establish embedded multi-language/polyglot execution or OOP performance.
