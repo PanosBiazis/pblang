@@ -410,3 +410,19 @@ follow-up for the reviewed scalar lowering, not every numeric edge case,
 backend or resource guarantee. Existing repeated-bound or binder-driven-loop
 code should express that behavior with `while`. No Rust, VM, parser,
 typechecker or frontend source changes. Overall release status stays NOT READY.
+
+## Remediation update — 2026-09-07, try subchunk context
+
+Baseline `b9a1b68`. New tests reproduced overwriting of a function parameter
+by try-body local storage and loss of an outer capture used only in try.
+Codegen now carries the enclosing slot allocator, lexical parent and shared
+upvalue descriptor list into both subchunks. Each branch keeps an independent
+local-name table while newly allocated slots advance the enclosing allocator.
+Nested tries and closures therefore preserve their frame context.
+
+Plain, optimized and in-memory bytecode round-trip probes pass. No Rust,
+VM or frontend changes. General control transfer across try subchunks and
+the report's resource/cleanup/isolation blockers remain open. The companion
+`PBLANG_PARADIGM_COVERAGE_2026-09-07.md` starts the requested programming-model
+composition audit; it explicitly distinguishes tested library combinations
+from full language/backend coverage. NOT READY for 1.0.0 remains unchanged.
