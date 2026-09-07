@@ -1,0 +1,122 @@
+// Guest exception cleanup is LIFO; engine/budget faults remain fatal.
+let VM = import("stdlib:host_pbck_vm.sapp");
+fn demand(ok, message) { if not ok { throw "FAIL pbck-unwind: " + message; } }
+fn ins(op, operand = 0) { return map{op: op, operand: operand}; }
+fn closure(index) { return map{op: 27, fn_const: index, captures: []}; }
+fn chunk(code, constants) { return map{instructions: code, constants: constants, source_name: nil}; }
+fn program(code, constants) { return map{format: "host-pbck-v1", version: 1, chunk: chunk(code, constants)}; }
+fn guest(code, constants) {
+    return map{__pbck_function: true, name: "fixture", arity: 0, min_arity: 0,
+        defaults: [], is_vararg: false, parameter_types_present: false,
+        parameter_types: [], chunk: chunk(code, constants)};
+}
+fn recorder(label) {
+    return guest([ins(14, 0), ins(0, 1), ins(31, 1), ins(33)], ["record", label]);
+}
+fn options(log, steps = 1000) {
+    return map{max_steps: steps, adapters: map{
+        record: fn(args) { array_push(log, args[0]); return nil; }
+    }};
+}
+fn logged(actual, expected) {
+    demand(len(actual) == len(expected), "cleanup count");
+    let i = 0;
+    while i < len(expected) {
+        demand(type(actual[i]) == type(expected[i]) and actual[i] == expected[i], "cleanup order/value");
+        i = i + 1;
+    }
+}
+let first = recorder("first");
+let last = recorder("last");
+
+// The root has no guest handler: cleanup must happen before the host observes failure.
+let root_log = [];
+let root_failed = try {
+    VM.run_decoded(program([closure(0), ins(34), closure(1), ins(34), ins(0, 2), ins(47)],
+        [first, last, "root-error"]), options(root_log));
+    false
+} catch true;
+demand(root_failed, "uncaught throw must still fail");
+logged(root_log, ["last", "first"]);
+
+// A cleanup that throws must itself unwind; its error cannot replace the body error.
+let bad = guest([closure(0), ins(34), ins(0, 1), ins(47)], [recorder("inner"), "cleanup-error"]);
+let child = guest([closure(0), ins(34), closure(1), ins(34), closure(2), ins(34), ins(0, 3), ins(47)],
+    [first, bad, last, "body-error"]);
+fn caught(child_fn, call_op, log) {
+    return VM.run_decoded(program([ins(23, 6), closure(0), ins(call_op, 0), ins(24),
+        ins(0, 1), ins(33), ins(33)], [child_fn, "unexpected-success"]), options(log));
+}
+let child_log = [];
+let caught_child = caught(child, 31, child_log);
+demand(caught_child.value == "body-error", "original exception must survive cleanup");
+logged(child_log, ["last", "inner", "first"]);
+
+// Failed result unwrap follows the same unwind route, then the parent returns.
+let unwrap_child = guest([closure(0), ins(34), ins(0, 1), ins(44), ins(33)],
+    [first, map{ok: false, error: "unwrap-error"}]);
+let unwrap_log = [];
+demand(caught(unwrap_child, 31, unwrap_log).value == "unwrap-error", "unwrap error identity");
+logged(unwrap_log, ["first"]);
+
+// A same-frame handler must run before frame cleanup, not trigger premature defers.
+let handler_log = [];
+let local_catch = VM.run_decoded(program([closure(0), ins(34), ins(23, 6), ins(0, 1), ins(47),
+    ins(24), ins(11), ins(14, 2), ins(0, 3), ins(31, 1), ins(11), ins(0, 4), ins(33)],
+    [first, "caught", "record", "handler", 42]), options(handler_log));
+demand(local_catch.value == 42, "same-frame return value");
+logged(handler_log, ["handler", "first"]);
+
+// Guest cleanup failures must also preserve a normal return and run older defers.
+let return_log = [];
+let normal = VM.run_decoded(program([closure(0), ins(34), closure(1), ins(34), ins(0, 2), ins(33)],
+    [first, bad, 7]), options(return_log));
+demand(normal.value == 7, "normal return replaced by cleanup error");
+logged(return_log, ["inner", "first"]);
+
+// Engine faults are not guest throws and cannot be suppressed by cleanup policy.
+let invalid_log = [];
+let invalid_failed = try {
+    VM.run_decoded(program([closure(0), ins(34), ins(0, 1), ins(34), ins(0, 2), ins(33)],
+        [first, 42, 7]), options(invalid_log));
+    false
+} catch true;
+demand(invalid_failed, "non-callable cleanup must remain fatal");
+logged(invalid_log, []);
+
+// All guest cleanup instructions share the original step budget (exact N/N-1).
+let bounded_program = program([closure(0), ins(34), ins(0, 1), ins(33)], [first, 9]);
+let warm_log = [];
+let warm = VM.run_decoded(bounded_program, options(warm_log));
+let exact_log = [];
+let exact = VM.run_decoded(bounded_program, options(exact_log, warm.runtime.steps));
+demand(exact.value == 9 and exact.runtime.steps == warm.runtime.steps, "exact cleanup budget");
+logged(exact_log, ["first"]);
+let short_log = [];
+demand(try { VM.run_decoded(bounded_program, options(short_log, warm.runtime.steps - 1)); false } catch true,
+    "cleanup step exhaustion must remain fatal");
+logged(short_log, ["first"]);
+let no_effect_log = [];
+demand(try { VM.run_decoded(bounded_program, options(no_effect_log, warm.runtime.steps - 2)); false } catch true,
+    "step limit before cleanup adapter");
+logged(no_effect_log, []);
+
+let allocation_log = [];
+let allocation_options = options(allocation_log);
+allocation_options.max_guest_allocation_units = warm.runtime.guest_allocation_units;
+demand(VM.run_decoded(bounded_program, allocation_options).value == 9, "exact cleanup allocation budget");
+logged(allocation_log, ["first"]);
+let exhausted_log = [];
+let exhausted_options = options(exhausted_log);
+exhausted_options.max_guest_allocation_units = warm.runtime.guest_allocation_units - 1;
+demand(try { VM.run_decoded(bounded_program, exhausted_options); false } catch true,
+    "cleanup allocation exhaustion must remain fatal");
+logged(exhausted_log, ["first"]);
+
+// Tail-position calls cannot discard live exception handlers.
+let tail_log = [];
+let caught_tail = caught(child, 32, tail_log);
+demand(caught_tail.value == "body-error" and caught_tail.runtime.tail_calls == 0,
+    "tail call lost active handler");
+logged(tail_log, ["last", "inner", "first"]);
+print "host_pbck_defer_unwind_pass";

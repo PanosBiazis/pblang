@@ -287,9 +287,15 @@ fn _normalized_stack(state, function, args) {
     let argc = len(args);
     if argc < function.min_arity { _fault("too few call arguments"); }
     if not function.is_vararg and argc > function.arity { _fault("too many call arguments"); }
+    let fixed = function.arity;
+    let slots = fixed;
+    if function.is_vararg { slots = slots + 1; }
+    // Defaults and even an empty varargs array occupy local stack cells.
+    // Admit the complete parameter shape before charging or constructing it.
+    if slots > state.limits.max_stack { _fault("parameter slots exceed stack limit"); }
+    if slots > state.limits.max_locals { _fault("parameter slots exceed locals limit"); }
     _charge(state, 1);
     let stack = [];
-    let fixed = function.arity;
     let i = 0;
     while i < fixed {
         let value = nil;
@@ -352,16 +358,21 @@ fn _instruction_at(chunk, index) {
 fn _run_defers(state, defers, depth) {
     while len(defers) > 0 {
         let deferred = array_pop(defers);
-        let result = _call_value(state, deferred, [], depth);
-        if result.kind == "throw" { return result; }
+        // Returned guest throws are ignored by the frozen defer contract.
+        // Do NOT catch direct engine/budget faults: those must stop execution.
+        _call_value(state, deferred, [], depth);
     }
     return _normal(nil);
 }
 
 fn _finish_frame(state, defers, value, depth) {
-    let cleanup = _run_defers(state, defers, depth);
-    if cleanup.kind == "throw" { return cleanup; }
+    _run_defers(state, defers, depth);
     return _normal(value);
+}
+
+fn _unwind_frame(state, defers, raised, depth) {
+    _run_defers(state, defers, depth);
+    return raised;
 }
 
 fn _frame(state, closure, args, depth) {
@@ -520,11 +531,13 @@ fn _frame(state, closure, args, depth) {
             while i < argc { array_push(call_args, nil); i = i + 1; }
             i = argc - 1; while i >= 0 { call_args[i] = _pop(stack); i = i - 1; }
             let callee = _pop(stack);
-            if op == 32 and len(defers) == 0 { return _tail(callee, call_args); }
+            // Trampolining discards this frame: neither its cleanups nor its
+            // exception handlers may still be needed by the called function.
+            if op == 32 and len(defers) == 0 and len(handlers) == 0 { return _tail(callee, call_args); }
             let call_result = _call_value(state, callee, call_args, depth);
             if call_result.kind == "throw" {
                 let routed = _raise_in_frame(state, handlers, stack, call_result.value);
-                if routed.kind == "throw" { return routed; }
+                if routed.kind == "throw" { return _unwind_frame(state, defers, routed, depth); }
                 ip = routed.target;
             } else { _push(state, stack, call_result.value); }
         }
@@ -564,7 +577,7 @@ fn _frame(state, closure, args, depth) {
             } elif not failed { _push(state, stack, wrapped); }
             if failed {
                 let routed = _raise_in_frame(state, handlers, stack, failure);
-                if routed.kind == "throw" { return routed; }
+                if routed.kind == "throw" { return _unwind_frame(state, defers, routed, depth); }
                 ip = routed.target;
             }
         }
@@ -572,7 +585,7 @@ fn _frame(state, closure, args, depth) {
         elif op == 46 { _push(state, stack, _peek(stack)); }
         elif op == 47 {
             let routed = _raise_in_frame(state, handlers, stack, _pop(stack));
-            if routed.kind == "throw" { return routed; }
+            if routed.kind == "throw" { return _unwind_frame(state, defers, routed, depth); }
             ip = routed.target;
         }
         else { _fault("unsupported opcode " + str(op)); }
@@ -581,7 +594,9 @@ fn _frame(state, closure, args, depth) {
 }
 
 fn _invoke(state, initial_closure, initial_args, depth) {
-    if depth > state.limits.max_frames { _fault("frame limit exceeded"); }
+    // max_frames counts live frames, including the root, not zero-based depth.
+    // Tail trampoline iterations reuse this admission until the frame exits.
+    if state.frames >= state.limits.max_frames { _fault("frame limit exceeded"); }
     state.frames = state.frames + 1;
     if state.frames > state.peak_frames { state.peak_frames = state.frames; }
     let closure = initial_closure;
