@@ -949,14 +949,14 @@ is justified by the current coverage.
 Already repaired with focused evidence: C1 optimizer behavior, C3's legacy
 borrow-release lifecycle, A4's identified frame/parameter admission defects,
 A5 lexical admission, A6/A6-L UTF-8 accounting, and the dated legacy/native
-match, array for-in and count/range corrections. C2's optional-assignment and concrete nil
+match, array for-in, count/range and try-context corrections. C2's optional-assignment and concrete nil
 arithmetic repairs are complete within their described scope, not all of C2.
 A3 guest-exception cleanup and P4 JSON serialization are partial repairs.
 P1/P2 source/library fixes are not an updated, qualified deployed host.
 
 | Area / finding | Remaining implementation or evidence | Status |
 | --- | --- | --- |
-| C2, C4, C5; compiler follow-ups | Retained checker call arity/index-expression checks; LLVM unsupported-subset rejection, continue/increment and scoped locals; JIT observable print parity. Resolve parser ambiguities and review remaining synthetic temporaries and numeric edge-case parity. Count/range scope and once-only bound lowering are now repaired as recorded below. | Open; no general compiler/backend parity claim |
+| C2, C4, C5; compiler follow-ups | Retained checker call arity/index-expression checks; LLVM unsupported-subset rejection, continue/increment and scoped locals; JIT observable print parity. Resolve parser ambiguities, block-tail/semicolon divergence, general try control transfer, remaining temporaries and numeric edge cases. Count/range lowering and try slot/capture context are repaired below. Programming-model composition remains partially audited in the companion coverage report. | Open; no general compiler/backend parity claim |
 | A7 diagnostics | Visibility-aware name suggestions across analysis/lint surfaces; exclude function-local candidates outside their scope. Existing unrelated frontend edits are not certified by this slice. | Open |
 | A1, A2 imports and file entrypoints | Syntax-aware import discovery, aggregate import/child budgets including cache paths, and descriptor-held bounded reads before whole-file allocation with file-kind/identity policy. | Open |
 | A3 cleanup; S1, S2 ownership/concurrency | Unwind on direct engine/resource faults; gate timer/spawn paths before allocation; VM-owned handle authority and cross-VM lifecycle tests. Existing guest-exception and legacy borrow fixes must be retained. | Partial overall; these listed paths remain open |
@@ -1020,3 +1020,56 @@ PBLang files exited zero without warnings. Added-line privacy checks and
 The dirty lock remains excluded. Graphify stopped at its 20-second timeout
 (124), so graph freshness is not claimed. No test/Graphify process or owned
 temporary test-output directory remained.
+
+## Remediation ledger — 2026-09-07, try local slots and captures
+
+Baseline `b9a1b68`; fix identity is this ledger's commit. Both new regressions
+failed behaviorally before the source change: a try-body local overwrote an
+enclosing parameter, and a closure's outer variable used only inside try was
+not captured. Subchunks copied local names but started their allocator at zero
+and discarded the lexical parent/upvalue context, despite VM execution sharing
+the enclosing locals and upvalues.
+
+`codegen_try` now propagates the monotonic slot allocator through body,
+handler and subsequent outer code. The branches keep independent local-name
+tables, share enclosing upvalue descriptors and inherit the enclosing lexical
+parent (not a fictitious extra function frame). Captures discovered in either
+branch become part of the enclosing closure constant. Nested tries inherit
+these rules. No Rust, VM, parser, typechecker, optimizer or serializer change.
+The owning codegen module had been read completely in preceding slices; the
+live try/scope/capture/closure consumers, parser/checker and serializer were
+rechecked here. No opaque-handle, FFI or other security authority was changed.
+
+Eighteen distinct targeted suites passed across two bounded batches:
+`selfhost_try_scope`, `selfhost_try_capture`, `selfhost_count_scope`,
+`selfhost_range_scope`, `selfhost_forin_scope`, `selfhost_match_scope`,
+`selfhost_literal_match_guard`, `selfhost_enum_guard_coverage`,
+`selfhost_optimizer_strength`, `selfhost_typeck_parity`, `selfhost_closure`,
+`selfhost_vm_bounded`, `selfhost_loop_kw`, `selfhost_compile_lexical`,
+`multi_paradigm_composition`, `oop_complete`, `functional_combinators`,
+`generics`. New compiler probes compare exact values/effects on plain,
+optimized and in-memory PBCS round-trip paths, bounded at 6,000 steps/16 frames.
+The host harness caps each test at 20 seconds/2 GiB and bounded output.
+No full suite, device run or file-backed serialization fixture was used.
+
+Test development exposed two incorrect fixture assumptions: an unparenthesized
+anonymous function at statement start parses as a named declaration, and the
+checker intentionally tolerates unresolved names inside a caught try body.
+The fixtures now use the supported parenthesized value form and test rejection
+outside that caught body. Neither limitation/rule was silently changed.
+The composition test also exposed retained/self-hosted block-tail semicolon
+divergence; the retained-host positive case now uses an unterminated value tail.
+The companion paradigm report records this open difference, not a repaired one.
+
+These fixes do not certify arbitrary malformed ASTs, named catch binding,
+cross-subchunk control transfer, every backend or universal runtime-fault
+cleanup. The broader resource, FFI, packaging, compatibility and platform
+blockers remain open; release status remains NOT READY for 1.0.0.
+
+Final build and portable-lock publication passed. Lint on the four touched
+PBLang files exited zero, with two unused-variable warnings for the composition
+test's outcome maps despite their following member reads. Added-line privacy
+and diff checks passed; the pre-existing frontend diff remains unchanged and
+the dirty lock is excluded. Graphify reached its 20-second timeout (124);
+no graph freshness is claimed. No test/Graphify process or owned temporary
+output directory remained.

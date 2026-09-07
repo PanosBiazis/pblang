@@ -358,6 +358,23 @@ optimized bounded execution for the repaired behavior, including closures,
 Unicode, empty/negative bounds, ordered effects and exception propagation.
 Undefined bounds/binders and malformed loops remain checked errors.
 
+Try-expression subchunks share the enclosing function's runtime locals and
+upvalues. Codegen now starts each subchunk at the enclosing next unused slot
+and advances that allocator after both the body and handler. Their source-name
+tables remain separate copies: failed-body declarations cannot leak into the
+handler. The enclosing lexical parent and shared upvalue descriptors are
+retained, including captures first discovered inside either branch and nested
+closures. Globals/constants still belong to each emitted chunk.
+
+`selfhost_try_scope` and `selfhost_try_capture` compare plain, safely optimized
+and in-memory serialized/reloaded execution. This repairs parameter/local
+overwrites and lost captures without changing VM instructions or the container
+format. It does not establish general statement-style catch binding,
+cross-subchunk return/break/continue, universal fault cleanup or backend parity.
+The checker intentionally permits some unresolved references inside a caught
+try body; this fix does not change that rule. In statement-leading position,
+anonymous function values in a block need parentheses under the current parser.
+
 The PBLang typechecker diagnoses proven scalar nil arithmetic with code
 `nil-arithmetic`: binary `+`, `-`, `*`, `/`, `%` between a known nil and a
 numeric type (or another nil), and unary `-nil`. It returns `any` for the
