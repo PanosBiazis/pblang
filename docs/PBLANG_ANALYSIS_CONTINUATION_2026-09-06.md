@@ -466,3 +466,19 @@ C99/direct-x64, C, Python and Node. It keeps raw samples, build/run/resource
 separation and platform/measurement limits. These are not a before/after
 measurement of this library fix or readiness evidence for untested devices.
 The once failure/reentrancy discrepancy is recorded for follow-up, not repaired.
+
+## Remediation update — 2026-09-08, explicit super owner
+
+Baseline `bcf223e`. Class-library super helpers now accept an optional final
+declaring-class argument for nested/inherited overrides. No instance metadata
+or global dispatch state is temporarily modified. Legacy omitted/nil-owner
+behavior remains compatible but is still unsuitable for arbitrary deep
+inheritance; migration is explicit. Tests cover four levels, forwarding,
+bound/functional/mixin composition, redispatch, errors and actual class-library
+import through the bounded PBLang frontend/VM. `CLASS_SUPER_OWNER.md` records
+the checked frontend's predeclaration requirement and ownership limitations.
+
+The nine-row numeric competitor batch adds C++, Go and Rust using existing
+fixtures. It does not exercise embedded polyglot, every application category or
+other devices. See `BENCHMARK_SESSION_2026-09-08_SUPER_OWNER.md`. No Rust
+product/compiler source changes; overall 1.0.0 readiness remains NOT READY.
