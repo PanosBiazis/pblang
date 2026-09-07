@@ -665,3 +665,42 @@ frames. Final project build and portable-lock publication passed. Lint exited
 0 with existing style/unused warnings. The dirty lockfile is excluded.
 Graphify hit its 20-second deadline (124); freshness is not claimed. No broad
 suite, device execution, temporary fixture writes or retained-host rebuild.
+
+## Remediation ledger — 2026-09-07, per-match legacy admission
+
+Baseline `0738f0a`; fix identity is this ledger's commit. The activation
+regression reproduced native-match corruption caused by an unrelated quoted
+separator. The PBLang adapter now validates complete supported legacy arms
+within each candidate; `has_guards` is not transformation authority. Every arm
+must have a non-keyword ASCII identifier, `if`, a real top-level tilde/hash
+separator, a value and a semicolon; only one optional final `else:` is admitted.
+Code is emitted after all arms validate. Native/mixed/partial/unsupported forms
+return no transformation rather than partial or always-true arms.
+
+Strings are preserved, grouping is balanced with a 64-level limit, and discovery
+skips complete comments or terminates at unfinished comments. Whole-keyword
+boundaries stop suffix lookalikes; bind substitution preserves neighboring
+Unicode/combining-mark identifiers. The canonical tokenizer supplies keyword
+authority and is already included in module-cache dependency measurement.
+
+The intentionally narrower legacy grammar is a correctness compatibility change:
+comments inside expressions, brace-based nesting, colon catchalls, partial arms
+and missing semicolons are left unlowered and may fail checked compilation.
+General expression semantics, generated-name hygiene, result/bind typing, nested
+legacy support and hard resource enforcement remain open. No frontend or Rust
+source edits, device testing or universal compatibility claim. **NOT READY for
+1.0.0** remains unchanged.
+
+Validation: ten focused suites passed (`guard_preprocessor_activation`,
+`guard_preprocessor_strings`, `guard_preprocessor_native_match`,
+`selfhost_compile_lexical`, `selfhost_project_lexical`,
+`selfhost_tokenizer_unterminated`, `selfhost_parse_safe`, `selfhost_vm_bounded`,
+`execution_pipeline`, `execution_pipeline_byte_limits`). The new regression
+checks unchanged native text, correct branch values in both sibling orders,
+unsupported/malformed forms, Unicode boundaries and exact 64/65 nesting.
+Tests used the 20-second/test, 2-GiB, capped-output harness; runtime probes add
+2,000-step/eight-frame limits. Final build and portable-lock publication passed;
+the pre-existing dirty lock is excluded. Lint exited 0 with two warnings
+(an unused-variable report on the checked local `code` and existing `while true`
+style). Graphify timed out cleanly at 20 seconds (124), so graph freshness is
+not claimed. No full suite, device scan or retained executable rebuild.

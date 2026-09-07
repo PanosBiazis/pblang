@@ -40,8 +40,9 @@
 //   let processed = gp.preprocess(source);
 //   // Validate processed with the checked frontend before code generation.
 //
-// Partial legacy adapter: source-wide activation, comments, nested expressions,
-// generated-name hygiene and Unicode identifier boundaries are not fully handled.
+// Partial legacy adapter: only guarded ASCII identifiers and an optional else
+// are lowered. Unsupported comments/nesting/colon patterns remain unchanged.
+// Generated-name hygiene and general expression semantics remain limited.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Helpers: quoted source spans and matching close braces
@@ -66,6 +67,90 @@ fn _string_end(src, start) {
     return -1;
 }
 
+let _TOKENIZER = import("stdlib:compiler/tokenizer.sapp");
+
+// Comment discovery only. Transform admission conservatively rejects comments
+// within an expression rather than attempting to reinterpret their contents.
+fn _comment_end(src, pos) {
+    let pair = str_slice(src, pos, pos + 2);
+    if pair == "//" {
+        let i = pos + 2;
+        while i < len(src) and str_slice(src, i, i + 1) != "\n" { i = i + 1; }
+        return i;
+    }
+    if pair == "/*" {
+        let i = pos + 2;
+        while i + 1 < len(src) {
+            if str_slice(src, i, i + 2) == "*/" { return i + 2; }
+            i = i + 1;
+        }
+        return -1;
+    }
+    return pos;
+}
+
+fn _word_char(ch) {
+    // Conservatively keep non-ASCII neighbors attached to identifiers.
+    return is_ident_char(ch) or (try strcharcodeat(ch, 0) catch 0) >= 128;
+}
+
+fn _word_at(src, pos, word) {
+    if pos < 0 or str_slice(src, pos, pos + len(word)) != word { return false; }
+    if pos > 0 and _word_char(str_slice(src, pos - 1, pos)) { return false; }
+    let end = pos + len(word);
+    return end >= len(src) or not _word_char(str_slice(src, end, end + 1));
+}
+
+fn _skip_space(src, pos) {
+    while pos < len(src) {
+        let ch = str_slice(src, pos, pos + 1);
+        if ch != " " and ch != "\t" and ch != "\r" and ch != "\n" { break; }
+        pos = pos + 1;
+    }
+    return pos;
+}
+
+// Read one supported expression up to its own top-level delimiter. Quoted
+// slices and balanced ()/[] are opaque to separator discovery; braces/comments
+// and misplaced delimiters reject the whole transform, not just a partial arm.
+fn _legacy_expr(src, start, mode) {
+    let i = start;
+    let stack = [];
+    while i < len(src) {
+        let ch = str_slice(src, i, i + 1);
+        if ch == "\"" {
+            let end = _string_end(src, i);
+            if end < 0 { return nil; }
+            i = end; continue;
+        }
+        let pair = str_slice(src, i, i + 2);
+        if pair == "//" or pair == "/*" { return nil; }
+        if ch == "(" or ch == "[" {
+            if len(stack) >= 64 { return nil; }
+            array_push(stack, ch); i = i + 1; continue;
+        }
+        if ch == ")" or ch == "]" {
+            if len(stack) == 0 { return nil; }
+            let open = array_pop(stack);
+            if (ch == ")" and open != "(") or (ch == "]" and open != "[") { return nil; }
+            i = i + 1; continue;
+        }
+        let delimiter = (mode == "scrutinee" and ch == "{")
+            or (mode == "guard" and (ch == "~" or ch == "#"))
+            or (mode == "value" and ch == ";");
+        if delimiter and len(stack) == 0 {
+            let text = str_trim(str_slice(src, start, i));
+            if text == "" { return nil; }
+            return map{ text: text, end: i, delimiter: ch };
+        }
+        if ch == "{" or ch == "}" or ch == ":" or ch == ";" or ch == "~" or ch == "#" {
+            return nil;
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
 fn find_matching_brace(src, start) {
     // start is the position of the opening '{'
     // Returns the position of the matching '}' or -1
@@ -73,6 +158,9 @@ fn find_matching_brace(src, start) {
     let i = start;
     while i < len(src) {
         let ch = str_slice(src, i, i + 1);
+        let comment_end = _comment_end(src, i);
+        if comment_end < 0 { return -1; }
+        if comment_end != i { i = comment_end; continue; }
         if ch == "{" { depth = depth + 1; }
         if ch == "}" {
             depth = depth - 1;
@@ -127,26 +215,11 @@ fn find_next_match(src, start_pos) {
             i = end;
             continue;
         }
-        // Skip single-line comments
-        if ch == "/" and i + 1 < len(src) and str_slice(src, i + 1, i + 1 + 1) == "/" {
-            while i < len(src) and str_slice(src, i, i + 1) != "\n" { i = i + 1; }
-            i = i + 1;
-            continue;
-        }
-        // Skip block comments
-        if ch == "/" and i + 1 < len(src) and str_slice(src, i + 1, i + 1 + 1) == "*" {
-            i = i + 2;
-            while i + 1 < len(src) {
-                if str_slice(src, i, i + 1) == "*" and str_slice(src, i + 1, i + 1 + 1) == "/" {
-                    i = i + 2;
-                    break;
-                }
-                i = i + 1;
-            }
-            continue;
-        }
+        let comment_end = _comment_end(src, i);
+        if comment_end < 0 { return -1; }
+        if comment_end != i { i = comment_end; continue; }
 
-        if find_keyword_at(src, i, "match") {
+        if _word_at(src, i, "match") {
             return i;
         }
         i = i + 1;
@@ -159,180 +232,55 @@ fn find_next_match(src, start_pos) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn transform_match(src, match_start) {
-    // match_start is the position of the "match" keyword
-    // Returns map{ transformed: string, end_pos: number }
-
-    // Find the open brace after "match ..."
-    let i = match_start + 5; // skip "match"
-    // Skip whitespace
-    while i < len(src) and (str_slice(src, i, i + 1) == " " or str_slice(src, i, i + 1) == "\t" or str_slice(src, i, i + 1) == "\n") {
-        i = i + 1;
-    }
-
-    // Read the scrutinee expression (until '{')
-    let scrutinee = "";
-    let parens_depth = 0;
-    while i < len(src) and (str_slice(src, i, i + 1) != "{" or parens_depth > 0) {
-        let ch = str_slice(src, i, i + 1);
-        if ch == "(" { parens_depth = parens_depth + 1; }
-        if ch == ")" { parens_depth = parens_depth - 1; }
-        if ch == "\"" {
-            let end = _string_end(src, i);
-            if end < 0 { return nil; }
-            scrutinee = scrutinee + str_slice(src, i, end);
-            i = end;
-            continue;
-        }
-        scrutinee = scrutinee + ch;
-        i = i + 1;
-    }
-
-    if i >= len(src) { return nil; }
-
-    // i is now at the '{' of match body
-    let open_brace = i;
-    let close_brace = find_matching_brace(src, open_brace);
+    // Only complete guarded-identifier legacy arms are admitted. Native colon
+    // patterns and unsupported forms return nil with no partial generated code.
+    if not _word_at(src, match_start, "match") { return nil; }
+    let subject = _legacy_expr(src, match_start + 5, "scrutinee");
+    if subject == nil { return nil; }
+    let scrutinee = subject.text;
+    let close_brace = find_matching_brace(src, subject.end);
     if close_brace < 0 { return nil; }
-
-    // Extract match body (everything between { and })
-    let body = str_slice(src, open_brace + 1, close_brace);
-
-    // Parse match arms from body
+    let body = str_slice(src, subject.end + 1, close_brace);
     let arms = [];
     let default_body = "";
     let has_default_body = false;
-    let pos = 0;
+    let pos = _skip_space(body, 0);
     while pos < len(body) {
-        // Skip whitespace
-        while pos < len(body) and (str_slice(body, pos, pos + 1) == " " or str_slice(body, pos, pos + 1) == "\t" or str_slice(body, pos, pos + 1) == "\n" or str_slice(body, pos, pos + 1) == ";") {
-            pos = pos + 1;
-        }
-        if pos >= len(body) or str_slice(body, pos, pos + 1) == "}" { break; }
-
-        // Check for "else"
-        if pos + 3 < len(body) and str_slice(body, pos, pos + 4) == "else" {
-            pos = pos + 4;
-            // Skip whitespace, optional ':'
-            while pos < len(body) and (str_slice(body, pos, pos + 1) == " " or str_slice(body, pos, pos + 1) == "\t" or str_slice(body, pos, pos + 1) == "\n" or str_slice(body, pos, pos + 1) == ":") {
-                pos = pos + 1;
-            }
-            // Read default expression until ; or end
-            let val = "";
-            while pos < len(body) {
-                let ch = str_slice(body, pos, pos + 1);
-                if ch == "\"" {
-                    let end = _string_end(body, pos);
-                    if end < 0 { return nil; }
-                    val = val + str_slice(body, pos, end);
-                    pos = end;
-                    continue;
-                }
-                if ch == ";" { break; }
-                val = val + ch;
-                pos = pos + 1;
-            }
-            default_body = str_trim(val);
+        if _word_at(body, pos, "else") {
+            if len(arms) == 0 { return nil; }
+            pos = _skip_space(body, pos + 4);
+            if str_slice(body, pos, pos + 1) != ":" { return nil; }
+            let fallback = _legacy_expr(body, pos + 1, "value");
+            if fallback == nil { return nil; }
+            default_body = fallback.text;
             has_default_body = true;
-            if str_ends_with(default_body, ";") {
-                default_body = str_slice(default_body, 0, len(default_body) - 1);
-            }
+            pos = _skip_space(body, fallback.end + 1);
+            if pos != len(body) { return nil; }
             break;
         }
-
-        // Check for "case"
-        if pos + 3 < len(body) and str_slice(body, pos, pos + 4) == "case" {
-            pos = pos + 4;
-            // Skip whitespace
-            while pos < len(body) and (str_slice(body, pos, pos + 1) == " " or str_slice(body, pos, pos + 1) == "\t") {
-                pos = pos + 1;
-            }
-            // Read bind name
-            let bind_name = "";
-            while pos < len(body) and is_ident_char(str_slice(body, pos, pos + 1)) {
-                bind_name = bind_name + str_slice(body, pos, pos + 1);
-                pos = pos + 1;
-            }
-
-            // Skip whitespace
-            while pos < len(body) and (str_slice(body, pos, pos + 1) == " " or str_slice(body, pos, pos + 1) == "\t") {
-                pos = pos + 1;
-            }
-
-            // Check for "if" (guarded arm)
-            let guard = "";
-            if pos + 1 < len(body) and str_slice(body, pos, pos + 2) == "if" {
-                let after_if = pos + 2;
-                if after_if < len(body) and not is_ident_char(str_slice(body, after_if, after_if + 1)) {
-                    pos = pos + 2;
-                    // Read guard condition until ~, #, or end at ; boundary
-                    while pos < len(body) and (str_slice(body, pos, pos + 1) == " " or str_slice(body, pos, pos + 1) == "\t") {
-                        pos = pos + 1;
-                    }
-                    while pos < len(body) {
-                        let gc = str_slice(body, pos, pos + 1);
-                        if gc == "\"" {
-                            let end = _string_end(body, pos);
-                            if end < 0 { return nil; }
-                            guard = guard + str_slice(body, pos, end);
-                            pos = end;
-                            continue;
-                        }
-                        if gc == "~" or gc == "#" { pos = pos + 1; break; }
-                        guard = guard + gc;
-                        pos = pos + 1;
-                    }
-                }
-            } else if pos + 0 < len(body) and str_slice(body, pos, pos + 1) == ":" {
-                // unguarded arm: case name: body;
-                pos = pos + 1;
-            }
-
-            // Skip whitespace/seps to body
-            while pos < len(body) and (str_slice(body, pos, pos + 1) == " " or str_slice(body, pos, pos + 1) == "\t" or str_slice(body, pos, pos + 1) == "~" or str_slice(body, pos, pos + 1) == "#") {
-                pos = pos + 1;
-            }
-
-            // Read body expression until ;
-            let val = "";
-            while pos < len(body) {
-                let vc = str_slice(body, pos, pos + 1);
-                if vc == "\"" {
-                    let end = _string_end(body, pos);
-                    if end < 0 { return nil; }
-                    val = val + str_slice(body, pos, end);
-                    pos = end;
-                    continue;
-                }
-                if vc == ";" { pos = pos + 1; break; }
-                val = val + vc;
-                pos = pos + 1;
-            }
-
-            if bind_name != "" {
-                let arm_body = str_trim(val);
-                if str_ends_with(arm_body, ";") {
-                    arm_body = str_slice(arm_body, 0, len(arm_body) - 1);
-                }
-                let condition = "";
-                if guard == "" or str_trim(guard) == "" {
-                    // Unguarded: bind the scrutinee value (no condition check needed)
-                    // We still create a condition that's always true
-                    condition = "true";
-                } else {
-                    // Replace bind name with _guard_tmp in the guard condition
-                    condition = replace_ident(guard, bind_name, "_guard_tmp");
-                }
-                array_push(arms, map{
-                    condition: str_trim(condition),
-                    body: arm_body,
-                    bind: bind_name,
-                });
-            }
-        } else {
-            // Skip unknown tokens
-            pos = pos + 1;
-        }
+        if not _word_at(body, pos, "case") { return nil; }
+        pos = _skip_space(body, pos + 4);
+        let name_start = pos;
+        let first = str_slice(body, pos, pos + 1);
+        let code = try strcharcodeat(first, 0) catch 0;
+        if not ((code >= 65 and code <= 90) or (code >= 97 and code <= 122) or code == 95) { return nil; }
+        while pos < len(body) and is_ident_char(str_slice(body, pos, pos + 1)) { pos = pos + 1; }
+        let bind_name = str_slice(body, name_start, pos);
+        if _TOKENIZER.is_keyword(bind_name) { return nil; }
+        pos = _skip_space(body, pos);
+        if not _word_at(body, pos, "if") { return nil; }
+        let guard = _legacy_expr(body, pos + 2, "guard");
+        if guard == nil { return nil; }
+        let value = _legacy_expr(body, guard.end + 1, "value");
+        if value == nil { return nil; }
+        array_push(arms, map{
+            condition: str_trim(replace_ident(guard.text, bind_name, "_guard_tmp")),
+            body: value.text,
+            bind: bind_name
+        });
+        pos = _skip_space(body, value.end + 1);
     }
+    if len(arms) == 0 { return nil; }
 
     // Build the IIFE
     let result = "(fn() {\n";
@@ -381,16 +329,10 @@ fn replace_ident(text, old_name, new_name) {
             i = end;
             continue;
         }
-        if find_keyword_at(text, i, old_name) or (
-            str_slice(text, i, i + len(old_name)) == old_name and
-            (i + len(old_name) >= len(text) or not is_ident_char(str_slice(text, i + len(old_name), i + len(old_name) + 1)))
-        ) {
-            let before_ok = i == 0 or not is_ident_char(str_slice(text, i - 1, i));
-            if before_ok {
-                out = out + new_name;
-                i = i + len(old_name);
-                continue;
-            }
+        if _word_at(text, i, old_name) {
+            out = out + new_name;
+            i = i + len(old_name);
+            continue;
         }
         out = out + str_slice(text, i, i + 1);
         i = i + 1;
@@ -407,6 +349,7 @@ fn preprocess(source) {
         return source;
     }
 
+    // Coarse fast path only; transform_match validates each candidate independently.
     // Only transform sources that use the LEGACY guard separators (` ~ ` / ` # `).
     // The self-hosted parser handles `match` natively — including `case PAT if
     // GUARD : BODY` and literal patterns — so a native colon-syntax match must be
@@ -449,7 +392,7 @@ fn preprocess(source) {
     return result;
 }
 
-/// Check whether source contains match guard syntax that needs preprocessing.
+/// Coarse candidate hint only; strings/comments can match. Not rewrite authority.
 fn has_guards(source) {
     return str_contains(source, " ~ ") or str_contains(source, " # ");
 }

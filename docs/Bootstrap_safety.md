@@ -307,11 +307,29 @@ arms, defaults and keyword/brace searches; identifier substitution does not
 rewrite quoted literals. Unterminated spans abort the affected transformation.
 The A5 raw/processed lexical gates remain mandatory and unchanged.
 
-The legacy rewriter is still partial. Its source-wide `has_guards` trigger can
-rewrite an unrelated native match when any legacy separator occurs elsewhere,
-even inside a string/comment. Comment handling, nested expressions, generated
-name collisions and Unicode/keyword boundaries remain incomplete. Do not infer
-general mixed-native/legacy compatibility from the focused string repair.
+The legacy rewriter is still partial, but `has_guards` is now only a coarse
+fast-path hint. Each individual match must contain complete supported guarded
+arms before any lowering is emitted. Unrelated native matches stay intact even
+when separators occur in strings, comments or another expression. Discovery
+skips comments and respects complete keyword boundaries; bind replacement no
+longer splits neighboring Unicode/combining-mark identifiers.
+
+The admitted legacy subset is `case ASCII_IDENT if CONDITION ~ VALUE;` (or `#`),
+with an optional final `else: VALUE;`. Names must not be tokenizer keywords.
+Quoted strings and balanced parentheses/brackets (up to 64 levels) are scanned
+without confusing their contents with arm separators. Colon-form cases,
+literal/destructuring patterns, comments within expressions, nested braces,
+misplaced separators and incomplete arms decline the entire outer transform.
+This intentionally narrows the older permissive adapter, which could silently
+emit partial or always-true arms. Leaving source unchanged is not a successful
+compile: callers must still check frontend diagnostics. Nested candidates may
+be processed independently; general nested legacy support is not established.
+Generated-name collisions and result/bind typing remain separate limitations.
+
+`guard_preprocessor_activation` checks exact native-text preservation, actual
+branch selection with independent legacy siblings in either order, misleading
+separators/keywords, malformed inputs and the 64/65 grouping boundary. It does
+not establish a whole-source heap or wall-clock limit.
 
 `guard_preprocessor_strings` compares fixed synthetic values in the bounded VM,
 including escapes, separator-like text and literal identifier preservation.
