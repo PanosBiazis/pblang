@@ -331,3 +331,19 @@ bounded execution, verify helper collisions, side effects and exceptions, and
 cover the optimized path. The previous tests no longer tolerate false legacy
 type diagnostics. No full-suite or physical-device claim; **NOT READY for
 1.0.0** remains the evidence-based release status.
+
+## Remediation update — 2026-09-07, concrete nil arithmetic
+
+Baseline `b16aaf9`. C2's PBLang `nil - 1` defect is repaired: concrete nil paired
+with a numeric type or nil in `+`, `-`, `*`, `/`, `%`, and unary `-nil`, produces
+`nil-arithmetic` rather than a fabricated numeric result. The checked frontend
+rejects the program before execution. The new regression failed before the
+source change and passed afterward; twelve focused suites passed.
+
+This intentionally tightens checked compilation, even inside `try`, without
+changing runtime operations or retained Rust source. Map overloads, string
+addition and gradual/generic/optional behavior remain as before. A bounded
+reflected-overload test confirms that a valid `nil - object` still works.
+No general type-soundness or host-parity claim follows; remaining C2 host
+discrepancies and the broader 1.0.0 blockers remain open. See the comparative
+audit's dated C2 ledger and `Bootstrap_safety.md` for the exact scope.

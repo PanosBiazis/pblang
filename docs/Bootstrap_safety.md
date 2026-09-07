@@ -283,6 +283,24 @@ When those concerns matter, treat them as separate workstreams.
 
 ## Strict frontend compilation boundary (2026-09-07)
 
+The PBLang typechecker diagnoses proven scalar nil arithmetic with code
+`nil-arithmetic`: binary `+`, `-`, `*`, `/`, `%` between a known nil and a
+numeric type (or another nil), and unary `-nil`. It returns `any` for the
+invalid expression after recording the error, avoiding a fabricated number
+and cascading assignment errors. Both operand subtrees are still checked.
+The checked frontend reports `ok=false`; its run APIs do not execute any part
+of the rejected program. Inspectable bytecode remains part of the existing
+type-error contract, not permission to run it.
+
+Compatibility: these expressions were formerly accepted by the self-hosted
+checker; they now fail checked compilation, including inside `try`. This
+does not change runtime operators or prohibit custom reflected/forward map
+operators. Existing string-addition inference, `any`, generic and optional
+operand behavior is preserved, not certified correct by this fix. Optional
+narrowing, all concrete operand combinations and complete retained-host parity
+remain separate work. `**` is already lowered to `num_pow` and uses call
+argument checking rather than the new binary rule.
+
 One checked-token parser now feeds direct, file, guard and project compilation.
 Unterminated strings/block comments become parse errors with their token line.
 Recovery ASTs remain inspectable, but lexical/parser errors produce an empty
