@@ -332,9 +332,31 @@ targets the loop end. `selfhost_forin_scope` checks plain and safely optimized
 bounded results, including Unicode binders and early return.
 
 This corrects lexical behavior without changing bytecode or VM instructions.
-It does not repair count/range-loop scopes, their bound-evaluation rules, or
-other generated temporaries. The regression uses arrays, not a claim of
-support for every iterable kind or backend.
+The array regression is not a claim of support for every iterable kind or
+backend; other generated temporaries remain separate work.
+
+Count loops (`for i N`) and inclusive numeric ranges (`for i in A to B`)
+now also have a dedicated lexical scope. Bounds evaluate once in the enclosing
+environment before introducing `i`; ranges evaluate A then B, even when empty.
+An exception in A skips B and the body; an exception in B skips the body.
+The counter and stored bound have unnamed slots. The body receives the current
+counter value each iteration, so assigning to `i` does not change subsequent
+iteration indices. Continue advances the private counter, break exits, and
+the enclosing binding is restored for following code. Existing by-value
+closure captures and monotonic slots are retained.
+
+Compatibility correction: self-hosted code that relied on re-evaluating a
+bound, changing iteration count by assigning the body binder, or leaking that
+binder must use an explicit `while` with a mutable counter/condition instead.
+The numeric lowering still uses scalar +1 stepping and existing < / <=
+comparisons, not a materialized range array. This does not establish parity
+for fractional/non-finite/extreme numbers, overloaded comparisons, a shadowed
+`range` builtin, every backend or global resource limits.
+
+`selfhost_count_scope` and `selfhost_range_scope` compare plain and safely
+optimized bounded execution for the repaired behavior, including closures,
+Unicode, empty/negative bounds, ordered effects and exception propagation.
+Undefined bounds/binders and malformed loops remain checked errors.
 
 The PBLang typechecker diagnoses proven scalar nil arithmetic with code
 `nil-arithmetic`: binary `+`, `-`, `*`, `/`, `%` between a known nil and a

@@ -949,14 +949,14 @@ is justified by the current coverage.
 Already repaired with focused evidence: C1 optimizer behavior, C3's legacy
 borrow-release lifecycle, A4's identified frame/parameter admission defects,
 A5 lexical admission, A6/A6-L UTF-8 accounting, and the dated legacy/native
-match and array for-in corrections. C2's optional-assignment and concrete nil
+match, array for-in and count/range corrections. C2's optional-assignment and concrete nil
 arithmetic repairs are complete within their described scope, not all of C2.
 A3 guest-exception cleanup and P4 JSON serialization are partial repairs.
 P1/P2 source/library fixes are not an updated, qualified deployed host.
 
 | Area / finding | Remaining implementation or evidence | Status |
 | --- | --- | --- |
-| C2, C4, C5; compiler follow-ups | Retained checker call arity/index-expression checks; LLVM unsupported-subset rejection, continue/increment and scoped locals; JIT observable print parity. Separately resolve count/range-loop scopes and bound semantics, parser ambiguities, and review remaining synthetic temporaries. | Open; no general compiler/backend parity claim |
+| C2, C4, C5; compiler follow-ups | Retained checker call arity/index-expression checks; LLVM unsupported-subset rejection, continue/increment and scoped locals; JIT observable print parity. Resolve parser ambiguities and review remaining synthetic temporaries and numeric edge-case parity. Count/range scope and once-only bound lowering are now repaired as recorded below. | Open; no general compiler/backend parity claim |
 | A7 diagnostics | Visibility-aware name suggestions across analysis/lint surfaces; exclude function-local candidates outside their scope. Existing unrelated frontend edits are not certified by this slice. | Open |
 | A1, A2 imports and file entrypoints | Syntax-aware import discovery, aggregate import/child budgets including cache paths, and descriptor-held bounded reads before whole-file allocation with file-kind/identity policy. | Open |
 | A3 cleanup; S1, S2 ownership/concurrency | Unwind on direct engine/resource faults; gate timer/spawn paths before allocation; VM-owned handle authority and cross-VM lifecycle tests. Existing guest-exception and legacy borrow fixes must be retained. | Partial overall; these listed paths remain open |
@@ -967,8 +967,56 @@ P1/P2 source/library fixes are not an updated, qualified deployed host.
 | R7 platforms/devices | Build/install/run/interact/shutdown/upgrade the actual candidate or independent adapter for each advertised target. Obtain required physical-platform evidence; an iOS simulator boot or host test is not iOS application execution. Mark unavailable targets explicitly. | Not established; no universal device support claim |
 | R8, R9 release qualification | Reproducible baseline/candidate measurements (warmups, samples, median/tails, peak memory and applicable energy), clean candidate/artifact identity, independent bootstrap and build reproducibility, fresh dependency review, relative lockfiles, matching documentation and release approval. | Not established |
 
-The next bounded PBLang correctness slice can address count/range loops;
-security-boundary repairs require the mandated defensive review first.
+Remaining PBLang correctness work includes other generated temporaries and
+parser ambiguities; security-boundary repairs require defensive review first.
 Unavailable hardware and release-wide evidence cannot be replaced by
 documentation or model/emulator results. Graph freshness is a separate tooling
 limitation, not proof for or against language semantics.
+
+## Remediation ledger — 2026-09-07, count/range scope and bound evaluation
+
+Baseline `3f81b2c`; fix identity is this ledger's commit. The new count and
+range regressions both failed on outer-binding restoration before the change.
+Complete codegen review and parser/typechecker/semantic/reference tracing also
+showed bound evaluation on each condition check and reuse of the user binder
+as the internal counter. The typechecker already resolves bounds before the
+binder; the retained count emitter evaluates its bound once and uses a separate
+index. The retained range parser lowers to a once-created range collection.
+
+Only the two PBLang numeric-loop emitters are changed. Each opens/closes a
+lexical scope, reserves unnamed counter/bound slots, evaluates bounds before
+introducing the binder, and copies the counter into the binder each iteration.
+Range evaluation is start then end; numeric +1 stepping remains scalar.
+Counter increments and patched break/continue destinations are unchanged.
+Physical slots remain monotonic and closure capture remains by value.
+No Rust, VM, parser, typechecker, optimizer or frontend edits were made.
+
+This supersedes the previous count/range scope and repeated-bound limitations
+only for these lowering paths. Programs relying on those defects must express
+dynamic conditions/counters with `while`, as documented in
+`Bootstrap_safety.md`. General malformed-AST, fractional/non-finite/extreme
+number, overloaded-comparison, shadowed-range-builtin and backend parity are
+not established. This is not a whole-language resource or safety guarantee.
+
+Fourteen targeted suites passed: `selfhost_count_scope`,
+`selfhost_range_scope`, `selfhost_forin_scope`, `selfhost_match_scope`,
+`selfhost_literal_match_guard`, `selfhost_enum_guard_coverage`,
+`selfhost_typeck_parity`, `selfhost_type_system_parity`,
+`selfhost_optimizer_strength`, `selfhost_closure`, `selfhost_loop_kw`,
+`selfhost_vm_bounded`, `loop_range_continue`, `selfhost_compile_lexical`.
+The two new tests compare plain/optimized typed values and ordered effects for
+local/global restoration, empty/negative/nested/sibling loops, outer-bound
+lookup, bound mutation, binder assignment, helper-like names, Unicode,
+closures, continue/break, early return and bound exceptions. Undefined names
+and malformed loop source reject. Probes use 5,000 steps/12 frames, with the
+trusted harness's 20-second/2-GiB/capped-output per-test limits.
+
+No full suite or physical-platform run. The R1–R9 release gate status remains
+unchanged: NOT READY for 1.0.0. Existing unrelated edits remain excluded.
+
+Final build and portable-lock publication passed; lint on all three touched
+PBLang files exited zero without warnings. Added-line privacy checks and
+`git diff --check` passed; the pre-existing frontend diff is unchanged.
+The dirty lock remains excluded. Graphify stopped at its 20-second timeout
+(124), so graph freshness is not claimed. No test/Graphify process or owned
+temporary test-output directory remained.
