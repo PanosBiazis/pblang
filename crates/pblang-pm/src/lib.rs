@@ -946,7 +946,6 @@ pub fn parse_registry_index(json: &[u8]) -> Result<RegistryIndex, String> {
 /// "Zip Slip" path traversal attacks where a malicious tarball contains entries
 /// with `../` components that would escape dest_dir.
 pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
-    use std::path::Component;
     if tar_gz.len() > MAX_REGISTRY_ARCHIVE_BYTES {
         return Err(format!(
             "registry archive: compressed payload of {} bytes exceeds cap of {} bytes",
@@ -963,10 +962,14 @@ pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
         .map_err(|e: String| e)?;
 
     let extraction = (|| {
-        let dec = flate2::read::GzDecoder::new(tar_gz);
+        let dec = ArchiveReadBudget::new(
+            flate2::read::GzDecoder::new(tar_gz),
+            MAX_ARCHIVE_DECODED_BYTES,
+        );
         let mut archive = tar::Archive::new(dec);
         let mut entry_count = 0usize;
         let mut unpacked_bytes = 0u64;
+        let mut seen_paths = std::collections::HashSet::new();
 
         for entry in archive.entries().map_err(|e| format!("tar entries: {e}"))? {
             entry_count = entry_count
@@ -979,8 +982,8 @@ pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
             }
 
             let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
-            let entry_path = entry.path().map_err(|e| format!("tar path: {e}"))?;
             let entry_type = entry.header().entry_type();
+            let entry_path = admit_archive_path(&entry.path_bytes(), entry_type, &mut seen_paths)?;
             if matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
                 return Err(format!(
                     "SECURITY: tarball link entries are not allowed: {}",
@@ -997,33 +1000,7 @@ pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
                 ));
             }
 
-            // Validate: reject any path that would escape dest_dir.
-            for component in entry_path.components() {
-                match component {
-                    Component::ParentDir => {
-                        return Err(format!(
-                            "SECURITY: tarball entry '{}' contains '..', rejected (Zip Slip)",
-                            entry_path.display()
-                        ));
-                    }
-                    Component::RootDir | Component::Prefix(_) => {
-                        return Err(format!(
-                            "SECURITY: tarball entry '{}' is absolute, rejected",
-                            entry_path.display()
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-
-            let entry_bytes = if entry_type == tar::EntryType::Regular {
-                entry
-                    .header()
-                    .size()
-                    .map_err(|e| format!("tar size: {e}"))?
-            } else {
-                0
-            };
+            let entry_bytes = archive_entry_size(entry_type, entry.size())?;
             if entry_bytes > MAX_REGISTRY_ENTRY_BYTES {
                 return Err(format!(
                     "registry archive: entry '{}' is {} bytes, cap is {} bytes",
@@ -1042,9 +1019,12 @@ pub fn unpack_tarball_gz(tar_gz: &[u8], dest_dir: &Path) -> Result<(), String> {
                 ));
             }
 
-            entry
+            if !entry
                 .unpack_in(&dest_dir)
-                .map_err(|e| format!("tar unpack entry: {e}"))?;
+                .map_err(|e| format!("tar unpack entry: {e}"))?
+            {
+                return Err("tarball entry was not extracted within destination".to_string());
+            }
         }
         Ok(())
     })();
@@ -1280,32 +1260,24 @@ fn http_index_base_url(index_url: &str) -> Option<String> {
 }
 
 fn verify_tarball_hmac_sidecar(tarball_url: &str, tarball_bytes: &[u8]) -> Result<(), String> {
-    let key = match std::env::var("PBLANG_SIGNING_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => return Ok(()),
-    };
-    let path = tarball_url
-        .strip_prefix("file://")
-        .map(Path::new)
-        .filter(|p| p.is_file());
-    let Some(path) = path else {
-        return Ok(());
-    };
-    let sidecar = PathBuf::from(format!("{}.sha256", path.display()));
-    if !sidecar.is_file() {
+    let key = std::env::var("PBLANG_SIGNING_KEY").ok();
+    verify_local_archive_sidecar(tarball_url, tarball_bytes, key.as_deref())
+}
+
+fn verify_local_archive_sidecar(
+    tarball_url: &str,
+    tarball_bytes: &[u8],
+    key: Option<&str>,
+) -> Result<(), String> {
+    if !tarball_url
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
         return Ok(());
     }
-    let expected =
-        std::fs::read_to_string(&sidecar).map_err(|e| format!("read HMAC sidecar: {e}"))?;
-    let expected = expected.trim();
-    let got = compute_tarball_hmac(tarball_bytes, key.as_bytes());
-    if !got.eq_ignore_ascii_case(expected) {
-        return Err(format!(
-            "HMAC signature mismatch for registry tarball (sidecar {})",
-            sidecar.display()
-        ));
-    }
-    Ok(())
+    let path = local_file_registry_path(tarball_url)
+        .ok_or_else(|| "invalid local registry archive URL".to_string())?;
+    verify_archive_sidecar(&path, tarball_bytes, key).map(|_| ())
 }
 
 /// Returns true when the directory contains at least one recognized module file.
@@ -2788,9 +2760,181 @@ pub fn compute_tarball_hmac(bytes: &[u8], key: &[u8]) -> String {
     hex::encode(outer.finalize())
 }
 
-/// Verify a pack tarball: checks it contains pblang.toml and at least one .sapp/.sap file.
-/// If a .sha256 sidecar exists alongside the tarball and PBLANG_SIGNING_KEY is set, also verifies HMAC.
+/// Append the sidecar suffix without losing extensions or non-UTF-8 filename bytes.
+pub fn tarball_hmac_sidecar_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".sha256");
+    PathBuf::from(name)
+}
+
+/// HMAC establishes shared-key integrity, not publisher authenticity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TarballVerification {
+    StructureOnly,
+    HmacVerified,
+}
+
+// Include bounded metadata/padding allowance above the regular-content cap.
+// This is a hard admission budget, not a guarantee every tar dialect fits it.
+const MAX_ARCHIVE_DECODED_BYTES: u64 =
+    MAX_REGISTRY_UNPACKED_BYTES + MAX_REGISTRY_ENTRIES as u64 * (4096 + 1024) + 1024;
+
+struct ArchiveReadBudget<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R> ArchiveReadBudget<R> {
+    fn new(inner: R, remaining: u64) -> Self {
+        Self { inner, remaining }
+    }
+}
+
+impl<R: Read> Read for ArchiveReadBudget<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "tarball decompressed input exceeds admission budget",
+            ));
+        }
+        let length = self.remaining.min(buffer.len() as u64) as usize;
+        let count = self.inner.read(&mut buffer[..length])?;
+        self.remaining -= count as u64;
+        Ok(count)
+    }
+}
+
+fn admit_archive_path(
+    bytes: &[u8],
+    kind: tar::EntryType,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> Result<PathBuf, String> {
+    if bytes.is_empty() || bytes.len() > 4096 {
+        return Err("tarball entry path length is invalid".to_string());
+    }
+    let name =
+        std::str::from_utf8(bytes).map_err(|_| "tarball entry path must be UTF-8".to_string())?;
+    if name
+        .chars()
+        .any(|c| c.is_control() || c == '\\' || c == ':')
+    {
+        return Err("tarball entry path contains forbidden characters".to_string());
+    }
+    let mut normalized = PathBuf::new();
+    for part in Path::new(name).components() {
+        match part {
+            Component::Normal(value) => normalized.push(value),
+            Component::CurDir => {}
+            _ => return Err("tarball entry path is absolute or contains '..'".to_string()),
+        }
+    }
+    if normalized.as_os_str().is_empty() && kind != tar::EntryType::Directory {
+        return Err("tarball file path is empty after normalization".to_string());
+    }
+    if !seen.insert(normalized.clone()) {
+        return Err("tarball contains duplicate normalized paths".to_string());
+    }
+    Ok(normalized)
+}
+
+fn archive_entry_size(kind: tar::EntryType, size: u64) -> Result<u64, String> {
+    // Entry::size includes a PAX size override; the raw header size does not.
+    if kind == tar::EntryType::Directory && size != 0 {
+        return Err("tarball directories must have zero payload bytes".to_string());
+    }
+    Ok(size)
+}
+
+fn verify_archive_sidecar(
+    archive_path: &Path,
+    bytes: &[u8],
+    key: Option<&str>,
+) -> Result<TarballVerification, String> {
+    let sidecar = tarball_hmac_sidecar_path(archive_path);
+    let metadata = match std::fs::symlink_metadata(&sidecar) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TarballVerification::StructureOnly);
+        }
+        Err(_) => return Err("cannot inspect HMAC sidecar".to_string()),
+    };
+    if !metadata.file_type().is_file() {
+        return Err("HMAC sidecar must be a regular non-symlink file".to_string());
+    }
+    let key = key
+        .filter(|k| !k.trim().is_empty())
+        .ok_or_else(|| "HMAC sidecar requires a nonblank PBLANG_SIGNING_KEY".to_string())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err("HMAC sidecar no-follow reads are unsupported on this platform".to_string());
+    let file = options
+        .open(&sidecar)
+        .map_err(|_| "cannot open HMAC sidecar safely".to_string())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "cannot stat HMAC sidecar".to_string())?;
+    if !metadata.is_file() {
+        return Err("HMAC sidecar is not a regular file".to_string());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            // FILE_ATTRIBUTE_REPARSE_POINT
+            return Err("HMAC sidecar reparse points are forbidden".to_string());
+        }
+    }
+    let mut encoded = Vec::new();
+    file.take(129)
+        .read_to_end(&mut encoded)
+        .map_err(|_| "cannot read HMAC sidecar".to_string())?;
+    if encoded.len() > 128 {
+        return Err("HMAC sidecar exceeds 128-byte cap".to_string());
+    }
+    let encoded = encoded
+        .strip_suffix(b"\r\n")
+        .or_else(|| encoded.strip_suffix(b"\n"))
+        .unwrap_or(&encoded);
+    if encoded.len() != 64 || !encoded.iter().all(u8::is_ascii_hexdigit) {
+        return Err("HMAC sidecar must contain exactly 64 hex digits".to_string());
+    }
+    let expected = hex::decode(encoded).map_err(|_| "invalid HMAC sidecar".to_string())?;
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key.as_bytes());
+    ring::hmac::verify(&key, bytes, &expected)
+        .map_err(|_| "HMAC signature mismatch".to_string())?;
+    Ok(TarballVerification::HmacVerified)
+}
+
+/// Compatibility wrapper; use the detailed form to distinguish unsigned packages.
 pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
+    verify_tarball_detailed(tarball_path).map(|_| ())
+}
+
+/// Validate structure without extraction, and require valid HMAC when a sidecar exists.
+pub fn verify_tarball_detailed(tarball_path: &Path) -> Result<TarballVerification, String> {
+    let key = std::env::var("PBLANG_SIGNING_KEY").ok();
+    verify_tarball_with_key(tarball_path, key.as_deref())
+}
+
+fn verify_tarball_with_key(
+    tarball_path: &Path,
+    key: Option<&str>,
+) -> Result<TarballVerification, String> {
     let file = std::fs::File::open(tarball_path).map_err(|e| format!("read tarball: {e}"))?;
     let size = file
         .metadata()
@@ -2812,7 +2956,10 @@ pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
             MAX_REGISTRY_ARCHIVE_BYTES
         ));
     }
-    let dec = flate2::read::GzDecoder::new(&bytes[..]);
+    let dec = ArchiveReadBudget::new(
+        flate2::read::GzDecoder::new(&bytes[..]),
+        MAX_ARCHIVE_DECODED_BYTES,
+    );
     let mut archive = tar::Archive::new(dec);
     let entries = archive
         .entries()
@@ -2821,6 +2968,7 @@ pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
     let mut has_entry = false;
     let mut entry_count = 0usize;
     let mut unpacked_bytes = 0u64;
+    let mut seen_paths = std::collections::HashSet::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("tarball entry: {e}"))?;
         entry_count = entry_count
@@ -2831,8 +2979,8 @@ pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
                 "tarball entry count exceeds cap of {MAX_REGISTRY_ENTRIES}"
             ));
         }
-        let path = entry.path().map_err(|e| format!("entry path: {e}"))?;
         let entry_type = entry.header().entry_type();
+        let path = admit_archive_path(&entry.path_bytes(), entry_type, &mut seen_paths)?;
         if !matches!(
             entry_type,
             tar::EntryType::Regular | tar::EntryType::Directory
@@ -2842,14 +2990,7 @@ pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
                 path.display()
             ));
         }
-        let entry_bytes = if entry_type == tar::EntryType::Regular {
-            entry
-                .header()
-                .size()
-                .map_err(|e| format!("entry size: {e}"))?
-        } else {
-            0
-        };
+        let entry_bytes = archive_entry_size(entry_type, entry.size())?;
         if entry_bytes > MAX_REGISTRY_ENTRY_BYTES {
             return Err(format!(
                 "tarball entry '{}' exceeds cap of {} bytes",
@@ -2867,10 +3008,10 @@ pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
             ));
         }
         let path_str = path.to_string_lossy();
-        if path_str.ends_with("pblang.toml") || path_str == "pblang.toml" {
+        if entry_type == tar::EntryType::Regular && path == Path::new("pblang.toml") {
             has_manifest = true;
         }
-        if has_module_extension(&path_str) {
+        if entry_type == tar::EntryType::Regular && has_module_extension(&path_str) {
             has_entry = true;
         }
     }
@@ -2880,26 +3021,11 @@ pub fn verify_tarball(tarball_path: &Path) -> Result<(), String> {
     if !has_entry {
         return Err("tarball has no .sapp/.sap entry file".to_string());
     }
-    // HMAC sidecar check
-    let sidecar = tarball_path.with_extension("").with_extension(
-        tarball_path
-            .extension()
-            .map(|e| format!("{}.sha256", e.to_string_lossy()))
-            .unwrap_or_else(|| "sha256".to_string()),
-    );
-    if sidecar.is_file() {
-        if let Ok(key) = std::env::var("PBLANG_SIGNING_KEY") {
-            let expected =
-                std::fs::read_to_string(&sidecar).map_err(|e| format!("read sidecar: {e}"))?;
-            let expected = expected.trim();
-            let got = compute_tarball_hmac(&bytes, key.as_bytes());
-            if !got.eq_ignore_ascii_case(expected) {
-                return Err(format!("HMAC mismatch: expected {} got {}", expected, got));
-            }
-        }
-    }
-    Ok(())
+    verify_archive_sidecar(tarball_path, &bytes, key)
 }
+
+#[cfg(test)]
+mod archive_verify_tests;
 
 /// Read target_platform and min_runtime hints from pblang.toml, if present.
 /// Returns None when manifest is missing or unparseable (non-fatal for the caller).
