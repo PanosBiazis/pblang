@@ -513,3 +513,40 @@ which was left untouched. Added-line privacy checks found no machine paths or
 credential material. The final Graphify update reached its 20-second deadline
 (exit 124), so graph freshness is not claimed. No test or analyzer processes or
 owned archive-test temporary directories remained. No full suite was run.
+
+## Remediation ledger — 2026-09-07, PBLang pipeline UTF-8 accounting
+
+Baseline `c3b0ace`; fix identity is the commit containing this section. This
+slice modifies PBLang implementation/tests and canonical documentation only;
+no Rust source or retained executable was rebuilt. Unrelated working-tree
+changes remain excluded.
+
+**A6 direct-source admission repaired.** Both pipeline source entrypoints now
+enforce UTF-8 byte ceilings before backend dispatch, with a character-count
+early rejection before byte-array allocation. String artifacts and rendered
+map/scalar artifacts also measure UTF-8 bytes rather than characters. Existing
+binary vectors keep their byte-element count. Diagnostic chunk rendering is
+explicitly not serialized PBCK or heap usage. See [execution pipeline contract](Execution_pipeline.md).
+
+The new regression failed against the unchanged source, then passed after the
+repair. The bounded targeted batch passed **3/3**: `execution_pipeline_byte_limits`,
+`execution_pipeline`, and `selfhost_vm_bounded`, using the existing local 0.6.0
+host, 20 seconds per test and a 2-GiB address-space limit. Tests use synthetic
+in-memory source only: no imports in guest fixtures, filesystem writes, native
+execution or devices. No full suite or independent-backend execution is claimed.
+
+The separate module-snapshot linker still counts characters for several
+byte-named limits (new supported open item A6-L). Per-backend allocations,
+serialized-bytecode sizing, aggregate import budgets and physical-platform
+qualification remain outside this repair. **NOT READY for 1.0.0** is unchanged.
+
+Scoped security review found no blocker in this diff. Lint exited 0 with one
+pre-existing boolean-style warning, the test's deliberate exact-boolean check,
+and a false unused-variable warning for the variable used to generate NaN.
+The multibyte diagnostic-artifact case is exercised; the C99 string-artifact
+control is ASCII, leaving its multibyte branch source-reviewed rather than
+independently exercised. Project build and portable-lock publication passed;
+the pre-existing dirty lockfile remains excluded from this commit. Added-line
+privacy checks and `git diff --check` passed. Graphify reached its 20-second
+deadline (exit 124), so graph freshness is not claimed. No test/analyzer workers
+or temporary test-output directories remained.
