@@ -301,8 +301,25 @@ Compatibility: guarded enum matches formerly misclassified as exhaustive may
 now fail checked compilation. Literal-guard behavior now follows the source
 condition instead of ignoring it. Tests use parenthesized call-expression
 bodies to avoid the existing colon-method-call parser ambiguity. This slice
-does not fix that ambiguity, native generated-name/binding-scope issues or
-establish whole-language/retained-host parity.
+does not fix that ambiguity or establish whole-language/retained-host parity.
+
+Native match lowering now gives each arm its own lexical scope, matching the
+typechecker's binding rule. A rejected arm's name is unavailable in later arms
+and the default; those resolve the enclosing binding instead. The scrutinee
+occupies an unnamed internal slot, not a synthetic source identifier such as
+`__match_scrut`. Reading that user-defined name therefore remains ordinary
+lexical lookup. Slots still increase monotonically: scope exit changes only
+name resolution, preserving the VM's existing by-value closure capture.
+
+`selfhost_match_scope` compares plain and safely optimized bounded execution
+for defaults, sibling/nested matches, repeated/distinct/Unicode binders, outer
+locals and helper-like names, and selected/fallback closures. These checks
+close the identified native match temporary-capture and inter-arm binding
+leaks. They do not certify other compiler-generated temporaries, reflection,
+arbitrary AST input, every backend, or general resource/safety guarantees.
+The parser also treats `match (` as a call to the contextual identifier `match`;
+the nested-subject regression uses the supported unparenthesized `match match`
+form. Parenthesized scrutinee disambiguation is not repaired here.
 
 The PBLang typechecker diagnoses proven scalar nil arithmetic with code
 `nil-arithmetic`: binary `+`, `-`, `*`, `/`, `%` between a known nil and a
