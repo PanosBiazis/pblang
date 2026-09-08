@@ -646,3 +646,26 @@ analyzer regression remains OPEN (not hidden by favorable component timings).
 See TOKENIZER_LEXEME_CONSTRUCTION.md and the session benchmark report. String
 literals, peak allocation, hard runtime limits and the broader 1.0.0 blockers
 remain unresolved; the executable was not refreshed.
+
+
+## Remediation update — 2026-09-08, fixed-field taint limits
+
+Reviewed the existing admission, dependency caller and phase benchmark tools
+before changing PBLang-owned code. Removed the per-call specification array and
+five maps, preserving exact order/errors/defaults and explicit-nil rejection.
+Fourteen targeted suites and independent defensive review passed. See
+TAINT_COMPLETENESS.md and BENCHMARK_SESSION_2026-09-08_TAINT_LIMITS.md.
+
+Paired measurements support approximately 50–54% lower isolated limits time;
+full-analyzer median ratios 1.0061 and 0.9913 do NOT prove repeatable end-to-end
+improvement. The earlier 5.97 → 7.22 ms regression remains OPEN. Isolated lexer,
+parser and complete-analyzer timings are recorded separately, not added together.
+The profiler's time_monotonic_ms is unavailable in the retained executable;
+source/runtime clock capability parity remains a follow-up, not silently fixed.
+
+Remaining: analyzer-wide performance, string/character-array allocation costs,
+full native self-bootstrap and executable refresh, compiler/paradigm compatibility,
+runtime ownership and hard heap/preemption, typed FFI/raw bypass and sandbox,
+package trust/artifact handoff/revocation/rollback, broad product regression and
+physical-platform verification. Existing bounds and earlier fixes remain credited.
+No Rust edit or full suite. PBLang 1.0.0 remains NOT READY.

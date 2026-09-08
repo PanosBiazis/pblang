@@ -29,6 +29,19 @@ in protect/strict/audit modes. Its existing option resolver treats nil as unset;
 this legacy normalization happens before the shared validator. Other taint
 policy shapes are still checked by analyze during traversal, not by limits.
 
+## Fixed-field limit validation
+
+The five static budgets are now resolved and checked directly, in the unchanged
+order: tokens, source bytes, findings, AST steps, call expansions. This avoids
+reconstructing a specification array and five specification maps for every call.
+Validation still precedes analysis; no bound, fallback, error string or explicit
+nil behavior changes. The result is a fresh map, not a shared mutable cache.
+`security_taint_limits_contract_test.sapp` covers exact results/errors, first-error
+precedence, boundaries, malformed values, input preservation and result isolation.
+See `BENCHMARK_SESSION_2026-09-08_TAINT_LIMITS.md`: isolated validation improves,
+but the complete analyzer has no demonstrated repeatable speedup. This is not
+VM-wide heap enforcement or recovery of the earlier analyzer regression.
+
 ## Source admission before tokenization
 
 Direct analysis defaults to a 1-MiB UTF-8 source cap. Oversized input rejects
