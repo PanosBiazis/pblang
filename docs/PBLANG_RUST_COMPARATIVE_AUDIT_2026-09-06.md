@@ -1579,3 +1579,71 @@ Graphify update reached its 20-second deadline (124), without a freshness claim.
 No owned test/benchmark/Graphify workers or benchmark temporary directories
 remained. Only the eleven slice files are staged; unrelated dirty work and the
 local lock remain excluded.
+
+## Remediation ledger — 2026-09-08, array chunk and stepped windows
+
+Baseline `bd697fb`. The prior array.windows fractional/nonfinite count finding
+is now corrected at the PBLang library boundary. Array.chunk also validates before
+work and no longer delegates to raw array_chunk. New array_windowing.sapp clamps
+chunk ends and avoids unused overflowing window advances; only derived bounded
+indices reach the existing native bulk slice primitive. Public array.slice is
+unchanged; no Rust source edits. This adds one transitive module import.
+
+Sixteen focused suites passed: array window contracts, actual PBLang frontend/VM,
+plain/optimized/PBCS roundtrip, array/map/functional regressions, functional and
+selfhost windowing, collection keys/bounds/selfhost, stable sort, once-attempt,
+multi-paradigm composition, portable lock, manifest and benchmark enrichment.
+The shape oracle covers 90 chunk and 900 stepped-window combinations. Invalid
+types/counts, empty input, huge finite counts and borrowed payloads are covered.
+No full suite ran. See `ARRAY_WINDOWING.md`.
+
+Two independent limits are explicitly tested, not hidden: the PBLang frontend
+treats explicit nil as an omitted default step whereas the retained host rejects
+it; PBCS serialization rejects numeric literals outside its existing supported
+constant interval. Neither frontend nor serializer was changed.
+
+Before/intermediate/after raw measurements and nine numeric comparison rows are
+in `BENCHMARK_SESSION_2026-09-08_ARRAY_WINDOWING.md`. Bulk copying improves the
+measured windows cases; many small chunks remain slower than the original raw
+native builtin. No universal performance or memory claim follows. The attempted
+retained C99 library fixture failed at unresolved import compilation, so no C99
+library execution parity is established.
+
+The user-requested executable refresh was attempted through PBLang pbbuild with
+direct-x64, no cache and no fallback, targeting the PBLang compiler CLI in an
+isolated temporary directory. Dependency analysis blocked publication before
+backend execution. It reported module_cache path-control taint, optimizer dynamic
+evaluation, and incomplete linux_dirfs parsing. These analyzer findings are not
+automatically confirmed vulnerabilities. No candidate was published and the
+active executable was not replaced. `tools/pbbootstrap_refresh.sapp` refreshes
+PBCK snapshots and a return-42 native probe, not a full native CLI replacement;
+that existing snapshot set was not overwritten by this attempt.
+
+Independent defensive diagnosis distinguished the reported findings: optimizer
+dynamic-eval is comment text, not execution. At module_cache:257-261, read bytes
+control whether already-formed staging paths are cleaned up; the high finding is
+conservative control-dependency classification, not confirmed path traversal.
+The non-Linux cache fallback nevertheless lacks confined held-directory/no-follow
+guarantees; a cache-directory writer can corrupt staging and induce cleanup/DoS.
+The Linux secure-file branch returns before that fallback. Do not blanket-disable
+the analyzer rule: path dataflow versus control-only cleanup needs a regression,
+and unsupported platforms need confined same-object handling or fail-closed cache
+behavior. The linux_dirfs parser coverage gap remains a real build-gate blocker.
+
+Remaining: resolve and verify the build-analysis blockers, complete standalone
+CLI/runtime parity and reproducible self-bootstrap; fix default/nil and wider
+arity/class/block semantics; qualify raw C99/VM array_chunk and raw slice plus
+compute.chunk; finish count/generator contracts and general paradigm composition.
+Eager quadratic windows, hard heap/preemption, import/file budgets, runtime
+cleanup/isolation, typed FFI/raw bypass, sandbox, package trust/artifact handoff/
+revocation/rollback, full product compatibility and physical-platform evidence
+remain open. PBLang 1.0.0 remains NOT READY.
+
+Final project build, PBLang-native relative lock publication and touched-file lint
+completed. Lint retains existing style warnings and inaccurate identical-operand
+advice on deliberately tested nonfinite guards. The final portable host fixture
+passes; the invalid-step CLI fixture exits 1 without its payload marker. Privacy
+scans and diff checks pass. Graphify stopped at its 20-second deadline (124),
+so graph freshness is not claimed. The isolated native-candidate directory was
+empty and removed; the active executable's hash, size and modification timestamp
+remain unchanged. No test/benchmark/build/Graphify process is retained.
