@@ -319,7 +319,7 @@ Arrays are 0-indexed, dynamically typed, reference semantics.
 - `range(n)` — [0, 1, ..., n-1]
 - `range(start, end)` — [start, ..., end-1]
 - `range(start, end, step)` — stepped range
-- `array_unique(arr)` — remove duplicates
+- `array_unique(arr)` — legacy raw duplicate removal; composite equality is not cycle/depth bounded on the retained host and differs in C99. Prefer the bounded scalar-key stdlib wrappers; see [Collection keys](COLLECTION_KEYS.md).
 - `array_zip(a, b)` — zip two arrays
 - `array_chunk(arr, n)` — split into chunks of size n
 - `array_flatten(arr)` — flatten one level

@@ -511,3 +511,14 @@ execution. See `FUNCTIONAL_ITERATE.md` and the comparative audit's matching ledg
 No Rust/compiler/VM change. Invalid count validation, lazy generation, once and
 unique/grouping remain separate. The separate local numeric benchmark batch is
 not a before/after performance measurement of this correctness fix.
+
+## Remediation update — 2026-09-08, typed scalar collection keys
+
+Baseline `addbb8a`. Fixed functional.unique mixed-scalar data loss and aligned
+array.unique/distinct_by with a shared bounded PBLang implementation. Added
+functional.unique_by and group_by_entries, preserving legacy string-map APIs.
+The new regression failed before implementation; twelve focused suites pass
+including actual bounded library import/execution. See `COLLECTION_KEYS.md`
+for scalar projection, limits, callback/reference rules and compatibility changes.
+Raw builtin composite equality, exact-number keys and C99 embedded-NUL behavior
+remain unresolved boundaries. No Rust/compiler/VM edits or 1.0.0 readiness claim.
