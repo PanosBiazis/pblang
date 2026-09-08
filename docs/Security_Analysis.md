@@ -53,6 +53,17 @@ reason and the explicit `--allow-high-security-suppressions` policy.
 
 ## Custom configuration
 
+The default `code.dynamic-eval` rule with needle `eval(` uses tokenizer
+identifiers rather than raw substring matching. Comments, string examples and
+longer names such as self_eval are inert; bare/member/optional-member eval calls
+are detected across whitespace and comments. Findings are attributed once to
+each callee's physical source line, including after multiline strings. This is
+conservative lexical call-shape detection (an eval declaration may also match),
+not complete alias/computed-call resolution. Malformed lexical input still blocks
+the mandatory pass. The same exact ID/needle pair inherits this behavior when
+severity/message is customized; different IDs or replacement needles remain
+literal rules. See `SELFHOST_LEXICAL_BUILD_PROGRESS_2026-09-08.md`.
+
 `--security-config=security-rules.json` accepts a bounded JSON object. Custom
 rules with an existing ID replace that rule; new IDs add rules. IDs listed in
 `disabled_rule_ids` remove rules. Invalid configuration fails closed.

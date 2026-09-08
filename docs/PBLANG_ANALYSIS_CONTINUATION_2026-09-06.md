@@ -584,3 +584,19 @@ explicitly unavailable in the existing bootstrap-refresh contract; PBCK snapshot
 and a return-42 probe cannot stand in for it. The comparative audit ledger records
 the parser/analysis blockers and remaining release work. No Rust source changed,
 no full suite ran, and 1.0.0 readiness is not claimed.
+
+## Remediation update — 2026-09-08, contextual names and lexical evidence
+
+PBLang now parses match.member, match?.member and match?[index] without confusing
+the contextual name with a pattern expression. Physical line/column positions
+after multiline strings are corrected; the default eval rule uses real identifier/
+call tokens while preserving custom-rule and mandatory-check boundaries.
+Sixteen focused suites pass, including actual PBLang VM and serialized execution,
+the whole linux_dirfs parse, malformed source and suppression-scope regressions.
+See `SELFHOST_LEXICAL_BUILD_PROGRESS_2026-09-08.md`.
+
+The native compiler refresh retry timed out after 40 seconds without a report or
+artifact. The active executable remains unchanged; full self-bootstrap is still
+pending. Parenthesized match/default semantics, cache confinement/analysis and
+the wider runtime/FFI/package/platform requirements remain open. No full suite or
+universal performance claim; raw comparison evidence is retained separately.

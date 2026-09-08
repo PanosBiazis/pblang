@@ -1647,3 +1647,33 @@ scans and diff checks pass. Graphify stopped at its 20-second deadline (124),
 so graph freshness is not claimed. The isolated native-candidate directory was
 empty and removed; the active executable's hash, size and modification timestamp
 remain unchanged. No test/benchmark/build/Graphify process is retained.
+
+## Remediation ledger — 2026-09-08, selfhost lexical build blockers
+
+Baseline `9274342`. Corrected three reproduced PBLang-owned defects: contextual
+match postfix access, physical line/column accounting after multiline strings,
+and the default dynamic-eval rule's raw comment/string substring false positives.
+Sixteen focused suites pass, including checked malformed-source rejection,
+plain/optimized/PBCS execution, whole-linux_dirfs parsing, source positions,
+security suppression/custom-policy/raw-builtin regressions and dependency tests.
+Independent defensive review found no concrete security regression. No Rust edits.
+
+See `SELFHOST_LEXICAL_BUILD_PROGRESS_2026-09-08.md` for exact implementation,
+compatibility and lexical-analysis boundaries. The prior linux_dirfs parser gap
+and optimizer-comment eval finding are addressed without changing those callers.
+The full native compiler build retry did not complete: 40-second timeout (124),
+no final report, no artifact, active executable unchanged. This is not a refreshed
+dependency-wide pass or proof that backend execution was reached. Module-cache
+taint classification/confinement and standalone CLI/runtime parity remain open.
+
+The reproducible parser control retained a slightly higher median after the
+change; no speedup claim. All nine separate numeric rows passed checksums, but
+PBLang's retained interpreter remains slower than Python/Node on that kernel.
+See `BENCHMARK_SESSION_2026-09-08_SELFHOST_LEXICAL.md`. No full suite ran.
+
+Still required for 1.0.0: complete self-bootstrap and build analysis, contextual/
+parenthesized match and general default/arity/class/block semantics, broader
+paradigm/compiler/LLVM/JIT qualification, import/file budgets, owner-scoped
+runtime cleanup/heap/preemption, typed FFI/raw bypass closure, hostile-code
+isolation, package trust/artifact delivery/revocation/rollback, product regression
+and physical-platform evidence. PBLang 1.0.0 remains NOT READY.
