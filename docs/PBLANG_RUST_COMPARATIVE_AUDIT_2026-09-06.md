@@ -1958,3 +1958,22 @@ max_findings/input-size admission, concurrent snapshots, compiler/C99 parity,
 self-bootstrap/executable refresh, runtime heap/time/ownership/cleanup, typed
 FFI/raw bypass/sandbox, package trust/artifact/revocation/rollback, whole-product
 compatibility and physical-platform verification. PBLang 1.0.0 remains NOT READY.
+
+## Selectable-analysis finite finding limits — 2026-09-08
+
+source_analysis now admits only finite integral ordinary-number max_findings
+values in 1..1024; omitted keys retain 256. Fractional limits retaining two rows
+and NaN throwing unstructured errors were reproduced against 2f299cc. A shared
+PBLang limits API now rejects these inputs with constant structured outcomes.
+pbanalyze applies the same guard before config/source I/O; explicit malformed
+limits no longer silently fall back. Valid defaults/category precedence and
+security blocking remain covered by focused tests. No Rust source or binary
+replacement. Evidence: BENCHMARK_SESSION_2026-09-08_ANALYSIS_LIMITS.md.
+
+Still open: direct project_audit malformed-limit admission, caller-supplied
+security_report trust/row ownership, whole-input/work bounds, category-filter/
+truncation semantics, source/config/namespace snapshots, compiler/paradigm/C99
+parity, self-bootstrap/executable refresh, VM resources/ownership/cleanup,
+typed FFI/raw bypass/sandbox, package authenticity/artifact handoff/revocation/
+rollback, whole-product compatibility and physical-platform verification.
+PBLang 1.0.0 remains NOT READY.

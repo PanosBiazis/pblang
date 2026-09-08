@@ -184,6 +184,28 @@ AVAILABLE is informational, not an analysis-registration API. The private array
 is not mutated by this implementation; no runtime deep-freeze or concurrent
 snapshot guarantee is claimed.
 
+Finding limits are admitted by `source_analysis.limits(options=nil)`. Missing
+options/key default to 256; an explicit value must be a finite integral ordinary
+number in 1..1024. Explicit nil, extended numeric types, NaN/infinity, fractions
+and out-of-range values return a constant value-free error. Successful outcomes
+are fresh maps containing only ok and max_findings. For example:
+
+```pblang
+let A=import("stdlib:source_analysis.sapp");
+let admitted=A.limits(map{max_findings:32});
+let report=A.analyze("let value=1;", "example.sapp", map{max_findings:32});
+```
+
+The direct analyzer preserves source/options and category error precedence,
+then validates before downstream work. The CLI's `--max-findings=1..1024`
+preflight occurs before config/source I/O, returns status 2 for malformed final
+values and preserves omitted=256 and last-option-wins. Integral syntax such as
+1.0 remains accepted. This intentionally replaces silent fallback to 256 and
+fractional caps with rejection; bad limits now precede config errors.
+Limits bound retained findings, not total analysis work or VM memory/time.
+Direct project_audit callers have separate admission limitations.
+See BENCHMARK_SESSION_2026-09-08_ANALYSIS_LIMITS.md for tests and measured costs.
+
 The optional caller-supplied security_report remains a trusted embedding input;
 its finding maps may be annotated by source_analysis. It is not an untrusted
 proof/admission interface. The current CLI creates this report itself.
