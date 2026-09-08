@@ -130,7 +130,21 @@ result semantics are explicit. General callable/paradigm coverage remains open.
 Inspection also found different existing exception behavior in `functional.once`
 (marks called before callback) and `pipe.once` (marks after success). Their
 failure/reentrancy contract needs a separate compatibility decision and tests;
-neither implementation was changed or qualified by this extrema slice.
+neither implementation was changed or qualified by this extrema slice. The later
+once-attempt slice below repairs functional.once and adds an explicit pipe API.
+
+## Once attempt lifecycle — 2026-09-08
+
+Baseline `d50f136`. Functional.once's failed-call-to-nil-success regression was
+reproduced and repaired with started/completed state in a shared PBLang helper.
+New pipe.once_attempt shares the contract; legacy pipe.once retains its different
+retry and reentry behavior. Tests cover sequential per-closure lifecycle, nil,
+first-input effects, callback errors, borrowed results, caught/uncaught reentry,
+malformed callbacks, legacy retries, actual frontend/module imports and helper
+serialization/optimization. `FUNCTIONAL_ONCE.md` documents compatibility and
+remaining limitations: no transactional rollback, concurrency/global exactly-once,
+cross-VM persistence or recovery after quota/process abort. Broader paradigm
+composition and migration of legacy retry callers remain separate.
 
 ## Sequence callback evaluation — 2026-09-08
 
