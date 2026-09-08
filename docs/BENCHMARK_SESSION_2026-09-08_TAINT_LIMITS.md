@@ -71,13 +71,14 @@ dimensionless units despite the existing *_ms statistic field names.
 
 ## Clock compatibility found during preflight
 
-stdlib/profiler.sapp uses time_monotonic_ms, but the current retained executable
-rejected that global in the new harness. This failed preflight produced no
-retained benchmark samples and is recorded. The measured harness uses existing
-now_ms, consistent with previous paired benchmarks; it is SystemTime-based, not
-monotonic. Nonpositive pairs reject; positive clock jumps, scheduler, GC and CPU
-frequency effects are not eliminated. No profiler/runtime change was made.
-A source-level API declaration is not evidence of executable availability.
+Correction after reading the complete profiler module: time_monotonic_ms was a
+private wrapper around now_ms, not a builtin or an unavailable profiler dependency.
+The benchmark's direct global call was invalid. This failed preflight produced
+no retained samples and remains recorded. The measured harness uses now_ms,
+consistent with previous pairs; it is SystemTime-based, not monotonic. Nonpositive
+pairs reject; positive clock jumps, scheduler, GC and CPU frequency effects are
+not eliminated. No profiler/runtime change was made in that slice. See PROFILER.md
+for the subsequent lifecycle fixes and honest clock capability disclosure.
 
 ## Separate numeric comparison
 
