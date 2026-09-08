@@ -1402,3 +1402,54 @@ Unrelated dirty work and local lock changes stay excluded from the commit.
 Graphify's final update stopped at its 20-second deadline (124), so graph
 freshness is not claimed. No owned test/benchmark/Graphify worker or benchmark
 temporary directory remained after validation.
+
+## Remediation ledger — 2026-09-08, once attempt lifecycle
+
+Baseline `d50f136`. Full functional/pipe modules and shared memoization, relevant
+callers, tests and exception contracts were reviewed. A valid regression failed
+before implementation: after an ordinary first exception, functional.once returned
+nil on the next call despite never completing successfully. An initial test fixture
+used an unsupported assignment target (call().field); a local binding repaired
+the fixture before reproducing the real lifecycle failure.
+
+The PBLang functional_once helper tracks started/completed state without catching
+the first error. Functional.once delegates; new pipe.once_attempt shares the
+explicit at-most-one-attempt behavior. Legacy pipe.once retains retry-on-failure
+and reentry semantics. Completed nil/false values and first-input behavior are
+preserved; later calls on an incomplete live closure throw a constant diagnostic.
+Caught nested reentry can still be followed by successful outer completion.
+Security review found no blocker in this sequential, per-instance scope.
+
+Thirteen targeted suites passed: once_attempt, selfhost_once_attempt,
+selfhost_once_roundtrip, pipe_stdlib, functional_combinators, memoize_identity,
+collection_keys, selfhost_collection_keys, functional_iterate,
+multi_paradigm_composition, portable_lock_current, manifest_validate and
+benchmark_enrich. Coverage includes nil/errors, references, invalid callbacks,
+bounded caught/uncaught reentry and legacy retries. Actual module import tests
+and standalone helper plain/optimized/serialized execution passed; plain and
+restored instruction counts match. Two uncaught fixtures exited with expected
+failure: original first sentinel preserved, later constant diagnostic without
+echoing the original private marker. No full suite ran.
+
+`FUNCTIONAL_ONCE.md` documents compatibility, the extra transitive module,
+callback side effects without rollback, cached shared references, lack of atomicity/
+thread-global/cross-VM persistence, and no quota/engine/process recovery or callback
+sandbox guarantee. The roundtrip fixture reads its trusted source file before the
+size assertion; it is not evidence of pre-allocation bounded file reading.
+
+Remaining: intentional legacy pipe.once migration and concurrency semantics;
+broader collection/exact-number/raw-builtin/C99 boundaries; general arity/class/
+default/block semantics and full paradigm composition; compiler/LLVM/JIT, import/
+file limits, runtime cleanup/isolation and hard heap/preemption, typed FFI/raw
+bypass closure, hostile-code sandbox, package trust/artifact delivery/revocation/
+rollback, reproducibility, broad compatibility and physical-platform verification.
+PBLang 1.0.0 remains NOT READY. No Rust/compiler/VM implementation was changed.
+
+Final build, repository-relative lock publication, lint (warnings retained),
+added-line/new-file privacy and diff checks passed. The pre-existing frontend
+diff is unchanged. `BENCHMARK_SESSION_2026-09-08_ONCE.md` retains all nine local
+numeric competitor rows, raw samples and build/time/RSS/artifact metrics. This
+unchanged workload does not measure once or establish general interpreter wins.
+Graphify stopped cleanly at its 20-second deadline (124), without a freshness
+claim. No owned test/benchmark/Graphify workers or benchmark temporary directory
+remained. Unrelated dirty work and local lock changes are excluded from the commit.

@@ -522,3 +522,14 @@ including actual bounded library import/execution. See `COLLECTION_KEYS.md`
 for scalar projection, limits, callback/reference rules and compatibility changes.
 Raw builtin composite equality, exact-number keys and C99 embedded-NUL behavior
 remain unresolved boundaries. No Rust/compiler/VM edits or 1.0.0 readiness claim.
+
+## Remediation update — 2026-09-08, once attempt lifecycle
+
+Baseline `d50f136`. Functional.once no longer turns an incomplete/failed attempt
+into a later nil success. Its shared PBLang helper also powers new pipe.once_attempt;
+legacy pipe.once retry semantics remain unchanged. Initial errors propagate;
+ordinary later/reentrant calls on the same incomplete closure are rejected.
+Tests cover exact lifecycle effects, actual bounded frontend/library imports,
+helper bytecode roundtrip and separate uncaught diagnostic fixtures. This is not
+thread/global exactly-once, rollback or quota/process-abort recovery. See
+`FUNCTIONAL_ONCE.md`; wider runtime/backend/platform work remains open.
