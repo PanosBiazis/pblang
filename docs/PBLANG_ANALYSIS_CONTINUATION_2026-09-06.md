@@ -600,3 +600,16 @@ artifact. The active executable remains unchanged; full self-bootstrap is still
 pending. Parenthesized match/default semantics, cache confinement/analysis and
 the wider runtime/FFI/package/platform requirements remain open. No full suite or
 universal performance claim; raw comparison evidence is retained separately.
+
+## Remediation update — 2026-09-08, taint completeness
+
+A capped finding list can no longer hide a later high finding behind earlier
+medium records and still approve a build. Numeric admission, direct lexical
+completeness, deduplication and AST/call/finding exhaustion are now validated.
+Dependency protect mode propagates analysis failures instead of treating them as
+zero blockers. Sixteen focused suites pass, including security CLI behavior.
+See `TAINT_COMPLETENESS.md` and the comparative audit ledger for exact boundaries.
+
+No full native bootstrap retry or executable replacement was performed. Direct
+tokenization bounds, cache/summaries, compiler/runtime/FFI/packages, broad product
+compatibility and physical-platform evidence remain open. No full suite ran.

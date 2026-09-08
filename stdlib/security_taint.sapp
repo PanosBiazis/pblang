@@ -234,11 +234,13 @@ fn _step(state) {
 }
 
 fn _finding(state, sink, spec, arg_index, flow, node, control_only) {
-    if len(state.findings) >= state.max_findings { state.truncated = true; return; }
     let identity = str(spec.class) + "\x00" + sink + "\x00" + str(arg_index)
         + "\x00" + str(_line(node)) + "\x00" + json_stringify(flow.sources)
         + "\x00" + str(control_only or flow.control);
     if map_has(state.finding_keys, identity) { return; }
+    // A duplicate already retained is not lost evidence. A new finding that
+    // cannot fit makes the final decision incomplete and blocking.
+    if len(state.findings) >= state.max_findings { state.truncated = true; return; }
     state.finding_keys[identity] = true;
     array_push(state.findings, map{
         format: "pblang.security-taint.finding.v1",
@@ -537,6 +539,36 @@ fn _stmt(node, env, state, control_flow) {
     return _clean();
 }
 
+fn _valid_limit(value, minimum, maximum) {
+    if type(value) != "number" { return false; }
+    if value != value or value - value != 0 { return false; }
+    return value >= minimum and value <= maximum and value == num_floor(value);
+}
+
+// Shared admission for direct and dependency-wide callers. Only omitted keys
+// select defaults; malformed explicit values must not silently change budgets.
+fn limits(options = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" {
+        return map{ ok: false, error: "taint limits require map options" };
+    }
+    let specs = [
+        map{ name: "max_taint_findings", minimum: 1, maximum: 2048, fallback: MAX_FINDINGS },
+        map{ name: "max_taint_steps", minimum: 100, maximum: 2000000, fallback: MAX_AST_STEPS },
+        map{ name: "max_call_expansions", minimum: 1, maximum: 200000, fallback: MAX_CALL_EXPANSIONS }
+    ];
+    let out = map{ ok: true };
+    for spec in specs {
+        let value = if map_has(options, spec.name) { options[spec.name] } else { spec.fallback };
+        if not _valid_limit(value, spec.minimum, spec.maximum) {
+            return map{ ok: false, error: spec.name + " must be a finite integer in "
+                + str(spec.minimum) + ".." + str(spec.maximum) };
+        }
+        out[spec.name] = value;
+    }
+    return out;
+}
+
 fn analyze(source, path = "[source]", options = nil) {
     if options == nil { options = map{}; }
     if type(source) != "string" or type(options) != "map" {
@@ -545,21 +577,31 @@ fn analyze(source, path = "[source]", options = nil) {
     }
     let config = _configuration(options);
     if not config.ok { return map{ ok: false, passed: false, format: FORMAT, error: config.error }; }
-    let max_findings = try options.max_taint_findings catch MAX_FINDINGS;
-    let max_steps = try options.max_taint_steps catch MAX_AST_STEPS;
-    let max_call_expansions = try options.max_call_expansions catch MAX_CALL_EXPANSIONS;
-    if type(max_findings) != "number" or max_findings < 1 or max_findings > 2048 { max_findings = MAX_FINDINGS; }
-    if type(max_steps) != "number" or max_steps < 100 or max_steps > 2000000 { max_steps = MAX_AST_STEPS; }
-    if type(max_call_expansions) != "number" or max_call_expansions < 1
-        or max_call_expansions > 200000 { max_call_expansions = MAX_CALL_EXPANSIONS; }
-    let parsed = try PARSER.parse(TOKENIZER.tokenize(source)) catch nil;
+    let bounded = limits(options);
+    if not bounded.ok { return map{ ok: false, passed: false, format: FORMAT, error: bounded.error }; }
+    let max_findings = bounded.max_taint_findings;
+    let max_steps = bounded.max_taint_steps;
+    let max_call_expansions = bounded.max_call_expansions;
+    let tokens = try TOKENIZER.tokenize(source) catch nil;
+    if type(tokens) != "array" {
+        return map{ ok: false, passed: false, format: FORMAT, path: path,
+            parser_complete: false, error: "tokenization failed during taint analysis", parser_errors: [] };
+    }
+    for token in tokens {
+        if (try token.unterminated catch false) == true {
+            return map{ ok: false, passed: false, format: FORMAT, path: path,
+                parser_complete: false, error: "unterminated source token",
+                parser_errors: ["unterminated source token at line " + str(token.line)] };
+        }
+    }
+    let parsed = try PARSER.parse(tokens) catch nil;
     if parsed == nil or type(try parsed.errors catch nil) != "array" {
         return map{ ok: false, passed: false, format: FORMAT, path: path,
-            error: "self-hosted parser failed during taint analysis", parser_errors: [] };
+            parser_complete: false, error: "self-hosted parser failed during taint analysis", parser_errors: [] };
     }
     if len(parsed.errors) > 0 {
         return map{ ok: false, passed: false, format: FORMAT, path: path,
-            error: "source is not semantically analyzable", parser_errors: parsed.errors };
+            parser_complete: false, error: "source is not semantically analyzable", parser_errors: parsed.errors };
     }
     let functions = map{}; let function_names = []; let fi = 0;
     while fi < len(parsed.stmts) {
@@ -618,7 +660,9 @@ fn analyze(source, path = "[source]", options = nil) {
     }
     if state.limit_exceeded { blocking = blocking + 1; }
     if state.call_limit_exceeded { blocking = blocking + 1; }
-    let interprocedural_complete = not state.call_limit_exceeded;
+    if state.truncated { blocking = blocking + 1; }
+    let interprocedural_complete = not state.call_limit_exceeded
+        and not state.limit_exceeded and not state.truncated;
     return map{ ok: true, passed: blocking == 0, format: FORMAT, path: path,
         findings: state.findings, finding_count: len(state.findings), blocking: blocking,
         ast_steps: state.steps, parser_complete: true,
@@ -633,4 +677,4 @@ fn analyze(source, path = "[source]", options = nil) {
         } else { "all-functions flow-sensitive interprocedural AST data/control flow with bounded call expansion" } };
 }
 
-export FORMAT, MAX_FINDINGS, MAX_AST_STEPS, MAX_CALL_EXPANSIONS, analyze;
+export FORMAT, MAX_FINDINGS, MAX_AST_STEPS, MAX_CALL_EXPANSIONS, limits, analyze;
