@@ -97,6 +97,12 @@ existing module and linked-output budgets; direct security_taint calls default
 to 1 MiB. Rejection occurs before tokenizer allocation. See
 `TAINT_COMPLETENESS.md` for UTF-8 boundaries and remaining memory/time limits.
 
+`max_taint_tokens` bounds tokenizer output for import discovery and taint analysis,
+including comments and EOF (default 65536; integer 1..1048576). Exhaustion discards
+partial tokens and rejects all dependency modes. The same budget applies to
+whole-program taint without automatic widening; it does not bound the linker's
+internal tokenization or replace source-byte/VM-memory limits.
+
 One rule can also be disabled for one invocation with
 `--disable-security-rule=RULE_ID`. Configuration is limited to 256 KiB, 128
 rules, 256-byte match strings and 512 findings per source.

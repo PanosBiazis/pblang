@@ -1733,3 +1733,35 @@ general compiler/paradigm compatibility, VM heap/preemption/ownership, typed
 FFI/raw bypass and sandbox, package trust/artifact/revocation/rollback, product
 regression and physical platforms. No executable refresh or Rust edits in this
 slice. PBLang 1.0.0 remains NOT READY.
+
+## Remediation ledger — 2026-09-08, bounded token production
+
+Baseline 8143c69. Added PBLang-owned tokenize_bounded without changing the legacy
+tokenize signature or array schema. Strict finite integer cap 1..1048576 includes
+comments and EOF; the guard reserves EOF before constructing each next token.
+Limit failure returns an empty token stream, never a partial success. TAINT uses
+max_taint_tokens (default 65536); dependency import discovery enforces the same
+validated cap and halts failed modules before pattern/taint/linker work. All modes
+reject incomplete graphs. Whole-program taint keeps the cap without widening.
+
+Twenty-one focused suites passed, including legacy token/position/Unicode parity,
+new token-boundary/privacy cases, existing expression-depth protection, source
+caps, dependency and CLI regressions. The bootstrap probe was extended and rerun:
+the PBLang-written VM itself runs the bounded tokenizer at exact and failing caps.
+This is not a full compiler bootstrap or executable refresh. No Rust changes.
+Independent defensive review found no blocking issue.
+
+Correction of an overly broad possible reading of prior residuals: parser
+expression-depth 256 and type-depth 64 guards already exist. This slice changes
+neither and does not claim comprehensive recursion/resource coverage.
+
+The small analyzer control rose from median 5.974 to 7.217 ms per ten analyses.
+No performance win is claimed; see BENCHMARK_SESSION_2026-09-08_TAINT_TOKEN_BOUNDS.md
+for raw timings and separate numeric comparisons.
+
+Remaining: per-token concatenation/character-array allocation costs, linker and
+other legacy tokenizer paths, comprehensive recursive-parser/AST resource
+qualification, flow summaries and cache confinement, full native self-bootstrap,
+compiler/paradigm compatibility, hard VM heap/preemption/ownership, FFI/raw bypass
+and sandbox, package authenticity/artifact/revocation/rollback, product regression
+and physical-platform evidence. PBLang 1.0.0 remains NOT READY.
