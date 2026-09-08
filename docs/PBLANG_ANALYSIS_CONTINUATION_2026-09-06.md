@@ -500,3 +500,14 @@ trails Python/Node on the existing integer kernel. Full raw evidence is in
 `BENCHMARK_SESSION_2026-09-08_VM_CALLS.md`. No Rust source change, full suite,
 universal-language benchmark or new physical-device qualification. Overall
 1.0.0 readiness remains NOT READY.
+
+## Remediation update — 2026-09-08, sequence successor evaluation
+
+Baseline `123991a`. Fixed `functional.iterate` computing one successor too many:
+nonnegative integer n now requires exactly max(n-1,0) callbacks. A failing
+pre-change singleton test establishes the regression; final tests cover callback
+effects, terminal values, failures and actual bounded PBLang frontend/library
+execution. See `FUNCTIONAL_ITERATE.md` and the comparative audit's matching ledger.
+No Rust/compiler/VM change. Invalid count validation, lazy generation, once and
+unique/grouping remain separate. The separate local numeric benchmark batch is
+not a before/after performance measurement of this correctness fix.

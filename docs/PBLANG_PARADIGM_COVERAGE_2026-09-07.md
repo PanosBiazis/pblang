@@ -118,6 +118,16 @@ Inspection also found different existing exception behavior in `functional.once`
 failure/reentrancy contract needs a separate compatibility decision and tests;
 neither implementation was changed or qualified by this extrema slice.
 
+## Sequence callback evaluation — 2026-09-08
+
+Baseline `123991a`. `functional.iterate` no longer computes the unused successor
+after its final element. For nonnegative integer counts it now invokes the callback
+exactly max(n-1,0) times, retaining existing seed/reference and required-exception
+semantics. The new singleton regression failed before the fix. Tests verify
+terminal values, callback effects and actual bounded frontend/library execution.
+See `FUNCTIONAL_ITERATE.md`. This does not add lazy evaluation, validate legacy
+count inputs, or resolve unique/grouping and once failure/reentrancy contracts.
+
 ## Explicit super owner — 2026-09-08
 
 Baseline `bcf223e`. `super_method`, `super_call`, `super1` and `super2` accept an

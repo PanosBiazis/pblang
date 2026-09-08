@@ -1298,3 +1298,45 @@ checks. The pre-existing frontend diff is unchanged. Graphify timed out cleanly
 at 20 seconds (124), so graph freshness is not claimed. No owned test/benchmark/
 Graphify worker or benchmark temporary directory remained. Unrelated dirty work
 and local lock changes are excluded from the commit.
+
+## Remediation ledger — 2026-09-08, sequence successor evaluation
+
+Baseline `123991a`. Complete `functional.sapp`, its shared memoization dependency,
+the related pipe module and discovered iterate callers/tests/contracts were
+reviewed. `iterate` evaluated an unused successor after the final emitted value,
+causing an extra callback, state mutation or exception. The singleton regression
+failed before implementation. The loop now checks whether another output value
+is needed before invoking the callback. No Rust, compiler, VM or public signature
+change. This is a correctness fix, not evidence of general interpreter speedup.
+
+`FUNCTIONAL_ITERATE.md` documents exact callback count/order, terminal values,
+borrowed-reference behavior and the side-effect compatibility correction. The
+new direct and actual-library bounded frontend/VM tests exercise success, nil,
+required exceptions, invalid callbacks, mutation, composition and larger counts.
+Legacy invalid/unbounded count behavior is not redesigned or newly qualified.
+The once failure/reentrancy compatibility decision remains separate.
+
+Remaining: unique/grouping and once contracts; general arity/class/default/block
+semantics and full paradigm composition; retained compiler/LLVM/JIT; import/file
+limits; runtime cleanup/isolation and hard heap/preemption; typed FFI/raw bypass
+closure and hostile-code sandbox; package trust/artifact delivery/revocation/
+rollback; reproducibility, broad product compatibility and physical-platform
+verification. PBLang 1.0.0 remains NOT READY.
+
+Twelve targeted suites passed: functional_iterate, selfhost_iterate,
+functional_combinators, functional_extrema, selfhost_extrema,
+functional_curry_args, pipe_stdlib, multi_paradigm_composition,
+selfhost_vm_small_calls, portable_lock_current, manifest_validate and
+benchmark_enrich. No full suite ran. Final build, relative-lock publication,
+lint (warnings retained), added-line/new-file privacy and diff checks passed.
+The pre-existing frontend diff remains unchanged; unrelated dirty files and
+local lock changes are excluded from this commit.
+
+`BENCHMARK_SESSION_2026-09-08_ITERATE.md` records nine sequential local numeric
+competitor rows with checksums, raw samples, build/time/RSS/artifact metrics and
+measurement limits. The initial batch's retrieved transcript was truncated; the
+complete batch was repeated, not cherry-picked. This is neither a performance
+measurement of iterate nor proof of all-language/platform/polyglot superiority.
+Graphify stopped cleanly at its 20-second deadline (124), without an updated
+graph claim. No owned test/benchmark/Graphify worker or benchmark temporary
+directory remained.
