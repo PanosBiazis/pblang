@@ -105,6 +105,37 @@ all modes, malformed entry source, missing entry and unresolved-import markers.
 Linux syscall observation is recorded separately from semantic assertions in
 BENCHMARK_SESSION_2026-09-08_TAINT_POLICY_PREFLIGHT.md.
 
+### Local repeated-class validation reuse
+
+Within each custom-sink traversal, the analyzer retains only the last class
+string that passed the existing text validator. An ordinary string equal to
+that value need not repeat UTF-8 conversion and the byte/control scan. The
+ordinary-string type guard precedes equality, so containers cannot invoke
+comparison hooks. A nil sentinel is never a valid class; the first class and
+every different class receive the full validator. Keys, schemas, severities,
+argument indexes and control_flow are checked for every rule, even on a match.
+
+This adds one local validated string reference, at most 256 UTF-8 bytes, not a
+map of policies or a cross-call cache. It neither mutates nor exposes caller or
+default containers. Replacing a class between calls triggers fresh validation;
+all module/linked passes still revalidate. Concurrent host mutation of policy
+containers remains outside the snapshot guarantees, as before.
+
+Repeated labels can benefit; distinct labels still require all old work plus
+the comparison. The paired benchmark includes 128 distinct 256-byte labels with
+a 253-byte common prefix, as well as repeated labels and complete analyses.
+See BENCHMARK_SESSION_2026-09-08_TAINT_CLASS_REUSE.md for measured costs.
+
+Backend boundary: retained VM strings and the PBLang-written VM preserve exact
+string content equality. The bounded self-host test checks equality/NUL suffix/
+Unicode/reassignment primitives, NOT the complete analyzer on that VM. The
+generic C99 runtime's strcmp equality and strlen-based len/str_to_bytes have a
+pre-existing embedded-NUL truncation gap: both the original and optimized text
+predicate see only the prefix. This optimization does not establish C99 analyzer
+safety or fix that gap. The separate PBLang-owned minimal pointer/numeric C
+transpiler is not qualified to run the full dynamic analyzer. No C/Rust runtime
+source or language string semantics were changed in this slice.
+
 ## Fixed-field limit validation
 
 The five static budgets are now resolved and checked directly, in the unchanged

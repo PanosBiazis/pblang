@@ -743,3 +743,29 @@ compiler/paradigm compatibility, hard runtime heap/time and ownership, typed
 FFI/raw bypass/sandbox, package trust/artifact/revocation/rollback, broad product
 regression and physical-platform verification. No Rust change or full suite.
 PBLang 1.0.0 remains NOT READY.
+
+## Local taint-class reuse update — 2026-09-08
+
+A single validated class string is now reused only within one sink-validation
+traversal. Keys, spec shapes, severities, indexes and flags still validate every
+time; no cross-call or mutable-rule cache exists. Sixteen targeted suites passed,
+including a bounded PBLang-written VM string equality/reassignment probe.
+Independent security review found no new blocking issue.
+
+Two paired series show 61–62% lower complete direct and 61–68% lower dependency
+time for repeated maximum-size class policies. Distinct classes and small cases
+do not share this improvement; unfavorable small-case results are retained.
+The earlier default-analyzer regression remains OPEN. See TAINT_COMPLETENESS.md
+and BENCHMARK_SESSION_2026-09-08_TAINT_CLASS_REUSE.md for samples and boundaries.
+
+Review also identifies the pre-existing generic C99 strcmp/strlen embedded-NUL
+parity gap; both old and new predicates truncate there. This is not a new
+optimization bypass, but remains unqualified backend behavior requiring repair.
+The minimal PBLang-owned C backend is not full-dynamic-analyzer qualified.
+
+Remaining: CLI entry pre-read/pattern admission, concurrent policy snapshots,
+general/distinct-policy performance, C99 full-string parity, native bootstrap/
+executable refresh, compiler/paradigm compatibility, hard runtime resources and
+ownership, typed FFI/raw bypass/sandbox, package authenticity/artifact handoff/
+revocation/rollback, broad product compatibility and physical platforms.
+No Rust/C runtime edits or full suite. PBLang 1.0.0 remains NOT READY.
