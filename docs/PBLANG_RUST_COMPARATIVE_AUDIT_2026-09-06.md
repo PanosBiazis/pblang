@@ -1996,3 +1996,23 @@ float reasoning; self-bootstrap/executable refresh; VM resource/ownership/
 cleanup guarantees; typed FFI/raw bypass/sandbox; package authenticity/artifact
 handoff/revocation/rollback; broad product compatibility and physical platforms.
 PBLang 1.0.0 remains NOT READY.
+
+## Audit pre-I/O finding admission and report preservation — 2026-09-08
+
+A reproduced invalid-limit CLI request removed its prior synthetic report before
+failing. pbaudit now validates its final --max-findings before roots, output
+removal or checkpoint operations. audit_roots preflights before collection, and
+audit_modules returns its existing structured error for malformed per-file
+finding limits before inventory. All reuse the PBLang require_finding_limit
+validator with a fixed internal default. Defaults and success schemas are
+preserved; module engine v6 requires a fresh audit for old v5 checkpoints, leaving
+rejected checkpoint files intact. No Rust source or binary replacement.
+Evidence: BENCHMARK_SESSION_2026-09-08_AUDIT_PREFLIGHT.md.
+
+Still open: other numeric CLI/module/snapshot/aggregate admission, generic gate
+validation, suppressed-row and whole-work budgets, broader publication/path-
+collision review, snapshots, trusted report ownership, compiler/paradigm/C99
+parity and linter float reasoning, native self-bootstrap/executable refresh,
+VM resource/ownership/cleanup guarantees, typed FFI/raw bypass/sandbox, publisher
+trust/artifact handoff/revocation/rollback, whole-product regression and physical
+platform qualification. PBLang 1.0.0 remains NOT READY.
