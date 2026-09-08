@@ -169,3 +169,14 @@ See `CLASS_SUPER_OWNER.md`: predeclare a class binding before referencing it
 inside its initializer's methods. This explicit selector does not infer lexical
 ownership, prove ancestry or fix old omitted-owner calls automatically. Native
 class syntax/defaults/types and broader paradigm composition remain open.
+
+## Stable ordering with explicit compatibility — 2026-09-08
+
+New functional.stable_sort_by composes comparator functions with opaque payloads
+and stable ordering, without replacing legacy sort_by callback traces. Tested
+equal-key map records retain order and object references; negative/malformed
+returns, callback exceptions and actual bounded frontend/VM execution are covered.
+`FUNCTIONAL_SORT.md` specifies finite numeric results and a consistent total
+preorder. Purity, key immutability and callback termination are caller obligations,
+not enforced type/effect-system properties. This additive library API does not
+complete every functional/OOP combination or establish cross-platform parity.
