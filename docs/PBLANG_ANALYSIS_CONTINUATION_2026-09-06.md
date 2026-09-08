@@ -719,3 +719,27 @@ and executable refresh, compiler/paradigm compatibility, hard runtime heap/time
 and ownership, typed FFI/raw bypass/sandbox, package trust/artifact/revocation/
 rollback, broad product regression and physical-platform verification.
 PBLang 1.0.0 remains NOT READY; no Rust change or full suite in this slice.
+
+
+## Dependency policy preflight update — 2026-09-08
+
+The library pre-I/O deep-taint-policy admission gap is now closed: outcome-only
+validate_policy runs after numeric limits and before target path/source/import
+work. Fourteen focused suites passed; Linux syscall tracing confirms zero target
+marker accesses after the fix, versus one attempted entry access on baseline.
+Independent security review found no blocker. No reusable approval token or
+mutable-policy cache was introduced; later module and linked passes revalidate.
+Valid reports, numeric precedence and dependency nil-as-unset remain unchanged.
+
+The added work is measured, not hidden: small-case paired ratios approximately
+1.011–1.015; maximum custom-policy ratios 1.464/1.485 (46–49% more time).
+This is a correctness/ordering fix, not a speedup. The maximum-policy validation
+cost and earlier analyzer regression remain OPEN. See TAINT_COMPLETENESS.md and
+BENCHMARK_SESSION_2026-09-08_TAINT_POLICY_PREFLIGHT.md for raw evidence and scope.
+
+Remaining: CLI entry pre-read/pattern-policy admission, concurrent policy
+snapshots, analyzer performance, native self-bootstrap/executable refresh,
+compiler/paradigm compatibility, hard runtime heap/time and ownership, typed
+FFI/raw bypass/sandbox, package trust/artifact/revocation/rollback, broad product
+regression and physical-platform verification. No Rust change or full suite.
+PBLang 1.0.0 remains NOT READY.
