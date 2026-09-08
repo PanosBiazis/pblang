@@ -1707,3 +1707,29 @@ self-bootstrap, general grammar/default/arity/class/block and paradigm coverage,
 runtime heap/preemption/ownership, typed FFI/sandbox, package trust/artifact/
 revocation/rollback and full product/physical-platform qualification.
 PBLang 1.0.0 remains NOT READY.
+
+## Remediation ledger — 2026-09-08, taint source admission
+
+Baseline 56d41d3. Direct taint analysis now enforces a UTF-8 source byte cap before
+the tokenizer builds its character array. Default 1 MiB, configurable finite
+integer 1..128 MiB. Scalar-count rejection and a four-byte-per-scalar fast path
+avoid an unbounded measurement conversion; exact conversion is reserved for the
+boundary region. The size failure is constant and omits source/path. This fixes
+the missing direct source admission, not a proved hard heap or time guarantee.
+
+Dependency module and aggregate linked budgets retain their existing defaults.
+Explicit nested/top-level source caps remain effective through linking, including
+legacy nil normalization. Fifteen targeted suites passed: new UTF-8 and two-module
+source-bound coverage plus taint, dependency, lexical, manifest/lock and CLI
+regressions. Defensive review found no blocking defect. No full suite ran.
+
+The identical small analyzer control rose from median 5.758 to 6.174 ms per ten
+analyses; no speedup claim. See BENCHMARK_SESSION_2026-09-08_TAINT_SOURCE_BOUNDS.md
+for retained raw samples, separate competitor rows and qualification limits.
+
+Still required: tokenizer token/per-token growth and parser nesting limits,
+nested-flow/summary soundness, cache confinement, full native self-bootstrap,
+general compiler/paradigm compatibility, VM heap/preemption/ownership, typed
+FFI/raw bypass and sandbox, package trust/artifact/revocation/rollback, product
+regression and physical platforms. No executable refresh or Rust edits in this
+slice. PBLang 1.0.0 remains NOT READY.
