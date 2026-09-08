@@ -29,6 +29,48 @@ in protect/strict/audit modes. Its existing option resolver treats nil as unset;
 this legacy normalization happens before the shared validator. Other taint
 policy shapes are still checked by analyze during traversal, not by limits.
 
+## Custom policy admission and private defaults
+
+Malformed nested policy formerly could produce a successful admission: a sink
+severity of HIGH retained a finding but did not increment the high-only blocking
+count, and omitted args silently became an empty list. Fractional argument indexes
+were also accepted. These are malformed-policy failures, not evidence that source
+text alone can rewrite an operator-owned policy.
+
+Custom taint_sources/taint_sanitizers/taint_sinks are now validated before direct
+analysis reaches numeric/source/token admission. Constant errors do not echo
+the supplied policy or path. The existing top-level field errors remain.
+
+| Consumed field | Contract |
+| --- | --- |
+| sources / sanitizers | Arrays, at most 128 nonempty names |
+| names / sink keys / class | Strings, at most 256 UTF-8 bytes; no ASCII C0 or DEL |
+| sinks | Map with at most 128 entries, counted before allocating its key list |
+| each sink | Map requiring severity, class and args |
+| severity | Exactly high, medium or low |
+| args | Array of at most 32 ordinary finite integer indexes in 0..255 |
+| control_flow | Optional exact bool; omission retains false |
+
+Scalar length is checked before UTF-8 conversion, limiting that temporary byte
+array to at most 1024 bytes. Empty replacement arrays/maps, explicitly empty
+args, duplicate indexes and low severity remain intentional operator choices.
+Explicit nil is malformed in direct calls; dependency option resolution retains
+its existing nil-as-unset behavior. Unknown unused sink fields remain ignored.
+Previously accepted malformed/oversized policy now rejects intentionally.
+
+The unchanged built-in defaults are constructed once per imported module and
+kept private/read-only. Callers cannot retrieve this table through module exports
+or reports. No reader mutates it; custom branches do not overwrite it. This is
+an ownership property of this implementation, not a new runtime-enforced deep
+immutability guarantee. Caller policy containers are not cloned or protected
+against concurrent mutation; snapshot/thread guarantees remain separate work.
+
+The new configuration test covers malformed unused rules, exact caps, UTF-8 and
+control input, input preservation, private/non-contaminating defaults, error
+precedence and all three dependency modes. Dependencies still perform bounded
+module work before their per-module taint pass validates deep policy; pre-I/O
+policy validation remains open. See BENCHMARK_SESSION_2026-09-08_TAINT_CONFIGURATION.md.
+
 ## Fixed-field limit validation
 
 The five static budgets are now resolved and checked directly, in the unchanged

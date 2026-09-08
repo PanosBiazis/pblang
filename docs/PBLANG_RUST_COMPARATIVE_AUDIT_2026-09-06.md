@@ -1834,3 +1834,29 @@ compiler/paradigm compatibility, runtime ownership/hard heap/preemption, typed
 FFI/raw bypass/sandbox, publisher artifact/trust/revocation/rollback, broad product
 compatibility and physical-platform verification. No full suite or Rust edits.
 PBLang 1.0.0 remains NOT READY.
+
+
+## Taint configuration update — 2026-09-08
+
+Nested malformed policy no longer silently disables sources/sinks or turns a
+bad severity into successful admission. Custom names, sink schemas and argument
+indexes now receive bounded, value-free validation. Intentional empty/low policies
+remain supported. The unchanged defaults are built once, private and read-only;
+custom inputs and returned findings cannot contaminate subsequent default runs.
+
+The maximum custom-policy boundary additionally costs 0.993 -> 42.103 ms per
+five empty-source analyses (paired ratio 41.9143) because deep validation now
+runs. This unfavorable cost is retained explicitly, not hidden by default gains.
+
+Fifteen targeted suites and independent defensive review pass. Full-analyzer
+paired median ratios 0.9151/0.9294 show approximately 7–8.5% less elapsed time on
+the fixed default-policy fixture. This does not establish complete recovery of
+the earlier 5.97 -> 7.22 ms regression or universal application performance.
+See TAINT_COMPLETENESS.md and BENCHMARK_SESSION_2026-09-08_TAINT_CONFIGURATION.md.
+
+Remaining: pre-I/O deep-policy admission in dependency analysis, concurrent policy
+snapshot guarantees, remaining analyzer cost/old regression, native self-bootstrap
+and executable refresh, compiler/paradigm compatibility, hard runtime heap/time
+and ownership, typed FFI/raw bypass/sandbox, package trust/artifact/revocation/
+rollback, broad product regression and physical-platform verification.
+PBLang 1.0.0 remains NOT READY; no Rust change or full suite in this slice.
