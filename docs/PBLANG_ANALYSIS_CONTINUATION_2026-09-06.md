@@ -533,3 +533,16 @@ Tests cover exact lifecycle effects, actual bounded frontend/library imports,
 helper bytecode roundtrip and separate uncaught diagnostic fixtures. This is not
 thread/global exactly-once, rollback or quota/process-abort recovery. See
 `FUNCTIONAL_ONCE.md`; wider runtime/backend/platform work remains open.
+
+## Remediation update — 2026-09-08, opt-in stable sorting
+
+Baseline `b7f760f`. New functional.stable_sort_by uses a bounded-item bottom-up
+merge algorithm in PBLang, while legacy comparator call sequences remain intact.
+Fourteen focused suites pass, including exhaustive short arrays, stable equal
+keys, error/type/boundary cases and actual PBLang frontend/VM plus bytecode
+roundtrip. A separate diagnostic fixture confirms constant errors do not echo
+the invalid returned payload. See `FUNCTIONAL_SORT.md` for trusted comparator,
+shallow references, finite result rules, lazy invocation and per-host limits.
+The local A/B report retains original and post-change controls, not just the best
+sample. Migration, general backend/device qualification and all wider 1.0.0
+runtime/compiler/package blockers remain open.

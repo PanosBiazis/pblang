@@ -1453,3 +1453,61 @@ unchanged workload does not measure once or establish general interpreter wins.
 Graphify stopped cleanly at its 20-second deadline (124), without a freshness
 claim. No owned test/benchmark/Graphify workers or benchmark temporary directory
 remained. Unrelated dirty work and local lock changes are excluded from the commit.
+
+## Remediation ledger — 2026-09-08, opt-in stable sorting
+
+Baseline `b7f760f`. Reviewed complete functional module, relevant callers/tests,
+benchmark helper and prior contracts. Added PBLang-only functional_sort and
+functional.stable_sort_by: bottom-up stable merge sorting with at most 4,096
+elements, two fixed shallow arrays, no recursion and finite numeric comparator
+results. Legacy sort_by/sort_asc/sort_desc are unchanged, including callback trace.
+The initial new-API test failed because the export did not yet exist; this is an
+additive feature, not a claim of a pre-existing sort correctness regression.
+
+Fourteen targeted suites passed: functional_stable_sort,
+functional_stable_sort_bounds, selfhost_stable_sort, stdlib_undefined_names_fix,
+functional_combinators, functional_extrema, functional_iterate, once_attempt,
+memoize_identity, collection_keys, multi_paradigm_composition,
+portable_lock_current, manifest_validate and benchmark_enrich. Tests cover empty/
+singleton, odd lengths, duplicates/stability, all 243 five-element ternary arrays,
+borrowed payloads, source mutation through callbacks, failure propagation,
+4,096/4,097 boundaries and comparison counts, malformed/nonfinite/exact-number
+comparator results including subtraction overflow, and legacy comparison trace.
+Actual library import through the PBLang frontend/VM and helper plain/optimized/
+serialized execution pass, including equal plain/restored instruction counts.
+An uncaught negative fixture exits 1 with the constant comparator diagnostic,
+without echoing its private payload marker. No full suite ran.
+
+Independent defensive review found no blocker in this trusted-callback scope.
+`FUNCTIONAL_SORT.md` explains the extra transitive import, lazy comparator
+validation for fewer than two items, consistent total preorder, shared mutable
+payloads, persistent callback effects, and stricter per-host collection limits.
+Algorithmic work/slot bounds are not callback containment, total-memory bounds,
+snapshot isolation, rollback, C99/device parity or a hostile-code sandbox.
+
+`BENCHMARK_SESSION_2026-09-08_STABLE_SORT.md` retains six pre-change legacy cells,
+six post-change legacy controls and six new-API cells with identical fixtures,
+warmups, five raw samples, first timings, median/p95 and comparison counts.
+At 1,024 items, stable-sort medians were 4.856–6.832 ms versus the original
+130.140–260.180 ms; this is retained-host local sort evidence only. The separate
+nine-row numeric competitor batch passed exact checksums and records time/build/
+RSS/artifact metrics. It does not invoke the sorter or establish interpreter wins.
+
+Remaining: deliberate migration of legacy sort/pipe.once callers, comparator
+purity/concurrency semantics and broader collection/exact-number/raw-builtin/C99
+boundaries; general arity/class/default/block semantics and full paradigm
+composition; compiler/LLVM/JIT, import/file limits, runtime cleanup/isolation and
+hard heap/preemption, typed FFI/raw bypass closure, hostile-code sandbox, package
+trust/artifact delivery/revocation/rollback, reproducibility, broad product
+compatibility and physical-platform verification. PBLang 1.0.0 remains NOT READY.
+No Rust/compiler/VM implementation changed.
+
+Final build and repository-relative lock publication passed. Lint completed with
+warnings, including misleading identical-operand warnings on intentional NaN/
+infinity guards; those guards remain and the nonfinite cases pass. Initial tests
+hit the stale dependency hash after the source addition; refreshing the local
+lock resolved it before validation. Added-line/new-file privacy and diff checks
+pass. The final Graphify update stopped at its 20-second deadline (124), so graph
+freshness is not claimed. No owned test/benchmark/Graphify worker or benchmark
+temporary directory remained. Only the fourteen slice files are staged;
+pre-existing dirty work and the local lock remain excluded.
