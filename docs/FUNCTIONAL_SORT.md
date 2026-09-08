@@ -52,7 +52,7 @@ physical-device or 1.0.0 readiness. This is not a hostile-code sandbox.
 
 `bench/functional_sort_compare.sapp` compares unchanged legacy and opt-in APIs
 using the same sorted/reversed/duplicate numeric arrays, exact reference results,
-input-preservation checks, one cold run, two warmups and five samples. Run with
+input-preservation checks, one first run (no cache flush), two warmups and five samples. Run with
 `PB_SORT_MODE=legacy` or `PB_SORT_MODE=stable` under an external process limit.
 Comparator counting is a separate untimed execution. The local report retains
 baseline and post-change data; it is not evidence of universal speed superiority.

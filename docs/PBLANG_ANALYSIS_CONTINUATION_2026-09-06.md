@@ -546,3 +546,18 @@ shallow references, finite result rules, lazy invocation and per-host limits.
 The local A/B report retains original and post-change controls, not just the best
 sample. Migration, general backend/device qualification and all wider 1.0.0
 runtime/compiler/package blockers remain open.
+
+## Remediation update — 2026-09-08, functional window sizes
+
+Baseline `9e2e930`. A regression reproduced silent acceptance of fractional
+functional.chunk size. Chunk/windows now validate array input and finite ordinary
+integer size before iteration, including empty input. Chunk rejects nonpositive
+size; windows retains its legacy nonpositive-integer empty result. Correct
+positive integer output/order and shallow reference semantics are unchanged.
+Fourteen focused suites pass, including actual PBLang-written frontend/VM imports,
+90 small length/size combinations, invalid values and structural/payload aliasing.
+An uncaught malformed-size fixture returns a constant diagnostic without echoing
+its payload marker. See `FUNCTIONAL_WINDOWING.md` for the documented compatibility
+tightening and remaining eager output growth. Related array/compute/raw builtins
+and repeat/iterate count validation remain separate; this is not hard heap/time
+enforcement or whole-platform qualification.
