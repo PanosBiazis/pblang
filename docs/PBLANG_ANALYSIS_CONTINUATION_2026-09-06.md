@@ -613,3 +613,14 @@ See `TAINT_COMPLETENESS.md` and the comparative audit ledger for exact boundarie
 No full native bootstrap retry or executable replacement was performed. Direct
 tokenization bounds, cache/summaries, compiler/runtime/FFI/packages, broad product
 compatibility and physical-platform evidence remain open. No full suite ran.
+
+## Remediation update — 2026-09-08, direct source admission
+
+Direct taint source-byte admission is now implemented before tokenizer allocation,
+with exact UTF-8 boundaries and a small-input fast path. Dependency analysis keeps
+module/linked defaults distinct and never widens an explicit taint source cap.
+Fifteen focused suites passed, including an actual two-module linked regression;
+see TAINT_COMPLETENESS.md and the latest comparative ledger. Token growth,
+parser nesting, hard VM limits, cache/summaries and broader 1.0.0 qualification
+remain open. The executable was not refreshed. Measurements are retained in
+BENCHMARK_SESSION_2026-09-08_TAINT_SOURCE_BOUNDS.md; no speedup is claimed.

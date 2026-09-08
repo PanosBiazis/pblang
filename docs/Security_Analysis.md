@@ -90,6 +90,13 @@ forwarded to dependency-wide semantic analysis. A configured local sanitizer
 terminates taint only on its return value; its body is still analyzed with
 tainted arguments, so it cannot hide a security-sensitive side effect.
 
+`max_taint_source_bytes` optionally caps each taint input, including linked
+whole-program input (finite integer, 1..134217728 bytes). Explicit values are not
+widened during linking. Without an override, dependency analysis retains its
+existing module and linked-output budgets; direct security_taint calls default
+to 1 MiB. Rejection occurs before tokenizer allocation. See
+`TAINT_COMPLETENESS.md` for UTF-8 boundaries and remaining memory/time limits.
+
 One rule can also be disabled for one invocation with
 `--disable-security-rule=RULE_ID`. Configuration is limited to 256 KiB, 128
 rules, 256-byte match strings and 512 findings per source.
