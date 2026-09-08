@@ -216,3 +216,21 @@ VM execution and bytecode roundtrips agree in focused tests. Missing bindings an
 malformed postfixes still reject. Parenthesized subjects remain an explicitly
 tested unsupported ambiguity, not a completed general grammar/paradigm guarantee.
 See `SELFHOST_LEXICAL_BUILD_PROGRESS_2026-09-08.md`.
+
+## CLI security policy admission update — 2026-09-08
+
+PBLang-owned pattern and dependency policy preflight now reject malformed
+configuration before entry reads in pbsecure and security-selected pbanalyze.
+The dependency library also rejects malformed pattern policy before traversal,
+with an invalid report rather than a completed finding report. Scope-specific
+nil resolution, command-line rule overrides and existing report publication
+protections are retained. Validation outcomes expose no reusable policy handles;
+normal analysis still revalidates. No Rust source or executable rebuild.
+
+Evidence and costs: BENCHMARK_SESSION_2026-09-08_SECURITY_CLI_PREFLIGHT.md.
+Remaining: concurrent policy snapshots, pbanalyze bounded pre-allocation reads
+and snapshot verification, general analyzer performance, C99 embedded-NUL parity,
+native self-bootstrap/executable refresh, compiler/paradigm compatibility,
+VM ownership/hard heap/preemption, typed FFI/raw bypass/hostile-code sandbox,
+publisher trust/artifact handoff/revocation/rollback, broad product regression
+and physical-platform qualification. PBLang 1.0.0 remains NOT READY.

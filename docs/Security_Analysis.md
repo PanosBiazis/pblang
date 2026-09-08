@@ -118,6 +118,31 @@ pblang run tools/pbsecure.sapp --allow-all -- app.sapp --mode=strict --config=se
 Use `--project-root=DIR` for an entry outside the current project root.
 `--entry-only` is the explicit bounded compatibility mode.
 
+Both tools now reject malformed effective security policy with status 2 before
+reading entry source. Configuration loading and CLI overrides happen first.
+Dependency mode checks dependency limits, mode, taint limits, taint schema and
+pattern schema; entry-only checks only the pattern policy it actually uses.
+In pbanalyze this preflight runs only when security/all is selected, so an unused
+deep-invalid security policy does not prevent performance-only analysis.
+
+`security_analysis.validate_policy(options=nil)` reuses the analyzer's pattern
+configuration validator; `security_dependency_analysis.validate_policy(options=nil)`
+validates the resolved combined policy. Success is a fresh `{ok:true}` outcome,
+not a source approval or a reusable validation capability. Errors contain constant
+diagnostics (pattern failures also contain configuration_errors), not policy values.
+Dependency nested nil-as-unset and nested-over-top-level precedence remain intact;
+direct pattern calls reject explicit nil fields. Analyzers still validate again.
+Malformed non-array disabled_rule_ids is no longer silently repaired by pbsecure;
+dependency-mode nil still accepts CLI rule additions. Invalid pattern policy is
+now a configuration failure, not a completed dependency report with findings.
+
+Early pbsecure config rejections retain configuration snapshot verification;
+they do not claim that any source snapshot was obtained. Existing exclusive
+report publication and input-collision guards remain active. This does not provide
+atomic policy snapshots, universal path-free reports or hard runtime resource
+limits. pbanalyze's ordinary source read and missing snapshot verification remain
+separate limitations. See BENCHMARK_SESSION_2026-09-08_SECURITY_CLI_PREFLIGHT.md.
+
 The opt-in `pbanalyze` tool composes selected analyses without adding them to
 the default build hot path:
 
