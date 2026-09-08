@@ -180,3 +180,14 @@ returns, callback exceptions and actual bounded frontend/VM execution are covere
 preorder. Purity, key immutability and callback termination are caller obligations,
 not enforced type/effect-system properties. This additive library API does not
 complete every functional/OOP combination or establish cross-platform parity.
+
+## Chunk/window shape validation — 2026-09-08
+
+Functional.chunk/windows reject non-array inputs and nonfinite/fractional or
+non-number sizes before iteration. Chunk requires positive size; windows retains
+the nonpositive-integer empty sentinel. Tests cover every length 0..8 with sizes
+1..10, exact order/shape, partial chunks/full windows, sum pipelines and borrowed
+object payloads, plus actual bounded PBLang frontend/VM execution. These checks
+correct invalid-input semantics, not enforce deep immutability, lazy sequences,
+total output budgets or general composition across every paradigm/backend.
+See `FUNCTIONAL_WINDOWING.md`; other size/step/count APIs remain unqualified.

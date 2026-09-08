@@ -1511,3 +1511,71 @@ pass. The final Graphify update stopped at its 20-second deadline (124), so grap
 freshness is not claimed. No owned test/benchmark/Graphify worker or benchmark
 temporary directory remained. Only the fourteen slice files are staged;
 pre-existing dirty work and the local lock remain excluded.
+
+## Remediation ledger — 2026-09-08, functional window size validation
+
+Baseline `9e2e930`. Reviewed the complete functional module, callers and targeted
+contracts/tests. A regression reproduced fractional chunk size being accepted
+instead of rejected. Added a private PBLang guard for array input and ordinary
+finite integer size, before iteration even when input is empty. Chunk rejects
+nonpositive size; windows preserves the finite nonpositive-integer empty sentinel.
+Valid positive integer algorithms/results remain unchanged. Documentation names
+the intentional invalid-input compatibility tightening, including accidental
+string input and chunk zero/negative sizes. No imports or Rust/compiler/runtime
+implementation changed.
+
+Fourteen targeted suites passed: functional_windowing, selfhost_windowing,
+functional_combinators, functional_iterate, selfhost_iterate,
+functional_stable_sort, selfhost_stable_sort, array_map_functional, once_attempt,
+memoize_identity, multi_paradigm_composition, portable_lock_current,
+manifest_validate and benchmark_enrich. New coverage includes 90 length/size
+combinations with every slot checked, partial chunks/full windows, invalid
+empty/nonempty inputs, finite huge sizes, exact-number variants, NaN/infinities,
+shallow structural independence, borrowed payloads and sum pipelines. Actual
+PBLang frontend/VM imports also reject NaN and both infinities. The uncaught
+invalid-size fixture exits 1 with a constant error and no private marker echo.
+No full suite ran.
+
+Independent defensive review approved the narrow guard implementation. This is
+input-shape validation, not a total resource limit: windows still eagerly
+allocates `(n-size+1)*size` payload slots and can amplify hostile input. The
+`FUNCTIONAL_WINDOWING.md` contract explicitly requires caller budgeting, with no
+hard heap, preemption, snapshot or sandbox claim.
+
+Related findings from that static review remain unresolved, not fixed by this
+functional-only change (unsafe malformed native cases were not executed):
+
+- High-priority C99 boundary: raw `array_chunk` converts nonfinite/out-of-range
+  double sizes to `size_t` in `crates/pblang-ctranspiler/src/pblang_rt.h:1041-1053`.
+  C conversion can have undefined behavior and a resulting zero increment could
+  prevent progress. This is static risk, not a reproduced exploit.
+- `array.windows` checks positivity only; fractional/nonfinite size/step handling
+  remains inconsistent (`stdlib/array.sapp:263-273`).
+- `compute.chunk` clamps only values below one; fractional/nonfinite sizes can
+  misalign work used by run_chunked (`stdlib/compute.sapp:501-529`).
+- Retained raw VM array_chunk truncates floats/accepts infinity; its boundary is
+  separate (`crates/pblang-vm/src/vm/arrays.rs:220-237`).
+
+Remaining release work also includes generator/count contracts, legacy API
+migration, broader collection/exact-number semantics, general arity/class/default/
+block semantics and paradigm composition, compiler/LLVM/JIT, import/file budgets,
+runtime cleanup/isolation and hard heap/preemption, typed FFI/raw bypass closure,
+hostile-code sandbox, package trust/artifact delivery/revocation/rollback,
+reproducible builds, full product compatibility and physical-platform checks.
+PBLang 1.0.0 remains NOT READY.
+
+The nine unchanged numeric competitor rows passed exact checksums and retain
+first values, raw samples, median/p95 and CPU/RSS/build/artifact metrics in
+`BENCHMARK_SESSION_2026-09-08_WINDOWING.md`. They do not invoke chunk/windows and
+do not establish a guard speedup or universal interpreter win. The prior sort
+contract's wording now correctly says first run, not flushed-cache cold run.
+
+Final build and repository-relative lock publication passed. The initial stale
+dependency hash after the source change was refreshed before testing. Lint
+completed with warnings, including inaccurate identical-operand advice on the
+deliberate nonfinite guards; passing NaN/infinity tests justify retaining them.
+Added-line/new-file privacy and staged/unstaged diff checks passed. The final
+Graphify update reached its 20-second deadline (124), without a freshness claim.
+No owned test/benchmark/Graphify workers or benchmark temporary directories
+remained. Only the eleven slice files are staged; unrelated dirty work and the
+local lock remain excluded.
