@@ -1977,3 +1977,22 @@ parity, self-bootstrap/executable refresh, VM resources/ownership/cleanup,
 typed FFI/raw bypass/sandbox, package authenticity/artifact handoff/revocation/
 rollback, whole-product compatibility and physical-platform verification.
 PBLang 1.0.0 remains NOT READY.
+
+## Direct project-audit finding-limit admission — 2026-09-08
+
+Both project_audit text and record entry points now reject malformed finding
+budgets before conversion/traversal, using a fixed catchable exception rather
+than a success-shaped empty report. Finite integral ordinary numbers 1..4096
+are accepted; legacy nil defaults 200/500 are retained. scan_text, project audits
+and readiness wrappers propagate rejection, preventing accidental clean gates.
+Only PBLang production source changed. Evidence, cost and compatibility:
+BENCHMARK_SESSION_2026-09-08_PROJECT_AUDIT_LIMITS.md.
+
+Remaining: suppressed arrays and whole-input/record/work budgets; audit CLI
+parser fallback and filesystem-bridge pre-I/O/module-option admission; generic
+quality/progress gate input/threshold validation and truncation; snapshots;
+trusted security_report ownership; compiler/paradigm/C99 parity and linter
+float reasoning; self-bootstrap/executable refresh; VM resource/ownership/
+cleanup guarantees; typed FFI/raw bypass/sandbox; package authenticity/artifact
+handoff/revocation/rollback; broad product compatibility and physical platforms.
+PBLang 1.0.0 remains NOT READY.
