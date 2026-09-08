@@ -222,8 +222,22 @@ let rows=audit.scan_text("example.sapp", "let value=1;", 32);
 ```
 
 This bound does not cover suppressed rows, input size or total work/heap/time.
-The filesystem bridge can collect before this check; no pre-I/O admission is
-claimed for audit_roots or the audit CLIs. See
+The narrow public `project_audit.require_finding_limit(value=nil)` returns an
+admitted scalar (nil/omitted means 500) or throws the same fixed limit error.
+It exposes no caller-controlled fallback or reusable authorization capability.
+audit_roots now uses it before collection, preserving missing=200 and nil=500.
+audit_modules rejects malformed max_findings_per_file, including nil, before
+inventory and returns its existing invalid-module-bounds error; omission is 256.
+
+pbaudit rejects malformed final --max-findings values with a value-free status-2
+diagnostic before audited-root/report/checkpoint effects. The old output remains
+untouched for these rejected requests, including resume. Default 160, numeric
+1.0 and last-option-wins are preserved. Other numeric CLI options and module
+bounds are not fully admitted by this finding-only fix. Startup/import I/O is
+not eliminated. Module engine v6 rejects unmodified v5 checkpoints on resume;
+start a fresh audit rather than treating the old checkpoint as current.
+See BENCHMARK_SESSION_2026-09-08_AUDIT_PREFLIGHT.md for compatibility and evidence.
+For the underlying direct-call contract, see
 BENCHMARK_SESSION_2026-09-08_PROJECT_AUDIT_LIMITS.md for compatibility and evidence.
 See BENCHMARK_SESSION_2026-09-08_ANALYSIS_LIMITS.md for tests and measured costs.
 
