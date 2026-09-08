@@ -1801,8 +1801,10 @@ Paired measurements support approximately 50–54% lower isolated limits time;
 full-analyzer median ratios 1.0061 and 0.9913 do NOT prove repeatable end-to-end
 improvement. The earlier 5.97 → 7.22 ms regression remains OPEN. Isolated lexer,
 parser and complete-analyzer timings are recorded separately, not added together.
-The profiler's time_monotonic_ms is unavailable in the retained executable;
-source/runtime clock capability parity remains a follow-up, not silently fixed.
+Correction after full profiler-module review: time_monotonic_ms was a private
+wrapper around now_ms, not an unavailable profiler dependency. The direct global
+call in the benchmark was invalid. Monotonic timing remains unimplemented; see
+PROFILER.md for the corrected clock contract and subsequent lifecycle fixes.
 
 Remaining: analyzer-wide performance, string/character-array allocation costs,
 full native self-bootstrap and executable refresh, compiler/paradigm compatibility,
@@ -1810,3 +1812,25 @@ runtime ownership and hard heap/preemption, typed FFI/raw bypass and sandbox,
 package trust/artifact handoff/revocation/rollback, broad product regression and
 physical-platform verification. Existing bounds and earlier fixes remain credited.
 No Rust edit or full suite. PBLang 1.0.0 remains NOT READY.
+
+
+## Profiler correctness update — 2026-09-08
+
+Full-module review corrected the earlier missing-clock assertion: the private
+helper existed and wrapped the non-monotonic now_ms. No replacement builtin was
+needed. Implemented honest clock_info, deterministic zero benchmarks, strict
+finite count/callback admission, streaming aggregates, coherent section end times,
+missing-key zero semantics, nested/disabled trace correctness and pair-consistent
+memory evidence. Existing resources.snapshot/diff remains the allocation API.
+
+Eleven focused suites pass, including live boundary/malformed/lifecycle/resource
+checks. Independent security reviews found no blocker. Final paired diagnostic
+ratios approximately 0.740 benchmark / 0.779 trace improve profiler overhead only;
+the analyzer regression remains OPEN. See PROFILER.md and its benchmark report.
+
+Remaining: monotonic clocks and bounded/thread-isolated profiling state, callback
+execution limits, analyzer performance, native self-bootstrap/executable refresh,
+compiler/paradigm compatibility, runtime ownership/hard heap/preemption, typed
+FFI/raw bypass/sandbox, publisher artifact/trust/revocation/rollback, broad product
+compatibility and physical-platform verification. No full suite or Rust edits.
+PBLang 1.0.0 remains NOT READY.
