@@ -203,7 +203,28 @@ values and preserves omitted=256 and last-option-wins. Integral syntax such as
 1.0 remains accepted. This intentionally replaces silent fallback to 256 and
 fractional caps with rejection; bad limits now precede config errors.
 Limits bound retained findings, not total analysis work or VM memory/time.
-Direct project_audit callers have separate admission limitations.
+Direct project_audit calls admit finite integral ordinary-number limits in
+1..4096. Invalid values throw the constant error
+`project audit max_findings must be a finite integer in 1..4096` before text
+conversion or record traversal; scan_text and audit/readiness wrappers propagate
+it. Do not catch this error and substitute an empty/clean audit. Successful
+report schemas have no new ok field. Omitted or explicit nil preserves the
+legacy text default 200 / record default 500; source_analysis retains its
+separate stricter explicit-nil convention. Previously accepted fractions,
+non-finite/extended numeric values, values below one and values above 4096
+are deliberately rejected. The maximum matches existing module per-file limits.
+
+For example, a bounded direct call remains:
+
+```pblang
+let audit=import("stdlib:project_audit.sapp");
+let rows=audit.scan_text("example.sapp", "let value=1;", 32);
+```
+
+This bound does not cover suppressed rows, input size or total work/heap/time.
+The filesystem bridge can collect before this check; no pre-I/O admission is
+claimed for audit_roots or the audit CLIs. See
+BENCHMARK_SESSION_2026-09-08_PROJECT_AUDIT_LIMITS.md for compatibility and evidence.
 See BENCHMARK_SESSION_2026-09-08_ANALYSIS_LIMITS.md for tests and measured costs.
 
 The optional caller-supplied security_report remains a trusted embedding input;
