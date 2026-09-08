@@ -624,3 +624,14 @@ see TAINT_COMPLETENESS.md and the latest comparative ledger. Token growth,
 parser nesting, hard VM limits, cache/summaries and broader 1.0.0 qualification
 remain open. The executable was not refreshed. Measurements are retained in
 BENCHMARK_SESSION_2026-09-08_TAINT_SOURCE_BOUNDS.md; no speedup is claimed.
+
+## Remediation update — 2026-09-08, bounded token production
+
+Token production now has an opt-in EOF-inclusive cap, enforced by taint analysis
+and dependency import discovery. Failure returns no partial token stream; the
+legacy tokenizer contract is preserved. Twenty-one focused suites passed, and
+the extended bootstrap probe verifies the bounded tokenizer inside the PBLang VM.
+See TAINT_COMPLETENESS.md and the latest comparative ledger. Existing expression
+and type depth guards are credited explicitly; broader recursive/resource
+qualification remains open. No full suite, native executable refresh or Rust
+change. The analyzer microbenchmark has a higher median; no speedup claim.

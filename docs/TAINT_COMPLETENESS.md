@@ -15,6 +15,7 @@ containing no high-severity entries.
 | max_taint_steps | 200000 | 100..2000000 |
 | max_call_expansions | 20000 | 1..200000 |
 | max_taint_source_bytes | 1048576 | 1..134217728 |
+| max_taint_tokens | 65536 | 1..1048576 |
 
 Direct calls use defaults for omitted keys. Explicit nil, bool, strings, exact
 number variants, containers, functions, fractional/nonfinite or out-of-range
@@ -68,6 +69,48 @@ remained. No full suite or executable replacement was performed.
 
 ## Lexical and finding completeness
 
+`compiler/tokenizer.tokenize_bounded(source, max_tokens, identifier_spans=false)`
+is an opt-in bounded API. Its result always contains ok, tokens, token_count,
+limit_exceeded and error. The token cap includes comments and EOF. A cap of one
+accepts empty/whitespace input only. Invalid inputs/limits reject with a constant
+error and limit_exceeded=false; exhaustion returns limit_exceeded=true. Both
+failures expose tokens=[] and token_count=0, never a truncated success stream.
+The guard runs after skipping whitespace but before constructing the next token
+or its text, reserving one slot for EOF. Ordinary tokenize retains its previous
+signature and array-returning behavior and does not opt into this cap.
+
+Taint analysis now uses this API with max_taint_tokens (default 65536, including
+EOF; finite integer 1..1048576). Dependency import enumeration uses the same
+validated cap and stops the failed module before pattern/taint passes or linking.
+Protect, strict and audit all reject the incomplete graph. The same cap is kept
+for linked whole-program taint, including when implicit: it is not automatically
+scaled with module count. Larger trusted projects may set a larger finite cap.
+This is intentional admission tightening, not a grammar or token-schema change.
+
+The source-byte check remains essential. The character array is created before
+token counting; whitespace and a single long token can still consume work
+proportional to admitted source, and token text uses repeated concatenation.
+The source inliner's internal tokenizer is still byte-bounded, not covered by
+the new aggregate taint token cap before linking. Other legacy tokenizer callers
+are unchanged. No VM-wide heap/time bound follows from this feature.
+
+Existing parser expression-depth (256) and type-depth (64) guards are already
+implemented; generic prior references to parser nesting as remaining work must
+not be read as absence of these guards. The targeted expression-depth regression
+passes. Comprehensive coverage of recursive paths and resource costs is still
+separate work; no parser implementation was changed in this slice.
+
+Token-admission validation: 21 targeted suites passed. The extended bootstrap
+probe additionally passed the bounded tokenizer inside the PBLang-written VM,
+including exact-cap success and overflow without partial tokens. Final build,
+portable-lock publication, touched-file lint, privacy and diff checks passed.
+Lint reports deliberate nonfinite-number comparisons, boolean style and test
+binding warnings. Graphify reached its 20-second deadline without completion;
+no graph-freshness claim is made. No owned workers remained, and unrelated dirty
+work was preserved. No full suite, Rust change or executable replacement ran.
+See BENCHMARK_SESSION_2026-09-08_TAINT_TOKEN_BOUNDS.md for the higher analyzer median
+and nine separate numeric rows; no performance improvement is claimed.
+
 Tokenization runs once; failure or an unterminated string/comment rejects before
 parsing, with parser_complete=false and a constant lexical diagnostic. Existing
 general parser diagnostics may still contain source token text; this is not a
@@ -115,8 +158,8 @@ separate work.
 
 These are analysis-budget and completeness fixes, not VM-wide hard heap or
 wall-clock enforcement. Direct analyze now has a pre-tokenization source-byte
-ceiling; a separate token ceiling remains absent. Dependency callers provide
-module/aggregate source limits.
+ceiling and an EOF-inclusive token ceiling. Dependency callers provide
+module/aggregate source limits, with token admission at imports and final taint.
 Nested flow structures, recursive summaries, full language/alias/effect coverage,
 cache confinement, same-object cleanup and complete compiler bootstrap remain
 unqualified. No full native compiler rebuild was retried in this slice and the
