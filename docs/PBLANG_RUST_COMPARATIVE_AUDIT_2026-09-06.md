@@ -2034,3 +2034,26 @@ live suite defaults to four child runs, with exhaustive pure checks and explicit
 field-level integration groups to avoid an oversized default test matrix.
 Evidence and remaining work: BENCHMARK_SESSION_2026-09-08_AUDIT_CLI_NUMERIC.md.
 No Rust source or executable replacement. PBLang 1.0.0 remains NOT READY.
+
+## Exact audit gate policy — 2026-09-08
+
+Quality/progress/comparison gates now reject malformed numeric and boolean
+options before direct report traversal. release_readiness validates its finding
+budget first, then snapshots gate policy before scanning. Nil/inherited defaults,
+explicit boolean choices, detached thresholds and valid checkpoint semantics
+are preserved. Runtime evidence confirmed infinity ceilings and numeric-zero
+flags were accepted; NaN instead raised a generic error, not a clean pass.
+
+Fourteen targeted suites passed. Paired gate measurements removed the initial
+default-policy regression; explicit validation retains measured microsecond
+overhead. Nine separate numeric comparisons passed their checksum, but the
+interpreter remains slower than Python/JavaScript on that workload. Evidence:
+BENCHMARK_SESSION_2026-09-08_AUDIT_GATE_POLICY.md. No Rust source or binary refresh.
+
+Remaining: gate report/counter integrity, comparison work/truncation and earlier
+filesystem-wrapper policy admission; other direct module/snapshot/aggregate
+options and whole-work budgets; source/namespace snapshots; compiler/paradigm/
+C99 parity including documented catch-variable/runtime mismatch; linter float
+reasoning; self-bootstrap/executable refresh; VM resources/ownership/cleanup;
+typed FFI/raw bypass/sandbox; publisher trust/artifact handoff/revocation/rollback;
+whole-product compatibility and physical platforms. PBLang 1.0.0 is NOT READY.
