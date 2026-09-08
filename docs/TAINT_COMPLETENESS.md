@@ -89,7 +89,10 @@ This is intentional admission tightening, not a grammar or token-schema change.
 
 The source-byte check remains essential. The character array is created before
 token counting; whitespace and a single long token can still consume work
-proportional to admitted source, and token text uses repeated concatenation.
+proportional to admitted source. String literals still use repeated decoded
+concatenation; identifiers, non-radix numbers and comments now join consumed scalar
+spans once (see TOKENIZER_LEXEME_CONSTRUCTION.md). Temporary slices and output
+strings still have token-sized memory costs; no hard heap improvement is claimed.
 The source inliner's internal tokenizer is still byte-bounded, not covered by
 the new aggregate taint token cap before linking. Other legacy tokenizer callers
 are unchanged. No VM-wide heap/time bound follows from this feature.

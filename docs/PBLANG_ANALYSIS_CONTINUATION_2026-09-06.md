@@ -635,3 +635,14 @@ See TAINT_COMPLETENESS.md and the latest comparative ledger. Existing expression
 and type depth guards are credited explicitly; broader recursive/resource
 qualification remains open. No full suite, native executable refresh or Rust
 change. The analyzer microbenchmark has a higher median; no speedup claim.
+
+## Remediation update — 2026-09-08, token text construction
+
+Identifiers, non-radix numbers and comments now join their consumed scalar span
+once, with a one-character fast path. Twenty-two focused suites passed, including
+independent token goldens and the extended PBLang VM bootstrap probe. No safety
+budget was relaxed. Long-token paired measurements improve, while the overall
+analyzer regression remains OPEN (not hidden by favorable component timings).
+See TOKENIZER_LEXEME_CONSTRUCTION.md and the session benchmark report. String
+literals, peak allocation, hard runtime limits and the broader 1.0.0 blockers
+remain unresolved; the executable was not refreshed.

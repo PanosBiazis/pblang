@@ -1678,6 +1678,28 @@ runtime cleanup/heap/preemption, typed FFI/raw bypass closure, hostile-code
 isolation, package trust/artifact delivery/revocation/rollback, product regression
 and physical-platform evidence. PBLang 1.0.0 remains NOT READY.
 
+## Remediation ledger — 2026-09-08, tokenizer lexeme construction
+
+Baseline 072ff3e. Identifiers, decimal/non-radix lexemes and line/block comments
+join consumed scalar-array spans once; one-scalar numbers/identifiers reuse the
+character. String escape decoding, radix normalization, positions, source/token
+budgets and EOF accounting are unchanged. Independent golden and self-hosted VM
+tests cover the boundaries. Twenty-two targeted suites passed; no Rust edit,
+full suite or native executable refresh.
+
+The user's regression concern is retained as OPEN, not dismissed. Final paired
+runs show long-token reductions but a median candidate/reference taint ratio of
+1.0173 and 1.0064; the small-program ratios cross 1.0 between runs. This does not
+establish recovery of the earlier analyzer slowdown. All exploratory, initial
+and final samples are retained in BENCHMARK_SESSION_2026-09-08_TOKENIZER_LEXEMES.md.
+No general throughput, lower-peak-memory or universal benchmark win is claimed.
+
+Remaining: analyzer performance regression investigation, long string handling,
+character-array and temporary-slice costs, legacy/linker admission, comprehensive
+runtime resource enforcement, flow/cache soundness, self-bootstrap, compiler and
+paradigm compatibility, FFI/sandbox, package trust/artifact/revocation/rollback,
+product regression and physical-platform qualification. 1.0.0 remains NOT READY.
+
 ## Remediation ledger — 2026-09-08, taint admission and completeness
 
 Baseline `ec42869`. Reproduced and fixed a security admission failure: a medium
