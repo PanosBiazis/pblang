@@ -2016,3 +2016,21 @@ parity and linter float reasoning, native self-bootstrap/executable refresh,
 VM resource/ownership/cleanup guarantees, typed FFI/raw bypass/sandbox, publisher
 trust/artifact handoff/revocation/rollback, whole-product regression and physical
 platform qualification. PBLang 1.0.0 remains NOT READY.
+
+## Audit CLI numeric preflight and startup cost — 2026-09-08
+
+Closed the remaining pbaudit numeric parser fallback and pre-I/O admission gaps.
+Malformed final values now reject before report/checkpoint/root effects; an
+owned baseline reproduction confirmed prior report overwrite with max-files=0.
+The pure project_audit.pbaudit_numeric_error helper preserves mode-specific
+ceilings, defaults and last-option-wins. Valid engine-v6 checkpoint identities
+are unchanged. Broad direct-library option admission is still separate work.
+
+The initial separate-helper import measured +3.8% paired CLI overhead and was
+replaced with reuse of the already-imported project_audit module. Final paired
+ordinary measurements were approximately -0.4% and -1.7%, module mode +0.03%;
+all raw samples are retained without claiming general acceleration. The new
+live suite defaults to four child runs, with exhaustive pure checks and explicit
+field-level integration groups to avoid an oversized default test matrix.
+Evidence and remaining work: BENCHMARK_SESSION_2026-09-08_AUDIT_CLI_NUMERIC.md.
+No Rust source or executable replacement. PBLang 1.0.0 remains NOT READY.

@@ -232,9 +232,32 @@ inventory and returns its existing invalid-module-bounds error; omission is 256.
 pbaudit rejects malformed final --max-findings values with a value-free status-2
 diagnostic before audited-root/report/checkpoint effects. The old output remains
 untouched for these rejected requests, including resume. Default 160, numeric
-1.0 and last-option-wins are preserved. Other numeric CLI options and module
-bounds are not fully admitted by this finding-only fix. Startup/import I/O is
-not eliminated. Module engine v6 rejects unmodified v5 checkpoints on resume;
+1.0 and last-option-wins are preserved. The remaining numeric CLI options now
+use the pure `project_audit.pbaudit_numeric_error` rule before root normalization,
+report removal or checkpoint reads. Malformed final values no longer silently
+fall back; all require finite integral ordinary numbers. Defaults remain unchanged:
+
+| CLI option | Ordinary audit | Module audit |
+| --- | --- | --- |
+| max-depth | 0..32 | 0..32 |
+| max-entries | 1..50000 | 1..50000 |
+| max-children | 1..4096 | 1..4096 |
+| max-files | 1..10000 | 1..100000 |
+| max-file-bytes | 1000..1048576 | 1000..16777216 |
+| max-runtime-ms | 10..300000 | 10..300000 |
+| backlog-limit, lines | 1..9007199254740991 | 1..9007199254740991 |
+
+The display options retain large exact integer requests: their loops also stop
+at the bounded findings/module arrays, not at an allocated array of that size.
+Zero/negative display values previously fell back or behaved inconsistently;
+they now reject, as do fractions, non-finite values and unsafe integers.
+Mode-specific limits follow the final mode flag, regardless of argument order.
+The existing max-findings diagnostic retains first precedence. Invalid numeric
+requests preserve old reports byte-for-byte, including --resume. Valid CLI
+checkpoint identities and engine v6 remain unchanged by this numeric-only fix.
+Direct module/snapshot/aggregate APIs still need broader option validation;
+CLI admission is not a hard VM memory/time guarantee or a sandbox.
+Startup/import I/O is not eliminated. Module engine v6 rejects unmodified v5 checkpoints on resume;
 start a fresh audit rather than treating the old checkpoint as current.
 See BENCHMARK_SESSION_2026-09-08_AUDIT_PREFLIGHT.md for compatibility and evidence.
 For the underlying direct-call contract, see
@@ -299,7 +322,7 @@ pblang run tools/pbaudit.sapp --allow-all -- \
   --project=AAP --module-by-module --resume \
   --json-output=docs/AAP_MODULE_AUDIT.json \
   --exclude=products/pblang/docs/PBLANG_MODULE_AUDIT_2026-08-09.json \
-  --max-depth=32 --max-entries=50000 --max-children=10000 \
+  --max-depth=32 --max-entries=50000 --max-children=4096 \
   --max-files=100000 --max-file-bytes=1048576 --max-runtime-ms=300000 \
   ../../archive ../../docs ../../library ../../products ../../projects ../../training
 ```
