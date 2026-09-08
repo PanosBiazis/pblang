@@ -269,6 +269,46 @@ its finding maps may be annotated by source_analysis. It is not an untrusted
 proof/admission interface. The current CLI creates this report itself.
 See BENCHMARK_SESSION_2026-09-08_ANALYSIS_SELECTION.md for regressions and costs.
 
+## Exact project-audit gate policy
+
+`quality_gate`, `compare_reports` and `progress_gate` accept a map or nil.
+Missing/nil fields retain legacy defaults; unrelated keys remain supported for
+shared options maps. The following ceilings require ordinary-number finite
+integers in 0..9007199254740991:
+
+| Gate | Numeric fields | Defaults |
+| --- | --- | --- |
+| quality | max_high, max_medium, max_total | 0, 5, 50 |
+| quality | max_source_high, max_source_medium, max_source_total | corresponding resolved overall ceiling |
+| comparison/progress | max_new_total, max_new_high, max_new_medium | 0, 0, 0 |
+
+Quality flags `source_only_blockers` (false), `allow_roadmap` (true) and comparison
+flags `block_new_security`, `block_new_reliability`, `block_new_performance` (true)
+require exact booleans. Nil preserves the stated default. Explicit false remains
+an intentional policy choice; numeric zero is not a substitute.
+
+Invalid policy throws one of these fixed messages, without embedding its value:
+
+- `project audit gate options must be a map or nil`
+- `project audit gate numeric limits must be finite integers in 0..9007199254740991`
+- `project audit gate flags must be booleans`
+
+Do not convert these exceptions to empty/clean reports. Thresholds are resolved
+before direct report inspection. `release_readiness` validates max_findings
+first (preserving its diagnostic precedence), then snapshots quality policy
+before scanning records. Returned thresholds do not alias the input options;
+default maps are fresh on each call. Successful schemas and valid-policy
+semantics remain unchanged; malformed policies deliberately no longer work.
+
+This validates policy, not report authenticity, consistency of counters with
+rows, completeness/truncation or total comparison work. Reports are still
+trusted caller inputs. The filesystem/module wrappers in project_text_audit
+currently reach the quality gate after their own collection/aggregation:
+universal pre-I/O gate-policy admission is not claimed. The private resolved
+helper is not an authorization capability. Valid engine-v6 checkpoint semantics
+are unchanged. Tests, corrected runtime evidence and measured costs:
+`BENCHMARK_SESSION_2026-09-08_AUDIT_GATE_POLICY.md`.
+
 ## Module-by-module repository audit
 
 The previous global audit stopped traversing when its shared file/finding cap
