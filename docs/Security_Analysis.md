@@ -171,6 +171,24 @@ Available categories are `security`, `quality`, `performance`, `completeness`
 and `roadmap`. The same security JSON config controls added, replaced and
 disabled security rules.
 
+Category names, including `all`, are case-insensitive: `ALL,performance`
+selects all five categories in canonical order and retains security results.
+Without all, recognized names keep first-requested order and duplicates are
+removed. Unknown names are ignored in mixed requests; unknown-only selection
+still fails. Existing empty/non-array library selections default to security.
+
+The source_analysis module keeps a private canonical catalog. Public AVAILABLE,
+report.available and report.analyses are detached arrays; editing a prior result
+or the public compatibility catalog cannot change later category admission.
+AVAILABLE is informational, not an analysis-registration API. The private array
+is not mutated by this implementation; no runtime deep-freeze or concurrent
+snapshot guarantee is claimed.
+
+The optional caller-supplied security_report remains a trusted embedding input;
+its finding maps may be annotated by source_analysis. It is not an untrusted
+proof/admission interface. The current CLI creates this report itself.
+See BENCHMARK_SESSION_2026-09-08_ANALYSIS_SELECTION.md for regressions and costs.
+
 ## Module-by-module repository audit
 
 The previous global audit stopped traversing when its shared file/finding cap

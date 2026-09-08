@@ -1943,3 +1943,18 @@ consistency, hard VM heap/time and cleanup enforcement, typed FFI/raw bypass and
 hostile-code sandbox, publisher trust/artifact handoff/revocation/rollback,
 compiler/C99 parity, native executable refresh, whole-product regression and
 physical-platform verification. This does not certify 1.0.0 readiness.
+
+## Analysis selection isolation — 2026-09-08
+
+Fixed two reproduced source_analysis selection failures: mixed-case ALL now
+selects the same canonical categories as all, and caller edits to exported or
+returned category arrays no longer change subsequent security selection.
+Valid defaults, unknown handling and first-requested/deduplicated ordering are
+retained. This closes a selectable-analysis issue, not a bypass of every build
+security gate. Evidence: BENCHMARK_SESSION_2026-09-08_ANALYSIS_SELECTION.md.
+
+Still open: trusted caller-supplied security_report and row annotation ownership,
+max_findings/input-size admission, concurrent snapshots, compiler/C99 parity,
+self-bootstrap/executable refresh, runtime heap/time/ownership/cleanup, typed
+FFI/raw bypass/sandbox, package trust/artifact/revocation/rollback, whole-product
+compatibility and physical-platform verification. PBLang 1.0.0 remains NOT READY.
