@@ -19,7 +19,7 @@ inventory with explicitly partial inspection, not whole-module certification.
 | Model | Concrete implementation | Evidence and limits in this slice |
 | --- | --- | --- |
 | Imperative / procedural / structured | Functions, mutable bindings, branches and loops in `compiler/parser.sapp`, `codegen.sapp`, `vm.sapp` | Focused count/range/for-in, scope, try and closure tests pass on plain/optimized PBLang VM paths; not every control-transfer/backend path. |
-| Functional | `functional.sapp`: map/filter/folds, compose/pipe, partial/curry, memoization, declarative combinators | Selected combinator and composition tests pass. These are eager array operations, not proof of universal lazy evaluation or enforced purity. Positional curry now rejects arities outside 0–4; `curry_args` adds explicit vector-callback collection for 0–256 values, not general positional spread. Memoization identity is repaired below; stringified unique/grouping semantics still need separate tests. |
+| Functional | `functional.sapp`: map/filter/folds, compose/pipe, partial/curry, memoization, declarative combinators | Selected combinator and composition tests pass. These are eager array operations, not proof of universal lazy evaluation or enforced purity. Positional curry rejects arities outside 0–4; `curry_args` collects 0–256 vector-callback values, not general positional spread. Memoization and bounded scalar unique/projection semantics are checked below; legacy string-map grouping and arbitrary structural/exact-number keys remain distinct limitations. |
 | Object-oriented | `class.sapp`: single inheritance, overrides, super helpers, mixins, statics, bound methods and operator bridges | `oop_complete` and mixed-library tests pass. `call`/`call1..4` and `bind0..2` are finite adapters, not arbitrary arity. Single-parent extension is not multiple inheritance; mixins merge methods with later values winning. Explicit-owner super calls now have four-level inheritance tests; legacy omitted-owner dispatch still needs migration for inheritable overrides. |
 | Class syntax | `compiler/parser.sapp::parse_class` builds a class table and constructor | Separate from the class library API. Selected source review shows method type/default syntax is parsed but discarded by this lowering; comment documents no `__call`/new0..new3 parity. Full constructor/method/default/type equivalence remains open. |
 | Generic / parametric / structural | `generics.sapp`: composable type predicates, typed lists/maps/boxes/options, interface-predicate bridge | `generics` and composition tests pass for runtime checks, negative mapper results and preserved input. This library is runtime-parametric, not evidence of static higher-kinded/dependent-type support or all native generic syntax. |
@@ -102,6 +102,20 @@ imports the actual functional library and exercises both conventions.
 See `FUNCTIONAL_CURRY.md` for limits and migration. General positional
 apply/spread, callback signature inference and full composition remain open;
 this is not a claim that arbitrary-arity positional functions now work.
+
+## Bounded typed collection keys — 2026-09-08
+
+Baseline `addbb8a`. Mixed-type deduplication loss reproduced before the fix.
+Functional/array unique and array distinct_by now share a bounded PBLang scalar
+key helper. New functional.unique_by and group_by_entries provide explicit
+object projection and typed group records while preserving legacy string-map
+group_by/frequencies output. Tests cover scalar distinctions, stable order,
+callback effects, rejection/boundaries and actual bounded frontend/VM imports.
+See `COLLECTION_KEYS.md` for the deliberate compatibility narrowing (4096 items,
+scalar keys and additional key/comparison budgets). No arbitrary structural-key,
+exact-number, C99 embedded-NUL or universal backend support is claimed. Direct
+array_unique remains a legacy native boundary. Once and full paradigm composition
+remain open; this is not full collection-wide or 1.0.0 qualification.
 
 ## Extrema callback evaluation — 2026-09-08
 

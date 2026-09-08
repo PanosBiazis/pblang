@@ -1340,3 +1340,65 @@ measurement of iterate nor proof of all-language/platform/polyglot superiority.
 Graphify stopped cleanly at its 20-second deadline (124), without an updated
 graph claim. No owned test/benchmark/Graphify worker or benchmark temporary
 directory remained.
+
+## Remediation ledger — 2026-09-08, typed scalar collection keys
+
+Baseline `addbb8a`. Full owning functional/array modules, shared memoization,
+related map contracts and discovered callers/tests were reviewed. Graphify query
+did not surface the relevant PBLang helpers, so source navigation was used.
+A new mixed-scalar regression failed before implementation: functional.unique
+collapsed number/string and bool/string inputs through str(value).
+
+The PBLang-only collection_keys module now provides type-tagged buckets with
+verified finite-f64/string/bool/nil equality, canonical zero bucketing, stable
+first representatives and bounded membership/key/comparison work. Both stdlib
+unique wrappers and array.distinct_by use it. New functional.unique_by supports
+object scalar projection; group_by_entries returns ordered typed-key records.
+Legacy group_by/frequencies string maps are unchanged. `COLLECTION_KEYS.md`
+documents deliberate narrowing: scalar projection keys, at most 4096 items,
+4096 text-key characters, 65536 aggregate bucket characters and 65536 comparisons.
+This is not a whole-VM memory or callback execution bound. Same-length input
+mutations/ABA and rollback of callback side effects are not provided.
+
+Defensive-security review approved the scalar-only path and array wrapper
+alignment. Unsupported keys are rejected before stringify or recursive equality.
+Raw array_unique still exposes unbounded/recursive composite comparison on the
+retained host, with different composite identity semantics in C99; no Rust source
+was changed. Bigint/rational/decimal keys and C99 embedded-NUL strings remain
+unqualified. A finite-f64 rendering collision was not verified; equality checks
+are defense-in-depth rather than a claim that the current formatter is lossy.
+
+Twelve targeted suites passed: collection_keys, collection_keys_bounds,
+selfhost_collection_keys, array_map_functional, functional_combinators,
+functional_iterate, selfhost_iterate, memoize_identity, multi_paradigm_composition,
+portable_lock_current, manifest_validate and benchmark_enrich. Tests cover mixed
+types, zeros, nearby f64s, Unicode/NUL on the retained host, typed grouping, stable
+representatives, callback order/failures/mutation, malformed and unsupported keys,
+exact-number/nonfinite rejection and item/text/aggregate boundaries. A cyclic
+key is rejected without traversal; the raw builtin was not exercised on cycles.
+Comparison-budget exhaustion remains statically guarded, not fault-injected.
+
+Remaining: once failure/reentrancy, broader collection/exact-number semantics,
+general arity/class/default/block semantics and complete paradigm composition;
+compiler/LLVM/JIT, import/file limits, runtime cleanup/isolation and hard heap/
+preemption, typed FFI/raw bypass closure and hostile-code sandbox, package trust/
+artifact delivery/revocation/rollback, reproducibility, broad compatibility and
+physical-platform qualification. PBLang 1.0.0 remains NOT READY.
+
+The separate nine-row numeric competitor batch is recorded, with all samples,
+checksums, build/time/RSS/artifact metrics and explicit limits, in
+`BENCHMARK_SESSION_2026-09-08_COLLECTION_KEYS.md`. It does not measure collection
+performance or prove cross-backend key parity. Final build and relative-lock
+publication passed. Lint completed with warnings, including misleading identical-
+operand warnings on the deliberate NaN/infinity guards (nonfinite rejection is
+tested); those guards were not removed. No full suite ran.
+
+Canonical Tooling/PrjAnalysis/Language_Semantics entries now distinguish bounded
+stdlib wrappers from the legacy raw builtin and remove the unconditional O(n)
+claim. The pre-existing Tooling and frontend diffs remain unchanged; only this
+turn's Tooling hunk is staged. Added-line/new-file privacy and diff checks pass.
+Unrelated dirty work and local lock changes stay excluded from the commit.
+
+Graphify's final update stopped at its 20-second deadline (124), so graph
+freshness is not claimed. No owned test/benchmark/Graphify worker or benchmark
+temporary directory remained after validation.

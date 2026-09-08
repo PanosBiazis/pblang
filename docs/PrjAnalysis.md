@@ -3337,7 +3337,7 @@ Fixes:
 
 | Item | Status | What changed |
 |---|---|---|
-| Native array transforms | **EXPOSED** | Added `array.flatten`, `array.unique`, `array.zip`, `array.chunk`, `array.take`, and `array.drop` wrappers over the VM builtins. |
+| Native array transforms | **EXPOSED; unique superseded** | Originally added array wrappers over VM builtins. `array.unique` now uses the PBLang bounded scalar-key helper; see `COLLECTION_KEYS.md` for limits and compatibility. Other listed transforms remain native-backed. |
 | Friendlier slicing | **HARDENED** | `array.slice(a, start, end)` now clamps negative and out-of-range bounds and returns `[]` for reversed ranges instead of risking an index error. |
 | Common helpers | **ADDED** | Added `min`, `max`, `none`, `find`, `find_index`, `count`, and `partition` to reduce repeated user loops. |
 | Existing API | **PRESERVED** | Existing `map/filter/reduce/contains/index_of/first/last/reverse/flat_map/sum/any/all/sort` behavior remains intact. |
