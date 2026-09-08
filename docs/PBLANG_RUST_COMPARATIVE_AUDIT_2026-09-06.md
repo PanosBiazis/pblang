@@ -1910,3 +1910,21 @@ executable refresh, compiler/paradigm compatibility, hard runtime resources and
 ownership, typed FFI/raw bypass/sandbox, package authenticity/artifact handoff/
 revocation/rollback, broad product compatibility and physical platforms.
 No Rust/C runtime edits or full suite. PBLang 1.0.0 remains NOT READY.
+
+## CLI security policy admission update — 2026-09-08
+
+PBLang-owned pattern and dependency policy preflight now reject malformed
+configuration before entry reads in pbsecure and security-selected pbanalyze.
+The dependency library also rejects malformed pattern policy before traversal,
+with an invalid report rather than a completed finding report. Scope-specific
+nil resolution, command-line rule overrides and existing report publication
+protections are retained. Validation outcomes expose no reusable policy handles;
+normal analysis still revalidates. No Rust source or executable rebuild.
+
+Evidence and costs: BENCHMARK_SESSION_2026-09-08_SECURITY_CLI_PREFLIGHT.md.
+Remaining: concurrent policy snapshots, pbanalyze bounded pre-allocation reads
+and snapshot verification, general analyzer performance, C99 embedded-NUL parity,
+native self-bootstrap/executable refresh, compiler/paradigm compatibility,
+VM ownership/hard heap/preemption, typed FFI/raw bypass/hostile-code sandbox,
+publisher trust/artifact handoff/revocation/rollback, broad product regression
+and physical-platform qualification. PBLang 1.0.0 remains NOT READY.

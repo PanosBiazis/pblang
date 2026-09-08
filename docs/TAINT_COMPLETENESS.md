@@ -83,7 +83,7 @@ successful preflight does not mean a source program is safe or even analyzed.
 `security_dependency_analysis.analyze_entry` validates the resolved policy after
 its existing path/mode/numeric admission but before path normalization, entry
 source handling, module reads, import probes, tokenization and pattern analysis.
-Malformed policy returns exactly `{ok:false,passed:false,format:FORMAT,error:...}`
+Malformed taint policy returns exactly `{ok:false,passed:false,format:FORMAT,error:...}`
 instead of a later incomplete traversal report. This intentional early-error
 schema change does not alter successful reports. Numeric error precedence,
 nested-policy priority, nil-as-unset and explicit empty replacements are retained.
@@ -93,11 +93,14 @@ maps are mutable; an earlier success or a supplied validated flag never skips
 validation. No cross-call cache or snapshot/atomicity guarantee is introduced.
 The extra check adds cost, especially at the maximum custom-policy boundary.
 
-This guarantee starts at the dependency library call, not process startup:
-pbsecure and pbanalyze still load config/entry source before invoking it. CLI
-pre-read admission and pattern-policy preflight remain separate work. Existing
-non-map outer security fallback is unchanged. General parser diagnostics and
-successful dependency reports are not universally path-free.
+The dependency library also preflights resolved pattern policy before source I/O;
+pattern failures add configuration_errors. pbsecure and security-selected
+pbanalyze now call the matching outcome-only validator before entry reads.
+Config loading is intentionally earlier; entry-only validates only pattern policy.
+Existing non-map outer security fallback is unchanged. General parser diagnostics
+and successful dependency reports are not universally path-free.
+See SECURITY_ANALYSIS.md and BENCHMARK_SESSION_2026-09-08_SECURITY_CLI_PREFLIGHT.md
+for CLI compatibility boundaries and syscall evidence.
 
 The focused preflight regression covers exact schemas, no container exposure,
 mutated/forged outcomes, direct nil versus dependency fallback, nested priority,
