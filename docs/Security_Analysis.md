@@ -184,6 +184,16 @@ audited artifacts. Broad path patterns are not accepted.
 
 ## Bounds and current limits
 
+Taint budgets now require ordinary finite integers within their documented
+intervals; invalid resolved numeric policy rejects before dependency reads.
+Unterminated lexical tokens reject direct taint analysis before parsing.
+Finding-index truncation and AST/call-budget exhaustion are blocking incomplete
+results, even if retained findings have only medium severity. Per-module and
+whole-program taint failures block protect as well as strict; audit still requires
+complete coverage. Deduplication happens before the retained finding cap, so a
+duplicate is not evidence loss. See [Taint completeness](TAINT_COMPLETENESS.md)
+for defaults, compatibility tightening, tests and remaining resource boundaries.
+
 This is not a proof that a program is vulnerability-free. Default dependency
 bounds are 256 modules, depth 64, 1 MiB per module, and 8 MiB total source;
 larger explicit bounds remain hard-capped. Literal imports, parser coverage,

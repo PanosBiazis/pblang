@@ -1677,3 +1677,33 @@ paradigm/compiler/LLVM/JIT qualification, import/file budgets, owner-scoped
 runtime cleanup/heap/preemption, typed FFI/raw bypass closure, hostile-code
 isolation, package trust/artifact delivery/revocation/rollback, product regression
 and physical-platform evidence. PBLang 1.0.0 remains NOT READY.
+
+## Remediation ledger — 2026-09-08, taint admission and completeness
+
+Baseline `ec42869`. Reproduced and fixed a security admission failure: a medium
+finding could fill the retained index before a high finding, leaving truncated
+evidence with passed=true. Unique finding overflow now blocks; duplicate retained
+identities do not falsely mark truncation. AST/call/finding exhaustion makes
+interprocedural_complete=false. Retained finding_count semantics are unchanged.
+
+Shared numeric admission rejects nonfinite, fractional, non-number and out-of-
+range budgets; dependency analysis validates resolved numeric policy before reads.
+The baseline NaN host probe threw an unstructured comparison error, not a proved
+unbounded execution. Direct taint now rejects unterminated tokens before parsing.
+Per-module and whole-program failures cannot become protect-mode approval.
+Intentional compatibility tightening and nil normalization are documented in
+`TAINT_COMPLETENESS.md`.
+
+Sixteen targeted suites passed, including all three dependency modes and security
+CLI publication/config regressions. Independent defensive review approved the
+narrow change. No Rust edit, full suite, source-content scan or host executable
+replacement. The nine separate numeric rows pass their exact checksum; the small
+before/after analyzer control establishes no speedup. See
+`BENCHMARK_SESSION_2026-09-08_TAINT_ADMISSION.md`.
+
+Remaining: pre-tokenization bounds for direct analysis, nested-flow and summary
+soundness/performance, cache confinement and control/data reporting, full native
+self-bootstrap, general grammar/default/arity/class/block and paradigm coverage,
+runtime heap/preemption/ownership, typed FFI/sandbox, package trust/artifact/
+revocation/rollback and full product/physical-platform qualification.
+PBLang 1.0.0 remains NOT READY.
