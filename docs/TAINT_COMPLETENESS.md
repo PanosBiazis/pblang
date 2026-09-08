@@ -26,8 +26,9 @@ demonstrated on that host. Missing finite/integer admission is now explicit.
 
 Dependency analysis validates its resolved numeric policy before module reads,
 in protect/strict/audit modes. Its existing option resolver treats nil as unset;
-this legacy normalization happens before the shared validator. Other taint
-policy shapes are still checked by analyze during traversal, not by limits.
+this legacy normalization happens before the shared validator. Deep policy
+validation now follows numeric limits before the library starts path resolution,
+source handling or import discovery. The limits API itself stays numeric-only.
 
 ## Custom policy admission and private defaults
 
@@ -67,9 +68,42 @@ against concurrent mutation; snapshot/thread guarantees remain separate work.
 
 The new configuration test covers malformed unused rules, exact caps, UTF-8 and
 control input, input preservation, private/non-contaminating defaults, error
-precedence and all three dependency modes. Dependencies still perform bounded
-module work before their per-module taint pass validates deep policy; pre-I/O
-policy validation remains open. See BENCHMARK_SESSION_2026-09-08_TAINT_CONFIGURATION.md.
+precedence and all three dependency modes. See
+BENCHMARK_SESSION_2026-09-08_TAINT_CONFIGURATION.md for the original slice.
+
+### Outcome-only preflight before dependency I/O
+
+`security_taint.validate_policy(options=nil)` checks only custom taint policy
+structure, using the same bounded validator as direct analyze. It returns exactly
+`{ok:true}` or `{ok:false,error:constant}`. A non-map options argument rejects with
+`taint policy requires map options`. No defaults, policy containers, source,
+path, or approval capability is returned. Numeric budgets still require limits;
+successful preflight does not mean a source program is safe or even analyzed.
+
+`security_dependency_analysis.analyze_entry` validates the resolved policy after
+its existing path/mode/numeric admission but before path normalization, entry
+source handling, module reads, import probes, tokenization and pattern analysis.
+Malformed policy returns exactly `{ok:false,passed:false,format:FORMAT,error:...}`
+instead of a later incomplete traversal report. This intentional early-error
+schema change does not alter successful reports. Numeric error precedence,
+nested-policy priority, nil-as-unset and explicit empty replacements are retained.
+
+Every per-module and whole-program analyze still validates again. Caller-owned
+maps are mutable; an earlier success or a supplied validated flag never skips
+validation. No cross-call cache or snapshot/atomicity guarantee is introduced.
+The extra check adds cost, especially at the maximum custom-policy boundary.
+
+This guarantee starts at the dependency library call, not process startup:
+pbsecure and pbanalyze still load config/entry source before invoking it. CLI
+pre-read admission and pattern-policy preflight remain separate work. Existing
+non-map outer security fallback is unchanged. General parser diagnostics and
+successful dependency reports are not universally path-free.
+
+The focused preflight regression covers exact schemas, no container exposure,
+mutated/forged outcomes, direct nil versus dependency fallback, nested priority,
+all modes, malformed entry source, missing entry and unresolved-import markers.
+Linux syscall observation is recorded separately from semantic assertions in
+BENCHMARK_SESSION_2026-09-08_TAINT_POLICY_PREFLIGHT.md.
 
 ## Fixed-field limit validation
 
