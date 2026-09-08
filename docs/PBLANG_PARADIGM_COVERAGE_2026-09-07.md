@@ -206,3 +206,13 @@ PBLang frontend; this is a language-level unresolved distinction, recorded in
 uses an existing runtime primitive, not a wholly native-free implementation.
 General default/arity/class/block composition, lazy/resource-safe sequences and
 cross-device qualification remain open.
+
+## Contextual match versus object access — 2026-09-08
+
+The PBLang parser now composes match-named map/array bindings with member and
+optional-member/index access. Real match expressions and a subject read from
+match.value retain their existing lowering. Checked compilation, plain/optimized
+VM execution and bytecode roundtrips agree in focused tests. Missing bindings and
+malformed postfixes still reject. Parenthesized subjects remain an explicitly
+tested unsupported ambiguity, not a completed general grammar/paradigm guarantee.
+See `SELFHOST_LEXICAL_BUILD_PROGRESS_2026-09-08.md`.
