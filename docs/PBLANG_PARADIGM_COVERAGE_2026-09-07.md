@@ -234,3 +234,18 @@ native self-bootstrap/executable refresh, compiler/paradigm compatibility,
 VM ownership/hard heap/preemption, typed FFI/raw bypass/hostile-code sandbox,
 publisher trust/artifact handoff/revocation/rollback, broad product regression
 and physical-platform qualification. PBLang 1.0.0 remains NOT READY.
+
+## Bounded selectable-analysis reads — 2026-09-08
+
+pbanalyze now uses the existing secure descriptor reader with a 16 MiB ceiling
+before materializing source bytes in the VM. Public read/UTF-8 error schemas and
+policy-before-read ordering remain intact; ordinary-read fallback is forbidden.
+Symlink/special-file and unsupported-platform-path rejection are intentional
+compatibility tightenings. See BENCHMARK_SESSION_2026-09-08_ANALYSIS_BOUNDED_READ.md
+for targeted tests, measured overhead and actual platform limits.
+
+Still open: post-analysis source/config snapshots, concurrent namespace/policy
+consistency, hard VM heap/time and cleanup enforcement, typed FFI/raw bypass and
+hostile-code sandbox, publisher trust/artifact handoff/revocation/rollback,
+compiler/C99 parity, native executable refresh, whole-product regression and
+physical-platform verification. This does not certify 1.0.0 readiness.

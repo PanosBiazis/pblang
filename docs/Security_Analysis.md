@@ -140,8 +140,24 @@ Early pbsecure config rejections retain configuration snapshot verification;
 they do not claim that any source snapshot was obtained. Existing exclusive
 report publication and input-collision guards remain active. This does not provide
 atomic policy snapshots, universal path-free reports or hard runtime resource
-limits. pbanalyze's ordinary source read and missing snapshot verification remain
-separate limitations. See BENCHMARK_SESSION_2026-09-08_SECURITY_CLI_PREFLIGHT.md.
+limits. See BENCHMARK_SESSION_2026-09-08_SECURITY_CLI_PREFLIGHT.md.
+
+pbanalyze now uses secure_file.read_bytes with a 16 MiB ceiling before source
+bytes are materialized in the VM, then retains its existing UTF-8 decoding.
+Read failures (including backend exceptions) produce the existing generic
+status-2 error; UTF-8 failures keep their separate existing message. Backend
+diagnostics/paths are not echoed and no ordinary path-read fallback is allowed.
+This intentionally rejects symlink traversal and unsupported special files even
+for performance-only analysis. The built-in backend bounds individual reads;
+it does not enforce total VM heap limits or guarantee cleanup on all exceptions.
+
+Linux absolute/relative paths are supported by the existing descriptor backend.
+macOS absolute secure paths are currently unsupported; Windows secure input
+must be relative to a supported root. Such inputs now fail closed, whereas the
+old ordinary reader could accept them. Use supported relative paths; broader
+secure-root support needs implementation and physical testing, not a fallback.
+Post-analysis source/config snapshot verification remains absent in pbanalyze.
+See BENCHMARK_SESSION_2026-09-08_ANALYSIS_BOUNDED_READ.md for evidence and cost.
 
 The opt-in `pbanalyze` tool composes selected analyses without adding them to
 the default build hot path:
