@@ -561,3 +561,26 @@ its payload marker. See `FUNCTIONAL_WINDOWING.md` for the documented compatibili
 tightening and remaining eager output growth. Related array/compute/raw builtins
 and repeat/iterate count validation remain separate; this is not hard heap/time
 enforcement or whole-platform qualification.
+
+## Remediation update — 2026-09-08, array windowing and executable refresh
+
+Array.chunk/windows now use the PBLang array_windowing helper for array and
+positive finite integer count validation. Bounded internally derived slices
+preserve valid output order and shallow ownership, with explicit huge-count
+handling. Sixteen focused suites pass, including actual PBLang frontend/VM and
+optimized/serialized roundtrips; 90 chunk and 900 stepped-window combinations
+are checked. See `ARRAY_WINDOWING.md` for the explicit nil/default divergence,
+PBCS literal bound, eager allocation and unqualified native boundaries.
+
+The complete three-stage measurements retain both improvements and regressions:
+windows improves in these samples; small chunks cost more than the old raw native
+builtin. Nine unchanged numeric comparison rows are separate evidence, not tests
+of the array helper. See `BENCHMARK_SESSION_2026-09-08_ARRAY_WINDOWING.md`.
+
+A real PBLang-driven direct-x64 build of the compiler CLI was attempted with
+cache/fallback disabled. Dependency analysis blocked before codegen; no new
+executable was published or substituted. Full host-CLI native parity is also
+explicitly unavailable in the existing bootstrap-refresh contract; PBCK snapshots
+and a return-42 probe cannot stand in for it. The comparative audit ledger records
+the parser/analysis blockers and remaining release work. No Rust source changed,
+no full suite ran, and 1.0.0 readiness is not claimed.

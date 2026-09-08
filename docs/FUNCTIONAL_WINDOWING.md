@@ -57,3 +57,10 @@ this patch. No Rust/compiler/runtime implementation or import graph is changed.
 Focused retained-host and actual PBLang-written frontend/VM tests do not prove
 all-backend, emulator or physical-platform parity. The separate numeric session
 benchmarks do not measure window construction or claim a speedup from validation.
+
+## Subsequent array-library follow-up
+
+The separate 2026-09-08 `ARRAY_WINDOWING.md` change now covers array.chunk and
+array.windows size/step validation. The preceding scope statement describes the
+original functional-only patch. Compute.chunk and raw native boundaries remain
+unrepaired; the array helper adds a transitive module and uses native bulk slice.

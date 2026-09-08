@@ -191,3 +191,18 @@ object payloads, plus actual bounded PBLang frontend/VM execution. These checks
 correct invalid-input semantics, not enforce deep immutability, lazy sequences,
 total output budgets or general composition across every paradigm/backend.
 See `FUNCTIONAL_WINDOWING.md`; other size/step/count APIs remain unqualified.
+
+## Array stepped-window composition — 2026-09-08
+
+Array.chunk/windows now validate shape and counts in PBLang before work, with
+independent result slots and borrowed object payloads. Focused array/functional
+and multi-paradigm regressions pass alongside actual PBLang frontend/VM imports
+and plain/optimized/serialized helper execution. The matrix checks 90 chunk and
+900 stepped-window combinations, not every paradigm or backend combination.
+
+Explicit nil with a default parameter still differs between retained host and
+PBLang frontend; this is a language-level unresolved distinction, recorded in
+`ARRAY_WINDOWING.md`. PBCS numeric literal limits also remain. Bulk copying
+uses an existing runtime primitive, not a wholly native-free implementation.
+General default/arity/class/block composition, lazy/resource-safe sequences and
+cross-device qualification remain open.
