@@ -1,0 +1,91 @@
+// Linux trusted-checkout integration; all inputs and trace targets are owned.
+if platform() != "linux" { print "module_coverage_live_skip_linux_required"; os_exit(0); }
+let compiler = env_get("PBLANG_BIN") ?? path_join(cwd(), "target/release/pblang");
+let SECURE = import("stdlib:secure_file.sapp");
+let trace_mode = env_get("PB_MODULE_COVERAGE_TRACE") ?? "";
+if trace_mode != "" and trace_mode != "1" { throw "invalid coverage trace selection"; }
+if trace_mode == "1" and (not fs_exists("/usr/bin/strace") or not fs_exists("/usr/bin/prlimit")) {
+    throw "coverage trace tools unavailable";
+}
+let root = "tests/fixtures/module-coverage-live-" + str_slice(sha256(str(now_ms()) + str(random_bytes(8))), 0, 16);
+let a = root + "/a"; let b = root + "/b"; let foreign = root + "/private-root-marker";
+let output = root + "/report.json"; let content = "fn ready() { return 1; }\n";
+let failure = "unexpected exception";
+fn expect(ok, label) { if not ok { failure = label; throw label; } }
+fn run(args, log = "") {
+    let command = ["-k", "1s", "15s"];
+    if log != "" {
+        for arg in ["/usr/bin/prlimit", "--fsize=131072:131072", "--", "/usr/bin/strace", "-f", "-qq", "-yy",
+            "-e", "trace=%file", "-P", path_join(cwd(), foreign), "-P", path_join(cwd(), foreign + "/main.sapp"), "-o", log] {
+            array_push(command, arg);
+        }
+    }
+    array_push(command, compiler);
+    for arg in args { array_push(command, arg); }
+    return proc_spawn_wait("/usr/bin/timeout", command);
+}
+fn child(resume, duplicate = false, log = "") {
+    let args = ["tools/pbaudit.sapp", "--allow-all", "--", "--project=fixture", "--module-by-module",
+        "--json-output=" + output, "--max-files=10", "--max-file-bytes=10000", a,
+        if duplicate { a + "/../a" } else { b }];
+    if resume { array_push(args, "--resume"); }
+    return run(args, log);
+}
+fn exercise() {
+    for path in [a, b, foreign] { fs_mkdirs(path); fs_write(path + "/main.sapp", content); }
+    let fresh = child(false);
+    expect(fresh.exit_code == 0, "fresh two-root checkpoint");
+    let original = fs_read(output); let clean = json_parse(original);
+    expect(clean.complete and clean.engine_revision == "pblang.module-audit.engine.v8", "current engine identity");
+    let valid = child(true); let report = json_parse(fs_read(output));
+    expect(valid.exit_code == 0 and report.resumed_modules == 2 and report.scanned_modules == 0, "valid roots resume");
+    let reordered = json_parse(original); reordered.modules = [reordered.modules[1], reordered.modules[0]];
+    fs_write(output, json_stringify(reordered));
+    expect(child(true).exit_code == 0 and json_parse(fs_read(output)).resumed_modules == 2, "reordered checkpoint modules resume");
+    let partial = json_parse(original); partial.modules = [partial.modules[1]]; partial.complete = false;
+    fs_write(output, json_stringify(partial));
+    expect(child(true).exit_code == 0, "partial checkpoint finishes");
+    report = json_parse(fs_read(output));
+    expect(report.complete and report.resumed_modules == 1 and report.scanned_modules == 1, "partial subset coverage preserved");
+    if trace_mode == "1" {
+        fs_write(root + "/control.sapp", "fs_read(" + json_stringify(foreign + "/main.sapp") + "); print \"control_pass\";\n");
+        let control = run([root + "/control.sapp", "--allow-all"], root + "/control.log");
+        let trace = SECURE.read_text(root + "/control.log", 131072, false);
+        expect(control.exit_code == 0 and control.stdout == "control_pass\n" and trace.ok
+            and str_contains(trace.text, "private-root-marker/main.sapp"), "exact-path trace positive control");
+    }
+    for mode in ["foreign", "duplicate", "saved-roots", "saved-order", "saved-shape"] {
+        let tampered = json_parse(original); let expected = "checkpoint module coverage is invalid";
+        if mode == "foreign" { tampered.modules[0].root = path_join(cwd(), foreign); }
+        else if mode == "duplicate" {
+            tampered.modules[1] = tampered.modules[0]; expected = "checkpoint module reports are invalid";
+        } else if mode == "saved-roots" { tampered.requested_roots[0] = path_join(cwd(), foreign); }
+        else if mode == "saved-order" { tampered.requested_roots = [clean.requested_roots[1], clean.requested_roots[0]]; }
+        else { tampered.requested_roots = nil; }
+        let text = json_stringify(tampered); fs_write(output, text);
+        let log = if mode == "foreign" and trace_mode == "1" { root + "/rejected.log" } else { "" };
+        let rejected = child(true, false, log);
+        expect(rejected.exit_code == 2 and rejected.stdout == "pbaudit: " + expected + "\n", "checkpoint identity rejects before resume");
+        expect(not str_contains(rejected.stdout, "private-root-marker") and not str_contains(rejected.stderr, "private-root-marker"), "no supplied root leakage");
+        expect(fs_read(output) == text, "rejected checkpoint stays byte-identical");
+        if log != "" {
+            let trace = SECURE.read_text(log, 131072, false);
+            expect(trace.ok and not str_contains(trace.text, "private-root-marker"), "foreign root has zero file events after admission rejection");
+        }
+    }
+    fs_write(output, "sentinel-report");
+    for resume in [false, true] {
+        let rejected = child(resume, true);
+        expect(rejected.exit_code == 2 and rejected.stdout == "pbaudit: invalid module roots\n", "normalized aliases reject");
+        expect(fs_read(output) == "sentinel-report", "invalid CLI roots preserve old output even without resume");
+    }
+    for path in [a, b, foreign] { expect(fs_read(path + "/main.sapp") == content, "owned sources unchanged"); }
+    return true;
+}
+let ok = try exercise() catch false;
+for path in [output, root + "/control.log", root + "/rejected.log", root + "/control.sapp",
+    a + "/main.sapp", b + "/main.sapp", foreign + "/main.sapp", a, b, foreign, root] {
+    if fs_exists(path) { fs_remove(path); }
+}
+if not ok { throw "FAIL module-coverage-live: " + failure; }
+print "module_audit_coverage_live_pass";
