@@ -329,7 +329,197 @@ Report schemas, detector semantics and valid v6 checkpoint identities are
 unchanged. Evidence and optional path-filtered trace instructions:
 `BENCHMARK_SESSION_2026-09-09_TEXT_GATE_PREFLIGHT.md`.
 
+### Quality-gate counter admission
+
+After policy admission, `quality_gate` requires a direct report map or a
+project wrapper whose present `report` member is a map. A sparse direct `{}`
+still represents zero counters. A present `report:nil` is rejected.
+
+The 19 scalar inputs used by the quality decision require ordinary-number
+finite integers in 0..9007199254740991:
+
+| Input | Consumed keys |
+| --- | --- |
+| report | finding_count |
+| counts_severity | high, medium, low, info |
+| counts_kind | security, reliability, performance, incomplete, roadmap |
+| counts_role | source, docs, test, config |
+| counts_role_severity | source:high, source:medium |
+| counts_role_kind_severity | source:security:high, source:reliability:high, source:performance:high |
+
+Absent containers/keys retain sparse zero defaults. Each present container
+must be a map; each present consumed scalar is checked, including explicit
+nil. The source high-plus-medium sum must also fit the exact integer domain;
+overflow is rejected before addition. Every consumed counter is checked even
+when the selected policy would not otherwise use it to block.
+
+If `finding_count` is absent, an absent `findings` means zero and a present
+`findings` must be an array whose length supplies the count. A supplied valid
+`finding_count` remains authoritative: public/module indexes may retain fewer
+rows than the total. No caller-sized map or finding rows are traversed here.
+The validation work depends only on the fixed inputs in the table.
+
+Errors use fixed messages without including supplied values:
+
+- `project audit gate report must be a map`
+- `project audit gate counter containers must be maps`
+- `project audit gate findings fallback must be an array`
+- `project audit gate counters must be finite integers in 0..9007199254740991`
+
+These exceptions must propagate; do not replace them with a passing/empty
+report. Valid policy defaults, gate output schemas, detached output counts,
+and sparse aggregate behavior are preserved. Malformed policy errors retain
+precedence over malformed report errors. `release_readiness` uses the same
+admission after its existing finding-budget and policy preflight.
+
+This closes malformed numeric decision inputs, not report forgery. Individually
+valid but false counters, cross-counter/row consistency, completeness, critical
+severity policy, checkpoint authenticity and module admission before aggregation
+remain outside this change. Reports remain trusted embedding inputs. The
+comparison/progress/backlog APIs were not changed. Valid engine-v6 checkpoint
+identities remain unchanged. See `AUDIT_GATE_COUNTERS_2026-09-09.md` for the
+observed negative-counter bypass and the separate NaN diagnostic improvement.
+
 ## Module-by-module repository audit
+
+The current module engine is **v8**. Earlier v6 compatibility notes above
+describe the preceding policy/counter fixes. V7 added canonical module admission
+and consistent failure of incomplete coverage; v8 binds coverage to unique
+requested root identities. Unmodified older-engine checkpoints have a different
+audit identity and require a fresh scan. Rejected resume files
+are preserved, not deleted or overwritten by the rejection path.
+
+`stdlib:module_audit_contract.sapp` is a pure validation layer used before
+`combine_module_reports` accumulates any counts, before snapshot inventory,
+and before the CLI reuses a loaded checkpoint. Its `module_error(module)` and
+`modules_error(modules)` return an empty string on admission or a fixed error;
+successful validation is not a trusted token. Consumers validate mutable input
+again on each call.
+
+Canonical modules require their existing format tag, a nonempty root string
+of at most 4096 code points without NUL, exact `complete` and
+`finding_index_truncated` booleans, and four ordinary-number finite integers
+in 0..9007199254740991: `files_scanned`, `finding_count`, `suppressed_count`,
+and `encoding_degraded_files`. Degraded files cannot exceed scanned files.
+Missing canonical fields and explicit nil are rejected.
+
+The required count maps use fixed domains and maximum widths:
+
+| Map | Domain | Maximum keys |
+| --- | --- | ---: |
+| counts_kind | security, reliability, performance, incomplete, roadmap | 5 |
+| counts_severity | high, medium, low, info | 4 |
+| counts_role | source, docs, test, config, unknown | 5 |
+| counts_role_severity | role:severity | 20 |
+| counts_role_kind_severity | role:kind:severity | 100 |
+
+Widths are checked before `map_keys` allocation, and keys are bounded to 64
+code points before splitting. Every value and sum uses the same exact integer
+domain. Each map totals `finding_count`; the joint map must reproduce all four
+marginal maps. Empty maps and explicit zero entries are equivalent for zero
+categories. Unsupported categories are rejected instead of silently ignored.
+
+The retained `findings` array is capped at 100000 rows per module. Each row
+must be a map with supported role/kind/severity, and its category cannot occur
+more often than the full joint count permits. `finding_count` cannot be smaller
+than the retained length. Equality is required when the index is not marked
+truncated; a truncated index remains a lower bound on the full counts.
+Other finding metadata and source provenance are not validated by this layer.
+
+The complete batch, capped at 256 modules, is admitted before cross-module
+arithmetic; checked additions reject aggregate overflow before accumulation.
+Failure returns `ok=false, complete=false` without a gate or partially combined
+module result. Malformed gate-policy errors retain precedence over module
+admission. `max_finding_index` requires a finite integer in 1..100000.
+
+Incomplete scan/combine results retain their outer `status=incomplete`, while
+both `aggregate.passed` and `quality_gate.passed` are false. The nested gate
+has `status=blocked` and the fixed blocker `module audit coverage is incomplete`.
+Empty batches with requested roots are incomplete initial checkpoints; the
+legacy empty batch without requested coverage remains supported.
+
+CLI checkpoint rejection uses `checkpoint module reports are invalid`, exits
+2, and happens before snapshot verification and checkpoint writes. Snapshot
+admission also protects direct callers. The CLI checks unsuccessful combination
+results before every subsequent write. Source hashing still has its separate
+purpose: detecting changed source bytes, not authenticating report counters.
+
+This closes cancellation and inconsistent canonical category counts. It does
+not prove that all source findings were recorded, establish checkpoint
+authenticity or validate arbitrary metadata graphs. Worst-case direct admission still permits 25.6 million row
+checks (256 times 100000); this is a finite algorithmic ceiling, not a hard CPU,
+heap or wall-time guarantee. The CLI retains its 64 MiB checkpoint-byte limit.
+A smaller shared work budget remains a separate follow-up. See `MODULE_AUDIT_ADMISSION_2026-09-09.md` for execution evidence.
+
+### Requested module coverage (engine v8)
+
+The pure contract now exposes `roots_error(roots)` and
+`coverage_error(modules, requested_roots)`. Root labels are exact strings,
+nonempty and capped at 4096 code points without NUL; lists have at most 256
+entries. Requested roots and module roots must each be unique. When a nonempty
+requested list is supplied, every module must belong to it. A unique subset
+is a valid incomplete checkpoint, and module ordering does not matter. Equal
+cardinality establishes full requested coverage only after these checks and
+only when all module reports are complete. Empty requested lists retain the
+legacy unspecified-coverage convention, including an empty combined report.
+
+No filesystem normalization or lookup occurs in the pure contract. Case,
+relative/absolute labels and lexical aliases remain distinct for direct API
+callers. `audit_modules` rejects invalid and duplicate exact roots before
+inventory, without converting nonstrings to strings. Snapshot verification
+also respects `options.requested_roots` when supplied. This is a label identity
+contract, not proof that two paths name distinct physical directories, nor a
+symlink, hardlink, mount or concurrent-filesystem identity guarantee.
+
+The CLI validates roots before and after its existing absolute lexical
+normalization, before removing an earlier output or loading a checkpoint.
+Thus normalized aliases reject with exit 2 and `pbaudit: invalid module roots`.
+Resume compares the checkpoint's top-level requested list, including order,
+against the trusted invocation roots and admits its module membership before
+snapshot inventory. Module order remains unrestricted. Foreign roots or an
+inconsistent saved requested list produce `checkpoint module coverage is
+invalid`; duplicate modules produce `checkpoint module reports are invalid`.
+Diagnostics do not echo supplied roots. Rejection leaves checkpoint bytes
+unchanged. The unkeyed audit identity is not treated as authentication.
+
+Tests: `module_audit_coverage` and `module_audit_coverage_live`; the latter has
+an opt-in `PB_MODULE_COVERAGE_TRACE=1` exact-path syscall check with a positive
+control. See `MODULE_AUDIT_COVERAGE_2026-09-09.md` for observed evidence and limits.
+
+### Direct module numeric preflight
+
+`module_audit_contract.bounds_error(options=nil, snapshot=false)` checks only
+consumed numeric fields. Whole options nil/omission retains defaults; a present
+numeric field set to nil is invalid. Each value must be an ordinary-number
+finite integer in the inclusive range below. Extra fields remain supported.
+
+| Option | Default | Inclusive range |
+| --- | ---: | ---: |
+| max_files_per_module | 10000 | 1..100000 |
+| max_file_bytes | 1048576 | 1000..16777216 |
+| max_depth | 32 | 0..32 |
+| max_entries_per_module | 50000 | 1..50000 |
+| max_children_per_dir | 4096 | 1..4096 |
+| max_runtime_ms_per_module | 300000 | 10..300000 |
+| max_findings_per_file | 256 | 1..4096 |
+| max_finding_index | 20000 | 1..100000 |
+| max_findings_per_module_index | 20000 | 1..100000 |
+| max_suppressed_per_module_index | 1000 | 1..10000 |
+
+The producer validates all ten fields after outer root-array admission and
+before gate policy, root identity and inventory. Failure returns the existing
+`ok=false, complete=false` module result with `invalid module audit bounds`.
+Snapshot verification validates the first six fields before inventory, using
+its existing `ok=false, stable=false, error="invalid module snapshot"` result.
+The four finding/index fields are not consumed by snapshot verification and
+remain ignored there, even when malformed. Validation does not enumerate
+caller-supplied option keys, mutate input or include supplied values in errors.
+
+For example, `audit_modules(project, roots, map{max_files_per_module: 1.5})`
+now rejects before scanning; `max_files_per_module: 1` remains valid. Valid
+v8 CLI checkpoint identities and report semantics are unchanged by this
+preflight-only extension. It establishes numeric admission, not hard wall-time,
+heap or aggregate-work enforcement. Evidence: `MODULE_AUDIT_BOUNDS_2026-09-09.md`.
 
 The previous global audit stopped traversing when its shared file/finding cap
 was reached. `--module-by-module` scans every eligible file independently and

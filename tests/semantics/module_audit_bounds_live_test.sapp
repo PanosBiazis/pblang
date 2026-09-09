@@ -1,0 +1,57 @@
+// Trusted Linux checkout integration. Trace only exact owned fixture paths.
+if platform() != "linux" { print "module_bounds_live_skip_linux_required"; os_exit(0); }
+let SECURE = import("stdlib:secure_file.sapp");
+let compiler = env_get("PBLANG_BIN") ?? path_join(cwd(), "target/release/pblang");
+let trace_mode = env_get("PB_MODULE_BOUNDS_TRACE") ?? "";
+if trace_mode != "" and trace_mode != "1" { throw "invalid bounds trace selection"; }
+if trace_mode == "1" and (not fs_exists("/usr/bin/strace") or not fs_exists("/usr/bin/prlimit")) { throw "bounds trace tools unavailable"; }
+let root = "tests/fixtures/module-bounds-live-" + str_slice(sha256(str(now_ms()) + str(random_bytes(8))), 0, 16);
+let source_root = root + "/src"; let path = source_root + "/main.sapp";
+let failure = "unexpected exception";
+fn expect(ok, label) { if not ok { failure = label; throw label; } }
+fn child(mode) {
+    let args = ["-k", "1s", "15s"];
+    if trace_mode == "1" {
+        for arg in ["/usr/bin/prlimit", "--fsize=131072:131072", "--", "/usr/bin/strace", "-f", "-qq", "-yy", "-e", "trace=%file",
+            "-P", path_join(cwd(), source_root), "-P", path_join(cwd(), path), "-o", root + "/" + mode + ".log"] { array_push(args, arg); }
+    }
+    for arg in [compiler, root + "/probe.sapp", "--allow-all", "--", mode] { array_push(args, arg); }
+    return proc_spawn_wait("/usr/bin/timeout", args);
+}
+fn exercise() {
+    fs_mkdirs(source_root); fs_write(path, "fn ready() { return 1; }\n");
+    let module = map{format: "pblang.module_audit.module.v1", root: source_root, complete: true,
+        files_scanned: 1, finding_count: 0, suppressed_count: 0, encoding_degraded_files: 0,
+        finding_index_truncated: false, findings: [], counts_kind: map{}, counts_severity: map{},
+        counts_role: map{}, counts_role_severity: map{}, counts_role_kind_severity: map{}, snapshot_sha256: "fixture"};
+    let source = "let T=import(\"stdlib:project_text_audit.sapp\");let args=os_args();let mode=args[len(args)-1];\n"
+        + "if mode==\"control\" {fs_read(" + json_stringify(path) + ");print \"control_pass\";os_exit(0);}\n"
+        + "let module=json_parse(" + json_stringify(json_stringify(module)) + ");\n"
+        + "let result=if mode==\"producer\" {T.audit_modules(\"fixture\",[module.root],map{max_files_per_module:1.5})}"
+        + "else {T.verify_module_snapshot(module,map{max_file_bytes:1.5})};print json_stringify(result);\n";
+    fs_write(root + "/probe.sapp", source);
+    let control = child("control"); expect(control.exit_code == 0 and control.stdout == "control_pass\n", "positive read control");
+    if trace_mode == "1" {
+        let trace = SECURE.read_text(root + "/control.log", 131072, false);
+        expect(trace.ok and str_contains(trace.text, "/src/main.sapp"), "trace detects known source access");
+    }
+    for mode in ["producer", "snapshot"] {
+        let rejected = child(mode);
+        let expected = if mode == "producer" { map{ok: false, complete: false, format: "pblang.module_audit.v1", error: "invalid module audit bounds"} }
+            else { map{ok: false, stable: false, error: "invalid module snapshot"} };
+        expect(rejected.exit_code == 0 and rejected.stdout == json_stringify(expected) + "\n", "structured numeric rejection without leaked values");
+        expect(rejected.stderr == "", "no generic numeric exception");
+        if trace_mode == "1" {
+            let trace = SECURE.read_text(root + "/" + mode + ".log", 131072, false);
+            expect(trace.ok and not str_contains(trace.text, "/src"), "numeric rejection has zero target file events");
+        }
+    }
+    expect(fs_read(path) == "fn ready() { return 1; }\n", "source unchanged");
+    return true;
+}
+let ok = try exercise() catch false;
+for p in [root + "/control.log", root + "/producer.log", root + "/snapshot.log", root + "/probe.sapp", path, source_root, root] {
+    if fs_exists(p) { fs_remove(p); }
+}
+if not ok { throw "FAIL module-bounds-live: " + failure; }
+print "module_audit_bounds_live_pass";
