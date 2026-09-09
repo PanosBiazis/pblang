@@ -2057,3 +2057,27 @@ C99 parity including documented catch-variable/runtime mismatch; linter float
 reasoning; self-bootstrap/executable refresh; VM resources/ownership/cleanup;
 typed FFI/raw bypass/sandbox; publisher trust/artifact handoff/revocation/rollback;
 whole-product compatibility and physical platforms. PBLang 1.0.0 is NOT READY.
+
+## Filesystem audit policy preflight — 2026-09-09
+
+Closed late quality-policy admission in audit_roots, audit_modules and
+combine_module_reports. A shared PBLang validator returns detached plain maps;
+consumers still revalidate. Wrapper absent/explicit-nil defaults, early bound
+error precedence and valid v6 checkpoint identities are preserved. Baseline
+c7a304d already rejected malformed policy; this change prevents work before
+rejection rather than fixing a new infinity bypass. Targeted file-event traces
+changed from 6 to 0 for each filesystem entry point; poisoned aggregation now
+receives the fixed policy error before row traversal.
+
+Sixteen targeted suites, optional positive-control trace and valid full-result
+benchmark parity passed. Aggregation retains measured preflight overhead;
+small scan timings are variable, not proof of acceleration. Nine separate
+numeric comparisons passed their checksum. No Rust source or executable refresh.
+Evidence: BENCHMARK_SESSION_2026-09-09_TEXT_GATE_PREFLIGHT.md.
+
+Still open: report integrity/authenticity, comparison work/truncation, other
+module/snapshot/aggregate bounds and whole-work budgets; source/namespace
+consistency; compiler/paradigm/C99/catch semantics and linter diagnostics;
+self-bootstrap/executable refresh; VM resources/ownership/cleanup; typed FFI,
+raw bypass and sandbox; publisher/artifact/revocation/rollback; full-product
+compatibility and physical-platform verification. PBLang 1.0.0 is NOT READY.

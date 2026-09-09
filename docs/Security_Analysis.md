@@ -302,12 +302,32 @@ semantics remain unchanged; malformed policies deliberately no longer work.
 
 This validates policy, not report authenticity, consistency of counters with
 rows, completeness/truncation or total comparison work. Reports are still
-trusted caller inputs. The filesystem/module wrappers in project_text_audit
-currently reach the quality gate after their own collection/aggregation:
-universal pre-I/O gate-policy admission is not claimed. The private resolved
-helper is not an authorization capability. Valid engine-v6 checkpoint semantics
-are unchanged. Tests, corrected runtime evidence and measured costs:
+trusted caller inputs. The private resolved helper is not an authorization
+capability. Valid engine-v6 checkpoint semantics are unchanged. Tests,
+corrected runtime evidence and measured costs:
 `BENCHMARK_SESSION_2026-09-08_AUDIT_GATE_POLICY.md`.
+
+`project_audit.require_quality_gate_options(options=nil)` exposes the same
+validator as a plain detached canonical map. Its result is not a trusted token:
+`quality_gate` always validates it again. Missing/nil inputs use the general
+defaults above. Callers may change the returned map, but cannot use it to bypass
+later admission.
+
+The three project_text_audit gate consumers now preflight a detached policy:
+`audit_roots` after finding-limit admission, before collection; `audit_modules`
+after its existing root/bound checks, before inventory; `combine_module_reports`
+after outer shape/index/requested-root checks, before module aggregation.
+Their absent defaults remain 0/8/80 overall, 0/4/40 source and true/true flags.
+Explicit nil retains the existing general fallback rather than the absent
+wrapper default: max_medium:nil resolves to 5, max_source_medium:nil inherits
+the resolved overall medium ceiling, and source_only_blockers:nil is false.
+Other shared options remain supported and the input map is not modified.
+
+Only quality policy is covered here. Startup/import I/O, other direct module
+numeric bounds, snapshot validation and whole-work guarantees are not covered.
+Report schemas, detector semantics and valid v6 checkpoint identities are
+unchanged. Evidence and optional path-filtered trace instructions:
+`BENCHMARK_SESSION_2026-09-09_TEXT_GATE_PREFLIGHT.md`.
 
 ## Module-by-module repository audit
 
