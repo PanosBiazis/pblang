@@ -419,7 +419,10 @@ domain. Each map totals `finding_count`; the joint map must reproduce all four
 marginal maps. Empty maps and explicit zero entries are equivalent for zero
 categories. Unsupported categories are rejected instead of silently ignored.
 
-The retained `findings` array is capped at 100000 rows per module. Each row
+The retained `findings` arrays are capped at 100000 rows across the entire
+batch (and per module). A shape/length-only preflight runs before any row
+content is inspected; excess total rows return `module audit whole-report
+finding budget exceeded`. Each row
 must be a map with supported role/kind/severity, and its category cannot occur
 more often than the full joint count permits. `finding_count` cannot be smaller
 than the retained length. Equality is required when the index is not marked
@@ -446,10 +449,12 @@ purpose: detecting changed source bytes, not authenticating report counters.
 
 This closes cancellation and inconsistent canonical category counts. It does
 not prove that all source findings were recorded, establish checkpoint
-authenticity or validate arbitrary metadata graphs. Worst-case direct admission still permits 25.6 million row
-checks (256 times 100000); this is a finite algorithmic ceiling, not a hard CPU,
-heap or wall-time guarantee. The CLI retains its 64 MiB checkpoint-byte limit.
-A smaller shared work budget remains a separate follow-up. See `MODULE_AUDIT_ADMISSION_2026-09-09.md` for execution evidence.
+authenticity or validate arbitrary metadata graphs. Engine v9 limits canonical
+row traversal to 100000 retained rows across the batch. This is an algorithmic
+work bound, not a hard CPU, heap or wall-time guarantee. Decoding and other
+metadata require separate bounds; the CLI retains its 64 MiB checkpoint-byte
+limit. See `MODULE_AUDIT_ADMISSION_2026-09-09.md` for earlier admission evidence
+and `module_audit_work_budget_test.sapp` for the shared-row regression.
 
 ### Requested module coverage (engine v8)
 
@@ -462,6 +467,18 @@ is a valid incomplete checkpoint, and module ordering does not matter. Equal
 cardinality establishes full requested coverage only after these checks and
 only when all module reports are complete. Empty requested lists retain the
 legacy unspecified-coverage convention, including an empty combined report.
+
+Requested-list admission runs before canonical module row/counter traversal.
+The combine path preserves outer module/index/requested-array errors and gate
+policy precedence, then rejects invalid/duplicate requested root labels before
+`modules_error`. The CLI preserves format, audit-id and outer module-index
+precedence, then validates the saved requested list and its count/order against
+the invocation before inspecting module contents. Thus a checkpoint with both
+bad saved roots and bad counters returns the fixed coverage diagnostic. Module
+membership still follows canonical report admission. That preflight-only change
+preserved engine v8 identities; the shared budget described below advances to
+v9. Rejection ordering alone is not a measured speedup or a whole-work bound. Regression: `module_audit_preflight_order` and the
+mixed-invalid cases in `module_audit_coverage_live`.
 
 No filesystem normalization or lookup occurs in the pure contract. Case,
 relative/absolute labels and lexical aliases remain distinct for direct API
@@ -503,8 +520,16 @@ finite integer in the inclusive range below. Extra fields remain supported.
 | max_runtime_ms_per_module | 300000 | 10..300000 |
 | max_findings_per_file | 256 | 1..4096 |
 | max_finding_index | 20000 | 1..100000 |
-| max_findings_per_module_index | 20000 | 1..100000 |
+| max_findings_per_module_index | 20000 | 0..100000 |
 | max_suppressed_per_module_index | 1000 | 1..10000 |
+
+Engine v9 adds a shared 100000-row retention ceiling. An explicit per-module
+index limit of zero keeps scanning and exact counts while retaining no rows;
+explicit nil is still invalid. The CLI subtracts retained rows in requested-root
+order, including reused checkpoints. Stable truncated modules are rescanned
+when their retained length differs from the currently available cap, preserving
+fresh-run retention after earlier modules change. Old engine v8 checkpoints
+require a fresh scan because their audit identity differs.
 
 The producer validates all ten fields after outer root-array admission and
 before gate policy, root identity and inventory. Failure returns the existing
