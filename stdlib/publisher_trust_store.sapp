@@ -1,0 +1,538 @@
+// Release-publisher key-store loading and attestation verification.
+//
+// The store is read exactly once from a current-UID-owned mode-0700 parent
+// through a temporary sealed Linux snapshot. After validation the snapshot is
+// closed and detached key data remains behind an unguessable bearer handle; raw
+// keys never cross the module boundary. Because the path is caller-selected and
+// no expected digest is pinned, this module does not claim operator-selected
+// trust-anchor origin, revocation freshness, artifact measurement, or execution
+// authority. A separate one-shot API may match a caller-supplied raw-byte
+// digest, but that caller-controlled value is not operator or host trust.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let RELEASE = import("stdlib:product_release_evidence.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+let SERIALIZATION = import("stdlib:serialization.sapp");
+
+let FORMAT = "pblang.release-publisher-key-store.v1";
+let HANDLE_FORMAT = "pblang.publisher-trust-store-handle.v1";
+let VERIFICATION_FORMAT = "pblang.publisher-trust-verification.v1";
+let POLYGLOT_CONTRACT_FORMAT = "pblang.publisher-trust-polyglot-contract.v1";
+let MAX_STORE_BYTES = 16384;
+let MAX_PUBLISHERS = 128;
+let MAX_OPEN_STORES = 16;
+let MAX_STORE_LINES = 1;
+let MAX_STORE_DEPTH = 4;
+let MAX_STORE_ITEMS = 6531;
+let _STORES = map{};
+
+fn _has(values, wanted) {
+    if type(values) != "array" { return false; }
+    for value in values { if value == wanted { return true; } }
+    return false;
+}
+
+fn _exact_fields(record, fields) {
+    if type(record) != "map" or len(record) != len(fields) { return false; }
+    let keys = map_keys(record);
+    let index = 0;
+    while index < len(keys) {
+        if not _has(fields, keys[index]) { return false; }
+        index = index + 1;
+    }
+    index = 0;
+    while index < len(fields) {
+        if not map_has(record, fields[index]) { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+fn _positive_integer(value, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= 1 and value <= maximum;
+}
+
+fn _bounded_text(value, maximum) {
+    return type(value) == "string" and value != "" and len(value) <= maximum
+        and not str_contains(value, strfromcharcode(0));
+}
+
+fn _identity(value) {
+    return _bounded_text(value, 128)
+        and regex_match(value, "^[a-z0-9][a-z0-9._-]{0,127}$");
+}
+
+fn _scope_text(value) {
+    return _bounded_text(value, 128)
+        and regex_match(value, "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$");
+}
+
+fn _canonical_scope(values, maximum, target) {
+    if type(values) != "array" or len(values) < 1 or len(values) > maximum {
+        return nil;
+    }
+    let out = [];
+    for value in values {
+        if target {
+            if type(value) != "string" or len(value) < 3 or len(value) > 128
+               or not regex_match(value,
+                    "^[a-z0-9][a-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$") {
+                return nil;
+            }
+        } else {
+            if type(value) != "string" or len(value) > 32
+               or not regex_match(value, "^[a-z][a-z0-9._-]{0,31}$") {
+                return nil;
+            }
+        }
+        if _has(out, value) { return nil; }
+        array_push(out, value);
+    }
+    let sorted = array_sort(out);
+    let index = 0;
+    while index < len(out) {
+        if out[index] != sorted[index] { return nil; }
+        index = index + 1;
+    }
+    return out;
+}
+
+fn _same_texts(left, right) {
+    if type(left) != "array" or type(right) != "array"
+       or len(left) != len(right) { return false; }
+    let index = 0;
+    while index < len(left) {
+        if left[index] != right[index] { return false; }
+        index = index + 1;
+    }
+    return true;
+}
+
+fn _canonical_public_key(encoded) {
+    if type(encoded) != "string" or len(encoded) > 64 { return nil; }
+    let decoded = try base64_decode_bytes(encoded) catch nil;
+    if type(decoded) != "array" or len(decoded) != 32
+       or base64_encode_bytes(decoded) != encoded {
+        return nil;
+    }
+    let detached = [];
+    for byte in decoded {
+        if type(byte) != "number" or byte != num_floor(byte)
+           or byte < 0 or byte > 255 { return nil; }
+        array_push(detached, byte);
+    }
+    return detached;
+}
+
+fn _parse_store_bytes(bytes, store_sha256) {
+    let text = try bytes_to_str(bytes) catch nil;
+    let parsed = if type(text) == "string" {
+        try SERIALIZATION.parse_safe(text, "json", map{
+            max_input_bytes:MAX_STORE_BYTES, max_output_bytes:MAX_STORE_BYTES,
+            max_lines:MAX_STORE_LINES, max_line_bytes:MAX_STORE_BYTES,
+            max_depth:MAX_STORE_DEPTH, max_items:MAX_STORE_ITEMS,
+            strict:true, reject_duplicate_keys:true
+        }) catch nil
+    } else { nil };
+    let document = if type(parsed) == "map"
+        and (try parsed.ok catch false)
+        and (try parsed.format catch "") == "json"
+        and (try parsed.duplicate_keys_checked catch false) {
+        try parsed.value catch nil
+    } else { nil };
+    // Exact canonical serialization rejects whitespace, alternate encodings,
+    // and trailing data after bounded structural/duplicate-key preflight.
+    if type(document) != "map" or json_stringify(document) != text
+       or not _exact_fields(document, ["format", "generation", "publishers"])
+       or document.format != FORMAT
+       or not _positive_integer(document.generation, 1000000000)
+       or type(document.publishers) != "array"
+       or len(document.publishers) < 1
+       or len(document.publishers) > MAX_PUBLISHERS {
+        throw "publisher_trust_store: invalid canonical store";
+    }
+
+    let publishers = map{};
+    let key_ids = map{};
+    for row in document.publishers {
+        if not _exact_fields(row, ["publisher_id", "policy_revision", "key_id",
+            "algorithm", "public_key", "state", "product", "package_id",
+            "release_channels", "targets"])
+           or not _identity(row.publisher_id)
+           or not _positive_integer(row.policy_revision, 1000000000)
+           or row.algorithm != "ed25519"
+           or not _has(["active", "revoked"], row.state)
+           or type(row.key_id) != "string"
+           or not regex_match(row.key_id, "^[0-9a-f]{64}$")
+           or map_has(publishers, row.publisher_id)
+           or map_has(key_ids, row.key_id) {
+            throw "publisher_trust_store: invalid or duplicate publisher entry";
+        }
+        let key = _canonical_public_key(row.public_key);
+        let channels = _canonical_scope(row.release_channels, 8, false);
+        let targets = _canonical_scope(row.targets, 32, true);
+        if key == nil or SHA256.sha256_hex_bytes(key) != row.key_id
+           or not _scope_text(row.product) or not _scope_text(row.package_id)
+           or channels == nil or targets == nil {
+            throw "publisher_trust_store: publisher key binding mismatch";
+        }
+        publishers[row.publisher_id] = map{publisher_id:row.publisher_id,
+            policy_revision:row.policy_revision, key_id:row.key_id,
+            algorithm:"ed25519", public_key:key, state:row.state,
+            product:row.product, package_id:row.package_id,
+            release_channels:channels, targets:targets};
+        key_ids[row.key_id] = true;
+    }
+    return map{generation:document.generation, publishers:publishers,
+        publisher_count:len(document.publishers), store_sha256:store_sha256};
+}
+
+// One descriptor snapshot, one byte read, one digest. Expected-digest mismatch
+// is rejected before parsing, key selection, or signature verification.
+fn _snapshot_attempt(reader, expected_digest = nil) {
+    let loaded = SECURE.immutable_reader_range(reader, 0, reader.size);
+    if not loaded.ok or len(loaded.bytes) != reader.size {
+        return map{ok:false, reason:"immutable-snapshot-read-rejected"};
+    }
+    let digest = SHA256.sha256_hex_bytes(loaded.bytes);
+    if expected_digest != nil and digest != expected_digest {
+        return map{ok:false, reason:"expected-store-digest-mismatch"};
+    }
+    return try map{ok:true, value:_parse_store_bytes(loaded.bytes, digest)}
+        catch map{ok:false, reason:"invalid-store"};
+}
+
+fn _new_id() {
+    let attempt = 0;
+    while attempt < 8 {
+        let id = sha256(base64_encode_bytes(random_bytes(32)) + ":publisher-store");
+        if not map_has(_STORES, id) { return id; }
+        attempt = attempt + 1;
+    }
+    throw "publisher_trust_store: handle allocation rejected";
+}
+
+fn _failure(reason) {
+    return map{ok:false, format:VERIFICATION_FORMAT, reason:reason,
+        protected_store_snapshot_verified:false,
+        same_store_snapshot_measured_and_parsed:false,
+        caller_expected_store_digest_requested:false,
+        caller_expected_store_digest_matched:false,
+        operator_trust_anchor_origin_verified:false,
+        trusted_key_selection_verified:false,
+        configured_store_key_selection_verified:false,
+        release_scope_matched:false,
+        ed25519_signature_verified:false, release_binding_verified:false,
+        configured_store_key_signature_verified:false,
+        trusted_publisher_attestation_verified:false,
+        revocation_state_snapshot_applied:false,
+        revocation_freshness_verified:false,
+        artifact_bytes_measured:false, same_verified_artifact_handoff:false,
+        rollback_protection_enforced:false,
+        publisher_authenticity_verified:false,
+        authorizes_execution:false, production_ready:false};
+}
+
+fn _operation_evidence(result, one_shot, cleanup_verified,
+                       handle_issued, registry_used,
+                       legacy_capacity_independent) {
+    result.one_shot_current_path_requested = one_shot;
+    result.one_shot_current_path_verification = one_shot and result.ok;
+    result.snapshot_cleanup_verified = cleanup_verified;
+    result.bearer_handle_issued = handle_issued;
+    result.valid_bearer_handle_bound = handle_issued and registry_used;
+    result.legacy_handle_registry_used = registry_used;
+    result.legacy_handle_registry_bypassed = not registry_used;
+    result.legacy_handle_capacity_independent = legacy_capacity_independent;
+    result.hostile_caller_capacity_isolation = false;
+    return result;
+}
+
+fn _caller_digest_evidence(result, requested, matched) {
+    if requested and map_has(result, "store_sha256") {
+        map_remove(result, "store_sha256");
+    }
+    result.caller_expected_store_digest_requested = requested;
+    result.caller_expected_store_digest_matched = matched;
+    result.same_store_snapshot_measured_and_parsed = matched and result.ok;
+    return result;
+}
+
+fn _digest(value) {
+    return type(value) == "string" and regex_match(value, "^[0-9a-f]{64}$");
+}
+
+fn _path_valid(path) {
+    return platform() == "linux" and type(path) == "string" and path != ""
+        and len(path) <= 4096 and str_starts_with(path, "/")
+        and not str_contains(path, strfromcharcode(0));
+}
+
+fn _binding(handle) {
+    if type(handle) != "map" or (try handle.format catch "") != HANDLE_FORMAT
+       or type(try handle.id catch nil) != "string"
+       or not regex_match(handle.id, "^[0-9a-f]{64}$")
+       or not map_has(_STORES, handle.id) {
+        return nil;
+    }
+    return _STORES[handle.id];
+}
+
+fn load(path) {
+    if not _path_valid(path) {
+        return map{ok:false, format:HANDLE_FORMAT,
+            reason:"invalid-or-unsupported-store-path"};
+    }
+    if len(map_keys(_STORES)) >= MAX_OPEN_STORES {
+        return map{ok:false, format:HANDLE_FORMAT, reason:"store-capacity-reached"};
+    }
+    let reader = SECURE.open_immutable_reader(path, MAX_STORE_BYTES, true);
+    if not reader.ok {
+        return map{ok:false, format:HANDLE_FORMAT,
+            reason:"protected-store-open-rejected"};
+    }
+    let attempt = try _snapshot_attempt(reader) catch map{
+        ok:false, reason:"immutable-snapshot-read-rejected"};
+    let closed = try SECURE.close_immutable_reader(reader) catch map{ok:false};
+    attempt.snapshot_close_ok = try closed.ok catch false;
+    if not attempt.snapshot_close_ok or not attempt.ok {
+        return map{ok:false, format:HANDLE_FORMAT,
+            reason:if attempt.snapshot_close_ok { "invalid-store" }
+                else { "snapshot-cleanup-rejected" }};
+    }
+    let id = try _new_id() catch nil;
+    if id == nil { return map{ok:false, format:HANDLE_FORMAT,
+        reason:"handle-allocation-rejected"}; }
+    _STORES[id] = attempt.value;
+    return map{ok:true, format:HANDLE_FORMAT, id:id,
+        generation:attempt.value.generation,
+        publisher_count:attempt.value.publisher_count,
+        store_sha256:attempt.value.store_sha256,
+        store_sha256_algorithm:"sha256(raw-bytes)",
+        private_parent_verified:true,
+        parent_owned_by_current_uid:true, parent_mode:"700",
+        immutable_store_snapshot_verified:true,
+        current_uid_private_snapshot_verified:true,
+        path_reopened:false, path_pinned_by_host:false,
+        expected_store_digest_pinned:false, raw_keys_exposed:false,
+        bearer_handle_copy_resistant:false,
+        source_file_single_link_verified:false,
+        source_file_mode_0600_verified:false,
+        production_ready:false};
+}
+
+fn _verify_store(store, source, artifact, attestation, v2 = false) {
+    if type(attestation) != "map"
+       or not _bounded_text(try attestation.publisher_id catch nil, 128)
+       or type(try attestation.key_id catch nil) != "string"
+       or type(try attestation.policy_revision catch nil) != "number"
+       or not map_has(store.publishers, attestation.publisher_id) {
+        return _failure("publisher-not-configured");
+    }
+    let entry = store.publishers[attestation.publisher_id];
+    if entry.state != "active" {
+        let revoked = _failure("publisher-key-revoked");
+        revoked.revocation_state_snapshot_applied = true;
+        return revoked;
+    }
+    if attestation.key_id != entry.key_id
+       or attestation.policy_revision != entry.policy_revision {
+        return _failure("publisher-key-or-revision-mismatch");
+    }
+    if type(source) != "map" or (try source.product catch nil) != entry.product
+       or (try attestation.package_id catch nil) != entry.package_id
+       or not _has(entry.release_channels,
+            try attestation.release_channel catch nil)
+       or not _same_texts(try attestation.targets catch nil, entry.targets) {
+        return _failure("publisher-release-scope-mismatch");
+    }
+    let policy = RELEASE.publisher_policy(entry.publisher_id,
+        entry.policy_revision, entry.public_key);
+    let checked = if v2 {
+        try RELEASE.verify_publisher_attestation_v2(source, artifact,
+            policy, attestation) catch nil
+    } else {
+        try RELEASE.verify_publisher_attestation(source, artifact,
+            policy, attestation) catch nil
+    };
+    if type(checked) != "map" {
+        return _failure("publisher-attestation-invalid");
+    }
+    let authenticated = checked.ed25519_signature_verified
+        and checked.release_binding_verified
+        and checked.configured_publisher_key_matched;
+    return map{ok:authenticated, format:VERIFICATION_FORMAT,
+        reason:if authenticated { "configured-store-signature-verified" }
+            else { "signature-or-release-binding-rejected" },
+        publisher_id:entry.publisher_id, key_id:entry.key_id,
+        policy_revision:entry.policy_revision, store_generation:store.generation,
+        store_sha256:store.store_sha256,
+        protected_store_snapshot_verified:true,
+        same_store_snapshot_measured_and_parsed:false,
+        caller_expected_store_digest_requested:false,
+        caller_expected_store_digest_matched:false,
+        operator_trust_anchor_origin_verified:false,
+        trusted_key_selection_verified:false,
+        configured_store_key_selection_verified:true,
+        release_scope_matched:true,
+        ed25519_signature_verified:checked.ed25519_signature_verified,
+        release_binding_verified:checked.release_binding_verified,
+        configured_store_key_signature_verified:authenticated,
+        artifact_digest_algorithm:try checked.artifact_digest_algorithm catch "unspecified-v1",
+        artifact_digest_algorithm_signed:try checked.artifact_digest_algorithm_signed catch false,
+        trusted_publisher_attestation_verified:false,
+        revocation_state_snapshot_applied:true,
+        revocation_freshness_verified:false,
+        artifact_bytes_measured:false, same_verified_artifact_handoff:false,
+        rollback_protection_enforced:false,
+        publisher_authenticity_verified:false,
+        authorizes_execution:false, production_ready:false};
+}
+
+fn verify_attestation(handle, source, artifact, attestation) {
+    let store = _binding(handle);
+    if store == nil {
+        return _operation_evidence(_failure("invalid-or-closed-store-handle"),
+            false, false, false, true, false);
+    }
+    return _operation_evidence(_verify_store(store, source, artifact, attestation),
+        false, true, true, true, false);
+}
+
+// One operation reads the current caller-selected path into a sealed snapshot,
+// optionally matches a caller-supplied digest, validates and verifies it, then
+// closes exactly once without issuing a bearer handle or consuming a registry
+// slot. A caller match is not operator-origin or revocation-freshness proof.
+fn _verify_current(path, expected_digest, digest_requested,
+                   source, artifact, attestation, v2) {
+    if not _path_valid(path) {
+        return _caller_digest_evidence(_operation_evidence(
+            _failure("invalid-or-unsupported-store-path"),
+            true, false, false, false, true), digest_requested, false);
+    }
+    if digest_requested and not _digest(expected_digest) {
+        return _caller_digest_evidence(_operation_evidence(
+            _failure("invalid-expected-store-digest"),
+            true, false, false, false, true), true, false);
+    }
+    let reader = SECURE.open_immutable_reader(path, MAX_STORE_BYTES, true);
+    if not reader.ok {
+        return _caller_digest_evidence(_operation_evidence(
+            _failure("protected-store-open-rejected"),
+            true, false, false, false, true), digest_requested, false);
+    }
+    let attempt = try _snapshot_attempt(reader,
+        if digest_requested { expected_digest } else { nil }) catch map{
+            ok:false, reason:"immutable-snapshot-read-rejected"};
+    let closed = try SECURE.close_immutable_reader(reader) catch map{ok:false};
+    let close_ok = try closed.ok catch false;
+    if not close_ok or not attempt.ok {
+        let reason = if not close_ok { "snapshot-cleanup-rejected" }
+            else { try attempt.reason catch "invalid-store" };
+        return _caller_digest_evidence(_operation_evidence(_failure(reason),
+            true, close_ok, false, false, true), digest_requested, false);
+    }
+    let checked = _verify_store(attempt.value, source, artifact, attestation, v2);
+    if not checked.ok {
+        let rejected = _failure(checked.reason);
+        if checked.revocation_state_snapshot_applied {
+            rejected.revocation_state_snapshot_applied = true;
+        }
+        return _caller_digest_evidence(_operation_evidence(rejected,
+            true, true, false, false, true), digest_requested, false);
+    }
+    return _caller_digest_evidence(_operation_evidence(checked,
+        true, true, false, false, true), digest_requested, digest_requested);
+}
+
+fn verify_current_snapshot(path, source, artifact, attestation) {
+    return _verify_current(path, nil, false, source, artifact, attestation, false);
+}
+
+// v2 requires the artifact digest algorithm to be covered by the publisher
+// signature, but without an expected store digest it remains current-path only.
+fn verify_current_snapshot_v2(path, source, artifact, attestation) {
+    return _verify_current(path, nil, false, source, artifact, attestation, true);
+}
+
+// Match the expected lowercase raw-byte SHA-256 before parsing or key use.
+// The caller still selects both values, so this is intentionally not a host or
+// operator trust-anchor claim.
+fn verify_expected_current_snapshot_v2(path, expected_store_sha256,
+                                       source, artifact, attestation) {
+    return _verify_current(path, expected_store_sha256, true,
+        source, artifact, attestation, true);
+}
+
+fn close(handle) {
+    let store = _binding(handle);
+    if store == nil {
+        return map{ok:false, closed:false, reason:"invalid-or-closed-store-handle"};
+    }
+    map_remove(_STORES, handle.id);
+    return map{ok:true, closed:true, ownership_consumed:true,
+        raw_keys_exposed:false};
+}
+
+// Foreign-language consumers may submit public release claims only. Trust-store
+// location and digest selection remain inside PBLang or a future operator-owned
+// host policy; the contract grants no filesystem or execution authority.
+fn polyglot_verification_contract() {
+    return map{format:POLYGLOT_CONTRACT_FORMAT,
+        canonical_policy_owner:"pblang",
+        allowed_public_inputs:["source-metadata", "artifact-metadata",
+            "publisher-v2-attestation"],
+        forbidden_public_inputs:["trust-store-path", "expected-store-digest",
+            "publisher-public-key", "file-descriptor", "store-bytes",
+            "trust-boolean", "authorization-boolean"],
+        pblang_supplies_trust_store_binding:true,
+        foreign_filesystem_access:false,
+        foreign_trust_anchor_selection:false,
+        trust_boolean_forwarding:false,
+        implementation_present:false,
+        execution_adapter_present:false,
+        authorizes_execution:false, production_ready:false};
+}
+
+fn status() {
+    let secure = try SECURE.available() catch map{ok:false,
+        operations_attemptable:false};
+    let operational = platform() == "linux" and (try secure.ok catch false)
+        and (try secure.operations_attemptable catch false);
+    return map{format:"pblang.publisher-trust-store-status.v1",
+        available:operational, backend:"linux-sealed-memfd",
+        max_store_bytes:MAX_STORE_BYTES, max_publishers:MAX_PUBLISHERS,
+        max_open_stores:MAX_OPEN_STORES,
+        protected_store_loading_supported:operational,
+        immutable_snapshot_supported:operational,
+        operator_trust_anchor_origin_supported:false,
+        host_pinned_path_supported:false,
+        expected_store_digest_pinning_supported:false,
+        caller_expected_store_digest_match_supported:operational,
+        same_store_snapshot_measure_parse_supported:operational,
+        bounded_json_preflight_supported:true,
+        store_json_max_lines:MAX_STORE_LINES,
+        store_json_max_depth:MAX_STORE_DEPTH,
+        store_json_max_items:MAX_STORE_ITEMS,
+        store_json_duplicate_keys_rejected:true,
+        revocation_freshness_supported:false,
+        one_shot_current_path_verification_supported:operational,
+        v2_digest_algorithm_binding_supported:operational,
+        legacy_handle_capacity_independent_supported:operational,
+        bearer_handle_copy_resistant:false,
+        hostile_caller_capacity_isolation:false,
+        artifact_measurement_supported:false,
+        same_object_handoff_supported:false,
+        rollback_enforcement_supported:false,
+        polyglot_contract_available:true,
+        polyglot_adapter_implemented:false,
+        publisher_authenticity_complete:false, production_ready:false};
+}
+
+export FORMAT, HANDLE_FORMAT, VERIFICATION_FORMAT, POLYGLOT_CONTRACT_FORMAT,
+       MAX_STORE_BYTES, MAX_PUBLISHERS, MAX_OPEN_STORES,
+       MAX_STORE_LINES, MAX_STORE_DEPTH, MAX_STORE_ITEMS;
+export load, verify_attestation, verify_current_snapshot,
+       verify_current_snapshot_v2, verify_expected_current_snapshot_v2,
+       close, polyglot_verification_contract, status;
