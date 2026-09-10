@@ -60,9 +60,18 @@ work (both forms are accepted).
 
 ### `ffi_load(path: string) -> handle`
 
-Open a shared library. Returns a numeric handle that the VM tracks in a
-global table. The handle is opaque — store it in a variable; arithmetic
-on it is undefined and a future error.
+Open a shared library. Returns an opaque numeric token in `1..=2^53-1`,
+tracked in the calling execution realm. Imports share their caller's realm;
+independent root VMs and spawned VMs have separate realms. Passing the number
+to another realm does not transfer its library authority. Tokens use OS
+randomness with bounded allocation retries; table ownership is the boundary,
+not token secrecy. Store the token without arithmetic or numeric coercion.
+
+At most 128 libraries may be open per realm, including all nested imports and
+`polyglot_compile_cached` handles. Capacity is checked before loading library
+constructors or starting a cached polyglot compilation. Closing a library frees
+one slot. Failed imports can retain already loaded libraries until the root
+realm ends; those resources remain subject to the same cap.
 
 Cross-platform path conventions:
 
@@ -162,8 +171,10 @@ ffi_call_typed: unsupported signature dispatch 'i,i,s,s->s'. Supported shapes ar
 
 ### `ffi_close(handle) -> nil`
 
-Drop the library handle. Subsequent `ffi_call(handle, ...)` errors with
-`invalid handle`. **Strongly recommended:** wrap with `defer`:
+Drop the library handle. Closed, unknown and foreign-realm handles produce
+`invalid handle`, including a repeated `ffi_close`. Failed symbol lookup leaves
+the original handle valid. Subsequent `ffi_call(handle, ...)` after close errors
+with `invalid handle`. **Strongly recommended:** wrap with `defer`:
 
 ```pblang
 let lib = ffi_load("./libmylib.so");
@@ -171,9 +182,11 @@ defer ffi_close(lib);
 // ... use lib ...
 ```
 
-If the VM is dropped without closing a handle, the `Library` is freed by
-its own `Drop` impl — no leak, just less deterministic ordering than a
-`defer`.
+When the last VM owning the realm is dropped, its remaining libraries are
+released. Dropping a temporary import VM does not unload the caller's libraries.
+A native call retains a short-lived library reference, so closing its handle
+does not unload code while that call is still executing. This is resource
+lifetime management, not isolation of native memory faults or execution time.
 
 ## Safety contract — who is responsible for what
 
@@ -230,7 +243,9 @@ catchable PBLang errors. The table below covers reported validation failures:
 | `ffi_call_typed: unsupported signature dispatch 'X'` | Shape not in the table — write a C wrapper or add the shape |
 | `signature must be of the form 'a,b->c'` | Malformed `sig` string (missing `->`, etc.) |
 | `unknown arg type 'X'` / `unknown ret type 'X'` | Typo in signature; allowed: i64 i32 f64 f32 bool string ptr (ret also: void) |
-| `invalid handle` | Handle was closed, never existed, or got coerced from a non-handle Number |
+| `invalid handle` | Handle was closed, never existed, or belongs to another execution realm |
+| `expected exact positive FFI handle number` | Non-number, fractional, non-finite, zero, negative or greater than `2^53-1` |
+| `ffi: library limit exceeded (128 per execution realm)` | Root program and imports reached their shared open-library cap |
 
 ## Cross-platform notes
 

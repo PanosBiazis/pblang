@@ -78,7 +78,7 @@ use gc::{gc_register_array, gc_register_map, gc_register_module};
 // with_*_table wrappers; no need to import the raw fns here.
 // DB_NEXT/with_db_table → used by vm/db.rs directly.
 // NET_NEXT/with_net_table → used by vm/net.rs directly.
-// with_ffi_table / FFI_NEXT → used directly by vm/ffi.rs and vm/polyglot.rs.
+// Realm-owned FFI accessors are used by vm/ffi.rs and vm/polyglot.rs.
 // spawn_function_from_wire / spawn_closure_to_wire are only called from inside
 // spawn_wire.rs (by spawn_value_from_wire / spawn_value_to_wire); no need to
 // re-import them here.
@@ -203,9 +203,9 @@ pub(super) struct NetStream {
 //
 // parse_ffi_sig + dispatch_ffi + c_str_to_value moved to vm/ffi_dispatch.rs.
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) enum FfiResource {
-    Library(Library),
+    Library(Rc<Library>),
 }
 
 #[derive(Debug)]
@@ -461,7 +461,7 @@ pub struct VmLimits {
     pub max_instructions: Option<u64>,
     /// Max call stack depth (number of frames).
     pub max_stack_depth: Option<usize>,
-    /// Max heap memory in bytes (optional). Enforcement is best-effort when set.
+    /// Reserved heap budget; intrinsic VM allocations are not hard-accounted by this field.
     pub max_memory_bytes: Option<usize>,
     /// Timeout in ms for IO builtins (e.g. HTTP, TCP read, fs read). Not yet enforced by all builtins.
     pub io_timeout_ms: Option<u64>,
@@ -516,6 +516,8 @@ pub struct VM {
     limits: Option<VmLimits>,
     /// Optional FFI allowlist; when Some and allow_all is false, only listed libs/symbols are allowed.
     ffi_policy: Option<FfiPolicy>,
+    /// Shared with import initialization VMs only; final owner drop unloads libraries.
+    ffi_resources: Rc<RefCell<HashMap<u64, FfiResource>>>,
     /// Memory safety tracker for Rust-like ownership and borrowing
     memory_tracker: MemoryTracker,
     /// Maps raw Rc pointers of tracked arrays/maps to their MemoryId for mutation checks.
@@ -927,27 +929,21 @@ impl VM {
         }
     }
 
-    fn new_with(
-        module: Rc<RefCell<Module>>,
-        builtins: Rc<RefCell<Module>>,
-        module_cache: Rc<RefCell<HashMap<String, Rc<RefCell<Module>>>>>,
-        import_stack: Rc<RefCell<Vec<String>>>,
-        stdlib_config: Option<StdlibConfig>,
-        limits: Option<VmLimits>,
-        ffi_policy: Option<FfiPolicy>,
-    ) -> Self {
+    /// Imports execute in their caller's authority and resource realm.
+    fn new_for_import(&self, module: Rc<RefCell<Module>>) -> Self {
         Self {
             stack: vec![],
             module,
-            builtins,
-            module_cache,
-            import_stack,
+            builtins: self.builtins.clone(),
+            module_cache: self.module_cache.clone(),
+            import_stack: self.import_stack.clone(),
             frames: vec![],
             open_upvalues: vec![],
             handlers: vec![],
-            stdlib_config,
-            limits,
-            ffi_policy,
+            stdlib_config: self.stdlib_config.clone(),
+            limits: self.limits.clone(),
+            ffi_policy: self.ffi_policy.clone(),
+            ffi_resources: self.ffi_resources.clone(),
             memory_tracker: MemoryTracker::new(),
             object_memory_map: RefCell::new(HashMap::new()),
             thread_pool: None,
@@ -1012,6 +1008,7 @@ impl VM {
             stdlib_config: None,
             limits: None,
             ffi_policy: None,
+            ffi_resources: Rc::new(RefCell::new(HashMap::new())),
             memory_tracker: MemoryTracker::new(),
             object_memory_map: RefCell::new(HashMap::new()),
             thread_pool: None,
@@ -1069,6 +1066,7 @@ impl VM {
             handle_registry: VmHandleRegistry::new(),
             limits: None,
             ffi_policy,
+            ffi_resources: Rc::new(RefCell::new(HashMap::new())),
             stdin_lines: std::collections::VecDeque::new(),
             signal_handlers: Rc::new(RefCell::new(HashMap::new())),
             jit: None,
@@ -3218,15 +3216,7 @@ impl VmHost for VM {
                 .borrow_mut()
                 .insert(key.clone(), module_rc.clone());
 
-            let mut vm = VM::new_with(
-                module_rc.clone(),
-                self.builtins.clone(),
-                self.module_cache.clone(),
-                self.import_stack.clone(),
-                self.stdlib_config.clone(),
-                self.limits.clone(),
-                self.ffi_policy.clone(),
-            );
+            let mut vm = self.new_for_import(module_rc.clone());
             vm.run(chunk)?;
 
             Ok(Value::Module(module_rc))

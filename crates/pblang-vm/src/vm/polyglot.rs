@@ -27,14 +27,11 @@
 //! Visibility: every item is `pub(super)` so vm.rs reaches them via
 //! `fun: polyglot::polyglot_exec` in the BuiltinFn table.
 
-use std::sync::atomic::Ordering;
-
 use libloading::Library;
 use pblang_ir::{alloc_string, RuntimeError, Value, VmHost};
 
 use super::errors::vm_cap;
-use super::handles::{with_ffi_table, FFI_NEXT};
-use super::FfiResource;
+use super::handles::{insert_ffi_library, require_ffi_capacity};
 
 /// polyglot_exec(lang, code) — Execute code in a foreign language via subprocess.
 /// Supported langs: python, js (node), bash (sh), ruby, perl
@@ -1856,6 +1853,7 @@ pub(super) fn polyglot_compile_cached(
         }
     }
 
+    require_ffi_capacity(host)?;
     let key = polyglot_cache_key(lang_norm, code);
     let cache_dir = polyglot_cache_dir();
     if let Err(e) = std::fs::create_dir_all(&cache_dir) {
@@ -1885,11 +1883,7 @@ pub(super) fn polyglot_compile_cached(
         // explicit and serial.
         let lib = unsafe { Library::new(&cached_path) }
             .map_err(|e| host.err(format!("polyglot_compile_cached(): {e}")))?;
-        let id = with_ffi_table(host, |t| {
-            let id = FFI_NEXT.fetch_add(1, Ordering::Relaxed);
-            t.insert(id, FfiResource::Library(lib));
-            id
-        })?;
+        let id = insert_ffi_library(host, lib)?;
         return Ok(Value::Number(id as f64));
     }
 
@@ -2495,11 +2489,7 @@ pub(super) fn polyglot_compile_cached(
     // `host.allow_exec()` together (both required for this builtin).
     let lib = unsafe { Library::new(&cached_path) }
         .map_err(|e| host.err(format!("polyglot_compile_cached(): load: {e}")))?;
-    let id = with_ffi_table(host, |t| {
-        let id = FFI_NEXT.fetch_add(1, Ordering::Relaxed);
-        t.insert(id, FfiResource::Library(lib));
-        id
-    })?;
+    let id = insert_ffi_library(host, lib)?;
     Ok(Value::Number(id as f64))
 }
 

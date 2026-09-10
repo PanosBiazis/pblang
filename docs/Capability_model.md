@@ -140,7 +140,7 @@ be retried automatically because the complete record may already be visible.
 |-------|--------|
 | `max_instructions: Option<u64>` | Anti-infinite-loop. The VM aborts with `instruction limit exceeded` once N bytecode ops have run. |
 | `max_stack_depth: Option<usize>` | Anti-stack-overflow. Recursion past N call frames errors out. |
-| `max_memory_bytes: Option<usize>` | Best-effort heap cap. Enforced where the allocator can ask. |
+| `max_memory_bytes: Option<usize>` | Reserved configuration; intrinsic VM allocations are not hard-accounted or bounded by this field. |
 | `io_timeout_ms: Option<u64>` | Per-call timeout for `http_*`, `tcp_*`, and the `read_*`/`write_*` variants. |
 
 `VmLimits` are independent of `StdlibConfig` — you can grant `http: true`
@@ -155,17 +155,21 @@ inherits:
 * The same `VmLimits` (each child enforces independently).
 * The same `FfiPolicy`.
 
-This means a sandboxed parent **cannot** be tricked into running unrestricted
-code via spawn — there is no privilege-escalation channel.
+The child retains the parent capability policy. Limits are per child, so this
+is not an aggregate thread, memory or execution-time budget.
 
-The values passed across the channel are restricted to *transferable*
-types: numbers, booleans, nil, strings, and deeply-cloneable arrays / maps
-(including closed-upvalue closures). Handles (file descriptors, TCP
-streams, FFI library handles, SQLite connections) **cannot** cross the
-boundary — they're rejected at `send_value` with `value not transferable`.
+Transferable values include numbers, booleans, nil, strings, deeply cloneable
+arrays/maps and supported closed-upvalue closures. FFI handle numbers can be
+copied as data, but their libraries belong to the originating execution realm
+and are not available in the child's fresh realm. Imports within a program
+share its FFI realm and its 128-library cap. Network and SQLite tables still
+have process-global ownership; do not treat their numeric values as isolated
+capabilities. Concurrency tables are explicitly shared with spawned children.
 
-This is the same VM-per-thread isolation Erlang and Go use; it eliminates
-data races by construction.
+The C API `pblang_create_vm_sandboxed` always disables VM thread spawning and
+host process exit. This closes its previous unconditional `spawn` grant; the
+ordinary `pblang_create_vm` compatibility constructor remains unchanged.
+Neither constructor provides hard native memory or wall-time isolation.
 
 ## Recipes
 

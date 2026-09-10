@@ -131,7 +131,7 @@ pub extern "C" fn pblang_create_vm_sandboxed(
         exec: allow_exec != 0,
         gfx: false,
         import: allow_fs != 0,
-        spawn: true,
+        spawn: false,
         // Embedders that haven't opted into env reads shouldn't leak host secrets;
         // tie it to the exec capability (the closest "host access" gate they set).
         env: allow_exec != 0,
@@ -522,6 +522,19 @@ mod tests {
             let vm = pblang_create_vm();
             // null source on a valid vm → arg error.
             assert_eq!(pblang_eval(vm, std::ptr::null(), std::ptr::null_mut()), 2);
+            pblang_free_vm(vm);
+        }
+    }
+
+    #[test]
+    fn sandbox_denies_spawn_and_still_evaluates_arithmetic() {
+        unsafe {
+            let vm = pblang_create_vm_sandboxed(0, 0, 0, 0, 0);
+            let (rc, _) = eval(vm, "spawn(fn() { return 1; });");
+            assert_ne!(rc, 0);
+            let err = CStr::from_ptr(pblang_last_error(vm)).to_string_lossy();
+            assert!(err.contains("spawn not allowed"), "{err}");
+            assert_eq!(eval(vm, "print 6 * 7;"), (0, Some("42".into())));
             pblang_free_vm(vm);
         }
     }
