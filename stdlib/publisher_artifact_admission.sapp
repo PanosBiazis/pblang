@@ -1,0 +1,706 @@
+// Linux-only, non-authorizing admission of one publisher-attested artifact.
+//
+// The artifact path is opened exactly once into a sealed snapshot. Its signed
+// byte count and v2 digest are checked against that same snapshot, which then
+// remains held in a fixed-capacity private registry until close(). No API in
+// this module executes, exports, reopens, or reveals the admitted artifact.
+
+let SECURE = import("stdlib:secure_file.sapp");
+let TRUST = import("stdlib:publisher_trust_store.sapp");
+let RELEASE = import("stdlib:product_release_evidence.sapp");
+let CONCURRENCY = import("stdlib:concurrency.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+let FORMAT = "pblang.publisher-artifact-admission.v1";
+let REQUEST_FORMAT = "pblang.publisher-artifact-admission-request.v1";
+let HANDLE_FORMAT = "pblang.publisher-artifact-handle.v1";
+let POLYGLOT_CONTRACT_FORMAT = "pblang.publisher-artifact-polyglot-contract.v1";
+let FLOOR_FORMAT = "pblang.publisher-release-floor.v1";
+let FLOOR_EVIDENCE_FORMAT = "pblang.publisher-release-floor-evidence.v1";
+let MAX_ARTIFACT_BYTES = 16777216;
+let MAX_TOTAL_HELD_BYTES = 67108864;
+let MAX_OPEN_ADMISSIONS = 8;
+let MAX_FLOOR_BYTES = 2048;
+let _OWNER = nil;
+let _SLOTS = [
+    map{reserved:false,active:false,poisoned:false,id:"",reader:nil,size:0,floor_recorded:false},
+    map{reserved:false,active:false,poisoned:false,id:"",reader:nil,size:0,floor_recorded:false},
+    map{reserved:false,active:false,poisoned:false,id:"",reader:nil,size:0,floor_recorded:false},
+    map{reserved:false,active:false,poisoned:false,id:"",reader:nil,size:0,floor_recorded:false},
+    map{reserved:false,active:false,poisoned:false,id:"",reader:nil,size:0,floor_recorded:false},
+    map{reserved:false,active:false,poisoned:false,id:"",reader:nil,size:0,floor_recorded:false},
+    map{reserved:false,active:false,poisoned:false,id:"",reader:nil,size:0,floor_recorded:false},
+    map{reserved:false,active:false,poisoned:false,id:"",reader:nil,size:0,floor_recorded:false}
+];
+
+fn _has(values, wanted) {
+    if type(values) != "array" { return false; }
+    for value in values { if value == wanted { return true; } }
+    return false;
+}
+
+fn _exact(record, fields) {
+    if type(record) != "map" or len(record) != len(fields) { return false; }
+    for field in fields { if not map_has(record, field) { return false; } }
+    for key in map_keys(record) { if not _has(fields, key) { return false; } }
+    return true;
+}
+
+fn _path(value) {
+    return platform() == "linux" and type(value) == "string"
+        and len(str_to_bytes(value)) >= 2 and len(str_to_bytes(value)) <= 4096
+        and str_starts_with(value, "/")
+        and not str_contains(value, strfromcharcode(0));
+}
+
+fn _with_owner(operation) {
+    if _OWNER == nil {
+        let created = try CONCURRENCY.mutex() catch nil;
+        if created == nil { return map{ok:false}; }
+        _OWNER = created;
+    }
+    return try CONCURRENCY.try_with_mutex(_OWNER, operation)
+        catch map{ok:false};
+}
+
+fn _free_slot() {
+    let index = 0;
+    while index < len(_SLOTS) {
+        if not _SLOTS[index].reserved and not _SLOTS[index].active
+           and not _SLOTS[index].poisoned { return index; }
+        index = index + 1;
+    }
+    return -1;
+}
+
+fn _slot_by_id(id) {
+    let index = 0;
+    while index < len(_SLOTS) {
+        if _SLOTS[index].active and _SLOTS[index].id == id { return index; }
+        index = index + 1;
+    }
+    return -1;
+}
+
+fn _new_id() {
+    let attempt = 0;
+    while attempt < 8 {
+        let id = base64_encode_bytes(random_bytes(32));
+        if _slot_by_id(id) < 0 { return id; }
+        attempt = attempt + 1;
+    }
+    throw "publisher_artifact_admission: handle allocation rejected";
+}
+
+fn _digest(value) {
+    return type(value) == "string" and len(value) == 64
+        and regex_match(value, "^[0-9a-f]{64}$");
+}
+
+fn _framed(domain, values) {
+    let out = domain + "|";
+    for value in values {
+        let text = str(value);
+        out = out + str(len(str_to_bytes(text))) + ":" + text;
+    }
+    return out;
+}
+
+fn _targets_sha256(targets) {
+    let canonical = [];
+    for target in targets { array_push(canonical, target); }
+    canonical = array_sort(canonical);
+    return sha256(_framed("pblang.publisher-target-scope.v1", canonical));
+}
+
+fn _scope_sha256(publisher_id, product, package_id, release_channel,
+                 artifact_name, targets_sha256) {
+    return sha256(_framed("pblang.publisher-release-floor-scope.v1",
+        [publisher_id, product, package_id, release_channel, artifact_name,
+         targets_sha256]));
+}
+
+fn _held_bytes() {
+    let total = 0;
+    for slot in _SLOTS {
+        if slot.reserved or slot.active or slot.poisoned {
+            total = total + slot.size;
+        }
+    }
+    return total;
+}
+
+fn _clear_slot(slot) {
+    slot.reserved = false; slot.active = false; slot.poisoned = false;
+    slot.id = ""; slot.reader = nil; slot.size = 0; slot.floor_recorded = false;
+}
+
+fn _failure(reason, artifact_opened = false,
+             artifact_cleanup_attempted = false,
+             artifact_cleanup_verified = false,
+             trust_attempted = false,
+             trust_cleanup_verified = false,
+             cooperative_floor_state = "unavailable") {
+    return map{ok:false, format:FORMAT, reason:reason, handle:nil,
+        artifact_snapshot_opened:artifact_opened,
+        artifact_snapshot_immutable:false,
+        artifact_bytes_measured:false, signed_byte_count_matched:false,
+        signed_digest_matched:false, artifact_digest_algorithm_signed:false,
+        configured_store_signature_verified:false,
+        protected_store_snapshot_verified:false,
+        artifact_snapshot_cleanup_attempted:artifact_cleanup_attempted,
+        artifact_snapshot_cleanup_verified:artifact_cleanup_verified,
+        trust_store_snapshot_attempted:trust_attempted,
+        trust_store_snapshot_cleanup_verified:trust_cleanup_verified,
+        same_object_prepared:false, same_verified_artifact_handoff:false,
+        cooperative_floor_state:cooperative_floor_state,
+        cooperative_floor_advanced_verified:false,
+        cooperative_local_replay_floor_recorded:false,
+        private_state_parent_verified:false,
+        floor_durability_verified:false, floor_readback_verified:false,
+        floor_lock_cleanup_verified:false,
+        floor_state_root_cleanup_verified:false,
+        bearer_handle_issued:false, bearer_handle_copy_resistant:false,
+        same_vm_handle_only:false, same_vm_handle_scope_verified:false,
+        cross_vm_handle_isolation:false,
+        hostile_caller_capacity_isolation:false,
+        vm_enforced_typed_ffi:false,
+        operator_trust_anchor_origin_verified:false,
+        revocation_freshness_verified:false,
+        rollback_protection_enforced:false,
+        publisher_authenticity_verified:false,
+        authorizes_execution:false, production_ready:false};
+}
+
+fn _cleanup_reserved(slot, reader, reason, trust_attempted,
+                     trust_cleanup_verified,
+                     cooperative_floor_state = "unavailable") {
+    let closed = try SECURE.close_immutable_reader(reader)
+        catch map{ok:false};
+    slot.reserved = false; slot.active = false; slot.id = "";
+    if closed.ok {
+        _clear_slot(slot);
+    } else {
+        // The close API is non-retryable. Preserve an explicit poisoned slot so
+        // uncertain ownership can never be reused or omitted from accounting.
+        slot.poisoned = true; slot.reader = reader;
+    }
+    return _failure(if closed.ok { reason }
+        else { "artifact-snapshot-cleanup-rejected" }, true, true, closed.ok,
+        trust_attempted, trust_cleanup_verified, cooperative_floor_state);
+}
+
+fn _prepare_locked(request, floor_request = nil, expected_store_sha256 = nil, store_evidence = nil) {
+    if not _exact(request, ["format", "trust_store_path", "artifact_path",
+            "source", "artifact", "attestation"])
+       or request.format != REQUEST_FORMAT
+       or not _path(request.trust_store_path) or not _path(request.artifact_path)
+       or type(request.source) != "map" or type(request.artifact) != "map"
+       or type(request.attestation) != "map" {
+        return _failure("invalid-request");
+    }
+    let floor_requested = floor_request != nil;
+    if floor_requested and (not _exact(floor_request,
+            ["state_root", "expectation"])
+       or type(floor_request.state_root) != "string"
+       or floor_request.state_root == "/"
+       or str_ends_with(floor_request.state_root, "/")
+       or len(str_to_bytes(floor_request.state_root)) > 4096
+       or not str_starts_with(floor_request.state_root, "/")
+       or str_contains(floor_request.state_root, strfromcharcode(0))
+       or not _has(["missing", "present"], floor_request.expectation)) {
+        return _failure("invalid-floor-request");
+    }
+    let signed_size = try request.artifact.byte_count catch nil;
+    let signed_digest = try request.artifact.artifact_sha256 catch nil;
+    if type(signed_size) != "number" or signed_size != num_floor(signed_size)
+       or signed_size < 1 or signed_size > MAX_ARTIFACT_BYTES
+       or type(signed_digest) != "string"
+       or not regex_match(signed_digest, "^[0-9a-f]{64}$") {
+        return _failure("invalid-artifact-claims");
+    }
+
+    // Reject malformed schemas, scopes and signatures before copying or
+    // hashing artifact bytes. This bounds unauthenticated work to the small
+    // trust-store and pure Ed25519 limits.
+    let verified = if expected_store_sha256 == nil {
+        TRUST.verify_current_snapshot_v2(request.trust_store_path,
+            request.source, request.artifact, request.attestation)
+    } else {
+        TRUST.verify_expected_current_snapshot_v2(request.trust_store_path,
+            expected_store_sha256, request.source, request.artifact, request.attestation)
+    };
+    let trusted = verified.ok
+        and verified.protected_store_snapshot_verified
+        and verified.snapshot_cleanup_verified
+        and verified.configured_store_key_signature_verified
+        and (try verified.artifact_digest_algorithm_signed catch false)
+        and (try verified.artifact_digest_algorithm catch "")
+            == RELEASE.ARTIFACT_DIGEST_ALGORITHM;
+    if not trusted {
+        return _failure("publisher-attestation-rejected", false, false, false,
+            true, try verified.snapshot_cleanup_verified catch false);
+    }
+    if store_evidence != nil {
+        store_evidence.matched = (try verified.caller_expected_store_digest_matched catch false);
+    }
+    let binding = try {
+        let target_digest = _targets_sha256(request.attestation.targets);
+        map{ok:true, publisher_id:verified.publisher_id,
+            product:request.source.product,
+            package_id:request.attestation.package_id,
+            release_channel:request.attestation.release_channel,
+            artifact_name:request.attestation.artifact_name,
+            targets_sha256:target_digest,
+            scope_sha256:_scope_sha256(verified.publisher_id,
+                request.source.product, request.attestation.package_id,
+                request.attestation.release_channel,
+                request.attestation.artifact_name, target_digest),
+            key_id:verified.key_id, policy_revision:verified.policy_revision,
+            store_generation:verified.store_generation,
+            release_sequence:request.attestation.release_sequence,
+            artifact_sha256:signed_digest}
+    } catch map{ok:false};
+    if not binding.ok {
+        return _failure("publisher-binding-rejected", false, false, false,
+            true, true);
+    }
+
+    let slot_index = _free_slot();
+    if slot_index < 0 {
+        return _failure("admission-capacity-reached", false, false, false,
+            true, true);
+    }
+    let held = _held_bytes();
+    if held > MAX_TOTAL_HELD_BYTES - signed_size {
+        return _failure("admission-byte-capacity-reached", false, false, false,
+            true, true);
+    }
+    // Reserve fixed storage before acquiring the descriptor. Later allocation
+    // or publication failure therefore always has an ownership record.
+    let slot = _SLOTS[slot_index];
+    _clear_slot(slot);
+    slot.reserved = true; slot.active = false; slot.poisoned = false;
+    slot.id = ""; slot.reader = nil; slot.size = signed_size;
+
+    // Requiring a private parent prevents another same-host account from
+    // replacing the source name while admission is opening it. The sealed
+    // snapshot is the only object used after this point.
+    // The copy ceiling must equal the bytes reserved above, even if the
+    // caller-selected file is larger than the signed artifact claim.
+    let reader = try SECURE.open_immutable_reader(request.artifact_path,
+        signed_size, true) catch map{ok:false};
+    if not reader.ok {
+        _clear_slot(slot);
+        return _failure("artifact-open-rejected", false, false, false,
+            true, true);
+    }
+    slot.reader = reader;
+    let measured = try SECURE.immutable_reader_base64_sha256(reader, 0, reader.size)
+        catch map{ok:false};
+    if not measured.ok or reader.size != signed_size
+       or measured.sha256 != signed_digest {
+        return _cleanup_reserved(slot, reader, "artifact-measurement-mismatch",
+            true, true);
+    }
+
+    // Allocate the complete public response before making the slot active. If
+    // allocation fails, no unreachable active handle can be orphaned.
+    let publication_reason = if floor_requested {
+        "measured-snapshot-with-cooperative-floor-prepared"
+    } else { "measured-snapshot-prepared" };
+    let publication_floor_state = if floor_requested {
+        "recorded"
+    } else { "not-requested" };
+    let publication = try {
+        let issued = _new_id();
+        let response = map{ok:true, format:FORMAT,
+            reason:publication_reason,
+            handle:map{format:HANDLE_FORMAT, id:issued},
+            artifact_snapshot_opened:true, artifact_snapshot_immutable:true,
+            artifact_bytes_measured:true, signed_byte_count_matched:true,
+            signed_digest_matched:true, artifact_digest_algorithm_signed:true,
+            configured_store_signature_verified:true,
+            protected_store_snapshot_verified:true,
+            artifact_snapshot_cleanup_attempted:false,
+            artifact_snapshot_cleanup_verified:false,
+            trust_store_snapshot_attempted:true,
+            trust_store_snapshot_cleanup_verified:true,
+            same_object_prepared:true, same_verified_artifact_handoff:false,
+            cooperative_floor_state:publication_floor_state,
+            cooperative_floor_advanced_verified:floor_requested,
+            cooperative_local_replay_floor_recorded:floor_requested,
+            private_state_parent_verified:floor_requested,
+            floor_durability_verified:floor_requested,
+            floor_readback_verified:floor_requested,
+            floor_lock_cleanup_verified:floor_requested,
+            floor_state_root_cleanup_verified:floor_requested,
+            bearer_handle_issued:true, bearer_handle_copy_resistant:false,
+            same_vm_handle_only:false, same_vm_handle_scope_verified:false,
+            cross_vm_handle_isolation:false,
+            hostile_caller_capacity_isolation:false,
+            vm_enforced_typed_ffi:false,
+            operator_trust_anchor_origin_verified:false,
+            revocation_freshness_verified:false,
+            rollback_protection_enforced:false,
+            publisher_authenticity_verified:false,
+            authorizes_execution:false, production_ready:false};
+        map{ok:true, id:issued, response:response}
+    } catch map{ok:false, id:""};
+    if not publication.ok {
+        return _cleanup_reserved(slot, reader, "handle-publication-rejected",
+            true, true);
+    }
+    if floor_requested {
+        // The cooperative state transition occurs while the measured reader is
+        // still reserved and before any bearer handle becomes observable.
+        let floor = try _advance_after_binding(binding,
+            floor_request.state_root, floor_request.expectation)
+            catch map{ok:false, evidence_indeterminate:true};
+        if not floor.ok {
+            let floor_state = if try floor.evidence_indeterminate catch true {
+                "indeterminate"
+            } else { "rejected" };
+            return _cleanup_reserved(slot, reader,
+                try floor.reason catch "cooperative-floor-internal-rejected",
+                true, true, floor_state);
+        }
+    }
+    let committed = try {
+        slot.id = publication.id; slot.reader = reader;
+        slot.floor_recorded = floor_requested;
+        slot.active = true; slot.reserved = false;
+        true
+    } catch false;
+    if not committed {
+        return _cleanup_reserved(slot, reader, "handle-publication-rejected",
+            true, true, if floor_requested {
+                "recorded-without-handle"
+            } else { "unavailable" });
+    }
+    return publication.response;
+}
+
+fn prepare(request) {
+    let guarded = _with_owner(fn() { return _prepare_locked(request, nil); });
+    if not guarded.ok { return _failure("admission-owner-busy-or-unavailable"); }
+    return guarded.value;
+}
+
+// Caller-selected digest binding is independent of operator trust. Validate
+// before acquiring the owner or opening either store or artifact.
+fn _prepare_expected(request, expected_store_sha256, floor_request) {
+    let result = nil; let evidence = map{matched:false};
+    if not _digest(expected_store_sha256) {
+        result = _failure("invalid-expected-store-digest");
+    } else {
+        let guarded = _with_owner(fn() {
+            return _prepare_locked(request, floor_request, expected_store_sha256, evidence);
+        });
+        result = if guarded.ok { guarded.value }
+            else { _failure("admission-owner-busy-or-unavailable") };
+    }
+    result.caller_expected_store_digest_requested = true;
+    result.caller_expected_store_digest_matched = evidence.matched;
+    return result;
+}
+
+fn prepare_with_expected_store(request, expected_store_sha256) {
+    return _prepare_expected(request, expected_store_sha256, nil);
+}
+
+fn prepare_with_expected_store_and_cooperative_floor(request,
+        expected_store_sha256, state_root, expectation) {
+    return _prepare_expected(request, expected_store_sha256,
+        map{state_root:state_root, expectation:expectation});
+}
+
+fn prepare_with_cooperative_floor(request, state_root, expectation) {
+    let floor_request = map{state_root:state_root, expectation:expectation};
+    let guarded = _with_owner(fn() {
+        return _prepare_locked(request, floor_request);
+    });
+    if not guarded.ok { return _failure("admission-owner-busy-or-unavailable"); }
+    return guarded.value;
+}
+
+fn _positive_integer(value) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= 1 and value <= 9007199254740991;
+}
+
+fn _floor_record(binding) {
+    return map{format:FLOOR_FORMAT, scope_sha256:binding.scope_sha256,
+        key_id:binding.key_id, policy_revision:binding.policy_revision,
+        store_generation:binding.store_generation,
+        release_sequence:binding.release_sequence,
+        artifact_digest_algorithm:RELEASE.ARTIFACT_DIGEST_ALGORITHM,
+        artifact_sha256:binding.artifact_sha256};
+}
+
+fn _validated_floor(record, binding) {
+    if not _exact(record, ["format", "scope_sha256", "key_id",
+            "policy_revision", "store_generation", "release_sequence",
+            "artifact_digest_algorithm", "artifact_sha256"])
+       or record.format != FLOOR_FORMAT
+       or not _digest(record.scope_sha256)
+       or record.scope_sha256 != binding.scope_sha256
+       or not _digest(record.key_id) or not _digest(record.artifact_sha256)
+       or not _positive_integer(record.policy_revision)
+       or not _positive_integer(record.store_generation)
+       or not _positive_integer(record.release_sequence)
+       or record.artifact_digest_algorithm != RELEASE.ARTIFACT_DIGEST_ALGORITHM {
+        return map{ok:false};
+    }
+    return map{ok:true, value:record};
+}
+
+fn _floor_failure(reason, evidence_indeterminate = false) {
+    return map{ok:false, format:FLOOR_EVIDENCE_FORMAT, reason:reason,
+        measured_snapshot_bound:true,
+        signed_release_sequence_bound:true,
+        cooperative_floor_advanced_verified:false,
+        cooperative_local_replay_floor_recorded:false,
+        private_state_parent_verified:false,
+        durability_verified:false, readback_verified:false,
+        lock_cleanup_verified:false, state_root_cleanup_verified:false,
+        evidence_indeterminate:evidence_indeterminate,
+        retry_safe:false, state_path_exposed:false,
+        state_record_exposed:false, digest_exposed:false,
+        sequence_exposed:false,
+        bearer_handle_copy_resistant:false,
+        same_vm_handle_only:false, same_vm_handle_scope_verified:false,
+        cross_vm_handle_isolation:false,
+        hostile_caller_capacity_isolation:false,
+        vm_enforced_typed_ffi:false,
+        hard_heap_enforcement:false, hard_wall_preemption:false,
+        hostile_code_sandbox:false,
+        operator_trust_anchor_origin_verified:false,
+        revocation_freshness_verified:false,
+        same_verified_artifact_handoff:false,
+        rollback_protection_enforced:false,
+        publisher_authenticity_verified:false,
+        authorizes_execution:false, production_ready:false};
+}
+
+fn _floor_success(initialized) {
+    return map{ok:true, format:FLOOR_EVIDENCE_FORMAT,
+        reason:if initialized { "cooperative-floor-initialized" }
+            else { "cooperative-floor-advanced" },
+        measured_snapshot_bound:true,
+        signed_release_sequence_bound:true,
+        cooperative_floor_advanced_verified:true,
+        cooperative_local_replay_floor_recorded:true,
+        private_state_parent_verified:true,
+        durability_verified:true, readback_verified:true,
+        lock_cleanup_verified:true, state_root_cleanup_verified:true,
+        evidence_indeterminate:false, retry_safe:false,
+        state_path_exposed:false, state_record_exposed:false,
+        digest_exposed:false, sequence_exposed:false,
+        bearer_handle_copy_resistant:false,
+        same_vm_handle_only:false, same_vm_handle_scope_verified:false,
+        cross_vm_handle_isolation:false,
+        hostile_caller_capacity_isolation:false,
+        vm_enforced_typed_ffi:false,
+        hard_heap_enforcement:false, hard_wall_preemption:false,
+        hostile_code_sandbox:false,
+        operator_trust_anchor_origin_verified:false,
+        revocation_freshness_verified:false,
+        same_verified_artifact_handoff:false,
+        rollback_protection_enforced:false,
+        publisher_authenticity_verified:false,
+        authorizes_execution:false, production_ready:false};
+}
+
+fn _load_floor(path, binding) {
+    let reader = SECURE.open_immutable_reader(path, MAX_FLOOR_BYTES, true);
+    if not reader.ok { return map{ok:false, reason:"floor-open-rejected"}; }
+    let attempt = try {
+        let loaded = SECURE.immutable_reader_range(reader, 0, reader.size);
+        let text = if loaded.ok { try bytes_to_str(loaded.bytes) catch nil }
+            else { nil };
+        let document = if type(text) == "string" {
+            try json_parse(text) catch map{}
+        } else { map{} };
+        let checked = _validated_floor(document, binding);
+        map{ok:loaded.ok and checked.ok and json_stringify(document) == text,
+            record:if checked.ok { checked.value } else { map{} },
+            sha256:if loaded.ok { SHA256.sha256_hex_bytes(loaded.bytes) } else { "" }}
+    } catch map{ok:false, record:map{}, sha256:""};
+    let closed = try SECURE.close_immutable_reader(reader)
+        catch map{ok:false};
+    if not closed.ok {
+        return map{ok:false, reason:"floor-snapshot-cleanup-rejected"};
+    }
+    if not attempt.ok { return map{ok:false, reason:"invalid-floor-record"}; }
+    return map{ok:true, record:attempt.record, sha256:attempt.sha256};
+}
+
+fn _advance_after_binding(binding, state_root, expectation) {
+    let root = SECURE.private_directory_status(state_root);
+    if not root.ok { return _floor_failure("private-state-root-rejected"); }
+    let path = state_root + "/publisher-floor-" + binding.scope_sha256 + ".json";
+    let replacement = str_to_bytes(json_stringify(_floor_record(binding)));
+    if len(replacement) > MAX_FLOOR_BYTES {
+        return _floor_failure("floor-record-too-large");
+    }
+    let initialized = expectation == "missing";
+    let cas_expectation = map{kind:"missing", algorithm:"none", sha256:""};
+    if not initialized {
+        let current = _load_floor(path, binding);
+        if not current.ok { return _floor_failure(current.reason); }
+        let prior = current.record;
+        if binding.release_sequence <= prior.release_sequence {
+            return _floor_failure("release-sequence-not-increasing");
+        }
+        if binding.store_generation < prior.store_generation
+           or binding.policy_revision < prior.policy_revision {
+            return _floor_failure("trust-generation-or-policy-rollback");
+        }
+        if binding.policy_revision == prior.policy_revision
+           and binding.key_id != prior.key_id {
+            return _floor_failure("key-change-without-policy-advance");
+        }
+        cas_expectation = map{kind:"present",
+            algorithm:SECURE.RAW_SHA256_ALGORITHM, sha256:current.sha256};
+    }
+    let changed = try SECURE.private_compare_and_swap(path, cas_expectation,
+        replacement, MAX_FLOOR_BYTES, 2000) catch map{ok:false,
+            evidence_indeterminate:true};
+    let policy = cooperative_floor_result_policy(changed);
+    if not policy.accepted {
+        return _floor_failure("cooperative-floor-publication-rejected",
+            policy.evidence_indeterminate);
+    }
+    return _floor_success(initialized);
+}
+
+// Pure, non-authorizing classification of the secure-file dependency result.
+// It exists so partial-publication fault classes can be tested without granting
+// a test hook access to paths, descriptors, or the real CAS operation.
+fn cooperative_floor_result_policy(changed) {
+    let accepted = type(changed) == "map"
+        and (try changed.ok catch false)
+        and (try changed.published catch false)
+        and (try changed.effect_completed catch false)
+        and not (try changed.retry_safe catch true)
+        and (try changed.cooperative_only catch false)
+        and (try changed.private_parent_verified catch false)
+        and (try changed.digest_algorithm catch "")
+            == SECURE.RAW_SHA256_ALGORITHM
+        and (try changed.readback_verified catch false)
+        and (try changed.durability_verified catch false)
+        and (try changed.lock_released catch false)
+        and (try changed.root_closed catch false)
+        and not (try changed.evidence_indeterminate catch true);
+    let effect_observed = type(changed) == "map"
+        and ((try changed.published catch false)
+            or (try changed.effect_completed catch false)
+            or (try changed.readback_verified catch false));
+    let indeterminate = not accepted
+        and (effect_observed
+            or (try changed.evidence_indeterminate catch true));
+    return map{format:"pblang.publisher-floor-result-policy.v1",
+        accepted:accepted, evidence_indeterminate:indeterminate,
+        retry_safe:false, mutates_state:false,
+        authorizes_external_effect:false, production_ready:false};
+}
+
+fn _close_locked(handle) {
+    if not _exact(handle, ["format", "id"]) or handle.format != HANDLE_FORMAT
+       or type(handle.id) != "string" or len(handle.id) != 44 {
+        return map{ok:false, closed:false,
+            reason:"invalid-or-closed-artifact-handle"};
+    }
+    let index = _slot_by_id(handle.id);
+    if index < 0 { return map{ok:false, closed:false,
+        reason:"invalid-or-closed-artifact-handle"}; }
+    let slot = _SLOTS[index];
+    let closed = try SECURE.close_immutable_reader(slot.reader)
+        catch map{ok:false};
+    slot.active = false; slot.reserved = false; slot.id = "";
+    if closed.ok { _clear_slot(slot); }
+    else { slot.poisoned = true; }
+    return map{ok:closed.ok, closed:true, ownership_consumed:true,
+        cleanup_verified:closed.ok, slot_poisoned:not closed.ok,
+        retryable:false};
+}
+
+fn close(handle) {
+    let guarded = _with_owner(fn() { return _close_locked(handle); });
+    if not guarded.ok { return map{ok:false, closed:false,
+        reason:"admission-owner-busy-or-unavailable"}; }
+    return guarded.value;
+}
+
+// Foreign-language components may implement this contract later, but they may
+// not receive a path, descriptor, key, bytes, or trust boolean from this API.
+fn polyglot_adapter_contract() {
+    return map{format:POLYGLOT_CONTRACT_FORMAT,
+        canonical_policy_owner:"pblang",
+        canonical_attestation_owner:"pblang",
+        descriptor_lifecycle_owner:"pblang",
+        allowed_public_input:["copyable-bearer-handle"],
+        forbidden_public_input:["artifact-path", "trust-store-path", "file-descriptor",
+            "artifact-bytes", "publisher-public-key", "authorization-boolean",
+            "release-floor-state-root", "prior-floor-record", "release-sequence",
+            "state-digest"],
+        path_reopen_allowed:false, shell_execution_allowed:false,
+        inherited_path_lookup_allowed:false,
+        implementation_present:false, execution_adapter_present:false,
+        authorizes_execution:false, production_ready:false};
+}
+
+fn status() {
+    let secure = try SECURE.available() catch map{ok:false};
+    let operational = platform() == "linux" and (try secure.ok catch false);
+    let open_count = 0; let reserved_count = 0; let poisoned_count = 0;
+    let floor_recorded_count = 0;
+    for slot in _SLOTS {
+        if slot.active { open_count = open_count + 1; }
+        if slot.reserved { reserved_count = reserved_count + 1; }
+        if slot.poisoned { poisoned_count = poisoned_count + 1; }
+        if slot.active and slot.floor_recorded {
+            floor_recorded_count = floor_recorded_count + 1;
+        }
+    }
+    return map{format:"pblang.publisher-artifact-admission-status.v1",
+        available:operational, experimental:true,
+        digest_algorithm:RELEASE.ARTIFACT_DIGEST_ALGORITHM,
+        max_artifact_bytes:MAX_ARTIFACT_BYTES,
+        max_total_held_bytes:MAX_TOTAL_HELD_BYTES,
+        max_open_admissions:MAX_OPEN_ADMISSIONS,
+        open_admissions:open_count, reserved_admissions:reserved_count,
+        poisoned_admissions:poisoned_count,
+        held_or_reserved_bytes:_held_bytes(), fixed_capacity_registry:true,
+        max_floor_bytes:MAX_FLOOR_BYTES,
+        cooperative_floor_supported:operational,
+        cooperative_floor_recorded_admissions:floor_recorded_count,
+        immutable_artifact_measurement_supported:operational,
+        same_object_preparation_supported:operational,
+        same_verified_artifact_handoff_supported:false,
+        execution_supported:false, polyglot_contract_available:true,
+        polyglot_adapter_implemented:false,
+        bearer_handle_copy_resistant:false,
+        same_vm_handle_only:false, same_vm_handle_scope_verified:false,
+        cross_vm_handle_isolation:false,
+        hostile_caller_capacity_isolation:false,
+        vm_enforced_typed_ffi:false,
+        operator_trust_anchor_origin_supported:false,
+        revocation_freshness_supported:false,
+        rollback_enforcement_supported:false,
+        hard_heap_enforcement_supported:false,
+        hard_wall_preemption_supported:false,
+        hostile_code_sandbox_supported:false,
+        publisher_authenticity_complete:false,
+        authorizes_execution:false, production_ready:false};
+}
+
+export FORMAT, REQUEST_FORMAT, HANDLE_FORMAT, POLYGLOT_CONTRACT_FORMAT,
+       FLOOR_FORMAT, FLOOR_EVIDENCE_FORMAT,
+       MAX_ARTIFACT_BYTES, MAX_TOTAL_HELD_BYTES, MAX_OPEN_ADMISSIONS,
+       MAX_FLOOR_BYTES;
+export prepare, prepare_with_cooperative_floor,
+       prepare_with_expected_store, prepare_with_expected_store_and_cooperative_floor,
+       cooperative_floor_result_policy, close,
+       polyglot_adapter_contract, status;
