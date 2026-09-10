@@ -101,11 +101,16 @@ The local Raspberry target has two intentionally different gates:
   enough to mount the real root filesystem and start systemd as ARM64. QEMU's
   Pi model does not fully implement VideoCore firmware, GPIO, Wi-Fi, or timing,
   so physical-board behavior is not claimed.
-- `tools/pbemucheck.sapp` generates Linux AArch64 ELF files with pblang and
-  executes them through the independent `qemu-aarch64-static` oracle. Each
-  seeded case and artifact digest is retained in a content-addressed report.
+- `tools/pbemucheck.sapp` generates Linux AArch64 ELF files with pblang,
+  creates them exclusively inside a private random per-run directory, measures
+  them before and after execution and removes only an unchanged artifact after
+  the bounded fixed `/usr/bin/qemu-aarch64-static` run. Each seeded input,
+  artifact, exit and output digest is retained in a content-addressed,
+  self-reported claim. Because QEMU still receives a mutable pathname,
+  artifact/result binding, same-object handoff,
+  QEMU publisher/digest authenticity and oracle independence are not verified.
 
-Run the independent code-generation gate with:
+Run the structural code-generation comparison with:
 
 ```sh
 pblang run tools/pbemucheck.sapp --allow-all
@@ -186,3 +191,31 @@ controller artifact installed by the provisioning workflow.
 - interrupted runs recover deterministically or quarantine the guest;
 - privacy scans find no credential or personal-path material;
 - exact-release evidence is created only after shutdown and cleanup verification.
+
+## Pinned external QEMU maintenance campaign (2026-09-10)
+
+`tools/pbemucheck.sapp` still defaults to the fixed system AArch64 QEMU.
+A trusted maintainer can instead provide both `PBLANG_QEMU_AARCH64` (absolute
+executable path) and `PBLANG_QEMU_BASE64_SHA256` (64 lowercase hexadecimal
+characters). The digest is **SHA-256 of the Base64 encoding of the executable
+bytes**, matching `linux_process.prepare_fixed_verified`; it is not the usual
+raw-byte `sha256sum`. Neither value is written into the differential report.
+
+The optional executable is copied into a sealed snapshot, measured once, held
+across the five fixed benign cases and duplicated for each bounded launch.
+No caller IR, source or child arguments are accepted. A bad/missing pair rejects
+before artifact creation; a digest mismatch rejects before any case execution.
+Each child must terminate and clean its owned state before ELF inspection or
+removal. Uncertain states get one bounded recovery attempt; unresolved recovery
+retains artifacts and fails the campaign. Final prepared-descriptor close gates
+success. Reports use the explicit `pblang.emulator-differential.v2` schema; legacy v1
+claims must be regenerated and are never silently upgraded.
+
+Child limits are 7 seconds wall time, 3 CPU seconds, 512 MiB address space,
+64 descriptors, 4096 captured output bytes and 1 MiB file output. The 2048 task
+limit is shared by the host UID, as required by RLIMIT_NPROC semantics; it does
+not establish a private descendant budget. Case durations are rounded upward
+to integral milliseconds for the differential-report contract. This campaign
+proves only the selected external computations. Publisher authenticity, oracle
+independence, full ISA coverage, guest OS coverage and physical-device support
+remain unverified. See `RELEASE_QEMU_VALIDATION_2026-09-10.md` for current results.

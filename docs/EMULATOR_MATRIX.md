@@ -87,6 +87,30 @@ Biological, protein, analog-signal, FPGA, NPU, and other non-ISA substrates
 require a defined operation/protocol contract before executable emulation can
 be honest.
 
+Differential reports use `pblang.emulator-differential.v2`. Legacy v1 reports
+are rejected: their independence flag cannot establish the new evidence
+contract. Regenerate reports with the current tool; renaming a format field is
+not a migration. Every declared comparison field must exist on both sides;
+absent fields fail even when both are missing, while explicit `nil` remains a
+valid scalar value.
+
+`stdlib:emulator_diff.sapp` separates per-case differential comparison from
+cross-target claim coverage. `report(...)` binds the caller's backend/oracle,
+source digest and platform/architecture/ABI claim to an exact digest, but does
+not authenticate the runner or verify independence. `coverage_matrix(...)`
+validates and detaches every bounded case before hashing, re-verifies the digest
+and pass count, rejects duplicate case and backend/oracle/target identities,
+and requires one passing claim for every requested target tuple. External cases
+must bind input, artifact, exit, stdout and stderr digests. All reports in one
+matrix must share the same ordered campaign input-state digest; target-specific
+artifacts remain bound by each report digest. Scalar strings,
+canonical cases, reports and matrices have explicit byte ceilings. The matrix
+is bounded to 128 reports and 32 target keys. A full set is only structurally
+complete and self-reported; `ok`,
+`complete` and `independent_execution_verified` remain false until a future
+trusted runner verifies provenance. It never claims physical device testing,
+complete kernel/driver emulation, or production readiness.
+
 The 6502, Z80, AVR, MSP430, MIPS32, PowerPC32, SPARC V8/LEON, RISC-V, and
 WebAssembly subsets
 are available to applications as `stdlib:emulator_6502.sapp`,

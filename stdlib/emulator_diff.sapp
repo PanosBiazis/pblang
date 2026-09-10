@@ -1,19 +1,152 @@
 // Deterministic contracts for comparing a pblang execution model with an
-// independent emulator.  This module is deliberately pure: process launch,
+// external emulator claim. This module is deliberately pure: process launch,
 // artifact creation, and credentials belong to the caller.
 
-let FORMAT = "pblang.emulator-differential.v1";
+let FORMAT = "pblang.emulator-differential.v2";
 let MAX_CASES = 4096;
 let MAX_FIELDS = 32;
+let MAX_REPORTS = 128;
+let MAX_ARCHITECTURES = 32;
+let MAX_SCALAR_STRING_BYTES = 1024;
+let MAX_CASE_CANONICAL_BYTES = 131072;
+let MAX_REPORT_CANONICAL_BYTES = 1048576;
+let MAX_MATRIX_CANONICAL_BYTES = 16777216;
 
 fn _safe_id(value) {
     return type(value)=="string" and len(value)>=1 and len(value)<=96
+        and len(str_to_bytes(value))<=96
         and regex_match(value,"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$");
 }
 
 fn _scalar(value) {
     let t=type(value);
-    return t=="number" or t=="string" or t=="bool" or t=="nil";
+    if t=="nil" or t=="bool" { return true; }
+    if t=="number" {
+        let rendered=str_lower(str(value));
+        return rendered!="nan" and not str_contains(rendered,"inf");
+    }
+    if t!="string" or len(value)>MAX_SCALAR_STRING_BYTES
+       or len(str_to_bytes(value))>MAX_SCALAR_STRING_BYTES {
+        return false;
+    }
+    let i=0;
+    while i<len(value) {
+        let code=strcharcodeat(value,i);
+        if code<32 or code==127 or (code>=128 and code<=159)
+           or code==1564 or code==8206 or code==8207
+           or (code>=8234 and code<=8238) or (code>=8294 and code<=8297) {
+            return false;
+        }
+        i=i+1;
+    }
+    return true;
+}
+
+fn _has(values,value) {
+    for item in values { if item==value { return true; } }
+    return false;
+}
+
+fn _hex(value) {
+    return type(value)=="string" and regex_match(value,"^[0-9a-f]{64}$");
+}
+
+fn _exact_keys(row, required, optional, label) {
+    if type(row)!="map" or len(row)<len(required)
+       or len(row)>len(required)+len(optional) {
+        throw "emulator_diff: invalid " + label + " field count";
+    }
+    for key in required {
+        if not map_has(row,key) { throw "emulator_diff: incomplete " + label; }
+    }
+    for key in map_keys(row) {
+        if not _has(required,key) and not _has(optional,key) {
+            throw "emulator_diff: unknown " + label + " field";
+        }
+    }
+}
+
+fn _validated_case(row) {
+    if type(row)!="map" { throw "emulator_diff: invalid comparison"; }
+    let required=["id","seed","ok","fields","differences"];
+    let optional=["input_sha256","artifact_sha256","artifact_path","oracle_exit_code",
+        "oracle_stdout_sha256","oracle_stderr_sha256","duration_ms"];
+    _exact_keys(row,required,optional,"comparison");
+    if not _safe_id(row.id) or type(row.seed)!="number"
+       or row.seed!=num_floor(row.seed) or row.seed<0 or row.seed>4294967295
+       or type(row.ok)!="bool" or type(row.fields)!="array"
+       or len(row.fields)<1 or len(row.fields)>MAX_FIELDS
+       or type(row.differences)!="array" or len(row.differences)>len(row.fields)
+       or row.ok!=(len(row.differences)==0) {
+        throw "emulator_diff: invalid comparison";
+    }
+    let seen=map{}; let fields=[];
+    for field in row.fields {
+        if not _safe_id(field) or map_has(seen,field) {
+            throw "emulator_diff: invalid comparison fields";
+        }
+        seen[field]=true;
+        array_push(fields,field);
+    }
+    let differences=[]; let difference_seen=map{};
+    for difference in row.differences {
+        if type(difference)!="map" or len(difference)!=5
+           or not map_has(difference,"field")
+           or not map_has(difference,"expected_present")
+           or not map_has(difference,"actual_present")
+           or not map_has(difference,"expected") or not map_has(difference,"actual")
+           or not _safe_id(difference.field)
+           or not map_has(seen,difference.field)
+           or map_has(difference_seen,difference.field)
+           or type(difference.expected_present)!="bool"
+           or type(difference.actual_present)!="bool"
+           or not _scalar(difference.expected) or not _scalar(difference.actual)
+           or (not difference.expected_present and difference.expected!=nil)
+           or (not difference.actual_present and difference.actual!=nil)
+           or (difference.expected_present and difference.actual_present
+               and difference.expected==difference.actual) {
+            throw "emulator_diff: invalid comparison difference";
+        }
+        difference_seen[difference.field]=true;
+        array_push(differences,map{field:difference.field,
+            expected_present:difference.expected_present,
+            actual_present:difference.actual_present,expected:difference.expected,
+            actual:difference.actual});
+    }
+    let input_sha=try row.input_sha256 catch nil;
+    let artifact_sha=try row.artifact_sha256 catch nil;
+    let stdout_sha=try row.oracle_stdout_sha256 catch nil;
+    let stderr_sha=try row.oracle_stderr_sha256 catch nil;
+    for digest in [input_sha,artifact_sha,stdout_sha,stderr_sha] {
+        if digest!=nil and not _hex(digest) { throw "emulator_diff: invalid case digest"; }
+    }
+    let artifact_path=try row.artifact_path catch nil;
+    if artifact_path!=nil and (type(artifact_path)!="string" or len(artifact_path)<1
+       or len(artifact_path)>256 or len(str_to_bytes(artifact_path))>256
+       or str_starts_with(artifact_path,"/") or str_contains(artifact_path,"\\")
+       or str_contains(artifact_path,"..")) {
+        throw "emulator_diff: invalid diagnostic artifact path";
+    }
+    let exit_code=try row.oracle_exit_code catch nil;
+    if exit_code!=nil and (type(exit_code)!="number" or exit_code!=num_floor(exit_code)
+       or exit_code<(-2147483648) or exit_code>2147483647) {
+        throw "emulator_diff: invalid oracle exit code";
+    }
+    let duration=try row.duration_ms catch 0;
+    if not _scalar(duration) or type(duration)!="number"
+       or duration!=num_floor(duration) or duration<0 or duration>600000 {
+        throw "emulator_diff: invalid case duration";
+    }
+    let checked=map{id:row.id,seed:row.seed,ok:row.ok,fields:fields,
+        differences:differences,artifact_sha256:artifact_sha,
+        input_sha256:input_sha,
+        artifact_path:artifact_path,oracle_exit_code:exit_code,
+        oracle_stdout_sha256:stdout_sha,oracle_stderr_sha256:stderr_sha,
+        duration_ms:duration};
+    if len(str_to_bytes(json_stringify(checked)))>MAX_CASE_CANONICAL_BYTES {
+        throw "emulator_diff: comparison exceeds the canonical byte ceiling";
+    }
+    return checked;
 }
 
 fn compare_case(id, seed, expected, actual, fields) {
@@ -36,7 +169,8 @@ fn compare_case(id, seed, expected, actual, fields) {
         if (expected_present and not _scalar(expected_value)) or (actual_present and not _scalar(actual_value)) {
             throw "emulator_diff: compared values must be scalar";
         }
-        if not expected_present or not actual_present or expected_value!=actual_value {
+        if not expected_present or not actual_present
+           or expected_value!=actual_value {
             array_push(differences,map{field:field,expected_present:expected_present,
                 actual_present:actual_present,expected:expected_value,actual:actual_value});
         }
@@ -44,37 +178,252 @@ fn compare_case(id, seed, expected, actual, fields) {
     return map{id:id,seed:seed,ok:len(differences)==0,fields:fields,differences:differences};
 }
 
+fn _case_identity(row) { return row.id+"|"+str(row.seed); }
+
+fn _public_case(row) {
+    return map{id:row.id,seed:row.seed,ok:row.ok,
+        fields:row.fields,differences:row.differences,
+        input_sha256:try row.input_sha256 catch nil,
+        artifact_sha256:try row.artifact_sha256 catch nil,
+        artifact_path:try row.artifact_path catch nil,
+        oracle_exit_code:try row.oracle_exit_code catch nil,
+        oracle_stdout_sha256:try row.oracle_stdout_sha256 catch nil,
+        oracle_stderr_sha256:try row.oracle_stderr_sha256 catch nil,
+        duration_ms:try row.duration_ms catch 0};
+}
+
+fn _external_case_complete(row) {
+    return _hex(row.input_sha256) and _hex(row.artifact_sha256)
+        and row.oracle_exit_code!=nil and _hex(row.oracle_stdout_sha256)
+        and _hex(row.oracle_stderr_sha256);
+}
+
+fn _campaign_source_state(rows) {
+    let inputs=[];
+    for row in rows {
+        if not _hex(row.input_sha256) or not _hex(row.artifact_sha256) {
+            throw "emulator_diff: external cases require input and artifact digests";
+        }
+        array_push(inputs,map{id:row.id,seed:row.seed,
+            input_sha256:row.input_sha256});
+    }
+    return sha256("pblang.emulator-campaign-source-state.v1|"+json_stringify(inputs));
+}
+
+fn campaign_source_state(comparisons) {
+    if type(comparisons)!="array" or len(comparisons)<1 or len(comparisons)>MAX_CASES {
+        throw "emulator_diff: invalid campaign comparisons";
+    }
+    let rows=[]; let seen=map{}; let total_bytes=0;
+    for candidate in comparisons {
+        let row=_validated_case(candidate); let identity=_case_identity(row);
+        if map_has(seen,identity) { throw "emulator_diff: duplicate comparison identity"; }
+        seen[identity]=true; total_bytes=total_bytes+len(str_to_bytes(json_stringify(row)));
+        if total_bytes>MAX_REPORT_CANONICAL_BYTES {
+            throw "emulator_diff: campaign exceeds the canonical byte ceiling";
+        }
+        array_push(rows,row);
+    }
+    return _campaign_source_state(rows);
+}
+
 fn report(metadata, comparisons) {
     if type(metadata)!="map" or type(comparisons)!="array" or len(comparisons)<1 or len(comparisons)>MAX_CASES {
         throw "emulator_diff.report requires metadata and 1..4096 comparisons";
     }
+    _exact_keys(metadata,["backend","oracle","platform","architecture","abi",
+        "source_state_sha256","external_execution_claimed"],
+        ["source_revision"],"report metadata");
     let backend=try metadata.backend catch ""; let oracle=try metadata.oracle catch "";
     let architecture=try metadata.architecture catch "";
-    if not _safe_id(backend) or not _safe_id(oracle) or not _safe_id(architecture) {
-        throw "emulator_diff: invalid backend, oracle, or architecture";
+    let platform=try metadata.platform catch ""; let abi=try metadata.abi catch "";
+    let source_state=try metadata.source_state_sha256 catch nil;
+    let source_revision=try metadata.source_revision catch "unknown";
+    if not _safe_id(backend) or not _safe_id(oracle) or not _safe_id(architecture)
+       or not _safe_id(platform) or not _safe_id(abi) or not _safe_id(source_revision)
+       or not _hex(source_state)
+       or type(metadata.external_execution_claimed)!="bool" {
+        throw "emulator_diff: invalid backend, oracle, platform, architecture, ABI, or source digest";
     }
-    let rows=[]; let passed=0;
+    let rows=[]; let passed=0; let seen=map{}; let total_bytes=0;
     for i len(comparisons) {
-        let row=comparisons[i];
-        if type(row)!="map" or not _safe_id(try row.id catch "")
-           or type(try row.ok catch nil)!="bool" { throw "emulator_diff: invalid comparison"; }
+        let row=_validated_case(comparisons[i]);
+        let identity=_case_identity(row);
+        if map_has(seen,identity) { throw "emulator_diff: duplicate comparison identity"; }
+        seen[identity]=true;
+        total_bytes=total_bytes+len(str_to_bytes(json_stringify(row)));
+        if total_bytes>MAX_REPORT_CANONICAL_BYTES {
+            throw "emulator_diff: report exceeds the canonical byte ceiling";
+        }
         if row.ok { passed=passed+1; }
-        array_push(rows,map{id:row.id,seed:row.seed,ok:row.ok,
-            fields:row.fields,differences:row.differences,
-            artifact_sha256:try row.artifact_sha256 catch nil,
-            artifact_path:try row.artifact_path catch nil,
-            oracle_exit_code:try row.oracle_exit_code catch nil,
-            oracle_stdout_sha256:try row.oracle_stdout_sha256 catch nil,
-            oracle_stderr_sha256:try row.oracle_stderr_sha256 catch nil,
-            duration_ms:try row.duration_ms catch 0});
+        array_push(rows,_public_case(row));
     }
-    let out=map{format:FORMAT,backend:backend,oracle:oracle,architecture:architecture,
-        source_revision:try metadata.source_revision catch "unknown",
-        source_state_sha256:try metadata.source_state_sha256 catch nil,
+    if metadata.external_execution_claimed {
+        for row in rows {
+            if not _external_case_complete(row) {
+                throw "emulator_diff: external claim lacks complete case evidence";
+            }
+        }
+        if source_state!=_campaign_source_state(rows) {
+            throw "emulator_diff: external source state does not bind the campaign";
+        }
+    }
+    let coverage_key=platform+"-"+architecture+"-"+abi;
+    if not _safe_id(coverage_key) {
+        throw "emulator_diff: composite coverage key exceeds its canonical bound";
+    }
+    let out=map{format:FORMAT,backend:backend,oracle:oracle,platform:platform,
+        architecture:architecture,abi:abi,coverage_key:coverage_key,
+        source_revision:source_revision,
+        source_state_sha256:source_state,
         cases:rows,passed:passed,total:len(rows),ok:passed==len(rows),
-        independent_execution:true};
-    out.report_sha256=sha256(json_stringify(out));
+        external_execution_claimed:metadata.external_execution_claimed,
+        independent_execution_verified:false,
+        structural_only:true};
+    let canonical=json_stringify(out);
+    if len(str_to_bytes(canonical))>MAX_REPORT_CANONICAL_BYTES {
+        throw "emulator_diff: report exceeds the canonical byte ceiling";
+    }
+    out.report_sha256=sha256(canonical);
     return out;
 }
 
-export FORMAT, MAX_CASES, MAX_FIELDS, compare_case, report;
+fn _report_digest(row) {
+    return sha256(json_stringify(map{format:row.format,backend:row.backend,
+        oracle:row.oracle,platform:row.platform,architecture:row.architecture,
+        abi:row.abi,coverage_key:row.coverage_key,
+        source_revision:row.source_revision,
+        source_state_sha256:row.source_state_sha256,cases:row.cases,
+        passed:row.passed,total:row.total,ok:row.ok,
+        external_execution_claimed:row.external_execution_claimed,
+        independent_execution_verified:row.independent_execution_verified,
+        structural_only:row.structural_only}));
+}
+
+// Aggregate self-reported external differential claims without turning
+// emulator evidence into a physical-device or production-readiness claim.
+fn coverage_matrix(reports, required_coverage_keys) {
+    if type(reports)!="array" or len(reports)<1 or len(reports)>MAX_REPORTS
+       or type(required_coverage_keys)!="array"
+       or len(required_coverage_keys)<1
+       or len(required_coverage_keys)>MAX_ARCHITECTURES {
+        throw "emulator_diff.coverage_matrix: invalid bounded inputs";
+    }
+    let required=[]; let required_seen=map{};
+    for coverage_key in required_coverage_keys {
+        if not _safe_id(coverage_key) or map_has(required_seen,coverage_key) {
+            throw "emulator_diff: invalid or duplicate required coverage key";
+        }
+        required_seen[coverage_key]=true; array_push(required,coverage_key);
+    }
+    let seen=map{}; let passing=map{}; let rows=[];
+    let matrix_bytes=0; let common_source_state=nil;
+    for row in reports {
+        if type(row)!="map" { throw "emulator_diff: invalid differential report evidence"; }
+        _exact_keys(row,["format","backend","oracle","platform","architecture","abi",
+            "coverage_key","source_revision","source_state_sha256","cases","passed",
+            "total","ok","external_execution_claimed","independent_execution_verified",
+            "structural_only","report_sha256"],[],"differential report");
+        if (try row.format catch "")!=FORMAT
+           or not _safe_id(try row.backend catch "")
+           or not _safe_id(try row.oracle catch "")
+           or not _safe_id(try row.platform catch "")
+           or not _safe_id(try row.architecture catch "")
+           or not _safe_id(try row.abi catch "")
+           or not _safe_id(try row.coverage_key catch "")
+           or row.coverage_key!=row.platform+"-"+row.architecture+"-"+row.abi
+           or not _safe_id(try row.source_revision catch "")
+           or not _hex(try row.source_state_sha256 catch nil)
+           or type(try row.cases catch nil)!="array"
+           or type(try row.total catch nil)!="number" or row.total!=num_floor(row.total)
+           or row.total<1 or row.total>MAX_CASES
+           or type(try row.passed catch nil)!="number" or row.passed!=num_floor(row.passed)
+           or row.passed<0 or row.passed>row.total
+           or type(try row.ok catch nil)!="bool"
+           or row.ok!=(row.passed==row.total)
+           or type(try row.external_execution_claimed catch nil)!="bool"
+           or not row.external_execution_claimed
+           or type(try row.independent_execution_verified catch nil)!="bool"
+           or row.independent_execution_verified
+           or type(try row.structural_only catch nil)!="bool"
+           or not row.structural_only
+           or type(try row.report_sha256 catch nil)!="string"
+           or not regex_match(row.report_sha256,"^[0-9a-f]{64}$") {
+            throw "emulator_diff: invalid differential report evidence";
+        }
+        if len(row.cases)!=row.total { throw "emulator_diff: report case count mismatch"; }
+        let computed_passed=0; let validated_cases=[]; let case_seen=map{};
+        let report_bytes=0;
+        for case_row in row.cases {
+            let checked=_validated_case(case_row);
+            let case_identity=_case_identity(checked);
+            if map_has(case_seen,case_identity) {
+                throw "emulator_diff: duplicate comparison identity";
+            }
+            case_seen[case_identity]=true;
+            if not _external_case_complete(checked) {
+                throw "emulator_diff: external claim lacks complete case evidence";
+            }
+            let public_case=_public_case(checked);
+            report_bytes=report_bytes+len(str_to_bytes(json_stringify(public_case)));
+            if report_bytes>MAX_REPORT_CANONICAL_BYTES {
+                throw "emulator_diff: report exceeds the canonical byte ceiling";
+            }
+            array_push(validated_cases,public_case);
+            if checked.ok { computed_passed=computed_passed+1; }
+        }
+        if computed_passed!=row.passed {
+            throw "emulator_diff: report pass count mismatch";
+        }
+        if row.source_state_sha256!=_campaign_source_state(validated_cases) {
+            throw "emulator_diff: external source state does not bind the campaign";
+        }
+        if common_source_state==nil { common_source_state=row.source_state_sha256; }
+        elif common_source_state!=row.source_state_sha256 {
+            throw "emulator_diff: mixed source states cannot form one coverage matrix";
+        }
+        let sanitized=map{format:row.format,backend:row.backend,oracle:row.oracle,
+            platform:row.platform,architecture:row.architecture,abi:row.abi,
+            coverage_key:row.coverage_key,source_revision:row.source_revision,
+            source_state_sha256:row.source_state_sha256,cases:validated_cases,
+            passed:row.passed,total:row.total,ok:row.ok,
+            external_execution_claimed:row.external_execution_claimed,
+            independent_execution_verified:row.independent_execution_verified,
+            structural_only:row.structural_only};
+        let sanitized_bytes=len(str_to_bytes(json_stringify(sanitized)));
+        if sanitized_bytes>MAX_REPORT_CANONICAL_BYTES
+           or _report_digest(sanitized)!=row.report_sha256 {
+            throw "emulator_diff: invalid differential report digest";
+        }
+        matrix_bytes=matrix_bytes+sanitized_bytes;
+        if matrix_bytes>MAX_MATRIX_CANONICAL_BYTES {
+            throw "emulator_diff: coverage matrix exceeds the canonical byte ceiling";
+        }
+        let identity=row.coverage_key+"|"+row.backend+"|"+row.oracle;
+        if map_has(seen,identity) { throw "emulator_diff: duplicate differential report"; }
+        seen[identity]=true;
+        if row.ok { passing[row.coverage_key]=(try passing[row.coverage_key] catch 0)+1; }
+        array_push(rows,map{coverage_key:row.coverage_key,platform:row.platform,
+            architecture:row.architecture,abi:row.abi,backend:row.backend,
+            oracle:row.oracle,ok:row.ok,cases:row.total,
+            report_sha256:row.report_sha256});
+    }
+    let missing=[];
+    for coverage_key in required {
+        if (try passing[coverage_key] catch 0)<1 { array_push(missing,coverage_key); }
+    }
+    return map{ok:false,format:"pblang.emulator-coverage-matrix.v1",
+        required_coverage_keys:required,reports:rows,report_count:len(rows),
+        missing_coverage_keys:missing,structurally_complete:len(missing)==0,
+        source_state_sha256:common_source_state,source_state_consistent:true,
+        complete:false,self_reported:true,
+        independent_execution_required:true,independent_execution_verified:false,
+        digest_reverification:true,
+        physical_platform_evidence:false,full_system_emulation:false,
+        production_ready:false};
+}
+
+export FORMAT, MAX_CASES, MAX_FIELDS, MAX_REPORTS, MAX_ARCHITECTURES;
+export MAX_SCALAR_STRING_BYTES, MAX_CASE_CANONICAL_BYTES;
+export MAX_REPORT_CANONICAL_BYTES, MAX_MATRIX_CANONICAL_BYTES;
+export compare_case, campaign_source_state, report, coverage_matrix;
