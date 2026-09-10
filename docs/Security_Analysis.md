@@ -777,3 +777,10 @@ construct. General dynamic string operations, for-in lowering, and exception
 semantics remain outside its current hosted-numeric subset; unsupported linked
 programs fail before publication and never fall back automatically to the
 retained path.
+
+## Invalid numeric source
+
+Malformed numeric tokens make the mandatory scan incomplete and block admission,
+independently of configurable severity or source suppressions. Taint analysis
+also rejects the parser failure. See [self-hosted numeric literal diagnostics](SELFHOST_NUMERIC_LITERALS.md)
+for the accepted subset, fixed diagnostics and remaining bootstrap differences.

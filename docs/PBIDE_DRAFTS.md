@@ -21,7 +21,9 @@ oldest snapshots; combined overflow rejects the operation without silently
 pruning other drafts. Selection uses explicit Unicode scalar offset fields.
 
 Check source runs the self-hosted linter on only the active draft, without
-resolving its imports or executing it. Source, tokens, nesting and rendered
+resolving its imports or executing it. Incomplete radix literals and exponents
+produce [numeric diagnostics](SELFHOST_NUMERIC_LITERALS.md); preview preserves
+the original text as an escaped plain fallback. Source, tokens, nesting and rendered
 diagnostics have independent bounds. This does not hard-preempt computation.
 
 The flat draft codec admits at most 17664 bytes and eleven fields. Only fixed
