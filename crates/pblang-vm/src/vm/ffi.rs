@@ -8,7 +8,7 @@
 //!
 //!   - `ffi_load(path)` → handle. Gated by `host.allow_ffi()` AND by
 //!     `host.ffi_allowed_library(path)` (default deny).
-//!   - `ffi_close(handle)` — drop the Library, run its destructors.
+//!   - `ffi_close(handle)` — revoke the handle; unload after active calls return.
 //!   - `ffi_call(handle, "sym", [nums…])` → number. The simple
 //!     numeric-only path; supports up to 6 `f64` args returning `f64`.
 //!   - `ffi_call_typed(handle, "sym", "sig", [args…])` → typed value.
@@ -24,10 +24,8 @@
 //! and the whole surface is gated by `host.allow_ffi()`. Resolved
 //! symbols are called as `extern "C" fn` with the user-claimed
 //! signature — if the library's actual export disagrees, behaviour is
-//! UB per `docs/FFI_contract.md`. The Library is owned by the per-VM
-//! FFI table; `ffi_close` removes it (and drops it).
-
-use std::sync::atomic::Ordering;
+//! UB per `docs/FFI_contract.md`. The Library is owned by the per-execution-realm
+//! FFI table; `ffi_close` removes realm authority, while active calls retain it.
 
 use libloading::Library;
 
@@ -35,7 +33,9 @@ use pblang_ir::{RuntimeError, Value, VmHost};
 
 use super::errors::vm_cap;
 use super::ffi_dispatch::{dispatch_ffi, parse_ffi_sig};
-use super::handles::{value_to_handle, with_ffi_table, FFI_NEXT};
+use super::handles::{
+    insert_ffi_library, require_ffi_capacity, value_to_ffi_handle, with_ffi_table,
+};
 use super::FfiResource;
 
 pub(super) fn ffi_load(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
@@ -62,13 +62,10 @@ pub(super) fn ffi_load(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
     // (defaults deny everything), and the whole builtin is gated by
     // `host.allow_ffi()`. The returned Library is owned by the FFI
     // table; drop = unload.
+    require_ffi_capacity(host)?;
     let lib = unsafe { Library::new(path) }
         .map_err(|e| host.err(format!("ffi_load(): failed to load library {path:?}: {e}")))?;
-    let id = with_ffi_table(host, |t| {
-        let id = FFI_NEXT.fetch_add(1, Ordering::Relaxed);
-        t.insert(id, FfiResource::Library(lib));
-        id
-    })?;
+    let id = insert_ffi_library(host, lib)?;
     Ok(Value::Number(id as f64))
 }
 
@@ -82,8 +79,10 @@ pub(super) fn ffi_close(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value
             args.len()
         )));
     }
-    let id = value_to_handle(host, args[0].clone(), "ffi_close")?;
-    let _ = with_ffi_table(host, |t| t.remove(&id));
+    let id = value_to_ffi_handle(host, args[0].clone(), "ffi_close")?;
+    let resource = with_ffi_table(host, |t| t.remove(&id))?
+        .ok_or_else(|| host.err("ffi_close(): invalid handle".into()))?;
+    drop(resource);
     Ok(Value::Nil)
 }
 
@@ -106,12 +105,15 @@ pub(super) fn ffi_call(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
             "ffi_call: symbol {sym:?} not in allowlist (set FfiPolicy.allowed_symbols or allow_all=true)"
         )));
     }
-    let id = value_to_handle(host, args[0].clone(), "ffi_call")?;
+    let id = value_to_ffi_handle(host, args[0].clone(), "ffi_call")?;
     let arr = match &args[2] {
         Value::Array(a) => a.clone(),
         _ => return Err(host.err("ffi_call(): expected args array".into())),
     };
 
+    if arr.borrow().len() > 6 {
+        return Err(host.err("ffi_call(): too many args, max 6".into()));
+    }
     let mut nums: Vec<f64> = vec![];
     for v in arr.borrow().iter() {
         match v {
@@ -120,7 +122,7 @@ pub(super) fn ffi_call(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
         }
     }
 
-    let res = match with_ffi_table(host, |t| t.remove(&id))? {
+    let res = match with_ffi_table(host, |t| t.get(&id).cloned())? {
         Some(FfiResource::Library(lib)) => {
             // SAFETY: We resolve `sym` from the library via
             // libloading's `get`, then call the function pointer.
@@ -135,58 +137,75 @@ pub(super) fn ffi_call(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
             let out = unsafe {
                 match nums.len() {
                     0 => {
-                        let f: libloading::Symbol<unsafe extern "C" fn() -> f64> = lib
-                            .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
+                        let f: libloading::Symbol<unsafe extern "C" fn() -> f64> =
+                            lib.get(sym.as_bytes()).map_err(|e| {
+                                host.err(format!(
+                                    "ffi_call(): symbol {sym:?} not found in loaded library: {e}"
+                                ))
+                            })?;
                         f()
                     }
                     1 => {
-                        let f: libloading::Symbol<unsafe extern "C" fn(f64) -> f64> = lib
-                            .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
+                        let f: libloading::Symbol<unsafe extern "C" fn(f64) -> f64> =
+                            lib.get(sym.as_bytes()).map_err(|e| {
+                                host.err(format!(
+                                    "ffi_call(): symbol {sym:?} not found in loaded library: {e}"
+                                ))
+                            })?;
                         f(nums[0])
                     }
                     2 => {
-                        let f: libloading::Symbol<unsafe extern "C" fn(f64, f64) -> f64> = lib
-                            .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
+                        let f: libloading::Symbol<unsafe extern "C" fn(f64, f64) -> f64> =
+                            lib.get(sym.as_bytes()).map_err(|e| {
+                                host.err(format!(
+                                    "ffi_call(): symbol {sym:?} not found in loaded library: {e}"
+                                ))
+                            })?;
                         f(nums[0], nums[1])
                     }
                     3 => {
-                        let f: libloading::Symbol<unsafe extern "C" fn(f64, f64, f64) -> f64> = lib
-                            .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
+                        let f: libloading::Symbol<unsafe extern "C" fn(f64, f64, f64) -> f64> =
+                            lib.get(sym.as_bytes()).map_err(|e| {
+                                host.err(format!(
+                                    "ffi_call(): symbol {sym:?} not found in loaded library: {e}"
+                                ))
+                            })?;
                         f(nums[0], nums[1], nums[2])
                     }
                     4 => {
                         let f: libloading::Symbol<unsafe extern "C" fn(f64, f64, f64, f64) -> f64> =
-                            lib.get(sym.as_bytes())
-                                .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
+                            lib.get(sym.as_bytes()).map_err(|e| {
+                                host.err(format!(
+                                    "ffi_call(): symbol {sym:?} not found in loaded library: {e}"
+                                ))
+                            })?;
                         f(nums[0], nums[1], nums[2], nums[3])
                     }
                     5 => {
                         let f: libloading::Symbol<
                             unsafe extern "C" fn(f64, f64, f64, f64, f64) -> f64,
-                        > = lib
-                            .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
+                        > = lib.get(sym.as_bytes()).map_err(|e| {
+                            host.err(format!(
+                                "ffi_call(): symbol {sym:?} not found in loaded library: {e}"
+                            ))
+                        })?;
                         f(nums[0], nums[1], nums[2], nums[3], nums[4])
                     }
                     6 => {
                         let f: libloading::Symbol<
                             unsafe extern "C" fn(f64, f64, f64, f64, f64, f64) -> f64,
-                        > = lib
-                            .get(sym.as_bytes())
-                            .map_err(|e| host.err(format!("ffi_call(): symbol {sym:?} not found in loaded library: {e}")))?;
+                        > = lib.get(sym.as_bytes()).map_err(|e| {
+                            host.err(format!(
+                                "ffi_call(): symbol {sym:?} not found in loaded library: {e}"
+                            ))
+                        })?;
                         f(nums[0], nums[1], nums[2], nums[3], nums[4], nums[5])
                     }
                     n => {
-                        let _ = with_ffi_table(host, |t| t.insert(id, FfiResource::Library(lib)));
                         return Err(host.err(format!("ffi_call(): too many args ({}), max 6", n)));
                     }
                 }
             };
-            let _ = with_ffi_table(host, |t| t.insert(id, FfiResource::Library(lib)));
             Ok(Value::Number(out))
         }
         None => Err(host.err("ffi_call(): invalid handle".into())),
@@ -241,7 +260,7 @@ pub(super) fn ffi_call_typed_builtin(
         .as_str()
         .map_err(|m| host.err(format!("ffi_call_typed(): {m}")))?
         .to_string();
-    let id = value_to_handle(host, args[0].clone(), "ffi_call_typed")?;
+    let id = value_to_ffi_handle(host, args[0].clone(), "ffi_call_typed")?;
     let arr = match &args[3] {
         Value::Array(a) => a.clone(),
         _ => return Err(host.err("ffi_call_typed(): expected args array".into())),
@@ -250,6 +269,9 @@ pub(super) fn ffi_call_typed_builtin(
     // Parse signature.
     let (arg_tys, ret_ty) =
         parse_ffi_sig(&sig_str).map_err(|m| host.err(format!("ffi_call_typed(): {m}")))?;
+    if arr.borrow().len() > 4 {
+        return Err(host.err("ffi_call_typed(): up to 4 arguments supported per call".into()));
+    }
     let raw_args = arr.borrow().clone();
     if raw_args.len() != arg_tys.len() {
         return Err(host.err(format!(
@@ -327,7 +349,7 @@ pub(super) fn ffi_call_typed_builtin(
         abbrev(&ret_ty)
     );
 
-    let res = match with_ffi_table(host, |t| t.remove(&id))? {
+    let res = match with_ffi_table(host, |t| t.get(&id).cloned())? {
         Some(FfiResource::Library(lib)) => {
             // SAFETY: `dispatch_ffi` resolves `sym` in `lib`, parses
             // `key` into a concrete C ABI signature, and invokes the
@@ -339,7 +361,6 @@ pub(super) fn ffi_call_typed_builtin(
             // library's actual signature is UB — the host is expected
             // to validate symbol exports before granting `allow_ffi`.
             let out_res = unsafe { dispatch_ffi(&lib, &sym, &key, &a_i64, &a_f64, &a_ptr) };
-            let _ = with_ffi_table(host, |t| t.insert(id, FfiResource::Library(lib)));
             match out_res {
                 Ok(v) => Ok(v),
                 Err(e) => Err(host.err(format!("ffi_call_typed(): {e}"))),
@@ -350,4 +371,209 @@ pub(super) fn ffi_call_typed_builtin(
     // c_strings are dropped here, after the call returns.
     drop(c_strings);
     Ok(res)
+}
+
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+mod tests {
+    use super::super::handles::MAX_FFI_LIBRARIES_PER_REALM;
+    use super::super::{StdlibConfig, VM};
+    use super::*;
+    use pblang_ir::alloc_string;
+    use std::rc::Rc;
+
+    const MISSING: &str = "pblang_test_nonexistent_ffi_symbol_ownership";
+
+    fn vm() -> VM {
+        VM::with_stdlib(StdlibConfig {
+            ffi: true,
+            ffi_allowed_libs: ["libc.so.6".into()].into_iter().collect(),
+            ffi_allowed_symbols: [MISSING.into()].into_iter().collect(),
+            ..Default::default()
+        })
+    }
+
+    fn load(vm: &mut VM) -> Value {
+        ffi_load(vm, vec![alloc_string("libc.so.6")]).unwrap()
+    }
+
+    fn call(vm: &mut VM, handle: Value, typed: bool) -> Result<Value, RuntimeError> {
+        let mut args = vec![handle, alloc_string(MISSING)];
+        if typed {
+            args.push(alloc_string("->i64"));
+        }
+        args.push(super::super::alloc_array(vec![]));
+        if typed {
+            ffi_call_typed_builtin(vm, args)
+        } else {
+            ffi_call(vm, args)
+        }
+    }
+
+    fn run(vm: &mut VM, source: &str) -> Result<Vec<Value>, RuntimeError> {
+        let chunk = pblang_compiler::compile(pblang_core::parse(source).unwrap()).unwrap();
+        vm.run_collect(chunk)
+    }
+
+    #[test]
+    fn ffi_root_realms_reject_foreign_call_and_close() {
+        let (mut a, mut b) = (vm(), vm());
+        let ha = load(&mut a);
+        let hb = load(&mut b);
+        for typed in [false, true] {
+            assert!(call(&mut b, ha.clone(), typed)
+                .unwrap_err()
+                .message
+                .contains("invalid handle"));
+            assert!(call(&mut a, hb.clone(), typed)
+                .unwrap_err()
+                .message
+                .contains("invalid handle"));
+        }
+        assert!(ffi_close(&mut b, vec![ha.clone()])
+            .unwrap_err()
+            .message
+            .contains("invalid handle"));
+        ffi_close(&mut a, vec![ha.clone()]).unwrap();
+        assert!(ffi_close(&mut a, vec![ha])
+            .unwrap_err()
+            .message
+            .contains("invalid handle"));
+        drop(a);
+        ffi_close(&mut b, vec![hb]).unwrap();
+    }
+
+    #[test]
+    fn ffi_missing_symbol_preserves_handle_and_final_owner_drop_releases_library() {
+        let mut owner = vm();
+        let handle = load(&mut owner);
+        for typed in [false, true] {
+            let err = call(&mut owner, handle.clone(), typed).unwrap_err();
+            assert!(!err.message.contains("invalid handle"), "{}", err.message);
+            assert!(err.message.contains(MISSING), "{}", err.message);
+        }
+        let id = value_to_ffi_handle(&mut owner, handle.clone(), "test").unwrap();
+        let weak = with_ffi_table(&mut owner, |table| {
+            let FfiResource::Library(lib) = table.get(&id).unwrap();
+            Rc::downgrade(lib)
+        })
+        .unwrap();
+        assert!(weak.upgrade().is_some());
+        ffi_close(&mut owner, vec![handle]).unwrap();
+        assert!(weak.upgrade().is_none());
+        let handle = load(&mut owner);
+        let id = value_to_ffi_handle(&mut owner, handle, "test").unwrap();
+        let weak = with_ffi_table(&mut owner, |table| {
+            let FfiResource::Library(lib) = table.get(&id).unwrap();
+            Rc::downgrade(lib)
+        })
+        .unwrap();
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn ffi_handles_reject_lossy_and_malformed_numbers() {
+        let mut owner = vm();
+        for n in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            0.0,
+            1.5,
+            9007199254740992.0,
+        ] {
+            assert!(ffi_close(&mut owner, vec![Value::Number(n)])
+                .unwrap_err()
+                .message
+                .contains("expected exact"));
+        }
+        assert!(ffi_close(&mut owner, vec![alloc_string("1")]).is_err());
+        assert_eq!(
+            value_to_ffi_handle(&mut owner, Value::Number(9007199254740991.0), "test").unwrap(),
+            9007199254740991
+        );
+    }
+
+    #[test]
+    fn ffi_capacity_rejects_before_loader_or_polyglot_effects() {
+        let mut owner = vm();
+        let handles: Vec<_> = (0..MAX_FFI_LIBRARIES_PER_REALM)
+            .map(|_| load(&mut owner))
+            .collect();
+        // Allowing a deliberately absent path makes a loader attempt distinguishable
+        // from the required capacity rejection, without running a constructor.
+        owner.ffi_policy.as_mut().unwrap().allow_all = true;
+        let err = ffi_load(
+            &mut owner,
+            vec![alloc_string("./pblang-missing-capacity-probe.so")],
+        )
+        .unwrap_err();
+        assert!(err.message.contains("library limit exceeded"));
+        owner.stdlib_config.as_mut().unwrap().exec = true;
+        let err = super::super::polyglot::polyglot_compile_cached(
+            &mut owner,
+            vec![alloc_string("c"), alloc_string("not compilable")],
+        )
+        .unwrap_err();
+        assert!(err.message.contains("library limit exceeded"));
+        ffi_close(&mut owner, vec![handles[0].clone()]).unwrap();
+        load(&mut owner);
+        assert_eq!(
+            owner.ffi_resources.borrow().len(),
+            MAX_FFI_LIBRARIES_PER_REALM
+        );
+    }
+
+    #[test]
+    fn ffi_nested_import_keeps_root_realm_alive() {
+        let dir =
+            std::env::temp_dir().join(format!("pblang-ffi-import-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let inner = dir.join("inner.sapp");
+        let outer = dir.join("outer.sapp");
+        std::fs::write(&inner, "let h = ffi_load(\"libc.so.6\"); export h;").unwrap();
+        std::fs::write(
+            &outer,
+            format!(
+                "let m = import({}); let h = m.h; export h;",
+                serde_json::to_string(&inner).unwrap()
+            ),
+        )
+        .unwrap();
+        let mut owner = vm();
+        let source = format!(
+            "let m = import({}); ffi_close(m.h); print 42;",
+            serde_json::to_string(&outer).unwrap()
+        );
+        assert_eq!(run(&mut owner, &source).unwrap(), vec![Value::Number(42.0)]);
+        assert!(owner.ffi_resources.borrow().is_empty());
+        assert!(run(&mut owner, "ffi_close(m.h);")
+            .unwrap_err()
+            .message
+            .contains("invalid handle"));
+    }
+
+    #[test]
+    fn ffi_spawn_cannot_use_parent_handle() {
+        let mut owner = vm();
+        let source = r#"
+            let h = ffi_load("libc.so.6");
+            let worker = spawn(fn() { ffi_close(h); });
+            join(worker);
+        "#;
+        assert!(run(&mut owner, source)
+            .unwrap_err()
+            .message
+            .contains("invalid handle"));
+        assert_eq!(owner.ffi_resources.borrow().len(), 1);
+        run(&mut owner, "ffi_close(h);").unwrap();
+    }
 }

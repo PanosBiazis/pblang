@@ -36,6 +36,8 @@ PblangVm* pblang_create_vm(void);
 
 /**
  * Create a new pblang VM with explicit capability sandbox.
+ * VM thread spawning and host process exit are always disabled.
+ * This capability profile does not impose a hard memory or wall-time limit.
  *
  * @param allow_fs      1 = allow filesystem access, 0 = deny
  * @param allow_net     1 = allow TCP/HTTP networking, 0 = deny
