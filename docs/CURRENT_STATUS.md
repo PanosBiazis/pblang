@@ -1,7 +1,23 @@
 # pblang — Current Status
 
-**Last Updated**: 2026-09-02
-**Status**: v0.6.0-alpha — Production-Candidate Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
+**Last Updated**: 2026-09-10
+**Status**: v0.6.0-alpha — Experimental Core with AI Integration, Security Hardening + Concurrency + Memory Safety + 369 top-level pblang stdlib files + **Runnable self-hosted compiler pipeline (tokenize→parse→check→compile→RUN in pblang) with active parity hardening** + Multi-Backend Codegen + blocks/code-blocks programming + machine/device optimization planning + resource-aware test profiles + cross-device play/run planning + cross-language convenience helpers
+
+## 2026-09-10 - Bounded publisher admission and emulator report v2
+
+Publisher admission now limits the snapshot copy to the signed byte count,
+handles measurement failures without silently freeing uncertain ownership, and
+bounds handle-allocation retries. The release slice is committed as `42c4668`.
+Differential report v2 rejects missing comparison fields and legacy v1 evidence.
+The QEMU tool supports a paired explicit executable path/digest; five actual
+external cases passed even though the default system QEMU path is unavailable.
+
+See [validation and remaining work](RELEASE_QEMU_VALIDATION_2026-09-10.md) for
+isolated tests, external results and coverage limits. This supersedes older
+statements below about QEMU not being run or being an independent oracle.
+No guest OS validation, complete publisher authenticity, hard native resource
+isolation or production readiness is established.
+
 
 ## 2026-09-02 - Strict Ed25519 release-attestation prerequisite
 
