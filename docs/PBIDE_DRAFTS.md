@@ -12,7 +12,7 @@ tab does not stop the server. This pilot uses the bounded Linux transport.
 Four drafts have separate Undo/Redo histories. New draft and selection first
 record the visible text. Discard explicitly removes the active draft; the last
 draft cannot be discarded. Draft IDs are local fixed labels, not filenames.
-Copy your work before closing: there is no server persistence, and browser
+Use Download .sapp or copy your work before closing: there is no server persistence, and browser
 Back entries can retain older text even after Discard or Clear history.
 
 Each source fits 4096 UTF-8 bytes. All history frames across all drafts share
@@ -34,7 +34,7 @@ Legacy six- and seven-field requests remain supported.
 HTTP admits exact loopback Host and same-origin POSTs, rejects duplicate/unknown
 fields and malformed encodings, and escapes source, history, workspace and
 diagnostics. The no-script CSP remains. Body and response limits are 65536 and
-98304 bytes respectively, including bounded transport enforcement; four requests
+131072 bytes respectively, including bounded transport enforcement; four requests
 can be in flight. Synchronous handlers do not have a hard CPU/heap deadline.
 
 Tests cover independent histories, new/select/discard, no final-tab discard,
@@ -43,5 +43,38 @@ splicing, legacy compatibility, escaping, non-echoing rejection, four-tab
 worst-case form/page sizes and actual loopback exchange. A browser verified
 retained drafts, independent Undo and Check on the active draft.
 
-File import/export, automatic caret binding, highlighting, Format/Run, Designer
-and bidirectional source synchronization remain unimplemented in this pilot.
+## Source preview and download
+
+Highlight source records the submitted draft through the existing history path
+and displays a lexical preview below the editor. Keywords, strings, numbers and
+comments have fixed colors. The preview uses the compiler tokenizer's physical
+Unicode scalar positions and escapes slices of the original source, preserving
+literal spelling, comments, whitespace and escapes. It never renders decoded
+token values or evaluates source. It is refreshed on submission, not as you type,
+and is separate from Check source.
+
+Preview source is capped at 4096 UTF-8 bytes, tokens at 512 including EOF, and
+rendered markup at 32768 bytes. Invalid positions or a token/output limit produce
+a complete escaped plain-text preview. Input beyond the source limit is rejected.
+The fixed no-script CSP remains unchanged.
+
+Download .sapp sends the visible LF-normalized source as a plain UTF-8 attachment
+named Draft1.sapp through Draft4.sapp, according to the active draft. Source never
+enters response headers. The server validates selection, source and existing
+workspace/history consistency but does not commit the submitted edit into
+history. Download therefore remains usable when a new history snapshot would
+exceed the shared byte limit. There is no host file write, filename/path input,
+server persistence or acknowledgment of a saved browser file. The browser controls
+where or whether the attachment is saved.
+
+Focused regressions cover exact Unicode/escape round trips, incomplete literals,
+HTML injection text, token and output fallback, full-budget export, canonical
+filenames, malformed/spliced state and combined worst-case page size. Seven real
+loopback exchanges cover edits, history, drafts, preview, attachment and origin/host
+rejection. Browser interaction verified visible colors, literal text and draft
+switching; browser download-manager completion was not asserted.
+
+File import, automatic caret binding, live highlighting inside the editable
+field, Format/Run, Designer and bidirectional source synchronization remain
+unimplemented in this pilot. Runtime hard resource enforcement and broader
+browser/OS coverage remain separate work.
