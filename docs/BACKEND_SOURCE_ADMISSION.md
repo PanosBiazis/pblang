@@ -45,8 +45,9 @@ admission helper for `compile_expr_exit`, `compile_program`, `compile_fns` and,
 through `compile_fns`, `compile_safe`. All user-source checks precede output
 allocation. The fixed internal prelude helpers retain their existing parser;
 their text is a private hard-coded map, not supplied source. `compile_safe` does
-not return a certificate on failed source admission. Its existing `safe` field
-is not proof of complete native runtime isolation.
+not return a certificate on failed source admission. Its legacy `safe` field is deprecated; explicit
+`memory_safety_certified=false`, `runtime_isolated=false`, a limited scope and
+limitations now accompany the result. No field authorizes hostile-code execution.
 
 `native/compile_session.sapp` checks source before cache keys, reads, hit/miss
 counters, compilation or publication. Batch admission checks every job before

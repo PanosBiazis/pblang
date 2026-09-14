@@ -17,6 +17,24 @@ current-platform acceptance evidence for the present compiler revision.
 
 ## Current local validation
 
+The latest native continuation bounds all eight bytes of type-predicate tag
+reads and rejects invalid/non-finite heap configuration before state changes.
+`compile_safe`, cache/session results and the CLI now state the limited scope
+and explicitly deny memory-safety certification and runtime isolation. Legacy
+`safe` remains only for compatibility. General native `type()` is still blocked
+by scalar/pointer representation collisions; no guessed lowering was added.
+This slice passed 57 selected suites including 17 emulator suites, real native
+boundary/CLI execution, cold/warm cache and smart-build publication, and Node/V8
+WASM execution. The original end-minus-one native tag probe exited with SIGSEGV;
+all tested mapping-edge predicates now complete normally at three heap sizes.
+Thirteen touched PBLang files passed self-hosted checking with zero errors or
+warnings and mandatory runtime-security checks. Twelve source scans had no
+blocking findings; the smart-build test retains its two deliberate negative
+fixture findings, unchanged from the baseline. Retained lint completed with
+style/conservative warnings. The optional
+CLI path variables now declare their dynamic type explicitly, correcting
+pre-existing retained-lint failures without changing path selection.
+
 The latest C99/interpreter/checked-linker change passed 75 selected suites,
 including 17 reference emulator suites, native C99/x64 execution, sanitizer
 checks of linked module globals and real WASM execution in Node/V8. The ten
@@ -36,10 +54,10 @@ rejects with `codegen: call to undefined fn type`: required builtin lowering
 remains incomplete. The interpreter's retained-host semantic suites pass, but
 this is not a successful native-selfhost interpreter validation.
 
-Graphify AST regeneration completed in the isolated checkout. Updating the
-main working repository did not complete within 45 seconds, so its graph is
-not claimed current. No guest OS, server deployment, push or remote test runner
-was used for this change.
+An earlier C99 slice completed isolated Graphify regeneration but not the main
+repository update. The latest native slice also hit the 45-second Graphify
+update bound; no current graph claim is made. No guest OS, server deployment,
+push or remote test runner was used for these changes.
 
 Current checked-source work tests generated artifacts locally and distinguishes
 reference emulators from guest operating systems. A complete current guest
@@ -50,7 +68,7 @@ matrix, physical-device support and general production readiness remain open.
 | Workstream | Established progress | What remains |
 | --- | --- | --- |
 | Compiler | Checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
-| Runtime/FFI | Existing resource contracts and selected boundary checks | Hard memory/time limits, typed native dispatch and hostile-code isolation with actual enforcement evidence |
+| Runtime/FFI | Existing resource contracts, bounded native type-tag reads, heap configuration validation and explicit uncertified scope | Hard memory/time limits, typed native dispatch and hostile-code isolation with actual enforcement evidence |
 | Audits | Policy preflight, checkpoint/counter validation and retained-finding bounds | Whole-report work/decoding budgets and trusted report provenance |
 | Releases | Selected signature/trust/artifact-copy checks | Complete publisher selection, revocation, rollback policy and immutable handoff |
 | PBIDE | Drafts, Check, preview, download and bounded UTF-8 import | Live highlighting/caret, Run/Designer integration, bidirectional forms and real UI acceptance |

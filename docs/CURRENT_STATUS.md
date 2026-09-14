@@ -998,7 +998,7 @@ partial, conditional, and not-yet-comparable areas instead of fabricating rows.
 The full methodology and raw samples are under
 `bench/results/2026-07-18-reproducible-core-matrix/`.
 
-The direct row is correctness-gated by its PBLang safety certificate, ELF header,
+The direct row is correctness-gated by compilation, ELF header,
 process result, output bound, and exact checksum. Unsupported hosts remain
 explicitly unavailable. A working example is in
 `examples/repro_codegen_benchmark/`; the project now also has the PBLang-native
