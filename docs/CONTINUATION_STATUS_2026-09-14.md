@@ -17,7 +17,31 @@ current-platform acceptance evidence for the present compiler revision.
 
 ## Current local validation
 
-The latest tree-interpreter continuation fixes stale lexical-depth reuse after
+The current continuation restores literal defaults in named interpreter functions.
+Omitted arguments use their number/string/bool/nil defaults on all call paths;
+explicit nil remains nil. Existing required/extra-argument behavior is preserved.
+Defaults are decoded once, never evaluated as expressions. A live negative test
+rejects a prepared call substituted as a default with a fixed diagnostic and no
+print effect. The shared positive fixture passes both the retained host and pbi.
+No new source-size, token-count or wall-clock limit was introduced.
+
+Forty selected suites passed, including 17 emulator suites, existing interpreter
+and admission regressions, default diagnostics and local driver parity. Five
+touched source files passed the self-hosted checker with zero errors/warnings
+and strict security scans with complete mandatory analysis, zero blocking
+findings and stable snapshots. Isolated and main retained-bootstrap builds and
+portable lock publication passed. Retained lint completed with conservative/style
+warnings. Independent security review found no new blocker. Mutable closure
+arrays remain an existing isolation gap, documented in INTERPRETER_SCOPES.md.
+
+Large-program compatibility is now an explicit continuation priority: strict
+untrusted-input budgets must be separated from normal local compilation. The
+current direct 1 MiB / 65,536-token caps can block large flattened projects and
+remain unchanged, pending a tested redesign. The checked C99 module profile's
+16 MiB / 1,048,576-token ceiling is not universal backend support. See
+[backend source admission](BACKEND_SOURCE_ADMISSION.md) for the present limits.
+
+The preceding tree-interpreter continuation fixes stale lexical-depth reuse after
 late shadowing declarations and across closures sharing an AST. Repeated binding
 names use the existing dynamic lookup for reads and writes; uniquely declared
 names retain caching. Prepared-AST version 3 rebuilds earlier metadata. This
@@ -74,9 +98,10 @@ rejects with `codegen: call to undefined fn type`: required builtin lowering
 remains incomplete. The interpreter's retained-host semantic suites pass, but
 this is not a successful native-selfhost interpreter validation.
 
-The current interpreter slice completed isolated Graphify regeneration (8,591
+The preceding shadow-lookup slice completed isolated Graphify regeneration (8,591
 nodes and 11,062 edges), but the main repository update exceeded its 45-second
-bound and was stopped. The main graph is not claimed current. Earlier C99 and
+bound and was stopped. The current literal-default slice also attempted a main
+update and stopped it at 45 seconds. The main graph is not claimed current. Earlier C99 and
 native attempts also had incomplete main updates. No guest OS, server deployment,
 push or remote test runner was used for these changes.
 
@@ -88,7 +113,7 @@ matrix, physical-device support and general production readiness remain open.
 
 | Workstream | Established progress | What remains |
 | --- | --- | --- |
-| Compiler | Corrected interpreter late-shadow lookup; checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Bootstrap closure-binding parity, native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
+| Compiler | Named-function literal defaults and corrected interpreter late-shadow lookup; checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Large-project compilation with distinct developer/untrusted budgets, bootstrap closure-binding parity, native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
 | Runtime/FFI | Existing resource contracts, bounded native type-tag reads, heap configuration validation and explicit uncertified scope | Hard memory/time limits, typed native dispatch and hostile-code isolation with actual enforcement evidence |
 | Audits | Policy preflight, checkpoint/counter validation and retained-finding bounds | Whole-report work/decoding budgets and trusted report provenance |
 | Releases | Selected signature/trust/artifact-copy checks | Complete publisher selection, revocation, rollback policy and immutable handoff |
