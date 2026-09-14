@@ -17,7 +17,31 @@ current-platform acceptance evidence for the present compiler revision.
 
 ## Current local validation
 
-The current continuation restores literal defaults in named interpreter functions.
+The current continuation separates local developer source admission from strict
+input budgets. `pbi`, explicit interpreter library entry points and hosted C99
+local translation/build/run support source above the former direct 1 MiB /
+65,536-token ceiling without preset byte/token caps. Optional budgets are exact,
+validated before effects, and token caps stop production early. Lexical and parser
+errors still reject before execution/emission. Existing strict APIs are unchanged.
+The CLI still reads the whole file before admission; this is not a streaming
+memory guarantee. Existing parser nesting guards and backend/runtime limitations
+remain. See [local compilation](LOCAL_COMPILATION.md).
+
+Validation: 57 distinct selected suites passed, including 17 emulator suites,
+real pbi execution and a real C99 executable from a source above both former
+ceilings. Optional budgets, UTF-8/EOF boundaries, malformed large suffixes,
+old-output preservation, runner option forwarding and numeric-mode restoration
+were exercised. The synthetic input establishes admission behavior, not a
+performance benchmark or unrestricted language/backend compatibility.
+The seven changed PBLang files passed self-hosted checking with zero errors or
+warnings and strict entry-source scans with complete mandatory analysis, zero
+blocking findings and stable snapshots. Retained lint passed with conservative
+and style warnings. Independent security review found no material blocker. Isolated and main
+retained-bootstrap builds and portable locks passed. The knowledge-graph update
+was stopped after 45 seconds; no current-graph claim is made. No server, guest
+operating system or remote runner was used.
+
+The preceding continuation restores literal defaults in named interpreter functions.
 Omitted arguments use their number/string/bool/nil defaults on all call paths;
 explicit nil remains nil. Existing required/extra-argument behavior is preserved.
 Defaults are decoded once, never evaluated as expressions. A live negative test
@@ -34,12 +58,11 @@ portable lock publication passed. Retained lint completed with conservative/styl
 warnings. Independent security review found no new blocker. Mutable closure
 arrays remain an existing isolation gap, documented in INTERPRETER_SCOPES.md.
 
-Large-program compatibility is now an explicit continuation priority: strict
-untrusted-input budgets must be separated from normal local compilation. The
-current direct 1 MiB / 65,536-token caps can block large flattened projects and
-remain unchanged, pending a tested redesign. The checked C99 module profile's
-16 MiB / 1,048,576-token ceiling is not universal backend support. See
-[backend source admission](BACKEND_SOURCE_ADMISSION.md) for the present limits.
+Large-program compatibility remains a continuation priority beyond the new local
+interpreter/hosted-C99 route. Smart builds, direct x64/ARM64/WASM routes, module
+linking and security/dependency scans retain separate limits. The checked C99
+module profile's 16 MiB / 1,048,576-token ceiling is not universal backend
+support. See [backend source admission](BACKEND_SOURCE_ADMISSION.md).
 
 The preceding tree-interpreter continuation fixes stale lexical-depth reuse after
 late shadowing declarations and across closures sharing an AST. Repeated binding
@@ -113,7 +136,7 @@ matrix, physical-device support and general production readiness remain open.
 
 | Workstream | Established progress | What remains |
 | --- | --- | --- |
-| Compiler | Named-function literal defaults and corrected interpreter late-shadow lookup; checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Large-project compilation with distinct developer/untrusted budgets, bootstrap closure-binding parity, native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
+| Compiler | Explicit local interpreter/C99 source budgets; named-function literal defaults and corrected interpreter late-shadow lookup; checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Extend developer budgets across smart builds/backends and separate compilation, bootstrap closure-binding parity, native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
 | Runtime/FFI | Existing resource contracts, bounded native type-tag reads, heap configuration validation and explicit uncertified scope | Hard memory/time limits, typed native dispatch and hostile-code isolation with actual enforcement evidence |
 | Audits | Policy preflight, checkpoint/counter validation and retained-finding bounds | Whole-report work/decoding budgets and trusted report provenance |
 | Releases | Selected signature/trust/artifact-copy checks | Complete publisher selection, revocation, rollback policy and immutable handoff |
