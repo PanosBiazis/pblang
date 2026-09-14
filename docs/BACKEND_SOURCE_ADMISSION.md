@@ -117,6 +117,8 @@ initial file-read allocation is not bounded by the new parser gate.
 The native-selfhost benchmark now bundles the helper, but current direct-x64
 compilation still rejects the existing missing `type` builtin lowering. Native
 self-hosted interpreter parity is not established by the retained-host tests.
+For prepared identifier/assignment caching and the observed bootstrap closure
+discrepancy, see [tree-interpreter scope resolution](INTERPRETER_SCOPES.md).
 
 This is lexical/syntax admission, not complete semantic validation or universal
 compiler parity. Backend-specific type, numeric, ABI and language-subset behavior

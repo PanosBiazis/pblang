@@ -17,7 +17,27 @@ current-platform acceptance evidence for the present compiler revision.
 
 ## Current local validation
 
-The latest native continuation bounds all eight bytes of type-predicate tag
+The latest tree-interpreter continuation fixes stale lexical-depth reuse after
+late shadowing declarations and across closures sharing an AST. Repeated binding
+names use the existing dynamic lookup for reads and writes; uniquely declared
+names retain caching. Prepared-AST version 3 rebuilds earlier metadata. This
+correctness change passed 36 selected suites, including 17 emulator suites and
+actual local `pbi` driver execution. Five touched PBLang files passed strict
+entry-source security scans with complete mandatory analysis, zero blocking
+findings and stable snapshots. Independent security review found no new blocker.
+The self-hosted checker reported zero errors and one expected unused-variable
+warning for the deliberately shadowing fixture; retained lint completed with
+style/conservative warnings. The retained-bootstrap build and portable lock
+passed in both isolated and main working copies. No new performance claim is made.
+
+A retained-bootstrap comparison of the same fixture produced different captured
+binding behavior. The fix restores consistency with the tree interpreter's own
+generic lookup, not cross-runtime parity. See [interpreter scopes](INTERPRETER_SCOPES.md)
+for the exact output difference and trusted-AST limits. Existing source admission
+checks remain unchanged. The earlier native slice below is historical validation,
+not a rerun of all its native suites against this interpreter revision.
+
+The preceding native continuation bounds all eight bytes of type-predicate tag
 reads and rejects invalid/non-finite heap configuration before state changes.
 `compile_safe`, cache/session results and the CLI now state the limited scope
 and explicitly deny memory-safety certification and runtime isolation. Legacy
@@ -54,9 +74,10 @@ rejects with `codegen: call to undefined fn type`: required builtin lowering
 remains incomplete. The interpreter's retained-host semantic suites pass, but
 this is not a successful native-selfhost interpreter validation.
 
-An earlier C99 slice completed isolated Graphify regeneration but not the main
-repository update. The latest native slice also hit the 45-second Graphify
-update bound; no current graph claim is made. No guest OS, server deployment,
+The current interpreter slice completed isolated Graphify regeneration (8,591
+nodes and 11,062 edges), but the main repository update exceeded its 45-second
+bound and was stopped. The main graph is not claimed current. Earlier C99 and
+native attempts also had incomplete main updates. No guest OS, server deployment,
 push or remote test runner was used for these changes.
 
 Current checked-source work tests generated artifacts locally and distinguishes
@@ -67,7 +88,7 @@ matrix, physical-device support and general production readiness remain open.
 
 | Workstream | Established progress | What remains |
 | --- | --- | --- |
-| Compiler | Checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
+| Compiler | Corrected interpreter late-shadow lookup; checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Bootstrap closure-binding parity, native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
 | Runtime/FFI | Existing resource contracts, bounded native type-tag reads, heap configuration validation and explicit uncertified scope | Hard memory/time limits, typed native dispatch and hostile-code isolation with actual enforcement evidence |
 | Audits | Policy preflight, checkpoint/counter validation and retained-finding bounds | Whole-report work/decoding budgets and trusted report provenance |
 | Releases | Selected signature/trust/artifact-copy checks | Complete publisher selection, revocation, rollback policy and immutable handoff |
