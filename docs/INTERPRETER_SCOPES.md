@@ -55,3 +55,38 @@ The retained bootstrap currently prints `1, 3, 3, 4, 4` for that same fixture.
 This is an observed cross-runtime closure-binding discrepancy, not a passing
 parity result. The bootstrap is unchanged. General native self-hosting remains
 blocked by missing builtin lowering and value-representation differences.
+
+## Literal defaults in named functions
+
+Named declarations retain their parser-provided number, string, boolean and
+nil defaults when the interpreter creates a closure. Defaults are decoded once
+as literal values; they are never evaluated as expressions. Calls with omitted
+positional arguments now use the corresponding defaults on every dispatch path
+(zero, one, two, or more arguments). An explicitly supplied value, including
+`nil`, always wins. For example, `fn f(x = 7) { return x; }` returns `7` for
+`f()` and `nil` for `f(nil)`.
+
+Missing required parameters retain the interpreter's existing `nil` behavior.
+Extra arguments are still evaluated before being ignored. This is compatibility
+with the current tree interpreter; it does not qualify every backend's arity
+rules. Parameter type annotations are not enforced by this change. Anonymous
+function defaults remain unsupported by the self-hosted parser, and computed
+defaults still fail checked source admission. The existing negative-number
+literal syntax remains accepted. Use body logic with a nil sentinel for complex
+initialization.
+
+The new defaults lane is part of the interpreter's array-based closure layout.
+That layout is not opaque: interpreted array operations can inspect or mutate
+closure internals. Neither literal-default support nor the trusted `eval_ast`
+contract establishes capability isolation or protection against closure forgery.
+Unsupported default AST kinds/shapes throw a fixed diagnostic without evaluating
+the supplied expression. This is a narrow check, not general AST validation.
+
+`interp_defaults_test.sapp` checks literal kinds, explicit nil, required/extra
+arguments, repeated AST evaluation and rejected source/default ASTs.
+`interp_defaults_live_test.sapp` runs one shared fixture through the retained
+host and `pbi`, covering all argument-count paths, nested closures, recursion,
+member/index calls and repeated default use. Its negative child verifies the
+fixed diagnostic and no print effect from a call node substituted as a default.
+This establishes parity for that fixture; the closure-shadowing discrepancy
+above and other backend/default semantics remain open.

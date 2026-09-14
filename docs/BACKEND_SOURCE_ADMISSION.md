@@ -38,6 +38,23 @@ The `pbc` CLI writes its destination only after successful compilation. A failed
 build leaves any older destination file intact; callers must honor failure and
 must not treat a pre-existing file as the result of the rejected build.
 
+## General-purpose compilation requirement
+
+The current direct-source byte/token ceilings are implementation restrictions,
+not intended language limits. A direct backend rejects a source over its cap
+immediately; waiting longer cannot make it compile. Flattening a multi-file
+project before passing it to a direct backend also subjects the combined source
+to that direct cap. The explicit checked C99 module route has a larger profile,
+but it does not remove the underlying scaling restriction or apply to every backend.
+
+Normal local development must support large applications through module-based
+compilation, resource-aware processing and developer-controlled budgets. Strict
+untrusted-input profiles should be explicit and separate from normal compilation.
+The fixed direct caps therefore remain a compatibility issue to redesign and test,
+not a completed general-purpose compiler policy. They are unchanged by the
+interpreter literal-default correction. Source size, token accounting, elapsed
+time and runtime execution budgets are separate controls.
+
 ## Scope and remaining limits
 
 The direct x86-64 module `stdlib/native/codegen_x64.sapp` now uses the same
