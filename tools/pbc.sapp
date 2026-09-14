@@ -2,6 +2,9 @@
 //
 //   pblang run tools/pbc.sapp <program.sapp> [--out <bin>] [--target x64|arm64|wasm] [--safe] [--overflow]
 //
+// --target wasm --local-source uses developer admission with optional
+// --max-source-bytes=N and --max-tokens=N; other targets retain strict admission.
+//
 // --target arm64 CROSS-COMPILES from x86-64 to a static AArch64/ARM64 ELF using the pure-pblang arm64 backend
 // (stdlib/codegen_arm64_ast.sapp) — no cross-toolchain needed. Integer subset (fn/if/elif/while/arith/print/
 // calls/recursion); copy the result to any arm64 device (Pi, phone, arm64 server, Apple-silicon VM) and run it.
@@ -16,6 +19,18 @@
 // while, functions + recursion, closures, arrays + push, maps). Unsupported constructs fail loud.
 
 let cg = import("stdlib/native/codegen_x64.sapp");
+let OS = import("stdlib:os.sapp");
+let SOURCE = import("stdlib:compiler/checked_source.sapp");
+
+fn _bad_option(message) { print "pbc: " + message; os_exit(2); }
+fn _count(text) {
+    if len(text) == 0 { return nil; }
+    for ch in str_split(text, "") {
+        let code = strcharcodeat(ch, 0);
+        if code < 48 or code > 57 { return nil; }
+    }
+    return try parse_number(text) catch nil;
+}
 
 fn _is_flag(a) { return len(a) > 0 and strcharcodeat(a, 0) == 45; }
 fn _has_suffix(f, ext) { if len(f) <= len(ext) { return false; } return str_slice(f, len(f) - len(ext), len(f)) == ext; }
@@ -28,27 +43,47 @@ fn _default_out(src) {
 }
 
 fn main() {
-    let a = os_args();
+    let a = OS.script_args();
     let src: any = nil; let out: any = nil; let safe = false; let overflow = false; let target = "x64"; let i = 0;
+    let local_source = false; let budget = map{}; let target_set = false;
     while i < len(a) {
         let arg = a[i];
-        if arg == "--out" and i + 1 < len(a) { out = a[i + 1]; i = i + 1; }
-        elif arg == "--target" and i + 1 < len(a) { target = a[i + 1]; i = i + 1; }
-        elif arg == "--safe" { safe = true; }
+        if arg == "--out" {
+            if out != nil or i + 1 >= len(a) { _bad_option("invalid or duplicate output option"); }
+            if _is_flag(a[i + 1]) { _bad_option("output option requires a path"); }
+            out = a[i + 1]; i = i + 1;
+        } elif arg == "--target" {
+            if target_set or i + 1 >= len(a) { _bad_option("invalid or duplicate target option"); }
+            target = a[i + 1]; target_set = true; i = i + 1;
+        } elif arg == "--safe" { safe = true; }
         elif arg == "--overflow" or arg == "--checked-arith" { overflow = true; }
-        elif not _is_flag(arg) and arg != "run" and _has_suffix(arg, ".sapp") and not _has_suffix(arg, "pbc.sapp") { src = arg; }
+        elif arg == "--local-source" {
+            if local_source { _bad_option("duplicate local source option"); }
+            local_source = true;
+        } elif str_starts_with(arg, "--max-source-bytes=") or str_starts_with(arg, "--max-tokens=") {
+            let is_bytes = str_starts_with(arg, "--max-source-bytes=");
+            let key = if is_bytes { "max_source_bytes" } else { "max_tokens" };
+            let offset = if is_bytes { 19 } else { 13 };
+            if map_has(budget, key) { _bad_option("duplicate source budget"); }
+            let count = _count(str_slice(arg, offset, len(arg)));
+            if count == nil { _bad_option("invalid source budget"); }
+            budget[key] = count;
+        } elif _is_flag(arg) { _bad_option("unknown option"); }
+        else {
+            if src != nil { _bad_option("exactly one source file is required"); }
+            src = arg;
+        }
         i = i + 1;
     }
-    if src == nil {
-        print "usage: pblang run tools/pbc.sapp <program.sapp> [--out <bin>] [--target x64|arm64|wasm] [--safe] [--overflow]";
-        return nil;
-    }
-    if target != "x64" and target != "arm64" and target != "wasm" {
-        print "pbc: unknown --target '" + target + "' (supported: x64, arm64, wasm)";
-        return nil;
-    }
+    if src == nil { _bad_option("source file required; use SOURCE --out OUTPUT --target x64|arm64|wasm"); }
+    if target != "x64" and target != "arm64" and target != "wasm" { _bad_option("unknown target"); }
+    if local_source and target != "wasm" { _bad_option("local source admission is currently supported only for wasm"); }
+    if not local_source and len(map_keys(budget)) != 0 { _bad_option("source budgets require --local-source"); }
+    let validated = try SOURCE.local_budget(budget) catch nil;
+    if validated == nil { _bad_option("invalid source budget"); }
     if out == nil { out = _default_out(src); }
 
+    // The optional byte budget applies after this existing whole-file read.
     let source = fs_read(src);
 
     // ── WASM: pure-pblang WebAssembly backend → a .wasm module exporting main() → i64. Runs in every
@@ -56,7 +91,7 @@ fn main() {
     if target == "wasm" {
         if safe or overflow { print "  note: --safe/--overflow are x64-only; wasm gets the engine's own sandboxing"; }
         let wcg = import("stdlib/codegen_wasm.sapp");
-        let wbin = wcg.compile_wasm(source);
+        let wbin = if local_source { wcg.compile_wasm_local(source, validated) } else { wcg.compile_wasm(source) };
         fs_write_bytes(out, wbin);
         print "pbc: compiled '" + str(src) + "' → '" + str(out) + "' (" + str(len(wbin)) + " bytes, WebAssembly module)";
         print "  run it:  node -e \"WebAssembly.instantiate(require('fs').readFileSync('" + str(out) + "')).then(r=>console.log(String(r.instance.exports.main())))\"";
