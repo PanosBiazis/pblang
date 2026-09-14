@@ -153,8 +153,11 @@ separately rejected shared return-signal experiment are under
 `results/2026-07-14-tree-interpreter-scope-cache/` and
 `results/2026-07-14-tree-interpreter-return-signal/`.
 The lexical-cache fixture uses longer batches and paired same-process lookup
-controls for depths 0, 1, and 2. Identifier nodes resolve their immutable
-lexical depth once; subsequent reads and assignments index that scope directly.
+controls for depths 0, 1, and 2. Uniquely declared names resolve their stable
+lexical depth once; repeated names use dynamic lookup to preserve late shadowing.
+See [tree-interpreter scope resolution](../docs/INTERPRETER_SCOPES.md) for the
+current contract and the retained-bootstrap discrepancy. Historical benchmark
+results are not new performance measurements of this correctness change.
 The control fixture correctness-gates recursive returns, returns through nested
 lexical scopes, and allocation-heavy break/continue loops. The closure-layout
 fixture alternates map and fixed-array metadata reads in one process and reports
