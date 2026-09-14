@@ -1,4 +1,4 @@
-# Checked WASM and ARM64 source admission
+# Checked WASM, ARM64 and x86-64 source admission
 
 `stdlib:compiler/checked_source.sapp` provides `parse_source(source,
 max_source_bytes=1048576, max_tokens=65536)`. It returns an AST only after
@@ -40,9 +40,38 @@ must not treat a pre-existing file as the result of the rejected build.
 
 ## Scope and remaining limits
 
+The direct x86-64 module `stdlib/native/codegen_x64.sapp` now uses the same
+admission helper for `compile_expr_exit`, `compile_program`, `compile_fns` and,
+through `compile_fns`, `compile_safe`. All user-source checks precede output
+allocation. The fixed internal prelude helpers retain their existing parser;
+their text is a private hard-coded map, not supplied source. `compile_safe` does
+not return a certificate on failed source admission. Its existing `safe` field
+is not proof of complete native runtime isolation.
+
+`native/compile_session.sapp` checks source before cache keys, reads, hit/miss
+counters, compilation or publication. Batch admission checks every job before
+processing any job, preserving old output files when a later job is invalid.
+The cached benchmark driver follows the same rule. Both include the helper in
+their default dependency fingerprints. A seeded invalid-source cache entry
+therefore cannot bypass admission. Cold builds currently parse source again in
+the backend; warm builds now pay the required admission cost. No speedup is
+claimed for this change.
+The local benchmark driver still reads its source file before applying the
+in-memory cap. Its caller must supply a bounded trusted local file; this change
+does not bound the initial file-read allocation.
+
+This deliberately lowers the session/driver's former 16-MiB source ceiling to
+1 MiB UTF-8 and adds the 65,536-token ceiling to all direct x64 source routes.
+Sessions retain their existing fixed source-size rejection; other admission
+failures return `error="x86-64 source admission failed"`. The artifact cache's
+standalone storage/key API is unchanged and does not itself validate source.
+The cache remains a private local performance cache trusted at the same-user
+boundary: matching metadata, digest and ELF shape do not authenticate machine
+code against a writer who can replace both metadata and artifact.
+
 This is lexical/syntax admission, not complete semantic validation or universal
 compiler parity. Backend-specific type, numeric, ABI and language-subset behavior
-remain separate. Other direct C/native/interpreter parser consumers require their
+remain separate. Other direct C/interpreter parser consumers require their
 own review; this helper does not change them or editor recovery. Source/token
 ceilings do not establish peak heap, wall-clock, native isolation or an aggregate
 runtime budget. Generated ARM64 tested in an emulator is not guest-OS validation.
@@ -56,11 +85,16 @@ runtime budget. Generated ARM64 tested in an emulator is not guest-OS validation
 - `tests/semantics/backend_source_diagnostics_live_test.sapp`: Linux child-process
   positive controls, actual fixed diagnostics and synthetic source non-disclosure.
   Set `PBLANG_BIN` when testing with a retained binary outside the checkout.
+- `tests/semantics/x64_source_admission_test.sapp`: all four x64 source routes,
+  inclusive byte bounds, UTF-8/token rejection, valid programs and prelude helpers.
+- `tests/semantics/x64_cache_admission_test.sapp`: readable seeded invalid-source
+  cache entries rejected before counters/effects, old outputs and entries intact,
+  valid cache reuse, and the actual cached benchmark driver.
 - Existing WASM Node/V8, ARM64 execution, pipeline, frontend, PBIDE and emulator
   suites check compatibility. Node/V8 needs virtual address space for its WASM
   reservation; this is distinct from physical memory use.
 
-Validation for this change passed 48 suites, including 17 emulator suites and
+Validation for the earlier WASM/ARM64 change passed 48 suites, including 17 emulator suites and
 real Node/V8 execution. After the ARM64 parameter rename, all four affected
 admission/ARM64 suites passed again. The retained-bootstrap project build passed;
 the self-hosted checker reported zero errors/warnings across eight touched source

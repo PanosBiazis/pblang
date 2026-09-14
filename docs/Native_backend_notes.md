@@ -549,11 +549,16 @@ and `emit-pbck` remains an explicit host bootstrap boundary. Full evidence is in
 ## One-process x86-64 builds and verified module bytecode (2026-07-19)
 
 `stdlib/native/compile_session.sapp` now imports the direct backend once,
-fingerprints codegen/tokenizer/parser/ELF inputs once, and compiles up to 256
-bounded jobs. All jobs are safety-certified and ELF-validated before any output
-publication. The content-addressed artifact cache is format-versioned and
-verified; cache I/O failure is observable but does not alter compiler semantics.
+fingerprints codegen/checked-source/tokenizer/parser/ELF inputs once, and compiles
+up to 256 bounded jobs. Source admission for every job now precedes cache access
+and publication, with a 1-MiB UTF-8 / 65,536-token ceiling. Cold jobs compile
+through `compile_safe`; cache hits validate source and stored ELF shape/digest.
+The cache trusts same-user local storage and does not independently certify a
+cached artifact's runtime safety. Cache I/O failure is observable. See
+[checked source admission](BACKEND_SOURCE_ADMISSION.md) for the full contract.
 
+The following measurements are historical, before mandatory cache-hit source
+admission; they are not measurements of the current path.
 On six distinct source files, nine samples measured 445.675 ms median for six
 independent processes, 102.972 ms for one process with cold artifacts (4.33x),
 and 81.758 ms for one process with verified warm artifacts (5.45x). The current

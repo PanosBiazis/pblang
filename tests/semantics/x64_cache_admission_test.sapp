@@ -1,0 +1,76 @@
+// Trusted local cache fixture. No generated native artifact is executed here.
+let Session = import("stdlib/native/compile_session.sapp");
+let Cache = import("stdlib/native/artifact_cache.sapp");
+let X = import("stdlib/native/codegen_x64.sapp");
+let root = path_join(env_get("TMPDIR") ?? "/tmp", "pblang-x64-admission-" + str_slice(sha256(str(random_bytes(16))), 0, 16));
+let cache = root + "-cache";
+let output = root + "-out.elf";
+let first_output = root + "-first.elf";
+let source_file = root + ".sapp";
+fn cleanup() {
+    for entry in (try fs_listdir(cache) catch []) { try fs_remove(path_join(cache, entry)) catch nil; }
+    try fs_remove(cache) catch nil;
+    try fs_remove(output) catch nil;
+    try fs_remove(first_output) catch nil;
+    try fs_remove(source_file) catch nil;
+}
+fn untouched(state) {
+    assert(state.hits == 0 and state.misses == 0 and state.stores == 0 and state.cache_errors == 0
+        and state.compiled == 0 and state.published == 0, "rejection precedes cache access and counters");
+}
+fn exercise() {
+    let includes_admission = false;
+    for path in Session.DEFAULT_DEPENDENCIES {
+        if path == "stdlib/compiler/checked_source.sapp" { includes_admission = true; }
+    }
+    assert(includes_admission, "admission helper participates in fingerprint");
+    let valid = "return 7;";
+    let binary = X.compile_safe(valid).binary;
+    let invalid = "return 7; /* private_canary";
+    let state = Session.session(map{ cache_root: cache });
+    let key = Cache.cache_key_with_fingerprint(invalid, state.dependency_fingerprint, state.profile);
+    assert(Cache.store(cache, key, binary).ok and Cache.load(cache, key).hit, "positive control: invalid source has a readable cache entry");
+    let old_binary = fs_read_bytes(path_join(cache, key + ".elf"));
+    let old_meta = fs_read(path_join(cache, key + ".json"));
+    let rejected = Session.compile_bytes(state, invalid);
+    assert(not rejected.ok and rejected.error == "x86-64 source admission failed"
+        and not map_has(rejected, "binary"), "cached invalid source has no returned bytes");
+    untouched(state);
+    let one = Session.compile_one(state, invalid, output);
+    assert(not one.ok and one.index == 0 and len(one.results) == 0 and not fs_exists(output), "single cached invalid source is not published");
+    untouched(state);
+    fs_write(output, "older-output"); fs_write(first_output, "older-first-output");
+    let batch = Session.compile_many(state, [map{ source: valid, output: first_output }, map{ source: invalid, output: output }]);
+    assert(not batch.ok and batch.index == 1 and len(batch.results) == 0, "late invalid job rejected before processing any job");
+    untouched(state);
+    assert(fs_read(output) == "older-output" and fs_read(first_output) == "older-first-output", "all old outputs preserved");
+    assert(fs_read_bytes(path_join(cache, key + ".elf")) == old_binary and fs_read(path_join(cache, key + ".json")) == old_meta, "rejected cache entry unchanged");
+    for source in ["fn main(){return 7;", "return 7; let x=0x;", str_repeat("//\n", 65536) + "return 7;",
+        "/*" + str_repeat("😀", 262144) + "*/return 7;"] {
+        assert(not Session.compile_bytes(state, source).ok, "byte/syntax/token admission precedes cache");
+        assert(not Session.compile_one(state, source, output).ok, "batch entry also enforces admission");
+        untouched(state);
+    }
+    let first = Session.compile_bytes(state, valid);
+    let second = Session.compile_bytes(state, valid);
+    assert(first.ok and second.ok and first.mode == "compiled" and second.mode == "cache-hit"
+        and first.binary == second.binary, "valid cold and warm cache remain equivalent");
+    if platform() == "linux" {
+        let compiler = env_get("PBLANG_BIN") ?? path_join(cwd(), "target/release/pblang");
+        let args = ["-k", "1s", "8s", compiler, "run", "bench/drivers/repro_codegen_x64_cached.sapp",
+            "--allow-all", "--", source_file, output, cache];
+        fs_write(source_file, valid);
+        let control = proc_spawn_wait("/usr/bin/timeout", args);
+        assert(control.exit_code == 0 and str_starts_with(control.stdout, "hit|"), "benchmark driver valid cache hit");
+        let previous = fs_read_bytes(output);
+        fs_write(source_file, invalid);
+        let denied = proc_spawn_wait("/usr/bin/timeout", args);
+        assert(denied.exit_code == 1 and str_contains(denied.stderr, "checked_source: invalid or unterminated token"), "benchmark driver rejects seeded invalid cache entry");
+        assert(not str_contains(denied.stderr + denied.stdout, "private_canary"), "driver does not disclose rejected source data");
+        assert(fs_read_bytes(output) == previous, "driver rejection preserves prior output");
+    }
+}
+let passed = try { exercise(); true } catch false;
+cleanup();
+assert(passed, "x64 cache admission regression failed");
+print "x64_cache_admission_pass";
