@@ -14,20 +14,35 @@ fn _nkeys(m) { return len(map_keys(m)); }
 
 // ── word emit / patch ─────────────────────────────────────────────────────────────────────────────────────────
 fn _w32(word) { return [word % 256, num_floor(word / 256) % 256, num_floor(word / 65536) % 256, num_floor(word / 16777216) % 256]; }
-fn _e(code, word) { let b = _w32(word); push(code, b[0]); push(code, b[1]); push(code, b[2]); push(code, b[3]); }
+// Append directly: no temporary four-element array per instruction.
+fn _e(code, word) {
+    push(code, word % 256); push(code, num_floor(word / 256) % 256);
+    push(code, num_floor(word / 65536) % 256); push(code, num_floor(word / 16777216) % 256);
+}
 fn _wpos(code) { return num_floor(len(code) / 4); }
 fn _patch(code, at, word) { let b = at * 4; let w = _w32(word); code[b] = w[0]; code[b + 1] = w[1]; code[b + 2] = w[2]; code[b + 3] = w[3]; }
-fn _imm19(off) { if off < 0 { return off + 524288; } return off; }
-fn _imm26(off) { if off < 0 { return off + 67108864; } return off; }
+fn _imm19(off) {
+    if not (try off >= -262144 and off <= 262143 and off == num_floor(off) catch false) { fail("branch exceeds signed imm19 encoding"); }
+    if off < 0 { return off + 524288; } return off;
+}
+fn _imm26(off) {
+    if not (try off >= -33554432 and off <= 33554431 and off == num_floor(off) catch false) { fail("branch exceeds signed imm26 encoding"); }
+    if off < 0 { return off + 67108864; } return off;
+}
+
+fn _uimm12(value) {
+    if not (try value >= 0 and value <= 4095 and value == num_floor(value) catch false) { fail("offset exceeds compact imm12 encoding"); }
+    return value;
+}
 
 // ── compact instruction encoders (used by the heap helpers; keep hand-hex out of loops) ──
-fn _addi_(d, n, imm) { return 0x91000000 + imm * 1024 + n * 32 + d; }   // add  Xd,Xn,#imm
-fn _subi_(d, n, imm) { return 0xD1000000 + imm * 1024 + n * 32 + d; }   // sub  Xd,Xn,#imm
+fn _addi_(d, n, imm) { return 0x91000000 + _uimm12(imm) * 1024 + n * 32 + d; }   // add  Xd,Xn,#imm
+fn _subi_(d, n, imm) { return 0xD1000000 + _uimm12(imm) * 1024 + n * 32 + d; }   // sub  Xd,Xn,#imm
 fn _addr_(d, n, m) { return 0x8B000000 + m * 65536 + n * 32 + d; }      // add  Xd,Xn,Xm
 fn _subr_(d, n, m) { return 0xCB000000 + m * 65536 + n * 32 + d; }      // sub  Xd,Xn,Xm
 fn _movr_(d, s) { return 0xAA0003E0 + s * 65536 + d; }                  // mov  Xd,Xs
-fn _strw_(t, n, u) { return 0xF9000000 + u * 1024 + n * 32 + t; }       // str  Xt,[Xn,#u*8]
-fn _ldrw_(t, n, u) { return 0xF9400000 + u * 1024 + n * 32 + t; }       // ldr  Xt,[Xn,#u*8]
+fn _strw_(t, n, u) { return 0xF9000000 + _uimm12(u) * 1024 + n * 32 + t; }       // str  Xt,[Xn,#u*8]
+fn _ldrw_(t, n, u) { return 0xF9400000 + _uimm12(u) * 1024 + n * 32 + t; }       // ldr  Xt,[Xn,#u*8]
 fn _strb_(t, n) { return 0x39000000 + n * 32 + t; }                     // strb Wt,[Xn]
 fn _ldrb_(t, n) { return 0x39400000 + n * 32 + t; }                     // ldrb Wt,[Xn]
 fn _movz_(d, imm) { return 0xD2800000 + imm * 32 + d; }                 // movz Xd,#imm
@@ -446,8 +461,31 @@ fn _seti(code, reg, v) {
 fn _push0(code) { _e(code, 0xD10043FF); _e(code, 0xF90003E0); }              // sub sp,sp,#16 ; str x0,[sp]
 fn _pop(code, reg) { _e(code, 0xF94003E0 + reg); _e(code, 0x910043FF); }     // ldr xreg,[sp] ; add sp,sp,#16
 fn _mov(code, d, s) { _e(code, 0xAA0003E0 + s * 65536 + d); }                // mov Xd, Xs (orr Xd,xzr,Xs)
-fn _ldr_fp(code, reg, slot) { _e(code, 0xF9400000 + slot * 1024 + 29 * 32 + reg); }   // ldr xreg,[x29,#8*slot]
-fn _str_fp(code, reg, slot) { _e(code, 0xF9000000 + slot * 1024 + 29 * 32 + reg); }   // str xreg,[x29,#8*slot]
+// x16 (IP0) is reserved for wide address formation; no call occurs between
+// formation and access. Normal offsets keep their original one-word encoding.
+fn _adjust(code, d, n, bytes, subtract = false) {
+    if not (try bytes >= 0 and bytes <= 9007199254740991 and bytes == num_floor(bytes) catch false) { fail("invalid address adjustment"); }
+    let opcode = if subtract { 0xD1000000 } else { 0x91000000 };
+    if bytes <= 4095 { _e(code, opcode + bytes * 1024 + n * 32 + d); return; }
+    let remaining = bytes; let base = n;
+    while remaining >= 4096 {
+        let high = num_floor(remaining / 4096); if high > 4095 { high = 4095; }
+        _e(code, opcode + 4194304 + high * 1024 + base * 32 + d);
+        remaining = remaining - high * 4096; base = d;
+    }
+    if remaining > 0 { _e(code, opcode + remaining * 1024 + base * 32 + d); }
+}
+fn _ldr_fp(code, reg, slot) {
+    if slot <= 4095 { _e(code, _ldrw_(reg, 29, slot)); return; }
+    _adjust(code, 16, 29, slot * 8);
+    _e(code, _ldrw_(reg, 16, 0));
+}
+fn _str_fp(code, reg, slot) {
+    if slot <= 4095 { _e(code, _strw_(reg, 29, slot)); return; }
+    if reg == 16 { fail("wide store conflicts with reserved address register"); }
+    _adjust(code, 16, 29, slot * 8);
+    _e(code, _strw_(reg, 16, 0));
+}
 fn _cmpcond(op) {   // op → the cset condition field (already the INVERSE the encoding wants), for cmp x0,x1
     if op == "==" { return 1; } if op == "!=" { return 0; }
     if op == "<" { return 10; } if op == ">=" { return 11; }
@@ -572,7 +610,7 @@ fn _emit_str_lit(code, slots, s) {
     push(slots["@spatch"], map{ pos: pos, off: off });
 }
 fn _epilogue(code, frame) {
-    _e(code, 0x910003BF + frame * 1024);                 // add sp, x29, #frame
+    _adjust(code, 31, 29, frame);                 // add sp, x29, #frame
     _e(code, 0xA8C00000 + 2 * 32768 + 30 * 1024 + 31 * 32 + 29);  // ldp x29,x30,[sp],#16
     _e(code, 0xD65F03C0);                                // ret
 }
@@ -912,13 +950,13 @@ fn _cfn(function_node, sdata, fnret, fnptype) {
     }
     let frame = 8 * nslots; let rr = frame % 16; if rr != 0 { frame = frame + (16 - rr); }
     _e(code, 0xA9800000 + 0x7E * 32768 + 30 * 1024 + 31 * 32 + 29);   // stp x29,x30,[sp,#-16]!
-    if frame > 0 { _e(code, 0xD10003FF + frame * 1024); }             // sub sp,sp,#frame
+    if frame > 0 { _adjust(code, 31, 31, frame, true); }             // sub sp,sp,#frame
     _e(code, 0x910003FD);                                            // mov x29,sp
     let pi = 0;                              // spill params to slots: 0-7 arrive in x0-x7, 8+ on the caller's stack
     while pi < len(params) {
         if pi < 8 { _str_fp(code, pi, slots[_pname(params[pi])]); }
         else {                               // incoming stack arg pi is at [x29, #frame+16+8*(pi-8)]
-            _e(code, _ldrw_(9, 29, num_floor(frame / 8) + 2 + (pi - 8)));
+            _ldr_fp(code, 9, num_floor(frame / 8) + 2 + (pi - 8));
             _str_fp(code, 9, slots[_pname(params[pi])]);
         }
         pi = pi + 1;

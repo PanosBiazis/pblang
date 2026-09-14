@@ -108,6 +108,10 @@ absence or failure is not reported as success. No guest operating system is invo
 
 ## Other routes and limits
 
+The ARM64 backend now encodes large frames and distant frame slots correctly,
+and rejects unrepresentable compact immediates/branches. Its source-admission
+policy is unchanged. See [ARM64 encoding and measured limits](ARM64_ENCODING.md).
+
 - `checked_source.parse_source`, `interp.compile_program`/`eval_program`, PBIDE
   and existing strict backend entry points keep their contracts.
 - `checked_source.parse_local_source` and `tokenizer.tokenize_local` expose the
