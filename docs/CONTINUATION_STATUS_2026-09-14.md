@@ -17,7 +17,36 @@ current-platform acceptance evidence for the present compiler revision.
 
 ## Current local validation
 
-The current continuation separates local developer source admission from strict
+The current slice adds explicit WebAssembly local source admission via
+`compile_wasm_local` and `pbc --target wasm --local-source`, with optional
+developer byte/token budgets. Existing strict APIs and bounded facades stay
+strict. CLI policy errors reject before reading input, and failed compilation
+preserves an existing output. Unknown/duplicate arguments now reject instead of
+being silently ignored; legacy trailing source arguments remain supported.
+
+The shared emitter sizes initial linear memory after final static data is known,
+retaining the old 16-page minimum and checking memory32 representation. Type
+inference now reaches its finite monotone fixed point instead of silently
+stopping after 200 rounds. A 210-function regression failed before that correction
+and passed afterward in Node/V8. This fixes a correctness restriction; it is not
+a performance benchmark. Static-memory sizing does not add runtime heap growth.
+
+Current validation passed 43 selected suites, including 17 emulator suites,
+real Node/V8 execution, actual local `pbc` artifact execution and the preceding
+interpreter/C99 regressions. Five changed source files passed self-hosted
+checking with zero errors/warnings and strict entry scans with complete mandatory
+analysis, zero blocking findings and stable snapshots. Retained lint passed with
+conservative/style warnings; independent security review found no new blocker.
+The fixed-point solver can still take quadratic work for long chains; no
+performance improvement is claimed. The high memory32 representation endpoints
+were reviewed but not exercised with multi-gigabyte allocations. Isolated and
+main retained-bootstrap builds and portable locks passed. Graphify was stopped
+after its 45-second update window; graph freshness remains unverified. No server,
+guest operating system or remote runner was used for this slice.
+
+The previous local-source slice separated interpreter/C99 admission as follows.
+
+The preceding continuation separates local developer source admission from strict
 input budgets. `pbi`, explicit interpreter library entry points and hosted C99
 local translation/build/run support source above the former direct 1 MiB /
 65,536-token ceiling without preset byte/token caps. Optional budgets are exact,
@@ -136,7 +165,7 @@ matrix, physical-device support and general production readiness remain open.
 
 | Workstream | Established progress | What remains |
 | --- | --- | --- |
-| Compiler | Explicit local interpreter/C99 source budgets; named-function literal defaults and corrected interpreter late-shadow lookup; checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Extend developer budgets across smart builds/backends and separate compilation, bootstrap closure-binding parity, native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
+| Compiler | Explicit local interpreter/C99/WASM source budgets, data-sized WASM memory and convergent string-type inference; named-function literal defaults and corrected interpreter late-shadow lookup; checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Extend developer budgets across smart builds/backends and separate compilation; repair ARM64 branch/frame/slot encoding range hazards before widening its source admission; bootstrap closure-binding parity, native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
 | Runtime/FFI | Existing resource contracts, bounded native type-tag reads, heap configuration validation and explicit uncertified scope | Hard memory/time limits, typed native dispatch and hostile-code isolation with actual enforcement evidence |
 | Audits | Policy preflight, checkpoint/counter validation and retained-finding bounds | Whole-report work/decoding budgets and trusted report provenance |
 | Releases | Selected signature/trust/artifact-copy checks | Complete publisher selection, revocation, rollback policy and immutable handoff |

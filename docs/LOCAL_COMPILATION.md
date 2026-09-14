@@ -64,13 +64,55 @@ Use the separate checked module APIs for project snapshots. Local admission plus
 unchecked files. `source_budget` without local admission also rejects instead of
 silently ignoring a caller's requested budget.
 
+## WebAssembly local compilation
+
+```pblang
+let W = import("stdlib:codegen_wasm.sapp");
+let bytes = W.compile_wasm_local(source);
+let limited = W.compile_wasm_local(source, map{max_tokens: 500000});
+```
+
+```sh
+pblang run tools/pbc.sapp --allow-all -- app.sapp --out app.wasm --target wasm --local-source
+pblang run tools/pbc.sapp --allow-all -- app.sapp --out app.wasm --target wasm --local-source --max-source-bytes=8388608 --max-tokens=500000
+```
+
+Without `--local-source`, `pbc` and `compile_wasm` keep strict admission.
+Local admission is currently supported only for the WASM target in `pbc`.
+Budgets without local mode, invalid or duplicate budget options, duplicate
+source/output/target arguments, missing option values and unknown flags fail
+before the source is read. A path starting with `-` can be written with `./`.
+The CLI still reads the entire source before enforcing an optional byte budget.
+Compilation must finish successfully before the output file is replaced.
+
+Both APIs share the same private emitter. Static string data determines initial
+linear-memory size after all literals have been emitted. The existing minimum
+is 16 pages; larger data receives enough additional pages to fit its aligned
+heap base. Small programs retain their previous memory declaration. The memory32
+address and string-header representation is checked, including signed encoding
+of high-bit heap-base constants. The architectural memory32 ceiling is distinct
+from source size; see the [WebAssembly memory limits](https://webassembly.github.io/spec/js-api/index.html#limits).
+The allocator still does not grow memory automatically at runtime: fitting static
+data does not establish sufficient capacity for later concatenations/allocations.
+
+String-type inference now runs to convergence. Its fixed set of return/parameter
+slots can each move only from numeric to string, so every changing round consumes
+one of a finite number of transitions. The former silent 200-round cutoff could
+miss string-returning functions in long call chains. A 210-function chain is
+checked through both admission APIs and executed in Node/V8.
+
+Tests execute source above both former direct caps, instantiate static data
+exactly at and just over the 16-page boundary, and exercise CLI budget rejection
+with old-output preservation. Node/V8 is required for these execution regressions;
+absence or failure is not reported as success. No guest operating system is involved.
+
 ## Other routes and limits
 
 - `checked_source.parse_source`, `interp.compile_program`/`eval_program`, PBIDE
-  and existing direct backend admission keep their strict contracts.
+  and existing strict backend entry points keep their contracts.
 - `checked_source.parse_local_source` and `tokenizer.tokenize_local` expose the
   developer policy explicitly. The strict bounded tokenizer is unchanged.
-- `pbbuild`/smart build, native-x64 cache sessions and dependency/security scans
+- `pbbuild`/smart build, native-x64 cache sessions, other backend routes and dependency/security scans
   have separate limits that this change does not widen. Full large-project
   support across those paths remains an explicit next priority.
 - Never forward untrusted request options into local admission automatically.
