@@ -50,10 +50,13 @@ but it does not remove the underlying scaling restriction or apply to every back
 Normal local development must support large applications through module-based
 compilation, resource-aware processing and developer-controlled budgets. Strict
 untrusted-input profiles should be explicit and separate from normal compilation.
-The fixed direct caps therefore remain a compatibility issue to redesign and test,
-not a completed general-purpose compiler policy. They are unchanged by the
-interpreter literal-default correction. Source size, token accounting, elapsed
-time and runtime execution budgets are separate controls.
+The explicit local interpreter and hosted C99 routes now accept source without
+preset byte/token ceilings, with optional developer budgets and unchanged syntax
+rejection. `pbi` selects this local policy; existing strict APIs retain their
+contracts. See [local compilation](LOCAL_COMPILATION.md) for exact APIs and CLI
+options. Smart builds, x64 sessions and other backends still need the same
+large-project redesign. Source size, token accounting, elapsed time and runtime
+execution budgets are separate controls.
 
 ## Scope and remaining limits
 
