@@ -176,10 +176,14 @@ codegen backends. FIPS 202 empty, `abc`, multi-block and byte-array vectors are
 covered by `tests/semantics/sha3_test.sapp`.
 
 `stdlib:native/compile_session.sapp` is the preferred direct-codegen path for a
-project or repeated build. It fingerprints the backend once, validates every
-artifact before publication, and loads `codegen_x64.sapp` lazily only after a
-real cache miss. Consequently, an all-hit warm session does not parse the 270 KB
-backend. `bench/x64_compile_pipeline_stages.sapp` reports process startup,
+project or repeated build. It imports and fingerprints the backend once, checks
+every source before cache access, and validates each artifact before publication.
+The x64 source limit is now 1 MiB UTF-8 and 65,536 tokens, including comments/EOF.
+Cache hits also undergo source admission; all jobs in a batch pass admission
+before any cache lookup or output publication. See
+[backend source admission](BACKEND_SOURCE_ADMISSION.md) for the same-user cache
+trust boundary and intentional tightening of the former 16-MiB limit.
+`bench/x64_compile_pipeline_stages.sapp` reports process startup,
 backend import, emitter, publication and cache stages separately; its derived
 rows make clear which latency belongs to code emission and which belongs to
 cold orchestration.
@@ -190,7 +194,8 @@ Plans are deterministic and expose why
 each backend was selected. Batch builds share one direct-codegen session, so a
 warm artifact does not reload the backend. All source/path/job sizes are
 bounded, subprocesses use argv rather than shell-concatenated paths, direct
-outputs are safety-certified before atomic publication, and manifest entries
+outputs use cold `compile_safe` or a locally trusted cache with source admission
+and ELF/digest validation before atomic publication, and manifest entries
 cannot escape their project. The legacy `compile` function remains available
 but delegates to this real build path; it no longer copies PBLang source into a
 fake C file. Automatic artifact execution is deliberately excluded because a
