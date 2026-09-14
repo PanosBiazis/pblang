@@ -52,8 +52,11 @@ separators/suffixes are rejected, not interpreted as another statement.
 Radix overflow/rounding and broader backend compatibility remain separate work.
 Only invalid numeric tokens get the raw parser's empty-AST guarantee here;
 ordinary syntax errors and unterminated-token recovery remain unchanged. Direct
-backends still need broader validation of other recovered syntax. No runtime
-resource or isolation guarantee is added.
+WASM and ARM64 source backends now additionally use
+[checked source admission](BACKEND_SOURCE_ADMISSION.md) to reject ordinary
+syntax errors and unterminated tokens before generation. Other direct parser
+consumers still need separate review. No runtime resource or isolation guarantee
+is added.
 
 Regressions cover positive values, malformed tokens, fixed diagnostics and
 Unicode positions; checked and direct parser consumers; raw legacy-guard input;

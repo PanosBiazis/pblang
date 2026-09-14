@@ -58,6 +58,13 @@ ABI integration exists. WASI uses the WebAssembly backend.
 
 ## Fail-closed limits
 
+The WASM source backend additionally requires bounded, lexically and syntactically
+valid source before generation: at most 1 MiB UTF-8 and 65,536 tokens including
+comments/EOF. Backend rejection returns a fixed `ok=false` result without an
+artifact. Raising the facade's source limit cannot widen this backend ceiling.
+See [Checked backend source admission](BACKEND_SOURCE_ADMISSION.md) for the
+direct WASM/ARM64 contract and remaining limits.
+
 The facade validates finite source, IR instruction, artifact, evaluator-step,
 frame, stack, locals, output, module-count/depth/source/path, and value-size
 options with immutable maxima. These are distinct admission/runtime controls,
