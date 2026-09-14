@@ -15,7 +15,49 @@ that no guest operating-system tests have ever run. The retained Kali report
 previously recorded locations during this reconciliation. None of these is
 current-platform acceptance evidence for the present compiler revision.
 
-## Current local validation
+## Current local validation — 2026-09-15 ARM64
+
+The ARM64 AST backend now expands frame adjustments and distant frame slots
+instead of corrupting instruction fields. Incoming stack arguments share the
+wide addressing path. Branch/compact immediate overflows reject with fixed
+errors, preserving an existing CLI output. Strict source-admission policy is
+unchanged; this adds no source-size or execution-time restriction to the language.
+Large literals, outgoing argument areas and long branches still need expanded
+lowering; runtime heap growth and stack probing remain pending.
+
+The byte emitter removes one temporary array per instruction. Twenty benchmark
+processes retained all measurements, with identical workloads and seven identical
+ELF fingerprints. Peak compiler RSS was consistently about 38% lower. Elapsed
+and CPU times were variable, including slower candidate runs; CPU speedup and
+non-regression are not established. No GPU/NPU/peripheral performance claim is
+made. See [ARM64 implementation, commands and measurements](ARM64_ENCODING.md).
+
+Validation passed 43 distinct selected suites: 41 regular suites (including the
+17 emulator suites and real Node/V8 execution) plus two opt-in extended ARM64
+probes. Large frames and incoming arguments ran in the PBLang reference, not
+on real ARM hardware or QEMU. Positive imm19 boundary and next-offset rejection,
+large literal/argument rejection and real local CLI old-output preservation
+passed. Baseline regressions reproduced the corrupt 4,096-byte frame encoding
+and acceptance of an unrepresentable positive imm19 offset before the fixes.
+
+All eight touched source files passed checking with zero errors and two unused
+benchmark-loop-variable warnings. Strict entry scans had complete mandatory
+analysis, zero blocking findings and stable source snapshots. Retained lint
+completed with conservative/style warnings. Independent security review found
+no blocker in the final retained files. A proposed standalone test runner was
+removed after review exposed false-pass and supervision gaps; new ordinary
+regressions use the existing semantics suite and heavy probes remain opt-in.
+A standalone supervised gate still requires an available audited process backend.
+
+Isolated and main retained-bootstrap builds and repository-relative lock
+publication passed. The final main build was clean after the dependency hash
+refresh. All 212 pre-existing dirty/untracked files were preserved, with only
+the necessary working dependency hash refreshed. Main-checkout frame, fingerprint,
+execution and live rejection checks also passed. Graphify was terminated after
+its 45-second update window; graph freshness remains unverified. No server,
+remote runner or guest OS was used. This slice is committed locally only.
+
+## Previous WebAssembly local validation
 
 The current slice adds explicit WebAssembly local source admission via
 `compile_wasm_local` and `pbc --target wasm --local-source`, with optional
@@ -165,7 +207,7 @@ matrix, physical-device support and general production readiness remain open.
 
 | Workstream | Established progress | What remains |
 | --- | --- | --- |
-| Compiler | Explicit local interpreter/C99/WASM source budgets, data-sized WASM memory and convergent string-type inference; named-function literal defaults and corrected interpreter late-shadow lookup; checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Extend developer budgets across smart builds/backends and separate compilation; repair ARM64 branch/frame/slot encoding range hazards before widening its source admission; bootstrap closure-binding parity, native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
+| Compiler | Explicit local interpreter/C99/WASM source budgets, data-sized WASM memory and convergent string-type inference; named-function literal defaults and corrected interpreter late-shadow lookup; checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Extend developer budgets across smart builds/backends and separate compilation; expand remaining ARM64 long-branch/literal/outgoing-argument lowering and validate stack/runtime behavior before widening its source admission; bootstrap closure-binding parity, native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
 | Runtime/FFI | Existing resource contracts, bounded native type-tag reads, heap configuration validation and explicit uncertified scope | Hard memory/time limits, typed native dispatch and hostile-code isolation with actual enforcement evidence |
 | Audits | Policy preflight, checkpoint/counter validation and retained-finding bounds | Whole-report work/decoding budgets and trusted report provenance |
 | Releases | Selected signature/trust/artifact-copy checks | Complete publisher selection, revocation, rollback policy and immutable handoff |
