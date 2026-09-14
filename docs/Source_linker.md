@@ -16,7 +16,8 @@ exports are removed only after string/comment-aware scanning.
 Successful results include flattened `source`, dependency order, reachable and
 supplied byte counts, per-module byte counts, output bytes, entry path,
 namespace strategy, and effective limits. `ctranspile.link_program(...)` adds a
-hosted-C99 compatibility gate; `ctranspile.transpile_program_linked(...)` returns
+generic source-linking result; `ctranspile.transpile_program_linked(...)` adds
+the checked-source and hosted-C99 compatibility gates and returns
 portable C source plus compact link metadata.
 
 ## Safety limits
@@ -81,6 +82,16 @@ functions can read and mutate persistent globals; module closures can capture
 initialized values; global closure handles and named function values use the
 checked dynamic-call runtime. Float and explicit integer profiles share this
 lowering. Generated-runtime/C-name collisions are rejected before returning C.
+
+Compiler linking now uses `link_modules_checked`: raw main and reachable modules
+must parse independently before their imports are scanned or their text is
+transformed. The final linked source is checked again before C lowering. This
+prevents one file from closing another file's unfinished comment/string/block.
+The compiler path caps linked UTF-8 output at 16 MiB and tokens at 1,048,576;
+lower byte options still apply. Generic linking keeps its existing 128 MiB hard
+ceiling and performs no syntax admission. Unreachable module syntax is ignored.
+See [checked source admission](BACKEND_SOURCE_ADMISSION.md) for direct-source
+limits, compatibility changes, effects ordering and remaining runtime limits.
 
 The current hosted representation remains the backend's numeric value subset;
 it is not yet a general tagged/GC-managed value runtime or a thread-safe module
