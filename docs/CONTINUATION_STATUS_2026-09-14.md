@@ -17,17 +17,29 @@ current-platform acceptance evidence for the present compiler revision.
 
 ## Current local validation
 
-The x64/cache admission change passed 50 selected suites, including 17 reference
-emulator suites, native x64 execution and real WASM execution in Node/V8. The
-seven touched PBLang files passed self-hosted checking with zero errors/warnings
-and mandatory security scans with no findings. Retained lint completed with
-style/conservative unused-variable warnings. The retained-bootstrap project
-build and repository-relative dependency lock passed. The cache test was rerun
-after its cleanup was made compatible with the self-hosted checker.
+The latest C99/interpreter/checked-linker change passed 75 selected suites,
+including 17 reference emulator suites, native C99/x64 execution, sanitizer
+checks of linked module globals and real WASM execution in Node/V8. The ten
+touched PBLang files passed self-hosted checking with zero errors/warnings and
+mandatory security scans. Independent security review found no material blocker.
+Retained lint completed with style/conservative unused-variable warnings. The
+retained-bootstrap project build and repository-relative dependency lock passed.
 
-Graphify extraction ran locally but the update did not complete within 45
-seconds; no graph-freshness claim is made. No guest OS, server deployment or
-remote test runner was used for this change.
+The linked-global AddressSanitizer test initially could not reserve shadow
+memory under the external 2 GiB virtual-address test cap. The unchanged suite
+passed with that virtual cap removed. All other test resource limits remained.
+The older x64/cache slice separately passed 50 suites before this continuation.
+
+The native self-hosted interpreter harness now includes and rewrites the new
+checked-source dependency. A single current direct-x64 compilation probe still
+rejects with `codegen: call to undefined fn type`: required builtin lowering
+remains incomplete. The interpreter's retained-host semantic suites pass, but
+this is not a successful native-selfhost interpreter validation.
+
+Graphify AST regeneration completed in the isolated checkout. Updating the
+main working repository did not complete within 45 seconds, so its graph is
+not claimed current. No guest OS, server deployment, push or remote test runner
+was used for this change.
 
 Current checked-source work tests generated artifacts locally and distinguishes
 reference emulators from guest operating systems. A complete current guest
@@ -37,7 +49,7 @@ matrix, physical-device support and general production readiness remain open.
 
 | Workstream | Established progress | What remains |
 | --- | --- | --- |
-| Compiler | Checked numeric tokens; bounded WASM/ARM64 admission; x64 admission including cached builds in this continuation | C99/interpreter consumers, broader language/ABI parity, current cross-backend execution matrix |
+| Compiler | Checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
 | Runtime/FFI | Existing resource contracts and selected boundary checks | Hard memory/time limits, typed native dispatch and hostile-code isolation with actual enforcement evidence |
 | Audits | Policy preflight, checkpoint/counter validation and retained-finding bounds | Whole-report work/decoding budgets and trusted report provenance |
 | Releases | Selected signature/trust/artifact-copy checks | Complete publisher selection, revocation, rollback policy and immutable handoff |

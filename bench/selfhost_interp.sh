@@ -13,14 +13,17 @@ CG="$DIR/stdlib/native/codegen_x64.sapp"
 TOK="$DIR/stdlib/compiler/tokenizer.sapp"
 PAR="$DIR/stdlib/compiler/parser.sapp"
 INT="$DIR/stdlib/compiler/interp.sapp"
+CHECKED="$DIR/stdlib/compiler/checked_source.sapp"
 W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
 PASS=0; FAIL=0
 
 # parser minus self-test + duplicate push; interp minus imports/export, module calls → top-level names.
 sed '/^fn print_ast/,$d' "$PAR" | perl -0pe 's/fn push\(arr, value\) \{\s*array_push\(arr, value\);\s*\}//' > "$W/par.sapp"
-sed -e '/^let _tok = import/d' -e '/^let _par = import/d' -e '/^export /d' \
-    -e 's/_tok\.tokenize/tokenize/g' -e 's/_par\.parse/parse/g' "$INT" > "$W/int.sapp"
-cat "$TOK" "$W/par.sapp" "$W/int.sapp" > "$W/base.txt"
+sed -e '/^let Tokens = import/d' -e '/^let Parser = import/d' -e '/^export /d' \
+    -e 's/Tokens\.tokenize_bounded/tokenize_bounded/g' -e 's/Parser\.parse/parse/g' "$CHECKED" > "$W/checked.sapp"
+sed -e '/^let _SOURCE = import/d' -e '/^export /d' \
+    -e 's/_SOURCE\.parse_source/parse_source/g' "$INT" > "$W/int.sapp"
+cat "$TOK" "$W/par.sapp" "$W/checked.sapp" "$W/int.sapp" > "$W/base.txt"
 
 check() {  # target-source  expected-stdout   (target may contain " — escaped into the pblang string literal)
   cp "$W/base.txt" "$W/n.txt"

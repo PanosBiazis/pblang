@@ -1,4 +1,4 @@
-# Checked WASM, ARM64 and x86-64 source admission
+# Checked executable source admission
 
 `stdlib:compiler/checked_source.sapp` provides `parse_source(source,
 max_source_bytes=1048576, max_tokens=65536)`. It returns an AST only after
@@ -69,11 +69,58 @@ The cache remains a private local performance cache trusted at the same-user
 boundary: matching metadata, digest and ELF shape do not authenticate machine
 code against a writer who can replace both metadata and artifact.
 
+## C99, interpreter and checked module linking
+
+All seven C99 source profiles (function-only, hosted float/integer,
+freestanding float/integer and kernel float/integer) now use the same direct
+1 MiB UTF-8 / 65,536-token admission. `compiler/interp.compile_program` checks
+before preparing its reusable AST; `eval_program` checks before evaluation.
+A rejected suffix cannot allow an earlier `print` to execute. C wrappers retain
+fixed profile-specific rejection messages and restore numeric/hosted mode.
+Invalid NaN limit comparisons in the retained runtime are normalized to the
+fixed admission-limit error rather than exposing an internal comparison error.
+
+`source_inliner.link_modules_checked` adds an explicit compiler linking path.
+It validates the raw main and every reachable module before import discovery
+or transformation. Unreachable files still receive the generic snapshot shape,
+path and byte checks, but do not have to parse. Checking only flattened text is
+insufficient: concatenation can close an earlier file's unfinished comment,
+string or function block. Generic `link_modules` and C99 `link_program` retain
+their source-linking compatibility contract; they are not source-admission APIs.
+
+`ctranspile.transpile_program_linked` and builds with `options.modules` force
+checked linking, then check the flattened text before lowering. The separate
+`checked_source.parse_linked_source(source, max_source_bytes=16777216,
+max_tokens=1048576)` profile accepts lower-only finite positive integer caps.
+Raw files also obey the linker's per-file byte limit. The C linked-output cap
+cannot exceed 16 MiB; a larger requested cap fails before transformation. The
+generic linker's optional 128 MiB ceiling is unchanged. Each reachable file and
+the final output have their own token cap; this is not an aggregate project
+work budget. Generated C retains existing output/memory limitations.
+
+`build_program` translates successfully before compiler discovery or output
+writes. Rejection preserves older output/C files and creates no new artifact.
+`run_program` validates its timeout, including NaN, before any build. Compiler
+execution authority, watchdog availability and runtime isolation are separate
+boundaries and have not been redesigned here.
+
+The new direct C cap deliberately also constrains callers supplying already
+flattened text, including `dist` publication and the integer benchmark driver,
+even when their outer byte checks allow more. Their effective C source cap is
+now 1 MiB / 65,536 tokens. Use the explicit in-memory module build API for the
+larger checked project profile; merely flattening externally loses raw-file
+syntax provenance. No raw-AST API (`eval_ast`, C expression/statement emitters)
+is made safe for arbitrary caller-crafted or mutated ASTs by this change.
+`tools/pbi.sapp` still reads its input file before in-memory admission; the
+initial file-read allocation is not bounded by the new parser gate.
+The native-selfhost benchmark now bundles the helper, but current direct-x64
+compilation still rejects the existing missing `type` builtin lowering. Native
+self-hosted interpreter parity is not established by the retained-host tests.
+
 This is lexical/syntax admission, not complete semantic validation or universal
 compiler parity. Backend-specific type, numeric, ABI and language-subset behavior
-remain separate. Other direct C/interpreter parser consumers require their
-own review; this helper does not change them or editor recovery. Source/token
-ceilings do not establish peak heap, wall-clock, native isolation or an aggregate
+remain separate. Editor recovery is unchanged. Source/token ceilings do not
+establish peak heap, nesting, wall-clock, native isolation or an aggregate
 runtime budget. Generated ARM64 tested in an emulator is not guest-OS validation.
 
 ## Regressions
@@ -90,6 +137,14 @@ runtime budget. Generated ARM64 tested in an emulator is not guest-OS validation
 - `tests/semantics/x64_cache_admission_test.sapp`: readable seeded invalid-source
   cache entries rejected before counters/effects, old outputs and entries intact,
   valid cache reuse, and the actual cached benchmark driver.
+- `c_interp_source_admission_test.sapp`: every C/interpreter source route,
+  malformed and recovered input, inclusive bytes, UTF-8/tokens and mode recovery.
+- `c99_checked_link_test.sapp`: cross-file healing, reachable-only admission,
+  lower/hard caps, and linked projects above the direct byte ceiling.
+- `c99_admission_effects_test.sapp`: positive-control local compiler probe,
+  rejection before external effects, old-output preservation and invalid timeouts.
+- `c_interp_diagnostics_live_test.sapp`: actual fixed child errors and no early
+  interpreter output from malformed source.
 - Existing WASM Node/V8, ARM64 execution, pipeline, frontend, PBIDE and emulator
   suites check compatibility. Node/V8 needs virtual address space for its WASM
   reservation; this is distinct from physical memory use.

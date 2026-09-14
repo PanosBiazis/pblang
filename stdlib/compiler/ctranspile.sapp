@@ -19,8 +19,7 @@
 let _NL = "
 ";
 let _SOURCE_LINKER = import("stdlib:source_inliner.sapp");
-let _TOKENIZER = import("stdlib:compiler/tokenizer.sapp");
-let _PARSER = import("stdlib:compiler/parser.sapp");
+let _SOURCE = import("stdlib:compiler/checked_source.sapp");
 let _OS = import("stdlib/os.sapp");
 let _UUID = import("stdlib/uuid.sapp");
 
@@ -860,10 +859,8 @@ fn _named_adapter_definition(node) {
 // before calling. Non-fn top-level statements are dropped (a freestanding unit is
 // functions).
 fn _emit_fns(source, preamble) {
-    _reset_fields();   // fresh field-layout per translation unit
-    let ast = _PARSER.parse(_TOKENIZER.tokenize(source));
-    let errors = try ast.errors catch [];
-    if len(errors) != 0 { throw "ctranspile: source has parser diagnostics"; }
+    let ast = _SOURCE.parse_source(source);
+    _reset_fields();   // fresh field-layout per admitted translation unit
     let stmts = try ast.stmts catch [];
     let out = preamble;
     // forward declarations (any call order / mutual recursion)
@@ -1003,11 +1000,10 @@ fn _validate_hosted_symbols(stmts) {
     }
 }
 
-fn _emit_hosted(source) {
+fn _emit_hosted(source) { return _emit_hosted_ast(_SOURCE.parse_source(source)); }
+
+fn _emit_hosted_ast(ast) {
     _reset_fields();
-    let ast = _PARSER.parse(_TOKENIZER.tokenize(source));
-    let errors = try ast.errors catch [];
-    if len(errors) != 0 { throw "hosted C99: source has parser diagnostics"; }
     let stmts = try ast.stmts catch [];
     _analyze_program(stmts);
     _validate_hosted_symbols(stmts);
@@ -1142,18 +1138,27 @@ fn _link_summary(linked) {
         entry_path: linked.entry_path, namespace: linked.namespace, limits: linked.limits };
 }
 
-fn transpile_program_linked(source, modules, options = nil) {
-    let linked = link_program(source, modules, options);
-    if not linked.ok { return linked; }
+fn _compile_linked(source, modules, options) {
     let numeric = _option(options, "numeric", "float");
     if numeric != "float" and numeric != "integer" {
-        return map{ ok: false, reason: "unknown numeric profile: " + str(numeric) };
+        return map{ ok: false, reason: "unknown numeric profile" };
     }
-    let artifact = nil;
-    if numeric == "integer" { artifact = try transpile_program_int(linked.source) catch nil; }
-    else { artifact = try transpile_program(linked.source) catch nil; }
+    let linked = try _SOURCE_LINKER.link_modules_checked(source, modules, options) catch nil;
+    if linked == nil { return map{ ok: false, reason: "invalid checked link options" }; }
+    if not linked.ok { return linked; }
+    let ast = try _SOURCE.parse_linked_source(linked.source, linked.limits.max_linked_source_bytes) catch nil;
+    if ast == nil { return map{ ok: false, reason: "C99 translation rejected linked source" }; }
+    _set_intmode(numeric == "integer"); _set_hosted(true);
+    let artifact = try _emit_hosted_ast(ast) catch nil;
+    _set_hosted(false); _set_intmode(false);
     if artifact == nil { return map{ ok: false, reason: "C99 translation rejected linked source" }; }
-    return map{ ok: true, source: artifact, link: _link_summary(linked) };
+    return map{ ok: true, source: artifact, linked: linked };
+}
+
+fn transpile_program_linked(source, modules, options = nil) {
+    let compiled = _compile_linked(source, modules, options);
+    if not compiled.ok { return compiled; }
+    return map{ ok: true, source: compiled.source, link: _link_summary(compiled.linked) };
 }
 
 fn _option(options, key, fallback) {
@@ -1236,28 +1241,26 @@ fn build_program(source, output, options = nil) {
     }
     let c_path = _option(options, "c_path", output + ".c");
     if not _safe_build_path(c_path) { return map{ ok: false, error: "invalid C output path" }; }
-    let compiler = find_c_compiler(_option(options, "compiler", nil));
-    if compiler == nil { return map{ ok: false, error: "no usable C99 compiler found" }; }
-
     let numeric = _option(options, "numeric", "float");
     if numeric != "float" and numeric != "integer" {
         return map{ ok: false, error: "unknown numeric profile: " + str(numeric) };
     }
     let linked = nil; let build_source = source;
     let modules = _option(options, "modules", nil);
-    if modules != nil {
-        linked = link_program(source, modules, options);
-        if not linked.ok { return map{ ok: false, error: "module linking failed", reason: linked.reason }; }
-        build_source = linked.source;
-    }
     let t0 = now_ms();
     let c_source = nil;
-    if numeric == "integer" { c_source = try transpile_program_int(build_source) catch nil; }
-    else { c_source = try transpile_program(build_source) catch nil; }
+    if modules != nil {
+        let compiled = _compile_linked(source, modules, options);
+        if not compiled.ok { return map{ ok: false, error: "module linking or translation failed", reason: compiled.reason }; }
+        linked = compiled.linked; build_source = linked.source; c_source = compiled.source;
+    } elif numeric == "integer" { c_source = try transpile_program_int(source) catch nil; }
+    else { c_source = try transpile_program(source) catch nil; }
     if c_source == nil {
         return map{ ok: false, error: "C99 translation rejected unsupported or invalid source" };
     }
     let transpile_ms = now_ms() - t0;
+    let compiler = find_c_compiler(_option(options, "compiler", nil));
+    if compiler == nil { return map{ ok: false, error: "no usable C99 compiler found" }; }
     let wrote = try fs_write(c_path, c_source) catch false;
     if type(wrote) == "bool" and not wrote {
         return map{ ok: false, error: "could not write generated C", c_path: c_path };
@@ -1291,6 +1294,11 @@ fn build_program(source, output, options = nil) {
 // run_program(source, options) — bounded compile-and-run convenience. GNU/coreutils
 // `timeout` is used as a watchdog; unbounded execution requires explicit opt-in.
 fn run_program(source, options = nil) {
+    let timeout_ms = _option(options, "timeout_ms", 10000);
+    let valid_timeout = try type(timeout_ms) == "number" and timeout_ms >= 1 and timeout_ms <= 300000 catch false;
+    if not valid_timeout {
+        return map{ ok: false, error: "timeout_ms must be between 1 and 300000" };
+    }
     let output = _OS.temp_dir() + "/pblang_c99_" + _UUID.v4();
     let build_options = map{
         profile: _option(options, "profile", "speed"),
@@ -1307,11 +1315,6 @@ fn run_program(source, options = nil) {
     let built = build_program(source, output, build_options);
     if not built.ok { return built; }
 
-    let timeout_ms = _option(options, "timeout_ms", 10000);
-    if type(timeout_ms) != "number" or timeout_ms < 1 or timeout_ms > 300000 {
-        try fs_remove(output) catch nil;
-        return map{ ok: false, error: "timeout_ms must be between 1 and 300000" };
-    }
     let watchdog = find_c_compiler("timeout");
     let allow_unbounded = _bool_option(options, "allow_unbounded");
     let run = nil;
