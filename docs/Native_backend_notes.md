@@ -32,6 +32,46 @@ The repository now contains a direct pblang-written Linux x86-64 backend in
 - bounds-trapping array access, guarded stack-frame sizing, and focused
   hardening/compactness tests.
 
+### Native value and memory checks (2026-09-14)
+
+`is_string`, `is_array` and `is_map` now require the complete eight-byte tag
+load to fit in the mapped arena. The final seven bytes fail the predicate
+without a load; a tag starting exactly eight bytes before the end may be read.
+The previous end-minus-one case crashed a local native child with SIGSEGV.
+This bounds that read only: an in-range integer, interior pointer or forged
+header is not authenticated as a legitimate allocation.
+
+`set_heap_reserve` rejects invalid/non-finite inputs before changing compiler
+state. Its existing floor-then-page-round policy and inclusive 1 MiB/1 GiB
+limits remain. Both intermediate and rounded values must pass the bounds.
+Rejected configuration preserves the last usable reservation.
+
+`compile_safe` retains its name and legacy `safe=true` marker for compatibility,
+but the marker is deprecated and **must not authorize hostile-code execution**.
+Results explicitly contain `safety_scope="selected_runtime_checks"`,
+`memory_safety_certified=false`, `runtime_isolated=false`, and `limitations`.
+The legacy `guarantees` list describes selected checks for legitimate generated
+handles, not a general proof. Compile sessions preserve the negative fields
+through cold compilation, cache hits and batch publication. `pbc --safe` prints
+the limited scope instead of claiming `CERTIFIED SAFE`; benchmark drivers no
+longer describe successful compilation as a safety certificate.
+
+General `type()` remains unsupported: native nil/false/zero share raw zero,
+and true/one share raw one; heap pointers also share the integer lane. General
+type fidelity needs a value representation change, not a guessed tag probe.
+Dynamic object headers, forged/interior pointers, arena reset marks/lifetimes,
+and hard memory/time limits remain unresolved. These changes do not establish
+runtime isolation or production readiness. Existing same-user artifact-cache
+trust and publication behavior remain unchanged.
+
+Focused tests: `native_heap_configuration_test.sapp`,
+`native_type_bounds_test.sapp`, and `native_scope_live_test.sapp`. The native
+boundary test exercises three reservation sizes, both sides of the mapping,
+the last readable eight-byte start, all seven forbidden starts, and genuine
+string/array/map/closure controls. Live diagnostics keep synthetic configuration
+content out of error messages; the retained reporter's caller/path context is
+still outside that guarantee.
+
 Measured on this checkout, a constant register-IR executable changed from 139
 to 135 bytes. Representative code blobs changed as follows:
 
@@ -50,8 +90,8 @@ currently supported surface.
 
 The pure-PBLang reproducible competitor harness now includes
 `pblang-codegen-x64` as a distinct native path. Its permanent PBLang driver
-imports `stdlib/native/codegen_x64.sapp`, calls `compile_safe`, rejects a failed
-safety certificate or malformed ELF header, writes the artifact, and executes
+imports `stdlib/native/codegen_x64.sapp`, calls `compile_safe`, rejects failed compilation
+or a malformed ELF header, writes the artifact, and executes
 the emitted Linux x86-64 ELF under the same timeout, output, checksum, RSS, and
 sampling contract as the foreign compiled rows. It does not transit C99.
 

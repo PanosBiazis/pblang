@@ -28,8 +28,8 @@ Linux peak RSS, CPU utilization, release artifact bytes, checksum, and all raw
 warm samples. Uninstalled toolchains remain visible as `unavailable` rows.
 
 The `pblang-codegen-x64` row is a direct PBLang path, not an alias for C99. Its
-fixed PBLang driver imports `stdlib/native/codegen_x64.sapp`, requires a passing
-safety certificate, validates the ELF header, writes the artifact, and executes
+fixed PBLang driver imports `stdlib/native/codegen_x64.sapp`, requires successful compilation
+with selected runtime checks, validates the ELF header, writes the artifact, and executes
 that generated ELF. On unsupported hosts it reports `unavailable`; it never
 silently substitutes another backend. Run that row as a standalone example:
 
@@ -154,7 +154,7 @@ success is not trust verification and never authorizes publication.
   direct C row measures a different pipeline boundary, so both are useful but
   not same-phase compiler measurements.
 - Direct-codegen compilation includes PBLang process startup, module imports,
-  safety certification, ELF validation/write, and `chmod`. It currently targets
+  selected runtime checks, ELF validation/write, and `chmod`. It currently targets
   Linux x86-64 and the source subset implemented by that backend. The phase
   harness above now complements this end-to-end measurement and keeps cold,
   uncached, and verified warm-cache boundaries explicit.

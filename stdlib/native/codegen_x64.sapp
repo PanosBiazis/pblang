@@ -244,7 +244,7 @@ fn _param_name(p) { if is_map(p) { return p.name; } return p; }
 
 // SAFETY: the frame is sized to exactly `slots.n` eight-byte slots (16-aligned), reg-save spills at the top
 // ([rbp-8]..) then locals. A function exceeding the sanity cap below (a codegen bug, not real code) is refused
-// (fail loud) rather than emitting out-of-frame writes. This keeps every binary memory-safe by construction.
+// (fail loud) rather than emitting this specific out-of-frame write. Other memory boundaries remain unchecked.
 fn _check_frame(nslots, where) {
     // The frame is now sized to nslots (16-aligned), so this is a runaway-allocation sanity cap, not a hard
     // 64-slot frame limit. 1024 slots = an 8KB frame — far beyond any real function; a higher count signals a bug.
@@ -1084,15 +1084,16 @@ fn _emit_str_from_num(code) {
     // rax still = result base
 }
 
-// is_map / is_array / is_string: value in RAX → 1 if it's a heap object whose leading tag word == `tag`,
-// else 0. A value is a heap object iff GBASE <= x < GBASE+_HEAPSZ (the mmap'd arena). We test membership
-// with a single unsigned range check ((x - GBASE) < arena size), which also rejects small numbers, nil, and
-// negatives (whose 2's-complement wraps far above the arena) WITHOUT ever dereferencing a non-pointer.
+// is_map / is_array / is_string: probe one eight-byte tag only when the entire
+// read fits in the mapped arena. The last seven bytes cannot start a tag read.
+// Unsigned subtraction also rejects addresses below the arena (including nil
+// and negative values). This checks read bounds, not allocation provenance:
+// integers and heap pointers still share the same untagged value lane.
 fn _emit_is_type(code, tag) {
     push(code, 72); push(code, 185); _elf.le(code, _GBASE(), 8);      // movabs rcx, GBASE
     push(code, 72); push(code, 137); push(code, 194);                // mov rdx, rax
     push(code, 72); push(code, 41); push(code, 202);                 // sub rdx, rcx   (rdx = x - GBASE)
-    push(code, 72); push(code, 185); _elf.le(code, _HEAPSZ(), 8);    // movabs rcx, arena size
+    push(code, 72); push(code, 185); _elf.le(code, _HEAPSZ() - 7, 8); // movabs rcx, exclusive tag-start bound
     push(code, 72); push(code, 57); push(code, 202);                 // cmp rdx, rcx
     push(code, 115); push(code, 15);                                 // jae notheap (+15)
     push(code, 72); push(code, 139); push(code, 0);                  // mov rax, [rax]  (tag word)
@@ -2132,15 +2133,16 @@ fn _ge_rax(node0, code, slots, calls) {
 // absolute address (there is no register to spare for a globals base). The heap is mmap'd MAP_FIXED at
 // _GBASE, with the first nglobals*8 bytes reserved for globals; global #idx is at [_GBASE + idx*8].
 //
-// WHY 0x4000_0000_0000 (70 TiB) and not a low address: values and heap pointers share one 64-bit slot, and the
+// WHY 0x4000_0000_0000 (64 TiB) and not a low address: values and heap pointers share one 64-bit slot, and the
 // runtime tells them apart by a single range test "is x in [GBASE, GBASE+HEAPSZ)?" (used by the `+` string/number
 // dispatch, ==, is_string/is_map, print). If a plain NUMBER lands in that window it is mistaken for a pointer and
 // dereferenced → segfault. At the old base of 4 GiB that happened for any integer ≥ 4e9 (e.g. a running sum),
-// crashing long loops. Pushing the arena to 70 TiB — still a canonical 47-bit user address MAP_FIXED can place —
-// moves the collision window to ~7e13, above any realistic program integer (and the fully-sound fix, value
-// tagging / NaN-boxing, is a far larger change tracked separately). All _GBASE uses are 64-bit movabs, so a high
-// base is encoding-safe; only the arena SIZE stays 32-bit (mov esi), which is fine at 1 GiB.
-fn _GBASE() { return 70368744177664; }   // 0x4000_0000_0000 (70 TiB) — out of the reachable-integer range
+// crashing long loops. Pushing the arena to 64 TiB — still a canonical 47-bit user address MAP_FIXED can place —
+// moves accidental collisions to 64 TiB, but user-controlled integers can still
+// deliberately collide. Sound separation requires value tagging or another
+// representation change. All base uses are 64-bit movabs; only the arena size
+// uses a 32-bit immediate, bounded to 1 GiB.
+fn _GBASE() { return 70368744177664; }   // 0x4000_0000_0000 (64 TiB); integers can still collide with this range
 // Arena size (bytes). MAP_ANON is lazy → this is a VIRTUAL reservation; RSS only grows with pages actually
 // written. 1 GiB gives long self-hosting loops headroom; arena_mark/arena_reset reclaim within it. The
 // is_type heap-membership check uses this exact bound, so both read it from here (they must never drift).
@@ -2149,9 +2151,12 @@ fn _HEAPSZ() { return _heap_state.bytes; }
 fn heap_reserve_bytes() { return _heap_state.bytes; }
 fn set_heap_reserve(bytes) {
     if not is_number(bytes) { throw "codegen: heap reserve must be a byte count"; }
-    let n = num_floor(bytes);
-    if n < 1048576 or n > 1073741824 { throw "codegen: heap reserve must be between 1 MiB and 1 GiB"; }
+    let n = try num_floor(bytes) catch 0;
+    let valid = try n >= 1048576 and n <= 1073741824 catch false;
+    if not valid { throw "codegen: heap reserve must be between 1 MiB and 1 GiB"; }
     n = num_floor((n + 4095) / 4096) * 4096;
+    let rounded_valid = try n >= 1048576 and n <= 1073741824 and n % 4096 == 0 catch false;
+    if not rounded_valid { throw "codegen: invalid rounded heap reserve"; }
     _heap_state.bytes = n;
     return n;
 }
@@ -3976,24 +3981,31 @@ fn compile_fns(src) {
 }
 
 // ── SAFETY PASS ───────────────────────────────────────────────────────────────
-// compile_safe(src) — compile with a memory-safety certification. The code generator is safe *by
-// construction*: any source, even one that indexes out of range, writes past an array, or reads a
-// missing map key, lowers to a binary that TRAPS on the unsafe operation (exit 134) instead of
-// corrupting memory. So "unsafe-looking" code is turned into a safe binary. Returns
-// { binary, safe, guarantees } — use `.binary` for the bytes.
+// compile_safe is a compatibility name for compilation with selected guards.
+// The legacy `safe` flag is deprecated: it does not certify hostile source or
+// runtime isolation. Scalar/pointer aliasing and unvalidated dynamic headers
+// remain; callers must inspect the explicit scope and negative certification.
 fn compile_safe(src) {
     let bin = compile_fns(src);
     return map{
         binary: bin,
         safe: true,
+        safety_scope: "selected_runtime_checks",
+        memory_safety_certified: false,
+        runtime_isolated: false,
         heap_reserve_bytes: _HEAPSZ(),
         guarantees: [
-            "array reads AND writes are bounds-checked — out-of-range traps (exit 134), never corrupts",
-            "map access traps on a missing key — never reads past the map",
+            "array reads and writes through valid generated handles check bounds (exit 134)",
+            "map access through valid generated handles checks for missing keys",
             "stack frames are size-guarded — refuses >1024 slots instead of smashing the stack",
             "heap mmap failure is checked before the returned address becomes the allocation pointer",
-            "no raw pointer arithmetic is exposed; the heap is zero-filled (no wild-pointer reads)",
-            "closure captures are read by index from the heap object — no stack escape"
+            "type predicates require all eight tag bytes to fit in the mapped arena"
+        ],
+        limitations: [
+            "numbers, booleans, nil and pointers do not have distinct runtime tags",
+            "dynamic headers and forged or interior object pointers are not authenticated",
+            "arena reset marks and object lifetimes are not validated",
+            "hard heap, stack and wall-clock isolation is not established"
         ]
     };
 }
