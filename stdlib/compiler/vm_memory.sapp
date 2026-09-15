@@ -1,0 +1,190 @@
+// PBLang-owned scalar lifetime engine. No host memory_* or allocate/free calls.
+// State belongs to one private VM execution context, never to guest globals.
+// Composite/reference values require an identity-aware VM representation and
+// are rejected before state changes; copying them would change alias semantics.
+let MAX_ID = 9007199254740991;
+
+fn registry() {
+    return map{allocate:true, memory_alloc:true, deallocate:true, memory_free:true,
+        load:true, memory_get:true, store:true, memory_set:true,
+        borrow_immutable:true, borrow_mutable:true, borrow_unique:true,
+        memory_borrow:true, release_borrow:true, memory_release:true,
+        push_lifetime:true, pop_lifetime:true, memory_stats:true};
+}
+
+fn new_state() {
+    let root = map{id:0, owners:map{}, borrows:map{}};
+    return map{owners:map{}, borrows:map{}, frames:[root], scopes:map{"0":root},
+        next_owner:1, next_borrow:1, next_scope:1,
+        allocations:0, reclaimed:0, peak_owners:0, failure:"", closed:false};
+}
+
+fn fail(state, reason) { state.failure = reason; throw "self-host memory: " + reason; }
+fn checked_id(state, value) {
+    if not is_number(value) or not (value >= 1 and value <= MAX_ID)
+        or value != num_floor(value) { fail(state, "invalid handle"); }
+    return str(value);
+}
+fn scalar(state, value) {
+    let kind = type(value);
+    if kind != "number" and kind != "string" and kind != "bool" and kind != "nil" {
+        fail(state, "reference-valued allocation is not supported");
+    }
+}
+fn mutable_flag(state, value) {
+    if type(value) == "bool" { return value; }
+    if type(value) == "number" and (value == 0 or value == 1) { return value == 1; }
+    fail(state, "mutability must be boolean or zero/one");
+}
+fn kind_flag(state, value) {
+    if not is_number(value) or (value != 0 and value != 1 and value != 2) {
+        fail(state, "invalid borrow kind");
+    }
+    return value;
+}
+fn owner(state, handle) {
+    let key = checked_id(state, handle);
+    if not map_has(state.owners, key) { fail(state, "owner is not allocated"); }
+    let row = state.owners[key];
+    if row.consumed { fail(state, "owner was moved"); }
+    return row;
+}
+fn allocate_value(state, value, mutable) {
+    scalar(state, value);
+    let writable = mutable_flag(state, mutable);
+    if state.next_owner > MAX_ID { fail(state, "owner identity exhausted"); }
+    let id = state.next_owner; let key = str(id);
+    let frame = state.frames[len(state.frames) - 1];
+    state.next_owner = id + 1;
+    state.owners[key] = map{value:value, mutable:writable, consumed:false,
+        shared:0, exclusive:0, scope:frame.id, borrows:map{}};
+    frame.owners[key] = true;
+    state.allocations = state.allocations + 1;
+    state.peak_owners = num_max(state.peak_owners, len(state.owners));
+    return id;
+}
+fn release_id(state, id) {
+    let key = checked_id(state, id);
+    if not map_has(state.borrows, key) { return nil; }
+    let row = state.borrows[key];
+    let o = state.owners[row.owner];
+    if row.kind == 0 { o.shared = o.shared - 1; } else { o.exclusive = 0; }
+    map_remove(o.borrows, key);
+    map_remove(state.scopes[str(row.scope)].borrows, key);
+    map_remove(state.borrows, key);
+    return nil;
+}
+fn free_id(state, id) {
+    let key = checked_id(state, id);
+    if not map_has(state.owners, key) { return nil; }
+    let row = state.owners[key];
+    if row.shared != 0 or row.exclusive != 0 { fail(state, "cannot free borrowed owner"); }
+    map_remove(state.scopes[str(row.scope)].owners, key);
+    map_remove(state.owners, key);
+    state.reclaimed = state.reclaimed + 1;
+    return nil;
+}
+fn borrow_id(state, id, kind) {
+    kind = kind_flag(state, kind);
+    let o = owner(state, id);
+    if o.exclusive != 0 or (kind != 0 and o.shared != 0) { fail(state, "conflicting borrow"); }
+    if kind != 0 and not o.mutable { fail(state, "owner is immutable"); }
+    if state.next_borrow > MAX_ID { fail(state, "borrow identity exhausted"); }
+    let bid = state.next_borrow; let key = str(bid);
+    let frame = state.frames[len(state.frames) - 1];
+    state.next_borrow = bid + 1;
+    state.borrows[key] = map{owner:str(id), kind:kind, scope:frame.id};
+    frame.borrows[key] = true; o.borrows[key] = true;
+    if kind == 0 { o.shared = o.shared + 1; } else { o.exclusive = bid; }
+    if kind == 2 { o.consumed = true; }
+    return bid;
+}
+fn release_kind(state, id, kind) {
+    let key = checked_id(state, id); kind = kind_flag(state, kind);
+    if not map_has(state.owners, key) { fail(state, "owner is not allocated"); }
+    let keys = map_keys(state.owners[key].borrows); let selected = 0;
+    for bid in keys {
+        let row = state.borrows[bid];
+        let n = parse_number(bid);
+        if row.kind == kind and (selected == 0 or n < selected) { selected = n; }
+    }
+    if selected == 0 { fail(state, "no matching borrow"); }
+    return release_id(state, selected);
+}
+fn push_scope(state) {
+    if state.next_scope > MAX_ID { fail(state, "lifetime identity exhausted"); }
+    let id = state.next_scope; state.next_scope = id + 1;
+    let frame = map{id:id, owners:map{}, borrows:map{}};
+    state.scopes[str(id)] = frame; array_push(state.frames, frame);
+    return id;
+}
+fn pop_scope(state) {
+    if len(state.frames) <= 1 { fail(state, "cannot pop root lifetime"); }
+    let frame = state.frames[len(state.frames) - 1];
+    // Snapshot only this scope's IDs. Removing a borrow updates its owner and
+    // scope index; no historical IDs or values survive normal cleanup.
+    for key in map_keys(frame.borrows) { release_id(state, parse_number(key)); }
+    for key in map_keys(frame.owners) { free_id(state, parse_number(key)); }
+    array_pop(state.frames); map_remove(state.scopes, str(frame.id));
+    return frame.id;
+}
+fn unwind(state, depth) {
+    if len(state.frames) < depth { fail(state, "lifetime boundary was crossed"); }
+    while len(state.frames) > depth { pop_scope(state); }
+}
+fn stats(state) {
+    return map{total_locations:len(state.owners), active_borrows:len(state.borrows),
+        lifetime_depth:len(state.frames), ref_count_total:len(state.owners),
+        allocations:state.allocations, reclaimed:state.reclaimed,
+        peak_locations:state.peak_owners};
+}
+fn close(state) {
+    if state.closed { return; }
+    // No user-value references may leave this private state. Clear root as well
+    // as unfinished scopes on normal whole-execution completion. On an uncaught
+    // failure the private context becomes unreachable; host GC timing applies.
+    state.reclaimed = state.reclaimed + len(state.owners);
+    state.owners = map{}; state.borrows = map{}; state.frames = []; state.scopes = map{};
+    state.closed = true;
+}
+fn dispatch(state, name, args, floor) {
+    if state.closed { fail(state, "execution is closed"); }
+    let n = len(args);
+    if name == "push_lifetime" or name == "pop_lifetime" or name == "memory_stats" {
+        if n != 0 { fail(state, "invalid builtin arity"); }
+        if name == "push_lifetime" { return push_scope(state); }
+        if name == "memory_stats" { return stats(state); }
+        if len(state.frames) <= floor { fail(state, "cannot cross protected lifetime boundary"); }
+        return pop_scope(state);
+    }
+    if name == "allocate" or name == "memory_alloc" {
+        if n < 1 or n > 2 { fail(state, "invalid builtin arity"); }
+        return allocate_value(state, args[0], if n == 2 { args[1] } else { true });
+    }
+    if name == "store" or name == "memory_set" {
+        if n != 2 { fail(state, "invalid builtin arity"); }
+        let row = owner(state, args[0]);
+        if not row.mutable { fail(state, "owner is immutable"); }
+        if row.shared != 0 or row.exclusive != 0 { fail(state, "cannot write borrowed owner"); }
+        scalar(state, args[1]); row.value = args[1]; return nil;
+    }
+    if name == "release_borrow" or name == "memory_release" {
+        if n == 1 { return release_id(state, args[0]); }
+        if n == 2 { return release_kind(state, args[0], args[1]); }
+        fail(state, "invalid builtin arity");
+    }
+    if name == "memory_borrow" {
+        if n != 2 { fail(state, "invalid builtin arity"); }
+        if args[1] != 0 and args[1] != 1 { fail(state, "invalid memory_borrow kind"); }
+        return borrow_id(state, args[0], args[1]);
+    }
+    if n != 1 { fail(state, "invalid builtin arity"); }
+    if name == "load" or name == "memory_get" { return owner(state, args[0]).value; }
+    if name == "deallocate" or name == "memory_free" { return free_id(state, args[0]); }
+    if name == "borrow_immutable" { return borrow_id(state, args[0], 0); }
+    if name == "borrow_mutable" { return borrow_id(state, args[0], 1); }
+    if name == "borrow_unique" { return borrow_id(state, args[0], 2); }
+    fail(state, "unknown memory builtin");
+}
+
+export registry, new_state, dispatch, stats, unwind, close;

@@ -1,0 +1,75 @@
+let F = import("stdlib:compiler/selfhost_frontend.sapp");
+let VM = import("stdlib:compiler/vm.sapp");
+let E = import("stdlib:compiler/vm_memory.sapp");
+fn require(ok, reason) { if not ok { throw "FAIL selfhost_memory: " + reason; } }
+fn expect(source, expected) {
+    let result = F.frontend_run(source);
+    require(result.ok and result.output == expected, "guest output mismatch: " + source);
+}
+let host_before = memory_stats();
+expect("let h=allocate(7); store(h,8); print load(h);", [8]);
+expect("push_lifetime(); let h=memory_alloc(42); print memory_get(h); pop_lifetime(); print memory_stats().total_locations;", [42, 0]);
+expect("push_lifetime(); let h=allocate(nil,1); print load(h); store(h,true); print load(h); memory_set(h,\"value\"); print memory_get(h); pop_lifetime(); print memory_stats().reclaimed;", [nil, true, "value", 1]);
+expect("let h=allocate(7,false); print try store(h,8) catch \"immutable\"; print load(h); deallocate(h); deallocate(h); print memory_stats().total_locations;", ["immutable", 7, 0]);
+expect("let h=allocate(7,false); print try borrow_unique(h) catch \"immutable\"; print load(h); print memory_stats().active_borrows;", ["immutable", 7, 0]);
+expect("let h=allocate(7,true); print try memory_borrow(h,2) catch \"kind\"; print try memory_borrow(h) catch \"arity\"; print load(h); print memory_stats().active_borrows;", ["kind", "arity", 7, 0]);
+expect("let h=memory_alloc(10); let a=borrow_immutable(h); let b=memory_borrow(h,0); print memory_stats().active_borrows; print try memory_set(h,11) catch \"borrowed\"; print try deallocate(h) catch \"borrowed\"; memory_release(a); release_borrow(b); store(h,12); print load(h);", [2, "borrowed", "borrowed", 12]);
+expect("let h=allocate(1,1); let b=borrow_mutable(h); print try borrow_immutable(h) catch \"exclusive\"; release_borrow(b); let m=borrow_unique(h); print try load(h) catch \"moved\"; release_borrow(m); print try load(h) catch \"moved\"; deallocate(h); print memory_stats().total_locations;", ["exclusive", "moved", "moved", 0]);
+expect("let h=allocate(1,1); let a=borrow_immutable(h); let b=borrow_immutable(h); release_borrow(h,0); print memory_stats().active_borrows; memory_release(h,0); print memory_stats().active_borrows; print try memory_release(h,0) catch \"absent\";", [1, 0, "absent"]);
+expect("let h=allocate(9,1); let a=borrow_immutable(h); push_lifetime(); let b=borrow_immutable(h); memory_alloc(3); pop_lifetime(); print memory_stats().total_locations; print memory_stats().active_borrows; print try store(h,4) catch \"outer borrow\"; release_borrow(a); print load(h);", [1, 1, "outer borrow", 9]);
+expect("print try pop_lifetime() catch \"root\"; print memory_stats().lifetime_depth;", ["root", 1]);
+expect("let i=0; while i<500 { push_lifetime(); let h=memory_alloc(i); memory_free(h); memory_alloc(i+1); pop_lifetime(); i=i+1; } print memory_stats().total_locations; print memory_stats().allocations; print memory_stats().reclaimed;", [0, 1000, 1000]);
+expect("let f=memory_alloc; let g=memory_get; print g(f(17));", [17]);
+expect("fn memory_alloc(x) { return x+1; } print memory_alloc(41); print memory_stats().total_locations;", [42, 0]);
+
+for bad in ["[]", "map{}", "fn(){return 1;}", "len"] {
+    expect("print try memory_alloc("+bad+") catch \"unsupported\"; print memory_stats().total_locations; print memory_stats().allocations;", ["unsupported", 0, 0]);
+    expect("let h=memory_alloc(19); print try memory_set(h,"+bad+") catch \"unsupported\"; print memory_get(h); print memory_stats().allocations;", ["unsupported", 19, 1]);
+}
+for bad in ["nil", "true", "\"1\"", "0", "-1", "1.5", "9007199254740992", "map{}"] {
+    expect("print try memory_get("+bad+") catch \"invalid\"; print memory_stats().total_locations;", ["invalid", 0]);
+}
+for bad in ["nil", "\"true\"", "2", "0.5"] {
+    expect("print try memory_alloc(1,"+bad+") catch \"invalid\"; print memory_stats().allocations;", ["invalid", 0]);
+}
+expect("print try memory_alloc() catch \"arity\"; print try memory_alloc(1,1,1) catch \"arity\"; print try memory_stats(1) catch \"arity\"; print memory_stats().allocations;", ["arity", "arity", "arity", 0]);
+expect("let M=import(\"tests/fixtures/selfhost_memory_owner.sapp\"); print memory_get(M.handle); print memory_stats().total_locations; memory_set(M.handle,29); print M.read_value();", [23, 1, 29]);
+
+// The engine itself must compile and execute as PBLang source on the PBLang VM.
+expect("let E=import(\"stdlib:compiler/vm_memory.sapp\"); let s=E.new_state(); E.dispatch(s,\"push_lifetime\",[],1); let h=E.dispatch(s,\"memory_alloc\",[42],1); let b=E.dispatch(s,\"borrow_immutable\",[h],1); E.dispatch(s,\"release_borrow\",[h,0],1); print E.dispatch(s,\"memory_get\",[h],1); E.dispatch(s,\"pop_lifetime\",[],1); print E.stats(s).total_locations;", [42, 0]);
+let bounded_module = F.frontend_run_bounded("let M=import(\"tests/fixtures/selfhost_memory_owner.sapp\"); print memory_get(M.handle); print M.read_value();", map{max_steps:100000});
+require(bounded_module.ok and bounded_module.output == [23, 23], "bounded module shares ownership context");
+
+// The actual libraries execute on the PBLang VM; their builtins use its state.
+for path in ["stdlib:memory.sapp", "stdlib:memory_safety.sapp"] {
+    let allocation = if path == "stdlib:memory.sapp" { "M.box(33)" } else { "M.own(33)" };
+    expect("let M=import(\""+path+"\"); let result=M.scope_result(fn(){"+allocation+"; throw \"failure\";}); print result.ok; print memory_stats().total_locations; print memory_stats().lifetime_depth;", [false, 0, 1]);
+    expect("let M=import(\""+path+"\"); let result=M.scope_result(fn(){return memory_get("+allocation+");}); print result.value; print memory_stats().total_locations;", [33, 0]);
+}
+expect("let M=import(\"stdlib:memory.sapp\"); let t=M.MemoryTracker(); print M.scope(fn(){let h=t.alloc(t,51); return t.get(t,h);}); print memory_stats().total_locations;", [51, 0]);
+expect("let M=import(\"stdlib:memory_safety.sapp\"); print M.scope(fn(){let a=M.Box(1); let b=M.Rc(2); let ar=M.arena_new(\"a\"); M.arena_alloc(ar,3); return memory_stats().total_locations;}); print memory_stats().total_locations;", [3, 0]);
+
+// A fresh run has fresh private state even after an uncaught guest failure.
+let aborted = try F.frontend_run("memory_alloc(4); throw \"stop\";") catch true;
+require(aborted == true, "uncaught failure propagates");
+expect("print memory_stats().total_locations; print memory_stats().active_borrows;", [0, 0]);
+
+// Storage admission checks the value, not just the last argument on the stack.
+let huge = F.frontend_compile("memory_alloc(\"oversized\",true);").chunk;
+let rejected = try VM.run_bounded(huge, map{max_value_items:4}) catch true;
+require(rejected == true, "bounded allocation rejects oversized string");
+
+let huge_store = F.frontend_compile("let h=memory_alloc(1); memory_set(h,\"oversized\");").chunk;
+let store_rejected = try VM.run_bounded(huge_store, map{max_value_items:4}) catch true;
+require(store_rejected == true, "bounded store rejects oversized string");
+
+// Context remains host-only and normal completion closes all root entries.
+let context = VM.execution_context();
+VM.run_seeded(F.frontend_compile("memory_alloc(6);").chunk, map{}, context);
+require(E.stats(context.memory).total_locations == 1, "explicit orchestration context owns roots");
+VM.close_execution(context);
+require(context.memory == nil, "closing execution drops private ownership state");
+require(memory_stats().total_locations == host_before.total_locations
+    and memory_stats().active_borrows == host_before.active_borrows,
+    "self-host engine does not call host ownership builtins");
+print "selfhost_memory_pass";
