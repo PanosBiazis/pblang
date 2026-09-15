@@ -1,0 +1,80 @@
+let L = import("stdlib:source_inliner.sapp");
+let F = import("stdlib:compiler/selfhost_frontend.sapp");
+fn require(ok, message) { if not ok { throw "FAIL source_inliner_traversal: " + message; } }
+let modules = map{
+    "a.sapp": "let S=import(\"./shared.sapp\"); let D=import(\"./deep.sapp\"); fn fa() { return S.base()+D.extra(); } export fa;",
+    "b.sapp": "let S=import(\"shared.sapp\"); fn fb() { return S.base(); } export fb;",
+    "shared.sapp": "fn base() { return 42; } export base;",
+    "deep.sapp": "fn extra() { return 1; } export extra;"
+};
+let main = "let A=import(\"a.sapp\"); let B=import(\"b.sapp\"); print A.fa()+B.fb();";
+let calls = [];
+fn resolve(path) { push(calls, path); return try modules[path] catch nil; }
+let expected_shared = "fn base() { return 42; } \nfn extra() { return 1; } \n  fn fa() { return base()+extra(); } \n fn fb() { return base(); } \n  print fa()+fb();";
+let expected_prefixed = "fn __pbi0_base() { return 42; } \nfn __pbi1_extra() { return 1; } \n  fn __pbi2_fa() { return __pbi0_base()+__pbi1_extra(); } \n fn __pbi3_fb() { return __pbi0_base(); } \n  print __pbi2_fa()+__pbi3_fb();";
+let shared = L.inline_source(main, resolve);
+require(shared.ok and shared.source == expected_shared, "shared output byte-identical to recursive baseline");
+require(calls == ["a.sapp", "shared.sapp", "deep.sapp", "b.sapp"], "DFS callback order and shared dependency read once");
+calls = [];
+let prefixed = L.inline_source_prefixed(main, resolve);
+require(prefixed.ok and prefixed.source == expected_prefixed, "prefixed output byte-identical to recursive baseline");
+require(prefixed.module_order == ["shared.sapp", "deep.sapp", "a.sapp", "b.sapp"], "dependency postorder");
+require(calls == ["a.sapp", "shared.sapp", "deep.sapp", "b.sapp"], "prefixed callback order");
+require(F.frontend_run(shared.source).output == [85] and F.frontend_run(prefixed.source).output == [85],
+    "both emitted programs execute equivalently");
+
+for link in [L.inline_source, L.inline_source_prefixed] {
+    calls = [];
+    let escaped = link("let X=import(\"../escape.sapp\");", resolve);
+    require(not escaped.ok and escaped.reason == "invalid or escaping import path: ../escape.sapp"
+        and len(calls) == 0, "reject traversal before resolver access");
+    calls = [];
+    let missing = link("let X=import(\"missing.sapp\"); let Y=import(\"later.sapp\");", resolve);
+    require(not missing.ok and missing.reason == "cannot resolve import: missing.sapp"
+        and calls == ["missing.sapp"], "first missing sibling stops resolution");
+    calls = [];
+    fn throwing(path) { push(calls, path); throw "resolver-sentinel"; }
+    let thrown = try { link("let X=import(\"first.sapp\"); let Y=import(\"later.sapp\");", throwing); "not-thrown" } catch "caught";
+    require(thrown == "caught" and calls == ["first.sapp"], "resolver exception preserved without later callbacks");
+    calls = [];
+    fn cyclic(path) {
+        push(calls, path);
+        if path == "a.sapp" { return "let B=import(\"b.sapp\");"; }
+        return "let A=import(\"./a.sapp\");";
+    }
+    let cycle = link("let A=import(\"a.sapp\");", cyclic);
+    require(not cycle.ok and cycle.reason == "import cycle at a.sapp"
+        and calls == ["a.sapp", "b.sapp"], "indirect canonical cycle has unchanged error");
+    calls = [];
+    fn self_cycle(path) { push(calls, path); return "let A=import(\"./a.sapp\");"; }
+    cycle = link("let A=import(\"a.sapp\");", self_cycle);
+    require(not cycle.ok and cycle.reason == "import cycle at a.sapp" and calls == ["a.sapp"],
+        "direct cycle is not hidden by premature caching");
+    calls = [];
+    fn broken_child(path) {
+        push(calls, path);
+        if path == "a.sapp" { return "let X=import(\"missing.sapp\"); let Y=import(\"later.sapp\");"; }
+        return nil;
+    }
+    missing = link("let A=import(\"a.sapp\"); let B=import(\"b.sapp\");", broken_child);
+    require(not missing.ok and missing.reason == "cannot resolve import: missing.sapp"
+        and calls == ["a.sapp", "missing.sapp"], "nested failure skips remaining children and roots");
+}
+
+let depth = 3000;
+let reads = 0;
+fn deep(path) {
+    reads = reads + 1;
+    let index = parse_number(str_slice(path, 1, len(path) - 5));
+    if index + 1 == depth { return "// deepest dependency"; }
+    return "let N=import(\"m" + str(index + 1) + ".sapp\");";
+}
+let deep_shared = L.inline_source("let M=import(\"m0.sapp\"); print 42;", deep);
+require(deep_shared.ok and deep_shared.modules == depth and reads == depth, "deep shared traversal without per-module call frames");
+reads = 0;
+let deep_prefixed = L.inline_source_prefixed("let M=import(\"m0.sapp\"); print 42;", deep);
+require(deep_prefixed.ok and deep_prefixed.modules == depth and reads == depth
+    and deep_prefixed.module_order[0] == "m2999.sapp"
+    and deep_prefixed.module_order[depth - 1] == "m0.sapp", "deep prefixed postorder");
+require(F.frontend_run(deep_prefixed.source).output == [42], "deep linked project executes");
+print "source_inliner_traversal_pass";
