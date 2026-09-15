@@ -31,10 +31,11 @@ deadline avoid clock work; entries with a deadline still check it on every read.
 for the example. Cache units are caller-defined accounting, not deep RAM usage;
 mutable values and cache objects do not gain cross-thread synchronization.
 
-[Lookup measurements and compatibility limits](CACHE_LOOKUP_VALIDATION_2026-09-15.md)
-include the unresolved self-hosted `now_ms()` gap. Permanent lookup APIs were tested
-through the self-hosted frontend; positive TTL, `keys()` and expiry sweeping are
-not covered by that success because they still require the clock.
+[Lookup measurements](CACHE_LOOKUP_VALIDATION_2026-09-15.md) record the earlier
+optimization. The subsequent [self-hosted time fix](SELFHOST_TIME.md) enables
+positive TTL, touch, keys and expiry sweeping on the tested self-hosted frontend.
+The underlying time remains host wall time and is not monotonic; other backends
+and deterministic/time-isolated execution require separate validation.
 
 ## Unified key/value API
 
