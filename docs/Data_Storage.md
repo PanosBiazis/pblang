@@ -18,6 +18,24 @@ for one another, and their guarantees should not be mixed.
 | External database CLI bridge | `stdlib:polyglot_db.sapp` | Bounded, shell-free compatibility bridge with typed connections, fixed executables, private stdin, redacted diagnostics, and fail-closed platform behavior; not a native driver or connection pool |
 | pbAI derived cache | `stdlib/pbai_cache.sapp` inside pbAI | Persistent SHA-256 keyed prompt/training artifacts with metadata verification, TTL, quotas, staged publish, and recovery |
 
+## Process-local lookup behavior
+
+`cache.get` and `cache.get_entry` count hits/misses and refresh opt-in LRU order.
+`cache.has` and `cache.peek` do neither; all four reject and remove elapsed entries.
+A stored `nil` is present: use `has` or `get_entry().found` to distinguish it from
+an absent key. Each `get_entry` result is a fresh map. Reads without an expiry
+deadline avoid clock work; entries with a deadline still check it on every read.
+
+[Local memoization example](../examples/cache_memoize.sapp) uses the existing
+`get_or_set` callback to avoid recomputation. Its two-entry quota is chosen only
+for the example. Cache units are caller-defined accounting, not deep RAM usage;
+mutable values and cache objects do not gain cross-thread synchronization.
+
+[Lookup measurements and compatibility limits](CACHE_LOOKUP_VALIDATION_2026-09-15.md)
+include the unresolved self-hosted `now_ms()` gap. Permanent lookup APIs were tested
+through the self-hosted frontend; positive TTL, `keys()` and expiry sweeping are
+not covered by that success because they still require the clock.
+
 ## Unified key/value API
 
 The same operations work on all three `data_store` backends:
