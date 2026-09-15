@@ -10,17 +10,21 @@ let _SOURCE = import("stdlib:compiler/checked_source.sapp");
 fn fail(m) { throw "FAIL arm64-ast: " + m; }
 fn _stmts_of(b) { if is_array(b) { return b; } if is_map(b) and map_has(b, "stmts") { return b.stmts; } return []; }
 fn _pname(p) { if is_map(p) { return p.name; } return p; }
-fn _nkeys(m) { return len(map_keys(m)); }
+// Map length is stored by the runtime; do not allocate all keys for each slot.
+fn _nkeys(m) { return len(m); }
 
 // ── word emit / patch ─────────────────────────────────────────────────────────────────────────────────────────
-fn _w32(word) { return [word % 256, num_floor(word / 256) % 256, num_floor(word / 65536) % 256, num_floor(word / 16777216) % 256]; }
 // Append directly: no temporary four-element array per instruction.
 fn _e(code, word) {
     push(code, word % 256); push(code, num_floor(word / 256) % 256);
     push(code, num_floor(word / 65536) % 256); push(code, num_floor(word / 16777216) % 256);
 }
 fn _wpos(code) { return num_floor(len(code) / 4); }
-fn _patch(code, at, word) { let b = at * 4; let w = _w32(word); code[b] = w[0]; code[b + 1] = w[1]; code[b + 2] = w[2]; code[b + 3] = w[3]; }
+fn _patch(code, at, word) {
+    let b = at * 4;
+    code[b] = word % 256; code[b + 1] = num_floor(word / 256) % 256;
+    code[b + 2] = num_floor(word / 65536) % 256; code[b + 3] = num_floor(word / 16777216) % 256;
+}
 fn _imm19(off) {
     if not (try off >= -262144 and off <= 262143 and off == num_floor(off) catch false) { fail("branch exceeds signed imm19 encoding"); }
     if off < 0 { return off + 524288; } return off;
@@ -98,26 +102,64 @@ fn _relax_branches(code, branches, fx, spatch) {
             }
         }
     }
-    for fix in fx { fix.pos = _mapped_position(fix.pos, branches, prefix); }
-    for patch in spatch { patch.pos = _mapped_position(patch.pos, branches, prefix); }
-    let result = []; let pos = 0; let index = 0;
-    while pos < words {
-        if index < len(branches) and branches[index].pos == pos {
-            let edge = branches[index]; let target = _mapped_position(edge.target, branches, prefix);
-            let here = _wpos(result);
+    let growth = prefix[len(branches)]; let old_bytes = len(code);
+    if not _code_position(growth, len(branches)) or growth > num_floor((9007199254740991 - old_bytes) / 4) {
+        fail("expanded function size is not exactly representable");
+    }
+    let final_bytes = old_bytes + growth * 4; let final_words = words + growth;
+    // Validate all final encodings and relocation ranges before changing bytes.
+    let index = 0;
+    for edge in branches {
+        let here = edge.pos + prefix[index];
+        let target = _mapped_position(edge.target, branches, prefix);
+        if not _code_position(here, final_words - 1) or not _code_position(target, final_words) { fail("invalid expanded branch position"); }
+        if edge.wide {
+            if not _code_position(here + 1, final_words - 1) { fail("invalid expanded branch pair"); }
+            _imm26(target - (here + 1));
+        } elif edge.opcode == 0x14000000 { _imm26(target - here); }
+        else { _imm19(target - here); }
+        index = index + 1;
+    }
+    for fix in fx {
+        let mapped = _mapped_position(fix.pos, branches, prefix);
+        if not _code_position(mapped, final_words - 1) { fail("invalid expanded call position"); }
+    }
+    for patch in spatch {
+        let mapped = _mapped_position(patch.pos, branches, prefix);
+        if not _code_position(mapped, final_words - 2) { fail("invalid expanded string position"); }
+    }
+    if _mapped_position(words, branches, prefix) != final_words { fail("invalid expanded function end"); }
+    // Grow the original array, then move backwards. Destinations never precede
+    // sources, so higher writes cannot overwrite an unread lower instruction.
+    while len(code) < final_bytes { push(code, 0); }
+    let pos = words - 1; index = len(branches) - 1;
+    while pos >= 0 {
+        if index >= 0 and branches[index].pos == pos {
+            let edge = branches[index]; let here = pos + prefix[index];
+            let target = _mapped_position(edge.target, branches, prefix);
             if edge.wide {
                 let inverse = 0xB5000000; if edge.opcode == 0xB5000000 { inverse = 0xB4000000; }
-                _e(result, inverse + _imm19(2) * 32);
-                _e(result, 0x14000000 + _imm26(target - (here + 1)));
-            } elif edge.opcode == 0x14000000 { _e(result, edge.opcode + _imm26(target - here)); }
-            else { _e(result, edge.opcode + _imm19(target - here) * 32); }
-            index = index + 1;
+                _patch(code, here, inverse + _imm19(2) * 32);
+                _patch(code, here + 1, 0x14000000 + _imm26(target - (here + 1)));
+            } elif edge.opcode == 0x14000000 { _patch(code, here, edge.opcode + _imm26(target - here)); }
+            else { _patch(code, here, edge.opcode + _imm19(target - here) * 32); }
+            index = index - 1;
         } else {
-            let b = pos * 4; push(result, code[b]); push(result, code[b + 1]); push(result, code[b + 2]); push(result, code[b + 3]);
+            let here = pos + prefix[index + 1];
+            if here != pos {
+                // Capture every original byte before writing the shifted word.
+                let source = pos * 4; let dest = here * 4;
+                let b0 = code[source]; let b1 = code[source + 1];
+                let b2 = code[source + 2]; let b3 = code[source + 3];
+                code[dest] = b0; code[dest + 1] = b1; code[dest + 2] = b2; code[dest + 3] = b3;
+            }
         }
-        pos = pos + 1;
+        pos = pos - 1;
     }
-    return result;
+    if index != -1 or len(code) != final_bytes { fail("incomplete expanded function layout"); }
+    for fix in fx { fix.pos = _mapped_position(fix.pos, branches, prefix); }
+    for patch in spatch { patch.pos = _mapped_position(patch.pos, branches, prefix); }
+    return code;
 }
 
 fn _uimm12(value) {

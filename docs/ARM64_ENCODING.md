@@ -79,7 +79,7 @@ imm26 displacement still fails rather than silently wrapping.
 
 The ordinary path patches the original array without a layout copy. Expanded
 functions use sorted sites, prefix insertion counts and binary-search mapping,
-then copy their instruction bytes once. Relaxation batches newly long edges and
+then move instructions backwards inside the original array. Relaxation batches newly long edges and
 converges monotonically without a preset pass limit. Today's forward conditional
 intervals are nested, disjoint or touching, so an initially short edge cannot
 contain an initially long edge: all required expansions are selected initially.
@@ -102,7 +102,67 @@ that harness issue. No compiler change was made for it. The package provenance
 and local resource supervision follow the procedure below. These results do not
 establish native ARM64, guest-OS support or isolation.
 
-### Compiler cost check
+### Current allocation and layout optimization
+
+Slot counting now uses `len(map)`, whose size is maintained by the runtime,
+rather than allocating all map keys for each parameter/local. Slot numbers still
+follow first occurrence, before compiler metadata is inserted. This removes
+quadratic key enumeration for large functions without changing scope semantics.
+`_patch` writes the four bytes directly and no longer allocates a temporary array.
+
+Expanded layout validates every final displacement and relocation range before
+extending the original code array. It moves instructions backwards using prefix
+counts; all four source bytes are captured before any destination byte is written.
+Every destination is at or after its old source, so unread instructions survive.
+Final length and complete branch consumption are checked. No second full result
+array or additional per-branch encoded-word fields are retained. A dynamic array
+may still reallocate its backing storage while growing; this is not an allocation-
+free compilation claim. The exact-size guard prevents arithmetic corruption and
+is not a new discretionary source/runtime limit.
+
+[All 18 measured processes](../bench/results/arm64_layout_2026-09-15.json) compare
+`61e6d46` against this emitter, alternating baseline/candidate order across three
+pairs per workload on the same allowed CPU. No task-owned test/analyzer ran
+concurrently with these measurements; unrelated host load and power policy were
+not controlled. No measured run was discarded. The small corpus uses the existing
+seven-source benchmark: two warmups, nine samples of 140 compilations. Each large
+workload uses one warmup and five single-compilation samples. Process peak RSS
+includes startup and warmup; compilation timings exclude source construction.
+
+| Workload / pair | Before median / p95 (ms) | After median / p95 (ms) | Before / after peak RSS (KiB) |
+| --- | ---: | ---: | ---: |
+| Small corpus / 1 | 319.37 / 430.41 | 417.60 / 428.40 | 38,804 / 38,904 |
+| Small corpus / 2 | 410.24 / 424.41 | 414.15 / 483.25 | 38,920 / 38,868 |
+| Small corpus / 3 | 409.07 / 480.73 | 396.89 / 405.84 | 38,876 / 38,856 |
+| Nested 24 / 1 | 2806.08 / 3089.87 | 2578.56 / 2695.25 | 208,968 / 199,672 |
+| Nested 24 / 2 | 2645.70 / 2764.51 | 2533.01 / 3139.23 | 208,284 / 198,928 |
+| Nested 24 / 3 | 2684.08 / 3121.90 | 2574.39 / 3079.11 | 208,136 / 198,848 |
+| 4,100 locals / 1 | 12928.59 / 13084.65 | 795.20 / 816.33 | 92,480 / 93,924 |
+| 4,100 locals / 2 | 13256.75 / 13591.68 | 786.66 / 816.52 | 92,816 / 91,456 |
+| 4,100 locals / 3 | 12557.24 / 13033.68 | 795.86 / 819.28 | 92,948 / 93,896 |
+
+The 4,100-local source compiled about 15.8–16.9 times faster. Its peak RSS varied
+in both directions, so no memory reduction is established for that workload.
+The nested long-branch source used about 4.4%–4.5% less peak compiler RSS and had
+about 4.1%–8.1% lower median compilation time. Small-program timings varied,
+including a substantially slower first candidate pair; universal acceleration
+and strict CPU/RAM non-regression are not established. Generated instructions,
+artifact sizes and runtime behavior are preserved for the validated corpus. [The current validation
+record](ARM64_LAYOUT_RESULTS.json) verifies identical baseline/candidate bytes for
+4,100 locals, 24 nested branches and 1,000 short conditions inside one long branch.
+All twelve long ELF fixtures match their previous SHA-256 values and pass current
+local QEMU with unchanged expected output/exit codes. These are correctness tests;
+the branch-heavy case was not separately benchmarked for performance.
+
+```sh
+pblang run bench/arm64_codegen_regression.sapp
+pblang run bench/arm64_layout_regression.sapp
+pblang run bench/arm64_slots_regression.sapp
+pblang run tests/semantics/arm64_slot_identity_test.sapp
+```
+
+### Historical compiler cost check — initial branch relaxation
+
 
 [Six alternating measured processes](../bench/results/arm64_branches_2026-09-15.json)
 compare baseline `5860ec8` with the branch emitter using the unchanged
