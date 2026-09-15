@@ -15,7 +15,49 @@ that no guest operating-system tests have ever run. The retained Kali report
 previously recorded locations during this reconciliation. None of these is
 current-platform acceptance evidence for the present compiler revision.
 
-## Current local validation — 2026-09-15 ARM64 long branches
+## Current local validation — 2026-09-15 ARM64 compiler allocation cost
+
+The ARM64 emitter now counts unique slots in constant time without allocating
+map-key lists. It also patches instruction bytes directly and expands long
+branches backwards inside the original code array, after validating the entire
+final layout. This removes the explicit second result array; it does not add a language
+source-size or runtime limit or alter the strict ARM64 admission API.
+
+The identical 4,100-local workload compiled about 15.8–16.9 times faster across
+three alternating baseline/candidate pairs. The 24-nested-branch workload used
+about 4.4%–4.5% less peak compiler RSS, with median compilation time about 4.1%–8.1%
+lower. Small-program timings and large-slot RSS varied; there is no universal
+speed or resource non-regression claim. All 18 measured processes are retained.
+
+Current tests cover 49 selected suites (43 regular, including 17 emulator suites,
+and six opt-in ARM64 suites), plus 12 independent local QEMU executions. Existing
+ten goldens are unchanged. Additional byte-for-byte comparisons cover the 4,100-
+local benchmark, 24 nested branches and 1,000 short conditions inside a long branch.
+QEMU artifacts match their prior SHA-256 values and expected output/exit codes.
+The new slot test covers name reuse, nested declarations and stack parameters.
+
+All four touched PBLang files passed individual self-hosted checking, retained
+lint and strict entry security scans with complete mandatory analysis, zero
+blocking findings and stable source snapshots. Entry scanning is not a complete
+semantic/dependency audit. Independent security review found no blocker.
+
+Graphify completed a local AST-only refresh without clustering; installed support
+excludes `.sapp`. A separate native lexical graph analyzed the compiler's 20
+`.sapp` files with distinct stems. Neither result is full-project dependency or
+platform acceptance evidence. The aggregate AAP graph was preserved.
+See [local refresh procedure and limits](GRAPH_REFRESH.md),
+[implementation and measured costs](ARM64_ENCODING.md),
+[current correctness evidence](ARM64_LAYOUT_RESULTS.json) and
+[all performance measurements](../bench/results/arm64_layout_2026-09-15.json).
+
+The remaining work is still substantial: multi-file compiler scalability and
+wider admission, runtime heap growth/allocation failure and stack probing,
+runtime/FFI isolation, library/backend compatibility, audit/release authenticity,
+PBIDE Run/Designer and current guest/hardware platform validation. This slice
+addresses compilation cost and local graph visibility, not those guarantees.
+All execution was local; no Specisoft server was used.
+
+## Previous local validation — 2026-09-15 ARM64 long branches
 
 Conditional source branches now expand beyond signed imm19 into an inverse
 condition plus B. Source control flow, calls and string addresses are relocated
