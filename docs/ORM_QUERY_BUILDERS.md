@@ -29,8 +29,10 @@ in the ordering error. No database call is needed to validate the grammar.
 This change does not make arbitrary SQL safe. `where_clause`/`opts.where`,
 `define_model` column definitions, and `raw_query`/`raw_exec` are raw,
 developer-authored SQL boundaries. Bind all external *values* through `params`.
-External SQL fragments require a future structured predicate/schema API;
-placeholders cannot protect identifiers, clauses or SQL keywords.
+For supported flat AND filters, use the optional
+[structured predicate compiler](SQL_PREDICATES.md). More complex external
+requests still need a structured API; never pass arbitrary external SQL
+fragments. Placeholders cannot protect identifiers, clauses or SQL keywords.
 
 ## Wide insert/upsert construction
 
