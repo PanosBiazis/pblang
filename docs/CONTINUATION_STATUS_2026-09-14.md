@@ -2,8 +2,8 @@
 
 This status reconciles prior work with the present compiler change. Historical
 reports are not new validation of the current checkout. Product changes remain
-PBLang-only. This continuation performs local checks and a local commit only;
-it does not deploy or upload PBLang to a server.
+PBLang-only. This continuation performs local checks and pushes reviewed source to the existing
+GitHub repository with CI skipped; it does not deploy or test PBLang on a server.
 
 ## Corrected platform picture
 
@@ -15,7 +15,43 @@ that no guest operating-system tests have ever run. The retained Kali report
 previously recorded locations during this reconciliation. None of these is
 current-platform acceptance evidence for the present compiler revision.
 
-## Current local validation — 2026-09-15 ARM64 large literals/calls
+## Current local validation — 2026-09-15 ARM64 long branches
+
+Conditional source branches now expand beyond signed imm19 into an inverse
+condition plus B. Source control flow, calls and string addresses are relocated
+together after final function layout. Small code retains its previous bytes.
+No new language source-size or execution-time cap was added; the ARM64 strict
+source API remains unchanged.
+
+Validation passed 48 selected suites: 42 regular suites, including 17 emulator
+suites and real Node/V8 execution, plus six opt-in ARM64 suites. Twelve long
+programs passed both the PBLang reference and independent local QEMU, covering
+both conditional outcomes, short circuiting, 24 nested branches, moved calls,
+strings and forward/backward unconditional jumps. The exact positive imm19
+endpoint remains compact and the next offset expands correctly through the CLI.
+Ten whole-artifact goldens remain byte-identical to their respective baselines.
+
+All four changed PBLang sources passed individual self-hosted checking and strict
+entry scans with complete mandatory analysis, zero blocking findings and stable
+snapshots. Entry scans do not claim complete semantic/dependency analysis. Retained
+lint passed with conservative unused-variable warnings; independent security
+review found no blocker. The ordinary-source benchmark retained all six alternating
+processes: median compilation times were similar (-0.3% to +1.3%), while measured
+peak compiler RSS was 0.9%–1.5% higher. Strict resource non-regression is not proven.
+Expanded branches add one instruction; large layout temporarily holds two arrays.
+
+See [implementation, costs and remaining limits](ARM64_ENCODING.md),
+[QEMU evidence](ARM64_BRANCH_QEMU_RESULTS.json) and
+[compiler measurements](../bench/results/arm64_branches_2026-09-15.json).
+The tests were local; no Specisoft server or remote deployment was used.
+Graphify update was terminated after 45 seconds without completing.
+
+Remaining work includes multi-file projects and wider source admission with
+stack probing, automatic heap growth/allocation-failure handling, imm26-range
+lowering, runtime/FFI isolation, audit/release authenticity, PBIDE Run/Designer,
+compiler/library compatibility and current guest/hardware platform acceptance.
+
+## Previous local validation — 2026-09-15 ARM64 large literals/calls
 
 Array/map literal allocation and element stores, outgoing call areas, staged
 argument loads and cleanup now expand to valid instructions. Call173, array512

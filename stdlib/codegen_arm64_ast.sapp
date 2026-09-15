@@ -30,6 +30,96 @@ fn _imm26(off) {
     if off < 0 { return off + 67108864; } return off;
 }
 
+// Source control-flow sites retain original word coordinates until function layout is final.
+fn _branch(code, slots, opcode) {
+    let edge = map{pos: _wpos(code), target: nil, opcode: opcode, wide: false};
+    push(slots["@branches"], edge); _e(code, opcode); return edge;
+}
+fn _word(code, pos) {
+    let b = pos * 4;
+    return code[b] + code[b + 1] * 256 + code[b + 2] * 65536 + code[b + 3] * 16777216;
+}
+fn _code_position(pos, end) {
+    return try pos >= 0 and pos <= end and pos == num_floor(pos) catch false;
+}
+// An insertion at x belongs AFTER the old instruction at x. Labels at x must
+// still land on that instruction, including when it becomes an inverse CB.
+fn _mapped_position(pos, branches, prefix) {
+    let lo = 0; let hi = len(branches);
+    while lo < hi {
+        let mid = num_floor((lo + hi) / 2);
+        if branches[mid].pos < pos { lo = mid + 1; } else { hi = mid; }
+    }
+    return pos + prefix[lo];
+}
+fn _relax_branches(code, branches, fx, spatch) {
+    if len(code) % 4 != 0 { fail("unaligned function code"); }
+    let words = _wpos(code); let previous = -1; let expanded = false;
+    for edge in branches {
+        if not _code_position(edge.pos, words - 1) or edge.pos <= previous or not _code_position(edge.target, words) {
+            fail("invalid branch position");
+        }
+        if edge.opcode != 0xB4000000 and edge.opcode != 0xB5000000 and edge.opcode != 0x14000000 {
+            fail("invalid source branch opcode");
+        }
+        if _word(code, edge.pos) != edge.opcode { fail("invalid branch placeholder"); }
+        previous = edge.pos;
+        let off = edge.target - edge.pos;
+        if edge.opcode != 0x14000000 and (off < -262144 or off > 262143) { edge.wide = true; expanded = true; }
+    }
+    for fix in fx {
+        if not _code_position(fix.pos, words - 1) { fail("invalid call position"); }
+        if _word(code, fix.pos) != 0x94000000 { fail("invalid call placeholder"); }
+    }
+    for patch in spatch {
+        if not _code_position(patch.pos, words - 2) { fail("invalid string position"); }
+        if _word(code, patch.pos) != 0xD2800000 or _word(code, patch.pos + 1) != 0xF2A00000 { fail("invalid string placeholder"); }
+    }
+    // Common case: preserve the original array and instruction bytes; no layout copy.
+    if not expanded {
+        for edge in branches {
+            let off = edge.target - edge.pos;
+            if edge.opcode == 0x14000000 { _patch(code, edge.pos, edge.opcode + _imm26(off)); }
+            else { _patch(code, edge.pos, edge.opcode + _imm19(off) * 32); }
+        }
+        return code;
+    }
+    let prefix = []; let changed = true;
+    // Monotone, batched relaxation: each additional round widens at least one
+    // previously short edge. No arbitrary pass cap or source-size restriction.
+    while changed {
+        prefix = [0]; let total = 0;
+        for edge in branches { if edge.wide { total = total + 1; } push(prefix, total); }
+        changed = false;
+        for edge in branches {
+            if edge.opcode != 0x14000000 and not edge.wide {
+                let off = _mapped_position(edge.target, branches, prefix) - _mapped_position(edge.pos, branches, prefix);
+                if off < -262144 or off > 262143 { edge.wide = true; changed = true; }
+            }
+        }
+    }
+    for fix in fx { fix.pos = _mapped_position(fix.pos, branches, prefix); }
+    for patch in spatch { patch.pos = _mapped_position(patch.pos, branches, prefix); }
+    let result = []; let pos = 0; let index = 0;
+    while pos < words {
+        if index < len(branches) and branches[index].pos == pos {
+            let edge = branches[index]; let target = _mapped_position(edge.target, branches, prefix);
+            let here = _wpos(result);
+            if edge.wide {
+                let inverse = 0xB5000000; if edge.opcode == 0xB5000000 { inverse = 0xB4000000; }
+                _e(result, inverse + _imm19(2) * 32);
+                _e(result, 0x14000000 + _imm26(target - (here + 1)));
+            } elif edge.opcode == 0x14000000 { _e(result, edge.opcode + _imm26(target - here)); }
+            else { _e(result, edge.opcode + _imm19(target - here) * 32); }
+            index = index + 1;
+        } else {
+            let b = pos * 4; push(result, code[b]); push(result, code[b + 1]); push(result, code[b + 2]); push(result, code[b + 3]);
+        }
+        pos = pos + 1;
+    }
+    return result;
+}
+
 fn _uimm12(value) {
     if not (try value >= 0 and value <= 4095 and value == num_floor(value) catch false) { fail("offset exceeds compact imm12 encoding"); }
     return value;
@@ -663,16 +753,16 @@ fn _ce(node, code, fx, slots) {
     if k == "binary" {
         if node.op == "and" {                  // short-circuit: a falsy → result a (0), else result b
             _ce(node.left, code, fx, slots);
-            let je = _wpos(code); _e(code, 0xB4000000);          // cbz x0, end
+            let je = _branch(code, slots, 0xB4000000);          // cbz x0, end
             _ce(node.right, code, fx, slots);
-            _patch(code, je, 0xB4000000 + _imm19(_wpos(code) - je) * 32 + 0);
+            je.target = _wpos(code);
             return;
         }
         if node.op == "or" {                   // short-circuit: a truthy → result a, else result b
             _ce(node.left, code, fx, slots);
-            let je = _wpos(code); _e(code, 0xB5000000);          // cbnz x0, end
+            let je = _branch(code, slots, 0xB5000000);          // cbnz x0, end
             _ce(node.right, code, fx, slots);
-            _patch(code, je, 0xB5000000 + _imm19(_wpos(code) - je) * 32 + 0);
+            je.target = _wpos(code);
             return;
         }
         if (node.op == "==" or node.op == "!=") and _is_str(node.left, slots) and _is_str(node.right, slots) {
@@ -903,26 +993,26 @@ fn _cs(node, code, fx, slots, frame) {
         // if cond {then} [elif c {b}]* [else {e}] — a chain of (cond; cbz next; body; b END) arms.
         let endjumps = [];
         _ce(node.cond, code, fx, slots);
-        let jn = _wpos(code); _e(code, 0xB4000000);              // cbz x0, next
+        let jn = _branch(code, slots, 0xB4000000);              // cbz x0, next
         _cblock(_stmts_of(node.then), code, fx, slots, frame);
-        push(endjumps, _wpos(code)); _e(code, 0x14000000);       // b END
-        _patch(code, jn, 0xB4000000 + _imm19(_wpos(code) - jn) * 32 + 0);
+        push(endjumps, _branch(code, slots, 0x14000000));       // b END
+        jn.target = _wpos(code);
         let elifs = try node.elifs catch nil;
         if elifs != nil {
             let ei = 0;
             while ei < len(elifs) {
                 _ce(elifs[ei].cond, code, fx, slots);
-                let jn2 = _wpos(code); _e(code, 0xB4000000);     // cbz x0, next
+                let jn2 = _branch(code, slots, 0xB4000000);     // cbz x0, next
                 _cblock(_stmts_of(elifs[ei].body), code, fx, slots, frame);
-                push(endjumps, _wpos(code)); _e(code, 0x14000000);   // b END
-                _patch(code, jn2, 0xB4000000 + _imm19(_wpos(code) - jn2) * 32 + 0);
+                push(endjumps, _branch(code, slots, 0x14000000));   // b END
+                jn2.target = _wpos(code);
                 ei = ei + 1;
             }
         }
         let el = try node.else catch nil;
         if el != nil { _cblock(_stmts_of(el), code, fx, slots, frame); }
         let endw = _wpos(code);
-        let j = 0; while j < len(endjumps) { _patch(code, endjumps[j], 0x14000000 + _imm26(endw - endjumps[j])); j = j + 1; }
+        let j = 0; while j < len(endjumps) { endjumps[j].target = endw; j = j + 1; }
         return;
     }
     if k == "print" {
@@ -935,11 +1025,11 @@ fn _cs(node, code, fx, slots, frame) {
     if k == "while" {
         let lstart = _wpos(code);
         _ce(node.cond, code, fx, slots);
-        let je = _wpos(code); _e(code, 0xB4000000);              // cbz x0, end (patch)
+        let je = _branch(code, slots, 0xB4000000);              // cbz x0, end
         _cblock(_stmts_of(node.body), code, fx, slots, frame);
-        let jb = _wpos(code); _e(code, 0x14000000 + _imm26(lstart - jb));  // b lstart
+        let jb = _branch(code, slots, 0x14000000); jb.target = lstart;  // b lstart
         let endw = _wpos(code);
-        _patch(code, je, 0xB4000000 + _imm19(endw - je) * 32 + 0);
+        je.target = endw;
         return;
     }
     if k == "block" { _cblock(_stmts_of(node), code, fx, slots, frame); return; }
@@ -956,6 +1046,7 @@ fn _cfn(function_node, sdata, fnret, fnptype) {
     _collect_slots(stmts, slots);
     let nslots = _nkeys(slots);
     slots["@sdata"] = sdata;        // shared string-data blob (append literal bytes here)
+    slots["@branches"] = [];        // ordered original source control-flow sites
     slots["@spatch"] = [];          // per-function string address-load patch sites
     slots["@strvars"] = map{};      // names of locals currently holding a string (for print dispatch)
     slots["@arrvars"] = map{};      // names of locals currently holding an array
@@ -983,7 +1074,8 @@ fn _cfn(function_node, sdata, fnret, fnptype) {
     }
     _cblock(stmts, code, fx, slots, frame);
     _seti(code, 0, 0); _epilogue(code, frame);                       // fall-through: return 0
-    return map{ bytes: code, fixups: fx, spatch: slots["@spatch"] };
+    let final = _relax_branches(code, slots["@branches"], fx, slots["@spatch"]);
+    return map{ bytes: final, fixups: fx, spatch: slots["@spatch"] };
 }
 
 // ── whole program ──  entry stub calls main, exits with x0; user fns relocated by name.
