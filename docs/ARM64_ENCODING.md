@@ -22,8 +22,8 @@ existing output artifact, and diagnostics do not echo the source.
 These are machine-instruction representation checks, not new source-size or
 execution-time limits for the language. This slice does not widen ARM64's
 existing strict source-admission API. Large array/map literal heap bumps and
-outgoing argument areas now use expanded lowering too. Long branches still
-reject outside their signed encoding range. Wider source admission still needs
+outgoing argument areas now use expanded lowering too. Conditional source branches now expand beyond imm19; branches still
+reject beyond the signed imm26 range of the resulting B instruction. Wider source admission still needs
 stack-probing/runtime work. The existing fixed heap arena, allocation-failure
 handling and lack of automatic runtime heap growth remain unresolved. This is
 not a native isolation or general memory-safety guarantee.
@@ -60,6 +60,72 @@ array511 and map255—remain byte-identical to `95d6bb1`, alongside the original
 seven goldens. This checks compatibility and artifact size for ten cases. No new
 compiler-speed, runtime-memory, GPU/NPU or peripheral-performance claim is made.
 
+## Long source branches
+
+Source `if`/`elif`, `while`, `and` and `or` branches retain original word positions
+until function layout is complete. A conditional displacement outside signed
+imm19 becomes an inverse condition skipping two words followed by an unconditional
+B to the original target. The B displacement is relative to its own instruction,
+not the preceding condition. This preserves x0, other registers, stack and flags.
+The first formerly rejected positive displacement, 262,144 words, now compiles;
+262,143 retains its original single instruction.
+
+Every source-relative B is relocated too, including forward if-arm exits and
+backward loop edges. Call placeholders and string address loads move with the
+function; global function and string-data addresses are computed from final sizes.
+Labels at an expanded branch still target its first instruction. Compiler-owned
+positions, opcodes and placeholders are validated before patching. Unsupported
+imm26 displacement still fails rather than silently wrapping.
+
+The ordinary path patches the original array without a layout copy. Expanded
+functions use sorted sites, prefix insertion counts and binary-search mapping,
+then copy their instruction bytes once. Relaxation batches newly long edges and
+converges monotonically without a preset pass limit. Today's forward conditional
+intervals are nested, disjoint or touching, so an initially short edge cannot
+contain an initially long edge: all required expansions are selected initially.
+The convergence loop remains for future syntax; crossing control flow would
+require revisiting worst-case iteration cost. No arbitrary language size or
+execution-time limit was introduced, and strict source admission is unchanged.
+
+`tests/fixtures/arm64_branch_sources.sapp` supplies deterministic long programs.
+The opt-in suite executes both condition outcomes, long short-circuit map
+expressions, 24 nested conditions, loopback relocation, forward B across a later
+expanded elif, moved global function targets and relocated strings. Ten existing
+whole-artifact goldens retain their bytes and size.
+
+[The independent QEMU record](ARM64_BRANCH_QEMU_RESULTS.json) binds the current
+emitter and fixture hashes to twelve unchanged generated ELF artifacts. All twelve
+passed local QEMU with the same expected exits/output as the PBLang reference.
+Initial harness runs had no ELF execute permission and returned exit 1 before
+execution; adding owner execute permission and rerunning the same bytes fixed
+that harness issue. No compiler change was made for it. The package provenance
+and local resource supervision follow the procedure below. These results do not
+establish native ARM64, guest-OS support or isolation.
+
+### Compiler cost check
+
+[Six alternating measured processes](../bench/results/arm64_branches_2026-09-15.json)
+compare baseline `5860ec8` with the branch emitter using the unchanged
+`bench/arm64_codegen_regression.sapp`: seven sources, two warmup batches, nine
+samples of 140 compilations, same allowed CPU. All measured processes and their
+statistics are retained; artifacts match in every run. Unrelated host load and
+power policy were not controlled. These timings concern ordinary small programs,
+not the newly supported large branches.
+
+| Pair | Before median / p95 (ms) | After median / p95 (ms) | Before / after peak RSS (KiB) |
+| --- | ---: | ---: | ---: |
+| 1 | 415.61 / 598.65 | 414.42 / 425.89 | 38,216 / 38,672 |
+| 2 | 407.95 / 419.25 | 408.80 / 417.69 | 38,616 / 38,972 |
+| 3 | 404.21 / 407.28 | 409.46 / 431.25 | 38,580 / 39,140 |
+
+Median times are similar (about -0.3% to +1.3%); measured peak compiler RSS is
+about 0.9%–1.5% higher. This does not prove compiler acceleration or strict resource
+non-regression. Small generated programs have unchanged machine instructions.
+Each expanded conditional adds four artifact bytes and, when the original branch
+is taken, one executed instruction. Large-function layout temporarily holds both
+original and expanded byte arrays. No runtime-RAM, GPU/NPU or peripheral speed
+claim follows from these compiler measurements.
+
 ## Local regression checks
 
 The ordinary semantics tests add exact frame encodings and baseline artifact
@@ -81,13 +147,15 @@ pblang run tests/extended/arm64_large_frames.sapp
 pblang run tests/extended/arm64_large_arrays.sapp
 pblang run tests/extended/arm64_large_maps.sapp
 pblang run tests/extended/arm64_large_calls.sapp
+pblang run tests/extended/arm64_long_branches.sapp
 PBLANG_BIN="$PWD/target/release/pblang" pblang run tests/extended/arm64_encoding_rejection_live.sapp --allow-exec
 ```
 
 The large-frame probe executes a 512-local function and a function with 4,100
 locals and nine incoming parameters in the PBLang test reference. The Linux-only
-live probe checks the exact positive imm19 endpoint, the next rejected offset,
-large literal/argument compilation and real local compiler output preservation.
+live probe checks the exact positive imm19 endpoint, the next expanded offset,
+large literal/argument compilation, exact CLI artifact bytes and preservation of
+an existing output when malformed source is rejected.
 It requires `/usr/bin/timeout`. A platform skip is not an executed test.
 These are trusted local developer tests, not a sandbox for third-party suites.
 Require the declared success line as well as exit status 0 when collecting
@@ -148,14 +216,14 @@ guest OS or real ARM64/QEMU performance claim follows from these measurements.
 - [Armv8 instruction-set overview](https://developer.arm.com/-/media/Files/pdf/graphics-and-multimedia/ARMv8_InstructionSetOverview.pdf)
 
 Current evidence includes fixed instruction words, a reference interpreter,
-positive imm19 boundary compilation, local CLI rejection and the local QEMU
-executions described below. The negative imm19
+positive imm19 boundary compilation/expansion, local malformed-source rejection and the local QEMU
+executions described in the retained records. The negative imm19
 endpoint, imm26 endpoints, maximum shifted chunks and multi-chunk adjustments
 were reviewed but are not reached by these public-source regressions. Additional
 independent boundary decoding, native ARM64 hardware and guest OS execution
 remain necessary for broader platform acceptance.
 
-## Local independent emulator validation
+## Historical independent emulator validation — wide literals/calls
 
 [The retained result record](ARM64_WIDE_QEMU_RESULTS.json) binds eight generated
 ELFs to the emitter and fixture source hashes. `tests/fixtures/arm64_wide_sources.sapp`
