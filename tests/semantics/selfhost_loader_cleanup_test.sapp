@@ -1,0 +1,46 @@
+let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let V=import("stdlib:compiler/vm.sapp");
+let M=import("stdlib:compiler/vm_memory.sapp");
+let P=import("stdlib:selfhost_pbck.sapp");
+let L=import("stdlib:selfhost_loader.sapp");
+fn require(ok,message){if not ok {throw "FAIL loader cleanup: "+message;}}
+fn chunk(source){let c=F.frontend_compile(source);require(c.ok,"fixture compilation");return c.chunk;}
+fn failed(result) {
+ require(not result.ok and result.error=="runtime error during execution" and result.output==[],"fixed failure contract");
+ require(not map_has(result,"globals") and not map_has(result,"locals") and not map_has(result,"execution"),"no partial/private state in failure result");
+}
+let source="let root=memory_alloc(1); let b=borrow_immutable(root); push_lifetime(); let h=memory_alloc(2); let b2=borrow_mutable(h); print \"synthetic partial output\"; throw \"synthetic private error\";";
+let code=chunk(source);
+// Retain a host-only state alias to prove close clears maps, not just the context pointer.
+let execution=V.execution_context();
+let aborted=try V.run_seeded_bounded(code,map{},nil,execution) catch true;
+require(aborted==true and execution.memory!=nil,"failure leaves supplied context owned by caller");
+let state=execution.memory;
+require(M.stats(state).total_locations==2 and M.stats(state).active_borrows==2,"positive live-state control");
+V.close_execution(execution);
+require(execution.memory==nil and state.closed,"context and state closed");
+require(M.stats(state).total_locations==0 and M.stats(state).active_borrows==0 and M.stats(state).lifetime_depth==0 and state.reclaimed==2,"all private scalar state cleared");
+V.close_execution(execution);require(state.reclaimed==2,"close is idempotent");
+require((try M.dispatch(state,"memory_alloc",[3],1) catch "closed")=="closed","closed state cannot be reused");
+let bytes=P.serialize_chunk(code);
+failed(L.run_pbck_bytes(bytes));failed(L.run_pbck_bytes_with_options(bytes,map{max_steps:10000}));
+let loop=P.serialize_chunk(chunk("memory_alloc(1); while true { let x=1; }"));
+failed(L.run_pbck_bytes_with_options(loop,map{max_steps:100}));
+failed(L.run_pbck_bytes_with_options(bytes,map{max_steps:0}));
+let fresh=L.run_pbck_bytes(P.serialize_chunk(chunk("print memory_stats().total_locations; print memory_stats().active_borrows;")));
+require(fresh.ok and fresh.output==[0,0],"next execution has fresh state");
+let caught=L.run_pbck_bytes(P.serialize_chunk(chunk("memory_alloc(4); print try error(\"caught\") catch nil;")));
+require(caught.ok and caught.output==[nil],"guest-caught error is still success");
+let path="/tmp/pbloader_cleanup_"+sha256(str(random_bytes(16)))+".pbcs";
+P.write_file(path,code);
+failed(L.run_pbck(path));failed(L.run_pbck_with_options(path,map{max_steps:10000}));
+failed(L.run_pbck_seeded(path,map{}));failed(L.run_pbck_seeded_with_options(path,map{},map{max_steps:10000}));
+let cli=L.cli_run([path]);require(not cli.ok and cli.exit_code==1 and cli.output==[] and cli.error=="runtime error during execution","CLI preserves failure");
+// Caller-owned seed maps preserve effects already performed; cleanup never retries.
+// The frontend cannot know seeded names; execute its emitted chunk with the seed.
+P.write_file(path,F.frontend_compile("marker=marker+1; memory_alloc(5); throw \"stop\";").chunk);
+let globals=map{marker:0};failed(L.run_pbck_seeded(path,globals));require(globals.marker==1,"no retry or rollback of caller globals");
+P.write_file(path,chunk("let h=memory_alloc(42); print memory_get(h);"));
+let success=L.run_pbck(path);require(success.ok and success.output==[42] and not map_has(success,"execution"),"normal result preserved");
+fs_remove(path);
+print "selfhost_loader_cleanup_pass";

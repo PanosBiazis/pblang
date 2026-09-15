@@ -83,10 +83,16 @@ manual pushes inside a callback are not automatically repaired; generic
 try/catch does not add an implicit lifetime boundary. The root cannot be popped.
 
 Normal whole-execution completion explicitly clears root allocations and any
-unfinished scopes. An uncaught failure preserves the original exception and
-makes the private context unreachable; final reclamation then depends on the
-host garbage collector. Deterministic immediate cleanup on that path remains
-open. Removing entries does not guarantee an immediate reduction in OS RSS.
+unfinished scopes. The self-hosted loader (`run_pbck*`, byte-array, seeded/options,
+pbrun and PBSELF routes) now owns its context and closes it after either success
+or a caught runtime failure, before returning its existing structured result.
+See [loader cleanup validation](LOADER_CLEANUP_VALIDATION_2026-09-16.md).
+
+Direct VM/frontend execution still preserves uncaught exceptions without an
+explicit failure close; final reclamation on that route depends on host GC.
+Deterministic cleanup there remains open. Loader cleanup does not undo changes
+to caller-supplied globals, perform retries or reclaim arbitrary host/native
+resources. Removing ownership entries does not guarantee lower OS RSS.
 
 Handles are positive integer IDs, never reused within one execution, with
 checked exhaustion at 2^53-1. They are predictable IDs, not unforgeable security
