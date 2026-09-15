@@ -105,3 +105,22 @@ Measured construction costs and test coverage are in
 
 Membership validation and same-run scalar overhead measurements are in
 [membership validation](SQL_MEMBERSHIP_VALIDATION_2026-09-15.md).
+
+## Adjacent column reuse
+
+Within one `compile_all` call, consecutive terms naming the same column reuse
+its validated bracket-quoted spelling. This is a single-entry local cache;
+alternating or unique columns are validated normally. No values, query results,
+errors or cross-call state are cached, and term/operator/value validation still
+runs for each term. SQL and parameter order are unchanged.
+
+A type check precedes the name comparison: PBLang maps may overload equality,
+so comparing an unvalidated compound name could invoke caller code. Nonstrings
+always take the existing fixed-error validation path. The cache is assigned
+only after successful identifier validation. It cannot certify a database
+schema; unknown columns still fail when SQLite resolves the query.
+
+There is no new source/project/filter limit. The cache retains at most one
+validated name and quoted spelling per call, independent of distinct-column
+count. It helps repeated columns but adds checking work to misses; measured
+tradeoffs and reproducibility are in [column reuse validation](SQL_COLUMN_REUSE_VALIDATION_2026-09-15.md).
