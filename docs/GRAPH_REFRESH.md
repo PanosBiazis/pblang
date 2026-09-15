@@ -35,5 +35,11 @@ are references, not analyzed source. No full-project freshness claim follows.
 Generated maps stay local under ignored `graphify-out/`; they are not release
 artifacts. Check coverage and paths before sharing them. Improvements still needed
 include native `.sapp` integration in Graphify, explicit truncation reporting,
-path-based module identities, incremental source-hash invalidation and verified
-full-project coverage. A faster refresh does not fix those correctness gaps.
+incremental source-hash invalidation and verified full-project coverage. A faster
+refresh does not fix those correctness gaps.
+
+For already supplied analyses, [code_graph_paths](CODE_GRAPH_PATHS.md) now offers
+path-based module identities using the source linker's resolver. It distinguishes
+missing targets from malformed inputs and canonical collisions. This additive
+library API does not change the legacy tool/walker above, validate lexical
+extraction, or establish complete project coverage.
