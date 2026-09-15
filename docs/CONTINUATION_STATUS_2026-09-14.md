@@ -15,7 +15,44 @@ that no guest operating-system tests have ever run. The retained Kali report
 previously recorded locations during this reconciliation. None of these is
 current-platform acceptance evidence for the present compiler revision.
 
-## Current local validation — 2026-09-15 ARM64
+## Current local validation — 2026-09-15 ARM64 large literals/calls
+
+Array/map literal allocation and element stores, outgoing call areas, staged
+argument loads and cleanup now expand to valid instructions. Call173, array512
+and map256 compile instead of failing at the former compact encoding boundary.
+Strict source admission, ordinary compact instruction bytes and existing runtime
+heap behavior are unchanged. No new source-size/time cap was added.
+
+Validation passed 47 distinct selected suites: 42 regular suites (including 17
+emulator suites and real Node/V8 execution) plus five opt-in extended ARM64
+suites. Eight generated programs also passed in independent local QEMU, covering
+arrays up to 4,095 elements, maps up to 2,048 entries and calls with 4,105 arguments.
+Nested argument order and caller preservation matched the PBLang reference.
+Ten complete normal/boundary artifacts remain byte-identical to their baselines.
+
+All seven touched PBLang sources passed checking with zero errors/warnings and
+strict entry scans with complete mandatory analysis, zero blocking findings and
+stable snapshots. Retained lint passed with conservative unused-variable warnings;
+independent security review found no new blocker. Previous compiler RSS/timing
+measurements are historical evidence for the previous frame-encoding slice, not
+new measurements of this extension. No all-device performance guarantee is made.
+
+QEMU was authenticated through Ubuntu package metadata and extracted temporarily;
+there was no system installation. These are local user-mode emulation tests, not
+native hardware or guest-OS acceptance. No server or EnterpriseOrg infrastructure was
+used. See [implementation and reproducible fixtures](ARM64_ENCODING.md) and the
+[QEMU result record](ARM64_WIDE_QEMU_RESULTS.json).
+
+Isolated and main retained-bootstrap builds and repository-relative lock
+publication passed; the final main build was clean after dependency refresh.
+Main boundary/fingerprint/live rejection tests passed too. All 212 pre-existing
+dirty/untracked files were preserved, with only the necessary working lock hash
+refreshed. Graphify exceeded its 45-second update window and was terminated;
+graph freshness remains unverified.
+The user authorized Git push; automatic remote workflows are skipped for this
+push to keep this validation local.
+
+## Previous ARM64 frame-encoding validation
 
 The ARM64 AST backend now expands frame adjustments and distant frame slots
 instead of corrupting instruction fields. Incoming stack arguments share the
@@ -207,7 +244,7 @@ matrix, physical-device support and general production readiness remain open.
 
 | Workstream | Established progress | What remains |
 | --- | --- | --- |
-| Compiler | Explicit local interpreter/C99/WASM source budgets, data-sized WASM memory and convergent string-type inference; named-function literal defaults and corrected interpreter late-shadow lookup; checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Extend developer budgets across smart builds/backends and separate compilation; expand remaining ARM64 long-branch/literal/outgoing-argument lowering and validate stack/runtime behavior before widening its source admission; bootstrap closure-binding parity, native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
+| Compiler | Explicit local interpreter/C99/WASM source budgets, data-sized WASM memory and convergent string-type inference; named-function literal defaults and corrected interpreter late-shadow lookup; checked numeric tokens; WASM/ARM64/x64 admission including caches; C99/interpreter admission and independently checked linked files | Extend developer budgets across smart builds/backends and separate compilation; expand remaining ARM64 long branches and validate stack/runtime behavior before widening its source admission; bootstrap closure-binding parity, native-selfhost interpreter builtin lowering, broader language/ABI parity, current cross-backend execution matrix |
 | Runtime/FFI | Existing resource contracts, bounded native type-tag reads, heap configuration validation and explicit uncertified scope | Hard memory/time limits, typed native dispatch and hostile-code isolation with actual enforcement evidence |
 | Audits | Policy preflight, checkpoint/counter validation and retained-finding bounds | Whole-report work/decoding budgets and trusted report provenance |
 | Releases | Selected signature/trust/artifact-copy checks | Complete publisher selection, revocation, rollback policy and immutable handoff |
