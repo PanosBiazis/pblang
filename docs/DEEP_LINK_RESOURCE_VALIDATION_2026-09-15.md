@@ -117,6 +117,43 @@ files were installed, and no Specisoft server was used. This validates those
 artifacts on a real Windows OS, not a native Windows PBLang runtime or full
 platform coverage.
 
+Additional local AArch64 QEMU execution passed all five fixed cases: add (12),
+multiply (42), bounded loop (11), zero branch (19), and signed compare (1).
+The existing cached executable was measured and held through the tool's
+verified-descriptor path. Every case passed its lifecycle/cleanup comparison.
+This is userspace emulation, not a booted guest OS or a physical ARM device;
+the report retains `independent_execution_verified=false`.
+
+Local VM inventory found six registered domains, all shut off. The read-only
+VM doctor rejected the existing manifest: two guest entries contained OS,
+evidence, suite and baseline fields unsupported by the current schema. No VM
+was started and no configuration was rewritten. Resolving the lab/controller
+contract is required before reporting current guest-OS test coverage.
+
+### Cross-platform testing requirement
+
+PBLang's development target includes old and modern operating systems and
+devices, from constrained hardware to powerful general-purpose machines. This
+is a design and test requirement, not a statement of universal current support.
+Future validation should preserve four independent axes: OS/version, CPU/ABI,
+device/peripheral capability, and available resources. A passing ISA model does
+not establish host-OS integration, and a new workstation result does not replace
+legacy or low-memory testing.
+
+| Target family | Current evidence in this slice | Still unverified here |
+| --- | --- | --- |
+| Linux x86-64 | retained runtime, C99 cases, compiler/memory suites | other distributions/versions and all libraries |
+| Windows x86-64 | four generated WASM cases in workstation Node | native runtime and legacy Windows versions |
+| ARM64 | PBLang model and five external QEMU cases | guest OS, physical boards and peripherals |
+| Other legacy/embedded ISAs | selected 6502, Z80, AVR, MSP430, MIPS, PowerPC, SPARC, RISC-V model subsets | full ISA, real firmware/RTOS and devices |
+| Android/device models | selected semantic emulator suites | current APK/physical-device integration |
+| BSD, macOS, iOS and other/legacy OS families | no current execution evidence | native/guest/device validation |
+| GPU, NPU and specialized peripherals | no current execution evidence | measured backend correctness and resource cost |
+
+Test infrastructure must remain local to the authorized laptop/VMs/emulators
+or the separately authorized corporate workstation. Broader platform intent
+does not authorize any Specisoft or Hetzner server testing or deployment.
+
 ## Discovery coverage and follow-up ideas
 
 The visible catalog was refreshed and three additional relevant conversation
