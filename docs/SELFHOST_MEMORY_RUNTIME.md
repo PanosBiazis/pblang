@@ -88,11 +88,17 @@ pbrun and PBSELF routes) now owns its context and closes it after either success
 or a caught runtime failure, before returning its existing structured result.
 See [loader cleanup validation](LOADER_CLEANUP_VALIDATION_2026-09-16.md).
 
+Android emulator `run_pbcs` and `compile_and_run` also close their private
+context after success or caught failure, before recording a success event.
+See [Android cleanup validation](ANDROID_CLEANUP_VALIDATION_2026-09-16.md).
+
 Direct VM/frontend execution still preserves uncaught exceptions without an
 explicit failure close; final reclamation on that route depends on host GC.
-Deterministic cleanup there remains open. Loader cleanup does not undo changes
-to caller-supplied globals, perform retries or reclaim arbitrary host/native
-resources. Removing ownership entries does not guarantee lower OS RSS.
+Deterministic cleanup there remains open. Neither loader nor Android cleanup
+retries execution, rolls back mutations or reclaims arbitrary host/native
+resources. Android copies top-level seeded globals, but nested maps/arrays
+can remain aliased and retain guest mutations. Removing ownership entries does
+not guarantee lower OS RSS.
 
 Handles are positive integer IDs, never reused within one execution, with
 checked exhaustion at 2^53-1. They are predictable IDs, not unforgeable security
