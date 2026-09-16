@@ -33,3 +33,21 @@ without retaining its personal filesystem path.
 Suffix classification does not inspect magic bytes or prove file contents. It
 is non-recursive and capped at 4,096 immediate items. Deep content detection,
 archive traversal and recursive scans remain explicitly outside this example.
+
+## Portable metadata names and indexed lookup
+
+Classification treats both `/` and `\` as separators on every host. A leading
+single ASCII letter plus colon in a separator-free input is a Windows
+relative-drive prefix (`C:main.py` becomes `main.py`). Empty basenames, trailing
+separators, `.` and `..` are rejected. This deliberately changes Linux handling
+of literal backslashes and drive-like prefixes, and rejects formerly normalized
+trailing separators, to uphold basename-only disclosure for imported metadata.
+It is not filesystem canonicalization or permission checking.
+
+`classify` and `summarize` no longer require filesystem capability for basename
+parsing; loading their source modules still uses the separate import capability.
+`scan_directory` still needs filesystem access. Classification uses a private
+index of ordered final-extension buckets; multipart/special-name precedence and
+all existing labels are unchanged. Basename extraction first checks a short
+trailing window, with a complete-path fallback for longer names. No foreign runtime or new scanner limit is
+introduced. See [validation and measurements](../../docs/FILE_CATALOG_INDEX_VALIDATION_2026-09-16.md).
