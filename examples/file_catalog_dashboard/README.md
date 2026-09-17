@@ -48,6 +48,19 @@ It is not filesystem canonicalization or permission checking.
 parsing; loading their source modules still uses the separate import capability.
 `scan_directory` still needs filesystem access. Classification uses a private
 index of ordered final-extension buckets; multipart/special-name precedence and
-all existing labels are unchanged. Basename extraction first checks a short
-trailing window, with a complete-path fallback for longer names. No foreign runtime or new scanner limit is
+all existing labels are unchanged. Basename extraction starts with a short
+trailing window and doubles it until the final separator is included. Longer
+names are retained in full without splitting every preceding directory. A long
+name after a single directory prefix is returned without repeated expansion. No foreign runtime or new scanner limit is
 introduced. See [validation and measurements](../../docs/FILE_CATALOG_INDEX_VALIDATION_2026-09-16.md).
+
+
+## Self-hosted aggregation
+
+`summarize` and `visualization_plan` are checked through the self-hosted frontend
+as well as the retained host. Missing options receive defaults; explicit invalid
+values (including `nil` inside an options map) are rejected. Sorted histogram
+rows preserve the retained host order. Directory scanning still uses the host
+filesystem boundary and is not established as a self-hosted guest-OS capability.
+
+See [current validation and resource measurements](../../docs/FILE_CATALOG_SUMMARY_VALIDATION_2026-09-17.md).
