@@ -260,10 +260,21 @@ fn _inflate_block_codes(st, out, lit, dist, max_out) {
     return nil;
 }
 
-fn _read_dynamic_tables(st) {
+fn _require_visit_tree(tree, code_lengths = false) {
+    let left = 1; let symbols = 0;
+    for bits 15 {
+        let n = tree.count[bits+1]; left = left*2-n; symbols = symbols+n;
+        if left < 0 { error("flate: oversubscribed huffman tree"); }
+    }
+    if left > 0 and (code_lengths or (symbols != 0 and not (symbols == 1 and tree.count[1] == 1))) {
+        error("flate: incomplete huffman tree");
+    }
+}
+fn _read_dynamic_tables(st, strict = false) {
     let hlit = _bits(st, 5) + 257;
     let hdist = _bits(st, 5) + 1;
     let hclen = _bits(st, 4) + 4;
+    if strict and hlit > 286 { error("flate: invalid literal code count"); }
     let cl = [];
     let i = 0;
     while i < 19 { array_push(cl, 0); i = i + 1; }
@@ -273,6 +284,7 @@ fn _read_dynamic_tables(st) {
         i = i + 1;
     }
     let clh = _huff_build(cl);
+    if strict { _require_visit_tree(clh,true); }
     let lengths = [];
     while len(lengths) < hlit + hdist {
         let sym = _huff_decode(st, clh);
@@ -293,7 +305,12 @@ fn _read_dynamic_tables(st) {
     if len(lengths) != hlit + hdist { error("flate: code length overflow"); }
     let ll = slice(lengths, 0, hlit);
     let dl = slice(lengths, hlit, len(lengths));
-    return map{ lit: _huff_build(ll), dist: _huff_build(dl) };
+    let lit = _huff_build(ll); let dist = _huff_build(dl);
+    if strict {
+        if ll[256] == 0 { error("flate: missing end-of-block code"); }
+        _require_visit_tree(lit); _require_visit_tree(dist);
+    }
+    return map{ lit: lit, dist: dist };
 }
 
 fn _output_cap(max_out) {
@@ -870,6 +887,91 @@ fn zlib_decode(data, max_out = nil, exact = false) {
     return out;
 }
 
+// A visitor sees provisional chunks, never authenticated output. It must not
+// publish effects until this function returns successfully. Chunk mutation is
+// detached from the retained history and checksum state.
+fn _visit_flush(state, visitor) {
+    let out = state.out; let n = len(out); let i = state.start;
+    if i == n { return; }
+    let a = state.a; let s = state.s;
+    while i < n {
+        let end = i + 5552; if end > n { end = n; }
+        while i < end { a = a + out[i]; s = s + a; i = i + 1; }
+        a = a % 65521; s = s % 65521;
+    }
+    state.a = a; state.s = s;
+    let chunk = slice(out,state.start,n); let offset = state.delivered;
+    state.delivered = state.delivered+len(chunk);
+    let keep = n-32768; if keep < 0 { keep = 0; }
+    state.out = slice(out,keep,n); state.start = len(state.out);
+    visitor(chunk,offset);
+}
+fn _visit_codes(st,state,lit,dist,visitor,cap) {
+    let out = state.out; let total = state.total;
+    loop {
+        let sym = _huff_decode(st,lit);
+        if sym == 256 { state.total = total; return; }
+        if sym < 256 {
+            if total >= cap { error("flate: output exceeds max_out cap"); }
+            array_push(out,sym); total = total+1;
+        } else {
+            if sym > 285 { error("flate: invalid length symbol"); }
+            let li = sym-257; let length = _LBASE[li]+_bits(st,_LEXTRA[li]);
+            let ds = _huff_decode(st,dist);
+            if ds > 29 { error("flate: invalid distance symbol"); }
+            let distance = _DBASE[ds]+_bits(st,_DEXTRA[ds]);
+            if distance > len(out) or distance > state.window { error("flate: distance outside history window"); }
+            if total+length > cap { error("flate: output exceeds max_out cap"); }
+            let at = len(out)-distance;
+            for k length { array_push(out,out[at+k]); }
+            total = total+length;
+        }
+        if len(out) >= 65536 { _visit_flush(state,visitor); out = state.out; }
+    }
+}
+// Original output-array APIs remain available. Only callers selecting this API
+// use bounded history. max_out is explicit; no language-wide quota is imposed.
+fn zlib_visit(data,visitor,max_out,exact = false) {
+    let kind = type(visitor);
+    if kind != "closure" and kind != "function" and kind != "builtin" { error("flate: visitor must be callable"); }
+    if type(max_out) != "number" or not (max_out >= 0 and max_out <= 9007199254740991)
+        or num_floor(max_out) != max_out or type(exact) != "bool" { error("flate: invalid visit bounds"); }
+    let b = _as_bytes(data);
+    if type(b) != "array" or len(b) < 6 { error("flate: zlib data too short"); }
+    for byte in b {
+        if type(byte) != "number" or not (byte >= 0 and byte <= 255) or num_floor(byte) != byte { error("flate: invalid byte"); }
+    }
+    if bit_and(b[0],15) != 8 or bit_shr(b[0],4) > 7 { error("flate: unsupported zlib method or window"); }
+    if (b[0]*256+b[1])%31 != 0 { error("flate: bad zlib header check"); }
+    if bit_and(b[1],32) != 0 { error("flate: zlib preset dictionary unsupported"); }
+    let st = _mk_reader(b,2);
+    let state = map{out:[],start:0,total:0,delivered:0,a:1,s:0,window:bit_shl(1,8+bit_shr(b[0],4))}; let done = false;
+    while not done {
+        done = _bits(st,1)==1; let block = _bits(st,2);
+        if block == 0 {
+            _bits(st,st.nb%8); let length = _bits(st,16); let inverse = _bits(st,16);
+            if bit_xor(length,65535) != inverse { error("flate: stored block LEN/NLEN mismatch"); }
+            if state.total+length > max_out { error("flate: output exceeds max_out cap"); }
+            let out = state.out; let total = state.total;
+            for i length {
+                array_push(out,_bits(st,8)); total = total+1;
+                if len(out) >= 65536 { _visit_flush(state,visitor); out = state.out; }
+            }
+            state.total = total;
+        } elif block == 1 or block == 2 {
+            let tables = if block == 1 { _fixed_tables() } else { _read_dynamic_tables(st,true) };
+            _visit_codes(st,state,tables.lit,tables.dist,visitor,max_out);
+        } else { error("flate: invalid block type"); }
+    }
+    _visit_flush(state,visitor);
+    let at = _consumed(st);
+    if at+4 > len(b) { error("flate: truncated zlib trailer"); }
+    if exact and at+4 != len(b) { error("flate: trailing zlib data"); }
+    let wanted = b[at]*16777216+b[at+1]*65536+b[at+2]*256+b[at+3];
+    if wanted != state.s*65536+state.a { error("flate: zlib adler32 mismatch"); }
+    return map{decoded_bytes:state.total,checksum_verified:true};
+}
+
 // ── file helpers ─────────────────────────────────────────────────────────────
 // gzip_read_file(path, max_out?) — read and decode a .gz file.
 fn gzip_read_file(path, max_out = nil) { return gzip_decode(fs_read_bytes(path), max_out); }
@@ -881,4 +983,4 @@ fn gzip_write_file(path, data) {
 }
 
 export crc32, crc32_range, adler32, inflate, deflate, gzip_encode, gzip_decode,
-       zlib_encode, zlib_decode, gzip_read_file, gzip_write_file;
+       zlib_encode, zlib_decode, zlib_visit, gzip_read_file, gzip_write_file;
