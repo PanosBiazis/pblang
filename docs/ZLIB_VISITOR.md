@@ -47,3 +47,18 @@ window-crossing streams, and PB-MCP's independent PNG pixel/error corpus.
 Tests include overlapping matches across flushes, callback mutation/failure,
 empty output, exactness, quotas, checksum failure and malformed dynamic trees.
 No general arbitrary-size soak, all-backend or universal platform claim is made.
+
+## Self-hosted module compatibility
+
+The fixed-encoder cache now declares `map<string,any>` explicitly: its readiness
+flag, initially empty slots and populated Huffman arrays are heterogeneous.
+Without that declaration the self-hosted checker inferred optional booleans and
+rejected the module, preventing even unrelated checksum/decoder exports from
+loading. No general type-checking rule was relaxed and concrete boolean-map
+assignments remain checked. Cache contents and initialization timing are unchanged.
+
+`tests/semantics/selfhost_flate_test.sapp` verifies real module compilation,
+checksums, repeated zlib encode/decode, gzip and malformed-trailer rejection.
+PB-MCP additionally validates its small PNG corpus through the actual self-hosted
+frontend. This fixes the module-loading failure; map-shaped visitor callables
+remain unsupported, so self-hosted PNG still uses the full-array decoder.
