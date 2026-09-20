@@ -1,4 +1,4 @@
-# Focused automatic-lifetime review, 2026-09-20
+# Focused automatic-lifetime review, updated 2026-09-21
 
 Scope: PBLang resource scopes, latest-update buffering, owned scalar callbacks,
 retained GC diagnostics, and the kernel collector/allocator. This is a local
@@ -11,7 +11,7 @@ executed for this review. No Specisoft server was accessed.
 | `resource_scope` | Result envelope snapshot precedes cleanup; callback removed before invocation; registration closes before cleanup; later callbacks run after a failure | Trusted synchronous callbacks only; payload/error objects retain shared aliases; no thread exclusion, deadline or general OOM guarantee |
 | `latest_updates` | Batch detaches before callbacks; reentrant updates go to the next batch; recursive flush/discard refused; failed work is not replayed | Shared payloads remain mutable; unbounded distinct keys can consume memory; it is not a permission-check queue or an ordered-event journal |
 | `memory_owned` | Scope-depth/token mismatches are detected; normal/error scalar cleanup preserves caller scope in tested cases; escaped freed handle becomes invalid | Raw handles/builtins are available to callbacks; this is not isolation from malicious callbacks; composite/native ownership and general exceptions remain incomplete |
-| Kernel GC | Table capacity/size checks, failed allocation before writes, no sweep after scratch failure, iterative traversal, generation retry/wrap, cycle reclamation, current-CPU IRQ serialization, atomic rooted allocation and size-overflow refusal | Raw pointer validity and owner identity are supplied by the kernel; SMP/NMI/DMA and external mutation still require synchronization |
+| Kernel GC | Table capacity/size checks, failed allocation before writes, no sweep after scratch failure, iterative traversal, generation retry/wrap, cycle reclamation, shared atomic lock with IRQ preservation, atomic rooted allocation, size-overflow refusal and constructor-failure rollback | Raw pointer validity and owner identity are supplied by the kernel; SMP boot remains unverified, NMI/DMA and external mutation are not covered |
 | Retained GC | Standard-library destructive collection remains refused because same-thread nested VM roots are incomplete | Specialized desktop maintenance does not prove a safe general collector |
 
 ## TOCTOU and concurrency
@@ -24,27 +24,35 @@ that permissions checked at submission still hold when its consumer runs.
 Effectful consumers must check the relevant authority at the effect boundary.
 
 The kernel collector has no callbacks during marking. Public GC/free-list
-operations now save and mask interrupts on the current CPU, with compiler memory
-barriers and restoration on success/failure. Nested operations preserve the
-incoming disabled state. `gc_alloc_rooted` closes the allocate-then-publish
-window, rolling back object registration/allocation if root growth fails.
-Existing `gc_alloc` remains unrooted; subsequent `gc_add_root` is not atomic with
-it. Callers must root values throughout their use and protect compound graph
-operations. Internal underscore helpers require an already-held critical section.
+operations now disable local interrupts, acquire a shared atomic x86 memory lock,
+release that lock and restore the original local interrupt state. Internal
+helpers require existing ownership and no longer reacquire the lock. This avoids
+self-deadlock in automatic collection, heap growth and rooted-allocation rollback.
+`gc_alloc_rooted` closes the allocate-then-publish window; existing `gc_alloc`
+remains unrooted, requiring caller-managed publication and complete roots.
 
-This addresses cooperative maskable-interrupt races on **one active x86 CPU**.
-It does not serialize other CPUs, NMIs, DMA, arbitrary bump-allocator users,
-external `poke32` writes or foreign runtimes. A saved IF bit is not an SMP lock.
-Whole-collection masking delays interrupts and gives no hard real-time bound.
-Public collector operations do not validate arbitrary pointer ownership and the
-heap does not detect general invalid/double frees. No general concurrent-GC or
-untrusted-native isolation claim follows from these changes.
+`kernel_gc_try_collect` returns 1 without waiting or traversing when another
+owner holds the lock, and restores IF. The native concurrency harness verifies
+this with a separate thread while the main thread deliberately holds the lock.
+If admitted, it still performs a complete collection; it is not an incremental
+collector or a real-time deadline guarantee. Blocking operations may spin with
+local interrupts disabled. The single global lock serializes independent arenas
+and has no fairness or bounded-wait guarantee. Raw invalid pointers/faults or
+NMI reentry while holding it can prevent progress; it is not hostile-code isolation.
 
-The collector control block still comes from the retained kernel bump arena.
-Failed `gc_new` attempts can consume that 48-byte block even though free-list
-metadata is unwound, and there is no general collector-destruction API. This
-existing lifecycle gap remains separate from rooted-object rollback; repeated
-collector creation is not claimed to be leak-free.
+The atomic primitives and emitted PBLang algorithms passed a four-host-thread
+harness, and 32-bit kernel IRQ behavior passed QEMU qemu64/486. The native harness
+uses a 64-bit host ABI, checked low-address arenas and a thread-local IF test seam;
+it is not an SMP kernel boot. Full AP startup, per-CPU stacks/interrupt tables,
+physical-device behavior, NMI/DMA, raw writes and foreign-runtime synchronization
+remain unverified or unsupported. See `KERNEL_GC_PARALLEL.md`.
+
+Failed `gc_new` now frees its 48-byte control payload and any earlier metadata
+through the free-list heap. Ten thousand failed constructions in a small arena
+leave its full allocation available. Successful collectors still have no general
+destruction API; replacing their whole lifetime remains a separate gap. Initialization
+of a live arena and general invalid/double frees remain caller errors, not made
+safe by the lock.
 
 Filesystem handles/path replacement, native handle reuse across independent
 owners, GPU/DMA buffers, cancellation during FFI and asynchronous callbacks

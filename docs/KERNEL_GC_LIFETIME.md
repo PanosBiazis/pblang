@@ -1,5 +1,8 @@
 # Kernel collector: cycles, growth and failure handling
 
+Current synchronization contract: [shared kernel lock and admission](KERNEL_GC_PARALLEL.md).
+The dated IRQ-only section below describes the preceding implementation.
+
 This change is PBLang code in `stdlib/kernel/gc.sapp`, lowered through the integer
 C kernel backend. It is not a collector for ordinary retained-host VM objects,
 PB-MCP, foreign runtimes, or every polyglot block. Those integrations remain open.
@@ -77,8 +80,9 @@ See [the focused automatic-lifetime review](AUTOMATIC_LIFETIME_REVIEW.md).
 The collector is precise only when the kernel supplies valid owned pointers,
 complete roots and serialized access. It does not scan the machine stack,
 validate arbitrary addresses or isolate hostile code. Public collector/heap
-operations now serialize maskable interrupts on the current CPU; see the narrow
-contract below. They do not synchronize other CPUs or arbitrary native writes. A caller must keep any value needed after a possible
+operations now share an atomic memory lock while preserving local interrupt
+state; see `KERNEL_GC_PARALLEL.md` for current coverage and limits. Arbitrary
+native writes are not covered. A caller must keep any value needed after a possible
 collection rooted before another allocation can trigger automatic collection.
 No thread-wide retained-host destructive GC has been enabled.
 
@@ -118,7 +122,7 @@ as a general GC overhead estimate. No Specisoft server was used.
 Graphify refresh was attempted and stopped at its 35-second budget. It does not
 provide semantic verification for this PBLang kernel source.
 
-## Mark generations and interrupt serialization, 2026-09-20
+## Mark generations and interrupt serialization, 2026-09-20 (historical)
 
 Ordinary collections now use a generation at control offset 44 instead of clearing
 all object marks first. Header/control sizes are unchanged. Generation advances

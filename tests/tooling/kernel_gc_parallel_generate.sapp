@@ -1,0 +1,36 @@
+// Generate a local native concurrency harness; this does not start any process.
+// Run from the repository root, with the destination C path as the first argument.
+// Product algorithms are emitted from the current PBLang heap and GC modules.
+// The Linux pthread shim uses a 64-bit host ABI with checked low-address arenas;
+// fake thread-local IF is only a test seam, never a kernel implementation.
+let C = import("stdlib:compiler/ctranspile.sapp");
+let source = fs_read("stdlib/kernel/heap.sapp") + fs_read("stdlib/kernel/gc.sapp");
+source = source + "\nfn parallel_worker(g) { let i=0; while i<2000 { let obj=gc_alloc_rooted(g,1); if obj==0 {return 0;} gc_set_child(obj,0,obj); parallel_yield(); let status=kernel_gc_try_collect(g); if status < 0 {return 0;} if peek32(obj+8)!=obj {return 0;} if gc_remove_root(g,obj)!=1 {return 0;} i=i+1; } return 1; }";
+let emitted = C.transpile_kernel_int(source);
+let nl = "\n";
+let shim = "#define _GNU_SOURCE\n#include <pthread.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <sched.h>\n#include <stdlib.h>\n";
+shim = shim + "typedef unsigned int u32; static _Thread_local u32 test_if=512;\n";
+shim = shim + "static inline u32 kernel_irq_save_disable(void){u32 f=test_if;test_if=0;__asm__ volatile(\"\"::: \"memory\");return f;}\n";
+shim = shim + "static inline void kernel_irq_restore(u32 f){__asm__ volatile(\"\"::: \"memory\");test_if=f & 512u;}\n";
+shim = shim + "static inline u32 peek32(unsigned long a){return *(volatile u32*)a;}\nstatic inline void poke32(unsigned long a,u32 v){*(volatile u32*)a=v;}\nstatic inline void parallel_yield(void){sched_yield();}\n";
+// Preserve the exact emitted atomic primitives, not a separately rewritten lock.
+for line in str_split(emitted, nl) {
+    if str_contains(line, "static u32 _kernel_memory_lock ") or str_contains(line, "static inline u32 kernel_memory_try_lock(") or str_contains(line, "static inline u32 kernel_memory_locked(") or str_contains(line, "static inline void kernel_memory_unlock(") or str_contains(line, "static inline void kernel_spin_wait(") { shim = shim + line + nl; }
+}
+let body = false;
+for line in str_split(emitted, nl) {
+    if line == "long _align8(long x);" { body = true; }
+    if body { shim = shim + line + nl; }
+}
+assert(body, "parallel fixture: emitted function boundary not found");
+shim = shim + "static unsigned char arenas[2][131072] __attribute__((aligned(64))); static u32 controls[2]; static long collectors[2]; static pthread_barrier_t barrier;\n";
+shim = shim + "static void* worker(void* arg){pthread_barrier_wait(&barrier);long ok=parallel_worker(collectors[(uintptr_t)arg%2]);return (void*)(uintptr_t)(ok==1 && test_if==512);}\n";
+shim = shim + "static void* busy_probe(void* arg){return (void*)(uintptr_t)(kernel_gc_try_collect((long)arg)==1 && test_if==512); }\n";
+shim = shim + "int main(void){pthread_t threads[4];for(int i=0;i<2;i++){if((uintptr_t)&arenas[i][131071]>2147483647u || (uintptr_t)&controls[i]>2147483647u)return 2;heap_init((long)&controls[i],(long)arenas[i],131072);collectors[i]=gc_new((long)&controls[i]);if(!collectors[i])return 3;gc_set_auto(collectors[i],1);gc_set_threshold(collectors[i],1);}\n";
+shim = shim + "long count=gc_collections(collectors[0]);if(!kernel_memory_try_lock())return 9;pthread_t probe;void* probe_result=0;if(pthread_create(&probe,0,busy_probe,(void*)collectors[0])||pthread_join(probe,&probe_result)||probe_result!=(void*)1)return 10;kernel_memory_unlock();if(gc_collections(collectors[0])!=count)return 11;\n";
+shim = shim + "if(pthread_barrier_init(&barrier,0,4))return 4;for(uintptr_t i=0;i<4;i++)if(pthread_create(&threads[i],0,worker,(void*)i))return 5;for(int i=0;i<4;i++){void* result=0;if(pthread_join(threads[i],&result)||result!=(void*)1)return 6;}pthread_barrier_destroy(&barrier);\n";
+shim = shim + "for(int i=0;i<2;i++){if(kernel_gc_collect(collectors[i])!=0||gc_live(collectors[i])!=0||peek32(collectors[i]+24)!=0)return 7;}puts(\"kernel_gc_parallel_pass: 4 host threads, 2 collectors, 8000 rooted lifetimes\");return test_if==512?0:8;}\n";
+let destination = try env_get("PBLANG_SCRIPT_ARGS") catch "";
+assert(destination != nil and str_trim(destination) != "", "destination C path required");
+fs_write(str_split(destination, "\n")[0], shim);
+print "parallel fixture generated";
