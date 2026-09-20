@@ -95,6 +95,10 @@ These checks do not replace application acceptance across all operating systems.
 Some existing kernel images still produce the retained linker's RWX warning;
 this change does not establish page-permission hardening.
 
+For the subsequent collection-time optimization and its current measurements,
+see [all-live sweep elimination](KERNEL_GC_LIVE_SWEEP.md). The measurements below
+describe the earlier interruptible-wait change.
+
 ## Performance and remaining integration
 
 The benchmark uses the unchanged 128-object ring with both 50000 literals scaled
