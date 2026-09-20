@@ -89,8 +89,10 @@ for two warmups and seven alternating measured runs.
 ## What remains
 
 This closes the caught-body temporary-reference gap, not every runtime lifetime
-issue. Uncaught failures and early returns still depend on existing frame/context
-teardown; general error-preserving cleanup of external resources is unfinished.
+issue. [Explicit throws and returns](EXPLICIT_EXIT_LIFETIME.md) now also clear
+their own active non-captured references. Implicit uncaught failures still depend
+on existing frame/context teardown; general error-preserving cleanup of external
+resources is unfinished.
 A handler that fails is cleaned by this mechanism when an enclosing compiled
 try owns its temporary slots, not by a universal finally/destructor facility.
 

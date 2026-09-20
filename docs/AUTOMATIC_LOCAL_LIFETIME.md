@@ -88,9 +88,11 @@ Example: [automatic_lifetime.sapp](../examples/automatic_lifetime.sapp).
 This is not full automatic memory management for every PBLang runtime:
 
 - Caught try-body failures now clean temporary references before the handler;
-  see [exception cleanup](EXCEPTION_LOCAL_LIFETIME.md). Uncaught exceptions and
-  early returns still rely on frame teardown; general external-resource cleanup
-  preserving the original error needs further runtime work.
+  see [exception cleanup](EXCEPTION_LOCAL_LIFETIME.md). Explicit throws and
+  returns now also clear their own active non-captured references; see
+  [explicit exits](EXPLICIT_EXIT_LIFETIME.md). Implicit uncaught failures and
+  general external-resource cleanup preserving the original error still need
+  further runtime work.
 - Captured slots remain until their existing frame/closure lifetime ends. Cyclic
   graphs and owner-isolated heap collection are not implemented by this change.
 - Explicit `memory_alloc` handles, FFI buffers, files, sockets, device allocations
