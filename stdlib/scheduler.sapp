@@ -1,109 +1,202 @@
-// stdlib/scheduler.sapp — Task scheduling (cron-like intervals, delayed execution).
-//
-// Usage:
-//   let sched = import("stdlib:scheduler.sapp");
-//   sched.set_interval(fn() { print "tick"; }, 1000);
-//   sched.set_timeout(fn() { print "delayed"; }, 5000);
-//   sched.run_loop();  // blocks, executing scheduled tasks
-
-let _timers = [];
+// Cooperative timers. Idle timers retain their values without executing.
+// See docs/SCHEDULER_IDLE.md for lifecycle, timing and host limitations.
+let _timers = map{};
+let _order = [];
+let _next_id = 0;
+let _active = 0;
+let _paused = 0;
 let _running = false;
+let _dispatching = false;
+let _executing_key = nil;
 
-// set_timeout(fn, delay_ms) — execute fn once after delay_ms.
-fn set_timeout(fn_, delay_ms) {
-    let id = len(_timers);
-    _timers[id] = map{
-        fn: fn_,
-        interval: 0,
-        next_run: clock() * 1000.0 + delay_ms,
-        repeat: false,
-        cancelled: false
-    };
-    return id;
+fn _finite(value) {
+    if type(value) != "number" { return false; }
+    // Finite numbers subtract to zero; infinities/NaN do not.
+    let difference = value;
+    difference = difference - value;
+    return difference == 0;
 }
-
-// set_interval(fn, interval_ms) — execute fn repeatedly every interval_ms.
-fn set_interval(fn_, interval_ms) {
-    let id = len(_timers);
-    _timers[id] = map{
-        fn: fn_,
-        interval: interval_ms,
-        next_run: clock() * 1000.0 + interval_ms,
-        repeat: true,
-        cancelled: false
-    };
-    return id;
+fn _key(id) {
+    if not _finite(id) { return nil; }
+    if id < 0 or id != num_floor(id) { return nil; }
+    return str(id);
 }
-
-// clear_timer(id) — cancel a timer.
-fn clear_timer(id) {
-    if id < len(_timers) {
-        _timers[id].cancelled = true;
+fn _timer(id) {
+    let key = _key(id);
+    if key == nil { return nil; }
+    if not map_has(_timers, key) { return nil; }
+    return _timers[key];
+}
+// Queue entries are allocated only on registration/resume, not every dispatch.
+// Compact when stale entries exceed live ones; cancelled records hold no callback.
+fn _compact() {
+    if _active == 0 { _order = []; return; }
+    if len(_order) <= _active * 2 { return; }
+    let next = [];
+    for t in _order {
+        if t.state == 0 {
+            array_push(next, t);
+        }
     }
+    _order = next;
 }
-
-// set_immediate(fn) — run fn on the next pending pass (a zero-delay timeout).
+fn _append(t) {
+    array_push(_order, t);
+    _active = _active + 1;
+}
+fn _schedule(fn_, delay, repeat) {
+    if not _finite(delay) { throw "scheduler: delay must be finite"; }
+    // Preserve exact ID identity with the host's numeric representation.
+    if _next_id >= 9007199254740991 { throw "scheduler: timer IDs exhausted"; }
+    let deadline = clock() * 1000.0 + delay;
+    if not _finite(deadline) { throw "scheduler: deadline is not finite"; }
+    let id = _next_id;
+    _next_id = _next_id + 1;
+    let t = map{ key: str(id), fn: fn_, interval: delay,
+        next_run: deadline, repeat: repeat, state: 0,
+        remaining: 0 };
+    _timers[t.key] = t;
+    _append(t);
+    return id;
+}
+fn set_timeout(fn_, delay_ms) { return _schedule(fn_, delay_ms, false); }
+fn set_interval(fn_, interval_ms) { return _schedule(fn_, interval_ms, true); }
 fn set_immediate(fn_) { return set_timeout(fn_, 0); }
 
-// run_once() — check and execute any ready timers (non-blocking). Returns the
-// number of timers fired.
-fn run_once() { return run_pending(); }
+// Cancellation drops the scheduler's callback reference immediately.
+fn clear_timer(id) {
+    let t = _timer(id);
+    if t == nil { return; }
+    if t.state == 1 { _paused = _paused - 1; } else { _active = _active - 1; }
+    t.state = 2;
+    t.fn = nil;
+    map_remove(_timers, t.key);
+    _compact();
+}
+fn pause_timer(id) {
+    let t = _timer(id);
+    if t == nil or t.state == 1 { return false; }
+    let remaining = t.next_run - clock() * 1000.0;
+    if _executing_key == t.key and t.repeat { remaining = t.interval; }
+    if remaining < 0 { remaining = 0; }
+    t.remaining = remaining;
+    _active = _active - 1;
+    t.state = 1;
+    _paused = _paused + 1;
+    _compact();
+    return true;
+}
+fn resume_timer(id) {
+    let t = _timer(id);
+    if t == nil or t.state != 1 { return false; }
+    // A fresh activation prevents an old pass from executing resumed work.
+    let resumed = map{ key: t.key, fn: t.fn, interval: t.interval,
+        next_run: clock() * 1000.0 + t.remaining, repeat: t.repeat,
+        state: 0, remaining: 0 };
+    t.state = 2;
+    t.fn = nil;
+    _timers[t.key] = resumed;
+    _paused = _paused - 1;
+    _append(resumed);
+    return true;
+}
+fn is_active(id) {
+    let t = _timer(id);
+    return t != nil and t.state == 0;
+}
+fn is_paused(id) {
+    let t = _timer(id);
+    return t != nil and t.state == 1;
+}
+fn active_timers() { return _active; }
+fn paused_timers() { return _paused; }
+fn retained_timers() { return len(_timers); }
+fn clear_all() {
+    // Mark records held by an in-flight pass, including paused timers.
+    for key in map_keys(_timers) {
+        let t = _timers[key];
+        t.state = 2;
+        t.fn = nil;
+    }
+    _timers = map{};
+    _order = [];
+    _active = 0;
+    _paused = 0;
+}
 
-// run_pending() — fire every ready timer once; returns the count fired.
 fn run_pending() {
+    if _dispatching { return 0; }
     let now = clock() * 1000.0;
+    // Keep the existing queue alive across callback mutations. New registrations
+    // and resumptions are outside this pass's original entry count.
+    let queue = _order;
+    let count = len(queue);
+    _dispatching = true;
     let fired = 0;
-    for i len(_timers) {
-        let t = _timers[i];
-        if t.cancelled == true { } // skip
-        else if now >= t.next_run {
-            try t.fn() catch nil;
-            fired = fired + 1;
-            if t.repeat {
-                t.next_run = now + t.interval;
-            } else {
-                t.cancelled = true;
+    for i count {
+        let t = queue[i];
+        if t.state == 0 {
+            if now >= t.next_run {
+                _executing_key = t.key;
+                try t.fn() catch nil;
+                _executing_key = nil;
+                fired = fired + 1;
+                if not t.repeat { clear_timer(parse_number(t.key)); }
+                else if t.state == 0 {
+                    t.next_run = now + t.interval;
+                }
             }
         }
     }
+    _dispatching = false;
     return fired;
 }
+fn run_once() { return run_pending(); }
 
-// run_loop(duration_ms) — run the scheduler for duration_ms (0 = forever).
-fn run_loop(duration_ms = 0) {
+// Caller-selectable maximum idle wait; active deadlines can shorten it.
+fn next_delay(max_wait_ms = 1000) {
+    if not _finite(max_wait_ms) or max_wait_ms <= 0 {
+        throw "scheduler: maximum idle wait must be finite and positive";
+    }
+    let delay = max_wait_ms;
+    let now = clock() * 1000.0;
+    for t in _order {
+        if t.state == 0 {
+            let remaining = t.next_run - now;
+            if remaining < delay { delay = remaining; }
+        }
+    }
+    if delay < 0 { return 0; }
+    return delay;
+}
+fn run_loop(duration_ms = 0, idle_poll_ms = 1000) {
+    if _running or _dispatching { throw "scheduler: nested run_loop is unsupported"; }
+    if not _finite(duration_ms) { throw "scheduler: duration must be finite"; }
+    next_delay(idle_poll_ms);
     let start = clock() * 1000.0;
     _running = true;
     while _running {
-        run_once();
-        sleep_ms(10);  // 10ms resolution
+        run_pending();
+        if not _running { break; }
+        let delay = next_delay(idle_poll_ms);
+        // Preserve pacing for zero/negative intervals; never spin on sub-ms sleeps.
+        if delay <= 0 { delay = 10; }
         if duration_ms > 0 {
-            if (clock() * 1000.0 - start) > duration_ms { break; }
+            let remaining = duration_ms - (clock() * 1000.0 - start);
+            if remaining <= 0 { break; }
+            if remaining < delay { delay = remaining; }
         }
+        let slept = try { sleep_ms(num_ceil(delay)); true } catch false;
+        if not slept {
+            _running = false;
+            throw "scheduler: host sleep failed";
+        }
+        if duration_ms > 0 and clock() * 1000.0 - start >= duration_ms { break; }
     }
+    _running = false;
 }
-
-// stop() — stop the run loop.
 fn stop() { _running = false; }
 
-// active_timers() — count of non-cancelled timers.
-fn active_timers() {
-    let count = 0;
-    for i len(_timers) {
-        if _timers[i].cancelled == false { count = count + 1; }
-    }
-    return count;
-}
-
-// is_active(id) — true if the timer exists and has not been cancelled.
-fn is_active(id) {
-    if id < 0 or id >= len(_timers) { return false; }
-    return _timers[id].cancelled == false;
-}
-
-// clear_all() — cancel every timer.
-fn clear_all() {
-    for i len(_timers) { _timers[i].cancelled = true; }
-}
-
 export set_timeout, set_interval, set_immediate, clear_timer, clear_all,
-       run_once, run_pending, run_loop, stop, active_timers, is_active;
+       pause_timer, resume_timer, is_paused, paused_timers, retained_timers,
+       run_once, run_pending, run_loop, stop, active_timers, is_active, next_delay;
