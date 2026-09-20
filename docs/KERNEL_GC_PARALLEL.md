@@ -1,5 +1,7 @@
 # Shared kernel memory lock and nonwaiting collection admission
 
+Current two-vCPU and interrupt-wait evidence: [SMP fixture](KERNEL_GC_SMP.md).
+
 This is a PBLang kernel-library change with atomic x86 instructions emitted by the
 existing C backend. It does not install a global collector in the retained VM,
 PB-MCP, FFI or polyglot runtimes, and it is not a completed SMP operating system.
@@ -7,8 +9,11 @@ PB-MCP, FFI or polyglot runtimes, and it is not a completed SMP operating system
 ## Behavior
 
 The free-list heap and collector now use one shared lock. Every public operation
-saves/disables local maskable interrupts, acquires the lock, accesses protected
-state, releases the lock, then restores the saved IF bit. Internal `_guarded_*`
+saves/disables local maskable interrupts, attempts acquisition, accesses protected
+state only after acquisition, releases the lock, then restores the saved IF bit.
+Following a failed acquisition it restores the original IF while polling, and
+disables interrupts again before retrying. An originally masked caller stays
+masked. Interrupts therefore need not stay disabled throughout a contended wait. Internal `_guarded_*`
 helpers require existing lock ownership and must not be called independently.
 They do not reacquire it, including automatic collection and heap metadata growth.
 Manual outer IRQ masking still works: an incoming disabled state remains disabled.
@@ -104,9 +109,11 @@ QEMU CPU 0.94 / 0.94 seconds, p95 1.42 / 1.37 seconds. Median QEMU peak RSS is
 improvement is demonstrated. This benchmark has no competing owner and measures
 QEMU process resources, not physical-device power, GPU/NPU or contention scaling.
 
-The global lock serializes independent arenas. Blocking acquisition spins with
-interrupts masked, with no fairness or bounded waiting. Collection still masks
-interrupts throughout traversal/sweep. Full SMP boot, fairness, per-arena locking,
+The global lock serializes independent arenas. Blocking acquisition still spins,
+with no fairness or bounded waiting; originally interruptible callers can now
+service IRQs during the wait. Collection still masks interrupts throughout
+traversal/sweep. A two-vCPU bootstrap/GC fixture has now passed (see the follow-up);
+general SMP operating-system support, fairness, per-arena locking, quantitative
 pause-latency measurements and physical devices remain open; NMI/DMA and arbitrary
 native memory access are not covered. A fault or noncooperative owner may block
 all users. No general runtime/FFI/PB-MCP integration or hard real-time safety is
