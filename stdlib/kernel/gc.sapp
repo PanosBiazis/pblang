@@ -1,129 +1,132 @@
-// stdlib/kernel/gc.sapp — a TUNABLE mark-sweep garbage collector, written in pblang.
-// pblang:target=kernel — lowered by compiler/ctranspile.sapp; the freestanding
-// preamble provides the OS intrinsics used below (see diagnostics.sapp pragmas).
-// pblang:extern heap_alloc heap_free  (linked from stdlib/kernel/heap.sapp)
-//
-// Sits on the §74 free-list heap (heap.sapp) and reclaims unreachable objects. It is
-// tunable in both axes the user asked for:
-//   • MANUAL collection — call `kernel_gc_collect(g)` any time; always available.
-//   • AUTOMATIC collection — when enabled, `gc_alloc` collects on its own once
-//     `bytes_since_last_collect >= threshold`. Both the on/off switch and the
-//     threshold are run-time tunable (`gc_set_auto`, `gc_set_threshold`), so the same
-//     kernel can run GC eagerly, lazily, or fully manual.
-//
-// Precise (not conservative): roots and inter-object edges are explicit, so marking
-// is exact — no stack scanning (which transpiled C can't do portably). A GC object's
-// payload is [ word0=mark, word1=nchildren, word2..=child pointers, …user data ].
-//
-// GC control block (raw poke32 fields, threaded explicitly — no globals):
-//   +0 heap_ctrl   +4 auto(0/1)   +8 threshold   +12 bytes_since
-//   +16 nobjs      +20 objs[]     +24 nroots     +28 roots[]      +32 collections
-//
-// Lower with `transpile_kernel_int` (§73) so the collector is float-free. All pblang.
-
-// gc_new(heap_ctrl) — a collector over an already-initialised heap arena. Auto starts
-// ON with a large threshold (effectively lazy); tune with the setters below. Object
-// and root tables are fixed-capacity (kmalloc'd once, kernel-lifetime).
+// pblang:target=kernel
+// pblang:extern heap_alloc heap_free
+// Precise PBLang mark/sweep collector for the 32-bit kernel ABI.
+// Roots and edges belong to this collector and must refer to live owned objects.
+// This raw kernel API is not a validator for arbitrary addresses or host VM values.
+// Control: heap +0, auto +4, threshold +8, bytes_since +12, count +16,
+// objects +20, root_count +24, roots +28, collections +32, capacities +36/+40.
+// Tables grow in the supplied heap; no fixed object/root count limit is imposed.
 fn gc_new(heap_ctrl) {
-    let g = kmalloc(40);
-    poke32(g + 0, heap_ctrl);
-    poke32(g + 4, 1);                 // auto: on
-    poke32(g + 8, 1000000);           // threshold: large (lazy) by default
-    poke32(g + 12, 0);                // bytes_since
-    poke32(g + 16, 0);                // nobjs
-    poke32(g + 20, kmalloc(1024));    // objs[] capacity 256
-    poke32(g + 24, 0);                // nroots
-    poke32(g + 28, kmalloc(256));     // roots[] capacity 64
-    poke32(g + 32, 0);                // collections performed
+    let g = kmalloc(48);
+    if g == 0 { return 0; }
+    let objs = heap_alloc(heap_ctrl, 1024);
+    if objs == 0 { return 0; }
+    let roots = heap_alloc(heap_ctrl, 256);
+    if roots == 0 { heap_free(heap_ctrl, objs); return 0; }
+    poke32(g, heap_ctrl); poke32(g + 4, 1); poke32(g + 8, 1000000);
+    poke32(g + 12, 0); poke32(g + 16, 0); poke32(g + 20, objs);
+    poke32(g + 24, 0); poke32(g + 28, roots); poke32(g + 32, 0);
+    poke32(g + 36, 256); poke32(g + 40, 64);
     return g;
 }
+fn gc_set_auto(g, on) { poke32(g + 4, on); }
+fn gc_set_threshold(g, bytes) { poke32(g + 8, bytes); }
+fn gc_collections(g) { return peek32(g + 32); }
+fn gc_live(g) { return peek32(g + 16); }
 
-// ── Tunables (manual + auto) ─────────────────────────────────────────────────────────
-fn gc_set_auto(g, on) { poke32(g + 4, on); }            // 1 = auto-collect, 0 = manual only
-fn gc_set_threshold(g, bytes) { poke32(g + 8, bytes); } // auto-collect trigger (bytes since last)
-
-// ── Observability (for tuning / proofs) ──────────────────────────────────────────────
-fn gc_collections(g) { return peek32(g + 32); }         // how many collections have run
-fn gc_live(g) { return peek32(g + 16); }                // live object count
-
-// ── Object graph ─────────────────────────────────────────────────────────────────────
-// gc_set_child(obj, i, child) — record an edge obj -> child (child reachable from obj).
-fn gc_set_child(obj, i, child) { poke32(obj + 8 + i * 4, child); }
-
-// gc_add_root(g, obj) — obj is a GC root (always reachable).
-fn gc_add_root(g, obj) {
-    let nr = peek32(g + 24);
-    poke32(peek32(g + 28) + nr * 4, obj);
-    poke32(g + 24, nr + 1);
+// Keep the previous table intact on allocation failure. Arithmetic is bounded by
+// the signed 32-bit allocator ABI, not by a language-wide application limit.
+fn _gc_grow(g, table_offset, count_offset, capacity_offset) {
+    let count = peek32(g + count_offset); let capacity = peek32(g + capacity_offset);
+    if count < capacity { return 1; }
+    if capacity > 268435452 { return 0; }
+    let expanded = capacity * 2; let heap = peek32(g);
+    let table = heap_alloc(heap, expanded * 4);
+    if table == 0 { return 0; }
+    let old = peek32(g + table_offset); let i = 0;
+    while i < count { poke32(table + i * 4, peek32(old + i * 4)); i = i + 1; }
+    poke32(g + table_offset, table); poke32(g + capacity_offset, expanded);
+    heap_free(heap, old);
+    return 1;
 }
-
-// gc_alloc(g, nchildren) — allocate a GC object with room for `nchildren` edges. If
-// auto is on and we're over threshold, collect FIRST (so the new object is never
-// swept by the collection it triggers). Returns the object payload address.
+fn gc_set_child(obj, i, child) {
+    if i < 0 or i >= peek32(obj + 4) { return 0; }
+    poke32(obj + 8 + i * 4, child); return 1;
+}
+fn gc_add_root(g, obj) {
+    if obj == 0 { return 0; }
+    if _gc_grow(g, 28, 24, 40) == 0 { return 0; }
+    let n = peek32(g + 24); poke32(peek32(g + 28) + n * 4, obj);
+    poke32(g + 24, n + 1); return 1;
+}
+// Remove every occurrence; removing a root never collects immediately.
+fn gc_remove_root(g, obj) {
+    let roots = peek32(g + 28); let n = peek32(g + 24); let keep = 0; let i = 0;
+    while i < n {
+        let value = peek32(roots + i * 4);
+        if value != obj { poke32(roots + keep * 4, value); keep = keep + 1; }
+        i = i + 1;
+    }
+    poke32(g + 24, keep); return n - keep;
+}
 fn gc_alloc(g, nchildren) {
+    if nchildren < 0 or nchildren > 536870905 { return 0; }
     let size = 8 + nchildren * 4;
     if peek32(g + 4) == 1 {
         if peek32(g + 12) >= peek32(g + 8) { kernel_gc_collect(g); }
     }
-    let p = heap_alloc(peek32(g + 0), size);
-    poke32(p, 0);                     // mark = 0
-    poke32(p + 4, nchildren);
+    if _gc_grow(g, 20, 16, 36) == 0 { return 0; }
+    let p = heap_alloc(peek32(g), size);
+    if p == 0 { return 0; }
+    poke32(p, 0); poke32(p + 4, nchildren);
     let i = 0;
-    while i < nchildren { poke32(p + 8 + i * 4, 0); i = i + 1; }   // zero edges
-    let n = peek32(g + 16);
-    poke32(peek32(g + 20) + n * 4, p);                            // objs[nobjs++] = p
-    poke32(g + 16, n + 1);
-    poke32(g + 12, peek32(g + 12) + size);                        // bytes_since += size
-    return p;
+    while i < nchildren { poke32(p + 8 + i * 4, 0); i = i + 1; }
+    let n = peek32(g + 16); poke32(peek32(g + 20) + n * 4, p); poke32(g + 16, n + 1);
+    let since = peek32(g + 12);
+    if since > 2147483647 - size { since = 2147483647; } else { since = since + size; }
+    poke32(g + 12, since); return p;
 }
-
-// _gc_mark(obj) — DFS mark obj and everything reachable from it.
-fn _gc_mark(obj) {
-    if obj == 0 { return 0; }
-    if peek32(obj) == 1 { return 0; }     // already marked
-    poke32(obj, 1);
-    let nch = peek32(obj + 4);
-    let i = 0;
-    while i < nch {
-        _gc_mark(peek32(obj + 8 + i * 4));
-        i = i + 1;
-    }
-    return 0;
-}
-
-// kernel_gc_collect(g) — mark roots, sweep unmarked objects, compact
-// the object table, and bump the collection counter. Works whether auto is on or off
-// (this is the MANUAL entry point; auto just calls it for you).
+// Iterative marking: one work item per newly marked object, including cycles.
+// If scratch allocation fails, return -1 without sweeping or resetting counters.
 fn kernel_gc_collect(g) {
-    let objs = peek32(g + 20);
-    let n = peek32(g + 16);
-    // clear marks
-    let i = 0;
+    let heap = peek32(g); let n = peek32(g + 16); let nr = peek32(g + 24); let work = 0;
+    if n > 0 and nr > 0 {
+        work = heap_alloc(heap, n * 4);
+        if work == 0 { return 0 - 1; }
+    }
+    let objs = peek32(g + 20); let i = 0;
     while i < n { poke32(peek32(objs + i * 4), 0); i = i + 1; }
-    // mark from roots
-    let roots = peek32(g + 28);
-    let nr = peek32(g + 24);
+    let roots = peek32(g + 28); let tail = 0;
     i = 0;
-    while i < nr { _gc_mark(peek32(roots + i * 4)); i = i + 1; }
-    // sweep: keep marked (compacting the table), free the rest
-    let hctrl = peek32(g + 0);
-    let keep = 0;
-    i = 0;
-    while i < n {
-        let o = peek32(objs + i * 4);
-        if peek32(o) == 1 {
-            poke32(objs + keep * 4, o);
-            keep = keep + 1;
-        } else {
-            heap_free(hctrl, o);
+    while i < nr {
+        let obj = peek32(roots + i * 4);
+        if obj != 0 and peek32(obj) == 0 {
+            if tail >= n { if work != 0 { heap_free(heap, work); } return 0 - 1; }
+            poke32(obj, 1); poke32(work + tail * 4, obj); tail = tail + 1;
         }
         i = i + 1;
     }
-    poke32(g + 16, keep);             // live count
-    poke32(g + 12, 0);                // reset bytes_since
-    poke32(g + 32, peek32(g + 32) + 1);   // collections++
-    return 0;
+    let head = 0;
+    while head < tail {
+        let obj = peek32(work + head * 4); head = head + 1;
+        let count = peek32(obj + 4); let single = 0;
+        if count == 1 { single = peek32(obj + 8); }
+        // Follow single-edge chains in registers. Branches still use the bounded
+        // work table; marking before advancing terminates self/mutual cycles.
+        while count == 1 and single != 0 and peek32(single) == 0 {
+            poke32(single, 1); obj = single; count = peek32(obj + 4); single = 0;
+            if count == 1 { single = peek32(obj + 8); }
+        }
+        i = 0;
+        while i < count {
+            let child = peek32(obj + 8 + i * 4);
+            if child != 0 and peek32(child) == 0 {
+                if tail >= n { heap_free(heap, work); return 0 - 1; }
+                poke32(child, 1); poke32(work + tail * 4, child); tail = tail + 1;
+            }
+            i = i + 1;
+        }
+    }
+    if work != 0 { heap_free(heap, work); }
+    let keep = 0; i = 0;
+    while i < n {
+        let obj = peek32(objs + i * 4);
+        if peek32(obj) == 1 { poke32(objs + keep * 4, obj); keep = keep + 1; }
+        else { heap_free(heap, obj); }
+        i = i + 1;
+    }
+    poke32(g + 16, keep); poke32(g + 12, 0);
+    poke32(g + 32, peek32(g + 32) + 1); return 0;
 }
-
 export gc_new, gc_set_auto, gc_set_threshold, gc_collections, gc_live;
-export gc_set_child, gc_add_root, gc_alloc, kernel_gc_collect;
+export gc_set_child, gc_add_root, gc_remove_root, gc_alloc, kernel_gc_collect;
