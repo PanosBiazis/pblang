@@ -78,3 +78,6 @@ physical guest-OS performance is inferred from this CPU-only workload.
 Error-preserving cleanup for every direct VM failure, composite ownership,
 identity-safe callable representation, missing host builtins such as JSON parsing,
 full native/FFI replacement and wider platform verification remain outstanding.
+
+Array/map indexed and attribute growth admission is documented separately in
+[Collection growth in bounded execution](SELFHOST_MUTATION_BUDGET.md).
