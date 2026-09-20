@@ -125,6 +125,9 @@ samples. The initial and optimized library revisions are also compared on the
 same workload. The optimized implementation stores callbacks directly in the
 pending array, derives IDs from their positions, and uses private tuples for
 capturing callback outcomes instead of temporary maps. Public reports stay maps.
+The original measurement baseline is preserved in
+[resource_scope_initial.sapp](../bench/fixtures/resource_scope_initial.sapp);
+production callers import `stdlib:resource_scope.sapp` instead.
 
 The benchmark runner uses `for i 50000` and either calls the two cleanup functions
 directly or calls `with_scope` with two `scope.defer(close)` registrations. Each
