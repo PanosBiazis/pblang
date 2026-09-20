@@ -1,12 +1,13 @@
+// pblang:extern kernel_irq_save_disable kernel_irq_restore
 // pblang:target=kernel
 // pblang:extern heap_alloc heap_free
 // Precise PBLang mark/sweep collector for the 32-bit kernel ABI.
 // Roots and edges belong to this collector and must refer to live owned objects.
 // This raw kernel API is not a validator for arbitrary addresses or host VM values.
 // Control: heap +0, auto +4, threshold +8, bytes_since +12, count +16,
-// objects +20, root_count +24, roots +28, collections +32, capacities +36/+40.
+// objects +20, root_count +24, roots +28, collections +32, capacities +36/+40, mark generation +44.
 // Tables grow in the supplied heap; no fixed object/root count limit is imposed.
-fn gc_new(heap_ctrl) {
+fn _guarded_gc_new(heap_ctrl) {
     let g = kmalloc(48);
     if g == 0 { return 0; }
     let objs = heap_alloc(heap_ctrl, 1024);
@@ -16,13 +17,13 @@ fn gc_new(heap_ctrl) {
     poke32(g, heap_ctrl); poke32(g + 4, 1); poke32(g + 8, 1000000);
     poke32(g + 12, 0); poke32(g + 16, 0); poke32(g + 20, objs);
     poke32(g + 24, 0); poke32(g + 28, roots); poke32(g + 32, 0);
-    poke32(g + 36, 256); poke32(g + 40, 64);
+    poke32(g + 36, 256); poke32(g + 40, 64); poke32(g + 44, 0);
     return g;
 }
-fn gc_set_auto(g, on) { poke32(g + 4, on); }
-fn gc_set_threshold(g, bytes) { poke32(g + 8, bytes); }
-fn gc_collections(g) { return peek32(g + 32); }
-fn gc_live(g) { return peek32(g + 16); }
+fn _guarded_gc_set_auto(g, on) { poke32(g + 4, on); }
+fn _guarded_gc_set_threshold(g, bytes) { poke32(g + 8, bytes); }
+fn _guarded_gc_collections(g) { return peek32(g + 32); }
+fn _guarded_gc_live(g) { return peek32(g + 16); }
 
 // Keep the previous table intact on allocation failure. Arithmetic is bounded by
 // the signed 32-bit allocator ABI, not by a language-wide application limit.
@@ -39,18 +40,18 @@ fn _gc_grow(g, table_offset, count_offset, capacity_offset) {
     heap_free(heap, old);
     return 1;
 }
-fn gc_set_child(obj, i, child) {
+fn _guarded_gc_set_child(obj, i, child) {
     if i < 0 or i >= peek32(obj + 4) { return 0; }
     poke32(obj + 8 + i * 4, child); return 1;
 }
-fn gc_add_root(g, obj) {
+fn _guarded_gc_add_root(g, obj) {
     if obj == 0 { return 0; }
     if _gc_grow(g, 28, 24, 40) == 0 { return 0; }
     let n = peek32(g + 24); poke32(peek32(g + 28) + n * 4, obj);
     poke32(g + 24, n + 1); return 1;
 }
 // Remove every occurrence; removing a root never collects immediately.
-fn gc_remove_root(g, obj) {
+fn _guarded_gc_remove_root(g, obj) {
     let roots = peek32(g + 28); let n = peek32(g + 24); let keep = 0; let i = 0;
     while i < n {
         let value = peek32(roots + i * 4);
@@ -59,7 +60,7 @@ fn gc_remove_root(g, obj) {
     }
     poke32(g + 24, keep); return n - keep;
 }
-fn gc_alloc(g, nchildren) {
+fn _guarded_gc_alloc(g, nchildren) {
     if nchildren < 0 or nchildren > 536870905 { return 0; }
     let size = 8 + nchildren * 4;
     if peek32(g + 4) == 1 {
@@ -78,21 +79,29 @@ fn gc_alloc(g, nchildren) {
 }
 // Iterative marking: one work item per newly marked object, including cycles.
 // If scratch allocation fails, return -1 without sweeping or resetting counters.
-fn kernel_gc_collect(g) {
+fn _guarded_kernel_gc_collect(g) {
     let heap = peek32(g); let n = peek32(g + 16); let nr = peek32(g + 24); let work = 0;
     if n > 0 and nr > 0 {
         work = heap_alloc(heap, n * 4);
         if work == 0 { return 0 - 1; }
     }
     let objs = peek32(g + 20); let i = 0;
-    while i < n { poke32(peek32(objs + i * 4), 0); i = i + 1; }
+    let generation = peek32(g + 44);
+    if generation >= 2147483647 {
+        // On wrap, no old mark may equal the reused generation.
+        while i < n { poke32(peek32(objs + i * 4), 0); i = i + 1; }
+        generation = 1;
+    } else { generation = generation + 1; }
+    // Advance before marking: a failed partial pass must not reuse its marks.
+    // Scratch-allocation failure above changes neither marks nor generation.
+    poke32(g + 44, generation);
     let roots = peek32(g + 28); let tail = 0;
     i = 0;
     while i < nr {
         let obj = peek32(roots + i * 4);
-        if obj != 0 and peek32(obj) == 0 {
+        if obj != 0 and peek32(obj) != generation {
             if tail >= n { if work != 0 { heap_free(heap, work); } return 0 - 1; }
-            poke32(obj, 1); poke32(work + tail * 4, obj); tail = tail + 1;
+            poke32(obj, generation); poke32(work + tail * 4, obj); tail = tail + 1;
         }
         i = i + 1;
     }
@@ -103,16 +112,16 @@ fn kernel_gc_collect(g) {
         if count == 1 { single = peek32(obj + 8); }
         // Follow single-edge chains in registers. Branches still use the bounded
         // work table; marking before advancing terminates self/mutual cycles.
-        while count == 1 and single != 0 and peek32(single) == 0 {
-            poke32(single, 1); obj = single; count = peek32(obj + 4); single = 0;
+        while count == 1 and single != 0 and peek32(single) != generation {
+            poke32(single, generation); obj = single; count = peek32(obj + 4); single = 0;
             if count == 1 { single = peek32(obj + 8); }
         }
         i = 0;
         while i < count {
             let child = peek32(obj + 8 + i * 4);
-            if child != 0 and peek32(child) == 0 {
+            if child != 0 and peek32(child) != generation {
                 if tail >= n { heap_free(heap, work); return 0 - 1; }
-                poke32(child, 1); poke32(work + tail * 4, child); tail = tail + 1;
+                poke32(child, generation); poke32(work + tail * 4, child); tail = tail + 1;
             }
             i = i + 1;
         }
@@ -121,12 +130,80 @@ fn kernel_gc_collect(g) {
     let keep = 0; i = 0;
     while i < n {
         let obj = peek32(objs + i * 4);
-        if peek32(obj) == 1 { poke32(objs + keep * 4, obj); keep = keep + 1; }
+        if peek32(obj) == generation { poke32(objs + keep * 4, obj); keep = keep + 1; }
         else { heap_free(heap, obj); }
         i = i + 1;
     }
     poke32(g + 16, keep); poke32(g + 12, 0);
     poke32(g + 32, peek32(g + 32) + 1); return 0;
 }
+// Public operations serialize against maskable interrupts on the current CPU.
+// This is not an SMP lock. The incoming interrupt state is restored on all returns.
+fn gc_new(heap_ctrl) {
+    let flags = kernel_irq_save_disable();
+    let result = _guarded_gc_new(heap_ctrl);
+    kernel_irq_restore(flags); return result;
+}
+fn gc_set_auto(g, on) {
+    let flags = kernel_irq_save_disable();
+    let result = _guarded_gc_set_auto(g, on);
+    kernel_irq_restore(flags); return result;
+}
+fn gc_set_threshold(g, bytes) {
+    let flags = kernel_irq_save_disable();
+    let result = _guarded_gc_set_threshold(g, bytes);
+    kernel_irq_restore(flags); return result;
+}
+fn gc_collections(g) {
+    let flags = kernel_irq_save_disable();
+    let result = _guarded_gc_collections(g);
+    kernel_irq_restore(flags); return result;
+}
+fn gc_live(g) {
+    let flags = kernel_irq_save_disable();
+    let result = _guarded_gc_live(g);
+    kernel_irq_restore(flags); return result;
+}
+fn gc_set_child(obj, i, child) {
+    let flags = kernel_irq_save_disable();
+    let result = _guarded_gc_set_child(obj, i, child);
+    kernel_irq_restore(flags); return result;
+}
+fn gc_add_root(g, obj) {
+    let flags = kernel_irq_save_disable();
+    let result = _guarded_gc_add_root(g, obj);
+    kernel_irq_restore(flags); return result;
+}
+fn gc_remove_root(g, obj) {
+    let flags = kernel_irq_save_disable();
+    let result = _guarded_gc_remove_root(g, obj);
+    kernel_irq_restore(flags); return result;
+}
+fn gc_alloc(g, nchildren) {
+    let flags = kernel_irq_save_disable();
+    let result = _guarded_gc_alloc(g, nchildren);
+    kernel_irq_restore(flags); return result;
+}
+fn kernel_gc_collect(g) {
+    let flags = kernel_irq_save_disable();
+    let result = _guarded_kernel_gc_collect(g);
+    kernel_irq_restore(flags); return result;
+}
+
+// Publish ownership before restoring interrupts. If root-table growth fails,
+// roll back the unpublished allocation while still holding the same section.
+fn gc_alloc_rooted(g, nchildren) {
+    let flags = kernel_irq_save_disable();
+    let obj = _guarded_gc_alloc(g, nchildren);
+    if obj != 0 {
+        if _guarded_gc_add_root(g, obj) == 0 {
+            poke32(g + 16, peek32(g + 16) - 1);
+            heap_free(peek32(g), obj); obj = 0;
+        }
+    }
+    kernel_irq_restore(flags); return obj;
+}
+
 export gc_new, gc_set_auto, gc_set_threshold, gc_collections, gc_live;
+export gc_alloc_rooted;
 export gc_set_child, gc_add_root, gc_remove_root, gc_alloc, kernel_gc_collect;
