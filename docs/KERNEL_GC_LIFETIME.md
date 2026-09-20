@@ -10,7 +10,8 @@ The tables now grow geometrically in the supplied free-list heap; old metadata
 is freed after copying, and failed growth leaves the prior table/count intact.
 `gc_new`, `gc_alloc` and failed root registration return zero on recoverable arena
 allocation failure. Their callers must check results before publishing pointers
-or continuing a rooted allocation sequence. Successful `gc_add_root` and
+or continuing an unrooted allocation sequence. Use `gc_alloc_rooted` for atomic
+allocation and root registration when interrupt-side collection is possible. Successful `gc_add_root` and
 `gc_set_child` now explicitly return 1. Invalid child indexes return 0.
 
 Reachability traversal is iterative, so native call-stack depth no longer grows
@@ -75,12 +76,13 @@ lint passes. This limitation was not hidden by inventing host implementations.
 See [the focused automatic-lifetime review](AUTOMATIC_LIFETIME_REVIEW.md).
 The collector is precise only when the kernel supplies valid owned pointers,
 complete roots and serialized access. It does not scan the machine stack,
-validate arbitrary addresses, isolate hostile code, or synchronize interrupt
-handlers/other threads. A caller must keep any value needed after a possible
+validate arbitrary addresses or isolate hostile code. Public collector/heap
+operations now serialize maskable interrupts on the current CPU; see the narrow
+contract below. They do not synchronize other CPUs or arbitrary native writes. A caller must keep any value needed after a possible
 collection rooted before another allocation can trigger automatic collection.
 No thread-wide retained-host destructive GC has been enabled.
 
-## Measured tradeoffs
+## Historical measurements before IRQ serialization
 
 Benchmark source: `bench/kernel_gc_collect.sapp`. Baseline is
 `4d35860:stdlib/kernel/gc.sapp`; both variants use the same 128-object rooted ring
@@ -108,10 +110,94 @@ in a separate run; [its samples](evidence/kernel-gc-initial-2026-09-20.json) are
 retained. Run-to-run baselines changed, so the two runs are not a controlled
 speed comparison with one another.
 
-This is a correctness/scalability change with a measured small-graph CPU cost,
-not a universal optimization. Efficient concurrent collection, generic object
-lifetime, ordinary runtime integration and physical-platform benchmarks remain
-open. No EnterpriseOrg server was used.
+These are historical process measurements, not isolated algorithm costs. The
+follow-up layout control below demonstrates that QEMU code/data placement
+substantially affects this fixture. The earlier +26.3% result must not be treated
+as a general GC overhead estimate. No EnterpriseOrg server was used.
 
 Graphify refresh was attempted and stopped at its 35-second budget. It does not
 provide semantic verification for this PBLang kernel source.
+
+## Mark generations and interrupt serialization, 2026-09-20
+
+Ordinary collections now use a generation at control offset 44 instead of clearing
+all object marks first. Header/control sizes are unchanged. Generation advances
+before marking, including a pass that fails after partial marking. A scratch
+allocation failure leaves it unchanged. At signed-32-bit generation wrap, all
+owned marks are cleared before generation 1 is reused. New objects start at 0.
+The wrap traversal is rare, but its cost has not disappeared.
+
+Public collector and free-list heap operations preserve the incoming x86 IF bit,
+disable maskable interrupts and restore the saved state on return. Nested calls
+and failure returns preserve IF=0. The existing PBLang C backend emits two small
+CPU primitives with compiler memory barriers; product changes remain PBLang
+source. This is a **single-active-CPU kernel contract**, not an SMP mutex or a
+solution for NMI, DMA, foreign writes or malicious raw pointers. The underscore
+helpers are implementation internals and must not be called independently.
+
+`gc_alloc_rooted(g, child_count)` returns an allocated, registered root, or 0.
+Root-table growth failure rolls back the new object while still in the same
+critical section. The cumulative allocation-work counter can still increase on
+this failed attempt. Root/table capacity is not shrunk. Remove the root only
+when no caller will subsequently use the object. Existing `gc_alloc` still
+returns an **unrooted** object: callers must protect the entire publication
+sequence or use the new API. Two independently guarded calls do not make such
+a sequence atomic. Complete roots, valid pointers and ownership remain required.
+
+Collection masks interrupts for its complete duration, including traversal and
+sweeping. This delays interrupt delivery; pause latency is not bounded to a
+real-time deadline or measured by the throughput benchmark. Arbitrary `kmalloc`
+users, direct `poke32` mutations and multiple CPUs need their own discipline.
+No automatic collection has been activated for PB-MCP or foreign runtimes.
+
+The free-list allocator also refuses negative payload sizes and values above
+2147483632 before list access, avoiding signed-32-bit header/alignment overflow.
+This is an ABI arithmetic bound, not a new source/project size limit. It still
+requires valid initialized arenas and valid, owned, not-already-freed pointers.
+General invalid-pointer/double-free validation is outside this change.
+
+### Current verification
+
+Three kernel fixtures passed on both qemu64 and 486 (six positive cases): the
+existing cycle/growth fixture; `examples/kernel_gc_generations.sapp` for partial
+mark failure/retry, stale marks, wrap and repeated collection; and
+`examples/kernel_gc_interrupts.sapp` for actual PIT IRQ0 collection interleaved
+with main-code use, nested IF preservation, failure paths, atomic root-publication
+rollback and allocator overflow refusal without altering a nonempty free list.
+The interrupt fixture deliberately waits for timer collection between publishing
+an object and reading it again. It prepends heap, collector, interrupts and timer.
+These tests use one virtual CPU and do not prove SMP safety or physical-device
+compatibility. Twenty-one related suites, build, two native lint checks and five
+kernel diagnostics checks passed. Native compiler lint retains its pre-existing
+unused `valid_timeout` warning. No new persistent background service is required.
+
+### Controlled performance follow-up
+
+The unchanged 128-object/50000-collection workload compared `fc508ac` heap+GC
+against the new heap+GC, including the new guards. Both use the same current
+transpiler and optimization flags from the earlier benchmark. Two warmups and
+five measured samples per variant alternate order. The default-linker run gave
+8.03 / 0.24 seconds median QEMU CPU, but **this is not a 97% GC algorithm speedup**.
+The old heap begins at 0x100e20 in the page containing collector code; the new
+heap starts at 0x1015a0. This is consistent with QEMU translation invalidation
+from code/data sharing a page, rather than comparable native CPU execution.
+
+A second control applies exactly `ALIGN(4096)` before `.bss` in the linker script
+for **both** variants, leaving the workload unchanged. Median CPU is 0.16 / 0.16
+seconds. This linker adjustment is only a benchmark control; it is not silently
+applied to product builds. To reduce startup and timing-resolution noise, a
+third control replaces both occurrences of 50000 with 500000 in the same fixture
+for both variants (loop and success assertion). It measures median CPU
+1.48 / 1.35 seconds (about 8.8% lower), nearest-rank p95 1.86 / 1.36 seconds.
+Samples vary substantially, so this is workload-specific evidence, not a general
+speed guarantee. Median QEMU RSS in that control is 59168 / 59380 KiB (about
+0.36% higher); general RAM savings are not demonstrated. ELF size is
+8860 / 11156 bytes (+2296). Collector frame estimates are 48 bytes before,
+52 bytes for the new helper plus a 12-byte wrapper; these are not peak stack
+measurements. Graph traversal remains nonrecursive.
+
+Raw samples and build settings are retained for all three runs:
+[default layout](evidence/kernel-gc-irq-default-layout-2026-09-20.json),
+[aligned layout](evidence/kernel-gc-irq-aligned-layout-2026-09-20.json),
+[aligned longer workload](evidence/kernel-gc-irq-aligned-extended-2026-09-20.json).
+No GPU/NPU, power, physical storage I/O or installed PB-MCP improvement is claimed.
