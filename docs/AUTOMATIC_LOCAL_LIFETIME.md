@@ -98,6 +98,9 @@ This is not full automatic memory management for every PBLang runtime:
 - Explicit `memory_alloc` handles, FFI buffers, files, sockets, device allocations
   and resource destructors are outside ordinary local-reference cleanup. Replacing
   a numeric owner handle with nil does not invoke `memory_free`.
+  [Resource scopes](RESOURCE_SCOPES.md) now offer automatic cleanup of explicitly
+  registered callbacks, including after catchable implicit exceptions; general
+  compiler-inserted resource ownership is still unfinished.
 - Values are cleaned at scope exit, not at a proven last read within a live
   scope. No arbitrary time-based deletion or suspension of live objects occurs.
 - Local-slot storage is not shrunk. Additional stores can materialize nil slots
