@@ -84,6 +84,9 @@ fn CodeGen() {
         next_slot: 0,     // monotonic local-slot counter (slots are never reused)
         parent: nil,      // enclosing CodeGen (for upvalue resolution), nil at top
         upvalues: [],     // [{index, is_local}] captured by THIS function
+        captured_slots: map{}, // conservative across native/reference captures
+        cleanup_writes: map{}, // earlier cleanup stores patchable on later capture
+        cleanup_nil: -1,
         exports: [],      // names listed in `export ...;` statements (module API)
     };
 }
@@ -119,7 +122,7 @@ fn codegen_global_let(cg, node) {
 }
 
 // ── Loop control (break/continue) bookkeeping ───────────────────────────
-fn _loop_push(cg) { array_push(cg.loops, map{ breaks: [], continues: [] }); }
+fn _loop_push(cg) { array_push(cg.loops, map{ breaks: [], continues: [], depth: cg.scope_depth }); }
 fn _loop_pop(cg) { return array_pop(cg.loops); }
 fn _loop_cur(cg) { return cg.loops[len(cg.loops) - 1]; }
 
@@ -131,12 +134,14 @@ fn _patch_all(cg, idxs, target) {
 
 fn codegen_break(cg) {
     if len(cg.loops) == 0 { return; }
+    _cleanup_deeper_than(cg, _loop_cur(cg).depth);
     let idx = len(cg.chunk.instructions);
     chunk_write_op(cg.chunk, OP_JUMP, 0);
     array_push(_loop_cur(cg).breaks, idx);
 }
 fn codegen_continue(cg) {
     if len(cg.loops) == 0 { return; }
+    _cleanup_deeper_than(cg, _loop_cur(cg).depth);
     let idx = len(cg.chunk.instructions);
     chunk_write_op(cg.chunk, OP_JUMP, 0);
     array_push(_loop_cur(cg).continues, idx);
@@ -156,11 +161,39 @@ fn codegen_begin_scope(cg) {
     cg.scope_depth = cg.scope_depth + 1;
 }
 
+// Drop only this local reference. The value on the operand stack, aliases,
+// global values and captured slots must remain intact. No destructors are called.
+fn _cleanup_slot(cg, slot) {
+    let key = str(slot);
+    if map_has(cg.captured_slots, key) { return; }
+    if cg.cleanup_nil < 0 { cg.cleanup_nil = chunk_add_constant(cg.chunk, nil); }
+    chunk_write_op(cg.chunk, OP_CONSTANT, cg.cleanup_nil);
+    let store = map{op: OP_SET_LOCAL, operand: slot};
+    chunk_write(cg.chunk, store);
+    if not map_has(cg.cleanup_writes, key) { cg.cleanup_writes[key] = []; }
+    array_push(cg.cleanup_writes[key], store);
+}
+fn _cleanup_deeper_than(cg, depth) {
+    for local in cg.locals {
+        if local.depth > depth { _cleanup_slot(cg, local.slot); }
+    }
+}
+fn _capture_slot(cg, slot) {
+    let key = str(slot);
+    cg.captured_slots[key] = true;
+    // A capture later in a loop can outlive an earlier break/continue path.
+    // Neutralize earlier stores without moving any branch targets.
+    if map_has(cg.cleanup_writes, key) {
+        for store in cg.cleanup_writes[key] { store.op = OP_POP; store.operand = 0; }
+    }
+}
+
 /// End current scope (pop locals)
 fn codegen_end_scope(cg) {
     let i = len(cg.locals) - 1;
     while i >= 0 {
         if cg.locals[i].depth == cg.scope_depth {
+            _cleanup_slot(cg, cg.locals[i].slot);
             array_pop(cg.locals);
         }
         i = i - 1;
@@ -209,7 +242,7 @@ fn codegen_resolve_upvalue(cg, name) {
     if cg.parent == nil { return -1; }
     // Captured directly from the enclosing function's locals?
     let plocal = _resolve_local_only(cg.parent, name);
-    if plocal >= 0 { return _add_upvalue(cg, plocal, true); }
+    if plocal >= 0 { _capture_slot(cg.parent, plocal); return _add_upvalue(cg, plocal, true); }
     // Otherwise, captured transitively through the enclosing function's upvalues.
     let puv = codegen_resolve_upvalue(cg.parent, name);
     if puv >= 0 { return _add_upvalue(cg, puv, false); }
@@ -317,6 +350,8 @@ fn codegen_try(cg, node) {
     body_cg.next_slot = cg.next_slot;
     body_cg.parent = cg.parent;
     body_cg.upvalues = cg.upvalues;
+    body_cg.captured_slots = cg.captured_slots;
+    body_cg.cleanup_writes = cg.cleanup_writes;
     codegen_expr(body_cg, node.body);
     chunk_write_op(body_cg.chunk, OP_RETURN, 0);
     cg.next_slot = body_cg.next_slot;
@@ -329,6 +364,8 @@ fn codegen_try(cg, node) {
     // Share descriptors so captures first discovered in either subchunk are
     // also included in the enclosing function's closure constant.
     handler_cg.upvalues = cg.upvalues;
+    handler_cg.captured_slots = cg.captured_slots;
+    handler_cg.cleanup_writes = cg.cleanup_writes;
     codegen_expr(handler_cg, node.handler);
     chunk_write_op(handler_cg.chunk, OP_RETURN, 0);
     cg.next_slot = handler_cg.next_slot;
@@ -379,8 +416,7 @@ fn codegen_match(cg, node) {
     codegen_expr(cg, node["scrutinee"]);
     // Reserve storage without registering a source-visible identifier. The
     // subject is accessed by slot only, so no user name can capture this temp.
-    let tmp = cg.next_slot;
-    cg.next_slot = cg.next_slot + 1;
+    let tmp = codegen_declare_local(cg, nil);
     chunk_write_op(cg.chunk, OP_SET_LOCAL, tmp);
 
     let end_jumps = [];   // JUMP-to-end instruction indices, patched at the end
@@ -417,19 +453,19 @@ fn codegen_match(cg, node) {
         }
 
         codegen_expr(cg, arm["body"]);
+        let arm_locals = [];
+        for local in cg.locals { if local.depth == cg.scope_depth { array_push(arm_locals, local.slot); } }
+        codegen_end_scope(cg);
         let ej = len(cg.chunk.instructions);
         chunk_write_op(cg.chunk, OP_JUMP, 0);
         array_push(end_jumps, ej);
-        // Removes name resolution entries only. Monotonic runtime slots and
-        // captured closure descriptors remain valid after leaving this scope.
-        codegen_end_scope(cg);
-
         if next_jump >= 0 {
             cg.chunk.instructions[next_jump]["operand"] = len(cg.chunk.instructions);
         }
         if guard_jump >= 0 {
             cg.chunk.instructions[guard_jump]["operand"] = len(cg.chunk.instructions);
         }
+        for slot in arm_locals { _cleanup_slot(cg, slot); }
         ai = ai + 1;
     }
 
@@ -825,11 +861,9 @@ fn codegen_for(cg, node) {
     codegen_begin_scope(cg);
     // Bounds resolve in the enclosing environment, just as in typeck.
     codegen_expr(cg, node.end);
-    let bound_slot = cg.next_slot;
-    cg.next_slot = cg.next_slot + 1;
+    let bound_slot = codegen_declare_local(cg, nil);
     chunk_write_op(cg.chunk, OP_SET_LOCAL, bound_slot);
-    let slot = cg.next_slot;
-    cg.next_slot = cg.next_slot + 1;
+    let slot = codegen_declare_local(cg, nil);
     let zero_idx = chunk_add_constant(cg.chunk, 0);
     chunk_write_op(cg.chunk, OP_CONSTANT, zero_idx);
     chunk_write_op(cg.chunk, OP_SET_LOCAL, slot);
@@ -869,12 +903,10 @@ fn codegen_for_in(cg, node) {
     // Evaluate in the enclosing lexical environment, before the loop binder.
     // Internal array/index slots have no names that user code can capture.
     codegen_expr(cg, node.iter);
-    let arr_slot = cg.next_slot;
-    cg.next_slot = cg.next_slot + 1;
+    let arr_slot = codegen_declare_local(cg, nil);
     chunk_write_op(cg.chunk, OP_SET_LOCAL, arr_slot);
 
-    let idx_slot = cg.next_slot;
-    cg.next_slot = cg.next_slot + 1;
+    let idx_slot = codegen_declare_local(cg, nil);
     let zero_idx = chunk_add_constant(cg.chunk, 0);
     chunk_write_op(cg.chunk, OP_CONSTANT, zero_idx);
     chunk_write_op(cg.chunk, OP_SET_LOCAL, idx_slot);
@@ -919,12 +951,10 @@ fn codegen_for_in(cg, node) {
 fn codegen_for_range(cg, node) {
     codegen_begin_scope(cg);
     codegen_expr(cg, node.start);
-    let slot = cg.next_slot;
-    cg.next_slot = cg.next_slot + 1;
+    let slot = codegen_declare_local(cg, nil);
     chunk_write_op(cg.chunk, OP_SET_LOCAL, slot);
     codegen_expr(cg, node.end);
-    let bound_slot = cg.next_slot;
-    cg.next_slot = cg.next_slot + 1;
+    let bound_slot = codegen_declare_local(cg, nil);
     chunk_write_op(cg.chunk, OP_SET_LOCAL, bound_slot);
     let var_slot = codegen_declare_local(cg, node.name);
 
