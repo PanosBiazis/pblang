@@ -1,0 +1,86 @@
+// pblang:target=kernel
+// pblang:extern fixture_cpu_id fixture_apic_base fixture_prepare_ap addr_of _kernel_memory_enter _kernel_memory_leave kernel_memory_try_lock kernel_memory_unlock kernel_spin_wait heap_init gc_new gc_set_auto gc_set_threshold gc_alloc_rooted gc_set_child gc_remove_root gc_live gc_collections kernel_gc_collect kernel_gc_try_collect idt_set_gate idt_load pic_remap pic_mask pic_eoi pit_init
+// QEMU-only fixture. Generate with tests/tooling/kernel_gc_smp_generate.sapp.
+// Owns low memory 0x7000..0x8fff, PIT channel 2 and APIC IDs 0/1; no host execution.
+fn require(ok, code) { if not ok {outb(244,code);while 1>0 {hlt();}} }
+fn wait_word(address, value) {
+    let i=0;while peek32(address)!=value and i<100000000 {kernel_spin_wait();i=i+1;}
+    return peek32(address)==value;
+}
+fn delay_us(us) {
+    // Round upward using a conservative PIT rate without overflowing 32-bit math.
+    if us<1 or us>50000 {return 0;}
+    let old=inb(97);let count=(us*1194+999)/1000;
+    outb(97,bit_and(old,252));outb(67,176);outb(66,bit_and(count,255));outb(66,bit_shr(count,8));
+    outb(97,bit_or(bit_and(old,252),1));
+    let i=0;while bit_and(inb(97),32)==0 and i<10000000 {i=i+1;}
+    let done=bit_and(inb(97),32)!=0;outb(97,old);return done;
+}
+fn send_ipi(base, command) {
+    let i=0;while bit_and(peek32(base+768),4096)!=0 and i<1000000 {kernel_spin_wait();i=i+1;}
+    if i>=1000000 {return 0;}
+    poke32(base+784,16777216);poke32(base+768,command);
+    i=0;while bit_and(peek32(base+768),4096)!=0 and i<1000000 {kernel_spin_wait();i=i+1;}
+    if i>=1000000 {return 0;}return 1;
+}
+fn exercise(g, counter) {
+    let i=0;
+    while i<2000 {
+        let obj=gc_alloc_rooted(g,1);require(obj!=0,20);
+        require(gc_set_child(obj,0,obj)==1,21);
+        let status=kernel_gc_try_collect(g);require(status==0 or status==1,22);
+        require(peek32(obj+8)==obj,23);
+        require(gc_remove_root(g,obj)==1,24);i=i+1;poke32(counter,i);
+    }
+}
+fn isr_tick() {poke32(28720,peek32(28720)+1);pic_eoi();}
+fn ap_main() {
+    require(fixture_cpu_id()==1,11);poke32(28688,1);
+    require(wait_word(28692,1),12);
+    // BSP owns the lock: try-collect must return without traversing or waiting.
+    require(kernel_gc_try_collect(peek32(28672))==1,13);poke32(28696,1);
+    require(wait_word(28700,1),14);
+    exercise(peek32(28672),28708);poke32(28712,1);
+    require(wait_word(28716,1),27);
+    let flags=_kernel_memory_enter();poke32(28724,1);
+    // BSP must service at least three IRQs while waiting for our lock.
+    let i=0;while peek32(28720)<3 and i<10000000 {kernel_spin_wait();i=i+1;}
+    require(peek32(28720)>=3,28);_kernel_memory_leave(flags);poke32(28728,1);
+    require(wait_word(28732,1),33);
+    flags=_kernel_memory_enter();let ticks=peek32(28720);poke32(28736,1);
+    require(delay_us(5000),34);require(peek32(28720)==ticks,35);
+    _kernel_memory_leave(flags);poke32(28740,1);
+    while 1>0 {hlt();}
+}
+fn kmain() {
+    cli();require(fixture_cpu_id()==0,2);
+    require(delay_us(0)==0 and delay_us(50001)==0,40);
+    let base=fixture_apic_base();require(base!=0,3);
+    let i=0;while i<96 {poke8(28672+i,0);i=i+1;}
+    let ctrl=kmalloc(8);let arena=kmalloc(131072);heap_init(ctrl,arena,131072);
+    let g=gc_new(ctrl);require(g!=0,4);gc_set_auto(g,1);gc_set_threshold(g,1);poke32(28672,g);
+    let stack=kmalloc(32768);require(fixture_prepare_ap(addr_of("ap_main"),stack+32768)==1,5);
+    // Enable the local APIC, then target INIT and SIPI at APIC ID 1 only.
+    poke32(base+240,bit_or(peek32(base+240),511));
+    require(send_ipi(base,17664)==1,6);require(delay_us(10000),7);
+    require(send_ipi(base,17928)==1,8);require(delay_us(200),9);
+    if peek32(28688)!=1 {require(send_ipi(base,17928)==1,10);}
+    require(wait_word(28688,1),15);
+    let before=gc_collections(g);let flags=_kernel_memory_enter();
+    poke32(28692,1);require(wait_word(28696,1),16);
+    require(peek32(g+32)==before,17);_kernel_memory_leave(flags);
+    poke32(28700,1);exercise(g,28704);require(wait_word(28712,1),18);
+    require(peek32(28704)==2000 and peek32(28708)==2000,19);
+    let idt=kmalloc(2048);pic_remap();pic_mask(254,255);
+    idt_set_gate(idt,32,addr_of("isr_tick"),8,142);idt_load(idt);pit_init(1193);
+    poke32(28716,1);require(wait_word(28724,1),29);
+    sti();flags=_kernel_memory_enter();require(bit_and(flags,512)!=0,30);
+    require(peek32(28720)>=3,31);_kernel_memory_leave(flags);cli();
+    require(wait_word(28728,1),32);
+    let ticks=peek32(28720);poke32(28732,1);require(wait_word(28736,1),36);
+    flags=_kernel_memory_enter();require(bit_and(flags,512)==0,37);
+    require(peek32(28720)==ticks,38);_kernel_memory_leave(flags);
+    require(wait_word(28740,1),39);
+    require(kernel_gc_collect(g)==0 and gc_live(g)==0,25);
+    require(peek32(g+24)==0,26);outb(244,42);while 1>0 {hlt();}
+}

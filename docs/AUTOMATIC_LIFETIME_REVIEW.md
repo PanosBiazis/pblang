@@ -11,7 +11,7 @@ executed for this review. No Specisoft server was accessed.
 | `resource_scope` | Result envelope snapshot precedes cleanup; callback removed before invocation; registration closes before cleanup; later callbacks run after a failure | Trusted synchronous callbacks only; payload/error objects retain shared aliases; no thread exclusion, deadline or general OOM guarantee |
 | `latest_updates` | Batch detaches before callbacks; reentrant updates go to the next batch; recursive flush/discard refused; failed work is not replayed | Shared payloads remain mutable; unbounded distinct keys can consume memory; it is not a permission-check queue or an ordered-event journal |
 | `memory_owned` | Scope-depth/token mismatches are detected; normal/error scalar cleanup preserves caller scope in tested cases; escaped freed handle becomes invalid | Raw handles/builtins are available to callbacks; this is not isolation from malicious callbacks; composite/native ownership and general exceptions remain incomplete |
-| Kernel GC | Table capacity/size checks, failed allocation before writes, no sweep after scratch failure, iterative traversal, generation retry/wrap, cycle reclamation, shared atomic lock with IRQ preservation, atomic rooted allocation, size-overflow refusal and constructor-failure rollback | Raw pointer validity and owner identity are supplied by the kernel; SMP boot remains unverified, NMI/DMA and external mutation are not covered |
+| Kernel GC | Table capacity/size checks, failed allocation before writes, no sweep after scratch failure, iterative traversal, generation retry/wrap, cycle reclamation, shared atomic lock with IRQ preservation, atomic rooted allocation, size-overflow refusal and constructor-failure rollback | Raw pointer validity and owner identity are supplied by the kernel; two-vCPU bootstrap tested, general SMP OS/NMI/DMA and external mutation are not covered |
 | Retained GC | Standard-library destructive collection remains refused because same-thread nested VM roots are incomplete | Specialized desktop maintenance does not prove a safe general collector |
 
 ## TOCTOU and concurrency
@@ -35,17 +35,21 @@ remains unrooted, requiring caller-managed publication and complete roots.
 owner holds the lock, and restores IF. The native concurrency harness verifies
 this with a separate thread while the main thread deliberately holds the lock.
 If admitted, it still performs a complete collection; it is not an incremental
-collector or a real-time deadline guarantee. Blocking operations may spin with
-local interrupts disabled. The single global lock serializes independent arenas
+collector or a real-time deadline guarantee. After failed acquisition, blocking operations restore the original IF while
+polling and disable IRQs again before retrying. Already-masked callers remain
+masked; interruptible callers can service IRQs while another CPU owns the lock. The single global lock serializes independent arenas
 and has no fairness or bounded-wait guarantee. Raw invalid pointers/faults or
 NMI reentry while holding it can prevent progress; it is not hostile-code isolation.
 
 The atomic primitives and emitted PBLang algorithms passed a four-host-thread
 harness, and 32-bit kernel IRQ behavior passed QEMU qemu64/486. The native harness
 uses a 64-bit host ABI, checked low-address arenas and a thread-local IF test seam;
-it is not an SMP kernel boot. Full AP startup, per-CPU stacks/interrupt tables,
-physical-device behavior, NMI/DMA, raw writes and foreign-runtime synchronization
-remain unverified or unsupported. See `KERNEL_GC_PARALLEL.md`.
+it is not an SMP kernel boot. A separate QEMU fixture now boots APIC ID 1 from
+real mode with its own stack, exercises the shared GC with BSP ID 0, and verifies
+IRQ progress and masked-state preservation under contention. The old wait path
+fails the IRQ-progress case. General topology discovery, AP interrupt handling,
+more than two CPUs, physical-device behavior, NMI/DMA, raw writes and foreign
+runtimes remain unverified or unsupported. See `KERNEL_GC_SMP.md`.
 
 Failed `gc_new` now frees its 48-byte control payload and any earlier metadata
 through the free-list heap. Ten thousand failed constructions in a small arena
