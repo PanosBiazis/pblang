@@ -133,3 +133,6 @@ No installed PB-MCP transport or Specisoft server was used or modified.
 
 Graphify update exceeded its 35-second budget; the owned process group was
 stopped. Its graph does not establish semantic coverage of these PBLang modules.
+
+For the subsequent direct try/catch dispatch and single-edge traversal changes,
+see [try and chain cost follow-up](TRY_AND_CHAIN_COST.md).

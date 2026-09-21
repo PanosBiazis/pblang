@@ -139,3 +139,6 @@ No Specisoft server was used. Unrelated local files were preserved.
 
 Graphify update timed out after 35 seconds; owned process group stopped. Its output does not establish semantic
 coverage of these PBLang modules.
+
+For the subsequent direct try/catch dispatch and single-edge traversal changes,
+see [try and chain cost follow-up](TRY_AND_CHAIN_COST.md).
