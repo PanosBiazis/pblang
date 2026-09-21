@@ -126,6 +126,10 @@ the single-vCPU QEMU command to read the count. Repeat with `-cpu 486` using the
 32-bit QEMU executable. Kernel tests remain QEMU-only, not host executables or
 installed guest operating systems; existing linker RWX warnings remain unresolved.
 
+For the subsequent mark-phase optimization, see
+[leaf queue elimination](KERNEL_GC_LEAF_MARKING.md). The measurements above
+remain the historical results for free-list cursor reuse.
+
 ## Remaining work
 
 Monotone free sequences avoid repeatedly visiting earlier free-list nodes;
