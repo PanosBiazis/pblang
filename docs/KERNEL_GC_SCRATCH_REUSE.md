@@ -156,3 +156,6 @@ server was used or modified.
 
 Graphify updates exceeded their 35-second budgets; the owned process groups
 were stopped. Graph output is not semantic coverage of these PBLang modules.
+
+For a later comparison that retains scratch reuse and removes redundant
+allocator successor recovery, see [resource-cost follow-up](RESOURCE_COST_FOLLOWUP.md).
