@@ -115,6 +115,10 @@ include a more complicated mixed-sweep optimization that was simplified; its
 rootless series briefly overlapped a diagnostic process. Use the final series
 for conclusions rather than comparing different series as a controlled speedup.
 
+For the next improvement to reclamation in fragmented heaps, see
+[free-list cursor reuse](KERNEL_GC_FREE_CURSOR.md). The measurements above remain
+the historical results of all-live sweep elimination.
+
 ## Remaining work
 
 Traversal and reclamation still execute under one lock. Incremental work needs
