@@ -159,3 +159,7 @@ were stopped. Graph output is not semantic coverage of these PBLang modules.
 
 For a later comparison that retains scratch reuse and removes redundant
 allocator successor recovery, see [resource-cost follow-up](RESOURCE_COST_FOLLOWUP.md).
+
+For the later no-root reclamation path, see
+[rootless sweep](KERNEL_GC_ROOTLESS_SWEEP.md). It preserves this rooted scratch
+strategy and does not enable collection in the retained host.
