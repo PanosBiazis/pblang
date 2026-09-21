@@ -74,12 +74,15 @@ not copied. No contents are logged, serialized or persisted by this library.
   remains a caller/runtime responsibility. Registering the same resource twice
   creates two independent cleanup obligations; handle identity is not inferred.
 - This is automatic cleanup **within this API**, not universal compiler-inserted
-  cleanup of all resources. Existing modules and PB-MCP do not automatically
-  import this optional library; no PB-MCP performance improvement is claimed.
+  cleanup of all resources. Other modules do not automatically import this optional library. The PB-MCP
+  GTK viewer explicitly uses it; the current installed integration and measured
+  scope are recorded in [allocation cost](RESOURCE_SCOPE_ALLOCATION_COST.md).
 - Cyclic references, implicit-error diagnostic capture in the general runtime,
   general destructor/FFI ownership and independent backends remain open work.
-  Retained thread-wide cycle collection remains disabled because complete roots
-  across suspended callers cannot currently be proven.
+  General retained-thread cycle collection cannot be treated as owner-isolated:
+  complete roots across suspended callers cannot currently be proven. The
+  optional `runtime_gc` facade refuses that operation; existing desktop
+  maintenance uses a separate retained-host collection path, unchanged here.
 
 ## Verification
 
@@ -122,7 +125,7 @@ measures the cost of that additional behavior, not a speedup claim.
 Two warmups and seven alternating measured processes per variant; GNU time records
 process CPU (user + system), wall time and peak RSS. P95 is the largest of seven
 samples. The initial and optimized library revisions are also compared on the
-same workload. The optimized implementation stores callbacks directly in the
+same workload. The earlier optimized implementation stores callbacks directly in the
 pending array, derives IDs from their positions, and uses private tuples for
 capturing callback outcomes instead of temporary maps. Public reports stay maps.
 The original measurement baseline is preserved in
@@ -151,3 +154,9 @@ or general RAM-saving claim. This synthetic workload uses exceptionally cheap
 callbacks; actual file/database/device workloads and PB-MCP must be measured
 separately. Retained-host weak allocation registries can also grow during long
 runs even after resource cleanup; this library does not repair host heap GC.
+
+## Current allocation follow-up
+
+[Callback allocation cost and installed desktop integration](RESOURCE_SCOPE_ALLOCATION_COST.md)
+replaces the earlier private tuples with exception state on the existing ledger,
+including mixed-failure measurements and current compatibility limits.
