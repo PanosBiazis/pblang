@@ -8,10 +8,11 @@ references are still terminated by the current mark generation.
 
 This automatically applies to explicit and automatic kernel collection, with no
 new public API, configuration requirement, object-count limit or persistent heap
-metadata. The existing temporary work allocation remains `owned_count * 4` when
-roots and owned objects are present. Fewer queue writes do **not** mean that this
-scratch allocation has been reduced. A leaf-only rooted graph can still encounter
-scratch OOM under the unchanged allocation policy.
+metadata. This leaf-queue change alone retained the `owned_count * 4` temporary
+allocation. The subsequent [scratch reuse change](KERNEL_GC_SCRATCH_REUSE.md)
+borrows unused ownership-table slots when the full queue fits; otherwise separate
+scratch allocation and its possible OOM remain. Fewer queue writes alone do not
+prove less allocated memory. The measurements below describe the earlier change.
 
 ## Invariants and review
 
