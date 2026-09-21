@@ -105,11 +105,14 @@ fn sample() {
 print sample();
 ```
 
-The retained runner prints `true`, but `frontend_run` prints `false` on the
-same source. A scalar flag in that catch cannot be relied on across these
-frontends yet. Using the already-private mutable ledger preserves behavior
+At baseline `53722e7`, the retained runner prints `true`, but `frontend_run` prints `false` on the
+same source. At that baseline, a scalar flag in that catch could not be relied
+on across these frontends. Using the already-private mutable ledger preserves behavior
 in both, as the expanded contract tests verify. The general compiler issue is
-recorded here, not claimed fixed. Original exception diagnostic capture,
+recorded here. The subsequent [expression-block correction](SELFHOST_INLINE_BLOCKS.md)
+fixes this minimal case while retaining explicit compatibility boundaries for
+user closures and control flow; general closure semantics remain open.
+Original exception diagnostic capture,
 cyclic references, hanging callbacks and abrupt termination remain outside this
 scope library's guarantees. No EnterpriseOrg server was used.
 
