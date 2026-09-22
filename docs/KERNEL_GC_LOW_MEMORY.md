@@ -158,6 +158,66 @@ hidden behind the better median. These are process-level QEMU measurements on
 a non-isolated laptop, not worst-case collection pause bounds or physical-device
 measurements. Default integration remains deferred.
 
+## Avoiding a second collection during the recovery retry
+
+After successful scratchless recovery, the optional allocator now retries the
+allocation without triggering another automatic collection. With threshold zero,
+the old retry could immediately walk the graph a second time. A pressure-cycle
+probe verifies **20000 collections before versus 10000 after** for the same
+10000 replacement allocations, live roots and garbage workload.
+
+Only the retry temporarily sets the automatic-trigger field to zero. It restores
+one unconditionally after the internal allocator returns, including a zero
+allocation result, before root registration or unlocking. The caller already
+holds the shared memory lock and the internal allocator has no callbacks or
+exception exits in the kernel target. All allocation-size, table-growth, heap
+and root-registration checks remain active. This is not a persistent policy
+change or a suspension of memory validation. Raw invalid-pointer faults and
+noncooperating memory writers remain outside the existing kernel contract.
+
+`examples/kernel_gc_recovery_retry.sapp` covers rooted/unrooted allocations,
+zero and high thresholds, preservation of the legacy negative-threshold bit
+pattern, an allocation too large for the recovered space, the next ordinary
+allocation obeying the original policy, and 100 root-publication rollbacks with
+no free-block loss. Its post-recovery collection-count assertion fails on the
+baseline and passes after the change on qemu64 and 486. The negative threshold retains the current i386
+unsigned comparison behavior; this change does not redefine that API.
+
+[Retry validation](evidence/kernel-gc-retry-validation-2026-09-22.json) records
+26 passing related suites, baseline failures and corrected QEMU runs on qemu64
+and 486, the existing low-memory fixture, exact collection-count probes,
+two-CPU SMP checks and three four-thread checks. Concurrency checks exercise the
+optional allocation entry but do not force every memory-pressure interleaving.
+Three kernel-aware diagnostics checks and isolated builds pass; native CLI lint
+retains its kernel-intrinsic limitation. Portable locks were regenerated only in
+isolated packages.
+
+[Retry measurements](evidence/kernel-gc-retry-cost-2026-09-22.json) retain two
+warmups and fifteen alternating samples per variant for the 10000-cycle pressure
+workload and explicit-collection ring/mixed controls. A longer confirmation uses
+50000 identical pressure cycles on both variants, two warmups and nine samples.
+
+| Workload | Before CPU median / p95 | After CPU median / p95 |
+| --- | --- | --- |
+| Recovery, 10000 cycles | 0.40 / 0.42 s | 0.39 / 0.41 s |
+| Recovery, 50000 cycles | 3.03 / 3.54 s | 2.86 / 4.08 s |
+| Explicit ring control | 0.87 / 1.78 s | 0.85 / 1.76 s |
+| Mixed control | 0.76 / 1.23 s | 0.77 / 1.26 s |
+
+The longer recovery median improves 5.6%, but its p95 worsens. The mixed median
+costs 1.3% more. The explicit collector's algorithm was not changed, so the ring
+control is not evidence that its earlier overhead was eliminated. Timing on this
+non-isolated laptop varies; these are QEMU process measurements, not bounds on
+individual collection pauses. Confirmation peak RSS medians are 59040 / 58960
+KiB, essentially unchanged. The recovery ELF grows by 48 bytes, 14316 / 14364;
+there is no new per-object metadata or persistent resource usage. Default
+integration and general CPU/RAM savings are not claimed.
+
+This removes the redundant **post-recovery** collection only. The initial normal
+allocator may still attempt collection before allocation fails; if that pass
+already reclaimed everything, the later fallback can remain redundant. That
+separate case is not optimized here. Default runtime/VM/FFI behavior is unchanged.
+
 ## Remaining work
 
 Default automatic integration still needs an acceptable performance result.
