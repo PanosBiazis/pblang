@@ -1,0 +1,121 @@
+# Optional kernel recovery under memory pressure
+
+`stdlib/kernel/gc_low_memory.sapp` provides three PBLang kernel APIs. Concatenate
+it after `kernel/heap.sapp` and `kernel/gc.sapp` when selecting this capability.
+It is **not enabled by default** in the existing collector, runtime or PB-MCP.
+The ordinary `gc.sapp` implementation remains byte-for-byte unchanged.
+
+| API | Behavior |
+| --- | --- |
+| `kernel_gc_collect_low_memory(g)` | Explicit scratchless collection. Returns 0 on success, -1 if an owned node branches or count admission fails. |
+| `gc_alloc_low_memory(g, children)` | First attempts normal allocation. A valid failed request with automatic collection enabled triggers scratchless collection and one allocation retry. Returns the object or zero. |
+| `gc_alloc_rooted_low_memory(g, children)` | Same recovery, with atomic root publication before unlock and rollback if root registration fails. |
+
+Thus recovery is automatic for a program choosing the new allocator APIs, while
+explicit collection is available for diagnostics. `gc_set_auto(g,0)` disables
+allocator recovery. Invalid child counts are rejected before collecting. The
+existing maximum comes from the 32-bit allocator ABI, not a new application cap.
+Unrooted results have the same publication obligations as ordinary `gc_alloc`;
+prefer the rooted variant when another CPU or interrupt may collect.
+
+## Reachability and failure contract
+
+The collector first checks every active owner. Each must be a leaf or have one
+child. It then follows chains from roots without a work queue or recursive calls.
+Generation marks terminate self/mutual cycles and avoid repeating shared tails or
+duplicate roots. Unreachable objects are swept with the existing free-list cursor.
+No scratch allocation, persistent cache or extra object metadata is added.
+
+Any branching owner rejects the operation before changing marks, even if that
+owner is unreachable. The operation does not claim to handle arbitrary graphs.
+Accepted traversal advances the generation before marking. A count-admission
+failure after partial marking returns -1 without sweeping, changing ownership
+entries, resetting bytes-since-collection or counting a success. Retry advances
+again; generation wrap clears owned marks before reusing generation one.
+
+One shared memory lock covers topology checks, marking, sweep, allocator retry
+and root publication. Cooperating edge/root mutation cannot interleave between
+inspection and use. There are no callbacks, foreign calls or temporary unlocks.
+A failed root-table expansion removes and frees the unpublished object once,
+matching the existing rooted allocator contract. The base kernel assumptions
+still apply: valid owned pointers/metadata and explicit root publication. This
+is not protection against arbitrary address corruption, foreign/DMA writes or
+noncooperating code. Allocation counters are not live-memory measurements.
+
+## Why the default was preserved
+
+General adaptive borrowing and automatic fallback integration were tested and
+rejected for default use. In the last integrated candidate, the six paired
+workloads were mostly unchanged but mixed allocation/sweep rose from 0.77 to
+0.82 CPU seconds and rootless allocation/sweep from 1.38 to 1.49 seconds. Some
+p95 values also worsened. Keeping that candidate would introduce new regressions.
+
+A cold fallback call also increased the ordinary worker's local stack reservation
+from 40 to 60 bytes in one generated i386 build. Separating dispatch restored the
+40-byte worker but did not remove the measured regressions. All exploratory
+samples are separate from measurements of the retained optional APIs. This is
+not evidence of a universal compiler, CPU, RAM or latency improvement.
+
+## Validation and reproduction
+
+`examples/kernel_gc_low_memory.sapp` checks collection of rooted cycles in an
+exhausted arena; duplicate roots/shared cycles; unchanged ownership; partial mark
+failure and retry; generation wrap; unreachable leaf reclamation; automatic
+allocator recovery; disabled-auto and invalid-count rejection; unsupported
+unreachable branches; and repeated root-publication rollback with no free-byte
+loss. An arena with no free block is checked explicitly, not inferred from RSS.
+
+The optional rooted allocator is also substituted in the existing SMP fixture
+and four-thread native harness. The native test retains the existing checked
+low-address host ABI and fake interrupt-state seam; it is not a physical-kernel
+proof. Source checks use kernel-aware diagnostics. Retained CLI lint does not
+recognize kernel intrinsics; existing linker RWX warnings and the i386 QEMU
+qemu64 long-mode CPUID warning remain toolchain limitations.
+
+Use an isolated package with identical retained executable/compiler sources.
+Build, then publish a repository-relative lock with `tools/pblock.sapp`. Emit the
+concatenated kernel sources with `compiler/ctranspile.transpile_kernel_int`.
+The comparison harness prepends heap, GC, interrupts and timer modules, adding
+`gc_low_memory.sapp` only when testing these optional APIs. Use the compile/link
+settings in [kernel lifetime](KERNEL_GC_LIFETIME.md#reproduce), align `.bss` to
+4096 on both sides, and run QEMU TCG with no disk/NIC/display/monitor. Timing
+uses two warmups, seven samples, alternating order, GNU time user+system CPU,
+peak QEMU RSS and nearest-rank p95. It is not a per-collection pause measurement.
+
+
+[Current validation](evidence/kernel-gc-low-memory-validation-2026-09-22.json)
+records 26 passing suites, two low-memory QEMU runs (qemu64/486), two optional
+allocator SMP runs (qemu64/Pentium III, two CPUs), and three four-thread runs.
+Three kernel-aware source checks report zero diagnostics. Six ordinary workloads
+produce byte-identical C and ELF outputs versus the baseline when the optional
+module is not selected. This verifies unchanged generated kernel execution for
+those cases, not compiler startup cost or every application.
+
+[Explicit-collection cost](evidence/kernel-gc-low-memory-cost-2026-09-22.json),
+with both variants including the optional module, uses the same 129-node live
+ring and 500000 successful collections. Ordinary versus scratchless CPU medians
+are **0.98 / 1.16 s** (+18.4%), p95 **0.98 / 1.18 s**. Peak QEMU RSS medians are
+59260 / 59268 KiB, effectively unchanged. The scratchless operation trades a
+full topology scan for not requiring work-buffer memory; it is not a faster
+replacement when ordinary scratch is available. Allocator-wrapper cost was not
+separately benchmarked. The exhausted-arena fixture proves the capability gain.
+
+[Discarded integration measurements](evidence/kernel-gc-low-memory-exploratory-2026-09-22.json)
+retain raw samples and patches separately; none of those default integrations
+was shipped.
+
+## Remaining work
+
+Default automatic integration still needs an acceptable performance result.
+The earlier bounded VM numeric/try-catch overheads were not changed or resolved.
+Long topology/mark/sweep passes still hold the shared lock and mask local
+interrupts; there is no incremental collection or real-time guarantee. Retained
+host cycles, complete runtime/FFI/polyglot integration and wider physical-platform
+validation remain open. The installed desktop PB-MCP does not contain these
+kernel modules or the compiler VM. It was inspected, not updated; no live-view
+improvement was measured. PBLang remains alpha.
+
+Graphify update was attempted with a 35-second local watchdog and did not
+complete. Its owned process group was stopped; no owned test, benchmark or
+analyzer processes remained at closeout. The 212 unrelated local files were
+preserved. No EnterpriseOrg server or installed desktop bundle was modified.
