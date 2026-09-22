@@ -3,6 +3,10 @@
 Validated locally on 2026-09-22 against baseline
 `27f2ef9c5d22bc780c67b4924642c6c647f392fb`.
 
+The costs below describe the initial shared-binding implementation. The later
+[grouped VM dispatch measurements](SELFHOST_DISPATCH_GROUPS.md) reduce closure
+execution/creation overhead while retaining these semantics and checks.
+
 ## Behavior
 
 Source compiled through `frontend_compile` / `compile_stmts` now shares a captured
