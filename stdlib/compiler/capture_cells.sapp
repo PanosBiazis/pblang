@@ -1,0 +1,112 @@
+// Lower captured bindings to one-element arrays using existing bytecode.
+// Runs after lexical capture discovery, before optimization/serialization.
+// VM captures copy the array reference, so siblings and their owner share value[0].
+// Declaration stores create a fresh cell; assignment stores mutate the old cell.
+fn emit(out, op, operand) { array_push(out, map{op:op, operand:operand}); }
+fn jump(op) { return op == 20 or op == 21 or op == 22 or op == 33 or op == 34 or op == 36 or op == 37; }
+
+fn lower_chunk(chunk, captured, scratch, params) {
+    let out = [];
+    // Only function parameters need entry boxing. Local declarations box their
+    // initialized value at the declaration, including each loop iteration.
+    for slot in params {
+        if map_has(captured, str(slot)) {
+            emit(out, 16, slot); emit(out, 25, 1); emit(out, 17, slot);
+        }
+    }
+    let offsets = [];
+    let zero = -1;
+    let empty = -1;
+    // Source assignment addresses are stable for one activation. Hold the cell
+    // and index beneath the RHS instead of storing the value in a scratch local.
+    // Reverse discovery puts an enclosing assignment before a nested one that
+    // starts at the same original instruction offset.
+    let prefixes = map{};
+    let j = len(chunk.instructions) - 1;
+    while j >= 0 {
+        let ins = chunk.instructions[j];
+        if map_has(ins, "binding_rhs_start") and
+            (ins.op == 39 or (ins.op == 17 and map_has(captured, str(ins.operand)))) {
+            let key = str(ins.binding_rhs_start);
+            if not map_has(prefixes, key) { prefixes[key] = []; }
+            array_push(prefixes[key], ins);
+        }
+        j = j - 1;
+    }
+    let position = 0;
+    for ins in chunk.instructions {
+        array_push(offsets, len(out));
+        if map_has(prefixes, str(position)) {
+            if zero < 0 { zero = len(chunk.constants); array_push(chunk.constants, 0); }
+            for store in prefixes[str(position)] {
+                emit(out, if store.op == 17 {16} else {38}, store.operand);
+                emit(out, 0, zero);
+            }
+        }
+        position = position + 1;
+        let op = ins.op;
+        let arg = ins.operand;
+        let local = (op == 16 or op == 17) and map_has(captured, str(arg));
+        let upvalue = op == 38 or op == 39;
+        let raw = map_has(ins, "raw_slot");
+        if op == 24 and len(chunk.constants[arg].upvalues) > 0 {
+            // A native reference-capturing VM can otherwise bind to a reused
+            // loop slot. Pass cell references through a short factory frame;
+            // each produced closure then owns stable parameter bindings.
+            let original = chunk.constants[arg];
+            let descriptors = [];
+            for i len(original.upvalues) { array_push(descriptors, map{is_local:true,index:i}); }
+            let target = map{arity:original.arity, min_arity:original.min_arity,
+                chunk:original.chunk, upvalues:descriptors};
+            let factory = map{arity:len(descriptors), min_arity:len(descriptors), upvalues:[],
+                chunk:map{constants:[target],instructions:[map{op:24,operand:0},map{op:19,operand:0}]}};
+            chunk.constants[arg] = factory;
+            emit(out, 24, arg);
+            for desc in original.upvalues { emit(out, if desc.is_local {16} else {38}, desc.index); }
+            emit(out, 18, len(descriptors));
+        } else if (local or upvalue) and not raw {
+            if op == 17 and map_has(ins, "binding_init") {
+                emit(out, 25, 1); emit(out, 17, arg);
+            } elif map_has(ins, "binding_rhs_start") {
+                emit(out, 28, 0);
+            } else {
+                if zero < 0 { zero = len(chunk.constants); array_push(chunk.constants, 0); }
+                if op == 16 or op == 38 {
+                    emit(out, op, arg); emit(out, 0, zero); emit(out, 27, 0);
+                } else {
+                    // SET_INDEX expects cell,index,value. A private frame slot
+                    // preserves RHS-first evaluation and is cleared immediately.
+                    if empty < 0 { empty = len(chunk.constants); array_push(chunk.constants, nil); }
+                    emit(out, 17, scratch);
+                    emit(out, if op == 17 {16} else {38}, arg);
+                    emit(out, 0, zero); emit(out, 16, scratch); emit(out, 28, 0);
+                    emit(out, 0, empty); emit(out, 17, scratch);
+                }
+            }
+        } else {
+            // Preserve non-binding hints such as direct_builtin_call. Discard
+            // compile-time binding markers even in functions without captures.
+            map_remove(ins, "binding_init"); map_remove(ins, "raw_slot"); map_remove(ins, "binding_rhs_start");
+            array_push(out, ins);
+        }
+    }
+    array_push(offsets, len(out));
+    for ins in out { if jump(ins.op) { ins.operand = offsets[ins.operand]; } }
+    chunk.instructions = out;
+    // Try body/handler borrow this frame. Nested function constants were lowered
+    // by their own code generator and must never be lowered a second time.
+    for value in chunk.constants {
+        if is_map(value) and map_has(value, "try_chunk") {
+            lower_chunk(value.try_chunk, captured, scratch, []);
+            lower_chunk(value.catch_chunk, captured, scratch, []);
+        }
+    }
+}
+
+fn lower(chunk, captured, upvalues, next_slot, params) {
+    // No VM branch, allocation or extra bytecode for noncapturing frames.
+    if len(captured) == 0 and len(upvalues) == 0 { return; }
+    lower_chunk(chunk, captured, next_slot, params);
+}
+
+export lower;

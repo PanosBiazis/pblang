@@ -5,6 +5,7 @@
 
 let _vm_builtin_module = import("stdlib/compiler/vm_builtins.sapp");
 let _VM_BUILTINS = _vm_builtin_module.registry();
+let _CAPTURE_CELLS = import("stdlib/compiler/capture_cells.sapp");
 
 // ── OpCode Constants ────────────────────────────────────────────────────
 const OP_CONSTANT = 0;
@@ -84,8 +85,7 @@ fn CodeGen() {
         next_slot: 0,     // monotonic local-slot counter (slots are never reused)
         parent: nil,      // enclosing CodeGen (for upvalue resolution), nil at top
         upvalues: [],     // [{index, is_local}] captured by THIS function
-        captured_slots: map{}, // conservative across native/reference captures
-        cleanup_writes: map{}, // earlier cleanup stores patchable on later capture
+        captured_slots: map{}, // bindings lowered to shared cells at finalization
         cleanup_nil: -1,
         cleanup_base: 0, // try subchunks borrow earlier slots from their caller
         exports: [],      // names listed in `export ...;` statements (module API)
@@ -99,6 +99,10 @@ fn _at_module_top(cg) { return cg.is_module and cg.scope_depth == 1; }
 // Local `let`/`const`: evaluate the value FIRST (so a same-named outer binding or
 // builtin in the initializer resolves correctly — e.g. `let len = len(source)`),
 // THEN declare the local and store into its slot.
+fn _binding_store(cg, slot) {
+    chunk_write(cg.chunk, map{op: OP_SET_LOCAL, operand: slot, binding_init: true});
+}
+
 fn codegen_local_let(cg, node) {
     if node.value != nil {
         codegen_expr(cg, node.value);
@@ -107,7 +111,7 @@ fn codegen_local_let(cg, node) {
         chunk_write_op(cg.chunk, OP_CONSTANT, idx_nil);
     }
     let slot = codegen_declare_local(cg, node.name);
-    chunk_write_op(cg.chunk, OP_SET_LOCAL, slot);
+    _binding_store(cg, slot);
 }
 
 // Top-level `let`/`const`: evaluate the value and DEFINE it as a global.
@@ -162,23 +166,17 @@ fn codegen_begin_scope(cg) {
     cg.scope_depth = cg.scope_depth + 1;
 }
 
-// Drop only this local reference. The value on the operand stack, aliases,
-// global values and captured slots must remain intact. No destructors are called.
+// Drop only this frame reference. Escaping closures own cell references via
+// factory parameters; clearing the owner slot cannot erase their value.
 fn _cleanup_slot(cg, slot) {
-    let key = str(slot);
-    if map_has(cg.captured_slots, key) { return; }
     if cg.cleanup_nil < 0 { cg.cleanup_nil = chunk_add_constant(cg.chunk, nil); }
     chunk_write_op(cg.chunk, OP_CONSTANT, cg.cleanup_nil);
-    let store = map{op: OP_SET_LOCAL, operand: slot};
-    chunk_write(cg.chunk, store);
-    if not map_has(cg.cleanup_writes, key) { cg.cleanup_writes[key] = []; }
-    array_push(cg.cleanup_writes[key], store);
+    chunk_write(cg.chunk, map{op: OP_SET_LOCAL, operand: slot, raw_slot: true});
 }
 // A failed expression may not have reached every statically allocated slot.
 // Read-before-clear avoids growing the frame merely to clear an absent value.
 fn _cleanup_existing_slot(cg, slot) {
-    if map_has(cg.captured_slots, str(slot)) { return; }
-    chunk_write_op(cg.chunk, OP_GET_LOCAL, slot);
+    chunk_write(cg.chunk, map{op: OP_GET_LOCAL, operand: slot, raw_slot: true});
     let skip = len(cg.chunk.instructions);
     chunk_write_op(cg.chunk, OP_JUMP_IF_NIL_PEEK, 0);
     chunk_write_op(cg.chunk, OP_POP, 0);
@@ -195,21 +193,13 @@ fn _cleanup_deeper_than(cg, depth) {
     }
 }
 // The exit payload is already on the operand stack. Drop this chunk's active
-// references without touching inherited try slots or captured local values.
+// references without touching inherited try slots or captured cell contents.
 fn _cleanup_exit(cg) {
     for local in cg.locals {
         if local.slot >= cg.cleanup_base { _cleanup_slot(cg, local.slot); }
     }
 }
-fn _capture_slot(cg, slot) {
-    let key = str(slot);
-    cg.captured_slots[key] = true;
-    // A capture later in a loop can outlive an earlier break/continue path.
-    // Neutralize earlier stores without moving any branch targets.
-    if map_has(cg.cleanup_writes, key) {
-        for store in cg.cleanup_writes[key] { store.op = OP_POP; store.operand = 0; }
-    }
-}
+fn _capture_slot(cg, slot) { cg.captured_slots[str(slot)] = true; }
 
 /// End current scope (pop locals)
 fn codegen_end_scope(cg) {
@@ -376,7 +366,6 @@ fn codegen_try(cg, node) {
     body_cg.parent = cg.parent;
     body_cg.upvalues = cg.upvalues;
     body_cg.captured_slots = cg.captured_slots;
-    body_cg.cleanup_writes = cg.cleanup_writes;
     codegen_expr(body_cg, node.body);
     chunk_write_op(body_cg.chunk, OP_RETURN, 0);
     cg.next_slot = body_cg.next_slot;
@@ -391,7 +380,6 @@ fn codegen_try(cg, node) {
     // also included in the enclosing function's closure constant.
     handler_cg.upvalues = cg.upvalues;
     handler_cg.captured_slots = cg.captured_slots;
-    handler_cg.cleanup_writes = cg.cleanup_writes;
     // The handler shares caller slots. Retire only the body's new temporaries,
     // including nested failed handlers, before evaluating the user's handler.
     let slot = body_start;
@@ -474,7 +462,7 @@ fn codegen_match(cg, node) {
         } else if pt == "bind" {
             let bslot = codegen_declare_local(cg, pat["name"]);
             chunk_write_op(cg.chunk, OP_GET_LOCAL, tmp);
-            chunk_write_op(cg.chunk, OP_SET_LOCAL, bslot);
+            _binding_store(cg, bslot);
         }
 
         // All pattern kinds require the guard after the pattern succeeds.
@@ -963,7 +951,7 @@ fn codegen_for(cg, node) {
     chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0);
 
     chunk_write_op(cg.chunk, OP_GET_LOCAL, slot);
-    chunk_write_op(cg.chunk, OP_SET_LOCAL, var_slot);
+    _binding_store(cg, var_slot);
     _loop_push(cg);
     codegen_block(cg, node.body);
     let lc = _loop_pop(cg);
@@ -1011,7 +999,7 @@ fn codegen_for_in(cg, node) {
     chunk_write_op(cg.chunk, OP_GET_LOCAL, arr_slot);
     chunk_write_op(cg.chunk, OP_GET_LOCAL, idx_slot);
     chunk_write_op(cg.chunk, OP_GET_INDEX, 0);
-    chunk_write_op(cg.chunk, OP_SET_LOCAL, var_slot);
+    _binding_store(cg, var_slot);
 
     _loop_push(cg);
     codegen_block(cg, node.body);
@@ -1052,7 +1040,7 @@ fn codegen_for_range(cg, node) {
     chunk_write_op(cg.chunk, OP_JUMP_IF_FALSE, 0);
 
     chunk_write_op(cg.chunk, OP_GET_LOCAL, slot);
-    chunk_write_op(cg.chunk, OP_SET_LOCAL, var_slot);
+    _binding_store(cg, var_slot);
     _loop_push(cg);
     codegen_block(cg, node.body);
     let lc = _loop_pop(cg);
@@ -1083,12 +1071,26 @@ fn codegen_fill_defaults(inner_cg, params, param_slots) {
             chunk_write_op(inner_cg.chunk, OP_EQ, 0);
             let jf = len(inner_cg.chunk.instructions);
             chunk_write_op(inner_cg.chunk, OP_JUMP_IF_FALSE, 0);
+            let rhs_start = len(inner_cg.chunk.instructions);
             codegen_expr(inner_cg, dflt);
-            chunk_write_op(inner_cg.chunk, OP_SET_LOCAL, param_slots[di]);
+            chunk_write(inner_cg.chunk, map{op: OP_SET_LOCAL, operand: param_slots[di], binding_rhs_start: rhs_start});
             inner_cg.chunk.instructions[jf]["operand"] = len(inner_cg.chunk.instructions);
         }
         di = di + 1;
     }
+}
+
+// Complete a manually assembled CodeGen before executing/serializing its chunk.
+// Idempotent; emitting additional source after finalization is unsupported.
+fn codegen_finish(cg, parameter_count = 0) {
+    if map_has(cg, "capture_lowered") { return cg.chunk; }
+    if len(cg.captured_slots) > 0 or len(cg.upvalues) > 0 {
+        let params = [];
+        for i parameter_count { array_push(params, i); }
+        _CAPTURE_CELLS.lower(cg.chunk, cg.captured_slots, cg.upvalues, cg.next_slot, params);
+    }
+    cg.capture_lowered = true;
+    return cg.chunk;
 }
 
 /// Compile an anonymous function literal `fn(params) { body }`. Unlike a fn
@@ -1115,6 +1117,7 @@ fn codegen_fnlit(cg, node) {
         chunk_write_op(inner_cg.chunk, OP_RETURN, 0);
     }
 
+    codegen_finish(inner_cg, len(node["params"]));
     let fn_const_idx = chunk_add_constant(cg.chunk, map{
         arity: len(node["params"]),
         min_arity: len(node["params"]),   // fn-literal params have no defaults
@@ -1157,6 +1160,7 @@ fn codegen_fn(cg, node) {
     }
 
     // Store function as constant in parent chunk
+    codegen_finish(inner_cg, len(node["params"]));
     let fn_const_idx = chunk_add_constant(cg.chunk, map{
         arity: len(node["params"]),
         min_arity: min_arity,
@@ -1177,10 +1181,11 @@ fn codegen_expr_stmt(cg, node) {
     // Assignment statement (parser wraps `x = v` as expr_stmt{ assign{name,value} }).
     // Evaluate the value and store it; SET_* consumes the value, so no POP.
     if is_map(e) and e.kind == "assign" {
+        let rhs_start = len(cg.chunk.instructions);
         codegen_expr(cg, e.value);
         let r = codegen_resolve(cg, e.name);
-        if r.kind == "local" { chunk_write_op(cg.chunk, OP_SET_LOCAL, r.index); }
-        else if r.kind == "upvalue" { chunk_write_op(cg.chunk, OP_SET_UPVALUE, r.index); }
+        if r.kind == "local" { chunk_write(cg.chunk, map{op: OP_SET_LOCAL, operand: r.index, binding_rhs_start: rhs_start}); }
+        else if r.kind == "upvalue" { chunk_write(cg.chunk, map{op: OP_SET_UPVALUE, operand: r.index, binding_rhs_start: rhs_start}); }
         else { chunk_write_op(cg.chunk, OP_SET_GLOBAL, r.index); }
         return;
     }
@@ -1288,7 +1293,7 @@ fn compile_stmts(stmts) {
         let ex_idx = codegen_intern_global(cg, "__exports__");
         chunk_write_op(cg.chunk, OP_DEFINE_GLOBAL, ex_idx);
     }
-    return cg.chunk;
+    return codegen_finish(cg);
 }
 
 // ── Disassembler ────────────────────────────────────────────────────────
@@ -1344,6 +1349,7 @@ fn disasm_chunk(chunk) {
 
 export Chunk;
 export CodeGen;
+export codegen_finish;
 export chunk_add_constant;
 export chunk_write;
 export chunk_write_op;
