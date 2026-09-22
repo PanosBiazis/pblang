@@ -6,6 +6,8 @@ Validated locally on 2026-09-22 against baseline
 The costs below describe the initial shared-binding implementation. The later
 [grouped VM dispatch measurements](SELFHOST_DISPATCH_GROUPS.md) reduce closure
 execution/creation overhead while retaining these semantics and checks.
+Further [small-array allocation changes](SELFHOST_SMALL_ARRAYS.md) address
+temporary argument arrays and the storage of retained captures.
 
 ## Behavior
 
