@@ -142,3 +142,6 @@ coverage of these PBLang modules.
 
 For the subsequent direct try/catch dispatch and single-edge traversal changes,
 see [try and chain cost follow-up](TRY_AND_CHAIN_COST.md).
+
+The later [inline instruction-admission follow-up](SELFHOST_TICK_ADMISSION.md)
+removes the private tick call while retaining the ordering described above.

@@ -114,3 +114,7 @@ approval state are preserved. No Specisoft server was used.
 See [shared binding behavior](SELFHOST_SHARED_CAPTURES.md),
 [previous dispatch measurements](SELFHOST_DISPATCH_GROUPS.md), and
 [stable-release gates](STABLE_1_0_READINESS.md).
+
+The subsequent [bounded instruction-admission follow-up](SELFHOST_TICK_ADMISSION.md)
+measures the unchanged try/catch workload against this revision. It does not
+retroactively replace the measurements above.
