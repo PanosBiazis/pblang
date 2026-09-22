@@ -3,6 +3,9 @@
 Local validation on 2026-09-22 against
 `78f34ab7001589041eb1800281a3e721a72f2e6f`.
 
+For the subsequent allocation changes and their separate measurements, see
+[small arrays and closure allocation](SELFHOST_SMALL_ARRAYS.md).
+
 ## Change and compatibility
 
 `stdlib/compiler/vm.sapp` now groups instruction handlers by opcode range after
