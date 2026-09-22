@@ -40,6 +40,17 @@ accelerator request either fails or reports that CPU fallback was used; it
 never changes devices silently. Runtime failure is re-routed through the same
 CPU cost model rather than blindly starting the maximum worker count.
 
+`run_controlled` automatically skips hardware discovery for empty batches,
+explicit CPU/sequential requests, disabled accelerators, and batches below
+`min_accelerator_items`. In those cases device availability cannot affect the
+route. Validation, rejection reasons, worker ordering, and strict fallback
+behavior are unchanged. Caller-supplied device lists are still validated,
+including on empty batches. Eligible accelerator calls retain fresh discovery;
+there is no device cache that could hide runtime registration or removal.
+This also benefits `run` and small batches in `run_chunked`. It does not change
+the explicit inventory functions `devices`, `hardware`, or `summary`, and does
+not enable a GPU/NPU executor merely because a driver is installed.
+
 ```sapp
 let compute = import("stdlib:compute.sapp");
 let result = compute.run_controlled([1, 2, 3, 4], fn(x) { return x * x; }, map{
@@ -238,6 +249,7 @@ Verification:
 - `tests/semantics/controlled_execution_test.sapp`
 - `tests/semantics/thread_pool_enrich_test.sapp`
 - `tests/semantics/compute_test.sapp`
+- `tests/semantics/compute_discovery_test.sapp`
 - `tests/semantics/hardware_cost_routing_test.sapp`
 - `tests/semantics/accelerator_test.sapp`
 - `tests/semantics/polyglot_policy_test.sapp`
@@ -248,5 +260,6 @@ Verification:
 - `tests/semantics/ffi_universal_enrich2_test.sapp`
 - `bench/controlled_execution_stages.sapp`
 - `bench/hardware_cost_routing_stages.sapp`
+- `bench/compute_discovery.sapp`
 - `examples/controlled_compute/main.sapp`
 - `examples/hardware_routing/main.sapp`
