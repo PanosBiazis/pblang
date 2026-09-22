@@ -47,6 +47,14 @@ route. Validation, rejection reasons, worker ordering, and strict fallback
 behavior are unchanged. Caller-supplied device lists are still validated,
 including on empty batches. Eligible accelerator calls retain fresh discovery;
 there is no device cache that could hide runtime registration or removal.
+Preferred-device membership checks stop at their first match; all subsequent
+policy and transfer-limit checks still run. Explicit `max_workers` also avoids
+querying the CPU count to compute an unused default, for both compute and
+controlled storage reads. Omitted or `nil` worker counts retain fresh detection.
+No device or policy cache is added.
+See [validation cost measurements](COMPUTE_VALIDATION_COST.md) for the measured
+cost and platform limitations.
+
 This also benefits `run` and small batches in `run_chunked`. It does not change
 the explicit inventory functions `devices`, `hardware`, or `summary`, and does
 not enable a GPU/NPU executor merely because a driver is installed.
@@ -250,6 +258,7 @@ Verification:
 - `tests/semantics/thread_pool_enrich_test.sapp`
 - `tests/semantics/compute_test.sapp`
 - `tests/semantics/compute_discovery_test.sapp`
+- `tests/semantics/compute_preferred_validation_test.sapp`
 - `tests/semantics/hardware_cost_routing_test.sapp`
 - `tests/semantics/accelerator_test.sapp`
 - `tests/semantics/polyglot_policy_test.sapp`
@@ -261,5 +270,6 @@ Verification:
 - `bench/controlled_execution_stages.sapp`
 - `bench/hardware_cost_routing_stages.sapp`
 - `bench/compute_discovery.sapp`
+- `bench/compute_explicit_workers.sapp`
 - `examples/controlled_compute/main.sapp`
 - `examples/hardware_routing/main.sapp`
