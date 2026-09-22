@@ -124,3 +124,6 @@ and broader physical/guest-platform validation remain unresolved. The installed
 PB-MCP desktop path does not use this VM, so this change does not establish a
 live-view benefit and does not require copying unused modules into its bundle.
 No desktop approval, running installation or EnterpriseOrg server is changed.
+
+The subsequent [call-classification follow-up](SELFHOST_CALL_CLASSIFICATION.md)
+retains this admission path and separately measures closure and return overhead.

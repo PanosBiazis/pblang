@@ -208,3 +208,6 @@ No new crash artifact was found in the checked diagnostic locations.
 
 Graphify update exceeded its 35-second bound and was terminated. The graph
 query did not provide semantic coverage of the PBLang implementation.
+
+The [call-classification follow-up](SELFHOST_CALL_CLASSIFICATION.md) measures
+small-call dispatch and ordinary return costs without changing shared cells.

@@ -24,7 +24,7 @@ in PBLang. Retained-runtime and OS/driver boundaries must be disclosed.
 
 | Area | Current evidence / gap | Gate for a stable claim |
 | --- | --- | --- |
-| Language and compiler parity | Scalar sibling closures still use different captures in retained and self-hosted VMs; expression-block fixes cover only eligible blocks. General backend parity remains incomplete. | Specify capture, scope, mutation, exceptions and numeric behavior; differential fixtures pass on every supported compiler/backend; no known result-changing defect in the supported subset. |
+| Language and compiler parity | Shared binding cells now cover owner, sibling and transitive captures in tested routes; expression-block fixes cover only eligible blocks. General backend parity remains incomplete. | Specify capture, scope, mutation, exceptions and numeric behavior; differential fixtures pass on every supported compiler/backend; no known result-changing defect in the supported subset. |
 | Memory and resource lifetime | Kernel precise GC is separate from the retained VM; explicit valid roots are required. General cycles, exceptional resource cleanup and FFI ownership are not universally integrated. | Define ownership at each boundary; verify escapes, cycles, exception preservation, cancellation, concurrency and long-running memory behavior. Unsupported guarantees fail explicitly. |
 | Isolation and foreign execution | Bounded facade checks do not prove hard preemption, heap isolation or absence of raw bootstrap bypasses. Existing foreign boundaries remain. | Verify actual enforcement at every exposed entry point; malicious-input, race and cleanup tests plus independent review. If PBLang-only is a release promise, migrate and disable remaining blocks with verified equivalent behavior first. |
 | Packages, audit reports and releases | Manifest validation and individual artifact checks do not establish the complete publisher/report trust chain. | Verify publisher identity, exact artifact binding, rollback policy, report authenticity, reproducible builds, upgrades and recovery for the actual distribution. |
@@ -39,7 +39,9 @@ Useful evidence pointers:
 - [Heap regression coverage and measured experiments](KERNEL_HEAP_MERGE.md)
 - [Release identity and publisher limitations](RELEASE_CHANNELS.md)
 - [VM and emulator evidence classes](VM_TEST_LAB.md)
-- `stdlib/compiler/vm.sapp`: OP_CLOSURE currently copies captured values.
+- [Shared bindings and the remaining cycle boundary](SELFHOST_SHARED_CAPTURES.md)
+- [Current closure/call-cost measurements](SELFHOST_CALL_CLASSIFICATION.md)
+- `stdlib/compiler/vm.sapp`: raw OP_CLOSURE copies references to compiler-lowered cells; raw legacy upvalues retain their old semantics.
 - `stdlib/runtime_gc.sapp`: explicit retained-host collection limitations.
 
 Older aggregate status tables and the historical "End of Month 6" milestone are
