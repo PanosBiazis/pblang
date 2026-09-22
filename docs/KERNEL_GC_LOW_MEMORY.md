@@ -7,7 +7,7 @@ The ordinary `gc.sapp` implementation remains byte-for-byte unchanged.
 
 | API | Behavior |
 | --- | --- |
-| `kernel_gc_collect_low_memory(g)` | Explicit scratchless collection. Returns 0 on success, -1 if an owned node branches or count admission fails. |
+| `kernel_gc_collect_low_memory(g)` | Explicit scratchless collection. Returns 0 on success, -1 if an owned node branches with roots registered or count admission fails. |
 | `gc_alloc_low_memory(g, children)` | First attempts normal allocation. A valid failed request with automatic collection enabled triggers scratchless collection and one allocation retry. Returns the object or zero. |
 | `gc_alloc_rooted_low_memory(g, children)` | Same recovery, with atomic root publication before unlock and rollback if root registration fails. |
 
@@ -20,14 +20,22 @@ prefer the rooted variant when another CPU or interrupt may collect.
 
 ## Reachability and failure contract
 
-The collector first checks every active owner. Each must be a leaf or have one
-child. It then follows chains from roots without a work queue or recursive calls.
+With registered roots, the collector first checks every active owner. Each must
+be a leaf or have one child. Admission checks four owners per loop iteration and
+then checks the remaining zero to three owners. No owner is skipped and no mark
+is changed before the entire admission pass succeeds. It then follows chains
+from roots without a work queue or recursive calls.
 Generation marks terminate self/mutual cycles and avoid repeating shared tails or
 duplicate roots. Unreachable objects are swept with the existing free-list cursor.
 No scratch allocation, persistent cache or extra object metadata is added.
 
-Any branching owner rejects the operation before changing marks, even if that
-owner is unreachable. The operation does not claim to handle arbitrary graphs.
+With roots registered, any branching owner rejects the operation before changing
+marks, even if that owner is unreachable. With **zero registered roots**, all
+owned objects are unreachable under the existing explicit-root contract. That
+case delegates to the ordinary collector's scratchless rootless path under the
+same lock, without checking topology or marks. Branching cycles are therefore
+supported when rootless, including exhausted-heap allocator recovery. Rooted
+arbitrary graphs still require the ordinary collector and its scratch space.
 Accepted traversal advances the generation before marking. A count-admission
 failure after partial marking returns -1 without sweeping, changing ownership
 entries, resetting bytes-since-collection or counting a success. Retry advances
@@ -65,6 +73,14 @@ allocator recovery; disabled-auto and invalid-count rejection; unsupported
 unreachable branches; and repeated root-publication rollback with no free-byte
 loss. An arena with no free block is checked explicitly, not inferred from RSS.
 
+The follow-up fixture checks 18 placements of unsupported branches, covering
+each admission batch position and tail, including short tables. Rejection at
+generation wrap leaves all marks, ownership, free bytes and counters unchanged.
+After removing roots, those same graphs are reclaimed, followed by an empty
+collection. Rootless branching recovery in an exhausted heap publishes the new
+root atomically. The saved-table comparison was corrected to inspect exactly
+129 entries, matching its 516-byte allocation, instead of reading a 130th entry.
+
 The optional rooted allocator is also substituted in the existing SMP fixture
 and four-thread native harness. The native test retains the existing checked
 low-address host ABI and fake interrupt-state seam; it is not a physical-kernel
@@ -83,7 +99,7 @@ uses two warmups, seven samples, alternating order, GNU time user+system CPU,
 peak QEMU RSS and nearest-rank p95. It is not a per-collection pause measurement.
 
 
-[Current validation](evidence/kernel-gc-low-memory-validation-2026-09-22.json)
+[Initial validation](evidence/kernel-gc-low-memory-validation-2026-09-22.json)
 records 26 passing suites, two low-memory QEMU runs (qemu64/486), two optional
 allocator SMP runs (qemu64/Pentium III, two CPUs), and three four-thread runs.
 Three kernel-aware source checks report zero diagnostics. Six ordinary workloads
@@ -91,7 +107,7 @@ produce byte-identical C and ELF outputs versus the baseline when the optional
 module is not selected. This verifies unchanged generated kernel execution for
 those cases, not compiler startup cost or every application.
 
-[Explicit-collection cost](evidence/kernel-gc-low-memory-cost-2026-09-22.json),
+[Initial explicit-collection cost](evidence/kernel-gc-low-memory-cost-2026-09-22.json),
 with both variants including the optional module, uses the same 129-node live
 ring and 500000 successful collections. Ordinary versus scratchless CPU medians
 are **0.98 / 1.16 s** (+18.4%), p95 **0.98 / 1.18 s**. Peak QEMU RSS medians are
@@ -103,6 +119,44 @@ separately benchmarked. The exhausted-arena fixture proves the capability gain.
 [Discarded integration measurements](evidence/kernel-gc-low-memory-exploratory-2026-09-22.json)
 retain raw samples and patches separately; none of those default integrations
 was shipped.
+
+## Batched admission and rootless recovery follow-up
+
+[Current validation](evidence/kernel-gc-low-memory-tuning-validation-2026-09-22.json)
+records 26 passing related suites, the expanded low-memory fixture on qemu64 and
+486, two-CPU SMP runs on qemu64 and Pentium III, and three four-thread native
+runs. Unlike the initial parallel fixtures, these also request explicit
+scratchless collection while published roots are shared. Two kernel-aware source
+checks have zero diagnostics. Retained CLI lint still rejects known kernel
+intrinsics/externs; it is not reported as passing. Isolated build and native
+portable-lock publication passed. The ordinary collector, allocator, compiler
+VM and runtime GC modules are unchanged.
+
+[All timing samples](evidence/kernel-gc-low-memory-tuning-cost-2026-09-22.json)
+include an initial two-warmup/seven-sample alternating run and a follow-up with
+two warmups and fifteen measured samples per variant in rotating order. The
+follow-up includes ordinary collection in the same current build as a control.
+Both variants execute identical workloads and verify successful exits.
+
+| Confirmation workload | Before CPU median / p95 | After CPU median / p95 | Median change |
+| --- | --- | --- | --- |
+| 129-node live ring, 500000 collections | 1.16 / 1.41 s | 1.10 / 1.70 s | 5.2% lower |
+| 128 live nodes + 16 garbage leaves, 100000 rounds | 0.85 / 1.37 s | 0.86 / 1.19 s | 1.2% higher |
+
+Ordinary collection of the ring costs 0.97 s median / 1.17 s p95. Thus the
+optional collector still costs **13.4% more CPU** than ordinary collection when
+scratch space is available. The initial ring improvement was 20.3%, but did not
+persist at that size in the longer confirmation; both runs are retained. The
+initial rootless workload improved from 1.51 to 1.48 s median (2.0%), with p95
+1.64 / 1.49 s. It was not rerun in the confirmation.
+
+Confirmation peak QEMU RSS medians are 59120 / 59244 KiB for the ring and
+59196 / 59180 KiB for mixed allocation: no general RAM reduction is established.
+The ring ELF grows from 13800 to 13980 bytes (+180); no extra persistent object
+metadata is introduced. The higher ring p95 is retained as a limitation, not
+hidden behind the better median. These are process-level QEMU measurements on
+a non-isolated laptop, not worst-case collection pause bounds or physical-device
+measurements. Default integration remains deferred.
 
 ## Remaining work
 
