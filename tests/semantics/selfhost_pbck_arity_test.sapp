@@ -1,0 +1,111 @@
+// PBCS must preserve the call contract as well as the executable body.
+let PB = import("stdlib/selfhost_pbck.sapp");
+let FE = import("stdlib/compiler/selfhost_frontend.sapp");
+let OPT = import("stdlib/compiler/optimizer.sapp");
+let VM = import("stdlib/compiler/vm.sapp");
+let LOADER = import("stdlib/selfhost_loader.sapp");
+let XL = import("stdlib/selfhost_to_pbck.sapp");
+fn expect(ok, why) { if not ok { throw "FAIL pbcs arity: " + why; } }
+fn same_bytes(a, b) {
+    expect(len(a) == len(b), "byte length");
+    let i = 0; while i < len(a) { expect(a[i] == b[i], "byte content"); i = i + 1; }
+}
+fn copy_bytes(bytes) {
+    let out = []; let i = 0;
+    while i < len(bytes) { array_push(out, bytes[i]); i = i + 1; }
+    return out;
+}
+fn check_contract(a, b) {
+    let i = 0;
+    while i < len(a.constants) {
+        let x = a.constants[i]; let y = b.constants[i];
+        if type(x) == "map" and map_has(x, "chunk") {
+            expect(map_has(x, "min_arity") == map_has(y, "min_arity"), "presence");
+            if map_has(x, "min_arity") { expect(x.min_arity == y.min_arity, "minimum"); }
+            check_contract(x.chunk, y.chunk);
+        } else if type(x) == "map" and map_has(x, "try_chunk") {
+            check_contract(x.try_chunk, y.try_chunk);
+            check_contract(x.catch_chunk, y.catch_chunk);
+        }
+        i = i + 1;
+    }
+}
+let sources = [
+    "fn add(a,b=2) { return a+b; } print add(3);",
+    "fn zero(a=7) { return a; } print zero();",
+    "fn outer(x) { return fn(y) { return x+y; }; } let f=outer(2); print f(3);",
+    "fn f(a,b,c,d=4) { return a+b+c+d; } print f(1,2,3);",
+    "let r=try 5 catch 9; fn f(a=3) { return a; } print f()+r;"
+];
+let s = 0;
+while s < len(sources) {
+    let compiled = FE.frontend_compile(sources[s]); expect(compiled.ok, "compile");
+    let chunks = [compiled.chunk, OPT.optimize_safe(compiled.chunk).chunk];
+    let j = 0;
+    while j < len(chunks) {
+        let c = chunks[j]; let bytes = PB.serialize_chunk(c);
+        expect(bytes[4] == 3, "writer version");
+        let restored = PB.deserialize_chunk(bytes);
+        check_contract(c, restored);
+        same_bytes(bytes, PB.serialize_chunk(restored));
+        // Native translation must not reinterpret defaults after persistence.
+        same_bytes(XL.translate(c), XL.translate(restored));
+        let expected = VM.run(c).output;
+        expect(str(VM.run(restored).output) == str(expected), "VM output");
+        let loaded = LOADER.run_pbck_bytes(bytes);
+        expect(loaded.ok and str(loaded.output) == str(expected), "loader output");
+        j = j + 1;
+    }
+    s = s + 1;
+}
+fn function_value(arity, minimum) {
+    return map{arity: arity, min_arity: minimum, upvalues: [], chunk: map{
+        instructions: [map{op:16, operand:0}, map{op:19, operand:0}], constants: []
+    }};
+}
+fn container(value) { return map{instructions: [], constants: [value]}; }
+// Hand-built call IR deliberately bypasses static source arity diagnostics.
+// Exercise zero-, one-, two- and generic argument VM call paths.
+let argc = 0;
+while argc < 5 {
+    let ins = [map{op:24, operand:0}]; let i = 0;
+    while i < argc { array_push(ins, map{op:0, operand:1}); i = i + 1; }
+    array_push(ins, map{op:18, operand:argc});
+    let c = map{instructions:ins, constants:[function_value(argc+1, argc+1), 7]};
+    expect((try VM.run(c) catch "rejected") == "rejected", "original call rejection");
+    let bytes = PB.serialize_chunk(c);
+    expect((try VM.run(PB.deserialize_chunk(bytes)) catch "rejected") == "rejected", "restored call rejection");
+    expect(not LOADER.run_pbck_bytes(bytes).ok, "loader call rejection");
+    argc = argc + 1;
+}
+let invalid = [0-1, 0.5, 3, "1", true, nil];
+let n = 0;
+while n < len(invalid) {
+    expect((try PB.serialize_chunk(container(function_value(2, invalid[n]))) catch "rejected") == "rejected", "invalid minimum");
+    n = n + 1;
+}
+let valid = PB.serialize_chunk(container(function_value(2, 1)));
+// Empty root instructions, one function: tag at 13, presence byte at 18.
+let bad = copy_bytes(valid); bad[18] = 2;
+expect((try PB.deserialize_chunk(bad) catch "rejected") == "rejected", "invalid presence byte");
+bad = copy_bytes(valid); bad[19] = 3;
+expect((try PB.deserialize_chunk(bad) catch "rejected") == "rejected", "minimum exceeds arity");
+let end = 19;
+while end < 23 {
+    let truncated = []; let i = 0;
+    while i < end { array_push(truncated, valid[i]); i = i + 1; }
+    expect((try PB.deserialize_chunk(truncated) catch "rejected") == "rejected", "truncated minimum");
+    end = end + 1;
+}
+// Legacy readers never encoded a minimum. Do not invent one during migration.
+let legacy = [80,66,67,83,1, 0,0,0,0, 1,0,0,0, 4, 2,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0];
+let version = 1;
+while version <= 2 {
+    legacy[4] = version;
+    let c = PB.deserialize_chunk(legacy);
+    expect(not map_has(c.constants[0], "min_arity"), "legacy absence");
+    let reread = PB.deserialize_chunk(PB.serialize_chunk(c));
+    expect(not map_has(reread.constants[0], "min_arity"), "migrated absence");
+    version = version + 1;
+}
+print "selfhost_pbck_arity_pass";
