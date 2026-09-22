@@ -1,5 +1,8 @@
 # Self-hosted expression blocks and catch assignments
 
+Update 2026-09-22: [shared capture lowering](SELFHOST_SHARED_CAPTURES.md) now
+addresses the scalar-copy limitation described in this historical report.
+
 The self-hosted compiler now emits eligible expression blocks directly in their
 enclosing frame. For example, this program prints `true` with the retained
 runner and the self-hosted frontend:

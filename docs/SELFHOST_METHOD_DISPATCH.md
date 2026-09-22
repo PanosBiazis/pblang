@@ -120,11 +120,10 @@ not updated or restarted; no live-view/streaming performance benefit is claimed.
 The existing desktop enrollment and permissions are unchanged. No EnterpriseOrg
 server was used. The 212 pre-existing dirty files were preserved by hash.
 
-Shared scalar captures between sibling closures and their owning frame still
-need a lifetime-aware representation. Current capture-by-value cannot simply
-be replaced with one shared slot without handling declarations re-entered by
-loops, escaping closures, try subframes, optimizer behavior and public raw-frame
-interfaces. No incomplete shared-cell implementation was retained here.
+Update: source-level shared scalar captures and owner cleanup are now addressed
+by [shared capture lowering](SELFHOST_SHARED_CAPTURES.md), including loop binding
+identity and ordinary/optimized native-bytecode checks. See that report for
+representation compatibility, measured costs and remaining runtime limits.
 
 Large GC pauses, rooted-collector overhead, general runtime/FFI/polyglot
 integration and broader platforms remain open. The earlier codec's extra metadata
