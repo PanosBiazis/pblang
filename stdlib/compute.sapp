@@ -31,7 +31,8 @@ let MAX_IO_PATHS = 10000;
 let MAX_PATH_BYTES = 4096;
 
 fn _option(options, key, fallback) {
-    if options != nil and is_map(options) and map_has(options, key) { return options[key]; }
+    // Private callers validate the options map once before reading any fields.
+    if options != nil and map_has(options, key) { return options[key]; }
     return fallback;
 }
 
@@ -242,11 +243,11 @@ fn _cpu_map(items, worker, workers, parallel) {
 fn _policy(options, item_count) {
     if options != nil and not is_map(options) { throw "compute: policy options must be a map"; }
     let preferred = str_lower(str(_option(options, "preferred_device", "auto")));
-    let valid = ["auto", "cpu", "sequential", "gpu", "npu", "simd", "distributed"];
-    let known = false;
-    let i = 0;
-    while i < len(valid) { if valid[i] == preferred { known = true; break; } i = i + 1; }
-    if not known { throw "compute: unknown preferred device '" + preferred + "'"; }
+    if preferred != "auto" and preferred != "cpu" and preferred != "sequential"
+       and preferred != "gpu" and preferred != "npu" and preferred != "simd"
+       and preferred != "distributed" {
+        throw "compute: unknown preferred device '" + preferred + "'";
+    }
     let workload = str_lower(str(_option(options, "workload", "generic")));
     let profile = _workload_profile(workload);
     let requested_workers = _option(options, "max_workers", nil);
@@ -329,8 +330,10 @@ fn _matches(workload, kind) {
     return true;
 }
 
-fn _cpu_route(n, cfg, reason, fallback_used) {
-    let estimate = estimate_work(n, cfg);
+fn _cpu_route(n, cfg, reason, fallback_used, estimate = nil) {
+    // A selector may reuse its own freshly validated estimate. Never reuse one
+    // across public calls or across an external executor invocation.
+    if estimate == nil { estimate = estimate_work(n, cfg); }
     let parallel_overhead = _bounded_nonnegative_int(
         try cfg.parallel_overhead_units catch 4096,
         "parallel_overhead_units", 4096, MAX_OVERHEAD_HINT);
@@ -401,14 +404,11 @@ fn select_device(n, devs, cfg) {
     }
     if n == 0 { return _cpu_route(n, cfg, "empty_workload", false); }
     let preferred = cfg.preferred_device;
-    let known_preferred = false;
-    let valid_preferred = ["auto", "cpu", "sequential", "gpu", "npu", "simd", "distributed"];
-    let pi = 0;
-    while pi < len(valid_preferred) {
-        if preferred == valid_preferred[pi] { known_preferred = true; break; }
-        pi = pi + 1;
+    if preferred != "auto" and preferred != "cpu" and preferred != "sequential"
+       and preferred != "gpu" and preferred != "npu" and preferred != "simd"
+       and preferred != "distributed" {
+        throw "compute: invalid preferred device in policy";
     }
-    if not known_preferred { throw "compute: invalid preferred device in policy"; }
     let workload = try cfg.workload catch "generic";
     let allow_accelerators = (try cfg.allow_accelerators catch true) == true;
     let fallback_to_cpu = (try cfg.fallback_to_cpu catch true) == true;
@@ -466,7 +466,7 @@ fn select_device(n, devs, cfg) {
         };
     }
     let reason = if preferred == "auto" { "portable_cpu_selected" } else { rejected[0].reason + "_cpu_fallback" };
-    let route = _cpu_route(n, cfg, reason, preferred != "auto");
+    let route = _cpu_route(n, cfg, reason, preferred != "auto", estimate);
     route.rejected = rejected;
     return route;
 }
@@ -479,6 +479,14 @@ fn _execution_devices(n, cfg) {
        n < cfg.min_accelerator_items {
         return [];
     }
+    // Availability cannot change a workload mismatch. Keep eligible requests
+    // fresh, including newly registered runtimes; this is not a device cache.
+    if cfg.preferred_device == "auto" {
+        if not _matches(cfg.workload, "npu") and not _matches(cfg.workload, "gpu")
+           and not _matches(cfg.workload, "simd") and not _matches(cfg.workload, "distributed") {
+            return [];
+        }
+    } elif not _matches(cfg.workload, cfg.preferred_device) { return []; }
     return devices();
 }
 
@@ -520,8 +528,8 @@ fn run_controlled(items, worker, options = nil) {
 // OS thread per element.
 fn run(items, worker) { return run_controlled(items, worker).results; }
 
-// run_chunked(items, worker, chunk_size) — RAM-aware: process the data chunk-by-chunk
-// (each chunk run in parallel), so a dataset bigger than one chunk still fits.
+// run_chunked snapshots the input slots before invoking workers. Release each
+// completed snapshot batch promptly; the input and full result still reside in RAM.
 fn run_chunked(items, worker, chunk_size) {
     let out = [];
     let cs = chunk(items, chunk_size);
@@ -530,6 +538,7 @@ fn run_chunked(items, worker, chunk_size) {
         let part = run(cs[c], worker);
         let i = 0;
         while i < len(part) { array_push(out, part[i]); i = i + 1; }
+        cs[c] = nil;
         c = c + 1;
     }
     return out;

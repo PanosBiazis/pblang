@@ -42,13 +42,18 @@ CPU cost model rather than blindly starting the maximum worker count.
 
 `run_controlled` automatically skips hardware discovery for empty batches,
 explicit CPU/sequential requests, disabled accelerators, and batches below
-`min_accelerator_items`. In those cases device availability cannot affect the
+`min_accelerator_items`. It also skips discovery when the requested workload
+cannot match the preferred accelerator (or any automatic candidate), using the
+same workload-matching rules as the selector. In those cases availability cannot affect the
 route. Validation, rejection reasons, worker ordering, and strict fallback
 behavior are unchanged. Caller-supplied device lists are still validated,
 including on empty batches. Eligible accelerator calls retain fresh discovery;
 there is no device cache that could hide runtime registration or removal.
-Preferred-device membership checks stop at their first match; all subsequent
-policy and transfer-limit checks still run. Explicit `max_workers` also avoids
+Preferred-device membership uses direct exact-name checks without constructing
+a temporary list; all subsequent policy and transfer-limit checks still run.
+Automatic routing reuses its fresh work estimate when it falls back to CPU;
+estimates are never cached across calls or external executor invocations.
+Explicit `max_workers` also avoids
 querying the CPU count to compute an unused default, for both compute and
 controlled storage reads. Execution also skips that query for batches guaranteed
 to remain serial: zero/one item, a batch below its parallel item threshold,
@@ -63,6 +68,13 @@ cost and platform limitations.
 This also benefits `run` and small batches in `run_chunked`. It does not change
 the explicit inventory functions `devices`, `hardware`, or `summary`, and does
 not enable a GPU/NPU executor merely because a driver is installed.
+
+`run_chunked` releases each completed private input batch after copying its
+results into the output. It still snapshots all input slots before invoking
+workers, preserving behavior when a worker changes the original input array.
+Shared values and returned closures retain their references. The input, initial
+snapshot and complete result still require memory; this API is not a streaming
+or out-of-core iterator. See [routing and chunk lifetime measurements](COMPUTE_ROUTE_LIFETIME_COST.md).
 
 ```sapp
 let compute = import("stdlib:compute.sapp");
@@ -265,6 +277,9 @@ Verification:
 - `tests/semantics/compute_discovery_test.sapp`
 - `tests/semantics/compute_preferred_validation_test.sapp`
 - `tests/semantics/compute_serial_discovery_test.sapp`
+- `tests/semantics/compute_route_estimate_test.sapp`
+- `tests/semantics/compute_workload_discovery_test.sapp`
+- `tests/semantics/compute_chunk_lifetime_test.sapp`
 - `tests/semantics/hardware_cost_routing_test.sapp`
 - `tests/semantics/accelerator_test.sapp`
 - `tests/semantics/polyglot_policy_test.sapp`
@@ -278,5 +293,6 @@ Verification:
 - `bench/compute_discovery.sapp`
 - `bench/compute_explicit_workers.sapp`
 - `bench/compute_serial_discovery.sapp`
+- `bench/compute_chunk_lifetime.sapp`
 - `examples/controlled_compute/main.sapp`
 - `examples/hardware_routing/main.sapp`
