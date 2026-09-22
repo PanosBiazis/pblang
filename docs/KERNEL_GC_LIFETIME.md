@@ -1,5 +1,8 @@
 # Kernel collector: cycles, growth and failure handling
 
+Optional kernel recovery APIs are documented in [low-memory collection](KERNEL_GC_LOW_MEMORY.md).
+They are separate from the default collector described below.
+
 Current synchronization contract: [shared kernel lock and admission](KERNEL_GC_PARALLEL.md).
 The dated IRQ-only section below describes the preceding implementation.
 

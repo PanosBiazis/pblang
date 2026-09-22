@@ -1,5 +1,8 @@
 # Borrow spare object-table space for collection work
 
+Optional kernel recovery APIs are documented in [low-memory collection](KERNEL_GC_LOW_MEMORY.md).
+They are separate from the default collector described below.
+
 The PBLang kernel collector now uses existing unused ownership-table slots for its
 work queue when the entire queue fits without overlapping active entries. With
 `n` owned entries and table capacity `capacity`, borrowing requires

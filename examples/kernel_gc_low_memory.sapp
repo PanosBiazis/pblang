@@ -1,0 +1,100 @@
+// pblang:target=kernel
+// pblang:extern heap_init heap_alloc heap_free gc_new gc_set_auto gc_set_threshold gc_alloc_low_memory gc_alloc_rooted_low_memory gc_alloc gc_set_child gc_add_root gc_remove_root gc_live gc_collections kernel_gc_collect kernel_gc_collect_low_memory
+// QEMU-only: prepend kernel heap, GC and optional gc_low_memory module.
+// Metadata writes are failure injection, never an application API.
+fn verify(ok) { if not ok { outb(244,1); while 1>0 { hlt(); } } }
+fn free_bytes(h) {
+    let p=peek32(h); let total=0; let steps=0;
+    while p!=0 {
+        verify(steps<2048); total=total+peek32(p);
+        let next=peek32(p+4); verify(next==0 or next>p); p=next; steps=steps+1;
+    }
+    return total;
+}
+fn exhaust(h) { let p=heap_alloc(h,8); while p!=0 { p=heap_alloc(h,8); } verify(peek32(h)==0); }
+fn kmain() {
+    let h=kmalloc(8); let region=kmalloc(16384); heap_init(h,region,16384);
+    let g=gc_new(h); verify(g!=0); gc_set_auto(g,0);
+    let first=gc_alloc(g,1); verify(first!=0); let prev=first; let i=1;
+    while i<129 {
+        let next=gc_alloc(g,1); verify(next!=0); gc_set_child(prev,0,next); prev=next; i=i+1;
+    }
+    gc_set_child(prev,0,first); verify(gc_add_root(g,first)==1);
+    verify(gc_add_root(g,first)==1 and gc_add_root(g,prev)==1);
+    let table=peek32(g+20); let saved=kmalloc(516); i=0;
+    while i<129 { poke32(saved+i*4,peek32(table+i*4)); i=i+1; }
+    exhaust(h);
+    // Above half occupancy and out of scratch space: walk the admitted chain directly.
+    i=0; while i<100 { verify(kernel_gc_collect_low_memory(g)==0 and gc_live(g)==129 and peek32(h)==0); i=i+1; }
+    i=0; while i<130 { verify(peek32(table+i*4)==peek32(saved+i*4)); i=i+1; }
+    poke32(g+44,2147483647); verify(kernel_gc_collect_low_memory(g)==0 and peek32(g+44)==1);
+    verify(gc_remove_root(g,first)==2 and gc_remove_root(g,prev)==1);
+    verify(kernel_gc_collect_low_memory(g)==0 and gc_live(g)==0);
+
+    let h2=kmalloc(8); let r2=kmalloc(16384); heap_init(h2,r2,16384);
+    let g2=gc_new(h2); verify(g2!=0); gc_set_auto(g2,0);
+    first=gc_alloc(g2,1); verify(first!=0); prev=first; i=1;
+    while i<130 {
+        let next=gc_alloc(g2,1); verify(next!=0); gc_set_child(prev,0,next); prev=next; i=i+1;
+    }
+    gc_set_child(prev,0,first); verify(gc_add_root(g2,first)==1);
+    let garbage=gc_alloc(g2,0); verify(garbage!=0); exhaust(h2);
+    table=peek32(g2+20); saved=kmalloc(524); i=0;
+    while i<131 { poke32(saved+i*4,peek32(table+i*4)); i=i+1; }
+    let since=peek32(g2+12); let rounds=gc_collections(g2);
+    // Inject an undercount: the fallback must stop after partial marking without
+    // sweeping, changing ownership entries or releasing its metadata storage.
+    poke32(g2+16,129); verify(kernel_gc_collect_low_memory(g2)==0-1); poke32(g2+16,131);
+    verify(gc_collections(g2)==rounds and peek32(g2+12)==since and peek32(h2)==0);
+    verify(peek32(g2+44)==1 and peek32(first)==1);
+    i=0; while i<131 { verify(peek32(table+i*4)==peek32(saved+i*4)); i=i+1; }
+    poke32(g2+16,129); verify(kernel_gc_collect_low_memory(g2)==0-1); poke32(g2+16,131);
+    verify(peek32(g2+44)==2 and peek32(h2)==0);
+    // Retry after generation wrap; the disconnected leaf must be reclaimed.
+    poke32(g2+44,2147483647);
+    verify(kernel_gc_collect_low_memory(g2)==0 and gc_live(g2)==130 and peek32(g2+44)==1);
+    verify(gc_collections(g2)==rounds+1 and peek32(g2+12)==0 and free_bytes(h2)==16);
+    i=0; while i<130 { verify(peek32(table+i*4)==peek32(saved+i*4)); i=i+1; }
+    // The automatic path must reclaim before allocating a replacement.
+    verify(gc_alloc(g2,0)!=0 and peek32(h2)==0); rounds=gc_collections(g2);
+    verify(gc_alloc_low_memory(g2,0)==0 and gc_collections(g2)==rounds);
+    verify(gc_alloc_low_memory(g2,-1)==0 and gc_alloc_rooted_low_memory(g2,536870906)==0);
+    gc_set_auto(g2,1); gc_set_threshold(g2,0);
+    let replacement=gc_alloc_rooted_low_memory(g2,0); verify(replacement!=0 and gc_live(g2)==131);
+    verify(gc_collections(g2)==rounds+1 and peek32(g2+24)==2);
+    gc_set_auto(g2,0); i=0;
+    while i<100 { verify(kernel_gc_collect_low_memory(g2)==0 and gc_live(g2)==131 and peek32(h2)==0); i=i+1; }
+    verify(gc_remove_root(g2,first)==1 and gc_remove_root(g2,replacement)==1);
+    verify(kernel_gc_collect_low_memory(g2)==0 and gc_live(g2)==0);
+
+    // A real branch cannot use this fallback, even when unreachable. Reject
+    // before changing generations, marks, ownership or counters; retry normally.
+    let h3=kmalloc(8); let r3=kmalloc(16384); heap_init(h3,r3,16384);
+    let g3=gc_new(h3); verify(g3!=0); gc_set_auto(g3,0);
+    let root=gc_alloc(g3,2); let child=gc_alloc(g3,1); verify(root!=0 and child!=0);
+    gc_set_child(root,0,child); gc_set_child(root,1,root); gc_set_child(child,0,child);
+    verify(gc_add_root(g3,child)==1); i=0;
+    while i<127 { verify(gc_alloc(g3,0)!=0); i=i+1; }
+    let reserve=heap_alloc(h3,1024); verify(reserve!=0); exhaust(h3);
+    since=peek32(g3+12); verify(kernel_gc_collect_low_memory(g3)==0-1);
+    verify(gc_live(g3)==129 and gc_collections(g3)==0 and peek32(g3+44)==0);
+    verify(peek32(root)==0 and peek32(child)==0 and peek32(g3+12)==since and peek32(h3)==0);
+    heap_free(h3,reserve); let available=free_bytes(h3);
+    verify(kernel_gc_collect(g3)==0 and gc_live(g3)==1 and free_bytes(h3)==available+24+127*16);
+    verify(gc_remove_root(g3,child)==1 and kernel_gc_collect_low_memory(g3)==0 and gc_live(g3)==0);
+    // A new object can fit while root-table growth cannot. Atomic publication
+    // must unwind that object exactly once, preserving all previously saved roots.
+    let h4=kmalloc(8); let r4=kmalloc(4096); heap_init(h4,r4,4096);
+    let g4=gc_new(h4); verify(g4!=0); gc_set_auto(g4,0);
+    let kept=gc_alloc(g4,0); verify(kept!=0); i=0;
+    while i<64 { verify(gc_add_root(g4,kept)==1); i=i+1; }
+    reserve=heap_alloc(h4,8); verify(reserve!=0); exhaust(h4); heap_free(h4,reserve);
+    verify(free_bytes(h4)==16); i=0;
+    while i<100 {
+        verify(gc_alloc_rooted_low_memory(g4,0)==0 and gc_live(g4)==1);
+        verify(peek32(g4+24)==64 and free_bytes(h4)==16 and gc_collections(g4)==0);
+        i=i+1;
+    }
+    verify(gc_remove_root(g4,kept)==64 and kernel_gc_collect_low_memory(g4)==0 and gc_live(g4)==0);
+    outb(244,42); while 1>0 { hlt(); }
+}
