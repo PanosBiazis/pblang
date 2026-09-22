@@ -1,0 +1,108 @@
+let FE = import("stdlib/compiler/selfhost_frontend.sapp");
+let VM = import("stdlib/compiler/vm.sapp");
+let OPT = import("stdlib/compiler/optimizer.sapp");
+let PB = import("stdlib/selfhost_pbck.sapp");
+let LOADER = import("stdlib/selfhost_loader.sapp");
+fn expect(ok, label) { if not ok { throw "FAIL method arity: " + label; } }
+fn check_source(source, expected) {
+    let compiled = FE.frontend_compile(source);
+    expect(compiled.ok, "source compiles: " + str(compiled.diagnostics));
+    let chunks = [compiled.chunk, OPT.optimize_safe(compiled.chunk).chunk];
+    for c in chunks {
+        expect(VM.run(c).output == expected, "unbounded output");
+        expect(VM.run_bounded(c).output == expected, "bounded output");
+        let bytes = PB.serialize_chunk(c);
+        expect(VM.run(PB.deserialize_chunk(bytes)).output == expected, "persisted output");
+        let loaded = LOADER.run_pbck_bytes(bytes);
+        expect(loaded.ok and loaded.output == expected, "loader output");
+    }
+}
+let operations = [
+    ["+","__add__","__radd__"], ["-","__sub__","__rsub__"],
+    ["*","__mul__","__rmul__"], ["/","__div__","__rdiv__"],
+    ["%","__mod__","__rmod__"], ["==","__eq__","__eq__"],
+    ["!=","__ne__","__ne__"], [">","__gt__","__lt__"],
+    [">=","__ge__","__le__"], ["<","__lt__","__gt__"],
+    ["<=","__le__","__ge__"]
+];
+for op in operations {
+    for reflected in [false,true] {
+        let name = if reflected { op[2] } else { op[1] };
+        let expr = if reflected { "3 "+op[0]+" obj" } else { "obj "+op[0]+" 3" };
+        for params in ["a", "a,b,c"] {
+            let src = "let calls=0;fn method("+params+"){calls=calls+1;return 9;}"
+                +"let obj=map{"+name+":method};let result=try ("+expr+") catch 0;print result;print calls;";
+            check_source(src,[0,0]);
+        }
+        check_source("let calls=0;fn method(a,b,c=9){calls=calls+1;return c;}"
+            +"let obj=map{__class:map{"+name+":method}};print ("+expr+");print calls;",[9,1]);
+    }
+}
+// A defaulted final parameter does not excuse a missing required argument.
+check_source("let defaults=0;"
+    +"fn method(a,b,c,d=8){defaults=defaults+1;return d;}let obj=map{__add__:method};"
+    +"let result=try (obj+3) catch 0;print result;print defaults;",[0,0]);
+// A rejected forward method must not silently fall back to the reflected one.
+check_source("let calls=0;let left=map{__add__:fn(a){return 7;}};"
+    +"let right=map{__radd__:fn(a,b){calls=calls+1;return 8;}};"
+    +"let result=try (left+right) catch 0;print result;print calls;",[0,0]);
+// Direct dispatch must not treat a valid false/nil result as absence.
+check_source("let calls=0;let a=map{__add__:fn(x,y){return nil;}};"
+    +"let b=map{__radd__:fn(x,y){calls=calls+1;return 8;}};"
+    +"print (a+b);print calls;",[nil,0]);
+check_source("let calls=0;let a=map{__eq__:fn(x,y){return false;}};"
+    +"let b=map{__eq__:fn(x,y){calls=calls+1;return true;}};"
+    +"print (a==b);print calls;",[false,0]);
+check_source("let a=map{__radd__:fn(x,y){return nil;}};print (3+a);",[nil]);
+fn raw(arity, minimum) {
+    return map{arity:arity,min_arity:minimum,chunk:map{
+        constants:[99,"called"], instructions:[map{op:0,operand:0},map{op:13,operand:1},
+            map{op:0,operand:0},map{op:19,operand:0}]
+    }};
+}
+fn call(callee, count) {
+    let ins=[map{op:0,operand:0}];
+    for i count { array_push(ins,map{op:0,operand:1}); }
+    array_push(ins,map{op:18,operand:count}); array_push(ins,map{op:12,operand:0});
+    return map{constants:[callee,7],instructions:ins};
+}
+for bounded in [false,true] {
+    for count in [0,1,2,3,4] {
+        for minimum in [count+1,0] {
+            let arity=if minimum==0 {count-1} else {minimum};
+            if arity>=0 {
+                let globals=map{};
+                let c=call(raw(arity,minimum),count);
+                let outcome=try map{ok:true,value:if bounded {VM.run_seeded_bounded(c,globals)} else {VM.run_seeded(c,globals)}} catch map{ok:false};
+                let rejected=not outcome.ok;
+                expect(rejected and not map_has(globals,"called"),"raw call body must not run");
+            }
+        }
+        expect(VM.run(call(raw(count,count),count)).output==[99],"valid raw call");
+    }
+    // Invoke raw/closure methods via seeded data, not compiler-created constants.
+    for wrapped in [false,true] {
+        let lexical=map{}; let method=raw(3,3);
+        if wrapped { method=map{__fn:method,__upvalues:[],__globals:lexical}; }
+        let globals=map{obj:map{__add__:method},__import_cache__:map{known:7}};
+        let c=map{constants:["obj",3],instructions:[map{op:14,operand:0},map{op:0,operand:1},map{op:1,operand:0}]};
+        let outcome=try map{ok:true,value:if bounded {VM.run_seeded_bounded(c,globals)} else {VM.run_seeded(c,globals)}} catch map{ok:false};
+                let rejected=not outcome.ok;
+        expect(rejected and not map_has(globals,"called") and not map_has(lexical,"called"),"raw/closure method rejection");
+        expect(not map_has(lexical,"__import_cache__"),"rejection precedes cache propagation");
+        method=raw(2,2);
+        if wrapped { method=map{__fn:method,__upvalues:[],__globals:lexical}; }
+        globals=map{obj:map{__add__:method},__import_cache__:map{known:7}};
+        array_push(c.instructions,map{op:12,operand:0});
+        let result=if bounded {VM.run_seeded_bounded(c,globals)} else {VM.run_seeded(c,globals)};
+        expect(result.output==[99],"valid raw/closure method");
+        if wrapped {
+            expect(lexical.called==99 and lexical.__import_cache__.known==7,"valid lexical globals and cache");
+            expect(not map_has(globals,"called"),"caller namespace retained");
+        } else {expect(globals.called==99,"raw method caller globals");}
+    }
+}
+// Legacy raw constants with no arity fields retain their prior contract.
+let legacy=raw(0,0); map_remove(legacy,"arity");map_remove(legacy,"min_arity");
+expect(VM.run(call(legacy,4)).output==[99],"absent legacy metadata retained");
+print "selfhost_method_arity_pass";

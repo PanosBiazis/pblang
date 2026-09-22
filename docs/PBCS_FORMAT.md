@@ -72,3 +72,6 @@ VM/method entry-point parity, change scalar closure sharing, provide hard memory
 isolation, or reduce GC pauses. Existing container admission limits and whole-file
 reads are unchanged. A bounded container reader is not a sandbox for arbitrary
 code. No new source-size or general application limit is introduced.
+
+Subsequent runtime work adds [operator/raw-function arity admission](SELFHOST_METHOD_DISPATCH.md).
+That is a separate VM change; PBCS metadata alone cannot enforce every call route.
