@@ -50,8 +50,13 @@ there is no device cache that could hide runtime registration or removal.
 Preferred-device membership checks stop at their first match; all subsequent
 policy and transfer-limit checks still run. Explicit `max_workers` also avoids
 querying the CPU count to compute an unused default, for both compute and
-controlled storage reads. Omitted or `nil` worker counts retain fresh detection.
-No device or policy cache is added.
+controlled storage reads. Execution also skips that query for batches guaranteed
+to remain serial: zero/one item, a batch below its parallel item threshold,
+disabled compute parallelism, or an explicit sequential compute request.
+Omitted or `nil` worker counts still trigger fresh detection whenever parallel
+execution is possible. Public `policy()` always resolves its worker default,
+including for sequential preferences. No device or policy cache is added.
+See [automatic serial discovery measurements](COMPUTE_AUTOMATIC_SERIAL_COST.md).
 See [validation cost measurements](COMPUTE_VALIDATION_COST.md) for the measured
 cost and platform limitations.
 
@@ -259,6 +264,7 @@ Verification:
 - `tests/semantics/compute_test.sapp`
 - `tests/semantics/compute_discovery_test.sapp`
 - `tests/semantics/compute_preferred_validation_test.sapp`
+- `tests/semantics/compute_serial_discovery_test.sapp`
 - `tests/semantics/hardware_cost_routing_test.sapp`
 - `tests/semantics/accelerator_test.sapp`
 - `tests/semantics/polyglot_policy_test.sapp`
@@ -271,5 +277,6 @@ Verification:
 - `bench/hardware_cost_routing_stages.sapp`
 - `bench/compute_discovery.sapp`
 - `bench/compute_explicit_workers.sapp`
+- `bench/compute_serial_discovery.sapp`
 - `examples/controlled_compute/main.sapp`
 - `examples/hardware_routing/main.sapp`
