@@ -49,6 +49,14 @@ alone cannot repair it. The module cache's default toolchain fingerprint include
 `selfhost_pbck.sapp`, so changed codec source changes that fingerprint. This does
 not authenticate cache contents or custom dependency lists.
 
+## Integer packing implementation
+
+The writer checks each u32 value before packing. Shift/mask results, already
+within the byte range, are appended directly instead of revalidating each
+result. Reader validation and the v3 wire layout are unchanged. The independent
+arithmetic-oracle test and before/after artifact fingerprints are described in
+[writer measurements and limitations](PBCS_WRITER_VALIDATION_2026-09-22.md).
+
 ## Scope and validation
 
 `tests/semantics/selfhost_pbck_arity_test.sapp` covers plain/optimized compilation,
