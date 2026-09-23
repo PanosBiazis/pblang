@@ -271,6 +271,8 @@ catchable PBLang errors. The table below covers reported validation failures:
 
 ## See also
 
+- [`Windows_ABI_bytes.md`](Windows_ABI_bytes.md) — byte validation before native
+  writes, integer `HeapFree` result handling, Windows test evidence and limits.
 - [`Capability_model.md`](Capability_model.md) — full capability story.
 - [`Embedding_lifecycle.md`](Embedding_lifecycle.md) — `VmHost` overrides
   for embedders that need to customise FFI loading from in-memory data
