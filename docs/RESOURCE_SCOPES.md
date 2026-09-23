@@ -157,6 +157,10 @@ runs even after resource cleanup; this library does not repair host heap GC.
 
 ## Current allocation follow-up
 
+[Scoped child-process ownership](PROCESS_SCOPES.md) adds process-specific exit
+policies, a default cancellation path, and explicit recovery ownership. The public
+process backend still fails closed until its FFI contract is verified.
+
 [Callback allocation cost and installed desktop integration](RESOURCE_SCOPE_ALLOCATION_COST.md)
 replaces the earlier private tuples with exception state on the existing ledger,
 including mixed-failure measurements and current compatibility limits.
