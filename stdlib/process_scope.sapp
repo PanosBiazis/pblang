@@ -1,0 +1,114 @@
+// Optional synchronous ownership of one bounded child process.
+// This module never discovers or terminates unrelated system processes.
+let Process = import("stdlib:process.sapp");
+
+fn _integer(value, maximum, label) {
+    if type(value) != "number" or value != num_floor(value)
+       or value < 0 or value > maximum {
+        throw "process_scope: invalid " + label;
+    }
+    return value;
+}
+
+fn _policy(options) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { throw "process_scope: cleanup options must be a map"; }
+    for key in map_keys(options) {
+        if key != "on_exit" and key != "grace_ms" and key != "wait_ms" {
+            throw "process_scope: unknown cleanup option";
+        }
+    }
+    let mode = try options.on_exit catch "cancel";
+    if mode != "cancel" and mode != "wait" {
+        throw "process_scope: on_exit must be cancel or wait";
+    }
+    return map{on_exit:mode,
+        grace_ms:_integer(try options.grace_ms catch 250, 10000, "grace_ms"),
+        wait_ms:_integer(try options.wait_ms catch 1500, 10805000, "wait_ms")};
+}
+
+// body(control) returns {ok:true,value:...} or {ok:false,error:...}.
+// control offers poll(), finish(wait_ms), cancel(grace_ms), not a PID/handle.
+// "wait" applies only after a successful body; failures always request cancel.
+fn with_process(candidates, args, options, body, cleanup = nil) {
+    let policy = _policy(cleanup);
+    if type(body) != "closure" { throw "process_scope: body must be a PBLang function"; }
+    let state = map{handle:nil, closed:false, phase:"body", terminal:nil};
+    let check_active = fn() {
+        if state.phase != "body" or state.closed {
+            throw "process_scope: controller is closed";
+        }
+    };
+    let control = map{
+        poll:fn() { check_active(); return Process.poll_bounded(state.handle); },
+        cancel:fn(grace_ms = 250) {
+            check_active(); return Process.request_cancel_bounded(state.handle, grace_ms);
+        },
+        finish:fn(wait_ms = nil) {
+            check_active();
+            let terminal = Process.finish_bounded(state.handle, wait_ms);
+            state.closed = (try terminal.handle_closed catch false) == true;
+            state.terminal = terminal;
+            return terminal;
+        }
+    };
+    let started = Process.start_fixed_bounded(candidates, args, options);
+    if (try started.started catch false) {
+        state.handle = map{format:started.format,id:started.id};
+    }
+    let threw=false; let result:any=nil;
+    if started.ok {
+        try {result=body(control);} catch {threw=true;}
+    } else {result=map{ok:false,error:started};}
+    let valid = not threw and type(result)=="map"
+        and type(try result.ok catch nil)=="bool"
+        and ((result.ok and map_has(result,"value"))
+            or (not result.ok and map_has(result,"error")));
+    // Snapshot the envelope before cleanup; preserve returned primary errors.
+    let body_ok=valid and result.ok;
+    let value:any=nil; let primary:any=nil; let body_result:any=nil;
+    let body_status="invalid_result";
+    if threw {body_status="exception";}
+    if valid {
+        body_status="returned";
+        if body_ok {value=result.value;body_result=map{ok:true,value:value};}
+        else {primary=result.error;body_result=map{ok:false,error:primary};}
+    }
+    state.phase="cleanup";
+    let attempted=0; let failures=[];
+    if state.handle!=nil and not state.closed {
+        attempted=1; let cleanup_threw=false; let terminal:any=nil;
+        if policy.on_exit=="wait" and body_ok {
+            terminal=try Process.finish_bounded(state.handle,policy.wait_ms)
+                catch {cleanup_threw=true; nil};
+        } else {
+            terminal=try Process.close_bounded(state.handle,policy.grace_ms,policy.wait_ms)
+                catch {cleanup_threw=true; nil};
+        }
+        state.terminal=terminal;
+        state.closed=(try terminal.handle_closed catch false)==true;
+        if not state.closed {
+            let failure=map{id:0,kind:"error_result",
+                result:map{ok:false,error:"child cleanup remains pending"}};
+            if cleanup_threw {failure.kind="exception";failure.result=nil;}
+            array_push(failures,failure);
+        }
+    }
+    state.phase="closed";
+    let recovery=state.handle!=nil and not state.closed;
+    let recovery_handle:any=nil;
+    if recovery {recovery_handle=state.handle;}
+    let terminal_result=state.terminal;
+    // Escaped closed controllers keep only their phase, not output buffers or
+    // recovery ownership. The returned report now owns those references.
+    state.terminal=nil;state.handle=nil;
+    return map{format:"pblang.process-scope.result.v1",
+        ok:body_ok and len(failures)==0,value:value,error:primary,
+        body_result:body_result,body_status:body_status,
+        original_error_available:valid and not body_ok,
+        cleanup_ok:len(failures)==0,cleanup_errors:failures,cleanups_attempted:attempted,
+        cleanup_policy:policy,process_result:terminal_result,
+        recovery_required:recovery,recovery_handle:recovery_handle};
+}
+
+export with_process;
