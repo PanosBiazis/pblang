@@ -1,5 +1,9 @@
 # Windows ABI byte validation and release results
 
+The historical measurements below describe the initial correctness fix.
+See [batch-write optimization](Windows_ABI_batch_performance.md) for the
+subsequent implementation, new measurements and remaining limits.
+
 ## Behavior
 
 `windows_native_abi.write_bytes` validates every input element as an integral
