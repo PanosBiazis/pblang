@@ -98,3 +98,15 @@ General cycle collection, long collection pauses, runtime/FFI/polyglot
 integration and measured GPU/NPU execution remain separate outstanding work.
 The installed PB-MCP was not updated; this change establishes no live-view
 performance benefit and does not complete the 1.0 stable requirements.
+
+## Held-parent publication and schema reuse
+
+The filesystem caller now uses the validated batch byte writer when converting
+UTF-8 paths. The fixed sixteen-call schema is built once per module load and
+kept private, rather than allocating sixteen maps at every native call.
+Per-call symbol/arity checks and closed-state checks remain active.
+
+[Windows publication validation](WINDOWS_PUBLICATION_VALIDATION.md) documents
+the destination-junction fix, invalid-byte side-effect prevention, modeled
+cleanup failure, native tests and measured cost. These are source-library
+changes, not completion of the Windows private-root/package-ACL requirements.

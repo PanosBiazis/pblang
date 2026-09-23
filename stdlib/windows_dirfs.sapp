@@ -89,7 +89,8 @@ fn _close_handle(fs, handle) {
 fn _components(path, allow_root = true) {
     if type(path) != "string" or len(path) > MAX_PATH or str_contains(path, strfromcharcode(0))
         or str_starts_with(path, "\\") or str_starts_with(path, "/") or str_contains(path, ":") { return nil; }
-    if path == "" or path == "." or path == "root" { return if allow_root { [] } else { nil }; }
+    if path == "" or path == "." { return if allow_root { [] } else { nil }; }
+    if allow_root and path == "root" { return []; }
     let raw = str_split(str_replace_all(path, "\\", "/"), "/"); let out = [];
     let i = 0; while i < len(raw) {
         if raw[i] == "" or raw[i] == "." or raw[i] == ".." or len(raw[i]) > MAX_COMPONENT
@@ -112,10 +113,8 @@ fn _wide(fs, text) {
     if type(text) != "string" or str_contains(text, strfromcharcode(0)) { return _error("invalid UTF-8 path"); }
     let bytes = str_to_bytes(text); let source = ABI.allocate(fs.abi, len(bytes) + 1);
     if source == 0 { return _error("UTF-8 path allocation failed"); }
-    let copied = true; let i = 0;
-    while i < len(bytes) and copied {
-        copied = ABI.write_u8(fs.abi, source, i, bytes[i]); i = i + 1;
-    }
+    // Reuse the validated batch writer; each packed word still rechecks ownership.
+    let copied = ABI.write_bytes(fs.abi, source, 0, bytes);
     if not copied or not ABI.write_u8(fs.abi, source, len(bytes), 0) {
         ABI.free(fs.abi, source); return _error("UTF-8 path copy failed");
     }
@@ -416,9 +415,36 @@ fn _delete_handle(fs, handle) {
     ABI.free(fs.abi, info); return ok;
 }
 fn _rename_handle(fs, handle, destination, replace) {
-    let relative = _relative(destination, false);
-    if relative == nil { return _error("invalid handle-relative rename destination"); }
-    let wide = _wide(fs, relative); if not wide.ok { return wide; }
+    let parts = _components(destination, false);
+    if parts == nil or len(parts) == 0 { return _error("invalid handle-relative rename destination"); }
+    let leaf = array_pop(parts);
+    let parent = map{ok:true,handle:fs.root_handle,owned:false};
+    if len(parts) > 0 {
+        parent = _open_relative(fs, _join(parts,"\\"),
+            SYNCHRONIZE + FILE_LIST_DIRECTORY + FILE_TRAVERSE + FILE_READ_ATTRIBUTES,
+            FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT + FILE_DIRECTORY_FILE);
+        parent.owned = true;
+    }
+    if not parent.ok { return _error("rename destination parent cannot be held without reparse traversal"); }
+    let tag = _tag_info(fs, parent.handle);
+    let result = _error("rename destination parent must be a non-reparse directory");
+    if tag.ok and bit_and(tag.attributes, FILE_ATTRIBUTE_REPARSE_POINT) == 0
+        and bit_and(tag.attributes,16) == 16 {
+        // Resolve only a single leaf against the held final parent. Passing the
+        // original multi-component path to NtSetInformationFile follows junctions.
+        result = try _rename_in_parent(fs, handle, map{handle:parent.handle,name:leaf}, replace)
+            catch _error("held-parent rename failed");
+    }
+    let closed = not parent.owned or _close_handle(fs, parent.handle);
+    if not closed and result.ok {
+        result = _error("rename published but destination parent cleanup failed");
+        result.published = true;
+    }
+    result.destination_parent_closed = closed;
+    return result;
+}
+fn _rename_in_parent(fs, handle, destination, replace) {
+    let wide = _wide(fs, destination.name); if not wide.ok { return wide; }
     // FILE_RENAME_INFO is 24 bytes on Win64 because FileName[1] and the
     // structure tail are naturally aligned. Keep a UTF-16 terminator in the
     // backing allocation even though FileNameLength excludes it.
@@ -432,7 +458,7 @@ fn _rename_handle(fs, handle, destination, replace) {
     let bytes = ABI.read_bytes(fs.abi, wide.pointer, 0, wide.bytes);
     let replace_flag = 0; if replace { replace_flag = 1; }
     let prepared = bytes != nil and ABI.write_u8(fs.abi, info, 0, replace_flag)
-        and ABI.write_u64(fs.abi, info, 8, fs.root_handle)
+        and ABI.write_u64(fs.abi, info, 8, destination.handle)
         and ABI.write_u32(fs.abi, info, 16, wide.bytes)
         and ABI.write_bytes(fs.abi, info, 20, bytes)
         and ABI.write_u16(fs.abi, info, 20 + wide.bytes, 0);
@@ -446,7 +472,7 @@ fn _rename_handle(fs, handle, destination, replace) {
     if not prepared { return _error("rename buffer preparation failed"); }
     if not called.ok { return _error("NtSetInformationFile rename gate failed"); }
     if status < 0 { return _error("handle-relative rename failed", status); }
-    return map{ ok: true, atomic: true, root_relative: true, ntstatus: status };
+    return map{ ok: true, atomic: true, published: true, root_relative: true, ntstatus: status };
 }
 fn _parent_stage(path) {
     let parts = _components(path, false); if parts == nil or len(parts) < 1 { return nil; }
@@ -454,7 +480,13 @@ fn _parent_stage(path) {
     let stage = ".pblang-win-stage-" + str_slice(sha256(base64_encode_bytes(random_bytes(24))), 0, 32);
     if len(parent) == 0 { return stage; } return _join(parent, "\\") + "\\" + stage;
 }
+fn _valid_bytes(bytes) {
+    if type(bytes) != "array" or len(bytes) > MAX_BYTES { return false; }
+    for value in bytes { if not _integer(value,0,255) { return false; } }
+    return true;
+}
 fn write_new_exclusive(fs, path, bytes, create_parents = true) {
+    if not _valid_bytes(bytes) { return _error("bytes must be a bounded byte array"); }
     if create_parents {
         let parts = _components(path, false); if parts == nil { return _error("invalid write path"); }
         let current = []; let i = 0; while i + 1 < len(parts) {
@@ -462,7 +494,7 @@ fn write_new_exclusive(fs, path, bytes, create_parents = true) {
             if not made.ok { return made; } i = i + 1;
         }
     }
-    let opened = _open_relative(fs, path, SYNCHRONIZE + FILE_WRITE_DATA + FILE_READ_ATTRIBUTES,
+    let opened = _open_relative(fs, path, SYNCHRONIZE + FILE_WRITE_DATA + FILE_READ_ATTRIBUTES + DELETE_ACCESS,
         FILE_CREATE, FILE_SYNCHRONOUS_IO_NONALERT + FILE_NON_DIRECTORY_FILE);
     if not opened.ok { return _error("destination exists or cannot be created exclusively", try opened.os_error catch nil); }
     let result = _write_handle(fs, opened.handle, bytes);
@@ -473,7 +505,7 @@ fn write_new_exclusive(fs, path, bytes, create_parents = true) {
         descriptor_bound_parent: true, nofollow: true };
 }
 fn write_atomic(fs, path, bytes, create_parents = true) {
-    if type(bytes) != "array" or len(bytes) > MAX_BYTES { return _error("bytes must be a bounded array"); }
+    if not _valid_bytes(bytes) { return _error("bytes must be a bounded byte array"); }
     if create_parents {
         let parts = _components(path, false); if parts == nil { return _error("invalid write path"); }
         let current = []; let i = 0; while i + 1 < len(parts) {
@@ -488,10 +520,11 @@ fn write_atomic(fs, path, bytes, create_parents = true) {
     let wrote = _write_handle(fs, opened.handle, bytes);
     let renamed = if wrote.ok { _rename_handle(fs, opened.handle, path, true) }
         else { _error("write failed before atomic publication") };
-    let published = wrote.ok and renamed.ok;
+    let published = wrote.ok and (renamed.ok or (try renamed.published catch false));
     if not published { _delete_handle(fs, opened.handle); }
     _close_handle(fs, opened.handle);
     if not wrote.ok { return wrote; }
+    if published and not renamed.ok { return renamed; }
     if not published { return _error("staged file cannot be published atomically",
         try renamed.os_error catch nil); }
     return map{ ok: true, path: path, size: len(bytes), atomic: true,

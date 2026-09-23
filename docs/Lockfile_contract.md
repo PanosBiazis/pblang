@@ -75,3 +75,9 @@ See `examples/portable_lock_quoted_paths.sapp` and
 function and filesystem publication have separate platform requirements:
 `publish()` still relies on Linux directory handling; safe Windows publication
 is not completed by this parser correction.
+
+Windows foundation update: the low-level filesystem now holds the final rename
+parent and rejects destination junctions, with malformed write payloads rejected
+before filesystem effects. See [validation](WINDOWS_PUBLICATION_VALIDATION.md).
+The portable publisher still requires Windows backend/root and package authority
+integration; these fixes do not enable Windows lockfile publication.
