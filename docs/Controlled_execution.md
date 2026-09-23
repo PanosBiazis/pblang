@@ -107,6 +107,21 @@ contains runtime exceptions and invokes a caller-supplied equivalent CPU
 implementation only when fallback is enabled. Supported hook classes are
 `gpu`, `npu`, `simd`, and `distributed`.
 
+### Revalidation within one compute request
+
+`run_controlled` builds a fresh validated scalar policy for each call, then uses
+an internal selector that avoids revalidating those same scalar fields. Public
+`policy`, `select_device` and `estimate_work` retain their input checks and
+mutable-policy behavior; a caller-supplied `validated` field or format marker
+cannot activate the internal route. Device lists and item counts remain checked.
+No policy is cached across calls. The CPU fallback route is prepared before an
+accelerator hook executes, so a hook changing the original options does not
+change that call's policy. A subsequent call validates the new options again.
+
+See [validation reuse measurements](COMPUTE_VALIDATION_REUSE.md) for parity,
+resource measurements and unresolved limits. This change neither grants native
+capabilities nor changes the collector, thread isolation or accelerator kernels.
+
 ## Polyglot policy
 
 `stdlib:polyglot_policy.sapp` validates runners when a policy is constructed.
@@ -277,6 +292,7 @@ Verification:
 - `tests/semantics/compute_discovery_test.sapp`
 - `tests/semantics/compute_preferred_validation_test.sapp`
 - `tests/semantics/compute_serial_discovery_test.sapp`
+- `tests/semantics/compute_validated_route_test.sapp`
 - `tests/semantics/compute_route_estimate_test.sapp`
 - `tests/semantics/compute_workload_discovery_test.sapp`
 - `tests/semantics/compute_chunk_lifetime_test.sapp`
@@ -291,6 +307,7 @@ Verification:
 - `bench/controlled_execution_stages.sapp`
 - `bench/hardware_cost_routing_stages.sapp`
 - `bench/compute_discovery.sapp`
+- `bench/compute_route_validation.sapp`
 - `bench/compute_explicit_workers.sapp`
 - `bench/compute_serial_discovery.sapp`
 - `bench/compute_chunk_lifetime.sapp`
