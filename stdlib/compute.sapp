@@ -288,6 +288,21 @@ fn _policy(options, item_count) {
 
 fn policy(options = nil) { return _policy(options, nil); }
 
+// Only validated scalar inputs reach this shared estimate constructor.
+fn _estimate_values(n, work_per_item, transfer_per_item) {
+    let work_units = _sat_mul(n, work_per_item);
+    let transfer_bytes = _sat_mul(n, transfer_per_item);
+    return map{
+        format: "pblang.compute.estimate.v1",
+        items: n,
+        work_units_per_item: work_per_item,
+        transfer_bytes_per_item: transfer_per_item,
+        work_units: work_units,
+        transfer_bytes: transfer_bytes,
+        saturated: work_units == MAX_COST or transfer_bytes == MAX_COST,
+    };
+}
+
 fn estimate_work(n, cfg) {
     n = _nonnegative_int(n, "item count");
     if cfg == nil or not is_map(cfg) or (try cfg.format catch "") != "pblang.compute.policy.v1" {
@@ -300,17 +315,7 @@ fn estimate_work(n, cfg) {
     let transfer_per_item = _bounded_nonnegative_int(
         try cfg.transfer_bytes_per_item catch profile.transfer,
         "transfer_bytes_per_item", profile.transfer, MAX_UNIT_HINT);
-    let work_units = _sat_mul(n, work_per_item);
-    let transfer_bytes = _sat_mul(n, transfer_per_item);
-    return map{
-        format: "pblang.compute.estimate.v1",
-        items: n,
-        work_units_per_item: work_per_item,
-        transfer_bytes_per_item: transfer_per_item,
-        work_units: work_units,
-        transfer_bytes: transfer_bytes,
-        saturated: work_units == MAX_COST or transfer_bytes == MAX_COST,
-    };
+    return _estimate_values(n, work_per_item, transfer_per_item);
 }
 
 fn _find_device(devs, kind) {
@@ -330,21 +335,21 @@ fn _matches(workload, kind) {
     return true;
 }
 
-fn _cpu_route(n, cfg, reason, fallback_used, estimate = nil) {
+fn _cpu_route(n, cfg, reason, fallback_used, estimate = nil, validated = false) {
     // A selector may reuse its own freshly validated estimate. Never reuse one
     // across public calls or across an external executor invocation.
-    if estimate == nil { estimate = estimate_work(n, cfg); }
-    let parallel_overhead = _bounded_nonnegative_int(
+    if estimate == nil { estimate = if validated { _estimate_values(n, cfg.work_units_per_item, cfg.transfer_bytes_per_item) } else { estimate_work(n, cfg) }; }
+    let parallel_overhead = if validated { cfg.parallel_overhead_units } else { _bounded_nonnegative_int(
         try cfg.parallel_overhead_units catch 4096,
-        "parallel_overhead_units", 4096, MAX_OVERHEAD_HINT);
-    let min_work_per_worker = _positive_int(
+        "parallel_overhead_units", 4096, MAX_OVERHEAD_HINT) };
+    let min_work_per_worker = if validated { cfg.min_work_units_per_worker } else { _positive_int(
         try cfg.min_work_units_per_worker catch 512,
-        "min_work_units_per_worker", 512, MAX_UNIT_HINT);
-    let max_workers = _positive_int(
-        try cfg.max_workers catch 1, "max_workers", 1, MAX_WORKERS);
-    let min_parallel_items = _positive_int(
+        "min_work_units_per_worker", 512, MAX_UNIT_HINT) };
+    let max_workers = if validated { cfg.max_workers } else { _positive_int(
+        try cfg.max_workers catch 1, "max_workers", 1, MAX_WORKERS) };
+    let min_parallel_items = if validated { cfg.min_parallel_items } else { _positive_int(
         try cfg.min_parallel_items catch 32,
-        "min_parallel_items", 32, 100000000);
+        "min_parallel_items", 32, 100000000) };
     let workers = 1;
     let parallel_reason = "parallel_disabled";
     if (try cfg.allow_parallel catch true) == true {
@@ -370,16 +375,26 @@ fn _cpu_route(n, cfg, reason, fallback_used, estimate = nil) {
     };
 }
 
-fn _accelerator_cost(kind, estimate, cfg) {
-    let overhead = _bounded_nonnegative_int(
-        try cfg.gpu_overhead_units catch 2048,
-        "gpu_overhead_units", 2048, MAX_OVERHEAD_HINT);
-    if kind == "npu" { overhead = _bounded_nonnegative_int(try cfg.npu_overhead_units catch 1024, "npu_overhead_units", 1024, MAX_OVERHEAD_HINT); }
-    elif kind == "simd" { overhead = _bounded_nonnegative_int(try cfg.simd_overhead_units catch 32, "simd_overhead_units", 32, MAX_OVERHEAD_HINT); }
-    elif kind == "distributed" { overhead = _bounded_nonnegative_int(try cfg.distributed_overhead_units catch 8192, "distributed_overhead_units", 8192, MAX_OVERHEAD_HINT); }
-    let transfer_ratio = _positive_int(
-        try cfg.transfer_bytes_per_work_unit catch 64,
-        "transfer_bytes_per_work_unit", 64, MAX_UNIT_HINT);
+fn _accelerator_cost(kind, estimate, cfg, validated = false) {
+    let overhead = 0;
+    let transfer_ratio = 0;
+    if validated {
+        overhead = cfg.gpu_overhead_units;
+        if kind == "npu" { overhead = cfg.npu_overhead_units; }
+        elif kind == "simd" { overhead = cfg.simd_overhead_units; }
+        elif kind == "distributed" { overhead = cfg.distributed_overhead_units; }
+        transfer_ratio = cfg.transfer_bytes_per_work_unit;
+    } else {
+        overhead = _bounded_nonnegative_int(
+            try cfg.gpu_overhead_units catch 2048,
+            "gpu_overhead_units", 2048, MAX_OVERHEAD_HINT);
+        if kind == "npu" { overhead = _bounded_nonnegative_int(try cfg.npu_overhead_units catch 1024, "npu_overhead_units", 1024, MAX_OVERHEAD_HINT); }
+        elif kind == "simd" { overhead = _bounded_nonnegative_int(try cfg.simd_overhead_units catch 32, "simd_overhead_units", 32, MAX_OVERHEAD_HINT); }
+        elif kind == "distributed" { overhead = _bounded_nonnegative_int(try cfg.distributed_overhead_units catch 8192, "distributed_overhead_units", 8192, MAX_OVERHEAD_HINT); }
+        transfer_ratio = _positive_int(
+            try cfg.transfer_bytes_per_work_unit catch 64,
+            "transfer_bytes_per_work_unit", 64, MAX_UNIT_HINT);
+    }
     let transfer_units = _ceil_div(estimate.transfer_bytes, transfer_ratio);
     let required = _sat_add(overhead, transfer_units);
     return map{
@@ -395,46 +410,52 @@ fn _accelerator_cost(kind, estimate, cfg) {
 }
 
 fn select_device(n, devs, cfg) {
+    return _select_device(n, devs, cfg, false);
+}
+
+// Only run_controlled can select the validated path, immediately after _policy.
+// Supplied device lists remain checked; they are not part of the private policy.
+fn _select_device(n, devs, cfg, validated) {
     n = _nonnegative_int(n, "item count");
-    if cfg == nil or not is_map(cfg) or (try cfg.format catch "") != "pblang.compute.policy.v1" {
+    if not validated and (cfg == nil or not is_map(cfg) or (try cfg.format catch "") != "pblang.compute.policy.v1") {
         throw "compute: invalid execution policy";
     }
     if type(devs) != "array" or len(devs) > MAX_DEVICES {
         throw "compute: devices must be an array with at most " + str(MAX_DEVICES) + " entries";
     }
-    if n == 0 { return _cpu_route(n, cfg, "empty_workload", false); }
+    if n == 0 { return _cpu_route(n, cfg, "empty_workload", false, nil, validated); }
     let preferred = cfg.preferred_device;
-    if preferred != "auto" and preferred != "cpu" and preferred != "sequential"
+    if not validated and (preferred != "auto" and preferred != "cpu" and preferred != "sequential"
        and preferred != "gpu" and preferred != "npu" and preferred != "simd"
-       and preferred != "distributed" {
+       and preferred != "distributed") {
         throw "compute: invalid preferred device in policy";
     }
     let workload = try cfg.workload catch "generic";
     let allow_accelerators = (try cfg.allow_accelerators catch true) == true;
     let fallback_to_cpu = (try cfg.fallback_to_cpu catch true) == true;
-    let min_accelerator_items = _positive_int(
+    let min_accelerator_items = if validated { cfg.min_accelerator_items } else { _positive_int(
         try cfg.min_accelerator_items catch 256,
-        "min_accelerator_items", 256, 100000000);
-    let max_transfer = _bounded_nonnegative_int(
+        "min_accelerator_items", 256, 100000000) };
+    let max_transfer = if validated { cfg.max_accelerator_transfer_bytes } else { _bounded_nonnegative_int(
         try cfg.max_accelerator_transfer_bytes catch 1073741824,
-        "max_accelerator_transfer_bytes", 1073741824, MAX_COST);
+        "max_accelerator_transfer_bytes", 1073741824, MAX_COST) };
     if preferred == "sequential" {
-        let route = _cpu_route(n, cfg, "sequential_requested", false);
+        let route = _cpu_route(n, cfg, "sequential_requested", false, nil, validated);
         route.mode = "sequential";
         route.workers = 1;
         route.parallel_reason = "sequential_requested";
         return route;
     }
-    if preferred == "cpu" { return _cpu_route(n, cfg, "cpu_requested", false); }
+    if preferred == "cpu" { return _cpu_route(n, cfg, "cpu_requested", false, nil, validated); }
 
     let candidates = if preferred == "auto" { ["npu", "gpu", "simd", "distributed"] } else { [preferred] };
     let rejected = [];
-    let estimate = estimate_work(n, cfg);
+    let estimate = if validated { _estimate_values(n, cfg.work_units_per_item, cfg.transfer_bytes_per_item) } else { estimate_work(n, cfg) };
     let i = 0;
     while i < len(candidates) {
         let kind = candidates[i];
         let d = _find_device(devs, kind);
-        let cost = _accelerator_cost(kind, estimate, cfg);
+        let cost = _accelerator_cost(kind, estimate, cfg, validated);
         let reason = "runtime_unavailable";
         if not allow_accelerators { reason = "accelerators_disabled"; }
         elif not _matches(workload, kind) { reason = "workload_not_supported"; }
@@ -466,7 +487,7 @@ fn select_device(n, devs, cfg) {
         };
     }
     let reason = if preferred == "auto" { "portable_cpu_selected" } else { rejected[0].reason + "_cpu_fallback" };
-    let route = _cpu_route(n, cfg, reason, preferred != "auto", estimate);
+    let route = _cpu_route(n, cfg, reason, preferred != "auto", estimate, validated);
     route.rejected = rejected;
     return route;
 }
@@ -500,13 +521,13 @@ fn run_controlled(items, worker, options = nil) {
     let devs = _option(options, "devices", nil);
     if devs == nil { devs = _execution_devices(len(items), cfg); }
     if type(devs) != "array" { throw "compute: devices must be an array"; }
-    let route = select_device(len(items), devs, cfg);
+    let route = _select_device(len(items), devs, cfg, true);
     if not route.ok {
         return map{ format: "pblang.compute.result.v1", ok: false, route: route, results: nil };
     }
     if route.mode == "accelerator" {
         let payload = _option(options, "payload", items);
-        let cpu_fallback_route = _cpu_route(len(items), cfg, "accelerator_cpu_fallback", true);
+        let cpu_fallback_route = _cpu_route(len(items), cfg, "accelerator_cpu_fallback", true, nil, true);
         let fallback = fn(_ignored) { return _cpu_map(items, worker, cpu_fallback_route.workers, cpu_fallback_route.mode == "parallel"); };
         let dispatched = A.dispatch(route.device, payload, fallback, cfg.fallback_to_cpu);
         if not dispatched.ok {
