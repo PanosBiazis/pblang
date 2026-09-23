@@ -27,6 +27,10 @@ remain incomplete elsewhere in the module/runtime.
 
 ## Resource cost
 
+These are historical results for the protected-parent fix. The subsequent
+[call-local frame optimization](Windows_open_frame.md) retains these protections
+and reports a new, separately measured comparison.
+
 Path conversion uses the existing validated batch byte writer. The sixteen fixed
 native call specifications are now one private module-level map. No API returns
 that map or mutates it. The public call still validates name, argument count,
