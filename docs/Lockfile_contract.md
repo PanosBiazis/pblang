@@ -55,3 +55,23 @@ In this repository, an integration test target exists for this contract:
 ```bash
 cargo test --test lockfile_repro
 ```
+
+## PBLang-native local publication
+
+After a retained-bootstrap build, run `pblang run tools/pblock.sapp --allow-all`
+in the owning project. This rewrites verified local dependency paths to their
+manifest-relative form and preserves their content hashes. It does not authenticate
+a publisher or make an arbitrary lockfile trustworthy.
+
+Inline dependency declarations accept double-quoted/basic or single-quoted/literal
+paths. Commas, equals signs and hash characters inside strings belong to the path;
+commas inside nested inline metadata/arrays are not dependency-field separators.
+Quoted `path` keys and quoted dependency names are recognized. Duplicate path
+keys, mismatched delimiters, unfinished strings and absolute manifest paths fail.
+This is the publisher's supported manifest subset, not a full TOML implementation.
+
+See `examples/portable_lock_quoted_paths.sapp` and
+[quoted-path validation](PORTABLE_LOCK_QUOTED_PATHS.md). The pure normalization
+function and filesystem publication have separate platform requirements:
+`publish()` still relies on Linux directory handling; safe Windows publication
+is not completed by this parser correction.
