@@ -114,6 +114,11 @@ an internal selector that avoids revalidating those same scalar fields. Public
 `policy`, `select_device` and `estimate_work` retain their input checks and
 mutable-policy behavior; a caller-supplied `validated` field or format marker
 cannot activate the internal route. Device lists and item counts remain checked.
+The public work estimator creates workload defaults only when a per-item work
+or transfer field is absent or `nil`. Explicit values are still validated on
+every call, including empty estimates; zero transfer remains an explicit value.
+Changing a workload or policy between calls is observed without changing the
+caller-owned map. See [lazy default measurements](COMPUTE_LAZY_ESTIMATE_DEFAULTS.md).
 No policy is cached across calls. The CPU fallback route is prepared before an
 accelerator hook executes, so a hook changing the original options does not
 change that call's policy. A subsequent call validates the new options again.
