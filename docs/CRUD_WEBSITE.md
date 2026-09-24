@@ -66,6 +66,28 @@ A successful disk write is not proof against failing hardware or dishonest stora
 
 This snapshot implementation rewrites and hashes the entire dataset per mutation;
 it is intended for small local examples, not high-throughput database workloads.
-It allocates detached copies and adds disk I/O. No speed or RAM improvement is
-claimed. Native/PHP storage and account parity, real MySQL integration and
-Windows/macOS persistence remain open.
+It allocates detached copies and adds disk I/O. Pure-PBLang SHA-256 compression
+and internal serialization avoid redundant operations while retaining public
+input validation and all digest/CAS/readback/synchronization checks. This is
+still more expensive than memory-only storage. Native/PHP storage and account
+parity and Windows/macOS persistence remain open. The separate product has
+repeatable real-MySQL integration tests for its explicit PHP polyglot edition.
+
+
+## Digest and persistence regression coverage
+
+`tests/semantics/sha256_reference_test.sapp` checks 25 independently calculated
+binary SHA-256 vectors, including both sides of padding/block boundaries, through
+one-shot and five incremental chunk sizes (150 comparisons). The compression
+round count, constants, rotations, padding and byte validation are unchanged.
+Adding at most five unsigned 32-bit words stays below 2^35, within exact f64
+integer range, so intermediate modular reductions can be combined. This is an
+implementation optimization of [SHA-256](https://csrc.nist.gov/pubs/fips/180-4/upd1/final),
+not cryptographic certification or a change to the algorithm.
+
+The persistence codec test also verifies rejection of malformed caller snapshots;
+only the private path receiving already-validated detached Records snapshots
+skips redundant reconstruction. The live test covers stale writers and uncertain
+publication behavior. The current C99 lowering rejects the assembled incremental SHA/reference harness
+on both the prior and optimized versions. No C99 compatibility claim follows from
+these retained-interpreter tests; other backends need independent verification.
