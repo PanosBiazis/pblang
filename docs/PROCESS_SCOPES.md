@@ -73,6 +73,11 @@ controllers, remove arbitrary orphan processes, or implement global runtime/FFI
 collection. No installed PB-MCP process was restarted or reconfigured. No general
 CPU/RAM or Live View speedup is claimed.
 
+The underlying [Linux pidfd lifecycle](PIDFD_LIFETIME.md) now rejects invalid
+one-shot signals before resource acquisition and retires descriptors before
+foreign cleanup, including library-unload failure. This correction does not
+change the public backend's admission status.
+
 A read-only laptop observation found no zombies in repeated `/proc` snapshots.
 Five existing PBLang processes belonged to three MCP connections and the desktop
 operator/worker. Over one ten-second sample they recorded no storage reads or
