@@ -1,0 +1,152 @@
+// Opt-in accounts for the serialized loopback CRUD preview. No public registration.
+// Account hashes are supplied by a trusted caller; sessions are memory-only.
+let Password = import("stdlib:password_bcrypt_linux.sapp");
+let HTTP = import("stdlib:http_server.sapp");
+let HTML = import("stdlib:html.sapp");
+let Records = import("stdlib:crud_records.sapp");
+fn _token() { return sha256(json_stringify(random_bytes(32))); }
+
+fn _name(value) {
+    if type(value) != "string" or len(value) < 1 or len(value) > 64 { return false; }
+    for ch in str_split(value, "") {
+        if not str_contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-", ch) { return false; }
+    }
+    return true;
+}
+
+fn _response(status, text) {
+    return map{status:status, body:text, content_type:"text/html; charset=utf-8", headers:map{
+            "Cache-Control":"no-store", "Referrer-Policy":"no-referrer", "X-Content-Type-Options":"nosniff",
+            "Content-Security-Policy":"default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+        }};
+}
+
+fn _redirect(path) { let out=_response(303, "Continue.");out.headers["Location"]=path;return out; }
+
+fn _cookie(token, lifetime) { return "pbcrud_session=" + token + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + str(lifetime); }
+
+fn _cookie_id(req) {
+    let header=HTTP.req_header(req, "cookie"); if header == nil { return ""; }
+    if type(header) != "string" or len(header) > 4096 { throw "invalid cookie"; }
+    let found="";
+    for pair in str_split(header, ";") {
+        let parts=str_split(str_trim(pair), "=");
+        if parts[0] == "pbcrud_session" {
+            if found != "" or len(parts) != 2 or len(parts[1]) != 64 { throw "invalid cookie"; }
+            for ch in str_split(parts[1], "") { if not str_contains("0123456789abcdef", ch) { throw "invalid cookie"; } }
+            found=parts[1];
+        }
+    }
+    return found;
+}
+
+fn _fields(body, allowed) {
+    if type(body) != "string" or len(body) > 2048 or len(str_to_bytes(body)) > 2048 { throw "invalid form"; }
+    let pairs=str_split(body, "&"); if len(pairs) != len(allowed) { throw "invalid fields"; }
+    let out=map{};
+    for pair in pairs {
+        let parts=str_split(pair, "="); if len(parts) != 2 { throw "invalid form"; }
+        let key=url_decode(parts[0]); let accepted=false;
+        for item in allowed { if item == key { accepted=true; } }
+        if not accepted or map_has(out, key) { throw "invalid field"; }
+        out[key]=url_decode(str_join(str_split(parts[1], "+"), " "));
+    }
+    return out;
+}
+
+fn _now(state) {
+    let current=now_ms();
+    if type(current) != "number" or not (current >= 0 and current <= 9007199254740991) or current < state.last_time {
+        state.sessions=map{}; state.closed=true; throw "accounts: invalid or reversed clock; restart required";
+    }
+    state.last_time=current;
+    for id in map_keys(state.sessions) { if current >= state.sessions[id].expires { map_remove(state.sessions, id); } }
+    return current;
+}
+
+fn _new(state, user, current) {
+    if len(map_keys(state.sessions)) >= state.max_sessions { return nil; }
+    let id=_token(); if map_has(state.sessions, id) { throw "accounts: token collision"; }
+    let session=map{user:user, csrf:_token(), expires:current + state.lifetime * 1000};
+    state.sessions[id]=session; return map{id:id, session:session};
+}
+
+fn _login_page(csrf) {
+    return HTML.page("Sign in - Race records", "<main><section class=\"card\"><h1>Sign in.</h1><p>Local account access. Sessions end on expiry, sign-out or application exit.</p><form method=\"post\" action=\"/login\"><input type=\"hidden\" name=\"csrf\" value=\"" + csrf + "\"><label>Account<input required name=\"username\" maxlength=\"64\" autocomplete=\"username\"></label><label>Password<input required type=\"password\" name=\"password\" maxlength=\"72\" autocomplete=\"current-password\"></label><p><button>Sign in</button></p></form><p>No public registration. All configured accounts share the record workspace.</p></section></main>", "<link rel=\"stylesheet\" href=\"/style.css\">");
+}
+
+fn _gate(state, req) {
+    if state.closed { return _response(503, "Accounts unavailable."); }
+    let seen=map{};
+    for name in map_keys(req.headers) {
+        let lower=str_lower(name);
+        if map_has(seen, lower) { return _response(400, "Duplicate header rejected."); }
+        seen[lower]=true;
+    }
+    if HTTP.req_header(req, "host") != state.host { return _response(403, "Host rejected."); }
+    let origin=HTTP.req_header(req, "origin");
+    if origin != nil and origin != state.origin { return _response(403, "Origin rejected."); }
+    let site=HTTP.req_header(req, "sec-fetch-site");
+    if site != nil and site != "none" and site != "same-origin" { return _response(403, "Cross-site request rejected."); }
+    let current=_now(state);
+    let id=try _cookie_id(req) catch nil;
+    if id == nil { return _response(400, "Invalid session cookie."); }
+    let session=try state.sessions[id] catch nil;
+    let path=req.path;
+    if path == "/login" and req.method == "GET" {
+        if session != nil and session.user != "" { return _redirect("/"); }
+        let fresh=nil;
+        if session == nil { fresh=_new(state, "", current); if fresh == nil { return _response(503, "Session capacity reached. Try later."); } session=fresh.session; }
+        let out=_response(200, _login_page(session.csrf));
+        if fresh != nil { out.headers["Set-Cookie"]=_cookie(fresh.id, state.lifetime); }
+        return out;
+    }
+    if (path == "/login" or path == "/logout") and req.method == "POST" {
+        // Exact origin is enforced here as well as in the preview before any state change.
+        if HTTP.req_header(req, "origin") != state.origin { return _response(403, "Same-origin form required."); }
+        if HTTP.req_header(req, "content-type") != "application/x-www-form-urlencoded" { return _response(415, "Form encoding required."); }
+        let allowed=if path == "/login" { ["username", "password", "csrf"] } else { ["csrf"] };
+        let fields=try _fields(req.body, allowed) catch nil;
+        if fields == nil { return _response(400, "Invalid form."); }
+        if session == nil or not constant_time_eq(fields.csrf, session.csrf) { return _response(403, "Request verification failed."); }
+        if path == "/logout" {
+            map_remove(state.sessions, id); let out=_redirect("/login");out.headers["Set-Cookie"]=_cookie("", 0);return out;
+        }
+        if current >= state.window + 60000 { state.window=current;state.attempts=0; }
+        if state.attempts >= 10 { let out=_response(429, "Sign-in temporarily limited. Try later.");out.headers["Retry-After"]="60";return out; }
+        state.attempts=state.attempts + 1;
+        let encoded=try state.accounts[fields.username] catch nil;
+        let target=if encoded == nil { state.dummy } else { encoded };
+        let verified=try state.provider.verify(fields.password, target) catch false;
+        // Same expensive verification for unknown accounts; no account names in errors.
+        if not verified or encoded == nil { return _response(401, "Sign-in failed."); }
+        map_remove(state.sessions, id);
+        let fresh=_new(state, fields.username, _now(state));
+        if fresh == nil { return _response(503, "Session unavailable."); }
+        let out=_redirect("/");out.headers["Set-Cookie"]=_cookie(fresh.id, state.lifetime);return out;
+    }
+    if session == nil or session.user == "" {
+        if req.method == "GET" { return _redirect("/login"); }
+        return _response(403, "Sign in before changing records.");
+    }
+    return map{grant:true, csrf:session.csrf, user:session.user};
+}
+
+fn create(accounts, port=8765, lifetime_seconds=900, max_sessions=16) {
+    Records.integer(port, 1024, 65535);Records.integer(lifetime_seconds, 1, 86400);Records.integer(max_sessions, 1, 256);
+    if type(accounts) != "map" or len(map_keys(accounts)) < 1 or len(map_keys(accounts)) > 100 { throw "accounts: invalid account catalog"; }
+    let copy=map{};
+    for name in map_keys(accounts) { if not _name(name) or not Password.valid_hash(accounts[name]) { throw "accounts: invalid name or password hash"; } copy[name]=accounts[name]; }
+    let provider=Password.open();
+    let dummy=try provider.hash(_token()) catch nil;
+    if dummy == nil { provider.close();throw "accounts: password provider unavailable"; }
+    // pblang-security-ignore-next-line: network.plaintext-http reason=exact loopback-only preview; remote exposure unsupported
+    let origin="http://127.0.0.1:" + str(port);
+    let state=map{accounts:copy, provider:provider, dummy:dummy, sessions:map{}, closed:false,
+        last_time:now_ms(), window:now_ms(), attempts:0, lifetime:lifetime_seconds, max_sessions:max_sessions, origin:origin, host:"127.0.0.1:" + str(port)};
+    return map{
+        gate:fn(req){ return _gate(state, req); },
+        close:fn(){state.closed=true;state.sessions=map{};state.accounts=map{};state.dummy="";return provider.close();}
+    };
+}
+export create;
