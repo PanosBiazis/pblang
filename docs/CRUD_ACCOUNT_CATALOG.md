@@ -88,3 +88,9 @@ four typed FFI arguments and `setsockopt` requires five. No socket reuse setting
 OS networking parameter or existing listener behavior was changed. Wait for the
 OS to release the address before a same-port restart; do not repeatedly provision
 or overwrite the account catalog when a bind fails.
+
+## Session read performance
+
+Issued tokens reuse the private session map for syntax validation. Unknown and
+duplicate cookies retain full validation; authentication and revocation remain
+unchanged. See [session validation and measurements](CRUD_SESSION_VALIDATION.md).
