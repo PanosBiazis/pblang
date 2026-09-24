@@ -112,3 +112,31 @@ fix, not a speedup or general memory optimization. It prevents the demonstrated
 resource leak on rejected requests; it does not resolve previous performance
 regressions, GC pauses/cycles, Windows lock publication, general FFI/polyglot
 isolation, GPU/NPU execution or broad platform coverage.
+
+## Follow-up allocation optimization (2026-09-24)
+
+The internal libc lookup now returns its handle directly. Only failure constructs
+an error map; public results, validation-before-acquisition, retired descriptor
+state and exactly-once release behavior are unchanged. No global library cache
+or extended resource lifetime was introduced. Synthetic failed-load/fallback
+and current-pid cleanup cases supplement the existing failure suite.
+
+Fresh matched-path measurements used the same 100,000 open/close workload,
+one warmup per variant and nine measured samples each with rotating order.
+'Original' is aebf26c; 'corrected' is e140256; 'optimized' includes this change.
+
+| Metric | Original | Corrected | Optimized |
+| --- | ---: | ---: | ---: |
+| Median CPU | 1.49 s | 1.65 s | 1.40 s |
+| p95 CPU (nearest rank) | 1.76 s | 1.94 s | 1.90 s |
+| Median peak RSS | 57,768 KiB | 58,572 KiB | 48,356 KiB |
+
+CPU samples:
+- Original: 1.49, 1.53, 1.76, 1.46, 1.45, 1.73, 1.47, 1.46, 1.49.
+- Corrected: 1.24, 1.63, 1.65, 1.91, 1.78, 1.94, 1.59, 1.61, 1.65.
+- Optimized: 1.41, 1.45, 1.90, 1.41, 1.36, 1.40, 1.36, 1.37, 1.37.
+
+Against the corrected version: median CPU -15.2%, peak RSS -17.4%. Against the
+original: median CPU -6.0%, peak RSS -16.3%, but p95 CPU is worse (+8.0%). These
+are measurements of this synthetic workload with timing variation, not universal
+resource savings or a latency guarantee. No installed PB-MCP benefit was tested.
