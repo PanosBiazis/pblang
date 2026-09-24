@@ -108,7 +108,10 @@ when business logic must distinguish options. Return a text string up to 4096
 characters; HTML is escaped. Imported event names do not select callbacks.
 Caller-provided functions are trusted application code, not sandboxed plugins.
 
-Supported controls: panel, label, textbox, textarea, checkbox, select, button.
+Supported controls: panel, label, textbox, textarea, checkbox, select, button, scatter.
+The passive scatter control accepts explicit PBLang point arrays; see
+[ND form projections](ND_FORM_PROJECTIONS.md). It does not automatically convert
+Delphi chart controls or execute imported handlers.
 Supported property types, parent containers and depth are checked before startup.
 Unsupported controls/properties, password fields and unresolved bindings fail
 closed. Geometry is deliberately adapted into responsive flow: pixel layout,
