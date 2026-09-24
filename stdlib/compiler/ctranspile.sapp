@@ -520,13 +520,7 @@ fn transpile_expr(node) {
     if k == "assign" {
         return "(" + _ctx_resolve(node.name) + " = " + transpile_expr(node.value) + ")";
     }
-    if k == "assign_to" {
-        let target_kind = try node.target.kind catch "";
-        if target_kind != "index" and target_kind != "member" {
-            return _unsupported(target_kind, "assignment target");
-        }
-        return "(" + transpile_expr(node.target) + " = " + transpile_expr(node.value) + ")";
-    }
+    if k == "assign_to" { return _store(node, true); }
     if k == "if_expr" {
         let yes = _value_block_expr(node.then);
         let no = "0";
@@ -612,6 +606,58 @@ fn transpile_expr(node) {
     return _unsupported(k, "expression");
 }
 
+// Preserve receiver -> index -> value evaluation, independent of C argument
+// order. Pure leaf statement stores retain the existing zero-temporary path.
+fn _store_leaf(node) {
+    let kind = try node.kind catch "";
+    return kind == "ident" or kind == "number" or kind == "bool" or kind == "nil";
+}
+fn _store(node, expression) {
+    let target = node.target;
+    let kind = try target.kind catch "";
+    if kind != "index" and kind != "member" {
+        return _unsupported(kind, "assignment target");
+    }
+    let object = transpile_expr(target.obj);
+    let index = "";
+    if kind == "index" { index = transpile_expr(target.index); }
+    let value = transpile_expr(node.value);
+    let ordered = expression or not _store_leaf(target.obj) or not _store_leaf(node.value);
+    if kind == "index" and not _store_leaf(target.index) { ordered = true; }
+    let prefix = ""; let before = ""; let result = "";
+    if ordered {
+        // Avoid capturing source identifiers or names emitted by nested stores.
+        let id = 0;
+        prefix = "_pb_store_0_";
+        while str_contains(object, prefix) or str_contains(index, prefix) or str_contains(value, prefix) {
+            id = id + 1; prefix = "_pb_store_" + str(id) + "_";
+        }
+        before = "({ " + _numty() + " " + prefix + "object = " + object + "; ";
+        object = prefix + "object";
+        if kind == "index" {
+            let index_type = _numty();
+            if _integral_index_expr(target.index) { index_type = "long"; }
+            before = before + index_type + " " + prefix + "index = " + index + "; ";
+            index = prefix + "index";
+        }
+        before = before + _numty() + " " + prefix + "value = " + value + "; ";
+        value = prefix + "value";
+    }
+    if kind == "index" {
+        let helper = "pb_index_set"; let extra = "";
+        if _integral_index_expr(target.index) {
+            helper = "pb_index_set_long";
+            let known = _known_array_length(target.obj);
+            if known != nil { helper = "pb_index_set_known"; extra = ", " + str(known); }
+        }
+        result = helper + "(" + object + ", " + index + ", " + value + extra + ")";
+    } else {
+        result = "(" + _pcast() + "(" + object + "))[" + str(_field_slot(target.name)) + "] = " + value;
+    }
+    if ordered { return before + result + "; " + value + "; })"; }
+    return result;
+}
+
 // ── Statements → C (indented) ──────────────────────────────────────────────────────
 fn _indent(n) {
     let s = "";
@@ -654,29 +700,8 @@ fn transpile_stmt(node, depth) {
             _array_bind(e.name, try e.value catch nil);
             return pad + _ctx_resolve(e.name) + " = " + transpile_expr(e.value) + ";";
         }
-        // `arr[i] = v` — index store into a length-prefixed array block.
         if is_map(e) and (try e.kind catch "") == "assign_to" {
-            let tgt = e.target;
-            if (try tgt.kind catch "") == "index" {
-                if _integral_index_expr(tgt.index) {
-                    let known_length = _known_array_length(tgt.obj);
-                    if known_length != nil {
-                        return pad + "pb_index_set_known(" + transpile_expr(tgt.obj) + ", "
-                            + transpile_expr(tgt.index) + ", " + transpile_expr(e.value)
-                            + ", " + str(known_length) + ");";
-                    }
-                    return pad + "pb_index_set_long(" + transpile_expr(tgt.obj) + ", "
-                        + transpile_expr(tgt.index) + ", " + transpile_expr(e.value) + ");";
-                }
-                return pad + "pb_index_set(" + transpile_expr(tgt.obj) + ", "
-                    + transpile_expr(tgt.index) + ", " + transpile_expr(e.value) + ");";
-            }
-            // `obj.field = v` — member store into a struct/map block at its slot.
-            if (try tgt.kind catch "") == "member" {
-                return pad + "(" + _pcast() + "(" + transpile_expr(tgt.obj) + "))["
-                    + str(_field_slot(tgt.name)) + "] = " + transpile_expr(e.value) + ";";
-            }
-            return _unsupported(try tgt.kind catch "", "assignment target");
+            return pad + _store(e, false) + ";";
         }
         return pad + transpile_expr(e) + ";";
     }
@@ -1492,7 +1517,8 @@ fn kernel_preamble() {
     s = s + "static void kreset(void){ _koff = 0; }" + nl;
     s = s + _array_runtime("_pb_index_fail");
     // stack + entry: _start sets esp, calls kmain, halts forever
-    s = s + "static u8 _kstack[65536];" + nl;
+    // Referenced by inline assembly rather than a C expression: retain it at -O2/-O3.
+    s = s + "static u8 _kstack[65536] __attribute__((used));" + nl;
     s = s + "__attribute__((naked)) void _start(void){ __asm__ volatile(\"mov $_kstack + 65536, %esp\\n call kmain\\n 1: hlt\\n jmp 1b\\n\"); }" + nl;
     s = s + nl;
     return s;

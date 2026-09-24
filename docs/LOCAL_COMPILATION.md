@@ -130,3 +130,42 @@ UTF-8 and EOF boundaries, invalid budgets and source rejection;
 `local_source_live_test.sapp` runs a source above 1 MiB and 65,536 tokens through
 pbi and a real C99 artifact, verifies optional budgets and preserved old outputs,
 and rejects a malformed suffix without executing its preceding print.
+
+
+## C99 indexed/member stores
+
+The hosted C99 route now supports indexed assignment values such as
+`let result = (a[0] = 42);`. The result is the assigned numeric value. Array
+bounds checks remain active, including negative, fractional and out-of-range
+indices. This remains the numeric C99 representation, not a general tagged-value
+or arbitrary-pointer memory-safety guarantee.
+
+Store evaluation follows receiver, index (if any), then value, each exactly once.
+This also applies to standalone statements and member stores. It matters when
+the value expression rebinds the original receiver variable: the already-evaluated
+receiver is the one written. Prior generated C passed side-effecting expressions
+as unsequenced arguments and could reverse their execution. Simple leaf statement
+stores retain the direct checked-helper path. Other stores use GNU99 statement
+expressions and collision-avoiding numeric temporaries, without extra heap
+allocations. This change does not fix general call/binary-expression ordering or
+other compiler/VM semantic differences. Assignment expressions are not supported
+uniformly by the retained parser/self-hosted VM; use statements for that parity.
+
+Run the fixed example with reviewed local execution capabilities:
+
+```sh
+pblang run examples/c99_store_order.sapp --allow-all
+```
+
+`tests/semantics/ctranspile_store_test.sapp` requires a C compiler and exercises
+27 native cases per compiler: sequencing, receiver rebinding, nested result
+values, source-identifier collisions and invalid indices in float/integer modes.
+Linux GCC and Clang were exercised. `tests/fixtures/c99_store_kernel.sapp` adds an
+i386 QEMU fixture for both numeric modes at -O2, expecting debug-exit status 85.
+The assembly-only boot stack is marked used so optimized C compilation retains
+it. This is a small bare-metal test, not a guest OS or Windows/macOS validation.
+
+Full incremental SHA-256 still depends on unimplemented C99 runtime facilities,
+including exception and dynamic value operations. Native CRUD accounts,
+production session policy, other backends and general runtime/FFI/GC integration
+remain separate work; do not infer those capabilities from this store fix.
