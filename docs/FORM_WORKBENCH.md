@@ -171,6 +171,12 @@ let app = Web.create(document, actions, 8766, policy);
   seconds with 429 and Retry-After. Closed previews remain closed, and waiting
   requests do not extend the cooldown. Clock rollback closes the preview. Stale
   revision responses (409) and callback failures (500) are not counted.
+  The developer can independently set `rejected_request_limit` (integer 1–10,000),
+  `rejection_window_ms` (100–3,600,000) and `rejection_cooldown_ms` (100–3,600,000).
+  Defaults stay 8 / 60,000 / 30,000. The failure window is separate from the
+  existing crawler request window. Settings are validated even when throttling
+  is disabled; invalid values never silently disable a protection. These are
+  per-preview shared budgets, not per-user counters.
   This is resistance to repeated rejected probes, **not pentest detection or a
   guarantee of blocking attacks**. It does not inspect user-agent fingerprints or
   identify scanner products. The counter is shared by the loopback preview: a
