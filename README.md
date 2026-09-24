@@ -1,8 +1,10 @@
+<img src="assets/brand/icon.svg" width="80" height="80" alt="PBLang icon" />
+
 # pblang
 
 **A fast, secure, embeddable programming language with a pblang-written self-hosted toolchain.**
 
-[![Version](https://img.shields.io/badge/version-0.6.0--alpha-blue)]() [![License](https://img.shields.io/badge/license-MIT-green)]() [![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
+**Version:** 0.6.0-alpha · **License:** MIT · **Status:** alpha; validation is scoped to the documented tests.
 
 pblang is a general-purpose programming language and bytecode VM designed for embedded scripting and standalone tooling. The project includes a Rust compiler/VM toolchain, a pblang standard library, package tooling, LSP support, a native pblang IDE, and a self-hosted compiler written in pblang.
 
