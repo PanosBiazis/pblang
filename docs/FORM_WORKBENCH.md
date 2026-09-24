@@ -50,8 +50,17 @@ For tools that already hold source text, use
 `import("stdlib:ui_form_check.sapp").analyze_dfm(text)`. For canonical documents,
 use `Web.inspect(document)`. Neither call starts a server or invokes actions.
 They share the actual web renderer validation, preventing a separate checker from
-silently accepting controls the renderer cannot handle. These APIs are available
-for future PBIDE/MCP adapters; this change does not install new PBIDE or MCP tools.
+silently accepting controls the renderer cannot handle. The PBIDE web pilot exposes **Check DFM form** for the current draft (existing
+4096-byte editor budget). Native PBIDE F6 routes `.dfm` buffers through the same
+checker (65,536-byte analysis budget); other files keep their existing source
+check. These are preflight reports, not live imported-form execution.
+
+PB-MCP exposes `pblang_form_check` with exactly one `source` text argument, bounded
+to 65,536 UTF-8 bytes. It is available in both the canonical registry and offline
+profile. Unknown arguments, file paths and effects are not accepted. An unsupported
+form returns a structured `ok:false` report; invalid tool arguments return a tool
+error. The pure `ui_form_web_document.sapp` schema/renderer has no HTTP, filesystem
+or FFI imports, so this integration keeps the offline worker's effect denials.
 
 ## Detached overlay API
 
@@ -133,14 +142,14 @@ callbacks must enforce their own resource/effect budgets. Sensitive inputs requi
 an authenticated application-specific adapter. Do not publish this preview through
 a reverse proxy or expose it as a production application.
 
-## Two independent options, ON by default
+## Independent protection options, ON by default
 
-The most recent requested defaults are both **ON**:
+The two original options and rejected-request throttling are **ON** by default:
 
 ```pblang
-let policy = map{discourage_scraping:true, hide_source_names:true};
+let policy = map{discourage_scraping:true, hide_source_names:true, throttle_rejected_requests:true};
 let app = Web.create(document, actions, 8766, policy);
-// Opt out separately by setting either boolean to false.
+// Opt out separately by setting any of these booleans to false.
 // Web.serve(document, actions, 8766, nil, policy) uses the same settings.
 ```
 
@@ -157,7 +166,18 @@ let app = Web.create(document, actions, 8766, policy);
   of delivered HTML/CSS or observable behavior. PBLang callback source is never
   sent to the browser in either mode.
 
-Both options may be turned off independently. Turning them off does not disable
+- `throttle_rejected_requests`: after eight responses with status 400, 403, 404,
+  405 or 415 within a 60-second fixed window, suspend further requests for 30
+  seconds with 429 and Retry-After. Closed previews remain closed, and waiting
+  requests do not extend the cooldown. Clock rollback closes the preview. Stale
+  revision responses (409) and callback failures (500) are not counted.
+  This is resistance to repeated rejected probes, **not pentest detection or a
+  guarantee of blocking attacks**. It does not inspect user-agent fingerprints or
+  identify scanner products. The counter is shared by the loopback preview: a
+  local program can temporarily affect other local clients. It does not enforce
+  an external authentication or per-user abuse boundary.
+
+All three options may be turned off independently. Turning any option off does not disable
 CSRF, Origin/Host checks, escaping, CSP, revision checks or input validation.
 Unknown/nonboolean options, including a generic `unsafe` bypass, are rejected.
 These defaults apply to **this adapter**, not automatically to every existing

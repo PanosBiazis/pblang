@@ -16,6 +16,10 @@ A comment is displayed as escaped text and is not saved. Ctrl+C stops the previe
 The first command checks the example and exits without opening a listener.
 
 Crawler discouragement/throttling and internal-name minimization are ON by default,
-independently configurable. Neither guarantees prevention of scraping or reverse
+independently configurable. Repeated-rejection throttling is also ON: eight rejected
+requests within a minute cause a 30-second cooldown shared by the local preview.
+Set `throttle_rejected_requests:false` in the web options to disable that extra
+policy; normal input/Origin/CSRF validation stays active. These policies do not
+detect pentest intent. Neither original option guarantees prevention of scraping or reverse
 engineering. The example has no accounts and must stay local with synthetic data.
 See [the contract and limitations](../../docs/FORM_WORKBENCH.md).
