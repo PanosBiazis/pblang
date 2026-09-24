@@ -1,0 +1,137 @@
+// Opt-in local snapshots, not a database or an adversarial shared directory.
+// Linux private state; all cooperating writers use the same sibling flock.
+let Records = import("stdlib:crud_records.sapp");
+let Secure = import("stdlib:secure_file.sapp");
+let Dir = import("stdlib:linux_dirfs.sapp");
+let SHA = import("stdlib:sha256_pb.sapp");
+
+fn _options(path, max_records, max_bytes) {
+    Records.integer(max_records, 1, 1000000);
+    Records.integer(max_bytes, 64, 67108864);
+    if platform() != "linux" or type(path) != "string" or not str_starts_with(path, "/")
+        or len(path) > 4096 or str_contains(path, strfromcharcode(0))
+        or str_contains(path, "\\") or str_ends_with(path, "/") {
+        throw "crud persistence: supported absolute private file path required";
+    }
+    for part in str_split(str_slice(path, 1, len(path)), "/") {
+        if part == "" or part == "." or part == ".." { throw "crud persistence: invalid path component"; }
+    }
+    if len(path_basename(path)) > 250 { throw "crud persistence: filename too long"; }
+}
+fn encode(snapshot, max_bytes = 1048576) {
+    Records.integer(max_bytes, 64, 67108864);
+    let checked = Records.create(1000000, snapshot);
+    let value = checked.snapshot(); checked.close();
+    let lines = ["PBLANG-CRUD-1\t" + str(value.revision)];
+    let total = len(lines[0]);
+    for row in value.rows {
+        let line = str(row.id) + "\t" + url_encode(row.name) + "\t"
+            + url_encode(row.country) + "\t" + url_encode(row.time);
+        total = total + 1 + len(str_to_bytes(line));
+        if total > max_bytes { throw "crud persistence: snapshot exceeds byte budget"; }
+        push(lines, line);
+    }
+    return str_join(lines, "\n");
+}
+fn decode(text, max_records = 10000, max_bytes = 1048576) {
+    Records.integer(max_records, 1, 1000000); Records.integer(max_bytes, 64, 67108864);
+    if type(text) != "string" or len(text) > max_bytes or len(str_to_bytes(text)) > max_bytes {
+        throw "crud persistence: snapshot exceeds byte budget";
+    }
+    // Flat escaped fields avoid recursive parsing of hostile nesting.
+    let lines = str_split(text, "\n");
+    if len(lines) > max_records + 1 { throw "crud persistence: snapshot exceeds record budget"; }
+    let header = str_split(lines[0], "\t");
+    if len(header) != 2 or header[0] != "PBLANG-CRUD-1" { throw "crud persistence: invalid format"; }
+    let rows = []; let i = 1;
+    while i < len(lines) {
+        if len(lines[i]) > 1800 { throw "crud persistence: oversized row"; }
+        let fields = str_split(lines[i], "\t");
+        if len(fields) != 4 { throw "crud persistence: invalid row"; }
+        push(rows, map{ id: Records.decimal(fields[0], 1), name: url_decode(fields[1]),
+            country: url_decode(fields[2]), time: url_decode(fields[3]) });
+        i = i + 1;
+    }
+    let checked = Records.create(max_records, map{revision:Records.decimal(header[1]),rows:rows});
+    let value = checked.snapshot(); checked.close(); return value;
+}
+fn _load(path, max_records, max_bytes) {
+    let fs = Dir.open_absolute(path_dirname(path), false, true);
+    if not fs.ok { throw "crud persistence: private directory unavailable"; }
+    let loaded = try Dir.read_prefix_bytes(fs, path_basename(path), max_bytes) catch nil;
+    let closed = Dir.close(fs);
+    if not closed or loaded == nil or not loaded.ok or loaded.truncated
+        or not loaded.owner_current_user or loaded.link_count != 1
+        or bit_and(loaded.mode, 511) != 384 {
+        throw "crud persistence: private snapshot unavailable";
+    }
+    let value = decode(bytes_to_str(loaded.bytes), max_records, max_bytes);
+    return map{value:value,digest:SHA.sha256_hex_bytes(loaded.bytes)};
+}
+fn _confirmed(result) {
+    return type(result) == "map" and (try result.ok catch false)
+        and (try result.published catch false) and (try result.readback_verified catch false)
+        and (try result.durability_verified catch false)
+        and (try result.lock_released catch false) and (try result.root_closed catch false);
+}
+fn initialize(path, max_records = 10000, max_bytes = 1048576) {
+    _options(path, max_records, max_bytes);
+    let bytes = str_to_bytes(encode(map{revision:0,rows:[]}, max_bytes));
+    let result = Secure.private_compare_and_swap(path,
+        map{kind:"missing",algorithm:"none",sha256:""}, bytes, max_bytes);
+    if not _confirmed(result) {
+        throw "crud persistence: initialization unconfirmed; inspect existing state, do not overwrite";
+    }
+    return true;
+}
+fn _prepare(candidate, action, value, expected, confirmation, max_bytes) {
+    let result = nil;
+    if action == "insert" { result = candidate.insert(value, expected); }
+    elif action == "update" { result = candidate.update(value, expected); }
+    elif action == "remove" { result = candidate.remove(value, expected); }
+    else { result = candidate.clear(expected, confirmation); }
+    return map{result:result,payload:str_to_bytes(encode(candidate.snapshot(),max_bytes))};
+}
+fn open(path, max_records = 10000, max_bytes = 1048576) {
+    _options(path, max_records, max_bytes);
+    let loaded = _load(path, max_records, max_bytes);
+    let state = map{store:Records.create(max_records, loaded.value),digest:loaded.digest,
+        closed:false,blocked:false};
+    let check = fn() {
+        if state.closed { throw "crud persistence: store closed"; }
+        if state.blocked { throw "crud persistence: refresh required before further use"; }
+    };
+    let mutate = fn(action, value, expected, confirmation) {
+        check(); let candidate = Records.create(max_records, state.store.snapshot());
+        let prepared = try _prepare(candidate, action, value, expected, confirmation, max_bytes) catch nil;
+        if prepared == nil { candidate.close(); throw "crud persistence: change rejected before publication"; }
+        let payload = prepared.payload;
+        let publication = try Secure.private_compare_and_swap(path,
+            map{kind:"present",algorithm:Secure.RAW_SHA256_ALGORITHM,sha256:state.digest},
+            payload, max_bytes) catch nil;
+        if not _confirmed(publication) {
+            candidate.close(); state.blocked = true;
+            throw "crud persistence: save unconfirmed; refresh and inspect before any retry";
+        }
+        state.store.close(); state.store = candidate;
+        state.digest = publication.replacement_sha256; return prepared.result;
+    };
+    return map{
+        info:fn(){ check(); let info = state.store.info(); info.persistent = true; return info; },
+        list:fn(offset=0,limit=25,query=""){ check(); return state.store.list(offset,limit,query); },
+        insert:fn(value,expected){return mutate("insert",value,expected,nil);},
+        update:fn(value,expected){return mutate("update",value,expected,nil);},
+        remove:fn(id,expected){return mutate("remove",id,expected,nil);},
+        clear:fn(expected,confirmation){return mutate("clear",nil,expected,confirmation);},
+        refresh:fn(){
+            if state.closed { throw "crud persistence: store closed"; }
+            state.blocked = true;
+            let fresh = _load(path,max_records,max_bytes);
+            let replacement = Records.create(max_records,fresh.value);
+            state.store.close(); state.store = replacement; state.digest = fresh.digest;
+            state.blocked = false; return true;
+        },
+        close:fn(){state.store.close();state.closed=true;return true;}
+    };
+}
+export initialize, open, encode, decode;
