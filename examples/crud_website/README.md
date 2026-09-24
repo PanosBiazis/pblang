@@ -131,3 +131,29 @@ The runtime does not guarantee secure erasure of string copies from RAM.
 Calls across all bcrypt providers must be serialized because libcrypt uses static
 native storage; this example's single request loop satisfies that contract.
 No claim of thread-safe use or production authentication is made.
+
+## Account-protected saved records (Linux)
+
+After initializing a private snapshot as described above, use:
+
+```sh
+pblang run examples/crud_website/main.sapp --allow-all -- --serve-persistent-account
+```
+
+`PBLANG_CRUD_FILE` must identify that existing private snapshot. This combines the
+same authenticated routes with durable record storage. Each start generates a new
+one-time editor password on the trusted terminal; accounts and sessions are still
+ephemeral, records are retained. Never collect that terminal output in shared logs.
+The ordinary `--serve-persistent` remains unauthenticated.
+
+`CRUD.create_persistent_accounts(path, account_hashes, port=8765,
+max_records=10000, max_bytes=1048576, lifetime_seconds=900, max_sessions=16)` accepts
+trusted caller-provisioned bcrypt hashes. `serve_persistent_accounts(path, hashes,
+port=8765, max_connections=nil)` starts the bounded local listener. This does not
+implement a permanent account manager/password reset or tenant isolation.
+Password hashing still depends on Linux libxcrypt through FFI.
+
+Session expiry now avoids scanning the session map until its earliest deadline.
+Clock rollback and absolute expiration remain checked. Login pages use same-origin
+referrer policy so real browser form submissions preserve their Origin header;
+cross-origin referrers are suppressed and `Origin: null` is not trusted.
