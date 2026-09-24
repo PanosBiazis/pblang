@@ -165,3 +165,8 @@ For account credentials that survive restart, use `--init-saved-accounts` once a
 example use the same implementation. See [setup, trusted administration, session
 revocation and limitations](../../docs/CRUD_ACCOUNT_CATALOG.md). The older account
 modes above intentionally keep their ephemeral behavior.
+
+For account-session correctness cases, repeatable workloads and measured costs,
+see [session validation](../../docs/CRUD_SESSION_VALIDATION.md) and
+`bench/crud_account_sessions.sapp`. These measurements do not establish browser
+throughput or general RAM savings.
