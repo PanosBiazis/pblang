@@ -77,6 +77,9 @@ A successful disk write is not proof against failing hardware or dishonest stora
 
 This snapshot implementation rewrites and hashes the entire dataset per mutation;
 it is intended for small local examples, not high-throughput database workloads.
-It allocates detached copies and adds disk I/O. No speed or RAM improvement is
-claimed. Native/PHP storage and account parity, real MySQL integration and
-Windows/macOS persistence remain open.
+It allocates detached copies and adds disk I/O. Pure-PBLang SHA-256 compression
+and internal serialization avoid redundant operations while retaining public
+input validation and all digest/CAS/readback/synchronization checks. This is
+still more expensive than memory-only storage. Native/PHP storage and account
+parity and Windows/macOS persistence remain open. The separate product has
+repeatable real-MySQL integration tests for its explicit PHP polyglot edition.
