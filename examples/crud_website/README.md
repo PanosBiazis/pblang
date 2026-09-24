@@ -157,3 +157,11 @@ Session expiry now avoids scanning the session map until its earliest deadline.
 Clock rollback and absolute expiration remain checked. Login pages use same-origin
 referrer policy so real browser form submissions preserve their Origin header;
 cross-origin referrers are suppressed and `Origin: null` is not trusted.
+
+## Saved account catalog
+
+For account credentials that survive restart, use `--init-saved-accounts` once and
+`--serve-saved-accounts` on later runs. Both the native standalone product and this
+example use the same implementation. See [setup, trusted administration, session
+revocation and limitations](../../docs/CRUD_ACCOUNT_CATALOG.md). The older account
+modes above intentionally keep their ephemeral behavior.

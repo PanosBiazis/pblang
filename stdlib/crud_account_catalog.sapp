@@ -1,0 +1,109 @@
+// Private Linux account hashes. Trusted local administration, no HTTP endpoints.
+// Cooperating writers use the existing private compare-and-swap publication.
+let Dir=import("stdlib:linux_dirfs.sapp");
+let Password=import("stdlib:password_bcrypt_linux.sapp");
+let MAX_BYTES=16384;
+let MAX_REVISION=9007199254740991;
+fn _revision(value) {
+    if type(value)!="number" or not (value>=0 and value<=MAX_REVISION) or value!=num_floor(value) {throw "account catalog: invalid revision";}
+    return value;
+}
+fn _accounts(value) {
+    if type(value)!="map" or len(map_keys(value))<1 or len(map_keys(value))>100 {throw "account catalog: invalid accounts";}
+    let copy=map{};
+    for name in map_keys(value) {
+        if len(name)<1 or len(name)>64 {throw "account catalog: invalid account";}
+        for ch in str_split(name,"") {
+            if not str_contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-",ch) {throw "account catalog: invalid account";}
+        }
+        if not Password.valid_hash(value[name]) {throw "account catalog: unsupported password hash";}
+        copy[name]=value[name];
+    }
+    return copy;
+}
+fn encode(snapshot) {
+    if type(snapshot)!="map" or len(map_keys(snapshot))!=2 or not map_has(snapshot,"revision") or not map_has(snapshot,"accounts") {throw "account catalog: invalid snapshot";}
+    let revision=_revision(snapshot.revision);let accounts=_accounts(snapshot.accounts);
+    let lines=["PBLANG-ACCOUNTS-1\t"+str(revision)];
+    for name in map_keys(accounts) {push(lines,name+"\t"+accounts[name]);}
+    return str_join(lines,"\n");
+}
+fn decode(text) {
+    if type(text)!="string" or len(text)>MAX_BYTES or len(str_to_bytes(text))>MAX_BYTES {throw "account catalog: invalid snapshot";}
+    let lines=str_split(text,"\n");
+    if len(lines)<2 or len(lines)>101 {throw "account catalog: invalid snapshot";}
+    let header=str_split(lines[0],"\t");
+    if len(header)!=2 or header[0]!="PBLANG-ACCOUNTS-1" or len(header[1])<1 or len(header[1])>16 {throw "account catalog: invalid header";}
+    for ch in str_split(header[1],"") {if not str_contains("0123456789",ch) {throw "account catalog: invalid revision";}}
+    let revision=_revision(parse_number(header[1]));
+    if str(revision)!=header[1] {throw "account catalog: noncanonical revision";}
+    let accounts=map{};
+    for i in range(1,len(lines)) {
+        let fields=str_split(lines[i],"\t");
+        if len(fields)!=2 or map_has(accounts,fields[0]) {throw "account catalog: invalid row";}
+        accounts[fields[0]]=fields[1];
+    }
+    return map{revision:revision,accounts:_accounts(accounts)};
+}
+fn _path(path) {
+    if platform()!="linux" or type(path)!="string" or len(path)>4096 or not str_starts_with(path,"/") or str_ends_with(path,"/") or str_contains(path,"\\") or str_contains(path,strfromcharcode(0)) {throw "account catalog: private Linux path required";}
+    for part in str_split(str_slice(path,1,len(path)),"/") {if part=="" or part=="." or part==".." {throw "account catalog: invalid path";}}
+    if len(path_basename(path))>250 {throw "account catalog: invalid filename";}
+}
+fn _confirmed(result) {
+    return type(result)=="map" and (try result.ok catch false) and (try result.published catch false)
+        and (try result.readback_verified catch false) and (try result.durability_verified catch false)
+        and (try result.lock_released catch false) and (try result.root_closed catch false);
+}
+fn _load(path,need_digest=true) {
+    let fs=Dir.open_absolute(path_dirname(path),false,true);
+    if not fs.ok {throw "account catalog: directory unavailable";}
+    let loaded=try Dir.read_prefix_bytes(fs,path_basename(path),MAX_BYTES) catch nil;
+    let closed=Dir.close(fs);
+    if not closed or loaded==nil or not loaded.ok or loaded.truncated or not loaded.owner_current_user
+        or loaded.link_count!=1 or bit_and(loaded.mode,511)!=384 {throw "account catalog: private snapshot unavailable";}
+    let snapshot=decode(bytes_to_str(loaded.bytes));
+    let digest=nil;if need_digest {let SHA=import("stdlib:sha256_pb.sapp");digest=SHA.sha256_hex_bytes(loaded.bytes);}
+    return map{snapshot:snapshot,digest:digest};
+}
+fn initialize(path,accounts) {
+    let Secure=import("stdlib:secure_file.sapp");
+    _path(path);let payload=str_to_bytes(encode(map{revision:0,accounts:accounts}));
+    let result=try Secure.private_compare_and_swap(path,map{kind:"missing",algorithm:"none",sha256:""},payload,MAX_BYTES) catch nil;
+    if not _confirmed(result) {throw "account catalog: initialization unconfirmed; inspect before retrying";}
+    return true;
+}
+fn open(path) {
+    let Secure=import("stdlib:secure_file.sapp");
+    _path(path);let loaded=try _load(path) catch nil;
+    if loaded==nil {throw "account catalog: private snapshot unavailable";}
+    let state=map{value:loaded.snapshot,digest:loaded.digest,closed:false,blocked:false};
+    let check=fn(){if state.closed or state.blocked {throw "account catalog: closed or refresh required";}};
+    return map{
+        snapshot:fn(){check();return map{revision:state.value.revision,accounts:_accounts(state.value.accounts)};},
+        save:fn(accounts,expected_revision){
+            check();_revision(expected_revision);
+            if expected_revision!=state.value.revision or expected_revision>=MAX_REVISION {throw "account catalog: stale or exhausted revision";}
+            let candidate=map{revision:expected_revision+1,accounts:_accounts(accounts)};
+            let payload=str_to_bytes(encode(candidate));
+            let result=try Secure.private_compare_and_swap(path,map{kind:"present",algorithm:Secure.RAW_SHA256_ALGORITHM,sha256:state.digest},payload,MAX_BYTES) catch nil;
+            if not _confirmed(result) {state.blocked=true;state.value=nil;throw "account catalog: save unconfirmed; refresh and inspect before retrying";}
+            state.value=candidate;state.digest=result.replacement_sha256;return candidate.revision;
+        },
+        refresh:fn(){
+            if state.closed {throw "account catalog: closed";}
+            state.blocked=true;state.value=nil;
+            let fresh=try _load(path) catch nil;
+            if fresh==nil {throw "account catalog: refresh unavailable";}
+            state.value=fresh.snapshot;state.digest=fresh.digest;state.blocked=false;return fresh.snapshot.revision;
+        },
+        close:fn(){state.closed=true;state.value=nil;state.digest="";return true;}
+    };
+}
+// Fresh read for immutable authentication snapshots; no unused CAS digest/handle.
+fn read(path) {
+    _path(path);let loaded=try _load(path,false) catch nil;
+    if loaded==nil {throw "account catalog: private snapshot unavailable";}
+    return loaded.snapshot;
+}
+export encode,decode,initialize,open,read,MAX_BYTES;
