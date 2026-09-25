@@ -1,5 +1,62 @@
 # Async lifecycle and self-hosted source checking
 
+## Automatic data transfer for parallel maps
+
+`async.map_parallel` automatically tries a data queue when there are at least
+64 items, more than one worker, and the first item is an array, a map or a string
+of at least 256 characters. This is a cheap shape heuristic, not a full input
+cost model or a universal performance guarantee. Small lists, scalar lists and
+single-worker calls retain the capture-based backend. The default worker count
+and the `async.pool` function-list API are unchanged.
+
+The data worker captures only the mapper and channel handles. Each input is
+transferred once through the shared queue rather than copied into every worker.
+Ordered results, task-error-as-nil behavior, nil/sentinel-shaped values and caller
+data isolation are preserved. Mapper captures are still copied to each worker.
+
+The retained host uses different wire formats for captures and channels: JSON
+channels replace non-finite numbers with nil and do not carry functions/modules.
+Before starting any worker, a bounded native JSON round trip and value comparison
+check each queued item. If it throws or changes a value, the staged queue is
+closed/drained and the previous capture backend is used. This fallback occurs
+before any mapper effects; it never retries executed tasks. Exact numeric inputs
+also take the fallback when JSON changes their types, preserving the retained
+capture route's existing string conversion. Cyclic/deep values remain subject to
+the retained transfer limits. This is not a new exact-numeric wire format.
+
+Started workers are joined on partial launch failure or output-transfer failure.
+Result-channel allocation failure drains already queued input. A nonterminating
+mapper can still delay return indefinitely. Queue slots are bounded by item
+count, but total input/output bytes and application concurrency need their own
+budgets. Retained closed channel registry entries are not reclaimed here.
+
+The 23 focused suites include ordered results, isolated mutation, non-finite and
+exact numeric inputs, function fallback without duplicate effects, cyclic input,
+and sibling cleanup on result failure. Fault injection checks failed first/second
+spawn, result-channel allocation, fallback and abandoned payload cleanup. See
+`tests/semantics/async_map_transfer_test.sapp` and
+`examples/async_data_map/main.sapp`.
+
+Against `bb9ca45`, with identical Linux retained executables, one warmup and nine
+alternating measured samples:
+
+| Workload | CPU median before/after (s) | Peak RSS median before/after (KiB) | Elapsed median before/after (s) |
+| --- | --- | --- | --- |
+| Three maps, 1024 rows of 64 numbers, eight workers | 0.22 / 0.12 | 43816 / 28768 | 0.14 / 0.12 |
+| Ten maps, 1024 scalars, eight workers | 0.12 / 0.12 | 28184 / 28272 | 0.07 / 0.07 |
+| 32 waits of 10 ms, default workers | 0.05 / 0.05 | 23196 / 23112 | 0.09 / 0.09 |
+| 128 waits of 5 ms, default workers | 0.05 / 0.04 | 23236 / 23172 | 0.13 / 0.13 |
+| 40 small four-item maps | 0.06 / 0.06 | 32864 / 32888 | 0.05 / 0.05 |
+| Ten function pools of 64 tasks | 0.07 / 0.06 | 27932 / 27920 | 0.05 / 0.05 |
+| 500 futures control | 0.08 / 0.08 | 48456 / 48348 | 0.07 / 0.07 |
+
+The large-row workload used about 45% less CPU and 34% less peak RSS. Timer
+resolution is 0.01 s; nine-sample nearest-rank p95 is the observed maximum.
+Scalar elapsed p95 worsened 0.09 to 0.11 s; future elapsed p95 0.07 to 0.08 s.
+An exploratory queue-for-all-large-lists variant increased scalar CPU and was
+not retained. Prior async/thread waiting regressions are not proven eliminated;
+there is no general RAM, energy, GPU/NPU or Live View improvement claim.
+
 ## Owned cleanup for thread pools
 
 `thread.thread_pool` and its `thread.parallel_map` caller now use a small,
