@@ -74,6 +74,68 @@ guaranteed to transfer.
 Example: `examples/async_lifecycle/main.sapp`.
 Regression coverage: `tests/semantics/async_lifecycle_test.sapp`.
 
+## Pool ownership and default concurrency
+
+`async.map_parallel(items, mapper)` now reuses at most eight workers, matching
+the existing conservative `thread.parallel_map` default. It still processes
+every item and preserves result order. The third argument explicitly chooses
+concurrency, including `1` for debugging and values greater than eight when the
+application has an appropriate resource budget. Empty input starts no workers.
+`pool(size, tasks)` retains its explicit size contract.
+
+This changes default scheduling: I/O-heavy tasks can take longer with fewer
+workers. Tasks must not rely on all items starting simultaneously; for example,
+a barrier expecting more participants than active workers can deadlock. Nested
+pools are separate pools, not a shared process-wide scheduler or a global
+concurrency budget. Inputs, captures, queued indices and retained results still
+consume memory proportional to workload size. No new item-count cap is imposed.
+
+Pool launch/collection lives in `async_pool_worker.sapp`, loaded on first pool
+use, separately from the small single-future launcher. This avoids copying the
+whole async module into each pool worker or loading pool code for `go` alone.
+The owner joins every successfully created worker, including after partial
+launch failure, and closes its result sender before returning. Its result queue
+can hold one message per input, so joining before draining cannot deadlock on
+that queue. External blocking inside a task is not covered by that guarantee.
+
+Launch failure, failed worker join and missing result messages now throw rather
+than returning an apparently successful partial array. After a launch/join
+failure, both abandoned queues are drained after joining, so their payloads do
+not remain in the retained channel registry. Already running tasks
+can complete their external effects before that error returns. They are not
+retried or forcibly cancelled. User task exceptions still map to `nil` for
+backward compatibility, indistinguishable from a successful `nil` in this API;
+use `go`/`all_settled` when that distinction is required. The retained host's
+channel-registry reclamation limitation remains unchanged.
+
+Example: `examples/async_pool/main.sapp`. Regression:
+`tests/semantics/async_pool_ownership_test.sapp`. Failure-injection checks use
+isolated copies of the internal module; production code has no injection hook.
+
+### Pool measurements (2026-09-25)
+
+Retained Linux host, same sources and executable, one warmup followed by seven
+alternating samples per variant. The CPU workload maps 64 items in 30 rounds;
+the wait workload maps 32 independent 30 ms sleeps once. CPU is user + system
+time; RSS is peak process memory. A separate observation saw peak process
+thread counts fall from 34 to 10 (including host threads).
+
+| Workload | CPU median before / after (s) | RSS median before / after (KiB) | Elapsed median before / after (s) |
+| --- | --- | --- | --- |
+| CPU map, default workers | 0.90 / 0.21 | 302368 / 38220 | 0.28 / 0.08 |
+| Same CPU map, explicit four workers | 0.17 / 0.14 | 39988 / 30192 | 0.07 / 0.08 |
+| Waiting tasks, default workers | 0.04 / 0.06 | 26936 / 23052 | 0.07 / 0.17 |
+| 500 single-future launch/await calls | 0.14 / 0.13 | 46980 / 47600 | 0.13 / 0.12 |
+
+Default CPU-map median CPU fell about 77% and RSS about 87% in this workload;
+this combines fewer workers and smaller worker-module snapshots. At the same
+explicit worker count, CPU and RSS also decreased, but elapsed time increased
+slightly. Waiting tasks took longer with the new default. These are tradeoffs,
+not a universal acceleration or general memory-management fix. Single-future
+RSS increased about 1.3%, and its observed p95 CPU rose 0.14 to 0.15 s. The
+explicit-four-worker elapsed p95 rose 0.11 to 0.18 s. With seven samples, p95 is the observed
+maximum. No installed desktop/Live View or wider-platform benefit is established.
+
 ## Self-hosted checking
 
 `frontend_analyze(source)` now checks names, call arity and operand types using
