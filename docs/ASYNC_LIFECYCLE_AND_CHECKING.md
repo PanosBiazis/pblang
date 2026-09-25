@@ -216,3 +216,48 @@ orchestration functions over the same tokenizer/parser/type-checker libraries.
 `source_analysis_parity_test.sapp` compares their complete structured outputs;
 changes to the analysis contract must update both facades and retain parity.
 No results establish Windows/macOS, GPU/NPU, PB-MCP or live-view acceleration.
+
+## Shared AST for smart and type diagnostics
+
+`stdlib:diagnostics.sapp.diagnose_checked(source)` combines smart diagnostics
+with gradual type checking of the same parsed AST. The public `pblang check`
+command uses this API instead of parsing again through `frontend_analyze`.
+Example: `examples/checked_diagnostics/main.sapp`.
+
+The result retains `ok`, diagnostic arrays and counts, and adds `type_checked`.
+Existing parser and unresolved-name errors prevent the type pass; warnings do
+not. Type diagnostics retain their code, message, available span and line.
+Empty/comment-only programs are rejected. All errors contribute to CLI counts
+and the failure exit status. The source is not executed.
+
+Legacy `diagnose`, `suggest` and `autofix` keep their lint-only behavior. The
+checked API is stricter: kernel/extern lint pragmas do not provide verified
+foreign type signatures. Imports and dynamic values remain subject to gradual
+typing limits. This is not a proof of runtime safety. Service callers must
+continue enforcing source-size, time and memory budgets.
+
+PB-MCP's source diagnostics and editor adapters now consume this checked API in
+source. This does not update an installed desktop release or imply Live View
+acceleration. The retained `--check --via-pblang` process-status limitation is
+still separate: use public `check` or `tools/pbcheck.sapp` for exit-status gates.
+
+### Shared-AST measurements (2026-09-25)
+
+Retained Linux runtime, same sources and executable, one warmup and seven
+alternating samples per variant. Before: smart diagnostics followed by
+`frontend_analyze`; after: `diagnose_checked`. Both assert a successful verdict.
+
+| Workload | CPU median before / after | Peak RSS median before / after | CPU observed p95 before / after |
+| --- | --- | --- | --- |
+| 60 checks of a small typed function | 1.08 / 1.02 s | 37148 / 37140 KiB | 1.21 / 1.06 s |
+| 60 checks containing a 400-element list | 4.36 / 2.74 s | 47072 / 37208 KiB | 4.78 / 2.79 s |
+| Public `check`, small file including startup | 1.01 / 0.98 s | 37248 / 37156 KiB | 1.36 / 1.05 s |
+
+These workloads used approximately 6%, 37% and 3% less median CPU respectively.
+The list workload used about 21% less peak RSS; the other medians were almost
+unchanged. Seven-sample nearest-rank p95 is the observed maximum, not a tail
+latency guarantee. This does not remove the earlier standalone frontend cost,
+GC pauses or general runtime/FFI ownership limitations. The API still imports
+the full frontend; `compiler/source_analysis.sapp` remains the smaller choice
+for callers needing type analysis without smart lints. MCP previously ran only
+smart lints, so these comparisons do not measure its added type-checking cost.
