@@ -158,3 +158,61 @@ The existing `examples/concurrent_tasks/main.sapp` now demonstrates the new
 result contract and uses a closed-capture factory for pool jobs. Its Fibonacci
 algorithm/workload is unchanged; recursive declaration moved to module scope
 because the retained host did not resolve the nested recursive name.
+
+## Source-only analysis
+
+`stdlib:compiler/source_analysis.sapp` exports `analyze(source)`, a parity-tested
+structured check equivalent to `frontend_analyze`. It imports only the tokenizer,
+parser and type checker plus their dependencies. It does not import the
+execution VM, optimizer, code generator or module loader. `tools/pbcheck.sapp`
+uses this smaller dependency set; applications needing execution still use the
+full frontend. Example: `examples/source_check/main.sapp`.
+
+This is dependency separation, not lazy loading of arbitrary language modules,
+general automatic memory reclamation or a new backend. Source input is still
+materialized in memory; service callers must retain their source-size and
+execution budgets. Returned token/diagnostic maps are owned by each call and
+are not stored in a cross-request cache.
+
+Lexical scanning checks whether the optional `unterminated` field exists
+instead of probing it through an exception on ordinary tokens. Keyword lookup
+also uses map membership. Malformed numbers and unterminated strings/comments
+retain their diagnostic text and prevent bytecode generation.
+
+The tokenizer now recognizes `nil`, `true` and `false` as completed values
+before a minus sign. Previously `nil-1` could become two expressions (`nil`
+and `-1`) while `nil - 1` was correctly parsed as subtraction. Both spellings
+now produce subtraction, including intervening comments and radix/exponent
+numbers. The checker rejects scalar nil arithmetic without requiring an
+explicit variable type. Unary negative literals after `return`, `throw`, an
+assignment or an opening delimiter retain their previous behavior.
+
+This does not repair the retained Rust `--check --via-pblang` exit-code route;
+use the public `check` command or `tools/pbcheck.sapp` for a process-status gate.
+No installed PB-MCP desktop release is changed by importing this source module.
+
+### Source-only checker measurements (2026-09-25)
+
+Retained Linux runtime, identical inputs, one warmup and seven alternating
+measured samples per variant. CPU is user + system time for the whole process;
+RSS is the process peak, not heap live bytes.
+
+| Workload | CPU median before / after | Peak RSS median before / after | CPU observed p95 before / after |
+| --- | --- | --- | --- |
+| `pbcheck`, one small valid source including startup | 0.83 / 0.12 s | 36848 / 24584 KiB | 0.85 / 0.12 s |
+| Full frontend, 60 small-source analyses | 0.85 / 0.86 s | 36688 / 36664 KiB | 0.90 / 0.88 s |
+| Full frontend, 60 analyses with a 400-element list | 2.49 / 2.46 s | 36688 / 36756 KiB | 2.62 / 2.95 s |
+
+The standalone checker used about 86% less CPU and 33% less peak RSS in this
+startup-dominated workload. This does not imply the same saving for a long-lived
+analysis server. Full-frontend medians remained close (about +1.2% and -1.2%);
+one worst time increased. No general RAM saving or elimination of the older
+analysis overhead is demonstrated. With seven samples, nearest-rank p95 is the
+observed maximum, not a reliable tail-latency bound.
+
+An attempted refactor making the full frontend import the smaller facade was
+rejected after it increased CPU. Both entry points therefore keep small
+orchestration functions over the same tokenizer/parser/type-checker libraries.
+`source_analysis_parity_test.sapp` compares their complete structured outputs;
+changes to the analysis contract must update both facades and retain parity.
+No results establish Windows/macOS, GPU/NPU, PB-MCP or live-view acceleration.
