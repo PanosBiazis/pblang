@@ -565,10 +565,9 @@ fn actor_get_result(actor_ref) { return actor_ref.get_result(); }
 // ─────────────────────────────────────────────────────────────────────────────
 // 16. PROMISE / FUTURE (Kotlin Deferred / Java CompletableFuture)
 //
-// NOTE: pblang closures cannot be serialized across thread boundaries.
-// promise() evaluates fn() eagerly (immediately) in the CURRENT thread and
-// wraps the result. await() and await_timeout() simply return the cached result.
-// For truly async computation, use spawn() + channel() + factory patterns.
+// promise() stays eager in the current VM. go() uses the same minimal worker
+// boundary as async.go, with copied supported captures and terminal envelopes.
+// Futures are owned by their creating VM; do not consume their internal channel.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // promise(fn) → Promise — eagerly evaluate fn() and wrap the result.
@@ -577,71 +576,69 @@ fn promise(fn_val) {
     return map{ __value: val, __done: true };
 }
 
-// go(fn) → Future — run fn() on its OWN thread (truly async). Resolve with
-// await()/try_await(). NOTE: like every spawned closure, `fn` should be
-// self-contained — captured upvalues do not cross the thread boundary.
+// Load only when go is used, so channel/pool-only callers do not import it.
+// Its worker does not snapshot all globals/closures in this thread module.
+let _GO_WORKER = nil;
+
+// go(fn) → Future — run a self-contained task with supported copied captures.
+// Keep the thread API's failure-as-nil contract; use async for distinct errors.
 fn go(fn_val) {
-    let ch = channel_new();
-    let handle = spawn(fn() {
-        let v = try fn_val() catch nil;
-        send(ch.sender, v);
-    });
-    return map{ __go: true, __ch: ch, __handle: handle, __value: nil, __resolved: false };
+    if _GO_WORKER == nil { _GO_WORKER = import("stdlib:async_worker.sapp"); }
+    let future = _GO_WORKER.launch(fn_val);
+    return map{ __go: true, __ch: future.channel, __handle: future.worker,
+                __value: nil, __resolved: false };
 }
 
 fn _is_go(p) { return (try p.__go catch false) == true; }
 
-// await(future) → value — block until resolved (works for promise() and go()).
+fn _go_settle(p, msg) {
+    let joined = try { join(p.__handle); true } catch false;
+    // recv has a host wait limit; recover a late result after joining.
+    if msg == nil and joined { msg = recv_timeout(p.__ch.receiver, 0); }
+    p.__value = if joined and msg != nil and msg.ok == true { msg.value } else { nil };
+    p.__resolved = true;
+    channel_close(p.__ch.sender);
+    return p.__value;
+}
+
+// await(future) → value — cached after completion, including nil and failure.
 fn await(p) {
-    if _is_go(p) {
-        if p.__resolved { return p.__value; }
-        let v = recv(p.__ch.receiver);
-        try join(p.__handle) catch nil;
-        p.__value = v;
-        p.__resolved = true;
-        return v;
+    if _is_go(p) and not p.__resolved {
+        return _go_settle(p, recv(p.__ch.receiver));
     }
     return p.__value;
 }
 
-// await_timeout(future, ms) → {ok, value}.
+// await_timeout(future, ms) → {ok, value}. Here ok means completed, not
+// successful: task failures still resolve to nil for backward compatibility.
+// A timeout does not cancel the worker; the caller retains and settles it.
 fn await_timeout(p, ms) {
-    if _is_go(p) {
-        if p.__resolved { return map{ ok: true, value: p.__value }; }
-        let v = recv_timeout(p.__ch.receiver, ms);
-        if v == nil { return map{ ok: false, value: nil }; }
-        try join(p.__handle) catch nil;
-        p.__value = v;
-        p.__resolved = true;
-        return map{ ok: true, value: v };
+    if _is_go(p) and not p.__resolved {
+        let msg = recv_timeout(p.__ch.receiver, ms);
+        if msg == nil and not channel_is_closed(p.__ch.receiver) {
+            return map{ ok: false, value: nil };
+        }
+        _go_settle(p, msg);
     }
     return map{ ok: true, value: p.__value };
 }
 
-// try_await(future) → value | nil — non-blocking; nil if not yet resolved.
+// try_await remains ambiguous for nil; use is_ready to distinguish completion.
 fn try_await(p) {
-    if _is_go(p) {
-        if p.__resolved { return p.__value; }
-        let v = recv_timeout(p.__ch.receiver, 0);
-        if v == nil { return nil; }
-        try join(p.__handle) catch nil;
-        p.__value = v;
-        p.__resolved = true;
-        return v;
+    if _is_go(p) and not p.__resolved {
+        let msg = recv_timeout(p.__ch.receiver, 0);
+        if msg == nil and not channel_is_closed(p.__ch.receiver) { return nil; }
+        _go_settle(p, msg);
     }
     return p.__value;
 }
 
-// is_ready(future) → bool.
+// is_ready may harvest one terminal result and join its worker. It never
+// discards a legitimate nil result. Join can include runtime teardown time.
 fn is_ready(p) {
     if _is_go(p) {
-        if p.__resolved { return true; }
-        let v = recv_timeout(p.__ch.receiver, 0);
-        if v == nil { return false; }
-        try join(p.__handle) catch nil;
-        p.__value = v;
-        p.__resolved = true;
-        return true;
+        if not p.__resolved { try_await(p); }
+        return p.__resolved;
     }
     return p.__done;
 }

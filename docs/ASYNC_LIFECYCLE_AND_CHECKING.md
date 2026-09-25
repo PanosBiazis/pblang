@@ -1,5 +1,57 @@
 # Async lifecycle and self-hosted source checking
 
+## Thread future completion and shared launch boundary
+
+`thread.go` now uses the minimal `async_worker` launch module, loaded on first
+use. Workers no longer snapshot the entire `thread` module just to execute a
+single task. `thread` and `async` share terminal envelope delivery and its
+serialization-failure fallback; their public failure contracts remain distinct.
+
+- `thread.await_timeout(...).ok` means **completed**, including a successful
+  `nil` or a task failure represented as `nil`. It is not an authentication,
+  application-success or task-success flag. Use `async.all_settled` when task
+  success must be distinguished from a legitimate `nil`.
+- `thread.is_ready` and `thread.try_await` harvest and cache a terminal result,
+  join the owned worker and close its result channel. Repeated observations do
+  not consume or join twice. `try_await` alone still cannot distinguish pending
+  from completed `nil`; inspect `is_ready` or the timeout result.
+- `thread.promise` stays eager. Its task errors still propagate immediately.
+- A waiting deadline does not cancel work. The creating VM retains the future
+  and eventually awaits it. Join after result receipt may include runtime
+  teardown, so these calls provide no hard real-time latency guarantee.
+- Channel registry entries are still retained by the host after close. General
+  cycle reclamation, host aborts before the worker body, external resource
+  cleanup and broader backend parity are not solved here. Future maps and their
+  internal handles must not be shared across VMs or consumed independently.
+
+Example: `examples/thread_future/main.sapp`. Regression coverage includes nil,
+false, envelope-shaped values, copied captures, task exceptions, unsupported
+function/cyclic results, mixed polling, cached observations and late completion.
+
+On Linux, against the preceding source revision with the same retained runtime,
+one warmup and seven alternating samples gave these process medians:
+
+| Workload | CPU before / after (s) | Peak RSS before / after (KiB) | Elapsed before / after (s) |
+| --- | --- | --- | --- |
+| 100 sequential thread futures | 0.11 / 0.04 | 64708 / 26876 | 0.09 / 0.04 |
+| 500 sequential thread futures | 0.50 / 0.07 | 245352 / 47404 | 0.37 / 0.07 |
+| 32 concurrent thread futures waiting 30 ms | 0.05 / 0.04 | 41844 / 26156 | 0.06 / 0.06 |
+| Pool-only control | 0.03 / 0.02 | 27012 / 27080 | 0.02 / 0.02 |
+| Unchanged async future control, 500 tasks | 0.07 / 0.07 | 49400 / 47392 | 0.07 / 0.07 |
+
+Small CPU readings have 0.01-second tool granularity. The waiting workload's
+elapsed p95 increased 0.06 to 0.07 s; the unchanged async control's elapsed p95
+increased 0.07 to 0.10 s. Seven-sample nearest-rank p95 is the sample maximum.
+The control variation is not evidence that this change optimized async itself.
+Earlier async default-pool wait regressions and sustained-future memory costs
+are not established as eliminated. No automatic I/O classification, worker-limit
+increase, GPU/NPU or Live View speedup is claimed.
+
+The separate installed CLI was also found to deny `sleep_ms` in spawned workers
+despite allowing it in the parent with the same invocation. The paired results
+above use the current project executable, not that older installed executable.
+No installed runtime or desktop application was replaced in this change.
+
 The PBLang-owned implementation is `stdlib/async.sapp`. It runs on the retained
 host's spawn/channel/join primitives; this is not a new event-loop runtime or a
 claim of native backend parity.
