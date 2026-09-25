@@ -1,5 +1,55 @@
 # Async lifecycle and self-hosted source checking
 
+## Owned cleanup for thread pools
+
+`thread.thread_pool` and its `thread.parallel_map` caller now use a small,
+on-demand `thread_pool_worker` module. They preserve completion-order results,
+including nil and marker-shaped maps. This is distinct from the ordered,
+task-failure-as-nil contract of `async.pool`.
+
+Input values are queued before any worker starts. If transfer fails, the queue
+is closed and drained and no mapper has run. This deliberately removes the old
+possibility of partial mapper effects before discovering a bad later input.
+Jobs are wrapped as data and the jobs channel is closed after queuing; separate
+stop messages are no longer needed. Job/result queues each hold at most the
+input count. The complete input and output still require application budgets.
+
+On a partial spawn failure, a mapper exception or a non-transferable result,
+every successfully started worker is joined before reporting the error. Joining
+continues after an individual failure. Both queues are closed and abandoned
+payloads are drained. Existing workers may finish queued jobs before that error
+returns. This is cleanup, not cancellation or rollback of external effects.
+A nonterminating mapper can still prevent return; runtime aborts and allocation
+failures outside catchable paths are not covered. Closed registry entries remain
+in the retained host; this is not general handle or cycle reclamation.
+
+Compatibility: nil/zero/negative finite worker counts keep the legacy one-worker
+fallback. Positive fractions and non-finite/nonnumeric counts are now rejected.
+Valid counts clamp to the input length, and empty input starts no worker. Failure
+still throws, but cleanup reports a generic pool-stage error instead of the
+original mapper exception text. Code matching old exception strings must migrate.
+See `examples/thread_pool_cleanup/main.sapp` and
+`tests/semantics/thread_pool_ownership_test.sapp`.
+
+Against source revision `37ee7aa`, identical Linux retained executables, one
+warmup and seven alternating measured samples produced these process medians:
+
+| Workload | CPU before / after (s) | Peak RSS before / after (KiB) | Elapsed before / after (s) |
+| --- | --- | --- | --- |
+| 40 pools, four workers, 32 simple jobs each | 0.17 / 0.06 | 92000 / 33776 | 0.08 / 0.05 |
+| 128 numeric jobs, eight workers | 0.08 / 0.08 | 23588 / 23472 | 0.03 / 0.04 |
+| 32 waits of 10 ms, eight workers | 0.03 / 0.04 | 23424 / 23420 | 0.06 / 0.07 |
+| 20 alternating future/pool calls | 0.09 / 0.06 | 59936 / 28020 | 0.06 / 0.05 |
+| Unchanged async control, 500 futures | 0.08 / 0.08 | 48400 / 48392 | 0.07 / 0.07 |
+
+The repeated pool workload used about 65% less CPU and 63% less peak RSS. These
+are workload-specific reductions from avoiding large module snapshots. The
+single waiting pool cost more CPU and elapsed time; numeric elapsed p95 increased
+0.04 to 0.07 s, waiting elapsed p95 0.06 to 0.09 s. Time readings have 0.01-second
+granularity and seven-sample nearest-rank p95 is the maximum observed sample.
+The previous async regressions, general runtime/FFI/GC, legacy CLI exit status,
+platform parity and installed product integration remain separate open work.
+
 ## Thread future completion and shared launch boundary
 
 `thread.go` now uses the minimal `async_worker` launch module, loaded on first
