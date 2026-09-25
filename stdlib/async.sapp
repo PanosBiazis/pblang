@@ -8,51 +8,68 @@
 //   let future = async.go(fn() { return expensive_computation(); });
 //   let result = async.await(future);
 
-let thread = import("stdlib:thread.sapp");
+let _WORKER = import("stdlib:async_worker.sapp");
 
-// go(fn) — launch a goroutine-style concurrent task. Returns a Future handle.
-// A task that RETURNS nil resolves successfully with nil; only a THROWN error is
-// a failure. We distinguish the two with a per-call sentinel (pblang's `catch`
-// can't bind the thrown value, so a nil return is otherwise indistinguishable
-// from a caught throw).
-fn go(task_fn) {
-    let ch = channel();
-    let sentinel = map{ __async_threw: true };
-    let worker = spawn(fn() {
-        let val = try task_fn() catch sentinel;
-        let threw = (val == sentinel);
-        let v = val;
-        if threw { v = nil; }
-        send(ch.sender, map{ ok: not threw, value: v });
-    });
-    return map{ channel: ch, worker: worker, resolved: false, _value: nil };
-}
-
-// await(future) — block until the future resolves and return its value. Throws
-// only if the task itself threw.
-fn await(future) {
-    if future.resolved == true { return future._value; }
-    let msg = recv(future.channel.receiver);
-    join(future.worker);
-    if msg == nil { return nil; }
-    if msg.ok == false {
-        return error("async.await: task threw");
+// Futures belong to the creating VM. Serialize access in that VM; these maps
+// are not cross-thread synchronization objects.
+fn _whole_number(value, minimum, label) {
+    if not is_number(value) { throw label + ": expected a number"; }
+    if value - value != 0 or value < minimum or value != num_floor(value) {
+        throw label + ": expected a finite whole number >= " + str(minimum);
     }
-    future._value = msg.value;
-    future.resolved = true;
-    return msg.value;
 }
 
-// all_settled(futures) — wait for all and return [{ ok, value }, ...]. Never
-// throws, even if some tasks failed.
+// Wrap success outside the user value: nil, false and sentinel-shaped maps
+// remain ordinary results. A task exception has a separate terminal state.
+fn go(task_fn) { return _WORKER.launch(task_fn); }
+
+fn _settle(future, msg) {
+    let joined = try { join(future.worker); true } catch false;
+    // recv has a host-level wait limit. For an ordinary unbounded await,
+    // join may finish later; recover the queued result only after completion.
+    if msg == nil and joined { msg = recv_timeout(future.channel.receiver, 0); }
+    future._ok = msg != nil and msg.ok == true and joined;
+    future._value = if future._ok { msg.value } else { nil };
+    future.resolved = true;
+    channel_close(future.channel.sender);
+    return nil;
+}
+
+fn _result(future) {
+    if not future._ok { throw "async.await: task threw"; }
+    return future._value;
+}
+
+fn _wait(future) {
+    if future.resolved { return nil; }
+    let msg = recv(future.channel.receiver);
+    return _settle(future, msg);
+}
+
+// Awaiting an already settled success/failure never consumes the channel twice.
+fn await(future) {
+    _wait(future);
+    return _result(future);
+}
+
+// Caller retains the future when a deadline expires, and can await it later.
+// Timeout limits waiting, not worker execution. No preemptive cancellation.
+fn await_timeout(future, ms) {
+    _whole_number(ms, 0, "async.await_timeout");
+    if not future.resolved {
+        let msg = recv_timeout(future.channel.receiver, ms);
+        if msg == nil { return map{ ready: false, ok: false, value: nil }; }
+        _settle(future, msg);
+    }
+    return map{ ready: true, ok: future._ok, value: future._value };
+}
+
 fn all_settled(futures) {
     let out = [];
     for i len(futures) {
-        let f = futures[i];
-        let msg = recv(f.channel.receiver);
-        try join(f.worker) catch nil;
-        if msg == nil { out[i] = map{ ok: false, value: nil }; }
-        else { out[i] = map{ ok: msg.ok, value: msg.value }; }
+        let future = futures[i];
+        _wait(future);
+        out[i] = map{ ok: future._ok, value: future._value };
     }
     return out;
 }
@@ -60,7 +77,16 @@ fn all_settled(futures) {
 // gather(fns) — spawn every zero-arg fn with go() and await all results in order.
 fn gather(fns) {
     let futures = [];
-    for i len(fns) { futures[i] = go(fns[i]); }
+    for i len(fns) {
+        let future = try go(fns[i]) catch nil;
+        if future == nil {
+            for future in futures { _wait(future); }
+            throw "async.gather: worker could not start";
+        }
+        futures[i] = future;
+    }
+    // gather owns these handles: reap every task before surfacing a failure.
+    for future in futures { _wait(future); }
     return await_all(futures);
 }
 
@@ -73,64 +99,49 @@ fn await_all(futures) {
     return results;
 }
 
-// await_race(futures) — return result of whichever future resolves first.
+// Race waits only for the selected worker. The caller still owns the other
+// futures and must await/all_settled them. Cached winners are reusable.
 fn await_race(futures) {
+    if len(futures) == 0 { return nil; }
     let channels = [];
     for i len(futures) {
+        if futures[i].resolved { return _result(futures[i]); }
         channels[i] = futures[i].channel.receiver;
     }
     let sel = select(channels);
     if sel == nil { return nil; }
-    let msg = sel.value;
-    // Join all workers
-    for i len(futures) {
-        try join(futures[i].worker) catch nil;
-    }
-    if msg == nil { return nil; }
-    return msg.value;
+    let winner = futures[sel.index];
+    _settle(winner, sel.value);
+    return _result(winner);
 }
 
-// sleep(ms) — async-friendly sleep
-fn sleep(ms) {
-    sleep_ms(ms);
-}
+fn sleep(ms) { sleep_ms(ms); }
 
-// timeout(ms, fn) — run fn with a timeout; returns nil if timed out.
+// timeout(ms, fn) -> {ready, ok, value, future}.
+// Correctness migration: the former value-or-nil contract could either wait
+// beyond the deadline or lose ownership of a live worker. Always return the
+// future, including on a deadline miss. Caller eventually awaits/settles it.
 fn timeout(ms, task_fn) {
-    let ch = channel();
-    let worker = spawn(fn() {
-        let result = try task_fn() catch nil;
-        send(ch.sender, result);
-    });
-    // Poll every 10ms up to ms total
-    let waited = 0;
-    let interval = 10;
-    while waited < ms {
-        sleep_ms(interval);
-        waited = waited + interval;
-        // Try non-blocking recv
-        let result = try recv(ch.receiver) catch nil;
-        if result != nil {
-            try join(worker) catch nil;
-            return result;
-        }
-    }
-    try join(worker) catch nil;
-    return nil;  // timed out
+    _whole_number(ms, 0, "async.timeout");
+    let future = go(task_fn);
+    let result = await_timeout(future, ms);
+    result.future = future;
+    return result;
 }
 
 // pool(size, tasks) — run tasks in a worker pool of `size` goroutines.
 // tasks: array of zero-arg functions. Returns array of results in order.
-// NOTE: each task must be SELF-CONTAINED — captured upvalues do not survive the
-// thread boundary in this VM. For mapping a function over data, prefer
+// Tasks should be self-contained or use supported closed, transferable captures.
+// Caller globals are not automatically imported. For mapping over data, prefer
 // map_parallel (which passes items as data to a single shared mapper).
 fn pool(size, tasks) {
+    _whole_number(size, 1, "async.pool size");
     let n = len(tasks);
     if n == 0 { return []; }
     if size > n { size = n; }
 
-    let work_ch = thread.channel_new_buffered(n);
-    let result_ch = thread.channel_new_buffered(n);
+    let work_ch = channel_buffered(n);
+    let result_ch = channel_buffered(n);
 
     // Send task INDICES (numbers are transferable; closures are not — they cross
     // the thread boundary only as captured upvalues, never through a channel).
@@ -173,20 +184,18 @@ fn pool(size, tasks) {
 // pool. Workers capture the shared `fn` and `items` (upvalues) and pull item
 // INDICES off a channel; the mapper receives each item as data.
 //
-// IMPORTANT (pblang concurrency constraint): a closure's captured upvalues do NOT
-// cross the thread boundary, so `fn` must be SELF-CONTAINED (non-capturing) — e.g.
-// `fn(x) { return x * 10; }`. A mapper that closes over outer variables will see
-// them as undefined inside a worker. (This is why the previous implementation,
-// which wrapped each item in a capturing closure, silently produced nils.)
+// Closed transferable captures are copied, not shared with the parent VM.
+// Arbitrary caller globals and OS resources are not transferred by this API.
 fn map_parallel(items, fn_, pool_size = nil) {
+    if pool_size != nil { _whole_number(pool_size, 1, "async.map_parallel size"); }
     let n = len(items);
     if n == 0 { return []; }
     let size = pool_size;
     if size == nil { size = n; }
     if size > n { size = n; }
 
-    let work_ch = thread.channel_new_buffered(n);
-    let result_ch = thread.channel_new_buffered(n);
+    let work_ch = channel_buffered(n);
+    let result_ch = channel_buffered(n);
     for i n { send(work_ch.sender, i); }
     channel_close(work_ch.sender);
 
@@ -241,5 +250,5 @@ fn throttle(fn_, interval_ms) {
     };
 }
 
-export go, await, await_all, await_race, all_settled, gather, sleep, timeout,
+export go, await, await_timeout, await_all, await_race, all_settled, gather, sleep, timeout,
        pool, map_parallel, debounce, throttle;
