@@ -312,3 +312,54 @@ diagnostics, the IDE tool module or either analysis frontend. Updating that
 release would not deliver this change, so it was not replaced. No Live View,
 GPU/NPU, Windows/macOS or general GC improvement is established. The retained
 legacy `--check --via-pblang` exit-status issue is unchanged.
+
+## Parser buffer lifetime and compact checking
+
+`compiler/parser.sapp.parse(tokens)` now automatically drops its module-owned
+token and error references before returning an AST, including reported grammar
+errors. A new parse first discards any abandoned state from a previous call.
+Returned ASTs/errors and caller-owned token arrays remain intact: cleanup
+replaces the parser's references rather than clearing shared arrays in place.
+
+The safe source-analysis and frontend parse facades also discard state after
+caught parser exceptions and empty-input rejection. Their lexical-invalid
+early returns release abandoned parser state too. Existing error structures,
+messages and success criteria are unchanged.
+
+`source_analysis.analyze(source, include_tokens = true)` keeps its complete
+historical output by default. Passing the boolean `false` omits only `tokens`
+and drops the analysis-local token reference before type checking. Counts and
+diagnostics remain available. `tools/pbcheck.sapp` selects this automatically;
+no CLI flag or manual cleanup is needed. Non-boolean options are rejected.
+See `examples/source_check/main.sapp` and `examples/parser_lifecycle/main.sapp`.
+
+For debugging, `parser.retained_state()` returns only token/error counts, not
+source content. `parser.discard_state()` is an idempotent explicit reset after
+a caught direct-parser exception. The parser still uses module-global state:
+it is not reentrant and must not be reset during an active parse. Direct
+uncaught parser exceptions preserve their original behavior and can retain
+state until explicit reset, a later parse, or a safe facade call. This is not
+general exception unwinding, cycle collection or external-resource/FFI cleanup.
+Releasing references also does not guarantee memory is returned to the OS.
+
+### Parser lifetime measurements (2026-09-25)
+
+Same retained Linux executable and inputs, one warmup and alternating samples:
+11 per variant for the small CLI, seven for each other workload. CPU is process
+user + system time, RSS is peak process memory. Nearest-rank p95 is the observed
+maximum with these sample counts and is not a latency guarantee.
+
+| Workload | CPU median before / after | Peak RSS median before / after | CPU observed p95 before / after |
+| --- | --- | --- | --- |
+| Standalone `pbcheck`, small source with startup | 0.08 / 0.08 s | 24632 / 24616 KiB | 0.09 / 0.09 s |
+| Standalone `pbcheck`, 4000-element list | 0.40 / 0.40 s | 24624 / 24496 KiB | 0.45 / 0.49 s |
+| 20 parses of an 800-element list | 1.02 / 1.01 s | 24436 / 24416 KiB | 1.05 / 1.44 s |
+| 30 direct PB-MCP checks, 400-element list | 2.29 / 2.25 s | 41804 / 41776 KiB | 2.83 / 2.66 s |
+
+The earlier small-CLI RSS increase did not repeat in this paired run, but the
+medians are essentially unchanged. Some observed worst times increased. These
+results do not establish a general speedup, RAM reduction or elimination of
+earlier regressions. The primary result is that completed parses no longer
+retain their internal token/error buffers. Measurements cover direct MCP
+source checks, not its installed desktop transport or Live View. Legacy CLI
+status handling, wider platforms and general runtime ownership remain separate.
