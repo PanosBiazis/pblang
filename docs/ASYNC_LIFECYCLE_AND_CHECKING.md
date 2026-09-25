@@ -257,7 +257,58 @@ These workloads used approximately 6%, 37% and 3% less median CPU respectively.
 The list workload used about 21% less peak RSS; the other medians were almost
 unchanged. Seven-sample nearest-rank p95 is the observed maximum, not a tail
 latency guarantee. This does not remove the earlier standalone frontend cost,
-GC pauses or general runtime/FFI ownership limitations. The API still imports
-the full frontend; `compiler/source_analysis.sapp` remains the smaller choice
+GC pauses or general runtime/FFI ownership limitations. At that checkpoint the
+API still imported the full frontend; `compiler/source_analysis.sapp` was the smaller choice
 for callers needing type analysis without smart lints. MCP previously ran only
 smart lints, so these comparisons do not measure its added type-checking cost.
+
+## Diagnostics without execution-frontend dependencies
+
+The source-analysis facade now also exports `parse_safe(source)` and
+`typecheck(ast)`. Diagnostics use these instead of importing the full frontend,
+which would load the execution VM, code generation and other unused modules.
+Parsing, smart lints and gradual type checks still run for every call. No
+cross-request cache or diagnostic suppression was added.
+
+The new parse/type results preserve the complete frontend structures, including
+error messages and their historical `frontend_*` prefixes. Parity tests cover
+malformed input, non-string inputs, Unicode, closures and error metadata. The
+low-level `typecheck` entry expects the parser's AST schema; it is not a general
+validator for arbitrary supplied objects. Parser exception conversion does not
+provide a hard CPU or heap budget. The full execution frontend remains unchanged.
+
+The checked-diagnostics regression also runs with only eight source modules
+present: diagnostics, source analysis, tokenizer, parser, type checker, semantic
+analysis, builtins and suggestions. No VM, codegen or full frontend module is
+available in that fixture. `examples/source_check/main.sapp` demonstrates AST
+reuse through the smaller facade.
+
+### Dependency reduction measurements (2026-09-25)
+
+Same workloads and runtime, one warmup and seven alternating measured samples.
+Both variants perform the same checks, unless the row explicitly says lint-only.
+CPU is whole-process user + system time; RSS is peak process memory.
+
+| Workload | CPU median before / after | Peak RSS median before / after | CPU observed p95 before / after |
+| --- | --- | --- | --- |
+| 60 small combined checks | 0.72 / 0.23 s | 37212 / 27076 KiB | 1.05 / 0.33 s |
+| 60 checks of a 400-element list | 2.70 / 2.02 s | 37116 / 27072 KiB | 2.75 / 2.57 s |
+| Public `check`, small file with startup | 0.95 / 0.27 s | 37212 / 26976 KiB | 0.98 / 0.27 s |
+| 30 direct PB-MCP checks, 400-element list | 2.50 / 2.23 s | 44860 / 41876 KiB | 2.99 / 2.34 s |
+| Earlier lint-only PB-MCP versus new checked tool | 2.44 / 2.24 s | 44808 / 41828 KiB | 3.01 / 2.33 s |
+| Standalone `pbcheck`, small source with startup | 0.08 / 0.07 s | 24548 / 24720 KiB | 0.08 / 0.08 s |
+
+The checked PB-MCP workload used about 11% less CPU and 7% less peak RSS than
+the previous checked version. Against the earlier lint-only tool, median CPU
+was about 8% lower while preserving the new type checks. This covers the prior
+6.7% added cost in this particular workload; it is not a guarantee for every
+program or long-lived service. Standalone `pbcheck` times are near the timer's
+resolution and its peak RSS increased slightly (about 0.7%). Absolute timings
+vary between runs; compare paired variants, not isolated historical numbers.
+With seven samples p95 is the observed maximum, not a tail-latency guarantee.
+
+The installed desktop release was inspected: its inventory does not contain
+diagnostics, the IDE tool module or either analysis frontend. Updating that
+release would not deliver this change, so it was not replaced. No Live View,
+GPU/NPU, Windows/macOS or general GC improvement is established. The retained
+legacy `--check --via-pblang` exit-status issue is unchanged.
