@@ -74,6 +74,55 @@ guaranteed to transfer.
 Example: `examples/async_lifecycle/main.sapp`.
 Regression coverage: `tests/semantics/async_lifecycle_test.sapp`.
 
+### Future result-transfer failures
+
+Single-future channels now have capacity one: exactly one terminal envelope is
+expected. One catch boundary covers both task execution and serialization of
+its result. If either fails, the worker attempts a plain failure envelope and
+closes the channel. This prevents unsupported payloads (such as functions or
+cyclic arrays) from leaving an owner waiting for an impossible result until the
+host's 30-second receive timeout. Repeated awaits cache failure as before.
+
+`await_timeout` distinguishes an empty closed channel from a live timed-out
+channel and settles the former. When select returns no winner and a channel is
+closed, `await_race` settles that failed future rather than reporting nil success.
+The ordinary failure-envelope path also wakes races involving other live tasks.
+If even the fallback send fails, a race containing both an empty failed channel
+and an open channel can still wait inside the retained host's select; there is
+no new polling loop or host-level failure notification mechanism. Runtime aborts
+before the worker body and hard resource exhaustion are not covered generally.
+
+The public failure result remains generic (`ok:false`, or the existing await
+error), not a preserved original exception value. `nil`, `false` and maps shaped
+like internal envelopes remain valid successful results. Channel registry entries
+are still retained by the host after close. This is not general handle reclamation
+or cycle collection. Example: `examples/async_transfer/main.sapp`; regression:
+`tests/semantics/async_transfer_failure_test.sapp`.
+
+#### Transfer measurements (2026-09-25)
+
+An identical unsupported-function result probe waited approximately 30001 ms
+before the change and less than 1 ms afterward, measured around await after
+launch. This is one correctness probe, not an overall latency guarantee.
+Normal-workload measurements used the same executable and sources, one warmup,
+seven alternating samples, whole-process CPU and peak RSS:
+
+| Workload | CPU median before / after (s) | RSS median before / after (KiB) | Elapsed median before / after (s) |
+| --- | --- | --- | --- |
+| 500 single-future launch/await pairs | 0.09 / 0.09 | 48840 / 47276 | 0.08 / 0.08 |
+| 5000 single-future launch/await pairs | 1.00 / 1.00 | 278508 / 281640 | 0.82 / 0.83 |
+| 32 waiting tasks, default eight workers | 0.08 / 0.10 | 23012 / 24588 | 0.20 / 0.23 |
+| Same waiting tasks, explicit 32 workers | 0.07 / 0.07 | 25812 / 24556 | 0.10 / 0.10 |
+
+Small-future median RSS decreased about 3.2%, but the sustained workload used
+about 1.1% more. Not all worst times improved: small-future elapsed p95 rose
+0.08 to 0.09 s and explicit-wait elapsed p95 rose 0.10 to 0.11 s. Seven-sample
+p95 is the observed maximum. The default-wait workload regressed in this run;
+its worker policy was not changed. Explicit concurrency reduces its waiting
+time by spending more concurrent workers, not by detecting I/O automatically.
+There is no general RAM saving, removal of all prior overhead, desktop Live View
+benefit or wider-platform result established by these tests.
+
 ## Pool ownership and default concurrency
 
 `async.map_parallel(items, mapper)` now reuses at most eight workers, matching
