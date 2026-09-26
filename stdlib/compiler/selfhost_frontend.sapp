@@ -271,55 +271,70 @@ fn frontend_compile(source) {
     };
 }
 
-/// Compile a batch of independent source strings, returning one frontend_compile()
-/// result per input, in input order. Per-source compilation shares no mutable state
-/// (each produces its own chunk), so the batch fans out across CPU cores via
-/// spawn/join — the textbook per-translation-unit parallelism. Each spawned closure
-/// captures the shared read-only `sources` array plus its own index; frontend_compile
-/// is a module-level function (resolved as a global, not a transferred upvalue), so
-/// the spawn is accepted. If the runtime rejects the spawned closures, this falls back
-/// to sequential compilation, so correctness never depends on threading.
-fn frontend_compile_many(sources) {
-    let n = len(sources);
+// Batch compilation owns every started worker. Limit concurrent snapshots and
+// join the entire active window before any sequential retry or exception.
+fn _batch_limit(max_workers) {
+    if not is_number(max_workers) { throw "frontend batch: max_workers must be a number"; }
+    if max_workers - max_workers != 0 or max_workers < 1 or max_workers > 64
+        or max_workers != num_floor(max_workers) {
+        throw "frontend batch: max_workers must be a whole number from 1 to 64";
+    }
+    return max_workers;
+}
+
+fn _batch_item(value, files, type_options) {
+    if files { return _file_result_wire_safe(frontend_compile_file(value, type_options)); }
+    return frontend_compile(value);
+}
+
+fn _batch_spawn(value, files, type_options) {
+    // Capture this item, not a complete copy of the batch per child VM.
+    return spawn(fn() { return _batch_item(value, files, type_options); });
+}
+
+fn _compile_batch(values, files, type_options, max_workers) {
+    let limit = _batch_limit(max_workers);
+    let n = len(values);
     let results = [];
     if n == 0 { return results; }
-    if n == 1 {
-        array_push(results, frontend_compile(sources[0]));
+    if n == 1 or limit == 1 {
+        for value in values { array_push(results, _batch_item(value, files, type_options)); }
         return results;
     }
-
-    // Spawn one compile per source. Spawn rejection is deterministic on the closure
-    // shape, so it is all-or-nothing: either every spawn succeeds or the first fails.
-    let handles = [];
+    let offset = 0;
     let parallel = true;
-    let i = 0;
-    while i < n {
-        let idx = i;
-        let h = try spawn(fn() { return frontend_compile(sources[idx]); }) catch nil;
-        if h == nil { parallel = false; break; }
-        array_push(handles, h);
-        i = i + 1;
-    }
-
-    if parallel and len(handles) == n {
-        let j = 0;
-        while j < len(handles) {
-            let v = try join(handles[j]) catch nil;
-            if v == nil { parallel = false; break; }
-            array_push(results, v);
-            j = j + 1;
+    while offset < n and parallel {
+        let handles = [];
+        let end = offset + limit;
+        if end > n { end = n; }
+        let i = offset;
+        while i < end {
+            let h = try _batch_spawn(values[i], files, type_options) catch nil;
+            if h == nil { parallel = false; break; }
+            array_push(handles, h);
+            i = i + 1;
         }
-        if parallel { return results; }
-        results = [];   // a join failed: recompute sequentially for a complete result
+        // A failed join does not discard ownership of its remaining siblings.
+        for handle in handles {
+            let value = try join(handle) catch nil;
+            if value == nil { parallel = false; }
+            else { array_push(results, value); }
+        }
+        offset = end;
     }
-
-    // Sequential fallback (threading unavailable or a join failed).
-    let k = 0;
-    while k < n {
-        array_push(results, frontend_compile(sources[k]));
-        k = k + 1;
-    }
+    if parallel { return results; }
+    // Keep the existing all-input fallback contract, but start it only after
+    // all owned workers finished. File contents can still change between reads.
+    results = [];
+    for value in values { array_push(results, _batch_item(value, files, type_options)); }
     return results;
+}
+
+/// Compile independent sources in input order. At most max_workers (default 8,
+/// hard limit 64) are active; 1 selects direct sequential compilation for debug.
+/// Rejected spawn/result transfer falls back only after joining all started work.
+fn frontend_compile_many(sources, max_workers = 8) {
+    return _compile_batch(sources, false, nil, max_workers);
 }
 
 /// Run the optimizer on a chunk, returning optimized chunk and stats.
@@ -869,50 +884,10 @@ fn _file_result_wire_safe(r) {
     };
 }
 
-/// Compile a batch of files by path, one wire-safe frontend_compile_file() result per
-/// input, in order. Files are independent translation units, so the batch fans out
-/// across CPU cores via spawn/join; each spawned closure captures the shared read-only
-/// `paths` array plus its own index. Falls back to sequential compilation if the
-/// runtime rejects the spawned closures, so correctness never depends on threading.
-/// Results omit `symbol_table` (see _file_result_wire_safe).
-fn frontend_compile_file_many(paths, type_options = nil) {
-    let n = len(paths);
-    let results = [];
-    if n == 0 { return results; }
-    if n == 1 {
-        array_push(results, _file_result_wire_safe(frontend_compile_file(paths[0], type_options)));
-        return results;
-    }
-
-    let handles = [];
-    let parallel = true;
-    let i = 0;
-    while i < n {
-        let idx = i;
-        let h = try spawn(fn() { return _file_result_wire_safe(frontend_compile_file(paths[idx], type_options)); }) catch nil;
-        if h == nil { parallel = false; break; }
-        array_push(handles, h);
-        i = i + 1;
-    }
-
-    if parallel and len(handles) == n {
-        let j = 0;
-        while j < len(handles) {
-            let v = try join(handles[j]) catch nil;
-            if v == nil { parallel = false; break; }
-            array_push(results, v);
-            j = j + 1;
-        }
-        if parallel { return results; }
-        results = [];
-    }
-
-    let k = 0;
-    while k < n {
-        array_push(results, _file_result_wire_safe(frontend_compile_file(paths[k], type_options)));
-        k = k + 1;
-    }
-    return results;
+/// Compile files in order, with the same ownership/limits as source batches.
+/// Results omit cyclic symbol_table data (see _file_result_wire_safe).
+fn frontend_compile_file_many(paths, type_options = nil, max_workers = 8) {
+    return _compile_batch(paths, true, type_options, max_workers);
 }
 
 fn _project_external_names(paths) {
@@ -940,7 +915,8 @@ fn _project_external_names(paths) {
 }
 
 /// Compile a project directory: find all .sapp files and compile them.
-fn frontend_compile_project(dir) {
+fn frontend_compile_project(dir, max_workers = 8) {
+    _batch_limit(max_workers);
     if dir == nil or dir == "" {
         return map{
             ok: false,
@@ -963,8 +939,7 @@ fn frontend_compile_project(dir) {
         };
     }
 
-    // Collect the .sapp files first, then compile them in parallel — each file is an
-    // independent translation unit, so the whole directory fans out across CPU cores.
+    // Collect independent translation units, then compile with bounded concurrency.
     let names = [];
     let paths = [];
     let fi = 0;
@@ -981,7 +956,7 @@ fn frontend_compile_project(dir) {
     // a bounded project symbol index so valid cross-file references are not
     // mistaken for typos. Actual linker/module resolution remains a later stage.
     let external_names = _project_external_names(paths);
-    let compiled = frontend_compile_file_many(paths, map{ extern_names: external_names });
+    let compiled = frontend_compile_file_many(paths, map{ extern_names: external_names }, max_workers);
     let ci = 0;
     while ci < len(compiled) {
         let result = compiled[ci];
