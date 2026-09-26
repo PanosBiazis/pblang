@@ -778,3 +778,39 @@ proof. Nine-sample nearest-rank p95 is the observed maximum. There is no general
 RAM reduction, elimination of old async regressions or streaming speedup claim.
 The previous pipeline returned incomplete work, so its time is not a valid
 performance baseline for this completed-batch implementation.
+
+## Single evaluation of computed method receivers (2026-09-27)
+
+The PBLang-owned parser now binds a computed receiver once before colon dispatch.
+Previously `make_object():read()` could call `make_object()` three times for a
+plain method map (twice for a class instance), selecting the method from one
+object but passing another as `self`. Calls, indexes, members and chained
+receivers now use a synthetic value-block local. Its name cannot collide with a
+source identifier, and existing scope/exception cleanup releases the temporary
+reference. A result referring to the object remains valid.
+
+Plain identifiers retain their existing dispatch AST, avoiding an unnecessary
+scope/frame on the common `obj:read()` path. Class-table selection, left-to-right
+argument evaluation, false/nil results and exception propagation are preserved.
+Blocks containing user closures still use the existing closure-frame fallback;
+this change is not a new collector or a general lifetime guarantee.
+
+See `examples/method_receiver_once/main.sapp` and
+`tests/semantics/selfhost_method_receiver_test.sapp`. The regression exercises
+normal/bounded VM execution, safe optimization and bytecode round trips, plus
+nested receivers, captured arguments, successful/failed temporary cleanup and
+malformed syntax.
+
+This is a self-hosted frontend correction. It does **not** change retained Rust
+colon lowering or resolve the separate nested `pipeline:run(...)` failure above.
+Use `thread.pipeline_run(pipeline, input)` on that host. The prior pool/future
+performance regressions, general runtime/FFI/GC work and desktop integration are
+still open. No Live View improvement follows from this parser change alone.
+
+A minimal retained-host reproducer uses a loop-local method map: direct
+`try local:run() catch 9` and `try {local.run(local)} catch 9` produce `7`,
+whereas `try {local:run()} catch 9` produces `9`. The retained parser/compiler
+introduces two nested functions, and its enclosing compiler snapshot stops at
+one parent (`enclosing: None`). The self-hosted regression checks all three
+forms produce `7`. The retained source is reference-only in this work; no Rust
+source was changed and its failing path must not be advertised as repaired.

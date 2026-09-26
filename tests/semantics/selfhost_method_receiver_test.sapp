@@ -1,0 +1,64 @@
+let FE = import("stdlib:compiler/selfhost_frontend.sapp");
+let VM = import("stdlib:compiler/vm.sapp");
+let OPT = import("stdlib:compiler/optimizer.sapp");
+let PB = import("stdlib:selfhost_pbck.sapp");
+let TOK = import("stdlib:compiler/tokenizer.sapp");
+let PAR = import("stdlib:compiler/parser.sapp");
+fn check(source, expected) {
+    let c = FE.frontend_compile(source);
+    assert(c.ok, "compile: " + str(c.diagnostics));
+    for chunk in [c.chunk, OPT.optimize_safe(c.chunk).chunk] {
+        for bounded in [false,true] {
+            let result = if bounded { VM.run_bounded(chunk) } else { VM.run(chunk) };
+            assert(result.output == expected, "method receiver output: " + str(result.output));
+            for key in map_keys(result.globals) {
+                assert(not str_contains(key, "$method_self_"), "temporary receiver must not leak into globals");
+            }
+        }
+        assert(VM.run(PB.deserialize_chunk(PB.serialize_chunk(chunk))).output == expected, "bytecode round trip");
+    }
+}
+let plain = "let calls=0;fn build(){calls=calls+1;return map{value:calls,run:fn(self,x){return self.value+x;}};}";
+check(plain + "print build():run(10);print calls;", [11,1]);
+// Class dispatch must receive the instance, not the class table.
+check("let calls=0;let C=map{run:fn(self,x){return self.value+x;}};"
+    + "fn build(){calls=calls+1;return map{value:calls,__class:C};}print build():run(10);print calls;",[11,1]);
+// An index expression also has effects; preserve left-to-right argument order.
+check("let order=[];let obj=map{run:fn(self,a,b){array_push(order,4);return a+b;}};"
+    + "fn index(){array_push(order,1);return 0;}fn arg(n){array_push(order,n);return n;}"
+    + "print [obj][index()]:run(arg(2),arg(3));print order;",[5,[1,2,3,4]]);
+check("let calls=0;fn build(){calls=calls+1;return map{next:fn(self){return self;},run:fn(self){return 9;}};}"
+    + "print build():next():next():run();print calls;",[9,1]);
+// Nested synthetic scopes must not alias receivers or user identifiers.
+check(plain + "let method_self_1=100;print build():run(build():run(method_self_1));print calls;print method_self_1;",[103,2,100]);
+check("let calls=0;fn build(){calls=calls+1;throw 7;}let args=0;fn arg(){args=args+1;return 0;}"
+    + "print (try build():run(arg()) catch 9);print calls;print args;",[9,1,0]);
+check("let calls=0;fn build(){calls=calls+1;return map{run:fn(self){throw 7;}};}"
+    + "for i 3 {print (try build():run() catch 9);}print calls;",[9,9,9,3]);
+check(plain + "fn exercise(){let total=0;for i 3 {total=total+build():run(i);}return total;}"
+    + "print exercise();print calls;",[9,3]);
+// Closure arguments keep their lexical captures when a value block needs a frame.
+check("fn use(x){return map{run:fn(self,f){return f();}};}fn outer(n){return use(0):run(fn(){return n;});}print outer(8);",[8]);
+check("fn build(){return map{run:fn(self){return self;},value:7};}let out=build():run();print out.value;",[7]);
+check("fn build(){return map{run:fn(self){return false;}};}print build():run();",[false]);
+check("fn build(){return map{run:fn(self){return nil;}};}print build():run();",[nil]);
+// Retained-host regression: nested implicit functions lose a loop-local receiver.
+// The PBLang-owned compiler must preserve all three equivalent spellings.
+check("for i 1 {let local=map{run:fn(self){return 7;}};"
+    + "print (try local:run() catch 9);print (try {local:run()} catch 9);"
+    + "print (try {local.run(local)} catch 9);}",[7,7,7]);
+// Both completion paths release the synthetic receiver slot.
+for action in ["return 7;", "throw 7;"] {
+    let c = FE.frontend_compile("fn build(){return map{run:fn(self){"+action+"}};}let result=try build():run() catch 9;");
+    assert(c.ok,"cleanup source compiles");
+    let result = VM.run(c.chunk);
+    for value in result.locals { assert(value==nil,"temporary receiver slot cleared"); }
+}
+// The common plain-name path retains its existing AST without a new frame.
+let ast = PAR.parse(TOK.tokenize("let p=map{};p:run(1);"));
+assert(len(ast.errors)==0, "plain method parses");
+assert(not map_has(ast.stmts[1].expr,"block_expr"), "plain receiver fast path");
+for source in ["build():run(", "build():run(,);", "build():run(1,,2);"] {
+    assert(not FE.frontend_compile(source).ok, "malformed method rejected");
+}
+print "selfhost_method_receiver_pass";
