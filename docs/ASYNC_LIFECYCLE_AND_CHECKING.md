@@ -814,3 +814,48 @@ introduces two nested functions, and its enclosing compiler snapshot stops at
 one parent (`enclosing: None`). The self-hosted regression checks all three
 forms produce `7`. The retained source is reference-only in this work; no Rust
 source was changed and its failing path must not be advertised as repaired.
+
+## Owned scope and aggregate-join cleanup (2026-09-27)
+
+`thread.scope(body)` now joins its launched workers even if `body(scope)` raises
+or a later launch fails. The scope closes to new launches before it joins, and
+releases its handle array afterwards, including when the caller saved its launch
+closure. Both `sc:launch(worker)` and explicit `thread.scope_launch(sc, worker)`
+are supported. Prefer the explicit function in nested retained-host `try` blocks
+because of the separately documented colon capture defect.
+
+`thread.thread_join_all(handles)` now also attempts every handle after a native
+aggregate-join failure. An invalid/already consumed handle no longer skips all
+later handles. Successful calls keep native launch-order results, including
+nil, false, and per-worker `{ok:false,error:...}` failure maps. Error-shaped user
+values remain ordinary data. Existing native builtins are unchanged.
+
+The normal path still uses one native `join_all`. Only its failure path retries
+handles independently, ignoring already consumed ones while settling the rest.
+When the scope body fails, cleanup discards each worker result rather than
+retaining an aggregate array that cannot be returned. Small private helpers live
+in `thread.sapp`; unused scope/join helpers start no workers and add no imports.
+An experimental cached owner module added worker-copy/import overhead and was
+rejected; importing it again per call was substantially slower still.
+
+### Failure contract and limits
+
+- The retained host cannot bind/rethrow a caught original exception. Body errors
+  now become `thread.scope: body failed` **after cleanup**; body failure takes
+  precedence over a concurrent join failure. The body return value is ignored,
+  as before. Native per-worker error maps retain their existing behavior.
+- Aggregate infrastructure failures raise `thread.scope: join failed` or
+  `thread.join_all: join failed` after remaining handles are attempted. These
+  stable messages replace the native aggregate error text on these paths.
+- An escaped launch closure raises `thread.scope: scope is closed` after its
+  body's lifetime ends. Scope objects belong to their creating VM; this is not
+  a cross-VM capability or a sandbox boundary.
+- Joining is not cancellation, rollback, a deadline or process termination.
+  A worker that never finishes can still prevent scope completion. Native
+  crashes, process exit, resource exhaustion during spawn/handle registration
+  and arbitrary external resources still need runtime-level support.
+
+See `examples/thread_scope_cleanup/main.sapp` and
+`tests/semantics/thread_scope_ownership_test.sapp`. This change does not fix the
+retained colon compiler, generic FFI/GC, prior async timing regressions or the
+installed desktop PB-MCP.

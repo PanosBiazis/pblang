@@ -22,6 +22,64 @@
 // 1. CORE SPAWN/JOIN
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Structured-concurrency cleanup helpers: no imports or background workers.
+fn _scope_body(body, scope_obj) {
+    body(scope_obj);
+    return true;
+}
+
+fn _scope_settle_remaining(handles) {
+    // Discard results one at a time on failure instead of retaining an array
+    // whose values can never be returned to the caller.
+    if type(handles) == "array" {
+        for handle in handles { try join(handle) catch nil; }
+    }
+}
+
+fn _scope_collect(handles) {
+    // Preserve native join_all's ordered results and per-worker error maps.
+    let joined = try map{ok:true, values:join_all(handles)} catch map{ok:false};
+    if not joined.ok {
+        // Native join_all can abort on an invalid/already-consumed handle.
+        // Retry every handle independently so later workers are not abandoned.
+        _scope_settle_remaining(handles);
+    }
+    return joined;
+}
+
+fn _scope_join_owned(handles) {
+    let joined = _scope_collect(handles);
+    if not joined.ok { throw "thread.join_all: join failed"; }
+    return joined.values;
+}
+
+fn _scope_run(body) {
+    let state = map{open:true, handles:[]};
+    let scope_obj = map{
+        launch:fn(_self, worker) {
+            if not state.open { throw "thread.scope: scope is closed"; }
+            let handle = spawn(worker);
+            array_push(state.handles, handle);
+            return handle;
+        }
+    };
+    // Catch binds no error value in this host. Report a stable body error after
+    // cleanup; do not use defer, which does not run on a throw here.
+    let completed = try _scope_body(body, scope_obj) catch false;
+    state.open = false;
+    if not completed {
+        _scope_settle_remaining(state.handles);
+        state.handles = [];
+        throw "thread.scope: body failed";
+    }
+    let joined = _scope_collect(state.handles);
+    // An escaped launch closure must not keep every completed handle alive.
+    state.handles = [];
+    if not joined.ok { throw "thread.scope: join failed"; }
+    return joined.values;
+}
+
+
 // spawn(fn) → handle — spawn a thread running fn().
 fn thread_spawn(fn_val) { return spawn(fn_val); }
 
@@ -30,7 +88,9 @@ fn thread_join(handle) { return join(handle); }
 
 // join_all(handles_array) → [values] — join all handles, collect results in order.
 // Like Go's WaitGroup.Wait() + result collection, or Java's CompletableFuture.allOf().
-fn thread_join_all(handles) { return join_all(handles); }
+fn thread_join_all(handles) {
+    return _scope_join_owned(handles);
+}
 
 // spawn_n(n, fn) → [handles] — spawn n identical threads.
 // Like Go's `for i := 0; i < n; i++ { go fn() }`.
@@ -623,20 +683,12 @@ fn rate_limiter(n_per_second) {
 // All launched tasks are joined before scope() returns.
 // Like Kotlin's coroutineScope {} or Java's StructuredTaskScope.
 fn scope(fn_val) {
-    let handles = [];
-    let scope_obj = map{
-        // `_self` receives `scope_obj` when called via `sc:launch(fn)` method syntax
-        launch: fn(_self, worker) {
-            let h = spawn(worker);
-            array_push(handles, h);
-            return h;
-        }
-    };
+    return _scope_run(fn_val);
+}
 
-    fn_val(scope_obj);  // Run the user's scope body
-
-    // Join all launched tasks
-    return join_all(handles);
+// Explicit receiver dispatch also works in nested retained-host try blocks.
+fn scope_launch(scope_obj, worker) {
+    return scope_obj.launch(scope_obj, worker);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1284,7 +1336,7 @@ export
     // Rate limiter
     rate_limiter,
     // Structured concurrency
-    scope,
+    scope, scope_launch,
     // Thread supervisor
     // Supervisor
     supervisor, cancellation_requested, cancellation_remaining_ms,
