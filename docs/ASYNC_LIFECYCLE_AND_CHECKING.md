@@ -906,3 +906,41 @@ Closing a channel still does not remove its retained-host registry entry.
 This change is not general handle reclamation, cycle collection, cancellation,
 or runtime/FFI cleanup. It does not repair the retained nested `p:run` capture
 issue or establish other-platform/installed-product support.
+
+## Exact partitions and partial launch cleanup in thread_pool
+
+The separate `stdlib:thread_pool.sapp` helper module now rounds chunk counts
+up to integers. Previously `(n + workers - 1) / workers` used floating-point
+division: mapping `[0,1,2,3,4,5]` with four workers returned
+`[0,1,2,2,3,4,4,5]`. `parallel_map` now visits each element once and preserves
+input order. `auto_size` returns `ceil(pending / 2)` clamped to 1..64, so an
+odd pending count cannot produce an invalid fractional worker count.
+
+`parallel_for` partitions iteration counts, not fractional array offsets.
+Start, end and step must be finite integers in the exactly represented range
+−9007199254740991..9007199254740991; positive spans must also fit that range.
+End is exclusive. For compatibility, nil or nonpositive integer step uses 1.
+Fractional/non-finite ranges now fail before launching work; use a separate
+data array for fractional coordinates. Empty calls validate configuration too.
+
+If launching a later worker fails, `parallel_map` and `parallel_for` settle
+all previously launched futures before throwing `thread_pool: worker could
+not start`. This is cleanup, not cancellation or rollback of external effects.
+A worker that never finishes can still delay cleanup indefinitely.
+
+`run_parallel` joins the successfully started chunks and records their task
+outcomes. Tasks in unstarted chunks become failed with `worker could not
+start`; they do not remain pending for implicit replay on the next run.
+Compatibility change: catchable launch failures are returned in the normal
+completed/failed summary rather than escaping with partially pending state.
+Ordinary per-task failures retain their existing result/status behavior.
+The standalone helpers' legacy handling of worker-body/transfer failures is
+unchanged; this is not a new universal exception-preservation mechanism.
+
+Regression tests: `thread_pool_partition_test.sapp` and
+`thread_pool_launch_cleanup_test.sapp` under `tests/semantics`. The latter
+injects first/second launch failure into a temporary copy of the real module,
+uses real workers and joins, and removes its fixture. The example is
+`examples/thread_pool_partition/main.sapp`. No foreign implementation code
+was added. Retained channel registry entries and general runtime/FFI/GC
+cleanup remain separate work.

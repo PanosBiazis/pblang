@@ -17,7 +17,7 @@ fn _callable(v) {
 fn _thread_count(value) {
     let n = value;
     if n == nil { n = DEFAULT_THREADS; }
-    if not is_number(n) or n != num_floor(n) or n < 1 or n > MAX_THREADS {
+    if not is_number(n) or n - n != 0 or n != num_floor(n) or n < 1 or n > MAX_THREADS {
         throw "thread_pool: worker count must be an integer in 1.." + str(MAX_THREADS);
     }
     return n;
@@ -191,6 +191,24 @@ fn _make_for_worker(chunk_start, chunk_end, step, body_fn) {
     };
 }
 
+// If a later launch fails, settle every previously started future before the
+// error escapes. This waits for effects; it does not cancel or roll them back.
+fn _launch_owned(thread_lib, task_fn, handles) {
+    let handle = try thread_lib.go(task_fn) catch nil;
+    if handle == nil {
+        for previous in handles { try thread_lib.await(previous) catch nil; }
+        throw "thread_pool: worker could not start";
+    }
+    array_push(handles, handle);
+}
+
+fn _range_integer(value, label) {
+    if not is_number(value) or value - value != 0 or value != num_floor(value)
+        or value < -9007199254740991 or value > 9007199254740991 {
+        throw "thread_pool.parallel_for: " + label + " must be an exact finite integer";
+    }
+}
+
 fn _make_race_worker(task_fn) {
     return fn() {
         return try map{ ok: true, value: task_fn() }
@@ -218,10 +236,12 @@ fn run_parallel(pool) {
     let chunks = split_tasks(pending, pool.size);
 
     let handles = [];
+    let launch_failed = false;
     let i = 0;
     while i < len(chunks) {
         let chunk = chunks[i];
-        let h = thread_lib.go(_make_chunk_worker(chunk));
+        let h = try thread_lib.go(_make_chunk_worker(chunk)) catch nil;
+        if h == nil { launch_failed = true; break; }
         array_push(handles, h);
         i = i + 1;
     }
@@ -270,7 +290,10 @@ fn run_parallel(pool) {
         } else {
             task.status = "failed";
             task.result = nil;
-            task.error = if outcome == nil { "missing worker outcome" } else { outcome.error };
+            if outcome == nil {
+                task.error = "missing worker outcome";
+                if launch_failed { task.error = "worker could not start"; }
+            } else { task.error = outcome.error; }
             failed = failed + 1;
         }
         array_push(pool.results, task.result);
@@ -322,7 +345,7 @@ fn auto_size(pool) {
     }
 
     // Scale up with workload, bounded by the module hard limit.
-    let optimal = pending / 2;
+    let optimal = num_ceil(pending / 2);
     if optimal < 1 { optimal = 1; }
     if optimal > MAX_THREADS { optimal = MAX_THREADS; }
     pool.size = optimal;
@@ -366,14 +389,15 @@ fn stats(pool) {
 
 /// Parallel map: apply fn to each element of arr using thread pool.
 fn parallel_map(arr, map_fn, nthreads = 4) {
-    let n = len(arr);
-    if n == 0 { return []; }
+    if not is_array(arr) { throw "thread_pool: map input must be an array"; }
     if not _callable(map_fn) { throw "thread_pool: map function must be callable"; }
     nthreads = _thread_count(nthreads);
+    let n = len(arr);
+    if n == 0 { return []; }
     if nthreads > n { nthreads = n; }
 
     let thread_lib = import("stdlib:thread.sapp");
-    let chunk_size = (n + nthreads - 1) / nthreads;
+    let chunk_size = num_ceil(n / nthreads);
 
     let handles = [];
     let i = 0;
@@ -390,8 +414,7 @@ fn parallel_map(arr, map_fn, nthreads = 4) {
             j = j + 1;
         }
 
-        let h = thread_lib.go(_make_map_worker(slice, map_fn));
-        array_push(handles, h);
+        _launch_owned(thread_lib, _make_map_worker(slice, map_fn), handles);
         i = i + 1;
     }
 
@@ -414,17 +437,22 @@ fn parallel_map(arr, map_fn, nthreads = 4) {
 
 /// Parallel for-each over array range.
 fn parallel_for(start, end, step, body_fn, nthreads = 4) {
-    if step == nil or step <= 0 { step = 1; }
+    _range_integer(start, "start");
+    _range_integer(end, "end");
+    if step == nil { step = 1; }
+    _range_integer(step, "step");
+    if step <= 0 { step = 1; }
     if not _callable(body_fn) { throw "thread_pool: body function must be callable"; }
     nthreads = _thread_count(nthreads);
     if end <= start { return nil; }
+    if end - start > 9007199254740991 { throw "thread_pool.parallel_for: range is too wide"; }
 
     let thread_lib = import("stdlib:thread.sapp");
-    let total = (end - start + step - 1) / step;
+    let total = num_ceil((end - start) / step);
     if nthreads > total { nthreads = total; }
 
     let handles = [];
-    let chunk_size = (total + nthreads - 1) / nthreads;
+    let chunk_size = num_ceil(total / nthreads);
 
     let i = 0;
     while i < nthreads {
@@ -433,8 +461,7 @@ fn parallel_for(start, end, step, body_fn, nthreads = 4) {
         let chunk_end = chunk_start + chunk_size * step;
         if chunk_end > end { chunk_end = end; }
 
-        let h = thread_lib.go(_make_for_worker(chunk_start, chunk_end, step, body_fn));
-        array_push(handles, h);
+        _launch_owned(thread_lib, _make_for_worker(chunk_start, chunk_end, step, body_fn), handles);
         i = i + 1;
     }
 
