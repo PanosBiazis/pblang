@@ -674,3 +674,41 @@ sample. An extra launch-module experiment reduced some RSS but added about
 claim follows from this correctness fix. The old retained CLI exit-status bug,
 installed PB-MCP/Live View integration and broader runtime/platform work remain
 separate.
+
+## Aggregate future ownership (2026-09-26)
+
+`async.await_all` now settles every supplied valid future before returning ordered
+values or throwing `async.await: task threw`. Previously a failed task aborted
+that loop before later siblings were joined or their channels closed. Task-body
+and result-transfer failures now leave all supplied futures in their cached
+terminal state. Successful sibling values remain available through `await`.
+Empty inputs, duplicate futures, nil/false and marker-shaped results are retained.
+`gather` delegates this settlement to `await_all`, removing its redundant wait pass.
+
+Compatibility: failure can now return later, after the slowest sibling finishes.
+This is deliberate ownership cleanup, not cancellation, retry or rollback.
+Use `await_timeout`/`await_race` when early return is needed and retain ownership
+of every unfinished future. A nonterminating task can block `await_all` forever.
+Only valid futures owned by this VM are supported; malformed handles, concurrent
+mutation, host aborts and arbitrary allocation failures are outside this fix.
+The separate `async_await.sapp` API and native backends are unchanged.
+
+Regression coverage: `tests/semantics/async_await_all_ownership_test.sapp`.
+Example: `examples/async_await_all_cleanup/main.sapp`.
+
+Identical Linux retained executables, two warmups and nine alternating measured
+samples per version, including startup; RSS is peak process memory:
+
+| Workload | CPU median before/after s | RSS median before/after KiB | Wall median before/after s | Wall p95 before/after s |
+| --- | --- | --- | --- | --- |
+| 40 gathers of four tasks | 0.12442 / 0.12227 | 29836 / 30896 | 0.09536 / 0.09481 | 0.10361 / 0.09866 |
+| Batch of 128 futures | 0.13055 / 0.12843 | 29080 / 29700 | 0.10723 / 0.10456 | 0.18519 / 0.19678 |
+| 32 futures waiting 10 ms | 0.08723 / 0.08632 | 25828 / 25644 | 0.09065 / 0.09274 | 0.13766 / 0.11567 |
+
+CPU differences are small (about 1–2%); RSS increased about 3.6% for gathers and
+2.1% for the batch. Batch wall p95 and wait median worsened. Nine-sample p95 is
+the observed maximum, not a latency guarantee. This is a cleanup correctness
+fix, not general optimization. The earlier pool RAM and compiler-tail regressions
+remain unresolved. An inline pool-initialization experiment saved only about
+0.5% RSS with mixed tails and was rejected. No installed PB-MCP or Live View
+performance benefit, general runtime/FFI/GC completion or platform parity follows.
