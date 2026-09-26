@@ -859,3 +859,50 @@ See `examples/thread_scope_cleanup/main.sapp` and
 `tests/semantics/thread_scope_ownership_test.sapp`. This change does not fix the
 retained colon compiler, generic FFI/GC, prior async timing regressions or the
 installed desktop PB-MCP.
+
+## Race deadlines and scope success allocations
+
+`async.await_race` waits until a supplied future is terminal. The retained
+host's `select` has an internal ten-second wait limit; reaching that limit
+without a terminal future now retries selection instead of inventing a `nil`
+result. An empty race still returns `nil`. A successful task returning `nil`
+remains distinguishable internally from an unfinished task.
+
+`async.await_race_timeout(futures, ms)` provides explicit bounded selection:
+
+- Returns `{ready, ok, value, index}`. `index` is zero-based in the supplied
+  array. Pending and empty races return `ready:false`, `ok:false`, `value:nil`,
+  `index:nil`; empty races return immediately.
+- Task and transfer failures return `ready:true, ok:false`. Successful `nil`,
+  `false`, and status-shaped maps remain ordinary values. Cached terminal
+  futures return immediately, using the first cached entry in array order.
+- `ms` must be a finite whole number from zero through 2147483647 inclusive.
+  Zero polls without waiting for an unfinished result. Invalid durations are
+  rejected even with an empty array or cached result.
+- Selection consumes and settles only the winner; every other future remains
+  caller-owned. Neither timeout nor race cancels work. Eventually use `await`
+  or `all_settled` for every future.
+- The selection duration is not a hard return-time guarantee: winner joining,
+  VM teardown, result conversion and scheduling can add latency. These maps
+  belong to the creating VM; concurrent mutation or consuming their internal
+  channels is unsupported. Selection order is not a chronological ordering
+  of all simultaneous completions.
+
+Example: `examples/async_race_deadline/main.sapp`. Focused tests:
+`tests/semantics/async_race_deadline_test.sapp` and
+`tests/semantics/async_race_host_timeout_test.sapp`. The latter deliberately
+waits 10.2 seconds to cover the real retained-host limit, then reaps the future
+even when run against the broken preceding source.
+
+Scope/aggregate joins no longer allocate a success-status map around the
+native result array. Scope handles transfer to the active stack frame before
+joining; the escaped launch closure is already closed and no longer retains
+them on success or failure. The exceptional path still independently joins
+remaining handles after an invalid/consumed handle. Worker error maps, ordered
+values and stable cleanup error strings remain unchanged. No catch-bound
+original exception value has been added to the retained host.
+
+Closing a channel still does not remove its retained-host registry entry.
+This change is not general handle reclamation, cycle collection, cancellation,
+or runtime/FFI cleanup. It does not repair the retained nested `p:run` capture
+issue or establish other-platform/installed-product support.
