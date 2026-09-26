@@ -633,3 +633,44 @@ earlier regressions. The primary result is that completed parses no longer
 retain their internal token/error buffers. Measurements cover direct MCP
 source checks, not its installed desktop transport or Live View. Legacy CLI
 status handling, wider platforms and general runtime ownership remain separate.
+
+## Pool initialization ownership (2026-09-26)
+
+`async.pool` and the capture-based `async.map_parallel` backend now close the
+work channel if allocation of the result channel fails. If preloading job
+indices fails, both channels are closed and already queued indices are drained
+before throwing. No worker has started on these paths; there is no task replay.
+New stage messages are `async.pool: result channel unavailable` and
+`async.pool: work queue initialization failed`. The retained catch mechanism
+cannot preserve the original host exception text. Initial work-channel allocation
+still propagates its own error because no channel is owned yet.
+
+The temporary fault-injection test rewrites a copy of the actual implementation,
+uses real channels, and verifies first/second allocation failure plus first/third
+index-send failure. Each created channel must be closed and empty. The regression
+fails against the previous implementation and passes after the change. Temporary
+source is removed. Existing task exceptions still yield nil; worker/result-transfer
+failures still join siblings before throwing. See
+`tests/semantics/async_pool_initialization_test.sapp` and
+`examples/async_pool_recovery/main.sapp`.
+
+Fifteen async/thread/channel suites, the example, lint, fixture build and portable
+lock validation passed. This closes specific initialization paths, not arbitrary
+OOM unwinding, retained registry reclamation, external-resource/FFI cleanup or GC.
+
+Paired Linux measurements, identical retained executable and input, two warmups
+and nine alternating measured samples (startup included; RSS in KiB):
+
+| Workload | CPU median before/after s | Peak RSS median before/after | Wall median before/after s | Wall p95 before/after s |
+| --- | --- | --- | --- | --- |
+| 40 four-item maps | 0.07713 / 0.07679 | 32844 / 33656 | 0.06215 / 0.06254 | 0.07100 / 0.06805 |
+| 32 waits of 10 ms | 0.05509 / 0.05395 | 23128 / 23108 | 0.09266 / 0.09201 | 0.09922 / 0.10009 |
+| Ten 128-item numeric maps | 0.07471 / 0.07335 | 27736 / 27996 | 0.06117 / 0.05785 | 0.06439 / 0.06603 |
+
+CPU/wait medians were close; small-map RSS increased about 2.5%, numeric RSS about
+0.9%, and some p95 times worsened. Nine-sample nearest-rank p95 is the maximum
+sample. An extra launch-module experiment reduced some RSS but added about
+20–23% CPU in its paired run and was rejected. No general speedup or RAM-saving
+claim follows from this correctness fix. The old retained CLI exit-status bug,
+installed PB-MCP/Live View integration and broader runtime/platform work remain
+separate.
