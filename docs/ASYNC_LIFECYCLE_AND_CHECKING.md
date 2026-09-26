@@ -712,3 +712,69 @@ fix, not general optimization. The earlier pool RAM and compiler-tail regression
 remain unresolved. An inline pool-initialization experiment saved only about
 0.5% RSS with mixed tails and was rejected. No installed PB-MCP or Live View
 performance benefit, general runtime/FFI/GC completion or platform parity follows.
+
+## Complete staged thread pipelines (2026-09-27)
+
+`thread.pipeline(stages)` now builds a batch pipeline with parallel workers
+inside each stage and a completion barrier between stages. Previously it used
+nonblocking `drain` on the final queue and could return an empty/partial result
+while workers and detached closer tasks were still active. The implementation
+is PBLang and loads `thread_pipeline.sapp` on first construction; ordinary thread
+users do not load that module. Its worker pool loads only for nonempty work.
+
+Use `thread.pipeline_run(pipeline, input_array)` for explicit receiver dispatch:
+
+```pblang
+let T = import("stdlib:thread.sapp");
+let p = T.pipeline([map{workers:2, process:fn(x){return x*2;}}]);
+let values = T.pipeline_run(p, [1,2,3]);
+```
+
+**Retained VM limitation:** in a reproduced nested-loop failure case,
+`p:run(data)` inside `try/catch` did not expose the expected sibling completion
+signal, while `p.run(p, data)` and `T.pipeline_run(p, data)` passed. Prefer the
+explicit public function, especially when catching failures in a local scope.
+The colon-method form remains for compatibility; this change does not repair
+general VM method-call/exception semantics. The exact VM root cause is unresolved.
+The synchronous `pipeline_source/stage/collect` API is unchanged.
+
+Stage configuration is copied and validated before any task starts. Every stage
+requires a callable `process`; `workers` defaults to one and must be a finite
+positive integer, clamped to the current batch length. Invalid later stages
+are rejected during construction. Input must be an array; nil input items are
+ordinary data. A nil *result* filters an item; false and marker-shaped maps remain
+values. Empty batches start no workers; zero stages return the input unchanged.
+Use one worker per stage when deterministic input order is required; multiworker
+results follow completion order.
+
+The existing owned pool joins every started worker and closes/drains queues on
+ordinary task, input/result transfer and partial launch failures. A failed stage
+prevents later stages from starting. Tasks are not retried; completed external
+effects are not rolled back, and unstarted jobs may be abandoned after failure.
+No detached closer task is needed. Nonterminating workers, runtime aborts and
+arbitrary OOM remain outside catchable cleanup. Input/result bytes require caller
+budgets; queue slots are bounded by batch length. Closed host registry entries
+are not reclaimed by this library.
+
+Compatibility correction: stages no longer stream concurrently into each other.
+The API returns a complete batch or throws instead of returning partial work.
+A request depending on overlapping stages needs a separately owned streaming API.
+Validation now rejects zero/negative/nonnumeric workers, even for empty batches.
+See `examples/thread_pipeline_cleanup/main.sapp` and
+`tests/semantics/thread_pipeline_ownership_test.sapp`.
+
+Paired Linux control measurements against `de0bbd9`, identical executables,
+two warmups and nine alternating samples, startup included:
+
+| Existing workload | CPU median before/after s | Peak RSS before/after KiB | Wall median before/after s | Wall p95 before/after s |
+| --- | --- | --- | --- | --- |
+| 40 four-item thread pools | 0.19451 / 0.19198 | 31416 / 32464 | 0.16937 / 0.16223 | 0.31321 / 0.27827 |
+| 100 thread futures | 0.15707 / 0.16137 | 26524 / 26560 | 0.15960 / 0.16641 | 0.50024 / 0.23106 |
+| Unchanged async control | 0.13948 / 0.13455 | 26512 / 25276 | 0.12846 / 0.12481 | 0.15725 / 0.13329 |
+
+The pool used about 3.3% more peak RSS; thread futures used about 2.7% more CPU.
+The unchanged async control also moved, so small differences are not causal
+proof. Nine-sample nearest-rank p95 is the observed maximum. There is no general
+RAM reduction, elimination of old async regressions or streaming speedup claim.
+The previous pipeline returned incomplete work, so its time is not a valid
+performance baseline for this completed-batch implementation.
