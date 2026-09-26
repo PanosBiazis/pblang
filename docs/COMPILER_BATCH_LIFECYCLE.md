@@ -94,3 +94,22 @@ join-failure paths. `frontend_batch_groups_test.sapp` compares complete bytecode
 and diagnostics for mixed valid/invalid inputs, uneven groups, several limits,
 file inputs and spawn-denied fallback. No general GC/FFI cleanup, old CLI status
 fix, async waiting fix or installed PB-MCP/Live View benefit is established.
+
+## Small-load follow-up
+
+The four-source and single-source controls were repeated against `a86e385`, with
+the grouped implementation `cc43089`, identical executable, two warmups and 31
+alternating measured runs per variant. Process CPU was measured using child
+resource usage and elapsed time with a monotonic clock; startup is included.
+
+| Workload | CPU median before/after s | Peak RSS median before/after KiB | Wall median before/after s | Wall p95 before/after s |
+| --- | --- | --- | --- | --- |
+| Four small sources | 0.89114 / 0.94115 | 123600 / 123908 | 0.82496 / 0.86250 | 1.23135 / 1.02876 |
+| Single source control | 0.55247 / 0.55176 | 36748 / 36836 | 0.55535 / 0.55448 | 0.60117 / 0.77055 |
+
+Nearest-rank p95 is the 30th sorted observation of 31. Four-source p95 improved,
+but its median CPU rose about 5.6%; the single-source median was essentially
+unchanged while its p95 worsened. Host activity varied. These mixed observations
+do not prove removal of previous overhead or explain all tail latency. No new
+compiler optimization is claimed from this follow-up, and no weaker validation
+or default safety check was introduced to improve a benchmark score.
