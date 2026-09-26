@@ -15,13 +15,18 @@ direct sequential compilation and debugging: it starts no workers. A batch of
 one item also uses direct compilation. These are per-call limits, not a global
 limit shared by independent processes or nested invocations.
 
-Sources and files are processed in windows of at most the selected size. Each
-worker captures its own source/path rather than the entire input batch. Every
-successfully started worker in a window is joined, including when a later spawn
-or an earlier join fails. No more windows are started after such a failure.
-Only after joining all started work does the existing sequential fallback run.
-Result order and diagnostics remain in input order. File batches omit cyclic
-symbol tables in both sequential and parallel modes, as before.
+Sources and files are divided into contiguous groups of `ceil(count / limit)`
+items. Each worker processes its group sequentially, so a call starts at most
+the selected worker count in total. A batch no larger than the limit still uses
+one item per worker. Every worker captures only its item/group, rather than the
+whole input array. Successful joins are flattened in input order.
+
+Every successfully started worker is joined, including when a later spawn or an
+earlier join fails. Only after joining all started work does the existing
+sequential fallback run. Result order and diagnostics remain in input order.
+File batches omit cyclic symbol tables in both sequential and parallel modes,
+as before. Work distribution is static: an unusually expensive group can delay
+completion while other workers are idle. There is no work stealing or deadline.
 
 Fallback still recompiles the complete input, including previously successful
 items. It is not cancellation, rollback, a consistent filesystem snapshot or an
@@ -63,3 +68,29 @@ host activity. No general speedup or RAM saving is demonstrated. Windows/macOS,
 general runtime/FFI/GC, legacy `--check --via-pblang` status and installed product
 integration remain separate work. This change does not establish a Live View
 benefit or resolve the earlier async waiting regressions.
+
+## Grouped worker reuse (2026-09-26)
+
+The next change avoids fresh child-VM snapshots for each window. Against
+`a86e385`, identical executable/workloads, one warmup and seven alternating
+measured runs per variant (including startup):
+
+| Workload | CPU median before/after s | Peak RSS median before/after KiB | Elapsed median before/after s | Elapsed p95 before/after s |
+| --- | --- | --- | --- | --- |
+| Four small sources | 0.61 / 0.61 | 122772 / 122780 | 0.57 / 0.57 | 0.57 / 0.58 |
+| 32 sources with large comments | 1.73 / 0.90 | 588664 / 220532 | 1.02 / 0.65 | 1.24 / 0.77 |
+| 16 small files | 1.20 / 0.91 | 321664 / 188656 | 0.88 / 0.76 | 1.01 / 0.90 |
+| Single source control | 0.57 / 0.57 | 36832 / 36628 | 0.58 / 0.58 | 1.46 / 0.65 |
+
+The large-source batch used about 48% less CPU and 63% less peak RSS; the file
+batch about 24% less CPU and 41% less peak RSS. Small/control medians were almost
+unchanged, and the small-batch elapsed p95 increased slightly. An exploratory
+fresh compiler import per worker cost 2.94 versus 0.62 s CPU on four sources and
+was rejected. It is not shipped.
+
+Real-thread instrumentation confirmed 32 sources used eight total workers and
+17 files used six, with zero unjoined handles on normal, partial-spawn and
+join-failure paths. `frontend_batch_groups_test.sapp` compares complete bytecode
+and diagnostics for mixed valid/invalid inputs, uneven groups, several limits,
+file inputs and spawn-denied fallback. No general GC/FFI cleanup, old CLI status
+fix, async waiting fix or installed PB-MCP/Live View benefit is established.
