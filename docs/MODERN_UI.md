@@ -76,6 +76,12 @@ Pass `theme: "dark"` or `theme: "light"`. A `palette` map can override the
 RGB/RGBA `bg`, `panel`, `field`, `border`, `accent`, `text`, and `muted` roles.
 Unknown roles and non-color values fail before a window opens.
 
+## Typography
+
+Headings and text support optional `font_size`, `font_weight` and `text_align`
+settings. `ui_typography.preset` provides five reusable styles, with ordinary map
+overrides. See [Typography](TYPOGRAPHY.md) for native fallback details and examples.
+
 ## Android APK
 
 The same tree can produce a signed debug APK in one call:
