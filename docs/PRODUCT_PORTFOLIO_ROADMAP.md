@@ -123,3 +123,7 @@ PBStencil gains editable orientation; PBTile embeds its motifs in saved repeated
 ## Literal vocabulary and subtitle text density
 
 PBWords adds local Writer vocabulary worksheets with exact-form frequencies, block locations, complete result pagination and explicit page CSV/Sheets export. PBMedia gains custom-limit density navigation. Shared bounded text metrics preserve Writer statistics while avoiding repeated Unicode indexing. See `WORDS_AND_SUBTITLE_READING.md`. Linguistic segmentation, full portable file editing and installed cross-platform releases remain future work.
+
+## Category count worksheets
+
+PBTally adds exact-category counts and two-axis cross-tabs with native/CLI preview and new-copy table exports. PBDataLab can export selected-column counts without changing source/undo/saved state. Shared table grouping indexes each axis once; the portable cell reader preserves full selected-row text. See `TABLE_GROUPING_AND_TALLY.md` for model bounds, measured scope and platform evidence. Numeric aggregations, larger tables and portable file editing remain future work.
