@@ -204,7 +204,7 @@ fn _max_local_slot(ins, consts) {
 
 // Lower one self-hosted instruction into `code`. `coff` offsets this chunk's
 // constant indices into the shared pool; `lbl_at` maps target indices -> labels.
-fn _lower_inst(code, inst, ctx, pool, coff, lbl_at, scratch, len_idx) {
+fn _lower_inst(code, inst, ctx, pool, coff, lbl_at, scratch, len_idx, guarded = false) {
     let op = inst.op;
 
     // Optional metadata retains native Module support as well as map lookup.
@@ -294,6 +294,44 @@ fn _lower_inst(code, inst, ctx, pool, coff, lbl_at, scratch, len_idx) {
         _lower_nil_peek_branch(code, ctx, 36, lbl_at[str(inst.operand)]);
         return;
     }
+    if op == 35 and guarded {
+        // Snapshot cleanup before entry can replace its global binding. The
+        // checked boundary uses a zero-argument global call, never arbitrary
+        // handler code. Keep the original native error below secondary errors.
+        let tc = pool[coff + inst.operand];
+        let cleanup_name = tc.catch_chunk.constants[tc.catch_chunk.instructions[0].operand];
+        let cleanup_idx = len(pool); array_push(pool, cleanup_name);
+        let failed = _fresh(ctx);
+        let cleanup_failed = _fresh(ctx);
+        let done = _fresh(ctx);
+        array_push(code, map{op:14, n:cleanup_idx});
+        array_push(code, map{op:26, n:ctx.cleanup_slot});
+        array_push(code, map{op:23, jmp:failed});
+        _lower(code, tc.try_chunk, ctx, pool, scratch, len_idx, true);
+        array_push(code, map{op:24});
+        array_push(code, map{op:25, n:ctx.cleanup_slot});
+        array_push(code, map{op:31, n:0});
+        array_push(code, map{op:11}); // discard cleanup result, preserve entry value
+        array_push(code, map{op:0, n:1});
+        array_push(code, map{op:26, n:ctx.cleanup_slot});
+        array_push(code, map{op:35, jmp:done});
+        array_push(code, map{label:failed});
+        array_push(code, map{op:23, jmp:cleanup_failed});
+        array_push(code, map{op:25, n:ctx.cleanup_slot});
+        array_push(code, map{op:31, n:0});
+        array_push(code, map{op:24});
+        array_push(code, map{op:11});
+        array_push(code, map{op:0, n:1});
+        array_push(code, map{op:26, n:ctx.cleanup_slot});
+        array_push(code, map{op:47}); // rethrow original message
+        array_push(code, map{label:cleanup_failed});
+        array_push(code, map{op:11}); // discard secondary message only
+        array_push(code, map{op:0, n:1});
+        array_push(code, map{op:26, n:ctx.cleanup_slot});
+        array_push(code, map{op:47});
+        array_push(code, map{label:done});
+        return;
+    }
     if op == 35 {                                      // OP_TRY -> inline try/catch
         let tc = pool[coff + inst.operand];
         let catch_lbl = _fresh(ctx);
@@ -330,7 +368,7 @@ fn _lower_inst(code, inst, ctx, pool, coff, lbl_at, scratch, len_idx) {
 // `drop_last_ret` is true (try/catch sub-chunks), the trailing OP_RETURN is
 // omitted so the sub-chunk's value is left on the stack instead of returning from
 // the enclosing function.
-fn _lower(code, chunk, ctx, pool, scratch, len_idx, drop_last_ret) {
+fn _lower(code, chunk, ctx, pool, scratch, len_idx, drop_last_ret, guard_index = nil) {
     let ins = chunk.instructions;
     let coff = len(pool);
     let ci = 0;
@@ -355,7 +393,7 @@ fn _lower(code, chunk, ctx, pool, scratch, len_idx, drop_last_ret) {
         if map_has(lbl_at, str(i)) { array_push(code, map{ label: lbl_at[str(i)] }); }
         // Inline try/catch bodies must not return from the enclosing frame.
         if not (drop_last_ret and i == n - 1 and ins[i].op == 19) {
-            _lower_inst(code, ins[i], ctx, pool, coff, lbl_at, scratch, len_idx);
+            _lower_inst(code, ins[i], ctx, pool, coff, lbl_at, scratch, len_idx, i == guard_index);
         }
         i = i + 1;
     }
@@ -405,7 +443,7 @@ fn _emit_item(out, it, pos) {
 //
 // `is_top` appends an implicit `OpConstant(nil); OpReturn` to satisfy the Rust VM's
 // main-chunk exit convention when the chunk doesn't already end in a return.
-fn _emit_chunk(out, chunk, is_top, arity) {
+fn _emit_chunk(out, chunk, is_top, arity, guard_index = nil) {
     // Shared constant pool, seeded with the two constants the lowering needs.
     let pool = ["len", nil];
     let len_idx = 0;
@@ -415,12 +453,13 @@ fn _emit_chunk(out, chunk, is_top, arity) {
     let pad = (maxloc + 1) - arity;
     if pad < 0 { pad = 0; }
     let scratch = arity + pad;          // dedicated OP_LEN scratch slot
-    let pad_total = pad + 1;            // real local placeholders + the scratch slot
+    let pad_total = pad + 1; // real local placeholders and the length scratch slot
+    if guard_index != nil { pad_total = pad_total + 1; } // captured cleanup callback
 
     // Lower the chunk to label IR (this also merges chunk constants into `pool`).
     let body = [];
-    let ctx = map{ n: 0, recoveries: [] };
-    _lower(body, chunk, ctx, pool, scratch, len_idx, false);
+    let ctx = map{ n: 0, recoveries: [], cleanup_slot: scratch + 1 };
+    _lower(body, chunk, ctx, pool, scratch, len_idx, false, guard_index);
 
     // Assemble: entry placeholders, then the lowered body, then (top) a return.
     let code = [];
@@ -491,6 +530,30 @@ fn translate(chunk) {
     return out;
 }
 
+// Internal native entry boundary. The checked compiler selects a freshly
+// generated top-level try instruction. The source IR/container is unchanged;
+// ordinary translate and PBCS round trips never acquire hidden cleanup metadata.
+fn translate_guarded(chunk, guard_index) {
+    if type(guard_index) != "number" or guard_index < 0 or guard_index != num_floor(guard_index)
+        or guard_index >= len(chunk.instructions) {
+        throw "selfhost_to_pbck: invalid cleanup boundary";
+    }
+    if chunk.instructions[guard_index].op != 35 {
+        throw "selfhost_to_pbck: cleanup boundary must be a try instruction";
+    }
+    let descriptor = chunk.constants[chunk.instructions[guard_index].operand];
+    for part in [descriptor.try_chunk, descriptor.catch_chunk] {
+        let instructions = part.instructions;
+        if len(instructions) != 3 or instructions[0].op != 14 or instructions[1].op != 18
+            or instructions[1].operand != 0 or instructions[2].op != 19 {
+            throw "selfhost_to_pbck: cleanup requires zero-argument global calls";
+        }
+    }
+    let out = [80,66,67,75,RUST_VERSION];
+    _emit_chunk(out, chunk, true, 0, guard_index);
+    return out;
+}
+
 fn write_file(path, chunk) { return fs_write_bytes(path, translate(chunk)); }
 
 // ── optimized translation ─────────────────────────────────────────────────────
@@ -510,4 +573,5 @@ fn optimize_chunk(chunk) {
 fn translate_optimized(chunk) { return translate(optimize_chunk(chunk)); }
 fn write_file_optimized(path, chunk) { return fs_write_bytes(path, translate_optimized(chunk)); }
 
+export translate_guarded;
 export translate, write_file, optimize_chunk, translate_optimized, write_file_optimized;
