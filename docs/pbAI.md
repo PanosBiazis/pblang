@@ -456,3 +456,6 @@ Locked by `tests/semantics/pb_mcp_bridge_test.sapp`.
 *pbAI: the language's own model — small, powerful, fast, smart, accurate, efficient;
 written in pblang; a flagship and its distilled sub-models; expandable; tool-driven
 through pb-mcp-server; built to make pblang better.*
+
+Both curriculum preparation modes are available through `neural_curriculum_split`
+and `neural_task_curriculum_split`; see [the shared contracts and limits](pbAI_Curriculum_Contracts.md).
