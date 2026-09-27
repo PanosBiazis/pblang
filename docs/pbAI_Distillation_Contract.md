@@ -105,6 +105,9 @@ See [measurements](benchmarks/pbai_distillation_release-2026-09-27.json) and
 No chat ingestion, file/network access, model registration, persistent checkpoint
 change or tool authorization occurs through this operation. Teacher training/test
 overlap and independent provenance remain unverified. Semantic dataset separation,
-supervised distillation, persistent student artifacts, production replacement gates,
+persistent student artifacts, production replacement gates,
 representative language evaluation and other devices remain separate work. No AGI,
 ASI, general language competence or universal-platform claim follows from this fixture.
+
+Explicit labeled training with bounded joint gradients is available through
+[`neural_specialist_distill_supervised`](pbAI_Specialist_Supervised_Distillation.md).
