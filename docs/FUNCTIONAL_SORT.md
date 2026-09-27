@@ -88,8 +88,9 @@ snapshots. Do not mutate key objects while comparing them. Caching scalar keys
 prevents later changes to source slots from changing the comparison inputs, but
 does not freeze mutable objects returned as keys.
 
-Implementation decorates each snapshot slot with its projected key, payload and
-original index, then reuses the existing stable merge sorter. No extra module or
+Implementation decorates each snapshot slot with a private two-element array:
+`[key, payload]` for values or `[key, original_index]` for indices. It then
+reuses the existing stable merge sorter. No extra module or
 alternate sorting algorithm is introduced. Source slots, decorated records,
 merge buffers and final output require O(n) extra storage with a larger constant
 than the plain comparator API. Projections require exactly n calls; comparisons
@@ -184,3 +185,88 @@ network, telemetry, credentials, dependencies or compiler changes were introduce
 Fixtures use synthetic data. No full Rust suite, dependency advisory scan or
 cross-platform runtime matrix was run; existing retained-runtime nested-closure
 capture limitations are not fixed by this change.
+
+## Compact key records (follow-up)
+
+The cached-key implementation originally allocated a three-field map per item,
+retaining both payload and index even though each API returns only one. Private
+pairs now retain just the projected key and the requested output. They are not
+exposed to callbacks: the comparator still receives only the projected keys.
+This removes named field lookups in the comparison wrapper and output extraction.
+It does not remove the input snapshot, alter the merge algorithm, reduce its
+comparison count or change the public API. No heap-byte reduction was measured.
+
+The original source at `8ae53b6ddd0346ad7c0a8fead88c2df2362c5caf` is retained byte
+for byte as `bench/fixtures/functional_sort_before_pairs.sapp`. The trace regression
+compares both APIs with that baseline on 243 ternary arrays each (486 cases),
+including the entire projection/comparison sequence and original source slots.
+Additional negative cases stop comparators at calls 1/2/3 or return an invalid
+map, checking immediate failure, all prior projections and no partial output.
+Comparator-side source mutation and array-valued keys are checked against the
+baseline. Existing input-bound, projection-failure, aliasing, NaN/infinity and
+legacy-sort tests remain in effect.
+
+`selfhost_key_sort_test.sapp` now also checks both cached-key APIs with actual
+helper source through plain, optimized and serialized bytecode, with invalid
+comparator rejection and matching comparison traces. Plain/restored instruction
+counts must match. The helper source-size cap is a post-read assertion on a trusted
+repository fixture, not a hostile-file pre-allocation bound.
+
+Seven suites passed: the six listed above plus
+`tests/semantics/functional_key_sort_trace_test.sapp`. Checks on the five changed
+PBLang files report zero errors and zero warnings. Existing unrelated functional
+window and older fixture warnings were not suppressed. Build, portable lock,
+manifest validation and whitespace checks are required for delivery.
+
+### Comparable measurements
+
+Run `pblang run bench/functional_key_pairs.sapp --allow-all`.
+Both sides call the same cached-key API on the same synthetic arrays and key
+functions, including identical n projection calls. This is a different comparison
+from the earlier table, which compared cached and repeated projections. Each run
+uses two warmups, seven alternating-order samples and five complete calls/sample;
+reported sample times are milliseconds per call. Full result parity and projection
+counts are checked outside timing. Two independent runs are retained, including
+all raw samples, medians and interpolated p95, in
+`bench/functional_key_pairs_results.json`. No workload or sample was discarded.
+
+| Output | n | Pattern | Key | Initial change | Confirmation before median ms | Confirmation after median ms | Confirmation before p95 ms | Confirmation after p95 ms | Confirmation change |
+|---|---:|---|---|---:|---:|---:|---:|---:|---:|
+| sort_values | 8 | reversed | cheap | -7.7% | 0.04549 | 0.04225 | 0.05616 | 0.04643 | -7.1% |
+| sort_indices | 8 | reversed | cheap | -12.9% | 0.04478 | 0.04101 | 0.05313 | 0.06774 | -8.4% |
+| sort_values | 8 | reversed | computed | -3.2% | 0.11139 | 0.11210 | 0.16989 | 0.13738 | +0.6% |
+| sort_indices | 8 | reversed | computed | -7.4% | 0.11168 | 0.10462 | 0.11950 | 0.10952 | -6.3% |
+| sort_values | 8 | duplicates | cheap | -7.8% | 0.04954 | 0.04501 | 0.05224 | 0.04559 | -9.1% |
+| sort_indices | 8 | duplicates | cheap | -8.1% | 0.04864 | 0.04611 | 0.05585 | 0.04830 | -5.2% |
+| sort_values | 8 | duplicates | computed | -2.1% | 0.11816 | 0.11148 | 0.15170 | 0.13432 | -5.6% |
+| sort_indices | 8 | duplicates | computed | -2.8% | 0.11821 | 0.11082 | 0.16110 | 0.14736 | -6.3% |
+| sort_values | 128 | reversed | cheap | -6.9% | 1.21746 | 1.04494 | 1.44069 | 1.10538 | -14.2% |
+| sort_indices | 128 | reversed | cheap | -8.7% | 1.21579 | 1.03922 | 1.31357 | 1.15303 | -14.5% |
+| sort_values | 128 | reversed | computed | -4.9% | 2.55494 | 2.33407 | 2.66141 | 2.42686 | -8.6% |
+| sort_indices | 128 | reversed | computed | -5.3% | 2.55036 | 2.35381 | 2.71561 | 2.46694 | -7.7% |
+| sort_values | 128 | duplicates | cheap | -13.8% | 1.47004 | 1.38073 | 1.55336 | 1.49439 | -6.1% |
+| sort_indices | 128 | duplicates | cheap | -13.5% | 1.52941 | 1.32580 | 1.68538 | 1.37411 | -13.3% |
+| sort_values | 128 | duplicates | computed | -1.7% | 2.54760 | 2.46444 | 2.70457 | 2.51468 | -3.3% |
+| sort_indices | 128 | duplicates | computed | -7.3% | 2.61126 | 2.45218 | 2.68065 | 2.55300 | -6.1% |
+| sort_values | 512 | reversed | cheap | -11.4% | 6.08282 | 5.24640 | 6.62640 | 5.79338 | -13.8% |
+| sort_indices | 512 | reversed | cheap | -12.7% | 6.51259 | 5.20692 | 6.76521 | 5.72925 | -20.0% |
+| sort_values | 512 | reversed | computed | -7.4% | 12.98146 | 11.65910 | 13.62980 | 12.09665 | -10.2% |
+| sort_indices | 512 | reversed | computed | -6.7% | 12.85105 | 11.43260 | 13.70345 | 12.29918 | -11.0% |
+| sort_values | 512 | duplicates | cheap | -10.8% | 7.79123 | 7.09071 | 8.09900 | 7.28026 | -9.0% |
+| sort_indices | 512 | duplicates | cheap | -13.2% | 8.09588 | 6.97742 | 8.66215 | 7.16621 | -13.8% |
+| sort_values | 512 | duplicates | computed | -5.7% | 12.51330 | 11.09061 | 12.74299 | 11.51680 | -11.4% |
+| sort_indices | 512 | duplicates | computed | -8.9% | 11.95483 | 10.96578 | 12.92850 | 11.48576 | -8.3% |
+
+Cheap-key medians improved in all 12 workloads in both runs: about 7–14% in
+the initial run and 5–20% in confirmation. Computed-key improvements were smaller;
+one eight-item value workload was 0.6% slower in confirmation. This supports the
+compact representation for this retained Linux runtime, not a universal speed
+claim. O(n) auxiliary space and O(n log n) comparisons remain unchanged. This
+follow-up does not establish that cached sorting beats plain comparator sorting
+for every cheap projection.
+
+The scoped source/privacy review covers private-pair exposure, borrowed references,
+callback effects and bounds. Only synthetic fixtures are introduced; no network,
+filesystem behavior, telemetry, dependencies, compiler or runtime changes are
+added to the production library. Cross-platform timing and a full dependency or
+runtime security audit remain outside this slice.
