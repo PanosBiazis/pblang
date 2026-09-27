@@ -978,8 +978,8 @@ duration; scheduling and VM teardown also prevent a hard return-time guarantee.
 
 Each selection pass polls all unfinished futures with zero wait, then sleeps
 once if necessary. It no longer waits one millisecond separately for each
-candidate. The dependency on `thread.sapp` is lazily loaded once per owning
-module/VM, shared by map, range, pool and race helpers. A failed import is not
+candidate. The minimal future backend described below is lazily loaded once per
+owning module/VM, shared by map, range, pool and race helpers. A failed import is not
 cached. Empty map/range/pool operations still avoid loading the dependency.
 A new execution is required to pick up dependency changes; this is not live
 module reload or a new runtime-wide cache. Serial `run_all` does not load it.
@@ -989,3 +989,32 @@ later task and first/second launch failure with observed real futures, reaping
 workers even against the broken baseline. `thread_pool_race_owned_test.sapp`
 covers ownership transfer, nil/false, failure, empty input and input limits.
 Example: `examples/thread_pool_race_owned/main.sapp`.
+
+## Minimal pool future dependency
+
+`thread_pool` now loads the internal `thread_pool_future.sapp` subset instead
+of importing the whole `thread.sapp` API. It still uses `async_worker.sapp` for
+launching, copied captures and terminal result/transfer envelopes. Serial or empty
+pool operations do not load this backend; repeated parallel calls reuse it in
+the same owning VM. This reduces dependency work without changing concurrency,
+result order, failure-as-nil compatibility, or partial-launch cleanup.
+
+The subset accepts only the valid, unmodified go-futures created by the pool or
+`thread.go`; it is not a replacement public API for eager promises. It preserves
+`__go`, `__ch`, `__handle`, `__value` and `__resolved`. Futures returned by
+`race_owned` therefore remain compatible with `thread.await`, readiness checks
+and repeated settlement. A timeout leaves the live future owned by the caller.
+The success message is recovered after joining if the retained receive wait
+limit was reached. A task/transfer/join failure retains the existing nil result
+contract; `ok` in the timeout result means terminal, not task success.
+
+`tests/semantics/thread_pool_future_test.sapp` checks both directions of
+interoperability, nil/false/status-shaped data, task and transfer errors, result
+queue draining, channel closure, exactly-once joining, timeout ownership and
+late-envelope recovery. The existing pool/race launch-failure tests run against
+the subset too. The partition example exercises repeated reuse.
+
+This does not replace the retained host, reclaim its closed-channel registry,
+preserve original caught exception objects, cancel workers, or enable general
+GC/FFI ownership. The full `thread` API and the installed desktop PB-MCP are
+unchanged. Startup/RAM improvements are workload-dependent, not guaranteed.
