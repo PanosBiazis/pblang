@@ -459,3 +459,6 @@ through pb-mcp-server; built to make pblang better.*
 
 Both curriculum preparation modes are available through `neural_curriculum_split`
 and `neural_task_curriculum_split`; see [the shared contracts and limits](pbAI_Curriculum_Contracts.md).
+
+Explicit specialist training, private evaluation, session promotion and exact rollback
+are available through [the shared neural lifecycle](pbAI_Neural_Lifecycle.md).
