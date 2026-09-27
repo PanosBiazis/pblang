@@ -1,0 +1,113 @@
+// Deterministic Leitner-style review. Dates come from the caller, never a clock.
+let Text=import("stdlib:text_document.sapp");
+let Date=import("stdlib:civil_date.sapp");
+let Serialization=import("stdlib:serialization.sapp");
+let FORMAT="pblang.study-deck.v1"; let MAX_CARDS=64; let MAX_FILE_BYTES=262144;
+fn _integer(value,low,high) {
+    return type(value)=="number" and value>=low and value<=high and value==num_floor(value);
+}
+fn _text(value,limit) {
+    if type(value)!="string" or len(value)>limit or len(str_to_bytes(value))>limit
+        or str_contains(value,"\u0000") { throw "invalid study text"; }
+}
+fn validate(deck) {
+    if type(deck)!="map" or len(deck)!=3 or not map_has(deck,"format") or deck.format!=FORMAT
+        or not map_has(deck,"title") or not map_has(deck,"cards") or type(deck.cards)!="array"
+        or len(deck.cards)<1 or len(deck.cards)>MAX_CARDS { throw "invalid study deck"; }
+    _text(deck.title,256); let seen=map{}; let total=len(str_to_bytes(deck.title));
+    for card in deck.cards {
+        if type(card)!="map" or len(card)!=8 { throw "invalid study card"; }
+        for key in ["id","prompt","answer","stage","due","reviews","last_review","format"] {
+            if not map_has(card,key) { throw "incomplete study card"; }
+        }
+        if card.format!="pblang.study-card.v1" or not _integer(card.id,1,MAX_CARDS)
+            or not _integer(card.stage,0,5) or not _integer(card.reviews,0,1000000)
+            or map_has(seen,str(card.id)) { throw "invalid study card identity or progress"; }
+        seen[str(card.id)]=true; _text(card.prompt,1024); _text(card.answer,4096);
+        if str_trim(card.prompt)=="" or str_trim(card.answer)=="" { throw "empty study question or answer"; }
+        total=total+len(str_to_bytes(card.prompt))+len(str_to_bytes(card.answer));
+        if total>32768 { throw "study deck text limit exceeded"; }
+        let due=Date.ordinal(card.due);
+        if card.last_review!=nil {
+            let last=Date.ordinal(card.last_review);
+            if last>=due or card.reviews<1 { throw "invalid study review dates"; }
+        } elif card.reviews!=0 or card.stage!=0 { throw "invalid initial study progress"; }
+    }
+    return true;
+}
+fn copy(deck) {
+    validate(deck); let cards=[];
+    for c in deck.cards { array_push(cards,map{format:c.format,id:c.id,prompt:c.prompt,answer:c.answer,
+        stage:c.stage,due:c.due,reviews:c.reviews,last_review:c.last_review}); }
+    return map{format:FORMAT,title:deck.title,cards:cards};
+}
+fn create(title,pairs,today) {
+    Date.ordinal(today); _text(title,256);
+    if type(pairs)!="array" or len(pairs)<1 or len(pairs)>MAX_CARDS { throw "invalid study pairs"; }
+    let deck=map{format:FORMAT,title:title,cards:[]};
+    for pair in pairs {
+        if type(pair)!="map" or len(pair)!=2 or not map_has(pair,"prompt") or not map_has(pair,"answer") {
+            throw "invalid study pair";
+        }
+        array_push(deck.cards,map{format:"pblang.study-card.v1",id:len(deck.cards)+1,
+            prompt:pair.prompt,answer:pair.answer,stage:0,due:today,reviews:0,last_review:nil});
+    }
+    validate(deck); return deck;
+}
+// Each heading becomes a question; the following non-heading blocks form its answer.
+// Reject orphan/incomplete sections rather than silently discarding supplied text.
+fn from_document(doc,today) {
+    Text.validate(doc); let pairs=[]; let prompt=nil; let parts=[];
+    for block in doc.blocks {
+        if block.kind=="heading" {
+            if prompt!=nil { array_push(pairs,map{prompt:prompt,answer:str_join(parts,"\n")}); }
+            prompt=block.text; parts=[];
+        } elif prompt==nil {
+            if str_trim(block.text)!="" { throw "study notes must begin with a heading"; }
+        } else { array_push(parts,block.text); }
+    }
+    if prompt!=nil { array_push(pairs,map{prompt:prompt,answer:str_join(parts,"\n")}); }
+    return create(doc.title,pairs,today);
+}
+fn due(deck,today) {
+    let checked=copy(deck); let day=Date.ordinal(today); let entries=[];
+    for card in checked.cards {
+        let ordinal=Date.ordinal(card.due);
+        if ordinal<=day { array_push(entries,map{day:ordinal,card:card}); }
+    }
+    // At most 64 cards. Stable insertion order breaks equal-date ties by input order.
+    // Parse each due date once, rather than twice for every comparison.
+    for i in range(1,len(entries)) {
+        let entry=entries[i]; let j=i;
+        while j>0 and entries[j-1].day>entry.day { entries[j]=entries[j-1]; j=j-1; }
+        entries[j]=entry;
+    }
+    let cards=[]; for entry in entries { array_push(cards,entry.card); }
+    return cards;
+}
+fn review(deck,id,rating,today) {
+    let out=copy(deck); let day=Date.ordinal(today);
+    if not _integer(id,1,MAX_CARDS) or (rating!="again" and rating!="good") { throw "invalid study review"; }
+    let found=false;
+    for card in out.cards {
+        if card.id!=id { continue; } found=true;
+        if day<Date.ordinal(card.due) { throw "card is not due yet"; }
+        if card.reviews>=1000000 { throw "study review limit reached"; }
+        let stage=if rating=="again" {0} else {num_min(5,card.stage+1)};
+        let intervals=[1,1,3,7,14,30];
+        card.stage=stage; card.due=Date.add_days(today,intervals[stage]);
+        card.reviews=card.reviews+1; card.last_review=today;
+    }
+    if not found { throw "study card not found"; } validate(out); return out;
+}
+fn _limits() { return map{max_input_bytes:MAX_FILE_BYTES,max_output_bytes:MAX_FILE_BYTES,
+    max_line_bytes:MAX_FILE_BYTES,max_depth:5,max_items:1400,strict:true,reject_duplicate_keys:true}; }
+fn encode(deck) {
+    let result=Serialization.stringify_safe(copy(deck),"json",_limits());
+    if not result.ok { throw "study serialization failed"; } return result.value;
+}
+fn decode(text) {
+    let result=Serialization.parse_safe(text,"json",_limits());
+    if not result.ok or result.duplicate_keys_checked!=true { throw "invalid study file"; } return copy(result.value);
+}
+export FORMAT,MAX_CARDS,MAX_FILE_BYTES,create,validate,copy,from_document,due,review,encode,decode;
