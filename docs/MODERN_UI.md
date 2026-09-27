@@ -80,6 +80,10 @@ Pass `theme: "dark"` or `theme: "light"`. A `palette` map can override the
 RGB/RGBA `bg`, `panel`, `field`, `border`, `accent`, `text`, and `muted` roles.
 Unknown roles and non-color values fail before a window opens.
 
+## Card appearance
+
+Use `ui_style.card_preset` or per-card `card_variant`, `card_radius` and `card_elevation` options. Local choices override the corresponding application defaults. See [Card styles](CARD_STYLES.md) for direct GUI use and platform behavior.
+
 ## Typography
 
 Headings and text support optional `font_size`, `font_weight` and `text_align`
