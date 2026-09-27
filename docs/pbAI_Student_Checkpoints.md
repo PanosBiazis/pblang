@@ -38,7 +38,9 @@ anonymized or encrypted representation.
 Loading produces `report`, `predict`, `evaluate`, and `checkpoint` operations.
 The weights are detached from the caller's input; editing reports, artifacts or
 prediction arrays cannot change subsequent inference. There is no promotion,
-default-router replacement, automatic learning or continuation-training method.
+default-router replacement, automatic learning or in-place training method.
+[Explicit continuation](pbAI_Student_Continuation.md) accepts a checkpoint and
+returns a separate candidate, preserving the loaded parent.
 Evaluation compares the restored student against its initial frozen-base student.
 Because split history is not exported, `exact_student_input_disjointness_checked`
 is false. No teacher agreement or independent-holdout claim is reconstructed.
@@ -109,8 +111,8 @@ preservation of rejected destinations.
 
 See [measurements](benchmarks/pbai_student_checkpoint_release-2026-09-27.json)
 and [verification](benchmarks/pbai_student_checkpoint_release-checks-2026-09-27.json).
-Representative language evaluation, authenticated provenance, continuation
-training, production replacement gates and other-platform private storage remain
+Representative language evaluation, authenticated provenance, production
+replacement gates and other-platform private storage remain
 separate work. This is not evidence of AGI, ASI or universal device support.
 
 Recorded Linux results: artifacts occupy 455, 459 and 464 bytes for weights 0,
