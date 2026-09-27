@@ -1,0 +1,89 @@
+let Ops=import("stdlib:devops_pipeline.sapp");
+let jobs=[map{id:"build",needs:[]},map{id:"unit",needs:["build"]},
+    map{id:"lint",needs:["build"]},map{id:"package",needs:["unit","lint"]},
+    map{id:"deploy",needs:["package"]},map{id:"docs",needs:[]}];
+fn ids(jobs) { let out=[]; for job in jobs { array_push(out,job.id); } return str_join(out,","); }
+assert(ids(Ops.select_jobs(jobs,["unit"]))=="build,unit","target includes prerequisites, excludes descendants and unrelated nodes");
+assert(ids(Ops.select_jobs(jobs,["package","docs"]))=="build,docs,unit,lint,package","diamond and independent target");
+assert(ids(Ops.select_jobs(jobs,["unit","package"]))=="build,unit,lint,package","target also ancestor is included once");
+assert(ids(Ops.select_jobs(jobs,["package","docs"]))==ids(Ops.select_jobs(jobs,["docs","package"])),"target order does not change stable graph order");
+let selected=Ops.select_jobs(jobs,["package"]);
+assert(str_join(selected[3].needs,",")=="unit,lint","dependency order preserved");
+selected[1].needs[0]="changed"; selected[0].id="changed";
+assert(jobs[1].needs[0]=="build" and jobs[0].id=="build","returned graph cannot mutate input");
+let original=json_parse(json_stringify(jobs)); let copy=Ops.select_jobs(original,["unit"]);
+original[1].needs[0]="changed"; original[0].id="changed";
+assert(copy[1].needs[0]=="build" and copy[0].id=="build","input mutations cannot mutate returned snapshot");
+fn blocked(graph,targets) {
+    let called=0;
+    let rejected=try {Ops.run_targets(graph,targets,fn(id){called=called+1;return map{ok:true};},true);false} catch true;
+    assert(rejected and called==0,"invalid graph/selection blocks every callback");
+}
+for target in [nil,0,"unit",map{},[],[nil],[""],["bad/id"],["missing"],["unit","unit"],[str_repeat("a",49)]] { blocked(jobs,target); }
+let over=[]; for _i in range(0,33) {array_push(over,"unit");} blocked(jobs,over);
+blocked([map{id:"good",needs:[]},map{id:"bad",needs:["missing"]}],["good"]);
+blocked([map{id:"good",needs:[]},map{id:"a",needs:["b"]},map{id:"b",needs:["a"]}],["good"]);
+blocked([map{id:"good",needs:[]},map{id:"bad",needs:[],command:"private_marker"}],["good"]);
+let seen=[];
+let runner=fn(id){array_push(seen,id);return map{ok:id!="unit"};};
+let denied=try Ops.run_targets(jobs,["unit"],runner) catch nil;
+assert(denied==nil and len(seen)==0,"targeted execution disabled by default");
+for opt in [nil,0,1,"true",[],map{}] {
+    assert((try Ops.run_targets(jobs,["unit"],runner,opt) catch nil)==nil and len(seen)==0,"only literal true authorizes callbacks");
+}
+let result=Ops.run_targets(jobs,["package","docs"],runner,true);
+assert(len(result)==9 and result.format=="pblang.devops-target-run.v1" and result.selection_mode=="target-closure"
+    and result.total_job_count==6 and result.selected_job_count==5 and result.target_count==2
+    and not result.all_jobs_selected and not result.production_ready,"partial scope explicit");
+assert(not result.ok and result.run.callbacks_invoked==4 and str_join(seen,",")=="build,docs,unit,lint"
+    and result.run.jobs[4].status=="skipped","selected failure skips dependents and keeps independent jobs");
+let small=Ops.run_targets(jobs,["unit"],fn(id){return map{ok:true};},true);
+assert(small.ok and not small.all_jobs_selected and small.selected_job_count==2,"successful subset is not full-pipeline evidence");
+let all=Ops.run_targets(jobs,["deploy","docs"],fn(id){return map{ok:true};},true);
+assert(all.ok and all.all_jobs_selected and all.run.callbacks_invoked==6,"all jobs included explicitly");
+let mutable=json_parse(json_stringify(jobs)); let targets=["unit"]; let count=0;
+let stable=Ops.run_targets(mutable,targets,fn(id){
+    count=count+1; mutable[1].needs=["deploy"]; targets[0]="deploy"; return map{ok:true};
+},true);
+assert(stable.ok and count==2 and stable.selected_job_count==2,"callback mutations cannot broaden selected closure");
+let malformed=Ops.run_targets(jobs,["unit"],fn(id){return map{ok:true,extra:"private_marker"};},true);
+assert(not malformed.ok and malformed.run.callbacks_invoked==1
+    and not str_contains(json_stringify(malformed),"private_marker"),"malformed callback fails without output reflection");
+let thrown=Ops.run_targets(jobs,["deploy","docs"],fn(id){throw "private_marker";},true);
+assert(thrown.all_jobs_selected and not thrown.ok and thrown.run.callbacks_invoked==2
+    and not str_contains(json_stringify(thrown),"private_marker"),
+    "all selected is not all successful; callback exceptions stay masked");
+let chain=[]; let all_targets=[];
+for i in range(0,32) {
+    let id="n"+str(i); array_push(all_targets,id);
+    array_push(chain,map{id:id,needs:if i==0 {[]} else {["n"+str(i-1)]}});
+}
+assert(len(Ops.select_jobs(chain,["n31"]))==32 and len(Ops.select_jobs(chain,all_targets))==32,"max chain and target count");
+// Exhaust every forward-edge DAG on three nodes and every nonempty target set.
+// Independent fixed-point oracle, deliberately non-topological input order.
+for edges in range(0,8) {
+    let a=map{id:"a",needs:[]}; let b=map{id:"b",needs:[]}; let c=map{id:"c",needs:[]};
+    if edges%2==1 {array_push(b.needs,"a");}
+    if num_floor(edges/2)%2==1 {array_push(c.needs,"a");}
+    if num_floor(edges/4)%2==1 {array_push(c.needs,"b");}
+    let graph=[c,a,b];
+    for mask in range(1,8) {
+        let names=[]; let expected=map{};
+        if mask%2==1 {array_push(names,"a");expected.a=true;}
+        if num_floor(mask/2)%2==1 {array_push(names,"b");expected.b=true;}
+        if num_floor(mask/4)%2==1 {array_push(names,"c");expected.c=true;}
+        for _pass in range(0,3) {
+            for job in graph { if map_has(expected,job.id) {
+                for dep in job.needs {expected[dep]=true;}
+            } }
+        }
+        let actual=Ops.select_jobs(graph,names); let emitted=map{};
+        assert(len(actual)==len(expected),"minimal closure cardinality against independent oracle");
+        for job in actual {
+            assert(map_has(expected,job.id) and not map_has(emitted,job.id),"exact unique closure membership");
+            for dep in job.needs {assert(map_has(emitted,dep),"every prerequisite precedes dependent");}
+            emitted[job.id]=true;
+        }
+    }
+}
+print "devops_targets_pass";
