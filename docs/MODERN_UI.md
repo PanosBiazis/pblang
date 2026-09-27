@@ -108,7 +108,10 @@ Arbitrary native closures are intentionally rejected by an Android build.
 Use portable actions for behavior shared across platforms, or a platform
 service adapter for advanced OS functionality. `choice` is emitted as an
 interactive native Android spinner. An `image` reserves an accessible native
-image surface but does not yet encode a PBLang frame into Android resources.
+image surface by default. Set `android_images: true` to embed bounded static
+RGB/RGBA frames. Optional per-image `fit` and `image_rendering` settings control
+framing and pixel edges; see [Image rendering](IMAGE_RENDERING.md) for examples,
+limits and adapter behavior.
 
 ## Web application
 
