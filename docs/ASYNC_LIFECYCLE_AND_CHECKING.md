@@ -1073,3 +1073,53 @@ Regression: `tests/semantics/thread_pool_result_slots_test.sapp` covers reused
 parallel pools, sparse public IDs relative to new batch positions, stable ties,
 nil/false/zero values and a real worker transfer failure. The priority regression
 also checks every NaN position in odd queues of 33, 65 and 97 tasks.
+
+## Compact round-robin worker payloads
+
+`run_parallel` builds per-worker arrays of callbacks directly, without an
+intermediate pending array or a map containing `{index, fn}` for every task.
+Each closed worker factory captures its first collection position and the
+validated worker stride. Result position is `first + offset * stride`; this is
+a pending-batch position, not a public task ID or a completed-history offset.
+Uneven last chunks and fewer pending tasks than workers are supported. The
+public `split_tasks` helper and all public pool signatures remain unchanged.
+
+Task outputs still cross the same bounded future/channel boundary, including
+its existing conversion and transfer-failure behavior. Started workers are still
+settled after later launch failure. There is no channel reuse, thread-count
+reduction, cancellation or new permission requirement. Callback functions retain
+the existing requirement for transferable closed captures.
+
+This removes per-task descriptor maps both before and during worker transfer;
+it does not imply equivalent peak RSS savings. The retained host still retains
+closed native channel registry entries, and this PBLang-only change does not
+reclaim that registry. Allocation counters count allocations, not live bytes.
+
+Regression: `tests/semantics/thread_pool_chunk_layout_test.sapp` covers empty and
+uneven batches, 1/3/4/8 workers, stable ties, task failures, original IDs and
+reused history; launch and whole-worker transfer failures retain their existing
+regressions. `examples/thread_pool_priority/main.sapp` includes an uneven batch.
+
+## Drop the temporary worker's unused launcher binding
+
+The retained spawn host copies `async_worker` globals into a temporary child
+module. The copied `launch` closure points back to that same module, forming an
+otherwise unused cycle after the worker completes. Before invoking user work,
+the child replaces only its private copied `launch` binding with the existing
+`error` builtin, which has a compatible callable type and owns no module. The parent's
+exported launcher is unchanged and remains callable. Explicitly imported modules
+inside the child retain their independent bindings, including nested async work.
+
+This applies automatically to `async.go`, `thread.go` and the pool future backend
+through their shared PBLang worker boundary. Captures, output conversion,
+success/failure envelopes, capability inheritance and join ownership are unchanged.
+Caller globals are still not a supported transfer contract; the implementation's
+incidental child-global launcher is not a public task API.
+
+This is removal of one known module-reference cycle, not general cycle collection.
+It does not clean arbitrary host/FFI failures, reclaim native channel registry
+entries, change native thread stack sizing, or enable unsupported backends.
+Regression: `tests/semantics/async_worker_module_lifetime_test.sapp` checks the
+child binding, preserved parent calls, closed captures, nested imports/workers,
+exceptions and result-transfer failures. Long-run RSS and allocation counters
+must be reported separately: allocation counts are not a live-memory measurement.
