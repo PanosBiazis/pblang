@@ -37,6 +37,47 @@ The CLI requires a separate `.pbck` output filename (default: source basename
 with `.pbck`). `--safe`, `--overflow`, and `--local-source` are rejected for this
 target rather than silently implying unsupported guarantees.
 
+## Explicit entry cleanup
+
+For a program that owns resources across calls, compile with an explicit entry
+and cleanup function:
+
+```sh
+./target/release/pblang run tools/pbc.sapp --allow-all -- examples/native_cleanup.sapp --target pbck --entry work --cleanup release --out cleanup.pbck
+./target/release/pblang run cleanup.pbck --allow-all
+PBLANG_CLEANUP_DEMO_FAIL=1 ./target/release/pblang run cleanup.pbck --allow-all
+```
+
+The last invocation deliberately fails after allocating a managed VM resource.
+It prints `resources released` and exits unsuccessfully with the original indexing
+error. Remove the generated artifact when finished.
+
+The library equivalent is `compile_source_with_cleanup(source, entry, cleanup)`.
+Both names must identify distinct, explicit top-level functions with no arguments.
+The compiler validates the whole source before publication. Source initialization
+runs first; then the cleanup callback is captured before invoking the entry.
+Reassigning its global name inside the entry does not replace that callback.
+
+Cleanup runs once after a successful result or a catchable native runtime error,
+including errors raised by imported code. If only cleanup fails, its error is
+reported. If both fail, the entry's original **error message** wins. The native
+boundary does not preserve a typed exception payload or the original stack trace.
+The successful entry result is preserved by the bytecode boundary; the CLI's
+appended entry expression discards it. No capability is granted by this option.
+
+This is explicit resource ownership, not automatic cleanup of every program.
+There is no cleanup guarantee for initialization failures before the boundary,
+process termination, native FFI crashes, unavailable memory preventing cleanup,
+or a cleanup callback that never returns. It does not install cancellation or
+cycle collection, and does not change direct retained-source execution or other
+backends. Ordinary PBCK compilation is unchanged. The low-level
+`translate_guarded(chunk, index)` accepts only the canonical two-callback shape;
+it is intended for trusted compiler-produced chunks, not untrusted bytecode.
+
+`native_pbck_cleanup_test.sapp` covers successful false/nil/container results,
+original versus secondary failures, callback replacement, denied capabilities,
+invalid declarations and actual VM resource release after a host indexing error.
+
 ## Method-call correction
 
 A colon call first checks the optional `__class` property and then looks up the
