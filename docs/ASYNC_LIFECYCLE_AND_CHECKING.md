@@ -1123,3 +1123,36 @@ Regression: `tests/semantics/async_worker_module_lifetime_test.sapp` checks the
 child binding, preserved parent calls, closed captures, nested imports/workers,
 exceptions and result-transfer failures. Long-run RSS and allocation counters
 must be reported separately: allocation counts are not a live-memory measurement.
+
+## Pool child-module lifetime (2026-09-27)
+
+The private `async_pool_worker`, `async_map_worker` and `thread_pool_worker`
+boundaries now retire their parent-only helper bindings in each child snapshot
+before executing user work. The retained spawn host hydrates those helpers as
+closures referring back to the same child module; without retiring all of them,
+joining the OS thread leaves a module/closure reference cycle. Native `error`
+bindings remain callable for type checking and own no module.
+
+The parent helpers are unchanged. Nested work imports a fresh normal module.
+The following public routes benefit automatically, without a new flag:
+
+- `async.pool` and the capture-based `async.map_parallel` path;
+- the queued-data `async.map_parallel` path, including its existing fallback;
+- `thread.thread_pool`, `thread.parallel_map`, and pipeline stages.
+
+Only private, parent-only bindings are retired. Mapper captures, input/result
+transfer, worker count, task failure semantics, joining, queue draining, and
+capability inheritance are unchanged. Retirement precedes callback execution,
+so callback or result-transfer failure cannot skip it. Tests cover each boundary,
+public routing, parent reuse, nested pools, captures, nil/false, task failure,
+result-transfer failure and the existing partial-start ownership checks.
+
+This is targeted cycle elimination, not a general cycle collector. Caller-held
+results, arbitrary user cycles, imported module graphs and the retained host's
+closed-channel registry are separate lifetimes. Fatal host/process failures
+before the child body starts are not covered. It neither repairs the retained
+nested `p:run` compiler bug nor adds original-exception access to its catch
+syntax; use `thread.pipeline_run` for the documented retained-host case.
+
+See `tests/semantics/pool_worker_module_lifetime_test.sapp` and the repeated-batch
+example in `examples/async_data_map/main.sapp`.
