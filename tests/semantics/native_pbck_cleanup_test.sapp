@@ -1,0 +1,65 @@
+// Native exceptions carry a message to their handler. Cleanup must neither
+// swallow that failure nor replace it with a second failure from cleanup.
+if platform() != "linux" { print "native_pbck_cleanup_skip_linux_required"; os_exit(0); }
+let N=import("stdlib:compiler/native_pbck.sapp");
+let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let X=import("stdlib:selfhost_to_pbck.sapp");
+let UUID=import("stdlib:uuid.sapp");
+let executable=env_get("PBLANG_BIN") ?? path_join(cwd(),"target/release/pblang");
+let path=path_join(cwd(),".cleanup_"+UUID.v4()+".pbck");
+fn execute(bytes, permission="--sandbox") {
+    fs_write_bytes(path,bytes);
+    let result=proc_spawn_wait("/usr/bin/timeout",["-k","1s","15s",executable,"run",path,permission]);
+    fs_remove(path);return result;
+}
+fn check(body,cleanup,output,error_message=nil,permission="--sandbox") {
+    let source="fn work(){"+body+"}fn release(){"+cleanup+"}";
+    let result=execute(N.compile_source_with_cleanup(source,"work","release"),permission);
+    assert(result.stdout==output,"cleanup runs once and in order: "+result.stdout+result.stderr);
+    if error_message==nil {assert(result.exit_code==0,"successful entry: "+result.stderr);}
+    else {
+        assert(result.exit_code!=0 and str_contains(result.stderr,error_message),"original failure preserved: "+result.stderr);
+        if error_message!="SECONDARY" {assert(not str_contains(result.stderr,"SECONDARY"),"cleanup failure must not replace primary");}
+    }
+}
+fn exercise() {
+    for value in ["nil","false","0","[1,2]","map{value:7}"] {
+        check("print \"WORK\";return "+value+";","print \"CLEAN\";return 99;","WORK\nCLEAN\n");
+    }
+    check("release=fn(){print \"WRONG\";};print \"WORK\";","print \"CLEAN\";","WORK\nCLEAN\n");
+    check("release=fn(){throw \"WRONG\";};throw \"ORIGINAL\";","print \"CLEAN\";","CLEAN\n","ORIGINAL");
+    check("throw \"ORIGINAL\";","print \"CLEAN\";","CLEAN\n","ORIGINAL");
+    check("throw \"ORIGINAL\";","print \"CLEAN\";throw \"SECONDARY\";","CLEAN\n","ORIGINAL");
+    check("print \"WORK\";","print \"CLEAN\";throw \"SECONDARY\";","WORK\nCLEAN\n","SECONDARY");
+    check("error(\"ORIGINAL\");","print \"CLEAN\";","CLEAN\n","ORIGINAL");
+    check("let a=[];print a[map{}];","print \"CLEAN\";throw \"SECONDARY\";","CLEAN\n","array index must be number");
+    check("fs_read(\"synthetic-not-readable\");","print \"CLEAN\";","CLEAN\n","fs access denied");
+    check("fn nested(){error(\"ORIGINAL\");}nested();","print \"CLEAN\";error(\"SECONDARY\");","CLEAN\n","ORIGINAL");
+    check("print (try {throw \"handled\";} catch 7);","print \"CLEAN\";","7\nCLEAN\n");
+    // Real managed owners from the imported self-hosted VM are closed even
+    // when its raw host-indexing failure bypasses its existing explicit hooks.
+    let source="let V=import(\"stdlib:compiler/vm.sapp\");let F=import(\"stdlib:compiler/selfhost_frontend.sapp\");"
+        +"let ctx=V.execution_context(true);fn work(){let setup=F.frontend_compile(\"memory_alloc(7);\");"
+        +"V.run_seeded(setup.chunk,map{},ctx);let c=map{instructions:[map{op:0,operand:0},map{op:0,operand:1},"
+        +"map{op:27,operand:0}],constants:[[],map{}]};V.run_seeded(c,map{},ctx);}"
+        +"fn release(){let owned=ctx.memory;V.close_execution(ctx);print owned.closed;print len(owned.owners);}";
+    let result=execute(N.compile_source_with_cleanup(source,"work","release"),"--allow-all");
+    assert(result.exit_code!=0 and result.stdout=="true\n0\n" and str_contains(result.stderr,"array index must be number"),"real host failure cleanup: "+result.stdout+result.stderr);
+    // The entry's successful value is preserved below cleanup's return value.
+    let c=F.frontend_compile("fn work(){return 42;}fn release(){return 99;}print (try work() catch release());");
+    assert(c.ok,"value fixture");let index=-1;let i=0;
+    while i<len(c.chunk.instructions) {if c.chunk.instructions[i].op==35 {index=i;}i=i+1;}
+    result=execute(X.translate_guarded(c.chunk,index));assert(result.exit_code==0 and result.stdout=="42\n","entry value retained");
+    for index in [-1,0.5,999999,"0",nil] {assert((try {X.translate_guarded(c.chunk,index);false} catch true),"bad boundary rejected");}
+    let valid="fn work(){return 7;}fn release(){return nil;}";
+    for names in [["work","work"],["","release"],["work();print 1;","release"],["work","bad.name"],["missing","release"],["work","missing"],[str_repeat("a",129),"release"]] {
+        assert((try {N.compile_source_with_cleanup(valid,names[0],names[1]);false} catch true),"invalid callback rejected");
+    }
+    for invalid in [nil,7,"fn work(x){return x;}fn release(){}","fn work(){}fn release(x){return x;}","fn work(){}fn release(){} /* private_canary",str_repeat(" ",1048577)] {
+        assert((try {N.compile_source_with_cleanup(invalid,"work","release");false} catch true),"invalid guarded source rejected");
+    }
+    result=execute(N.compile_source_with_cleanup(valid+"// trailing comment","work","release"));assert(result.exit_code==0,"line comment cannot hide generated boundary");
+}
+let passed=try {exercise();true} catch false;
+try fs_remove(path) catch nil;
+assert(passed,"native cleanup regression");print "native_pbck_cleanup_pass";
