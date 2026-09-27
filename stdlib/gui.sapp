@@ -24,6 +24,8 @@ let gfx  = import("stdlib/graphics.sapp");
 let font = import("stdlib/bitmap_font.sapp");
 let keys = import("stdlib/keymap.sapp");
 let ui   = import("stdlib/ui_kit.sapp");
+let Clip = import("stdlib:rect_clip.sapp");
+let Style = import("stdlib:ui_style.sapp");
 
 // ── metrics & theme ───────────────────────────────────────────────────────────────────
 let SCALE = 2;          // bitmap-font pixel scale
@@ -153,7 +155,8 @@ fn slider(name, x, y, w, h, value, min, max, onchange) {
 // ── form container ────────────────────────────────────────────────────────────────────
 fn form(title, w, h) {
     return map{ kind: "form", title: title, w: w, h: h, widgets: [],
-                focus: nil, shift: false, mouse: map{ x: 0, y: 0 }, model: map{},
+                focus: nil, shift: false, mouse: map{ x: 0, y: 0 }, pointer_known: false, model: map{},
+                onscroll: nil,
                 pressed_keys: map{},
                 palette: palette("dark"),
                 layout_fn: nil, layout_options: nil, onresize: nil,
@@ -170,6 +173,14 @@ fn set_palette(f, value) {
     let checked = custom_palette("dark", value);
     f.palette = checked;
     f.dirty = true;
+    return f;
+}
+
+// Legacy forms remain bitmap by default. Modern UI opts into the existing
+// native font renderer with the same fixed advance used by editing/hit tests.
+fn set_text_render(f, mode = "auto") {
+    if mode != "auto" and mode != "bitmap" { throw "gui text renderer must be auto or bitmap"; }
+    f.text_render=mode; f.dirty=true;
     return f;
 }
 
@@ -239,6 +250,8 @@ fn sync(f) {
 // ── interactive core (window-free → testable) ─────────────────────────────────────────
 fn _in(w, x, y) {
     if (try w.visible catch true) == false { return false; }
+    let clip=try w.clip_rect catch nil;
+    if clip!=nil and not Clip.contains(clip,x,y) { return false; }
     return x >= w.x and x < w.x + w.w and y >= w.y and y < w.y + w.h;
 }
 fn _focused(f) { if f.focus == nil { return nil; } return get(f, f.focus); }
@@ -246,6 +259,12 @@ fn _focused(f) { if f.focus == nil { return nil; } return get(f, f.focus); }
 fn _focusable(w) {
     if w == nil or (try w.visible catch true) == false
         or not (try w.enabled catch true) { return false; }
+    let clip=try w.clip_rect catch nil;
+    if clip!=nil {
+        let region=Clip.region(clip);
+        if region.w==0 or region.h==0 or w.x+w.w<=region.x or w.y+w.h<=region.y
+            or w.x>=region.x+region.w or w.y>=region.y+region.h { return false; }
+    }
     let kind = try w.kind catch "";
     if kind == "textbox" or kind == "textarea" {
         return not (try w.readonly catch false);
@@ -255,6 +274,7 @@ fn _focusable(w) {
 }
 
 fn focus_next(f, reverse = false) {
+    _cancel_drag(f);
     let count = len(f.widgets);
     if count == 0 { f.focus = nil; return nil; }
     let current = -1; let i = 0;
@@ -291,9 +311,118 @@ fn hit_test(f, x, y) {
     return hit;
 }
 
+// Cursor state is transient widget state, never part of the bound model.
+// External value replacement (page change, binding, Undo) invalidates it.
+fn _textbox_cursor(w) {
+    let n=len(w.value);
+    if (try w.cursor_value catch nil)!=w.value {
+        w.caret=n; w.selection_anchor=n; w.text_offset=0; w.cursor_value=w.value;
+    }
+    let at=try w.caret catch n;
+    if type(at)!="number" or not (at>=0 and at<=n) or at!=num_floor(at) {
+        at=n; w.selection_anchor=at;
+    }
+    w.caret=at;
+    let anchor=try w.selection_anchor catch at;
+    if type(anchor)!="number" or not (anchor>=0 and anchor<=n) or anchor!=num_floor(anchor) { anchor=at; }
+    w.selection_anchor=anchor;
+    return at;
+}
+
+fn _textbox_window(w, char_width) {
+    let at=_textbox_cursor(w);
+    let columns=num_max(1,num_floor((w.w-12)/char_width));
+    let start=try w.text_offset catch 0;
+    if type(start)!="number" or not (start>=0 and start<=len(w.value))
+        or start!=num_floor(start) { start=0; }
+    if at<start { start=at; }
+    if at>=start+columns { start=at-columns+1; }
+    w.text_offset=start;
+    return map{start:start,caret:at,text:str_slice(w.value,start,num_min(len(w.value),start+columns))};
+}
+
+fn _text_modifier_down(f) {
+    for pressed in map_keys(f.pressed_keys) {
+        if keys.is_ctrl(pressed) or keys.is_meta(pressed) { return true; }
+    }
+    return false;
+}
+
+fn _cancel_drag(f) { f.drag=nil; f.text_drag_value=nil; }
+
+fn _textbox_advance(f) {
+    return 6*num_max(1,num_min(8,num_floor(try f.viewport.font_pixel_scale catch SCALE)));
+}
+
+fn _drag_at(f,x) {
+    let name=try f.drag catch nil;
+    if name==nil { return; }
+    let w=get(f,name);
+    if not _focusable(w) { _cancel_drag(f); return; }
+    if w.kind=="slider" {
+        _slider_set(w,x); _push(f,w); f.dirty=true;
+        if w.onchange!=nil { w.onchange(f); }
+        return;
+    }
+    if w.kind!="textbox" or f.focus!=name { _cancel_drag(f); return; }
+    _pull(f,w);
+    if type(w.value)!="string" or w.value!=(try f.text_drag_value catch nil) {
+        _cancel_drag(f); return;
+    }
+    let advance=_textbox_advance(f); let view=_textbox_window(w,advance);
+    let columns=num_max(1,num_floor((w.w-12)/advance));
+    let at=view.start+num_floor((x-w.x-6)/advance+0.5);
+    // At most one extra scalar beyond the currently visible edge per event.
+    if x<w.x+6 { at=view.start-1; }
+    elif x>w.x+w.w-6 { at=view.start+columns; }
+    w.caret=num_max(0,num_min(len(w.value),at));
+    _textbox_window(w,advance); f.dirty=true;
+}
+
 fn _type_into(f, w, key, shift) {
     if w == nil or (w.kind != "textbox" and w.kind != "textarea") { return 0; }
-    if (try w.readonly catch false) or not (try w.enabled catch true) { return 0; }
+    if not _focusable(w) or type(w.value)!="string" { return 0; }
+    let modified=_text_modifier_down(f);
+    if w.kind=="textbox" {
+        let at=_textbox_cursor(w); let n=len(w.value); let value=w.value;
+        if modified {
+            if key=="A" or key=="a" or key=="KeyA" {
+                w.selection_anchor=0; w.caret=n; f.dirty=true;
+            }
+            return 0;
+        }
+        let anchor=w.selection_anchor;
+        let first=num_min(anchor,at); let last=num_max(anchor,at);
+        let moving=key=="Left" or key=="Right" or key=="Home" or key=="End";
+        if moving {
+            if key=="Left" {
+                if not shift and first!=last { at=first; } else { at=num_max(0,at-1); }
+            } elif key=="Right" {
+                if not shift and first!=last { at=last; } else { at=num_min(n,at+1); }
+            } elif key=="Home" { at=0; }
+            else { at=n; }
+            if not shift { anchor=at; }
+        } elif (key=="Backspace" or key=="Delete") and first!=last {
+            value=str_slice(value,0,first)+str_slice(value,last,n); at=first; anchor=at;
+        } elif key=="Backspace" and at>0 {
+            value=str_slice(value,0,at-1)+str_slice(value,at,n); at=at-1;
+            anchor=at;
+        } elif key=="Delete" and at<n {
+            value=str_slice(value,0,at)+str_slice(value,at+1,n);
+            anchor=at;
+        } else {
+            let ch=keys.key_to_char(key,shift);
+            if ch!="" and n-(last-first)+len(ch)<=(try w.max_chars catch 4096) {
+                value=str_slice(value,0,first)+ch+str_slice(value,last,n);
+                at=first+len(ch); anchor=at;
+            }
+        }
+        if at!=w.caret or anchor!=w.selection_anchor or value!=w.value { f.dirty=true; }
+        if value!=w.value { w.value=value; _push(f,w); }
+        w.caret=at; w.selection_anchor=anchor; w.cursor_value=w.value;
+        return 0;
+    }
+    if modified { return 0; }
     if key == "Backspace" {
         if len(w.value) > 0 { w["value"] = str_slice(w.value, 0, len(w.value) - 1); _push(f, w); f.dirty = true; }
         return 0;
@@ -396,11 +525,22 @@ fn _activate_keyboard(f, w, key) {
 
 fn _click_at(f, x, y) {
     f.dirty = true;
+    let previous_focus=f.focus;
     f["focus"] = nil;                          // empty space clears focus
     let w = hit_test(f, x, y);
     if w == nil { return 0; }
     if not (try w.enabled catch true) { return 0; }
     if _focusable(w) { f["focus"] = w.name; }
+    if w.kind=="textbox" and f.focus==w.name and type(w.value)=="string" {
+        _textbox_cursor(w);
+        let advance=_textbox_advance(f);
+        let start=0;
+        if previous_focus==w.name { start=_textbox_window(w,advance).start; }
+        w.caret=num_max(0,num_min(len(w.value),start+num_floor((x-w.x-6)/advance+0.5)));
+        if not f.shift or previous_focus!=w.name { w.selection_anchor=w.caret; }
+        w.text_offset=start;
+        f.drag=w.name; f.text_drag_value=w.value;
+    }
     if w.kind == "textbox" or w.kind == "textarea" { return 0; }
     if w.kind == "checkbox" {
         w["checked"] = not w.checked;
@@ -429,12 +569,47 @@ fn _click_at(f, x, y) {
     return 0;
 }
 
-// handle_event(form, ev) — apply one gfxpollevents record (mousemove/mousedown/mouseup/
-// keydown/keyup). mousedown carries no coords, so we read the cursor tracked from mousemove.
+// Native pointer coordinates use the signed 32-bit pixel domain. Explicit but
+// incomplete/invalid coordinates never fall back to a different stale target.
+fn _event_pointer(f, ev, legacy = false) {
+    if not map_has(ev,"x") and not map_has(ev,"y") { return legacy; }
+    let x=try ev.x catch nil; let y=try ev.y catch nil;
+    if type(x)!="number" or type(y)!="number"
+        or not (x>=-2147483648 and x<=2147483647 and y>=-2147483648 and y<=2147483647) {
+        f.pointer_known=false;
+        return false;
+    }
+    f.mouse=map{x:x,y:y};
+    f.pointer_known=true;
+    return true;
+}
+
+// handle_event(form, ev) — apply one gfxpollevents record. Prefer each click's
+// coordinates; only legacy coordinate-free clicks use the tracked pointer.
 // A press on a slider starts a drag (f.drag) so the knob tracks the cursor until release.
 fn handle_event(f, ev) {
     let t = try ev.type catch "";
+    if t == "scroll" {
+        let callback=try f.onscroll catch nil;
+        if callback==nil or (try f.close_requested catch false) { return 0; }
+        let dx=try ev.dx catch nil; let dy=try ev.dy catch nil;
+        if type(dx)!="number" or type(dy)!="number"
+            or not (dx>=-1000 and dx<=1000 and dy>=-1000 and dy<=1000) { return 0; }
+        let source="tracked";
+        if map_has(ev,"x") or map_has(ev,"y") {
+            if not _event_pointer(f,ev) { return 0; }
+            source="event";
+        } elif not (try f.pointer_known catch false) { return 0; }
+        if dx==0 and dy==0 { return 0; }
+        // Editing normalized event coordinates does not overwrite tracked pointer state.
+        let changed=callback(f,map{type:"scroll",dx:dx,dy:dy,x:f.mouse.x,y:f.mouse.y,pointer_source:source});
+        if changed==true { f.dirty=true; }
+        return 0;
+    }
     if t == "close" or t == "quit" {
+        _cancel_drag(f);
+        // Observed native close, not proof that its registry resource is freed.
+        // graphics.run owns release on normal event-loop exit.
         f.close_requested = true; f.native_window_closed = true; f.dirty = true;
         return 0;
     }
@@ -462,27 +637,35 @@ fn handle_event(f, ev) {
         return 0;
     }
     if t == "mousemove" {
-        f["mouse"] = map{ x: ev.x, y: ev.y };
-        if (try f.drag catch nil) != nil {
-            let w = get(f, f.drag);
-            if w != nil and w.kind == "slider" {
-                _slider_set(w, ev.x); _push(f, w); f.dirty = true;
-                if w.onchange != nil { w.onchange(f); }
-            }
-        }
+        if not _event_pointer(f,ev) { _cancel_drag(f); return 0; }
+        _drag_at(f,ev.x);
         return 0;
     }
     if t == "mousedown" {
         if (try ev.button catch "Left") != "Left" { return 0; }
+        if not _event_pointer(f,ev,true) { _cancel_drag(f); return 0; }
+        _cancel_drag(f);
         let hit = hit_test(f, f.mouse.x, f.mouse.y);
-        if hit != nil and hit.kind == "slider" { f["drag"] = hit.name; }
+        if hit != nil and hit.kind == "slider" and _focusable(hit) { f["drag"] = hit.name; }
         _click_at(f, f.mouse.x, f.mouse.y);
         return 0;
     }
-    if t == "mouseup" { if (try f.drag catch nil) != nil { f.dirty = true; } f["drag"] = nil; return 0; }
+    if t == "mouseup" {
+        if (try ev.button catch "Left")!="Left" { return 0; }
+        if (try f.drag catch nil)!=nil {
+            // Legacy coordinate-free release retains the last processed position.
+            let previous=f.mouse;
+            if (map_has(ev,"x") or map_has(ev,"y")) and _event_pointer(f,ev) {
+                if f.mouse.x!=previous.x or f.mouse.y!=previous.y { _drag_at(f,ev.x); }
+            }
+            f.dirty=true;
+        }
+        _cancel_drag(f); return 0;
+    }
     if t == "keydown" {
         let k = try ev.key catch "";
-        if keys.is_shift(k) { f["shift"] = true; return 0; }
+        if keys.is_shift(k) { f.pressed_keys[k]=true; f.shift=true; return 0; }
+        _cancel_drag(f);
         let repeated = map_has(f.pressed_keys, k);
         if not repeated { f.pressed_keys[k] = true; }
         let focused = _focused(f);
@@ -504,8 +687,13 @@ fn handle_event(f, ev) {
     }
     if t == "keyup" {
         let k = try ev.key catch "";
-        if keys.is_shift(k) { f["shift"] = false; }
         if map_has(f.pressed_keys, k) { map_remove(f.pressed_keys, k); }
+        if keys.is_shift(k) {
+            f.shift=false;
+            for pressed in map_keys(f.pressed_keys) {
+                if keys.is_shift(pressed) { f.shift=true; }
+            }
+        }
         return 0;
     }
     return 0;
@@ -538,6 +726,13 @@ fn _text(win, x, y, s, color, pixel_scale) {
     let ps = num_floor(pixel_scale);
     if ps < 1 { ps = 1; } if ps > 8 { ps = 8; }
     let advance = 6 * ps;
+    let smooth = try win.textAA catch nil;
+    if smooth != nil {
+        let result = try smooth(x, y - ps, s, color, 9 * ps, advance) catch nil;
+        if result != nil and (try result.ok catch false) == true {
+            return x + len(s) * advance;
+        }
+    }
     let cx = x;
     let i = 0;
     while i < len(s) {
@@ -668,29 +863,25 @@ fn _widget_image(w) {
 
 fn _draw_widget(win, f, w) {
     if (try w.visible catch true) == false { return 0; }
+    let clip=try w.clip_rect catch nil;
+    if clip!=nil { win=Clip.canvas(win,clip); }
     let c = try f.palette catch _C;
     let pixel_scale = num_floor(try f.viewport.font_pixel_scale catch SCALE);
+    if w.kind == "label" and (try w.text_role catch "") == "heading" {
+        pixel_scale=num_ceil(pixel_scale*1.5);
+    }
     if pixel_scale < 1 { pixel_scale = 1; } if pixel_scale > 8 { pixel_scale = 8; }
     let char_width = 6 * pixel_scale; let char_height = 8 * pixel_scale;
     _pull(f, w);                              // bound widgets mirror the model each frame
     let ty = w.y + (w.h - 7 * pixel_scale) / 2;
     if w.kind == "label" {
-        _text(win, w.x, w.y, _fit_text(w.text, w.w, char_width), c.text, pixel_scale);
+        _text(win, w.x, w.y, _fit_text(w.text, w.w, char_width),
+            Style.tone(c,try w.tone catch "",c.text), pixel_scale);
     } else if w.kind == "button" {
         let enabled = try w.enabled catch true;
         let variant = try w.variant catch "primary";
-        let fill = c.accent; let text_color = c.on_accent; let button_border = c.accent;
-        if variant == "secondary" or variant == "navigation" {
-            fill = c.panel; text_color = c.text; button_border = c.border;
-        } elif variant == "ghost" {
-            fill = c.bg; text_color = c.text; button_border = c.bg;
-        } elif variant == "danger" {
-            fill = c.danger; text_color = c.on_accent; button_border = c.danger;
-        }
-        if try w.selected catch false {
-            fill = c.selected; text_color = c.on_accent; button_border = c.selected;
-        }
-        if not enabled { fill = c.panel; text_color = c.muted; }
+        let style = Style.button(c,variant,try w.selected catch false,enabled);
+        let fill=style.fill; let text_color=style.text; let button_border=style.border;
         _fill_rects(win, ui.elevation(w.x, w.y, w.w, w.h, 2), c.field);
         if not enabled { button_border = c.field; }
         if f.focus == w.name { button_border = c.focus; }
@@ -701,8 +892,28 @@ fn _draw_widget(win, f, w) {
         let bc = c.border;
         if f.focus == w.name { bc = c.accent; }
         _card(win, w.x, w.y, w.w, w.h, 5, bc, c.field);
-        _text(win, w.x + 6, ty, _fit_text(w.value, w.w - 12, char_width),
-            c.text, pixel_scale);
+        let hint = w.value == "";
+        let visible_text = if hint { str(try w.placeholder catch "") } else { w.value };
+        let focused=f.focus==w.name and _focusable(w) and type(w.value)=="string";
+        let text_view=nil;
+        if focused {
+            text_view=_textbox_window(w,char_width);
+            if not hint { visible_text=text_view.text; }
+        }
+        _text(win, w.x + 6, ty, _fit_text(visible_text, w.w - 12, char_width),
+            if hint { c.muted } else { c.text }, pixel_scale);
+        if focused and w.w>12 and w.h>=7*pixel_scale {
+            // Paint only the visible intersection; offsets remain scalar indexes.
+            let first=num_max(text_view.start,num_min(w.selection_anchor,w.caret));
+            let last=num_min(text_view.start+len(text_view.text),num_max(w.selection_anchor,w.caret));
+            if last>first {
+                let sx=w.x+6+(first-text_view.start)*char_width;
+                win.rect(sx,ty,(last-first)*char_width,7*pixel_scale,c.accent);
+                _text(win,sx,ty,str_slice(w.value,first,last),c.on_accent,pixel_scale);
+            }
+            let cx=w.x+6+(text_view.caret-text_view.start)*char_width;
+            win.line(cx,ty,cx,ty+7*pixel_scale,c.accent);
+        }
     } else if w.kind == "textarea" {
         let bc = c.border;
         if f.focus == w.name { bc = c.accent; }
@@ -716,7 +927,10 @@ fn _draw_widget(win, f, w) {
         _text(win, w.x + char_height + 6, w.y + 1, w.text, c.text, pixel_scale);
     } else if w.kind == "panel" {
         _fill_rects(win, ui.elevation(w.x, w.y, w.w, w.h, 2), c.field);
-        _card(win, w.x, w.y, w.w, w.h, 7, c.border, c.panel);
+        let radius=try f.card_radius catch nil;
+        if radius==nil { radius=7; }
+        else { radius=radius*(try f.viewport.ui_scale catch 1); }
+        _card(win, w.x, w.y, w.w, w.h, radius, c.border, c.panel);
         if w.title != "" { _text(win, w.x + 8, w.y + 6, w.title, c.muted, pixel_scale); }
     } else if w.kind == "cube3d" {
         let off = 12;
@@ -776,6 +990,13 @@ fn _draw_widget(win, f, w) {
     }
 }
 fn draw(win, f) {
+    // Do not mutate the caller's backend. Clipped canvases intentionally omit
+    // textAA and retain their pixel-clipped bitmap path until glyph clipping exists.
+    if (try f.text_render catch "bitmap") != "auto" and map_has(win,"textAA") {
+        let legacy=map{};
+        for key in map_keys(win) { if key != "textAA" { legacy[key]=win[key]; } }
+        win=legacy;
+    }
     let c = try f.palette catch _C;
     win.clear(c.bg);
     let i = 0;
@@ -797,7 +1018,15 @@ fn run(f) {
                 s.graphics_stop = true;
                 return false;
             }
-            let i = 0; while i < len(evs) { handle_event(s, evs[i]); i = i + 1; }
+            let i = 0;
+            while i < len(evs) {
+                handle_event(s, evs[i]); i = i + 1;
+                if try s.close_requested catch false { break; }
+            }
+            if try s.close_requested catch false {
+                s.graphics_stop = true;
+                return false;
+            }
             poll_tick(s);
             return try s.dirty catch true;
         },
@@ -809,6 +1038,7 @@ fn run(f) {
 // request_close(form) asks the active native event loop to terminate on its
 // next bounded poll. It does not kill the process and is safe in headless tests.
 fn request_close(f) {
+    _cancel_drag(f);
     f.close_requested = true;
     f.dirty = true;
     return true;
@@ -956,6 +1186,8 @@ fn set_layout(f, layout_fn, options = nil) {
 
 fn set_layout_options(f, options = nil) { f.layout_options = options; return f; }
 fn set_resize_handler(f, handler = nil) { f.onresize = handler; return f; }
+// Opt-in only. No default wheel behavior for existing controls/forms.
+fn set_scroll_handler(f, handler = nil) { f.onscroll = handler; return f; }
 
 // A tick handler must remain non-blocking. It is intended for draining worker
 // channels and advancing small state machines, never for network or disk I/O.
@@ -1000,6 +1232,7 @@ fn set_visible(f, name, visible) {
     widget.visible = visible;
     f.dirty = true;
     if not visible and f.focus == name { f.focus = nil; }
+    if not visible and (try f.drag catch nil) == name { _cancel_drag(f); }
     return true;
 }
 
@@ -1009,10 +1242,12 @@ fn set_enabled(f, name, enabled) {
     widget.enabled = enabled;
     f.dirty = true;
     if not enabled and f.focus == name { f.focus = nil; }
+    if not enabled and (try f.drag catch nil) == name { _cancel_drag(f); }
     return true;
 }
 
 fn relayout(f, width, height, options = nil) {
+    _cancel_drag(f);
     if options == nil { options = try f.layout_options catch nil; }
     let profile = layout_profile(width, height, options);
     f.w = profile.width; f.h = profile.height; f.viewport = profile;
@@ -1059,6 +1294,8 @@ fn widget_kinds(f) {
 
 // remove_widget(f, name) — drop the widget with the given name (if present).
 fn remove_widget(f, name) {
+    if (try f.drag catch nil)==name { _cancel_drag(f); }
+    if f.focus==name { f.focus=nil; }
     let kept = [];
     let i = 0;
     while i < len(f.widgets) {
@@ -1070,13 +1307,13 @@ fn remove_widget(f, name) {
     return f;
 }
 
-export theme, palette, custom_palette, set_palette,
+export theme, palette, custom_palette, set_palette, set_text_render,
        label, button, textbox, checkbox, panel, cube3d, sphere3d, image, radio, select, slider,
        form, add, fit_form, get, bind, set_model, sync, hit_test, handle_event, draw, run,
        request_close,
        progress_bar, widget_count, remove_widget,
        divider, spacer, textarea, layout_profile, logical_layout_profile, scale_layout,
        set_layout, set_layout_options,
-       set_resize_handler, set_tick_handler, poll_tick,
+       set_resize_handler, set_scroll_handler, set_tick_handler, poll_tick,
        set_visible, set_enabled, relayout, focus_next,
        has_widget, set_prop, widget_kinds;

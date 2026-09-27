@@ -1,0 +1,109 @@
+// Trusted synchronous jobs over the existing workflow ordering engine.
+// No shell, clock, file, network, retry, deployment or rollback is implicit.
+let Workflow=import("stdlib:workflow.sapp");
+
+fn _id(value) {
+    if type(value)!="string" or len(value)<1 or len(value)>48 { return false; }
+    for i in range(0,len(value)) {
+        if str_index_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-",str_slice(value,i,i+1))<0 { return false; }
+    }
+    return true;
+}
+fn _keys(value,keys) {
+    if type(value)!="map" or len(map_keys(value))!=len(keys) { return false; }
+    for key in keys { if not map_has(value,key) { return false; } }
+    return true;
+}
+// Validate the entire graph before calling any job. Snapshot dependency arrays.
+fn _prepare(jobs) {
+    if type(jobs)!="array" or len(jobs)<1 or len(jobs)>32 { throw "devops: invalid job count"; }
+    let graph=Workflow.new(); let snapshot=map{};
+    Workflow.register(graph,"job",fn(input,params){return input;});
+    for job in jobs {
+        if not _keys(job,["id","needs"]) or not _id(job.id)
+            or type(job.needs)!="array" or len(job.needs)>16 or map_has(snapshot,job.id) {
+            throw "devops: invalid job";
+        }
+        let deps=[]; let seen=map{};
+        for dep in job.needs {
+            if not _id(dep) or dep==job.id or map_has(seen,dep) { throw "devops: invalid dependency"; }
+            seen[dep]=true; array_push(deps,dep);
+        }
+        snapshot[job.id]=deps; Workflow.add_node(graph,job.id,"job",nil);
+    }
+    for job in jobs { for dep in snapshot[job.id] {
+        if not map_has(snapshot,dep) { throw "devops: missing dependency"; }
+        Workflow.connect(graph,dep,job.id);
+    } }
+    let order=try Workflow.topo_order(graph) catch nil;
+    if order==nil { throw "devops: dependency cycle"; }
+    return map{order:order,needs:snapshot};
+}
+fn order(jobs) { return _prepare(jobs).order; }
+
+fn _select(jobs,targets) {
+    let plan=_prepare(jobs); // even excluded nodes must pass full validation
+    if type(targets)!="array" or len(targets)<1 or len(targets)>32 {
+        throw "devops: invalid targets";
+    }
+    let wanted=map{};
+    for target in targets {
+        if not _id(target) or not map_has(plan.needs,target) or map_has(wanted,target) {
+            throw "devops: invalid targets";
+        }
+        wanted[target]=true;
+    }
+    // Dependencies precede dependents: one reverse pass marks every ancestor.
+    let index=len(plan.order)-1;
+    while index>=0 {
+        let id=plan.order[index];
+        if map_has(wanted,id) { for dep in plan.needs[id] { wanted[dep]=true; } }
+        index=index-1;
+    }
+    let selected=[];
+    for id in plan.order {
+        if map_has(wanted,id) {
+            let deps=[]; for dep in plan.needs[id] { array_push(deps,dep); }
+            array_push(selected,map{id:id,needs:deps});
+        }
+    }
+    return map{jobs:selected,total_job_count:len(plan.order),target_count:len(targets)};
+}
+// Returns identified job records, not a masked report or execution permission.
+fn select_jobs(jobs,targets) { return _select(jobs,targets).jobs; }
+
+// runner(id) -> exact {ok:bool}. Exceptions/malformed returns fail the job.
+// Explicit opt-in and caller-owned callbacks are not a sandbox or time bound.
+fn run(jobs,runner,allow_callbacks=false) {
+    let plan=_prepare(jobs);
+    if allow_callbacks!=true { throw "devops: callback execution requires explicit opt-in"; }
+    if type(runner)!="fn" and type(runner)!="closure" { throw "devops: invalid runner"; }
+    let results=map{}; let rows=[]; let failed=false; let calls=0;
+    for id in plan.order {
+        let blocked=false;
+        for dep in plan.needs[id] { if results[dep]!="succeeded" { blocked=true; } }
+        let status="skipped";
+        if not blocked {
+            calls=calls+1;
+            let result=try runner(id) catch nil;
+            let ok=_keys(result,["ok"]) and type(result.ok)=="bool" and result.ok==true;
+            status=if ok {"succeeded"} else {"failed"};
+            if not ok { failed=true; }
+        }
+        results[id]=status; array_push(rows,map{id:id,status:status});
+    }
+    return map{format:"pblang.devops-run.v1",ok:not failed,jobs:rows,callbacks_invoked:calls,
+        hard_timeout_enforced:false,rollback_performed:false};
+}
+// A target selects its entire prerequisite closure. Authorize that closure,
+// not only its requested terminal jobs. No cache or previous success is assumed.
+fn run_targets(jobs,targets,runner,allow_callbacks=false) {
+    let selected=_select(jobs,targets);
+    let result=run(selected.jobs,runner,allow_callbacks);
+    return map{format:"pblang.devops-target-run.v1",ok:result.ok,
+        selection_mode:"target-closure",total_job_count:selected.total_job_count,
+        selected_job_count:len(selected.jobs),target_count:selected.target_count,
+        all_jobs_selected:len(selected.jobs)==selected.total_job_count,
+        run:result,production_ready:false};
+}
+export order,run,select_jobs,run_targets;
