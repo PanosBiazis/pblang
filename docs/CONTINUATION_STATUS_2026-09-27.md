@@ -1,7 +1,7 @@
 # Continuation status — 2026-09-27
 
 This reconciles the runtime audit with nine recent product/library delivery
-summaries and the PBLang main tree at `b1dccb1`. It is a scoped status ledger,
+summaries and the PBLang main tree at `4a4e528`. It is a scoped status ledger,
 not a line-by-line audit, full conversation export, performance certificate or
 claim that every historical request is implemented. Related-product results
 below are reported by those deliveries; they were not all rerun in this review.
@@ -62,3 +62,20 @@ No guest expression, function, callback or FFI operation is replayed.
 `selfhost_index_cleanup_test.sapp` also covers changing receivers/keys during
 repeated accesses and allocations made after frame entry. Performance must be
 reported per measured workload; this change is not a general GC or async fix.
+
+## Static-linking follow-up
+
+The `compiler/native_bundle.compile_bundle` entry now compiles supported static
+modules through PBLang as well as the main source. The imported nested-method
+reproducer passes under the native VM sandbox without dependency files. Linker
+admission rejects computed/aliased/nested imports, cycles and bounded-graph
+violations instead of returning an artifact with hidden retained-source imports.
+Whitespace, comments and decoded literal paths work. Existing filesystem/dist
+bundle consumers share this fix. See the explicit initialization, shared-global,
+size and resolver limits in `NATIVE_PBCK_COMPILATION.md`.
+
+This closes the hidden-import admission defect and supplies an explicit route
+for the imported reproducer. Direct retained-source execution, generic host/FFI
+cleanup, cycles/pauses, async regressions and the installed desktop PB-MCP remain
+separate unfinished work. The nine previously reviewed product deliveries were
+checked for newer task updates; no newer delivery was found in this follow-up.

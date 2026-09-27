@@ -153,3 +153,52 @@ avoid an additional helper frame on each managed access. This preserves the
 same ownership policy and failed-primitive assumptions. Changing receiver/key
 loops and allocation after frame entry are regression-tested. For the wider
 unfinished work, see [continuation status](CONTINUATION_STATUS_2026-09-27.md).
+
+## Explicit static dependency bundles
+
+`compiler/native_bundle.sapp::compile_bundle(source, resolve)` compiles the entry
+and its transitive static imports in PBLang and returns native PBCK bytes.
+`resolve(canonical_path)` must return trusted source text or nil. This API does
+not read dependencies, execute the artifact or grant capabilities. The existing
+`selfhost_bundle.bundle`, filesystem writers and `dist` bytecode builds use the
+same corrected linker. Ordinary `compile_source` and `pbc --target pbck` retain
+runtime imports; they do not opt into this profile automatically.
+
+```sh
+./target/release/pblang run examples/native_static_bundle.sapp --allow-all -- bundle.pbck
+./target/release/pblang run bundle.pbck --sandbox
+```
+
+The example compiles a virtual module containing the nested loop/try `p:run`
+case. The artifact prints `7` twice with no source dependency on disk. This
+extends the verified PBLang compiler route to supported imported modules; it
+**does not repair the retained Rust source compiler** or migrate every product.
+
+Import discovery examines compiler instructions, including decoded literal
+paths, rather than searching for one source spelling. Whitespace/comments between
+`import`, parentheses and the literal are supported. `stdlib:` and `stdlib/`
+canonicalize to one dependency. Computed paths, first-class import aliases,
+imports inside functions/try chunks, cycles, invalid paths and unresolved modules
+fail closed. Invalid entry source is rejected before invoking the resolver.
+The `__bundle_` global prefix and rebinding `import` are reserved. Rejection
+reasons exclude source diagnostics and dependency paths. The native bridge
+raises a fixed error rather than silently reverting to the retained resolver.
+
+Resource admission: 64 distinct modules, dependency depth 32, at most 16 MiB
+UTF-8/1,048,576 tokens in the main translation unit, 1 MiB/65,536 tokens per
+module and 20 MiB aggregate source. The larger main limit preserves the existing
+`dist.bundle_pbck_blob` linked-source profile. Paths are limited to 4,096 Unicode
+scalars and cannot contain NUL. These are compiler-work limits, not a process
+memory/time sandbox: resolver work, whole-file reads, already allocated strings,
+native allocations and caller concurrency require their own boundaries.
+
+**Static linking is a separate execution profile.** Modules initialize in
+`dependencies first` order before main, not at each runtime import expression.
+Globals occupy a shared namespace and collisions are rejected; exported maps
+are snapshots, not live module bindings or an isolation boundary for mutually
+untrusted source. Existing export/closure/backend limitations remain. Do not use
+this profile for applications that depend on lazy/conditional initialization or
+runtime module mutation. The filesystem convenience resolver is for trusted
+project paths; the in-memory resolver is preferable for exact source snapshots.
+No CLI default, filesystem authority, telemetry or desktop-control approval was
+changed. Native live tests currently qualify Linux only.
