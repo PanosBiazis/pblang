@@ -1,0 +1,11 @@
+# Table review tools — wave 11
+
+Motivation: `PORTFOLIO_FOUNDATIONS.md` documents aggregate profiles; `PORTFOLIO_TABLE_WORKFLOWS.md` documents trimming and duplicate removal. This slice adds positional review before transformation, using existing Sheet/CSV/file contracts rather than another file model or parser. Existing explicit `table_schema` remains separate: these checks infer neither types nor required fields.
+
+`table_row_selection.select(doc, indices, header=false)` accepts nonempty unique increasing zero-based data-row indices and returns a detached Sheet. With header mode, row zero is prepended once and cannot appear among selected data indices. Empty selections reject because a meaningful review export requires a data row.
+
+`table_quality.inspect(doc,header=false)` returns bounded rows with original coordinates, blank/padded column arrays and the first duplicate-row position. Duplicates use unambiguous JSON keys for complete original rows; header is excluded. Blank means trim produces an empty string; padded means trim changes a value. Neither implies an error. Output omits cell/header text but is not declared safe to log. `select_flagged` independently recomputes diagnostics and delegates copying to row selection, so no untrusted cached report can choose an unrelated row. `describe_row` formats internally produced findings for display.
+
+PBDataLab adds report/export CLI commands and native review-row export with unchanged undo/saved state. PBTableCheck adds a focused native reader, CLI, and generated four-finding Web/Android report pages. All production logic is PBLang. Limits remain 32 rows/8 columns/8192 text bytes. Bounds are derived in one table traversal with a duplicate index; no benchmark speedup is claimed.
+
+Tests cover independent pairwise duplicate oracles, Unicode, source-row-zero duplicate references, header-only tables, exact comparisons before trim, overlapping blank/padded findings, detached copies, malformed indices/documents, maximum dimensions/bytes, UI state preservation, no findings/no output, exact export and source/target overwrite refusal. Native Linux and generated Web/Android capabilities are distinct from full multi-platform editor parity or device validation.
