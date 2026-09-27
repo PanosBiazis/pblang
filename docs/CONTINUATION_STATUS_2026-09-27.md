@@ -1,5 +1,11 @@
 # Continuation status — 2026-09-27
 
+This file preserves the earlier audit and follow-up history. The nine related
+tasks were subsequently resumed; see [the 2026-09-28 continuation record](NINE_CONTINUATIONS_2026-09-28.md)
+for their newer deliveries, evidence, installation scope and remaining limits.
+Statements below that no newer delivery was found describe those earlier checks,
+not the current state of the resumed tasks.
+
 This reconciles the runtime audit with nine recent product/library delivery
 summaries and the PBLang main tree at `4a4e528`. It is a scoped status ledger,
 not a line-by-line audit, full conversation export, performance certificate or
