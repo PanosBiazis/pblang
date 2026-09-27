@@ -1,0 +1,84 @@
+let N=import("stdlib:pbai_neural_adapter.sapp");
+let AD=import("stdlib:llm_adapters.sapp");let ATT=import("stdlib:llm_attention.sapp");
+fn equal(a,b) {return json_stringify(a)==json_stringify(b);}
+fn rejects(f) {return try {f();false} catch true;}
+assert(not rejects(fn(){return 1;}) and rejects(fn(){throw "expected rejection";}),"rejection helper distinguishes success from failure");
+let train=[];let valid=[];
+for i 4 {push(train,map{x:[i],y:i+4});push(valid,map{x:[7,i],y:i+4});}
+let original=json_stringify([train,valid]);
+let r=N.train(train,valid);
+assert(r.steps==256 and r.candidate_improved,"real training improves validation loss");
+assert(r.validation_after.loss<r.validation_before.loss and r.train_after.loss<r.train_before.loss,"final weights measured");
+assert(r.neural_weights_changed and r.base_weights_frozen and not r.accepted_for_merge and not r.globally_activated,"explicit candidate only");
+assert(N.valid_artifact(r.artifact) and r.artifact.digest!=r.initial_artifact.digest,"bounded weight artifact identity");
+assert(original==json_stringify([train,valid]),"training never mutates examples");
+assert(N.train(train,valid).artifact.digest==r.artifact.digest,"deterministic training");
+let restored=json_parse(json_stringify(r.artifact));
+assert(N.valid_artifact(restored),"artifact JSON roundtrip");
+assert(equal(N.predict(restored,[0]),N.predict(r.artifact,[0])),"reload predictions identical");
+let changed=false;
+for i 4 {if not equal(N.predict(r.initial_artifact,[i]).logits,N.predict(r.artifact,[i]).logits) {changed=true;}}
+assert(changed,"inference uses learned weights");
+let model=ATT.model_new(ATT.config(8,4,8,16,1,1,77));let raw=json_stringify(model);
+let ad=AD.lm_head_adapter(model,2,4.0,1901);
+assert(equal(AD.logits(model,ATT.head_hidden(model,[1,2]),ad),ATT.logits(model,[1,2])),"zero adapter exactly matches binary-residual base");
+let a=AD.train_epochs(model,ad,ATT.adapter_hidden,train,1,0.1,2);
+let b=AD.train_epochs(model,a.adapter,ATT.adapter_hidden,train,1,0.1,2);
+assert(a.steps==2 and b.steps==2 and b.adapter_summary.steps==4,"continued adapter keeps cumulative counters");
+assert(raw==json_stringify(model),"base weights remain unchanged");
+assert(rejects(fn(){N.train(train,train);}),"validation leakage rejected");
+assert(rejects(fn(){N.train([train[0],train[0]],valid);}),"duplicate contexts rejected");
+for bad in [nil,[],map{},[map{x:[],y:0}],[map{x:[0],y:8}],[map{x:[0],y:0,extra:true}]] {
+    assert(rejects(fn(){N.train(bad,valid);}),"malformed training data");
+}
+let zero=len([]);
+for bad in [nil,[],[8],[-1],[0.5],[true],[0,0,0,0,0],[zero/zero],[1/zero]] {
+    assert(rejects(fn(){N.predict(r.artifact,bad);}),"bounded token input");
+}
+for opts in [map{},map{epochs:0,lr:0.1},map{epochs:129,lr:0.1},map{epochs:1,lr:0.5},map{epochs:0.5,lr:0.1},map{epochs:zero/zero,lr:0.1},map{epochs:1,lr:1/zero}] {
+    assert(rejects(fn(){N.train(train,valid,opts);}),"training budgets validated");
+}
+let bad=json_parse(json_stringify(r.artifact));bad.b[0][0]=bad.b[0][0]+1;
+assert(not N.valid_artifact(bad) and rejects(fn(){N.predict(bad,[0]);}),"changed weights need matching identity");
+bad=json_parse(json_stringify(r.artifact));bad.a[0][0]=zero/zero;
+assert(not N.valid_artifact(bad),"nonfinite artifact");
+bad=json_parse(json_stringify(r.artifact));bad.profile="other";
+assert(not N.valid_artifact(bad),"unknown profile");
+print "pbai_neural_adapter_pass";
+// Central finite differences independently verify both factors' analytic gradient.
+let CORE=import("stdlib:llm_core.sapp");
+let tiny=map{lm_head:[[0.1,-0.1],[0.2,-0.2]],lm_bias:[0.0,0.0]};
+let factor=AD.lm_head_adapter(tiny,1,2.0,5);factor.a_matrix=[[0.3],[-0.2]];factor.b_matrix=[[0.4,-0.1]];
+let h=[0.7,-0.5];let step=AD.train_step(tiny,factor,h,1,0.01);let eps=0.00001;
+for kind in ["a_matrix","b_matrix"] {
+    for row len(factor[kind]) {for col len(factor[kind][row]) {
+        let plus=json_parse(json_stringify(factor));let minus=json_parse(json_stringify(factor));
+        plus[kind][row][col]=plus[kind][row][col]+eps;minus[kind][row][col]=minus[kind][row][col]-eps;
+        let numerical=(CORE.cross_entropy_from_logits(AD.logits(tiny,h,plus),1)-CORE.cross_entropy_from_logits(AD.logits(tiny,h,minus),1))/(2*eps);
+        let updated=if kind=="a_matrix" {step.updated_a_matrix} else {step.updated_b_matrix};
+        let analytic=(factor[kind][row][col]-updated[row][col])/0.01;
+        let error=numerical-analytic;assert(error*error<0.0000000001,"low-rank gradient matches finite differences");
+    }}
+}
+print "pbai_adapter_gradient_pass";
+
+let signed_zero=0/(0-1);
+assert(rejects(fn(){N.train([map{x:[0],y:4}],[map{x:[signed_zero],y:4}],map{epochs:1,lr:0.1});}),"signed-zero validation overlap");
+assert(rejects(fn(){N.train([map{x:[0],y:4},map{x:[signed_zero],y:4}],[map{x:[7,0],y:4}]);}),"signed-zero duplicate training example");
+
+// Exact schemas reject wide maps and cyclic data before serialization or model work.
+let wide=map{};for i 1025 {wide["field-"+str(i)]=i;}
+assert(not N.valid_artifact(wide),"wide artifact rejected");
+assert(rejects(fn(){N.train([wide],valid);}),"wide example rejected");
+let cyclic=map{x:[],y:0};push(cyclic.x,cyclic);
+assert(rejects(fn(){N.train([cyclic],valid);}),"cyclic example rejected");
+for invalid_digest in [nil,true,[],map{},str_repeat("a",65)] {
+ let altered=json_parse(json_stringify(r.artifact));altered.base_digest=invalid_digest;
+ assert(not N.valid_artifact(altered),"base digest bounded before model reconstruction");
+}
+assert(r.neural_weights_changed!=(equal(r.artifact.a,r.initial_artifact.a) and equal(r.artifact.b,r.initial_artifact.b)),"weight-change report matches saved artifacts");
+
+let tiny_update=N.train([map{x:[0],y:4}],[map{x:[7,0],y:4}],map{epochs:1,lr:0.000001});
+assert(tiny_update.steps==1 and tiny_update.artifact.digest!=tiny_update.initial_artifact.digest,"step metadata changes artifact identity");
+assert(equal(tiny_update.artifact.a,tiny_update.initial_artifact.a) and equal(tiny_update.artifact.b,tiny_update.initial_artifact.b),"sub-quantization update leaves saved weights unchanged");
+assert(not tiny_update.neural_weights_changed,"metadata-only update cannot claim learned weight change");

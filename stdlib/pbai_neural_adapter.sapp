@@ -1,0 +1,215 @@
+// Explicit, in-memory specialist training. No corpus reads, cache writes or activation.
+// Fixed tiny decoder: this is an experimental token specialist, not a pretrained LLM.
+let ATT = import("stdlib:llm_attention.sapp");
+let AD = import("stdlib:llm_adapters.sapp");
+let CORE = import("stdlib:llm_core.sapp");
+let FORMAT = "pbai.neural.token-adapter.v1";
+let PROFILE = "tiny-token-8-context-4-seed-77-q6-v1";
+
+fn _number(x, lo, hi, integer = false) {
+    if type(x) != "number" { return false; }
+    if x != x { return false; }
+    if x < lo or x > hi { return false; }
+    return not integer or x == num_floor(x);
+}
+fn _keys(x, keys) {
+    if type(x) != "map" or len(x) != len(keys) { return false; }
+    for key in keys { if not map_has(x,key) { return false; } }
+    return true;
+}
+fn _ids(ids) {
+    if type(ids) != "array" or len(ids) < 1 or len(ids) > 4 { return false; }
+    for id in ids { if not _number(id,0,7,true) { return false; } }
+    return true;
+}
+// Token identity is numerical: +0 and -0 address the same embedding row.
+fn _context_key(ids) {
+    let canonical=[];for id in ids {push(canonical,if id==0 {0} else {id});}
+    return json_stringify(canonical);
+}
+fn _examples(examples) {
+    if type(examples) != "array" or len(examples) < 1 or len(examples) > 32 { throw "expected 1..32 examples"; }
+    let seen=map{};
+    for ex in examples {
+        if not _keys(ex,["x","y"]) or not _ids(ex.x) or not _number(ex.y,0,7,true) { throw "invalid token example"; }
+        let key=_context_key(ex.x);
+        if map_has(seen,key) { throw "duplicate input context"; }
+        seen[key]=true;
+    }
+    return seen;
+}
+fn _model() { return ATT.model_new(ATT.config(8,4,8,16,1,1,77)); }
+fn _matrix(m, rows, cols, limit = 10000, integer = false) {
+    if type(m) != "array" or len(m) != rows { return false; }
+    for row in m {
+        if type(row) != "array" or len(row) != cols { return false; }
+        for value in row { if not _number(value,0-limit,limit,integer) { return false; } }
+    }
+    return true;
+}
+fn _identity(base_digest,a,b,steps) { return sha256(json_stringify([FORMAT,PROFILE,base_digest,a,b,steps])); }
+// Fixed-point integers make the artifact digest stable across JSON roundtrips.
+fn _quantize(matrix) {
+    let out=[];for row in matrix {let values=[];for v in row {push(values,num_floor(v*1000000+0.5));}push(out,values);}return out;
+}
+fn _dequantize(matrix) {
+    let out=[];for row in matrix {let values=[];for v in row {push(values,v/1000000);}push(out,values);}return out;
+}
+fn _artifact(ad, base_digest) {
+    let a=_quantize(ad.a_matrix);let b=_quantize(ad.b_matrix);
+    return map{format:FORMAT,profile:PROFILE,base_digest:base_digest,a:a,b:b,steps:ad.steps,digest:_identity(base_digest,a,b,ad.steps)};
+}
+fn valid_artifact(value) {
+    if not _keys(value,["format","profile","base_digest","a","b","steps","digest"]) { return false; }
+    if value.format != FORMAT or value.profile != PROFILE { return false; }
+    if type(value.base_digest) != "string" or len(value.base_digest) != 64 { return false; }
+    if not _number(value.steps,0,4096,true) or not _matrix(value.a,8,2,10000000000,true) or not _matrix(value.b,2,8,10000000000,true) { return false; }
+    if type(value.digest) != "string" or len(value.digest) != 64 { return false; }
+    return value.base_digest == sha256(json_stringify(_model()))
+        and value.digest == _identity(value.base_digest,value.a,value.b,value.steps);
+}
+fn _adapter(model, artifact) {
+    let ad=AD.lm_head_adapter(model,2,4.0,1901);
+    return AD.from_state(ad,_dequantize(artifact.a),_dequantize(artifact.b),0.0,artifact.steps,artifact.steps);
+}
+fn predict(artifact, ids) {
+    if not valid_artifact(artifact) { throw "invalid neural adapter artifact"; }
+    if not _ids(ids) { throw "invalid neural input"; }
+    let model=_model(); let ad=_adapter(model,artifact);
+    let raw=AD.logits(model,ATT.head_hidden(model,ids),ad);
+    return map{format:"pbai.neural.prediction.v1",token:CORE.argmax(raw),logits:raw,
+        artifact_digest:artifact.digest,stages:["explicit-candidate","neural-specialist"],
+        globally_activated:false,authorizes_action:false,artifact_authenticated:false,authorizes_activation:false};
+}
+fn train(train_examples, validation_examples, options = nil) {
+    let seen=_examples(train_examples); _examples(validation_examples);
+    for ex in validation_examples { if map_has(seen,_context_key(ex.x)) { throw "training/validation input overlap"; } }
+    if options == nil { options=map{epochs:64,lr:0.1}; }
+    if not _keys(options,["epochs","lr"]) or not _number(options.epochs,1,128,true)
+        or not _number(options.lr,0.000001,0.25) { throw "invalid neural training options"; }
+    let model=_model(); let base_digest=sha256(json_stringify(model)); let initial=AD.lm_head_adapter(model,2,4.0,1901);
+    let ad=initial;
+    let before=AD.evaluate(model,initial,ATT.adapter_hidden,validation_examples);
+    let train_before=AD.evaluate(model,initial,ATT.adapter_hidden,train_examples);
+    // Frozen features are computed once. Only the 32 low-rank parameters train.
+    let hidden=[]; for ex in train_examples { push(hidden,ATT.head_hidden(model,ex.x)); }
+    let total=0.0;
+    for _epoch options.epochs { for i len(train_examples) {
+        let step=AD.train_step(model,ad,hidden[i],train_examples[i].y,options.lr);
+        ad=AD.from_state(ad,step.updated_a_matrix,step.updated_b_matrix,step.loss,step.next_steps,step.next_examples);
+        if not _matrix(ad.a_matrix,8,2) or not _matrix(ad.b_matrix,2,8) { throw "nonfinite or oversized training update"; }
+        total=total+step.loss;
+    } }
+    let artifact=_artifact(ad,base_digest);
+    let initial_artifact=_artifact(initial,base_digest);
+    let saved=_adapter(model,artifact);
+    let after=AD.evaluate(model,saved,ATT.adapter_hidden,validation_examples);
+    let train_after=AD.evaluate(model,saved,ATT.adapter_hidden,train_examples);
+    return map{format:"pbai.neural.training.v1",artifact:artifact,
+        initial_artifact:initial_artifact,train_before:train_before,train_after:train_after,
+        validation_before:before,validation_after:after,steps:ad.steps,online_loss:total/ad.steps,
+        candidate_improved:after.loss < before.loss and after.accuracy >= before.accuracy,
+        trainable_parameters:32,base_weights_frozen:true,neural_weights_changed:json_stringify([artifact.a,artifact.b])!=json_stringify([initial_artifact.a,initial_artifact.b]),
+        persists_weights:false,globally_activated:false,accepted_for_merge:false,
+        artifact_authenticated:false,training_data_authenticated:false,authorizes_activation:false,
+        training_digest:sha256(json_stringify(train_examples)),validation_digest:sha256(json_stringify(validation_examples)),
+        options_digest:sha256(json_stringify([options.epochs,options.lr])),
+        data_scope:"explicit-caller-token-examples",evaluation_scope:"distinct-input-validation-not-independent-test",
+        agi_status:"not-demonstrated",asi_status:"not-demonstrated"};
+}
+export train, predict, valid_artifact;
+
+fn _copy_examples(examples) {
+    let out=[];
+    for ex in examples { let ids=[]; for id in ex.x { push(ids,id); } push(out,map{x:ids,y:ex.y}); }
+    return out;
+}
+fn _metric_copy(metric) {
+    return map{examples:metric.examples,loss:metric.loss,correct:metric.correct,accuracy:metric.accuracy};
+}
+fn _finite_metric(metric) {
+    return _number(metric.loss,0,1000000000000) and _number(metric.accuracy,0,1)
+        and _number(metric.examples,1,32,true) and _number(metric.correct,0,metric.examples,true);
+}
+fn _correct_regressions(model, before_ad, after_ad, examples) {
+    let count=0;
+    for ex in examples {
+        let hidden=ATT.head_hidden(model,ex.x);
+        let old_token=CORE.argmax(AD.logits(model,hidden,before_ad));
+        let new_token=CORE.argmax(AD.logits(model,hidden,after_ad));
+        if old_token == ex.y and new_token != ex.y { count=count+1; }
+    }
+    return count;
+}
+fn _session_status(state) {
+    return map{format:"pbai.neural.session.status.v1",phase:state.phase,revision:state.revision,
+        active_digest:state.active.digest,evaluation_consumed:state.phase != "candidate",
+        session_adapter_active:state.phase == "promoted",persists_weights:false,globally_activated:false,
+        training_data_authenticated:false,independent_provenance_verified:false,
+        global_session_budget_enforced:false,authorizes_activation:false,authorizes_action:false};
+}
+// A single training candidate, one evaluation, one promotion and one rollback.
+// Handles are for single-threaded local use; no registry or external effects.
+fn session(train_examples, validation_examples, options = nil) {
+    _examples(train_examples); _examples(validation_examples);
+    let private_train=_copy_examples(train_examples); let private_valid=_copy_examples(validation_examples);
+    let trained=train(private_train,private_valid,options);
+    let seen=_examples(private_train);
+    for ex in private_valid { seen[_context_key(ex.x)]=true; }
+    let training_gate=_finite_metric(trained.train_before) and _finite_metric(trained.train_after)
+        and _finite_metric(trained.validation_before) and _finite_metric(trained.validation_after)
+        and trained.train_after.loss <= trained.train_before.loss
+        and trained.train_after.accuracy >= trained.train_before.accuracy
+        and trained.validation_after.loss < trained.validation_before.loss
+        and trained.validation_after.accuracy >= trained.validation_before.accuracy;
+    // train() created these artifacts here; neither has escaped to the caller.
+    let state=map{phase:"candidate",revision:0,active:trained.initial_artifact,
+        baseline:trained.initial_artifact,candidate:trained.artifact};
+    return map{
+        status:fn() { return _session_status(state); },
+        predict:fn(ids) {
+            let result=predict(state.active,ids);
+            result.stages=["session-active-artifact","neural-specialist"];
+            result.session_phase=state.phase; result.session_revision=state.revision;
+            return result;
+        },
+        evaluate:fn(test_examples) {
+            if state.phase != "candidate" { throw "session evaluation already consumed"; }
+            _examples(test_examples);
+            for ex in test_examples {
+                if map_has(seen,_context_key(ex.x)) { throw "session test input overlaps training or validation"; }
+            }
+            let private_test=_copy_examples(test_examples);
+            // A valid test set consumes the allowance even if quality fails.
+            state.phase="rejected"; state.revision=1;
+            let model=_model(); let before_ad=_adapter(model,state.baseline); let after_ad=_adapter(model,state.candidate);
+            let paired=AD.evaluate_pair(model,before_ad,after_ad,ATT.adapter_hidden,private_test);
+            let before=paired.baseline; let after=paired.candidate;
+            let regressions=paired.baseline_correct_regressions;
+            let train_regressions=_correct_regressions(model,before_ad,after_ad,private_train);
+            let valid_regressions=_correct_regressions(model,before_ad,after_ad,private_valid);
+            let retained_training=training_gate and train_regressions==0 and valid_regressions==0;
+            let passed=retained_training and _finite_metric(before) and _finite_metric(after)
+                and after.loss < before.loss and after.accuracy >= before.accuracy and regressions == 0;
+            if passed { state.phase="evaluated"; }
+            return map{format:"pbai.neural.session.evaluation.v1",passed:passed,
+                baseline:_metric_copy(before),candidate:_metric_copy(after),baseline_correct_regressions:regressions,
+                test_digest:sha256(json_stringify(private_test)),baseline_digest:state.baseline.digest,
+                candidate_digest:state.candidate.digest,exact_input_disjointness_checked:true,
+                independent_provenance_verified:false,training_gate_passed:retained_training,
+                training_correct_regressions:train_regressions,validation_correct_regressions:valid_regressions,
+                authorizes_activation:false,globally_activated:false,revision:state.revision};
+        },
+        promote:fn() {
+            if state.phase != "evaluated" { throw "session candidate did not pass evaluation"; }
+            state.active=state.candidate; state.phase="promoted"; state.revision=2;
+            return _session_status(state);
+        },
+        rollback:fn() {
+            if state.phase != "promoted" { throw "session has no promoted candidate to roll back"; }
+            state.active=state.baseline; state.candidate=nil; state.phase="rolled-back"; state.revision=3;
+            return _session_status(state);
+        }
+    };
+}
+export session;
