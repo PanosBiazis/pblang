@@ -92,9 +92,25 @@ Android emulator `run_pbcs` and `compile_and_run` also close their private
 context after success or caught failure, before recording a success event.
 See [Android cleanup validation](ANDROID_CLEANUP_VALIDATION_2026-09-16.md).
 
-Direct VM/frontend execution still preserves uncaught exceptions without an
-explicit failure close; final reclamation on that route depends on host GC.
-Deterministic cleanup there remains open. Neither loader nor Android cleanup
+Direct VM/frontend execution now closes its private scalar ownership context
+before an escaping guest `throw` or `error(value)`, while propagating the original
+value/message. Active guest try handlers prevent premature whole-run cleanup;
+the selected handler is removed before its catch body executes. A nested catch
+that rethrows is therefore protected only by its remaining outer handlers.
+Normal success, nil/false values and handled failures retain their behavior.
+
+`execution_context()` still defaults to caller-owned state. Internal orchestrators
+can opt into escaping-guest-error cleanup with `execution_context(true)` when an
+uncaught guest error ends the entire run. Ordinary VM run helpers and the two
+frontend run routes opt in automatically, including module initialization. This
+flag is not a guest capability. Explicitly supplied default contexts must still
+be closed by the caller. The context and active-handler count must never be
+mutated concurrently, shared by simultaneous executions, or exposed to guest code.
+
+Implicit host failures, quota failures and arbitrary FFI exceptions are not
+covered by this path. A host failure during cleanup is suppressed to retain the
+original guest exception; complete reclamation in that case is not guaranteed.
+General deterministic exceptional cleanup remains open. Neither loader nor Android cleanup
 retries execution, rolls back mutations or reclaims arbitrary host/native
 resources. Android copies top-level seeded globals, but nested maps/arrays
 can remain aliased and retain guest mutations. Removing ownership entries does
@@ -123,3 +139,7 @@ Programs that never invoke memory builtins leave the ownership engine state
 unallocated. VM calls still carry a shared execution-context reference; measured
 cost must therefore be checked even for programs without explicit ownership.
 See [validation and migration gaps](SELFHOST_MEMORY_VALIDATION_2026-09-15.md).
+
+Regression coverage: `tests/semantics/selfhost_throw_cleanup_test.sapp`. The
+`examples/selfhost_throw_cleanup/main.sapp` driver shows automatic frontend
+behavior and the explicit orchestration option.
