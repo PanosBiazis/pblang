@@ -162,6 +162,24 @@ Module initialization currently receives separate runtime budgets: shared
 ownership state does not create a cumulative step or aggregate-memory budget
 for the entire import graph. That resource-accounting gap remains open.
 
+## Compiler metadata and packaging
+
+`compiler/vm_builtins.sapp` owns the memory builtin name table through
+`memory_registry()`. Code generation imports this metadata without loading
+`vm_memory.sapp`. The engine retains its existing `registry()` callable as an
+alias of the same function; both APIs return fresh maps. Mutating one returned
+registry cannot change future lookups or another compiler instance.
+
+The VM still imports its engine statically. This preserves source linking and
+freezing: the current inliner rejects nested runtime imports. Consequently this
+change avoids engine loading for metadata/codegen-only consumers, but does not
+promise lazy engine loading for the full frontend, VM or packaged applications.
+It neither changes scalar cleanup rules nor enables cycle collection or FFI
+cleanup. Actual OS memory/time savings depend on the importing application.
+
+Coverage: `tests/semantics/selfhost_memory_metadata_test.sapp`; example:
+`examples/selfhost_throw_cleanup/memory_metadata.sapp`.
+
 ## Observability and cost
 
 `memory_stats()` returns current owner/borrow counts and lifetime depth, plus
