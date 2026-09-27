@@ -43,7 +43,12 @@ A colon call first checks the optional `__class` property and then looks up the
 method on the class or receiver. The self-hosted VM returns nil for absent class
 metadata, while native attribute lookup throws. The native translator now catches
 only this reserved lookup and supplies nil without retaining an extra receiver
-reference. It preserves class dispatch, single receiver evaluation, argument order,
+reference. Recovery code is emitted after the normal frame body, so successful
+lookups do not jump over it on every call. Branch lowering also removes an
+unnecessary jump on fallthrough while consuming the same stack values on both
+paths. Native module exports remain supported; replacing lookup with a map-only
+optional-access instruction would break them. It preserves class dispatch, single
+receiver evaluation, argument order,
 and propagation of method/argument errors. Nil class metadata falls back to the
 receiver; false or other invalid class metadata is not treated as absent.
 
@@ -68,8 +73,8 @@ to that Rust compiler.
   logs. Bytecode includes program constants and is not source-code encryption.
 
 `native_pbck_method_test.sapp` executes plain, optimized and PBCS-roundtripped
-translations on the actual native VM, including nested methods, classes, invalid
-metadata, single evaluation, argument order, thrown errors and real pipeline
-workers. `native_pbck_cli_live_test.sapp` verifies option/diagnostic failures,
+translations on the actual native VM, including nested methods, classes, native
+modules with and without exported class metadata, invalid metadata, single
+evaluation, argument order, thrown errors and real pipeline workers. `native_pbck_cli_live_test.sapp` verifies option/diagnostic failures,
 output preservation, execution and capability denial. These live tests explicitly
 skip non-Linux systems; they are not proof of Windows/macOS compatibility.
