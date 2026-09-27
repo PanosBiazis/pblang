@@ -128,8 +128,24 @@ resume an execution that has ended; create a fresh context. Closing again is
 idempotent. Implicit host failure before reaching the controlled `fail` function
 is outside this guarantee.
 
-Implicit host failures, quota failures and arbitrary FFI exceptions are not
-covered by this path. A host failure during cleanup is suppressed to retain the
+Runtime quota failures now also close an owned scalar context. Limits remain
+sticky and cannot be caught to resume the same budget: step, frame, stack,
+local-slot, output, value-size and allocation/growth limits terminate the run.
+Consequently quota cleanup applies even while guest handlers are active. It
+never closes caller-owned contexts unless the orchestrator explicitly opted in.
+The execution context is passed privately to the guard helpers; it is not stored
+in or returned with the public runtime counters. Limits, step accounting and
+counter shape remain unchanged.
+
+Explicit VM admission errors (invalid call counts, declared function/method
+arity, unresolved imports, invalid overload targets, selected builtin arities,
+negative slots and explicit byte-conversion type checks) use the same ownership
+rule as ordinary guest exceptions: close only if no guest handler can continue.
+The original error messages are retained; stack traces can include a cleanup
+helper frame. This does not make every host builtin failure a controlled VM
+error.
+
+Implicit host failures and arbitrary FFI exceptions are not covered by this path. A host failure during cleanup is suppressed to retain the
 original guest exception; complete reclamation in that case is not guaranteed.
 General deterministic exceptional cleanup remains open. Neither loader nor Android cleanup
 retries execution, rolls back mutations or reclaims arbitrary host/native
@@ -171,3 +187,11 @@ Controlled-memory regression coverage:
 and ordinary routes, nested handlers, caller-owned contexts, ID exhaustion and
 idempotent closing. This does not activate the PBLang VM inside applications
 that still use the retained host directly.
+
+Quota/admission regression coverage:
+`tests/semantics/selfhost_admission_cleanup_test.sapp`; runnable example:
+`examples/selfhost_throw_cleanup/quota_failure.sapp`. The tests include nested
+handlers, borrowed contexts, pre-mutation rejection and unchanged public runtime
+counter fields. See also the existing bounded VM, tick-accounting and UTF-8
+budget suites. A malformed host value or arbitrary builtin exception that occurs
+before an explicit VM rejection can still escape without this cleanup.
