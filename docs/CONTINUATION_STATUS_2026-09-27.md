@@ -79,3 +79,15 @@ for the imported reproducer. Direct retained-source execution, generic host/FFI
 cleanup, cycles/pauses, async regressions and the installed desktop PB-MCP remain
 separate unfinished work. The nine previously reviewed product deliveries were
 checked for newer task updates; no newer delivery was found in this follow-up.
+
+## Static-bundle CLI integration
+
+The public PBLang compiler tool now accepts `--target pbck --bundle`, backed by
+`compiler/native_bundle.compile_file`. The file-based example and live CLI test
+cover imported nested method calls, transitive dependencies, source deletion and
+runtime capability denial. Unsupported target/cleanup combinations fail before
+input reads and compilation failures preserve an existing output artifact.
+The previous nine-task delivery inventory was rechecked for newer updates;
+no newer delivery was found. This completes this CLI integration only. Direct
+retained-source compilation, universal host/FFI cleanup, cycles, GC/async latency,
+platform qualification and installed desktop PB-MCP integration remain open.
