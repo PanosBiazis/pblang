@@ -462,3 +462,6 @@ and `neural_task_curriculum_split`; see [the shared contracts and limits](pbAI_C
 
 Explicit specialist training, private evaluation, session promotion and exact rollback
 are available through [the shared neural lifecycle](pbAI_Neural_Lifecycle.md).
+
+Explicit teacher-to-student training is available through
+[the shared distillation contract](pbAI_Distillation_Contract.md).

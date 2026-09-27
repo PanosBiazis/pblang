@@ -213,3 +213,89 @@ fn session(train_examples, validation_examples, options = nil) {
     };
 }
 export session;
+
+// Diagnostic distillation: a rank-1 student learns a caller-selected rank-2 teacher.
+// Handles retain private in-memory weights; no checkpoint or activation operations.
+fn _distill_metrics(model, teacher, initial, student, examples) {
+    let teacher_loss=0.0;let initial_loss=0.0;let student_loss=0.0;
+    let teacher_correct=0;let initial_correct=0;let student_correct=0;
+    let agreement=0;let initial_agreement=0;let regressions=0;let kl=0.0;let initial_kl=0.0;
+    let corrections=0;let both_wrong=0;let initial_regressions=0;
+    for ex in examples {
+        let h=ATT.head_hidden(model,ex.x);let t=AD.logits(model,h,teacher);
+        let b=AD.logits(model,h,initial);let s=AD.logits(model,h,student);
+        let target=CORE.argmax(t);let old=CORE.argmax(b);let predicted=CORE.argmax(s);
+        teacher_loss=teacher_loss+CORE.cross_entropy_from_logits(t,ex.y);
+        initial_loss=initial_loss+CORE.cross_entropy_from_logits(b,ex.y);
+        student_loss=student_loss+CORE.cross_entropy_from_logits(s,ex.y);
+        if target==ex.y {teacher_correct=teacher_correct+1;if predicted!=ex.y {regressions=regressions+1;}}
+        if old==ex.y {initial_correct=initial_correct+1;if predicted!=ex.y {initial_regressions=initial_regressions+1;}}
+        if target!=ex.y and predicted==ex.y {corrections=corrections+1;}
+        if target!=ex.y and predicted!=ex.y {both_wrong=both_wrong+1;}
+        if predicted==ex.y {student_correct=student_correct+1;}
+        if predicted==target {agreement=agreement+1;}
+        if old==target {initial_agreement=initial_agreement+1;}
+        let q=CORE.softmax(t,1.0);let entropy=AD.soft_target_loss(t,q);
+        let delta=AD.soft_target_loss(s,q)-entropy;let before_delta=AD.soft_target_loss(b,q)-entropy;
+        if delta>0 {kl=kl+delta;}if before_delta>0 {initial_kl=initial_kl+before_delta;}
+    }
+    let n=len(examples);
+    return map{format:"pbai.neural.distillation.evaluation.v1",examples:n,
+        teacher:map{loss:teacher_loss/n,correct:teacher_correct,accuracy:teacher_correct/n},
+        initial_student:map{loss:initial_loss/n,correct:initial_correct,accuracy:initial_correct/n},
+        student:map{loss:student_loss/n,correct:student_correct,accuracy:student_correct/n},
+        teacher_agreement:agreement/n,initial_teacher_agreement:initial_agreement/n,
+        teacher_correct_student_wrong:regressions,teacher_wrong_student_correct:corrections,
+        teacher_and_student_wrong:both_wrong,initial_student_correct_regressions:initial_regressions,teacher_student_kl:kl/n,initial_teacher_student_kl:initial_kl/n,
+        exact_student_input_disjointness_checked:true,teacher_training_overlap_checked:false,
+        independent_provenance_verified:false,authorizes_activation:false,globally_activated:false};
+}
+fn distill(teacher_artifact, contexts, validation, options=nil) {
+    if not valid_artifact(teacher_artifact) {throw "invalid distillation teacher artifact";}
+    if type(contexts)!="array" or len(contexts)<1 or len(contexts)>32 {throw "expected 1..32 distillation contexts";}
+    let training=[];
+    for ids in contexts {if not _ids(ids) {throw "invalid distillation context";}push(training,map{x:ids,y:0});}
+    let seen=_examples(training);_examples(validation);
+    for ex in validation {if map_has(seen,_context_key(ex.x)) {throw "distillation validation overlaps training";}}
+    if options==nil {options=map{epochs:64,lr:0.1,temperature:2.0};}
+    if not _keys(options,["epochs","lr","temperature"]) or not _number(options.epochs,1,128,true)
+        or not _number(options.lr,0.000001,0.25) or not _number(options.temperature,0.25,8) {throw "invalid distillation options";}
+    let model=_model();let teacher=_adapter(model,teacher_artifact);
+    let initial=AD.lm_head_adapter(model,1,2.0,1901);let student=initial;
+    let hidden=[];let targets=[];
+    for ex in training {
+        let h=ATT.head_hidden(model,ex.x);push(hidden,h);
+        push(targets,CORE.softmax(AD.logits(model,h,teacher),options.temperature));
+    }
+    let total=0.0;
+    for _epoch options.epochs {for i len(training) {
+        let step=AD.train_soft_step(model,student,hidden[i],targets[i],options.lr,options.temperature);
+        student=AD.from_state(student,step.updated_a_matrix,step.updated_b_matrix,step.loss,step.next_steps,step.next_examples);
+        if not _matrix(student.a_matrix,8,1) or not _matrix(student.b_matrix,1,8) {throw "nonfinite or oversized student update";}
+        total=total+step.loss;
+    }}
+    let private_valid=_copy_examples(validation);
+    let evaluation=_distill_metrics(model,teacher,initial,student,private_valid);
+    for ex in private_valid {seen[_context_key(ex.x)]=true;}
+    let report=map{format:"pbai.neural.distillation.v1",training_examples:len(training),steps:student.steps,
+        teacher_trainable_parameters:32,student_trainable_parameters:16,adapter_parameter_ratio:0.5,
+        compression_scope:"adapter-only-shared-frozen-base",base_weights_frozen:true,
+        online_soft_loss:total/student.steps,temperature:options.temperature,validation:evaluation,
+        teacher_digest:teacher_artifact.digest,student_digest:sha256(json_stringify([student.a_matrix,student.b_matrix])),
+        teacher_training_overlap_checked:false,persists_weights:false,globally_activated:false,
+        authorizes_activation:false,accepted_for_merge:false,agi_status:"not-demonstrated",asi_status:"not-demonstrated"};
+    return map{report:report,
+        predict:fn(ids) {
+            if not _ids(ids) {throw "invalid student input";}
+            let raw=AD.logits(model,ATT.head_hidden(model,ids),student);
+            return map{format:"pbai.neural.distillation.prediction.v1",token:CORE.argmax(raw),logits:raw,
+                trainable_parameters:16,globally_activated:false,authorizes_action:false};
+        },
+        evaluate:fn(examples) {
+            _examples(examples);
+            for ex in examples {if map_has(seen,_context_key(ex.x)) {throw "distillation test overlaps training or validation";}}
+            return _distill_metrics(model,teacher,initial,student,_copy_examples(examples));
+        }
+    };
+}
+export distill;
