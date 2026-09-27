@@ -91,3 +91,20 @@ The previous nine-task delivery inventory was rechecked for newer updates;
 no newer delivery was found. This completes this CLI integration only. Direct
 retained-source compilation, universal host/FFI cleanup, cycles, GC/async latency,
 platform qualification and installed desktop PB-MCP integration remain open.
+
+
+## Guarded static-bundle integration
+
+`pbc --target pbck --bundle --entry work --cleanup release` now combines the
+previously separate linker and native cleanup boundary. Imported entry failures
+retain their primary message even if cleanup also fails. Tests include transitive
+imports, once-only explicit file cleanup, source deletion and denied capabilities.
+Callback validation is shared with the single-source compiler; main is compiled
+once. The plain compiler/linker profiles remain unchanged.
+
+This closes the former unsupported flag combination, not the general automatic
+host/FFI cleanup item. Initialization/native-crash limits and the narrower guarded
+main admission are documented. The direct retained-source p:run defect, cycle
+collection/pauses, old async regressions, platform qualification and separate
+installed desktop PB-MCP remain open. Nine related tasks still have no newer
+reported delivery than the inventory above.

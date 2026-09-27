@@ -219,9 +219,9 @@ allowlist, a filesystem sandbox, or a guarantee of one consistent filesystem
 snapshot during concurrent edits. Use `compile_bundle(source, resolve)` with an
 immutable in-memory source set when that guarantee is required.
 
-The CLI rejects duplicate `--bundle`, other targets, and combinations with
-`--entry`/`--cleanup` before reading the entry. Static bundles do not yet support
-that explicit cleanup option; rejection prevents silently losing it. Ordinary
+The CLI rejects duplicate `--bundle`, other targets and unpaired
+`--entry`/`--cleanup` before reading the entry. Paired callbacks are supported
+with static bundles as described below. Ordinary
 PBCK compilation is unchanged and does not load the optional linker. Every
 compilation/link check completes before writing output. The existing trusted
 output-directory and non-atomic-write limitations still apply.
@@ -231,3 +231,48 @@ files, and executes the artifact under the native VM sandbox. It also checks
 option failures before input reads, output preservation, private diagnostic
 canaries and denied filesystem access. This is Linux evidence, not a portable
 platform certification or a repair of direct retained-source compilation.
+
+
+### Cleanup across a static dependency bundle
+
+```sh
+./target/release/pblang run tools/pbc.sapp --allow-all -- examples/static_project/cleanup.sapp --target pbck --bundle --entry work --cleanup release --out cleanup-bundle.pbck
+./target/release/pblang run cleanup-bundle.pbck --allow-all
+PBLANG_BUNDLE_DEMO_FAIL=1 ./target/release/pblang run cleanup-bundle.pbck --allow-all
+```
+
+The successful example prints `7` and `resources released`. The failure example
+prints `resources released`, exits unsuccessfully and retains the imported
+indexing error. Its owned buffer is cleared by an explicit callback. The example
+is not a general collector or an FFI lifetime implementation.
+
+Library entries are `native_bundle.compile_bundle_with_cleanup(source, resolve,
+entry, cleanup)` and `compile_file_with_cleanup(path, entry, cleanup)`. The lower
+linker exposes `bundle_with_cleanup` and `bundle_file_with_cleanup`; these return
+ordinary linked IR. Only the native bridge's guarded translation installs the
+cleanup behavior. Passing that IR to ordinary translation or the self-hosted VM
+does **not** install a finally boundary. `native_pbck.checked_cleanup_chunk` is a
+compiler integration helper returning validated IR, not an execution API.
+
+Callbacks must be distinct zero-argument top-level functions declared in the
+entry source. A dependency cannot supply missing callback declarations. Main
+validation occurs before dependency resolver callbacks. Main is compiled once,
+then its instructions are relocated after the dependencies and the final guarded
+instruction is checked again before translation. The original error **message**
+is retained if entry and cleanup both fail; typed exception/stack preservation is
+not promised. Cleanup is captured before the entry call and runs once without
+replaying the failed operation. Runtime capabilities remain separate.
+
+Guarded main source, **including the generated callback expression**, has the
+same 1 MiB UTF-8 / 65,536-token budget as ordinary explicit-cleanup compilation.
+This is intentionally narrower than the unguarded static main limit. Existing
+module-count, depth, per-module and aggregate limits remain. The filesystem
+convenience call still reads whole files before compiler admission.
+
+Module and entry initialization precede the boundary. Initializer errors,
+process termination, native FFI crashes, cleanup that cannot complete, and
+resource exhaustion preventing cleanup remain outside the guarantee. Shared
+globals and export snapshots remain properties of this explicit static profile.
+`native_bundle_cleanup_test.sapp` and `native_bundle_cli_live_test.sapp` cover
+transitive imports, caught and escaping failures, callback reassignment, actual
+file cleanup, source deletion, denied capabilities and invalid callback contracts.
