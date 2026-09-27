@@ -1047,3 +1047,29 @@ reused pools and actual parallel success/failure collection. Example:
 `examples/thread_pool_priority/main.sapp`. Benchmarks must include small,
 already-ordered and equal-priority queues as well as disordered queues; the
 extra merge buffer is a tradeoff, not a promise of lower process RSS.
+
+## Dense parallel result collection
+
+`run_parallel` assigns an internal zero-based collection position to each pending
+job. Worker outcomes go directly into that position rather than through decimal
+ID strings and a dictionary. Public task IDs, task records, completed history,
+priority ties and round-robin worker assignment are unchanged. Collection
+positions are rebuilt for each batch, so a reused pool does not confuse a new
+result with an earlier task's record.
+
+Workers enrich their existing outcome envelope with its collection position;
+they no longer allocate a second map containing the same value and status.
+Nil/false/zero successful values stay distinct from missing or failed worker
+outcomes. If a whole worker result cannot be transferred, all jobs assigned to
+that worker remain failures; sibling results survive. Partially launched batches
+still settle their started workers and do not silently replay their effects.
+
+This is an internal protocol between PBLang modules in the owning VM. It does
+not add a cross-process protocol, allow concurrent mutation of a pool, guarantee
+lower RSS on every host, or change native worker cancellation/exception handling.
+Priority preparation remains unchanged.
+
+Regression: `tests/semantics/thread_pool_result_slots_test.sapp` covers reused
+parallel pools, sparse public IDs relative to new batch positions, stable ties,
+nil/false/zero values and a real worker transfer failure. The priority regression
+also checks every NaN position in odd queues of 33, 65 and 97 tasks.
