@@ -131,3 +131,7 @@ PBTally adds exact-category counts and two-axis cross-tabs with native/CLI previ
 ## Exact numeric category summaries
 
 PBGroupStats adds a dedicated native/CLI worksheet for exact decimal Count/Sum/Min/Max by category. PBTally gains the same numeric mode alongside existing counts/cross-tabs. Shared `table_group_stats` reuses the native decimal type and existing grouping; `table_stats_view` supplies the dedicated workspace and portable reader. See `TABLE_NUMERIC_GROUPS.md`. Input is bounded and strict; no implicit zero, skipping, rounding, unit inference or new file format. Web/Android remain selected-row snapshots; larger streaming tables and installed cross-platform editions remain future work.
+
+## Explicit free-time windows
+
+PBSlotFinder adds native/CLI search for relative-time gaps inside an explicit window and minimum duration. PBTimeline exposes the same commands and a separate slot workspace. The shared interval analyzer supplies clipped occupancy and boundary gaps; timeline_slots exports generic-labeled copies without reservations. See `TIMELINE_FREE_SLOTS.md` for limits, independent-oracle tests and platform distinctions. Resources, calendars and installed portable releases remain future work.
