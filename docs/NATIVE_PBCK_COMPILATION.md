@@ -202,3 +202,32 @@ runtime module mutation. The filesystem convenience resolver is for trusted
 project paths; the in-memory resolver is preferable for exact source snapshots.
 No CLI default, filesystem authority, telemetry or desktop-control approval was
 changed. Native live tests currently qualify Linux only.
+
+### Compile a trusted project from the CLI
+
+```sh
+./target/release/pblang run tools/pbc.sapp --allow-all -- examples/static_project/main.sapp --target pbck --bundle --out static-project.pbck
+./target/release/pblang run static-project.pbck --sandbox
+```
+
+The artifact prints `7`. `--bundle` is opt-in and uses
+`compiler/native_bundle.compile_file(path)`. Imports are resolved against the
+compiler's **working directory**, not relative to the importing file. Run from
+the project root. This profile accepts trusted local project paths and reads
+whole files before the documented linker admission limits. It is not an import
+allowlist, a filesystem sandbox, or a guarantee of one consistent filesystem
+snapshot during concurrent edits. Use `compile_bundle(source, resolve)` with an
+immutable in-memory source set when that guarantee is required.
+
+The CLI rejects duplicate `--bundle`, other targets, and combinations with
+`--entry`/`--cleanup` before reading the entry. Static bundles do not yet support
+that explicit cleanup option; rejection prevents silently losing it. Ordinary
+PBCK compilation is unchanged and does not load the optional linker. Every
+compilation/link check completes before writing output. The existing trusted
+output-directory and non-atomic-write limitations still apply.
+
+`native_bundle_cli_live_test.sapp` compiles transitive imports, deletes all source
+files, and executes the artifact under the native VM sandbox. It also checks
+option failures before input reads, output preservation, private diagnostic
+canaries and denied filesystem access. This is Linux evidence, not a portable
+platform certification or a repair of direct retained-source compilation.
