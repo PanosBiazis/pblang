@@ -151,31 +151,27 @@ fn _fresh(ctx) { ctx.n = ctx.n + 1; return ctx.n; }
 // Self-hosted ordinary branches consume their condition, so both the taken and
 // fallthrough paths need an explicit pop. `branch_op` is native 36/37.
 fn _lower_consuming_branch(code, ctx, branch_op, target) {
-    let taken = _fresh(ctx);
-    let done = _fresh(ctx);
-    array_push(code, map{ op: branch_op, jmp: taken });
-    array_push(code, map{ op: 11 });                   // fallthrough: consume condition
-    array_push(code, map{ op: 35, jmp: done });
-    array_push(code, map{ label: taken });
+    let fallthrough = _fresh(ctx);
+    let inverse = if branch_op == 36 { 37 } else { 36 };
+    array_push(code, map{ op: inverse, jmp: fallthrough });
     array_push(code, map{ op: 11 });                   // taken: consume condition
     array_push(code, map{ op: 35, jmp: target });
-    array_push(code, map{ label: done });
+    array_push(code, map{ label: fallthrough });
+    array_push(code, map{ op: 11 });                   // fallthrough: consume condition
 }
 
 // Nil-peek branches preserve the original value. OpIsNil consumes the duplicate
 // and produces a boolean; remove only that boolean on both paths.
 fn _lower_nil_peek_branch(code, ctx, branch_op, target) {
-    let taken = _fresh(ctx);
-    let done = _fresh(ctx);
+    let fallthrough = _fresh(ctx);
+    let inverse = if branch_op == 36 { 37 } else { 36 };
     array_push(code, map{ op: 46 });                   // original, duplicate
     array_push(code, map{ op: 45 });                   // original, is_nil(duplicate)
-    array_push(code, map{ op: branch_op, jmp: taken });
-    array_push(code, map{ op: 11 });                   // discard predicate
-    array_push(code, map{ op: 35, jmp: done });
-    array_push(code, map{ label: taken });
-    array_push(code, map{ op: 11 });                   // discard predicate
+    array_push(code, map{ op: inverse, jmp: fallthrough });
+    array_push(code, map{ op: 11 });                   // taken: discard predicate
     array_push(code, map{ op: 35, jmp: target });
-    array_push(code, map{ label: done });
+    array_push(code, map{ label: fallthrough });
+    array_push(code, map{ op: 11 });                   // fallthrough: discard predicate
 }
 
 // Highest local slot referenced anywhere in `ins` (incl. inlined OP_TRY
@@ -211,24 +207,17 @@ fn _max_local_slot(ins, consts) {
 fn _lower_inst(code, inst, ctx, pool, coff, lbl_at, scratch, len_idx) {
     let op = inst.op;
 
-    // Colon calls consult optional class metadata before falling back to the
-    // receiver map. Self-hosted GET_ATTR yields nil when that key is absent;
-    // native GET_ATTR throws. Catch only this reserved lookup, not the method
-    // call/arguments. GET_ATTR consumes exactly one operand on either path;
-    // the handler truncates without growing the stack, then pushes the error.
-    // Replacing that error with nil therefore restores one result, with no
-    // extra receiver reference or scratch-local writes.
+    // Optional metadata retains native Module support as well as map lookup.
+    // Put the missing-key handler after normal frame code: successful lookups
+    // no longer jump over cold recovery instructions on every method call.
     if op == 29 and pool[coff + inst.operand] == "__class" {
         let missing = _fresh(ctx);
-        let done = _fresh(ctx);
+        let resume = _fresh(ctx);
         array_push(code, map{op:23, jmp:missing});
         array_push(code, map{op:16, n:coff + inst.operand});
         array_push(code, map{op:24});
-        array_push(code, map{op:35, jmp:done});
-        array_push(code, map{label:missing});
-        array_push(code, map{op:11});
-        array_push(code, map{op:0, n:1}); // pool[1] is the frame's nil constant
-        array_push(code, map{label:done});
+        array_push(code, map{label:resume});
+        array_push(ctx.recoveries, map{missing:missing, resume:resume});
         return;
     }
 
@@ -364,8 +353,8 @@ fn _lower(code, chunk, ctx, pool, scratch, len_idx, drop_last_ret) {
     i = 0;
     while i < n {
         if map_has(lbl_at, str(i)) { array_push(code, map{ label: lbl_at[str(i)] }); }
-        let skip = drop_last_ret and i == n - 1 and ins[i].op == 19;   // trailing OP_RETURN
-        if not skip {
+        // Inline try/catch bodies must not return from the enclosing frame.
+        if not (drop_last_ret and i == n - 1 and ins[i].op == 19) {
             _lower_inst(code, ins[i], ctx, pool, coff, lbl_at, scratch, len_idx);
         }
         i = i + 1;
@@ -430,7 +419,7 @@ fn _emit_chunk(out, chunk, is_top, arity) {
 
     // Lower the chunk to label IR (this also merges chunk constants into `pool`).
     let body = [];
-    let ctx = map{ n: 0 };
+    let ctx = map{ n: 0, recoveries: [] };
     _lower(body, chunk, ctx, pool, scratch, len_idx, false);
 
     // Assemble: entry placeholders, then the lowered body, then (top) a return.
@@ -442,6 +431,20 @@ fn _emit_chunk(out, chunk, is_top, arity) {
     if is_top and _last_real_op(code) != 33 {
         array_push(code, map{ op: 0, n: nil_idx });    // OpConstant nil
         array_push(code, map{ op: 33 });               // OpReturn
+    }
+
+    // Recovery islands share this frame's pool and locals, including inlined
+    // try chunks. Neither a return nor ordinary fallthrough may enter them.
+    if len(ctx.recoveries) > 0 {
+        let end = _fresh(ctx);
+        if _last_real_op(code) != 33 { array_push(code, map{op:35, jmp:end}); }
+        for recovery in ctx.recoveries {
+            array_push(code, map{label:recovery.missing});
+            array_push(code, map{op:11});       // discard this lookup's error
+            array_push(code, map{op:0, n:nil_idx});
+            array_push(code, map{op:35, jmp:recovery.resume});
+        }
+        array_push(code, map{label:end});
     }
 
     // Resolve labels -> instruction indices.
