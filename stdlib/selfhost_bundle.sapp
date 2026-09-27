@@ -11,13 +11,20 @@
 // top-level code is concatenated (its globals run in the one shared namespace);
 // after a module's init we synthesize `__bundle_N = map{ name: <global name>, ... }`
 // from its defined globals, and every `import("path")` call site in main is
-// rewritten in place to push `__bundle_N`. Correctness is guaranteed by REJECTING
-// (ok:false) any program where this could alias: a name defined by two modules,
+// rewritten in place to push `__bundle_N`. Known namespace conflicts are rejected
+// (ok:false): a name defined by two modules,
 // a module global that shadows a builtin, an unresolvable path, a compile error,
-// or a module that itself imports (nested). On ok:false the caller simply keeps
-// using runtime-resolved import (still correct, just not self-contained).
+// or an unsupported import site. Transitive top-level imports are supported.
+// On ok:false no artifact is available: callers must not silently fall back.
+// Modules initialize before main in dependency order and share globals. This
+// is an explicit static-linking profile, not general runtime-import equivalence.
+// Limits: 64 modules, depth 32, 16 MiB/1,048,576 tokens for main; 1 MiB/65,536 per module;
+// 20 MiB aggregate UTF-8 source.
+// Resolver work/allocations and filesystem reads occur outside these limits.
 
-let _fe  = import("stdlib/compiler/selfhost_frontend.sapp");
+let _SOURCE = import("stdlib:compiler/checked_source.sapp");
+let _TYPES = import("stdlib:compiler/typeck.sapp");
+let _CODE = import("stdlib:compiler/codegen.sapp");
 let _blt = import("stdlib/compiler/builtins_list.sapp");
 let _TO_PBCK = import("stdlib/selfhost_to_pbck.sapp");
 let _SELFHOST_PBCK = import("stdlib/selfhost_pbck.sapp");
@@ -31,13 +38,6 @@ let OP_CALL = 18;
 let OP_MAKE_ARRAY = 25;
 let OP_MAKE_MAP = 26;
 
-fn _is_ident_char(c) {
-    if c == "" { return false; }
-    let code = strcharcodeat(c, 0);
-    return (code >= 48 and code <= 57) or (code >= 65 and code <= 90)
-        or (code >= 97 and code <= 122) or code == 95 or code >= 128;
-}
-
 fn _canonical_path(path) {
     if str_starts_with(path, "stdlib:") {
         return "stdlib/" + str_slice(path, 7, len(path));
@@ -45,70 +45,52 @@ fn _canonical_path(path) {
     return path;
 }
 
-// Source scan for real import("PATH") expressions. Comments and unrelated
-// string literals are skipped, so documentation examples cannot create fake
-// dependency cycles. Paths are canonicalized before de-duplication.
-fn _find_imports(src) {
-    let out = [];
-    let seen = map{};
-    let marker = "import(\"";
-    let n = len(src);
-    let i = 0;
-    while i < n {
-        let c = str_slice(src, i, i + 1);
-        let next = if i + 1 < n { str_slice(src, i + 1, i + 2) } else { "" };
-        if c == "/" and next == "/" {
-            i = i + 2;
-            while i < n and str_slice(src, i, i + 1) != "\n" { i = i + 1; }
-        } else if c == "/" and next == "*" {
-            i = i + 2;
-            while i + 1 < n and not (
-                str_slice(src, i, i + 1) == "*"
-                and str_slice(src, i + 1, i + 2) == "/"
-            ) {
-                i = i + 1;
+// Inspect compiler instructions, never source substrings. Every reference to
+// import must be a direct literal call; aliases and computed paths cannot be
+// rewritten without changing runtime behavior. Nested imports are unsupported.
+fn _find_imports(chunk) {
+    if _has_nested_import(chunk) { throw "bundle: nested import unsupported"; }
+    let out = []; let seen = map{}; let i = 0;
+    let ins = chunk.instructions;
+    while i < len(ins) {
+        if ins[i].op == OP_GET_GLOBAL and chunk.constants[ins[i].operand] == "import" {
+            if i + 2 >= len(ins) or ins[i + 1].op != OP_CONSTANT
+                or ins[i + 2].op != OP_CALL or ins[i + 2].operand != 1 {
+                throw "bundle: static import required";
             }
-            if i + 1 < n { i = i + 2; }
-        } else if c == "\"" {
-            i = i + 1;
-            let escaped = false;
-            while i < n {
-                let sc = str_slice(src, i, i + 1);
-                if escaped {
-                    escaped = false;
-                } else if sc == "\\" {
-                    escaped = true;
-                } else if sc == "\"" {
-                    i = i + 1;
-                    break;
-                }
-                i = i + 1;
+            let path = chunk.constants[ins[i + 1].operand];
+            if type(path) != "string" or len(path) == 0 or len(path) > 4096
+                or str_contains(path, strfromcharcode(0)) {
+                throw "bundle: invalid import path";
             }
-        } else if i + len(marker) <= n
-           and (i == 0 or not _is_ident_char(str_slice(src, i - 1, i)))
-           and str_slice(src, i, i + len(marker)) == marker {
-            let j = i + len(marker);
-            let start = j;
-            let escaped = false;
-            while j < n {
-                let pc = str_slice(src, j, j + 1);
-                if escaped {
-                    escaped = false;
-                } else if pc == "\\" {
-                    escaped = true;
-                } else if pc == "\"" {
-                    break;
-                }
-                j = j + 1;
-            }
-            let path = _canonical_path(str_slice(src, start, j));
+            path = _canonical_path(path);
             if not map_has(seen, path) { seen[path] = true; array_push(out, path); }
-            i = j + 1;
-        } else {
-            i = i + 1;
-        }
+            i = i + 3;
+        } else { i = i + 1; }
     }
     return out;
+}
+
+fn _compile(source, budget, main = false) {
+    let cap = if main { 16777216 } else { 1048576 };
+    if type(source) != "string" or len(source) > cap {
+        throw "bundle: invalid source";
+    }
+    // Encode only after the per-source scalar bound. Count UTF-8 bytes across
+    // the whole graph, including main, before parsing or retaining a new chunk.
+    budget.bytes = budget.bytes + len(str_to_bytes(source));
+    if budget.bytes > 20971520 { throw "bundle: source budget exceeded"; }
+    let ast = if main { _SOURCE.parse_linked_source(source) } else { _SOURCE.parse_source(source) };
+    if len(ast.stmts) == 0 or len(_TYPES.type_check(ast.stmts)) != 0 {
+        throw "bundle: source check failed";
+    }
+    let chunk = _CODE.compile_stmts(ast.stmts);
+    for name in _defined_globals(chunk) {
+        if name == "import" or str_starts_with(name, "__bundle_") {
+            throw "bundle: reserved global";
+        }
+    }
+    return chunk;
 }
 
 // Top-level globals a chunk DEFINEs (OP_DEFINE_GLOBAL name), minus __exports__.
@@ -281,33 +263,31 @@ fn _err(reason) { return map{ ok: false, reason: reason }; }
 // deps-first (post-order) order so a module is appended after every module it
 // imports. Cycles and resolve/compile errors are reported via `errbox.err`
 // (pblang `catch` doesn't bind the error, so we thread errors through a box).
-fn _collect(path, resolve, reg, visiting, order, errbox) {
+fn _collect(path, resolve, reg, visiting, order, errbox, budget, depth) {
     path = _canonical_path(path);
     if errbox.err != nil { return; }
     if map_has(reg, path) { return; }
-    if map_has(visiting, path) { errbox.err = "import cycle at " + str(path); return; }
+    if map_has(visiting, path) { errbox.err = "import cycle"; return; }
+    if depth > 32 or budget.modules >= 64 { errbox.err = "module graph limit exceeded"; return; }
+    budget.modules = budget.modules + 1;
     visiting[path] = true;
     let src = try resolve(path) catch nil;
-    if src == nil { errbox.err = "cannot resolve import: " + str(path); return; }
-    let cr = _fe.frontend_compile(src);
-    if not cr.ok {
-        errbox.err = "module failed to compile: " + str(path)
-            + " diagnostics=" + str(cr.diagnostics);
-        return;
-    }
-    if _has_nested_import(cr.chunk) { errbox.err = "import inside a function/block not supported (use a top-level import) in " + str(path); return; }
-    let deps = _find_imports(src);
+    if src == nil { errbox.err = "cannot resolve import"; return; }
+    let chunk = try _compile(src, budget) catch nil;
+    if chunk == nil { errbox.err = "module source rejected"; return; }
+    let deps = try _find_imports(chunk) catch nil;
+    if deps == nil { errbox.err = "unsupported module import"; return; }
     let i = 0;
     while i < len(deps) {
-        _collect(deps[i], resolve, reg, visiting, order, errbox);
+        _collect(deps[i], resolve, reg, visiting, order, errbox, budget, depth + 1);
         if errbox.err != nil { return; }
         i = i + 1;
     }
     // `defined` (ALL globals) drives shared-namespace collision detection;
     // `visible` (only exported names, or all if no `export`) is what the bundle's
-    // import map exposes, so a module's private globals stay private — matching
-    // runtime import semantics.
-    reg[path] = map{ path: path, chunk: cr.chunk, defined: _defined_globals(cr.chunk), visible: _visible_globals(cr.chunk) };
+    // import map exposes. Other globals are absent from that map, but the shared
+    // namespace is not an isolation boundary between mutually untrusted sources.
+    reg[path] = map{ path: path, chunk: chunk, defined: _defined_globals(chunk), visible: _visible_globals(chunk) };
     array_push(order, path);
     map_remove(visiting, path);
 }
@@ -315,11 +295,13 @@ fn _collect(path, resolve, reg, visiting, order, errbox) {
 // Link `main_src` + its (transitive) imports into one self-hosted chunk.
 // `resolve(path)` returns the module source for an import path, or nil if missing.
 fn bundle(main_src, resolve) {
-    let paths = _find_imports(main_src);
+    let budget = map{ bytes: 0, modules: 0 };
+    let main_chunk = try _compile(main_src, budget, true) catch nil;
+    if main_chunk == nil { return _err("main source rejected"); }
+    let paths = try _find_imports(main_chunk) catch nil;
+    if paths == nil { return _err("unsupported main import"); }
     if len(paths) == 0 {
-        let only = _fe.frontend_compile(main_src);
-        if not only.ok { return _err("main failed to compile"); }
-        return map{ ok: true, chunk: only.chunk, modules: 0 };
+        return map{ ok: true, chunk: main_chunk, modules: 0 };
     }
 
     // Resolve the whole dependency tree, deps-first.
@@ -329,7 +311,7 @@ fn bundle(main_src, resolve) {
     let errbox = map{ err: nil };
     let pi = 0;
     while pi < len(paths) {
-        _collect(paths[pi], resolve, reg, visiting, order, errbox);
+        _collect(paths[pi], resolve, reg, visiting, order, errbox, budget, 1);
         if errbox.err != nil { return _err(errbox.err); }
         pi = pi + 1;
     }
@@ -342,23 +324,20 @@ fn bundle(main_src, resolve) {
         let di = 0;
         while di < len(mod.defined) {
             let nm = mod.defined[di];
-            if _blt.is_builtin_name(nm) { return _err("module global shadows builtin '" + str(nm) + "' in " + str(mod.path)); }
-            if map_has(all_defined, nm) { return _err("global name collision '" + str(nm) + "' (" + str(all_defined[nm]) + " and " + str(mod.path) + ")"); }
+            if _blt.is_builtin_name(nm) { return _err("module global shadows builtin"); }
+            if map_has(all_defined, nm) { return _err("module global name collision"); }
             all_defined[nm] = mod.path;
             di = di + 1;
         }
         oi = oi + 1;
     }
 
-    // Compile main; its own top-level globals must not collide with module globals.
-    let mc = _fe.frontend_compile(main_src);
-    if not mc.ok { return _err("main failed to compile"); }
-    if _has_nested_import(mc.chunk) { return _err("import inside a function/block not supported (use a top-level import) in main"); }
-    let main_defined = _defined_globals(mc.chunk);
+    // Main was checked before any resolver callback.
+    let main_defined = _defined_globals(main_chunk);
     let mdi = 0;
     while mdi < len(main_defined) {
         if map_has(all_defined, main_defined[mdi]) {
-            return _err("main global collides with a module global '" + str(main_defined[mdi]) + "'");
+            return _err("main global collides with a module global");
         }
         mdi = mdi + 1;
     }
@@ -371,13 +350,13 @@ fn bundle(main_src, resolve) {
     let m = 0;
     while m < len(order) {
         let mod = reg[order[m]];
-        if not _append(merged, mod.chunk, bundle_map, nil_idx) { return _err("unresolved import in module: " + str(mod.path)); }
+        if not _append(merged, mod.chunk, bundle_map, nil_idx) { return _err("unresolved module import"); }
         let bn = _emit_export_map(merged, mod.visible, "__bundle_" + str(m));
         bundle_map[mod.path] = bn;
         m = m + 1;
     }
 
-    if not _append(merged, mc.chunk, bundle_map, nil_idx) {
+    if not _append(merged, main_chunk, bundle_map, nil_idx) {
         return _err("unresolved import call site in main");
     }
 
