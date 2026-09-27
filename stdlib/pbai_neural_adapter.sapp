@@ -215,7 +215,7 @@ fn session(train_examples, validation_examples, options = nil) {
 export session;
 
 // Diagnostic distillation: a rank-1 student learns a caller-selected rank-2 teacher.
-// Handles retain private in-memory weights; no checkpoint or activation operations.
+// Handles retain private in-memory weights; checkpoints export only on explicit calls.
 fn _distill_metrics(model, teacher, initial, student, examples) {
     let teacher_loss=0.0;let initial_loss=0.0;let student_loss=0.0;
     let teacher_correct=0;let initial_correct=0;let student_correct=0;
@@ -315,6 +315,7 @@ fn _distill(teacher_artifact, training, validation, options, supervised) {
         report.data_scope="explicit-caller-token-examples-and-teacher-probabilities";
     }
     return map{report:report,
+        checkpoint:fn() {return _student_artifact(student,sha256(json_stringify(model)));},
         predict:fn(ids) {
             if not _ids(ids) {throw "invalid student input";}
             let raw=AD.logits(model,ATT.head_hidden(model,ids),student);
@@ -329,3 +330,71 @@ fn _distill(teacher_artifact, training, validation, options, supervised) {
     };
 }
 export distill, distill_supervised;
+
+// Rank-1 fixed-point checkpoints have a distinct format from rank-2 teachers.
+let STUDENT_FORMAT="pbai.neural.student-checkpoint.v1";
+let STUDENT_PROFILE="tiny-token-8-context-4-seed-77-rank-1-alpha-2-q6-v1";
+fn _student_identity(base_digest,a,b,steps) {
+    return sha256(json_stringify([STUDENT_FORMAT,STUDENT_PROFILE,base_digest,a,b,steps]));
+}
+fn _student_artifact(ad, base_digest) {
+    let a=_quantize(ad.a_matrix);let b=_quantize(ad.b_matrix);
+    return map{format:STUDENT_FORMAT,profile:STUDENT_PROFILE,base_digest:base_digest,
+        a:a,b:b,steps:ad.steps,digest:_student_identity(base_digest,a,b,ad.steps)};
+}
+fn valid_student_artifact(value) {
+    if not _keys(value,["format","profile","base_digest","a","b","steps","digest"]) {return false;}
+    if value.format!=STUDENT_FORMAT or value.profile!=STUDENT_PROFILE {return false;}
+    if type(value.base_digest)!="string" or len(value.base_digest)!=64
+        or type(value.digest)!="string" or len(value.digest)!=64 {return false;}
+    if not _number(value.steps,0,4096,true) or not _matrix(value.a,8,1,10000000000,true)
+        or not _matrix(value.b,1,8,10000000000,true) {return false;}
+    return value.base_digest==sha256(json_stringify(_model()))
+        and value.digest==_student_identity(value.base_digest,value.a,value.b,value.steps);
+}
+fn student_encode(artifact) {
+    if not valid_student_artifact(artifact) {throw "invalid student checkpoint";}
+    // Validation proves a fixed, acyclic shape before serialization.
+    return json_stringify(artifact);
+}
+fn student_decode(text) {
+    if type(text)!="string" or len(text)>4096 {throw "invalid student checkpoint encoding";}
+    let SER=import("stdlib:serialization.sapp");
+    let parsed=SER.parse_safe(text,"json",map{max_input_bytes:4096,max_depth:4,max_items:64,
+        max_lines:128,max_line_bytes:4096,strict:true,reject_duplicate_keys:true});
+    if not parsed.ok {throw "invalid student checkpoint encoding";}
+    if not valid_student_artifact(parsed.value) {throw "invalid student checkpoint";}
+    return parsed.value;
+}
+fn student_load(artifact) {
+    if not valid_student_artifact(artifact) {throw "invalid student checkpoint";}
+    let model=_model();let initial=AD.lm_head_adapter(model,1,2.0,1901);
+    let student=AD.from_state(initial,_dequantize(artifact.a),_dequantize(artifact.b),0,artifact.steps,artifact.steps);
+    let digest=artifact.digest;let base_digest=artifact.base_digest;
+    return map{
+        report:map{format:"pbai.neural.student-load.v1",artifact_digest:digest,
+            trainable_parameters:16,steps:artifact.steps,fixed_point_scale:1000000,
+            artifact_authenticated:false,training_data_authenticated:false,
+            exact_student_input_disjointness_checked:false,independent_provenance_verified:false,
+            persists_weights:false,globally_activated:false,authorizes_activation:false},
+        checkpoint:fn() {return _student_artifact(student,base_digest);},
+        predict:fn(ids) {
+            if not _ids(ids) {throw "invalid student input";}
+            let raw=AD.logits(model,ATT.head_hidden(model,ids),student);
+            return map{format:"pbai.neural.student-checkpoint.prediction.v1",token:CORE.argmax(raw),
+                logits:raw,artifact_digest:digest,trainable_parameters:16,
+                artifact_authenticated:false,globally_activated:false,authorizes_action:false};
+        },
+        evaluate:fn(examples) {
+            _examples(examples);
+            let pair=AD.evaluate_pair(model,initial,student,ATT.adapter_hidden,examples);
+            return map{format:"pbai.neural.student-checkpoint.evaluation.v1",examples:len(examples),
+                initial_student:_metric_copy(pair.baseline),student:_metric_copy(pair.candidate),
+                initial_student_correct_regressions:pair.baseline_correct_regressions,
+                exact_student_input_disjointness_checked:false,teacher_training_overlap_checked:false,
+                independent_provenance_verified:false,artifact_authenticated:false,
+                authorizes_activation:false,globally_activated:false};
+        }
+    };
+}
+export valid_student_artifact, student_encode, student_decode, student_load;

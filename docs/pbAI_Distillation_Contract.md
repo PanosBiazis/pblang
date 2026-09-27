@@ -35,7 +35,8 @@ Frozen hidden vectors and teacher target distributions are computed once for eac
 training context. Only student factors update; teacher and base weights remain
 unchanged. Validation labels do not enter the training loop. Evaluation uses the
 actual private floating-point student weights; unlike the teacher artifact, this
-student handle is not an exported or reloadable fixed-point checkpoint.
+student handle retains full-precision weights. Its explicit `checkpoint()` operation
+exports a separate fixed-point representation; see [student checkpoints](pbAI_Student_Checkpoints.md).
 
 The low-level `soft_target_loss` and `train_soft_step` validate bounded probability
 vectors (up to 65536 entries), normalized mass, learning rate and temperature.
@@ -105,7 +106,7 @@ See [measurements](benchmarks/pbai_distillation_release-2026-09-27.json) and
 No chat ingestion, file/network access, model registration, persistent checkpoint
 change or tool authorization occurs through this operation. Teacher training/test
 overlap and independent provenance remain unverified. Semantic dataset separation,
-persistent student artifacts, production replacement gates,
+production replacement gates,
 representative language evaluation and other devices remain separate work. No AGI,
 ASI, general language competence or universal-platform claim follows from this fixture.
 

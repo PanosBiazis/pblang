@@ -56,10 +56,12 @@ validation does not replace the specialist's fixed-shape boundary.
 
 ## Results, privacy and interpretation
 
-The handle exposes only `report`, `predict(ids)` and diagnostic `evaluate(examples)`.
-Weights stay private and in memory; no activation, export or persistence operation
-is provided. Returned objects and later mutations of inputs cannot change them.
-No file, network, chat ingestion, registry or training telemetry is added. Numeric
+The handle exposes `report`, `predict(ids)`, diagnostic `evaluate(examples)` and
+explicit `checkpoint()`. Training retains private in-memory weights; optional
+[checkpoint export and file persistence](pbAI_Student_Checkpoints.md) are separate
+caller-invoked operations, with no activation. Returned objects and later mutations of inputs cannot change them.
+Training adds no file writes, network calls, chat ingestion, registry changes or
+telemetry. Numeric
 labels, model outputs, weights and hashes can still encode information: reports
 are not automatically anonymous or suitable for public logging.
 
@@ -92,7 +94,7 @@ additional tests verify joint clipping, unchanged legacy updates, correction of 
 wrong teacher, validation-label isolation, strict boundaries and private handles.
 This synthetic tiny-token experiment does not establish language competence, AGI,
 ASI, universal device support or production readiness. Representative datasets,
-independent provenance, persistent student artifacts and production replacement
+independent provenance and production replacement
 gates remain separate work.
 
 Measured on the recorded Linux runtime, all three variants obtained 8/16 correct.
