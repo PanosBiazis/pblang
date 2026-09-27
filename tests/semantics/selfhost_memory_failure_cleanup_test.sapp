@@ -1,0 +1,77 @@
+let VM=import("stdlib:compiler/vm.sapp");
+let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let E=import("stdlib:compiler/vm_memory.sapp");
+fn chunk(source) {
+    let result=F.frontend_compile(source);
+    assert(result.ok,"fixture compiles");
+    return result.chunk;
+}
+fn execute(code,ctx,bounded) {
+    return if bounded {VM.run_seeded_bounded(code,map{},nil,ctx)} else {VM.run_seeded(code,map{},ctx)};
+}
+let setup=chunk("memory_alloc(7); push_lifetime(); borrow_immutable(1); memory_alloc(9);");
+let failures=["memory_get(nil);","memory_get(99);","memory_set(1,8);",
+    "memory_free(1);","borrow_mutable(1);","memory_alloc(map{});",
+    "memory_alloc(1,2);","memory_release(2,0);","memory_stats(1);",
+    "pop_lifetime(); pop_lifetime();","memory_borrow(1,2);"];
+for source in failures {
+    let code=chunk(source);
+    for bounded in [false,true] {
+        for automatic in [false,true] {
+            let ctx=VM.execution_context(automatic);
+            execute(setup,ctx,bounded); let memory=ctx.memory;
+            assert((try {execute(code,ctx,bounded);false} catch true),"memory failure propagates");
+            assert(memory.closed==automatic,"only owned escaping failure closes");
+            if automatic {
+                assert(len(memory.owners)==0 and len(memory.borrows)==0 and len(memory.frames)==0 and len(memory.scopes)==0,"all indexes reclaimed");
+                assert(memory.reclaimed==2,"reclaim each owner once");
+                assert(len(memory.failure)>0,"controlled reason retained");
+            }
+            VM.close_execution(ctx);
+            assert(memory.reclaimed==2 and ctx.memory==nil,"explicit close remains idempotent");
+        }
+    }
+}
+for source in [
+    "print try memory_get(nil) catch memory_get(h);",
+    "print try {try memory_get(nil) catch memory_get(99);} catch memory_get(h);",
+    "fn bad(){memory_get(nil);} print try bad() catch memory_get(h);",
+    "print try {memory_get(nil);} catch {let get=memory_get;get(h)};"
+] {
+    for bounded in [false,true] {
+        let ctx=VM.execution_context(true);
+        let result=execute(chunk("let h=memory_alloc(11);"+source),ctx,bounded);
+        assert(result.output==[11] and not ctx.memory.closed,"outer handler retains live ownership");
+        assert(ctx.handlers==0,"handler count restored");
+        // A caught failure must not suppress cleanup of a subsequent escape.
+        let memory=ctx.memory;
+        assert((try {execute(chunk("memory_get(nil);"),ctx,bounded);false} catch true),"later escape");
+        assert(memory.closed and memory.reclaimed==1,"later escape reclaims once");
+        VM.close_execution(ctx);
+    }
+}
+// Aliases and nested calls follow the same private memory dispatch.
+for source in ["let get=memory_get;get(nil);","fn bad(){memory_get(nil);}bad();",
+    "try memory_get(nil) catch memory_get(99);"] {
+    let ctx=VM.execution_context(true);execute(setup,ctx,false);let memory=ctx.memory;
+    assert((try {execute(chunk(source),ctx,false);false} catch true),"nested memory escape");
+    assert(memory.closed and memory.reclaimed==2,"nested escape reclaims");
+    VM.close_execution(ctx);
+}
+// Direct engine users retain caller-owned behavior unless explicitly opted in.
+let direct=E.new_state();E.dispatch(direct,"memory_alloc",[1],1,true);
+assert((try E.dispatch(direct,"memory_get",[nil],1) catch true)==true,"direct default failure");
+assert(not direct.closed,"default dispatch resets prior policy");
+E.dispatch(direct,"memory_stats",[],1,true);
+assert((try E.unwind(direct,2) catch true)==true,"explicit unwind boundary failure");
+assert(not direct.closed,"unwind is caller owned");
+E.close(direct);
+for row in [["next_owner","memory_alloc",[1]],["next_borrow","borrow_immutable",[1]],["next_scope","push_lifetime",[]]] {
+    let state=E.new_state();E.dispatch(state,"memory_alloc",[1],1);
+    state[row[0]]=9007199254740992;
+    let name=row[1];let args=row[2];
+    assert((try E.dispatch(state,name,args,1,true) catch true)==true,"identity exhaustion");
+    assert(state.closed and state.reclaimed==1,"identity failure cleanup");
+}
+assert(F.frontend_run("print memory_stats().total_locations;").output==[0],"fresh run independent");
+print "selfhost_memory_failure_cleanup_pass";

@@ -107,6 +107,27 @@ flag is not a guest capability. Explicitly supplied default contexts must still
 be closed by the caller. The context and active-handler count must never be
 mutated concurrently, shared by simultaneous executions, or exposed to guest code.
 
+Controlled ownership failures (invalid handles, conflicting borrows, unsupported
+values, arity, exhausted IDs and lifetime boundaries) now also close the private
+engine state before escaping an owned execution. The original `self-host memory:`
+reason is retained, including when cleanup itself fails. A guest handler prevents
+whole-execution cleanup; once that handler is removed, a failure from its catch
+body closes the state unless another outer handler remains. Aliased builtins and
+nested guest calls use the same dispatch policy.
+
+The private engine's `dispatch(state, name, args, floor, close_on_failure=false)`
+keeps its four-argument caller-owned behavior. The VM supplies the fifth argument
+from its ownership flag and current handler count. Each synchronous dispatch
+replaces the private policy; explicit `unwind` resets it to caller-owned behavior.
+No callback or reference to the VM context is stored in the engine, avoiding a new
+context/engine reference cycle. This is not a synchronization primitive: the
+existing rule against concurrent sharing of an execution context still applies.
+After a controlled escape, an explicitly retained context may reference the
+**closed, emptied state** until `close_execution` clears that reference. Do not
+resume an execution that has ended; create a fresh context. Closing again is
+idempotent. Implicit host failure before reaching the controlled `fail` function
+is outside this guarantee.
+
 Implicit host failures, quota failures and arbitrary FFI exceptions are not
 covered by this path. A host failure during cleanup is suppressed to retain the
 original guest exception; complete reclamation in that case is not guaranteed.
@@ -143,3 +164,10 @@ See [validation and migration gaps](SELFHOST_MEMORY_VALIDATION_2026-09-15.md).
 Regression coverage: `tests/semantics/selfhost_throw_cleanup_test.sapp`. The
 `examples/selfhost_throw_cleanup/main.sapp` driver shows automatic frontend
 behavior and the explicit orchestration option.
+
+Controlled-memory regression coverage:
+`tests/semantics/selfhost_memory_failure_cleanup_test.sapp`; runnable example:
+`examples/selfhost_throw_cleanup/memory_failure.sapp`. The suite covers bounded
+and ordinary routes, nested handlers, caller-owned contexts, ID exhaustion and
+idempotent closing. This does not activate the PBLang VM inside applications
+that still use the retained host directly.
