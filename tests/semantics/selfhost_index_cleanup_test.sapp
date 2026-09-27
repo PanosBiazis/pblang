@@ -1,0 +1,87 @@
+// Automatic owned cleanup for guest indexing; borrowed/caught state stays live.
+let V=import("stdlib:compiler/vm.sapp");
+let F=import("stdlib:compiler/selfhost_frontend.sapp");
+fn compiled(source) {let r=F.frontend_compile(source);assert(r.ok,"fixture compiles");return r.chunk;}
+let setup=compiled("let h=memory_alloc(7);push_lifetime();borrow_immutable(h);memory_alloc(9);");
+fn context(automatic) {let c=V.execution_context(automatic);V.run_seeded(setup,map{},c);return c;}
+fn operation(op,object,index,value=nil) {
+    let instructions=[map{op:0,operand:0}];
+    if op==30 {array_push(instructions,map{op:0,operand:2});array_push(instructions,map{op:30,operand:1});}
+    elif op==26 {instructions=[map{op:0,operand:1},map{op:0,operand:2},map{op:26,operand:1}];}
+    else {
+        array_push(instructions,map{op:0,operand:1});
+        if op==28 {array_push(instructions,map{op:0,operand:2});}
+        array_push(instructions,map{op:op,operand:0});
+    }
+    return map{constants:[object,index,value],instructions:instructions};
+}
+let failures=[
+ [27,[],map{},nil],[27,[1],1,nil],[27,[1],-1,nil],
+ [27,map{},"missing",nil],[27,map{},7,nil],
+ [27,"λ",2,nil],[27,"λ",map{},nil],[27,nil,0,nil],
+ [28,[1],map{},9],[28,[1],2,9],[28,[1],-1,9],
+ [28,map{},7,9],[28,map{__frozen:true,value:1},"value",9],[28,"text",0,9],
+ [30,nil,"value",9],[30,map{},7,9],[30,map{__frozen:true},"value",9],
+ [26,nil,7,9]
+];
+for bounded in [false,true] {
+    for automatic in [false,true] {
+        for row in failures {
+            let c=context(automatic);let memory=c.memory;let before=str(row[1]);
+            let chunk=operation(row[0],row[1],row[2],row[3]);
+            let failed=false;
+            if bounded {try V.run_seeded_bounded(chunk,map{},nil,c) catch {failed=true;};}
+            else {try V.run_seeded(chunk,map{},c) catch {failed=true;};}
+            assert(failed,"invalid access must fail");
+            assert(str(row[1])==before,"failed write cannot mutate target");
+            if automatic {
+                assert(c.memory==nil and memory.closed and memory.reclaimed==2,"owned failure reclaims all scopes");
+                assert(len(memory.owners)==0 and len(memory.borrows)==0,"owners and borrows cleared");
+            } else {assert(c.memory!=nil and not memory.closed,"borrowed context remains owned by caller");}
+            V.close_execution(c);assert(memory.reclaimed==2,"close remains idempotent");
+        }
+    }
+    // A handled guest error must not close memory needed by its catch body.
+    for source in [
+        "let h=memory_alloc(11);let a=[];print try a[1] catch memory_get(h);",
+        "let h=memory_alloc(11);let a=[];print try {a[2]=9;} catch memory_get(h);",
+        "let h=memory_alloc(11);let a=[];print try {try a[1] catch a[2]} catch memory_get(h);"
+    ] {
+        let c=V.execution_context(true);let chunk=compiled(source);
+        let result=nil;
+        if bounded {result=V.run_seeded_bounded(chunk,map{},nil,c);} else {result=V.run_seeded(chunk,map{},c);}
+        assert(result.output==[11] and c.handlers==0 and not c.memory.closed,"caught access retains usable memory");
+        V.close_execution(c);
+    }
+}
+// After a handled error, the outer frame's ownership policy still applies.
+for source in [
+    "let a=[];print try a[1] catch 7;print a[2];",
+    "fn failing(){let a=[];print a[1];}print try {throw 7;} catch failing();"
+] {
+    let escape_context=context(true);let saved=escape_context.memory;
+    let chunk=compiled(source);
+    assert((try {V.run_seeded(chunk,map{},escape_context);false} catch true),"post-handler failure escapes");
+    assert(saved.closed and escape_context.memory==nil and escape_context.handlers==0,"post-handler cleanup");
+}
+// Already evaluated guest operands are never rerun by failure cleanup.
+let effect_context=context(true);let globals=map{};let owned=effect_context.memory;
+let effects=compiled("let calls=0;fn object(){calls=calls+1;return [];}fn index(){calls=calls+1;return 4;}print object()[index()];");
+assert((try {V.run_seeded(effects,globals,effect_context);false} catch true),"side-effect fixture fails");
+assert(globals.calls==2 and owned.closed,"each operand evaluated once");
+// Fault injection: secondary cleanup failure cannot make an invalid write succeed.
+let damaged=context(true);let state=damaged.memory;state.reclaimed=map{};let unchanged=[1];
+assert((try {V.run_seeded(operation(28,unchanged,2,9),map{},damaged);false} catch true),"secondary cleanup failure still throws");
+assert(unchanged==[1],"cleanup failure does not change target");
+state.reclaimed=0;V.close_execution(damaged);assert(state.closed,"fault fixture released after repair");
+// Existing conversions, Unicode, frozen-map checks and append behavior are host-owned.
+for row in [[27,[7],0.9,7],[27,"λβ",1.9,"β"],[27,map{a:9},"a",9]] {
+    let c=context(true);let chunk=operation(row[0],row[1],row[2]);array_push(chunk.instructions,map{op:19,operand:0});
+    let r=V.run_seeded_bounded(chunk,map{},nil,c);assert(r.value==row[3],"read compatibility");V.close_execution(c);
+}
+for op in [28,30] {
+    let c=context(true);let object=if op==28 {[7]} else {map{}};let index=if op==28 {1.9} else {"a"};
+    V.run_seeded(operation(op,object,index,9),map{},c);
+    assert(object[if op==28 {1} else {"a"}]==9 and not c.memory.closed,"successful write preserved");V.close_execution(c);
+}
+print "selfhost_index_cleanup_pass";
