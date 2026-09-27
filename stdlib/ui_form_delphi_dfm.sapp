@@ -47,6 +47,7 @@ fn _source_name(value) {
 
 fn _normalize_source(source) {
     if type(source) != "string" { return _result_error("source-type"); }
+    if len(source) > MAX_SOURCE_CHARS { return _result_error("source-too-large"); }
     let bytes = str_to_bytes(source);
     if len(bytes) > MAX_SOURCE_BYTES or len(source) > MAX_SOURCE_CHARS {
         return _result_error("source-too-large");
@@ -248,6 +249,13 @@ fn _event_name(property_name) {
     return try names[str_lower(property_name)] catch nil;
 }
 
+fn _lfm_widget_kind(class_name) {
+    let classes = map{tpanel:"panel",tbutton:"button",tlabel:"label",tedit:"textbox",
+        tmemo:"textarea",tcheckbox:"checkbox",tradiobutton:"radio",
+        tcombobox:"select",ttrackbar:"slider",tprogressbar:"progress"};
+    return try classes[str_lower(class_name)] catch nil;
+}
+
 fn _number_property(object, name, fallback) {
     let value = try object.properties[str_lower(name)] catch fallback;
     if type(value) != "number" { return fallback; }
@@ -258,8 +266,9 @@ fn _property(object, name, fallback) {
     return try object.properties[str_lower(name)] catch fallback;
 }
 
-fn _map_widget(object) {
-    let kind = _widget_kind(object.class_name);
+fn _map_widget(object, dialect) {
+    let kind = if dialect == "lazarus-lfm" { _lfm_widget_kind(object.class_name) }
+        else { _widget_kind(object.class_name) };
     if kind == nil { return map{ok:false,error:"unsupported-component-class"}; }
     let width = _number_property(object, "Width", if kind == "label" { 80 } else { 96 });
     let height = _number_property(object, "Height", if kind == "panel" { 100 } else { 24 });
@@ -312,7 +321,7 @@ fn _map_widget(object) {
         w:width,h:height,props:props,events:object.events}};
 }
 
-fn _canonical_document(objects, source_name, state) {
+fn _canonical_document(objects, source_name, state, dialect) {
     let root = objects[0];
     let width = _number_property(root, "ClientWidth", _number_property(root, "Width", 480));
     let height = _number_property(root, "ClientHeight", _number_property(root, "Height", 320));
@@ -320,11 +329,11 @@ fn _canonical_document(objects, source_name, state) {
     let design = map{form:map{title:title,w:width,h:height},widgets:[],model:map{}};
     let i = 1;
     while i < len(objects) {
-        let mapped = _map_widget(objects[i]);
+        let mapped = _map_widget(objects[i], dialect);
         if not mapped.ok { return _result_error(mapped.error); }
         array_push(design.widgets, mapped.widget); i = i + 1;
     }
-    let document = try UI.from_design(design, "delphi-dfm") catch nil;
+    let document = try UI.from_design(design, dialect) catch nil;
     if document == nil { return _result_error("canonical-validation-failed"); }
     let checked = UI.validate(document);
     if not checked.ok { return _result_error("canonical-validation-failed"); }
@@ -353,7 +362,7 @@ fn sniff_text(source) {
     return _result_error("content-signature-mismatch");
 }
 
-fn import_text(source, logical_name = "form.dfm") {
+fn _import_text(source, logical_name, dialect) {
     if not _source_name(logical_name) { return _result_error("invalid-source-name"); }
     let normalized = _normalize_source(source); if not normalized.ok { return normalized; }
     let lines = str_split(normalized.text, "\n");
@@ -371,6 +380,18 @@ fn import_text(source, logical_name = "form.dfm") {
         else {
             let declaration = _object_declaration(line);
             if declaration != nil {
+                if dialect == "lazarus-lfm" {
+                    if declaration.keyword != "object" {
+                        return _result_error("lfm-inheritance-unsupported");
+                    }
+                    if len(objects) == 0 {
+                        if not regex_match(declaration.class_name, "^TForm[0-9]{0,8}$") {
+                            return _result_error("lfm-root-class-unsupported");
+                        }
+                    } else if _lfm_widget_kind(declaration.class_name) == nil {
+                        return _result_error("unsupported-component-class");
+                    }
+                }
                 if len(stack) >= MAX_DEPTH { return _result_error("object-depth-exceeded"); }
                 if len(objects) >= MAX_OBJECTS { return _result_error("too-many-objects"); }
                 let folded = str_lower(declaration.name);
@@ -433,6 +454,8 @@ fn import_text(source, logical_name = "form.dfm") {
                         "visible","enabled","taborder","align","anchors","text","texthint","readonly","passwordchar",
                         "lines.strings","items.strings","itemindex","checked","min","max","position"];
                     let recognized = false; for item in known { if item == folded { recognized = true; } }
+                    if dialect == "lazarus-lfm" and (folded == "align" or folded == "anchors"
+                        or folded == "taborder") { recognized = false; }
                     if not recognized { state.unmapped_properties = state.unmapped_properties + 1; }
                 }
             }
@@ -441,7 +464,68 @@ fn import_text(source, logical_name = "form.dfm") {
     }
     if len(objects) == 0 { return _result_error("root-declaration-required"); }
     if len(stack) != 0 or not state.root_closed { return _result_error("unterminated-object"); }
-    return _canonical_document(objects, logical_name, state);
+    return _canonical_document(objects, logical_name, state, dialect);
+}
+
+fn import_text(source, logical_name = "form.dfm") {
+    return _import_text(source, logical_name, "delphi-dfm");
+}
+
+// Separate entry point: no caller-supplied dialect policy or source rewriting.
+fn import_lfm_text(source, logical_name = "form.lfm") {
+    let valid_name = type(logical_name) == "string" and len(logical_name) <= 255
+        and regex_match(logical_name, "^[A-Za-z0-9_][A-Za-z0-9_.-]*\\.lfm$");
+    let result = if valid_name { _import_text(source, logical_name, "lazarus-lfm") }
+        else { _result_error("invalid-source-name") };
+    result.format = "pblang.lazarus-lfm-import.v1";
+    if not result.ok and result.error == "binary-dfm-unsupported" {
+        result.error = "binary-lfm-unsupported";
+        result.diagnostics = [result.error];
+    }
+    if result.ok {
+        let dropped_handlers = 0;
+        for widget in result.document.widgets {
+            dropped_handlers = dropped_handlers + len(map_keys(widget.events));
+            widget.events = map{};
+        }
+        result.unmapped_event_count = result.unmapped_event_count + dropped_handlers;
+        // Rebuild canonical accounting after removing foreign handler identifiers.
+        result.document = UI.validate(result.document).document;
+        result.foreign_handlers_omitted = true;
+        // Pascal inheritance, event bodies and widgetset behavior are not imported.
+        result.lossy = true;
+        result.source_semantics_preserved = false;
+        result.root_class_verified = false;
+        result.production_ready = false;
+    }
+    return result;
+}
+
+fn sniff_lfm_text(source) {
+    let normalized = _normalize_source(source);
+    if not normalized.ok {
+        normalized.format = "pblang.lazarus-lfm-signature.v1";
+        if normalized.error == "binary-dfm-unsupported" {
+            normalized.error = "binary-lfm-unsupported"; normalized.diagnostics = [normalized.error];
+        }
+        return normalized;
+    }
+    let lines = str_split(normalized.text, "\n");
+    if len(lines) > MAX_LINES { return map{ok:false,error:"too-many-lines"}; }
+    for raw_line in lines {
+        if len(raw_line) > MAX_LINE_CHARS { return map{ok:false,error:"line-too-large"}; }
+        let line = str_trim(raw_line);
+        if line != "" {
+            let root = _object_declaration(line);
+            if root == nil or root.keyword != "object"
+                or not regex_match(root.class_name, "^TForm[0-9]{0,8}$") {
+                return map{ok:false,error:"content-signature-mismatch"};
+            }
+            return map{ok:true,format:"pblang.lazarus-lfm-signature.v1",text_lfm:true,
+                signature_only:true,validated:false,dialect_identity_verified:false};
+        }
+    }
+    return map{ok:false,error:"content-signature-mismatch"};
 }
 
 fn status() {
@@ -455,3 +539,4 @@ fn status() {
 
 export FORMAT, MAX_SOURCE_BYTES, MAX_SOURCE_CHARS, MAX_LINES, MAX_OBJECTS, MAX_DEPTH;
 export sniff_text, import_text, status;
+export import_lfm_text, sniff_lfm_text;
