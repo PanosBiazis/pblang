@@ -1,0 +1,194 @@
+// Renderer-neutral, bounded literal-cell document. No formula evaluation or I/O.
+let Serialization=import("stdlib:serialization.sapp");
+let FORMAT="pblang.sheet-document.v1";
+let MAX_ROWS=32; let MAX_COLUMNS=8; let MAX_CELL_BYTES=256;
+let MAX_TOTAL_BYTES=8192; let MAX_FILE_BYTES=65536;
+
+fn _integer(value,low,high) {
+    return type(value)=="number" and value==value and value>=low and value<=high
+        and value==num_floor(value);
+}
+fn validate(doc) {
+    if type(doc)!="map" or len(map_keys(doc))!=2 or not map_has(doc,"format")
+        or not map_has(doc,"cells") or doc.format!=FORMAT or type(doc.cells)!="array"
+        or len(doc.cells)<1 or len(doc.cells)>MAX_ROWS { throw "invalid sheet document"; }
+    let columns=0; let total=0;
+    for row in doc.cells {
+        if type(row)!="array" or len(row)<1 or len(row)>MAX_COLUMNS { throw "invalid sheet row"; }
+        if columns==0 { columns=len(row); }
+        if len(row)!=columns { throw "sheet rows must be rectangular"; }
+        for value in row {
+            if type(value)!="string" or len(value)>MAX_CELL_BYTES { throw "invalid cell text"; }
+            let bytes=len(str_to_bytes(value)); total=total+bytes;
+            if bytes>MAX_CELL_BYTES or total>MAX_TOTAL_BYTES { throw "sheet text limit exceeded"; }
+            if str_contains(value,"\u0000") { throw "NUL is not supported in cells"; }
+        }
+    }
+    return map{rows:len(doc.cells),columns:columns,text_bytes:total};
+}
+fn create(rows=16,columns=8) {
+    if not _integer(rows,1,MAX_ROWS) or not _integer(columns,1,MAX_COLUMNS) {
+        throw "invalid sheet dimensions";
+    }
+    let cells=[];
+    for r in range(0,rows) {
+        let row=[]; for c in range(0,columns) { array_push(row,""); }
+        array_push(cells,row);
+    }
+    return map{format:FORMAT,cells:cells};
+}
+fn copy(doc) {
+    validate(doc); let cells=[];
+    for source in doc.cells {
+        let row=[]; for value in source { array_push(row,value); }
+        array_push(cells,row);
+    }
+    return map{format:FORMAT,cells:cells};
+}
+// Append blank axes or remove only empty trailing cells. Never truncate content.
+fn resize(doc,rows,columns) {
+    let size=validate(doc);
+    if not _integer(rows,1,MAX_ROWS) or not _integer(columns,1,MAX_COLUMNS) {
+        throw "invalid sheet dimensions";
+    }
+    for r in range(0,size.rows) { for c in range(0,size.columns) {
+        if (r>=rows or c>=columns) and doc.cells[r][c]!="" {
+            throw "resize would remove nonempty trailing cells";
+        }
+    } }
+    let candidate=create(rows,columns);
+    for r in range(0,size.rows) { for c in range(0,size.columns) {
+        if r<rows and c<columns { candidate.cells[r][c]=doc.cells[r][c]; }
+    } }
+    validate(candidate); return candidate;
+}
+fn edit(doc,changes) {
+    let size=validate(doc);
+    if type(changes)!="array" or len(changes)>32 { throw "at most 32 edits per transaction"; }
+    let candidate=copy(doc); let seen=map{};
+    for change in changes {
+        if type(change)!="map" or len(map_keys(change))!=3
+            or not map_has(change,"row") or not map_has(change,"column") or not map_has(change,"value")
+            or not _integer(change.row,0,size.rows-1) or not _integer(change.column,0,size.columns-1)
+            or type(change.value)!="string" or len(change.value)>MAX_CELL_BYTES {
+            throw "invalid cell edit";
+        }
+        let key=str(change.row)+":"+str(change.column);
+        if map_has(seen,key) { throw "duplicate cell edit"; }
+        seen[key]=true; candidate.cells[change.row][change.column]=change.value;
+    }
+    validate(candidate); return candidate;
+}
+fn _limits() {
+    return map{max_input_bytes:MAX_FILE_BYTES,max_output_bytes:MAX_FILE_BYTES,
+        max_line_bytes:MAX_FILE_BYTES,max_depth:4,max_items:1200,
+        strict:true,reject_duplicate_keys:true};
+}
+fn encode(doc) {
+    let result=Serialization.stringify_safe(copy(doc),"json",_limits());
+    if not result.ok or len(str_to_bytes(result.value))>MAX_FILE_BYTES { throw "sheet serialization failed"; }
+    return result.value;
+}
+fn decode(text) {
+    let parsed=Serialization.parse_safe(text,"json",_limits());
+    if not parsed.ok or parsed.duplicate_keys_checked!=true { throw "invalid sheet file"; }
+    return copy(parsed.value);
+}
+fn sum_column(doc,column) {
+    let stats=stats_column(doc,column);
+    return map{value:stats.sum,numeric_cells:stats.numeric_cells};
+}
+// One coordinate per matching cell, not per occurrence. No normalization or I/O.
+fn _query(query) {
+    if type(query)!="string" or len(query)==0 or len(query)>MAX_CELL_BYTES
+        or len(str_to_bytes(query))>MAX_CELL_BYTES or str_contains(query,"\u0000") {
+        throw "invalid sheet search text";
+    }
+}
+fn find(doc,query) {
+    let size=validate(doc); _query(query);
+    let matches=[];
+    for r in range(0,size.rows) { for c in range(0,size.columns) {
+        if str_contains(doc.cells[r][c],query) {
+            array_push(matches,map{row:r,column:c});
+        }
+    } }
+    return matches;
+}
+// Replace non-overlapping occurrences in original cells, never in inserted text.
+// Candidate byte budgets are checked before concatenation, not after expansion.
+fn replace_all(doc,query,replacement) {
+    let size=validate(doc); _query(query);
+    if type(replacement)!="string" or len(replacement)>MAX_CELL_BYTES
+        or len(str_to_bytes(replacement))>MAX_CELL_BYTES or str_contains(replacement,"\u0000") {
+        throw "invalid sheet replacement text";
+    }
+    let candidate=create(size.rows,size.columns);
+    let query_length=len(query); let replacement_bytes=len(str_to_bytes(replacement));
+    let total=0; let matched_cells=0; let replacements=0;
+    for r in range(0,size.rows) { for c in range(0,size.columns) {
+        let text=doc.cells[r][c]; let output=""; let cell_bytes=0; let i=0; let matched=false;
+        while i<len(text) {
+            let piece=""; let piece_bytes=0;
+            if str_slice(text,i,i+query_length)==query {
+                piece=replacement; piece_bytes=replacement_bytes;
+                i=i+query_length; replacements=replacements+1; matched=true;
+            } else {
+                piece=str_slice(text,i,i+1); piece_bytes=len(str_to_bytes(piece)); i=i+1;
+            }
+            if piece_bytes>MAX_CELL_BYTES-cell_bytes or piece_bytes>MAX_TOTAL_BYTES-total {
+                throw "sheet replacement text limit exceeded";
+            }
+            output=output+piece; cell_bytes=cell_bytes+piece_bytes; total=total+piece_bytes;
+        }
+        candidate.cells[r][c]=output;
+        if matched { matched_cells=matched_cells+1; }
+    } }
+    validate(candidate);
+    return map{document:candidate,matched_cells:matched_cells,replacements:replacements};
+}
+fn _stats(doc,index,column_axis) {
+    let size=validate(doc);
+    let index_limit=if column_axis {size.columns} else {size.rows};
+    if not _integer(index,0,index_limit-1) { throw "invalid sheet statistics index"; }
+    let total=0; let count=0; let minimum=nil; let maximum=nil;
+    let length=if column_axis {size.rows} else {size.columns};
+    for offset in range(0,length) {
+        let text=str_trim(if column_axis {doc.cells[offset][index]} else {doc.cells[index][offset]});
+        if text!="" {
+            let value=_decimal(text);
+            if type(value)=="number" {
+                if value!=value or value>1000000000000 or value< -1000000000000 {
+                    throw "numeric cell is outside the supported sum range";
+                }
+                total=total+value; count=count+1;
+                if minimum==nil or value<minimum { minimum=value; }
+                if maximum==nil or value>maximum { maximum=value; }
+            }
+        }
+    }
+    return map{sum:total,numeric_cells:count,
+        mean:if count>0 {total/count} else {nil},min:minimum,max:maximum};
+}
+fn stats_column(doc,column) { return _stats(doc,column,true); }
+fn stats_row(doc,row) { return _stats(doc,row,false); }
+
+// Deliberately small decimal grammar: optional sign, one dot, ASCII digits.
+// Text, formulas, exponents and nonfinite names are not numeric cells here.
+fn _decimal(text) {
+    if len(text)>32 { return nil; }
+    let i=0; let digits=0; let dot=false;
+    if str_slice(text,0,1)=="+" or str_slice(text,0,1)=="-" { i=1; }
+    while i<len(text) {
+        let ch=str_slice(text,i,i+1);
+        if ch=="." and not dot { dot=true; }
+        elif str_index_of("0123456789",ch)>=0 { digits=digits+1; }
+        else { return nil; }
+        i=i+1;
+    }
+    if digits==0 { return nil; }
+    return parse_number(text);
+}
+
+export FORMAT,MAX_ROWS,MAX_COLUMNS,MAX_CELL_BYTES,MAX_TOTAL_BYTES,MAX_FILE_BYTES;
+export create,validate,copy,edit,resize,encode,decode,sum_column,stats_column,stats_row,find,replace_all;
