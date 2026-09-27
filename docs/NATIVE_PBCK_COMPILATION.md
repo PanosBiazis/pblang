@@ -119,3 +119,31 @@ modules with and without exported class metadata, invalid metadata, single
 evaluation, argument order, thrown errors and real pipeline workers. `native_pbck_cli_live_test.sapp` verifies option/diagnostic failures,
 output preservation, execution and capability denial. These live tests explicitly
 skip non-Linux systems; they are not proof of Windows/macOS compatibility.
+
+## Automatic guest-index failure cleanup
+
+The PBLang interpreter (`compiler/vm.sapp`) now closes its private scalar lifetime
+state when an uncaught guest index read/write fails and that context has
+`close_on_throw` enabled. Internally owned runs already enable this policy.
+Explicitly borrowed contexts retain their existing default of caller-owned cleanup.
+No `--entry`/`--cleanup` option is required for this automatic path.
+
+Covered operations are guest index reads, index assignments, attribute assignments
+lowered to index writes, and map-key construction. This does not change successful
+index semantics, numeric truncation, Unicode indexing, frozen-map rejection, growth
+limits, or guest catch behavior. Caught failures leave the execution's resources
+available to the handler. Only an escaping failure closes the complete context.
+
+On the retained host these primitives invoke no guest callbacks and their reported
+errors occur before writes. The cold failure path repeats only the failed primitive
+on its already-evaluated operands after cleanup; it never reruns an operand expression
+or the guest program. This preserves the host's error message, including errors that
+PBLang catch cannot bind. Cleanup invokes no guest callbacks and its state must remain
+private; embedding code must not alias an execution context into guest objects.
+Native backend changes adding observable index hooks would require revalidating this
+assumption. Tests compare the original messages against the prior implementation.
+
+This is not a universal host-error handler, general cycle collection, or cleanup of
+native FFI crashes. It does not cover every malformed raw chunk, builtin error,
+process exit, OOM or hardware failure. See `examples/index_cleanup.sapp` and
+`tests/semantics/selfhost_index_cleanup_test.sapp` for the tested ownership rules.
