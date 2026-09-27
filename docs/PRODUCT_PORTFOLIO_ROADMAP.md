@@ -126,4 +126,8 @@ PBWords adds local Writer vocabulary worksheets with exact-form frequencies, blo
 
 ## Category count worksheets
 
-PBTally adds exact-category counts and two-axis cross-tabs with native/CLI preview and new-copy table exports. PBDataLab can export selected-column counts without changing source/undo/saved state. Shared table grouping indexes each axis once; the portable cell reader preserves full selected-row text. See `TABLE_GROUPING_AND_TALLY.md` for model bounds, measured scope and platform evidence. Numeric aggregations, larger tables and portable file editing remain future work.
+PBTally adds exact-category counts and two-axis cross-tabs with native/CLI preview and new-copy table exports. PBDataLab can export selected-column counts without changing source/undo/saved state. Shared table grouping indexes each axis once; the portable cell reader preserves full selected-row text. See `TABLE_GROUPING_AND_TALLY.md` for model bounds, measured scope and platform evidence. Exact numeric aggregations are now delivered below; larger tables and portable file editing remain future work.
+
+## Exact numeric category summaries
+
+PBGroupStats adds a dedicated native/CLI worksheet for exact decimal Count/Sum/Min/Max by category. PBTally gains the same numeric mode alongside existing counts/cross-tabs. Shared `table_group_stats` reuses the native decimal type and existing grouping; `table_stats_view` supplies the dedicated workspace and portable reader. See `TABLE_NUMERIC_GROUPS.md`. Input is bounded and strict; no implicit zero, skipping, rounding, unit inference or new file format. Web/Android remain selected-row snapshots; larger streaming tables and installed cross-platform editions remain future work.
