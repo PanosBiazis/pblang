@@ -1,0 +1,70 @@
+if platform()!="linux" {print "native_bundle_cleanup_skip_linux_required";os_exit(0);}
+let N=import("stdlib:compiler/native_bundle.sapp");
+let B=import("stdlib:selfhost_bundle.sapp");
+let UUID=import("stdlib:uuid.sapp");
+let exe=env_get("PBLANG_BIN") ?? path_join(cwd(),"target/release/pblang");
+let base="bundle_cleanup_"+UUID.v4();let artifact=base+".pbck";let resource=base+".txt";
+let resolves=0;
+fn execute(bytes,permission="--sandbox") {
+    fs_write_bytes(artifact,bytes);
+    return proc_spawn_wait("/usr/bin/timeout",["-k","1s","10s",exe,"run",artifact,permission]);
+}
+// Keep exported names and entry callbacks distinct in the shared namespace.
+fn compile_module(body,cleanup,initial="") {
+    return N.compile_bundle_with_cleanup("let api=import(\"virtual\");fn work(){api.module_work();}fn release(){api.module_release();}",fn(path){
+        return initial+"fn module_work(){"+body+"}fn module_release(){"+cleanup+"}export module_work,module_release;";
+    },"work","release");
+}
+fn check(body,cleanup,stdout,message=nil,initial="",permission="--sandbox") {
+    let result=execute(compile_module(body,cleanup,initial),permission);
+    assert(result.stdout==stdout,"cleanup once/in order: "+result.stdout+result.stderr);
+    if message==nil {assert(result.exit_code==0,"successful bundle: "+result.stderr);}
+    else {
+        assert(result.exit_code!=0 and str_contains(result.stderr,message),"primary failure: "+result.stderr);
+        if message!="SECONDARY" {assert(not str_contains(result.stderr,"SECONDARY"),"secondary cleanup failure must not replace primary");}
+    }
+}
+fn exercise() {
+    for value in ["nil","false","7","[1,2]","map{v:7}"] {
+        check("print \"WORK\";return "+value+";","print \"CLEAN\";","WORK\nCLEAN\n");
+    }
+    check("for i 1 {let p=map{run:fn(self){return 7;}};print (try {p:run()} catch 9);}","print \"CLEAN\";","7\nCLEAN\n");
+    check("throw \"ORIGINAL\";","print \"CLEAN\";throw \"SECONDARY\";","CLEAN\n","ORIGINAL");
+    check("error(\"ORIGINAL\");","print \"CLEAN\";error(\"SECONDARY\");","CLEAN\n","ORIGINAL");
+    check("let a=[];print a[map{}];","print \"CLEAN\";throw \"SECONDARY\";","CLEAN\n","array index must be number");
+    check("fs_read(\"private_canary\");","print \"CLEAN\";","CLEAN\n","fs access denied");
+    check("print (try {throw \"handled\";} catch 7);","print \"CLEAN\";","7\nCLEAN\n");
+    check("print \"WORK\";","throw \"SECONDARY\";","WORK\n","SECONDARY");
+    check("release=fn(){print \"WRONG\";};throw \"ORIGINAL\";","print \"CLEAN\";","CLEAN\n","ORIGINAL");
+    // Module initialization precedes the entry boundary: do not claim cleanup here.
+    check("print 7;","print \"CLEAN\";","","INIT","throw \"INIT\";");
+    // A real external effect is performed once, then removed by explicit cleanup.
+    check("fs_write(\""+resource+"\",\"synthetic\");throw \"ORIGINAL\";",
+        "assert(fs_read(\""+resource+"\")==\"synthetic\");fs_remove(\""+resource+"\");print \"CLEAN\";",
+        "CLEAN\n","ORIGINAL","","--allow-all");
+    assert(not fs_exists(resource),"owned file removed after failure");
+    let valid="let api=import(\"virtual\");fn work(){}fn release(){}";
+    for names in [["work","work"],["missing","release"],["work","missing"],["work();private_canary();","release"],["work",nil]] {
+        resolves=0;let result=B.bundle_with_cleanup(valid,fn(path){resolves=resolves+1;return "let leaf=7;";},names[0],names[1]);
+        assert(not result.ok and resolves==0,"invalid callbacks refused before resolving dependencies");
+        assert(not str_contains(result.reason,"private_canary"),"private failure text");
+    }
+    for invalid in ["fn work(x){}fn release(){}", "fn work(){}fn release(x){}", "fn work(){}fn release(){}let __bundle_x=7;", "fn work(){}fn release(){} /* private_canary"] {
+        assert(not B.bundle_with_cleanup(invalid,fn(path){return nil;},"work","release").ok,"invalid guarded main");
+    }
+    // Dependency declarations must not satisfy absent main callback declarations.
+    assert(not B.bundle_with_cleanup("let a=import(\"virtual\");",fn(path){return "fn work(){}fn release(){}";},"work","release").ok,"callbacks belong to main");
+    let result=execute(N.compile_bundle_with_cleanup("fn work(){print 7;}fn release(){print 8;}// trailing comment",fn(path){return nil;},"work","release"));
+    assert(result.exit_code==0 and result.stdout=="7\n8\n","zero modules and trailing comment");
+    let transitive=N.compile_bundle_with_cleanup("let outer=import(\"branch\");fn work(){outer.branch_work();}fn release(){print \"CLEAN\";}",fn(path){
+        if path=="branch" {return "let inner=import(\"leaf\");fn branch_work(){inner.leaf_work();}export branch_work;";}
+        return "fn leaf_work(){throw \"TRANSITIVE\";}export leaf_work;";
+    },"work","release");
+    result=execute(transitive);
+    assert(result.exit_code!=0 and result.stdout=="CLEAN\n" and str_contains(result.stderr,"TRANSITIVE"),"guard relocated after transitive modules");
+    let hidden="let p=\"virtual\";let a=import(p);fn work(){}fn release(){}";
+    assert(not B.bundle_with_cleanup(hidden,fn(path){return nil;},"work","release").ok,"guard cannot hide dynamic import");
+}
+let passed=try {exercise();true} catch false;
+for path in [artifact,resource] {try fs_remove(path) catch nil;}
+assert(passed,"native bundle cleanup regression");print "native_bundle_cleanup_pass";
