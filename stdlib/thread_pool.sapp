@@ -9,6 +9,13 @@ let DEFAULT_THREADS = 4;
 let MAX_THREADS = 64;
 let MAX_TASKS = 100000;
 
+// Reuse the dependency within this VM. A new VM/import gets its own binding.
+let _THREAD = nil;
+fn _thread_backend() {
+    if _THREAD == nil { _THREAD = import("stdlib:thread.sapp"); }
+    return _THREAD;
+}
+
 fn _callable(v) {
     let t = type(v);
     return t == "closure" or t == "function" or t == "builtin";
@@ -46,7 +53,7 @@ fn _submit(pool, task_fn, priority) {
     return task_id;
 }
 
-/// Thread pool with work-stealing and dynamic sizing.
+/// Thread pool with stable chunk assignment and explicit sizing.
 /// Usage:
 ///   let tp = import("stdlib:thread_pool.sapp");
 ///   let pool = tp.new();
@@ -225,7 +232,7 @@ fn run_parallel(pool) {
         return map{ completed: 0, failed: 0, results: [] };
     }
 
-    let thread_lib = import("stdlib:thread.sapp");
+    let thread_lib = _thread_backend();
     let pending = [];
     let oi = 0;
     while oi < len(order) {
@@ -396,7 +403,7 @@ fn parallel_map(arr, map_fn, nthreads = 4) {
     if n == 0 { return []; }
     if nthreads > n { nthreads = n; }
 
-    let thread_lib = import("stdlib:thread.sapp");
+    let thread_lib = _thread_backend();
     let chunk_size = num_ceil(n / nthreads);
 
     let handles = [];
@@ -447,7 +454,7 @@ fn parallel_for(start, end, step, body_fn, nthreads = 4) {
     if end <= start { return nil; }
     if end - start > 9007199254740991 { throw "thread_pool.parallel_for: range is too wide"; }
 
-    let thread_lib = import("stdlib:thread.sapp");
+    let thread_lib = _thread_backend();
     let total = num_ceil((end - start) / step);
     if nthreads > total { nthreads = total; }
 
@@ -485,49 +492,86 @@ fn pipeline(data, stages, nthreads = 4) {
     return current;
 }
 
-/// Race multiple async tasks, return the result of the first to complete.
-fn race(task_fns, timeout_ms) {
-    if timeout_ms != nil and (not is_number(timeout_ms) or timeout_ms < 0) {
-        throw "thread_pool: race timeout must be non-negative";
+// All tasks/configuration are checked before the first external effect.
+fn _race_validate(task_fns, timeout_ms) {
+    if not is_array(task_fns) { throw "thread_pool: race tasks must be an array"; }
+    if len(task_fns) > MAX_THREADS { throw "thread_pool: race exceeds 64 workers"; }
+    if timeout_ms != nil {
+        if not is_number(timeout_ms) or timeout_ms - timeout_ms != 0
+            or timeout_ms < 0 or timeout_ms > 2147483647
+            or timeout_ms != num_floor(timeout_ms) {
+            throw "thread_pool: race timeout must be an integer in 0..2147483647";
+        }
     }
-    let thread_lib = import("stdlib:thread.sapp");
-    let handles = [];
-    let finished = [];
-    let i = 0;
-    while i < len(task_fns) {
-        let task_fn = task_fns[i];
+    for task_fn in task_fns {
         if not _callable(task_fn) { throw "thread_pool: race task must be callable"; }
-        let h = thread_lib.go(_make_race_worker(task_fn));
-        array_push(handles, h);
-        array_push(finished, false);
-        i = i + 1;
     }
+}
 
-    // Wait for first result
+fn _race_select(thread_lib, handles, timeout_ms) {
+    let finished = [];
+    for i len(handles) { array_push(finished, false); }
+    let result = map{ready:false, value:nil, index:nil, status:"empty", handles:handles};
+    if len(handles) == 0 { return result; }
+    let completed = 0;
     let start = now_ms();
     while true {
-        let j = 0;
-        let completed = 0;
-        while j < len(handles) {
-            if finished[j] {
-                completed = completed + 1;
-            } else {
-                let ready = try thread_lib.await_timeout(handles[j], 1) catch nil;
-                if ready != nil and ready.ok {
+        for j len(handles) {
+            if not finished[j] {
+                // Poll every candidate without serial per-candidate waits.
+                let ready = thread_lib.await_timeout(handles[j], 0);
+                if ready.ok {
                     finished[j] = true;
                     completed = completed + 1;
-                    let result = ready.value;
-                    if result != nil and result.ok { return result.value; }
+                    if ready.value != nil and ready.value.ok {
+                        result.ready = true;
+                        result.value = ready.value.value;
+                        result.index = j;
+                        result.status = "ready";
+                        return result;
+                    }
                 }
             }
-            j = j + 1;
         }
-        if completed == len(handles) { return nil; }
-        if timeout_ms != nil and now_ms() - start > timeout_ms {
-            break;
+        if completed == len(handles) { result.status = "failed"; return result; }
+        if timeout_ms != nil and now_ms() - start >= timeout_ms {
+            result.status = "timeout"; return result;
         }
+        sleep_ms(1);
     }
-    return nil;
+}
+
+// Early return explicitly transfers ownership of every future to the caller.
+// Selection is first observed success; failures do not win this legacy race.
+fn race_owned(task_fns, timeout_ms = nil) {
+    _race_validate(task_fns, timeout_ms);
+    let thread_lib = _thread_backend();
+    let handles = [];
+    for task_fn in task_fns {
+        _launch_owned(thread_lib, _make_race_worker(task_fn), handles);
+    }
+    let result = try _race_select(thread_lib, handles, timeout_ms) catch nil;
+    if result == nil {
+        for handle in handles { try thread_lib.await(handle) catch nil; }
+        throw "thread_pool: race selection failed";
+    }
+    return result;
+}
+
+// Complete owned effects before discarding the result, including after timeout.
+// Repeated settlement is safe for valid, unmodified results in the owning VM.
+fn settle_race(result) {
+    let thread_lib = _thread_backend();
+    for handle in result.handles { thread_lib.await(handle); }
+    return result;
+}
+
+// Value-only convenience waits for loser cleanup, including on timeout. Use
+// race_owned for early return and eventually settle_race its returned handle set.
+fn race(task_fns, timeout_ms) {
+    let result = race_owned(task_fns, timeout_ms);
+    settle_race(result);
+    return result.value;
 }
 
 /// submit_all(pool, fns) — submit many tasks; returns an array of task ids.
@@ -564,4 +608,4 @@ fn get_status(pool, id) {
 
 export new, new_thread_pool, submit, submit_priority, submit_all, run_all, run_parallel,
        auto_size, shutdown, stats, get_result, get_status,
-       parallel_map, parallel_for, pipeline, race, try_catch, split_tasks;
+       parallel_map, parallel_for, pipeline, race, race_owned, settle_race, try_catch, split_tasks;

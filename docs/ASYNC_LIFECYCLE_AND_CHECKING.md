@@ -944,3 +944,48 @@ uses real workers and joins, and removes its fixture. The example is
 `examples/thread_pool_partition/main.sapp`. No foreign implementation code
 was added. Retained channel registry entries and general runtime/FFI/GC
 cleanup remain separate work.
+
+## Owned first-success races and dependency reuse
+
+`thread_pool.race_owned(tasks, timeout_ms=nil)` starts at most 64 zero-argument
+callables and returns `{ready, value, index, status, handles}`. This helper races
+**successful** outcomes; task/transfer failures do not win. A successful nil or
+false is a ready value. `index` is the zero-based first observed success, not a
+strict chronology of simultaneous completions. Status is `ready`, `timeout`,
+`failed` (all terminal without a success), or `empty`.
+
+All task kinds and the finite whole duration (nil or 0..2147483647 ms) are
+validated before starting any worker. Zero performs one nonblocking selection
+pass; worker creation happens before the selection period. A partial launch or
+catchable selection failure settles every started worker before throwing a
+stable library error. This does not preserve an original host exception value.
+
+**Ownership:** every handle remains with the returned result. Eventually call
+`thread_pool.settle_race(result)` in the creating VM, including after timeout;
+it joins all workers and returns the same result. Repeating settlement is safe
+for unmodified results. Do not transfer these future maps across VMs, concurrently
+mutate them, or consume their channels directly. Cleanup waits for effects; it
+does not cancel workers, roll back work, or stop a nonterminating task.
+
+**Alpha compatibility correction:** the value-only `thread_pool.race` still
+returns the first successful value (or nil), but now settles all workers before
+returning. Consequently loser cleanup may exceed the selection timeout. Previously
+it lost the unreturned worker handles. Call `race_owned` for early return and
+explicit ownership. Races over 64 tasks, fractional/non-finite durations and
+malformed task lists now fail before launch. Empty input still returns immediately.
+The timer uses the retained wall clock, so clock adjustments can change selection
+duration; scheduling and VM teardown also prevent a hard return-time guarantee.
+
+Each selection pass polls all unfinished futures with zero wait, then sleeps
+once if necessary. It no longer waits one millisecond separately for each
+candidate. The dependency on `thread.sapp` is lazily loaded once per owning
+module/VM, shared by map, range, pool and race helpers. A failed import is not
+cached. Empty map/range/pool operations still avoid loading the dependency.
+A new execution is required to pick up dependency changes; this is not live
+module reload or a new runtime-wide cache. Serial `run_all` does not load it.
+
+Tests: `thread_pool_race_ownership_test.sapp` covers success, timeout, malformed
+later task and first/second launch failure with observed real futures, reaping
+workers even against the broken baseline. `thread_pool_race_owned_test.sapp`
+covers ownership transfer, nil/false, failure, empty input and input limits.
+Example: `examples/thread_pool_race_owned/main.sapp`.
