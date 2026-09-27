@@ -135,3 +135,8 @@ PBGroupStats adds a dedicated native/CLI worksheet for exact decimal Count/Sum/M
 ## Explicit free-time windows
 
 PBSlotFinder adds native/CLI search for relative-time gaps inside an explicit window and minimum duration. PBTimeline exposes the same commands and a separate slot workspace. The shared interval analyzer supplies clipped occupancy and boundary gaps; timeline_slots exports generic-labeled copies without reservations. See `TIMELINE_FREE_SLOTS.md` for limits, independent-oracle tests and platform distinctions. Resources, calendars and installed portable releases remain future work.
+
+
+## Study worksheets and supplied answer keys
+
+PBQuiz prepares bounded Writer question worksheets and separate answer keys from existing decks or lessons. PBLesson adds native/CLI worksheet export. Shared study_worksheet and study_worksheet_files compose canonical models and file adapters; text_document gains exact UTF-8-bounded text splitting. See STUDY_WORKSHEETS.md. Explicit ranges, original order/IDs, source preservation and no truncation are retained. Portable readers are snapshots; installed targets, printing, grading and secure examination workflows remain separate work.
