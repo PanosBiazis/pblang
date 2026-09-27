@@ -194,3 +194,7 @@ See `examples/one_line_apps/modern.sapp` for a terminating preview,
 the secure browser preview, `modern_web_export.sapp` creates the static
 artifacts, and `modern_surface.sapp` demonstrates mode selection without
 changing components.
+
+### Contextual control names
+
+Buttons and toggles accept `accessibility_label` for an explicit contextual name without changing visible text. See [Accessible controls](ACCESSIBLE_CONTROLS.md) for validation, keyboard behavior, compatibility and platform coverage.
