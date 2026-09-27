@@ -1,0 +1,76 @@
+let AI=import("stdlib/pbai.sapp");
+let AD=import("stdlib:llm_adapters.sapp");let ATT=import("stdlib:llm_attention.sapp");
+fn rejects(f) {return try {f();false} catch true;}
+assert(not rejects(fn(){return 1;}) and rejects(fn(){throw "expected";}),"calibrated helper");
+let teacher=AI.neural_specialist_train([map{x:[0],y:4}],[map{x:[7,0],y:4}]);
+let student=AI.neural_specialist_distill(teacher.artifact,[[0],[1,0]],[map{x:[7,0],y:4}]);
+let artifact=student.checkpoint();let encoded=AI.neural_specialist_student_encode(artifact);
+let baseline=AI.neural_specialist_student_load(artifact);
+let training=[map{x:[2,0],y:5},map{x:[3,0],y:5}];let validation=[map{x:[4,0],y:5}];let test=[map{x:[5,0],y:5}];
+let options=map{epochs:64,lr:0.1,max_grad_norm:1};let original=json_stringify([artifact,training,validation,options]);
+let candidate=AI.neural_specialist_student_continue(artifact,training,validation,options);
+assert(original==json_stringify([artifact,training,validation,options]),"caller data unchanged");
+assert(candidate.report.prior_steps==artifact.steps and candidate.report.added_steps==128 and candidate.report.total_steps==artifact.steps+128,"cumulative counters preserve checkpoint history");
+assert(candidate.checkpoint().steps==candidate.report.total_steps,"export uses cumulative steps");
+let evaluation=candidate.evaluate(test);
+assert(evaluation.baseline.correct==0 and evaluation.candidate.correct==1 and evaluation.candidate.loss<evaluation.baseline.loss,"continuation learns revised labels");
+assert(baseline.predict([5,0]).token==4 and candidate.predict([5,0]).token==5,"parent remains usable unchanged");
+assert(candidate.evaluate([map{x:[5,0],y:4}]).baseline_correct_regressions==1,"lost old answers remain visible");
+assert(not candidate.report.accepted_for_merge and not candidate.report.persists_weights and not evaluation.prior_training_overlap_checked,"learning does not imply activation or verified historical holdout");
+assert(candidate.report.checkpoint_digest==candidate.checkpoint().digest and candidate.report.checkpoint_weights_changed,"export identity and actual quantized weight change");
+assert(json_stringify(candidate.report)==json_stringify(AI.neural_specialist_student_continue(artifact,training,validation,options).report),"deterministic continuation");
+let revised_valid=AI.neural_specialist_student_continue(artifact,training,[map{x:[4,0],y:1}],options);
+assert(revised_valid.report.student_digest==candidate.report.student_digest,"validation labels do not train or select weights");
+assert(rejects(fn(){candidate.evaluate(training);}) and rejects(fn(){candidate.evaluate(validation);}),"current-run holdout guard");
+assert(rejects(fn(){candidate.evaluate([map{x:[2,0/(0-1)],y:5}]);}),"signed-zero identity guard");
+assert(not candidate.evaluate([map{x:[0],y:5}]).prior_training_overlap_checked,"old training history is explicitly unknown");
+assert(not candidate.report.training.current_run_input_disjointness_checked,"training metric not described as heldout");
+let defaults=AI.neural_specialist_student_continue(artifact,training,validation);
+assert(defaults.report.added_steps==32 and defaults.report.epochs==16 and defaults.report.lr==0.05,"bounded documented defaults");
+// Independent one-update oracle starts with the serialized factors, not a fresh head.
+let single=AI.neural_specialist_student_continue(artifact,[training[0]],validation,map{epochs:1,lr:0.1,max_grad_norm:1});
+let model=ATT.model_new(ATT.config(8,4,8,16,1,1,77));let model_before=json_stringify(model);
+let ad=AD.lm_head_adapter(model,1,2,1901);let a=[];let b=[];
+for row in artifact.a {let values=[];for v in row {push(values,v/1000000);}push(a,values);}
+for row in artifact.b {let values=[];for v in row {push(values,v/1000000);}push(b,values);}
+ad=AD.from_state(ad,a,b,0,artifact.steps,artifact.steps);
+let step=AD.train_supervised_step_clipped(model,ad,ATT.head_hidden(model,training[0].x),[0,0,0,0,0,1,0,0],5,0.1,1,1,1);
+let expected=AD.from_state(ad,step.updated_a_matrix,step.updated_b_matrix,step.loss,step.next_steps,step.next_examples);
+assert(json_stringify(single.predict([5,0]).logits)==json_stringify(AD.logits(model,ATT.head_hidden(model,[5,0]),expected)),"actual update continues serialized weights exactly");
+assert(model_before==json_stringify(model),"reference frozen base unchanged");
+let tiny=AI.neural_specialist_student_continue(artifact,[map{x:[2,0],y:4}],validation,map{epochs:1,lr:0.000001,max_grad_norm:1});
+let old_factors=json_stringify([artifact.a,artifact.b]);let tiny_ck=tiny.checkpoint();
+assert(tiny.report.checkpoint_weights_changed==(old_factors!=json_stringify([tiny_ck.a,tiny_ck.b])),"step metadata never masquerades as quantized learning");
+fn recounter(steps) {
+ let copy=AI.neural_specialist_student_decode(encoded);copy.steps=steps;
+ copy.digest=sha256(json_stringify([copy.format,copy.profile,copy.base_digest,copy.a,copy.b,copy.steps]));return copy;
+}
+let edge=AI.neural_specialist_student_continue(recounter(4095),[training[0]],validation,map{epochs:1,lr:0.1,max_grad_norm:1});
+assert(edge.checkpoint().steps==4096,"exact cumulative ceiling allowed");
+assert(rejects(fn(){AI.neural_specialist_student_continue(edge.checkpoint(),[training[0]],validation,map{epochs:1,lr:0.1,max_grad_norm:1});}),"ceiling cannot reset on resume");
+assert(rejects(fn(){AI.neural_specialist_student_continue(recounter(4095),training,validation,map{epochs:1,lr:0.1,max_grad_norm:1});}),"whole batch rejected before budget overflow");
+let twice=AI.neural_specialist_student_continue(single.checkpoint(),[training[0]],validation,map{epochs:1,lr:0.1,max_grad_norm:1});
+assert(twice.report.prior_steps==artifact.steps+1 and twice.report.total_steps==artifact.steps+2,"chained continuation counters");
+let zero=len([]);
+for key in ["epochs","lr","max_grad_norm"] {for value in [nil,true,"1",0,-1,0/zero,1/zero] {
+ let bad=json_parse(json_stringify(options));bad[key]=value;
+ assert(rejects(fn(){AI.neural_specialist_student_continue(artifact,training,validation,bad);}),"option types and lower bounds");
+}}
+for bad in [map{},map{epochs:129,lr:0.1,max_grad_norm:1},map{epochs:1,lr:0.251,max_grad_norm:1},map{epochs:1,lr:0.1,max_grad_norm:1001},map{epochs:1,lr:0.1,max_grad_norm:1,extra:true}] {
+ assert(rejects(fn(){AI.neural_specialist_student_continue(artifact,training,validation,bad);}),"exact option schema and upper bounds");
+}
+for bad in [nil,[],[map{x:[8],y:5}],[map{x:[0],y:8}],[map{x:[0],y:4},map{x:[0/(0-1)],y:5}]] {
+ assert(rejects(fn(){AI.neural_specialist_student_continue(artifact,bad,validation,options);}),"strict examples");
+}
+let many=[];for i 33 {push(many,map{x:[i%8],y:5});}
+assert(rejects(fn(){AI.neural_specialist_student_continue(artifact,many,validation,options);}),"bounded example count");
+let cyclic=[];push(cyclic,cyclic);
+assert(rejects(fn(){AI.neural_specialist_student_continue(artifact,[map{x:cyclic,y:5}],validation,options);}),"cyclic input rejected");
+assert(rejects(fn(){AI.neural_specialist_student_continue(artifact,training,training,options);}),"training validation disjoint");
+assert(rejects(fn(){AI.neural_specialist_student_continue(teacher.artifact,training,validation,options);}),"wrong checkpoint profile");
+let predicted=json_stringify(candidate.predict([5,0]));let exported=candidate.checkpoint();
+artifact.a[0][0]=0;training[0].x[0]=7;training[0].y=0;validation[0].y=0;options.lr=0.25;candidate.report.total_steps=0;
+exported.a[0][0]=0;let output=candidate.predict([5,0]);output.logits[0]=999;
+assert(predicted==json_stringify(candidate.predict([5,0])),"candidate owns private weights and split identity");
+assert(AI.neural_specialist_student_load(AI.neural_specialist_student_decode(encoded)).predict([5,0]).token==4,"original checkpoint restores original behavior");
+print "pbai_student_continuation_pass";

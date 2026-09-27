@@ -398,3 +398,79 @@ fn student_load(artifact) {
     };
 }
 export valid_student_artifact, student_encode, student_decode, student_load;
+
+// Caller-supplied label updates from an existing fixed-point student. The parent
+// is a read-only baseline; this operation neither writes files nor activates it.
+fn _continuation_metrics(model, baseline, candidate, examples) {
+    let pair=AD.evaluate_pair(model,baseline,candidate,ATT.adapter_hidden,examples);
+    return map{format:"pbai.neural.student-continuation.evaluation.v1",examples:len(examples),
+        baseline:_metric_copy(pair.baseline),candidate:_metric_copy(pair.candidate),
+        baseline_correct_regressions:pair.baseline_correct_regressions,
+        current_run_input_disjointness_checked:true,prior_training_overlap_checked:false,
+        independent_provenance_verified:false,authorizes_activation:false,globally_activated:false};
+}
+fn student_continue(artifact, training, validation, options=nil) {
+    if not valid_student_artifact(artifact) {throw "invalid student checkpoint";}
+    let seen=_examples(training);_examples(validation);
+    for ex in validation {if map_has(seen,_context_key(ex.x)) {throw "continuation validation overlaps training";}}
+    if options==nil {options=map{epochs:16,lr:0.05,max_grad_norm:1};}
+    if not _keys(options,["epochs","lr","max_grad_norm"]) or not _number(options.epochs,1,128,true)
+        or not _number(options.lr,0.000001,0.25) or not _number(options.max_grad_norm,0.000001,1000) {
+        throw "invalid student continuation options";
+    }
+    let added_steps=options.epochs*len(training);
+    if artifact.steps+added_steps>4096 {throw "student checkpoint cumulative step limit exceeded";}
+    let private_train=_copy_examples(training);let private_valid=_copy_examples(validation);
+    let model=_model();let source=AD.lm_head_adapter(model,1,2.0,1901);
+    let baseline=AD.from_state(source,_dequantize(artifact.a),_dequantize(artifact.b),0,artifact.steps,artifact.steps);
+    let candidate=baseline;let hidden=[];let labels=[];
+    for ex in private_train {
+        push(hidden,ATT.head_hidden(model,ex.x));
+        let onehot=[];for i 8 {push(onehot,if i==ex.y {1} else {0});}push(labels,onehot);
+    }
+    let total=0.0;let clipped_steps=0;let largest_norm=0.0;
+    for _epoch options.epochs {for i len(private_train) {
+        // The hard-only endpoint reuses the verified joint factor-gradient clip.
+        let step=AD.train_supervised_step_clipped(model,candidate,hidden[i],labels[i],private_train[i].y,
+            options.lr,1,1,options.max_grad_norm);
+        candidate=AD.from_state(candidate,step.updated_a_matrix,step.updated_b_matrix,step.loss,step.next_steps,step.next_examples);
+        if not _matrix(candidate.a_matrix,8,1) or not _matrix(candidate.b_matrix,1,8) {throw "nonfinite or oversized continuation update";}
+        total=total+step.loss;
+        if step.gradient_clipped {clipped_steps=clipped_steps+1;}
+        if step.gradient_norm>largest_norm {largest_norm=step.gradient_norm;}
+    }}
+    let training_result=_continuation_metrics(model,baseline,candidate,private_train);
+    let validation_result=_continuation_metrics(model,baseline,candidate,private_valid);
+    // These are diagnostics on supplied training/validation, not held-out tests.
+    training_result.current_run_input_disjointness_checked=false;
+    for ex in private_valid {seen[_context_key(ex.x)]=true;}
+    let parent_digest=artifact.digest;let base_digest=artifact.base_digest;
+    let serialized_candidate=_student_artifact(candidate,base_digest);
+    let report=map{format:"pbai.neural.student-continuation.v1",parent_digest:parent_digest,
+        prior_steps:artifact.steps,added_steps:added_steps,total_steps:candidate.steps,
+        epochs:options.epochs,lr:options.lr,max_grad_norm:options.max_grad_norm,
+        online_hard_loss:total/added_steps,clipped_steps:clipped_steps,maximum_unclipped_gradient_norm:largest_norm,
+        training:training_result,validation:validation_result,trainable_parameters:16,base_weights_frozen:true,
+        weights_changed:json_stringify([candidate.a_matrix,candidate.b_matrix])!=json_stringify([baseline.a_matrix,baseline.b_matrix]),
+        student_digest:sha256(json_stringify([candidate.a_matrix,candidate.b_matrix])),
+        checkpoint_digest:serialized_candidate.digest,
+        checkpoint_weights_changed:json_stringify([serialized_candidate.a,serialized_candidate.b])!=json_stringify([artifact.a,artifact.b]),
+        step_budget_scope:"checkpoint-declared-cumulative-steps",global_training_budget_enforced:false,
+        checkpoint_history_authenticated:false,training_data_authenticated:false,prior_training_overlap_checked:false,
+        persists_weights:false,globally_activated:false,authorizes_activation:false,accepted_for_merge:false};
+    return map{report:report,
+        checkpoint:fn() {return _student_artifact(candidate,base_digest);},
+        predict:fn(ids) {
+            if not _ids(ids) {throw "invalid student input";}
+            let raw=AD.logits(model,ATT.head_hidden(model,ids),candidate);
+            return map{format:"pbai.neural.student-continuation.prediction.v1",token:CORE.argmax(raw),logits:raw,
+                trainable_parameters:16,globally_activated:false,authorizes_action:false};
+        },
+        evaluate:fn(examples) {
+            _examples(examples);
+            for ex in examples {if map_has(seen,_context_key(ex.x)) {throw "continuation test overlaps current training or validation";}}
+            return _continuation_metrics(model,baseline,candidate,_copy_examples(examples));
+        }
+    };
+}
+export student_continue;
