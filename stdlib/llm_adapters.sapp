@@ -128,11 +128,11 @@ fn train_step(model, ad, hidden, target_id, lr = 0.01) {
     let raw = logits(model, hidden, ad);
     let loss = core.cross_entropy_from_logits(raw, target_id);
     let dg = _dlogits(raw, target_id);
-    return _train_gradient(ad,hidden,loss,dg,lr);
+    return _train_gradient(ad, hidden, loss, dg, lr);
 }
 
-// Shared analytic factor gradient; the hard-label arithmetic order is unchanged.
-fn _train_gradient(ad,hidden,loss,dg,lr) {
+// Both hard-label and soft-target objectives use the same factor gradients.
+fn _train_gradient(ad, hidden, loss, dg, lr, max_grad_norm=nil) {
     let mid = core.vecmat(hidden, ad.a_matrix);
 
     let through = [];
@@ -148,6 +148,26 @@ fn _train_gradient(ad,hidden,loss,dg,lr) {
         }
         push(through, through_b);
         r = r + 1;
+    }
+
+    // One L2 norm over BOTH factors, before either is updated. Scale by the
+    // largest magnitude before squaring so large finite gradients do not overflow.
+    let gradient_norm=0.0;let gradient_scale=1.0;
+    if max_grad_norm!=nil {
+        let gradients=[];
+        for rank_idx ad.rank {for v len(dg) {push(gradients,mid[rank_idx]*dg[v]*ad.scaling);}}
+        for d len(ad.a_matrix) {for rank_idx ad.rank {push(gradients,hidden[d]*through[rank_idx]);}}
+        let largest=0.0;let magnitude_limit=num_pow(10,150);
+        for g in gradients {
+            if g!=g or g< -magnitude_limit or g>magnitude_limit {throw "nonfinite or oversized adapter gradient";}
+            let magnitude=if g<0 {-g} else {g};if magnitude>largest {largest=magnitude;}
+        }
+        if largest>0 {
+            let squared=0.0;for g in gradients {let scaled=g/largest;squared=squared+scaled*scaled;}
+            gradient_norm=largest*num_sqrt(squared);
+            if gradient_norm>max_grad_norm {gradient_scale=max_grad_norm/gradient_norm;}
+        }
+        lr=lr*gradient_scale;
     }
 
     let next_b = [];
@@ -187,7 +207,7 @@ fn _train_gradient(ad,hidden,loss,dg,lr) {
     let cur_examples = try ad.example_count catch try ad.examples catch 0;
     let next_steps = cur_steps + 1;
     let next_examples = cur_examples + 1;
-    return map{
+    let result=map{
         format: "pblang.llm.lora_train_step.v1",
         mode: "frozen-base-low-rank-lm-head-adapter",
         loss: loss,
@@ -199,6 +219,11 @@ fn _train_gradient(ad,hidden,loss,dg,lr) {
         updated_a_matrix: next_a,
         updated_b_matrix: next_b
     };
+    if max_grad_norm!=nil {
+        result.gradient_norm=gradient_norm;result.gradient_scale=gradient_scale;
+        result.max_grad_norm=max_grad_norm;result.gradient_clipped=gradient_scale<1;
+    }
+    return result;
 }
 
 fn train_epochs(model, ad, forward_hidden_fn, examples, epochs = 1, lr = 0.01, max_steps = 0) {
@@ -222,6 +247,7 @@ fn train_epochs(model, ad, forward_hidden_fn, examples, epochs = 1, lr = 0.01, m
     }
     let avg = 0.0;
     if steps > 0 { avg = total / steps; }
+    // ad already has cumulative counters, including any earlier training run.
     let final_ad = ad;
     return map{
         format: "pblang.llm.lora_training.v1",
@@ -359,17 +385,55 @@ fn _soft_loss(raw, q, temperature) {
 fn soft_target_loss(raw, targets, temperature=1.0) {
     return _soft_loss(raw,_soft_inputs(raw,targets,temperature),temperature);
 }
-fn _soft_step(model, ad, hidden, targets, lr, temperature) {
+fn _soft_step(model, ad, hidden, targets, lr, temperature, max_grad_norm) {
     if type(lr)!="number" {throw "invalid distillation learning rate";}
     if lr!=lr {throw "invalid distillation learning rate";}
     if lr<0.000001 or lr>0.25 {throw "invalid distillation learning rate";}
     let raw=logits(model,hidden,ad);let q=_soft_inputs(raw,targets,temperature);
     let probabilities=core.softmax(raw,temperature);let dg=[];
     for i len(q) {push(dg,temperature*(probabilities[i]-q[i]));}
-    let step=_train_gradient(ad,hidden,_soft_loss(raw,q,temperature),dg,lr);
+    let step=_train_gradient(ad,hidden,_soft_loss(raw,q,temperature),dg,lr,max_grad_norm);
     step.mode="frozen-base-soft-target-distillation";return step;
 }
 fn train_soft_step(model, ad, hidden, targets, lr=0.01, temperature=1.0) {
-    return _soft_step(model,ad,hidden,targets,lr,temperature);
+    return _soft_step(model,ad,hidden,targets,lr,temperature,nil);
 }
-export soft_target_loss, train_soft_step;
+// Explicit opt-in; the legacy SGD path and its exact update order are unchanged.
+fn train_soft_step_clipped(model, ad, hidden, targets, lr, temperature, max_grad_norm) {
+    if type(max_grad_norm)!="number" {throw "invalid gradient norm limit";}
+    if max_grad_norm!=max_grad_norm {throw "invalid gradient norm limit";}
+    if max_grad_norm<0.000001 or max_grad_norm>1000 {throw "invalid gradient norm limit";}
+    return _soft_step(model,ad,hidden,targets,lr,temperature,max_grad_norm);
+}
+export soft_target_loss, train_soft_step, train_soft_step_clipped;
+
+// Explicit supplied labels complement teacher probabilities. Clip the combined
+// factor gradient once; component losses are measured before the update.
+fn train_supervised_step_clipped(model, ad, hidden, targets, target_id, lr, temperature, hard_weight, max_grad_norm) {
+    if type(hard_weight)!="number" {throw "invalid supervised weight";}
+    if hard_weight!=hard_weight or hard_weight<0 or hard_weight>1 {throw "invalid supervised weight";}
+    if type(target_id)!="number" {throw "invalid supervised label";}
+    if target_id!=target_id or target_id<0 or target_id>=len(model.lm_bias) or num_floor(target_id)!=target_id {throw "invalid supervised label";}
+    if type(lr)!="number" {throw "invalid distillation learning rate";}
+    if lr!=lr or lr<0.000001 or lr>0.25 {throw "invalid distillation learning rate";}
+    if type(max_grad_norm)!="number" {throw "invalid gradient norm limit";}
+    if max_grad_norm!=max_grad_norm or max_grad_norm<0.000001 or max_grad_norm>1000 {throw "invalid gradient norm limit";}
+    let raw=logits(model,hidden,ad);let q=_soft_inputs(raw,targets,temperature);
+    let onehot=[];for i len(raw) {push(onehot,if i==target_id {1} else {0});}
+    let soft_loss=_soft_loss(raw,q,temperature);let hard_loss=_soft_loss(raw,onehot,1);
+    let soft_prob=core.softmax(raw,temperature);let hard_gradient=_dlogits(raw,target_id);let dg=[];
+    for i len(q) {
+        let soft_gradient=temperature*(soft_prob[i]-q[i]);
+        let gradient=soft_gradient;
+        if hard_weight==1 {gradient=hard_gradient[i];}
+        if hard_weight>0 and hard_weight<1 {gradient=(1-hard_weight)*soft_gradient+hard_weight*hard_gradient[i];}
+        push(dg,gradient);
+    }
+    let loss=soft_loss;
+    if hard_weight==1 {loss=hard_loss;}
+    if hard_weight>0 and hard_weight<1 {loss=(1-hard_weight)*soft_loss+hard_weight*hard_loss;}
+    let step=_train_gradient(ad,hidden,loss,dg,lr,max_grad_norm);
+    step.mode="frozen-base-supervised-distillation";step.soft_loss=soft_loss;step.hard_loss=hard_loss;step.hard_weight=hard_weight;
+    return step;
+}
+export train_supervised_step_clipped;
