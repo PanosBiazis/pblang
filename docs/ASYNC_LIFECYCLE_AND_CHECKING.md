@@ -1156,3 +1156,12 @@ syntax; use `thread.pipeline_run` for the documented retained-host case.
 
 See `tests/semantics/pool_worker_module_lifetime_test.sapp` and the repeated-batch
 example in `examples/async_data_map/main.sapp`.
+
+## Native execution through the PBLang compiler
+
+The nested `p:run` retained-source compiler issue has a verified alternative:
+compile the source entry with `tools/pbc.sapp --target pbck`, then run the native
+PBCK artifact. The optional class lookup is now translated consistently, including
+loop-local receivers inside nested try blocks and real `thread.pipeline` workers.
+See [commands, permissions, tests and boundaries](NATIVE_PBCK_COMPILATION.md).
+The old direct-source compiler and runtime-imported dependencies are not replaced.
