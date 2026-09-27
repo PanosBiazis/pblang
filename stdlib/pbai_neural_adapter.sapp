@@ -255,11 +255,26 @@ fn distill(teacher_artifact, contexts, validation, options=nil) {
     if type(contexts)!="array" or len(contexts)<1 or len(contexts)>32 {throw "expected 1..32 distillation contexts";}
     let training=[];
     for ids in contexts {if not _ids(ids) {throw "invalid distillation context";}push(training,map{x:ids,y:0});}
+    return _distill(teacher_artifact,training,validation,options,false);
+}
+// Explicit labels are supplied by the caller, not certified as ground truth.
+fn distill_supervised(teacher_artifact, training, validation, options=nil) {
+    if not valid_artifact(teacher_artifact) {throw "invalid distillation teacher artifact";}
+    return _distill(teacher_artifact,training,validation,options,true);
+}
+fn _distill(teacher_artifact, training, validation, options, supervised) {
     let seen=_examples(training);_examples(validation);
     for ex in validation {if map_has(seen,_context_key(ex.x)) {throw "distillation validation overlaps training";}}
-    if options==nil {options=map{epochs:64,lr:0.1,temperature:2.0};}
-    if not _keys(options,["epochs","lr","temperature"]) or not _number(options.epochs,1,128,true)
-        or not _number(options.lr,0.000001,0.25) or not _number(options.temperature,0.25,8) {throw "invalid distillation options";}
+    if supervised {
+        if options==nil {options=map{epochs:64,lr:0.1,temperature:2.0,hard_weight:0.5,max_grad_norm:1.0};}
+        if not _keys(options,["epochs","lr","temperature","hard_weight","max_grad_norm"])
+            or not _number(options.hard_weight,0,1) or not _number(options.max_grad_norm,0.000001,1000) {throw "invalid supervised distillation options";}
+    } else {
+        if options==nil {options=map{epochs:64,lr:0.1,temperature:2.0};}
+        if not _keys(options,["epochs","lr","temperature"]) {throw "invalid distillation options";}
+    }
+    if not _number(options.epochs,1,128,true) or not _number(options.lr,0.000001,0.25)
+        or not _number(options.temperature,0.25,8) {throw "invalid distillation options";}
     let model=_model();let teacher=_adapter(model,teacher_artifact);
     let initial=AD.lm_head_adapter(model,1,2.0,1901);let student=initial;
     let hidden=[];let targets=[];
@@ -267,9 +282,16 @@ fn distill(teacher_artifact, contexts, validation, options=nil) {
         let h=ATT.head_hidden(model,ex.x);push(hidden,h);
         push(targets,CORE.softmax(AD.logits(model,h,teacher),options.temperature));
     }
-    let total=0.0;
+    let total=0.0;let soft_total=0.0;let hard_total=0.0;let clipped_steps=0;let largest_norm=0.0;
     for _epoch options.epochs {for i len(training) {
-        let step=AD.train_soft_step(model,student,hidden[i],targets[i],options.lr,options.temperature);
+        let step=nil;
+        if supervised {
+            step=AD.train_supervised_step_clipped(model,student,hidden[i],targets[i],training[i].y,
+                options.lr,options.temperature,options.hard_weight,options.max_grad_norm);
+            soft_total=soft_total+step.soft_loss;hard_total=hard_total+step.hard_loss;
+            if step.gradient_clipped {clipped_steps=clipped_steps+1;}
+            if step.gradient_norm>largest_norm {largest_norm=step.gradient_norm;}
+        } else {step=AD.train_soft_step(model,student,hidden[i],targets[i],options.lr,options.temperature);}
         student=AD.from_state(student,step.updated_a_matrix,step.updated_b_matrix,step.loss,step.next_steps,step.next_examples);
         if not _matrix(student.a_matrix,8,1) or not _matrix(student.b_matrix,1,8) {throw "nonfinite or oversized student update";}
         total=total+step.loss;
@@ -284,6 +306,14 @@ fn distill(teacher_artifact, contexts, validation, options=nil) {
         teacher_digest:teacher_artifact.digest,student_digest:sha256(json_stringify([student.a_matrix,student.b_matrix])),
         teacher_training_overlap_checked:false,persists_weights:false,globally_activated:false,
         authorizes_activation:false,accepted_for_merge:false,agi_status:"not-demonstrated",asi_status:"not-demonstrated"};
+    if supervised {
+        report.format="pbai.neural.supervised-distillation.v1";
+        report.online_soft_loss=soft_total/student.steps;report.online_hard_loss=hard_total/student.steps;
+        report.online_combined_loss=total/student.steps;report.hard_weight=options.hard_weight;
+        report.max_grad_norm=options.max_grad_norm;report.clipped_steps=clipped_steps;
+        report.maximum_unclipped_gradient_norm=largest_norm;report.training_labels_authenticated=false;
+        report.data_scope="explicit-caller-token-examples-and-teacher-probabilities";
+    }
     return map{report:report,
         predict:fn(ids) {
             if not _ids(ids) {throw "invalid student input";}
@@ -298,4 +328,4 @@ fn distill(teacher_artifact, contexts, validation, options=nil) {
         }
     };
 }
-export distill;
+export distill, distill_supervised;
