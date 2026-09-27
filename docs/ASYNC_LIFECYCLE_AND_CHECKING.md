@@ -1018,3 +1018,32 @@ This does not replace the retained host, reclaim its closed-channel registry,
 preserve original caught exception objects, cancel workers, or enable general
 GC/FFI ownership. The full `thread` API and the installed desktop PB-MCP are
 unchanged. Startup/RAM improvements are workload-dependent, not guaranteed.
+
+## Stable priority queues without quadratic preparation
+
+`thread_pool.run_all` and `run_parallel` collect pending task indices, with higher
+numeric priorities first and stable submission order for equal priorities.
+Queues with at most 32 pending tasks retain insertion ordering. Larger queues
+are checked for existing order and otherwise use iterative stable merge sorting:
+O(n log n) ordering time, with one O(n) temporary index buffer only when needed.
+Already ordered large queues use O(n) preparation without that merge buffer.
+The existing submit limit remains 100,000 tasks; worker count is unchanged.
+
+Only pending indices move. Task records, IDs, callbacks, completed history and
+failure accounting are retained. Repeated runs do not replay completed work.
+Non-numeric priorities are rejected by submission as before. Positive and negative
+infinity retain their numeric ordering; if ordering compares a NaN, the retained
+host still rejects it before callbacks or worker launch. No new NaN total-order
+policy is imposed. A single pending task needs no comparison.
+
+Priority is preparation/collection order, not an OS thread priority, preemption,
+starvation prevention or real-time scheduling guarantee. Parallel callbacks may
+run in any wall-clock order. This does not change async deadlines or cancellation,
+retained channel reclamation, runtime/FFI cleanup or the installed desktop server.
+
+Regression: `tests/semantics/thread_pool_priority_order_test.sapp`, including
+threshold boundaries, odd lengths, duplicate priorities, infinities/NaN,
+reused pools and actual parallel success/failure collection. Example:
+`examples/thread_pool_priority/main.sapp`. Benchmarks must include small,
+already-ordered and equal-priority queues as well as disordered queues; the
+extra merge buffer is a tradeoff, not a promise of lower process RSS.
