@@ -147,3 +147,9 @@ This is not a universal host-error handler, general cycle collection, or cleanup
 native FFI crashes. It does not cover every malformed raw chunk, builtin error,
 process exit, OOM or hardware failure. See `examples/index_cleanup.sapp` and
 `tests/semantics/selfhost_index_cleanup_test.sapp` for the tested ownership rules.
+
+The index success/handler path is emitted inline in the interpreter dispatch to
+avoid an additional helper frame on each managed access. This preserves the
+same ownership policy and failed-primitive assumptions. Changing receiver/key
+loops and allocation after frame entry are regression-tested. For the wider
+unfinished work, see [continuation status](CONTINUATION_STATUS_2026-09-27.md).
