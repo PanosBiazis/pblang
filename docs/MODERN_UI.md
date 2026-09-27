@@ -70,6 +70,10 @@ The built-in controls are `heading`, `text`, `button`, `input`, `area`,
 Controls support explicit stable `name` values, model `bind` fields, callbacks,
 size overrides, enabled/read-only state and bounded text.
 
+## Spacing
+
+Use `ui_spacing.preset("comfortable")` for shared container gap/padding defaults, or override either value in an ordinary options map. Android now honors explicit root/card padding and responsive child gaps. See [Shared spacing](UI_SPACING.md) for compatibility details.
+
 ## Themes
 
 Pass `theme: "dark"` or `theme: "light"`. A `palette` map can override the
