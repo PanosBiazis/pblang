@@ -27,6 +27,15 @@ fn _close_on_escape(execution) {
     }
 }
 
+fn _raise(execution, message) {
+    _close_on_escape(execution);
+    throw message;
+}
+fn _raise_host(execution, message) {
+    _close_on_escape(execution);
+    return error(message);
+}
+
 
 let OP_CONSTANT = 0;
 let OP_ADD = 1;
@@ -111,22 +120,27 @@ fn _runtime(options) {
     };
 }
 
-fn _trip(runtime, reason) {
+fn _trip(runtime, reason, execution) {
     runtime.tripped = true;
     runtime.reason = reason;
+    // Budget failures are sticky: no guest catch body may resume this run.
+    // Keep the execution context out of the returned/public runtime counters.
+    if execution != nil and execution.close_on_throw {
+        try close_execution(execution) catch nil;
+    }
     throw "self-host VM: " + reason;
 }
 
-fn _guard_value(runtime, value) {
+fn _guard_value(runtime, value, execution) {
     if runtime == nil { return; }
     if (is_string(value) or is_array(value) or is_map(value)) and len(value) > runtime.max_value_items {
-        _trip(runtime, "value size limit exceeded");
+        _trip(runtime, "value size limit exceeded", execution);
     }
 }
 
-fn _output_push(out, value, runtime) {
-    if runtime != nil and len(out) >= runtime.max_output { _trip(runtime, "output limit exceeded"); }
-    _guard_value(runtime, value);
+fn _output_push(out, value, runtime, execution) {
+    if runtime != nil and len(out) >= runtime.max_output { _trip(runtime, "output limit exceeded", execution); }
+    _guard_value(runtime, value, execution);
     array_push(out, value);
     if runtime != nil and len(out) > runtime.peak_output { runtime.peak_output = len(out); }
 }
@@ -145,22 +159,22 @@ let _BUILTINS = _vm_builtin_module.registry();
 
 fn _is_builtin(name) { return map_has(_BUILTINS, name); }
 
-fn _guard_allocation(runtime, requested, label) {
+fn _guard_allocation(runtime, requested, label, execution) {
     if runtime != nil and (not is_number(requested) or requested < 0 or requested > runtime.max_value_items) {
-        _trip(runtime, label + " allocation limit exceeded");
+        _trip(runtime, label + " allocation limit exceeded", execution);
     }
 }
 
-fn _guard_push(runtime, container, label) {
+fn _guard_push(runtime, container, label, execution) {
     if runtime != nil and len(container) >= runtime.max_value_items {
-        _trip(runtime, label + " size limit exceeded");
+        _trip(runtime, label + " size limit exceeded", execution);
     }
 }
 
 // Admission for mutation must precede the host write: SET consumes its target,
 // so a later stack tick need not see the enlarged collection at all. Preserve
 // the retained host's index typing, truncation and errors for non-growing writes.
-fn _guard_index_growth(runtime, target, index) {
+fn _guard_index_growth(runtime, target, index, execution) {
     if is_array(target) {
         // The host truncates number indices toward zero and permits append only
         // at len(target). Runtime limits are positive, so an empty-array append
@@ -168,11 +182,11 @@ fn _guard_index_growth(runtime, target, index) {
         let count = len(target);
         if count >= runtime.max_value_items and is_number(index)
             and index >= count and index < count + 1 {
-            _trip(runtime, "array size limit exceeded");
+            _trip(runtime, "array size limit exceeded", execution);
         }
     } elif is_map(target) and is_string(index) {
         if len(target) >= runtime.max_value_items and not map_has(target,index) {
-            _trip(runtime, "map size limit exceeded");
+            _trip(runtime, "map size limit exceeded", execution);
         }
     }
 }
@@ -180,16 +194,16 @@ fn _guard_index_growth(runtime, target, index) {
 // Count only when the worst-case UTF-8 size does not already fit the caller's
 // explicit budget. Split long strings so repeated scalar indexing cannot turn
 // into a quadratic scan of the entire input. No output byte array is allocated.
-fn _utf8_size(value, remaining, runtime) {
+fn _utf8_size(value, remaining, runtime, execution) {
     let count = len(value);
-    if count > remaining { _trip(runtime, "str_to_bytes allocation limit exceeded"); }
+    if count > remaining { _trip(runtime, "str_to_bytes allocation limit exceeded", execution); }
     if count > 128 {
         let middle = num_floor(count / 2);
-        let first = _utf8_size(str_slice(value, 0, middle), remaining, runtime);
-        return first + _utf8_size(str_slice(value, middle, count), remaining - first, runtime);
+        let first = _utf8_size(str_slice(value, 0, middle), remaining, runtime, execution);
+        return first + _utf8_size(str_slice(value, middle, count), remaining - first, runtime, execution);
     }
-    if runtime.tripped { throw "self-host VM: " + runtime.reason; }
-    if count > runtime.max_steps - runtime.steps { _trip(runtime, "step limit exceeded"); }
+    if runtime.tripped { _trip(runtime, runtime.reason, execution); }
+    if count > runtime.max_steps - runtime.steps { _trip(runtime, "step limit exceeded", execution); }
     runtime.steps = runtime.steps + count;
     let bytes = 0;
     for i count {
@@ -198,18 +212,18 @@ fn _utf8_size(value, remaining, runtime) {
         elif cp < 2048 { bytes = bytes + 2; }
         elif cp < 65536 { bytes = bytes + 3; }
         else { bytes = bytes + 4; }
-        if bytes > remaining { _trip(runtime, "str_to_bytes allocation limit exceeded"); }
+        if bytes > remaining { _trip(runtime, "str_to_bytes allocation limit exceeded", execution); }
     }
     return bytes;
 }
 
-fn _string_bytes(value, runtime) {
-    if type(value) != "string" { throw "str_to_bytes() expects a string"; }
+fn _string_bytes(value, runtime, execution) {
+    if type(value) != "string" { _raise(execution, "str_to_bytes() expects a string"); }
     if runtime != nil {
         let count = len(value);
-        _guard_allocation(runtime, count, "str_to_bytes");
+        _guard_allocation(runtime, count, "str_to_bytes", execution);
         if count > num_floor(runtime.max_value_items / 4) {
-            _utf8_size(value, runtime.max_value_items, runtime);
+            _utf8_size(value, runtime.max_value_items, runtime, execution);
         }
     }
     return str_to_bytes(value);
@@ -217,17 +231,17 @@ fn _string_bytes(value, runtime) {
 
 fn _call_builtin(name, args, runtime = nil, execution = nil) {
     if map_has(_MEMORY_NAMES, name) {
-        if execution == nil { throw "self-host memory: missing execution context"; }
+        if execution == nil { _raise(execution, "self-host memory: missing execution context"); }
         if execution.memory == nil { execution.memory = _MEMORY.new_state(); }
-        if (name == "allocate" or name == "memory_alloc") and len(args) > 0 { _guard_value(runtime, args[0]); }
-        if (name == "store" or name == "memory_set") and len(args) > 1 { _guard_value(runtime, args[1]); }
+        if (name == "allocate" or name == "memory_alloc") and len(args) > 0 { _guard_value(runtime, args[0], execution); }
+        if (name == "store" or name == "memory_set") and len(args) > 1 { _guard_value(runtime, args[1], execution); }
         return _MEMORY.dispatch(execution.memory, name, args, 1,
             execution.close_on_throw and execution.handlers == 0);
     }
     if name == "len" { return len(args[0]); }
     if name == "str" { return str(args[0]); }
     if name == "print" { return nil; }
-    if name == "array_push" { _guard_push(runtime, args[0], "array"); return array_push(args[0], args[1]); }
+    if name == "array_push" { _guard_push(runtime, args[0], "array", execution); return array_push(args[0], args[1]); }
     if name == "array_pop" { return array_pop(args[0]); }
     if name == "str_split" { return str_split(args[0], args[1]); }
     if name == "str_upper" { return str_upper(args[0]); }
@@ -256,7 +270,7 @@ fn _call_builtin(name, args, runtime = nil, execution = nil) {
     if name == "strcharcodeat" { return strcharcodeat(args[0], args[1]); }
     if name == "strfromcharcode" { return strfromcharcode(args[0]); }
     if name == "str_from_char_code" { return str_from_char_code(args[0]); }
-    if name == "str_repeat" { _guard_allocation(runtime, len(args[0]) * args[1], "str_repeat"); return str_repeat(args[0], args[1]); }
+    if name == "str_repeat" { _guard_allocation(runtime, len(args[0]) * args[1], "str_repeat", execution); return str_repeat(args[0], args[1]); }
     if name == "is_map" { return is_map(args[0]); }
     if name == "is_array" { return is_array(args[0]); }
     if name == "is_string" { return is_string(args[0]); }
@@ -281,38 +295,38 @@ fn _call_builtin(name, args, runtime = nil, execution = nil) {
     }
     if name == "num_exp" { return num_exp(args[0]); }
     if name == "num_ln" { return num_ln(args[0]); }
-    if name == "str_replace_all" { _guard_allocation(runtime, len(args[0]) * num_max(1, len(args[2])), "str_replace_all"); return str_replace_all(args[0], args[1], args[2]); }
-    if name == "str_pad_left" { _guard_allocation(runtime, args[1], "str_pad_left"); return str_pad_left(args[0], args[1], args[2]); }
-    if name == "str_pad_right" { _guard_allocation(runtime, args[1], "str_pad_right"); return str_pad_right(args[0], args[1], args[2]); }
-    if name == "push" { _guard_push(runtime, args[0], "array"); return push(args[0], args[1]); }
+    if name == "str_replace_all" { _guard_allocation(runtime, len(args[0]) * num_max(1, len(args[2])), "str_replace_all", execution); return str_replace_all(args[0], args[1], args[2]); }
+    if name == "str_pad_left" { _guard_allocation(runtime, args[1], "str_pad_left", execution); return str_pad_left(args[0], args[1], args[2]); }
+    if name == "str_pad_right" { _guard_allocation(runtime, args[1], "str_pad_right", execution); return str_pad_right(args[0], args[1], args[2]); }
+    if name == "push" { _guard_push(runtime, args[0], "array", execution); return push(args[0], args[1]); }
     if name == "pop" { return pop(args[0]); }
-    if name == "array_push" { _guard_push(runtime, args[0], "array"); return array_push(args[0], args[1]); }
+    if name == "array_push" { _guard_push(runtime, args[0], "array", execution); return array_push(args[0], args[1]); }
     if name == "array_pop" { return array_pop(args[0]); }
     if name == "error" { let original=args[0]; _close_on_escape(execution); return error(original); }
     // Read-only host wall time. Keep strict zero arity and the retained host's
     // errors; these calls are not monotonic or deterministic guest clocks.
     if name == "clock" {
-        if len(args) != 0 { throw "clock() takes no arguments"; }
+        if len(args) != 0 { _raise(execution, "clock() takes no arguments"); }
         return clock();
     }
     if name == "now_ms" {
-        if len(args) != 0 { throw "now_ms() takes no arguments"; }
+        if len(args) != 0 { _raise(execution, "now_ms() takes no arguments"); }
         return now_ms();
     }
     if name == "now_iso" {
-        if len(args) != 0 { throw "now_iso() takes no arguments"; }
+        if len(args) != 0 { _raise(execution, "now_iso() takes no arguments"); }
         return now_iso();
     }
     if name == "array_sort" {
-        if len(args) != 1 { throw "array_sort() expects 1 argument, got " + str(len(args)); }
-        _guard_value(runtime, args[0]);
+        if len(args) != 1 { _raise(execution, "array_sort() expects 1 argument, got " + str(len(args))); }
+        _guard_value(runtime, args[0], execution);
         return array_sort(args[0]);
     }
     if name == "str_to_bytes" {
-        if len(args) != 1 { throw "str_to_bytes() expects 1 argument"; }
-        return _string_bytes(args[0], runtime);
+        if len(args) != 1 { _raise(execution, "str_to_bytes() expects 1 argument"); }
+        return _string_bytes(args[0], runtime, execution);
     }
-    return error("self-host VM: unknown builtin '" + name + "'");
+    return _raise_host(execution, "self-host VM: unknown builtin '" + name + "'");
 }
 
 // Scalar dispatch for normal builtin arities. OP_CALL uses these paths before
@@ -348,13 +362,13 @@ fn _call_builtin1(name, a0, runtime = nil, execution = nil) {
     if name == "num_ln" { return num_ln(a0); }
     if name == "pop" { return pop(a0); }
     if name == "error" { _close_on_escape(execution); return error(a0); }
-    if name == "array_sort" { _guard_value(runtime, a0); return array_sort(a0); }
-    if name == "str_to_bytes" { return _string_bytes(a0, runtime); }
+    if name == "array_sort" { _guard_value(runtime, a0, execution); return array_sort(a0); }
+    if name == "str_to_bytes" { return _string_bytes(a0, runtime, execution); }
     return _call_builtin(name, [a0], runtime, execution);
 }
 
 fn _call_builtin2(name, a0, a1, runtime = nil, execution = nil) {
-    if name == "array_push" { _guard_push(runtime, a0, "array"); return array_push(a0, a1); }
+    if name == "array_push" { _guard_push(runtime, a0, "array", execution); return array_push(a0, a1); }
     if name == "map_has" { return map_has(a0, a1); }
     if name == "bit_and" { return bit_and(a0, a1); }
     if name == "bit_or" { return bit_or(a0, a1); }
@@ -373,28 +387,28 @@ fn _call_builtin2(name, a0, a1, runtime = nil, execution = nil) {
     if name == "num_pow" { return num_pow(a0, a1); }
     if name == "map_remove" { return map_remove(a0, a1); }
     if name == "strcharcodeat" { return strcharcodeat(a0, a1); }
-    if name == "str_repeat" { _guard_allocation(runtime, len(a0) * a1, "str_repeat"); return str_repeat(a0, a1); }
+    if name == "str_repeat" { _guard_allocation(runtime, len(a0) * a1, "str_repeat", execution); return str_repeat(a0, a1); }
     if name == "has_member" { return has_member(a0, a1); }
     if name == "rational" { return rational(a0, a1); }
-    if name == "push" { _guard_push(runtime, a0, "array"); return push(a0, a1); }
+    if name == "push" { _guard_push(runtime, a0, "array", execution); return push(a0, a1); }
     return _call_builtin(name, [a0, a1], runtime, execution);
 }
 
 fn _call_builtin3(name, a0, a1, a2, runtime = nil, execution = nil) {
     if name == "str_slice" { return str_slice(a0, a1, a2); }
     if name == "slice" { return slice(a0, a1, a2); }
-    if name == "str_replace_all" { _guard_allocation(runtime, len(a0) * num_max(1, len(a2)), "str_replace_all"); return str_replace_all(a0, a1, a2); }
-    if name == "str_pad_left" { _guard_allocation(runtime, a1, "str_pad_left"); return str_pad_left(a0, a1, a2); }
-    if name == "str_pad_right" { _guard_allocation(runtime, a1, "str_pad_right"); return str_pad_right(a0, a1, a2); }
+    if name == "str_replace_all" { _guard_allocation(runtime, len(a0) * num_max(1, len(a2)), "str_replace_all", execution); return str_replace_all(a0, a1, a2); }
+    if name == "str_pad_left" { _guard_allocation(runtime, a1, "str_pad_left", execution); return str_pad_left(a0, a1, a2); }
+    if name == "str_pad_right" { _guard_allocation(runtime, a1, "str_pad_right", execution); return str_pad_right(a0, a1, a2); }
     return _call_builtin(name, [a0, a1, a2], runtime, execution);
 }
 
 // Grow `arr` to at least index i+1 (nil-filled), then set arr[i] = v.
-fn _set_slot(arr, i, v, runtime = nil) {
-    if i < 0 { throw "self-host VM: negative local slot"; }
+fn _set_slot(arr, i, v, runtime, execution) {
+    if i < 0 { _raise(execution, "self-host VM: negative local slot"); }
     if runtime != nil {
-        if i >= runtime.max_locals { _trip(runtime, "locals limit exceeded"); }
-        _guard_value(runtime, v);
+        if i >= runtime.max_locals { _trip(runtime, "locals limit exceeded", execution); }
+        _guard_value(runtime, v, execution);
     }
     while len(arr) <= i { array_push(arr, nil); }
     arr[i] = v;
@@ -422,16 +436,16 @@ fn _call_method(callee, args, globals, out, runtime, depth, execution) {
     let closure = is_map(callee) and map_has(callee, "__fn");
     let fnc = if closure { callee.__fn } else { callee };
     if not closure and not (is_map(fnc) and map_has(fnc, "chunk")) {
-        return error("operator overload target is not callable");
+        return _raise_host(execution, "operator overload target is not callable");
     }
     // Match OP_CALL before guest code, default evaluation or global propagation.
     // Missing legacy metadata remains absent rather than inventing a minimum.
     let argc = len(args);
     if map_has(fnc, "min_arity") and argc < fnc.min_arity {
-        throw "self-host VM: function expects at least " + str(fnc.min_arity) + " argument(s), got " + str(argc);
+        _raise(execution, "self-host VM: function expects at least " + str(fnc.min_arity) + " argument(s), got " + str(argc));
     }
     if map_has(fnc, "arity") and argc > fnc.arity {
-        throw "self-host VM: function expects at most " + str(fnc.arity) + " argument(s), got " + str(argc);
+        _raise(execution, "self-host VM: function expects at most " + str(fnc.arity) + " argument(s), got " + str(argc));
     }
     if closure {
         let call_globals = globals;
@@ -543,30 +557,30 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
     let n = len(ins);
 
     if runtime != nil {
-        if runtime.tripped { throw "self-host VM: " + runtime.reason; }
-        if depth + 1 > runtime.max_frames { _trip(runtime, "frame limit exceeded"); }
+        if runtime.tripped { _trip(runtime, runtime.reason, execution); }
+        if depth + 1 > runtime.max_frames { _trip(runtime, "frame limit exceeded", execution); }
         if depth + 1 > runtime.peak_frames { runtime.peak_frames = depth + 1; }
-        if len(locals) > runtime.max_locals { _trip(runtime, "locals limit exceeded"); }
+        if len(locals) > runtime.max_locals { _trip(runtime, "locals limit exceeded", execution); }
     }
 
     while ip < n {
         // Keep admission in this loop: no extra host call frame per guest step.
         if runtime != nil {
-            if runtime.tripped { throw "self-host VM: " + runtime.reason; }
-            if runtime.steps >= runtime.max_steps { _trip(runtime, "step limit exceeded"); }
+            if runtime.tripped { _trip(runtime, runtime.reason, execution); }
+            if runtime.steps >= runtime.max_steps { _trip(runtime, "step limit exceeded", execution); }
             runtime.steps = runtime.steps + 1;
             // This tick invokes no guest callbacks and neither array changes here.
             // Reuse lengths within this tick only; the next instruction may mutate them.
             let stack_count = len(stack);
-            if stack_count > runtime.max_stack { _trip(runtime, "stack limit exceeded"); }
+            if stack_count > runtime.max_stack { _trip(runtime, "stack limit exceeded", execution); }
             let local_count = len(locals);
-            if local_count > runtime.max_locals { _trip(runtime, "locals limit exceeded"); }
+            if local_count > runtime.max_locals { _trip(runtime, "locals limit exceeded", execution); }
             if stack_count > runtime.peak_stack { runtime.peak_stack = stack_count; }
             if local_count > runtime.peak_locals { runtime.peak_locals = local_count; }
             if stack_count > 0 {
                 let top = stack[stack_count - 1];
                 if (is_string(top) or is_array(top) or is_map(top)) and len(top) > runtime.max_value_items {
-                    _trip(runtime, "value size limit exceeded");
+                    _trip(runtime, "value size limit exceeded", execution);
                 }
             }
         }
@@ -583,7 +597,7 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
             if arg < len(locals) { array_push(stack, locals[arg]); }
             else { array_push(stack, nil); }
         }
-        else if op == OP_SET_LOCAL { _set_slot(locals, arg, array_pop(stack), runtime); }
+        else if op == OP_SET_LOCAL { _set_slot(locals, arg, array_pop(stack), runtime, execution); }
         // Group colder handlers by opcode range; each instruction still executes
         // the same handler and tick. Raw callers can use exact numeric values
         // (bigint/decimal/rational), which compare equal to ordinary opcodes.
@@ -595,13 +609,13 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                     let a = if arg.slot < len(locals) { locals[arg.slot] } else { nil };
                     let b = consts[arg.constant];
                     let value = if is_map(a) or is_map(b) { _op_add(a, b, globals, out, runtime, depth, execution) } else { a + b };
-                    _set_slot(locals, arg.slot, value, runtime);
+                    _set_slot(locals, arg.slot, value, runtime, execution);
                 }
                 else if op == OP_ADD_LOCAL_LOCAL {
                     let a = if arg.slot < len(locals) { locals[arg.slot] } else { nil };
                     let b = if arg.rhs < len(locals) { locals[arg.rhs] } else { nil };
                     let value = if is_map(a) or is_map(b) { _op_add(a, b, globals, out, runtime, depth, execution) } else { a + b };
-                    _set_slot(locals, arg.slot, value, runtime);
+                    _set_slot(locals, arg.slot, value, runtime, execution);
                 }
                 else if op == OP_JUMP_IF_FALSE_PEEK { if not _truthy(stack[len(stack) - 1]) { ip = arg; } }
                 else if op == OP_JUMP_IF_TRUE_PEEK { if _truthy(stack[len(stack) - 1]) { ip = arg; } }
@@ -641,7 +655,7 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                     let value = array_pop(stack);
                     let idx = array_pop(stack);
                     let obj = array_pop(stack);
-                    if runtime != nil { _guard_index_growth(runtime, obj, idx); }
+                    if runtime != nil { _guard_index_growth(runtime, obj, idx, execution); }
                     obj[idx] = value;
                 }
                 else if op == OP_MOD {
@@ -651,7 +665,7 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                 }
                 else if op == OP_LEN { array_push(stack, len(array_pop(stack))); }
                 else if op == OP_MAKE_ARRAY {
-                    if runtime != nil and arg > runtime.max_value_items { _trip(runtime, "array size limit exceeded"); }
+                    if runtime != nil and arg > runtime.max_value_items { _trip(runtime, "array size limit exceeded", execution); }
                     // Captured bindings use fresh one-element cells. Construct
                     // small arrays directly instead of filling nil slots and
                     // overwriting them; pop in reverse to preserve source order.
@@ -676,7 +690,7 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                     array_push(stack, items);
                 }
                 else if op == OP_MAKE_MAP {
-                    if runtime != nil and arg > runtime.max_value_items { _trip(runtime, "map size limit exceeded"); }
+                    if runtime != nil and arg > runtime.max_value_items { _trip(runtime, "map size limit exceeded", execution); }
                     let m = map{};
                     let k = 0;
                     while k < arg {
@@ -696,7 +710,7 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                 else if op == OP_SET_ATTR {
                     let value = array_pop(stack);
                     let obj = array_pop(stack);
-                    if runtime != nil { _guard_index_growth(runtime, obj, consts[arg]); }
+                    if runtime != nil { _guard_index_growth(runtime, obj, consts[arg], execution); }
                     obj[consts[arg]] = value;
                 }
                 else if op == OP_CLOSURE {
@@ -737,12 +751,12 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
             }
         } else if (is_number(op) or type(op) == "bigint" or type(op) == "decimal" or type(op) == "rational") and op >= 18 {
             if op == OP_CALL {
-                if not is_number(arg) { throw "self-host VM: invalid call argument count"; }
-                if runtime != nil and arg > runtime.max_stack { _trip(runtime, "call argument limit exceeded"); }
+                if not is_number(arg) { _raise(execution, "self-host VM: invalid call argument count"); }
+                if runtime != nil and arg > runtime.max_stack { _trip(runtime, "call argument limit exceeded", execution); }
                 // Raw chunks may bypass the serialized-bytecode validator. Check
                 // count and callee/argument availability before indexing or popping.
                 if not (arg >= 0 and arg < len(stack)) or arg != num_floor(arg) {
-                    throw "self-host VM: invalid call argument count or stack underflow";
+                    _raise(execution, "self-host VM: invalid call argument count or stack underflow");
                 }
                 // Callee sits below arg0..argN-1. Builtins with their normal scalar
                 // arities can consume those values directly, avoiding an args-array
@@ -771,9 +785,9 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                             let cache = nil;
                             if map_has(globals, "__import_cache__") { cache = globals["__import_cache__"]; }
                             if cache != nil and map_has(cache, a0) { array_push(stack, cache[a0]); }
-                            else { array_push(stack, error("self-host import: module not resolved: " + str(a0))); }
+                            else { array_push(stack, _raise_host(execution, "self-host import: module not resolved: " + str(a0))); }
                         } else if name == "print" {
-                            _output_push(out, a0, runtime);
+                            _output_push(out, a0, runtime, execution);
                             array_push(stack, nil);
                         } else {
                             array_push(stack, _call_builtin1(name, a0, runtime, execution));
@@ -783,7 +797,7 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                         let a0 = array_pop(stack);
                         array_pop(stack); // callee descriptor
                         if name == "print" {
-                            _output_push(out, a0, runtime); _output_push(out, a1, runtime);
+                            _output_push(out, a0, runtime, execution); _output_push(out, a1, runtime, execution);
                             array_push(stack, nil);
                         } else {
                             array_push(stack, _call_builtin2(name, a0, a1, runtime, execution));
@@ -794,7 +808,7 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                         let a0 = array_pop(stack);
                         array_pop(stack); // callee descriptor
                         if name == "print" {
-                            _output_push(out, a0, runtime); _output_push(out, a1, runtime); _output_push(out, a2, runtime);
+                            _output_push(out, a0, runtime, execution); _output_push(out, a1, runtime, execution); _output_push(out, a2, runtime, execution);
                             array_push(stack, nil);
                         } else {
                             array_push(stack, _call_builtin3(name, a0, a1, a2, runtime, execution));
@@ -818,10 +832,10 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                     let callee = array_pop(stack);
                     let fnc = callee.__fn;
                     if map_has(fnc, "min_arity") and arg < fnc.min_arity {
-                        throw "self-host VM: function expects at least " + str(fnc.min_arity) + " argument(s), got " + str(arg);
+                        _raise(execution, "self-host VM: function expects at least " + str(fnc.min_arity) + " argument(s), got " + str(arg));
                     }
                     if map_has(fnc, "arity") and arg > fnc.arity {
-                        throw "self-host VM: function expects at most " + str(fnc.arity) + " argument(s), got " + str(arg);
+                        _raise(execution, "self-host VM: function expects at most " + str(fnc.arity) + " argument(s), got " + str(arg));
                     }
                     let call_globals = globals;
                     if map_has(callee, "__globals") { call_globals = callee.__globals; }
@@ -846,10 +860,10 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                             if map_has(globals, "__import_cache__") { cache = globals["__import_cache__"]; }
                             let p = callargs[0];
                             if cache != nil and map_has(cache, p) { array_push(stack, cache[p]); }
-                            else { array_push(stack, error("self-host import: module not resolved: " + str(p))); }
+                            else { array_push(stack, _raise_host(execution, "self-host import: module not resolved: " + str(p))); }
                         } else if callee["__bi"] == "print" {
                             let pi = 0;
-                            while pi < len(callargs) { _output_push(out, callargs[pi], runtime); pi = pi + 1; }
+                            while pi < len(callargs) { _output_push(out, callargs[pi], runtime, execution); pi = pi + 1; }
                             array_push(stack, nil);
                         } else {
                             array_push(stack, _call_builtin(callee["__bi"], callargs, runtime, execution));
@@ -857,10 +871,10 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                     } else if is_map(callee) and map_has(callee, "__fn") {
                         let __fnc = callee.__fn;
                         if map_has(__fnc, "min_arity") and arg < __fnc.min_arity {
-                            throw "self-host VM: function expects at least " + str(__fnc.min_arity) + " argument(s), got " + str(arg);
+                            _raise(execution, "self-host VM: function expects at least " + str(__fnc.min_arity) + " argument(s), got " + str(arg));
                         }
                         if map_has(__fnc, "arity") and arg > __fnc.arity {
-                            throw "self-host VM: function expects at most " + str(__fnc.arity) + " argument(s), got " + str(arg);
+                            _raise(execution, "self-host VM: function expects at most " + str(__fnc.arity) + " argument(s), got " + str(arg));
                         }
                         let call_globals = globals;
                         if map_has(callee, "__globals") { call_globals = callee.__globals; }
@@ -873,10 +887,10 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                         // contract as closures; do not bypass it on this route.
                         if is_map(callee) {
                             if map_has(callee, "min_arity") and arg < callee.min_arity {
-                                throw "self-host VM: function expects at least " + str(callee.min_arity) + " argument(s), got " + str(arg);
+                                _raise(execution, "self-host VM: function expects at least " + str(callee.min_arity) + " argument(s), got " + str(arg));
                             }
                             if map_has(callee, "arity") and arg > callee.arity {
-                                throw "self-host VM: function expects at most " + str(callee.arity) + " argument(s), got " + str(arg);
+                                _raise(execution, "self-host VM: function expects at most " + str(callee.arity) + " argument(s), got " + str(arg));
                             }
                         }
                         array_push(stack, exec(callee.chunk, callargs, globals, out, [], runtime, depth + 1, execution));
@@ -888,7 +902,7 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                 // Keep bounded return admission without a helper call per return.
                 if runtime != nil {
                     if (is_string(value) or is_array(value) or is_map(value)) and len(value) > runtime.max_value_items {
-                        _trip(runtime, "value size limit exceeded");
+                        _trip(runtime, "value size limit exceeded", execution);
                     }
                 }
                 return value;
@@ -948,7 +962,7 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
                 else { array_push(stack, a <= b); }
             }
             else if op == OP_POP { array_pop(stack); }
-            else if op == OP_PRINT { _output_push(out, array_pop(stack), runtime); }
+            else if op == OP_PRINT { _output_push(out, array_pop(stack), runtime, execution); }
             else if op == OP_GET_GLOBAL {
                 let name = consts[arg];
                 if map_has(globals, name) { array_push(stack, globals[name]); }
@@ -970,7 +984,7 @@ fn exec(chunk, locals, globals, out, upvalues, runtime = nil, depth = 0, executi
             }
         }
     }
-    if runtime != nil and len(stack) > runtime.max_stack { _trip(runtime, "stack limit exceeded"); }
+    if runtime != nil and len(stack) > runtime.max_stack { _trip(runtime, "stack limit exceeded", execution); }
     return nil;
 }
 

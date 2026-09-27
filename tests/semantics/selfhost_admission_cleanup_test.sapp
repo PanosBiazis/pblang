@@ -1,0 +1,82 @@
+let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let V=import("stdlib:compiler/vm.sapp");
+fn compiled(source) {let c=F.frontend_compile(source);assert(c.ok,"fixture compiles: "+source+" "+str(c.diagnostics));return c.chunk;}
+let setup=compiled("memory_alloc(7);push_lifetime();borrow_immutable(1);memory_alloc(9);");
+fn prepare(automatic) {let ctx=V.execution_context(automatic);V.run_seeded(setup,map{},ctx);return ctx;}
+fn invoke(callee,args,count) {
+    let constants=[callee];let ins=[map{op:0,operand:0}];
+    for x in args {array_push(constants,x);array_push(ins,map{op:0,operand:len(constants)-1});}
+    array_push(ins,map{op:18,operand:count});return map{constants:constants,instructions:ins};
+}
+let bare=map{arity:2,min_arity:2,chunk:compiled("print 123;")};
+let bad_calls=[invoke(map{__bi:"clock"},[1],1),invoke(map{__bi:"now_ms"},[1],1),
+    invoke(map{__bi:"now_iso"},[1],1),invoke(map{__bi:"array_sort"},[],0),
+    invoke(map{__bi:"str_to_bytes"},[1],1),invoke(map{__bi:"str_to_bytes"},[],0),
+    invoke(map{__bi:"unknown_test_builtin"},[],0),invoke(map{__bi:"import"},["unresolved-test-module"],1),
+    invoke(map{__fn:bare,__upvalues:[]},[],0),invoke(bare,[],0),
+    invoke(map{__fn:bare,__upvalues:[]},[1,2,3,4],4),invoke(bare,[1,2,3,4],4),
+    invoke(bare,[],"invalid"),invoke(bare,[],1),
+    map{constants:[7],instructions:[map{op:0,operand:0},map{op:17,operand:-1}]},
+    map{constants:[map{__add__:7},2],instructions:[map{op:0,operand:0},map{op:0,operand:1},map{op:1,operand:0}]},
+    compiled("let a=map{__add__:fn(self){return 7;}};a+2;")];
+let catch_chunk=compiled("print memory_get(1);");
+for code in bad_calls {
+    for bounded in [false,true] {
+        for automatic in [false,true] {
+            let ctx=prepare(automatic);let memory=ctx.memory;
+            let failed=false;
+            if bounded {try V.run_seeded_bounded(code,map{},nil,ctx) catch {failed=true;};}
+            else {try V.run_seeded(code,map{},ctx) catch {failed=true;};}
+            assert(failed and memory.closed==automatic,"controlled admission failure ownership");
+            if automatic {assert(ctx.memory==nil and memory.reclaimed==2,"owned state closed once");}
+            V.close_execution(ctx);assert(memory.reclaimed==2,"idempotent close");
+        }
+        let ctx=prepare(true);let memory=ctx.memory;
+        let handled=map{constants:[map{try_chunk:code,catch_chunk:catch_chunk}],instructions:[map{op:35,operand:0}]};
+        let result=if bounded {V.run_seeded_bounded(handled,map{},nil,ctx)} else {V.run_seeded(handled,map{},ctx)};
+        assert(result.output==[7] and not memory.closed,"ordinary handler retains live value");
+        assert(ctx.handlers==0,"handler count restored");V.close_execution(ctx);
+    }
+}
+// All resource limits remain sticky. Even nested guest catch bodies cannot run.
+let quotas=[
+    ["while true {}",map{max_steps:20}],
+    ["fn recurse(){return recurse();}recurse();",map{max_frames:4}],
+    ["print 1;print 2;",map{max_output:1}],
+    ["fn f(a,b){return a+b;}f(1,2);",map{max_locals:1}],
+    ["let a=[1,2,3,4];",map{max_value_items:3}],
+    ["let a=map{a:1,b:2,c:3,d:4};",map{max_value_items:3}],
+    ["let a=[1,2,3];array_push(a,4);",map{max_value_items:3}],
+    ["let a=[1,2,3];a[3]=4;",map{max_value_items:3}],
+    ["let a=map{a:1,b:2,c:3};a.d=4;",map{max_value_items:3}],
+    ["str_repeat(\"x\",20);",map{max_value_items:10}],
+    ["str_to_bytes(\"αβγ\");",map{max_value_items:4}],
+    ["memory_alloc(\"oversized\");",map{max_value_items:4}],
+    ["memory_set(2,\"oversized\");",map{max_value_items:4}]
+];
+for row in quotas {
+    for automatic in [false,true] {
+        let ctx=prepare(automatic);let memory=ctx.memory;
+        let runtime=V.run_seeded_bounded(map{constants:[],instructions:[]},map{},row[1],ctx).runtime;
+        let output=[];
+        let code=compiled(row[0]);
+        let forbidden=compiled("print 999;");
+        for level 2 {code=map{constants:[map{try_chunk:code,catch_chunk:forbidden}],instructions:[map{op:35,operand:0}]};}
+        assert((try {V.exec(code,[],map{},output,[],runtime,0,ctx);false} catch true),"quota must escape: "+row[0]+" "+str(output)+" "+str(runtime));
+        assert(runtime.tripped and len(runtime.reason)>0,"quota reason retained");
+        for value in output {assert(value!=999,"guest cannot recover from quota");}
+        assert(memory.closed==automatic,"quota only closes owned execution");
+        if automatic {assert(ctx.memory==nil and len(memory.owners)==0 and len(memory.borrows)==0,"quota releases all private state");}
+        assert(ctx.handlers==0,"quota unwind restores handlers");
+        assert(len(map_keys(runtime))==13,"public counter schema unchanged");
+        for key in map_keys(runtime) {assert(key!="execution" and key!="memory" and key!="context","counters expose no context");}
+        V.close_execution(ctx);assert(memory.reclaimed==2,"quota cleanup is idempotent");
+    }
+}
+// Stack and call-argument limits exercised with raw chunks, including fallthrough.
+for code in [map{constants:[1],instructions:[map{op:0,operand:0},map{op:0,operand:0}]},invoke(bare,[1,2],2),invoke(bare,[],2)] {
+    let ctx=prepare(true);let memory=ctx.memory;
+    assert((try {V.run_seeded_bounded(code,map{},map{max_stack:1},ctx);false} catch true),"raw stack limit");
+    assert(memory.closed and ctx.memory==nil,"raw limit releases state");
+}
+print "selfhost_admission_cleanup_pass";
