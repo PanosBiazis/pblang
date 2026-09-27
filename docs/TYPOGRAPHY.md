@@ -92,3 +92,7 @@ fonts; it adds no remote font downloads, dependencies or telemetry.
 
 Shared native code serves desktop adapters. Windows/macOS and iOS runtime
 verification remains separate; these options do not introduce an iOS renderer.
+
+## Multiline text
+
+Add `wrap: true` and optional `max_lines` to a text/heading options map. See [Text flow](TEXT_FLOW.md) for sizing, Designer controls and platform behavior.
