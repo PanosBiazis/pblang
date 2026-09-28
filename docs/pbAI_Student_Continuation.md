@@ -107,7 +107,7 @@ See [measurements](benchmarks/pbai_student_continuation_release-2026-09-27.json)
 and [checks](benchmarks/pbai_student_continuation_release-checks-2026-09-27.json).
 Runnable examples are `examples/pbai_student_continuation.sapp` in PBLang and
 `demo/pbai_student_continuation.sapp` in standalone pbAI. Representative language
-benchmarks, authenticated lineage, history-aware replay/retention gates, production
+benchmarks, authenticated lineage, history-aware replay, production
 promotion and validation on other devices remain separate work.
 
 Measured result: the original checkpoint declared 1024 updates; continuation added
@@ -116,3 +116,11 @@ accuracy stayed 8/16, and baseline-correct regressions were zero. Both products
 returned identical reports and live/reloaded quality across all five samples.
 The original checkpoint file hash stayed unchanged across the cross-product
 fresh-process continuation test. These are fixture-specific results.
+
+## Optional history and retention review
+
+For explicit declared history, fresh-input admission, serialized-weight retention
+gates and reversible local acceptance, use the new
+[student review API](pbAI_Student_Review.md). The diagnostic API above retains its
+original behavior and provenance limitations. A declared history is not authenticated
+ancestry or proof of complete upstream data.
