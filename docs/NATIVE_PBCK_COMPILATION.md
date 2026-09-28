@@ -276,3 +276,70 @@ globals and export snapshots remain properties of this explicit static profile.
 `native_bundle_cleanup_test.sapp` and `native_bundle_cli_live_test.sapp` cover
 transitive imports, caught and escaping failures, callback reassignment, actual
 file cleanup, source deletion, denied capabilities and invalid callback contracts.
+
+
+## Explicit initialization within cleanup
+
+`native_pbck.compile_source_with_lifecycle(source, initialize, entry, cleanup)`
+and PBCK CLI `--initialize NAME --entry NAME --cleanup NAME` run a declared
+initializer and entry under one captured cleanup callback. The three callbacks
+must be distinct zero-argument top-level functions. Cleanup runs once after
+successful initialization/entry or a catchable failure in either. If cleanup
+also fails, the original native error message is retained; typed exception
+payloads and original stacks are not promised. Entry is skipped after failed
+initialization. The entry and initializer are captured before initialization;
+cleanup is captured by the existing native guard before that call starts.
+Rebinding their global names in initialization does not replace captured calls.
+
+```sh
+./target/release/pblang run tools/pbc.sapp --allow-all -- examples/native_lifecycle.sapp --target pbck --initialize initialize --entry work --cleanup release --out lifecycle.pbck
+./target/release/pblang run lifecycle.pbck --sandbox
+```
+
+The example prints
+`7` and `released`. `--initialize` currently rejects `--bundle` rather than
+implying protection of dependency initialization. The existing entry/cleanup
+pair and static-bundle cleanup APIs are unchanged.
+
+Top-level source evaluation still runs before this explicit boundary. Move
+resource acquisition into the declared initializer and make cleanup tolerate
+partial initialization. No guarantee is added for earlier top-level/import
+failures, forced exit, native crashes, resource exhaustion or hung cleanup.
+This is not universal automatic cleanup or cycle collection.
+
+The generated wrapper reserves the spelling `__pb_lifecycle_` anywhere in this
+opt-in source, including comments/literals, and uses the same strict admission
+on the complete generated translation unit. Original callback declarations are
+checked before compilation; invalid names cannot inject source. Generated code
+does not call or inspect user callbacks during compilation.
+
+
+### Why no automatic source runner was added
+
+The retained direct-source nested loop/try method call still yields 9 in the
+historical fixture. The checked PBLang-to-PBCK compiler and separate native VM
+execution yield 7. An automatic compile/run option was investigated but not
+published: `process.bounded_status()` fails closed because the current Linux
+backend reports an unverified FFI symbol contract (`available:false`). No direct
+lower-level launch or unbounded fallback was used to override that admission.
+Use the explicit two-step route with appropriate external process limits; this
+lifecycle addition does not repair the retained source compiler or install a
+new runtime/launcher.
+
+
+### Lifecycle verification
+
+`native_pbck_lifecycle_test.sapp` checks success, initialization throws, host
+index failure during initialization, entry failure, secondary cleanup failure,
+cleanup-only failure, caught exceptions, and callback rebinding. Negative cases
+reject missing/duplicate-role/injected callback names, arity errors, reserved
+spelling, unterminated source and oversized input.
+
+`native_lifecycle_cli_live_test.sapp` checks seven option failures before reading
+a missing input, unchanged source/previous artifact, nested method output 7,
+actual owned-file deletion after partial initialization, preservation of the
+initial error despite a secondary cleanup error, sandbox filesystem denial and
+source-canary redaction. Compilation never acquires that owned file. Existing
+`native_pbck_cli_live_test.sapp` and `native_pbck_cleanup_test.sapp` also passed.
+These are Linux retained-runtime tests, not cross-platform qualification or a
+claim that arbitrary top-level initializers receive cleanup.
