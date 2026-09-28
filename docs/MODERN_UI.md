@@ -198,3 +198,7 @@ changing components.
 ### Contextual control names
 
 Buttons and toggles accept `accessibility_label` for an explicit contextual name without changing visible text. See [Accessible controls](ACCESSIBLE_CONTROLS.md) for validation, keyboard behavior, compatibility and platform coverage.
+
+### Checkbox actions
+
+`UI.toggle(text, checked, action, options)` accepts portable actions like a button. The existing `options.action` form is retained. GUI/Web execute the action once per user change; disabled controls remain inactive. See [Toggle actions](TOGGLE_ACTIONS.md) for callback precedence and platform verification limits.
