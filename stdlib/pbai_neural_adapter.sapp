@@ -474,3 +474,150 @@ fn student_continue(artifact, training, validation, options=nil) {
     };
 }
 export student_continue;
+
+// Optional declared history and one-shot local acceptance of a continuation.
+// Digests bind content to a checkpoint; they do not authenticate its history.
+let HISTORY_FORMAT="pbai.neural.student-history.v1";
+fn _history_examples(examples) {
+    if type(examples)!="array" or len(examples)<1 or len(examples)>128 {throw "expected 1..128 history examples";}
+    let seen=map{};
+    for ex in examples {
+        if not _keys(ex,["x","y"]) or not _ids(ex.x) or not _number(ex.y,0,7,true) {throw "invalid history example";}
+        let key=_context_key(ex.x);
+        if map_has(seen,key) {throw "duplicate history context";}
+        seen[key]=true;
+    }
+    return seen;
+}
+fn _canonical_examples(examples) {
+    let out=[];
+    for ex in examples {
+        let ids=[];for id in ex.x {let token=id;if token==0 {token=0;}push(ids,token);}
+        let label=ex.y;if label==0 {label=0;}
+        push(out,map{x:ids,y:label});
+    }
+    return out;
+}
+fn _history_record(artifact, training, holdout, generation) {
+    let train=_canonical_examples(training);let valid=_canonical_examples(holdout);
+    return map{format:HISTORY_FORMAT,checkpoint_digest:artifact.digest,generation:generation,
+        training:train,holdout:valid,
+        digest:sha256(json_stringify([HISTORY_FORMAT,artifact.digest,generation,train,valid]))};
+}
+fn _checked_history(artifact, history) {
+    if not valid_student_artifact(artifact) {throw "invalid student checkpoint";}
+    if not _keys(history,["format","checkpoint_digest","generation","training","holdout","digest"])
+        or history.format!=HISTORY_FORMAT or type(history.checkpoint_digest)!="string"
+        or history.checkpoint_digest!=artifact.digest or not _number(history.generation,0,8,true)
+        or type(history.digest)!="string" or len(history.digest)!=64 {throw "invalid student history";}
+    let seen=_history_examples(history.training);_history_examples(history.holdout);
+    for ex in history.holdout {if map_has(seen,_context_key(ex.x)) {throw "history split overlap";}}
+    let normalized=_history_record(artifact,history.training,history.holdout,history.generation);
+    if normalized.digest!=history.digest {throw "student history digest mismatch";}
+    return normalized;
+}
+// The legacy checkpoint has no history: this seed is explicitly a caller claim.
+fn student_history(artifact, training, holdout) {
+    if not valid_student_artifact(artifact) {throw "invalid student checkpoint";}
+    let seen=_history_examples(training);_history_examples(holdout);
+    for ex in holdout {if map_has(seen,_context_key(ex.x)) {throw "history split overlap";}}
+    return _history_record(artifact,training,holdout,0);
+}
+fn student_history_encode(artifact, history) {return json_stringify(_checked_history(artifact,history));}
+fn student_history_decode(artifact, text) {
+    if type(text)!="string" or len(text)>32768 {throw "invalid student history encoding";}
+    let SER=import("stdlib:serialization.sapp");
+    let parsed=SER.parse_safe(text,"json",map{max_input_bytes:32768,max_depth:5,max_items:4096,
+        max_lines:1024,max_line_bytes:32768,strict:true,reject_duplicate_keys:true});
+    if not parsed.ok {throw "invalid student history encoding";}
+    return _checked_history(artifact,parsed.value);
+}
+fn _review_pair(model, before, after, examples) {
+    let pair=AD.evaluate_pair(model,before,after,ATT.adapter_hidden,examples);
+    return map{baseline:_metric_copy(pair.baseline),candidate:_metric_copy(pair.candidate),
+        baseline_correct_regressions:pair.baseline_correct_regressions};
+}
+fn _review_metric_valid(metric) {
+    return _number(metric.loss,0,1000000000000) and _number(metric.accuracy,0,1)
+        and _number(metric.examples,1,128,true) and _number(metric.correct,0,metric.examples,true);
+}
+fn _review_preserved(pair) {
+    return _review_metric_valid(pair.baseline) and _review_metric_valid(pair.candidate)
+        and pair.candidate.loss<=pair.baseline.loss and pair.candidate.correct>=pair.baseline.correct
+        and pair.baseline_correct_regressions==0;
+}
+fn _review_status(state) {
+    return map{format:"pbai.neural.student-review.status.v1",phase:state.phase,
+        active_checkpoint_digest:state.active.digest,active_history_digest:state.history.digest,
+        session_candidate_active:state.phase=="accepted",globally_activated:false,
+        persists_weights:false,authorizes_activation:false,authorizes_action:false};
+}
+// A closed, single-threaded transaction: review -> explicit accept -> rollback.
+// All evaluation sets are fixed before training; gate the exported q6 weights.
+fn student_continue_reviewed(artifact, history, training, validation, options=nil) {
+    let prior=_checked_history(artifact,history);
+    if prior.generation>=8 {throw "student history generation limit exceeded";}
+    let seen=_history_examples(prior.training);
+    for ex in prior.holdout {seen[_context_key(ex.x)]=true;}
+    _examples(training);_examples(validation);
+    if len(prior.training)+len(training)>128 or len(prior.holdout)+len(validation)>128 {
+        throw "student history capacity exceeded";
+    }
+    // Fresh-only admission covers both declared history and this candidate.
+    for examples in [training,validation] {for ex in examples {
+        let key=_context_key(ex.x);
+        if map_has(seen,key) {throw "reviewed continuation reuses an observed context";}
+        seen[key]=true;
+    }}
+    let private_train=_canonical_examples(training);let private_valid=_canonical_examples(validation);
+    let parent=student_decode(student_encode(artifact));
+    let trained=student_continue(parent,private_train,private_valid,options);
+    let candidate=trained.checkpoint();
+    let model=_model();let seed=AD.lm_head_adapter(model,1,2.0,1901);
+    let before=AD.from_state(seed,_dequantize(parent.a),_dequantize(parent.b),0,parent.steps,parent.steps);
+    let after=AD.from_state(seed,_dequantize(candidate.a),_dequantize(candidate.b),0,candidate.steps,candidate.steps);
+    let train_pair=_review_pair(model,before,after,private_train);
+    let valid_pair=_review_pair(model,before,after,private_valid);
+    // Evaluate every declared historical holdout, never a post-training subset.
+    let retention=_review_pair(model,before,after,prior.holdout);
+    let training_passed=_review_preserved(train_pair);
+    let validation_passed=_review_preserved(valid_pair) and valid_pair.candidate.loss<valid_pair.baseline.loss;
+    let retention_passed=_review_preserved(retention) and retention.baseline.correct>0;
+    let passed=training_passed and validation_passed and retention_passed;
+    let all_train=_canonical_examples(prior.training);for ex in private_train {push(all_train,ex);}
+    let all_holdout=_canonical_examples(prior.holdout);for ex in private_valid {push(all_holdout,ex);}
+    let next_history=_history_record(candidate,all_train,all_holdout,prior.generation+1);
+    let report=map{format:"pbai.neural.student-review.v1",passed:passed,
+        training_passed:training_passed,validation_passed:validation_passed,retention_passed:retention_passed,
+        training:train_pair,validation:valid_pair,retention:retention,
+        parent_digest:parent.digest,candidate_digest:candidate.digest,history_digest:prior.digest,
+        candidate_history_digest:next_history.digest,prior_steps:parent.steps,total_steps:candidate.steps,
+        declared_training_examples:len(prior.training),declared_holdout_examples:len(prior.holdout),
+        history_generation:prior.generation,declared_history_disjointness_checked:true,
+        history_prefix_scope:"caller-declared-unverified",history_complete_verified:false,
+        independent_provenance_verified:false,history_authenticated:false,labels_authenticated:false,
+        evaluation_weights:"exported-fixed-point-checkpoint",retention_scope:"all-declared-prior-holdouts",
+        independent_test:false,repeat_attempts_globally_limited:false,
+        base_weights_frozen:true,persists_weights:false,globally_activated:false,authorizes_activation:false};
+    // Store only private validated values. Caller report edits confer no authority.
+    let report_text=json_stringify(report);
+    let state=map{phase:if passed {"reviewed"} else {"rejected"},active:parent,history:prior};
+    return map{
+        report:fn() {return json_parse(report_text);},
+        status:fn() {return _review_status(state);},
+        predict:fn(ids) {return student_load(state.active).predict(ids);},
+        checkpoint:fn() {return student_decode(student_encode(state.active));},
+        history:fn() {return _checked_history(state.active,state.history);},
+        accept:fn() {
+            if state.phase!="reviewed" {throw "student continuation did not pass review";}
+            state.active=candidate;state.history=next_history;state.phase="accepted";
+            return _review_status(state);
+        },
+        rollback:fn() {
+            if state.phase!="accepted" {throw "no accepted student continuation to roll back";}
+            state.active=parent;state.history=prior;state.phase="rolled-back";
+            return _review_status(state);
+        }
+    };
+}
+export student_history, student_history_encode, student_history_decode, student_continue_reviewed;
