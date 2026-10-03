@@ -53,6 +53,16 @@ def main():
         x('mouseup', 1)
         time.sleep(0.15)
 
+    def key(name):
+        x('keydown', name); time.sleep(.12); x('keyup', name); time.sleep(.12)
+
+    def replace_text(value):
+        # Retained native input is sampled per graphics frame; hold keys across
+        # that boundary instead of injecting sub-frame press/release pairs.
+        x('keydown', 'Control_L'); time.sleep(.15); key('a'); x('keyup', 'Control_L'); time.sleep(.12)
+        for character in value:
+            key(character)
+
     def shot(name):
         subprocess.run(['import', '-window', window, str(root / 'build' / name)], check=True, timeout=5)
 
@@ -68,10 +78,20 @@ def main():
         settled(pixel0=1, pixel1=1)
         shot('uno-r4-native-edited.png')
         # 390px layout: matrix ends at 362, text action starts at 402.
+        click(225, 416)  # Static PB remains one frame.
+        settled(count=1, index=0, playing=False, total_ms=250)
         click(320, 416)
         settled(count=25, index=0, playing=False)
+        click(50, 504)
+        replace_text('200')
+        settled(duration_input='200')
+        click(150, 548)  # All ms, without changing pixels or frame count.
+        settled(count=25, total_ms=5000)
+        click(50, 688)
+        replace_text('2')
+        settled(repeat_input='2')
         click(232, 504)
-        settled(playing=True)
+        settled(playing=True, repeat_count=2)
         time.sleep(0.45)
         click(320, 504)
         settled(playing=False)
@@ -97,7 +117,7 @@ def main():
         import_created = True
         click(320, 100)  # Clear current frame first.
         click(320, 592)
-        settled(count=25, index=0, playing=False, pixel0=0, pixel1=0, export_sha256=expected_digest)
+        settled(count=25, index=0, playing=False, pixel0=0, pixel1=0, export_sha256=expected_digest, repeat_count=1, repeat_input="1")
         shot('uno-r4-native-imported.png')
         importfile.write_text('{malformed')
         click(320, 592)
