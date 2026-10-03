@@ -5,6 +5,7 @@ a deterministic metadata classifier and responsive dashboard. It needs no
 NumPy, Matplotlib or foreign runtime package.
 
 ```text
+pblang run tools/pblock_install.sapp --allow-all -- examples/file_catalog_dashboard
 pblang run examples/file_catalog_dashboard/main.sapp
 pblang run examples/file_catalog_dashboard/benchmark.sapp
 ```
@@ -64,3 +65,46 @@ rows preserve the retained host order. Directory scanning still uses the host
 filesystem boundary and is not established as a self-hosted guest-OS capability.
 
 See [current validation and resource measurements](../../docs/FILE_CATALOG_SUMMARY_VALIDATION_2026-09-17.md).
+
+## Inventory scope in the dashboard
+
+The scope card consumes the existing `scan_directory` fields; rendering never
+starts a scan. The default ten-name sample says **Supplied list / sample; no
+scan evidence**. `summarize` output alone establishes no filesystem coverage.
+
+A valid report with `scan_scope = "one directory level, metadata only"`, boolean
+`inventory_truncated`/`inventory_timed_out` and an integer `scanned_entries`
+produces one of these labels:
+
+- One-level scan report; no truncation reported. This is not a promise of
+  complete inventory: exclusions, skipped entries and snapshot consistency
+  are not established by these four fields.
+- Partial scan report; inventory truncated.
+- Timed out; partial scan report (with a truncation note when both flags apply).
+
+Missing/invalid fields, unrecognized scope, nonfinite counts and visited-entry
+counts below the classified-file count display **coverage unknown**. Unknown
+scope strings are not rendered; they may contain private paths. Classification
+counters must be nonnegative integers up to 4096 with known + unknown = total;
+invalid classification counters reject before rendering. Visited entries may
+include directories and are displayed separately from classified files.
+
+The progress bar is explicitly **recognized suffixes among listed files**, not
+scan completion, file-content verification or an estimate of unvisited files.
+Empty input has an unavailable rate (zero-position bar), not a completion claim.
+Family Inspect buttons preserve all scope and interruption indications.
+Caller-supplied flags are report metadata, not authenticated scan provenance.
+
+Run `pblang run examples/file_catalog_dashboard/test.sapp` after the local lock
+setup above. `scan_fixture.sapp` is a test adapter for a newly created owned
+temporary directory with three immediate files and a nested directory. It
+checks actual one-level/cap-limited metadata results through the existing
+scanner; do not point this fixture at personal volumes or company paths.
+Timeout states are synthetic tests, not a claim of reproducing a real timeout.
+
+The retained runtime resolves nested local locks against its process cwd. The
+existing `pblock_install` helper materializes this example's isolated local lock.
+Before publishing/moving the checkout, restore its portable lock using
+`pblang run tools/pblock.sapp --allow-all -- examples/file_catalog_dashboard`.
+Do not publish a host-bound lock. The Discovery kit uses its shared root
+manifest/lock snapshot and omits this nested manifest/lock.
