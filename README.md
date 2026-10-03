@@ -419,6 +419,12 @@ automatically after a successful build and removes the produced artifact if
 portable lock publication fails. Direct retained-bootstrap `pblang build`
 still requires `pblock` as its explicit final publication step.
 
+For a retained-runtime installation launched from other working directories,
+`tools/pblock_install.sapp` materializes local dependency paths at the final
+installation location while preserving all digests. Keep that host-bound lock
+local; source/release locks stay portable. See
+[`Installed dependency locks`](docs/INSTALLED_DEPENDENCY_LOCKS.md).
+
 See [`STRUCTURE.md`](STRUCTURE.md) for the crate map and [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md) for the current test/status snapshot.
 
 ---
