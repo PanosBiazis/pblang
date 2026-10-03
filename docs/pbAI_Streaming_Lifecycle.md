@@ -32,7 +32,7 @@ The handle is still a mutable in-process map intended for trusted callers. Lifec
 checks are not authentication, a sandbox, or a defense against a caller deliberately
 forging or rewriting a complete handle. This change does not fix general garbage
 collection, guarantee secure erasure or successful OS resource cleanup, add async
-cancellation, change cached byte-array ownership, or provide universal platform support.
+cancellation, or provide universal platform support.
 No benchmark or performance improvement is claimed for this correctness change.
 
 The focused lifecycle tests use private synthetic four-byte shards. They cover active,
@@ -59,3 +59,36 @@ them into supported parts or wait for a separately verified reader expansion.
 Boundary tests use the exact 64 MiB limit with a four-byte file, then reject 64 MiB+1,
 256 MiB and 1 GiB configurations before an unavailable root is touched. They do not
 allocate a 64 MiB fixture, and no throughput or memory-performance claim is made.
+
+
+## Caller-owned shard bytes
+
+A successful load now returns byte arrays that are independent of resident storage
+and of previous load results. On a cache miss that is admitted, the store retains a
+copy of the verified file bytes and transfers the original read result to the caller.
+On a cache hit, it returns a fresh copy of the resident bytes. A bypassed read is
+already independent and does not create an unnecessary cache copy.
+
+Previously returned bytes shared the cache array: changing a byte or appending to a
+result could poison future results while they still reported `verified:true`, and
+could make the actual array length disagree with its declared size/resident count.
+The new ownership boundary applies to ordinary, pinned, prefetched and empty shards.
+Caller edits, including cyclic replacements, cannot reach resident bytes through a
+load result. Failed integrity reads expose no bytes and do not replace a healthy
+resident entry. Eviction and close leave earlier caller-owned results unchanged.
+
+This adds a linear copy and one additional array on each cached load. The configured
+cache budget still counts resident payload bytes; it does not bound caller-held
+results, temporary copies, VM representation overhead or total process RAM. No
+speedup or memory reduction is claimed. The byte-copy helper is deliberately limited
+to scalar bytes read by this module; it is not a general recursive object copier.
+
+The public session map is still mutable. Directly rewriting its cache/config/manifest
+or forging a handle is outside this trusted-caller contract. The fix does not add
+handle authentication, snapshot consistency against concurrent disk writes, general
+GC, secure erasure or OS close-failure recovery. Disk verification policy is unchanged.
+
+Focused byte-ownership tests cover real miss/hit loads, result element and length
+changes, cyclic caller results, prefetch, pinning, cache bypass, zero-length shards,
+eviction, failed corrupted reread and close. The existing paired lifecycle examples
+now demonstrate independent byte results, including their source-hidden installed run.
