@@ -465,3 +465,9 @@ are available through [the shared neural lifecycle](pbAI_Neural_Lifecycle.md).
 
 Explicit teacher-to-student training is available through
 [the shared distillation contract](pbAI_Distillation_Contract.md).
+
+## Bounded sensor diagnostics
+
+The shared deterministic [sensor specialist](pbAI_Sensors.md) accepts explicit
+uniform numeric samples through `sensor_analyze`; it performs no collection,
+training, persistence or device actions.
