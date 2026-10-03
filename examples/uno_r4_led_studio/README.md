@@ -15,6 +15,45 @@ The Web command prints a loopback URL (`http://127.0.0.1:8768/`) and runs in the
 foreground; stop it with Ctrl+C. The CLI export prints a validated initial project
 to stdout. No background service or board connection is created.
 
+## Explicit Linux Web launch permissions
+
+The general commands above run trusted local source with `--allow-all`. A narrower
+profile was exercised on Linux x86-64 in the actual browser counter/Stop/Capture
+journey. Save this direct launcher beside `web.sapp` as `local_web.sapp`:
+
+```sapp
+let Web=import("./web.sapp");
+Web.serve(18774,512);
+```
+
+From the PBLang installation directory, with these exact libraries available:
+
+```sh
+pblang run examples/uno_r4_led_studio/local_web.sapp \
+  --allow-ffi \
+  --ffi-lib=/usr/lib/x86_64-linux-gnu/libc.so.6 \
+  --ffi-lib=/usr/lib/x86_64-linux-gnu/libcrypto.so.3 \
+  --ffi-symbol=memset --ffi-symbol=free --ffi-symbol=close \
+  --ffi-symbol=calloc --ffi-symbol=poll --ffi-symbol=getsockname \
+  --ffi-symbol=socket --ffi-symbol=bind --ffi-symbol=listen \
+  --ffi-symbol=accept4 --ffi-symbol=write --ffi-symbol=read \
+  --ffi-symbol=shutdown --ffi-symbol=basename \
+  --ffi-symbol=CRYPTO_free --ffi-symbol=OPENSSL_buf2hexstr \
+  --ffi-symbol=OPENSSL_hexstr2buf \
+  --deny-exec --deny-http --deny-sqlite --deny-spawn --deny-gfx --deny-env
+```
+
+Visit `http://127.0.0.1:18774/`. The direct launcher avoids `main.sapp`'s
+`PBLANG_SCRIPT_ARGS` environment lookup, allowing environment reads to be denied.
+Filesystem, network, imports and ordinary core capabilities remain at the CLI's
+default settings; filesystem access is needed to locate the adapter libraries.
+The listener uses the existing native TCP adapter, so `--deny-http` disables VM
+HTTP client helpers without disabling this FFI server. The exact library/symbol
+allowlist is narrower than unrestricted FFI, **not a complete sandbox or a
+network/filesystem resource allowlist**. It is for this trusted local example.
+Without the required FFI grants the listener fails closed. Other architectures,
+library locations and Windows/macOS need separately verified profiles.
+
 ## Edit and preview
 
 Web **Draw / Text / Animation / Dynamic** choices show the relevant tools without changing
@@ -73,8 +112,9 @@ These controls remain functional without JavaScript.
   `build/uno-r4-led-studio/`, using the existing exclusive-write helper. Existing
   files are never replaced. A failed export is explicitly reported and may leave
   an incomplete new file; the application does not claim success on failure.
-- Web **Download validated JSON** downloads the current project and its Arduino
-  frame words without changing the model or invalidating the current form.
+- Web **Download frames JSON (legacy / Arduino)** downloads the authored frames
+  and Arduino words; **Download project JSON** also keeps counter settings.
+  Neither changes the model or invalidates the current form.
 
 The editor starts with a heart. State is memory-only until explicitly exported.
 Closing/restarting discards unexported work. Reopen a saved export using **Import**:
