@@ -202,3 +202,7 @@ Buttons and toggles accept `accessibility_label` for an explicit contextual name
 ### Checkbox actions
 
 `UI.toggle(text, checked, action, options)` accepts portable actions like a button. The existing `options.action` form is retained. GUI/Web execute the action once per user change; disabled controls remain inactive. See [Toggle actions](TOGGLE_ACTIONS.md) for callback precedence and platform verification limits.
+
+Native applications using the shared graphics loop also benefit from
+[backend-aware input delivery](NATIVE_GRAPHICS_INPUT.md), including documented
+idle-presentation tradeoffs and Linux keyboard regression checks.
