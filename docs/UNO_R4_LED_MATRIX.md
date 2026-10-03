@@ -117,3 +117,33 @@ server edit does not push updates to already open tabs. Use one active editor ta
 The mechanism uses SVG [`set`](https://developer.mozilla.org/en-US/docs/Web/SVG/Reference/Element/set)
 visibility with finite durations. Actual tested browser support is reported in the
 release evidence; this source contract is not a universal platform test.
+
+
+## Local counter generator and project envelope
+
+The Studio's pure `counter.sapp` derives values from elapsed time without creating
+an authored frame sequence. Its strict config is `{kind:"counter",start,end,
+interval_ms}` with integer start/end0–99, whole-second intervals1000–10000ms,
+maximum30 values and60000ms. Count direction follows the endpoints. Native uses
+the existing tick loop; Web renders current server samples via explicitly started,
+bounded same-origin refreshes. This is not hardware or an external sensor feed.
+
+`Model.apply(state,"counter_start",config,now)` validates atomically; Stop retains
+the last sampled value and returns to unchanged authored frames. Only
+`counter_capture` copies pixels into the selected authored frame. `counter_settings`
+saves without starting; `counter_clear` removes settings. Sequence playback and
+counter playback do not run concurrently. Clock reversal stops the active source.
+
+`Model.export_project` emits `pblang.uno-r4-led-project.v2` with exactly five keys:
+format, mapping, document, arduino_frames, generator. The first four retain the
+legacy authored-frame mapping; generator is null or a validated counter config.
+Runtime clocks, active playback and last sample are deliberately not serialized.
+`Exchange.decode_project` accepts v1 or v2 and returns detached document/settings.
+The legacy `Exchange.decode` remains v1-only to avoid silently discarding generator
+configuration. Importing v1 clears absent settings; v2 imports stopped at its start.
+`Model.export_document` and `/frames.json` stay byte-compatible v1 exports. The
+new `/project.json` endpoint and native Project action persist both parts.
+
+Both formats retain the128KiB strict duplicate/depth/item limits and independent
+validation of all Arduino words against authored pixels. No new renderer/runtime,
+external resource access, JavaScript or Rust is required by this generator.

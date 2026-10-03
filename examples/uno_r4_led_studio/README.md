@@ -17,7 +17,7 @@ to stdout. No background service or board connection is created.
 
 ## Edit and preview
 
-Web **Draw / Text / Animation** choices show the relevant tools without changing
+Web **Draw / Text / Animation / Dynamic** choices show the relevant tools without changing
 any pixels, frames, selection or unsubmitted text. The chosen workspace is kept
 on the next valid action. The matrix, selected frame and preview/navigation
 controls remain together. The active workspace actions precede the matrix in
@@ -69,7 +69,7 @@ These controls remain functional without JavaScript.
   message may change. Valid native/Web edits with a clock resolve the elapsed
   frame atomically before applying their change. Programmatic `Model.apply`
   calls without a clock retain the already selected frame.
-- Native **Export new JSON** creates a new timestamped file beneath
+- Native **Frames** creates a new timestamped file beneath
   `build/uno-r4-led-studio/`, using the existing exclusive-write helper. Existing
   files are never replaced. A failed export is explicitly reported and may leave
   an incomplete new file; the application does not claim success on failure.
@@ -90,13 +90,77 @@ by the server after the request. It may remain in browser history/form recovery;
 this example does not control browser retention. A different button discards the
 pasted payload and performs that button's action.
 
-Only the exact `pblang.uno-r4-led-export.v1` envelope exported by this studio is
-accepted, including its exact mapping and matching Arduino words/durations.
+The exact legacy `pblang.uno-r4-led-export.v1` and project
+`pblang.uno-r4-led-project.v2` envelopes are accepted, including their exact
+mapping and matching authored Arduino words/durations. Project v2 additionally
+validates its generator settings; unknown source types are rejected.
 Raw canonical documents, additional fields, duplicate keys (including escaped
 aliases), excessive nesting, non-binary pixels, malformed JSON and inconsistent
 words are rejected. The shared importer accepts at most 131072 UTF-8 bytes,
 5 nesting levels, 14000 parser items and 16384 lines. Existing limits of 64 frames
 and 60 seconds remain. See the data contract for API examples.
+
+## Dynamic: local timed counter
+
+This source derives its current numeric value from elapsed local runtime time.
+It is **not a sensor, serial connection, external data feed or saved animation
+sequence**. No counter frame list is created. The authored frames, selection and
+frame durations remain independent.
+
+- Choose **Dynamic** on Web, or the **From / To / Every** controls in native.
+- From/To are **0–99**. Counting goes up or down automatically, one unit per
+  interval. The interval is **1–10 whole seconds**. A run allows at most
+  **30 values and 60 seconds**, including the final value's interval.
+- **Save counter settings / Save** stores the settings without motion.
+  **Start counter / Start** validates the currently entered settings and
+  starts from From. Restart begins a new run; opening/importing never starts it.
+- **Stop counter / Stop** samples the current elapsed value, freezes that value
+  for possible capture, and returns to the unchanged authored frame editor.
+  The deadline also stops automatically. A backward clock stops the source.
+- **Capture last value → selected frame / Capture** is the explicit operation
+  that copies generated pixels into a frame. It preserves that frame's duration
+  and all other frames. **Remove counter settings / Remove** clears the source
+  without deleting any authored frame.
+- Sequence **Play preview / Play** and the counter are independent choices.
+  Switching the active preview stops the previous source, retaining the project.
+
+Native samples the generator through the existing update loop. Web renders the
+current server-generated sample and uses a same-origin timed page refresh only
+while the counter runs. This is an explicit bounded local-clock display, not a
+claim that repeated requests discover hardware or obtain a live sensor feed.
+The Stop form token remains valid across counter-only refreshes. Stop/completion
+removes the refresh instruction. Ordinary editing and sequence playback gain no
+refresh loop. Use one active browser tab; existing request budgets still apply.
+Slow/background clients can skip intermediate values; elapsed time determines
+the current value, without a backlog of frames or a precision-timing guarantee.
+
+### What is saved
+
+**Project JSON** (native Project button / Web project download) contains the exact
+`pblang.uno-r4-led-project.v2` envelope: the authored document, matching Arduino
+words and optional counter settings. It excludes running state, last sampled
+value and clock timestamps. Reopening restores a stopped source at its configured
+start, retains the authored document and selects frame1.
+
+**Frames JSON** remains the exact legacy `pblang.uno-r4-led-export.v1` envelope.
+It exports only the authored frames and their matching Arduino words; counter
+settings are intentionally absent. Older Studio versions can still consume this
+export. Importing a legacy file clears absent generator settings. New Studio
+accepts both formats through the same bounded strict import path. Invalid
+settings/duplicate keys/inconsistent Arduino words preserve the existing project.
+
+Programmatic use uses the same controller and pure counter library:
+
+```sapp
+let M=import("./model.sapp");
+let state=M.create();
+let settings=map{kind:"counter",start:7,end:9,interval_ms:1000};
+M.apply(state,"counter_start",settings,10000);
+M.tick(state,11100); // value 8; authored frames unchanged
+M.apply(state,"stop",nil,11200);
+let project=M.export_project(state); // settings retained, timer not persisted
+M.apply(state,"counter_capture"); // explicit authored-frame change
+```
 
 ## Glyph coverage
 
@@ -115,7 +179,8 @@ updates, `Model.apply(state, "static_text", "PB")` updates the selected frame an
 `Model.apply(state, "timing_all", 200)` changes the sequence speed. `Model.apply(state, "play", 3, num_floor(now_ms()))` previews three bounded passes.
 Calls accept an optional clock for atomic elapsed-frame editing during playback. Callers may
 supply changing content explicitly; this example does not poll sensors, run an
-external live-data source, repeat forever or claim physical-board transport.
+external live-data source, repeat forever or claim physical-board transport. The
+separate local counter is described above.
 
 `exchange.sapp` owns strict export-envelope import; `playback.sapp` generates the
 bounded SVG preview; `web_import.sapp` separates the bounded paste payload before
@@ -129,8 +194,8 @@ bodies are not delayed by a 25 ms pause per 4096-byte transport chunk.
 conversion. `model.sapp` owns editor actions; `view.sapp` uses existing GUI/graphics;
 `web.sapp` uses existing UI documents, guarded loopback forms and HTML escaping.
 There is no handwritten JavaScript runtime and no new Rust. Web forms retain
-same-origin, Host, CSRF, stale-form and script-free CSP checks. Each redraw rotates
-the form token; stale forms are rejected and offer a **Return to editor** GET
+same-origin, Host, CSRF, stale-form and script-free CSP checks. Each form rebuild rotates
+the token; counter-only refreshes retain the Stop token until completion. Stale forms are rejected and offer a **Return to editor** GET
 link instead of replaying the previous POST. Invalid forms use the same recovery. An overall 120-request/minute budget
 survives redraws when the existing crawler policy is on; page, style and download
 requests count. A budget rejection retains the session, asks for a 60-second wait
@@ -154,5 +219,9 @@ pblang run tests/semantics/uno_r4_led_studio_test.sapp --allow-all
 pblang run tests/semantics/uno_r4_led_studio_combinations_test.sapp --allow-all
 pblang run tests/semantics/uno_r4_led_studio_web_test.sapp --allow-all
 pblang run tests/semantics/uno_r4_led_studio_import_test.sapp --allow-all
+pblang run tests/semantics/uno_r4_led_studio_counter_test.sapp --allow-all
+pblang run tests/semantics/uno_r4_led_studio_counter_web_test.sapp --allow-all
+python3 tests/tooling/uno_r4_led_studio_counter_http.py
+xvfb-run -a -s '-screen 0 1000x1000x24 -nolisten tcp' env XMODIFIERS=@im=none python3 tests/tooling/uno_r4_led_studio_counter_native.py
 xvfb-run -a -s '-screen 0 1000x1000x24 -nolisten tcp' env XMODIFIERS=@im=none python3 tests/tooling/uno_r4_led_studio_native.py
 ```
