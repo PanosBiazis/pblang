@@ -1,7 +1,8 @@
 # Controlled pbAI adapters
 
 Both facades expose `modular_catalog()`, `modular_probe(adapter)`,
-`modular_run(adapter, request)` and `modular_bind(adapter, provider, resolver)` through the shared PBLang
+`modular_run(adapter, request)`, `modular_bind(adapter, provider, resolver)`
+and `modular_bind_limited(adapter, provider, resolver, limits)` through the shared PBLang
 `stdlib:pbai_modularity.sapp`. Supported IDs are exactly `sensor-v1` and
 `student-v1`. No arbitrary source paths, callbacks, GPU/NPU providers or plugin
 installation are admitted. Existing direct functions remain compatible.
@@ -80,7 +81,7 @@ Set `PBLANG_BIN` to a trusted executable and run it with `--allow-all --deny-net
 --deny-http` (one line). The outer test creates only UUID-named disposable fixtures,
 uses bounded subprocesses and cleans them afterward. Each child denies network,
 HTTP, process execution, FFI, spawning and SQLite. Both products use the same test.
-The 20 cases include missing providers, mismatched exports/contracts, invalid source,
+The 25 cases include missing providers, mismatched exports/contracts, invalid source,
 incorrect numeric output, throwing probes/execution, callable metadata never invoked,
 resolver failure and catalog/invalid-ID paths that never import optional providers.
 These are Linux fixture results; other platforms require their own runtime evidence.
@@ -180,8 +181,8 @@ Storage is constant per live binding. The first **1,024** calls are observed;
 `window_full` becomes true at that boundary. A subsequent call sets
 `observations_dropped:true` and runs normally without new counters/timing. These
 are partial-window aggregates, not lifetime totals. `clear_metrics()` discards
-aggregates and starts a fresh window without changing checked callables, admission
-or report. The binding and its counters live in process memory until released.
+aggregates and starts a fresh window while idle, without changing checked callables,
+admission, lifetime quota or report; during an active call it returns false. The binding and its counters live in process memory until released.
 This is logical retention control, not guaranteed secure memory erasure.
 
 `duration` uses two actual `now_ms()` readings around the checked call. It reports
@@ -211,3 +212,76 @@ from a synthetic checkpoint. Five additional isolated dependency cases exercise
 throwing providers, cyclic unclassified outputs, backward/unavailable/oversized clock
 samples. The source-hidden installed test runs the updated examples' metric assertions
 from a foreign cwd without loading the unselected student provider.
+
+## Call limits, cancellation and active-call state
+
+The existing `modular_bind(adapter, provider, resolver)` remains available without a
+lifetime call limit. Use `modular_bind_limited(adapter, provider, resolver, limits)`
+when the host needs a finite session. `limits` must contain exactly one field,
+`max_calls`, a finite integer in **0..1,000,000**. No strings, booleans, coercion,
+callbacks or additional fields are accepted. Invalid limits produce `invalid_limits`
+before calling the provider's contract/probe or resolver. Already performed top-level
+host imports are outside that admission check. Limits are copied as a number; later
+edits to the caller's map cannot change the session.
+
+```pblang
+let binding=AI.modular_bind_limited("sensor-v1",SENSOR,RESOLVER,map{max_calls:2});
+let first=binding.run(request);
+let state=binding.status();
+assert(state.remaining_calls==1,"one actual call charged");
+binding.clear_metrics(); // Does not replenish the lifetime budget.
+binding.cancel();
+assert(binding.run(nil).error=="binding_cancelled","future work refused");
+```
+
+Each admitted `run` consumes one slot **before** invoking the checked callable.
+Provider input errors, nil replies and exceptions still consume that slot; no
+implicit retry or refund occurs. Rejected admission does not consume a slot. Contract
+probes are separately bounded setup work and are not charged as run calls: a valid
+zero budget still checks the provider but refuses every request. Limits count calls,
+not tokens, CPU time or memory. Existing sensor/student request limits still apply.
+
+Both binding constructors expose `status()` and `cancel()`:
+
+- `status()` returns a detached `pbai.modular.lifecycle.v1` snapshot with `code`,
+  `ready`, `cancelled`, `in_flight`, `max_calls`, `remaining_calls`, `started_calls`
+  and explicit enforcement boundaries. Unlimited bindings use nil for all three
+  quota quantities; they do not invent an unbounded lifetime counter.
+- `cancel()` prevents further calls through this binding. It returns true on the
+  first cancellation and false afterward. It cannot reopen a refused or exhausted
+  binding. There is no resume or budget-refill operation.
+- Refusal precedence is original binding failure, cancellation, active call,
+  exhausted quota. The new run error codes are `binding_cancelled`, `binding_busy`
+  and `call_limit_reached`. `status().code` uses the same precedence, or `ok`.
+
+A private active-call guard rejects synchronous reentry through the same binding
+before provider execution. This prevents recursive work from bypassing admission.
+The guard is cleared after a normal return, nil reply or caught exception. A provider
+may request cancellation during its call; that already-started call still returns
+its ordinary result. Cancellation is **future-calls-only**, not preemption. Fatal
+process termination or a provider that never returns cannot be recovered here.
+There is no watchdog, hard timeout, OS memory cap or cross-thread atomicity guarantee.
+
+`clear_metrics()` keeps its successful nil return. If invoked while this binding's
+call is active, it returns false and leaves the window intact; this prevents silently
+losing that call's measurement. Clearing metrics, saturation of the 1,024-observation
+window and edits to returned report/status/metric maps cannot alter admission or
+replenish quota. Lifecycle refusals count as `rejected_calls` when observed; they add
+no provider duration. The frozen `report().ok` still describes the initial probe,
+not current readiness: check `status()` or the actual `run` result.
+
+State is private and constant-size. No request, checkpoint, output, reason string,
+caller identity or wall-clock timestamp is added to lifecycle state. Cancellation
+does not guarantee release of provider resources or secure memory erasure. The
+host retains responsibility for admission across multiple bindings, direct/legacy
+calls, workers or processes. Creating a new binding creates a new budget. These
+in-process controls are not a sandbox for hostile provider code or a new capability
+grant. No optional imports, network calls or implicit training were introduced.
+
+The lifecycle semantic test covers strict malformed limits including cyclic values,
+NaN/Infinity, zero/maximum boundaries, detached snapshots, cancellation, exhausted
+budgets, provider errors and saturation independent from quota. The shared numeric
+suite charges a real student checkpoint prediction. Five additional dependency
+fixtures verify invalid limits before probing, thrown/nil provider returns, nested
+calls/clear refusal and cancellation during an active call. The installed example
+now also checks quota and cancellation from a foreign cwd with source trees hidden.
