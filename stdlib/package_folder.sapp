@@ -1,0 +1,261 @@
+// Linux source-folder packaging. Never invokes the retained native bundle command.
+// Sources are read-only; existing destinations are never replaced or removed.
+let Dir=import("stdlib:linux_dirfs.sapp");
+let Path=import("stdlib:path.sapp");
+let Ser=import("stdlib:serialization.sapp");
+let Lock=import("stdlib:portable_lock.sapp");
+let Hash=import("stdlib:sha256_pb.sapp");
+let Manifest=import("stdlib:manifest_validate.sapp");
+let FORMAT="pblang.package-folder.v1";
+let MAX_FILES=512;let MAX_DEPTH=24;let MAX_FILE=1048576;let MAX_TOTAL=8388608;
+fn _fail(s,code,message) {s.code=code;s.error=message;throw message;}
+fn _need(s,ok,code,message) {if not ok {_fail(s,code,message);}}
+fn _path(s,value) {
+    _need(s,type(value)=="string" and len(value)>0 and len(value)<=4096,"invalid_path","Expected a bounded path.");
+    _need(s,not str_contains(value,"\\") and not str_contains(value,strfromcharcode(0)),"invalid_path","Unsupported path character.");
+    return Path.normalize(Path.absolute(value));
+}
+fn _within(root,path) {return path==root or str_starts_with(path,root+"/");}
+fn _relative(s,path) {
+    _need(s,type(path)=="string" and len(path)>0 and len(path)<=4096 and not str_starts_with(path,"/")
+        and not str_contains(path,"\\") and not str_contains(path,strfromcharcode(0)),"invalid_relative_path","Expected an in-package relative path.");
+    let normalized=Path.normalize(path);
+    _need(s,normalized!="." and normalized!=".." and not str_starts_with(normalized,"../"),"invalid_relative_path","Path escapes the package.");
+    for part in str_split(normalized,"/") {_need(s,not str_starts_with(part,"."),"hidden_path","Hidden package paths are outside this packaging profile.");}
+    return normalized;
+}
+fn _open(s,path,private) {
+    let fs=Dir.open_absolute(path,false,private);
+    _need(s,fs.ok,"root_unavailable","A required directory could not be opened without following links.");
+    array_push(s.roots,fs);return fs;
+}
+fn _read(s,fs,path) {
+    let r=Dir.read_bytes(fs,path,MAX_FILE);
+    _need(s,r.ok,"source_unavailable","A source file is unreadable, special, linked, or over the limit.");
+    return r.bytes;
+}
+fn _text(s,bytes) {
+    let text=try bytes_to_str(bytes) catch nil;
+    _need(s,type(text)=="string" and str_to_bytes(text)==bytes,"invalid_text","Package metadata must be UTF-8.");return text;
+}
+fn _parse(s,text) {
+    let parsed=Ser.parse_safe(text,"toml",map{max_input_bytes:MAX_FILE});
+    _need(s,parsed.ok and type(parsed.value)=="map","invalid_metadata","Unsupported or malformed package metadata.");return parsed.value;
+}
+// The serialization library deliberately excludes inline TOML tables. Expand
+// only our path-only dependency form before its strict duplicate/type checks.
+fn _manifest(s,text) {
+    let lines=[];let tables=[];let dependencies=false;
+    for raw in str_split(text,"\n") {
+        let line=str_trim(raw);let keep=true;
+        if str_starts_with(line,"[") {dependencies=line=="[dependencies]";}
+        else if dependencies and line!="" and not str_starts_with(line,"#") {
+            let eq=str_index_of(line,"=");
+            if eq>0 {
+                let name=str_trim(str_slice(line,0,eq));let value=str_trim(str_slice(line,eq+1,len(line)));
+                if str_starts_with(value,"{") {
+                    _need(s,regex_match(name,"^[A-Za-z][A-Za-z0-9_-]*$") and str_ends_with(value,"}"),"invalid_metadata","Expected a single-line path dependency table.");
+                    let inner=str_trim(str_slice(value,1,len(value)-1));let spec=_parse(s,inner);
+                    _need(s,len(spec)==1 and map_has(spec,"path") and type(spec.path)=="string","unsupported_dependency","Expected exactly one dependency path.");
+                    array_push(tables,"[dependencies."+name+"]\n"+inner);keep=false;
+                }
+            }
+        }
+        if keep {array_push(lines,raw);}
+    }
+    return _parse(s,str_join(lines,"\n")+"\n"+str_join(tables,"\n"));
+}
+// Validate the descriptor-rooted argv operand locally; linux_dirfs keeps its
+// own sanitizer private. No shell interpolation or option-like operand occurs.
+fn sanitize_path(value) {
+    if type(value)!="string" or len(value)>8192
+        or not regex_match(value,"^/proc/[0-9]+/fd/[0-9]+(/[^/]+)*$")
+        or str_contains(value,strfromcharcode(0)) or str_contains(value,"\\") {
+        throw "package_folder: invalid descriptor path";
+    }
+    for part in str_split(value,"/") {
+        if part=="." or part==".." {throw "package_folder: invalid descriptor component";}
+    }
+    return value;
+}
+// Device/inode values remain strings, avoiding loss of 64-bit identity precision.
+// The stat operand is rooted at the live descriptor, never a shell command.
+fn _identity(s,fs,relative="") {
+    let held=Dir.descriptor_path(fs);_need(s,held.ok,"identity_unavailable","Directory identity is unavailable.");
+    let path=held.path+if relative=="" {""} else {"/"+relative};
+    let stat=if fs_exists("/usr/bin/stat") {"/usr/bin/stat"} else {"/bin/stat"};
+    let result=try proc_spawn_wait(stat,["-L","-c","%d:%i",sanitize_path(path)]) catch nil;
+    _need(s,result!=nil and result.exit_code==0,"identity_unavailable","Directory identity could not be checked.");
+    let identity=str_trim(result.stdout);
+    _need(s,regex_match(identity,"^[0-9]+:[0-9]+$"),"identity_unavailable","Directory identity is malformed.");return identity;
+}
+fn _mount_id(s,fs) {
+    let held=Dir.descriptor_path(fs);
+    _need(s,held.ok and regex_match(held.path,"^/proc/[0-9]+/fd/[0-9]+$"),"identity_unavailable","Held directory identity is unavailable.");
+    let text=try fs_read(str_replace_all(held.path,"/fd/","/fdinfo/")) catch nil;
+    _need(s,type(text)=="string" and len(text)<=4096,"identity_unavailable","Held directory mount record is unavailable.");
+    let value=nil;
+    for line in str_split(text,"\n") {
+        if str_starts_with(line,"mnt_id:") {
+            _need(s,value==nil,"identity_unavailable","Duplicate mount identity.");
+            value=str_trim(str_slice(line,7,len(line)));
+        }
+    }
+    _need(s,type(value)=="string" and regex_match(value,"^[0-9]+$"),"identity_unavailable","Mount identity is malformed.");return value;
+}
+fn _collect(s,fs,relative,depth) {
+    _need(s,depth<=MAX_DEPTH,"depth_limit","Package directory depth exceeds the limit.");
+    s.directory_ids[_identity(s,fs,relative)]=true;
+    let listed=Dir.list(fs,if relative=="" {"root"} else {relative},MAX_FILES+1);
+    _need(s,listed.ok and not listed.truncated,"inventory_failed","Package directory could not be listed completely.");
+    for name in array_sort(listed.entries) {
+        _need(s,type(name)=="string" and name!="" and name!="." and name!=".." and not str_contains(name,"/")
+            and not str_contains(name,"\\") and not str_contains(name,strfromcharcode(0)),"invalid_name","Invalid package entry name.");
+        if not str_starts_with(name,".") and name!="target" {
+            let path=if relative=="" {name} else {relative+"/"+name};
+            _need(s,path!="pblang" and path!="root" and path!="package-receipt.json","reserved_path","Package uses a reserved output filename.");
+            _need(s,not str_ends_with(path,"/pblang.toml") and not str_ends_with(path,"/pblang.lock"),"nested_metadata","Nested package metadata is outside this profile.");
+            let meta=Dir.metadata(fs,path);
+            _need(s,meta.ok and (meta.kind=="directory" or meta.kind=="file"),"unsupported_entry","Only regular files and directories can be packaged.");
+            _need(s,len(s.entries)<MAX_FILES,"entry_limit","Package entry count exceeds the limit.");
+            if meta.kind=="directory" {
+                s.entries[path]=map{kind:"d",bytes:[]};_collect(s,fs,path,depth+1);
+            } else {
+                let bytes=_read(s,fs,path);s.total=s.total+len(bytes);
+                _need(s,s.total<=MAX_TOTAL,"byte_limit","Package source bytes exceed the limit.");
+                s.entries[path]=map{kind:"f",bytes:bytes};
+            }
+        }
+    }
+}
+fn _u64(n) {
+    let bytes=[0,0,0,0,0,0,0,0];let i=7;
+    while i>=0 {bytes[i]=num_mod(n,256);n=num_floor(n/256);i=i-1;}return bytes;
+}
+// Exactly the retained package-tree-v2 byte format, including empty directories.
+fn _dependency_digest(s,root) {
+    let hash=Hash.new();Hash.update(hash,str_to_bytes("pblang-package-tree-v2"));Hash.update(hash,[0]);
+    for path in array_sort(map_keys(s.entries)) {
+        if str_starts_with(path,root+"/") {
+            let entry=s.entries[path];let rel=str_slice(path,len(root)+1,len(path));let bytes=str_to_bytes(rel);
+            Hash.update(hash,str_to_bytes(entry.kind));Hash.update(hash,_u64(len(bytes)));Hash.update(hash,bytes);
+            Hash.update(hash,_u64(len(entry.bytes)));Hash.update(hash,entry.bytes);
+        }
+    }
+    return Hash.finish(hash);
+}
+fn _metadata(s,root) {
+    _need(s,map_has(s.entries,"pblang.toml") and s.entries["pblang.toml"].kind=="f","manifest_missing","pblang.toml is required.");
+    let text=_text(s,s.entries["pblang.toml"].bytes);let manifest=_manifest(s,text);
+    let validated=Manifest.validate_manifest_text(text);
+    _need(s,validated.ok,"invalid_package","Package manifest validation failed.");
+    let package=try manifest.package catch nil;
+    _need(s,type(package)=="map" and type(try package.name catch nil)=="string"
+        and type(try package.version catch nil)=="string","invalid_package","Package name and version are required.");
+    let entry=_relative(s,try package.entry catch nil);
+    _need(s,str_ends_with(entry,".sapp"),"invalid_entry","Declared entry must end in .sapp.");
+    _need(s,map_has(s.entries,entry) and s.entries[entry].kind=="f","entry_missing","Declared package entry is not an included regular file.");
+    let deps=try manifest.dependencies catch map{};
+    _need(s,type(deps)=="map" and len(deps)<=64,"invalid_dependencies","Expected at most 64 local dependencies.");
+    let paths=map{};
+    for name in map_keys(deps) {
+        _need(s,regex_match(name,"^[A-Za-z][A-Za-z0-9_-]*$"),"unsupported_dependency","Only local named dependencies are supported.");
+        let spec=deps[name];
+        _need(s,type(spec)=="map" and not map_has(spec,"git") and not map_has(spec,"registry"),"unsupported_dependency","Remote dependencies are not packaged.");
+        for key in map_keys(spec) {_need(s,key=="path","unsupported_dependency","This profile supports path-only dependency declarations.");}
+        let path=_relative(s,try spec.path catch nil);
+        _need(s,map_has(s.entries,path) and s.entries[path].kind=="d","dependency_missing","Dependency must be a visible in-package directory.");paths[name]=path;
+    }
+    let digest=sha256(text);let locktext="manifest_sha256 = \""+digest+"\"\ncontent_hash_algorithm = \"pblang-package-tree-v2\"\n\n[dependencies]\n";
+    if map_has(s.entries,"pblang.lock") {
+        let original=_text(s,s.entries["pblang.lock"].bytes);let lock=_parse(s,original);
+        _need(s,(try lock.manifest_sha256 catch "")==digest and (try lock.content_hash_algorithm catch "")=="pblang-package-tree-v2","stale_lock","Lock does not match the manifest or supported algorithm.");
+        let locked=try lock.dependencies catch map{};
+        _need(s,type(locked)=="map" and len(locked)==len(paths),"stale_lock","Lock dependencies do not match the manifest.");
+        for name in map_keys(paths) {
+            let item=try locked[name] catch nil;
+            _need(s,type(item)=="map" and (try item.source catch nil)==nil,"unsupported_lock","Lock must describe local dependencies only.");
+            _need(s,(try item.sha256 catch "")==_dependency_digest(s,paths[name]),"dependency_hash","Dependency content does not match its lock.");
+        }
+        // No dependencies is a valid empty lock; normalize_text expects a table.
+        if len(paths)>0 {
+            let normalized=try Lock.normalize_text(text,original,root) catch nil;
+            _need(s,normalized!=nil and normalized.ok and normalized.rewritten==len(paths),"lock_path","Dependency lock paths must match in-package manifest paths.");locktext=normalized.text;
+        }
+    } else {_need(s,len(paths)==0,"lock_missing","Local dependencies require a current pblang.lock.");}
+    s.entries["pblang.lock"]=map{kind:"f",bytes:str_to_bytes(locktext)};
+    s.entry=entry;s.dependency_count=len(paths);
+}
+fn _publish_bytes(s,dest,path,bytes) {
+    s.publication_attempted=true;
+    let result=nil;
+    if len(bytes)==0 {result=Dir.write_new_atomic(dest,path,bytes,false);}
+    else {
+        let held=Dir.sealed_child_bytes(dest,"package-file",bytes);
+        _need(s,held.ok,"snapshot_failed","Output bytes could not be sealed.");
+        result=Dir.copy_held_range_new_atomic(dest,held,dest,path,0,len(bytes),false,false);
+        let closed=Dir.close_child_descriptor(dest,held);
+        if not closed {s.cleanup_ok=false;}
+    }
+    _need(s,result!=nil and result.ok,"publication_failed","File publication failed; inspect the partial destination before retrying.");
+    _need(s,s.cleanup_ok,"cleanup_failed","File snapshot closure was not confirmed.");s.files_written=s.files_written+1;
+}
+fn _run(s,project,destination,runtime) {
+    _need(s,platform()=="linux","platform_unavailable","Source-folder packaging currently requires Linux.");
+    let root=_path(s,project);let out=_path(s,destination);let executable=_path(s,runtime);
+    _need(s,root!="/" and out!="/" and not _within(root,out) and not _within(out,root),"overlap","Source and destination must be disjoint directories.");
+    let source=_open(s,root,false);let source_mount=_mount_id(s,source);
+    // Admission and a complete immutable-in-memory source view precede output creation.
+    _collect(s,source,"",0);_metadata(s,root);
+    let runtime_fs=_open(s,Path.dirname(executable),false);let runtime_name=Path.basename(executable);
+    let meta=Dir.metadata(runtime_fs,runtime_name);
+    _need(s,meta.ok and meta.kind=="file" and meta.size>=4 and meta.size<=67108864,"runtime_unavailable","Choose a regular Linux runtime file up to 64 MiB.");
+    let held=Dir.sealed_snapshot_file_descriptor(runtime_fs,runtime_name,67108864);
+    _need(s,held.ok,"runtime_unavailable","Runtime snapshot could not be sealed.");
+    let magic=Dir.read_held_range_bytes(runtime_fs,held,0,num_min(20,held.size));
+    _need(s,magic.ok and len(magic.bytes)==20 and slice(magic.bytes,0,6)==[127,69,76,70,2,1]
+        and magic.bytes[18]==62 and magic.bytes[19]==0,"runtime_format","Runtime must be a Linux x86-64 ELF executable.");
+    // A pre-existing private parent is required; never chmod a caller directory.
+    let parent=_open(s,Path.dirname(out),true);let name=Path.basename(out);
+    _need(s,_mount_id(s,parent)==source_mount,"mount_mismatch","Source and output parent must share one mount in this profile.");
+    _need(s,not map_has(s.directory_ids,_identity(s,parent)),"identity_overlap","Output parent aliases a source directory.");
+    s.output_attempted=true;
+    let made=Dir.mkdir_new(parent,name,false);
+    _need(s,made.ok and made.permission_private,"output_exists","Destination must be absent in an existing private output parent.");
+    s.output_created=true;let dest=_open(s,out,true);
+    _need(s,not map_has(s.directory_ids,_identity(s,dest)),"identity_overlap","Output directory aliases a source directory.");
+    let initial=Dir.list(dest,"root",1);
+    _need(s,initial.ok and not initial.truncated and len(initial.entries)==0,"output_changed","New output directory changed before publication.");
+    for path in array_sort(map_keys(s.entries)) {
+        let item=s.entries[path];
+        if item.kind=="d" {
+            let made=Dir.mkdir_new(dest,path,false);_need(s,made.ok and made.permission_private,"directory_failed","Output directory creation failed.");
+        } else {_publish_bytes(s,dest,path,item.bytes);}
+    }
+    s.publication_attempted=true;
+    let copied=Dir.copy_held_range_new_atomic(runtime_fs,held,dest,"pblang",0,held.size,false,true);
+    _need(s,copied.ok,"runtime_publication_failed","Runtime publication failed; inspect the partial destination.");
+    s.files_written=s.files_written+1;
+    let receipt=map{format:FORMAT,complete:true,entry:s.entry,files:s.files_written,source_bytes:s.total,
+        dependencies:s.dependency_count,native_bundle_invoked:false,source_writes:false,
+        whole_tree_atomic:false,scope:"linux-local-visible-files",runtime_authenticated:false};
+    _publish_bytes(s,dest,"package-receipt.json",str_to_bytes(json_stringify(receipt)+"\n"));
+    s.complete=true;
+}
+fn bundle(project,destination,runtime) {
+    let s=map{roots:[],entries:map{},directory_ids:map{},total:0,entry:nil,dependency_count:0,code:nil,error:nil,
+        output_attempted:false,output_created:false,publication_attempted:false,
+        files_written:0,complete:false,cleanup_ok:true};
+    let passed=try {_run(s,project,destination,runtime);true} catch false;
+    if not passed and s.error==nil {s.code="operation_failed";s.error="Package operation failed before confirmed completion.";}
+    for fs in s.roots {if not (try Dir.close(fs) catch false) {s.cleanup_ok=false;}}
+    let result=map{ok:passed and s.complete and s.cleanup_ok,format:FORMAT,complete:s.complete,
+        entry:s.entry,files_written:s.files_written,source_bytes:s.total,dependencies:s.dependency_count,
+        output_created:s.output_created,output_may_exist:s.output_attempted,publication_attempted:s.publication_attempted,
+        partial_output_possible:s.output_attempted and not s.complete,owned_handles_closed:s.cleanup_ok,
+        native_bundle_invoked:false,source_writes:false,whole_tree_atomic:false};
+    if s.error!=nil {result.code=s.code;result.error=s.error;}
+    if not s.cleanup_ok {result.cleanup_error="Handle cleanup was not confirmed; do not automatically retry.";}
+    return result;
+}
+export bundle;
