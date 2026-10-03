@@ -148,3 +148,7 @@ acceptance was rejected. Neither result measures general language capability.
 
 See [the measured reports](benchmarks/pbai_student_review_release-2026-09-28.json)
 and [local verification](benchmarks/pbai_student_review_checks-2026-09-28.json).
+
+Reviewed predictions now reuse the private evaluated adapters across calls and
+follow acceptance/rollback without reloading. For bounded prediction/comparison
+requests and measured inference behavior, see [student tools](pbAI_Student_Tools.md).
