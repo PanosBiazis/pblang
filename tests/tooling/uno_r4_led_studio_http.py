@@ -21,7 +21,7 @@ class Form(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
-        if tag == 'input' and 'name' in attrs:
+        if tag == 'input' and 'name' in attrs and (attrs.get('type') != 'radio' or 'checked' in attrs):
             self.inputs[attrs['name']] = attrs.get('value', '')
         if tag == 'button' and 'value' in attrs:
             self.active = [attrs['value'], '']
@@ -38,10 +38,10 @@ class Form(HTMLParser):
 
 def main():
     root = Path(__file__).resolve().parents[2]
-    origin = 'http://127.0.0.1:18768'
+    origin = 'http://127.0.0.1:18769'
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with socket.socket() as probe:
-        probe.bind(('127.0.0.1', 18768))
+        probe.bind(('127.0.0.1', 18769))
     child = subprocess.Popen([str(root / 'target/release/pblang'), 'run', 'tests/fixtures/uno_r4_led_studio_web.sapp', '--allow-all'], cwd=root, start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def get(path='/'):
@@ -70,6 +70,8 @@ def main():
                 time.sleep(.1)
         original = json.loads(get('/frames.json'))
         assert '<set ' not in page
+        assert '<button type="submit" disabled hidden' in page
+        assert 'action="/action#studio-stage"' in page
         document = copy.deepcopy(original)
         frame = document['document']['frames'][0]
         frame['duration_ms'] = 50
@@ -92,18 +94,36 @@ def main():
                 page = candidate
         assert post(page, 'Import JSON', json.dumps(original), 'https://invalid.example')[0] == 403
         assert get('/frames.json') == snapshot
-        code, page = post(page, 'Play once')
+        stale = page
+        code, page = post(page, 'Play preview')
         assert code == 200 and 'id="led-playback"' in page
+        assert 'id="led-editor" hidden' in page
+        code, rejected = post(stale, 'Clear')
+        assert code == 403 and 'Return to editor' in rejected
+        assert get('/frames.json') == snapshot
         code, page = post(page, 'Stop playback')
         assert code == 200 and '<set ' not in page
-        code, page = post(page, 'Play once')
+        code, page = post(page, 'Play preview')
         code, page = post(page, 'Clear')
         assert code == 200 and '<set ' not in page
         code, page = post(page, 'Import JSON', snapshot)
         assert code == 200 and '<set ' not in page and get('/frames.json') == snapshot
         for frame, words in zip(document['document']['frames'], document['arduino_frames']):
             assert [int(''.join(str(int(v)) for v in frame['pixels'][i:i+32]), 2) for i in (0, 32, 64)] + [frame['duration_ms']] == words
-        print(json.dumps({'result': 'pass', 'real_http': True, 'pretty_import_bytes': len(pretty.encode()), 'frames': 64, 'atomic_invalid_imports': True, 'origin_guard': True, 'play_stop_edit_remove_animation': True, 'all_words_independently_verified': True}))
+        # Exercise the default outer budget through actual HTTP; styles/downloads
+        # count too. Failure must preserve exported state and offer GET recovery.
+        budget_state = get('/frames.json')
+        for attempt in range(130):
+            try:
+                get('/robots.txt')
+            except urllib.error.HTTPError as error:
+                assert error.code == 429 and error.headers['Retry-After'] == '60'
+                recovery = error.read().decode()
+                assert 'href="/#studio-stage"' in recovery and 'Wait 60 seconds' in recovery
+                break
+        else:
+            raise AssertionError('Request budget was reset by redraws')
+        print(json.dumps({'result': 'pass', 'real_http': True, 'pretty_import_bytes': len(pretty.encode()), 'frames': 64, 'atomic_invalid_imports': True, 'origin_guard': True, 'stale_form_recovery': True, 'request_budget_recovery': True, 'play_stop_edit_remove_animation': True, 'all_words_independently_verified': True}))
     finally:
         if child.poll() is None:
             os.killpg(child.pid, signal.SIGTERM)
