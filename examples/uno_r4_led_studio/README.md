@@ -20,7 +20,9 @@ to stdout. No background service or board connection is created.
 Web **Draw / Text / Animation** choices show the relevant tools without changing
 any pixels, frames, selection or unsubmitted text. The chosen workspace is kept
 on the next valid action. The matrix, selected frame and preview/navigation
-controls remain together. **Save / import JSON** is an expandable advanced section.
+controls remain together. The active workspace actions precede the matrix in
+DOM and keyboard order; at widths of 900px and above they sit beside it. Narrow
+screens stack the tools before the matrix. **Save / import JSON** is an expandable advanced section.
 These controls remain functional without JavaScript.
 
 
