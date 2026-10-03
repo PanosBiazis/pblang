@@ -135,3 +135,42 @@ The X11 driver requires an existing retained runtime, xdotool and Xvfb. It uses
 Tab/Enter for local-link → Back → Forward, checks the resulting session and closes
 after 6.5 seconds. It refuses non-Xvfb displays. See the capability matrix in
 [the browser contract](../../docs/DECLARATIVE_BROWSER.md).
+
+
+## Reading appearance
+
+The native reader uses one compact Back / Forward / Home / Style toolbar, even at
+390px width. **Style** opens a separate reading settings screen; **Done** returns
+to the same document. Family, body size, text scale, line spacing and density are
+session-local options. No preferences are persisted or transmitted.
+
+```pblang
+let App=import("./app.sapp");
+let reader=App.create("local","dark",map{
+    font_family:"sans",body_size:16,title_size:28,
+    caption_size:12,button_size:15,font_scale:1,line_height:1.45,density:"comfortable"
+});
+App.configure(reader,map{font_family:"serif",body_size:18});
+App.refresh(reader);
+```
+
+`browser_view.create(document,appearance)` accepts the same options for native,
+Web and Android presentation. Unknown keys are rejected. Sizes are integers
+12–40, font scale is 0.75–1.5, line height is 1–2.5, density is `compact` or
+`comfortable`. Invalid updates leave the existing settings intact. Per-element
+choices can be applied to the resulting Modern UI tree using normal option maps.
+The reader defaults opt into natural native spacing; existing unrelated GUI
+applications retain their defaults. See [typography](../../docs/TYPOGRAPHY.md).
+
+The default guide fits the tested 800×816 and 390×844 native windows. Very large
+custom settings, unusually long documents or shorter windows can exceed the
+available height; this example does not add scrolling or a pagination engine.
+Native row reservation remains conservative, and bitmap fallback cannot emulate
+arbitrary system fonts. Web/Android use platform-owned fonts and may break lines
+differently. The inert `--export` HTML continues to use its existing fixed style;
+customizable presentation is provided by `--web-preview` and the shared view.
+
+Additional tests: `tests/semantics/readable_typography_test.sapp` and
+`tests/tooling/readable_browser_native.py` (isolated Xvfb, optional
+`PBLANG_READER_WIDTH=390`). The latter checks navigation plus keyboard-only font
+changes and records default/serif screenshots.

@@ -36,7 +36,7 @@ PBIDE's **WRAP** toolbar action toggles wrapping for the selected label and expa
 ## Rendering and limits
 
 - Native GUI wraps at spaces, splits long words at the existing `text_layout` grouping boundaries, preserves explicit line breaks, collapses horizontal spaces and replaces tabs with spaces. CRLF/CR normalize to LF. It preserves the existing combining-mark and ZWJ groups; this is not a full Unicode shaping or grapheme-conformance implementation.
-- Native width uses the existing fixed scalar advance. Groups wider than a whole line become a bounded dot placeholder. Truncated content ends with `...` (fewer dots for extremely narrow labels). A rectangle too short for one complete line draws no text.
+- Native row reservation uses the existing fixed scalar advance. Optional `text_spacing:"natural"` uses measured glyph positioning within each row; see [Typography](TYPOGRAPHY.md). Groups wider than a whole line become a bounded dot placeholder. Truncated content ends with `...` (fewer dots for extremely narrow labels). A rectangle too short for one complete line draws no text.
 - Web emits optional pre-line wrapping, overflow handling and a line clamp. Android emits TextView single-line, maximum-line and END-ellipsis settings. Each platform uses its existing fonts and layout: identical pixel positions or line breaks across platforms are not promised.
 - The pure `text_flow.wrap(text,columns,max_lines)` helper accepts at most 65,536 scalar characters, 0–4,096 columns and 1–64 rows. Native style sizes remain 8–64 logical units. Existing UI tree/depth limits still apply.
 - No external fonts, new dependencies, telemetry or network operations are introduced by text flow. Existing glyph availability and rendering backends remain in place.

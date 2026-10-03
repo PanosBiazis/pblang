@@ -1,0 +1,117 @@
+// Bounded TrueType positioning over the existing parser and native glyph painter.
+// Unsupported collections, CFF, characters and unavailable bounded I/O return nil.
+let TTF=import("stdlib:ttf.sapp");
+fn parse(bytes) {
+    if type(bytes)!="array" or len(bytes)<12 or len(bytes)>1048576 {throw "font metrics byte limit";}
+    if not TTF.validate(bytes).ok or TTF.u16(bytes,4)>64 {throw "font metrics directory limit";}
+    let dir=TTF.read_table_directory(bytes);
+    for key in map_keys(dir.tables) {
+        let table=dir.tables[key];
+        if table.offset<12 or table.length<0 or table.offset+table.length>len(bytes) {throw "font table outside snapshot";}
+    }
+    for key in ["head","maxp","loca","hhea","hmtx","cmap","glyf"] {
+        if not map_has(dir.tables,key) {throw "unsupported font metrics tables";}
+    }
+    if dir.tables.head.length<54 or dir.tables.maxp.length<6 or dir.tables.hhea.length<36
+        or dir.tables.cmap.length<4 {throw "short metrics table";}
+    let units=TTF.u16(bytes,dir.tables.head.offset+18);
+    let loca_kind=TTF.i16(bytes,dir.tables.head.offset+50);
+    let count=TTF.u16(bytes,dir.tables.maxp.offset+4);
+    let horizontal=TTF.u16(bytes,dir.tables.hhea.offset+34);
+    if units<16 or units>16384 or count<1 or count>16384 or horizontal<1 or horizontal>count
+        or (loca_kind!=0 and loca_kind!=1) {throw "font metrics count limit";}
+    if dir.tables.loca.length<(count+1)*(if loca_kind==1 {4} else {2})
+        or dir.tables.hmtx.length<horizontal*4+(count-horizontal)*2 {throw "short metrics records";}
+    let cm=dir.tables.cmap;let records=TTF.u16(bytes,cm.offset+2);
+    if records>64 or 4+8*records>cm.length {throw "cmap record limit";}
+    let found=false;
+    for i records {
+        let sub=cm.offset+TTF.u32(bytes,cm.offset+4+i*8+4);
+        if sub<cm.offset or sub+2>cm.offset+cm.length {throw "cmap offset outside table";}
+        if TTF.u16(bytes,sub)==4 and not found {
+            if sub+16>cm.offset+cm.length {throw "short cmap header";}
+            let length=TTF.u16(bytes,sub+2);let segments=TTF.u16(bytes,sub+6)/2;
+            if segments<1 or segments>1024 or segments!=num_floor(segments)
+                or length<16+segments*8 or sub+length>cm.offset+cm.length {throw "cmap segment limit";}
+            found=true;
+        }
+    }
+    if not found {throw "font metrics requires BMP cmap4";}
+    let font=TTF.load_font(bytes);font.metric_cache=map{};font.metric_cache_bytes=0;
+    let cmap=map{};for key in map_keys(font.cmap) {if key!="bytes" {cmap[key]=font.cmap[key];}}
+    font.cache_bytes=len(bytes)+1024+len(str_to_bytes(json_stringify(map{dir:font.dir,head:font.head,
+        loca:font.loca,hmtx:font.hmtx,cmap:cmap})));
+    if font.cache_bytes>2097152 {throw "font metadata payload limit";}
+    return font;
+}
+fn load(path) {
+    let File=import("stdlib:secure_file.sapp");
+    let result=try File.read_bytes(path,1048576) catch nil;
+    if result==nil or not result.ok {return nil;}
+    return try parse(result.bytes) catch nil;
+}
+fn _glyph(font,code) {
+    let key=str(code);if map_has(font.metric_cache,key) {return font.metric_cache[key];}
+    if code<32 or code>65535 {return nil;}
+    let index=TTF.font_glyph_index(font,code);
+    if index==0 or index>=font.num_glyphs {return nil;}
+    let advance=font.hmtx[index].advance_width;
+    // Combining/zero-advance glyphs require shaping; leave them to the fallback.
+    if advance<=0 {return nil;}
+    let start=font.loca[index];let end=font.loca[index+1];let table=font.dir.tables.glyf;
+    if start<0 or end<start or end>table.length {return nil;}
+    let result=map{advance:advance,left:0,right:0,bottom:0,top:0};
+    if end>start {
+        if end-start<10 {return nil;}
+        let offset=table.offset+start;
+        result.left=TTF.i16(font.bytes,offset+2);result.bottom=TTF.i16(font.bytes,offset+4);
+        result.right=TTF.i16(font.bytes,offset+6);result.top=TTF.i16(font.bytes,offset+8);
+        if result.right<result.left or result.top<result.bottom {return nil;}
+    }
+    let cost=len(key)+len(str_to_bytes(json_stringify(result)));
+    if len(map_keys(font.metric_cache))<2048 and font.metric_cache_bytes+cost<=131072 {
+        font.metric_cache[key]=result;font.metric_cache_bytes=font.metric_cache_bytes+cost;
+    }
+    return result;
+}
+fn layout(font,text,size) {
+    if font==nil or type(text)!="string" or len(text)>4096 or type(size)!="number"
+        or not (size>=6 and size<=256) {return nil;}
+    let ratio=size/font.head.units_per_em;let cursor=0;let right=0;let top=0;let bottom=0;let glyphs=[];let phase=0;
+    for i len(text) {
+        let metric=_glyph(font,strcharcodeat(text,i));if metric==nil {return nil;}
+        let upper=num_ceil(metric.top*ratio);let lower=num_floor(metric.bottom*ratio);
+        top=num_max(top,upper);bottom=num_min(bottom,lower);
+        // Start an ordered batch phase when raster boxes overlap. Within a
+        // phase ink boxes are disjoint, so grouping cannot reorder overlapping ink.
+        if upper>lower {
+            let left=num_floor(cursor+0.5)+num_floor(metric.left*ratio);
+            if left<0 {return nil;}
+            if left<right {phase=phase+1;}
+            right=num_max(right,num_floor(cursor+0.5)+num_ceil(metric.right*ratio));
+        }
+        push(glyphs,map{text:str_slice(text,i,i+1),x:num_floor(cursor+0.5),top:upper,height:upper-lower,phase:phase});
+        cursor=cursor+metric.advance*ratio;
+    }
+    if top-bottom>size*2.5 {return nil;}
+    let height=num_max(size,top-bottom);
+    let baseline=num_floor((height-(top-bottom))/2)+top;
+    for glyph in glyphs {glyph.y=baseline-glyph.top-num_max(0,num_floor((num_floor(size)-glyph.height)/2));}
+    let width=num_max(num_ceil(cursor),right);if width>8192 {return nil;}
+    // Batch glyphs sharing a native vertical offset into sparse one-pixel cells.
+    // Space cells carry positioning only: the existing painter emits no space ink.
+    let rows=map{};let batches=[];
+    for glyph in glyphs {
+        if glyph.height>0 {
+            let key=str(glyph.phase)+":"+str(glyph.y);
+            if not map_has(rows,key) {
+                if len(batches)>=32 {return nil;}
+                let row=map{y:glyph.y,text:"",cursor:0};rows[key]=row;push(batches,row);
+            }
+            let row=rows[key];if glyph.x<row.cursor {return nil;}
+            row.text=row.text+str_repeat(" ",glyph.x-row.cursor)+glyph.text;row.cursor=glyph.x+1;
+        }
+    }
+    return map{glyphs:glyphs,batches:batches,width:width,height:height,baseline:baseline};
+}
+export parse,load,layout;
