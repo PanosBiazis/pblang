@@ -57,8 +57,9 @@ Plots are prepared once from the detached document, not from submitted form data
 
 Labels are HTML-escaped. SVG contains only generated geometry and text, with no
 scripts, remote assets, or input event handlers. A labelled figure and expandable
-HTML table expose all point values; keyboard users can open the table. Each axis
-is independently normalized; constant axes are centered. Distances and angles
+HTML table expose all point values; keyboard users can open the table. By default each axis
+is independently normalized; constant axes are centered. Explicit domains
+override autoscaling, including constant axes. Distances and angles
 are not preserved on screen. Consult the table for exact source values.
 
 Plot data is deliberately sent to the browser and can be read or copied. Existing
@@ -120,3 +121,40 @@ validation passed in an isolated fixture. Entry-only security analysis reported
 no unsuppressed findings; it is not a complete security audit. Existing heuristic
 lint warnings remain. The Graphify update exceeded a 20-second bound and was
 terminated; no claim of refreshed graph coverage is made.
+
+## Named points and comparable scales
+
+`Plot.render(points, title, x_label, y_label, options)` accepts an optional fifth
+argument. Existing four-argument calls and an empty options map retain the
+previous HTML byte for byte. Canonical scatter widgets pass the same map in
+`props.plot_options`:
+
+```pblang
+map{points:[[1,2],[3,4]],title:"Projection",x_label:"X",y_label:"Y",
+    plot_options:map{x_domain:[0,4],y_domain:[0,8],
+        point_labels:["Reference","Candidate"],
+        description:"Both views use the same coordinate ranges.",table_open:true}}
+```
+
+- `x_domain` / `y_domain`: optional `[minimum, maximum]`, strictly increasing,
+  within the existing coordinate bound. Every point must fit. Out-of-domain
+  points are rejected; none are silently hidden, clipped or clamped. Omitted
+  axes retain autoscaling. Shared domains provide consistent scale across plots
+  only when the same axes/units and plotting dimensions are used.
+- `point_labels`: optional array with exactly one nonempty string per point, up
+  to 256 characters each and 4096 UTF-8 bytes in total. Names appear in the SVG
+  tooltip and the first column of the data table. Duplicate names are allowed;
+  rows preserve input order. No color-only encoding is required.
+- `description`: optional text up to 4096 characters, visibly rendered below the
+  plot. It is descriptive text, never interpreted markup.
+- `table_open`: optional boolean, default false; opens the native HTML details
+  element initially. Users can still open/close it with keyboard controls.
+
+A nonempty options map also displays point count and exact axis limits as text.
+Titles, labels and descriptions remain escaped; unknown options fail closed.
+The 256 KiB plot output limit and canonical document budgets remain in force.
+Options are prepared from the detached canonical document, and hidden plots do
+not expose their labels or descriptions in the page. Names are public plotted
+data, not private metadata. This extends passive Web/SVG visualization of 2D
+data or projected 3D/ND data; it does not add a native GPU renderer, device
+installation or OS accessibility bridge. No rendering speedup is claimed.
