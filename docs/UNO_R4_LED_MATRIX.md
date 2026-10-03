@@ -65,3 +65,42 @@ per row). It is a validated data export, not a firmware image or transport proto
 The Arduino adapter/board initialization and physical orientation check remain
 future work. Import the canonical document via `LED.validate(exported.document)`;
 `LED.decode` accepts canonical document JSON, not the outer download envelope.
+
+
+## Studio export import and playback
+
+The studio `examples/uno_r4_led_studio/exchange.sapp` accepts only the existing
+export envelope, with exactly `format`, `mapping`, `document`, `arduino_frames`.
+`format` is `pblang.uno-r4-led-export.v1`; `mapping` must be
+`row-major; pixel y*12+x; MSB-first uint32 words`. Every four-number Arduino row
+must equal the three packed pixel words and duration from its corresponding
+canonical frame. Canonical document validation remains unchanged.
+
+```pblang
+let Model=import("../examples/uno_r4_led_studio/model.sapp");
+let state=Model.create();
+let saved=Model.export_document(state);
+Model.apply(state,"import",saved);
+```
+
+Import is atomic: validate the complete envelope before replacing state. It resets
+selection to frame 1, stops playback, and clears transient text/export flags.
+Malformed import leaves those fields unchanged. Native uses `secure_file.read_text`
+with 131072-byte maximum; Web uses explicit paste plus the existing guarded form.
+Limits are 131072 UTF-8 bytes, 5 JSON nesting levels, 14000 parser items and 16384
+lines, with duplicate keys rejected before the ordinary JSON parser. This larger
+*envelope* limit does not change the library's 64 KiB canonical decode contract.
+No extra fields or raw document-only import are accepted.
+
+Web playback is a finite SVG timeline produced in PBLang. Each remaining frame
+has a timed visibility interval; the final frame freezes and a completion label
+appears. Stop and successful edits/import navigate to a response without the
+animation tree. There is no JavaScript, setInterval, recurring request or infinite
+repeat. Browser presentation and server wall clock are not synchronized hardware
+clocks: server state catches up on the next valid page/action request. Background
+tab scheduling, navigation/history and other viewers are browser-local; a shared
+server edit does not push updates to already open tabs. Use one active editor tab.
+
+The mechanism uses SVG [`set`](https://developer.mozilla.org/en-US/docs/Web/SVG/Reference/Element/set)
+visibility with finite durations. Actual tested browser support is reported in the
+release evidence; this source contract is not a universal platform test.
