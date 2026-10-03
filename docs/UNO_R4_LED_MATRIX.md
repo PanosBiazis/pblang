@@ -92,6 +92,19 @@ lines, with duplicate keys rejected before the ordinary JSON parser. This larger
 *envelope* limit does not change the library's 64 KiB canonical decode contract.
 No extra fields or raw document-only import are accepted.
 
+Static text is a separate selected-frame operation (`Model.apply(state,
+"static_text", "PB")`): 1–2 complete centered 5×7 glyphs fit without cropping.
+It preserves the selected duration and every other frame. Scrolling text remains
+an explicit whole-timeline replacement. `Model.apply(state, "timing_all", 200)`
+changes all frame durations atomically within the existing 60-second document
+budget. Switching Web Draw/Text/Animation workspaces changes no project data.
+
+`Model.apply(state, "play", 3, num_floor(now_ms()))` starts three preview passes
+from frame 1. Repetitions must be 1–8, with at most 60 seconds and 128 displayed
+frames per run. These transient settings do not change the document or export
+schema. Stop resolves the elapsed pass/frame; invalid actions preserve clocks,
+selection, playback and document. Import resets repetitions to 1.
+
 Web playback is a finite SVG timeline produced in PBLang. Each remaining frame
 has a timed visibility interval; the final frame freezes and a completion label
 appears. Stop and successful edits/import navigate to a response without the
