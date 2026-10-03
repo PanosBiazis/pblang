@@ -471,3 +471,9 @@ Explicit teacher-to-student training is available through
 The shared deterministic [sensor specialist](pbAI_Sensors.md) accepts explicit
 uniform numeric samples through `sensor_analyze`; it performs no collection,
 training, persistence or device actions.
+
+## Controlled optional adapters
+
+The common [modularity bridge](pbAI_Modularity.md) separates static declarations,
+explicit runtime probes and bounded serial execution of sensor/student adapters.
+Unavailable or incompatible optional providers do not silently activate replacements.
