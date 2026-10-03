@@ -366,6 +366,13 @@ fn student_decode(text) {
     if not valid_student_artifact(parsed.value) {throw "invalid student checkpoint";}
     return parsed.value;
 }
+fn _student_prediction(model, student, digest, ids) {
+    if not _ids(ids) {throw "invalid student input";}
+    let raw=AD.logits(model,ATT.head_hidden(model,ids),student);
+    return map{format:"pbai.neural.student-checkpoint.prediction.v1",token:CORE.argmax(raw),
+        logits:raw,artifact_digest:digest,trainable_parameters:16,
+        artifact_authenticated:false,globally_activated:false,authorizes_action:false};
+}
 fn student_load(artifact) {
     if not valid_student_artifact(artifact) {throw "invalid student checkpoint";}
     let model=_model();let initial=AD.lm_head_adapter(model,1,2.0,1901);
@@ -379,11 +386,7 @@ fn student_load(artifact) {
             persists_weights:false,globally_activated:false,authorizes_activation:false},
         checkpoint:fn() {return _student_artifact(student,base_digest);},
         predict:fn(ids) {
-            if not _ids(ids) {throw "invalid student input";}
-            let raw=AD.logits(model,ATT.head_hidden(model,ids),student);
-            return map{format:"pbai.neural.student-checkpoint.prediction.v1",token:CORE.argmax(raw),
-                logits:raw,artifact_digest:digest,trainable_parameters:16,
-                artifact_authenticated:false,globally_activated:false,authorizes_action:false};
+            return _student_prediction(model,student,digest,ids);
         },
         evaluate:fn(examples) {
             _examples(examples);
@@ -601,23 +604,87 @@ fn student_continue_reviewed(artifact, history, training, validation, options=ni
         base_weights_frozen:true,persists_weights:false,globally_activated:false,authorizes_activation:false};
     // Store only private validated values. Caller report edits confer no authority.
     let report_text=json_stringify(report);
-    let state=map{phase:if passed {"reviewed"} else {"rejected"},active:parent,history:prior};
+    let state=map{phase:if passed {"reviewed"} else {"rejected"},active:parent,history:prior,adapter:before};
     return map{
         report:fn() {return json_parse(report_text);},
         status:fn() {return _review_status(state);},
-        predict:fn(ids) {return student_load(state.active).predict(ids);},
+        predict:fn(ids) {return _student_prediction(model,state.adapter,state.active.digest,ids);},
         checkpoint:fn() {return student_decode(student_encode(state.active));},
         history:fn() {return _checked_history(state.active,state.history);},
         accept:fn() {
             if state.phase!="reviewed" {throw "student continuation did not pass review";}
-            state.active=candidate;state.history=next_history;state.phase="accepted";
+            state.active=candidate;state.history=next_history;state.adapter=after;state.phase="accepted";
             return _review_status(state);
         },
         rollback:fn() {
             if state.phase!="accepted" {throw "no accepted student continuation to roll back";}
-            state.active=parent;state.history=prior;state.phase="rolled-back";
+            state.active=parent;state.history=prior;state.adapter=before;state.phase="rolled-back";
             return _review_status(state);
         }
     };
 }
 export student_history, student_history_encode, student_history_decode, student_continue_reviewed;
+
+// Small in-process protocol for tool adapters. External transports enforce their
+// own byte/concurrency/auth limits; this entry point accepts bounded data only.
+fn _student_tool_error(code) {
+    return map{format:"pbai.neural.student-tool.v1",status:"error",result:nil,error:code};
+}
+fn _student_tool_result(result) {
+    return map{format:"pbai.neural.student-tool.v1",status:"result",result:result,error:nil};
+}
+fn _student_tool(request) {
+    if type(request)!="map" or not map_has(request,"op") or type(request.op)!="string" or len(request.op)>32 {
+        return _student_tool_error("invalid_request");
+    }
+    if request.op=="capabilities" {
+        if not _keys(request,["op"]) {return _student_tool_error("invalid_request");}
+        return _student_tool_result(map{operations:["capabilities","predict_batch","compare"],
+            transport:"in-process-map",model_scope:"fixed-tiny-token-specialist",checkpoint_format:STUDENT_FORMAT,
+            checkpoint_profile:STUDENT_PROFILE,max_contexts:32,max_context_tokens:4,vocabulary_size:8,max_examples:32,
+            required_fields:map{capabilities:["op"],predict_batch:["op","checkpoint","contexts","include_logits"],
+                compare:["op","baseline","candidate","examples"]},
+            training:false,activation:false,persistence:false,network:false,acceptance:false,
+            artifact_authenticated:false,independent_provenance_verified:false,
+            agi_status:"not-demonstrated",asi_status:"not-demonstrated"});
+    }
+    if request.op=="predict_batch" {
+        if not _keys(request,["op","checkpoint","contexts","include_logits"])
+            or type(request.include_logits)!="bool" or type(request.contexts)!="array"
+            or len(request.contexts)<1 or len(request.contexts)>32 {return _student_tool_error("invalid_request");}
+        // Complete admission before any forward pass or returned partial result.
+        for ids in request.contexts {if not _ids(ids) {return _student_tool_error("invalid_request");}}
+        if not valid_student_artifact(request.checkpoint) {return _student_tool_error("invalid_checkpoint");}
+        let loaded=student_load(request.checkpoint);let predictions=[];
+        for i len(request.contexts) {
+            let prediction=loaded.predict(request.contexts[i]);
+            for value in prediction.logits {if not _number(value,-1000000000000,1000000000000) {return _student_tool_error("computation_failed");}}
+            let row=map{index:i,token:prediction.token};
+            if request.include_logits {row.logits=prediction.logits;}
+            push(predictions,row);
+        }
+        return _student_tool_result(map{checkpoint_digest:loaded.report.artifact_digest,predictions:predictions,
+            artifact_authenticated:false,authorizes_activation:false,authorizes_action:false,
+            globally_activated:false,persists_weights:false});
+    }
+    if request.op=="compare" {
+        if not _keys(request,["op","baseline","candidate","examples"]) {return _student_tool_error("invalid_request");}
+        let valid_examples=try {_examples(request.examples);true} catch false;
+        if not valid_examples {return _student_tool_error("invalid_request");}
+        if not valid_student_artifact(request.baseline) or not valid_student_artifact(request.candidate) {
+            return _student_tool_error("invalid_checkpoint");
+        }
+        let model=_model();let seed=AD.lm_head_adapter(model,1,2.0,1901);
+        let before=AD.from_state(seed,_dequantize(request.baseline.a),_dequantize(request.baseline.b),0,request.baseline.steps,request.baseline.steps);
+        let after=AD.from_state(seed,_dequantize(request.candidate.a),_dequantize(request.candidate.b),0,request.candidate.steps,request.candidate.steps);
+        let pair=_review_pair(model,before,after,request.examples);
+        if not _review_metric_valid(pair.baseline) or not _review_metric_valid(pair.candidate) {return _student_tool_error("computation_failed");}
+        return _student_tool_result(map{baseline_digest:request.baseline.digest,candidate_digest:request.candidate.digest,
+            metrics:pair,evaluation_weights:"exported-fixed-point-checkpoints",evaluation_scope:"explicit-caller-examples",
+            independent_test:false,history_overlap_checked:false,artifact_authenticated:false,
+            authorizes_activation:false,authorizes_action:false,globally_activated:false,persists_weights:false});
+    }
+    return _student_tool_error("unsupported_operation");
+}
+fn student_tool(request) {return try {_student_tool(request)} catch _student_tool_error("computation_failed");}
+export student_tool;
