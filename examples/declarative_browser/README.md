@@ -144,6 +144,15 @@ The native reader uses one compact Back / Forward / Home / Style toolbar, even a
 to the same document. Family, body size, text scale, line spacing and density are
 session-local options. No preferences are persisted or transmitted.
 
+Opening **Style** focuses the font choice. Enter changes the focused option while
+keeping it selected; Tab and Shift+Tab move between the available controls.
+**Done** restores focus to **Style** on the same document. A held activation key
+does not activate another option after a redraw. Programmatic appearance updates
+also preserve an available, enabled button's focus and any held keyboard modifier.
+Back, Forward and Home leave settings and display their destination while retaining
+the chosen appearance. Removed, disabled or non-interactive controls do not receive
+restored focus.
+
 ```pblang
 let App=import("./app.sapp");
 let reader=App.create("local","dark",map{
@@ -174,3 +183,15 @@ Additional tests: `tests/semantics/readable_typography_test.sapp` and
 `tests/tooling/readable_browser_native.py` (isolated Xvfb, optional
 `PBLANG_READER_WIDTH=390`). The latter checks navigation plus keyboard-only font
 changes and records default/serif screenshots.
+
+`tests/semantics/reader_preferences_focus_test.sapp` checks focus restoration,
+held keys, reverse navigation, rejected options and navigation from settings.
+The Greek 390×844 keyboard journey can be reproduced with:
+
+```sh
+xvfb-run -a -s '-screen 0 1000x1000x24 -nolisten tcp' env XMODIFIERS=@im=none python3 tests/tooling/reader_preferences_native.py
+```
+
+It writes synthetic state and screenshots under `build/reader-focus-*` and closes
+its own window. These focus rules belong to the native example; the exported
+Web/Android presentation does not implement the example's preference callbacks.
