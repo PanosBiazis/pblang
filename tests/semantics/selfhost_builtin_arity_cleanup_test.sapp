@@ -1,0 +1,99 @@
+// Dynamic builtin calls must reject wrong counts before invoking the primitive.
+let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let V=import("stdlib:compiler/vm.sapp");
+let B=import("stdlib:compiler/vm_builtins.sapp");
+let O=import("stdlib:compiler/optimizer.sapp");
+let P=import("stdlib:selfhost_pbck.sapp");
+fn compiled(source) {let c=F.frontend_compile(source);assert(c.ok,"fixture compiles: "+str(c.diagnostics));return c.chunk;}
+let setup=compiled("memory_alloc(7);push_lifetime();borrow_immutable(1);memory_alloc(9);");
+let recover=compiled("print memory_get(1);");
+fn prepared(automatic) {let ctx=V.execution_context(automatic);V.run_seeded(setup,map{},ctx);return ctx;}
+fn run(code,globals,ctx,bounded) {
+    if bounded {return V.run_seeded_bounded(code,globals,nil,ctx);}
+    return V.run_seeded(code,globals,ctx);
+}
+fn invoke(name,args) {
+    let constants=[map{__bi:name}];let ins=[map{op:0,operand:0}];
+    for value in args {array_push(constants,value);array_push(ins,map{op:0,operand:len(constants)-1});}
+    array_push(ins,map{op:18,operand:len(args)});
+    return map{constants:constants,instructions:ins};
+}
+fn released(ctx,state) {
+    assert(ctx.memory==nil and state.closed,"owned state closed");
+    assert(len(state.owners)==0 and len(state.borrows)==0,"all owners and borrows released");
+    assert(state.reclaimed==2 and ctx.handlers==0,"all scopes reclaimed once");
+    V.close_execution(ctx);assert(state.reclaimed==2,"idempotent close");
+}
+let arities=B.fixed_arities();let names=B.registry();let memory=B.memory_registry();
+for name in map_keys(names) {
+    assert(map_has(arities,name) or map_has(memory,name) or name=="print" or name=="rational","arity coverage: "+name);
+}
+for name in map_keys(arities) {assert(map_has(names,name),"no stale arity metadata");}
+let mutable=B.fixed_arities();mutable.array_pop=2;
+assert(B.fixed_arities().array_pop==1,"fresh public metadata");
+// All fixed builtins, all scalar fallbacks, zero and general (>3) routes.
+// Use a mutable canary as every argument: an invalid call must never consume it.
+let cases=0;
+let checked_names=map_keys(arities);array_push(checked_names,"rational");
+for name in checked_names {
+    for count in [0,1,2,3,4] {
+        let valid=if name=="rational" {count==1 or count==2} else {count==arities[name]};
+        if not valid {
+            let canary=[41,42];let args=[];
+            for i count {array_push(args,canary);}
+            let code=invoke(name,args);
+            for bounded in [false,true] {
+                for automatic in [false,true] {
+                    let ctx=prepared(automatic);let state=ctx.memory;
+                    assert((try {run(code,map{},ctx,bounded);false} catch true),"wrong count rejected: "+name+"/"+str(count));
+                    assert(canary==[41,42],"invalid call cannot mutate arguments: "+name);
+                    if automatic {released(ctx,state);}
+                    else {assert(not state.closed and len(state.owners)==2,"borrowed execution retained");V.close_execution(ctx);}
+                    cases=cases+1;
+                }
+                let ctx=prepared(true);let state=ctx.memory;
+                let handled=map{constants:[map{try_chunk:code,catch_chunk:recover}],instructions:[map{op:35,operand:0}]};
+                assert(run(handled,map{},ctx,bounded).output==[7],"handler can still load value");
+                assert(not state.closed and ctx.handlers==0,"handled rejection keeps ownership");
+                assert(canary==[41,42],"handled rejection does not mutate");V.close_execution(ctx);
+                cases=cases+1;
+            }
+        }
+    }
+}
+// These programs pass frontend admission: builtin identity is a function parameter.
+// Side effects in argument expressions occur exactly once; the rejected
+// primitive itself never runs. Source, optimized IR and serialized IR agree.
+let sources=[
+    "let a=[7];let events=[];fn arg(){array_push(events,1);return a;}fn call(f){return f(arg());}call(array_push);",
+    "let a=[7];let events=[];fn arg(){array_push(events,1);return a;}fn call(f){return f(arg(),99);}call(array_pop);",
+    "let a=map{k:7};let events=[];fn arg(){array_push(events,1);return a;}fn call(f){return f(arg(),\"k\",99);}call(map_remove);"
+];
+for source in sources {
+    let plain=compiled(source);
+    for code in [plain,O.optimize_safe(plain).chunk,P.deserialize_chunk(P.serialize_chunk(plain))] {
+        for bounded in [false,true] {
+            let ctx=prepared(true);let state=ctx.memory;let globals=map{};
+            assert((try {run(code,globals,ctx,bounded);false} catch true),"admitted dynamic call rejected");
+            assert(globals.events==[1],"argument evaluated once");
+            assert(globals.a==[7] or globals.a==map{k:7},"primitive never changed data");released(ctx,state);
+        }
+    }
+}
+// A second rejected call in a catch escapes only after the handler is removed.
+let nested=compiled("fn bad(f){return f();}try bad(array_push) catch bad(array_pop);");
+for bounded in [false,true] {
+    let ctx=prepared(true);let state=ctx.memory;
+    assert((try {run(nested,map{},ctx,bounded);false} catch true),"catch failure escapes");released(ctx,state);
+}
+// Legitimate overloads, variadic calls, cached import, aliases and shadows survive.
+for count in [0,1,2,3,4] {
+    let args=[];for i count {array_push(args,i);}
+    assert(V.run(invoke("print",args)).output==args,"print remains variadic");
+}
+let valid=F.frontend_run("fn call(f,a){return f(a);}print call(rational,3);print rational(3,2);let len=fn(a,b){return a+b;};print len(4,5);");
+assert(valid.ok and valid.output==[rational(3),rational(3,2),9],"valid overloads and shadows");
+let import_code=invoke("import",["fixture"]);array_push(import_code.instructions,map{op:12,operand:0});
+let imported=V.run_seeded(import_code,map{__import_cache__:map{fixture:map{n:7}}});
+assert(imported.output==[map{n:7}],"valid cached import");
+print "selfhost_builtin_arity_cleanup_pass: "+str(cases)+" ownership cases";
