@@ -59,6 +59,12 @@ from the optional manifest validator is not a fail-closed guard.
 
 ## Alternative routes
 
+The separate PBLang-owned [`tools/pbpackage.sapp`](PACKAGE_FOLDER.md) packages
+small Linux x64 source projects with local assets and in-project path dependencies.
+It reads sources without writing them, refuses existing destinations, verifies
+dependency content hashes, and publishes a completion receipt. Its documented
+limits apply; it does not change or certify the retained native command.
+
 For the compiler's supported static module subset, `tools/pbc.sapp` with
 `--bundle --target pbck --out DISTINCT_FILE.pbck` is a separate PBLang-owned
 compiler route. It produces compiled bytecode, not the native command's portable

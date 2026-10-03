@@ -62,6 +62,10 @@ not attested.
 - **`pblang fmt [--max-line-length=N] [file.sap …]`** — Format one or more `.sap`/`.sapp` files: trim lines, **spacing around binary operators** (`+` `-` `*` `/` `==` `!=` `<` `>` `<=` `>=`), **comma spacing** (space after comma; unchanged inside string literals), indent by brace depth (4 spaces per level), optional **line wrap** when `--max-line-length=N` is set (wraps at last space before N), ensure final newline, and insert a single blank line between top-level `fn` declarations. Does not change content inside string literals. Only overwrites if content changed.
 - **`pblang lint [file.sap …]`** — Parse and typecheck each file; print diagnostics (errors and warnings). Reports **unused variable**, **unused import** (bindings never read), and **variable shadows outer binding** (L2-beta) warnings. Exit 1 only on parse or typecheck errors; warnings do not change exit code. The PBLang-native analyzer in `stdlib/diagnostics.sapp` also performs bounded, side-effect-free identical-operand analysis. It reports suspicious arithmetic and strict ordering such as `x / x` and `x < x`, while intentionally accepting `x != x`, `x == x`, `x <= x`, and `x >= x` because these can be valid IEEE-754 NaN classification idioms. The retained bootstrap CLI may still emit its older, noisier `eq_op` result until the self-hosted lint path replaces it.
 
+## PBLang source-folder packaging
+
+`tools/pbpackage.sapp SOURCE NEW_OUTPUT --runtime ELF_RUNTIME` is a separate PBLang-owned route for bounded Linux x64 projects, assets and in-project local dependencies. Invoke it through `pblang run tools/pbpackage.sapp --allow-all -- ...`; see [supported inputs and invocation](PACKAGE_FOLDER.md). It never invokes the retained native `bundle` command and does not repair that command. The output parent must already exist with private permissions and the destination must be absent.
+
 ## Error UX (L2-gamma)
 
 - Parse and runtime errors print **`error[<file>:<line>:<col>]: <message>`** when location is available.
