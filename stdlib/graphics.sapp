@@ -1,6 +1,7 @@
 // stdlib/graphics.sapp — High-level graphics API: native builtins (minifb) + event loop helpers
 
 let _font = import("stdlib:bitmap_font.sapp");
+let FontMetrics=import("stdlib:font_metrics.sapp");
 
 // === Colors ===
 let BLACK   = [0, 0, 0];
@@ -227,6 +228,78 @@ fn text_font_path() {
     return TEXT_FONT_PATH;
 }
 
+// Family names are a closed set: caller text never becomes a file path.
+fn text_font_resolve(family="system") {
+    if family=="system" or family=="sans" {return TEXT_FONT_PATH;}
+    let paths=[];
+    if family=="serif" {
+        paths=["/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf",
+            "/System/Library/Fonts/Times.ttc","C:/Windows/Fonts/times.ttf"];
+    } elif family=="monospace" {
+        paths=["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+            "/System/Library/Fonts/Menlo.ttc","C:/Windows/Fonts/consola.ttf"];
+    } else {throw "unsupported native font family";}
+    let selected=_first_existing_font(paths);
+    return if selected=="" {TEXT_FONT_PATH} else {selected};
+}
+fn _text_result_copy(value) {let out=map{};for key in map_keys(value) {out[key]=value[key];}return out;}
+fn _styled_text(handle,state,x,y,text,color,px,advance,family,measure=false) {
+    if type(text)!="string" or len(text)>65536 or type(px)!="number" or not (px>=6 and px<=256)
+        or type(advance)!="number" or not (advance>=0 and advance<=512) {throw "styled text exceeds bounds";}
+    if not map_has(state.fonts,family) {state.fonts[family]=text_font_resolve(family);}
+    let key=json_stringify([family,px,advance,text]);
+    if measure and map_has(state.widths,key) {return _text_result_copy(state.widths[key]);}
+    let run=nil;
+    if advance==0 {
+        if not map_has(state.metrics,family) {
+            let probe=gfxdrawtextaa(handle,-131072,-131072,"A",color,px,state.fonts[family],0);
+            if probe.ok {state.fonts[family]=probe.font;}
+            let font=if probe.ok {try FontMetrics.load(probe.font) catch nil} else {nil};
+            if font!=nil and state.font_bytes+font.cache_bytes<=8388608 {
+                state.font_bytes=state.font_bytes+font.cache_bytes;state.metrics[family]=font;
+            } else {state.metrics[family]=nil;}
+        }
+        if map_has(state.runs,key) {run=state.runs[key];}
+        else {
+            run=try FontMetrics.layout(state.metrics[family],text,px) catch nil;
+            if len(text)<=1024 {
+                let cost=len(str_to_bytes(key))+len(str_to_bytes(json_stringify(run)));
+                if cost<=524288 {
+                    if len(map_keys(state.runs))>=128 or state.run_bytes+cost>524288 {state.runs=map{};state.run_bytes=0;}
+                    state.runs[key]=run;state.run_bytes=state.run_bytes+cost;
+                }
+            }
+        }
+    }
+    // Offscreen drawing reuses the retained host when bounded TrueType metrics
+    // are unavailable. No renderer or rasterizer is replaced.
+    let result=map{};
+    if run!=nil {
+        result=map{ok:true,width:run.width,height:run.height,font:state.fonts[family],
+            renderer:"native-aa-fontdue",positioning:"truetype-baseline"};
+        if not measure {
+            for batch in run.batches {
+                let painted=gfxdrawtextaa(handle,x,y+batch.y,batch.text,color,px,state.fonts[family],1);
+                if not painted.ok {return painted;}
+            }
+        }
+    } else {
+        result=gfxdrawtextaa(handle,if measure {-131072} else {x},if measure {-131072} else {y},
+            text,color,px,state.fonts[family],advance);
+        result.positioning="retained-host";
+    }
+    if measure and len(text)<=1024 {
+        let cost=len(str_to_bytes(key))+len(str_to_bytes(json_stringify(result)));
+        if cost<=131072 {
+            if len(map_keys(state.widths))>=128 or state.width_bytes+cost>131072 {state.widths=map{};state.width_bytes=0;}
+            state.widths[key]=result;state.width_bytes=state.width_bytes+cost;
+        }
+    }
+    return if measure {_text_result_copy(result)} else {result};
+}
 fn draw_text_aa(handle, x, y, text, color, px, advance) {
     return gfxdrawtextaa(handle, x, y, str(text), color, px, TEXT_FONT_PATH, advance);
 }
@@ -335,13 +408,14 @@ fn text_render_status(plan = nil) {
 fn Window(w, h, title) {
     let handle = gfxcreatewindow(w, h, title);
     let lifetime = map{ closed: false };
+    let typography=map{fonts:map{},widths:map{},metrics:map{},runs:map{},font_bytes:0,run_bytes:0,width_bytes:0};
     let obj = map{
         "handle": handle,
         // minifb input is a retained snapshot refreshed by present; SDL2 drains a queue.
         "event_poll_mode": if (try gfxbackendprofile().backend catch "") == "minifb" { "present-snapshot" } else { "drain" },
         "isOpen": fn() { if lifetime.closed { return false; } return gfxisopen(handle); },
         "close": fn() {
-            if not lifetime.closed { gfxclose(handle); lifetime.closed = true; }
+            if not lifetime.closed { gfxclose(handle); lifetime.closed = true; typography.widths=map{}; typography.fonts=map{}; typography.metrics=map{}; typography.runs=map{}; typography.font_bytes=0; typography.run_bytes=0; typography.width_bytes=0; }
         },
         "size": fn() { return gfxsize(handle); },
         "clear": fn(color) { gfxclear(handle, color); },
@@ -355,6 +429,16 @@ fn Window(w, h, title) {
         "bezier": fn(x0, y0, cx1, cy1, cx2, cy2, x1, y1, color, segments) { return bezier(handle, x0, y0, cx1, cy1, cx2, cy2, x1, y1, color, segments); },
         "text": fn(x, y, text, color) { return draw_text(handle, x, y, text, color); },
         "textAA": fn(x, y, text, color, px, advance) { return draw_text_aa(handle, x, y, text, color, px, advance); },
+        "textStyled": fn(x,y,text,color,px,advance,family) {if lifetime.closed {throw "window is closed";} return _styled_text(handle,typography,x,y,text,color,px,advance,family);},
+        "textMeasure": fn(text,px,advance,family) {if lifetime.closed {throw "window is closed";} return _styled_text(handle,typography,0,0,text,[0,0,0],px,advance,family,true);},
+        "textCacheStatus": fn() {
+            let chars=0;for family in map_keys(typography.metrics) {
+                let font=typography.metrics[family];if font!=nil {chars=chars+font.metric_cache_bytes;}
+            }
+            return map{font_bytes:typography.font_bytes,character_bytes:chars,run_bytes:typography.run_bytes,
+                measurement_bytes:typography.width_bytes,payload_bytes:typography.font_bytes+chars+typography.run_bytes+typography.width_bytes,
+                payload_limit:9568256,includes_vm_overhead:false};
+        },
         "present": fn() { gfxpresent(handle); },
         "pollEvents": fn() { return gfxpollevents(handle); }
     };
@@ -1222,6 +1306,7 @@ export clamp, lerp, manhattan, rect_center, rect_union, point_in_polygon;
 export distance, lerp_point, point_in_rect, point_in_circle, rect_intersect;
 export rgb, rgba, gray, hsl, lerpColor;
 export bezier_point, bezier_points, draw_polyline, polygon, bezier, draw_text, draw_rects;
+export text_font_resolve;
 export draw_text_aa, text_font_candidates, text_font_path, text_profile, text_render_plan, text_render_status;
 export Window, run, runGameLoop, backend_profile, backend_status, backend_event_status, render_route_plan, render_route_status, cpu_render_status, render_acceleration_plan, render_device_policy, render_device_policy_status, render_startup_profile, render_startup_env_lines, render_startup_profile_status;
 export dirty_region_plan, render_batch_plan, frame_schedule, frame_schedule_status,
