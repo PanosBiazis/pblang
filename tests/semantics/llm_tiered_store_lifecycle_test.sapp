@@ -1,0 +1,69 @@
+let S=import("stdlib:llm_tiered_store.sapp");
+let state=env_get("PBAI_STATE_ROOT");
+assert(type(state)=="string" and state!="","isolated state is required");
+let root=path_join(state,"streaming-lifecycle");fs_mkdirs(root);
+let bytes=[1,2,3,4];fs_write_bytes(path_join(root,"expert.bin"),bytes);
+let parts=[S.model_part("expert","expert.bin",4,sha256(base64_encode_bytes(bytes)),"expert",0,0,"int4")];
+let options=map{ram_budget_bytes:8,max_shard_bytes:8,expected_precision:"int4",prefetch_capacity:2,hot_slots:1};
+fn refused(result) {assert(type(result)=="map" and not result.ok and result.code=="closed","inactive operation returns closed");}
+let b=S.create(root,parts,S.config(options.ram_budget_bytes,options));assert(b.ok,"real session opened");
+let old=S.status(b);let old_json=json_stringify(old);
+assert(not str_contains(old_json,root),"status contains no private root path");
+assert(len(old.stats)==11 and json_stringify(old.stats)==json_stringify(b.stats),"complete counter schema preserved");
+let loaded=S.load(b,"expert",true);assert(loaded.ok and loaded.bytes==bytes,"real verified bytes");
+assert(S.record_routes(b,0,[0]).ok,"active routing remains available");
+assert(json_stringify(old)==old_json,"earlier status does not change after loads or routing");
+let edited=S.status(b);let expected=json_stringify(S.status(b));
+for key in map_keys(edited.stats) {edited.stats[key]=999;}
+edited.resident_bytes=999;
+assert(json_stringify(S.status(b))==expected,"caller cannot edit internal counters through status");
+assert(S.close(b) and not S.close(b),"close is idempotent");
+let closed=S.status(b);let closed_json=json_stringify(closed);
+assert(not closed.ok and closed.resident_bytes==0 and closed.cached_shards==0 and closed.queued_prefetch==0,"closed status remains observable without resident cache");
+let internal=json_stringify(map{heat:b.heat,last:b.last,clock:b.clock,stats:b.stats,prefetch:b.prefetch_queue});
+let cyclic=[];push(cyclic,cyclic);
+refused(S.load(b,cyclic));
+refused(S.record_routes(b,0,cyclic));
+refused(S.run_prefetch(b,cyclic));refused(S.rebalance_hot(b));
+refused(S.queue_prefetch(b,cyclic));refused(S.queue_expert_prefetch(b,0,cyclic));
+assert(not S.unpin(b,cyclic) and S.weighted_root_for(b,cyclic)==nil and S.predict_experts(b,0,cyclic)==[],"inactive query and boolean sentinels preserve types");
+assert(json_stringify(map{heat:b.heat,last:b.last,clock:b.clock,stats:b.stats,prefetch:b.prefetch_queue})==internal,"all rejected operations leave closed state unchanged");
+assert(json_stringify(S.status(b))==closed_json and json_stringify(old)==old_json,"closed and older snapshots preserved");
+assert(loaded.bytes==bytes,"closing cannot erase caller-owned successful output");
+let failed=S.create(root,[],S.config(options.ram_budget_bytes,options));
+let failed_json=json_stringify(failed);
+for invalid in [failed,nil,42,"invalid",map{},map{ok:false},map{ok:true,closed:false}] {
+ refused(S.status(invalid));refused(S.load(invalid,cyclic));
+ refused(S.record_routes(invalid,0,cyclic));refused(S.run_prefetch(invalid,cyclic));refused(S.rebalance_hot(invalid));
+ refused(S.queue_prefetch(invalid,cyclic));refused(S.queue_expert_prefetch(invalid,0,cyclic));
+ assert(not S.close(invalid) and not S.unpin(invalid,cyclic) and S.weighted_root_for(invalid,cyclic)==nil and S.predict_experts(invalid,0,cyclic)==[],"failed and malformed values are inert");
+}
+assert(json_stringify(failed)==failed_json,"original creation failure is preserved");
+let default_parts=[S.model_part("default","expert.bin",4,sha256(base64_encode_bytes(bytes)))];
+let defaults=S.create(root,default_parts);assert(defaults.ok,"default session opens");
+assert(defaults.config.max_shard_bytes==67108864 and S.DEFAULT_MAX_SHARD_BYTES==67108864,"default matches bounded reader");
+assert(S.load(defaults,"default").bytes==bytes,"default configuration loads small shard");assert(S.close(defaults),"default session closes");
+let at_limit=S.create(root,default_parts,S.config(8,map{max_shard_bytes:67108864}));
+assert(at_limit.ok and S.load(at_limit,"default").bytes==bytes,"exact supported limit loads without allocating a limit-sized fixture");assert(S.close(at_limit),"boundary session closes");
+for limit in [67108865,268435456,1073741824] {
+ let invalid_limit=S.create(path_join(root,"absent"),default_parts,S.config(8,map{max_shard_bytes:limit}));
+ assert(not invalid_limit.ok and invalid_limit.code=="config","unsupported bound rejected before opening unavailable root");
+}
+fs_write_bytes(path_join(root,"tiny.bin"),[1]);
+let smallest=[S.model_part("tiny","tiny.bin",1,sha256(base64_encode_bytes([1])))];
+let at_min=S.create(root,smallest,S.config(8,map{max_shard_bytes:1}));
+assert(at_min.ok and S.load(at_min,"tiny").bytes==[1],"minimum one-byte budget works");assert(S.close(at_min),"minimum session closes");
+for invalid_bound in [nil,0,-1,1.5,"8",cyclic] {
+ let malformed_cfg=S.config(8);malformed_cfg.max_shard_bytes=invalid_bound;
+ assert(S.create(root,default_parts,malformed_cfg).code=="config","malformed direct configuration rejected early");
+}
+let cycle=0;
+while cycle<4 {
+ let fresh=S.create(root,parts,S.config(options.ram_budget_bytes,options));assert(fresh.ok,"explicit independent reopen");
+ assert(S.status(fresh).stats.loads==0,"new session starts without prior counters");
+ assert(S.record_routes(fresh,0,[0]).ok and S.queue_expert_prefetch(fresh,0,1).ok and S.run_prefetch(fresh,1).ok,"fresh prefetch executes");
+ assert(S.load(fresh,"expert").bytes==bytes,"reopened session retains correct bytes");
+ assert(S.close(fresh),"fresh session closes once");cycle=cycle+1;
+}
+assert(json_stringify(S.status(b))==closed_json,"new sessions never revive the old session");
+print "llm_tiered_store_lifecycle_pass";
