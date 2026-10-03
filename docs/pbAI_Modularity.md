@@ -1,7 +1,7 @@
 # Controlled pbAI adapters
 
-Both facades expose `modular_catalog()`, `modular_probe(adapter)` and
-`modular_run(adapter, request)` through the shared PBLang
+Both facades expose `modular_catalog()`, `modular_probe(adapter)`,
+`modular_run(adapter, request)` and `modular_bind(adapter, provider, resolver)` through the shared PBLang
 `stdlib:pbai_modularity.sapp`. Supported IDs are exactly `sensor-v1` and
 `student-v1`. No arbitrary source paths, callbacks, GPU/NPU providers or plugin
 installation are admitted. Existing direct functions remain compatible.
@@ -84,3 +84,62 @@ The 15 cases include missing providers, mismatched exports/contracts, invalid so
 incorrect numeric output, throwing probes/execution, callable metadata never invoked,
 resolver failure and catalog/invalid-ID paths that never import optional providers.
 These are Linux fixture results; other platforms require their own runtime evidence.
+
+## Installed execution and the retained function-origin limit
+
+The retained runtime does not preserve the declaring file's import origin for
+all exported function chunks. A lazy `stdlib:` import inside a function can therefore
+resolve against the caller's working directory. Installed dependency locks alone
+cannot repair this missing origin. The convenience `modular_probe` / `modular_run`
+wrappers require the trusted installed product directory as cwd on this runtime.
+An unrelated directory without a manifest produces `dependency_unavailable`; a
+caller-owned manifest can instead redirect a legacy lazy import. Do not use these
+legacy wrappers from an untrusted cwd. The general runtime defect
+is not fixed by this module.
+
+For foreign-cwd callers, use explicit **trusted-host binding**:
+
+```pblang
+let AI=import("stdlib/pbai.sapp");
+let SENSOR=import("stdlib:pbai_sensor.sapp");
+let RESOLVER=import("stdlib:controlled_modularity.sapp");
+let binding=AI.modular_bind("sensor-v1",SENSOR,RESOLVER);
+assert(binding.report().ok,"selected provider passed bounded ABI/probe checks");
+let reply=binding.run(map{values:[2,4,6,100],period_seconds:1,sigma:3,absolute_tolerance:1});
+```
+
+Top-level package imports retain the application's source context and normal lock
+validation. Import only the selected provider. The binding accepts native module
+handles from trusted application setup, not paths, JSON/MCP fields, maps or supplied
+callbacks. It is not a new capability grant or authenticated module provenance.
+The resolver result must match the exact selected two-module plan. Failed admission
+produces a binding whose `run` always refuses; mutating a returned report cannot
+activate it. A successful binding captures the checked callable and a private report
+snapshot. It does not reload code or repeat the probe on every request. The already
+trusted provider's own mutable internal state, if any, remains outside this snapshot;
+this is not isolation for malicious modules.
+
+The updated `pbai_modularity.sapp` example follows this pattern, requiring no cwd
+mutation, subprocess bootstrap, absolute-path imports or unselected provider load.
+For an installed layout with a materialized local lock:
+
+```sh
+cd /tmp
+"$PBLANG_ROOT/bin/pblang" run "$PBLANG_ROOT/examples/pbai_modularity.sapp" --deny-net --deny-http --deny-exec --deny-ffi --deny-spawn --deny-sqlite
+```
+
+Set `PBLANG_ROOT` to the reviewed installed directory. The standalone equivalent
+uses its `demo/pbai_modularity.sapp` with its installed dependency lock. For legacy
+lazy-wrapper applications, run from their installed project directory instead.
+
+`tests/semantics/pbai_modularity_installed_test.sapp` tests both actual facade copies
+with a trusted `PBLANG_BIN`, Linux `bwrap` and the sibling source checkout layout.
+It creates private installed fixtures, removes the unselected student module,
+materializes local fixture locks, hides both source checkouts and optionally the
+`PBAI_SOURCE_HIDE_ROOT` tree, then runs from a foreign cwd containing a decoy provider, both without a manifest
+and with a valid caller-owned dependency lock.
+It verifies both facade results, legacy project-cwd success and the known foreign-cwd
+legacy refusal. Run the outer test with `--allow-all --deny-net --deny-http`; its
+numerical children deny process/FFI/network capabilities. This is tested Linux
+installed-fixture evidence, not proof of universal platform support or a global
+runtime-origin repair. The test does not alter an installed launcher or release.
