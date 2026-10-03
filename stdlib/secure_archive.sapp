@@ -1,0 +1,161 @@
+// Bounded, effect-free ZIP facade. File contents are opaque bytes, never code.
+// This module deliberately performs no filesystem, process or network access.
+let ZIP = import("stdlib:zipfile.sapp");
+let MAX_BYTES = 4194304;
+let MAX_TOTAL = 16777216;
+let MAX_ENTRIES = 1024;
+
+fn _integer(value, low, high) {
+    if type(value) != "number" or not (value >= low and value <= high) or
+       num_floor(value) != value { throw "archive: invalid integer limit"; }
+    return value;
+}
+fn _bytes(value, cap) {
+    if type(value) != "array" or len(value) > cap { throw "archive: byte array exceeds input limit"; }
+    for i len(value) { _integer(value[i], 0, 255); }
+    return value;
+}
+fn _limits(options) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { throw "archive: options must be an object"; }
+    let keys = map_keys(options);
+    for i len(keys) {
+        if keys[i] != "max_entries" and keys[i] != "max_total_bytes" and
+           keys[i] != "max_file_bytes" { throw "archive: unknown option"; }
+    }
+    return map{
+        entries: _integer(try options.max_entries catch 256, 1, MAX_ENTRIES),
+        total: _integer(try options.max_total_bytes catch MAX_BYTES, 0, MAX_TOTAL),
+        file: _integer(try options.max_file_bytes catch 1048576, 0, MAX_BYTES)
+    };
+}
+fn _name(value) {
+    if type(value) != "string" or len(value) == 0 or len(value) > 512 { throw "archive: invalid name"; }
+    // Conservative portable names: reject controls, ADS, drive paths and Win32 aliases.
+    for i len(value) {
+        let code = strcharcodeat(value, i);
+        if code < 32 or code == 127 or str_contains("\\:<>\"|?*", value[i]) {
+            throw "archive: unsupported path character";
+        }
+    }
+    let directory = str_ends_with(value, "/");
+    let name = if directory { str_slice(value, 0, len(value)-1) } else { value };
+    let parts = str_split(name, "/");
+    if len(parts) > 32 { throw "archive: path exceeds depth limit"; }
+    for i len(parts) {
+        let part = parts[i];
+        if part == "" or part == "." or part == ".." or str_ends_with(part, ".") or
+           str_ends_with(part, " ") { throw "archive: ambiguous path component"; }
+        let base = str_lower(str_split(part, ".")[0]);
+        if base == "con" or base == "prn" or base == "aux" or base == "nul" or
+           regex_match(base, "^(com|lpt)[0-9]$") { throw "archive: reserved device name"; }
+    }
+    return map{ name: name, key: str_lower(name), directory: directory, parts: parts };
+}
+fn _names(rows) {
+    let seen = map{};
+    for i len(rows) {
+        let info = _name(rows[i].name);
+        if map_has(seen, info.key) { throw "archive: duplicate or case-colliding name"; }
+        seen[info.key] = info.directory;
+    }
+    for i len(rows) {
+        let info = _name(rows[i].name); let ancestor = "";
+        for j len(info.parts)-1 {
+            if j != 0 { ancestor = ancestor + "/"; }
+            ancestor = ancestor + str_lower(info.parts[j]);
+            if map_has(seen, ancestor) and not seen[ancestor] { throw "archive: file/directory conflict"; }
+        }
+    }
+}
+fn _plan(data, limits) {
+    let bytes = _bytes(data, MAX_BYTES);
+    let rows = ZIP.entries_bounded(bytes, limits.entries);
+    _names(rows);
+    let total = 0; let offsets = []; let ends = map{};
+    for i len(rows) {
+        let row = rows[i]; let info = _name(row.name);
+        let p = row.offset;
+        if p+30>row.data_limit { throw "archive: local header outside data range"; }
+        let end = p+30+bytes[p+26]+256*bytes[p+27]+bytes[p+28]+256*bytes[p+29]+row.csize;
+        if bit_and(row.flags,8)!=0 {
+            if end+4<=row.data_limit and bytes[end]==80 and bytes[end+1]==75 and
+               bytes[end+2]==7 and bytes[end+3]==8 { end=end+4; }
+            end=end+12;
+        }
+        if end>row.data_limit or map_has(ends,str(p)) { throw "archive: overlapping or invalid local range"; }
+        offsets[len(offsets)]=p; ends[str(p)]=end;
+        _integer(row.size, 0, limits.file);
+        _integer(row.csize, 0, MAX_BYTES);
+        total = total + row.size;
+        if total > limits.total { throw "archive: total expanded bytes exceed limit"; }
+        let kind = bit_and(row.mode, 61440);
+        if kind != 0 and kind != 32768 and kind != 16384 { throw "archive: links and special files unsupported"; }
+        if (kind == 16384 and not info.directory) or (info.directory and row.size != 0) {
+            throw "archive: invalid directory entry";
+        }
+        if row.method != 0 and row.method != 8 { throw "archive: unsupported ZIP method"; }
+        if bit_and(row.flags, 63473) != 0 { throw "archive: unsupported ZIP flags"; }
+    }
+    let ordered=array_sort(offsets);
+    for i len(ordered)-1 {
+        if ends[str(ordered[i])]>ordered[i+1] { throw "archive: overlapping entries"; }
+    }
+    return map{ rows: rows, total: total };
+}
+// Verify every member before publishing a report, including members not viewed.
+fn inspect(data, options = nil) {
+    let limits = _limits(options); let plan = _plan(data, limits); let entries = [];
+    for i len(plan.rows) {
+        let row = plan.rows[i];
+        ZIP.read_entry(data, row, limits.file);
+        entries[len(entries)] = map{ name: row.name, size: row.size,
+            compressed_size: row.csize, directory: str_ends_with(row.name, "/"), method: row.method };
+    }
+    return map{ format: "pblang.zip.v1", entries: entries, total_bytes: plan.total,
+        archive_bytes: len(data), verified: true, effects_performed: false };
+}
+fn unpack(data, options = nil) {
+    let limits = _limits(options); let plan = _plan(data, limits); let entries = [];
+    for i len(plan.rows) {
+        let row = plan.rows[i];
+        entries[len(entries)] = map{ name: row.name, directory: str_ends_with(row.name, "/"),
+            data: ZIP.read_entry(data, row, limits.file) };
+    }
+    return entries;
+}
+// Caller supplies a bounded tree snapshot; no directory walk or implicit read.
+fn pack(files, mode = "fast", options = nil) {
+    let limits = _limits(options);
+    if type(files) != "array" or len(files) > limits.entries { throw "archive: entry count exceeds limit"; }
+    let checked = []; let total = 0; let maximum_archive = 22;
+    for i len(files) {
+        let item = files[i];
+        if type(item) != "map" or len(map_keys(item)) != 2 or not map_has(item,"name") or
+           not map_has(item,"data") { throw "archive: expected name and data only"; }
+        let info = _name(item.name); let bytes = _bytes(item.data, limits.file);
+        if info.directory and len(bytes) != 0 { throw "archive: directory has data"; }
+        total = total + len(bytes);
+        maximum_archive = maximum_archive + 76 + 2 * len(str_to_bytes(item.name)) + len(bytes);
+        if total > limits.total or maximum_archive > MAX_BYTES { throw "archive: packing budget exceeded"; }
+        checked[len(checked)] = map{ name: item.name, data: bytes };
+    }
+    _names(checked);
+    return ZIP.create(checked, mode);
+}
+fn view(data, name, max_bytes = 4096, options = nil) {
+    _integer(max_bytes, 0, 65536); _name(name);
+    let limits = _limits(options); let plan = _plan(data, limits); let found = map{}; let matched = false;
+    for i len(plan.rows) {
+        let row = plan.rows[i]; let bytes = ZIP.read_entry(data, row, limits.file);
+        if row.name == name {
+            matched = true;
+            found = map{ name: row.name, size: len(bytes),
+                data: slice(bytes, 0, num_min(max_bytes, len(bytes))),
+                truncated: len(bytes) > max_bytes, verified: true, effects_performed: false };
+        }
+    }
+    if not matched { throw "archive: entry not found"; }
+    return found;
+}
+export pack, inspect, unpack, view;
