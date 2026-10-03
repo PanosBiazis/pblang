@@ -158,3 +158,10 @@ not expose their labels or descriptions in the page. Names are public plotted
 data, not private metadata. This extends passive Web/SVG visualization of 2D
 data or projected 3D/ND data; it does not add a native GPU renderer, device
 installation or OS accessibility bridge. No rendering speedup is claimed.
+
+## Synthetic aggregate dashboard
+
+[Admin metrics](../examples/admin_metrics/README.md) combines six fictional tenant
+records, summary cards, accessible tables and two projections in one offline HTML
+file. It demonstrates named plot options and shared styling without implementing
+authentication, SSO, service access or tenant isolation.
