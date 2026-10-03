@@ -324,3 +324,34 @@ raw samples and source bases are recorded in
 No destructive garbage collection, provider unloading, automatic checkpoint deletion,
 secure erasure or shared-installation change is performed. Caller-held results remain
 the caller's responsibility. Reading snapshots still creates copies by design.
+
+
+## Detached snapshot allocation
+
+`metrics()` copies its fixed scalar-only schema directly, including a fresh nested
+`duration` map. Immutable scalar strings can be reused; no JSON serialization and
+parsing is needed. Every snapshot still owns two separate mutable maps. Editing any
+returned root or duration field cannot alter private state or another snapshot.
+When changing the metrics schema, update the snapshot helper and the full-schema
+regression together. This is a schema-specific copy, not a general object cloner.
+
+`tests/semantics/pbai_modularity_snapshot_cycles_test.sapp` retains completion,
+provider-error and cancelled snapshots across 32 independent lifecycle cycles. It
+checks their full serialized contents after later calls and resets, verifies original
+numerical outputs, and checks that caller edits cannot reach private or sibling maps.
+On the retained runtime, 100 retained reads allocate 200 maps and only the one string
+produced by the allocation-counter probe.
+
+`tests/benchmarks/pbai_metrics_snapshot_bench.sapp` measures the identical before/after
+workload: three warmups, nine batches of 1,000 snapshots, all snapshots retained until
+the end of each batch. Binding setup, successful/error requests and cancellation are
+outside the measured loop. Each batch checks first/last snapshots and the original
+outputs. The process-wide cumulative `gc_stats` counters measure PBLang value
+allocations, not bytes, all host allocations, live memory or a general leak. The string
+delta includes one counter-probe string. Timing uses wall-clock `now_ms`, not a
+monotonic clock; local median and nearest-rank p95 are recorded with raw samples in
+`benchmarks/pbai_metrics_snapshot-2026-10-03.json`.
+
+This removes temporary snapshot strings; it does not bound caller-retained snapshots,
+repair garbage collection, prove secure erasure, or change provider resource lifetime.
+No imports, permissions, persistence, automatic training or public API were added.
