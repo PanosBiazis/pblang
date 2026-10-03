@@ -1,0 +1,15 @@
+# Ideal sensor acquisition worksheet
+
+`stdlib:sensor_acquisition.sapp` composes existing `circuits.sapp` calculations with a bounded quantizer and sample-stream storage arithmetic. It performs no device/file/network/process operations and allocates no sample buffer.
+
+- `frontend(supply_volts, upper_ohms, lower_ohms, capacitance_farads)`: ideal voltage source and unloaded divider, capacitor from output to ground. Computes steady voltage, Thevenin resistance (`upper || lower`), RC time constant and single-pole corner frequency. Supply is finite -1000..1000 V, each resistance 1..1,000,000 ohms, capacitance 0..1 F. Zero capacitance gives `nil` cutoff. Positive capacitance producing a nonfinite corner or one above 1e15 Hz is rejected.
+- `quantize(volts, reference_volts, bits)`: endpoint-inclusive ideal model with `2^bits-1` maximum code, step `reference/max_code`, nearest-code rounding and upward half-step ties. Reference 1e-6..1000 V; input 0..reference; integral bits 1..24. Out-of-range input is rejected. Error is reconstructed minus input. This convention is explicit and may differ from a physical ADC datasheet.
+- `stream(sample_rate_hz, channels, bits, duration_seconds)`: rate 1..1,000,000 complete frames/sec, channels 1..256, bits 1..32, duration 1..86400 seconds, all strict integers. A frame contains one sample per channel. Packed frames use `ceil(channels*bits/8)` bytes; aligned frames use `channels*ceil(bits/8)`. Both restart on byte boundaries. Reports rates and totals without headers, timestamps, filesystem costs, compression or transport overhead. Maximum total is 88,473,600,000,000 bytes, below 2^53.
+
+Every result states `physical_verified:false`. No tolerances, noise, loading, ADC acquisition impedance, anti-aliasing adequacy, power rating, Nyquist admission, scheduling, throughput or hardware safety are verified. Derived values may still disclose caller data; the library has no logging or persistence and errors do not include caller values.
+
+Run `pblang run tests/semantics/sensor_acquisition_test.sapp` and `pblang run examples/discovery_sensor_acquisition.sapp` from a locked PBLang checkout. The example uses synthetic data: 5 V through equal resistors gives 2.5 V; an ideal 12-bit/3.3 V conversion gives code 3102; three 12-bit channels at 1000 frames/sec for 60 seconds require 300,000 packed or 360,000 byte-aligned bytes.
+
+Discovery origin: a bounded read-only local project inventory and source inspection of existing circuit/resource facilities. This module contains original calculations and synthetic fixtures, not imported external project implementations or corporate documents. It is a reusable library/example; GUI/product integration and real instrument validation remain separate work.
+
+CLI diagnostic limitation: the current runtime may show the source line of a failing call. A synthetic literal on that same line was reproduced in the diagnostic; passing the value via a separate variable did not echo it in the tested fixture. Constant library error messages are not a guarantee of redacted runtime diagnostics. Do not embed real secrets in example sources.
