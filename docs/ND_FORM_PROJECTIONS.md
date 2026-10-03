@@ -165,3 +165,7 @@ installation or OS accessibility bridge. No rendering speedup is claimed.
 records, summary cards, accessible tables and two projections in one offline HTML
 file. It demonstrates named plot options and shared styling without implementing
 authentication, SSO, service access or tenant isolation.
+
+For bounded text/link document navigation alongside graphical applications, see
+[the declarative browser foundation](DECLARATIVE_BROWSER.md). It is a separate
+inert document subset and does not import arbitrary web charts or scripts.
