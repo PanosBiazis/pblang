@@ -1,0 +1,84 @@
+// Real Linux subprocesses; installed driver runs with source checkout hidden.
+if platform()!="linux" {print "import_origin_cli_skip_linux_required";os_exit(0);}
+let U=import("stdlib:uuid.sapp");let project=cwd();
+let exe=env_get("PBLANG_BIN") ?? path_join(project,"target/release/pblang");
+let root=path_join("/tmp","import-origin-"+U.v4());let installed=path_join(root,"installed");
+let caller=path_join(root,"caller");let bin=path_join(installed,"pblang");let step=["setup"];let cases=[0];
+fn process(command,args) {
+    let argv=["-k","1s","30s",command];for arg in args {push(argv,arg);}
+    return proc_spawn_wait("/usr/bin/timeout",argv);
+}
+fn checked(args,profile="",hidden=true) {
+    let argv=["--die-with-parent","--unshare-net","--ro-bind","/","/","--tmpfs",project,
+        "--chdir",caller,"/usr/bin/env","-u","PBLANG_PATH","PBLANG_CHECK_PROFILE="+profile,bin];
+    if not hidden {argv=["-C",project,"PBLANG_CHECK_PROFILE="+profile,exe];}
+    for arg in args {push(argv,arg);}
+    let result=process(if hidden {"/usr/bin/bwrap"} else {"/usr/bin/env"},argv);
+    cases[0]=cases[0]+1;
+    assert(not str_contains(result.stdout+result.stderr,"DECOY_EXECUTED"),"caller modules never loaded by checker");
+    assert(not str_contains(result.stdout+result.stderr,"SOURCE_EXECUTED"),"checked sources never executed");
+    return result;
+}
+fn driver(files,flags=nil) {
+    if flags==nil {flags=[];}
+    let args=["run",path_join(installed,"stdlib/check_cli.sapp"),"--deny-net","--deny-http",
+        "--deny-exec","--deny-ffi","--deny-spawn","--deny-sqlite","--"];
+    for flag in flags {push(args,flag);}for file in files {push(args,file);}
+    return args;
+}
+fn exercise() {
+    fs_mkdirs(installed);fs_mkdirs(path_join(caller,"stdlib/compiler"));
+    assert(process("/bin/chmod",["700",root]).exit_code==0,"private fixture root");
+    assert(process("/bin/cp",[exe,bin]).exit_code==0,"copy retained executable");
+    assert(process("/bin/cp",["-R",path_join(project,"stdlib"),path_join(installed,"stdlib")]).exit_code==0,"copy installed libraries");
+    for at in [installed,caller] {
+        fs_write(path_join(at,"pblang.toml"),"[package]\nname=\"origin-fixture\"\nversion=\"0.1.0\"\nentry=\"main.sapp\"\n[dependencies]\nstdlib={path=\"stdlib\"}\n");
+        fs_write(path_join(at,"main.sapp"),"print 0;");
+    }
+    for name in ["import_origin_check.sapp","retained_source_check.sapp","checked_source.sapp"] {
+        fs_write(path_join(caller,"stdlib/compiler/"+name),"print \"DECOY_EXECUTED\";fn check(source){return map{ok:true};}export check;");
+    }
+    fs_write(path_join(caller,"stdlib/provider.sapp"),"print \"DECOY_EXECUTED\";let value=99;export value;");
+    fs_write(path_join(installed,"stdlib/provider.sapp"),"print \"SOURCE_EXECUTED\";let value=7;export value;");
+    fs_write(path_join(installed,"example.sapp"),fs_read(path_join(project,"examples/import_origin/main.sapp")));
+    for at in [installed,caller] {
+        step[0]="fixture lock";
+        assert(process("/usr/bin/env",["-C",at,bin,"build"]).exit_code==0,"materialize fixture dependency lock");
+        assert(not str_contains(fs_read(path_join(at,"pblang.lock")),project),"no source checkout in installed lock");
+    }
+    let safe=path_join(installed,"safe.sapp");let lazy=path_join(installed,"lazy.sapp");
+    fs_write(safe,"let provider=import(\"stdlib:provider.sapp\");fn value(){return provider.value;}print value();");
+    fs_write(lazy,"fn value(){return import(\"stdlib:PRIVATE_CANARY.sapp\");}export value;");
+    step[0]="installed static source";
+    let result=checked(driver([safe],["--import-origin"]));assert(result.exit_code==0,"top-level imports allowed without execution");
+    step[0]="installed deferred source";
+    result=checked(driver([lazy],["--import-origin"]));
+    assert(result.exit_code!=0 and str_contains(result.stdout,"import-origin-deferred"),"installed checker rejects lazy import from locked foreign cwd");
+    assert(not str_contains(result.stdout+result.stderr,"PRIVATE_CANARY"),"fixed origin diagnostic privacy");
+    assert(checked(driver([lazy])).exit_code==0,"default semantics check unchanged");
+    assert(checked(driver([lazy]),"import-origin").exit_code!=0,"environment profile selects same gate");
+    assert(checked(driver([safe],["--import-origin","--import-origin"])).exit_code!=0,"duplicate flag rejected");
+    assert(checked(driver([safe]),"unknown").exit_code!=0,"unknown profile rejected");
+    assert(checked(driver([safe,lazy],["--import-origin"])).exit_code!=0,"mixed batch fails");
+    assert(checked(driver([safe],["--retained-source","--import-origin"])).exit_code!=0,"retained source still refuses unchecked dependencies");
+    fs_write(safe,"for _i 1 {let p=map{run:fn(self){return 7;}};print (try {p:run()} catch 9);}");
+    result=checked(driver([safe],["--retained-source"]));
+    assert(result.exit_code!=0 and str_contains(result.stdout,"retained-nested-try"),"retained checker also bound to trusted driver origin");
+    step[0]="native check dispatch";
+    result=checked(["check",lazy],"import-origin",false);
+    assert(result.exit_code!=0 and str_contains(result.stdout,"import-origin-deferred"),"actual check subcommand propagates origin rejection");
+    fs_write(safe,"print missing_name;");
+    assert(checked(driver([safe],["--import-origin"])).exit_code!=0,"ordinary diagnostics still apply");
+    assert(checked(driver([path_join(installed,"missing.sapp")],["--import-origin"])).exit_code!=0,"unreadable source rejected");
+    step[0]="bound installed example";
+    result=checked(["run",path_join(installed,"example.sapp"),"--deny-net","--deny-http","--deny-exec","--deny-ffi","--deny-spawn","--deny-sqlite"]);
+    assert(result.exit_code==0 and result.stdout=="true\n","actual required provider stays bound from foreign cwd");
+    step[0]="manifestless caller";
+    fs_remove(path_join(caller,"pblang.toml"));fs_remove(path_join(caller,"pblang.lock"));
+    result=checked(driver([lazy],["--import-origin"]));
+    assert(result.exit_code!=0 and str_contains(result.stdout,"import-origin-deferred"),"installed gate also works without caller manifest");
+}
+let passed=try {exercise();true} catch false;
+let removed=process("/bin/rm",["-rf","--",root]);
+assert(passed,"import origin CLI regression: "+step[0]);assert(removed.exit_code==0,"owned fixture removed");
+assert(cases[0]==14,"all CLI cases executed");print "import_origin_cli_pass: "+str(cases[0]);
