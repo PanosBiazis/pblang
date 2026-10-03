@@ -122,9 +122,10 @@ and compare *those*.
 
 ## Layer 3 — Verified `.pbck` artifacts (partial)
 
-**Current status (2026-09-22):** [PBCS v3](PBCS_FORMAT.md) preserves optional
-minimum function arity, retains v1/v2 reader compatibility, structural validation
-and bounded loader execution. Upgrade readers before distributing v3 artifacts. The
+**Current status (2026-10-03):** [PBCS v4](PBCS_FORMAT.md) preserves optional
+minimum function arity and literal defaults, retains v1/v2/v3 reader compatibility,
+structural validation and bounded loader execution. Upgrade readers before
+distributing v4 artifacts. The
 opt-in module cache verifies toolchain/source keys, metadata, digest, size, and
 PBCS structure before reuse. However, `stdlib/compiler/_pbck/` does not exist in
 this checkout, and no deterministic checked-in snapshot/freshness CI gate has

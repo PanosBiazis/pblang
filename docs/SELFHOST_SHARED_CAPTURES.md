@@ -43,7 +43,9 @@ version. It does not replace the native runtime or introduce a cycle collector.
 
 After lexical capture discovery, the compiler lowers captured bindings to
 one-element arrays. Declaration stores construct new cells; assignments update
-cell element zero. Parameters are boxed once at function entry, before defaults.
+cell element zero. Parameters are boxed once at function entry. Newly compiled functions normalize
+omitted defaults at the call boundary before boxing; see
+[default-argument semantics](COMPILER_DEFAULT_ARGUMENTS.md).
 Uncaptured bindings retain ordinary local instructions. Try body and handler
 chunks share the enclosing binding set and scratch slot, but receive no parameter
 boxing prologue. Branch targets are remapped after expansion, including targets
