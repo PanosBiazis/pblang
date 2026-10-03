@@ -1,0 +1,116 @@
+// Explicit, bounded compatibility planning. No module loading or capability grants.
+let SEMVER=import("stdlib:semver.sapp");
+let GRAPH=import("stdlib:graph.sapp");
+let SERIAL=import("stdlib:serialization.sapp");
+let FORMAT="pblang.controlled-modularity.v1";
+let MAX_BYTES=262144;let MAX_MODULES=64;let MAX_EDGES=256;
+fn _shape(value,keys) {
+    if type(value)!="map" or len(value)!=len(keys) {return false;}
+    for key in keys {if not map_has(value,key) {return false;}}
+    return true;
+}
+fn _id(value) {
+    if type(value)!="string" or len(value)<1 or len(value)>64 {return false;}
+    for i len(value) {
+        let c=strcharcodeat(value,i);
+        if not ((c>=97 and c<=122) or (c>=65 and c<=90) or (c>=48 and c<=57) or c==95 or c==45 or c==46) {return false;}
+    }
+    return true;
+}
+fn _version(value) {let parsed=SEMVER.parse_strict(value);return parsed!=nil and SEMVER.format(parsed)==value;}
+fn _names(values,limit) {
+    if type(values)!="array" or len(values)>limit {return false;}
+    let seen=map{};
+    for value in values {if not _id(value) or map_has(seen,value) {return false;}seen[value]=true;}
+    return true;
+}
+fn validate(document) {
+    if not _shape(document,["format","modules"]) or document.format!=FORMAT
+        or type(document.modules)!="array" or len(document.modules)<1 or len(document.modules)>MAX_MODULES {return false;}
+    let seen=map{};let edges=0;
+    for module in document.modules {
+        if not _shape(module,["id","version","interfaces","capabilities","dependencies"])
+            or not _id(module.id) or not _version(module.version) or map_has(seen,module.id)
+            or not _names(module.capabilities,16) or type(module.interfaces)!="map" or len(module.interfaces)>16
+            or type(module.dependencies)!="array" or len(module.dependencies)>16 {return false;}
+        seen[module.id]=true;
+        for name in map_keys(module.interfaces) {if not _id(name) or not _version(module.interfaces[name]) {return false;}}
+        let slots=map{};
+        for dep in module.dependencies {
+            edges=edges+1;if edges>MAX_EDGES {return false;}
+            if not _shape(dep,["slot","module","version","interface","interface_version","optional","fallback"])
+                or not _id(dep.slot) or not _id(dep.module) or not _id(dep.interface)
+                or not _version(dep.version) or not _version(dep.interface_version)
+                or type(dep.optional)!="bool" or map_has(slots,dep.slot) {return false;}
+            if dep.fallback!=nil and (not dep.optional or not _id(dep.fallback) or dep.fallback==dep.module) {return false;}
+            slots[dep.slot]=true;
+        }
+    }
+    return true;
+}
+fn _failure(code,module=nil,slot=nil) {
+    return map{format:"pblang.module-plan.v1",ok:false,code:code,module:module,slot:slot,
+        order:[],bindings:[],capability_claims_verified:false,execution_performed:false};
+}
+fn parse(text) {
+    let parsed=SERIAL.parse_safe(text,"json",map{max_input_bytes:MAX_BYTES,max_output_bytes:MAX_BYTES,
+        max_depth:12,max_items:16384,max_lines:8192,max_line_bytes:MAX_BYTES,strict:true,reject_duplicate_keys:true});
+    if not parsed.ok or not validate(parsed.value) {return map{ok:false,code:"invalid_contract",document:nil};}
+    return map{ok:true,code:"ok",document:parsed.value};
+}
+fn resolve(document,root,available=nil) {
+    if available==nil {available=[];}
+    if not validate(document) {return _failure("invalid_contract");}
+    if not _id(root) or not _names(available,64) {return _failure("invalid_request");}
+    let modules=map{};for module in document.modules {modules[module.id]=module;}
+    if not map_has(modules,root) {return _failure("missing_root",root);}
+    let capabilities=map{};for name in available {capabilities[name]=true;}
+    let pending=[root];let selected=map{};let selections=map{};
+    while len(pending)>0 {
+        let id=array_pop(pending);
+        if map_has(selected,id) {continue;}
+        selected[id]=true;let module=modules[id];
+        for capability in module.capabilities {
+            if not map_has(capabilities,capability) {return _failure("missing_capability",id);}
+        }
+        let slots=map{};for dep in module.dependencies {slots[dep.slot]=dep;}
+        let rows=[];
+        for slot in array_sort(map_keys(slots)) {
+            let dep=slots[slot];let provider=dep.module;let status="primary";
+            if not map_has(modules,provider) {
+                if not dep.optional {return _failure("missing_required",id,slot);}
+                provider=dep.fallback;status=if provider==nil {"disabled"} else {"fallback"};
+                if provider!=nil and not map_has(modules,provider) {return _failure("missing_fallback",id,slot);}
+            }
+            if provider!=nil {
+                let offered=modules[provider];
+                if offered.version!=dep.version {return _failure("package_version_mismatch",id,slot);}
+                if not map_has(offered.interfaces,dep.interface) {return _failure("missing_interface",id,slot);}
+                if offered.interfaces[dep.interface]!=dep.interface_version {return _failure("interface_version_mismatch",id,slot);}
+                push(pending,provider);
+            }
+            push(rows,map{consumer:id,slot:slot,provider:provider,status:status,
+                interface:dep.interface,interface_version:dep.interface_version,version:dep.version});
+        }
+        selections[id]=rows;
+    }
+    // Insert nodes/edges canonically before reusing the shared Kahn traversal.
+    let graph=GRAPH.new(true);let ids=array_sort(map_keys(selected));
+    for id in ids {GRAPH.add_node(graph,id);}
+    for id in ids {for row in selections[id] {if row.provider!=nil {GRAPH.add_edge(graph,row.provider,id);}}}
+    let order=GRAPH.topological_sort(graph);
+    if order==nil {return _failure("dependency_cycle");}
+    // Canonical dependency layers do not depend on a VM's map iteration order.
+    let levels=map{};
+    for id in order {
+        let level=0;
+        for row in selections[id] {if row.provider!=nil and levels[row.provider]>=level {level=levels[row.provider]+1;}}
+        levels[id]=level;
+    }
+    let canonical=[];
+    for level len(ids) {for id in ids {if levels[id]==level {push(canonical,id);}}}
+    let bindings=[];for id in ids {for row in selections[id] {push(bindings,row);}}
+    return map{format:"pblang.module-plan.v1",ok:true,code:"ok",module:root,slot:nil,
+        order:canonical,bindings:bindings,capability_claims_verified:false,execution_performed:false};
+}
+export FORMAT,MAX_BYTES,MAX_MODULES,MAX_EDGES,validate,parse,resolve;

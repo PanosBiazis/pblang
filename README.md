@@ -425,6 +425,12 @@ installation location while preserving all digests. Keep that host-bound lock
 local; source/release locks stay portable. See
 [`Installed dependency locks`](docs/INSTALLED_DEPENDENCY_LOCKS.md).
 
+[Controlled modularity](docs/CONTROLLED_MODULARITY.md) adds exact versioned
+interface contracts, bounded required/optional dependency resolution and explicit
+fallback planning for PBLang tools and products. `pbmodules` reports compatibility;
+`pbc --module-contract FILE --module-root ID` rejects incompatible declarations
+before compiling. Capability declarations do not grant runtime permissions.
+
 See [`STRUCTURE.md`](STRUCTURE.md) for the crate map and [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md) for the current test/status snapshot.
 
 ---
