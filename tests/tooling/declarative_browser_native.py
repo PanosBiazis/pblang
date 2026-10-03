@@ -24,7 +24,7 @@ def main():
         window = x('search', '--sync', '--name', '^PBLang document browser probe$').splitlines()[0]
         x('windowfocus', '--sync', window)
         time.sleep(0.4)
-        for key in ['Tab', 'Tab', 'Return', 'Tab', 'Return', 'Tab', 'Return']:
+        for key in ['Tab', 'Tab', 'Tab', 'Return', 'Tab', 'Return', 'Tab', 'Return']:
             x('keydown', key)
             time.sleep(0.15)
             x('keyup', key)
