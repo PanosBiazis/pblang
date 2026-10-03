@@ -138,11 +138,12 @@ in or returned with the public runtime counters. Limits, step accounting and
 counter shape remain unchanged.
 
 Explicit VM admission errors (invalid call counts, declared function/method
-arity, unresolved imports, invalid overload targets, selected builtin arities,
+arity, unresolved imports, invalid overload targets, builtin arities,
 negative slots and explicit byte-conversion type checks) use the same ownership
 rule as ordinary guest exceptions: close only if no guest handler can continue.
-The original error messages are retained; stack traces can include a cleanup
-helper frame. This does not make every host builtin failure a controlled VM
+Previously explicit error messages are retained; newly checked builtin counts
+report the builtin name and expected/actual count without argument values. Stack
+traces can include a cleanup helper frame. This does not make every host builtin failure a controlled VM
 error.
 
 Implicit host failures and arbitrary FFI exceptions are not covered by this path. A host failure during cleanup is suppressed to retain the
@@ -213,3 +214,39 @@ handlers, borrowed contexts, pre-mutation rejection and unchanged public runtime
 counter fields. See also the existing bounded VM, tick-accounting and UTF-8
 budget suites. A malformed host value or arbitrary builtin exception that occurs
 before an explicit VM rejection can still escape without this cleanup.
+
+
+### Dynamic builtin argument counts
+
+The VM checks wrong builtin argument counts before indexing an argument list or
+calling a primitive. This also covers source programs whose callee is a function
+parameter, and direct VM/PBCS chunks. For example:
+
+```pblang
+fn call(f, values) { return f(values, 99); }
+let values = [7];
+call(array_pop, values);
+```
+
+The call now fails and `values` stays `[7]`. Previously the extra argument was
+ignored and the array became empty. A missing argument to `array_push` previously
+escaped through a host index error without closing an opted-in scalar context.
+Both failures now use the existing controlled-exception cleanup path. A guest
+`catch` retains usable allocations; an escaping error closes owned contexts;
+borrowed contexts remain the caller's responsibility. Arguments are still
+evaluated once, in normal language order, before argument-count rejection.
+Those evaluation side effects are not rolled back.
+
+`compiler/vm_builtins.sapp::fixed_arities()` returns fresh fixed-count metadata.
+The VM caches its own copy once and consults it only in generic/fallback dispatch.
+Valid scalar fast paths still avoid temporary argument arrays and this lookup.
+`print` remains variadic, `rational` accepts one or two arguments, `import` requires
+one path, and memory builtin contracts remain in the ownership engine. Existing
+explicit clock/sort/byte-conversion arity diagnostics are preserved. Code relying
+on silently ignored extra arguments must be corrected.
+
+Coverage: `tests/semantics/selfhost_builtin_arity_cleanup_test.sapp` and
+`examples/selfhost_throw_cleanup/builtin_arity.sapp`. This checks argument counts,
+not every builtin argument type or host failure. General FFI/resource cleanup,
+composite/cyclic ownership and other backends are outside this guarantee. No host
+runtime change or general performance improvement is claimed.
