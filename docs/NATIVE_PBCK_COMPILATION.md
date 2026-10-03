@@ -297,9 +297,10 @@ Rebinding their global names in initialization does not replace captured calls.
 ```
 
 The example prints
-`7` and `released`. `--initialize` currently rejects `--bundle` rather than
-implying protection of dependency initialization. The existing entry/cleanup
-pair and static-bundle cleanup APIs are unchanged.
+`7` and `released`. `--initialize --bundle` compiles the declared main lifecycle together with
+static dependencies. Dependency top-level initializers still precede the boundary;
+only work explicitly called by the main initializer is protected. The existing
+entry/cleanup pair and static-bundle cleanup APIs are unchanged.
 
 Top-level source evaluation still runs before this explicit boundary. Move
 resource acquisition into the declared initializer and make cleanup tolerate
@@ -343,3 +344,79 @@ source-canary redaction. Compilation never acquires that owned file. Existing
 `native_pbck_cli_live_test.sapp` and `native_pbck_cleanup_test.sapp` also passed.
 These are Linux retained-runtime tests, not cross-platform qualification or a
 claim that arbitrary top-level initializers receive cleanup.
+
+
+## Retained source compatibility gate (2026-10-03)
+
+The retained direct-source compiler is not repaired by the library. To refuse
+its known nested implicit-capture hazard before an execution stage, use:
+
+```sh
+PBLANG_CHECK_PROFILE=retained-source ./target/release/pblang check program.sapp
+# Direct PBLang driver equivalent:
+./target/release/pblang run stdlib/check_cli.sapp --allow-all -- --retained-source program.sapp
+```
+
+The `check` wrapper treats arguments as file paths, so its profile is selected
+through the environment; the flag is for the direct driver only. Empty/default
+profile keeps existing diagnostics. Unknown profiles fail before file reads.
+This is an explicit checking gate, not automatic enforcement in `pblang run`.
+Run dependent commands only if the check succeeds. A user who skips the gate can
+still encounter the retained compiler defect.
+
+The conservative profile refuses every `try` beneath a block/function scope,
+including safe cases, rather than guessing which implicit captures the retained
+compiler will miss. It catches colon calls, dot calls, nested try blocks and
+closures in this class. It rejects imports and first-class import references
+because it does not inspect dependencies. Strings/comments are not treated as
+code. Ordinary type/name checking remains active after compatibility admission.
+Accepted input is not certified free of all compiler bugs or safe to execute.
+
+The pure `compiler/retained_source_check.sapp::check(source)` returns a fixed
+code/message and never runs source, resolves imports or returns source literals.
+It uses existing strict 1 MiB UTF-8 / 65,536-token parser admission, followed by
+an iterative AST walk capped at depth 128 and 262,144 admitted container nodes.
+Those are library-work limits, not an OS sandbox; file reads occur before source
+admission and the parser retains its existing behavior. The standalone helper
+checks this compatibility subset only; use the driver for type/name diagnostics.
+
+## Lifecycle in static bundles (2026-10-03)
+
+`native_bundle.compile_bundle_with_lifecycle(source, resolve, initialize, entry,
+cleanup)` and `compile_file_with_lifecycle(path, initialize, entry, cleanup)`
+reuse the same checked wrapper and guarded native translation as single-source
+lifecycle compilation. The lower `selfhost_bundle` helpers return linked IR;
+only native guarded translation supplies finally behavior. No FFI admission,
+execution profile, source launcher or runtime default changes.
+
+```sh
+./target/release/pblang run tools/pbc.sapp --allow-all -- examples/static_project/lifecycle.sapp --target pbck --bundle --initialize initialize --entry work --cleanup release --out lifecycle-bundle.pbck
+./target/release/pblang run lifecycle-bundle.pbck --sandbox
+```
+
+Main callback names/declarations, generated source admission and reserved main
+globals are checked before resolver callbacks. The complete generated wrapper
+and cleanup expression count toward both strict main admission and aggregate
+source bytes. Existing module/depth/import/collision limits remain unchanged.
+Cycles, unsupported imports and a dependency collision with the generated
+lifecycle entry fail before artifact publication; no source fallback occurs.
+The namespace is shared, so this is not isolation between untrusted modules.
+
+A module can expose acquisition and release functions; calling acquisition from
+the declared main initializer then puts those effects inside the cleanup boundary.
+Import-time effects remain outside. Cleanup must tolerate partial acquisition.
+The entry is skipped on initialization failure; the original native message wins
+if cleanup also fails. Successful and failure artifacts execute after removing
+the compiled source files, without reintroducing retained-source compilation.
+
+
+Verification on the Linux retained runtime: `retained_source_check_test`,
+`retained_source_cli_live_test`, `native_bundle_lifecycle_test`,
+`native_bundle_cli_live_test`, `native_lifecycle_cli_live_test`,
+`native_pbck_lifecycle_test`, `native_bundle_cleanup_test`,
+`native_pbck_cleanup_test`, `check_cli_exit_live_test`, and
+`diagnostics_checked_test` passed. The checker reported zero errors/warnings
+across the 13 changed PBLang files. The two-file example produced `7` then
+`released`. These checks cover the named fixtures, not all source programs,
+all platforms, or hosted CI. Test child environments use `/usr/bin/env` because
+the retained runtime deliberately disables process-wide `env_set` mutation.
