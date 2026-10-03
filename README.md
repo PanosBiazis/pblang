@@ -529,3 +529,7 @@ MIT. See [`LICENSE`](LICENSE).
 ### Retained import-origin checking
 
 Use the opt-in [import-origin source profile](docs/IMPORT_ORIGIN_CHECK.md) to reject deferred or escaped imports before release. It performs no dependency execution and does not repair the retained host or replace per-dependency qualification.
+
+### Default argument correctness
+
+The PBLang compiler preserves explicit `nil` arguments and fills only omitted parameters. See [default arguments and PBCS v4 compatibility](docs/COMPILER_DEFAULT_ARGUMENTS.md).
