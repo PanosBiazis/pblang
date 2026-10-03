@@ -8,10 +8,28 @@ let DIRFS = import("stdlib:linux_dirfs.sapp");
 
 let FORMAT = "pblang.llm.tiered_store.v1";
 let MAX_SHARDS = 65536;
-let DEFAULT_MAX_SHARD_BYTES = 268435456;
+// Matches the existing bounded reader; larger explicit budgets fail at creation.
+let DEFAULT_MAX_SHARD_BYTES = 67108864;
 
 fn _error(code, message) {
     return map{ ok: false, format: FORMAT, code: code, error: message };
+}
+
+// Lifecycle checks for handles returned by create(), including failed creation.
+// The public map remains caller-owned; this is not handle authentication.
+fn _created(store) {
+    return type(store) == "map" and (try store.format catch nil) == FORMAT
+        and (try store.ok catch false) == true
+        and type(try store.closed catch nil) == "bool";
+}
+fn _open(store) { return _created(store) and not store.closed; }
+fn _closed() { return _error("closed", "tiered store is not open"); }
+// Fixed scalar counters: callers must not receive the mutable internal map.
+fn _stats_snapshot(stats) {
+    return map{loads:stats.loads,hits:stats.hits,misses:stats.misses,
+        evictions:stats.evictions,bypasses:stats.bypasses,verified_reads:stats.verified_reads,
+        rejected_reads:stats.rejected_reads,mirror_failovers:stats.mirror_failovers,
+        prefetched:stats.prefetched,prefetch_hits:stats.prefetch_hits,route_events:stats.route_events};
 }
 
 fn _int(value, fallback, minimum, maximum) {
@@ -165,6 +183,11 @@ fn create(root, shards, cfg = nil) {
     if type(cfg) != "map" or (try cfg.format catch "") != "pblang.llm.tiered_store.config.v1" {
         return _error("config", "invalid tiered-store configuration");
     }
+    let read_limit = try cfg.max_shard_bytes catch nil;
+    if type(read_limit) != "number" or read_limit < 1 or read_limit > DEFAULT_MAX_SHARD_BYTES
+        or read_limit != num_floor(read_limit) {
+        return _error("config", "max_shard_bytes must be an integer from 1 to 67108864");
+    }
     if type(shards) != "array" or len(shards) == 0 or len(shards) > MAX_SHARDS {
         return _error("manifest", "shard manifest must be non-empty and bounded");
     }
@@ -260,7 +283,7 @@ fn _preferred_root(store, id) {
 }
 
 fn weighted_root_for(store, id) {
-    if store == nil or not (try store.ok catch false) or len(store.roots) == 0 { return nil; }
+    if not _open(store) or len(store.roots) == 0 { return nil; }
     return store.roots[_preferred_root(store, id)].root;
 }
 
@@ -356,9 +379,7 @@ fn _cache_insert(store, shard_value, bytes, pin, prefetched) {
 }
 
 fn load(store, id, pin = false) {
-    if store == nil or not (try store.ok catch false) or (try store.closed catch true) {
-        return _error("closed", "tiered store is not open");
-    }
+    if not _open(store) { return _closed(); }
     id = str(id);
     if not map_has(store.shard_by_id, id) { return _error("missing", "unknown shard id"); }
     store.stats.loads = store.stats.loads + 1;
@@ -396,6 +417,7 @@ fn load(store, id, pin = false) {
 }
 
 fn unpin(store, id) {
+    if not _open(store) { return false; }
     id = str(id);
     if not map_has(store.cache, id) { return false; }
     let entry = store.cache[id];
@@ -405,6 +427,7 @@ fn unpin(store, id) {
 }
 
 fn rebalance_hot(store) {
+    if not _open(store) { return _closed(); }
     let keys = map_keys(store.cache);
     let i = 0;
     while i < len(keys) {
@@ -453,6 +476,7 @@ fn _queued(store, id) {
 }
 
 fn queue_prefetch(store, ids) {
+    if not _open(store) { return _closed(); }
     if type(ids) != "array" { return _error("prefetch", "prefetch ids must be an array"); }
     let accepted = [];
     let rejected = [];
@@ -478,6 +502,7 @@ fn queue_prefetch(store, ids) {
 }
 
 fn run_prefetch(store, max_items = 1) {
+    if not _open(store) { return _closed(); }
     let limit = _int(max_items, 1, 0, store.config.prefetch_capacity);
     let completed = [];
     let failed = [];
@@ -525,6 +550,7 @@ fn _expert_id(store, layer_index, expert_index) {
 }
 
 fn record_routes(store, layer_index, expert_indices) {
+    if not _open(store) { return _closed(); }
     if type(expert_indices) != "array" { return _error("router", "expert indices must be an array"); }
     let accepted = [];
     let i = 0;
@@ -546,6 +572,7 @@ fn record_routes(store, layer_index, expert_indices) {
 }
 
 fn predict_experts(store, layer_index, limit = 2) {
+    if not _open(store) { return []; }
     let candidates = [];
     let i = 0;
     while i < len(store.shards) {
@@ -581,10 +608,12 @@ fn predict_experts(store, layer_index, limit = 2) {
 }
 
 fn queue_expert_prefetch(store, layer_index, limit = 2) {
+    if not _open(store) { return _closed(); }
     return queue_prefetch(store, predict_experts(store, layer_index, limit));
 }
 
 fn status(store) {
+    if not _created(store) { return _closed(); }
     let cache_keys = map_keys(store.cache);
     let pinned = 0;
     let i = 0;
@@ -604,12 +633,12 @@ fn status(store) {
         queued_prefetch: len(store.prefetch_queue),
         precision: store.config.expected_precision,
         semantics_preserved: true,
-        stats: store.stats
+        stats: _stats_snapshot(store.stats)
     };
 }
 
 fn close(store) {
-    if store == nil or (try store.closed catch true) { return false; }
+    if not _open(store) { return false; }
     let i = 0;
     while i < len(store.roots) {
         if store.roots[i].handle != nil { DIRFS.close(store.roots[i].handle); }

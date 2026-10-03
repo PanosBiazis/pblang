@@ -477,3 +477,7 @@ training, persistence or device actions.
 The common [modularity bridge](pbAI_Modularity.md) separates static declarations,
 explicit runtime probes and bounded serial execution of sensor/student adapters.
 Unavailable or incompatible optional providers do not silently activate replacements.
+
+
+Streaming session close/reuse behavior and detached status snapshots are documented in
+[pbAI Streaming Lifecycle](pbAI_Streaming_Lifecycle.md).
