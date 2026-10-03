@@ -206,3 +206,8 @@ Buttons and toggles accept `accessibility_label` for an explicit contextual name
 Native applications using the shared graphics loop also benefit from
 [backend-aware input delivery](NATIVE_GRAPHICS_INPUT.md), including documented
 idle-presentation tradeoffs and Linux keyboard regression checks.
+
+The [declarative browser foundation](DECLARATIVE_BROWSER.md) reuses this layer for
+bounded HTML↔UI documents and shared destination-inspection actions. Its native
+local navigation, passive Web bundle, Android generation and unlinked iOS contract
+have distinct capabilities; a shared representation does not grant device access.

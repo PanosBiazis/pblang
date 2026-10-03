@@ -1,0 +1,109 @@
+// Offline navigation owns private detached documents and bounded memory history.
+// This is application admission, not authentication or an OS/network sandbox.
+let D=import("stdlib:browser_document.sapp");
+let B=import("stdlib:browser.sapp");
+fn _has(items,value) {for item in items {if item==value {return true;}}return false;}
+fn capabilities() {
+    return map{format:"pblang.declarative-browser.v1",local_navigation:true,html_ui_roundtrip:true,
+        history_limit:32,page_limit:16,source_bytes_limit:65536,javascript:false,network:false,
+        cookies:false,downloads:false,tor:false,authentication:false,ad_tracker_protection:"no-subresource-loading; advisory URL patterns only"};
+}
+fn search_engines() {
+    let out=[];
+    // Reuse existing templates, without inheriting unverified privacy ratings.
+    for engine in B.search_engine_records() {push(out,map{id:engine.id,label:engine.label,prefix:engine.url});}
+    return out;
+}
+fn _external(url) {
+    if type(url)!="string" or len(url)>2048 or not str_starts_with(url,"https://") {throw "browser_session: HTTPS proposal required";}
+    // Strict lexical preflight is advisory only; no DNS, socket or request occurs.
+    if not regex_match(url,"^https://[a-z][a-z0-9.-]*[a-z]/[^ <>\"\\\\]*$") {throw "browser_session: unsupported URL proposal";}
+    let policy=B.url_policy(url,false,false,false);
+    if not policy.ok {throw "browser_session: blocked URL proposal";}
+    let labels=str_split(policy.host,".");
+    if len(labels)<2 {throw "browser_session: qualified host required";}
+    for label in labels {
+        if not regex_match(label,"^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$") {throw "browser_session: unsupported host label";}
+    }
+    if _has(["onion","local","internal","home","invalid","test"],labels[len(labels)-1]) {throw "browser_session: unsupported host suffix";}
+    for i len(url) {
+        let code=strcharcodeat(url,i);
+        if code<33 or code>126 {throw "browser_session: explicit URL encoding required";}
+        if code==37 and (i+2>=len(url) or not regex_match(str_slice(url,i+1,i+3),"^[0-9A-Fa-f]{2}$")) {throw "browser_session: malformed URL encoding";}
+    }
+    return url;
+}
+fn create(pages,options=nil) {
+    if type(pages)!="map" or len(map_keys(pages))<1 or len(map_keys(pages))>16 {throw "browser_session: page budget";}
+    if options==nil {options=map{};}
+    if type(options)!="map" {throw "browser_session: invalid options";}
+    for key in map_keys(options) {if not _has(["level","home","allow"],key) {throw "browser_session: unsupported option";}}
+    let level=try options.level catch "local";
+    if not _has(["locked","local","review"],level) {throw "browser_session: unsupported level";}
+    let home=D.address(try options.home catch "pb://home");let documents=map{};let total=0;
+    for url in map_keys(pages) {
+        D.address(url);let source=pages[url];
+        if type(source)!="string" or len(source)>D.MAX_SOURCE_BYTES {throw "browser_session: source budget";}
+        total=total+len(str_to_bytes(source));if total>65536 {throw "browser_session: total source budget";}
+        documents[url]=D.import_html(source);
+    }
+    if not map_has(documents,home) {throw "browser_session: unknown home";}
+    let grants=map{};let allow=try options.allow catch map_keys(documents);
+    if type(allow)!="array" or len(allow)>16 {throw "browser_session: grant budget";}
+    for url in allow {
+        D.address(url);if not map_has(documents,url) or map_has(grants,url) {throw "browser_session: invalid grant";}
+        grants[url]=true;
+    }
+    if not map_has(grants,home) {throw "browser_session: home not granted";}
+    let state=map{closed:false,current:home,history:[home],position:0};
+    fn active() {if state.closed {throw "browser_session: closed";}}
+    fn admitted(url) {
+        active();D.address(url);
+        if not map_has(grants,url) or (level=="locked" and url!=home) {throw "browser_session: destination denied";}
+    }
+    fn snapshot() {
+        active();
+        return map{url:state.current,level:level,document:D.inspect(documents[state.current]).document,
+            can_back:state.position>0,can_forward:state.position+1<len(state.history),history_count:len(state.history)};
+    }
+    fn navigate(url) {
+        admitted(url);
+        if url==state.current {return snapshot();}
+        let next=[];for i (state.position+1) {push(next,state.history[i]);}
+        push(next,url);if len(next)>32 {let trimmed=[];for i len(next) {if i>0 {push(trimmed,next[i]);}}next=trimmed;}
+        state.history=next;state.position=len(next)-1;state.current=url;return snapshot();
+    }
+    fn follow(index) {
+        active();let blocks=D.inspect(documents[state.current]).blocks;
+        if type(index)!="number" or not (index>=0 and index<len(blocks)) or index!=num_floor(index) {throw "browser_session: invalid link index";}
+        if blocks[index].tag!="a" {throw "browser_session: selected block is not a link";}
+        return navigate(blocks[index].href);
+    }
+    fn back() {active();if state.position>0 {state.position=state.position-1;state.current=state.history[state.position];}return snapshot();}
+    fn forward() {active();if state.position+1<len(state.history) {state.position=state.position+1;state.current=state.history[state.position];}return snapshot();}
+    fn home_page() {return navigate(home);}
+    fn search(query,engine="duckduckgo",custom_prefix=nil) {
+        active();if level!="review" {throw "browser_session: proposals disabled";}
+        if type(query)!="string" or len(query)<1 or len(query)>256 {throw "browser_session: query budget";}
+        let prefix=nil;
+        if engine=="custom" {
+            prefix=_external(custom_prefix);
+            if not str_ends_with(prefix,"=") or not str_contains(prefix,"?") or len(prefix)>1024 {throw "browser_session: explicit query prefix required";}
+        } else {
+            if custom_prefix!=nil {throw "browser_session: unexpected template";}
+            for item in search_engines() {if item.id==engine {prefix=item.prefix;}}
+            if prefix==nil {throw "browser_session: unknown search engine";}
+        }
+        let url=_external(prefix+B.percent_encode(query));
+        return map{url:url,effects:false,executable:false,reason:"network transport not linked; query not sent"};
+    }
+    fn bundle() {
+        active();let targets=map{};let exported=map{};
+        for url in map_keys(grants) {if level!="locked" or url==home {targets[url]=str_slice(url,5,len(url))+".html";}}
+        for url in map_keys(targets) {exported[targets[url]]=D.page(documents[url],targets);}
+        return map{files:exported,entry:targets[home],effects:false,protection:"local links only; exported files are readable by their recipient"};
+    }
+    fn close() {state.closed=true;state.current="";state.history=[];state.position=0;documents=map{};grants=map{};}
+    return map{snapshot:snapshot,navigate:navigate,follow:follow,back:back,forward:forward,home:home_page,search:search,bundle:bundle,close:close};
+}
+export create,capabilities,search_engines;
