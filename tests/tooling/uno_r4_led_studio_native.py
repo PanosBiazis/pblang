@@ -1,5 +1,6 @@
 """Synthetic native journey; refuses personal displays and cleans its own process."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import shlex
@@ -19,6 +20,10 @@ def main():
     env = dict(os.environ)
     for key in ('PBLANG_GRAPHICS_IDLE_PUMP_MS', 'PBLANG_GRAPHICS_MAX_MS', 'PBLANG_GRAPHICS_MAX_FRAMES'):
         env.pop(key, None)
+    importfile = root / 'build/uno-r4-import-test.json'
+    import_created = False
+    if importfile.exists():
+        raise RuntimeError('Refuse to overwrite existing import fixture')
     child = subprocess.Popen([str(root / 'target/release/pblang'), 'run', 'tests/fixtures/uno_r4_led_studio_native.sapp', '--allow-all'], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     observations = []
 
@@ -77,17 +82,37 @@ def main():
         settled(status='Saved new validated export under build/uno-r4-led-studio/.')
         created = set(exports.glob('frames-*.json')) - before
         assert len(created) == 1
-        exported = json.loads(created.pop().read_text())
+        exported_bytes = created.pop().read_bytes()
+        exported = json.loads(exported_bytes)
+        expected_digest = hashlib.sha256(exported_bytes).hexdigest()
         assert len(exported['document']['frames']) == 25
         assert len(exported['arduino_frames']) == 25
         for frame, words in zip(exported['document']['frames'], exported['arduino_frames']):
             packed = [int(''.join(str(int(v)) for v in frame['pixels'][i:i+32]), 2) for i in (0,32,64)]
             assert packed + [frame['duration_ms']] == words
-        output, error = child.communicate(timeout=18)
+        # Import the actual exported document via the native button, then reject
+        # malformed input without replacing the imported document.
+        with importfile.open('x') as stream:
+            stream.write(json.dumps(exported))
+        import_created = True
+        click(320, 100)  # Clear current frame first.
+        click(320, 592)
+        settled(count=25, index=0, playing=False, pixel0=0, pixel1=0, export_sha256=expected_digest)
+        shot('uno-r4-native-imported.png')
+        importfile.write_text('{malformed')
+        click(320, 592)
+        settled(count=25, index=0, playing=False, pixel0=0, export_sha256=expected_digest, status='Cannot apply: check input, file format and limits.')
+        importfile.unlink()
+        output, error = child.communicate(timeout=28)
         assert child.returncode == 0, error
         assert 'uno_r4_native_pass' in output
         print(json.dumps({'result': 'pass', 'observations': observations}))
     finally:
+        if import_created:
+            importfile.unlink(missing_ok=True)
+        if child.poll() is not None and child.returncode != 0:
+            output, error = child.communicate()
+            print(error)
         if child.poll() is None:
             os.killpg(child.pid, signal.SIGTERM)
             try:
