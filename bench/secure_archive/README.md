@@ -26,3 +26,9 @@ Windows working-set reads after process exit returned zero and are **unavailable
 They are not evidence of zero RAM use. Windows CPU measurements are quantized;
 the repeat workload reported zero CPU ticks, which cannot establish its true
 CPU cost. Its wall-time observations remain usable with desktop-noise limits.
+
+The same archive suite and28 measured samples also ran on a second authorized
+Linux x86_64 laptop. Its raw observations are in
+`secure_archive_second_linux_2026-10-03.json` in the same benchmark documentation
+directory. Only the synthetic acceptance package was transferred; its temporary
+remote directory was removed afterward. No corporate server was used.
