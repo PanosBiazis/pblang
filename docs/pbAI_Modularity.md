@@ -80,7 +80,7 @@ Set `PBLANG_BIN` to a trusted executable and run it with `--allow-all --deny-net
 --deny-http` (one line). The outer test creates only UUID-named disposable fixtures,
 uses bounded subprocesses and cleans them afterward. Each child denies network,
 HTTP, process execution, FFI, spawning and SQLite. Both products use the same test.
-The 15 cases include missing providers, mismatched exports/contracts, invalid source,
+The 20 cases include missing providers, mismatched exports/contracts, invalid source,
 incorrect numeric output, throwing probes/execution, callable metadata never invoked,
 resolver failure and catalog/invalid-ID paths that never import optional providers.
 These are Linux fixture results; other platforms require their own runtime evidence.
@@ -143,3 +143,71 @@ legacy refusal. Run the outer test with `--allow-all --deny-net --deny-http`; it
 numerical children deny process/FFI/network capabilities. This is tested Linux
 installed-fixture evidence, not proof of universal platform support or a global
 runtime-origin repair. The test does not alter an installed launcher or release.
+
+## Private operational measurements
+
+An explicit binding adds `metrics()` and `clear_metrics()`; existing run/report
+results are unchanged. Metrics cover only that binding's `run` calls after creation
+or the latest clear. Contract probes, direct provider calls, legacy `modular_run`,
+other bindings and model quality are outside the observation scope.
+
+```pblang
+let metrics=binding.metrics();
+assert(metrics.executed_calls==1,"one actual adapter call observed");
+// Detaching or editing this snapshot never changes counters or admission.
+binding.clear_metrics();
+assert(binding.metrics().observed_calls==0,"new empty observation window");
+```
+
+The fixed `pbai.modular.metrics.v1` snapshot contains these separate counts:
+
+| Field | Observation |
+| --- | --- |
+| `observed_calls` | Calls included in the current bounded window |
+| `rejected_calls` | Binding admission refused; no provider execution or latency |
+| `executed_calls` | Checked callable was invoked |
+| `provider_results` | Reply declared `status:"result"`; not proof of answer correctness |
+| `provider_errors` | Reply declared `status:"error"`, including rejected provider input |
+| `execution_errors` | Callable threw or returned nil; bridge emits `execution_failed` |
+| `unclassified_replies` | Other non-nil replies; not counted as successful results |
+
+Within a completed synchronous window, `observed_calls` equals rejected plus
+executed calls. Executed calls equal the four outcome categories. Replies are not
+copied, serialized or semantically validated for monitoring; only the top-level
+status is classified. Cyclic payloads and exception text are never retained.
+
+Storage is constant per live binding. The first **1,024** calls are observed;
+`window_full` becomes true at that boundary. A subsequent call sets
+`observations_dropped:true` and runs normally without new counters/timing. These
+are partial-window aggregates, not lifetime totals. `clear_metrics()` discards
+aggregates and starts a fresh window without changing checked callables, admission
+or report. The binding and its counters live in process memory until released.
+This is logical retention control, not guaranteed secure memory erasure.
+
+`duration` uses two actual `now_ms()` readings around the checked call. It reports
+source/unit, `monotonic:false`, valid `samples`, `invalid_samples`, and total/min/max
+milliseconds. No valid sample means min/max are nil, not an invented zero; an actual
+zero-ms sample is allowed because the clock is coarse. Missing/nonfinite readings,
+backward movement and elapsed values above 86,400,000ms are marked invalid and
+excluded. This upper bound limits numeric aggregation; it is **not a timeout**.
+Undetected forward wall-clock adjustments can still distort a valid sample. Duration
+includes dispatch/error handling between readings; it excludes admission probes and
+post-call metric aggregation. These are operational observations, not a monotonic
+benchmark, latency guarantee, confidence score or AGI/ASI evidence.
+
+No raw inputs, checkpoints, outputs, timestamps, paths, caller identifiers or free-text
+labels are stored. Nothing is written to disk or sent over the network. Metrics do
+not grant rights, activate models or authenticate artifacts. A host that exports
+snapshots must define its own retention and access policy; counts/timing may still
+reveal usage patterns. This synchronous binding is not a cross-thread monitor or a
+global concurrency limiter. The implementation reuses the runtime clock directly;
+the shared profiler's global arbitrary-name stores and trace list do not provide
+this bounded per-binding retention model. No optional provider imports were added.
+
+`pbai_modularity_metrics_test.sapp` covers real sensor calls, status categories,
+1024/1025 saturation, reset/refusal isolation, detached nested snapshots and separate
+student counters. The existing modularity suite also checks a real student prediction
+from a synthetic checkpoint. Five additional isolated dependency cases exercise
+throwing providers, cyclic unclassified outputs, backward/unavailable/oversized clock
+samples. The source-hidden installed test runs the updated examples' metric assertions
+from a foreign cwd without loading the unselected student provider.
