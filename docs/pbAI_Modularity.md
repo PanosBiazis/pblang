@@ -285,3 +285,42 @@ suite charges a real student checkpoint prediction. Five additional dependency
 fixtures verify invalid limits before probing, thrown/nil provider returns, nested
 calls/clear refusal and cancellation during an active call. The installed example
 now also checks quota and cancellation from a foreign cwd with source trees hidden.
+
+## Reset allocation and caller-owned results
+
+Idle `clear_metrics()` now resets the existing private counter and duration maps in
+place. It does not replace those two containers. This matters for repeated monitoring
+windows: the retained runtime records each container allocation and its weak registry
+is not automatically pruned. The change avoids new map registrations from resets;
+it does not repair the runtime's collector or establish a bound on process RAM.
+
+Only private scalar fields are reset. `metrics()` still returns a detached deep copy,
+so callers can retain or edit old snapshots. Prior successful/error outputs and inputs
+are unchanged by clearing, cancellation or subsequent calls. No previous result is
+replayed after refusal. Active-call clearing still returns false; an in-place reset
+must not discard the measurement currently being completed. Quota and cancellation
+state remain separate and cannot be renewed by clearing statistics.
+
+The retained-runtime allocation regression is
+`tests/semantics/pbai_modularity_retention_test.sapp`. It exercises the real facade,
+sensor result and provider error, retains nested snapshots, cancels the binding, then
+performs 1,000 resets and checks that no replacement maps were allocated. Existing
+isolated fixtures check reset after exceptions, unclassified replies and invalid clock
+samples; the saturation test compares the complete empty schema after reset. The
+installed examples retain an actual result and snapshot across reset/cancellation.
+
+The reproducible microbenchmark is `tests/benchmarks/pbai_metrics_reset_bench.sapp`:
+three warmup batches, nine measured batches, 1,000 identical idle resets per batch.
+The before/after workloads, selected provider, request and cancellation state are the
+same. Only measured-loop map allocations and elapsed time are compared; startup,
+imports and the retained snapshot are outside that loop. The `gc_stats` allocation
+counters are process-wide cumulative counters (static atomics in the retained VM),
+not live objects, bytes, leaks or per-binding memory. Each run uses one isolated
+process without spawned work. Timing uses non-monotonic `now_ms`; results are local
+observations, not a platform-wide latency guarantee. Median and nearest-rank p95,
+raw samples and source bases are recorded in
+`benchmarks/pbai_metrics_reset-2026-10-03.json`.
+
+No destructive garbage collection, provider unloading, automatic checkpoint deletion,
+secure erasure or shared-installation change is performed. Caller-held results remain
+the caller's responsibility. Reading snapshots still creates copies by design.
