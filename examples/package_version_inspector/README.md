@@ -79,3 +79,23 @@ checkout, restore the portable lock with
 Do not commit a host-bound lock. See `docs/INSTALLED_DEPENDENCY_LOCKS.md` for this
 existing runtime limitation. The Discovery kit runs from its shared root
 dependency snapshot and does not include the nested manifest/lock.
+
+## Review declaration gaps
+
+Each release card has a **Review evidence** button. The shared details panel
+names the reviewed version and shows every exact blocker already returned by
+`product_release_evidence.evaluate`; it does not run a new verifier. For the
+stable synthetic fixture, zero blockers is explicitly explained as complete
+declarations without proof that an artifact, signature or installation was
+checked. The RC fixture displays its eight missing declaration checks.
+
+Reviewing another release replaces the whole title and detail text. Changing
+the channel keeps the explicitly reviewed version unchanged. **Clear details**
+resets the review panel without changing the channel or compatible candidate.
+The persistent synthetic-data boundary remains visible in all states. The
+example uses the existing portable `action_sequence` and `action_set_text`
+actions, with ordinary escaped text; no installation or network action is added.
+
+Keyboard order after the three package Inspect buttons is: Stable only, Include
+prerelease, Review stable evidence, Review RC evidence, Clear details. Generated
+Web controls use native buttons, so Tab and Enter exercise the same actions.
