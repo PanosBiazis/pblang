@@ -298,3 +298,51 @@ work, active-ID deduplication, repeated cancel, zero limit, close precedence and
 handles. The simulated backend owns no OS descriptors. Real-file suites and the
 source-hidden shared/standalone examples separately verify normal operation and idle
 cancellation before an optional real prefetch.
+
+
+## Ordinary load reentry
+
+Session ownership now covers the complete public `load` operation, from before ID
+coercion through read/verification, cache admission or cache-hit copy. A nested load
+on the same open session returns the fixed `busy` error without reading, pinning,
+evicting, touching heat/recency, changing counters or consuming queued work. The guard
+applies to the same ID, another ID, an already resident ID and malformed nested
+arguments. A closed session still returns `closed` first. A different session remains
+independent; this is not a global lock.
+
+`run_prefetch` also refuses admission while an ordinary load owns the session, before
+normalizing its item limit or changing the queue. The owning prefetch executor may
+still call ordinary load normally, and its backend callbacks cannot start another
+load or batch. Previously an ordinary callback could reload the same shard, charge
+resident bytes twice, or run prefetch inside the load and publish another cache entry
+for an ID already admitted by the nested batch.
+
+An ordinary active ID is excluded from new prefetch queue admission using the existing
+`resident-or-queued` reason. Optional work queued before an ordinary load remains
+pending until an explicit batch or cancellation. `cancel_prefetch` is still available:
+it cancels pending optional work and reports whether a **prefetch batch** is running;
+it does not cancel an ordinary active load. New work queued after cancellation survives,
+but no nested executor may run it until the current load returns. The existing active
+prefetch cancellation and terminal-close policies are unchanged.
+
+The load guard and active ID are retired after success, unknown ID, read failure,
+terminal close or a caught execution exception. Unexpected exceptions outside the
+existing read boundary return the fixed `load` / `shard load failed` error without raw
+text. This is not transactional rollback of arbitrary caller mutations or allocation
+failures. The private operational fields are deliberately absent from the established
+status snapshot, whose counters and schema remain unchanged.
+
+This is a compatibility tightening for same-session synchronous callbacks: nested
+loads (including cache hits) must be deferred until the owning operation returns or
+use a separately opened session. No waiting/retry loop, worker, mutex or native-read
+preemption is introduced. Direct forgery/mutation of the trusted public handle,
+native crashes, OOM and genuine multi-thread races remain outside this guarantee.
+
+One hundred thirty-two adversarial simulated cases per test execution cover direct,
+standalone and embedded dedicated-facade entrypoints: nested same/different/cached/
+missing/cyclic IDs with both pin choices; ordinary and prefetch owners; nested prefetch;
+read errors and recovery; cancellation/requeue; close precedence; invalid handles; and
+independent sessions. Exact counters, cache bytes, pinned entries, queue order, heat,
+recency, prior outputs and closed snapshots are checked. Existing real filesystem and
+source-hidden examples separately verify normal sequential use. These callback tests
+substitute the directory backend and own no actual OS descriptors.
