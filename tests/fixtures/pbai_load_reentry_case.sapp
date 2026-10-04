@@ -1,0 +1,69 @@
+let S=import("stdlib:llm_tiered_store.sapp");let D=import("stdlib:linux_dirfs.sapp");
+let F=import("streaming.sapp");let E=import("embedded.sapp");
+let bytes=[1,2,3,4];let parts=[];
+for id in ["a","b","c","seed"] {push(parts,S.model_part(id,id+".bin",4,sha256(base64_encode_bytes(bytes))));}
+fn start(mode) {
+ let options=map{ram_budget_bytes:16,prefetch_capacity:4,mirrors:[S.mirror("synthetic-two")]};
+ if mode==1 {return F.open("synthetic",parts,options);}if mode==2 {return E.open("synthetic",parts,options);}
+ return S.create("synthetic",parts,S.config(16,options));
+}
+fn load(mode,s,id,pin=false) {if mode==1 {return F.load_weight(s,id,pin);}if mode==2 {return E.load_weight(s,id,pin);}return S.load(s,id,pin);}
+fn run(mode,s,limit=1) {if mode==1 {return F.run_prefetch(s,limit);}if mode==2 {return E.run_prefetch(s,limit);}return S.run_prefetch(s,limit);}
+fn cancel(mode,s) {if mode==1 {return F.cancel_prefetch(s);}if mode==2 {return E.cancel_prefetch(s);}return S.cancel_prefetch(s);}
+fn outer(mode,s,prefetch) {if prefetch {return run(mode,s);}return load(mode,s,"a");}
+fn snapshot(s) {return json_stringify(map{status:S.status(s),heat:s.heat,last:s.last,clock:s.clock,queue:s.prefetch_queue});}
+fn finish(s) {assert(S.close(s) and D.snapshot().closes==[1,2],"known owners close once");}
+let cyclic=[];push(cyclic,cyclic);let cases=0;
+for mode in [0,1,2] {
+ for prefetch in [false,true] {for id in ["a","b","seed","missing",cyclic] {for pin in [false,true] {
+  D.configure();let s=start(mode);let retained=load(mode,s,"seed");assert(retained.ok,"cache seeded");S.queue_prefetch(s,["a","b"]);
+  let seen=map{load:nil,prefetch:nil,calls:0};
+  D.behavior("ok",false,fn(){seen.calls=seen.calls+1;let before=snapshot(s);seen.load=load(mode,s,id,pin);seen.prefetch=run(mode,s,cyclic);assert(snapshot(s)==before,"rejected reentry changes no cache counter heat pin or queue");});
+  let result=outer(mode,s,prefetch);let after=S.status(s);
+  assert(result.ok and seen.calls==1 and seen.load.code=="busy" and seen.prefetch.code=="busy","same-session load and prefetch reentry rejected before coercion");
+  assert(len(D.snapshot().reads)==1 and after.cached_shards==2 and after.resident_bytes==8 and after.stats.loads==2 and after.stats.misses==2 and after.stats.hits==0 and after.pinned_shards==0,"one charge per successful shard; nested hit cannot pin seed");
+  let expected=["a","b"];if prefetch {expected=["b"];}assert(s.prefetch_queue==expected and retained.bytes==bytes,"pending order and caller bytes preserved");
+  D.behavior();assert(load(mode,s,"a").cache_hit,"ordinary load guard released after success");
+  assert(run(mode,s,4).ok and S.status(s).resident_bytes==12,"later explicit batch runs without duplicate accounting");finish(s);cases=cases+1;
+ }}}
+ for prefetch in [false,true] {for outcome in ["throw","false","corrupt","nil"] {
+  D.configure();let s=start(mode);let retained=load(mode,s,"seed");S.queue_prefetch(s,["a","b"]);let seen=map{result:nil};
+  D.behavior(outcome,true,fn(){seen.result=load(mode,s,cyclic);assert(run(mode,s).code=="busy","failed outer read still owns admission");});
+  let result=outer(mode,s,prefetch);let code="read";if outcome=="corrupt" {code="integrity";}
+  assert(not result.ok and seen.result.code=="busy" and len(D.snapshot().reads)==2,"failure tries bounded mirrors without nested reads");
+  if prefetch {assert(len(result.failed)==1 and result.failed[0].code==code,"prefetch retains primary failure");}else {assert(result.code==code,"ordinary load retains primary failure");}
+  assert(S.status(s).resident_bytes==4 and S.status(s).cached_shards==1 and retained.bytes==bytes,"failed read preserves existing cache");
+  let encoded=json_stringify(result);assert(not str_contains(encoded,"synthetic-private") and not str_contains(encoded,"synthetic-two"),"no raw backend diagnostics in error");
+  D.behavior();assert(load(mode,s,"a").ok and run(mode,s,4).ok and S.status(s).resident_bytes==12,"guards released after failed read and explicit recovery");finish(s);cases=cases+1;
+ }}
+ for prefetch in [false,true] {for outcome in ["ok","throw"] {
+  D.configure();let s=start(mode);S.queue_prefetch(s,["a","b"]);let seen=map{cancel:nil,nested:nil};
+  D.behavior(outcome,true,fn(){seen.cancel=cancel(mode,s);let expected=["a","b"];if prefetch {expected=["b"];}
+   assert(seen.cancel.cancelled==expected and seen.cancel.running==prefetch,"cancel describes pending optional work, not ordinary load ownership");
+   assert(S.queue_prefetch(s,["a","c"]).accepted==["c"],"ordinary active id deduplicates new queue work");
+   seen.nested=load(mode,s,"a");assert(run(mode,s).code=="busy","cancel cannot reopen admission");});
+  let result=outer(mode,s,prefetch);assert(seen.nested.code=="busy" and s.prefetch_queue==["c"],"new work survives pending cancellation");
+  if prefetch {assert(not result.ok and result.cancelled,"active batch observes cancel after current load");}else {assert(result.ok==(outcome=="ok"),"ordinary load outcome unaffected by optional cancellation");}
+  D.behavior();let resumed=run(mode,s,4);assert(resumed.ok and not resumed.cancelled and resumed.completed==["c"],"explicit next batch resumes only new work");
+  assert(load(mode,s,"a").ok and S.status(s).resident_bytes==8,"load ownership released after cancellation");finish(s);cases=cases+1;
+ }}
+ for prefetch in [false,true] {for outcome in ["ok","throw"] {
+  D.configure();let s=start(mode);let retained=load(mode,s,"seed");S.queue_prefetch(s,["a","b"]);let seen=map{snapshot:nil,nested:nil};
+  D.behavior(outcome,true,fn(){cancel(mode,s);assert(S.close(s),"close while read is active");seen.snapshot=snapshot(s);seen.nested=load(mode,s,cyclic);assert(run(mode,s,cyclic).code=="closed" and cancel(mode,s).code=="closed","terminal state takes precedence over admission guards");});
+  let result=outer(mode,s,prefetch);assert(not result.ok and seen.nested.code=="closed" and len(D.snapshot().reads)==1,"closed read exposes no late success or next mirror");
+  if prefetch {assert(result.failed[0].code=="closed" and result.queued==0,"closed batch outcome retained");}else {assert(result.code=="closed" and not map_has(result,"bytes"),"closed load exposes no bytes");}
+  assert(snapshot(s)==seen.snapshot and retained.bytes==bytes and D.snapshot().closes==[1,2] and not S.close(s),"close remains terminal and snapshots stable after ownership retires");cases=cases+1;
+ }}
+ D.configure();let first=start(mode);let second=start(mode);let seen=map{result:nil};
+ D.behavior("ok",false,fn(){seen.result=load(mode,second,"b");});
+ assert(load(mode,first,"a").ok and seen.result.ok and len(D.snapshot().reads)==2,"different sessions may load independently");
+ assert(S.status(first).resident_bytes==4 and S.status(second).resident_bytes==4 and S.status(first).stats.loads==1 and S.status(second).stats.loads==1,"per-session ownership and accounting");
+ assert(S.close(first) and S.close(second) and D.snapshot().closes==[1,2,3,4],"independent handles close");cases=cases+1;
+ for invalid in [nil,false,42,"invalid",map{}] {let before=json_stringify(invalid);assert(load(mode,invalid,cyclic).code=="closed" and run(mode,invalid,cyclic).code=="closed" and json_stringify(invalid)==before,"invalid non-handle remains inert");cases=cases+1;}
+ let failed=S.create("synthetic",[],S.config(16));let original=json_stringify(failed);
+ assert(load(mode,failed,cyclic).code=="closed" and json_stringify(failed)==original,"failed creation stays unchanged");cases=cases+1;
+ D.configure();let s=start(mode);let before=snapshot(s);assert(load(mode,s,"missing").code=="missing" and snapshot(s)==before,"unknown id causes no accounting changes");
+ assert(load(mode,s,"a").ok and load(mode,s,"a").cache_hit,"guard released after unknown id and cache hit");finish(s);cases=cases+1;
+}
+assert(cases==132,"all direct and both-facade adversarial cases executed");
+print "pbai_load_reentry_cases_pass:132";
