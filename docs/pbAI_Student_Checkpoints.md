@@ -90,12 +90,19 @@ save must not be treated as a usable checkpoint.
 
 See `examples/pbai_student_checkpoint.sapp` in PBLang and
 `demo/pbai_student_checkpoint.sapp` in standalone pbAI for the pure round trip.
-For explicit private storage:
+For explicit private storage, use the separate
+[checkpoint binding](pbAI_Checkpoint_Binding.md), including when running from a
+foreign working directory. Legacy wrappers remain compatible from the trusted
+product directory:
 
 ```sapp
+// Place these imports at application top level.
+let AI = import("stdlib/pbai.sapp");
+let IO = import("stdlib:pbai_student_checkpoint_io.sapp");
+let storage = AI.neural_specialist_checkpoint_bind(IO);
 let checkpoint = student.checkpoint();
-let receipt = AI.neural_specialist_student_save_new(path, checkpoint);
-let restored = AI.neural_specialist_student_load_file(path);
+let receipt = storage.save_new(path, checkpoint);
+let restored = storage.load_file(path);
 print restored.predict([6,0]).token;
 ```
 

@@ -68,8 +68,9 @@ retains its pass/fail gates, one-shot local acceptance/rollback and terminal
 `close()`. Earlier exports and other handles keep their own lifetimes. See
 [student review](pbAI_Student_Review.md). Binding is not global model activation.
 
-The filesystem checkpoint APIs, curriculum/sensor wrappers and unrelated lazy
-imports are outside this computational binding. Existing convenience wrappers
+Filesystem checkpoints have a separate opt-in
+[checkpoint binding](pbAI_Checkpoint_Binding.md). They remain outside this
+computational binding, as do curriculum/sensor wrappers and unrelated lazy imports. Existing convenience wrappers
 remain compatible when called from the trusted product directory. Their general
 [retained function-origin limitation](pbAI_Modularity.md#installed-execution-and-the-retained-function-origin-limit)
 remains; this is not a universal loader repair.
