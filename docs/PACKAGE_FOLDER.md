@@ -50,7 +50,8 @@ current lock. The manifest digest and dependency tree digests are verified over
 the captured bytes using the actual `pblang-package-tree-v2` contract: entry
 kind, big-endian lengths, UTF-8 relative path and content, with empty directory
 entries included. Unsupported/excluded dependency contents produce a digest
-mismatch. The old compiler snapshot digest implementation is not reused.
+mismatch. Hashing operates directly on the captured packaging entries. The
+compiler snapshot follows the same v2 contract; see [locked snapshots](LOCKED_SOURCE_SNAPSHOT.md).
 
 The root lock is normalized only in the output. Absolute local paths must match
 the original manifest root before being rewritten to relative paths. A project

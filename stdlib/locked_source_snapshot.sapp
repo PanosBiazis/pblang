@@ -2,7 +2,8 @@
 //
 // Linux directory handles keep every traversal beneath a held root and reject
 // symlinks. Dependency content is hashed with the exact byte contract used by
-// pblang-pm: sorted relative path, NUL, file bytes, NUL.
+// pblang-pm: v2 domain prefix, then sorted file/directory entries with kind,
+// big-endian byte lengths, UTF-8 relative path and exact content bytes.
 
 let PATH = import("stdlib:path.sapp");
 let SECURE = import("stdlib:secure_file.sapp");
@@ -15,6 +16,7 @@ let FORMAT = "pblang.locked-source-snapshot.v1";
 let CONTENT_HASH_ALGORITHM = "pblang-package-tree-v2";
 let MAX_MANIFEST_BYTES = 1048576;
 let MAX_FILES = 4096;
+let MAX_TREE_ENTRIES = 8192;
 let MAX_ENTRIES_PER_DIRECTORY = 4096;
 let MAX_DEPTH = 64;
 let MAX_FILE_BYTES = 16777216;
@@ -49,82 +51,112 @@ fn _builtin_hash_ok() {
     return _builtin_check.ok;
 }
 
-fn _collect_tree(fs, relative, state, depth) {
+// All lengths are bounded below 2^53; division is exact for this contract.
+fn _u64(value) {
+    let bytes = [0, 0, 0, 0, 0, 0, 0, 0]; let i = 7;
+    while i >= 0 { bytes[i] = value % 256; value = num_floor(value / 256); i = i - 1; }
+    return bytes;
+}
+
+fn _utf8_exact(bytes) {
+    let text = try bytes_to_str(bytes) catch nil;
+    if text == nil { return nil; }
+    let restored = str_to_bytes(text);
+    if len(restored) != len(bytes) { return nil; }
+    let i = 0;
+    while i < len(bytes) {
+        if restored[i] != bytes[i] { return nil; }
+        i = i + 1;
+    }
+    return text;
+}
+
+fn _collect_tree(fs, relative, state, depth, listed) {
     if state.error != nil { return; }
     if depth > MAX_DEPTH { state.error = "dependency directory depth exceeds the bound"; return; }
-    let listed = DIRFS.list(fs, if relative == "" { "root" } else { relative },
-        MAX_ENTRIES_PER_DIRECTORY);
     if not listed.ok or listed.truncated {
-        state.error = "dependency directory cannot be listed completely: " + relative;
-        return;
+        state.error = "dependency directory cannot be listed completely: " + relative; return;
     }
-    let names = array_sort(listed.entries);
-    let i = 0;
-    while i < len(names) {
-        let name = names[i];
+    for name in listed.entries {
         if type(name) != "string" or name == "" or name == "." or name == ".."
             or str_contains(name, "/") or str_contains(name, "\\")
             or str_contains(name, strfromcharcode(0)) {
             state.error = "dependency contains an invalid directory entry"; return;
         }
-        if not str_starts_with(name, ".") and name != "target" {
+        // Project discovery retains its exclusions. A locked dependency hashes
+        // every entry, including hidden names, target and empty directories.
+        if not state.source_only or (not str_starts_with(name, ".") and name != "target") {
             let path = if relative == "" { name } else { relative + "/" + name };
+            // Legacy DIRFS.list treats this spelling as a root alias. Reject it
+            // explicitly instead of accidentally hashing the enclosing tree.
+            if path == "root" { state.error = "top-level entry 'root' is unsupported by directory listing"; return; }
+            state.entry_count = state.entry_count + 1;
+            if state.entry_count > MAX_TREE_ENTRIES { state.error = "dependency tree entry count exceeds the bound"; return; }
             let child = DIRFS.list(fs, path, MAX_ENTRIES_PER_DIRECTORY);
             if child.ok {
-                if child.truncated { state.error = "dependency directory entry bound exceeded: " + path; return; }
-                _collect_tree(fs, path, state, depth + 1);
+                if not state.source_only { state.entries[path] = "d"; }
+                _collect_tree(fs, path, state, depth + 1, child);
             } elif not state.source_only or _module_path(path) {
-                let loaded = DIRFS.read_bytes(fs, path, MAX_FILE_BYTES);
-                if not loaded.ok {
-                    state.error = "dependency entry is not a no-follow regular file or directory: " + path;
-                    return;
-                }
                 state.file_count = state.file_count + 1;
-                state.total_bytes = state.total_bytes + loaded.size;
                 if state.file_count > MAX_FILES { state.error = "dependency file count exceeds the bound"; return; }
-                if state.total_bytes > MAX_TOTAL_BYTES { state.error = "dependency byte count exceeds the bound"; return; }
-                array_push(state.files, path);
+                state.entries[path] = "f";
             }
             if state.error != nil { return; }
         }
-        i = i + 1;
     }
 }
 
 fn _snapshot_pass(held, namespace, source_only, mode) {
-    let state = map{ error: nil, files: [], file_count: 0, total_bytes: 0,
+    let state = map{ error: nil, entries: map{}, file_count: 0, entry_count: 0,
         source_only: source_only };
-    _collect_tree(held, "", state, 0);
+    _collect_tree(held, "", state, 0, DIRFS.list(held, "", MAX_ENTRIES_PER_DIRECTORY));
     if state.error != nil { return _error(state.error); }
     let modules = map{}; let hash = if mode == "pure" { SHA256.new() } else { nil };
-    let parts = []; let actual_bytes = 0; let canonical_bytes = 0; let actual_files = 0;
-    let paths = array_sort(state.files);
+    let prefix = CONTENT_HASH_ALGORITHM + strfromcharcode(0);
+    if hash != nil { SHA256.update(hash, str_to_bytes(prefix)); }
+    let parts = [prefix]; let actual_bytes = 0; let actual_files = 0;
+    let canonical_bytes = len(str_to_bytes(prefix));
+    let paths = array_sort(map_keys(state.entries));
     for path in paths {
-        let loaded = DIRFS.read_bytes(held, path, MAX_FILE_BYTES);
-        if not loaded.ok { return _error("source file changed or became unreadable: " + path); }
-        actual_files = actual_files + 1; actual_bytes = actual_bytes + loaded.size;
-        if actual_files > MAX_FILES or actual_bytes > MAX_TOTAL_BYTES {
-            return _error("source tree changed beyond its file or byte bound");
+        let kind = state.entries[path]; let content = []; let size = 0;
+        if kind == "f" {
+            let loaded = DIRFS.read_bytes(held, path, MAX_FILE_BYTES);
+            if not loaded.ok { return _error("source file changed or became unreadable: " + path); }
+            content = loaded.bytes; size = loaded.size;
+            actual_files = actual_files + 1; actual_bytes = actual_bytes + size;
+            if actual_files > MAX_FILES or actual_bytes > MAX_TOTAL_BYTES {
+                return _error("source tree changed beyond its file or byte bound");
+            }
         }
+        let path_bytes = str_to_bytes(path);
+        let path_length = _u64(len(path_bytes)); let content_length = _u64(size);
+        canonical_bytes = canonical_bytes + 17 + len(path_bytes) + size;
         if hash != nil {
-            SHA256.update(hash, str_to_bytes(path)); SHA256.update(hash, [0]);
-            SHA256.update(hash, loaded.bytes); SHA256.update(hash, [0]);
+            SHA256.update(hash, str_to_bytes(kind)); SHA256.update(hash, path_length);
+            SHA256.update(hash, path_bytes); SHA256.update(hash, content_length);
+            SHA256.update(hash, content);
         }
-        let text = if mode == "fast" or _module_path(path) {
-            try bytes_to_str(loaded.bytes) catch nil
-        } else { nil };
+        let path_size_text = nil; let content_size_text = nil;
         if mode == "fast" {
-            let path_bytes = len(str_to_bytes(path));
-            canonical_bytes = canonical_bytes + path_bytes + 1 + loaded.size + 1;
-            if text == nil or len(str_to_bytes(text)) != loaded.size
+            path_size_text = _utf8_exact(path_length);
+            content_size_text = _utf8_exact(content_length);
+            if path_size_text == nil or content_size_text == nil
                 or canonical_bytes > MAX_FAST_CANONICAL_BYTES {
+                return map{ ok: false, format: FORMAT, retry_pure: true,
+                    error: "fast canonical framing is unavailable" };
+            }
+        }
+        let is_module = kind == "f" and _module_path(path);
+        let text = if mode == "fast" or is_module { _utf8_exact(content) } else { nil };
+        if mode == "fast" {
+            if text == nil {
                 return map{ ok: false, format: FORMAT, retry_pure: true,
                     error: "fast canonical text path is unavailable" };
             }
-            array_push(parts, path); array_push(parts, strfromcharcode(0));
-            array_push(parts, text); array_push(parts, strfromcharcode(0));
+            array_push(parts, kind); array_push(parts, path_size_text);
+            array_push(parts, path); array_push(parts, content_size_text); array_push(parts, text);
         }
-        if _module_path(path) {
+        if is_module {
             if text == nil { return _error("PBLang module is not valid UTF-8: " + path); }
             let virtual = if namespace == "" { path } else { namespace + ":" + path };
             modules[virtual] = text;
@@ -134,10 +166,8 @@ fn _snapshot_pass(held, namespace, source_only, mode) {
     if mode == "pure" {
         digest_state.value = try SHA256.finish(hash) catch nil;
         digest_state.backend = "pure-pblang-incremental";
-    }
-    elif mode == "fast" {
-        if len(parts) != actual_files * 4 { return _error("fast canonical part count mismatch"); }
-        for part in parts { if type(part) != "string" { return _error("fast canonical part is not text"); } }
+    } elif mode == "fast" {
+        if len(parts) != 1 + len(paths) * 5 { return _error("fast canonical part count mismatch"); }
         let canonical = try str_join(parts, "") catch nil;
         if canonical == nil or len(str_to_bytes(canonical)) != canonical_bytes {
             return map{ ok: false, format: FORMAT, retry_pure: true,
@@ -171,7 +201,8 @@ fn _snapshot_root(root, namespace, require_digest = nil) {
             result = _snapshot_pass(held, namespace, false, "pure");
         }
     }
-    DIRFS.close(held);
+    let closed = DIRFS.close(held);
+    if not closed { return _error("source directory handle cleanup failed"); }
     if not result.ok { return result; }
     let digest = result.digest;
     if require_digest != nil and not constant_time_eq(digest, require_digest) {
@@ -209,7 +240,7 @@ fn load(project_root = ".") {
 
     let project = _snapshot_root(root, "", nil);
     if not project.ok { return project; }
-    let modules = project.modules; let dependency_digests = map{};
+    let modules = project.modules; let dependency_digests = map{}; let dependency_digest_backends = map{};
     let names = array_sort(map_keys(declared));
     for name in names {
         if not _safe_name(name) { return _error("invalid dependency name: " + str(name)); }
@@ -232,9 +263,11 @@ fn load(project_root = ".") {
             modules[virtual] = snapshot.modules[virtual];
         }
         dependency_digests[name] = snapshot.digest;
+        dependency_digest_backends[name] = snapshot.digest_backend;
     }
     return map{ ok: true, format: FORMAT, root: root, modules: modules,
         manifest_sha256: actual_manifest, dependency_digests: dependency_digests,
+        dependency_digest_backends: dependency_digest_backends,
         project_files: project.files, project_bytes: project.bytes,
         dependency_count: len(names), immutable_snapshot: true,
         descriptor_confined: true, lock_verified: true,
