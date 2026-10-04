@@ -244,3 +244,57 @@ installed examples now use the actual filename `root` for their mirror fallback.
 
 These are Linux CPU results using local synthetic files. The change adds no network,
 FFI symbols, backend implementation, general cleanup guarantee or all-platform claim.
+
+
+## Prefetch batch ownership and cooperative cancellation
+
+Only one `run_prefetch` may execute per session. A nested call returns the fixed
+`busy` error before inspecting its item limit and without changing counters or the
+queue. A closed session still returns `closed` first. Previously a reentrant batch
+could read one shard twice, double-charge its resident bytes and drop another queued
+item while both calls reported success.
+
+The batch detaches each item before starting its load. Its active ID stays deduplicated
+until the load returns. Queueing during that load preserves pending work and respects
+the configured pending-queue capacity; the active item is separate from that capacity.
+Normal execution may consume newly queued work within its original bounded item limit.
+Batch ownership is released on ordinary completion and caught exceptions. Unexpected
+execution exceptions produce the fixed `prefetch` error without raw exception text;
+an already-started item is not implicitly retried.
+
+`cancel_prefetch(store)` is an explicit, synchronous operation. It clears pending
+items and returns `ok:true`, format `pblang.llm.prefetch_cancel.v1`, a detached array
+`cancelled` containing those IDs in order, `running` and `queued:0`. It leaves the
+session open and preserves resident cache, existing counters and caller-held bytes.
+Repeated cancellation of an empty idle queue succeeds without other effects. Closed,
+failed or malformed non-handles return the existing `closed` error without mutation.
+
+If a batch is active, cancellation also asks it to stop **after its current load**.
+That load retains its existing bounded mirror policy and may complete/cache verified
+bytes or report a read failure. Its ID is excluded from the cancellation array.
+The run result adds boolean `cancelled`; when true, overall `ok` is false while
+`completed` and `failed` describe work that actually finished. New work explicitly
+queued after cancellation survives, but this cancelled batch does not execute it.
+A later explicit `run_prefetch` starts a fresh batch. A second nested run remains
+`busy` even after cancellation. Terminal close takes precedence and still prevents
+late bytes from reaching the cache.
+
+The operation is exposed as `cancel_prefetch` on both dedicated streaming facades
+and `streaming_cancel_prefetch` beside the existing central `streaming_*` wrappers.
+Capabilities declare `cooperative_prefetch_cancellation:true` and
+`preempts_active_read:false`; `asynchronous_io` remains false. Existing two-argument
+`run_prefetch` calls remain valid; `cancelled` is an additive result field.
+
+This is cooperative cancellation between synchronous loads, not a scheduler, native
+read interruption, thread synchronization, general resource reclamation or protection
+against direct rewriting of the trusted public session map. A native blocked read
+still has to return before the batch can observe cancellation. The explicit operation
+does not install signal handlers, launch workers, activate models or access a network.
+
+Sixty-three simulated cases exercise the exact owner through direct, standalone and
+embedded dedicated-facade calls. They cover nested rejection, queue/cache accounting,
+cancellation before work, active cancellation with four read outcomes, newly queued
+work, active-ID deduplication, repeated cancel, zero limit, close precedence and invalid
+handles. The simulated backend owns no OS descriptors. Real-file suites and the
+source-hidden shared/standalone examples separately verify normal operation and idle
+cancellation before an optional real prefetch.
