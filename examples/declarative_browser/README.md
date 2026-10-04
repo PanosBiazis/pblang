@@ -677,3 +677,43 @@ The native journey exercises Save → restart, temporary Apply → restart, Rese
 restart and invalid-profile fallback through the real GUI. Inspect screenshots
 as well as machine-readable results; successful key injection is not a visual
 assertion. Only Linux x86-64/X11 is covered by this persistence adapter.
+
+
+### Stronger native focus indicator
+
+The native launcher now uses `App.draw(reader, canvas)`. After the unchanged GUI
+renderer draws the form, a reader-local three-physical-pixel inset frame identifies
+the focused, enabled, visible button. `focus_indicator.sapp` uses existing
+`ui_style.button` to resolve the actual fill and `colors.best_text_checked` to
+choose black or white against that opaque 8-bit sRGB fill. This also works with
+selected buttons and the existing light/dark palettes. The frame remains inside
+the widget and its clip/viewport; it does not change hit areas, text layout,
+keyboard handling, controller state or saved preferences. Drawing adds at most
+four filled rectangles per dirty frame.
+
+Developers can adopt the additive `App.draw(reader, canvas, highlight=true)`
+callback or pass `false` to keep the previous visual indicator. Direct `GUI.draw`
+callers retain their existing behavior. Missing, hidden, disabled, fully clipped
+or tiny custom buttons and unresolved/translucent colors keep the shared fallback.
+The indicator is not serialized into appearance profiles. Default session-only,
+explicit Save, conflict checks and Reload remain unchanged.
+
+The baseline reader's primary-button focus was one native pixel at approximately
+2.02:1 against its fill. The compact native test verifies a three-pixel white
+frame at approximately 4.86:1, its removal on Tab and restoration on Shift+Tab,
+then exercises large text, page navigation and clearing focus. Pure tests cover
+both themes, other button variants, selected states, grayscale colors and clipping.
+The W3C [Focus Appearance guidance](https://www.w3.org/WAI/WCAG22/Understanding/focus-appearance)
+informs the size/contrast goal. This is measured Linux/X11 behavior in physical
+pixels, not a claim of complete WCAG conformance, CSS-pixel equivalence, screen
+reader integration, native forced-colors support or verification on other platforms.
+
+```sh
+pblang run tests/semantics/reader_focus_indicator_test.sapp --allow-all --deny-fs --deny-net --deny-http --deny-exec --deny-spawn --deny-ffi
+python3 tests/tooling/reader_focus_indicator_native.py --package /absolute/candidate --evidence /absolute/NEW_FOCUS_EVIDENCE
+python3 tests/tooling/reader_focus_indicator_native.py --install-root /home/USER/.local/share/pb-document-reader --launcher /home/USER/.local/bin/pb-document-reader --evidence /absolute/NEW_INSTALLED_FOCUS_EVIDENCE
+```
+
+The native driver reuses the source-hidden synthetic-data harness and additionally
+requires Pillow for read-only screenshot pixel inspection. Inspect the screenshots
+as well as the machine results; the profile/Reload journey remains a separate test.
