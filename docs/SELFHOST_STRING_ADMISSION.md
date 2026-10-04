@@ -57,13 +57,36 @@ primitive error after eligible cleanup; handled and borrowed state stays live.
 Unbounded valid calls skip this size scan. This does not bound all allocations
 inside the retained host, nor does it add admission for other string primitives.
 
-A local retained-host measurement used the unchanged workload of 200 bounded
-joins over 64 two-scalar Unicode strings, with one warmup and five alternating
-samples per revision (baseline `a486aa6`, then the join guard). The VM median
-increased from 21.066 to 31.767 ms (+50.8%); nearest-rank p95 increased from
-22.862 to 41.434 ms. The additional pre-admission scan is a correctness cost,
-not a speed improvement. Five local samples do not establish general performance
-or platform behavior, and process-startup noise must not hide that scan cost.
+The initial admission change measured a +50.8% VM median cost on a local
+200-join workload. A follow-up removes redundant generic helper calls for lengths
+already known to be nonnegative numbers and caches the private run limit. It
+still checks after each string member and charges all member-inspection steps;
+no input validation, early rejection, or allocation quota was weakened. Zero/one-member
+arrays still validate the separator type but need no separator-length arithmetic.
+
+The unchanged workload joins 64 two-scalar Unicode strings with commas 200 times
+(checksum 38200). With one warmup and nine alternating samples per revision,
+a three-way same-process comparison of the identical compiled chunk measured:
+
+| VM revision | Bounded median / p95 (ms) | Unbounded median / p95 (ms) |
+| --- | --- | --- |
+| Original without join admission (`a486aa6`) | 24.372 / 24.683 | 10.422 / 11.723 |
+| Guarded baseline (`d5e0cff`, same guard as `6010a8d`) | 40.815 / 42.825 | 10.729 / 11.432 |
+| Optimized admission | 32.714 / 35.633 | 10.839 / 11.875 |
+
+This is a 19.8% reduction against the guarded baseline in that comparison,
+with 8.342 ms of extra bounded cost still remaining against the original
+unguarded reference (+34.2%). The bounded step count remains exactly 18658;
+the original reference charged 5858 because it did not perform join admission.
+Separate-process samples measured 36.783 -> 29.022 ms bounded median, and a
+separate two-module same-process comparison measured 33.547 -> 27.241 ms.
+Small unbounded differences vary between runs; they establish neither a general
+improvement nor a resolved regression. All datasets, including the first variant
+and its worse unbounded sample, remain in the
+[cost evidence](evidence/selfhost-join-cost-2026-10-04.json). Process wall time,
+CPU and RSS include startup. Nine local samples and nearest-rank p95 do not
+establish general performance or other-platform behavior, and this does not
+remove the cost of bounded admission.
 
 This change covers neither general host failures, native crashes, arbitrary
 FFI/resource cleanup, composite/cyclic ownership, nor process RSS reclamation.
