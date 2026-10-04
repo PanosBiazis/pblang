@@ -34,6 +34,7 @@ def main():
     parser.add_argument('--repo', required=True)
     parser.add_argument('--report', required=True)
     parser.add_argument('--baseline', help='Old snapshot module; record the known failure only')
+    parser.add_argument('--baseline-root', help='Previous snapshot module; reproduce literal root rejection')
     opts = parser.parse_args()
     binary = Path(opts.runtime).resolve()
     repo = Path(opts.repo).resolve()
@@ -55,8 +56,8 @@ def main():
         harness = base / 'harness'
         harness.mkdir()
         shutil.copytree(repo / 'stdlib', harness / 'stdlib')
-        if opts.baseline:
-            shutil.copy2(opts.baseline, harness / 'stdlib/locked_source_snapshot.sapp')
+        if opts.baseline or opts.baseline_root:
+            shutil.copy2(opts.baseline or opts.baseline_root, harness / 'stdlib/locked_source_snapshot.sapp')
         (harness / 'pblang.toml').write_text(
             '[package]\nname="snapshot-harness"\nversion="1.0.0"\nentry="main.sapp"\n'
             '[dependencies]\nstdlib={path="' + str(harness / 'stdlib') + '"}\n')
@@ -119,6 +120,34 @@ def main():
                    backend=result.get('dependency_digest_backends'), stderr=proc.stderr)
             return result
 
+        def verify_bundle(root, label):
+            proc, bundle, _ = check(root, 'bundle')
+            record(label + ' locked broker bundle', proc.returncode == 0 and bundle.get('ok')
+                   and bundle.get('lock_verified') and not bundle.get('production_execution_ready'), stderr=proc.stderr)
+            linked = root / 'linked.sapp'
+            # Relocate only linked text into a project with no dependencies.
+            standalone = base / (root.name + '-standalone')
+            standalone.mkdir()
+            shutil.copy2(linked, standalone / 'main.sapp')
+            (standalone / 'pblang.toml').write_text('[package]\nname="linked"\nversion="1.0.0"\nentry="main.sapp"\n')
+            sandbox = ['bwrap', '--unshare-all', '--die-with-parent',
+                       '--ro-bind', '/usr', '/usr', '--ro-bind', '/bin', '/bin',
+                       '--ro-bind', '/lib', '/lib', '--ro-bind', '/lib64', '/lib64',
+                       '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+                       '--ro-bind', str(binary), str(binary),
+                       '--ro-bind', str(standalone), str(standalone), '--chdir', str(standalone)]
+            executed = subprocess.run(sandbox + [str(binary), 'run', str(standalone),
+                                     '--deny-net', '--deny-http', '--deny-exec', '--deny-ffi'],
+                                     capture_output=True, text=True, timeout=30)
+            record(label + ' linked program source-hidden', executed.returncode == 0
+                   and executed.stdout.strip() == '42', stdout=executed.stdout, stderr=executed.stderr)
+
+        if opts.baseline_root:
+            for name, files in [('root-file', {'root': b'binary\0payload'}),
+                                ('root-directory', {'root/value.sapp': b'fn value() { return 42; }\nexport value;\n'})]:
+                case, _, _ = fixture(name, files)
+                expect(case, 'baseline rejects ' + name, False)
+            return
         root, digest, before = fixture('ascii')
         if opts.baseline:
             expect(root, 'baseline rejects genuine v2 lock', False)
@@ -128,26 +157,7 @@ def main():
             record('baseline accepts legacy bytes mislabeled v2', proc.returncode == 0 and result.get('ok'))
             return
         expect(root, 'ASCII fast path', True, digest, 'vm-sha256-utf8-canonical')
-        proc, bundle, _ = check(root, 'bundle')
-        record('real locked broker bundle', proc.returncode == 0 and bundle.get('ok')
-               and bundle.get('lock_verified') and not bundle.get('production_execution_ready'), stderr=proc.stderr)
-        linked = root / 'linked.sapp'
-        # Relocate only linked text into a project with no dependencies.
-        standalone = base / 'standalone'
-        standalone.mkdir()
-        shutil.copy2(linked, standalone / 'main.sapp')
-        (standalone / 'pblang.toml').write_text('[package]\nname="linked"\nversion="1.0.0"\nentry="main.sapp"\n')
-        sandbox = ['bwrap', '--unshare-all', '--die-with-parent',
-                   '--ro-bind', '/usr', '/usr', '--ro-bind', '/bin', '/bin',
-                   '--ro-bind', '/lib', '/lib', '--ro-bind', '/lib64', '/lib64',
-                   '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
-                   '--ro-bind', str(binary), str(binary),
-                   '--ro-bind', str(standalone), str(standalone), '--chdir', str(standalone)]
-        executed = subprocess.run(sandbox + [str(binary), 'run', str(standalone),
-                                 '--deny-net', '--deny-http', '--deny-exec', '--deny-ffi'],
-                                 capture_output=True, text=True, timeout=30)
-        record('linked program runs without dependency project', executed.returncode == 0
-               and executed.stdout.strip() == '42', stdout=executed.stdout, stderr=executed.stderr)
+        verify_bundle(root, 'ascii')
         lock = root / 'pblang.lock'
         valid_lock = lock.read_text()
         lock.write_text(valid_lock.replace(digest, tree_digest(root / 'dep', legacy=True)))
@@ -175,6 +185,23 @@ def main():
                     p.write_bytes(old)
                 (case / 'dep/empty').rmdir()
                 expect(case, 'empty directory removal', False)
+        for name, files in [('root-file', {'root': bytes([255, 0, 128, 7])}),
+                            ('root-directory', {'root/value.sapp': b'fn value() { return 42; }\nexport value;\n'}),
+                            ('root-empty-directory', {})]:
+            case, expected, original = fixture(name, files, ['root'] if name == 'root-empty-directory' else [])
+            if name == 'root-directory':
+                (case / 'main.sapp').write_text('let D=import("dep:root/value.sapp");print D.value();\n')
+            expect(case, name + ' exact v2 snapshot', True, expected)
+            verify_bundle(case, name)
+            actual = {p.relative_to(case / 'dep').as_posix(): p.read_bytes() if p.is_file() else None
+                      for p in (case / 'dep').rglob('*')}
+            record(name + ' sources unchanged', actual == original)
+        case, expected, _ = fixture('project-root-module')
+        (case / 'root').mkdir()
+        (case / 'root/value.sapp').write_text('fn value() { return 42; }\nexport value;\n')
+        (case / 'main.sapp').write_text('let D=import("root/value.sapp");print D.value();\n')
+        expect(case, 'project root module discovery', True, expected)
+        verify_bundle(case, 'project-root-module')
         (root / 'dep/value.sapp').write_bytes(b'fn value() { return 43; }\nexport value;\n')
         expect(root, 'module content tamper', False)
         (root / 'dep/value.sapp').write_bytes(before['value.sapp'])
@@ -189,10 +216,10 @@ def main():
         (root / 'dep/pipe').unlink()
         (root / 'dep/value.sapp').write_bytes(b'\xff')
         expect(root, 'invalid UTF8 module rejected', False)
-        # Restore known module; a legacy listing alias must not recurse forever.
+        # A newly added directory must change the locked digest, even if named root.
         (root / 'dep/value.sapp').write_bytes(before['value.sapp'])
         (root / 'dep/root').mkdir()
-        expect(root, 'root alias explicitly unsupported', False)
+        expect(root, 'unlocked root directory addition rejected', False)
 
 
 if __name__ == '__main__':
