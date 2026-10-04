@@ -250,8 +250,12 @@ disable origin/CSRF checks. This is a local preview, not multi-user authenticati
 
 Native execution has an X11 acceptance fixture; supported platform adapters are
 not equivalent to tested Windows/macOS/mobile execution. Web uses a loopback
-PBLang server, not a standalone exported app. Android/iOS adapters and physical
-hardware execution are not provided by this example. The display has only binary
+PBLang server, not a standalone exported app. The [Android companion](platforms/android/README.md) is an installable debug APK
+using this host Web editor through USB; it is not a standalone Android runtime.
+[Desktop source launchers](platforms/desktop/README.md) cover Linux/Windows/macOS
+entry points with a separately supplied compatible runtime. No native iOS runtime
+or signed IPA is available. Physical hardware execution uses only the separately
+documented Linux device route. The display has only binary
 red pixels: no RGB, grayscale, physical 3D display, image decoding, arbitrary nD
 projection or hardware driver is claimed.
 
@@ -270,3 +274,9 @@ python3 tests/tooling/uno_r4_led_studio_counter_http.py
 xvfb-run -a -s '-screen 0 1000x1000x24 -nolisten tcp' env XMODIFIERS=@im=none python3 tests/tooling/uno_r4_led_studio_counter_native.py
 xvfb-run -a -s '-screen 0 1000x1000x24 -nolisten tcp' env XMODIFIERS=@im=none python3 tests/tooling/uno_r4_led_studio_native.py
 ```
+
+## Platform packages
+
+See [Android build/install](platforms/android/README.md) and
+[desktop launchers and runtime requirements](platforms/desktop/README.md).
+The Web server stays loopback-only; a mobile wrapper does not publish it to a LAN.
