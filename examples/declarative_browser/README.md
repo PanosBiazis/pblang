@@ -328,19 +328,22 @@ and Web/Android exports are unchanged; these checks establish Linux behavior onl
 This example can produce a new portable folder containing the existing reader,
 its literal-import library closure, a matching local dependency lock, and an
 explicitly selected Linux x86-64 PBLang runtime. It uses the existing PBLang-owned
-`tools/pbpackage.sapp` route in an isolated temporary source stage. No native
+`stdlib:package_folder.sapp` API (the same route as `tools/pbpackage.sapp`). Its
+public `package.sapp` entry and `package_builder.sapp` workflow are PBLang; the
+existing PBLang tokenizer discovers literal imports. Python is only used by the
+external acceptance harness. No native
 `pblang bundle` command is invoked, and the checkout manifest/lock are not edited.
 
 ```sh
 # Run from the repository. Choose a NEW private output parent.
 mkdir -m 700 ../reader-candidates
-python3 examples/declarative_browser/package.py \
-  --runtime "$PWD/target/release/pblang" \
-  --output "$PWD/../reader-candidates/reader-v1"
+target/release/pblang run examples/declarative_browser/package.sapp --allow-all -- \
+  "$PWD" "$PWD/../reader-candidates/reader-v2" \
+  --runtime "$PWD/target/release/pblang"
 
 # These work from a different current directory, using only the candidate.
-sh ../reader-candidates/reader-v1/run-reader.sh --check
-sh ../reader-candidates/reader-v1/run-reader.sh
+sh ../reader-candidates/reader-v2/run-reader.sh --check
+sh ../reader-candidates/reader-v2/run-reader.sh
 ```
 
 The default launch opens the native GUI, including actual font measurement and
@@ -351,26 +354,31 @@ still needs local graphics/FFI and filesystem access for libraries/fonts; this i
 not an application sandbox. Invoke the launcher with `sh`: the package contract
 keeps source files non-executable and only marks the runtime executable.
 
-The output parent must already be private (0700), and the destination must be
-absent and outside the checkout. Existing outputs are never replaced or removed.
-The helper accepts this example's literal imports only, with at most 128 modules
-and 1 MiB per module; the packager's own additional limits still apply. It captures
-trusted local checkout sources, not concurrently hostile inputs. It uses private
-temporary manifests for both the tool and application so checkout folder names
-and the repository's dependency-lock paths are not runtime dependencies.
+The output parent must already be private (0700). Both the destination and its
+`NEW_OUTPUT.source` staging sibling must be absent and outside the checkout.
+Existing outputs/staging are never replaced or removed. The workflow accepts this
+example's literal imports only, with at most 128 modules, 1 MiB and 65,536 tokens
+per module, and 8 MiB of module bytes; the packager's additional limits still apply.
+It captures trusted local sources through the existing no-follow directory API,
+not concurrently hostile inputs. Run the public tool from the repository's
+supported PBLang environment; its existing bootstrap dependency setup still
+applies. The generated application's manifest and local lock are independent of
+the repository's dependency paths. The finished reader does not need the checkout.
 
 The `reader-source-sha256.json` inventory records copied modules. The normalized
 `pblang.lock` binds the included stdlib tree; `package-receipt.json` describes
 publication, not acceptance or runtime authenticity. Select a trusted runtime.
 On failure a partial destination may remain: inspect it and use a new destination
-for a later attempt. Only the helper's own temporary stage is cleaned up.
+for a later attempt. Staging is explicitly reported and retained on success or
+failure for inspection; this workflow never recursively deletes it. Preserve an
+earlier accepted package until the new candidate passes acceptance.
 
 Accept the candidate before distributing or activating it:
 
 ```sh
 python3 tests/tooling/reader_package.py \
-  --package ../reader-candidates/reader-v1 \
-  --evidence ../reader-candidates/reader-v1-acceptance
+  --package ../reader-candidates/reader-v2 \
+  --evidence ../reader-candidates/reader-v2-acceptance
 ```
 
 Acceptance requires Linux with Python 3.9+, bubblewrap, Xvfb, xauth, xdotool,
@@ -387,3 +395,9 @@ single executable, a universal binary or a Windows/macOS/mobile installer. The
 host's compatible native libraries/fonts remain requirements. Web and Android
 exports remain available through the original source example; this launch wrapper
 exposes the native reader only.
+
+`tests/semantics/reader_package_builder_test.sapp` checks the PBLang import
+scanner, path admission and v2 digest (including Unicode and empty directories)
+without filesystem, network, FFI or process effects. The native runtime and
+standard OS libraries are retained dependencies. The small shell launcher is
+only an OS handoff to the included runtime, not a packaging implementation.
