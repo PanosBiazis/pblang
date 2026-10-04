@@ -115,7 +115,11 @@ aborts the exchange. This host clock is not a hard real-time guarantee.
 
 Results distinguish `acknowledged`, `cleanup_ok` and `outcome_uncertain`.
 `ok:false` with `acknowledged:true` means the broker already acknowledged the
-message but disconnect/cleanup failed. Do not automatically retry: even QoS 1
+message but the subsequent clock check, disconnect or cleanup failed. An exact
+PUBACK received at/after the deadline remains acknowledged, while `ok` stays
+false and no further protocol write is attempted. Invalid/truncated or wrong-ID
+acknowledgements never confirm delivery. The fixed `post-ack-clock-failed` error
+identifies a clock failure after a valid PUBACK. Do not automatically retry: even QoS 1
 can deliver duplicates. A broker ACK does not prove a subscriber displayed it.
 Use the caller sequence to detect repeats when appropriate.
 `cleanup_ok` reports the native transport's close result; the existing primitive
