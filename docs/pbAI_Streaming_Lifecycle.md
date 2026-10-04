@@ -396,3 +396,59 @@ exhausted mirrors, cache preservation before and after actual admission, reentry
 cancellation/requeue and terminal close. The callback fixtures own no OS descriptors.
 The shared/standalone source-hidden lifecycle examples now also demonstrate that a
 verified large-shard bypass preserves two actual resident shards and a later warm hit.
+
+
+## Cache admission cost benchmark
+
+The reproducible benchmark is `tests/benchmarks/pbai_cache_admission_bench.sapp`.
+Run it from the product repository with a trusted `PBLANG_BIN` and private
+`PBAI_STATE_ROOT`, using the sibling PBLang/pbAI source layout of the regression
+fixtures. The runner copies the exact common owner and actual dedicated facades;
+only the directory reader is synthetic. The child forbids network, FFI, exec and
+spawn. Temporary copies are removed on success or controlled failure.
+
+Each entrypoint (direct, standalone, embedded) runs the same three workloads:
+16 four-byte resident shards plus a prior warm hit, followed by (1) one four-byte
+shard that exactly fits a 68-byte / 17-entry cache, (2) a 64-byte shard blocked by
+one protected resident in a 64-byte cache, or (3) a 64-byte shard requiring all
+16 unprotected victims. Every batch uses 128 independent sessions, two warmup
+batches and seven recorded batches. Setup, full result/accounting assertions and
+close are outside the timed interval. The incoming public load, digest check,
+cache operation and retained result append are inside it. Identical source hashes
+bind baseline and candidate workloads; neither drops verification work.
+
+`gc_stats` deltas count process-wide cumulative allocations, not live objects,
+bytes, peak RAM or GC pause time. The string probe contributes one string allocation
+per batch. `now_ms` is a wall clock; a backwards interval fails the fixture.
+The recorded before/after evidence contains all samples, median and nearest-rank
+p95, with baseline/candidate order reversed in a second round. These are bounded
+Linux CPU measurements with tiny synthetic shards, not disk throughput or model
+inference benchmarks. Concurrent machine activity and thermal state are not isolated.
+
+An experimental capacity guard skipped the key snapshot, selection map and victim
+array whenever both resident bytes and entry slots allowed immediate admission.
+It retained the owned-byte copy and existing planner under pressure. All 42 measured
+fits samples saved exactly two arrays, one map and sixteen strings per public load;
+the two pressure workloads retained identical allocation counts. Fits median time
+was lower in all six comparisons. However, pressure-path timings were inconsistent
+and mostly higher, including a 49.3% median increase in one multi-victim comparison.
+The experiment cannot distinguish environmental noise from a latency regression.
+
+The candidate was therefore **not retained**. Production remains the previously
+verified plan-before-commit implementation. This delivery adds the benchmark and
+honest evidence, not a speedup or RAM-saving claim. The non-applied candidate patch
+is retained with the evidence solely to reproduce and investigate the comparison;
+applying it is a separate explicit experiment, not normal product activation.
+
+With the two variables set, the final baseline can be rerun using:
+
+```sh
+"$PBLANG_BIN" run tests/benchmarks/pbai_cache_admission_bench.sapp --allow-all --deny-net --deny-http
+```
+
+Reproducing the discarded candidate requires a separate disposable PBLang checkout
+and the non-applied patch in `docs/evidence/pbai_cache_fast_path_candidate-2026-10-04.patch`.
+Keep the same workload/backend/facade hashes and runtime; rebuild and publish portable
+locks with `tools/pblock.sapp` before running the same benchmark. The comparison JSON
+records the exact owner hashes and both run orders. Do not apply the patch to an active
+installation or interpret it as an approved product optimization.
