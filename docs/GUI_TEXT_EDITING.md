@@ -73,3 +73,25 @@ The PBOffice editing test additionally applies and undoes/redoes a mouse edit.
 For an explicit visual demonstration, see
 [product previews](UI_PRODUCT_PREVIEWS.md). Web and Android use their respective
 renderer controls; these native pointer tests do not establish platform parity.
+
+## Per-event keyboard modifiers
+
+For text editing and Tab navigation, boolean `shift`, `ctrl`, and `meta`
+properties on a keydown event take precedence over previously tracked key edges.
+This handles a native snapshot that enumerates `A` before `LeftShift` even though
+`A` already has `shift: true`. Explicit `false` matters too: a released modifier
+need not wait for its separate keyup edge before ordinary typing resumes.
+
+Resolution is independent for each property. Missing, nil or non-boolean values
+use the existing tracked state for that modifier, preserving legacy event
+adapters. The event map and tracked key state are not rewritten by these flags.
+The same rules cover repeated text keys and Shift+Tab. Ctrl/Command+A selects
+all in textboxes; other command chords, including Ctrl/Command+V, do not insert
+their letter. This does not implement clipboard paste.
+
+`tests/semantics/gui_event_modifiers_test.sapp` checks letter-first ordering,
+explicit false, malformed flags, legacy and mixed modifiers, selection
+replacement, modifier release, repeats, textarea behavior and read-only fields.
+This addresses interpretation of delivered events. A key press and release
+entirely between host snapshots may still be absent; event flags cannot recover
+a transition the backend never delivered.
