@@ -9,6 +9,21 @@ fn capability_option(value) {
     return false;
 }
 
+// Parse a small decimal limit without accepting signs, exponents or overflow.
+fn source_limit(arg) {
+    let value = str_slice(arg, 17, len(arg));
+    if len(value) == 0 or len(value) > 7 { return nil; }
+    let result = 0;
+    for ch in value {
+        let digit = -1; let n = 0;
+        while n < 10 { if ch == str(n) { digit = n; } n = n + 1; }
+        if digit < 0 { return nil; }
+        result = result * 10 + digit;
+    }
+    if result < 1 or result > 1048576 { return nil; }
+    return result;
+}
+
 fn classify(argv) {
     if len(argv) == 0 { return map{ action: "native" }; }
     if argv[0] == "bundle" {
@@ -19,29 +34,52 @@ fn classify(argv) {
     let start = 0;
     while start < len(argv) and capability_option(argv[start]) { start = start + 1; }
     if start == len(argv) { return map{ action: "native" }; }
+    // A misplaced explicit bounded option must never reach the legacy reader.
+    if argv[start] == "--bounded-source" or str_starts_with(argv[start], "--bounded-source=") {
+        return map{ action: "usage" };
+    }
     if argv[start] != "--check" and argv[start] != "--via-pblang" and argv[start] != "--self-host" {
         return map{ action: "native" };
     }
     let check_seen = false; let via_seen = false;
+    let bounded_seen = false; let before_boundary = true;
     // The legacy handler scans even after '--'. Capture that ambiguous form,
     // then validate proper option boundaries before permitting any file access.
     for arg in argv {
+        if arg == "--" { before_boundary = false; }
+        if before_boundary and (arg == "--bounded-source" or str_starts_with(arg, "--bounded-source=")) {
+            bounded_seen = true;
+        }
         if arg == "--check" { check_seen = true; }
         if arg == "--via-pblang" or arg == "--self-host" { via_seen = true; }
     }
-    if not check_seen or not via_seen { return map{ action: "native" }; }
+    if not check_seen or not via_seen {
+        if bounded_seen { return map{ action: "usage" }; }
+        return map{ action: "native" };
+    }
+    let limit = nil; let ffi_grants = false;
     let options = true; let check_count = 0; let via_count = 0; let path = nil;
     for arg in argv {
         if options and arg == "--" { options = false; }
         elif options and arg == "--check" { check_count = check_count + 1; }
         elif options and (arg == "--via-pblang" or arg == "--self-host") { via_count = via_count + 1; }
         elif options and capability_option(arg) { }
+        elif options and (str_starts_with(arg, "--ffi-lib=") or str_starts_with(arg, "--ffi-symbol=")) {
+            // Forward explicit caller grants unchanged; the native runtime
+            // validates their spelling, library identity and capability policy.
+            ffi_grants = true;
+        }
+        elif options and str_starts_with(arg, "--bounded-source=") {
+            if limit != nil { return map{ action: "usage" }; }
+            limit = source_limit(arg);
+            if limit == nil { return map{ action: "usage" }; }
+        }
         elif options and str_starts_with(arg, "--") { return map{ action: "usage" }; }
         elif path != nil or len(arg) == 0 { return map{ action: "usage" }; }
         else { path = arg; }
     }
-    if check_count != 1 or via_count == 0 or path == nil { return map{ action: "usage" }; }
-    return map{ action: "check", path: path };
+    if (ffi_grants and limit == nil) or check_count != 1 or via_count == 0 or path == nil { return map{ action: "usage" }; }
+    return map{ action: "check", path: path, source_limit: limit };
 }
 
 let raw = os_args();
@@ -59,9 +97,19 @@ if admission {
     if route.action != "check" { throw "pblang launcher: invalid check adapter invocation"; }
     // This executes only after admission. The native run command processes the
     // original capabilities before '--', including environment and locked sandbox.
-    let FRONTEND = import("stdlib:compiler/source_analysis.sapp");
-    let source = try fs_read(route.path) catch nil;
+    let source: any = nil;
+    if route.source_limit == nil { source = try fs_read(route.path) catch nil; }
+    else {
+        let READER = import("stdlib:compiler/bounded_source.sapp");
+        let loaded = READER.read_source(route.path, route.source_limit);
+        if not loaded.ok {
+            print "pblang --check: bounded source rejected: " + loaded.error;
+            os_exit(1);
+        }
+        source = loaded.source;
+    }
     if source == nil { print "pblang --check: failed to read source file"; os_exit(1); }
+    let FRONTEND = import("stdlib:compiler/source_analysis.sapp");
     let result = FRONTEND.analyze(source, false);
     if not result.ok {
         print "self-hosted check failed: " + str(result.errors);

@@ -16,7 +16,7 @@ if admission=$("$native" run "$guard" --sandbox -- pblang-launch-argv-v2 "$@" </
         pblang-launch-admit-v1) ;;
         pblang-launch-check-v1) exec "$native" run "$guard" "$@" ;;
         pblang-launch-check-usage-v1)
-            printf '%s\n' 'pblang --check: expected --check --via-pblang (or --self-host), supported capability options, and exactly one filename; use -- before a filename starting with --' >&2
+            printf '%s\n' 'pblang --check: expected --check --via-pblang (or --self-host), supported capability options, optional --bounded-source=BYTES (1..1048576; Linux no-follow reader requiring explicit --ffi-lib/--ffi-symbol grants), and exactly one filename; use -- before a filename starting with --' >&2
             exit 2 ;;
         *)
             printf '%s\n' 'pblang launcher: no valid admission decision' >&2
