@@ -62,11 +62,21 @@ def main():
         print(name, passed, flush=True)
         assert passed, details
     record('candidate module identities', True, modules=len(inventory), files=len(before),runtime_sha256=before['pblang'])
-    refused = subprocess.run(['python3',str(repo/'examples/declarative_browser/package.py'),
-                             '--runtime',str(package/'pblang'),'--output',str(package)],
-                            capture_output=True,text=True,timeout=10)
+    refused = subprocess.run([str(package/'pblang'),'run',str(repo/'examples/declarative_browser/package.sapp'),
+                             '--allow-all','--',str(repo),str(package),'--runtime',str(package/'pblang')],
+                            cwd=repo,capture_output=True,text=True,timeout=30)
     (evidence/'existing-output.log').write_text(refused.stdout+refused.stderr)
-    record('existing candidate refused unchanged',refused.returncode==2 and before==snapshot(package))
+    record('existing candidate refused unchanged',refused.returncode==1 and before==snapshot(package)
+           and 'Output already exists' in refused.stdout)
+    with tempfile.TemporaryDirectory(prefix='reader-existing-stage-') as temporary:
+        destination=Path(temporary)/'candidate';stage=Path(str(destination)+'.source');stage.mkdir()
+        (stage/'sentinel').write_text('preserve existing staging')
+        refused=subprocess.run([str(package/'pblang'),'run',str(repo/'examples/declarative_browser/package.sapp'),
+                                '--allow-all','--',str(repo),str(destination),'--runtime',str(package/'pblang')],
+                               cwd=repo,capture_output=True,text=True,timeout=30)
+        record('existing staging refused unchanged',refused.returncode==1 and 'Staging already exists' in refused.stdout
+               and not destination.exists() and (stage/'sentinel').read_text()=='preserve existing staging'
+               and len(list(stage.iterdir()))==1)
     with tempfile.TemporaryDirectory(prefix='reader-accept-') as temporary:
         probe = Path(temporary)
         # Test-only fixture and driver. Application modules and runtime are read
