@@ -120,3 +120,15 @@ this route does not claim physical-device transport on those platforms or ESP32.
 
 Official SDK references: [matrix API](https://github.com/arduino/ArduinoCore-renesas/blob/main/libraries/Arduino_LED_Matrix/src/Arduino_LED_Matrix.h)
 and [board target definitions](https://github.com/arduino/ArduinoCore-renesas/blob/main/boards.txt).
+
+## Web / Android opt-in controls
+
+The [Android host entry](platforms/android/README.md#explicit-physical-controls-through-the-linux-host)
+adds guarded physical Play/Stop/Status without changing the default offline editor.
+`device_control.sapp` binds a validated installed plan and explicitly confirmed
+Linux port on the host. Browser clients cannot select ports, paths or firmware.
+The public `Web.create(port, options, device, project)` and `Web.serve(port,
+max_connections, device, project)` accept optional trusted controller and bounded
+saved-project text. Omit both to retain existing behavior. A rejected initial
+project fails before the listener starts. Only explicit guarded POST actions
+call the controller; edits never automatically transmit or flash a board.
