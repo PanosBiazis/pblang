@@ -269,3 +269,13 @@ local, output and return paths without treating numeric objects as collections.
 Numeric digit/bit quotas and arbitrary host exceptions remain outside this
 change. See [contracts, parity tests and limits](SELFHOST_COLLECTION_BOUNDARY.md)
 and `examples/selfhost_throw_cleanup/collection_types.sapp`.
+
+### String allocation admission failures
+
+Known argument rejections for repeat, replace and padding now skip size
+arithmetic, close eligible owned scalar state, then invoke the original primitive
+once. This preserves its first diagnostic and guest argument evaluation, while
+handled and caller-owned contexts stay live. See [string admission and its
+limits](SELFHOST_STRING_ADMISSION.md), including the separate existing
+empty-search replacement estimate gap. Arbitrary host/FFI failures remain outside
+this guarantee.
