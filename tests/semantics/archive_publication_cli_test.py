@@ -42,9 +42,15 @@ with tempfile.TemporaryDirectory(prefix='archive-cli-') as temporary:
             command = command[:5] + args
         log = root / (label + '.trace')
         if inject or trace:
-            command = ['strace', '-f', '-qq', '-o', str(log), '-e', 'trace=write,fsync,close,openat,memfd_create'] + (
+            command = ['strace', '-ff', '-qq', '-o', str(log), '-e', 'trace=write,fsync,close,openat,memfd_create'] + (
                 sum((['-e', 'inject=' + item] for item in (inject if isinstance(inject, list) else [inject])), []) if inject else []) + command
         p = subprocess.run(command, cwd=repo, capture_output=True, text=True, timeout=45)
+        if inject or trace:
+            lines = []
+            for part in sorted(root.glob(log.name + '.*')):
+                tid = part.name.rsplit('.', 1)[1]
+                lines.extend(tid + ' ' + line for line in part.read_text().splitlines())
+            log.write_text('\n'.join(lines) + '\n')
         assert p.returncode == (0 if success else 1), (label, p.returncode, p.stdout, p.stderr)
         result = json.loads(p.stdout)
         assert result['ok'] == success, (label, result)
@@ -133,7 +139,7 @@ with tempfile.TemporaryDirectory(prefix='archive-cli-') as temporary:
     if group in ('all', 'close'):
         _, log = run('close_control', root / 'close-control.zip', success=True, trace=True)
         lines = log.read_text().splitlines()
-        synced = [i for i, line in enumerate(lines) if re.search(r'fsync\(.*\) = 0$', line)]
+        synced = [i for i, line in enumerate(lines) if re.search(r'fsync\(.*\)\s+= 0$', line)]
         assert len(synced) == 2
         tid = lines[synced[1]].split()[0]
         next_close = next(i for i in range(synced[1] + 1, len(lines))
