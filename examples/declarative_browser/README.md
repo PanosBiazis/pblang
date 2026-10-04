@@ -755,3 +755,60 @@ This is Linux/X11 evidence for the installed modules and test-owned imported
 session. The normal launcher still opens its existing bundled documents; its
 separate focus/launch acceptance remains applicable. Other platforms, arbitrary
 HTML, unlimited documents and physical screen-reader support are not claimed.
+
+### Open a supported document from the real launcher
+
+```sh
+pb-document-reader --open "./My local document.html"
+pb-document-reader --with-profile --open "./My local document.html"
+pb-document-reader --check --open "./My local document.html"
+```
+
+Standalone packages accept the same arguments through `sh /path/run-reader.sh`.
+Relative paths are resolved from the caller's directory before the launcher moves
+into its application folder. Spaces and Unicode names are supported. Paths are
+normalized lexically; symlinks in the remaining parent path or final filename are
+refused. Control characters, backslashes and paths over 4096 characters are
+unsupported. The reader never evaluates the filename as shell code.
+
+`--open` reads at most 16 KiB through the existing Linux held-descriptor bounded
+snapshot API. It rejects invalid UTF-8 and validates the existing inert document
+subset before creating a window or loading preferences. Outer whitespace is
+accepted; the byte limit is checked before trimming. The existing limits remain:
+80 title characters, eight blocks, 256 characters per text/heading block, 64 per
+link label, and registered `pb://` navigation only. No scripts, remote loading or
+arbitrary HTML engine is introduced. See `import-example.html` for a complete
+example; the example is in the repository, not an extra installed package file.
+
+The document replaces `pb://home` only in the new session. Home/Back can return
+to it after visiting the built-in guide. Unknown local destinations remain denied.
+Each invocation is independent: a rejected file exits unsuccessfully and does not
+replace an already open window, write the input, or change saved preferences.
+There is no single-instance forwarding, hot reload or automatic file watching.
+
+`--check --open FILE` validates without a display and prints only format, byte
+count and block count, without the source text, title or filename. Default
+`--check`, ordinary demo startup, `--session-only` and `--manage` remain available.
+Import in session-only/check mode retains `--deny-exec`, `--deny-net`,
+`--deny-http` and `--deny-spawn`. The existing explicit `--with-profile` option
+still permits trusted stat subprocesses for profile operations; the launcher is
+not an OS command allowlist or full sandbox. Read-only hard links are permitted.
+A bounded snapshot limits allocation but is not a transactional snapshot against
+a writer modifying the same file concurrently.
+
+Developer entry points are `document_file.decode(bytes)` / `load(absolute_path)`
+and the optional fourth `source` argument of `App.create`. Existing calls retain
+the demo. The same session/parser contracts validate programmatic sources.
+
+```sh
+pblang run tests/semantics/reader_document_file_test.sapp --allow-all --deny-fs --deny-exec --deny-net --deny-http --deny-spawn
+python3 tests/tooling/reader_document_file_cli.py --package /absolute/package --evidence /absolute/NEW_CLI_EVIDENCE
+python3 tests/tooling/reader_document_launcher_native.py --package /absolute/package --evidence /absolute/NEW_GUI_EVIDENCE
+python3 tests/tooling/reader_document_launcher_native.py --install-root /home/USER/.local/share/pb-document-reader --launcher /home/USER/.local/bin/pb-document-reader --evidence /absolute/NEW_INSTALLED_EVIDENCE
+```
+
+The new tests invoke the actual launcher with `--open`; they do not substitute a
+controller/session fixture. They use synthetic input/profile data and a read-only
+package with the original checkout absent. Inspect GUI screenshots as well as
+machine results. File import through this launcher is verified on Linux x86-64;
+no Windows/macOS/mobile file-picker or launcher support is claimed.
