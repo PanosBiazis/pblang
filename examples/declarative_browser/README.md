@@ -812,3 +812,51 @@ controller/session fixture. They use synthetic input/profile data and a read-onl
 package with the original checkout absent. Inspect GUI screenshots as well as
 machine results. File import through this launcher is verified on Linux x86-64;
 no Windows/macOS/mobile file-picker or launcher support is claimed.
+
+### Understand and recover from an import error
+
+A rejected file now includes a specific recovery hint rather than one identical
+message for every failure. `--check --open FILE` also emits a single JSON object
+on stdout with `ok: false`, the existing `pblang.reader.document.v1` format,
+`code` and `error`, then exits nonzero. Successful JSON is unchanged. GUI launch
+failures print the same human-readable hint on stdout before creating a window or
+loading the profile; they do not open an error dialog or replace another reader window.
+Expected admission failures exit with status 1 through the existing `os_exit`
+primitive, after file handles have closed. They emit no stderr stack trace or
+installation path. Tools should inspect the exit status and the documented stdout
+result, rather than the old interpreter exception on stderr.
+
+| Code | Recovery |
+| --- | --- |
+| `empty_document` | Add a supported article and title; whitespace-only input is empty. |
+| `too_large` | Reduce the UTF-8 file to at most 16384 bytes, including outer whitespace. |
+| `invalid_utf8` | Save the file as UTF-8 and retry. |
+| `unsupported_document` | Use the supported markup and existing field limits. |
+| `invalid_path` | Use an absolute normalized path without control characters/backslashes; the launcher resolves relative paths. |
+| `read_failed` | Choose a readable regular file without symbolic links; the exact OS failure is not exposed. |
+
+`document_file.decode/load` return the same codes in an additive `code` field;
+success uses `ok`. `decode` additionally reports `invalid_input` for a non-array
+argument. Existing `ok/source/bytes/blocks/error` fields remain. Rejected results
+have no source; byte/block values remain zero and are not measurements of the
+rejected input. Syntax/argument errors before admission still use the existing
+usage/error path and are not promised document JSON. No source, title, input filename,
+parser exception or OS error is copied into diagnostics. Unknown read failures
+stay `read_failed`; the existing bounded-reader byte-limit result maps to
+`too_large` without a second read or changing its allocation limit.
+
+For example, replace a document containing a `<script>` element with this
+complete supported document (or start from `import-example.html`):
+
+```html
+<article><h1>My document</h1><p>Local readable text.</p><a href="pb://guide">Guide</a></article>
+```
+
+Validate with `pb-document-reader --check --open ./document.html`, then open
+with `pb-document-reader --with-profile --open ./document.html`. Changing
+appearance never repairs unsupported source; correct the file and launch again.
+The real-launcher tests also reject malformed/unsupported/oversize/invalid-UTF-8
+files while a saved-profile reader remains on its last page, verifying unchanged
+profile bytes and screenshots as well as continued navigation. An invalid saved
+profile is also tested with a valid imported document: reading remains available,
+the Style status explains the fallback and the invalid profile is not rewritten.
