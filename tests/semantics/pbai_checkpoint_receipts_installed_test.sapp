@@ -1,0 +1,86 @@
+// Isolated backend protocol faults through the real public checkpoint adapter.
+if platform()!="linux" {print "pbai_checkpoint_receipts_skip_linux_required";os_exit(0);}
+let U=import("stdlib:uuid.sapp");let parent=path_dirname(cwd());
+let exe=env_get("PBLANG_BIN");assert(type(exe)=="string" and exe!="","set trusted PBLANG_BIN");
+let phase=env_get("PBAI_RECEIPT_PHASE");if phase==nil or phase=="" {phase="cases";}
+assert(phase=="baseline" or phase=="cases" or phase=="errors-write" or phase=="errors-read" or phase=="roundtrip","bounded phase required");
+let root=path_join("/tmp","pbai-checkpoint-receipts-installed-"+U.v4());let caller=path_join(root,"caller");
+let step=["setup"];let completed=[0];
+fn process(command,args) {let argv=["-k","1s","15s",command];for arg in args {push(argv,arg);}return proc_spawn_wait("/usr/bin/timeout",argv);}
+fn must(command,args) {let result=process(command,args);assert(result.exit_code==0,"fixture operation");return result;}
+fn build(at) {let result=must("/usr/bin/env",["-C",at,exe,"build"]);assert(str_contains(result.stdout,"build ok"),"fixture build marker");}
+fn hidden(at,mode,file="case.sapp") {
+ let argv=["--die-with-parent","--unshare-net","--ro-bind","/","/","--dev","/dev","--bind",root,root,
+  "--tmpfs",path_join(parent,"pblang"),"--tmpfs",path_join(parent,"pbai")];
+ let extra=env_get("PBAI_SOURCE_HIDE_ROOT");if type(extra)=="string" and extra!="" {push(argv,"--tmpfs");push(argv,extra);}
+ for value in ["--setenv","PBAI_STATE_ROOT",path_join(root,"state"),"--setenv","PBAI_RECEIPT_MODE",mode,
+  "--setenv","PBAI_CHECKPOINT_TEST_DIR",path_join(at,"private"),"--setenv","PBAI_CHECKPOINT_TEST_PHASE",mode,
+  "--chdir",caller,exe,"run",path_join(at,file),"--allow-all","--deny-net","--deny-http","--deny-sqlite"] {push(argv,value);}
+ if phase!="roundtrip" {for value in ["--deny-exec","--deny-spawn","--deny-ffi"] {push(argv,value);}}
+ return process("/usr/bin/bwrap",argv);
+}
+fn exercise() {
+ fs_mkdirs(root);must("/bin/chmod",["700",root]);fs_mkdirs(caller);fs_mkdirs(path_join(root,"state"));fs_mkdirs(path_join(caller,"stdlib"));
+ for name in ["pbai_student_checkpoint_io.sapp","secure_file.sapp","pbai_neural_adapter.sapp","pbai_specialist_binding.sapp","serialization.sapp","json.sapp"] {
+  fs_write(path_join(path_join(caller,"stdlib"),name),"print \"DECOY_EXECUTED\";throw \"caller decoy\";\n");
+ }
+ fs_write(path_join(caller,"main.sapp"),"print 0;\n");
+ fs_write(path_join(caller,"pblang.toml"),"[package]\nname=\"receipt-caller\"\nversion=\"0.1.0\"\nentry=\"main.sapp\"\n[dependencies]\nstdlib={path=\"stdlib\"}\n");build(caller);
+ for repo in ["pblang","pbai"] {
+  let source=path_join(parent,repo);let at=path_join(root,repo);fs_mkdirs(at);
+  must("/bin/cp",["-R",path_join(source,"stdlib"),path_join(at,"stdlib")]);
+  fs_write(path_join(at,"case.sapp"),fs_read(path_join(source,"tests/fixtures/pbai_checkpoint_receipts.sapp")));
+  let example=if repo=="pblang" {"examples/pbai_student_checkpoint_file.sapp"} else {"demo/pbai_student_checkpoint_file.sapp"};
+  fs_write(path_join(at,"example.sapp"),fs_read(path_join(source,example)));
+  fs_mkdirs(path_join(at,"private"));must("/bin/chmod",["700",path_join(at,"private")]);
+  let dep=if repo=="pblang" {"stdlib"} else {"../pblang/stdlib"};
+  fs_write(path_join(at,"pblang.toml"),"[package]\nname=\"receipt-installed\"\nversion=\"0.1.0\"\nentry=\"case.sapp\"\n[dependencies]\nstdlib={path="+json_stringify(dep)+"}\n");
+ }
+ if phase!="roundtrip" {fs_write(path_join(root,"pblang/stdlib/secure_file.sapp"),fs_read(path_join(parent,"pblang/tests/fixtures/pbai_checkpoint_backend_fault.sapp")));}
+ let roundtrip_expected="";
+ for repo in ["pblang","pbai"] {
+  let at=path_join(root,repo);build(at);step[0]=phase+" "+repo;
+  if phase=="roundtrip" {
+   let output=[];let wrote=hidden(at,"write","example.sapp");
+   assert(wrote.exit_code==0 and json_parse(wrote.stdout).saved,"real private save");push(output,wrote.stdout);
+   let file=path_join(at,"private/student.json");let original=fs_read(file);
+   let read=hidden(at,"read","example.sapp");assert(read.exit_code==0 and json_parse(read.stdout).token==5,"real fresh-process load");push(output,read.stdout);
+   for kind in ["missing","corrupt","valid"] {
+    step[0]=repo+" reload "+kind;
+    if kind!="missing" {fs_write(path_join(at,"private/candidate.json"),if kind=="valid" {original} else {"{}"});}
+    let result=hidden(at,"reload","example.sapp");assert(result.exit_code==0,"example handles candidate failure");let value=json_parse(result.stdout);
+    assert(value.phase=="reload" and value.loaded==(kind=="valid") and value.previous_retained==(kind!="valid")
+     and value.token==5 and not value.globally_activated,"previous handle retained until a valid replacement exists");
+    assert(fs_read(file)==original,"previous on-disk checkpoint unchanged");push(output,result.stdout);
+   }
+   let encoded=json_stringify(output);if roundtrip_expected!="" {assert(encoded==roundtrip_expected,"exact real example parity");}roundtrip_expected=encoded;
+  } elif phase=="baseline" or phase=="cases" {
+   let expected=if phase=="baseline" {"pbai_checkpoint_receipts_baseline_gap:4"} else {"pbai_checkpoint_receipts_pass:51:37"};
+   let result=hidden(at,phase);
+   if result.exit_code!=0 {print str_replace_all(result.stderr,root,"<fixture>");}
+   assert(result.exit_code==0 and result.stdout==expected+"\n","exact public receipt protocol result and parity");
+  } else {
+   let cases=if phase=="errors-write" {[
+    ["write_throw","checkpoint could not be created exclusively in a private directory"],
+    ["write_nil","checkpoint could not be created exclusively in a private directory"],
+    ["write_size","checkpoint could not be created exclusively in a private directory"],
+    ["invalid_input","invalid student checkpoint"]
+   ]} else {[
+    ["read_throw","checkpoint could not be read within private storage bounds"],
+    ["read_nil","checkpoint could not be read within private storage bounds"],
+    ["read_json","invalid student checkpoint encoding"],
+    ["read_artifact","invalid student checkpoint"]
+   ]};
+   for case in cases {
+    step[0]=repo+" "+case[0];let failed=hidden(at,case[0]);
+    assert(failed.exit_code!=0 and str_contains(failed.stderr,": "+case[1]+"\n"),"primary public error preserved");
+    assert(not str_contains(failed.stdout,"DECOY_EXECUTED") and not str_contains(failed.stderr,"SYNTHETIC_PRIVATE_BACKEND_ERROR")
+     and not str_contains(failed.stderr,"SYNTHETIC_PRIVATE_CHECKPOINT_PATH") and not str_contains(failed.stderr,"UNEXPECTED_CHECKPOINT_SUCCESS"),"no private backend details or false success");
+   }
+  }
+  completed[0]=completed[0]+1;
+ }
+}
+let passed=try {exercise();true} catch false;let removed=process("/bin/rm",["-rf","--",root]);
+assert(passed,"checkpoint receipt acceptance: "+step[0]);assert(removed.exit_code==0 and completed[0]==2,"owned fixture cleaned after both facades");
+print "pbai_checkpoint_receipts_"+phase+"_pass";
