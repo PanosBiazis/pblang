@@ -26,9 +26,9 @@ Graphify update timed out after40seconds and is not current evidence.
 
 Actual UNO USB checks reported PLAY/running, progressing frames, finite completion,
 STOP/idle and successful close/termios restoration. A real browser physical Play
-returned device acknowledgement. **Visible physical LEDs remain unverified**:
-the user first reported no visible output, then reported missing the short run.
-Acknowledgement alone must not close that issue. No new firmware flash occurred.
+returned device acknowledgement. The user subsequently confirmed visible physical output after using Play on Arduino.
+This acceptance covers the installed project and the tested Linux-host route only.
+No new firmware flash occurred in this platform delivery.
 
 Mac/iOS completion, standalone Android operation and cross-platform physical
 transport remain open. No performance improvement or universal compatibility is

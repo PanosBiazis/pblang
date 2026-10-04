@@ -132,3 +132,15 @@ max_connections, device, project)` accept optional trusted controller and bounde
 saved-project text. Omit both to retain existing behavior. A rejected initial
 project fails before the listener starts. Only explicit guarded POST actions
 call the controller; edits never automatically transmit or flash a board.
+
+### Multiple Web/Android views
+
+Device buttons use a separate single-use guarded form per rendered page. Editing
+frames, refreshing another tab, or checking the device from Android does not revoke
+a still-unused Stop form. Host/origin, CSRF, revision, body and aggregate request
+limits remain enforced. Only the most recent 16 device forms are retained; consumed
+or evicted forms return a recovery link and never retry a device operation. Return
+to the editor for fresh controls after expiration or a server restart. Physical
+buttons do not submit editor drafts or uploaded JSON. Editor stale-write protection
+remains independent. A Stop request targets the explicitly bound board, including
+playback started from another view. It is not a safety-certified emergency stop.
