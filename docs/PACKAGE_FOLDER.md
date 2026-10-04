@@ -2,8 +2,9 @@
 
 `tools/pbpackage.sapp` builds a new source-folder package through
 `stdlib/package_folder.sapp`. It never calls the destructive retained native
-`pblang bundle` command. The shared `pblang` launcher and retained binary are not
-replaced by a dispatcher. Use this explicit route for the supported profile.
+`pblang bundle` command. Use this explicit route for the supported profile.
+The separately qualified Linux launcher blocks native `bundle`; see the
+[public-entry guard](NATIVE_BUNDLE_SOURCE_INTEGRITY.md).
 
 ```sh
 mkdir -m 700 ../package-output
@@ -13,8 +14,13 @@ target/release/pblang run tools/pbpackage.sapp --allow-all -- \
 ../package-output/demo/pblang run ../package-output/demo
 ```
 
-For an installed release, use that release's absolute `tools/pbpackage.sapp` and
-`bin/pblang` paths. Source and destination may be relative or absolute. The
+For an installed release, run its absolute `tools/pbpackage.sapp` through the
+public `pblang` command. Pass the release's actual ELF file as `--runtime`:
+`RELEASE/bin/pblang-native` in the guarded layout, or `RELEASE/bin/pblang` in
+the older ELF layout. The shell launcher and symlinks are not accepted runtime
+payloads. This source-folder format copies only the chosen ELF; the distributed
+executable does **not** inherit the public launcher's native-bundle guard.
+Source and destination may be relative or absolute. The
 specified source must contain its own manifest; ancestor-manifest search is not
 performed. The parent of the output must already exist, belong to the current
 user and have mode 0700. Source and output parent must be on the same kernel mount; cross-mount and bind-mount aliases are refused in this profile. The final output directory must be absent. The tool
