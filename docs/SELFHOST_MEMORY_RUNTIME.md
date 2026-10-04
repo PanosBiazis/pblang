@@ -146,7 +146,8 @@ report the builtin name and expected/actual count without argument values. Stack
 traces can include a cleanup helper frame. This does not make every host builtin failure a controlled VM
 error.
 
-Implicit host failures and arbitrary FFI exceptions are not covered by this path. A host failure during cleanup is suppressed to retain the
+Other implicit host failures and arbitrary FFI exceptions are not covered by this path.
+Predictable collection type failures have the narrower coverage described below. A host failure during cleanup is suppressed to retain the
 original guest exception; complete reclamation in that case is not guaranteed.
 General deterministic exceptional cleanup remains open. Neither loader nor Android cleanup
 retries execution, rolls back mutations or reclaims arbitrary host/native
@@ -250,3 +251,21 @@ Coverage: `tests/semantics/selfhost_builtin_arity_cleanup_test.sapp` and
 not every builtin argument type or host failure. General FFI/resource cleanup,
 composite/cyclic ownership and other backends are outside this guarantee. No host
 runtime change or general performance improvement is claimed.
+
+
+### Collection type failures and exact numeric size checks
+
+The PBLang VM now closes eligible owned state before a guaranteed collection
+receiver/key type rejection, then invokes the original host primitive once to
+preserve its message. It covers array/map operations, length and membership,
+including the length instruction used by for-in loops. Handled errors,
+caller-owned contexts, valid nil/false results and successful mutations retain
+their behavior. Invalid bounded push calls now reach the original array-type
+error rather than an earlier length error.
+
+Bounded value-size guards also distinguish actual strings from boxed exact
+numbers. This restores valid bigint/rational/decimal execution across stack,
+local, output and return paths without treating numeric objects as collections.
+Numeric digit/bit quotas and arbitrary host exceptions remain outside this
+change. See [contracts, parity tests and limits](SELFHOST_COLLECTION_BOUNDARY.md)
+and `examples/selfhost_throw_cleanup/collection_types.sapp`.
