@@ -12,7 +12,15 @@ static double pb_millis() { return (double)(uint32_t)millis(); }
 static double pb_serial_begin() { Serial.begin(115200); return 0; }
 static double pb_available() { return Serial.available(); }
 static double pb_read() { return Serial.read(); }
-static double pb_writable() { return Serial.availableForWrite(); }
+static double pb_writable() {
+#if defined(NO_USB)
+  // UNO R4 WiFi uses UART1 through its ESP USB bridge. UART inherits Print's
+  // always-zero availableForWrite(); its single-byte write is interrupt paced.
+  return 1;
+#else
+  return Serial.availableForWrite();
+#endif
+}
 static double pb_put(double value) { return Serial.write((uint8_t)value); }
 static double pb_begin() { return matrix.begin() ? 1 : 0; }
 static double pb_clear() { matrix.clear(); return 0; }

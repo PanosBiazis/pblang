@@ -9,7 +9,7 @@ The application is actual `device_firmware.sapp`, compiled by PBLang's
 `stdlib/compiler/ctranspile.sapp` numeric C backend. `device_export.sapp` adds numeric
 project/digest/literal accessors and invokes that compiler. The generated
 `pblang_firmware.h` is built with the official Arduino ARM toolchain. The temporary
-22-line SDK adapter supplies fixed storage, milliseconds, serial bytes and matrix
+thin SDK adapter supplies fixed storage, milliseconds, serial bytes and matrix
 I/O only. This is **not** a completed native RA4M1 machine-code backend. No existing
 compiler/runtime or legacy AVR/ESP protocol is replaced.
 
@@ -79,10 +79,18 @@ Replies are JSON lines under 512 bytes with exactly thirteen fields:
 frames, repetitions, total_ms`. Frame zero means cleared. The host strictly parses
 JSON and rejects duplicate keys. Replies are snapshots, not a live stream.
 
-Firmware spends at most 32 received/transmitted bytes per loop iteration and ticks
-playback even if the host stops reading. It waits for queued output to drain before
+Firmware receives at most 32 bytes per loop iteration and transmits at most 32
+bytes per flush (at most two flushes, or 64 bytes, per loop). On the
+UNO R4 WiFi target, the official core defines `NO_USB`: `Serial` is UART1 through the
+ESP USB bridge. Renesas 1.6.0 UART inherits an always-zero `availableForWrite()`;
+the thin adapter instead permits its synchronous, interrupt-paced one-byte writes.
+The USB implementation retains its real readiness check. The UART driver waits for
+a transmit interrupt, so this is a bounded application quota, not a hard real-time
+guarantee if the SDK/hardware interrupt path stalls. With a functioning driver,
+playback ticks even if the host stops reading. It waits for queued output to drain before
 reading another command; therefore Stop acknowledgement depends on a reading host.
-The finite device deadline still clears LEDs under output backpressure or input flood.
+Synthetic output-backpressure and input-flood tests verify the finite deadline in
+the application; they do not prove the SDK can never block.
 The host reports uncertainty if confirmation cannot be obtained.
 
 `millis()` and packed words are represented exactly as doubles; uint32 casts happen
