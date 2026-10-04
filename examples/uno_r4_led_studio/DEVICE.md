@@ -217,3 +217,9 @@ restart deliberately, use Stop then Play. Send verifies an identical installed
 project rather than recompiling/reflashing it. Upload still uses four retained
 private job slots; different-project transfers beyond that bound require host
 review. Cancellation and process reaping remain cooperative, not hard real time.
+
+The physical-device panel uses a separate compact layout: four equal-height
+controls on wide screens, two columns on narrow screens, and one column at
+360 CSS pixels or less. Keyboard focus remains visible. Its independent guarded
+forms do not inherit the editor form border or background; changing appearance
+does not combine their request tokens or change device actions.
