@@ -1,0 +1,119 @@
+let M=import("stdlib:embedded_telemetry_monitor.sapp");
+fn check(v,message){if not v{throw "Monitor: "+message;}}
+fn snapshot(sequence){return map{format:"pblang.embedded-telemetry.v1",board:"arduino-uno-r4-wifi",
+    evidence:"confirmed-wired-status",sequence:sequence,status:map{state:"idle",frame:0,remaining_ms:0,frames:2}};}
+fn options(){return map{samples:3,interval_ms:1000,budget_ms:10000,publish_timeout_ms:1000,port:1883,sequence_start:7};}
+fn fixture(mode="ok",opts=nil){
+    let chosen=opts;if chosen==nil{chosen=options();}
+    let f=map{time:0,reads:0,sends:0,sequences:[],budgets:[],mode:mode,session:M.new(chosen),input:nil};
+    f.clock=fn(){if f.mode=="clock-invalid"{return "PRIVATE_CLOCK";}return f.time;};
+    f.read=fn(sequence,remaining){
+        f.reads=f.reads+1;push(f.budgets,remaining);f.time=f.time+100;
+        if f.mode=="cancel-read"{M.cancel(f.session);}
+        if f.mode=="close-read"{M.close(f.session);}
+        if f.mode=="read-throw"{throw "PRIVATE_ACQUISITION";}
+        if f.mode=="read-late"{f.time=10000;}
+        if f.mode=="clock-backward"{f.time=-1;}
+        if f.mode=="reentrant"{
+            let nested=M.poll(f.session,f.read,f.publish,f.clock);
+            check(nested.busy and f.reads==1 and f.sends==0,"read reentry has no effects");
+        }
+        let value=snapshot(sequence);
+        if f.mode=="bad-snapshot"{value.path="PRIVATE_PATH";}
+        if f.mode=="bad-sequence"{value.sequence=sequence+1;}
+        f.input=value;return value;
+    };
+    f.publish=fn(value,port,timeout){
+        check(port==1883 and timeout>=250 and timeout<=1000,"bounded publisher configuration");
+        f.sends=f.sends+1;push(f.sequences,value.sequence);push(f.budgets,timeout);f.time=f.time+200;
+        if f.mode=="publish-throw"{throw "PRIVATE_BROKER";}
+        if f.mode=="publish-late"{f.time=10000;}
+        if f.mode=="cancel-publish" or f.mode=="cancel-cleanup"{M.cancel(f.session);}
+        if f.mode=="close-publish"{M.close(f.session);}
+        if f.mode=="reentrant"{
+            let nested=M.poll(f.session,f.read,f.publish,f.clock);
+            check(nested.busy and f.reads==1 and f.sends==1,"publish reentry has no effects");
+        }
+        if f.mode=="mutation"{
+            value.sequence=999;value.status.state="PRIVATE_STATE";
+            f.session.samples=1000;f.session.published=999;
+        }
+        if f.mode=="ack-cleanup" or f.mode=="cancel-cleanup"{return map{ok:false,acknowledged:true,cleanup_ok:false,publish_attempted:true,outcome_uncertain:false};}
+        if f.mode=="connect-failed"{return map{ok:false,acknowledged:false,cleanup_ok:true,publish_attempted:false,outcome_uncertain:false,error:"connect-failed",network_attempted:true};}
+        if f.mode=="no-ack"{return map{ok:false,acknowledged:false,cleanup_ok:true,publish_attempted:true,outcome_uncertain:true};}
+        if f.mode=="missing-uncertainty"{return map{ok:true,acknowledged:true,cleanup_ok:true};}
+        if f.mode=="inconsistent"{return map{ok:true,acknowledged:true,cleanup_ok:true,publish_attempted:true,outcome_uncertain:true};}
+        return map{ok:true,acknowledged:true,cleanup_ok:true,publish_attempted:true,outcome_uncertain:false};
+    };
+    return f;
+}
+fn poll(f){return M.poll(f.session,f.read,f.publish,f.clock);}
+fn redacted(result){check(not str_contains(json_stringify(result),"PRIVATE"),"status excludes callback content");}
+for bad in [nil,"x",map{samples:0},map{samples:33},map{interval_ms:999},map{interval_ms:30001},
+    map{budget_ms:60001},map{publish_timeout_ms:249},map{publish_timeout_ms:5001},
+    map{port:0},map{sequence_start:-1},map{sequence_start:2147483647,samples:2},
+    map{samples:3,interval_ms:30000},map{samples:3,budget_ms:4000},map{secret:"PRIVATE_OPTIONS"}]{
+    // nil is the documented default, not malformed configuration.
+    if bad!=nil{check((try M.new(bad) catch nil)==nil,"reject invalid bounded configuration");}
+}
+let source=options();let f=fixture("ok",source);source.samples=32;source.interval_ms=30000;
+check(f.reads==0 and f.sends==0 and M.status(f.session).state=="ready","construction has no effects");
+let first=poll(f);check(first.state=="waiting" and first.published==1 and first.wait_ms==1000 and first.remaining_ms==9700,"first bounded pair");
+let same=poll(f);check(same.published==1 and same.wait_ms==1000 and f.reads==1,"early poll has no effects");
+f.time=6000;let delayed=poll(f);
+check(delayed.published==2 and delayed.wait_ms==1000 and f.reads==2,"late poll has one pair without catch-up");
+check(poll(f).published==2 and f.reads==2,"immediate repeat cannot burst");
+f.time=7300;let completed=poll(f);
+check(completed.ok and completed.terminal and completed.state=="completed" and completed.published==3 and completed.acknowledged==3,"finite completion");
+check(f.sequences==[7,8,9],"sequences assigned privately");
+poll(f);check(f.reads==3 and f.sends==3,"completed monitor never retries");
+completed.published=999;check(M.status(f.session).published==3,"reported status is detached");
+check(M.close(f.session).published==3,"close preserves completion counters");
+
+for mode in ["read-throw","read-late","clock-backward","bad-snapshot","bad-sequence","clock-invalid"]{
+    let failed=fixture(mode);let result=poll(failed);redacted(result);
+    check(result.terminal and not result.ok and result.state=="failed" and failed.sends==0,"acquisition/clock failure blocks publication");
+    let reads=failed.reads;poll(failed);check(failed.reads==reads,"terminal acquisition failure not retried");
+}
+for mode in ["publish-throw","publish-late","ack-cleanup","no-ack","inconsistent","missing-uncertainty","connect-failed"]{
+    let failed=fixture(mode);let result=poll(failed);redacted(result);
+    check(result.terminal and not result.ok and failed.sends==1,"publication failure terminal");
+    poll(failed);check(failed.sends==1,"publication never retried");
+    if mode=="ack-cleanup"{check(result.acknowledged==1 and result.published==0 and not result.cleanup_ok and not result.outcome_uncertain,"ack facts preserved despite cleanup failure");}
+    if mode=="connect-failed"{check(result.acknowledged==0 and result.published==0 and not result.outcome_uncertain,"confirmed pre-publication failure preserves certainty");}
+    if mode=="publish-late"{check(result.acknowledged==1 and result.error=="deadline-exceeded","late ACK retained without successful monitor completion");}
+}
+for mode in ["cancel-read","close-read","cancel-publish","close-publish","cancel-cleanup"]{
+    let stopped=fixture(mode);let result=poll(stopped);redacted(result);
+    check(result.terminal and not result.ok and not result.busy,"callback can stop monitor");
+    if mode=="cancel-read" or mode=="close-read"{check(stopped.sends==0,"stop during read prevents publish");}
+    if mode=="cancel-publish" or mode=="close-publish" or mode=="cancel-cleanup"{check(result.acknowledged==1,"stop during publisher preserves ACK");}
+    let sends=stopped.sends;poll(stopped);check(stopped.sends==sends,"stopped publisher not repeated");
+}
+let cancelled=fixture();M.cancel(cancelled.session);poll(cancelled);
+check(cancelled.reads==0 and cancelled.sends==0 and M.status(cancelled.session).state=="cancelled","pre-start cancellation has no effects");
+let closed=fixture();M.close(closed.session);poll(closed);
+check(closed.reads==0 and M.status(closed.session).state=="closed","pre-start close has no effects");
+let reentrant=fixture("reentrant");check(poll(reentrant).published==1,"reentry guard completes outer pair");
+let mutated=fixture("mutation");let observed=poll(mutated);redacted(observed);
+check(observed.published==1 and observed.next_sequence==8 and observed.requested==3,"public handle and publisher snapshot mutations cannot change private schedule");
+check(mutated.input.status.state=="idle" and mutated.input.sequence==7,"publisher receives detached validated snapshot");
+let expired=fixture();poll(expired);expired.time=10000;let ended=poll(expired);
+check(ended.error=="deadline-exceeded" and expired.reads==1 and expired.sends==1,"deadline checked before later acquisition");
+let fractional=fixture();fractional.time=0.5;check(poll(fractional).terminal and fractional.reads==0,"invalid injected clock refused before effects");
+let callback=M.new();check(M.poll(callback,nil,nil,nil).error=="invalid-callback","invalid callback rejected before effects");
+let last_sequence=fixture("ok",map{samples:1,interval_ms:1000,budget_ms:1000,publish_timeout_ms:1000,sequence_start:2147483647});
+let last_result=poll(last_sequence);
+check(last_result.ok and last_result.next_sequence==nil and last_sequence.sequences==[2147483647],"sequence cap never overflows");
+let reduced=fixture("ok",map{samples:1,interval_ms:1000,budget_ms:1000,publish_timeout_ms:1000});
+reduced.read=fn(sequence,remaining){reduced.reads=reduced.reads+1;reduced.time=700;return snapshot(sequence);};
+let reduced_result=poll(reduced);
+check(reduced_result.ok and reduced.budgets[len(reduced.budgets)-1]==300,"remaining budget bounds final publication");
+let too_late=fixture("ok",map{samples:1,interval_ms:1000,budget_ms:1000,publish_timeout_ms:1000});
+too_late.read=fn(sequence,remaining){too_late.reads=too_late.reads+1;too_late.time=751;return snapshot(sequence);};
+check(poll(too_late).terminal and too_late.sends==0,"insufficient minimum publication budget has no network effects");
+let timer_cancel=fixture();timer_cancel.clock=fn(){M.cancel(timer_cancel.session);return 0;};
+check(poll(timer_cancel).state=="cancelled" and timer_cancel.reads==0,"clock callback cancellation respected");
+let backwards=fixture();poll(backwards);backwards.time=299;
+check(poll(backwards).error=="clock-moved-backward" and backwards.sends==1,"positive clock rollback is terminal");
+print "embedded telemetry monitor tests passed";

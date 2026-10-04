@@ -1,6 +1,6 @@
 # Microcontroller connectivity
 
-One PBLang status read over USB, followed by one MQTT 3.1.1 QoS 1 publication
+By default, one PBLang status read over USB, followed by one MQTT 3.1.1 QoS 1 publication
 to an already running broker on **127.0.0.1**. Nothing runs on import; the CLI
 requires explicit board, port and confirmation. It does not upload firmware,
 start a broker, discover devices, change outputs or keep a background worker.
@@ -26,6 +26,51 @@ mismatch prevents publication. Close other serial monitors before running.
 The ESP32 must already run the compatible PBLang embedded-controller firmware.
 This example reads its controller status; it does not assume that the board has
 an onboard LED. Status fields describe that protocol, not unmeasured sensors.
+
+## Finite monitoring
+
+Prefix the same explicit board arguments with `--monitor SAMPLES INTERVAL_MS`:
+
+```sh
+pblang --allow-all examples/microcontroller_connectivity/main.sapp -- --monitor 3 1000 uno-r4-wifi /absolute/export.json /dev/ttyACM0 1883 4 1 --confirmed
+```
+
+This requests three separate status messages, starting with sequence 1. Each
+sample closes its serial and network connection. The CLI sleeps between samples
+and returns a final counter summary; it does not leave a service running.
+The exported UNO project is read and validated once before acquisition begins.
+Changing the file during a run does not silently change the expected firmware.
+
+Limits: 1–32 samples, 1000–30000 ms minimum interval, and a total scheduling
+budget of `(samples - 1) * interval + samples * 1000 + 6000`, at most 60000 ms. Choose a smaller
+count/interval if this combination exceeds the budget. Sequence overflow is
+rejected before device access. The interval is a minimum wait after completing
+a sample, not a promise of a fixed sampling frequency or simultaneous snapshots.
+
+A failed read or unconfirmed publish stops the session; it never catches up
+by sending a burst or retries an uncertain delivery. `acknowledged` counts broker
+acknowledgements even if later cleanup fails; `published` counts fully successful
+exchanges. Neither is a subscriber counter.
+Status summaries do not retain a history of device payloads or private paths.
+The selected broker may have its own independent storage policy.
+
+Applications can import `stdlib:embedded_telemetry_monitor.sapp` and drive one
+`poll(session, read_snapshot, publish, clock)` at a time from their own event loop.
+`new(options)` has no device or network effects. The read callback receives
+`(sequence, remaining_ms)` and must return a validated telemetry snapshot.
+The optional publisher receives `(snapshot, port, timeout_ms)`; omitting it uses
+the local MQTT publisher. `status`, `cancel` and `close` support an application's
+own progress display and Stop control. The CLI currently has no interactive Stop
+UI; cooperative cancellation is an API capability.
+Use the returned `wait_ms` to schedule the next poll instead of repeatedly polling
+while waiting. `status()` reports the last observed clock; it does not read a
+device, advance time or perform I/O.
+
+Callbacks are trusted application code. They must bound their own execution and
+release their resources. Cancellation is checked at callback boundaries, not a
+forced native interruption. Existing USB acquisition can overrun the scheduling
+budget; a late result is not published and no later acquisition starts. Process
+termination or native failures do not guarantee serial-settings restoration.
 
 | Board | Topic | Published status |
 | --- | --- | --- |
