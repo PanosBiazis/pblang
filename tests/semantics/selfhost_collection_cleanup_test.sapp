@@ -1,0 +1,104 @@
+// Guaranteed collection type rejection closes only escaping owned state.
+let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let V=import("stdlib:compiler/vm.sapp");
+let O=import("stdlib:compiler/optimizer.sapp");
+let P=import("stdlib:selfhost_pbck.sapp");
+fn compile(source) {let c=F.frontend_compile(source);assert(c.ok,"fixture compiles: "+str(c.diagnostics));return c.chunk;}
+let setup=compile("memory_alloc(7);push_lifetime();borrow_immutable(1);memory_alloc(9);");
+let recover=compile("print memory_get(1);");
+fn prepared(owned) {let c=V.execution_context(owned);V.run_seeded(setup,map{},c);return c;}
+fn execute(code,globals,ctx,bounded) {
+    if bounded {return V.run_seeded_bounded(code,globals,nil,ctx);}
+    return V.run_seeded(code,globals,ctx);
+}
+fn call(name,args) {
+    let constants=[map{__bi:name}];let instructions=[map{op:0,operand:0}];
+    for value in args {array_push(constants,value);array_push(instructions,map{op:0,operand:len(constants)-1});}
+    array_push(instructions,map{op:18,operand:len(args)});return map{constants:constants,instructions:instructions};
+}
+fn released(ctx,state) {
+    assert(ctx.memory==nil and state.closed,"owned state closes");
+    assert(len(state.owners)==0 and len(state.borrows)==0 and state.reclaimed==2,"owners and borrows close exactly once");
+    V.close_execution(ctx);assert(state.reclaimed==2,"close idempotent");
+}
+let cases=[];
+for name in ["array_push","push"] {for v in [nil,7,map{k:8},bigint("42")] {array_push(cases,call(name,[v,9]));}}
+for name in ["array_pop","pop","array_sort"] {for v in [false,"text",map{k:8},rational(3,2)] {array_push(cases,call(name,[v]));}}
+for name in ["map_keys","len"] {for v in [nil,7,decimal("1.25")] {array_push(cases,call(name,[v]));}}
+for name in ["map_has","map_remove"] {
+    array_push(cases,call(name,[[7],"k"]));
+    for key in [nil,9,[],map{},bigint("42"),rational(3,2),decimal("1.25")] {array_push(cases,call(name,[map{k:7},key]));}
+}
+for key in [nil,9,bigint("42")] {array_push(cases,call("has_member",[nil,key]));}
+// OP_LEN is also emitted for a for-in iterator, independently of builtin calls.
+array_push(cases,map{constants:[nil],instructions:[map{op:0,operand:0},map{op:32,operand:0}]});
+// Numeric map keys must reach the existing index-error closure path; the growth
+// guard must not mistake boxed numeric objects for strings and fail first.
+for key in [bigint("42"),rational(3,2),decimal("1.25")] {
+    array_push(cases,map{constants:[map{k:7},key,9],instructions:[map{op:0,operand:0},map{op:0,operand:1},map{op:0,operand:2},map{op:28,operand:0}]});
+}
+// Operator builtin targets use the generic dispatcher rather than scalar calls.
+array_push(cases,compile("let receiver=map{__add__:map_remove,k:7};receiver+9;"));
+array_push(cases,compile("let receiver=map{__add__:push,k:7};receiver+9;"));
+let runs=0;
+for code in cases {
+    for bounded in [false,true] {
+        for owned in [false,true] {
+            let ctx=prepared(owned);let state=ctx.memory;
+            assert((try {execute(code,map{},ctx,bounded);false} catch true),"invalid collection type rejects");
+            if owned {released(ctx,state);}
+            else {assert(not state.closed and len(state.owners)==2 and len(state.borrows)==1,"borrowed state retained");V.close_execution(ctx);}
+            runs=runs+1;
+        }
+        let ctx=prepared(true);let state=ctx.memory;
+        let handled=map{constants:[map{try_chunk:code,catch_chunk:recover}],instructions:[map{op:35,operand:0}]};
+        assert(execute(handled,map{},ctx,bounded).output==[7],"guest catch retains usable allocation");
+        assert(not state.closed and ctx.handlers==0,"guest handler completes without closing state");V.close_execution(ctx);runs=runs+1;
+    }
+}
+// A full map must not route a boxed invalid key into map_has inside the quota
+// guard before the existing index-error handler can close owned state.
+for key in [bigint("42"),rational(3,2),decimal("1.25")] {
+    let target=map{k:7};let code=map{constants:[target,key,9],instructions:[map{op:0,operand:0},map{op:0,operand:1},map{op:0,operand:2},map{op:28,operand:0}]};
+    let ctx=prepared(true);let state=ctx.memory;
+    assert((try {V.run_seeded_bounded(code,map{},map{max_value_items:1},ctx);false} catch true),"full map invalid index rejected");
+    assert(target==map{k:7},"full map invalid index cannot mutate");released(ctx,state);
+}
+// Real dynamic source calls: evaluate each argument once and preserve the map.
+let sources=[
+    "let events=[];let a=map{k:7};fn arg(){array_push(events,1);return a;}fn bad(f){f(arg(),9);}bad(map_remove);",
+    "let events=[];let a=map{k:7};fn arg(){array_push(events,1);return a;}fn bad(f){f(arg(),9);}bad(array_push);",
+    "let events=[];let a=map{k:7};fn arg(){array_push(events,1);return a;}fn bad(f){f(arg());}bad(array_pop);"
+];
+for source in sources {
+    let plain=compile(source);
+    for code in [plain,O.optimize_safe(plain).chunk,P.deserialize_chunk(P.serialize_chunk(plain))] {
+        for bounded in [false,true] {
+            let ctx=prepared(true);let state=ctx.memory;let globals=map{};
+            assert((try {execute(code,globals,ctx,bounded);false} catch true),"dynamic source rejection");
+            assert(globals.events==[1] and globals.a==map{k:7},"one evaluation and no mutation");released(ctx,state);
+        }
+    }
+}
+let nested=compile("fn bad(f){return f(nil);}try bad(array_pop) catch bad(map_keys);");
+for bounded in [false,true] {
+    let ctx=prepared(true);let state=ctx.memory;
+    assert((try {execute(nested,map{},ctx,bounded);false} catch true),"catch failure escapes");released(ctx,state);
+}
+// Valid nil/false results and mutations must never be mistaken for failure.
+let valid=compile("let a=[];print array_pop(a);print push(a,false);print pop(a);let m=map{k:nil};print map_has(m,\"k\");print map_remove(m,\"k\");print map_remove(m,\"missing\");print has_member(7,\"k\");print map_keys(m);print len(\"αβ\");print array_sort([3,1,2]);");
+for bounded in [false,true] {
+    let ctx=prepared(true);let state=ctx.memory;
+    assert(execute(valid,map{},ctx,bounded).output==[nil,1,false,true,nil,nil,false,[],2,[1,2,3]],"valid collection results");
+    assert(not state.closed,"success keeps explicit context alive");V.close_execution(ctx);
+}
+// Exact numbers are not strings. Cover constant/stack, locals, return, output,
+// optimized code and PBCS. The public retained is_string behavior is unchanged.
+let numeric=compile("fn id(x){return x;}let a=bigint(\"42\");let b=rational(3,2);let c=decimal(\"1.25\");print id(a+bigint(\"1\"));print id(b);print id(c);print [a,b,c];");
+let expected=V.run(numeric).output;
+for code in [numeric,O.optimize_safe(numeric).chunk,P.deserialize_chunk(P.serialize_chunk(numeric))] {
+    let ctx=prepared(true);let state=ctx.memory;
+    assert(execute(code,map{},ctx,true).output==expected,"bounded exact number parity");
+    assert(not state.closed,"valid exact numbers do not close context");V.close_execution(ctx);
+}
+print "selfhost_collection_cleanup_pass: "+str(runs)+" ownership cases";
