@@ -144,6 +144,26 @@ Impossible known device/OS pairings are rejected. `custom_profile()` exists for
 new research substrates, but labels them unverified until conformance tests are
 provided.
 
+`Device.tick(machine, milliseconds = 1)` accepts integer numbers from 0 through
+86,400,000 milliseconds, including zero. It returns the new device time only
+when the composed platform clock accepts the step. A platform error (including
+exit or exhausted syscall budget) throws and leaves the device clock unchanged;
+the platform clock also remains unchanged for these rejections. Existing signal
+timestamps remain unchanged. Fixing the simulated platform condition permits a
+subsequent valid tick without adding the previously rejected duration.
+
+The platform `clock_ms` syscall uses the same integer range and returns an
+`ok: false` result for an invalid advance. Fractional advances are now rejected
+instead of silently rounded down; strings, booleans, nil and non-finite values
+are rejected too. Default and valid integer behavior is unchanged. Failed
+platform calls retain existing syscall-attempt accounting; clock preservation
+does not roll back the syscall counter. Device argument rejection occurs before
+the platform call. Direct platform ticks and device ticks remain separate entry
+points: callers should use `Device.tick` when advancing a composed device.
+These are deterministic in-memory models, not wall-clock synchronization or
+hardware timing guarantees; externally corrupted machine maps are not a general
+transactional state API.
+
 `stdlib:input_events.sapp` is the PBLang-native portable event and virtual-input
 implementation. `stdlib:linux_uinput.sapp` now emits an RX-only x86-64 ELF that
 uses the real Linux uinput ioctl/write ABI, replacing ydotoold for approved key,
@@ -173,6 +193,7 @@ Run the device contract and benchmark with:
 
 ```sh
 target/release/pblang run tests/semantics/device_emulator_test.sapp --allow-all
+target/release/pblang run tests/semantics/device_clock_test.sapp --allow-all
 target/release/pblang run tests/semantics/input_events_test.sapp --allow-all
 target/release/pblang run bench/device_emulator_stages.sapp --allow-all
 target/release/pblang run examples/device_emulation/main.sapp --allow-all
