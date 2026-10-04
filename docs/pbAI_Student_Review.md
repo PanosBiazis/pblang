@@ -79,9 +79,11 @@ The returned single-threaded, in-memory handle exposes:
 | `checkpoint()` | Detached active checkpoint, initially the parent |
 | `history()` | Detached active history, initially the original declaration |
 | `accept()` | Once, only after a passing review; switches this handle to the exact evaluated checkpoint and appended history |
-| `rollback()` | Once after acceptance; restores both original checkpoint and original history, then closes the transaction |
+| `rollback()` | Once after acceptance; restores both original checkpoint and original history, then finishes the acceptance transaction while keeping the handle usable |
+| `close()` | From any phase, clears handle-owned model/checkpoint/history references and enters terminal `closed`; returns `true` once, then `false` |
 
 Phases are `reviewed` or `rejected`, then `accepted`, then `rolled-back`.
+Any of these phases may explicitly transition to terminal `closed`.
 A rejected handle cannot be accepted. Editing returned reports, status, histories,
 checkpoints or original inputs confers no authority and cannot alter private state.
 No evaluator callback, custom model implementation, file target or tool authority
@@ -92,6 +94,40 @@ A new reviewed continuation may explicitly receive the accepted `checkpoint()`
 and `history()`. The accumulated training and holdout data remain bound to that
 checkpoint. The next review evaluates the entire accumulated holdout, including
 validation from accepted preceding runs. Keep the parent pair to restore or branch.
+
+## Explicit terminal close
+
+`close()` ends only the reviewed handle. After closing, `predict`, `checkpoint`,
+`history`, `accept` and `rollback` throw `student review is closed` before
+processing their inputs. Saved method aliases observe the same closed state.
+`status()` and detached `report()` remain readable: active checkpoint/history
+identities are `nil`, candidate activity is false, and authority flags remain false.
+The retained report still contains aggregate metrics, counts and content digests.
+
+The private method factory captures only the state owning its model, adapters,
+checkpoints and histories. Closing clears those references; it does not promise
+immediate garbage collection, physical memory erasure, a measured RAM reduction,
+crash cleanup or thread safety. Previously exported checkpoints, histories and
+predictions remain caller-owned and usable, as do other independently created
+handles. Closing does not delete caller files or revoke exports. Ordinary loaded,
+distilled and legacy continuation handles retain their existing lifecycle.
+Rollback remains distinct: it restores usable parent state. To stop using that
+rolled-back handle, call `close()` explicitly. There is no reopen operation;
+creating another review is an explicit independent operation.
+
+Run `tests/semantics/pbai_student_review_close_test.sapp` in each product for
+both direct-module and public-facade routes across all four pre-close phases.
+The runnable examples are `examples/pbai_student_review_close.sapp` in PBLang
+and `demo/pbai_student_review_close.sapp` in standalone pbAI. The Linux-only
+`tests/semantics/pbai_student_review_close_installed_test.sapp` copies both
+libraries and examples, hides both source trees, disables network access and
+executes from the trusted installed product directory. It also confirms the known
+foreign-cwd limitation using a synthetic decoy dependency. This is copied-fixture
+acceptance under the tested runtime, not universal installation/platform evidence.
+The specialist facade uses lazy `stdlib:` imports on the retained runtime: run it
+with the trusted product directory as cwd. A foreign caller manifest can redirect
+those imports before a reviewed handle exists. This change does not repair the
+[runtime function-origin limit](pbAI_Modularity.md#installed-execution-and-the-retained-function-origin-limit).
 
 ## Transport and privacy
 
