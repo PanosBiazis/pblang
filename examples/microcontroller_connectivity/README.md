@@ -66,6 +66,15 @@ Use the returned `wait_ms` to schedule the next poll instead of repeatedly polli
 while waiting. `status()` reports the last observed clock; it does not read a
 device, advance time or perform I/O.
 
+Custom publisher reports must contain boolean `ok`, `acknowledged`, `cleanup_ok`,
+`publish_attempted` and `outcome_uncertain` fields. An acknowledgement requires
+an attempted publication; uncertainty must mean an attempt without acknowledgement;
+`ok:true` also requires acknowledgement and successful cleanup. A malformed or
+contradictory report ends the monitor without retry, counts no acknowledgement or
+publication, and leaves delivery uncertain. The explicitly reported cleanup result
+remains separate. Valid acknowledgements survive cancellation and cleanup failures.
+These checks validate the callback contract, not the truth of a broker response.
+
 Callbacks are trusted application code. They must bound their own execution and
 release their resources. Cancellation is checked at callback boundaries, not a
 forced native interruption. Existing USB acquisition can overrun the scheduling
