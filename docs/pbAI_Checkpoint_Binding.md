@@ -80,8 +80,7 @@ owner and adds a bound facade route; it does not repair every loader/lazy import
   and broken selected dependencies). Each phase checks both actual facades and
   cleans its owned fixture. `PBAI_SOURCE_HIDE_ROOT` optionally hides another source
   tree. The outer harness needs fixture/process permissions and its own minimal `/dev` for child `/dev/null`;
-file children retain
-  the existing filesystem/FFI/exec grants while denying network, HTTP and SQLite.
+  file children retain the existing filesystem/FFI/exec grants while denying network, HTTP and SQLite.
 
 The three positive directory phases compare exact checkpoint bytes and public
 example output between products; loaded prediction is checked in a fresh process.
@@ -101,3 +100,73 @@ Recorded local medians for five load+predict calls were 124.155 -> 36.792 ms
 checkpoint digest and prediction stayed identical. The standalone baseline was
 noisy, so these are bounded workload observations, not a portable speedup claim.
 See the [raw evidence](evidence/pbai_checkpoint_origin-2026-10-04.json).
+
+## Backend failures and response validation
+
+The existing shared checkpoint adapter validates each storage response before
+returning a success receipt or decoding a checkpoint. This adds no public method
+and does not change the checkpoint format or file permissions.
+
+- Write responses must be maps with boolean `ok:true`, the exact encoded UTF-8
+  byte count, boolean `no_replace`, `exclusive_create`, `descriptor_bound_parent`
+  and `atomic_namespace_admission` all true, and boolean `atomic_visibility:false`.
+- Read responses must have boolean `ok:true`, a string `text`, and an integer
+  `size` in 0..4096 that exactly matches the text's UTF-8 byte count. A character
+  ceiling is checked before byte conversion. The unchanged strict checkpoint
+  decoder then validates syntax, duplicate keys, fixed shape, bounds and digest.
+- Missing fields, nonboolean success, inconsistent sizes, wrong types, callbacks,
+  cyclic values in required fields and provider exceptions are rejected. Only
+  fixed fields are inspected; unrelated additional metadata is ignored without
+  traversing, serializing or invoking it. A fully shaped lying backend remains
+  possible: receipt checks are not authentication or independent I/O proof.
+
+Backend exceptions and malformed responses retain the existing generic public
+save/read failure strings, without echoing backend errors or caller paths. A valid
+read envelope containing invalid JSON or a malformed checkpoint retains the
+specific decoder error; a later field-access error must not replace it. Input
+validation still runs before invoking the backend. No retry, fallback, automatic
+read-back or attempted deletion is added. A failed or malformed save response
+cannot establish whether a provider already created partial output; keep the
+failure and inspect it explicitly, rather than retrying or deleting a name blindly.
+
+Loading has no active-model registry. Keep the previous application handle and
+assign a replacement only after `load_file` returns successfully. The existing
+file example now has `PBAI_CHECKPOINT_TEST_PHASE=reload`: it loads `student.json`,
+tries `candidate.json`, and retains the previous handle on failure. This is an
+application-level assignment pattern, not automatic model promotion. Saving or
+loading does not mutate the input artifact, earlier loaded handle or an earlier
+checkpoint file through the adapter; malicious backend code is outside this
+trusted-module contract.
+
+`tests/semantics/pbai_checkpoint_receipts_installed_test.sapp` copies both actual
+facades and shared adapter into private fixtures, hides the original sources,
+and supplies a valid caller manifest with decoys. With `PBLANG_BIN` set, run
+separate `PBAI_RECEIPT_PHASE=cases`, `errors-write`, `errors-read` and `roundtrip`
+phases. The first three inject a synthetic `secure_file` module only into that
+private copy; computational children deny exec/spawn/FFI as well as network/HTTP
+and SQLite. The real `roundtrip` phase uses the unchanged secure-file backend and
+its existing filesystem/FFI/exec requirements. Each phase cleans its fixture.
+The `baseline` phase is a characterization intended for the pre-fix owner and
+must fail against the corrected adapter. The fault module is a test fixture,
+never a runtime backend selection mechanism.
+
+Coverage includes 51 malformed write responses and 37 malformed read responses
+per facade, one-call/no-retry counters, provider throws, validation before I/O,
+previous model/input preservation, normal responses with extra metadata, exact
+public error strings, and real-file missing/corrupt/valid replacement attempts.
+Primary backend messages are intentionally not exposed; the public adapter error
+is preserved. No claim of filesystem rollback, atomic replacement, new platform
+support, global activation or model quality follows from these checks.
+
+Local receipt-validation cost (unchanged file-origin benchmark, one warmup,
+seven samples, five load+predict calls per sample; import/setup excluded):
+
+| Product | Baseline median / p95 ms | Validated median / p95 ms |
+| --- | ---: | ---: |
+| pblang | 26.385 / 28.142 | 29.773 / 30.829 |
+| pbai | 26.127 / 26.607 | 30.756 / 39.468 |
+
+The 464-byte artifact, digest and prediction remain equal. These are bounded
+local timings on a shared desktop, not a general speedup or model-quality claim.
+With seven samples, nearest-rank p95 is the maximum sample. See the
+[raw response-validation evidence](evidence/pbai_checkpoint_receipts-2026-10-05.json).

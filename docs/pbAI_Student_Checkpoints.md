@@ -127,3 +127,9 @@ Recorded Linux results: artifacts occupy 455, 459 and 464 bytes for weights 0,
 8/16. Maximum absolute logit drift was respectively 0.000002658, 0.000005105 and
 0.000002847. Both products produced identical checkpoint digests and quality
 metrics. This establishes fixture round-trip behavior, not accuracy improvement.
+
+The adapter also validates backend result types, exact byte counts and exclusive
+creation flags before reporting success. Malformed responses cannot replace a
+previous loaded handle; callers assign a replacement only after successful load.
+See [backend failure handling](pbAI_Checkpoint_Binding.md#backend-failures-and-response-validation)
+for the preserved error contract, synthetic fault tests and `reload` example.
