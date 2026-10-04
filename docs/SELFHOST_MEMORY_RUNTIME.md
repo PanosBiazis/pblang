@@ -276,6 +276,6 @@ Known argument rejections for repeat, replace and padding now skip size
 arithmetic, close eligible owned scalar state, then invoke the original primitive
 once. This preserves its first diagnostic and guest argument evaluation, while
 handled and caller-owned contexts stay live. See [string admission and its
-limits](SELFHOST_STRING_ADMISSION.md), including the separate existing
-empty-search replacement estimate gap. Arbitrary host/FFI failures remain outside
-this guarantee.
+limits](SELFHOST_STRING_ADMISSION.md), including bounded NaN padding parity
+and pre-allocation empty-search replacement accounting. Arbitrary host/FFI
+failures remain outside this guarantee.

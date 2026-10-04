@@ -14,7 +14,7 @@ def main():
     parser.add_argument('--report', required=True)
     parser.add_argument('--lock')
     parser.add_argument('--start', type=int, default=0)
-    parser.add_argument('--count', type=int, default=20)
+    parser.add_argument('--count', type=int, default=21)
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
     report = Path(args.report)
@@ -54,6 +54,7 @@ def main():
          'print str_pad_left("a",3.9,"λβ");print str_pad_right("a",3,"");', True),
         ('accepted nan width', 'print str_pad_left("a",num_sqrt(-1),"x");'
          'print str_pad_right("a",num_sqrt(-1),"x");', True),
+        ('empty search boundaries', 'print str_replace_all("","","xyz");print str_replace_all("α🙂","","λβ");print str_replace_all("á","","x");', True),
         ('handled and shadowed', 'print (try str_repeat(nil,2) catch false);'
          'fn str_pad_left(a,b,c){return nil;}print str_pad_left(nil,nil,nil);', True),
     ]
@@ -66,7 +67,7 @@ def main():
             expected = run(native)
             assert (expected['exit'] == 0) == valid, (name, expected)
             for mode in ['plain', 'optimized', 'pbcs']:
-                for bounded in ([False] if name == 'accepted nan width' else [False, True]):
+                for bounded in [False, True]:
                     text = 'let F=import("stdlib:compiler/selfhost_frontend.sapp");'
                     text += 'let V=import("stdlib:compiler/vm.sapp");'
                     text += 'let O=import("stdlib:compiler/optimizer.sapp");'

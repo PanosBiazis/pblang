@@ -1,0 +1,78 @@
+// Pre-allocation scalar bounds, including a terminal raw OP_CALL with no
+// following tick to mask an underestimated output. Synthetic fixtures only.
+let V=import("stdlib:compiler/vm.sapp");
+let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let O=import("stdlib:compiler/optimizer.sapp");
+let P=import("stdlib:selfhost_pbck.sapp");
+let checks=0;
+fn demand(ok,message){checks=checks+1;assert(ok,message);}
+fn compile(source,mode=0){let r=F.frontend_compile(source);assert(r.ok,"compile");if mode==1{return O.optimize_safe(r.chunk).chunk;}if mode==2{return P.deserialize_chunk(P.serialize_chunk(r.chunk));}return r.chunk;}
+let setup=compile("let h=memory_alloc(7);push_lifetime();borrow_immutable(h);memory_alloc(9);");
+fn context(owned){let c=V.execution_context(owned);V.run_seeded(setup,map{},c);return c;}
+fn terminal(name,args){let constants=[map{__bi:name}];let instructions=[map{op:0,operand:0}];for arg in args {array_push(constants,arg);array_push(instructions,map{op:0,operand:len(constants)-1});}array_push(instructions,map{op:18,operand:len(args)});return map{constants:constants,instructions:instructions};}
+// This is the exact retained-host boundary formula in Unicode scalars, not bytes
+// or grapheme clusters: source + (source length + 1) replacement insertions.
+for value in ["","a","ab","α🙂","á"] {
+    for replacement in ["","x","λ🙂","xyz"] {
+        let expected=str_replace_all(value,"",replacement);let count=len(expected);
+        for owned in [false,true] {
+            let good=context(owned);let state=good.memory;
+            let source="print str_replace_all("+json_stringify(value)+",\"\","+json_stringify(replacement)+");";
+            for mode in [0,1,2] {
+                let result=V.run_seeded_bounded(compile(source,mode),map{},map{max_value_items:num_max(8,count)},good);
+                demand(result.output==[expected],"accepted output parity");
+            }
+            demand(not state.closed and len(state.owners)==2,"success retains owner");
+            V.close_execution(good);
+            // Small exact boundaries below eight use raw calls to avoid unrelated
+            // long builtin-name constants being charged as guest values.
+            let exact=context(owned);
+            V.run_seeded_bounded(terminal("str_replace_all",[value,"",replacement]),map{},map{max_value_items:num_max(1,count)},exact);
+            demand(not exact.memory.closed,"exact quota admits");V.close_execution(exact);
+            // Require each argument itself to fit, isolating output admission.
+            if count>1 and len(value)<count and len(replacement)<count {
+                let bad=context(owned);let old=bad.memory;
+                demand(try {V.run_seeded_bounded(terminal("str_replace_all",[value,"",replacement]),map{},map{max_value_items:count-1},bad);false} catch true,"one below output rejects before terminal call");
+                demand(old.closed==owned,"owned quota closes; borrowed context retained");
+                if owned {demand(bad.memory==nil and len(old.owners)==0 and len(old.borrows)==0 and old.reclaimed==2,"quota clears scalar state");}
+                V.close_execution(bad);demand(old.reclaimed==2,"idempotent close");
+            }
+        }
+    }
+}
+for name in ["str_pad_left","str_pad_right"] {
+    for value in ["","a","α🙂","á"] {
+        for padding in ["","x","λβ"] {
+            let expected=if name=="str_pad_left" {str_pad_left(value,num_sqrt(-1),padding)} else {str_pad_right(value,num_sqrt(-1),padding)};
+            for owned in [false,true] {
+                let c=context(owned);let old=c.memory;
+                for mode in [0,1,2] {
+                    let source="print "+name+"("+json_stringify(value)+",num_sqrt(-1),"+json_stringify(padding)+");";
+                    let result=V.run_seeded_bounded(compile(source,mode),map{},map{max_value_items:32},c);
+                    demand(result.output==[expected],"NaN width host parity");
+                }
+                demand(not old.closed and len(old.owners)==2,"NaN success retains owner");V.close_execution(c);
+            }
+        }
+    }
+}
+// Sticky quota cannot be swallowed by a guest handler, even if the over-limit
+// replacement result is discarded. A later independent run can reuse context.
+for mode in [0,1,2] {
+    for owned in [false,true] {
+        let c=context(owned);let old=c.memory;let globals=map{caught:false};
+        let source="try str_replace_all(\"ab\",\"\",\"xyz\") catch {caught=true;7};";
+        demand(try {V.run_seeded_bounded(compile(source,mode),globals,map{max_value_items:8},c);false} catch true,"quota escapes guest catch");
+        demand(not globals.caught and old.closed==owned,"guest effects skipped");
+        let recovered=V.run_seeded_bounded(compile("print memory_get(memory_alloc(13));",mode),map{},nil,c);
+        demand(recovered.output==[13] and not c.memory.closed,"fresh runtime recovers after allocation quota");
+        V.close_execution(c);demand(old.closed,"all state eventually closed");
+    }
+}
+// Invalid argument still receives primitive admission rather than NaN handling.
+for name in ["str_pad_left","str_pad_right"] {
+    let c=context(true);let old=c.memory;
+    demand(try {V.run_seeded_bounded(terminal(name,["a",num_sqrt(-1),nil]),map{},nil,c);false} catch true,"bad padding rejects");
+    demand(old.closed and c.memory==nil,"bad NaN call closes eligible state");
+}
+print "selfhost_string_bounds_pass "+str(checks);
