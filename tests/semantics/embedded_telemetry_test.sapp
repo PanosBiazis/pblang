@@ -1,0 +1,137 @@
+let T=import("stdlib:embedded_telemetry.sapp");
+let MQTT=import("stdlib:mqtt311.sapp");
+fn check(v, message){if not v{throw "Telemetry: " + message;}}
+
+fn refused(result){check(not result.ok,"request must be refused");check(not str_contains(json_stringify(result),"PRIVATE"),"redacted refusal");}
+fn uno(){return map{ok:true, identity_matched:true, close_ok:true, termios_restored:true, command:"STATUS",
+        port:"PRIVATE_PORT", reply:map{protocol:"PBLED1", board:"UNO_R4_WIFI", command:"STATUS", ok:true, error:"",
+            digest:"PRIVATE_DIGEST", request:"PRIVATE_NONCE", ssid:"PRIVATE_SSID", state:"idle", frame:0, remaining_ms:0, frames:2}};}
+
+fn esp_session(){return map{format:"pblang.embedded-controller.v1", board:"esp32-devkitc-v4", mode:"wired", closed:true, connected:false, device_id:"PRIVATE_DEVICE", port:"PRIVATE_PORT"};}
+
+fn esp_result(){return map{ok:true, applied:false, transport:"wired-serial", circuit:map{ok:true, state_verified:true, device:"PRIVATE_DEVICE"},
+        response:map{ok:true, format:"pblang.embedded-wire.v1", kind:"response", status:0, sequence:7, on:true, blinking:false, interval_ms:500, remaining_ms:0}};}
+let closed=map{ok:true, termios_restored:true};
+let u=T.from_uno(uno(), 1);let e=T.from_esp(esp_session(), esp_result(), closed, 2);
+check(u.board == "arduino-uno-r4-wifi" and u.status.frames == 2, "UNO adapter");
+check(e.board == "esp32-devkitc-v4" and e.status.on, "ESP adapter");
+check(not str_contains(json_stringify(u) + json_stringify(e), "PRIVATE"), "adapters exclude identities");
+for field in ["ok", "identity_matched", "close_ok", "termios_restored"]{
+    let bad=uno();bad[field]=false;check((try T.from_uno(bad, 1) catch nil) == nil, "UNO confirmation required");
+}
+let bad_uno=uno();bad_uno.command="PLAY";check((try T.from_uno(bad_uno, 1) catch nil) == nil, "only status accepted");
+let simulated=esp_session();simulated.mode="emulator";
+check((try T.from_esp(simulated, esp_result(), closed, 1) catch nil) == nil, "emulator rejected");
+let wrong=esp_session();wrong.board="arduino-uno";
+check((try T.from_esp(wrong, esp_result(), closed, 1) catch nil) == nil, "other board rejected");
+let unverified=esp_result();unverified.circuit.state_verified=false;
+check((try T.from_esp(esp_session(), unverified, closed, 1) catch nil) == nil, "unverified response rejected");
+check((try T.from_esp(esp_session(), esp_result(), map{ok:false, termios_restored:false}, 1) catch nil) == nil, "serial cleanup required");
+
+// All transports below are in-memory fixtures. No socket, serial port or subprocess.
+
+fn fixture(mode="ok"){
+    let s=map{time:0, connects:0, writes:[], reads:0, closes:0, budgets:[], mode:mode};
+    let io=map{
+        now:fn(){
+            if s.mode=="fractional"{return 100.75;}
+            if s.mode=="invalid-clock"{return "PRIVATE_CLOCK";}
+            if s.mode=="rollback" and s.time==10{return 4;}
+            return s.time;
+        },
+        random:fn(){if s.mode == "entropy-throw"{throw "PRIVATE_ENTROPY";}return [0, 1, 2, 3, 4, 5, 6, 7];},
+        connect:fn(host, port, timeout){
+            check(host == "127.0.0.1" and port == 1883, "fixed loopback endpoint");
+            s.connects=s.connects + 1;push(s.budgets, timeout);s.time=s.time + 5;
+            if s.mode == "connect-throw"{throw "PRIVATE_CONNECT";}
+            return map{ok:s.mode != "connect-deny"};
+        },
+        write:fn(socket, bytes, timeout){
+            push(s.writes, bytes);push(s.budgets, timeout);s.time=s.time + 5;
+            if s.mode == "write-throw"{throw "PRIVATE_WRITE";}
+            if s.mode == "partial-write"{return map{ok:true, count:len(bytes) - 1};}
+            if s.mode == "disconnect-throw" and bytes == [224, 0]{throw "PRIVATE_DISCONNECT";}
+            return map{ok:true, count:len(bytes)};
+        },
+        read:fn(socket, count, timeout){
+            check(count == 4, "exact acknowledgement bound");s.reads=s.reads + 1;
+            push(s.budgets, timeout);s.time=s.time + 5;
+            if s.mode == "read-throw"{throw "PRIVATE_READ";}
+            if s.mode == "timeout"{return map{ok:false, error:"PRIVATE_TIMEOUT"};}
+            if s.mode == "late"{s.time=1000;}
+            let bytes=[32,2,0,0];
+            if s.reads!=1{bytes=[64,2,0,1];}
+            if s.mode == "connack-deny" and s.reads == 1{bytes=[32, 2, 0, 5];}
+            if s.mode == "session-present" and s.reads == 1{bytes=[32, 2, 1, 0];}
+            if s.mode == "wrong-ack" and s.reads == 2{bytes=[64, 2, 0, 2];}
+            if s.mode == "truncated"{return map{ok:true, count:3, bytes:[32, 2, 0]};}
+            return map{ok:true, count:4, bytes:bytes};
+        },
+        close:fn(socket){s.closes=s.closes + 1;
+            if s.mode == "close-throw"{throw "PRIVATE_CLOSE";}
+            return map{ok:s.mode != "close-false"};
+        }
+    };
+    return map{state:s, io:io};
+}
+for snapshot in [u, e]{
+    let f=fixture();let _result=T.publish_local(snapshot, 1883, 1000, f.io);
+    check(_result.ok and _result.acknowledged and _result.cleanup_ok and not _result.outcome_uncertain, "QoS1 success");
+    check(f.state.connects == 1 and f.state.closes == 1 and f.state.reads == 2 and len(f.state.writes) == 3, "one shot lifecycle");
+    check(f.state.writes[1][0] == 50 and f.state.writes[2] == [224, 0], "QoS1 non-retained and disconnect");
+    let frame=f.state.writes[1];let length=MQTT.decode_remaining_length(frame,1);
+    let body=slice(frame,1+length.bytes_used,len(frame));
+    let message=MQTT.parse_publish(map{ok:true,header:frame[0],packet_type:3,body:body});
+    check(message.ok and message.qos==1 and not message.retain,"exact MQTT publish codec");
+    let wire=message.topic+message.text;
+    check(str_contains(wire, T.topic(snapshot.board)) and str_contains(wire, json_stringify(snapshot)), "fixed topic and exact redacted payload");
+    check(not str_contains(wire, "PRIVATE"), "wire excludes identity markers");
+    let previous=1001;for budget in f.state.budgets{check(budget > 0 and budget < previous, "one decreasing transaction budget");previous=budget;}
+}
+for mode in ["rollback", "connect-deny", "write-throw", "partial-write", "read-throw", "timeout", "late", "connack-deny", "session-present", "wrong-ack", "truncated", "disconnect-throw", "close-throw", "close-false"]{
+    let f=fixture(mode);let _result=T.publish_local(u, 1883, 1000, f.io);
+    check(not _result.ok and f.state.connects == 1 and f.state.closes == 1, "recoverable failures close once: " + mode);
+    check(not str_contains(json_stringify(_result), "PRIVATE"), "failure redaction");
+    if mode == "close-throw" or mode == "close-false"{
+        check(_result.acknowledged and not _result.cleanup_ok and not _result.outcome_uncertain, "ack survives cleanup failure");
+    }
+    if mode == "wrong-ack"{check(_result.publish_attempted and not _result.acknowledged and _result.outcome_uncertain, "uncertain publication not retried");}
+}
+for mode in ["connect-throw", "entropy-throw"]{
+    let f=fixture(mode);let _result=T.publish_local(u, 1883, 1000, f.io);
+    refused(_result);
+    check(not _result.ok and f.state.closes == 0, "no returned handle to close");
+    if mode == "entropy-throw"{check(f.state.connects == 0 and not _result.network_attempted, "entropy failure before networking");}
+}
+let invalid=[];
+let extra=T.validate(u);extra.password="PRIVATE_PASSWORD";push(invalid, extra);
+let status_extra=T.validate(u);status_extra.status.path="PRIVATE_PATH";push(invalid, status_extra);
+let synthetic=T.validate(u);synthetic.evidence="synthetic";push(invalid, synthetic);
+let board=T.validate(u);board.board="unknown";push(invalid, board);
+let sequence=T.validate(u);sequence.sequence=2147483648;push(invalid, sequence);
+let state=T.validate(u);state.status.state="running";push(invalid, state);
+let excessive=T.validate(u);excessive.status.remaining_ms=60001;push(invalid, excessive);
+push(invalid, nil);push(invalid, map{});
+for value in invalid{
+    let f=fixture();let _result=T.publish_local(value, 1883, 1000, f.io);
+    refused(_result);
+    check(not _result.ok and not _result.network_attempted and f.state.connects == 0, "invalid snapshot has no effects");
+}
+for timeout in [0, 249, 5001, 1000.5]{let f=fixture();let value=T.publish_local(u, 1883, timeout, f.io);refused(value);check(not value.ok and f.state.connects == 0, "deadline bounds");}
+for port in [0, 65536, 1.5]{let f=fixture();let value=T.publish_local(u, port, 1000, f.io);refused(value);check(not value.ok and f.state.connects == 0, "port bounds");}
+
+// Real native callbacks are safe to exercise without connecting or opening ports.
+let normalized=T.native_io(fn(){return 1234.875;});
+check(normalized.now()==1234,"native fractional milliseconds are floored");
+let real=T.native_io();let sampled=real.now();
+check(type(sampled)=="number" and sampled==num_floor(sampled) and sampled>=0,"native clock supplies integer milliseconds");
+check(len(real.random())==8,"native entropy callback remains available");
+for bad_clock in [-1,9007199254740992,"private",nil]{
+    let bad_native=T.native_io(fn(){return bad_clock;});
+    check((try bad_native.now() catch nil)==nil,"invalid native clock rejected");
+}
+for mode in ["fractional","invalid-clock"]{
+    let f=fixture(mode);let rejected=T.publish_local(u,1883,1000,f.io);refused(rejected);
+    check(f.state.connects==0 and f.state.closes==0,"invalid injected clock fails before effects");
+}
+print "embedded telemetry tests passed";
