@@ -189,8 +189,7 @@ reserves space for navigation. If a text cluster cannot fit the supported width 
 a single line cannot fit the available height, it explicitly asks for more space or
 a different style rather than silently omitting content. Blank text/button anchors
 remain distinct. This does not introduce a general scrolling container or enlarge
-the document limits above. The separate settings screen retains its existing layout;
-very short windows may still require enlargement to use all appearance controls.
+the document limits above. The settings screen also adapts to short windows as described below.
 
 Developers can use the pure `pagination.sapp` planner without opening a window:
 
@@ -241,3 +240,40 @@ writes `build/reader-pages-*.png` and its own state file. Web/Android exports re
 the shared view and portable destination-inspection action; they do not gain the
 native controller's pagination callbacks. Windows/macOS/iOS/Android device execution
 is not established by these Linux/Xvfb tests.
+
+
+## Preferences in short windows
+
+When the original **Style** screen would overflow or truncate its text, it switches
+to a compact layout. All five existing choices remain available: font family, body
+size, text scale, line spacing and density. The layout shows one choice at the
+minimum 320×240 viewport, two at 320×288, and up to five as height allows.
+**Previous options / Next options**, Page Up/Down and Home/End navigate these option
+pages while Style is open; document reading position is unchanged. Changing pages
+focuses the first displayed choice. Tab/Shift+Tab and Enter/Space retain their
+existing control behavior, and held activation keys do not change a newly focused
+choice unintentionally. Done remains in the top toolbar and returns to the document.
+
+Resizing keeps the currently focused choice visible. If a page navigation button
+becomes disabled or disappears in a larger layout, focus returns to the remembered
+choice. Opening Style starts at the font choice. When the original screen fits,
+its previous choice layout is preserved. The Style toolbar always uses compact
+14px sans text. Compact choice controls use 14px text and fixed spacing
+so even extreme document typography cannot hide the options needed to change it.
+Preferences are still session-local and have no new storage or network effects.
+
+Developers may call `App.settings_page(reader,index)` (zero-based, clamped, false
+when unavailable or unchanged). The example-local `settings_layout.plan(height,
+anchor)` computes capacity and visible indices without opening a window; anchor is
+the choice index 0–4, and height uses the existing GUI bounds 240–4320. Shared GUI
+contracts and Web/Android exporters remain unchanged.
+
+```sh
+pblang run tests/semantics/reader_compact_settings_test.sapp --allow-all
+xvfb-run -a -s '-screen 0 1000x1000x24 -nolisten tcp' env XMODIFIERS=@im=none python3 tests/tooling/reader_compact_settings_native.py
+```
+
+The isolated native test changes all five options using real keyboard input at
+320×240, enlarges and shrinks the window, checks focus and held keys, then returns
+to the same document. Synthetic screenshots are written to `build/reader-settings-*`.
+This establishes Linux/Xvfb behavior, not execution on other physical platforms.
