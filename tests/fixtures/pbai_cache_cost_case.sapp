@@ -1,0 +1,46 @@
+// CPU admission benchmark: synthetic reader, real owner and dedicated facades.
+let S=import("stdlib:llm_tiered_store.sapp");let F=import("streaming.sapp");let E=import("embedded.sapp");
+let batch=128;let warmups=2;let samples=7;let residents=16;
+let small=[1,2,3,4];let large=[];let n=0;while n<64 {push(large,num_mod(n,4)+1);n=n+1;}
+let parts=[];let i=0;while i<residents {push(parts,S.model_part("s"+str(i),"small",4,sha256(base64_encode_bytes(small))));i=i+1;}
+push(parts,S.model_part("incoming-small","small",4,sha256(base64_encode_bytes(small))));
+push(parts,S.model_part("incoming-large","large",64,sha256(base64_encode_bytes(large))));
+fn start(mode,scenario) {
+ let budget=64;if scenario=="fits" {budget=68;}
+ let options=map{ram_budget_bytes:budget,max_cache_entries:17};
+ if mode==1 {return F.open("synthetic",parts,options);}if mode==2 {return E.open("synthetic",parts,options);}
+ return S.create("synthetic",parts,S.config(budget,options));
+}
+fn load(mode,s,id,pin=false) {if mode==1 {return F.load_weight(s,id,pin);}if mode==2 {return E.load_weight(s,id,pin);}return S.load(s,id,pin);}
+fn counter(raw,key) {for word in str_split(raw," ") {let fields=str_split(word,"=");if len(fields)==2 and fields[0]==key {return parse_number(fields[1]);}}throw "allocation counter unavailable";}
+let rows=[];
+for mode in [0,1,2] {for scenario in ["fits","impossible","multivictim"] {
+ let sample=0;let measured=[];
+ while sample<warmups+samples {
+  let sessions=[];let j=0;
+  while j<batch {
+   let s=start(mode,scenario);assert(s.ok,"synthetic session opens");let k=0;
+   while k<residents {assert(load(mode,s,"s"+str(k),scenario=="impossible" and k==0).cached,"seed resident");k=k+1;}
+   assert(load(mode,s,"s15").cache_hit,"preexisting warm hit");push(sessions,s);j=j+1;
+  }
+  let id="incoming-large";if scenario=="fits" {id="incoming-small";}
+  let held=[];let before=gc_stats();let started=now_ms();
+  for s in sessions {push(held,load(mode,s,id));}
+  let elapsed=now_ms()-started;let after=gc_stats();assert(elapsed>=0,"wall clock must not move backwards");
+  j=0;while j<batch {
+   let s=sessions[j];let value=held[j];let status=S.status(s);
+   assert(value.ok and value.verified and not value.cache_hit and status.stats.loads==18 and status.stats.verified_reads==17,"one verified miss after warm hit");
+   if scenario=="fits" {assert(value.cached and value.bytes==small and status.resident_bytes==68 and status.cached_shards==17 and status.stats.evictions==0 and status.stats.bypasses==0,"exact fit including final entry slot");}
+   elif scenario=="impossible" {assert(not value.cached and value.bytes==large and status.resident_bytes==64 and status.cached_shards==16 and status.pinned_shards==1 and status.stats.evictions==0 and status.stats.bypasses==1 and map_has(s.cache,"s15"),"impossible plan preserves all residents");}
+   else {assert(value.cached and value.bytes==large and status.resident_bytes==64 and status.cached_shards==1 and status.stats.evictions==16 and status.stats.bypasses==0,"complete sixteen-victim plan");}
+   assert(S.close(s),"simulated session closes");j=j+1;
+  }
+  if sample>=warmups {push(measured,map{elapsed_ms:elapsed,map_allocations:counter(after,"map_allocs")-counter(before,"map_allocs"),array_allocations:counter(after,"array_allocs")-counter(before,"array_allocs"),string_allocations:counter(after,"string_allocs")-counter(before,"string_allocs")});}
+  sample=sample+1;
+ }
+ push(rows,map{mode:mode,scenario:scenario,samples:measured});
+}}
+assert(len(rows)==9,"three unchanged workloads through three actual entrypoints");
+print json_stringify(map{format:"pbai.cache-admission-benchmark.v1",batch:batch,warmups:warmups,sample_count:samples,residents:residents,
+ clock:"now_ms-wall-clock",scope:"verified-public-load-with-synthetic-reader",allocation_scope:"cumulative-process-allocations-not-live-RAM",string_probe_overhead:1,
+ setup_and_verification_outside_timing:true,rows:rows});
