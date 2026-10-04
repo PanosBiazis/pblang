@@ -399,38 +399,30 @@ fn _read_verified(store, shard_value) {
     return last_error;
 }
 
-fn _evict_one(store) {
+// Plan against a stable synchronous session; failed admission changes no residents.
+fn _eviction_plan(store, bytes) {
     let keys = map_keys(store.cache);
-    let victim = "";
-    let victim_score = 0;
-    let found = false;
-    let i = 0;
-    while i < len(keys) {
-        let entry = store.cache[keys[i]];
-        if not entry.pinned {
-            let score = _score(store, keys[i]);
-            if not found or score < victim_score {
-                found = true;
-                victim = keys[i];
-                victim_score = score;
+    let selected = map{}; let victims = [];
+    let resident = store.resident_bytes; let entries = len(keys);
+    while resident + bytes > store.config.ram_budget_bytes
+        or entries >= store.config.max_cache_entries {
+        let victim = ""; let victim_score = 0; let found = false; let i = 0;
+        while i < len(keys) {
+            let id = keys[i]; let entry = store.cache[id];
+            if not entry.pinned and not map_has(selected, id) {
+                let score = _score(store, id);
+                if not found or score < victim_score {
+                    found = true; victim = id; victim_score = score;
+                }
             }
+            i = i + 1;
         }
-        i = i + 1;
+        if not found { return nil; }
+        selected[victim] = true; array_push(victims, victim);
+        resident = resident - store.cache[victim].bytes;
+        entries = entries - 1;
     }
-    if not found { return false; }
-    store.resident_bytes = store.resident_bytes - store.cache[victim].bytes;
-    map_remove(store.cache, victim);
-    store.stats.evictions = store.stats.evictions + 1;
-    return true;
-}
-
-fn _make_room(store, bytes) {
-    while (store.resident_bytes + bytes > store.config.ram_budget_bytes
-           or len(map_keys(store.cache)) >= store.config.max_cache_entries)
-          and _evict_one(store) {
-    }
-    return store.resident_bytes + bytes <= store.config.ram_budget_bytes
-        and len(map_keys(store.cache)) < store.config.max_cache_entries;
+    return victims;
 }
 
 // Verified file bytes are scalar values, but their array is mutable.
@@ -442,11 +434,17 @@ fn _copy_bytes(bytes) {
 }
 
 fn _cache_insert(store, shard_value, bytes, pin, prefetched) {
-    if shard_value.bytes > store.config.ram_budget_bytes or not _make_room(store, shard_value.bytes) {
+    if shard_value.bytes > store.config.ram_budget_bytes {
         store.stats.bypasses = store.stats.bypasses + 1;
         return false;
     }
-    store.cache[shard_value.id] = map{
+    let victims = _eviction_plan(store, shard_value.bytes);
+    if victims == nil {
+        store.stats.bypasses = store.stats.bypasses + 1;
+        return false;
+    }
+    // Prepare the owned bytes before committing any of the planned evictions.
+    let prepared = map{
         data: _copy_bytes(bytes),
         bytes: shard_value.bytes,
         manual_pinned: pin,
@@ -454,6 +452,15 @@ fn _cache_insert(store, shard_value, bytes, pin, prefetched) {
         pinned: pin,
         prefetched: prefetched
     };
+    let i = 0;
+    while i < len(victims) {
+        let victim = victims[i];
+        store.resident_bytes = store.resident_bytes - store.cache[victim].bytes;
+        map_remove(store.cache, victim);
+        store.stats.evictions = store.stats.evictions + 1;
+        i = i + 1;
+    }
+    store.cache[shard_value.id] = prepared;
     store.resident_bytes = store.resident_bytes + shard_value.bytes;
     return true;
 }
