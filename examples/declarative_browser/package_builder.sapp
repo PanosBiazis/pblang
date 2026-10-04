@@ -1,0 +1,98 @@
+// Public reader packaging workflow in PBLang. Only trusted local sources/runtime.
+let Tokens=import("stdlib:compiler/tokenizer.sapp");let Path=import("stdlib:path.sapp");
+let Dir=import("stdlib:linux_dirfs.sapp");let Hash=import("stdlib:sha256_pb.sapp");
+let Package=import("stdlib:package_folder.sapp");
+let ENTRY="examples/declarative_browser/main.sapp";
+fn imports(source) {
+    let parsed=Tokens.tokenize_bounded(source,65536);assert(parsed.ok,"Reader token budget exceeded.");
+    let tokens=[];
+    for token in parsed.tokens {
+        assert(token.kind!="invalid" and not (try token.unterminated catch false),"Malformed reader source token.");
+        if token.kind!="comment" {push(tokens,token);}
+    }
+    let found=[];
+    for i len(tokens) {
+        if tokens[i].kind=="keyword" and tokens[i].text=="import" {
+            assert(i+3<len(tokens) and tokens[i+1].text=="(" and tokens[i+2].kind=="string"
+                and tokens[i+3].text==")","Only literal import(\"path\") is supported.");
+            push(found,tokens[i+2].text);
+        }
+    }
+    return found;
+}
+fn resolve(raw,importer) {
+    assert(type(raw)=="string" and len(raw)>0 and len(raw)<=4096 and not Path.is_absolute(raw)
+        and not str_contains(raw,"\\") and not str_contains(raw,strfromcharcode(0)),"Invalid reader import path.");
+    let parts=Path.split(importer);array_pop(parts);let target=str_join(parts,"/")+"/"+raw;
+    if str_starts_with(raw,"stdlib:") {target="stdlib/"+str_slice(raw,7,len(raw));}
+    if str_starts_with(raw,"stdlib/") {target=raw;}
+    target=Path.normalize(target);
+    assert(str_ends_with(target,".sapp") and (str_starts_with(target,"stdlib/")
+        or str_starts_with(target,"examples/declarative_browser/")),"Import is outside the reader profile.");
+    for part in str_split(target,"/") {assert(not str_starts_with(part,"."),"Hidden/traversing reader import.");}
+    return target;
+}
+fn _need(s,ok,message) {if not ok {s.error=message;throw message;}}
+fn _open(s,path,private=false) {let fs=Dir.open_absolute(path,false,private);_need(s,fs.ok,"Directory admission failed.");push(s.handles,fs);return fs;}
+fn _add(entries,path,bytes) {
+    entries[path]=map{kind:"f",bytes:bytes};let parent=Path.dirname(path);
+    while parent!="." and parent!="" {entries[parent]=map{kind:"d",bytes:[]};parent=Path.dirname(parent);}
+}
+fn _read(s,source,path) {let data=Dir.read_bytes(source,path,1048576);_need(s,data.ok,"Source must be a regular, unlinked file up to 1 MiB.");return data.bytes;}
+fn _u64(value) {let out=[0,0,0,0,0,0,0,0];let i=7;while i>=0 {out[i]=num_mod(value,256);value=num_floor(value/256);i=i-1;}return out;}
+fn tree_digest(entries) {
+    let digest=Hash.new();Hash.update(digest,str_to_bytes("pblang-package-tree-v2"));Hash.update(digest,[0]);
+    for path in array_sort(map_keys(entries)) {
+        if str_starts_with(path,"stdlib/") {
+            let entry=entries[path];let name=str_to_bytes(str_slice(path,7,len(path)));
+            Hash.update(digest,str_to_bytes(entry.kind));Hash.update(digest,_u64(len(name)));Hash.update(digest,name);
+            Hash.update(digest,_u64(len(entry.bytes)));Hash.update(digest,entry.bytes);
+        }
+    }
+    return Hash.finish(digest);
+}
+fn _run(s,repo,output,runtime) {
+    repo=Path.normalize(Path.absolute(repo));output=Path.normalize(Path.absolute(output));runtime=Path.normalize(Path.absolute(runtime));
+    let stage=output+".source";s.stage=stage;
+    _need(s,output!=repo and not str_starts_with(output,repo+"/") and not str_starts_with(repo,output+"/"),"Output must be outside the checkout.");
+    let parent=_open(s,Path.dirname(output),true);let name=Path.basename(output);
+    _need(s,not Dir.metadata(parent,name).ok,"Output already exists; it will not be replaced.");
+    _need(s,not Dir.metadata(parent,name+".source").ok,"Staging already exists; choose a fresh destination.");
+    let source=_open(s,repo);let pending=[ENTRY];let captured=map{};let entries=map{};let inventory=map{};let total=0;
+    while len(pending)>0 {
+        let path=array_pop(pending);
+        if not map_has(captured,path) {
+            s.current_module=path;_need(s,len(captured)<128,"Reader module count exceeds 128.");let bytes=_read(s,source,path);
+            total=total+len(bytes);_need(s,total<=8388608,"Reader source exceeds 8 MiB.");
+            let text=bytes_to_str(bytes);_need(s,str_to_bytes(text)==bytes,"Reader modules must be UTF-8.");
+            captured[path]=true;_add(entries,path,bytes);inventory[path]=sha256(text);
+            for raw in imports(text) {push(pending,resolve(raw,path));}
+        }
+    }
+    let manifest="[package]\nname=\"pb-document-reader\"\nversion=\"0.1.0\"\nentry=\""+ENTRY+"\"\n[dependencies]\nstdlib={path=\"stdlib\"}\n";
+    let lock="manifest_sha256 = \""+sha256(manifest)+"\"\ncontent_hash_algorithm = \"pblang-package-tree-v2\"\n[dependencies.stdlib]\npath = \"stdlib\"\nsha256 = \""+tree_digest(entries)+"\"\n";
+    _add(entries,"pblang.toml",str_to_bytes(manifest));_add(entries,"pblang.lock",str_to_bytes(lock));
+    _add(entries,"run-reader.sh",_read(s,source,"examples/declarative_browser/run-reader.sh"));
+    _add(entries,"LICENSE",_read(s,source,"LICENSE"));
+    _add(entries,"reader-source-sha256.json",str_to_bytes(json_stringify(inventory)+"\n"));
+    _add(entries,"README.txt",str_to_bytes("PBLang offline document reader — Linux x86-64 candidate\n\nOpen: sh /path/to/this/folder/run-reader.sh\nCheck without a display: sh /path/to/this/folder/run-reader.sh --check\nRequires compatible Linux libraries and system fonts. Readable sources and selected runtime included.\nNo global installation or activation. This launcher is not a sandbox.\nPublication is not acceptance. Preserve the previous accepted candidate until validation succeeds.\n"));
+    _need(s,Dir.mkdir_new(parent,name+".source",false).ok,"Cannot create exclusive staging.");s.stage_created=true;
+    let dest=_open(s,stage,true);
+    for path in array_sort(map_keys(entries)) {
+        let entry=entries[path];
+        if entry.kind=="d" {_need(s,Dir.mkdir_new(dest,path,false).ok,"Staging directory creation failed.");}
+        else {_need(s,Dir.write_new_atomic(dest,path,entry.bytes,false).ok,"Staging file publication failed.");}
+    }
+    s.modules=len(captured);s.publication=Package.bundle(stage,output,runtime);
+    _need(s,s.publication.ok,"Package publication failed; inspect its result and retained staging.");
+}
+fn bundle(repo,output,runtime) {
+    let s=map{handles:[],error:nil,current_module:nil,stage:nil,stage_created:false,modules:0,publication:nil};
+    let passed=try {_run(s,repo,output,runtime);true} catch false;let closed=true;
+    for handle in s.handles {if not (try Dir.close(handle) catch false) {closed=false;}}
+    if not passed and s.error==nil {s.error="Reader source/import admission failed.";}
+    return map{ok:passed and closed,error:s.error,current_module:s.current_module,modules:s.modules,stage:s.stage,stage_created:s.stage_created,
+        staging_retained:s.stage_created,owned_handles_closed:closed,publication:s.publication,
+        python_invoked:false,activated:false};
+}
+export imports,resolve,tree_digest,bundle;
