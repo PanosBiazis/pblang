@@ -18,11 +18,11 @@ Only actual strings pass string admission; boxed bigint/rational/decimal values
 are not strings even when the retained `is_string` predicate says otherwise.
 Repeat accepts an ordinary number greater than or equal to zero: fractional
 counts preserve host truncation, while NaN and negative counts reject. Padding
-accepts any ordinary numeric width at the primitive boundary. Negative and NaN
-widths retain their host behavior on unbounded execution; the bounded VM keeps
-its existing allocation policy, including rejection of negative widths. Its
-ordered size comparison can also reject a NaN width; that existing bounded
-limitation is not corrected here.
+accepts any ordinary numeric width at the primitive boundary. NaN widths preserve
+the host conversion to zero on both bounded and unbounded execution and return the
+source unchanged, keeping successful scalar ownership live. The bounded VM
+checks that source length without an ordered NaN comparison. Negative widths
+retain their host behavior unbounded and the prior allocation rejection bounded.
 
 `execution_context(true)` closes only with no active guest handler. Caught
 failures keep scalar handles usable, and nested catches remove their own handler
@@ -30,11 +30,17 @@ before executing the catch body. A default caller-owned context remains the
 caller's closing responsibility. Normal results do not trigger this cleanup.
 Both generic and scalar dispatch use the same guards.
 
-Existing allocation guards remain in place for valid inputs. They are not a
-complete allocation proof: the existing replacement estimate undercounts empty
-search strings, which insert at both end boundaries as well as between
-characters. That adjacent quota defect is outside this cleanup change. Numeric
-infinity can also exceed what an unbounded host allocation can safely perform;
+Empty-search replacement admission uses `n + (n + 1) * r`, where `n` and `r`
+are source and replacement lengths in Unicode scalars. This includes both ends,
+one insertion for an empty source, and combining characters as separate scalars.
+The check precedes the allocating primitive even when the result is discarded
+or the raw bytecode ends at its call. Exact fitting results pass; over-limit
+requests trip the sticky budget, close opted-in ownership even inside guest
+catches, and skip catch-body effects. Borrowed contexts remain caller-owned. A
+later independent run can reuse the context with a fresh runtime budget.
+Nonempty-search replacement retains the conservative existing estimate. These
+are scalar item limits, not byte or process-memory limits, and are not a complete
+allocation proof. Numeric infinity can exceed safe unbounded host allocation;
 only bounded rejection is tested for infinite padding widths.
 
 This change covers neither general host failures, native crashes, arbitrary
@@ -42,7 +48,8 @@ FFI/resource cleanup, composite/cyclic ownership, nor process RSS reclamation.
 It changes the explicit PBLang VM, not the retained compiler's nested `p:run`
 behavior or the global launcher. No alternate PBCK route is substituted.
 
-Verification lives in `tests/semantics/selfhost_string_admission_cleanup_test.sapp`
+Verification lives in `tests/semantics/selfhost_string_admission_cleanup_test.sapp`,
+`tests/semantics/selfhost_string_bounds_test.sapp`
 and `tests/tooling/selfhost_string_admission_parity.py`. The latter compares
 actual error messages and accepted results through plain, optimized and PBCS
 chunks, bounded and unbounded, and injects a secondary cleanup failure.
