@@ -346,3 +346,53 @@ independent sessions. Exact counters, cache bytes, pinned entries, queue order, 
 recency, prior outputs and closed snapshots are checked. Existing real filesystem and
 source-hidden examples separately verify normal sequential use. These callback tests
 substitute the directory backend and own no actual OS descriptors.
+
+
+## Plan-before-commit cache admission
+
+A successful verified read is distinct from cache admission. The result can remain
+`ok:true`, `verified:true`, `cached:false` when pins or entry/byte budgets prevent
+admission. That bypass now preserves every existing resident and does not increment
+`evictions`. `loads`, `misses`, `verified_reads` and `bypasses` still record the work
+that actually occurred; the attempted request is not rolled back.
+
+Previously room-making evicted unprotected entries one at a time while looking for
+space. With an 8-byte cache, a protected 4-byte resident, a warm unprotected 4-byte
+resident, and an incoming verified 8-byte shard, it evicted the warm resident and
+then discovered admission was impossible. The caller received a bypass and lost a
+useful resident without gaining a replacement. This occurred with both manual and
+learned hot pins. The real-file baseline also confirmed that failed digest reads
+already preserved the cache: that earlier read-validation behavior is not a new fix.
+
+Admission now has three synchronous phases. A bounded plan selects all victims using
+the existing heat/recency score, pin eligibility, byte budget and entry limit, without
+mutating cache entries or counters. An impossible plan returns a normal bypass.
+For a successful plan, the independent new byte array and cache entry are prepared
+before any eviction. Only then are the selected victims removed and the prepared
+entry published. Zero-byte shards still require an entry slot. Manual and hot pins
+remain protected; cache budget and eviction counts reflect committed residents.
+
+Malformed, partial, thrown and integrity-failed reader results remain rejected before
+admission planning. A failed mirror may still fall back to a healthy mirror; if the
+verified replacement cannot be admitted, that request bypasses without evicting.
+Prefetch reports the verified shard as completed, but does not increment resident
+`prefetched` for a bypass. Cancellation, active-load ownership, terminal close and
+caller-byte isolation retain their existing behavior.
+
+The plan uses temporary metadata proportional to current cache entries, and preparing
+bytes before eviction can increase temporary peak memory. The configured RAM budget
+still describes resident payload bytes, not total process memory or caller-held results.
+The existing repeated score-selection approach is retained; no speed or memory reduction
+is claimed. The plan/commit sequence relies on the synchronous trusted-session contract:
+it is not an OS transaction, thread mutex, crash/OOM rollback, secure erase guarantee or
+defense against direct public-handle mutation.
+
+Thirty-six real-filesystem cases per product cover manual/hot pins, failed integrity
+reads after cache hits, repeated uncached bypasses, independent caller bytes, prefetch
+bypass, complete multi-victim admission, failed reread after prior eviction, and both
+successful and blocked zero-byte entry-slot admission. One hundred eight additional
+simulated cases per product cover seven invalid reader outcomes, healthy fallback or
+exhausted mirrors, cache preservation before and after actual admission, reentry,
+cancellation/requeue and terminal close. The callback fixtures own no OS descriptors.
+The shared/standalone source-hidden lifecycle examples now also demonstrate that a
+verified large-shard bypass preserves two actual resident shards and a later warm hit.

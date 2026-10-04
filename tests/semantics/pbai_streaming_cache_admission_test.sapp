@@ -1,0 +1,42 @@
+assert(platform()=="linux","real cache admission fixture requires Linux");
+let S=import("stdlib:llm_tiered_store.sapp");let F=import("../pbai/stdlib/pbai_streaming.sapp");let E=import("stdlib:ai/pbai/stdlib/pbai_streaming.sapp");let U=import("stdlib:uuid.sapp");
+let state=env_get("PBAI_STATE_ROOT");assert(type(state)=="string" and state!="","private synthetic state required");
+let root=path_join(state,"cache-admission-"+U.v4());let small=[1,2,3,4];let large=[1,2,3,4,5,6,7,8];let parts=[];
+for row in [["pinned",small],["warm",small],["large",large],["empty",[]]] {push(parts,S.model_part(row[0],row[0],len(row[1]),sha256(base64_encode_bytes(row[1]))));}
+fn start(mode,options) {if mode==1 {return F.open(root,parts,options);}if mode==2 {return E.open(root,parts,options);}return S.create(root,parts,S.config(options.ram_budget_bytes,options));}
+fn load(mode,s,id,pin=false) {if mode==1 {return F.load_weight(s,id,pin);}if mode==2 {return E.load_weight(s,id,pin);}return S.load(s,id,pin);}
+fn run(mode,s) {if mode==1 {return F.run_prefetch(s,1);}if mode==2 {return E.run_prefetch(s,1);}return S.run_prefetch(s,1);}
+let step=map{label:"setup",cases:0};
+fn exercise() {
+ fs_mkdirs(root);fs_write_bytes(path_join(root,"pinned"),small);fs_write_bytes(path_join(root,"warm"),small);fs_write_bytes(path_join(root,"empty"),[]);
+ for mode in [0,1,2] {
+  for hot in [false,true] {
+   step.label="seed and protect";let s=start(mode,map{ram_budget_bytes:8,hot_slots:1});assert(s.ok,"real root opens");
+   let held=load(mode,s,"pinned",not hot);load(mode,s,"warm");assert(load(mode,s,"warm").cache_hit,"valid warm cache hit");
+   if hot {load(mode,s,"pinned");load(mode,s,"pinned");assert(S.rebalance_hot(s).hot_pinned==["pinned"],"learned pin protects the intended shard");}
+   let cache=json_stringify(s.cache);let before=S.status(s);
+   step.label="failed integrity read";fs_write_bytes(path_join(root,"large"),[9,9,9,9,9,9,9,9]);let bad=load(mode,s,"large");
+   assert(not bad.ok and bad.code=="integrity" and json_stringify(s.cache)==cache and S.status(s).resident_bytes==8 and S.status(s).stats.evictions==0,"invalid bytes cannot start eviction");step.cases=step.cases+1;
+   step.label="unfulfillable valid admission";fs_write_bytes(path_join(root,"large"),large);let bypass=load(mode,s,"large");
+   assert(bypass.ok and not bypass.cached and bypass.bytes==large and bypass.verified and json_stringify(s.cache)==cache and S.status(s).resident_bytes==8 and S.status(s).stats.evictions==0 and S.status(s).stats.bypasses==before.stats.bypasses+1,"impossible full plan preserves every resident");step.cases=step.cases+1;
+   step.label="repeat and independent output";bypass.bytes[0]=99;push(bypass.bytes,255);let again=load(mode,s,"large");
+   assert(again.ok and not again.cached and again.bytes==large and load(mode,s,"warm").cache_hit and held.bytes==small and json_stringify(s.cache)==cache and S.status(s).stats.evictions==0,"bypass output edits and retry preserve warm cache");step.cases=step.cases+1;
+   step.label="prefetch bypass";S.queue_prefetch(s,["large"]);let prefetched=run(mode,s);
+   assert(prefetched.ok and prefetched.completed==["large"] and prefetched.queued==0 and S.status(s).stats.prefetched==0 and json_stringify(s.cache)==cache and S.status(s).resident_bytes==8,"prefetch completion does not claim residence or evict on bypass");step.cases=step.cases+1;
+   assert(S.close(s) and held.bytes==small,"protected session closes without changing prior output");
+  }
+  step.label="successful multi-victim admission";let s=start(mode,map{ram_budget_bytes:8});let held=load(mode,s,"pinned");load(mode,s,"warm");load(mode,s,"warm");
+  let admitted=load(mode,s,"large");assert(admitted.ok and admitted.cached and admitted.bytes==large and S.status(s).cached_shards==1 and S.status(s).resident_bytes==8 and S.status(s).stats.evictions==2 and held.bytes==small,"complete plan commits exactly two victims");step.cases=step.cases+1;
+  step.label="failure after prior eviction";fs_write_bytes(path_join(root,"pinned"),[9,9,9,9]);let cache=json_stringify(s.cache);let bad=load(mode,s,"pinned");
+  assert(not bad.ok and bad.code=="integrity" and json_stringify(s.cache)==cache and S.status(s).resident_bytes==8 and S.status(s).stats.evictions==2 and load(mode,s,"large").cache_hit,"failed subsequent read retains replacement entry and exact accounting");step.cases=step.cases+1;
+  assert(S.close(s),"replacement session closes");fs_write_bytes(path_join(root,"pinned"),small);
+  step.label="zero-byte entry blocked by pinned slot";s=start(mode,map{ram_budget_bytes:8,max_cache_entries:1});load(mode,s,"pinned",true);cache=json_stringify(s.cache);let empty=load(mode,s,"empty");
+  assert(empty.ok and not empty.cached and empty.bytes==[] and json_stringify(s.cache)==cache and S.status(s).resident_bytes==4 and S.status(s).stats.evictions==0,"entry limit cannot evict a protected resident for an empty shard");assert(S.close(s),"pinned slot session closes");step.cases=step.cases+1;
+  step.label="zero-byte entry successful slot eviction";s=start(mode,map{ram_budget_bytes:8,max_cache_entries:1});load(mode,s,"pinned");empty=load(mode,s,"empty");
+  assert(empty.ok and empty.cached and S.status(s).resident_bytes==0 and S.status(s).cached_shards==1 and S.status(s).stats.evictions==1 and load(mode,s,"empty").cache_hit,"successful entry-slot plan handles empty bytes");assert(S.close(s),"empty session closes");step.cases=step.cases+1;
+ }
+}
+let passed=try {exercise();true} catch false;
+let removed=proc_spawn_wait("/bin/rm",["-rf","--",root]);assert(removed.exit_code==0,"private real fixture removed");
+assert(passed,"real admission case: "+step.label);assert(step.cases==36,"all real direct and facade scenarios executed");
+print "pbai_cache_admission_real_pass:36";

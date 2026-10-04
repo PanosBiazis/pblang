@@ -1,0 +1,50 @@
+let S=import("stdlib:llm_tiered_store.sapp");let D=import("stdlib:linux_dirfs.sapp");let F=import("streaming.sapp");let E=import("embedded.sapp");
+let small=[1,2,3,4];let large=[1,2,3,4,5,6,7,8];let parts=[];
+for row in [["pinned",small],["warm",small],["large",large],["empty",[]]] {push(parts,S.model_part(row[0],row[0],len(row[1]),sha256(base64_encode_bytes(row[1]))));}
+fn start(mode) {let options=map{ram_budget_bytes:8,mirrors:[S.mirror("synthetic-two")]};if mode==1 {return F.open("synthetic",parts,options);}if mode==2 {return E.open("synthetic",parts,options);}return S.create("synthetic",parts,S.config(8,options));}
+fn load(mode,s,id,pin=false) {if mode==1 {return F.load_weight(s,id,pin);}if mode==2 {return E.load_weight(s,id,pin);}return S.load(s,id,pin);}
+fn run(mode,s) {if mode==1 {return F.run_prefetch(s,1);}if mode==2 {return E.run_prefetch(s,1);}return S.run_prefetch(s,1);}
+fn outer(mode,s,prefetch) {if prefetch {return run(mode,s);}return load(mode,s,"large");}
+fn seed(mode,s) {assert(load(mode,s,"pinned",true).ok and load(mode,s,"warm").ok and load(mode,s,"warm").cache_hit,"two valid residents and a real cache hit");}
+fn finish(s) {assert(S.close(s) and D.snapshot().closes==[1,2],"known simulated roots close");}
+let cases=0;
+for mode in [0,1,2] {for prefetch in [false,true] {
+ for fault in ["throw","false","partial","missing_bytes","wrong_type","truthy","corrupt"] {for all in [false,true] {
+  D.configure();let s=start(mode);seed(mode,s);let retained=load(mode,s,"warm");let cache=json_stringify(s.cache);let before=S.status(s);S.queue_prefetch(s,["large"]);
+  let callback=map{called:false};D.behavior(fault,all,fn(){callback.called=true;assert(load(mode,s,"warm",true).code=="busy","reader callback cannot mutate cached pin state");});
+  let result=outer(mode,s,prefetch);let after=S.status(s);
+  assert(callback.called and len(D.snapshot().reads)==2 and json_stringify(s.cache)==cache and after.resident_bytes==8 and after.cached_shards==2 and after.stats.evictions==0,"invalid or bypassed read cannot partially evict healthy residents");
+  if all {
+   let code="read";if fault=="partial" {code="size";}if fault=="corrupt" {code="integrity";}
+   assert(not result.ok and after.stats.rejected_reads==before.stats.rejected_reads+1 and after.stats.bypasses==before.stats.bypasses,"all invalid mirrors preserve admission counters");
+   if prefetch {assert(result.failed[0].code==code,"prefetch exposes controlled failure");}else {assert(result.code==code and not map_has(result,"bytes"),"ordinary invalid read exposes no partial bytes");}
+  }else {
+   assert(result.ok and after.stats.bypasses==before.stats.bypasses+1 and after.stats.mirror_failovers==before.stats.mirror_failovers+1,"healthy fallback bypasses without evicting");
+   if prefetch {assert(result.completed==["large"] and after.stats.prefetched==0,"bypass is completed but not resident prefetch");}else {assert(not result.cached and result.bytes==large,"verified uncached bytes returned");}
+  }
+  let encoded=json_stringify(result);assert(not str_contains(encoded,"synthetic-private"),"raw callback errors excluded");
+  D.behavior();assert(load(mode,s,"warm").cache_hit and S.unpin(s,"pinned"),"resident survives until explicit unpin");
+  let admitted=load(mode,s,"large");assert(admitted.ok and admitted.cached and admitted.bytes==large and S.status(s).resident_bytes==8 and S.status(s).cached_shards==1 and S.status(s).stats.evictions==2,"complete valid plan evicts exactly two entries");
+  let saved=json_stringify(s.cache);D.behavior("partial",true,nil,"pinned");let rejected=load(mode,s,"pinned");
+  assert(not rejected.ok and rejected.code=="size" and json_stringify(s.cache)==saved and S.status(s).stats.evictions==2 and retained.bytes==small,"partial read after successful eviction leaves replacement intact");
+  finish(s);cases=cases+1;
+ }}
+ for action in ["cancel","close"] {for fault in ["ok","partial"] {
+  D.configure();let s=start(mode);seed(mode,s);let cache=json_stringify(s.cache);S.queue_prefetch(s,["large","empty"]);let seen=map{snapshot:nil};
+  D.behavior(fault,true,fn(){
+   if action=="close" {assert(S.close(s),"close during read");seen.snapshot=json_stringify(S.status(s));}
+   else {S.cancel_prefetch(s);assert(S.queue_prefetch(s,["large","empty"]).accepted==["empty"] and run(mode,s).code=="busy","cancel preserves only new pending work and cannot release active ownership");}
+  });
+  let result=outer(mode,s,prefetch);
+  if action=="close" {
+   assert(not result.ok and json_stringify(S.status(s))==seen.snapshot and len(D.snapshot().reads)==1 and D.snapshot().closes==[1,2] and not S.close(s),"terminal close prevents admission and leaves no late counter changes");
+  }else {
+   assert(json_stringify(s.cache)==cache and s.prefetch_queue==["empty"] and S.status(s).stats.evictions==0,"cancelled load or bypass does not evict or consume new work");
+   if prefetch {assert(result.cancelled and not result.ok,"batch observes cooperative cancellation");}
+   D.behavior();assert(run(mode,s).completed==["empty"] and S.status(s).cached_shards==3 and S.status(s).resident_bytes==8 and S.status(s).stats.evictions==0,"explicit later empty shard admission preserves resident bytes");finish(s);
+  }
+  cases=cases+1;
+ }}
+}}
+assert(cases==108,"all direct and facade admission fault scenarios executed");
+print "pbai_cache_admission_cases_pass:108";
