@@ -171,11 +171,41 @@ choices can be applied to the resulting Modern UI tree using normal option maps.
 The reader defaults opt into natural native spacing; existing unrelated GUI
 applications retain their defaults. See [typography](../../docs/TYPOGRAPHY.md).
 
-The default guide fits the tested 800×816 and 390×844 native windows. Very large
-custom settings, unusually long documents or shorter windows can exceed the
-available height; this example does not add scrolling or a pagination engine.
-Native row reservation remains conservative, and bitmap fallback cannot emulate
-arbitrary system fonts. Web/Android use platform-owned fonts and may break lines
+The native example automatically paginates a document when its current view would
+exceed the window height, truncate wrapped text, or clip a document link label.
+**Previous page / Next page**, **Page Up / Page Down**, **Home / End** navigate
+reading pages. The toolbar's **Home** button still navigates to the session home.
+Held page keys advance once per press. The original view remains when it fits.
+
+Changing appearance or resizing retains a logical text position (block and offset),
+so a changed page count does not move the reader to unrelated text. Local navigation
+starts at the destination's first page. Reading position is memory-only and is not
+stored separately for each history entry. A link's complete label is readable text
+followed by **Open link**, which uses the original session-validated block index.
+
+Document text obeys the selected sizes; pagination chrome uses compact 14px buttons
+and 12px status text. The planner reuses PBLang's bounded Unicode text flow and
+reserves space for navigation. If a text cluster cannot fit the supported width or
+a single line cannot fit the available height, it explicitly asks for more space or
+a different style rather than silently omitting content. Blank text/button anchors
+remain distinct. This does not introduce a general scrolling container or enlarge
+the document limits above. The separate settings screen retains its existing layout;
+very short windows may still require enlargement to use all appearance controls.
+
+Developers can use the pure `pagination.sapp` planner without opening a window:
+
+```pblang
+let P=import("./pagination.sapp");let V=import("stdlib:browser_view.sapp");
+let layout=P.plan(doc,V.appearance(map{body_size:20,font_scale:1.5}),390,844);
+let position=P.anchor(layout,1); // zero-based page; check layout.available first
+let resized=P.plan(doc,V.appearance(map{body_size:20,font_scale:1.5}),320,480);
+let page=P.locate(resized,position);
+App.read_page(reader,reader.reading_page+1); // native controller; clamped to its page count
+```
+
+`needs`, `plan`, `anchor`, `locate` and `view` are example-local helpers, not changes
+to the document interchange contract or shared renderer API. Native row reservation
+remains conservative, and bitmap fallback cannot emulate arbitrary system fonts. Web/Android use platform-owned fonts and may break lines
 differently. The inert `--export` HTML continues to use its existing fixed style;
 customizable presentation is provided by `--web-preview` and the shared view.
 
@@ -195,3 +225,19 @@ xvfb-run -a -s '-screen 0 1000x1000x24 -nolisten tcp' env XMODIFIERS=@im=none py
 It writes synthetic state and screenshots under `build/reader-focus-*` and closes
 its own window. These focus rules belong to the native example; the exported
 Web/Android presentation does not implement the example's preference callbacks.
+
+
+Pagination tests cover complete text coverage, canonical link indices, page bounds,
+held keys, resize/appearance anchors and explicit unsupported layouts:
+
+```sh
+pblang run tests/semantics/reader_pagination_test.sapp --allow-all
+xvfb-run -a -s '-screen 0 1000x1000x24 -nolisten tcp' env XMODIFIERS=@im=none python3 tests/tooling/reader_pagination_native.py
+```
+
+The native journey uses synthetic Greek/English text, large type at 390×844,
+keyboard settings changes, resize to 320×480 and last-page local navigation. It
+writes `build/reader-pages-*.png` and its own state file. Web/Android exports retain
+the shared view and portable destination-inspection action; they do not gain the
+native controller's pagination callbacks. Windows/macOS/iOS/Android device execution
+is not established by these Linux/Xvfb tests.
