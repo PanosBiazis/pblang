@@ -1,0 +1,87 @@
+// Explicit Linux serial control. Injected transports permit tests without ports.
+let Serial=import("stdlib:linux_serial.sapp");let S=import("stdlib:serialization.sapp");
+let Device=import("./device_export.sapp");
+fn nonce() {
+    let id=str_slice(sha256(base64_encode_bytes(random_bytes(32))),0,16);
+    if id=="0000000000000000" {throw "Request ID unavailable.";}return id;
+}
+fn integer(value,low,high) {return type(value)=="number" and value==num_floor(value) and value>=low and value<=high;}
+fn response(text,p,command,id) {
+    let parsed=S.parse_safe(text,"json",map{max_input_bytes:512,max_output_bytes:1024,
+        max_line_bytes:512,max_lines:1,max_depth:2,max_items:32,strict:true,reject_duplicate_keys:true});
+    if not parsed.ok or parsed.duplicate_keys_checked!=true {throw "Malformed device response.";}
+    let r=parsed.value;
+    if type(r)!="map" or len(map_keys(r))!=13 {throw "Unexpected device response fields.";}
+    for key in ["protocol","board","digest","command","request","ok","error","state","frame","remaining_ms","frames","repetitions","total_ms"] {
+        if not map_has(r,key) {throw "Missing device response field.";}
+    }
+    if r.protocol!="PBLED1" or r.board!="UNO_R4_WIFI" or r.digest!=p.digest
+        or r.command!=command or r.request!=id or r.frames!=len(p.rows)
+        or r.repetitions!=p.repetitions or r.total_ms!=p.total_ms {throw "Device, project or request mismatch.";}
+    if r.ok!=true or r.error!="" {throw "Device rejected the command.";}
+    if not integer(r.frame,0,len(p.rows)) or not integer(r.remaining_ms,0,p.total_ms)
+        or (r.state!="idle" and r.state!="running" and r.state!="done") {throw "Invalid device playback state.";}
+    if r.state=="running" {if r.frame==0 {throw "Running device has no visible frame.";}}
+    else {if r.frame!=0 or r.remaining_ms!=0 {throw "Stopped device reports active output.";}}
+    if command=="STOP" and r.state!="idle" {throw "Stop was not confirmed.";}
+    if command=="PLAY" and r.state=="idle" {throw "Play was not confirmed.";}
+    return r;
+}
+fn exchange(io,handle,p,command,synchronize=false) {
+    let id=io.nonce();if type(id)!="string" or not regex_match(id,"^[0-9a-f]{16}$") or id=="0000000000000000" {throw "Invalid request ID.";}
+    let line=command+" "+id+"\n";if synchronize {line="\n"+line;}
+    let bytes=str_to_bytes(line);let written=io.write(handle,bytes,1000);
+    if not written.ok or written.bytes_sent!=len(bytes) {throw "Command write was not confirmed.";}
+    let started=io.now();let buffer="";let received=0;let attempts=0;
+    while attempts<128 {
+        let remaining=2000-num_floor(io.now()-started);if remaining<1 {break;}
+        attempts=attempts+1;let read=io.read(handle,128,num_min(remaining,250));
+        if not read.ok or type(read.bytes)!="array" or read.count!=len(read.bytes) {throw "Device read failed.";}
+        for i len(read.bytes) {
+            let b=read.bytes[i];received=received+1;
+            if received>2048 {throw "Device response budget exceeded.";}
+            if b==10 {
+                let checked=try map{ok:true,value:response(buffer,p,command,id)} catch map{ok:false};buffer="";
+                if checked.ok {return checked.value;}
+                if not synchronize {throw "Device response validation failed.";}
+            }else {
+                if not integer(b,32,126) or len(buffer)>=511 {throw "Invalid or oversized device response.";}
+                buffer=buffer+strfromcharcode(b);
+            }
+        }
+    }
+    throw "Device response deadline expired.";
+}
+fn execute(io,handle,p,command,state) {
+    state.error="Serial input flush failed.";
+    let flushed=io.flush(handle);if not flushed.ok {throw state.error;}
+    state.error="Device/project handshake was not confirmed.";
+    exchange(io,handle,p,"HELLO",true);state.identity_matched=true;
+    state.error="Device command was not confirmed.";
+    if command=="PLAY" {state.play_attempted=true;}
+    state.reply=exchange(io,handle,p,command);
+    if command=="STOP" {state.stop_confirmed=true;}
+    state.error="";return true;
+}
+fn run_with(io,plan,port,command,confirmed=false) {
+    let p=Device.validate(plan);
+    if confirmed!=true or type(port)!="string" or not regex_match(port,"^/dev/ttyACM[0-9]{1,3}$")
+        or (command!="PLAY" and command!="STOP" and command!="STATUS") {throw "Explicit UNO R4 WiFi port and command confirmation required.";}
+    let handle=io.open(port,115200);if not handle.ok {return map{ok:false,error:"Serial open failed.",opened:false};}
+    let state=map{identity_matched:false,play_attempted:false,reply:nil,error:"",stop_confirmed:false};
+    let completed=try execute(io,handle,p,command,state) catch false;
+    if not completed and state.identity_matched and state.play_attempted {
+        let stopped=try exchange(io,handle,p,"STOP",true) catch nil;
+        state.stop_confirmed=stopped!=nil;
+    }
+    let closed=try io.close(handle) catch map{ok:false,termios_restored:false};
+    if not closed.ok and state.error=="" {state.error="Serial close or restoration was not confirmed.";}
+    state.ok=completed and closed.ok;state.opened=true;state.command=command;
+    state.output_uncertain=state.error!="" and state.play_attempted and not state.stop_confirmed;
+    state.close_ok=closed.ok;state.termios_restored=closed.termios_restored;
+    state.finite_device_limit_ms=p.total_ms;return state;
+}
+fn linux_transport() {return map{open:Serial.open_port,flush:Serial.flush_input,write:Serial.write_bytes,
+    read:Serial.read_bytes,close:Serial.close,now:now_ms,nonce:nonce};}
+fn run(plan,port,command,confirmed=false) {return run_with(linux_transport(),plan,port,command,confirmed);}
+export nonce,response,exchange,run_with,linux_transport,run;
