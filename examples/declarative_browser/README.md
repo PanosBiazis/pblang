@@ -717,3 +717,41 @@ python3 tests/tooling/reader_focus_indicator_native.py --install-root /home/USER
 The native driver reuses the source-hidden synthetic-data harness and additionally
 requires Pillow for read-only screenshot pixel inspection. Inspect the screenshots
 as well as the machine results; the profile/Reload journey remains a separate test.
+
+### Large imported blocks and recoverable pagination
+
+A valid imported 256-character heading can need more than 64 rows after native
+font measurement at maximum magnification. The reader now requests an explicit
+256-row refinement budget for each canonical block. `text_fit.lines` retains its
+64-row default for existing callers and accepts an optional final `max_rows`
+integer from 1 to 256 for measured refinement. Shared `text_flow`, Unicode
+clustering, document admission limits and native input remain unchanged. A truly
+unfittable text cluster still produces an unavailable layout.
+
+The existing overall limit stays at 512 pages. When a narrow/short viewport and
+large text exceed it, the reader presents its existing space/Style recovery view
+instead of throwing out of the application. It keeps the canonical document and
+logical reading anchor; enlarging the viewport recomputes the complete layout.
+No document is truncated or partially presented as complete. No new import UI,
+file access or persistence field is introduced: imported documents use the
+existing `browser_session`/`browser_document` interfaces.
+
+`reader_large_document_test.sapp` covers native-like wide glyphs, combining groups,
+complete title/block/link coverage, budget validation, anchor recovery and the
+maximum eight-block document. The native test imports synthetic HTML into the
+real reader controller and uses a real window font measurement callback. It
+visits every resulting page, verifies exact text draw calls, checks Style and
+focus across resize/reflow, and opens the final canonical local link. Its test
+fixture writes only to an isolated probe directory; the package is mounted
+read-only and the checkout/home are absent. `--baseline` explicitly reproduces
+the old failure and does not claim successful reading.
+
+```sh
+pblang run tests/semantics/reader_large_document_test.sapp --allow-all --deny-fs --deny-exec --deny-net --deny-http --deny-spawn
+python3 tests/tooling/reader_large_document_native.py --package /absolute/reader-release --evidence /absolute/NEW_EVIDENCE
+```
+
+This is Linux/X11 evidence for the installed modules and test-owned imported
+session. The normal launcher still opens its existing bundled documents; its
+separate focus/launch acceptance remains applicable. Other platforms, arbitrary
+HTML, unlimited documents and physical screen-reader support are not claimed.
