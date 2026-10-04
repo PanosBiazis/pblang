@@ -125,8 +125,15 @@ The editor starts with a heart. State is memory-only until explicitly exported.
 Closing/restarting discards unexported work. Reopen a saved export using **Import**:
 - Native: enter its local path and click Import. The existing secure file reader
   rejects symlinks/unsafe paths and reads at most 128 KiB; no fallback reader.
-- Web: open your exported JSON in a text editor, paste its contents into **Paste
-  exported JSON**, then click **Import JSON**. There is no file upload picker.
+- Web: paste exported JSON and click **Import JSON**, or leave the paste box empty
+  and click **Import JSON · choose file** to open the browser's native file dialog.
+  After choosing a file, click **Import selected file** to confirm. Canceling the
+  dialog sends no request and preserves the project. Pasted text takes priority
+  by hiding the file controls; clear the box to switch back to file selection.
+  Whitespace-only pasted text is still input and receives normal JSON validation.
+  The picker requires browser file-input support; embedded wrappers must supply
+  that capability separately. Older browsers without CSS `:has` show both explicit
+  alternatives. No JavaScript or automatic upload is added.
 
 Successful import replaces the timeline, selects frame 1, stops playback and clears
 text input and resets preview repetitions to 1. Invalid input keeps the document, selection and playback state; only
@@ -229,7 +236,12 @@ separate local counter is described above.
 
 `exchange.sapp` owns strict export-envelope import; `playback.sapp` generates the
 bounded SVG preview; `web_import.sapp` separates the bounded paste payload before
-the existing form handler checks Host/origin/CSRF/revision. The Web transport is
+the existing form handler checks Host/origin/CSRF/revision. `web_upload.sapp`
+validates a separate, bounded multipart file form and routes it through those same
+guards and the existing atomic import action. Its token belongs to the editor
+revision: stale tabs cannot overwrite newer edits. Filenames are ignored and
+never used as server paths; no uploaded files are persisted. Duplicate fields,
+extra parts, malformed framing and oversized payloads fail closed. The Web transport is
 capped at 401408 bytes to allow percent-encoding of a 128 KiB export plus form
 fields; decoded input is still capped at 128 KiB. The bounded listener allows
 5 seconds to receive a request and polls acceptance at 1 ms so large paste
@@ -268,6 +280,9 @@ pblang run tests/semantics/uno_r4_led_studio_test.sapp --allow-all
 pblang run tests/semantics/uno_r4_led_studio_combinations_test.sapp --allow-all
 pblang run tests/semantics/uno_r4_led_studio_web_test.sapp --allow-all
 pblang run tests/semantics/uno_r4_led_studio_import_test.sapp --allow-all
+pblang run tests/semantics/uno_r4_led_studio_upload_test.sapp --allow-all
+pblang run tests/semantics/uno_r4_led_studio_device_upload_test.sapp --allow-all
+pblang run tests/semantics/uno_r4_led_studio_transfer_test.sapp --allow-all
 pblang run tests/semantics/uno_r4_led_studio_counter_test.sapp --allow-all
 pblang run tests/semantics/uno_r4_led_studio_counter_web_test.sapp --allow-all
 python3 tests/tooling/uno_r4_led_studio_counter_http.py
