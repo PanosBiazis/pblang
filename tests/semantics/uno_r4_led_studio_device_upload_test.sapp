@@ -1,0 +1,102 @@
+let Upload=import("../../examples/uno_r4_led_studio/device_upload.sapp");
+let Device=import("../../examples/uno_r4_led_studio/device_export.sapp");
+let Model=import("../../examples/uno_r4_led_studio/model.sapp");
+let config=map{enabled:true,confirmed:true,cli:"/trusted/arduino-cli",cli_sha256:str_repeat("a",64),
+    config_file:"/trusted/arduino.yaml",output_parent:"/private/jobs",port:"/dev/ttyACM0",firmware:"",adapter:""};
+let plan=Device.plan(Model.create().document,1);
+fn fixture(){
+    let s=map{calls:[],ready:false,success:true,terminated:true,release_ok:true,
+        starts:0,releases:0,unpins:0,cancels:0,prepare_fail:false,start_fail:false,
+        start_active_failure:false,poll_fail:false,finish_fail:false};
+    let io=map{
+        persist:fn(c,p){return true;},
+        pin:fn(c){return map{ok:true};},
+        unpin:fn(p){s.unpins=s.unpins+1;return map{ok:true};},
+        prepare:fn(c,p,slot){if s.prepare_fail {throw "private path secret";}push(s.calls,"prepare");return map{ok:true,sketch:"/private/job",build:"/private/job/build"};},
+        start:fn(p,args,options){
+            s.starts=s.starts+1;push(s.calls,map{args:args,options:options});
+            if s.start_fail {return map{ok:false};}
+            return map{ok:not s.start_active_failure,active:true,requires_recovery:s.start_active_failure,cleaned:false};
+        },
+        poll:fn(h){if s.poll_fail {throw "private process failure";}return map{ok:true,complete:s.ready,terminated:false};},
+        finish:fn(h,wait){if s.finish_fail {throw "private finish failure";}h.cleaned=s.terminated;return map{command_ok:s.success,process_group_terminated:s.terminated,timed_out:false,stdout:"private output",stderr:"private path"};},
+        cancel:fn(h,grace){s.cancels=s.cancels+1;return map{ok:true};},
+        release:fn(job){s.releases=s.releases+1;return s.release_ok;}
+    };
+    return map{state:s,io:io};
+}
+fn reject(work){return try {work();false} catch true;}
+let bad=json_parse(json_stringify(config));bad.enabled=false;
+assert(reject(fn(){Upload.create(bad,fixture().io);}),"upload requires explicit opt-in");
+bad=json_parse(json_stringify(config));bad.port="/dev/ttyACM0; touch /tmp/bad";
+assert(reject(fn(){Upload.create(bad,fixture().io);}),"untrusted port rejected");
+bad=json_parse(json_stringify(config));bad.cli="../arduino-cli";
+assert(reject(fn(){Upload.create(bad,fixture().io);}),"relative executable rejected");
+let f=fixture();let u=Upload.create(config,f.io);
+assert(not u.start(plan,false).ok and f.state.starts==0,"STOP confirmation required");
+let invalid=json_parse(json_stringify(plan));invalid.digest="bad";
+assert(not u.start(invalid,true).ok and f.state.starts==0,"invalid plan has no effects");
+let r=u.start(plan,true);
+assert(r.ok and r.phase=="compiling" and r.busy and not r.upload_attempted and f.state.starts==1,"compile begins first");
+assert(not u.start(plan,true).ok and f.state.starts==1,"duplicate start cannot spawn another process");
+assert(u.poll().phase=="compiling" and f.state.starts==1,"pending poll does not upload");
+let compile=f.state.calls[1];
+assert(compile.args[0]=="--config-file" and compile.args[1]==config.config_file
+    and compile.args[2]=="compile" and compile.args[6]=="1","fixed single-worker compile argv");
+assert(not compile.options.inherit_environment and compile.options.max_output_bytes==16384
+    and compile.options.timeout_secs==120 and compile.options.max_processes==4096
+    and compile.options.environment.GOMAXPROCS=="2","bounded process settings and scrubbed environment");
+f.state.ready=true;r=u.poll();
+assert(r.phase=="uploading" and r.upload_attempted and f.state.starts==2,"upload follows verified compile cleanup");
+let upload=f.state.calls[2];
+assert(upload.args[2]=="upload" and upload.args[6]=="/dev/ttyACM0","fixed host port only");
+r=u.poll();
+assert(r.ok and r.phase=="done" and r.complete and not r.busy and r.cleanup_confirmed
+    and f.state.releases==1 and r.project_digest==plan.digest,"terminal cleanup precedes success");
+assert(not str_contains(json_stringify(r),"private") and not str_contains(json_stringify(r),"/trusted")
+    and not r.automatic_play,"no path/output leakage or automatic playback");
+assert(u.confirm(plan).ok,"only completed plan can persist");
+u.close();assert(f.state.unpins==1,"close releases pinned executable once");u.close();assert(f.state.unpins==1,"close idempotent");
+assert(not u.start(plan,true).ok,"closed uploader cannot restart");
+// Compile failure never attempts firmware replacement.
+f=fixture();u=Upload.create(config,f.io);u.start(plan,true);f.state.ready=true;f.state.success=false;r=u.poll();
+assert(r.phase=="failed" and not r.upload_attempted and f.state.starts==1 and f.state.releases==1,"failed compile cannot upload");u.close();
+// Uncertain termination retains ownership and blocks the next process.
+f=fixture();u=Upload.create(config,f.io);u.start(plan,true);f.state.ready=true;f.state.terminated=false;r=u.poll();
+assert(r.busy and not r.cleanup_confirmed and r.phase=="cancelling" and f.state.starts==1
+    and f.state.releases==0,"uncertain cleanup retains job and process");
+f.state.terminated=true;r=u.poll();assert(r.phase=="failed" and not r.upload_attempted,"recovery cannot resume cancelled compile");u.close();
+// Closing during compile cancels; subsequent polling can complete cleanup.
+f=fixture();u=Upload.create(config,f.io);u.start(plan,true);r=u.close();
+assert(r.phase=="cancelling" and r.busy and f.state.unpins==0,"close retains live process authority");
+f.state.ready=true;r=u.poll();assert(r.phase=="failed" and f.state.starts==1 and f.state.unpins==1,"closed compile cannot start upload");
+// Failed start with a live group is retained for recovery.
+f=fixture();f.state.start_active_failure=true;u=Upload.create(config,f.io);r=u.start(plan,true);
+assert(r.busy and r.phase=="cancelling" and f.state.releases==0,"partially started process remains owned");f.state.ready=true;u.poll();u.close();
+// File preparation and failed process admission do not expose exception content.
+f=fixture();f.state.prepare_fail=true;u=Upload.create(config,f.io);r=u.start(plan,true);
+assert(r.phase=="failed" and f.state.starts==0 and not str_contains(r.message,"secret"),"preparation failure redacted");u.close();
+f=fixture();f.state.start_fail=true;u=Upload.create(config,f.io);r=u.start(plan,true);
+assert(r.phase=="failed" and not r.busy and f.state.releases==1,"failed launch releases job descriptor");u.close();
+// A cleanup failure poisons future admission.
+f=fixture();f.state.release_ok=false;u=Upload.create(config,f.io);u.start(plan,true);f.state.ready=true;u.poll();r=u.poll();
+assert(not r.ok and not r.cleanup_confirmed and not u.start(plan,true).ok,"uncertain directory cleanup blocks reuse");u.close();
+// Poll/finish exceptions redact internals and retain ownership until recovery.
+f=fixture();u=Upload.create(config,f.io);u.start(plan,true);f.state.poll_fail=true;r=u.poll();
+assert(r.busy and r.phase=="cancelling" and f.state.releases==0,"poll exception preserves handle");
+f.state.poll_fail=false;f.state.ready=true;r=u.poll();assert(r.phase=="failed" and not r.busy,"poll failure recovery cannot upload");u.close();
+f=fixture();u=Upload.create(config,f.io);u.start(plan,true);f.state.ready=true;f.state.finish_fail=true;r=u.poll();
+assert(r.busy and not r.cleanup_confirmed and f.state.releases==0,"finish exception preserves ownership");
+f.state.finish_fail=false;r=u.poll();assert(r.phase=="failed" and f.state.starts==1,"finish recovery cannot trigger upload");u.close();
+// Caller mutations cannot change the already-authorized host configuration.
+let mutable=json_parse(json_stringify(config));f=fixture();u=Upload.create(mutable,f.io);
+mutable.port="/dev/ttyACM55";mutable.config_file="/other/settings";
+u.start(plan,true);assert(not u.confirm(plan).ok,"pending project cannot persist");
+f.state.ready=true;u.poll();assert(f.state.calls[2].args[6]=="/dev/ttyACM0"
+    and f.state.calls[2].args[1]==config.config_file,"configuration detached at creation");
+u.poll();assert(not u.confirm(invalid).ok,"invalid plan cannot persist");u.close();
+// At most four retained artifact slots; no unbounded history.
+f=fixture();u=Upload.create(config,f.io);f.state.ready=true;
+for _i 4 {u.start(plan,true);u.poll();assert(u.poll().phase=="done","bounded repeated upload");}
+assert(not u.start(plan,true).ok and f.state.starts==8,"fifth job rejected before work");u.close();
+print "uno_r4_led_studio_upload_pass";
