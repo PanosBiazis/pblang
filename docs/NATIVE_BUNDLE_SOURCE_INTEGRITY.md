@@ -1,9 +1,69 @@
 # Retained native bundle source-integrity limitation
 
 The retained PBLang 0.6.0 executable can truncate the source entry while reporting
-success for `pblang bundle . OUT`. Do not use this invocation on an original
-project. Updating PBLang-written compiler libraries does **not** fix this native
-command.
+success for `pblang bundle . OUT`. The Linux launcher described below blocks
+native `bundle` before dispatch. The underlying executable remains defective:
+do not invoke its `bundle` command directly on an original project. Updating
+PBLang-written compiler libraries does **not** fix this native command.
+
+## Linux public-entry guard
+
+[`tools/pblang-launch.sh`](../tools/pblang-launch.sh) is a small Linux exec bridge
+for a versioned installation. It resolves the invoked symlink with GNU
+`/usr/bin/readlink -f`, then runs
+[`tools/native_bundle_guard.sapp`](../tools/native_bundle_guard.sapp) under
+`--sandbox`. The policy has no imports and denies **every** invocation whose
+first argument is exactly `bundle`, including help, self-extract, absolute,
+relative, overlapping and symlink destinations. No package is read or written
+by this policy. The guard's own source must still be loaded by the retained host.
+
+The bridge requires both a successful guard process and its exact admission
+marker. Missing, empty or malformed guard files fail closed. It passes a single
+prefixed command token through the native argv array, rather than the lossy
+newline-separated `PBLANG_SCRIPT_ARGS` channel. Its guard cannot consume stdin.
+Accepted invocations use `exec` with the original argument boundaries, cwd,
+environment and streams. This adds one native process startup per invocation;
+no performance improvement is claimed. It does not filter the native help text,
+which still advertises the disabled command.
+
+The installed layout is:
+
+```text
+RELEASE/bin/pblang                         copy of tools/pblang-launch.sh (0755)
+RELEASE/bin/pblang-native                  retained native executable
+RELEASE/libexec/native_bundle_guard.sapp   copy of tools/native_bundle_guard.sapp
+RELEASE/tools/pbc.sapp                     existing compiler tool
+RELEASE/tools/pbpackage.sapp                existing source-folder tool
+RELEASE/stdlib/                            matching qualified libraries
+```
+
+Prepare a **new** release directory and preserve the previous release. Copy the
+retained executable to `bin/pblang-native`, the launcher to `bin/pblang`, and the
+guard to `libexec/native_bundle_guard.sapp`. Do not rename files inside an active
+release. Keep the native executable's bytes unchanged. Regenerate/validate the
+new release lock and qualify its tools, then run:
+
+```sh
+python3 tests/tooling/native_bundle_guard.py --native RELEASE/bin/pblang-native \
+  --repo CHECKOUT --launcher RELEASE/bin/pblang --report guard-checks.json
+```
+
+Only after acceptance, atomically replace the public `pblang` symlink with a link
+to `RELEASE/bin/pblang`; retain the old link target for rollback. Re-run the same
+contract with `--launcher` pointing at the actual public symlink. The optional
+`--reproduce-native` flag deliberately reproduces the known truncation **only in
+disposable fixtures inside a network-isolated bubblewrap sandbox**. All test
+source and destination trees are synthetic. Neither this wrapper nor the test
+is qualified for Windows/macOS; Linux requires `/bin/sh`, GNU readlink, and the
+tests additionally require Python 3 and bubblewrap.
+
+Protection applies only to entries routed through this launcher. Direct calls
+to `bin/pblang-native`, old release binaries, copied ELF files, or other product
+runtimes remain unprotected. This is source-integrity admission, not an access
+control boundary against a user who can replace the installation. It does not
+intercept `pack`, compiler output writes, application code or arbitrary native
+commands. Revisit the first-argument dispatch contract before changing the
+retained native executable. Rollback to an old ELF entry restores the old risk.
 
 ## Reproduced scope
 
@@ -53,9 +113,9 @@ therefore a copy of the entry onto itself and truncates it.
 The retained command needs a host fix: normalize the package root consistently,
 reject a failed relative-path derivation, and reject source/destination identity
 before writes, including manifest/lock/runtime copies. No such host change is
-included in the PBLang VM argument-count fix. There is no PBLang wrapper on the
-direct executable path that could reliably intercept this operation; a warning
-from the optional manifest validator is not a fail-closed guard.
+included in the retained executable. The public launcher now intercepts the
+operation when installed as described above; a warning from the optional
+manifest validator alone is not a fail-closed guard.
 
 ## Alternative routes
 
@@ -70,12 +130,15 @@ For the compiler's supported static module subset, `tools/pbc.sapp` with
 compiler route. It produces compiled bytecode, not the native command's portable
 source folder. The source-hidden compiler portability suite covers this route;
 see [compiler CLI portability](COMPILER_CLI_PORTABILITY.md). Use a fresh output
-path separate from every input. It is not a replacement for arbitrary source
-packages, dynamic imports, runtime assets or every host builtin.
+path separate from every input, including symlink aliases. The compiler's output
+writer is not protected by the native-command guard. It is not a replacement
+for arbitrary source packages, dynamic imports, runtime assets or every host
+builtin.
 
 For a source-folder distribution, stage an independent copy of the package and
 its required files, compare original hashes, regenerate/verify dependencies in
 that copy, and qualify it with original sources unavailable. Do not run the
 broken native relative-root command on the original package. This document
-records the defect and alternatives; it does not certify general bundle safety
-or repair a source file already truncated by an earlier invocation.
+records the defect, scoped launcher protection and alternatives; it does not
+certify general bundle safety or repair a source file already truncated by an
+earlier invocation.
