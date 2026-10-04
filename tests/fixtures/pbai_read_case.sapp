@@ -1,0 +1,59 @@
+let S=import("stdlib:llm_tiered_store.sapp");let D=import("stdlib:linux_dirfs.sapp");let F=import("streaming.sapp");
+let bytes=[1,2,3,4];let parts=[];
+for id in ["a","b","c"] {push(parts,S.model_part(id,id+".bin",4,sha256(base64_encode_bytes(bytes))));}
+fn start(facade,verify=true) {
+ let cfg=map{ram_budget_bytes:8,verify_sha256:verify,mirrors:[S.mirror("synthetic-two"),S.mirror("synthetic-three")]};
+ if facade {return F.open("synthetic-primary",parts,cfg);}
+ return S.create("synthetic-primary",parts,S.config(8,cfg));
+}
+fn load(facade,session,id) {if facade {return F.load_weight(session,id);}return S.load(session,id);}
+fn prefetch(facade,session) {if facade {return F.run_prefetch(session,2);}return S.run_prefetch(session,2);}
+let completed=0;
+for facade in [false,true] {
+ for mode in ["throw","false","nil","number","missing_ok","truthy_ok","numeric_ok","missing_bytes","wrong_bytes","wrong_size","corrupt"] {
+  for all in [false,true] {
+   D.configure();let session=start(facade);assert(session.ok,"fixture session created");
+   let retained=load(facade,session,"a");assert(retained.ok,"healthy cache seeded");let before=S.status(session);
+   D.behavior(mode,all);let result=load(facade,session,"b");let after=S.status(session);let calls=D.snapshot().reads;
+   assert(retained.bytes==bytes and after.ok,"failed mirror cannot alter prior output or close active session");
+   if all {
+    let expected="read";if mode=="wrong_size" {expected="size";}if mode=="corrupt" {expected="integrity";}
+    assert(not result.ok and result.code==expected and not map_has(result,"bytes"),"all failed mirrors return bounded error without bytes");
+    assert(len(calls)==3 and calls[0]!=calls[1] and calls[0]!=calls[2] and calls[1]!=calls[2],"each mirror attempted once");
+    assert(after.cached_shards==1 and after.resident_bytes==4 and after.stats.rejected_reads==before.stats.rejected_reads+1 and after.stats.verified_reads==before.stats.verified_reads,"all-read failure preserves healthy cache and exact counters");
+    let serialized=json_stringify(result);assert(not str_contains(serialized,"synthetic-private") and not str_contains(serialized,"synthetic-primary"),"raw backend text and roots excluded from failure");
+    D.behavior();let recovered=load(facade,session,"b");assert(recovered.ok and recovered.bytes==bytes,"later explicit load can recover");
+   } else {
+    assert(result.ok and result.bytes==bytes and result.verified and len(calls)==2 and calls[0]!=calls[1],"healthy second mirror serves verified bytes");
+    assert(after.cached_shards==2 and after.resident_bytes==8 and after.stats.mirror_failovers==before.stats.mirror_failovers+1 and after.stats.verified_reads==before.stats.verified_reads+1 and after.stats.rejected_reads==before.stats.rejected_reads,"failover counted exactly once without rejected request");
+   }
+   assert(S.close(session) and D.snapshot().closes==[1,2,3],"all directory owners remain closable");completed=completed+1;
+  }
+ }
+ for mode in ["ok","throw","false","wrong_size"] {
+  for queued in [false,true] {
+   D.configure();let session=start(facade);let retained=load(facade,session,"a");let closed=map{snapshot:nil};
+   if queued {assert(S.queue_prefetch(session,["b","c"]).ok,"prefetch work queued");}
+   D.behavior(mode,true,fn(){assert(S.close(session),"close inside pending read");closed.snapshot=json_stringify(S.status(session));});
+   let result=map{};if queued {result=prefetch(facade,session);}else {result=load(facade,session,"b");}
+   assert(not result.ok and not map_has(result,"bytes"),"closed in-flight operation cannot publish bytes");
+   if queued {assert(result.completed==[] and len(result.failed)==1 and result.failed[0].code=="closed" and result.queued==0,"prefetch stops after terminal close");}
+   else {assert(result.code=="closed","terminal close takes precedence over read outcome");}
+   let after=S.status(session);
+   assert(not after.ok and after.cached_shards==0 and after.resident_bytes==0 and after.queued_prefetch==0,"late result cannot repopulate closed cache or queue");
+   assert(json_stringify(after)==closed.snapshot and retained.bytes==bytes,"no post-close counters change and old output survives");
+   assert(len(D.snapshot().reads)==1 and D.snapshot().closes==[1,2,3] and not S.close(session),"no next mirror or repeated cleanup after close");completed=completed+1;
+  }
+ }
+ D.configure();let batch=start(facade);assert(load(facade,batch,"a").ok,"seed batch cache");
+ D.behavior("throw",true,nil,"b.bin");assert(S.queue_prefetch(batch,["b","c"]).ok,"mixed batch queued");let result=prefetch(facade,batch);
+ assert(not result.ok and result.completed==["c"] and len(result.failed)==1 and result.failed[0].id=="b" and result.failed[0].code=="read" and result.queued==0,"failed shard does not strand the next prefetch item");
+ assert(len(D.snapshot().reads)==4 and S.status(batch).stats.prefetched==1 and S.status(batch).resident_bytes==8 and S.close(batch),"bounded batch effects and cleanup");completed=completed+1;
+ for mode in ["truthy_ok","numeric_ok"] {
+  D.configure(mode,true);let session=start(facade,false);let rejected=load(facade,session,"b");
+  assert(not rejected.ok and rejected.code=="read" and len(D.snapshot().reads)==3 and S.status(session).cached_shards==0,"read result success must be boolean even without digest verification");
+  assert(S.close(session),"unverified-read session closes");completed=completed+1;
+ }
+}
+assert(completed==66,"all exact-source direct and facade cases executed");
+print "pbai_read_fault_cases_pass:66";

@@ -166,3 +166,44 @@ exercise invalid-plan rejection and successful real directory cleanup.
 This is bounded synchronous initialization cleanup, not a guarantee against native
 crashes, process termination, allocation/OOM failure, malicious raw session mutation,
 or unreturned backend owners. No general cross-platform or performance claim is made.
+
+
+## Read failures, mirror failover and terminal results
+
+A confined read must return a map with an explicit boolean `ok:true` before its bytes
+are considered. Missing fields, non-map responses and truthy non-boolean success flags
+are failures, including when digest verification is explicitly disabled. Existing
+array/length/digest checks remain in place; rejected envelopes and failed checks
+expose no bytes. The trusted directory backend still owns the scalar byte-array
+representation contract; this change does not add a general object validator.
+
+Each root read is now an exception boundary. A caught backend or decoding exception
+becomes the fixed `read` error `shard is not readable`, and the next configured mirror
+is attempted. Raw backend error text is not retained or returned. Each root is tried
+at most once per load; the existing maximum is 65 roots including the primary. When
+all roots fail, the existing last-attempt error policy applies, `rejected_reads`
+increases once, and healthy resident cache entries and prior caller bytes survive.
+A later explicit load can recover. A successful fallback increments `verified_reads`
+and `mirror_failovers` once, without counting the overall request as rejected.
+
+After every attempted read, the session is checked again before accepting bytes or
+updating read-success/rejection counters. If it closed during the backend call, the
+load returns `closed` and no further mirror is tried. A late success cannot repopulate
+the cache or publish bytes. Prefetch reports that item as closed, leaves the cleared
+queue empty and starts no next item. For an ordinary read failure while still open,
+prefetch reports the failed item and continues its remaining bounded work.
+
+Sixty-six exact-source direct/standalone-facade fixtures cover eleven read failure
+forms, healthy fallback versus exhausted mirrors, cache preservation and later
+recovery, mixed failed/successful prefetch, strict success flags without digest
+verification, and close callbacks during load/prefetch with multiple read outcomes.
+They simulate backend responses and own no OS descriptors. The existing real-file
+store suites remain separate integration checks. The paired source-hidden installed
+examples corrupt the selected preferred on-disk shard, recover verified bytes from
+the other real root, and confirm successful cleanup of both directory handles.
+
+This is synchronous control-flow containment. It does not reclaim descriptors a
+backend failed to return, prove real native/syscall recovery, preempt a blocked read,
+add asynchronous cancellation or guarantee multi-threaded atomicity. Direct mutation
+of the trusted session/config/manifest remains outside this contract. No performance,
+universal platform, AGI or ASI claim follows from these fixtures.
