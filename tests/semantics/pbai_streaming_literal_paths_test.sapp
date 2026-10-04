@@ -1,0 +1,65 @@
+assert(platform()=="linux","literal path integration requires Linux");
+let S=import("stdlib:llm_tiered_store.sapp");let U=import("stdlib:uuid.sapp");
+fn open(root,parts,options) {return S.create(root,parts,S.config(try options.ram_budget_bytes catch 16,options));}
+fn load(session,id) {return S.load(session,id);}
+fn close(session) {return S.close(session);}
+fn status(session) {return S.status(session);}
+fn prefetch(session,count) {return S.run_prefetch(session,count);}
+let state=env_get("PBAI_STATE_ROOT");assert(type(state)=="string" and state!="","private synthetic state required");
+let base=path_join(state,"literal-shards-"+U.v4());let step=map{label:"setup",scenarios:0};
+fn part(id,path,bytes) {return S.model_part(id,path,len(bytes),sha256(base64_encode_bytes(bytes)));}
+fn run(command,args) {let result=proc_spawn_wait(command,args);assert(result.exit_code==0,"owned filesystem operation succeeded");}
+fn rejected(root,path,bytes) {
+ let session=open(root,[part("weight",path,bytes)],map{ram_budget_bytes:16});assert(session.ok,"accepted safe manifest path");
+ let result=load(session,"weight");assert(not result.ok and not map_has(result,"bytes"),"unreadable path returns no bytes");
+ assert(close(session),"rejected read retains closable owner");step.scenarios=step.scenarios+1;
+}
+fn exercise() {
+ let bytes=[0,1,127,128,255];let files=path_join(base,"files");fs_mkdirs(files);
+ let rows=[["root",bytes],["root ",[2,0,255]],[" weights ",[3,0,128]],["βάρη.bin",[4,0,127]],["empty",[]],["weights.bin",[5,0,255]],["Root",[6,0,255]]];
+ let parts=[];let i=0;for row in rows {fs_write_bytes(path_join(files,row[0]),row[1]);push(parts,part("item-"+str(i),row[0],row[1]));i=i+1;}
+ step.label="literal names";let session=open(files,parts,map{ram_budget_bytes:64});assert(session.ok,"real literal-name session opens");i=0;
+ for row in rows {
+  let value=load(session,"item-"+str(i));assert(value.ok and value.bytes==row[1] and value.size==len(row[1]) and value.verified,"exact bytes for literal filename");
+  i=i+1;step.scenarios=step.scenarios+1;
+ }
+ let cached=load(session,"item-0");assert(cached.ok and cached.cache_hit and cached.bytes==bytes,"literal root is a normal cached shard");step.scenarios=step.scenarios+1;
+ assert(close(session),"literal-name session closes");
+ step.label="nested root components";let dirs=path_join(base,"dirs");fs_mkdirs(path_join(dirs,"root/root"));
+ fs_write_bytes(path_join(dirs,"root/item"),bytes);fs_write_bytes(path_join(dirs,"root/root/item"),bytes);
+ let nested=open(dirs,[part("one","root/item",bytes),part("two","root/root/item",bytes)],map{ram_budget_bytes:16});assert(nested.ok,"nested session opens");
+ for id in ["one","two"] {assert(load(nested,id).bytes==bytes,"root components remain literal");step.scenarios=step.scenarios+1;}
+ assert(close(nested),"nested session closes");
+ step.label="held root pathname replacement";let held=open(files,[part("weight","root",bytes)],map{ram_budget_bytes:0});assert(held.ok,"held root opens without cache");
+ run("/bin/mv",["--",files,path_join(base,"held")]);fs_mkdirs(files);fs_write_bytes(path_join(files,"root"),[9,9,9,9,9]);
+ let original=load(held,"weight");assert(original.ok and original.bytes==bytes and not original.cached and not original.cache_hit,"read stays on held descriptor after pathname replacement");
+ assert(close(held),"held root closes");step.scenarios=step.scenarios+1;
+ step.label="missing file";let missing=path_join(base,"missing");fs_mkdirs(missing);rejected(missing,"root",bytes);
+ step.label="final symlink";let links=path_join(base,"links");fs_mkdirs(links);let outside=path_join(base,"outside");fs_mkdirs(outside);fs_write_bytes(path_join(outside,"item"),bytes);
+ run("/bin/ln",["-s",path_join(outside,"item"),path_join(links,"root")]);rejected(links,"root",bytes);
+ step.label="intermediate symlink";let linkdirs=path_join(base,"linkdirs");fs_mkdirs(linkdirs);run("/bin/ln",["-s",outside,path_join(linkdirs,"root")]);rejected(linkdirs,"root/item",bytes);
+ step.label="directory is not shard bytes";rejected(dirs,"root",[]);
+ step.label="invalid manifest paths";let long="";for i 256 {long=long+"x";}
+ for path in ["",".","..","../root","/root","root/..","root/./x","root//x","root/","root\\x",strfromcharcode(0),long] {
+  let invalid=open(path_join(base,"unavailable"),[part("weight",path,bytes)],map{ram_budget_bytes:16});
+  assert(not invalid.ok and invalid.code=="manifest" and not close(invalid),"invalid path rejected before root acquisition");step.scenarios=step.scenarios+1;
+ }
+ step.label="literal mirror prefetch";let a=path_join(base,"mirror-a");let b=path_join(base,"mirror-b");fs_mkdirs(a);fs_mkdirs(b);
+ fs_write_bytes(path_join(a,"root"),bytes);fs_write_bytes(path_join(b,"root"),bytes);
+ let shards=[part("weight","root",bytes)];let opts=map{ram_budget_bytes:16,mirrors:[S.mirror(b)]};let mirrored=open(a,shards,opts);assert(mirrored.ok,"literal mirror session opens");
+ let preferred=S.weighted_root_for(mirrored,"weight");fs_write_bytes(path_join(preferred,"root"),[8,8,8,8,8]);
+ assert(S.queue_prefetch(mirrored,["weight"]).ok,"literal root queued");let prefetched=prefetch(mirrored,1);
+ assert(prefetched.ok and prefetched.completed==["weight"],"literal root prefetched via healthy mirror");let result=load(mirrored,"weight");
+ assert(result.ok and result.bytes==bytes and result.cache_hit and status(mirrored).stats.mirror_failovers==1 and status(mirrored).stats.prefetched==1,"literal mirror and prefetch counters preserved");
+ assert(close(mirrored) and status(mirrored).cleanup.confirmed_handles==2,"both mirror handles close");step.scenarios=step.scenarios+1;
+ step.label="all mirrors corrupt";fs_write_bytes(path_join(a,"root"),[8,8,8,8,8]);fs_write_bytes(path_join(b,"root"),[8,8,8,8,8]);
+ let corrupt=open(a,shards,opts);let bad=load(corrupt,"weight");assert(not bad.ok and bad.code=="integrity" and not map_has(bad,"bytes") and status(corrupt).resident_bytes==0,"corrupt literal files fail integrity without caching bytes");
+ assert(close(corrupt),"corrupt mirrors close");step.scenarios=step.scenarios+1;
+ step.label="bounded literal read";let limited=open(a,[part("weight","root",[8,8,8,8])],map{ram_budget_bytes:16,max_shard_bytes:4});
+ assert(limited.ok,"declared bounded manifest accepted");let oversized=load(limited,"weight");assert(not oversized.ok and not map_has(oversized,"bytes"),"actual file exceeding limit yields no bytes");
+ assert(close(limited),"bounded-read session closes");step.scenarios=step.scenarios+1;
+}
+let passed=try {exercise();true} catch false;
+let removed=proc_spawn_wait("/bin/rm",["-rf","--",base]);assert(removed.exit_code==0,"private synthetic tree removed");
+assert(passed,"literal path scenario: "+step.label);assert(step.scenarios==30,"all thirty real filesystem scenarios ran");
+print "pbai_literal_paths_pass:30";
