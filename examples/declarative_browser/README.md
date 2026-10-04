@@ -268,7 +268,7 @@ Developers may call `App.settings_page(reader,index)` (zero-based, clamped, fals
 when unavailable or unchanged). The example-local `settings_layout.plan(height,
 anchor, total=5)` computes capacity and visible indices without opening a window;
 anchor is a zero-based choice index, and height uses the existing GUI bounds
-240–4320. The optional preferences workflow uses `total=8` to include its actions. Shared GUI
+240–4320. The optional preferences workflow uses `total=8` for its actions, or `total=9` with explicit reload. Shared GUI
 contracts and Web/Android exporters remain unchanged.
 
 ```sh
@@ -560,7 +560,7 @@ Startup only reads. Missing settings use the existing defaults. Invalid, unknown
 noncanonical or oversized profiles cannot silently change the appearance or be
 rewritten during startup. The UI reports fallback to defaults or session-only
 operation. Save failures keep the chosen draft and the currently applied style;
-an uncertain publication disables further Save until a restart checks the disk.
+an uncertain publication disables further Save until an explicit successful reload or a restart checks the disk.
 
 With `--with-profile`, installed releases discover their own marked installation root and use
 `data/reader-style/appearance-v1.json`. Releases and recovery snapshots remain
@@ -611,13 +611,54 @@ hostile-concurrent-process or universal-filesystem guarantee.
 
 Developer integration is additive: `App.create()` and `App.configure()` retain
 their original pure/session behavior. Opt in with
-`App.enable_preferences(controller, appearance, save_callback, message)`.
+`App.enable_preferences(controller, appearance, save_callback, message, reload_callback=nil)`.
 The callback receives the complete validated style and returns an `ok` result;
 `attempted` signals uncertain publication and `reload` signals a stale revision.
 The app owns the draft/Apply/Save/Reset interaction; storage remains injectable.
 The standalone `appearance_store` owns local I/O, while `appearance_profile` and
 controller tests remain usable with filesystem/network/FFI effects denied.
 The new actions also participate in the existing bounded settings pagination.
+
+#### Explicit reload without restart
+
+With `--with-profile`, **Reload saved style** reads the selected profile once. A
+successful reload replaces both the draft and the currently applied appearance
+with the valid saved style, and renews the revision used by the next Save. The
+button deliberately discards unapplied choices; use Apply first only if you want
+to keep them temporarily before deciding to reload. Reload never writes a file,
+creates a profile, or retries a failed Save. There is no background polling.
+
+After a stale or uncertain Save, Save stays disabled until reload succeeds. If
+the profile is missing, invalid, oversized, nonprivate or otherwise unavailable,
+reload preserves the current applied style **and** draft, reports the failure,
+and leaves Save disabled. Repair/restore the external profile and reload again,
+or restart to use the existing startup fallback/explicit first-save behavior.
+The original startup defaults and explicit invalid-profile repair remain unchanged.
+Another writer can still change the profile immediately after a successful read;
+the existing revision check rejects the next stale Save again. Local advisory
+locking and trusted same-user assumptions are unchanged.
+
+The optional reload callback takes no arguments and must return
+`{ok:true, appearance:complete_validated_style, save:renewed_save_callback}`.
+Malformed results and thrown errors preserve both styles and disable Save. The
+additive `App.reload_preferences(controller)` performs the same explicit action
+and returns a boolean. No callback means no Reload button; previous four-argument
+callers and default/session-only launchers retain their earlier behavior. The
+native adapter reuses `Store.load` and `Store.save`; it reloads the chosen location
+without rediscovering environment overrides or changing launcher capabilities.
+All nine controls remain available through the existing compact settings pages.
+
+```sh
+pblang run tests/semantics/reader_reload_test.sapp --allow-all --deny-fs --deny-net --deny-http --deny-exec --deny-spawn --deny-ffi
+python3 tests/tooling/reader_reload_native.py --package /absolute/candidate --evidence /absolute/NEW_RELOAD_EVIDENCE
+python3 tests/tooling/reader_reload_native.py --install-root /home/USER/.local/share/pb-document-reader --launcher /home/USER/.local/bin/pb-document-reader --evidence /absolute/NEW_INSTALLED_RELOAD_EVIDENCE
+```
+
+The reload journey runs a second PBLang writer against synthetic data, induces a
+GUI conflict, reloads and saves without restarting that GUI process. It checks
+repeated invalid/UTF-8/oversized/missing reads without writes, renewed conflicts
+after external churn, restart persistence, and default deny-exec/no-write behavior.
+It reuses the source-hidden package/installed harness; review its screenshots.
 
 Tests for this extension:
 
