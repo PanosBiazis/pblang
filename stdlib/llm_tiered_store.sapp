@@ -291,6 +291,9 @@ fn create(root, shards, cfg = nil) {
         cache: map{},
         resident_bytes: 0,
         prefetch_queue: [],
+        prefetch_running: false,
+        prefetch_cancelled: false,
+        prefetch_active_id: nil,
         heat: map{},
         last: map{},
         clock: 0,
@@ -542,6 +545,7 @@ fn rebalance_hot(store) {
 }
 
 fn _queued(store, id) {
+    if store.prefetch_active_id == id { return true; }
     let i = 0;
     while i < len(store.prefetch_queue) {
         if store.prefetch_queue[i] == id { return true; }
@@ -576,15 +580,32 @@ fn queue_prefetch(store, ids) {
     };
 }
 
-fn run_prefetch(store, max_items = 1) {
+// Cancel pending work only. An already-started synchronous load may finish.
+fn cancel_prefetch(store) {
     if not _open(store) { return _closed(); }
-    let limit = _int(max_items, 1, 0, store.config.prefetch_capacity);
+    let cancelled = store.prefetch_queue;
+    store.prefetch_queue = [];
+    if store.prefetch_running { store.prefetch_cancelled = true; }
+    return map{ok:true,format:"pblang.llm.prefetch_cancel.v1",cancelled:cancelled,
+        running:store.prefetch_running,queued:0};
+}
+
+fn _run_prefetch(store, limit) {
     let completed = [];
     let failed = [];
     let processed = 0;
-    while processed < limit and processed < len(store.prefetch_queue) {
-        let id = store.prefetch_queue[processed];
+    while processed < limit and len(store.prefetch_queue) > 0 and _open(store)
+        and not store.prefetch_cancelled {
+        let id = store.prefetch_queue[0];
+        // Detach only this item before effects; preserve any later queue edits.
+        let remaining = []; let i = 1;
+        while i < len(store.prefetch_queue) {
+            array_push(remaining, store.prefetch_queue[i]); i = i + 1;
+        }
+        store.prefetch_queue = remaining;
+        store.prefetch_active_id = id;
         let loaded = load(store, id, false);
+        store.prefetch_active_id = nil;
         if loaded.ok {
             if map_has(store.cache, id) {
                 store.cache[id].prefetched = true;
@@ -596,20 +617,28 @@ fn run_prefetch(store, max_items = 1) {
         }
         processed = processed + 1;
     }
-    let remaining = [];
-    let i = processed;
-    while i < len(store.prefetch_queue) {
-        array_push(remaining, store.prefetch_queue[i]);
-        i = i + 1;
-    }
-    store.prefetch_queue = remaining;
     return map{
-        ok: len(failed) == 0,
+        ok: len(failed) == 0 and not store.prefetch_cancelled,
         format: "pblang.llm.prefetch_run.v1",
         completed: completed,
         failed: failed,
-        queued: len(remaining)
+        queued: len(store.prefetch_queue),
+        cancelled: store.prefetch_cancelled
     };
+}
+
+fn run_prefetch(store, max_items = 1) {
+    if not _open(store) { return _closed(); }
+    if store.prefetch_running { return _error("busy", "prefetch is already running"); }
+    let limit = _int(max_items, 1, 0, store.config.prefetch_capacity);
+    store.prefetch_running = true;
+    store.prefetch_cancelled = false;
+    let result = try _run_prefetch(store, limit)
+        catch _error("prefetch", "prefetch execution failed");
+    store.prefetch_running = false;
+    store.prefetch_active_id = nil;
+    store.prefetch_cancelled = false;
+    return result;
 }
 
 fn _expert_id(store, layer_index, expert_index) {
@@ -736,6 +765,8 @@ fn capability() {
         ],
         placement_changes_semantics: false,
         asynchronous_io: false,
+        cooperative_prefetch_cancellation: true,
+        preempts_active_read: false,
         gpu_transfer_backend: false,
         note: "Prefetch execution is synchronous until PBLang gains portable async read-at handles."
     };
@@ -743,6 +774,6 @@ fn capability() {
 
 export FORMAT, MAX_SHARDS, MAX_MIRRORS, DEFAULT_MAX_SHARD_BYTES;
 export model_part, mirror, config, create, load, unpin, rebalance_hot;
-export weighted_root_for, queue_prefetch, run_prefetch;
+export weighted_root_for, queue_prefetch, run_prefetch, cancel_prefetch;
 export record_routes, predict_experts, queue_expert_prefetch;
 export status, close, capability;

@@ -1,0 +1,86 @@
+let S=import("stdlib:llm_tiered_store.sapp");let D=import("stdlib:linux_dirfs.sapp");
+let F=import("streaming.sapp");let E=import("embedded.sapp");
+let bytes=[1,2,3,4];let parts=[];
+for id in ["a","b","c"] {push(parts,S.model_part(id,id+".bin",4,sha256(base64_encode_bytes(bytes))));}
+fn start(mode) {
+ let options=map{ram_budget_bytes:16,prefetch_capacity:3,mirrors:[S.mirror("synthetic-two")]};
+ if mode==1 {return F.open("synthetic",parts,options);}
+ if mode==2 {return E.open("synthetic",parts,options);}
+ return S.create("synthetic",parts,S.config(16,options));
+}
+fn run(mode,session,count=3) {
+ if mode==1 {return F.run_prefetch(session,count);}
+ if mode==2 {return E.run_prefetch(session,count);}
+ return S.run_prefetch(session,count);
+}
+fn cancel(mode,session) {
+ if mode==1 {return F.cancel_prefetch(session);}
+ if mode==2 {return E.cancel_prefetch(session);}
+ return S.cancel_prefetch(session);
+}
+fn finish(session) {assert(S.close(session) and D.snapshot().closes==[1,2],"both simulated owners close once");}
+let cases=0;
+for mode in [0,1,2] {
+ for limit in [1,2] {
+  D.configure();let session=start(mode);let nested=map{result:nil};let cyclic=[];push(cyclic,cyclic);
+  assert(S.queue_prefetch(session,["a","b"]).accepted==["a","b"],"two items queued");
+  D.behavior("ok",false,fn(){let before=json_stringify(S.status(session));nested.result=run(mode,session,cyclic);assert(json_stringify(S.status(session))==before,"busy rejection is inert before argument coercion");});
+  let result=run(mode,session,limit);
+  assert(not nested.result.ok and nested.result.code=="busy","reentrant batch refused");
+  assert(result.ok and not result.cancelled and len(result.completed)==limit and len(D.snapshot().reads)==limit,"each started shard read once");
+  let after=S.status(session);assert(after.cached_shards==limit and after.resident_bytes==limit*4 and after.stats.prefetched==limit,"one cache charge per shard");
+  assert(result.queued==2-limit,"unprocessed queue preserved");
+  if limit==1 {D.behavior();let tail=run(mode,session,1);assert(tail.ok and tail.completed==["b"] and tail.queued==0,"later explicit batch consumes preserved item");}
+  finish(session);cases=cases+1;
+ }
+ D.configure();let session=start(mode);let retained=S.load(session,"a");assert(retained.ok,"seed resident bytes");D.behavior();
+ S.queue_prefetch(session,["b","c"]);let before=S.status(session);let cancelled=cancel(mode,session);
+ assert(cancelled.ok and not cancelled.running and cancelled.cancelled==["b","c"] and cancelled.queued==0,"cancel pending batch before reads");
+ let empty=run(mode,session);assert(empty.ok and empty.completed==[] and not empty.cancelled and len(D.snapshot().reads)==0,"cancelled queue performs no reads");
+ assert(S.status(session).resident_bytes==4 and json_stringify(S.status(session).stats)==json_stringify(before.stats) and retained.bytes==bytes,"cancellation preserves cache counters and caller bytes");
+ push(cancelled.cancelled,"a");assert(S.status(session).queued_prefetch==0,"cancel report is detached from live queue");
+ assert(cancel(mode,session).cancelled==[],"repeated empty cancel is inert");
+ S.queue_prefetch(session,["b"]);assert(run(mode,session).completed==["b"],"new explicit batch works after prior cancellation");finish(session);cases=cases+1;
+
+ D.configure();session=start(mode);S.queue_prefetch(session,["a","b"]);before=json_stringify(S.status(session));
+ let zero=run(mode,session,0);assert(zero.ok and zero.completed==[] and zero.queued==2 and not zero.cancelled and json_stringify(S.status(session))==before,"zero limit leaves pending work untouched");
+ cancel(mode,session);finish(session);cases=cases+1;
+
+ for outcome in ["ok","throw","false","corrupt"] {
+  for requeue in [false,true] {
+   D.configure();session=start(mode);S.queue_prefetch(session,["a","b"]);let signal=map{value:nil,busy:nil};
+   D.behavior(outcome,true,fn(){signal.value=cancel(mode,session);assert(signal.value.cancelled==["b"] and signal.value.running,"in-flight item excluded from cancellation report");
+    if requeue {assert(S.queue_prefetch(session,["a","c"]).accepted==["c"],"active id remains deduplicated while new work is accepted");}
+    signal.busy=run(mode,session);});
+   let stopped=run(mode,session);assert(not signal.busy.ok and signal.busy.code=="busy","cancel does not release active batch ownership");
+   assert(not stopped.ok and stopped.cancelled and stopped.queued==len(session.prefetch_queue),"active batch reports cooperative cancellation");
+   let expected=[];if requeue {expected=["c"];}assert(session.prefetch_queue==expected,"post-cancel newly queued work is not overwritten");
+   if outcome=="ok" {assert(stopped.completed==["a"] and stopped.failed==[] and len(D.snapshot().reads)==1 and S.status(session).resident_bytes==4,"already-started successful load completes once");}
+   else {assert(stopped.completed==[] and len(stopped.failed)==1 and stopped.failed[0].id=="a" and len(D.snapshot().reads)==2 and S.status(session).resident_bytes==0,"started failed load keeps bounded mirror policy and does not start next shard");}
+   let encoded=json_stringify(stopped);assert(not str_contains(encoded,"synthetic-private") and not str_contains(encoded,"synthetic-two"),"cancel output contains no raw backend diagnostics");
+   D.behavior();let resumed=run(mode,session);assert(resumed.ok and not resumed.cancelled and resumed.completed==expected,"only explicit next batch resumes preserved new work");
+   finish(session);cases=cases+1;
+  }
+ }
+ for do_cancel in [false,true] {
+  D.configure();session=start(mode);S.queue_prefetch(session,["a","b"]);let closed=map{snapshot:nil,result:nil,cancelled:nil};
+  D.behavior("ok",false,fn(){if do_cancel {cancel(mode,session);}assert(S.close(session),"close during read");closed.snapshot=json_stringify(S.status(session));closed.result=run(mode,session);closed.cancelled=cancel(mode,session);});
+  let result=run(mode,session);assert(not result.ok and result.completed==[] and len(result.failed)==1 and result.failed[0].code=="closed" and result.queued==0,"close refuses current bytes and further work");
+  assert(closed.result.code=="closed" and closed.cancelled.code=="closed","closed takes precedence over busy and cancel");
+  assert(json_stringify(S.status(session))==closed.snapshot and len(D.snapshot().reads)==1 and D.snapshot().closes==[1,2] and not S.close(session),"terminal close remains stable after active batch retires");cases=cases+1;
+ }
+ for invalid in [nil,false,1,"invalid",map{}] {
+  let old=json_stringify(invalid);let result=cancel(mode,invalid);assert(not result.ok and result.code=="closed" and json_stringify(invalid)==old,"invalid handle cancellation is inert");cases=cases+1;
+ }
+ let failed=S.create("synthetic",[],S.config(8));before=json_stringify(failed);
+ assert(cancel(mode,failed).code=="closed" and json_stringify(failed)==before,"failed creation stays unchanged");cases=cases+1;
+
+ D.configure();session=start(mode);S.queue_prefetch(session,["a"]);let queued=map{result:nil};
+ D.behavior("ok",false,fn(){queued.result=S.queue_prefetch(session,["a","b"]);});
+ let result=run(mode,session,1);assert(queued.result.accepted==["b"] and result.completed==["a"] and result.queued==1,"ordinary queue callback preserves pending tail and deduplicates active item");
+ D.behavior();assert(run(mode,session).completed==["b"],"tail survives without cancellation");finish(session);cases=cases+1;
+}
+assert(cases==63,"all direct and both facade scenarios executed");
+assert(S.capability().cooperative_prefetch_cancellation and not S.capability().preempts_active_read,"honest shared capability");
+assert(F.capability().cooperative_prefetch_cancellation and E.capability().cooperative_prefetch_cancellation and not F.capability().asynchronous_io,"facade capability parity");
+print "pbai_prefetch_cases_pass:63";
