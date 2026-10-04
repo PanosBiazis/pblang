@@ -1,5 +1,6 @@
 let T=import("stdlib:embedded_telemetry.sapp");
 let MQTT=import("stdlib:mqtt311.sapp");
+let Monitor=import("stdlib:embedded_telemetry_monitor.sapp");
 fn check(v, message){if not v{throw "Telemetry: " + message;}}
 
 fn refused(result){check(not result.ok,"request must be refused");check(not str_contains(json_stringify(result),"PRIVATE"),"redacted refusal");}
@@ -133,5 +134,67 @@ for bad_clock in [-1,9007199254740992,"private",nil]{
 for mode in ["fractional","invalid-clock"]{
     let f=fixture(mode);let rejected=T.publish_local(u,1883,1000,f.io);refused(rejected);
     check(f.state.connects==0 and f.state.closes==0,"invalid injected clock fails before effects");
+}
+// A validated PUBACK remains a delivery fact when the following clock check
+// fails. No DISCONNECT/write is allowed beyond that boundary; close still runs.
+for timing in ["at-deadline","after-deadline","rollback","clock-throw","clock-invalid"]{
+    for valid in [true,false]{
+        let f=fixture();
+        f.io.read=fn(socket,count,timeout){
+            f.state.reads=f.state.reads+1;
+            if f.state.reads==1{return map{ok:true,count:4,bytes:[32,2,0,0]};}
+            f.state.time=1000;
+            if timing=="after-deadline"{f.state.time=1001;}
+            if timing=="rollback"{f.state.time=0;}
+            let bytes=[64,2,0,2];if valid{bytes=[64,2,0,1];}
+            return map{ok:true,count:4,bytes:bytes};
+        };
+        f.io.now=fn(){
+            if f.state.reads==2 and timing=="clock-throw"{throw "PRIVATE_LATE_CLOCK";}
+            if f.state.reads==2 and timing=="clock-invalid"{return nil;}
+            return f.state.time;
+        };
+        let result=T.publish_local(u,1883,1000,f.io);
+        refused(result);
+        check(result.acknowledged==valid and result.outcome_uncertain==not valid,
+            "delivery fact survives post-PUBACK clock failure: "+timing);
+        if valid{check(result.error=="post-ack-clock-failed","clock failure distinguished from unconfirmed delivery");}
+        check(result.publish_attempted and result.cleanup_ok and f.state.closes==1,
+            "late acknowledgement closes exactly once");
+        check(len(f.state.writes)==2 and f.state.reads==2,
+            "clock failure prevents disconnect or retry");
+    }
+}
+for malformed in [map{ok:false,count:4,bytes:[64,2,0,1]},
+    map{ok:true,count:3,bytes:[64,2,0,1]},map{ok:true,count:4,bytes:[64,2,0]},
+    map{ok:1,count:4,bytes:[64,2,0,1]},map{ok:true,count:4},nil]{
+    let f=fixture();
+    f.io.read=fn(socket,count,timeout){
+        f.state.reads=f.state.reads+1;
+        if f.state.reads==1{return map{ok:true,count:4,bytes:[32,2,0,0]};}
+        f.state.time=1000;return malformed;
+    };
+    let result=T.publish_local(u,1883,1000,f.io);refused(result);
+    check(not result.acknowledged and result.outcome_uncertain and f.state.closes==1
+        and len(f.state.writes)==2,"late malformed read never confirms publication");
+}
+for cleanup in [true,false]{
+    let f=fixture();
+    f.io.read=fn(socket,count,timeout){
+        f.state.reads=f.state.reads+1;
+        if f.state.reads==1{return map{ok:true,count:4,bytes:[32,2,0,0]};}
+        f.state.time=1000;return map{ok:true,count:4,bytes:[64,2,0,1]};
+    };
+    f.io.close=fn(socket){f.state.closes=f.state.closes+1;return map{ok:cleanup};};
+    let monitor=Monitor.new(map{samples:1});
+    let read=fn(sequence,remaining){return T.from_uno(uno(),sequence);};
+    let publish=fn(value,port,timeout){return T.publish_local(value,port,timeout,f.io);};
+    let result=Monitor.poll(monitor,read,publish,fn(){return 0;});
+    check(result.terminal and not result.ok and result.acknowledged==1
+        and result.published==0 and not result.outcome_uncertain
+        and result.cleanup_ok==cleanup,"monitor preserves late ACK and separate cleanup fact");
+    Monitor.poll(monitor,read,publish,fn(){return 0;});
+    check(f.state.connects==1 and f.state.closes==1 and len(f.state.writes)==2,
+        "terminal monitor never retries a late ACK");
 }
 print "embedded telemetry tests passed";
