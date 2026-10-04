@@ -116,18 +116,20 @@ rolled-back handle, call `close()` explicitly. There is no reopen operation;
 creating another review is an explicit independent operation.
 
 Run `tests/semantics/pbai_student_review_close_test.sapp` in each product for
-both direct-module and public-facade routes across all four pre-close phases.
+direct-module, legacy public-facade and bound-facade routes across all four
+pre-close phases (12 cases per product).
 The runnable examples are `examples/pbai_student_review_close.sapp` in PBLang
-and `demo/pbai_student_review_close.sapp` in standalone pbAI. The Linux-only
-`tests/semantics/pbai_student_review_close_installed_test.sapp` copies both
-libraries and examples, hides both source trees, disables network access and
-executes from the trusted installed product directory. It also confirms the known
-foreign-cwd limitation using a synthetic decoy dependency. This is copied-fixture
-acceptance under the tested runtime, not universal installation/platform evidence.
-The specialist facade uses lazy `stdlib:` imports on the retained runtime: run it
-with the trusted product directory as cwd. A foreign caller manifest can redirect
-those imports before a reviewed handle exists. This change does not repair the
-[runtime function-origin limit](pbAI_Modularity.md#installed-execution-and-the-retained-function-origin-limit).
+and `demo/pbai_student_review_close.sapp` in standalone pbAI. The examples now use the
+[explicit specialist binding](pbAI_Specialist_Binding.md), with the selected neural
+module imported at application top level. This supported route executes from a
+foreign cwd without loading a caller-directory provider. Its Linux installed
+harness has separate `installed`, `unavailable` and `surface` phases for source-hidden
+execution, decoy manifests and missing/broken selected dependencies.
+
+The legacy `neural_specialist_*` convenience wrappers still require the trusted
+product directory as cwd on the retained runtime. A foreign caller manifest can
+redirect their lazy imports before a reviewed handle exists. Use the bound route
+for foreign-cwd applications; the general runtime-origin defect is not repaired.
 
 ## Transport and privacy
 
