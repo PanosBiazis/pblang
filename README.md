@@ -223,7 +223,7 @@ layer. See [`docs/NATIVE_TCP.md`](docs/NATIVE_TCP.md).
 | `pblang install` | Install dependencies. |
 | `pblang publish` | Publish a package. |
 | `pblang search <query>` | Search the package registry. |
-| `pblang bundle [--self-extract]` | Build a portable bundle or self-extracting executable. |
+| `pblang bundle [--self-extract]` | Disabled by the qualified Linux launcher: the retained native command can truncate sources. See [source-integrity guard and alternatives](docs/NATIVE_BUNDLE_SOURCE_INTEGRITY.md). |
 | `pblang lsp` | Start the language server. |
 | `pblang --ide` | Launch the native pblang IDE. |
 | `pblang --check <file>` | Parse and type-check only. |
