@@ -1,0 +1,120 @@
+// Rejecting string allocation calls retain their primitive errors and close
+// eligible scalar owners. This does not catch arbitrary host/FFI failures.
+let V=import("stdlib:compiler/vm.sapp");
+let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let cases=0;
+fn demand(ok,message) { cases=cases+1; assert(ok,message); }
+fn compiled(source) {let r=F.frontend_compile(source);assert(r.ok,"fixture compiles");return r.chunk;}
+let setup=compiled("let h=memory_alloc(7);push_lifetime();borrow_immutable(h);memory_alloc(9);");
+fn context(owned) {let c=V.execution_context(owned);V.run_seeded(setup,map{},c);return c;}
+fn call(name,args) {
+    let constants=[map{__bi:name}];let code=[map{op:0,operand:0}];
+    for arg in args {array_push(constants,arg);array_push(code,map{op:0,operand:len(constants)-1});}
+    array_push(code,map{op:18,operand:len(args)});
+    array_push(code,map{op:19,operand:0});
+    return map{constants:constants,instructions:code};
+}
+fn run(code,c,bounded,options=nil) {
+    if bounded {return V.run_seeded_bounded(code,map{},options,c);}
+    return V.run_seeded(code,map{},c);
+}
+let invalid=[
+ ["str_repeat",[nil,2]], ["str_repeat",[[],2]],
+ ["str_repeat",[bigint("2"),2]], ["str_repeat",["a",nil]],
+ ["str_repeat",["a",-1]], ["str_repeat",["a",-num_pow(10,1000)]], ["str_repeat",["a",bigint("2")]],
+ ["str_repeat",["a",num_sqrt(-1)]],
+ ["str_replace_all",[nil,"a","b"]], ["str_replace_all",["a",nil,"b"]],
+ ["str_replace_all",["a","a",map{}]], ["str_replace_all",["a","a",decimal("1")]],
+ ["str_pad_left",[nil,2,"a"]], ["str_pad_left",["a",nil,"b"]],
+ ["str_pad_left",["a",2,nil]], ["str_pad_left",["a",rational(2,1),"b"]],
+ ["str_pad_right",[nil,2,"a"]], ["str_pad_right",["a",nil,"b"]],
+ ["str_pad_right",["a",2,nil]], ["str_pad_right",["a",2,bigint("1")]]
+];
+for bounded in [false,true] {
+    for owned in [false,true] {
+        for row in invalid {
+            let c=context(owned);let memory=c.memory;
+            demand(try {run(call(row[0],row[1]),c,bounded);false} catch true,"invalid call fails");
+            if owned {
+                demand(c.memory==nil and memory.closed and memory.reclaimed==2,"owned scalar scopes closed: "+row[0]+" "+str(row[1])+" "+str(bounded)+" "+str(memory.closed)+" "+str(memory.reclaimed));
+                demand(len(memory.owners)==0 and len(memory.borrows)==0,"owners and borrows cleared");
+            } else {demand(c.memory!=nil and not memory.closed and len(memory.owners)==2,"caller-owned state retained");}
+            V.close_execution(c);demand(memory.reclaimed==2,"close idempotent");
+        }
+    }
+    for source in [
+      "print try str_repeat(nil,2) catch memory_get(h);",
+      "print try str_replace_all(\"a\",nil,\"b\") catch memory_get(h);",
+      "print try str_pad_left(\"a\",2,nil) catch memory_get(h);",
+      "print try str_pad_right(nil,2,\"b\") catch memory_get(h);",
+      "print try {try str_repeat(nil,2) catch str_replace_all(nil,\"a\",\"b\")} catch memory_get(h);",
+      "fn fail(){str_repeat(nil,2);}print try fail() catch memory_get(h);",
+      "let receiver=map{__add__:str_repeat};print try receiver+2 catch memory_get(h);"
+    ] {
+        let c=V.execution_context(true);
+        let result=run(compiled("let h=memory_alloc(11);"+source),c,bounded);
+        demand(result.output==[11] and c.handlers==0 and not c.memory.closed,"handled failure retains usable state");
+        V.close_execution(c);
+    }
+    for source in [
+      "try str_repeat(nil,2) catch str_pad_right(nil,2,\"b\");",
+      "let receiver=map{__add__:str_repeat};receiver+2;",
+      "fn fail(){str_replace_all(nil,\"a\",\"b\");}fail();"
+    ] {
+        let c=context(true);let state=c.memory;
+        demand(try {run(compiled(source),c,bounded);false} catch true,"nested failure escapes");
+        demand(state.closed and c.memory==nil and c.handlers==0,"catch removed before escape");
+    }
+    let c=context(true);let state=c.memory;let globals=map{};
+    let code=compiled("let calls=0;fn first(){calls=calls+1;return nil;}fn second(){calls=calls+1;return 2;}str_repeat(first(),second());");
+    if bounded {demand(try {V.run_seeded_bounded(code,globals,nil,c);false} catch true,"effects fail");}
+    else {demand(try {V.run_seeded(code,globals,c);false} catch true,"effects fail");}
+    demand(globals.calls==2 and state.closed,"each argument evaluated once");
+    for row in [
+      ["str_repeat",["α",2.9],"αα"], ["str_repeat",["",2],""],
+      ["str_repeat",["a",0],""], ["str_replace_all",["aba","a","λ"],"λbλ"],
+      ["str_pad_left",["a",3,"λ"],"λλa"], ["str_pad_right",["a",3,""],"a  "]
+    ] {
+        let good=context(true);
+        let accepted_code=call(row[0],row[1]);accepted_code.instructions[len(accepted_code.instructions)-1]=map{op:12,operand:0};
+        let result=run(accepted_code,good,bounded);
+        demand(result.output==[row[2]] and not good.memory.closed,"valid values and ownership unchanged");
+        V.close_execution(good);
+    }
+}
+// Host-accepted edge widths must not close a successful execution.
+for width in [-1,-num_pow(10,1000),num_sqrt(-1),2.9] {
+    for name in ["str_pad_left","str_pad_right"] {
+        let c=context(true);
+        run(call(name,["a",width,"x"]),c,false);
+        demand(not c.memory.closed,"accepted numeric width keeps scalar owners");
+        V.close_execution(c);
+    }
+}
+// Infinite positive allocation requests are tested only bounded, never sent to
+// an unbounded padding primitive where the host could attempt a huge allocation.
+for name in ["str_repeat","str_pad_left","str_pad_right"] {
+    let c=context(true);let state=c.memory;
+    let args=if name=="str_repeat" {["a",num_pow(10,1000)]} else {["a",num_pow(10,1000),"b"]};
+    demand(try {run(call(name,args),c,true);false} catch true,"infinite allocation rejected");
+    demand(state.closed,"infinite allocation closes owned state");
+}
+// Existing quota guards still terminate the run, including active handlers.
+for source in [
+ "str_repeat(\"a\",9);", "str_replace_all(\"aaaa\",\"a\",\"bbb\");",
+ "str_pad_left(\"a\",9,\"b\");", "str_pad_right(\"a\",9,\"b\");",
+ "try str_repeat(\"a\",9) catch 7;"
+] {
+    let c=context(true);let state=c.memory;
+    demand(try {run(compiled(source),c,true,map{max_value_items:8});false} catch true,"quota rejects");
+    demand(state.closed and c.memory==nil,"quota cleanup remains sticky");
+}
+// The host type error comes before arithmetic even when the requested size is huge.
+let admission=context(true);let admission_state=admission.memory;
+demand(try {run(call("str_repeat",[nil,1000000]),admission,true,map{max_value_items:8});false} catch true,"invalid huge repeat rejects");
+demand(admission_state.closed,"invalid huge repeat cleaned");
+// Secondary cleanup failure is suppressed; the original primitive still fails.
+let broken=context(true);let broken_state=broken.memory;broken_state.reclaimed=map{};
+demand(try {run(call("str_repeat",[nil,2]),broken,false);false} catch true,"secondary cleanup cannot convert failure to success");
+broken_state.reclaimed=0;V.close_execution(broken);demand(broken_state.closed,"repaired fault fixture released");
+print "selfhost_string_admission_cleanup_pass " + str(cases);
