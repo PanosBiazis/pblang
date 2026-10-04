@@ -36,8 +36,10 @@ claiming a universal speedup over the formerly incorrect digest.
 The loader retains its limits of 4,096 files, 4,096 entries per directory,
 64 directory levels, 16 MiB per file and 64 MiB total file content. A new
 8,192-entry aggregate inventory bound includes directories. Symlinks and
-unreadable/unsupported file entries fail. The legacy directory-list API aliases
-a top-level entry named `root`; this loader now rejects that name explicitly.
+unreadable/unsupported file entries fail. The loader uses literal-relative
+directory listing and file reads, so a top-level file or directory named `root`
+is supported. Only the empty directory path addresses the held root; `.` and
+`..` are rejected by these APIs. See [relative paths](LINUX_DIRFS_RELATIVE_PATHS.md).
 It does not claim support for every package accepted by the native manager.
 
 Local inline path dependencies and portable relative lock paths remain required.
@@ -58,7 +60,8 @@ this is not a general exception/OOM cleanup guarantee.
 `tests/tooling/locked_source_snapshot.py` compares native-generated lock digests
 with Python SHA-256 and then exercises the real PBLang loader after portable
 normalization. It covers length-field boundaries, Unicode paths, binary bytes,
-hidden/target entries, empty directory mutations, stale legacy digests, link and
+hidden/target entries, literal `root` files/directories (including a real import),
+empty directory mutations, stale legacy digests, link and
 special-file rejection, and a real broker bundle executed without dependencies.
 The semantic snapshot and bundle tests use fixed independently computed digest
 answers instead of duplicating the implementation under test.
