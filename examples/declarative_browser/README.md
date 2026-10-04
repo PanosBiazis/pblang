@@ -322,3 +322,68 @@ native text-drawing calls while reading all measured pages. It checks wide Latin
 and Greek content, complete help/footer rendering, resize recovery and the final
 local link. Synthetic images are under `build/reader-measured-*`. Shared renderers
 and Web/Android exports are unchanged; these checks establish Linux behavior only.
+
+## Standalone Linux reader candidate
+
+This example can produce a new portable folder containing the existing reader,
+its literal-import library closure, a matching local dependency lock, and an
+explicitly selected Linux x86-64 PBLang runtime. It uses the existing PBLang-owned
+`tools/pbpackage.sapp` route in an isolated temporary source stage. No native
+`pblang bundle` command is invoked, and the checkout manifest/lock are not edited.
+
+```sh
+# Run from the repository. Choose a NEW private output parent.
+mkdir -m 700 ../reader-candidates
+python3 examples/declarative_browser/package.py \
+  --runtime "$PWD/target/release/pblang" \
+  --output "$PWD/../reader-candidates/reader-v1"
+
+# These work from a different current directory, using only the candidate.
+sh ../reader-candidates/reader-v1/run-reader.sh --check
+sh ../reader-candidates/reader-v1/run-reader.sh
+```
+
+The default launch opens the native GUI, including actual font measurement and
+the existing Style controls. `--check` exercises offline document navigation and
+roundtrip without a display. `--help` prints usage; other arguments are rejected.
+The launcher disables network, HTTP, process execution and spawning. Native GUI
+still needs local graphics/FFI and filesystem access for libraries/fonts; this is
+not an application sandbox. Invoke the launcher with `sh`: the package contract
+keeps source files non-executable and only marks the runtime executable.
+
+The output parent must already be private (0700), and the destination must be
+absent and outside the checkout. Existing outputs are never replaced or removed.
+The helper accepts this example's literal imports only, with at most 128 modules
+and 1 MiB per module; the packager's own additional limits still apply. It captures
+trusted local checkout sources, not concurrently hostile inputs. It uses private
+temporary manifests for both the tool and application so checkout folder names
+and the repository's dependency-lock paths are not runtime dependencies.
+
+The `reader-source-sha256.json` inventory records copied modules. The normalized
+`pblang.lock` binds the included stdlib tree; `package-receipt.json` describes
+publication, not acceptance or runtime authenticity. Select a trusted runtime.
+On failure a partial destination may remain: inspect it and use a new destination
+for a later attempt. Only the helper's own temporary stage is cleaned up.
+
+Accept the candidate before distributing or activating it:
+
+```sh
+python3 tests/tooling/reader_package.py \
+  --package ../reader-candidates/reader-v1 \
+  --evidence ../reader-candidates/reader-v1-acceptance
+```
+
+Acceptance requires Linux with Python 3.9+, bubblewrap, Xvfb, xauth, xdotool,
+ImageMagick, the native runtime's system libraries and usable system fonts. The
+evidence directory must be new. Only OS directories, the read-only candidate and
+synthetic test fixtures are mounted into the isolated execution environment; the
+original checkout is absent. Checks cover launch from a foreign working directory,
+the semantic text-fit suite with effects denied, GUI launch and the full measured
+text/resize/navigation journey. Candidate hashes must remain unchanged. The test
+does not install a launcher, change a desktop entry or activate an existing product.
+
+This is a Linux folder candidate with readable source, not a source-concealing
+single executable, a universal binary or a Windows/macOS/mobile installer. The
+host's compatible native libraries/fonts remain requirements. Web and Android
+exports remain available through the original source example; this launch wrapper
+exposes the native reader only.

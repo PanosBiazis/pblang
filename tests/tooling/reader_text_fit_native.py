@@ -1,17 +1,20 @@
 """Real keyboard/resize journey on a task-owned Xvfb only; no personal desktop."""
-import json, os, shlex, signal, subprocess, time
+import argparse, json, os, shlex, signal, subprocess, time
 from pathlib import Path
 
 def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--runtime',type=Path);parser.add_argument('--fixture',type=Path);parser.add_argument('--work-dir',type=Path);parser.add_argument('--cwd',type=Path)
+    args=parser.parse_args()
     display=os.environ.get('DISPLAY','').split('.')[0]
     servers=subprocess.check_output(['ps','-C','Xvfb','-o','args='],text=True)
     if not display or not any(display in shlex.split(line)[1:] for line in servers.splitlines()):
         raise SystemExit('Use an isolated xvfb-run display.')
-    root=Path(__file__).resolve().parents[2];state_file=root/'build/reader-measured.json'
+    root=args.work_dir or Path(__file__).resolve().parents[2];state_file=root/'build/reader-measured.json'
     state_file.parent.mkdir(exist_ok=True);state_file.unlink(missing_ok=True)
     env=dict(os.environ)
     for key in ('PBLANG_GRAPHICS_IDLE_PUMP_MS','PBLANG_GRAPHICS_MAX_MS','PBLANG_GRAPHICS_MAX_FRAMES'):env.pop(key,None)
-    child=subprocess.Popen([str(root/'target/release/pblang'),'run','tests/fixtures/reader_text_fit_native.sapp','--allow-all'],cwd=root,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+    child=subprocess.Popen([str(args.runtime or root/'target/release/pblang'),'run',str(args.fixture or root/'tests/fixtures/reader_text_fit_native.sapp'),'--allow-all','--deny-net','--deny-http','--deny-exec','--deny-spawn'],cwd=args.cwd or root,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
     observations=[]
     def x(*args):return subprocess.check_output(['xdotool',*map(str,args)],text=True,timeout=6).strip()
     def settled(**expected):
