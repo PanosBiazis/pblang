@@ -86,9 +86,40 @@ to scalar bytes read by this module; it is not a general recursive object copier
 The public session map is still mutable. Directly rewriting its cache/config/manifest
 or forging a handle is outside this trusted-caller contract. The fix does not add
 handle authentication, snapshot consistency against concurrent disk writes, general
-GC, secure erasure or OS close-failure recovery. Disk verification policy is unchanged.
+GC or secure erasure. Disk verification policy is unchanged.
 
 Focused byte-ownership tests cover real miss/hit loads, result element and length
 changes, cyclic caller results, prefetch, pinning, cache bypass, zero-length shards,
 eviction, failed corrupted reread and close. The existing paired lifecycle examples
 now demonstrate independent byte results, including their source-hidden installed run.
+
+
+## Terminal close and unconfirmed cleanup
+
+`close` still returns a boolean. A first close returns true only if every held directory
+handle returns an explicit boolean true from the underlying close operation. False,
+exceptions and non-boolean results are treated as unconfirmed cleanup; the result is
+false. Repeated or reentrant close also returns false without another cleanup attempt.
+
+The session becomes closed, drops its resident cache references and clears queued
+prefetch work before the first close effect. Each owned handle is detached before its
+attempt; later handles are still attempted if an earlier one fails or throws. No retry
+is performed because an ambiguous descriptor might have been released and reused.
+This is terminal failure handling, not proof of OS resource release or a retry mechanism.
+
+`status().cleanup` is an independent snapshot containing `attempted`,
+`confirmed_handles`, `unconfirmed_handles`, `first_error` and `retry_supported:false`.
+Before close the counters are zero and first_error is nil. The first failure remains
+one of `close_unconfirmed`, `close_threw`, or `close_invalid_result`; raw exception text,
+paths and descriptor identities are not retained. An earlier operation error or byte
+result remains unchanged. An unconfirmed count must never be interpreted as released
+resources. Existing read/load status and output formats otherwise remain unchanged.
+
+Deterministic fixtures substitute only the directory backend and copy the exact owner
+and standalone streaming facade. Fourteen direct/facade cases cover success, false,
+throw, nil, numeric/string truthy returns and mixed failures across three handles.
+Callbacks attempt reentrant close, cache reads, queueing and status-snapshot mutation.
+The fixtures own no OS descriptors; they demonstrate control flow, not real syscall
+failure recovery. Normal local and source-hidden installed examples separately check
+successful real directory-handle cleanup. Direct mutation/forgery of the public session
+or underlying handle structures is still outside the trusted-caller contract.
