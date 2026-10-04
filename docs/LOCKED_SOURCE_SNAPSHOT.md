@@ -14,6 +14,19 @@ content is empty. Hidden entries, `target`, empty directories and binary assets
 all contribute to dependency verification. The dependency root itself does not.
 Project-only module discovery retains its existing hidden/target exclusions.
 
+Before collecting modules, the loader now validates lock metadata with the
+existing strict TOML subset parser. Duplicate fields/tables, malformed lines,
+scalar/table conflicts and unsupported values are rejected rather than silently
+overwritten. Bare-compatible identifiers may be single- or double-quoted,
+including table components; quoting does not create a distinct key for duplicate
+checks. Escaped identifiers, dots or spaces inside a quoted identifier remain
+outside this strict subset. Metadata must decode as exact UTF-8 bytes. The lock's dependency
+names must match the local names extracted from the manifest, and a local lock
+record may not also declare a `source` marker. Empty dependency sets are valid.
+This checks lock admission; the manifest path extractor remains a separate,
+limited parser and is not a complete validator of arbitrary manifest grammar or
+all registry/Git declarations. Those forms are not newly supported here.
+
 Existing callers still use `load(project_root)`. Successful results add
 `dependency_digest_backends`, keyed by dependency name:
 
@@ -67,3 +80,8 @@ The semantic snapshot and bundle tests use fixed independently computed digest
 answers instead of duplicating the implementation under test.
 
 Production changes are PBLang source. The retained native executable is unchanged.
+
+`tests/tooling/snapshot_lock_admission.py` exercises the snapshot and broker APIs
+together using a genuine native-generated portable lock, contradictory duplicate
+fields, extra/missing/renamed dependencies, mixed origin records, malformed TOML,
+invalid UTF-8 and an empty dependency set. Every case checks source preservation.
