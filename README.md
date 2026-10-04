@@ -227,6 +227,7 @@ layer. See [`docs/NATIVE_TCP.md`](docs/NATIVE_TCP.md).
 | `pblang lsp` | Start the language server. |
 | `pblang --ide` | Launch the native pblang IDE. |
 | `pblang --check <file>` | Parse and type-check only. |
+| `pblang --check --via-pblang <file>` | PBLang source analysis with failing diagnostic status through the [qualified Linux launcher](docs/PUBLIC_SELFHOST_CHECK.md); `--self-host` is an alias. |
 | `pblang --dump-bytecode <file>` | Print bytecode disassembly. |
 | `pblang --cfg <file>` | Dump a control-flow graph. |
 

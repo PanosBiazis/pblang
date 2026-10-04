@@ -66,9 +66,11 @@ lowers block expressions into immediate function literals
 (`crates/pblang-compiler/src/lib.rs`, `ExprKind::BlockExpr`). The function-literal
 compiler copies only one enclosing compiler level and sets that snapshot's
 `enclosing` to `None`; deeper synthetic closures lose the outer local binding.
-The named-function path already preserves a full enclosing chain, but it is not
-used by those generated literals. Changing that retained compilation path needs
-a Rust compiler change/rebuild, which is outside this PBLang-only task.
+The named-function path copies the current compiler and at most one additional
+enclosing level, whose `enclosing` is also set to `None`; it does not preserve an
+arbitrary-depth chain. That path is not used by those generated literals.
+Changing the retained compilation paths needs a Rust compiler change/rebuild,
+which is outside this PBLang-only task.
 
 The existing explicit PBLang-to-PBCK route producing 7 is regression-tested,
 but is not a new fix for direct retained execution. No automatic reroute,

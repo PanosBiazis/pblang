@@ -12,17 +12,19 @@ PBLang-written compiler libraries does **not** fix this native command.
 for a versioned installation. It resolves the invoked symlink with GNU
 `/usr/bin/readlink -f`, then runs
 [`tools/native_bundle_guard.sapp`](../tools/native_bundle_guard.sapp) under
-`--sandbox`. The policy has no imports and denies **every** invocation whose
+`--sandbox`. This admission phase performs no imports and denies **every** invocation whose
 first argument is exactly `bundle`, including help, self-extract, absolute,
 relative, overlapping and symlink destinations. No package is read or written
 by this policy. The guard's own source must still be loaded by the retained host.
 
 The bridge requires both a successful guard process and its exact admission
 marker. Missing, empty or malformed guard files fail closed. It passes a single
-prefixed command token through the native argv array, rather than the lossy
+versioned marker followed by the full native argv array, rather than the lossy
 newline-separated `PBLANG_SCRIPT_ARGS` channel. Its guard cannot consume stdin.
-Accepted invocations use `exec` with the original argument boundaries, cwd,
-environment and streams. This adds one native process startup per invocation;
+Ordinary accepted invocations use `exec` with the original argument boundaries,
+cwd, environment and streams. Explicit self-hosted checks use the separately
+documented [PBLang check adapter](PUBLIC_SELFHOST_CHECK.md) in the same policy
+script; that execution phase imports the checker and reads its admitted source. This adds one native process startup per invocation;
 no performance improvement is claimed. It does not filter the native help text,
 which still advertises the disabled command.
 

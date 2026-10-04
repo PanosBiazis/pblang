@@ -9,15 +9,19 @@ if [ ! -x "$native" ] || [ ! -f "$guard" ]; then
     printf '%s\n' 'pblang launcher: native runtime or admission guard is missing' >&2
     exit 126
 fi
-token=no-command
-if [ "$#" -gt 0 ]; then token=command:$1; fi
 # The guard cannot consume the application stdin. An empty/damaged guard must
 # not authorize dispatch merely by exiting successfully without a decision.
-if admission=$("$native" run "$guard" --sandbox -- "$token" </dev/null); then
-    if [ "$admission" != 'pblang-launch-admit-v1' ]; then
-        printf '%s\n' 'pblang launcher: no valid admission decision' >&2
-        exit 126
-    fi
+if admission=$("$native" run "$guard" --sandbox -- pblang-launch-argv-v2 "$@" </dev/null); then
+    case "$admission" in
+        pblang-launch-admit-v1) ;;
+        pblang-launch-check-v1) exec "$native" run "$guard" "$@" ;;
+        pblang-launch-check-usage-v1)
+            printf '%s\n' 'pblang --check: expected --check --via-pblang (or --self-host), supported capability options, and exactly one filename; use -- before a filename starting with --' >&2
+            exit 2 ;;
+        *)
+            printf '%s\n' 'pblang launcher: no valid admission decision' >&2
+            exit 126 ;;
+    esac
 else
     exit "$?"
 fi

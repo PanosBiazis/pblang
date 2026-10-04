@@ -37,13 +37,17 @@ entry for its PBLang-only source analysis. Both return a failing process status
 for diagnosed errors and do not execute the checked source. They are distinct
 analysis profiles, not claimed to have identical diagnostics for every program.
 
-The old **`pblang --check --via-pblang FILE` is not a reliable CI gate** on the
-retained host: its embedded Rust driver prints `self-hosted check failed` but
-returns success when `frontend_analyze` returns `ok:false`. Its in-memory driver
-also lacks a trusted installed script origin. Fixing that old entry itself
-requires changing/rebuilding the host; changing a shared library to throw on all
-analysis failures would break its structured-result API. This change deliberately
-preserves that API and documents the working public entries above.
+The qualified Linux launcher now routes **`pblang --check --via-pblang FILE`**
+(and `--self-host`) through PBLang-owned structured source analysis with a
+nonzero process status on diagnostics. See the [exact argv, permissions and
+installation contract](PUBLIC_SELFHOST_CHECK.md). This requires deploying the
+new launcher and guard together with a matching installed stdlib and lock;
+a source checkout change alone does not update the public command.
+
+The direct retained **`pblang-native --check --via-pblang FILE` remains unreliable
+as a CI gate**: its Rust driver can print failure and return success. The shared
+`frontend_analyze` structured-result API remains unchanged. This scoped launcher
+route is not a native-host or nested `p:run` fix.
 
 ## Evidence and scope
 
