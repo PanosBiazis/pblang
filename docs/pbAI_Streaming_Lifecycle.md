@@ -207,3 +207,40 @@ backend failed to return, prove real native/syscall recovery, preempt a blocked 
 add asynchronous cancellation or guarantee multi-threaded atomicity. Direct mutation
 of the trusted session/config/manifest remains outside this contract. No performance,
 universal platform, AGI or ASI claim follows from these fixtures.
+
+
+## Literal shard filenames
+
+The manifest's safe relative path contract now reaches the confined reader without
+legacy root aliases: the store uses `linux_dirfs.read_bytes_relative`. A shard file
+named exactly `root` is a normal child file. Previously that manifest was accepted,
+but the legacy reader rejected the same string as a root alias and the load failed.
+No path rewriting, alias fallback or normalization is added. This changes shard
+paths inside an opened root; root-directory opening and its accepted-root forms
+are unchanged.
+
+Nested `root/item` and `root/root/item`, case differences, leading/trailing spaces,
+Unicode names and empty files keep their existing literal behavior. This change does
+not redefine those names. Empty paths, absolute paths, dot/traversal components,
+empty components, trailing separators, backslashes, NUL and oversized components
+remain rejected by manifest validation. A directory or symlink cannot become a shard
+merely because its name is `root`.
+
+The adopted API uses the same held directory, no-follow component traversal,
+anonymous-file snapshot, byte limits and result schema as the legacy bounded reader.
+Manifest size/SHA checks, cache/prefetch behavior and mirror selection remain in the
+store. The dependency must provide `read_bytes_relative`; release locks bind the
+shared library tree. There is no fallback to legacy alias semantics if that API is
+missing. The underlying general `read_bytes` API and its other callers are unchanged.
+
+Thirty real-filesystem scenarios per product cover exact literal bytes, a cached
+`root` shard, nested names, held-root pathname replacement with RAM caching disabled,
+missing files, final/intermediate symlinks to private synthetic targets, directory
+rejection, twelve invalid manifest paths, mirror prefetch with a corrupted preferred
+`root`, all-corrupt mirrors, and an actual file exceeding its declared read limit.
+Existing fault fixtures export only the literal read API so the new call remains
+covered by initialization, close and read-boundary regressions. Both source-hidden
+installed examples now use the actual filename `root` for their mirror fallback.
+
+These are Linux CPU results using local synthetic files. The change adds no network,
+FFI symbols, backend implementation, general cleanup guarantee or all-platform claim.
