@@ -144,3 +144,54 @@ to the editor for fresh controls after expiration or a server restart. Physical
 buttons do not submit editor drafts or uploaded JSON. Editor stale-write protection
 remains independent. A Stop request targets the explicitly bound board, including
 playback started from another view. It is not a safety-certified emergency stop.
+
+
+### Send edited frames from the Web editor (optional Linux host)
+
+A trusted host may construct `device_upload.create(config)` and pass it as the
+fifth argument of `device_control.create(plan, port, true, runner, uploader)`.
+Only then does the Web page expose **Send current project**. This explicitly
+replaces the UNO firmware: STOP must be confirmed first. A fresh page binds the
+send to its displayed authored-frame snapshot; another tab's edit rejects it.
+The frame count, total duration and installed repetition count remain bounded.
+Counter settings are not streamed: capture values into authored frames first.
+
+1. Choose **Send current project**. A single bounded compiler runs with one job.
+2. Choose **Check Arduino** for progress. Once compilation finishes, this advances
+   the explicitly requested transfer to upload. It never starts playback.
+3. Keep checking until the new project identity is confirmed, then **Play on
+   Arduino**. A changed or unconfirmed project cannot silently play old frames.
+4. **Stop Arduino** requests process cancellation during transfer. Check until
+   cleanup is confirmed. An interrupted flash may require explicit recovery;
+   cancellation is not proof that previous firmware was restored.
+
+The `device_upload.sapp` helper uses the documented optional Linux process host
+adapter, not the disabled portable process facade. Configuration is trusted local
+code only: `enabled:true`, `confirmed:true`, fixed `cli`, `cli_sha256`, `port`,
+private dedicated `output_parent` (only job slots and checkpoint), optional fixed `config_file`, and trusted `firmware` and
+`adapter` source strings. Its digest format is SHA-256 of base64-encoded executable
+bytes, matching the existing descriptor API (not ordinary sha256sum).
+The CLI executable is held by a verified descriptor. SDK/config files remain
+trusted external dependencies, not a completely attested toolchain or FFI contract.
+Browser JSON never supplies paths, executables, shell commands or source code.
+
+`start(plan,true)`, `poll()`, `cancel()` and `close()` return bounded phase/cleanup
+metadata; the controller confirms the new board identity via the existing serial
+HELLO/STATUS path. `confirm(plan)` writes a private installed-plan checkpoint only
+after that confirmation. A trusted launcher calls `restore(output_parent,fallback)`
+on restart; a malformed checkpoint is rejected rather than silently ignored.
+
+Compilation is limited to 120 seconds; upload to 30 seconds; captured output to
+16 KiB. Failed-process output may be retained in private `diagnostic.json` for
+host review; it is never included in Web responses. The CLI uses `GOMAXPROCS=2`
+and one compile job. The 4,096 process/thread ceiling is Linux per-user
+`RLIMIT_NPROC`, not a promise to isolate/count only this job. Process-group termination is checked before advancing. There are four
+exclusive retained job slots beneath the private output directory, also across
+restarts. They hold generated frame content and build artifacts for local review;
+no automatic recursive deletion is attempted. After four attempts, explicit local
+review/cleanup or a new explicitly configured private directory is required.
+No background monitor or automatic retry is installed. Closing a host with active
+work still requires polling cancellation until cleanup is confirmed. Abrupt host
+termination is not a successful cleanup claim. These controls are not certified
+emergency stops. This uploader is Linux-only and still uses the Arduino SDK/CLI
+boundary; it is not a native cross-platform or pure RA4M1 machine-code backend.

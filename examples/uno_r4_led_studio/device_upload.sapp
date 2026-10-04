@@ -1,0 +1,209 @@
+// Explicit Linux host adapter, not the unavailable portable process facade.
+// Arduino SDK/CLI is a temporary OS boundary. This does not verify all FFI.
+// Four exclusive private slots are retained for host review; no recursive erase.
+let Device=import("./device_export.sapp");
+let Dir=import("stdlib:linux_dirfs.sapp");let Process=import("stdlib:linux_process.sapp");
+let Serial=import("stdlib:serialization.sapp");
+let FQBN="arduino:renesas_uno:unor4wifi";
+fn absolute(value) {
+    if type(value)!="string" or len(value)>4096 or not str_starts_with(value,"/")
+        or str_contains(value,"\n") or str_contains(value,"\r") {return false;}
+    if str_contains(value,"\\") or str_contains(value,strfromcharcode(0)) {return false;}
+    let parts=str_split(value,"/");if len(parts)<3 {return false;}
+    for i len(parts) {if i>0 and (parts[i]=="" or parts[i]=="." or parts[i]=="..") {return false;}}
+    return true;
+}
+fn prepare_contents(fs,c,p,slot) {
+    let existing=Dir.list(fs,"",16);
+    if not existing.ok or existing.truncated {throw "Upload slot inventory unavailable.";}
+    let name="";
+    for candidate 4 {
+        let proposed="led_upload_"+str(candidate+1);let present=false;
+        for entry in existing.entries {if entry==proposed {present=true;}}
+        if name=="" and not present {name=proposed;}
+    }
+    if name=="" {throw "Private upload slots require host review.";}
+    // Inventory is only selection: exclusive mkdir remains the race check.
+    let made=Dir.mkdir_new(fs,name,false);
+    if not made.ok or not made.permission_private {throw "Upload slot unavailable.";}
+    let lowered=Device.lower(p,c.firmware);
+    let content=map{"pblang_firmware.h":lowered.c_source,
+        "firmware.sapp":lowered.pblang_source,"plan.json":json_stringify(p)};
+    content[name+".ino"]=c.adapter;
+    for file in map_keys(content) {
+        if not Dir.write_new_exclusive(fs,name+"/"+file,str_to_bytes(content[file]),false).ok {throw "Upload preparation failed.";}
+    }
+    let base=Dir.descriptor_path(fs);if not base.ok {throw "Upload root unavailable.";}
+    return map{ok:true,root:fs,name:name,sketch:base.path+"/"+name,build:base.path+"/"+name+"/build"};
+}
+fn prepare_job(c,p,slot) {
+    let fs=Dir.open_absolute(c.output_parent,false,true);
+    if not fs.ok {throw "Private upload directory unavailable.";}
+    let prepared=try prepare_contents(fs,c,p,slot) catch nil;
+    if prepared==nil {let closed=Dir.close(fs);return map{ok:false,cleanup_confirmed:closed};}
+    return prepared;
+}
+// Startup readiness releases the bounded supervisor before returning control
+// to the browser. Subsequent compilation/upload remains asynchronous.
+fn native_start(pinned,args,options) {
+    let h=Process.start_prepared_verified(pinned,args,options);
+    if not h.ok {return h;}
+    let waiter=channel();let deadline=now_ms()+5000;let status=Process.poll(h);
+    while (try status.startup_pending catch false) and now_ms()<deadline {
+        recv_timeout(waiter.receiver,5);status=Process.poll(h);
+    }
+    if not status.ok or (try status.startup_pending catch false) or (try status.startup_failed catch false) {
+        h.ok=false;h.requires_recovery=true;try Process.request_cancel(h,250) catch nil;
+    }
+    return h;
+}
+fn persist(c,p) {
+    let bytes=str_to_bytes(json_stringify(Device.validate(p)));
+    if len(bytes)>262144 {return false;}
+    let fs=Dir.open_absolute(c.output_parent,false,true);if not fs.ok {return false;}
+    let written=try Dir.write_atomic(fs,"confirmed-plan.json",bytes,false) catch nil;
+    let closed=Dir.close(fs);return written!=nil and written.ok and closed;
+}
+fn restore_read(fs,fallback) {
+    let listed=Dir.list(fs,"",16);
+    if not listed.ok or listed.truncated {throw "Confirmed project directory unavailable.";}
+    let found=false;for name in listed.entries {if name=="confirmed-plan.json" {found=true;}}
+    if not found {return fallback;}
+    let stored=Dir.read_bytes(fs,"confirmed-plan.json",262144);
+    if not stored.ok {throw "Confirmed project read failed.";}
+    let parsed=Serial.parse_safe(bytes_to_str(stored.bytes),"json",map{max_input_bytes:262144,
+        max_output_bytes:262144,max_depth:8,max_items:32768,max_line_bytes:262144,max_lines:1,
+        strict:true,reject_duplicate_keys:true});
+    if not parsed.ok or not parsed.duplicate_keys_checked {throw "Invalid confirmed project.";}
+    return Device.validate(parsed.value);
+}
+fn restore(output_parent,fallback) {
+    let initial=Device.validate(fallback);
+    if not absolute(output_parent) {throw "Invalid trusted upload root.";}
+    let fs=Dir.open_absolute(output_parent,false,true);if not fs.ok {throw "Private upload root unavailable.";}
+    let result=try restore_read(fs,initial) catch nil;let closed=Dir.close(fs);
+    if result==nil or not closed {throw "Confirmed project restoration failed.";}
+    return result;
+}
+// Host-only bounded diagnostics stay in the private job, never response maps.
+fn diagnostic(job,result) {
+    let stdout=try result.stdout catch "";let stderr=try result.stderr catch "";
+    if type(stdout)!="string" or type(stderr)!="string"
+        or len(str_to_bytes(stdout))+len(str_to_bytes(stderr))>16384 {stdout="";stderr="Diagnostic output exceeded its bound.";}
+    let record=map{exit_code:try result.exit_code catch -1,timed_out:try result.timed_out catch false,
+        process_group_terminated:try result.process_group_terminated catch false,stdout:stdout,stderr:stderr};
+    let bytes=str_to_bytes(json_stringify(record));
+    if len(bytes)>32768 {record.stdout="";record.stderr="Diagnostic serialization exceeded its bound.";bytes=str_to_bytes(json_stringify(record));}
+    return Dir.write_new_exclusive(job.root,job.name+"/diagnostic.json",bytes,false).ok;
+}
+fn host_io() {return map{
+    pin:fn(c){return Process.prepare_fixed_verified([c.cli],c.cli_sha256,134217728);},
+    unpin:Process.close_prepared_verified,prepare:prepare_job,
+    start:native_start,persist:persist,diagnostic:diagnostic,poll:Process.poll,finish:Process.finish,
+    cancel:Process.request_cancel,release:fn(job){return Dir.close(job.root);}};}
+fn view(s){return map{ok:s.ok,phase:s.phase,busy:s.handle!=nil,
+    complete:s.handle==nil and s.phase!="idle",message:s.message,
+    cleanup_confirmed:s.cleanup_confirmed,project_digest:s.digest,
+    upload_attempted:s.upload_attempted,retained_jobs:s.jobs,
+    automatic_play:false,ffi_contract_fully_verified:false};}
+fn unpin(s){
+    if s.pinned!=nil {let done=try s.io.unpin(s.pinned) catch nil;
+        if done==nil or not (try done.ok catch false) {s.cleanup_confirmed=false;s.ok=false;s.phase="failed";s.message="Arduino CLI handle cleanup was not confirmed.";}
+        s.pinned=nil;}
+}
+fn release(s){
+    if s.job!=nil {let done=try s.io.release(s.job) catch false;s.job=nil;
+        if not done {s.cleanup_confirmed=false;s.ok=false;s.phase="failed";s.message="Upload directory cleanup was not confirmed.";}}
+    if s.closed {unpin(s);}
+}
+fn launch(s,stage){
+    let args=if s.config.config_file==nil {[]} else {["--config-file",s.config.config_file]};
+    let tail=if stage=="compiling" {["compile","--fqbn",FQBN,"--jobs","1","--build-path",s.job.build,s.job.sketch]}
+        else {["upload","--fqbn",FQBN,"--port",s.config.port,"--input-dir",s.job.build,s.job.sketch]};
+    for value in tail {push(args,value);}
+    if stage=="uploading" {s.upload_attempted=true;}
+    let h=try s.io.start(s.pinned,args,map{timeout_secs:if stage=="compiling" {120} else {30},
+        startup_timeout_ms:5000,max_output_bytes:16384,max_file_bytes:67108864,
+        // RLIMIT_NPROC counts every thread of the UID, not only this job.
+        max_memory_bytes:2147483648,max_cpu_seconds:120,max_open_files:128,max_processes:4096,
+        inherit_environment:false,environment:map{GOMAXPROCS:"2",PATH:"/usr/bin:/bin",LANG:"C",LC_ALL:"C",HOME:"/nonexistent",TMPDIR:s.job.sketch}}) catch nil;
+    // Failed native launches can still own a process; never discard them.
+    if h!=nil and ((try h.ok catch false) or (try h.active catch false)
+        or (try h.requires_recovery catch false)) {
+        s.handle=h;s.cleanup_confirmed=false;
+        if not (try h.ok catch false) {s.ok=false;s.phase="cancelling";s.message="Upload process start requires cleanup.";try s.io.cancel(h,250) catch nil;return false;}
+        s.ok=true;s.phase=stage;s.message=if stage=="compiling" {"Compiling edited frames for Arduino."} else {"Uploading edited frames to Arduino; playback remains stopped."};return true;
+    }
+    if h==nil {s.cleanup_confirmed=false;}
+    s.ok=false;s.phase="failed";s.message="Upload process could not start.";release(s);return false;
+}
+fn start(s,plan,stopped_confirmed=false){
+    if s.closed or s.handle!=nil or s.jobs>=4 or not s.cleanup_confirmed {
+        return map{ok:false,phase:s.phase,busy:s.handle!=nil,complete:s.handle==nil,cleanup_confirmed:s.cleanup_confirmed,
+            upload_attempted:s.upload_attempted,message:"Upload session is busy or requires host cleanup."};
+    }
+    if stopped_confirmed!=true {return map{ok:false,phase:"failed",busy:false,complete:true,cleanup_confirmed:true,upload_attempted:false,message:"Confirm Arduino Stop before upload."};}
+    let p=try Device.validate(plan) catch nil;
+    if p==nil {return map{ok:false,phase:"failed",busy:false,complete:true,cleanup_confirmed:true,upload_attempted:false,message:"Invalid Arduino project."};}
+    s.jobs=s.jobs+1;s.digest=p.digest;s.ok=false;s.upload_attempted=false;
+    s.job=try s.io.prepare(s.config,p,s.jobs) catch nil;
+    if s.job==nil or not (try s.job.ok catch false) {
+        s.cleanup_confirmed=s.job!=nil and (try s.job.cleanup_confirmed catch false);
+        s.job=nil;s.ok=false;s.phase="failed";s.message="Private upload preparation failed or retained slots are full; no upload started.";return view(s);
+    }
+    launch(s,"compiling");return view(s);
+}
+fn poll(s){
+    if s.handle==nil {return view(s);}
+    let observed=try s.io.poll(s.handle) catch nil;
+    if observed==nil or not (try observed.ok catch false) {
+        s.ok=false;s.phase="cancelling";s.message="Upload process status failed; cleanup required.";try s.io.cancel(s.handle,250) catch nil;
+    }
+    if observed==nil or (not (try observed.complete catch false) and not (try observed.terminated catch false)) {return view(s);}
+    let result=try s.io.finish(s.handle,0) catch nil;
+    if result==nil or not (try result.process_group_terminated catch false)
+        or not (try s.handle.cleaned catch false) {
+        s.ok=false;s.phase="cancelling";s.message="Upload process termination is not confirmed.";try s.io.cancel(s.handle,250) catch nil;return view(s);
+    }
+    if not (try result.command_ok catch false) {try s.io.diagnostic(s.job,result) catch nil;}
+    s.handle=nil;s.cleanup_confirmed=true;
+    if s.phase=="cancelling" or not (try result.command_ok catch false)
+        or (try result.timed_out catch false) {
+        s.ok=false;s.phase="failed";s.message="Upload stopped or failed. Device state requires verification; no automatic retry.";release(s);return view(s);
+    }
+    if s.phase=="compiling" and not s.closed {launch(s,"uploading");return view(s);}
+    s.phase="done";s.ok=true;s.message="Upload process completed. Confirm the new Arduino project before Play.";release(s);return view(s);
+}
+fn cancel(s){if s.handle!=nil {s.ok=false;s.phase="cancelling";s.message="Upload cancellation requested; awaiting process cleanup.";try s.io.cancel(s.handle,250) catch nil;}return view(s);};
+fn close(s){s.closed=true;cancel(s);if s.handle==nil {release(s);}return poll(s);};
+fn confirm(s,plan) {
+    let p=try Device.validate(plan) catch nil;
+    if s.closed or s.handle!=nil or s.phase!="done" or not s.ok or not s.cleanup_confirmed
+        or p==nil or p.digest!=s.digest {return map{ok:false,message:"Only the completed uploaded project may be confirmed."};}
+    let saved=try s.io.persist(s.config,p) catch false;
+    return map{ok:saved,message:if saved {"Confirmed Arduino project saved privately."}
+        else {"Arduino project confirmation could not be saved."}};
+}
+fn create(configuration,io=nil) {
+    let c=try json_parse(json_stringify(configuration)) catch nil;
+    if type(c)!="map" or (try c.enabled catch false)!=true or (try c.confirmed catch false)!=true
+        or not absolute(try c.cli catch nil) or not absolute(try c.output_parent catch nil)
+        or not regex_match(try c.cli_sha256 catch "","^[a-f0-9]{64}$")
+        or not regex_match(try c.port catch "","^/dev/ttyACM[0-9]{1,3}$")
+        or type(try c.firmware catch nil)!="string" or len(c.firmware)>32768
+        or type(try c.adapter catch nil)!="string" or len(c.adapter)>32768 {
+        throw "Explicit trusted UNO upload configuration required.";
+    }
+    c.config_file=try c.config_file catch nil;
+    if c.config_file!=nil and not absolute(c.config_file) {throw "Invalid trusted Arduino CLI configuration.";}
+    if io==nil {io=host_io();}
+    // Callbacks are trusted local test/host authority, never browser input.
+    let pinned=try io.pin(c) catch nil;
+    if pinned==nil or not (try pinned.ok catch false) {throw "Arduino CLI identity could not be verified.";}
+    let s=map{phase:"idle",handle:nil,job:nil,closed:false,jobs:0,digest:"",
+        message:"No upload requested.",ok:false,cleanup_confirmed:true,
+        upload_attempted:false,pinned:pinned,config:c,io:io};
+    return map{start:fn(plan,stopped_confirmed=false){return start(s,plan,stopped_confirmed);},
+        confirm:fn(plan){return confirm(s,plan);},poll:fn(){return poll(s);},cancel:fn(){return cancel(s);},close:fn(){return close(s);}};
+}
+export create,restore;
