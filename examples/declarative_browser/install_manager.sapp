@@ -1,0 +1,164 @@
+// Exclusive local reader installation; trusted caller receipts are not signatures.
+let Dir=import("stdlib:linux_dirfs.sapp");let Path=import("stdlib:path.sapp");
+let FORMAT="pblang.reader.install.v1";let RELEASE="pblang.reader.release.v1";
+let ACCEPT="pblang.reader.acceptance.v1";let NAME="pb-document-reader";
+fn valid_version(value) {return type(value)=="string" and regex_match(value,"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$") and not str_contains(value,"..");}
+fn quote(value) {return "'"+str_replace_all(value,"'","'\\''")+"'";}
+fn fingerprint(version,hashes) {
+    assert(valid_version(version) and type(hashes)=="map","Invalid release identity.");
+    let lines=[RELEASE,version];
+    for path in array_sort(map_keys(hashes)) {
+        assert(regex_match(path,"^[A-Za-z0-9_./-]+$") and regex_match(hashes[path],"^[0-9a-f]{64}$"),"Invalid file pin.");
+        push(lines,path+"="+hashes[path]);
+    }
+    return sha256(str_join(lines,"\n")+"\n");
+}
+fn launcher(root,current,previous="-") {
+    assert(valid_version(current) and (previous=="-" or valid_version(previous)),"Invalid launcher selection.");
+    return "#!/bin/sh\n# "+FORMAT+"\n# current="+current+"\n# previous="+previous+"\nexec /bin/sh "+quote(root+"/releases/"+current+"/run-reader.sh")+" \"$@\"\n";
+}
+fn selection(text,root) {
+    let lines=str_split(text,"\n");assert(len(lines)==6,"Not a managed reader launcher.");
+    assert(str_starts_with(lines[2],"# current=") and str_starts_with(lines[3],"# previous="),"Invalid launcher header.");
+    let current=str_slice(lines[2],10,len(lines[2]));let previous=str_slice(lines[3],11,len(lines[3]));
+    assert(text==launcher(root,current,previous),"Foreign or modified launcher; refusing replacement.");
+    return map{current:current,previous:previous};
+}
+fn _need(s,ok,error) {if not ok {s.error=error;throw error;}}
+fn _absolute(s,path) {
+    _need(s,type(path)=="string" and len(path)>0 and len(path)<=4096 and not str_contains(path,"\n")
+        and not str_contains(path,"\r") and not str_contains(path,"\\") and not str_contains(path,strfromcharcode(0)),"Invalid installation path.");
+    let result=Path.normalize(Path.absolute(path));_need(s,result!="/","Filesystem root is not an installation path.");return result;
+}
+fn _open(s,path,private=false) {let fs=Dir.open_absolute(path,false,private);_need(s,fs.ok,"Directory admission failed.");push(s.handles,fs);return fs;}
+fn _text(s,fs,path) {let r=Dir.read_bytes(fs,path,1048576);_need(s,r.ok,"Cannot read bounded regular metadata.");let t=bytes_to_str(r.bytes);_need(s,str_to_bytes(t)==r.bytes,"Metadata must be UTF-8.");return t;}
+fn _root(s,path,create=false) {
+    let parent=_open(s,Path.dirname(path));let name=Path.basename(path);let meta=Dir.metadata(parent,name);
+    if not meta.ok {
+        _need(s,create,"Reader installation does not exist.");
+        _need(s,Dir.mkdir_new(parent,name,false).ok,"Cannot create new installation root.");s.root_created=true;
+        let fresh=_open(s,path,true);
+        for dir in ["releases","accepted","data"] {_need(s,Dir.mkdir_new(fresh,dir,false).ok,"Cannot create installation directories.");}
+        _need(s,Dir.write_new_atomic(fresh,"owner.txt",str_to_bytes(FORMAT+"\n"),false).ok,"Cannot publish installation owner.");
+    }
+    let fs=_open(s,path,true);_need(s,_text(s,fs,"owner.txt")==FORMAT+"\n","Unmanaged root; refusing to adopt it.");
+    let lock=Dir.acquire_lock(fs,"install.lock",0,10,true);_need(s,lock.ok,"Reader installation is busy.");push(s.locks,map{fs:fs,lock:lock});return fs;
+}
+fn _walk(s,fs,prefix,out,depth,installed) {
+    _need(s,depth<=8,"Release directory depth exceeded.");let ls=Dir.list_relative(fs,prefix,129);
+    _need(s,ls.ok and not ls.truncated,"Release inventory unavailable or too large.");
+    for name in array_sort(ls.entries) {
+        out.entries=out.entries+1;_need(s,out.entries<=192,"Release entry count exceeded.");
+        _need(s,regex_match(name,"^[A-Za-z0-9_][A-Za-z0-9_.-]*$") and not str_contains(name,".."),"Unsupported release name.");
+        let path=if prefix=="" {name} else {prefix+"/"+name};let meta=Dir.metadata(fs,path);
+        _need(s,meta.ok and (meta.kind=="directory" or meta.kind=="file"),"Only regular files/directories are admitted.");
+        if meta.kind=="directory" {push(out.dirs,path);_walk(s,fs,path,out,depth+1,installed);}
+        else {
+            if not (installed and path=="reader-release.json") {
+                _need(s,len(out.files)<128,"Release file count exceeded.");
+                let limit=if path=="pblang" {67108864} else {1048576};
+                let held=Dir.sealed_snapshot_file_descriptor(fs,path,limit);_need(s,held.ok,"File snapshot admission failed.");
+                let digest=Dir.held_base64_sha256(fs,held);_need(s,digest.ok,"Streaming file digest unavailable.");
+                out.total=out.total+held.size;_need(s,out.total<=75497472,"Release byte budget exceeded.");
+                out.files[path]=held;out.hashes[path]=digest.sha256;
+                if installed {let mode=if path=="pblang" {448} else {384};_need(s,bit_and(meta.mode,511)==mode,"Installed file permissions changed.");}
+            }
+        }
+    }
+}
+fn _capture(s,fs,installed=false) {let out=map{files:map{},hashes:map{},dirs:[],total:0,entries:0};_walk(s,fs,"",out,0,installed);return out;}
+fn _held_text(s,fs,snap,path) {
+    _need(s,map_has(snap.files,path),"Required package file is absent.");let held=snap.files[path];
+    _need(s,held.size<=1048576,"Text file exceeds admission bound.");let data=Dir.read_held_range_bytes(fs,held,0,held.size);
+    _need(s,data.ok,"Cannot read captured package bytes.");let text=bytes_to_str(data.bytes);
+    _need(s,str_to_bytes(text)==data.bytes,"Package text must be UTF-8.");return text;
+}
+fn _candidate(s,fs,snap,runtime_pin) {
+    _need(s,regex_match(runtime_pin,"^[0-9a-f]{64}$") and (try snap.hashes.pblang catch "")==runtime_pin,"Runtime pin mismatch.");
+    let magic=Dir.read_held_range_bytes(fs,snap.files.pblang,0,20);
+    _need(s,magic.ok and slice(magic.bytes,0,6)==[127,69,76,70,2,1] and magic.bytes[18]==62 and magic.bytes[19]==0,"Expected Linux x86-64 ELF runtime.");
+    let receipt=json_parse(_held_text(s,fs,snap,"package-receipt.json"));
+    _need(s,receipt.format=="pblang.package-folder.v1" and receipt.complete and receipt.entry=="examples/declarative_browser/main.sapp","Not a complete reader package.");
+    let inventory=json_parse(_held_text(s,fs,snap,"reader-source-sha256.json"));_need(s,type(inventory)=="map" and len(inventory)>0 and len(inventory)<=120,"Invalid module inventory.");
+    let allowed=map{};
+    for name in ["pblang","pblang.toml","pblang.lock","run-reader.sh","LICENSE","README.txt","reader-source-sha256.json","package-receipt.json"] {allowed[name]=true;_need(s,map_has(snap.files,name),"Incomplete package.");}
+    for path in map_keys(inventory) {
+        _need(s,str_starts_with(path,"stdlib/") or str_starts_with(path,"examples/declarative_browser/"),"Module is outside reader scope.");
+        _need(s,sha256(_held_text(s,fs,snap,path))==inventory[path],"Module content pin mismatch.");allowed[path]=true;
+    }
+    _need(s,len(allowed)==len(snap.files),"Unexpected package files.");
+    for path in map_keys(snap.files) {_need(s,map_has(allowed,path),"Unexpected package file.");}
+    _need(s,map_has(inventory,"examples/declarative_browser/install.sapp") and map_has(inventory,"examples/declarative_browser/install_manager.sapp"),"Package lacks the standalone install manager.");
+}
+fn _verify(s,root,version) {
+    _need(s,valid_version(version),"Invalid version.");let fs=_open(s,root+"/releases/"+version,true);
+    let metadata=json_parse(_text(s,fs,"reader-release.json"));
+    _need(s,metadata.format==RELEASE and metadata.version==version and metadata.digest_algorithm=="sha256(base64(bytes))","Invalid release record.");
+    let snap=_capture(s,fs,true);_need(s,snap.hashes==metadata.files and fingerprint(version,snap.hashes)==metadata.fingerprint,"Installed release content changed.");
+    _candidate(s,fs,snap,metadata.runtime_pin);return metadata;
+}
+fn _receipt(s,receipt,metadata) {
+    _need(s,receipt.format==ACCEPT and receipt.version==metadata.version and receipt.fingerprint==metadata.fingerprint
+        and receipt.passed==true,"Acceptance does not match this release.");
+    for check in ["source_hidden","launcher","style","pagination","content_unchanged"] {_need(s,(try receipt.checks[check] catch false)==true,"Required acceptance check is missing.");}
+}
+fn _current(s,bin,root) {
+    if not Dir.metadata(bin,NAME).ok {return nil;}
+    return selection(_text(s,bin,NAME),root);
+}
+fn _publish(s,bin,root,current,previous,old) {
+    let before=_current(s,bin,root);_need(s,before==old,"Launcher selection changed before publication.");
+    let temp=NAME+"-stage-"+str_slice(sha256(base64_encode_bytes(random_bytes(16))),0,20);
+    _need(s,Dir.write_new_atomic(bin,temp,str_to_bytes(launcher(root,current,previous)),false).ok,"Cannot stage reader launcher.");
+    _need(s,Dir.protect_executable(bin,temp).ok,"Cannot protect reader launcher.");
+    s.activation_attempted=true;
+    let moved=if old==nil {Dir.move_new_exclusive(bin,temp,NAME,false)} else {Dir.move(bin,temp,NAME,false)};
+    _need(s,moved.ok,"Launcher publication not confirmed; inspect status before retry.");s.changed=true;
+    let after=_current(s,bin,root);_need(s,after.current==current and after.previous==previous,"Launcher readback mismatch.");s.selection=after;
+}
+fn _run(s,args) {
+    let action=args[0];
+    if action=="prepare" {
+        _need(s,len(args)==5,"prepare requires CANDIDATE ROOT VERSION RUNTIME_BASE64_SHA256");
+        let candidate=_absolute(s,args[1]);let root=_absolute(s,args[2]);let version=args[3];_need(s,valid_version(version),"Invalid version.");
+        _need(s,not Path.is_subpath(candidate,root) and not Path.is_subpath(root,candidate),"Candidate and installation root overlap.");
+        let source=_open(s,candidate,true);let snap=_capture(s,source);_candidate(s,source,snap,args[4]);
+        let fs=_root(s,root,true);_need(s,Dir.mkdir_new(fs,"releases/"+version,false).ok,"Release already exists or cannot be created.");
+        s.release_created=true;let dest=_open(s,root+"/releases/"+version,true);
+        for path in array_sort(snap.dirs) {_need(s,Dir.mkdir_new(dest,path,false).ok,"Release directory creation failed.");}
+        for path in array_sort(map_keys(snap.files)) {let held=snap.files[path];_need(s,Dir.copy_held_range_new_atomic(source,held,dest,path,0,held.size,false,path=="pblang").ok,"Release file publication failed.");}
+        let metadata=map{format:RELEASE,version:version,files:snap.hashes,runtime_pin:args[4],digest_algorithm:"sha256(base64(bytes))",fingerprint:fingerprint(version,snap.hashes)};
+        _need(s,Dir.write_new_atomic(dest,"reader-release.json",str_to_bytes(json_stringify(metadata)+"\n"),false).ok,"Release completion record failed.");s.release=metadata;
+    } else {
+        _need(s,len(args)>=3,"Expected ROOT and version/bin arguments.");let root=_absolute(s,args[1]);let fs=_root(s,root);
+        if action=="verify" {_need(s,len(args)==3,"verify requires ROOT VERSION");s.release=_verify(s,root,args[2]);}
+        elif action=="activate" {
+            _need(s,len(args)==5,"activate requires ROOT VERSION BIN_DIR ACCEPTANCE_JSON");let metadata=_verify(s,root,args[2]);
+            let evidence=_absolute(s,args[4]);let input=_open(s,Path.dirname(evidence));let receipt=json_parse(_text(s,input,Path.basename(evidence)));_receipt(s,receipt,metadata);
+            let bin=_open(s,_absolute(s,args[3]));let old=_current(s,bin,root);let previous="-";
+            if old!=nil {if old.current==args[2] {s.selection=old;s.release=metadata;return;}previous=old.current;_verify(s,root,previous);}
+            let name="accepted/"+args[2]+".json";
+            if Dir.metadata(fs,name).ok {_receipt(s,json_parse(_text(s,fs,name)),metadata);}
+            else {_need(s,Dir.write_new_atomic(fs,name,str_to_bytes(json_stringify(receipt)+"\n"),false).ok,"Cannot retain acceptance receipt.");}
+            _publish(s,bin,root,args[2],previous,old);s.release=metadata;
+        } elif action=="rollback" or action=="status" {
+            _need(s,len(args)==3,"Expected ROOT BIN_DIR");let bin=_open(s,_absolute(s,args[2]));let old=_current(s,bin,root);_need(s,old!=nil,"No active reader launcher.");
+            if action=="rollback" {
+                _need(s,old.previous!="-","No previous reader version.");let metadata=_verify(s,root,old.previous);
+                _receipt(s,json_parse(_text(s,fs,"accepted/"+old.previous+".json")),metadata);
+                _publish(s,bin,root,old.previous,old.current,old);s.release=metadata;
+            } else {s.selection=old;s.release=_verify(s,root,old.current);}
+        } else {_need(s,false,"Unknown install operation.");}
+    }
+}
+fn run(args) {
+    let s=map{handles:[],locks:[],error:nil,root_created:false,release_created:false,activation_attempted:false,changed:false,selection:nil,release:nil};
+    let ok=try {_need(s,type(args)=="array" and len(args)>0,"Missing install operation.");_run(s,args);true} catch false;
+    let closed=true;for item in s.locks {if not (try Dir.release_lock(item.fs,item.lock) catch false) {closed=false;}}
+    for fs in s.handles {if not (try Dir.close(fs) catch false) {closed=false;}}
+    if not ok and s.error==nil {s.error="Installation metadata/operation rejected.";}
+    return map{ok:ok and closed,error:s.error,root_created:s.root_created,release_created:s.release_created,
+        activation_attempted:s.activation_attempted,selection_changed:s.changed,selection:s.selection,
+        release:s.release,owned_handles_closed:closed,whole_install_atomic:false,data_modified:false};
+}
+export valid_version,quote,fingerprint,launcher,selection,run;

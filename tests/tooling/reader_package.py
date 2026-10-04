@@ -8,8 +8,9 @@ import subprocess
 import tempfile
 
 
-LAUNCH_PROBE = '''import subprocess,time
-child=subprocess.Popen(['/bin/sh','/app/run-reader.sh'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+LAUNCH_PROBE = '''import subprocess,time,sys
+launch=sys.argv[1] if len(sys.argv)>1 else '/app/run-reader.sh'
+child=subprocess.Popen(['/bin/sh',launch],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
 try:
     window=None;deadline=time.monotonic()+15
     while time.monotonic()<deadline:
@@ -21,9 +22,27 @@ try:
     time.sleep(.5)
     subprocess.run(['import','-window',window,'/probe/reader-standalone.png'],check=True,timeout=8)
     subprocess.run(['xdotool','windowfocus','--sync',window],check=True,timeout=5)
-    subprocess.run(['xdotool','keydown','Escape'],check=True,timeout=5)
-    time.sleep(.18)
-    subprocess.run(['xdotool','keyup','Escape'],check=True,timeout=5)
+    def key(name):
+        subprocess.run(['xdotool','keydown',name],check=True,timeout=5)
+        time.sleep(.18)
+        subprocess.run(['xdotool','keyup',name],check=True,timeout=5)
+        time.sleep(.25)
+    def click(x,y):
+        subprocess.run(['xdotool','mousemove','--window',window,str(x),str(y),'mousedown','1'],check=True,timeout=5)
+        time.sleep(.18)
+        subprocess.run(['xdotool','mouseup','1'],check=True,timeout=5)
+        time.sleep(.3)
+    click(700,44)
+    for name in ('Return','Tab','Return','Return','Tab','Return','Return','Tab','Return'):key(name)
+    subprocess.run(['import','-window',window,'/probe/reader-style.png'],check=True,timeout=8)
+    click(700,44)
+    subprocess.run(['xdotool','windowsize',window,'320','480'],check=True,timeout=5)
+    time.sleep(.6)
+    subprocess.run(['import','-window',window,'/probe/reader-first.png'],check=True,timeout=8)
+    key('End')
+    subprocess.run(['import','-window',window,'/probe/reader-last.png'],check=True,timeout=8)
+    key('Escape')  # First Escape clears the focused Style/navigation control.
+    if child.poll() is None:key('Escape')
     output,error=child.communicate(timeout=10)
     assert child.returncode==0,(output,error)
     print('standalone_window_pass')
@@ -114,6 +133,8 @@ def main():
         def run(name, command, timeout=60, success=0, marker=None):
             result = subprocess.run(sandbox+command,capture_output=True,text=True,timeout=timeout)
             (evidence/(name+'.log')).write_text(result.stdout+result.stderr)
+            for screenshot in probe.glob('reader-*.png'):
+                shutil.copy2(screenshot,evidence/screenshot.name)
             record(name,result.returncode==success and (marker is None or marker in result.stdout),exit=result.returncode)
         run('checkout absent',['/bin/sh','-c','test ! -e "$1" && test ! -e /home && test ! -e /media','sh',str(repo)])
         run('foreign cwd CLI',['/bin/sh','/app/run-reader.sh','--check'],marker='declarative_browser_pass')
@@ -131,7 +152,8 @@ def main():
             timeout=90,marker='"result": "pass"')
         for screenshot in (probe/'build').glob('reader-measured-*.png'):
             shutil.copy2(screenshot,evidence/screenshot.name)
-        shutil.copy2(probe/'reader-standalone.png',evidence/'reader-standalone.png')
+        for screenshot in probe.glob('reader-*.png'):
+            shutil.copy2(screenshot,evidence/screenshot.name)
     record('candidate unchanged after acceptance',before==snapshot(package))
 
 

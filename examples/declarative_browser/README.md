@@ -349,7 +349,7 @@ sh ../reader-candidates/reader-v2/run-reader.sh
 The default launch opens the native GUI, including actual font measurement and
 the existing Style controls. `--check` exercises offline document navigation and
 roundtrip without a display. `--help` prints usage; other arguments are rejected.
-The launcher disables network, HTTP, process execution and spawning. Native GUI
+Normal reader launch disables network, HTTP, process execution and spawning. Native GUI
 still needs local graphics/FFI and filesystem access for libraries/fonts; this is
 not an application sandbox. Invoke the launcher with `sh`: the package contract
 keeps source files non-executable and only marks the runtime executable.
@@ -401,3 +401,141 @@ scanner, path admission and v2 digest (including Unicode and empty directories)
 without filesystem, network, FFI or process effects. The native runtime and
 standard OS libraries are retained dependencies. The small shell launcher is
 only an OS handoff to the included runtime, not a packaging implementation.
+
+### Dedicated versioned Linux installation
+
+The additive `install.sapp` / `install_manager.sapp` workflow is written in
+PBLang and ships in the candidate's import closure. It owns only an explicitly
+chosen root and the `pb-document-reader` launcher in an explicitly chosen bin
+directory. It does not update global PBLang, desktop entries, other products or
+old candidate archives. A typical local contract is:
+
+- `~/.local/share/pb-document-reader/releases/<version>`: pinned complete copies;
+- `~/.local/share/pb-document-reader/accepted/<version>.json`: retained acceptance;
+- `~/.local/share/pb-document-reader/data`: reserved user data, never modified by
+  upgrade/rollback;
+- `~/.local/bin/pb-document-reader`: executable containing current and previous
+  version IDs and a shell handoff to the selected release.
+
+Both parent directories must already exist; the installer creates a private
+0700 root and refuses to adopt an existing unmarked root. Version IDs are 1–64
+ASCII letters/digits/dots/underscores/hyphens, start with a letter/digit, and
+cannot contain `..`. Existing versions are never overwritten. Directory and
+file access uses the existing Linux no-follow, descriptor-bound helpers;
+source snapshots are copied with exclusive publication. Inputs are trusted local
+packages, not a defense against concurrent hostile processes running as you.
+
+From any working directory, using an already accepted candidate:
+
+```sh
+# PIN is sha256(base64(runtime bytes)), with no base64 line wrapping.
+# Obtain it independently from the trusted runtime, not from an unknown package.
+# This digest format uses the existing streaming Dir.held_base64_sha256 API.
+sh /absolute/candidate/run-reader.sh --manage prepare \
+  /absolute/candidate /home/USER/.local/share/pb-document-reader VERSION PIN
+sh /absolute/candidate/run-reader.sh --manage verify \
+  /home/USER/.local/share/pb-document-reader VERSION
+```
+
+`prepare` verifies the package/module inventory, exact file set, Linux x86-64
+ELF header and the supplied runtime pin. It snapshots all files, copies to a new
+release and writes `reader-release.json` last. The release record pins **all**
+files, including the runtime, launcher, manifest, dependency lock and inventory.
+Its fingerprint also binds the version ID. Maximums are 128 files, 192 directory
+entries, depth 8, 1 MiB per source/metadata file, 64 MiB runtime and 72 MiB total.
+Installed source files are 0600 and runtime 0700. `verify` recaptures file bytes,
+checks pins/permissions and revalidates package admission; it does not execute
+the GUI or certify the runtime's origin.
+
+Before activation, run `tests/tooling/reader_package.py` against the **prepared
+release** and inspect its native `reader-style.png`, `reader-first.png` and
+`reader-last.png`. The harness mounts that release read-only with the original
+checkout absent, exercises real launch/Style/pagination plus measured rendering,
+and verifies unchanged content. Copy its verified version/fingerprint from
+`reader-release.json` into an acceptance JSON file, only after all checks pass:
+
+```json
+{
+  "format": "pblang.reader.acceptance.v1",
+  "version": "VERSION",
+  "fingerprint": "64 lowercase hexadecimal characters from the verified record",
+  "passed": true,
+  "checks": {
+    "source_hidden": true,
+    "launcher": true,
+    "style": true,
+    "pagination": true,
+    "content_unchanged": true
+  }
+}
+```
+
+This is a **trusted caller attestation**, not a signature, independent auditor or
+automatically authenticated test result. The installer enforces its required
+fields and exact release binding. Keep actual logs/screenshots separately.
+
+```sh
+sh /absolute/candidate/run-reader.sh --manage activate \
+  /home/USER/.local/share/pb-document-reader VERSION \
+  /home/USER/.local/bin /absolute/acceptance.json
+/home/USER/.local/bin/pb-document-reader
+/home/USER/.local/bin/pb-document-reader --check
+/home/USER/.local/bin/pb-document-reader --manage status \
+  /home/USER/.local/share/pb-document-reader /home/USER/.local/bin
+/home/USER/.local/bin/pb-document-reader --manage rollback \
+  /home/USER/.local/share/pb-document-reader /home/USER/.local/bin
+```
+
+Activation validates the target and the current release that becomes the rollback
+baseline. The first activation has no previous version: for an initial rollout,
+prepare/test/accept a separate recovery snapshot, activate it first, then activate
+the separately prepared/tested current version. Two copies of the same candidate
+are a recovery snapshot, not evidence of an upgrade from an older product.
+Rollback verifies the previous copy and its retained receipt, then swaps current
+and previous. It can recover from damaged current files without verifying those
+files; a second rollback returns to the other copy if it still verifies. If the
+active runtime/manager itself cannot start, invoke a retained good release:
+
+```sh
+sh /home/USER/.local/share/pb-document-reader/releases/RECOVERY/run-reader.sh \
+  --manage rollback /home/USER/.local/share/pb-document-reader /home/USER/.local/bin
+```
+
+A private advisory lock serializes this installer per root; another operation
+fails busy rather than waiting. The one authoritative launcher contains both
+IDs. A new executable is staged beside it before publication; initial publication
+uses no-replace rename and subsequent selection uses atomic rename. A foreign or
+modified launcher is refused. Selection is atomic for ordinary readers, but the
+whole installation is **not** a transaction or a power-loss durability guarantee.
+Partial releases and staged launchers are retained on failure; nothing recursively
+deletes them. If publication is reported attempted but unconfirmed, inspect
+`status` before any retry. Do not run separate roots against the same launcher.
+The normal launch does not hash every file on each start; use `verify`/`status`
+after suspected modification. GUI preferences remain per session.
+
+`tests/semantics/reader_install_test.sapp` covers pure identity/launcher/fingerprint
+contracts. `tests/tooling/reader_install.py` checks transitions, no-overwrite,
+foreign state, locking, tampering, source-hidden management and data preservation
+in temporary roots. Its synthetic receipts test the mechanism and **do not**
+constitute acceptance of a real installation. Python remains test-only; normal
+prepare/verify/activate/status/rollback run through the packaged PBLang manager.
+Management enables filesystem/FFI and process support for the existing PBLang
+directory helpers (including native no-replace publication); it explicitly denies
+network/HTTP. This maintenance route is not an application sandbox. No telemetry,
+credential store or remote service is added. Only Linux x86-64 is covered by this
+local installer.
+
+After activating or rolling back, test the exact installed launcher with:
+
+```sh
+python3 tests/tooling/reader_installed.py \
+  --root /home/USER/.local/share/pb-document-reader \
+  --bin-dir /home/USER/.local/bin --evidence /absolute/NEW_EVIDENCE
+```
+
+This read-only native journey mounts just the selected release, its launcher,
+OS dependencies and synthetic test driver; the checkout and user data are absent.
+It opens Style, changes font/size/scale/spacing, resizes to 320×480 and goes to the
+last reading page. Inspect the resulting screenshots separately; successful key
+injection alone is not a visual correctness assertion. The driver checks that
+release files and the launcher remain unchanged.
