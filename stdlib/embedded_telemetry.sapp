@@ -1,0 +1,153 @@
+// Explicit USB-to-host-to-local-MQTT telemetry. No MCU Wi-Fi driver or discovery.
+// Adapter evidence validates local result contracts; it is not device attestation.
+let MQTT=import("stdlib:mqtt311.sapp");
+let TCP=import("stdlib:native_tcp.sapp");
+let FORMAT="pblang.embedded-telemetry.v1";
+let EVIDENCE="confirmed-wired-status";
+fn _integer(v, low, high){return type(v) == "number" and v >= low and v <= high and v == num_floor(v);}
+
+fn _true(v){return type(v) == "bool" and v;}
+
+fn _false(v){return type(v) == "bool" and not v;}
+
+fn _fields(v, names){
+    if type(v) != "map" or len(map_keys(v)) != len(names){throw "Invalid telemetry shape.";}
+    let index=0;
+    while index<len(names){
+        if not map_has(v,names[index]){throw "Invalid telemetry shape.";}
+        index=index+1;
+    }
+}
+
+fn validate(snapshot){
+    _fields(snapshot, ["format", "board", "evidence", "sequence", "status"]);
+    if snapshot.format != FORMAT or snapshot.evidence != EVIDENCE or not _integer(snapshot.sequence, 0, 2147483647){throw "Invalid telemetry evidence.";}
+    let status=snapshot.status;let clean=map{};
+    if snapshot.board == "arduino-uno-r4-wifi"{
+        _fields(status, ["state", "frame", "remaining_ms", "frames"]);
+        if (status.state != "idle" and status.state != "running" and status.state != "done")
+        or not _integer(status.frames, 1, 64) or not _integer(status.frame, 0, status.frames)
+        or not _integer(status.remaining_ms, 0, 60000){throw "Invalid UNO telemetry.";}
+        if status.state == "running" and status.frame < 1{throw "Invalid UNO telemetry.";}
+        if status.state != "running" and (status.frame != 0 or status.remaining_ms != 0){throw "Invalid UNO telemetry.";}
+        clean=map{state:status.state, frame:status.frame, remaining_ms:status.remaining_ms, frames:status.frames};
+    } elif snapshot.board == "esp32-devkitc-v4"{
+        _fields(status, ["on", "blinking", "interval_ms", "remaining_ms"]);
+        if type(status.on) != "bool" or type(status.blinking) != "bool"
+        or not _integer(status.interval_ms, 10, 60000) or not _integer(status.remaining_ms, 0, 60000){throw "Invalid ESP telemetry.";}
+        clean=map{on:status.on, blinking:status.blinking, interval_ms:status.interval_ms, remaining_ms:status.remaining_ms};
+    } else {throw "Unsupported telemetry board.";}
+    return map{format:FORMAT, board:snapshot.board, evidence:EVIDENCE, sequence:snapshot.sequence, status:clean};
+}
+
+fn from_uno(result, sequence){
+    if type(result) != "map" or not _true((try result.ok catch false)) or not _true((try result.identity_matched catch false))
+    or not _true((try result.close_ok catch false)) or not _true((try result.termios_restored catch false))
+    or (try result.command catch "") != "STATUS"{throw "Unconfirmed UNO status.";}
+    let r=result.reply;
+    if r.protocol != "PBLED1" or r.board != "UNO_R4_WIFI" or r.command != "STATUS" or not _true(r.ok) or r.error != ""{throw "Unconfirmed UNO status.";}
+    return validate(map{format:FORMAT, board:"arduino-uno-r4-wifi", evidence:EVIDENCE, sequence:sequence,
+        status:map{state:r.state, frame:r.frame, remaining_ms:r.remaining_ms, frames:r.frames}});
+}
+
+fn from_esp(session, result, closed, sequence){
+    if type(session) != "map" or (try session.format catch "") != "pblang.embedded-controller.v1"
+    or session.board != "esp32-devkitc-v4" or session.mode != "wired" or not _true(session.closed)
+    or not _false(session.connected) or not _true(closed.ok) or not _true(closed.termios_restored)
+    or not _true(result.ok) or not _false(result.applied) or result.transport != "wired-serial"
+    or not _true(result.circuit.ok) or not _true(result.circuit.state_verified)
+    or result.circuit.device != session.device_id{throw "Unconfirmed ESP status.";}
+    let r=result.response;
+    if not _true(r.ok) or r.format != "pblang.embedded-wire.v1" or r.kind != "response"
+    or (r.status != 0 and r.status != 2) or not _integer(r.sequence, 1, 255){throw "Unconfirmed ESP status.";}
+    return validate(map{format:FORMAT, board:"esp32-devkitc-v4", evidence:EVIDENCE, sequence:sequence,
+        status:map{on:r.on, blinking:r.blinking, interval_ms:r.interval_ms, remaining_ms:r.remaining_ms}});
+}
+
+fn topic(board){
+    if board == "arduino-uno-r4-wifi"{return "pblang/boards/uno-r4-wifi/status";}
+    if board == "esp32-devkitc-v4"{return "pblang/boards/esp32-wroom-32d/status";}
+    throw "Unsupported telemetry board.";
+}
+
+fn _remaining(io, started, timeout){
+    let now=io.now();
+    if not _integer(now, 0, 9007199254740991) or now < started.last or now - started.begin >= timeout{throw "Telemetry deadline expired.";}
+    started.last=now;
+    return timeout - (now - started.begin);
+}
+
+fn _write(io, state, bytes, started, timeout){
+    let wrote=io.write(state.socket, bytes, _remaining(io, started, timeout));
+    if not _true(wrote.ok) or wrote.count != len(bytes){throw "Telemetry write failed.";}
+    _remaining(io, started, timeout);
+}
+
+fn _read4(io, state, expected, started, timeout){
+    let read=io.read(state.socket, 4, _remaining(io, started, timeout));
+    _remaining(io, started, timeout);
+    if not _true(read.ok) or read.count != 4 or read.bytes != expected{throw "Telemetry acknowledgement failed.";}
+}
+
+fn _exchange(io, state, payload, destination, timeout){
+    let first=io.now();if not _integer(first, 0, 9007199254740991){throw "Invalid telemetry clock.";}
+    let started=map{begin:first,last:first};
+    // Random session identifier contains no host, user, device or project identity.
+    let random=io.random();
+    if type(random) != "array" or len(random) != 8{throw "Telemetry entropy unavailable.";}
+    let index=0;
+    while index<len(random){
+        if not _integer(random[index],0,255){throw "Telemetry entropy unavailable.";}
+        index=index+1;
+    }
+    let id="pb-" + str_slice(sha256(base64_encode_bytes(random)), 0, 16);
+    state.network_attempted=true;state.error="connect-failed";
+    state.socket=io.connect("127.0.0.1", state.port, _remaining(io, started, timeout));
+    if type(state.socket) != "map" or not _true((try state.socket.ok catch false)){throw "Telemetry connect failed.";}
+    state.error="connect-handshake-failed";
+    _write(io, state, MQTT.connect_packet(id, 0), started, timeout);
+    _read4(io, state, [32, 2, 0, 0], started, timeout);
+    state.error="publish-unconfirmed";state.publish_attempted=true;
+    _write(io, state, MQTT.publish_packet(destination, payload, 1, 1, false), started, timeout);
+    _read4(io, state, [64, 2, 0, 1], started, timeout);state.acknowledged=true;
+    // A broker ACK confirms QoS1 delivery; a disconnect failure is reported separately.
+    state.error="disconnect-failed";_write(io, state, [224, 0], started, timeout);
+    state.error="";return true;
+}
+
+// The host clock returns fractional milliseconds. Normalize only the native
+// clock boundary; injected transport clocks must still return valid integers.
+fn native_io(clock=nil){
+    let source=now_ms;if clock!=nil{source=clock;}
+    return map{connect:TCP.connect_ipv4,write:TCP.write_bytes,read:TCP.read_exact_bytes,
+        close:TCP.close,now:fn(){
+            let raw=source();
+            if type(raw)!="number" or not(raw>=0 and raw<=9007199254740991){throw "Invalid native telemetry clock.";}
+            return num_floor(raw);
+        },random:fn(){return random_bytes(8);}};
+}
+
+fn publish_local(snapshot, port=1883, timeout=1000, io=nil){
+    let state=map{ok:false, acknowledged:false, cleanup_ok:true, network_attempted:false,
+        publish_attempted:false, outcome_uncertain:false, error:"invalid-request", socket:nil, port:port};
+    let clean=try validate(snapshot) catch nil;
+    if clean == nil or not _integer(port, 1, 65535) or not _integer(timeout, 250, 5000){return _report(state);}
+    let payload=str_to_bytes(json_stringify(clean));if len(payload) > 1024{return _report(state);}
+    let transport=if io == nil{native_io()} else {io};
+    state.error="transport-failed";
+    let completed=try _exchange(transport, state, payload, topic(clean.board), timeout) catch false;
+    if state.socket != nil{
+        let closed=try transport.close(state.socket) catch nil;
+        state.cleanup_ok=type(closed) == "map" and _true(try closed.ok catch false);
+    }
+    state.ok=completed and state.cleanup_ok;
+    if not state.cleanup_ok and state.error == ""{state.error="cleanup-failed";}
+    state.outcome_uncertain=state.publish_attempted and not state.acknowledged;
+    return _report(state);
+}
+
+fn _report(state){return map{ok:state.ok, acknowledged:state.acknowledged, cleanup_ok:state.cleanup_ok,
+        network_attempted:state.network_attempted, publish_attempted:state.publish_attempted,
+        outcome_uncertain:state.outcome_uncertain, error:state.error, qos:1, retained:false,
+        transport:"host-loopback-mqtt", device_wifi_used:false};}
+export FORMAT, validate, from_uno, from_esp, topic, native_io, publish_local;
