@@ -228,6 +228,7 @@ layer. See [`docs/NATIVE_TCP.md`](docs/NATIVE_TCP.md).
 | `pblang --ide` | Launch the native pblang IDE. |
 | `pblang --check <file>` | Parse and type-check only. |
 | `pblang --check --via-pblang <file>` | PBLang source analysis with failing diagnostic status through the [qualified Linux launcher](docs/PUBLIC_SELFHOST_CHECK.md); `--self-host` is an alias. |
+| `pblang --check --via-pblang --bounded-source=65536 <FFI grants> <file>` | Opt-in Linux source-byte admission before allocation; stricter no-follow paths, explicit library/symbol grants. See [contract](docs/PUBLIC_SELFHOST_CHECK.md#opt-in-bounded-source-admission). |
 | `pblang --dump-bytecode <file>` | Print bytecode disassembly. |
 | `pblang --cfg <file>` | Dump a control-flow graph. |
 
