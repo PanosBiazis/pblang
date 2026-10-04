@@ -1,0 +1,104 @@
+// Optional local reader preferences. Only explicit Save/Reset can publish bytes.
+let Dir=import("stdlib:linux_dirfs.sapp");let Path=import("stdlib:path.sapp");
+let Profile=import("./appearance_profile.sapp");
+let OWNER="pblang.reader.style-store.v1\n";let FILE="appearance-v1.json";
+fn _need(s,ok,message) {if not ok {s.error=message;throw message;}}
+fn _open(s,path) {let fs=Dir.open_absolute(path,false,true);_need(s,fs.ok,"Private profile folder unavailable");push(s.handles,fs);return fs;}
+fn _close(s) {
+    let closed=true;
+    for item in s.locks {if not (try Dir.release_lock(item.fs,item.lock) catch false) {closed=false;}}
+    for fs in s.handles {if not (try Dir.close(fs) catch false) {closed=false;}}
+    return closed;
+}
+fn _bytes(s,fs,name) {
+    let meta=Dir.metadata(fs,name);_need(s,meta.ok and meta.kind=="file" and meta.owner_current_user and meta.link_count==1 and bit_and(meta.mode,511)==384,"Private regular profile required");
+    let read=Dir.read_bytes(fs,name,4096);_need(s,read.ok,"Profile exceeds limits or cannot be read");return read.bytes;
+}
+fn _path(s,parent) {
+    _need(s,type(parent)=="string" and len(parent)>0 and len(parent)<=4096
+        and Path.is_absolute(parent) and not str_contains(parent,"\n") and not str_contains(parent,"\r")
+        and not str_contains(parent,"\\") and not str_contains(parent,strfromcharcode(0)),"Profile path unavailable");
+    let path=Path.normalize(parent);_need(s,path!="/","Profile root is not a data folder");return path;
+}
+fn _folder(s,parent,create) {
+    parent=_path(s,parent);let root=_open(s,parent);let meta=Dir.metadata(root,"reader-style");
+    if not meta.ok {
+        if not create {return nil;}
+        _need(s,Dir.mkdir_new(root,"reader-style",false).ok,"Cannot create exclusive profile folder");
+        let fresh=_open(s,parent+"/reader-style");
+        _need(s,Dir.write_new_exclusive(fresh,"owner.txt",str_to_bytes(OWNER),false).ok,"Cannot record profile ownership");
+    }
+    let fs=_open(s,parent+"/reader-style");
+    _need(s,_bytes(s,fs,"owner.txt")==str_to_bytes(OWNER),"Unmanaged profile folder preserved");return fs;
+}
+fn _read(s,fs) {
+    if fs==nil {return map{token:"missing",bytes:nil,backups:0};}
+    let names=Dir.list_relative(fs,"",64);_need(s,names.ok and not names.truncated,"Profile folder entry limit");
+    let present=false;let backups=0;
+    for name in names.entries {
+        if name==FILE {present=true;}
+        if str_starts_with(name,"previous-") {backups=backups+1;}
+    }
+    if not present {return map{token:"missing",bytes:nil,backups:backups};}
+    let bytes=_bytes(s,fs,FILE);
+    return map{token:sha256(base64_encode_bytes(bytes)),bytes:bytes,backups:backups};
+}
+fn load(parent) {
+    let s=map{handles:[],locks:[],error:nil};let state=nil;
+    let ok=try {let fs=_folder(s,parent,false);state=_read(s,fs);true} catch false;
+    let closed=_close(s);
+    if not ok or not closed {return map{ok:false,can_save:false,token:nil,appearance:Profile.defaults(),message:"Profile unavailable; session only",reason:s.error};}
+    if state.bytes==nil {return map{ok:true,can_save:true,token:state.token,appearance:Profile.defaults(),message:"Not saved yet"};}
+    let text=try bytes_to_str(state.bytes) catch "";let parsed=Profile.decode(text);
+    if str_to_bytes(text)!=state.bytes {parsed=Profile.decode("");}
+    return map{ok:parsed.ok,can_save:true,token:state.token,appearance:parsed.appearance,message:parsed.message};
+}
+fn _save(s,parent,appearance,expected) {
+        let text=Profile.encode(appearance);let bytes=str_to_bytes(text);
+        _need(s,expected=="missing" or (type(expected)=="string" and regex_match(expected,"^[0-9a-f]{64}$")),"Missing profile revision");
+        let fs=_folder(s,parent,true);let lock=Dir.acquire_lock(fs,"style.lock",0,10,true);
+        _need(s,lock.ok,"Another window is saving");push(s.locks,map{fs:fs,lock:lock});
+        let prior=_read(s,fs);_need(s,prior.token==expected,"Profile changed; restart before saving");
+        if prior.bytes!=bytes {
+            if prior.bytes!=nil {
+                let backup="previous-"+prior.token+".json";
+                let existing=Dir.metadata(fs,backup);
+                if existing.ok {_need(s,_bytes(s,fs,backup)==prior.bytes,"Existing backup differs");}
+                else {
+                    _need(s,prior.backups<16,"Backup limit reached; existing files preserved");
+                    _need(s,Dir.write_new_exclusive(fs,backup,prior.bytes,false).ok,"Backup not confirmed; profile preserved");
+                    _need(s,_bytes(s,fs,backup)==prior.bytes,"Backup readback failed; profile preserved");
+                }
+            }
+            s.attempted=true;let published=Dir.write_atomic(fs,FILE,bytes,false);
+            s.confirmed=(try published.ok catch false) or (try published.published catch false);
+            if s.confirmed {s.confirmed=_bytes(s,fs,FILE)==bytes;}
+            if s.confirmed {s.token=sha256(base64_encode_bytes(bytes));}
+            s.durable=try published.durability_verified catch false;
+            _need(s,published.ok and s.confirmed,"Profile publication uncertain; restart before retry");
+        } else {s.confirmed=true;s.token=prior.token;}
+}
+fn save(parent,appearance,expected) {
+    let s=map{handles:[],locks:[],error:nil,attempted:false,confirmed:false,token:nil,durable:false};
+    let ok=try {_save(s,parent,appearance,expected);true} catch false;
+    let closed=_close(s);
+    return map{ok:ok and closed,attempted:s.attempted,confirmed:s.confirmed,token:s.token,
+        durability_verified:s.durable,owned_handles_closed:closed,reload:s.error=="Profile changed; restart before saving",history_full:s.error=="Backup limit reached; existing files preserved",error:s.error};
+}
+// Standalone candidates remain session-only unless an explicit private data
+// folder is supplied. Installed releases discover only their own marked root.
+fn _locate(s,cwd,explicit) {
+    let app=Path.normalize(Path.absolute(cwd));
+    if explicit!=nil and explicit!="" {
+        let result=_path(s,explicit);_need(s,not Path.is_subpath(app,result),"Data folder must be outside application files");return result;
+    }
+    let releases=Path.dirname(app);_need(s,Path.basename(releases)=="releases","Not an installed reader");
+    let root=Path.dirname(releases);let fs=_open(s,root);
+    _need(s,_bytes(s,fs,"owner.txt")==str_to_bytes("pblang.reader.install.v1\n"),"Not a managed reader root");
+    return root+"/data";
+}
+fn data_parent(cwd,explicit=nil) {
+    let s=map{handles:[],locks:[],error:nil};let result=try _locate(s,cwd,explicit) catch nil;
+    if not _close(s) {return nil;}return result;
+}
+export load,save,data_parent;

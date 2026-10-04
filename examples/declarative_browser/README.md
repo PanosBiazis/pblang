@@ -260,12 +260,15 @@ choice. Opening Style starts at the font choice. When the original screen fits,
 its previous choice layout is preserved. The Style toolbar always uses compact
 14px sans text. Compact choice controls use 14px text and fixed spacing
 so even extreme document typography cannot hide the options needed to change it.
-Preferences are still session-local and have no new storage or network effects.
+The legacy controller keeps session-local preferences without storage or network
+effects. The native launcher additionally exposes the optional profile workflow
+described below; its default remains session-only.
 
 Developers may call `App.settings_page(reader,index)` (zero-based, clamped, false
 when unavailable or unchanged). The example-local `settings_layout.plan(height,
-anchor)` computes capacity and visible indices without opening a window; anchor is
-the choice index 0–4, and height uses the existing GUI bounds 240–4320. Shared GUI
+anchor, total=5)` computes capacity and visible indices without opening a window;
+anchor is a zero-based choice index, and height uses the existing GUI bounds
+240–4320. The optional preferences workflow uses `total=8` to include its actions. Shared GUI
 contracts and Web/Android exporters remain unchanged.
 
 ```sh
@@ -348,8 +351,8 @@ sh ../reader-candidates/reader-v2/run-reader.sh
 
 The default launch opens the native GUI, including actual font measurement and
 the existing Style controls. `--check` exercises offline document navigation and
-roundtrip without a display. `--help` prints usage; other arguments are rejected.
-Normal reader launch disables network, HTTP, process execution and spawning. Native GUI
+roundtrip without a display. `--help` prints usage, including the opt-in persistence mode; unsupported arguments are rejected.
+Default GUI, `--session-only` and `--check` retain `--deny-net`, `--deny-http`, `--deny-exec` and `--deny-spawn`. Explicit `--with-profile` enables process execution for the fixed system `stat` utility used by the existing directory API; it retains the other three flags. Native GUI
 still needs local graphics/FFI and filesystem access for libraries/fonts; this is
 not an application sandbox. Invoke the launcher with `sh`: the package contract
 keeps source files non-executable and only marks the runtime executable.
@@ -511,7 +514,7 @@ Partial releases and staged launchers are retained on failure; nothing recursive
 deletes them. If publication is reported attempted but unconfirmed, inspect
 `status` before any retry. Do not run separate roots against the same launcher.
 The normal launch does not hash every file on each start; use `verify`/`status`
-after suspected modification. GUI preferences remain per session.
+after suspected modification. Default GUI preferences remain per session; opt-in saved appearance is described below.
 
 `tests/semantics/reader_install_test.sapp` covers pure identity/launcher/fingerprint
 contracts. `tests/tooling/reader_install.py` checks transitions, no-overwrite,
@@ -539,3 +542,97 @@ It opens Style, changes font/size/scale/spacing, resizes to 320×480 and goes to
 last reading page. Inspect the resulting screenshots separately; successful key
 injection alone is not a visual correctness assertion. The driver checks that
 release files and the launcher remain unchanged.
+
+### Optional persistent reading appearance
+
+The native reader keeps session-only behavior by default. Start it with
+`--with-profile` to opt in to loading and saving local preferences. The default
+and `--session-only` routes skip profile discovery/read/write entirely and show
+Save disabled. The UI separates choices from application and persistence:
+
+- Changing a Style control edits a draft. **Done** discards unapplied choices.
+- **Apply for this session** applies the draft without touching profile storage.
+- **Save for next launch** saves and applies the draft explicitly.
+- **Reset defaults** saves and applies the original reader defaults. When storage
+  is unavailable, the label becomes **Reset this session** and Save is disabled.
+
+Startup only reads. Missing settings use the existing defaults. Invalid, unknown,
+noncanonical or oversized profiles cannot silently change the appearance or be
+rewritten during startup. The UI reports fallback to defaults or session-only
+operation. Save failures keep the chosen draft and the currently applied style;
+an uncertain publication disables further Save until a restart checks the disk.
+
+With `--with-profile`, installed releases discover their own marked installation root and use
+`data/reader-style/appearance-v1.json`. Releases and recovery snapshots remain
+separate from preferences. No global PBLang setting, network or telemetry is used.
+The default and `--session-only` launcher routes skip all profile discovery/read/write
+and retain the earlier process-execution denial. Explicit `--with-profile` enables
+process execution because the existing directory API validates held descriptors through
+fixed `/usr/bin/stat` or `/bin/stat` calls. This is a capability grant to trusted
+application code, not an OS-enforced command allowlist or sandbox; filesystem/FFI
+are also required for native graphics. No arbitrary user command comes from a
+profile. The `--deny-net`, `--deny-http` and `--deny-spawn` flags remain in place.
+
+With the opt-in flag, a standalone candidate still remains session-only unless
+the developer supplies an
+existing private 0700 data directory **outside the application directory**:
+
+```sh
+PBLANG_READER_DATA_DIR=/absolute/private/data sh /absolute/candidate/run-reader.sh --with-profile
+```
+
+The environment override is process-local; no directory or profile is created
+until explicit Save/Reset. The manager creates a dedicated private `reader-style`
+child and refuses to adopt an unmarked existing child. Source-hidden installed
+acceptance overlays the data path with synthetic test data, leaving real user
+files untouched.
+
+`appearance_profile.sapp` reuses `browser_view.appearance` for the eight existing
+appearance fields. The exact v1 record has `format`, `version` and `appearance`,
+is at most 4096 UTF-8 bytes, and stores all eight validated fields. It accepts
+canonical output from `Profile.encode(style)` (surrounding whitespace allowed).
+Unknown/missing fields, unknown versions, duplicate keys, noncanonical JSON and
+invalid values fall back to defaults. Use the encoder to generate editable
+profiles through PBLang; arbitrary pretty-printed JSON is not the storage format.
+
+`appearance_store.sapp` uses existing `linux_dirfs` descriptor-bound reads,
+private files, advisory locking and atomic replacement with fsync. Save compares
+the revision originally loaded by that window before replacing anything. A stale
+window cannot overwrite another window's newer preferences. Previous bounded
+bytes—including invalid UTF-8/JSON—are preserved in content-addressed
+`previous-<revision>.json` backups before an explicit replacement. Backups are
+never automatically deleted: at most 16 distinct previous records are admitted;
+further changes fail without replacing the current profile until old backups are
+explicitly archived by the owner. The whole folder is capped at 64 entries for
+admission. Symlinks, hard links, nonprivate or oversized records are refused and
+preserved. A failed backup may remain for inspection; no recursive cleanup or
+automatic retry is attempted. This is trusted same-user local storage, not a
+hostile-concurrent-process or universal-filesystem guarantee.
+
+Developer integration is additive: `App.create()` and `App.configure()` retain
+their original pure/session behavior. Opt in with
+`App.enable_preferences(controller, appearance, save_callback, message)`.
+The callback receives the complete validated style and returns an `ok` result;
+`attempted` signals uncertain publication and `reload` signals a stale revision.
+The app owns the draft/Apply/Save/Reset interaction; storage remains injectable.
+The standalone `appearance_store` owns local I/O, while `appearance_profile` and
+controller tests remain usable with filesystem/network/FFI effects denied.
+The new actions also participate in the existing bounded settings pagination.
+
+Tests for this extension:
+
+```sh
+python3 tests/tooling/reader_appearance_store.py \
+  --runtime target/release/pblang --evidence /absolute/NEW_STORE_EVIDENCE
+python3 tests/tooling/reader_appearance_native.py \
+  --package /absolute/candidate --evidence /absolute/NEW_GUI_EVIDENCE
+python3 tests/tooling/reader_appearance_native.py \
+  --install-root /home/USER/.local/share/pb-document-reader \
+  --launcher /home/USER/.local/bin/pb-document-reader \
+  --evidence /absolute/NEW_INSTALLED_EVIDENCE
+```
+
+The native journey exercises Save → restart, temporary Apply → restart, Reset →
+restart and invalid-profile fallback through the real GUI. Inspect screenshots
+as well as machine-readable results; successful key injection is not a visual
+assertion. Only Linux x86-64/X11 is covered by this persistence adapter.
