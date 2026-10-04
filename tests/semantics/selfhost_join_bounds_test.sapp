@@ -1,0 +1,99 @@
+// Join admission uses synthetic strings and never renders non-string members.
+let V=import("stdlib:compiler/vm.sapp");
+let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let O=import("stdlib:compiler/optimizer.sapp");
+let P=import("stdlib:selfhost_pbck.sapp");
+let checks=0;
+fn demand(ok,message){checks=checks+1;assert(ok,message);}
+fn compile(source,mode=0){let r=F.frontend_compile(source);assert(r.ok,"compile");if mode==1{return O.optimize_safe(r.chunk).chunk;}if mode==2{return P.deserialize_chunk(P.serialize_chunk(r.chunk));}return r.chunk;}
+let setup=compile("let h=memory_alloc(7);push_lifetime();borrow_immutable(h);memory_alloc(9);");
+fn context(owned){let c=V.execution_context(owned);V.run_seeded(setup,map{},c);return c;}
+fn terminal(parts,separator){return map{constants:[map{__bi:"str_join"},parts,separator],instructions:[map{op:0,operand:0},map{op:0,operand:1},map{op:0,operand:2},map{op:18,operand:2}]};}
+fn run(code,c,bounded,options=nil){if bounded{return V.run_seeded_bounded(code,map{},options,c);}return V.run_seeded(code,map{},c);}
+let rows=[
+ [[],"λ"], [[""],""], [["",""],"🙂"], [["abc","abc","abc"],"xyz"],
+ [["α🙂","á"],"λβ"], [[nil,7,false,[],map{private:"synthetic"}],"|"],
+ [["α",bigint("7"),decimal("2"),rational(1,2),"🙂"],""], [["longer"],""],
+ [["a","b","c"],""], [["","",""],"xyz"]
+];
+for row in rows {
+    let parts=row[0];let separator=row[1];let expected=str_join(parts,separator);
+    let budget=num_max(1,num_max(len(parts),num_max(len(separator),len(expected))));
+    for owned in [false,true] {
+        let c=context(owned);let state=c.memory;
+        V.run_seeded_bounded(terminal(parts,separator),map{},map{max_value_items:budget},c);
+        demand(not state.closed and len(state.owners)==2,"exact fitting call retains owners");V.close_execution(c);
+        // Check all actual output values through the raw return route too.
+        let code=terminal(parts,separator);array_push(code.instructions,map{op:19,operand:0});
+        let value=V.run_seeded_bounded(code,map{},map{max_value_items:budget}).value;
+        demand(value==expected,"raw output matches retained host");
+        if len(expected)>len(parts) and len(expected)>len(separator) {
+            let bad=context(owned);let old=bad.memory;
+            demand(try {V.run_seeded_bounded(terminal(parts,separator),map{},map{max_value_items:len(expected)-1},bad);false} catch true,"terminal call rejects one below exact output");
+            demand(old.closed==owned,"quota respects context ownership");
+            if owned {demand(bad.memory==nil and len(old.owners)==0 and len(old.borrows)==0 and old.reclaimed==2,"owned quota clears scalar state");}
+            V.close_execution(bad);demand(old.reclaimed==2,"close idempotent");
+        }
+    }
+}
+let invalid=[[nil,"x"],[map{},"x"],[bigint("3"),"x"],[[],nil],[["a"],map{}],[["a"],decimal("1")],[nil,nil]];
+for bounded in [false,true] {
+    for owned in [false,true] {
+        for row in invalid {
+            let c=context(owned);let old=c.memory;
+            demand(try {run(terminal(row[0],row[1]),c,bounded);false} catch true,"malformed join rejects");
+            demand(old.closed==owned,"malformed cleanup respects ownership");
+            V.close_execution(c);demand(old.reclaimed==2,"malformed close idempotent");
+        }
+    }
+    for mode in [0,1,2] {
+        for source in [
+          "print str_join([],\"x\");print str_join([\"α\",nil,7,[],false,\"🙂\"],\"|\");",
+          "let h=memory_alloc(11);print try str_join(nil,\"x\") catch memory_get(h);",
+          "let h=memory_alloc(11);print try {try str_join([],nil) catch str_join(nil,\"x\")} catch memory_get(h);",
+          "let h=memory_alloc(11);let r=map{__add__:str_join};print try r+\"x\" catch memory_get(h);",
+          "fn str_join(a,b){return nil;}print str_join(nil,nil);"
+        ] {
+            let c=context(true);
+            let result=run(compile(source,mode),c,bounded);
+            let expected=V.run_seeded(compile(source),map{}).output;
+            demand(not c.memory.closed,"compiled success or caught error retains owners");
+            demand(result.output==expected and c.handlers==0,"compiled values and handlers preserved");V.close_execution(c);
+        }
+        for source in ["str_join(nil,\"x\");","try str_join([],nil) catch str_join(nil,\"x\");","let r=map{__add__:str_join};r+\"x\";"] {
+            let c=context(true);let old=c.memory;
+            demand(try {run(compile(source,mode),c,bounded);false} catch true,"compiled malformed call escapes");
+            demand(old.closed and c.memory==nil and c.handlers==0,"escaped malformed call closes owners");
+        }
+        let c=context(true);let old=c.memory;let globals=map{};
+        let code=compile("let calls=0;fn first(){calls=calls+1;return nil;}fn second(){calls=calls+1;return nil;}str_join(first(),second());",mode);
+        if bounded {demand(try {V.run_seeded_bounded(code,globals,nil,c);false} catch true,"argument rejection");}
+        else {demand(try {V.run_seeded(code,globals,c);false} catch true,"argument rejection");}
+        demand(globals.calls==2 and old.closed,"arguments evaluated once in order");
+    }
+}
+for mode in [0,1,2] {
+    for owned in [false,true] {
+        let c=context(owned);let old=c.memory;let globals=map{caught:false};
+        let code=compile("try str_join([\"abc\",\"abc\",\"abc\"],\"xyz\") catch {caught=true;7};",mode);
+        demand(try {V.run_seeded_bounded(code,globals,map{max_value_items:8},c);false} catch true,"join quota cannot be caught");
+        demand(not globals.caught and old.closed==owned,"quota skips catch effects");
+        let recovered=V.run_seeded_bounded(compile("print memory_get(memory_alloc(13));",mode),map{},nil,c);
+        demand(recovered.output==[13] and not c.memory.closed,"independent runtime recovers");V.close_execution(c);demand(old.closed,"all state released");
+    }
+}
+// Four VM instructions plus three inspected members require seven steps.
+for owned in [false,true] {
+    let c=context(owned);let old=c.memory;
+    demand(try {V.run_seeded_bounded(terminal(["","",""],""),map{},map{max_steps:6},c);false} catch true,"join scan obeys steps before primitive");
+    demand(old.closed==owned,"scan quota closes eligible owners");V.close_execution(c);
+    let good=context(owned);
+    let result=V.run_seeded_bounded(terminal(["","",""],""),map{},map{max_steps:7},good);
+    demand(result.runtime.steps==7 and not good.memory.closed,"exact scan budget accepts");V.close_execution(good);
+}
+// A cyclic non-string member is ignored without recursion or serialization.
+let cyclic=[];array_push(cyclic,cyclic);
+let cycle_code=terminal([cyclic,"ok"],"|");array_push(cycle_code.instructions,map{op:19,operand:0});
+demand(V.run_seeded_bounded(cycle_code,map{},map{max_value_items:3}).value=="|ok","cyclic member is empty, never traversed");
+array_pop(cyclic);
+print "selfhost_join_bounds_pass "+str(checks);

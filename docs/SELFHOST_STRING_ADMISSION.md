@@ -1,8 +1,8 @@
 # String allocation admission and exceptional scalar cleanup
 
 The PBLang VM checks the known rejecting argument shapes of `str_repeat`,
-`str_replace_all`, `str_pad_left` and `str_pad_right` before calculating their
-allocation estimates. Previously `str_repeat(nil, 2)` raised an incidental
+`str_replace_all`, `str_pad_left`, `str_pad_right` and `str_join` before
+calculating their allocation estimates. Previously `str_repeat(nil, 2)` raised an incidental
 `len()` error and left an opted-in scalar ownership context open. Invalid
 replacement arguments could fail inside `len()` as well. Invalid padding
 arguments escaped through the primitive, also leaving that state open.
@@ -43,14 +43,38 @@ are scalar item limits, not byte or process-memory limits, and are not a complet
 allocation proof. Numeric infinity can exceed safe unbounded host allocation;
 only bounded rejection is tested for infinite padding widths.
 
+Join admission counts `max(0, n - 1) * len(separator)` plus the Unicode
+scalar lengths of actual string members before calling the retained primitive.
+Non-string members remain empty fields, including boxed numbers, arrays, maps,
+and cycles; the guard neither stringifies them nor invokes guest callbacks.
+Empty arrays produce an empty string and separators still appear between empty
+fields. The array count must fit `max_value_items`, and the admission scan charges
+one shared VM step per member. This extra work can therefore exhaust a tight
+step budget even when the output fits. Exact item and step boundaries pass.
+A terminal raw call cannot escape output admission, and a quota failure remains
+sticky across guest catches. Invalid array/separator types receive the original
+primitive error after eligible cleanup; handled and borrowed state stays live.
+Unbounded valid calls skip this size scan. This does not bound all allocations
+inside the retained host, nor does it add admission for other string primitives.
+
+A local retained-host measurement used the unchanged workload of 200 bounded
+joins over 64 two-scalar Unicode strings, with one warmup and five alternating
+samples per revision (baseline `a486aa6`, then the join guard). The VM median
+increased from 21.066 to 31.767 ms (+50.8%); nearest-rank p95 increased from
+22.862 to 41.434 ms. The additional pre-admission scan is a correctness cost,
+not a speed improvement. Five local samples do not establish general performance
+or platform behavior, and process-startup noise must not hide that scan cost.
+
 This change covers neither general host failures, native crashes, arbitrary
 FFI/resource cleanup, composite/cyclic ownership, nor process RSS reclamation.
 It changes the explicit PBLang VM, not the retained compiler's nested `p:run`
 behavior or the global launcher. No alternate PBCK route is substituted.
 
 Verification lives in `tests/semantics/selfhost_string_admission_cleanup_test.sapp`,
-`tests/semantics/selfhost_string_bounds_test.sapp`
-and `tests/tooling/selfhost_string_admission_parity.py`. The latter compares
+`tests/semantics/selfhost_string_bounds_test.sapp`,
+`tests/semantics/selfhost_join_bounds_test.sapp`,
+`tests/tooling/selfhost_join_admission_parity.py`
+and `tests/tooling/selfhost_string_admission_parity.py`. The parity harnesses compare
 actual error messages and accepted results through plain, optimized and PBCS
-chunks, bounded and unbounded, and injects a secondary cleanup failure.
+chunks, bounded and unbounded, and inject a secondary cleanup failure.
 Run the example with `pblang run examples/selfhost_throw_cleanup/string_admission.sapp`.
