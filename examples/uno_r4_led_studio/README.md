@@ -15,6 +15,11 @@ The Web command prints a loopback URL (`http://127.0.0.1:8768/`) and runs in the
 foreground; stop it with Ctrl+C. The CLI export prints a validated initial project
 to stdout. No background service or board connection is created.
 
+For explicit physical UNO R4 WiFi control, the separate [PBLang device route](DEVICE.md)
+exports authored frames, compiles real `.sapp` firmware, and provides guarded Linux
+Play/Stop/Status commands after a separately selected official Arduino upload.
+The existing editor commands above remain offline.
+
 ## Explicit Linux Web launch permissions
 
 The general commands above run trusted local source with `--allow-all`. A narrower
