@@ -8,6 +8,7 @@ let DIRFS = import("stdlib:linux_dirfs.sapp");
 
 let FORMAT = "pblang.llm.tiered_store.v1";
 let MAX_SHARDS = 65536;
+let MAX_MIRRORS = 64;
 // Matches the existing bounded reader; larger explicit budgets fail at creation.
 let DEFAULT_MAX_SHARD_BYTES = 67108864;
 
@@ -178,6 +179,53 @@ fn _open_root(root, weight, cfg) {
     return entry;
 }
 
+fn _new_cleanup() {
+    return map{attempted:false,confirmed_handles:0,unconfirmed_handles:0,first_error:nil};
+}
+fn _cleanup_snapshot(cleanup) {
+    return map{attempted:cleanup.attempted,confirmed_handles:cleanup.confirmed_handles,
+        unconfirmed_handles:cleanup.unconfirmed_handles,first_error:cleanup.first_error,
+        retry_supported:false};
+}
+// Used by terminal close and failed initialization; only known owners are retired.
+fn _cleanup_roots(roots, cleanup) {
+    cleanup.attempted = true;
+    let i = 0;
+    while i < len(roots) {
+        let entry = roots[i]; let handle = entry.handle;
+        // Detach before attempting close: an ambiguous descriptor must not be retried.
+        entry.handle = nil; entry.available = false;
+        if handle != nil {
+            let attempt = try map{completed:true,value:DIRFS.close(handle)}
+                catch map{completed:false,value:nil};
+            let failure = "";
+            if not attempt.completed { failure = "close_threw"; }
+            elif type(attempt.value) != "bool" { failure = "close_invalid_result"; }
+            elif not attempt.value { failure = "close_unconfirmed"; }
+            if failure == "" {
+                cleanup.confirmed_handles = cleanup.confirmed_handles + 1;
+            } else {
+                cleanup.unconfirmed_handles = cleanup.unconfirmed_handles + 1;
+                if cleanup.first_error == nil { cleanup.first_error = failure; }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn _acquire_roots(roots, root, primary_weight, mirrors, cfg) {
+    let primary = _open_root(root, primary_weight, cfg);
+    if not primary.available { return false; }
+    array_push(roots, primary);
+    let i = 0;
+    while i < len(mirrors) {
+        let opened = _open_root(mirrors[i].root, mirrors[i].weight, cfg);
+        if opened.available { array_push(roots, opened); }
+        i = i + 1;
+    }
+    return true;
+}
+
 fn create(root, shards, cfg = nil) {
     if cfg == nil { cfg = config(536870912); }
     if type(cfg) != "map" or (try cfg.format catch "") != "pblang.llm.tiered_store.config.v1" {
@@ -202,23 +250,34 @@ fn create(root, shards, cfg = nil) {
         i = i + 1;
     }
 
-    let roots = [];
-    let primary = _open_root(root, cfg.primary_weight, cfg);
-    if not primary.available {
-        return _error("root", "primary shard root is unavailable or not safely confined");
-    }
-    array_push(roots, primary);
-
-    let mirrors = cfg.mirrors;
+    // Preflight the bounded plan before opening even the primary directory.
+    let mirrors = try cfg.mirrors catch nil;
     if type(mirrors) != "array" { return _error("config", "mirrors must be an array"); }
-    i = 0;
+    if len(mirrors) > MAX_MIRRORS {
+        return _error("config", "at most 64 mirrors are supported");
+    }
+    let plan = []; i = 0;
     while i < len(mirrors) {
         let m = mirrors[i];
         let mr = try m.root catch nil;
-        let mw = _int(try m.weight catch 1, 1, 1, 1000000);
-        let opened_mirror = _open_root(mr, mw, cfg);
-        if opened_mirror.available { array_push(roots, opened_mirror); }
+        // Preserve the existing policy: malformed/unavailable optional roots are skipped.
+        if type(mr) != "string" { mr = nil; }
+        array_push(plan, map{root:mr,weight:_int(try m.weight catch 1,1,1,1000000)});
         i = i + 1;
+    }
+    let primary_weight = cfg.primary_weight;
+    let opening_cfg = map{require_linux_confinement:cfg.require_linux_confinement};
+    let roots = [];
+    let acquired = try _acquire_roots(roots, root, primary_weight, plan, opening_cfg) catch nil;
+    if acquired != true {
+        let failure = _error("root", "primary shard root is unavailable or not safely confined");
+        if acquired == nil { failure = _error("root", "shard root initialization failed"); }
+        let cleanup = _new_cleanup();
+        _cleanup_roots(roots, cleanup);
+        failure.cleanup = _cleanup_snapshot(cleanup);
+        // A throwing/malformed acquisition may have an owner it never returned.
+        failure.acquisition_uncertain = acquired == nil;
+        return failure;
     }
 
     return map{
@@ -236,7 +295,7 @@ fn create(root, shards, cfg = nil) {
         last: map{},
         clock: 0,
         closed: false,
-        cleanup: map{attempted:false,confirmed_handles:0,unconfirmed_handles:0,first_error:nil},
+        cleanup: _new_cleanup(),
         stats: map{
             loads: 0, hits: 0, misses: 0, evictions: 0, bypasses: 0,
             verified_reads: 0, rejected_reads: 0, mirror_failovers: 0,
@@ -642,10 +701,7 @@ fn status(store) {
         queued_prefetch: len(store.prefetch_queue),
         precision: store.config.expected_precision,
         semantics_preserved: true,
-        cleanup: map{attempted:store.cleanup.attempted,
-            confirmed_handles:store.cleanup.confirmed_handles,
-            unconfirmed_handles:store.cleanup.unconfirmed_handles,
-            first_error:store.cleanup.first_error,retry_supported:false},
+        cleanup: _cleanup_snapshot(store.cleanup),
         stats: _stats_snapshot(store.stats)
     };
 }
@@ -658,27 +714,7 @@ fn close(store) {
     store.cache = map{};
     store.prefetch_queue = [];
     store.resident_bytes = 0;
-    let i = 0;
-    while i < len(store.roots) {
-        let entry = store.roots[i]; let handle = entry.handle;
-        // Detach before attempting close: an ambiguous descriptor must not be retried.
-        entry.handle = nil; entry.available = false;
-        if handle != nil {
-            let attempt = try map{completed:true,value:DIRFS.close(handle)}
-                catch map{completed:false,value:nil};
-            let failure = "";
-            if not attempt.completed { failure = "close_threw"; }
-            elif type(attempt.value) != "bool" { failure = "close_invalid_result"; }
-            elif not attempt.value { failure = "close_unconfirmed"; }
-            if failure == "" {
-                store.cleanup.confirmed_handles = store.cleanup.confirmed_handles + 1;
-            } else {
-                store.cleanup.unconfirmed_handles = store.cleanup.unconfirmed_handles + 1;
-                if store.cleanup.first_error == nil { store.cleanup.first_error = failure; }
-            }
-        }
-        i = i + 1;
-    }
+    _cleanup_roots(store.roots, store.cleanup);
     return store.cleanup.unconfirmed_handles == 0;
 }
 
@@ -698,7 +734,7 @@ fn capability() {
     };
 }
 
-export FORMAT, MAX_SHARDS, DEFAULT_MAX_SHARD_BYTES;
+export FORMAT, MAX_SHARDS, MAX_MIRRORS, DEFAULT_MAX_SHARD_BYTES;
 export model_part, mirror, config, create, load, unpin, rebalance_hot;
 export weighted_root_for, queue_prefetch, run_prefetch;
 export record_routes, predict_experts, queue_expert_prefetch;

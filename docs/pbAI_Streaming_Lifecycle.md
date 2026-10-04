@@ -123,3 +123,46 @@ The fixtures own no OS descriptors; they demonstrate control flow, not real sysc
 failure recovery. Normal local and source-hidden installed examples separately check
 successful real directory-handle cleanup. Direct mutation/forgery of the public session
 or underlying handle structures is still outside the trusted-caller contract.
+
+
+## Failed initialization and bounded acquisition
+
+`create` validates the mirror container before opening the primary directory. A
+non-array container returns the existing `config` error without acquiring a handle.
+There is now a hard maximum of **64 optional mirrors** (`MAX_MIRRORS`), plus one
+primary root. A larger list returns `config` before any acquisition. This is a
+resource-bound compatibility change: callers previously supplying more than 64
+mirrors must select a smaller set; entries are never silently truncated.
+
+The acquisition plan copies scalar mirror roots and normalized weights before the
+first open. Backend callbacks cannot extend or rewrite that plan by changing the
+original caller list. Normal unavailable or malformed optional mirror records still
+follow the existing skip policy. An unavailable primary still returns the original
+root error. This snapshot covers initialization only; the published session remains
+a trusted mutable map, not an authenticated or immutable configuration object.
+
+A thrown or malformed backend acquisition aborts initialization with `code:"root"`
+and fixed message `shard root initialization failed`. Every earlier known directory
+handle receives exactly one cleanup attempt using the same retirement helper as
+terminal close. A failed cleanup never replaces this primary initialization error
+and does not stop later known handles from being attempted. No usable partial
+session or handle identity is returned.
+
+Acquisition failures add a detached `cleanup` diagnostic with the same fixed fields
+as session status, plus `acquisition_uncertain`. The latter is true when acquisition
+threw or returned a malformed value: the backend may have acquired a resource it
+never returned. Zero `unconfirmed_handles` describes only **known returned handles**;
+it must not be interpreted as recovery of such an unknown resource. No retries are
+performed. Passing the failure result to close/load/status remains inert and does
+not change its original code/message or repeat cleanup.
+
+Seventy exact-source direct/standalone-facade fixture cases cover preflight before
+side effects, the 64/65 boundary, skipped malformed/unavailable optional roots,
+caller-list mutation during acquisition, thrown/nil/numeric acquisition outcomes,
+and successful/false/throw/nil/numeric/string/mixed rollback outcomes. They own no
+real OS descriptors. Separate actual examples and installed source-hidden checks
+exercise invalid-plan rejection and successful real directory cleanup.
+
+This is bounded synchronous initialization cleanup, not a guarantee against native
+crashes, process termination, allocation/OOM failure, malicious raw session mutation,
+or unreturned backend owners. No general cross-platform or performance claim is made.
