@@ -27,6 +27,10 @@ VM array storage and temporary allocations require more physical memory.
 All content remains untrusted. Returned names are not authorization to extract
 onto a filesystem; secure destination handling is a separate operation.
 
+For explicit publication of validated ZIP bytes as one complete new `.zip` file,
+use the separate [archive publication API/CLI](ARCHIVE_PUBLICATION.md).
+The four computation functions above and the offline MCP grants are unchanged.
+
 `fast` compares fixed-Huffman DEFLATE against STORE and avoids dynamic-Huffman
 construction; `auto` retains the existing three-way compression choice; `store`
 skips compression. No mode is claimed fastest or smallest for every workload.
