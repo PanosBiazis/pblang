@@ -33,7 +33,7 @@ try:
         subprocess.run(['xdotool','mouseup','1'],check=True,timeout=5)
         time.sleep(.3)
     click(700,44)
-    for name in ('Return','Tab','Return','Return','Tab','Return','Return','Tab','Return'):key(name)
+    for name in ('Return','Tab','Return','Return','Tab','Return','Return','Tab','Return','Tab','Tab','Return'):key(name)
     subprocess.run(['import','-window',window,'/probe/reader-style.png'],check=True,timeout=8)
     click(700,44)
     subprocess.run(['xdotool','windowsize',window,'320','480'],check=True,timeout=5)
