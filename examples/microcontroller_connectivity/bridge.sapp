@@ -1,5 +1,6 @@
-// One explicit status read followed by one local MQTT publication. No background task.
+// Explicit one-shot or finite USB status monitoring. No background task.
 let Telemetry=import("stdlib:embedded_telemetry.sapp");
+let Monitor=import("stdlib:embedded_telemetry_monitor.sapp");
 let Circuit=import("stdlib:embedded_circuit.sapp");
 let Controller=import("stdlib:embedded_controller.sapp");
 let Files=import("../uno_r4_led_studio/device_files.sapp");
@@ -26,7 +27,7 @@ fn options(args) {
     }
     throw "Unsupported board.";
 }
-fn esp_snapshot(opts) {
+fn esp_snapshot(opts,sequence) {
     let circuit=Circuit.new(map{mode:"wired"});
     let added=Circuit.add_device(circuit,"board","esp32-wroom-32d",map{mode:"wired",port:opts.port});
     if not added.ok {throw "Device configuration rejected.";}
@@ -34,21 +35,56 @@ fn esp_snapshot(opts) {
     if not session.ok {throw "Device connection unavailable.";}
     let result=try Controller.status(session) catch nil;
     let closed=try Controller.close(session) catch map{ok:false,termios_restored:false};
-    return Telemetry.from_esp(session,result,closed,opts.sequence);
+    return Telemetry.from_esp(session,result,closed,sequence);
+}
+fn prepare(opts) {
+    if platform()!="linux" {throw "Wired platform unavailable.";}
+    let plan=nil;
+    if opts.board=="uno-r4-wifi" {plan=Files.project(opts.project,opts.repetitions);}
+    return map{options:opts,plan:plan};
+}
+fn acquire(context,sequence) {
+    let opts=context.options;
+    if opts.board=="uno-r4-wifi" {
+        let observed=Host.run(context.plan,opts.port,"STATUS",true);
+        return Telemetry.from_uno(observed,sequence);
+    }
+    return esp_snapshot(opts,sequence);
 }
 fn run(args) {
     let opts=try options(args) catch nil;
     if opts==nil {return map{ok:false,error:"invalid-options",network_attempted:false};}
     if platform()!="linux" {return map{ok:false,error:"wired-platform-unavailable",network_attempted:false};}
-    let snapshot=nil;
-    if opts.board=="uno-r4-wifi" {
-        let plan=try Files.project(opts.project,opts.repetitions) catch nil;
-        if plan!=nil {
-            let observed=try Host.run(plan,opts.port,"STATUS",true) catch nil;
-            snapshot=try Telemetry.from_uno(observed,opts.sequence) catch nil;
-        }
-    } else {snapshot=try esp_snapshot(opts) catch nil;}
+    let snapshot=try acquire(prepare(opts),opts.sequence) catch nil;
     if snapshot==nil {return map{ok:false,error:"device-status-unconfirmed",network_attempted:false};}
     return Telemetry.publish_local(snapshot,opts.broker_port,1000);
 }
-export options,run;
+fn monitor_options(args) {
+    if type(args)!="array" or (len(args)!=8 and len(args)!=10) or args[0]!="--monitor" {throw "Explicit monitor options required.";}
+    let samples=integer(args[1],1,32);let interval=integer(args[2],1000,30000);
+    // Reserve acquisition/publication time beyond the minimum inter-sample waits.
+    let budget=(samples-1)*interval+samples*1000+6000;
+    if budget>60000 {throw "Monitor duration outside limits.";}
+    let remaining=[];let index=3;
+    while index<len(args) {push(remaining,args[index]);index=index+1;}
+    let opts=options(remaining);
+    if opts.sequence+samples-1>2147483647 {throw "Monitor sequence outside limits.";}
+    return map{device:opts,monitor:map{samples:samples,interval_ms:interval,budget_ms:budget,
+        publish_timeout_ms:1000,port:opts.broker_port,sequence_start:opts.sequence}};
+}
+fn run_monitor(args) {
+    let config=try monitor_options(args) catch nil;
+    if config==nil {return map{ok:false,error:"invalid-monitor-options",network_attempted:false};}
+    let monitor=try Monitor.new(config.monitor) catch nil;
+    if monitor==nil {return map{ok:false,error:"invalid-monitor-options",network_attempted:false};}
+    let context=try prepare(config.device) catch nil;
+    if context==nil {Monitor.close(monitor);return map{ok:false,error:"device-configuration-unavailable",network_attempted:false};}
+    let read=fn(sequence,remaining_ms){return acquire(context,sequence);};
+    let result=Monitor.poll(monitor,read);
+    while not result.terminal {
+        if result.wait_ms>0 {sleep_ms(result.wait_ms);}
+        result=Monitor.poll(monitor,read);
+    }
+    Monitor.close(monitor);return result;
+}
+export options,run,monitor_options,run_monitor;

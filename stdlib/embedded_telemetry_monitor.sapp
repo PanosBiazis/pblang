@@ -1,0 +1,124 @@
+// Caller-driven USB status monitoring. No sleeps, threads, discovery or retries.
+// Deadlines are checked around callbacks; a blocking callback cannot be preempted.
+let Telemetry=import("stdlib:embedded_telemetry.sapp");
+let FORMAT="pblang.embedded-telemetry-monitor.v1";
+fn _integer(v,low,high){return type(v)=="number" and v>=low and v<=high and v==num_floor(v);}
+fn _true(v){return type(v)=="bool" and v;}
+fn _false(v){return type(v)=="bool" and not v;}
+fn _terminal(s){return s.phase=="completed" or s.phase=="cancelled" or s.phase=="failed" or s.phase=="closed";}
+fn _fail(s,error){if not _terminal(s){s.phase="failed";s.error=error;}return false;}
+fn _native_clock(){return num_floor(now_ms());}
+fn _report(s){
+    let remaining=s.budget_ms;let wait=0;
+    if s.started{remaining=s.budget_ms-(s.last-s.start);if remaining<0{remaining=0;}}
+    if not _terminal(s) and not s.busy and s.started and s.due>s.last{
+        wait=s.due-s.last;if wait>remaining{wait=remaining;}
+    }
+    let next_sequence:any=nil;if not _terminal(s){next_sequence=s.sequence_start+s.published;}
+    return map{format:FORMAT,state:s.phase,terminal:_terminal(s),ok:s.phase=="completed",
+        completed:s.phase=="completed",busy:s.busy,requested:s.samples,
+        acquired:s.acquired,acknowledged:s.acknowledged,published:s.published,
+        next_sequence:next_sequence,next_due_ms:s.due,
+        remaining_ms:remaining,wait_ms:wait,error:s.error,
+        cleanup_ok:s.cleanup_ok,outcome_uncertain:s.outcome_uncertain,
+        snapshot_retained:false,background_task:false};
+}
+fn _clock(s,clock){
+    let now=try clock() catch nil;
+    if _terminal(s){return false;}
+    if not _integer(now,0,9007199254680991){return _fail(s,"invalid-clock");}
+    if s.started and now<s.last{return _fail(s,"clock-moved-backward");}
+    if not s.started{s.started=true;s.start=now;s.due=now;}
+    s.last=now;
+    if now-s.start>=s.budget_ms{return _fail(s,"deadline-exceeded");}
+    return true;
+}
+fn _cancel(s){if not _terminal(s){s.phase="cancelled";}return _report(s);}
+fn _close(s){if not _terminal(s){s.phase="closed";}return _report(s);}
+fn _step(s,read_snapshot,publish,clock){
+    if not _clock(s,clock) or _terminal(s){return false;}
+    if s.last<s.due{s.phase="waiting";return true;}
+    let remaining=s.budget_ms-(s.last-s.start);
+    if remaining<250{return _fail(s,"deadline-exceeded");}
+    s.phase="running";
+    let sequence=s.sequence_start+s.published;
+    let raw=try read_snapshot(sequence,remaining) catch nil;
+    // Cancellation from a callback prevents every subsequent operation.
+    if _terminal(s){return false;}
+    if not _clock(s,clock){return false;}
+    let snapshot=try Telemetry.validate(raw) catch nil;raw=nil;
+    if snapshot==nil{return _fail(s,"acquisition-unconfirmed");}
+    if snapshot.sequence!=sequence{return _fail(s,"snapshot-sequence-mismatch");}
+    s.acquired=s.acquired+1;
+    if not _clock(s,clock){return false;}
+    remaining=s.budget_ms-(s.last-s.start);
+    if remaining<250{return _fail(s,"deadline-exceeded");}
+    let timeout=s.publish_timeout_ms;if timeout>remaining{timeout=remaining;}
+    s.cleanup_ok=false;
+    let result=try publish(snapshot,s.port,timeout) catch nil;snapshot=nil;
+    // Preserve delivery facts even when cancellation occurs inside publication.
+    let ack=_true(try result.acknowledged catch false);
+    let cleanup=_true(try result.cleanup_ok catch false);
+    let uncertain=true;
+    let shaped=type(result)=="map" and type(try result.ok catch nil)=="bool"
+        and type(try result.acknowledged catch nil)=="bool"
+        and type(try result.cleanup_ok catch nil)=="bool"
+        and type(try result.publish_attempted catch nil)=="bool"
+        and type(try result.outcome_uncertain catch nil)=="bool";
+    if shaped and _false(result.outcome_uncertain) and (ack or _false(result.publish_attempted)){uncertain=false;}
+    if ack{s.acknowledged=s.acknowledged+1;}
+    s.cleanup_ok=cleanup;s.outcome_uncertain=uncertain;
+    let success=_true(try result.ok catch false) and ack and cleanup and not uncertain;
+    if success{s.published=s.published+1;}
+    result=nil;
+    if _terminal(s){return false;}
+    if not _clock(s,clock){return false;}
+    if not cleanup{return _fail(s,"publish-cleanup-unconfirmed");}
+    if not success{return _fail(s,"publish-unconfirmed");}
+    if s.published==s.samples{s.phase="completed";return true;}
+    // Schedule from completion: a delayed poll never triggers catch-up bursts.
+    s.due=s.last+s.interval_ms;s.phase="waiting";return true;
+}
+fn _poll(s,read_snapshot,publish,clock){
+    if _terminal(s) or s.busy{return _report(s);}
+    let sender=publish;if sender==nil{sender=Telemetry.publish_local;}
+    let timer=clock;if timer==nil{timer=_native_clock;}
+    if not is_fn(read_snapshot) or not is_fn(sender) or not is_fn(timer){_fail(s,"invalid-callback");return _report(s);}
+    s.busy=true;
+    let checked=try _step(s,read_snapshot,sender,timer) catch nil;
+    if checked==nil{_fail(s,"monitor-operation-failed");}
+    s.busy=false;return _report(s);
+}
+// Separate scope keeps constructor inputs outside the retained closure environment.
+fn _handle(state){
+    return map{format:FORMAT,
+        poll:fn(read_snapshot,publish=nil,clock=nil){return _poll(state,read_snapshot,publish,clock);},
+        status:fn(){return _report(state);},cancel:fn(){return _cancel(state);},close:fn(){return _close(state);}};
+}
+fn new(options=nil){
+    let o=options;if o==nil{o=map{};}
+    if type(o)!="map" or len(map_keys(o))>6{throw "Invalid monitor options.";}
+    let allowed=["samples","interval_ms","budget_ms","publish_timeout_ms","port","sequence_start"];
+    for key in map_keys(o){
+        let known=false;for field in allowed{if key==field{known=true;}}
+        if not known{throw "Unknown monitor option.";}
+    }
+    let samples=try o.samples catch 3;let interval=try o.interval_ms catch 1000;
+    let budget=try o.budget_ms catch 60000;let timeout=try o.publish_timeout_ms catch 1000;
+    let port=try o.port catch 1883;let sequence=try o.sequence_start catch 1;
+    if not _integer(samples,1,32) or not _integer(interval,1000,30000)
+        or not _integer(budget,250,60000) or not _integer(timeout,250,5000)
+        or not _integer(port,1,65535) or not _integer(sequence,0,2147483647)
+        or sequence+samples-1>2147483647
+        or (samples-1)*interval+samples*timeout>budget{throw "Monitor bounds or schedule are invalid.";}
+    // Only scalar copies live inside the closure. No caller option or snapshot is retained.
+    let state=map{samples:samples,interval_ms:interval,budget_ms:budget,publish_timeout_ms:timeout,
+        port:port,sequence_start:sequence,phase:"ready",busy:false,started:false,start:0,last:0,due:0,
+        acquired:0,acknowledged:0,published:0,error:"",cleanup_ok:true,outcome_uncertain:false};
+    return _handle(state);
+}
+fn poll(session,read_snapshot,publish=nil,clock=nil){return session.poll(read_snapshot,publish,clock);}
+fn status(session){return session.status();}
+fn cancel(session){return session.cancel();}
+fn close(session){return session.close();}
+export FORMAT,new,poll,status,cancel,close;
