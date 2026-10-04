@@ -195,3 +195,25 @@ work still requires polling cancellation until cleanup is confirmed. Abrupt host
 termination is not a successful cleanup claim. These controls are not certified
 emergency stops. This uploader is Linux-only and still uses the Arduino SDK/CLI
 boundary; it is not a native cross-platform or pure RA4M1 machine-code backend.
+
+### Repeated browser controls
+
+Each rendered device button has its own one-use form. Play does not consume Stop
+on the same page. A newer Play, Send or Stop supersedes older unused Play/Send
+controls; Check and Stop remain independently usable. Replayed/expired controls
+redirect to fresh controls without repeating a physical action. Successful POSTs
+redirect to GET, so Refresh does not resubmit a command. Host, Origin, CSRF and
+per-command validation still apply. At most sixteen rendered control groups
+(up to sixty-four small forms) are retained.
+
+While a transfer or unresolved Stop is pending, Play/Send are disabled in the
+current view and rejected by the controller even if submitted from an older view.
+Repeated Stop polls cancellation without resetting its grace period. The Stop
+intent persists until cleanup and the board Stop reply are both confirmed; a
+later Check can finish that pending Stop. No automatic retry or playback occurs.
+
+Play checks current board state and does not restart a running animation. To
+restart deliberately, use Stop then Play. Send verifies an identical installed
+project rather than recompiling/reflashing it. Upload still uses four retained
+private job slots; different-project transfers beyond that bound require host
+review. Cancellation and process reaping remain cooperative, not hard real time.
