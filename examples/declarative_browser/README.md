@@ -277,3 +277,48 @@ The isolated native test changes all five options using real keyboard input at
 320×240, enlarges and shrinks the window, checks focus and held keys, then returns
 to the same document. Synthetic screenshots are written to `build/reader-settings-*`.
 This establishes Linux/Xvfb behavior, not execution on other physical platforms.
+
+## Large text and actual native font widths
+
+The native `--gui` entry point now supplies its window's existing `textMeasure`
+function to the reader. If a naturally wide glyph line would exceed its width,
+the reader refines the existing text-flow lines at word/Unicode-cluster boundaries
+before making pages. This prevents a line from passing the approximate planner and
+then being replaced with ellipses by the native renderer. Original whitespace
+normalization, canonical source, local-link policy and bitmap fallback budgets are
+retained. Each block still has the existing bounded line budget; an unfit cluster
+or exhausted budget produces an explicit unavailable layout.
+
+Applications using the controller directly can opt in with the same window:
+
+```pblang
+App.set_text_measure(reader,fn(text,size,family) {
+    return window.textMeasure(text,size,0,family);
+});
+App.refresh(reader);
+```
+
+The callback is trusted application code and must return the same `{ok,width,height}`
+metrics as the owning window for natural spacing. It is never imported from a
+document. `App.set_text_measure(reader,nil)` removes it. Without a callback, or when
+host measurement is unavailable or too tall for the renderer's line budget, the
+existing approximate/bitmap route remains. This does not add universal font shaping
+or device guarantees. Use a live owning window, and refresh after replacing the
+measurement provider. The pure `pagination.needs` and `pagination.plan` helpers
+accept the callback as an optional last argument.
+
+Page status, recovery help, link controls and the local-only footer use compact
+line spacing independently of document line spacing. At 320×240 with large document
+text, the complete instruction to enlarge the window or change Style stays visible.
+Resizing back to a usable layout retains the reading anchor.
+
+```sh
+pblang run tests/semantics/reader_text_fit_test.sapp --allow-all
+xvfb-run -a -s '-screen 0 1000x1000x24 -nolisten tcp' env XMODIFIERS=@im=none python3 tests/tooling/reader_text_fit_native.py
+```
+
+The new Xvfb fixture measures an actually too-wide baseline, then records successful
+native text-drawing calls while reading all measured pages. It checks wide Latin
+and Greek content, complete help/footer rendering, resize recovery and the final
+local link. Synthetic images are under `build/reader-measured-*`. Shared renderers
+and Web/Android exports are unchanged; these checks establish Linux behavior only.
