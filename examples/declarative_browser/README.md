@@ -1029,7 +1029,7 @@ verify Linux behavior remains usable; no additional platform guarantee is implie
 
 ### Precise text and title sizes
 
-Focus **Text size** or **Title size** in Style and use Left/Right to decrease or
+Focus the **Text** or **Title** size choice in Style and use Left/Right to decrease or
 increase by one, including values between the existing presets (for example 17
 and 29). Both remain within the shared 12–40 appearance limits; the endpoints do
 not wrap or rebuild the unchanged view. The hint stays on the choice in compact
