@@ -67,8 +67,8 @@ argument priority remain. The same caught/borrowed-context rules above apply.
 Wrong arity still fails before inspecting arguments, via the existing arity guard.
 Successful calls, negative domain results, NaN and infinities keep the host behavior.
 Boxed exact integers, rationals and decimals are still rejected by these primitives;
-`num_pow`, `num_mod` and exact-number constructors have different contracts and are
-not included in this numeric cleanup extension. Shadowed guest functions remain
+`num_pow` and `num_mod` have different value-dependent contracts, covered below.
+Exact-number constructors themselves remain outside this extension. Shadowed guest functions remain
 ordinary guest calls.
 
 See `examples/selfhost_throw_cleanup/numeric.sapp` for an executable ownership
@@ -79,6 +79,43 @@ The tooling harness's `--numeric --reference <previous-release>` group compares
 stdout, exit status and the original first error message across all six routes,
 including secondary cleanup failure. This is a correctness extension; no numeric
 throughput improvement is claimed.
+
+## Value-dependent modulo and power failures
+
+Explicit `num_mod` and `num_pow` now use the same escaping-error ownership rule
+as arithmetic opcodes, in both scalar and generic builtin dispatch. Previously
+`num_mod(7,nil)` and `num_pow(2,nil)` could leave private allocations/borrows live,
+while the equivalent failing `%` instruction already closed its opted-in context.
+This also covers checked-source `**`, which dispatches through `num_pow`.
+
+These primitives accept both ordinary binary64 and exact numeric objects, so a
+simple number-only admission check would incorrectly reject valid bigint,
+rational or decimal values. The VM instead intercepts failures of the pure host
+primitive only when a private owned context has live memory and no guest handler.
+It attempts the existing cleanup and repeats only that failed primitive on the
+already-evaluated operands to reproduce its original host diagnostic. No guest
+method, call target, argument expression or external operation is replayed. The
+host math implementations inspect numeric values directly, including when maps
+are rejected; they do not invoke guest overloads. Shadowed guest functions and
+operator-method dispatch retain their existing rules.
+
+Covered failures include invalid argument types, bigint modulo by zero, unsupported
+rational/decimal modulo, negative or out-of-range bigint exponents and nonintegral
+rational/decimal exponents. Arity still fails through the existing earlier guard.
+Successful exact arithmetic, mixed fractional demotion, and float NaN/infinity
+results retain host behavior. A guest catch keeps memory usable; borrowed contexts
+remain caller-owned. A secondary cleanup failure cannot replace the original
+numeric error, but completion of cleanup is not guaranteed with corrupt private
+metadata. This does not add allocation/exponent quotas or recover process aborts,
+panics or exhaustion, and it does not fix arbitrary builtin/FFI failures.
+
+`tests/semantics/selfhost_exact_math_cleanup_test.sapp` checks ownership/borrows,
+handlers, argument effects, overloads, accepted exact values, optimizer/PBCS replay
+and late allocations. `tests/tooling/selfhost_arithmetic_cleanup.py --exact-math
+--reference PREVIOUS_RELEASE` compares original errors across six routes and an
+injected secondary cleanup failure. The runnable `examples/selfhost_throw_cleanup/
+exact_math.sapp` and small `tests/fixtures/selfhost_exact_math_acceptance.sapp` are
+installation acceptance fixtures. This is a correctness change, not a speed claim.
 
 ## String transforms, search and split
 
@@ -114,9 +151,10 @@ For example, the self-host `%` instruction uses `num_mod`, whose error message
 already differs from the retained native `%` opcode; that existing distinction
 is preserved.
 
-The contract does not include map operands without a resolved guest overload,
-arbitrary host/builtin/FFI failures, allocation exhaustion, malformed bytecode in
-general, composite ownership, or other backends. It is not a speedup claim.
+Fallback arithmetic opcodes on map operands without a resolved guest overload
+remain outside this correction, as do arbitrary host/builtin/FFI failures,
+allocation exhaustion, malformed bytecode in general, composite ownership,
+and other backends. It is not a speedup claim.
 The retained native compiler and its nested `p:run()` source bug are unchanged.
 Native PBCK execution uses a different runtime path; PBCS replay here means the
 self-host IR serializer and the PBLang VM, not a fix to that retained compiler.

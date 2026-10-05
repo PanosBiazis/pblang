@@ -1,0 +1,62 @@
+// Value-dependent host math failures preserve diagnostics and scalar ownership.
+let V=import("stdlib:compiler/vm.sapp");let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let O=import("stdlib:compiler/optimizer.sapp");let P=import("stdlib:selfhost_pbck.sapp");
+fn raw_compiled(s){let r=F.frontend_compile(s);assert(r.ok,"compile: "+str(r.diagnostics));return r.chunk;}
+fn compiled(s){return raw_compiled("fn invoke(f,a,b){return f(a,b);}"+str_replace_all(str_replace_all(s,"num_mod(","invoke(num_mod,"),"num_pow(","invoke(num_pow,"));}
+let setup=compiled("memory_alloc(7);push_lifetime();borrow_immutable(1);memory_alloc(9);");
+fn prepare(owned){let c=V.execution_context(owned);V.run_seeded(setup,map{},c);return c;}
+fn run(code,bounded,c,g){if bounded {return V.run_seeded_bounded(code,g,nil,c);}return V.run_seeded(code,g,c);}
+let calls=["num_mod(nil,2)","num_mod(2,nil)","num_pow(nil,2)","num_pow(2,nil)",
+ "num_mod(bigint(7),bigint(0))","num_mod(rational(1,2),2)","num_mod(decimal(7),2)",
+ "num_pow(bigint(2),-1)","num_pow(bigint(2),bigint(\"4294967296\"))",
+ "num_pow(rational(1,2),0.5)","num_pow(decimal(2),0.5)",
+ "let a=map{__add__:num_mod};a+2","let a=map{__add__:num_pow};a+2"];
+let handler=compiled("print memory_get(1);");
+for source in calls {
+ let code=compiled(source+";");
+ for bounded in [false,true] {
+  for owned in [false,true] {
+   let c=prepare(owned);let m=c.memory;
+   assert((try {run(code,bounded,c,map{});false} catch true),"math rejects: "+source);
+   assert(m.closed==owned and c.handlers==0,"escape respects ownership");
+   if owned {assert(c.memory==nil and m.reclaimed==2 and len(m.owners)==0 and len(m.borrows)==0,"both lifetimes and borrow released");}
+   else {assert(c.memory==m and len(m.owners)==2 and len(m.borrows)==1,"borrowed ownership preserved");}
+   V.close_execution(c);V.close_execution(c);assert(m.reclaimed==2,"idempotent close");
+  }
+  let c=prepare(true);let m=c.memory;
+  let caught=map{constants:[map{try_chunk:code,catch_chunk:handler}],instructions:[map{op:35,operand:0}]};
+  assert(run(caught,bounded,c,map{}).output==[7] and not m.closed and c.handlers==0,"guest handler retains memory");V.close_execution(c);
+ }
+}
+// First-class calls, optimizer and PBCS replay evaluate operands exactly once.
+for name in ["num_mod","num_pow"] {
+ let code=compiled("let calls=[];fn arg(i){array_push(calls,i);return nil;}fn call(f,a,b){return f(a,b);}call("+name+",arg(1),arg(2));");
+ for variant in [code,O.optimize_safe(code).chunk,P.deserialize_chunk(P.serialize_chunk(code))] {
+  for bounded in [false,true] {
+   let c=prepare(true);let m=c.memory;let g=map{};
+   assert((try {run(variant,bounded,c,g);false} catch true),"dynamic failure");
+   assert(m.closed and m.reclaimed==2 and g.calls==[1,2],"no operand replay");
+  }
+ }
+ for source in ["print "+name+"(5,2);memory_alloc(3);"+name+"(nil,2);",
+  "memory_alloc(3);try "+name+"(nil,2) catch "+name+"(2,nil);",
+  "memory_alloc(3);print try "+name+"(nil,2) catch 7;"+name+"(nil,2);"] {
+  for bounded in [false,true] {let c=V.execution_context(true);assert((try {run(compiled(source),bounded,c,map{});false} catch true),"late/handler escape");assert(c.memory==nil and c.handlers==0,"late allocation released");}
+ }
+ let code2=compiled("let calls=[];fn bad(self,x){array_push(calls,1);return "+name+"(nil,x);}let a=map{__add__:bad};a+2;");
+ let c=prepare(true);let g=map{};assert((try {run(code2,true,c,g);false} catch true),"guest overload rejection");assert(c.memory==nil and g.calls==[1],"guest method invoked once");
+}
+// Exact arithmetic and float domain behavior remain successful and owned.
+let ok=compiled("print num_mod(bigint(17),bigint(5));print num_pow(bigint(2),10);print num_pow(rational(1,2),-2);print num_pow(decimal(2),3);print num_pow(bigint(4),0.5);print num_mod(5.5,2);print num_mod(2,0);print num_pow(-1,0.5);");
+for bounded in [false,true] {
+ let c=prepare(true);let m=c.memory;let r=run(ok,bounded,c,map{}).output;
+ assert(r[0]==bigint(2) and r[1]==bigint(1024) and r[2]==rational(4,1) and r[3]==decimal(8) and r[4]==2 and r[5]==1.5,"accepted numeric contracts");
+ assert(r[6]!=r[6] and r[7]!=r[7] and not m.closed,"NaN is a successful numeric result");V.close_execution(c);
+}
+for name in ["num_mod","num_pow"] {
+ let c=prepare(true);let m=c.memory;m.reclaimed=map{};
+ assert((try {run(compiled(name+"(nil,2);"),false,c,map{});false} catch true),"secondary cleanup fault still rejects");
+ m.reclaimed=0;V.close_execution(c);assert(m.closed,"fault fixture recovered");
+ let c2=prepare(true);assert(run(raw_compiled("fn "+name+"(a,b){return a;}print "+name+"(nil,2);"),true,c2,map{}).output==[nil] and not c2.memory.closed,"shadowed function unchanged");V.close_execution(c2);
+}
+print "selfhost_exact_math_cleanup_pass";
