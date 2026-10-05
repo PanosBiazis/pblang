@@ -152,3 +152,17 @@ FILE --group source|argv|permissions|allocation|library`. The allocation group u
 `strace` and a sparse 4 GiB fixture to verify the bounded copy and absence of
 source/snapshot reads on rejection; other groups run with the checkout hidden
 inside the same minimal Linux sandbox as the ordinary checker contract tests.
+
+## Explicit retained-source compatibility preflight
+
+`pblang --check --via-pblang --retained-source FILE` adds the existing
+`compiler/retained_source_check.sapp` gate before ordinary analysis. It rejects
+known/conservative nested-try capture hazards and unqualified imports without
+executing the source. It can be combined with `--bounded-source=BYTES` and that
+profile's explicit grants. Repeated/misplaced profile selectors fail with usage
+status 2. `--retained-source` after `--` is a literal filename.
+
+This public argv-based profile does not consult `PBLANG_CHECK_PROFILE`; that
+environment variable continues to belong to `pblang check` / `check_cli.sapp`.
+Default checking and `run` are unchanged. See [the retained source contract and
+PBCK example](PUBLIC_RETAINED_SOURCE_CHECK.md) for limitations.
