@@ -74,7 +74,20 @@ values receive the reversible string encoding, so user strings, commas, numeric
 text, escape sequences and operator-shaped keys cannot collide with markers.
 The host parses this numeric-free document, and a PBLang walk restores strings,
 keys and numbers. Arrays are private to this parse and are restored in place;
-maps are rebuilt to avoid key-renaming collisions. Caller objects are not used
+maps are rebuilt to avoid key-renaming collisions. Within an array, tagged string
+and number leaves are restored directly, without a recursive call for each leaf.
+An immediately repeated tagged scalar reuses the preceding restored immutable
+value. The comparison uses the exact tagged string, never numeric equality: `0`
+and `-0`, or distinct decimal spellings, cannot be conflated. No arrays or objects
+are reused. A non-string tagged value breaks the run, so a nested value cannot
+change strict-error ordering through a stale reused result. All tokens were
+already admitted by the complete original validation before this optimization.
+
+This is a one-token reference per active array traversal, released with that
+traversal; it is not a growing dictionary, global cache or cross-request state.
+Strings are immutable, and numeric values are immutable binary64 values. The
+first occurrence still performs all finite-number and optional exactness checks;
+their failure flags remain sticky for the parse. Caller objects are not used
 or mutated. Original host validation rejects numeric object keys before quoting
 could admit them, and rejects overflowing overwritten duplicate values.
 
@@ -106,6 +119,20 @@ separate owner and requires its own wire tests and installation qualification.
 - `--group scale --start N --count 1`: individual source-hidden workloads near
   or at 2 MiB, each with a 30-second process deadline. The process report records
   actual byte counts, elapsed time and failures.
+- `--group arrays`: 512 independent numeric spellings, each checked six times
+  across repeated entries and nested array boundaries (3,072 byte comparisons).
+- `--group exact-diagnostics`: repeated strict failures and diagnostic ordering
+  across intervening strings, nulls, booleans, arrays and objects.
+- `tests/tooling/json_number_cost.py --baseline OLD_RELEASE --candidate NEW_RELEASE
+  --report cost.json --start N --count 1`: five alternating paired samples. Each
+  fresh isolated process warms up once, times one decode and then validates the
+  complete output against Python's binary64 conversion, including signed zero.
+  The first fixture is the unchanged cycle11 65,536-cell fractional MCP request
+  (plus its 256 query values). This harness measures the parser only, not MCP
+  transport. Other fixtures include unique/alternating decimals, repeated boundary
+  numbers, strict mode, dense integers and a small mixed object. Timings and RSS
+  are separate: RSS includes warmup and output serialization; results are samples,
+  not universal speed or memory guarantees.
 - Existing JSON and serialization regression suites remain required.
 
 Run the executable `examples/json_numbers/main.sapp` for the corrected facade
