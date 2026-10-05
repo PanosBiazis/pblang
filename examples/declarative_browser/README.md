@@ -172,6 +172,24 @@ choices can be applied to the resulting Modern UI tree using normal option maps.
 The reader defaults opt into natural native spacing; existing unrelated GUI
 applications retain their defaults. See [typography](../../docs/TYPOGRAPHY.md).
 
+The controller remembers reading positions by default. Developers can call
+`App.remember_positions(reader,false)` to retain first-page-only navigation, or
+pass `true` to enable restoration again. The boolean-only option returns whether
+the policy changed. A change clears remembered positions without moving the current
+page, modifying appearance or writing a profile. The policy itself is session-only.
+Use the controller's navigation callbacks; direct mutation/replacement of its
+session is not a position-history API. Observable external session changes discard
+the controller's remembered positions. Positions are not restored across launches.
+
+`position_demo.sapp` is an executable, window-free example of the same callbacks.
+`tests/semantics/reader_history_position_test.sapp` covers distinct visits, reflow,
+branching, denied links, policy changes and the history cap. The Linux source-hidden
+`tests/tooling/reader_history_position_native.py --package /absolute/release
+--evidence /new/evidence` exercises the real launcher and records screenshots;
+installed mode accepts `--install-root` and `--launcher` instead of `--package`.
+This history journey also requires Pillow in the isolated system Python for pixel
+comparison; it adds no dependency to the Reader application.
+
 The native example automatically paginates a document when its current view would
 exceed the window height, truncate wrapped text, or clip a document link label.
 **Previous page / Next page**, **Page Up / Page Down**, **Home / End** navigate
@@ -180,8 +198,11 @@ Held page keys advance once per press. The original view remains when it fits.
 
 Changing appearance or resizing retains a logical text position (block and offset),
 so a changed page count does not move the reader to unrelated text. Local navigation
-starts at the destination's first page. Reading position is memory-only and is not
-stored separately for each history entry. A link's complete label is readable text
+starts at the destination's first page. Back and Forward restore a separate logical
+reading position for each history entry, including repeated visits to the same
+document. Positions remain memory-only, bounded by the existing 32-entry session
+history; new navigation after Back discards the forward positions. Home deliberately
+starts at the beginning. A link's complete label is readable text
 followed by **Open link**, which uses the original session-validated block index.
 
 Document text obeys the selected sizes; pagination chrome uses compact 14px buttons
