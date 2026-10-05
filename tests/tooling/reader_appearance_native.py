@@ -40,18 +40,18 @@ def tabs(n):
 def current():return json.loads(profile.read_text())['appearance']
 try:
     start();assert not profile.exists(),'Startup must not save a profile'
-    for k in ('Return','Tab','Return','Return','Tab','Return','Return','Tab','Return'):key(k)
+    for k in ('Return','Tab','Return','Return','Tab','Return','Tab','Return','Return','Tab','Return'):key(k)
     assert not profile.exists(),'Draft must not save'
     tabs(3);key('Return');time.sleep(.5)
     assert profile.exists(),'Save did not publish'
-    style=current();assert style['font_family']=='serif' and style['body_size']==20 and style['font_scale']==1.5 and style['line_height']==1.75,style
+    style=current();assert style['font_family']=='serif' and style['body_size']==20 and style['title_size']==32 and style['font_scale']==1.5 and style['line_height']==1.75,style
     shot('style-saved');saved=profile.read_bytes();close()
     start();shot('style-restarted');assert profile.read_bytes()==saved
-    key('Return');tabs(5);key('Return');shot('style-temporary')
+    key('Return');tabs(6);key('Return');shot('style-temporary')
     assert profile.read_bytes()==saved,'Apply must not persist';close()
     start();shot('style-after-temporary-restart');assert profile.read_bytes()==saved
-    tabs(7);key('Return');time.sleep(.5);reset=current()
-    assert reset['font_family']=='sans' and reset['body_size']==16 and reset['font_scale']==1 and reset['line_height']==1.45,reset
+    tabs(8);key('Return');time.sleep(.5);reset=current()
+    assert reset['font_family']=='sans' and reset['body_size']==16 and reset['title_size']==28 and reset['font_scale']==1 and reset['line_height']==1.45,reset
     shot('style-reset');close()
     start();shot('style-default-restart');assert current()==reset;close()
     backups=list((data/'reader-style').glob('previous-*.json'))
