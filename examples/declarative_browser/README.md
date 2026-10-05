@@ -154,6 +154,21 @@ Back, Forward and Home leave settings and display their destination while retain
 the chosen appearance. Removed, disabled or non-interactive controls do not receive
 restored focus.
 
+**Escape** in Style now returns to the same reading position and focuses **Style**,
+including when no choice has focus or a compact options page is open. It discards
+only unapplied draft choices, exactly like Done; Apply and Save results remain.
+Holding Escape cannot turn dismissal into a window close. Once released, Escape
+on the document keeps the existing behavior: clear focus first, then close on a
+separate press with no focus. Actual native close/quit requests remain effective.
+Later events in the same batch target the returned document, not stale settings.
+
+Developers can call `App.close_preferences(reader)` and then `App.update(reader,[])`
+to use the same dismissal. It returns false when already closed or the window has
+a pending close request. It does not save/reload, change appearance or erase
+Back/Forward positions. See `escape_demo.sapp`, the semantic
+`reader_escape_preferences_test.sapp` and the source-hidden real-launcher
+`reader_escape_preferences_native.py` journey (Pillow required for image comparison).
+
 ```pblang
 let App=import("./app.sapp");
 let reader=App.create("local","dark",map{
