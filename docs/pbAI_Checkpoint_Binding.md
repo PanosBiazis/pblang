@@ -177,3 +177,7 @@ open. Close never deletes the persisted checkpoint. See the
 [loaded-handle lifetime contract](pbAI_Student_Checkpoints.md#explicit-loaded-handle-close)
 and run the installed receipt harness with `PBAI_RECEIPT_PHASE=close` for the
 real-file lifecycle and terminal-error checks.
+
+For explicit cleanup after a catchable application failure, use the additive
+[scoped checkpoint file API](pbAI_Checkpoint_Scope.md). The original storage
+binding and manual loaded-handle ownership remain unchanged.
