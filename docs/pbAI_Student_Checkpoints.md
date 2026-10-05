@@ -225,3 +225,7 @@ An inline closed-state-guard prototype was rejected: alternating baseline/candid
 runs did not show consistent improvement in either the file or loaded-prediction
 workload. The shared neural owner remains unchanged. See
 [measurements and lifecycle checks](evidence/pbai_file_usage-2026-10-05.json).
+
+For explicit cleanup after a catchable application failure, use the additive
+[scoped checkpoint file API](pbAI_Checkpoint_Scope.md). The original storage
+binding and manual loaded-handle ownership remain unchanged.
