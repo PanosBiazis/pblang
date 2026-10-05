@@ -1026,3 +1026,27 @@ restart with a sequential UI reference. That native stress flow also passes on
 0.8.3: it does not establish that the backend delivered a single controller batch.
 The defect reproduction is the explicit ordered `App.update` batch. Native checks
 verify Linux behavior remains usable; no additional platform guarantee is implied.
+
+### Precise text and title sizes
+
+Focus the **Text** or **Title** size choice in Style and use Left/Right to decrease or
+increase by one, including values between the existing presets (for example 17
+and 29). Both remain within the shared 12–40 appearance limits; the endpoints do
+not wrap or rebuild the unchanged view. The hint stays on the choice in compact
+layouts. Enter/Space and mouse activation keep their existing preset cycles.
+
+Only unmodified arrows on an enabled, visible size choice adjust it. Held arrows
+change once until released, including across rebuilds. Other controls, reading
+navigation and Alt+history retain their behavior. Profile-enabled editing remains
+a draft until explicit Apply or Save; Escape/Done discards an unapplied draft.
+The original session-only mode applies adjustments immediately.
+
+Embedders can call `App.adjust_text_size(reader, "body_size", 1)` or use
+`"title_size"` and `-1`. The helper validates the property and unit step, returns
+whether the value changed, and acts only while Style is open and not closing.
+It marks presentation pending; call `App.update(reader, [])` when no input follows.
+`App.configure` continues to accept exact validated appearance maps.
+
+See `fine_size_demo.sapp`, `tests/semantics/reader_fine_size_test.sapp` and
+`tests/tooling/reader_fine_size_native.py`. Acceptance is real Linux X11 execution;
+no new native mobile, Windows or macOS support is implied by these controls.
