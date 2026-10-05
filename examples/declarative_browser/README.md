@@ -952,3 +952,35 @@ lookups and uses no timing threshold. A separate integrity test overlays a chang
 shared GUI file in an isolated mount and requires rejection without modifying the
 real package. Timing comparisons are separate evidence;
 this optimization does not establish GUI frame-rate or other-platform improvements.
+
+### Reader history keyboard shortcuts
+
+In the native reader, **Alt+Left** goes Back and **Alt+Right** goes Forward,
+returning to the same remembered reading positions as the toolbar. A held arrow
+moves once; release and press again for the next history entry. With no available
+entry it preserves the current page and focus. Plain arrows and the existing
+PageUp/PageDown/Home/End reading controls are unchanged. Additional Ctrl, Meta or
+Shift modifiers do not trigger these shortcuts (including Ctrl+Alt/AltGr).
+
+While Style is open, these shortcuts leave the draft, focus and history alone.
+Escape still returns to reading. Navigation never saves a style or reading history.
+Embedding applications can reserve the shortcut keys independently:
+
+```sapp
+App.history_shortcuts(reader, false); // Disabled; toolbar still works.
+App.history_shortcuts(reader);        // Enable again (default for new readers).
+```
+
+The method requires a boolean and returns whether the policy changed; it does not
+alter `remember_positions`, rebuild the view or reinterpret an already held key.
+The controller accepts explicit boolean modifier flags on key events and falls
+back to the shared `keymap.sapp` aliases for older event producers. A native
+modifier snapshot takes precedence over tracked key edges.
+
+Run `shortcuts_demo.sapp` for a small embedding example. The semantic regression is
+`tests/semantics/reader_history_shortcuts_test.sapp`; the source-hidden actual
+launcher journey is `tests/tooling/reader_history_shortcuts_native.py --package
+<prepared-release> --evidence <new-directory>`. It compares returned reading areas,
+a held key across three history entries and the unchanged Style draft with real
+X11 keyboard input. This establishes Linux native behavior; Web/Android exports
+and other desktop/mobile native targets have no new shortcut guarantee.
