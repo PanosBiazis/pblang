@@ -984,3 +984,22 @@ launcher journey is `tests/tooling/reader_history_shortcuts_native.py --package
 a held key across three history entries and the unchanged Style draft with real
 X11 keyboard input. This establishes Linux native behavior; Web/Android exports
 and other desktop/mobile native targets have no new shortcut guarantee.
+
+### Keyboard recovery when Save becomes unavailable
+
+If a profile conflict, uncertain save or failed reload disables the focused Save
+button, the native Reader now focuses **Reload saved style** when a reloader is
+available, or **Apply for this session** otherwise. The relevant settings page is
+shown automatically, including at 320×240 where only one option fits per page.
+The error message and unapplied draft remain intact. Focus movement does not read,
+apply or save anything; release and press Enter again to choose the recovery.
+A held Enter cannot accidentally invoke the newly focused action.
+
+A retryable save error keeps Save focused and available. Other focused controls
+are retained; document navigation and Escape are unchanged. Embedders use the
+existing `App.enable_preferences` save/reload callbacks without an API change.
+See `recovery_focus_demo.sapp` for the fallback without a reload callback,
+`tests/semantics/reader_recovery_focus_test.sapp` for the controller contract, and
+`tests/tooling/reader_recovery_focus_native.py` for source-hidden actual-launcher
+keyboard recovery with a second PBLang profile writer at wide and compact sizes.
+This is Linux X11 evidence, not a new Web/mobile/native-platform support claim.

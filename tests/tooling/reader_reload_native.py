@@ -19,8 +19,8 @@ def external(family):
     result=json.loads(p.stdout);assert result['ok'] and result['owned_handles_closed']
     return profile.read_bytes()
 def choose():click(400,182)
-def save():click(400,494)
-def reload():click(400,598)
+def save():click(400,546)
+def reload():click(400,650)
 def stored_files():return {p.name:p.read_bytes() for p in profile.parent.iterdir() if p.is_file()}
 try:
     start();pid=child.pid;choose();save();assert current()['font_family']=='serif'
