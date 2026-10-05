@@ -18,6 +18,7 @@ def main():
     ap.add_argument('--reference', type=Path)
     ap.add_argument('--calls', action='store_true')
     ap.add_argument('--numeric', action='store_true')
+    ap.add_argument('--strings', action='store_true')
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--count', type=int, default=3)
     a = ap.parse_args()
@@ -102,6 +103,23 @@ def main():
                       ('numeric-exact-rejected', 'fn call(f,x){return f(x);}call(num_abs,bigint("7"));', False)]
             cases += [(name + '/both-invalid', 'fn call(f,a,b){return f(a,b);}call(' + name + ',nil,"bad");', False)
                       for name in ['num_min', 'num_max']]
+        if a.strings:
+            assert a.reference, '--reference is required for existing VM diagnostics'
+            assert not (a.calls or a.numeric), 'select one diagnostic group'
+            cases = [(name, 'fn call(f,x){return f(x);}call(' + name + ',nil);', False)
+                     for name in ['str_upper', 'str_lower', 'str_trim']]
+            cases += [(name + '/' + values, 'fn call(f,a,b){return f(a,b);}call(' + name + ',' + values + ');', False)
+                      for name in ['str_split', 'str_contains', 'str_starts_with', 'str_ends_with', 'str_index_of']
+                      for values in ['nil,"x"', '"x",nil']]
+            cases += [('generic/' + name, 'let obj=map{__add__:' + name + '};obj+"x";', False)
+                      for name in ['str_contains', 'str_split']]
+            cases += [('valid-strings', 'print str_upper("Straße");print str_lower("ΑΒ");print str_trim(" α😀β ");'
+                       'print str_split("α😀","");print str_contains("α😀β","😀");print str_starts_with("α😀β","α");'
+                       'print str_ends_with("α😀β","β");print str_index_of("α😀β","β");print str_index_of("abc","z");', True),
+                      ('caught-string', 'fn call(f,x){return f(x);}print try call(str_upper,nil) catch memory_get(1);', True),
+                      ('string-arity', 'fn call(f){return f();}call(str_upper);', False),
+                      ('string-exact-rejected', 'fn call(f,x){return f(x);}call(str_upper,bigint("7"));', False),
+                      ('string-both-invalid', 'fn call(f,a,b){return f(a,b);}call(str_contains,nil,7);', False)]
         for label, source, valid in cases[a.start:a.start + a.count]:
             if a.reference:
                 expected = run(prefix + 'let c=V.execution_context(true);V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk,map{},c);'

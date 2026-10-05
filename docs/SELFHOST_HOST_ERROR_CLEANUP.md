@@ -1,4 +1,4 @@
-# Self-hosted arithmetic, numeric builtin and non-callable cleanup
+# Self-hosted arithmetic, builtin and non-callable cleanup
 
 The PBLang VM now releases opted-in scalar ownership when a non-map arithmetic
 or ordering primitive fails outside any guest `try`, and when the generic call
@@ -79,6 +79,29 @@ The tooling harness's `--numeric --reference <previous-release>` group compares
 stdout, exit status and the original first error message across all six routes,
 including secondary cleanup failure. This is a correctness extension; no numeric
 throughput improvement is claimed.
+
+## String transforms, search and split
+
+`str_upper`, `str_lower`, `str_trim`, `str_split`, `str_contains`,
+`str_starts_with`, `str_ends_with` and `str_index_of` now close eligible owned
+scalar state on an escaping argument-type failure, in both generic and scalar
+dispatch. `type(value) == "string"` identifies actual strings; the broad host
+`is_string` predicate is not sufficient for boxed exact numeric objects.
+The VM closes only before guaranteed type rejection, then calls the original
+host primitive once. Wrong arity retains the earlier shared arity check.
+Guest catches and caller-owned contexts keep their memory and original errors.
+
+Successful Unicode case conversion, trimming, split results, character-based
+search offsets, empty strings, false predicates and not-found `-1` results are
+unchanged. No allocation-size quota or general host allocation-failure cleanup
+is added. Slice/character-code operations, parsing, join, repeat, replace and
+padding have separate contracts; they are not part of this extension.
+
+See `examples/selfhost_throw_cleanup/string_types.sapp` and
+`tests/semantics/selfhost_string_cleanup_test.sapp`. The source-hidden tooling
+harness supports `--strings --reference <previous-release>` to compare exact
+original diagnostics across plain/optimized/PBCS and bounded/unbounded routes,
+including cleanup failure. This is a correctness extension, not a speed claim.
 
 ## Checks and limits
 
