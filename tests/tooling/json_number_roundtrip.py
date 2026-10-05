@@ -18,7 +18,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--candidate', type=Path, required=True)
     ap.add_argument('--report', type=Path, required=True)
-    ap.add_argument('--group', choices=['numbers', 'diagnostics', 'scale'], required=True)
+    ap.add_argument('--group', choices=['numbers', 'arrays', 'exact-diagnostics', 'diagnostics', 'scale'], required=True)
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--count', type=int, default=10)
     a = ap.parse_args()
@@ -47,7 +47,7 @@ def main():
         def record(label, passed, **data):
             rows.append(dict(label=label,passed=passed,**data));a.report.write_text(json.dumps(rows,indent=2,ensure_ascii=False));print(label,passed,flush=True);assert passed,rows[-1]
         prefix='let D=import("stdlib:json_decode.sapp");let J=import("stdlib:json.sapp");'
-        if a.group=='numbers':
+        if a.group in ['numbers','arrays']:
             cases=['0','-0','0.0','-0.0','0e999','-0e-999','0.1','0.10000000000000001','0.10000000000000002','0.1000000000000000055511151231257827021181583404541015625','1.2345678901234567','1.7976931348623157e308','2.2250738585072014e-308','2.2250738585072011e-308','5e-324','2e-324','3e-324','1e-400','-1e-400']
             for n in [4503599627370495,4503599627370496,9007199254740990,9007199254740991,9007199254740992,9007199254740993,9007199254740994]:
                 for sign in ['', '-']:
@@ -61,7 +61,20 @@ def main():
                 if math.isfinite(f):cases.append(repr(f))
             fixtures='['+','.join('map{text:'+json.dumps(t)+',bytes:'+json.dumps(list(struct.pack('<d',float(t))))+'}' for t in cases)+']'
             source=prefix+'let cases='+fixtures+';for c in cases {let v=D.parse(c.text);assert(num_to_le_bytes(v)==c.bytes,"oracle "+c.text);assert(num_to_le_bytes(J.parse(J.stringify(v)))==c.bytes,"roundtrip "+c.text);}print "json_oracle_pass";'
-            result=run(source);record('512 decimal/exponent/binary64 byte oracles and 512 roundtrips',result['exit']==0 and 'json_oracle_pass' in result['stdout'],count=len(cases),result=result)
+            if a.group=='arrays':
+                source=prefix+'let cases='+fixtures+';for c in cases {let v=D.parse("["+c.text+","+c.text+",null,["+c.text+","+c.text+"],"+c.text+","+c.text+"]");for n in [v[0],v[1],v[3][0],v[3][1],v[4],v[5]] {assert(num_to_le_bytes(n)==c.bytes,"array oracle "+c.text);}}print "json_oracle_pass";'
+            label='512 array vectors with six binary64 comparisons each' if a.group=='arrays' else '512 decimal/exponent/binary64 byte oracles and 512 roundtrips'
+            result=run(source);record(label,result['exit']==0 and 'json_oracle_pass' in result['stdout'],count=len(cases),result=result)
+        elif a.group=='exact-diagnostics':
+            precision='number is not exactly representable as binary64'
+            exponent='exponent outside -4096..4096'
+            token='numeric token exceeds 1024 characters'
+            long='0.'+'0'*1023
+            cases=[('[0.1,0.1]',precision),('[0e-4097,0e-4097]',exponent),('['+long+','+long+']',token),('[0.1,[0e-4097],0.1]',precision),('[0e-4097,[0.1],0e-4097]',exponent),('[0.1,{"x":0e-4097},0.1]',precision),('[0.1,0.5,0.5]',precision),('[0.1,true,0.1]',precision),('[0.1,null,0.1]',precision),('[0.1,"0.1",0.1]',precision)]
+            for i,(document,message) in enumerate(cases):
+                result=run(prefix+'D.parse_exact('+json.dumps(document)+');')
+                expected='json.parse_exact: '+message
+                record('strict error ordering '+str(i),result['exit']==1 and result['error'] is not None and result['error'].endswith(expected),expected=expected,result=result)
         elif a.group=='diagnostics':
             cases=['',' ','[','{','[1,]','{"a":1,}','01','-01','+1','.1','1.','1e','1e+','--1','NaN','Infinity','1e309','-1e309','{"n":1e999}','[0,\n1e999]','{1:2}','{-1.2e2:0}','{"a":0,2:1}','{"1":2,1:3}','{"a" 1}','true false','[1 2]','"\\uD800"','"\\udc00"','"\\x20"','"a\nb"','"unterminated','"bad\\"','['*128+'0'+']'*128,'{"n":1e999,}','{"x":01}','1e9999x','{"a":0} trailing','[null, false,, 2]','["x",+2]','{"x":1e9999,"x":1}','{"x":1,"x":1e9999}','{"x":-1e9999,"x":1}']
             inputs=[json.dumps(raw) for raw in cases]+['nil','true','7','[]','map{}','bigint("1")']
