@@ -170,3 +170,10 @@ The 464-byte artifact, digest and prediction remain equal. These are bounded
 local timings on a shared desktop, not a general speedup or model-quality claim.
 With seven samples, nearest-rank p95 is the maximum sample. See the
 [raw response-validation evidence](evidence/pbai_checkpoint_receipts-2026-10-05.json).
+
+Loaded handles now support explicit terminal `close()`. The `reload` example
+retires the previous handle only after a successful replacement; failures keep it
+open. Close never deletes the persisted checkpoint. See the
+[loaded-handle lifetime contract](pbAI_Student_Checkpoints.md#explicit-loaded-handle-close)
+and run the installed receipt harness with `PBAI_RECEIPT_PHASE=close` for the
+real-file lifecycle and terminal-error checks.
