@@ -1,0 +1,205 @@
+let S = import("stdlib:sse_bytes.sapp");
+
+fn eq(actual, expected, label) {
+    if actual != expected { throw "FAIL sse_bytes: " + label; }
+}
+fn event(data, name = "message", id = "") {
+    return map{ event: name, data: data, last_event_id: id };
+}
+fn append(out, items) { for item in items { array_push(out, item); } }
+fn failed(reader, label) {
+    eq(reader.status(), map{ phase: "failed", pending_bytes: 0, last_event_id: "", retry_ms: nil }, label + " cleared");
+    eq(try { reader.feed([]); false } catch true, true, label + " sticky feed");
+    eq(try { reader.finish(); false } catch true, true, label + " sticky finish");
+}
+fn parses(bytes, expected, label) {
+    for cut in 0 to len(bytes) {
+        let reader = S.new();
+        let out = reader.feed(slice(bytes, 0, cut));
+        append(out, reader.feed(slice(bytes, cut, len(bytes))));
+        append(out, reader.finish());
+        eq(out, expected, label + " two chunks");
+        eq(reader.status().pending_bytes, 0, label + " no carry");
+    }
+    let reader = S.new();
+    let out = [];
+    for byte in bytes {
+        append(out, reader.feed([byte]));
+        if reader.status().pending_bytes > 3 { throw "FAIL carry bound"; }
+    }
+    append(out, reader.finish());
+    eq(out, expected, label + " one byte per call");
+}
+fn invalid(bytes, label) {
+    for cut in 0 to len(bytes) {
+        let reader = S.new();
+        let rejected = try {
+            reader.feed(slice(bytes, 0, cut));
+            reader.feed(slice(bytes, cut, len(bytes)));
+            reader.finish();
+            false
+        } catch true;
+        eq(rejected, true, label + " split rejection");
+        failed(reader, label);
+    }
+}
+fn rejects(options, bytes, label) {
+    let reader = S.new(options);
+    eq(try { reader.feed(bytes); false } catch true, true, label);
+    failed(reader, label);
+}
+
+parses(str_to_bytes("data: Aé€😀\n\n"), [event("Aé€😀")], "all UTF8 widths");
+parses(str_to_bytes("﻿id: α\r\nretry: 12\r\nevent: custom\r\ndata: Γεια 😀\r\ndata: κόσμε\r\n\r\ndata: [DONE]\n\n"),
+    [event("Γεια 😀\nκόσμε", "custom", "α"), event("[DONE]", "message", "α")], "SSE controls CRLF BOM");
+parses(str_to_bytes("data:\n\ndata\r\r:ignored\ndata: ﻿inside\n\n"),
+    [event(""), event(""), event("﻿inside")], "empty data embedded BOM");
+parses(str_to_bytes("﻿﻿data: ignored\n\ndata: later\n\n"), [event("later")], "one BOM only");
+parses(str_to_bytes("id: a\n\nid: b\0bad\ndata: x\n\nid\ndata: y\n\ndata: unfinished"),
+    [event("x", "message", "a"), event("y")], "NUL id EOF unfinished");
+
+// UTF-8 range edges are independent byte fixtures, not encoder round trips.
+let edges = [0,127,194,128,223,191,224,160,128,237,159,191,238,128,128,
+    239,191,191,240,144,128,128,244,143,191,191];
+let edge_text = "";
+for cp in [0,127,128,2047,2048,55295,57344,65535,65536,1114111] {
+    edge_text = edge_text + str_from_char_code(cp);
+}
+let edge_stream = str_to_bytes("data: "); append(edge_stream, edges); append(edge_stream, [10,10]);
+parses(edge_stream, [event(edge_text)], "scalar range edges");
+
+// Every pair of byte split positions in a non-BMP event, including empty feeds.
+let short = [100,97,116,97,58,240,159,152,128,10,10];
+for first in 0 to len(short) {
+    for second in first to len(short) {
+        let reader = S.new();
+        let out = reader.feed(slice(short, 0, first));
+        append(out, reader.feed(slice(short, first, second)));
+        append(out, reader.feed(slice(short, second, len(short))));
+        append(out, reader.finish());
+        eq(out, [event("😀")], "three chunk partition");
+    }
+}
+
+for bad in [[128],[191],[192,128],[193,191],[224,128,128],[224,159,191],
+    [237,160,128],[237,191,191],[240,128,128,128],[240,143,191,191],
+    [244,144,128,128],[245,128,128,128],[248,136,128,128,128],[254],[255],
+    [194,65],[226,130,65],[240,159,65,128],[240,159,152,65],
+    [194],[226],[226,130],[240],[240,159],[240,159,152],[239,187]] {
+    invalid(bad, "malformed or truncated UTF8");
+}
+// Compare every possible second byte at each restricted lead boundary with the
+// existing strict whole-buffer decoder; split immediately after the lead.
+for lead in [194,224,237,240,244] {
+    for second in 0 to 255 {
+        let bytes = [lead,second];
+        if lead >= 224 { array_push(bytes,128); }
+        if lead >= 240 { array_push(bytes,128); }
+        let expected_valid = try { bytes_to_str(bytes); true } catch false;
+        let reader = S.new();
+        let actual_valid = try {
+            reader.feed([lead]); reader.feed(slice(bytes,1,len(bytes))); reader.finish(); true
+        } catch false;
+        eq(actual_valid, expected_valid, "strict decoder second-byte oracle");
+    }
+}
+for bad in [nil,true,1,"data: x\n\n",map{}] { rejects(nil, bad, "array required"); }
+for bad in [nil,true,false,"65",[],map{},-1,256,65.5,parse_number("NaN"),parse_number("inf"),parse_number("-inf")] {
+    rejects(nil, [bad], "finite integer byte required");
+}
+for bad in [true,1,"1",[],map{ unknown: 1 },map{ feeds: 0.5 },map{ chunk_bytes: -1 },
+    map{ total_bytes: parse_number("NaN") },map{ decoded_chars: parse_number("inf") }] {
+    eq(try { S.new(bad); false } catch true, true, "malformed options");
+}
+let caps = S.limits();
+for key in map_keys(caps) {
+    let option = map{}; option[key] = caps[key];
+    eq(S.new(option).status().phase, "open", "hard cap accepted");
+    option[key] = caps[key] + 1;
+    eq(try { S.new(option); false } catch true, true, "hard cap rejected");
+}
+rejects(map{ chunk_bytes: 0 }, [65], "chunk byte limit");
+rejects(map{ feeds: 0 }, [], "empty feed counts");
+rejects(map{ total_bytes: 1 }, [194,128], "total byte admission");
+rejects(map{ decoded_chars: 0 }, [65], "decoded scalar admission");
+let counted = S.new(map{ total_bytes: 3 });
+counted.feed([240,159,152]);
+eq(counted.status().pending_bytes, 3, "maximum carry");
+eq(try { counted.feed([128]); false } catch true, true, "cumulative bytes include carry");
+failed(counted, "cumulative bytes");
+let scalars = S.new(map{ decoded_chars: 1 });
+scalars.feed([240,159]); scalars.feed([152,128]);
+eq(try { scalars.feed([65]); false } catch true, true, "cumulative decoded characters");
+failed(scalars, "decoded limit");
+let calls = S.new(map{ feeds: 1 }); calls.feed([]);
+eq(try { calls.feed([]); false } catch true, true, "cumulative feed limit");
+failed(calls, "feed limit");
+let bound = S.new(map{ chunk_bytes: 9, total_bytes: 9, feeds: 1, decoded_chars: 9 });
+eq(bound.feed([100,97,116,97,58,32,120,10,10]), [event("x")], "all byte boundaries exact");
+bound.finish();
+
+// Entire malformed call is rejected before valid-prefix SSE events are returned.
+let atomic = S.new(); let untouched = "unchanged";
+let malformed = str_to_bytes("id: private\nretry: 5\ndata: prefix\n\n"); array_push(malformed, 255);
+eq(try { untouched = atomic.feed(malformed); false } catch true, true, "atomic malformed suffix");
+eq(untouched, "unchanged", "no partial call result"); failed(atomic, "atomic call");
+let prior = S.new();
+let delivered = prior.feed(str_to_bytes("id: saved\nretry: 5\ndata: first\n\n"));
+prior.feed([240,159,152]);
+eq(try { prior.finish(); false } catch true, true, "truncated EOF clears parser");
+failed(prior, "EOF failure");
+eq(delivered, [event("first", "message", "saved")], "earlier calls remain delivered");
+let sse_limit = S.new(nil, map{ events: 0 });
+eq(try { sse_limit.feed(str_to_bytes("data:\n\n")); false } catch true, true, "inner event bound");
+failed(sse_limit, "inner bound");
+let text_bound = S.new(nil, map{ chunk_chars: 0 });
+eq(try { text_bound.feed([65]); false } catch true, true, "inner text bound");
+failed(text_bound, "inner text bound");
+let output_limit = S.new(nil, map{ output_chars: 8 });
+eq(output_limit.feed(str_to_bytes("data: x\n\n")), [event("x")], "inner output boundary");
+eq(try { output_limit.feed(str_to_bytes("data: y\n\n")); false } catch true, true, "inner cumulative output bound");
+failed(output_limit, "inner output bound");
+let event_limit = S.new(nil, map{ events: 1 }); let no_partial = "unchanged";
+eq(try { no_partial = event_limit.feed(str_to_bytes("data: x\n\ndata: y\n\n")); false } catch true, true, "inner atomic event bound");
+eq(no_partial, "unchanged", "inner failure no partial events"); failed(event_limit, "inner atomic bound");
+
+// No retained aliases to caller bytes, byte options, text options or status maps.
+let opts = map{ chunk_bytes: 32 }; let text_opts = map{ events: 1 };
+let owned = S.new(opts, text_opts); opts.chunk_bytes = 0; text_opts.events = 0;
+owned.feed(str_to_bytes("data: ")); let carry = [240,159,152]; owned.feed(carry); carry[0] = 255;
+eq(owned.feed([128,10,10]), [event("😀")], "copied carry and limits");
+let snapshot = owned.status(); snapshot.phase = "failed"; snapshot.pending_bytes = 3;
+let alias = owned; alias.finish();
+eq(owned.status().phase, "closed", "alias observes close");
+eq(try { owned.feed([]); false } catch true, true, "closed feed rejected");
+eq(try { alias.finish(); false } catch true, true, "closed finish rejected");
+eq(owned.status().pending_bytes, 0, "status detached");
+let failure_alias = atomic;
+eq(failure_alias.status().phase, "failed", "alias observes failure");
+for truncated in [false,true] {
+    let reader = S.new(); let saved_feed = reader.feed; let saved_finish = reader.finish; let saved_status = reader.status;
+    saved_feed(str_to_bytes("id: saved\nretry: 5\ndata: first\n\n"));
+    let before = saved_status(); before.last_event_id = "changed"; before.retry_ms = 99;
+    eq(saved_status().last_event_id, "saved", "status control fields detached");
+    if truncated {
+        saved_feed([240,159]);
+        eq(try { saved_finish(); false } catch true, true, "saved finish truncation");
+    } else {
+        eq(try { saved_feed([255]); false } catch true, true, "saved feed malformed");
+    }
+    eq(saved_status(), map{ phase: "failed", pending_bytes: 0, last_event_id: "", retry_ms: nil }, "saved status cleared");
+    eq(try { saved_feed([]); false } catch true, true, "saved feed sticky failure");
+    eq(try { saved_finish(); false } catch true, true, "saved finish sticky failure");
+}
+let closing = S.new(); let closed_feed = closing.feed; let closed_finish = closing.finish; let closed_status = closing.status;
+closed_feed(str_to_bytes("id: retained\nretry: 12\n\n")); closed_finish();
+eq(closed_status(), map{ phase: "closed", pending_bytes: 0, last_event_id: "retained", retry_ms: 12 }, "successful close retains controls");
+eq(try { closed_feed([]); false } catch true, true, "saved feed after close");
+eq(try { closed_finish(); false } catch true, true, "saved finish after close");
+let default_snapshot = S.defaults(); default_snapshot.feeds = 0;
+eq(S.defaults().feeds, 65536, "default map detached");
+let limit_snapshot = S.limits(); limit_snapshot.chunk_bytes = 0;
+eq(S.limits().chunk_bytes, 65536, "limit map detached");
+let empty = S.new(map{ chunk_bytes: 0, total_bytes: 0, decoded_chars: 0 });
+eq(empty.feed([]), [], "empty zero-budget feed"); eq(empty.finish(), [], "empty finish");
+print "sse_bytes_pass";

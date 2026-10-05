@@ -1,0 +1,146 @@
+//! Strict, bounded incremental UTF-8 byte admission for the existing SSE reader.
+//! Caller-owned integer byte arrays only; no I/O, replacement decoding or reconnect.
+let SSE = import("stdlib:sse_reader.sapp");
+
+fn defaults() {
+    return map{ chunk_bytes: 4096, total_bytes: 4194304, feeds: 65536,
+        decoded_chars: 1048576 };
+}
+
+fn limits() {
+    return map{ chunk_bytes: 65536, total_bytes: 67108864, feeds: 1048576,
+        decoded_chars: 16777216 };
+}
+
+fn _options(raw) {
+    if not is_map(raw) { throw "sse_bytes: options must be a map"; }
+    let caps = limits();
+    if len(raw) > len(caps) { throw "sse_bytes: too many options"; }
+    let out = defaults();
+    for key in map_keys(raw) {
+        if not map_has(caps, key) { throw "sse_bytes: unknown option"; }
+        let value = raw[key];
+        if type(value) != "number" { throw "sse_bytes: limit must be an integer"; }
+        if not (try value >= 0 and value <= caps[key] catch false) {
+            throw "sse_bytes: limit out of range";
+        }
+        if num_floor(value) != value { throw "sse_bytes: limit must be an integer"; }
+        out[key] = value;
+    }
+    return out;
+}
+
+fn _clear(s) {
+    // A deliberate invalid feed clears the private SSE state using its existing
+    // failure contract. Never expose the inner reader or retain its closures.
+    if s.reader != nil { try s.reader.feed(nil) catch nil; }
+    s.reader = nil;
+    s.pending = [];
+    s.remaining = 0;
+    s.lower = 128;
+    s.upper = 191;
+    s.input_count = 0;
+    s.decoded_count = 0;
+    s.feed_count = 0;
+    s.phase = "failed";
+}
+
+fn _feed(s, chunk) {
+    if not is_array(chunk) { throw "sse_bytes: expected byte array"; }
+    let size = len(chunk);
+    if size > s.options.chunk_bytes { throw "sse_bytes: chunk byte limit"; }
+    if size > s.options.total_bytes - s.input_count { throw "sse_bytes: total byte limit"; }
+    if s.feed_count >= s.options.feeds { throw "sse_bytes: feed limit"; }
+    s.input_count = s.input_count + size;
+    s.feed_count = s.feed_count + 1;
+
+    // This work buffer holds at most chunk_bytes + 3 numbers; conversion has
+    // additional bounded copies/text. Never retain the caller's array.
+    let bytes = [];
+    for byte in s.pending { array_push(bytes, byte); }
+    let complete = 0;
+    let characters = 0;
+    for byte in chunk {
+        if type(byte) != "number" { throw "sse_bytes: byte must be an integer"; }
+        if not (try byte >= 0 and byte <= 255 catch false) {
+            throw "sse_bytes: byte out of range";
+        }
+        if num_floor(byte) != byte { throw "sse_bytes: byte must be an integer"; }
+        if s.remaining == 0 {
+            if byte <= 127 { s.remaining = 0; }
+            else if byte >= 194 and byte <= 223 { s.remaining = 1; }
+            else if byte >= 224 and byte <= 239 {
+                s.remaining = 2;
+                if byte == 224 { s.lower = 160; }
+                if byte == 237 { s.upper = 159; }
+            } else if byte >= 240 and byte <= 244 {
+                s.remaining = 3;
+                if byte == 240 { s.lower = 144; }
+                if byte == 244 { s.upper = 143; }
+            } else { throw "sse_bytes: invalid UTF-8 lead"; }
+        } else {
+            if byte < s.lower or byte > s.upper { throw "sse_bytes: invalid UTF-8 continuation"; }
+            s.remaining = s.remaining - 1;
+            s.lower = 128;
+            s.upper = 191;
+        }
+        array_push(bytes, byte);
+        if s.remaining == 0 {
+            if characters >= s.options.decoded_chars - s.decoded_count {
+                throw "sse_bytes: decoded character limit";
+            }
+            characters = characters + 1;
+            complete = len(bytes);
+        }
+    }
+    // Validate the entire feed first: malformed suffixes cannot leak events from
+    // its valid prefix. Decode only a complete bounded prefix, once per feed.
+    let text = bytes_to_str(slice(bytes, 0, complete));
+    s.pending = slice(bytes, complete, len(bytes));
+    s.decoded_count = s.decoded_count + characters;
+    return s.reader.feed(text);
+}
+
+fn _guarded_feed(s, chunk) {
+    if s.phase != "open" { throw "sse_bytes: reader is not open"; }
+    return try _feed(s, chunk) catch {
+        _clear(s);
+        throw "sse_bytes: feed rejected; reader failed";
+    };
+}
+
+fn _finish(s) {
+    if s.remaining != 0 { throw "sse_bytes: truncated UTF-8 at EOF"; }
+    let events = s.reader.finish();
+    s.pending = [];
+    s.phase = "closed";
+    return events;
+}
+
+fn _guarded_finish(s) {
+    if s.phase != "open" { throw "sse_bytes: reader is not open"; }
+    return try _finish(s) catch {
+        _clear(s);
+        throw "sse_bytes: finish rejected; reader failed";
+    };
+}
+
+fn _status(s) {
+    let inner = if s.reader == nil { map{ last_event_id: "", retry_ms: nil } }
+        else { s.reader.status() };
+    return map{ phase: s.phase, pending_bytes: len(s.pending),
+        last_event_id: inner.last_event_id, retry_ms: inner.retry_ms };
+}
+
+// Byte limits and the existing SSE text/event limits are separate, copied inputs.
+fn new(options = nil, text_options = nil) {
+    if options == nil { options = map{}; }
+    let s = map{ options: _options(options), reader: SSE.new(text_options),
+        pending: [], remaining: 0, lower: 128, upper: 191, input_count: 0,
+        decoded_count: 0, feed_count: 0, phase: "open" };
+    return map{ feed: fn(bytes) { return _guarded_feed(s, bytes); },
+        finish: fn() { return _guarded_finish(s); },
+        status: fn() { return _status(s); } };
+}
+
+export new, defaults, limits;
