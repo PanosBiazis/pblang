@@ -32,8 +32,10 @@ def start(with_profile=True):
     assert all(flag in flags for flag in (b'--deny-net',b'--deny-http',b'--deny-spawn')),flags
     x('windowfocus','--sync',window);time.sleep(.4);click(700,44)
 def close():
-    key('Escape')
-    if child.poll() is None:key('Escape')
+    # Style -> document -> clear opener focus -> close; old releases need fewer.
+    for _ in range(3):
+        if child.poll() is not None:break
+        key('Escape')
     out,err=child.communicate(timeout=10);assert child.returncode==0,(out,err)
 def tabs(n):
     for _ in range(n):key('Tab')
