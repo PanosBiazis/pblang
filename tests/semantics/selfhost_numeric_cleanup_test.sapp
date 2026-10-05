@@ -1,0 +1,85 @@
+let V=import("stdlib:compiler/vm.sapp");
+let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let P=import("stdlib:selfhost_pbck.sapp");
+let O=import("stdlib:compiler/optimizer.sapp");
+fn compiled(source){let r=F.frontend_compile(source);assert(r.ok,"fixture compile: "+str(r.diagnostics));return r.chunk;}
+let setup=compiled("memory_alloc(7);push_lifetime();borrow_immutable(1);memory_alloc(9);");
+fn prepare(automatic){let c=V.execution_context(automatic);V.run_seeded(setup,map{},c);return c;}
+fn run(code,bounded,c){if bounded {return V.run_seeded_bounded(code,map{},nil,c);}return V.run_seeded(code,map{},c);}
+let unary=["num_floor","num_ceil","num_abs","num_sqrt","num_ln","num_exp"];
+let binary=["num_min","num_max"];
+let cases=[];
+for name in unary {array_push(cases,"fn call(f,a){return f(a);}call("+name+",nil);");}
+for name in binary {array_push(cases,"fn call(f,a,b){return f(a,b);}call("+name+",nil,2);");array_push(cases,"fn call(f,a,b){return f(a,b);}call("+name+",2,nil);");}
+let handler=compiled("print memory_get(1);");
+for source in cases {
+ let code=compiled(source);
+ for bounded in [false,true] {
+  for automatic in [false,true] {
+   let c=prepare(automatic);let m=c.memory;
+   assert((try {run(code,bounded,c);false} catch true),"numeric call rejects");
+   assert(m.closed==automatic,"escaping error closes only owned state: "+source);
+   if automatic {assert(c.memory==nil and m.reclaimed==2 and len(m.owners)==0 and len(m.borrows)==0,"all private scopes released");}
+   else {assert(c.memory==m and len(m.owners)==2 and len(m.borrows)==1,"borrowed state unchanged");}
+   V.close_execution(c);V.close_execution(c);assert(m.reclaimed==2,"idempotent close");
+  }
+  let c=prepare(true);let m=c.memory;
+  let caught=map{constants:[map{try_chunk:code,catch_chunk:handler}],instructions:[map{op:35,operand:0}]};
+  assert(run(caught,bounded,c).output==[7],"guest handler can use memory");
+  assert(c.memory==m and not m.closed and c.handlers==0,"handler ownership restored");V.close_execution(c);
+ }
+}
+// Other rejected types include boxed exact values; these eight host builtins
+// accept only ordinary numbers. They do not coerce strings/bools/boxed numbers.
+for value in [true,"7",[],map{},bigint("7"),rational("1/2"),decimal("7")] {
+ for name in unary {
+  let code=map{constants:[map{__bi:name},value],instructions:[map{op:0,operand:0},map{op:0,operand:1},map{op:18,operand:1}]};
+  let c=prepare(true);let m=c.memory;assert((try {run(code,true,c);false} catch true),"unsupported unary value");assert(m.closed,"typed failure cleanup");
+ }
+}
+// Both binary positions, including when both values are invalid, reject the
+// same types as the host. First-error precedence is covered by diagnostic parity.
+for value in [true,"7",[],map{},bigint("7"),rational("1/2"),decimal("7")] {
+ for name in binary {
+  for values in [[value,2],[2,value],[value,nil]] {
+   let code=map{constants:[map{__bi:name},values[0],values[1]],instructions:[map{op:0,operand:0},map{op:0,operand:1},map{op:0,operand:2},map{op:18,operand:2}]};
+   let c=prepare(true);let m=c.memory;assert((try {run(code,true,c);false} catch true),"unsupported binary value");assert(m.closed and m.reclaimed==2,"binary typed failure cleanup");
+  }
+ }
+}
+// Generic operator-method dispatch must use the same cleanup, after evaluation.
+for name in binary {
+ let code=compiled("let obj=map{__add__:"+name+"};obj+2;");
+ for bounded in [false,true] {
+  let c=prepare(true);let m=c.memory;assert((try {run(code,bounded,c);false} catch true),"generic method rejects map");assert(m.closed,"generic method cleanup");
+ }
+}
+let effects=compiled("let calls=[];fn arg(n){array_push(calls,n);return nil;}fn invoke(f,a,b){return f(a,b);}invoke(num_max,arg(1),arg(2));");
+for code in [effects,O.optimize_safe(effects).chunk,P.deserialize_chunk(P.serialize_chunk(effects))] {
+ for bounded in [false,true] {
+  let c=prepare(true);let m=c.memory;let g=map{};let failed=false;
+  if bounded {try V.run_seeded_bounded(code,g,nil,c) catch {failed=true;};}
+  else {try V.run_seeded(code,g,c) catch {failed=true;};}
+  assert(failed and m.closed and g.calls==[1,2],"arguments evaluated once in order");
+ }
+}
+// Success, NaN/infinities and domain results retain the host contract.
+let accepted=compiled("let h=memory_alloc(11);print num_floor(3.9);print num_ceil(-3.9);print num_abs(-4);print num_sqrt(9);"
+ +"print num_ln(1);print num_exp(0);print num_min(3,4);print num_max(3,4);let nan=num_sqrt(-1);print nan!=nan;"
+ +"print num_max(nan,7);print num_min(7,nan);print num_exp(1000)>100000;print num_ln(0)<0;print memory_get(h);");
+for bounded in [false,true] {
+ let c=V.execution_context(true);let result=run(accepted,bounded,c);
+ assert(result.output==[3,-3,4,3,0,1,3,4,true,7,7,true,true,11],"successful and nonfinite results");
+ assert(not c.memory.closed,"successful operations retain owners");V.close_execution(c);
+}
+// Late allocation, caught errors and handler errors must not leave stale policy.
+for source in ["print num_floor(2);memory_alloc(3);fail(num_floor,nil);",
+ "memory_alloc(3);print try fail(num_abs,nil) catch 7;fail(num_ceil,nil);",
+ "memory_alloc(3);try fail(num_sqrt,nil) catch fail(num_ln,nil);"] {
+ let code=compiled("fn fail(f,x){return f(x);}"+source);
+ for bounded in [false,true] {let c=V.execution_context(true);assert((try {run(code,bounded,c);false} catch true),"escaping late/handler failure");assert(c.memory==nil and c.handlers==0,"late/handler state closed");}
+}
+// Shadowing remains ordinary guest code, not builtin admission.
+let shadowed=compiled("fn num_sqrt(x){return x;}print num_sqrt(nil);");
+let c=prepare(true);assert(run(shadowed,true,c).output==[nil] and not c.memory.closed,"shadowed builtin unchanged");V.close_execution(c);
+print "selfhost_numeric_cleanup_pass";
