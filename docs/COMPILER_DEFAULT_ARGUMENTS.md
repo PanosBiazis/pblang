@@ -78,3 +78,8 @@ source rewrite, global installation change or permission change is introduced.
 This default-argument fix does not close the nested p:run, general lazy-import
 origin, FFI or garbage-collection backlog. Native execution tests qualify Linux;
 no universal operating-system or performance claim is made.
+
+The installed public checker can now expose the existing conservative admission
+profile directly: `pblang --check --via-pblang --retained-source FILE`. Its early
+rejection does not repair direct execution. See
+[public retained-source checking](PUBLIC_RETAINED_SOURCE_CHECK.md).
