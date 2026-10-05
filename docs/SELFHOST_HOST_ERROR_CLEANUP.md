@@ -1,4 +1,4 @@
-# Self-hosted arithmetic and non-callable cleanup
+# Self-hosted arithmetic, numeric builtin and non-callable cleanup
 
 The PBLang VM now releases opted-in scalar ownership when a non-map arithmetic
 or ordering primitive fails outside any guest `try`, and when the generic call
@@ -47,6 +47,38 @@ body: a non-map callee, or a legacy raw descriptor without a map-valued `chunk`.
 It attempts cleanup before the original access rejects, without replacing that
 access's message. Valid legacy raw function constants still run. This does not
 validate every arbitrary malformed VM descriptor.
+
+## Strict numeric builtins
+
+`num_floor`, `num_ceil`, `num_abs`, `num_sqrt`, `num_ln`, `num_exp`,
+`num_min` and `num_max` also release opted-in ownership on an escaping type
+error, in both scalar and generic dispatch. For example:
+
+```pblang
+memory_alloc(7);
+fn call(f, x) { return f(x); }
+call(num_sqrt, nil);
+```
+
+These eight primitives accept ordinary numbers only. A non-number is a guaranteed
+host rejection, so the VM attempts cleanup before invoking the original primitive
+once on the already-evaluated arguments. The original message and first-invalid-
+argument priority remain. The same caught/borrowed-context rules above apply.
+Wrong arity still fails before inspecting arguments, via the existing arity guard.
+Successful calls, negative domain results, NaN and infinities keep the host behavior.
+Boxed exact integers, rationals and decimals are still rejected by these primitives;
+`num_pow`, `num_mod` and exact-number constructors have different contracts and are
+not included in this numeric cleanup extension. Shadowed guest functions remain
+ordinary guest calls.
+
+See `examples/selfhost_throw_cleanup/numeric.sapp` for an executable ownership
+example. `tests/semantics/selfhost_numeric_cleanup_test.sapp` exercises scalar and
+generic dispatch, owner/borrow release, handlers, accepted and rejected types,
+argument effects, optimized/PBCS routes and late allocations.
+The tooling harness's `--numeric --reference <previous-release>` group compares
+stdout, exit status and the original first error message across all six routes,
+including secondary cleanup failure. This is a correctness extension; no numeric
+throughput improvement is claimed.
 
 ## Checks and limits
 

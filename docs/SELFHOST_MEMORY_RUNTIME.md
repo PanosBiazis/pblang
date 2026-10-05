@@ -280,10 +280,15 @@ limits](SELFHOST_STRING_ADMISSION.md), including bounded NaN padding parity
 and pre-allocation empty-search replacement accounting. Arbitrary host/FFI
 failures remain outside this guarantee.
 
-### Arithmetic and non-callable host failures
+### Arithmetic, numeric builtin and non-callable host failures
 
 Non-map arithmetic/ordering failures and generic non-callable targets now release
 opted-in scalar ownership when the error escapes. Guest catches and borrowed
 contexts remain live; original diagnostics and operand/argument evaluation are
 preserved. Optimized local-add instructions use the same rule. See
 [the exact contract and limitations](SELFHOST_HOST_ERROR_CLEANUP.md).
+
+Strict numeric builtin type-error cleanup now covers `num_floor`, `num_ceil`,
+`num_abs`, `num_sqrt`, `num_ln`, `num_exp`, `num_min` and `num_max` in both
+dispatch paths. The opted-in escaping/caught/borrowed ownership contract remains
+the same; see [host-error cleanup](SELFHOST_HOST_ERROR_CLEANUP.md) for exact scope.

@@ -1,4 +1,4 @@
-"""Source-hidden semantic checks and host-diagnostic parity for VM arithmetic."""
+"""Source-hidden semantic checks and host-diagnostic parity for VM host errors."""
 import argparse
 import hashlib
 import json
@@ -17,6 +17,7 @@ def main():
     ap.add_argument('--suite', type=Path)
     ap.add_argument('--reference', type=Path)
     ap.add_argument('--calls', action='store_true')
+    ap.add_argument('--numeric', action='store_true')
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--count', type=int, default=3)
     a = ap.parse_args()
@@ -84,6 +85,23 @@ def main():
                      ('call-parameter', 'fn call(f){return f();}call(3);', False),
                      ('call-large', 'let f=3;f(1,2,3,4,5);', False),
                      ('call-caught', 'let f=3;print try f() catch 7;', True)]
+        if a.numeric:
+            assert a.reference, '--reference is required for existing VM diagnostics'
+            assert not a.calls, 'select either numeric or non-callable cases'
+            unary = ['num_floor', 'num_ceil', 'num_abs', 'num_sqrt', 'num_ln', 'num_exp']
+            cases = [(name, 'fn call(f,x){return f(x);}call(' + name + ',nil);', False)
+                     for name in unary]
+            cases += [(name + '/' + values, 'fn call(f,a,b){return f(a,b);}call(' + name + ',' + values + ');', False)
+                      for name in ['num_min', 'num_max'] for values in ['nil,2', '2,nil']]
+            cases += [('generic/' + name, 'let obj=map{__add__:' + name + '};obj+2;', False)
+                      for name in ['num_min', 'num_max']]
+            cases += [('valid-numeric', 'print num_floor(3.9);print num_ceil(-3.9);print num_abs(-4);'
+                       'print num_sqrt(9);print num_ln(1);print num_exp(0);print num_min(3,4);print num_max(3,4);', True),
+                      ('caught-numeric', 'fn call(f,x){return f(x);}print try call(num_sqrt,nil) catch memory_get(1);', True),
+                      ('numeric-arity', 'fn call(f){return f();}call(num_floor);', False),
+                      ('numeric-exact-rejected', 'fn call(f,x){return f(x);}call(num_abs,bigint("7"));', False)]
+            cases += [(name + '/both-invalid', 'fn call(f,a,b){return f(a,b);}call(' + name + ',nil,"bad");', False)
+                      for name in ['num_min', 'num_max']]
         for label, source, valid in cases[a.start:a.start + a.count]:
             if a.reference:
                 expected = run(prefix + 'let c=V.execution_context(true);V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk,map{},c);'
@@ -108,7 +126,7 @@ def main():
                            expected=expected, actual=actual)
             if not valid:
                 # Fault injection affects only private cleanup metadata. Preserve
-                # the original arithmetic diagnostic when that cleanup also fails.
+                # the original host diagnostic when that cleanup also fails.
                 text = prefix + 'let c=V.execution_context(true);V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk,map{},c);'
                 text += 'c.memory.reclaimed=map{};V.run_seeded(F.frontend_compile(' + json.dumps(source) + ').chunk,map{},c);'
                 actual = run(text)
