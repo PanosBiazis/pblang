@@ -1,0 +1,143 @@
+let S = import("stdlib:sse_reader.sapp");
+
+fn eq(actual, expected, label) {
+    if actual != expected { throw "FAIL sse_reader: " + label + " actual=" + str(actual); }
+}
+fn event(data, name = "message", id = "") {
+    return map{ event: name, data: data, last_event_id: id };
+}
+fn append(out, events) { for item in events { array_push(out, item); } }
+fn reject(options, chunk, label) {
+    let reader = S.new(options);
+    eq(try { reader.feed(chunk); false } catch true, true, label);
+    eq(reader.status(), map{ phase: "failed", last_event_id: "", retry_ms: nil }, label + " cleared");
+    eq(try { reader.feed(""); false } catch true, true, label + " sticky feed");
+    eq(try { reader.finish(); false } catch true, true, label + " sticky finish");
+}
+fn parses(text, expected, label) {
+    // Every two-chunk split (including empty chunks), and one scalar per feed.
+    let cut = 0;
+    while cut <= len(text) {
+        let reader = S.new();
+        let out = reader.feed(str_slice(text, 0, cut));
+        append(out, reader.feed(str_slice(text, cut, len(text))));
+        append(out, reader.finish());
+        eq(out, expected, label + " split " + str(cut));
+        cut = cut + 1;
+    }
+    let reader = S.new();
+    let out = [];
+    for character in str_split(text, "") { append(out, reader.feed(character)); }
+    append(out, reader.finish());
+    eq(out, expected, label + " scalar chunks");
+}
+
+parses("data: hi\n\n", [event("hi")], "LF");
+parses("data: hi\r\r", [event("hi")], "CR");
+parses("data: hi\r\n\r\n", [event("hi")], "CRLF");
+parses("﻿:comment\r\ndata: Ελληνικά 😀\r\ndata:  tail \rdata\n\n", [event("Ελληνικά 😀\n tail \n")], "BOM whitespace Unicode");
+parses("data:\n\ndata\n\ndata: a:b\ndata:\n\n", [event(""), event(""), event("a:b\n")], "empty data");
+parses("event: ignored\n\ndata: a\n\nevent: custom\ndata: b\n\nevent:\ndata: c\n\n", [event("a"), event("b", "custom"), event("c")], "event reset");
+parses("id: first\n\ndata: a\n\nid: bad\0value\ndata: b\n\nid\ndata: c\n\n", [event("a", "message", "first"), event("b", "message", "first"), event("c")], "persistent id NUL reset");
+parses(" data: ignored\nData: ignored\nunknown: x\n:\ndata:\t spaced \n\ndata: [DONE]\n\ndata: later\n\n", [event("\t spaced "), event("[DONE]"), event("later")], "literal fields and done");
+parses("﻿﻿data: ignored\n\ndata: ﻿retained\n\n", [event("﻿retained")], "only initial BOM");
+parses("data: complete\n\ndata: unfinished\n", [event("complete")], "EOF drops event");
+parses("data: unfinished", [], "EOF drops line");
+parses("data: x\n", [], "no final blank");
+
+let r = S.new();
+eq(r.feed(""), [], "empty first chunk");
+eq(r.feed("﻿retry: 00012\nid: saved\n\n"), [], "control only");
+eq(r.status(), map{ phase: "open", last_event_id: "saved", retry_ms: 12 }, "control state");
+for value in ["", "+2", "-2", "1.0", "  2", "2 ", "１２", "999999999999999999999x"] {
+    r.feed("retry:" + value + "\n");
+    eq(r.status().retry_ms, 12, "invalid retry ignored");
+}
+r.feed("retry: 2147483647\n");
+eq(r.status().retry_ms, 2147483647, "retry max");
+r.feed("retry: 0\n");
+eq(r.status().retry_ms, 0, "retry zero");
+r.feed("id: unfinished\n");
+eq(r.status().last_event_id, "saved", "id only commits on blank line");
+eq(r.finish(), [], "finish empty result");
+eq(r.status(), map{ phase: "closed", last_event_id: "saved", retry_ms: 0 }, "finish status");
+eq(try { r.feed(""); false } catch true, true, "post close feed");
+eq(try { r.finish(); false } catch true, true, "post close finish");
+
+// Snapshots and caller-owned event maps cannot corrupt captured state.
+let opts = map{ line_chars: 7 };
+let isolated = S.new(opts);
+opts.line_chars = 0;
+let first = isolated.feed("id: a\n\ndata: x\n\n");
+first[0].last_event_id = "mutated";
+let status = isolated.status();
+status.last_event_id = "changed";
+eq(isolated.feed("data: y\n\n"), [event("y", "message", "a")], "alias isolation");
+let second = S.new();
+eq(second.feed("data: z\n\n"), [event("z")], "independent readers");
+
+for bad in [true, false, "1", [], map{ unknown: 1 }, map{ line_chars: -1 }, map{ feeds: 1.5 }, map{ events: nil }, map{ retry_ms: 2147483648 }, map{ total_chars: parse_number("NaN") }, map{ output_chars: parse_number("inf") }] {
+    eq(try { S.new(bad); false } catch true, true, "malformed options");
+}
+let many = map{};
+let index = 0;
+while index < 10 { many[str(index)] = 0; index = index + 1; }
+eq(try { S.new(many); false } catch true, true, "option cardinality");
+for bad in [nil, 0, true, [], map{}] { reject(nil, bad, "chunk type"); }
+reject(map{ chunk_chars: 0 }, "x", "chunk limit");
+eq(S.new(map{ chunk_chars: 1 }).feed("😀"), [], "scalar character limit");
+reject(map{ line_chars: 6 }, "data: x", "line limit");
+eq(S.new(map{ line_chars: 7 }).feed("data: x\n\n"), [event("x")], "line boundary");
+reject(map{ data_chars: 1 }, "data: x\n\n", "data LF counted");
+eq(S.new(map{ data_chars: 2 }).feed("data: x\n\n"), [event("x")], "data boundary");
+reject(map{ pending_chars: 7 }, "id: a\ndata: x\n\n", "pending combined");
+eq(S.new(map{ pending_chars: 8 }).feed("id: a\ndata: x\n\n"), [event("x", "message", "a")], "pending boundary");
+reject(map{ total_chars: 8 }, "data: x\n\n", "input limit");
+eq(S.new(map{ total_chars: 9 }).feed("data: x\n\n"), [event("x")], "input boundary");
+reject(map{ output_chars: 7 }, "data: x\n\n", "output includes name");
+eq(S.new(map{ output_chars: 8 }).feed("data: x\n\n"), [event("x")], "output boundary");
+reject(map{ events: 1 }, "data: x\n\ndata: y\n\n", "event limit atomic call");
+eq(S.new(map{ events: 1 }).feed("data:\n\n"), [event("")], "event boundary");
+reject(map{ events: 0 }, "data:\n\n", "empty event counted");
+reject(map{ feeds: 0 }, "", "empty feed counted");
+reject(nil, "retry: 2147483648\n", "retry overflow");
+reject(map{ retry_ms: 1 }, "retry: 2\n", "retry custom limit");
+eq(S.new(map{ retry_ms: 0 }).feed("retry: 0\n"), [], "retry zero boundary");
+let cumulative = S.new(map{ total_chars: 2 });
+cumulative.feed("a");
+cumulative.feed("b");
+eq(try { cumulative.feed("c"); false } catch true, true, "cumulative input");
+let calls = S.new(map{ feeds: 1 });
+calls.feed("");
+eq(try { calls.feed(""); false } catch true, true, "cumulative feeds");
+let outputs = S.new(map{ output_chars: 8 });
+let delivered = outputs.feed("data: x\n\n");
+eq(try { outputs.feed("data: y\n\n"); false } catch true, true, "cumulative output");
+eq(delivered, [event("x")], "prior call retained after failure");
+// Limits also accumulate across calls and across fields of one event.
+let lines = S.new(map{ line_chars: 2 });
+lines.feed("ab");
+eq(try { lines.feed("c"); false } catch true, true, "split line bound");
+let data_limit = S.new(map{ data_chars: 3 });
+data_limit.feed("data: a\n");
+eq(try { data_limit.feed("data: b\n"); false } catch true, true, "multiline data bound");
+let event_limit = S.new(map{ events: 1 });
+event_limit.feed("id: private\nretry: 5\ndata: x\n\n");
+eq(try { event_limit.feed("data: y\n\n"); false } catch true, true, "cumulative events");
+eq(event_limit.status(), map{ phase: "failed", last_event_id: "", retry_ms: nil }, "failure clears prior control state");
+let default_snapshot = S.defaults();
+default_snapshot.events = 0;
+eq(S.defaults().events, 4096, "default snapshot isolation");
+let limit_snapshot = S.limits();
+limit_snapshot.events = 0;
+eq(S.limits().events, 65536, "limit snapshot isolation");
+let caps = S.limits();
+for key in map_keys(caps) {
+    let option = map{};
+    option[key] = caps[key];
+    eq(S.new(option).status().phase, "open", "hard cap accepted");
+    option[key] = caps[key] + 1;
+    eq(try { S.new(option); false } catch true, true, "hard cap rejected");
+}
+eq(str_to_bytes("\0"), [0], "NUL fixture is U+0000");
+print "sse_reader_pass";
