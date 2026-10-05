@@ -181,3 +181,6 @@ real-file lifecycle and terminal-error checks.
 For explicit cleanup after a catchable application failure, use the additive
 [scoped checkpoint file API](pbAI_Checkpoint_Scope.md). The original storage
 binding and manual loaded-handle ownership remain unchanged.
+
+For one to eight files with cleanup after partial acquisition, see
+[bounded checkpoint groups](pbAI_Checkpoint_Batch.md).
