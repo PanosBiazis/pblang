@@ -133,3 +133,6 @@ prediction alias has become terminal.
 See [recorded evidence](evidence/pbai_checkpoint_scope-2026-10-05.json).
 This is a lifecycle/correctness change, with no performance optimization claim.
 The cycle8 benchmarks and rejected inline-guard experiment remain unchanged.
+
+For one to eight files with cleanup after partial acquisition, see
+[bounded checkpoint groups](pbAI_Checkpoint_Batch.md).
