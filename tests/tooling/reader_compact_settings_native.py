@@ -31,11 +31,11 @@ def main():
         initial=settled(settings=False,bounds=True)
         for _ in range(3):press('Tab')
         settled(focus='appearance');press('Return');settled(settings=True,focus='font_family',bounds=True);shot('reader-settings-small.png')
-        for name,value in [('font_family','serif'),('body_size',18),('font_scale',1.25),('line_height',1.75),('density','compact')]:
+        for name,value in [('font_family','serif'),('body_size',18),('title_size',32),('font_scale',1.25),('line_height',1.75),('density','compact')]:
             settled(focus=name,bounds=True);press('Return');state=settled(focus=name,bounds=True);assert state['appearance'][name]==value
             if name!='density':press('Next',.7)
         shot('reader-settings-last.png');x('windowsize',window,390,844);settled(width=390,height=844,focus='density',layout=None,bounds=True);shot('reader-settings-expanded.png')
-        x('windowsize',window,320,240);last=settled(width=320,height=240,focus='density',bounds=True);assert last['layout']['page']==4
+        x('windowsize',window,320,240);last=settled(width=320,height=240,focus='density',bounds=True);assert last['layout']['page']==5
         press('Home');settled(focus='font_family',bounds=True);press('End');settled(focus='density',bounds=True)
         x('keydown','Shift_L');press('Tab');x('keyup','Shift_L');settled(focus='settings_previous')
         press('space',.7);state=settled(focus='line_height',bounds=True);assert state['appearance']['line_height']==1.75

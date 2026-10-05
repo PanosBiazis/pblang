@@ -141,8 +141,9 @@ after 6.5 seconds. It refuses non-Xvfb displays. See the capability matrix in
 
 The native reader uses one compact Back / Forward / Home / Style toolbar, even at
 390px width. **Style** opens a separate reading settings screen; **Done** returns
-to the same document. Family, body size, text scale, line spacing and density are
-session-local options. No preferences are persisted or transmitted.
+to the same document. Family, body size, title size, text scale, line spacing and density are
+session-local options by default. The optional `--with-profile` mode described below
+adds explicit saving; no preferences are transmitted.
 
 Opening **Style** focuses the font choice. Enter changes the focused option while
 keeping it selected; Tab and Shift+Tab move between the available controls.
@@ -245,9 +246,9 @@ is not established by these Linux/Xvfb tests.
 ## Preferences in short windows
 
 When the original **Style** screen would overflow or truncate its text, it switches
-to a compact layout. All five existing choices remain available: font family, body
-size, text scale, line spacing and density. The layout shows one choice at the
-minimum 320×240 viewport, two at 320×288, and up to five as height allows.
+to a compact layout. All six choices remain available: font family, body
+size, title size, text scale, line spacing and density. The layout shows one choice at the
+minimum 320×240 viewport, two at 320×288, and up to six as height allows.
 **Previous options / Next options**, Page Up/Down and Home/End navigate these option
 pages while Style is open; document reading position is unchanged. Changing pages
 focuses the first displayed choice. Tab/Shift+Tab and Enter/Space retain their
@@ -266,9 +267,9 @@ described below; its default remains session-only.
 
 Developers may call `App.settings_page(reader,index)` (zero-based, clamped, false
 when unavailable or unchanged). The example-local `settings_layout.plan(height,
-anchor, total=5)` computes capacity and visible indices without opening a window;
+anchor, total=6)` computes capacity and visible indices without opening a window;
 anchor is a zero-based choice index, and height uses the existing GUI bounds
-240–4320. The optional preferences workflow uses `total=8` for its actions, or `total=9` with explicit reload. Shared GUI
+240–4320. The optional preferences workflow uses `total=9` for its actions, or `total=10` with explicit reload. Shared GUI
 contracts and Web/Android exporters remain unchanged.
 
 ```sh
@@ -276,7 +277,7 @@ pblang run tests/semantics/reader_compact_settings_test.sapp --allow-all
 xvfb-run -a -s '-screen 0 1000x1000x24 -nolisten tcp' env XMODIFIERS=@im=none python3 tests/tooling/reader_compact_settings_native.py
 ```
 
-The isolated native test changes all five options using real keyboard input at
+The isolated native test changes all six options using real keyboard input at
 320×240, enlarges and shrinks the window, checks focus and held keys, then returns
 to the same document. Synthetic screenshots are written to `build/reader-settings-*`.
 This establishes Linux/Xvfb behavior, not execution on other physical platforms.
@@ -646,7 +647,7 @@ and returns a boolean. No callback means no Reload button; previous four-argumen
 callers and default/session-only launchers retain their earlier behavior. The
 native adapter reuses `Store.load` and `Store.save`; it reloads the chosen location
 without rediscovering environment overrides or changing launcher capabilities.
-All nine controls remain available through the existing compact settings pages.
+All ten controls remain available through the existing compact settings pages.
 
 ```sh
 pblang run tests/semantics/reader_reload_test.sapp --allow-all --deny-fs --deny-net --deny-http --deny-exec --deny-spawn --deny-ffi
@@ -860,3 +861,32 @@ files while a saved-profile reader remains on its last page, verifying unchanged
 profile bytes and screenshots as well as continued navigation. An invalid saved
 profile is also tested with a valid imported document: reading remains available,
 the Style status explains the fallback and the invalid profile is not rewritten.
+
+
+## Independent title size in Style
+
+**Title size** cycles through 20, 24, 28, 32, 36 and 40; the default remains 28.
+It changes the article's main title independently of **Text size** (paragraphs and
+section headings). **Text scale** still multiplies both sizes. The displayed number
+is the base size before that scale. At 320×240 the title is the third option page;
+at 320×480 all six appearance choices fit together and actions are on the next page.
+
+Apply, Save, Reload and Reset include the title using the existing v1 profile.
+Apply preserves the reading anchor and does not write the profile; reflow can change
+the page number. Done discards an unapplied draft. Saved styles work with `--open`
+on a new document, and local navigation retains the applied style. Reset restores
+28 along with all other defaults. Default/session-only launches still ignore saved
+profiles. No source document is rewritten.
+
+Developers can continue using `App.configure(reader,map{title_size:27})` or supply
+`title_size` in the appearance passed to `App.create`. All previously accepted
+integer sizes 12–40 remain valid and are preserved without rounding to presets.
+Explicitly activating Title size from a non-preset value starts the sequence at 20.
+The profile schema, shared typography, renderers and packaging contracts are unchanged.
+
+`reader_title_size_test.sapp` covers draft/apply/save/reload/reset, imported content,
+navigation, a new document, custom values and paginated reflow.
+`reader_title_size_native.py` exercises the real packaged/installed launcher with
+synthetic imported files and isolated profile data, including 320×480 screenshots.
+This is a native reader control; it does not add a settings UI to exported Web/Android
+previews or establish device execution on other platforms.
