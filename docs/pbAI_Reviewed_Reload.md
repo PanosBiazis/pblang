@@ -1,0 +1,138 @@
+# Compare before replacing a loaded student
+
+A structurally valid checkpoint can still regress on the application's examples.
+The bundled loaded student handle now provides `compare(candidate, examples)`:
+read-only comparison against its actual loaded fixed-point weights. It returns
+aggregate metrics and a bounded admission result. It does not replace, close,
+train or persist either model. No new provider framework or binding is needed:
+direct loading, the existing specialist binding, legacy facade loading and file
+loading return the same bundled handle contract in both products.
+
+```pblang
+let current=storage.load_file(current_path);
+let candidate=storage.load_file(candidate_path);
+let review=current.compare(candidate.checkpoint(),[map{x:[6,0],y:5}]);
+candidate.close();
+print review.passed;
+current.close();
+```
+
+That minimal fragment illustrates the method. For cleanup after a catchable
+error and an actual session replacement, use the full runnable example below.
+Custom providers retain responsibility for their own returned-handle methods;
+existing binding metadata does not authenticate or verify a provider's compare.
+
+## Bounded comparison and decision
+
+The candidate must pass the unchanged strict student-checkpoint validator.
+Examples use the existing 1..32 unique-context contract: each has exactly x/y,
+x contains 1..4 integer token IDs 0..7, and y is an integer label 0..7. Malformed,
+cyclic, extra-field and duplicate-context inputs are rejected. Positive and
+negative zero denote the same context. There is no recursive arbitrary-payload
+walk or invocation of supplied functions. The loaded handle's terminal guard
+runs before candidate/example validation.
+
+The operation reconstructs only the candidate head from its fixed-point weights
+and reuses the active handle's frozen model and baseline student. The existing
+paired evaluator supplies both losses, correct counts and per-example regressions
+on the same features. This is code reuse, not a measured performance improvement.
+
+The `pbai.neural.student-comparison.v1` report contains:
+
+| Field | Meaning |
+| --- | --- |
+| `baseline`, `candidate` | Aggregate examples, mean loss, correct count, accuracy |
+| `baseline_correct_regressions` | Baseline-correct examples made incorrect |
+| `non_regression_passed` | Valid finite metrics, non-increasing mean loss, non-decreasing correct count, zero correct-example regressions |
+| `non_vacuous` | Baseline has at least one correct example |
+| `passed` | Both preceding conditions hold |
+| `baseline_digest`, `candidate_digest` | Content identities of the compared checkpoints, not authenticated provenance |
+
+Identical checkpoints can pass; an application may treat the same digest as a
+no-op. Equal accuracy with worse loss fails. A both-wrong tie fails because it is
+vacuous. Reports are detached; editing them cannot affect later comparisons.
+Failed comparisons also leave the active checkpoint and candidate artifact
+unchanged. Saved compare methods share closed state with predict/evaluate/export;
+after close they throw `student checkpoint is closed` before validation. Reports
+already returned remain caller-owned and usable.
+
+All results concern caller-declared examples only. Labels are not authenticated;
+prior training overlap, independent testing and globally limited repeated attempts
+are not established. The comparison does not claim quality beyond these examples,
+generalization, trustworthy training history or authorization to activate a model.
+It returns no raw examples or weights. Aggregate metrics and digests are not an
+anonymization guarantee. No request or result is logged or persisted by compare.
+
+## Runnable session recovery example
+
+Use `examples/pbai_student_checkpoint_reload_reviewed.sapp` in PBLang or
+`demo/pbai_student_checkpoint_reload_reviewed.sapp` in standalone pbAI. Run from
+the selected product with its materialized manifest/lock and trusted runtime.
+The file backend currently requires Linux plus its existing filesystem/FFI/process
+grants. No network is needed.
+
+```sh
+# Linux mktemp creates a fresh current-user-owned directory with mode 0700.
+export PBAI_CHECKPOINT_TEST_DIR="$(mktemp -d)"
+PBAI_RELOAD_PHASE=prepare pblang run examples/pbai_student_checkpoint_reload_reviewed.sapp --allow-all --deny-net --deny-http
+PBAI_RELOAD_PHASE=recover pblang run examples/pbai_student_checkpoint_reload_reviewed.sapp --allow-all --deny-net --deny-http
+PBAI_RELOAD_PHASE=review-error pblang run examples/pbai_student_checkpoint_reload_reviewed.sapp --allow-all --deny-net --deny-http
+```
+
+Use the demo path for standalone. The directory retains the synthetic files for
+inspection after the runs; no checkpoint is automatically deleted. Preparation exclusively creates three synthetic
+checkpoints, refusing to overwrite existing names: student.json (label 5, 64
+steps), worse.json (label 6, 64 steps), better.json (label 5, 128 steps). The
+example uses one declared application example, x=[6,0], y=5. These tiny rank-1
+8-token specialists are a reproducible fixture, not a representative AI benchmark.
+
+Recovery tries missing, worse, better and better again. The expected decisions
+are load_failed, rejected, replaced, unchanged, with active token 5 throughout.
+An unsuccessful acquisition or review keeps the current handle available. Each
+loaded candidate is reviewed inside with_file and closed before adoption is
+considered. Only a passing detached checkpoint is returned from the review.
+A new independent handle is reconstructed from that exact artifact, not by
+rereading the file path. Only after this load succeeds does the example select it
+and close the retired handle. The same digest avoids unnecessary replacement.
+If reconstructing the replacement throws, the example retains the current handle
+and reports replacement_load_failed; no failure is injected at this stage in the
+current tests.
+
+An outer resource scope owns the final active handle and closes it at the end.
+The cleanup factory directly captures a private state map whose current close
+function is updated on replacement. This uses the previously tested capture
+pattern; it is not a general runtime closure fix. The example verifies that saved
+prediction methods for retired/final handles are terminal. review-error supplies
+an invalid comparison set and demonstrates candidate cleanup plus preservation
+of the current model. The installed test also corrupts a private candidate copy
+and verifies recovery without rewriting it.
+
+The comparison gate is an explicit application policy. The example's replacement
+is in this synchronous process only. Original checkpoint files are unchanged;
+restarting the example loads the original student.json again. There is no global
+router/registry update, persistence of a selected model, automatic training,
+concurrent-request coordination or durable transaction. The example uses bundled
+handles; it does not establish recovery guarantees for dishonest or failing custom
+closers. Hard termination, OOM, nonreturning callbacks and deadlines remain outside
+the existing scope contract. Earlier detached outputs cannot be revoked.
+
+## Verification
+
+- `tests/semantics/pbai_student_compare_test.sapp`: direct, legacy and explicitly
+  bound loads; actual paired metrics against independent loaded evaluation;
+  better/worse/equal/vacuous comparisons, equal-accuracy loss regression, max 32
+  examples, invalid artifacts/examples, signed-zero duplicate contexts, detached
+  results, unchanged model/artifact, and terminal saved compare method.
+- `tests/semantics/pbai_student_reload_reviewed_installed_test.sapp`: set trusted
+  PBLANG_BIN and PBAI_RELOAD_PRODUCT=pblang|pbai for one bounded product run.
+  Optional PBAI_SOURCE_HIDE_ROOT hides another source tree. Both product copies
+  run with original sources hidden, a foreign manifest/cwd, eight decoy modules
+  and network denied. It characterizes the old format-only reload adopting the
+  regressing token 6, then verifies the reviewed sequence, invalid-review recovery,
+  corrupt-file recovery, exact closed-handle error without private input, unchanged
+  checkpoint bytes and fixture cleanup.
+
+The format-only reload example remains available with its original contract.
+JSON/VM owners, checkpoint formats, codecs, storage, scopes and provider binding
+surfaces are unchanged. No speedup, AGI/ASI, universal-device support or independent
+model-quality certification is claimed. See [recorded evidence](evidence/pbai_reviewed_reload-2026-10-05.json).

@@ -136,3 +136,6 @@ The cycle8 benchmarks and rejected inline-guard experiment remain unchanged.
 
 For one to eight files with cleanup after partial acquisition, see
 [bounded checkpoint groups](pbAI_Checkpoint_Batch.md).
+
+The [reviewed reload example](pbAI_Reviewed_Reload.md) uses this scope to close a
+candidate after successful, rejected or failed comparison against a live model.

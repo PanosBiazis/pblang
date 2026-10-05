@@ -35,7 +35,7 @@ training/validation examples, source paths, teacher weights or training labels.
 Weights and hashes can nevertheless encode information; the artifact is not an
 anonymized or encrypted representation.
 
-Loading produces `report`, `predict`, `evaluate`, `checkpoint`, and `close`.
+Loading produces `report`, `predict`, `evaluate`, `compare`, `checkpoint`, and `close`.
 The weights are detached from the caller's input; editing reports, artifacts or
 prediction arrays cannot change subsequent inference. There is no promotion,
 default-router replacement, automatic learning or in-place training method.
@@ -144,7 +144,7 @@ adapter without adding another facade or binding entry point.
 - First close returns `true`; later calls return `false`, including through saved
   method aliases. Closing an unused, predicted, evaluated or exported handle is
   allowed.
-- `predict`, `evaluate` and `checkpoint` then throw `student checkpoint is closed`
+- `predict`, `evaluate`, `compare` and `checkpoint` then throw `student checkpoint is closed`
   before inspecting ordinary or malformed inputs. Saved method references share
   that terminal state. There is no reopen method.
 - The closed state drops its references to the model, initial/student adapters,
@@ -223,9 +223,13 @@ real-world model quality, AGI/ASI, or other-platform storage support.
 
 An inline closed-state-guard prototype was rejected: alternating baseline/candidate
 runs did not show consistent improvement in either the file or loaded-prediction
-workload. The shared neural owner remains unchanged. See
+workload. That experiment left the neural owner guards and model construction unchanged. See
 [measurements and lifecycle checks](evidence/pbai_file_usage-2026-10-05.json).
 
 For explicit cleanup after a catchable application failure, use the additive
 [scoped checkpoint file API](pbAI_Checkpoint_Scope.md). The original storage
 binding and manual loaded-handle ownership remain unchanged.
+
+For read-only comparison against the loaded baseline and a runnable session reload
+that rejects a well-formed but regressing candidate, see
+[reviewed checkpoint reload](pbAI_Reviewed_Reload.md).
