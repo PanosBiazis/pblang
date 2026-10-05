@@ -35,7 +35,7 @@ training/validation examples, source paths, teacher weights or training labels.
 Weights and hashes can nevertheless encode information; the artifact is not an
 anonymized or encrypted representation.
 
-Loading produces `report`, `predict`, `evaluate`, and `checkpoint` operations.
+Loading produces `report`, `predict`, `evaluate`, `checkpoint`, and `close`.
 The weights are detached from the caller's input; editing reports, artifacts or
 prediction arrays cannot change subsequent inference. There is no promotion,
 default-router replacement, automatic learning or in-place training method.
@@ -133,3 +133,57 @@ creation flags before reporting success. Malformed responses cannot replace a
 previous loaded handle; callers assign a replacement only after successful load.
 See [backend failure handling](pbAI_Checkpoint_Binding.md#backend-failures-and-response-validation)
 for the preserved error contract, synthetic fault tests and `reload` example.
+
+## Explicit loaded-handle close
+
+The bundled `student_load(artifact)` handle also provides `close()`. This reaches
+both public facades, explicit specialist binding, and the real checkpoint file
+adapter without adding another facade or binding entry point.
+
+- First close returns `true`; later calls return `false`, including through saved
+  method aliases. Closing an unused, predicted, evaluated or exported handle is
+  allowed.
+- `predict`, `evaluate` and `checkpoint` then throw `student checkpoint is closed`
+  before inspecting ordinary or malformed inputs. Saved method references share
+  that terminal state. There is no reopen method.
+- The closed state drops its references to the model, initial/student adapters,
+  checkpoint identities and counters. Closures are built in a state-only helper,
+  so they do not retain the loading function's caller artifact or model locals.
+- Existing `report` metadata and earlier prediction/evaluation/checkpoint exports
+  remain caller owned. Editing public fields cannot reopen the private state.
+  A previously exported checkpoint can explicitly create a new independent handle.
+- Close performs no file I/O, provider call, training or activation. It neither
+  deletes persisted checkpoints nor closes independent handles.
+
+This is logical ownership release for single-threaded local use. It does not
+promise immediate garbage collection, reduced resident memory, secure zeroization,
+revocation of prior exports, or concurrent close/inference synchronization. The
+mutable diagnostic `report` is retained for compatibility and is not live status
+or authority to reopen the handle. Arbitrary custom providers remain responsible
+for their own returned-handle contracts.
+
+The file example's `reload` phase closes the retired handle only after a valid
+replacement is returned and assigned. Missing/corrupt replacements keep the
+previous model open. Its `close` phase demonstrates terminal reuse rejection and
+reloading an earlier export. With the existing explicit private directory set,
+use `PBAI_CHECKPOINT_TEST_PHASE=close` after the `write` phase.
+
+`tests/semantics/pbai_student_load_close_test.sapp` covers direct, legacy facade and
+explicit bound facade loading across four prior-use states, including saved method
+aliases, malformed/cyclic inputs, independent handles and retained exports.
+`tests/semantics/pbai_checkpoint_receipts_installed_test.sapp` has a `close` phase
+that tests the real file backend with original sources hidden, a foreign caller
+and decoy modules, exact cross-product output parity, unchanged persisted bytes,
+and the primary terminal error for predict/evaluate/checkpoint. The existing
+`roundtrip` phase checks retirement only after successful replacement. The fault
+receipt fixture confirms close makes no further backend calls.
+
+A focused regression also rejects a foreign base digest even when the checkpoint
+content digest is recomputed consistently, preserving the existing fixed-base
+validation in encode, decode and load.
+
+See [loaded lifecycle evidence](evidence/pbai_loaded_close-2026-10-05.json) for
+actual checks and comparable timing samples. An investigated base-construction
+reuse change was not retained: it reduced construction counts, but elapsed-time
+measurements did not show a consistent benefit across both installed products.
+The original artifact validation and model construction path remains in place.
