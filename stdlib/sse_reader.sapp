@@ -1,0 +1,177 @@
+//! Bounded incremental SSE parsing of already-decoded Unicode text.
+//! No I/O, UTF-8 decoder, provider interpretation, or reconnection behavior.
+let B = import("stdlib:string_builder.sapp");
+
+fn limits() {
+    return map{ chunk_chars: 65536, line_chars: 16384, data_chars: 262144,
+        pending_chars: 524288, total_chars: 16777216, output_chars: 16777216,
+        events: 65536, feeds: 1048576, retry_ms: 2147483647 };
+}
+
+fn defaults() {
+    return map{ chunk_chars: 4096, line_chars: 4096, data_chars: 65536,
+        pending_chars: 131072, total_chars: 1048576, output_chars: 1048576,
+        events: 4096, feeds: 65536, retry_ms: 2147483647 };
+}
+
+fn _options(raw) {
+    if not is_map(raw) { throw "sse_reader: options must be a map"; }
+    let caps = limits();
+    if len(raw) > len(caps) { throw "sse_reader: too many options"; }
+    let out = defaults();
+    for key in map_keys(raw) {
+        if not map_has(caps, key) { throw "sse_reader: unknown option"; }
+        let value = raw[key];
+        if type(value) != "number" { throw "sse_reader: limit must be an integer"; }
+        if not (try value >= 0 and value <= caps[key] catch false) {
+            throw "sse_reader: limit out of range";
+        }
+        if num_floor(value) != value { throw "sse_reader: limit must be an integer"; }
+        out[key] = value;
+    }
+    return out;
+}
+
+fn _clear_pending(s) {
+    B.clear(s.line);
+    B.clear(s.data);
+    s.event = "";
+    s.event_chars = 0;
+    s.id = "";
+    s.id_chars = 0;
+    s.skip_lf = false;
+}
+
+fn _pending(s) {
+    if B.length(s.line) + B.length(s.data) + s.event_chars + s.id_chars + s.last_id_chars > s.options.pending_chars {
+        throw "sse_reader: pending character limit";
+    }
+}
+
+fn _retry(s, value) {
+    if value == "" { return; }
+    let number = 0;
+    let overflow = false;
+    for character in str_split(value, "") {
+        let digit = str_index_of("0123456789", character);
+        if digit < 0 { return; }
+        if not overflow {
+            if number > num_floor((s.options.retry_ms - digit) / 10) { overflow = true; }
+            else { number = number * 10 + digit; }
+        }
+    }
+    // Oversized digit-only values are explicitly unsupported; never clamp.
+    if overflow { throw "sse_reader: retry limit"; }
+    s.retry = number;
+}
+
+fn _line(s, events) {
+    let line = B.take(s.line);
+    if line == "" {
+        s.last_id = s.id;
+        s.last_id_chars = s.id_chars;
+        _pending(s);
+        if B.length(s.data) > 0 {
+            let name = if s.event == "" { "message" } else { s.event };
+            let name_chars = if s.event == "" { 7 } else { s.event_chars };
+            let count = B.length(s.data) - 1 + name_chars + s.last_id_chars;
+            if s.event_count >= s.options.events { throw "sse_reader: event limit"; }
+            if count > s.options.output_chars - s.output_count { throw "sse_reader: output character limit"; }
+            let data = B.take(s.data);
+            array_push(events, map{ event: name, data: str_slice(data, 0, len(data) - 1), last_event_id: s.last_id });
+            s.event_count = s.event_count + 1;
+            s.output_count = s.output_count + count;
+        }
+        B.clear(s.data);
+        s.event = "";
+        s.event_chars = 0;
+        return;
+    }
+    if str_starts_with(line, ":") { return; }
+    let colon = str_index_of(line, ":");
+    let field = line;
+    let value = "";
+    if colon >= 0 {
+        field = str_slice(line, 0, colon);
+        value = str_slice(line, colon + 1, len(line));
+        if str_starts_with(value, " ") { value = str_slice(value, 1, len(value)); }
+    }
+    if field == "data" {
+        // Includes the synthetic trailing LF: even an empty data field costs one.
+        if len(value) + 1 > s.options.data_chars - B.length(s.data) { throw "sse_reader: data character limit"; }
+        B.write(s.data, value);
+        B.write(s.data, "\n");
+    } else if field == "event" { s.event = value; s.event_chars = len(value); }
+    else if field == "id" {
+        if not str_contains(value, "\0") { s.id = value; s.id_chars = len(value); }
+    } else if field == "retry" { _retry(s, value); }
+    _pending(s);
+}
+
+fn _feed(s, chunk) {
+    if type(chunk) != "string" { throw "sse_reader: chunk must be text"; }
+    let size = len(chunk);
+    if size > s.options.chunk_chars { throw "sse_reader: chunk character limit"; }
+    if size > s.options.total_chars - s.input_count { throw "sse_reader: total character limit"; }
+    if s.feed_count >= s.options.feeds { throw "sse_reader: feed limit"; }
+    s.feed_count = s.feed_count + 1;
+    s.input_count = s.input_count + size;
+    let events = [];
+    // Split only after admission; avoids repeatedly indexing a growing string.
+    for character in str_split(chunk, "") {
+        if s.first {
+            s.first = false;
+            if character == "﻿" { continue; }
+        }
+        if s.skip_lf {
+            s.skip_lf = false;
+            if character == "\n" { continue; }
+        }
+        if character == "\r" or character == "\n" {
+            _line(s, events);
+            s.skip_lf = character == "\r";
+        } else {
+            B.write(s.line, character);
+            _pending(s);
+        }
+    }
+    return events;
+}
+
+// Keep catch cleanup in a named function: retained VM closure catch blocks
+// do not reliably capture enclosing locals on exceptional paths.
+fn _guarded_feed(s, chunk) {
+    if s.phase != "open" { throw "sse_reader: reader is not open"; }
+    return try _feed(s, chunk) catch {
+        _clear_pending(s);
+        s.last_id = "";
+        s.last_id_chars = 0;
+        s.retry = nil;
+        s.phase = "failed";
+        throw "sse_reader: feed rejected; reader failed";
+    };
+}
+
+// The returned closures share private state. Treat one reader as single-owner.
+// Returned records/options are snapshots: mutating them cannot mutate the parser.
+fn new(options = nil) {
+    if options == nil { options = map{}; }
+    let opts = _options(options);
+    let s = map{ options: opts, line: B.new(opts.line_chars), data: B.new(opts.data_chars),
+        event: "", id: "", last_id: "", event_chars: 0, id_chars: 0, last_id_chars: 0, retry: nil, skip_lf: false, first: true,
+        phase: "open", input_count: 0, output_count: 0, event_count: 0, feed_count: 0 };
+    return map{
+        feed: fn(chunk) { return _guarded_feed(s, chunk); },
+        finish: fn() {
+            if s.phase != "open" { throw "sse_reader: reader is not open"; }
+            _clear_pending(s);
+            s.phase = "closed";
+            return [];
+        },
+        status: fn() {
+            return map{ phase: s.phase, last_event_id: s.last_id, retry_ms: s.retry };
+        }
+    };
+}
+
+export new, defaults, limits;
