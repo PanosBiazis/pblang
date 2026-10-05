@@ -53,6 +53,8 @@ The caller must decode UTF-8 incrementally before calling `feed`; a byte chunk
 ending inside a code point is not valid input to this interface. The parser cannot
 validate or repair a previous decoder's decisions. Pass either decoded text with
 its leading BOM or text whose decoder stripped exactly that BOM, consistently.
+For byte chunks, the opt-in [strict UTF-8 wrapper](SSE_BYTES.md) performs bounded
+incremental decoding before calling this unchanged text interface.
 There is no origin, URL, MIME/status validation, dispatch queue, JSON decoding,
 provider usage inference, or billing estimate.
 
