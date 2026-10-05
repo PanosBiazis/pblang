@@ -1,0 +1,67 @@
+# Self-hosted arithmetic and non-callable cleanup
+
+The PBLang VM now releases opted-in scalar ownership when a non-map arithmetic
+or ordering primitive fails outside any guest `try`, and when the generic call
+path rejects a non-callable value. This is a runtime correction, not a new
+admission profile. It applies to `compiler/vm.sapp`, including bounded execution,
+optimized IR and PBCS-decoded chunks.
+
+Previously this checked source could raise while keeping an opted-in execution
+context's allocations and borrows alive:
+
+```pblang
+memory_alloc(7);
+fn subtract(a, b) { return a - b; }
+subtract("x", 1);
+```
+
+Likewise, `let f=3; f();`, `let f=nil; f();`, `let f=map{}; f();` and calls
+through a function parameter escaped through a host map/field access without
+releasing that context. The frontend accepts these dynamic call forms; the VM
+must preserve ownership even when runtime invocation fails.
+
+## Contract
+
+- `execution_context(true)` closes its private scalar memory on these escaping
+  errors. Owners and borrows are released once; later close is idempotent.
+- A guest `catch` keeps memory available to its handler and following code.
+- The default borrowed `execution_context()` remains caller-owned, even on error.
+- The original host failure message remains the failure; cleanup errors must not
+  replace it. Stack locations can change with the additional implementation frame.
+- Operands, call targets and arguments are evaluated once, in their existing
+  order. Their prior side effects are not rolled back.
+- The non-map paths for `+`, `-`, `*`, `/`, `%`, `>`, `>=`, `<`, `<=` and the two
+  optimized local-add instructions participate. Valid values, boxed exact
+  arithmetic, strings, and the host's floating-point division behavior remain.
+- Overloaded guest methods are never retried. Their scalar failures use the same
+  correction when the guest method executes the affected instruction.
+
+For non-map arithmetic, a private helper intercepts a failed synchronous host
+primitive, attempts ownership cleanup, then repeats only that primitive on its
+already-evaluated operands to preserve the host's original diagnostic. This
+host does not expose caught error values for a direct rethrow. No guest callback
+or operand expression is repeated.
+
+The generic non-callable path has a guaranteed rejection before entering a guest
+body: a non-map callee, or a legacy raw descriptor without a map-valued `chunk`.
+It attempts cleanup before the original access rejects, without replacing that
+access's message. Valid legacy raw function constants still run. This does not
+validate every arbitrary malformed VM descriptor.
+
+## Checks and limits
+
+`tests/semantics/selfhost_arithmetic_cleanup_test.sapp` covers ownership,
+borrows, handlers, optimized local adds, source/PBCS/optimizer parity, exact
+values, argument order, overload effects, and secondary cleanup faults.
+`tests/tooling/selfhost_arithmetic_cleanup.py` runs release-only fixtures in a
+network-isolated environment with the checkout absent, and compares the previous VM failure messages with all six execution routes.
+For example, the self-host `%` instruction uses `num_mod`, whose error message
+already differs from the retained native `%` opcode; that existing distinction
+is preserved.
+
+The contract does not include map operands without a resolved guest overload,
+arbitrary host/builtin/FFI failures, allocation exhaustion, malformed bytecode in
+general, composite ownership, or other backends. It is not a speedup claim.
+The retained native compiler and its nested `p:run()` source bug are unchanged.
+Native PBCK execution uses a different runtime path; PBCS replay here means the
+self-host IR serializer and the PBLang VM, not a fix to that retained compiler.

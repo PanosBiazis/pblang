@@ -1,0 +1,105 @@
+// Host arithmetic failures must end opted-in memory ownership, without replaying
+// guest evaluation, closing a caught error, or taking a borrowed context.
+let V=import("stdlib:compiler/vm.sapp");
+let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let O=import("stdlib:compiler/optimizer.sapp");
+let P=import("stdlib:selfhost_pbck.sapp");
+fn compiled(source){let c=F.frontend_compile(source);assert(c.ok,"fixture compiles: "+source+" "+str(c.diagnostics));return c.chunk;}
+let setup=compiled("let h=memory_alloc(7);push_lifetime();borrow_immutable(h);memory_alloc(9);");
+fn prepare(automatic){let c=V.execution_context(automatic);V.run_seeded(setup,map{},c);return c;}
+fn run(code,bounded,c,g){
+    if bounded {return V.run_seeded_bounded(code,g,nil,c);}
+    return V.run_seeded(code,g,c);
+}
+fn operation(op,a,b){return map{constants:[a,b],instructions:[
+    map{op:0,operand:0},map{op:0,operand:1},map{op:op,operand:0},map{op:19,operand:0}]};}
+let cases=[];
+for op in [1,2,3,4,31,7,8,9,10] {array_push(cases,operation(op,nil,2));}
+// Optimized local updates must have the same cleanup as ordinary addition.
+for op in [41,42] {
+    let arg=if op==41 {map{slot:0,constant:1}} else {map{slot:0,rhs:1}};
+    array_push(cases,map{constants:[nil,2],instructions:[map{op:0,operand:0},map{op:17,operand:0},
+        map{op:0,operand:1},map{op:17,operand:1},map{op:op,operand:arg}]});
+}
+for source in ["let f=3;f();","let f=nil;f();","let f=map{};f();",
+    "fn call(f){return f();}call(3);", "let f=3;f(1,2,3,4,5);"] {
+    array_push(cases,compiled(source));
+}
+let handler=compiled("print memory_get(1);");
+for code in cases {
+    for bounded in [false,true] {
+        for automatic in [false,true] {
+            let c=prepare(automatic);let m=c.memory;
+            assert((try {run(code,bounded,c,map{});false} catch true),"operation rejects");
+            assert(m.closed==automatic and c.handlers==0,"escape respects ownership: "+str([code.instructions,bounded,automatic,m.closed,c.handlers]));
+            if automatic {assert(c.memory==nil and m.reclaimed==2 and len(m.owners)==0 and len(m.borrows)==0,"release all owned scopes");}
+            else {assert(c.memory==m and len(m.owners)==2,"borrowed memory survives");}
+            V.close_execution(c);V.close_execution(c);assert(m.reclaimed==2,"close exactly once");
+        }
+        let c=prepare(true);let m=c.memory;
+        let wrapped=map{constants:[map{try_chunk:code,catch_chunk:handler}],instructions:[map{op:35,operand:0}]};
+        assert(run(wrapped,bounded,c,map{}).output==[7],"catch can use memory");
+        assert(c.memory==m and not m.closed and c.handlers==0,"catch restores handler count");V.close_execution(c);
+    }
+}
+// Actual checked source, optimized IR and PBCS replay agree. Operands execute once.
+for expression in ["a()+b()","a()-b()","a()*b()","a()/b()","a()%b()","a()>b()","a()>=b()","a()<b()","a()<=b()"] {
+    let source="let calls=[];fn a(){array_push(calls,1);return nil;}fn b(){array_push(calls,2);return 2;}"+expression+";";
+    let code=compiled(source);
+    for variant in [code,O.optimize_safe(code).chunk,P.deserialize_chunk(P.serialize_chunk(code))] {
+        for bounded in [false,true] {
+            let c=prepare(true);let m=c.memory;let globals=map{};
+            assert((try {run(variant,bounded,c,globals);false} catch true),"dynamic source rejection");
+            assert(m.closed and globals.calls==[1,2],"cleanup without guest operand replay");
+        }
+    }
+}
+// A later allocation in the same frame is still covered; handler failure escapes.
+for source in [
+    "let a=2;print a+1;memory_alloc(8);fn bad(x){return x-1;}bad(nil);",
+    "memory_alloc(8);fn bad(x){return x*2;}try bad(nil) catch bad(nil);",
+    "memory_alloc(8);fn bad(x){return x/2;}print try bad(nil) catch 7;bad(nil);"
+] {
+    for bounded in [false,true] {
+        let code=compiled(source);let c=V.execution_context(true);assert((try {run(code,bounded,c,map{});false} catch true),"late/handler error");
+        assert(c.memory==nil and c.handlers==0,"late/handler cleanup");
+    }
+}
+// Guest overloads remain outside the primitive retry: forward wins, even on error.
+let overloaded=compiled("let calls=[];fn bad(x){return x-2;}fn fail(self,x){array_push(calls,1);return bad(nil);}"
+    +"let a=map{__sub__:fail};let b=map{__rsub__:fn(self,x){array_push(calls,2);return 9;}};a-b;");
+for bounded in [false,true] {
+    let c=prepare(true);let m=c.memory;let globals=map{};
+    assert((try {run(overloaded,bounded,c,globals);false} catch true),"overload failure");
+    assert(m.closed and globals.calls==[1],"overload called once without reflected fallback");
+}
+// Successful scalar arithmetic keeps memory usable and preserves host values.
+for row in [[1,4,2,6],[2,4,2,2],[3,4,2,8],[4,4,2,2],[31,5,2,1],
+    [7,4,2,true],[8,2,2,true],[9,4,2,false],[10,2,2,true],[1,"α","β","αβ"],
+    [1,bigint("4"),bigint("2"),bigint("6")],[4,rational(3,1),rational(2,1),rational(3,1)/rational(2,1)]] {
+    for bounded in [false,true] {
+        let c=prepare(true);let m=c.memory;let code=operation(row[0],row[1],row[2]);
+        let result=V.exec(code,[],map{},[],[],nil,0,c);
+        assert(result==row[3] and not m.closed,"successful host value preserved: "+str([row,result,m.closed]));
+        if bounded {assert(V.run_seeded_bounded(code,map{},nil,c).value==row[3],"bounded value preserved");}
+        V.close_execution(c);
+    }
+}
+// A non-callable target never replays the callee or arguments.
+let call_effects=compiled("let calls=[];fn target(){array_push(calls,0);return nil;}"
+    +"fn arg(n){array_push(calls,n);return n;}target()(arg(1),arg(2),arg(3),arg(4));");
+for bounded in [false,true] {
+    let c=prepare(true);let m=c.memory;let globals=map{};
+    assert((try {run(call_effects,bounded,c,globals);false} catch true),"non-callable rejects after arguments");
+    assert(m.closed and globals.calls==[0,1,2,3,4],"callee and arguments evaluated once");
+}
+// Valid legacy raw function constants retain their call contract.
+let raw=map{arity:0,min_arity:0,chunk:compiled("print memory_get(1);")};
+let raw_call=map{constants:[raw],instructions:[map{op:0,operand:0},map{op:18,operand:0}]};
+let raw_context=prepare(true);assert(run(raw_call,true,raw_context,map{}).output==[7],"raw callable stays valid");
+assert(not raw_context.memory.closed,"raw successful call retains ownership");V.close_execution(raw_context);
+// A secondary cleanup fault must not turn the original operation into success.
+let c=prepare(true);let m=c.memory;m.reclaimed=map{};
+assert((try {run(operation(2,nil,2),false,c,map{});false} catch true),"cleanup failure preserves rejection");
+m.reclaimed=0;V.close_execution(c);assert(m.closed,"fault fixture closed");
+print "selfhost_arithmetic_cleanup_pass";
