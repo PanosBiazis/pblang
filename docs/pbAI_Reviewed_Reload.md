@@ -95,8 +95,8 @@ A new independent handle is reconstructed from that exact artifact, not by
 rereading the file path. Only after this load succeeds does the example select it
 and close the retired handle. The same digest avoids unnecessary replacement.
 If reconstructing the replacement throws, the example retains the current handle
-and reports replacement_load_failed; no failure is injected at this stage in the
-current tests.
+and reports replacement_load_failed. The reconstruction acceptance below tests
+this branch with an exception injected at the constructor entry in private copies.
 
 An outer resource scope owns the final active handle and closes it at the end.
 The cleanup factory directly captures a private state map whose current close
@@ -131,6 +131,42 @@ the existing scope contract. Earlier detached outputs cannot be revoked.
   regressing token 6, then verifies the reviewed sequence, invalid-review recovery,
   corrupt-file recovery, exact closed-handle error without private input, unchanged
   checkpoint bytes and fixture cleanup.
+
+- `tests/semantics/pbai_student_reload_reconstruction_test.sapp`: Linux acceptance
+  using the same trusted runtime/product variables and optional hidden source root.
+  Run from the selected checkout with adjacent `pblang` and `pbai` checkouts,
+  `/usr/bin/bwrap`, `/usr/bin/timeout`, `/usr/bin/env` and `/bin/cp`, `/bin/chmod`,
+  `/bin/rm` available. The retained runtime must permit the required file/process
+  operations; outer and inner invocations deny network/HTTP.
+  It copies both products, hides original sources, uses a foreign manifest/cwd with
+  nine decoy modules (including json_decode), and denies network. An unmodified
+  example run calibrates normal behavior before any instrumentation. The companion
+  `tests/fixtures/pbai_reload_reconstruction_hooks.sapp` is inlined only into the
+  copied shared neural owner at exact constructor/export anchors; it is never a
+  production dependency or runtime fault option. Both copied package locks are
+  rebuilt after instrumentation. Each mode runs in a fresh process:
+
+  | Mode | Four recovery decisions | Real handles | Injected failures |
+  | --- | --- | --- | --- |
+  | none | load_failed, rejected, replaced, unchanged | 5 | 0 |
+  | once | load_failed, rejected, replacement_load_failed, replaced | 5 | 1 |
+  | repeat | load_failed, rejected, replacement_load_failed, replacement_load_failed | 4 | 2 |
+
+  The no-fault example output must be byte-identical to calibration. Faults occur
+  only for reconstruction of the already-reviewed better checkpoint, after its
+  review candidate has closed. The probe verifies the old prediction alias and
+  digest survive each failure, a subsequent successful retry retires the old
+  handle, and every successfully constructed native handle is closed before the
+  diagnostic repeated-close probe. All three checkpoint files remain byte-identical.
+  The private fixture is removed after success or a caught test failure.
+
+The injection throws **before** the selected call delegates to the original
+constructor. Successful calls return actual unmodified native handles. This tests
+catchable reconstruction failure and ownership in the unchanged application
+example; it does not simulate partial allocation failure inside the constructor,
+OOM, abrupt process termination, or recovery on other operating systems. Test
+output contains synthetic fixture metrics/digests and bounded trace fields only.
+See [reconstruction evidence](evidence/pbai_reconstruction_failure-2026-10-05.json).
 
 The format-only reload example remains available with its original contract.
 JSON/VM owners, checkpoint formats, codecs, storage, scopes and provider binding
