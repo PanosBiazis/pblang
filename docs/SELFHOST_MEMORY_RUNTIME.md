@@ -292,3 +292,11 @@ Strict numeric builtin type-error cleanup now covers `num_floor`, `num_ceil`,
 `num_abs`, `num_sqrt`, `num_ln`, `num_exp`, `num_min` and `num_max` in both
 dispatch paths. The opted-in escaping/caught/borrowed ownership contract remains
 the same; see [host-error cleanup](SELFHOST_HOST_ERROR_CLEANUP.md) for exact scope.
+
+### String transforms, search and split
+
+Escaping type failures in `str_upper`, `str_lower`, `str_trim`, `str_split`,
+`str_contains`, `str_starts_with`, `str_ends_with` and `str_index_of` now release
+eligible owned scalar state. Caught/borrowed contexts and successful Unicode
+results remain unchanged. See [host-error cleanup](SELFHOST_HOST_ERROR_CLEANUP.md)
+for scope and tests; this does not add general string allocation-failure cleanup.
