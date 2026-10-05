@@ -168,6 +168,61 @@ OOM, abrupt process termination, or recovery on other operating systems. Test
 output contains synthetic fixture metrics/digests and bounded trace fields only.
 See [reconstruction evidence](evidence/pbai_reconstruction_failure-2026-10-05.json).
 
+## Failures after partial construction
+
+`tests/semantics/pbai_student_reload_partial_test.sapp` extends the preceding
+entry-point test. Use its same Linux utilities, adjacent product checkouts and
+trusted runtime/product variables, plus `PBAI_PARTIAL_STAGE=model|initial|student`.
+Run each stage separately so each product/stage remains a bounded acceptance run.
+The real runnable reviewed-reload example is unchanged. With `PBLANG_BIN` exported
+to the absolute path of the trusted executable, run from the selected checkout:
+
+```sh
+PBAI_RELOAD_PRODUCT=pblang PBAI_PARTIAL_STAGE=model "$PBLANG_BIN" run tests/semantics/pbai_student_reload_partial_test.sapp --allow-all --deny-net --deny-http
+```
+
+Repeat with `initial` and `student`. For the standalone checkout select
+`PBAI_RELOAD_PRODUCT=pbai`; use the same test path and stages.
+
+The test copies the production constructor and inserts an observer immediately
+**after** one of three real operations has returned:
+
+| Stage | Actual operation already completed | Later operations skipped on failure |
+| --- | --- | --- |
+| model | `_model()` creates the tiny decoder | initial adapter, restored student, returned handle |
+| initial | `AD.lm_head_adapter` creates the rank-1 seed | restored student, returned handle |
+| student | `AD.from_state` creates the saved fixed-point student | returned handle |
+
+Each run calibrates against the uninstrumented example, then tests none/once/repeat
+fault modes. The observer checks the real model/adapter type, matrix dimensions
+and restored step count, and records only the ordered stage names and bounded
+booleans. It retains no reference to a partially created model or adapter. A
+failure is injected only into reconstruction of the previously approved candidate,
+after its review handle has closed. Full stage traces prove that subsequent
+constructor stages did not run. Normal runs retain byte-identical example output.
+
+Both products must retain the old active digest and prediction alias on each
+failure, permit a later successful retry, close all successfully returned handles
+before the diagnostic close probe, and leave the three checkpoint files unchanged.
+The test-only observer lives in `tests/fixtures/pbai_reload_partial_hooks.sapp`;
+its exact-anchor source instrumentation is confined to temporary package copies.
+It introduces no production fault setting, alternate provider, JSON or VM edit.
+
+**Cleanup boundary:** this construction path creates managed PBLang maps and
+arrays, not independently closable files, device contexts or native allocation
+handles. A failed invocation has no returned student handle to close. This test has no per-object allocator-release observation for those
+managed values. The retained `stdlib:runtime_gc.sapp` contract declares
+`owner_isolation:false`, `collection_allowed:false` and
+`allocation_counters_are_live_usage:false`; cumulative allocation counters and
+forced collection cannot substitute for this missing evidence. Therefore the
+trace explicitly reports `partial_memory_release_verified: false`. The tests
+verify recovery after real partial construction and closure of the successful
+handles; they do not prove physical release, GC timing, RSS reduction, zeroization,
+OOM recovery, faults *inside* a model/matrix operation, or hard-termination cleanup.
+A process exiting or temporary fixture removal is not used as evidence of memory
+release. Existing entry-point evidence and its limits remain unchanged.
+See [partial-construction evidence](evidence/pbai_partial_construction-2026-10-05.json).
+
 The format-only reload example remains available with its original contract.
 JSON/VM owners, checkpoint formats, codecs, storage, scopes and provider binding
 surfaces are unchanged. No speedup, AGI/ASI, universal-device support or independent
