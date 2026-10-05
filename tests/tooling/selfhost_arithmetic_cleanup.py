@@ -20,6 +20,7 @@ def main():
     ap.add_argument('--numeric', action='store_true')
     ap.add_argument('--strings', action='store_true')
     ap.add_argument('--exact-math', action='store_true')
+    ap.add_argument('--constructors', action='store_true')
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--count', type=int, default=3)
     a = ap.parse_args()
@@ -136,6 +137,15 @@ def main():
                       ('pow-desugared','fn power(a,b){return a ** b;}print power(bigint(2),-1);',False)]
         if a.exact_math:
             cases=[(label,'fn invoke(f,a,b){return f(a,b);}'+source.replace('num_mod(', 'invoke(num_mod,').replace('num_pow(', 'invoke(num_pow,'),valid) for label,source,valid in cases]
+        if a.constructors:
+            assert a.reference and not (a.calls or a.numeric or a.strings or a.exact_math), 'choose constructors with reference'
+            exprs = ['call1(bigint,nil)', 'call1(bigint,"bad")', 'call1(bigint,0.5)', 'call1(bigint,rational(1,2))', 'call1(bigint,num_mod(2,0))', 'call1(decimal,nil)', 'call1(decimal,"bad")', 'call1(decimal,num_exp(1000))', 'call1(rational,nil)', 'call1(rational,"bad")', 'call1(rational,"1/0")', 'call1(rational,num_mod(2,0))', 'call2(rational,1,0)', 'call2(rational,0.5,2)', 'call2(rational,1,0.5)', 'let a=map{__add__:rational};a+2']
+            cases = [(e, e+';', False) for e in exprs]
+            cases += [('bigint-arity', 'fn call(f){return f();}call(bigint);', False),
+                      ('rational-arity', 'fn call(f){return f(1,2,3);}call(rational);', False),
+                      ('valid-constructors', 'print bigint("9007199254740993");print decimal(rational(1,2));print rational(decimal("0.125"));print rational(2,4);print rational(4,2);', True),
+                      ('caught-constructors', 'print try call1(bigint,0.5) catch memory_get(1);print try call1(decimal,"bad") catch memory_get(1);print try call1(rational,"1/0") catch memory_get(1);print try call2(rational,1,0) catch memory_get(1);', True)]
+            cases = [(label, 'fn call1(f,a){return f(a);}fn call2(f,a,b){return f(a,b);}'+source, valid) for label,source,valid in cases]
         for label, source, valid in cases[a.start:a.start + a.count]:
             if a.reference:
                 expected = run(prefix + 'let c=V.execution_context(true);V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk,map{},c);'

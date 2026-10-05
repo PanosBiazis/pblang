@@ -68,7 +68,7 @@ Wrong arity still fails before inspecting arguments, via the existing arity guar
 Successful calls, negative domain results, NaN and infinities keep the host behavior.
 Boxed exact integers, rationals and decimals are still rejected by these primitives;
 `num_pow` and `num_mod` have different value-dependent contracts, covered below.
-Exact-number constructors themselves remain outside this extension. Shadowed guest functions remain
+Exact-number constructors have the separate failure handling described below. Shadowed guest functions remain
 ordinary guest calls.
 
 See `examples/selfhost_throw_cleanup/numeric.sapp` for an executable ownership
@@ -116,6 +116,41 @@ and late allocations. `tests/tooling/selfhost_arithmetic_cleanup.py --exact-math
 injected secondary cleanup failure. The runnable `examples/selfhost_throw_cleanup/
 exact_math.sapp` and small `tests/fixtures/selfhost_exact_math_acceptance.sapp` are
 installation acceptance fixtures. This is a correctness change, not a speed claim.
+
+## Exact-number constructor failures
+
+`bigint(x)`, `decimal(x)`, `rational(x)` and `rational(numerator, denominator)`
+now release private opted-in execution memory when a host conversion failure
+escapes without a guest handler. Both scalar and generic dispatch use this rule.
+Previously even a short invalid value such as `bigint(0.5)`, `decimal("bad")`
+or `rational(1,0)` could leave allocations and borrows live.
+
+The constructors inspect immutable numeric/string values and do not invoke guest
+callbacks. As with modulo/power, the VM catches the failed primitive, attempts
+private cleanup and repeats only that failed conversion on evaluated arguments
+to retain the original host diagnostic. It does not repeat argument expressions
+or successful allocations. This is intentionally separate from generic callable
+retry: guest functions, effects and overload callbacks must never be replayed.
+
+Valid exact conversions, identities, rational reduction, nonfinite/type/value
+rejection and argument-error priority keep their host contracts. Arity rejection
+still occurs first. Guest catches keep their memory usable; borrowed contexts
+remain caller-owned; shadowed constructor names remain ordinary guest functions.
+Secondary cleanup faults cannot replace the original conversion diagnostic.
+Diagnostic strings can contain an invalid input string, as before; applications
+must not assume that host errors redact input. Tests use synthetic values only.
+
+This does not add digit/allocation limits, change numeric conversion semantics,
+or recover native aborts, panics or exhaustion. The existing private/unaliased
+metadata assumption and corrupt-state cleanup limitations still apply.
+
+`tests/semantics/selfhost_constructor_cleanup_test.sapp` covers ownership,
+lifetimes/borrows, caught and borrowed execution, late allocations, argument
+effects, overloads, valid conversions, optimizer and PBCS replay. The diagnostic
+driver's `--constructors --reference PREVIOUS_RELEASE` group compares host
+messages across six routes and secondary cleanup faults. Small installation
+probes are `examples/selfhost_throw_cleanup/constructors.sapp` and
+`tests/fixtures/selfhost_constructor_acceptance.sapp`.
 
 ## String transforms, search and split
 
