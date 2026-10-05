@@ -25,7 +25,19 @@ no implicit truthy conversion. A prediction request contains 1..32 contexts, eac
 1..4 integer tokens in 0..7. Duplicate prediction contexts are allowed, and their
 order and multiplicity are preserved. All inputs are validated before inference;
 malformed later rows never produce a partial successful batch. The batch loads
-one validated private model and reuses it for every context.
+one validated private model and reuses it for every context. That private handle
+is now closed before returning either a complete successful response or a
+`computation_failed` response. A caught prediction exception, malformed internal
+prediction, or rejected nonfinite/oversized logit cannot skip this cleanup.
+The close method is captured immediately after acquisition. Input rejection still
+happens before acquisition; a construction failure has no returned handle to close.
+
+The batch result is detached from that private handle and remains usable after
+close. A separately loaded active model remains owned by its caller and is not
+closed or replaced by a tool request. The cleanup guarantee concerns the bundled
+synchronous handle and catchable failures; it does not establish physical memory
+reclamation, zeroization, hard-termination/OOM cleanup or behavior of untrusted
+custom providers. Retained runtime memory limitations remain unchanged.
 
 Comparison uses 1..32 exact `{x,y}` examples, with the same token limits and labels
 in 0..7. Duplicate numerical contexts, including signed zero, are rejected. Both
@@ -82,6 +94,41 @@ No external transport, encryption or authentication is implied by this release.
 
 The contract remains a fixed tiny token specialist. These checks and measurements
 are not representative language, AGI/ASI, full-privacy or all-platform evaluations.
+
+## Batch lifetime regression (2026-10-05)
+
+Run `tests/semantics/pbai_student_tool_lifetime_test.sapp` from the selected product,
+with `PBLANG_BIN` exported as the absolute trusted executable and
+`PBAI_RELOAD_PRODUCT=pblang|pbai`. Both sibling checkouts must be available. Linux,
+`bwrap`, `timeout`, `env`, `cp`, `chmod` and `rm` are required for private copied
+packages and hidden original sources. Network is denied. The copied package cwd
+is retained for the legacy facade; this is not a new foreign-cwd import guarantee.
+
+```sh
+PBAI_RELOAD_PRODUCT=pblang "$PBLANG_BIN" run tests/semantics/pbai_student_tool_lifetime_test.sapp --allow-all --deny-net --deny-http
+```
+
+The companion `tests/fixtures/pbai_student_tool_lifetime_hooks.sapp` and scenario
+wrap original methods only in the private copied owner. All predictions and close
+operations delegate to the actual bundled handle. Three public routes (direct,
+legacy facade, explicit specialist binding) each exercise compact/verbose success,
+first/second prediction exceptions, a nonfinite logit, an oversized logit, a
+malformed prediction, and a later successful recovery request. Invalid later input
+contexts must be rejected before creating a model.
+
+The observer checks original predict/checkpoint/evaluate/compare aliases and the
+exact close count **before** its own diagnostic cleanup. It deliberately retains
+method aliases to make lifecycle state observable; baseline live aliases are not
+by themselves proof of a physical production memory leak. The same 24 cases per
+product reproduced zero automatic closes before the fix and require exactly one
+close after it. `PBAI_TOOL_LIFETIME_PHASE=baseline` is an explicit historical
+characterization mode for the old source, not a way to pass the fixed-source gate.
+Raw errors and partial predictions never escape; requests/checkpoints and the
+independently active model remain unchanged. The example also shows the caller
+closing its own active handle after a rejected batch.
+
+See [lifetime evidence](evidence/pbai_student_tool_lifetime-2026-10-05.json).
+These are lifecycle checks, not new performance or model-quality measurements.
 
 ## Local measurements (2026-10-03)
 
