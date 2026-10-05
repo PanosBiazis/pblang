@@ -890,3 +890,29 @@ navigation, a new document, custom values and paginated reflow.
 synthetic imported files and isolated profile data, including 320×480 screenshots.
 This is a native reader control; it does not add a settings UI to exported Web/Android
 previews or establish device execution on other platforms.
+
+## Admission before presentation loading
+
+The executable validates `--open` before loading the controller, graphics or
+preference store. A successful `--check --open FILE` returns its existing JSON and
+exits normally without loading the presentation layer. A rejected file uses the
+same codes, text, output stream and exit status as before; graphical `--open`
+rejections also finish before any window or profile is opened.
+
+This avoids parsing unused presentation modules during headless checks and failed
+imports. It does not cache input, skip UTF-8/parser/path checks, change byte limits,
+or relax launcher permissions. Valid GUI imports still load the existing controller
+and saved style. The ordinary `--check` navigation demo, source export routes and
+all title-size choices retain their behavior. The public builder still captures
+literal imports inside branches, so GUI/export dependencies remain in the package.
+
+`tests/tooling/reader_admission_imports.py` traces the actual packaged or installed
+launcher with `strace` on Linux in the existing source-hidden harness. Successful
+checks and failed imports must not open the reader controller or its settings
+module, while the ordinary demo must still load them. Shared stdlib files can still
+be read to verify the dependency tree hash; these reads do not prove module
+evaluation and are preserved. The trace checks successful opens rather than failed
+lookups and uses no timing threshold. A separate integrity test overlays a changed
+shared GUI file in an isolated mount and requires rejection without modifying the
+real package. Timing comparisons are separate evidence;
+this optimization does not establish GUI frame-rate or other-platform improvements.
