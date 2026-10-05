@@ -19,6 +19,7 @@ def main():
     ap.add_argument('--calls', action='store_true')
     ap.add_argument('--numeric', action='store_true')
     ap.add_argument('--strings', action='store_true')
+    ap.add_argument('--exact-math', action='store_true')
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--count', type=int, default=3)
     a = ap.parse_args()
@@ -120,6 +121,21 @@ def main():
                       ('string-arity', 'fn call(f){return f();}call(str_upper);', False),
                       ('string-exact-rejected', 'fn call(f,x){return f(x);}call(str_upper,bigint("7"));', False),
                       ('string-both-invalid', 'fn call(f,a,b){return f(a,b);}call(str_contains,nil,7);', False)]
+        if a.exact_math:
+            assert a.reference and not (a.calls or a.numeric or a.strings), 'choose exact-math with reference'
+            exprs=['num_mod(nil,2)','num_mod(2,nil)','num_pow(nil,2)','num_pow(2,nil)',
+                   'num_mod(bigint(7),bigint(0))','num_mod(rational(1,2),2)','num_mod(decimal(7),2)',
+                   'num_pow(bigint(2),-1)','num_pow(bigint(2),bigint("4294967296"))',
+                   'num_pow(rational(1,2),0.5)','num_pow(decimal(2),0.5)',
+                   'let a=map{__add__:num_mod};a+2','let a=map{__add__:num_pow};a+2']
+            cases=[(e,e+';',False) for e in exprs]
+            cases += [('valid-exact-math','print num_mod(bigint(17),bigint(5));print num_pow(bigint(2),10);print num_pow(rational(1,2),-2);print num_pow(decimal(2),3);print num_pow(bigint(4),0.5);print num_mod(2,0);print num_pow(-1,0.5);',True),
+                      ('caught-exact-math','print try num_mod(bigint(7),bigint(0)) catch memory_get(1);print try num_pow(bigint(2),-1) catch memory_get(1);',True),
+                      ('mod-arity','fn call(f){return f();}call(num_mod);',False),
+                      ('pow-arity','fn call(f){return f(2);}call(num_pow);',False),
+                      ('pow-desugared','fn power(a,b){return a ** b;}print power(bigint(2),-1);',False)]
+        if a.exact_math:
+            cases=[(label,'fn invoke(f,a,b){return f(a,b);}'+source.replace('num_mod(', 'invoke(num_mod,').replace('num_pow(', 'invoke(num_pow,'),valid) for label,source,valid in cases]
         for label, source, valid in cases[a.start:a.start + a.count]:
             if a.reference:
                 expected = run(prefix + 'let c=V.execution_context(true);V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk,map{},c);'
