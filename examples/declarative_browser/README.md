@@ -1003,3 +1003,26 @@ See `recovery_focus_demo.sapp` for the fallback without a reload callback,
 `tests/tooling/reader_recovery_focus_native.py` for source-hidden actual-launcher
 keyboard recovery with a second PBLang profile writer at wide and compact sizes.
 This is Linux X11 evidence, not a new Web/mobile/native-platform support claim.
+
+### Ordered input batches
+
+`App.update(reader, events)` now settles pending presentation changes before the
+next event. Page Down followed by Enter in one poll therefore edits the newly
+visible option. Resize followed by Tab uses the new layout's focus order; opening
+Style followed by a separate Enter edits its first choice. An explicit second
+press after a blocked Save can reach its newly focused recovery action.
+
+Held keys remain held across these rebuilds. Idle polls, releases and ordinary
+pointer movement do not rebuild an unchanged view. Close/quit is terminal for the
+batch: later callbacks are ignored and a pending refresh cannot discard the close
+request. The controller preserves input order and does not sort backend events or
+change the shared input pump, renderer or builder.
+
+`event_batch_demo.sapp` demonstrates the ordered controller API. The deterministic
+regression is `tests/semantics/reader_event_batch_test.sapp`. The real-launcher
+`tests/tooling/reader_event_batch_native.py` queues an X11 resize and Tab while
+pausing only its isolated test child, then compares editing, explicit Save and
+restart with a sequential UI reference. That native stress flow also passes on
+0.8.3: it does not establish that the backend delivered a single controller batch.
+The defect reproduction is the explicit ordered `App.update` batch. Native checks
+verify Linux behavior remains usable; no additional platform guarantee is implied.
