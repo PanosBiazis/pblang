@@ -72,6 +72,27 @@ effects. Rewriting can change dispatch or evaluation order.
 
 ## Why default execution is unchanged
 
+### Compiler boundary behind the nested-method case
+
+In the native reference source, `crates/pblang-core/src/parser.rs` lowers a colon
+method into a value block that evaluates the receiver once, selects `__class`
+when present and calls the selected method with the original receiver. In
+`crates/pblang-compiler/src/lib.rs`, `ExprKind::BlockExpr` becomes a synthetic
+zero-argument function. The `ExprKind::FnLit` compiler constructs an enclosing
+snapshot with `enclosing: None`; `resolve_upvalue` follows only the enclosing
+chain it receives. Nested synthetic functions can therefore lose a binding from
+a more distant loop/function frame. This source-level finding is consistent
+with the retained regression; it is not proof of the provenance of every
+distributed native binary.
+
+Default source execution in `src/main.rs` calls that native parser/compiler.
+Editing the PBLang frontend or VM cannot replace the compiler already embedded
+in the retained executable. The supported explicit PBLang-to-PBCK path above
+avoids that lowering for its supported subset and already passes the fixture.
+It remains an alternative route, not a retained-native repair. A complete native
+repair requires work on the native compiler and verification of its rebuilt
+binary; that lies outside a PBLang-only production change.
+
 An automatic switch to the self-hosted VM or PBCK would change supported syntax,
 imports, builtins, argument/host context and error behavior. A mandatory pre-read
 would add filesystem/import requirements to native source loading, and the

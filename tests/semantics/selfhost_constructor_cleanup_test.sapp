@@ -1,0 +1,62 @@
+// Exact-number constructor failures close only unhandled opted-in ownership.
+let V=import("stdlib:compiler/vm.sapp");let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let O=import("stdlib:compiler/optimizer.sapp");let P=import("stdlib:selfhost_pbck.sapp");
+fn compiled(source) {
+    let r=F.frontend_compile("fn call1(f,a){return f(a);}fn call2(f,a,b){return f(a,b);}"+source);
+    assert(r.ok,"constructor fixture compiles: "+str(r.diagnostics));return r.chunk;
+}
+let setup=compiled("memory_alloc(7);push_lifetime();borrow_immutable(1);memory_alloc(9);");
+fn prepare(owned) {let c=V.execution_context(owned);V.run_seeded(setup,map{},c);return c;}
+fn run(code,bounded,c,g) {if bounded {return V.run_seeded_bounded(code,g,nil,c);}return V.run_seeded(code,g,c);}
+let sources=["call1(bigint,nil)", "call1(bigint,\"bad\")", "call1(bigint,0.5)", "call1(bigint,rational(1,2))", "call1(bigint,num_mod(2,0))", "call1(decimal,nil)", "call1(decimal,\"bad\")", "call1(decimal,num_exp(1000))", "call1(rational,nil)", "call1(rational,\"bad\")", "call1(rational,\"1/0\")", "call1(rational,num_mod(2,0))", "call2(rational,1,0)", "call2(rational,0.5,2)", "call2(rational,1,0.5)", "let a=map{__add__:rational};a+2"];
+let handler=compiled("print memory_get(1);");
+for source in sources {
+    let code=compiled(source+";");
+    for bounded in [false,true] {
+        for owned in [false,true] {
+            let c=prepare(owned);let m=c.memory;
+            assert((try {run(code,bounded,c,map{});false} catch true),"constructor rejects");
+            assert(m.closed==owned and c.handlers==0,"ownership rule");
+            if owned {assert(c.memory==nil and m.reclaimed==2 and len(m.owners)==0 and len(m.borrows)==0,"release both lifetimes and borrow");}
+            else {assert(c.memory==m and len(m.owners)==2 and len(m.borrows)==1,"preserve caller-owned memory");}
+            V.close_execution(c);V.close_execution(c);assert(m.reclaimed==2,"idempotent close");
+        }
+        let c=prepare(true);let m=c.memory;
+        let caught=map{constants:[map{try_chunk:code,catch_chunk:handler}],instructions:[map{op:35,operand:0}]};
+        assert(run(caught,bounded,c,map{}).output==[7] and not m.closed and c.handlers==0,"handler keeps memory usable");V.close_execution(c);
+    }
+}
+// Successful conversions, including identities and exact reductions, stay live.
+let valid=compiled("print bigint(\"9007199254740993\");print bigint(bigint(7));print decimal(rational(1,2));print decimal(decimal(\"0.125\"));print rational(decimal(\"0.125\"));print rational(bigint(7));print rational(2,4);print rational(4,2);print rational(0.5);print bigint(0);");
+for bounded in [false,true] {
+    let c=prepare(true);let m=c.memory;let out=run(valid,bounded,c,map{}).output;
+    assert(out==[bigint("9007199254740993"),bigint(7),decimal("0.5"),decimal("0.125"),rational(1,8),bigint(7),rational(1,2),bigint(2),rational(1,2),bigint(0)],"conversion values unchanged");
+    assert(not m.closed and m.reclaimed==0,"successful constructors do not close memory");V.close_execution(c);
+}
+for expression in ["call1(bigint,arg(1))","call1(decimal,arg(1))","call1(rational,arg(1))","call2(rational,arg(1),arg(2))"] {
+    let code=compiled("let calls=[];fn arg(i){array_push(calls,i);return nil;}"+expression+";");
+    for variant in [code,O.optimize_safe(code).chunk,P.deserialize_chunk(P.serialize_chunk(code))] {
+        for bounded in [false,true] {
+            let c=prepare(true);let m=c.memory;let g=map{};
+            assert((try {run(variant,bounded,c,g);false} catch true),"dynamic error");
+            assert(m.closed and m.reclaimed==2 and g.calls[0]==1,"single argument evaluation");
+            if str_starts_with(expression,"call2") {assert(g.calls==[1,2],"argument order, no replay");}
+            else {assert(g.calls==[1],"single argument, no replay");}
+        }
+    }
+}
+for name in ["bigint","decimal","rational"] {
+    for source in ["print call1("+name+",2);memory_alloc(3);call1("+name+",nil);",
+                   "memory_alloc(3);try call1("+name+",nil) catch call1("+name+",nil);",
+                   "memory_alloc(3);print try call1("+name+",nil) catch 7;call1("+name+",nil);"] {
+        for bounded in [false,true] {let c=V.execution_context(true);assert((try {run(compiled(source),bounded,c,map{});false} catch true),"late/handler failure");assert(c.memory==nil and c.handlers==0,"late state released");}
+    }
+    let c=prepare(true);let m=c.memory;m.reclaimed=map{};
+    assert((try {run(compiled("call1("+name+",nil);"),false,c,map{});false} catch true),"secondary cleanup fault");
+    m.reclaimed=0;V.close_execution(c);assert(m.closed,"fault fixture restored");
+    let c2=prepare(true);let shadow=F.frontend_compile("fn "+name+"(x){return x;}print "+name+"(nil);");
+    assert(shadow.ok and run(shadow.chunk,true,c2,map{}).output==[nil] and not c2.memory.closed,"shadowed guest function unchanged");V.close_execution(c2);
+}
+let overloaded=compiled("let calls=[];fn bad(self,x){array_push(calls,1);return call2(rational,1,0);}let o=map{__add__:bad};o+2;");
+let c=prepare(true);let g=map{};assert((try {run(overloaded,true,c,g);false} catch true),"overload error");assert(c.memory==nil and g.calls==[1],"guest overload not repeated");
+print "selfhost_constructor_cleanup_pass";
