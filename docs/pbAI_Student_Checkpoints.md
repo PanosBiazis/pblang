@@ -104,6 +104,7 @@ let checkpoint = student.checkpoint();
 let receipt = storage.save_new(path, checkpoint);
 let restored = storage.load_file(path);
 print restored.predict([6,0]).token;
+restored.close();
 ```
 
 `pbai_student_checkpoint_test.sapp` checks both distillation variants, round-trip
@@ -187,3 +188,40 @@ actual checks and comparable timing samples. An investigated base-construction
 reuse change was not retained: it reduced construction counts, but elapsed-time
 measurements did not show a consistent benefit across both installed products.
 The original artifact validation and model construction path remains in place.
+
+## Complete file usage and separate timing workloads
+
+The `read` example closes its loaded handle after obtaining the detached prediction.
+The `reload` example keeps the old handle usable while a missing/corrupt replacement
+is rejected, closes a retired handle only after a valid replacement is assigned,
+and closes the final active handle after prediction. Both phases verify that the
+saved prediction method rejects reuse, then report `active_closed` and
+`active_prediction_blocked`. These are checks of explicit successful example paths,
+not exception-safe resource scopes or memory zeroization guarantees.
+
+`bench/pbai_checkpoint_file_origin.sapp` retains its historical load-plus-predict
+workload unchanged so previous timing results remain interpretable. It excludes
+explicit close and must not be described as a full lifecycle measurement.
+
+Two separate bounded workloads complement it:
+
+- `bench/pbai_loaded_prediction.sapp`: 100 predictions from one already-loaded
+  handle per sample. Setup/training/loading and final close are outside timing.
+  The saved prediction alias must reject reuse after close.
+- `bench/pbai_checkpoint_file_lifecycle.sapp`: five file-load, prediction and close
+  operations per sample. Requires a fresh private directory through
+  `PBAI_CHECKPOINT_TEST_DIR`; it creates one synthetic checkpoint exclusively.
+  Every loaded handle is closed before loading the next. Forty retained prediction
+  aliases (including warmup) must reject after timing. A separately loaded reference
+  handle is closed before timing. No file is deleted by close.
+
+Both report seven raw elapsed-time samples after one warmup, explicit timing scope,
+synthetic artifact identity/size and the same prediction. Lifecycle timing includes
+fixed alias retention and output assertions but excludes terminal-alias validation,
+imports and training. These workloads do not measure resident-memory release,
+real-world model quality, AGI/ASI, or other-platform storage support.
+
+An inline closed-state-guard prototype was rejected: alternating baseline/candidate
+runs did not show consistent improvement in either the file or loaded-prediction
+workload. The shared neural owner remains unchanged. See
+[measurements and lifecycle checks](evidence/pbai_file_usage-2026-10-05.json).
