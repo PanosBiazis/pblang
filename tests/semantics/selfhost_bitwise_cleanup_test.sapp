@@ -1,0 +1,56 @@
+// Bitwise failure cleanup preserves host integer/shift contracts and ownership.
+let V=import("stdlib:compiler/vm.sapp");let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let O=import("stdlib:compiler/optimizer.sapp");let P=import("stdlib:selfhost_pbck.sapp");
+fn compiled(s){let r=F.frontend_compile("fn call1(f,a){return f(a);}fn call2(f,a,b){return f(a,b);}"+s);assert(r.ok,"compile: "+str(r.diagnostics));return r.chunk;}
+let setup=compiled("memory_alloc(7);push_lifetime();borrow_immutable(1);memory_alloc(9);");
+fn prepare(owned){let c=V.execution_context(owned);V.run_seeded(setup,map{},c);return c;}
+fn run(code,bounded,c,g){if bounded {return V.run_seeded_bounded(code,g,nil,c);}return V.run_seeded(code,g,c);}
+let sources=["call2(bit_and,nil,1)", "call2(bit_or,nil,1)", "call2(bit_xor,nil,1)", "call2(bit_shl,nil,1)", "call2(bit_shr,nil,1)", "call2(bit_and,1,nil)", "call2(bit_or,1,nil)", "call2(bit_xor,1,nil)", "call2(bit_shl,1,nil)", "call2(bit_shr,1,nil)", "call1(bit_not,nil)", "call1(bit_not,0.5)", "call1(bit_not,num_sqrt(-1))", "call2(bit_shl,1,64)", "call2(bit_shr,1,-1)", "call2(bit_shl,1,0.5)", "call2(bit_xor,9223372036854777856,1)", "call2(bit_and,-9223372036854777856,1)", "call2(bit_or,num_exp(1000),1)", "call2(bit_and,decimal(1),1)", "let a=map{__add__:bit_or};a+2", "fn bad(f){return f();}bad(bit_not)", "fn bad(f){return f(1);}bad(bit_shl)", "fn shift(x,n){return x << n;}shift(1,64)"];
+let handler=compiled("print memory_get(1);");
+for source in sources {
+ let code=compiled(source+";");
+ for bounded in [false,true] {
+  for owned in [false,true] {
+   let c=prepare(owned);let m=c.memory;
+   assert((try {run(code,bounded,c,map{});false} catch true),"bitwise rejects");
+   assert(m.closed==owned and c.handlers==0,"escape ownership");
+   if owned {assert(c.memory==nil and m.reclaimed==2 and len(m.owners)==0 and len(m.borrows)==0,"both lifetimes and borrow released");}
+   else {assert(c.memory==m and len(m.owners)==2 and len(m.borrows)==1,"caller-owned memory retained");}
+   V.close_execution(c);V.close_execution(c);assert(m.reclaimed==2,"idempotent close");
+  }
+  let c=prepare(true);let m=c.memory;
+  let caught=map{constants:[map{try_chunk:code,catch_chunk:handler}],instructions:[map{op:35,operand:0}]};
+  assert(run(caught,bounded,c,map{}).output==[7] and not m.closed and c.handlers==0,"handler memory remains usable");V.close_execution(c);
+ }
+}
+// Raw IR covers every rejected type, nonfinite/range value and both positions.
+let binary=["bit_and","bit_or","bit_xor","bit_shl","bit_shr"];
+for name in ["bit_and","bit_or","bit_xor","bit_shl","bit_shr","bit_not"] {
+ for bad in [nil,true,"1",[],map{},bigint(1),rational(1,2),decimal(1),0.5,num_sqrt(-1),num_exp(1000),9223372036854777856,-9223372036854777856] {
+  let values=[bad,1];let arity=2;if name=="bit_not" {arity=1;}
+  let ins=[map{op:0,operand:0},map{op:0,operand:1}];if arity==2 {array_push(ins,map{op:0,operand:2});}array_push(ins,map{op:18,operand:arity});
+  let code=map{constants:[map{__bi:name},values[0],values[1]],instructions:ins};
+  let c=prepare(true);let m=c.memory;assert((try {run(code,true,c,map{});false} catch true),"invalid raw operand");assert(m.closed and m.reclaimed==2,"raw cleanup");
+  if arity==2 {code.constants[1]=1;code.constants[2]=bad;let c2=prepare(true);assert((try {run(code,true,c2,map{});false} catch true),"invalid second operand");assert(c2.memory==nil,"second operand cleanup");}
+ }
+ let suffix=",arg(1),arg(2)";let invoke="call2";let expected=[1,2];if name=="bit_not" {suffix=",arg(1)";invoke="call1";expected=[1];}
+ let code=compiled("let calls=[];fn arg(n){array_push(calls,n);return nil;}"+invoke+"("+name+suffix+");");
+ for variant in [code,O.optimize_safe(code).chunk,P.deserialize_chunk(P.serialize_chunk(code))] {
+  for bounded in [false,true] {let c=prepare(true);let g=map{};assert((try {run(variant,bounded,c,g);false} catch true),"dynamic bitwise failure");assert(c.memory==nil and g.calls==expected,"arguments once in order");}
+ }
+ let c=prepare(true);let m=c.memory;m.reclaimed=map{};let fail=compiled("call1("+name+",nil);");if name!="bit_not" {fail=compiled("call2("+name+",nil,1);");}
+ assert((try {run(fail,false,c,map{});false} catch true),"secondary fault still rejects");m.reclaimed=0;V.close_execution(c);assert(m.closed,"fault fixture restored");
+ let shadow=F.frontend_compile("fn "+name+"(a){return a;}print "+name+"(nil);");let c2=prepare(true);assert(shadow.ok and run(shadow.chunk,true,c2,map{}).output==[nil] and not c2.memory.closed,"shadowing unchanged");V.close_execution(c2);
+}
+for name in binary {let code=compiled("let a=map{__add__:"+name+"};a+1;");let c=prepare(true);assert((try {run(code,true,c,map{});false} catch true) and c.memory==nil,"generic builtin dispatch cleanup");}
+for expr in ["a & b","a | b","a ^ b","a << b","a >> b","~a"] {
+ let code=compiled("fn apply(a,b){return "+expr+";}apply(0.5,1);");
+ for variant in [code,O.optimize_safe(code).chunk,P.deserialize_chunk(P.serialize_chunk(code))] {let c=prepare(true);assert((try {run(variant,true,c,map{});false} catch true) and c.memory==nil,"operator lowering cleanup");}
+}
+// Keep host boundary rounding/saturation as well as ordinary integer results.
+let valid=compiled("print bit_and(12,10);print bit_or(12,10);print bit_xor(12,10);print bit_not(5);print bit_shl(1,4);print bit_shr(-8,1);print bit_shl(1,63);print bit_shr(-1,63);print bit_shl(1,0);print bit_not(9223372036854775808);print bit_not(-9223372036854775808);");
+let expected=[8,14,6,-6,16,-4,bit_shl(1,63),-1,1,bit_not(9223372036854775808),bit_not(-9223372036854775808)];
+for bounded in [false,true] {let c=prepare(true);let m=c.memory;assert(run(valid,bounded,c,map{}).output==expected and not m.closed,"valid signed/boundary results");V.close_execution(c);}
+for source in ["print bit_shl(1,2);memory_alloc(3);call2(bit_shl,1,64);","memory_alloc(3);print try call2(bit_shr,1,-1) catch 7;call1(bit_not,nil);","memory_alloc(3);try call2(bit_and,nil,1) catch call2(bit_or,1,nil);"] {let c=V.execution_context(true);assert((try {run(compiled(source),true,c,map{});false} catch true) and c.memory==nil and c.handlers==0,"late/handler cleanup");}
+let code=compiled("let calls=[];fn bad(self,x){array_push(calls,1);return call2(bit_shl,1,64);}let a=map{__add__:bad};a+1;");let c=prepare(true);let g=map{};assert((try {run(code,true,c,g);false} catch true) and c.memory==nil and g.calls==[1],"guest overload is not replayed");
+print "selfhost_bitwise_cleanup_pass";

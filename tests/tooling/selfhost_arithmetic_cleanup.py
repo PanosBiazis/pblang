@@ -21,6 +21,7 @@ def main():
     ap.add_argument('--strings', action='store_true')
     ap.add_argument('--exact-math', action='store_true')
     ap.add_argument('--constructors', action='store_true')
+    ap.add_argument('--bitwise', action='store_true')
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--count', type=int, default=3)
     a = ap.parse_args()
@@ -146,6 +147,15 @@ def main():
                       ('valid-constructors', 'print bigint("9007199254740993");print decimal(rational(1,2));print rational(decimal("0.125"));print rational(2,4);print rational(4,2);', True),
                       ('caught-constructors', 'print try call1(bigint,0.5) catch memory_get(1);print try call1(decimal,"bad") catch memory_get(1);print try call1(rational,"1/0") catch memory_get(1);print try call2(rational,1,0) catch memory_get(1);', True)]
             cases = [(label, 'fn call1(f,a){return f(a);}fn call2(f,a,b){return f(a,b);}'+source, valid) for label,source,valid in cases]
+        if a.bitwise:
+            assert a.reference and not (a.calls or a.numeric or a.strings or a.exact_math or a.constructors), 'choose bitwise with reference'
+            # Compute wide operands at runtime: PBCS currently rejects these
+            # decimal-text numeric literals before reaching the bitwise call.
+            exprs = ['call2(bit_and,nil,1)', 'call2(bit_or,nil,1)', 'call2(bit_xor,nil,1)', 'call2(bit_shl,nil,1)', 'call2(bit_shr,nil,1)', 'call2(bit_and,1,nil)', 'call2(bit_or,1,nil)', 'call2(bit_xor,1,nil)', 'call2(bit_shl,1,nil)', 'call2(bit_shr,1,nil)', 'call1(bit_not,nil)', 'call1(bit_not,0.5)', 'call1(bit_not,num_sqrt(-1))', 'call2(bit_shl,1,64)', 'call2(bit_shr,1,-1)', 'call2(bit_shl,1,0.5)', 'call2(bit_xor,(num_pow(2,63)+2048),1)', 'call2(bit_and,-(num_pow(2,63)+2048),1)', 'call2(bit_or,num_exp(1000),1)', 'call2(bit_and,decimal(1),1)', 'let a=map{__add__:bit_or};a+2', 'fn bad(f){return f();}bad(bit_not)', 'fn bad(f){return f(1);}bad(bit_shl)', 'fn shift(x,n){return x << n;}shift(1,64)']
+            cases = [(e,e+';',False) for e in exprs]
+            cases += [('valid-bitwise','print bit_and(12,10);print bit_or(12,10);print bit_xor(12,10);print bit_not(5);print bit_shl(1,63);print bit_shr(-8,1);print bit_shr(-1,63);print bit_shl(1,0);print bit_not(num_pow(2,63));print bit_not(-num_pow(2,63));',True),
+                      ('caught-bitwise','print try call1(bit_not,nil) catch memory_get(1);print try call2(bit_shl,1,64) catch memory_get(1);',True)]
+            cases = [(label,'fn call1(f,a){return f(a);}fn call2(f,a,b){return f(a,b);}'+source,valid) for label,source,valid in cases]
         for label, source, valid in cases[a.start:a.start + a.count]:
             if a.reference:
                 expected = run(prefix + 'let c=V.execution_context(true);V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk,map{},c);'

@@ -152,6 +152,41 @@ messages across six routes and secondary cleanup faults. Small installation
 probes are `examples/selfhost_throw_cleanup/constructors.sapp` and
 `tests/fixtures/selfhost_constructor_acceptance.sapp`.
 
+## Bitwise builtin and operator failures
+
+`bit_and`, `bit_or`, `bit_xor`, `bit_not`, `bit_shl` and `bit_shr` now release
+private opted-in execution memory when their host error escapes without a guest
+handler. Scalar and generic dispatch follow the same rule. The PBLang parser
+lowers `&`, `|`, `^`, `~`, `<<` and `>>` to these builtins, so checked-source
+operators participate as well. Previously invalid types, fractional operands
+and invalid shift counts could leave allocations and borrows live.
+
+These failures depend on both type and value. The VM leaves integer admission,
+signed 64-bit conversion, shift-count validation and error priority to the host.
+As with exact-number constructors, it catches a failed pure primitive, attempts
+private cleanup, then repeats only that primitive on already-evaluated operands
+to preserve the original error. No guest operand expression or method is retried.
+Successful bitwise operations are invoked once; catches and borrowed contexts
+keep their memory. Arity checks and shadowed guest functions remain unchanged.
+
+The correction deliberately preserves the host's existing binary64 boundary
+rounding and conversion behavior, including its accepted rounded positive
+64-bit endpoint. It does not redefine the integer range or add exact-bigint
+bit operations. Tests distinguish rejected neighboring values from accepted
+endpoints and retain arithmetic right shifts and shift counts 0 and 63.
+
+`tests/semantics/selfhost_bitwise_cleanup_test.sapp` covers six builtins and
+operator lowering, type/value failures, handlers, owned/borrowed lifetimes,
+argument effects, generic dispatch, optimizer/PBCS replay and primary errors
+despite secondary cleanup faults. The diagnostic harness's `--bitwise
+--reference PREVIOUS_RELEASE` group compares exit/stdout/first host error across
+six routes. Wide boundary operands in that matrix are computed at runtime:
+PBCS currently rejects some serialized numeric literals before the bitwise
+operation. This cleanup change does not fix that separate representation limit.
+`examples/selfhost_throw_cleanup/bitwise.sapp` is a short public-CLI
+installation probe for all six builtins plus caught/borrowed state. There is no
+claim of general host/FFI, native abort/panic/exhaustion recovery or speedup.
+
 ## String transforms, search and split
 
 `str_upper`, `str_lower`, `str_trim`, `str_split`, `str_contains`,
