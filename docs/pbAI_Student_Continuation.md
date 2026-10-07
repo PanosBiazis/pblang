@@ -40,7 +40,7 @@ The report makes that limitation explicit.
 
 ## Candidate, metrics and reversibility
 
-The returned handle exposes `report`, `predict`, `evaluate` and `checkpoint`.
+The returned handle exposes `report`, `predict`, `evaluate`, `checkpoint` and `close`.
 It has no promotion or automatic-save operation. Reports include the parent
 digest, prior/added/total steps, options, online hard-label loss, clipping counts,
 maximum gradient norm, and paired baseline/candidate train and validation metrics.
@@ -124,3 +124,39 @@ gates and reversible local acceptance, use the new
 [student review API](pbAI_Student_Review.md). The diagnostic API above retains its
 original behavior and provenance limitations. A declared history is not authenticated
 ancestry or proof of complete upstream data.
+
+## Explicit continuation ownership (2026-10-08)
+
+The caller owns each handle returned by `student_continue`. Call `close()` when
+finished: the first call returns `true`, subsequent calls return `false`.
+`predict`, `evaluate` and `checkpoint` become terminal, including previously
+saved method references. Public map edits cannot reopen the private state.
+Already exported checkpoints, reports, predictions and metrics remain caller-owned.
+Export a checkpoint before close if later restoration is needed. The supplied
+parent artifact and independently loaded parent handles remain unchanged.
+
+The reviewed constructor owns its intermediate continuation handle. It captures
+its close method immediately, exports the checkpoint, and closes the intermediate
+before reconstruction or evaluation. A catchable checkpoint export exception also
+closes it, then throws `student continuation checkpoint export failed`; no partial
+review is returned. Constructor failure before a handle exists has no handle to
+close. The returned reviewed handle has its own independent lifetime.
+
+Method factories capture only a private state map. Close clears the model,
+baseline/candidate factors, base identity, context ledger and internal report
+reference. This establishes explicit reference removal and terminal methods,
+not physical allocator reclamation, zeroization, RSS reduction, or cleanup after
+OOM/hard termination. Distillation handles and ordinary neural training sessions
+still lack this explicit close operation; this is not a universal lifecycle fix.
+
+`tests/semantics/pbai_continuation_close_test.sapp` exercises original saved methods,
+malformed inputs, detached exports and independent active ownership through direct,
+legacy-facade and explicit-binding routes. `pbai_continuation_lifetime_test.sapp`
+uses private copied providers with Linux `bwrap`, denied network and hidden source
+roots, following the prerequisites of the [tool lifetime test](pbAI_Student_Tools.md).
+Set `PBLANG_BIN` to the trusted executable and `PBAI_RELOAD_PRODUCT=pblang|pbai`.
+The default gate requires closure; `PBAI_CONTINUATION_LIFETIME_PHASE=baseline` only
+characterizes the historical implementation. Three routes each exercise successful
+review, checkpoint-export exception, rejected review and later recovery, with an
+independent caller model preserved throughout. Original methods are inspected
+before diagnostic cleanup. See [evidence](evidence/pbai_continuation_lifetime-2026-10-08.json).
