@@ -1050,3 +1050,29 @@ It marks presentation pending; call `App.update(reader, [])` when no input follo
 See `fine_size_demo.sapp`, `tests/semantics/reader_fine_size_test.sapp` and
 `tests/tooling/reader_fine_size_native.py`. Acceptance is real Linux X11 execution;
 no new native mobile, Windows or macOS support is implied by these controls.
+
+### Precise scale and line spacing
+
+In Style, focus **Scale** or **Spacing** and use unmodified Left/Right to move to
+the adjacent 0.05 value. Scale uses the existing 0.75–1.50 range; line spacing uses
+1.00–2.50. For example, scale 1 becomes 1.05 and spacing 1.45 becomes 1.50. Values
+between grid points move to the next point in the requested direction (1.123 to
+1.15 or 1.10). Tiny floating-point noise near a grid point is normalized before
+stepping. Integer ticks prevent accumulated drift; limits do not wrap or rebuild
+an unchanged view. The controls retain short ASCII keyboard hints in compact UI.
+
+Enter/Space/click keep the original presets. Only a fresh unmodified arrow on an
+enabled visible numeric choice changes it. Held arrows remain consumed across
+rebuilds. Profile mode edits drafts until explicit Apply/Save; Escape/Done discards
+unapplied ratios. Session-only mode applies immediately, as before.
+
+`App.adjust_text_ratio(reader, "font_scale", 1)` also accepts `"line_height"` and
+step `-1`. It returns whether the value changed, validates the property/unit step,
+and acts only while Style is open and not closing. Call `App.update(reader, [])`
+to settle a programmatic change when no input follows. `App.configure` and the
+profile schema still accept their existing validated values; they are not globally
+quantized by the new keyboard helper.
+
+See `text_ratio_demo.sapp`, `tests/semantics/reader_text_ratio_test.sapp` and
+`tests/tooling/reader_text_ratio_native.py`. Native acceptance is Linux X11 only;
+these controls do not establish new mobile, Windows or macOS execution coverage.
