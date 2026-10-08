@@ -595,7 +595,14 @@ The native reader keeps session-only behavior by default. Start it with
 and `--session-only` routes skip profile discovery/read/write entirely and show
 Save disabled. The UI separates choices from application and persistence:
 
-- Changing a Style control edits a draft. **Done** discards unapplied choices.
+- Changing a Style control edits a draft. **Done** and **Escape** discard unapplied choices.
+  Successful **Home**, **Back** or **Forward** navigation from Style uses the same
+  dismissal: the draft is immediately reset to the applied appearance and a real
+  discard reports `Unapplied changes discarded` when Style is reopened. Existing
+  status messages remain when no draft differs. Navigation never saves or reloads
+  preferences, and applied/saved choices and normal reading history are preserved.
+  Disabled navigation does not dismiss a draft. See `navigation_draft_demo.sapp`
+  for a runnable example using the existing controller and toolbar callbacks.
 - **Apply for this session** applies the draft without touching profile storage.
 - **Save for next launch** saves and applies the draft explicitly.
 - **Reset defaults** saves and applies the original reader defaults. When storage
