@@ -9,8 +9,17 @@ must not exceed the actual sample count. No time spacing is inferred.
 Every complete trailing window is returned in input order: First and Last are
 one-based data-sample indices, followed by From label, To label and Mean.
 Labels remain literal, including blanks/duplicates. Values must be finite within
-+/-1e9. Arithmetic is ordinary floating point; no exact decimal, statistical
-confidence, anomaly detection, forecast or measured speedup is claimed.
++/-1e9. Each mean uses a binary tree of nonoverlapping floating-point expansions of the current window. Replacing
+an expired leaf and recomputing its ancestors prevents old large samples from
+erasing a small later window; width one preserves each stored sample exactly.
+The shared kernel accepts up to 4096 samples. Widths above one require
+O(N*ceil(log2(window))) node recomputations, each with O(K²) work for K bounded
+expansion components. This table interface keeps
+its existing 31-sample limit (at most 155 node recomputations). Compensation
+improves cancellation but does not guarantee exact decimal or universally
+correctly rounded results; final division can round or underflow. No statistical
+confidence, anomaly detection, forecast or universal speedup is claimed.
+See SAMPLE_SERIES_NUMERICS.md for the contract.
 
 `measure_table.parse_value(text)` exposes the existing measurement decimal
 parser for reuse, without changing its grammar: optional sign, decimal point,
