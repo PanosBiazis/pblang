@@ -25,6 +25,7 @@ def main():
     ap.add_argument('--conversions', action='store_true')
     ap.add_argument('--slices', action='store_true')
     ap.add_argument('--map-fallback', action='store_true')
+    ap.add_argument('--equality', action='store_true')
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--count', type=int, default=3)
     a = ap.parse_args()
@@ -184,6 +185,17 @@ def main():
                        'let c=map{__class:map{__lt__:fn(s,b){return 7;}}};print c<2;'
                        'print map{x:1}==map{x:1};print map{x:1}!=map{x:2};', True),
                       ('caught-fallback', 'let a=map{};print try a+2 catch memory_get(1);', True)]
+        if a.equality:
+            assert a.reference, '--reference is required for nil equality diagnostics'
+            cases = [(op + '/' + side + '/' + shape,
+                      'fn compare(a,b){return a' + op + 'b;}let a=' + shape + ';compare(' + side + ');', False)
+                     for op,method in [('==','__eq__'),('!=','__ne__')]
+                     for side in ['a,2','2,a']
+                     for shape in ['map{'+method+':nil}', 'map{__class:map{'+method+':nil}}']]
+            cases += [('structural-valid','print map{x:1}==map{x:1};print map{x:1}!=map{x:2};'
+                       'let a=map{__eq__:fn(s,b){return nil;}};print a==2;'
+                       'let b=map{__ne__:fn(s,b){return false;}};print 2!=b;',True),
+                      ('caught-nil-method','let a=map{__eq__:nil};print try a==2 catch memory_get(1);',True)]
         for label, source, valid in cases[a.start:a.start + a.count]:
             if a.reference:
                 expected = run(prefix + 'let c=V.execution_context(true);V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk,map{},c);'

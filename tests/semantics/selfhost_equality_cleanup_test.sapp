@@ -1,0 +1,39 @@
+// Distinguish absent equality methods from present nil methods without replay.
+let V=import("stdlib:compiler/vm.sapp");let F=import("stdlib:compiler/selfhost_frontend.sapp");let O=import("stdlib:compiler/optimizer.sapp");let P=import("stdlib:selfhost_pbck.sapp");
+fn compiled(s){let r=F.frontend_compile(s);assert(r.ok,"compile: "+str(r.diagnostics));return r.chunk;}
+fn variants(c){return [c,O.optimize_safe(c).chunk,P.deserialize_chunk(P.serialize_chunk(c))];}
+let setup=compiled("memory_alloc(7);push_lifetime();borrow_immutable(1);memory_alloc(9);");
+fn prepare(owned){let c=V.execution_context(owned);V.run_seeded(setup,map{},c);return c;}
+fn run(code,bounded,c,g){if bounded {return V.run_seeded_bounded(code,g,nil,c);}return V.run_seeded(code,g,c);}
+fn raw(op,a,b){return map{constants:[a,b],instructions:[map{op:0,operand:0},map{op:0,operand:1},map{op:op,operand:0},map{op:12,operand:0}]};}
+let handler=compiled("print memory_get(1);");
+for spec in [["==","__eq__",5],["!=","__ne__",6]] {
+ let op=spec[0];let method=spec[1];
+ for shape in ["map{"+method+":nil}","map{__class:map{"+method+":nil}}"] {for args in ["a,2","2,a","a,a"] {
+  let code=compiled("fn compare(a,b){return a"+op+"b;}let a="+shape+";compare("+args+");");
+  for variant in variants(code) {for bounded in [false,true] {
+   for owned in [false,true] {let c=prepare(owned);let m=c.memory;assert((try {run(variant,bounded,c,map{});false} catch true),"nil method rejects");assert(m.closed==owned and c.handlers==0,"ownership");
+    if owned {assert(c.memory==nil and m.reclaimed==2 and len(m.owners)==0 and len(m.borrows)==0,"two lifetimes and borrow released");}else {assert(c.memory==m and len(m.owners)==2 and len(m.borrows)==1,"caller memory retained");}
+    V.close_execution(c);V.close_execution(c);assert(m.reclaimed==2,"idempotent close");}
+   let caught_ctx=prepare(true);let m=caught_ctx.memory;let caught=map{constants:[map{try_chunk:variant,catch_chunk:handler}],instructions:[map{op:35,operand:0}]};assert(run(caught,bounded,caught_ctx,map{}).output==[7] and not m.closed and caught_ctx.handlers==0,"actual handler retains memory");V.close_execution(caught_ctx);
+  }}
+ }}
+ let effects=compiled("let calls=[];fn left(){array_push(calls,1);return map{"+method+":nil};}fn right(){array_push(calls,2);return 2;}left()"+op+"right();");
+ for variant in variants(effects) {for bounded in [false,true] {let c=prepare(true);let g=map{};assert((try {run(variant,bounded,c,g);false} catch true) and g.calls==[1,2] and c.memory==nil,"operands once in order");}}
+ // Existing precedence: nil forward value can yield to an actual reflected method.
+ for result in ["nil","false"] {
+  let source="let calls=[];fn method(s,b){array_push(calls,1);return "+result+";}let a=map{"+method+":nil};let b=map{__class:map{"+method+":method}};print a"+op+"b;print calls;print memory_get(1);";
+  for variant in variants(compiled(source)) {let c=prepare(true);let expected=if result=="nil" {nil}else{false};assert(run(variant,true,c,map{}).output==[expected,[1],7] and not c.memory.closed,"valid reflected result");V.close_execution(c);}
+ }
+ let precedence=compiled("let calls=[];fn first(a,b){array_push(calls,1);throw 42;}fn second(a,b){array_push(calls,2);return 0;}let a=map{"+method+":first};let b=map{"+method+":second};a"+op+"b;");let throw_ctx=prepare(true);let g=map{};assert((try {run(precedence,true,throw_ctx,g);false} catch true) and g.calls==[1] and throw_ctx.memory==nil,"forward failure never retries reflected");
+ // Both lookup APIs count32 tables: depth31 includes nil; depth32 excludes it.
+ for depth in [31,32] {let target=map{};target[method]=nil;for i depth {target=map{__class:target};}let c=prepare(true);let failed=try {run(raw(spec[2],target,2),true,c,map{});false}catch true;assert(failed==(depth==31),"same class depth limit");assert((c.memory==nil)==failed,"depth ownership");V.close_execution(c);}
+ let cycle=map{};cycle.__class=cycle;let cycle_ctx=prepare(true);assert(run(raw(spec[2],cycle,2),true,cycle_ctx,map{}).output==[op=="!="] and not cycle_ctx.memory.closed,"absent method cycle preserves equality");V.close_execution(cycle_ctx);
+ let shadow=compiled("fn inherited(a,b){return 1;}let a=map{"+method+":nil,__class:map{"+method+":inherited}};a"+op+"2;");let shadow_ctx=prepare(true);assert((try {run(shadow,true,shadow_ctx,map{});false}catch true) and shadow_ctx.memory==nil,"nil shadows inherited callback");
+ let fault_ctx=prepare(true);let m=fault_ctx.memory;m.reclaimed=map{};assert((try {run(effects,false,fault_ctx,map{});false}catch true),"secondary cleanup error");m.reclaimed=0;V.close_execution(fault_ctx);assert(m.closed,"fault fixture restored");
+}
+let valid=compiled("print map{x:1}==map{x:1};print map{x:1}!=map{x:2};print map{}==2;print 2!=map{};print [1,map{x:2}]==[1,map{x:2}];print bigint(2)==bigint(2);print rational(1,2)==rational(2,4);");
+for variant in variants(valid) {for bounded in [false,true] {let c=prepare(true);assert(run(variant,bounded,c,map{}).output==[true,true,false,true,true,true,true] and not c.memory.closed,"structural and exact equality remain live");V.close_execution(c);}}
+let late=compiled("memory_alloc(3);let a=map{__eq__:nil};print try a==2 catch memory_get(1);a==2;");let late_ctx=V.execution_context(true);assert((try {run(late,true,late_ctx,map{});false}catch true) and late_ctx.memory==nil,"late memory escape");
+let nested=compiled("let a=map{__eq__:nil,__ne__:nil};try a==2 catch a!=2;");let nested_ctx=prepare(true);assert((try {run(nested,true,nested_ctx,map{});false}catch true) and nested_ctx.memory==nil and nested_ctx.handlers==0,"failing catch cleans");
+print "selfhost_equality_cleanup_pass";
