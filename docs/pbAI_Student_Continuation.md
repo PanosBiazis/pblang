@@ -162,3 +162,11 @@ characterizes the historical implementation. Three routes each exercise successf
 review, checkpoint-export exception, rejected review and later recovery, with an
 independent caller model preserved throughout. Original methods are inspected
 before diagnostic cleanup. See [evidence](evidence/pbai_continuation_lifetime-2026-10-08.json).
+
+## Migrated example and benchmark ownership (2026-10-08)
+
+The matching checkpoint, continuation and review examples now register captured
+closers before export/use and close on synchronous catchable failure. Their
+benchmarks close seeds, warmups and samples outside the timed work. See the exact
+[migrated caller scope and reproduction](pbAI_Caller_Ownership.md); other legacy
+callers remain separate work.
