@@ -1148,3 +1148,17 @@ Embedders can call `App.zoom(reader, -1|0|1)` and reserve shortcuts with
 methods return whether state changed; direct zoom returns false in Style or
 after closing. See `zoom_demo.sapp` and `tests/semantics/reader_zoom_test.sapp`.
 The public appearance, renderer, profile and installation contracts are unchanged.
+
+### Ordered Linux input
+
+The GUI entrypoint opts into `G.Window(..., map{ordered_input:true})`. On the
+qualified Linux x86_64/local X11 setup, a per-window queue retains short and
+ordered key presses. The renderer, profile workflow, permission flags and
+three-argument Window API remain compatible. Unsupported configurations retain
+the previous input backend; no permission is added automatically.
+
+See [native input support and limits](../../docs/NATIVE_GRAPHICS_INPUT.md).
+This does not establish IME/dead-key/AltGr composition or native validation on
+Windows, macOS, Android or iOS. The Reader remains a document viewer; editable
+Greek save/readback acceptance is exercised in the shared GUI fixtures, while
+Reader acceptance checks its real shortcuts, explicit profile Save and restart.
