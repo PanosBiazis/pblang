@@ -331,9 +331,10 @@ For example, the self-host `%` instruction uses `num_mod`, whose error message
 already differs from the retained native `%` opcode; that existing distinction
 is preserved.
 
-Fallback arithmetic opcodes on map operands without a resolved guest overload
-remain outside this correction, as do arbitrary host/builtin/FFI failures,
-allocation exhaustion, malformed bytecode in general, composite ownership,
+Missing arithmetic/ordering map overloads are covered by the single-call guards
+described above. Present nil equality methods have their separate presence guard;
+absent equality methods still permit structural comparison. Remaining gaps include
+arbitrary host/builtin/FFI failures, allocation exhaustion, malformed bytecode in general, composite ownership,
 and other backends. It is not a speedup claim.
 The retained native compiler and its nested `p:run()` source bug are unchanged.
 Native PBCK execution uses a different runtime path; PBCS replay here means the
@@ -364,3 +365,6 @@ bounds/defaults, optimized/PBCS guest chunks and secondary cleanup failure.
 The diagnostic driver adds `--initialization --reference PREVIOUS_RELEASE`.
 `examples/selfhost_throw_cleanup/initialization.sapp` is the installation probe.
 No speedup is claimed; earlier conversion/async performance findings remain open.
+
+For conversion-cost measurement boundaries and the observed import overhead, see
+[SELFHOST_CONVERSION_COST.md](SELFHOST_CONVERSION_COST.md).
