@@ -203,3 +203,7 @@ The separate terminal-close example now owns its seed and restored model as well
 as its reviewed handle. Registered closers cover synchronous export/use/acquisition
 failures without changing exported checkpoints or the explicit close demonstration.
 See [the cycle 19 caller migration](pbAI_Caller_Ownership.md).
+
+The intermediate export/cleanup failure precedence is specified in the
+[continuation ownership contract](pbAI_Student_Continuation.md#export-failure-and-cleanup-precedence-2026-10-08-cycle-22).
+Known export errors take precedence; malformed cleanup cannot return a review.
