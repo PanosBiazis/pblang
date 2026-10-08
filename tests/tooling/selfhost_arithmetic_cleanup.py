@@ -22,6 +22,7 @@ def main():
     ap.add_argument('--exact-math', action='store_true')
     ap.add_argument('--constructors', action='store_true')
     ap.add_argument('--bitwise', action='store_true')
+    ap.add_argument('--conversions', action='store_true')
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--count', type=int, default=3)
     a = ap.parse_args()
@@ -155,6 +156,13 @@ def main():
             cases = [(e,e+';',False) for e in exprs]
             cases += [('valid-bitwise','print bit_and(12,10);print bit_or(12,10);print bit_xor(12,10);print bit_not(5);print bit_shl(1,63);print bit_shr(-8,1);print bit_shr(-1,63);print bit_shl(1,0);print bit_not(num_pow(2,63));print bit_not(-num_pow(2,63));',True),
                       ('caught-bitwise','print try call1(bit_not,nil) catch memory_get(1);print try call2(bit_shl,1,64) catch memory_get(1);',True)]
+            cases = [(label,'fn call1(f,a){return f(a);}fn call2(f,a,b){return f(a,b);}'+source,valid) for label,source,valid in cases]
+        if a.conversions:
+            assert a.reference and not (a.calls or a.numeric or a.strings or a.exact_math or a.constructors or a.bitwise), 'choose conversions with reference'
+            exprs = ['call1(parse_number,nil)', 'call1(parse_number,"bad")', 'call1(parse_bool,nil)', 'call1(parse_bool,"1")', 'call2(strcharcodeat,nil,0)', 'call2(strcharcodeat,"a",nil)', 'call2(strcharcodeat,"",0)', 'call2(strcharcodeat,"α",1)', 'call1(strfromcharcode,nil)', 'call1(strfromcharcode,55296)', 'call1(strfromcharcode,1114112)', 'call1(str_from_char_code,nil)', 'call1(str_from_char_code,56319)', 'call1(str_from_char_code,num_exp(1000))', 'call1(parse_number,bigint(1))', 'let a=map{__add__:strcharcodeat};a+0', 'fn bad(f){return f();}bad(parse_bool)', 'fn bad(f){return f("a");}bad(strcharcodeat)']
+            cases = [(e,e+';',False) for e in exprs]
+            cases += [('valid-conversions','print parse_number(" -1.25e2 ");print parse_bool(" TRUE ");print parse_bool("False");print strcharcodeat("α🙂",1);print strcharcodeat("α",-1);print strfromcharcode(65.9);print str_from_char_code(128578);print strfromcharcode(1114111);print parse_number("NaN");print parse_number("inf");',True),
+                      ('caught-conversions','print try call1(parse_number,"bad") catch memory_get(1);print try call1(str_from_char_code,55296) catch memory_get(1);print try call2(strcharcodeat,"",0) catch memory_get(1);',True)]
             cases = [(label,'fn call1(f,a){return f(a);}fn call2(f,a,b){return f(a,b);}'+source,valid) for label,source,valid in cases]
         for label, source, valid in cases[a.start:a.start + a.count]:
             if a.reference:

@@ -1,0 +1,50 @@
+// Parsing and Unicode conversion failures preserve ownership and host semantics.
+let V=import("stdlib:compiler/vm.sapp");let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let O=import("stdlib:compiler/optimizer.sapp");let P=import("stdlib:selfhost_pbck.sapp");
+fn compiled(s){let r=F.frontend_compile("fn call1(f,a){return f(a);}fn call2(f,a,b){return f(a,b);}"+s);assert(r.ok,"compile: "+str(r.diagnostics));return r.chunk;}
+let setup=compiled("memory_alloc(7);push_lifetime();borrow_immutable(1);memory_alloc(9);");
+fn prepare(owned){let c=V.execution_context(owned);V.run_seeded(setup,map{},c);return c;}
+fn run(code,bounded,c,g){if bounded {return V.run_seeded_bounded(code,g,nil,c);}return V.run_seeded(code,g,c);}
+let sources=["call1(parse_number,nil)", "call1(parse_number,\"bad\")", "call1(parse_bool,nil)", "call1(parse_bool,\"1\")", "call2(strcharcodeat,nil,0)", "call2(strcharcodeat,\"a\",nil)", "call2(strcharcodeat,\"\",0)", "call2(strcharcodeat,\"α\",1)", "call1(strfromcharcode,nil)", "call1(strfromcharcode,55296)", "call1(strfromcharcode,1114112)", "call1(str_from_char_code,nil)", "call1(str_from_char_code,56319)", "call1(str_from_char_code,num_exp(1000))", "call1(parse_number,bigint(1))", "let a=map{__add__:strcharcodeat};a+0", "fn bad(f){return f();}bad(parse_bool)", "fn bad(f){return f(\"a\");}bad(strcharcodeat)"];
+let handler=compiled("print memory_get(1);");
+for source in sources {
+ let code=compiled(source+";");
+ for bounded in [false,true] {
+  for owned in [false,true] {
+   let c=prepare(owned);let m=c.memory;
+   assert((try {run(code,bounded,c,map{});false} catch true),"conversion rejects");
+   assert(m.closed==owned and c.handlers==0,"escape ownership");
+   if owned {assert(c.memory==nil and m.reclaimed==2 and len(m.owners)==0 and len(m.borrows)==0,"both lifetimes and borrow released");}
+   else {assert(c.memory==m and len(m.owners)==2 and len(m.borrows)==1,"caller-owned memory retained");}
+   V.close_execution(c);V.close_execution(c);assert(m.reclaimed==2,"idempotent close");
+  }
+  let c=prepare(true);let m=c.memory;
+  let caught=map{constants:[map{try_chunk:code,catch_chunk:handler}],instructions:[map{op:35,operand:0}]};
+  assert(run(caught,bounded,c,map{}).output==[7] and not m.closed and c.handlers==0,"handler memory remains usable");V.close_execution(c);
+ }
+}
+// Cover every rejected runtime type without evaluating guest conversions.
+for name in ["parse_number","parse_bool","strfromcharcode","str_from_char_code","strcharcodeat"] {
+ for bad in [nil,true,[],map{},bigint(1),rational(1,2),decimal(1)] {
+  let arity=1;let ins=[map{op:0,operand:0},map{op:0,operand:1}];if name=="strcharcodeat" {arity=2;array_push(ins,map{op:0,operand:2});}array_push(ins,map{op:18,operand:arity});
+  let code=map{constants:[map{__bi:name},bad,0],instructions:ins};
+  for bounded in [false,true] {let c=prepare(true);let m=c.memory;assert((try {run(code,bounded,c,map{});false} catch true),"raw type rejects");assert(m.closed and m.reclaimed==2 and c.memory==nil,"raw type cleanup");}
+ }
+ let suffix=",arg(1)";let invoke="call1";let expected=[1];if name=="strcharcodeat" {suffix=",arg(1),arg(2)";invoke="call2";expected=[1,2];}
+ let code=compiled("let calls=[];fn arg(n){array_push(calls,n);return nil;}"+invoke+"("+name+suffix+");");
+ for variant in [code,O.optimize_safe(code).chunk,P.deserialize_chunk(P.serialize_chunk(code))] {
+  for bounded in [false,true] {let c=prepare(true);let g=map{};assert((try {run(variant,bounded,c,g);false} catch true),"conversion failure");assert(c.memory==nil and g.calls==expected,"arguments once in order");}
+ }
+ let c=prepare(true);let m=c.memory;m.reclaimed=map{};
+ assert((try {run(code,false,c,map{});false} catch true),"secondary fault still rejects");m.reclaimed=0;V.close_execution(c);assert(m.closed,"fault fixture restored");
+ let shadow=F.frontend_compile("fn "+name+"(a){return a;}print "+name+"(nil);");let c2=prepare(true);assert(shadow.ok and run(shadow.chunk,true,c2,map{}).output==[nil] and not c2.memory.closed,"shadowing unchanged");V.close_execution(c2);
+}
+// Host coercion is deliberately retained: truncate fractions, saturate negative
+// and NaN codepoints/indices, count Unicode scalars rather than UTF-8 bytes.
+let valid=compiled("print parse_number(\" -1.25e2 \");print parse_bool(\" TRUE \");print parse_bool(\"false\");print strcharcodeat(\"α🙂\",1);print strcharcodeat(\"α\",-1);print strcharcodeat(\"α\",num_sqrt(-1));print strfromcharcode(65.9);print str_from_char_code(128578);print strfromcharcode(-1);print strfromcharcode(num_sqrt(-1));print strfromcharcode(55295);print strfromcharcode(57344);print strfromcharcode(1114111);");
+let expected=[-125,true,false,128578,945,945,"A","🙂",strfromcharcode(0),strfromcharcode(0),strfromcharcode(55295),strfromcharcode(57344),strfromcharcode(1114111)];
+for variant in [valid,O.optimize_safe(valid).chunk,P.deserialize_chunk(P.serialize_chunk(valid))] {for bounded in [false,true] {let c=prepare(true);assert(run(variant,bounded,c,map{}).output==expected and not c.memory.closed,"valid host contracts");V.close_execution(c);}}
+let special=compiled("let nan=parse_number(\"NaN\");print nan!=nan;print parse_number(\"inf\")==num_exp(1000);print parse_number(\"-inf\")==-num_exp(1000);");let c=prepare(true);assert(run(special,true,c,map{}).output==[true,true,true] and not c.memory.closed,"nonfinite parse succeeds");V.close_execution(c);
+for source in ["memory_alloc(3);call1(parse_number,\"bad\");","memory_alloc(3);print try call1(parse_bool,\"bad\") catch 7;call1(strfromcharcode,55296);","memory_alloc(3);try call2(strcharcodeat,\"\",0) catch call1(parse_number,\"bad\");"] {let c=V.execution_context(true);assert((try {run(compiled(source),true,c,map{});false} catch true) and c.memory==nil and c.handlers==0,"late and handler escape");}
+let code=compiled("let calls=[];fn bad(self,x){array_push(calls,1);return call2(strcharcodeat,\"\",0);}let a=map{__add__:bad};a+1;");let c=prepare(true);let g=map{};assert((try {run(code,true,c,g);false} catch true) and c.memory==nil and g.calls==[1],"guest method not replayed");
+print "selfhost_conversion_cleanup_pass";

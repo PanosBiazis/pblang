@@ -152,6 +152,34 @@ messages across six routes and secondary cleanup faults. Small installation
 probes are `examples/selfhost_throw_cleanup/constructors.sapp` and
 `tests/fixtures/selfhost_constructor_acceptance.sapp`.
 
+## Text parsing and Unicode conversion failures
+
+`parse_number`, `parse_bool`, `strcharcodeat`, `strfromcharcode` and its alias
+`str_from_char_code` release opted-in private ownership when a host error escapes
+without a guest handler. Both scalar and generic dispatch use the same rule.
+Previously invalid text, wrong types, out-of-range character indices and invalid
+Unicode scalar values could leave owners and borrows live.
+
+The VM intercepts only a failed pure conversion, attempts private cleanup and
+repeats that primitive on the evaluated arguments to preserve its host error.
+Arguments, call targets and guest methods are never replayed. Valid calls run
+once; guest catches retain usable memory and borrowed contexts stay caller-owned.
+Wrong arity remains the earlier call guard's responsibility.
+
+Host parsing and coercion remain unchanged: whitespace/case handling, exponent
+notation and accepted nonfinite numeric text; Unicode scalar indexing; fractional
+index/codepoint truncation and negative/NaN saturation; surrogate and out-of-range
+codepoint errors. This is not stricter Unicode or numeric admission. Corrupt
+private cleanup metadata can prevent release, but cannot replace the primary
+conversion diagnostic. This does not cover arbitrary host/FFI/abort/OOM failures.
+
+`tests/semantics/selfhost_conversion_cleanup_test.sapp` covers ownership, handlers,
+raw invalid types, effects, aliases, host boundary behavior and optimized/PBCS
+execution. The diagnostic harness's `--conversions --reference PREVIOUS_RELEASE`
+compares exit/stdout/first host error across six routes and secondary cleanup
+faults. `examples/selfhost_throw_cleanup/conversions.sapp` is the small installed
+probe. No throughput or physical memory reclamation improvement is claimed.
+
 ## Bitwise builtin and operator failures
 
 `bit_and`, `bit_or`, `bit_xor`, `bit_not`, `bit_shl` and `bit_shr` now release
