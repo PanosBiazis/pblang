@@ -163,3 +163,32 @@ and after the change: 15 linked modules became 11. This is covered by
 `tests/semantics/module_cache_link_test.sapp`. It is distinct from the existing
 nested import in `zipfile.extract` that blocks that unrelated whole-program
 link route; this change neither modifies `zipfile` nor relaxes linker rejection.
+
+### Follow-up: do not report success after unconfirmed parent close
+
+Fault injection after the initial import optimization confirmed that the inherited
+facade ignored false close results. The cache adapter now attempts close once and
+requires a boolean `true`. False, nil, non-boolean and opaque close exceptions
+produce `ok:false, cleanup_uncertain:true`. A successful write also reports
+`publication_may_have_occurred:true`; callers must not infer rollback or blindly
+retry an effectful operation. A known primary error map and its extra fields are
+retained when cleanup also fails. Newly created parents are rejected when their
+first parent close cannot be verified. No shared LinuxDirFS or secure-file code
+was changed for this correction.
+
+Run `module_cache_file_check.py --group faults` with the same candidate/reference
+arguments to exercise the 15 fault scenarios. The fixture replaces exactly one
+import in private source copies with a deterministic backend model; it acquires
+no native descriptors. Actual descriptor-bound I/O and close-count checks remain
+in the separate parity/integration groups.
+
+Five injected unexpected backend exceptions still preserve the original
+exception and skip the adapter's subsequent parent close, as in the original
+facade. This remains open. PBLang catch currently exposes no original exception
+payload (`resource_scope.sapp` documents the same limit), and retrying effectful
+operations to reconstruct that exception is unsafe. This change verifies normal
+return/cleanup-failure handling; it does not claim generalized exception-safe
+cleanup, physical resource reclamation, or a closed whole-runtime ownership audit.
+The preceding timing table describes the initial specialization; subsequent
+cleanup changes require their own frozen measurement before using those numbers
+for the newer source revision.

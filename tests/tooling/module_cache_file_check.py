@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -16,12 +17,32 @@ SYMBOLS = ['free', 'close', 'dup', 'strdup', 'openat', 'mkdirat', 'unlinkat',
            'renameat', 'fchmod', 'fsync', 'memfd_create', 'sendfile', 'lseek', 'getpid', 'getuid']
 
 
+BACKEND_FIXTURE = r"""
+let state=map{mode:"",closes:0,created:false};
+fn configure(mode){state.mode=mode;}
+fn open(path,create=false,protect=false){
+ if path=="new" and not state.created{return map{ok:false};}
+ return map{ok:true,path:path};
+}
+fn open_absolute(path,create=false,protect=false){return open(path,create,protect);}
+fn private_root_status(fs){if state.mode=="policy-throw"{throw "injected-primary-policy";}return map{ok:true};}
+fn mkdir_new(fs,name,create=false){if state.mode=="mkdir-throw"{throw "injected-primary-mkdir";}state.created=true;return map{ok:true};}
+fn close(fs){state.closes=state.closes+1;print "close:"+str(state.closes);
+ if state.mode=="close-throw" or str_ends_with(state.mode,"close-throw"){throw "injected-close";}
+ if state.mode=="close-nil"{return nil;}if state.mode=="close-number"{return 1;}
+ if state.mode=="close-false" or (str_ends_with(state.mode,"close-false") and state.mode!="first-close-false") or (state.mode=="first-close-false" and state.closes==1){return false;}return true;}
+fn read_bytes(fs,name,limit){if state.mode=="read-throw"{throw "injected-primary-read";}if str_starts_with(state.mode,"read-error-"){return map{ok:false,error:"injected-known-primary",detail:7};}return map{ok:true,bytes:[65],size:1};}
+fn write_atomic(fs,name,bytes,create=false){if state.mode=="write-throw"{throw "injected-primary-write";}if str_starts_with(state.mode,"write-error-"){return map{ok:false,error:"injected-known-primary",detail:7};}return map{ok:true};}
+fn remove(fs,name){if state.mode=="remove-throw"{throw "injected-primary-remove";}if str_starts_with(state.mode,"remove-error-"){return map{ok:false,error:"injected-known-primary",detail:7};}return map{ok:true};}
+export configure,open,open_absolute,private_root_status,mkdir_new,close,read_bytes,write_atomic,remove;
+"""
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--candidate', type=Path, required=True)
     ap.add_argument('--reference', type=Path, required=True)
     ap.add_argument('--report', type=Path, required=True)
-    ap.add_argument('--group', choices=['parity', 'denials', 'integration'], required=True)
+    ap.add_argument('--group', choices=['parity', 'denials', 'integration', 'faults'], required=True)
     args = ap.parse_args()
     rows = []
     source_root = Path(__file__).resolve().parents[2]
@@ -35,7 +56,7 @@ def main():
         print(label, bool(passed), flush=True)
         assert passed, rows[-1]
 
-    def run(release, source, omit=None):
+    def run(release, source, omit=None, facade=None, backend=None):
         release = release.resolve()
         with tempfile.TemporaryDirectory(prefix='pblang-cache-io-') as tmp:
             root = Path(tmp)
@@ -57,6 +78,9 @@ def main():
                 +'\ncontent_hash_algorithm="pblang-package-tree-v2"\n[dependencies.stdlib]\npath='
                 +json.dumps(str(release/'stdlib'))+'\nsha256='+json.dumps(dep['sha256'])+'\n')
             (root/'main.sapp').write_text(source)
+            if facade is not None:
+                (root/'facade.sapp').write_text(facade)
+                (root/'backend.sapp').write_text(backend)
             box = ['bwrap', '--unshare-all', '--die-with-parent', '--clearenv']
             for d in ['/usr', '/bin', '/lib', '/lib64']:
                 box += ['--ro-bind', d, d]
@@ -101,11 +125,61 @@ def main():
             actual, _ = run(args.candidate, source, omitted)
             record('denied '+omitted, actual == expected and actual['exit'] == 0
                    and all(json.loads(line)['ok'] is False for line in actual['stdout'].splitlines()), result=actual)
-    else:
+    elif args.group == 'integration':
         source = (source_root/'tests/semantics/module_cache_test.sapp').read_text()
         for name, release in [('reference', args.reference), ('candidate', args.candidate)]:
             result, _ = run(release, source)
             record(name+' persistent cache integration', result['exit'] == 0 and result['stdout'] == 'module_cache_pass\n', result=result)
+
+    else:
+        # Replace exactly one import in a private copy of each complete facade.
+        # The model owns no native resources; actual I/O is tested separately.
+        backend = BACKEND_FIXTURE
+        cases = [('read-throw', 'read'), ('write-throw', 'write'), ('remove-throw', 'remove'),
+                 ('policy-throw', 'read'), ('mkdir-throw', 'create'),
+                 ('close-false', 'read'), ('close-false', 'write'), ('close-false', 'remove'),
+                 ('close-nil', 'read'), ('close-number', 'read'), ('close-throw', 'read'),
+                 ('first-close-false', 'create'), ('read-error-close-false', 'read'),
+                 ('write-error-close-throw', 'write'), ('remove-error-close-false', 'remove')]
+        for mode, operation in cases:
+            pair = []
+            for variant, release, filename in [('baseline', args.reference, 'stdlib/secure_file.sapp'),
+                                               ('candidate', args.candidate, 'stdlib/compiler/module_cache_file.sapp')]:
+                call = {'read': 'read_bytes("private/value",8)', 'write': 'write_atomic("private/value",[65])',
+                        'remove': 'remove("private/value")', 'create': 'write_atomic("new/value",[65])'}[operation]
+                if variant == 'baseline':
+                    call = call[:-1] + (',true)' if operation in ['read', 'remove'] else ',true,true)')
+                source = ('let B=import("backend.sapp");let C=import("facade.sapp");B.configure('
+                          + json.dumps(mode) + ');print json_stringify(C.' + call + ');')
+                facade = (release/filename).read_text()
+                needle = 'let LinuxDirFS = import("stdlib:linux_dirfs.sapp");'
+                assert facade.count(needle) == 1
+                result, _ = run(release, source, 'ffi',
+                                facade.replace(needle, 'let LinuxDirFS = import("backend.sapp");'), backend)
+                errors = re.findall(r'^error\[.*?\]: (.*)$', result['stderr'], re.M)
+                pair.append(dict(variant=variant, exit=result['exit'], stdout=result['stdout'],
+                                 error=errors[0] if errors else None))
+            before, after = pair
+            if mode in ['read-throw', 'write-throw', 'remove-throw', 'policy-throw', 'mkdir-throw']:
+                passed = (before['exit'] == after['exit'] == 1 and before['stdout'] == after['stdout'] == ''
+                          and before['error'] == after['error'] and before['error'].startswith('injected-primary-'))
+                record(mode + '/inherited-opaque-exception-limit', passed, results=pair,
+                       cleanup_fixed=False, limitation='backend exception still skips parent close; original diagnostic retained')
+            else:
+                assert after['exit'] == 0, after
+                value = json.loads(after['stdout'].splitlines()[-1])
+                passed = value['ok'] is False and value['cleanup_uncertain'] is True
+                if '-error-' in mode:
+                    passed = passed and value['error'] == 'injected-known-primary' and value['detail'] == 7
+                passed = passed and after['stdout'].count('close:') == 1
+                if mode.endswith('close-throw'):
+                    passed = passed and before['exit'] == 1 and before['error'] == 'injected-close'
+                elif '-error-' in mode:
+                    passed = passed and before['exit'] == 0 and json.loads(before['stdout'].splitlines()[-1])['error'] == value['error']
+                else:
+                    passed = passed and before['exit'] == 0 and json.loads(before['stdout'].splitlines()[-1])['ok'] is True
+                record(mode + '/' + operation, passed, results=pair, close_result_checked=True,
+                       native_release_verified=False)
 
 
 if __name__ == '__main__':
