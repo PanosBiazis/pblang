@@ -198,3 +198,8 @@ closers before export/use and close on synchronous catchable failure. Their
 benchmarks close seeds, warmups and samples outside the timed work. See the exact
 [migrated caller scope and reproduction](pbAI_Caller_Ownership.md); other legacy
 callers remain separate work.
+
+The separate terminal-close example now owns its seed and restored model as well
+as its reviewed handle. Registered closers cover synchronous export/use/acquisition
+failures without changing exported checkpoints or the explicit close demonstration.
+See [the cycle 19 caller migration](pbAI_Caller_Ownership.md).
