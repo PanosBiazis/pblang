@@ -1091,3 +1091,17 @@ quantized by the new keyboard helper.
 See `text_ratio_demo.sapp`, `tests/semantics/reader_text_ratio_test.sapp` and
 `tests/tooling/reader_text_ratio_native.py`. Native acceptance is Linux X11 only;
 these controls do not establish new mobile, Windows or macOS execution coverage.
+
+Long custom ratio labels remain readable in a 320px-wide Style panel. Values whose
+numeric string exceeds six characters display rounded to three decimal places,
+prefixed with `~` (for example `Scale: ~1.235 (Left/Right)`). Short existing labels
+remain unchanged. This is presentation only: configuration, draft values, Apply,
+Save and canonical profile reload retain the original precise number. Arrow keys
+still use that original number and the existing 0.05 stepping rules.
+
+The Scale/Spacing widgets retain the full numeric string in `accessibility_label`
+metadata for embedders. This does not add an operating-system screen-reader bridge.
+Run `ratio_label_demo.sapp` for a small customization example. Regression coverage
+is in `tests/semantics/reader_ratio_label_test.sapp` and
+`tests/tooling/reader_ratio_label_native.py`; the latter uses the real Linux launcher,
+canonical profile Save/restart, isolated synthetic data and native font measurements.
