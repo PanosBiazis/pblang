@@ -6,6 +6,25 @@ let LinuxDirFS = import("stdlib:linux_dirfs.sapp");
 let MAX_PATH = 4096;
 fn _error(message) { return map{ ok: false, error: message }; }
 
+// A close is attempted once. Failure or an opaque cleanup exception cannot
+// certify release; do not retry a potentially consumed native descriptor.
+fn _close_verified(fs) {
+    let closed = try LinuxDirFS.close(fs) catch false;
+    return type(closed) == "bool" and closed;
+}
+
+fn _finish(fs, result, publication = false) {
+    if _close_verified(fs) { return result; }
+    // Retain a known primary failure, including its publication/durability flags.
+    if type(result) == "map" and not (try result.ok catch false) {
+        result.cleanup_uncertain = true;
+        return result;
+    }
+    return map{ ok: false, error: "module cache parent cleanup could not be verified",
+        cleanup_uncertain: true, operation_completed: type(result) == "map" and (try result.ok catch false),
+        publication_may_have_occurred: publication };
+}
+
 fn _parts(path) {
     if type(path) != "string" or path == "" or len(path) > MAX_PATH
         or str_contains(path, strfromcharcode(0)) or str_ends_with(path, "/") {
@@ -36,7 +55,10 @@ fn _create_parent(path) {
     } else { LinuxDirFS.open(parts.parent, false, false) };
     if not parent.ok { return _error("private directory parent is unavailable"); }
     let created = LinuxDirFS.mkdir_new(parent, parts.name, false);
-    LinuxDirFS.close(parent);
+    if not _close_verified(parent) {
+        return map{ ok: false, error: "private directory parent cleanup could not be verified",
+            cleanup_uncertain: true };
+    }
     if type(created) != "map" or not created.ok {
         return _error("private directory must be newly created");
     }
@@ -45,7 +67,7 @@ fn _create_parent(path) {
     } else { LinuxDirFS.open(path, false, false) };
     if not fs.ok { return _error("new private directory cannot be reopened securely"); }
     let policy = LinuxDirFS.private_root_status(fs);
-    let closed = LinuxDirFS.close(fs);
+    let closed = _close_verified(fs);
     if type(policy) != "map" or not policy.ok or type(closed) != "bool" or not closed {
         return _error("private directory ownership or mode cannot be verified");
     }
@@ -59,15 +81,19 @@ fn _open_parent(path, create) {
         LinuxDirFS.open_absolute(parts.parent, false, false)
     } else { LinuxDirFS.open(parts.parent, false, false) };
     if not fs.ok and create {
-        if not _create_parent(parts.parent).ok { return _error("private parent must exist or be exclusively creatable"); }
+        let created = _create_parent(parts.parent);
+        if not created.ok {
+            let failed = _error("private parent must exist or be exclusively creatable");
+            if try created.cleanup_uncertain catch false { failed.cleanup_uncertain = true; }
+            return failed;
+        }
         fs = if parts.absolute {
             LinuxDirFS.open_absolute(parts.parent, false, false)
         } else { LinuxDirFS.open(parts.parent, false, false) };
     }
     if not fs.ok { return _error("private parent directory is unavailable"); }
     if not LinuxDirFS.private_root_status(fs).ok {
-        LinuxDirFS.close(fs);
-        return _error("private parent must already be current-user-owned mode 0700");
+        return _finish(fs, _error("private parent must already be current-user-owned mode 0700"));
     }
     return map{ ok: true, fs: fs, name: parts.name, private_parent_verified: true };
 }
@@ -79,7 +105,7 @@ fn read_bytes(path, max_bytes) {
     }
     let parent = _open_parent(path, false); if not parent.ok { return parent; }
     let result = LinuxDirFS.read_bytes(parent.fs, parent.name, max_bytes);
-    LinuxDirFS.close(parent.fs); return result;
+    return _finish(parent.fs, result);
 }
 
 fn read_text(path, max_bytes) {
@@ -94,7 +120,7 @@ fn write_atomic(path, bytes) {
     if type(bytes) != "array" { return _error("secure file bytes must be an array"); }
     let parent = _open_parent(path, true); if not parent.ok { return parent; }
     let result = LinuxDirFS.write_atomic(parent.fs, parent.name, bytes, false);
-    LinuxDirFS.close(parent.fs); return result;
+    return _finish(parent.fs, result, true);
 }
 
 fn write_text_atomic(path, text) {
@@ -106,7 +132,7 @@ fn remove(path) {
     if platform() != "linux" { return _error("module cache private files require Linux"); }
     let parent = _open_parent(path, false); if not parent.ok { return parent; }
     let result = LinuxDirFS.remove(parent.fs, parent.name);
-    LinuxDirFS.close(parent.fs); return result;
+    return _finish(parent.fs, result);
 }
 
 export read_bytes, read_text, write_atomic, write_text_atomic, remove;
