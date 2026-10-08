@@ -146,8 +146,9 @@ Method factories capture only a private state map. Close clears the model,
 baseline/candidate factors, base identity, context ledger and internal report
 reference. This establishes explicit reference removal and terminal methods,
 not physical allocator reclamation, zeroization, RSS reduction, or cleanup after
-OOM/hard termination. Ordinary neural training sessions still lack this explicit close operation;
-this is not a universal lifecycle fix. Distillation handles have their own
+OOM/hard termination. Ordinary neural training sessions now have an explicit
+[close contract](pbAI_Neural_Lifecycle.md#explicit-lifetime-and-failed-use-2026-10-08);
+legacy callers still need ownership migration. Distillation handles have their own
 [close contract](pbAI_Distillation_Contract.md#explicit-lifetime-and-failed-use-2026-10-08).
 
 `tests/semantics/pbai_continuation_close_test.sapp` exercises original saved methods,

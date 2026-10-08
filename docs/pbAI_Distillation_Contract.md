@@ -146,5 +146,6 @@ See [evidence](evidence/pbai_distillation_lifetime-2026-10-08.json).
 
 Explicit ownership removal is not proof of physical GC/reclamation, zeroization or
 RSS savings. The fixed numerical experiment does not establish AGI/ASI or all-device
-support. Plain neural training sessions still lack terminal close; older callers
-that discard these handles without closing them are not automatically migrated.
+support. Plain neural training sessions now have a separate
+[terminal close contract](pbAI_Neural_Lifecycle.md#explicit-lifetime-and-failed-use-2026-10-08).
+Older distillation/student callers that discard handles still require migration.
