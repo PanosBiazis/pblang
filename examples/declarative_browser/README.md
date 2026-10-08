@@ -1115,8 +1115,17 @@ Disabled/hidden controls and an externally changed document do not acquire a lin
 anchor from stale focus.
 
 Embedders should feed resize events through `App.update`, as demonstrated by
-`resize_focus_demo.sapp`. This behavior applies when the resulting reading layout
-is available; the existing "needs more space" fallback remains for unsupported
-text/viewport combinations. Direct manual form reconstruction is not a resize
+`resize_focus_demo.sapp`. The existing "needs more space" fallback remains for
+unsupported text/viewport combinations. Direct manual form reconstruction is not a resize
 event. Regression tests are `tests/semantics/reader_resize_focus_test.sapp` and
 `tests/tooling/reader_resize_focus_native.py`; native evidence is isolated Linux X11.
+
+If a resize temporarily makes a large-text layout unavailable, the Reader retains
+one validated link-focus target without focusing an invisible control. When the
+layout becomes available again, the same link regains focus. A new keydown, mouse
+press or scroll cancels that deferred target; passive mouse movement, key release
+and ticks do not. Style, explicit focus/page changes, document navigation and close
+also discard it. This transient state is controller-local and is never saved in
+an appearance profile. See `focus_recovery_demo.sapp`,
+`tests/semantics/reader_focus_recovery_test.sapp` and
+`tests/tooling/reader_focus_recovery_native.py` for recovery and cancellation flows.
