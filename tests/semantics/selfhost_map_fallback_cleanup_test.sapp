@@ -1,0 +1,54 @@
+// Map operator fallback preserves cleanup, dispatch precedence and operand effects.
+let V=import("stdlib:compiler/vm.sapp");let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let O=import("stdlib:compiler/optimizer.sapp");let P=import("stdlib:selfhost_pbck.sapp");
+fn compiled(source){let r=F.frontend_compile(source);assert(r.ok,"compile: "+str(r.diagnostics));return r.chunk;}
+let setup=compiled("memory_alloc(7);push_lifetime();borrow_immutable(1);memory_alloc(9);");
+fn prepare(owned){let ctx=V.execution_context(owned);V.run_seeded(setup,map{},ctx);return ctx;}
+fn run(code,bounded,ctx,g){if bounded {return V.run_seeded_bounded(code,g,nil,ctx);}return V.run_seeded(code,g,ctx);}
+fn variants(code){return [code,O.optimize_safe(code).chunk,P.deserialize_chunk(P.serialize_chunk(code))];}
+let operators=[["+","__add__","__radd__"],["-","__sub__","__rsub__"],["*","__mul__","__rmul__"],["/","__div__","__rdiv__"],["%","__mod__","__rmod__"],[">","__gt__","__lt__"],[">=","__ge__","__le__"],["<","__lt__","__gt__"],["<=","__le__","__ge__"]];
+let handler=compiled("print memory_get(1);");
+for spec in operators {
+ let op=spec[0];let fnames=[spec[1],spec[2]];
+ for args in ["map{},2","2,map{}","map{},map{}"] {
+  let code=compiled("fn apply(a,b){return a"+op+"b;}apply("+args+");");
+  for variant in variants(code) {for bounded in [false,true] {
+   for owned in [false,true] {
+    let ctx=prepare(owned);let memory=ctx.memory;
+    assert((try {run(variant,bounded,ctx,map{});false} catch true),"map fallback rejects");
+    assert(memory.closed==owned and ctx.handlers==0,"ownership respected");
+    if owned {assert(ctx.memory==nil and memory.reclaimed==2 and len(memory.owners)==0 and len(memory.borrows)==0,"two lifetimes released");}
+    else {assert(ctx.memory==memory and len(memory.owners)==2 and len(memory.borrows)==1,"borrowed context remains live");}
+    V.close_execution(ctx);V.close_execution(ctx);assert(memory.reclaimed==2,"close idempotent");
+   }
+   let ctx=prepare(true);let memory=ctx.memory;
+   let caught=map{constants:[map{try_chunk:variant,catch_chunk:handler}],instructions:[map{op:35,operand:0}]};
+   assert(run(caught,bounded,ctx,map{}).output==[7] and not memory.closed and ctx.handlers==0,"actual guest catch retains memory");V.close_execution(ctx);
+  }}
+ }
+ // Neither operand is re-evaluated, including optimized and serialized routes.
+ let effects=compiled("let calls=[];fn left(){array_push(calls,1);return map{};}fn right(){array_push(calls,2);return 2;}left()"+op+"right();");
+ for variant in variants(effects) {for bounded in [false,true] {let ctx=prepare(true);let g=map{};assert((try {run(variant,bounded,ctx,g);false} catch true) and g.calls==[1,2] and ctx.memory==nil,"operands once in order");}}
+ // Forward, reflected and inherited methods may return nil or false. They run once.
+ for side in [0,1] {for result in ["nil","false"] {
+  let expr=if side==0 {"a"+op+"2"} else {"2"+op+"a"};
+  let source="let calls=[];fn method(self,other){array_push(calls,other);return "+result+";}let a=map{__class:map{"+fnames[side]+":method}};print "+expr+";print calls;print memory_get(1);";
+  for variant in variants(compiled(source)) {let ctx=prepare(true);let expected=if result=="nil" {nil} else {false};assert(run(variant,true,ctx,map{}).output==[expected,[2],7] and not ctx.memory.closed,"overload result and memory preserved");V.close_execution(ctx);}
+ }}
+ // A present forward method wins; failure does not try the reflected method.
+ let throwing=compiled("let calls=[];fn forward(a,b){array_push(calls,1);throw 42;}fn reflected(a,b){array_push(calls,2);return 9;}let a=map{"+fnames[0]+":forward};let b=map{"+fnames[1]+":reflected};a"+op+"b;");
+ let throw_ctx=prepare(true);let g=map{};assert((try {run(throwing,true,throw_ctx,g);false} catch true) and g.calls==[1] and throw_ctx.memory==nil,"throwing method once without reflection");
+ // nil/missing methods and cyclic/malformed class parents keep bounded lookup.
+ for target in ["map{"+fnames[0]+":nil}","map{__class:nil}","map{__class:map{}}"] {
+  let ctx=prepare(true);assert((try {run(compiled("let a="+target+";a"+op+"2;"),true,ctx,map{});false} catch true) and ctx.memory==nil,"missing method cleanup");
+ }
+ let cyclic=compiled("let a=map{};a.__class=a;a"+op+"2;");let cycle_ctx=prepare(true);assert((try {run(cyclic,true,cycle_ctx,map{});false} catch true) and cycle_ctx.memory==nil,"cyclic class lookup bounded");
+ let fault_ctx=prepare(true);let fault_memory=fault_ctx.memory;fault_memory.reclaimed=map{};
+ assert((try {run(effects,false,fault_ctx,map{});false} catch true),"cleanup fault retains primary failure");fault_memory.reclaimed=0;V.close_execution(fault_ctx);assert(fault_memory.closed,"corrupt fixture restored");
+}
+// Equality has a valid structural fallback and must never close live state.
+let equality=compiled("print map{x:1}==map{x:1};print map{x:1}!=map{x:2};print 2+3;print 7-2;print 3*4;print 8/2;print 7%2;print bigint(7)+bigint(2);print rational(1,2)+rational(1,2);print decimal(2)+decimal(3);");
+for variant in variants(equality) {let ctx=prepare(true);assert(run(variant,true,ctx,map{}).output==[true,true,5,5,12,4,1,bigint(9),rational(1,1),decimal(5)] and not ctx.memory.closed,"valid arithmetic and equality");V.close_execution(ctx);}
+let late=compiled("memory_alloc(3);let a=map{};print try a+2 catch memory_get(1);a-2;");let ctx=V.execution_context(true);assert((try {run(late,true,ctx,map{});false} catch true) and ctx.memory==nil and ctx.handlers==0,"late memory cleanup");
+let nested=compiled("let a=map{};try a+2 catch a<2;");let nested_ctx=prepare(true);assert((try {run(nested,true,nested_ctx,map{});false} catch true) and nested_ctx.memory==nil and nested_ctx.handlers==0,"failing guest catch cleans");
+print "selfhost_map_fallback_cleanup_pass";
