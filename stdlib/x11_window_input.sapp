@@ -1,0 +1,150 @@
+let _KEY_NAMES=map{"BackSpace":"Backspace","Return":"Enter","KP_Enter":"Enter","space":"Space","Shift_L":"LeftShift","Shift_R":"RightShift","Control_L":"LeftCtrl","Control_R":"RightCtrl","Alt_L":"LeftAlt","Alt_R":"RightAlt","Super_L":"LeftSuper","Super_R":"RightSuper","Prior":"PageUp","Next":"PageDown","equal":"Equal","minus":"Minus","KP_Insert":"NumPad0","KP_End":"NumPad1","KP_Down":"NumPad2","KP_Next":"NumPad3","KP_Left":"NumPad4","KP_Begin":"NumPad5","KP_Right":"NumPad6","KP_Home":"NumPad7","KP_Up":"NumPad8","KP_Prior":"NumPad9","KP_Delete":"NumPadDot"};
+
+// Optional ordered input for an owned minifb window, Linux x86_64 X11 only.
+// No injection, root keyboard subscription, process execution or native callback.
+// LP64 layouts are from Xlib.h, xcbext.h and xproto.h. FFI calls have <=4 args.
+// The bounded XCB GetProperty request avoids Xlib's fatal BadWindow handler when
+// an unrelated window disappears during the short creation-notification phase.
+fn _call(lib,name,args) {
+    let sig="";let i=0;while i<len(args) {if sig!="" {sig=sig+",";}sig=sig+"i64";i=i+1;}
+    return ffi_call_typed(lib,name,sig+"->i64",args);
+}
+fn _free(s,p) {if p!=0 {ffi_call_typed(s.c,"free","ptr->void",[p]);}}
+fn _word(bytes,offset,count) {
+    let value=0;let scale=1;for i in range(0,count) {value=value+bytes[offset+i]*scale;scale=scale*256;}return value;
+}
+fn _put(bytes,offset,count,value) {for i in range(0,count) {bytes[offset+i]=value%256;value=num_floor(value/256);}}
+fn _snapshot(s,p,count) {
+    assert(count>=0 and count<=192,"X11 input snapshot bound");
+    assert(_call(s.c,"ftruncate",[s.fd,0])==0 and _call(s.c,"lseek",[s.fd,0,0])==0,"X11 input snapshot reset");
+    assert(_call(s.c,"write",[s.fd,p,count])==count,"X11 input snapshot write");
+    let bytes=fs_read_bytes("/proc/self/fd/"+str(s.fd));assert(len(bytes)==count,"X11 input snapshot read");return bytes;
+}
+fn _owned_name(s,id) {
+    // 24-byte descriptor, two reserved iovecs, one iovec, 24-byte request.
+    let bytes=[];while len(bytes)<96 {push(bytes,0);}
+    _put(bytes,0,8,1);_put(bytes,16,1,20); // one vector; core GetProperty
+    _put(bytes,56,8,s.buffer+328);_put(bytes,64,8,24);
+    _put(bytes,76,4,id);_put(bytes,80,4,39);_put(bytes,92,4,16); // WM_NAME, max 64 bytes
+    fs_write_bytes("/proc/self/fd/"+str(s.fd),bytes);
+    assert(_call(s.c,"lseek",[s.fd,0,0])==0 and _call(s.c,"read",[s.fd,s.buffer+256,96])==96,"X11 identity request");
+    let cookie=_call(s.cb,"xcb_send_request",[s.connection,1,s.buffer+312,s.buffer+256]);
+    if cookie==0 {return false;}
+    let reply=_call(s.cb,"xcb_wait_for_reply",[s.connection,cookie,0]);if reply==0 {return false;}
+    let matches=try _read_name(s,reply) catch nil;
+    _free(s,reply);assert(matches!=nil,"X11 identity read");return matches;
+}
+fn _read_name(s,reply) {
+    let head=_snapshot(s,reply,32);
+    if head[0]!=1 or head[1]!=8 or _word(head,12,4)!=0 or _word(head,16,4)!=len(s.nonce) {return false;}
+    let name="";for byte in _snapshot(s,reply+32,len(s.nonce)) {name=name+strfromcharcode(byte);}
+    return name==s.nonce;
+}
+
+fn close(s) {
+    if s==nil or s.closed {return true;}s.closed=true;let ok=true;
+    if s.connection!=0 {if not (try {ffi_call_typed(s.cb,"xcb_disconnect","ptr->void",[s.connection]);true} catch false) {ok=false;}s.connection=0;}
+    if s.display!=0 {if not (try {_call(s.x,"XCloseDisplay",[s.display]);true} catch false) {ok=false;}s.display=0;}
+    if s.fd>=0 {if not (try {_call(s.c,"close",[s.fd])==0} catch false) {ok=false;}s.fd=-1;}
+    if s.buffer!=0 {if not (try {_free(s,s.buffer);true} catch false) {ok=false;}s.buffer=0;}
+    for lib in [s.k,s.cb,s.x,s.c] {if lib!=nil {if not (try {ffi_close(lib);true} catch false) {ok=false;}}}
+    s.pressed=map{};return ok;
+}
+fn open(title) {
+    // ASCII titles preserve the old WM_NAME fallback exactly. Other titles,
+    // platforms, permissions and missing libraries keep the existing backend.
+    if platform()!="linux" or type(title)!="string" or len(title)>128 {return nil;}
+    for i in range(0,len(title)) {let cp=strcharcodeat(title,i);if cp<32 or cp>126 {return nil;}}
+    let display=try env_get("DISPLAY") catch nil;
+    if type(display)!="string" or not str_starts_with(display,":") {return nil;}
+    let s=map{x:nil,c:nil,k:nil,cb:nil,connection:0,display:0,buffer:0,fd:-1,window:0,closed:false,pressed:map{},nonce:""};
+    let ok=try _open_owned(s) catch false;
+    if not ok {assert(close(s),"X11 input initialization cleanup failed");return nil;}return s;
+}
+fn _open_owned(s) {
+        s.c=ffi_load("/usr/lib/x86_64-linux-gnu/libc.so.6");
+        s.x=ffi_load("/usr/lib/x86_64-linux-gnu/libX11.so.6");
+        s.cb=ffi_load("/usr/lib/x86_64-linux-gnu/libxcb.so.1");
+        s.k=ffi_load("/usr/lib/x86_64-linux-gnu/libxkbcommon.so.0");
+        _free(s,0);ffi_call_typed(s.c,"free","ptr->void",[0]);_call(s.c,"close",[-1]);
+        assert(_call(s.x,"XInitThreads",[])!=0,"X11 threads");
+        s.display=_call(s.x,"XOpenDisplay",[0]);assert(s.display>0,"X11 display");
+        s.buffer=_call(s.c,"calloc",[1,512]);assert(s.buffer>0 and s.buffer<9007199254740480,"X11 input allocation");
+        s.fd=ffi_call_typed(s.c,"memfd_create","string,i32->i64",["pblang-window-input",1]);
+        if s.fd>=2147483648 {s.fd=-1;}assert(s.fd>=0,"X11 input memory descriptor");
+        assert(_call(s.c,"fchmod",[s.fd,384])==0,"X11 input private descriptor");
+        s.connection=_call(s.cb,"xcb_connect",[0,0]);assert(s.connection>0 and _call(s.cb,"xcb_connection_has_error",[s.connection])==0,"X11 identity connection");
+        s.root=_call(s.x,"XDefaultRootWindow",[s.display]);
+        s.nonce="pblang-owned-"+str_slice(sha256(base64_encode_bytes(random_bytes(24))),0,40);
+        _call(s.x,"XSelectInput",[s.display,s.root,524288]); // creation metadata ONLY
+        _call(s.x,"XSync",[s.display,0]);return true;
+}
+fn bind(s,title) {
+    let ok=try _bind_owned(s,title) catch false;
+    if not ok {assert(close(s),"X11 input binding cleanup failed");}return ok;
+}
+fn _bind_owned(s,title) {
+        _call(s.x,"XSync",[s.display,0]);let count=0;
+        while count<256 and _call(s.x,"XPending",[s.display])>0 {
+            _call(s.x,"XNextEvent",[s.display,s.buffer]);let data=_snapshot(s,s.buffer,192);count=count+1;
+            if _word(data,0,4)==16 and _word(data,32,8)==s.root {
+                let id=_word(data,40,8);if _owned_name(s,id) {assert(s.window==0,"Ambiguous X11 identity");s.window=id;}
+            }
+        }
+        _call(s.x,"XSelectInput",[s.display,s.root,0]);
+        assert(s.window!=0 and _call(s.x,"XPending",[s.display])==0,"Owned X11 window unavailable");
+        ffi_call_typed(s.cb,"xcb_disconnect","ptr->void",[s.connection]);s.connection=0;
+        // Restore the ordinary title. ASCII-only admission preserves WM fallback.
+        let text=ffi_call_typed(s.c,"strdup","string->ptr",[title]);assert(text>0,"X11 title allocation");
+        let renamed=try {_call(s.x,"XStoreName",[s.display,s.window,text]);true} catch false;_free(s,text);assert(renamed,"X11 title restore");
+        let name=ffi_call_typed(s.c,"strdup","string->ptr",["_NET_WM_NAME"]);assert(name>0,"X11 atom allocation");
+        let atom=0;let interned=try {atom=_call(s.x,"XInternAtom",[s.display,name,0]);true} catch false;_free(s,name);assert(interned and atom!=0,"X11 title atom");
+        _call(s.x,"XDeleteProperty",[s.display,s.window,atom]);
+        _call(s.x,"XkbSetDetectableAutoRepeat",[s.display,1,s.buffer]);
+        _call(s.x,"XSelectInput",[s.display,s.window,2097155]); // own KeyPress/Release + focus
+        _call(s.x,"XSync",[s.display,0]);return true;
+}
+fn _key(s,sym,code) {
+
+    let name=ffi_call_typed(s.x,"XKeysymToString","i64->string",[sym]);
+    if type(name)=="string" and map_has(_KEY_NAMES,name) {return _KEY_NAMES[name];}
+    let cp=_call(s.k,"xkb_keysym_to_utf32",[sym]);
+    if cp>=97 and cp<=122 {return strfromcharcode(cp-32);}
+    if cp>=32 and cp<=126 {return strfromcharcode(cp);}
+    if type(name)=="string" and name!="" {return name;}
+    return "X11Key"+str(code);
+}
+fn poll(s) {
+    if s==nil or s.closed {return [];}let events=[];let count=0;
+    while count<64 and _call(s.x,"XPending",[s.display])>0 {
+        _call(s.x,"XNextEvent",[s.display,s.buffer]);let data=_snapshot(s,s.buffer,192);count=count+1;
+        let kind=_word(data,0,4);
+        if kind==34 {_call(s.x,"XRefreshKeyboardMapping",[s.buffer]);}
+        if _word(data,32,8)==s.window {
+            if kind==10 {
+                for code in map_keys(s.pressed) {push(events,map{type:"keyup",key:s.pressed[code],shift:false,ctrl:false,alt:false,meta:false});}
+                s.pressed=map{};
+            } elif (kind==2 or kind==3) and _word(data,16,4)==0 {
+                let state=_word(data,80,4);let code=_word(data,84,4);
+                if code<8 or code>255 {continue;}let id=str(code);
+                let group=num_floor(state/8192)%4;let shift=state%2==1;
+                let base_sym=_call(s.x,"XkbKeycodeToKeysym",[s.display,code,group,0]);
+                let level=if shift {1} else {0};
+                if base_sym>=65429 and base_sym<=65439 and num_floor(state/16)%2==1 {level=if shift {0} else {1};}
+                let sym=_call(s.x,"XkbKeycodeToKeysym",[s.display,code,group,level]);
+                if num_floor(state/2)%2==1 {sym=_call(s.k,if shift {"xkb_keysym_to_lower"} else {"xkb_keysym_to_upper"},[sym]);}
+                let key=try s.pressed[id] catch nil;
+                if key==nil {key=_key(s,base_sym,code);}
+                let ctrl=num_floor(state/4)%2==1;let alt=num_floor(state/8)%2==1;let meta=num_floor(state/64)%2==1;
+                let event=map{type:if kind==2 {"keydown"} else {"keyup"},key:key,shift:shift,ctrl:ctrl,alt:alt,meta:meta};
+                if kind==2 {
+                    s.pressed[id]=key;let cp=_call(s.k,"xkb_keysym_to_utf32",[sym]);
+                    event.text=if not ctrl and not meta and not alt and num_floor(state/128)%2==0 and cp>=32 and cp<=1114111 and not (cp>=127 and cp<=159) and not (cp>=55296 and cp<=57343) {strfromcharcode(cp)} else {""};
+                } elif map_has(s.pressed,id) {map_remove(s.pressed,id);}
+                push(events,event);
+            }
+        }
+    }
+    return events;
+}
+export open,bind,poll,close;
