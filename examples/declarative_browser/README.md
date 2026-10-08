@@ -1162,3 +1162,20 @@ This does not establish IME/dead-key/AltGr composition or native validation on
 Windows, macOS, Android or iOS. The Reader remains a document viewer; editable
 Greek save/readback acceptance is exercised in the shared GUI fixtures, while
 Reader acceptance checks its real shortcuts, explicit profile Save and restart.
+
+### Headless startup
+
+The built-in documents live in `pages.sapp`; `App.pages()` remains available and
+returns the same fresh map. The public `--check` still creates a local session,
+follows a link, returns through history, and checks a document roundtrip. It now
+loads the presentation controller only for GUI modes, so headless checks and
+HTML export avoid initializing unused window/view modules. Web and Android
+previews still load their existing view adapters when requested. Packaging keeps
+all literal-imported GUI modules, including imports in conditional branches.
+
+`tests/semantics/reader_pages_test.sapp` checks content and fresh-map compatibility.
+`tests/tooling/reader_headless_startup.py --package PATH --evidence NEW_PATH`
+checks the standalone launcher with source hidden and private presentation/link
+faults. The GUI must still load its presentation code, and a wrong navigation
+link must still fail the headless check. These are startup checks, not GUI frame
+rate, device execution, or universal memory-reclamation measurements.
