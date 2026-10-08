@@ -108,3 +108,5 @@ wrong teacher in the hard-only endpoint.
 
 For close semantics, detached exports and cleanup after failed use, see the
 [shared lifetime contract](pbAI_Distillation_Contract.md#explicit-lifetime-and-failed-use-2026-10-08).
+
+The runnable supervised example now closes its student after catchable evaluation failure as well as success, with unchanged training and output. See [caller ownership and regression evidence](pbAI_Caller_Ownership.md#tool-and-distillation-examples-cycle-20).

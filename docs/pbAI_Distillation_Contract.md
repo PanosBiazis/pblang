@@ -149,3 +149,5 @@ RSS savings. The fixed numerical experiment does not establish AGI/ASI or all-de
 support. Plain neural training sessions now have a separate
 [terminal close contract](pbAI_Neural_Lifecycle.md#explicit-lifetime-and-failed-use-2026-10-08).
 Older distillation/student callers that discard handles still require migration.
+
+The original soft-only and supervised runnable examples now register cleanup before evaluation/prediction while retaining successful explicit closes and exact numerical stdout. See [caller ownership and regression evidence](pbAI_Caller_Ownership.md#tool-and-distillation-examples-cycle-20).

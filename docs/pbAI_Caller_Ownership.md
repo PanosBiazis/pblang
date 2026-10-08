@@ -89,7 +89,7 @@ these instrumented observations.
 
 See [the scoped evidence](evidence/pbai_caller_ownership-2026-10-08.json).
 Other callers, including legacy file-origin measurements, the separate checkpoint-file
-write/read example and tool examples, still require individual ownership assessment.
+write/read example, still require individual ownership assessment.
 Existing historical benchmark evidence is not rewritten.
 
 ## Review close and reviewed-reload preparation (cycle 19)
@@ -142,3 +142,53 @@ review-error compatibility. No model algorithm or handle API is changed.
 See [cycle 19 evidence](evidence/pbai_remaining_caller_ownership-2026-10-08.json).
 The observer retains aliases and demonstrates explicit closure only, not physical
 memory release, zeroization, hard-kill recovery or universal device support.
+
+## Tool and distillation examples (cycle 20)
+
+Three additional callers now register owned handles before using them:
+
+- `pbai_student_tools.sapp` owns its checkpoint-producing seed and independently
+  loaded active model. The seed closes immediately after detached export; both
+  captured closers are registered before later operations can fail. The batch
+  provider continues to own its separate private loaded handle. Its prediction
+  worker borrows that handle and does not acquire caller ownership.
+- `pbai_neural_distillation.sapp` and
+  `pbai_specialist_supervised_distillation.sapp` register their student's close
+  method before evaluation or prediction. Their explicit successful closes remain;
+  scope exit safely tolerates an already-closed bundled handle.
+
+These files are in PBLang's `examples/` and standalone pbAI's `demo/`. Teacher
+training returns a detached artifact/report, not another closeable handle.
+Successful stdout is byte-for-byte unchanged across both products. On catchable
+failure, `resource_scope` attempts the captured cleanups before the final assertion
+reports workflow failure; the retained catch mechanism does not preserve raw
+exception text. There is no returned handle when construction fails.
+
+```sh
+python3 tests/tooling/pbai_caller_lifetime.py --product pblang --target tools
+python3 tests/tooling/pbai_caller_lifetime.py --product pblang --target distillation
+python3 tests/tooling/pbai_caller_lifetime.py --product pblang --target supervised
+```
+
+Use `--product pbai` from the sibling standalone checkout, with the same trusted
+`PBLANG_BIN` setup above. These are example-only targets. They run with net, http,
+exec, ffi, spawn, gfx and sqlite explicitly denied. The Python test driver creates
+and builds the private copied fixtures; the example process needs no process or
+FFI grant. Older file-backed observer profiles are unaffected.
+
+The cases cover success, detached-export failure, invalid active prediction,
+later acquisition failure, a private tool prediction failure returned as the
+existing error envelope, soft evaluation/prediction failures, supervised evaluation
+failure, initial constructor rejection and recovery. The tool-error case checks
+that the provider closed its private handle and the caller can continue. Every
+case keeps an independently owned model and its checkpoint unchanged.
+
+Across both products, 30 cases per phase observe 40 actual acquired handles.
+Before migration 20 were still usable at observation time; afterwards none were,
+and all 40 had exactly one successful first close before diagnostic cleanup.
+Original method aliases, detached-export digests and partial/successful outputs
+are compared. Six direct executions per phase independently preserve exact stdout.
+See [cycle 20 evidence](evidence/pbai_tool_distill_caller_ownership-2026-10-08.json).
+This proves explicit cleanup for these callers; it does not establish physical RAM
+reclamation, zeroization, performance gains, AGI/ASI or universal platform support.
+Other test/benchmark callers and file workflows remain individually scoped work.
