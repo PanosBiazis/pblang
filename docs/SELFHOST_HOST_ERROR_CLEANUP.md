@@ -48,6 +48,34 @@ It attempts cleanup before the original access rejects, without replacing that
 access's message. Valid legacy raw function constants still run. This does not
 validate every arbitrary malformed VM descriptor.
 
+## Missing map operator fallback
+
+Arithmetic and ordering with a map operand now close opted-in private memory
+when neither forward nor reflected method supplies a value: `+`, `-`, `*`, `/`,
+`%`, `>`, `>=`, `<`, `<=`. Previously, `map{} + 2` or `2 < map{}` could leave
+allocations and borrows live after the host rejected the operation.
+
+Cleanup occurs only after both existing method lookups fall through, immediately
+before the unchanged rejecting host primitive. A map is neither a numeric value
+nor a string; this fallback cannot succeed. The primitive runs once. Methods that
+were found return through the existing dispatch first, including nil/false
+results, forward precedence, reflected and inherited methods. Operand expressions
+and callbacks are never replayed. Equality/inequality retain their valid structural
+fallback and do not use this guard. The existing 32-table class lookup bound and
+nil-method behavior remain unchanged; this is not a dispatch redesign.
+
+Private unhandled contexts close, actual guest catches retain usable memory, and
+borrowed contexts remain caller-owned. Secondary cleanup failure cannot replace
+the original host error. Corrupt private metadata, arbitrary callback/FFI errors,
+abort/OOM and physical RSS reclamation remain outside this guarantee.
+
+`tests/semantics/selfhost_map_fallback_cleanup_test.sapp` exercises all nine
+operators, both operand positions, both maps, two lifetimes/borrows, catches,
+side effects, dispatch, class chains, equality and plain/optimized/PBCS routes.
+The diagnostic driver provides `--map-fallback --reference PREVIOUS_RELEASE`.
+`examples/selfhost_throw_cleanup/map_fallback.sapp` is a small installation probe.
+No speedup is claimed and previous conversion/async costs remain unresolved.
+
 ## Strict numeric builtins
 
 `num_floor`, `num_ceil`, `num_abs`, `num_sqrt`, `num_ln`, `num_exp`,

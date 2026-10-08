@@ -24,6 +24,7 @@ def main():
     ap.add_argument('--bitwise', action='store_true')
     ap.add_argument('--conversions', action='store_true')
     ap.add_argument('--slices', action='store_true')
+    ap.add_argument('--map-fallback', action='store_true')
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--count', type=int, default=3)
     a = ap.parse_args()
@@ -171,6 +172,18 @@ def main():
             cases = [(e,e+';',False) for e in exprs]
             cases += [('valid-slices','print str_slice("α🙂β",1,2);print str_slice("abc",0,num_exp(1000));print str_slice("abc",2,1);print str_slice("abc",0.9,2.9);print slice([1,2,3],1,nil);print slice("α🙂β",nil,2);print slice([1,2],8,9);let a=[1,2,3];print a[..];print a[1..];print a[..2];print a[1..2];',True),('caught-slices','print try call3(str_slice,"a",nil,1) catch memory_get(1);print try call3(slice,[1],-1,nil) catch memory_get(1);',True)]
             cases = [(label,'fn call3(f,a,b,c){return f(a,b,c);}'+source,valid) for label,source,valid in cases]
+        if a.map_fallback:
+            assert a.reference, '--reference is required for map fallback diagnostics'
+            cases = [(op + '/' + values, 'fn apply(a,b){return a' + op + 'b;}apply(' + values + ');', False)
+                     for op in ['+', '-', '*', '/', '%', '>', '>=', '<', '<=']
+                     for values in ['map{},2', '2,map{}']]
+            cases += [('nil-method', 'let a=map{__add__:nil};a+2;', False),
+                      ('class-missing', 'let a=map{__class:map{}};a<2;', False),
+                      ('valid-overloads', 'let a=map{__add__:fn(s,b){return nil;}};print a+2;'
+                       'let b=map{__rsub__:fn(s,a){return false;}};print 2-b;'
+                       'let c=map{__class:map{__lt__:fn(s,b){return 7;}}};print c<2;'
+                       'print map{x:1}==map{x:1};print map{x:1}!=map{x:2};', True),
+                      ('caught-fallback', 'let a=map{};print try a+2 catch memory_get(1);', True)]
         for label, source, valid in cases[a.start:a.start + a.count]:
             if a.reference:
                 expected = run(prefix + 'let c=V.execution_context(true);V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk,map{},c);'
