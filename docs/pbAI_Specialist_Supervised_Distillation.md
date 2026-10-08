@@ -57,7 +57,7 @@ validation does not replace the specialist's fixed-shape boundary.
 ## Results, privacy and interpretation
 
 The handle exposes `report`, `predict(ids)`, diagnostic `evaluate(examples)` and
-explicit `checkpoint()`. Training retains private in-memory weights; optional
+explicit `checkpoint()` plus terminal, idempotent `close()`. Training retains private in-memory weights; optional
 [checkpoint export and file persistence](pbAI_Student_Checkpoints.md) are separate
 caller-invoked operations, with no activation. Returned objects and later mutations of inputs cannot change them.
 Training adds no file writes, network calls, chat ingestion, registry changes or
@@ -105,3 +105,6 @@ and quality metrics across all repeated runs. These results do not support a
 general accuracy improvement or selecting the mixed objective as superior. A
 separate regression fixture verifies that explicit labels can correct a deliberately
 wrong teacher in the hard-only endpoint.
+
+For close semantics, detached exports and cleanup after failed use, see the
+[shared lifetime contract](pbAI_Distillation_Contract.md#explicit-lifetime-and-failed-use-2026-10-08).
