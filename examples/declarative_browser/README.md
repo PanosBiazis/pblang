@@ -1105,3 +1105,18 @@ Run `ratio_label_demo.sapp` for a small customization example. Regression covera
 is in `tests/semantics/reader_ratio_label_test.sapp` and
 `tests/tooling/reader_ratio_label_native.py`; the latter uses the real Linux launcher,
 canonical profile Save/restart, isolated synthetic data and native font measurements.
+
+When a document link has keyboard focus, native resize events keep its action on
+the visible reading page. The Reader uses the existing typed link anchor when the
+viewport changes, so Enter can still open the selected destination at 320×240.
+Resizing alone never follows the link. Ordinary reading positions, toolbar focus,
+Style focus and explicit Page Up/Down/Home/End navigation keep their existing rules.
+Disabled/hidden controls and an externally changed document do not acquire a link
+anchor from stale focus.
+
+Embedders should feed resize events through `App.update`, as demonstrated by
+`resize_focus_demo.sapp`. This behavior applies when the resulting reading layout
+is available; the existing "needs more space" fallback remains for unsupported
+text/viewport combinations. Direct manual form reconstruction is not a resize
+event. Regression tests are `tests/semantics/reader_resize_focus_test.sapp` and
+`tests/tooling/reader_resize_focus_native.py`; native evidence is isolated Linux X11.
