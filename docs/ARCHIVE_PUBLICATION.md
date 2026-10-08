@@ -4,6 +4,8 @@
 It publishes a caller-supplied ZIP byte array to one new `.zip` path. It never
 extracts members, walks directories, replaces an existing name or creates parents.
 The existing `secure_archive` computation API remains effect-free.
+The additional `extract_member` entry point is documented in
+[selected-member extraction](ARCHIVE_EXTRACTION.md); `save` retains its ZIP-only contract.
 
 ```pblang
 let Archive = import("stdlib:secure_archive.sapp");
