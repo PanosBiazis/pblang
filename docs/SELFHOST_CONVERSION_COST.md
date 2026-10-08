@@ -88,3 +88,78 @@ receipts, measuring scripts, frozen contracts and host context privately.
 
 For automatic cleanup contracts and remaining host/FFI limits, see
 [SELFHOST_HOST_ERROR_CLEANUP.md](SELFHOST_HOST_ERROR_CLEANUP.md).
+
+## Narrow module-cache dependency (cycle22)
+
+The full frontend imports `compiler/module_cache.sapp` even when a caller only
+compiles source. Previously that cache imported `secure_file.sapp`, pulling in
+its Linux, macOS, Windows and SHA-256 modules. The cache only called five of its
+private-parent operations, and only on Linux.
+
+`compiler/module_cache_file.sapp` now specializes that internal contract using
+`linux_dirfs.sapp`. Its imports remain literal top-level declarations, preserving
+module origin and the source inliner's existing import rules. Package resolution
+and complete locked dependency-tree verification are unchanged; no trusted-path
+shortcut or cross-process validation cache was added. The helper is part of the
+cache's default toolchain revision, so upgrading it invalidates old entries.
+
+The helper always requires a current-user-owned mode-0700 parent. Creation is
+exclusive, only one missing parent component is admitted, each component is
+opened without following links, reads retain the bounded descriptor snapshot,
+and writes retain staged fsync/rename/parent-fsync publication. It never changes
+an existing parent's mode or falls back to ordinary path I/O. Atomic replacement
+of an existing final symlink or hard link replaces that directory entry without
+writing through it; this remains a replaceable cache, not a no-overwrite archive.
+Non-Linux module-cache branches and the general secure-file library are unchanged.
+
+The intentionally small specialization duplicates the five-operation private
+contract; changes to that contract must update the differential tests and both
+implementations. This does not add exception-safe cleanup to the underlying
+LinuxDirFS operations or repair the existing non-Linux post-read quota limitation.
+
+Qualification (prepared Linux releases, disposable source-hidden fixtures):
+
+```sh
+python3 tests/tooling/module_cache_file_check.py --candidate /path/to/candidate \
+  --reference /path/to/reference --report parity.json --group parity
+python3 tests/tooling/module_cache_file_check.py --candidate /path/to/candidate \
+  --reference /path/to/reference --report denials.json --group denials
+python3 tests/tooling/module_cache_file_check.py --candidate /path/to/candidate \
+  --reference /path/to/reference --report integration.json --group integration
+```
+
+These checks compare full structured results with the previous secure-file path,
+exercise UTF-8 byte boundaries, malformed paths/limits, missing and non-private
+parents, symlinks, hard links, FIFOs, repeated descriptor closure, denied FFI
+capabilities, cold/warm cache use, corruption, and source invalidation. The tests
+use explicit existing libc symbols and retain the existing `stat` subprocess
+policy checks; this change does not claim an exec-free persistent cache.
+
+The isolated cycle22 comparison retained the active `942d13f77be4` payload and
+native binary, changing only the cache module/helper and regenerated lock
+(plus the new qualification fixtures in the candidate). All 26 invocations
+passed: two warmups and 11 measured samples per variant, alternating AB/BA.
+Two leases contained pairs 0–6 and 7–12, respectively, retaining the 5-second
+sample and 50-second active-lease limits. The earlier single-lease attempt
+retained four successful warmups then failed to produce the required inner-usage
+record; it remains incomplete and was not used in the statistics below.
+
+| Actual CLI metric | Baseline median | Candidate median | Median change | Paired median change |
+|---|---:|---:|---:|---:|
+| CPU, user + system | 1.206815 s | 1.067380 s | -11.55% | -18.74% |
+| Whole invocation wall | 1.252567 s | 1.122340 s | -10.40% | -18.16% |
+| Peak RSS | 37,128 KiB | 34,792 KiB | -6.29% | -6.25% |
+
+Nearest-rank p95 (the maximum at n=11): CPU 2.079428 → 1.487513 s;
+wall 2.662505 → 1.613796 s; RSS 37,320 → 35,044 KiB. The variation is substantial
+on the shared host: these are bounded local observations for this exact import
+workload, not a guarantee for arbitrary programs, platforms, or the later combined
+release. Existing cycle20 negative evidence is retained. Lower peak RSS does not
+prove physical memory reclamation. No safety check was removed to obtain these
+measurements.
+
+The real cache dependency closure also passed `inline_source_prefixed` before
+and after the change: 15 linked modules became 11. This is covered by
+`tests/semantics/module_cache_link_test.sapp`. It is distinct from the existing
+nested import in `zipfile.extract` that blocks that unrelated whole-program
+link route; this change neither modifies `zipfile` nor relaxes linker rejection.
