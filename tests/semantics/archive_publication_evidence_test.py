@@ -12,13 +12,16 @@ import tempfile
 repo = Path(__file__).resolve().parents[2]
 runtime = str(Path(sys.argv[1]).resolve())
 source = (repo / 'stdlib/archive_publication.sapp').read_text()
-extract = len(sys.argv) > 2 and sys.argv[2] == 'extract'
+extract = len(sys.argv) > 2 and sys.argv[2] in ('extract', 'empty')
+empty = len(sys.argv) > 2 and sys.argv[2] == 'empty'
 
 def invocation(text):
     if extract:
         text = text.replace('P.save(', 'P.extract_member(')
         text = text.replace(',[0])', ',[0],"a")').replace(',bytes)', ',bytes,"a")')
         text = text.replace(')==bytes,"held original', ')==[0,128,255],"held original')
+    if empty:
+        text = text.replace("data:[1]", "data:[]").replace("[0,128,255]", "[]")
     return text
 with tempfile.TemporaryDirectory(prefix='archive-model-') as temporary:
     root = Path(temporary)
@@ -31,7 +34,7 @@ fn configure(mode) {state.mode=mode;state.opens=0;state.closes=0;state.copies=0;
 fn open(path,a,b) {state.opens=state.opens+1;return map{ok:true};}
 fn open_absolute(path,a,b) {return open(path,a,b);}
 fn sealed_child_bytes(fs,name,bytes) {return map{ok:state.mode!="seal_failure"};}
-fn copy_held_range_new_atomic(a,b,c,d,e,f,g,h) {
+fn copy_held_range_new_atomic(a,b,c,d,e,f,g,h,allow_empty=false) {
  state.copies=state.copies+1;
  if state.mode=="throws" {throw "SECRET_BACKEND";}
  if state.mode=="ambiguous" {return map{ok:false,error:"SECRET_BACKEND"};}
