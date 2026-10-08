@@ -45,7 +45,8 @@ facade for the fixed, fully bounded model shape.
 
 ## Handle, reports and paired outcomes
 
-The returned handle contains `report`, `predict(ids)` and `evaluate(examples)`.
+The returned handle contains `report`, `predict(ids)`, `evaluate(examples)`,
+`checkpoint()` and `close()`.
 Final evaluation examples must be unique and disjoint from student training and
 validation. Evaluation is repeatable and diagnostic: it does not enforce a hidden
 one-shot test, activate the student or choose a production checkpoint.
@@ -79,6 +80,7 @@ let student=AI.neural_specialist_distill(
  teacher.artifact,[[0],[1,0]],[map{x:[7,0],y:4}]);
 print json_stringify(student.evaluate([map{x:[6,0],y:4}]));
 print student.predict([6,0]).token;
+assert(student.close(),"release caller-owned distillation state");
 ```
 
 Use `examples/pbai_neural_distillation.sapp` in PBLang or
@@ -112,3 +114,37 @@ ASI, general language competence or universal-platform claim follows from this f
 
 Explicit labeled training with bounded joint gradients is available through
 [`neural_specialist_distill_supervised`](pbAI_Specialist_Supervised_Distillation.md).
+
+## Explicit lifetime and failed use (2026-10-08)
+
+Both soft-only and supervised distillation now return an idempotent `close()`.
+The first call returns true, subsequent calls false. It clears the private model,
+teacher/initial/student adapters, context ledger and internal report reference.
+Saved `predict`, `evaluate` and `checkpoint` aliases become terminal; mutable public
+fields cannot reopen the private state. Reports, metrics, predictions and checkpoints
+exported before close retain their independent caller-owned lifetimes. Export before
+close when a later load or continuation is intended. Training and numerical output
+formats are unchanged.
+
+The caller must close each acquired handle. For automatic cleanup after catchable
+use failures, register its captured close method in `resource_scope.with_scope`.
+`examples/pbai_distillation_scope.sapp` (standalone: `demo/`) demonstrates success,
+invalid prediction and overlapping evaluation while keeping an independent active
+model usable. The callback uses a direct-parameter factory to avoid inherited
+capture limitations in the retained runtime. Raw distillation calls do not
+implicitly join an ambient scope. There is no returned handle to close when
+construction itself fails, and registration/OOM/hard termination are not covered.
+
+Run `tests/semantics/pbai_distillation_close_test.sapp` with isolated `PBAI_STATE_ROOT`.
+It checks direct/facade/binding routes, soft/supervised variants, successful use,
+actual invalid-prediction and evaluation-overlap failures, and early manual close
+followed by scope cleanup. It inspects original methods before a diagnostic close,
+preserves the caller's active model, checks detached exports and rejects malformed
+post-close inputs. Default mode requires closure; `PBAI_DISTILL_LIFETIME_PHASE=baseline`
+only characterizes old code. The before/after output digests must match exactly.
+See [evidence](evidence/pbai_distillation_lifetime-2026-10-08.json).
+
+Explicit ownership removal is not proof of physical GC/reclamation, zeroization or
+RSS savings. The fixed numerical experiment does not establish AGI/ASI or all-device
+support. Plain neural training sessions still lack terminal close; older callers
+that discard these handles without closing them are not automatically migrated.
