@@ -139,3 +139,8 @@ For one to eight files with cleanup after partial acquisition, see
 
 The [reviewed reload example](pbAI_Reviewed_Reload.md) uses this scope to close a
 candidate after successful, rejected or failed comparison against a live model.
+
+The file adapter additionally exposes `load_file_result`: success transfers one
+owned handle and known validation failures return a fixed error envelope. This
+does not change `with_file` or the original two-operation binding. See
+[acquisition diagnostics](pbAI_Checkpoint_Diagnostics.md).
