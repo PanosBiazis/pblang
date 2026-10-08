@@ -85,6 +85,17 @@ a more distant loop/function frame. This source-level finding is consistent
 with the retained regression; it is not proof of the provenance of every
 distributed native binary.
 
+A fresh retained PBCK decode of the fixture above makes this boundary visible:
+the colon form's nested synthetic function loads global `p` with empty captures;
+the explicit form captures local slot3 and reads upvalue0. Removing the outer
+catch exposes `undefined global 'p'` before the method runs. A receiver-mutation
+control leaves6 after the colon failure but reaches7 through the explicit call;
+an explicit throwing method exposes42 whereas the nested colon form fails before
+that method. The no-exception control still returns7, and an extra loop retains
+the caught9. Native-emitted PBCK preserves the faulty binding; PBLang-emitted
+PBCK is a different compilation route and returns7. These observations identify
+the broken capture, not a repaired direct-source route.
+
 Default source execution in `src/main.rs` calls that native parser/compiler.
 Editing the PBLang frontend or VM cannot replace the compiler already embedded
 in the retained executable. The supported explicit PBLang-to-PBCK path above

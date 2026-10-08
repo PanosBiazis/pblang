@@ -76,6 +76,30 @@ The diagnostic driver provides `--map-fallback --reference PREVIOUS_RELEASE`.
 `examples/selfhost_throw_cleanup/map_fallback.sapp` is a small installation probe.
 No speedup is claimed and previous conversion/async costs remain unresolved.
 
+## Present nil equality methods
+
+`==` and `!=` now close eligible private execution memory when both self-host
+method-value lookups yield nil but `__eq__` or `__ne__` is actually present on
+an operand or its class chain. The native fallback dispatches by key presence,
+so this case calls nil and fails; it is distinct from an absent method, whose
+structural comparison remains valid. The existing `has_member` primitive uses
+the same32-table lookup bound. The guard runs only for live opted-in memory
+without a guest handler, after normal forward/reflected methods have returned.
+
+The original rejecting comparison executes once. No operand, callback or method
+is replayed. Valid structural comparisons, nil/false method results, current
+forward/reflected precedence and nil-shadow behavior stay unchanged. This fixes
+cleanup, not the pre-existing self-host/native difference in nil-method dispatch.
+Borrowed contexts and actual catches retain memory; secondary cleanup failure
+cannot replace the initial diagnostic. Private metadata must remain unaliased.
+
+`tests/semantics/selfhost_equality_cleanup_test.sapp` covers direct/inherited nil
+methods, operand positions, class depth/cycles, live structural comparison,
+callbacks, catches, ownership, effects and optimized/PBCS execution. The prior
+map-fallback suite and installation probe remain separate regression checks.
+The diagnostic driver adds `--equality --reference PREVIOUS_RELEASE`.
+`examples/selfhost_throw_cleanup/equality.sapp` is the installation probe.
+
 ## Strict numeric builtins
 
 `num_floor`, `num_ceil`, `num_abs`, `num_sqrt`, `num_ln`, `num_exp`,
