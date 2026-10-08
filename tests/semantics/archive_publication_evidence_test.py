@@ -12,6 +12,14 @@ import tempfile
 repo = Path(__file__).resolve().parents[2]
 runtime = str(Path(sys.argv[1]).resolve())
 source = (repo / 'stdlib/archive_publication.sapp').read_text()
+extract = len(sys.argv) > 2 and sys.argv[2] == 'extract'
+
+def invocation(text):
+    if extract:
+        text = text.replace('P.save(', 'P.extract_member(')
+        text = text.replace(',[0])', ',[0],"a")').replace(',bytes)', ',bytes,"a")')
+        text = text.replace(')==bytes,"held original', ')==[0,128,255],"held original')
+    return text
 with tempfile.TemporaryDirectory(prefix='archive-model-') as temporary:
     root = Path(temporary)
     (root / 'pblang.toml').write_text('[package]\nname="archive-evidence"\nversion="0.1.0"\nentry="main.sapp"\n[dependencies]\nstdlib={path=' + json.dumps(str(repo / 'stdlib')) + ',paths=["stdlib"]}\n')
@@ -33,7 +41,7 @@ fn copy_held_range_new_atomic(a,b,c,d,e,f,g,h) {
 fn close(fs) {state.closes=state.closes+1;return state.mode!="cleanup" and state.mode!="wrapper_both";}
 export configure,open,open_absolute,sealed_child_bytes,copy_held_range_new_atomic,close,state;
 ''')
-    (root / 'main.sapp').write_text('''let D=import("dir.sapp");let P=import("publication.sapp");
+    (root / 'main.sapp').write_text(invocation('''let D=import("dir.sapp");let P=import("publication.sapp");
 let A=import("stdlib:secure_archive.sapp");let bytes=A.pack([map{name:"a",data:[1]}],"store");
 D.configure("success");let invalid=P.save("new.zip",[0]);
 assert(D.state.opens==0 and not invalid.publication_attempted,"invalid bytes never open output root");
@@ -49,7 +57,7 @@ for mode in ["success","seal_failure","ambiguous","throws","unsynced","cleanup",
  if mode=="success" {assert(r.ok and r.durability_verified and r.wrapper_handles_closed,"complete success");}
 }
 print "archive_evidence_model_8_pass";
-''')
+'''))
     p = subprocess.run([runtime, 'run', str(root / 'main.sapp'), '--allow-all'], cwd=repo,
                        text=True, capture_output=True, timeout=45)
     assert p.returncode == 0 and 'archive_evidence_model_8_pass' in p.stdout, p.stdout + p.stderr
@@ -74,12 +82,12 @@ let open=Real.open;let sealed_child_bytes=Real.sealed_child_bytes;
 let copy_held_range_new_atomic=Real.copy_held_range_new_atomic;let close=Real.close;
 export open,open_absolute,sealed_child_bytes,copy_held_range_new_atomic,close;
 ''')
-    (root / 'main.sapp').write_text('''let P=import("publication.sapp");let A=import("stdlib:secure_archive.sapp");
+    (root / 'main.sapp').write_text(invocation('''let P=import("publication.sapp");let A=import("stdlib:secure_archive.sapp");
 let bytes=A.pack([map{name:"a",data:[0,128,255]}],"store");
 let r=P.save('''+json.dumps(str(parent / 'new.zip'))+''',bytes);assert(r.ok,"held parent publication");
 assert(fs_read_bytes('''+json.dumps(str(moved / 'new.zip'))+''')==bytes,"held original receives exact bytes");
 print "archive_parent_swap_pass";
-''')
+'''))
     p = subprocess.run([runtime, 'run', str(root / 'main.sapp'), '--allow-all'], cwd=repo,
                        text=True, capture_output=True, timeout=45)
     assert p.returncode == 0 and 'archive_parent_swap_pass' in p.stdout, p.stdout + p.stderr
