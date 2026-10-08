@@ -58,6 +58,7 @@ resource-scope fields plus:
 | Field | Meaning |
 | --- | --- |
 | `stage` | `acquire` if acquisition stopped; `body` once every handle loaded |
+| `acquisition_error` | nil, or a fixed adapter error with zero-based `index` of the rejected file (0..7) |
 | `acquired_count` | Number of successfully loaded, registered handles, 0..8 |
 | `cleanups_attempted` | Equals `acquired_count` on normal return from the scope |
 
@@ -68,8 +69,16 @@ report `body_status:exception`, nil primary error and
 `original_error_available:false`, because the retained runtime does not expose
 the original caught exception message. Unlike `with_file`, batch acquisition
 errors are intentionally caught by the already-open resource scope. Use the
-stage to distinguish acquisition from body failure; do not infer an exact
-missing/corrupt/permission cause from this opaque report.
+stage to distinguish acquisition from body failure. The additive
+`acquisition_error` preserves known adapter failures before the opaque catch.
+It contains only `index` and `error`, never a path or checkpoint content. Read
+rejections deliberately do not distinguish missing files from permission/storage
+failures. Invalid encoding and invalid checkpoint structure have distinct fixed
+messages. Unexpected exceptions still have nil `acquisition_error`; this field
+does not recover arbitrary runtime exception messages. All old fields retain
+their previous values, including nil `error` and false
+`original_error_available` for acquisition failures. Cleanup failures remain
+separate and cannot replace the acquisition diagnostic.
 
 The callback returns `map{ok:true,value:...}` or `map{ok:false,error:...}`. Its
 explicit error is retained separately from cleanup errors. Invalid results are
@@ -122,3 +131,6 @@ The native file backend remains Linux-only. This uses the previously tested
 direct-capture cleanup factory; it is not a general fix for the retained
 runtime's inherited-closure limitation. No performance optimization or AGI/ASI
 claim is made. See [recorded evidence](evidence/pbai_checkpoint_batch-2026-10-05.json).
+
+For result-based decoding/loading, reproducible before/after checks and the
+three-case example, see [acquisition diagnostics](pbAI_Checkpoint_Diagnostics.md).
