@@ -23,6 +23,7 @@ def main():
     ap.add_argument('--constructors', action='store_true')
     ap.add_argument('--bitwise', action='store_true')
     ap.add_argument('--conversions', action='store_true')
+    ap.add_argument('--slices', action='store_true')
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--count', type=int, default=3)
     a = ap.parse_args()
@@ -164,6 +165,12 @@ def main():
             cases += [('valid-conversions','print parse_number(" -1.25e2 ");print parse_bool(" TRUE ");print parse_bool("False");print strcharcodeat("α🙂",1);print strcharcodeat("α",-1);print strfromcharcode(65.9);print str_from_char_code(128578);print strfromcharcode(1114111);print parse_number("NaN");print parse_number("inf");',True),
                       ('caught-conversions','print try call1(parse_number,"bad") catch memory_get(1);print try call1(str_from_char_code,55296) catch memory_get(1);print try call2(strcharcodeat,"",0) catch memory_get(1);',True)]
             cases = [(label,'fn call1(f,a){return f(a);}fn call2(f,a,b){return f(a,b);}'+source,valid) for label,source,valid in cases]
+        if a.slices:
+            assert a.reference and not (a.calls or a.numeric or a.strings or a.exact_math or a.constructors or a.bitwise or a.conversions), 'choose slices with reference'
+            exprs = ['call3(str_slice,nil,0,1)', 'call3(str_slice,"x",nil,1)', 'call3(str_slice,"x",0,nil)', 'call3(str_slice,"x",-1,1)', 'call3(str_slice,"x",num_sqrt(-1),1)', 'call3(str_slice,"x",0,-1)', 'call3(str_slice,bigint(1),0,1)', 'call3(slice,nil,nil,nil)', 'call3(slice,[1],-1,nil)', 'call3(slice,[1],0,"x")', 'call3(slice,[1],num_exp(1000),nil)', 'call3(slice,[1],nil,num_sqrt(-1))', 'call3(slice,map{},-1,-1)', 'fn cut(a,b){return a[b..];}cut([1],-1)', 'fn bad(f){return f("a",0);}bad(str_slice)', 'fn bad(f){return f("a",0,1,2);}bad(slice)']
+            cases = [(e,e+';',False) for e in exprs]
+            cases += [('valid-slices','print str_slice("α🙂β",1,2);print str_slice("abc",0,num_exp(1000));print str_slice("abc",2,1);print str_slice("abc",0.9,2.9);print slice([1,2,3],1,nil);print slice("α🙂β",nil,2);print slice([1,2],8,9);let a=[1,2,3];print a[..];print a[1..];print a[..2];print a[1..2];',True),('caught-slices','print try call3(str_slice,"a",nil,1) catch memory_get(1);print try call3(slice,[1],-1,nil) catch memory_get(1);',True)]
+            cases = [(label,'fn call3(f,a,b,c){return f(a,b,c);}'+source,valid) for label,source,valid in cases]
         for label, source, valid in cases[a.start:a.start + a.count]:
             if a.reference:
                 expected = run(prefix + 'let c=V.execution_context(true);V.run_seeded(F.frontend_compile("memory_alloc(7);").chunk,map{},c);'

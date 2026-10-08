@@ -152,6 +152,36 @@ messages across six routes and secondary cleanup faults. Small installation
 probes are `examples/selfhost_throw_cleanup/constructors.sapp` and
 `tests/fixtures/selfhost_constructor_acceptance.sapp`.
 
+## String and array slicing failures
+
+`str_slice` and `slice` now close live opted-in private execution memory when
+an error escapes without a guest handler. Scalar three-argument dispatch and
+generic fallback share the same rule. The parser lowers all four range forms
+`a[lo..hi]`, `a[lo..]`, `a[..hi]`, `a[..]` to `slice`, so range syntax inherits
+the correction. Previously wrong sequence types or invalid bounds could leave
+private allocations and borrows live.
+
+The helpers catch only a failed pure host slice, attempt cleanup, then repeat
+that failed operation on already-evaluated operands for the original diagnostic.
+No argument, callback or guest method is replayed; arrays are not mutated.
+Successful slicing runs once. Guest handlers and borrowed contexts retain their
+memory, and the existing arity guard still precedes argument validation.
+
+The two contracts intentionally differ: `str_slice` checks the string first,
+rejects nil bounds and accepts positive infinity as a clamped bound. `slice`
+checks start/end before sequence type, accepts nil as an omitted bound, and
+requires finite non-negative numeric bounds otherwise. Both truncate fractional
+bounds, clamp to length and produce empty results for reversed ranges. Unicode
+scalar indexing and shallow array-copy element identity are unchanged. This does
+not introduce quotas or recover arbitrary host/FFI/panic/abort/OOM failures.
+
+`tests/semantics/selfhost_slice_cleanup_test.sapp` checks invalid types/bounds,
+private/borrowed ownership, actual guest catches, argument effects, range syntax,
+valid boundaries, shallow-copy semantics and optimized/PBCS execution. Diagnostic
+parity uses `tests/tooling/selfhost_arithmetic_cleanup.py --slices --reference
+PREVIOUS_RELEASE`. `examples/selfhost_throw_cleanup/slices.sapp` is the small
+public-CLI installation probe. No speedup or physical RSS reclamation is claimed.
+
 ## Text parsing and Unicode conversion failures
 
 `parse_number`, `parse_bool`, `strcharcodeat`, `strfromcharcode` and its alias
