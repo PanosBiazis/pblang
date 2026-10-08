@@ -1129,3 +1129,22 @@ also discard it. This transient state is controller-local and is never saved in
 an appearance profile. See `focus_recovery_demo.sapp`,
 `tests/semantics/reader_focus_recovery_test.sapp` and
 `tests/tooling/reader_focus_recovery_native.py` for recovery and cancellation flows.
+## Session zoom from the keyboard
+
+While reading, press **Ctrl+Plus** (or **Ctrl+Equal**) to enlarge text,
+**Ctrl+Minus** to reduce it, and **Ctrl+0** to restore scale 1.0. Each fresh
+press moves to the adjacent 0.05 step within the existing 0.75–1.5 limits.
+Other font sizes, family and spacing stay intact. A held shortcut changes once
+until released. Style keeps its existing draft-editing keys.
+
+Zoom affects the current session. To retain it for the next launch, open Style
+and choose **Save for next launch**. Resetting with Ctrl+0 does not overwrite a
+previously saved profile. Ctrl+Alt, Ctrl+Meta and shifted Minus/0 are ignored.
+Meta alternatives have source contract coverage; actual macOS execution is not
+verified. Native input loss remains documented in `docs/NATIVE_GRAPHICS_INPUT.md`.
+
+Embedders can call `App.zoom(reader, -1|0|1)` and reserve shortcuts with
+`App.zoom_shortcuts(reader, false)` independently of history shortcuts. Both
+methods return whether state changed; direct zoom returns false in Style or
+after closing. See `zoom_demo.sapp` and `tests/semantics/reader_zoom_test.sapp`.
+The public appearance, renderer, profile and installation contracts are unchanged.
