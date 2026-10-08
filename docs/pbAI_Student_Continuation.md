@@ -138,7 +138,7 @@ parent artifact and independently loaded parent handles remain unchanged.
 The reviewed constructor owns its intermediate continuation handle. It captures
 its close method immediately, exports the checkpoint, and closes the intermediate
 before reconstruction or evaluation. A catchable checkpoint export exception also
-closes it, then throws `student continuation checkpoint export failed`; no partial
+attempts to close it, then throws `student continuation checkpoint export failed`; no partial
 review is returned. Constructor failure before a handle exists has no handle to
 close. The returned reviewed handle has its own independent lifetime.
 
@@ -170,3 +170,55 @@ closers before export/use and close on synchronous catchable failure. Their
 benchmarks close seeds, warmups and samples outside the timed work. See the exact
 [migrated caller scope and reproduction](pbAI_Caller_Ownership.md); other legacy
 callers remain separate work.
+
+## Export failure and cleanup precedence (2026-10-08, cycle 22)
+
+The reviewed constructor makes exactly one attempt to close its intermediate
+continuation, including when checkpoint export throws or returns nil. A failed
+export retains the existing fixed `student continuation checkpoint export failed`
+message even if cleanup also throws or returns an invalid value. Cleanup cannot
+replace that known primary failure. The retained runtime still cannot recover
+arbitrary original caught exception text.
+
+When checkpoint export succeeds, a catchable cleanup exception or nonboolean
+close result throws `student continuation cleanup failed` before reconstruction,
+review evaluation or return of a reviewed handle. No backend payload is formatted
+or exposed. The bundled idempotent boolean results remain compatible, including
+false for an already closed handle. A return shape alone does not prove closure
+for an untrusted or modified implementation. There is no retry, fallback, global
+activation or new callback/provider API.
+
+This deliberately tightens the previously silent acceptance of malformed cleanup
+results. Normal successful/rejected reviews, artifacts, metrics and legacy
+facade/binding outputs remain unchanged. When both operations fail, the existing
+known export error takes precedence; the throwing API does not expose a separate
+secondary cleanup report. If cleanup throws before releasing state, this change
+does not manufacture successful release or solve unknown native cleanup failures.
+
+The mirrored `tests/tooling/pbai_review_export_failure.py` gate copies the real
+provider into a private fixture and wraps only continuation export/close methods.
+It tests real owned handles through direct, legacy facade and explicit binding
+routes. Saved original methods are checked before diagnostic cleanup. Cases where
+a close throws before release are explicitly counted as still open, then closed
+by the test; they are not automatic-cleanup successes. An independent model and
+caller parent/history are checked after every case. Separate uncaught subprocess
+cases check the exact fixed failure text and suppression of synthetic private
+messages. This is test-only fault injection, not a new production extension hook
+or proof over all native failures.
+
+From either product, set `PBLANG_BIN` to the trusted executable and run:
+
+```sh
+python3 tests/tooling/pbai_review_export_failure.py --product pblang
+# From the standalone sibling repository, use --product pbai.
+```
+
+Linux/Python/bubblewrap are test prerequisites. Child model computations deny net,
+HTTP, exec, FFI, spawn, graphics and SQLite; the orchestrator creates/removes only
+its private fixture. `--phase baseline --baseline-owner FILE` is an explicit
+historical source comparison, not an installed runtime mode. The source gate's
+`--provider-stdlib DIR --expected-owner-sha256 HASH` allows a separately pinned
+installed-provider copy to be tested with the same fault overlay. Such a test
+must be labeled an overlay qualification and cannot stand in for unmodified
+installed-launcher acceptance. No performance, physical RAM release or accelerator
+claim follows from the lifecycle counts.
