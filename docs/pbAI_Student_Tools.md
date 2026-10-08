@@ -9,7 +9,7 @@ Each response has exactly `format: "pbai.neural.student-tool.v1"`, `status`,
 `result`, and `error`. Successful `status: "result"` responses have `error: nil`.
 Failed `status: "error"` responses have `result: nil` and a fixed error code:
 `invalid_request`, `invalid_checkpoint`, `unsupported_operation`, or
-`computation_failed`. Errors do not echo input, paths, checkpoint contents or raw
+`computation_failed`, or `cleanup_failed`. Errors do not echo input, paths, checkpoint contents or raw
 exception text. Unsupported training/acceptance operations fail explicitly.
 
 ## Exact request shapes
@@ -26,9 +26,9 @@ no implicit truthy conversion. A prediction request contains 1..32 contexts, eac
 order and multiplicity are preserved. All inputs are validated before inference;
 malformed later rows never produce a partial successful batch. The batch loads
 one validated private model and reuses it for every context. That private handle
-is now closed before returning either a complete successful response or a
-`computation_failed` response. A caught prediction exception, malformed internal
-prediction, or rejected nonfinite/oversized logit cannot skip this cleanup.
+gets one close attempt before returning either a complete successful response or
+a failure response. A caught prediction exception, malformed internal prediction,
+or rejected nonfinite/oversized logit cannot skip that attempt.
 The close method is captured immediately after acquisition. Input rejection still
 happens before acquisition; a construction failure has no returned handle to close.
 
@@ -152,3 +152,43 @@ See [raw before/after measurements](benchmarks/pbai_student_tools_performance-20
 and [verification](benchmarks/pbai_student_tools_checks-2026-10-03.json).
 
 The runnable tool example now scopes both its checkpoint seed and independently loaded active model, including export/use failures. The provider keeps ownership of its private batch handle. See [caller ownership and regression evidence](pbAI_Caller_Ownership.md#tool-and-distillation-examples-cycle-20).
+
+
+## Batch cleanup result and error precedence (2026-10-09)
+
+`predict_batch` retains `computation_failed` if prediction already failed, even
+when its captured close also throws or returns a nonboolean value. If prediction
+succeeded, those cleanup outcomes now return `cleanup_failed`, with `result: nil`.
+This prevents a malformed close result from silently qualifying a successful
+batch, and distinguishes a cleanup-only exception from a prediction exception.
+The four-field response shape, admission errors, capabilities, successful outputs
+and comparison operation are unchanged. Consumers enumerating error codes should
+handle the added fixed `cleanup_failed` code. Raw backend errors are never echoed.
+
+Both boolean close results remain valid under the bundled idempotent contract,
+including false after an earlier close. A boolean alone is not proof of release
+by an arbitrary modified backend. No retry is attempted. If close throws before
+releasing state, cleanup remains unconfirmed. The original prediction error takes
+precedence; this protocol does not add a separate secondary cleanup report or
+recover arbitrary original exception text.
+
+Run `python3 tests/tooling/pbai_student_tool_cleanup.py --product pblang` from the
+PBLang checkout, or use `--product pbai` in standalone pbAI, with `PBLANG_BIN` set
+to the complete trusted launcher. Linux, Python and bubblewrap are prerequisites.
+The driver copies the real stdlib into a private fixture, then wraps only loaded
+prediction/close methods. It exercises all three entry routes, 13 admitted modes
+and two pre-acquisition rejection cases per route. It observes saved original
+predict/checkpoint/evaluate/compare methods before diagnostic cleanup, verifies
+exact fixed error codes, no partial output, unchanged caller inputs and an
+independent caller-owned model. The private seed and active model are explicitly
+closed. Before-release faults remain open until the test's diagnostic close; they
+are not counted as automatic cleanup successes.
+
+`--phase baseline --baseline-owner FILE` is an explicit original-source comparison.
+`--provider-stdlib DIR --expected-owner-sha256 HASH` qualifies a pinned provider
+copy with the same test-only overlay. Neither option modifies the shared runtime.
+Installed-provider overlay results must remain distinct from unmodified installed
+calls. Child calls deny network, HTTP, exec, FFI, spawn, graphics and SQLite, use
+isolated `PBAI_STATE_ROOT`, and hide original product sources. These are logical
+lifecycle checks, not physical memory, performance or all-platform guarantees.
+See [before/after evidence](evidence/pbai_student_tool_cleanup-2026-10-09.json).
