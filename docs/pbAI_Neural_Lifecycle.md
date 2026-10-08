@@ -8,7 +8,7 @@ Standalone and embedded pbAI share the PBLang implementation in
 - `neural_specialist_run(artifact, ids)` predicts with an explicitly supplied artifact.
 - `neural_specialist_session(training, validation, options=nil)` retains private
   initial/candidate weights and exposes `status`, `predict`, `evaluate`, `promote`
-  and `rollback`.
+  `rollback` and `close`.
 
 ## Model and input contract
 
@@ -66,6 +66,49 @@ The private decision cannot be changed by editing a returned report. Caller chan
 to original datasets, prediction arrays or status objects cannot rewrite private
 weights or remembered split membership. Use a handle on one thread only.
 
+## Explicit lifetime and failed use (2026-10-08)
+
+The caller owns every session. `close()` returns `true` once and `false` on
+subsequent calls, from any of the five reachable phases. It clears the active,
+baseline and candidate artifacts, copied training/validation examples, context
+ledger and training-gate reference. All other methods, **including `status()`**,
+throw `neural session is closed` afterward. Previously captured methods share
+this terminal state; editing the public handle or exported reports cannot reopen it.
+Unlike a reviewed student handle, a closed plain session has no readable status
+method. Save the last status before close if it is needed later.
+
+Existing status maps, evaluations and predictions retain their independent
+caller-owned lifetimes and unchanged contents. Close does not rewrite caller
+inputs or another active session. Rollback remains a separate operation: it
+restores the initial weights but leaves prediction available until explicit close.
+The session does not export a resumable checkpoint.
+
+For synchronous catchable failures, capture the closer and register it immediately
+with `resource_scope.with_scope`. The runnable `pbai_neural_session_scope.sapp`
+example in the examples/demo directory covers success, invalid prediction,
+overlapping evaluation data and subsequent recovery. Its callback factory takes
+the session as a direct parameter, avoiding inherited nested-loop capture in the
+retained runtime. Constructors do not implicitly join a scope; if construction
+throws before returning a handle, there is no handle for the caller to close.
+
+The ordinary example, lifecycle benchmark and three existing session/facade/binding
+tests now close the handles they acquire on their successful path. Benchmark cleanup
+is outside timed regions and keeps the same workload, warmup and sample counts;
+no performance improvement is claimed. Other legacy student/distillation callers
+are a separate migration, not automatically fixed by this operation.
+
+`tests/semantics/pbai_neural_session_close_test.sapp` checks direct, facade and bound
+routes across candidate, evaluated, promoted, rolled-back and rejected phases,
+plus scope cleanup after real use failures and early manual close. It preserves
+export digests, checks original method aliases and rejects cyclic/malformed input
+after close. Default mode requires closure; `PBAI_SESSION_LIFETIME_PHASE=baseline`
+is only for characterizing pre-fix source. See the
+[before/after evidence](evidence/pbai_neural_session_lifetime-2026-10-08.json).
+
+This proves explicit reference removal and terminal operations, not physical GC,
+RSS reduction, secure zeroization, concurrency safety or cleanup after hard process
+termination/OOM. These remain single-threaded local handles.
+
 ## Example: curriculum to session
 
 ```pblang
@@ -79,6 +122,7 @@ let evaluation=session.evaluate(data.test_families[0].examples);
 if evaluation.passed {session.promote();}
 print session.predict([6,0]).token;
 if session.status().session_adapter_active {session.rollback();}
+assert(session.close(),"release private session state");
 ```
 
 The runnable example is `examples/pbai_neural_session.sapp` in PBLang and
