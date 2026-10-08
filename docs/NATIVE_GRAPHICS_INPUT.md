@@ -65,3 +65,26 @@ reader export and native close using the candidate graphics file.
 Only Linux/minifb has live native evidence here. SDL2/custom queue behavior has
 contract tests; Windows/macOS/iOS/Android native behavior and arbitrarily fast
 keystrokes still need platform-specific validation.
+
+## Remaining native boundary (2026-10-08)
+
+`tests/tooling/native_keyboard_boundary.py` records events **before**
+`GUI.handle_event`, each resulting edit, and a synthetic file save/readback.
+Run with an explicit existing runtime and a fresh evidence directory inside
+`xvfb-run -a`; it refuses a personal display. No Rust changes are involved.
+
+In one bounded Linux/minifb run at 30 fps, 120 ms `abc` presses arrived and saved
+as `abc`. Six 1 ms `abcdef` presses produced only an `F` key release, so the GUI
+remained empty. Overlapping `b`, `a` presses arrived as `A`, `B` and produced
+`ab`. Greek `αβ` keysyms held 180 ms produced no keydown/keyup records. All four
+save/readbacks exactly matched their GUI values, including the incorrect/empty
+ones: successful storage does not establish correct keyboard delivery.
+
+The retained path `gfxpresent` updates minifb state; `gfxpollevents` enumerates
+`get_keys_pressed` followed by `get_keys_released`. It exposes physical key names,
+not ordered Unicode text/composition events. `keymap.key_to_char` accepts a direct
+Unicode scalar when one is supplied, but cannot recover omitted input or original
+ordering. PBLang polling changes cannot reconstruct this missing information.
+A supported ordered text-input backend is still needed; no faster sampling,
+layout/focus correction, Reader zoom shortcut, or save/readback is claimed to fix
+the native loss. These are diagnostic samples, not timing guarantees or benchmarks.
