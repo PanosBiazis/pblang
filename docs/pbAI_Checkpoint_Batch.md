@@ -64,21 +64,28 @@ resource-scope fields plus:
 
 A failed first load returns stage `acquire`, count 0 and cleanup success with
 zero attempts: there was no acquired handle to release. A failed second load
-reports count 1 and one attempt. Failed acquisitions and thrown body exceptions
-report `body_status:exception`, nil primary error and
-`original_error_available:false`, because the retained runtime does not expose
-the original caught exception message. Unlike `with_file`, batch acquisition
-errors are intentionally caught by the already-open resource scope. Use the
-stage to distinguish acquisition from body failure. The additive
-`acquisition_error` preserves known adapter failures before the opaque catch.
-It contains only `index` and `error`, never a path or checkpoint content. Read
-rejections deliberately do not distinguish missing files from permission/storage
-failures. Invalid encoding and invalid checkpoint structure have distinct fixed
-messages. Unexpected exceptions still have nil `acquisition_error`; this field
-does not recover arbitrary runtime exception messages. All old fields retain
-their previous values, including nil `error` and false
-`original_error_available` for acquisition failures. Cleanup failures remain
-separate and cannot replace the acquisition diagnostic.
+reports count 1 and one attempt. Known adapter rejections return the existing
+fixed error through `error` and `body_result:{ok:false,error:...}`, with
+`body_status:returned` and `original_error_available:true`. The acquisition phase
+returned a structured failure; the application callback was never invoked.
+`stage:acquire` identifies that distinction. The additive `acquisition_error`
+retains the same zero-based index and fixed message. It contains no path or
+checkpoint content. Read rejections do not distinguish missing files from
+permission/storage failures. Invalid encoding and invalid checkpoint structure
+have distinct fixed messages.
+
+Unexpected acquisition exceptions and thrown body exceptions still report
+`body_status:exception`, nil primary error and `original_error_available:false`.
+An unexpected acquisition exception also has nil `acquisition_error`; this does
+not recover arbitrary caught exception text. Cleanup failures remain separate
+and cannot replace the known primary or acquisition diagnostic.
+
+This intentionally corrects four fields for known acquisition rejection as of
+2026-10-09: `error`, `body_result`, `body_status`, and
+`original_error_available`. Callers should use `stage` to distinguish acquisition
+from application work and `ok` for overall success, not assume every acquisition
+failure is an opaque exception. Successful and body-result fields, acquisition
+index, counts and cleanup reports are unchanged.
 
 The callback returns `map{ok:true,value:...}` or `map{ok:false,error:...}`. Its
 explicit error is retained separately from cleanup errors. Invalid results are

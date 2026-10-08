@@ -17,7 +17,8 @@ Known rejection messages distinguish invalid encoding, invalid checkpoint,
 invalid path, unsupported platform, and bounded private-storage read rejection.
 The latter does not reveal missing-versus-permission details. No source path,
 backend payload or checkpoint content is included. Body errors and cleanup errors
-are separate; the old report fields remain unchanged. `with_file` is unchanged.
+are separate. Known acquisition errors now also populate the primary scope
+error fields as described below. `with_file` is unchanged.
 
 ## Verification
 
@@ -36,7 +37,7 @@ executable allowlist. This qualification is Linux-specific.
 
 Each product exercises 34 direct/facade cases: missing, malformed encoding,
 invalid artifact and duplicate keys at positions 0, 1 and 7; groups of 1 and 8;
-body error, throw and invalid return. The before/after comparison records 68 cases
+body error, throw and invalid return. The historical cycle21 before/after comparison records 68 cases
 and 188 closed handles per phase, with 0 then 48 known diagnostics, identical old
 report fields and file bytes, and equal standalone/embedded observations. This is
 explicit lifecycle evidence, not physical memory reclamation or a speed claim.
@@ -58,3 +59,36 @@ model. Source-qualified checks do not establish installed-release acceptance.
 
 No AGI/ASI, trained specialist, universal device support, authenticated model,
 physical zeroization, hard-termination cleanup or new performance claim is made.
+
+
+## Known primary error through cleanup (2026-10-09, cycle24)
+
+`with_files` returns a known rejected load as `{ok:false,error:fixed_message}`
+inside its existing resource scope. This preserves that message in `error` and
+`body_result`, sets `original_error_available:true` and `body_status:returned`,
+and still skips the application callback and attempts prior closes in reverse
+order. The acquisition diagnostic, index, stage, counts and cleanup entries are
+unchanged. This is a deliberate correction of those four diagnostic fields;
+it does not claim access to arbitrary caught exceptions. The earlier cycle21
+measurement above remains an immutable historical result.
+
+A primary error and a cleanup error can both be present. The known acquisition
+message wins the primary slot while a throwing/nonboolean close stays in
+`cleanup_errors`. A valid idempotent false from an already closed bundled handle
+is accepted. No retry is added; a close that throws before release leaves cleanup
+unconfirmed, even though a test can later perform its own diagnostic close.
+
+Run `python3 tests/tooling/pbai_checkpoint_primary.py --product pblang` from PBLang
+or `--product pbai` from standalone with the complete trusted `PBLANG_BIN` launcher.
+Linux/Python/bubblewrap and the existing private-file exec plus exact libc/11-symbol
+profile are required. Real synthetic files exercise missing/invalid encoding after
+an acquired handle, normal/already-closed/malformed/throwing closers, recovery,
+first-file rejection, explicit body error with early close, opaque body exception
+and successful body. Original saved methods are observed before test cleanup;
+source-hidden copies and isolated `PBAI_STATE_ROOT` are removed after execution.
+
+`--phase baseline --baseline-owner FILE` compares an explicitly restored original
+scope. `--provider-stdlib DIR --expected-owner-sha256 HASH` qualifies a pinned
+provider copy. Neural-handle observation wrappers are test-only. Installed-copy
+qualification is separate from shared launcher activation or unmodified production
+acceptance. See [scoped evidence](evidence/pbai_checkpoint_primary-2026-10-09.json).
