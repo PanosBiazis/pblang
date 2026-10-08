@@ -190,3 +190,11 @@ and [local verification](benchmarks/pbai_student_review_checks-2026-09-28.json).
 Reviewed predictions now reuse the private evaluated adapters across calls and
 follow acceptance/rollback without reloading. For bounded prediction/comparison
 requests and measured inference behavior, see [student tools](pbAI_Student_Tools.md).
+
+## Migrated example and benchmark ownership (2026-10-08)
+
+The matching checkpoint, continuation and review examples now register captured
+closers before export/use and close on synchronous catchable failure. Their
+benchmarks close seeds, warmups and samples outside the timed work. See the exact
+[migrated caller scope and reproduction](pbAI_Caller_Ownership.md); other legacy
+callers remain separate work.

@@ -233,3 +233,11 @@ binding and manual loaded-handle ownership remain unchanged.
 For read-only comparison against the loaded baseline and a runnable session reload
 that rejects a well-formed but regressing candidate, see
 [reviewed checkpoint reload](pbAI_Reviewed_Reload.md).
+
+## Migrated example and benchmark ownership (2026-10-08)
+
+The matching checkpoint, continuation and review examples now register captured
+closers before export/use and close on synchronous catchable failure. Their
+benchmarks close seeds, warmups and samples outside the timed work. See the exact
+[migrated caller scope and reproduction](pbAI_Caller_Ownership.md); other legacy
+callers remain separate work.
