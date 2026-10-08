@@ -150,3 +150,5 @@ the variable shared-desktop load is visible in the raw samples. They do not
 establish an all-workload or all-device speedup, RAM savings, or a quality gain.
 See [raw before/after measurements](benchmarks/pbai_student_tools_performance-2026-10-03.json)
 and [verification](benchmarks/pbai_student_tools_checks-2026-10-03.json).
+
+The runnable tool example now scopes both its checkpoint seed and independently loaded active model, including export/use failures. The provider keeps ownership of its private batch handle. See [caller ownership and regression evidence](pbAI_Caller_Ownership.md#tool-and-distillation-examples-cycle-20).
