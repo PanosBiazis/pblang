@@ -30,7 +30,7 @@ onto a filesystem; secure destination handling is a separate operation.
 
 For explicit publication of validated ZIP bytes as one complete new `.zip` file,
 use the separate [archive publication API/CLI](ARCHIVE_PUBLICATION.md).
-For one nonempty member to a caller-chosen new file, see
+For one regular member (including empty STORE files) to a caller-chosen new file, see
 [selected-member extraction](ARCHIVE_EXTRACTION.md). All computation functions
 remain effect-free; offline MCP grants are unchanged.
 

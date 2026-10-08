@@ -2,7 +2,7 @@
 
 `stdlib:archive_publication.sapp` exports
 `extract_member(path, bytes, name, options=nil)`. It verifies the whole ZIP, then
-publishes one selected **nonempty regular file** to a new caller-chosen path.
+publishes one selected **regular file** (including empty ZIP STORE members) to a new caller-chosen path.
 `name` is an exact case-sensitive archive selector, never a destination path.
 There is no automatic directory-tree extraction, parent creation or overwrite.
 
@@ -38,7 +38,7 @@ CRC/decompression before opening the output directory. Corruption in an
 **unselected** member rejects the operation. The pure computation API
 `secure_archive.read_member(bytes,name,options=nil)` implements this selection
 and returns the full selected payload (not the 64 KiB preview), `size`, `name`,
-`directory`, `truncated:false`, `verified:true`, `effects_performed:false`.
+`directory`, compression `method`, `truncated:false`, `verified:true`, `effects_performed:false`.
 Unlike `unpack`, its result retains only one payload. This does not promise a
 particular VM garbage-collection schedule or physical memory ceiling.
 
@@ -63,9 +63,22 @@ invalid components and symlink parents. No weaker fallback is used.
 Results use `format:"pblang.archive-extraction.v1"` with the publication evidence
 fields documented above. `invalid_selection` covers archive/limits/selector
 failure without disclosing private names. `unsupported_member` explicitly
-rejects selected empty files and directory entries **before output effects**:
-the reused anonymous-range primitive currently requires at least one byte.
-Empty/unselected directory members remain valid within the ZIP.
+rejects selected directory entries and empty non-STORE members **before output effects**.
+Empty STORE members use the same complete anonymous-inode publication with zero
+payload bytes: mode0600, size0, file fsync, exclusive link, directory fsync.
+There is no special direct-write fallback. The native copy buffer and copy loop
+are skipped, but verification of every other ZIP member is retained.
+
+The shared `linux_dirfs.copy_held_range_new_atomic` adds a final optional
+`allow_empty=false`. Existing callers retain the positive-count requirement.
+Explicit zero publication additionally requires an immutable empty held snapshot,
+offset0, count0 and executable=false; invalid combinations reject before opening
+the output parent. This is not arbitrary zero-range truncation or directory creation.
+A zero file/total budget is valid for an entirely empty archive payload, while an
+unselected nonempty member still violates that budget.
+
+Example: `pblang run examples/secure_archive/extract_empty.sapp --allow-all -- NEW_FILE`.
+Empty DEFLATE selection and tree/directory extraction remain outside this slice.
 
 `output_may_exist:true` means inspect the destination before any retry. A failure
 after linking may leave the entire selected file in place; internal close errors
@@ -96,3 +109,18 @@ symlink behavior, a deterministic parent swap, two concurrent writers, injected
 ENOSPC after 65536 actual output bytes, fsync failures before/after linking and
 internal-close uncertainty. The model tests describe result projection; strace
 fault tests exercise real I/O. Neither is proof of every concurrent schedule.
+
+Empty-file regression and explicit backend-contract tests:
+
+```sh
+pblang run tests/semantics/archive_empty_range_test.sapp --allow-all -- SCRATCH
+python3 tests/semantics/archive_empty_cli_test.py /absolute/pblang-native
+python3 tests/semantics/archive_publication_cli_test.py /absolute/pblang-native all EVIDENCE_DIR empty
+python3 tests/semantics/archive_publication_evidence_test.py /absolute/pblang-native empty
+```
+
+The empty CLI test denies the copy-specific libc symbols calloc/pread/write in
+addition to the usual unrelated capabilities, demonstrating that the zero branch
+does not invoke those FFI operations. This is not a physical-RAM or zero-syscall
+claim: VM imports, input verification, snapshot/helper preparation and metadata
+publication still perform work.

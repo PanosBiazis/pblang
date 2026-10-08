@@ -16,7 +16,8 @@ evidence = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 if evidence:
     evidence.mkdir(parents=True, exist_ok=True)
 group = sys.argv[2] if len(sys.argv) > 2 else 'all'
-extract = len(sys.argv) > 4 and sys.argv[4] == 'extract'
+extract = len(sys.argv) > 4 and sys.argv[4] in ('extract', 'empty')
+empty = len(sys.argv) > 4 and sys.argv[4] == 'empty'
 script = 'archive_extract.sapp' if extract else 'archive_publish.sapp'
 flag = '--extract' if extract else '--publish'
 member_args = ['folder/binary.bin'] if extract else []
@@ -39,7 +40,7 @@ def zip_bytes(size=12):
 with tempfile.TemporaryDirectory(prefix='archive-cli-') as temporary:
     root = Path(temporary)
     source = root / 'input.zip'
-    source.write_bytes(zip_bytes())
+    source.write_bytes(zip_bytes(0 if empty else 12))
     original = source.read_bytes()
     sentinel = root / 'unrelated'
     sentinel.write_bytes(b'keep')
@@ -164,4 +165,4 @@ with tempfile.TemporaryDirectory(prefix='archive-cli-') as temporary:
             assert 'INJECTED' in trace.read_text()
     assert source.read_bytes() == original and sentinel.read_bytes() == b'keep'
     assert not any(p.name.startswith('.pblang-stage-') for p in root.iterdir())
-print(json.dumps({'passed': checks, 'count': len(checks), 'operation': 'extract' if extract else 'publish', 'partial_write_after_bytes': 65536 if 'partial_write' in checks else None}))
+print(json.dumps({'passed': checks, 'count': len(checks), 'operation': 'empty' if empty else ('extract' if extract else 'publish'), 'partial_write_after_bytes': 65536 if 'partial_write' in checks else None}))

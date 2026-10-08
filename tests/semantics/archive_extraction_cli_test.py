@@ -56,7 +56,9 @@ with tempfile.TemporaryDirectory(prefix='archive-selection-') as tmp:
         cursor += 46 + int.from_bytes(encrypted[cursor+28:cursor+30], 'little')
     run('encryption-flags', encrypted)
     run('missing', good, name='absent')
-    run('empty', archive([('chosen', b'')]))
+    dst, _ = run('empty', archive([('chosen', b'')]), ok=True)
+    assert dst.read_bytes() == b''
+    run('empty-deflate', archive([('chosen', b'')], zipfile.ZIP_DEFLATED))
     run('directory', archive([('chosen/', b'')]), name='chosen/')
     run('expanded-limit', archive([('chosen', b'x'*1048577)], zipfile.ZIP_DEFLATED))
     run('entry-limit', archive([('chosen', b'x')]+[(f'f{i}',b'') for i in range(256)]))
