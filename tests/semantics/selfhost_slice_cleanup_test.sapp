@@ -1,0 +1,50 @@
+// String/array slicing failures preserve ownership and distinct host bound rules.
+let V=import("stdlib:compiler/vm.sapp");let F=import("stdlib:compiler/selfhost_frontend.sapp");
+let O=import("stdlib:compiler/optimizer.sapp");let P=import("stdlib:selfhost_pbck.sapp");
+fn compiled(s){let r=F.frontend_compile("fn call3(f,a,b,c){return f(a,b,c);}"+s);assert(r.ok,"compile: "+str(r.diagnostics));return r.chunk;}
+let setup=compiled("memory_alloc(7);push_lifetime();borrow_immutable(1);memory_alloc(9);");
+fn prepare(owned){let c=V.execution_context(owned);V.run_seeded(setup,map{},c);return c;}
+fn run(code,bounded,c,g){if bounded {return V.run_seeded_bounded(code,g,nil,c);}return V.run_seeded(code,g,c);}
+let sources=["call3(str_slice,nil,0,1)", "call3(str_slice,\"x\",nil,1)", "call3(str_slice,\"x\",0,nil)", "call3(str_slice,\"x\",-1,1)", "call3(str_slice,\"x\",num_sqrt(-1),1)", "call3(str_slice,\"x\",0,-1)", "call3(str_slice,bigint(1),0,1)", "call3(slice,nil,nil,nil)", "call3(slice,[1],-1,nil)", "call3(slice,[1],0,\"x\")", "call3(slice,[1],num_exp(1000),nil)", "call3(slice,[1],nil,num_sqrt(-1))", "call3(slice,map{},-1,-1)", "fn cut(a,b){return a[b..];}cut([1],-1)", "fn bad(f){return f(\"a\",0);}bad(str_slice)", "fn bad(f){return f(\"a\",0,1,2);}bad(slice)"];
+let handler=compiled("print memory_get(1);");
+for source in sources {
+ let code=compiled(source+";");
+ for bounded in [false,true] {
+  for owned in [false,true] {
+   let c=prepare(owned);let m=c.memory;
+   assert((try {run(code,bounded,c,map{});false} catch true),"slice rejects");
+   assert(m.closed==owned and c.handlers==0,"escape ownership");
+   if owned {assert(c.memory==nil and m.reclaimed==2 and len(m.owners)==0 and len(m.borrows)==0,"both lifetimes and borrow released");}
+   else {assert(c.memory==m and len(m.owners)==2 and len(m.borrows)==1,"caller-owned memory retained");}
+   V.close_execution(c);V.close_execution(c);assert(m.reclaimed==2,"idempotent close");
+  }
+  let c=prepare(true);let m=c.memory;
+  let caught=map{constants:[map{try_chunk:code,catch_chunk:handler}],instructions:[map{op:35,operand:0}]};
+  assert(run(caught,bounded,c,map{}).output==[7] and not m.closed and c.handlers==0,"handler memory remains usable");V.close_execution(c);
+ }
+}
+// Raw IR values cover target/bound types including boxed exact numbers.
+fn raw(name,values){return map{constants:[map{__bi:name},values[0],values[1],values[2]],instructions:[map{op:0,operand:0},map{op:0,operand:1},map{op:0,operand:2},map{op:0,operand:3},map{op:18,operand:3}]};}
+for name in ["slice","str_slice"] {
+ for bad in [nil,true,1,map{},bigint(1),rational(1,2),decimal(1)] {
+  for bounded in [false,true] {let c=prepare(true);let m=c.memory;assert((try {run(raw(name,[bad,0,1]),bounded,c,map{});false} catch true),"invalid sequence");assert(m.closed and m.reclaimed==2,"sequence cleanup");}
+ }
+ for bad in [true,"0",[],map{},bigint(1),rational(1,2),decimal(1),-1,num_sqrt(-1)] {
+  for values in [["α🙂",bad,1],["α🙂",0,bad]] {let c=prepare(true);let m=c.memory;assert((try {run(raw(name,values),true,c,map{});false} catch true),"invalid bound");assert(m.closed and m.reclaimed==2,"bound cleanup");}
+ }
+ let code=compiled("let calls=[];fn arg(n){array_push(calls,n);return nil;}call3("+name+",arg(1),arg(2),arg(3));");
+ for variant in [code,O.optimize_safe(code).chunk,P.deserialize_chunk(P.serialize_chunk(code))] {
+  for bounded in [false,true] {let c=prepare(true);let g=map{};assert((try {run(variant,bounded,c,g);false} catch true),"slice failure");assert(c.memory==nil and g.calls==[1,2,3],"arguments once in order");}
+ }
+ let c=prepare(true);let m=c.memory;m.reclaimed=map{};assert((try {run(code,false,c,map{});false} catch true),"secondary cleanup fault");m.reclaimed=0;V.close_execution(c);assert(m.closed,"corrupt fixture restored");
+ let shadow=F.frontend_compile("fn "+name+"(a,b,c){return a;}print "+name+"(nil,nil,nil);");let c2=prepare(true);assert(shadow.ok and run(shadow.chunk,true,c2,map{}).output==[nil] and not c2.memory.closed,"shadowing unchanged");V.close_execution(c2);
+}
+let valid=compiled("print str_slice(\"α🙂β\",1,2);print str_slice(\"abc\",0,num_exp(1000));print str_slice(\"abc\",2,1);print str_slice(\"abc\",0.9,2.9);print slice([1,2,3],1,nil);print slice(\"α🙂β\",nil,2);print slice([1,2],8,9);let a=[1,2,3];print a[..];print a[1..];print a[..2];print a[1..2];");
+let expected=["🙂","abc","","ab",[2,3],"α🙂",[],[1,2,3],[2,3],[1,2],[2]];
+for variant in [valid,O.optimize_safe(valid).chunk,P.deserialize_chunk(P.serialize_chunk(valid))] {for bounded in [false,true] {let c=prepare(true);assert(run(variant,bounded,c,map{}).output==expected and not c.memory.closed,"valid slice contracts");V.close_execution(c);}}
+// Array slicing makes a new outer array while retaining nested element identity.
+let alias=compiled("let inner=map{x:1};let a=[inner,2];let b=slice(a,0,1);b[0].x=3;array_push(b,9);print a[0].x;print len(a);b[0]=nil;print a[0].x;print len(b);");let c=prepare(true);assert(run(alias,true,c,map{}).output==[3,2,3,2] and not c.memory.closed,"shallow copy semantics");V.close_execution(c);
+for source in ["fn f(a){return a[-1..];}f([1]);","fn f(a){return a[..-1];}f([1]);","fn f(a){return a[0..1];}f(nil);","fn f(a){return a[..];}f(nil);"] {let code=compiled(source);for variant in [code,O.optimize_safe(code).chunk,P.deserialize_chunk(P.serialize_chunk(code))] {let c=prepare(true);assert((try {run(variant,true,c,map{});false} catch true) and c.memory==nil,"range-sugar cleanup");}}
+let late=compiled("memory_alloc(3);print try call3(slice,[1],-1,nil) catch 7;call3(str_slice,\"x\",nil,1);");let c=V.execution_context(true);assert((try {run(late,true,c,map{});false} catch true) and c.memory==nil and c.handlers==0,"late allocation escape");
+let nested=compiled("try call3(slice,[1],-1,nil) catch call3(str_slice,\"x\",0,nil);");let c=prepare(true);assert((try {run(nested,true,c,map{});false} catch true) and c.memory==nil and c.handlers==0,"failing guest catch cleans");
+print "selfhost_slice_cleanup_pass";
