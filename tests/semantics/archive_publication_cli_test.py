@@ -16,6 +16,15 @@ evidence = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 if evidence:
     evidence.mkdir(parents=True, exist_ok=True)
 group = sys.argv[2] if len(sys.argv) > 2 else 'all'
+extract = len(sys.argv) > 4 and sys.argv[4] == 'extract'
+script = 'archive_extract.sapp' if extract else 'archive_publish.sapp'
+flag = '--extract' if extract else '--publish'
+member_args = ['folder/binary.bin'] if extract else []
+
+def expected(data):
+    if extract:
+        with zipfile.ZipFile(io.BytesIO(data)) as z: return z.read('folder/binary.bin')
+    return data
 assert group in ('all', 'basic', 'faults', 'close')
 
 
@@ -36,8 +45,8 @@ with tempfile.TemporaryDirectory(prefix='archive-cli-') as temporary:
     sentinel.write_bytes(b'keep')
 
     def run(label, dest, *, src=source, inject=None, success=False, trace=False, args=None):
-        command = [runtime, 'run', str(repo / 'tools/archive_publish.sapp'), '--allow-all', '--',
-                   '--publish', str(src), str(dest)]
+        command = [runtime, 'run', str(repo / 'tools' / script), '--allow-all', '--',
+                   flag, str(src), *member_args, str(dest)]
         if args is not None:
             command = command[:5] + args
         log = root / (label + '.trace')
@@ -66,12 +75,13 @@ with tempfile.TemporaryDirectory(prefix='archive-cli-') as temporary:
         dest = root / 'new.zip'
         r, _ = run('success', dest, success=True)
         assert r['publication_confirmed'] and r['durability_verified'] and r['wrapper_handles_closed']
-        assert dest.read_bytes() == original and dest.stat().st_mode & 0o777 == 0o600
-        with zipfile.ZipFile(dest) as z:
-            assert z.testzip() is None and z.read('folder/binary.bin') == b'x' * 12
+        assert dest.read_bytes() == expected(original) and dest.stat().st_mode & 0o777 == 0o600
+        if not extract:
+            with zipfile.ZipFile(dest) as z:
+                assert z.testzip() is None and z.read('folder/binary.bin') == b'x' * 12
         inode = dest.stat().st_ino
         run('collision', dest)
-        assert dest.stat().st_ino == inode and dest.read_bytes() == original
+        assert dest.stat().st_ino == inode and dest.read_bytes() == expected(original)
         run('same_input', source)
         for kind in ['symlink', 'hardlink', 'directory']:
             path = root / (kind + '.zip')
@@ -82,13 +92,13 @@ with tempfile.TemporaryDirectory(prefix='archive-cli-') as temporary:
             run(kind, path)
             assert path.lstat().st_ino == before.st_ino and sentinel.read_bytes() == b'keep'
         race = root / 'race.zip'
-        command = [runtime, 'run', str(repo / 'tools/archive_publish.sapp'), '--allow-all', '--',
-                   '--publish', str(source), str(race)]
+        command = [runtime, 'run', str(repo / 'tools' / script), '--allow-all', '--',
+                   flag, str(source), *member_args, str(race)]
         writers = [subprocess.Popen(command, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True) for _ in range(2)]
         results = [writer.communicate(timeout=45) for writer in writers]
         assert sorted(writer.returncode for writer in writers) == [0, 1], results
-        assert race.read_bytes() == original
+        assert race.read_bytes() == expected(original)
         checks.append('two_writer_no_replace')
         linked = root / 'linked-parent'
         linked.symlink_to(root, target_is_directory=True)
@@ -114,7 +124,7 @@ with tempfile.TemporaryDirectory(prefix='archive-cli-') as temporary:
             assert 'INJECTED' in log.read_text() and out.exists() == exists
             assert r['output_may_exist'] and not r['partial_output_possible']
             if exists:
-                assert out.read_bytes() == original and r['written'] and r['publication_confirmed']
+                assert out.read_bytes() == expected(original) and r['written'] and r['publication_confirmed']
                 assert not r['durability_verified']
             else:
                 assert 'written' not in r
@@ -149,9 +159,9 @@ with tempfile.TemporaryDirectory(prefix='archive-cli-') as temporary:
                                   ('fsync_internal_close', ['fsync:error=EIO:when=2', f'close:error=EIO:when={ordinal}'])]:
             out = root / (label + '.zip')
             r, trace = run(label, out, inject=injections)
-            assert out.read_bytes() == original and not r['publication_confirmed']
+            assert out.read_bytes() == expected(original) and not r['publication_confirmed']
             assert r['output_may_exist'] and 'written' not in r and r['wrapper_handles_closed']
             assert 'INJECTED' in trace.read_text()
     assert source.read_bytes() == original and sentinel.read_bytes() == b'keep'
     assert not any(p.name.startswith('.pblang-stage-') for p in root.iterdir())
-print(json.dumps({'passed': checks, 'count': len(checks), 'partial_write_after_bytes': 65536 if 'partial_write' in checks else None}))
+print(json.dumps({'passed': checks, 'count': len(checks), 'operation': 'extract' if extract else 'publish', 'partial_write_after_bytes': 65536 if 'partial_write' in checks else None}))

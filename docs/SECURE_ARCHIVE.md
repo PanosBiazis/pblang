@@ -2,7 +2,8 @@
 
 `stdlib:secure_archive.sapp` provides `pack(files, mode="fast", options=nil)`,
 `inspect(bytes, options=nil)`, `unpack(bytes, options=nil)` and
-`view(bytes, name, max_bytes=4096, options=nil)` in PBLang source.
+`view(bytes, name, max_bytes=4096, options=nil)`, plus
+`read_member(bytes,name,options=nil)` for one full selected payload, in PBLang source.
 See `examples/secure_archive/main.sapp` for a binary/directory round trip.
 
 Files are opaque byte arrays. A tree is an explicit array of `{name,data}` maps;
@@ -29,7 +30,9 @@ onto a filesystem; secure destination handling is a separate operation.
 
 For explicit publication of validated ZIP bytes as one complete new `.zip` file,
 use the separate [archive publication API/CLI](ARCHIVE_PUBLICATION.md).
-The four computation functions above and the offline MCP grants are unchanged.
+For one nonempty member to a caller-chosen new file, see
+[selected-member extraction](ARCHIVE_EXTRACTION.md). All computation functions
+remain effect-free; offline MCP grants are unchanged.
 
 `fast` compares fixed-Huffman DEFLATE against STORE and avoids dynamic-Huffman
 construction; `auto` retains the existing three-way compression choice; `store`
