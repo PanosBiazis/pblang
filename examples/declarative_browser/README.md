@@ -287,7 +287,12 @@ size, title size, text scale, line spacing and density. The layout shows one cho
 minimum 320×240 viewport, two at 320×288, and up to six as height allows.
 **Previous options / Next options**, Page Up/Down and Home/End navigate these option
 pages while Style is open; document reading position is unchanged. Changing pages
-focuses the first displayed choice. Tab/Shift+Tab and Enter/Space retain their
+focuses the first enabled choice on the destination page. A page containing only
+an unavailable Save action is skipped in the requested direction, so Apply and
+Reset remain reachable even at 320×240. A disabled Save sharing a page with Reset
+does not redirect navigation to a different page. The separate recovery behavior
+after a failed Save still focuses Reload (or Apply when Reload is unavailable).
+Tab/Shift+Tab and Enter/Space retain their
 existing control behavior, and held activation keys do not change a newly focused
 choice unintentionally. Done remains in the top toolbar and returns to the document.
 
@@ -302,7 +307,10 @@ effects. The native launcher additionally exposes the optional profile workflow
 described below; its default remains session-only.
 
 Developers may call `App.settings_page(reader,index)` (zero-based, clamped, false
-when unavailable or unchanged). The example-local `settings_layout.plan(height,
+when unavailable or unchanged). Disabled-only pages resolve forward or backward
+relative to the current page; paging does not apply, save, reset or reload any
+settings. See `disabled_page_demo.sapp` for an executable read-only example.
+The example-local `settings_layout.plan(height,
 anchor, total=6)` computes capacity and visible indices without opening a window;
 anchor is a zero-based choice index, and height uses the existing GUI bounds
 240–4320. The optional preferences workflow uses `total=9` for its actions, or `total=10` with explicit reload. Shared GUI
