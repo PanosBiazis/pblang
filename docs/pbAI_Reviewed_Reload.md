@@ -85,6 +85,10 @@ checkpoints, refusing to overwrite existing names: student.json (label 5, 64
 steps), worse.json (label 6, 64 steps), better.json (label 5, 128 steps). The
 example uses one declared application example, x=[6,0], y=5. These tiny rank-1
 8-token specialists are a reproducible fixture, not a representative AI benchmark.
+Each preparation now registers its trained handle before checkpoint export/save
+and closes it before the next iteration, including catchable failures. Failure
+retains already-created checkpoint files; preparation is not a rollback transaction.
+See the [caller ownership tests and boundaries](pbAI_Caller_Ownership.md).
 
 Recovery tries missing, worse, better and better again. The expected decisions
 are load_failed, rejected, replaced, unchanged, with active token 5 throughout.

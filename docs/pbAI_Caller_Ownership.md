@@ -88,7 +88,57 @@ unmodified example/benchmark executions and core semantic regressions supplement
 these instrumented observations.
 
 See [the scoped evidence](evidence/pbai_caller_ownership-2026-10-08.json).
-Other callers, including legacy file-origin measurements and separate review-close,
-file-preparation and tool examples, are not automatically migrated by this change.
-Their remaining ownership work must be assessed individually; existing historical
-benchmark evidence is not rewritten.
+Other callers, including legacy file-origin measurements, the separate checkpoint-file
+write/read example and tool examples, still require individual ownership assessment.
+Existing historical benchmark evidence is not rewritten.
+
+## Review close and reviewed-reload preparation (cycle 19)
+
+Two more examples are migrated in both products:
+
+- `pbai_student_review_close.sapp` registers the seed, reviewed handle and restored
+  handle before export or use. The seed closes immediately after detached export.
+  Its existing demonstration still explicitly closes the reviewed handle twice,
+  observes terminal prediction, and reloads the earlier export. Final scope cleanup
+  treats already-closed bundled handles as valid no-ops and closes the restored one.
+- `pbai_student_checkpoint_reload_reviewed.sapp`, **prepare branch only**, gives
+  each trained model its own scope. It closes that model before starting the next
+  file, including after export or exclusive-save failure. A failed later acquisition
+  has no new returned handle and all preceding models are already closed.
+
+The prepare operation is still nontransactional: earlier explicitly saved files
+remain if a later operation fails. Existing destinations are never overwritten.
+Cleanup changes neither serialized checkpoint bytes nor training options. A failed
+body/cleanup makes the example fail; the current scope does not expose caught
+exception text, so the outer assertion reports workflow failure. The
+recover and review-error branches are unchanged. Their `with_file` callback borrows
+its candidate from the checkpoint scope; that scope remains its owner. The active
+model and any independently reconstructed replacement have separate ownership.
+The teacher training result is an artifact/report, not a closeable model handle.
+
+The same observer now supports:
+
+```sh
+python3 tests/tooling/pbai_caller_lifetime.py --product pblang --target review_close
+python3 tests/tooling/pbai_caller_lifetime.py --product pblang --target checkpoint_reload_reviewed
+```
+
+Use `--product pbai` in standalone. These two targets are example-only. The second
+runs prepare against a private harness-created directory, preserving the real file
+adapter and exclusive-create behavior. Its save-failure case puts a synthetic
+existing destination at the second name and checks that its bytes remain unchanged.
+The harness removes only its own temporary fixture after observation.
+
+The review-close observer covers success, seed export failure, reviewed export
+failure, malformed reviewed/restored prediction, failure acquiring the reviewed or
+restored model, and recovery success. Preparation covers success, export failure,
+real save failure, later acquisition failure, and recovery in the same process.
+Saved original methods are inspected before diagnostic cleanup, with exactly one
+first close required per real handle, including the review constructor's already
+owned intermediate continuation. Serialized exports and saved-file byte digests
+are compared before/after; direct unwrapped executions also check recover and
+review-error compatibility. No model algorithm or handle API is changed.
+
+See [cycle 19 evidence](evidence/pbai_remaining_caller_ownership-2026-10-08.json).
+The observer retains aliases and demonstrates explicit closure only, not physical
+memory release, zeroization, hard-kill recovery or universal device support.
