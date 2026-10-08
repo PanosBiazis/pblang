@@ -338,3 +338,29 @@ and other backends. It is not a speedup claim.
 The retained native compiler and its nested `p:run()` source bug are unchanged.
 Native PBCK execution uses a different runtime path; PBCS replay here means the
 self-host IR serializer and the PBLang VM, not a fix to that retained compiler.
+
+## Bounded runtime initialization rejection
+
+`run_seeded_bounded` now passes its private execution ownership into limit
+validation. Invalid option shapes and explicit positive-integer/range rejection
+close opted-in unhandled memory even though guest execution has not started.
+Ordered comparison of a numeric NaN still invokes the retained host once after
+eligible cleanup, preserving its original diagnostic rather than replacing it
+with the ordinary limit-validation message. All six limits keep the same
+validation order, defaults and hard maxima; unknown keys are still ignored.
+
+Borrowed contexts and contexts protected by an existing handler retain memory.
+No guest instruction, callback, or validation pass is replayed. The public
+`runtime_limits(options)` API remains an ownership-free inspection operation.
+The unbounded entry and running-program budget/exception behavior are unchanged.
+A secondary cleanup error cannot replace the original initialization error.
+This covers declared option/limit rejection and numeric NaN comparison, not
+arbitrary overloaded operations on malicious option metadata, allocation failure,
+native initialization/FFI crashes or physical RAM reclamation.
+
+`tests/semantics/selfhost_initialization_cleanup_test.sapp` checks all six limits,
+owned/borrowed/protected contexts, rejected-before-execution effects, accepted
+bounds/defaults, optimized/PBCS guest chunks and secondary cleanup failure.
+The diagnostic driver adds `--initialization --reference PREVIOUS_RELEASE`.
+`examples/selfhost_throw_cleanup/initialization.sapp` is the installation probe.
+No speedup is claimed; earlier conversion/async performance findings remain open.

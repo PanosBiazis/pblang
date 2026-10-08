@@ -26,6 +26,7 @@ def main():
     ap.add_argument('--slices', action='store_true')
     ap.add_argument('--map-fallback', action='store_true')
     ap.add_argument('--equality', action='store_true')
+    ap.add_argument('--initialization', action='store_true')
     ap.add_argument('--start', type=int, default=0)
     ap.add_argument('--count', type=int, default=3)
     a = ap.parse_args()
@@ -69,6 +70,39 @@ def main():
         if a.suite:
             result = run(a.suite.read_text())
             record(a.suite.name, result['exit'] == 0 and '_pass' in result['stdout'], result=result)
+            return
+
+        if a.initialization:
+            assert a.reference, '--reference is required for initialization diagnostics'
+            limits = ['max_steps', 'max_frames', 'max_stack', 'max_locals', 'max_output', 'max_value_items']
+            cases = [('option-shape', '7', False)]
+            cases += [(key + '/' + value, 'map{' + key + ':' + value + '}', False)
+                      for key in limits for value in ['0', 'num_sqrt(-1)']]
+            cases += [('defaults', 'nil', True), ('valid-limits', 'map{max_steps:8,max_frames:1}', True)]
+            prefix = ('let V=import("stdlib:compiler/vm.sapp");'
+                      'let c=V.execution_context(true);'
+                      'let setup=map{constants:[map{__bi:"memory_alloc"},7],'
+                      'instructions:[map{op:0,operand:0},map{op:0,operand:1},map{op:18,operand:1}]};'
+                      'V.run_seeded(setup,map{},c);let empty=map{constants:[],instructions:[]};')
+            for label, options, valid in cases[a.start:a.start + a.count]:
+                for route, expression in [
+                        ('seeded', 'V.run_seeded_bounded(empty,map{},options,c).runtime.max_steps'),
+                        ('owned-entry', 'V.run_bounded(empty,options).runtime.max_steps'),
+                        ('inspection', 'V.runtime_limits(options).max_steps')]:
+                    source = prefix + 'let options=' + options + ';print ' + expression + ';V.close_execution(c);'
+                    expected = run(source, a.reference.resolve())
+                    assert (expected['exit'] == 0) == valid
+                    if not valid:
+                        assert expected['error'] is not None
+                    actual = run(source)
+                    record(label + '/' + route, actual == expected, expected=expected, result=actual)
+                if not valid:
+                    source = (prefix + 'c.memory.reclaimed=map{};let options=' + options + ';'
+                              'V.run_seeded_bounded(empty,map{},options,c);')
+                    expected = run(source, a.reference.resolve())
+                    actual = run(source)
+                    record(label + '/secondary-close-fault', actual == expected,
+                           expected=expected, result=actual)
             return
 
         cases = [(op, 'fn f(a,b){return a' + op + 'b;}f(nil,2);', False)
