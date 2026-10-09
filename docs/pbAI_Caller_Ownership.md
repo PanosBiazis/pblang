@@ -88,8 +88,8 @@ unmodified example/benchmark executions and core semantic regressions supplement
 these instrumented observations.
 
 See [the scoped evidence](evidence/pbai_caller_ownership-2026-10-08.json).
-Other callers, including legacy file-origin measurements, the separate checkpoint-file
-write/read example, still require individual ownership assessment.
+Other callers, including legacy file-origin measurements and checkpoint-file
+read/reload failure paths, still require individual ownership assessment.
 Existing historical benchmark evidence is not rewritten.
 
 ## Review close and reviewed-reload preparation (cycle 19)
@@ -192,3 +192,36 @@ See [cycle 20 evidence](evidence/pbai_tool_distill_caller_ownership-2026-10-08.j
 This proves explicit cleanup for these callers; it does not establish physical RAM
 reclamation, zeroization, performance gains, AGI/ASI or universal platform support.
 Other test/benchmark callers and file workflows remain individually scoped work.
+
+
+## Checkpoint-file write ownership (cycle 25)
+
+The `write` branch of `pbai_student_checkpoint_file.sapp` now opens a resource
+scope before training and registers the returned student's captured closer before
+exporting its checkpoint. Export and exclusive-save failures retain fixed primary
+messages even if cleanup also fails. Unexpected constructor/assertion exceptions
+remain opaque. Cleanup runs once; only boolean results are valid, including the
+idempotent `false`. A throwing or nonboolean closer prevents success output.
+The successful output schema, training options and saved checkpoint bytes remain
+unchanged. The teacher is an artifact/report, not a second owned handle.
+
+A successfully saved file remains if subsequent cleanup fails: this example is
+not a transaction. Existing destination bytes are never replaced. A close that
+throws before release leaves the model's release unconfirmed; there is no automatic
+retry. The test's later diagnostic cleanup is separate from application cleanup.
+The read/reload/close branches are unchanged and still need separate exception-path
+ownership review.
+
+```sh
+python3 tests/tooling/pbai_caller_lifetime.py --product pblang --target checkpoint_file
+```
+
+Use `--product pbai` in the sibling standalone checkout. The example-only observer
+runs ten cases per product: success, export failure, real exclusive-save failure,
+initial construction failure, close failures before and after release, a nonboolean
+close, combined export/close and save/close failures, and recovery success. Saved
+original operations are inspected before diagnostic cleanup, and real checkpoint
+bytes and existing-file sentinels are checked. This uses the existing Linux
+source-hidden file observer profile, not a new sandbox or cross-platform guarantee.
+No training algorithm, model API, physical-memory or AGI/ASI claim follows from
+these lifecycle tests. See [cycle 25 evidence](evidence/pbai_file_write_ownership-2026-10-09.json).

@@ -41,7 +41,7 @@ def quality(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--product", choices=["pblang", "pbai"], required=True)
-    parser.add_argument("--target", choices=["checkpoint", "continuation", "review", "review_close", "checkpoint_reload_reviewed", "tools", "distillation", "supervised"], required=True)
+    parser.add_argument("--target", choices=["checkpoint", "checkpoint_file", "continuation", "review", "review_close", "checkpoint_reload_reviewed", "checkpoint_file", "tools", "distillation", "supervised"], required=True)
     parser.add_argument("--kind", choices=["example", "benchmark"], default="example")
     parser.add_argument("--phase", choices=["baseline", "fixed"], default="fixed")
     args = parser.parse_args()
@@ -53,7 +53,7 @@ def main():
     directory = "bench" if args.kind == "benchmark" else ("examples" if args.product == "pblang" else "demo")
     pure_targets = {"tools": "pbai_student_tools.sapp", "distillation": "pbai_neural_distillation.sapp", "supervised": "pbai_specialist_supervised_distillation.sapp"}
     caller = root / directory / pure_targets.get(args.target, "pbai_student_" + args.target + ".sapp")
-    if args.kind == "benchmark" and (args.target in {"review_close", "checkpoint_reload_reviewed"} or args.target in pure_targets):
+    if args.kind == "benchmark" and (args.target in {"review_close", "checkpoint_reload_reviewed", "checkpoint_file"} or args.target in pure_targets):
         parser.error("remaining-caller targets are examples only")
     source = caller.read_text()
     fixtures = root / "tests/fixtures"
@@ -89,9 +89,11 @@ def main():
             hooks += "\nfn " + name + "(" + parameters + "){_caller_probe_acquire(" + json.dumps(kind) + ");return _caller_probe_wrap(" + original + "(" + arguments + ")," + json.dumps(kind) + ");}\n"
         assert provider.count("fn _number(") == 1
         owner.write_text(provider.replace("fn _number(", hooks + "\nfn _number(", 1))
-        scenario_name = "pbai_remaining_caller_scenario.sapp" if args.target in {"review_close", "checkpoint_reload_reviewed"} else "pbai_caller_lifetime_scenario.sapp"
+        scenario_name = "pbai_remaining_caller_scenario.sapp" if args.target in {"review_close", "checkpoint_reload_reviewed", "checkpoint_file"} else "pbai_caller_lifetime_scenario.sapp"
         if args.target in pure_targets:
             scenario_name = "pbai_tool_distill_caller_scenario.sapp"
+        if args.target == "checkpoint_file":
+            scenario_name = "pbai_file_write_caller_scenario.sapp"
         scenario = (fixtures / scenario_name).read_text()
         placeholder = 'fn _caller_workflow(){throw "test harness must supply the real caller";}'
         assert scenario.count(placeholder) == 1
@@ -101,9 +103,9 @@ def main():
                    PBAI_CALLER_BENCHMARK="1" if args.kind == "benchmark" else "0",
                    PBAI_CALLER_LIFETIME_PHASE=args.phase)
         (temporary / "state").mkdir(mode=0o700)
-        if args.target == "checkpoint_reload_reviewed":
+        if args.target in {"checkpoint_reload_reviewed", "checkpoint_file"}:
             (temporary / "checkpoints").mkdir(mode=0o700)
-            env.update(PBAI_CHECKPOINT_TEST_DIR=str(temporary / "checkpoints"), PBAI_RELOAD_PHASE="prepare")
+            env.update(PBAI_CHECKPOINT_TEST_DIR=str(temporary / "checkpoints"), PBAI_RELOAD_PHASE="prepare", PBAI_CHECKPOINT_TEST_PHASE="write")
         if args.product == "pbai":
             run([str(runtime), "build"], private_embedded, env)
         run([str(runtime), "build"], project, env)
