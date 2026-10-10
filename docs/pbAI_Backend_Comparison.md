@@ -42,8 +42,8 @@ Run the two pure tests from either product with the seven runtime capability
 categories denied:
 
 ```sh
-pblang run tests/semantics/pbai_optimization_test.sapp --sandbox
-pblang run tests/semantics/pbai_optimization_comparison_test.sapp --sandbox
+pblang run tests/semantics/pbai_optimization_test.sapp --deny-net --deny-http --deny-exec --deny-ffi --deny-spawn --deny-gfx --deny-sqlite
+pblang run tests/semantics/pbai_optimization_comparison_test.sapp --deny-net --deny-http --deny-exec --deny-ffi --deny-spawn --deny-gfx --deny-sqlite
 ```
 
 The original suite covers selection/fallback, quality, NPU, planning and status.

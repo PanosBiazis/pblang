@@ -225,3 +225,64 @@ bytes and existing-file sentinels are checked. This uses the existing Linux
 source-hidden file observer profile, not a new sandbox or cross-platform guarantee.
 No training algorithm, model API, physical-memory or AGI/ASI claim follows from
 these lifecycle tests. See [cycle 25 evidence](evidence/pbai_file_write_ownership-2026-10-09.json).
+
+
+## Guarded checkpoint-file read/reload (explicit PBCK profile)
+
+`pbai_student_checkpoint_file_guarded.sapp` is a companion compilation input in
+`examples/` (PBLang) or `demo/` (standalone). It exposes `checkpoint_work` and
+`checkpoint_release` for the existing PBLang-native compiler cleanup boundary.
+It supports `read` and `reload`; continue using the original example for `write`
+and `close`. The original direct-source read/reload branches retain their
+historical exception-cleanup limitation. Running the companion as ordinary source
+does not invoke its declared entry. Use the explicit guarded compilation below.
+
+From the trusted PBLang project directory:
+
+```sh
+pblang run tools/pbc.sapp --allow-all -- examples/pbai_student_checkpoint_file_guarded.sapp --target pbck --entry checkpoint_work --cleanup checkpoint_release --out checkpoint-guarded.pbck
+PBAI_CHECKPOINT_TEST_DIR="$PRIVATE_CHECKPOINT_DIR" PBAI_CHECKPOINT_TEST_PHASE=read pblang run checkpoint-guarded.pbck --allow-all --deny-net --deny-http --deny-spawn --deny-gfx --deny-sqlite
+PBAI_CHECKPOINT_TEST_DIR="$PRIVATE_CHECKPOINT_DIR" PBAI_CHECKPOINT_TEST_PHASE=reload pblang run checkpoint-guarded.pbck --allow-all --deny-net --deny-http --deny-spawn --deny-gfx --deny-sqlite
+```
+
+For standalone, run from its project directory, use the sibling provider compiler
+`../pblang/tools/pbc.sapp` and source `demo/pbai_student_checkpoint_file_guarded.sapp`.
+Keep the generated artifact inside its product project so its imports can find
+the product manifest; moving it to an unrelated directory without that layout is
+unsupported. Compile to a new private output filename. The existing compiler output is not an
+exclusive-create transaction. The artifact retains module imports and requires
+the qualified product/provider layout and trusted working directory; this is not
+a relocatable dependency-free executable. The private checkpoint directory must
+already meet the existing Linux adapter's private/no-follow rules. No capability
+allowlist is strengthened by this example; the file profile retains exec/FFI
+permissions, while networking, spawn, graphics and SQLite are denied in tests.
+
+The guard captures cleanup before entering the workflow. Each returned handle's
+closer is saved immediately and its attempt flag is set before calling it.
+A rejected candidate leaves the previous model intact. A successfully loaded
+replacement is separately owned before the retired model is closed. If retired
+close throws, cleanup still attempts the replacement exactly once. Other active
+models remain caller-owned. Success output retains the old read/reload schema and
+is printed only after cleanup and terminal-prediction checks.
+
+If the work throws, the compiled boundary preserves the original native message,
+including when cleanup also fails. Cleanup continues through remaining handles;
+throwing/nonboolean cleanup on an otherwise successful body prevents success
+output. Boolean false is a valid idempotent response and is reported as such.
+There is no automatic retry after a before-release exception. Initializer/import
+failures before entry, hard termination, OOM and nonreturning cleanup remain out
+of scope. No runtime/compiler/shared primitive was changed.
+
+The standalone and embedded qualification driver is:
+
+```sh
+PBLANG_BIN="$TRUSTED_PBLANG_RUNTIME" python3 tests/tooling/pbai_guarded_file_lifetime.py --product pblang
+```
+
+Use `--product pbai` in standalone. It compares the actual historical caller to
+the companion using real private files, saved original model aliases, independent
+active-model preservation and synthetic faults. Observation precedes diagnostic
+cleanup. Unmodified companion runs verify success/fallback output parity. The
+private copies hide the original source roots and deny networking. This is Linux
+qualification of the explicit profile, not universal source cleanup or physical
+RAM reclamation. See [guarded evidence](evidence/pbai_guarded_file_ownership-2026-10-10.json).
