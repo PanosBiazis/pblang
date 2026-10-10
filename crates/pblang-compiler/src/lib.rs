@@ -125,6 +125,73 @@ enum Resolved {
 }
 
 impl Compiler {
+    /// Empty placeholder used while a compiler is temporarily owned by a child.
+    fn detached() -> Compiler {
+        Compiler {
+            chunk: Chunk::default(),
+            globals: HashMap::new(),
+            locals: vec![],
+            scope_depth: 0,
+            upvalues: vec![],
+            enclosing: None,
+            loop_ctx: vec![],
+            error: None,
+        }
+    }
+
+    /// Start compiling a nested function whose enclosing compiler is the *real*
+    /// current compiler (moved into the child), not a copy.
+    ///
+    /// Upvalue resolution walks the complete enclosing chain, so a nested
+    /// function can capture a variable from any ancestor. Intermediate
+    /// functions receive the matching upvalue descriptors and captured locals
+    /// are marked in their owning compiler, which makes `end_scope` emit
+    /// `OpCloseUpvalue`. Previously each child received a clone whose own
+    /// enclosing link was cut, so captures beyond one level (for example the
+    /// synthetic function produced by `obj:method()` inside a block) silently
+    /// fell back to global lookup. Must be paired with [`Compiler::end_child`].
+    fn begin_child(&mut self) -> Compiler {
+        let parent = std::mem::replace(self, Compiler::detached());
+        Compiler {
+            chunk: Chunk::default(),
+            globals: HashMap::new(),
+            locals: vec![],
+            scope_depth: 1,
+            upvalues: vec![],
+            loop_ctx: vec![],
+            enclosing: Some(Box::new(parent)),
+            error: None,
+        }
+    }
+
+    /// Finish a nested function started by [`Compiler::begin_child`]: restore
+    /// the enclosing compiler into `self` and return the finished child.
+    fn end_child(&mut self, mut child: Compiler) -> Compiler {
+        let parent = child
+            .enclosing
+            .take()
+            .expect("end_child: child compiler must own its enclosing compiler");
+        *self = *parent;
+        child
+    }
+
+    /// Emit stack cleanup for the locals above `keep`, closing captured ones.
+    /// Used by `break`/`continue`, which leave scopes without `end_scope`.
+    fn emit_unwind_locals(&mut self, keep: usize, sp: Span) {
+        let captured: Vec<bool> = self.locals[keep.min(self.locals.len())..]
+            .iter()
+            .rev()
+            .map(|l| l.is_captured)
+            .collect();
+        for is_captured in captured {
+            if is_captured {
+                self.chunk.write(OpCode::OpCloseUpvalue, vspan(sp));
+            } else {
+                self.chunk.write(OpCode::OpPop, vspan(sp));
+            }
+        }
+    }
+
     /// Εξάγει jump placeholder και επιστρέφει το position του.
     fn emit_jump_placeholder(&mut self, opcode: OpCode, sp: Span) -> usize {
         self.emit(opcode, sp) // π.χ. OpJump(0) ή OpJumpIfFalse(0)
@@ -395,42 +462,10 @@ impl Compiler {
             }
 
             StmtKind::Fn(name, params, _ret_ty, body) => {
-                // FIX #19: Build the full enclosing chain by cloning `self` as a
-                // proper enclosing compiler. Previously `enclosing: None` was hard-coded,
-                // which meant closures could only capture from 1 level up. Now the chain
-                // is threaded correctly so `fn outer { fn inner { fn deep { x } } }` works.
-                let enclosing_snapshot = Compiler {
-                    chunk: Chunk::default(), // unused placeholder (we only need locals/upvalues)
-                    globals: HashMap::new(),
-                    locals: self.locals.clone(),
-                    scope_depth: self.scope_depth,
-                    upvalues: self.upvalues.clone(),
-                    loop_ctx: vec![],
-                    enclosing: self.enclosing.as_ref().map(|e| {
-                        // Carry the next level of the chain for arbitrarily deep nesting.
-                        Box::new(Compiler {
-                            chunk: Chunk::default(),
-                            globals: HashMap::new(),
-                            locals: e.locals.clone(),
-                            scope_depth: e.scope_depth,
-                            upvalues: e.upvalues.clone(),
-                            loop_ctx: vec![],
-                            enclosing: None, // two levels deep is sufficient for most programs
-                            error: None,
-                        })
-                    }),
-                    error: None,
-                };
-                let mut f_compiler = Compiler {
-                    chunk: Chunk::default(),
-                    globals: HashMap::new(),
-                    locals: vec![],
-                    scope_depth: 1,
-                    upvalues: vec![],
-                    loop_ctx: vec![],
-                    enclosing: Some(Box::new(enclosing_snapshot)),
-                    error: None,
-                };
+                // The child owns the real enclosing chain while its body is
+                // compiled (see `begin_child`), so captures from any depth are
+                // threaded through every intermediate function.
+                let mut f_compiler = self.begin_child();
 
                 // params are locals in slot 0..arity-1 (ignore type annotations at runtime)
                 for p in &params {
@@ -443,6 +478,7 @@ impl Compiler {
                     f_compiler.emit_stmt(st);
                 }
                 f_compiler.end_scope();
+                let mut f_compiler = self.end_child(f_compiler);
 
                 // fallthrough return nil
                 let nil = f_compiler.chunk.add_const(Value::Nil);
@@ -535,25 +571,7 @@ impl Compiler {
 
             StmtKind::Defer(expr) => {
                 // Compile a 0-arg thunk that runs expr (side effects) and returns nil; register it as defer.
-                let mut thunk_compiler = Compiler {
-                    chunk: Chunk::default(),
-                    globals: HashMap::new(),
-                    locals: vec![],
-                    scope_depth: 1,
-                    upvalues: vec![],
-                    loop_ctx: vec![],
-                    enclosing: Some(Box::new(Compiler {
-                        chunk: Chunk::default(),
-                        globals: HashMap::new(),
-                        locals: self.locals.clone(),
-                        scope_depth: self.scope_depth,
-                        upvalues: self.upvalues.clone(),
-                        loop_ctx: vec![],
-                        enclosing: None,
-                        error: None,
-                    })),
-                    error: None,
-                };
+                let mut thunk_compiler = self.begin_child();
                 thunk_compiler.begin_scope();
                 thunk_compiler.emit_expr(expr);
                 thunk_compiler.chunk.write(OpCode::OpPop, vspan(sp));
@@ -565,6 +583,7 @@ impl Compiler {
                     .chunk
                     .write(OpCode::OpReturn, VmSpan::default());
                 thunk_compiler.end_scope();
+                let mut thunk_compiler = self.end_child(thunk_compiler);
                 optimize_chunk(&mut thunk_compiler.chunk);
                 let fun = Rc::new(Function {
                     name: None,
@@ -1066,14 +1085,10 @@ impl Compiler {
 
             // break; — emit jump to loop exit (patched after loop completes)
             StmtKind::Break => {
-                // Pop locals introduced inside the loop before jumping out
-                let locals_to_pop = if let Some(&(_, locals_at, _, _)) = self.loop_ctx.last() {
-                    self.locals.len().saturating_sub(locals_at)
-                } else {
-                    0
-                };
-                for _ in 0..locals_to_pop {
-                    self.chunk.write(OpCode::OpPop, vspan(sp));
+                // Pop locals introduced inside the loop before jumping out,
+                // closing any that a closure captured.
+                if let Some(&(_, locals_at, _, _)) = self.loop_ctx.last() {
+                    self.emit_unwind_locals(locals_at, sp);
                 }
                 let bp = self.chunk.instructions.len();
                 self.chunk.write(OpCode::OpJump(0), vspan(sp)); // placeholder
@@ -1099,13 +1114,8 @@ impl Compiler {
             // Jumping to loop_start there would skip the increment and spin
             // forever.
             StmtKind::Continue => {
-                let locals_to_pop = if let Some(&(_, locals_at, _, _)) = self.loop_ctx.last() {
-                    self.locals.len().saturating_sub(locals_at)
-                } else {
-                    0
-                };
-                for _ in 0..locals_to_pop {
-                    self.chunk.write(OpCode::OpPop, vspan(sp));
+                if let Some(&(_, locals_at, _, _)) = self.loop_ctx.last() {
+                    self.emit_unwind_locals(locals_at, sp);
                 }
                 match self.loop_ctx.last().map(|(t, _, _, _)| *t) {
                     Some(target) if target != usize::MAX => {
@@ -1469,26 +1479,10 @@ impl Compiler {
             }
 
             ExprKind::FnLit(name_opt, params, _ret_ty, body) => {
-                // Compile function literal into its own chunk.
-                let mut f_compiler = Compiler {
-                    chunk: Chunk::default(),
-                    globals: HashMap::new(),
-                    locals: vec![],
-                    scope_depth: 1,
-                    upvalues: vec![],
-                    loop_ctx: vec![],
-                    enclosing: Some(Box::new(Compiler {
-                        chunk: Chunk::default(), // dummy
-                        globals: HashMap::new(), // dummy
-                        locals: self.locals.clone(),
-                        scope_depth: self.scope_depth,
-                        upvalues: self.upvalues.clone(),
-                        loop_ctx: vec![],
-                        enclosing: None,
-                        error: None,
-                    })),
-                    error: None,
-                };
+                // Compile function literal into its own chunk. Block expressions
+                // and `obj:method()` calls are lowered to FnLit, so this must see
+                // the complete enclosing chain (see `begin_child`).
+                let mut f_compiler = self.begin_child();
 
                 // params are locals in slot 0..arity-1
                 for p in &params {
@@ -1501,6 +1495,7 @@ impl Compiler {
                     f_compiler.emit_stmt(st);
                 }
                 f_compiler.end_scope();
+                let mut f_compiler = self.end_child(f_compiler);
 
                 // fallthrough return nil
                 let nil = f_compiler.chunk.add_const(Value::Nil);

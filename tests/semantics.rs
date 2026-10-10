@@ -3182,3 +3182,158 @@ fn graphics_helpers_pass() {
         out
     );
 }
+
+// ---------------------------------------------------------------------------
+// ROOT-CORE-01: closures must capture through the complete enclosing chain.
+//
+// Before the fix every nested function compiled against a *clone* of its
+// parent compiler whose own enclosing link was cut. Consequences reproduced on
+// the retained 0.6.0 native executable: `obj:method()` inside a nested block
+// resolved the receiver as a global (9 instead of 7), three-level captures
+// failed with "upvalue index out of bounds", and per-iteration loop captures
+// returned nil because capture flags never reached the owning compiler.
+// ---------------------------------------------------------------------------
+
+fn nums(out: &[Value]) -> Vec<f64> {
+    out.iter()
+        .map(|v| match v {
+            Value::Number(n) => *n,
+            other => panic!("expected number, got {:?}", other),
+        })
+        .collect()
+}
+
+#[test]
+fn root_core_01_nested_colon_method_in_try_inside_loop() {
+    // Original reproducer: must print 7 (the retained compiler printed 9).
+    let out = run_collect(
+        r#"for i 1 {let p=map{run:fn(self){return 7;}};print (try {p:run()} catch 9);}"#,
+    );
+    assert_eq!(nums(&out), vec![7.0]);
+}
+
+#[test]
+fn root_core_01_colon_matches_explicit_receiver_in_nested_loops() {
+    let out = run_collect(
+        r#"
+        for i 2 {
+            for j 2 {
+                let p = map{k: i * 10 + j, run: fn(self) { return self.k; }};
+                print (try { p:run() } catch -1);
+                print (try { p.run(p) } catch -1);
+            }
+        }
+        "#,
+    );
+    assert_eq!(nums(&out), vec![0.0, 0.0, 1.0, 1.0, 10.0, 10.0, 11.0, 11.0]);
+}
+
+#[test]
+fn root_core_01_method_throw_reaches_catch_with_local_receiver() {
+    let out = run_collect(
+        r#"
+        for i 1 {
+            let p = map{run: fn(self) { throw 42; }};
+            print (try { p:run() } catch 9);
+            let q = map{run: fn(self) { return 5; }};
+            print (try { { q:run() } } catch 9);
+        }
+        "#,
+    );
+    assert_eq!(nums(&out), vec![9.0, 5.0]);
+}
+
+#[test]
+fn root_core_01_three_and_four_level_named_function_captures() {
+    let out = run_collect(
+        r#"
+        fn outer() { let x = 5; fn mid() { fn inner() { return x; } return inner(); } return mid(); }
+        print outer();
+        fn outer2() {
+            let x = 5;
+            fn mid() { let y = 1; fn inner() { fn deep() { return x + y; } return deep(); } return inner(); }
+            return mid();
+        }
+        print outer2();
+        "#,
+    );
+    assert_eq!(nums(&out), vec![5.0, 6.0]);
+}
+
+#[test]
+fn root_core_01_loop_closures_capture_each_iteration() {
+    let out = run_collect(
+        r#"
+        let fs = [];
+        for i 3 { let x = i * 10; push(fs, fn() { return x; }); }
+        print fs[0](); print fs[1](); print fs[2]();
+        "#,
+    );
+    assert_eq!(nums(&out), vec![0.0, 10.0, 20.0]);
+}
+
+#[test]
+fn root_core_01_break_and_continue_close_captured_locals() {
+    let out = run_collect(
+        r#"
+        let fs = [];
+        for i 4 {
+            let x = i + 100;
+            push(fs, fn() { return x; });
+            if i == 1 { continue; }
+            if i == 2 { break; }
+        }
+        print len(fs); print fs[0](); print fs[1](); print fs[2]();
+        let gs = [];
+        let k = 0;
+        while k < 5 {
+            let y = k;
+            push(gs, fn() { return y; });
+            k = k + 1;
+            if y == 2 { break; }
+        }
+        print len(gs); print gs[2]();
+        "#,
+    );
+    assert_eq!(nums(&out), vec![3.0, 100.0, 101.0, 102.0, 3.0, 2.0]);
+}
+
+#[test]
+fn root_core_01_shared_mutable_capture_through_block_expression() {
+    let out = run_collect(
+        r#"
+        fn make() {
+            let n = 0;
+            return map{inc: fn() { n = n + 1; return n; }, get: fn() { return { n }; }};
+        }
+        let c = make();
+        c.inc(); c.inc();
+        print c.get();
+        let d = make();
+        d.inc();
+        print d.get();
+        print c.get();
+        "#,
+    );
+    assert_eq!(nums(&out), vec![2.0, 1.0, 2.0]);
+}
+
+#[test]
+fn root_core_01_defer_sees_value_at_scope_exit() {
+    // Deferred thunks run at function return (LIFO). Each must observe its own
+    // captured per-iteration value; the retained compiler produced nil here.
+    let out = run_collect(
+        r#"
+        let log = [];
+        fn f() {
+            let total = 0;
+            for i 3 { let v = i + 1; defer push(log, v); total = total + v; }
+            return total;
+        }
+        print f();
+        print len(log);
+        print log[0]; print log[1]; print log[2];
+        "#,
+    );
+    assert_eq!(nums(&out), vec![6.0, 3.0, 3.0, 2.0, 1.0]);
+}
