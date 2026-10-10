@@ -13,6 +13,7 @@ let _TYPECHECK = import("stdlib:compiler/typeck.sapp");
 let _CODEGEN = import("stdlib:compiler/codegen.sapp");
 let _OPTIMIZER = import("stdlib:compiler/optimizer.sapp");
 let _MODULE_CACHE = import("stdlib:compiler/module_cache.sapp");
+let _IMPORT_ROOTS = import("stdlib:compiler/import_roots.sapp");
 let _GUARD_PREPROCESSOR = import("stdlib:compiler/guard_preprocessor.sapp");
 let _VM = import("stdlib:compiler/vm.sapp");
 let _SEMANTIC = import("stdlib:compiler/semantic.sapp");
@@ -370,7 +371,8 @@ fn frontend_optimize(chunk) {
 // the multi-file step toward a self-hosted toolchain that can build real projects.
 
 // "stdlib:foo.sapp" -> "stdlib/foo.sapp"; other path forms used as-is.
-fn _resolve_import_path(s) {
+fn _resolve_import_path(s, roots = nil) {
+    if roots != nil { return _IMPORT_ROOTS.resolve(s, roots); }
     if str_starts_with(s, "stdlib:") { return "stdlib/" + str_slice(s, 7, len(s)); }
     return s;
 }
@@ -415,7 +417,7 @@ fn _frontend_limit(options, key, fallback, hard_max) {
     return value;
 }
 
-fn _module_cache_state(options) {
+fn _module_cache_state(options, roots = nil) {
     if options == nil or not is_map(options) { return nil; }
     let enabled = map_has(options, "module_cache") and options.module_cache == true;
     let root = nil;
@@ -427,15 +429,20 @@ fn _module_cache_state(options) {
         enabled = true;
     }
     if not enabled { return nil; }
+    // Guest dependency selection does not establish executing compiler origin.
+    // Reject before cache fingerprint reads/publication, even for similar paths.
+    if map_has(options, "stdlib_root") or (roots != nil and roots.selected) {
+        throw "selfhost cache: executing compiler origin unavailable for selected stdlib root";
+    }
     return map{ context: _MODULE_CACHE.context(root) };
 }
 
-fn _resolve_module(path, cache, runtime_options = nil, bytecode_cache = nil, execution = nil) {
+fn _resolve_module(path, cache, runtime_options = nil, bytecode_cache = nil, execution = nil, roots = nil) {
     if map_has(cache, path) { return cache[path]; }
     let max_modules = _frontend_limit(runtime_options, "max_modules", 256, 4096);
     if len(map_keys(cache)) >= max_modules { throw "frontend_run_bounded: module limit exceeded"; }
     cache[path] = map{};
-    let file = _resolve_import_path(path);
+    let file = _resolve_import_path(path, roots);
     // `_find_imports` is a naive text scan that also matches `import("...")`
     // occurrences inside comments/strings (e.g. illustrative `import("__FILE__")`
     // or `import("...")` in doc comments). Guard the read so a non-existent
@@ -452,7 +459,7 @@ fn _resolve_module(path, cache, runtime_options = nil, bytecode_cache = nil, exe
     let deps = _find_imports(src);
     let di = 0;
     while di < len(deps) {
-        if not map_has(cache, deps[di]) { _resolve_module(deps[di], cache, runtime_options, bytecode_cache, execution); }
+        if not map_has(cache, deps[di]) { _resolve_module(deps[di], cache, runtime_options, bytecode_cache, execution, roots); }
         di = di + 1;
     }
     let processed = _preprocess_checked(src);
@@ -506,20 +513,27 @@ fn _resolve_module(path, cache, runtime_options = nil, bytecode_cache = nil, exe
 }
 
 // Build the import cache for `source` (resolves every imported module).
-fn _build_import_cache_state(source, runtime_options = nil, execution = nil) {
+fn _build_import_cache_state(source, runtime_options = nil, execution = nil, resolver_options = nil) {
     let cache = map{};
-    let bytecode_cache = _module_cache_state(runtime_options);
     let paths = _find_imports(source);
+    // Import-free programs require no new manifest read authority.
+    let roots: any = nil;
+    if len(paths) > 0 {
+        let selected_options = runtime_options;
+        if resolver_options != nil { selected_options = resolver_options; }
+        roots = _IMPORT_ROOTS.context(selected_options);
+    }
+    let bytecode_cache = _module_cache_state(runtime_options, roots);
     let i = 0;
     while i < len(paths) {
-        _resolve_module(paths[i], cache, runtime_options, bytecode_cache, execution);
+        _resolve_module(paths[i], cache, runtime_options, bytecode_cache, execution, roots);
         i = i + 1;
     }
     return map{ modules: cache, bytecode_cache: bytecode_cache };
 }
 
-fn _build_import_cache(source, runtime_options = nil, execution = nil) {
-    return _build_import_cache_state(source, runtime_options, execution).modules;
+fn _build_import_cache(source, runtime_options = nil, execution = nil, resolver_options = nil) {
+    return _build_import_cache_state(source, runtime_options, execution, resolver_options).modules;
 }
 
 // Read a .sapp file from disk and run it end-to-end through the self-hosted
@@ -739,7 +753,7 @@ fn frontend_lint(source) {
     return map{ ok: len(diags) == 0, diagnostics: diags, count: len(diags) };
 }
 
-fn frontend_run_file(path) {
+fn frontend_run_file(path, options = nil) {
     if path == nil or path == "" {
         return map{ ok: false, error: "frontend_run_file: path is empty" };
     }
@@ -747,10 +761,11 @@ fn frontend_run_file(path) {
     if src == nil or src == "" {
         return map{ ok: false, error: "frontend_run_file: cannot read file: " + path };
     }
-    return frontend_run(_preprocess_checked(src));
+    return frontend_run(_preprocess_checked(src), options);
 }
 
-fn frontend_run(source) {
+fn frontend_run(source, options = nil) {
+    if options != nil and not is_map(options) { throw "frontend_run: options must be a map"; }
     let r = frontend_compile(source);
     if not r.ok {
         return map{ ok: false, error: "frontend_run: compilation failed", output: [], chunk: r.chunk };
@@ -763,7 +778,7 @@ fn frontend_run(source) {
     let chunk = _OPTIMIZER.optimize_safe(r.chunk).chunk;
     // Pre-resolve imported modules so the program's `import(...)` calls find them.
     let execution = _VM.execution_context(true);
-    let cache = _build_import_cache(source, nil, execution);
+    let cache = _build_import_cache(source, nil, execution, options);
     let res = _VM.run_seeded(chunk, map{ __import_cache__: cache }, execution);
     _VM.close_execution(execution);
     return map{

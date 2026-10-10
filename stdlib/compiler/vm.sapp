@@ -136,7 +136,11 @@ fn _trip(runtime, reason, execution) {
     // Budget failures are sticky: no guest catch body may resume this run.
     // Keep the execution context out of the returned/public runtime counters.
     if execution != nil and execution.close_on_throw {
-        try close_execution(execution) catch nil;
+        // A private admission budget in an otherwise unbounded run has no
+        // shared execution budget to exhaust. Its caught rejection retains
+        // ownership; actual bounded runtime budgets stay sticky and close.
+        if map_has(runtime,"data_only") and runtime.data_only { _close_on_escape(execution); }
+        else { try close_execution(execution) catch nil; }
     }
     throw "self-host VM: " + reason;
 }
@@ -316,6 +320,160 @@ fn _string_bytes(value, runtime, execution) {
     return str_to_bytes(value);
 }
 
+// New data primitives have a hard admission ceiling even for unbounded runs.
+// Bounded runs share their sticky work/value budget with these scans.
+fn _data_budget(runtime) {
+    if runtime != nil { return runtime; }
+    return map{max_steps:100000000,steps:0,max_value_items:1048576,tripped:false,reason:"",data_only:true};
+}
+fn _data_cap(runtime) { return num_min(1048576, runtime.max_value_items); }
+fn _data_charge(runtime, count, execution) {
+    if runtime.tripped { _trip(runtime, runtime.reason, execution); }
+    if count > runtime.max_steps - runtime.steps { _trip(runtime, "data work limit exceeded", execution); }
+    runtime.steps = runtime.steps + count;
+}
+fn _data_text(value, runtime, execution, maximum) {
+    if type(value) != "string" { _raise(execution, "self-host data: expected string"); }
+    return _utf8_size(value, num_min(maximum, _data_cap(runtime)), runtime, execution);
+}
+fn _data_sum(total, count, maximum, runtime, execution) {
+    if count > maximum - total { _trip(runtime, "data size limit exceeded", execution); }
+    return total + count;
+}
+fn _data_product(total, count, width, maximum, runtime, execution) {
+    if width > 0 and count > num_floor((maximum - total) / width) {
+        _trip(runtime, "data size limit exceeded", execution);
+    }
+    return total + count * width;
+}
+fn _data_range(args, runtime, execution) {
+    let budget = _data_budget(runtime); let count = len(args);
+    for value in args {
+        if type(value) != "number" or value != value or value - value != 0 {
+            _raise(execution, "range(): arguments must be finite numbers");
+        }
+    }
+    let start = if count == 1 { 0 } else { args[0] };
+    let end = if count == 1 { args[0] } else { args[1] };
+    let step = if count == 3 { args[2] } else { 1 };
+    if step == 0 { _raise(execution, "range(): step must be non-zero"); }
+    let values = []; let current = start; let maximum = _data_cap(budget);
+    while (step > 0 and current < end) or (step < 0 and current > end) {
+        _data_charge(budget, 1, execution);
+        if len(values) >= maximum { _trip(budget, "range item limit exceeded", execution); }
+        array_push(values, current);
+        let next = current + step;
+        if next == current { _raise(execution, "range(): step makes no progress"); }
+        // Overflow beyond a finite end is already finished; no nonfinite value
+        // is emitted. A nonfinite value still inside the interval is rejected.
+        let more = (step > 0 and next < end) or (step < 0 and next > end);
+        if more and (next != next or next - next != 0) { _raise(execution, "range(): nonfinite progress"); }
+        current = next;
+    }
+    return values;
+}
+fn _data_bytes(value, runtime, execution) {
+    let budget = _data_budget(runtime);
+    if not is_array(value) { _raise(execution, "bytes_to_str(): expected byte array"); }
+    if len(value) > _data_cap(budget) { _trip(budget, "byte size limit exceeded", execution); }
+    _data_charge(budget, len(value), execution);
+    for byte in value {
+        if type(byte) != "number" or byte != byte or byte < 0 or byte > 255 or num_floor(byte) != byte {
+            _raise(execution, "bytes_to_str(): expected byte numbers 0..255");
+        }
+    }
+    return try bytes_to_str(value) catch { _close_on_escape(execution); bytes_to_str(value) };
+}
+fn _data_json_parse(text, runtime, execution) {
+    let budget = _data_budget(runtime);
+    let size = _data_text(text, budget, execution, 1048576);
+    _data_charge(budget, size, execution);
+    let bytes = str_to_bytes(text); let depth = 0; let quoted = false; let escaped = false;
+    for byte in bytes {
+        if quoted {
+            if escaped { escaped = false; }
+            elif byte == 92 { escaped = true; }
+            elif byte == 34 { quoted = false; }
+        } elif byte == 34 { quoted = true; }
+        elif byte == 123 or byte == 91 {
+            depth = depth + 1;
+            if depth > 128 { _trip(budget, "JSON depth limit exceeded", execution); }
+        } elif byte == 125 or byte == 93 { depth = depth - 1; }
+    }
+    // Grammar and original duplicate/range validation remain host-owned.
+    return try json_parse(text) catch { _close_on_escape(execution); json_parse(text) };
+}
+fn _json_text_size(text, state, runtime, execution) {
+    let bytes = _data_text(text, runtime, execution, state.maximum);
+    state.bytes = _data_sum(state.bytes, 2, state.maximum, runtime, execution);
+    // Six bytes per input byte conservatively includes every JSON escape.
+    state.bytes = _data_product(state.bytes, bytes, 6, state.maximum, runtime, execution);
+}
+fn _json_value_size(value, state, depth, runtime, execution) {
+    if depth > 128 { _trip(runtime, "JSON depth limit exceeded", execution); }
+    _data_charge(runtime, 1, execution);
+    state.items = _data_sum(state.items, 1, state.maximum, runtime, execution);
+    let kind = type(value);
+    if kind == "string" { _json_text_size(value, state, runtime, execution); return; }
+    if kind == "bigint" or kind == "rational" or kind == "decimal" {
+        // Retained limitation: str(boxed exact number) materializes a temporary
+        // decimal representation before its size can be inspected. No host
+        // digit-length API exists; subsequent JSON output is pre-admitted.
+        _json_text_size(str(value), state, runtime, execution); return;
+    }
+    if kind == "array" or kind == "map" {
+        if kind == "map" and (map_has(value,"__bi") or map_has(value,"__fn")
+            or (map_has(value,"chunk") and is_map(value.chunk))) {
+            _raise(execution, "json_stringify(): reserved callable map shape");
+        }
+        if len(value) > state.maximum - state.items { _trip(runtime, "JSON item limit exceeded", execution); }
+        state.bytes = _data_sum(state.bytes, 2 + len(value), state.maximum, runtime, execution);
+        if kind == "array" {
+            for item in value { _json_value_size(item, state, depth + 1, runtime, execution); }
+        } else {
+            for key in map_keys(value) {
+                _data_charge(runtime, 1, execution);
+                state.items = _data_sum(state.items, 1, state.maximum, runtime, execution);
+                _json_text_size(key, state, runtime, execution);
+                state.bytes = _data_sum(state.bytes, 1, state.maximum, runtime, execution);
+                _json_value_size(value[key], state, depth + 1, runtime, execution);
+            }
+        }
+        return;
+    }
+    if kind != "number" and kind != "bool" and kind != "nil" {
+        _raise(execution, "json_stringify(): unsupported value type");
+    }
+    state.bytes = _data_sum(state.bytes, if kind == "number" { 32 } else { 5 }, state.maximum, runtime, execution);
+}
+fn _data_json_stringify(value, runtime, execution) {
+    let budget = _data_budget(runtime);
+    let state = map{items:0,bytes:0,maximum:_data_cap(budget)};
+    _json_value_size(value, state, 0, budget, execution);
+    return try json_stringify(value) catch { _close_on_escape(execution); json_stringify(value) };
+}
+fn _data_regex(name, args, runtime, execution) {
+    let budget = _data_budget(runtime); let text = args[0]; let pattern = args[1];
+    let size = _data_text(text, budget, execution, 1048576);
+    let pattern_size = _data_text(pattern, budget, execution, 4096);
+    // Admission charge is a conservative work estimate, not a host CPU deadline.
+    let work = _data_product(0, size + 1, pattern_size + 1, budget.max_steps, budget, execution);
+    _data_charge(budget, work, execution);
+    if name == "regex_match" {
+        return try regex_match(text, pattern) catch { _close_on_escape(execution); regex_match(text, pattern) };
+    }
+    let replacement = args[2];
+    let replacement_size = _data_text(replacement, budget, execution, 1048576);
+    let dollars = 0;
+    for byte in str_to_bytes(replacement) { if byte == 36 { dollars = dollars + 1; } }
+    let maximum = _data_cap(budget);
+    let bound = _data_product(size, len(text) + 1, replacement_size, maximum, budget, execution);
+    bound = _data_product(bound, dollars, size, maximum, budget, execution);
+    return try regex_replace_all(text, pattern, replacement) catch {
+        _close_on_escape(execution); regex_replace_all(text, pattern, replacement)
+    };
+}
+
 // Check before indexing arguments or invoking a primitive with side effects.
 // Normal scalar calls bypass this helper; only generic/fallback calls need it.
 fn _check_builtin_arity(name, count, execution) {
@@ -328,6 +486,7 @@ fn _check_builtin_arity(name, count, execution) {
         if name == "str_to_bytes" { _raise(execution, "str_to_bytes() expects 1 argument"); }
         _raise(execution, "self-host VM: " + name + "() expects " + str(expected) + " argument(s), got " + str(count));
     }
+    if name == "range" and (count < 1 or count > 3) { _raise(execution, "range() expects 1..3 arguments"); }
     if name == "rational" and count != 1 and count != 2 {
         _raise(execution, "self-host VM: rational() expects 1 or 2 arguments, got " + str(count));
     }
@@ -355,6 +514,11 @@ fn _call_builtin(name, args, runtime = nil, execution = nil) {
             execution.close_on_throw and execution.handlers == 0);
     }
     _check_builtin_arity(name, len(args), execution);
+    if name == "range" { return _data_range(args, runtime, execution); }
+    if name == "bytes_to_str" { return _data_bytes(args[0], runtime, execution); }
+    if name == "json_parse" { return _data_json_parse(args[0], runtime, execution); }
+    if name == "json_stringify" { return _data_json_stringify(args[0], runtime, execution); }
+    if name == "regex_match" or name == "regex_replace_all" { return _data_regex(name, args, runtime, execution); }
     if name == "len" {
         if execution != nil and execution.memory != nil and (not is_array(args[0]) and not is_map(args[0]) and type(args[0]) != "string") { _close_on_escape(execution); }
         return len(args[0]);
