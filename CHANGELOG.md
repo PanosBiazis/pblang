@@ -2,6 +2,23 @@
 
 ## [0.6.0-alpha] — 2026
 
+- The native bytecode VM (`pblang-vm`) now runs `defer` thunks when an
+  exception unwinds a frame, matching the frozen defer contract
+  (`docs/Spec_freeze.md`) and the PBLang `host_pbck_vm`. Frames between the
+  throw and the handler run their defers innermost first, LIFO within a frame;
+  an uncaught error runs every pending defer, including script-level ones,
+  before `run` reports it. A defer that throws during unwinding has its own
+  frames' defers run and its exception discarded, so older defers still run
+  and the primary error is preserved. Previously every exception path skipped
+  deferred cleanup. Takes effect only in a native executable rebuilt from this
+  source.
+- `stdlib:compiler/module_cache_file.sapp` now closes the opened private parent
+  exactly once when a backend operation (read, write, remove, private-root
+  policy check or exclusive mkdir) throws, using a pending guard and `defer`.
+  The original exception and diagnostic propagate unchanged; a failing cleanup
+  close is ignored on that path. Normal-return cleanup is unchanged. Requires
+  the native VM fix above.
+
 - Fixed closure capture in the bytecode compiler (`pblang-compiler`). Nested
   functions now compile against the real enclosing compiler chain instead of a
   truncated copy. This corrects `obj:method()` inside nested blocks/`try`

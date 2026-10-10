@@ -222,6 +222,25 @@ struct CallFrame {
     defers: Vec<Value>, // closures to run on scope exit
     is_returning: bool,
     is_defer_thunk: bool,
+    /// Defer closure running while an exception unwinds (see `UnwindState`).
+    is_unwind_thunk: bool,
+}
+
+/// An exception that is unwinding frames while their deferred closures run.
+///
+/// Frames between the failure point and the target handler (or every frame,
+/// when the exception is uncaught) are popped first and their defers are
+/// collected in execution order (innermost frame first, LIFO within a frame).
+/// Each defer then runs as an ordinary call frame marked `is_unwind_thunk`.
+/// An exception escaping a defer is discarded after that defer's own frames
+/// have unwound, so the original error is preserved and older defers still run.
+struct UnwindState {
+    error: RuntimeError,
+    handler: Option<TryHandler>,
+    /// Remaining defers; `pop()` yields the next one to run.
+    pending: Vec<Value>,
+    /// Index of the currently running unwind-thunk frame, if any.
+    thunk_frame: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -510,6 +529,10 @@ pub struct VM {
     frames: Vec<CallFrame>,
     open_upvalues: Vec<Rc<RefCell<Upvalue>>>,
     handlers: Vec<TryHandler>,
+    /// Exceptions currently unwinding through deferred cleanup (innermost last).
+    unwinds: Vec<UnwindState>,
+    /// Set by `do_return` when an unwind thunk finished; the run loop resumes the unwind.
+    unwind_resume: bool,
     /// Capability config for sandboxing; None = minimal VM (no builtins).
     stdlib_config: Option<StdlibConfig>,
     /// Optional resource limits (instruction count, stack depth).
@@ -940,6 +963,8 @@ impl VM {
             frames: vec![],
             open_upvalues: vec![],
             handlers: vec![],
+            unwinds: vec![],
+            unwind_resume: false,
             stdlib_config: self.stdlib_config.clone(),
             limits: self.limits.clone(),
             ffi_policy: self.ffi_policy.clone(),
@@ -1005,6 +1030,8 @@ impl VM {
             frames: vec![],
             open_upvalues: vec![],
             handlers: vec![],
+            unwinds: vec![],
+            unwind_resume: false,
             stdlib_config: None,
             limits: None,
             ffi_policy: None,
@@ -1059,6 +1086,8 @@ impl VM {
             frames: vec![],
             open_upvalues: vec![],
             handlers: vec![],
+            unwinds: vec![],
+            unwind_resume: false,
             stdlib_config: Some(config),
             memory_tracker: MemoryTracker::new(),
             object_memory_map: RefCell::new(HashMap::new()),
@@ -1112,6 +1141,8 @@ impl VM {
     ) -> Result<(), RuntimeError> {
         self.stack.clear();
         self.frames.clear();
+        self.unwinds.clear();
+        self.unwind_resume = false;
 
         if let Some(src) = chunk.source.as_deref() {
             let blocks = pblang_core::extract_polyglot_blocks(src.as_str());
@@ -2290,35 +2321,15 @@ impl VM {
             })();
 
             if let Err(e) = step {
-                if let Some(h) = self.handlers.pop() {
-                    // Unwind frames above handler frame (avoid unwrap: pop only when len > h.frame_index+1)
-                    while self.frames.len() > h.frame_index + 1 {
-                        if let Some(frame) = self.frames.pop() {
-                            self.close_upvalues_from(frame.stack_base + 1);
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // Restore stack
-                    self.close_upvalues_from(h.stack_len);
-                    if self.stack.len() > h.stack_len {
-                        self.stack.truncate(h.stack_len);
-                    }
-
-                    // Jump to handler
-                    if let Some(frame) = self.frames.get_mut(h.frame_index) {
-                        frame.ip = h.target_ip;
-                    } else {
-                        return Err(e);
-                    }
-
-                    // Provide the error as a value (message string)
-                    self.stack.push(alloc_string(e.message.clone()));
-                    continue;
-                } else {
-                    return Err(e);
-                }
+                // Exceptions run the exiting frames' defers before reaching the
+                // handler (or leaving `run`), per the frozen defer contract.
+                self.unwind_resume = false;
+                self.begin_unwind(e)?;
+                continue;
+            }
+            if self.unwind_resume {
+                self.unwind_resume = false;
+                self.continue_unwind()?;
             }
         }
 
@@ -2398,7 +2409,7 @@ impl VM {
         let frame_clean = self
             .frames
             .last()
-            .map(|f| f.defers.is_empty() && !f.is_defer_thunk)
+            .map(|f| f.defers.is_empty() && !f.is_defer_thunk && !f.is_unwind_thunk)
             .unwrap_or(false);
         if !(reusable && frame_clean) {
             return self.call_top(argc);
@@ -2757,9 +2768,127 @@ impl VM {
             defers: vec![],
             is_returning: false,
             is_defer_thunk: false,
+            is_unwind_thunk: false,
         });
 
         Ok(())
+    }
+
+    /// Pop frames above `target_len`, closing upvalues, and collect their
+    /// defers in execution order (innermost frame first, LIFO within a frame).
+    fn pop_frames_collecting_defers(&mut self, target_len: usize) -> Vec<Value> {
+        let mut run_order = Vec::new();
+        while self.frames.len() > target_len {
+            let Some(mut frame) = self.frames.pop() else {
+                break;
+            };
+            self.close_upvalues_from(frame.stack_base + 1);
+            run_order.extend(frame.defers.drain(..).rev());
+        }
+        run_order
+    }
+
+    /// Start unwinding for a runtime error raised by an instruction.
+    fn begin_unwind(&mut self, e: RuntimeError) -> Result<(), RuntimeError> {
+        // Is the error escaping a defer that is itself running during an unwind?
+        let thunk_floor = self.unwinds.last().and_then(|u| u.thunk_frame);
+        let handler = match (self.handlers.last(), thunk_floor) {
+            (Some(h), Some(floor)) if h.frame_index < floor => None,
+            (Some(_), _) => self.handlers.pop(),
+            (None, _) => None,
+        };
+
+        if handler.is_none() {
+            if let Some(floor) = thunk_floor {
+                // Discard the defer's exception after unwinding its own frames;
+                // their defers run before the remaining outer defers.
+                let base = self.frames[floor].stack_base;
+                let inner = self.pop_frames_collecting_defers(floor);
+                self.close_upvalues_from(base);
+                self.stack.truncate(base);
+                let u = self
+                    .unwinds
+                    .last_mut()
+                    .expect("thunk_floor implies an active unwind");
+                u.thunk_frame = None;
+                u.pending.extend(inner.into_iter().rev());
+                return self.continue_unwind();
+            }
+        }
+
+        // An uncaught error keeps the bottom (script) frame as the execution
+        // context for the defers (globals resolve through it), but still runs
+        // that frame's own defers last. The frame is left in place, matching the
+        // previous behaviour of returning the error without popping frames.
+        let target_len = match &handler {
+            Some(h) => h.frame_index + 1,
+            None => self.frames.len().min(1),
+        };
+        let mut run_order = self.pop_frames_collecting_defers(target_len);
+        if handler.is_none() {
+            if let Some(bottom) = self.frames.first_mut() {
+                run_order.extend(bottom.defers.drain(..).rev());
+            }
+        }
+        if let Some(h) = &handler {
+            self.close_upvalues_from(h.stack_len);
+            if self.stack.len() > h.stack_len {
+                self.stack.truncate(h.stack_len);
+            }
+        }
+        self.unwinds.push(UnwindState {
+            error: e,
+            handler,
+            pending: run_order.into_iter().rev().collect(),
+            thunk_frame: None,
+        });
+        self.continue_unwind()
+    }
+
+    /// Run the next pending defer of the innermost unwind, or finish it by
+    /// jumping to its handler / returning its error.
+    fn continue_unwind(&mut self) -> Result<(), RuntimeError> {
+        loop {
+            let next = match self.unwinds.last_mut() {
+                Some(u) => u.pending.pop(),
+                None => return Ok(()),
+            };
+            if let Some(defer_closure) = next {
+                let depth = self.frames.len();
+                let stack_len = self.stack.len();
+                self.stack.push(defer_closure);
+                match self.call_top(0) {
+                    Ok(()) if self.frames.len() > depth => {
+                        let idx = self.frames.len() - 1;
+                        self.frames[idx].is_unwind_thunk = true;
+                        if let Some(u) = self.unwinds.last_mut() {
+                            u.thunk_frame = Some(idx);
+                        }
+                        return Ok(());
+                    }
+                    // A native callable completed synchronously, or the call
+                    // itself failed: discard its result/error and continue.
+                    _ => {
+                        self.stack.truncate(stack_len);
+                        continue;
+                    }
+                }
+            }
+
+            let u = self.unwinds.pop().expect("checked above");
+            match u.handler {
+                Some(h) => match self.frames.get_mut(h.frame_index) {
+                    Some(frame) => {
+                        frame.ip = h.target_ip;
+                        // Provide the error as a value (message string)
+                        self.stack.push(alloc_string(u.error.message.clone()));
+                        return Ok(());
+                    }
+                    None => return Err(u.error),
+                },
+                None => return Err(u.error),
+            }
+        }
     }
 
     fn do_return(&mut self) -> Result<(), RuntimeError> {
@@ -2802,6 +2931,16 @@ impl VM {
 
             self.close_upvalues_from(frame.stack_base + 1);
             self.stack.truncate(frame.stack_base);
+
+            if frame.is_unwind_thunk {
+                // A defer that ran during exception unwinding returned normally.
+                // Its value is discarded; the run loop continues the unwind.
+                if let Some(u) = self.unwinds.last_mut() {
+                    u.thunk_frame = None;
+                }
+                self.unwind_resume = true;
+                return Ok(());
+            }
 
             let out = frame.module_result.unwrap_or(ret);
 

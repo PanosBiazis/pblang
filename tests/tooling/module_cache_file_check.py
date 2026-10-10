@@ -161,10 +161,17 @@ def main():
                                  error=errors[0] if errors else None))
             before, after = pair
             if mode in ['read-throw', 'write-throw', 'remove-throw', 'policy-throw', 'mkdir-throw']:
-                passed = (before['exit'] == after['exit'] == 1 and before['stdout'] == after['stdout'] == ''
-                          and before['error'] == after['error'] and before['error'].startswith('injected-primary-'))
-                record(mode + '/inherited-opaque-exception-limit', passed, results=pair,
-                       cleanup_fixed=False, limitation='backend exception still skips parent close; original diagnostic retained')
+                # OWN3-J02: the backend exception must still propagate with its
+                # original diagnostic, but the opened parent is now closed exactly
+                # once during unwinding. The reference secure_file path skips the
+                # close (empty stdout); it is kept only as the diagnostic oracle.
+                passed = (before['exit'] == after['exit'] == 1
+                          and before['error'] == after['error'] and before['error'].startswith('injected-primary-')
+                          and after['stdout'].count('close:') == 1
+                          and after['stdout'].strip() == 'close:1')
+                record(mode + '/opaque-exception-cleanup', passed, results=pair,
+                       cleanup_fixed=True, reference_closes=before['stdout'].count('close:'),
+                       candidate_closes=after['stdout'].count('close:'))
             else:
                 assert after['exit'] == 0, after
                 value = json.loads(after['stdout'].splitlines()[-1])
