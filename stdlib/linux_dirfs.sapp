@@ -2593,41 +2593,90 @@ fn read_bytes_relative(fs, path, max_bytes = 4194304) {
     return _read_bytes_relative(fs, path, max_bytes, true);
 }
 
+// Operation-local ownership: consume an fd before one close attempt. A failed
+// close may already have released its number, so retrying could close a reused fd.
+fn _bounded_read_close(fs, state, key) {
+    let fd = state[key]; state[key] = -1;
+    if fd < 0 { return true; }
+    let closed = try _close_fd(fs, fd) catch false;
+    if not closed { state.cleanup_confirmed = false; }
+    return closed;
+}
+
+fn _bounded_read_cleanup(fs, state) {
+    _bounded_read_close(fs, state, "snapshot_fd");
+    _bounded_read_close(fs, state, "source_fd");
+    _bounded_read_close(fs, state, "parent_fd");
+    return state.cleanup_confirmed;
+}
+
 fn _read_bytes_relative(fs, path, max_bytes, literal_relative) {
     if type(max_bytes) != "number" or max_bytes < 0 or max_bytes != num_floor(max_bytes)
         or max_bytes > 67108864 {
         return _error("invalid bounded read limit");
     }
-    let parent = _parent(fs, path, false, literal_relative); if not parent.ok { return parent; }
-    let fd = _openat(fs, parent.fd, parent.name, O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
-    _close_fd(fs, parent.fd); if fd < 0 { return _error("file cannot be opened without following links"); }
+    if fs == nil or not is_map(fs) or (try fs.closed catch true) {
+        return _error("directory root is closed");
+    }
+    if _mount_admission_cleanup_poisoned {
+        let failed = _cleanup_error("bounded read is disabled after ambiguous cleanup");
+        failed.error_code = "bounded-read-cleanup-poisoned"; return failed;
+    }
+    let state = map{parent_fd: -1, source_fd: -1, snapshot_fd: -1,
+        cleanup_confirmed: true};
+    let result = try _bounded_read_owned(fs, path, max_bytes, literal_relative, state)
+        catch _error("bounded file read failed safely");
+    let cleaned = _bounded_read_cleanup(fs, state);
+    if not cleaned or _mount_admission_cleanup_poisoned {
+        // Preserve the first known operation failure; cleanup cannot turn either
+        // a successful copy or a prior failure into a successful publication.
+        let message = if result.ok { "bounded file descriptor cleanup failed" }
+            else { result.error };
+        let failed = _cleanup_error(message);
+        failed.error_code = "bounded-read-cleanup-poisoned"; return failed;
+    }
+    return result;
+}
 
-    // fs_read_bytes has no length parameter. Reading the held source directly
-    // would allocate the whole file before the post-read quota check. Copy at
-    // most max_bytes+1 into an anonymous kernel file first; the VM can then
-    // load only that bounded snapshot. This also remains bounded if another
-    // process grows the source inode concurrently.
-    let snapshot = _i32(_call(fs, "memfd_create", "string,i32->i32",
+fn _bounded_read_owned(fs, path, max_bytes, literal_relative, state) {
+    let parent = _parent(fs, path, false, literal_relative); if not parent.ok { return parent; }
+    state.parent_fd = parent.fd;
+    state.source_fd = _openat(fs, parent.fd, parent.name,
+        O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
+    let parent_closed = _bounded_read_close(fs, state, "parent_fd");
+    if state.source_fd < 0 { return _error("file cannot be opened without following links"); }
+    if not parent_closed { return _error("bounded file parent descriptor cleanup failed"); }
+
+    // fs_read_bytes has no length parameter. Copy at most max_bytes+1 into an
+    // anonymous kernel file before any VM byte allocation, also during growth.
+    state.snapshot_fd = _i32(_call(fs, "memfd_create", "string,i32->i32",
         ["pblang-bounded-read", MFD_CLOEXEC]));
-    if snapshot < 0 { _close_fd(fs, fd); return _error("bounded snapshot is unavailable"); }
+    if state.snapshot_fd < 0 { return _error("bounded snapshot is unavailable"); }
     let ceiling = max_bytes + 1; let copied = 0; let failed = false;
-    while copied < ceiling and not failed {
+    let eof = false;
+    while copied < ceiling and not failed and not eof {
+        let remaining = ceiling - copied;
         let count = _call(fs, "sendfile", "i32,i32,ptr,i64->i64",
-            [snapshot, fd, 0, ceiling - copied]);
-        if count < 0 { failed = true; }
-        else if count == 0 { copied = ceiling; }
+            [state.snapshot_fd, state.source_fd, 0, remaining]);
+        if type(count) != "number" or count < 0 or count != num_floor(count)
+           or count > remaining { failed = true; }
+        else if count == 0 { eof = true; }
         else { copied = copied + count; }
     }
-    _close_fd(fs, fd);
-    if failed { _close_fd(fs, snapshot); return _error("bounded file snapshot failed"); }
+    let source_closed = _bounded_read_close(fs, state, "source_fd");
+    if failed { return _error("bounded file snapshot failed"); }
+    if not source_closed { return _error("bounded file source descriptor cleanup failed"); }
+    let snapshot = state.snapshot_fd;
     let snapshot_size = _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 2]);
-    if snapshot_size < 0 { _close_fd(fs, snapshot); return _error("bounded snapshot size is unavailable"); }
-    if snapshot_size > max_bytes {
-        _close_fd(fs, snapshot); return _error("file exceeds byte limit");
+    if type(snapshot_size) != "number" or snapshot_size < 0
+       or snapshot_size != num_floor(snapshot_size) {
+        return _error("bounded snapshot size is unavailable");
     }
-    _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 0]);
+    if snapshot_size > max_bytes { return _error("file exceeds byte limit"); }
+    if _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 0]) != 0 {
+        return _error("bounded snapshot cannot be rewound");
+    }
     let bytes = try fs_read_bytes(_fd_path(snapshot)) catch nil;
-    _close_fd(fs, snapshot);
     if not is_array(bytes) { return _error("path is not a readable regular file"); }
     if len(bytes) != snapshot_size { return _error("bounded snapshot size changed"); }
     return map{ ok: true, path: path, bytes: bytes, size: len(bytes) };

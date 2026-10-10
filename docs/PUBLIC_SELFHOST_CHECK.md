@@ -166,3 +166,34 @@ This public argv-based profile does not consult `PBLANG_CHECK_PROFILE`; that
 environment variable continues to belong to `pblang check` / `check_cli.sapp`.
 Default checking and `run` are unchanged. See [the retained source contract and
 PBCK example](PUBLIC_RETAINED_SOURCE_CHECK.md) for limitations.
+
+## Bounded snapshot cleanup failures
+
+The Linux `read_bytes` and `read_bytes_relative` snapshot operation returns no
+bytes when its owned parent, source or snapshot descriptor cleanup is unconfirmed.
+Each descriptor number is consumed before one close attempt and is never retried;
+a reported close error does not prove whether the kernel released it. Remaining
+owned descriptors are still attempted. Existing process cleanup poison rejects
+later bounded reads in that module instance. Caller-owned root cleanup remains
+the caller's responsibility. Resources not handed back by underlying helpers are
+outside this operation's ownership guarantee.
+
+Invalid copy progress (negative, nonintegral, nonfinite, or larger than the
+remaining request), invalid snapshot size, and a nonzero rewind result reject
+the snapshot before publication. The `max_bytes+1` copy limit does not bound
+parser/AST expansion, diagnostic construction, or whole-process CPU/RAM.
+
+A known operation error remains the primary backend error when cleanup also
+fails; `cleanup_failed`, `invalidate_handle`, `process_admission_poisoned`, and
+`error_code: "bounded-read-cleanup-poisoned"` describe that uncertainty. The
+compiler `bounded_source.read_source` facade retains its existing behavior:
+it discards extra backend metadata and gives its own root-close failure
+precedence. Both paths reject success publication on read failure. These rules
+do not change other directory operations, caller permissions, the eight explicit
+libc symbols, or the legacy direct native `--check --via-pblang` exit limitation.
+
+`tests/tooling/bounded_read_cleanup_check.py` compares an unchanged baseline with
+a candidate using whole copied modules and deterministic native-effect boundaries.
+These are simulated failures, not claims of induced kernel close faults. Existing
+`bounded_source_check.py` groups separately exercise real Linux admission, exact
+argv, permission denial, source-size enforcement and library contracts.
