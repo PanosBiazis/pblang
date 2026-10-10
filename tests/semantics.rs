@@ -3337,3 +3337,171 @@ fn root_core_01_defer_sees_value_at_scope_exit() {
     );
     assert_eq!(nums(&out), vec![6.0, 3.0, 3.0, 2.0, 1.0]);
 }
+
+// ---- OWN3-J02: `defer` must run when an exception unwinds a frame ----
+// docs/Spec_freeze.md: deferred calls run when the function exits, including
+// error/throw. The retained native VM skipped them on every exception path.
+
+fn strs(out: &[Value]) -> Vec<String> {
+    out.iter().map(|v| format!("{v}")).collect()
+}
+
+#[test]
+fn own3_j02_defer_runs_when_throw_is_caught_by_caller() {
+    let out = run_collect(
+        r#"
+        let log = [];
+        fn op(t) { defer push(log, "close"); if t { throw "primary"; } return 1; }
+        print op(false);
+        print len(log);
+        print (try op(true) catch "caught");
+        print len(log);
+        "#,
+    );
+    assert_eq!(strs(&out), vec!["1", "1", "caught", "2"]);
+}
+
+#[test]
+fn own3_j02_nested_frames_unwind_innermost_first_lifo() {
+    let out = run_collect(
+        r#"
+        let log = [];
+        fn inner() { defer push(log, "i1"); defer push(log, "i2"); throw "boom"; }
+        fn outer() { defer push(log, "o1"); inner(); return 0; }
+        print (try outer() catch "caught");
+        print log;
+        "#,
+    );
+    assert_eq!(strs(&out), vec!["caught", "[i2, i1, o1]"]);
+}
+
+#[test]
+fn own3_j02_throwing_defer_is_ignored_and_primary_error_preserved() {
+    let out = run_collect(
+        r#"
+        let log = [];
+        fn cleanup() { defer push(log, "cleanup-own"); throw "cleanup-failed"; }
+        fn op() { defer push(log, "older"); defer cleanup(); throw "primary"; }
+        print (try op() catch "caught");
+        print log;
+        "#,
+    );
+    assert_eq!(strs(&out), vec!["caught", "[cleanup-own, older]"]);
+    let err = run_err(
+        r#"
+        fn op() { defer { throw "cleanup-failed"; }; throw "primary"; }
+        let r = try op() catch "x";
+        throw "after";
+        "#,
+    );
+    assert!(err.message.contains("after"), "got {}", err.message);
+    let err = run_err(
+        r#"
+        fn op() { defer { throw "cleanup-failed"; }; throw "primary"; }
+        op();
+        "#,
+    );
+    assert!(
+        err.message.contains("primary"),
+        "primary error lost: {}",
+        err.message
+    );
+}
+
+#[test]
+fn own3_j02_defer_with_internal_try_catch_completes() {
+    let out = run_collect(
+        r#"
+        let log = [];
+        fn fail_it() { throw "in-defer"; }
+        fn cl() { let r = try fail_it() catch "inner-caught"; push(log, r); }
+        fn op() { defer cl(); throw "primary"; }
+        print (try op() catch "outer-caught");
+        print log;
+        "#,
+    );
+    assert_eq!(strs(&out), vec!["outer-caught", "[inner-caught]"]);
+}
+
+#[test]
+fn own3_j02_recursive_frames_with_defers_all_unwind() {
+    let out = run_collect(
+        r#"
+        let log = [];
+        fn tc(n) { defer push(log, n); if n == 0 { throw "t"; } return tc(n - 1); }
+        print (try tc(3) catch "caught");
+        print log;
+        "#,
+    );
+    assert_eq!(strs(&out), vec!["caught", "[0, 1, 2, 3]"]);
+}
+
+#[test]
+fn own3_j02_normal_return_defers_unchanged() {
+    let out = run_collect(
+        r#"
+        let log = [];
+        fn norm() { defer push(log, "n1"); defer push(log, "n2"); return 5; }
+        print norm();
+        print log;
+        "#,
+    );
+    assert_eq!(strs(&out), vec!["5", "[n2, n1]"]);
+}
+
+#[test]
+fn own3_j02_catch_after_unwind_resumes_handler_frame_state() {
+    let out = run_collect(
+        r#"
+        let log = [];
+        fn op() { defer push(log, "close"); throw "primary"; }
+        fn host() {
+            let a = 10;
+            let r = try op() catch "caught";
+            return a + len(log);
+        }
+        print host();
+        print host();
+        "#,
+    );
+    assert_eq!(nums(&out), vec![11.0, 12.0]);
+}
+
+#[test]
+fn own3_j02_uncaught_throw_runs_defers_before_exit() {
+    let dir = std::env::temp_dir().join(format!("own3_j02_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("uncaught.sapp");
+    std::fs::write(
+        &script,
+        "fn inner() { defer { print \"d-inner\"; }; throw \"boom\"; }\n\
+         fn outer() { defer { print \"d-outer\"; }; inner(); }\n\
+         defer { print \"d-script\"; };\n\
+         outer();\n",
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pblang"))
+        .arg("run")
+        .arg(&script)
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!out.status.success());
+    let lines: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("d-"))
+        .collect();
+    assert_eq!(
+        lines,
+        vec!["d-inner", "d-outer", "d-script"],
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("boom") || stdout.contains("boom"),
+        "primary error lost: {stderr}"
+    );
+}

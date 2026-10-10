@@ -120,7 +120,7 @@ Any other character (including unescaped `"`) ends or starts the string. The par
 
 
 - **Runtime error**: a `RuntimeError` value with message, optional span/source, and stack trace. Thrown by builtins and VM (e.g. type mismatch, undefined global, capability denied).
-- **Exception handling**: `try { ... } catch e { ... }` catches runtime errors; `e` is the error value. `defer { ... }` runs on scope exit (LIFO).
+- **Exception handling**: `try { ... } catch e { ... }` catches runtime errors; `e` is the error value. `defer { ... }` runs on scope exit (LIFO), including exits caused by a thrown error; an exception raised inside a defer during unwinding is ignored so the original error propagates.
 
 ## Function call arity
 
