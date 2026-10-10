@@ -49,6 +49,13 @@ keeping current-vs-roadmap claims honest.
 | `tests/semantics/` | Regression contract for assistant, LM, tokenizer, BPE, brain, sampling, accel, and assets. |
 | `checkpoints/` | Saved model checkpoints and weights. |
 
+
+The one-shot bridge rejects supplied files outside its bounded UTF-8/JSON and
+regular-file policy before importing models or dispatching actions. File admission
+currently uses the existing Linux descriptor profile; omitted filenames bypass
+that backend. See [request-file admission](docs/pbAI_API_Request_Admission.md) for
+limits, error envelopes, cleanup limitations and the exact owning-root command.
+
 The `.sapp` modules are **pblang** source. The `website/` host (`index.html`,
 `styles.css`, `pbai-web.js`) is plain static front-end code and needs no toolchain to edit.
 
