@@ -1,0 +1,132 @@
+// Caller-owned local dependency selection; not a filesystem sandbox or a TOML
+// implementation. No upward/environment search, downloads or new read grants.
+fn _bad() { throw "selfhost import: unsupported or invalid stdlib declaration"; }
+fn _space(s, i) {
+    while i < len(s) and (str_slice(s,i,i+1)==" " or str_slice(s,i,i+1)=="\t") { i=i+1; }
+    return i;
+}
+fn _quoted(s, state) {
+    state.i=_space(s,state.i);
+    if str_slice(s,state.i,state.i+1)!="\"" { _bad(); }
+    state.i=state.i+1; let begin=state.i;
+    while state.i<len(s) and str_slice(s,state.i,state.i+1)!="\"" {
+        let cp=strcharcodeat(s,state.i);
+        if cp<32 or cp==127 or cp==92 { _bad(); }
+        state.i=state.i+1;
+    }
+    if state.i>=len(s) { _bad(); }
+    let value=str_slice(s,begin,state.i);state.i=state.i+1;
+    return value;
+}
+fn _path(value) {
+    if type(value)!="string" or len(value)==0 or len(value)>4096 { _bad(); }
+    for cp in str_to_bytes(value) { if cp<32 or cp==127 or cp==92 { _bad(); } }
+    if len(str_to_bytes(value))>4096 { _bad(); }
+    return value;
+}
+fn _inline(s) {
+    let state=map{i:_space(s,0)};let seen=map{};let root=nil;
+    if str_slice(s,state.i,state.i+1)!="{" { _bad(); }
+    state.i=state.i+1;
+    loop {
+        state.i=_space(s,state.i);
+        if str_slice(s,state.i,state.i+1)=="}" { state.i=state.i+1;break; }
+        let begin=state.i;
+        while state.i<len(s) and regex_match(str_slice(s,state.i,state.i+1),"^[a-z]$") { state.i=state.i+1; }
+        let key=str_slice(s,begin,state.i);
+        if (key!="path" and key!="paths") or map_has(seen,key) { _bad(); }
+        seen[key]=true;state.i=_space(s,state.i);
+        if str_slice(s,state.i,state.i+1)!="=" { _bad(); }
+        state.i=state.i+1;
+        if key=="path" { root=_path(_quoted(s,state)); }
+        else {
+            state.i=_space(s,state.i);
+            if str_slice(s,state.i,state.i+1)!="[" { _bad(); }
+            state.i=state.i+1;let count=0;
+            loop {
+                state.i=_space(s,state.i);
+                if str_slice(s,state.i,state.i+1)=="]" { state.i=state.i+1;break; }
+                _path(_quoted(s,state));count=count+1;if count>32 { _bad(); }
+                state.i=_space(s,state.i);
+                if str_slice(s,state.i,state.i+1)=="]" { state.i=state.i+1;break; }
+                if str_slice(s,state.i,state.i+1)!="," { _bad(); }
+                state.i=state.i+1;
+            }
+        }
+        state.i=_space(s,state.i);
+        if str_slice(s,state.i,state.i+1)=="}" { state.i=state.i+1;break; }
+        if str_slice(s,state.i,state.i+1)!="," { _bad(); }
+        state.i=state.i+1;
+    }
+    if _space(s,state.i)!=len(s) or root==nil { _bad(); }
+    return root;
+}
+fn _line(s) {
+    let quoted=false;let escaped=false;let i=0;
+    while i<len(s) {
+        let cp=strcharcodeat(s,i);
+        if cp==0 { _bad(); }
+        if cp==35 and not quoted { return str_trim(str_slice(s,0,i)); }
+        if escaped { escaped=false; }
+        elif cp==92 and quoted { escaped=true; }
+        elif cp==34 { quoted=not quoted; }
+        i=i+1;
+    }
+    if quoted { _bad(); }
+    return str_trim(s);
+}
+fn from_manifest(text) {
+    if type(text)!="string" or len(text)>65536 or len(str_to_bytes(text))>65536 { _bad(); }
+    let lines=str_split(str_replace_all(text,"\r\n","\n"),"\n");
+    if len(lines)>1024 { _bad(); }
+    let section="";let dependencies=false;let root=nil;
+    for raw in lines {
+        if len(raw)>4096 { _bad(); }
+        let line=_line(raw);
+        if line=="" { continue; }
+        if str_starts_with(line,"[") {
+            if line=="[dependencies]" {
+                if dependencies { _bad(); } dependencies=true;section="dependencies";
+            } else {
+                // Unsupported table/quoted spellings must not become absence.
+                let normalized=str_replace_all(str_replace_all(str_replace_all(line,"\"",""),"'","")," ","");
+                if str_contains(normalized,"dependencies") { _bad(); }
+                section="other";
+            }
+            continue;
+        }
+        let equal=str_index_of(line,"=");
+        let lhs=if equal<0 { line } else { str_trim(str_slice(line,0,equal)) };
+        let key=str_replace_all(str_replace_all(str_replace_all(lhs,"\"",""),"'","")," ","");
+        if str_starts_with(key,"dependencies") { _bad(); }
+        if section=="dependencies" and (str_contains(lhs,"\"") or str_contains(lhs,"'")) { _bad(); }
+        if section=="dependencies" and (key=="stdlib" or str_starts_with(key,"stdlib.")) {
+            if lhs!="stdlib" or root!=nil or equal<0 { _bad(); }
+            root=_inline(str_trim(str_slice(line,equal+1,len(line))));
+        }
+    }
+    return if root==nil { map{root:"stdlib",selected:false} } else {map{root:root,selected:true}};
+}
+fn context(options=nil) {
+    if options!=nil and not is_map(options) { _bad(); }
+    if options!=nil and map_has(options,"stdlib_root") { return map{root:_path(options.stdlib_root),selected:true}; }
+    let exists=try map{ok:true,value:fs_exists("pblang.toml")} catch map{ok:false};
+    if not exists.ok { _bad(); }
+    if not exists.value { return map{root:"stdlib",selected:false}; }
+    // Retained fs_read allocates before admission. Caller filesystem authority
+    // remains mandatory; this is not a hard descriptor-oriented read bound.
+    let text=try fs_read("pblang.toml") catch nil;
+    return from_manifest(text);
+}
+fn resolve(path, roots) {
+    let suffix="";
+    if str_starts_with(path,"stdlib:") { suffix=str_slice(path,7,len(path)); }
+    elif str_starts_with(path,"stdlib/") { suffix=str_slice(path,7,len(path)); }
+    else { return path; }
+    _path(suffix);
+    for part in str_split(suffix,"/") { if part=="" or part=="." or part==".." { _bad(); } }
+    let full=roots.root+"/"+suffix;
+    if len(str_to_bytes(full))>4096 { _bad(); }
+    return full;
+}
+export context, from_manifest, resolve;
