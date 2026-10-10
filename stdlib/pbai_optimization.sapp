@@ -1,0 +1,219 @@
+// pbai_optimization.sapp -- measurable architecture optimization contracts.
+//
+// This module plans and validates; it never probes hardware, benchmarks, loads
+// weights, trains, or changes precision. Caller-measured reports are required
+// before a non-CPU backend can be selected.
+
+let BENCHMARK_FORMAT = "pbai.backend.benchmark.v1";
+let PLAN_FORMAT = "pbai.optimization.plan.v1";
+
+fn _in(items, value) {
+    let i = 0;
+    while i < len(items) { if items[i] == value { return true; } i = i + 1; }
+    return false;
+}
+
+// Reject NaN/infinity before arithmetic; counts/bytes also need exact integers.
+fn _finite(value) { return type(value) == "number" and value - value == 0; }
+fn _positive(value) { return _finite(value) and value > 0; }
+fn _count(value, minimum) {
+    return _finite(value) and value >= minimum and value <= 9007199254740991
+        and value == num_floor(value);
+}
+fn _ratio(value) { return type(value) == "number" and value >= 0 and value <= 1; }
+
+fn requirements() {
+    return map{
+        format: "pbai.optimization.requirements.v1",
+        goals: ["accuracy", "grounded-abstention", "low-latency", "throughput",
+            "ram-efficiency", "storage-efficiency", "portability", "modularity",
+            "expandability", "fast-training", "easy-training", "energy-awareness"],
+        benchmark_metrics: ["median_latency_ms", "p95_latency_ms", "throughput_per_second",
+            "peak_memory_bytes", "peak_vram_bytes", "artifact_bytes", "load_ms",
+            "unload_ms", "training_ms", "quality_score", "abstention_score"],
+        minimum_warmups: 2,
+        minimum_samples: 5,
+        maximum_quality_drop: 0.01,
+        minimum_accelerator_speedup: 1.05,
+        cpu_correctness_fallback_required: true,
+        identical_workload_required: true,
+        model_digest_required: true,
+        matching_model_digest_required: true,
+        maximum_exact_measurement_count: 9007199254740991,
+        current_npu_backend_available: false,
+        optimization_policy: "select a measured Pareto profile; never change semantics or quality merely to improve a benchmark"
+    };
+}
+
+fn _valid_report(report, workload) {
+    let req = requirements();
+    if type(report) != "map" or (try report.format catch "") != BENCHMARK_FORMAT { return false; }
+    if not _in(["cpu", "gpu", "npu"], try report.backend catch "") { return false; }
+    if (try report.workload catch "") != workload or not (try report.identical_workload catch false) { return false; }
+    if type(try report.model_digest catch nil) != "string" or len(report.model_digest) != 64 { return false; }
+    if not _count(try report.warmups catch nil, req.minimum_warmups) { return false; }
+    if not _count(try report.samples catch nil, req.minimum_samples) { return false; }
+    if not _positive(try report.median_latency_ms catch nil)
+        or not _positive(try report.p95_latency_ms catch nil)
+        or report.p95_latency_ms < report.median_latency_ms
+        or not _positive(try report.throughput_per_second catch nil)
+        or not _count(try report.peak_memory_bytes catch nil, 1)
+        or not _count(try report.artifact_bytes catch nil, 1) { return false; }
+    if not _ratio(try report.quality_score catch nil)
+        or not _ratio(try report.baseline_quality_score catch nil)
+        or report.baseline_quality_score - report.quality_score > req.maximum_quality_drop { return false; }
+    if not (try report.parity_passed catch false) or not (try report.artifact_verified catch false)
+        or not (try report.runtime_verified catch false) or not (try report.operator_coverage_passed catch false) {
+        return false;
+    }
+    return true;
+}
+
+fn _eligible(report, workload) {
+    if not _valid_report(report, workload) { return false; }
+    if report.backend == "cpu" { return try report.deterministic_fallback catch false; }
+    if report.backend == "gpu" {
+        return (workload == "tensor-matmul-inference" or workload == "tensor-matmul-training")
+            and (try report.precision catch "") == "f32"
+            and (try report.runtime catch "") == "pblang-wgpu-matmul-v1";
+    }
+    // Detection is not compute. No current PBLang NPU backend is available.
+    return false;
+}
+
+fn select_backend(workload, reports) {
+    if type(reports) != "array" or len(reports) == 0 or len(reports) > 16 {
+        return map{ format: "pbai.backend.selection.v1", ok: false,
+            selected: "none", fallback: "cpu", reason: "missing-or-invalid-benchmark-reports" };
+    }
+    let cpu = nil;
+    let i = 0;
+    while i < len(reports) {
+        if (try reports[i].backend catch "") == "cpu" and _eligible(reports[i], workload) { cpu = reports[i]; }
+        i = i + 1;
+    }
+    if cpu == nil {
+        return map{ format: "pbai.backend.selection.v1", ok: false,
+            selected: "none", fallback: "cpu", reason: "verified-deterministic-cpu-baseline-required" };
+    }
+
+    let selected = cpu;
+    let speedup = 1.0;
+    i = 0;
+    while i < len(reports) {
+        let candidate = reports[i];
+        if _eligible(candidate, workload) and candidate.backend != "cpu"
+            and candidate.model_digest == cpu.model_digest {
+            let candidate_speedup = cpu.median_latency_ms / candidate.median_latency_ms;
+            if _positive(candidate_speedup) and candidate_speedup >= requirements().minimum_accelerator_speedup
+                and candidate.median_latency_ms < selected.median_latency_ms {
+                selected = candidate;
+                speedup = candidate_speedup;
+            }
+        }
+        i = i + 1;
+    }
+    return map{
+        format: "pbai.backend.selection.v1",
+        ok: true,
+        selected: selected.backend,
+        selected_runtime: try selected.runtime catch "portable-pblang-cpu",
+        selected_precision: try selected.precision catch "f64",
+        fallback: "cpu",
+        measured_speedup_over_cpu: speedup,
+        quality_score: selected.quality_score,
+        median_latency_ms: selected.median_latency_ms,
+        p95_latency_ms: selected.p95_latency_ms,
+        throughput_per_second: selected.throughput_per_second,
+        peak_memory_bytes: selected.peak_memory_bytes,
+        artifact_bytes: selected.artifact_bytes,
+        benchmark_proven: true,
+        npu_inventory_is_compute: false,
+        reason: if selected.backend == "cpu" { "no eligible accelerator beat the verified CPU baseline" }
+            else { "eligible accelerator passed parity, quality, operator, artifact and speedup gates" }
+    };
+}
+
+fn deployment_plan(tier, parameter_count, context_tokens, ram_budget_bytes, storage_budget_bytes) {
+    let valid = type(parameter_count) == "number" and parameter_count > 0
+        and type(context_tokens) == "number" and context_tokens > 0
+        and type(ram_budget_bytes) == "number" and ram_budget_bytes > 0
+        and type(storage_budget_bytes) == "number" and storage_budget_bytes > 0;
+    if not valid {
+        return map{ format: PLAN_FORMAT, ok: false, error: "invalid-deployment-bounds" };
+    }
+    let f16_bytes = parameter_count * 2;
+    let f8_bytes = parameter_count;
+    let candidate_precision = "sharded-f8";
+    if f16_bytes <= storage_budget_bytes { candidate_precision = "f16"; }
+    else if f8_bytes <= storage_budget_bytes { candidate_precision = "f8"; }
+    return map{
+        format: PLAN_FORMAT,
+        ok: true,
+        tier: str(tier),
+        parameter_count: parameter_count,
+        context_tokens: context_tokens,
+        ram_budget_bytes: ram_budget_bytes,
+        storage_budget_bytes: storage_budget_bytes,
+        precision_candidate: candidate_precision,
+        precision_committed: false,
+        accuracy_gate_required: true,
+        strategies: ["verified-weight-shards", "on-demand-layer-and-expert-loading",
+            "bounded-kv-and-retrieval-cache", "measured-prefetch", "deterministic-eviction",
+            "inactive-expert-offload", "shared-immutable-tokenizer-and-embeddings"],
+        cpu_fallback_required: true,
+        portable_checkpoint_required: true,
+        modular_role_contract_required: true,
+        note: "precision and sharding remain candidates until identical-workload quality, latency, RAM and storage measurements pass"
+    };
+}
+
+fn training_plan(role_count, examples, epochs, parameter_count, options = nil) {
+    if options == nil { options = map{}; }
+    let valid = type(role_count) == "number" and role_count >= 1 and role_count <= 64
+        and type(examples) == "number" and examples >= 1 and examples <= 1000000000
+        and type(epochs) == "number" and epochs >= 1 and epochs <= 100000
+        and type(parameter_count) == "number" and parameter_count >= 1;
+    if not valid { return map{ format: "pbai.optimization.training-plan.v1", ok: false, error: "invalid-training-bounds" }; }
+    return map{
+        format: "pbai.optimization.training-plan.v1",
+        ok: true,
+        role_count: role_count,
+        examples: examples,
+        epochs: epochs,
+        parameter_count: parameter_count,
+        strategy: if try options.full_retrain catch false { "reviewed-full-retrain-candidate" } else { "adapter-and-small-specialist-first" },
+        reusable_assets: ["admitted-dataset-manifest", "deduplicated-token-cache",
+            "versioned-tokenizer", "derived-feature-cache", "teacher-trace-cache"],
+        lifecycle: ["resume-safe-checkpoint", "bounded-parallel-workers", "validation",
+            "sealed-evaluation", "adversarial-verification", "accept-or-rollback"],
+        live_chat_training: false,
+        provenance_gate_required: true,
+        privacy_gate_required: true,
+        ruler_gate_required: true,
+        quality_gate_required: true,
+        benchmark_gate_required: true,
+        launches_training: false
+    };
+}
+
+fn status() {
+    return map{
+        format: "pbai.optimization.status.v1",
+        ok: true,
+        policy: "measured Pareto profiles per model, workload, runtime and device",
+        requirements: requirements(),
+        cpu: "portable deterministic baseline available",
+        gpu: "conditional pblang wgpu f32 tensor-matmul route; requires current measured proof",
+        npu: "inventory only; no current PBLang compute backend",
+        memory_storage: "quantization candidates plus verified shards, bounded caches, on-demand loading and offload",
+        training: "adapter/small-specialist first, reusable admitted assets, resumable checkpoints, sealed evaluation and rollback",
+        performs_benchmark: false,
+        trains_model: false,
+        changes_precision: false,
+        universal_best_claimed: false
+    };
+}
+
+export BENCHMARK_FORMAT, PLAN_FORMAT;
+export requirements, select_backend, deployment_plan, training_plan, status;
