@@ -430,17 +430,48 @@ fn write_atomic(fs, path, bytes, create_parents = true) {
         descriptor_bound_parent: true, nofollow: true };
 }
 
+// Only this exclusive-write path consumes the native close result. Other
+// portable operations retain their separate, unverified cleanup contracts.
+fn _exclusive_close_fd(fs, fd) {
+    if fd < 0 { return false; }
+    return _i32(_call(fs, "close", "i32->i32", [fd])) == 0;
+}
+
 fn write_new_exclusive(fs, path, bytes, create_parents = true) {
     if type(bytes) != "array" or len(bytes) > MAX_BYTES { return _error("bytes must be a bounded array"); }
     let parent = _parent(fs, path, create_parents); if not parent.ok { return parent; }
     let flags = fs.profile.o_wronly + fs.profile.o_creat + fs.profile.o_excl
         + fs.profile.o_nofollow + fs.profile.o_cloexec;
     let fd = _openat(fs, parent.fd, parent.name, flags, MODE_FILE);
-    if fd < 0 { _close_fd(fs, parent.fd); return _error("destination exists or cannot be created exclusively"); }
-    let wrote = try { fs_write_bytes(_fd_path(fs, fd), bytes); true } catch false; _close_fd(fs, fd);
-    if not wrote { _unlinkat(fs, parent.fd, parent.name, 0); }
-    _close_fd(fs, parent.fd);
-    if not wrote { return _error("exclusive destination write failed"); }
+    if fd < 0 {
+        let closed = try _exclusive_close_fd(fs, parent.fd) catch false;
+        let result = _error("destination exists or cannot be created exclusively");
+        if type(closed) != "bool" or not closed {
+            result.cleanup_uncertain = true;
+            result.dirfs_parent_close_confirmed = false;
+            result.retry_safe = false;
+        }
+        return result;
+    }
+    let wrote = try { fs_write_bytes(_fd_path(fs, fd), bytes); true } catch false;
+    // Consume each owned descriptor once, even when the first close fails.
+    let file_closed = try _exclusive_close_fd(fs, fd) catch false;
+    let parent_closed = try _exclusive_close_fd(fs, parent.fd) catch false;
+    let file_confirmed = type(file_closed) == "bool" and file_closed;
+    let parent_confirmed = type(parent_closed) == "bool" and parent_closed;
+    if not wrote or not file_confirmed or not parent_confirmed {
+        // The held parent does not bind its mutable child name to our inode.
+        // Never unlink by that name: a replacement may belong to another writer.
+        return map{ ok: false, error: if not wrote {
+                "exclusive destination write failed; output may remain"
+            } else { "exclusive destination cleanup could not be verified; output may remain" },
+            write_completed: wrote, output_may_exist: true,
+            publication_may_have_occurred: true,
+            rollback_attempted: false, rollback_complete: false,
+            cleanup_uncertain: true, retry_safe: false,
+            file_close_confirmed: file_confirmed,
+            dirfs_parent_close_confirmed: parent_confirmed };
+    }
     return map{ ok: true, path: path, size: len(bytes), no_replace: true,
         atomic_namespace_admission: true, atomic_visibility: false,
         descriptor_bound_parent: true, nofollow: true };

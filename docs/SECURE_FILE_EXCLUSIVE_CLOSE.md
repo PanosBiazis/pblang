@@ -45,9 +45,9 @@ unconfirmed-copy messages remain applicable. Batch completion counts confirmed
 prior results, not every file that may exist. Pinned products need a separate
 stdlib dependency/lock update and installation before receiving the behavior.
 
-Other secure-file methods and direct DirFS callers are unchanged. The Linux
-exclusive backend still has separate lower-level close/unlink outcome limits.
-macOS and Windows close implementations do not aggregate every native close result;
+Other secure-file methods retain their separate cleanup contracts. The exclusive
+Linux/POSIX backend changes below also apply to direct DirFS callers. macOS and
+Windows outer close implementations do not aggregate every native close result;
 checking their return boolean does not establish full native cleanup correctness.
 
 ## Reproducible qualification
@@ -101,3 +101,83 @@ Qualification on retained runtime72: the paired model/caller/real-I/O checks and
 all twelve product cases passed. Original failed harness attempts are retained in
 the private execution evidence. No macOS/Windows live tests, rollback acceptance,
 opaque-exception cleanup solution, product adoption or installation is claimed.
+
+
+## Exclusive backend failures retain possible output
+
+Linux `linux_dirfs.write_new_exclusive` and portable
+`posix_dirfs.write_new_exclusive` no longer call `unlinkat` after a failed write.
+The held parent descriptor identifies a directory, not the file currently named
+by its child entry. Another writer can rename the newly created file and replace
+its name before cleanup; unlinking that name would remove the replacement.
+A separate identity check followed by unlink would still allow this race.
+
+Both backends attempt the created file close and their own parent close once,
+independently. Only boolean `true` confirms a close. A returned or thrown close
+failure does not suppress the other owned close, trigger a retry, or erase the
+fixed primary write diagnostic. The POSIX change uses an exclusive-write-only
+close helper; other portable cleanup operations are not certified by it.
+
+Successful writes with both closes confirmed retain their existing success maps.
+After creation, any write or close failure returns these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `ok:false` | The operation is not confirmed successful |
+| `write_completed` | The byte-writing call returned normally; no durability claim |
+| `file_close_confirmed` | One close of the created descriptor returned boolean true |
+| `dirfs_parent_close_confirmed` | One close of the backend-owned parent returned boolean true |
+| `output_may_exist:true`, `publication_may_have_occurred:true` | Partial or complete output may remain; current path identity is not known |
+| `rollback_attempted:false`, `rollback_complete:false` | No implicit pathname rollback was attempted or verified |
+| `cleanup_uncertain:true`, `retry_safe:false` | Stop automatically repeating effects or removing names |
+
+`cleanup_uncertain` also covers retained possible output when both descriptor
+closes succeed. It is not solely a close-error flag. The fixed write diagnostic
+is `exclusive destination write failed; output may remain`; after a completed
+write with an unconfirmed close it is `exclusive destination cleanup could not
+be verified; output may remain`. No exception payload, file content, or path is
+included in these new diagnostics.
+
+The facade preserves backend fields on a normal return. Its separate
+`parent_close_confirmed` describes the outer root handle, so it does not overwrite
+`dirfs_parent_close_confirmed`. Exclusive-open rejection still never writes or
+removes anything. If closing that already-owned parent is unconfirmed, its
+original rejection gains `cleanup_uncertain`, `dirfs_parent_close_confirmed:false`
+and `retry_safe:false`, without claiming that this attempt created output.
+
+The existing complete `polyglot_web.bundle` and `polyglot_build` callers now stop
+on this backend uncertainty before their next retry or output-directory removal.
+Document adapters already reject `ok:false`. Partial files can remain even when
+unlink authority is available. Callers must not implement a pathname deletion
+fallback. This fixes replacement-entry data loss and false cleanup/success
+reporting; it does **not** implement atomic output, verified rollback, crash
+recovery, general opaque-exception preservation, or cleanup for named staging in
+other APIs. The facade exception limits above still apply.
+
+### Paired backend qualification
+
+```sh
+python3 tests/tooling/dirfs_exclusive_failure_check.py \
+  --runtime /path/to/retained-runtime \
+  --baseline /path/to/immutable-original-source \
+  --report /path/to/private-report.json
+```
+
+Run serially under the existing coordinator heavy lock with a finite acquisition
+deadline. The harness uses complete private module copies, resource limits,
+Bubblewrap and synthetic scratch files. Its Linux replacement fixture writes
+16 real bytes, pauses at a bounded rendezvous, renames that inode, creates a
+distinct replacement, and then forces the write failure. The original cleanup
+removes the replacement; the changed cleanup preserves both inode identities and
+bytes. Native cleanup itself is unchanged in that fixture. A separate real
+`RLIMIT_FSIZE=16` case exercises a kernel write failure with the existing
+15-symbol profile and with test-only unlink authority. That extra authority is
+never added to a product or installation.
+
+Whole-module Linux/POSIX models cover success/failure and boolean, nil, numeric,
+and thrown close outcomes, plus admission rejection. Real Linux close failures
+are not injected. POSIX/macOS qualification is source/model evidence only; no
+macOS hardware or operational availability is implied. Complete caller models
+use the unchanged facade and changed backend to verify one write, no retry and
+no subsequent remove. Sources, baseline bytes, private harness and reports must
+be frozen together for independent review.
