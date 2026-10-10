@@ -2,6 +2,16 @@
 
 ## [0.6.0-alpha] — 2026
 
+- Fixed closure capture in the bytecode compiler (`pblang-compiler`). Nested
+  functions now compile against the real enclosing compiler chain instead of a
+  truncated copy. This corrects `obj:method()` inside nested blocks/`try`
+  resolving a local receiver as a global (the retained `9` instead of `7`
+  reproducer), `upvalue index out of bounds` for captures three or more levels
+  deep, block expressions inside closures losing captured locals, and loop
+  closures/`defer` thunks reading `nil` instead of their per-iteration value.
+  `break`/`continue` now close captured loop locals. Takes effect only in a
+  native executable rebuilt from this source.
+
 - Corrected the canonical PBLang numeric version to `0.6.0` and kept the
   non-production `alpha` channel explicit.
 - Added independent optional application release channels. Application
