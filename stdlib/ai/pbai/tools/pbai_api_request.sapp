@@ -1,0 +1,121 @@
+// One-shot request admission. No model imports, persistent state or permission grants.
+// Files require the existing Linux descriptor profile; omission needs no backend.
+let MAX_BYTES = 983040;
+let MAX_DEPTH = 32;
+
+fn _fail(message) { return map{ok:false,error:message,value:nil}; }
+fn _true(value) {return type(value)=="bool" and value;}
+fn _false(value) {return type(value)=="bool" and not value;}
+fn _ready(backend) {
+    let state=try backend.scan_mount_admission_status() catch nil;
+    return type(state)=="map" and _true(try state.ready catch false)
+        and _false(try state.process_admission_poisoned catch true);
+}
+
+fn _parts(path) {
+    if type(path)!="string" or len(path)>4096 {return nil;}
+    if len(str_to_bytes(path))>4096 or str_contains(path,strfromcharcode(0)) {
+        return nil;
+    }
+    // Only a leading ./ is normalized; interior dots/traversal are rejected.
+    if str_starts_with(path,"./") {path=str_slice(path,2,len(path));}
+    if path=="" or str_ends_with(path,"/") {return nil;}
+    let absolute=str_starts_with(path,"/");
+    let parts=str_split(path,"/");let start=if absolute {1} else {0};
+    let i=start;
+    while i<len(parts) {
+        let part=parts[i];
+        if part=="" or part=="." or part==".." or str_contains(part,"\\")
+            or len(str_to_bytes(part))>255 {return nil;}
+        i=i+1;
+    }
+    let name=parts[len(parts)-1];
+    // These names are reserved by the existing prefix/root backend contracts.
+    if name=="root" or (not absolute and len(parts)==2 and parts[0]=="root") {
+        return nil;
+    }
+    let parent=try path_dirname(path) catch nil;
+    if parent==nil {return nil;}
+    if parent=="" {parent=".";}
+    return map{parent:parent,name:name,absolute:absolute};
+}
+
+fn _depth_ok(bytes) {
+    let depth=0;let quoted=false;let escaped=false;let i=0;
+    while i<len(bytes) {
+        let byte=bytes[i];
+        if quoted {
+            if escaped {escaped=false;}
+            elif byte==92 {escaped=true;}
+            elif byte==34 {quoted=false;}
+        } else {
+            if byte==34 {quoted=true;}
+            elif byte==123 or byte==91 {
+                depth=depth+1;if depth>MAX_DEPTH {return false;}
+            } elif byte==125 or byte==93 {
+                depth=depth-1;if depth<0 {return false;}
+            }
+        }
+        i=i+1;
+    }
+    return depth==0 and not quoted;
+}
+
+// Pure boundary for focused fixtures; the CLI supplies only backend-owned bytes.
+fn parse_bytes(bytes) {
+    if type(bytes)!="array" or len(bytes)>MAX_BYTES {
+        return _fail("request exceeds byte limit");
+    }
+    let text=try bytes_to_str(bytes) catch nil;
+    if text==nil {return _fail("request must be valid UTF-8");}
+    // Retained runtimes may repair invalid UTF-8; reject every repaired byte.
+    let encoded=str_to_bytes(text);
+    if len(encoded)!=len(bytes) {return _fail("request must be valid UTF-8");}
+    let i=0;
+    while i<len(encoded) {
+        if encoded[i]!=bytes[i] {return _fail("request must be valid UTF-8");}
+        i=i+1;
+    }
+    if not _depth_ok(bytes) {return _fail("request JSON structure exceeds policy");}
+    let value=try json_parse(text) catch nil;
+    if type(value)!="map" {return _fail("request must be a valid JSON object");}
+    return map{ok:true,value:value,error:nil};
+}
+
+fn read_request(path) {
+    // Omitted input must not load/probe a filesystem or FFI backend.
+    if path=="" {return map{ok:true,value:map{},error:nil};}
+    let parts=_parts(path);
+    if parts==nil {return _fail("request path is outside supported policy");}
+    if platform()!="linux" {return _fail("request file backend is unavailable");}
+    let backend=try import("stdlib:linux_dirfs.sapp") catch nil;
+    if backend==nil or not _ready(backend) {
+        return _fail("request file backend is unavailable");
+    }
+    let handle: any=nil;
+    if parts.absolute {handle=try backend.open_absolute(parts.parent,false,false) catch nil;}
+    else {handle=try backend.open(parts.parent,false,false) catch nil;}
+    if type(handle)!="map" or not _true(try handle.ok catch false) {
+        return _fail("request file could not be read safely");
+    }
+    let loaded=try backend.read_prefix_bytes(handle,parts.name,MAX_BYTES+1) catch nil;
+    // Ownership consumed once, including when reading throws. Never retry close.
+    let closed=try backend.close(handle) catch false;
+    if type(closed)!="bool" or not closed or not _ready(backend) {
+        return _fail("request file cleanup could not be confirmed");
+    }
+    if type(loaded)!="map" or not _true(try loaded.ok catch false) {
+        return _fail("request file could not be read safely");
+    }
+    let bytes=try loaded.bytes catch nil;
+    let size=try loaded.size catch nil;
+    if type(bytes)!="array" or type(size)!="number" or size!=len(bytes)
+        or size>MAX_BYTES or (try loaded.source_size catch nil)!=size
+        or not _false(try loaded.truncated catch true)
+        or (try loaded.kind catch "")!="file"
+        or not _true(try loaded.descriptor_bound_metadata catch false) {
+        return _fail("request file is outside bounded regular-file policy");
+    }
+    return parse_bytes(bytes);
+}
+export read_request, parse_bytes, MAX_BYTES, MAX_DEPTH;
