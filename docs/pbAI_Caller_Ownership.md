@@ -286,3 +286,32 @@ cleanup. Unmodified companion runs verify success/fallback output parity. The
 private copies hide the original source roots and deny networking. This is Linux
 qualification of the explicit profile, not universal source cleanup or physical
 RAM reclamation. See [guarded evidence](evidence/pbai_guarded_file_ownership-2026-10-10.json).
+
+## Direct checkpoint-file read/reload ownership (`defer`)
+
+The ordinary `read` and `reload` branches of `pbai_student_checkpoint_file.sapp`
+now run inside `read_phase`/`reload_phase`. Each acquired student handle gets its
+own owner record (`handle_owner`), released once through
+`defer handle_owner_release(owner);`. The owner records are never reassigned,
+because PBLang closures capture variables by reference: a reassigned
+`active_release` variable would redirect a pending cleanup (the reverted PR #92
+bug). Native `defer` runs on unwind and keeps the primary error; a non-boolean
+close result raises `invalid checkpoint close result`. The `write` and `close`
+branches are unchanged.
+
+The self-hosted PBCK frontend has no `defer` statement, so this direct example
+cannot be compiled to PBCK; the guarded PBCK companion above remains the
+compiled profile. Its gate now uses the frozen pre-defer caller
+`tests/fixtures/pbai_student_checkpoint_file_baseline.sapp` as its baseline.
+
+Linux/bwrap source-hidden check (20 read/reload fault cases):
+
+```bash
+PBLANG_BIN="$TRUSTED_PBLANG_RUNTIME" python3 tests/tooling/pbai_checkpoint_file_direct_lifetime.py --product pblang --phase baseline
+PBLANG_BIN="$TRUSTED_PBLANG_RUNTIME" python3 tests/tooling/pbai_checkpoint_file_direct_lifetime.py --product pblang
+```
+
+The baseline must report unclosed fault cases (7 observed); the fixed run must
+report `unclosed_fault_cases: 0`. In the standalone `pbai` repository use
+`--product pbai` with sibling `../pblang`. This verifies handle close calls only,
+not physical RAM reclamation or hosted CI.
