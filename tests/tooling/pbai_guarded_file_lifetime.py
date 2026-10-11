@@ -34,7 +34,9 @@ def main():
     provider = root if args.product == "pblang" else root.parent / "pblang"
     runtime = str(Path(os.environ["PBLANG_BIN"]).resolve(strict=True))
     directory = "examples" if args.product == "pblang" else "demo"
-    original = (root / directory / "pbai_student_checkpoint_file.sapp").read_text()
+    # Frozen pre-defer direct caller: the PBCK frontend has no `defer`
+    # statement, and this baseline must stay the historical unguarded shape.
+    original = (root / "tests/fixtures/pbai_student_checkpoint_file_baseline.sapp").read_text()
     guarded = (root / directory / "pbai_student_checkpoint_file_guarded.sapp").read_text()
     temp = Path(tempfile.mkdtemp(prefix="pbai-guarded-file-"))
     os.chmod(temp, 0o700)
