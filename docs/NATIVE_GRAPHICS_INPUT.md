@@ -183,6 +183,26 @@ Use `G.Window(width, height, title, map{ordered_input:true})`, not
 `window.input_backend == "x11-ordered-keysyms"` before attributing results to
 the optional queue. Three-argument callers continue to select the legacy path.
 
+Forms using the shared GUI loop can pass window options explicitly:
+
+```sapp
+let GUI = import("stdlib:gui.sapp");
+let form = GUI.form("Editor", 800, 600);
+GUI.run(form, map{ordered_input:true});
+```
+
+`GUI.run(form)` and `GUI.run(form,nil)` preserve legacy input. The optional
+second argument must be a map or nil; an `ordered_input` field, when present,
+must be a boolean. Invalid values are rejected before layout or window creation.
+The map is forwarded without modification to `graphics.Window`; `false` keeps
+legacy input, and `true` requests the existing platform-dependent adapter with
+its documented fallback. Requesting it does not prove which backend opened.
+
+`modern_ui.build` constructs a form, not an operating-system window. Its layout
+options do not configure native input. When using a built form, pass window
+options to `GUI.run` on every invocation, including close-confirmation/reopen
+loops. `modern_ui.run` retains its existing default input behavior.
+
 The widget integration fixture can now explicitly qualify either route:
 
 ```sh
