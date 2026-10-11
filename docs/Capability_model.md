@@ -138,7 +138,7 @@ be retried automatically because the complete record may already be visible.
 
 | Field | Effect |
 |-------|--------|
-| `max_instructions: Option<u64>` | Anti-infinite-loop. The VM aborts with `instruction limit exceeded` once N bytecode ops have run. |
+| `max_instructions: Option<u64>` | After N bytecode ops, normal execution terminates. Registered cleanup shares at most 10,000 additional bytecode ops; nested cleanup never renews this allowance. See [native cleanup limits](Native_cleanup_limits.md). |
 | `max_stack_depth: Option<usize>` | Anti-stack-overflow. Recursion past N call frames errors out. |
 | `max_memory_bytes: Option<usize>` | Reserved configuration; intrinsic VM allocations are not hard-accounted or bounded by this field. |
 | `io_timeout_ms: Option<u64>` | Per-call timeout for `http_*`, `tcp_*`, and the `read_*`/`write_*` variants. |

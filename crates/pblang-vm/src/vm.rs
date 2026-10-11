@@ -476,7 +476,9 @@ pub struct FfiPolicy {
 /// Resource limits for sandboxing (anti-infinite-loop, stack overflow, IO, memory).
 #[derive(Debug, Clone, Default)]
 pub struct VmLimits {
-    /// Max VM instructions per run. Prevents infinite loops.
+    /// Max normal VM instructions per run. On exhaustion, registered cleanup
+    /// receives at most MAX_INSTRUCTION_CLEANUP_STEPS additional instructions.
+    /// The limit is terminal: user catch handlers cannot resume normal execution.
     pub max_instructions: Option<u64>,
     /// Max call stack depth (number of frames).
     pub max_stack_depth: Option<usize>,
@@ -490,6 +492,10 @@ pub struct VmLimits {
     /// — only external bytes are. Default applied by helpers when None: 10 MB.
     pub max_external_json_bytes: Option<usize>,
 }
+
+/// One shared emergency allowance per run, never renewed by nested cleanup.
+/// This bounds bytecode execution, not time spent inside a native builtin.
+pub const MAX_INSTRUCTION_CLEANUP_STEPS: u64 = 10_000;
 
 /// Hardcoded fallback when `VmLimits.max_external_json_bytes` is None.
 /// 10 MB matches the IDE-server body cap and is large enough for any
@@ -1141,6 +1147,7 @@ impl VM {
     ) -> Result<(), RuntimeError> {
         self.stack.clear();
         self.frames.clear();
+        self.handlers.clear();
         self.unwinds.clear();
         self.unwind_resume = false;
 
@@ -1188,15 +1195,33 @@ impl VM {
         let _gil_guard = GilGuard(gil_reg.clone());
 
         let mut instruction_count: u64 = 0;
+        let mut cleanup_remaining = None;
         while !self.frames.is_empty() {
-            if let Some(ref lim) = self.limits {
-                if let Some(max) = lim.max_instructions {
-                    if instruction_count >= max {
-                        return Err(self.make_err("instruction limit exceeded"));
-                    }
+            if let Some(remaining) = &mut cleanup_remaining {
+                if *remaining == 0 {
+                    // Never renew the allowance, including for nested failures.
+                    // Preserve the primary failure even if cleanup cannot finish.
+                    let error = self.unwinds.remove(0).error;
+                    self.close_upvalues_from(0);
+                    self.frames.clear();
+                    self.stack.clear();
+                    self.handlers.clear();
+                    self.unwinds.clear();
+                    self.unwind_resume = false;
+                    return Err(error);
                 }
+                *remaining -= 1;
+            } else if self
+                .limits
+                .as_ref()
+                .and_then(|l| l.max_instructions)
+                .is_some_and(|max| instruction_count >= max)
+            {
+                cleanup_remaining = Some(MAX_INSTRUCTION_CLEANUP_STEPS);
+                self.begin_instruction_limit_unwind()?;
+                continue;
             }
-            instruction_count += 1;
+            instruction_count = instruction_count.saturating_add(1);
             // GIL cooperative yield: periodically hand the lock to another waiting
             // thread so threads interleave. No-op (one predictable branch) when off.
             if gil_reg.gil.enabled && (instruction_count & 0x1FFF) == 0 {
@@ -2786,6 +2811,50 @@ impl VM {
             run_order.extend(frame.defers.drain(..).rev());
         }
         run_order
+    }
+
+    /// Convert instruction exhaustion to terminal cleanup. Merge suspended
+    /// unwinds at their active thunk boundaries so inner cleanup still precedes
+    /// older defers and outer frames. No user catch may swallow this limit.
+    fn begin_instruction_limit_unwind(&mut self) -> Result<(), RuntimeError> {
+        let error = self
+            .unwinds
+            .first()
+            .map(|u| u.error.clone())
+            .unwrap_or_else(|| self.make_err("instruction limit exceeded"));
+        let mut run_order = Vec::new();
+        while self.frames.len() > 1 {
+            let index = self.frames.len() - 1;
+            let mut frame = self.frames.pop().expect("length checked");
+            self.close_upvalues_from(frame.stack_base + 1);
+            run_order.extend(frame.defers.drain(..).rev());
+            while self
+                .unwinds
+                .last()
+                .is_some_and(|u| u.thunk_frame == Some(index))
+            {
+                let unwind = self.unwinds.pop().expect("last checked");
+                run_order.extend(unwind.pending.into_iter().rev());
+            }
+        }
+        while let Some(unwind) = self.unwinds.pop() {
+            run_order.extend(unwind.pending.into_iter().rev());
+        }
+        if let Some(bottom) = self.frames.first_mut() {
+            run_order.extend(bottom.defers.drain(..).rev());
+        }
+        // Capture all remaining script locals before truncating the stack.
+        self.close_upvalues_from(0);
+        self.stack.truncate(1);
+        self.handlers.clear();
+        self.unwind_resume = false;
+        self.unwinds.push(UnwindState {
+            error,
+            handler: None,
+            pending: run_order.into_iter().rev().collect(),
+            thunk_frame: None,
+        });
+        self.continue_unwind()
     }
 
     /// Start unwinding for a runtime error raised by an instruction.
