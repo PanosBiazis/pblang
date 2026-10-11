@@ -85,7 +85,15 @@ existing report is refused; failures remain evidence.
 
 Only Linux is qualified. Other platforms explicitly reject this opt-in profile.
 The retained host's portable dependency lock resolution from an unrelated
-working directory remains a separate limitation; direct qualification runs from
-the prepared bundle root. Native `check` already changes to that root internally.
+working directory remains a separate limitation. Portable bundle qualification
+runs from the prepared bundle root. A reviewed local installation can instead
+materialize its own dependency lock using the existing explicit installation
+step in [installed dependency locks](INSTALLED_DEPENDENCY_LOCKS.md). Such a lock
+binds imports to that installation's absolute dependency paths and supports
+foreign-cwd execution without changing the retained resolver. Keep published
+packages portable; do not commit or distribute the local host-bound lock. Before
+moving an installation, publish its portable lock, then materialize at the new
+location. Native `check` already changes to its executable's bundle root
+internally.
 This change does not repair native lint's unary-negation traversal discrepancy,
 install a runtime, or establish Windows/macOS/Android compatibility.
