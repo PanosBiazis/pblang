@@ -8,7 +8,8 @@
 //! the RC graph can release them.
 //!
 //! Roots are: the VM stack, every active call frame's closure, every closed
-//! upvalue, the current module, the builtins module, and the module cache.
+//! upvalue, frame-held defers/return values, pending unwind closures, the current
+//! module, the builtins module, and the module cache.
 //!
 //! Each cleared container's `Rc` may still be held by some user value; that's
 //! fine — clearing its body breaks the cycle, and the `Rc` itself is dropped
@@ -88,6 +89,20 @@ impl VM {
         // --- roots: active call frames / closures ---
         for f in self.frames.iter() {
             self.gc_mark_closure(&f.closure, &mut marks);
+            for deferred in &f.defers {
+                self.gc_mark_value(deferred, &mut marks);
+            }
+            if let Some(result) = &f.module_result {
+                self.gc_mark_value(result, &mut marks);
+            }
+        }
+
+        // Removed call frames no longer root their closed captures. Their
+        // pending cleanup closures remain live until invoked or abandoned.
+        for unwind in &self.unwinds {
+            for deferred in &unwind.pending {
+                self.gc_mark_value(deferred, &mut marks);
+            }
         }
 
         // --- roots: closed upvalues (open upvalues point into stack) ---

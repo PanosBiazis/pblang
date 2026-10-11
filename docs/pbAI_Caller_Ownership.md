@@ -304,14 +304,65 @@ cannot be compiled to PBCK; the guarded PBCK companion above remains the
 compiled profile. Its gate now uses the frozen pre-defer caller
 `tests/fixtures/pbai_student_checkpoint_file_baseline.sapp` as its baseline.
 
-Linux/bwrap source-hidden check (20 read/reload fault cases):
+### Required runtime and backend contract
+
+Use the **retained native source** backend for this direct example. The VM
+change introduced in revision `90797788f433` is necessary for unwind cleanup,
+but that revision alone is insufficient: its pending-defer captures are not
+protected during GC. A `0.6.0` version string is not an acceptance criterion.
+Before using a product's runtime, run the behavioral preflight below against
+**that exact executable**. It checks pending list/map captures across GC and
+preservation of the primary error when cleanup throws. A rejected runtime must
+not be used for the direct workflow; use a separately qualified guarded PBCK
+companion instead. Preflight acceptance covers these behaviors, not every
+possible host/FFI failure, native crash, budget termination or platform.
+
+The direct example is **not PBCK-compatible**. The guarded companion is the
+supported explicit PBCK profile and must pass its own
+`pbai_guarded_file_lifetime.py` acceptance gate. A passed companion is not
+proof that the direct source example compiles to PBCK. A globally installed
+CLI does not qualify or update product-bundled runtimes: repeat the preflight
+for each effective launcher/native pair and retain its fingerprint.
+
+Linux/bwrap qualification (20 invocations, 18 distinct read/reload phase/mode
+pairs, including success and recovery cases):
 
 ```bash
-PBLANG_BIN="$TRUSTED_PBLANG_RUNTIME" python3 tests/tooling/pbai_checkpoint_file_direct_lifetime.py --product pblang --phase baseline
-PBLANG_BIN="$TRUSTED_PBLANG_RUNTIME" python3 tests/tooling/pbai_checkpoint_file_direct_lifetime.py --product pblang
+PBLANG_BIN="$TRUSTED_PBLANG_RUNTIME" python3 tests/tooling/pbai_checkpoint_file_direct_lifetime.py --product pblang --runtime-check-only --output runtime-check.json
+PBLANG_BIN="$TRUSTED_PBLANG_RUNTIME" python3 tests/tooling/pbai_checkpoint_file_direct_lifetime.py --product pblang --phase baseline --output baseline.json
+PBLANG_BIN="$TRUSTED_PBLANG_RUNTIME" python3 tests/tooling/pbai_checkpoint_file_direct_lifetime.py --product pblang --output fixed.json
 ```
 
-The baseline must report unclosed fault cases (7 observed); the fixed run must
-report `unclosed_fault_cases: 0`. In the standalone `pbai` repository use
-`--product pbai` with sibling `../pblang`. This verifies handle close calls only,
-not physical RAM reclamation or hosted CI.
+Use a native ELF executable or the standard installed PBLang bridge; arbitrary
+shell dispatchers cannot provide an identified native target and are rejected.
+`--output` writes a **new** mode-0600 JSON file, refuses existing paths, and must
+point to durable storage outside `/tmp`. Choose fresh filenames for reruns so
+failed attempts remain available. The report fingerprints the launcher/native,
+caller, unmodified example, test harness/hooks, runtime probes and provider /
+product `.sapp` module trees. Hashes contain no private machine paths. Keep the
+report alongside the exact source revisions and binary artifact used for it.
+
+The fixed gate rejects a runtime that fails preflight before running caller
+scenarios. `--phase baseline` may characterize historical caller faults on an
+unqualified runtime, but reports `runtime_accepted:false`; that is not fixed
+acceptance. `--runtime-check-only` checks the runtime without claiming any
+caller cases passed. Unexpected gate failures retain partial evidence with
+`status:failed`; successful fixed acceptance requires `status:passed`.
+
+The metrics deliberately distinguish cleanup attempts from successful release:
+
+- `missing_cleanup_attempt_fault_cases`: acquired handles without any attempt
+  in a fault invocation (7 in the historical caller, 0 required in fixed).
+- `unclosed_fault_cases`: deprecated compatibility alias for that same metric;
+  it does **not** count live handles or leaks.
+- `unconfirmed_release_cases` / `unconfirmed_release_handles`: invocations and
+  handles with no successful release observed **before diagnostic cleanup**.
+  Fixed synthetic close-before faults intentionally produce 4 cases / 6
+  handles; these are not evidence of production leaks or success at releasing.
+- `invocations`, `distinct_phase_modes`, `fault_invocations`: separate executed
+  runs, unique pairs and fault runs; repeated recovery runs remain visible.
+
+In standalone `pbai`, use `--product pbai` with the sibling `../pblang` provider.
+Both copies must retain the same caller, fixtures and harness. These checks
+verify observable ownership and cleanup behavior only, not physical RAM
+reclamation, complete platform coverage, installation or hosted CI.

@@ -84,8 +84,7 @@ def main():
                     elif truncated:
                         passed &= result['stdout_bytes'] > 16384
                     if name == 'late invalid':
-                        summary = result['stdout'].splitlines()[-1]
-                        passed &= '0 error(s)' not in summary
+                        passed &= bool(summary) and '0 error(s)' not in summary
                     result['passed'] = passed
                     rows.append(result)
                     if result['failure'] or result['group_survived_normal_exit']:
