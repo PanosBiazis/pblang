@@ -1,8 +1,8 @@
 # Bounded neural reconstruction and feedback
 
-`stdlib/pbai_feedback.sapp` adds a pure PBLang inference path. In standalone
-pbAI use `import("stdlib/pbai_feedback.sapp")`; with a PBLang core dependency
-containing this module use `import("stdlib:pbai_feedback.sapp")`:
+The embedded subtree adds a pure PBLang inference path. From the PBLang project
+root use `import("stdlib:ai/pbai/stdlib/pbai_feedback.sapp")`. The separate
+canonical `stdlib:pbai_feedback.sapp` module is not changed by this adoption:
 
 ```text
 input -> encoder hidden layers -> output -> decoder hidden layers -> reconstructed input
@@ -73,18 +73,34 @@ custom activations and executable model providers are not accepted.
 
 ## Example and scope
 
-Run `demo/pbai_feedback.sapp` with the project's compatible PBLang dependency.
+The standalone `demo/pbai_feedback.sapp` uses its own module path; embedded
+qualification runs `stdlib/ai/pbai/tests/semantics/pbai_feedback_test.sapp`
+from the PBLang root with the explicit embedded import.
 It uses seeded demonstration networks; they are **not trained reconstructions**.
 Tests cover forward parity with `nn.predict`, multiple hidden layers, anchored
 and damped recurrence, oscillation, final-output consistency, detached ownership,
 finite/shape/budget validation and the difference between convergence and accuracy.
 
 An encoder/decoder can be trained separately with existing neural facilities before
-calling this module. Joint autoencoder training, denoising objectives, learned
-cycle consistency, predictive coding, deep-equilibrium implicit differentiation,
-attention-based feedback and hardware-accelerated feedback remain future work.
+calling this module. Joint one-pass reconstruction gradients, SGD and bounded full-batch epochs are
+available in the separate training module linked below. Denoising objectives,
+learned cycle consistency, predictive coding, deep-equilibrium implicit
+differentiation, attention-based feedback and hardware-accelerated feedback
+remain future work.
 This bounded inference loop does not implement those training methods or claim
 consciousness, universal convergence, optimality or superiority over other models.
 
 Background: [autoencoders](https://www.cs.toronto.edu/~hinton/absps/cvq.html),
 [Deep Equilibrium Models](https://arxiv.org/abs/1909.01377).
+
+A separate embedded [one-pass derivative primitive](Neural_Feedback_Gradients.md)
+now supplies independently testable encoder/decoder gradients (HF-13A). It does
+not itself update weights. A separate [detached SGD step](Neural_Feedback_Step.md)
+updates both models from original-weight gradients (HF-13B). A separate
+[bounded full-batch trainer](Neural_Feedback_Epochs.md) adds fixed epochs and
+initial/final held-out evaluation (HF-13C). Installation and cross-surface
+qualification remain separate; these primitives do not train the iterative
+feedback recurrence.
+
+For embedded invocation, provenance and a staged adoption checklist, see
+[Embedded training adoption](Embedded_Training_Adoption.md).
