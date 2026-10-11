@@ -2,7 +2,9 @@
 
 # pblang
 
-**A fast, secure, embeddable programming language with a pblang-written self-hosted toolchain.**
+**An experimental programming language, bytecode runtime and PBLang-written toolchain.**
+
+[Quick start](#quick-start) · [Examples](examples) · [Documentation](docs) · [Tests](tests) · [Contributing](CONTRIBUTING.md) · [Release guide](RELEASES.md) · [Releases](https://github.com/PanosBiazis/pblang/releases)
 
 **Version:** 0.6.0-alpha · **License:** MIT · **Status:** alpha; validation is scoped to the documented tests.
 
@@ -12,7 +14,7 @@ pblang is a general-purpose programming language and bytecode VM designed for em
 
 ## What works today
 
-### Stable / primary surface
+### Implemented primary surface
 
 - **Stack-based bytecode VM** with closures, modules, errors, arrays/maps, GC support, and runtime diagnostics.
 - **Parser, compiler, type checker, linter, formatter, and CLI**.
