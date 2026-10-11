@@ -1,0 +1,204 @@
+// Reconstruction derivatives, detached SGD and bounded full-batch training. No I/O.
+// 10^100, far above the admitted eight-layer derivative bound. This retained
+// parser does not accept scientific-notation literals; keep one named constant.
+let MAX_ARITHMETIC = 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000;
+fn _fail() {throw "pbai.feedback.gradients: invalid or unsupported request";}
+fn _number(x,lo,hi) {return type(x)=="number" and x==x and x>=lo and x<=hi;}
+fn _integer(x,lo,hi) {return _number(x,lo,hi) and num_floor(x)==x;}
+fn _finite(x) {if not _number(x,0-MAX_ARITHMETIC,MAX_ARITHMETIC) {return _fail();} return x;}
+fn _vector(xs,n,lo,hi) {
+ if type(xs)!="array" {return _fail();}
+ if len(xs)!=n {return _fail();}
+ let out=[];let i=0;
+ while i<n {if not _number(xs[i],lo,hi) {return _fail();} push(out,xs[i]);i=i+1;}
+ return out;
+}
+fn _model(model) {
+ if type(model)!="map" {return _fail();}
+ if len(model)!=2 {return _fail();}
+ if (try model.format catch nil)!="pbai.feedback.stack.v1" {return _fail();}
+ let ls=try model.layers catch nil;
+ if type(ls)!="array" {return _fail();}
+ if len(ls)<1 or len(ls)>4 {return _fail();}
+ let out=[];let params=0;let previous=0;let first=0;let k=0;
+ while k<len(ls) {
+  let l=ls[k];if type(l)!="map" {return _fail();}
+  if len(l)!=4 {return _fail();}
+  let ni=try l.n_in catch nil;let no=try l.n_out catch nil;
+  if not _integer(ni,1,16) or not _integer(no,1,16) {return _fail();}
+  if k>0 and ni!=previous {return _fail();}
+  if k==0 {first=ni;}
+  let ws=try l.w catch nil;let bs=try l.b catch nil;
+  if type(ws)!="array" {return _fail();}
+  if len(ws)!=no {return _fail();}
+  let rows=[];let j=0;
+  while j<no {push(rows,_vector(ws[j],ni,0-10000,10000));j=j+1;}
+  push(out,map{n_in:ni,n_out:no,w:rows,b:_vector(bs,no,0-10000,10000)});
+  params=params+no*(ni+1);previous=no;k=k+1;
+ }
+ return map{layers:out,n_in:first,n_out:previous,parameters:params};
+}
+fn _zeros(n) {let out=[];let i=0;while i<n {push(out,0);i=i+1;} return out;}
+fn _zero_layers(ls) {
+ let out=[];let k=0;
+ while k<len(ls) {let l=ls[k];let rows=[];let o=0;
+  while o<l.n_out {push(rows,_zeros(l.n_in));o=o+1;}
+  push(out,map{n_in:l.n_in,n_out:l.n_out,w:rows,b:_zeros(l.n_out)});k=k+1;
+ } return out;
+}
+// Stable sigmoid: the exponent is never positive. Finite saturation is valid.
+fn _sigmoid(z) {
+ if z>=0 {return 1/(1+num_exp(0-z));}
+ let e=num_exp(z);return e/(1+e);
+}
+fn _activations(ls,x) {
+ let values=[x];let k=0;
+ while k<len(ls) {let l=ls[k];let previous=values[k];let next=[];let o=0;
+  while o<l.n_out {let z=l.b[o];let i=0;
+   while i<l.n_in {z=z+l.w[o][i]*previous[i];i=i+1;}
+   let a=_sigmoid(_finite(z));
+   if not _number(a,0,1) {return _fail();}
+   push(next,a);o=o+1;
+  } push(values,next);k=k+1;
+ } return values;
+}
+// Returns detached gradients of L = sum((D(E(x))-x)^2)/(2*batch*width).
+// Concatenating both stacks makes their boundary an ordinary chain-rule edge.
+fn gradients(encoder,decoder,batch) {
+ let e=_model(encoder);let d=_model(decoder);
+ if e.n_out!=d.n_in or d.n_out!=e.n_in {return _fail();}
+ let parameters=e.parameters+d.parameters;
+ if parameters>4096 {return _fail();}
+ if type(batch)!="array" {return _fail();}
+ let count=len(batch);
+ if count<1 or count>16 {return _fail();}
+ // Admission happens before forward/backward work and gradient allocation.
+ let work=count*parameters;
+ if work>32768 {return _fail();}
+ let inputs=[];let n=0;
+ while n<count {push(inputs,_vector(batch[n],e.n_in,0,1));n=n+1;}
+ let layers=[];let k=0;
+ while k<len(e.layers) {push(layers,e.layers[k]);k=k+1;}
+ k=0;while k<len(d.layers) {push(layers,d.layers[k]);k=k+1;}
+ let gs=_zero_layers(layers);let loss=0;let scale=1/(count*e.n_in);n=0;
+ while n<count {
+  let x=inputs[n];let values=_activations(layers,x);let last=values[len(layers)];
+  let upstream=[];let o=0;
+  while o<e.n_in {let err=last[o]-x[o];loss=loss+0.5*err*err*scale;
+   push(upstream,err*scale);o=o+1;
+  }
+  k=len(layers)-1;
+  while k>=0 {
+   let l=layers[k];let previous=values[k];let current=values[k+1];
+   let next=_zeros(l.n_in);o=0;
+   while o<l.n_out {
+    let delta=_finite(upstream[o]*current[o]*(1-current[o]));
+    gs[k].b[o]=_finite(gs[k].b[o]+delta);let i=0;
+    while i<l.n_in {
+     gs[k].w[o][i]=_finite(gs[k].w[o][i]+delta*previous[i]);
+     next[i]=_finite(next[i]+l.w[o][i]*delta);i=i+1;
+    } o=o+1;
+   } upstream=next;k=k-1;
+  } n=n+1;
+ }
+ let eg=[];let dg=[];k=0;
+ while k<len(e.layers) {push(eg,gs[k]);k=k+1;}
+ while k<len(layers) {push(dg,gs[k]);k=k+1;}
+ return map{format:"pbai.feedback.gradients.v1",objective:"half_mean_squared_reconstruction",
+  loss:_finite(loss),encoder:eg,decoder:dg,batch_size:count,input_width:e.n_in,
+  parameters:parameters,parameter_sample_pairs:work};
+}
+fn _updated_value(value,gradient,rate) {
+ let delta=_finite(rate*_finite(gradient));
+ if num_abs(delta)>1 {return _fail();}
+ let next=_finite(value-delta);
+ if not _number(next,0-10000,10000) {return _fail();}
+ if num_abs(next-value)>1 {return _fail();}
+ return next;
+}
+fn _updated_layers(ls,gs,rate) {
+ let out=[];let largest=0;let k=0;
+ while k<len(ls) {let l=ls[k];let rows=[];let biases=[];let o=0;
+  while o<l.n_out {let row=[];let i=0;
+   while i<l.n_in {
+    let v=_updated_value(l.w[o][i],gs[k].w[o][i],rate);
+    let change=num_abs(v-l.w[o][i]);if change>largest {largest=change;}
+    push(row,v);i=i+1;
+   }
+   let b=_updated_value(l.b[o],gs[k].b[o],rate);
+   let change=num_abs(b-l.b[o]);if change>largest {largest=change;}
+   push(rows,row);push(biases,b);o=o+1;
+  }push(out,map{n_in:l.n_in,n_out:l.n_out,w:rows,b:biases});k=k+1;
+ }return map{layers:out,max_update:largest};
+}
+fn _pair_loss(e,d,inputs) {
+ let loss=0;let n=0;let scale=1/(len(inputs)*len(inputs[0]));
+ while n<len(inputs) {
+  let x=inputs[n];let ev=_activations(e,x);let dv=_activations(d,ev[len(e)]);
+  let y=dv[len(d)];let i=0;
+  while i<len(x) {let diff=y[i]-x[i];loss=loss+0.5*diff*diff*scale;i=i+1;}
+  n=n+1;
+ }return _finite(loss);
+}
+// One full-batch SGD update. A candidate is returned only after every tensor and
+// its frozen-weight loss are valid; all callers retain their original objects.
+fn step(encoder,decoder,batch,learning_rate) {
+ if not _number(learning_rate,0.000001,0.1) {return _fail();}
+ let e=_model(encoder);let d=_model(decoder);
+ if e.n_out!=d.n_in or d.n_out!=e.n_in {return _fail();}
+ if type(batch)!="array" {return _fail();}
+ let count=len(batch);let parameters=e.parameters+d.parameters;
+ if count<1 or count>16 or parameters>4096 or count*parameters>32768 {return _fail();}
+ let inputs=[];let n=0;
+ while n<count {push(inputs,_vector(batch[n],e.n_in,0,1));n=n+1;}
+ let original_e=map{format:"pbai.feedback.stack.v1",layers:e.layers};
+ let original_d=map{format:"pbai.feedback.stack.v1",layers:d.layers};
+ let g=gradients(original_e,original_d,inputs);
+ let ne=_updated_layers(e.layers,g.encoder,learning_rate);
+ let nd=_updated_layers(d.layers,g.decoder,learning_rate);
+ let after=_pair_loss(ne.layers,nd.layers,inputs);
+ let largest=ne.max_update;if nd.max_update>largest {largest=nd.max_update;}
+ return map{format:"pbai.feedback.step.v1",objective:g.objective,
+  encoder:map{format:"pbai.feedback.stack.v1",layers:ne.layers},
+  decoder:map{format:"pbai.feedback.stack.v1",layers:nd.layers},
+  loss_before:g.loss,loss_after:after,learning_rate:learning_rate,
+  parameters:parameters,batch_size:count,input_width:e.n_in,
+  parameter_sample_pairs:g.parameter_sample_pairs,max_abs_update:largest};
+}
+// Full-batch epochs on detached models. Held-out samples are evaluated only
+// before and after training; they never select weights or influence gradients.
+fn train_epochs(encoder,decoder,train_batch,eval_batch,learning_rate,epochs) {
+ if not _integer(epochs,1,16) or not _number(learning_rate,0.000001,0.1) {return _fail();}
+ let e=_model(encoder);let d=_model(decoder);
+ if e.n_out!=d.n_in or d.n_out!=e.n_in {return _fail();}
+ if type(train_batch)!="array" or type(eval_batch)!="array" {return _fail();}
+ let nt=len(train_batch);let ne=len(eval_batch);let parameters=e.parameters+d.parameters;
+ if nt<1 or nt>16 or ne<1 or ne>16 or parameters>4096 {return _fail();}
+ // Three parameter/sample traversals per epoch (forward, backward, candidate
+ // forward), plus initial/final evaluation. Copy/validation costs are separate.
+ let work=parameters*(3*epochs*nt+2*ne);
+ if work>32768 {return _fail();}
+ let train=[];let eval=[];let n=0;
+ while n<nt {push(train,_vector(train_batch[n],e.n_in,0,1));n=n+1;}
+ n=0;while n<ne {push(eval,_vector(eval_batch[n],e.n_in,0,1));n=n+1;}
+ let current_e=map{format:"pbai.feedback.stack.v1",layers:e.layers};
+ let current_d=map{format:"pbai.feedback.stack.v1",layers:d.layers};
+ let initial_eval=_pair_loss(e.layers,d.layers,eval);
+ let initial_train=0;let final_train=0;let trace=[];n=0;
+ while n<epochs {
+  let candidate=step(current_e,current_d,train,learning_rate);
+  if n==0 {initial_train=candidate.loss_before;}
+  final_train=candidate.loss_after;
+  push(trace,map{epoch:n+1,loss_before:candidate.loss_before,
+   loss_after:candidate.loss_after,max_abs_update:candidate.max_abs_update});
+  current_e=candidate.encoder;current_d=candidate.decoder;n=n+1;
+ }
+ let final_eval=_pair_loss(current_e.layers,current_d.layers,eval);
+ return map{format:"pbai.feedback.epochs.v1",objective:"half_mean_squared_reconstruction",
+  encoder:current_e,decoder:current_d,learning_rate:learning_rate,epochs:epochs,
+  parameters:parameters,input_width:e.n_in,train_batch_size:nt,eval_batch_size:ne,
+  initial_train_loss:initial_train,final_train_loss:final_train,
+  initial_eval_loss:initial_eval,final_eval_loss:final_eval,
+  parameter_sample_traversals:work,trace:trace};
+}
+export gradients,step,train_epochs;
