@@ -175,3 +175,29 @@ all-failure-path cleanup guarantee follows from those counts.
 A runnable developer example is `examples/native_ordered_input.sapp`. It opts
 into the queue and the existing `form.text_render="auto"` smooth text renderer,
 without changing default GUI rendering or persisting entered text.
+
+### Acceptance evidence and consumer migration
+
+Use `G.Window(width, height, title, map{ordered_input:true})`, not
+`graphics.create_window(map{...})`: the latter is not an exported API. Check
+`window.input_backend == "x11-ordered-keysyms"` before attributing results to
+the optional queue. Three-argument callers continue to select the legacy path.
+
+The widget integration fixture can now explicitly qualify either route:
+
+```sh
+xvfb-run -a -s '-screen 0 1000x700x24 -nolisten tcp' python3 tests/tooling/native_keyboard_delivery.py --runtime /path/to/pblang --mode ordered --evidence /new/private/evidence-directory
+```
+
+Its output identifies the actual input backend and verifies normal window
+cleanup after the form loop. It types the literal `native.pbsheet`; it does not
+launch PBSheet. It does not simulate a window-manager close or resize. The
+churn test exercises unrelated window notifications; it does not measure RSS
+or descriptor leaks. Do not use either result as a universal cleanup claim.
+
+Each real consumer needs its own acceptance: pin its source and launcher,
+inspect its selected backend, type into initially empty real fields at the
+required timing/layout, save and reopen exact synthetic bytes, then exercise
+focus, resize and close. Fixture evidence and older consumer reports remain
+separate from current installed-product evidence. Native IME, other operating
+systems and total-memory reclamation require separate platform measurements.

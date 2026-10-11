@@ -108,7 +108,7 @@ A few capability errors have stable text the host can pattern-match:
 |-----------|---------|
 | `<cap> access denied` | A capability builtin was denied (`fs access denied`, `proc_spawn_wait access denied`, etc.). Surface to the user as a permission prompt. |
 | `not in allowlist` | An FFI library or symbol failed the `FfiPolicy` check. |
-| `instruction limit exceeded` | `VmLimits::max_instructions` cap reached — abort the script. |
+| `instruction limit exceeded` | Normal instruction cap reached; native cleanup receives one bounded 10,000-instruction allowance before termination. Existing primary errors are preserved. See [native cleanup limits](Native_cleanup_limits.md). |
 | `import cycle detected` | Two modules import each other; the cycle is included in the message. |
 
 ## Module cache & import system

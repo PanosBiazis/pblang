@@ -147,7 +147,7 @@ If a script calls a builtin whose capability is disabled, the VM returns a runti
 
 When **VmLimits** is set via `vm.set_limits(Some(limits))`:
 
-- **max_instructions**: After this many VM instructions, execution stops with a runtime error ("instruction limit exceeded"). Used to prevent infinite loops.
+- **max_instructions**: After this many VM instructions, normal execution terminates. Native VM cleanup shares at most 10,000 additional instructions; exhaustion cannot be caught to restart normal execution. The original active error is retained when a failure was already unwinding. See [native cleanup limits](Native_cleanup_limits.md) for finite-cleanup and native-call limits.
 - **max_stack_depth**: Maximum call stack depth (number of frames). Exceeding it yields "stack depth limit exceeded".
 - **max_memory_bytes**: Optional cap on heap memory (best-effort enforcement when set).
 - **io_timeout_ms**: Timeout in ms for IO: enforced for **http_get**, **http_post**, TCP streams (read/write timeout on **tcp_accept**), and for **fs_read**, **fs_write**, **fs_read_bytes**, **fs_write_bytes** (when set, fs I/O runs in a thread and returns an error on timeout).
