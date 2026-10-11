@@ -197,3 +197,35 @@ a candidate using whole copied modules and deterministic native-effect boundarie
 These are simulated failures, not claims of induced kernel close faults. Existing
 `bounded_source_check.py` groups separately exercise real Linux admission, exact
 argv, permission denial, source-size enforcement and library contracts.
+
+### Shared bounded-reader implementation
+
+The source-admission facade imports the internal
+`linux_dirfs_read_core.sapp` module directly. Full `linux_dirfs.sapp` uses the
+same fixed-signature native dispatcher, component traversal and bounded-read
+implementation. Source admission therefore does not import the full directory
+API or its publication, crypto and enumeration dependencies.
+
+The two paths share one private, monotonic cleanup-poison state per imported
+core module instance. A failed copy or unavailable memfd with confirmed cleanup
+is an ordinary refusal; it does not alone poison admission. Ambiguous cleanup
+continues to block later bounded reads through either path. No temporary-file
+fallback, new native symbol, signature, permission grant or cleanup retry is
+introduced. Full root closure retains its child, lock and enumeration cleanup.
+The internal read-only root closure refuses full roots and roots carrying
+children, locks or enumeration state; it must not be used as a replacement for
+the full directory owner's `close` operation.
+
+The existing full-directory public exports/defaults and compiler
+`read_source(path, max_bytes)` contract are unchanged. The shared module's
+underscored helpers and policy callbacks are internal implementation boundaries;
+creation/protection callbacks are bound by the full directory wrappers, never
+selected from file input. Factoring import dependencies alone does not establish
+a startup or memory improvement; compare identical workloads and runtimes.
+
+The copied-module cleanup qualification additionally checks direct shared-core
+reads, poison propagation in both directions, read-only ownership refusal and
+full child/lock/root close ordering. `--candidate-only` explicitly skips the
+historical broken-reader comparison; it must not be reported as a differential
+proof. The exclusive-write harness also supports the factored facade without
+substituting a separate reader implementation.
