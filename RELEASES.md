@@ -4,6 +4,16 @@ PBLang is experimental. Named development snapshots identify reproducible source
 
 ## Development snapshot · 2026-10-11
 
+### Bounded document libraries · corrected snapshot
+
+`snapshot-2026-10-11-brief-r2` adds the [brief and excerpt APIs](docs/Document_Brief.md) and a dependency lock reproduced from tracked source. Three semantic suites, lint without warnings, manifest validation, strict source build and portable-lock publication passed against the clean source tree using the retained `379e783b1547` runtime. Installed runtimes were not replaced. Graphify update reached its time limit; this is not a successful graph refresh.
+
+The earlier `snapshot-2026-10-11-brief` is superseded: its lock included ignored local state in the dependency digest. Its immutable tag and draft release are retained for traceability. The corrected stdlib tree-v2 digest is `e29159f375346501c70b3c1a53f2dca5e291bb7525be4b2b7ebe16cf6ffd10fd`.
+
+Build and validate release sources in a clean checkout or extracted source archive. Ignored files under a dependency directory can affect the package-tree digest even when Git reports a clean working tree. Preserve such local state separately; do not delete it or silently regenerate a release lock from it. The corrected lock deliberately matches the published source, not a working dependency tree containing extra local files.
+
+### Initial snapshot
+
 This source snapshot includes [PR95](https://github.com/PanosBiazis/pblang/pull/95), merged at `379e783b1547dacd8b3a6181dc1ff8b9dba3bbad`, plus documentation and editor workspace organization. The tag `snapshot-2026-10-11` identifies the exact published revision. The package version remains `0.6.0`; a version string alone does not establish compatibility.
 
 ### Included runtime corrections
