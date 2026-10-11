@@ -47,7 +47,11 @@ its own behavior for those dependencies.
   in a portable release. No personal absolute path is added to this repository.
 - Before moving an installation, restore its portable lock with
   `tools/pblock.sapp`, move it, then run `pblock_install.sapp` at the new location.
-  A lock still bound to another root is refused; it is not silently rebound.
+  Explicit materialization refuses a lock still bound to another root; it does
+  not silently rebind it. Merely moving/copying the directory does not invoke
+  that validation: the retained runtime may still use the old absolute dependency
+  while it exists, or fail when it is absent. Publish before moving, then
+  materialize at the destination before launching there.
 - Run the maintenance tool from a working project/installation root so that its
   own imports work before it repairs the target. It cannot bootstrap its own
   missing dependencies from an arbitrary directory.
@@ -87,3 +91,28 @@ then ran that example and the calibration-sheet example successfully from an
 unrelated directory after materialization. Manifest/dependency hashes stayed
 unchanged and the active installation was not modified. This is local Linux
 evidence, not activation or cross-platform qualification.
+
+## Literal CLI directory arguments
+
+Both maintenance scripts read actual arguments after `--`, without trimming or
+splitting directory names. `PBLANG_SCRIPT_ARGS` does not select their target.
+`pblock.sapp` accepts zero arguments (the current directory) or one nonempty
+argument. `pblock_install.sapp` requires exactly one nonempty argument. Extra
+arguments and an explicitly empty argument are refused before the lock writer
+runs. No argument is different from an explicitly empty one.
+
+Spaces in a supplied directory are significant, including leading/trailing
+spaces. LF, CR and NUL are explicitly unsupported and refused; a newline never
+selects its prefix as a separate directory. This does not relax the existing
+no-follow, bounded parsing, digest-shape or atomic-publication constraints.
+The installation command continues not to print the installation root in its
+success message; native error rendering may still include script paths.
+
+`tests/tooling/lock_cli_exact_argv.py --binary RETAINED_LAUNCHER --report NEW.json`
+checks actual scripts in disposable Linux projects and preserves failure reports.
+It compares complete fixture file contents before/after each invocation, so
+successful operations must alter only the selected lock and rejected operations
+must not alter any fixture. `--tools-dir` can select baseline scripts for a
+negative control while keeping the same runtime and library. Synthetic fixture
+digests validate metadata preservation only, not dependency-content integrity;
+the existing live import/tamper tests cover that separate contract.
