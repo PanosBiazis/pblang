@@ -30,6 +30,13 @@ export state,configure,parent,open,close,unlink,write;
 
 
 def body_replace(text, name, body):
+    # A factored full facade may bind a shared primitive directly. Model the
+    # same effect boundary without requiring a duplicate production body.
+    aliases={'_openat':'fs, dirfd, name, flags, mode = 0','_close_fd':'fs, fd'}
+    alias='let '+name+' = READ_CORE.'+name+';'
+    if alias in text:
+        assert name in aliases
+        return text.replace(alias,'fn '+name+'('+aliases[name]+') {\n'+body+'\n}',1)
     start = text.index('fn '+name+'(')
     opening = text.index('{', start)
     depth = 1
@@ -138,19 +145,28 @@ export trace;
 
 
 def main():
-    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--runtime',type=Path,required=True);ap.add_argument('--baseline',type=Path,required=True);ap.add_argument('--report',type=Path,required=True)
-    a=ap.parse_args();os.umask(0o077);candidate=Path(__file__).resolve().parents[2];rows=[]
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--runtime',type=Path,required=True);ap.add_argument('--baseline',type=Path);ap.add_argument('--candidate-only',action='store_true');ap.add_argument('--report',type=Path,required=True)
+    a=ap.parse_args();os.umask(0o077)
+    if not a.candidate_only and a.baseline is None:ap.error('--baseline is required unless --candidate-only')
+    candidate=Path(__file__).resolve().parents[2];rows=[]
     def record(label,r,passed):
         rows.append(dict(label=label,passed=bool(passed and r['bounded'] and r['inputs_unchanged'] and r['exit']==0 and r['stderr']==''),result=r))
         a.report.write_text(json.dumps(rows,indent=2)+'\n');a.report.chmod(0o600);print(label,rows[-1]['passed'],flush=True)
         assert rows[-1]['passed'],label
     semantic=(candidate/'tests/semantics/dirfs_exclusive_failure_test.sapp').read_text()
-    for variant,source in [('baseline',a.baseline),('candidate',candidate)]:
+    sources=[('candidate',candidate)] if a.candidate_only else [('baseline',a.baseline),('candidate',candidate)]
+    for variant,source in sources:
         baseline=variant=='baseline'
+        def execute_variant(runtime,files,*args):
+            core=source/'stdlib/linux_dirfs_read_core.sapp'
+            if core.exists():
+                files={k:v.replace('import("stdlib:linux_dirfs_read_core.sapp")','import("core.sapp")') for k,v in files.items()}
+                files['core.sapp']=core.read_text()
+            return execute(runtime,files,*args)
         for posix in [False,True]:
             raw=(source/'stdlib'/('posix_dirfs.sapp' if posix else 'linux_dirfs.sapp')).read_text()
             files={'dirfs.sapp':modeled(raw,posix),'model.sapp':MODEL,'semantic.sapp':semantic,'main.sapp':'let D=import("dirfs.sapp");let B=import("model.sapp");let T=import("semantic.sapp");print json_stringify(T.run(D,B,'+str(baseline).lower()+','+str(posix).lower()+'));'}
-            r=execute(a.runtime,files);record(variant+('/posix-model' if posix else '/linux-model'),r,('"cases":38' if baseline else '"cases":57') in r['stdout'])
+            r=execute_variant(a.runtime,files);record(variant+('/posix-model' if posix else '/linux-model'),r,('"cases":38' if baseline else '"cases":57') in r['stdout'])
         raw=(source/'stdlib/linux_dirfs.sapp').read_text()
         for case in ['normal','partial-production','partial-unlink-test-only','replacement']:
             main='let D=import("dirfs.sapp");let fs=D.open("scratch",false);assert(fs.ok,"open root");'
@@ -158,7 +174,7 @@ def main():
                 main+='let r=D.write_new_exclusive(fs,"target",[0,127,255],false);assert(r.ok,"write");assert(D.write_new_exclusive(fs,"empty",[],false).ok,"empty");assert(D.write_new_exclusive(fs,"utf8",str_to_bytes("α"),false).ok,"utf8");for path in ["existing","alias","link","dirlink/new","missing/new"] {assert(not D.write_new_exclusive(fs,path,[65],false).ok,"refuse");}'
             else:main+='let r=D.write_new_exclusive(fs,"target",str_to_bytes("0123456789abcdef0123456789abcdef"),false);assert(not r.ok,"write failure");'
             main+='assert(D.close(fs),"root close");print json_stringify(map{result:r,trace:D.trace});'
-            r=execute(a.runtime,{'dirfs.sapp':instrument(raw,case=='replacement'),'main.sapp':main},True,16 if case.startswith('partial') else 1048576,case in ['replacement','partial-unlink-test-only'],case=='replacement')
+            r=execute_variant(a.runtime,{'dirfs.sapp':instrument(raw,case=='replacement'),'main.sapp':main},True,16 if case.startswith('partial') else 1048576,case in ['replacement','partial-unlink-test-only'],case=='replacement')
             try:data=json.loads(r['stdout'])
             except ValueError:data={}
             good=bool(data)
@@ -182,7 +198,7 @@ def main():
                 payload='str_to_bytes("0123456789abcdef0123456789abcdef")' if api=='bytes' else '"0123456789abcdef0123456789abcdef"'
                 method='write_new_exclusive' if api=='bytes' else 'write_text_new_exclusive'
                 main='let S=import("facade.sapp");let r=S.'+method+'("scratch/target",'+payload+',false,false);print json_stringify(r);'
-                r=execute(a.runtime,{'dirfs.sapp':raw,'facade.sapp':facade_real,'main.sapp':main},True,16 if partial else 1048576)
+                r=execute_variant(a.runtime,{'dirfs.sapp':raw,'facade.sapp':facade_real,'main.sapp':main},True,16 if partial else 1048576)
                 try:data=json.loads(r['stdout'])
                 except ValueError:data={}
                 expected=b'0123456789abcdef' if partial else b'0123456789abcdef0123456789abcdef'
@@ -200,8 +216,8 @@ def main():
                 text=replace_once((source/'stdlib'/f'{caller}.sapp').read_text(),'let SECURE_FILE = import("stdlib:secure_file.sapp");','let SECURE_FILE = import("caller_adapter.sapp");')
                 call='C.bundle("synthetic","","")' if caller=='polyglot_web' else 'C.build_language("python","sample","synthetic","/tmp",map{unsafe_polyglot:true,trusted_source:true,allow_toolchain_effects:true,unsafe_polyglot_sha256:H.sha256_hex_bytes(str_to_bytes("synthetic"))})'
                 main='let B=import("model.sapp");let A=import("caller_adapter.sapp");let C=import("caller.sapp");let H=import("stdlib:sha256_pb.sapp");B.configure(false,true,true);let failed=try {'+call+';false} catch true;assert(failed and B.state.writes==1 and B.state.closes==[20,10] and B.state.unlinks==0 and A.state.removes==0 and A.state.atomic_writes==0,"new backend failure stops complete caller");print "caller-pass";'
-                r=execute(a.runtime,{'model.sapp':MODEL,'dirfs.sapp':backend,'facade.sapp':facade,'caller_adapter.sapp':CALLER_ADAPTER,'caller.sapp':text,'main.sapp':main});record('candidate/'+caller,r,r['stdout']=='caller-pass\n')
+                r=execute_variant(a.runtime,{'model.sapp':MODEL,'dirfs.sapp':backend,'facade.sapp':facade,'caller_adapter.sapp':CALLER_ADAPTER,'caller.sapp':text,'main.sapp':main});record('candidate/'+caller,r,r['stdout']=='caller-pass\n')
             main='let B=import("model.sapp");let S=import("facade.sapp");B.configure(false,true,false);let r=S.write_new_exclusive("owned/value",[65],false);assert(not r.ok and r.cleanup_uncertain and r.file_close_confirmed and not r.dirfs_parent_close_confirmed and not r.rollback_attempted,"facade preserves backend failure");print "facade-pass";'
-            r=execute(a.runtime,{'model.sapp':MODEL,'dirfs.sapp':backend,'facade.sapp':facade,'main.sapp':main});record('candidate/facade',r,r['stdout']=='facade-pass\n')
+            r=execute_variant(a.runtime,{'model.sapp':MODEL,'dirfs.sapp':backend,'facade.sapp':facade,'main.sapp':main});record('candidate/facade',r,r['stdout']=='facade-pass\n')
 
 if __name__=='__main__':main()

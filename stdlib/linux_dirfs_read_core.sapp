@@ -1,0 +1,567 @@
+// Internal shared Linux descriptor and bounded-snapshot primitives.
+// Both full linux_dirfs and compiler source admission use this single module.
+// No full filesystem/crypto/enumeration imports and no temporary-file fallback.
+// The fixed native signature table and cleanup ordering are shared verbatim.
+let LIBC_PATHS = [
+    "/usr/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libc.so.6",
+    "/usr/lib/aarch64-linux-gnu/libc.so.6", "/lib/aarch64-linux-gnu/libc.so.6",
+    "/usr/lib/i386-linux-gnu/libc.so.6", "/lib/i386-linux-gnu/libc.so.6",
+    "/usr/lib/libc.so.6", "/lib/libc.so.6"
+];
+
+
+let AT_FDCWD = -100;
+let O_RDONLY = 0; let O_NONBLOCK = 2048;
+let O_DIRECTORY = 65536; let O_NOFOLLOW = 131072; let O_CLOEXEC = 524288;
+let MFD_CLOEXEC = 1;
+let MAX_PATH = 4096; let MAX_COMPONENT = 255;
+// Process admission is monotonic. Full-dirfs cleanup and bounded reads share
+// this exact module instance; production exposes no reset operation.
+let _mount_admission_cleanup_poisoned = false;
+fn mark_cleanup_poisoned() { _mount_admission_cleanup_poisoned = true; }
+fn cleanup_poisoned() { return _mount_admission_cleanup_poisoned; }
+
+fn _error(message) { return map{ ok: false, error: message }; }
+
+fn _cleanup_error(message) {
+    _mount_admission_cleanup_poisoned = true;
+    return map{ ok: false, error: message, cleanup_failed: true,
+        invalidate_handle: true, process_admission_poisoned: true,
+        error_code: "scan-mount-cleanup-poisoned" };
+}
+
+fn _close_library(libc) {
+    let closed = try { ffi_close(libc); true } catch false;
+    if not closed { _mount_admission_cleanup_poisoned = true; }
+    return closed;
+}
+
+fn _error_after_library_close(libc, message) {
+    let closed = _close_library(libc);
+    if not closed or _mount_admission_cleanup_poisoned {
+        return _cleanup_error(message + " with ambiguous native cleanup");
+    }
+    return _error(message);
+}
+
+fn _first_existing(paths) {
+    let i = 0;
+    while i < len(paths) { if try fs_exists(paths[i]) catch false { return paths[i]; } i = i + 1; }
+    return nil;
+}
+
+fn available() {
+    let libc = _first_existing(LIBC_PATHS);
+    let proc_fd = try fs_exists("/proc/self/fd") catch false;
+    let ffi_library_authority = false;
+    if platform() == "linux" and libc != nil {
+        let probe = try ffi_load(libc) catch nil;
+        if probe != nil {
+            ffi_library_authority = _close_library(probe);
+        }
+    }
+    // Loading and closing libc proves only the library-level grant. The VM's
+    // current FFI policy does not expose a safe way to prove the complete
+    // symbol + typed-signature contract required by this backend.
+    let ffi_symbol_contract_verified = false;
+    let library_ready = platform() == "linux" and libc != nil and proc_fd
+        and ffi_library_authority;
+    let reason = "ffi-symbol-contract-unverified";
+    if platform() != "linux" { reason = "linux-required"; }
+    elif libc == nil { reason = "trusted-libc-unavailable"; }
+    elif not proc_fd { reason = "proc-fd-unavailable"; }
+    elif not ffi_library_authority { reason = "ffi-library-authority-unavailable"; }
+    return map{ ok: library_ready and ffi_symbol_contract_verified,
+                library_ready: library_ready, libc: libc, proc_fd: proc_fd,
+                ffi_library_authority: ffi_library_authority,
+                ffi_symbol_contract_verified: ffi_symbol_contract_verified,
+                reason: reason, contract: "pblang.linux-dirfs.v1" };
+}
+
+fn _components(path, allow_root = true) {
+    if type(path) != "string" or len(path) > MAX_PATH or str_starts_with(path, "/") or
+       str_contains(path, strfromcharcode(0)) { return nil; }
+    if path == "" or path == "." or path == "root" { if allow_root { return []; } return nil; }
+    let raw = str_split(path, "/"); let out = []; let i = 0;
+    while i < len(raw) {
+        let part = raw[i];
+        if part == "" or part == "." or part == ".." or len(part) > MAX_COMPONENT { return nil; }
+        array_push(out, part); i = i + 1;
+    }
+    return out;
+}
+
+fn _strict_components(path) {
+    if type(path) != "string" or len(path) > MAX_PATH or str_starts_with(path, "/") or
+       str_contains(path, strfromcharcode(0)) { return nil; }
+    if path == "" { return []; }
+    let raw = str_split(path, "/"); let out = []; let i = 0;
+    while i < len(raw) {
+        let part = raw[i];
+        if part == "" or part == "." or part == ".." or len(part) > MAX_COMPONENT { return nil; }
+        array_push(out, part); i = i + 1;
+    }
+    return out;
+}
+
+fn _root_components(root) {
+    if root == "." { return []; }
+    return _components(root, false);
+}
+
+fn _absolute_components(path) {
+    if type(path) != "string" or len(path) < 1 or len(path) > MAX_PATH
+        or not str_starts_with(path, "/") or str_contains(path, strfromcharcode(0)) {
+        return nil;
+    }
+    if path == "/" { return []; }
+    let raw = str_split(path, "/"); let out = []; let i = 1;
+    while i < len(raw) {
+        let part = raw[i];
+        if part == "" or part == "." or part == ".." or len(part) > MAX_COMPONENT { return nil; }
+        array_push(out, part); i = i + 1;
+    }
+    if len(out) == 0 { return nil; }
+    return out;
+}
+
+// Keep the cached typed-FFI path and existing independently loaded transient
+// fallback. Both filesystem surfaces share this exact signature dispatcher.
+fn _typed_call(fs, symbol, signature, args) {
+    let direct = try map{ ok: true,
+        value: ffi_call_typed(fs.libc, symbol, signature, args) }
+        catch map{ ok: false };
+    if direct.ok { return direct.value; }
+    let libc_path = try fs.libc_path catch nil;
+    if type(libc_path) != "string" or libc_path == "" { throw "linux_dirfs: libc handle unavailable"; }
+    let transient = try ffi_load(libc_path) catch nil;
+    if transient == nil { throw "linux_dirfs: transient libc handle unavailable"; }
+    let fallback = try map{ ok: true,
+        value: ffi_call_typed(transient, symbol, signature, args) }
+        catch map{ ok: false };
+    let transient_closed = _close_library(transient);
+    if not fallback.ok or not transient_closed {
+        throw "linux_dirfs: typed libc call or cleanup unavailable";
+    }
+    return fallback.value;
+}
+
+fn _call(fs, symbol, signature, args) {
+    // Keep every native symbol and ABI literal at the FFI boundary. The
+    // caller-facing selector is accepted only for internal compatibility and
+    // can never become an arbitrary dlsym target through tainted data.
+    if symbol == "close" and signature == "i32->i32" {
+        return try _typed_call(fs, "close", "i32->i32", args) catch -1;
+    }
+    if symbol == "strdup" and signature == "string->ptr" {
+        return try _typed_call(fs, "strdup", "string->ptr", args) catch nil;
+    }
+    if symbol == "free" and signature == "ptr->void" {
+        return try _typed_call(fs, "free", "ptr->void", args) catch -1;
+    }
+    if symbol == "calloc" and signature == "i64,i64->ptr" {
+        return try _typed_call(fs, "calloc", "i64,i64->ptr", args) catch nil;
+    }
+    if symbol == "read" and signature == "i32,ptr,i64->i64" {
+        return try _typed_call(fs, "read", "i32,ptr,i64->i64", args) catch -1;
+    }
+    if symbol == "pread" and signature == "i32,ptr,i64,i64->i64" {
+        return try _typed_call(fs, "pread", "i32,ptr,i64,i64->i64", args) catch -1;
+    }
+    if symbol == "write" and signature == "i32,ptr,i64->i64" {
+        return try _typed_call(fs, "write", "i32,ptr,i64->i64", args) catch -1;
+    }
+    if symbol == "fsync" and signature == "i32->i32" {
+        return try _typed_call(fs, "fsync", "i32->i32", args) catch -1;
+    }
+    if symbol == "openat" and signature == "i32,ptr,i32,i32->i32" {
+        return try _typed_call(fs, "openat", "i32,ptr,i32,i32->i32", args) catch -1;
+    }
+    if symbol == "mkdirat" and signature == "i32,ptr,i32->i32" {
+        return try _typed_call(fs, "mkdirat", "i32,ptr,i32->i32", args) catch -1;
+    }
+    if symbol == "unlinkat" and signature == "i32,ptr,i32->i32" {
+        return try _typed_call(fs, "unlinkat", "i32,ptr,i32->i32", args) catch -1;
+    }
+    if symbol == "renameat" and signature == "i32,ptr,i32,ptr->i32" {
+        return try _typed_call(fs, "renameat", "i32,ptr,i32,ptr->i32", args) catch -1;
+    }
+    if symbol == "getpid" and signature == "->i32" {
+        return try _typed_call(fs, "getpid", "->i32", args) catch -1;
+    }
+    if symbol == "getuid" and signature == "->i32" {
+        return try _typed_call(fs, "getuid", "->i32", args) catch -1;
+    }
+    if symbol == "fchmod" and signature == "i32,i32->i32" {
+        return try _typed_call(fs, "fchmod", "i32,i32->i32", args) catch -1;
+    }
+    if symbol == "flock" and signature == "i32,i32->i32" {
+        return try _typed_call(fs, "flock", "i32,i32->i32", args) catch -1;
+    }
+    if symbol == "dup" and signature == "i32->i32" {
+        return try _typed_call(fs, "dup", "i32->i32", args) catch -1;
+    }
+    if symbol == "fcntl" and signature == "i32,i32,i32->i32" {
+        return try _typed_call(fs, "fcntl", "i32,i32,i32->i32", args) catch -1;
+    }
+    if symbol == "memfd_create" and signature == "string,i32->i32" {
+        return try _typed_call(fs, "memfd_create", "string,i32->i32", args) catch -1;
+    }
+    if symbol == "sendfile" and signature == "i32,i32,ptr,i64->i64" {
+        return try _typed_call(fs, "sendfile", "i32,i32,ptr,i64->i64", args) catch -1;
+    }
+    if symbol == "lseek" and signature == "i32,i64,i32->i64" {
+        return try _typed_call(fs, "lseek", "i32,i64,i32->i64", args) catch -1;
+    }
+    if symbol == "ftruncate" and signature == "i32,i64->i32" {
+        return try _typed_call(fs, "ftruncate", "i32,i64->i32", args) catch -1;
+    }
+    if symbol == "getdents64" and signature == "i32,ptr,i64->i64" {
+        return try _typed_call(fs, "getdents64", "i32,ptr,i64->i64", args) catch -1;
+    }
+    return -1;
+}
+
+fn _i32(value) {
+    // The current typed FFI uses an i64 trampoline for all integer returns.
+    // A C function returning int writes EAX, so normalize its unsigned 32-bit
+    // representation back to the signed result required by POSIX APIs.
+    if value >= 2147483648 and value <= 4294967295 { return value - 4294967296; }
+    return value;
+}
+
+fn _close_fd(fs, fd) {
+    if fd < 0 { return true; }
+    let closed = try _i32(_call(fs, "close", "i32->i32", [fd])) == 0 catch false;
+    if not closed { _mount_admission_cleanup_poisoned = true; }
+    return closed;
+}
+
+fn _fd_path(fd) { return "/proc/self/fd/" + str(fd); }
+
+fn _positive_pointer(pointer) {
+    return type(pointer) == "number" and pointer == num_floor(pointer) and pointer > 0;
+}
+
+fn _cstring(fs, value) {
+    let pointer = _call(fs, "strdup", "string->ptr", [value]);
+    if not _positive_pointer(pointer) { return nil; }
+    return pointer;
+}
+
+fn _free(fs, pointer) {
+    if pointer == nil or pointer == 0 { return true; }
+    if not _positive_pointer(pointer) {
+        _mount_admission_cleanup_poisoned = true; return false;
+    }
+    let freed = try { _typed_call(fs, "free", "ptr->void", [pointer]); true }
+        catch false;
+    if not freed { _mount_admission_cleanup_poisoned = true; }
+    return freed;
+}
+
+fn _cleanup_authority_available(fs) {
+    // Probe symbol invocation before acquiring any descriptor or allocation.
+    // free(NULL) is a defined no-op; close(-1) returns EBADF but still proves
+    // that the cleanup symbol was admitted by the VM's exact FFI policy.
+    let free_invoked = try {
+        _typed_call(fs, "free", "ptr->void", [0]);
+        true
+    } catch false;
+    let close_invoked = try {
+        _typed_call(fs, "close", "i32->i32", [-1]);
+        true
+    } catch false;
+    return free_invoked and close_invoked;
+}
+
+fn _openat(fs, dirfd, name, flags, mode = 0) {
+    let pointer = _cstring(fs, name); if not _positive_pointer(pointer) { return -1; }
+    let result = _i32(_call(fs, "openat", "i32,ptr,i32,i32->i32", [dirfd, pointer, flags, mode]));
+    if not _free(fs, pointer) {
+        if result >= 0 { _close_fd(fs, result); }
+        return -1;
+    }
+    return result;
+}
+
+fn open_with_policy(root, create, protect_root, create_component, protect_component) {
+    let host = available(); if not host.library_ready { return _error(host.reason); }
+    let parts = _root_components(root); if parts == nil { return _error("root must be a safe relative path"); }
+    let libc = try ffi_load(host.libc) catch nil;
+    if libc == nil { return _error("trusted libc cannot be loaded"); }
+    let holder = map{ libc: libc, libc_path: host.libc };
+    if not _cleanup_authority_available(holder) {
+        let library_closed = _close_library(libc);
+        let poisoned = _mount_admission_cleanup_poisoned;
+        let code = "native-cleanup-authority-unavailable";
+        if poisoned { code = "scan-mount-cleanup-poisoned"; }
+        return map{ ok: false, error: "native cleanup authority is unavailable",
+            error_code: code, cleanup_failed: poisoned,
+            process_admission_poisoned: poisoned,
+            primary_library_closed: library_closed };
+    }
+    // Hold the current directory first, then resolve every caller-controlled
+    // component relative to a held descriptor. O_NOFOLLOW on one multi-part
+    // open protects only its final component and would leave intermediate
+    // symlinks vulnerable to a check/use race.
+    let current = _openat(holder, AT_FDCWD, ".", O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+    if current < 0 {
+        return _error_after_library_close(libc, "current directory cannot be opened");
+    }
+    let i = 0;
+    while i < len(parts) {
+        let next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+        if next < 0 and create {
+            create_component(holder, current, parts[i]);
+            // Always retry: another process may have won the mkdir race. The
+            // descriptor open still rejects links and non-directories.
+            next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+        }
+        let previous_closed = _close_fd(holder, current); current = -1;
+        if not previous_closed {
+            if next >= 0 { _close_fd(holder, next); }
+            return _error_after_library_close(libc,
+                "root component cleanup failed");
+        }
+        if next < 0 {
+            return _error_after_library_close(libc,
+                "root component is missing, not a directory, or a symbolic link");
+        }
+        current = next; i = i + 1;
+    }
+    if protect_root and len(parts) > 0 {
+        if not protect_component(holder, current) {
+            _close_fd(holder, current); current = -1;
+            return _error_after_library_close(libc,
+                "relative root must already be current-user-owned mode 0700");
+        }
+    }
+    return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: current,
+                libc: libc, libc_path: host.libc, closed: false,
+                child_fds: map{}, lock_fds: map{} };
+}
+
+fn open_absolute_with_policy(root, create, protect_root, create_component, protect_component) {
+    let host = available(); if not host.library_ready { return _error(host.reason); }
+    let parts = _absolute_components(root); if parts == nil { return _error("root must be a safe absolute path"); }
+    let libc = try ffi_load(host.libc) catch nil;
+    if libc == nil { return _error("trusted libc cannot be loaded"); }
+    let holder = map{ libc: libc, libc_path: host.libc };
+    if not _cleanup_authority_available(holder) {
+        let library_closed = _close_library(libc);
+        let poisoned = _mount_admission_cleanup_poisoned;
+        let code = "native-cleanup-authority-unavailable";
+        if poisoned { code = "scan-mount-cleanup-poisoned"; }
+        return map{ ok: false, error: "native cleanup authority is unavailable",
+            error_code: code, cleanup_failed: poisoned,
+            process_admission_poisoned: poisoned,
+            primary_library_closed: library_closed };
+    }
+    let current = _openat(holder, AT_FDCWD, "/", O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+    if current < 0 {
+        return _error_after_library_close(libc, "filesystem root cannot be opened");
+    }
+    let i = 0;
+    while i < len(parts) {
+        let next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+        if next < 0 and create {
+            create_component(holder, current, parts[i]);
+            next = _openat(holder, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+        }
+        let previous_closed = _close_fd(holder, current); current = -1;
+        if not previous_closed {
+            if next >= 0 { _close_fd(holder, next); }
+            return _error_after_library_close(libc,
+                "absolute path component cleanup failed");
+        }
+        if next < 0 {
+            return _error_after_library_close(libc,
+                "absolute path component is missing, not a directory, or a symbolic link");
+        }
+        current = next; i = i + 1;
+    }
+    if protect_root {
+        if not protect_component(holder, current) {
+            _close_fd(holder, current); current = -1;
+            return _error_after_library_close(libc,
+                "application root must already be current-user-owned mode 0700");
+        }
+    }
+    return map{ ok: true, format: "pblang.linux-dirfs.v1", root: root, root_fd: current,
+                libc: libc, libc_path: host.libc, closed: false, absolute: true,
+                child_fds: map{}, lock_fds: map{} };
+}
+
+fn _walk_dir(fs, parts, create, create_component = nil) {
+    if fs == nil or (try fs.closed catch true) { return _error("directory root is closed"); }
+    let current = _i32(_call(fs, "dup", "i32->i32", [fs.root_fd]));
+    if current < 0 { return _error("cannot duplicate root directory handle"); }
+    let i = 0;
+    while i < len(parts) {
+        let next = _openat(fs, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+        if next < 0 and create {
+            create_component(fs, current, parts[i]);
+            next = _openat(fs, current, parts[i], O_RDONLY + O_DIRECTORY + O_NOFOLLOW + O_CLOEXEC, 0);
+        }
+        let previous_closed = _close_fd(fs, current); current = -1;
+        if not previous_closed {
+            if next >= 0 { _close_fd(fs, next); }
+            return _cleanup_error("path-component descriptor cleanup failed");
+        }
+        if next < 0 {
+            return _error("path component is missing, not a directory, or a symbolic link");
+        }
+        current = next; i = i + 1;
+    }
+    return map{ ok: true, fd: current };
+}
+
+fn _parent(fs, path, create, literal_relative = false, create_component = nil) {
+    let parts = if literal_relative { _strict_components(path) } else { _components(path, false) };
+    if parts == nil or len(parts) == 0 { return _error("a non-root path is required"); }
+    let dirs = []; let i = 0;
+    while i + 1 < len(parts) { array_push(dirs, parts[i]); i = i + 1; }
+    let parent = _walk_dir(fs, dirs, create, create_component); if not parent.ok { return parent; }
+    parent.name = parts[len(parts) - 1]; return parent;
+}
+
+fn read_bytes(fs, path, max_bytes = 4194304) {
+    return _read_bytes_relative(fs, path, max_bytes, false);
+}
+
+fn read_bytes_relative(fs, path, max_bytes = 4194304) {
+    return _read_bytes_relative(fs, path, max_bytes, true);
+}
+
+// Consume operation-local ownership before one close attempt; a failed close
+// may already have released its numeric fd, so it must never be retried.
+fn _bounded_read_close(fs, state, key) {
+    let fd = state[key]; state[key] = -1;
+    if fd < 0 { return true; }
+    let closed = try _close_fd(fs, fd) catch false;
+    if not closed { state.cleanup_confirmed = false; }
+    return closed;
+}
+
+fn _bounded_read_cleanup(fs, state) {
+    _bounded_read_close(fs, state, "snapshot_fd");
+    _bounded_read_close(fs, state, "source_fd");
+    _bounded_read_close(fs, state, "parent_fd");
+    return state.cleanup_confirmed;
+}
+
+fn _read_bytes_relative(fs, path, max_bytes, literal_relative) {
+    if type(max_bytes) != "number" or max_bytes < 0 or max_bytes != num_floor(max_bytes)
+        or max_bytes > 67108864 {
+        return _error("invalid bounded read limit");
+    }
+    if fs == nil or not is_map(fs) or (try fs.closed catch true) {
+        return _error("directory root is closed");
+    }
+    if _mount_admission_cleanup_poisoned {
+        let failed = _cleanup_error("bounded read is disabled after ambiguous cleanup");
+        failed.error_code = "bounded-read-cleanup-poisoned"; return failed;
+    }
+    let state = map{parent_fd: -1, source_fd: -1, snapshot_fd: -1,
+        cleanup_confirmed: true};
+    let result = try _bounded_read_owned(fs, path, max_bytes, literal_relative, state)
+        catch _error("bounded file read failed safely");
+    let cleaned = _bounded_read_cleanup(fs, state);
+    if not cleaned or _mount_admission_cleanup_poisoned {
+        // Preserve the first known operation failure; cleanup cannot turn either
+        // a successful copy or a prior failure into a successful publication.
+        let message = if result.ok { "bounded file descriptor cleanup failed" }
+            else { result.error };
+        let failed = _cleanup_error(message);
+        failed.error_code = "bounded-read-cleanup-poisoned"; return failed;
+    }
+    return result;
+}
+
+fn _bounded_read_owned(fs, path, max_bytes, literal_relative, state) {
+    let parent = _parent(fs, path, false, literal_relative); if not parent.ok { return parent; }
+    state.parent_fd = parent.fd;
+    state.source_fd = _openat(fs, parent.fd, parent.name,
+        O_RDONLY + O_NONBLOCK + O_NOFOLLOW + O_CLOEXEC, 0);
+    let parent_closed = _bounded_read_close(fs, state, "parent_fd");
+    if state.source_fd < 0 { return _error("file cannot be opened without following links"); }
+    if not parent_closed { return _error("bounded file parent descriptor cleanup failed"); }
+
+    // fs_read_bytes has no length parameter. Copy at most max_bytes+1 into an
+    // anonymous kernel file before any VM byte allocation, also during growth.
+    state.snapshot_fd = _i32(_call(fs, "memfd_create", "string,i32->i32",
+        ["pblang-bounded-read", MFD_CLOEXEC]));
+    if state.snapshot_fd < 0 { return _error("bounded snapshot is unavailable"); }
+    let ceiling = max_bytes + 1; let copied = 0; let failed = false;
+    let eof = false;
+    while copied < ceiling and not failed and not eof {
+        let remaining = ceiling - copied;
+        let count = _call(fs, "sendfile", "i32,i32,ptr,i64->i64",
+            [state.snapshot_fd, state.source_fd, 0, remaining]);
+        if type(count) != "number" or count < 0 or count != num_floor(count)
+           or count > remaining { failed = true; }
+        else if count == 0 { eof = true; }
+        else { copied = copied + count; }
+    }
+    let source_closed = _bounded_read_close(fs, state, "source_fd");
+    if failed { return _error("bounded file snapshot failed"); }
+    if not source_closed { return _error("bounded file source descriptor cleanup failed"); }
+    let snapshot = state.snapshot_fd;
+    let snapshot_size = _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 2]);
+    if type(snapshot_size) != "number" or snapshot_size < 0
+       or snapshot_size != num_floor(snapshot_size) {
+        return _error("bounded snapshot size is unavailable");
+    }
+    if snapshot_size > max_bytes { return _error("file exceeds byte limit"); }
+    if _call(fs, "lseek", "i32,i64,i32->i64", [snapshot, 0, 0]) != 0 {
+        return _error("bounded snapshot cannot be rewound");
+    }
+    let bytes = try fs_read_bytes(_fd_path(snapshot)) catch nil;
+    if not is_array(bytes) { return _error("path is not a readable regular file"); }
+    if len(bytes) != snapshot_size { return _error("bounded snapshot size changed"); }
+    return map{ ok: true, path: path, bytes: bytes, size: len(bytes) };
+}
+
+// Called only after the full owner has settled its own registries, or by a
+// validated fresh read-only root. Preserve root close, library close, then
+// ownership consumption: no numeric descriptor close retry is introduced.
+fn close_root_owned(fs) {
+    let closed = _close_fd(fs, fs.root_fd);
+    let library_closed = _close_library(fs.libc);
+    if not library_closed { _mount_admission_cleanup_poisoned = true; }
+    fs.closed = true; fs.root_fd = -1;
+    return closed and library_closed;
+}
+
+// These internal source-admission handles never create/protect directories and
+// never acquire children, locks or enumeration state. The tag distinguishes
+// their lifecycle from a full-dirfs root; it is not a general capability token.
+fn open_readonly(root) {
+    let fs = open_with_policy(root, false, false, nil, nil);
+    if fs.ok { fs.read_core_owner = "pblang.source-root.v1"; }
+    return fs;
+}
+fn open_absolute_readonly(root) {
+    let fs = open_absolute_with_policy(root, false, false, nil, nil);
+    if fs.ok { fs.read_core_owner = "pblang.source-root.v1"; }
+    return fs;
+}
+fn close_readonly(fs) {
+    if fs == nil or not is_map(fs) or (try fs.closed catch true) { return false; }
+    if (try fs.read_core_owner catch nil) != "pblang.source-root.v1" { return false; }
+    let children = try fs.child_fds catch nil;
+    let locks = try fs.lock_fds catch nil;
+    if not is_map(children) or not is_map(locks) { return false; }
+    if len(map_keys(children)) != 0 or len(map_keys(locks)) != 0 { return false; }
+    if map_has(fs, "enumeration_context_id") or map_has(fs, "strict_enum_operation_id") { return false; }
+    return close_root_owned(fs);
+}
+
+export _error, _cleanup_error, _close_library, _error_after_library_close, available,
+       _components, _strict_components, _call, _i32, _close_fd,
+       _fd_path, _positive_pointer, _cstring, _free, _openat,
+       read_bytes, read_bytes_relative, mark_cleanup_poisoned, cleanup_poisoned, open_with_policy,
+       open_absolute_with_policy, _walk_dir, _parent, close_root_owned, open_readonly,
+       open_absolute_readonly, close_readonly, AT_FDCWD, O_RDONLY, O_NONBLOCK,
+       O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC, MFD_CLOEXEC, MAX_COMPONENT;
