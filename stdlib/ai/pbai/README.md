@@ -302,3 +302,10 @@ Keep model artifacts out of the pblang core repo. New tokenizers, checkpoints, t
 corpora, architecture code, and brain modules belong here in `pbai`. The pblang repo keeps
 only the tensor/NN builtins, stdlib support, import/runtime integration, and IDE hooks that
 call pbAI through a stable boundary. See [`docs/pbAI_externalization.md`](docs/pbAI_externalization.md).
+
+## Embedded bounded encoder/decoder training
+
+The embedded subtree includes HF-13A/B/C reconstruction gradients, detached SGD
+and bounded full-batch epochs. From the PBLang root import
+`stdlib:ai/pbai/stdlib/pbai_feedback_train.sapp`; adoption is explicit and no
+installed runtime or facade action changes. See [contracts and adoption plan](docs/Embedded_Training_Adoption.md).
