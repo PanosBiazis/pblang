@@ -1,0 +1,216 @@
+// Pure PBLang qualification runner for secure_file.list_directory ownership,
+// single-close, exception redaction, reply validation and Linux FD checks.
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _replace_once(source, needle, replacement) {
+    let parts = str_split(source, needle);
+    assert(len(parts) == 2, "expected exactly one occurrence of needle");
+    return parts[0] + replacement + parts[1];
+}
+
+let raw_args = os_args();
+let baseline_path = "";
+let report_path = "";
+let i = 0;
+while i < len(raw_args) {
+    if raw_args[i] == "--baseline-source" and i + 1 < len(raw_args) {
+        baseline_path = raw_args[i + 1];
+    }
+    if raw_args[i] == "--report" and i + 1 < len(raw_args) {
+        report_path = raw_args[i + 1];
+    }
+    i = i + 1;
+}
+if baseline_path == "" or report_path == "" {
+    throw "usage: pblang run --allow-all tests/tooling/secure_file_list_directory_cleanup_check.sapp -- --baseline-source <path> --report <path>";
+}
+
+let stdlib_root = cwd() + "/stdlib/";
+let candidate_raw = fs_read("stdlib/secure_file.sapp");
+let baseline_raw = fs_read(baseline_path);
+let semantic_raw = fs_read("tests/semantics/secure_file_list_directory_cleanup_test.sapp");
+
+let scratch = "/tmp/pblang-list-dir-qual-" + str(num_floor(now_ms()));
+assert(SECURE.create_private_temporary_directory_new(scratch).ok, "private temporary qualification directory created");
+assert(SECURE.create_private_directory_new(scratch + "/sample").ok, "private sample subdirectory created");
+assert(SECURE.write_text_new_exclusive(scratch + "/sample/a.txt", "A", false, true).ok, "write sample a");
+assert(SECURE.write_text_new_exclusive(scratch + "/sample/b.txt", "B", false, true).ok, "write sample b");
+assert(SECURE.write_text_new_exclusive(scratch + "/sample/c.txt", "C", false, true).ok, "write sample c");
+
+let backend_src = "let state = map{};\n"
+    + "fn configure(list_mode, close_mode) {\n"
+    + "    state.list_mode = list_mode; state.close_mode = close_mode;\n"
+    + "    state.opens = 0; state.open_absolutes = 0; state.lists = 0; state.closes = 0;\n"
+    + "    state.open_mode = \"ok\";\n"
+    + "}\n"
+    + "fn _open_reply() {\n"
+    + "    if state.open_mode == \"false\" { return map{ ok: false, error: \"denied\" }; }\n"
+    + "    if state.open_mode == \"nil\" { return nil; }\n"
+    + "    if state.open_mode == \"bad_ok\" { return map{ ok: 1 }; }\n"
+    + "    return map{ ok: true };\n"
+    + "}\n"
+    + "fn open(path, create = false, protect = false) { state.opens = state.opens + 1; return _open_reply(); }\n"
+    + "fn open_absolute(path, create = false, protect = false) { state.open_absolutes = state.open_absolutes + 1; return _open_reply(); }\n"
+    + "fn close(fs) {\n"
+    + "    state.closes = state.closes + 1; let m = state.close_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { return nil; }\n"
+    + "    if m == \"number\" { return 1; }\n"
+    + "    if m == \"map\" { return map{ ok: true }; }\n"
+    + "    return m == \"success\";\n"
+    + "}\n"
+    + "fn list(fs, path, maximum) {\n"
+    + "    state.lists = state.lists + 1; let m = state.list_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { return nil; }\n"
+    + "    if m == \"failure\" { return map{ ok: false, error: \"synthetic listing failure\", marker: 11 }; }\n"
+    + "    if m == \"bad_ok\" { return map{ ok: 1, entries: [], truncated: false }; }\n"
+    + "    if m == \"bad_entries\" { return map{ ok: true, entries: map{}, truncated: false }; }\n"
+    + "    if m == \"bad_entry\" { return map{ ok: true, entries: [123], truncated: false }; }\n"
+    + "    if m == \"oversize_entries\" { return map{ ok: true, entries: [\"a\", \"b\", \"c\", \"d\", \"e\"], truncated: false }; }\n"
+    + "    if m == \"missing_truncated\" { return map{ ok: true, entries: [\"a\"] }; }\n"
+    + "    if m == \"bad_truncated\" { return map{ ok: true, entries: [\"a\"], truncated: \"no\" }; }\n"
+    + "    if m == \"empty\" { return map{ ok: true, entries: [], truncated: false }; }\n"
+    + "    if m == \"truncated\" { return map{ ok: true, entries: [\"a\", \"b\", \"c\", \"d\"], truncated: true }; }\n"
+    + "    if m == \"extra_fields\" { return map{ ok: true, entries: [\"x\"], truncated: false, descriptor_bound: true, race_resistant: true }; }\n"
+    + "    return map{ ok: true, entries: [\"alpha.sapp\", \"beta.sapp\"], truncated: false };\n"
+    + "}\n"
+    + "export state, configure, open, open_absolute, close, list;\n";
+
+fs_write(scratch + "/backend.sapp", backend_src);
+fs_write(scratch + "/semantic.sapp", semantic_raw);
+
+let cand_bound = str_replace_all(candidate_raw, "\"stdlib:", "\"" + stdlib_root);
+let base_bound = str_replace_all(baseline_raw, "\"stdlib:", "\"" + stdlib_root);
+
+let cand_model = _replace_once(
+    cand_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/cand_model.sapp", cand_model);
+
+let base_model = _replace_once(
+    base_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/base_model.sapp", base_model);
+
+let cand_real_throw = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.list(fs, path, max_entries); }",
+    "if platform() == \"linux\" { throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/cand_real_throw.sapp", cand_real_throw);
+
+let base_real_throw = _replace_once(
+    base_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.list(fs, path, max_entries); }",
+    "if platform() == \"linux\" { throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/base_real_throw.sapp", base_real_throw);
+
+let cand_close_false = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); return false; }"
+);
+fs_write(scratch + "/cand_close_false.sapp", cand_close_false);
+
+let cand_close_throw = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/cand_close_throw.sapp", cand_close_throw);
+
+let B = import(scratch + "/backend.sapp");
+let SEM = import(scratch + "/semantic.sapp");
+let S_CAND_MODEL = import(scratch + "/cand_model.sapp");
+let S_BASE_MODEL = import(scratch + "/base_model.sapp");
+let S_CAND_REAL = import("stdlib:secure_file.sapp");
+let S_CAND_THROW = import(scratch + "/cand_real_throw.sapp");
+let S_BASE_THROW = import(scratch + "/base_real_throw.sapp");
+let S_CLOSE_FALSE = import(scratch + "/cand_close_false.sapp");
+let S_CLOSE_THROW = import(scratch + "/cand_close_throw.sapp");
+
+let rows = [];
+
+// Group 1: Candidate modeled matrix (156 matrix cases + 16 admission cases)
+let m_res = SEM.run(S_CAND_MODEL, B);
+assert(m_res.ok and m_res.matrix_cases == 156 and m_res.admission_cases == 16, "candidate modeled matrix passed");
+array_push(rows, map{ label: "candidate_modeled_matrix", passed: true, result: m_res });
+
+// Group 2: Unchanged baseline rejected by new semantic contract
+let base_rejected = try { SEM.run(S_BASE_MODEL, B); false } catch true;
+assert(base_rejected, "baseline source rejected by semantic ownership contract");
+array_push(rows, map{ label: "baseline_rejected_by_semantic_contract", passed: true, rejected: base_rejected });
+
+// Group 3: Real Linux normal + truncated directory listing with FD delta 0
+let fd_before_normal = len(fs_listdir("/proc/self/fd"));
+let real_full = S_CAND_REAL.list_directory(scratch + "/sample", 8);
+assert(real_full.ok and not real_full.truncated and len(real_full.entries) == 3, "real full listing");
+let real_trunc = S_CAND_REAL.list_directory(scratch + "/sample", 2);
+assert(real_trunc.ok and real_trunc.truncated and len(real_trunc.entries) == 2, "real truncated listing");
+assert(not S_CAND_REAL.list_directory(scratch + "/nonexistent", 8).ok, "real missing directory rejected");
+let fd_delta_normal = len(fs_listdir("/proc/self/fd")) - fd_before_normal;
+assert(fd_delta_normal == 0, "zero fd delta on real normal/truncated/missing listings");
+array_push(rows, map{ label: "candidate_real_linux_listings", passed: true, fd_delta: fd_delta_normal });
+
+// Group 4: Real Linux descriptor leak control under synthetic _list_backend exception
+let fd_before_cand_exc = len(fs_listdir("/proc/self/fd"));
+let cand_exc_count = 0;
+let cand_denied_count = 0;
+let k1 = 0;
+while k1 < 4 {
+    let r = try S_CAND_THROW.list_directory(scratch + "/sample", 8) catch { cand_exc_count = cand_exc_count + 1; nil };
+    if r != nil {
+        assert(not r.ok and r.error == "secure directory listing backend failed" and not map_has(r, "entries"), "candidate exception redacted");
+        cand_denied_count = cand_denied_count + 1;
+    }
+    k1 = k1 + 1;
+}
+let fd_delta_cand_exc = len(fs_listdir("/proc/self/fd")) - fd_before_cand_exc;
+assert(cand_exc_count == 0 and cand_denied_count == 4 and fd_delta_cand_exc == 0, "candidate closes root descriptor on list exception");
+array_push(rows, map{ label: "candidate_real_list_exception_zero_fd_leak", passed: true, exceptions: cand_exc_count, denied: cand_denied_count, fd_delta: fd_delta_cand_exc });
+
+// Group 5: Baseline real Linux descriptor leak demonstration under synthetic _list_backend exception
+let fd_before_base_exc = len(fs_listdir("/proc/self/fd"));
+let base_exc_count = 0;
+let k2 = 0;
+while k2 < 4 {
+    try { S_BASE_THROW.list_directory(scratch + "/sample", 8); } catch { base_exc_count = base_exc_count + 1; }
+    k2 = k2 + 1;
+}
+let fd_delta_base_exc = len(fs_listdir("/proc/self/fd")) - fd_before_base_exc;
+assert(base_exc_count == 4 and fd_delta_base_exc == 4, "baseline leaks +4 root descriptors on 4 list exceptions");
+array_push(rows, map{ label: "baseline_real_list_exception_leaks_4_fds", passed: true, exceptions: base_exc_count, fd_delta: fd_delta_base_exc });
+
+// Group 6: Real close followed by synthetic false / throw suppresses entries with FD delta 0
+let fd_before_close_proj = len(fs_listdir("/proc/self/fd"));
+let k3 = 0;
+while k3 < 4 {
+    let rf = S_CLOSE_FALSE.list_directory(scratch + "/sample", 8);
+    assert(not rf.ok and rf.cleanup_uncertain and not rf.root_close_confirmed and not map_has(rf, "entries"), "close false suppresses result");
+    let rt = S_CLOSE_THROW.list_directory(scratch + "/sample", 8);
+    assert(not rt.ok and rt.cleanup_uncertain and not rt.root_close_confirmed and not map_has(rt, "entries"), "close throw suppresses result");
+    k3 = k3 + 1;
+}
+let fd_delta_close_proj = len(fs_listdir("/proc/self/fd")) - fd_before_close_proj;
+assert(fd_delta_close_proj == 0, "zero fd delta on post-close projection tests");
+array_push(rows, map{ label: "candidate_real_close_uncertainty_projection", passed: true, checks: 8, fd_delta: fd_delta_close_proj });
+
+let report = map{
+    passed: true,
+    runner: "tests/tooling/secure_file_list_directory_cleanup_check.sapp",
+    language: "PBLang",
+    source_sha256: SHA256.sha256_hex(candidate_raw),
+    baseline_sha256: SHA256.sha256_hex(baseline_raw),
+    semantic_sha256: SHA256.sha256_hex(semantic_raw),
+    groups_passed: len(rows),
+    rows: rows
+};
+fs_write(report_path, json_stringify(report) + "\n");
+print json_stringify(report);

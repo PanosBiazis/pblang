@@ -90,3 +90,25 @@ process-output caps and source-hidden/network-off execution. Run under the share
 coordinator lock. These tests do not prove native Windows/macOS operation, physical
 release after a failed native close, complete heap bounds, or cleanup after VM
 termination. No consumer state is saved during these checks.
+
+## Directory listings
+
+`list_directory` now closes its successfully acquired directory root handle (`fs`)
+exactly once, including catchable backend listing and reply-validation failures.
+Only boolean `true` confirms that close. Every other close result or catchable
+exception returns a fixed error (`secure directory root cleanup could not be verified`)
+with `cleanup_uncertain:true` and `root_close_confirmed:false`; `entries` are never
+exposed under cleanup uncertainty and close is never retried. Catchable backend
+exceptions become a fixed `secure directory listing backend failed` diagnostic
+after a confirmed close.
+
+Successful backend listings must have boolean `ok:true`, boolean `truncated`, and
+`entries` as an array of at most `max_entries` strings. Malformed replies fail
+closed with `secure directory listing result is invalid` while ordinary backend
+error maps (`ok:false`) are preserved after confirmed close.
+
+`tests/tooling/secure_file_list_directory_cleanup_check.sapp` is a native PBLang
+qualification runner (`pblang run --allow-all tests/tooling/secure_file_list_directory_cleanup_check.sapp -- --baseline-source <path> --report <path>`)
+that verifies 156 modeled list/close combinations, 16 admission cases, baseline
+rejection, real Linux directory listings, real descriptor leak elimination on
+synthetic listing exceptions, and post-close uncertainty projection.
