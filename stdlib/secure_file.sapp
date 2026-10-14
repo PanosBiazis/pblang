@@ -697,6 +697,39 @@ fn _immutable_reader_valid(reader) {
 // Open one bounded file once and freeze its bytes in a sealed kernel-backed
 // snapshot. This high-level handle is intentionally Linux-only until the
 // Windows and macOS backends can provide equivalent immutable snapshots.
+fn _open_immutable_snapshot_owned(fs, name, max_bytes) {
+    let snapshot = LinuxDirFS.sealed_snapshot_file_descriptor(fs, name, max_bytes);
+    if not is_map(snapshot) or type(try snapshot.ok catch nil) != "bool" {
+        return _error("immutable reader snapshot result is invalid");
+    }
+    if not snapshot.ok { return snapshot; }
+    let size = try snapshot.size catch nil;
+    let active = try snapshot.active catch nil;
+    let immutable = try snapshot.immutable catch nil;
+    if type(active) != "bool" or not active
+       or type(immutable) != "bool" or not immutable
+       or type(size) != "number" or size != size
+       or size < 0 or size > max_bytes or size != num_floor(size) {
+        try LinuxDirFS.close_child_descriptor(fs, snapshot) catch false;
+        return _error("immutable reader snapshot result is invalid");
+    }
+    return snapshot;
+}
+
+fn _finish_failed_parent_close(fs, result, default_error) {
+    let closed = try _close(fs) catch false;
+    if type(closed) == "bool" and closed { return result; }
+    let failed = map{};
+    if is_map(result) {
+        for key in map_keys(result) { failed[key] = result[key]; }
+    }
+    failed.ok = false;
+    if not map_has(failed, "error") { failed.error = default_error; }
+    failed.cleanup_uncertain = true;
+    failed.parent_close_confirmed = false;
+    return failed;
+}
+
 fn open_immutable_reader(path, max_bytes, private_parent = false) {
     if platform() != "linux" {
         return _error("immutable secure readers currently require Linux");
@@ -706,9 +739,12 @@ fn open_immutable_reader(path, max_bytes, private_parent = false) {
         return _error("invalid immutable reader byte limit");
     }
     let parent = _open_parent(path, false, private_parent); if not parent.ok { return parent; }
-    let snapshot = LinuxDirFS.sealed_snapshot_file_descriptor(parent.fs,
-        parent.name, max_bytes);
-    if not snapshot.ok { _close(parent.fs); return snapshot; }
+    let snapshot = try _open_immutable_snapshot_owned(parent.fs, parent.name, max_bytes)
+        catch _error("immutable reader snapshot backend failed");
+    if not snapshot.ok {
+        return _finish_failed_parent_close(parent.fs, snapshot,
+            "immutable reader parent cleanup could not be verified");
+    }
     return map{ok:true,format:"pblang.secure-file.immutable-reader.v1",
         active:true,fs:parent.fs,snapshot:snapshot,path:path,size:snapshot.size,
         backend:"linux-sealed-memfd",descriptor_bound:true,nofollow:true,
@@ -737,6 +773,62 @@ fn immutable_reader_magic_offsets(reader, magic, max_matches = 128) {
         magic, max_matches);
 }
 
+fn _publish_range_owned(reader, dest_fs, dest_name, offset, count, executable, is_private) {
+    if is_private {
+        let policy = LinuxDirFS.private_root_status(dest_fs);
+        if not is_map(policy) or type(try policy.ok catch nil) != "bool" or not policy.ok {
+            return _error("output parent must already be current-UID-owned mode 0700");
+        }
+    }
+    let result = LinuxDirFS.copy_held_range_new_atomic(reader.fs, reader.snapshot,
+        dest_fs, dest_name, offset, count, false, executable);
+    if not is_map(result) or type(try result.ok catch nil) != "bool" {
+        return _error(if is_private {
+            "private immutable reader publication result is invalid"
+        } else {
+            "immutable reader publication result is invalid"
+        });
+    }
+    return result;
+}
+
+fn _finish_range_publication(dest_fs, result, is_private) {
+    let closed = try _close(dest_fs) catch false;
+    let close_msg = if is_private {
+        "private immutable reader publication parent cleanup could not be verified"
+    } else {
+        "immutable reader publication parent cleanup could not be verified"
+    };
+    if type(closed) == "bool" and closed {
+        if is_private and is_map(result) and result.ok {
+            let out = map{};
+            for key in map_keys(result) { out[key] = result[key]; }
+            out.private_parent_verified = true;
+            out.parent_owned_by_current_uid = true;
+            out.parent_mode = "700";
+            return out;
+        }
+        return result;
+    }
+    let failed = map{};
+    if is_map(result) {
+        for key in map_keys(result) { failed[key] = result[key]; }
+    }
+    let backend_ok = is_map(result)
+        and (try (type(result.ok) == "bool" and result.ok) catch false);
+    failed.ok = false;
+    if backend_ok or not map_has(failed, "error") {
+        failed.error = close_msg;
+    }
+    failed.cleanup_uncertain = true;
+    failed.parent_close_confirmed = false;
+    if backend_ok {
+        failed.publish_backend_succeeded = true;
+        failed.publication_may_have_occurred = true;
+    }
+    return failed;
+}
+
 fn publish_immutable_reader_range(reader, output, offset, count,
                                   private_parent = false, executable = false) {
     if not _immutable_reader_valid(reader) or type(output) != "string"
@@ -745,10 +837,10 @@ fn publish_immutable_reader_range(reader, output, offset, count,
     }
     let destination = _open_parent(output, false, private_parent);
     if not destination.ok { return destination; }
-    let result = LinuxDirFS.copy_held_range_new_atomic(reader.fs, reader.snapshot,
-        destination.fs, destination.name, offset, count, false, executable);
-    _close(destination.fs);
-    return result;
+    let result = try _publish_range_owned(reader, destination.fs, destination.name,
+        offset, count, executable, false)
+        catch _error("immutable reader publication backend failed");
+    return _finish_range_publication(destination.fs, result, false);
 }
 
 fn publish_immutable_reader_range_private(reader, output, offset, count,
@@ -760,20 +852,10 @@ fn publish_immutable_reader_range_private(reader, output, offset, count,
     }
     let destination = _open_parent(output, false, false);
     if not destination.ok { return destination; }
-    let policy = LinuxDirFS.private_root_status(destination.fs);
-    if type(policy) != "map" or not policy.ok {
-        _close(destination.fs);
-        return _error("output parent must already be current-UID-owned mode 0700");
-    }
-    let result = LinuxDirFS.copy_held_range_new_atomic(reader.fs, reader.snapshot,
-        destination.fs, destination.name, offset, count, false, executable);
-    _close(destination.fs);
-    if type(result) == "map" and result.ok {
-        result.private_parent_verified = true;
-        result.parent_owned_by_current_uid = true;
-        result.parent_mode = "700";
-    }
-    return result;
+    let result = try _publish_range_owned(reader, destination.fs, destination.name,
+        offset, count, executable, true)
+        catch _error("private immutable reader publication backend failed");
+    return _finish_range_publication(destination.fs, result, true);
 }
 
 fn publish_immutable_reader_range_private_temp(reader, output, offset, count,
@@ -783,23 +865,31 @@ fn publish_immutable_reader_range_private_temp(reader, output, offset, count,
        path_dirname(parts.parent) != "/tmp" or path_basename(parts.parent) == "tmp" {
         return _error("temporary private output must be one dedicated child below /tmp");
     }
-    let temporary_root = LinuxDirFS.open_absolute("/tmp", false, false);
-    if not temporary_root.ok {
+    let temporary_root = try LinuxDirFS.open_absolute("/tmp", false, false) catch nil;
+    if not is_map(temporary_root) or type(try temporary_root.ok catch nil) != "bool" or not temporary_root.ok {
         return _error("temporary container cannot be opened securely");
     }
-    let temporary_meta = LinuxDirFS.metadata(temporary_root, "root");
-    let temporary_closed = LinuxDirFS.close(temporary_root);
-    if type(temporary_meta) != "map" or not temporary_meta.ok or
-       temporary_meta.kind != "directory" or bit_and(temporary_meta.mode, 512) == 0 or
-       type(temporary_closed) != "bool" or not temporary_closed {
+    let temporary_meta = try LinuxDirFS.metadata(temporary_root, "root") catch nil;
+    let temporary_closed = try LinuxDirFS.close(temporary_root) catch false;
+    if type(temporary_closed) != "bool" or not temporary_closed {
+        return map{ ok: false,
+            error: "temporary container handle cleanup could not be verified",
+            cleanup_uncertain: true, root_close_confirmed: false };
+    }
+    if not is_map(temporary_meta) or type(try temporary_meta.ok catch nil) != "bool" or not temporary_meta.ok or
+       (try temporary_meta.kind catch "") != "directory" or
+       type(try temporary_meta.mode catch nil) != "number" or bit_and(temporary_meta.mode, 512) == 0 {
         return _error("temporary container must be a held sticky directory");
     }
     let result = publish_immutable_reader_range_private(reader, output,
         offset, count, executable);
-    if type(result) == "map" and result.ok {
-        result.sticky_temporary_container_verified = true;
-        result.temporary_container = "/tmp";
-        result.post_return_other_uid_replacement_blocked = true;
+    if is_map(result) and result.ok {
+        let out = map{};
+        for key in map_keys(result) { out[key] = result[key]; }
+        out.sticky_temporary_container_verified = true;
+        out.temporary_container = "/tmp";
+        out.post_return_other_uid_replacement_blocked = true;
+        return out;
     }
     return result;
 }
@@ -812,19 +902,38 @@ fn create_private_directory_new(path) {
     }
     let parent = _open_parent(path, false, false);
     if not parent.ok { return _error("private directory parent is unavailable"); }
-    let created = LinuxDirFS.mkdir_new(parent.fs, parent.name, false);
-    _close(parent.fs);
-    if type(created) != "map" or not created.ok {
+    let created = try LinuxDirFS.mkdir_new(parent.fs, parent.name, false) catch nil;
+    let parent_closed = try _close(parent.fs) catch false;
+    if type(parent_closed) != "bool" or not parent_closed {
+        let failed = map{ ok: false,
+            error: "private directory parent cleanup could not be verified",
+            cleanup_uncertain: true, parent_close_confirmed: false };
+        if is_map(created) and (try (type(created.ok) == "bool" and created.ok) catch false) {
+            failed.mkdir_backend_succeeded = true;
+            failed.creation_may_have_occurred = true;
+        }
+        return failed;
+    }
+    if not is_map(created) or type(try created.ok catch nil) != "bool" or not created.ok {
         return _error("private directory must be newly created");
     }
-    let fs = if str_starts_with(path, "/") {
-        LinuxDirFS.open_absolute(path, false, false)
-    } else { LinuxDirFS.open(path, false, false) };
-    if not fs.ok { return _error("new private directory cannot be reopened securely"); }
-    let policy = LinuxDirFS.private_root_status(fs);
-    let closed = LinuxDirFS.close(fs);
-    if type(policy) != "map" or not policy.ok or
-       type(closed) != "bool" or not closed {
+    let fs = nil;
+    if str_starts_with(path, "/") {
+        fs = try LinuxDirFS.open_absolute(path, false, false) catch nil;
+    } else {
+        fs = try LinuxDirFS.open(path, false, false) catch nil;
+    }
+    if not is_map(fs) or type(try fs.ok catch nil) != "bool" or not fs.ok {
+        return _error("new private directory cannot be reopened securely");
+    }
+    let policy = try LinuxDirFS.private_root_status(fs) catch nil;
+    let closed = try LinuxDirFS.close(fs) catch false;
+    if type(closed) != "bool" or not closed {
+        return map{ ok: false,
+            error: "private directory verification handle cleanup could not be verified",
+            cleanup_uncertain: true, root_close_confirmed: false };
+    }
+    if not is_map(policy) or type(try policy.ok catch nil) != "bool" or not policy.ok {
         return _error("private directory ownership or mode cannot be verified");
     }
     return map{ok:true,path:path,created:true,exclusive_create:true,
@@ -835,16 +944,23 @@ fn _temporary_container_status() {
     if platform() != "linux" {
         return _error("temporary container verification requires Linux");
     }
-    let temporary_root = LinuxDirFS.open_absolute("/tmp", false, false);
-    if not temporary_root.ok {
+    let temporary_root = try LinuxDirFS.open_absolute("/tmp", false, false) catch nil;
+    if not is_map(temporary_root) or type(try temporary_root.ok catch nil) != "bool" or not temporary_root.ok {
         return _error("temporary container cannot be opened securely");
     }
-    let temporary_meta = LinuxDirFS.metadata(temporary_root, "root");
-    let temporary_closed = LinuxDirFS.close(temporary_root);
-    if type(temporary_meta) != "map" or not temporary_meta.ok
-       or temporary_meta.kind != "directory" or bit_and(temporary_meta.mode, 512) == 0
-       or not (temporary_meta.owner_uid == 0 or temporary_meta.owner_current_user)
-       or type(temporary_closed) != "bool" or not temporary_closed {
+    let temporary_meta = try LinuxDirFS.metadata(temporary_root, "root") catch nil;
+    let temporary_closed = try LinuxDirFS.close(temporary_root) catch false;
+    if type(temporary_closed) != "bool" or not temporary_closed {
+        return map{ ok: false,
+            error: "temporary container handle cleanup could not be verified",
+            cleanup_uncertain: true, root_close_confirmed: false };
+    }
+    if not is_map(temporary_meta) or type(try temporary_meta.ok catch nil) != "bool" or not temporary_meta.ok
+       or (try temporary_meta.kind catch "") != "directory"
+       or type(try temporary_meta.mode catch nil) != "number"
+       or bit_and(temporary_meta.mode, 512) == 0
+       or not ((try temporary_meta.owner_uid catch -1) == 0
+           or (try (type(temporary_meta.owner_current_user) == "bool" and temporary_meta.owner_current_user) catch false)) {
         return _error("temporary container must be a root-owned or current-user-owned held sticky directory");
     }
     return map{ ok: true, sticky_temporary_container_verified: true,
@@ -891,13 +1007,18 @@ fn private_directory_status(path) {
        or not str_starts_with(path, "/") or str_contains(path, strfromcharcode(0)) {
         return map{ ok: false, ready: false, reason: "invalid-private-directory-path" };
     }
-    let fs = LinuxDirFS.open_absolute(path, false, false);
-    if not fs.ok {
+    let fs = try LinuxDirFS.open_absolute(path, false, false) catch nil;
+    if not is_map(fs) or type(try fs.ok catch nil) != "bool" or not fs.ok {
         return map{ ok: false, ready: false, reason: "private-directory-unavailable" };
     }
-    let policy = LinuxDirFS.private_root_status(fs);
-    let closed = LinuxDirFS.close(fs);
-    if not policy.ok or not closed {
+    let policy = try LinuxDirFS.private_root_status(fs) catch nil;
+    let closed = try LinuxDirFS.close(fs) catch false;
+    if type(closed) != "bool" or not closed {
+        return map{ ok: false, ready: false,
+            reason: "private-directory-cleanup-unverified",
+            cleanup_uncertain: true, root_close_confirmed: false };
+    }
+    if not is_map(policy) or type(try policy.ok catch nil) != "bool" or not policy.ok {
         return map{ ok: false, ready: false,
             reason: "private-directory-ownership-or-mode-unverified" };
     }
@@ -913,9 +1034,11 @@ fn close_immutable_reader(reader) {
     if not (try reader.active catch false) {
         return map{ok:true,closed:true,already_closed:true};
     }
-    let snapshot_closed = try LinuxDirFS.close_child_descriptor(reader.fs,
+    let raw_snapshot_closed = try LinuxDirFS.close_child_descriptor(reader.fs,
         reader.snapshot) catch false;
-    let parent_closed = try LinuxDirFS.close(reader.fs) catch false;
+    let raw_parent_closed = try LinuxDirFS.close(reader.fs) catch false;
+    let snapshot_closed = type(raw_snapshot_closed) == "bool" and raw_snapshot_closed;
+    let parent_closed = type(raw_parent_closed) == "bool" and raw_parent_closed;
     reader.active = false; reader.close_attempted = true;
     return map{ok:snapshot_closed and parent_closed,closed:true,
         ownership_consumed:true,retryable:false,

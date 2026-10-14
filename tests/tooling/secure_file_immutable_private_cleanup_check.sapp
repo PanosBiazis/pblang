@@ -1,0 +1,300 @@
+// Pure PBLang qualification runner for secure_file immutable-reader and
+// private-directory parent/root ownership, single-close, exception redaction,
+// reply validation, and Linux FD leak verification.
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _replace_once(source, needle, replacement) {
+    let parts = str_split(source, needle);
+    assert(len(parts) == 2, "expected exactly one occurrence of needle: " + needle);
+    return parts[0] + replacement + parts[1];
+}
+
+let raw_args = os_args();
+let baseline_path = "";
+let report_path = "";
+let i = 0;
+while i < len(raw_args) {
+    if raw_args[i] == "--baseline-source" and i + 1 < len(raw_args) {
+        baseline_path = raw_args[i + 1];
+    }
+    if raw_args[i] == "--report" and i + 1 < len(raw_args) {
+        report_path = raw_args[i + 1];
+    }
+    i = i + 1;
+}
+if baseline_path == "" or report_path == "" {
+    throw "usage: pblang run --allow-all tests/tooling/secure_file_immutable_private_cleanup_check.sapp -- --baseline-source <path> --report <path>";
+}
+
+let stdlib_root = cwd() + "/stdlib/";
+let candidate_raw = fs_read("stdlib/secure_file.sapp");
+let baseline_raw = fs_read(baseline_path);
+let semantic_raw = fs_read("tests/semantics/secure_file_immutable_private_cleanup_test.sapp");
+
+let scratch = "/tmp/pblang-immutable-private-qual-" + str(num_floor(now_ms()));
+assert(SECURE.create_private_temporary_directory_new(scratch).ok, "private temporary qualification directory created");
+assert(SECURE.create_private_directory_new(scratch + "/work").ok, "private work subdirectory created");
+
+let backend_src = "let state = map{};\n"
+    + "fn configure(op_mode, close_mode) {\n"
+    + "    state.op_mode = op_mode; state.close_mode = close_mode;\n"
+    + "    state.opens = 0; state.snapshots = 0; state.publishes = 0;\n"
+    + "    state.mkdirs = 0; state.policy_checks = 0;\n"
+    + "    state.closes = 0; state.child_closes = 0;\n"
+    + "    state.admit = true; state.test_policy = false; state.result = nil;\n"
+    + "}\n"
+    + "fn open(path, create = false, protect = false) {\n"
+    + "    state.opens = state.opens + 1;\n"
+    + "    return if state.admit { map{ ok: true } } else { map{ ok: false, error: \"admission denied\" } };\n"
+    + "}\n"
+    + "fn open_absolute(path, create = false, protect = false) { return open(path, create, protect); }\n"
+    + "fn close(fs) {\n"
+    + "    state.closes = state.closes + 1; let m = state.close_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { return nil; }\n"
+    + "    if m == \"number\" { return 1; }\n"
+    + "    if m == \"map\" { return map{ ok: true }; }\n"
+    + "    return m == \"success\";\n"
+    + "}\n"
+    + "fn close_child_descriptor(fs, snap) {\n"
+    + "    state.child_closes = state.child_closes + 1; let m = state.close_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { return nil; }\n"
+    + "    if m == \"number\" { return 1; }\n"
+    + "    if m == \"map\" { return map{ ok: true }; }\n"
+    + "    return m == \"success\";\n"
+    + "}\n"
+    + "fn sealed_snapshot_file_descriptor(fs, name, max_bytes) {\n"
+    + "    state.snapshots = state.snapshots + 1; let m = state.op_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { return nil; }\n"
+    + "    if m == \"bad_size\" { return map{ ok: true, active: true, immutable: true, size: max_bytes + 5 }; }\n"
+    + "    if m == \"failure\" { return map{ ok: false, error: \"synthetic snapshot failure\" }; }\n"
+    + "    if m == \"object_error\" { return map{ ok: false, error: map{ kind: \"synthetic-snap\", code: 4 } }; }\n"
+    + "    return map{ ok: true, active: true, immutable: true, size: 5 };\n"
+    + "}\n"
+    + "fn private_root_status(fs) {\n"
+    + "    state.policy_checks = state.policy_checks + 1; let m = state.op_mode;\n"
+    + "    if state.test_policy {\n"
+    + "        if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "        if m == \"nil\" { return nil; }\n"
+    + "        if m == \"bad_ok\" { return map{ ok: 1 }; }\n"
+    + "        if m == \"failure\" or m == \"object_error\" { return map{ ok: false }; }\n"
+    + "    }\n"
+    + "    return map{ ok: true, owned_by_current_uid: true, mode: 448 };\n"
+    + "}\n"
+    + "fn copy_held_range_new_atomic(src_fs, snap, dst_fs, dst_name, offset, count, replace = false, executable = false) {\n"
+    + "    state.publishes = state.publishes + 1; let m = state.op_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { state.result = nil; return nil; }\n"
+    + "    if m == \"bad_ok\" { state.result = map{ ok: 1 }; return state.result; }\n"
+    + "    if m == \"failure\" { state.result = map{ ok: false, error: \"synthetic publish failure\" }; return state.result; }\n"
+    + "    if m == \"object_error\" { state.result = map{ ok: false, error: map{ kind: \"synthetic-pub\", code: 8 } }; return state.result; }\n"
+    + "    state.result = map{ ok: true, size: count, atomic: true, no_replace: true };\n"
+    + "    return state.result;\n"
+    + "}\n"
+    + "fn mkdir_new(fs, name, shared = false) {\n"
+    + "    state.mkdirs = state.mkdirs + 1; let m = state.op_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { return nil; }\n"
+    + "    if m == \"bad_ok\" { return map{ ok: \"yes\" }; }\n"
+    + "    if m == \"failure\" or m == \"object_error\" { return map{ ok: false, error: \"mkdir failed\" }; }\n"
+    + "    return map{ ok: true };\n"
+    + "}\n"
+    + "export state, configure, open, open_absolute, close, close_child_descriptor,\n"
+    + "    sealed_snapshot_file_descriptor, private_root_status, copy_held_range_new_atomic, mkdir_new;\n";
+
+fs_write(scratch + "/backend.sapp", backend_src);
+fs_write(scratch + "/semantic.sapp", semantic_raw);
+
+let cand_bound = str_replace_all(candidate_raw, "\"stdlib:", "\"" + stdlib_root);
+let base_bound = str_replace_all(baseline_raw, "\"stdlib:", "\"" + stdlib_root);
+
+let cand_model = _replace_once(
+    cand_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/cand_model.sapp", cand_model);
+
+let base_model = _replace_once(
+    base_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/base_model.sapp", base_model);
+
+let cand_real_throw = _replace_once(
+    _replace_once(
+        _replace_once(
+            _replace_once(
+                cand_bound,
+                "let snapshot = LinuxDirFS.sealed_snapshot_file_descriptor(fs, name, max_bytes);",
+                "if true { throw \"synthetic-private-value\"; } let snapshot = LinuxDirFS.sealed_snapshot_file_descriptor(fs, name, max_bytes);"
+            ),
+            "let result = LinuxDirFS.copy_held_range_new_atomic(reader.fs, reader.snapshot,",
+            "if true { throw \"synthetic-private-value\"; } let result = LinuxDirFS.copy_held_range_new_atomic(reader.fs, reader.snapshot,"
+        ),
+        "let created = try LinuxDirFS.mkdir_new(parent.fs, parent.name, false) catch nil;",
+        "let created = try (fn() { throw \"synthetic-private-value\"; })() catch nil;"
+    ),
+    "let policy = try LinuxDirFS.private_root_status(fs) catch nil;\n    let closed = try LinuxDirFS.close(fs) catch false;\n    if type(closed) != \"bool\" or not closed {\n        return map{ ok: false, ready: false,",
+    "let policy = try (fn() { throw \"synthetic-private-value\"; })() catch nil;\n    let closed = try LinuxDirFS.close(fs) catch false;\n    if type(closed) != \"bool\" or not closed {\n        return map{ ok: false, ready: false,"
+);
+fs_write(scratch + "/cand_real_throw.sapp", cand_real_throw);
+
+let base_real_throw = _replace_once(
+    _replace_once(
+        _replace_once(
+            _replace_once(
+                base_bound,
+                "let snapshot = LinuxDirFS.sealed_snapshot_file_descriptor(parent.fs,",
+                "if true { throw \"synthetic-private-value\"; } let snapshot = LinuxDirFS.sealed_snapshot_file_descriptor(parent.fs,"
+            ),
+            "let destination = _open_parent(output, false, private_parent);\n    if not destination.ok { return destination; }\n    let result = LinuxDirFS.copy_held_range_new_atomic(reader.fs, reader.snapshot,",
+            "let destination = _open_parent(output, false, private_parent);\n    if not destination.ok { return destination; }\n    if true { throw \"synthetic-private-value\"; } let result = LinuxDirFS.copy_held_range_new_atomic(reader.fs, reader.snapshot,"
+        ),
+        "let created = LinuxDirFS.mkdir_new(parent.fs, parent.name, false);",
+        "if true { throw \"synthetic-private-value\"; } let created = LinuxDirFS.mkdir_new(parent.fs, parent.name, false);"
+    ),
+    "let policy = LinuxDirFS.private_root_status(fs);\n    let closed = LinuxDirFS.close(fs);\n    if not policy.ok or not closed {",
+    "if true { throw \"synthetic-private-value\"; } let policy = LinuxDirFS.private_root_status(fs);\n    let closed = LinuxDirFS.close(fs);\n    if not policy.ok or not closed {"
+);
+fs_write(scratch + "/base_real_throw.sapp", base_real_throw);
+
+let cand_close_false = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); return false; }"
+);
+fs_write(scratch + "/cand_close_false.sapp", cand_close_false);
+
+let cand_close_throw = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/cand_close_throw.sapp", cand_close_throw);
+
+let B = import(scratch + "/backend.sapp");
+let SEM = import(scratch + "/semantic.sapp");
+let S_CAND_MODEL = import(scratch + "/cand_model.sapp");
+let S_BASE_MODEL = import(scratch + "/base_model.sapp");
+let S_CAND_REAL = import("stdlib:secure_file.sapp");
+let S_CAND_THROW = import(scratch + "/cand_real_throw.sapp");
+let S_BASE_THROW = import(scratch + "/base_real_throw.sapp");
+let S_CLOSE_FALSE = import(scratch + "/cand_close_false.sapp");
+let S_CLOSE_THROW = import(scratch + "/cand_close_throw.sapp");
+
+let rows = [];
+
+// Group 1: Candidate modeled matrix (180 matrix cases + 14 admission cases)
+let m_res = SEM.run(S_CAND_MODEL, B);
+assert(m_res.ok and m_res.matrix_cases == 180 and m_res.admission_cases == 14, "candidate modeled matrix passed");
+array_push(rows, map{ label: "candidate_modeled_matrix", passed: true, result: m_res });
+
+// Group 2: Unchanged baseline rejected by new semantic contract
+let base_rejected = try { SEM.run(S_BASE_MODEL, B); false } catch true;
+assert(base_rejected, "baseline source rejected by semantic ownership contract");
+array_push(rows, map{ label: "baseline_rejected_by_semantic_contract", passed: true, rejected: base_rejected });
+
+// Group 3: Real Linux open_immutable_reader, publish_immutable_reader_range(_private), create_private_directory_new, private_directory_status, and close_immutable_reader with FD delta 0
+let src_file = scratch + "/work/source.bin";
+assert(S_CAND_REAL.write_atomic(src_file, [10, 20, 30, 40, 50, 60], false, true).ok, "real source file written");
+let fd_before_normal = len(fs_listdir("/proc/self/fd"));
+let rdr = S_CAND_REAL.open_immutable_reader(src_file, 64, true);
+assert(rdr.ok and rdr.immutable and rdr.size == 6, "real open_immutable_reader");
+let pub1 = S_CAND_REAL.publish_immutable_reader_range(rdr, scratch + "/work/pub1.bin", 1, 4, true, false);
+assert(pub1.ok and S_CAND_REAL.read_bytes(scratch + "/work/pub1.bin", 16, true).bytes == [20, 30, 40, 50], "real publish_immutable_reader_range");
+let pdir = scratch + "/work/priv_out";
+let cpd = S_CAND_REAL.create_private_directory_new(pdir);
+assert(cpd.ok and cpd.owned_by_current_uid and cpd.mode == "700", "real create_private_directory_new");
+let pds = S_CAND_REAL.private_directory_status(pdir);
+assert(pds.ok and pds.ready and pds.mode == "700", "real private_directory_status");
+let pub2 = S_CAND_REAL.publish_immutable_reader_range_private(rdr, pdir + "/pub2.bin", 2, 3, false);
+assert(pub2.ok and pub2.private_parent_verified and S_CAND_REAL.read_bytes(pdir + "/pub2.bin", 16, true).bytes == [30, 40, 50], "real publish_immutable_reader_range_private");
+let cls = S_CAND_REAL.close_immutable_reader(rdr);
+assert(cls.ok and cls.snapshot_close_ok and cls.parent_close_ok, "real close_immutable_reader");
+let fd_delta_normal = len(fs_listdir("/proc/self/fd")) - fd_before_normal;
+assert(fd_delta_normal == 0, "zero fd delta on real immutable reader and private directory operations");
+array_push(rows, map{ label: "candidate_real_linux_immutable_and_private", passed: true, fd_delta: fd_delta_normal });
+
+// Group 4: Real Linux descriptor leak control under synthetic backend exceptions
+let live_rdr = S_CAND_REAL.open_immutable_reader(src_file, 64, true);
+assert(live_rdr.ok, "live reader opened for exception tests");
+let fd_before_cand_exc = len(fs_listdir("/proc/self/fd"));
+let cand_exc_count = 0;
+let cand_denied_count = 0;
+let k1 = 0;
+while k1 < 2 {
+    let ro = try S_CAND_THROW.open_immutable_reader(src_file, 64, true) catch { cand_exc_count = cand_exc_count + 1; nil };
+    if ro != nil {
+        assert(not ro.ok and ro.error == "immutable reader snapshot backend failed", "candidate open_immutable_reader exception redacted");
+        cand_denied_count = cand_denied_count + 1;
+    }
+    let rp = try S_CAND_THROW.publish_immutable_reader_range(live_rdr, scratch + "/work/exc_pub.bin", 0, 2, true, false) catch { cand_exc_count = cand_exc_count + 1; nil };
+    if rp != nil {
+        assert(not rp.ok and rp.error == "immutable reader publication backend failed", "candidate publish exception redacted");
+        cand_denied_count = cand_denied_count + 1;
+    }
+    let rc = try S_CAND_THROW.create_private_directory_new(scratch + "/work/exc_dir_" + str(k1)) catch { cand_exc_count = cand_exc_count + 1; nil };
+    if rc != nil {
+        assert(not rc.ok and rc.error == "private directory must be newly created", "candidate create_private_directory_new exception redacted");
+        cand_denied_count = cand_denied_count + 1;
+    }
+    let rs = try S_CAND_THROW.private_directory_status(pdir) catch { cand_exc_count = cand_exc_count + 1; nil };
+    if rs != nil {
+        assert(not rs.ok and not rs.ready and rs.reason == "private-directory-ownership-or-mode-unverified", "candidate private_directory_status exception redacted");
+        cand_denied_count = cand_denied_count + 1;
+    }
+    k1 = k1 + 1;
+}
+let fd_delta_cand_exc = len(fs_listdir("/proc/self/fd")) - fd_before_cand_exc;
+assert(cand_exc_count == 0 and cand_denied_count == 8 and fd_delta_cand_exc == 0, "candidate closes parent/root descriptors on exceptions");
+array_push(rows, map{ label: "candidate_real_exception_zero_fd_leak", passed: true, exceptions: cand_exc_count, denied: cand_denied_count, fd_delta: fd_delta_cand_exc });
+
+// Group 5: Baseline real Linux descriptor leak demonstration under identical synthetic backend exceptions
+let fd_before_base_exc = len(fs_listdir("/proc/self/fd"));
+let base_exc_count = 0;
+let k2 = 0;
+while k2 < 2 {
+    try { S_BASE_THROW.open_immutable_reader(src_file, 64, true); } catch { base_exc_count = base_exc_count + 1; }
+    try { S_BASE_THROW.publish_immutable_reader_range(live_rdr, scratch + "/work/exc_pub.bin", 0, 2, true, false); } catch { base_exc_count = base_exc_count + 1; }
+    try { S_BASE_THROW.create_private_directory_new(scratch + "/work/exc_dir_" + str(k2)); } catch { base_exc_count = base_exc_count + 1; }
+    try { S_BASE_THROW.private_directory_status(pdir); } catch { base_exc_count = base_exc_count + 1; }
+    k2 = k2 + 1;
+}
+let fd_delta_base_exc = len(fs_listdir("/proc/self/fd")) - fd_before_base_exc;
+assert(base_exc_count == 8 and fd_delta_base_exc == 8, "baseline leaks +8 descriptors on 8 immutable/private exceptions");
+array_push(rows, map{ label: "baseline_real_exception_leaks_8_fds", passed: true, exceptions: base_exc_count, fd_delta: fd_delta_base_exc });
+
+// Group 6: Real close followed by synthetic false / throw reports cleanup_uncertain with FD delta 0
+let fd_before_close_proj = len(fs_listdir("/proc/self/fd"));
+let pf = S_CLOSE_FALSE.publish_immutable_reader_range(live_rdr, scratch + "/work/proj_pub1.bin", 0, 2, true, false);
+assert(not pf.ok and pf.cleanup_uncertain and not pf.parent_close_confirmed
+    and pf.publish_backend_succeeded and pf.publication_may_have_occurred, "publish close false projection");
+let pt = S_CLOSE_THROW.publish_immutable_reader_range_private(live_rdr, pdir + "/proj_pub2.bin", 0, 2, false);
+assert(not pt.ok and pt.cleanup_uncertain and not pt.parent_close_confirmed
+    and pt.publish_backend_succeeded and pt.publication_may_have_occurred
+    and not map_has(pt, "private_parent_verified"), "private publish close throw projection");
+let cf = S_CLOSE_FALSE.create_private_directory_new(scratch + "/work/proj_dir1");
+assert(not cf.ok and cf.cleanup_uncertain and not cf.parent_close_confirmed
+    and cf.mkdir_backend_succeeded and cf.creation_may_have_occurred, "create_private_directory_new close false projection");
+let fd_delta_close_proj = len(fs_listdir("/proc/self/fd")) - fd_before_close_proj;
+assert(fd_delta_close_proj == 0, "zero fd delta on post-close projection tests");
+assert(S_CAND_REAL.close_immutable_reader(live_rdr).ok, "live reader closed cleanly");
+array_push(rows, map{ label: "candidate_real_close_uncertainty_projection", passed: true, checks: 3, fd_delta: fd_delta_close_proj });
+
+let report = map{
+    passed: true,
+    runner: "tests/tooling/secure_file_immutable_private_cleanup_check.sapp",
+    language: "PBLang",
+    source_sha256: SHA256.sha256_hex(candidate_raw),
+    baseline_sha256: SHA256.sha256_hex(baseline_raw),
+    semantic_sha256: SHA256.sha256_hex(semantic_raw),
+    groups_passed: len(rows),
+    rows: rows
+};
+fs_write(report_path, json_stringify(report) + "\n");
+print json_stringify(report);
