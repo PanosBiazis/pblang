@@ -1,0 +1,253 @@
+// Counted resource-free backend; tests open_immutable_reader, close_immutable_reader,
+// publish_immutable_reader_range, publish_immutable_reader_range_private,
+// create_private_directory_new, and private_directory_status parent/root ownership,
+// single close, exception redaction, reply validation, and admission boundaries.
+fn _assert_open_reader(S, res, B, snap_mode, close_mode) {
+    assert(B.state.opens == 1 and B.state.snapshots == 1,
+        "open_immutable_reader acquires parent and requests snapshot once");
+    if snap_mode == "success" {
+        assert(res.ok and res.active and res.immutable and res.size == 5
+            and B.state.closes == 0 and B.state.child_closes == 0,
+            "successful immutable reader retains open parent and snapshot");
+        let closed = S.close_immutable_reader(res);
+        let close_ok = close_mode == "success";
+        assert(B.state.child_closes == 1 and B.state.closes == 1
+            and closed.closed and closed.ownership_consumed and not closed.retryable
+            and closed.ok == close_ok and closed.snapshot_close_ok == close_ok
+            and closed.parent_close_ok == close_ok,
+            "close_immutable_reader closes child and parent once with boolean confirmation");
+        return nil;
+    }
+    assert(B.state.closes == 1 and not res.ok,
+        "failed open_immutable_reader closes parent once");
+    if snap_mode == "bad_size" {
+        assert(B.state.child_closes == 1, "invalid active snapshot closes child descriptor");
+    }
+    if close_mode != "success" {
+        assert(res.cleanup_uncertain and not res.parent_close_confirmed,
+            "unconfirmed parent close marks cleanup_uncertain on open_immutable_reader");
+    } else {
+        assert(not map_has(res, "cleanup_uncertain"),
+            "confirmed parent close does not mark cleanup_uncertain");
+    }
+    if snap_mode == "failure" {
+        assert(res.error == "synthetic snapshot failure", "snapshot failure preserved");
+    } elif snap_mode == "object_error" {
+        assert(res.error == map{ kind: "synthetic-snap", code: 4 }, "structured snapshot error preserved");
+    } elif snap_mode == "throw" {
+        assert(res.error == "immutable reader snapshot backend failed", "snapshot exception redacted");
+    } else {
+        assert(res.error == "immutable reader snapshot result is invalid", "invalid snapshot rejected");
+    }
+    assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+        "thrown value never escapes open_immutable_reader");
+}
+
+fn _assert_publish(res, B, is_private, pub_mode, close_mode) {
+    assert(B.state.opens == 1 and B.state.publishes == 1 and B.state.closes == 1,
+        "range publication acquires destination parent, publishes once, and closes once");
+    if is_private {
+        assert(B.state.policy_checks == 1, "private publication checks private_root_status once");
+    }
+    if is_map(B.state.result) {
+        assert(not map_has(B.state.result, "private_parent_verified")
+            and not map_has(B.state.result, "cleanup_uncertain"),
+            "backend publication map is never mutated in place");
+    }
+    let close_msg = if is_private {
+        "private immutable reader publication parent cleanup could not be verified"
+    } else {
+        "immutable reader publication parent cleanup could not be verified"
+    };
+    let throw_msg = if is_private {
+        "private immutable reader publication backend failed"
+    } else {
+        "immutable reader publication backend failed"
+    };
+    let invalid_msg = if is_private {
+        "private immutable reader publication result is invalid"
+    } else {
+        "immutable reader publication result is invalid"
+    };
+    if close_mode != "success" {
+        assert(not res.ok and res.cleanup_uncertain and not res.parent_close_confirmed,
+            "unconfirmed destination parent close rejects publication");
+        assert(not map_has(res, "private_parent_verified"),
+            "unconfirmed close never claims private_parent_verified");
+        if pub_mode == "success" {
+            assert(res.publish_backend_succeeded and res.publication_may_have_occurred
+                and res.error == close_msg and res.size == 4,
+                "successful backend publication noted under cleanup uncertainty");
+        } elif pub_mode == "failure" {
+            assert(res.error == "synthetic publish failure"
+                and not map_has(res, "publish_backend_succeeded"),
+                "backend publish failure retained");
+        } elif pub_mode == "object_error" {
+            assert(res.error == map{ kind: "synthetic-pub", code: 8 }
+                and not map_has(res, "publish_backend_succeeded"),
+                "structured publish error retained");
+        } elif pub_mode == "throw" {
+            assert(res.error == throw_msg and not map_has(res, "publish_backend_succeeded"),
+                "redacted publish exception retained");
+        } else {
+            assert(res.error == invalid_msg and not map_has(res, "publish_backend_succeeded"),
+                "invalid publish reply diagnostic retained");
+        }
+    } elif pub_mode == "success" {
+        assert(res.ok and res.size == 4 and res.atomic, "confirmed close preserves publish success");
+        if is_private {
+            assert(res.private_parent_verified and res.parent_owned_by_current_uid
+                and res.parent_mode == "700",
+                "private publication attaches private parent metadata on fresh copy");
+        } else {
+            assert(res == B.state.result, "non-private publication returns backend result");
+        }
+    } elif pub_mode == "failure" {
+        assert(not res.ok and res.error == "synthetic publish failure", "publish failure preserved");
+    } elif pub_mode == "object_error" {
+        assert(not res.ok and res.error == map{ kind: "synthetic-pub", code: 8 }, "structured error preserved");
+    } elif pub_mode == "throw" {
+        assert(not res.ok and res.error == throw_msg, "publish exception redacted");
+    } else {
+        assert(not res.ok and res.error == invalid_msg, "invalid publish result rejected");
+    }
+    assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+        "thrown value never escapes range publication");
+}
+
+fn _assert_create_private_dir(res, B, op_mode, close_mode) {
+    if close_mode != "success" {
+        assert(B.state.opens == 1 and B.state.mkdirs == 1 and B.state.closes == 1,
+            "unconfirmed parent close stops before reopening directory");
+        assert(not res.ok and res.cleanup_uncertain and not res.parent_close_confirmed
+            and res.error == "private directory parent cleanup could not be verified",
+            "unconfirmed parent close reports cleanup_uncertain on create_private_directory_new");
+        if op_mode == "success" {
+            assert(res.mkdir_backend_succeeded and res.creation_may_have_occurred,
+                "successful mkdir noted under parent cleanup uncertainty");
+        } else {
+            assert(not map_has(res, "mkdir_backend_succeeded"),
+                "failed mkdir does not claim mkdir_backend_succeeded");
+        }
+    } elif op_mode == "success" {
+        assert(B.state.opens == 2 and B.state.mkdirs == 1 and B.state.policy_checks == 1
+            and B.state.closes == 2 and res.ok and res.created and res.exclusive_create
+            and res.owned_by_current_uid and res.mode == "700",
+            "create_private_directory_new closes both parent and verification handle");
+    } else {
+        assert(B.state.opens == 1 and B.state.mkdirs == 1 and B.state.closes == 1
+            and not res.ok and res.error == "private directory must be newly created",
+            "failed mkdir closes parent once and rejects creation");
+    }
+    assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+        "thrown value never escapes create_private_directory_new");
+}
+
+fn _assert_private_dir_status(res, B, op_mode, close_mode) {
+    assert(B.state.opens == 1 and B.state.policy_checks == 1 and B.state.closes == 1,
+        "private_directory_status opens, checks policy, and closes once");
+    if close_mode != "success" {
+        assert(not res.ok and not res.ready and res.cleanup_uncertain
+            and not res.root_close_confirmed
+            and res.reason == "private-directory-cleanup-unverified",
+            "unconfirmed close rejects private_directory_status");
+    } elif op_mode == "success" {
+        assert(res.ok and res.ready and res.reason == "verified"
+            and res.owned_by_current_uid and res.mode == "700",
+            "confirmed close and valid policy verify private directory");
+    } else {
+        assert(not res.ok and not res.ready
+            and res.reason == "private-directory-ownership-or-mode-unverified",
+            "invalid or throwing policy rejects private_directory_status after close");
+    }
+    assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+        "thrown value never escapes private_directory_status");
+}
+
+fn run(S, B) {
+    let cases = 0;
+    let snap_modes = ["success", "failure", "object_error", "throw", "nil", "bad_size"];
+    let pub_modes = ["success", "failure", "object_error", "throw", "nil", "bad_ok"];
+    let closes = ["success", "false", "nil", "number", "map", "throw"];
+
+    for snap_mode in snap_modes {
+        for close_mode in closes {
+            B.configure(snap_mode, close_mode);
+            let res = S.open_immutable_reader("/owned/source.bin", 64, false);
+            _assert_open_reader(S, res, B, snap_mode, close_mode);
+            cases = cases + 1;
+        }
+    }
+
+    B.configure("success", "success");
+    let valid_reader = S.open_immutable_reader("/owned/source.bin", 64, false);
+    assert(valid_reader.ok, "fixture reader opened");
+
+    for is_private in [false, true] {
+        for pub_mode in pub_modes {
+            for close_mode in closes {
+                B.configure(pub_mode, close_mode);
+                let res = if is_private {
+                    S.publish_immutable_reader_range_private(valid_reader, "/owned/out.bin", 0, 4, false)
+                } else {
+                    S.publish_immutable_reader_range(valid_reader, "/owned/out.bin", 0, 4, false, false)
+                };
+                _assert_publish(res, B, is_private, pub_mode, close_mode);
+                cases = cases + 1;
+            }
+        }
+    }
+
+    for op_mode in pub_modes {
+        for close_mode in closes {
+            B.configure(op_mode, close_mode);
+            let res = S.create_private_directory_new("/owned/privdir");
+            _assert_create_private_dir(res, B, op_mode, close_mode);
+            cases = cases + 1;
+        }
+    }
+
+    for op_mode in pub_modes {
+        for close_mode in closes {
+            B.configure(op_mode, close_mode);
+            B.state.test_policy = true;
+            let res = S.private_directory_status("/owned/privdir");
+            _assert_private_dir_status(res, B, op_mode, close_mode);
+            cases = cases + 1;
+        }
+    }
+
+    B.configure("success", "success");
+    assert(not S.open_immutable_reader("/owned/source.bin", 0, false).ok, "reject 0 max_bytes");
+    assert(not S.open_immutable_reader("/owned/source.bin", -1, false).ok, "reject negative max_bytes");
+    assert(not S.open_immutable_reader("", 16, false).ok, "reject empty reader path");
+    assert(not S.publish_immutable_reader_range(map{ ok: false }, "/owned/out.bin", 0, 4).ok, "reject invalid reader");
+    assert(not S.publish_immutable_reader_range(valid_reader, "", 0, 4).ok, "reject empty publish path");
+    assert(not S.publish_immutable_reader_range_private(valid_reader, "", 0, 4).ok, "reject empty private publish path");
+    assert(not S.create_private_directory_new("").ok, "reject empty private directory path");
+    assert(not S.create_private_directory_new("/").ok, "reject root private directory path");
+    assert(not S.private_directory_status("relative/path").ok, "reject relative private_directory_status");
+    assert(not S.close_immutable_reader(map{ ok: true }).ok, "reject invalid close_immutable_reader handle");
+    assert(B.state.opens == 0 and B.state.closes == 0, "argument validation acquires nothing");
+
+    for denied_op in ["open_reader", "publish", "publish_private", "create_dir"] {
+        B.configure("success", "success");
+        B.state.admit = false;
+        let denied = nil;
+        if denied_op == "open_reader" {
+            denied = S.open_immutable_reader("/owned/source.bin", 64, false);
+        } elif denied_op == "publish" {
+            denied = S.publish_immutable_reader_range(valid_reader, "/owned/out.bin", 0, 4, false, false);
+        } elif denied_op == "publish_private" {
+            denied = S.publish_immutable_reader_range_private(valid_reader, "/owned/out.bin", 0, 4, false);
+        } else {
+            denied = S.create_private_directory_new("/owned/privdir");
+        }
+        assert(not denied.ok and B.state.opens == 1 and B.state.closes == 0,
+            "unacquired parent never operated on or closed");
+    }
+
+    return map{ ok: true, matrix_cases: cases, admission_cases: 14 };
+}
+
+export run;

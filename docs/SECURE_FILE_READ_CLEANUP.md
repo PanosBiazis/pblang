@@ -146,3 +146,34 @@ that verifies 144 modeled write/remove/close combinations, 12 admission cases,
 baseline rejection, real Linux atomic writes and removals, real descriptor leak
 elimination (`0` vs baseline `+6`) on synthetic backend exceptions, and post-close
 uncertainty projection.
+
+## Immutable readers and private directories
+
+`open_immutable_reader`, `close_immutable_reader`, `publish_immutable_reader_range`,
+`publish_immutable_reader_range_private`, `publish_immutable_reader_range_private_temp`,
+`create_private_directory_new`, `_temporary_container_status`, and `private_directory_status`
+now enforce single-close parent/root cleanup, catchable backend exception redaction,
+and reply validation:
+- `open_immutable_reader` validates that a successful snapshot reply is a map with
+  boolean `ok:true`, `active:true`, `immutable:true`, and an integer `size` within
+  `[0, max_bytes]`. If snapshot creation fails, throws, or returns an invalid shape,
+  the acquired parent handle is closed once (`parent_close_confirmed:false` and
+  `cleanup_uncertain:true` when parent close is not boolean `true`).
+- `close_immutable_reader` requires boolean `true` from both `close_child_descriptor`
+  and `close` before reporting `ok:true`, `snapshot_close_ok:true`, and
+  `parent_close_ok:true`.
+- `publish_immutable_reader_range` and `publish_immutable_reader_range_private`
+  close their acquired destination parent handle once after normal return or
+  catchable backend exception, never mutate backend maps in place, and report
+  `publish_backend_succeeded:true` and `publication_may_have_occurred:true` when
+  backend publication succeeded before an unconfirmed parent close.
+- `create_private_directory_new`, `_temporary_container_status`, and
+  `private_directory_status` wrap post-acquisition backend calls in `try ... catch`
+  and verify boolean `true` on every parent/root close.
+
+`tests/tooling/secure_file_immutable_private_cleanup_check.sapp` is a native PBLang
+qualification runner (`pblang run --allow-all tests/tooling/secure_file_immutable_private_cleanup_check.sapp -- --baseline-source <path> --report <path>`)
+that verifies 180 modeled immutable/private/close combinations, 14 admission cases,
+baseline rejection, real Linux immutable reader and private directory operations,
+real descriptor leak elimination (`0` vs baseline `+8`) on synthetic backend
+exceptions, and post-close uncertainty projection.
