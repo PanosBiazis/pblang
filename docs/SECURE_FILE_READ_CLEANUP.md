@@ -112,3 +112,37 @@ qualification runner (`pblang run --allow-all tests/tooling/secure_file_list_dir
 that verifies 156 modeled list/close combinations, 16 admission cases, baseline
 rejection, real Linux directory listings, real descriptor leak elimination on
 synthetic listing exceptions, and post-close uncertainty projection.
+
+## Atomic writes and entry removals
+
+`write_atomic`, `write_text_atomic`, `remove`, and `remove_file` now close their
+successfully acquired parent handle (`parent.fs`) exactly once, including catchable
+backend operation and reply-validation failures. Only boolean `true` confirms that
+close. Every other close result or catchable close exception returns `ok:false`,
+`cleanup_uncertain:true`, and `parent_close_confirmed:false` without retrying close.
+Catchable backend exceptions become fixed diagnostics (`secure atomic write backend failed`,
+`secure remove backend failed`, `secure file remove backend failed`) after a confirmed
+close. Malformed non-map or non-boolean-`ok` backend replies fail closed with fixed
+invalid-result diagnostics (`secure atomic write result is invalid`,
+`secure remove result is invalid`, `secure file remove result is invalid`).
+
+When the backend operation succeeded (`ok:true`) before an unconfirmed parent close:
+- `write_atomic` and `write_text_atomic` return `ok:false`,
+  `error:"secure atomic-write parent cleanup could not be verified"`,
+  `cleanup_uncertain:true`, `parent_close_confirmed:false`,
+  `write_backend_succeeded:true`, and `publication_may_have_occurred:true`, while
+  retaining non-`ok` metadata without mutating the backend map.
+- `remove` and `remove_file` return `ok:false`, fixed cleanup diagnostics
+  (`secure remove parent cleanup could not be verified` or
+  `secure file remove parent cleanup could not be verified`), `cleanup_uncertain:true`,
+  `parent_close_confirmed:false`, `remove_backend_succeeded:true`, and
+  `removal_may_have_occurred:true`. `remove_file` attaches `namespace_absent:true`
+  and `absence_evidence:"descriptor-held file-only unlink"` on a fresh copy only when
+  both backend removal and parent close succeed.
+
+`tests/tooling/secure_file_remove_write_cleanup_check.sapp` is a native PBLang
+qualification runner (`pblang run --allow-all tests/tooling/secure_file_remove_write_cleanup_check.sapp -- --baseline-source <path> --report <path>`)
+that verifies 144 modeled write/remove/close combinations, 12 admission cases,
+baseline rejection, real Linux atomic writes and removals, real descriptor leak
+elimination (`0` vs baseline `+6`) on synthetic backend exceptions, and post-close
+uncertainty projection.

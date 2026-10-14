@@ -1,0 +1,277 @@
+// Pure PBLang qualification runner for secure_file write_atomic, write_text_atomic,
+// remove, and remove_file parent ownership, single-close, exception redaction,
+// reply validation, and Linux FD leak verification.
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _replace_once(source, needle, replacement) {
+    let parts = str_split(source, needle);
+    assert(len(parts) == 2, "expected exactly one occurrence of needle");
+    return parts[0] + replacement + parts[1];
+}
+
+let raw_args = os_args();
+let baseline_path = "";
+let report_path = "";
+let i = 0;
+while i < len(raw_args) {
+    if raw_args[i] == "--baseline-source" and i + 1 < len(raw_args) {
+        baseline_path = raw_args[i + 1];
+    }
+    if raw_args[i] == "--report" and i + 1 < len(raw_args) {
+        report_path = raw_args[i + 1];
+    }
+    i = i + 1;
+}
+if baseline_path == "" or report_path == "" {
+    throw "usage: pblang run --allow-all tests/tooling/secure_file_remove_write_cleanup_check.sapp -- --baseline-source <path> --report <path>";
+}
+
+let stdlib_root = cwd() + "/stdlib/";
+let candidate_raw = fs_read("stdlib/secure_file.sapp");
+let baseline_raw = fs_read(baseline_path);
+let semantic_raw = fs_read("tests/semantics/secure_file_remove_write_cleanup_test.sapp");
+
+let scratch = "/tmp/pblang-remove-write-qual-" + str(num_floor(now_ms()));
+assert(SECURE.create_private_temporary_directory_new(scratch).ok, "private temporary qualification directory created");
+assert(SECURE.create_private_directory_new(scratch + "/work").ok, "private work subdirectory created");
+
+let backend_src = "let state = map{};\n"
+    + "fn configure(op_mode, close_mode) {\n"
+    + "    state.op_mode = op_mode; state.close_mode = close_mode;\n"
+    + "    state.opens = 0; state.atomic_writes = 0; state.removes = 0; state.closes = 0;\n"
+    + "    state.admit = true; state.bytes = nil; state.create = nil;\n"
+    + "    state.file_only = false; state.result = nil;\n"
+    + "}\n"
+    + "fn open(path, create = false, protect = false) {\n"
+    + "    state.opens = state.opens + 1;\n"
+    + "    return if state.admit { map{ ok: true } } else { map{ ok: false, error: \"admission denied\" } };\n"
+    + "}\n"
+    + "fn open_absolute(path, create = false, protect = false) { return open(path, create, protect); }\n"
+    + "fn close(fs) {\n"
+    + "    state.closes = state.closes + 1; let m = state.close_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { return nil; }\n"
+    + "    if m == \"number\" { return 1; }\n"
+    + "    if m == \"map\" { return map{ ok: true }; }\n"
+    + "    return m == \"success\";\n"
+    + "}\n"
+    + "fn write_atomic(fs, name, bytes, create = false) {\n"
+    + "    state.atomic_writes = state.atomic_writes + 1;\n"
+    + "    state.bytes = bytes; state.create = create;\n"
+    + "    let m = state.op_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { state.result = nil; return nil; }\n"
+    + "    if m == \"bad_ok\" { state.result = map{ ok: 1 }; return state.result; }\n"
+    + "    if m == \"failure\" {\n"
+    + "        state.result = map{ ok: false, error: \"synthetic atomic failure\", marker: 19 };\n"
+    + "        return state.result;\n"
+    + "    }\n"
+    + "    if m == \"object_error\" {\n"
+    + "        state.result = map{ ok: false, error: map{ kind: \"synthetic-atomic\", code: 9 } };\n"
+    + "        return state.result;\n"
+    + "    }\n"
+    + "    state.result = map{ ok: true, size: len(bytes), atomic: true, extra: map{ value: 7 } };\n"
+    + "    return state.result;\n"
+    + "}\n"
+    + "fn _do_remove(name, file_only) {\n"
+    + "    state.removes = state.removes + 1; state.file_only = file_only;\n"
+    + "    let m = state.op_mode;\n"
+    + "    if m == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if m == \"nil\" { state.result = nil; return nil; }\n"
+    + "    if m == \"bad_ok\" { state.result = map{ ok: \"yes\" }; return state.result; }\n"
+    + "    if m == \"failure\" {\n"
+    + "        state.result = map{ ok: false, error: \"synthetic remove failure\", marker: 23 };\n"
+    + "        return state.result;\n"
+    + "    }\n"
+    + "    if m == \"object_error\" {\n"
+    + "        state.result = map{ ok: false, error: map{ kind: \"synthetic-remove\", code: 11 } };\n"
+    + "        return state.result;\n"
+    + "    }\n"
+    + "    if file_only {\n"
+    + "        state.result = map{ ok: true, path: name, directory_removal: false,\n"
+    + "            descriptor_bound_parent: true, symlink_target_followed: false };\n"
+    + "    } else {\n"
+    + "        state.result = map{ ok: true, path: name };\n"
+    + "    }\n"
+    + "    return state.result;\n"
+    + "}\n"
+    + "fn remove(fs, name) { return _do_remove(name, false); }\n"
+    + "fn remove_file(fs, name) { return _do_remove(name, true); }\n"
+    + "export state, configure, open, open_absolute, close, write_atomic, remove, remove_file;\n";
+
+fs_write(scratch + "/backend.sapp", backend_src);
+fs_write(scratch + "/semantic.sapp", semantic_raw);
+
+let cand_bound = str_replace_all(candidate_raw, "\"stdlib:", "\"" + stdlib_root);
+let base_bound = str_replace_all(baseline_raw, "\"stdlib:", "\"" + stdlib_root);
+
+let cand_model = _replace_once(
+    cand_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/cand_model.sapp", cand_model);
+
+let base_model = _replace_once(
+    base_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/base_model.sapp", base_model);
+
+let cand_real_throw = _replace_once(
+    _replace_once(
+        _replace_once(
+            cand_bound,
+            "if platform() == \"linux\" { return LinuxDirFS.write_atomic(fs, name, bytes, false); }",
+            "if platform() == \"linux\" { throw \"synthetic-private-value\"; }"
+        ),
+        "if platform() == \"linux\" { return LinuxDirFS.remove_file(fs, name); }",
+        "if platform() == \"linux\" { throw \"synthetic-private-value\"; }"
+    ),
+    "if platform() == \"linux\" { return LinuxDirFS.remove(fs, name); }",
+    "if platform() == \"linux\" { throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/cand_real_throw.sapp", cand_real_throw);
+
+let base_real_throw = _replace_once(
+    _replace_once(
+        _replace_once(
+            base_bound,
+            "if platform() == \"linux\" { return LinuxDirFS.write_atomic(fs, name, bytes, false); }",
+            "if platform() == \"linux\" { throw \"synthetic-private-value\"; }"
+        ),
+        "if platform() == \"linux\" { return LinuxDirFS.remove_file(fs, name); }",
+        "if platform() == \"linux\" { throw \"synthetic-private-value\"; }"
+    ),
+    "result = LinuxDirFS.remove(opened_parent.fs, opened_parent.name);",
+    "throw \"synthetic-private-value\";"
+);
+fs_write(scratch + "/base_real_throw.sapp", base_real_throw);
+
+let cand_close_false = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); return false; }"
+);
+fs_write(scratch + "/cand_close_false.sapp", cand_close_false);
+
+let cand_close_throw = _replace_once(
+    cand_bound,
+    "if platform() == \"linux\" { return LinuxDirFS.close(fs); }",
+    "if platform() == \"linux\" { LinuxDirFS.close(fs); throw \"synthetic-private-value\"; }"
+);
+fs_write(scratch + "/cand_close_throw.sapp", cand_close_throw);
+
+let B = import(scratch + "/backend.sapp");
+let SEM = import(scratch + "/semantic.sapp");
+let S_CAND_MODEL = import(scratch + "/cand_model.sapp");
+let S_BASE_MODEL = import(scratch + "/base_model.sapp");
+let S_CAND_REAL = import("stdlib:secure_file.sapp");
+let S_CAND_THROW = import(scratch + "/cand_real_throw.sapp");
+let S_BASE_THROW = import(scratch + "/base_real_throw.sapp");
+let S_CLOSE_FALSE = import(scratch + "/cand_close_false.sapp");
+let S_CLOSE_THROW = import(scratch + "/cand_close_throw.sapp");
+
+let rows = [];
+
+// Group 1: Candidate modeled matrix (144 matrix cases + 12 admission cases)
+let m_res = SEM.run(S_CAND_MODEL, B);
+assert(m_res.ok and m_res.matrix_cases == 144 and m_res.admission_cases == 12, "candidate modeled matrix passed");
+array_push(rows, map{ label: "candidate_modeled_matrix", passed: true, result: m_res });
+
+// Group 2: Unchanged baseline rejected by new semantic contract
+let base_rejected = try { SEM.run(S_BASE_MODEL, B); false } catch true;
+assert(base_rejected, "baseline source rejected by semantic ownership contract");
+array_push(rows, map{ label: "baseline_rejected_by_semantic_contract", passed: true, rejected: base_rejected });
+
+// Group 3: Real Linux write_atomic, write_text_atomic, remove_file, and remove with FD delta 0
+let fd_before_normal = len(fs_listdir("/proc/self/fd"));
+let f1 = scratch + "/work/atomic1.txt";
+let f2 = scratch + "/work/atomic2.bin";
+let w1 = S_CAND_REAL.write_text_atomic(f1, "δοκιμή", false, true);
+assert(w1.ok and S_CAND_REAL.read_text(f1, 32, true).text == "δοκιμή", "real write_text_atomic");
+let w2 = S_CAND_REAL.write_atomic(f2, [1, 2, 3, 4], false, true);
+assert(w2.ok and S_CAND_REAL.read_bytes(f2, 16, true).bytes == [1, 2, 3, 4], "real write_atomic");
+let rf1 = S_CAND_REAL.remove_file(f1, true);
+assert(rf1.ok and rf1.namespace_absent and rf1.absence_evidence == "descriptor-held file-only unlink", "real remove_file");
+assert(not S_CAND_REAL.remove_file(f1, true).ok, "second remove_file rejected");
+let rm2 = S_CAND_REAL.remove(f2, true);
+assert(rm2.ok and not map_has(rm2, "namespace_absent"), "real remove");
+let fd_delta_normal = len(fs_listdir("/proc/self/fd")) - fd_before_normal;
+assert(fd_delta_normal == 0, "zero fd delta on real normal write/remove operations");
+array_push(rows, map{ label: "candidate_real_linux_write_and_remove", passed: true, fd_delta: fd_delta_normal });
+
+// Group 4: Real Linux descriptor leak control under synthetic backend exceptions (write_atomic, remove, remove_file)
+let fd_before_cand_exc = len(fs_listdir("/proc/self/fd"));
+let cand_exc_count = 0;
+let cand_denied_count = 0;
+let k1 = 0;
+while k1 < 2 {
+    let rw = try S_CAND_THROW.write_text_atomic(scratch + "/work/exc.txt", "x", false, true) catch { cand_exc_count = cand_exc_count + 1; nil };
+    if rw != nil {
+        assert(not rw.ok and rw.error == "secure atomic write backend failed", "candidate write_atomic exception redacted");
+        cand_denied_count = cand_denied_count + 1;
+    }
+    let rr = try S_CAND_THROW.remove(scratch + "/work/exc.txt", true) catch { cand_exc_count = cand_exc_count + 1; nil };
+    if rr != nil {
+        assert(not rr.ok and rr.error == "secure remove backend failed", "candidate remove exception redacted");
+        cand_denied_count = cand_denied_count + 1;
+    }
+    let rrf = try S_CAND_THROW.remove_file(scratch + "/work/exc.txt", true) catch { cand_exc_count = cand_exc_count + 1; nil };
+    if rrf != nil {
+        assert(not rrf.ok and rrf.error == "secure file remove backend failed" and not map_has(rrf, "namespace_absent"), "candidate remove_file exception redacted");
+        cand_denied_count = cand_denied_count + 1;
+    }
+    k1 = k1 + 1;
+}
+let fd_delta_cand_exc = len(fs_listdir("/proc/self/fd")) - fd_before_cand_exc;
+assert(cand_exc_count == 0 and cand_denied_count == 6 and fd_delta_cand_exc == 0, "candidate closes parent descriptor on write/remove exceptions");
+array_push(rows, map{ label: "candidate_real_exception_zero_fd_leak", passed: true, exceptions: cand_exc_count, denied: cand_denied_count, fd_delta: fd_delta_cand_exc });
+
+// Group 5: Baseline real Linux descriptor leak demonstration under identical synthetic backend exceptions
+let fd_before_base_exc = len(fs_listdir("/proc/self/fd"));
+let base_exc_count = 0;
+let k2 = 0;
+while k2 < 2 {
+    try { S_BASE_THROW.write_text_atomic(scratch + "/work/exc.txt", "x", false, true); } catch { base_exc_count = base_exc_count + 1; }
+    try { S_BASE_THROW.remove(scratch + "/work/exc.txt", true); } catch { base_exc_count = base_exc_count + 1; }
+    try { S_BASE_THROW.remove_file(scratch + "/work/exc.txt", true); } catch { base_exc_count = base_exc_count + 1; }
+    k2 = k2 + 1;
+}
+let fd_delta_base_exc = len(fs_listdir("/proc/self/fd")) - fd_before_base_exc;
+assert(base_exc_count == 6 and fd_delta_base_exc == 6, "baseline leaks +6 parent descriptors on 6 write/remove exceptions");
+array_push(rows, map{ label: "baseline_real_exception_leaks_6_fds", passed: true, exceptions: base_exc_count, fd_delta: fd_delta_base_exc });
+
+// Group 6: Real close followed by synthetic false / throw reports cleanup_uncertain with FD delta 0
+let fd_before_close_proj = len(fs_listdir("/proc/self/fd"));
+let wf = S_CLOSE_FALSE.write_text_atomic(scratch + "/work/proj1.txt", "hello", false, false);
+assert(not wf.ok and wf.cleanup_uncertain and not wf.parent_close_confirmed
+    and wf.write_backend_succeeded and wf.publication_may_have_occurred, "write_atomic close false projection");
+let rff = S_CLOSE_FALSE.remove_file(scratch + "/work/proj1.txt", false);
+assert(not rff.ok and rff.cleanup_uncertain and not rff.parent_close_confirmed
+    and rff.remove_backend_succeeded and rff.removal_may_have_occurred
+    and not map_has(rff, "namespace_absent"), "remove_file close false projection");
+let wt = S_CLOSE_THROW.write_text_atomic(scratch + "/work/proj2.txt", "world", false, false);
+assert(not wt.ok and wt.cleanup_uncertain and not wt.parent_close_confirmed
+    and wt.write_backend_succeeded and wt.publication_may_have_occurred, "write_atomic close throw projection");
+let rmt = S_CLOSE_THROW.remove(scratch + "/work/proj2.txt", false);
+assert(not rmt.ok and rmt.cleanup_uncertain and not rmt.parent_close_confirmed
+    and rmt.remove_backend_succeeded and rmt.removal_may_have_occurred, "remove close throw projection");
+let fd_delta_close_proj = len(fs_listdir("/proc/self/fd")) - fd_before_close_proj;
+assert(fd_delta_close_proj == 0, "zero fd delta on post-close projection tests");
+array_push(rows, map{ label: "candidate_real_close_uncertainty_projection", passed: true, checks: 4, fd_delta: fd_delta_close_proj });
+
+let report = map{
+    passed: true,
+    runner: "tests/tooling/secure_file_remove_write_cleanup_check.sapp",
+    language: "PBLang",
+    source_sha256: SHA256.sha256_hex(candidate_raw),
+    baseline_sha256: SHA256.sha256_hex(baseline_raw),
+    semantic_sha256: SHA256.sha256_hex(semantic_raw),
+    groups_passed: len(rows),
+    rows: rows
+};
+fs_write(report_path, json_stringify(report) + "\n");
+print json_stringify(report);
