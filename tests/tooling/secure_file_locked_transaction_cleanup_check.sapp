@@ -1,0 +1,320 @@
+// Pure PBLang qualification runner for secure_file locked transaction
+// (append_text_bounded_locked, private_compare_and_swap, consume_nonce_once,
+// _finish_locked) lock/parent/root ownership, single release/close, exception
+// redaction, reply validation, and Linux FD + flock leak verification.
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _replace_once(source, needle, replacement) {
+    let parts = str_split(source, needle);
+    assert(len(parts) == 2, "expected exactly one occurrence of needle: " + needle);
+    return parts[0] + replacement + parts[1];
+}
+
+let raw_args = os_args();
+let baseline_path = "";
+let report_path = "";
+let i = 0;
+while i < len(raw_args) {
+    if raw_args[i] == "--baseline-source" and i + 1 < len(raw_args) {
+        baseline_path = raw_args[i + 1];
+    }
+    if raw_args[i] == "--report" and i + 1 < len(raw_args) {
+        report_path = raw_args[i + 1];
+    }
+    i = i + 1;
+}
+if baseline_path == "" or report_path == "" {
+    throw "usage: pblang run --allow-all tests/tooling/secure_file_locked_transaction_cleanup_check.sapp -- --baseline-source <path> --report <path>";
+}
+
+let stdlib_root = cwd() + "/stdlib/";
+let candidate_raw = fs_read("stdlib/secure_file.sapp");
+let baseline_raw = fs_read(baseline_path);
+let semantic_raw = fs_read("tests/semantics/secure_file_locked_transaction_cleanup_test.sapp");
+
+let scratch = "/tmp/pblang-locked-tx-qual-" + str(num_floor(now_ms()));
+assert(SECURE.create_private_temporary_directory_new(scratch).ok, "private temporary qualification directory created");
+assert(SECURE.create_private_directory_new(scratch + "/work").ok, "private work subdirectory created");
+
+let backend_src = "let SHA256 = import(\"" + stdlib_root + "sha256_pb.sapp\");\n"
+    + "let state = map{};\n"
+    + "fn configure(kind, op_mode, rel_mode, close_mode) {\n"
+    + "    state.kind = kind; state.op_mode = op_mode;\n"
+    + "    state.rel_mode = rel_mode; state.close_mode = close_mode;\n"
+    + "    state.opens = 0; state.locks = 0; state.releases = 0;\n"
+    + "    state.closes = 0; state.policy_checks = 0; state.admit = true;\n"
+    + "}\n"
+    + "fn open(path, create = false, protect = false) {\n"
+    + "    state.opens = state.opens + 1;\n"
+    + "    return if state.admit { map{ ok: true } } else { map{ ok: false, error: \"admission denied\" } };\n"
+    + "}\n"
+    + "fn open_absolute(path, create = false, protect = false) { return open(path, create, protect); }\n"
+    + "fn private_root_status(fs) {\n"
+    + "    state.policy_checks = state.policy_checks + 1;\n"
+    + "    if state.kind == \"nonce\" {\n"
+    + "        if state.op_mode == \"policy_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "        if state.op_mode == \"policy_fail\" { return map{ ok: false }; }\n"
+    + "    }\n"
+    + "    return map{ ok: true, owned_by_current_uid: true, mode: 448 };\n"
+    + "}\n"
+    + "fn acquire_lock(fs, name, timeout_ms, poll_ms = 10, private_only = false) {\n"
+    + "    state.locks = state.locks + 1;\n"
+    + "    if state.op_mode == \"lock_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.op_mode == \"lock_fail\" { return map{ ok: false, error: \"lock busy\", timeout: true }; }\n"
+    + "    if state.op_mode == \"lock_bad_mode\" { return map{ ok: true, private_mode_verified: false }; }\n"
+    + "    return map{ ok: true, private_mode_verified: true };\n"
+    + "}\n"
+    + "fn release_lock(fs, lock) {\n"
+    + "    state.releases = state.releases + 1;\n"
+    + "    if state.rel_mode == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    return state.rel_mode == \"success\";\n"
+    + "}\n"
+    + "fn close(fs) {\n"
+    + "    state.closes = state.closes + 1;\n"
+    + "    if state.close_mode == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.close_mode == \"nil\" { return nil; }\n"
+    + "    return state.close_mode == \"success\";\n"
+    + "}\n"
+    + "fn write_new_atomic(fs, name, bytes, executable = false) {\n"
+    + "    if state.kind == \"append\" {\n"
+    + "        if state.op_mode == \"write_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "        if state.op_mode == \"bad_write_reply\" { return map{ ok: \"invalid\" }; }\n"
+    + "        if state.op_mode == \"existing_success\" { return map{ ok: false, published: false }; }\n"
+    + "        return map{ ok: true, published: true, durability_verified: true };\n"
+    + "    }\n"
+    + "    if state.kind == \"cas\" {\n"
+    + "        if state.op_mode == \"write_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "        return map{ ok: true, published: true, durability_verified: true };\n"
+    + "    }\n"
+    + "    if state.op_mode == \"write_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.op_mode == \"spent_replay\" { return map{ ok: false, published: false, durability_verified: false }; }\n"
+    + "    return map{ ok: true, published: true, durability_verified: true };\n"
+    + "}\n"
+    + "fn metadata(fs, name) {\n"
+    + "    return map{ ok: true, kind: \"file\", owner_current_user: true, link_count: 1, mode: 384 };\n"
+    + "}\n"
+    + "fn read_bytes(fs, name, max_bytes) {\n"
+    + "    return map{ ok: true, bytes: [120, 121], size: 2 };\n"
+    + "}\n"
+    + "fn write_atomic(fs, name, bytes, executable = false) {\n"
+    + "    if state.op_mode == \"write_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    return map{ ok: true, published: true, durability_verified: true };\n"
+    + "}\n"
+    + "fn read_prefix_bytes(fs, name, max_bytes) {\n"
+    + "    if state.kind == \"cas\" {\n"
+    + "        if state.op_mode == \"read_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "        if state.op_mode == \"present_success\" and state.PresentReadDone != true {\n"
+    + "            state.PresentReadDone = true;\n"
+    + "            return map{ ok: true, truncated: false, source_size: 2, bytes: [97, 98],\n"
+    + "                kind: \"file\", owner_current_user: true, link_count: 1, mode: 384,\n"
+    + "                descriptor_bound_metadata: true };\n"
+    + "        }\n"
+    + "        state.PresentReadDone = false;\n"
+    + "        if state.op_mode == \"write_throw\" { return map{ ok: false }; }\n"
+    + "        return map{ ok: true, truncated: false, source_size: 3, bytes: [110, 101, 119],\n"
+    + "            kind: \"file\", owner_current_user: true, link_count: 1, mode: 384,\n"
+    + "            descriptor_bound_metadata: true };\n"
+    + "    }\n"
+    + "    if state.op_mode == \"write_throw\" { return map{ ok: false }; }\n"
+    + "    let nd = SHA256.sha256_hex(str_repeat(\"a\", 64));\n"
+    + "    let r = json_stringify(map{ format: \"pbide.nonce-receipt.v1\",\n"
+    + "        nonce_digest: nd, request_sha256: str_repeat(\"b\", 64),\n"
+    + "        digest_algorithm: \"sha256(raw-bytes)\" });\n"
+    + "    let rb = str_to_bytes(r);\n"
+    + "    return map{ ok: true, truncated: false, source_size: len(rb), bytes: rb,\n"
+    + "        kind: \"file\", owner_current_user: true, link_count: 1, mode: 384,\n"
+    + "        descriptor_bound_metadata: true };\n"
+    + "}\n"
+    + "export state, configure, open, open_absolute, private_root_status, acquire_lock,\n"
+    + "    release_lock, close, write_new_atomic, metadata, read_bytes, write_atomic, read_prefix_bytes;\n";
+
+fs_write(scratch + "/backend.sapp", backend_src);
+fs_write(scratch + "/semantic.sapp", str_replace_all(semantic_raw, "\"stdlib:", "\"" + stdlib_root));
+
+let cand_bound = str_replace_all(candidate_raw, "\"stdlib:", "\"" + stdlib_root);
+let base_bound = str_replace_all(baseline_raw, "\"stdlib:", "\"" + stdlib_root);
+
+let cand_model = _replace_once(
+    cand_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/cand_model.sapp", cand_model);
+
+let base_model = _replace_once(
+    base_bound,
+    "let LinuxDirFS = import(\"" + stdlib_root + "linux_dirfs.sapp\");",
+    "let LinuxDirFS = import(\"" + scratch + "/backend.sapp\");"
+);
+fs_write(scratch + "/base_model.sapp", base_model);
+
+let cand_real_throw = _replace_once(
+    _replace_once(
+        _replace_once(
+            cand_bound,
+            "let first = LinuxDirFS.write_new_atomic(fs, name, addition, false);",
+            "if true { throw \"synthetic-private-value\"; } let first = LinuxDirFS.write_new_atomic(fs, name, addition, false);"
+        ),
+        "let written = if expected.kind == \"missing\" {",
+        "if true { throw \"synthetic-private-value\"; } let written = if expected.kind == \"missing\" {"
+    ),
+    "let nonce_digest = SHA256.sha256_hex(nonce);\n    let name = \"nonce-\" + nonce_digest + \".json\";",
+    "if true { throw \"synthetic-private-value\"; } let nonce_digest = SHA256.sha256_hex(nonce);\n    let name = \"nonce-\" + nonce_digest + \".json\";"
+);
+fs_write(scratch + "/cand_real_throw.sapp", cand_real_throw);
+
+let base_real_throw = _replace_once(
+    _replace_once(
+        _replace_once(
+            base_bound,
+            "let operation = LinuxDirFS.write_new_atomic(parent.fs, parent.name, addition, false);",
+            "if true { throw \"synthetic-private-value\"; } let operation = LinuxDirFS.write_new_atomic(parent.fs, parent.name, addition, false);"
+        ),
+        "let written = if expected.kind == \"missing\" {",
+        "if true { throw \"synthetic-private-value\"; } let written = if expected.kind == \"missing\" {"
+    ),
+    "let nonce_digest = SHA256.sha256_hex(nonce);\n    let name = \"nonce-\" + nonce_digest + \".json\";",
+    "if true { throw \"synthetic-private-value\"; } let nonce_digest = SHA256.sha256_hex(nonce);\n    let name = \"nonce-\" + nonce_digest + \".json\";"
+);
+fs_write(scratch + "/base_real_throw.sapp", base_real_throw);
+
+let cand_rel_false = _replace_once(
+    cand_bound,
+    "let raw_released = try LinuxDirFS.release_lock(fs, lock) catch false;",
+    "let raw_released = try { LinuxDirFS.release_lock(fs, lock); false } catch false;"
+);
+fs_write(scratch + "/cand_rel_false.sapp", cand_rel_false);
+
+let cand_rel_throw = _replace_once(
+    cand_bound,
+    "let raw_released = try LinuxDirFS.release_lock(parent.fs, lock) catch false;",
+    "let raw_released = try { LinuxDirFS.release_lock(parent.fs, lock); throw \"synthetic-private-value\"; } catch false;"
+);
+fs_write(scratch + "/cand_rel_throw.sapp", cand_rel_throw);
+
+let B = import(scratch + "/backend.sapp");
+let SEM = import(scratch + "/semantic.sapp");
+let S_CAND_MODEL = import(scratch + "/cand_model.sapp");
+let S_BASE_MODEL = import(scratch + "/base_model.sapp");
+let S_CAND_REAL = import("stdlib:secure_file.sapp");
+let S_CAND_THROW = import(scratch + "/cand_real_throw.sapp");
+let S_BASE_THROW = import(scratch + "/base_real_throw.sapp");
+let S_REL_FALSE = import(scratch + "/cand_rel_false.sapp");
+let S_REL_THROW = import(scratch + "/cand_rel_throw.sapp");
+
+let rows = [];
+
+// Group 1: Candidate modeled matrix (216 matrix cases + 12 admission cases)
+let m_res = SEM.run(S_CAND_MODEL, B);
+assert(m_res.ok and m_res.matrix_cases == 216 and m_res.admission_cases == 12, "candidate modeled matrix passed");
+array_push(rows, map{ label: "candidate_modeled_matrix", passed: true, result: m_res });
+
+// Group 2: Unchanged baseline rejected by new semantic contract
+let base_rejected = try { SEM.run(S_BASE_MODEL, B); false } catch true;
+assert(base_rejected, "baseline source rejected by semantic ownership contract");
+array_push(rows, map{ label: "baseline_rejected_by_semantic_contract", passed: true, rejected: base_rejected });
+
+// Group 3: Real Linux append_text_bounded_locked, private_compare_and_swap, and consume_nonce_once with FD delta 0
+let fd_before_normal = len(fs_listdir("/proc/self/fd"));
+let app_path = scratch + "/work/append.log";
+let a1 = S_CAND_REAL.append_text_bounded_locked(app_path, "one\n", 128, 1000);
+let a2 = S_CAND_REAL.append_text_bounded_locked(app_path, "two\n", 128, 1000);
+assert(a1.ok and a2.ok and a2.final_bytes == 8 and S_CAND_REAL.read_text(app_path, 128, true).text == "one\ntwo\n",
+    "real append_text_bounded_locked");
+
+let cas_path = scratch + "/work/cas.bin";
+let missing_exp = map{ kind: "missing", algorithm: "none", sha256: "" };
+let c1 = S_CAND_REAL.private_compare_and_swap(cas_path, missing_exp, [65, 66], 128, 1000);
+assert(c1.ok and c1.published and c1.readback_verified, "real CAS missing->present");
+let pres_exp = map{ kind: "present", algorithm: S_CAND_REAL.RAW_SHA256_ALGORITHM,
+    sha256: SHA256.sha256_hex_bytes([65, 66]) };
+let c2 = S_CAND_REAL.private_compare_and_swap(cas_path, pres_exp, [67, 68, 69], 128, 1000);
+assert(c2.ok and c2.published and c2.readback_verified, "real CAS present->present");
+
+let nonce_val = str_repeat("7", 64);
+let req_val = str_repeat("8", 64);
+let n1 = S_CAND_REAL.consume_nonce_once(scratch + "/work", nonce_val, req_val, 1000);
+let n2 = S_CAND_REAL.consume_nonce_once(scratch + "/work", nonce_val, req_val, 1000);
+assert(n1.ok and n1.effect_admitted and not n2.ok and n2.consumed and not n2.effect_admitted,
+    "real consume_nonce_once burn and replay rejection");
+let fd_delta_normal = len(fs_listdir("/proc/self/fd")) - fd_before_normal;
+assert(fd_delta_normal == 0, "zero fd delta on real locked transactions");
+array_push(rows, map{ label: "candidate_real_linux_locked_transactions", passed: true, fd_delta: fd_delta_normal });
+
+// Group 4: Candidate real Linux descriptor + flock release under synthetic post-lock exceptions
+let fd_before_cand_exc = len(fs_listdir("/proc/self/fd"));
+let cand_exc_count = 0;
+let cand_denied_count = 0;
+let k1 = 0;
+while k1 < 2 {
+    let ra = try S_CAND_THROW.append_text_bounded_locked(scratch + "/work/exc_app.log", "x", 64, 200) catch { cand_exc_count = cand_exc_count + 1; nil };
+    if ra != nil {
+        assert(not ra.ok and ra.error == "locked append backend failed" and ra.lock_released and ra.root_closed, "candidate append exception cleaned up");
+        cand_denied_count = cand_denied_count + 1;
+    }
+    let rc = try S_CAND_THROW.private_compare_and_swap(scratch + "/work/exc_cas.bin", missing_exp, [1, 2], 64, 200) catch { cand_exc_count = cand_exc_count + 1; nil };
+    if rc != nil {
+        assert(not rc.ok and rc.error == "private CAS backend failed" and rc.lock_released and rc.root_closed, "candidate CAS exception cleaned up");
+        cand_denied_count = cand_denied_count + 1;
+    }
+    let rn = try S_CAND_THROW.consume_nonce_once(scratch + "/work", str_repeat("9", 64), req_val, 200) catch { cand_exc_count = cand_exc_count + 1; nil };
+    if rn != nil {
+        assert(not rn.ok and rn.error == "nonce publication outcome is indeterminate" and rn.lock_released and rn.root_closed, "candidate nonce exception cleaned up");
+        cand_denied_count = cand_denied_count + 1;
+    }
+    k1 = k1 + 1;
+}
+let fd_delta_cand_exc = len(fs_listdir("/proc/self/fd")) - fd_before_cand_exc;
+assert(cand_exc_count == 0 and cand_denied_count == 6 and fd_delta_cand_exc == 0,
+    "candidate releases flock and closes parent/root descriptors on post-lock exceptions");
+array_push(rows, map{ label: "candidate_real_exception_zero_fd_and_lock_leak", passed: true, exceptions: cand_exc_count, denied: cand_denied_count, fd_delta: fd_delta_cand_exc });
+
+// Group 5: Baseline real Linux descriptor + flock leak demonstration under identical post-lock exceptions
+let bdir0 = scratch + "/work/base0";
+let bdir1 = scratch + "/work/base1";
+assert(S_CAND_REAL.create_private_directory_new(bdir0).ok and S_CAND_REAL.create_private_directory_new(bdir1).ok,
+    "baseline private directories created");
+let fd_before_base_exc = len(fs_listdir("/proc/self/fd"));
+let base_exc_count = 0;
+for bdir in [bdir0, bdir1] {
+    try { S_BASE_THROW.append_text_bounded_locked(bdir + "/app.log", "x", 64, 200); } catch { base_exc_count = base_exc_count + 1; }
+    try { S_BASE_THROW.private_compare_and_swap(bdir + "/cas.bin", missing_exp, [1, 2], 64, 200); } catch { base_exc_count = base_exc_count + 1; }
+    try { S_BASE_THROW.consume_nonce_once(bdir, str_repeat("9", 64), req_val, 200); } catch { base_exc_count = base_exc_count + 1; }
+}
+let fd_delta_base_exc = len(fs_listdir("/proc/self/fd")) - fd_before_base_exc;
+assert(base_exc_count == 6 and fd_delta_base_exc == 12,
+    "baseline leaks +12 descriptors (6 parent/root + 6 held lock descriptors) on 6 post-lock exceptions");
+array_push(rows, map{ label: "baseline_real_exception_leaks_12_fds", passed: true, exceptions: base_exc_count, fd_delta: fd_delta_base_exc });
+
+// Group 6: Real release/close followed by synthetic false / throw reports cleanup_uncertain with FD delta 0
+let fd_before_proj = len(fs_listdir("/proc/self/fd"));
+let ap_proj = S_REL_THROW.append_text_bounded_locked(scratch + "/work/proj_app.log", "hi", 64, 500);
+assert(not ap_proj.ok and ap_proj.cleanup_uncertain and ap_proj.published
+    and ap_proj.append_backend_succeeded and not ap_proj.lock_released and ap_proj.root_closed,
+    "append release throw projection");
+let cas_proj = S_REL_FALSE.private_compare_and_swap(scratch + "/work/proj_cas.bin", missing_exp, [9, 9], 64, 500);
+assert(not cas_proj.ok and cas_proj.cleanup_uncertain and cas_proj.published
+    and cas_proj.transaction_backend_succeeded and not cas_proj.lock_released and cas_proj.root_closed,
+    "CAS release false projection");
+let nonce_proj = S_REL_FALSE.consume_nonce_once(scratch + "/work", str_repeat("6", 64), req_val, 500);
+assert(not nonce_proj.ok and nonce_proj.cleanup_uncertain and nonce_proj.published
+    and nonce_proj.consumed and not nonce_proj.effect_admitted
+    and nonce_proj.transaction_backend_succeeded and not nonce_proj.lock_released and nonce_proj.root_closed,
+    "nonce release false projection");
+let fd_delta_proj = len(fs_listdir("/proc/self/fd")) - fd_before_proj;
+assert(fd_delta_proj == 0, "zero fd delta on post-release projection tests");
+array_push(rows, map{ label: "candidate_real_release_uncertainty_projection", passed: true, checks: 3, fd_delta: fd_delta_proj });
+
+let report = map{
+    passed: true,
+    runner: "tests/tooling/secure_file_locked_transaction_cleanup_check.sapp",
+    language: "PBLang",
+    source_sha256: SHA256.sha256_hex(candidate_raw),
+    baseline_sha256: SHA256.sha256_hex(baseline_raw),
+    semantic_sha256: SHA256.sha256_hex(semantic_raw),
+    groups_passed: len(rows),
+    rows: rows
+};
+fs_write(report_path, json_stringify(report) + "\n");
+print json_stringify(report);

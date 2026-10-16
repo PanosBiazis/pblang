@@ -177,3 +177,30 @@ that verifies 180 modeled immutable/private/close combinations, 14 admission cas
 baseline rejection, real Linux immutable reader and private directory operations,
 real descriptor leak elimination (`0` vs baseline `+8`) on synthetic backend
 exceptions, and post-close uncertainty projection.
+
+## Locked transactions
+
+`append_text_bounded_locked`, `_inspect_private_file`, `_finish_locked`,
+`private_compare_and_swap`, and `consume_nonce_once` now enforce single-release
+sibling lock cleanup, single-close parent/root cleanup, catchable backend exception
+redaction, and reply validation:
+- `append_text_bounded_locked` catches lock acquisition, new-file creation, metadata,
+  bounded read, and atomic replacement failures at the owned parent/lock boundary,
+  releases the acquired lock once and closes the parent once with boolean `true`
+  verification, never mutates backend maps in place, and reports
+  `cleanup_uncertain:true` (plus `append_backend_succeeded:true` when the backend
+  write succeeded) if lock release or parent close cannot be verified.
+- `_finish_locked`, `private_compare_and_swap`, and `consume_nonce_once` catch
+  post-acquisition policy, lock, readback, and write exceptions, ensure both
+  `release_lock` and `close` are attempted once with boolean `true` verification,
+  and fail closed with `cleanup_uncertain:true`, `effect_admitted:false`,
+  `effect_completed:false`, and `evidence_indeterminate:true` (plus
+  `transaction_backend_succeeded:true` when the transaction succeeded before an
+  unconfirmed release/close).
+
+`tests/tooling/secure_file_locked_transaction_cleanup_check.sapp` is a native PBLang
+qualification runner (`pblang run --allow-all tests/tooling/secure_file_locked_transaction_cleanup_check.sapp -- --baseline-source <path> --report <path>`)
+that verifies 216 modeled locked-transaction/release/close combinations, 12 admission
+cases, baseline rejection, real Linux locked appends, CAS, and nonce burns, real
+descriptor and flock leak elimination (`0` vs baseline `+12`) on synthetic post-lock
+exceptions, and post-release uncertainty projection.
