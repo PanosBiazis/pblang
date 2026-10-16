@@ -1,0 +1,299 @@
+// Pure PBLang qualification runner for secure_file _open_parent private-parent
+// policy/close cleanup and bounded enumerator lifecycle (open_bounded_enumerator,
+// open_admitted_scan_enumerator, enumerate_bounded, discard_bounded_traversal,
+// read_bounded_enumerator_file, restart_bounded_enumerator,
+// recheck_admitted_scan_enumerator, close_bounded_enumerator) ownership,
+// single abort/close verification, exception redaction, reply validation,
+// and Linux FD leak verification.
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _replace_once(source, needle, replacement) {
+    let parts = str_split(source, needle);
+    assert(len(parts) == 2, "expected exactly one occurrence of needle: " + needle);
+    return parts[0] + replacement + parts[1];
+}
+
+let raw_args = os_args();
+let baseline_path = "";
+let report_path = "";
+let i = 0;
+while i < len(raw_args) {
+    if raw_args[i] == "--baseline-source" and i + 1 < len(raw_args) {
+        baseline_path = raw_args[i + 1];
+    }
+    if raw_args[i] == "--report" and i + 1 < len(raw_args) {
+        report_path = raw_args[i + 1];
+    }
+    i = i + 1;
+}
+if baseline_path == "" or report_path == "" {
+    throw "usage: pblang run --allow-all tests/tooling/secure_file_bounded_enumerator_cleanup_check.sapp -- --baseline-source <path> --report <path>";
+}
+
+let stdlib_root = cwd() + "/stdlib/";
+let candidate_raw = fs_read("stdlib/secure_file.sapp");
+let baseline_raw = fs_read(baseline_path);
+let semantic_raw = fs_read("tests/semantics/secure_file_bounded_enumerator_cleanup_test.sapp");
+
+let scratch = "/tmp/pblang-enum-parent-qual-" + str(num_floor(now_ms()));
+assert(SECURE.create_private_temporary_directory_new(scratch).ok, "private temporary qualification directory created");
+assert(SECURE.create_private_directory_new(scratch + "/work").ok, "private work subdirectory created");
+
+let backend_src = "let state = map{};\n"
+    + "let close_fn = nil;\n"
+    + "fn configure(kind, op_mode, abort_mode, close_mode) {\n"
+    + "    state.kind = kind; state.op_mode = op_mode;\n"
+    + "    state.abort_mode = abort_mode; state.close_mode = close_mode;\n"
+    + "    state.opens = 0; state.policy_checks = 0; state.admits = 0;\n"
+    + "    state.aborts = 0; state.closes = 0; state.admit = true;\n"
+    + "    state.discard_mode = \"success\";\n"
+    + "}\n"
+    + "fn open(path, create = false, protect = false) {\n"
+    + "    state.opens = state.opens + 1;\n"
+    + "    return if state.admit { map{ ok: true } } else { map{ ok: false, error: \"admission denied\" } };\n"
+    + "}\n"
+    + "fn open_absolute(path, create = false, protect = false) { return open(path, create, protect); }\n"
+    + "fn private_root_status(fs) {\n"
+    + "    state.policy_checks = state.policy_checks + 1;\n"
+    + "    if state.op_mode == \"policy_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.op_mode == \"policy_fail\" { return map{ ok: false }; }\n"
+    + "    return map{ ok: true, owned_by_current_uid: true, mode: 448 };\n"
+    + "}\n"
+    + "fn read_bytes(fs, name, max_bytes) {\n"
+    + "    return map{ ok: true, bytes: [111, 107], size: 2 };\n"
+    + "}\n"
+    + "fn scan_mount_admission_status() {\n"
+    + "    return map{ ok: true, ready: true, process_admission_poisoned: state.abort_mode != \"success\" or state.close_mode != \"success\", error_code: \"scan-mount-cleanup-poisoned\" };\n"
+    + "}\n"
+    + "fn admit_scan_mount(fs) {\n"
+    + "    state.admits = state.admits + 1;\n"
+    + "    if state.op_mode == \"admit_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.op_mode == \"admit_fail\" { return map{ ok: false, error_code: \"mount-denied\" }; }\n"
+    + "    if state.op_mode == \"admit_bad_reply\" { return map{ ok: \"invalid\" }; }\n"
+    + "    return map{ ok: true };\n"
+    + "}\n"
+    + "fn enumerate_bounded(fs, relative_path = \"\", max_entries = 512, traversal_token = nil) {\n"
+    + "    if state.op_mode == \"op_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.op_mode == \"bad_reply\" { return map{ ok: \"invalid\" }; }\n"
+    + "    if state.op_mode == \"cleanup_failed\" { return map{ ok: false, cleanup_failed: true, invalidate_handle: true }; }\n"
+    + "    return map{ ok: true, entries: [], truncated: false };\n"
+    + "}\n"
+    + "fn read_enumerated_file(fs, content_token, max_bytes = 1048576) {\n"
+    + "    if state.op_mode == \"op_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.op_mode == \"bad_reply\" { return map{ ok: \"invalid\" }; }\n"
+    + "    if state.op_mode == \"cleanup_failed\" { return map{ ok: false, cleanup_failed: true, invalidate_handle: true, error_code: \"strict-content-cleanup-failed\" }; }\n"
+    + "    return map{ ok: true, size: 2, sha256: \"deadbeef\" };\n"
+    + "}\n"
+    + "fn restart_bounded_enumeration(fs) {\n"
+    + "    if state.op_mode == \"op_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.op_mode == \"bad_reply\" { return map{ ok: \"invalid\" }; }\n"
+    + "    if state.op_mode == \"cleanup_failed\" { return map{ ok: false, cleanup_failed: true, invalidate_handle: true }; }\n"
+    + "    return map{ ok: true, generation: 2 };\n"
+    + "}\n"
+    + "fn recheck_scan_mount(fs) {\n"
+    + "    if state.op_mode == \"op_throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.op_mode == \"bad_reply\" { return map{ ok: \"invalid\" }; }\n"
+    + "    if state.op_mode == \"recheck_fail\" { return map{ ok: false }; }\n"
+    + "    return map{ ok: true, mount_binding_rechecked: true, held_root_vfs_policy_admitted: true, contains_paths: false, contains_mount_identity: false, contains_filesystem_type: false };\n"
+    + "}\n"
+    + "fn discard_enumeration_token(fs, token) {\n"
+    + "    if state.discard_mode == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.discard_mode == \"nil\" { return nil; }\n"
+    + "    return state.discard_mode == \"success\";\n"
+    + "}\n"
+    + "fn abort_bounded_enumeration(fs) {\n"
+    + "    state.aborts = state.aborts + 1;\n"
+    + "    if state.abort_mode == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    return state.abort_mode == \"success\";\n"
+    + "}\n"
+    + "fn close(fs) {\n"
+    + "    state.closes = state.closes + 1;\n"
+    + "    if state.close_mode == \"throw\" { throw \"synthetic-private-value\"; }\n"
+    + "    if state.close_mode == \"nil\" { return nil; }\n"
+    + "    return state.close_mode == \"success\";\n"
+    + "}\n"
+    + "fn available() { return map{ ok: true }; }\n"
+    + "export state, close_fn, configure, open, open_absolute, private_root_status, read_bytes, scan_mount_admission_status, admit_scan_mount, enumerate_bounded, read_enumerated_file, restart_bounded_enumeration, recheck_scan_mount, discard_enumeration_token, abort_bounded_enumeration, close, available;\n";
+fs_write(scratch + "/backend.sapp", backend_src);
+
+fn _bind_stdlib_imports(src, linux_target) {
+    let s1 = _replace_once(src, "import(\"stdlib:linux_dirfs.sapp\")", "import(\"" + linux_target + "\")");
+    let s2 = _replace_once(s1, "import(\"stdlib:posix_dirfs.sapp\")", "import(\"" + stdlib_root + "posix_dirfs.sapp\")");
+    let s3 = _replace_once(s2, "import(\"stdlib:windows_dirfs.sapp\")", "import(\"" + stdlib_root + "windows_dirfs.sapp\")");
+    return _replace_once(s3, "import(\"stdlib:sha256_pb.sapp\")", "import(\"" + stdlib_root + "sha256_pb.sapp\")");
+}
+
+let export_tail = "\nexport read_text, open_bounded_enumerator, open_admitted_scan_enumerator, enumerate_bounded, discard_bounded_traversal, read_bounded_enumerator_file, restart_bounded_enumerator, recheck_admitted_scan_enumerator, close_bounded_enumerator;\n";
+fs_write(scratch + "/cand_model.sapp", _bind_stdlib_imports(candidate_raw, scratch + "/backend.sapp") + export_tail);
+fs_write(scratch + "/base_model.sapp", _bind_stdlib_imports(baseline_raw, scratch + "/backend.sapp") + export_tail);
+fs_write(scratch + "/semantic.sapp", semantic_raw);
+
+let helper_tail = "\nfn _fault_throw() { throw \"synthetic-private-value\"; }\nfn _close_false_helper(fs) { try _close(fs) catch false; return false; }\n";
+let cand_bound = _bind_stdlib_imports(candidate_raw, stdlib_root + "linux_dirfs.sapp") + helper_tail + export_tail;
+let base_bound = _bind_stdlib_imports(baseline_raw, stdlib_root + "linux_dirfs.sapp") + helper_tail + export_tail;
+
+let cand_real_fault = _replace_once(
+    _replace_once(
+        _replace_once(
+            cand_bound,
+            "try LinuxDirFS.private_root_status(private_fs) catch nil",
+            "try _fault_throw() catch nil"
+        ),
+        "let raw_result = try LinuxDirFS.enumerate_bounded(\n        state.fs, relative_path, max_entries, traversal_token) catch \"__enumerator_exception__\";",
+        "let raw_result = map{ ok: \"invalid\" };"
+    ),
+    "let raw_result = try LinuxDirFS.restart_bounded_enumeration(state.fs)\n        catch \"__enumerator_exception__\";",
+    "let raw_result = map{ ok: \"invalid\" };"
+);
+fs_write(scratch + "/cand_real_fault.sapp", cand_real_fault);
+
+let base_real_fault = _replace_once(
+    _replace_once(
+        _replace_once(
+            base_bound,
+            "let policy = LinuxDirFS.private_root_status(private_fs);",
+            "let policy = _fault_throw();"
+        ),
+        "let outcome = try { map{ ok: true, value: LinuxDirFS.enumerate_bounded(\n        state.fs, relative_path, max_entries, traversal_token) } } catch map{ ok: false };",
+        "let outcome = map{ ok: true, value: map{ ok: \"invalid\" } };"
+    ),
+    "let outcome = try { map{ ok: true,\n        value: LinuxDirFS.restart_bounded_enumeration(state.fs) } }\n        catch map{ ok: false };",
+    "let outcome = map{ ok: true, value: map{ ok: \"invalid\" } };"
+);
+fs_write(scratch + "/base_real_fault.sapp", base_real_fault);
+
+let cand_close_false = _replace_once(
+    _replace_once(
+        cand_bound,
+        "if not _map_bool(try LinuxDirFS.private_root_status(private_fs) catch nil, \"ok\") {\n            let raw_closed = try _close(private_fs) catch false;",
+        "if not _map_bool(map{ ok: false }, \"ok\") {\n            let raw_closed = _close_false_helper(private_fs);"
+    ),
+    "fn _close_enumerator_fs(fs) {\n    let raw_val = try LinuxDirFS.close(fs) catch false;\n    return type(raw_val) == \"bool\" and raw_val;\n}",
+    "fn _close_enumerator_fs(fs) {\n    return _close_false_helper(fs);\n}"
+);
+fs_write(scratch + "/cand_close_false.sapp", cand_close_false);
+
+let B = import(scratch + "/backend.sapp");
+let SEM = import(scratch + "/semantic.sapp");
+let S_CAND_MODEL = import(scratch + "/cand_model.sapp");
+let S_BASE_MODEL = import(scratch + "/base_model.sapp");
+let S_CAND_REAL = import("stdlib:secure_file.sapp");
+let S_CAND_FAULT = import(scratch + "/cand_real_fault.sapp");
+let S_BASE_FAULT = import(scratch + "/base_real_fault.sapp");
+let S_CLOSE_FALSE = import(scratch + "/cand_close_false.sapp");
+
+let rows = [];
+
+// Group 1: Candidate modeled matrix (161 matrix cases + 14 admission cases)
+let m_res = SEM.run(S_CAND_MODEL, B);
+assert(m_res.ok and m_res.matrix_cases == 161 and m_res.admission_cases == 14, "candidate modeled matrix passed");
+array_push(rows, map{ label: "candidate_modeled_matrix", passed: true, result: m_res });
+
+// Group 2: Unchanged baseline rejected by new semantic contract
+let base_rejected = try { SEM.run(S_BASE_MODEL, B); false } catch true;
+assert(base_rejected, "baseline source rejected by semantic ownership contract");
+array_push(rows, map{ label: "baseline_rejected_by_semantic_contract", passed: true, rejected: base_rejected });
+
+// Group 3: Real Linux private-parent read and bounded enumerator lifecycle with FD delta 0
+let sample_file = scratch + "/work/sample.txt";
+assert(S_CAND_REAL.write_text_atomic(sample_file, "hello", false, true).ok, "write private sample file");
+let fd_before_normal = len(fs_listdir("/proc/self/fd"));
+let pr = S_CAND_REAL.read_text(sample_file, 32, true);
+assert(pr.ok and pr.text == "hello", "real private-parent read_text");
+
+let h1 = S_CAND_REAL.open_bounded_enumerator(scratch + "/work", 60000);
+assert(h1.ok and not h1.contains_paths and not h1.contains_descriptors, "real open_bounded_enumerator");
+let step1 = S_CAND_REAL.enumerate_bounded(h1, "", 16, nil);
+assert(step1.ok and len(step1.entries) == 1, "real enumerate_bounded step");
+let ctok = step1.entries[0].content_token;
+let rfile = S_CAND_REAL.read_bounded_enumerator_file(h1, ctok, 32);
+assert(rfile.ok and rfile.size == 5, "real read_bounded_enumerator_file");
+let rstart = S_CAND_REAL.restart_bounded_enumerator(h1);
+assert(rstart.ok, "real restart_bounded_enumerator");
+assert(S_CAND_REAL.close_bounded_enumerator(h1), "real close_bounded_enumerator");
+
+let h2 = S_CAND_REAL.open_admitted_scan_enumerator(scratch + "/work", 60000);
+assert(h2.ok and h2.held_root_vfs_policy_admitted, "real open_admitted_scan_enumerator");
+let rech = S_CAND_REAL.recheck_admitted_scan_enumerator(h2);
+assert(rech.ok and rech.mount_binding_rechecked, "real recheck_admitted_scan_enumerator");
+assert(S_CAND_REAL.close_bounded_enumerator(h2), "real close admitted scan enumerator");
+
+let fd_delta_normal = len(fs_listdir("/proc/self/fd")) - fd_before_normal;
+assert(fd_delta_normal == 0, "zero fd delta on real private-parent and bounded enumerator operations");
+array_push(rows, map{ label: "candidate_real_linux_enumerator_and_private_parent", passed: true, fd_delta: fd_delta_normal });
+
+// Group 4: Candidate real Linux descriptor release under synthetic post-open exception / malformed reply
+let fd_before_cand_fault = len(fs_listdir("/proc/self/fd"));
+let cand_fault_checks = 0;
+let k1 = 0;
+while k1 < 2 {
+    let r_priv = S_CAND_FAULT.read_text(sample_file, 32, true);
+    assert(not r_priv.ok and r_priv.error == "private parent must already be current-user-owned mode 0700",
+        "candidate private_root_status exception caught and parent closed");
+    cand_fault_checks = cand_fault_checks + 1;
+
+    let he1 = S_CAND_FAULT.open_bounded_enumerator(scratch + "/work", 60000);
+    assert(he1.ok, "candidate enumerator opened for step fault");
+    let r_step = S_CAND_FAULT.enumerate_bounded(he1, "", 8, nil);
+    assert(not r_step.ok and r_step.handle_invalidated and r_step.enumerator_closed,
+        "candidate malformed enumerate_bounded reply invalidates and closes root");
+    cand_fault_checks = cand_fault_checks + 1;
+
+    let he2 = S_CAND_FAULT.open_bounded_enumerator(scratch + "/work", 60000);
+    assert(he2.ok, "candidate enumerator opened for restart fault");
+    let r_rest = S_CAND_FAULT.restart_bounded_enumerator(he2);
+    assert(not r_rest.ok and r_rest.handle_invalidated and r_rest.enumerator_closed,
+        "candidate malformed restart_bounded_enumerator reply invalidates and closes root");
+    cand_fault_checks = cand_fault_checks + 1;
+    k1 = k1 + 1;
+}
+let fd_delta_cand_fault = len(fs_listdir("/proc/self/fd")) - fd_before_cand_fault;
+assert(cand_fault_checks == 6 and fd_delta_cand_fault == 0,
+    "candidate leaks 0 descriptors across 6 post-open faults");
+array_push(rows, map{ label: "candidate_real_fault_zero_fd_leak", passed: true, checks: cand_fault_checks, fd_delta: fd_delta_cand_fault });
+
+// Group 5: Baseline real Linux descriptor leak demonstration under identical post-open faults
+let fd_before_base_fault = len(fs_listdir("/proc/self/fd"));
+let base_fault_count = 0;
+let k2 = 0;
+while k2 < 2 {
+    try { S_BASE_FAULT.read_text(sample_file, 32, true); } catch { base_fault_count = base_fault_count + 1; }
+    let bh1 = S_BASE_FAULT.open_bounded_enumerator(scratch + "/work", 60000);
+    let bs1 = S_BASE_FAULT.enumerate_bounded(bh1, "", 8, nil);
+    if bs1.ok == "invalid" { base_fault_count = base_fault_count + 1; }
+    let bh2 = S_BASE_FAULT.open_bounded_enumerator(scratch + "/work", 60000);
+    let br1 = S_BASE_FAULT.restart_bounded_enumerator(bh2);
+    if br1.ok == "invalid" { base_fault_count = base_fault_count + 1; }
+    k2 = k2 + 1;
+}
+let fd_delta_base_fault = len(fs_listdir("/proc/self/fd")) - fd_before_base_fault;
+assert(base_fault_count == 6 and fd_delta_base_fault == 6,
+    "baseline leaks +6 directory descriptors across 6 identical post-open faults");
+array_push(rows, map{ label: "baseline_real_fault_leaks_6_fds", passed: true, faults: base_fault_count, fd_delta: fd_delta_base_fault });
+
+// Group 6: Real close followed by synthetic false reports cleanup_uncertain with FD delta 0
+let fd_before_proj = len(fs_listdir("/proc/self/fd"));
+let p_priv = S_CLOSE_FALSE.read_text(sample_file, 32, true);
+assert(not p_priv.ok and p_priv.cleanup_uncertain and not p_priv.parent_close_confirmed,
+    "private parent close uncertainty projection");
+let ph = S_CLOSE_FALSE.open_bounded_enumerator(scratch + "/work", 60000);
+assert(ph.ok, "projection enumerator opened");
+assert(not S_CLOSE_FALSE.close_bounded_enumerator(ph),
+    "close_bounded_enumerator returns false when close cannot be verified");
+let fd_delta_proj = len(fs_listdir("/proc/self/fd")) - fd_before_proj;
+assert(fd_delta_proj == 0, "zero fd delta on close uncertainty projection");
+array_push(rows, map{ label: "candidate_real_close_uncertainty_projection", passed: true, checks: 2, fd_delta: fd_delta_proj });
+
+let report = map{
+    passed: true,
+    runner: "tests/tooling/secure_file_bounded_enumerator_cleanup_check.sapp",
+    language: "PBLang",
+    source_sha256: SHA256.sha256_hex(candidate_raw),
+    baseline_sha256: SHA256.sha256_hex(baseline_raw),
+    semantic_sha256: SHA256.sha256_hex(semantic_raw),
+    groups_passed: len(rows),
+    rows: rows
+};
+fs_write(report_path, json_stringify(report) + "\n");
+print json_stringify(report);
