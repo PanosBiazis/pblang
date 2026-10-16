@@ -204,3 +204,38 @@ that verifies 216 modeled locked-transaction/release/close combinations, 12 admi
 cases, baseline rejection, real Linux locked appends, CAS, and nonce burns, real
 descriptor and flock leak elimination (`0` vs baseline `+12`) on synthetic post-lock
 exceptions, and post-release uncertainty projection.
+
+## Bounded enumerators and private-parent acquisition
+
+`_open_parent` (with `private_parent:true`), `_purge_bounded_enumerators`,
+`open_bounded_enumerator`, `open_admitted_scan_enumerator`, `enumerate_bounded`,
+`discard_bounded_traversal`, `read_bounded_enumerator_file`,
+`restart_bounded_enumerator`, `recheck_admitted_scan_enumerator`, and
+`close_bounded_enumerator` now enforce single-abort / single-close root and parent
+cleanup, catchable exception redaction, reply validation, and non-mutating map
+projection:
+- `_open_parent(..., private_parent:true)` wraps `private_root_status` in
+  `try ... catch nil` and verifies boolean `true` when closing a rejected private
+  parent handle (`cleanup_uncertain:true` and `parent_close_confirmed:false` when
+  close is not boolean `true`).
+- `open_bounded_enumerator` and `open_admitted_scan_enumerator` close their acquired
+  root descriptor once with boolean `true` verification on handle creation or mount
+  admission failure, setting `enumerator_closed` to the verified boolean and
+  `cleanup_uncertain:true` when close is not boolean `true`.
+- `enumerate_bounded`, `read_bounded_enumerator_file`, `restart_bounded_enumerator`,
+  and `recheck_admitted_scan_enumerator` validate backend reply maps (`_has_bool_ok`),
+  invalidate and remove the handle on terminal error, exception, or malformed reply,
+  attempt single abort/close with boolean `true` verification, copy backend maps
+  before attaching facade flags, and set `cleanup_uncertain:true` (plus
+  `process_admission_poisoned:true` on content read cleanup failures) when abort or
+  close cannot be verified.
+- `discard_bounded_traversal` and `close_bounded_enumerator` wrap backend calls in
+  `try ... catch false` and require boolean `true`.
+
+`tests/tooling/secure_file_bounded_enumerator_cleanup_check.sapp` is a native PBLang
+qualification runner (`pblang run --allow-all tests/tooling/secure_file_bounded_enumerator_cleanup_check.sapp -- --baseline-source <path> --report <path>`)
+that verifies 161 modeled private-parent/enumerator/abort/close combinations, 14
+admission cases, baseline rejection, real Linux private-parent reads and bounded
+enumerator operations, real descriptor leak elimination (`0` vs baseline `+6`) on
+synthetic post-open faults, and close uncertainty projection.
+
