@@ -1,0 +1,265 @@
+// Counted resource-free backend; tests append_text_bounded_locked,
+// private_compare_and_swap, consume_nonce_once, and _finish_locked
+// parent/root/lock ownership, single release/close, exception redaction,
+// reply validation, and admission boundaries.
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _assert_append(res, B, op_mode, rel_mode, close_mode) {
+    assert(B.state.opens == 1 and B.state.locks == 1 and B.state.closes == 1,
+        "append_text_bounded_locked opens parent, requests lock, and closes parent once");
+    let close_ok = close_mode == "success";
+    let rel_ok = rel_mode == "success";
+    if op_mode == "lock_fail" or op_mode == "lock_throw" {
+        assert(B.state.releases == 0 and not res.ok and res.target_unchanged and not res.published,
+            "failed lock acquisition does not release unheld lock");
+        if not close_ok {
+            assert(res.cleanup_uncertain and not res.parent_close_confirmed and not res.retry_safe,
+                "unconfirmed parent close after failed lock marks cleanup_uncertain");
+        } else {
+            assert(res.retry_safe and not map_has(res, "cleanup_uncertain"),
+                "confirmed parent close after failed lock is retry_safe");
+        }
+        assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+            "thrown value never escapes append_text_bounded_locked lock failure");
+        return nil;
+    }
+    assert(B.state.releases == 1, "acquired append lock is released once");
+    if not rel_ok or not close_ok {
+        assert(not res.ok and res.cleanup_uncertain
+            and res.error == "locked append cleanup could not be verified"
+            and res.lock_released == rel_ok and res.root_closed == close_ok,
+            "unconfirmed lock release or parent close fails append_text_bounded_locked");
+        if op_mode == "new_success" or op_mode == "existing_success" {
+            assert(res.published and res.append_backend_succeeded and not res.retry_safe,
+                "published append noted under cleanup uncertainty");
+        }
+    } elif op_mode == "new_success" {
+        assert(res.ok and res.published and not res.retry_safe
+            and res.lock_released and res.root_closed and res.final_bytes == 3,
+            "new locked append succeeds when lock release and parent close succeed");
+    } elif op_mode == "existing_success" {
+        assert(res.ok and res.published and not res.retry_safe
+            and res.lock_released and res.root_closed and res.final_bytes == 5,
+            "existing locked append succeeds when lock release and parent close succeed");
+    } elif op_mode == "write_throw" {
+        assert(not res.ok and not res.published and not res.retry_safe
+            and res.error == "locked append backend failed",
+            "locked append backend exception is redacted after cleanup");
+    } else {
+        assert(not res.ok and not res.published and not res.retry_safe
+            and res.error == "locked append publication result is invalid",
+            "invalid locked append reply is rejected after cleanup");
+    }
+    assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+        "thrown value never escapes append_text_bounded_locked");
+}
+
+fn _assert_cas(res, B, op_mode, rel_mode, close_mode) {
+    assert(B.state.opens == 1 and B.state.locks == 1 and B.state.closes == 1,
+        "private_compare_and_swap opens parent, requests lock, and closes parent once");
+    let close_ok = close_mode == "success";
+    let rel_ok = rel_mode == "success";
+    if op_mode == "lock_fail" {
+        assert(B.state.releases == 0 and not res.ok, "failed CAS lock does not release");
+        if not close_ok {
+            assert(res.cleanup_uncertain and not res.root_closed
+                and res.error == "private CAS lock cleanup could not be verified",
+                "unconfirmed close after CAS lock failure reports cleanup_uncertain");
+        } else {
+            assert(res.error == "private CAS lock unavailable or not mode-0600",
+                "confirmed close after CAS lock failure reports standard lock error");
+        }
+        return nil;
+    }
+    if op_mode == "lock_bad_mode" {
+        assert(B.state.releases == 1 and not res.ok,
+            "non-mode-0600 CAS lock releases acquired lock and closes parent");
+        if not rel_ok or not close_ok {
+            assert(res.cleanup_uncertain
+                and res.error == "private CAS lock cleanup could not be verified"
+                and res.lock_released == rel_ok and res.root_closed == close_ok,
+                "unconfirmed cleanup on non-mode-0600 CAS lock reports cleanup_uncertain");
+        } else {
+            assert(res.error == "private CAS lock unavailable or not mode-0600",
+                "confirmed cleanup on non-mode-0600 CAS lock reports standard lock error");
+        }
+        return nil;
+    }
+    assert(B.state.releases == 1, "acquired CAS lock is released once");
+    if not rel_ok or not close_ok {
+        assert(not res.ok and res.cleanup_uncertain
+            and res.error == "private transaction cleanup unverified"
+            and res.lock_released == rel_ok and res.root_closed == close_ok
+            and not res.effect_completed and res.evidence_indeterminate,
+            "unconfirmed CAS lock release or parent close rejects transaction");
+        if op_mode == "missing_success" or op_mode == "present_success" {
+            assert(res.published and res.transaction_backend_succeeded,
+                "successful CAS backend noted under cleanup uncertainty");
+        }
+    } elif op_mode == "missing_success" or op_mode == "present_success" {
+        assert(res.ok and res.published and res.effect_completed
+            and res.readback_verified and res.lock_released and res.root_closed,
+            "CAS succeeds when readback, lock release, and parent close succeed");
+    } elif op_mode == "read_throw" {
+        assert(not res.ok and not res.published and res.error == "private CAS backend failed"
+            and res.evidence_indeterminate and res.lock_released and res.root_closed,
+            "CAS read exception is caught and redacted before lock release and close");
+    } else {
+        assert(not res.ok and not res.effect_completed
+            and res.error == "private CAS publication outcome is not provable"
+            and res.evidence_indeterminate and res.lock_released and res.root_closed,
+            "CAS write exception is caught and classified before lock release and close");
+    }
+    assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+        "thrown value never escapes private_compare_and_swap");
+}
+
+fn _assert_nonce(res, B, op_mode, rel_mode, close_mode) {
+    assert(B.state.opens == 1 and B.state.policy_checks == 1 and B.state.closes == 1,
+        "consume_nonce_once opens root, checks policy, and closes root once");
+    let close_ok = close_mode == "success";
+    let rel_ok = rel_mode == "success";
+    if op_mode == "policy_fail" or op_mode == "policy_throw" {
+        assert(B.state.locks == 0 and B.state.releases == 0 and not res.ok,
+            "failed nonce root policy never acquires lock");
+        if not close_ok {
+            assert(res.cleanup_uncertain and not res.root_closed
+                and res.error == "private nonce root cleanup could not be verified",
+                "unconfirmed close after nonce policy failure reports cleanup_uncertain");
+        } else {
+            assert(res.error == "private nonce root policy unverified",
+                "confirmed close after nonce policy failure reports standard policy error");
+        }
+        assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+            "thrown value never escapes consume_nonce_once policy check");
+        return nil;
+    }
+    assert(B.state.locks == 1, "nonce transaction requests broker lock once");
+    if op_mode == "lock_bad_mode" {
+        assert(B.state.releases == 1 and not res.ok,
+            "non-mode-0600 nonce lock releases lock and closes root");
+        if not rel_ok or not close_ok {
+            assert(res.cleanup_uncertain
+                and res.error == "private nonce lock cleanup could not be verified"
+                and res.lock_released == rel_ok and res.root_closed == close_ok,
+                "unconfirmed cleanup on non-mode-0600 nonce lock reports cleanup_uncertain");
+        } else {
+            assert(res.error == "private nonce lock unavailable or not mode-0600",
+                "confirmed cleanup on non-mode-0600 nonce lock reports standard lock error");
+        }
+        return nil;
+    }
+    assert(B.state.releases == 1, "acquired nonce lock is released once");
+    if not rel_ok or not close_ok {
+        assert(not res.ok and res.cleanup_uncertain
+            and res.error == "private transaction cleanup unverified"
+            and res.lock_released == rel_ok and res.root_closed == close_ok
+            and not res.effect_admitted and res.evidence_indeterminate,
+            "unconfirmed nonce lock release or root close denies effect admission");
+        if op_mode == "success" {
+            assert(res.published and res.consumed and res.transaction_backend_succeeded,
+                "durable nonce burn noted under cleanup uncertainty");
+        }
+    } elif op_mode == "success" {
+        assert(res.ok and res.consumed and res.published and res.effect_admitted
+            and res.at_most_once and res.lock_released and res.root_closed,
+            "nonce burn succeeds when write, readback, durability, release, and close succeed");
+    } elif op_mode == "spent_replay" {
+        assert(not res.ok and res.consumed and not res.published and not res.effect_admitted
+            and res.error == "nonce already spent" and res.lock_released and res.root_closed,
+            "prior spent nonce replay fails closed after lock release and root close");
+    } else {
+        assert(not res.ok and not res.effect_admitted and res.evidence_indeterminate
+            and res.error == "nonce publication outcome is indeterminate"
+            and res.lock_released and res.root_closed,
+            "nonce write exception fails closed after lock release and root close");
+    }
+    assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+        "thrown value never escapes consume_nonce_once");
+}
+
+fn run(S, B) {
+    let cases = 0;
+    let rel_modes = ["success", "false", "throw"];
+    let close_modes = ["success", "false", "nil", "throw"];
+
+    let append_modes = ["new_success", "existing_success", "lock_fail", "lock_throw", "write_throw", "bad_write_reply"];
+    for op_mode in append_modes {
+        for rel_mode in rel_modes {
+            for close_mode in close_modes {
+                B.configure("append", op_mode, rel_mode, close_mode);
+                let res = S.append_text_bounded_locked("/owned/state.log", "abc", 64, 100);
+                _assert_append(res, B, op_mode, rel_mode, close_mode);
+                cases = cases + 1;
+            }
+        }
+    }
+
+    let cas_modes = ["missing_success", "present_success", "lock_fail", "lock_bad_mode", "read_throw", "write_throw"];
+    let missing_exp = map{ kind: "missing", algorithm: "none", sha256: "" };
+    let present_exp = map{ kind: "present", algorithm: S.RAW_SHA256_ALGORITHM,
+        sha256: SHA256.sha256_hex_bytes([97, 98]) };
+    for op_mode in cas_modes {
+        for rel_mode in rel_modes {
+            for close_mode in close_modes {
+                B.configure("cas", op_mode, rel_mode, close_mode);
+                let exp = missing_exp;
+                if op_mode == "present_success" or op_mode == "read_throw" {
+                    exp = present_exp;
+                }
+                let res = S.private_compare_and_swap("/owned/cas.bin", exp, [110, 101, 119], 64, 100);
+                _assert_cas(res, B, op_mode, rel_mode, close_mode);
+                cases = cases + 1;
+            }
+        }
+    }
+
+    let nonce_modes = ["success", "spent_replay", "policy_fail", "policy_throw", "lock_bad_mode", "write_throw"];
+    let nonce_hex = str_repeat("a", 64);
+    let req_hex = str_repeat("b", 64);
+    for op_mode in nonce_modes {
+        for rel_mode in rel_modes {
+            for close_mode in close_modes {
+                B.configure("nonce", op_mode, rel_mode, close_mode);
+                let res = S.consume_nonce_once("/owned/nonces", nonce_hex, req_hex, 100);
+                _assert_nonce(res, B, op_mode, rel_mode, close_mode);
+                cases = cases + 1;
+            }
+        }
+    }
+
+    B.configure("append", "new_success", "success", "success");
+    assert(not S.append_text_bounded_locked("/owned/state.log", "", 64, 100).ok, "reject empty append text");
+    assert(not S.append_text_bounded_locked("relative.log", "a", 64, 100).ok, "reject relative append path");
+    assert(not S.append_text_bounded_locked("/owned/state.log", "abc", 2, 100).ok, "reject oversized append text");
+    assert(not S.private_compare_and_swap("relative.bin", missing_exp, [1], 64, 100).ok, "reject relative CAS path");
+    assert(not S.private_compare_and_swap("/owned/cas.bin", map{ kind: "bad" }, [1], 64, 100).ok, "reject invalid CAS expectation");
+    assert(not S.private_compare_and_swap("/owned/cas.bin", missing_exp, [300], 64, 100).ok, "reject invalid CAS byte array");
+    assert(not S.consume_nonce_once("/", nonce_hex, req_hex, 100).ok, "reject root nonce state_root");
+    assert(not S.consume_nonce_once("/owned/nonces", "short", req_hex, 100).ok, "reject malformed nonce");
+    assert(not S.classify_nonce_publication_evidence("bad", false, false, false).ok, "reject non-bool evidence");
+    assert(B.state.opens == 0 and B.state.locks == 0 and B.state.closes == 0,
+        "argument validation acquires no handles");
+
+    for denied_op in ["append", "cas", "nonce"] {
+        B.configure(denied_op, "new_success", "success", "success");
+        B.state.admit = false;
+        let denied = nil;
+        let expected_opens = 1;
+        if denied_op == "append" {
+            expected_opens = 2;
+            denied = S.append_text_bounded_locked("/owned/state.log", "abc", 64, 100);
+        } elif denied_op == "cas" {
+            denied = S.private_compare_and_swap("/owned/cas.bin", missing_exp, [1], 64, 100);
+        } else {
+            denied = S.consume_nonce_once("/owned/nonces", nonce_hex, req_hex, 100);
+        }
+        assert(not denied.ok and B.state.opens == expected_opens and B.state.locks == 0
+            and B.state.releases == 0 and B.state.closes == 0,
+            "unacquired parent/root never locks, releases, or closes");
+    }
+
+    return map{ ok: true, matrix_cases: cases, admission_cases: 12 };
+}
+
+export run;
