@@ -18,6 +18,17 @@ let _strict_enumerators = map{};
 
 fn _error(message) { return map{ ok: false, error: message }; }
 
+fn _map_bool(value, key) {
+    if not is_map(value) or not map_has(value, key) { return false; }
+    let field = value[key];
+    return type(field) == "bool" and field;
+}
+
+fn _has_bool_ok(value) {
+    if not is_map(value) or not map_has(value, "ok") { return false; }
+    return type(value.ok) == "bool";
+}
+
 fn _backend_name() {
     if platform() == "linux" { return "linux"; }
     if platform() == "macos" { return "macos"; }
@@ -122,8 +133,8 @@ fn _open_parent(path, create, private_parent) {
     }
     if platform() == "windows" {
         if parts.absolute { return _error("absolute secure roots require an explicit WindowsDirFS root handle"); }
-        let fs = WindowsDirFS.open(".", false);
-        if not fs.ok { return _error("secure Windows root directory is unavailable"); }
+        let fs = try WindowsDirFS.open(".", false) catch nil;
+        if not _map_bool(fs, "ok") { return _error("secure Windows root directory is unavailable"); }
         return map{ ok: true, fs: fs, name: str_replace_all(path, "/", "\\") };
     }
     if parts.absolute and platform() != "linux" {
@@ -132,31 +143,39 @@ fn _open_parent(path, create, private_parent) {
     if _backend_name() == "unavailable" { return _error("secure file backend is unavailable"); }
     if platform() == "linux" and private_parent {
         let private_fs = if parts.absolute {
-            LinuxDirFS.open_absolute(parts.parent, false, false)
-        } else { LinuxDirFS.open(parts.parent, false, false) };
-        if not private_fs.ok and create {
-            let created = create_private_directory_new(parts.parent);
-            if not created.ok { return _error("private parent must exist or be exclusively creatable"); }
+            try LinuxDirFS.open_absolute(parts.parent, false, false) catch nil
+        } else { try LinuxDirFS.open(parts.parent, false, false) catch nil };
+        if not _map_bool(private_fs, "ok") and create {
+            if not _map_bool(create_private_directory_new(parts.parent), "ok") {
+                return _error("private parent must exist or be exclusively creatable");
+            }
             private_fs = if parts.absolute {
-                LinuxDirFS.open_absolute(parts.parent, false, false)
-            } else { LinuxDirFS.open(parts.parent, false, false) };
+                try LinuxDirFS.open_absolute(parts.parent, false, false) catch nil
+            } else { try LinuxDirFS.open(parts.parent, false, false) catch nil };
         }
-        if not private_fs.ok { return _error("private parent directory is unavailable"); }
-        let policy = LinuxDirFS.private_root_status(private_fs);
-        if not policy.ok {
-            _close(private_fs);
+        if not _map_bool(private_fs, "ok") { return _error("private parent directory is unavailable"); }
+        if not _map_bool(try LinuxDirFS.private_root_status(private_fs) catch nil, "ok") {
+            let raw_closed = try _close(private_fs) catch false;
+            if type(raw_closed) != "bool" or not raw_closed {
+                return map{ ok: false, error: "private parent cleanup could not be verified",
+                    cleanup_uncertain: true, parent_close_confirmed: false };
+            }
             return _error("private parent must already be current-user-owned mode 0700");
         }
         return map{ ok: true, fs: private_fs, name: parts.name,
             private_parent_verified: true };
     }
     let fs = nil;
-    if parts.absolute { fs = LinuxDirFS.open_absolute(parts.parent, create, false); }
-    elif platform() == "linux" { fs = LinuxDirFS.open(parts.parent, create, false); }
-    else { fs = PosixDirFS.open(parts.parent, create); }
-    if not fs.ok {
-        return _error("secure parent directory is unavailable: "
-            + (try fs.error catch "descriptor backend rejected the root"));
+    if parts.absolute { fs = try LinuxDirFS.open_absolute(parts.parent, create, false) catch nil; }
+    elif platform() == "linux" { fs = try LinuxDirFS.open(parts.parent, create, false) catch nil; }
+    else { fs = try PosixDirFS.open(parts.parent, create) catch nil; }
+    if not _map_bool(fs, "ok") {
+        let detail = if is_map(fs) and map_has(fs, "error") and type(fs.error) == "string" {
+            fs.error
+        } else {
+            "descriptor backend rejected the root"
+        };
+        return _error("secure parent directory is unavailable: " + detail);
     }
     return map{ ok: true, fs: fs, name: parts.name };
 }
@@ -219,11 +238,43 @@ fn list_directory(path, max_entries = 512) {
     return result;
 }
 
+fn _close_enumerator_fs(fs) {
+    let raw_val = try LinuxDirFS.close(fs) catch false;
+    return type(raw_val) == "bool" and raw_val;
+}
+
+fn _abort_enumerator_fs(fs) {
+    let raw_val = try LinuxDirFS.abort_bounded_enumeration(fs) catch false;
+    return type(raw_val) == "bool" and raw_val;
+}
+
+fn _str_field(value, key, fallback) {
+    if not is_map(value) or not map_has(value, key) { return fallback; }
+    let field = value[key];
+    if type(field) == "string" { return field; }
+    return fallback;
+}
+
+fn _bool_field(value, key, fallback) {
+    if not is_map(value) or not map_has(value, key) { return fallback; }
+    let field = value[key];
+    if type(field) == "bool" { return field; }
+    return fallback;
+}
+
+fn _fail_new_enumerator(fs, message) {
+    if not _close_enumerator_fs(fs) {
+        return map{ ok: false, error: "strict enumerator root cleanup could not be verified",
+            cleanup_uncertain: true, enumerator_closed: false };
+    }
+    return map{ ok: false, error: message, enumerator_closed: true };
+}
+
 fn _purge_bounded_enumerators() {
     let now = now_ms();
     for id in map_keys(_strict_enumerators) {
         if now >= (try _strict_enumerators[id].expires_ms catch 0) {
-            try LinuxDirFS.close(_strict_enumerators[id].fs) catch nil;
+            _close_enumerator_fs(_strict_enumerators[id].fs);
             map_remove(_strict_enumerators, id);
         }
     }
@@ -246,10 +297,12 @@ fn open_bounded_enumerator(root, ttl_ms = 600000) {
     if len(map_keys(_strict_enumerators)) >= STRICT_ENUMERATOR_MAX_HANDLES {
         return _error("strict enumerator handle capacity reached");
     }
-    let fs = LinuxDirFS.open_absolute(root, false, false);
-    if fs == nil or not fs.ok {
+    let fs = try LinuxDirFS.open_absolute(root, false, false) catch nil;
+    if not _map_bool(fs, "ok") {
         let result = _error("strict scan root cannot be held without following links");
-        let error_code = try fs.error_code catch "";
+        let error_code = if is_map(fs) and map_has(fs, "error_code") and type(fs.error_code) == "string" {
+            fs.error_code
+        } else { "" };
         if error_code == "native-cleanup-authority-unavailable" {
             result.error_code = error_code;
         }
@@ -257,29 +310,23 @@ fn open_bounded_enumerator(root, ttl_ms = 600000) {
     }
     let id = try str_slice(sha256(base64_encode_bytes(random_bytes(32)) + ":" + str(now_ms())), 0, 48)
         catch nil;
-    if type(id) != "string" { LinuxDirFS.close(fs); return _error("strict enumerator handle creation failed safely"); }
+    if type(id) != "string" { return _fail_new_enumerator(fs, "strict enumerator handle creation failed safely"); }
     if map_has(_strict_enumerators, id) {
-        LinuxDirFS.close(fs); return _error("strict enumerator handle collision");
+        return _fail_new_enumerator(fs, "strict enumerator handle collision");
     }
     let expires_ms = now_ms() + ttl_ms;
     let public_handle = try map{ ok: true, format: "pblang.secure-file.bounded-enumerator.v1",
         id: id, contains_paths: false, contains_descriptors: false,
         persistable: false, expires_ms: expires_ms } catch nil;
-    if public_handle == nil { LinuxDirFS.close(fs); return _error("strict enumerator handle creation failed safely"); }
-    let stored = try {
-        _strict_enumerators[id] = map{ fs: fs, expires_ms: expires_ms, ttl_ms: ttl_ms };
-        true
-    } catch false;
-    if not stored { LinuxDirFS.close(fs); return _error("strict enumerator handle creation failed safely"); }
+    if public_handle == nil { return _fail_new_enumerator(fs, "strict enumerator handle creation failed safely"); }
+    _strict_enumerators[id] = map{ fs: fs, expires_ms: expires_ms, ttl_ms: ttl_ms };
     return public_handle;
 }
 
 // Scanner-only opener. Admission is derived from the held root descriptor and
 // the current process' bounded mount table; caller-provided flags are ignored.
 fn open_admitted_scan_enumerator(root, ttl_ms = 600000) {
-    let readiness = try LinuxDirFS.scan_mount_admission_status()
-        catch map{ ok: false, ready: false, process_admission_poisoned: true };
-    if not (try readiness.ready catch false) {
+    if not _map_bool(try LinuxDirFS.scan_mount_admission_status() catch nil, "ready") {
         return map{ ok: false,
             error: "scan mount admission is terminally disabled after ambiguous cleanup",
             error_code: "scan-mount-cleanup-poisoned",
@@ -296,19 +343,22 @@ fn open_admitted_scan_enumerator(root, ttl_ms = 600000) {
         return _error("admitted scan enumerator state is unavailable");
     }
     let state = _strict_enumerators[handle.id];
-    let admission = try LinuxDirFS.admit_scan_mount(state.fs)
-        catch map{ ok: false };
-    if not (try admission.ok catch false) {
+    let admission = try LinuxDirFS.admit_scan_mount(state.fs) catch nil;
+    let err_code = _str_field(admission, "error_code", "scan-mount-admission-failed");
+    if not _map_bool(admission, "ok") {
         map_remove(_strict_enumerators, handle.id);
-        let closed = try LinuxDirFS.close(state.fs) catch false;
-        return map{ ok: false,
-            error: "scan root mount admission failed safely",
-            error_code: try admission.error_code catch "scan-mount-admission-failed",
+        let closed = _close_enumerator_fs(state.fs);
+        let out = map{ ok: false,
+            error: if closed { "scan root mount admission failed safely" }
+                else { "scan root mount admission cleanup could not be verified" },
+            error_code: err_code,
             handle_invalidated: true, enumerator_closed: closed,
             held_root_vfs_policy_admitted: false,
             contains_paths: false, contains_descriptors: false,
             contains_mount_identity: false, contains_filesystem_type: false,
             authorizes_idea_admission: false };
+        if not closed { out.cleanup_uncertain = true; }
+        return out;
     }
     handle.held_root_vfs_policy_admitted = true;
     handle.mount_binding_rechecked = false;
@@ -334,29 +384,43 @@ fn enumerate_bounded(handle, relative_path = "", max_entries = 512,
     }
     let state = _strict_enumerators[handle.id];
     state.expires_ms = now_ms() + state.ttl_ms;
-    let outcome = try { map{ ok: true, value: LinuxDirFS.enumerate_bounded(
-        state.fs, relative_path, max_entries, traversal_token) } } catch map{ ok: false };
-    if not outcome.ok {
+    let raw_result = try LinuxDirFS.enumerate_bounded(
+        state.fs, relative_path, max_entries, traversal_token) catch "__enumerator_exception__";
+    let threw = type(raw_result) == "string" and raw_result == "__enumerator_exception__";
+    if threw or not _has_bool_ok(raw_result) {
         map_remove(_strict_enumerators, handle.id);
-        try LinuxDirFS.abort_bounded_enumeration(state.fs) catch false;
-        try LinuxDirFS.close(state.fs) catch false;
-        return _error("strict enumeration failed safely and invalidated its handle");
-    }
-    let result = outcome.value;
-    if type(result) == "map" {
-        result.root_path_exposed = false;
-        result.handle_descriptor_exposed = false;
-        let cleanup_failed = try result.cleanup_failed catch false;
-        let invalidate_handle = try result.invalidate_handle catch false;
-        if cleanup_failed or invalidate_handle {
-            map_remove(_strict_enumerators, handle.id);
-            let closed = try LinuxDirFS.close(state.fs) catch false;
-            result.ok = false;
-            result.cleanup_failed = true;
-            result.invalidate_handle = true;
-            result.handle_invalidated = true;
-            result.enumerator_closed = closed;
+        let cleanup_ok = _abort_enumerator_fs(state.fs);
+        let closed = _close_enumerator_fs(state.fs);
+        if not closed { cleanup_ok = false; }
+        let out = map{ ok: false,
+            error: if threw {
+                "strict enumeration failed safely and invalidated its handle"
+            } else {
+                "strict enumeration result is invalid"
+            },
+            handle_invalidated: true, enumerator_closed: closed,
+            root_path_exposed: false, handle_descriptor_exposed: false };
+        if not cleanup_ok {
+            out.cleanup_failed = true;
+            out.cleanup_uncertain = true;
         }
+        return out;
+    }
+    let result = map{};
+    for key in map_keys(raw_result) { result[key] = raw_result[key]; }
+    result.root_path_exposed = false;
+    result.handle_descriptor_exposed = false;
+    let cleanup_failed = _map_bool(result, "cleanup_failed");
+    let invalidate_handle = _map_bool(result, "invalidate_handle");
+    if cleanup_failed or invalidate_handle {
+        map_remove(_strict_enumerators, handle.id);
+        let closed = _close_enumerator_fs(state.fs);
+        result.ok = false;
+        result.cleanup_failed = true;
+        result.invalidate_handle = true;
+        result.handle_invalidated = true;
+        result.enumerator_closed = closed;
+        if not closed { result.cleanup_uncertain = true; }
     }
     return result;
 }
@@ -371,7 +435,8 @@ fn discard_bounded_traversal(handle, traversal_token) {
     }
     let state = _strict_enumerators[handle.id];
     state.expires_ms = now_ms() + state.ttl_ms;
-    return LinuxDirFS.discard_enumeration_token(state.fs, traversal_token);
+    let raw_val = try LinuxDirFS.discard_enumeration_token(state.fs, traversal_token) catch false;
+    return type(raw_val) == "bool" and raw_val;
 }
 
 fn discard_bounded_content(handle, content_token) {
@@ -388,52 +453,63 @@ fn read_bounded_enumerator_file(handle, content_token, max_bytes = 1048576) {
     }
     let state = _strict_enumerators[handle.id];
     state.expires_ms = now_ms() + state.ttl_ms;
-    let outcome = try { map{ ok: true,
-        value: LinuxDirFS.read_enumerated_file(
-            state.fs, content_token, max_bytes) } } catch map{ ok: false };
-    if not outcome.ok {
+    let raw_result = try LinuxDirFS.read_enumerated_file(
+        state.fs, content_token, max_bytes) catch "__enumerator_exception__";
+    let threw = type(raw_result) == "string" and raw_result == "__enumerator_exception__";
+    if threw or not _has_bool_ok(raw_result) {
         map_remove(_strict_enumerators, handle.id);
-        let cleaned = try LinuxDirFS.abort_bounded_enumeration(state.fs) catch false;
-        let closed = try LinuxDirFS.close(state.fs) catch false;
-        let readiness = try LinuxDirFS.scan_mount_admission_status()
-            catch map{ process_admission_poisoned: true };
-        let poisoned = not cleaned or not closed
-            or (try readiness.process_admission_poisoned catch true);
-        return map{ ok: false,
-            error: if poisoned {
+        let cleanup_ok = _abort_enumerator_fs(state.fs);
+        let closed = _close_enumerator_fs(state.fs);
+        if not closed { cleanup_ok = false; }
+        let readiness = try LinuxDirFS.scan_mount_admission_status() catch nil;
+        let poisoned = _bool_field(readiness, "process_admission_poisoned", true);
+        if not cleanup_ok { poisoned = true; }
+        let err_msg = "strict content read result is invalid";
+        if threw {
+            err_msg = if poisoned {
                 "strict content exception left ambiguous cleanup"
-            } else { "strict content read failed safely" },
+            } else { "strict content read failed safely" };
+        }
+        let err_code = "strict-content-invalid-result";
+        if poisoned { err_code = "scan-mount-cleanup-poisoned"; }
+        elif threw { err_code = "strict-content-exception"; }
+        let out = map{ ok: false,
+            error: err_msg,
             cleanup_failed: poisoned, process_admission_poisoned: poisoned,
-            error_code: if poisoned { "scan-mount-cleanup-poisoned" }
-                else { "strict-content-exception" },
+            error_code: err_code,
             invalidate_handle: true, handle_invalidated: true,
             enumerator_closed: closed, contains_paths: false,
             contains_bytes: false, contains_tokens: false };
+        if not cleanup_ok { out.cleanup_uncertain = true; }
+        return out;
     }
-    let result = outcome.value;
-    if type(result) == "map" {
-        result.root_path_exposed = false;
-        result.handle_descriptor_exposed = false;
-        let cleanup_failed = try result.cleanup_failed catch false;
-        let invalidate_handle = try result.invalidate_handle catch false;
-        if cleanup_failed or invalidate_handle {
-            map_remove(_strict_enumerators, handle.id);
-            let closed = try LinuxDirFS.close(state.fs) catch false;
-            let readiness = try LinuxDirFS.scan_mount_admission_status()
-                catch map{ process_admission_poisoned: true,
-                    error_code: "scan-mount-cleanup-poisoned" };
-            let poisoned = try readiness.process_admission_poisoned catch true;
-            return map{ ok: false,
-                error: "strict content cleanup failed and invalidated its handle",
-                cleanup_failed: true, invalidate_handle: true,
-                process_admission_poisoned: poisoned,
-                error_code: if poisoned {
-                    try readiness.error_code catch "scan-mount-cleanup-poisoned"
-                } else { try result.error_code catch "strict-content-cleanup-failed" },
-                handle_invalidated: true, enumerator_closed: closed,
-                contains_paths: false, contains_bytes: false,
-                contains_tokens: false };
-        }
+    let result = map{};
+    for key in map_keys(raw_result) { result[key] = raw_result[key]; }
+    result.root_path_exposed = false;
+    result.handle_descriptor_exposed = false;
+    let cleanup_failed = _map_bool(result, "cleanup_failed");
+    let invalidate_handle = _map_bool(result, "invalidate_handle");
+    if cleanup_failed or invalidate_handle {
+        map_remove(_strict_enumerators, handle.id);
+        let closed = _close_enumerator_fs(state.fs);
+        let readiness = try LinuxDirFS.scan_mount_admission_status() catch nil;
+        let poisoned = _bool_field(readiness, "process_admission_poisoned", true);
+        if not closed { poisoned = true; }
+        let err_code = if poisoned {
+            _str_field(readiness, "error_code", "scan-mount-cleanup-poisoned")
+        } else {
+            _str_field(result, "error_code", "strict-content-cleanup-failed")
+        };
+        let out = map{ ok: false,
+            error: "strict content cleanup failed and invalidated its handle",
+            cleanup_failed: true, invalidate_handle: true,
+            process_admission_poisoned: poisoned,
+            error_code: err_code,
+            handle_invalidated: true, enumerator_closed: closed,
+            contains_paths: false, contains_bytes: false,
+            contains_tokens: false };
+        if not closed { out.cleanup_uncertain = true; }
+        return out;
     }
     return result;
 }
@@ -448,25 +524,31 @@ fn restart_bounded_enumerator(handle) {
     }
     let state = _strict_enumerators[handle.id];
     state.expires_ms = now_ms() + state.ttl_ms;
-    let outcome = try { map{ ok: true,
-        value: LinuxDirFS.restart_bounded_enumeration(state.fs) } }
-        catch map{ ok: false };
-    if not outcome.ok {
+    let raw_result = try LinuxDirFS.restart_bounded_enumeration(state.fs)
+        catch "__enumerator_exception__";
+    let threw = type(raw_result) == "string" and raw_result == "__enumerator_exception__";
+    if threw or not _has_bool_ok(raw_result) {
         map_remove(_strict_enumerators, handle.id);
-        let closed = try LinuxDirFS.close(state.fs) catch false;
-        return map{ ok: false, error: "strict enumeration restart failed safely",
+        let closed = _close_enumerator_fs(state.fs);
+        let out = map{ ok: false,
+            error: if threw { "strict enumeration restart failed safely" }
+                else { "strict enumeration restart result is invalid" },
             handle_invalidated: true, enumerator_closed: closed,
             contains_paths: false, contains_tokens: false };
+        if not closed { out.cleanup_uncertain = true; }
+        return out;
     }
-    let result = outcome.value;
+    let result = map{};
+    for key in map_keys(raw_result) { result[key] = raw_result[key]; }
     result.contains_paths = false; result.contains_tokens = false;
-    let cleanup_failed = try result.cleanup_failed catch false;
-    let invalidate_handle = try result.invalidate_handle catch false;
+    let cleanup_failed = _map_bool(result, "cleanup_failed");
+    let invalidate_handle = _map_bool(result, "invalidate_handle");
     if cleanup_failed or invalidate_handle {
         map_remove(_strict_enumerators, handle.id);
-        let closed = try LinuxDirFS.close(state.fs) catch false;
+        let closed = _close_enumerator_fs(state.fs);
         result.ok = false; result.handle_invalidated = true;
         result.enumerator_closed = closed;
+        if not closed { result.cleanup_uncertain = true; }
     }
     return result;
 }
@@ -481,18 +563,24 @@ fn recheck_admitted_scan_enumerator(handle) {
     }
     let state = _strict_enumerators[handle.id];
     state.expires_ms = now_ms() + state.ttl_ms;
-    let result = try LinuxDirFS.recheck_scan_mount(state.fs)
+    let raw_result = try LinuxDirFS.recheck_scan_mount(state.fs)
         catch map{ ok: false, invalidate_handle: true };
-    if not (try result.ok catch false) {
+    if not _map_bool(raw_result, "ok") {
         map_remove(_strict_enumerators, handle.id);
-        let closed = try LinuxDirFS.close(state.fs) catch false;
-        return map{ ok: false, error: "scan root mount binding recheck failed safely",
+        let closed = _close_enumerator_fs(state.fs);
+        let out = map{ ok: false,
+            error: if closed { "scan root mount binding recheck failed safely" }
+                else { "scan root mount binding recheck cleanup could not be verified" },
             handle_invalidated: true, enumerator_closed: closed,
             held_root_vfs_policy_admitted: false, mount_binding_rechecked: false,
             contains_paths: false, contains_descriptors: false,
             contains_mount_identity: false, contains_filesystem_type: false,
             authorizes_idea_admission: false };
+        if not closed { out.cleanup_uncertain = true; }
+        return out;
     }
+    let result = map{};
+    for key in map_keys(raw_result) { result[key] = raw_result[key]; }
     result.contains_descriptors = false;
     result.authorizes_idea_admission = false;
     return result;
@@ -505,7 +593,7 @@ fn close_bounded_enumerator(handle) {
     }
     let state = _strict_enumerators[handle.id];
     map_remove(_strict_enumerators, handle.id);
-    return LinuxDirFS.close(state.fs);
+    return _close_enumerator_fs(state.fs);
 }
 
 fn bounded_enumerator_status() {
@@ -659,8 +747,8 @@ fn _read_optional_owned(parent, max_bytes) {
         return loaded;
     }
     let bytes = try loaded.bytes catch nil; let size = try loaded.size catch nil;
-    if not is_array(bytes) or type(size) != "number" or size != size or size < 0
-        or size > max_bytes or size != num_floor(size) or size != len(bytes) {
+    if not is_array(bytes) or type(size) != "number" or not (size >= 0 and size <= max_bytes)
+        or size != num_floor(size) or size != len(bytes) {
         return _error("secure optional read result is invalid");
     }
     let text = try bytes_to_str(bytes) catch nil;
@@ -708,8 +796,8 @@ fn _open_immutable_snapshot_owned(fs, name, max_bytes) {
     let immutable = try snapshot.immutable catch nil;
     if type(active) != "bool" or not active
        or type(immutable) != "bool" or not immutable
-       or type(size) != "number" or size != size
-       or size < 0 or size > max_bytes or size != num_floor(size) {
+       or type(size) != "number" or not (size >= 0 and size <= max_bytes)
+       or size != num_floor(size) {
         try LinuxDirFS.close_child_descriptor(fs, snapshot) catch false;
         return _error("immutable reader snapshot result is invalid");
     }
@@ -1126,17 +1214,6 @@ fn write_text_new_exclusive(path, text, create_parent = true, private_parent = f
     return write_new_exclusive(path, str_to_bytes(text), create_parent, private_parent);
 }
 
-fn _map_bool(value, key) {
-    if not is_map(value) or not map_has(value, key) { return false; }
-    let field = value[key];
-    return type(field) == "bool" and field;
-}
-
-fn _has_bool_ok(value) {
-    if not is_map(value) or not map_has(value, "ok") { return false; }
-    return type(value.ok) == "bool";
-}
-
 fn _append_locked_owned(fs, name, text, addition, max_bytes) {
     let first = LinuxDirFS.write_new_atomic(fs, name, addition, false);
     if not _has_bool_ok(first) {
@@ -1529,10 +1606,8 @@ fn consume_nonce_once(state_root, nonce, request_sha256, timeout_ms = 2000) {
     if not _map_bool(fs, "ok") {
         return _error("private nonce root unavailable");
     }
-    let policy = try LinuxDirFS.private_root_status(fs) catch nil;
-    if not _map_bool(policy, "ok") {
-        let cleaned_root = _cleanup_rejected_lock(fs, nil, false);
-        if not cleaned_root.ok {
+    if not _map_bool(try LinuxDirFS.private_root_status(fs) catch nil, "ok") {
+        if not _cleanup_rejected_lock(fs, nil, false).ok {
             return map{ ok: false, error: "private nonce root cleanup could not be verified",
                 cleanup_uncertain: true, root_closed: false, retry_safe: false,
                 effect_admitted: false, evidence_indeterminate: true };

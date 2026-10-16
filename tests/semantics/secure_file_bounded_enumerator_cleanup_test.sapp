@@ -1,0 +1,259 @@
+// Counted resource-free backend; tests _open_parent private-parent policy/close
+// cleanup and bounded enumerator lifecycle (open_bounded_enumerator,
+// open_admitted_scan_enumerator, enumerate_bounded, discard_bounded_traversal,
+// read_bounded_enumerator_file, restart_bounded_enumerator,
+// recheck_admitted_scan_enumerator, close_bounded_enumerator) ownership,
+// single abort/close verification, exception redaction, and reply validation.
+
+fn _assert_private_parent(res, B, op_mode, close_mode) {
+    let close_ok = close_mode == "success";
+    assert(B.state.opens == 1 and B.state.policy_checks == 1 and B.state.closes == 1
+        and type(close_ok) == "bool",
+        "private-parent read opens parent, checks policy, and closes parent once");
+    if op_mode == "policy_fail" or op_mode == "policy_throw" {
+        assert(not res.ok, "rejected or throwing private_root_status fails closed");
+        if not close_ok {
+            assert(res.cleanup_uncertain and not res.parent_close_confirmed
+                and res.error == "private parent cleanup could not be verified",
+                "unconfirmed close after private-parent policy failure reports cleanup_uncertain");
+        } else {
+            assert(res.error == "private parent must already be current-user-owned mode 0700"
+                and not map_has(res, "cleanup_uncertain"),
+                "confirmed close after private-parent policy failure reports standard error");
+        }
+    } elif not close_ok {
+        assert(not res.ok and res.cleanup_uncertain and not res.parent_close_confirmed,
+            "unconfirmed parent close after read fails closed");
+    } else {
+        assert(res.ok and res.text == "ok", "confirmed private-parent read succeeds");
+    }
+    assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+        "thrown value never escapes private-parent read");
+}
+
+fn _assert_open_admitted(res, B, op_mode, close_mode) {
+    assert(B.state.opens == 1 and B.state.admits == 1,
+        "admitted scan enumerator opens root and checks mount admission once");
+    let close_ok = close_mode == "success";
+    if op_mode == "success" {
+        assert(res.ok and B.state.closes == 0 and res.held_root_vfs_policy_admitted
+            and not res.contains_paths and not res.contains_descriptors,
+            "successful admitted scan open keeps root open in handle registry");
+        let closed = B.state.close_fn(res);
+        assert(closed == close_ok and B.state.closes == 1,
+            "close_bounded_enumerator verifies boolean true close once");
+        return nil;
+    }
+    assert(not res.ok and res.handle_invalidated and B.state.closes == 1
+        and res.enumerator_closed == close_ok
+        and not res.held_root_vfs_policy_admitted and not res.authorizes_idea_admission,
+        "failed admitted scan open closes acquired root once and denies admission");
+    if not close_ok {
+        assert(res.cleanup_uncertain
+            and res.error == "scan root mount admission cleanup could not be verified",
+            "unconfirmed root close on failed admitted scan open marks cleanup_uncertain");
+    } else {
+        assert(res.error == "scan root mount admission failed safely"
+            and not map_has(res, "cleanup_uncertain"),
+            "confirmed root close on failed admitted scan open omits cleanup_uncertain");
+    }
+    assert(not B.state.close_fn(res), "failed admitted scan open leaves no active handle");
+    assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+        "thrown value never escapes open_admitted_scan_enumerator");
+}
+
+fn _assert_step_or_read(res, B, kind, op_mode, abort_mode, close_mode) {
+    let close_ok = close_mode == "success";
+    let abort_ok = abort_mode == "success";
+    assert(type(abort_ok) == "bool", "abort_ok is boolean");
+    if op_mode == "success" {
+        assert(res.ok and B.state.aborts == 0 and B.state.closes == 0
+            and not res.root_path_exposed and not res.handle_descriptor_exposed,
+            "successful step/read keeps enumerator open");
+        let closed = B.state.close_fn(B.state.active_handle);
+        assert(closed == close_ok and B.state.closes == 1,
+            "closing active handle after step/read closes root once");
+        return nil;
+    }
+    assert(not res.ok and res.handle_invalidated and B.state.closes == 1
+        and res.enumerator_closed == close_ok,
+        "terminal step/read failure invalidates handle and closes root once");
+    if op_mode == "op_throw" or op_mode == "bad_reply" {
+        assert(B.state.aborts == 1, "exception or malformed reply aborts enumeration once");
+        if kind == "read" and (not abort_ok or not close_ok) {
+            assert(res.process_admission_poisoned,
+                "unconfirmed abort or close poisons process admission");
+        }
+    } else {
+        assert(B.state.aborts == 0 and res.cleanup_failed and res.invalidate_handle,
+            "backend cleanup_failed closes root once without duplicate abort");
+        if kind == "read" and not close_ok {
+            assert(res.process_admission_poisoned,
+                "unconfirmed close after cleanup_failed poisons process admission");
+        }
+    }
+    if not close_ok {
+        assert(res.cleanup_uncertain, "unconfirmed close marks cleanup_uncertain");
+    }
+    if kind == "read" {
+        assert(not res.contains_bytes, "failed content read never exposes bytes");
+    }
+    assert(not B.state.close_fn(B.state.active_handle),
+        "invalidated handle is already removed from registry");
+    assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+        "thrown value never escapes step/read");
+}
+
+fn _assert_restart_or_recheck(res, B, kind, op_mode, close_mode) {
+    let close_ok = close_mode == "success";
+    if op_mode == "success" {
+        assert(res.ok and B.state.closes == 0, "successful restart/recheck keeps handle active");
+        let closed = B.state.close_fn(B.state.active_handle);
+        assert(closed == close_ok and B.state.closes == 1,
+            "closing active handle after restart/recheck closes root once");
+        return nil;
+    }
+    assert(not res.ok and res.handle_invalidated and B.state.closes == 1
+        and res.enumerator_closed == close_ok,
+        "failed restart/recheck invalidates handle and closes root once");
+    if not close_ok {
+        assert(res.cleanup_uncertain,
+            "unconfirmed close on failed restart/recheck marks cleanup_uncertain");
+    }
+    if kind == "recheck" {
+        assert(not res.held_root_vfs_policy_admitted and not res.mount_binding_rechecked,
+            "failed recheck clears admission flags");
+    }
+    assert(not B.state.close_fn(B.state.active_handle),
+        "invalidated handle after restart/recheck is removed from registry");
+    assert(not str_contains(json_stringify(res), "synthetic-private-value"),
+        "thrown value never escapes restart/recheck");
+}
+
+fn run(S, B) {
+    B.state.close_fn = fn(h) { return S.close_bounded_enumerator(h); };
+    let cases = 0;
+    let close_modes = ["success", "false", "nil", "throw"];
+    let abort_modes = ["success", "false", "throw"];
+
+    for op_mode in ["success", "policy_fail", "policy_throw"] {
+        for close_mode in close_modes {
+            B.configure("private_parent", op_mode, "success", close_mode);
+            let res = S.read_text("/owned/item.txt", 32, true);
+            _assert_private_parent(res, B, op_mode, close_mode);
+            cases = cases + 1;
+        }
+    }
+
+    for op_mode in ["success", "admit_fail", "admit_throw", "admit_bad_reply"] {
+        for close_mode in close_modes {
+            B.configure("admitted", op_mode, "success", close_mode);
+            let res = S.open_admitted_scan_enumerator("/owned/root", 60000);
+            _assert_open_admitted(res, B, op_mode, close_mode);
+            cases = cases + 1;
+        }
+    }
+
+    for kind in ["step", "read"] {
+        for op_mode in ["success", "cleanup_failed", "op_throw", "bad_reply"] {
+            for abort_mode in abort_modes {
+                for close_mode in close_modes {
+                    B.configure("bounded", "success", abort_mode, "success");
+                    let h = S.open_bounded_enumerator("/owned/root", 60000);
+                    assert(h.ok, "setup handle opened");
+                    B.configure(kind, op_mode, abort_mode, close_mode);
+                    B.state.active_handle = h;
+                    let res = if kind == "step" {
+                        S.enumerate_bounded(h, "", 8, nil)
+                    } else {
+                        S.read_bounded_enumerator_file(h, "ctok-1", 64)
+                    };
+                    _assert_step_or_read(res, B, kind, op_mode, abort_mode, close_mode);
+                    cases = cases + 1;
+                }
+            }
+        }
+    }
+
+    for kind in ["restart", "recheck"] {
+        let modes = if kind == "restart" {
+            ["success", "cleanup_failed", "op_throw", "bad_reply"]
+        } else {
+            ["success", "recheck_fail", "op_throw", "bad_reply"]
+        };
+        for op_mode in modes {
+            for close_mode in close_modes {
+                B.configure("admitted", "success", "success", "success");
+                let h = S.open_admitted_scan_enumerator("/owned/root", 60000);
+                assert(h.ok, "setup admitted handle opened");
+                B.configure(kind, op_mode, "success", close_mode);
+                B.state.active_handle = h;
+                let res = if kind == "restart" {
+                    S.restart_bounded_enumerator(h)
+                } else {
+                    S.recheck_admitted_scan_enumerator(h)
+                };
+                _assert_restart_or_recheck(res, B, kind, op_mode, close_mode);
+                cases = cases + 1;
+            }
+        }
+    }
+
+    for disc_mode in ["success", "false", "nil", "throw"] {
+        B.configure("bounded", "success", "success", "success");
+        let h = S.open_bounded_enumerator("/owned/root", 60000);
+        B.state.discard_mode = disc_mode;
+        let d_ok = S.discard_bounded_traversal(h, "ttok-1");
+        assert(d_ok == (disc_mode == "success"),
+            "discard_bounded_traversal requires boolean true");
+        assert(S.close_bounded_enumerator(h), "cleanup handle after discard test");
+        cases = cases + 1;
+    }
+
+    // Handle table capacity enforcement (16 handles max, 17th rejected before opening)
+    B.configure("bounded", "success", "success", "success");
+    let opened_handles = [];
+    let idx = 0;
+    while idx < 16 {
+        let h = S.open_bounded_enumerator("/owned/root", 60000);
+        assert(h.ok, "open handle within capacity");
+        array_push(opened_handles, h);
+        idx = idx + 1;
+    }
+    B.configure("bounded", "success", "success", "success");
+    assert(not S.open_bounded_enumerator("/owned/root", 60000).ok
+        and B.state.opens == 0 and B.state.closes == 0,
+        "17th handle is rejected before acquiring a descriptor");
+    for h_item in opened_handles {
+        assert(S.close_bounded_enumerator(h_item), "close capacity handle");
+    }
+    cases = cases + 1;
+
+    // Admission checks (14 cases)
+    B.configure("bounded", "success", "success", "success");
+    assert(not S.open_bounded_enumerator("", 1000).ok, "reject empty root path");
+    assert(not S.open_bounded_enumerator("relative", 1000).ok, "reject relative root path");
+    assert(not S.open_bounded_enumerator("/owned/root", 999).ok, "reject sub-1000ms ttl_ms");
+    assert(not S.open_bounded_enumerator("/owned/root", 600001).ok, "reject excessive ttl_ms");
+    assert(not S.open_admitted_scan_enumerator("", 1000).ok, "reject empty admitted scan path");
+    assert(not S.open_admitted_scan_enumerator("/owned/root", -1).ok, "reject negative admitted scan ttl_ms");
+    assert(not S.enumerate_bounded(nil, "", 8, nil).ok, "reject nil handle in enumerate_bounded");
+    assert(not S.discard_bounded_traversal(nil, "tok"), "reject nil handle in discard_bounded_traversal");
+    assert(not S.read_bounded_enumerator_file(nil, "tok", 64).ok, "reject nil handle in read_bounded_enumerator_file");
+    assert(not S.restart_bounded_enumerator(nil).ok, "reject nil handle in restart_bounded_enumerator");
+    assert(not S.recheck_admitted_scan_enumerator(nil).ok, "reject nil handle in recheck_admitted_scan_enumerator");
+    assert(not S.close_bounded_enumerator(nil), "reject nil handle in close_bounded_enumerator");
+    assert(B.state.opens == 0 and B.state.closes == 0, "invalid arguments never open or close handles");
+
+    B.state.admit = false;
+    assert(not S.open_bounded_enumerator("/owned/root", 1000).ok and B.state.opens == 1 and B.state.closes == 0,
+        "unacquired bounded enumerator root never closes");
+    B.configure("private_parent", "success", "success", "success");
+    B.state.admit = false;
+    assert(not S.read_text("/owned/item.txt", 32, true).ok and B.state.opens == 1 and B.state.closes == 0,
+        "unacquired private parent never closes");
+
+    return map{ ok: true, matrix_cases: cases, admission_cases: 14 };
+}
+
+export run;
