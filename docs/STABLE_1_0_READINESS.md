@@ -86,7 +86,7 @@ phases can overlap, but runtime changes can also invalidate earlier results.
 Re-estimate after the first 2–4 week inventory/baseline phase using observed
 throughput and the actual blocked targets. Do not change the manifest to stable
 until the gates pass. This document schedules no background work and deploys
-nothing; EnterpriseOrg servers are excluded from all testing.
+nothing; external production servers are excluded from all testing.
 
 ## Prioritized 1.0.0-stable & Public GitHub Release Backlog (2026-10-18)
 

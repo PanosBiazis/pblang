@@ -46,10 +46,10 @@ training, retrieval, evaluation, or design-reference sources.
 - `ai/Sp_AIModel` - Pascal model/text processor reference.
 - `ai/AI`, `ai/Delphi_AI` - repeated Delphi/C# assistant prototypes, chat history,
   Google Drive integration, file parsing, RAG, and question-template ideas.
-- `ai/WEB/FinSystem` - financial/reporting web system, auth, services, technical analysis,
+- `ai/WEB/financial-web` - financial/reporting web system, auth, services, technical analysis,
   localization, attachments, and reporting docs.
-- `ai/WEB/Sales` - sales/customer search app, data model, importers, auth/security docs.
-- `ai/WEB/EnterpriseOrg.*` - financial migration, data repositories, reporting abstractions,
+- `ai/WEB/commercial-crm` - sales/customer search app, data model, importers, auth/security docs.
+- `ai/WEB/enterprise-reporting.*` - financial migration, data repositories, reporting abstractions,
   report renderers, and legacy-to-web modernization references.
 
 ## Sibling Projects Folder
@@ -82,7 +82,7 @@ Use bounded commands:
 ```bash
 pblang run tools/pbai_feed.sapp --allow-all -- drives_survey
 pblang run tools/pbai_feed.sapp --allow-all -- drives 10 2
-pblang run tools/pbai_feed.sapp --allow-all -- path "../../ai/WEB/FinSystem" 40 3
+pblang run tools/pbai_feed.sapp --allow-all -- path "../../ai/WEB/financial-web" 40 3
 pblang run tools/pbai_feed.sapp --allow-all -- path "/path/to/curated/project" 40 3
 ```
 
