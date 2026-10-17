@@ -71,17 +71,9 @@ pblang is a general-purpose programming language and bytecode VM designed for em
 
 ## Quick start
 
-### Prerequisites
+### Standalone Execution (No External Toolchain Required)
 
-- Rust 1.70+
-
-### Build
-
-```bash
-git clone https://github.com/PanosBiazis/pblang.git
-cd pblang
-cargo build --release
-```
+With a sealed `pblang` release bundle installed on `PATH`, no external compiler or Rust toolchain is required to run, check, lint, or compile `.sapp` programs.
 
 ### Hello World
 
@@ -97,11 +89,27 @@ fn add(a, b) {
 print add(2, 3);
 ```
 
-Run it:
+Run, check, and lint it directly with `pblang`:
 
 ```bash
-cargo run -- run hello.sapp
+pblang run hello.sapp
+pblang check hello.sapp
+pblang lint hello.sapp
 ```
+
+### 100% PBLang Native Compilation (`x64`, `arm64`, `wasm`, `pbck`)
+
+`tools/pbc.sapp` compiles `.sapp` programs directly to standalone static Linux `x86-64` ELF executables, `AArch64/ARM64` ELF executables, WebAssembly (`.wasm`), or `.pbck` bytecode using pure-PBLang code generators (`stdlib/native/codegen_x64.sapp`, `stdlib:codegen_arm64_ast.sapp`, `stdlib:codegen_wasm.sapp`, `stdlib:compiler/native_pbck.sapp`) — with zero `rustc`/`cargo` or external C toolchain required:
+
+```bash
+pblang run tools/pbc.sapp --allow-all -- hello.sapp --target x64 --out hello
+chmod +x ./hello && ./hello
+
+pblang run tools/pbc.sapp --allow-all -- hello.sapp --target arm64 --out hello-arm64
+pblang run tools/pbc.sapp --allow-all -- hello.sapp --target wasm --out hello.wasm
+pblang run tools/pbc.sapp --allow-all -- hello.sapp --target pbck --out hello.pbck
+```
+
 
 ### One-line applications
 

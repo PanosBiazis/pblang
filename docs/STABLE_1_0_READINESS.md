@@ -87,3 +87,15 @@ Re-estimate after the first 2–4 week inventory/baseline phase using observed
 throughput and the actual blocked targets. Do not change the manifest to stable
 until the gates pass. This document schedules no background work and deploys
 nothing; EnterpriseOrg servers are excluded from all testing.
+
+## Prioritized 1.0.0-stable & Public GitHub Release Backlog (2026-10-18)
+
+| Priority | Backlog ID | Area | Deliverable (100% PBLang, `0` Lint Warnings) | Status |
+| --- | --- | --- | --- | --- |
+| **P1 — Critical (S1)** | `PB-02-022` | Rust-Independence in Native TLS & PEM Engine | `stdlib/tls.sapp`: `validate_cert_pair`, `inspect_certificate`, `pblang_tls13_status` bypassing `rustls` `CryptoProvider` (`ring` vs `aws-lc-rs`) conflicts + `stdlib/auto_tls_gateway.sapp` ACME HTTP-01 & 30-day renewal. | **Delivered (`tests/public_release_readiness_test.sapp`)** |
+| **P1 — Critical (S1)** | `PB-02-019` | Relative-Root Bundle Source Integrity & Overlap Guard | `stdlib/selfhost_bundle.sapp` & `stdlib/compiler/native_bundle.sapp`: `validate_bundle_destination`, `bundle_file_from_root`, `write_bundle_safe`, `publish_bundle_safe` preserving source bytes and rejecting self-copy/overlap/`.sapp` targets before write. | **Delivered (`tests/public_release_readiness_test.sapp`)** |
+| **P1 — Critical (S1)** | `PB-02-023` | Public GitHub Hygiene, Privacy & `1.0.0` Gate Auditor | `stdlib/public_release_audit.sapp`: `scan_text_for_private_leaks`, `audit_repository_tree`, `audit_readme_rust_independence`, `evaluate_1_0_stability_gates` with O(1) `len(args)` guards and `ordered_input: true`. | **Delivered (`tests/public_release_readiness_test.sapp`)** |
+| **P2 — High (S1)** | `PB-02-024` | Public Documentation & Zero-Rust Quickstart | `README.md`: Standalone `pblang` execution and 100% PBLang native compilation (`tools/pbc.sapp` to `x64`, `arm64`, `wasm`, `pbck`) without requiring `cargo`/`rustc` as a user prerequisite; by-default A+ web security (`stdlib/http_server.sapp`, `stdlib/modern_ui_web.sapp`). | **Delivered (`README.md`)** |
+| **P2 — High (S2)** | `PB-02-025` | Differential Multi-Backend Compiler Parity Suite | `stdlib/compiler/backend_parity.sapp`: Automated parity verification across `selfhost_vm`, `native_pbck`, `c99_transpiler`, `x86_64_elf`, `arm64_elf`, and `wasm32`. | **Delivered (`tests/public_release_readiness_test.sapp`)** |
+| **P3 — Open Gate** | `PB-02-001` / `PB-02-018` | Full Retained Bootstrap Removal & Cross-OS Physical Matrix | Eliminate remaining retained host bootstrap boundaries (`ROOT-CORE-01`) and complete physical non-modeled Windows/macOS/iOS/Android hardware release qualification before flipping `pblang.toml` channel from `alpha` to `1.0.0-stable`. | **Open (Tracked in `CURRENT_BACKLOG.md`)** |
+

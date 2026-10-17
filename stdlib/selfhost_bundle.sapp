@@ -408,13 +408,125 @@ fn bundle_file(main_path) {
     return bundle(src, _fs_resolve);
 }
 
+fn _norm_abs_path(p) {
+    if type(p) != "string" or len(p) == 0 or len(p) > 4096
+        or str_contains(p, strfromcharcode(0)) or str_contains(p, "\\") {
+        return nil;
+    }
+    let raw = p;
+    if not str_starts_with(raw, "/") {
+        let base = try cwd() catch ".";
+        raw = base + "/" + raw;
+    }
+    let parts = str_split(raw, "/");
+    let stack = [];
+    let i = 0;
+    while i < len(parts) {
+        let seg = parts[i];
+        if seg == "" or seg == "." {
+            // skip
+        } elif seg == ".." {
+            if len(stack) > 0 { array_pop(stack); }
+        } else {
+            array_push(stack, seg);
+        }
+        i = i + 1;
+    }
+    return "/" + str_join(stack, "/");
+}
+
+// PB-02-019: Validate that bundle destination never aliases or overlaps the source
+// entry, relative root, or a .sapp source file before any write occurs.
+fn validate_bundle_destination(main_path, out_path, root_dir = ".") {
+    let abs_main = _norm_abs_path(main_path);
+    let abs_out = _norm_abs_path(out_path);
+    let abs_root = _norm_abs_path(root_dir);
+    if abs_main == nil or abs_out == nil or abs_root == nil {
+        return map{ ok: false, ordered_input: true, reason: "invalid bundle source, root, or destination path" };
+    }
+    if abs_out == "/" or abs_root == "/" {
+        return map{ ok: false, ordered_input: true, reason: "bundle root or destination cannot be /" };
+    }
+    if str_ends_with(abs_out, ".sapp") {
+        return map{ ok: false, ordered_input: true, reason: "bundle destination cannot overwrite a .sapp source file" };
+    }
+    if abs_out == abs_main or abs_out == abs_root
+        or str_starts_with(abs_out, abs_main + "/")
+        or str_starts_with(abs_main, abs_out + "/")
+        or str_starts_with(abs_out, abs_root + "/")
+        or str_starts_with(abs_root, abs_out + "/") {
+        return map{ ok: false, ordered_input: true, reason: "bundle destination overlaps source root or entry" };
+    }
+    return map{
+        ok: true,
+        ordered_input: true,
+        main_abs: abs_main,
+        out_abs: abs_out,
+        root_abs: abs_root
+    };
+}
+
+fn bundle_file_from_root(main_path, root_dir = ".") {
+    let abs_root = _norm_abs_path(root_dir);
+    if abs_root == nil or abs_root == "/" {
+        return _err("invalid relative root directory");
+    }
+    let resolved_main = main_path;
+    if type(main_path) == "string" and not str_starts_with(main_path, "/") {
+        let candidate = abs_root + "/" + main_path;
+        if (try fs_exists(candidate) catch false) {
+            resolved_main = candidate;
+        }
+    }
+    let src = try bytes_to_str(fs_read_bytes(resolved_main)) catch nil;
+    if src == nil { return _err("cannot read main from root"); }
+    let root_resolver = fn(p) {
+        if type(p) != "string" or p == "" or str_contains(p, strfromcharcode(0))
+            or str_contains(p, "\\") or str_contains(p, "/../")
+            or str_starts_with(p, "../") or str_ends_with(p, "/..") {
+            return nil;
+        }
+        let path = _canonical_path(p);
+        if str_starts_with(path, "stdlib/") {
+            return _fs_resolve(path);
+        }
+        let in_root = abs_root + "/" + path;
+        let from_root = try bytes_to_str(fs_read_bytes(in_root)) catch nil;
+        if from_root != nil { return from_root; }
+        return _fs_resolve(path);
+    };
+    return bundle(src, root_resolver);
+}
+
 // Bundle `main_path` and write a self-contained Rust .pbck to `out_path`.
 // Returns {ok:true, modules, out} or {ok:false, reason}.
 fn write_bundle(main_path, out_path) {
+    let abs_main = _norm_abs_path(main_path);
+    let abs_out = _norm_abs_path(out_path);
+    if abs_main == nil or abs_out == nil or abs_main == abs_out or str_ends_with(abs_out, ".sapp") {
+        return _err("bundle destination overlaps source or targets a .sapp file");
+    }
     let b = bundle_file(main_path);
     if not b.ok { return b; }
     fs_write_bytes(out_path, _TO_PBCK.translate(b.chunk));
     return map{ ok: true, modules: b.modules, out: out_path };
+}
+
+fn write_bundle_safe(main_path, out_path, root_dir = ".") {
+    let check = validate_bundle_destination(main_path, out_path, root_dir);
+    if not check.ok { return _err(check.reason); }
+    let b = bundle_file_from_root(main_path, root_dir);
+    if not b.ok { return b; }
+    let bytes = _TO_PBCK.translate(b.chunk);
+    fs_write_bytes(out_path, bytes);
+    return map{
+        ok: true,
+        ordered_input: true,
+        modules: b.modules,
+        out: out_path,
+        byte_count: len(bytes),
+        source_writes: false
+    };
 }
 
 // Bundle `main_path` and write a self-contained SELF-HOSTED (PBCS) .pbck to
@@ -423,6 +535,11 @@ fn write_bundle(main_path, out_path) {
 // runs via stdlib/selfhost_loader.sapp with no Rust front-end in the path.
 // Returns {ok:true, modules, out, bytes} or {ok:false, reason}.
 fn write_bundle_selfhost(main_path, out_path) {
+    let abs_main = _norm_abs_path(main_path);
+    let abs_out = _norm_abs_path(out_path);
+    if abs_main == nil or abs_out == nil or abs_main == abs_out or str_ends_with(abs_out, ".sapp") {
+        return _err("bundle destination overlaps source or targets a .sapp file");
+    }
     let b = bundle_file(main_path);
     if not b.ok { return b; }
     let blob = _SELFHOST_PBCK.serialize_chunk(b.chunk);
@@ -430,7 +547,8 @@ fn write_bundle_selfhost(main_path, out_path) {
     return map{ ok: true, modules: b.modules, out: out_path, bytes: len(blob) };
 }
 
-export bundle, bundle_file, write_bundle, write_bundle_selfhost;
+export bundle, bundle_file, bundle_file_from_root, validate_bundle_destination,
+       write_bundle, write_bundle_safe, write_bundle_selfhost;
 
 fn bundle_file_with_cleanup(main_path,entry,cleanup) {
     let src=try bytes_to_str(fs_read_bytes(main_path)) catch nil;
@@ -451,3 +569,4 @@ fn bundle_file_with_lifecycle(path,initialize,entry,cleanup) {
     return bundle_with_lifecycle(source,_fs_resolve,initialize,entry,cleanup);
 }
 export bundle_with_lifecycle,bundle_file_with_lifecycle;
+
