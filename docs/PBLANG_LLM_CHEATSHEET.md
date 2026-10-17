@@ -53,3 +53,20 @@ All CLI/GUI product entrypoints (`main.sapp`, `src/app.sapp`) and `stdlib/*_view
 
 ### E. Sealed Offline Release Hygiene (`python3 -I -B`)
 When invoking Python for `stdio_guard.py` or `build_offline_release.sapp`, always pass `-I -B` so `__pycache__` never pollutes `release/transport/` before `MANIFEST.sha256.json` / `SHA256.json` verification.
+
+---
+
+## 3. Native PBLang LLM Cognition & Cyber/AI Suite (`stdlib:llm_cognition_suite.sapp`)
+
+1. `inspect_pblang_idioms` (`pblang.llm.idiom-mentor.v1`): Detects and rewrites foreign-language syntax habits and enforces `ordered_input: true`, O(1) `len(args)` guards, and `OWN3-J02` cleanup contracts.
+2. `compile_orientation_brief` (`pblang.llm.orientation-brief.v1`): Generates the `< 30`-line `NOW.md` handoff, decodes internal shorthand (`L1..L4`, `R8-LOCAL-02`, `OWN3-J02`, `QZ-NEXT-03`), and enforces Home Linux vs Corporate Windows isolation.
+3. `audit_ecosystem_topology` (`pblang.llm.ecosystem-topology.v1`): Verifies `L1 -> L2 -> L3 -> L4` `pblang.lock` synchronization, sealed `pb-mcp-offline` `MANIFEST.sha256.json`, and `--tmpfs` source-hidden isolation.
+4. `evaluate_epistemic_claims` (`pblang.llm.epistemic-gate.v1`): Blocks conflation of modeled/static analysis with runtime execution, hosted GitHub Actions CI (billing-blocked), physical `BME688` hardware, or Windows/macOS execution.
+5. `verify_dualstack_and_commercial` (`pblang.llm.dualstack-commercial.v1`): Verifies `.sapp <-> C#` DTO parity, Greek 9-digit AFM Modulo-11 (`000000000` retail-only), 11-column running-balance ledger, `6,000` email quota (`90%` warning / `100%` hard-stop), `pbduallock` opt-in `second_lock`, and white-label leak checks.
+6. `audit_gui_viewport_and_plan` (`pblang.llm.viewport-dag-planner.v1`): Prevents vertical/horizontal viewport clipping on `1366x768` (`1200x920` `152px` overflow) and validates `L1 -> L2 -> L3 -> L4` DAG execution order.
+7. `migrate_delphi_to_blazor` (`pblang.llm.delphi-blazor-migrator.v1`): Extracts VCL `OnChange`/`OnClick`/`OnCalcFields`/`BeforePost` event-coupled business logic, flags synchronous `FieldByName` / `Application.ProcessMessages` / unit globals, and verifies 2-decimal EUR VAT (`24%`, `13%`, `6%`) & 12-digit GEMI equivalence.
+8. `enforce_von_neumann_and_bpe_shield` (`pblang.llm.von-neumann-bpe-shield.v1`): Enforces NX/DEP separation between `SYSTEM_INSTRUCTION_PLANE` and `UNTRUSTED_DATA_PLANE`, provides deterministic character counting, string reversal, and arbitrary-precision string BigInt addition, and refutes false user premises (Anti-Sycophancy Gate).
+9. `guard_attention_and_continual_memory` (`pblang.llm.attention-continual-guard.v1`): Hoists critical invariants from the `25%..75%` middle-context zone ("Lost in the Middle"), blocks catastrophic forgetting of `prior_invariants`, and detects synthetic AI-slop / Model Collapse.
+10. `evaluate_causal_world_and_alignment` (`pblang.llm.causal-world-alignment.v1`): Distinguishes spurious correlation from `do(X)` causal intervention, flags Out-of-Distribution (OOD) Z-score anomalies, validates physical hardware tolerances, emits a 4-step white-box proof trace, and blocks Goodhart's Law reward hacking.
+11. `audit_cyber_pqc_and_user_shield` (`pblang.llm.cyber-pqc-user-shield.v1`): Detects lookalike phishing domains, unwatermarked voice-clone deepfakes, session hijack risks, UI dark patterns, unpinned dependencies, C/C++ memory hazards, and Post-Quantum Cryptography (`Harvest Now, Decrypt Later` `RSA`/`ECDSA` vs NIST FIPS 203/204 `ML-KEM-768` / `ML-DSA-65`).
+12. `resolve_historical_cycle_vs_live` (`pblang.llm.historical-cycle-resolver.v1`): Quarantines historical claims from earlier cycles (`Cycles 1..27`) when mistakenly treated as live runtime authority in `Cycle 28`.
