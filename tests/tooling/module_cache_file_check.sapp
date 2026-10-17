@@ -1,0 +1,316 @@
+// Pure PBLang qualification runner for OWN3-J02-OPAQUE-CLEANUP-CONTRACT
+// (stdlib/compiler/module_cache_file.sapp deferred single-close cleanup,
+// reply validation, parent_close_confirmed flags, live Linux private-file I/O,
+// persistent module_cache integration, and portable_lock close verification).
+let SECURE = import("stdlib:secure_file.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+let REAL_MCF = import("stdlib:compiler/module_cache_file.sapp");
+let MC = import("stdlib:compiler/module_cache.sapp");
+let FE = import("stdlib:compiler/selfhost_frontend.sapp");
+let VM = import("stdlib:compiler/vm.sapp");
+
+fn _replace_once(source, needle, replacement) {
+    let parts = str_split(source, needle);
+    assert(len(parts) == 2, "expected exactly one occurrence of needle: " + needle);
+    return parts[0] + replacement + parts[1];
+}
+
+let raw_args = os_args();
+let baseline_path = "";
+let report_path = "";
+let arg_idx = 0;
+while arg_idx < len(raw_args) {
+    if raw_args[arg_idx] == "--baseline-source" and arg_idx + 1 < len(raw_args) {
+        baseline_path = raw_args[arg_idx + 1];
+    }
+    if raw_args[arg_idx] == "--report" and arg_idx + 1 < len(raw_args) {
+        report_path = raw_args[arg_idx + 1];
+    }
+    arg_idx = arg_idx + 1;
+}
+if baseline_path == "" or report_path == "" {
+    throw "usage: pblang run --allow-all tests/tooling/module_cache_file_check.sapp -- --baseline-source <path> --report <path>";
+}
+
+let repo_root = cwd();
+let stdlib_root = repo_root + "/stdlib/";
+let candidate_raw = fs_read("stdlib/compiler/module_cache_file.sapp");
+let baseline_raw = fs_read(baseline_path);
+let lock_raw = fs_read("stdlib/portable_lock.sapp");
+
+let scratch = "/tmp/pblang-mcf-qual-" + str(num_floor(now_ms()));
+assert(SECURE.create_private_temporary_directory_new(scratch).ok, "private temporary qualification directory created");
+
+let backend_src = "let state = map{ mode: \"\", closes: 0, created: false, thrown: \"\" };\n"
+    + "fn configure(mode) {\n"
+    + "    state.mode = mode;\n"
+    + "    state.closes = 0;\n"
+    + "    state.created = false;\n"
+    + "    state.thrown = \"\";\n"
+    + "}\n"
+    + "fn open(path, create = false, protect = false) {\n"
+    + "    if path == \"new\" and not state.created { return map{ ok: false }; }\n"
+    + "    return map{ ok: true, path: path };\n"
+    + "}\n"
+    + "fn open_absolute(path, create = false, protect = false) { return open(path, create, protect); }\n"
+    + "fn private_root_status(fs) {\n"
+    + "    if state.mode == \"policy-throw\" { state.thrown = \"injected-primary-policy\"; throw \"injected-primary-policy\"; }\n"
+    + "    return map{ ok: true };\n"
+    + "}\n"
+    + "fn mkdir_new(fs, name, create = false) {\n"
+    + "    if state.mode == \"mkdir-throw\" { state.thrown = \"injected-primary-mkdir\"; throw \"injected-primary-mkdir\"; }\n"
+    + "    state.created = true;\n"
+    + "    return map{ ok: true };\n"
+    + "}\n"
+    + "fn close(fs) {\n"
+    + "    state.closes = state.closes + 1;\n"
+    + "    if state.mode == \"close-throw\" or str_ends_with(state.mode, \"close-throw\") { state.thrown = \"injected-close\"; throw \"injected-close\"; }\n"
+    + "    if state.mode == \"close-nil\" { return nil; }\n"
+    + "    if state.mode == \"close-number\" { return 1; }\n"
+    + "    if state.mode == \"first-close-false\" and state.closes == 1 { return false; }\n"
+    + "    if state.mode == \"second-close-false\" and state.closes == 2 { return false; }\n"
+    + "    if state.mode == \"close-false\" or (str_ends_with(state.mode, \"close-false\") and state.mode != \"first-close-false\" and state.mode != \"second-close-false\") { return false; }\n"
+    + "    return true;\n"
+    + "}\n"
+    + "fn read_bytes(fs, name, limit) {\n"
+    + "    if state.mode == \"read-throw\" { state.thrown = \"injected-primary-read\"; throw \"injected-primary-read\"; }\n"
+    + "    if state.mode == \"read-bad-reply\" { return map{ ok: \"invalid\" }; }\n"
+    + "    if str_starts_with(state.mode, \"read-error-\") { return map{ ok: false, error: \"injected-known-primary\", detail: 7 }; }\n"
+    + "    return map{ ok: true, bytes: [65], size: 1 };\n"
+    + "}\n"
+    + "fn write_atomic(fs, name, bytes, create = false) {\n"
+    + "    if state.mode == \"write-throw\" { state.thrown = \"injected-primary-write\"; throw \"injected-primary-write\"; }\n"
+    + "    if state.mode == \"write-bad-reply\" { return map{ ok: \"invalid\" }; }\n"
+    + "    if str_starts_with(state.mode, \"write-error-\") { return map{ ok: false, error: \"injected-known-primary\", detail: 7 }; }\n"
+    + "    return map{ ok: true };\n"
+    + "}\n"
+    + "fn remove(fs, name) {\n"
+    + "    if state.mode == \"remove-throw\" { state.thrown = \"injected-primary-remove\"; throw \"injected-primary-remove\"; }\n"
+    + "    if state.mode == \"remove-bad-reply\" { return map{ ok: \"invalid\" }; }\n"
+    + "    if str_starts_with(state.mode, \"remove-error-\") { return map{ ok: false, error: \"injected-known-primary\", detail: 7 }; }\n"
+    + "    return map{ ok: true };\n"
+    + "}\n"
+    + "export state, configure, open, open_absolute, private_root_status, mkdir_new, close, read_bytes, write_atomic, remove;\n";
+fs_write(scratch + "/backend.sapp", backend_src);
+
+fn _bind_imports(src, linux_target) {
+    let s1 = _replace_once(src, "import(\"stdlib:linux_dirfs.sapp\")", "import(\"" + linux_target + "\")");
+    return str_replace_all(s1, "import(\"stdlib:", "import(\"" + stdlib_root);
+}
+
+fs_write(scratch + "/candidate_mcf.sapp", _bind_imports(candidate_raw, scratch + "/backend.sapp"));
+fs_write(scratch + "/baseline_secure.sapp", _bind_imports(baseline_raw, scratch + "/backend.sapp"));
+
+let B = import(scratch + "/backend.sapp");
+let CAND = import(scratch + "/candidate_mcf.sapp");
+let BASE = import(scratch + "/baseline_secure.sapp");
+
+fn _run_variant(mod, is_baseline, operation) {
+    let outcome = map{ threw: false, error: nil, value: nil, closes: 0 };
+    if operation == "read" {
+        if is_baseline {
+            try { outcome.value = mod.read_bytes("private/value", 8, true); } catch { outcome.threw = true; outcome.error = B.state.thrown; }
+        } else {
+            try { outcome.value = mod.read_bytes("private/value", 8); } catch { outcome.threw = true; outcome.error = B.state.thrown; }
+        }
+    } elif operation == "write" {
+        if is_baseline {
+            try { outcome.value = mod.write_atomic("private/value", [65], true, true); } catch { outcome.threw = true; outcome.error = B.state.thrown; }
+        } else {
+            try { outcome.value = mod.write_atomic("private/value", [65]); } catch { outcome.threw = true; outcome.error = B.state.thrown; }
+        }
+    } elif operation == "remove" {
+        if is_baseline {
+            try { outcome.value = mod.remove("private/value", true); } catch { outcome.threw = true; outcome.error = B.state.thrown; }
+        } else {
+            try { outcome.value = mod.remove("private/value"); } catch { outcome.threw = true; outcome.error = B.state.thrown; }
+        }
+    } elif operation == "create" {
+        if is_baseline {
+            try { outcome.value = mod.write_atomic("new/value", [65], true, true); } catch { outcome.threw = true; outcome.error = B.state.thrown; }
+        } else {
+            try { outcome.value = mod.write_atomic("new/value", [65]); } catch { outcome.threw = true; outcome.error = B.state.thrown; }
+        }
+    }
+    outcome.closes = B.state.closes;
+    return outcome;
+}
+
+let cases = [
+    ["read-throw", "read"],
+    ["write-throw", "write"],
+    ["remove-throw", "remove"],
+    ["policy-throw", "read"],
+    ["mkdir-throw", "create"],
+    ["close-false", "read"],
+    ["close-false", "write"],
+    ["close-false", "remove"],
+    ["close-nil", "read"],
+    ["close-number", "read"],
+    ["close-throw", "read"],
+    ["first-close-false", "create"],
+    ["second-close-false", "create"],
+    ["read-error-close-false", "read"],
+    ["write-error-close-throw", "write"],
+    ["remove-error-close-false", "remove"],
+    ["read-bad-reply", "read"],
+    ["write-bad-reply", "write"],
+    ["remove-bad-reply", "remove"]
+];
+
+let rows = [];
+let idx = 0;
+while idx < len(cases) {
+    let c = cases[idx];
+    let mode = c[0];
+    let op = c[1];
+    B.configure(mode);
+    let before = _run_variant(BASE, true, op);
+    B.configure(mode);
+    let after = _run_variant(CAND, false, op);
+    let passed = false;
+    if str_ends_with(mode, "-throw") and mode != "close-throw" and mode != "write-error-close-throw" {
+        // OWN3-J02: primary exception propagates unchanged, and candidate closes opened parent once via defer.
+        passed = after.threw and str_starts_with(after.error, "injected-primary-") and after.closes == 1;
+    } elif str_ends_with(mode, "-bad-reply") {
+        passed = not after.threw and type(after.value) == "map" and not after.value.ok
+            and after.value.parent_close_confirmed and after.closes == 1;
+    } elif mode == "second-close-false" {
+        passed = not after.threw and type(after.value) == "map" and not after.value.ok
+            and after.value.cleanup_uncertain and not after.value.parent_close_confirmed
+            and after.closes == 2;
+    } else {
+        passed = not after.threw and type(after.value) == "map" and not after.value.ok
+            and after.value.cleanup_uncertain and not after.value.parent_close_confirmed
+            and after.closes == 1;
+        if str_contains(mode, "-error-") {
+            passed = passed and after.value.error == "injected-known-primary" and after.value.detail == 7;
+        }
+    }
+    assert(passed, "qualification case failed: " + mode + "/" + op + " -> " + json_stringify(after));
+    array_push(rows, map{
+        mode: mode,
+        operation: op,
+        passed: passed,
+        baseline: before,
+        candidate: after
+    });
+    idx = idx + 1;
+}
+
+// Verify portable_lock held dependency directory close check.
+let lock_backend_src = "let state = map{ close_ok: true, closes: 0 };\n"
+    + "fn open_absolute(path, create = false, protect = false) { return map{ ok: true, path: path }; }\n"
+    + "fn close(fs) { state.closes = state.closes + 1; return state.close_ok; }\n"
+    + "export state, open_absolute, close;\n";
+fs_write(scratch + "/lock_backend.sapp", lock_backend_src);
+fs_write(scratch + "/candidate_lock.sapp", _bind_imports(lock_raw, scratch + "/lock_backend.sapp"));
+let LB = import(scratch + "/lock_backend.sapp");
+let PLOCK = import(scratch + "/candidate_lock.sapp");
+let lock_proj = scratch + "/lock_proj";
+assert(SECURE.create_private_directory_new(lock_proj).ok, "lock project dir created");
+assert(SECURE.create_private_directory_new(lock_proj + "/stdlib").ok, "lock stdlib dir created");
+let lock_manifest = "[dependencies]\nstdlib = { path = \"stdlib\" }\n";
+let lock_digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+let lock_doc = "manifest_sha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+    + "content_hash_algorithm = \"pblang-package-tree-v2\"\n\n"
+    + "[dependencies.stdlib]\npath = \"" + lock_proj + "/stdlib\"\nsha256 = \"" + lock_digest + "\"\n";
+fs_write(lock_proj + "/pblang.toml", lock_manifest);
+fs_write(lock_proj + "/pblang.lock", lock_doc);
+LB.state.close_ok = false;
+LB.state.closes = 0;
+let lock_failed = false;
+try {
+    PLOCK.publish(lock_proj);
+} catch {
+    lock_failed = true;
+}
+assert(lock_failed and LB.state.closes == 1,
+    "portable_lock must fail closed when held dependency directory close fails");
+LB.state.close_ok = true;
+LB.state.closes = 0;
+let lock_ok = PLOCK.publish(lock_proj);
+assert(lock_ok.ok and LB.state.closes == 1, "portable_lock publish succeeds when held directory closes cleanly");
+
+fn _not_ok(res) { return not res.ok; }
+fn _not_hit(res) { return not res.hit; }
+
+// Real Linux private-file I/O and descriptor-release verification via REAL_MCF.
+let fd_before_real = len(fs_listdir("/proc/self/fd"));
+let real_new_file = scratch + "/new_cache/value";
+let written = REAL_MCF.write_text_atomic(real_new_file, "α😀");
+assert(written.ok and written.atomic and written.durability_verified, "real new private parent publication");
+let loaded = REAL_MCF.read_text(real_new_file, 6);
+assert(loaded.ok and loaded.text == "α😀" and loaded.size == 6, "real UTF-8 exact boundary");
+let short_read = REAL_MCF.read_text(real_new_file, 5);
+assert(_not_ok(short_read), "real bounded snapshot rejects overflow");
+let empty_write = REAL_MCF.write_atomic(scratch + "/new_cache/empty", []);
+assert(empty_write.ok and REAL_MCF.read_bytes(scratch + "/new_cache/empty", 0).ok, "real empty bytes");
+assert(REAL_MCF.write_atomic(scratch + "/new_cache/invalid-utf8", [255]).ok, "real invalid UTF-8 fixture");
+assert(_not_ok(REAL_MCF.read_text(scratch + "/new_cache/invalid-utf8", 1)), "real invalid UTF-8 rejection");
+for bad_path in [nil, 7, "", ".", "..", scratch + "/new_cache/", scratch + "/new_cache/a\\b", scratch + "/new_cache/" + strfromcharcode(0)] {
+    assert(_not_ok(REAL_MCF.read_bytes(bad_path, 8)), "invalid path rejected");
+}
+for bad_limit in [nil, "8", -1, 0.5, 67108865] {
+    assert(_not_ok(REAL_MCF.read_bytes(real_new_file, bad_limit)), "invalid limit rejected");
+}
+assert(REAL_MCF.remove(real_new_file).ok, "real remove");
+assert(_not_ok(REAL_MCF.remove(real_new_file)), "missing remove rejected");
+for rep in range(0, 8) {
+    let text = "value" + str(rep);
+    let rpath = scratch + "/new_cache/repeated";
+    assert(REAL_MCF.write_text_atomic(rpath, text).ok, "repeated write");
+    assert(REAL_MCF.read_text(rpath, 6).text == text, "repeated read");
+    assert(REAL_MCF.remove(rpath).ok, "repeated remove");
+}
+let fd_delta_real = len(fs_listdir("/proc/self/fd")) - fd_before_real;
+assert(fd_delta_real == 0, "zero FD delta after real module_cache_file operations");
+
+// Real persistent module_cache integration verification.
+let cache_root = scratch + "/cache_store";
+let dep_path = scratch + "/dep_mod.sapp";
+fs_write(dep_path, "export VALUE;");
+let ctx1 = MC.context(cache_root, [dep_path]);
+fs_write(dep_path, "export VALUE2;");
+let ctx2 = MC.context(cache_root, [dep_path]);
+assert(ctx1.toolchain != ctx2.toolchain, "toolchain edit invalidates revision");
+fs_write(dep_path, "export VALUE;");
+let ctx = MC.context(cache_root, [dep_path]);
+let src = "let answer = 6 * 7;";
+let compiled = FE.frontend_compile(src);
+assert(compiled.ok, "fixture compilation");
+let key = MC.cache_key(ctx, "/virtual/answer.sapp", src);
+let miss = MC.load(ctx, key);
+assert(_not_hit(miss) and ctx.misses == 1, "initial miss accounting");
+let stored = MC.store(ctx, key, compiled.chunk);
+assert(stored.ok and not stored.reused and ctx.stores == 1 and stored.race_free_publication, "initial race-free store");
+let hit = MC.load(ctx, key);
+assert(hit.hit and ctx.hits == 1, "verified cache hit");
+let executed = VM.run_seeded_bounded(hit.chunk, map{}, map{ max_steps: 100 });
+assert(executed.globals.answer == 42, "cached bytecode execution");
+let artifact_path = cache_root + "/" + key + ".pbcs";
+let damaged = fs_read_bytes(artifact_path);
+damaged[0] = 0;
+fs_write_bytes(artifact_path, damaged);
+let corrupt = MC.load(ctx, key);
+assert(_not_hit(corrupt) and ctx.corruptions == 1, "corrupt artifact rejected");
+
+let fd_after = len(fs_listdir("/proc/self/fd"));
+let report = map{
+    schema: "pblang.module_cache_file_qualification.v1",
+    job_id: "OWN3-J02-OPAQUE-CLEANUP-CONTRACT",
+    candidate_sha256: SHA256.sha256_hex(candidate_raw),
+    baseline_sha256: SHA256.sha256_hex(baseline_raw),
+    portable_lock_sha256: SHA256.sha256_hex(lock_raw),
+    case_count: len(rows),
+    all_passed: true,
+    portable_lock_close_verified: true,
+    module_cache_file_real_io_passed: true,
+    module_cache_file_fd_delta: fd_delta_real,
+    module_cache_integration_passed: true,
+    fd_count_after: fd_after,
+    cases: rows
+};
+fs_mkdirs(path_dirname(report_path));
+fs_write(report_path, json_stringify(report) + "\n");
+print "module_cache_file_qualification_pass:" + str(len(rows));
