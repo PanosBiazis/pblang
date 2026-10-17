@@ -6,6 +6,24 @@ let LinuxDirFS = import("stdlib:linux_dirfs.sapp");
 let MAX_PATH = 4096;
 fn _error(message) { return map{ ok: false, error: message }; }
 
+fn _map_bool(value, key) {
+    if type(value) != "map" or not map_has(value, key) { return false; }
+    let flag = try value[key] catch nil;
+    return type(flag) == "bool" and flag;
+}
+
+fn _not_ok(value) {
+    return not _map_bool(value, "ok");
+}
+
+fn _reply_valid(result) {
+    return type(result) == "map" and map_has(result, "ok") and type(try result.ok catch nil) == "bool";
+}
+
+fn _not_reply_valid(result) {
+    return not _reply_valid(result);
+}
+
 // A close is attempted once. Failure or an opaque cleanup exception cannot
 // certify release; do not retry a potentially consumed native descriptor.
 fn _close_verified(fs) {
@@ -21,19 +39,27 @@ fn _close_verified(fs) {
 fn _close_pending(fs, guard) {
     if guard.pending {
         guard.pending = false;
-        let ignored = _close_verified(fs);
+        _close_verified(fs);
     }
 }
 
 fn _finish(fs, result, publication = false) {
-    if _close_verified(fs) { return result; }
+    if _close_verified(fs) {
+        if _not_reply_valid(result) {
+            return map{ ok: false, error: "module cache operation returned an invalid backend reply",
+                parent_close_confirmed: true };
+        }
+        return result;
+    }
     // Retain a known primary failure, including its publication/durability flags.
-    if type(result) == "map" and not (try result.ok catch false) {
+    if _reply_valid(result) and _not_ok(result) {
         result.cleanup_uncertain = true;
+        result.parent_close_confirmed = false;
         return result;
     }
     return map{ ok: false, error: "module cache parent cleanup could not be verified",
-        cleanup_uncertain: true, operation_completed: type(result) == "map" and (try result.ok catch false),
+        cleanup_uncertain: true, parent_close_confirmed: false,
+        operation_completed: _map_bool(result, "ok"),
         publication_may_have_occurred: publication };
 }
 
@@ -65,28 +91,31 @@ fn _create_parent(path) {
     let parent = if parts.absolute {
         LinuxDirFS.open_absolute(parts.parent, false, false)
     } else { LinuxDirFS.open(parts.parent, false, false) };
-    if not parent.ok { return _error("private directory parent is unavailable"); }
+    if _not_ok(parent) { return _error("private directory parent is unavailable"); }
     let parent_guard = map{ pending: true };
     defer _close_pending(parent, parent_guard);
     let created = LinuxDirFS.mkdir_new(parent, parts.name, false);
     parent_guard.pending = false;
     if not _close_verified(parent) {
         return map{ ok: false, error: "private directory parent cleanup could not be verified",
-            cleanup_uncertain: true };
+            cleanup_uncertain: true, parent_close_confirmed: false };
     }
-    if type(created) != "map" or not created.ok {
+    if _not_ok(created) {
         return _error("private directory must be newly created");
     }
     let fs = if str_starts_with(path, "/") {
         LinuxDirFS.open_absolute(path, false, false)
     } else { LinuxDirFS.open(path, false, false) };
-    if not fs.ok { return _error("new private directory cannot be reopened securely"); }
+    if _not_ok(fs) { return _error("new private directory cannot be reopened securely"); }
     let fs_guard = map{ pending: true };
     defer _close_pending(fs, fs_guard);
     let policy = LinuxDirFS.private_root_status(fs);
     fs_guard.pending = false;
-    let closed = _close_verified(fs);
-    if type(policy) != "map" or not policy.ok or type(closed) != "bool" or not closed {
+    if not _close_verified(fs) {
+        return map{ ok: false, error: "private directory ownership or mode cannot be verified",
+            cleanup_uncertain: true, parent_close_confirmed: false };
+    }
+    if _not_ok(policy) {
         return _error("private directory ownership or mode cannot be verified");
     }
     return map{ ok: true };
@@ -98,23 +127,26 @@ fn _open_parent(path, create) {
     let fs = if parts.absolute {
         LinuxDirFS.open_absolute(parts.parent, false, false)
     } else { LinuxDirFS.open(parts.parent, false, false) };
-    if not fs.ok and create {
+    if _not_ok(fs) and create {
         let created = _create_parent(parts.parent);
-        if not created.ok {
+        if _not_ok(created) {
             let failed = _error("private parent must exist or be exclusively creatable");
-            if try created.cleanup_uncertain catch false { failed.cleanup_uncertain = true; }
+            if _map_bool(created, "cleanup_uncertain") {
+                failed.cleanup_uncertain = true;
+                failed.parent_close_confirmed = false;
+            }
             return failed;
         }
         fs = if parts.absolute {
             LinuxDirFS.open_absolute(parts.parent, false, false)
         } else { LinuxDirFS.open(parts.parent, false, false) };
     }
-    if not fs.ok { return _error("private parent directory is unavailable"); }
+    if _not_ok(fs) { return _error("private parent directory is unavailable"); }
     let guard = map{ pending: true };
     defer _close_pending(fs, guard);
-    let policy_ok = LinuxDirFS.private_root_status(fs).ok;
+    let policy = LinuxDirFS.private_root_status(fs);
     guard.pending = false;
-    if not policy_ok {
+    if _not_ok(policy) {
         return _finish(fs, _error("private parent must already be current-user-owned mode 0700"));
     }
     return map{ ok: true, fs: fs, name: parts.name, private_parent_verified: true };
@@ -125,7 +157,7 @@ fn read_bytes(path, max_bytes) {
     if type(max_bytes) != "number" or max_bytes < 0 or max_bytes != num_floor(max_bytes) {
         return _error("invalid secure read limit");
     }
-    let parent = _open_parent(path, false); if not parent.ok { return parent; }
+    let parent = _open_parent(path, false); if _not_ok(parent) { return parent; }
     let guard = map{ pending: true };
     defer _close_pending(parent.fs, guard);
     let result = LinuxDirFS.read_bytes(parent.fs, parent.name, max_bytes);
@@ -134,7 +166,10 @@ fn read_bytes(path, max_bytes) {
 }
 
 fn read_text(path, max_bytes) {
-    let result = read_bytes(path, max_bytes); if not result.ok { return result; }
+    let result = read_bytes(path, max_bytes); if _not_ok(result) { return result; }
+    if type(try result.bytes catch nil) != "array" or type(try result.size catch nil) != "number" {
+        return _error("module cache read returned an invalid byte payload");
+    }
     let text = try bytes_to_str(result.bytes) catch nil;
     if text == nil { return _error("secure file is not valid UTF-8"); }
     return map{ ok: true, text: text, size: result.size };
@@ -143,7 +178,7 @@ fn read_text(path, max_bytes) {
 fn write_atomic(path, bytes) {
     if platform() != "linux" { return _error("module cache private files require Linux"); }
     if type(bytes) != "array" { return _error("secure file bytes must be an array"); }
-    let parent = _open_parent(path, true); if not parent.ok { return parent; }
+    let parent = _open_parent(path, true); if _not_ok(parent) { return parent; }
     let guard = map{ pending: true };
     defer _close_pending(parent.fs, guard);
     let result = LinuxDirFS.write_atomic(parent.fs, parent.name, bytes, false);
@@ -158,7 +193,7 @@ fn write_text_atomic(path, text) {
 
 fn remove(path) {
     if platform() != "linux" { return _error("module cache private files require Linux"); }
-    let parent = _open_parent(path, false); if not parent.ok { return parent; }
+    let parent = _open_parent(path, false); if _not_ok(parent) { return parent; }
     let guard = map{ pending: true };
     defer _close_pending(parent.fs, guard);
     let result = LinuxDirFS.remove(parent.fs, parent.name);
