@@ -1,0 +1,234 @@
+// 100% Pure-PBLang User Preference & Explicit Consent Gate (PB-03-006 & PB-05-008)
+// 1. PB-03-006: Allows screen sharing ON as a user preference for the user's own session
+//    while strictly preserving all enforced target/sensitive approvals, TTLs, and emergency Stop.
+// 2. PB-05-008: Phone/call/SMS tools with mandatory, single-use, recipient-bound explicit
+//    user approval before any real transmission or dialing.
+
+let FORMAT = "pblang.user-consent-gate.v1";
+
+fn _valid_e164(phone) {
+    return type(phone) == "string" and regex_match(phone, "^[+][1-9][0-9]{7,14}$");
+}
+
+fn create_screen_sharing_policy(owner_session_id, screen_sharing_default_on = true, max_events = 1000, ttl_ms = 3600000, now_ms_val = 0) {
+    if type(owner_session_id) != "string" or len(owner_session_id) < 8 {
+        throw "user_consent_gate: owner_session_id must be at least 8 characters";
+    }
+    if type(max_events) != "number" or max_events < 1 or max_events != num_floor(max_events) {
+        throw "user_consent_gate: max_events must be a positive integer";
+    }
+    if type(ttl_ms) != "number" or ttl_ms < 1000 {
+        throw "user_consent_gate: ttl_ms must be at least 1000 ms";
+    }
+    return map{
+        format: FORMAT,
+        owner_session_id: owner_session_id,
+        screen_sharing_default_on: screen_sharing_default_on,
+        emergency_stop: false,
+        session_revoked: false,
+        consumed_events: 0,
+        max_events: max_events,
+        issued_at_ms: now_ms_val,
+        expires_at_ms: now_ms_val + ttl_ms,
+        approved_targets: map{}
+    };
+}
+
+fn approve_screen_target(policy, target_id, allow_sensitive = false) {
+    if type(policy) != "map" or (try policy.format catch "") != FORMAT {
+        throw "user_consent_gate: invalid screen sharing policy";
+    }
+    if type(target_id) != "string" or str_trim(target_id) == "" {
+        throw "user_consent_gate: target_id is required";
+    }
+    policy.approved_targets[target_id] = map{
+        approved: true,
+        allow_sensitive: allow_sensitive
+    };
+    return policy;
+}
+
+fn trigger_emergency_stop(policy) {
+    if type(policy) != "map" { throw "user_consent_gate: invalid policy"; }
+    policy.emergency_stop = true;
+    policy.session_revoked = true;
+    policy.approved_targets = map{};
+    return policy;
+}
+
+fn evaluate_screen_sharing_request(policy, req) {
+    if type(policy) != "map" or (try policy.format catch "") != FORMAT or type(req) != "map" {
+        return map{ allowed: false, reason: "invalid_policy_or_request", approvals_bypassed: false };
+    }
+    if policy.emergency_stop or policy.session_revoked {
+        return map{ allowed: false, reason: "emergency_stop_or_revoked", approvals_bypassed: false };
+    }
+    let now_val = try req.now_ms catch 0;
+    if now_val >= policy.expires_at_ms {
+        return map{ allowed: false, reason: "session_ttl_expired", approvals_bypassed: false };
+    }
+    if policy.consumed_events >= policy.max_events {
+        return map{ allowed: false, reason: "event_budget_exhausted", approvals_bypassed: false };
+    }
+    if not constant_time_eq(try req.requester_session_id catch "", policy.owner_session_id) {
+        return map{ allowed: false, reason: "non_owner_session_denied", approvals_bypassed: false };
+    }
+    if not policy.screen_sharing_default_on and not (try req.explicit_per_request_prompt_accepted catch false) {
+        return map{ allowed: false, reason: "preference_off_requires_prompt", approvals_bypassed: false };
+    }
+    let target_id = try req.target_id catch "";
+    if type(target_id) != "string" or not map_has(policy.approved_targets, target_id) {
+        return map{ allowed: false, reason: "target_approval_required", approvals_bypassed: false };
+    }
+    if not (try policy.approved_targets[target_id].approved catch false) {
+        return map{ allowed: false, reason: "target_not_approved", approvals_bypassed: false };
+    }
+    if (try req.sensitive_action catch false) and not (try policy.approved_targets[target_id].allow_sensitive catch false) {
+        return map{ allowed: false, reason: "sensitive_action_approval_required", approvals_bypassed: false };
+    }
+    policy.consumed_events = policy.consumed_events + 1;
+    return map{
+        allowed: true,
+        format: FORMAT,
+        owner_preference_active: policy.screen_sharing_default_on,
+        approvals_bypassed: false,
+        target_id: target_id,
+        remaining_events: policy.max_events - policy.consumed_events
+    };
+}
+
+fn _is_gsm_ascii_byte(b) {
+    return (b >= 32 and b <= 126) or b == 10 or b == 13;
+}
+
+fn plan_sms_message(recipient, message, purpose = "user-requested-sms") {
+    if not _valid_e164(recipient) {
+        throw "user_consent_gate: recipient must be an E.164 phone number";
+    }
+    if type(message) != "string" {
+        throw "user_consent_gate: message must be a string";
+    }
+    let msg_bytes = str_to_bytes(message);
+    if len(msg_bytes) < 1 or len(msg_bytes) > 160 {
+        throw "user_consent_gate: SMS message must be 1..160 bytes";
+    }
+    let i = 0;
+    while i < len(msg_bytes) {
+        if not _is_gsm_ascii_byte(msg_bytes[i]) {
+            throw "user_consent_gate: SMS message must use printable GSM ASCII bytes";
+        }
+        i = i + 1;
+    }
+    let digest = sha256("sms:" + recipient + ":" + message + ":" + str(purpose));
+    return map{
+        ok: true,
+        format: FORMAT,
+        action_kind: "sms_send",
+        recipient: recipient,
+        message: message,
+        message_bytes: len(msg_bytes),
+        purpose: str(purpose),
+        action_digest: digest,
+        requires_explicit_approval: true,
+        executed: false,
+        hardware_transmitted: false
+    };
+}
+
+fn plan_phone_call(recipient, max_duration_secs = 60, purpose = "user-requested-call") {
+    if not _valid_e164(recipient) {
+        throw "user_consent_gate: recipient must be an E.164 phone number";
+    }
+    if type(max_duration_secs) != "number" or max_duration_secs != num_floor(max_duration_secs) or max_duration_secs < 1 or max_duration_secs > 3600 {
+        throw "user_consent_gate: max_duration_secs must be an integer in 1..3600";
+    }
+    let digest = sha256("call:" + recipient + ":" + str(max_duration_secs) + ":" + str(purpose));
+    return map{
+        ok: true,
+        format: FORMAT,
+        action_kind: "voice_call",
+        recipient: recipient,
+        max_duration_secs: max_duration_secs,
+        purpose: str(purpose),
+        action_digest: digest,
+        requires_explicit_approval: true,
+        executed: false,
+        hardware_transmitted: false
+    };
+}
+
+fn issue_communication_approval(action_plan, approver_id, approval_token, now_ms_val, ttl_ms = 60000) {
+    if type(action_plan) != "map" or (try action_plan.format catch "") != FORMAT {
+        throw "user_consent_gate: valid action_plan is required";
+    }
+    if type(approver_id) != "string" or str_trim(approver_id) == "" {
+        throw "user_consent_gate: non-empty approver_id is required";
+    }
+    if type(approval_token) != "string" or len(approval_token) < 16 {
+        throw "user_consent_gate: approval_token must be at least 16 characters";
+    }
+    if type(ttl_ms) != "number" or ttl_ms < 1000 or ttl_ms > 300000 {
+        throw "user_consent_gate: approval ttl_ms must be in 1000..300000 ms";
+    }
+    return map{
+        format: FORMAT,
+        action_kind: action_plan.action_kind,
+        recipient: action_plan.recipient,
+        action_digest: action_plan.action_digest,
+        approver_id: approver_id,
+        approval_token: approval_token,
+        issued_at_ms: now_ms_val,
+        expires_at_ms: now_ms_val + ttl_ms,
+        used: false
+    };
+}
+
+fn execute_approved_action(action_plan, approval_record, supplied_token, now_ms_val, modem_dispatch = nil) {
+    if type(action_plan) != "map" or (try action_plan.format catch "") != FORMAT {
+        return map{ ok: false, executed: false, hardware_transmitted: false, error: "invalid_action_plan" };
+    }
+    if type(approval_record) != "map" or (try approval_record.format catch "") != FORMAT {
+        return map{ ok: false, executed: false, hardware_transmitted: false, error: "explicit_approval_required" };
+    }
+    if approval_record.used {
+        return map{ ok: false, executed: false, hardware_transmitted: false, error: "approval_already_used" };
+    }
+    if now_ms_val > approval_record.expires_at_ms or now_ms_val < approval_record.issued_at_ms {
+        return map{ ok: false, executed: false, hardware_transmitted: false, error: "approval_expired_or_invalid_clock" };
+    }
+    if approval_record.action_digest != action_plan.action_digest or approval_record.recipient != action_plan.recipient {
+        return map{ ok: false, executed: false, hardware_transmitted: false, error: "approval_digest_or_recipient_mismatch" };
+    }
+    if type(supplied_token) != "string" or not constant_time_eq(supplied_token, approval_record.approval_token) {
+        return map{ ok: false, executed: false, hardware_transmitted: false, error: "approval_token_mismatch" };
+    }
+    // Single-use lock before any external dispatch
+    approval_record.used = true;
+    if modem_dispatch == nil {
+        return map{
+            ok: true,
+            format: FORMAT,
+            action_kind: action_plan.action_kind,
+            recipient: action_plan.recipient,
+            approval_verified: true,
+            executed: false,
+            hardware_transmitted: false,
+            mode: "approved_dry_run_no_hardware"
+        };
+    }
+    let dispatch_res = modem_dispatch(action_plan);
+    return map{
+        ok: try dispatch_res.ok catch false,
+        format: FORMAT,
+        action_kind: action_plan.action_kind,
+        recipient: action_plan.recipient,
+        approval_verified: true,
+        executed: try dispatch_res.executed catch true,
+        hardware_transmitted: try dispatch_res.accepted_by_modem catch false,
+        dispatch_result: dispatch_res
+    };
+}
+
+export FORMAT, create_screen_sharing_policy, approve_screen_target, trigger_emergency_stop,
+       evaluate_screen_sharing_request, plan_sms_message, plan_phone_call,
+       issue_communication_approval, execute_approved_action;

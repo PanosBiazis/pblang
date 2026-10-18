@@ -1,0 +1,374 @@
+// 100% Pure-PBLang OpenID Connect (OIDC) & Multi-Tenant SSO Engine (PB-03-010)
+// Supports Google Workspace, Microsoft Entra ID, Keycloak, and generic OIDC providers
+// with RFC 7636 PKCE (S256), strict tenant isolation, role/admin separation, and revocation.
+
+let FORMAT = "pblang.oidc-sso.v1";
+let B64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn _hex_nibble(ch) {
+    let idx = str_index_of("0123456789abcdef", str_lower(ch));
+    if idx < 0 { throw "oidc_sso: invalid hex digit"; }
+    return idx;
+}
+
+fn _hex_to_bytes(hex_str) {
+    let out = [];
+    let i = 0;
+    let n = len(hex_str);
+    while i + 1 < n {
+        let hi = _hex_nibble(str_slice(hex_str, i, i + 1));
+        let lo = _hex_nibble(str_slice(hex_str, i + 1, i + 2));
+        array_push(out, bit_or(bit_shl(hi, 4), lo));
+        i = i + 2;
+    }
+    return out;
+}
+
+fn base64url_encode_bytes(bytes) {
+    let out = "";
+    let i = 0;
+    let n = len(bytes);
+    while i < n {
+        let b0 = bytes[i];
+        i = i + 1;
+        let idx0 = bit_shr(b0, 2);
+        out = out + str_slice(B64URL_ALPHABET, idx0, idx0 + 1);
+        if i >= n {
+            let idx1_last = bit_shl(bit_and(b0, 3), 4);
+            out = out + str_slice(B64URL_ALPHABET, idx1_last, idx1_last + 1);
+            break;
+        }
+        let b1 = bytes[i];
+        i = i + 1;
+        let idx1 = bit_or(bit_shl(bit_and(b0, 3), 4), bit_shr(b1, 4));
+        out = out + str_slice(B64URL_ALPHABET, idx1, idx1 + 1);
+        if i >= n {
+            let idx2_last = bit_shl(bit_and(b1, 15), 2);
+            out = out + str_slice(B64URL_ALPHABET, idx2_last, idx2_last + 1);
+            break;
+        }
+        let b2 = bytes[i];
+        i = i + 1;
+        let idx2 = bit_or(bit_shl(bit_and(b1, 15), 2), bit_shr(b2, 6));
+        let idx3 = bit_and(b2, 63);
+        out = out + str_slice(B64URL_ALPHABET, idx2, idx2 + 1) + str_slice(B64URL_ALPHABET, idx3, idx3 + 1);
+    }
+    return out;
+}
+
+fn _valid_verifier(verifier) {
+    if type(verifier) != "string" or len(verifier) < 43 or len(verifier) > 128 {
+        return false;
+    }
+    let i = 0;
+    while i < len(verifier) {
+        if not str_contains("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~", str_slice(verifier, i, i + 1)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn create_pkce_challenge(verifier) {
+    if not _valid_verifier(verifier) {
+        throw "oidc_sso: PKCE code_verifier must be 43..128 RFC 7636 unreserved characters";
+    }
+    let digest_hex = sha256(verifier);
+    let digest_bytes = _hex_to_bytes(digest_hex);
+    return map{
+        code_challenge: base64url_encode_bytes(digest_bytes),
+        code_challenge_method: "S256"
+    };
+}
+
+fn _valid_https_or_loopback(uri) {
+    if type(uri) != "string" or len(uri) < 10 or len(uri) > 1024 {
+        return false;
+    }
+    if str_contains(uri, " ") or str_contains(uri, "\n") or str_contains(uri, "\r") {
+        return false;
+    }
+    if str_starts_with(uri, "https://") {
+        return true;
+    }
+    // RFC 8252 native loopback exception
+    if str_starts_with(uri, "http://127.0.0.1:") or str_starts_with(uri, "http://[::1]:") {
+        return true;
+    }
+    return false;
+}
+
+fn provider_profile(kind, config) {
+    if type(config) != "map" { throw "oidc_sso: config must be a map"; }
+    let client_id = try config.client_id catch "";
+    let tenant_id = try config.tenant_id catch "";
+    if type(client_id) != "string" or str_trim(client_id) == "" {
+        throw "oidc_sso: non-empty client_id is required";
+    }
+    if type(tenant_id) != "string" or str_trim(tenant_id) == "" {
+        throw "oidc_sso: explicit tenant_id is required for tenant isolation";
+    }
+    if kind == "google" {
+        return map{
+            format: FORMAT,
+            provider: "google",
+            client_id: client_id,
+            tenant_id: tenant_id,
+            issuer: "https://accounts.google.com",
+            authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+            token_endpoint: "https://oauth2.googleapis.com/token",
+            tenant_claim: "hd"
+        };
+    }
+    if kind == "microsoft_entra" {
+        let is_wildcard = tenant_id == "common" or tenant_id == "consumers" or tenant_id == "organizations";
+        if is_wildcard and not (try config.allow_multi_tenant catch false) {
+            throw "oidc_sso: Microsoft Entra wildcard tenant requires explicit allow_multi_tenant=true";
+        }
+        let base = "https://login.microsoftonline.com/" + tenant_id;
+        return map{
+            format: FORMAT,
+            provider: "microsoft_entra",
+            client_id: client_id,
+            tenant_id: tenant_id,
+            issuer: base + "/v2.0",
+            authorization_endpoint: base + "/oauth2/v2.0/authorize",
+            token_endpoint: base + "/oauth2/v2.0/token",
+            tenant_claim: "tid"
+        };
+    }
+    if kind == "keycloak" {
+        let base_url = try config.base_url catch "";
+        let realm = try config.realm catch tenant_id;
+        if not str_starts_with(base_url, "https://") or str_trim(realm) == "" {
+            throw "oidc_sso: Keycloak requires an HTTPS base_url and non-empty realm";
+        }
+        let issuer = base_url + "/realms/" + realm;
+        return map{
+            format: FORMAT,
+            provider: "keycloak",
+            client_id: client_id,
+            tenant_id: tenant_id,
+            realm: realm,
+            issuer: issuer,
+            authorization_endpoint: issuer + "/protocol/openid-connect/auth",
+            token_endpoint: issuer + "/protocol/openid-connect/token",
+            tenant_claim: "realm"
+        };
+    }
+    if kind == "generic_oidc" {
+        let issuer = try config.issuer catch "";
+        let auth_ep = try config.authorization_endpoint catch (issuer + "/authorize");
+        let token_ep = try config.token_endpoint catch (issuer + "/token");
+        if not str_starts_with(issuer, "https://") or not str_starts_with(auth_ep, "https://") or not str_starts_with(token_ep, "https://") {
+            throw "oidc_sso: generic OIDC provider requires HTTPS issuer and endpoints";
+        }
+        return map{
+            format: FORMAT,
+            provider: "generic_oidc",
+            client_id: client_id,
+            tenant_id: tenant_id,
+            issuer: issuer,
+            authorization_endpoint: auth_ep,
+            token_endpoint: token_ep,
+            tenant_claim: try config.tenant_claim catch "tenant_id"
+        };
+    }
+    throw "oidc_sso: unsupported provider kind: " + str(kind);
+}
+
+fn build_authorization_request(profile, redirect_uri, state, nonce, code_verifier, scopes = nil) {
+    if type(profile) != "map" or (try profile.format catch "") != FORMAT {
+        throw "oidc_sso: valid provider_profile is required";
+    }
+    if not _valid_https_or_loopback(redirect_uri) {
+        throw "oidc_sso: redirect_uri must use HTTPS or RFC 8252 loopback";
+    }
+    if type(state) != "string" or len(state) < 16 or type(nonce) != "string" or len(nonce) < 16 {
+        throw "oidc_sso: state and nonce must be at least 16 characters";
+    }
+    let pkce = create_pkce_challenge(code_verifier);
+    let scope_list = if scopes == nil { ["openid", "profile", "email"] } else { scopes };
+    let scope_str = str_join(scope_list, " ");
+    let query = "response_type=code"
+        + "&client_id=" + url_encode(profile.client_id)
+        + "&redirect_uri=" + url_encode(redirect_uri)
+        + "&scope=" + url_encode(scope_str)
+        + "&state=" + url_encode(state)
+        + "&nonce=" + url_encode(nonce)
+        + "&code_challenge=" + url_encode(pkce.code_challenge)
+        + "&code_challenge_method=S256";
+    if profile.provider == "google" {
+        query = query + "&hd=" + url_encode(profile.tenant_id);
+    }
+    return map{
+        ok: true,
+        format: FORMAT,
+        provider: profile.provider,
+        tenant_id: profile.tenant_id,
+        authorization_url: profile.authorization_endpoint + "?" + query,
+        redirect_uri: redirect_uri,
+        state: state,
+        nonce: nonce,
+        code_challenge: pkce.code_challenge,
+        code_challenge_method: "S256",
+        network_exchange_performed: false
+    };
+}
+
+fn verify_id_token_claims(profile, claims, expected_nonce, now_secs, max_skew_secs = 60) {
+    if type(profile) != "map" or type(claims) != "map" {
+        return map{ ok: false, error: "invalid profile or claims map" };
+    }
+    let iss = try claims.iss catch "";
+    let aud = try claims.aud catch "";
+    let sub = try claims.sub catch "";
+    let exp = try claims.exp catch 0;
+    let iat = try claims.iat catch 0;
+    let nbf = try claims.nbf catch iat;
+    if iss != profile.issuer {
+        return map{ ok: false, error: "issuer mismatch" };
+    }
+    if aud != profile.client_id {
+        return map{ ok: false, error: "audience mismatch" };
+    }
+    if type(sub) != "string" or str_trim(sub) == "" {
+        return map{ ok: false, error: "missing subject claim" };
+    }
+    if type(expected_nonce) != "string" or len(expected_nonce) < 16 or not constant_time_eq(try claims.nonce catch "", expected_nonce) {
+        return map{ ok: false, error: "nonce mismatch" };
+    }
+    if type(exp) != "number" or exp <= now_secs - max_skew_secs {
+        return map{ ok: false, error: "token expired" };
+    }
+    if type(iat) != "number" or iat > now_secs + max_skew_secs or nbf > now_secs + max_skew_secs {
+        return map{ ok: false, error: "token issued in the future or not yet valid" };
+    }
+    let t_claim = profile.tenant_claim;
+    let token_tenant = try claims[t_claim] catch "";
+    if token_tenant != profile.tenant_id {
+        return map{ ok: false, error: "tenant claim mismatch (" + t_claim + ")" };
+    }
+    let raw_roles = try claims.roles catch ["viewer"];
+    let roles = [];
+    let is_admin = false;
+    let i = 0;
+    while i < len(raw_roles) {
+        let r = str(raw_roles[i]);
+        array_push(roles, r);
+        if r == "admin" or r == "tenant_admin" or r == "super_admin" {
+            is_admin = true;
+        }
+        i = i + 1;
+    }
+    return map{
+        ok: true,
+        format: FORMAT,
+        provider: profile.provider,
+        tenant_id: profile.tenant_id,
+        subject: sub,
+        email: try claims.email catch "",
+        roles: roles,
+        is_admin: is_admin,
+        expires_at: exp,
+        live_jwks_signature_verified: try claims.signature_verified catch false
+    };
+}
+
+fn create_tenant_registry() {
+    let state = map{
+        sessions: map{},
+        revoked_sessions: map{},
+        revoked_subjects: map{},
+        revoked_tenants: map{}
+    };
+    return map{
+        format: FORMAT,
+        issue_session: fn(session_id, verified_principal) {
+            if type(session_id) != "string" or len(session_id) < 16 {
+                throw "oidc_sso: session_id must be at least 16 characters";
+            }
+            if type(verified_principal) != "map" or not (try verified_principal.ok catch false) {
+                throw "oidc_sso: cannot issue session for unverified principal";
+            }
+            let tid = verified_principal.tenant_id;
+            let sub = verified_principal.subject;
+            if map_has(state.revoked_tenants, tid) or map_has(state.revoked_subjects, tid + ":" + sub) {
+                return map{ ok: false, error: "tenant or subject is revoked" };
+            }
+            let record = map{
+                session_id: session_id,
+                provider: verified_principal.provider,
+                tenant_id: tid,
+                subject: sub,
+                roles: verified_principal.roles,
+                is_admin: verified_principal.is_admin,
+                expires_at: verified_principal.expires_at
+            };
+            state.sessions[session_id] = record;
+            return map{ ok: true, session: record };
+        },
+        authorize: fn(session_id, required_tenant_id, required_role, now_secs) {
+            if map_has(state.revoked_sessions, session_id) {
+                return map{ allowed: false, reason: "session_revoked" };
+            }
+            if not map_has(state.sessions, session_id) {
+                return map{ allowed: false, reason: "session_not_found" };
+            }
+            let sess = state.sessions[session_id];
+            if map_has(state.revoked_tenants, sess.tenant_id) {
+                return map{ allowed: false, reason: "tenant_revoked" };
+            }
+            if map_has(state.revoked_subjects, sess.tenant_id + ":" + sess.subject) {
+                return map{ allowed: false, reason: "subject_revoked" };
+            }
+            if sess.tenant_id != required_tenant_id {
+                return map{ allowed: false, reason: "cross_tenant_denied" };
+            }
+            if now_secs >= sess.expires_at {
+                map_remove(state.sessions, session_id);
+                return map{ allowed: false, reason: "session_expired" };
+            }
+            if required_role == "admin" and not sess.is_admin {
+                return map{ allowed: false, reason: "admin_role_required" };
+            }
+            let has_role = false;
+            let i = 0;
+            while i < len(sess.roles) {
+                if sess.roles[i] == required_role {
+                    has_role = true;
+                }
+                i = i + 1;
+            }
+            if not has_role {
+                return map{ allowed: false, reason: "missing_required_role" };
+            }
+            return map{
+                allowed: true,
+                tenant_id: sess.tenant_id,
+                subject: sess.subject,
+                provider: sess.provider,
+                is_admin: sess.is_admin
+            };
+        },
+        revoke_session: fn(session_id) {
+            state.revoked_sessions[session_id] = true;
+            if map_has(state.sessions, session_id) {
+                map_remove(state.sessions, session_id);
+            }
+            return true;
+        },
+        revoke_subject: fn(tenant_id, subject) {
+            state.revoked_subjects[tenant_id + ":" + subject] = true;
+            return true;
+        },
+        revoke_tenant: fn(tenant_id) {
+            state.revoked_tenants[tenant_id] = true;
+            return true;
+        }
+    };
+}
+
+export FORMAT, base64url_encode_bytes, create_pkce_challenge, provider_profile,
+       build_authorization_request, verify_id_token_claims, create_tenant_registry;
