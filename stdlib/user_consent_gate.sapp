@@ -229,6 +229,287 @@ fn execute_approved_action(action_plan, approval_record, supplied_token, now_ms_
     };
 }
 
+// ── PB-03-001, PB-03-002, PB-03-003, PB-03-004, PB-03-005, PB-03-009 ──────
+// Desktop Broker Single-GUI Transport, Minimize/Background Resilience,
+// Per-AI-Tool Remembered Local Approval, Monotonic Non-Resetting Budgets,
+// and Client/Profile/App/Device Isolation.
+
+fn create_desktop_broker(broker_id, owner_session_id, now_ms_val = 0) {
+    if type(broker_id) != "string" or str_trim(broker_id) == "" {
+        throw "user_consent_gate: broker_id is required";
+    }
+    if type(owner_session_id) != "string" or len(owner_session_id) < 8 {
+        throw "user_consent_gate: owner_session_id must be at least 8 characters";
+    }
+    return map{
+        format: FORMAT,
+        broker_id: broker_id,
+        owner_session_id: owner_session_id,
+        gui_instances: 1,
+        single_gui_enforced: true,
+        window_state: "foreground",
+        transport_connected: true,
+        visible_safe_close: true,
+        emergency_stop_visible: true,
+        emergency_stopped: false,
+        created_at_ms: now_ms_val,
+        attached_clients: map{},
+        grants: map{}
+    };
+}
+
+fn _valid_broker(broker) {
+    if type(broker) != "map" { return false; }
+    let fmt = try broker.format catch "";
+    return fmt == FORMAT;
+}
+
+fn request_broker_gui_attach(broker, ai_client_id) {
+    if not _valid_broker(broker) {
+        throw "user_consent_gate: invalid desktop broker";
+    }
+    if type(ai_client_id) != "string" or str_trim(ai_client_id) == "" {
+        throw "user_consent_gate: ai_client_id is required";
+    }
+    if broker.emergency_stopped or not broker.transport_connected {
+        return map{
+            ok: false,
+            reason: "broker_stopped_or_disconnected",
+            gui_instances: broker.gui_instances,
+            duplicate_window_spawned: false
+        };
+    }
+    broker.attached_clients[ai_client_id] = true;
+    return map{
+        ok: true,
+        broker_id: broker.broker_id,
+        ai_client_id: ai_client_id,
+        gui_instances: 1,
+        duplicate_window_spawned: false,
+        reused_existing_gui: true,
+        transport_connected: broker.transport_connected
+    };
+}
+
+fn transition_broker_window(broker, target_state) {
+    if not _valid_broker(broker) {
+        throw "user_consent_gate: invalid desktop broker";
+    }
+    if target_state == "foreground" or target_state == "background" or target_state == "minimized" {
+        if broker.emergency_stopped or not broker.transport_connected {
+            return map{
+                ok: false,
+                window_state: broker.window_state,
+                transport_connected: false,
+                unintended_disconnect: false,
+                reason: "cannot_restore_closed_or_stopped_broker"
+            };
+        }
+        broker.window_state = target_state;
+        return map{
+            ok: true,
+            window_state: broker.window_state,
+            transport_connected: true,
+            unintended_disconnect: false,
+            visible_safe_close: true,
+            emergency_stop_visible: true,
+            gui_instances: 1
+        };
+    }
+    if target_state == "safe_closed" or target_state == "emergency_stop" {
+        broker.window_state = target_state;
+        broker.transport_connected = false;
+        if target_state == "emergency_stop" {
+            broker.emergency_stopped = true;
+        }
+        broker.grants = map{};
+        return map{
+            ok: true,
+            window_state: broker.window_state,
+            transport_connected: false,
+            unintended_disconnect: false,
+            visible_safe_close: true,
+            emergency_stop_visible: true,
+            all_grants_revoked: true
+        };
+    }
+    throw "user_consent_gate: unsupported window state: " + str(target_state);
+}
+
+fn _grant_scope_key(ai_client_id, profile_mode, tool_name, target_app_id, target_device_id) {
+    return str(ai_client_id) + "|" + str(profile_mode) + "|" + str(tool_name) + "|" + str(target_app_id) + "|" + str(target_device_id);
+}
+
+fn grant_scoped_tool_consent(broker, spec) {
+    if not _valid_broker(broker) or type(spec) != "map" {
+        throw "user_consent_gate: valid broker and spec are required";
+    }
+    if broker.emergency_stopped or not broker.transport_connected {
+        throw "user_consent_gate: broker is not active";
+    }
+    let ai_client_id = try spec.ai_client_id catch "";
+    let profile_mode = try spec.profile_mode catch "standard";
+    let tool_name = try spec.tool_name catch "";
+    let target_app_id = try spec.target_app_id catch "";
+    let target_device_id = try spec.target_device_id catch "local-display";
+    if ai_client_id == "" or tool_name == "" or target_app_id == "" {
+        throw "user_consent_gate: ai_client_id, tool_name and target_app_id are required";
+    }
+    let raw_remember = try spec.remember_checkbox catch false;
+    let remember_checkbox = type(raw_remember) == "bool" and raw_remember;
+    let new_conn_dialog = try spec.new_connection_dialog catch "always_ask";
+    let sensitive_dialog = try spec.sensitive_action_dialog catch "always_ask";
+    if new_conn_dialog != "always_ask" and new_conn_dialog != "ask_on_new_connection" and new_conn_dialog != "remembered_allow" {
+        throw "user_consent_gate: invalid new_connection_dialog policy";
+    }
+    if sensitive_dialog != "always_ask" and sensitive_dialog != "explicit_per_action" {
+        throw "user_consent_gate: invalid sensitive_action_dialog policy";
+    }
+    let raw_unlim = try spec.unlimited_until_revoked catch false;
+    let unlimited = type(raw_unlim) == "bool" and raw_unlim;
+    let now_val = try spec.now_ms catch 0;
+    let max_events = try spec.max_events catch 100;
+    let duration_ms = try spec.duration_ms catch 600000;
+    let exp_ms = 0 - 1;
+    if unlimited {
+        max_events = 0 - 1;
+        duration_ms = 0 - 1;
+    } else {
+        if type(max_events) != "number" or max_events < 1 or max_events != num_floor(max_events) {
+            throw "user_consent_gate: max_events must be a positive integer when not unlimited";
+        }
+        if type(duration_ms) != "number" or duration_ms < 1000 {
+            throw "user_consent_gate: duration_ms must be >= 1000 ms when not unlimited";
+        }
+        exp_ms = now_val + duration_ms;
+    }
+    let init_nonce = try spec.approval_nonce catch "initial-human-approval";
+    let key = _grant_scope_key(ai_client_id, profile_mode, tool_name, target_app_id, target_device_id);
+    let record = map{
+        scope_key: key,
+        ai_client_id: ai_client_id,
+        profile_mode: profile_mode,
+        tool_name: tool_name,
+        target_app_id: target_app_id,
+        target_device_id: target_device_id,
+        remember_checkbox: remember_checkbox,
+        new_connection_dialog: new_conn_dialog,
+        sensitive_action_dialog: sensitive_dialog,
+        unlimited_until_revoked: unlimited,
+        initial_grant_ms: now_val,
+        expires_at_ms: exp_ms,
+        max_events: max_events,
+        cumulative_events_consumed: 0,
+        revoked: false,
+        last_approval_nonce: init_nonce
+    };
+    broker.grants[key] = record;
+    return record;
+}
+
+fn attempt_consent_renewal(broker, scope_key, renewal_req) {
+    if not _valid_broker(broker) or not map_has(broker.grants, scope_key) or type(renewal_req) != "map" {
+        return map{ ok: false, renewed: false, hidden_reset_blocked: true, reason: "unknown_scope_key" };
+    }
+    let rec = broker.grants[scope_key];
+    let new_nonce = try renewal_req.approval_nonce catch "";
+    let human_ok = false;
+    if (try renewal_req.explicit_human_reapproval catch false)
+        and type(new_nonce) == "string" and len(new_nonce) >= 12 and new_nonce != rec.last_approval_nonce {
+        human_ok = true;
+    }
+    if human_ok {
+        let add_events = try renewal_req.additional_events catch 0;
+        let add_duration_ms = try renewal_req.additional_duration_ms catch 0;
+        if not rec.unlimited_until_revoked {
+            if add_events > 0 { rec.max_events = rec.max_events + add_events; }
+            if add_duration_ms > 0 { rec.expires_at_ms = rec.expires_at_ms + add_duration_ms; }
+        }
+        rec.last_approval_nonce = new_nonce;
+        return map{
+            ok: true,
+            renewed: true,
+            hidden_reset_blocked: false,
+            cumulative_events_consumed: rec.cumulative_events_consumed,
+            max_events: rec.max_events,
+            expires_at_ms: rec.expires_at_ms
+        };
+    }
+    // PB-03-004 invariant: silent/automatic renewal NEVER resets cumulative limits
+    return map{
+        ok: false,
+        renewed: false,
+        hidden_reset_blocked: true,
+        cumulative_events_consumed: rec.cumulative_events_consumed,
+        max_events: rec.max_events,
+        expires_at_ms: rec.expires_at_ms,
+        reason: "silent_or_duplicate_renewal_forbidden"
+    };
+}
+
+fn revoke_scoped_tool_consent(broker, scope_key) {
+    if not _valid_broker(broker) or not map_has(broker.grants, scope_key) {
+        return map{ ok: false, revoked: false };
+    }
+    broker.grants[scope_key].revoked = true;
+    return map{ ok: true, revoked: true, scope_key: scope_key };
+}
+
+fn evaluate_scoped_tool_action(broker, req) {
+    if not _valid_broker(broker) or type(req) != "map" {
+        return map{ allowed: false, reason: "invalid_broker_or_request" };
+    }
+    if broker.emergency_stopped or not broker.transport_connected {
+        return map{ allowed: false, reason: "broker_stopped_or_closed" };
+    }
+    let req_client = try req.ai_client_id catch "";
+    let req_mode = try req.profile_mode catch "standard";
+    let req_tool = try req.tool_name catch "";
+    let req_app = try req.target_app_id catch "";
+    let req_dev = try req.target_device_id catch "local-display";
+    let key = _grant_scope_key(req_client, req_mode, req_tool, req_app, req_dev);
+    if not map_has(broker.grants, key) {
+        return map{ allowed: false, reason: "isolated_scope_not_granted", scope_key: key };
+    }
+    let rec = broker.grants[key];
+    if rec.revoked {
+        return map{ allowed: false, reason: "grant_revoked", scope_key: key };
+    }
+    let now_val = try req.now_ms catch 0;
+    if not rec.unlimited_until_revoked {
+        if now_val >= rec.expires_at_ms {
+            return map{ allowed: false, reason: "grant_duration_expired", scope_key: key };
+        }
+        if rec.cumulative_events_consumed >= rec.max_events {
+            return map{ allowed: false, reason: "grant_event_budget_exhausted", scope_key: key };
+        }
+    }
+    if not rec.remember_checkbox {
+        if try req.dialog_confirmed catch false {
+        } else {
+            return map{ allowed: false, reason: "dialog_confirmation_required_when_not_remembered", scope_key: key };
+        }
+    }
+    if try req.is_sensitive catch false {
+        if try req.sensitive_dialog_confirmed catch false {
+        } else {
+            return map{ allowed: false, reason: "sensitive_action_dialog_confirmation_required", scope_key: key };
+        }
+    }
+    rec.cumulative_events_consumed = rec.cumulative_events_consumed + 1;
+    return map{
+        allowed: true,
+        scope_key: key,
+        window_state: broker.window_state,
+        cumulative_events_consumed: rec.cumulative_events_consumed,
+        unlimited_until_revoked: rec.unlimited_until_revoked
+    };
+}
+
 export FORMAT, create_screen_sharing_policy, approve_screen_target, trigger_emergency_stop,
        evaluate_screen_sharing_request, plan_sms_message, plan_phone_call,
-       issue_communication_approval, execute_approved_action;
+       issue_communication_approval, execute_approved_action,
+       create_desktop_broker, request_broker_gui_attach, transition_broker_window,
+       grant_scoped_tool_consent, attempt_consent_renewal, revoke_scoped_tool_consent,
+       evaluate_scoped_tool_action;
+

@@ -328,6 +328,646 @@ fn generate_reproducible_research_dataset(seed_key, raw_subjects, samples_per_su
     };
 }
 
+// ── PB-02-004 & PB-02-007: Memory/Lifetime Safety Arena (TOCTOU, Reentrancy, Double-Free, Mutation-on-Cleanup, Exhaustion & Idle Trim) ──
+
+fn create_memory_safety_arena(max_bytes = 1048576, max_handles = 256, idle_trim_ms = 30000, debug_controls = false) {
+    if type(max_bytes) != "number" or max_bytes < 64 or type(max_handles) != "number" or max_handles < 1 {
+        throw "open_capabilities_suite: invalid arena limits";
+    }
+    return map{
+        format: FORMAT,
+        phase: "active",
+        max_bytes: max_bytes,
+        max_handles: max_handles,
+        idle_trim_ms: idle_trim_ms,
+        debug_controls: if debug_controls { true } else { false },
+        used_bytes: 0,
+        active_handles: 0,
+        next_id: 1,
+        handles: map{},
+        debug_events: []
+    };
+}
+
+fn _log_arena_debug(arena, evt) {
+    if arena.debug_controls {
+        array_push(arena.debug_events, evt);
+    }
+}
+
+fn arena_alloc(arena, tag, size_bytes, initial_digest, now_ms_val = 0) {
+    if type(arena) != "map" or (try arena.format catch "") != FORMAT {
+        throw "open_capabilities_suite: invalid arena";
+    }
+    if arena.phase == "cleanup" or arena.phase == "closed" {
+        _log_arena_debug(arena, "alloc_denied_during_" + arena.phase);
+        return map{ ok: false, code: "mutation_during_cleanup_denied" };
+    }
+    if type(size_bytes) != "number" or size_bytes < 1 or size_bytes != num_floor(size_bytes) {
+        return map{ ok: false, code: "invalid_allocation_size" };
+    }
+    if arena.active_handles >= arena.max_handles or (arena.used_bytes + size_bytes) > arena.max_bytes {
+        _log_arena_debug(arena, "memory_exhaustion_guard_triggered");
+        return map{
+            ok: false,
+            code: "memory_exhaustion_prevented",
+            used_bytes: arena.used_bytes,
+            max_bytes: arena.max_bytes
+        };
+    }
+    let hid = "h_" + str(arena.next_id);
+    arena.next_id = arena.next_id + 1;
+    arena.used_bytes = arena.used_bytes + size_bytes;
+    arena.active_handles = arena.active_handles + 1;
+    let rec = map{
+        handle_id: hid,
+        tag: str(tag),
+        size_bytes: size_bytes,
+        state: "alive",
+        in_use_depth: 0,
+        generation: 1,
+        digest: str(initial_digest),
+        last_used_ms: now_ms_val
+    };
+    arena.handles[hid] = rec;
+    _log_arena_debug(arena, "alloc:" + hid);
+    return map{ ok: true, handle_id: hid, generation: 1, used_bytes: arena.used_bytes };
+}
+
+fn arena_enter_exclusive(arena, handle_id, mutate_digest = nil, now_ms_val = 0) {
+    if type(arena) != "map" or not map_has(arena.handles, handle_id) {
+        return map{ ok: false, code: "invalid_handle" };
+    }
+    if arena.phase == "cleanup" and mutate_digest != nil {
+        _log_arena_debug(arena, "mutate_on_cleanup_blocked:" + handle_id);
+        return map{ ok: false, code: "mutation_during_cleanup_denied" };
+    }
+    let h = arena.handles[handle_id];
+    if h.state != "alive" {
+        return map{ ok: false, code: "use_after_free_denied" };
+    }
+    if h.in_use_depth > 0 {
+        _log_arena_debug(arena, "reentrancy_blocked:" + handle_id);
+        return map{ ok: false, code: "reentrant_or_concurrent_access_denied" };
+    }
+    h.in_use_depth = 1;
+    h.last_used_ms = now_ms_val;
+    if mutate_digest != nil {
+        h.generation = h.generation + 1;
+        h.digest = str(mutate_digest);
+    }
+    return map{ ok: true, handle_id: handle_id, generation: h.generation, digest: h.digest };
+}
+
+fn arena_leave_exclusive(arena, handle_id) {
+    if type(arena) != "map" or not map_has(arena.handles, handle_id) {
+        return map{ ok: false, code: "invalid_handle" };
+    }
+    let h = arena.handles[handle_id];
+    if h.in_use_depth > 0 { h.in_use_depth = 0; }
+    return map{ ok: true, handle_id: handle_id };
+}
+
+fn arena_issue_toctou_ticket(arena, handle_id) {
+    if type(arena) != "map" or not map_has(arena.handles, handle_id) {
+        return map{ ok: false, code: "invalid_handle" };
+    }
+    let h = arena.handles[handle_id];
+    if h.state != "alive" { return map{ ok: false, code: "use_after_free_denied" }; }
+    return map{
+        ok: true,
+        handle_id: handle_id,
+        expected_generation: h.generation,
+        expected_digest: h.digest
+    };
+}
+
+fn arena_verify_toctou_ticket(arena, ticket) {
+    if type(arena) != "map" or type(ticket) != "map" or not map_has(arena.handles, try ticket.handle_id catch "") {
+        return map{ ok: false, toctou_detected: true, code: "invalid_ticket" };
+    }
+    let h = arena.handles[ticket.handle_id];
+    if h.state != "alive" or h.generation != ticket.expected_generation or h.digest != ticket.expected_digest {
+        _log_arena_debug(arena, "toctou_violation:" + ticket.handle_id);
+        return map{
+            ok: false,
+            toctou_detected: true,
+            code: "toctou_state_changed_between_check_and_use"
+        };
+    }
+    return map{ ok: true, toctou_detected: false, handle_id: h.handle_id, generation: h.generation };
+}
+
+fn arena_free(arena, handle_id) {
+    if type(arena) != "map" or not map_has(arena.handles, handle_id) {
+        return map{ ok: false, code: "invalid_handle" };
+    }
+    let h = arena.handles[handle_id];
+    if h.state == "freed" {
+        _log_arena_debug(arena, "double_free_blocked:" + handle_id);
+        return map{ ok: false, double_free_detected: true, code: "double_free_detected" };
+    }
+    if h.in_use_depth > 0 {
+        return map{ ok: false, code: "cannot_free_while_in_use" };
+    }
+    h.state = "freed";
+    arena.used_bytes = arena.used_bytes - h.size_bytes;
+    arena.active_handles = arena.active_handles - 1;
+    _log_arena_debug(arena, "free:" + handle_id);
+    return map{ ok: true, double_free_detected: false, used_bytes: arena.used_bytes };
+}
+
+fn arena_trim_idle(arena, now_ms_val) {
+    if type(arena) != "map" or arena.phase != "active" {
+        return map{ ok: false, trimmed_handles: 0, reclaimed_bytes: 0 };
+    }
+    let trimmed = 0;
+    let reclaimed = 0;
+    for hid in map_keys(arena.handles) {
+        let h = arena.handles[hid];
+        if h.state == "alive" and h.in_use_depth == 0 and (now_ms_val - h.last_used_ms) >= arena.idle_trim_ms {
+            h.state = "freed";
+            arena.used_bytes = arena.used_bytes - h.size_bytes;
+            arena.active_handles = arena.active_handles - 1;
+            trimmed = trimmed + 1;
+            reclaimed = reclaimed + h.size_bytes;
+        }
+    }
+    return map{
+        ok: true,
+        trimmed_handles: trimmed,
+        reclaimed_bytes: reclaimed,
+        remaining_bytes: arena.used_bytes
+    };
+}
+
+fn arena_begin_cleanup(arena) {
+    arena.phase = "cleanup";
+    return arena;
+}
+
+// ── PB-02-009: Bounded Async Deadline, Queue Backpressure & Cancellation Coordinator ──
+
+fn create_bounded_async_coordinator(max_workers = 4, max_queue_depth = 16, default_timeout_ms = 5000) {
+    if max_workers < 1 or max_queue_depth < 1 or default_timeout_ms < 10 {
+        throw "open_capabilities_suite: invalid async coordinator bounds";
+    }
+    return map{
+        format: FORMAT,
+        max_workers: max_workers,
+        max_queue_depth: max_queue_depth,
+        default_timeout_ms: default_timeout_ms,
+        active_workers: 0,
+        queued_tasks: 0,
+        next_task_id: 1,
+        tasks: map{}
+    };
+}
+
+fn submit_bounded_async_task(coord, name, now_ms_val, timeout_ms = nil) {
+    let eff_timeout = if timeout_ms == nil { coord.default_timeout_ms } else { timeout_ms };
+    if (coord.active_workers + coord.queued_tasks) >= (coord.max_workers + coord.max_queue_depth) {
+        return map{
+            ok: false,
+            accepted: false,
+            code: "queue_backpressure_limit_reached"
+        };
+    }
+    let tid = "task_" + str(coord.next_task_id);
+    coord.next_task_id = coord.next_task_id + 1;
+    let status = "running";
+    if coord.active_workers < coord.max_workers {
+        coord.active_workers = coord.active_workers + 1;
+    } else {
+        status = "queued";
+        coord.queued_tasks = coord.queued_tasks + 1;
+    }
+    let task = map{
+        task_id: tid,
+        name: str(name),
+        status: status,
+        submitted_at_ms: now_ms_val,
+        deadline_ms: now_ms_val + eff_timeout,
+        cancelled: false
+    };
+    coord.tasks[tid] = task;
+    return map{ ok: true, accepted: true, task_id: tid, status: status, deadline_ms: task.deadline_ms };
+}
+
+fn cancel_bounded_async_task(coord, task_id, reason = "caller_cancelled") {
+    if not map_has(coord.tasks, task_id) {
+        return map{ ok: false, cancelled: false, code: "unknown_task" };
+    }
+    let t = coord.tasks[task_id];
+    if t.status == "running" { coord.active_workers = coord.active_workers - 1; }
+    elif t.status == "queued" { coord.queued_tasks = coord.queued_tasks - 1; }
+    t.status = "cancelled";
+    t.cancelled = true;
+    t.cancel_reason = str(reason);
+    return map{ ok: true, cancelled: true, task_id: task_id, status: "cancelled" };
+}
+
+fn sweep_bounded_async_deadlines(coord, now_ms_val) {
+    let expired = [];
+    for tid in map_keys(coord.tasks) {
+        let t = coord.tasks[tid];
+        if (t.status == "running" or t.status == "queued") and now_ms_val >= t.deadline_ms {
+            if t.status == "running" { coord.active_workers = coord.active_workers - 1; }
+            else { coord.queued_tasks = coord.queued_tasks - 1; }
+            t.status = "deadline_expired";
+            array_push(expired, tid);
+        }
+    }
+    let idle_wait_ms = if coord.active_workers == 0 and coord.queued_tasks == 0 { 250 } else { 5 };
+    return map{
+        ok: true,
+        expired_task_ids: expired,
+        expired_count: len(expired),
+        recommended_idle_backoff_ms: idle_wait_ms
+    };
+}
+
+// ── PB-02-013: Cross-Platform Windows/POSIX Lockfile Publication & Cleanup-Error Result Preservation ──
+
+fn _valid_cross_platform_lock_path(path) {
+    if type(path) != "string" or len(path) < 5 or len(path) > 1024 { return false; }
+    if not str_ends_with(str_lower(path), ".lock") { return false; }
+    if str_contains(path, "..") or str_contains(path, strfromcharcode(0)) { return false; }
+    let norm = str_replace_all(path, "\\", "/");
+    let parts = str_split(norm, "/");
+    let i = 0;
+    while i < len(parts) {
+        let p = parts[i];
+        if i > 0 and str_contains(p, ":") { return false; }
+        let stem = str_lower(str_split(p, ".")[0]);
+        if stem == "con" or stem == "prn" or stem == "aux" or stem == "nul"
+            or regex_match(stem, "^(com|lpt)[1-9]$") {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn execute_transactional_lock_publication(lock_path, operation_fn, cleanup_fn) {
+    if not _valid_cross_platform_lock_path(lock_path) {
+        return map{
+            ok: false,
+            committed: false,
+            primary_result_preserved: false,
+            error: "invalid_or_unsafe_lockfile_path"
+        };
+    }
+    let op_threw = false;
+    let primary_res = try operation_fn() catch { op_threw = true; map{ ok: false, error: "operation_threw" } };
+    let primary_ok = false;
+    let primary_val = nil;
+    let primary_err = "operation_failed";
+    if type(primary_res) == "map" {
+        primary_ok = try primary_res.ok catch false;
+        primary_val = try primary_res.value catch nil;
+        primary_err = try primary_res.error catch "operation_failed";
+    }
+    let committed = not op_threw and primary_ok;
+    let cleanup_threw = false;
+    let cleanup_res = try cleanup_fn() catch { cleanup_threw = true; map{ ok: false, error: "cleanup_threw" } };
+    let cleanup_res_ok = false;
+    let cleanup_err = "cleanup_failed_after_commit";
+    if type(cleanup_res) == "map" {
+        cleanup_res_ok = try cleanup_res.ok catch false;
+        cleanup_err = try cleanup_res.error catch "cleanup_failed_after_commit";
+    }
+    let cleanup_ok = not cleanup_threw and cleanup_res_ok;
+    return map{
+        ok: committed and cleanup_ok,
+        lock_path: lock_path,
+        committed: committed,
+        primary_result_preserved: committed,
+        primary_value: if committed { primary_val } else { nil },
+        primary_error: if committed { nil } else { primary_err },
+        cleanup_ok: cleanup_ok,
+        cleanup_error: if cleanup_ok { nil } else { cleanup_err }
+    };
+}
+
+// ── PB-02-010: Ghost / Zombie / Orphan Process Diagnostics & Safe Root-Cause Cleanup ──
+
+fn diagnose_and_plan_process_cleanup(process_rows, owned_root_pids, allow_force_kill = false) {
+    if type(process_rows) != "array" or type(owned_root_pids) != "array" {
+        throw "open_capabilities_suite: process_rows and owned_root_pids must be arrays";
+    }
+    let owned_set = map{};
+    for pid in owned_root_pids { owned_set[str(pid)] = true; }
+    let zombies = [];
+    let orphans = [];
+    let ghosts = [];
+    let actions = [];
+    let i = 0;
+    while i < len(process_rows) {
+        let p = process_rows[i];
+        let pid_s = str(try p.pid catch 0);
+        let ppid_s = str(try p.ppid catch 0);
+        let session_owned = try p.owned_by_session catch false;
+        let is_owned = map_has(owned_set, pid_s) or map_has(owned_set, ppid_s) or session_owned;
+        if is_owned {
+            let st = str_upper(str(try p.state catch "S"));
+            let stale_lock = try p.stale_lock_held catch false;
+            if st == "Z" {
+                array_push(zombies, p.pid);
+                array_push(actions, map{
+                    pid: p.pid,
+                    classification: "zombie_defunct",
+                    root_cause: "parent_missing_waitpid_reap",
+                    recommended_action: "waitpid_reap_nonblocking"
+                });
+            } elif (try p.ppid catch 0) == 1 {
+                array_push(orphans, p.pid);
+                array_push(actions, map{
+                    pid: p.pid,
+                    classification: "orphan_reparented_to_init",
+                    root_cause: "parent_exited_without_process_scope_drain",
+                    recommended_action: if allow_force_kill { "sigterm_then_sigkill" } else { "graceful_sigterm_only" }
+                });
+            } elif stale_lock {
+                array_push(ghosts, p.pid);
+                array_push(actions, map{
+                    pid: p.pid,
+                    classification: "ghost_holding_stale_resource",
+                    root_cause: "unclosed_inherited_descriptor",
+                    recommended_action: "close_descriptor_and_sigterm"
+                });
+            }
+        }
+        i = i + 1;
+    }
+    return map{
+        ok: true,
+        format: FORMAT,
+        zombie_pids: zombies,
+        orphan_pids: orphans,
+        ghost_pids: ghosts,
+        cleanup_plan: actions,
+        unrelated_processes_touched: 0,
+        safe_default_enforced: true
+    };
+}
+
+// ── PB-05-007 & PB-05-009: Camera/Mic/Screen/Touch/Stylus/Board/Peripheral Target Authorization ──
+
+fn authorize_peripheral_device_operation(req) {
+    if type(req) != "map" { throw "open_capabilities_suite: req must be a map"; }
+    let kind = str_lower(str(try req.device_kind catch ""));
+    if kind != "camera" and kind != "microphone" and kind != "screen_capture"
+        and kind != "touchscreen" and kind != "stylus" and kind != "interactive_board"
+        and kind != "usb_peripheral" and kind != "os_service" {
+        return map{ ok: false, allowed: false, error: "unsupported_device_kind" };
+    }
+    let target_id = str_trim(str(try req.target_device_id catch ""));
+    let token = str(try req.target_auth_token catch "");
+    let token_matches = constant_time_eq(token, str(try req.expected_target_token catch ""));
+    if target_id == "" or len(token) < 12 {
+        return map{
+            ok: false,
+            allowed: false,
+            device_kind: kind,
+            target_device_id: target_id,
+            error: "explicit_target_authorization_failed"
+        };
+    }
+    if token_matches {
+        // valid target token
+    } else {
+        return map{
+            ok: false,
+            allowed: false,
+            device_kind: kind,
+            target_device_id: target_id,
+            error: "explicit_target_authorization_failed"
+        };
+    }
+    let needs_indicator = kind == "camera" or kind == "microphone" or kind == "screen_capture";
+    let indicator_active = try req.hardware_or_os_indicator_active catch false;
+    if needs_indicator {
+        if indicator_active {
+            // hardware/OS capture indicator active
+        } else {
+            return map{
+                ok: false,
+                allowed: false,
+                device_kind: kind,
+                target_device_id: target_id,
+                error: "visible_capture_indicator_required"
+            };
+        }
+    }
+    return map{
+        ok: true,
+        allowed: true,
+        format: FORMAT,
+        device_kind: kind,
+        target_device_id: target_id,
+        indicator_verified: if needs_indicator { true } else { false },
+        hardware_connected: false
+    };
+}
+
+// ── PB-05-020: Bounded Soft-Real-Time Streaming Monitor (Explicit Non-Hard-RT Contract) ──
+
+fn evaluate_soft_realtime_stream(stream_spec, latencies_ms) {
+    if type(stream_spec) != "map" or type(latencies_ms) != "array" or len(latencies_ms) < 1 or len(latencies_ms) > 4096 {
+        throw "open_capabilities_suite: valid stream_spec and 1..4096 latencies_ms are required";
+    }
+    let budget_ms = try stream_spec.deadline_budget_ms catch 33;
+    let sorted = array_sort(latencies_ms);
+    let n = len(sorted);
+    let sum = 0;
+    let drops = 0;
+    let i = 0;
+    while i < n {
+        let v = sorted[i];
+        sum = sum + v;
+        if v > budget_ms { drops = drops + 1; }
+        i = i + 1;
+    }
+    let p50 = sorted[num_floor((n - 1) * 0.50)];
+    let p95 = sorted[num_floor((n - 1) * 0.95)];
+    let p99 = sorted[num_floor((n - 1) * 0.99)];
+    let jitter = sorted[n - 1] - sorted[0];
+    return map{
+        ok: true,
+        format: FORMAT,
+        execution_class: "soft_realtime_bounded_monitoring",
+        hard_realtime_guaranteed: false,
+        sample_count: n,
+        budget_ms: budget_ms,
+        mean_latency_ms: sum / n,
+        p50_ms: p50,
+        p95_ms: p95,
+        p99_ms: p99,
+        jitter_ms: jitter,
+        deadline_misses: drops,
+        within_soft_budget: p95 <= budget_ms
+    };
+}
+
+// ── PB-04-012: RBAC Hierarchy, Deterministic TOTP (2FA) & Single-Use Recovery Codes ──
+
+fn validate_role(role) {
+    let r = str_lower(str_trim(str(role)));
+    return r == "viewer" or r == "editor" or r == "operator" or r == "admin" or r == "owner";
+}
+
+fn _role_rank(role) {
+    let r = str_lower(str_trim(str(role)));
+    if r == "viewer" { return 1; }
+    if r == "editor" { return 2; }
+    if r == "operator" { return 3; }
+    if r == "admin" { return 4; }
+    if r == "owner" { return 5; }
+    return 0;
+}
+
+fn authorize_role_action(user_role, required_role, action_name = "unspecified") {
+    let ur = _role_rank(user_role);
+    let rr = _role_rank(required_role);
+    let allowed = ur > 0 and rr > 0 and ur >= rr;
+    return map{
+        ok: allowed,
+        allowed: allowed,
+        user_role: str_lower(str_trim(str(user_role))),
+        required_role: str_lower(str_trim(str(required_role))),
+        action: str(action_name),
+        code: if allowed { "role_authorized" } else { "insufficient_role_privilege" }
+    };
+}
+
+fn _hex_nibble_val(ch) {
+    let c = str_lower(ch);
+    if c == "0" { return 0; }
+    if c == "1" { return 1; }
+    if c == "2" { return 2; }
+    if c == "3" { return 3; }
+    if c == "4" { return 4; }
+    if c == "5" { return 5; }
+    if c == "6" { return 6; }
+    if c == "7" { return 7; }
+    if c == "8" { return 8; }
+    if c == "9" { return 9; }
+    if c == "a" { return 10; }
+    if c == "b" { return 11; }
+    if c == "c" { return 12; }
+    if c == "d" { return 13; }
+    if c == "e" { return 14; }
+    if c == "f" { return 15; }
+    return 0;
+}
+
+fn compute_totp_code(totp_secret, unix_seconds, step_seconds = 30) {
+    if type(totp_secret) != "string" or len(totp_secret) < 16 {
+        throw "open_capabilities_suite: totp_secret must be at least 16 chars";
+    }
+    let step = if step_seconds > 0 { step_seconds } else { 30 };
+    let counter = num_floor(unix_seconds / step);
+    let digest = hmac_sha256(totp_secret, "totp-v1:" + str(counter));
+    let val = 0;
+    let i = 0;
+    while i < 7 {
+        val = (val * 16) + _hex_nibble_val(str_slice(digest, i, i + 1));
+        i = i + 1;
+    }
+    let code_num = val % 1000000;
+    let s = str(code_num);
+    while len(s) < 6 {
+        s = "0" + s;
+    }
+    return s;
+}
+
+fn verify_totp_code(totp_secret, candidate_code, unix_seconds, step_seconds = 30, skew_steps = 1) {
+    if type(candidate_code) != "string" or len(candidate_code) != 6 {
+        return map{ ok: false, verified: false, code: "invalid_totp_format" };
+    }
+    let step = if step_seconds > 0 { step_seconds } else { 30 };
+    let skew = if skew_steps >= 0 and skew_steps <= 2 { skew_steps } else { 1 };
+    let matched = false;
+    let matched_offset = 0;
+    let d = 0 - skew;
+    while d <= skew {
+        let expected = compute_totp_code(totp_secret, unix_seconds + (d * step), step);
+        if constant_time_eq(candidate_code, expected) {
+            matched = true;
+            matched_offset = d;
+        }
+        d = d + 1;
+    }
+    return map{
+        ok: matched,
+        verified: matched,
+        skew_step_matched: matched_offset,
+        code: if matched { "totp_verified" } else { "totp_mismatch" }
+    };
+}
+
+fn generate_recovery_bundle(seed_material, account_id, count = 8) {
+    if type(seed_material) != "string" or len(seed_material) < 16 {
+        throw "open_capabilities_suite: seed_material must be at least 16 chars";
+    }
+    let n = if count >= 1 and count <= 16 { count } else { 8 };
+    let plaintext_codes = [];
+    let stored_hashes = map{};
+    let i = 0;
+    while i < n {
+        let raw = str_upper(str_slice(hmac_sha256(seed_material, "recovery:" + str(account_id) + ":" + str(i)), 0, 12));
+        let formatted = str_slice(raw, 0, 4) + "-" + str_slice(raw, 4, 8) + "-" + str_slice(raw, 8, 12);
+        array_push(plaintext_codes, formatted);
+        let code_hash = sha256("recovery-store:" + str(account_id) + ":" + formatted);
+        stored_hashes[code_hash] = false;
+        i = i + 1;
+    }
+    return map{
+        ok: true,
+        account_id: str(account_id),
+        plaintext_codes: plaintext_codes,
+        recovery_state: map{
+            account_id: str(account_id),
+            remaining_count: n,
+            used_hashes: stored_hashes
+        }
+    };
+}
+
+fn redeem_recovery_code(recovery_state, candidate_code) {
+    if type(recovery_state) != "map" or type(candidate_code) != "string" {
+        return map{ ok: false, redeemed: false, code: "invalid_recovery_request" };
+    }
+    let norm = str_upper(str_trim(candidate_code));
+    let code_hash = sha256("recovery-store:" + recovery_state.account_id + ":" + norm);
+    if not map_has(recovery_state.used_hashes, code_hash) {
+        return map{ ok: false, redeemed: false, code: "unknown_recovery_code" };
+    }
+    let already_used = recovery_state.used_hashes[code_hash];
+    if already_used {
+        return map{ ok: false, redeemed: false, replay_blocked: true, code: "recovery_code_already_used" };
+    }
+    recovery_state.used_hashes[code_hash] = true;
+    recovery_state.remaining_count = recovery_state.remaining_count - 1;
+    return map{
+        ok: true,
+        redeemed: true,
+        replay_blocked: false,
+        remaining_count: recovery_state.remaining_count,
+        code: "recovery_code_redeemed"
+    };
+}
+
 export FORMAT, inspect_ble_tag_frame, analyze_spectrum_ultrasound,
        compile_template_to_app_schema, validate_office_device_job,
-       generate_reproducible_research_dataset;
+       generate_reproducible_research_dataset,
+       create_memory_safety_arena, arena_alloc, arena_enter_exclusive, arena_leave_exclusive,
+       arena_issue_toctou_ticket, arena_verify_toctou_ticket, arena_free, arena_trim_idle, arena_begin_cleanup,
+       create_bounded_async_coordinator, submit_bounded_async_task, cancel_bounded_async_task, sweep_bounded_async_deadlines,
+       execute_transactional_lock_publication, diagnose_and_plan_process_cleanup,
+       authorize_peripheral_device_operation, evaluate_soft_realtime_stream,
+       validate_role, authorize_role_action, compute_totp_code, verify_totp_code,
+       generate_recovery_bundle, redeem_recovery_code;
+

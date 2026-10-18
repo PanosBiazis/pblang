@@ -268,5 +268,254 @@ fn validate_manifest_file(path) {
     return validate_manifest_text(text);
 }
 
+// ── PB-01-005: Declared Required/Optional Dependencies, Versions, Capabilities, Licenses & Cycle Guard ──
+
+let SUPPORTED_LICENSES = [
+    "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause",
+    "MPL-2.0", "LGPL-3.0-only", "GPL-3.0-only", "Proprietary", "Unlicense"
+];
+
+fn is_supported_license(spdx) {
+    if type(spdx) != "string" or spdx == "" { return false; }
+    let i = 0;
+    while i < len(SUPPORTED_LICENSES) {
+        if SUPPORTED_LICENSES[i] == spdx { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn check_license_compatibility(consumer_license, provider_license) {
+    if not is_supported_license(consumer_license) or not is_supported_license(provider_license) {
+        return map{ ok: false, compatible: false, reason: "unsupported_or_missing_spdx_license" };
+    }
+    let provider_permissive = provider_license == "MIT" or provider_license == "Apache-2.0"
+        or provider_license == "BSD-2-Clause" or provider_license == "BSD-3-Clause"
+        or provider_license == "Unlicense";
+    if provider_permissive {
+        return map{ ok: true, compatible: true, reason: "permissive_provider_compatible" };
+    }
+    if provider_license == "MPL-2.0" or provider_license == "LGPL-3.0-only" {
+        return map{ ok: true, compatible: true, reason: "weak_copyleft_module_boundary_compatible" };
+    }
+    if provider_license == "GPL-3.0-only" {
+        if consumer_license == "GPL-3.0-only" {
+            return map{ ok: true, compatible: true, reason: "strong_copyleft_matched" };
+        }
+        return map{ ok: false, compatible: false, reason: "gpl3_incompatible_with_" + consumer_license };
+    }
+    if provider_license == "Proprietary" {
+        if consumer_license == "Proprietary" {
+            return map{ ok: true, compatible: true, reason: "proprietary_matched" };
+        }
+        return map{ ok: false, compatible: false, reason: "proprietary_provider_incompatible_with_open_license" };
+    }
+    return map{ ok: false, compatible: false, reason: "license_combination_rejected" };
+}
+
+fn _version_satisfies(offered_ver, constraint) {
+    if type(offered_ver) != "string" or type(constraint) != "string" { return false; }
+    let offered = SEMVER.parse_strict(offered_ver);
+    if offered == nil { return false; }
+    let c = str_trim(constraint);
+    if str_starts_with(c, "^") {
+        let req = SEMVER.parse_strict(str_slice(c, 1, len(c)));
+        if req == nil { return false; }
+        if offered.major != req.major { return false; }
+        if offered.major == 0 and offered.minor != req.minor { return false; }
+        return SEMVER.compare(offered, req) >= 0;
+    }
+    if str_starts_with(c, ">=") {
+        let req = SEMVER.parse_strict(str_slice(c, 2, len(c)));
+        if req == nil { return false; }
+        return SEMVER.compare(offered, req) >= 0;
+    }
+    let exact = SEMVER.parse_strict(c);
+    if exact == nil { return false; }
+    return SEMVER.compare(offered, exact) == 0;
+}
+
+fn _visit_pkg(pkg_name, reg, cap_set, state_color, order, bindings, degraded_optional, failure) {
+    if failure.failed { return nil; }
+    let color = try state_color[pkg_name] catch 0;
+    if color == 1 {
+        failure.failed = true;
+        failure.code = "dependency_cycle_detected";
+        failure.package = pkg_name;
+        return nil;
+    }
+    if color == 2 { return nil; }
+    state_color[pkg_name] = 1;
+
+    let pkg = reg[pkg_name];
+    let req_caps = try pkg.required_capabilities catch [];
+    if type(req_caps) == "array" {
+        let ci = 0;
+        while ci < len(req_caps) {
+            let rc = req_caps[ci];
+            if not map_has(cap_set, rc) {
+                failure.failed = true;
+                failure.code = "missing_required_capability";
+                failure.package = pkg_name;
+                failure.detail = rc;
+                return nil;
+            }
+            ci = ci + 1;
+        }
+    }
+
+    let deps = try pkg.dependencies catch [];
+    if type(deps) == "array" {
+        let di = 0;
+        while di < len(deps) {
+            if failure.failed { return nil; }
+            let dep = deps[di];
+            let dep_name = try dep.name catch "";
+            let dep_ver = try dep.version catch "";
+            let fallback_name = try dep.fallback catch nil;
+
+            let target_name = dep_name;
+            let resolution_mode = "required";
+            if try dep.optional catch false {
+                resolution_mode = "optional_present";
+            }
+            if not map_has(reg, target_name) {
+                if resolution_mode == "required" {
+                    failure.failed = true;
+                    failure.code = "missing_required_dependency";
+                    failure.package = pkg_name;
+                    failure.dependency = dep_name;
+                    return nil;
+                }
+                if fallback_name != nil and fallback_name != "" {
+                    if not map_has(reg, fallback_name) {
+                        failure.failed = true;
+                        failure.code = "missing_optional_fallback";
+                        failure.package = pkg_name;
+                        failure.dependency = fallback_name;
+                        return nil;
+                    }
+                    target_name = fallback_name;
+                    resolution_mode = "optional_fallback";
+                } else {
+                    array_push(degraded_optional, map{
+                        consumer: pkg_name,
+                        dependency: dep_name,
+                        status: "optional_absent_safe_degraded"
+                    });
+                    target_name = "";
+                }
+            }
+
+            if target_name != "" {
+                let target_pkg = reg[target_name];
+                if not _version_satisfies(target_pkg.version, dep_ver) {
+                    failure.failed = true;
+                    failure.code = "incompatible_dependency_version";
+                    failure.package = pkg_name;
+                    failure.dependency = target_name;
+                    failure.detail = "expected " + dep_ver + ", got " + target_pkg.version;
+                    return nil;
+                }
+                let lic_check = check_license_compatibility(pkg.license, target_pkg.license);
+                if not lic_check.compatible {
+                    failure.failed = true;
+                    failure.code = "incompatible_dependency_license";
+                    failure.package = pkg_name;
+                    failure.dependency = target_name;
+                    failure.detail = lic_check.reason;
+                    return nil;
+                }
+                _visit_pkg(target_name, reg, cap_set, state_color, order, bindings, degraded_optional, failure);
+                if failure.failed { return nil; }
+                array_push(bindings, map{
+                    consumer: pkg_name,
+                    provider: target_name,
+                    version: target_pkg.version,
+                    license: target_pkg.license,
+                    mode: resolution_mode
+                });
+            }
+            di = di + 1;
+        }
+    }
+
+    state_color[pkg_name] = 2;
+    array_push(order, pkg_name);
+    return nil;
+}
+
+fn resolve_dependency_graph_safe(pkg_list, root_name, available_capabilities = nil) {
+    if type(pkg_list) != "array" or len(pkg_list) < 1 or len(pkg_list) > 128 {
+        return map{ ok: false, code: "invalid_package_catalog", order: [], resolved: [] };
+    }
+    if not _valid_package_name(root_name) {
+        return map{ ok: false, code: "invalid_root_name", order: [], resolved: [] };
+    }
+    let cap_set = map{};
+    if type(available_capabilities) == "array" {
+        let ci = 0;
+        while ci < len(available_capabilities) {
+            let cap = available_capabilities[ci];
+            if type(cap) == "string" and cap != "" { cap_set[cap] = true; }
+            ci = ci + 1;
+        }
+    }
+    let reg = map{};
+    let pi = 0;
+    while pi < len(pkg_list) {
+        let pkg = pkg_list[pi];
+        if type(pkg) != "map" or not _valid_package_name(try pkg.name catch "") {
+            return map{ ok: false, code: "invalid_package_entry", order: [], resolved: [] };
+        }
+        if map_has(reg, pkg.name) {
+            return map{ ok: false, code: "duplicate_package_entry", package: pkg.name, order: [], resolved: [] };
+        }
+        let ver = try pkg.version catch "";
+        if SEMVER.parse_strict(ver) == nil {
+            return map{ ok: false, code: "invalid_package_semver", package: pkg.name, order: [], resolved: [] };
+        }
+        if not is_supported_license(try pkg.license catch "") {
+            return map{ ok: false, code: "invalid_or_missing_license", package: pkg.name, order: [], resolved: [] };
+        }
+        reg[pkg.name] = pkg;
+        pi = pi + 1;
+    }
+    if not map_has(reg, root_name) {
+        return map{ ok: false, code: "missing_root_package", package: root_name, order: [], resolved: [] };
+    }
+
+    let state_color = map{};
+    let order = [];
+    let bindings = [];
+    let degraded_optional = [];
+    let failure = map{ failed: false, code: "", package: "", dependency: "", detail: "" };
+
+    _visit_pkg(root_name, reg, cap_set, state_color, order, bindings, degraded_optional, failure);
+    if failure.failed {
+        return map{
+            ok: false,
+            code: failure.code,
+            package: failure.package,
+            dependency: failure.dependency,
+            detail: failure.detail,
+            order: [],
+            bindings: [],
+            degraded_optional: []
+        };
+    }
+
+    return map{
+        ok: true,
+        code: "ok",
+        root: root_name,
+        order: order,
+        bindings: bindings,
+        degraded_optional: degraded_optional
+    };
+}
+
 export MAX_MANIFEST_BYTES, MAX_MANIFEST_LINES, MAX_MANIFEST_LINE_CHARS;
-export validate_manifest_text, validate_manifest_file;
+export SUPPORTED_LICENSES, is_supported_license, check_license_compatibility;
+export validate_manifest_text, validate_manifest_file, resolve_dependency_graph_safe;
+
