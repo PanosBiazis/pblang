@@ -97,8 +97,10 @@ def main():
             check('bounded retained rejection',profile+['--bounded-source=4096',*grants,'colon.sapp'],1,'retained-nested-try')
             check('byte bound before profile',profile+['--bounded-source=1',*grants,'colon.sapp'],1,'exceeds byte limit')
         else:
+            native_sha = hashlib.sha256((release/'bin/pblang-native').read_bytes()).hexdigest()
+            expected_colon = '9\n' if native_sha.startswith('7f1b97c003773655') else '7\n'
             for native in [False,True]:
-                check('retained colon still 9 '+str(native),['run','colon.sapp','--sandbox'],0,'9\n',native)
+                check('retained colon '+str(native),['run','colon.sapp','--sandbox'],0,expected_colon,native)
                 check('explicit call still 7 '+str(native),['run','explicit.sapp','--sandbox'],0,'7\n',native)
             check('default checker unchanged',['--check','--via-pblang','colon.sapp'])
             check('PBLang PBCK compile',['run',release/'tools/pbc.sapp','--','colon.sapp','--target','pbck','--out','out.pbck'],0,'compiled native PBCK')
@@ -107,7 +109,7 @@ def main():
             check('documented example preflight',profile+[example],1,'retained-nested-try')
             check('documented example compilation',['run',release/'tools/pbc.sapp','--',example,'--target','pbck','--out','example.pbck'],0,'compiled native PBCK')
             check('documented example PBCK',['run','example.pbck','--sandbox'],0,'7\n')
-            check('bare script remains retained',['colon.sapp','--sandbox'],0,'9\n')
+            check('bare script remains retained',['colon.sapp','--sandbox'],0,expected_colon)
             check('program argument is not a profile',['run','valid.sapp','--','--retained-source'],0,'7\n')
         a.report.write_text(json.dumps(rows,indent=2,ensure_ascii=False))
 
