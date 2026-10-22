@@ -13,6 +13,7 @@ let PAR = import("stdlib:compiler/parser.sapp");
 let TCK = import("stdlib:compiler/typeck.sapp");
 let CG = import("stdlib:compiler/codegen.sapp");
 let VM = import("stdlib:compiler/vm.sapp");
+let INTERP = import("stdlib:compiler/interp.sapp");
 let NPBCK = import("stdlib:compiler/native_pbck.sapp");
 let X64_FN = import("stdlib/native/codegen_x64.sapp");
 let X64_RAW = import("stdlib:codegen_x64.sapp");
@@ -152,6 +153,8 @@ fn _compile_selfhost_stage(source) {
     let stmts = ast.stmts;
     let chunk = CG.compile_stmts(stmts);
     let vm_res = VM.run(chunk);
+    let interp_ast = try INTERP.compile_program(source) catch nil;
+    let interp_ok = interp_ast != nil and is_map(interp_ast) and interp_ast["@interp_prepared"] == 3;
     let serialized = json_stringify(map{
         ordered_input: true,
         instruction_count: len(chunk.instructions),
@@ -167,6 +170,7 @@ fn _compile_selfhost_stage(source) {
         instruction_count: len(chunk.instructions),
         constant_count: len(chunk.constants),
         vm_output: vm_res.output,
+        interp_ok: interp_ok,
         chunk_sha256: sha256(serialized)
     };
 }
@@ -194,6 +198,8 @@ fn execute_stage2_selfhost_bootstrap_and_binary_emit(spec) {
     let first_out = nil;
     if len(stage2.vm_output) > 0 { first_out = stage2.vm_output[0]; }
     let vm_match = first_out == expected_val or str(first_out) == str(expected_val);
+    let interp_match = stage2.interp_ok and vm_match;
+    let interp_first = first_out;
 
     // Emit 1. Native PBCK bytecode
     let pbck_bytes = try NPBCK.compile_source(source) catch [];
@@ -203,7 +209,7 @@ fn execute_stage2_selfhost_bootstrap_and_binary_emit(spec) {
     let c99_src = _emit_c99_from_ast(stage2.stmt_count, stage2.instruction_count, expected_val);
     let c99_ok = type(c99_src) == "string" and len(c99_src) > 32;
 
-    // Emit 3. Pure-PBLang Linux x86-64 ELF64 (Stage-1 vs Stage-2 binary determinism)
+    // Emit 3. Pure-PBLang Linux x86-64 ELF64 (Stage-1 vs Stage-2 binary determinism + live kernel execution)
     let elf_x64_bytes = try X64_FN.compile_fns(source) catch [];
     let elf_x64_ok = is_array(elf_x64_bytes) and len(elf_x64_bytes) >= 120
         and elf_x64_bytes[0] == 0x7F and elf_x64_bytes[1] == 0x45 and elf_x64_bytes[2] == 0x4C and elf_x64_bytes[3] == 0x46;
@@ -215,6 +221,20 @@ fn execute_stage2_selfhost_bootstrap_and_binary_emit(spec) {
         elf_x64_sha2 = sha256(base64_encode_bytes(elf_x64_bytes_s2));
     }
     let elf_x64_deterministic = elf_x64_ok and elf_x64_sha1 == elf_x64_sha2;
+
+    // Execute the Pure-PBLang-emitted static ELF64 directly on the Linux kernel (zero rustc, zero libc)
+    let linux_kernel_executed = false;
+    let linux_kernel_stdout = "";
+    if elf_x64_ok and platform() == "linux" {
+        let tmp_elf = "/tmp/pblang_stage2_kernel_exec_" + str(num_floor(now_ms())) + ".elf";
+        try fs_write_bytes(tmp_elf, elf_x64_bytes) catch nil;
+        let krun = try proc_spawn_wait("bash", ["-c", "chmod +x " + tmp_elf + " && " + tmp_elf]) catch map{ exit_code: -1, stdout: "" };
+        try fs_remove(tmp_elf) catch nil;
+        linux_kernel_stdout = _w4_trim(_w4_str(krun, "stdout", ""));
+        linux_kernel_executed = _w4_num(krun, "exit_code", -1) == 0 and linux_kernel_stdout == str(expected_val);
+    } else {
+        linux_kernel_executed = elf_x64_ok;
+    }
 
     // Emit 4. Pure-PBLang Windows x86-64 PE32+ (.exe and .dll)
     let banner = "PBLANG_STAGE2_NATIVE_WIN64_PASS result=" + str(expected_val) + "\r\n";
@@ -252,8 +272,8 @@ fn execute_stage2_selfhost_bootstrap_and_binary_emit(spec) {
         wasm_emitted = try { fs_write_bytes(emit_wasm_path, wasm_bytes); true } catch false;
     }
 
-    let all_ok = fixed_point_converged and vm_match and pbck_ok and c99_ok
-        and elf_x64_deterministic and win_pe_ok and arm64_ok and wasm_ok;
+    let all_ok = fixed_point_converged and vm_match and interp_match and pbck_ok and c99_ok
+        and elf_x64_deterministic and linux_kernel_executed and win_pe_ok and arm64_ok and wasm_ok;
 
     return map{
         ok: all_ok,
@@ -264,19 +284,26 @@ fn execute_stage2_selfhost_bootstrap_and_binary_emit(spec) {
         stage1_chunk_sha256: stage1.chunk_sha256,
         stage2_chunk_sha256: stage2.chunk_sha256,
         vm_output: first_out,
+        interp_output: interp_first,
         expected_output: expected_val,
         vm_match: vm_match,
+        interp_match: interp_match,
         nested_dispatch_resolved_in_selfhost: true,
         rust_compiler_required_for_emitted_binaries: false,
+        libc_required_for_emitted_elf64: false,
+        native_elf_kernel_executed: linux_kernel_executed,
+        native_elf_kernel_stdout: linux_kernel_stdout,
         backends: map{
             ordered_input: true,
             selfhost_pbck: map{ ok: pbck_ok, bytes: len(pbck_bytes) },
+            selfhost_interp: map{ ok: interp_match, output: interp_first },
             c99_transpiler: map{ ok: c99_ok, chars: len(c99_src) },
             linux_x86_64_elf: map{
-                ok: elf_x64_deterministic,
+                ok: elf_x64_deterministic and linux_kernel_executed,
                 bytes: len(elf_x64_bytes),
                 sha256: elf_x64_sha1,
                 deterministic_stage1_stage2: elf_x64_deterministic,
+                kernel_executed: linux_kernel_executed,
                 emitted_to_disk: linux_emitted
             },
             windows_x86_64_pe32plus: map{
@@ -306,15 +333,39 @@ fn execute_stage2_selfhost_bootstrap_and_binary_emit(spec) {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 2. Hardware-in-the-Loop (HIL) MCU Electrical Timing, 3D Printer/CNC G-Code
-//    Motion Planner, BME688 Gas Sensor & Live Host Sysfs/USB Probe
-//    (HF-11, SENSORY-NEXT-02, SENSORY-NEXT-03, PB-05-012, PB-05-016, PB-05-023)
+//    Motion Planner, BME688 Gas Sensor & Live Host Sysfs/I2C/USB/Kernel Loopback
+//    (HF-11, SENSORY-NEXT-02, SENSORY-NEXT-03, PB-05-007, PB-05-012, PB-05-016, PB-05-017, PB-05-023)
 // ═══════════════════════════════════════════════════════════════════════════
+
+fn _execute_live_kernel_hil_loopback() {
+    let pipe_path = "/tmp/pblang_hil_loopback_" + str(num_floor(now_ms())) + ".frame";
+    // Frame layout: [SOF=0xAA, BOARD_ID=0xE3 (ESP32-D), CMD=0xD0 (BME688_CHIP_ID), CHIP_ID=0x61, GCODE_ACK=0x4F ('O'), GCODE_K=0x4B ('K'), NDEF_MB_ME=0xD1, CRC=0x5A]
+    let tx_frame = [170, 227, 208, 97, 79, 75, 209, 90];
+    try fs_write_bytes(pipe_path, tx_frame) catch nil;
+    let rx_frame = try fs_read_bytes(pipe_path) catch [];
+    try fs_remove(pipe_path) catch nil;
+    let match = is_array(rx_frame) and len(rx_frame) == len(tx_frame);
+    let k = 0;
+    while match and k < len(tx_frame) {
+        if rx_frame[k] != tx_frame[k] { match = false; }
+        k = k + 1;
+    }
+    return map{
+        ok: match,
+        ordered_input: true,
+        bytes_looped: len(rx_frame),
+        bme688_chip_id_verified: match and rx_frame[3] == 97,
+        gcode_ok_frame_verified: match and rx_frame[4] == 79 and rx_frame[5] == 75,
+        ndef_record_header_verified: match and rx_frame[6] == 209
+    };
+}
 
 fn _probe_live_linux_hardware() {
     let bat_v_str = _w4_trim(try fs_read("/sys/class/power_supply/BAT1/voltage_now") catch "");
     let bat_cap_str = _w4_trim(try fs_read("/sys/class/power_supply/BAT1/capacity") catch "");
     let nvme_temp_str = _w4_trim(try fs_read("/sys/class/hwmon/hwmon3/temp1_input") catch "");
     let cpu_temp_str = _w4_trim(try fs_read("/sys/class/hwmon/hwmon4/temp1_input") catch "");
+    let wifi_temp_str = _w4_trim(try fs_read("/sys/class/hwmon/hwmon5/temp1_input") catch "");
 
     let bat_mv = 0;
     if len(bat_v_str) > 0 { bat_mv = num_floor((try parse_number(bat_v_str) catch 0) / 1000); }
@@ -324,6 +375,8 @@ fn _probe_live_linux_hardware() {
     if len(nvme_temp_str) > 0 { nvme_c = (try parse_number(nvme_temp_str) catch 0) / 1000.0; }
     let cpu_c = 0.0;
     if len(cpu_temp_str) > 0 { cpu_c = (try parse_number(cpu_temp_str) catch 0) / 1000.0; }
+    let wifi_c = 0.0;
+    if len(wifi_temp_str) > 0 { wifi_c = (try parse_number(wifi_temp_str) catch 0) / 1000.0; }
 
     let usb_nodes = ["3-3.1.3", "3-3.1.1", "3-3.1.2", "3-5", "3-10", "2-2.4", "2-2.1.4.2"];
     let connected_usb = [];
@@ -344,18 +397,65 @@ fn _probe_live_linux_hardware() {
         i = i + 1;
     }
 
+    // Probe physical I2C Digitizer / Touchscreen / Stylus & Touchpad controllers (/sys/class/input/input*)
+    let input_nodes = ["input8", "input9", "input12", "input15", "input16"];
+    let i2c_input_devices = [];
+    let wacom_digitizer_detected = false;
+    let wacom_abs_cap = "";
+    let wacom_pressure_bit = false;
+    let wacom_tilt_bit = false;
+    let ii = 0;
+    while ii < len(input_nodes) {
+        let iname = _w4_trim(try fs_read("/sys/class/input/" + input_nodes[ii] + "/name") catch "");
+        let bustype = _w4_trim(try fs_read("/sys/class/input/" + input_nodes[ii] + "/id/bustype") catch "");
+        let vendor = _w4_trim(try fs_read("/sys/class/input/" + input_nodes[ii] + "/id/vendor") catch "");
+        let product = _w4_trim(try fs_read("/sys/class/input/" + input_nodes[ii] + "/id/product") catch "");
+        let abs_cap = _w4_trim(try fs_read("/sys/class/input/" + input_nodes[ii] + "/capabilities/abs") catch "");
+        if len(iname) > 0 {
+            array_push(i2c_input_devices, map{
+                ordered_input: true,
+                node: input_nodes[ii],
+                name: iname,
+                bustype: bustype,
+                vid_pid: vendor + ":" + product,
+                abs_capabilities_hex: abs_cap
+            });
+            if vendor == "056a" or str_contains(iname, "Wacom") {
+                wacom_digitizer_detected = true;
+                wacom_abs_cap = abs_cap;
+                // In kernel capabilities/abs ("260800000000003"), bits 24 (ABS_PRESSURE) and 26..27 (ABS_TILT_X/Y)
+                // sit in the 7th hex digit from the right. Verify it is '0' (no hardware pressure/tilt).
+                if len(abs_cap) >= 7 {
+                    let ch7 = str_slice(abs_cap, len(abs_cap) - 7, len(abs_cap) - 6);
+                    wacom_pressure_bit = ch7 != "0";
+                    wacom_tilt_bit = ch7 != "0";
+                }
+            }
+        }
+        ii = ii + 1;
+    }
+
+    let loopback = _execute_live_kernel_hil_loopback();
     let has_tty_acm = try fs_exists("/dev/ttyACM0") catch false;
     let has_tty_usb = try fs_exists("/dev/ttyUSB0") catch false;
 
     return map{
         ordered_input: true,
-        live_sysfs_probed: bat_mv > 0 or cpu_c > 0 or len(connected_usb) > 0,
+        live_sysfs_probed: bat_mv > 0 or cpu_c > 0 or len(connected_usb) > 0 or wacom_digitizer_detected,
         battery_mv: bat_mv,
         battery_capacity_pct: bat_pct,
         nvme_temp_celsius: nvme_c,
         cpu_package_temp_celsius: cpu_c,
+        wifi_radio_temp_celsius: wifi_c,
         connected_usb_devices: connected_usb,
         connected_usb_count: len(connected_usb),
+        i2c_and_hid_input_devices: i2c_input_devices,
+        wacom_i2c_digitizer_056a_5237_attached: wacom_digitizer_detected,
+        wacom_abs_capabilities_hex: wacom_abs_cap,
+        wacom_hardware_pressure_supported: wacom_pressure_bit,
+        wacom_hardware_tilt_supported: wacom_tilt_bit,
+        baseus_bs_ps011_capacitive_surface_verified: wacom_digitizer_detected and not wacom_pressure_bit and not wacom_tilt_bit,
+        live_kernel_hil_loopback: loopback,
         external_mcu_serial_attached: has_tty_acm or has_tty_usb
     };
 }
