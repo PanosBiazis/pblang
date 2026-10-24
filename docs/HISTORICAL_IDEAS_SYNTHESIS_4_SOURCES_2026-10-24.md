@@ -128,8 +128,8 @@
   - Κορυφαίο Ελληνικό Μοντέλο: `ilsp/llama-krikri-8b-instruct` (ιδανικό για ακολουθία ελληνικών οδηγιών χωρίς ανάγκη εξωτερικών API keys).
   - VRAM/Context Tuning: Παράκαμψη του global context 256k με εξειδικευμένα per-model Modelfiles.
 
-### 4.4 Χρηματοοικονομική Μεθοδολογία & Έργο FIN.I.S. (Έργο 117093, Δράση Δ3)
-- **Πηγή:** `CLAUDE-MEMORY-REVIEW.md` (`/areas/financial-analysis-system.md`, `/areas/finis-project.md`)
+### 4.4 Χρηματοοικονομική Μεθοδολογία & Σουίτα Enterprise Financial Analytics
+- **Πηγή:** `CLAUDE-MEMORY-REVIEW.md` (`/areas/financial-analysis-system.md`, `/areas/financial-analytics-suite.md`)
 - **Μεθοδολογικός Πυρήνας:**
   - *Credit Scoring & Όρια Πίστωσης:* Μονάδα `CreditScoring.pas`, ταξινομία δεικτών και δέντρα αποφάσεων με παραμετροποιημένα κατώφλια ανά κλάδο.
   - *Σύνθετο Scoring Αφερεγγυότητας:* Υλοποίηση μοντέλων Altman Z′-Score / Z″-Score και Ohlson O-Score για πρόβλεψη πτώχευσης.
@@ -149,7 +149,7 @@
 
 ### 5.2 Αποσύνδεση Κοινών Βιβλιοθηκών & Συμβόλαιο Μη-Παλινδρόμησης (Non-Regression)
 - **Κανόνας:** Λειτουργίες όπως η παραγωγή αναφορών, εξαγωγή PDF και διαχείριση εγγράφων πρέπει να κατοικούν σε εξωτερικές κοινές βιβλιοθήκες (`EnterpriseCore.Reporting.*`).
-- **Συμβόλαιο Αμεταβλητότητας:** Το κεντρικό προϊόν (π.χ. FinSystem) πρέπει να παραμένει **byte-identical**. Οποιεσδήποτε νέες δυνατότητες για θυγατρικές εφαρμογές (π.χ. corp_portal Teiresias) εισάγονται αυστηρά ως **opt-in παράμετροι με προεπιλεγμένες τιμές (defaults)**, αποδεδειγμένες μέσω golden unit tests.
+- **Συμβόλαιο Αμεταβλητότητας:** Το κεντρικό προϊόν (π.χ. CoreFinancialEngine) πρέπει να παραμένει **byte-identical**. Οποιεσδήποτε νέες δυνατότητες για θυγατρικές εφαρμογές (π.χ. credit_risk_portal) εισάγονται αυστηρά ως **opt-in παράμετροι με προεπιλεγμένες τιμές (defaults)**, αποδεδειγμένες μέσω golden unit tests.
 
 ### 5.3 Versioned Αρχεία Ρυθμίσεων έναντι Εγγραφών Βάσης
 - **Κανόνας:** Προτίμηση για αρχεία ρυθμίσεων και μεταφράσεων (JSON/TSV) που ελέγχονται από το σύστημα εκδόσεων (Git), αντί δυναμικών εγγραφών ανά μετάφραση σε κοινόχρηστους πίνακες της βάσης. Αυτό αποτρέπει αποκλίσεις συγχρονισμού (sync drift) μεταξύ διαφορετικών βάσεων πελατών.
@@ -232,11 +232,11 @@
   - **Replay-Safe Monotonic Licensing:** Υπογραφή αδειών δεσμευμένη σε machine/product ID με μονοτονικό χρονικό μετρητή (`monotonic_tick`) ενάντια σε replay attacks.
 
 ### 5.13 Sovereign Dual-Pane File Explorer, VFS Mount Manager & Cleanroom Commander (`pbexplorer`)
-- **Πηγή:** Άμεση ιδέα χρήστη στο τρέχον chat + ενοποίηση με `pbos`, `pbide`, `pbwatermarks-remover` (Cleanroom), `pbduallock` και τα απομακρυσμένα mounts (`verpserver` SMB `127.0.0.1:1445` & `EnterpriseCore` SFTP).
+- **Πηγή:** Άμεση ιδέα χρήστη στο τρέχον chat + ενοποίηση με `pbos`, `pbide`, `pbwatermarks-remover` (Cleanroom), `pbduallock` και τα απομακρυσμένα mounts (`remote_fileserver` SMB `127.0.0.1:1445` & `EnterpriseCore` SFTP).
 - **Κεντρική Ιδέα:**
   - **5 Καταστάσεις Προβολής (Layout Modes) με Flagship UI (`obsidian_aurora_glass`):** `dual_pane_commander`, `miller_columns`, `tree_sidebar_dock`, `masonry_media_grid`, `timeline_git_journal`, με `2.0x` 4K HiDPI scaling και πλήρη συνδυασμό πλήκτρων (`F3..F8`, `Space`, `Ctrl+F`, `Ctrl+D`).
   - **Content-Addressable SHA-256 Deduplicator & Merkle Directory Digest:** Υπολογισμός ακριβούς μεγέθους, SHA-256 αποτυπώματος περιεχομένου, ομάδων διπλότυπων αρχείων (duplicate clusters), ανακτήσιμων bytes και ρίζας Merkle ανά φάκελο.
-  - **Multi-Protocol VFS & Auto-Heal Mount Monitor:** Ενιαία διαχείριση `local_posix`, `smb_cifs_ssh_tunnel` (`smb://127.0.0.1:1445/f/Transf/panosb` μέσω `EnterpriseCore-verpserver-files.service` και `IdentityAgent=%t/gcr/ssh`), `sftp_gvfs` (`sftp://EnterpriseCore/`), `.zip/.tar.gz` Archive VFS και `pbduallock_pq_vault`.
+  - **Multi-Protocol VFS & Auto-Heal Mount Monitor:** Ενιαία διαχείριση `local_posix`, `smb_cifs_ssh_tunnel` (`smb://127.0.0.1:1445/share/workspace_user` μέσω `EnterpriseCore-remote-files.service` και `IdentityAgent=%t/gcr/ssh`), `sftp_gvfs` (`sftp://EnterpriseCore/`), `.zip/.tar.gz` Archive VFS και `pbduallock_pq_vault`.
   - **Ενσωματωμένο PBOS Antivirus, Parseltongue & PB Cleanroom Quick-Look:** Αυτόματος έλεγχος εντροπίας/RWX και adversarial prompt injection πριν την προεπισκόπηση, αφαίρεση αόρατων χαρακτήρων (`ZWSP_`/`ZWNJ_`) και απόκρυψη μυστικών (`[REDACTED]`).
   - **Atomic Batch Rename με Ανίχνευση Συγκρούσεων & Ημερολόγιο Αναίρεσης (Undo/Redo Journal):** Υποστήριξη προτύπων `{index}`, `{stem}`, `{ext}`, `{sha8}`.
 

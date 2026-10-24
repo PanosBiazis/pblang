@@ -1,0 +1,258 @@
+// stdlib/compiler/ctranspile_tier1.sapp
+// Generalized Tier-1 fast C99 transpiler for scalar/loop/branch/print ASTs,
+// with automatic lazy delegation to full ctranspile.sapp for functions, collections, and strings.
+
+let _full_cache = map{};
+
+fn _full_ctranspile() {
+    if not map_has(_full_cache, "ct") {
+        _full_cache["ct"] = import("./ctranspile.sapp");
+    }
+    return _full_cache["ct"];
+}
+
+fn _needs_full_ct(src) {
+    let n = len(src);
+    if n == 0 or n > 4096 { return true; }
+    let i = 0;
+    while i < n {
+        let c = strcharcodeat(src, i);
+        if c == 34 or c == 39 or c == 91 or c == 93 or c == 46 or c == 44 or c == 58 {
+            return true;
+        }
+        i = i + 1;
+    }
+    if str_contains(src, "fn ") or str_contains(src, "for ") or str_contains(src, "import") or
+       str_contains(src, "try") or str_contains(src, "map") or str_contains(src, "and") or
+       str_contains(src, "or") or str_contains(src, "not") {
+        return true;
+    }
+    return false;
+}
+
+fn _tokenize_fast(src) {
+    let tokens = [];
+    let n = len(src);
+    let i = 0;
+    while i < n {
+        let c = strcharcodeat(src, i);
+        if c <= 32 { i = i + 1; }
+        elif c == 47 and i + 1 < n and strcharcodeat(src, i + 1) == 47 {
+            i = i + 2;
+            while i < n and strcharcodeat(src, i) != 10 { i = i + 1; }
+        }
+        elif c >= 48 and c <= 57 {
+            let start = i;
+            while i < n {
+                let d = strcharcodeat(src, i);
+                if d >= 48 and d <= 57 { i = i + 1; } else { break; }
+            }
+            let s = str_slice(src, start, i);
+            push(tokens, map{ kind: "num", val: parse_number(s), raw: s });
+        }
+        elif (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 {
+            let start = i;
+            while i < n {
+                let d = strcharcodeat(src, i);
+                if (d >= 65 and d <= 90) or (d >= 97 and d <= 122) or (d >= 48 and d <= 57) or d == 95 {
+                    i = i + 1;
+                } else { break; }
+            }
+            push(tokens, map{ kind: "id", val: str_slice(src, start, i) });
+        }
+        else {
+            if i + 1 < n {
+                let two = str_slice(src, i, i + 2);
+                if two == "<=" or two == ">=" or two == "==" or two == "!=" {
+                    push(tokens, map{ kind: "op", val: two });
+                    i = i + 2;
+                    continue;
+                }
+            }
+            push(tokens, map{ kind: "op", val: str_slice(src, i, i + 1) });
+            i = i + 1;
+        }
+    }
+    push(tokens, map{ kind: "eof", val: "" });
+    return tokens;
+}
+
+fn _peek(st) { return st.tokens[st.pos]; }
+fn _next(st) { let t = st.tokens[st.pos]; st.pos = st.pos + 1; return t; }
+
+fn _parse_primary(st) {
+    let t = _peek(st);
+    if t.kind == "num" { _next(st); return map{ kind: "num", val: t.val, raw: t.raw }; }
+    if t.kind == "id" { _next(st); return map{ kind: "id", name: t.val }; }
+    if t.kind == "op" and t.val == "(" {
+        _next(st);
+        let e = _parse_cmp(st);
+        if _next(st).val != ")" { throw "ct_tier1: expected )"; }
+        return e;
+    }
+    if t.kind == "op" and t.val == "-" {
+        _next(st);
+        return map{ kind: "neg", expr: _parse_primary(st) };
+    }
+    throw "ct_tier1: unexpected token";
+}
+
+fn _parse_mul(st) {
+    let left = _parse_primary(st);
+    while true {
+        let t = _peek(st);
+        if t.kind == "op" and (t.val == "*" or t.val == "/" or t.val == "%") {
+            _next(st);
+            let right = _parse_primary(st);
+            left = map{ kind: "bin", op: t.val, left: left, right: right };
+        } else { break; }
+    }
+    return left;
+}
+
+fn _parse_add(st) {
+    let left = _parse_mul(st);
+    while true {
+        let t = _peek(st);
+        if t.kind == "op" and (t.val == "+" or t.val == "-") {
+            _next(st);
+            let right = _parse_mul(st);
+            left = map{ kind: "bin", op: t.val, left: left, right: right };
+        } else { break; }
+    }
+    return left;
+}
+
+fn _parse_cmp(st) {
+    let left = _parse_add(st);
+    let t = _peek(st);
+    if t.kind == "op" and (t.val == "<" or t.val == ">" or t.val == "<=" or t.val == ">=" or t.val == "==" or t.val == "!=") {
+        _next(st);
+        let right = _parse_add(st);
+        return map{ kind: "bin", op: t.val, left: left, right: right };
+    }
+    return left;
+}
+
+fn _emit_expr(node) {
+    let k = node.kind;
+    if k == "num" { return node.raw; }
+    if k == "id" { return "pb_v_" + node.name; }
+    if k == "neg" { return "(-" + _emit_expr(node.expr) + ")"; }
+    if k == "bin" {
+        let op = node.op;
+        let l = _emit_expr(node.left);
+        let r = _emit_expr(node.right);
+        if op == "%" {
+            if node.right.kind == "num" {
+                if node.right.val == 0 { throw "ct_tier1: div by zero"; }
+                if node.right.val > 10000 {
+                    return "pb_mod_const(" + l + ", " + r + ")";
+                }
+                return "(" + l + " % " + r + ")";
+            }
+            return "pb_mod_checked(" + l + ", " + r + ")";
+        }
+        return "(" + l + " " + op + " " + r + ")";
+    }
+    throw "ct_tier1: unsupported expr";
+}
+
+fn _parse_stmt_c(st, vars) {
+    let t = _peek(st);
+    if t.kind == "id" and (t.val == "let" or t.val == "const") {
+        _next(st);
+        let nm = _next(st);
+        if nm.kind != "id" or _next(st).val != "=" { throw "ct_tier1: bad let"; }
+        let val = _emit_expr(_parse_cmp(st));
+        if _peek(st).val == ";" { _next(st); }
+        if not map_has(vars, nm.val) {
+            vars[nm.val] = true;
+            return "    long pb_v_" + nm.val + " = " + val + ";\n";
+        }
+        return "    pb_v_" + nm.val + " = " + val + ";\n";
+    }
+    if t.kind == "id" and t.val == "print" {
+        _next(st);
+        let val = _emit_expr(_parse_cmp(st));
+        if _peek(st).val == ";" { _next(st); }
+        return "    printf(\"%ld\\n\", (long)(" + val + "));\n";
+    }
+    if t.kind == "id" and t.val == "return" {
+        _next(st);
+        let val = _emit_expr(_parse_cmp(st));
+        if _peek(st).val == ";" { _next(st); }
+        return "    return (int)(" + val + ");\n";
+    }
+    if t.kind == "id" and t.val == "while" {
+        _next(st);
+        let cond = _emit_expr(_parse_cmp(st));
+        if _next(st).val != "{" { throw "ct_tier1: expected {"; }
+        let body = "";
+        while _peek(st).kind != "eof" and _peek(st).val != "}" {
+            body = body + _parse_stmt_c(st, vars);
+        }
+        if _next(st).val != "}" { throw "ct_tier1: expected }"; }
+        return "    while (" + cond + ") {\n" + body + "    }\n";
+    }
+    if t.kind == "id" and t.val == "if" {
+        _next(st);
+        let cond = _emit_expr(_parse_cmp(st));
+        if _next(st).val != "{" { throw "ct_tier1: expected {"; }
+        let tb = "";
+        while _peek(st).kind != "eof" and _peek(st).val != "}" {
+            tb = tb + _parse_stmt_c(st, vars);
+        }
+        if _next(st).val != "}" { throw "ct_tier1: expected }"; }
+        let out = "    if (" + cond + ") {\n" + tb + "    }\n";
+        if _peek(st).kind == "id" and _peek(st).val == "else" {
+            _next(st);
+            if _next(st).val != "{" { throw "ct_tier1: expected {"; }
+            let eb = "";
+            while _peek(st).kind != "eof" and _peek(st).val != "}" {
+                eb = eb + _parse_stmt_c(st, vars);
+            }
+            if _next(st).val != "}" { throw "ct_tier1: expected }"; }
+            out = out + "    else {\n" + eb + "    }\n";
+        }
+        return out;
+    }
+    if t.kind == "id" {
+        _next(st);
+        if _next(st).val != "=" { throw "ct_tier1: expected ="; }
+        let val = _emit_expr(_parse_cmp(st));
+        if _peek(st).val == ";" { _next(st); }
+        return "    pb_v_" + t.val + " = " + val + ";\n";
+    }
+    throw "ct_tier1: unsupported stmt";
+}
+
+fn _transpile_tier1(src) {
+    let tokens = _tokenize_fast(src);
+    let st = map{ tokens: tokens, pos: 0 };
+    let vars = map{};
+    let body = "";
+    while _peek(st).kind != "eof" {
+        body = body + _parse_stmt_c(st, vars);
+    }
+    return "/* generated by pblang Tier-1 C99 integer backend */\n"
+        + "#include <stdint.h>\n#include <limits.h>\n#include <stdio.h>\n#include <stdlib.h>\n"
+        + "static inline long pb_mod_checked(long a, long b){\n"
+        + "    if (b == 0 || (a == LONG_MIN && b == -1)) { fputs(\"pblang: invalid modulo\\n\", stderr); exit(73); }\n"
+        + "    return a % b;\n}\n"
+        + "static inline long pb_mod_const(long x, long m){\n"
+        + "    unsigned long ux = (unsigned long)x; unsigned long um = (unsigned long)m;\n"
+        + "    if (__builtin_expect(ux < (um << 1), 1)) return (long)(ux >= um ? ux - um : ux);\n"
+        + "    return x % m;\n}\n"
+        + "int main(void) {\n" + body + "    return 0;\n}\n";
+}
+
+fn transpile_program_int(src) {
+    if not _needs_full_ct(src) {
+        let fast = try _transpile_tier1(src) catch nil;
+        if fast != nil { return fast; }
+    }
+    return _full_ctranspile().transpile_program_int(src);
+}
+
+export transpile_program_int;

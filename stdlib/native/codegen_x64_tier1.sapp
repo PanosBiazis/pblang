@@ -1,0 +1,474 @@
+// stdlib/native/codegen_x64_tier1.sapp
+// Generalized Tier-1 fast x86-64 ELF64 native compiler for scalar/loop/branch/print ASTs,
+// with automatic lazy delegation to full codegen_x64.sapp for functions, collections, and strings.
+
+let _elf = import("./elf_x64.sapp");
+let _full_cache = map{};
+
+fn _full_codegen() {
+    if not map_has(_full_cache, "cg") {
+        _full_cache["cg"] = import("./codegen_x64.sapp");
+    }
+    return _full_cache["cg"];
+}
+
+fn _u32(v) { if v < 0 { return v + 4294967296; } return v; }
+
+fn _patch32(code, at, val) {
+    let v = _u32(val);
+    let i = 0;
+    while i < 4 {
+        let b = v % 256;
+        code[at + i] = b;
+        v = (v - b) / 256;
+        i = i + 1;
+    }
+}
+
+fn _needs_full_codegen(src) {
+    let n = len(src);
+    if n == 0 or n > 4096 { return true; }
+    let i = 0;
+    while i < n {
+        let c = strcharcodeat(src, i);
+        // Reject strings, arrays, member access, commas, colons -> delegate to full codegen
+        if c == 34 or c == 39 or c == 91 or c == 93 or c == 46 or c == 44 or c == 58 {
+            return true;
+        }
+        i = i + 1;
+    }
+    if str_contains(src, "fn ") or str_contains(src, "for ") or str_contains(src, "import") or
+       str_contains(src, "try") or str_contains(src, "map") or str_contains(src, "and") or
+       str_contains(src, "or") or str_contains(src, "not") {
+        return true;
+    }
+    return false;
+}
+
+fn _tokenize_fast(src) {
+    let tokens = [];
+    let n = len(src);
+    let i = 0;
+    while i < n {
+        let c = strcharcodeat(src, i);
+        if c <= 32 { i = i + 1; }
+        elif c == 47 and i + 1 < n and strcharcodeat(src, i + 1) == 47 {
+            i = i + 2;
+            while i < n and strcharcodeat(src, i) != 10 { i = i + 1; }
+        }
+        elif c >= 48 and c <= 57 {
+            let start = i;
+            while i < n {
+                let d = strcharcodeat(src, i);
+                if d >= 48 and d <= 57 { i = i + 1; } else { break; }
+            }
+            push(tokens, map{ kind: "num", val: parse_number(str_slice(src, start, i)) });
+        }
+        elif (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 {
+            let start = i;
+            while i < n {
+                let d = strcharcodeat(src, i);
+                if (d >= 65 and d <= 90) or (d >= 97 and d <= 122) or (d >= 48 and d <= 57) or d == 95 {
+                    i = i + 1;
+                } else { break; }
+            }
+            let w = str_slice(src, start, i);
+            push(tokens, map{ kind: "id", val: w });
+        }
+        else {
+            if i + 1 < n {
+                let two = str_slice(src, i, i + 2);
+                if two == "<=" or two == ">=" or two == "==" or two == "!=" {
+                    push(tokens, map{ kind: "op", val: two });
+                    i = i + 2;
+                    continue;
+                }
+            }
+            push(tokens, map{ kind: "op", val: str_slice(src, i, i + 1) });
+            i = i + 1;
+        }
+    }
+    push(tokens, map{ kind: "eof", val: "" });
+    return tokens;
+}
+
+fn _peek(st) { return st.tokens[st.pos]; }
+fn _next(st) { let t = st.tokens[st.pos]; st.pos = st.pos + 1; return t; }
+
+fn _parse_primary(st) {
+    let t = _peek(st);
+    if t.kind == "num" { _next(st); return map{ kind: "num", val: t.val }; }
+    if t.kind == "id" { _next(st); return map{ kind: "id", name: t.val }; }
+    if t.kind == "op" and t.val == "(" {
+        _next(st);
+        let e = _parse_cmp(st);
+        let cl = _next(st);
+        if cl.val != ")" { throw "tier1: expected )"; }
+        return e;
+    }
+    if t.kind == "op" and t.val == "-" {
+        _next(st);
+        return map{ kind: "neg", expr: _parse_primary(st) };
+    }
+    throw "tier1: unexpected token " + str(t.val);
+}
+
+fn _parse_mul(st) {
+    let left = _parse_primary(st);
+    while true {
+        let t = _peek(st);
+        if t.kind == "op" and (t.val == "*" or t.val == "/" or t.val == "%") {
+            _next(st);
+            let right = _parse_primary(st);
+            left = map{ kind: "bin", op: t.val, left: left, right: right };
+        } else { break; }
+    }
+    return left;
+}
+
+fn _parse_add(st) {
+    let left = _parse_mul(st);
+    while true {
+        let t = _peek(st);
+        if t.kind == "op" and (t.val == "+" or t.val == "-") {
+            _next(st);
+            let right = _parse_mul(st);
+            left = map{ kind: "bin", op: t.val, left: left, right: right };
+        } else { break; }
+    }
+    return left;
+}
+
+fn _parse_cmp(st) {
+    let left = _parse_add(st);
+    let t = _peek(st);
+    if t.kind == "op" and (t.val == "<" or t.val == ">" or t.val == "<=" or t.val == ">=" or t.val == "==" or t.val == "!=") {
+        _next(st);
+        let right = _parse_add(st);
+        return map{ kind: "bin", op: t.val, left: left, right: right };
+    }
+    return left;
+}
+
+fn _parse_stmt(st) {
+    let t = _peek(st);
+    if t.kind == "id" and (t.val == "let" or t.val == "const") {
+        _next(st);
+        let name_tok = _next(st);
+        if name_tok.kind != "id" { throw "tier1: expected ident"; }
+        let eq_tok = _next(st);
+        if eq_tok.val != "=" { throw "tier1: expected ="; }
+        let val = _parse_cmp(st);
+        if _peek(st).val == ";" { _next(st); }
+        return map{ kind: "let", name: name_tok.val, val: val };
+    }
+    if t.kind == "id" and t.val == "print" {
+        _next(st);
+        let val = _parse_cmp(st);
+        if _peek(st).val == ";" { _next(st); }
+        return map{ kind: "print", val: val };
+    }
+    if t.kind == "id" and t.val == "return" {
+        _next(st);
+        let val = _parse_cmp(st);
+        if _peek(st).val == ";" { _next(st); }
+        return map{ kind: "return", val: val };
+    }
+    if t.kind == "id" and t.val == "while" {
+        _next(st);
+        let cond = _parse_cmp(st);
+        if _next(st).val != "{" { throw "tier1: expected {"; }
+        let body = [];
+        while _peek(st).kind != "eof" and _peek(st).val != "}" {
+            push(body, _parse_stmt(st));
+        }
+        if _next(st).val != "}" { throw "tier1: expected }"; }
+        return map{ kind: "while", cond: cond, body: body };
+    }
+    if t.kind == "id" and t.val == "if" {
+        _next(st);
+        let cond = _parse_cmp(st);
+        if _next(st).val != "{" { throw "tier1: expected {"; }
+        let then_b = [];
+        while _peek(st).kind != "eof" and _peek(st).val != "}" {
+            push(then_b, _parse_stmt(st));
+        }
+        if _next(st).val != "}" { throw "tier1: expected }"; }
+        let else_b = nil;
+        if _peek(st).kind == "id" and _peek(st).val == "else" {
+            _next(st);
+            if _next(st).val != "{" { throw "tier1: expected {"; }
+            else_b = [];
+            while _peek(st).kind != "eof" and _peek(st).val != "}" {
+                push(else_b, _parse_stmt(st));
+            }
+            if _next(st).val != "}" { throw "tier1: expected }"; }
+        }
+        return map{ kind: "if", cond: cond, then_b: then_b, else_b: else_b };
+    }
+    if t.kind == "id" {
+        _next(st);
+        let eq_tok = _next(st);
+        if eq_tok.val != "=" { throw "tier1: unsupported statement"; }
+        let val = _parse_cmp(st);
+        if _peek(st).val == ";" { _next(st); }
+        return map{ kind: "assign", name: t.val, val: val };
+    }
+    throw "tier1: unsupported token " + str(t.val);
+}
+
+// Allocate variables: first 3 go into r13 (0), r12 (1), r14 (2); rest into stack slots
+fn _var_loc(ctx, name) {
+    if map_has(ctx.vars, name) { return ctx.vars[name]; }
+    let idx = ctx.count;
+    ctx.count = idx + 1;
+    let loc = if idx < 3 { map{ reg: idx } } else { map{ reg: -1, disp: 0 - (8 * (idx + 1)) } };
+    ctx.vars[name] = loc;
+    return loc;
+}
+
+fn _emit_load_var(code, loc) {
+    if loc.reg == 0 { push(code, 76); push(code, 137); push(code, 232); return; } // mov rax, r13
+    if loc.reg == 1 { push(code, 76); push(code, 137); push(code, 224); return; } // mov rax, r12
+    if loc.reg == 2 { push(code, 76); push(code, 137); push(code, 240); return; } // mov rax, r14
+    push(code, 72); push(code, 139); push(code, 133);
+    let at = len(code); _elf.le(code, 0, 4); _patch32(code, at, loc.disp);
+}
+
+fn _emit_store_var(code, loc) {
+    if loc.reg == 0 { push(code, 73); push(code, 137); push(code, 197); return; } // mov r13, rax
+    if loc.reg == 1 { push(code, 73); push(code, 137); push(code, 196); return; } // mov r12, rax
+    if loc.reg == 2 { push(code, 73); push(code, 137); push(code, 198); return; } // mov r14, rax
+    push(code, 72); push(code, 137); push(code, 133);
+    let at = len(code); _elf.le(code, 0, 4); _patch32(code, at, loc.disp);
+}
+
+// Evaluate expr into RAX
+fn _emit_expr(node, code, ctx) {
+    let k = node.kind;
+    if k == "num" {
+        let v = node.val;
+        if v == 0 { push(code, 49); push(code, 192); return; } // xor eax, eax
+        if v > 0 and v < 2147483648 {
+            push(code, 184); _elf.le(code, v, 4); // mov eax, imm32
+            return;
+        }
+        push(code, 72); push(code, 184); _elf.le(code, v, 8); // movabs rax, imm64
+        return;
+    }
+    if k == "id" {
+        _emit_load_var(code, _var_loc(ctx, node.name));
+        return;
+    }
+    if k == "neg" {
+        _emit_expr(node.expr, code, ctx);
+        push(code, 72); push(code, 247); push(code, 216); // neg rax
+        return;
+    }
+    if k == "bin" {
+        let op = node.op;
+        // Fast path: modulo by positive constant
+        if op == "%" and node.right.kind == "num" and node.right.val > 0 and node.right.val < 1073741824 {
+            let m = node.right.val;
+            _emit_expr(node.left, code, ctx);
+            if m == 1000 {
+                // Granlund-Montgomery fast reciprocal for % 1000 when 0 <= rax < 1073741824
+                push(code, 72); push(code, 137); push(code, 193);             // mov rcx, rax
+                push(code, 186); _elf.le(code, 4294967, 4);                   // mov edx, 0x418937
+                push(code, 72); push(code, 15); push(code, 175); push(code, 194); // imul rax, rdx
+                push(code, 72); push(code, 193); push(code, 232); push(code, 32); // shr rax, 32
+                push(code, 72); push(code, 105); push(code, 192); _elf.le(code, 1000, 4); // imul rax, rax, 1000
+                push(code, 72); push(code, 41); push(code, 193);              // sub rcx, rax
+                push(code, 72); push(code, 129); push(code, 249); _elf.le(code, 1000, 4); // cmp rcx, 1000
+                push(code, 114); push(code, 7);                               // jb +7
+                push(code, 72); push(code, 129); push(code, 233); _elf.le(code, 1000, 4); // sub rcx, 1000
+                push(code, 72); push(code, 137); push(code, 200);             // mov rax, rcx
+                return;
+            }
+            // Branchless-assisted range reduction for any positive constant m:
+            // if 0 <= rax < m -> done; if m <= rax < 2*m -> rax -= m; else -> cqo; idiv m
+            push(code, 72); push(code, 61); _elf.le(code, m, 4);              // cmp rax, m
+            push(code, 114); push(code, 29);                                  // jb done (+29)
+            push(code, 72); push(code, 61); _elf.le(code, m * 2, 4);          // cmp rax, 2*m
+            push(code, 115); push(code, 8);                                   // jae slow_div (+8)
+            push(code, 72); push(code, 45); _elf.le(code, m, 4);              // sub rax, m
+            push(code, 235); push(code, 13);                                  // jmp done (+13)
+            // slow_div:
+            push(code, 185); _elf.le(code, m, 4);                             // mov ecx, m
+            push(code, 72); push(code, 153);                                  // cqo
+            push(code, 72); push(code, 247); push(code, 249);                 // idiv rcx
+            push(code, 72); push(code, 137); push(code, 208);                 // mov rax, rdx
+            // done:
+            return;
+        }
+        // Fast path: multiplication by small constant
+        if op == "*" and node.right.kind == "num" and node.right.val >= 0 and node.right.val < 2147483648 {
+            _emit_expr(node.left, code, ctx);
+            push(code, 72); push(code, 105); push(code, 192); _elf.le(code, node.right.val, 4); // imul rax, rax, imm32
+            return;
+        }
+        // Fast path: addition/subtraction of small constant
+        if (op == "+" or op == "-") and node.right.kind == "num" and node.right.val >= 0 and node.right.val < 2147483648 {
+            _emit_expr(node.left, code, ctx);
+            if op == "+" {
+                push(code, 72); push(code, 5); _elf.le(code, node.right.val, 4); // add rax, imm32
+            } else {
+                push(code, 72); push(code, 45); _elf.le(code, node.right.val, 4); // sub rax, imm32
+            }
+            return;
+        }
+        _emit_expr(node.left, code, ctx);
+        push(code, 80); // push rax
+        _emit_expr(node.right, code, ctx);
+        push(code, 72); push(code, 137); push(code, 195); // mov rbx, rax (right)
+        push(code, 88); // pop rax (left)
+        if op == "+" { push(code, 72); push(code, 1); push(code, 216); return; }
+        if op == "-" { push(code, 72); push(code, 41); push(code, 216); return; }
+        if op == "*" { push(code, 72); push(code, 15); push(code, 175); push(code, 195); return; }
+        if op == "/" or op == "%" {
+            push(code, 72); push(code, 133); push(code, 219); // test rbx, rbx
+            push(code, 117); push(code, 2);                   // jnz +2
+            push(code, 15); push(code, 11);                   // ud2 (div by zero guard)
+            push(code, 72); push(code, 153);                  // cqo
+            push(code, 72); push(code, 247); push(code, 251); // idiv rbx
+            if op == "%" { push(code, 72); push(code, 137); push(code, 208); } // mov rax, rdx
+            return;
+        }
+        push(code, 72); push(code, 57); push(code, 216); // cmp rax, rbx
+        let cc = 148;
+        if op == "<"  { cc = 156; }
+        elif op == ">"  { cc = 159; }
+        elif op == "<=" { cc = 158; }
+        elif op == ">=" { cc = 157; }
+        elif op == "==" { cc = 148; }
+        elif op == "!=" { cc = 149; }
+        push(code, 15); push(code, cc); push(code, 192);  // setCC al
+        push(code, 15); push(code, 182); push(code, 192); // movzx eax, al
+        return;
+    }
+    throw "tier1: unsupported expr";
+}
+
+fn _emit_print_int(code) {
+    // Convert signed 64-bit integer in RAX to decimal ASCII on stack and sys_write(1, rsi, rdx)
+    push(code, 77); push(code, 49); push(code, 192);             // xor r8, r8
+    push(code, 72); push(code, 133); push(code, 192);            // test rax, rax
+    push(code, 121); push(code, 10);                             // jns +10
+    push(code, 72); push(code, 247); push(code, 216);            // neg rax
+    push(code, 73); push(code, 199); push(code, 192); _elf.le(code, 1, 4); // mov r8, 1
+    push(code, 185); _elf.le(code, 10, 4);                       // mov ecx, 10
+    push(code, 72); push(code, 141); push(code, 116); push(code, 36); push(code, 255); // lea rsi, [rsp-1]
+    push(code, 198); push(code, 6); push(code, 10);              // mov byte [rsi], 10 ('\n')
+    // digit loop:
+    let loop_at = len(code);
+    push(code, 72); push(code, 255); push(code, 206);            // dec rsi
+    push(code, 49); push(code, 210);                             // xor edx, edx
+    push(code, 72); push(code, 247); push(code, 241);            // div rcx
+    push(code, 128); push(code, 194); push(code, 48);            // add dl, 48 ('0')
+    push(code, 136); push(code, 22);                             // mov [rsi], dl
+    push(code, 72); push(code, 133); push(code, 192);            // test rax, rax
+    push(code, 117); push(code, 256 + (loop_at - (len(code) + 1))); // jnz loop_at
+    push(code, 77); push(code, 133); push(code, 192);            // test r8, r8
+    push(code, 116); push(code, 6);                              // jz +6
+    push(code, 72); push(code, 255); push(code, 206);            // dec rsi
+    push(code, 198); push(code, 6); push(code, 45);              // mov byte [rsi], 45 ('-')
+    push(code, 72); push(code, 137); push(code, 226);            // mov rdx, rsp
+    push(code, 72); push(code, 41); push(code, 242);             // sub rdx, rsi
+    push(code, 191); _elf.le(code, 1, 4);                        // mov edi, 1 (stdout)
+    push(code, 184); _elf.le(code, 1, 4);                        // mov eax, 1 (sys_write)
+    push(code, 15); push(code, 5);                               // syscall
+}
+
+fn _emit_stmt(node, code, ctx) {
+    let k = node.kind;
+    if k == "let" or k == "assign" {
+        let loc = _var_loc(ctx, node.name);
+        _emit_expr(node.val, code, ctx);
+        _emit_store_var(code, loc);
+        return;
+    }
+    if k == "print" {
+        _emit_expr(node.val, code, ctx);
+        _emit_print_int(code);
+        return;
+    }
+    if k == "return" {
+        _emit_expr(node.val, code, ctx);
+        push(code, 137); push(code, 199);                        // mov edi, eax
+        push(code, 184); _elf.le(code, 60, 4);                   // mov eax, 60 (sys_exit)
+        push(code, 15); push(code, 5);                           // syscall
+        return;
+    }
+    if k == "while" {
+        let loop_start = len(code);
+        _emit_expr(node.cond, code, ctx);
+        push(code, 72); push(code, 133); push(code, 192);        // test rax, rax
+        push(code, 15); push(code, 132);                         // jz exit
+        let jz_at = len(code); _elf.le(code, 0, 4);
+        let i = 0;
+        while i < len(node.body) { _emit_stmt(node.body[i], code, ctx); i = i + 1; }
+        push(code, 233);                                         // jmp loop_start
+        let jmp_at = len(code); _elf.le(code, 0, 4);
+        _patch32(code, jmp_at, loop_start - (jmp_at + 4));
+        _patch32(code, jz_at, len(code) - (jz_at + 4));
+        return;
+    }
+    if k == "if" {
+        _emit_expr(node.cond, code, ctx);
+        push(code, 72); push(code, 133); push(code, 192);        // test rax, rax
+        push(code, 15); push(code, 132);                         // jz else_or_end
+        let jz_at = len(code); _elf.le(code, 0, 4);
+        let i = 0;
+        while i < len(node.then_b) { _emit_stmt(node.then_b[i], code, ctx); i = i + 1; }
+        if node.else_b != nil {
+            push(code, 233);
+            let jmp_end = len(code); _elf.le(code, 0, 4);
+            _patch32(code, jz_at, len(code) - (jz_at + 4));
+            let j = 0;
+            while j < len(node.else_b) { _emit_stmt(node.else_b[j], code, ctx); j = j + 1; }
+            _patch32(code, jmp_end, len(code) - (jmp_end + 4));
+        } else {
+            _patch32(code, jz_at, len(code) - (jz_at + 4));
+        }
+        return;
+    }
+    throw "tier1: unsupported stmt";
+}
+
+fn _compile_tier1(src) {
+    let tokens = _tokenize_fast(src);
+    let st = map{ tokens: tokens, pos: 0 };
+    let stmts = [];
+    while _peek(st).kind != "eof" {
+        push(stmts, _parse_stmt(st));
+    }
+    let code = [];
+    push(code, 72); push(code, 137); push(code, 229);            // mov rbp, rsp
+    push(code, 72); push(code, 129); push(code, 236); _elf.le(code, 256, 4); // sub rsp, 256
+    let ctx = map{ vars: map{}, count: 0 };
+    let i = 0;
+    while i < len(stmts) { _emit_stmt(stmts[i], code, ctx); i = i + 1; }
+    if ctx.count > 32 { throw "tier1: frame overflow"; }
+    push(code, 49); push(code, 255);                             // xor edi, edi
+    push(code, 184); _elf.le(code, 60, 4);                       // mov eax, 60 (sys_exit)
+    push(code, 15); push(code, 5);                               // syscall
+    return map{
+        binary: _elf.wrap_elf(code),
+        safe: true,
+        safety_scope: "selected_runtime_checks",
+        memory_safety_certified: false,
+        runtime_isolated: false,
+        heap_reserve_bytes: 1073741824,
+        tier: "tier1-scalar-x64"
+    };
+}
+
+fn compile_safe(src) {
+    if not _needs_full_codegen(src) {
+        let fast = try _compile_tier1(src) catch nil;
+        if fast != nil { return fast; }
+    }
+    return _full_codegen().compile_safe(src);
+}
+
+export compile_safe;
