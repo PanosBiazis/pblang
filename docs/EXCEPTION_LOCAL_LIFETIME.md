@@ -115,7 +115,7 @@ The isolated build, native portable-lock publication and six lint/self-hosted
 syntax checks passed. Lint reports one unused-result advisory in the deliberate
 uncaught-error fixture. Graphify update exceeded 35 seconds and was terminated;
 no new semantic graph coverage is claimed. All 212 unrelated dirty files were
-preserved. No EnterpriseOrg server was used.
+preserved. No external corporate server was used.
 
 For the subsequent direct try/catch dispatch and single-edge traversal changes,
 see [try and chain cost follow-up](TRY_AND_CHAIN_COST.md).

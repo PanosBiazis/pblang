@@ -114,4 +114,4 @@ and shared-value lifetime management, native runtime/FFI and C99 allocation
 correctness, authenticated audit/release evidence, PBIDE Run/Designer and actual
 guest-OS validation. Entry quotas/accounting units do not measure deep live RAM.
 This slice does not complete 1.0.0 or verify universal platform/device support.
-No EnterpriseOrg/Hetzner server was contacted or used for execution.
+No EnterpriseCore/Hetzner server was contacted or used for execution.

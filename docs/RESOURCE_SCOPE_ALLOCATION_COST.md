@@ -114,7 +114,7 @@ fixes this minimal case while retaining explicit compatibility boundaries for
 user closures and control flow; general closure semantics remain open.
 Original exception diagnostic capture,
 cyclic references, hanging callbacks and abrupt termination remain outside this
-scope library's guarantees. No EnterpriseOrg server was used.
+scope library's guarantees. No external corporate server was used.
 
 Graphify AST refresh exceeded its 35-second bound and its owned process group
 was terminated. It does not provide semantic `.sapp` coverage.

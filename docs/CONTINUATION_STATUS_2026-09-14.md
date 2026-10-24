@@ -55,7 +55,7 @@ wider admission, runtime heap growth/allocation failure and stack probing,
 runtime/FFI isolation, library/backend compatibility, audit/release authenticity,
 PBIDE Run/Designer and current guest/hardware platform validation. This slice
 addresses compilation cost and local graph visibility, not those guarantees.
-All execution was local; no EnterpriseOrg server was used.
+All execution was local; no EnterpriseCore server was used.
 
 ## Previous local validation — 2026-09-15 ARM64 long branches
 
@@ -85,7 +85,7 @@ Expanded branches add one instruction; large layout temporarily holds two arrays
 See [implementation, costs and remaining limits](ARM64_ENCODING.md),
 [QEMU evidence](ARM64_BRANCH_QEMU_RESULTS.json) and
 [compiler measurements](../bench/results/arm64_branches_2026-09-15.json).
-The tests were local; no EnterpriseOrg server or remote deployment was used.
+The tests were local; no EnterpriseCore server or remote deployment was used.
 Graphify update was terminated after 45 seconds without completing.
 
 Remaining work includes multi-file projects and wider source admission with
@@ -117,7 +117,7 @@ new measurements of this extension. No all-device performance guarantee is made.
 
 QEMU was authenticated through Ubuntu package metadata and extracted temporarily;
 there was no system installation. These are local user-mode emulation tests, not
-native hardware or guest-OS acceptance. No server or EnterpriseOrg infrastructure was
+native hardware or guest-OS acceptance. No server or EnterpriseCore infrastructure was
 used. See [implementation and reproducible fixtures](ARM64_ENCODING.md) and the
 [QEMU result record](ARM64_WIDE_QEMU_RESULTS.json).
 

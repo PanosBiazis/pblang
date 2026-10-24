@@ -127,7 +127,7 @@ General runtime/FFI/PB-MCP/polyglot integration remains unfinished; the precise
 kernel graph cannot safely substitute for missing retained-host roots. Marking,
 sweep and generation wrap still run under a global lock and can cause long
 pauses. Broader platforms, physical-device testing, fairness and incremental
-barriers remain open. No realtime guarantee is provided. No EnterpriseOrg server was
+barriers remain open. No realtime guarantee is provided. No EnterpriseCore server was
 used. Other local changes were preserved.
 
 Graphify update timed out after 35 seconds; owned process group stopped. Its graph is not semantic

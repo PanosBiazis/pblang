@@ -137,6 +137,6 @@ approval setting was changed. That integration needs a measured application
 change rather than copying an unused module.
 
 Collector pauses, general runtime reference cycles, FFI/polyglot integration,
-real GPU/NPU kernels and wider platform coverage remain open. No EnterpriseOrg
+real GPU/NPU kernels and wider platform coverage remain open. No EnterpriseCore
 server was used. Graphify update reached its 35-second bound; its process group
 was terminated, and it supplies no semantic coverage claim for this change.

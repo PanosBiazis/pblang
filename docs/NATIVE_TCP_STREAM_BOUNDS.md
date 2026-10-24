@@ -40,7 +40,7 @@ pending-data tests on Windows are not a claim of Windows socket support.
 
 ## Resource measurement scope
 
-Measurements use trusted local fixtures only, with no EnterpriseOrg server access.
+Measurements use trusted local fixtures only, with no EnterpriseCore server access.
 Windows execution uses a dedicated fixture below `C:\exe`, and the uploaded
 retained executable's SHA-256 is verified before running. No antivirus exceptions,
 driver settings, device power policies or public listeners are changed.

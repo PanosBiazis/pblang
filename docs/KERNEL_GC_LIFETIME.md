@@ -120,7 +120,7 @@ speed comparison with one another.
 These are historical process measurements, not isolated algorithm costs. The
 follow-up layout control below demonstrates that QEMU code/data placement
 substantially affects this fixture. The earlier +26.3% result must not be treated
-as a general GC overhead estimate. No EnterpriseOrg server was used.
+as a general GC overhead estimate. No external corporate server was used.
 
 Graphify refresh was attempted and stopped at its 35-second budget. It does not
 provide semantic verification for this PBLang kernel source.

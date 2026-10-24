@@ -4,7 +4,7 @@ This continues [the earlier intake](IDEA_INTAKE_2026-09-15.md). It is a bounded
 read-only discovery record, not complete access to all conversations, disks,
 installed AI products or plugin activation states. No third-party plugin,
 hook, extension or marketplace command was installed or executed. No remote
-workstation or EnterpriseOrg/Hetzner server was accessed or used for testing.
+workstation or EnterpriseCore/Hetzner server was accessed or used for testing.
 
 ## What was inspected this time
 

@@ -1,7 +1,7 @@
 # SQL column reuse validation — 2026-09-15
 
 Scope: `sql_predicate.compile_all` call-local reuse of adjacent column names.
-Baseline: `99ef7a4acbb7d1271468d7e9dee5a7f28d5a425b`. No EnterpriseOrg server or remote
+Baseline: `99ef7a4acbb7d1271468d7e9dee5a7f28d5a425b`. No EnterpriseCore server or remote
 runtime was used. This is a selected regression/performance slice, not 1.0.0
 readiness, a full-repository audit or universal backend validation.
 
@@ -105,6 +105,6 @@ passed. Graphify AST update completed with 9,069 nodes and 13,226 edges, but zer
 `.sapp` source nodes: it is not semantic PBLang graph coverage. The snapshot is
 kept outside publication, preserving the main worktree's existing graph.
 
-No guest OS, device, remote workstation or EnterpriseOrg server was used. Native
+No guest OS, device, remote workstation or EnterpriseCore server was used. Native
 runtime/FFI, composite ownership, backend allocation, audit/release authenticity,
 PBIDE Run/Designer and broader platform evidence remain open.

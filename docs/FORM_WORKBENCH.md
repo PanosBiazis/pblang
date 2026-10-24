@@ -242,7 +242,7 @@ HSTS, HTTPS redirects, certificates and Secure cookies require a real HTTPS
 application/deployment boundary; adding those headers to an HTTP loopback demo
 would not establish TLS. HSTS preload/includeSubDomains must be chosen only after
 checking ownership and HTTPS readiness of the whole intended domain tree. No
-production/EnterpriseOrg host was contacted or changed for these checks.
+production/EnterpriseCore host was contacted or changed for these checks.
 
 ## Full application and multidimensional scope
 

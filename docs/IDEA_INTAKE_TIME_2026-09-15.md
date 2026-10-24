@@ -41,4 +41,4 @@ documentation. The existing cache get_or_set automation now works with expiry on
 the tested frontend. A general capability matrix/plugin catalog, monotonic clock
 and deterministic injected-clock facility remain proposals, not delivered features.
 No external AI service was called for inference, no user content was uploaded,
-and no EnterpriseOrg/Hetzner system was used for PBLang execution.
+and no EnterpriseCore/Hetzner system was used for PBLang execution.

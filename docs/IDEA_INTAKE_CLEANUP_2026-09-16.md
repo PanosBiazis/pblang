@@ -33,4 +33,4 @@ reproducible resource measurements and updated memory-runtime documentation.
 Pending: exception-preserving cleanup for direct VM/frontend calls, shared-value
 ownership, native/FFI resources, signed evidence, PBIDE and guest platforms.
 No autonomous retry system, plugin installer, background task, external AI call
-or EnterpriseOrg/Hetzner execution was added.
+or EnterpriseCore/Hetzner execution was added.

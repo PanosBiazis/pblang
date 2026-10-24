@@ -123,7 +123,7 @@ General closure-capture compatibility, runtime/FFI/polyglot ownership and wider
 physical-platform testing remain open. Kernel ownership is not the retained VM's
 ownership: these modules are absent from the installed PB-MCP desktop bundle.
 That installation was not changed or restarted. No live-streaming acceleration
-is claimed, and no EnterpriseOrg server was used.
+is claimed, and no EnterpriseCore server was used.
 
 A current closure diagnostic is retained in the validation evidence: two sibling
 closures capturing the same scalar produce `[1,1]` on the retained runner and

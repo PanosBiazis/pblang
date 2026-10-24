@@ -117,7 +117,7 @@ The isolated build, native portable-lock publication and six lint/self-hosted
 syntax checks passed. Lint reports one advisory constant-condition warning in
 the deliberately scoped example. Graphify update exceeded 35 seconds and was
 terminated; semantic graph coverage is not claimed. The 212 unrelated local
-files were preserved byte-for-byte. No EnterpriseOrg server was used.
+files were preserved byte-for-byte. No external corporate server was used.
 
 A later [resource-cost follow-up](RESOURCE_COST_FOLLOWUP.md) preserves these
 cleanup instructions while reducing repeated work in the VM and remeasuring

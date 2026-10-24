@@ -117,7 +117,7 @@ retain the variation.
 The configured installed PB-MCP desktop bundle was checked read-only: it includes
 `resource_scope.sapp`, but not `compiler/vm.sapp` or `selfhost_pbck.sapp`. It was
 not updated or restarted; no live-view/streaming performance benefit is claimed.
-The existing desktop enrollment and permissions are unchanged. No EnterpriseOrg
+The existing desktop enrollment and permissions are unchanged. No EnterpriseCore
 server was used. The 212 pre-existing dirty files were preserved by hash.
 
 Update: source-level shared scalar captures and owner cleanup are now addressed

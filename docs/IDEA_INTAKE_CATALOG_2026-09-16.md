@@ -62,7 +62,7 @@ categories, these suggest the following backlog; they are not delivered features
 
 Only names/categories/manifests informed this pass. No automatic conversion of
 arbitrary proprietary applications, no polyglot execution, and no access to
-EnterpriseOrg or Hetzner servers occurred. Native runtime/FFI, composite memory,
+EnterpriseCore or Hetzner servers occurred. Native runtime/FFI, composite memory,
 audit/release authenticity, PBIDE Run/Designer and real guest-OS coverage remain
 open; 1.0.0 remains incomplete.
 

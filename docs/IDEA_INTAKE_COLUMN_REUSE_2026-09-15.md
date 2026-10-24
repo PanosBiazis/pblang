@@ -1,7 +1,7 @@
 # Column-reuse continuation: ideas and boundaries
 
 This slice follows `99ef7a4`. It focuses on measured filter-construction cost,
-while retaining the wider 1.0.0 backlog. No EnterpriseOrg server, remote workstation,
+while retaining the wider 1.0.0 backlog. No EnterpriseCore server, remote workstation,
 cloud runtime, plugin installation or activation was used.
 
 ## Evidence actually sampled

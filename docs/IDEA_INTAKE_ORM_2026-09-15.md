@@ -3,7 +3,7 @@
 This extends [the DB intake](IDEA_INTAKE_DB_2026-09-15.md). It is selected,
 read-only discovery, not a full scan of every disk, conversation, AI product
 or marketplace. No third-party plugin was installed, activated or executed.
-No EnterpriseOrg/Hetzner server or remote workstation was accessed.
+No EnterpriseCore/Hetzner server or remote workstation was accessed.
 
 ## Current sources
 

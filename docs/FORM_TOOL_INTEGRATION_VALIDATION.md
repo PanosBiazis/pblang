@@ -71,4 +71,4 @@ persistent accounts, general runtime/FFI/GC work and wider platform verification
 remain open. Scraping discouragement and internal-name minimization do not stop
 all scraping or reverse engineering. The separately installed desktop-control
 PB-MCP was not modified; no Live View benefit was measured. Graphify refresh timed
-out and its process group was stopped. No EnterpriseOrg server was used.
+out and its process group was stopped. No external corporate server was used.

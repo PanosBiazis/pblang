@@ -102,7 +102,7 @@ running by this slice.
 These are local Linux checks. Emulator results validate their declared model
 subsets, not execution of the new ownership engine on every modeled device.
 No guest operating system or remote workstation was used in this slice. The
-approved workstation was off. No EnterpriseOrg/Hetzner server was accessed.
+approved workstation was off. No EnterpriseCore/Hetzner server was accessed.
 
 ## 1.0.0 work still open
 

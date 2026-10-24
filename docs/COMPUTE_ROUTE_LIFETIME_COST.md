@@ -179,7 +179,7 @@ and integration beyond the existing Linux publisher. Windows consuming a
 portable lock is distinct from publishing it safely. No admission check was
 relaxed. Long collector pauses, general reference cycles, runtime/FFI/polyglot
 integration, actual GPU/NPU throughput and broader device coverage remain open.
-No EnterpriseOrg server was used.
+No external corporate server was used.
 
 Graphify's AST-only update exceeded its 35-second limit and its own process group
 was terminated. It does not establish semantic coverage of the PBLang changes.

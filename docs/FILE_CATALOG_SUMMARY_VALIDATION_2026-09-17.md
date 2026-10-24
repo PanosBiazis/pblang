@@ -107,7 +107,7 @@ included as a successful optimization.
 [Bounded intake and independent implementation provenance](IDEA_INTAKE_CATALOG_2026-09-17.md)
 cover prior context, six mounted data volumes, application entries, cached
 Codex/Claude manifests and public extension documentation. No discovered source
-was executed or copied wholesale. No EnterpriseOrg/Hetzner server was contacted.
+was executed or copied wholesale. No EnterpriseCore/Hetzner server was contacted.
 
 Self-hosted metadata summaries are now covered; filesystem scans, complete
 native runtime replacement, direct VM/frontend failure cleanup, composite/shared

@@ -113,7 +113,7 @@ these runs; no general RAM saving is established.
 Full selfhost catalog summaries, direct VM/frontend failure cleanup, complex
 memory, native runtime/FFI, backend parity, audits/releases, PBIDE Run/Designer
 and real guest operating systems remain open. Version 1.0.0 is incomplete.
-The 211 unrelated working-tree changes are preserved. No EnterpriseOrg server was
+The 211 unrelated working-tree changes are preserved. No EnterpriseCore server was
 used. No plugin installation, foreign-code execution or remote device test ran.
 
 A scratch experiment printed an entire frontend result containing recursive

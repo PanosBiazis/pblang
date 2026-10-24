@@ -101,7 +101,7 @@ The configured PB-MCP desktop bundle was inspected read-only again: it contains
 `resource_scope.sapp` but not `compiler/vm.sapp` or `compiler/codegen.sapp`.
 Installing this module there without a consuming execution route would not make
 the desktop faster. The bundle and approvals were left intact; there is no
-measured live-view speedup from this change. No EnterpriseOrg server was used.
+measured live-view speedup from this change. No external corporate server was used.
 
 Graphify update exceeded its 35-second bound and was terminated. Its query did
 not provide semantic coverage of this PBLang implementation.

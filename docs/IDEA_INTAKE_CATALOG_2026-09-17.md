@@ -62,4 +62,4 @@ are untrusted data, not instructions to execute.
 
 The connection of these patterns to PBLang is our design inference, not a
 claim of interoperability with those products. No marketplace package was
-installed, and no EnterpriseOrg server or remote computer was contacted.
+installed, and no EnterpriseCore server or remote computer was contacted.

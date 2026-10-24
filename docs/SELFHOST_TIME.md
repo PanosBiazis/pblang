@@ -106,5 +106,5 @@ disk writes, GPU/NPU, other backends and physical devices were not benchmarked.
 Monotonic/test-injected clocks and per-guest time policy need a separate design.
 Runtime ownership for complex/shared values, native FFI/isolation, other backends,
 audit/release authenticity, PBIDE and actual guest-OS validation remain open.
-This is not universal platform support or completion of PBLang 1.0.0. No EnterpriseOrg
+This is not universal platform support or completion of PBLang 1.0.0. No EnterpriseCore
 or Hetzner server was contacted for development or testing.

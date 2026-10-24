@@ -83,7 +83,7 @@ cleanup, composite/shared values, native runtime/FFI, backend parity, broader
 library work, audit/release authenticity, PBIDE Run/Designer and guest-OS tests
 remain open. Android tests run the userspace conformance model locally, not a
 real Android OS or device; they do not prove universal compatibility or hostile
-code isolation. Version 1.0.0 remains incomplete. No EnterpriseOrg server was used.
+code isolation. Version 1.0.0 remains incomplete. No external corporate server was used.
 
 ## Final local gates
 

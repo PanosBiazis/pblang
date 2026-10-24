@@ -313,4 +313,4 @@ environment, file-backed output, 20-second outer wall supervision, 10-second
 CPU limit, 2 GiB address-space limit and 1 MiB output-file limit. These are test
 harness settings, not language/runtime limits. They do not isolate filesystem
 or network access. This is independent user-mode emulation, not a booted guest
-operating system or native ARM64 hardware test. No EnterpriseOrg server was used.
+operating system or native ARM64 hardware test. No external corporate server was used.

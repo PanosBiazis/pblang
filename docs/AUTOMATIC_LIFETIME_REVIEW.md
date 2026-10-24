@@ -4,7 +4,7 @@ Scope: PBLang resource scopes, latest-update buffering, owned scalar callbacks,
 retained GC diagnostics, and the kernel collector/allocator. This is a local
 source review plus the listed regressions, not a certification of all PBLang,
 all native libraries or installed PB-MCP transports. No unreviewed external code was
-executed for this review. No EnterpriseOrg server was accessed.
+executed for this review. No EnterpriseCore server was accessed.
 
 | Component | Verified behavior | Remaining boundary |
 | --- | --- | --- |

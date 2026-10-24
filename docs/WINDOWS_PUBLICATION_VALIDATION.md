@@ -76,7 +76,7 @@ separately in the raw report and not mixed with final paired samples.
   The isolated package built and its lock was published through native `pblock`.
 - The generated PE bridge bytes/digest and runtime were unchanged. Test inputs,
   executable and bridge stayed in an owned private test directory and were removed.
-  No EnterpriseOrg server was used. The current installed PB-MCP was not updated.
+  No external corporate server was used. The current installed PB-MCP was not updated.
 
 Run the live tests only in an explicitly owned Windows test directory with the
 reviewed packaged ABI and `PBLANG_WINDOWS_ABI_BRIDGE` configured. For the example,

@@ -44,7 +44,7 @@ and preserved. The retained loader required installed absolute dependency roots
 for sibling-package execution after relative-lock publication; this was recorded
 as a tooling limitation, not silently treated as portable execution evidence.
 No Windows/macOS, GPU/NPU, desktop Live View or full self-hosted runtime claims are
-made. No EnterpriseOrg server was used.
+made. No external corporate server was used.
 
 ## Measurements
 

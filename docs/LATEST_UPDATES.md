@@ -159,6 +159,6 @@ portable-lock publication passed. Twelve latest-update lint/syntax checks passed
 lint reports one used result variable as unused in the polyglot refusal fixture.
 Review covered detached-batch ownership, finite reentrant submission, explicit
 acknowledgements, no automatic retries and unchanged polyglot authorization.
-No EnterpriseOrg server was used; other local modifications were preserved.
+No EnterpriseCore server was used; other local modifications were preserved.
 Graphify refresh exceeded its 35-second process limit and was terminated;
 refreshed semantic coverage is not claimed.

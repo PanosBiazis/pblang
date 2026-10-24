@@ -117,7 +117,7 @@ general SMP operating-system support, fairness, per-arena locking, quantitative
 pause-latency measurements and physical devices remain open; NMI/DMA and arbitrary
 native memory access are not covered. A fault or noncooperative owner may block
 all users. No general runtime/FFI/PB-MCP integration or hard real-time safety is
-claimed. No EnterpriseOrg server was used.
+claimed. No external corporate server was used.
 
 Graphify update was attempted with an owned 35-second budget and timed out.
 Its incomplete output is not semantic verification of these PBLang modules.

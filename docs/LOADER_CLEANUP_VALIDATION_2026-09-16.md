@@ -101,5 +101,5 @@ The bounded loader's existing step/value limits remain in place; this is not a
 new aggregate-memory limit or resource-budget policy. It is not a compiler/project
 size restriction. Canonical [memory runtime documentation](SELFHOST_MEMORY_RUNTIME.md)
 describes the different execution routes. PBLang 1.0.0 is not complete; audits/
-releases, PBIDE, other backends and actual guest-OS tests remain open. No EnterpriseOrg
+releases, PBIDE, other backends and actual guest-OS tests remain open. No EnterpriseCore
 or Hetzner server was used.

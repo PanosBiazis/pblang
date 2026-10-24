@@ -154,7 +154,7 @@ acceptance remain open.
 Runtime/FFI/PB-MCP/polyglot integration also remains open. Destructive retained-host
 collection remains disabled because roots across nested VMs cannot all be proven.
 Borrowing precise kernel metadata does not supply those missing host roots or
-safe ownership of foreign resources. No installed PB-MCP transport or EnterpriseOrg
+safe ownership of foreign resources. No installed PB-MCP transport or EnterpriseCore
 server was used or modified.
 
 Graphify updates exceeded their 35-second budgets; the owned process groups

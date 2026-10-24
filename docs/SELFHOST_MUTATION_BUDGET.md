@@ -63,7 +63,7 @@ The isolated project builds and publishes repository-relative lock paths with
 the PBLang portable-lock library. Lint exits successfully, with style/unused-variable
 warnings (including the nested map admission condition); this is not a zero-warning
 claim. Fixtures are synthetic; no credentials, desktop control, provider network
-requests or EnterpriseOrg servers are involved. These are local Linux/VM/emulator
+requests or EnterpriseCore servers are involved. These are local Linux/VM/emulator
 checks, not evidence for real guest operating systems or universal compatibility.
 
 ## Resource measurement

@@ -93,7 +93,7 @@ batches and do not compare only the fastest samples.
 | Devices | Actual GPU/NPU execution, output parity, device-specific resource measurements and deterministic fallbacks. |
 | Products / platforms | Current-artifact integration and tests on declared platforms. This Windows source change does not update the installed Linux PB-MCP or prove a Live View benefit. |
 
-No EnterpriseOrg server, personal desktop control or antivirus setting was used or
+No EnterpriseCore server, personal desktop control or antivirus setting was used or
 changed. The implementation is a tested reduction in per-call allocation work,
 not completion of the wider 1.0.0 program.
 

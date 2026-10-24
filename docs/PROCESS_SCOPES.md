@@ -84,4 +84,4 @@ operator/worker. Over one ten-second sample they recorded no storage reads or
 writes, stable descriptor counts, and 0%, 2.2%, and 0.3% CPU respectively (percent
 of one core; the three MCP workers were idle). This short observation cannot
 exclude intermittent leaks or prove whole-system health. No existing process was
-killed. The corporate Windows computer and EnterpriseOrg servers were not accessed.
+killed. The corporate Windows computer and EnterpriseCore servers were not accessed.

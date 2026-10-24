@@ -129,7 +129,7 @@ General runtime/FFI/PB-MCP/polyglot integration remains open. The retained-host
 runtime contract still cannot prove all roots across nested same-thread VMs, so
 destructive host collection stays unavailable. Leaf skipping in a precise kernel
 graph does not provide those missing roots or safe foreign-object ownership.
-No installed PB-MCP transport or EnterpriseOrg server was used or modified.
+No installed PB-MCP transport or EnterpriseCore server was used or modified.
 
 Graphify update exceeded its 35-second budget; the owned process group was
 stopped. Its graph does not establish semantic coverage of these PBLang modules.

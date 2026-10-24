@@ -93,7 +93,7 @@ The configured installed PB-MCP desktop bundle was checked read-only: it include
 `compiler/vm.sapp`. Its launcher still uses the retained runtime/OS boundary.
 Replacing this absent codec in that bundle would not speed up the viewer.
 The PB-MCP source and installed bundle were not changed or restarted, and saved
-permissions were not modified. There was no EnterpriseOrg-server access.
+permissions were not modified. There was no EnterpriseCore-server access.
 
 Large collector pauses and the rooted-collector overhead remain open; kernel
 collection is not the same as the retained desktop runtime. Scalar sibling

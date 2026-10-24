@@ -86,7 +86,7 @@ host's typed FFI accepts at most four arguments, while `setsockopt` requires fiv
 No raw syscall, generated machine-code bypass, new C/Rust shim or socket behavior
 change was added here. Full application conversion, spatial/multidimensional
 interfaces, general runtime/FFI/GC work, pure-PBLang bcrypt, public account-management
-features and Windows/macOS verification remain open. No EnterpriseOrg server was used.
+features and Windows/macOS verification remain open. No external corporate server was used.
 
 Graphify update exceeded a 20-second bound. Its process group was terminated and
 reaped; the graph refresh did not complete.

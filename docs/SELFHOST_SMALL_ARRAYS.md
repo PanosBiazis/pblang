@@ -109,7 +109,7 @@ platform compatibility. Physical-device and guest-OS tests remain separate work.
 The installed PB-MCP desktop path does not contain or execute this interpreter.
 Adding an unused file to its bundle would not improve live view. That integration
 and its measured desktop benefit remain open; the installed bundle, consent and
-approval state are preserved. No EnterpriseOrg server was used.
+approval state are preserved. No external corporate server was used.
 
 See [shared binding behavior](SELFHOST_SHARED_CAPTURES.md),
 [previous dispatch measurements](SELFHOST_DISPATCH_GROUPS.md), and

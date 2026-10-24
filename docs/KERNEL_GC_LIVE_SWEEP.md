@@ -132,7 +132,7 @@ General runtime/FFI/PB-MCP/polyglot integration is also open. In particular,
 `stdlib/runtime_gc.sapp` still refuses destructive retained-host collection when
 nested VM roots cannot be accounted for. This kernel optimization does not supply
 those missing roots and does not silently activate a host collector. No PB-MCP
-installation was changed and no EnterpriseOrg server was used.
+installation was changed and no EnterpriseCore server was used.
 
 Graphify update reached its 35-second budget and its owned process group was
 stopped. Graph metadata is not semantic verification of `.sapp` code.

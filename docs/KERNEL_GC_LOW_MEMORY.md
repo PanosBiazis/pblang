@@ -232,4 +232,4 @@ improvement was measured. PBLang remains alpha.
 Graphify update was attempted with a 35-second local watchdog and did not
 complete. Its owned process group was stopped; no owned test, benchmark or
 analyzer processes remained at closeout. The 212 unrelated local files were
-preserved. No EnterpriseOrg server or installed desktop bundle was modified.
+preserved. No EnterpriseCore server or installed desktop bundle was modified.

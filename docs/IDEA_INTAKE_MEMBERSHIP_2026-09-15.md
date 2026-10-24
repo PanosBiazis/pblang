@@ -3,7 +3,7 @@
 This bounded continuation follows the structured-predicate slice at `41c0b86`.
 It does not represent a full scan of all conversations, disks, marketplaces or
 plugin implementation code. No plugins were installed or activated, and no
-remote runtime or EnterpriseOrg server was used.
+remote runtime or EnterpriseCore server was used.
 
 ## Intake actually performed
 

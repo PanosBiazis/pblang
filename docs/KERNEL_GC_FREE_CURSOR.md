@@ -143,7 +143,7 @@ acceptance are still open.
 General runtime/FFI/PB-MCP/polyglot integration remains open. The retained-host
 `runtime_gc` still refuses destructive collection because nested VM roots are
 incomplete; this optimization neither supplies them nor bypasses that refusal.
-No PB-MCP installation or EnterpriseOrg server was used for these kernel tests.
+No PB-MCP installation or EnterpriseCore server was used for these kernel tests.
 
 Graphify update exceeded its 35-second budget; its owned process group was
 stopped. Its graph is not semantic coverage of these PBLang modules.

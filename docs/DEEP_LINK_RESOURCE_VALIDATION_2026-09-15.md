@@ -113,7 +113,7 @@ The same four WASM artifacts ran on Linux Node 18.19.1 and the approved Windows
 11 Pro workstation's existing Node 26.8.2, producing 49995000, 144, 300 and 42.
 Both engines rejected half-truncated copies. The multi-file case was regenerated
 through the new compatibility traversal. No remote software or test program
-files were installed, and no EnterpriseOrg server was used. This validates those
+files were installed, and no EnterpriseCore server was used. This validates those
 artifacts on a real Windows OS, not a native Windows PBLang runtime or full
 platform coverage.
 
@@ -152,7 +152,7 @@ legacy or low-memory testing.
 
 Test infrastructure must remain local to the authorized laptop/VMs/emulators
 or the separately authorized corporate workstation. Broader platform intent
-does not authorize any EnterpriseOrg or Hetzner server testing or deployment.
+does not authorize any EnterpriseCore or Hetzner server testing or deployment.
 
 ## Discovery coverage and follow-up ideas
 

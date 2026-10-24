@@ -3,7 +3,7 @@
 Baseline: `125152fe86631fde54c773f785506cd345907e68`. All product changes in
 PBLang. The retained host executable is identical on both sides. Tests/builds
 ran in disposable clean archives with only this change overlaid; 212 unrelated
-working-tree files were preserved. No EnterpriseOrg server, remote test machine,
+working-tree files were preserved. No EnterpriseCore server, remote test machine,
 desktop service or installed PB-MCP configuration was used or changed.
 
 ## Reproduced defect and correction

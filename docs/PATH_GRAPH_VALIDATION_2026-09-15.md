@@ -15,7 +15,7 @@ Added a path-preserving supplied-import graph API and an additive identity resol
 
 ## Real Windows workstation
 
-Only the user-approved corporate workstation was accessed through its existing direct Tailscale/SSH route, with host-key checking and hostname/workstation-OS verification. No EnterpriseOrg server was accessed for this work. No remote software was installed and no test program files were created on that PC. Generated WASM bytes were supplied in memory to its existing Node runtime.
+Only the user-approved corporate workstation was accessed through its existing direct Tailscale/SSH route, with host-key checking and hostname/workstation-OS verification. No EnterpriseCore server was accessed for this work. No remote software was installed and no test program files were created on that PC. Generated WASM bytes were supplied in memory to its existing Node runtime.
 
 The same artifacts ran on Linux x64 Node 18.19.1 and Windows 11 Pro x64 Node 26.8.2. Each engine also rejected a half-truncated copy of each module.
 

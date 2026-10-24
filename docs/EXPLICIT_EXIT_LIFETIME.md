@@ -111,4 +111,4 @@ Live cyclic objects are not traversed or cleared by this implementation.
 
 Independent C99/WASM/ARM64 and other backends, remaining PB-MCP Rust/AI parity,
 polyglot replacement and the shared desktop broker are still separate open work.
-The full project is not complete. No EnterpriseOrg server was used.
+The full project is not complete. No external corporate server was used.

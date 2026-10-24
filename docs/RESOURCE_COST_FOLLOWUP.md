@@ -135,7 +135,7 @@ barriers, broader platforms, physical-device measurements and runtime/FFI/PB-MCP
 polyglot integration remain open. This does not activate general host cycle
 collection or provide a realtime guarantee. Installed PB-MCP was not updated;
 these VM changes take effect for consumers loading the updated PBLang module.
-No EnterpriseOrg server was used. Unrelated local files were preserved.
+No external corporate server was used. Unrelated local files were preserved.
 
 Graphify update timed out after 35 seconds; owned process group stopped. Its output does not establish semantic
 coverage of these PBLang modules.

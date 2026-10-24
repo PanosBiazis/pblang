@@ -9,10 +9,10 @@
 
 ## 1. Μεθοδολογία & Πηγές Δεδομένων
 
-Η ανάλυση πραγματοποιήθηκε με τοπικά εργαλεία ευρετηρίασης (`google-memory.py`, `google-history.py`, `catalog.json` και τοπικές βάσεις SQLite), χωρίς εξωτερική δικτυακή κλήση και χωρίς τροποποίηση των προστατευμένων βιβλιοθηκών stdlib (`stdlib/`, `/opt/app/.local/share/pblang/`, `pblang.lock`).
+Η ανάλυση πραγματοποιήθηκε με τοπικά εργαλεία ευρετηρίασης (`google-memory.py`, `google-history.py`, `catalog.json` και τοπικές βάσεις SQLite), χωρίς εξωτερική δικτυακή κλήση και χωρίς τροποποίηση των προστατευμένων βιβλιοθηκών stdlib (`stdlib/`, `/home/user/.local/share/pblang/`, `pblang.lock`).
 
 ### Σύνοψη Ευρετηρίου Πηγών:
-1. **ChatGPT Direct Archive:** 598 συνομιλίες (`/opt/app/Documents/Codex/2026-10-01-google-200/private-history/chatgpt-direct/`).
+1. **ChatGPT Direct Archive:** 598 συνομιλίες (`/home/user/Documents/Codex/2026-10-01-google-200/private-history/chatgpt-direct/`).
 2. **Codex Sessions & Rollouts:** 304 καταγεγραμμένες συνεδρίες (`CODEX-TEXT-HISTORY-2026-10-01.zip::sessions/`, `~/.codex/`).
 3. **Claude & Claude Code (Home Linux):** 360 συνεδρίες στο `CLAUDE-SECOND-FOLDER-TEXT-2026-10-01.zip`, 248 συνεδρίες στα `Local assistants` (`LOCAL-AI-HISTORY-2026-10-01.zip::claude-code/`), επίσημες μνήμες `claude-cloud-memories.json` και `CLAUDE-MEMORY-OFFICIAL.json`.
 4. **Claude & Claude Code (Corporate PC, Redacted):** 14 θεματικές ενότητες μνήμης και αναφορές ελέγχου στα `CLAUDE-CORPORATE-PASTED-MEMORIES-2026-10-02-REDACTED.md` και `CLAUDE-CORPORATE-SCREENSHOT-MEMORIES-REDACTED.md`.
@@ -148,8 +148,8 @@
 - **Εφαρμογή:** Άμεση εκτέλεση παραμετροποιημένων SQL queries (`UserSession.ExecSqlAsync`) που επιστρέφουν απλά DTOs (`List<DTO>` ή `Dictionary`). Τα δεδομένα δεν διατηρούνται σε παράλληλη κατάσταση στη μνήμη του server.
 
 ### 5.2 Αποσύνδεση Κοινών Βιβλιοθηκών & Συμβόλαιο Μη-Παλινδρόμησης (Non-Regression)
-- **Κανόνας:** Λειτουργίες όπως η παραγωγή αναφορών, εξαγωγή PDF και διαχείριση εγγράφων πρέπει να κατοικούν σε εξωτερικές κοινές βιβλιοθήκες (`EnterpriseOrg.Reporting.*`).
-- **Συμβόλαιο Αμεταβλητότητας:** Το κεντρικό προϊόν (π.χ. FinSystem) πρέπει να παραμένει **byte-identical**. Οποιεσδήποτε νέες δυνατότητες για θυγατρικές εφαρμογές (π.χ. CorpSystem Teiresias) εισάγονται αυστηρά ως **opt-in παράμετροι με προεπιλεγμένες τιμές (defaults)**, αποδεδειγμένες μέσω golden unit tests.
+- **Κανόνας:** Λειτουργίες όπως η παραγωγή αναφορών, εξαγωγή PDF και διαχείριση εγγράφων πρέπει να κατοικούν σε εξωτερικές κοινές βιβλιοθήκες (`EnterpriseCore.Reporting.*`).
+- **Συμβόλαιο Αμεταβλητότητας:** Το κεντρικό προϊόν (π.χ. FinSystem) πρέπει να παραμένει **byte-identical**. Οποιεσδήποτε νέες δυνατότητες για θυγατρικές εφαρμογές (π.χ. corp_portal Teiresias) εισάγονται αυστηρά ως **opt-in παράμετροι με προεπιλεγμένες τιμές (defaults)**, αποδεδειγμένες μέσω golden unit tests.
 
 ### 5.3 Versioned Αρχεία Ρυθμίσεων έναντι Εγγραφών Βάσης
 - **Κανόνας:** Προτίμηση για αρχεία ρυθμίσεων και μεταφράσεων (JSON/TSV) που ελέγχονται από το σύστημα εκδόσεων (Git), αντί δυναμικών εγγραφών ανά μετάφραση σε κοινόχρηστους πίνακες της βάσης. Αυτό αποτρέπει αποκλίσεις συγχρονισμού (sync drift) μεταξύ διαφορετικών βάσεων πελατών.
@@ -232,11 +232,11 @@
   - **Replay-Safe Monotonic Licensing:** Υπογραφή αδειών δεσμευμένη σε machine/product ID με μονοτονικό χρονικό μετρητή (`monotonic_tick`) ενάντια σε replay attacks.
 
 ### 5.13 Sovereign Dual-Pane File Explorer, VFS Mount Manager & Cleanroom Commander (`pbexplorer`)
-- **Πηγή:** Άμεση ιδέα χρήστη στο τρέχον chat + ενοποίηση με `pbos`, `pbide`, `pbwatermarks-remover` (Cleanroom), `pbduallock` και τα απομακρυσμένα mounts (`verpserver` SMB `127.0.0.1:1445` & `EnterpriseOrg` SFTP).
+- **Πηγή:** Άμεση ιδέα χρήστη στο τρέχον chat + ενοποίηση με `pbos`, `pbide`, `pbwatermarks-remover` (Cleanroom), `pbduallock` και τα απομακρυσμένα mounts (`verpserver` SMB `127.0.0.1:1445` & `EnterpriseCore` SFTP).
 - **Κεντρική Ιδέα:**
   - **5 Καταστάσεις Προβολής (Layout Modes) με Flagship UI (`obsidian_aurora_glass`):** `dual_pane_commander`, `miller_columns`, `tree_sidebar_dock`, `masonry_media_grid`, `timeline_git_journal`, με `2.0x` 4K HiDPI scaling και πλήρη συνδυασμό πλήκτρων (`F3..F8`, `Space`, `Ctrl+F`, `Ctrl+D`).
   - **Content-Addressable SHA-256 Deduplicator & Merkle Directory Digest:** Υπολογισμός ακριβούς μεγέθους, SHA-256 αποτυπώματος περιεχομένου, ομάδων διπλότυπων αρχείων (duplicate clusters), ανακτήσιμων bytes και ρίζας Merkle ανά φάκελο.
-  - **Multi-Protocol VFS & Auto-Heal Mount Monitor:** Ενιαία διαχείριση `local_posix`, `smb_cifs_ssh_tunnel` (`smb://127.0.0.1:1445/f/Transf/panosb` μέσω `EnterpriseOrg-verpserver-files.service` και `IdentityAgent=%t/gcr/ssh`), `sftp_gvfs` (`sftp://EnterpriseOrg/`), `.zip/.tar.gz` Archive VFS και `pbduallock_pq_vault`.
+  - **Multi-Protocol VFS & Auto-Heal Mount Monitor:** Ενιαία διαχείριση `local_posix`, `smb_cifs_ssh_tunnel` (`smb://127.0.0.1:1445/f/Transf/panosb` μέσω `EnterpriseCore-verpserver-files.service` και `IdentityAgent=%t/gcr/ssh`), `sftp_gvfs` (`sftp://EnterpriseCore/`), `.zip/.tar.gz` Archive VFS και `pbduallock_pq_vault`.
   - **Ενσωματωμένο PBOS Antivirus, Parseltongue & PB Cleanroom Quick-Look:** Αυτόματος έλεγχος εντροπίας/RWX και adversarial prompt injection πριν την προεπισκόπηση, αφαίρεση αόρατων χαρακτήρων (`ZWSP_`/`ZWNJ_`) και απόκρυψη μυστικών (`[REDACTED]`).
   - **Atomic Batch Rename με Ανίχνευση Συγκρούσεων & Ημερολόγιο Αναίρεσης (Undo/Redo Journal):** Υποστήριξη προτύπων `{index}`, `{stem}`, `{ext}`, `{sha8}`.
 

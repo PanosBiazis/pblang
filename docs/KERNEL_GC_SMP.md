@@ -125,7 +125,7 @@ runtime/FFI/PB-MCP/polyglot integration also remains open: `stdlib/runtime_gc.sa
 still refuses destructive retained-host collection because roots across nested
 VMs are incomplete. A 32-bit kernel object graph cannot substitute for those
 host ownership/root contracts. No runtime refusal was bypassed, no installed
-PB-MCP transport was changed and no EnterpriseOrg server was used.
+PB-MCP transport was changed and no EnterpriseCore server was used.
 
 Graphify update timed out at its 35-second budget; its owned process group was
 stopped. Graph output is not semantic verification of these PBLang modules.

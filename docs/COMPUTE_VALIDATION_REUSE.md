@@ -149,7 +149,7 @@ does not solve those problems or justify enabling destructive collection.
 
 The installed PB-MCP does not invoke this compute route. Its desktop maintenance
 and frame pipeline remain unchanged; no live-view benefit was measured. The
-unrelated workspace changes were preserved. No EnterpriseOrg server was used.
+unrelated workspace changes were preserved. No external corporate server was used.
 
 Graphify's AST-only update exceeded 35 seconds; its owned process group was
 terminated and reaped. It does not establish semantic PBLang coverage.

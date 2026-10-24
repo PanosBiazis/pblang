@@ -2,7 +2,7 @@
 
 This continues [the ORM intake](IDEA_INTAKE_ORM_2026-09-15.md), with one concrete
 library implementation rather than new product installations. No remote
-workstation or EnterpriseOrg/Hetzner server was accessed. No third-party plugin,
+workstation or EnterpriseCore/Hetzner server was accessed. No third-party plugin,
 hook, configuration, marketplace installation command or database connector
 was executed.
 

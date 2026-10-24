@@ -132,5 +132,5 @@ replacement would not complete exception-preserving cleanup.
 The installed desktop bundle was inspected read-only for this VM/code generator.
 No installation, consent state or desktop transport is changed. General
 runtime/FFI/polyglot integration, physical/guest-platform validation, cycles and
-long pauses remain open; this does not establish better live view. No EnterpriseOrg
+long pauses remain open; this does not establish better live view. No EnterpriseCore
 server or the external `sw` reference tree is used or modified.

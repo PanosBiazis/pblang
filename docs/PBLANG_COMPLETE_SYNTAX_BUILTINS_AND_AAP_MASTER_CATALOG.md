@@ -143,14 +143,14 @@ export compute, MAX_ITEMS; // comma-separated or individual `export ident;` stat
 ### 3.1 `AAP/products/` — **64 Product Directories** (`59` Standalone Pure-PBLang Packages with `pblang.toml` + `5` Additional Modules)
 
 1. **Ασφάλεια, Αδειοδότηση, Φυσική/Ψηφιακή Φύλαξη, Κρυπτογραφία & Zero-Knowledge Cloud (4):**
-   - [`pbduallock`](file://../pbduallock/pblang.toml) — Dual-Key Sovereign Vault, Partner-Safeguard, Canary Tripwires & 720h Autonomous Continuity Control Plane
-   - [`pblicense`](file://../pblicense/pblang.toml) — Multi-Layer ERP, Hardware, Heartbeat, Manifest & SaaS Licensing Engine
-   - [`pbspotit`](file://../pbspotit/pblang.toml) (+ `spotit`) — Release-Signing, Authenticated-State & Physical Motion/Tamper Alarm Security Guard (`Controller.arm`, pattern guard, bounded alert policy)
-   - [`pbcloud`](file://../pbcloud/pblang.toml) — **ΝΕΟ:** Zero-Knowledge Google Cloud Server Control Plane (`AMD_SEV_SNP`, `ChaCha20` Envelope, SSRF `169.254.169.254` blocker) connected to `pbduallock` & `pbspotit`
+   - [`pbduallock`](file://<workspace-root>/products/pbduallock/pblang.toml) — Dual-Key Sovereign Vault, Partner-Safeguard, Canary Tripwires & 720h Autonomous Continuity Control Plane
+   - [`pblicense`](file://<workspace-root>/products/pblicense/pblang.toml) — Multi-Layer ERP, Hardware, Heartbeat, Manifest & SaaS Licensing Engine
+   - [`pbspotit`](file://<workspace-root>/products/pbspotit/pblang.toml) (+ `spotit`) — Release-Signing, Authenticated-State & Physical Motion/Tamper Alarm Security Guard (`Controller.arm`, pattern guard, bounded alert policy)
+   - [`pbcloud`](file://<workspace-root>/products/pbcloud/pblang.toml) — **ΝΕΟ:** Zero-Knowledge Google Cloud Server Control Plane (`AMD_SEV_SNP`, `ChaCha20` Envelope, SSRF `169.254.169.254` blocker) connected to `pbduallock` & `pbspotit`
 2. **Πυρήνας Γλώσσας, IDE, OS, AI & MCP (7):**
-   - [`pblang`](file://../pblang/pblang.toml), [`pblang-synced`](file://../pblang-synced/pblang.toml), [`pbide`](file://../pbide/pblang.toml), [`pbos`](file://../pbos/pblang.toml), [`pbai`](file://../pbai/pblang.toml), [`pb-mcp-server`](file://../pb-mcp-server/pblang.toml), [`aipy`](file://../aipy/pblang.toml)
+   - [`pblang`](file://<pblang-root>/pblang.toml), [`pblang-synced`](file://<pblang-root>-synced/pblang.toml), [`pbide`](file://<workspace-root>/products/pbide/pblang.toml), [`pbos`](file://<workspace-root>/products/pbos/pblang.toml), [`pbai`](file://<workspace-root>/products/pbai/pblang.toml), [`pb-mcp-server`](file://<workspace-root>/products/pb-mcp-server/pblang.toml), [`aipy`](file://<workspace-root>/products/aipy/pblang.toml)
 3. **Ναυαρχίδες, Διαχείριση Αρχείων & Καθαρισμός Περιεχομένου (6):**
-   - [`pbcosmodata`](file://../pbcosmodata/pblang.toml), [`pbprofessions`](file://../pbprofessions/pblang.toml), [`pbexplorer`](file://../pbexplorer/pblang.toml), [`pbwatermarks-remover`](file://../pbwatermarks-remover/pblang.toml), [`pbremote`](file://../pbremote/pblang.toml), [`crud-website-pblang`](file://../crud-website-pblang/pblang.toml)
+   - [`pbcosmodata`](file://<workspace-root>/products/pbcosmodata/pblang.toml), [`pbprofessions`](file://<workspace-root>/products/pbprofessions/pblang.toml), [`pbexplorer`](file://<workspace-root>/products/pbexplorer/pblang.toml), [`pbwatermarks-remover`](file://<workspace-root>/products/pbwatermarks-remover/pblang.toml), [`pbremote`](file://<workspace-root>/products/pbremote/pblang.toml), [`crud-website-pblang`](file://<workspace-root>/products/crud-website-pblang/pblang.toml)
 4. **Δεδομένα, Πίνακες, Λογιστική Συμφωνία & Στατιστική (12):**
    - `pbdatalab`, `pbgroupstats`, `pbreshape`, `pbportions`, `pbreconcile`, `pbtablecheck`, `pbcompare`, `pbjoin`, `pbmerge`, `pbtally`, `pbinterpolate`, `pbsmooth`
 5. **Επιστημονικά, Μαθηματικά, Κυκλώματα, Υλικό & Μετρήσεις (5):**

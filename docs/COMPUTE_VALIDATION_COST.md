@@ -172,5 +172,5 @@ The generic scheduler still needs real, parity-tested GPU/NPU execution backends
 Hardware inventory and a mock registered executor do not demonstrate hardware
 acceleration. Collector pauses, runtime reference cycles, general runtime/FFI
 and polyglot integration, and wider platform testing remain open. PB-MCP was
-not updated and no live-view performance benefit was measured. No EnterpriseOrg
+not updated and no live-view performance benefit was measured. No EnterpriseCore
 server was used.

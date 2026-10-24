@@ -42,4 +42,4 @@ semantics; the current catch expression does not bind arbitrary thrown values.
 Composite/shared ownership, native runtime/FFI, backend parity, libraries,
 audits/release authenticity, PBIDE Run/Designer and guest-OS tests remain open.
 A capability inventory UI is a proposal, not implemented in this slice.
-Version 1.0.0 is not ready. No EnterpriseOrg server or remote device was used.
+Version 1.0.0 is not ready. No EnterpriseCore server or remote device was used.

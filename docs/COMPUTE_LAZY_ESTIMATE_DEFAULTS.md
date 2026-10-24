@@ -133,7 +133,7 @@ remain unresolved. Actual GPU/NPU acceleration requires kernels and measured
 result parity; test runtime hooks do not establish hardware acceleration.
 
 PB-MCP's installed desktop pipeline was not changed and does not gain a proven
-live-view benefit from this estimator. No EnterpriseOrg server was used. The 170
+live-view benefit from this estimator. No external corporate server was used. The 170
 pre-existing status entries (212 hashed files) were preserved. Graphify's
 AST-only update exceeded 35 seconds; its owned process group was terminated
 and reaped. No semantic PBLang graph coverage is claimed.

@@ -200,7 +200,7 @@ the bundle was neither replaced nor restarted, and approvals were preserved.
 Large collector pauses, broader runtime/FFI/polyglot integration, physical-device
 and guest-OS validation remain open. The earlier codec's memory overhead is not
 removed by this change. The project remains alpha; the
-[stable-release gates](STABLE_1_0_READINESS.md) still apply. No EnterpriseOrg server was
+[stable-release gates](STABLE_1_0_READINESS.md) still apply. No EnterpriseCore server was
 used. The pre-existing 212-file change baseline was preserved.
 
 A diagnostic probe that printed the entire cyclic VM globals map recursed in

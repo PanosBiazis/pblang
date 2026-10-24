@@ -107,7 +107,7 @@ Large collection pauses, general closure semantics, runtime/FFI/polyglot ownersh
 and wider platforms remain open. No collection-pause bound, streaming benefit,
 GPU/NPU gain, disk reduction or universal resource saving is established.
 The kernel modules remain absent from the retained PB-MCP desktop package;
-its installation is unchanged. No EnterpriseOrg server was used.
+its installation is unchanged. No external corporate server was used.
 
 See [1.0 readiness and planning estimate](STABLE_1_0_READINESS.md) for release
 criteria, remaining blockers and the assumptions behind calendar estimates.
