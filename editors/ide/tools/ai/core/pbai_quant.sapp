@@ -1,0 +1,147 @@
+// stdlib/pbai_quant.sapp -- pbAI weight quantization (Phase 3 of the fN engine).
+//
+// Bridges the pblang fN engine (stdlib:floatn.sapp) to the pbAI Nano LM: it can round a
+// model's weight tensors (E, W1, W2, b1, b2) to a low-bit format (f8e4m3, f16, bf16, ...),
+// measure the resulting compression and quantization error, and hand back a model that
+// still runs forward/generate (the quantized weights are stored as f64, i.e. exact fN
+// values, so compute is unchanged -- this models real load-fN / compute-f32 inference).
+//
+// HONEST framing: this shrinks the *stored* precision of weights and lets you measure the
+// accuracy cost, end to end. It does not change pblang's compute (still f64) and does not
+// silently rewrite checkpoints -- packing to disk is opt-in via pack_tensor/floatn.pack.
+
+let FN = import("stdlib:floatn.sapp");
+
+let BASELINE_BITS = 64;   // pblang numbers are f64
+
+// _acc_quant_1d(arr, fmt, acc) — quantize a 1D weight vector in place into a fresh array,
+// accumulating {count, sum_abs_err, max_abs_err} into acc (a map). Returns the new array.
+fn _quant_1d(arr, fmt, acc) {
+    let out = [];
+    let i = 0;
+    let n = len(arr);
+    while i < n {
+        let a = arr[i];                        // read once (was indexed twice per weight, over every model weight)
+        let q = FN.quantize(a, fmt);
+        push(out, q);
+        let e = a - q;
+        if e < 0 { e = 0 - e; }
+        acc.count = acc.count + 1;
+        acc.sum_abs_err = acc.sum_abs_err + e;
+        if e > acc.max_abs_err { acc.max_abs_err = e; }
+        i = i + 1;
+    }
+    return out;
+}
+
+// _quant_2d(mat, fmt, acc) — quantize a 2D weight matrix (array of row arrays).
+fn _quant_2d(mat, fmt, acc) {
+    let out = [];
+    let i = 0;
+    while i < len(mat) {
+        push(out, _quant_1d(mat[i], fmt, acc));
+        i = i + 1;
+    }
+    return out;
+}
+
+// quantize_model(model, fmt) — return a new model whose weight tensors are quantized to
+// fmt (values rounded to fN, stored as f64), plus a `quant` report map. Non-weight fields
+// (V, D, H, K) are preserved so the model still runs.
+fn quantize_model(model, fmt) {
+    fmt = FN.resolve(fmt);
+    let acc = map{ count: 0, sum_abs_err: 0, max_abs_err: 0 };
+    let E = _quant_2d(model.E, fmt, acc);
+    let W1 = _quant_2d(model.W1, fmt, acc);
+    let W2 = _quant_2d(model.W2, fmt, acc);
+    let b1 = _quant_1d(model.b1, fmt, acc);
+    let b2 = _quant_1d(model.b2, fmt, acc);
+    let out = map{
+        E: E, W1: W1, b1: b1, W2: W2, b2: b2,
+        V: model.V, D: model.D, H: model.H, K: model.K,
+        quant: _report_from(acc, fmt)
+    };
+    return out;
+}
+
+// quant_report(model, fmt) — measure compression + error WITHOUT mutating the model.
+fn quant_report(model, fmt) {
+    fmt = FN.resolve(fmt);
+    let acc = map{ count: 0, sum_abs_err: 0, max_abs_err: 0 };
+    _quant_2d(model.E, fmt, acc);
+    _quant_2d(model.W1, fmt, acc);
+    _quant_2d(model.W2, fmt, acc);
+    _quant_1d(model.b1, fmt, acc);
+    _quant_1d(model.b2, fmt, acc);
+    return _report_from(acc, fmt);
+}
+
+fn _report_from(acc, fmt) {
+    let info = FN.info(fmt);
+    let weights = acc.count;
+    let baseline_bytes = num_ceil(weights * BASELINE_BITS / 8);
+    let packed_bytes = num_ceil(weights * info.bits / 8);
+    let ratio = 0;
+    if packed_bytes > 0 { ratio = baseline_bytes / packed_bytes; }
+    let mean_err = 0;
+    if weights > 0 { mean_err = acc.sum_abs_err / weights; }
+    return map{
+        format: info.name,
+        bits_per_weight: info.bits,
+        baseline_bits_per_weight: BASELINE_BITS,
+        weights: weights,
+        baseline_bytes: baseline_bytes,
+        packed_bytes: packed_bytes,
+        compression: ratio,
+        mean_abs_error: mean_err,
+        max_abs_error: acc.max_abs_err
+    };
+}
+
+// pack_tensor(arr2d_or_1d, fmt) — pack a weight tensor to a compact byte stream (opt-in,
+// for on-disk storage). Flattens row-major. Use unpack_tensor to restore.
+fn pack_tensor(t, fmt) {
+    fmt = FN.resolve(fmt);
+    let flat = _flatten(t);
+    return map{
+        format: FN.info(fmt).name,
+        n: len(flat),
+        bytes: FN.pack(flat, fmt)
+    };
+}
+
+// unpack_tensor(packed, fmt) — restore a flat array of values from pack_tensor output.
+fn unpack_tensor(packed, fmt) {
+    fmt = FN.resolve(fmt);
+    return FN.unpack(packed.bytes, packed.n, fmt);
+}
+
+fn _flatten(t) {
+    let out = [];
+    let i = 0;
+    while i < len(t) {
+        if is_array(t[i]) {
+            let j = 0;
+            while j < len(t[i]) { push(out, t[i][j]); j = j + 1; }
+        } else {
+            push(out, t[i]);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// capability() — honest summary for model_status(): quantization is available via the fN
+// engine, with the formats most useful for weights. Compute stays f64.
+fn capability() {
+    return map{
+        module: "stdlib/pbai_quant.sapp",
+        engine: "stdlib:floatn.sapp (pblang-native fN)",
+        supported: ["f8e4m3", "f8e5m2", "f16", "bf16", "f32", "f64", "fN (any width)"],
+        recommended_for_weights: "f8e4m3 (4x smaller) or f16/bf16 (2x smaller)",
+        compute: "f64 (quantization shrinks stored precision; compute is unchanged)",
+        note: "use quant_report(model, fmt) to measure compression + error before committing"
+    };
+}
+
+export quantize_model, quant_report, pack_tensor, unpack_tensor, capability;

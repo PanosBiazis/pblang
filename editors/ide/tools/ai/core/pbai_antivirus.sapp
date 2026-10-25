@@ -1,0 +1,188 @@
+// pbai_antivirus.sapp -- bounded external file-AV adapter for pbAI.
+//
+// ClamAV scans a private copy created from one sealed immutable reader. Raw
+// scanner output and paths never cross this boundary. This is not memory AV,
+// full DLP, or a malware-free guarantee.
+
+let PROCESS = import("stdlib:process.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
+
+let FORMAT = "pbai.antivirus.scan.v1";
+let MAX_FILE_BYTES = 67108864;
+let MAX_OUTPUT_BYTES = 32768;
+let SCAN_TIMEOUT_SECS = 60;
+
+fn _result(verdict, disposition, completed, extra = nil) {
+    let out = map{ format: FORMAT, ok: completed,
+        completed: completed, verdict: verdict, disposition: disposition,
+        antivirus_engine: "clamav", antivirus_verdict: completed,
+        scanner_execution_completed: false,
+        malware_free_claimed: false, memory_scanned: false,
+        full_dlp: false, raw_scanner_output_returned: false,
+        raw_path_returned: false, archive_complete_coverage: false };
+    if type(extra) == "map" {
+        for key in map_keys(extra) { out[key] = extra[key]; }
+    }
+    return out;
+}
+
+fn _process_options() {
+    return map{ timeout_secs: SCAN_TIMEOUT_SECS, startup_timeout_ms: 5000,
+        max_output_bytes: MAX_OUTPUT_BYTES, max_file_bytes: MAX_FILE_BYTES,
+        // RLIMIT_NPROC counts all current host-UID threads before any private
+        // namespace exists; keep this high enough for launch while retaining
+        // the process-group and memory bounds as the effective containment.
+        max_memory_bytes: 2147483648, max_processes: 2048,
+        max_open_files: 128, inherit_environment: false,
+        environment: map{ PATH: "/usr/bin:/bin", HOME: "/nonexistent",
+            TMPDIR: "/tmp", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" } };
+}
+
+fn _unavailable_probe() {
+    return map{ ok: false, output_digest: "", process_group_terminated: false };
+}
+
+fn _version_probe() {
+    if platform() != "linux" or not PROCESS.bounded_status().available {
+        return _unavailable_probe();
+    }
+    let result = PROCESS.run_fixed_bounded(["/usr/bin/clamscan", "/bin/clamscan"],
+        ["--version"], map{ timeout_secs: 5, startup_timeout_ms: 3000,
+            max_output_bytes: 4096, max_file_bytes: 4096,
+            max_memory_bytes: 268435456, max_processes: 2048,
+            max_open_files: 32, inherit_environment: false,
+            environment: map{ PATH: "/usr/bin:/bin", HOME: "/nonexistent",
+                TMPDIR: "/tmp", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" } });
+    let text = (try result.stdout catch "") + (try result.stderr catch "");
+    return map{ ok: try result.command_ok catch false,
+        output_digest: sha256(text), process_group_terminated:
+            try result.process_group_terminated catch false };
+}
+
+fn _status_from_probe(probe, live_probe_attempted) {
+    let probe_ok = try probe.ok catch false;
+    let process_group_terminated = try probe.process_group_terminated catch false;
+    return map{ format: "pbai.antivirus.status.v1", ok: true,
+        platform: platform(), external_file_antivirus_available: probe_ok,
+        engine: "clamav", fixed_executable_candidates: true,
+        engine_version_output_digest: if probe_ok {
+            try probe.output_digest catch ""
+        } else { "" },
+        engine_version_verified_live: probe_ok,
+        live_probe_attempted: live_probe_attempted,
+        default_status_external_effects: false,
+        signature_database_freshness_verified: false,
+        immutable_snapshot_before_scan: true,
+        external_process_timeout_enforced: probe_ok and process_group_terminated,
+        max_file_bytes: MAX_FILE_BYTES, timeout_secs: SCAN_TIMEOUT_SECS,
+        scanner_namespace_verification_available: false,
+        memory_scan_available: false, full_dlp: false,
+        malware_free_guarantee: false, archive_complete_coverage: false };
+}
+
+// Cheap, deterministic, and process-free. Product health and UI refreshes use
+// this status so observation cannot silently become execution.
+fn status() { return _status_from_probe(_unavailable_probe(), false); }
+
+// Explicit diagnostic surface. It may start the fixed bounded ClamAV version
+// probe but never returns raw command output or upgrades scan guarantees.
+fn live_status() {
+    let probe = try _version_probe() catch _unavailable_probe();
+    return _status_from_probe(probe, true);
+}
+
+fn scan_file(path) {
+    if type(path) != "string" or path == "" or len(path) > 4096 {
+        return _result("unknown", "quarantine", false,
+            map{ error_code: "invalid-scan-path" });
+    }
+    let reader = SECURE.open_immutable_reader(path, MAX_FILE_BYTES, false);
+    if not (try reader.ok catch false) {
+        return _result("unknown", "quarantine", false,
+            map{ error_code: "immutable-snapshot-unavailable" });
+    }
+    let snapshot = SECURE.immutable_reader_range(reader, 0, reader.size);
+    let reader_closed = SECURE.close_immutable_reader(reader);
+    if not (try snapshot.ok catch false) or not (try reader_closed.ok catch false) {
+        return _result("unknown", "quarantine", false,
+            map{ error_code: "immutable-snapshot-read-failed" });
+    }
+    let args = ["--unshare-user", "--uid", "65534", "--gid", "65534",
+        "--unshare-pid", "--unshare-net", "--unshare-ipc", "--unshare-uts",
+        "--die-with-parent", "--new-session", "--disable-userns", "--clearenv",
+        "--setenv", "PATH", "/usr/bin", "--setenv", "HOME", "/nonexistent",
+        "--setenv", "TMPDIR", "/tmp", "--setenv", "LANG", "C.UTF-8",
+        "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib", "/lib",
+        "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/var/lib/clamav", "/var/lib/clamav",
+        "--ro-bind", "/etc/clamav/certs", "/etc/clamav/certs",
+        "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+        "--chdir", "/tmp", "--cap-drop", "ALL", "--", "/usr/bin/clamscan",
+        "--no-summary", "--stdout", "--max-filesize=64M",
+        "--max-scansize=64M", "--max-recursion=4", "--max-files=64",
+        "--bytecode-timeout=5000", "-"];
+    let options = _process_options();
+    options.stdin_bytes = snapshot.bytes;
+    let result = try PROCESS.run_fixed_bounded(["/usr/bin/bwrap", "/bin/bwrap"],
+        args, options) catch nil;
+    if result == nil {
+        return _result("unknown", "quarantine", false, map{
+            error_code: "scanner-runner-unavailable",
+            content_base64_sha256: sha256(base64_encode_bytes(snapshot.bytes)),
+            bytes_scanned: 0, snapshot_submitted_to_runner: false,
+            immutable_snapshot_scanned: false,
+            scanner_input_transport: "stdin",
+            scanner_namespace_configuration_requested: true,
+            scanner_network_namespace_configuration_requested: true,
+            scanner_namespace_sandboxed: false,
+            scanner_network_namespace_isolated: false,
+            external_process_bounded: false,
+            external_process_timeout_enforced: false,
+            cleanup_verified: false,
+            filesystem_scan_artifact_created: false,
+            signature_database_freshness_verified: false
+        });
+    }
+    let raw = (try result.stdout catch "") + (try result.stderr catch "");
+    let stale_database = str_contains(str_lower(raw), "database is older than 7 days");
+    let completed = try result.completed catch false;
+    let bounded = try result.bounded catch false;
+    let terminated = try result.process_group_terminated catch false;
+    let timed_out = try result.timed_out catch false;
+    let exit_code = try result.exit_code catch -1;
+    let extra = map{ content_base64_sha256: sha256(base64_encode_bytes(snapshot.bytes)),
+        bytes_scanned: 0, scanner_output_digest: sha256(raw),
+        snapshot_submitted_to_runner: true, immutable_snapshot_scanned: false,
+        scanner_input_transport: "stdin",
+        scanner_namespace_configuration_requested: true,
+        scanner_network_namespace_configuration_requested: true,
+        scanner_namespace_sandboxed: false, scanner_network_namespace_isolated: false,
+        scanner_seccomp_filtered: false, scanner_cgroup_enforced: false,
+        external_process_bounded: bounded,
+        external_process_timeout_enforced: bounded and terminated,
+        timed_out: timed_out, cleanup_verified: terminated,
+        filesystem_scan_artifact_created: false,
+        signature_database_freshness_verified: false,
+        signature_database_stale_observed: stale_database };
+    if not completed or not bounded or not terminated or timed_out {
+        extra.error_code = if timed_out { "scanner-timeout" } else { "scanner-incomplete" };
+        return _result("unknown", "quarantine", false, extra);
+    }
+    if exit_code == 1 {
+        extra.bytes_scanned = reader.size; extra.immutable_snapshot_scanned = true;
+        extra.scanner_execution_completed = true;
+        extra.known_malware_match = true;
+        return _result("known-malware-match", "deny", true, extra);
+    }
+    if exit_code == 0 {
+        extra.bytes_scanned = reader.size; extra.immutable_snapshot_scanned = true;
+        extra.scanner_execution_completed = true;
+        extra.error_code = if stale_database { "signature-database-stale" }
+            else { "signature-database-freshness-unverified" };
+        extra.known_malware_match = false;
+        return _result("unknown", "quarantine", false, extra);
+    }
+    extra.error_code = "scanner-error";
+    return _result("unknown", "quarantine", false, extra);
+}
+
+export FORMAT, MAX_FILE_BYTES, status, live_status, scan_file;

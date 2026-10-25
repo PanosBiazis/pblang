@@ -1,0 +1,453 @@
+// stdlib/pbai_brain.sapp -- first measurable pbAI cognitive loop.
+//
+// This is not a biological-brain clone. It is the pblang-native control surface
+// promised by docs/pbAI_externalization.md: perception, working/episodic memory,
+// planning, critique, and verification signals that the assistant can expose today.
+
+let nn = import("stdlib:nn.sapp");
+let PBAI_TOOLS = (try import("pbai_tools.sapp") catch import("editors/ide/tools/ai/core/pbai_tools.sapp"));
+
+let FORMAT = "pbai.brain.loop.v1";
+let _COG_NET = nil;
+
+// Hard cap on perception->reflection cycles. The loop refines plan/critique/reflection,
+// but without an explicit counter a caller could iterate past the interaction budget with
+// no guaranteed termination. MAX_LOOP_STEPS bounds the loop so run() always terminates and
+// flags `step_exhausted` when the cap is hit.
+let MAX_LOOP_STEPS = 50;
+
+fn _lower(s) { return str_lower(str(s)); }
+
+fn contains(arr, value) {
+    let i = 0;
+    while i < len(arr) {
+        if arr[i] == value { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _push_signal(signals, name) {
+    if not contains(signals, name) { push(signals, name); }
+}
+
+fn data_modalities(input) {
+    let text = str(input);
+    let t = _lower(text);
+    let trimmed = str_trim(text);
+    let mods = [];
+    if str_contains(text, "fn ") or str_contains(text, "let ") or str_contains(text, "map{") { _push_signal(mods, "code"); }
+    if str_contains(t, ".json")
+        or (str_starts_with(trimmed, "{") and str_contains(trimmed, ":") and not contains(mods, "code"))
+        or (str_starts_with(trimmed, "[") and (str_contains(trimmed, "map{") == false)) {
+        _push_signal(mods, "json");
+    }
+    if str_contains(text, ",") and str_contains(text, "\n") { _push_signal(mods, "csv"); }
+    if str_contains(text, "# ") or str_contains(text, "```") or str_contains(t, ".md") { _push_signal(mods, "markdown"); }
+    if str_contains(t, "error") or str_contains(t, "warn") or str_contains(t, "stack trace") or str_contains(t, ".log") { _push_signal(mods, "logs"); }
+    if str_contains(t, "diff") or str_contains(t, "patch") or str_contains(text, "@@") { _push_signal(mods, "diff"); }
+    if str_contains(t, "test") or str_contains(t, "assert") or str_contains(t, "pass") or str_contains(t, "fail") { _push_signal(mods, "test-output"); }
+    if str_contains(t, ".png") or str_contains(t, ".jpg") or str_contains(t, ".jpeg") or str_contains(t, ".gif") or str_contains(t, ".webp") or str_contains(t, "image") { _push_signal(mods, "image"); }
+    if str_contains(t, ".wav") or str_contains(t, ".mp3") or str_contains(t, ".flac") or str_contains(t, "audio") { _push_signal(mods, "audio"); }
+    if str_contains(t, ".mp4") or str_contains(t, ".mov") or str_contains(t, ".webm") or str_contains(t, "video") { _push_signal(mods, "video"); }
+    if str_contains(t, ".bin") or str_contains(t, ".safetensors") or str_contains(t, ".gguf") or str_contains(t, "binary") { _push_signal(mods, "binary"); }
+    if len(mods) == 0 { _push_signal(mods, "text"); }
+    return mods;
+}
+
+fn perceive(input) {
+    let text = str(input);
+    let t = _lower(text);
+    let signals = [];
+    let kind = "question";
+    let modalities = data_modalities(input);
+
+    if contains(modalities, "code") {
+        kind = "code";
+        _push_signal(signals, "code");
+    }
+    if str_contains(t, "error") or str_contains(t, "failed") or str_contains(t, "panic") or str_contains(t, "exception") {
+        kind = "failure";
+        _push_signal(signals, "failure");
+    }
+    if contains(modalities, "diff") {
+        kind = "diff";
+        _push_signal(signals, "diff");
+    }
+    if str_contains(t, "test") or str_contains(t, "assert") or str_contains(t, "pass") {
+        _push_signal(signals, "test");
+    }
+    if str_contains(t, "tool") or str_contains(t, "mcp") or str_contains(t, "workspace") {
+        _push_signal(signals, "tool");
+    }
+    if str_contains(t, "doc") or str_contains(t, "explain") or str_contains(t, "how") {
+        _push_signal(signals, "docs");
+    }
+    if len(signals) == 0 { _push_signal(signals, "language"); }
+
+    return map{
+        format: FORMAT,
+        kind: kind,
+        text_len: len(text),
+        signals: signals,
+        modalities: modalities,
+        needs_verification: kind == "code" or kind == "failure" or contains(signals, "test"),
+        confidence_hint: if kind == "question" { 0.62 } else { 0.74 }
+    };
+}
+
+fn _bool01(v) {
+    if v { return 1; }
+    return 0;
+}
+
+fn _features(input, p = nil) {
+    if p == nil { p = perceive(input); }
+    let len_score = p.text_len / 500;
+    if len_score > 1 { len_score = 1; }
+    return [
+        _bool01(p.kind == "code"),
+        _bool01(p.kind == "failure"),
+        _bool01(p.kind == "diff"),
+        _bool01(contains(p.signals, "test")),
+        _bool01(contains(p.signals, "tool")),
+        _bool01(contains(p.signals, "docs")),
+        _bool01(contains(p.modalities, "json") or contains(p.modalities, "csv") or contains(p.modalities, "image") or contains(p.modalities, "audio") or contains(p.modalities, "video")),
+        _bool01(str_contains(_lower(input), "learn") or str_contains(_lower(input), "teach")),
+        len_score
+    ];
+}
+
+fn _cog_sample(text, target) {
+    return nn.sample(_features(text), target);
+}
+
+fn _train_cognitive_core() {
+    let net = nn.mlp_new(9, 12, 6, 77);
+    let data = [
+        _cog_sample("hi what is pblang", [0.45, 0.35, 0.35, 0.05, 0.08, 0.05]),
+        _cog_sample("Find bugs:\nfn f() { print(1); }", [0.85, 0.55, 0.78, 0.85, 0.18, 0.10]),
+        _cog_sample("error: missing key while running tests", [0.88, 0.70, 0.82, 0.96, 0.25, 0.08]),
+        _cog_sample("diff @@ patch review", [0.82, 0.55, 0.75, 0.90, 0.30, 0.05]),
+        _cog_sample("use workspace tools and run tests", [0.70, 0.50, 0.80, 0.92, 0.95, 0.05]),
+        _cog_sample("learn: project rule map reads need guard", [0.75, 0.98, 0.45, 0.35, 0.10, 0.98]),
+        _cog_sample("image.png json csv data", [0.76, 0.62, 0.60, 0.30, 0.35, 0.10])
+    ];
+    nn.train(net, data, 450, 0.35);
+    return net;
+}
+
+fn _cognitive_net() {
+    if _COG_NET != nil { return _COG_NET; }
+    _COG_NET = _train_cognitive_core();
+    return _COG_NET;
+}
+
+fn neural_core(input, perception = nil) {
+    if perception == nil { perception = perceive(input); }
+    let y = nn.predict(_cognitive_net(), _features(input, perception));
+    return map{
+        format: "pbai.neural.brain.v1",
+        portable: "pure pblang nn.sapp MLP",
+        outputs: map{
+            attention: y[0],
+            memory: y[1],
+            planning: y[2],
+            verification: y[3],
+            tool_use: y[4],
+            learning: y[5]
+        },
+        features: _features(input, perception)
+    };
+}
+
+fn new_memory(limit = 8) {
+    return map{
+        format: FORMAT,
+        limit: limit,
+        working: [],
+        episodic: [],
+        long_term: []
+    };
+}
+
+fn _trim_working(memory) {
+    while len(memory.working) > memory.limit {
+        let next = [];
+        let i = 1;
+        while i < len(memory.working) {
+            push(next, memory.working[i]);
+            i = i + 1;
+        }
+        memory.working = next;
+    }
+}
+
+fn remember(memory, kind, text, score = 1) {
+    let event = map{
+        kind: kind,
+        text: str(text),
+        score: score,
+        index: len(memory.episodic)
+    };
+    push(memory.episodic, event);
+    push(memory.working, event);
+    if kind == "decision" or kind == "lesson" or score >= 2 {
+        push(memory.long_term, event);
+    }
+    _trim_working(memory);
+    return memory;
+}
+
+fn attend(memory, perception) {
+    let focus = [];
+    let i = 0;
+    while i < len(memory.working) {
+        let e = memory.working[i];
+        let et = _lower(e.text);
+        let keep = false;
+        for s in perception.signals {
+            if str_contains(et, s) { keep = true; }
+        }
+        if e.kind == "decision" or e.kind == "lesson" or e.score >= 2 { keep = true; }
+        if keep { push(focus, e); }
+        i = i + 1;
+    }
+    if len(focus) == 0 and len(memory.working) > 0 { push(focus, memory.working[len(memory.working) - 1]); }
+    return map{
+        format: FORMAT,
+        mode: if perception.needs_verification { "task-focused" } else { "contextual" },
+        focus: focus,
+        focus_count: len(focus)
+    };
+}
+
+fn goal_state(goal, perception = nil) {
+    if perception == nil { perception = perceive(goal); }
+    let success = "answer is useful and internally consistent";
+    if perception.kind == "code" { success = "code issue is explained or improved and verification path is named"; }
+    else if perception.kind == "failure" { success = "failure is localized, fixed minimally, and test output passes"; }
+    else if perception.kind == "diff" { success = "diff risks are reviewed and a verification plan exists"; }
+    return map{
+        format: FORMAT,
+        goal: str(goal),
+        kind: perception.kind,
+        success: success,
+        priority: if perception.needs_verification { 2 } else { 1 }
+    };
+}
+
+fn plan(goal, perception = nil) {
+    if perception == nil { perception = perceive(goal); }
+    let neural = neural_core(goal, perception);
+    let steps = [];
+    push(steps, map{ action: "perceive", target: perception.kind, done: true });
+    push(steps, map{ action: "retrieve", target: "working memory + pblang docs", done: false });
+
+    if perception.kind == "failure" {
+        push(steps, map{ action: "localize", target: "error text and nearby code", done: false });
+        push(steps, map{ action: "propose_fix", target: "smallest behavioral change", done: false });
+    } else if perception.kind == "code" or perception.kind == "diff" {
+        push(steps, map{ action: "analyze", target: "structure, risks, pblang gotchas", done: false });
+        push(steps, map{ action: "improve", target: "quality and capability boundaries", done: false });
+    } else {
+        push(steps, map{ action: "answer", target: "grounded pblang knowledge", done: false });
+    }
+
+    if perception.needs_verification {
+        push(steps, map{ action: "verify", target: "lint/run/tests or deterministic checks", done: false });
+    } else if neural.outputs.verification > 0.65 {
+        push(steps, map{ action: "verify", target: "neural core requested verification", done: false });
+    } else {
+        push(steps, map{ action: "self_check", target: "critique answer before returning", done: false });
+    }
+
+    return map{
+        format: FORMAT,
+        goal: str(goal),
+        steps: steps,
+        data_modalities: perception.modalities,
+        tool_ready: contains(perception.signals, "tool") or perception.needs_verification,
+        confidence: perception.confidence_hint,
+        neural: neural
+    };
+}
+
+fn reflect(plan_map, critique_map, verification = nil) {
+    let lessons = [];
+    if plan_map.tool_ready { push(lessons, "tool-ready work needs verification before completion"); }
+    if len(critique_map.risks) > 0 { push(lessons, "risks were identified before answering"); }
+    if verification != nil {
+        if verification.passed { push(lessons, "verification passed; preserve the tested path"); }
+        else { push(lessons, "verification did not pass; revise plan or gather more evidence"); }
+    }
+    if len(lessons) == 0 { push(lessons, "no new lesson"); }
+    return map{
+        format: FORMAT,
+        lessons: lessons,
+        confidence_delta: if verification != nil and verification.passed { 0.12 } else { 0 - 0.04 }
+    };
+}
+
+fn consolidate(memory) {
+    let i = 0;
+    while i < len(memory.episodic) {
+        let e = memory.episodic[i];
+        if (e.kind == "lesson" or e.kind == "decision" or e.score >= 2) and not contains(memory.long_term, e) {
+            push(memory.long_term, e);
+        }
+        i = i + 1;
+    }
+    return map{
+        format: FORMAT,
+        working: len(memory.working),
+        episodic: len(memory.episodic),
+        long_term: len(memory.long_term)
+    };
+}
+
+fn _agent(level, name, role, task) {
+    return map{
+        format: FORMAT,
+        level: level,
+        name: name,
+        role: role,
+        task: task
+    };
+}
+
+fn agent_hierarchy(goal) {
+    let p = perceive(goal);
+    let sub_agents = [
+        _agent("sub-agent", "Planner", "turn a goal into steps", "plan: " + str(goal)),
+        _agent("sub-agent", "Reviewer", "find risks and pblang gotchas", "review current work"),
+        _agent("sub-agent", "Learner", "store and retrieve local lessons", "use live corpus and memory"),
+        _agent("sub-agent", "Tool Runner", "prepare verification and tool calls", PBAI_TOOLS.short_summary())
+    ];
+    if contains(p.modalities, "data") or contains(p.modalities, "json") or contains(p.modalities, "csv") or contains(p.modalities, "image") {
+        push(sub_agents, _agent("sub-agent", "Data Reader", "classify and route mixed data", "inspect modalities"));
+    }
+    let atomic_agents = [
+        _agent("atomic-agent", "Perceiver", "detect kind, signals, and modalities", "perceive input"),
+        _agent("atomic-agent", "Attention", "select relevant working memory", "focus context"),
+        _agent("atomic-agent", "Retriever", "recall long-term lessons and docs", "retrieve facts"),
+        _agent("atomic-agent", "Verifier", "parse pass/fail/error output", "verify result"),
+        _agent("atomic-agent", "Reflector", "turn results into lessons", "reflect and consolidate")
+    ];
+    let sub_atomic_agents = [
+        _agent("sub-atomic-agent", "Token", "character/token evidence", "tokenize text"),
+        _agent("sub-atomic-agent", "Signal", "small boolean/score features", "score prompt features"),
+        _agent("sub-atomic-agent", "Gradient", "tiny learning update", "reduce loss during training"),
+        _agent("sub-atomic-agent", "Capability Gate", "small trust decision", "allow or deny risky action")
+    ];
+    return map{
+        format: "pbai.agent.hierarchy.v1",
+        goal: str(goal),
+        root: _agent("root", "pbAI", "orchestrate model, memory, tools, and verification", str(goal)),
+        sub_agents: sub_agents,
+        atomic_agents: atomic_agents,
+        sub_atomic_agents: sub_atomic_agents,
+        routing: p.modalities
+    };
+}
+
+fn critique(plan_map) {
+    let risks = [];
+    if plan_map.tool_ready { push(risks, "tool output can be stale or unavailable; verify before acting"); }
+    if len(plan_map.steps) < 4 { push(risks, "plan is shallow; add an explicit verification step"); }
+    if str_contains(_lower(plan_map.goal), "security") or str_contains(_lower(plan_map.goal), "exec") {
+        push(risks, "capability-sensitive request; keep sandbox gates explicit");
+    }
+    if len(risks) == 0 { push(risks, "no immediate structural risk detected"); }
+    return map{
+        format: FORMAT,
+        risks: risks,
+        recommendation: if plan_map.tool_ready { "run the verifier step before marking complete" } else { "answer with the grounded knowledge path" }
+    };
+}
+
+fn verify_result(output) {
+    let t = _lower(output);
+    let ok = str_contains(t, "pass") or str_contains(t, "ok") or str_contains(t, "no structural issues");
+    let bad = str_contains(t, "fail") or str_contains(t, "panic") or str_contains(t, "error:");
+    return map{
+        format: FORMAT,
+        passed: ok and not bad,
+        signals: map{ ok: ok, bad: bad },
+        summary: if ok and not bad { "verification signal passed" } else { "verification signal inconclusive or failing" }
+    };
+}
+
+fn run(goal, observed_output = "", max_steps = nil) {
+    if max_steps == nil { max_steps = MAX_LOOP_STEPS; }
+    let p = perceive(goal);
+    let nc = neural_core(goal, p);
+    let gs = goal_state(goal, p);
+    let mem = new_memory();
+    remember(mem, "observation", goal, 1);
+    let vr = if observed_output == "" { nil } else { verify_result(observed_output) };
+
+    // Explicit perception->reflection loop with a hard step cap so it always terminates.
+    // Each step refines attention/plan/critique/reflection and folds new lessons back into
+    // memory. The loop stops early once a step produces no genuinely new lesson (a stable
+    // fixpoint), and stops unconditionally at max_steps with a step_exhausted flag.
+    let at = attend(mem, p);
+    let pl = plan(goal, p);
+    let cr = critique(pl);
+    let rf = reflect(pl, cr, vr);
+    let steps = 0;
+    let step_exhausted = false;
+    let looping = true;
+    while looping {
+        if steps >= max_steps {
+            step_exhausted = true;
+            looping = false;
+        } else {
+            steps = steps + 1;
+            at = attend(mem, p);
+            pl = plan(goal, p);
+            cr = critique(pl);
+            rf = reflect(pl, cr, vr);
+            let new_lesson = false;
+            for lesson in rf.lessons {
+                let known = false;
+                let i = 0;
+                while i < len(mem.long_term) {
+                    if mem.long_term[i].text == str(lesson) { known = true; }
+                    i = i + 1;
+                }
+                if not known {
+                    remember(mem, "lesson", lesson, 2);
+                    new_lesson = true;
+                }
+            }
+            // Fixpoint: nothing new was learned this step, so further iteration is redundant.
+            if not new_lesson { looping = false; }
+        }
+    }
+
+    let cs = consolidate(mem);
+    let ag = agent_hierarchy(goal);
+    return map{
+        format: FORMAT,
+        perception: p,
+        neural: nc,
+        goal_state: gs,
+        attention: at,
+        plan: pl,
+        critique: cr,
+        verification: vr,
+        reflection: rf,
+        memory: cs,
+        agents: ag,
+        steps: steps,
+        max_steps: max_steps,
+        step_exhausted: step_exhausted
+    };
+}
+
+fn describe() {
+    return "pbAI brain loop: " + FORMAT + " portable pblang neural cognitive core + multimodal data perception + attention + goals + sub-agents/atomic-agents/sub-atomic-agents + working/episodic/long-term memory + planning + critique + verification + reflection.";
+}
+
+export perceive, data_modalities, neural_core, new_memory, remember, attend, goal_state, plan, critique, verify_result, reflect, consolidate, agent_hierarchy, run, describe, contains;

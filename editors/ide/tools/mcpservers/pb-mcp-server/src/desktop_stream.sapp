@@ -1,0 +1,91 @@
+// One private PBRemote stream per MCP connection. No remote stream ID/owner.
+let Delta = try import("pbremote:core/frame_delta.sapp") catch map{ decode: fn(raw, frame) { return map{ ok: false }; } };
+fn keys(value, allowed) {
+    if type(value) != "map" { throw "invalid stream arguments"; }
+    for k in map_keys(value) {
+        let found = false;
+        for a in allowed { if k == a { found = true; } }
+        if not found { throw "unexpected stream argument"; }
+    }
+}
+fn integer(n, low, high) {
+    if type(n) != "number" or not (n >= low and n <= high) or n != num_floor(n) { throw "invalid stream integer"; }
+    return n;
+}
+fn new(desktop, service, owner) {
+    let state = map{ id: "", raw: "", digest: "" };
+    fn reset() { state.id = ""; state.raw = ""; state.digest = ""; }
+    fn close() {
+        // Release image references even if backend cleanup fails. Retain only
+        // the private identifier on a thrown error so callers can retry.
+        state.raw = ""; state.digest = "";
+        if state.id != "" {
+            // Existing best-effort close: PBRemote can prune an exhausted
+            // stream before resolving this call. Do not reject that completion.
+            desktop.stream_close(service, map{ stream_id: state.id }, owner);
+        }
+        reset(); return map{ ok: true, state: "closed" };
+    }
+    fn open(args) {
+        keys(args, ["fps", "max_frames"]);
+        let fps = integer(try args.fps catch 2, 1, 10);
+        let frames = integer(try args.max_frames catch 120, 1, 3600);
+        let opened = desktop.stream_open(service, map{ encoding: "png", adaptive: true,
+            fps: fps, max_frames: frames, max_width: 1280, max_height: 720, max_bytes: 98304 }, owner);
+        if not opened.ok { return map{ ok: false }; }
+        reset(); state.id = opened.stream_id;
+        return map{ ok: true, state: "open", fps: opened.fps, max_frames: opened.max_frames,
+            next_frame_in_ms: opened.next_frame_in_ms, expires_at: opened.expires_at,
+            adaptive: true, profile: opened.profile };
+    }
+    fn next(args) {
+        keys(args, []);
+        if state.id == "" { return map{ ok: false }; }
+        let frame = desktop.stream_next(service, map{ stream_id: state.id }, owner);
+        if not frame.ok { close(); return map{ ok: false }; }
+        if frame.state == "wait" {
+            return map{ ok: true, state: "wait", retry_after_ms: frame.retry_after_ms,
+                frame_index: frame.frame_index, expires_at: frame.expires_at };
+        }
+        let metadata = map{ state: frame.state, frame_index: frame.frame_index,
+            remaining_frames: frame.remaining_frames, next_frame_in_ms: frame.next_frame_in_ms,
+            captured_at_ms: frame.captured_at, profile: frame.profile, fps: frame.fps };
+        if frame.state == "unchanged" {
+            if state.raw == "" or state.digest != frame.base_sha256 { throw "stream cache mismatch"; }
+            // An unchanged result is valid only after a validated full frame.
+            if frame.remaining_frames == 0 { close(); }
+            metadata.ok = true; return metadata;
+        }
+        if frame.state == "delta" {
+            let rebuilt = Delta.decode(state.raw, frame);
+            if not rebuilt.ok { throw "invalid desktop delta"; }
+            frame.data_b64 = rebuilt.data_b64;
+        } elif frame.state != "frame" { throw "unsupported stream frame"; }
+        if type(frame.data_b64) != "string" or len(frame.data_b64) > 131072
+            or sha256(frame.data_b64) != frame.sha256 { throw "invalid stream frame identity"; }
+        state.raw = frame.data_b64; state.digest = frame.sha256;
+        if frame.remaining_frames == 0 { close(); }
+        metadata.state = "frame";
+        return map{ ok: true, frame: frame, metadata: metadata };
+    }
+    fn feedback(args) {
+        keys(args, ["decode_ms", "network_ms", "dropped_frames", "queue_depth", "power_save"]);
+        let payload = map{ stream_id: state.id };
+        for key in ["decode_ms", "network_ms", "dropped_frames", "queue_depth"] {
+            let max = 60000;
+            if key == "dropped_frames" { max = 10000; }
+            if key == "queue_depth" { max = 1024; }
+            payload[key] = integer(try args[key] catch 0, 0, max);
+        }
+        payload.power_save = try args.power_save catch false;
+        if type(payload.power_save) != "bool" { throw "invalid stream pressure"; }
+        if state.id == "" { return map{ ok: false }; }
+        let result = desktop.stream_feedback(service, payload, owner);
+        if not result.ok { return map{ ok: false }; }
+        return map{ ok: true, state: "adapted", profile: result.profile, fps: result.fps,
+            interval_ms: result.interval_ms, max_width: result.max_width,
+            max_height: result.max_height, max_bytes: result.max_bytes };
+    }
+    return map{ open: open, next: next, feedback: feedback, close: close, reset: reset };
+}
+export new;

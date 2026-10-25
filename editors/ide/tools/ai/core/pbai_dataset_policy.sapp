@@ -1,0 +1,405 @@
+// stdlib/pbai_dataset_policy.sapp -- fail-closed dataset admission for pbAI.
+//
+// This module is deliberately pure: it does not read files, persist content, or train
+// models. Discovery may describe a source, but training needs explicit provenance,
+// rights, consent, privacy, poisoning, deduplication, and split evidence.
+
+let POLICY_VERSION = "pbai-dataset-policy-2026-08-26";
+let MAX_ID_CHARS = 128;
+let MAX_RECORD_BYTES = 4000000;
+let MAX_RECORD_CHARS = 4000000;
+
+fn _text(value, fallback = "") {
+    if type(value) != "string" { return fallback; }
+    return str_trim(value);
+}
+
+fn _bounded_text(value, maximum_bytes, fallback = "") {
+    if type(value) != "string" or len(value) > maximum_bytes
+        or len(str_to_bytes(value)) > maximum_bytes { return fallback; }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        if c < 32 or (c >= 127 and c <= 159)
+            or c == 1564 or (c >= 8203 and c <= 8207)
+            or (c >= 8234 and c <= 8238) or c == 8288
+            or (c >= 8294 and c <= 8297) or c == 65279 { return fallback; }
+        i = i + 1;
+    }
+    return str_trim(value);
+}
+
+fn _one_of(value, allowed) {
+    let i = 0;
+    while i < len(allowed) {
+        if value == allowed[i] { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _safe_id(value) {
+    let s = _text(value);
+    if s == "" or len(s) > MAX_ID_CHARS { return false; }
+    let i = 0;
+    while i < len(s) {
+        if not ((strcharcodeat(s, i) >= 48 and strcharcodeat(s, i) <= 57)
+            or (strcharcodeat(s, i) >= 65 and strcharcodeat(s, i) <= 90)
+            or (strcharcodeat(s, i) >= 97 and strcharcodeat(s, i) <= 122)
+            or strcharcodeat(s, i) == 45 or strcharcodeat(s, i) == 46
+            or strcharcodeat(s, i) == 58 or strcharcodeat(s, i) == 95) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _sha256_hex(value) {
+    if type(value) != "string" or len(value) != 64 { return false; }
+    let i = 0;
+    while i < 64 {
+        if not ((strcharcodeat(value, i) >= 48 and strcharcodeat(value, i) <= 57)
+            or (strcharcodeat(value, i) >= 97 and strcharcodeat(value, i) <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _bounded_count(value, maximum) {
+    if type(value) != "number" or value < 0 or value > maximum or value != num_floor(value) { return false; }
+    return true;
+}
+
+fn _push_reason(reasons, condition, reason) {
+    if not condition { push(reasons, reason); }
+}
+
+fn _source_shape(spec) {
+    let source_id = _bounded_text(try spec.source_id catch "", 128);
+    let source_kind = _bounded_text(try spec.source_kind catch "unknown", 32, "unknown");
+    let discovery_mode = _bounded_text(try spec.discovery_mode catch "metadata-only", 32, "metadata-only");
+    let owner_scope = _bounded_text(try spec.owner_scope catch "unknown", 32, "unknown");
+    let consent_status = _bounded_text(try spec.consent_status catch "unknown", 32, "unknown");
+    let consent_scope = _bounded_text(try spec.consent_scope catch "none", 32, "none");
+    let rights_status = _bounded_text(try spec.rights_status catch "unknown", 32, "unknown");
+    let license_id = _bounded_text(try spec.license_id catch "", 128);
+    let grant = _bounded_text(try spec.acquisition_grant_id catch "", 128);
+    let trust_tier = _bounded_text(try spec.trust_tier catch "unknown", 32, "unknown");
+    let locator = _bounded_text(try spec.locator catch "", 4096);
+    let collected_at = _bounded_text(try spec.collected_at catch "", 64);
+    let requested_training = try spec.training_allowed catch (try spec.training_requested catch false);
+    let requested_retrieval = try spec.retrieval_allowed catch (try spec.retrieval_requested catch false);
+    let retrieval_grant = _bounded_text(try spec.retrieval_use_grant_id catch "", 128);
+    let retrieval_scope = _bounded_text(try spec.retrieval_use_scope catch "none", 32, "none");
+    let retrieval_audience = _bounded_text(try spec.retrieval_audience catch "", 32);
+    let retrieval_purpose = _bounded_text(try spec.retrieval_purpose catch "", 32);
+    let locator_token = _bounded_text(try spec.locator_token catch "", 64);
+    if locator != "" and source_id != "" {
+        locator_token = sha256("pbai-source-locator-v1\x00" + source_id + "\x00" + locator);
+    }
+    return map{
+        format: "pbai.dataset.source.v1", policy_version: POLICY_VERSION,
+        source_id: source_id, source_kind: source_kind, discovery_mode: discovery_mode,
+        locator_token: locator_token,
+        display_name: if source_id == "" { "unidentified source" } else { source_kind + ":" + str_slice(sha256(source_id), 0, 12) },
+        owner_scope: owner_scope, acquisition_grant_id: grant,
+        consent_status: consent_status, consent_scope: consent_scope,
+        rights_status: rights_status, license_id: license_id,
+        training_requested: requested_training, retrieval_requested: requested_retrieval,
+        retrieval_use_grant_id: retrieval_grant,
+        retrieval_use_scope: retrieval_scope,
+        retrieval_audience: retrieval_audience,
+        retrieval_purpose: retrieval_purpose,
+        trust_tier: trust_tier, collected_at: collected_at
+    };
+}
+
+fn source_admission(spec) {
+    let source = _source_shape(spec);
+    let reasons = [];
+    _push_reason(reasons, _safe_id(source.source_id), "invalid-or-missing-source-id");
+    _push_reason(reasons, _one_of(source.source_kind,
+        ["local-file", "local-folder", "device", "scanned-book", "web", "generated", "curated-dataset"]),
+        "unsupported-source-kind");
+    _push_reason(reasons, _one_of(source.discovery_mode, ["metadata-only", "content-review", "admitted-content"]),
+        "unsupported-discovery-mode");
+    _push_reason(reasons, _sha256_hex(source.locator_token), "missing-or-invalid-locator-token");
+    _push_reason(reasons, _one_of(source.owner_scope, ["self", "household-third-party", "public", "organization"]),
+        "unknown-owner-scope");
+    _push_reason(reasons, _one_of(source.rights_status,
+        ["owned", "licensed", "public-domain", "permission-granted"]), "rights-not-established");
+    _push_reason(reasons, _safe_id(source.acquisition_grant_id), "missing-or-invalid-acquisition-grant");
+    _push_reason(reasons, source.trust_tier == "trusted" or source.trust_tier == "reviewed", "source-not-trusted");
+    _push_reason(reasons, source.collected_at != "" and len(source.collected_at) <= 64, "missing-collected-at");
+    if source.rights_status == "licensed" {
+        _push_reason(reasons, _safe_id(source.license_id), "missing-or-invalid-license-id");
+    }
+    let consent_needed = source.owner_scope == "household-third-party" or source.owner_scope == "organization";
+    if consent_needed {
+        _push_reason(reasons, source.consent_status == "granted", "explicit-consent-required");
+        _push_reason(reasons, source.consent_scope == "training" or source.consent_scope == "both", "training-consent-scope-required");
+    } else {
+        _push_reason(reasons, source.consent_status == "granted" or source.consent_status == "not-required", "consent-status-unresolved");
+    }
+    _push_reason(reasons, source.discovery_mode == "admitted-content", "metadata-or-review-source-cannot-train");
+    _push_reason(reasons, source.training_requested, "training-not-requested");
+    let passed = len(reasons) == 0;
+    source.training_allowed = passed;
+    // Training admission never grants retrieval, even when the same manifest asks
+    // for both. Only retrieval_source_admission() can issue that capability.
+    source.retrieval_allowed = false;
+    return map{
+        format: "pbai.dataset.admission.v1", policy_version: POLICY_VERSION,
+        passed: passed, rights_ok: not str_contains(str(reasons), "rights-"),
+        consent_ok: not str_contains(str(reasons), "consent"),
+        privacy_ok: nil, secrets_ok: nil, poisoning_ok: nil, bounds_ok: nil,
+        dedupe_ok: nil, split_ok: nil, reviewer: "deterministic-policy",
+        reasons: reasons, source: source
+    };
+}
+
+fn retrieval_source_admission(spec) {
+    let source = _source_shape(spec);
+    let reasons = [];
+    _push_reason(reasons, _safe_id(source.source_id), "invalid-or-missing-source-id");
+    _push_reason(reasons, _one_of(source.source_kind,
+        ["local-file", "local-folder", "device", "scanned-book", "web", "generated", "curated-dataset"]),
+        "unsupported-source-kind");
+    _push_reason(reasons, _one_of(source.discovery_mode, ["content-review", "admitted-content"]),
+        "metadata-only-source-cannot-retrieve");
+    _push_reason(reasons, _sha256_hex(source.locator_token), "missing-or-invalid-locator-token");
+    _push_reason(reasons, _one_of(source.owner_scope,
+        ["self", "household-third-party", "public", "organization"]),
+        "unknown-owner-scope");
+    _push_reason(reasons, _one_of(source.rights_status,
+        ["owned", "licensed", "public-domain", "permission-granted"]),
+        "retrieval-rights-not-established");
+    _push_reason(reasons, _safe_id(source.acquisition_grant_id),
+        "missing-or-invalid-acquisition-grant");
+    _push_reason(reasons, source.trust_tier == "trusted" or source.trust_tier == "reviewed",
+        "source-not-trusted");
+    _push_reason(reasons, source.collected_at != "" and len(source.collected_at) <= 64,
+        "missing-collected-at");
+    _push_reason(reasons, type(source.retrieval_requested) == "bool"
+        and source.retrieval_requested, "retrieval-not-explicitly-requested");
+    _push_reason(reasons, _safe_id(source.retrieval_use_grant_id),
+        "missing-or-invalid-retrieval-use-grant");
+    _push_reason(reasons, source.retrieval_use_scope == "retrieval"
+        or source.retrieval_use_scope == "both", "retrieval-use-scope-not-granted");
+    _push_reason(reasons, _one_of(source.retrieval_audience,
+        ["local-private", "household-subject", "organization-internal", "public"]),
+        "invalid-retrieval-audience");
+    _push_reason(reasons, _one_of(source.retrieval_purpose,
+        ["local-assistance", "private-research", "organization-reference", "public-reference"]),
+        "invalid-retrieval-purpose");
+    if source.rights_status == "licensed" {
+        _push_reason(reasons, _safe_id(source.license_id), "missing-or-invalid-license-id");
+    }
+    let consent_needed = source.owner_scope == "household-third-party"
+        or source.owner_scope == "organization";
+    if consent_needed {
+        _push_reason(reasons, source.consent_status == "granted",
+            "explicit-retrieval-consent-required");
+        _push_reason(reasons, source.consent_scope == "retrieval"
+            or source.consent_scope == "both", "retrieval-consent-scope-required");
+    } else {
+        _push_reason(reasons, source.consent_status == "granted"
+            or source.consent_status == "not-required", "consent-status-unresolved");
+    }
+    if source.owner_scope == "self" {
+        _push_reason(reasons, source.retrieval_audience == "local-private",
+            "self-owned-retrieval-must-be-local-private");
+    } elif source.owner_scope == "household-third-party" {
+        _push_reason(reasons, source.retrieval_audience == "household-subject",
+            "household-retrieval-audience-mismatch");
+    } elif source.owner_scope == "organization" {
+        _push_reason(reasons, source.retrieval_audience == "organization-internal",
+            "organization-retrieval-audience-mismatch");
+    } else {
+        _push_reason(reasons, source.retrieval_audience == "public",
+            "public-retrieval-audience-mismatch");
+    }
+    let passed = len(reasons) == 0;
+    source.training_allowed = false;
+    source.retrieval_allowed = passed;
+    return map{
+        format: "pbai.dataset.retrieval-source-admission.v1",
+        policy_version: POLICY_VERSION,
+        passed: passed, reasons: reasons, source: source,
+        authorizes_retrieval: passed, authorizes_training: false,
+        persists: false, content_read: false, training_performed: false
+    };
+}
+
+fn _find_source(admitted_sources, source_id) {
+    let i = 0;
+    while i < len(admitted_sources) {
+        if admitted_sources[i].source.source_id == source_id { return admitted_sources[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _in_list(values, wanted) {
+    let i = 0;
+    while i < len(values) { if values[i] == wanted { return true; } i = i + 1; }
+    return false;
+}
+
+fn _possible_email(text) {
+    let at = str_index_of(text, "@");
+    if at < 1 or at + 3 >= len(text) { return false; }
+    return str_contains(str_slice(text, at + 1, len(text)), ".");
+}
+
+fn _long_digit_run(text, minimum) {
+    let run = 0;
+    let i = 0;
+    while i < len(text) {
+        let c = strcharcodeat(text, i);
+        if c >= 48 and c <= 57 { run = run + 1; } else { run = 0; }
+        if run >= minimum { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn scan_text(text) {
+    if type(text) != "string" or len(text) > MAX_RECORD_CHARS {
+        return map{ format: "pbai.dataset.content-scan.v1", passed: false,
+            secret_scan: "failed", pii_scan: "failed", poisoning_scan: "failed",
+            reasons: ["invalid-or-oversized-text"] };
+    }
+    let lower = str_lower(text);
+    let reasons = [];
+    let secret = str_contains(lower, "authorization: bearer ")
+        or str_contains(lower, "-----begin private key")
+        or str_contains(lower, "api_key=") or str_contains(lower, "password=")
+        or str_contains(lower, "ghp_") or str_contains(lower, "xoxb-");
+    let possible_email = _possible_email(lower);
+    let long_digit_run = _long_digit_run(lower, 10);
+    let named_pii = str_contains(lower, "social security number")
+        or str_contains(lower, "passport number") or str_contains(lower, "credit card number")
+        or str_contains(lower, "phone number:") or str_contains(lower, "home address:");
+    let pii = possible_email or long_digit_run or named_pii;
+    let poison = str_contains(lower, "ignore all previous instructions")
+        or str_contains(lower, "ignore previous instructions")
+        or str_contains(lower, "reveal the system prompt")
+        or str_contains(lower, "<|system|>") or str_contains(lower, "<|assistant|>")
+        or str_contains(lower, "execute this command without asking");
+    if secret { push(reasons, "secret-pattern-detected"); }
+    if possible_email { push(reasons, "possible-email-pattern-detected"); }
+    if long_digit_run { push(reasons, "long-digit-run-detected"); }
+    if named_pii { push(reasons, "named-pii-pattern-detected"); }
+    if poison { push(reasons, "instruction-poisoning-pattern-detected"); }
+    return map{
+        format: "pbai.dataset.content-scan.v1", passed: len(reasons) == 0,
+        secret_scan: if secret { "failed" } else { "passed" },
+        pii_scan: if pii { "failed" } else { "passed" },
+        poisoning_scan: if poison { "failed" } else { "passed" },
+        reasons: reasons
+    };
+}
+
+fn _record_admission(spec, source_result, sealed_hashes, prior_records) {
+    let reasons = [];
+    let record_id = _text(try spec.record_id catch "");
+    let source_id = _text(try spec.source_id catch "");
+    let raw_hash = _text(try spec.raw_sha256 catch "");
+    let normalized_hash = _text(try spec.normalized_sha256 catch "");
+    let cluster = _text(try spec.dedupe_cluster catch "");
+    let split = _text(try spec.split catch "");
+    let media_type = _text(try spec.media_type catch "");
+    let bytes = try spec.bytes catch -1;
+    let chars = try spec.chars catch -1;
+    let secret_scan = _text(try spec.secret_scan catch "missing");
+    let pii_scan = _text(try spec.pii_scan catch "missing");
+    let poisoning_scan = _text(try spec.poisoning_scan catch "missing");
+    let quality_status = _text(try spec.quality_status catch "missing");
+    let eval_overlap = try spec.eval_overlap catch true;
+    _push_reason(reasons, _safe_id(record_id), "invalid-or-missing-record-id");
+    _push_reason(reasons, source_result != nil and source_result.passed, "source-not-admitted");
+    _push_reason(reasons, source_result != nil and source_result.source.source_id == source_id, "source-id-mismatch");
+    _push_reason(reasons, _sha256_hex(raw_hash), "invalid-raw-sha256");
+    _push_reason(reasons, _sha256_hex(normalized_hash), "invalid-normalized-sha256");
+    _push_reason(reasons, _safe_id(cluster), "invalid-or-missing-dedupe-cluster");
+    _push_reason(reasons, _one_of(split, ["train", "validation", "test"]), "invalid-or-sealed-split");
+    _push_reason(reasons, media_type != "" and len(media_type) <= 128, "invalid-media-type");
+    _push_reason(reasons, _bounded_count(bytes, MAX_RECORD_BYTES) and _bounded_count(chars, MAX_RECORD_CHARS), "record-bounds-failed");
+    _push_reason(reasons, secret_scan == "passed", "secret-scan-not-passed");
+    _push_reason(reasons, pii_scan == "passed", "pii-scan-not-passed");
+    _push_reason(reasons, poisoning_scan == "passed", "poisoning-scan-not-passed");
+    _push_reason(reasons, quality_status == "passed", "quality-gate-not-passed");
+    _push_reason(reasons, not eval_overlap, "declared-eval-overlap");
+    _push_reason(reasons, not _in_list(sealed_hashes, normalized_hash), "sealed-eval-overlap");
+    let duplicate = false;
+    let split_leak = false;
+    let i = 0;
+    while i < len(prior_records) {
+        if prior_records[i].normalized_sha256 == normalized_hash { duplicate = true; }
+        if prior_records[i].dedupe_cluster == cluster and prior_records[i].split != split { split_leak = true; }
+        i = i + 1;
+    }
+    _push_reason(reasons, not duplicate, "duplicate-normalized-content");
+    _push_reason(reasons, not split_leak, "dedupe-cluster-crosses-splits");
+    let passed = len(reasons) == 0;
+    return map{
+        format: "pbai.dataset.record.v1", policy_version: POLICY_VERSION,
+        record_id: record_id, source_id: source_id,
+        raw_sha256: raw_hash, normalized_sha256: normalized_hash,
+        extractor: _text(try spec.extractor catch ""),
+        transform_chain: try spec.transform_chain catch [],
+        media_type: media_type, bytes: bytes, chars: chars,
+        secret_scan: secret_scan, pii_scan: pii_scan, poisoning_scan: poisoning_scan,
+        dedupe_cluster: cluster, split: split, eval_overlap: eval_overlap,
+        quality_status: quality_status, admitted: passed, reasons: reasons
+    };
+}
+
+fn dataset_admission(sources, records, options = nil) {
+    if type(sources) != "array" { sources = []; }
+    if type(records) != "array" { records = []; }
+    if options == nil or type(options) != "map" { options = map{}; }
+    let sealed = try options.sealed_eval_hashes catch [];
+    if type(sealed) != "array" { sealed = []; }
+    let source_results = [];
+    let i = 0;
+    while i < len(sources) { push(source_results, source_admission(sources[i])); i = i + 1; }
+    let record_results = [];
+    let admitted_records = [];
+    i = 0;
+    while i < len(records) {
+        let source_id = _text(try records[i].source_id catch "");
+        let result = _record_admission(records[i], _find_source(source_results, source_id), sealed, admitted_records);
+        push(record_results, result);
+        if result.admitted { push(admitted_records, result); }
+        i = i + 1;
+    }
+    let passed_sources = 0;
+    i = 0; while i < len(source_results) { if source_results[i].passed { passed_sources = passed_sources + 1; } i = i + 1; }
+    return map{
+        format: "pbai.dataset.batch-admission.v1", policy_version: POLICY_VERSION,
+        passed: passed_sources == len(source_results) and len(source_results) > 0
+            and len(admitted_records) == len(records) and len(records) > 0,
+        sources: source_results, records: record_results,
+        admitted_sources: passed_sources, admitted_records: len(admitted_records),
+        rejected_sources: len(source_results) - passed_sources,
+        rejected_records: len(record_results) - len(admitted_records),
+        content_read: false, training_performed: false
+    };
+}
+
+fn policy_status() {
+    return map{
+        format: "pbai.dataset.policy-status.v1", policy_version: POLICY_VERSION,
+        mode: "fail-closed-provenance-consent-rights-privacy-dedupe-split",
+        discovery_reads_content: false, unknown_rights_trainable: false,
+        third_party_requires_explicit_consent: true,
+        sealed_evaluation_excluded: true, raw_locators_persisted: false,
+        retrieval_admission_separate: true,
+        retrieval_never_authorizes_training: true,
+        retrieval_audience_and_purpose_bound: true
+    };
+}
+
+export POLICY_VERSION, source_admission, retrieval_source_admission,
+       dataset_admission, scan_text, policy_status;

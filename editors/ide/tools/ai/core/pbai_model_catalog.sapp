@@ -1,0 +1,690 @@
+// pbai_model_catalog.sapp -- bounded metadata catalog for specialist model families.
+//
+// This module never loads weights, trains, evaluates, promotes, activates, persists,
+// or authorizes a model. Every descriptor is registered-disabled and carries no
+// artifact locator, granted capability, tool, callback, command, or readiness flag.
+
+let BOUNDED = import("stdlib:validate.sapp");
+let SEMVER = import("stdlib:semver.sapp");
+let RULER = (try import("pbai_ruler.sapp") catch import("editors/ide/tools/ai/core/pbai_ruler.sapp"));
+
+let CATALOG_FORMAT = "pbai.model.catalog.v1";
+let MODEL_FORMAT = "pbai.model.descriptor.v1";
+let REQUEST_FORMAT = "pbai.model.registration-request.v1";
+let PLAN_FORMAT = "pbai.model.coverage-plan.v1";
+let TRAINING_TEAM_FORMAT = "pbai.model.training-team.v1";
+let SCHEMA_VERSION = "1.0.0";
+let MAX_MODELS = 256;
+let MAX_ID_CHARS = 128;
+let MAX_TOKEN_CHARS = 64;
+let MAX_FALLBACK_DEPTH = 8;
+let MAX_CLAIMS_PER_MODEL = 256;
+let MAX_CATALOG_CLAIMS = 4096;
+
+let CATALOG_BOUNDS = map{
+    max_depth: 8, max_nodes: 65536, max_map_entries: 32, max_array_items: MAX_MODELS,
+    max_string_chars: 256, max_string_bytes: 256, max_total_string_bytes: 2097152,
+    max_key_chars: 64, max_key_bytes: 64
+};
+let REQUEST_BOUNDS = map{
+    max_depth: 5, max_nodes: 1024, max_map_entries: 24, max_array_items: 64,
+    max_string_chars: 256, max_string_bytes: 256, max_total_string_bytes: 65536,
+    max_key_chars: 64, max_key_bytes: 64
+};
+
+fn _in(items, value) {
+    if type(items) != "array" { return false; }
+    let i = 0;
+    while i < len(items) { if items[i] == value { return true; } i = i + 1; }
+    return false;
+}
+
+fn _exact_keys(value, allowed) {
+    if type(value) != "map" { return false; }
+    let keys = map_keys(value);
+    if len(keys) != len(allowed) { return false; }
+    let i = 0;
+    while i < len(keys) {
+        if not _in(allowed, keys[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _safe_token(value, maximum = nil) {
+    if maximum == nil { maximum = MAX_TOKEN_CHARS; }
+    if type(value) != "string" or value == "" or len(value) > maximum
+        or len(str_to_bytes(value)) > maximum or str_trim(value) != value
+        or str_contains(value, "..") { return false; }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        let ok = (c >= 48 and c <= 57) or (c >= 65 and c <= 90)
+            or (c >= 97 and c <= 122) or c == 45 or c == 46 or c == 58 or c == 95;
+        if not ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _canonical_semver(value) {
+    if type(value) != "string" or len(value) > 64 { return false; }
+    let parsed = SEMVER.parse_strict(value);
+    return parsed != nil and SEMVER.format(parsed) == value;
+}
+
+fn _hex_or_empty(value) {
+    if value == "" { return true; }
+    if type(value) != "string" or len(value) != 64 { return false; }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        if not ((c >= 48 and c <= 57) or (c >= 97 and c <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+
+fn _unique_tokens(values, maximum_items, maximum_chars = nil) {
+    if maximum_chars == nil { maximum_chars = MAX_TOKEN_CHARS; }
+    if type(values) != "array" or len(values) < 1 or len(values) > maximum_items { return false; }
+    let seen = map{};
+    let i = 0;
+    while i < len(values) {
+        if not _safe_token(values[i], maximum_chars) or map_has(seen, values[i]) { return false; }
+        seen[values[i]] = true;
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _unique_optional_tokens(values, maximum_items, maximum_chars = nil) {
+    if maximum_chars == nil { maximum_chars = MAX_TOKEN_CHARS; }
+    if type(values) != "array" or len(values) > maximum_items { return false; }
+    if len(values) == 0 { return true; }
+    return _unique_tokens(values, maximum_items, maximum_chars);
+}
+
+fn _kind(value) {
+    return _in(["inference", "curator", "trainer", "evaluator", "verifier", "governance"], value);
+}
+
+fn _owner_valid(kind, role) {
+    if kind == "inference" {
+        return _in(["orchestrator", "planner", "producer", "searcher", "identifier",
+            "error-corrector", "translator"], role);
+    }
+    if kind == "curator" { return role == "memory-curator"; }
+    if kind == "trainer" { return role == "trainer"; }
+    if kind == "evaluator" or kind == "verifier" { return role == "verifier"; }
+    if kind == "governance" { return role == "pbruler"; }
+    return false;
+}
+
+fn _requested_caps_valid(kind, capabilities) {
+    if not _unique_optional_tokens(capabilities, 16) { return false; }
+    let i = 0;
+    while i < len(capabilities) {
+        if not _in(RULER.capabilities(), capabilities[i]) { return false; }
+        if kind == "inference" and not _in(["ai:infer", "ai:memory:read"], capabilities[i]) { return false; }
+        if kind == "curator" and not _in(["ai:infer", "ai:memory:read"], capabilities[i]) { return false; }
+        if kind == "trainer" and capabilities[i] != "ai:learn" { return false; }
+        if (kind == "evaluator" or kind == "verifier" or kind == "governance")
+            and capabilities[i] != "ai:infer" { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _limits_valid(value) {
+    if not _exact_keys(value, ["context_tokens", "input_bytes", "output_bytes",
+        "memory_bytes", "time_ms", "compute_units"]) { return false; }
+    return _integer(value.context_tokens, 0, 1048576)
+        and _integer(value.input_bytes, 0, 16777216)
+        and _integer(value.output_bytes, 0, 16777216)
+        and _integer(value.memory_bytes, 0, 68719476736)
+        and _integer(value.time_ms, 0, 86400000)
+        and _integer(value.compute_units, 0, 1000000);
+}
+
+fn _default_limits() {
+    return map{ context_tokens: 8192, input_bytes: 1048576, output_bytes: 262144,
+        memory_bytes: 1073741824, time_ms: 60000, compute_units: 10000 };
+}
+
+fn _artifact(version) {
+    return map{
+        artifact_id: "", model_version: version, sha256: "", size_bytes: 0,
+        container_format: "", weight_format: "", architecture: "", runtime_abi: "",
+        tokenizer_digest: "", config_digest: "", code_digest: "", base_model_digest: "",
+        dataset_lineage_digest: "", sbom_digest: "", model_card_digest: "",
+        license_digest: "", publisher_key_id: "", attestation_refs: []
+    };
+}
+
+fn _artifact_valid(value, version) {
+    if not _exact_keys(value, ["artifact_id", "model_version", "sha256", "size_bytes",
+        "container_format", "weight_format", "architecture", "runtime_abi",
+        "tokenizer_digest", "config_digest", "code_digest", "base_model_digest",
+        "dataset_lineage_digest", "sbom_digest", "model_card_digest", "license_digest",
+        "publisher_key_id", "attestation_refs"]) { return false; }
+    if value.model_version != version or not _integer(value.size_bytes, 0, 1099511627776)
+        or not _unique_optional_tokens(value.attestation_refs, 16, MAX_ID_CHARS) { return false; }
+    for digest in [value.sha256, value.tokenizer_digest, value.config_digest,
+        value.code_digest, value.base_model_digest, value.dataset_lineage_digest,
+        value.sbom_digest, value.model_card_digest, value.license_digest] {
+        if not _hex_or_empty(digest) { return false; }
+    }
+    // This slice accepts metadata-only entries, never caller artifact/readiness claims.
+    return value.artifact_id == "" and value.sha256 == "" and value.size_bytes == 0
+        and value.container_format == "" and value.weight_format == ""
+        and value.architecture == "" and value.runtime_abi == ""
+        and value.tokenizer_digest == "" and value.config_digest == ""
+        and value.code_digest == "" and value.base_model_digest == ""
+        and value.dataset_lineage_digest == "" and value.sbom_digest == ""
+        and value.model_card_digest == "" and value.license_digest == ""
+        and value.publisher_key_id == "" and len(value.attestation_refs) == 0;
+}
+
+fn _sorted_copy(values) {
+    let copy = [];
+    for value in values { push(copy, value); }
+    return array_sort(copy);
+}
+
+fn _canonical_artifact(value) {
+    return map{
+        artifact_id: value.artifact_id, model_version: value.model_version,
+        sha256: value.sha256, size_bytes: value.size_bytes,
+        container_format: value.container_format, weight_format: value.weight_format,
+        architecture: value.architecture, runtime_abi: value.runtime_abi,
+        tokenizer_digest: value.tokenizer_digest, config_digest: value.config_digest,
+        code_digest: value.code_digest, base_model_digest: value.base_model_digest,
+        dataset_lineage_digest: value.dataset_lineage_digest, sbom_digest: value.sbom_digest,
+        model_card_digest: value.model_card_digest, license_digest: value.license_digest,
+        publisher_key_id: value.publisher_key_id,
+        attestation_refs: _sorted_copy(value.attestation_refs)
+    };
+}
+
+fn _canonical_limits(value) {
+    return map{ context_tokens: value.context_tokens, input_bytes: value.input_bytes,
+        output_bytes: value.output_bytes, memory_bytes: value.memory_bytes,
+        time_ms: value.time_ms, compute_units: value.compute_units };
+}
+
+fn _payload(model) {
+    return map{
+        format: MODEL_FORMAT, schema_version: SCHEMA_VERSION,
+        model_id: model.model_id, model_version: model.model_version,
+        kind: model.kind, owner_role: model.owner_role,
+        domains: _sorted_copy(model.domains), tasks: _sorted_copy(model.tasks),
+        input_contracts: _sorted_copy(model.input_contracts),
+        output_contracts: _sorted_copy(model.output_contracts),
+        artifact: _canonical_artifact(model.artifact), lifecycle_state: model.lifecycle_state,
+        requested_capabilities: _sorted_copy(model.requested_capabilities),
+        granted_capabilities: _sorted_copy(model.granted_capabilities),
+        tool_allowlist: _sorted_copy(model.tool_allowlist),
+        sandbox_profile_id: model.sandbox_profile_id,
+        sandbox_profile_digest: model.sandbox_profile_digest,
+        resource_limits: _canonical_limits(model.resource_limits),
+        coverage: _sorted_copy(model.coverage),
+        fallback_model_ids: _sorted_copy(model.fallback_model_ids),
+        protected: model.protected, dynamically_registered: model.dynamically_registered,
+        active: model.active, authorizes_action: model.authorizes_action
+    };
+}
+
+fn _descriptor(id, kind, role, domains, tasks, requested, protected = false,
+    dynamic = false, fallbacks = nil) {
+    if fallbacks == nil { fallbacks = []; }
+    let model = map{
+        model_id: id, model_version: "0.1.0", kind: kind, owner_role: role,
+        domains: domains, tasks: tasks,
+        input_contracts: ["pbai.model.input.v1"],
+        output_contracts: ["pbai.model.output.v1"],
+        artifact: _artifact("0.1.0"), lifecycle_state: "registered-disabled",
+        requested_capabilities: requested, granted_capabilities: [], tool_allowlist: [],
+        sandbox_profile_id: "metadata-only", sandbox_profile_digest: "",
+        resource_limits: _default_limits(), coverage: ["metadata-only"],
+        fallback_model_ids: fallbacks, protected: protected,
+        dynamically_registered: dynamic, active: false, authorizes_action: false
+    };
+    let out = _payload(model);
+    out.descriptor_digest = sha256(json_stringify(out));
+    return out;
+}
+
+fn _base_models() {
+    return [
+        _descriptor("router-model", "inference", "orchestrator", ["universal"], ["route"], ["ai:infer"], true),
+        _descriptor("orchestrator-model", "inference", "orchestrator", ["universal"], ["coordinate"], ["ai:infer"], true),
+        _descriptor("planner-model", "inference", "planner", ["universal"], ["plan"], ["ai:infer"]),
+        _descriptor("general-language-model", "inference", "producer", ["language"], ["generate"], ["ai:infer"]),
+        _descriptor("pblang-code-model", "inference", "producer", ["pblang"], ["code"], ["ai:infer"]),
+        _descriptor("software-model", "inference", "producer", ["software"], ["code"], ["ai:infer"]),
+        _descriptor("mathematics-model", "inference", "producer", ["mathematics"], ["reason"], ["ai:infer"]),
+        _descriptor("science-model", "inference", "producer", ["science"], ["reason"], ["ai:infer"]),
+        _descriptor("translation-model", "inference", "translator", ["language"], ["translate"], ["ai:infer"]),
+        _descriptor("retrieval-model", "inference", "searcher", ["knowledge"], ["retrieve"], ["ai:infer", "ai:memory:read"]),
+        _descriptor("identifier-model", "inference", "identifier", ["universal"], ["identify"], ["ai:infer"]),
+        _descriptor("error-correction-model", "inference", "error-corrector", ["universal"], ["correct"], ["ai:infer"]),
+        _descriptor("vision-model", "inference", "producer", ["vision"], ["understand"], ["ai:infer"]),
+        _descriptor("audio-model", "inference", "producer", ["audio"], ["understand"], ["ai:infer"]),
+        _descriptor("video-model", "inference", "producer", ["video"], ["understand"], ["ai:infer"]),
+        _descriptor("document-model", "inference", "producer", ["documents"], ["understand"], ["ai:infer"]),
+        _descriptor("data-model", "inference", "producer", ["data"], ["analyze"], ["ai:infer"]),
+        _descriptor("security-review-model", "verifier", "verifier", ["security"], ["review"], ["ai:infer"], true),
+        _descriptor("source-curator-model", "curator", "memory-curator", ["training"], ["source-curation"], ["ai:infer", "ai:memory:read"], true),
+        _descriptor("dataset-curator-model", "curator", "memory-curator", ["training"], ["dataset-curation"], ["ai:infer", "ai:memory:read"], true),
+        _descriptor("tokenizer-trainer-model", "trainer", "trainer", ["training"], ["tokenizer-training"], ["ai:learn"], true),
+        _descriptor("pretrainer-model", "trainer", "trainer", ["training"], ["pretraining"], ["ai:learn"], true),
+        _descriptor("finetuner-model", "trainer", "trainer", ["training"], ["fine-tuning"], ["ai:learn"], true),
+        _descriptor("adapter-trainer-model", "trainer", "trainer", ["training"], ["adapter-training"], ["ai:learn"], true),
+        _descriptor("distillation-trainer-model", "trainer", "trainer", ["training"], ["distillation"], ["ai:learn"], true),
+        _descriptor("quantization-calibrator-model", "trainer", "trainer", ["training"], ["quantization-calibration"], ["ai:learn"], true),
+        _descriptor("quality-evaluator-model", "evaluator", "verifier", ["training"], ["quality-evaluation"], ["ai:infer"], true),
+        _descriptor("benchmark-evaluator-model", "evaluator", "verifier", ["training"], ["benchmark-evaluation"], ["ai:infer"], true),
+        _descriptor("regression-evaluator-model", "evaluator", "verifier", ["training"], ["regression-evaluation"], ["ai:infer"], true),
+        _descriptor("privacy-verifier-model", "verifier", "verifier", ["training"], ["privacy-verification"], ["ai:infer"], true),
+        _descriptor("provenance-verifier-model", "verifier", "verifier", ["training"], ["provenance-verification"], ["ai:infer"], true),
+        _descriptor("reproducibility-verifier-model", "verifier", "verifier", ["training"], ["reproducibility-verification"], ["ai:infer"], true),
+        _descriptor("promotion-advisor-model", "governance", "pbruler", ["training"], ["promotion-advice"], ["ai:infer"], true),
+        _descriptor("test-planner-model", "evaluator", "verifier", ["testing"], ["test-planning"], ["ai:infer"], true),
+        _descriptor("unit-test-evaluator-model", "evaluator", "verifier", ["testing"], ["unit-testing"], ["ai:infer"], true),
+        _descriptor("integration-test-evaluator-model", "evaluator", "verifier", ["testing"], ["integration-testing"], ["ai:infer"], true),
+        _descriptor("end-to-end-test-evaluator-model", "evaluator", "verifier", ["testing"], ["end-to-end-testing"], ["ai:infer"], true),
+        _descriptor("adversarial-test-evaluator-model", "evaluator", "verifier", ["testing"], ["adversarial-testing"], ["ai:infer"], true),
+        _descriptor("fuzz-test-verifier-model", "verifier", "verifier", ["security"], ["fuzz-testing"], ["ai:infer"], true),
+        _descriptor("accuracy-benchmark-model", "evaluator", "verifier", ["benchmarking"], ["accuracy-benchmark"], ["ai:infer"], true),
+        _descriptor("calibration-benchmark-model", "evaluator", "verifier", ["benchmarking"], ["calibration-benchmark"], ["ai:infer"], true),
+        _descriptor("latency-benchmark-model", "evaluator", "verifier", ["benchmarking"], ["latency-benchmark"], ["ai:infer"], true),
+        _descriptor("throughput-benchmark-model", "evaluator", "verifier", ["benchmarking"], ["throughput-benchmark"], ["ai:infer"], true),
+        _descriptor("memory-benchmark-model", "evaluator", "verifier", ["benchmarking"], ["memory-benchmark"], ["ai:infer"], true),
+        _descriptor("storage-benchmark-model", "evaluator", "verifier", ["benchmarking"], ["storage-benchmark"], ["ai:infer"], true),
+        _descriptor("energy-benchmark-model", "evaluator", "verifier", ["benchmarking"], ["energy-benchmark"], ["ai:infer"], true),
+        _descriptor("cpu-benchmark-model", "evaluator", "verifier", ["benchmarking"], ["cpu-benchmark"], ["ai:infer"], true),
+        _descriptor("gpu-benchmark-model", "evaluator", "verifier", ["benchmarking"], ["gpu-benchmark"], ["ai:infer"], true),
+        _descriptor("npu-benchmark-model", "evaluator", "verifier", ["benchmarking"], ["npu-benchmark"], ["ai:infer"], true),
+        _descriptor("sandbox-policy-verifier-model", "verifier", "verifier", ["sandboxing"], ["policy-verification"], ["ai:infer"], true),
+        _descriptor("process-isolation-verifier-model", "verifier", "verifier", ["sandboxing"], ["process-isolation"], ["ai:infer"], true),
+        _descriptor("filesystem-isolation-verifier-model", "verifier", "verifier", ["sandboxing"], ["filesystem-isolation"], ["ai:infer"], true),
+        _descriptor("network-isolation-verifier-model", "verifier", "verifier", ["sandboxing"], ["network-isolation"], ["ai:infer"], true),
+        _descriptor("syscall-isolation-verifier-model", "verifier", "verifier", ["sandboxing"], ["syscall-isolation"], ["ai:infer"], true),
+        _descriptor("memory-isolation-verifier-model", "verifier", "verifier", ["sandboxing"], ["memory-isolation"], ["ai:infer"], true),
+        _descriptor("timeout-containment-verifier-model", "verifier", "verifier", ["sandboxing"], ["timeout-containment"], ["ai:infer"], true),
+        _descriptor("crash-containment-verifier-model", "verifier", "verifier", ["sandboxing"], ["crash-containment"], ["ai:infer"], true),
+        _descriptor("quarantine-recovery-verifier-model", "verifier", "verifier", ["sandboxing"], ["quarantine-recovery"], ["ai:infer"], true)
+    ];
+}
+
+fn base_catalog() {
+    return map{
+        format: CATALOG_FORMAT, schema_version: SCHEMA_VERSION, revision: 1,
+        max_models: MAX_MODELS, models: _base_models(), metadata_only: true,
+        activates_models: false, authorizes_action: false, promotion_available: false,
+        hidden_evaluation_enforced: false
+    };
+}
+
+fn _descriptor_valid(model) {
+    let keys = ["format", "schema_version", "model_id", "model_version", "kind",
+        "owner_role", "domains", "tasks", "input_contracts", "output_contracts",
+        "artifact", "lifecycle_state", "requested_capabilities", "granted_capabilities",
+        "tool_allowlist", "sandbox_profile_id", "sandbox_profile_digest",
+        "resource_limits", "coverage", "fallback_model_ids", "protected",
+        "dynamically_registered", "active", "authorizes_action", "descriptor_digest"];
+    if not _exact_keys(model, keys) or model.format != MODEL_FORMAT
+        or model.schema_version != SCHEMA_VERSION or not _safe_token(model.model_id, MAX_ID_CHARS)
+        or not _canonical_semver(model.model_version) or not _kind(model.kind)
+        or not _safe_token(model.owner_role, MAX_ID_CHARS)
+        or not _owner_valid(model.kind, model.owner_role)
+        or not _unique_tokens(model.domains, 64) or not _unique_tokens(model.tasks, 64)
+        or not _unique_tokens(model.input_contracts, 32) or not _unique_tokens(model.output_contracts, 32)
+        or not _artifact_valid(model.artifact, model.model_version)
+        or model.lifecycle_state != "registered-disabled"
+        or not _requested_caps_valid(model.kind, model.requested_capabilities)
+        or type(model.granted_capabilities) != "array" or len(model.granted_capabilities) != 0
+        or type(model.tool_allowlist) != "array" or len(model.tool_allowlist) != 0
+        or model.sandbox_profile_id != "metadata-only" or model.sandbox_profile_digest != ""
+        or not _limits_valid(model.resource_limits)
+        or type(model.coverage) != "array" or len(model.coverage) != 1
+        or model.coverage[0] != "metadata-only"
+        or not _unique_optional_tokens(model.fallback_model_ids, 16, MAX_ID_CHARS)
+        or type(model.protected) != "bool" or type(model.dynamically_registered) != "bool"
+        or model.active != false or model.authorizes_action != false
+        or not _hex_or_empty(model.descriptor_digest) or model.descriptor_digest == "" { return false; }
+    let payload = _payload(model);
+    return sha256(json_stringify(payload)) == model.descriptor_digest;
+}
+
+fn _find_model(catalog, id) {
+    let i = 0;
+    while i < len(catalog.models) {
+        if catalog.models[i].model_id == id { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn _caps_subset(left, right) {
+    let i = 0;
+    while i < len(left) { if not _in(right, left[i]) { return false; } i = i + 1; }
+    return true;
+}
+
+fn _limits_not_broader(candidate, source) {
+    return candidate.context_tokens <= source.context_tokens
+        and candidate.input_bytes <= source.input_bytes
+        and candidate.output_bytes <= source.output_bytes
+        and candidate.memory_bytes <= source.memory_bytes
+        and candidate.time_ms <= source.time_ms
+        and candidate.compute_units <= source.compute_units;
+}
+
+fn _fallback_visit(catalog, indexes, id, colors, depths) {
+    let color = try colors[id] catch 0;
+    if color == 1 { return map{ ok: false, depth: 0 }; }
+    if color == 2 { return map{ ok: true, depth: depths[id] }; }
+    if not map_has(indexes, id) { return map{ ok: false, depth: 0 }; }
+    colors[id] = 1;
+    let source = catalog.models[indexes[id]];
+    let longest = 0;
+    let i = 0;
+    while i < len(source.fallback_model_ids) {
+        if not map_has(indexes, source.fallback_model_ids[i]) {
+            return map{ ok: false, depth: 0 };
+        }
+        let target_index = indexes[source.fallback_model_ids[i]];
+        let target = catalog.models[target_index];
+        if target.kind != source.kind
+            or target.owner_role != source.owner_role
+            or not _caps_subset(target.requested_capabilities, source.requested_capabilities)
+            or not _limits_not_broader(target.resource_limits, source.resource_limits)
+            or json_stringify(_sorted_copy(target.domains)) != json_stringify(_sorted_copy(source.domains))
+            or json_stringify(_sorted_copy(target.tasks)) != json_stringify(_sorted_copy(source.tasks))
+            or json_stringify(_sorted_copy(target.input_contracts)) != json_stringify(_sorted_copy(source.input_contracts))
+            or json_stringify(_sorted_copy(target.output_contracts)) != json_stringify(_sorted_copy(source.output_contracts))
+            or target.sandbox_profile_id != source.sandbox_profile_id {
+            return map{ ok: false, depth: 0 };
+        }
+        let branch = _fallback_visit(catalog, indexes, target.model_id, colors, depths);
+        if not branch.ok or branch.depth + 1 > MAX_FALLBACK_DEPTH {
+            return map{ ok: false, depth: 0 };
+        }
+        if branch.depth + 1 > longest { longest = branch.depth + 1; }
+        i = i + 1;
+    }
+    colors[id] = 2;
+    depths[id] = longest;
+    return map{ ok: true, depth: longest };
+}
+
+fn validate_catalog(catalog) {
+    let inspected = BOUNDED.inspect_bounded(catalog, CATALOG_BOUNDS);
+    if not inspected.ok { return map{ format: "pbai.model.catalog-validation.v1", ok: false,
+        reason: "catalog-bound-exceeded", bound_reason: try inspected.reason catch "unknown" }; }
+    if not _exact_keys(catalog, ["format", "schema_version", "revision", "max_models",
+        "models", "metadata_only", "activates_models", "authorizes_action",
+        "promotion_available", "hidden_evaluation_enforced"])
+        or catalog.format != CATALOG_FORMAT or catalog.schema_version != SCHEMA_VERSION
+        or not _integer(catalog.revision, 1, 1000000000) or catalog.max_models != MAX_MODELS
+        or type(catalog.models) != "array" or len(catalog.models) < 1 or len(catalog.models) > MAX_MODELS
+        or catalog.metadata_only != true or catalog.activates_models != false
+        or catalog.authorizes_action != false or catalog.promotion_available != false
+        or catalog.hidden_evaluation_enforced != false {
+        return map{ format: "pbai.model.catalog-validation.v1", ok: false, reason: "invalid-catalog-schema" };
+    }
+    let ids = map{};
+    let indexes = map{};
+    let claims = map{};
+    let total_claims = 0;
+    let i = 0;
+    while i < len(catalog.models) {
+        let model = catalog.models[i];
+        if not _descriptor_valid(model) { return map{ format: "pbai.model.catalog-validation.v1", ok: false, reason: "invalid-model-descriptor" }; }
+        if map_has(ids, model.model_id) { return map{ format: "pbai.model.catalog-validation.v1", ok: false, reason: "duplicate-model-id" }; }
+        ids[model.model_id] = true;
+        indexes[model.model_id] = i;
+        let model_claims = len(model.domains) * len(model.tasks)
+            * len(model.input_contracts) * len(model.output_contracts);
+        if model_claims > MAX_CLAIMS_PER_MODEL
+            or total_claims + model_claims > MAX_CATALOG_CLAIMS {
+            return map{ format: "pbai.model.catalog-validation.v1", ok: false,
+                reason: "coverage-claim-limit" };
+        }
+        total_claims = total_claims + model_claims;
+        let d = 0;
+        while d < len(model.domains) {
+            let t = 0;
+            while t < len(model.tasks) {
+                let input_index = 0;
+                while input_index < len(model.input_contracts) {
+                    let output_index = 0;
+                    while output_index < len(model.output_contracts) {
+                        let claim = model.kind + ":" + model.domains[d] + ":" + model.tasks[t]
+                            + ":" + model.input_contracts[input_index]
+                            + ":" + model.output_contracts[output_index];
+                        if map_has(claims, claim) { return map{ format: "pbai.model.catalog-validation.v1", ok: false, reason: "ambiguous-coverage-claim" }; }
+                        claims[claim] = model.model_id;
+                        output_index = output_index + 1;
+                    }
+                    input_index = input_index + 1;
+                }
+                t = t + 1;
+            }
+            d = d + 1;
+        }
+        i = i + 1;
+    }
+    let colors = map{};
+    let depths = map{};
+    i = 0;
+    while i < len(catalog.models) {
+        if not _fallback_visit(catalog, indexes, catalog.models[i].model_id, colors, depths).ok {
+            return map{ format: "pbai.model.catalog-validation.v1", ok: false, reason: "unsafe-fallback-graph" };
+        }
+        i = i + 1;
+    }
+    return map{ format: "pbai.model.catalog-validation.v1", ok: true,
+        models: len(catalog.models), metadata_only: true, activates_models: false,
+        authorizes_action: false };
+}
+
+fn _request_valid(request) {
+    let keys = ["format", "model_id", "model_version", "kind", "owner_role",
+        "domains", "tasks", "input_contracts", "output_contracts",
+        "requested_capabilities", "resource_limits", "coverage",
+        "fallback_model_ids", "protected"];
+    return _exact_keys(request, keys) and request.format == REQUEST_FORMAT
+        and _safe_token(request.model_id, MAX_ID_CHARS) and _canonical_semver(request.model_version)
+        and _kind(request.kind) and _safe_token(request.owner_role, MAX_ID_CHARS)
+        and _owner_valid(request.kind, request.owner_role)
+        and _unique_tokens(request.domains, 64) and _unique_tokens(request.tasks, 64)
+        and _unique_tokens(request.input_contracts, 32) and _unique_tokens(request.output_contracts, 32)
+        and _requested_caps_valid(request.kind, request.requested_capabilities)
+        and _limits_valid(request.resource_limits)
+        and type(request.coverage) == "array" and len(request.coverage) == 1
+        and request.coverage[0] == "metadata-only"
+        and _unique_optional_tokens(request.fallback_model_ids, 16, MAX_ID_CHARS)
+        and request.protected == false;
+}
+
+fn register_disabled(catalog, request) {
+    if not validate_catalog(catalog).ok { return map{ format: "pbai.model.catalog-change.v1", ok: false, reason: "invalid-catalog" }; }
+    if not BOUNDED.inspect_bounded(request, REQUEST_BOUNDS).ok or not _request_valid(request) {
+        return map{ format: "pbai.model.catalog-change.v1", ok: false,
+            reason: "invalid-registration-request", catalog_revision: catalog.revision };
+    }
+    if len(catalog.models) >= MAX_MODELS or _find_model(catalog, request.model_id) >= 0 {
+        return map{ format: "pbai.model.catalog-change.v1", ok: false,
+            reason: "catalog-full-or-duplicate", catalog_revision: catalog.revision };
+    }
+    let model = _descriptor(request.model_id, request.kind, request.owner_role,
+        request.domains, request.tasks, request.requested_capabilities, false, true,
+        request.fallback_model_ids);
+    model.model_version = request.model_version;
+    model.input_contracts = json_parse(json_stringify(request.input_contracts));
+    model.output_contracts = json_parse(json_stringify(request.output_contracts));
+    model.resource_limits = json_parse(json_stringify(request.resource_limits));
+    model.artifact = _artifact(request.model_version);
+    let payload = _payload(model);
+    model.descriptor_digest = sha256(json_stringify(payload));
+    let updated = json_parse(json_stringify(catalog));
+    push(updated.models, json_parse(json_stringify(model)));
+    updated.revision = updated.revision + 1;
+    let checked = validate_catalog(updated);
+    if not checked.ok { return map{ format: "pbai.model.catalog-change.v1", ok: false,
+        reason: checked.reason, catalog_revision: catalog.revision }; }
+    return map{ format: "pbai.model.catalog-change.v1", ok: true,
+        action: "registered-disabled", model_id: model.model_id, catalog: updated,
+        activates_model: false, authorizes_action: false, readiness_accepted: false };
+}
+
+fn exact_coverage_plan(catalog, kind, domain, task,
+    input_contract = "pbai.model.input.v1", output_contract = "pbai.model.output.v1") {
+    if not validate_catalog(catalog).ok or not _kind(kind) or not _safe_token(domain)
+        or not _safe_token(task) or not _safe_token(input_contract)
+        or not _safe_token(output_contract) {
+        return map{ format: PLAN_FORMAT, ok: false, decision: "abstain",
+            reason: "invalid-catalog-or-request", may_route: false,
+            artifact_verified: false, activates_model: false, training_started: false,
+            authorizes_action: false };
+    }
+    let matches = [];
+    let i = 0;
+    while i < len(catalog.models) {
+        let model = catalog.models[i];
+        if model.kind == kind and _in(model.domains, domain) and _in(model.tasks, task)
+            and _in(model.input_contracts, input_contract) and _in(model.output_contracts, output_contract) {
+            push(matches, model.model_id);
+        }
+        i = i + 1;
+    }
+    if len(matches) == 1 {
+        return map{ format: PLAN_FORMAT, ok: true, decision: "abstain",
+            next_step: "admit-verified-artifact", may_route: false,
+            reason: "catalogued-contract-is-disabled-metadata", coverage: "catalogued-contract",
+            specialist_gap: false, recommended_model_id: matches[0], catalog_revision: catalog.revision,
+            recommended_model_digest: catalog.models[_find_model(catalog, matches[0])].descriptor_digest,
+            activates_model: false, training_started: false,
+            authorizes_action: false, artifact_verified: false };
+    }
+    if len(matches) > 1 {
+        return map{ format: PLAN_FORMAT, ok: false, decision: "abstain",
+            reason: "ambiguous-specialist-coverage", may_route: false,
+            artifact_verified: false, activates_model: false, training_started: false,
+            authorizes_action: false };
+    }
+    return map{ format: PLAN_FORMAT, ok: true, decision: "abstain",
+        next_step: "plan-disabled-specialist", may_route: false,
+        reason: "no-exact-specialist", coverage: "missing", specialist_gap: true,
+        suggested_model_id: "specialist-" + str_slice(sha256(kind + "\x00" + domain + "\x00" + task
+            + "\x00" + input_contract + "\x00" + output_contract), 0, 16),
+        requested_domain: domain, requested_task: task, catalog_revision: catalog.revision,
+        requires_reviewed_dataset: true, requires_sealed_evaluation: true,
+        artifact_verified: false, activates_model: false,
+        authorizes_action: false, training_started: false };
+}
+
+fn coverage_plan(catalog, domain, task, input_contract = "pbai.model.input.v1",
+    output_contract = "pbai.model.output.v1") {
+    return exact_coverage_plan(catalog, "inference", domain, task,
+        input_contract, output_contract);
+}
+
+fn _stage(index, name, model_id, principal, input_receipts, output_receipt,
+    hidden_test = false, aggregate_only = false) {
+    return map{ index: index, stage: name, model_id: model_id, principal: principal,
+        input_receipts: input_receipts, output_receipt: output_receipt,
+        hidden_test_access: hidden_test, aggregate_only: aggregate_only,
+        enabled: false, executes: false, authorizes_next_stage: false };
+}
+
+fn training_team(catalog, domain, task) {
+    if not validate_catalog(catalog).ok or not _safe_token(domain) or not _safe_token(task) {
+        return map{ format: TRAINING_TEAM_FORMAT, ok: false, reason: "invalid-catalog-or-target",
+            executable: false, promotable: false, active: false, authorizes_action: false };
+    }
+    let requirements = [
+        ["source-curator-model", "curator", "memory-curator"],
+        ["dataset-curator-model", "curator", "memory-curator"],
+        ["tokenizer-trainer-model", "trainer", "trainer"],
+        ["adapter-trainer-model", "trainer", "trainer"],
+        ["quality-evaluator-model", "evaluator", "verifier"],
+        ["privacy-verifier-model", "verifier", "verifier"],
+        ["reproducibility-verifier-model", "verifier", "verifier"],
+        ["promotion-advisor-model", "governance", "pbruler"]
+    ];
+    let requirement_index = 0;
+    while requirement_index < len(requirements) {
+        let model_index = _find_model(catalog, requirements[requirement_index][0]);
+        if model_index < 0 or catalog.models[model_index].kind != requirements[requirement_index][1]
+            or catalog.models[model_index].owner_role != requirements[requirement_index][2]
+            or not catalog.models[model_index].protected {
+            return map{ format: TRAINING_TEAM_FORMAT, ok: false,
+                reason: "missing-or-invalid-training-stage-model",
+                executable: false, promotable: false, active: false,
+                authorizes_action: false };
+        }
+        requirement_index = requirement_index + 1;
+    }
+    let stages = [
+        _stage(1, "source-curation", "source-curator-model", "curator-source", [], "source-grant-receipt"),
+        _stage(2, "dataset-admission", "dataset-curator-model", "curator-dataset",
+            ["source-grant-receipt"], "dataset-manifest-receipt"),
+        _stage(3, "tokenizer-candidate", "tokenizer-trainer-model", "trainer-tokenizer",
+            ["dataset-manifest-receipt"], "tokenizer-candidate-receipt"),
+        _stage(4, "model-candidate", "adapter-trainer-model", "trainer-candidate",
+            ["dataset-manifest-receipt", "tokenizer-candidate-receipt"], "quarantined-candidate-receipt"),
+        _stage(5, "sealed-quality-evaluation", "quality-evaluator-model", "evaluator-hidden",
+            ["quarantined-candidate-receipt", "sealed-test-escrow-receipt"], "aggregate-evaluation-receipt", true, true),
+        _stage(6, "privacy-verification", "privacy-verifier-model", "verifier-privacy",
+            ["quarantined-candidate-receipt", "aggregate-evaluation-receipt"], "privacy-verdict-receipt"),
+        _stage(7, "reproducibility-verification", "reproducibility-verifier-model", "verifier-reproducibility",
+            ["quarantined-candidate-receipt", "aggregate-evaluation-receipt"], "reproducibility-verdict-receipt"),
+        _stage(8, "promotion-review-advice", "promotion-advisor-model", "governance-advisor",
+            ["dataset-manifest-receipt", "quarantined-candidate-receipt", "aggregate-evaluation-receipt",
+                "privacy-verdict-receipt", "reproducibility-verdict-receipt"], "promotion-advice-receipt")
+    ];
+    return map{
+        format: TRAINING_TEAM_FORMAT, ok: true, domain: domain, task: task,
+        catalog_revision: catalog.revision, stages: stages, serial: true,
+        distinct_principals_required: true, trainer_can_access_test: false,
+        trainer_can_evaluate: false, trainer_can_verify: false, trainer_can_promote: false,
+        evaluator_emits_aggregate_only: true, model_can_promote_itself: false,
+        promotion_authority: "external-pbruler-and-operator",
+        promotion_separate_from_activation: true, authenticated_receipt_chain_required: true,
+        replay_and_revocation_validation_required: true, catalog_revision_cas_required: true,
+        hidden_evaluation_enforced: false, receipt_validator_implemented: false,
+        executable: false, promotable: false, active: false,
+        granted_capabilities: [], tool_allowlist: [], authorizes_action: false
+    };
+}
+
+fn status() {
+    let catalog = base_catalog();
+    let counts = map{ inference: 0, curator: 0, trainer: 0, evaluator: 0, verifier: 0, governance: 0 };
+    for model in catalog.models { counts[model.kind] = counts[model.kind] + 1; }
+    return map{
+        format: "pbai.model.catalog-status.v1", ok: validate_catalog(catalog).ok,
+        implementation_language: "pblang", base_models: len(catalog.models), kinds: counts,
+        arbitrary_domain_specialization_plan: true, training_models_catalogued: true,
+        metadata_only: true, dynamic_metadata_registration: true,
+        dynamic_model_activation: false,
+        model_artifacts_verified: false, model_activation_available: false,
+        receipt_validator_implemented: false, hidden_evaluation_enforced: false,
+        promotion_available: false, authorizes_action: false
+    };
+}
+
+export CATALOG_FORMAT, MODEL_FORMAT, REQUEST_FORMAT, PLAN_FORMAT, TRAINING_TEAM_FORMAT;
+export SCHEMA_VERSION, MAX_MODELS, MAX_FALLBACK_DEPTH;
+export MAX_CLAIMS_PER_MODEL, MAX_CATALOG_CLAIMS;
+export base_catalog, validate_catalog, register_disabled, exact_coverage_plan;
+export coverage_plan, training_team, status;

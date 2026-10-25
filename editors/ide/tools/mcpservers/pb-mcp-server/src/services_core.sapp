@@ -1,0 +1,139 @@
+// PBLang service metadata contract. The callback is an internal HTTPS broker,
+// never a caller-supplied function or a source of authorization.
+fn _cursor(value) {
+    if type(value) != "string" or len(value) > 1024 { throw "invalid service cursor"; }
+    let digits = true; let base32 = true;
+    for ch in str_to_bytes(value) {
+        if ch < 48 or ch > 57 { digits = false; }
+        if not ((ch >= 65 and ch <= 90) or (ch >= 50 and ch <= 55)) { base32 = false; }
+    }
+    if not digits and not base32 { throw "invalid service cursor"; }
+    return value;
+}
+fn _project(value) {
+    if type(value)!="string" or len(value)<1 or len(value)>128 { throw "invalid service project"; }
+    for ch in str_to_bytes(value) {
+        if not ((ch>=48 and ch<=57) or (ch>=65 and ch<=90) or (ch>=97 and ch<=122) or ch==45 or ch==95) { throw "invalid service project"; }
+    }
+    return value;
+}
+fn _timestamp_number(value) {
+    if type(value)!="string" or len(value)<1 or len(value)>16 or (len(value)>1 and str_starts_with(value,"0")) { throw "invalid deployment timestamp"; }
+    let number=0;
+    for ch in str_to_bytes(value) {
+        if ch<48 or ch>57 { throw "invalid deployment timestamp"; }
+        number=number*10+(ch-48);
+        if number>9007199254740991 { throw "deployment timestamp bound"; }
+    }
+    return number;
+}
+fn _deployment_cursor(value) {
+    if value=="" { return value; }
+    _timestamp_number(value);return value;
+}
+fn _state(value) {
+    for allowed in ["BLOCKED","BUILDING","CANCELED","DELETED","ERROR","INITIALIZING","QUEUED","READY"] {
+        if value==allowed { return true; }
+    }
+    return false;
+}
+fn _fields(operation) {
+    if operation == "vercel_projects" { return ["id", "name"]; }
+    if operation == "vercel_deployments" { return ["id", "name", "project_id", "state", "created_ms"]; }
+    if operation == "supabase_projects" { return ["id", "name", "organization_id", "region", "created_at", "status"]; }
+    if operation == "supabase_organizations" { return ["id", "name"]; }
+    throw "unsupported service operation";
+}
+fn _normalize(operation, response) {
+    let fields = _fields(operation);
+    let provider = if operation == "vercel_projects" or operation == "vercel_deployments" { "vercel" } else { "supabase" };
+    if type(response) != "map" or (try response.ok catch false) != true or
+        (try response.provider catch nil) != provider or (try response.operation catch nil) != operation or
+        (try response.tls_verified catch false) != true or (try response.dns_pinned catch false) != true or
+        (try response.redirects_followed catch true) != false { throw "service response unavailable or refused"; }
+    let rows = try response.items catch nil;
+    if type(rows) != "array" or len(rows) > 500 { throw "service response list bound"; }
+    let out = []; let ids = map{}; let text_bytes = 0;
+    for row in rows {
+        if type(row) != "map" { throw "invalid service metadata row"; }
+        let item = map{};
+        for field in fields {
+            let value = try row[field] catch nil;
+            // Reject clearly oversized text before allocating a byte array.
+            if type(value) != "string" or len(value) < 1 or len(value) > 512 {
+                throw "invalid service metadata field";
+            }
+            let size = len(str_to_bytes(value));
+            if size > 512 { throw "invalid service metadata field"; }
+            text_bytes = text_bytes + size;
+            if text_bytes > 262144 { throw "service metadata text bound"; }
+            item[field] = value;
+        }
+        if operation=="vercel_deployments" {
+            _project(item.project_id);_timestamp_number(item.created_ms);
+            if not _state(item.state) { throw "invalid deployment state"; }
+        }
+        if map_has(ids, item.id) { throw "duplicate service identity"; }
+        ids[item.id] = true;
+        array_push(out, item);
+    }
+    let result = map{ format: "pb_mcp.service_metadata.v1", provider: provider, operation: operation,
+        items: out, count: len(out), source: "untrusted_provider_metadata", instructions_from_data: false,
+        credentials_returned: false, database_configuration_returned: false };
+    if operation == "vercel_projects" or operation == "vercel_deployments" {
+        if len(rows) > 100 { throw "service page bound"; }
+        let known = try response.pagination_supported catch nil;
+        let next = try response.next_cursor catch nil;
+        if type(known) != "bool" or not map_has(response, "next_cursor") { throw "missing service pagination"; }
+        if operation=="vercel_deployments" {
+            if not known { throw "deployment pagination required"; }
+            if next!=nil { _timestamp_number(next); }
+        }
+        if next != nil { if _cursor(next) == "" { throw "empty service continuation"; } }
+        if not known and next != nil { throw "unsupported service pagination"; }
+        result.pagination_supported = known; result.next_cursor = next;
+        result.pagination_exhausted = known and next == nil;
+    }
+    return result;
+}
+fn read(operation, args, exchange) {
+    _fields(operation);
+    if type(args) != "map" { throw "service read expects arguments object"; }
+    let spec = map{ operation: operation };
+    if operation == "vercel_projects" {
+        for key in map_keys(args) { if key != "cursor" { throw "unsupported service argument"; } }
+        spec.cursor = _cursor(try args.cursor catch "");
+    } elif operation=="vercel_deployments" {
+        for key in map_keys(args) { if key!="cursor" and key!="project_id" { throw "unsupported service argument"; } }
+        spec.project_id=_project(try args.project_id catch nil);
+        spec.cursor=_deployment_cursor(try args.cursor catch "");
+    } else { if len(map_keys(args)) != 0 { throw "service read accepts no caller account or URL"; } }
+    let result = _normalize(operation, exchange(spec));
+    if operation == "vercel_projects" and result.next_cursor != nil and result.next_cursor == spec.cursor {
+        throw "service continuation did not advance";
+    }
+    if operation=="vercel_deployments" {
+        for item in result.items { if item.project_id!=spec.project_id { throw "deployment project mismatch"; } }
+        if result.next_cursor!=nil and spec.cursor!="" and _timestamp_number(result.next_cursor)>=_timestamp_number(spec.cursor) {
+            throw "deployment continuation did not advance";
+        }
+        result.project_id=spec.project_id;
+    }
+    return result;
+}
+fn catalog_entries() {
+    let entries = [];
+    for name in ["supabase_projects", "supabase_organizations"] {
+        array_push(entries, map{ name: name, description: "Read selected Supabase metadata using the locally configured account and operation grant. No SQL, secrets, deployment or mutation access.",
+            input_schema: map{ type: "object", properties: map{}, additionalProperties: false },
+            read_only: true, open_world: true });
+    }
+    array_push(entries, map{ name: "vercel_projects", description: "Read one page of Vercel project names and IDs for the locally configured account. Pass next_cursor as cursor for another page. No deployment, environment or mutation access.",
+        input_schema: map{ type: "object", properties: map{ cursor: map{ type: "string", maxLength: 1024, pattern: "^([0-9]*|[A-Z2-7]*)$" } }, additionalProperties: false },
+        read_only: true, open_world: true });
+    array_push(entries,map{name:"vercel_deployments",description:"Read one page of deployment IDs, names, states and creation times for one Vercel project using a separate local read grant. Pass next_cursor as cursor. No deployment creation, logs, secrets or mutations.",
+        input_schema:map{type:"object",properties:map{project_id:map{type:"string",minLength:1,maxLength:128,pattern:"^[A-Za-z0-9_-]+$"},cursor:map{type:"string",maxLength:16,pattern:"^(0|[1-9][0-9]{0,15})?$"}},required:["project_id"],additionalProperties:false},
+        read_only:true,open_world:true});
+    return entries;
+}
+export read, _normalize, catalog_entries;

@@ -1,0 +1,1420 @@
+// stdlib/pbai_lm.sapp — pbAI's GENERATIVE model: a character-level neural language
+// model, written entirely in pblang. The first step toward pbAI text generation
+// (docs/pbAI.md): tokenize → embed → hidden → vocab logits → sample.
+//
+// Architecture (a Bengio-style neural LM): the previous K characters are embedded
+// (E[V,D]), concatenated, run through a tanh hidden layer (W1,b1), then projected to
+// vocab logits (W2,b2) and softmax'd. Training is next-character prediction with
+// cross-entropy and MANUAL backprop — the VM's tensor_* kernels are forward-only (no
+// autograd), so the gradients are computed by hand here; the kernels accelerate the
+// inference/generation path (tensor_softmax / tensor_argmax over the logits).
+//
+//   let lm = (try import("pbai_lm.sapp") catch import("editors/ide/tools/ai/core/pbai_lm.sapp"));
+//   let v  = lm.vocab_build(corpus);
+//   let m  = lm.model_new(v.size, 8, 24, 3, 1);
+//   lm.train(m, lm.encode(v, corpus), 30, 0.2);
+//   print lm.generate(m, v, "fn ", 40);
+//
+// Small by design (it runs in the interpreter); the transformer scale-up is the
+// roadmap. All pblang.
+
+let LIVE_DATA = import("stdlib:llm_data.sapp");
+let SECURE_FILE = import("stdlib:secure_file.sapp");
+
+let DEFAULT_CORPUS =
+    "fn add(a, b) { return a + b; }\n"
+    + "fn main() { let x = add(2, 3); print x; }\n"
+    + "let m = map{ ok: true, value: 42 };\n"
+    + "if map_has(m, \"value\") { print m[\"value\"]; }\n"
+    + "fn fact(n) { if n <= 1 { return 1; } return n * fact(n - 1); }\n";
+
+let CURRICULUM_CORPUS =
+    "\n### pbAI baby curriculum: symbols and tiny facts\n"
+    + "print \"hello\";\n"
+    + "let name = \"pbAI\";\n"
+    + "let age = 1;\n"
+    + "fn identity(x) { return x; }\n"
+    + "fn yes() { return true; }\n"
+    + "fn no() { return false; }\n"
+    + "\n### pbAI kid curriculum: pblang rules and safe habits\n"
+    + "fn greet(name) { print \"hello \" + name; return name; }\n"
+    + "fn safe_map(m, k) { if map_has(m, k) { return m[k]; } return nil; }\n"
+    + "fn safe_div(a, b) { if b == 0 { return nil; } return a / b; }\n"
+    + "fn read_text(path) { return try fs_read(path) catch \"\"; }\n"
+    + "fn write_text(path, text) { try fs_write(path, text) catch nil; return path; }\n"
+    + "fn count_to(n) { for i n { print i; } return n; }\n"
+    + "\n### pbAI teen curriculum: engineering patterns\n"
+    + "fn test_add() { assert(add(2, 3) == 5, \"add works\"); return true; }\n"
+    + "fn clamp(x, lo, hi) { if x < lo { return lo; } if x > hi { return hi; } return x; }\n"
+    + "fn collect_keys(m) { let ks = map_keys(m); return ks; }\n"
+    + "fn review_capabilities(code) { if str_contains(code, \"fs_read\") { return \"needs fs review\"; } return \"ok\"; }\n"
+    + "\n### pbAI adult curriculum: code review and self-improvement knowledge\n"
+    + "pbAI reviews pblang code, explains functions, finds bugs, improves syntax, and verifies with tests.\n"
+    + "In pblang print is a statement: write print x; not print(x);\n"
+    + "Missing map keys raise an error, so dynamic map reads should use map_has before m[k].\n"
+    + "Filesystem, process, ffi, http, and env access require explicit capability review.\n"
+    + "Good code has small functions, named constants, try/catch around fallible I/O, and deterministic tests.\n"
+    + "\n### pbAI language curriculum: pblang facts\n"
+    + "Arrays use [1, 2, 3], len(a), push(a, v), pop(a), slice(a, i, j), and for v in a.\n"
+    + "Maps use map{ key: value }, map_has(m, k), map_keys(m), map_remove(m, k), and m.k member sugar for identifier keys.\n"
+    + "Functions use fn name(args) { ... }; closures use fn(x) { ... } and capture variables.\n"
+    + "Modules use let m = import(\"stdlib/name.sapp\"); exports are read as m.member.\n"
+    + "Errors use try EXPR catch FALLBACK, throw v, and error(\"message\").\n"
+    + "Async work uses async fn, spawn, spawn_n, and waitgroup-style coordination.\n"
+    + "Precision types include bigint, rational, and decimal for exact or high-precision arithmetic.\n"
+    + "Operator overloads use dunder methods like __add__, __lt__, and reflected methods on maps or objects.\n"
+    + "Typeclasses provide runtime ad-hoc polymorphism with executable laws.\n"
+    + "Reactive streams use refs, computed values, subjects, subscriptions, map, filter, scan, take, merge, and combine_latest.\n"
+    + "\n### pbAI assistant curriculum: behavior\n"
+    + "When the user greets pbAI, answer naturally and offer useful next actions.\n"
+    + "When the user says learn or teach, explain the learn: command and store explicit lessons in the live corpus.\n"
+    + "When the user asks many topics at once, answer each topic briefly instead of selecting only one keyword.\n"
+    + "When code is pasted, prefer concrete findings, exact pblang syntax repairs, and verification steps.\n"
+    + "When unsure, say what is known, what is planned, and what should be verified.\n"
+    + "\n### pbAI data curriculum: modalities\n"
+    + "pbAI should route text, code, markdown, json, csv, logs, diffs, test output, binary artifacts, images, audio, and video.\n"
+    + "Deep image, audio, and video understanding should use native parsers, embeddings, retrieval, and plugin backends behind capability gates.\n"
+    + "\n### pbAI examples: review and fixes\n"
+    + "fn safe_read(path) { return try fs_read(path) catch \"\"; }\n"
+    + "fn safe_get(m, k, fallback) { if map_has(m, k) { return m[k]; } return fallback; }\n"
+    + "fn safe_exec(cmd) { if str_contains(cmd, \";\") { return error(\"unsafe command\"); } return exec(cmd); }\n"
+    + "fn summarize(xs) { let total = 0; for x in xs { total = total + x; } return total; }\n"
+    + "fn test_safe_get() { let m = map{ answer: 42 }; assert(safe_get(m, \"answer\", 0) == 42, \"existing key\"); assert(safe_get(m, \"missing\", 0) == 0, \"fallback\"); }\n";
+
+let LIVE_CORPUS_NAME = "live-corpus-v1.txt";
+let NANO_CKPT_NAME = "nano-checkpoint-v1.json";
+let MAX_LIVE_CORPUS_BYTES = 4000000;
+let MAX_NANO_CHECKPOINT_BYTES = 33554432;
+let MAX_DIRECT_LESSON_BYTES = 24000;
+let MAX_ADMITTED_BATCH_ITEM_BYTES = 32000;
+let MAX_ADMITTED_BATCH_INPUT_BYTES = 128000;
+
+let _NANO_CKPT = nil;
+let _NANO_EPOCHS = 0;
+let _NANO_LR = 0;
+let _NANO_CORPUS = "";
+let _STATE_ROOT_SELECTION = nil;
+
+// Cross-process cache for the trained nano checkpoint. A char-LM train is expensive
+// under the interpreter (seconds–minutes), and `_NANO_CKPT` above only survives within
+// a single process — so every fresh `pblang` invocation (a test, a `/status` route, a
+// CLI call) used to retrain from scratch. Persisting the checkpoint to disk, keyed by the
+// exact (corpus, epochs, lr) it was trained on, makes the first train the only slow one.
+fn _validated_state_root(raw, source) {
+    if raw == nil or str_trim(str(raw)) == "" {
+        return map{ ok: false, configured: false, reason: "state-root-required" };
+    }
+    let root = str_trim(str(raw));
+    if len(root) > 4000 or root == "/" or not str_starts_with(root, "/")
+       or str_contains(root, strfromcharcode(0)) or str_ends_with(root, "/") {
+        return map{ ok: false, configured: true, reason: "state-root-must-be-bounded-absolute" };
+    }
+    return map{ ok: true, configured: true, root: root, reason: "configured", source: source };
+}
+
+fn _state_root_status() {
+    if _STATE_ROOT_SELECTION == nil {
+        _STATE_ROOT_SELECTION = _validated_state_root(
+            try env_get("PBAI_STATE_ROOT") catch nil, "process-bootstrap-environment");
+    }
+    return _STATE_ROOT_SELECTION;
+}
+
+fn _state_path(name) {
+    let state = _state_root_status();
+    if not state.ok { return ""; }
+    return state.root + "/" + name;
+}
+
+fn live_storage_status() {
+    let state = _state_root_status();
+    let private_state = if state.ok { SECURE_FILE.private_directory_status(state.root) }
+        else { map{ ok: false, ready: false, reason: state.reason } };
+    return map{ format: "pbai.live-storage.v1", configured: state.configured,
+        path_admitted: state.ok, usable: private_state.ok,
+        reason: if private_state.ok { "verified" } else { private_state.reason },
+        source: try state.source catch "unconfigured", path_exposed: false,
+        private_parent_required: true, tracked_source_storage: false,
+        cooperative_local_locking: true, atomic_replacement: true,
+        cross_platform_live_write: false,
+        linux_private_persistence_milestone: platform() == "linux" and private_state.ok,
+        macos_private_persistence_verified: false,
+        windows_private_persistence_verified: false,
+        server_fixed_worker_broker_required: true,
+        server_fixed_worker_broker_implemented: false,
+        same_vm_untrusted_ffi_safe: false,
+        runtime_signature_tuple_enforced: false };
+}
+
+fn _nano_checkpoint_path() { return _state_path(NANO_CKPT_NAME); }
+
+fn _read_nano_checkpoint() {
+    let path = _nano_checkpoint_path(); if path == "" { return nil; }
+    let loaded = SECURE_FILE.read_optional_text(path, MAX_NANO_CHECKPOINT_BYTES, true);
+    if not loaded.ok or (try loaded.missing catch false) { return nil; }
+    return try json_parse(loaded.text) catch nil;
+}
+
+fn _write_nano_checkpoint(value) {
+    let path = _nano_checkpoint_path(); if path == "" { return false; }
+    let encoded = try json_stringify(value) catch nil;
+    if encoded == nil or len(str_to_bytes(str(encoded))) > MAX_NANO_CHECKPOINT_BYTES { return false; }
+    return SECURE_FILE.write_text_atomic(path, str(encoded), true, true).ok;
+}
+
+// _nano_cache_key — ties a cached model to the inputs that produced it, so a changed
+// corpus (e.g. after live learning appends to the corpus) or different hyper-params can
+// never return a mismatched model. sha256 keeps the key compact and collision-safe.
+fn _nano_cache_key(corpus, epochs, lr) {
+    return sha256("pbai-nano|" + str(epochs) + "|" + str(lr) + "|" + corpus);
+}
+
+// ── math helpers ─────────────────────────────────────────────────────────────────────
+fn _tanh(z) {
+    if z > 20 { return 1; }            // saturate to avoid num_exp overflow -> NaN
+    if z < 0 - 20 { return 0 - 1; }
+    let e2 = num_exp(2 * z);
+    return (e2 - 1) / (e2 + 1);
+}
+
+fn _rand(seed, a, b) {
+    let k = seed * 131 + a * 7 + b * 13 + 1;
+    return (num_mod(k * 2654435761, 100000) / 100000 - 0.5);   // ~[-0.5,0.5)
+}
+
+fn _sqrt(x) {                          // Newton's method (no builtin dependency)
+    if x <= 0 { return 0; }
+    let g = x;
+    let i = 0;
+    while i < 24 { g = (g + x / g) / 2; i = i + 1; }
+    return g;
+}
+
+fn _zeros(n) { let v = []; let i = 0; while i < n { push(v, 0); i = i + 1; } return v; }
+fn _zeros2(rows, cols) { let m = []; let r = 0; while r < rows { push(m, _zeros(cols)); r = r + 1; } return m; }
+
+// ── vocabulary ───────────────────────────────────────────────────────────────────────
+fn vocab_build(text) {
+    let ch2id = map{};
+    let id2ch = [];
+    let size = 0;
+    let i = 0;
+    while i < len(text) {
+        let c = strcharcodeat(text, i);
+        let key = str(c);                 // map keys must be strings; id2ch keeps the code
+        if not map_has(ch2id, key) {
+            ch2id[key] = size;
+            push(id2ch, c);
+            size = size + 1;
+        }
+        i = i + 1;
+    }
+    return map{ ch2id: ch2id, id2ch: id2ch, size: size };
+}
+
+fn encode(vocab, text) {
+    let ids = [];
+    let i = 0;
+    while i < len(text) {
+        let key = str(strcharcodeat(text, i));
+        if map_has(vocab.ch2id, key) { push(ids, vocab.ch2id[key]); }
+        i = i + 1;
+    }
+    return ids;
+}
+
+// ── model ──────────────────────────────────────────────────────────────────────────
+// E[V][D], W1[K*D][H], b1[H], W2[H][V], b2[V].
+// init: "default" keeps the original heuristic scales; "xavier" uses Glorot-uniform
+// scaling (≈ sqrt(6/(fan_in+fan_out))), which keeps activations/gradients better scaled
+// and so trains faster in the FEW-epoch regime (e.g. the live generate path). _rand is
+// ~[-0.5,0.5), so the factor includes a ×2 to span ~[-scale, scale).
+fn model_new(vsize, d, h, k, seed, init = "default") {
+    let kd = k * d;
+    let fE = 1; let fW1 = 0.5; let fW2 = 0.5;
+    if init == "xavier" {
+        fE = 2 * _sqrt(6 / (vsize + d));
+        fW1 = 2 * _sqrt(6 / (kd + h));
+        fW2 = 2 * _sqrt(6 / (h + vsize));
+    }
+    let E = [];
+    let vi = 0;
+    while vi < vsize {
+        let row = [];
+        let di = 0;
+        while di < d { push(row, _rand(seed, vi, di) * fE); di = di + 1; }
+        push(E, row);
+        vi = vi + 1;
+    }
+    let W1 = [];
+    let ii = 0;
+    while ii < kd {
+        let row = [];
+        let hi = 0;
+        while hi < h { push(row, _rand(seed + 7, ii, hi) * fW1); hi = hi + 1; }
+        push(W1, row);
+        ii = ii + 1;
+    }
+    let W2 = [];
+    let hi2 = 0;
+    while hi2 < h {
+        let row = [];
+        let vv = 0;
+        while vv < vsize { push(row, _rand(seed + 19, hi2, vv) * fW2); vv = vv + 1; }
+        push(W2, row);
+        hi2 = hi2 + 1;
+    }
+    return map{ E: E, W1: W1, b1: _zeros(h), W2: W2, b2: _zeros(vsize),
+                V: vsize, D: d, H: h, K: k };
+}
+
+// forward(model, ctx) — ctx is an array of K char ids. Returns intermediates needed
+// for backprop: x (concat embeddings), a1 (hidden), p (softmax probs), logits.
+fn _forward(m, ctx) {
+    // Hoist map fields + dimensions into locals: the inner loops below run O(H·V) times per
+    // call, and each `m.W2`/`m.V` was a per-iteration map-field lookup. Reading them once here
+    // is numerically identical (same values, same order) but removes millions of string-keyed
+    // lookups from a hot path — the single biggest interpreted-speed win for train/generate.
+    let E = m.E; let W1 = m.W1; let W2 = m.W2; let b1 = m.b1; let b2 = m.b2;
+    let V = m.V; let D = m.D; let H = m.H; let K = m.K;
+    let x = [];
+    let k = 0;
+    while k < K {
+        let row = E[ctx[k]];
+        let d = 0;
+        while d < D { push(x, row[d]); d = d + 1; }
+        k = k + 1;
+    }
+    let xn = len(x);
+    // hidden = tanh(x·W1 + b1), accumulated in row-major (i-outer) order so each W1[i] is a
+    // hoisted, sequentially-scanned row instead of a strided column access W1[i][h]. Same
+    // result; the summation order over i differs only in FP rounding (below any assertion).
+    let a1 = [];
+    let hb0 = 0;
+    while hb0 < H { push(a1, b1[hb0]); hb0 = hb0 + 1; }
+    let i = 0;
+    while i < xn {
+        let xi = x[i];
+        let w1i = W1[i];
+        let hh = 0;
+        while hh < H { a1[hh] = a1[hh] + xi * w1i[hh]; hh = hh + 1; }
+        i = i + 1;
+    }
+    let ht = 0;
+    while ht < H { a1[ht] = _tanh(a1[ht]); ht = ht + 1; }
+    // logits = a1·W2 + b2, likewise accumulated h-outer so W2[h2] is a hoisted sequential row.
+    let logits = [];
+    let vb0 = 0;
+    while vb0 < V { push(logits, b2[vb0]); vb0 = vb0 + 1; }
+    let h2 = 0;
+    while h2 < H {
+        let a = a1[h2];
+        let w2h = W2[h2];
+        let vv = 0;
+        while vv < V { logits[vv] = logits[vv] + a * w2h[vv]; vv = vv + 1; }
+        h2 = h2 + 1;
+    }
+    // softmax
+    let mx = logits[0];
+    let vi = 1;
+    while vi < V { if logits[vi] > mx { mx = logits[vi]; } vi = vi + 1; }
+    let p = [];
+    let sum = 0;
+    let v2 = 0;
+    while v2 < V { let e = num_exp(logits[v2] - mx); push(p, e); sum = sum + e; v2 = v2 + 1; }
+    // Guard: max-subtraction keeps sum >= 1 for finite logits, but a NaN/Inf weight
+    // (e.g. a runaway learning rate) can drive sum to 0/NaN. Fall back to a uniform
+    // distribution rather than cascading NaN through generate()/learn().
+    if not (sum > 0) {
+        let vu = 0;
+        while vu < V { p[vu] = 1 / V; vu = vu + 1; }
+        return map{ x: x, a1: a1, p: p, logits: logits };
+    }
+    let v3 = 0;
+    while v3 < V { p[v3] = p[v3] / sum; v3 = v3 + 1; }
+    return map{ x: x, a1: a1, p: p, logits: logits };
+}
+
+// train_step — one SGD update on (ctx → target); returns the cross-entropy loss.
+fn train_step(m, ctx, target, lr) {
+    let f = _forward(m, ctx);
+    let p = f.p; let a1 = f.a1; let x = f.x;
+    // Same hoisting as _forward: dimensions and weight matrices into locals, and each weight
+    // ROW into a local before its inner loop (the outer index is the row index, so this is a
+    // loop-invariant reference, not a copy — pblang lists are by-reference, so writes through
+    // the row still update the model). Preserves the exact update order and values.
+    let V = m.V; let H = m.H; let D = m.D; let K = m.K;
+    let W1 = m.W1; let W2 = m.W2; let b1 = m.b1; let b2 = m.b2; let E = m.E;
+    let loss = 0 - num_ln(p[target] + 0.000000001);
+
+    // dlogits = p - onehot(target)
+    let dlog = [];
+    let v = 0;
+    while v < V { if v == target { push(dlog, p[v] - 1); } else { push(dlog, p[v]); } v = v + 1; }
+
+    // grads into W2/b2 and back to a1
+    let da1 = _zeros(H);
+    let h = 0;
+    while h < H {
+        let w2h = W2[h];
+        let a1h = a1[h];
+        let acc = da1[h];
+        let vv = 0;
+        while vv < V {
+            let g = dlog[vv];
+            acc = acc + w2h[vv] * g;
+            w2h[vv] = w2h[vv] - lr * a1h * g;
+            vv = vv + 1;
+        }
+        da1[h] = acc;
+        h = h + 1;
+    }
+    let vb = 0;
+    while vb < V { b2[vb] = b2[vb] - lr * dlog[vb]; vb = vb + 1; }
+
+    // through tanh: dz1 = da1 * (1 - a1^2)
+    let dz1 = [];
+    let h2 = 0;
+    while h2 < H { push(dz1, da1[h2] * (1 - a1[h2] * a1[h2])); h2 = h2 + 1; }
+
+    // grads into W1/b1 and back to x
+    let xn = len(x);
+    let dx = _zeros(xn);
+    let i = 0;
+    while i < xn {
+        let w1i = W1[i];
+        let xi = x[i];
+        let acc = dx[i];
+        let hh = 0;
+        while hh < H {
+            let g = dz1[hh];
+            acc = acc + w1i[hh] * g;
+            w1i[hh] = w1i[hh] - lr * xi * g;
+            hh = hh + 1;
+        }
+        dx[i] = acc;
+        i = i + 1;
+    }
+    let hb = 0;
+    while hb < H { b1[hb] = b1[hb] - lr * dz1[hb]; hb = hb + 1; }
+
+    // scatter dx back into the embedding rows
+    let k = 0;
+    while k < K {
+        let cid = ctx[k];
+        let erow = E[cid];
+        let base = k * D;
+        let d = 0;
+        while d < D {
+            erow[d] = erow[d] - lr * dx[base + d];
+            d = d + 1;
+        }
+        k = k + 1;
+    }
+    return loss;
+}
+
+// train(model, ids, epochs, lr, lr_decay) — slide a K-window over the id sequence with
+// online SGD; returns the average loss of the final epoch (a learning signal that should
+// fall over epochs). `lr_decay` is a per-epoch multiplier (default 1 = constant lr).
+// Setting it < 1 enables learning-rate ANNEALING: a higher initial lr explores quickly,
+// then the step shrinks so the model settles into a sharper minimum. On the curriculum
+// this reaches a much lower final loss than a flat lr for the same epoch budget (e.g.
+// ~0.31 vs ~1.71 at 40 epochs). The 4-argument call is unchanged (constant lr).
+// (Momentum was tried but amplifies per-sample noise in this online setting; annealing
+// is the win here.)
+fn train(m, ids, epochs, lr, lr_decay = 1) {
+    let cur_lr = lr;
+    let last = 0;
+    // Hoist the loop bounds out of the O(windows·epochs) inner loop: `len(ids)` and `m.K`
+    // were re-evaluated on every one of the ~5k×epochs iterations. Same traversal, fewer ops.
+    let K = m.K;
+    let n_ids = len(ids);
+    let e = 0;
+    while e < epochs {
+        let total = 0;
+        let n = 0;
+        let t = K;
+        while t < n_ids {
+            let ctx = [];
+            let start = t - K;
+            let j = 0;
+            while j < K { push(ctx, ids[start + j]); j = j + 1; }
+            total = total + train_step(m, ctx, ids[t], cur_lr);
+            n = n + 1;
+            t = t + 1;
+        }
+        if n > 0 { last = total / n; }
+        cur_lr = cur_lr * lr_decay;
+        e = e + 1;
+    }
+    return last;
+}
+
+// ── mini-batch optimizer: gradient accumulation + momentum ───────────────────────────
+// Online SGD updates per character, so each gradient is high-variance and momentum
+// destabilizes it. Averaging gradients over a BATCH of windows cuts that variance — the
+// regime where momentum actually helps: a running velocity accelerates consistent
+// descent. Gradient accumulators (g*) and velocity (v*) live on the model.
+fn _ensure_opt_buffers(m) {
+    if map_has(m, "gE") { return; }
+    m.gE = _zeros2(m.V, m.D);          m.vE = _zeros2(m.V, m.D);
+    m.gW1 = _zeros2(m.K * m.D, m.H);   m.vW1 = _zeros2(m.K * m.D, m.H);
+    m.gb1 = _zeros(m.H);               m.vb1 = _zeros(m.H);
+    m.gW2 = _zeros2(m.H, m.V);         m.vW2 = _zeros2(m.H, m.V);
+    m.gb2 = _zeros(m.V);               m.vb2 = _zeros(m.V);
+}
+
+// _backward_accum — forward + backward, ADDING gradients into the accumulators (no
+// parameter update). Same hand-derived gradients as train_step. Returns the loss.
+fn _backward_accum(m, ctx, target) {
+    let f = _forward(m, ctx);
+    let p = f.p; let a1 = f.a1; let x = f.x;
+    let loss = 0 - num_ln(p[target] + 0.000000001);
+
+    let dlog = [];
+    let v = 0;
+    while v < m.V { if v == target { push(dlog, p[v] - 1); } else { push(dlog, p[v]); } v = v + 1; }
+
+    let W2 = m.W2; let gW2 = m.gW2; let gb2 = m.gb2;
+    let da1 = _zeros(m.H);
+    let h = 0;
+    while h < m.H {
+        let vv = 0;
+        while vv < m.V {
+            da1[h] = da1[h] + W2[h][vv] * dlog[vv];
+            gW2[h][vv] = gW2[h][vv] + a1[h] * dlog[vv];
+            vv = vv + 1;
+        }
+        h = h + 1;
+    }
+    let vb = 0;
+    while vb < m.V { gb2[vb] = gb2[vb] + dlog[vb]; vb = vb + 1; }
+
+    let dz1 = [];
+    let h2 = 0;
+    while h2 < m.H { push(dz1, da1[h2] * (1 - a1[h2] * a1[h2])); h2 = h2 + 1; }
+
+    let W1 = m.W1; let gW1 = m.gW1; let gb1 = m.gb1;
+    let dx = _zeros(len(x));
+    let i = 0;
+    while i < len(x) {
+        let hh = 0;
+        while hh < m.H {
+            dx[i] = dx[i] + W1[i][hh] * dz1[hh];
+            gW1[i][hh] = gW1[i][hh] + x[i] * dz1[hh];
+            hh = hh + 1;
+        }
+        i = i + 1;
+    }
+    let hb = 0;
+    while hb < m.H { gb1[hb] = gb1[hb] + dz1[hb]; hb = hb + 1; }
+
+    let gE = m.gE;
+    let k = 0;
+    while k < m.K {
+        let d = 0;
+        while d < m.D {
+            let cid = ctx[k];
+            gE[cid][d] = gE[cid][d] + dx[k * m.D + d];
+            d = d + 1;
+        }
+        k = k + 1;
+    }
+    return loss;
+}
+
+// _apply_batch — momentum update from the averaged accumulated gradients, then reset the
+// accumulators to zero. v = mom*v - (lr/count)*g ; param = param + v.
+fn _apply_batch(m, lr, mom, count) {
+    if count <= 0 { return; }
+    let scale = lr / count;
+
+    let E = m.E; let gE = m.gE; let vE = m.vE;
+    let r = 0;
+    while r < m.V {
+        let c = 0;
+        while c < m.D {
+            vE[r][c] = mom * vE[r][c] - scale * gE[r][c];
+            E[r][c] = E[r][c] + vE[r][c];
+            gE[r][c] = 0;
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    let W1 = m.W1; let gW1 = m.gW1; let vW1 = m.vW1; let kd = m.K * m.D;
+    let i = 0;
+    while i < kd {
+        let h = 0;
+        while h < m.H {
+            vW1[i][h] = mom * vW1[i][h] - scale * gW1[i][h];
+            W1[i][h] = W1[i][h] + vW1[i][h];
+            gW1[i][h] = 0;
+            h = h + 1;
+        }
+        i = i + 1;
+    }
+    let b1 = m.b1; let gb1 = m.gb1; let vb1 = m.vb1;
+    let h1 = 0;
+    while h1 < m.H {
+        vb1[h1] = mom * vb1[h1] - scale * gb1[h1];
+        b1[h1] = b1[h1] + vb1[h1];
+        gb1[h1] = 0;
+        h1 = h1 + 1;
+    }
+    let W2 = m.W2; let gW2 = m.gW2; let vW2 = m.vW2;
+    let h2 = 0;
+    while h2 < m.H {
+        let vv = 0;
+        while vv < m.V {
+            vW2[h2][vv] = mom * vW2[h2][vv] - scale * gW2[h2][vv];
+            W2[h2][vv] = W2[h2][vv] + vW2[h2][vv];
+            gW2[h2][vv] = 0;
+            vv = vv + 1;
+        }
+        h2 = h2 + 1;
+    }
+    let b2 = m.b2; let gb2 = m.gb2; let vb2 = m.vb2;
+    let vb = 0;
+    while vb < m.V {
+        vb2[vb] = mom * vb2[vb] - scale * gb2[vb];
+        b2[vb] = b2[vb] + vb2[vb];
+        gb2[vb] = 0;
+        vb = vb + 1;
+    }
+}
+
+// train_batch — mini-batch training: accumulate gradients over `batch_size` windows,
+// then apply one momentum update. Optional per-epoch lr_decay anneals as in train().
+// Returns the final-epoch average loss.
+fn train_batch(m, ids, epochs, lr, batch_size, momentum = 0.9, lr_decay = 1) {
+    _ensure_opt_buffers(m);
+    let bs = batch_size;
+    if bs < 1 { bs = 1; }
+    let cur_lr = lr;
+    let last = 0;
+    let e = 0;
+    while e < epochs {
+        let total = 0;
+        let n = 0;
+        let count = 0;
+        let t = m.K;
+        while t < len(ids) {
+            let ctx = [];
+            let j = 0;
+            while j < m.K { push(ctx, ids[t - m.K + j]); j = j + 1; }
+            total = total + _backward_accum(m, ctx, ids[t]);
+            count = count + 1;
+            n = n + 1;
+            if count >= bs {
+                _apply_batch(m, cur_lr, momentum, count);
+                count = 0;
+            }
+            t = t + 1;
+        }
+        if count > 0 { _apply_batch(m, cur_lr, momentum, count); }
+        if n > 0 { last = total / n; }
+        cur_lr = cur_lr * lr_decay;
+        e = e + 1;
+    }
+    return last;
+}
+
+// avg_loss(model, ids) — mean cross-entropy over the sequence (no update).
+fn avg_loss(m, ids) {
+    let total = 0; let n = 0;
+    let K = m.K;
+    let n_ids = len(ids);
+    let t = K;
+    while t < n_ids {
+        let ctx = [];
+        let start = t - K;
+        let j = 0;
+        while j < K { push(ctx, ids[start + j]); j = j + 1; }
+        let f = _forward(m, ctx);
+        total = total + (0 - num_ln(f.p[ids[t]] + 0.000000001));
+        n = n + 1;
+        t = t + 1;
+    }
+    if n > 0 { return total / n; }
+    return 0;
+}
+
+// ══ Tensorized mini-batch training (uses the VM `tensor_matmul` kernel) ═══════════════════
+// The interpreted per-sample train() is O(H·V) nested-loop math per character. Batching B
+// windows turns each layer into ONE matrix multiply routed through `tensor_matmul` — which is
+// rayon-parallel across CPU cores, and GPU-offloaded when the VM is built `--features gpu`. The
+// tensor kernels are forward-only, so backprop stays explicit, but every heavy step (forward
+// AND the gradient matmuls dW2=A1ᵀ·dLog, dA1=dLog·W2ᵀ, dW1=Xᵀ·dZ1, dX=dZ1·W1ᵀ) is a matmul,
+// leaving only cheap O(B·H)/O(B·V) elementwise work in interpreted pblang. This is mini-batch
+// gradient descent (one update per batch) — a standard, stable variant of train()'s online
+// SGD. It is an ADDITIVE opt-in path; train()/train_nano() are unchanged.
+
+fn _flatten_rows(mat, rows, cols) {
+    let out = [];
+    let r = 0;
+    while r < rows {
+        let row = mat[r];
+        let c = 0;
+        while c < cols { push(out, row[c]); c = c + 1; }
+        r = r + 1;
+    }
+    return out;
+}
+
+// (rows×cols) row-major flat -> (cols×rows) row-major flat.
+fn _transpose_flat(flat, rows, cols) {
+    let out = [];
+    let c = 0;
+    while c < cols {
+        let r = 0;
+        while r < rows { push(out, flat[r * cols + c]); r = r + 1; }
+        c = c + 1;
+    }
+    return out;
+}
+
+// _forward_batch(m, ctxs) — batched forward for B contexts (each K ids). Returns flat X (B×KD),
+// A1 (B×H) and P (B×V); matches _forward row-for-row (same math, tensor_matmul sum order).
+fn _forward_batch(m, ctxs) {
+    let B = len(ctxs);
+    let K = m.K; let D = m.D; let H = m.H; let V = m.V;
+    let KD = K * D;
+    let E = m.E; let b1 = m.b1; let b2 = m.b2;
+    let X = [];
+    let bi = 0;
+    while bi < B {
+        let ctx = ctxs[bi];
+        let k = 0;
+        while k < K {
+            let erow = E[ctx[k]];
+            let d = 0;
+            while d < D { push(X, erow[d]); d = d + 1; }
+            k = k + 1;
+        }
+        bi = bi + 1;
+    }
+    let w1 = _flatten_rows(m.W1, KD, H);
+    let z1 = tensor_matmul(map{ shape: [B, KD], data: X }, map{ shape: [KD, H], data: w1 }).data;
+    let A1 = [];
+    let r = 0;
+    while r < B {
+        let base = r * H;
+        let h = 0;
+        while h < H { push(A1, _tanh(z1[base + h] + b1[h])); h = h + 1; }
+        r = r + 1;
+    }
+    let w2 = _flatten_rows(m.W2, H, V);
+    let logits = tensor_matmul(map{ shape: [B, H], data: A1 }, map{ shape: [H, V], data: w2 }).data;
+    let P = [];
+    let r2 = 0;
+    while r2 < B {
+        let base = r2 * V;
+        let mx = logits[base] + b2[0];
+        let v = 1;
+        while v < V { let z = logits[base + v] + b2[v]; if z > mx { mx = z; } v = v + 1; }
+        let es = [];
+        let sum = 0;
+        let v2 = 0;
+        while v2 < V { let e = num_exp(logits[base + v2] + b2[v2] - mx); push(es, e); sum = sum + e; v2 = v2 + 1; }
+        if not (sum > 0) { sum = 1; }
+        let v3 = 0;
+        while v3 < V { push(P, es[v3] / sum); v3 = v3 + 1; }
+        r2 = r2 + 1;
+    }
+    return map{ X: X, A1: A1, P: P, B: B, KD: KD };
+}
+
+// train_batch_tensor(m, ids, epochs, lr, batch_size, lr_decay) — mini-batch GD via tensor_matmul.
+// Mutates m in place; returns the average loss of the final epoch (falls over epochs, like train()).
+fn train_batch_tensor(m, ids, epochs, lr, batch_size = 64, lr_decay = 1) {
+    let K = m.K; let D = m.D; let H = m.H; let V = m.V;
+    let KD = K * D;
+    let n_ids = len(ids);
+    let cur_lr = lr;
+    let last = 0;
+    let e = 0;
+    while e < epochs {
+        let total = 0; let nb = 0;
+        let start = K;
+        while start < n_ids {
+            let ctxs = []; let targets = [];
+            let t = start; let count = 0;
+            while t < n_ids and count < batch_size {
+                let ctx = [];
+                let j = 0;
+                while j < K { push(ctx, ids[t - K + j]); j = j + 1; }
+                push(ctxs, ctx);
+                push(targets, ids[t]);
+                count = count + 1;
+                t = t + 1;
+            }
+            let B = len(ctxs);
+            let f = _forward_batch(m, ctxs);
+            let P = f.P; let A1 = f.A1; let X = f.X;
+            // loss + dLogits = (P - onehot) / B  (mean gradient over the batch)
+            let dLog = [];
+            let loss = 0;
+            let invB = 1 / B;
+            let r = 0;
+            while r < B {
+                let base = r * V;
+                let tgt = targets[r];
+                loss = loss - num_ln(P[base + tgt] + 0.000000001);
+                let v = 0;
+                while v < V {
+                    let g = P[base + v];
+                    if v == tgt { g = g - 1; }
+                    push(dLog, g * invB);
+                    v = v + 1;
+                }
+                r = r + 1;
+            }
+            total = total + loss / B; nb = nb + 1;
+            // gradient matmuls (transposes are cheap; the matmuls run on the tensor kernel)
+            let A1t = _transpose_flat(A1, B, H);                                   // H×B
+            let dW2 = tensor_matmul(map{ shape: [H, B], data: A1t }, map{ shape: [B, V], data: dLog }).data; // H×V
+            let w2 = _flatten_rows(m.W2, H, V);
+            let w2t = _transpose_flat(w2, H, V);                                   // V×H
+            let dA1 = tensor_matmul(map{ shape: [B, V], data: dLog }, map{ shape: [V, H], data: w2t }).data; // B×H
+            let dZ1 = [];
+            let i = 0;
+            let BH = B * H;
+            while i < BH { let a = A1[i]; push(dZ1, dA1[i] * (1 - a * a)); i = i + 1; }
+            let Xt = _transpose_flat(X, B, KD);                                    // KD×B
+            let dW1 = tensor_matmul(map{ shape: [KD, B], data: Xt }, map{ shape: [B, H], data: dZ1 }).data;  // KD×H
+            let w1 = _flatten_rows(m.W1, KD, H);
+            let w1t = _transpose_flat(w1, KD, H);                                  // H×KD
+            let dX = tensor_matmul(map{ shape: [B, H], data: dZ1 }, map{ shape: [H, KD], data: w1t }).data;  // B×KD
+            // apply updates: W2, b2, W1, b1, then scatter dX into the embedding rows
+            let h = 0;
+            while h < H {
+                let w2row = m.W2[h];
+                let hv = h * V;
+                let v = 0;
+                while v < V { w2row[v] = w2row[v] - cur_lr * dW2[hv + v]; v = v + 1; }
+                h = h + 1;
+            }
+            let vb = 0;
+            while vb < V {
+                let s = 0; let rr = 0;
+                while rr < B { s = s + dLog[rr * V + vb]; rr = rr + 1; }
+                m.b2[vb] = m.b2[vb] - cur_lr * s;
+                vb = vb + 1;
+            }
+            let ii = 0;
+            while ii < KD {
+                let w1row = m.W1[ii];
+                let ih = ii * H;
+                let hh = 0;
+                while hh < H { w1row[hh] = w1row[hh] - cur_lr * dW1[ih + hh]; hh = hh + 1; }
+                ii = ii + 1;
+            }
+            let hb = 0;
+            while hb < H {
+                let s = 0; let rr = 0;
+                while rr < B { s = s + dZ1[rr * H + hb]; rr = rr + 1; }
+                m.b1[hb] = m.b1[hb] - cur_lr * s;
+                hb = hb + 1;
+            }
+            let rb = 0;
+            while rb < B {
+                let ctx = ctxs[rb];
+                let rbase = rb * KD;
+                let k = 0;
+                while k < K {
+                    let erow = m.E[ctx[k]];
+                    let kb = rbase + k * D;
+                    let d = 0;
+                    while d < D { erow[d] = erow[d] - cur_lr * dX[kb + d]; d = d + 1; }
+                    k = k + 1;
+                }
+                rb = rb + 1;
+            }
+            start = t;
+        }
+        if nb > 0 { last = total / nb; }
+        cur_lr = cur_lr * lr_decay;
+        e = e + 1;
+    }
+    return last;
+}
+
+// tensor_selftest() — max |P_batch - p_single| across a few contexts. ~1e-12 (FP order only)
+// proves the batched forward matches the reference _forward exactly.
+fn tensor_selftest() {
+    let corpus = source_corpus();
+    let vocab = vocab_build(corpus);
+    let ids = encode(vocab, corpus);
+    let m = model_new(vocab.size, 6, 16, 3, 7, "xavier");
+    let ctxs = [];
+    let i = 0;
+    while i < 4 { push(ctxs, [ids[i], ids[i + 1], ids[i + 2]]); i = i + 1; }
+    let fb = _forward_batch(m, ctxs);
+    let V = m.V;
+    let maxdiff = 0;
+    let b = 0;
+    while b < len(ctxs) {
+        let single = _forward(m, ctxs[b]);
+        let v = 0;
+        while v < V {
+            let d = fb.P[b * V + v] - single.p[v];
+            if d < 0 { d = 0 - d; }
+            if d > maxdiff { maxdiff = d; }
+            v = v + 1;
+        }
+        b = b + 1;
+    }
+    return maxdiff;
+}
+
+// train_nano_tensor(epochs, lr, batch_size) — a faster drop-in for train_nano() that trains via
+// the tensorized mini-batch path (tensor_matmul: multi-core CPU, GPU-offloaded with --features
+// gpu). Shares the SAME in-memory + disk checkpoint cache as train_nano (a nano checkpoint is a
+// nano checkpoint however it was trained), so nano_checkpoint_peek/model_status reuse it.
+fn train_nano_tensor(epochs = 18, lr = 0.25, batch_size = 64) {
+    let corpus = source_corpus();
+    if _NANO_CKPT != nil and _NANO_EPOCHS == epochs and _NANO_LR == lr and _NANO_CORPUS == corpus { return _NANO_CKPT; }
+    let key = _nano_cache_key(corpus, epochs, lr);
+    let disk = _read_nano_checkpoint();
+    if disk != nil and (try disk.key catch "") == key and (try disk.ckpt catch nil) != nil {
+        _NANO_CKPT = disk.ckpt;
+        _NANO_EPOCHS = epochs;
+        _NANO_LR = lr;
+        _NANO_CORPUS = corpus;
+        return _NANO_CKPT;
+    }
+    let vocab = vocab_build(corpus);
+    let ids = encode(vocab, corpus);
+    let init_mode = "default";
+    if epochs < 12 { init_mode = "xavier"; }
+    let model = model_new(vocab.size, 6, 16, 3, 7, init_mode);
+    let loss0 = avg_loss(model, ids);
+    train_batch_tensor(model, ids, epochs, lr, batch_size, 0.96);
+    let loss1 = avg_loss(model, ids);
+    _NANO_CKPT = checkpoint(model, vocab, "pbAI-Nano", "stdlib/pbai_lm.sapp::source_corpus", loss0, loss1);
+    _NANO_EPOCHS = epochs;
+    _NANO_LR = lr;
+    _NANO_CORPUS = corpus;
+    _write_nano_checkpoint(map{ key: key, ckpt: _NANO_CKPT });
+    return _NANO_CKPT;
+}
+
+// next_id(model, ctx) — the most likely next token, chosen with the tensor_argmax
+// KERNEL over the model's logits (the inference path runs over the tensor builtins).
+fn next_id(m, ctx) {
+    let f = _forward(m, ctx);
+    let logits_t = map{ shape: [m.V], data: f.logits, dtype: "f32" };
+    return tensor_argmax(logits_t);     // native kernel
+}
+
+// generate(model, vocab, seed_text, n) — autoregressive greedy generation. Seeds the
+// context from the last K chars of seed_text and emits n more characters.
+fn generate(m, vocab, seed_text, n) {
+    let ids = encode(vocab, seed_text);
+    // pad/trim to a K-length context (pad with the first id if too short)
+    let ctx = [];
+    let start = len(ids) - m.K;
+    let j = 0;
+    while j < m.K {
+        let idx = start + j;
+        if idx < 0 { push(ctx, 0); } else { push(ctx, ids[idx]); }
+        j = j + 1;
+    }
+    let out = seed_text;
+    let step = 0;
+    while step < n {
+        let nid = next_id(m, ctx);
+        out = out + strfromcharcode(vocab.id2ch[nid]);
+        // shift the context window
+        let nc = [];
+        let s = 1;
+        while s < m.K { push(nc, ctx[s]); s = s + 1; }
+        push(nc, nid);
+        ctx = nc;
+        step = step + 1;
+    }
+    return out;
+}
+
+// ── stochastic generation: temperature + top-k sampling with a deterministic RNG ──
+// Greedy argmax (next_id/generate) is stable but collapses a tiny LM into repetitive
+// loops. Temperature reshapes the softmax, top-k truncates the unlikely tail, and a
+// light repetition penalty discourages immediate echoes — much better samples, and
+// still 100% pblang. The RNG is a seeded LCG so every sample is reproducible/testable.
+
+fn rng_new(seed) {
+    // single-element array as a mutable cell (array index assignment is exact)
+    return [num_mod(seed * 2654435761 + 12345, 4294967296)];
+}
+
+fn _rng_next(rng) {
+    // 32-bit LCG (Numerical Recipes constants). Products stay < 2^53, so the double
+    // arithmetic is exact and the stream is fully deterministic.
+    rng[0] = num_mod(rng[0] * 1664525 + 1013904223, 4294967296);
+    return rng[0] / 4294967296;          // ~[0,1)
+}
+
+// _kth_largest(values, k) — the k-th largest value (1-indexed) via partial selection.
+fn _kth_largest(values, k) {
+    let arr = [];
+    let i = 0;
+    while i < len(values) { push(arr, values[i]); i = i + 1; }
+    let kth = arr[0];
+    let c = 0;
+    while c < k and c < len(arr) {
+        let mi = 0;
+        let mx = 0 - 1000000000;
+        let j = 0;
+        while j < len(arr) {
+            if arr[j] > mx { mx = arr[j]; mi = j; }
+            j = j + 1;
+        }
+        kth = arr[mi];
+        arr[mi] = 0 - 1000000000;         // drop the current max and continue
+        c = c + 1;
+    }
+    return kth;
+}
+
+// _sample_logits(logits, temperature, top_k, recent, rep_penalty) — turn raw logits
+// into a sampling distribution. Applies a repetition penalty to recently emitted ids,
+// temperature scaling, then optional top-k truncation, and renormalizes.
+fn _sample_logits(logits, temperature, top_k, recent, rep_penalty) {
+    let n = len(logits);
+    let adj = [];
+    let i = 0;
+    while i < n { push(adj, logits[i]); i = i + 1; }
+
+    if rep_penalty > 0 and recent != nil {
+        let r = 0;
+        while r < len(recent) {
+            let id = recent[r];
+            if id >= 0 and id < n { adj[id] = adj[id] - rep_penalty; }
+            r = r + 1;
+        }
+    }
+
+    let temp = temperature;
+    if temp < 0.01 { temp = 0.01; }       // guard against div-by-zero / overflow
+
+    let mx = adj[0];
+    let a = 1;
+    while a < n { if adj[a] > mx { mx = adj[a]; } a = a + 1; }
+
+    let probs = [];
+    let s = 0;
+    let b = 0;
+    while b < n {
+        let e = num_exp((adj[b] - mx) / temp);
+        push(probs, e);
+        s = s + e;
+        b = b + 1;
+    }
+    // Guard: temperature-scaled max-subtraction keeps s >= 1 for finite logits, but a
+    // NaN/Inf weight would zero/NaN the sum. Fall back to uniform before normalizing.
+    if not (s > 0) {
+        let cu = 0;
+        while cu < n { probs[cu] = 1 / n; cu = cu + 1; }
+        s = 1;
+    } else {
+        let c = 0;
+        while c < n { probs[c] = probs[c] / s; c = c + 1; }
+    }
+
+    if top_k > 0 and top_k < n {
+        let kth = _kth_largest(probs, top_k);
+        let s2 = 0;
+        let g = 0;
+        while g < n {
+            if probs[g] < kth { probs[g] = 0; }
+            s2 = s2 + probs[g];
+            g = g + 1;
+        }
+        if s2 > 0 {
+            let h = 0;
+            while h < n { probs[h] = probs[h] / s2; h = h + 1; }
+        }
+    }
+    return probs;
+}
+
+fn _sample_from(probs, rng) {
+    let r = _rng_next(rng);
+    let cum = 0;
+    let i = 0;
+    while i < len(probs) {
+        cum = cum + probs[i];
+        if r < cum { return i; }
+        i = i + 1;
+    }
+    return len(probs) - 1;
+}
+
+// sample_next_id — draw the next token id from the temperature/top-k/penalty-shaped
+// distribution instead of taking the argmax.
+fn sample_next_id(m, ctx, rng, temperature = 0.8, top_k = 0, recent = nil, rep_penalty = 0) {
+    let f = _forward(m, ctx);
+    let probs = _sample_logits(f.logits, temperature, top_k, recent, rep_penalty);
+    return _sample_from(probs, rng);
+}
+
+// generate_sampled — autoregressive sampling generation. Same context handling as
+// generate(), but each step samples (seeded for reproducibility) and keeps a short
+// window of recent ids so the repetition penalty can break degenerate loops.
+fn generate_sampled(m, vocab, seed_text, n, temperature = 0.8, top_k = 0, seed = 1, rep_penalty = 0) {
+    let ids = encode(vocab, seed_text);
+    let ctx = [];
+    let start = len(ids) - m.K;
+    let j = 0;
+    while j < m.K {
+        let idx = start + j;
+        if idx < 0 { push(ctx, 0); } else { push(ctx, ids[idx]); }
+        j = j + 1;
+    }
+    let rng = rng_new(seed);
+    let recent = [];
+    let window = m.K * 2;
+    let out = seed_text;
+    let step = 0;
+    while step < n {
+        let nid = sample_next_id(m, ctx, rng, temperature, top_k, recent, rep_penalty);
+        out = out + strfromcharcode(vocab.id2ch[nid]);
+        let nc = [];
+        let sft = 1;
+        while sft < m.K { push(nc, ctx[sft]); sft = sft + 1; }
+        push(nc, nid);
+        ctx = nc;
+        push(recent, nid);
+        if len(recent) > window {
+            let trimmed = [];
+            let ri = len(recent) - window;
+            while ri < len(recent) { push(trimmed, recent[ri]); ri = ri + 1; }
+            recent = trimmed;
+        }
+        step = step + 1;
+    }
+    return out;
+}
+
+fn source_corpus() {
+    return DEFAULT_CORPUS + CURRICULUM_CORPUS + live_corpus();
+}
+
+fn curriculum_corpus() {
+    return CURRICULUM_CORPUS;
+}
+
+fn live_corpus_path() {
+    return _state_path(LIVE_CORPUS_NAME);
+}
+
+fn live_corpus() {
+    let path = live_corpus_path(); if path == "" { return ""; }
+    let loaded = SECURE_FILE.read_optional_text(path, MAX_LIVE_CORPUS_BYTES, true);
+    if not loaded.ok or (try loaded.missing catch false) { return ""; }
+    return loaded.text;
+}
+
+fn live_stats() {
+    let live = live_corpus();
+    // Reuse the descriptor-held live read above. source_corpus() would read the
+    // same private file a second time during every status call.
+    let source = DEFAULT_CORPUS + CURRICULUM_CORPUS + live;
+    return map{
+        live_chars: len(live),
+        live_bytes: len(str_to_bytes(live)),
+        source_chars: len(source),
+        source_bytes: len(str_to_bytes(source)),
+        has_live_data: len(str_trim(live)) > 0
+    };
+}
+
+fn _admission_valid(admission) {
+    return type(admission) == "map"
+        and (try admission.format catch "") == "pbai.dataset.batch-admission.v1"
+        and (try admission.passed catch false)
+        and (try admission.admitted_records catch 0) == 1
+        and (try admission.rejected_records catch 1) == 0
+        and (try admission.policy_version catch "") == (try import("pbai_dataset_policy.sapp") catch import("editors/ide/tools/ai/core/pbai_dataset_policy.sapp")).POLICY_VERSION;
+}
+
+fn _batch_sample(texts) {
+    if type(texts) != "array" or len(texts) < 1 or len(texts) > 16 {
+        return map{ ok: false, sample: "" };
+    }
+    let parts = [];
+    let input_bytes = 0;
+    let i = 0;
+    while i < len(texts) {
+        if type(texts[i]) != "string" { return map{ ok: false, sample: "" }; }
+        if len(texts[i]) > MAX_ADMITTED_BATCH_ITEM_BYTES {
+            return map{ ok: false, sample: "" };
+        }
+        let item_bytes = len(str_to_bytes(texts[i]));
+        if item_bytes > MAX_ADMITTED_BATCH_ITEM_BYTES
+            or input_bytes + item_bytes > MAX_ADMITTED_BATCH_INPUT_BYTES {
+            return map{ ok: false, sample: "" };
+        }
+        input_bytes = input_bytes + item_bytes;
+        let sample = str_trim(LIVE_DATA.sanitize_text(texts[i]).text);
+        if sample == "" { return map{ ok: false, sample: "" }; }
+        push(parts, sample);
+        i = i + 1;
+    }
+    return map{ ok: true, sample: str_join(parts, "\n\n") };
+}
+
+fn _store_live_sample_atomic(sample) {
+    let storage = _state_root_status();
+    if not storage.ok {
+        return map{ ok: false, status: storage.reason, live: live_stats(),
+            published: false, retry_safe: true };
+    }
+    let framed = "\n\n### learned sample\n" + sample + "\n";
+    let wrote = SECURE_FILE.append_text_bounded_locked(live_corpus_path(), framed,
+        MAX_LIVE_CORPUS_BYTES, 2000);
+    if not wrote.ok {
+        let status = "atomic-write-failed";
+        let message = try wrote.error catch "";
+        if str_contains(message, "exceed the byte limit") { status = "corpus-full"; }
+        elif try wrote.timeout catch false { status = "corpus-lock-timeout"; }
+        elif str_contains(message, "ownership") or str_contains(message, "permissions") {
+            status = "state-root-not-private";
+        }
+        return map{ ok: false, status: status, live: live_stats(),
+            published: try wrote.published catch false,
+            retry_safe: try wrote.retry_safe catch false };
+    }
+    _NANO_CKPT = nil;
+    _NANO_CORPUS = "";
+    return map{ ok: true, status: "stored", live: live_stats(),
+        final_bytes: wrote.final_bytes, locked_atomic_replacement: true };
+}
+
+fn admitted_batch_fits_from_bytes(current_bytes, texts) {
+    if type(current_bytes) != "number" or current_bytes < 0
+        or current_bytes != num_floor(current_bytes) { return false; }
+    let batch = _batch_sample(texts);
+    if not batch.ok { return false; }
+    let framed = "\n\n### learned sample\n" + batch.sample + "\n";
+    return current_bytes + len(str_to_bytes(framed)) <= MAX_LIVE_CORPUS_BYTES;
+}
+
+fn remember_admitted_batch(texts, admission) {
+    if not _admission_valid(admission) {
+        return map{ ok: false, status: "invalid-admission", live: live_stats() };
+    }
+    let batch = _batch_sample(texts);
+    if not batch.ok { return map{ ok: false, status: "invalid-batch", live: live_stats() }; }
+    let stored = _store_live_sample_atomic(batch.sample);
+    stored.batch_items = len(texts);
+    return stored;
+}
+
+fn max_live_corpus_bytes() { return MAX_LIVE_CORPUS_BYTES; }
+
+fn _append_live_sample(sample) {
+    if sample == "" { return live_stats(); }
+    let stored = _store_live_sample_atomic(sample);
+    if not stored.ok { throw "pbAI live lesson was not stored: " + stored.status; }
+    return stored.live;
+}
+
+fn remember_text(text) {
+    if type(text) != "string" or len(text) > MAX_DIRECT_LESSON_BYTES
+        or len(str_to_bytes(text)) > MAX_DIRECT_LESSON_BYTES {
+        throw "pbAI live lesson rejected by the direct lesson byte limit";
+    }
+    let sample = str_trim(LIVE_DATA.sanitize_text(text).text);
+    if sample == "" { return live_stats(); }
+    if not (try import("pbai_dataset_policy.sapp") catch import("editors/ide/tools/ai/core/pbai_dataset_policy.sapp")).scan_text(sample).passed {
+        throw "pbAI live lesson rejected by privacy or poisoning policy: "
+            + str((try import("pbai_dataset_policy.sapp") catch import("editors/ide/tools/ai/core/pbai_dataset_policy.sapp")).scan_text(sample).reasons);
+    }
+    return _append_live_sample(sample);
+}
+
+fn remember_admitted_text(text, admission) {
+    let result = remember_admitted_batch([text], admission);
+    if not result.ok { throw "pbAI admitted lesson was not stored: " + result.status; }
+    return result.live;
+}
+
+fn checkpoint(model, vocab, tier, source, loss_before, loss_after) {
+    return map{
+        format: "pbai.lm.char.v1",
+        tier: tier,
+        source: source,
+        vocab: vocab,
+        model: model,
+        metrics: map{ loss_before: loss_before, loss_after: loss_after },
+        architecture: map{
+            kind: "char-neural-lm",
+            context: model.K,
+            embedding: model.D,
+            hidden: model.H,
+            vocab_size: model.V
+        }
+    };
+}
+
+fn checkpoint_generate(ckpt, seed_text, n) {
+    return generate(ckpt.model, ckpt.vocab, seed_text, n);
+}
+
+fn train_nano(epochs = 18, lr = 0.25) {
+    let corpus = source_corpus();
+    if _NANO_CKPT != nil and _NANO_EPOCHS == epochs and _NANO_LR == lr and _NANO_CORPUS == corpus { return _NANO_CKPT; }
+    let key = _nano_cache_key(corpus, epochs, lr);
+    // Cross-process cache: reuse a disk checkpoint trained on the same (corpus, epochs, lr)
+    // instead of retraining. The `key` guard guarantees the cached model matches the current
+    // inputs, so a stale corpus or changed hyper-params always miss and retrain.
+    let disk = _read_nano_checkpoint();
+    if disk != nil and (try disk.key catch "") == key and (try disk.ckpt catch nil) != nil {
+        _NANO_CKPT = disk.ckpt;
+        _NANO_EPOCHS = epochs;
+        _NANO_LR = lr;
+        _NANO_CORPUS = corpus;
+        return _NANO_CKPT;
+    }
+    let vocab = vocab_build(corpus);
+    let ids = encode(vocab, corpus);
+    // Xavier init trains faster in the few-epoch regime (the live generate/learn paths);
+    // the default heuristic reaches a slightly sharper minimum given many epochs.
+    let init_mode = "default";
+    if epochs < 12 { init_mode = "xavier"; }
+    // Capacity: D6/H16/K3 measured ~18% lower loss than D4/H10/K3 on a representative
+    // corpus at this budget (bigger K undertrains here, so the context stays at 3).
+    let model = model_new(vocab.size, 6, 16, 3, 7, init_mode);
+    let loss0 = avg_loss(model, ids);
+    train(model, ids, epochs, lr, 0.96);     // lr annealing -> sharper convergence
+    let loss1 = avg_loss(model, ids);
+    // LR BACKOFF (correctness): in the few-epoch live-learn regime a starting lr can OVERSHOOT on a
+    // grown corpus, leaving loss1 >= loss0 — i.e. learn() would report NEGATIVE learning (loss_after >
+    // loss_before). Retry from the SAME deterministic init (seed 7 → identical loss0) with a halved lr
+    // until training actually reduces loss, up to 3 backoffs. Extra passes happen ONLY when the first
+    // attempt diverged, so the common (already-converging) path pays nothing.
+    let _bk = 0;
+    while loss1 >= loss0 and _bk < 3 {
+        lr = lr * 0.5;
+        model = model_new(vocab.size, 6, 16, 3, 7, init_mode);
+        train(model, ids, epochs, lr, 0.96);
+        loss1 = avg_loss(model, ids);
+        _bk = _bk + 1;
+    }
+    _NANO_CKPT = checkpoint(model, vocab, "pbAI-Nano", "stdlib/pbai_lm.sapp::source_corpus", loss0, loss1);
+    _NANO_EPOCHS = epochs;
+    _NANO_LR = lr;
+    _NANO_CORPUS = corpus;
+    // Persist for the next process; best-effort (a read-only FS just means no cache).
+    _write_nano_checkpoint(map{ key: key, ckpt: _NANO_CKPT });
+    return _NANO_CKPT;
+}
+
+// nano_checkpoint_peek — the trained nano checkpoint WITHOUT ever training: the resident
+// one if it matches, else a matching disk cache, else nil. Status/health callers
+// (pbai.model_status, a `/status` route) must stay cheap and must never trigger a train —
+// a char-LM train costs seconds-to-minutes under the interpreter. Returns nil on a miss so
+// the caller can report "not-trained" instead of blocking.
+fn nano_checkpoint_peek(epochs = 18, lr = 0.25) {
+    let corpus = source_corpus();
+    if _NANO_CKPT != nil and _NANO_EPOCHS == epochs and _NANO_LR == lr and _NANO_CORPUS == corpus { return _NANO_CKPT; }
+    let key = _nano_cache_key(corpus, epochs, lr);
+    let disk = _read_nano_checkpoint();
+    if disk != nil and (try disk.key catch "") == key and (try disk.ckpt catch nil) != nil { return disk.ckpt; }
+    return nil;
+}
+
+// ── parallel best-of-N training (multi-core CPU) ─────────────────────────────────────
+// pblang training runs on one interpreted thread, so a single model uses ~one CPU core
+// (hence low total CPU on a many-core machine). spawn() runs closures on real OS threads,
+// so training N models with different seeds in PARALLEL uses ~N cores for roughly the
+// wall-time of ONE model (measured ~3.6x on 4 cores), and keeping the lowest-loss model
+// reliably beats a single seed. This is pure CPU work — pblang has no GPU/NPU compute
+// backend, so the math stays on the CPU — and it is safe to scale on modern hardware
+// (the OS handles thermal throttling).
+fn _nano_worker(ids, vsize, epochs, lr, seed) {
+    return fn() {
+        let init_mode = "default";
+        if epochs < 12 { init_mode = "xavier"; }
+        let model = model_new(vsize, 6, 16, 3, seed, init_mode);
+        let loss0 = avg_loss(model, ids);
+        train(model, ids, epochs, lr, 0.96);
+        let loss1 = avg_loss(model, ids);
+        return map{ model: model, loss0: loss0, loss1: loss1, seed: seed };
+    };
+}
+
+// train_best — train `workers` models in parallel (distinct seeds) and return the best
+// result map{ model, loss0, loss1, seed }. workers <= 1 runs a single model sequentially.
+fn train_best(ids, vsize, workers, epochs, lr) {
+    let n = workers;
+    if n < 1 { n = 1; }
+    let results = [];
+    if n == 1 {
+        results = [_nano_worker(ids, vsize, epochs, lr, 7)()];
+    } else {
+        let handles = [];
+        let i = 0;
+        while i < n {
+            push(handles, spawn(_nano_worker(ids, vsize, epochs, lr, 7 + i * 101)));
+            i = i + 1;
+        }
+        results = join_all(handles);
+    }
+    let best = results[0];
+    let j = 1;
+    while j < len(results) {
+        if results[j].loss1 < best.loss1 { best = results[j]; }
+        j = j + 1;
+    }
+    return best;
+}
+
+// train_nano_parallel — like train_nano but trains `workers` models concurrently and
+// keeps the lowest-loss one (best-of-N). Uses multiple CPU cores; primes the same cache.
+fn train_nano_parallel(workers = 4, epochs = 18, lr = 0.25) {
+    let corpus = source_corpus();
+    let vocab = vocab_build(corpus);
+    let ids = encode(vocab, corpus);
+    let best = train_best(ids, vocab.size, workers, epochs, lr);
+    _NANO_CKPT = checkpoint(best.model, vocab, "pbAI-Nano", "stdlib/pbai_lm.sapp::source_corpus", best.loss0, best.loss1);
+    _NANO_EPOCHS = epochs;
+    _NANO_LR = lr;
+    _NANO_CORPUS = corpus;
+    return _NANO_CKPT;
+}
+
+fn learn_text(text, epochs = 8, lr = 0.2) {
+    remember_text(text);
+    return train_nano(epochs, lr);
+}
+
+fn generate_nano(seed_text, n = 64, epochs = 8) {
+    let ckpt = train_nano(epochs, 0.2);
+    return map{
+        checkpoint: ckpt,
+        text: checkpoint_generate(ckpt, seed_text, n)
+    };
+}
+
+// generate_nano_sampled — Nano generation with temperature/top-k sampling. Defaults
+// are tuned to read better than greedy decoding while staying reproducible (seed).
+fn generate_nano_sampled(seed_text, n = 64, epochs = 8, temperature = 0.8, top_k = 8, seed = 1, rep_penalty = 0.5) {
+    let ckpt = train_nano(epochs, 0.2);
+    return map{
+        checkpoint: ckpt,
+        text: generate_sampled(ckpt.model, ckpt.vocab, seed_text, n, temperature, top_k, seed, rep_penalty)
+    };
+}
+
+export vocab_build, encode, model_new, train_step, train, train_batch, avg_loss, next_id, generate,
+       rng_new, sample_next_id, generate_sampled,
+       source_corpus, curriculum_corpus, live_corpus_path, live_corpus, live_stats,
+       live_storage_status,
+       remember_text, remember_admitted_text, remember_admitted_batch,
+       admitted_batch_fits_from_bytes, max_live_corpus_bytes,
+       checkpoint, checkpoint_generate, train_nano, nano_checkpoint_peek, learn_text,
+       generate_nano, generate_nano_sampled, train_best, train_nano_parallel,
+       train_batch_tensor, tensor_selftest, train_nano_tensor;

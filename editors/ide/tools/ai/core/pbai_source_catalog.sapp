@@ -1,0 +1,649 @@
+// Privacy-safe pbAI discovery catalog.
+//
+// This module consumes caller-supplied metadata observations. It deliberately
+// has no filesystem, ingestion, model, memory, or training imports. A catalog
+// entry is only a discovery lead and never permission to read file content.
+
+let FORMAT = "pbai.source-catalog.v2";
+let MAX_ROOTS = 16;
+let MAX_OBSERVATIONS_HARD = 8192;
+let MAX_CANDIDATES_HARD = 4096;
+let MAX_OUTPUT_BYTES_HARD = 1000000;
+let MAX_LOCATOR_BYTES = 4096;
+let MAX_COMPONENTS = 65;
+let MAX_COMPONENT_BYTES = 255;
+
+fn _bounded_text(value, maximum_bytes) {
+    if type(value) != "string" { return ""; }
+    // UTF-8 never uses fewer bytes than characters. This cheap guard avoids
+    // allocating a byte array for obviously oversized attacker input.
+    if len(value) > maximum_bytes { return ""; }
+    if len(str_to_bytes(value)) > maximum_bytes { return ""; }
+    return str_trim(value);
+}
+
+fn _safe_id(value) {
+    let s = _bounded_text(value, 128);
+    if s == "" { return false; }
+    let i = 0;
+    while i < len(s) {
+        let c = strcharcodeat(s, i);
+        if not ((c >= 48 and c <= 57) or (c >= 65 and c <= 90)
+            or (c >= 97 and c <= 122) or c == 45 or c == 46
+            or c == 58 or c == 95) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _one_of(value, allowed) {
+    let i = 0;
+    while i < len(allowed) {
+        if value == allowed[i] { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _bounded_int(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+
+fn _forbidden_codepoint(c) {
+    return c < 32 or (c >= 127 and c <= 159)
+        or c == 1564 or c == 8203 or c == 8204 or c == 8205
+        or c == 8206 or c == 8207 or (c >= 8234 and c <= 8238)
+        or c == 8288 or (c >= 8294 and c <= 8297) or c == 65279;
+}
+
+fn _control_free(value) {
+    if type(value) != "string" { return false; }
+    let i = 0;
+    while i < len(value) {
+        if _forbidden_codepoint(strcharcodeat(value, i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _opaque_locator_safe(value) {
+    return type(value) == "string" and value != ""
+        and len(value) <= MAX_LOCATOR_BYTES
+        and len(str_to_bytes(value)) <= MAX_LOCATOR_BYTES
+        and _control_free(value);
+}
+
+fn _relative_locator(value) {
+    if type(value) != "string" or value == ""
+        or len(value) > MAX_LOCATOR_BYTES
+        or len(str_to_bytes(value)) > MAX_LOCATOR_BYTES
+        or not _control_free(value) or str_starts_with(value, "/")
+        or str_starts_with(value, "\\") or str_contains(value, "\\")
+        or str_contains(value, ":") or str_contains(value, "//")
+        or str_ends_with(value, "/") { return nil; }
+    let parts = str_split(value, "/");
+    if len(parts) < 1 or len(parts) > MAX_COMPONENTS { return nil; }
+    let i = 0;
+    while i < len(parts) {
+        let part = parts[i];
+        if part == "" or part == "." or part == ".."
+            or len(part) > MAX_COMPONENT_BYTES
+            or len(str_to_bytes(part)) > MAX_COMPONENT_BYTES
+            or str_starts_with(part, " ") or str_ends_with(part, " ")
+            or str_ends_with(part, ".") { return nil; }
+        i = i + 1;
+    }
+    return map{ raw: value, parts: parts, basename: parts[len(parts) - 1] };
+}
+
+fn _limits(options) {
+    if options == nil or type(options) != "map" { options = map{}; }
+    let max_observations = try options.max_observations catch 2048;
+    let max_candidates = try options.max_candidates catch 512;
+    let max_output_bytes = try options.max_output_bytes catch
+        (try options.max_output_chars catch 262144);
+    let output_limit_valid = _bounded_int(max_output_bytes, 4096, MAX_OUTPUT_BYTES_HARD);
+    let valid = _bounded_int(max_observations, 1, MAX_OBSERVATIONS_HARD)
+        and _bounded_int(max_candidates, 1, MAX_CANDIDATES_HARD)
+        and output_limit_valid;
+    return map{ valid: valid, max_observations: max_observations,
+        max_candidates: max_candidates,
+        max_output_bytes: if output_limit_valid { max_output_bytes } else { 262144 },
+        nonce: base64_encode_bytes(random_bytes(32)) };
+}
+
+fn _token(nonce, domain, value) {
+    return sha256("pbai-source-catalog-v2\x00" + nonce + "\x00" + domain + "\x00" + value);
+}
+
+fn _root_decision(spec, nonce) {
+    let root_id = _bounded_text(try spec.root_id catch "", 128);
+    let locator = try spec.locator catch "";
+    let owner = _bounded_text(try spec.owner_scope catch "unknown", 32);
+    let consent = _bounded_text(try spec.consent_status catch "unknown", 32);
+    let consent_scope = _bounded_text(try spec.consent_scope catch "none", 32);
+    let grant = _bounded_text(try spec.discovery_grant_id catch "", 128);
+    let requested = try spec.discovery_allowed catch false;
+    let reasons = [];
+    if not _safe_id(root_id) { push(reasons, "invalid-or-missing-root-id"); }
+    if not _opaque_locator_safe(locator) { push(reasons, "invalid-or-missing-locator"); }
+    if not _one_of(owner, ["self", "household-third-party", "public", "organization"]) {
+        push(reasons, "unknown-owner-scope");
+    }
+    if not _safe_id(grant) { push(reasons, "missing-or-invalid-discovery-grant"); }
+    if not requested { push(reasons, "discovery-not-requested"); }
+    let third_party = owner == "household-third-party" or owner == "organization";
+    if third_party and consent != "granted" { push(reasons, "explicit-discovery-consent-required"); }
+    if third_party and not (consent_scope == "discovery" or consent_scope == "both") {
+        push(reasons, "discovery-consent-scope-required");
+    }
+    if not third_party and not (consent == "granted" or consent == "not-required") {
+        push(reasons, "consent-status-unresolved");
+    }
+    let accepted = len(reasons) == 0;
+    let root_token = if not accepted { "" }
+        else { _token(nonce, "root", root_id + "\x00" + locator) };
+    return map{
+        root_id_internal: root_id,
+        locator_internal: if accepted { locator } else { "" },
+        accepted: accepted,
+        public: map{
+            source_id: if root_token == "" { "" } else { "src-" + str_slice(root_token, 0, 24) },
+            root_token: root_token,
+            discovery_allowed: accepted,
+            discovery_only: true,
+            authorizes_ingest: false,
+            authorizes_retrieval: false,
+            authorizes_training: false,
+            reasons: reasons
+        }
+    };
+}
+
+fn _find_root(roots, root_id) {
+    let i = 0;
+    while i < len(roots) {
+        if roots[i].root_id_internal == root_id { return roots[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _last_dot(value) {
+    let found = -1;
+    let i = 0;
+    while i < len(value) {
+        if strcharcodeat(value, i) == 46 { found = i; }
+        i = i + 1;
+    }
+    return found;
+}
+
+fn _media_family(basename, kind) {
+    if kind == "directory" { return "directory"; }
+    let lower = str_lower(basename);
+    let dot = _last_dot(lower);
+    let ext = if dot < 0 { "" } else { str_slice(lower, dot, len(lower)) };
+    if _one_of(ext, [".sapp", ".sap", ".bpx", ".py", ".pas", ".dpr", ".cs",
+        ".java", ".kt", ".js", ".ts", ".rs", ".c", ".cpp", ".h", ".hpp",
+        ".go", ".rb", ".php", ".sh", ".ps1"]) { return "source-code"; }
+    if _one_of(ext, [".md", ".me", ".txt", ".rtf", ".pdf", ".doc", ".docx", ".odt"]) {
+        return "document";
+    }
+    if _one_of(ext, [".json", ".jsonl", ".csv", ".tsv", ".arrow", ".parquet",
+        ".xml", ".yaml", ".yml", ".toml"]) { return "data"; }
+    if _one_of(ext, [".gguf", ".safetensors", ".onnx", ".pt", ".pth", ".ckpt",
+        ".keras", ".pickle", ".pkl", ".model"]) { return "model"; }
+    if _one_of(ext, [".html", ".css"]) { return "web"; }
+    if ext == ".ipynb" { return "notebook"; }
+    if _one_of(ext, [".zip", ".7z", ".tar", ".gz", ".tgz"]) { return "archive-metadata"; }
+    return "unknown";
+}
+
+fn _basename_words(basename) {
+    let lower = str_lower(basename);
+    let dot = _last_dot(lower);
+    if dot > 0 { lower = str_slice(lower, 0, dot); }
+    let separators = ["-", "_", ".", " ", "(", ")", "[", "]", "{", "}",
+        "+", "#", "@", ",", ";", "!"];
+    let i = 0;
+    while i < len(separators) {
+        lower = str_replace_all(lower, separators[i], " "); i = i + 1;
+    }
+    let raw = str_split(lower, " ");
+    let words = [];
+    i = 0;
+    while i < len(raw) {
+        if raw[i] != "" { push(words, raw[i]); }
+        i = i + 1;
+    }
+    return words;
+}
+
+fn _has(words, variants) {
+    let i = 0;
+    while i < len(words) {
+        let j = 0;
+        while j < len(variants) {
+            if words[i] == variants[j] { return true; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _push_unique(values, value) {
+    let i = 0;
+    while i < len(values) { if values[i] == value { return; } i = i + 1; }
+    push(values, value);
+}
+
+fn _derived_classification(basename, kind) {
+    let words = _basename_words(basename);
+    let signals = [];
+    let strength = 3;
+    if _has(words, ["pbai"]) { _push_unique(signals, "pbai"); strength = 0; }
+    if _has(words, ["pblang"]) { _push_unique(signals, "pblang"); strength = 0; }
+    if _has(words, ["llm"]) { _push_unique(signals, "machine-learning"); strength = 0; }
+    if _has(words, ["pbruler"]) { _push_unique(signals, "policy"); strength = 0; }
+    let ai_exact = _has(words, ["ai", "τν"]);
+    let ml_pair = _has(words, ["machine"]) and _has(words, ["learning"]);
+    if ai_exact or ml_pair or _has(words, ["neural", "rag", "retrieval"]) {
+        _push_unique(signals, "machine-learning"); if strength > 1 { strength = 1; }
+    }
+    if _has(words, ["model", "models", "checkpoint", "checkpoints", "weights"]) {
+        _push_unique(signals, "model"); if strength > 2 { strength = 2; }
+    }
+    if _has(words, ["dataset", "datasets", "corpus", "corpora"]) {
+        _push_unique(signals, "dataset"); if strength > 1 { strength = 1; }
+    }
+    if _has(words, ["train", "trainer", "training", "tokenizer", "tokenizers"]) {
+        _push_unique(signals, "training"); if strength > 1 { strength = 1; }
+    }
+    if _has(words, ["agent", "agents"]) {
+        _push_unique(signals, "agent"); if strength > 2 { strength = 2; }
+    }
+    if _has(words, ["orchestrator", "orchestrators", "orchestration"]) {
+        _push_unique(signals, "orchestration"); if strength > 1 { strength = 1; }
+    }
+    if _has(words, ["ruler", "policy", "verifier", "verifiers", "searcher", "searchers",
+        "translator", "translators", "identifier", "identifiers"]) {
+        _push_unique(signals, "policy"); if strength > 2 { strength = 2; }
+    }
+    if _has(words, ["memory", "memories", "history"]) {
+        _push_unique(signals, "memory"); if strength > 2 { strength = 2; }
+    }
+    if _has(words, ["idea", "ideas", "roadmap", "brainstorm", "ιδεα", "ιδέα"]) {
+        _push_unique(signals, "idea"); if strength > 1 { strength = 1; }
+    }
+    return map{ relevant: len(signals) > 0, signals: signals,
+        media_family: _media_family(basename, kind), strength: strength };
+}
+
+fn classify_metadata(metadata) {
+    let relative = _relative_locator(try metadata.relative_locator catch nil);
+    let kind = _bounded_text(try metadata.kind catch "", 32);
+    let depth = try metadata.depth catch -1;
+    let bytes = try metadata.size_bytes catch -1;
+    let evidence = _bounded_text(try metadata.metadata_evidence catch "", 64);
+    let valid = relative != nil and _one_of(kind, ["regular-file", "directory"])
+        and _one_of(evidence, ["descriptor-bound", "operator-reviewed-inventory", "mtp-locator-only"])
+        and _bounded_int(depth, 0, 64)
+        and ((kind == "directory" and bytes == 0)
+            or (kind == "regular-file" and _bounded_int(bytes, 0, 1099511627776)));
+    if not valid { return map{ format: "pbai.source-classification.v1", valid: false,
+        relevant: false, reason: "invalid-metadata-observation", signals: [],
+        media_family: "unknown", discovery_only: true, content_read: false };
+    }
+    let derived = _derived_classification(relative.basename, kind);
+    return map{ format: "pbai.source-classification.v1", valid: true,
+        relevant: derived.relevant,
+        reason: if derived.relevant { "direct-basename-signal" } else { "no-direct-ai-metadata-signal" },
+        signals: derived.signals, media_family: derived.media_family,
+        signal_strength: if derived.relevant { derived.strength } else { nil },
+        discovery_only: true, content_read: false };
+}
+
+fn _size_bucket(kind, bytes) {
+    if kind == "directory" { return "not-applicable"; }
+    if bytes == 0 { return "empty"; }
+    if bytes < 4096 { return "under-4-kib"; }
+    if bytes < 65536 { return "4-kib-to-64-kib"; }
+    if bytes < 1048576 { return "64-kib-to-1-mib"; }
+    if bytes < 16777216 { return "1-mib-to-16-mib"; }
+    if bytes < 268435456 { return "16-mib-to-256-mib"; }
+    return "256-mib-or-more";
+}
+
+fn _strength_label(value) {
+    if value == 0 { return "strong"; }
+    if value == 1 { return "focused"; }
+    return "generic";
+}
+
+fn _part_in(parts, names) {
+    let i = 0;
+    while i < len(parts) {
+        let part = str_lower(parts[i]);
+        let j = 0;
+        while j < len(names) {
+            if part == names[j] { return true; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _has_signal(signals, wanted) {
+    let i = 0;
+    while i < len(signals) {
+        if signals[i] == wanted { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// This coarse class is derived while the private relative locator is still in
+// scope. Callers cannot inject a category field. It remains an unverified
+// discovery heuristic and never grants conversion, ingestion, or training.
+fn _migration_class(relative, classification) {
+    let parts = relative.parts;
+    if _part_in(parts, ["vendor", "node_modules", ".venv", "venv", "site-packages"]) {
+        return map{ name:"vendor", evidence:"excluded-vendor-component", excluded:true };
+    }
+    if _part_in(parts, ["target", "build", "dist", "bin", "obj", "__pycache__",
+        "cache", "caches", "coverage", "checkpoints"]) {
+        return map{ name:"generated", evidence:"excluded-generated-component", excluded:true };
+    }
+    if _part_in(parts, ["archive", "archives", "backup", "backups", "trash", "tmp", "temp"]) {
+        return map{ name:"archive", evidence:"excluded-archive-component", excluded:true };
+    }
+    if classification.media_family == "data" or classification.media_family == "model" {
+        return map{ name:"dataset", evidence:"dataset-or-model-media", excluded:true };
+    }
+    if classification.media_family == "source-code" {
+        return map{ name:"implementation", evidence:"source-code-media", excluded:false };
+    }
+    if classification.media_family == "document" and _has_signal(classification.signals, "idea") {
+        return map{ name:"idea", evidence:"idea-document-signal", excluded:false };
+    }
+    if classification.media_family == "document" or classification.media_family == "web"
+        or classification.media_family == "notebook" {
+        return map{ name:"reference", evidence:"reference-media", excluded:false };
+    }
+    return map{ name:"unknown", evidence:"insufficient-metadata", excluded:true };
+}
+
+fn _candidate_record(metadata, root, nonce, relative, classification) {
+    let kind = _bounded_text(metadata.kind, 32);
+    let token = _token(nonce, "candidate", root.public.root_token + "\x00" + relative.raw);
+    let public = map{};
+    public.source_id = root.public.source_id;
+    public.candidate_token = token;
+    public.kind = kind;
+    public.media_family = classification.media_family;
+    public.size_bucket = _size_bucket(kind, metadata.size_bytes);
+    public.depth = metadata.depth;
+    public.signals = classification.signals;
+    public.metadata_evidence = "caller-supplied-unverified";
+    public.metadata_claim_validated = false;
+    public.descriptor_binding_verified = false;
+    public.signal_strength = _strength_label(classification.signal_strength);
+    let migration = _migration_class(relative, classification);
+    public.migration_class = migration.name;
+    public.classification_evidence = migration.evidence;
+    public.excluded_from_migration = migration.excluded;
+    public.automatic_conversion = false;
+    public.human_review_required = true;
+    public.locator_dedupe_status = "unique-in-this-scan";
+    public.content_copy_dedupe_status = "unknown-without-content";
+    public.discovery_only = true;
+    public.content_read = false;
+    public.persisted = false;
+    public.authorizes_ingest = false;
+    public.authorizes_retrieval = false;
+    public.authorizes_training = false;
+    return map{ status: "candidate", token: token, strength: classification.signal_strength,
+        source_id: root.public.source_id, public: public };
+}
+
+fn _candidate(metadata, root, nonce) {
+    let relative = _relative_locator(try metadata.relative_locator catch nil);
+    let classification = classify_metadata(metadata);
+    if relative == nil or not classification.valid {
+        return map{ status: "malformed", error: "invalid-candidate-observation" };
+    }
+    if not classification.relevant { return map{ status: "non-candidate" }; }
+    return _candidate_record(metadata, root, nonce, relative, classification);
+}
+
+fn _seen_token(candidates, token) {
+    let i = 0;
+    while i < len(candidates) {
+        if candidates[i].token == token { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _ranked_fair(candidates, maximum, root_count) {
+    let records = map{};
+    let keys = [];
+    let i = 0;
+    while i < len(candidates) {
+        let key = str(candidates[i].strength) + "|" + candidates[i].source_id
+            + "|" + candidates[i].token;
+        records[key] = candidates[i]; push(keys, key); i = i + 1;
+    }
+    keys = array_sort(keys);
+    let quota = num_floor(maximum / (if root_count < 1 { 1 } else { root_count }));
+    if quota < 1 { quota = 1; }
+    let per_root = map{};
+    let selected = map{};
+    let out = [];
+    i = 0;
+    while i < len(keys) and len(out) < maximum {
+        let row = records[keys[i]];
+        let count = if map_has(per_root, row.source_id) { per_root[row.source_id] } else { 0 };
+        if count < quota {
+            push(out, row.public); per_root[row.source_id] = count + 1;
+            selected[row.token] = true;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(keys) and len(out) < maximum {
+        let row = records[keys[i]];
+        if not map_has(selected, row.token) {
+            push(out, row.public); selected[row.token] = true;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _has_error(errors, wanted) {
+    let i = 0;
+    while i < len(errors) { if errors[i] == wanted { return true; } i = i + 1; }
+    return false;
+}
+
+fn _fit_output(result, maximum) {
+    if len(str_to_bytes(json_stringify(result))) <= maximum { return result; }
+    if not _has_error(result.errors, "output-cap-reached") { push(result.errors, "output-cap-reached"); }
+    result.complete = false;
+    result.output_truncated = true;
+    result.output_fit_strategy = "bounded-binary-search";
+
+    let all_candidates = result.candidates;
+    let low = 0;
+    let high = len(all_candidates);
+    while low < high {
+        let mid = num_floor((low + high + 1) / 2);
+        result.candidates = array_take(all_candidates, mid);
+        if len(str_to_bytes(json_stringify(result))) <= maximum { low = mid; }
+        else { high = mid - 1; }
+    }
+    result.candidates = array_take(all_candidates, low);
+    if len(str_to_bytes(json_stringify(result))) <= maximum { return result; }
+
+    // Roots take precedence over candidates. If the root set alone does not
+    // fit, remove every candidate before fitting a deterministic root prefix.
+    result.candidates = [];
+    let all_roots = result.roots;
+    low = 0;
+    high = len(all_roots);
+    while low < high {
+        let mid = num_floor((low + high + 1) / 2);
+        result.roots = array_take(all_roots, mid);
+        if len(str_to_bytes(json_stringify(result))) <= maximum { low = mid; }
+        else { high = mid - 1; }
+    }
+    result.roots = array_take(all_roots, low);
+    result.roots_truncated = low < len(all_roots);
+    if len(str_to_bytes(json_stringify(result))) > maximum {
+        return map{ format: FORMAT, ok: false, complete: false,
+            errors: ["output-cap-reached"], roots: [], candidates: [],
+            discovery_only: true, content_read: false, training_performed: false,
+            persisted: false, admission_attempted: false, authorizes_ingest: false,
+            authorizes_retrieval: false, authorizes_training: false };
+    }
+    return result;
+}
+
+fn _empty_result(limits, errors) {
+    return _fit_output(map{ format: FORMAT,
+        scan_id: "scan-" + str_slice(_token(limits.nonce, "scan", "catalog"), 0, 24),
+        ok: false, complete: false, errors: errors, roots: [], candidates: [],
+        accepted_roots: 0, rejected_roots: 0, observations_seen: 0,
+        malformed_observations: 0, non_candidate_observations: 0,
+        rejected_observations: 0, duplicate_locators_suppressed: 0,
+        output_truncated: false, roots_truncated: false,
+        output_fit_strategy: "bounded-binary-search",
+        discovery_only: true, content_read: false, training_performed: false,
+        persisted: false, admission_attempted: false, authorizes_ingest: false,
+        authorizes_retrieval: false, authorizes_training: false }, limits.max_output_bytes);
+}
+
+fn catalog_observations(root_manifests, observations, options = nil) {
+    let limits = _limits(options);
+    if not limits.valid { return _empty_result(limits, ["invalid-catalog-limits"]); }
+    if type(root_manifests) != "array" or len(root_manifests) < 1 or len(root_manifests) > MAX_ROOTS {
+        return _empty_result(limits, ["invalid-root-manifest-count"]);
+    }
+    if type(observations) != "array" {
+        return _empty_result(limits, ["observations-must-be-an-array"]);
+    }
+
+    let roots = [];
+    let public_roots = [];
+    let root_ids = map{};
+    let accepted_locators = map{};
+    let accepted_roots = 0;
+    let rejected_roots = 0;
+    let errors = [];
+    let i = 0;
+    while i < len(root_manifests) {
+        let root_id = _bounded_text(try root_manifests[i].root_id catch "", 128);
+        if root_id != "" and map_has(root_ids, root_id) {
+            return _empty_result(limits, ["duplicate-root-id"]);
+        }
+        if root_id != "" { root_ids[root_id] = true; }
+        let decision = _root_decision(root_manifests[i], limits.nonce);
+        if decision.accepted and map_has(accepted_locators, decision.locator_internal) {
+            return _empty_result(limits, ["duplicate-root-locator"]);
+        }
+        if decision.accepted { accepted_locators[decision.locator_internal] = true; }
+        push(roots, decision); push(public_roots, decision.public);
+        if decision.accepted { accepted_roots = accepted_roots + 1; }
+        else { rejected_roots = rejected_roots + 1; }
+        i = i + 1;
+    }
+
+    let candidates = [];
+    let rejected_observations = 0;
+    let malformed_observations = 0;
+    let non_candidates = 0;
+    let duplicate_locators = 0;
+    let observation_cap = len(observations) > limits.max_observations;
+    let stop = len(observations);
+    if stop > limits.max_observations { stop = limits.max_observations; }
+    i = 0;
+    while i < stop {
+        let root_id = _bounded_text(try observations[i].root_id catch "", 128);
+        let root = _find_root(roots, root_id);
+        if root == nil or not root.accepted {
+            rejected_observations = rejected_observations + 1;
+        } else {
+            let candidate = _candidate(observations[i], root, limits.nonce);
+            if candidate.status == "malformed" {
+                malformed_observations = malformed_observations + 1;
+            } elif candidate.status == "non-candidate" {
+                non_candidates = non_candidates + 1;
+            } elif _seen_token(candidates, candidate.token) {
+                duplicate_locators = duplicate_locators + 1;
+            } else {
+                push(candidates, candidate);
+            }
+        }
+        i = i + 1;
+    }
+    let candidate_cap = len(candidates) > limits.max_candidates;
+    if observation_cap { push(errors, "observation-cap-reached"); }
+    if candidate_cap { push(errors, "candidate-cap-reached"); }
+    if rejected_roots > 0 { push(errors, "one-or-more-roots-rejected"); }
+    if rejected_observations > 0 { push(errors, "one-or-more-observations-under-rejected-root"); }
+    if malformed_observations > 0 { push(errors, "one-or-more-observations-malformed"); }
+    let complete = len(errors) == 0;
+    let emitted = _ranked_fair(candidates, limits.max_candidates, accepted_roots);
+    let result = map{
+        format: FORMAT,
+        scan_id: "scan-" + str_slice(_token(limits.nonce, "scan", "catalog"), 0, 24),
+        ok: accepted_roots > 0,
+        complete: complete,
+        errors: errors,
+        roots: public_roots,
+        candidates: emitted,
+        accepted_roots: accepted_roots,
+        rejected_roots: rejected_roots,
+        observations_seen: stop,
+        malformed_observations: malformed_observations,
+        non_candidate_observations: non_candidates,
+        rejected_observations: rejected_observations,
+        duplicate_locators_suppressed: duplicate_locators,
+        output_truncated: false,
+        roots_truncated: false,
+        output_fit_strategy: "bounded-binary-search",
+        discovery_only: true,
+        content_read: false,
+        training_performed: false,
+        persisted: false,
+        admission_attempted: false,
+        authorizes_ingest: false,
+        authorizes_retrieval: false,
+        authorizes_training: false
+    };
+    return _fit_output(result, limits.max_output_bytes);
+}
+
+fn status() {
+    return map{ format: "pbai.source-catalog.status.v2",
+        observation_catalog_available: true,
+        derived_metadata_classification: true,
+        caller_classification_trusted: false,
+        caller_metadata_provenance_trusted: false,
+        descriptor_binding_verified: false,
+        exact_token_boundaries: true,
+        per_scan_nonce_internal: true,
+        input_bounds_before_trim: true,
+        output_fit_strategy: "bounded-binary-search",
+        filesystem_walker_available: false,
+        reason: "bounded root-descriptor walker is not yet available",
+        discovery_only: true, content_read: false, training_performed: false,
+        persisted: false, authorizes_ingest: false, authorizes_training: false };
+}
+
+export FORMAT, classify_metadata, catalog_observations, status;

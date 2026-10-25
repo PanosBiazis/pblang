@@ -1,0 +1,181 @@
+// Pure stateful browser controller. Use only with a connection-owned internal
+// transport implementing PB.session.* admission and independently checked CDP.
+// This module grants no OS capability; the owner independently admits effects.
+let K = import("browser_inspection.sapp");
+
+fn _fields(value, allowed) {
+    if type(value) != "map" { throw "browser session expects an object"; }
+    for key in map_keys(value) {
+        let known = false;
+        for name in allowed { if key == name { known = true; } }
+        if not known { throw "unsupported browser session field"; }
+    }
+}
+fn _session_id(value) {
+    if type(value) != "string" or len(str_to_bytes(value)) != 32 { throw "invalid browser session identifier"; }
+    for ch in str_to_bytes(value) {
+        if not ((ch >= 48 and ch <= 57) or (ch >= 97 and ch <= 102)) { throw "invalid browser session identifier"; }
+    }
+    return value;
+}
+fn _revision(value) {
+    if type(value) != "number" or not (value >= 0 and value < 9007199254740991)
+        or value != num_floor(value) { throw "invalid browser session revision"; }
+    return value;
+}
+fn _identifier(value) {
+    if type(value) != "string" or len(value) < 1 or len(value) > 128 { throw "invalid internal browser identifier"; }
+    return value;
+}
+fn new(exchange, live = nil) {
+    // Callbacks belong to the trusted pipe owner, never to MCP tool arguments.
+    let state = map{ current: nil, last_closed: nil, last_issued: nil, blocked: false };
+    fn control(method, params) { return K._call(exchange, "PB.session." + method, params); }
+    fn require_usable() {
+        if state.blocked { throw "browser owner cleanup is unconfirmed; a new connection is required"; }
+    }
+    fn abort_session() {
+        let old = state.current;
+        state.current = nil;
+        if old == nil { return not state.blocked; }
+        // Even a failed close must reach the independent owner cleanup path.
+        if old.target != nil { let ignored_close = try K._call(exchange, "Target.closeTarget", map{ targetId: old.target }) catch nil; }
+        let ended = try control("end", map{ session_id: old.id }) catch nil;
+        let confirmed = (try ended.closed catch false) == true;
+        if confirmed { state.last_closed = old.id; }
+        else { state.blocked = true; }
+        return confirmed;
+    }
+    fn finish(result) {
+        let kept = control("commit", map{ session_id: state.current.id, revision: state.current.revision });
+        if (try kept.kept catch false) != true { throw "browser session retention failed"; }
+        result.session_id = state.current.id; result.revision = state.current.revision;
+        result.session_active = true; result.target_closed = false;
+        return result;
+    }
+    fn open_ready(input) {
+            let version = K._call(exchange, "Browser.getVersion", map{});
+            if (try version.protocolVersion catch nil) != "1.3" { throw "unsupported browser protocol"; }
+            state.current.product = _identifier(try version.product catch nil);
+            state.current.target = _identifier(try K._call(exchange, "Target.createTarget", map{ url: "about:blank" }).targetId catch nil);
+            let driver = state.current.driver;
+            let opened = driver._open_target(input, exchange, state.current.product, state.current.target);
+            state.current.session = opened.session;
+            let observer = state.current.driver;
+            return finish(observer._observe(input, exchange, state.current.product, state.current.session));
+    }
+    fn open_admitted(args, is_live) {
+        require_usable();
+        if state.current != nil { throw "a browser session is already open"; }
+        if is_live and live == nil { throw "live browser sessions are unavailable"; }
+        let input = nil; let admission_args = args; let admission_method = "open_url"; let driver = live;
+        if not is_live { input = K.validate(args); admission_args = input; admission_method = "open"; driver = K; }
+        let lease = try control(admission_method, admission_args) catch nil;
+        let id = try _session_id(lease.session_id) catch nil;
+        if id == nil or id == state.last_issued {
+            let ended = try control("abort", map{}) catch nil;
+            if (try ended.closed catch false) != true { state.blocked = true; }
+            throw "browser session admission failed";
+        }
+        // The owner must issue a fresh random ID for every admitted session.
+        state.last_issued = id;
+        state.current = map{ id: id, revision: 0, input: input, target: nil, session: nil, product: nil, driver: driver };
+        if is_live { input = try live.validate(args, lease.origins) catch nil; state.current.input = input; }
+        let result = try open_ready(input) catch nil;
+        if result == nil {
+            let confirmed = abort_session();
+            if not confirmed { throw "browser session opening failed; owner cleanup is unconfirmed"; }
+            throw "browser session opening failed and was closed";
+        }
+        return result;
+    }
+    fn open(args) { return open_admitted(args, false); }
+    fn open_url(args) { return open_admitted(args, true); }
+    fn step_ready(input, id, revision, actions, screenshot) {
+            let ready = control("resume", map{ session_id: id, revision: revision, actions: actions, screenshot: screenshot });
+            if (try ready.ready catch false) != true { throw "browser session resume refused"; }
+            // Advance before effects. Any later failure closes the session.
+            state.current.revision = revision + 1;
+            let observer = state.current.driver;
+            return finish(observer._observe(input, exchange, state.current.product, state.current.session));
+    }
+    fn step(args) {
+        require_usable();
+        _fields(args, ["session_id", "revision", "actions", "screenshot"]);
+        let id = _session_id(try args.session_id catch nil);
+        let revision = _revision(try args.revision catch nil);
+        if state.current == nil or id != state.current.id { throw "browser session is not active"; }
+        if revision != state.current.revision { throw "stale browser session revision; no action was replayed"; }
+        let screenshot = try args.screenshot catch false;
+        if type(screenshot) != "bool" { throw "invalid browser screenshot option"; }
+        let actions = K._actions(try args.actions catch [], state.current.input.width, state.current.input.height);
+        // A validated copy preserves the original viewport and script policy.
+        let input = map{ html: state.current.input.html, width: state.current.input.width, height: state.current.input.height,
+            javascript: state.current.input.javascript, actions: actions, screenshot: screenshot };
+        let result = try step_ready(input, id, revision, actions, screenshot) catch nil;
+        if result == nil {
+            let confirmed = abort_session();
+            if not confirmed { throw "browser session step failed; owner cleanup is unconfirmed; an action may have occurred"; }
+            throw "browser session step failed and was closed; an action may have occurred";
+        }
+        return result;
+    }
+    fn view(args) {
+        // A separate closed schema prevents a caller from disguising actions as a view.
+        _fields(args, ["session_id", "revision", "screenshot"]);
+        let result = step(map{ session_id: try args.session_id catch nil,
+            revision: try args.revision catch nil, screenshot: try args.screenshot catch false, actions: [] });
+        result.observation_only = true; result.actions_dispatched = 0;
+        // AX, metrics and optional PNG are sequential reads, not an atomic DOM snapshot.
+        result.atomic_snapshot = false; result.application_settled = false;
+        return result;
+    }
+    fn close_prepared(prepared, target) {
+        if (try prepared.closing catch false) != true { throw "browser session close refused"; }
+        return K._call(exchange, "Target.closeTarget", map{ targetId: target });
+    }
+    fn close(args) {
+        require_usable();
+        _fields(args, ["session_id"]);
+        let id = _session_id(try args.session_id catch nil);
+        if state.current == nil {
+            if id == state.last_closed { return map{ session_id: id, session_closed: true, already_closed: true }; }
+            throw "unknown browser session";
+        }
+        if id != state.current.id { throw "browser session identifier mismatch"; }
+        let old = state.current;
+        state.current = nil;
+        let prepared = try control("close", map{ session_id: id }) catch nil;
+        let closed = try close_prepared(prepared, old.target) catch nil;
+        let ended = try control("end", map{ session_id: id }) catch nil;
+        if (try ended.closed catch false) != true { state.blocked = true; }
+        if (try closed.success catch false) != true or (try ended.closed catch false) != true {
+            throw "browser session close was not confirmed; owner cleanup is required";
+        }
+        state.last_closed = id;
+        return map{ session_id: id, session_closed: true, already_closed: false };
+    }
+    fn active() { return state.current != nil; }
+    return map{ open: open, open_url: open_url, step: step, view: view, close: close, active: active, abort: abort_session };
+}
+fn catalog_entries() {
+    let opening = K.catalog_entries()[0];
+    opening.name = "browser_session_open";
+    opening.description = "Open one isolated caller-HTML page retained across steps. No external network or personal browser. Expires after 30 seconds idle or 5 minutes total. Keep the returned session_id and revision; never retry uncertain actions automatically.";
+    let identity = map{ type: "string", pattern: "^[0-9a-f]{32}$" };
+    let step = map{ name: "browser_session_step", open_world: false,
+        description: "Act on the same isolated page using its current revision. Stale revisions are refused before input. Returns the next revision, accessibility tree and optional PNG. Does not reload the page.",
+        input_schema: map{ type: "object", additionalProperties: false, required: ["session_id", "revision"], properties: map{
+            session_id: identity, revision: map{ type: "integer", minimum: 0, maximum: 9007199254740990 },
+            actions: opening.input_schema.properties.actions, screenshot: map{ type: "boolean", default: false } } } };
+    let closing = map{ name: "browser_session_close", open_world: false,
+        description: "Close the isolated page and release its browser. Only this connection's session may be closed.",
+        input_schema: map{ type: "object", additionalProperties: false, required: ["session_id"], properties: map{ session_id: identity } } };
+    let viewing = map{ name: "browser_session_view", open_world: false,
+        description: "Observe this connection's retained page at its current revision without click, text, key, navigation or reload. Returns accessibility names/roles, metrics and optional viewport PNG, with the next revision. Read-only page observation still advances the session lease; autonomous page activity may continue. Stale revisions are refused; errors may close the session.",
+        input_schema: map{ type: "object", additionalProperties: false, required: ["session_id", "revision"], properties: map{
+            session_id: identity, revision: map{ type: "integer", minimum: 0, maximum: 9007199254740990 },
+            screenshot: map{ type: "boolean", default: false } } } };
+    return [opening, step, closing, viewing];
+}
+export new, catalog_entries;

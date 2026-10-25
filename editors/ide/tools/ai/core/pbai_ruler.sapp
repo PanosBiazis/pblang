@@ -1,0 +1,382 @@
+// pbai_ruler.sapp -- deterministic, fail-closed PBRuler policy foundation.
+//
+// This pure module evaluates observable event metadata. It does not execute,
+// persist, quarantine, scan malware, provide a sandbox, or adapt its own rules.
+// A future effect adapter must evaluate again immediately before any effect.
+
+let EVENT_FORMAT = "pbai.ruler.event.v1";
+let CONTEXT_FORMAT = "pbai.ruler.trusted-context.v1";
+let DECISION_FORMAT = "pbai.ruler.decision.v1";
+let TOOL_ADAPTER_FORMAT = "pbai.ruler.tool-adapter.v1";
+let MAX_ID_CHARS = 96;
+let MAX_CAPABILITIES = 16;
+let MAX_REASONS = 24;
+
+fn _in(items, value) {
+    if type(items) != "array" { return false; }
+    let i = 0;
+    while i < len(items) { if items[i] == value { return true; } i = i + 1; }
+    return false;
+}
+
+fn _bounded_token(value) {
+    let text = str(value);
+    if text == "" or len(text) > MAX_ID_CHARS { return false; }
+    let i = 0;
+    while i < len(text) {
+        let c = strcharcodeat(text, i);
+        let ok = (c >= 48 and c <= 57) or (c >= 65 and c <= 90)
+            or (c >= 97 and c <= 122) or c == 45 or c == 95 or c == 58;
+        if not ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _hex_digest(value) {
+    let text = str_lower(str(value));
+    if len(text) != 64 { return false; }
+    let i = 0;
+    while i < len(text) {
+        let c = strcharcodeat(text, i);
+        if not ((c >= 48 and c <= 57) or (c >= 97 and c <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _phase(value) {
+    return _in(["input", "envelope", "output", "tool-call", "action",
+        "memory-write", "learning-candidate"], value);
+}
+
+fn _operation_for(phase, operation) {
+    if phase == "input" { return operation == "accept-request"; }
+    if phase == "envelope" { return operation == "deliver-message"; }
+    if phase == "output" { return operation == "release-response"; }
+    if phase == "tool-call" { return operation == "invoke-tool"; }
+    if phase == "action" { return operation == "external-effect"; }
+    if phase == "memory-write" { return operation == "persist-memory"; }
+    if phase == "learning-candidate" { return operation == "promote-learning"; }
+    return false;
+}
+
+fn roles() {
+    return ["user", "external", "router", "orchestrator", "planner", "producer",
+        "verifier", "searcher", "error-corrector", "translator", "identifier",
+        "memory-curator", "trainer", "sandbox-executor", "tool-broker", "pbruler"];
+}
+
+fn capabilities() {
+    return ["ai:infer", "ai:memory:read", "ai:memory:write", "ai:learn",
+        "ai:tool", "fs:read", "fs:write", "net:connect", "process:spawn",
+        "device:read", "device:control"];
+}
+
+fn _valid_role(role, context) {
+    if _in(roles(), role) { return true; }
+    return _in(try context.registered_roles catch [], role);
+}
+
+fn _valid_caps(requested, granted, reasons) {
+    if type(requested) != "array" or len(requested) > MAX_CAPABILITIES {
+        push(reasons, "invalid-capability-list");
+        return false;
+    }
+    let ok = true;
+    let i = 0;
+    while i < len(requested) {
+        let cap = requested[i];
+        if type(cap) != "string" or not _in(capabilities(), cap) {
+            push(reasons, "unknown-capability");
+            ok = false;
+        } else if not _in(granted, cap) {
+            push(reasons, "capability-not-granted");
+            ok = false;
+        }
+        i = i + 1;
+    }
+    return ok;
+}
+
+fn _number_between(value, minimum, maximum) {
+    return type(value) == "number" and value >= minimum and value <= maximum;
+}
+
+fn _valid_limits(event, context, reasons) {
+    let limits = try event.limits catch nil;
+    if type(limits) != "map" {
+        push(reasons, "missing-resource-limits");
+        return false;
+    }
+    let ok = true;
+    if not _number_between(try limits.tokens catch nil, 0, try context.max_tokens catch 0) {
+        push(reasons, "token-budget-invalid"); ok = false;
+    }
+    if not _number_between(try limits.memory_bytes catch nil, 0, try context.max_memory_bytes catch 0) {
+        push(reasons, "memory-budget-invalid"); ok = false;
+    }
+    if not _number_between(try limits.time_ms catch nil, 0, try context.max_time_ms catch 0) {
+        push(reasons, "time-budget-invalid"); ok = false;
+    }
+    if not _number_between(try limits.output_chars catch nil, 0, try context.max_output_chars catch 0) {
+        push(reasons, "output-budget-invalid"); ok = false;
+    }
+    return ok;
+}
+
+fn _push_reason(reasons, reason) {
+    if len(reasons) >= MAX_REASONS or _in(reasons, reason) { return nil; }
+    push(reasons, reason);
+    return nil;
+}
+
+fn _rank(value) {
+    if value == "allow" { return 0; }
+    if value == "allow-limited" { return 1; }
+    if value == "review" { return 2; }
+    if value == "quarantine" { return 3; }
+    if value == "deny" { return 4; }
+    if value == "shutdown" { return 5; }
+    return 4;
+}
+
+fn _decision(event, disposition, reasons) {
+    let phase = try str(event.phase) catch "unknown";
+    let effectful = _in(["tool-call", "action", "memory-write", "learning-candidate"], phase);
+    return map{
+        format: DECISION_FORMAT,
+        ok: true,
+        evaluated: true,
+        permitted: disposition == "allow" or disposition == "allow-limited",
+        decision: disposition,
+        allowed_for_display: disposition == "allow" or disposition == "allow-limited",
+        may_execute: false,
+        may_persist: false,
+        effectful: effectful,
+        requires_fresh_effect_check: effectful,
+        reasons: reasons,
+        enforced: false,
+        audit: map{
+            format: "pbai.ruler.audit.v1",
+            event_id: try str(event.event_id) catch "invalid",
+            trace_id: try str(event.trace_id) catch "invalid",
+            phase: phase,
+            operation: try str(event.operation) catch "unknown",
+            payload_kind: try str(event.payload_kind) catch "unknown",
+            payload_chars: try event.payload_chars catch 0,
+            payload_digest: try str(event.payload_digest) catch "",
+            decision: disposition,
+            reasons: reasons,
+            contains_raw_payload: false
+        }
+    };
+}
+
+// Authorize exactly one already-validated, bounded broker call. Read-only calls
+// are the default. The sole effectful form is a create-new staging write whose
+// exact request digest has been approved by the local operator; publication,
+// overwrite, remove and device/network effects are not authorized here.
+// This decision is reporting data, not a bearer token: only the broker that
+// creates the internal context may execute, immediately, in the same call.
+fn evaluate_mediated_tool(event, trusted_context) {
+    let base = evaluate(event, trusted_context);
+    if base.decision != "review" or type(event) != "map" or type(trusted_context) != "map" {
+        return base;
+    }
+    let bound = (try trusted_context.adapter_format catch "") == TOOL_ADAPTER_FORMAT
+        and (try trusted_context.adapter_id catch "") == "pbai.tool.broker.v1"
+        and (try trusted_context.invocation_digest catch "") == (try event.payload_digest catch "")
+        and (try trusted_context.tool_name catch "") == (try event.tool_name catch "")
+        and (try trusted_context.tool_spec_digest catch "") == (try event.tool_spec_digest catch "")
+        and _hex_digest(try event.tool_spec_digest catch "")
+        and _bounded_token(try event.tool_name catch "")
+        and (try event.phase catch "") == "tool-call"
+        and (try event.operation catch "") == "invoke-tool";
+    let context_parent = try trusted_context.parent_invocation_digest catch "";
+    let event_parent = try event.parent_invocation_digest catch "";
+    if context_parent != "" or event_parent != "" {
+        bound = bound and _hex_digest(context_parent) and context_parent == event_parent;
+    }
+    if not bound { return _decision(event, "deny", ["invalid-tool-adapter-binding"]); }
+    let effect_kind = try trusted_context.effect_kind catch "read-only";
+    let reason = "fresh-mediated-read-only-tool";
+    if effect_kind == "read-only" {
+        if (try trusted_context.read_only catch false) != true {
+            return _decision(event, "deny", ["invalid-read-only-adapter"]);
+        }
+    } elif effect_kind == "stage-new-artifact" {
+        if (try trusted_context.read_only catch true) != false
+            or (try trusted_context.attended_approval_verified catch false) != true
+            or (try trusted_context.approval_digest catch "") != (try event.payload_digest catch "")
+            or not _in(try event.requested_capabilities catch [], "fs:write") {
+            return _decision(event, "deny", ["invalid-staged-write-approval"]);
+        }
+        reason = "fresh-operator-enabled-create-new-staging-write";
+    } elif effect_kind == "discard-staged-artifact" {
+        if (try trusted_context.read_only catch true) != false
+            or not (try trusted_context.attended_approval_verified catch false)
+            or (try trusted_context.approval_digest catch "") != (try event.payload_digest catch "")
+            or not _in(try event.requested_capabilities catch [], "fs:write") {
+            return _decision(event, "deny", ["invalid-staged-discard-approval"]);
+        }
+        reason = "fresh-operator-enabled-broker-stage-discard";
+    } elif effect_kind == "fixed-isolation-probe" {
+        if (try trusted_context.read_only catch true) != false
+            or not (try trusted_context.fixed_probe catch false)
+            or not _in(try event.requested_capabilities catch [], "process:spawn") {
+            return _decision(event, "deny", ["invalid-fixed-probe-adapter"]);
+        }
+        reason = "fresh-fixed-isolation-probe";
+    } elif effect_kind == "fixed-security-scan" {
+        if (try trusted_context.read_only catch true) != false
+            or not (try trusted_context.fixed_security_scan catch false)
+            or not _in(try event.requested_capabilities catch [], "fs:read")
+            or not _in(try event.requested_capabilities catch [], "process:spawn") {
+            return _decision(event, "deny", ["invalid-fixed-security-scan-adapter"]);
+        }
+        reason = "fresh-fixed-bounded-antivirus-scan";
+    } else {
+        return _decision(event, "deny", ["unsupported-tool-effect-kind"]);
+    }
+    let out = _decision(event, "allow-limited", [reason]);
+    out.may_execute = true;
+    out.enforced = true;
+    out.requires_fresh_effect_check = true;
+    return out;
+}
+
+fn evaluate(event, trusted_context) {
+    let reasons = [];
+    if type(event) != "map" { return _decision(map{}, "deny", ["malformed-event"]); }
+    if type(trusted_context) != "map" or (try trusted_context.format catch "") != CONTEXT_FORMAT {
+        return _decision(event, "deny", ["invalid-trusted-context"]);
+    }
+    if (try event.format catch "") != EVENT_FORMAT { _push_reason(reasons, "unsupported-event-version"); }
+    let event_id = try str(event.event_id) catch "";
+    let trace_id = try str(event.trace_id) catch "";
+    if not _bounded_token(event_id) { _push_reason(reasons, "invalid-event-id"); }
+    if not _bounded_token(trace_id) { _push_reason(reasons, "invalid-trace-id"); }
+    if _in(try trusted_context.seen_event_ids catch [], event_id) { _push_reason(reasons, "replayed-event"); }
+
+    let phase = try str(event.phase) catch "";
+    let operation = try str(event.operation) catch "";
+    if not _phase(phase) { _push_reason(reasons, "unknown-phase"); }
+    if not _operation_for(phase, operation) { _push_reason(reasons, "phase-operation-mismatch"); }
+    if not _valid_role(try event.subject_role catch "", trusted_context) { _push_reason(reasons, "unknown-subject-role"); }
+    if not _valid_role(try event.recipient_role catch "", trusted_context) { _push_reason(reasons, "unknown-recipient-role"); }
+
+    if not _bounded_token(try event.payload_kind catch "") { _push_reason(reasons, "invalid-payload-kind"); }
+    if not _number_between(try event.payload_chars catch nil, 0, try trusted_context.max_payload_chars catch 0) {
+        _push_reason(reasons, "payload-size-invalid");
+    }
+    if not _hex_digest(try event.payload_digest catch "") { _push_reason(reasons, "invalid-payload-digest"); }
+    let provenance = try str(event.provenance) catch "";
+    if not _in(["internal", "admitted", "untrusted", "unknown"], provenance) {
+        _push_reason(reasons, "invalid-provenance-state");
+    }
+    let redaction = try str(event.redaction) catch "";
+    if not _in(["not-needed", "passed", "required", "unknown"], redaction) {
+        _push_reason(reasons, "invalid-redaction-state");
+    }
+    let now = try trusted_context.current_ms catch 0;
+    let deadline = try event.deadline_ms catch nil;
+    if not _number_between(deadline, 1, try trusted_context.max_deadline_ms catch 0) or deadline < now {
+        _push_reason(reasons, "expired-or-invalid-deadline");
+    }
+    if not _number_between(try event.retry_count catch nil, 0, try trusted_context.max_retries catch 0) {
+        _push_reason(reasons, "retry-budget-invalid");
+    }
+    _valid_limits(event, trusted_context, reasons);
+    _valid_caps(try event.requested_capabilities catch [],
+        try trusted_context.granted_capabilities catch [], reasons);
+
+    if len(reasons) > 0 { return _decision(event, "deny", reasons); }
+
+    let disposition = "allow-limited";
+    if phase == "output" { disposition = "allow"; }
+    if phase == "output" and (redaction == "required" or redaction == "unknown") {
+        disposition = "review";
+        _push_reason(reasons, "output-redaction-incomplete");
+    }
+    if _in(["tool-call", "action", "memory-write", "learning-candidate"], phase) {
+        disposition = "review";
+        _push_reason(reasons, "effect-adapter-not-enforced");
+    }
+
+    // Adaptive signals can only make a deterministic result more restrictive.
+    let anomaly = try str(event.anomaly) catch "none";
+    if anomaly == "medium" and _rank(disposition) < _rank("review") { disposition = "review"; }
+    else if anomaly == "high" { disposition = "quarantine"; }
+    else if anomaly == "critical" { disposition = "shutdown"; }
+    else if anomaly != "none" and anomaly != "low" and anomaly != "medium" {
+        disposition = "deny";
+        _push_reason(reasons, "invalid-anomaly-signal");
+    }
+    if anomaly != "none" and anomaly != "low" { _push_reason(reasons, "adaptive-signal-restricted-result"); }
+    return _decision(event, disposition, reasons);
+}
+
+fn combine(decisions) {
+    if type(decisions) != "array" or len(decisions) == 0 {
+        return _decision(map{}, "deny", ["no-decisions"]);
+    }
+    let selected = "allow";
+    let reasons = [];
+    let i = 0;
+    while i < len(decisions) {
+        let item = decisions[i];
+        if type(item) != "map" or (try item.format catch "") != DECISION_FORMAT {
+            selected = "deny";
+            _push_reason(reasons, "malformed-decision");
+        } else {
+            let current = try str(item.decision) catch "deny";
+            if _rank(current) > _rank(selected) { selected = current; }
+            let item_reasons = try item.reasons catch [];
+            if type(item_reasons) == "array" {
+                let j = 0;
+                while j < len(item_reasons) { _push_reason(reasons, str(item_reasons[j])); j = j + 1; }
+            }
+        }
+        i = i + 1;
+    }
+    _push_reason(reasons, "most-restrictive-combination");
+    return _decision(map{}, selected, reasons);
+}
+
+fn status() {
+    return map{
+        format: "pbai.ruler.status.v1",
+        ok: true,
+        implementation: "deterministic-policy-evaluator",
+        event_format: EVENT_FORMAT,
+        context_format: CONTEXT_FORMAT,
+        decision_format: DECISION_FORMAT,
+        dispositions: ["allow", "allow-limited", "review", "quarantine", "deny", "shutdown"],
+        default_capabilities_empty: true,
+        model_output_grants_authority: false,
+        grounding_grants_authority: false,
+        verifier_grants_authority: false,
+        effects_require_fresh_check: true,
+        may_execute: false,
+        may_persist: false,
+        sandbox_enforced: false,
+        quarantine_enforced: false,
+        shutdown_enforced: false,
+        adaptive_detection: false,
+        malware_scanning: false,
+        audit_persisted: false
+        ,mediated_read_only_tool_authorization: true
+        ,mediated_create_new_staging_authorization: true
+        ,mediated_broker_stage_discard_authorization: true
+        ,mediated_fixed_isolation_probe_authorization: true
+        ,overwrite_authorization: false
+        ,remove_authorization: false
+        ,publication_authorization: false
+        ,tool_decisions_are_bearer_tokens: false
+        ,combine_reporting_only: true
+    };
+}
+
+export EVENT_FORMAT, CONTEXT_FORMAT, DECISION_FORMAT, TOOL_ADAPTER_FORMAT;
+export roles, capabilities, evaluate, evaluate_mediated_tool, combine, status;

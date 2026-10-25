@@ -1,0 +1,969 @@
+// pbai_tool_broker.sapp -- effect-time, fail-closed tool mediation for pbAI.
+//
+// The broker owns a deliberately small registry. It never accepts policy,
+// decisions, grants, deadlines, profiles, roots, or approvals from callers.
+// File reads use the descriptor-bound no-follow secure_file adapter. Tool output
+// remains untrusted data and never authorizes another action.
+
+let MCP = import("stdlib:pb_mcp.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
+let RULER = (try import("pbai_ruler.sapp") catch import("editors/ide/tools/ai/core/pbai_ruler.sapp"));
+let SECURITY = (try import("pbai_security_engine.sapp") catch import("editors/ide/tools/ai/core/pbai_security_engine.sapp"));
+let ISOLATION = (try import("pbai_isolation.sapp") catch import("editors/ide/tools/ai/core/pbai_isolation.sapp"));
+let ANTIVIRUS = (try import("pbai_antivirus.sapp") catch import("editors/ide/tools/ai/core/pbai_antivirus.sapp"));
+let WATCH = import("stdlib:watch.sapp");
+let BATCH_CONTEXT = (try import("pbai_batch_context.sapp") catch import("editors/ide/tools/ai/core/pbai_batch_context.sapp"));
+
+let FORMAT = "pbai.tool.broker.v1";
+let RESULT_FORMAT = "pbai.tool.result.v1";
+let SPEC_FORMAT = "pbai.tool.spec.v1";
+let MAX_SECURE_READ_BYTES = 65536;
+let MAX_FILE_TEXT_CHARS = 20000;
+let MAX_PATH_CHARS = 4096;
+let MAX_LINES = 400;
+let MAX_RECURSIVE_DEPTH = 2;
+let MAX_RECURSIVE_FILES = 128;
+let MAX_BATCH_CALLS = 8;
+let MAX_BATCH_OUTPUT_CHARS = 65536;
+let STAGE_APPROVAL_TTL_MS = 120000;
+let STAGE_ARTIFACT_TTL_MS = 300000;
+let MAX_STAGE_LEASES = 16;
+let _INVOCATION_SEQUENCE = 0;
+let _HANDLER_CALLS = 0;
+let _STAGE_LEASES = map{};
+let _STAGES = map{};
+
+fn _in(items, value) {
+    if type(items) != "array" { return false; }
+    let i = 0;
+    while i < len(items) { if items[i] == value { return true; } i = i + 1; }
+    return false;
+}
+
+fn _spec(name, required, optional, max_input_chars, max_output_chars, caps, handler,
+         recursive = false, batch = false, timeout_enforced = false,
+         read_only = true) {
+    let public = map{
+        format: SPEC_FORMAT,
+        name: name,
+        required_args: required,
+        optional_args: optional,
+        max_input_chars: max_input_chars,
+        max_output_chars: max_output_chars,
+        time_budget_ms: 1000,
+        capabilities: caps,
+        read_only: read_only,
+        recursive: recursive,
+        batch: batch,
+        timeout_enforced: timeout_enforced,
+        output_provenance: "untrusted-tool-output"
+    };
+    return map{ public: public, handler: handler,
+        digest: sha256(json_stringify(public)) };
+}
+
+fn _registry() {
+    return [
+        _spec("pbai_recommend_sampling", ["prompt"], [], 16384, 8192,
+            ["ai:tool"], "mcp-pure"),
+        _spec("pbai_normalize_reply", ["text"], [], 32768, 32768,
+            ["ai:tool"], "mcp-pure"),
+        _spec("pbai_detect_obfuscation", ["text"], [], 16384, 32768,
+            ["ai:tool"], "mcp-pure"),
+        _spec("read_file", ["path"], ["start_line", "end_line"], 8192, 24576,
+            ["ai:tool", "fs:read"], "secure-read"),
+        _spec("head_file", ["path"], ["n"], 8192, 24576,
+            ["ai:tool", "fs:read"], "secure-head"),
+        _spec("protect_scan_text", ["text"], ["purpose"], 65536, 16384,
+            ["ai:tool"], "security-scan"),
+        _spec("list_files", ["path"], ["max_depth", "max_files"], 8192, 32768,
+            ["ai:tool", "fs:read"], "secure-recursive-list", true),
+        _spec("grep_code", ["path", "query"], ["max_depth", "max_results"],
+            8192, 32768, ["ai:tool", "fs:read"], "secure-recursive-grep", true),
+        _spec("call_batch", ["calls"], [], 65536, MAX_BATCH_OUTPUT_CHARS,
+            ["ai:tool", "fs:read"], "bounded-batch", false, true),
+        _spec("watch_runtime", [], [], 128, 16384,
+            ["ai:tool"], "runtime-watch"),
+        _spec("compute_inventory", [], [], 128, 8192,
+            ["ai:tool", "device:read"], "coarse-compute"),
+        _spec("isolation_status", [], [], 128, 16384,
+            ["ai:tool"], "isolation-status"),
+        _spec("isolation_selftest", [], [], 128, 32768,
+            ["ai:tool", "process:spawn"], "isolation-selftest", false, false, false, false),
+        _spec("stage_artifact_preview", ["name", "text"], [], 32768, 16384,
+            ["ai:tool"], "stage-preview"),
+        _spec("stage_new_artifact", ["name", "text", "approval_digest"], [], 32768, 8192,
+            ["ai:tool", "fs:write"], "staged-write", false, false, false, false),
+        _spec("discard_staged_artifact", ["stage_handle", "approval_digest"], [], 1024, 4096,
+            ["ai:tool", "fs:write"], "staged-discard", false, false, false, false),
+        _spec("antivirus_scan_file", ["path"], [], 8192, 16384,
+            ["ai:tool", "fs:read", "process:spawn"], "fixed-antivirus-scan", false, false, false, false)
+    ];
+}
+
+fn _lookup(name) {
+    if type(name) != "string" or name == "" or len(name) > 96 { return nil; }
+    let rows = _registry();
+    let i = 0;
+    while i < len(rows) {
+        if rows[i].public.name == name { return rows[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn tool_catalog() {
+    let rows = _registry();
+    let out = [];
+    let i = 0;
+    while i < len(rows) { push(out, rows[i].public); i = i + 1; }
+    return out;
+}
+
+fn _error(tool, code, executed, request_digest = "") {
+    return map{
+        format: RESULT_FORMAT,
+        ok: false,
+        executed: executed,
+        tool: if type(tool) == "string" and len(tool) <= 96 { tool } else { "invalid" },
+        error_code: code,
+        request_digest: request_digest,
+        pre_decision: nil,
+        post_decision: nil,
+        output_chars: 0,
+        output_digest: "",
+        output_truncated: false,
+        provenance: "untrusted-tool-output",
+        authorizes_action: false,
+        timeout_enforced: false,
+        elapsed_ms: 0
+    };
+}
+
+fn _exact_keys(args, spec) {
+    if type(args) != "map" { return false; }
+    let allowed = [];
+    let i = 0;
+    while i < len(spec.required_args) { push(allowed, spec.required_args[i]); i = i + 1; }
+    i = 0;
+    while i < len(spec.optional_args) { push(allowed, spec.optional_args[i]); i = i + 1; }
+    let keys = map_keys(args);
+    i = 0;
+    while i < len(keys) { if not _in(allowed, keys[i]) { return false; } i = i + 1; }
+    i = 0;
+    while i < len(spec.required_args) {
+        if not map_has(args, spec.required_args[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _integer_between(value, minimum, maximum) {
+    if type(value) != "number" { return false; }
+    let rounded = try num_floor(value) catch nil;
+    return rounded != nil and value == rounded and value >= minimum and value <= maximum;
+}
+
+fn _safe_artifact_name(value) {
+    if type(value) != "string" or value == "" or len(value) > 64 { return false; }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        let ok = (c >= 48 and c <= 57) or (c >= 65 and c <= 90)
+            or (c >= 97 and c <= 122) or c == 45 or c == 95;
+        if not ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _hex64(value) {
+    return type(value) == "string" and len(value) == 64
+        and (try regex_match(value, "^[a-f0-9]{64}$") catch false);
+}
+
+fn _caps_subset(child, parent) {
+    let i = 0;
+    while i < len(child) {
+        if not _in(parent, child[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _safe_repo_path(path, allow_directory_root = false) {
+    if type(path) != "string" or path == "" or len(path) > MAX_PATH_CHARS { return false; }
+    if str_starts_with(path, "/") or str_starts_with(path, "\\")
+        or str_contains(path, "\\") or str_contains(path, strfromcharcode(0)) { return false; }
+    if len(path) >= 2 and str_slice(path, 1, 2) == ":" { return false; }
+    let parts = str_split(path, "/");
+    if len(parts) == 0 { return false; }
+    let allowed_roots = ["README.md", "pblang.lock", "stdlib", "tests", "docs", "demo", "tools", "website"];
+    if not _in(allowed_roots, parts[0]) { return false; }
+    let denied = ["target", "node_modules", "graphify-out", "checkpoints", "cache", "caches"];
+    let sensitive_names = ["credential", "credentials", "password", "passwd", "secret",
+        "private-key", "private_key", "id_rsa", "id_ed25519", "authorization", "cookie", "tokens"];
+    let i = 0;
+    while i < len(parts) {
+        let part = parts[i];
+        if part == "" or part == "." or part == ".." or str_starts_with(part, ".")
+            or _in(denied, part) { return false; }
+        let lowered = str_lower(part);
+        let s = 0;
+        while s < len(sensitive_names) {
+            if str_contains(lowered, sensitive_names[s]) { return false; }
+            s = s + 1;
+        }
+        i = i + 1;
+    }
+    if len(parts) == 1 and parts[0] != "README.md" and parts[0] != "pblang.lock"
+        and not allow_directory_root { return false; }
+    return true;
+}
+
+fn _sensitive_output(text) {
+    if type(text) != "string" { return true; }
+    let lower = str_lower(text);
+    let markers = ["-----begin private key-----", "-----begin rsa private key-----",
+        "authorization: bearer ", "password=", "password:", "\"password\"",
+        "api_key=", "api-key:", "\"api_key\"", "client_secret=",
+        "private_key=", "private-key:", "recovery_code=", "session_cookie="];
+    let i = 0;
+    while i < len(markers) {
+        if str_contains(lower, markers[i]) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _validate_and_normalize(row, args) {
+    let spec = row.public;
+    if not _exact_keys(args, spec) { return map{ ok: false, code: "invalid-argument-schema" }; }
+    let normalized = map{};
+    if spec.name == "pbai_recommend_sampling" {
+        let prompt = try args.prompt catch nil;
+        if type(prompt) != "string" or len(prompt) > 16384 { return map{ ok: false, code: "invalid-prompt" }; }
+        normalized.prompt = prompt;
+    } elif spec.name == "pbai_normalize_reply" {
+        let text = try args.text catch nil;
+        if type(text) != "string" or len(text) > 32768 { return map{ ok: false, code: "invalid-text" }; }
+        normalized.text = text;
+    } elif spec.name == "pbai_detect_obfuscation" {
+        let text = try args.text catch nil;
+        if type(text) != "string" or len(text) > 16384 { return map{ ok: false, code: "invalid-text" }; }
+        normalized.text = text;
+    } elif spec.name == "read_file" {
+        let path = try args.path catch nil;
+        if not _safe_repo_path(path) { return map{ ok: false, code: "path-out-of-scope" }; }
+        let start_line = try args.start_line catch 1;
+        let end_line = try args.end_line catch start_line + MAX_LINES - 1;
+        if not _integer_between(start_line, 1, 1000000)
+            or not _integer_between(end_line, start_line, start_line + MAX_LINES - 1) {
+            return map{ ok: false, code: "invalid-line-window" };
+        }
+        normalized.path = path; normalized.start_line = start_line; normalized.end_line = end_line;
+    } elif spec.name == "head_file" {
+        let path = try args.path catch nil;
+        let n = try args.n catch 40;
+        if not _safe_repo_path(path) { return map{ ok: false, code: "path-out-of-scope" }; }
+        if not _integer_between(n, 1, MAX_LINES) { return map{ ok: false, code: "invalid-line-count" }; }
+        normalized.path = path; normalized.n = n;
+    } elif spec.name == "protect_scan_text" {
+        let text = try args.text catch nil;
+        let purpose = try args.purpose catch "tool-input";
+        if type(text) != "string" or len(text) > 65536 {
+            return map{ ok: false, code: "invalid-text" };
+        }
+        if type(purpose) != "string" or purpose == "" or len(purpose) > 64 {
+            return map{ ok: false, code: "invalid-purpose" };
+        }
+        normalized.text = text; normalized.purpose = purpose;
+    } elif spec.name == "list_files" {
+        let path = try args.path catch nil;
+        let max_depth = try args.max_depth catch MAX_RECURSIVE_DEPTH;
+        let max_files = try args.max_files catch 64;
+        if not _safe_repo_path(path, true) { return map{ ok: false, code: "path-out-of-scope" }; }
+        if not _integer_between(max_depth, 0, MAX_RECURSIVE_DEPTH)
+            or not _integer_between(max_files, 1, MAX_RECURSIVE_FILES) {
+            return map{ ok: false, code: "invalid-recursive-budget" };
+        }
+        normalized.path = path; normalized.max_depth = max_depth;
+        normalized.max_files = max_files;
+    } elif spec.name == "grep_code" {
+        let path = try args.path catch nil;
+        let query = try args.query catch nil;
+        let max_depth = try args.max_depth catch MAX_RECURSIVE_DEPTH;
+        let max_results = try args.max_results catch 20;
+        if not _safe_repo_path(path, true) { return map{ ok: false, code: "path-out-of-scope" }; }
+        if type(query) != "string" or query == "" or len(query) > 128
+            or str_contains(query, strfromcharcode(0)) {
+            return map{ ok: false, code: "invalid-query" };
+        }
+        if not _integer_between(max_depth, 0, MAX_RECURSIVE_DEPTH)
+            or not _integer_between(max_results, 1, 20) {
+            return map{ ok: false, code: "invalid-recursive-budget" };
+        }
+        normalized.path = path; normalized.query = query;
+        normalized.max_depth = max_depth; normalized.max_results = max_results;
+    } elif spec.name == "call_batch" {
+        let calls = try args.calls catch nil;
+        if type(calls) != "array" or len(calls) < 1 or len(calls) > MAX_BATCH_CALLS {
+            return map{ ok: false, code: "invalid-batch-size" };
+        }
+        let batch_allowed = ["pbai_recommend_sampling", "pbai_normalize_reply",
+            "pbai_detect_obfuscation", "protect_scan_text", "read_file",
+            "head_file", "list_files", "grep_code"];
+        let i = 0;
+        while i < len(calls) {
+            let call = calls[i];
+            if type(call) != "map" or len(map_keys(call)) != 2
+                or not map_has(call, "tool") or not map_has(call, "args")
+                or type(call.tool) != "string" or type(call.args) != "map"
+                or not _in(batch_allowed, call.tool) or _lookup(call.tool) == nil
+                or not _caps_subset(_lookup(call.tool).public.capabilities,
+                    ["ai:tool", "fs:read"]) {
+                return map{ ok: false, code: "invalid-batch-child" };
+            }
+            i = i + 1;
+        }
+        normalized.calls = calls;
+    } elif spec.name == "watch_runtime" or spec.name == "compute_inventory"
+        or spec.name == "isolation_status" or spec.name == "isolation_selftest" {
+        // Exact empty argument map was already enforced.
+    } elif spec.name == "antivirus_scan_file" {
+        let path = try args.path catch nil;
+        if not _safe_repo_path(path) { return map{ ok: false, code: "path-out-of-scope" }; }
+        normalized.path = path;
+    } elif spec.name == "stage_artifact_preview" {
+        let name = try args.name catch nil;
+        let text = try args.text catch nil;
+        if not _safe_artifact_name(name) {
+            return map{ ok: false, code: "invalid-artifact-name" };
+        }
+        if type(text) != "string" or text == "" or len(text) > 24576
+            or str_contains(text, strfromcharcode(0)) {
+            return map{ ok: false, code: "invalid-artifact-text" };
+        }
+        normalized.name = name; normalized.text = text;
+    } elif spec.name == "stage_new_artifact" {
+        let name = try args.name catch nil;
+        let text = try args.text catch nil;
+        let approval = try args.approval_digest catch nil;
+        if not _safe_artifact_name(name) or not _hex64(approval) {
+            return map{ ok: false, code: "invalid-staged-write-lease" };
+        }
+        if type(text) != "string" or text == "" or len(text) > 24576
+            or str_contains(text, strfromcharcode(0)) {
+            return map{ ok: false, code: "invalid-artifact-text" };
+        }
+        normalized.name = name; normalized.text = text;
+        normalized.approval_digest = approval;
+    } elif spec.name == "discard_staged_artifact" {
+        let handle = try args.stage_handle catch nil;
+        let approval = try args.approval_digest catch nil;
+        if not _hex64(handle) or not _hex64(approval) {
+            return map{ ok: false, code: "invalid-stage-handle" };
+        }
+        normalized.stage_handle = handle; normalized.approval_digest = approval;
+    } else { return map{ ok: false, code: "unknown-tool" }; }
+    let encoded = try json_stringify(normalized) catch nil;
+    if encoded == nil or len(encoded) > spec.max_input_chars {
+        return map{ ok: false, code: "input-limit-exceeded" };
+    }
+    return map{ ok: true, args: normalized, encoded: encoded };
+}
+
+fn _line_window(text, start_line, end_line) {
+    let lines = str_split(text, "\n");
+    let out = "";
+    let line = start_line;
+    while line <= end_line and line <= len(lines) and len(out) < MAX_FILE_TEXT_CHARS {
+        let next = lines[line - 1];
+        if out != "" { next = "\n" + next; }
+        let remaining = MAX_FILE_TEXT_CHARS - len(out);
+        if len(next) > remaining { out = out + str_slice(next, 0, remaining); }
+        else { out = out + next; }
+        line = line + 1;
+    }
+    return out;
+}
+
+fn _secure_file_value(args, head_only) {
+    let loaded = SECURE.read_text_prefix(args.path, MAX_SECURE_READ_BYTES, false);
+    if type(loaded) != "map" or not (try loaded.ok catch false) { return nil; }
+    let start_line = 1;
+    let end_line = try args.n catch MAX_LINES;
+    if not head_only { start_line = args.start_line; end_line = args.end_line; }
+    let text = _line_window(loaded.text, start_line, end_line);
+    return map{
+        format: "pbai.tool.file-read.v1",
+        text: text,
+        returned_chars: len(text),
+        source_size: try loaded.source_size catch try loaded.size catch 0,
+        source_truncated: try loaded.truncated catch false,
+        start_line: start_line,
+        end_line: end_line,
+        path_digest: sha256(args.path),
+        race_resistant: try loaded.race_resistant catch false,
+        nofollow: true
+    };
+}
+
+fn _join_path(parent, child) {
+    if str_ends_with(parent, "/") { return parent + child; }
+    return parent + "/" + child;
+}
+
+fn _text_path(path) {
+    let lower = str_lower(path);
+    let suffixes = [".sapp", ".sap", ".md", ".txt", ".json", ".html",
+        ".css", ".js", ".ts", ".toml", ".yaml", ".yml", ".xml", ".csv"];
+    let i = 0;
+    while i < len(suffixes) {
+        if str_ends_with(lower, suffixes[i]) { return true; }
+        i = i + 1;
+    }
+    return path == "README.md" or path == "pblang.lock";
+}
+
+fn _walk_files(path, depth, args, out, stats) {
+    if depth > args.max_depth or len(out) >= args.max_files
+        or stats.visited >= MAX_RECURSIVE_FILES * 4 { return nil; }
+    let listed = SECURE.list_directory(path, MAX_RECURSIVE_FILES);
+    if not (try listed.ok catch false) {
+        let path_scan = SECURITY.inspect_text(path, "broker-relative-filename");
+        if _text_path(path) and _safe_repo_path(path)
+            and (try path_scan.permitted catch false) { push(out, path); }
+        elif _text_path(path) { stats.rejected = stats.rejected + 1; }
+        return nil;
+    }
+    let i = 0;
+    while i < len(listed.entries) and len(out) < args.max_files {
+        stats.visited = stats.visited + 1;
+        let child = _join_path(path, listed.entries[i]);
+        if _safe_repo_path(child) { _walk_files(child, depth + 1, args, out, stats); }
+        else { stats.rejected = stats.rejected + 1; }
+        i = i + 1;
+    }
+    if len(listed.entries) >= MAX_RECURSIVE_FILES { stats.entry_cap_reached = true; }
+    return nil;
+}
+
+fn _list_files_value(args) {
+    let files = [];
+    let stats = map{ visited: 0, rejected: 0, entry_cap_reached: false };
+    _walk_files(args.path, 0, args, files, stats);
+    return map{ format: "pbai.tool.file-list.v1", files: files,
+        count: len(files), max_depth: args.max_depth, max_files: args.max_files,
+        visited_entries: stats.visited, rejected_entries: stats.rejected,
+        file_cap_reached: len(files) >= args.max_files,
+        entry_cap_reached: stats.entry_cap_reached,
+        descriptor_directory_walk: true, nofollow: true };
+}
+
+fn _grep_value(args) {
+    let listing = _list_files_value(map{ path: args.path,
+        max_depth: args.max_depth, max_files: MAX_RECURSIVE_FILES });
+    let matches = [];
+    let query = str_lower(args.query);
+    let scanned_bytes = 0;
+    let i = 0;
+    while i < len(listing.files) and len(matches) < args.max_results
+        and scanned_bytes < 1048576 {
+        let loaded = SECURE.read_text_prefix(listing.files[i], 32768, false);
+        if try loaded.ok catch false {
+            scanned_bytes = scanned_bytes + len(str_to_bytes(loaded.text));
+            let lines = str_split(loaded.text, "\n");
+            let line = 0;
+            while line < len(lines) and len(matches) < args.max_results {
+                if str_contains(str_lower(lines[line]), query) {
+                    push(matches, map{ path: listing.files[i], line: line + 1,
+                        line_digest: sha256(lines[line]), match_text_returned: false });
+                }
+                line = line + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return map{ format: "pbai.tool.grep.v1", matches: matches,
+        count: len(matches), files_considered: i, scanned_bytes: scanned_bytes,
+        aggregate_byte_cap: 1048576, result_cap_reached: len(matches) >= args.max_results,
+        snippets_returned: false, descriptor_reads: true, nofollow: true };
+}
+
+fn _batch_children_value(args) {
+    let results = [];
+    let aggregate = 0;
+    let i = 0;
+    while i < len(args.calls) and aggregate <= MAX_BATCH_OUTPUT_CHARS {
+        let child = tool_call(args.calls[i].tool, args.calls[i].args);
+        let compact = map{ format: "pbai.tool.batch-child.v1",
+            ok: child.ok, executed: child.executed, tool: child.tool,
+            error_code: try child.error_code catch "",
+            request_digest: child.request_digest,
+            output_digest: child.output_digest,
+            timeout_enforced: child.timeout_enforced,
+            value: try child.value catch nil };
+        let encoded = try json_stringify(compact) catch "";
+        aggregate = aggregate + len(encoded);
+        if aggregate <= MAX_BATCH_OUTPUT_CHARS { push(results, compact); }
+        i = i + 1;
+    }
+    return map{ format: "pbai.tool.batch.v1", results: results,
+        requested_calls: len(args.calls), completed_calls: len(results),
+        aggregate_output_chars: aggregate,
+        aggregate_output_cap: MAX_BATCH_OUTPUT_CHARS,
+        aggregate_cap_reached: aggregate > MAX_BATCH_OUTPUT_CHARS,
+        nested_batches_allowed: false, per_child_policy_checks: true };
+}
+
+fn _batch_value(args, parent_digest) {
+    let guarded = BATCH_CONTEXT.run(parent_digest,
+        fn() { return _batch_children_value(args); });
+    if not guarded.ok { return nil; }
+    return guarded.value;
+}
+
+fn _runtime_watch_value() {
+    let vm = WATCH.vm();
+    return map{ format: "pbai.tool.runtime-watch.v1",
+        heap: try vm.heap catch map{}, memory: try vm.memory catch map{},
+        persistent: false, callbacks: false, sample_count: 1,
+        paths_returned: false, network_inventory_returned: false };
+}
+
+fn _compute_value() {
+    let compute = WATCH.compute();
+    return map{ format: "pbai.tool.compute-inventory.v1",
+        cpu_threads: try compute.cpu_threads catch 0,
+        parallel_matmul: try compute.parallel_matmul catch false,
+        gpu_feature: try compute.gpu_feature catch false,
+        gpu_available: try compute.gpu_available catch false,
+        gpu_enabled: try compute.gpu_enabled catch false,
+        gpu_adapter_count: try len(compute.gpu_adapters) catch 0,
+        npu_backend_available: false,
+        names_returned: false, serials_returned: false,
+        addresses_returned: false, storage_returned: false,
+        detection_proves_workload_readiness: false };
+}
+
+fn _stage_request_digest(args) {
+    return sha256(FORMAT + "\x00stage-content\x00"
+        + json_stringify(map{ name: args.name, text: args.text }));
+}
+
+fn _random_handle(label) {
+    return sha256(label + "\x00" + base64_encode_bytes(random_bytes(32))
+        + "\x00" + str(now_ms()));
+}
+
+fn _remove_stage(stage) {
+    let file_removed = try SECURE.remove_file(stage.path, true) catch map{ ok: false };
+    let dir_removed = try SECURE.remove(stage.dir, false) catch map{ ok: false };
+    return (try file_removed.ok catch false) and (try dir_removed.ok catch false);
+}
+
+fn _maintain_stages() {
+    let current = num_floor(now_ms());
+    let approvals = map_keys(_STAGE_LEASES);
+    let i = 0;
+    while i < len(approvals) {
+        let lease = _STAGE_LEASES[approvals[i]];
+        if current > (try lease.expires_ms catch 0) { map_remove(_STAGE_LEASES, approvals[i]); }
+        i = i + 1;
+    }
+    let handles = map_keys(_STAGES);
+    i = 0;
+    while i < len(handles) {
+        let stage = _STAGES[handles[i]];
+        if current > (try stage.expires_ms catch 0) {
+            // Retain ownership metadata when cleanup fails so a later broker
+            // activity can retry instead of orphaning an untracked artifact.
+            if _remove_stage(stage) { map_remove(_STAGES, handles[i]); }
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _stage_approval_valid(args) {
+    let enabled = try str(env_get("PBAI_ENABLE_STAGED_WRITES")) catch "";
+    let approval = try args.approval_digest catch "";
+    if enabled != "1" or approval == "" or not map_has(_STAGE_LEASES, approval) {
+        return false;
+    }
+    let lease = _STAGE_LEASES[approval];
+    return (try lease.content_request_digest catch "") == _stage_request_digest(args)
+        and num_floor(now_ms()) <= (try lease.expires_ms catch 0);
+}
+
+fn _consume_stage_approval(args) {
+    if not _stage_approval_valid(args) { return ""; }
+    let approval = args.approval_digest;
+    map_remove(_STAGE_LEASES, approval);
+    return approval;
+}
+
+fn _stage_preview_value(args) {
+    let scan = SECURITY.inspect_text(args.text, "staged-artifact-preview");
+    let request_digest = _stage_request_digest(args);
+    let approval = "";
+    let expires_ms = 0;
+    if (try scan.permitted catch false) and len(map_keys(_STAGE_LEASES)) < MAX_STAGE_LEASES {
+        approval = _random_handle("pbai-stage-approval:" + request_digest);
+        expires_ms = num_floor(now_ms()) + STAGE_APPROVAL_TTL_MS;
+        _STAGE_LEASES[approval] = map{ content_request_digest: request_digest,
+            expires_ms: expires_ms };
+    }
+    return map{ format: "pbai.tool.stage-preview.v1",
+        permitted_for_staging: (try scan.permitted catch false) and approval != "",
+        security_verdict: try scan.verdict catch "unknown",
+        security_disposition: try scan.disposition catch "quarantine",
+        security_rule_ids: try scan.rule_ids catch [],
+        content_chars: len(args.text), content_digest: sha256(args.text),
+        request_digest: request_digest, approval_digest: approval,
+        approval_expires_ms: expires_ms, approval_ttl_ms: STAGE_APPROVAL_TTL_MS,
+        approval_single_use: true, approval_is_bearer_token: true,
+        operator_environment_name: "PBAI_ENABLE_STAGED_WRITES",
+        raw_content_returned: false, publication_authorized: false,
+        overwrite_authorized: false, remove_authorized: false };
+}
+
+fn _stage_value(args, request_digest) {
+    let approval = _consume_stage_approval(args);
+    if approval == "" {
+        return map{ ok: false, error_code: "attended-approval-required" };
+    }
+    let scan = SECURITY.inspect_text(args.text, "staged-artifact-effect");
+    if not (try scan.permitted catch false) {
+        return map{ ok: false, error_code: "staged-content-policy-denied",
+            security_verdict: try scan.verdict catch "unknown",
+            security_rule_ids: try scan.rule_ids catch [] };
+    }
+    if platform() != "linux" {
+        return map{ ok: false, error_code: "private-staging-platform-unavailable" };
+    }
+    let stage_dir = "/tmp/pbai-stage-" + str_slice(request_digest, 0, 24);
+    let created = SECURE.create_private_directory_new(stage_dir);
+    if not (try created.ok catch false) {
+        return map{ ok: false, error_code: "stage-create-failed" };
+    }
+    let path = stage_dir + "/" + args.name + ".txt";
+    let written = SECURE.write_text_new_exclusive(path, args.text, false, true);
+    if not (try written.ok catch false) {
+        try SECURE.remove(stage_dir, false) catch nil;
+        return map{ ok: false, error_code: "stage-write-failed" };
+    }
+    let readback = SECURE.read_text(path, 24576, true);
+    if not (try readback.ok catch false) or sha256(readback.text) != sha256(args.text) {
+        try SECURE.remove_file(path, true) catch nil;
+        try SECURE.remove(stage_dir, false) catch nil;
+        return map{ ok: false, error_code: "stage-readback-verification-failed" };
+    }
+    let handle = _random_handle("pbai-stage-handle:" + request_digest);
+    let expires_ms = num_floor(now_ms()) + STAGE_ARTIFACT_TTL_MS;
+    _STAGES[handle] = map{ path: path, dir: stage_dir,
+        approval_digest: approval, expires_ms: expires_ms };
+    return map{ format: "pbai.tool.staged-artifact.v1", ok: true,
+        stage_handle: handle, stage_path_digest: sha256(path),
+        content_digest: sha256(args.text), content_chars: len(args.text),
+        private_parent_verified: true, parent_mode: "700",
+        exclusive_create: true, no_replace: true, executable: false,
+        publication_authorized: false, overwrite_authorized: false,
+        readback_verified: true, expires_ms: expires_ms,
+        stage_ttl_ms: STAGE_ARTIFACT_TTL_MS, raw_path_returned: false,
+        remove_authorized: false, rollback_scope: "attended-discard-or-ttl-cleanup" };
+}
+
+fn _stage_discard_valid(args) {
+    if not map_has(_STAGES, args.stage_handle) { return false; }
+    let stage = _STAGES[args.stage_handle];
+    let enabled = try str(env_get("PBAI_ENABLE_STAGED_WRITES")) catch "";
+    return enabled == "1" and args.approval_digest == (try stage.approval_digest catch "")
+        and num_floor(now_ms()) <= (try stage.expires_ms catch 0);
+}
+
+fn _discard_stage_value(args) {
+    if not _stage_discard_valid(args) {
+        return map{ ok: false, error_code: "attended-discard-approval-required" };
+    }
+    let stage = _STAGES[args.stage_handle];
+    let removed = _remove_stage(stage);
+    if removed { map_remove(_STAGES, args.stage_handle); }
+    return map{ format: "pbai.tool.stage-discard.v1", ok: removed,
+        discarded: removed, raw_path_returned: false,
+        error_code: if removed { "" } else { "stage-discard-failed" } };
+}
+
+fn _execute(row, args, request_digest) {
+    _HANDLER_CALLS = _HANDLER_CALLS + 1;
+    if row.handler == "mcp-pure" { return MCP.call(row.public.name, args); }
+    if row.handler == "secure-read" { return _secure_file_value(args, false); }
+    if row.handler == "secure-head" { return _secure_file_value(args, true); }
+    if row.handler == "security-scan" { return SECURITY.inspect_text(args.text, args.purpose); }
+    if row.handler == "secure-recursive-list" { return _list_files_value(args); }
+    if row.handler == "secure-recursive-grep" { return _grep_value(args); }
+    if row.handler == "bounded-batch" { return _batch_value(args, request_digest); }
+    if row.handler == "runtime-watch" { return _runtime_watch_value(); }
+    if row.handler == "coarse-compute" { return _compute_value(); }
+    if row.handler == "isolation-status" { return ISOLATION.status(); }
+    if row.handler == "isolation-selftest" { return ISOLATION.selftest(); }
+    if row.handler == "fixed-antivirus-scan" { return ANTIVIRUS.scan_file(args.path); }
+    if row.handler == "stage-preview" { return _stage_preview_value(args); }
+    if row.handler == "staged-write" { return _stage_value(args, request_digest); }
+    if row.handler == "staged-discard" { return _discard_stage_value(args); }
+    return nil;
+}
+
+fn _context(now, row, request_digest, args = nil) {
+    let effect_kind = "read-only";
+    if row.handler == "staged-write" { effect_kind = "stage-new-artifact"; }
+    elif row.handler == "staged-discard" { effect_kind = "discard-staged-artifact"; }
+    elif row.handler == "isolation-selftest" { effect_kind = "fixed-isolation-probe"; }
+    elif row.handler == "fixed-antivirus-scan" { effect_kind = "fixed-security-scan"; }
+    let approved = false;
+    if effect_kind == "stage-new-artifact" and type(args) == "map" {
+        approved = _stage_approval_valid(args);
+    }
+    elif effect_kind == "discard-staged-artifact" and type(args) == "map" {
+        approved = _stage_discard_valid(args);
+    }
+    return map{
+        format: RULER.CONTEXT_FORMAT,
+        current_ms: now,
+        max_deadline_ms: now + row.public.time_budget_ms,
+        max_retries: 0,
+        max_payload_chars: row.public.max_input_chars,
+        max_tokens: 0,
+        max_memory_bytes: 262144,
+        max_time_ms: row.public.time_budget_ms,
+        max_output_chars: row.public.max_output_chars,
+        granted_capabilities: row.public.capabilities,
+        registered_roles: [],
+        seen_event_ids: [],
+        adapter_format: RULER.TOOL_ADAPTER_FORMAT,
+        adapter_id: FORMAT,
+        invocation_digest: request_digest,
+        tool_name: row.public.name,
+        tool_spec_digest: row.digest,
+        read_only: row.public.read_only,
+        effect_kind: effect_kind,
+        attended_approval_verified: approved,
+        approval_digest: if approved { request_digest } else { "" },
+        fixed_probe: effect_kind == "fixed-isolation-probe",
+        fixed_security_scan: effect_kind == "fixed-security-scan",
+        parent_invocation_digest: BATCH_CONTEXT.parent_digest()
+    };
+}
+
+fn _event(now, invocation_id, row, encoded, request_digest) {
+    return map{
+        format: RULER.EVENT_FORMAT,
+        event_id: invocation_id,
+        trace_id: "trace-" + str_slice(request_digest, 0, 32),
+        phase: "tool-call",
+        operation: "invoke-tool",
+        subject_role: "tool-broker",
+        recipient_role: "pbruler",
+        payload_kind: "tool-arguments",
+        payload_chars: len(encoded),
+        payload_digest: request_digest,
+        requested_capabilities: row.public.capabilities,
+        provenance: "untrusted",
+        redaction: "required",
+        deadline_ms: now + row.public.time_budget_ms,
+        retry_count: 0,
+        limits: map{ tokens: 0, memory_bytes: 262144,
+            time_ms: row.public.time_budget_ms, output_chars: row.public.max_output_chars },
+        anomaly: "none",
+        tool_name: row.public.name,
+        tool_spec_digest: row.digest,
+        parent_invocation_digest: BATCH_CONTEXT.parent_digest()
+    };
+}
+
+fn _post_event(now, invocation_id, output_text, output_digest, row, redaction) {
+    return map{
+        format: RULER.EVENT_FORMAT,
+        event_id: invocation_id + "-out",
+        trace_id: "trace-" + str_slice(output_digest, 0, 32),
+        phase: "output",
+        operation: "release-response",
+        subject_role: "tool-broker",
+        recipient_role: "verifier",
+        payload_kind: "tool-output",
+        payload_chars: len(output_text),
+        payload_digest: output_digest,
+        requested_capabilities: [],
+        provenance: "untrusted",
+        redaction: redaction,
+        deadline_ms: now + row.public.time_budget_ms,
+        retry_count: 0,
+        limits: map{ tokens: 0, memory_bytes: 262144,
+            time_ms: row.public.time_budget_ms, output_chars: row.public.max_output_chars },
+        anomaly: "none"
+    };
+}
+
+fn tool_call(name, args = nil) {
+    _maintain_stages();
+    let row = _lookup(name);
+    if row == nil { return _error(name, "tool-not-allowed", false); }
+    if args == nil { args = map{}; }
+    let checked = _validate_and_normalize(row, args);
+    if not checked.ok { return _error(name, checked.code, false); }
+
+    let request_digest = sha256(FORMAT + "\x00" + row.digest + "\x00" + checked.encoded);
+    let now = num_floor(now_ms());
+    _INVOCATION_SEQUENCE = _INVOCATION_SEQUENCE + 1;
+    let invocation_id = "tool-" + str(_INVOCATION_SEQUENCE) + "-" + str_slice(request_digest, 0, 24);
+    let context = _context(now, row, request_digest, checked.args);
+    let event = _event(now, invocation_id, row, checked.encoded, request_digest);
+    let pre = RULER.evaluate_mediated_tool(event, context);
+    if not pre.permitted or not pre.may_execute or not pre.enforced {
+        let denied = _error(name, "policy-denied", false, request_digest);
+        denied.pre_decision = pre;
+        return denied;
+    }
+
+    let started = num_floor(now_ms());
+    let value = try _execute(row, checked.args, request_digest) catch nil;
+    let elapsed = num_floor(now_ms()) - started;
+    if value == nil {
+        let failed = _error(name, "handler-failed", true, request_digest);
+        failed.pre_decision = pre; failed.elapsed_ms = elapsed;
+        return failed;
+    }
+    if (row.handler == "staged-write" or row.handler == "staged-discard")
+        and not (try value.ok catch false) {
+        let failed = _error(name, try value.error_code catch "stage-write-failed",
+            true, request_digest);
+        failed.pre_decision = pre; failed.elapsed_ms = elapsed;
+        return failed;
+    }
+    let redaction = "not-needed";
+    if row.handler == "secure-read" or row.handler == "secure-head" {
+        let file_text = try value.text catch nil;
+        let scan = SECURITY.inspect_text(file_text, "broker-file-output");
+        if _sensitive_output(file_text) or not (try scan.permitted catch false) {
+            let private = _error(name, "sensitive-output-denied", true, request_digest);
+            private.pre_decision = pre; private.elapsed_ms = elapsed;
+            private.security_verdict = try scan.verdict catch "unknown";
+            private.security_rule_ids = try scan.rule_ids catch [];
+            return private;
+        }
+        redaction = "passed";
+    }
+    let output_text = try json_stringify(value) catch nil;
+    if output_text == nil or len(output_text) > row.public.max_output_chars {
+        let oversized = _error(name, "output-limit-exceeded", true, request_digest);
+        oversized.pre_decision = pre; oversized.elapsed_ms = elapsed;
+        return oversized;
+    }
+    let output_scan = SECURITY.inspect_text(output_text, "broker-serialized-output");
+    if not (try output_scan.permitted catch false) {
+        let private = _error(name, "sensitive-output-denied", true, request_digest);
+        private.pre_decision = pre; private.elapsed_ms = elapsed;
+        private.security_verdict = try output_scan.verdict catch "unknown";
+        private.security_rule_ids = try output_scan.rule_ids catch [];
+        return private;
+    }
+    redaction = "passed";
+    let output_digest = sha256(output_text);
+    let post_now = num_floor(now_ms());
+    let post_context = _context(post_now, row, request_digest, checked.args);
+    post_context.granted_capabilities = [];
+    post_context.max_payload_chars = row.public.max_output_chars;
+    let post = RULER.evaluate(_post_event(post_now, invocation_id,
+        output_text, output_digest, row, redaction), post_context);
+    if not post.permitted or not post.allowed_for_display {
+        let denied_output = _error(name, "output-policy-denied", true, request_digest);
+        denied_output.pre_decision = pre; denied_output.post_decision = post;
+        denied_output.output_chars = len(output_text); denied_output.output_digest = output_digest;
+        denied_output.elapsed_ms = elapsed;
+        return denied_output;
+    }
+    return map{
+        format: RESULT_FORMAT,
+        ok: true,
+        executed: true,
+        tool: name,
+        request_digest: request_digest,
+        pre_decision: pre,
+        post_decision: post,
+        output_chars: len(output_text),
+        output_digest: output_digest,
+        output_truncated: false,
+        provenance: "untrusted-tool-output",
+        authorizes_action: false,
+        timeout_enforced: false,
+        elapsed_ms: elapsed,
+        value: value
+    };
+}
+
+fn status() {
+    return map{
+        format: "pbai.tool.broker.status.v1",
+        ok: true,
+        registry_format: SPEC_FORMAT,
+        result_format: RESULT_FORMAT,
+        allowed_tools: len(tool_catalog()),
+        authoritative_registry: true,
+        fresh_ruler_check: true,
+        post_output_check: true,
+        exact_argument_schemas: true,
+        secure_descriptor_reads: true,
+        sensitive_filename_filter: true,
+        file_output_secret_scan: true,
+        incomplete_redaction_fails_closed: true,
+        raw_mcp_catalog_is_authority: false,
+        caller_policy_accepted: false,
+        caller_decisions_accepted: false,
+        recursive_tools_enabled: true,
+        recursive_max_depth: MAX_RECURSIVE_DEPTH,
+        recursive_max_files: MAX_RECURSIVE_FILES,
+        batch_tools_enabled: true,
+        batch_max_calls: MAX_BATCH_CALLS,
+        batch_nested: false,
+        batch_state_exception_safe: BATCH_CONTEXT.status().exception_safe_cleanup,
+        batch_state_active: BATCH_CONTEXT.status().active,
+        batch_parent_binding_active: BATCH_CONTEXT.status().parent_binding_active,
+        watcher_tools_enabled: true,
+        watcher_persistent: false,
+        coarse_compute_inventory_enabled: true,
+        full_hardware_inventory_enabled: false,
+        network_tools_enabled: false,
+        staged_create_new_write_enabled: true,
+        write_tools_enabled: true,
+        general_write_tools_enabled: false,
+        write_requires_operator_environment_opt_in: true,
+        write_operator_environment_name: "PBAI_ENABLE_STAGED_WRITES",
+        write_approval_single_use: true,
+        write_approval_ttl_ms: STAGE_APPROVAL_TTL_MS,
+        staged_artifact_ttl_ms: STAGE_ARTIFACT_TTL_MS,
+        opaque_stage_handles: true,
+        staged_discard_enabled: true,
+        cleanup_on_broker_activity: true,
+        physical_cleanup_guaranteed_at_expiry: false,
+        crash_restart_scavenging: false,
+        private_staging_platforms: ["linux"],
+        staging_inside_repository: false,
+        overwrite_tools_enabled: false,
+        remove_tools_enabled: false,
+        broker_owned_stage_discard_enabled: true,
+        publication_tools_enabled: false,
+        trusted_worker_timeout_available: ISOLATION.status().trusted_worker_timeout_available,
+        timeout_enforced_for_all_tools: false,
+        isolation_selftest_timeout_enforced: false,
+        isolation_selftest_inner_worker_bounded: true,
+        full_sandbox_verified: false,
+        security_engine: SECURITY.status(),
+        antivirus_adapter: ANTIVIRUS.status(),
+        output_authorizes_action: false,
+        handler_calls: _HANDLER_CALLS
+    };
+}
+
+export FORMAT, RESULT_FORMAT, SPEC_FORMAT;
+export tool_catalog, tool_call, status;

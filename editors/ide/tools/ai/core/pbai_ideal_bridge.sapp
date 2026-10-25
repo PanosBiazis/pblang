@@ -1,0 +1,1095 @@
+// stdlib/pbai_ideal_bridge.sapp — wire the Ideal NN into the REAL pbai LM model.
+//
+// pbai_ideal_nn.sapp and pbai_rl.sapp reason about an abstract model view
+//   { layers: array<matrix>, output_dist: array<prob>, complex_weights: array<{re,im}> }
+// while the real char LM (pbai_lm.sapp) is
+//   { E, W1, b1, W2, b2, V, D, H, K }.
+//
+// This module is the missing adapter + integration contract. It is purely
+// ADDITIVE (a new module — it does not modify pbai.sapp or pbai_max.sapp), so it
+// can't destabilise the training loop, and it is written entirely in pblang.
+//
+// What it gives you:
+//   * ideality_status(model)        — observability: how close the real model is
+//                                     to the Ideal NN across the four axes.
+//   * orthogonal_regularize(model)  — a SOUND training nudge: blend W1/W2 toward
+//                                     orthonormal columns (dynamical isometry =
+//                                     healthier gradient flow). Returns a NEW
+//                                     model of the same shape.
+//   * regularized_loss(...)         — task_loss + lambda * ideality, the opt-in
+//                                     loss-shaping hook.
+//
+// Honest scope: the SPECTRAL axis (orthogonality of the real weight matrices) and
+// the DISTRIBUTIONAL/GEOMETRIC axes (output-layer prior vs. a target distribution)
+// are well-defined, meaningful metrics for a real LM. The COMPLEX axis is the
+// research/exploratory frontier from the Ideal NN spec; here it is a documented
+// structural proxy (a sample of real weights mapped to re+0i), reported for
+// completeness, not used by orthogonal_regularize.
+
+let IDEAL = (try import("pbai_ideal_nn.sapp") catch import("editors/ide/tools/ai/core/pbai_ideal_nn.sapp"));
+
+let _CW_SAMPLE = 64;   // cap on weights mapped into the complex proxy axis
+
+// ── small helpers ──────────────────────────────────────────────────────────────
+
+fn _softmax(v) {
+    let mx = v[0];
+    let i = 1;
+    while i < len(v) { if v[i] > mx { mx = v[i]; } i = i + 1; }
+    let out = [];
+    let sum = 0.0;
+    let j = 0;
+    while j < len(v) { let e = num_exp(v[j] - mx); push(out, e); sum = sum + e; j = j + 1; }
+    if not (sum > 0.0) {
+        let u = [];
+        let k = 0;
+        while k < len(v) { push(u, 1.0 / len(v)); k = k + 1; }
+        return u;
+    }
+    let n = [];
+    let k2 = 0;
+    while k2 < len(out) { push(n, out[k2] / sum); k2 = k2 + 1; }
+    return n;
+}
+
+// Blend a matrix toward a target matrix by learning rate lr in (0,1].
+fn _blend(W, T, lr) {
+    let out = [];
+    let i = 0;
+    while i < len(W) {
+        let row = [];
+        let j = 0;
+        while j < len(W[i]) {
+            push(row, W[i][j] + lr * (T[i][j] - W[i][j]));
+            j = j + 1;
+        }
+        push(out, row);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── adapters ─────────────────────────────────────────────────────────────────
+
+// The model's unconditioned output distribution: softmax of the output bias b2.
+// This is a valid probability vector that shifts as the output layer trains; it
+// needs no forward pass (pbai_lm._forward is private). Callers that already have
+// a real next-token distribution p (from generate()) can pass it to the status
+// functions directly instead.
+fn output_prior(model) {
+    return _softmax(model.b2);
+}
+
+fn default_target_dist(V) {
+    let out = [];
+    let i = 0;
+    while i < V { push(out, 1.0 / V); i = i + 1; }
+    return out;
+}
+
+// Sample real weights from W1 into the complex proxy axis (re = weight, im = 0).
+fn _complex_proxy(model) {
+    let out = [];
+    let count = 0;
+    let i = 0;
+    while i < len(model.W1) and count < _CW_SAMPLE {
+        let j = 0;
+        while j < len(model.W1[i]) and count < _CW_SAMPLE {
+            push(out, map{ re: model.W1[i][j], im: 0.0 });
+            count = count + 1;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Adapt a real LM model into the abstract Ideal-NN view. `output_dist` is
+// optional; defaults to the output-layer prior.
+fn model_to_ideal_view(model, output_dist = nil) {
+    if output_dist == nil { output_dist = output_prior(model); }
+    return map{
+        layers: [model.W1, model.W2],
+        output_dist: output_dist,
+        complex_weights: _complex_proxy(model)
+    };
+}
+
+// ── observability: ideality status of a real model ──────────────────────────────
+
+fn ideality_status(model, target_dist = nil) {
+    if target_dist == nil { target_dist = default_target_dist(model.V); }
+    let view = model_to_ideal_view(model, output_prior(model));
+    let ideal = IDEAL.ideal_spec(target_dist);
+    let d = IDEAL.ideality_distance(view, ideal);
+
+    let per_layer = [];
+    let i = 0;
+    while i < len(view.layers) {
+        push(per_layer, IDEAL.orthogonality_defect(view.layers[i]));
+        i = i + 1;
+    }
+
+    let summary = "ideality total=" + str(d.total)
+        + " | spectral=" + str(d.spectral)
+        + " distributional=" + str(d.distributional)
+        + " geometric=" + str(d.geometric)
+        + " complex=" + str(d.complex);
+
+    return map{
+        format: "pbai.ideal_bridge.status.v1",
+        total: d.total,
+        spectral: d.spectral,
+        distributional: d.distributional,
+        geometric: d.geometric,
+        complex: d.complex,
+        per_layer_spectral: per_layer,
+        summary: summary
+    };
+}
+
+// ── training integration ─────────────────────────────────────────────────────
+
+// A SOUND spectral nudge: blend W1 and W2 toward their Newton-Schulz
+// orthogonalized form. Orthonormal columns give every singular value ~1
+// (dynamical isometry), which keeps gradients from vanishing/exploding. Returns a
+// NEW LM model of the same shape; only W1/W2 change, so training can continue
+// seamlessly. lr in (0,1] controls how hard each call pulls toward orthogonality.
+fn orthogonal_regularize(model, lr) {
+    let nw1 = _blend(model.W1, IDEAL.newton_schulz_step(model.W1), lr);
+    let nw2 = _blend(model.W2, IDEAL.newton_schulz_step(model.W2), lr);
+    return map{
+        E: model.E, W1: nw1, b1: model.b1, W2: nw2, b2: model.b2,
+        V: model.V, D: model.D, H: model.H, K: model.K
+    };
+}
+
+// loss = task_loss + lambda * ideality(model). The opt-in loss-shaping hook for a
+// trainer that wants to regularize toward the Ideal NN.
+fn regularized_loss(model, task_loss, lambda, target_dist = nil) {
+    return task_loss + lambda * ideality_status(model, target_dist).total;
+}
+
+// train_with_orthogonal_reg — interleave a caller-supplied task training step
+// with periodic orthogonal regularization, tracking BOTH the task loss and the
+// spectral conditioning (orthogonality defect) over time. This is how the Ideal
+// NN plugs into real training: keep optimizing the task while periodically
+// nudging the weight matrices toward dynamical isometry for healthier gradients.
+//
+//   step_fn(model) -> map{ model, loss }   (one task SGD step; returns updated model + loss)
+//   reg_every: apply orthogonal_regularize every N steps (0 disables)
+// Returns map{ final, loss_history, spectral_history, steps, improved_conditioning }.
+fn train_with_orthogonal_reg(model, step_fn, steps, reg_every, reg_lr, target_dist = nil) {
+    let cur = model;
+    let loss_history = [];
+    let spectral_history = [ ideality_status(cur, target_dist).spectral ];
+    let i = 0;
+    while i < steps {
+        let r = step_fn(cur);
+        cur = r.model;
+        push(loss_history, try r.loss catch 0.0);
+        if reg_every > 0 and num_mod(i + 1, reg_every) == 0 {
+            cur = orthogonal_regularize(cur, reg_lr);
+        }
+        push(spectral_history, ideality_status(cur, target_dist).spectral);
+        i = i + 1;
+    }
+    let first = spectral_history[0];
+    let last = spectral_history[len(spectral_history) - 1];
+    return map{
+        format: "pbai.ideal_bridge.train.v1",
+        final: cur,
+        loss_history: loss_history,
+        spectral_history: spectral_history,
+        steps: steps,
+        improved_conditioning: last <= first
+    };
+}
+
+// train_with_adaptive_reg — like train_with_orthogonal_reg, but applies the
+// orthogonal nudge ON DEMAND: only after a step whose spectral defect exceeds
+// `spectral_tol`, instead of blindly every N steps. A fixed schedule can
+// over-regularize (pulling weights toward orthogonality harder than the task
+// needs, which can fight the task gradient); this keeps the defect under a
+// budget while leaving conditioning-healthy steps untouched. Records WHICH steps
+// fired so a caller can see how much correction the run actually required.
+//
+//   step_fn(model) -> map{ model, loss }
+//   spectral_tol: regularize whenever post-step spectral defect > this
+// Returns map{ final, loss_history, spectral_history, reg_steps, reg_count,
+//             steps, within_tolerance }.
+fn train_with_adaptive_reg(model, step_fn, steps, spectral_tol, reg_lr, target_dist = nil) {
+    let cur = model;
+    let loss_history = [];
+    let spectral_history = [ ideality_status(cur, target_dist).spectral ];
+    let reg_at = [];
+    let i = 0;
+    while i < steps {
+        let r = step_fn(cur);
+        cur = r.model;
+        push(loss_history, try r.loss catch 0.0);
+        let sp = ideality_status(cur, target_dist).spectral;
+        if sp > spectral_tol {
+            cur = orthogonal_regularize(cur, reg_lr);
+            sp = ideality_status(cur, target_dist).spectral;
+            push(reg_at, i + 1);
+        }
+        push(spectral_history, sp);
+        i = i + 1;
+    }
+    let last = spectral_history[len(spectral_history) - 1];
+    return map{
+        format: "pbai.ideal_bridge.adaptive.v1",
+        final: cur,
+        loss_history: loss_history,
+        spectral_history: spectral_history,
+        reg_steps: reg_at,
+        reg_count: len(reg_at),
+        steps: steps,
+        within_tolerance: last <= spectral_tol
+    };
+}
+
+// training_summary — turn a train_with_orthogonal_reg / train_with_adaptive_reg
+// run into an assessment: did conditioning (spectral defect) and task loss
+// improve, by how much, and how much regularization the run needed. Pure; reads
+// only the histories on the run map, so it works for either trainer.
+fn training_summary(run) {
+    let sh = try run.spectral_history catch [];
+    let lh = try run.loss_history catch [];
+    let sp_first = 0.0;
+    let sp_last = 0.0;
+    if len(sh) > 0 { sp_first = sh[0]; sp_last = sh[len(sh) - 1]; }
+    let sp_delta = sp_last - sp_first;
+    let sp_pct = 0.0;
+    if sp_first != 0.0 { sp_pct = (sp_delta / sp_first) * 100.0; }
+    let loss_first = 0.0;
+    let loss_last = 0.0;
+    if len(lh) > 0 { loss_first = lh[0]; loss_last = lh[len(lh) - 1]; }
+    let loss_delta = loss_last - loss_first;
+    let steps = try run.steps catch len(lh);
+    return map{
+        format: "pbai.ideal_bridge.training_summary.v1",
+        steps: steps,
+        spectral_first: sp_first,
+        spectral_last: sp_last,
+        spectral_delta: sp_delta,
+        spectral_pct: sp_pct,
+        conditioning_improved: sp_last <= sp_first,
+        loss_first: loss_first,
+        loss_last: loss_last,
+        loss_delta: loss_delta,
+        loss_improved: loss_last <= loss_first,
+        reg_count: try run.reg_count catch nil,    // present on adaptive runs
+        summary: "steps=" + str(steps)
+            + " spectral " + str(sp_first) + "->" + str(sp_last) + " (" + str(sp_pct) + "%)"
+            + " loss " + str(loss_first) + "->" + str(loss_last)
+    };
+}
+
+fn _sum_defect(pls) {
+    let s = 0.0;
+    let i = 0;
+    while i < len(pls) { s = s + pls[i]; i = i + 1; }
+    return s;
+}
+
+// recommend_regularization — inspect a model's conditioning and advise whether to
+// apply orthogonal regularization. Rectangular layers have an irreducible defect
+// (a 2x3 matrix can't have 3 orthonormal columns), so an absolute threshold is
+// meaningless. Instead we DRY-RUN a nudge and recommend it only if it actually
+// reclaims total orthogonality defect (summed across layers) by more than
+// `min_rel_improvement` — i.e. there is conditioning headroom worth reclaiming.
+// A nudge on a matrix outside Newton-Schulz's convergence basin can DIVERGE, so a
+// non-positive improvement correctly yields "none". Pure (no mutation).
+fn recommend_regularization(model, target_dist = nil, min_rel_improvement = 0.02) {
+    let before = _sum_defect(ideality_status(model, target_dist).per_layer_spectral);
+    let trial = orthogonal_regularize(model, 0.5);
+    let after = _sum_defect(ideality_status(trial, target_dist).per_layer_spectral);
+    let improvement = before - after;
+    let rel = 0.0;
+    if before != 0.0 { rel = improvement / before; }
+    let action = "none";
+    let suggested_lr = 0.0;
+    let reason = "at conditioning floor — a nudge would not meaningfully help (rel " + str(rel) + ")";
+    if rel > min_rel_improvement {
+        action = "regularize";
+        suggested_lr = 0.5;
+        reason = "a nudge reclaims " + str(rel * 100.0) + "% of total layer defect ("
+            + str(before) + " -> " + str(after) + ")";
+    }
+    return map{
+        format: "pbai.ideal_bridge.recommendation.v1",
+        action: action,
+        suggested_lr: suggested_lr,
+        total_defect_before: before,
+        total_defect_after_trial: after,
+        improvement: improvement,
+        relative_improvement: rel,
+        reason: reason
+    };
+}
+
+// auto_regularize — close the full observe -> decide -> act loop: repeatedly ask
+// recommend_regularization and apply the suggested nudge until it advises "none"
+// (no reclaimable conditioning) or `max_rounds` is hit. Returns the conditioned
+// model plus a per-round log and the final total defect. Pure (no mutation of the
+// input). This is the hands-off way to bring a model to its conditioning floor.
+fn auto_regularize(model, max_rounds = 10, target_dist = nil) {
+    let cur = model;
+    let rounds = 0;
+    let log = [];
+    let start_defect = _sum_defect(ideality_status(cur, target_dist).per_layer_spectral);
+    while rounds < max_rounds {
+        let rec = recommend_regularization(cur, target_dist, 0.02);
+        if rec.action == "none" {
+            push(log, map{ round: rounds, action: "none", total_defect: rec.total_defect_before });
+            return map{
+                format: "pbai.ideal_bridge.auto_reg.v1",
+                final: cur, rounds: rounds, log: log,
+                start_total_defect: start_defect,
+                final_total_defect: rec.total_defect_before,
+                converged: true
+            };
+        }
+        push(log, map{ round: rounds, action: "regularize", lr: rec.suggested_lr, total_defect: rec.total_defect_before });
+        cur = orthogonal_regularize(cur, rec.suggested_lr);
+        rounds = rounds + 1;
+    }
+    return map{
+        format: "pbai.ideal_bridge.auto_reg.v1",
+        final: cur, rounds: rounds, log: log,
+        start_total_defect: start_defect,
+        final_total_defect: _sum_defect(ideality_status(cur, target_dist).per_layer_spectral),
+        converged: false
+    };
+}
+
+// output_entropy — normalized Shannon entropy of the output prior softmax(b2),
+// in [0,1]: 1.0 = maximally diverse (uniform next-token distribution), near 0 =
+// collapsed/over-confident on one class. A model-health signal ORTHOGONAL to
+// weight conditioning (a well-conditioned model can still be collapsed).
+fn output_entropy(model) {
+    let p = output_prior(model);
+    let v = len(p);
+    if v <= 1 { return 0.0; }
+    let h = 0.0;
+    let i = 0;
+    while i < v {
+        if p[i] > 0.0 { h = h - p[i] * num_ln(p[i]); }
+        i = i + 1;
+    }
+    return h / num_ln(v);
+}
+
+// perplexity — exp(Shannon entropy in nats) of a probability vector: the
+// "effective number of equally-likely choices". 1 = fully certain (collapsed),
+// V = uniform over V classes. The canonical language-model quality metric, and
+// the natural-scale companion to the normalized output_entropy above.
+fn perplexity(dist) {
+    let v = len(dist);
+    if v == 0 { return 1.0; }
+    let h = 0.0;
+    let i = 0;
+    while i < v {
+        if dist[i] > 0.0 { h = h - dist[i] * num_ln(dist[i]); }
+        i = i + 1;
+    }
+    return num_exp(h);
+}
+
+// output_perplexity — perplexity of the model's output prior (softmax(b2)).
+fn output_perplexity(model) {
+    return perplexity(output_prior(model));
+}
+
+// gini_coefficient — concentration/inequality of a distribution: G = Σᵢ Σⱼ|pᵢ-pⱼ|
+// / (2·n·Σp). 0 for a uniform distribution, approaching 1 as mass piles onto one
+// outcome. A non-entropic view of output collapse (no logs).
+fn gini_coefficient(dist) {
+    let n = len(dist);
+    if n == 0 { return 0; }
+    let total = 0.0;
+    let s = 0.0;
+    let i = 0;
+    while i < n {
+        s = s + dist[i];
+        let j = 0;
+        while j < n {
+            let d = dist[i] - dist[j];
+            if d < 0.0 { d = 0.0 - d; }
+            total = total + d;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    if s <= 0.0 { return 0; }
+    return total / (2 * n * s);
+}
+
+// output_gini — Gini concentration of the model's output prior.
+fn output_gini(model) {
+    return gini_coefficient(output_prior(model));
+}
+
+// kl_divergence — KL(p || q) in nats: the information lost approximating p by q.
+// 0 iff p==q, otherwise > 0 (Gibbs). Infinite where q=0 but p>0 (q can't cover p).
+fn kl_divergence(p, q) {
+    let n = len(p);
+    let kl = 0.0;
+    let i = 0;
+    while i < n {
+        if p[i] > 0.0 {
+            if q[i] <= 0.0 { return 1 / 0; }   // +inf: q gives zero mass where p does not
+            kl = kl + p[i] * num_ln(p[i] / q[i]);
+        }
+        i = i + 1;
+    }
+    return kl;
+}
+
+// cross_entropy — H(p, q) in nats = H(p) + KL(p||q): the per-token training loss
+// of predicting q when the truth is p.
+fn cross_entropy(p, q) {
+    let n = len(p);
+    let ce = 0.0;
+    let i = 0;
+    while i < n {
+        if p[i] > 0.0 {
+            if q[i] <= 0.0 { return 1 / 0; }
+            ce = ce - p[i] * num_ln(q[i]);
+        }
+        i = i + 1;
+    }
+    return ce;
+}
+
+// js_divergence — Jensen-Shannon divergence (nats): the symmetric, smoothed
+// cousin of KL. JS(p,q) = ½KL(p‖m) + ½KL(q‖m) with m = (p+q)/2. Always finite
+// (m covers both p and q), symmetric, and bounded in [0, ln2]; 0 iff p==q, ln2
+// for disjoint supports. sqrt(JS) is a true metric.
+fn js_divergence(p, q) {
+    let n = len(p);
+    let m = [];
+    let i = 0;
+    while i < n { push(m, 0.5 * (p[i] + q[i])); i = i + 1; }
+    return 0.5 * kl_divergence(p, m) + 0.5 * kl_divergence(q, m);
+}
+
+// hellinger_distance — H(p,q) = (1/√2)·√(Σ(√pᵢ-√qᵢ)²). A true metric (unlike
+// KL/JS-divergence): symmetric, satisfies the triangle inequality, and bounded
+// in [0,1] (0 iff p==q, 1 for disjoint supports). Numerically gentle — no logs,
+// so zeros are harmless.
+fn hellinger_distance(p, q) {
+    let n = len(p);
+    let s = 0.0;
+    let i = 0;
+    while i < n {
+        let d = num_sqrt(p[i]) - num_sqrt(q[i]);
+        s = s + d * d;
+        i = i + 1;
+    }
+    return num_sqrt(s) / 1.4142135623730951;
+}
+
+// total_variation_distance — TV(p,q) = ½·Σ|pᵢ-qᵢ|: the largest possible
+// difference in probability either distribution assigns to any event. Symmetric,
+// bounded [0,1], 0 iff p==q, 1 for disjoint supports. Drives consensus_score
+// (agreement = 1 - TV between two model output priors).
+fn total_variation_distance(p, q) {
+    let s = 0.0;
+    let k = 0;
+    while k < len(p) and k < len(q) {
+        let d = p[k] - q[k];
+        if d < 0.0 { d = 0.0 - d; }
+        s = s + d;
+        k = k + 1;
+    }
+    return s * 0.5;
+}
+
+// output_kl — KL of the model's output prior against a target distribution
+// (defaults to uniform). 0 = on-target; larger = more distributional drift.
+fn output_kl(model, target_dist = nil) {
+    let p = output_prior(model);
+    let q = target_dist;
+    if q == nil { q = default_target_dist(len(p)); }
+    return kl_divergence(p, q);
+}
+
+// model_health — one-call snapshot combining weight conditioning (ideality), the
+// output-distribution entropy, and the regularization recommendation.
+fn model_health(model, target_dist = nil) {
+    let st = ideality_status(model, target_dist);
+    let rec = recommend_regularization(model, target_dist, 0.02);
+    let ent = output_entropy(model);
+    let ppl = output_perplexity(model);
+    return map{
+        format: "pbai.ideal_bridge.health.v1",
+        ideality_total: st.total,
+        output_entropy: ent,
+        output_perplexity: ppl,
+        recommendation: rec.action,
+        suggested_lr: rec.suggested_lr,
+        summary: "ideality=" + str(st.total) + " entropy=" + str(ent)
+                 + " ppl=" + str(ppl) + " advice=" + rec.action
+    };
+}
+
+// target_from_corpus — build a target output distribution from observed token
+// counts (length V), Laplace-smoothed so no class is zero-probability. Pass the
+// result as `target_dist` to ideality_status / recommend / model_health to measure
+// the model against a REAL data distribution instead of the uniform default.
+fn target_from_corpus(counts, smoothing = 1.0) {
+    let v = len(counts);
+    if v == 0 { return []; }
+    let total = 0.0;
+    let i = 0;
+    while i < v { total = total + counts[i] + smoothing; i = i + 1; }
+    let out = [];
+    i = 0;
+    while i < v { push(out, (counts[i] + smoothing) / total); i = i + 1; }
+    return out;
+}
+
+// compare_models — A/B two models on the metrics that matter for selection:
+// conditioning (lower ideality_total = closer to the Ideal NN) and output
+// diversity (higher entropy = less collapsed). Returns each model's health plus
+// which one wins on each axis. For picking between checkpoints / variants.
+fn compare_models(a, b, target_dist = nil) {
+    let ha = model_health(a, target_dist);
+    let hb = model_health(b, target_dist);
+    let better_conditioned = "b";
+    if ha.ideality_total <= hb.ideality_total { better_conditioned = "a"; }
+    let more_diverse = "b";
+    if ha.output_entropy >= hb.output_entropy { more_diverse = "a"; }
+    return map{
+        format: "pbai.ideal_bridge.compare.v1",
+        a: ha,
+        b: hb,
+        better_conditioned: better_conditioned,
+        more_diverse: more_diverse
+    };
+}
+
+// rank_models — N-way selection across checkpoints/variants. Scores each model
+// by `output_entropy - ideality_total` (reward diversity, penalize conditioning
+// defect) and returns the ranking (best first) plus best_index. Generalizes
+// compare_models from A/B to picking the best of many. best_index is -1 if empty.
+fn rank_models(models, target_dist = nil) {
+    let n = len(models);
+    let entries = [];
+    let i = 0;
+    while i < n {
+        let h = model_health(models[i], target_dist);
+        push(entries, map{ index: i, score: h.output_entropy - h.ideality_total, health: h });
+        i = i + 1;
+    }
+    // insertion sort, descending by score (stable on ties -> lower index first)
+    let a = 1;
+    while a < len(entries) {
+        let cur = entries[a];
+        let b = a - 1;
+        while b >= 0 and entries[b].score < cur.score { entries[b + 1] = entries[b]; b = b - 1; }
+        entries[b + 1] = cur;
+        a = a + 1;
+    }
+    let best = 0 - 1;
+    if len(entries) > 0 { best = entries[0].index; }
+    return map{ format: "pbai.ideal_bridge.ranking.v1", ranking: entries, best_index: best };
+}
+
+// pick_best — the single best model plus a selection-confidence MARGIN (how far
+// its score beats the runner-up). margin>0 => `confident`. Convenience over
+// rank_models for "just give me the winner and tell me if it's a clear choice".
+fn pick_best(models, target_dist = nil) {
+    let rk = rank_models(models, target_dist);
+    if len(rk.ranking) == 0 {
+        return map{ format: "pbai.ideal_bridge.pick.v1", index: 0 - 1, model: nil,
+                    health: nil, score: 0.0, margin: 0.0, confident: false };
+    }
+    let best = rk.ranking[0];
+    let margin = 0.0;
+    if len(rk.ranking) > 1 { margin = best.score - rk.ranking[1].score; }
+    return map{
+        format: "pbai.ideal_bridge.pick.v1",
+        index: best.index,
+        model: models[best.index],
+        health: best.health,
+        score: best.score,
+        margin: margin,
+        confident: margin > 0.0
+    };
+}
+
+// ensemble_prior — soft, ideality-weighted blend of model output distributions.
+// Where pick_best is a hard argmax over the selection score, this is a softmax:
+// weight_i = softmax(score_i / temperature), then blend each model's output_prior
+// into a single distribution. Lower temperature -> concentrate on the winner;
+// higher -> flatten toward a uniform mix. Returns the weights, the blended prior,
+// and its normalized entropy. Empty input -> n=0, empty weights/prior.
+fn ensemble_prior(models, target_dist = nil, temperature = 1.0) {
+    let n = len(models);
+    if n == 0 {
+        return map{ format: "pbai.ideal_bridge.ensemble.v1", n: 0,
+                    weights: [], prior: [], entropy: 0.0 };
+    }
+    let temp = temperature;
+    if not (temp > 0.0) { temp = 1.0; }
+    // selection score per model: reward diversity, penalize conditioning defect
+    let scores = [];
+    let priors = [];
+    let i = 0;
+    while i < n {
+        let h = model_health(models[i], target_dist);
+        push(scores, (h.output_entropy - h.ideality_total) / temp);
+        push(priors, output_prior(models[i]));
+        i = i + 1;
+    }
+    let weights = _softmax(scores);
+    // blend the priors element-wise by weight (priors share length V)
+    let vlen = len(priors[0]);
+    let blended = [];
+    let c = 0;
+    while c < vlen { push(blended, 0.0); c = c + 1; }
+    i = 0;
+    while i < n {
+        let p = priors[i];
+        let w = weights[i];
+        let j = 0;
+        while j < len(p) and j < vlen { blended[j] = blended[j] + w * p[j]; j = j + 1; }
+        i = i + 1;
+    }
+    // normalized entropy of the blended distribution
+    let h = 0.0;
+    let k = 0;
+    while k < vlen { if blended[k] > 0.0 { h = h - blended[k] * num_ln(blended[k]); } k = k + 1; }
+    let ent = 0.0;
+    if vlen > 1 { ent = h / num_ln(vlen); }
+    return map{
+        format: "pbai.ideal_bridge.ensemble.v1",
+        n: n,
+        weights: weights,
+        prior: blended,
+        entropy: ent
+    };
+}
+
+// diagnose_model — one-call model debugging report. Combines the conditioning
+// status (ideality, per-layer spectral defect), output diversity (entropy), and
+// the regularization dry-run into actionable FLAGS, a VERDICT, and the index of
+// the worst-conditioned layer. Avoids magic absolute thresholds: "ill_conditioned"
+// reuses the sound recommend_regularization dry-run (does a Newton-Schulz nudge
+// reclaim defect?), "collapsed_output" / "off_target" use the normalized,
+// dimension-free entropy and KL metrics.
+fn diagnose_model(model, target_dist = nil) {
+    let st = ideality_status(model, target_dist);
+    let ent = output_entropy(model);
+    let rec = recommend_regularization(model, target_dist, 0.02);
+
+    let flags = [];
+    if rec.action == "regularize" { push(flags, "ill_conditioned"); }
+    if ent < 0.5 { push(flags, "collapsed_output"); }
+    if st.distributional > 0.05 { push(flags, "off_target"); }
+
+    // worst-conditioned layer = argmax per-layer spectral defect
+    let worst = 0;
+    let worst_val = 0.0 - 1.0;
+    let i = 0;
+    while i < len(st.per_layer_spectral) {
+        if st.per_layer_spectral[i] > worst_val { worst_val = st.per_layer_spectral[i]; worst = i; }
+        i = i + 1;
+    }
+    if len(st.per_layer_spectral) == 0 { worst = 0 - 1; }
+
+    let verdict = "healthy";
+    if len(flags) == 1 { verdict = "needs_attention"; }
+    if len(flags) >= 2 { verdict = "unhealthy"; }
+
+    return map{
+        format: "pbai.ideal_bridge.diagnose.v1",
+        verdict: verdict,
+        flags: flags,
+        ideality_total: st.total,
+        output_entropy: ent,
+        worst_layer: worst,
+        worst_layer_defect: worst_val,
+        action: rec.action,
+        suggested_lr: rec.suggested_lr,
+        summary: "verdict=" + verdict + " flags=" + str(len(flags))
+            + " ideality=" + str(st.total) + " entropy=" + str(ent) + " advice=" + rec.action
+    };
+}
+
+// fleet_report — decision support over a set of checkpoints/variants. Combines
+// rank_models (best-first ordering by score) with diagnose_model (per-model
+// verdict + flags) and a deployment recommendation. The capstone of the
+// selection family: compare_models (A/B) -> rank_models (N-way) -> pick_best
+// (winner + margin) -> ensemble_prior (soft blend) -> fleet_report (full board).
+fn fleet_report(models, target_dist = nil) {
+    let rk = rank_models(models, target_dist);
+    if len(rk.ranking) == 0 {
+        return map{ format: "pbai.ideal_bridge.fleet.v1", best_index: 0 - 1, confident: false,
+                    entries: [], healthy_count: 0, needs_attention_count: 0, unhealthy_count: 0,
+                    recommendation: "no models to evaluate" };
+    }
+    let pk = pick_best(models, target_dist);
+    let healthy = 0;
+    let attn = 0;
+    let unhealthy = 0;
+    let entries = [];
+    let r = 0;
+    while r < len(rk.ranking) {
+        let e = rk.ranking[r];
+        let dg = diagnose_model(models[e.index], target_dist);
+        if dg.verdict == "healthy" { healthy = healthy + 1; }
+        if dg.verdict == "needs_attention" { attn = attn + 1; }
+        if dg.verdict == "unhealthy" { unhealthy = unhealthy + 1; }
+        push(entries, map{
+            index: e.index, rank: r, score: e.score,
+            verdict: dg.verdict, flags: dg.flags,
+            ideality_total: dg.ideality_total, output_entropy: dg.output_entropy
+        });
+        r = r + 1;
+    }
+
+    // recommendation: trust the ranked winner only if it's healthy and a clear pick.
+    let best_diag = entries[0];
+    let rec = "deploy model " + str(pk.index);
+    if best_diag.verdict == "unhealthy" {
+        rec = "do not deploy: best model is unhealthy (" + str(len(best_diag.flags)) + " flags) — regularize or retrain first";
+    } else { if best_diag.verdict == "needs_attention" {
+        rec = "deploy model " + str(pk.index) + " with caution (" + str(len(best_diag.flags)) + " flag)";
+    } else { if not pk.confident {
+        rec = "deploy model " + str(pk.index) + ", but the margin over the runner-up is thin — consider an ensemble";
+    } } }
+
+    return map{
+        format: "pbai.ideal_bridge.fleet.v1",
+        best_index: pk.index,
+        confident: pk.confident,
+        margin: pk.margin,
+        entries: entries,
+        healthy_count: healthy,
+        needs_attention_count: attn,
+        unhealthy_count: unhealthy,
+        recommendation: rec
+    };
+}
+
+// consensus_score — how much do a set of models AGREE on their output? For each
+// pair, agreement = 1 - total-variation distance between their output priors
+// (TV = 0.5 * sum|p_i - q_i|, in [0,1]). Returns the mean pairwise agreement and
+// the most-divergent pair. High consensus -> the choice is robust, pick one; low
+// consensus -> the models disagree, an ensemble_prior hedge is safer.
+// (target_dist accepted for API symmetry with the rest of the family; agreement
+// is measured strictly between model outputs.)
+fn consensus_score(models, target_dist = nil) {
+    let n = len(models);
+    if n == 0 {
+        return map{ format: "pbai.ideal_bridge.consensus.v1", n: 0,
+                    mean_agreement: 1.0, most_divergent: nil };
+    }
+    if n == 1 {
+        return map{ format: "pbai.ideal_bridge.consensus.v1", n: 1,
+                    mean_agreement: 1.0, most_divergent: nil };
+    }
+    let priors = [];
+    let i = 0;
+    while i < n { push(priors, output_prior(models[i])); i = i + 1; }
+
+    let total = 0.0;
+    let pairs = 0;
+    let worst = nil;
+    let worst_agree = 2.0;
+    i = 0;
+    while i < n {
+        let j = i + 1;
+        while j < n {
+            let tv = total_variation_distance(priors[i], priors[j]);
+            let agree = 1.0 - tv;
+            total = total + agree;
+            pairs = pairs + 1;
+            if agree < worst_agree { worst_agree = agree; worst = map{ a: i, b: j, agreement: agree }; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    let mean = 1.0;
+    if pairs > 0 { mean = total / pairs; }
+    return map{
+        format: "pbai.ideal_bridge.consensus.v1",
+        n: n,
+        mean_agreement: mean,
+        most_divergent: worst
+    };
+}
+
+// recommend_strategy — the top-level deployment decision, fusing fleet_report
+// (which model wins + is it healthy) with consensus_score (do the models agree).
+// Returns one of: "none" (no models), "retrain" (best available is unhealthy),
+// "deploy_single" (a clear, sound winner — or the models agree so any is fine),
+// "ensemble" (a tight race where the models DISAGREE — hedge with ensemble_prior).
+fn recommend_strategy(models, target_dist = nil, consensus_threshold = 0.8) {
+    let n = len(models);
+    if n == 0 {
+        return map{ format: "pbai.ideal_bridge.strategy.v1", strategy: "none",
+                    best_index: 0 - 1, reason: "no models to evaluate" };
+    }
+    let fleet = fleet_report(models, target_dist);
+    if n == 1 {
+        return map{ format: "pbai.ideal_bridge.strategy.v1", strategy: "deploy_single",
+                    best_index: fleet.best_index, confident: true, consensus: 1.0,
+                    reason: "only one model", fleet_verdict: fleet.entries[0].verdict };
+    }
+    let cons = consensus_score(models, target_dist);
+    let best_verdict = fleet.entries[0].verdict;
+
+    let strategy = "deploy_single";
+    let reason = "clear, sound winner";
+    if best_verdict == "unhealthy" {
+        strategy = "retrain";
+        reason = "the best available model is unhealthy — regularize or retrain before deploying";
+    } else { if fleet.confident {
+        strategy = "deploy_single";
+        reason = "model " + str(fleet.best_index) + " is a confident winner";
+    } else { if cons.mean_agreement >= consensus_threshold {
+        strategy = "deploy_single";
+        reason = "tight race but the models agree (consensus " + str(cons.mean_agreement) + ") — any is fine, pick the best";
+    } else {
+        strategy = "ensemble";
+        reason = "tight race and the models disagree (consensus " + str(cons.mean_agreement) + ") — hedge with an ensemble";
+    } } }
+
+    return map{
+        format: "pbai.ideal_bridge.strategy.v1",
+        strategy: strategy,
+        best_index: fleet.best_index,
+        confident: fleet.confident,
+        consensus: cons.mean_agreement,
+        fleet_verdict: best_verdict,
+        reason: reason
+    };
+}
+
+// summarize — a compact, human-readable one-liner for any result produced by
+// this module (detected via its `format` tag). For logging/CLI/display ("pbai
+// outside of pblang"). Unknown shapes fall back to str().
+fn summarize(result) {
+    let fmt = try result.format catch nil;
+    if fmt == "pbai.ideal_bridge.strategy.v1" {
+        return "strategy: " + str(result.strategy) + " (best=" + str(result.best_index)
+            + ", consensus=" + str(result.consensus) + ") — " + str(result.reason);
+    }
+    if fmt == "pbai.ideal_bridge.fleet.v1" {
+        return "fleet: best=" + str(result.best_index) + " healthy=" + str(result.healthy_count)
+            + " attn=" + str(result.needs_attention_count) + " bad=" + str(result.unhealthy_count)
+            + " — " + str(result.recommendation);
+    }
+    if fmt == "pbai.ideal_bridge.diagnose.v1" {
+        return "diagnose: " + str(result.verdict) + " (" + str(len(result.flags))
+            + " flags) entropy=" + str(result.output_entropy) + " ideality=" + str(result.ideality_total);
+    }
+    if fmt == "pbai.ideal_bridge.consensus.v1" {
+        return "consensus: mean_agreement=" + str(result.mean_agreement) + " over " + str(result.n) + " models";
+    }
+    if fmt == "pbai.ideal_bridge.ranking.v1" {
+        return "ranking: best=" + str(result.best_index) + " over " + str(len(result.ranking)) + " models";
+    }
+    if fmt == "pbai.ideal_bridge.pick.v1" {
+        return "pick: model " + str(result.index) + " (confident=" + str(result.confident)
+            + ", margin=" + str(result.margin) + ")";
+    }
+    if fmt == "pbai.ideal_bridge.ensemble.v1" {
+        return "ensemble: " + str(result.n) + " models, entropy=" + str(result.entropy);
+    }
+    return str(result);
+}
+
+// _score — the selection score used across the family: reward output diversity,
+// penalize conditioning defect.
+fn _score(model, target_dist) {
+    let h = model_health(model, target_dist);
+    return h.output_entropy - h.ideality_total;
+}
+
+// checkpoint_gate — a training-loop regression guard. Accept a NEW checkpoint over
+// the PREVIOUS one only if the new model is not unhealthy AND its score is at
+// least as good (delta >= 0). Rejects regressions and unhealthy checkpoints even
+// when they score higher. Returns the decision + both scores + the delta.
+fn checkpoint_gate(prev_model, new_model, target_dist = nil) {
+    let prev_score = _score(prev_model, target_dist);
+    let new_score = _score(new_model, target_dist);
+    let delta = new_score - prev_score;
+    let new_diag = diagnose_model(new_model, target_dist);
+    let accept = true;
+    let reason = "new checkpoint improves the score and is healthy";
+    if new_diag.verdict == "unhealthy" {
+        accept = false;
+        reason = "new checkpoint is unhealthy (" + str(len(new_diag.flags)) + " flags) — rejected";
+    } else { if delta < 0.0 {
+        accept = false;
+        reason = "new checkpoint does not improve the score (delta " + str(delta) + ") — rejected";
+    } }
+    return map{
+        format: "pbai.ideal_bridge.gate.v1",
+        accept: accept,
+        prev_score: prev_score,
+        new_score: new_score,
+        delta: delta,
+        new_verdict: new_diag.verdict,
+        reason: reason
+    };
+}
+
+// select — the one-call capstone. Runs recommend_strategy and returns WHAT TO
+// USE: the chosen model (deploy_single), a blended ensemble prior (ensemble), or
+// nil + advice (retrain/none). Saves callers from re-deriving the artifact.
+fn select(models, target_dist = nil) {
+    let strat = recommend_strategy(models, target_dist);
+    let out = map{
+        format: "pbai.ideal_bridge.select.v1",
+        strategy: strat.strategy,
+        index: strat.best_index,
+        reason: strat.reason,
+        model: nil,
+        ensemble: nil
+    };
+    if strat.strategy == "deploy_single" {
+        out.model = models[strat.best_index];
+    } else { if strat.strategy == "ensemble" {
+        out.ensemble = ensemble_prior(models, target_dist);
+    } }
+    return out;
+}
+
+// pareto_front — the multi-objective view that the scalar score collapses. The
+// two axes are kept INDEPENDENT: spectral defect (pure weight conditioning,
+// lower is better) vs output_entropy (diversity, higher is better). Using the
+// pure spectral axis (not ideality_total, which folds in the output-distribution
+// term) avoids double-counting the diversity axis. A model is DOMINATED if
+// another is at least as good on both and strictly better on one. Returns the
+// non-dominated `front` (the real trade-off choices) and `dominated` indices.
+fn pareto_front(models, target_dist = nil) {
+    let n = len(models);
+    let ideal = [];
+    let ent = [];
+    let i = 0;
+    while i < n {
+        push(ideal, ideality_status(models[i], target_dist).spectral);
+        push(ent, output_entropy(models[i]));
+        i = i + 1;
+    }
+    let front = [];
+    let dominated = [];
+    i = 0;
+    while i < n {
+        let is_dom = false;
+        let j = 0;
+        while j < n {
+            if j != i {
+                // j dominates i?
+                let not_worse = ideal[j] <= ideal[i] and ent[j] >= ent[i];
+                let strictly = ideal[j] < ideal[i] or ent[j] > ent[i];
+                if not_worse and strictly { is_dom = true; }
+            }
+            j = j + 1;
+        }
+        if is_dom { push(dominated, i); } else { push(front, i); }
+        i = i + 1;
+    }
+    return map{ format: "pbai.ideal_bridge.pareto.v1", front: front, dominated: dominated, n: n };
+}
+
+// improvement — per-axis delta between two checkpoints (for training dashboards).
+// Positive spectral_delta = conditioning improved (spectral defect fell); positive
+// entropy_delta = diversity improved. Verdict: "improved" (both axes >= with one
+// strictly better), "regressed" (both <= with one strictly worse), else "mixed".
+fn improvement(prev_model, new_model, target_dist = nil) {
+    let ps = ideality_status(prev_model, target_dist).spectral;
+    let ns = ideality_status(new_model, target_dist).spectral;
+    let pe = output_entropy(prev_model);
+    let ne = output_entropy(new_model);
+    let spectral_delta = ps - ns;     // fell => positive => better
+    let entropy_delta = ne - pe;      // rose => positive => better
+    let score_delta = (ne - ns) - (pe - ps);
+
+    let verdict = "mixed";
+    if spectral_delta >= 0.0 and entropy_delta >= 0.0 and (spectral_delta > 0.0 or entropy_delta > 0.0) {
+        verdict = "improved";
+    } else { if spectral_delta <= 0.0 and entropy_delta <= 0.0 and (spectral_delta < 0.0 or entropy_delta < 0.0) {
+        verdict = "regressed";
+    } }
+    return map{
+        format: "pbai.ideal_bridge.improvement.v1",
+        spectral_delta: spectral_delta,
+        entropy_delta: entropy_delta,
+        score_delta: score_delta,
+        verdict: verdict
+    };
+}
+
+// report_text — a full human-readable dashboard for a fleet of models: the
+// recommended strategy, inter-model consensus, the Pareto front, and the ranked
+// table (with per-model verdict). Composes the whole selection family into one
+// string for logs/CLI ("pbai outside of pblang").
+fn report_text(models, target_dist = nil) {
+    let n = len(models);
+    if n == 0 { return "=== pbai model report (0 models) ==="; }
+    let strat = recommend_strategy(models, target_dist);
+    let cons = consensus_score(models, target_dist);
+    let pf = pareto_front(models, target_dist);
+    let fleet = fleet_report(models, target_dist);
+    let out = "=== pbai model report (" + str(n) + " models) ===\n";
+    out = out + summarize(strat) + "\n";
+    out = out + summarize(cons) + "\n";
+    out = out + "pareto front: " + str(pf.front) + "\n";
+    out = out + "ranking:\n";
+    let i = 0;
+    while i < len(fleet.entries) {
+        let e = fleet.entries[i];
+        out = out + "  #" + str(e.rank) + " model " + str(e.index)
+            + " score=" + str(e.score) + " verdict=" + str(e.verdict) + "\n";
+        i = i + 1;
+    }
+    return out;
+}
+
+// best_for_corpus — select the best model against a REAL data distribution built
+// from observed token counts (Laplace-smoothed), instead of the uniform default.
+// Answers "which checkpoint is best for THIS data?". Returns select()'s result
+// with the derived target attached for transparency.
+fn best_for_corpus(models, counts, smoothing = 1.0) {
+    let target = target_from_corpus(counts, smoothing);
+    let sel = select(models, target);
+    sel.target = target;
+    return sel;
+}
+
+// rank_for_targets — multi-domain selection: for each candidate target
+// distribution, which model is the best pick? Deploying across domains with
+// different token distributions, the winner can differ per domain. Returns the
+// best model index + score for each target.
+fn rank_for_targets(models, targets) {
+    let per = [];
+    let i = 0;
+    while i < len(targets) {
+        let pk = pick_best(models, targets[i]);
+        push(per, map{ target_index: i, best_index: pk.index, score: pk.score, confident: pk.confident });
+        i = i + 1;
+    }
+    return map{ format: "pbai.ideal_bridge.multitarget.v1", per_target: per, n_targets: len(targets) };
+}
+
+export output_prior, default_target_dist, model_to_ideal_view, target_from_corpus;
+export rank_models, pick_best, ensemble_prior, diagnose_model, fleet_report, consensus_score;
+// score — the public selection score (reward diversity, penalize conditioning
+// defect). Exposed so callers can rank/threshold with their own logic.
+fn score(model, target_dist = nil) { return _score(model, target_dist); }
+
+export recommend_strategy, summarize, checkpoint_gate, select, pareto_front, improvement;
+export report_text, best_for_corpus, rank_for_targets, score;
+export ideality_status, orthogonal_regularize, regularized_loss, train_with_orthogonal_reg;
+export train_with_adaptive_reg, training_summary, recommend_regularization, auto_regularize;
+export output_entropy, perplexity, output_perplexity, gini_coefficient, output_gini, model_health, compare_models;
+export kl_divergence, cross_entropy, js_divergence, hellinger_distance, total_variation_distance, output_kl;

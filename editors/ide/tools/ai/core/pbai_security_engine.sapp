@@ -1,0 +1,178 @@
+// pbai_security_engine.sapp -- bounded, fail-closed content-risk signals.
+//
+// This module is not an antivirus and does not claim that unmatched content is
+// clean.  It emits privacy-safe rule identifiers and digests; raw matches are
+// never returned. Adaptive state is process-level telemetry only and cannot
+// currently allow, deny, quarantine, or otherwise change a decision.
+
+let FORMAT = "pbai.security.scan.v1";
+let STATUS_FORMAT = "pbai.security.status.v1";
+let SECSCAN = import("stdlib:secscan.sapp");
+let MAX_TEXT_CHARS = 65536;
+let MAX_RULES = 48;
+let _SCAN_SEQUENCE = 0;
+let _RECENT_RISK = 0;
+let _RECENT_SUSPICIOUS = 0;
+
+fn _in(items, value) {
+    let i = 0;
+    while i < len(items) { if items[i] == value { return true; } i = i + 1; }
+    return false;
+}
+
+fn _push_unique(items, value) {
+    if len(items) < MAX_RULES and not _in(items, value) { push(items, value); }
+    return nil;
+}
+
+fn _contains_any(lower, needles, rules, prefix) {
+    let hits = 0;
+    let i = 0;
+    while i < len(needles) {
+        if str_contains(lower, needles[i]) {
+            hits = hits + 1;
+            _push_unique(rules, prefix + str(i + 1));
+        }
+        i = i + 1;
+    }
+    return hits;
+}
+
+fn _regex_signal(text, pattern, rule, rules) {
+    let matched = try regex_match(text, pattern) catch false;
+    if matched { _push_unique(rules, rule); return 1; }
+    return 0;
+}
+
+fn _entropy_token_signals(text, rules) {
+    // secscan applies named-token rules plus Shannon entropy/mixed-class gates.
+    // Its previews are deliberately discarded at this boundary.
+    let hits = 0;
+    let detected = try SECSCAN.detect_secrets(text) catch [];
+    let i = 0;
+    while i < len(detected) {
+        let kind = try str(detected[i].type) catch "unknown";
+        _push_unique(rules, "dlp-token-" + kind);
+        hits = hits + 1;
+        i = i + 1;
+    }
+    return hits;
+}
+
+fn _risk_disposition(score, hard_match) {
+    if hard_match { return "deny"; }
+    if score >= 8 { return "quarantine"; }
+    if score >= 3 { return "review"; }
+    return "allow-limited";
+}
+
+fn inspect_text(text, purpose = "tool-output") {
+    _SCAN_SEQUENCE = _SCAN_SEQUENCE + 1;
+    if type(text) != "string" or type(purpose) != "string"
+        or purpose == "" or len(purpose) > 64 {
+        return map{ format: FORMAT, ok: false, completed: false,
+            verdict: "unknown", disposition: "quarantine",
+            reasons: ["invalid-scan-input"], rule_ids: [],
+            raw_matches_returned: false, adaptive_can_relax: false };
+    }
+    if len(text) > MAX_TEXT_CHARS {
+        return map{ format: FORMAT, ok: false, completed: false,
+            verdict: "unknown", disposition: "quarantine",
+            reasons: ["scan-input-limit-exceeded"], rule_ids: [],
+            input_chars: len(text), max_input_chars: MAX_TEXT_CHARS,
+            input_digest: sha256(str_slice(text, 0, MAX_TEXT_CHARS)),
+            raw_matches_returned: false, adaptive_can_relax: false };
+    }
+
+    let lower = str_lower(text);
+    let rules = [];
+    let secret_hits = _contains_any(lower, [
+        "-----begin private key-----", "-----begin rsa private key-----",
+        "-----begin openssh private key-----", "authorization: bearer ",
+        "client_secret=", "private_key=", "recovery_code=",
+        "session_cookie=", "api_key=", "api-key:", "\"api_key\"",
+        "password=", "password:", "\"password\""
+    ], rules, "dlp-secret-signature-");
+
+    let pii_hits = 0;
+    pii_hits = pii_hits + _regex_signal(text,
+        ".*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}.*",
+        "dlp-email-address", rules);
+    pii_hits = pii_hits + _regex_signal(text,
+        ".*(^|[^0-9])[+]?[0-9]{2,4}[ ()-][0-9][0-9 ()-]{5,}[0-9]([^0-9]|$).*",
+        "dlp-phone-like", rules);
+    pii_hits = pii_hits + _regex_signal(lower,
+        ".*(recovery code|backup code|one[- ]time password|otp)[ :=].*",
+        "dlp-recovery-material", rules);
+
+    let entropy_hits = _entropy_token_signals(text, rules);
+    let malware_hits = 0;
+    malware_hits = malware_hits + _contains_any(lower, [
+        "powershell -encodedcommand", "powershell.exe -enc",
+        "frombase64string(", "certutil -decode", "mshta ",
+        "rundll32 ", "regsvr32 ", "invoke-expression",
+        "curl | sh", "curl | bash", "wget | sh", "wget | bash",
+        "eval(base64", "exec(base64", "document.write(unescape(",
+        "autoopen()", "document_open()", "createobject(\"wscript.shell\")"
+    ], rules, "malware-heuristic-");
+
+    let destructive_hits = _contains_any(lower, [
+        "rm -rf /", "mkfs.", "dd if=/dev/zero", ":(){ :|:& };:",
+        "cipher /w:", "format c:", "bcdedit /delete", "shadowcopy delete"
+    ], rules, "destructive-signature-");
+    let hard_match = secret_hits > 0 or destructive_hits > 0;
+    let score = secret_hits * 6 + destructive_hits * 8 + pii_hits * 3
+        + entropy_hits * 2 + malware_hits * 3;
+
+    // Keep bounded process-level telemetry for later per-principal design.
+    // It does not influence enforcement because unrelated callers currently
+    // share this module instance.
+    if _RECENT_RISK > 0 { _RECENT_RISK = _RECENT_RISK - 1; }
+    if score >= 3 {
+        _RECENT_SUSPICIOUS = _RECENT_SUSPICIOUS + 1;
+        if _RECENT_SUSPICIOUS > 16 { _RECENT_SUSPICIOUS = 16; }
+        _RECENT_RISK = _RECENT_RISK + num_floor(score / 3);
+        if _RECENT_RISK > 24 { _RECENT_RISK = 24; }
+    } elif _RECENT_SUSPICIOUS > 0 { _RECENT_SUSPICIOUS = _RECENT_SUSPICIOUS - 1; }
+
+    let disposition = _risk_disposition(score, hard_match);
+    let verdict = if len(rules) > 0 { "known-match" }
+        else { "no-known-match-under-policy" };
+    return map{
+        format: FORMAT, ok: true, completed: true,
+        scan_id: "scan-" + str(_SCAN_SEQUENCE), purpose_digest: sha256(purpose),
+        verdict: verdict, disposition: disposition,
+        permitted: disposition == "allow-limited",
+        rule_ids: rules, rule_count: len(rules),
+        secret_signature_hits: secret_hits, pii_signal_hits: pii_hits,
+        entropy_signal_hits: entropy_hits, malware_heuristic_hits: malware_hits,
+        destructive_signature_hits: destructive_hits,
+        risk_score: score, adaptive_risk_score: _RECENT_RISK,
+        adaptive_recent_suspicious: _RECENT_SUSPICIOUS,
+        input_chars: len(text), input_digest: sha256(text),
+        raw_matches_returned: false, raw_input_returned: false,
+        adaptive_can_relax: false, adaptive_enforcement: false,
+        adaptive_scope: "process-telemetry-only", hard_rules_mutable: false,
+        full_dlp: false, antivirus_verdict: false,
+        malware_free_claimed: false
+    };
+}
+
+fn status() {
+    return map{
+        format: STATUS_FORMAT, ok: true, max_text_chars: MAX_TEXT_CHARS,
+        signature_scan: true, pii_signal_scan: true,
+        high_entropy_signal_scan: true, shannon_entropy_classifier: true,
+        token_previews_returned: false, malware_heuristic_scan: true,
+        destructive_signature_scan: true, bounded_adaptive_risk: true,
+        adaptive_restrict_only: false, adaptive_telemetry_only: true,
+        adaptive_enforcement: false,
+        adaptive_scope: "process-telemetry-only", raw_matches_returned: false,
+        external_antivirus: false, full_dlp: false,
+        archive_scanning: false, memory_scanning: false,
+        malware_free_guarantee: false, signed_rule_updates: false,
+        scans: _SCAN_SEQUENCE, recent_risk_score: _RECENT_RISK
+    };
+}
+
+export FORMAT, STATUS_FORMAT, inspect_text, status;

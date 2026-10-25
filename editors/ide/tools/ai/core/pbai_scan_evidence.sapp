@@ -1,0 +1,713 @@
+// Pure, privacy-safe orchestration for external malware-scan evidence.
+//
+// This module never opens a file, scans memory, probes a network, launches a
+// process, or trusts a scanner claim. It binds bounded opaque scope manifests
+// to bounded receipts so a separate verifier can distinguish complete claims,
+// partial coverage, scanner errors, and known matches without retaining paths,
+// device identifiers, filenames, raw logs, or match strings.
+
+let VALIDATE = import("stdlib:validate.sapp");
+
+let FORMAT = "pbai.scan-evidence.plan.v1";
+let RECEIPT_FORMAT = "pbai.scan-evidence.receipt.v1";
+let RESULT_FORMAT = "pbai.scan-evidence.validation.v1";
+let POLICY_VERSION = "pbai-scan-evidence-2026-08-30-v1";
+let MAX_TARGETS = 16;
+let MAX_SHARDS = 64;
+let MAX_CHECKS = 1;
+let MAX_COUNTER = 9007199254740991;
+let MAX_OUTPUT_BYTES = 1048576;
+
+let BOUNDS = map{
+    max_depth: 5, max_nodes: 4096, max_map_entries: 48, max_array_items: 64,
+    max_string_chars: 256, max_string_bytes: 256,
+    max_total_string_bytes: 131072, max_key_chars: 64, max_key_bytes: 64
+};
+
+let TARGET_KEYS = ["target_token", "target_kind", "scope_manifest_sha256",
+    "selection_manifest_sha256s", "requested_checks"];
+let POLICY_KEYS = ["scanner_policy_sha256", "max_files", "max_bytes",
+    "max_file_bytes", "max_depth", "max_time_ms", "max_output_bytes",
+    "max_signature_age_seconds", "raw_memory_allowed", "active_network_allowed",
+    "content_retention_allowed"];
+let PLAN_KEYS = ["format", "policy_version", "plan_id", "targets", "policy",
+    "target_count", "shard_count", "authorizes_scan", "authorizes_execution",
+    "authorizes_network", "authorizes_memory_read", "authorizes_persistence"];
+let RECEIPT_KEYS = ["format", "plan_id", "target_token", "check_kind", "shard_index",
+    "scope_manifest_sha256", "selection_manifest_sha256",
+    "scanner_policy_sha256", "engine_name", "engine_version",
+    "signature_db_sha256", "signature_db_epoch", "exit_code", "exit_class",
+    "selected_files", "selected_bytes", "scanned_files", "scanned_bytes",
+    "skipped_files", "error_count", "match_count", "observed_max_file_bytes",
+    "observed_max_depth", "elapsed_ms", "output_bytes",
+    "max_file_limit_enforced", "max_depth_limit_enforced",
+    "time_limit_enforced", "output_limit_enforced", "started", "terminal",
+    "timed_out", "cancelled", "unavailable", "archive_complete", "cleanup_claim"];
+
+fn _base(reason) {
+    return map{
+        format: RESULT_FORMAT, policy_version: POLICY_VERSION,
+        ok: false, state: "invalid", disposition: "quarantine",
+        reason: reason, reasons: [reason], plan_id: "", target_token: "",
+        check_kind: "", shard_index: -1, receipt_claim_sha256: "",
+        known_match: false, complete_claimed: false,
+        signature_fresh_claimed: false, receipt_authenticated: false,
+        scanner_attestation_verified: false, coverage_verified: false,
+        cleanup_verified: false, malware_free_claimed: false,
+        raw_log_returned: false, path_returned: false, identifier_returned: false,
+        content_returned: false, authorizes_action: false, authorizes_scan: false,
+        authorizes_execution: false, authorizes_network: false,
+        authorizes_memory_read: false, authorizes_ingest: false,
+        authorizes_training: false, authorizes_build: false,
+        authorizes_git: false, authorizes_publication: false
+    };
+}
+
+// Keep this small formatter near the start of the module. The current bootstrap
+// compiler has a regression for parameter slots in some late, high-index
+// closures; the semantic test protects this executable placement until the
+// compiler itself is regenerated with the fix.
+fn _format_validation(x) {
+    return map{
+        format: RESULT_FORMAT, policy_version: POLICY_VERSION,
+        ok: x["ok"], state: x["state"], disposition: x["disposition"],
+        reason: x["reason"], reasons: x["reasons"], plan_id: x["plan_id"],
+        target_token: x["target_token"], check_kind: x["check_kind"],
+        shard_index: x["shard_index"], receipt_claim_sha256: x["claim_digest"],
+        known_match: x["known_match"], complete_claimed: x["complete"],
+        signature_fresh_claimed: x["fresh"], receipt_authenticated: false,
+        scanner_attestation_verified: false, coverage_verified: false,
+        cleanup_verified: false, malware_free_claimed: false,
+        raw_log_returned: false, path_returned: false, identifier_returned: false,
+        content_returned: false, authorizes_action: false, authorizes_scan: false,
+        authorizes_execution: false, authorizes_network: false,
+        authorizes_memory_read: false, authorizes_ingest: false,
+        authorizes_training: false, authorizes_build: false,
+        authorizes_git: false, authorizes_publication: false
+    };
+}
+
+fn _format_aggregate(x) {
+    return map{
+        format: "pbai.scan-evidence.aggregate.v1", policy_version: POLICY_VERSION,
+        ok: x["ok"], state: x["state"], disposition: x["disposition"],
+        reason: x["reason"], reasons: [x["reason"]], plan_id: x["plan_id"],
+        target_token: "", check_kind: "", shard_index: -1,
+        receipt_claim_sha256: "", known_match: x["known_matches"] > 0,
+        complete_claimed: false, signature_fresh_claimed: false,
+        receipt_authenticated: false, scanner_attestation_verified: false,
+        coverage_verified: false, cleanup_verified: false,
+        malware_free_claimed: false, raw_log_returned: false,
+        path_returned: false, identifier_returned: false, content_returned: false,
+        authorizes_action: false, authorizes_scan: false,
+        authorizes_execution: false, authorizes_network: false,
+        authorizes_memory_read: false, authorizes_ingest: false,
+        authorizes_training: false, authorizes_build: false,
+        authorizes_git: false, authorizes_publication: false,
+        receipt_count: x["receipt_count"], expected_claims: x["expected_claims"],
+        complete_fresh_claims: x["complete_claims"],
+        known_match_receipts: x["known_matches"], results: x["results"]
+    };
+}
+
+fn _aggregate_failure(reason) {
+    return _format_aggregate(map{ ok:false, state:"invalid", disposition:"quarantine",
+        reason:reason, plan_id:"", known_matches:0, receipt_count:0,
+        expected_claims:0, complete_claims:0, results:[] });
+}
+
+fn _aggregate_state(all_valid, complete_claims, expected_claims) {
+    if all_valid and complete_claims == expected_claims {
+        return "complete-claims-unattested";
+    }
+    return "partial";
+}
+
+fn _aggregate_reason(known_matches, state) {
+    if known_matches > 0 { return "known-match"; }
+    if state == "complete-claims-unattested" {
+        return "awaiting-independent-attestation";
+    }
+    return "missing-invalid-partial-or-stale-shards";
+}
+
+fn _bounded_aggregate(candidate, output_limit) {
+    let candidate_bytes = len(str_to_bytes(json_stringify(candidate)));
+    if candidate_bytes > output_limit or candidate_bytes > MAX_OUTPUT_BYTES {
+        return _aggregate_failure("aggregate-output-limit-exceeded");
+    }
+    return candidate;
+}
+
+fn _exact(value, keys) {
+    return VALIDATE.exact_map_bounded(value, keys, BOUNDS).ok;
+}
+
+fn _hex(value) {
+    if type(value) != "string" or len(value) != 64 { return false; }
+    let i = 0;
+    while i < 64 {
+        let c = strcharcodeat(value, i);
+        if not ((c >= 48 and c <= 57) or (c >= 97 and c <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+
+fn _one_of(value, allowed) {
+    let i = 0;
+    while i < len(allowed) {
+        if value == allowed[i] { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _safe_text(value, maximum) {
+    if type(value) != "string" or value == "" or len(value) > maximum
+        or len(str_to_bytes(value)) > maximum or str_trim(value) != value {
+        return false;
+    }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        if c < 32 or (c >= 127 and c <= 159) or c == 1564
+            or (c >= 8203 and c <= 8207) or (c >= 8234 and c <= 8238)
+            or c == 8288 or (c >= 8294 and c <= 8297) or c == 65279 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _frame(value) {
+    let text = str(value);
+    return str(len(str_to_bytes(text))) + ":" + text;
+}
+
+fn _typed_frame(value) {
+    return _frame(type(value)) + _frame(value);
+}
+
+fn _target_shape(target) {
+    if not _exact(target, TARGET_KEYS) or not _hex(target.target_token)
+        or not _hex(target.scope_manifest_sha256)
+        or not _one_of(target.target_kind,
+            ["host-storage", "external-storage", "android-package-set",
+             "android-shared-storage"])
+        or type(target.selection_manifest_sha256s) != "array"
+        or len(target.selection_manifest_sha256s) < 1
+        or len(target.selection_manifest_sha256s) > MAX_SHARDS
+        or type(target.requested_checks) != "array"
+        or len(target.requested_checks) != 1
+        or target.requested_checks[0] != "antivirus-static" {
+        return false;
+    }
+    let seen = [];
+    let i = 0;
+    while i < len(target.selection_manifest_sha256s) {
+        let digest = target.selection_manifest_sha256s[i];
+        if not _hex(digest) { return false; }
+        let j = 0;
+        while j < len(seen) { if seen[j] == digest { return false; } j = j + 1; }
+        push(seen, digest);
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _policy_shape(policy) {
+    return _exact(policy, POLICY_KEYS) and _hex(policy.scanner_policy_sha256)
+        and _integer(policy.max_files, 1, 10000000)
+        and _integer(policy.max_bytes, 1, MAX_COUNTER)
+        and _integer(policy.max_file_bytes, 1, policy.max_bytes)
+        and _integer(policy.max_depth, 0, 64)
+        and _integer(policy.max_time_ms, 100, 86400000)
+        and _integer(policy.max_output_bytes, 1024, MAX_OUTPUT_BYTES)
+        and _integer(policy.max_signature_age_seconds, 0, 2592000)
+        and type(policy.raw_memory_allowed) == "bool"
+        and type(policy.active_network_allowed) == "bool"
+        and type(policy.content_retention_allowed) == "bool"
+        and not policy.raw_memory_allowed and not policy.active_network_allowed
+        and not policy.content_retention_allowed;
+}
+
+fn _canonical_target(target) {
+    let fields = [target.target_token, target.target_kind,
+        target.scope_manifest_sha256, str(len(target.selection_manifest_sha256s))];
+    let i = 0;
+    while i < len(target.selection_manifest_sha256s) {
+        push(fields, target.selection_manifest_sha256s[i]); i = i + 1;
+    }
+    push(fields, str(len(target.requested_checks)));
+    i = 0;
+    while i < len(target.requested_checks) {
+        push(fields, target.requested_checks[i]); i = i + 1;
+    }
+    let framed = [];
+    i = 0;
+    while i < len(fields) { push(framed, _frame(fields[i])); i = i + 1; }
+    return str_join(framed, "");
+}
+
+fn _canonical_policy(policy) {
+    let fields = [policy.scanner_policy_sha256, str(policy.max_files),
+        str(policy.max_bytes), str(policy.max_file_bytes), str(policy.max_depth),
+        str(policy.max_time_ms), str(policy.max_output_bytes),
+        str(policy.max_signature_age_seconds), str(policy.raw_memory_allowed),
+        str(policy.active_network_allowed), str(policy.content_retention_allowed)];
+    let framed = [];
+    let i = 0;
+    while i < len(fields) { push(framed, _frame(fields[i])); i = i + 1; }
+    return str_join(framed, "");
+}
+
+fn _plan_id(targets, policy) {
+    let canonical = _frame(POLICY_VERSION) + _frame(_canonical_policy(policy));
+    let i = 0;
+    while i < len(targets) { canonical = canonical + _frame(_canonical_target(targets[i])); i = i + 1; }
+    return sha256("pbai-scan-plan-v1\x00" + canonical);
+}
+
+fn _plan_shape(value) {
+    if not _exact(value, PLAN_KEYS) or value.format != FORMAT
+        or value.policy_version != POLICY_VERSION or not _hex(value.plan_id)
+        or type(value.targets) != "array" or len(value.targets) < 1
+        or len(value.targets) > MAX_TARGETS or not _policy_shape(value.policy)
+        or not _integer(value.target_count, 1, MAX_TARGETS)
+        or not _integer(value.shard_count, 1, MAX_SHARDS)
+        or value.target_count != len(value.targets)
+        or type(value.authorizes_scan) != "bool"
+        or type(value.authorizes_execution) != "bool"
+        or type(value.authorizes_network) != "bool"
+        or type(value.authorizes_memory_read) != "bool"
+        or type(value.authorizes_persistence) != "bool"
+        or value.authorizes_scan or value.authorizes_execution
+        or value.authorizes_network or value.authorizes_memory_read
+        or value.authorizes_persistence { return false; }
+    let shards = 0;
+    let i = 0;
+    while i < len(value.targets) {
+        if not _target_shape(value.targets[i]) { return false; }
+        let j = 0;
+        while j < i {
+            if value.targets[j].target_token == value.targets[i].target_token { return false; }
+            j = j + 1;
+        }
+        shards = shards + len(value.targets[i].selection_manifest_sha256s);
+        if shards > MAX_SHARDS { return false; }
+        i = i + 1;
+    }
+    return shards == value.shard_count and value.plan_id == _plan_id(value.targets, value.policy);
+}
+
+fn plan(targets, policy) {
+    let out = map{ format: FORMAT, policy_version: POLICY_VERSION, plan_id: "",
+        targets: [], policy: map{}, target_count: 0, shard_count: 0,
+        authorizes_scan: false, authorizes_execution: false,
+        authorizes_network: false, authorizes_memory_read: false,
+        authorizes_persistence: false };
+    if type(targets) != "array" or len(targets) < 1 or len(targets) > MAX_TARGETS
+        or not _policy_shape(policy) { return out; }
+    let shards = 0;
+    let i = 0;
+    while i < len(targets) {
+        if not _target_shape(targets[i]) { return out; }
+        let j = 0;
+        while j < i {
+            if targets[j].target_token == targets[i].target_token { return out; }
+            j = j + 1;
+        }
+        shards = shards + len(targets[i].selection_manifest_sha256s);
+        if shards > MAX_SHARDS { return out; }
+        i = i + 1;
+    }
+    // Build fresh maps through JSON so caller-owned nested arrays cannot be mutated
+    // through the returned plan in runtimes with reference-valued collections.
+    let copied = try json_parse(json_stringify(targets)) catch nil;
+    let copied_policy = try json_parse(json_stringify(policy)) catch nil;
+    if copied == nil or copied_policy == nil { return out; }
+    out.targets = copied; out.policy = copied_policy;
+    out.target_count = len(copied); out.shard_count = shards;
+    out.plan_id = _plan_id(copied, copied_policy);
+    return out;
+}
+
+fn _find_target(scan_plan, token) {
+    let i = 0;
+    while i < len(scan_plan.targets) {
+        if scan_plan.targets[i].target_token == token { return scan_plan.targets[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _receipt_shape(value) {
+    if not _exact(value, RECEIPT_KEYS) { return false; }
+    if value.format != RECEIPT_FORMAT or not _hex(value.plan_id)
+        or not _hex(value.target_token)
+        or value.check_kind != "antivirus-static"
+        or not _integer(value.shard_index, 0, MAX_SHARDS - 1) { return false; }
+    if not _hex(value.scope_manifest_sha256)
+        or not _hex(value.selection_manifest_sha256)
+        or not _hex(value.scanner_policy_sha256)
+        or value.engine_name != "clamav"
+        or not _safe_text(value.engine_version, 64)
+        or not _hex(value.signature_db_sha256) { return false; }
+    if not _integer(value.signature_db_epoch, 0, MAX_COUNTER)
+        or not _integer(value.exit_code, -1, 255)
+        or not _one_of(value.exit_class, ["not-run", "no-match", "match", "error"])
+        or not _integer(value.selected_files, 0, MAX_COUNTER)
+        or not _integer(value.selected_bytes, 0, MAX_COUNTER)
+        or not _integer(value.scanned_files, 0, MAX_COUNTER)
+        or not _integer(value.scanned_bytes, 0, MAX_COUNTER)
+        or not _integer(value.skipped_files, 0, MAX_COUNTER)
+        or not _integer(value.error_count, 0, MAX_COUNTER)
+        or not _integer(value.match_count, 0, MAX_COUNTER)
+        or not _integer(value.observed_max_file_bytes, 0, MAX_COUNTER)
+        or not _integer(value.observed_max_depth, 0, 64)
+        or not _integer(value.elapsed_ms, 0, MAX_COUNTER)
+        or not _integer(value.output_bytes, 0, MAX_COUNTER) { return false; }
+    return type(value.started) == "bool" and type(value.terminal) == "bool"
+        and type(value.timed_out) == "bool" and type(value.cancelled) == "bool"
+        and type(value.unavailable) == "bool" and type(value.archive_complete) == "bool"
+        and type(value.max_file_limit_enforced) == "bool"
+        and type(value.max_depth_limit_enforced) == "bool"
+        and type(value.time_limit_enforced) == "bool"
+        and type(value.output_limit_enforced) == "bool"
+        and _one_of(value.cleanup_claim, ["not-retained", "deleted", "pending", "failed"]);
+}
+
+fn _canonical_receipt(evidence) {
+    let fields = [];
+    let i = 0;
+    while i < len(RECEIPT_KEYS) {
+        push(fields, _frame(RECEIPT_KEYS[i]) + _typed_frame(evidence[RECEIPT_KEYS[i]]));
+        i = i + 1;
+    }
+    return str_join(fields, "");
+}
+
+fn _receipt_claim_digest(evidence) {
+    return sha256("pbai-scan-receipt-claim-v1\x00" + _canonical_receipt(evidence));
+}
+
+fn receipt_claim_sha256(evidence) {
+    if not _exact(evidence, RECEIPT_KEYS) { return ""; }
+    return _receipt_claim_digest(evidence);
+}
+
+fn _binding_reasons(scan_plan, evidence) {
+    let reasons = [];
+    let target = _find_target(scan_plan, evidence.target_token);
+    if target == nil { push(reasons, "unknown-target"); }
+    if evidence.plan_id != scan_plan.plan_id { push(reasons, "plan-mismatch"); }
+    if evidence.scanner_policy_sha256 != scan_plan.policy.scanner_policy_sha256 {
+        push(reasons, "scanner-policy-mismatch");
+    }
+    if target != nil {
+        if evidence.check_kind != target.requested_checks[0] {
+            push(reasons, "requested-check-mismatch");
+        }
+        if evidence.scope_manifest_sha256 != target.scope_manifest_sha256 {
+            push(reasons, "scope-manifest-mismatch");
+        }
+        if evidence.shard_index >= len(target.selection_manifest_sha256s)
+            or evidence.selection_manifest_sha256
+                != target.selection_manifest_sha256s[evidence.shard_index] {
+            push(reasons, "selection-manifest-mismatch");
+        }
+    }
+    return reasons;
+}
+
+fn _counter_reasons(scan_plan, evidence) {
+    let reasons = [];
+    if evidence.selected_files > scan_plan.policy.max_files
+        or evidence.selected_bytes > scan_plan.policy.max_bytes
+        or evidence.scanned_files > evidence.selected_files
+        or evidence.scanned_bytes > evidence.selected_bytes
+        or evidence.scanned_files + evidence.skipped_files > evidence.selected_files
+        or evidence.match_count > evidence.scanned_files
+        or evidence.error_count > evidence.selected_files {
+        push(reasons, "counter-contradiction");
+    }
+    if (evidence.selected_files == 0 and evidence.selected_bytes != 0)
+        or (evidence.scanned_files == 0 and evidence.scanned_bytes != 0)
+        or (evidence.selected_bytes == 0 and evidence.observed_max_file_bytes != 0) {
+        push(reasons, "file-byte-counter-contradiction");
+    }
+    if evidence.observed_max_file_bytes > scan_plan.policy.max_file_bytes
+        or evidence.observed_max_file_bytes > evidence.selected_bytes {
+        push(reasons, "max-file-limit-exceeded");
+    }
+    if evidence.observed_max_depth > scan_plan.policy.max_depth {
+        push(reasons, "depth-limit-exceeded");
+    }
+    if evidence.elapsed_ms > scan_plan.policy.max_time_ms {
+        push(reasons, "time-limit-exceeded");
+    }
+    if evidence.output_bytes > scan_plan.policy.max_output_bytes {
+        push(reasons, "output-limit-exceeded");
+    }
+    if evidence.started and evidence.terminal and evidence.selected_files == 0 {
+        push(reasons, "empty-scope-unattested");
+    }
+    return reasons;
+}
+
+fn _lifecycle_reasons(evidence) {
+    let reasons = [];
+    if evidence.terminal and not evidence.started { push(reasons, "terminal-without-start"); }
+    if (evidence.timed_out or evidence.cancelled) and not evidence.started {
+        push(reasons, "interruption-without-start");
+    }
+    if (evidence.timed_out or evidence.cancelled) and not evidence.terminal {
+        push(reasons, "interruption-without-terminal");
+    }
+    if evidence.unavailable and (evidence.started or evidence.scanned_files > 0) {
+        push(reasons, "unavailable-scan-contradiction");
+    }
+    if not evidence.started {
+        let claimed_work = evidence.scanned_files != 0 or evidence.scanned_bytes != 0
+            or evidence.skipped_files != 0 or evidence.error_count != 0
+            or evidence.match_count != 0 or evidence.observed_max_file_bytes != 0
+            or evidence.observed_max_depth != 0 or evidence.elapsed_ms != 0
+            or evidence.output_bytes != 0 or evidence.archive_complete
+            or evidence.max_file_limit_enforced or evidence.max_depth_limit_enforced
+            or evidence.time_limit_enforced or evidence.output_limit_enforced
+            or evidence.cleanup_claim != "not-retained";
+        if claimed_work { push(reasons, "work-claimed-before-start"); }
+    }
+    return reasons;
+}
+
+fn _exit_reasons(evidence) {
+    let reasons = [];
+    let exit_class = evidence.exit_class;
+    let match_count = evidence.match_count;
+    let error_count = evidence.error_count;
+    let exit_code = evidence.exit_code;
+    let expected_class = "not-run";
+    if exit_code >= 0 {
+        expected_class = "error";
+        if exit_code == 0 { expected_class = "no-match"; }
+        elif exit_code == 1 { expected_class = "match"; }
+    }
+    if exit_class != expected_class { push(reasons, "exit-class-mismatch"); }
+    if not evidence.terminal and exit_class != "not-run" {
+        push(reasons, "exit-observed-before-terminal");
+    }
+    if evidence.terminal and not evidence.timed_out and not evidence.cancelled
+        and exit_class == "not-run" {
+        push(reasons, "terminal-without-observed-exit");
+    }
+    if exit_class == "match" {
+        if match_count < 1 { push(reasons, "match-counter-contradiction"); }
+    } elif match_count > 0 {
+        push(reasons, "match-counter-contradiction");
+    }
+    if exit_class == "error" and error_count < 1 {
+        push(reasons, "error-counter-contradiction");
+    }
+    return reasons;
+}
+
+fn _append_reasons(target, source) {
+    let i = 0;
+    while i < len(source) { push(target, source[i]); i = i + 1; }
+    return target;
+}
+
+fn _semantic_reasons(scan_plan, evidence) {
+    let reasons = _counter_reasons(scan_plan, evidence);
+    reasons = _append_reasons(reasons, _lifecycle_reasons(evidence));
+    reasons = _append_reasons(reasons, _exit_reasons(evidence));
+    return reasons;
+}
+
+fn _fresh(scan_plan, evidence, evaluation_epoch) {
+    return evidence.signature_db_epoch <= evaluation_epoch
+        and evaluation_epoch - evidence.signature_db_epoch
+            <= scan_plan.policy.max_signature_age_seconds;
+}
+
+fn _complete(evidence) {
+    return evidence.started and evidence.terminal and not evidence.timed_out
+        and not evidence.cancelled and not evidence.unavailable
+        and evidence.exit_class != "error" and evidence.error_count == 0
+        and evidence.skipped_files == 0
+        and evidence.scanned_files == evidence.selected_files
+        and evidence.scanned_bytes == evidence.selected_bytes
+        and evidence.selected_files > 0 and evidence.archive_complete
+        and evidence.max_file_limit_enforced and evidence.max_depth_limit_enforced
+        and evidence.time_limit_enforced and evidence.output_limit_enforced;
+}
+
+fn _state(evidence, complete, reasons) {
+    if len(reasons) > 0 { return "invalid"; }
+    if evidence.unavailable { return "unavailable"; }
+    if not evidence.started { return "requested"; }
+    if not evidence.terminal { return "started"; }
+    if complete { return "complete-claim"; }
+    return "partial";
+}
+
+fn _reason(reasons, known_match, complete, fresh) {
+    if len(reasons) > 0 { return reasons[0]; }
+    if known_match { return "known-match"; }
+    if complete and fresh { return "unattested-complete-claim"; }
+    return "partial-or-stale-claim";
+}
+
+fn _validate_request(request) {
+    let scan_plan = request["scan_plan"];
+    let evidence = request["evidence"];
+    let evaluation_epoch = request["evaluation_epoch"];
+    if not _plan_shape(scan_plan) or not _receipt_shape(evidence)
+        or not _integer(evaluation_epoch, 0, MAX_COUNTER) {
+        return _base("invalid-bounded-input");
+    }
+    let reasons = _binding_reasons(scan_plan, evidence);
+    let semantic = _semantic_reasons(scan_plan, evidence);
+    let i = 0;
+    while i < len(semantic) { push(reasons, semantic[i]); i = i + 1; }
+    let fresh = _fresh(scan_plan, evidence, evaluation_epoch);
+    let complete = _complete(evidence);
+    let known_match = evidence.match_count > 0;
+    return _format_validation(map{
+        plan_id: scan_plan.plan_id, target_token: evidence.target_token,
+        check_kind: evidence.check_kind, shard_index: evidence.shard_index,
+        claim_digest: _receipt_claim_digest(evidence), fresh: fresh, complete: complete,
+        known_match: known_match, reasons: reasons, ok: len(reasons) == 0,
+        state: _state(evidence, complete, reasons),
+        disposition: if known_match { "deny" } else { "quarantine" },
+        reason: _reason(reasons, known_match, complete, fresh)
+    });
+}
+
+fn validate_receipt(scan_plan, evidence, evaluation_epoch) {
+    return _validate_request(map{ scan_plan: scan_plan, evidence: evidence,
+        evaluation_epoch: evaluation_epoch });
+}
+
+fn _identity(token, check_kind, shard_index) {
+    return token + ":" + check_kind + ":" + str(shard_index);
+}
+
+fn _canonical_result(scan_plan, raw_results, raw_identities, identity,
+        target_token, shard_index) {
+    let count = 0;
+    let found = nil;
+    let i = 0;
+    while i < len(raw_identities) {
+        if raw_identities[i] == identity { count = count + 1; found = raw_results[i]; }
+        i = i + 1;
+    }
+    if count == 1 { return found; }
+    let result = _base(if count == 0 { "missing-check-shard" } else { "duplicate-check-shard" });
+    result.plan_id = scan_plan.plan_id; result.target_token = target_token;
+    result.check_kind = "antivirus-static"; result.shard_index = shard_index;
+    return result;
+}
+
+fn _canonical_results(scan_plan, raw_results, raw_identities) {
+    let results = [];
+    let i = 0;
+    while i < len(scan_plan.targets) {
+        let target = scan_plan.targets[i];
+        let shard_index = 0;
+        while shard_index < len(target.selection_manifest_sha256s) {
+            let identity = _identity(target.target_token, "antivirus-static", shard_index);
+            push(results, _canonical_result(scan_plan, raw_results, raw_identities,
+                identity, target.target_token, shard_index));
+            shard_index = shard_index + 1;
+        }
+        i = i + 1;
+    }
+    return results;
+}
+
+fn aggregate(scan_plan, receipts, evaluation_epoch) {
+    if not _plan_shape(scan_plan) or type(receipts) != "array"
+        or len(receipts) > MAX_SHARDS
+        or not _integer(evaluation_epoch, 0, MAX_COUNTER) {
+        return _aggregate_failure("invalid-aggregate-input");
+    }
+    let raw_results = [];
+    let raw_identities = [];
+    let known_matches = 0;
+    let total_files = 0; let total_bytes = 0; let total_time_ms = 0;
+    let total_output_bytes = 0;
+    let i = 0;
+    while i < len(receipts) {
+        let r = receipts[i];
+        let validated = validate_receipt(scan_plan, r, evaluation_epoch);
+        let identity = if not _receipt_shape(r) { "invalid-" + str(i) }
+            else { _identity(r.target_token, r.check_kind, r.shard_index) };
+        if _receipt_shape(r) {
+            total_files = total_files + r.selected_files;
+            total_bytes = total_bytes + r.selected_bytes;
+            total_time_ms = total_time_ms + r.elapsed_ms;
+            total_output_bytes = total_output_bytes + r.output_bytes;
+        }
+        push(raw_identities, identity); push(raw_results, validated);
+        if validated.known_match { known_matches = known_matches + 1; }
+        i = i + 1;
+    }
+    let results = _canonical_results(scan_plan, raw_results, raw_identities);
+    let complete_claims = 0;
+    i = 0;
+    while i < len(results) {
+        if results[i].ok and results[i].complete_claimed
+            and results[i].signature_fresh_claimed { complete_claims = complete_claims + 1; }
+        i = i + 1;
+    }
+    let all_valid = len(receipts) == scan_plan.shard_count;
+    i = 0;
+    while i < len(raw_results) { if not raw_results[i].ok { all_valid = false; } i = i + 1; }
+    i = 0;
+    while i < len(results) { if not results[i].ok { all_valid = false; } i = i + 1; }
+    let cumulative_exceeded = total_files > scan_plan.policy.max_files
+        or total_bytes > scan_plan.policy.max_bytes
+        or total_time_ms > scan_plan.policy.max_time_ms
+        or total_output_bytes > scan_plan.policy.max_output_bytes;
+    if cumulative_exceeded { all_valid = false; }
+    let aggregate_state = _aggregate_state(all_valid, complete_claims, scan_plan.shard_count);
+    let aggregate_reason = if cumulative_exceeded { "cumulative-policy-limit-exceeded" }
+        else { _aggregate_reason(known_matches, aggregate_state) };
+    return _bounded_aggregate(_format_aggregate(map{
+        ok:all_valid,
+        state:aggregate_state,
+        disposition:if known_matches > 0 { "deny" } else { "quarantine" },
+        reason:aggregate_reason,
+        plan_id:scan_plan.plan_id, known_matches:known_matches,
+        receipt_count:len(receipts), expected_claims:scan_plan.shard_count,
+        complete_claims:complete_claims, results:results
+    }), scan_plan.policy.max_output_bytes);
+}
+
+fn status() {
+    let out = _base("status");
+    out.format = "pbai.scan-evidence.status.v1"; out.ok = true;
+    out.implementation_language = "pblang";
+    out.pure_metadata_only = true; out.exact_bounded_schemas = true;
+    out.maximum_targets = MAX_TARGETS; out.maximum_shards = MAX_SHARDS;
+    out.maximum_checks_per_target = MAX_CHECKS; out.maximum_output_bytes = MAX_OUTPUT_BYTES;
+    out.supported_checks = ["antivirus-static"];
+    out.receipt_claims_authenticated = false;
+    out.scanner_attestation_available = false;
+    out.external_scanner_execution_available = false;
+    out.memory_scanning_available = false; out.active_network_scanning_available = false;
+    out.malware_free_guarantee = false;
+    return out;
+}
+
+export FORMAT, RECEIPT_FORMAT, RESULT_FORMAT, POLICY_VERSION,
+       plan, receipt_claim_sha256, validate_receipt, aggregate, status;

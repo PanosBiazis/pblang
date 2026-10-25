@@ -1,0 +1,304 @@
+// stdlib/pbai_ideal_nn.sapp -- pbAI's "Ideal NN" target.
+//
+// The Ideal NN is an imaginary mathematical optimum, not a checkpoint. We measure a
+// computable "ideality distance" from a current model and provide operators that nudge
+// the model toward the ideal. Four axes (see docs/Ideal_NN_Target.md):
+//   * spectral      (linear algebra) -- orthogonality / dynamical isometry
+//   * distributional(probability)    -- KL + Hellinger to a target distribution
+//   * geometric     (geometry)       -- Fisher-Rao geodesic on the probability simplex
+//   * complex       (complex numbers)-- weights pulled toward the ideal point 1 + 0i
+//
+// Self-contained: depends only on pblang's stdlib:math.sapp. Not wired into the
+// pbAI-Max training loop; `ideality_regularizer` is the opt-in integration contract.
+
+let math = import("stdlib:math.sapp");
+let la = math.la;
+
+// stdlib:math.sapp's acos uses a low-order Taylor asin (inaccurate near +/-1), so we
+// compute an accurate acos via atan2 -- this keeps Fisher-Rao exactly 0 for identical
+// distributions.
+fn _acos(x) {
+    if x > 1.0 { x = 1.0; }
+    if x < 0.0 - 1.0 { x = 0.0 - 1.0; }
+    return num_atan2(num_sqrt(num_max(0.0, 1.0 - x * x)), x);
+}
+
+fn _abs(x) {
+    if x < 0.0 { return 0.0 - x; }
+    return x;
+}
+
+// ── Spectral axis (linear algebra) ───────────────────────────────────────────────────
+
+fn _frob_diff_identity(M) {
+    // ||M - I||_F for a square matrix M
+    let s = 0.0;
+    let i = 0;
+    let rows = len(M);
+    while i < rows {
+        let row = M[i];          // hoist the invariant row ref + length out of the inner loop (by-reference)
+        let cols = len(row);
+        let j = 0;
+        while j < cols {
+            let target = 0.0;
+            if i == j { target = 1.0; }
+            let d = row[j] - target;
+            s = s + d * d;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return num_sqrt(s);
+}
+
+// Orthogonality defect ||W^T W - I||_F. Zero iff W has orthonormal columns (the ideal:
+// every singular value 1, i.e. dynamical isometry).
+fn orthogonality_defect(W) {
+    let WtW = la.mat_mul(la.mat_transpose(W), W);
+    return _frob_diff_identity(WtW);
+}
+
+// One Newton-Schulz iteration  Y <- 1.5 W - 0.5 W (W^T W).  Drives a matrix toward
+// orthogonality when its singular values are within (0, sqrt(3)).
+fn newton_schulz_step(W) {
+    let WtW = la.mat_mul(la.mat_transpose(W), W);
+    let WWtW = la.mat_mul(W, WtW);
+    let out = [];
+    let i = 0;
+    let n = len(W);
+    while i < n {
+        let wr = W[i];          // hoist row refs + row length out of the inner loop (by-reference, no copy)
+        let gr = WWtW[i];
+        let cols = len(wr);
+        let row = [];
+        let j = 0;
+        while j < cols {
+            push(row, 1.5 * wr[j] - 0.5 * gr[j]);
+            j = j + 1;
+        }
+        push(out, row);
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── Distributional axis (probability) ────────────────────────────────────────────────
+
+fn kl_divergence(p, q) {
+    let s = 0.0;
+    let i = 0;
+    while i < len(p) {
+        if p[i] > 0.0 {
+            let qi = q[i];
+            if qi <= 0.0 { qi = 0.000000001; }   // guard: q=0 where p>0
+            s = s + p[i] * num_ln(p[i] / qi);
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn hellinger(p, q) {
+    let s = 0.0;
+    let i = 0;
+    while i < len(p) {
+        let d = num_sqrt(p[i]) - num_sqrt(q[i]);
+        s = s + d * d;
+        i = i + 1;
+    }
+    return num_sqrt(s) / num_sqrt(2.0);
+}
+
+// ── Geometric axis (geometry on the statistical manifold) ────────────────────────────
+
+fn bhattacharyya(p, q) {
+    let s = 0.0;
+    let i = 0;
+    while i < len(p) {
+        s = s + num_sqrt(p[i] * q[i]);
+        i = i + 1;
+    }
+    return s;
+}
+
+// Fisher-Rao geodesic distance on the probability simplex: 2 * arccos(sum sqrt(p*q)).
+fn fisher_rao(p, q) {
+    let bc = bhattacharyya(p, q);
+    if bc > 1.0 { bc = 1.0; }
+    return 2.0 * _acos(bc);
+}
+
+// ── Complex / imaginary axis ─────────────────────────────────────────────────────────
+// A weight is map{ re, im }; the ideal point is 1 + 0i (unit magnitude, zero phase).
+
+fn complex_magnitude_defect(w) {
+    let mag = num_sqrt(w.re * w.re + w.im * w.im);
+    return _abs(mag - 1.0);
+}
+
+fn complex_phase_defect(w) {
+    return _abs(num_atan2(w.im, w.re));
+}
+
+// RMS distance of the weights to the ideal point 1 + 0i in the complex plane.
+fn complex_ideality(ws) {
+    if len(ws) == 0 { return 0.0; }
+    let s = 0.0;
+    let i = 0;
+    while i < len(ws) {
+        let dr = ws[i].re - 1.0;
+        let di = ws[i].im - 0.0;
+        s = s + dr * dr + di * di;
+        i = i + 1;
+    }
+    return num_sqrt(s / len(ws));
+}
+
+// ── Ideal spec + composite ideality distance ─────────────────────────────────────────
+// Axis weights are the research dial; tune to emphasise trainability (spectral),
+// calibration (geometric), or the exploratory complex frontier.
+let DEFAULT_WEIGHTS = map{ spectral: 1.0, distributional: 1.0, geometric: 1.0, complex: 1.0 };
+
+fn ideal_spec(target_dist) {
+    return map{
+        format: "pbai.ideal_nn.spec.v1",
+        target_dist: target_dist,
+        complex_target: map{ re: 1.0, im: 0.0 },
+        weights: DEFAULT_WEIGHTS
+    };
+}
+
+fn _spectral_total(layers) {
+    let s = 0.0;
+    let i = 0;
+    while i < len(layers) {
+        s = s + orthogonality_defect(layers[i]);
+        i = i + 1;
+    }
+    return s;
+}
+
+// A model is map{ layers: array<matrix>, output_dist: array<prob>, complex_weights: array<{re,im}> }.
+fn ideality_distance(model, ideal) {
+    let spectral = _spectral_total(model.layers);
+    let distributional = kl_divergence(model.output_dist, ideal.target_dist);
+    let geometric = fisher_rao(model.output_dist, ideal.target_dist);
+    let cmplx = complex_ideality(model.complex_weights);
+    let w = ideal.weights;
+    let total = w.spectral * spectral
+              + w.distributional * distributional
+              + w.geometric * geometric
+              + w.complex * cmplx;
+    return map{
+        format: "pbai.ideal_nn.distance.v1",
+        total: total,
+        spectral: spectral,
+        distributional: distributional,
+        geometric: geometric,
+        complex: cmplx
+    };
+}
+
+// ── Train toward the ideal ───────────────────────────────────────────────────────────
+
+fn _normalize(v) {
+    let s = 0.0;
+    let i = 0;
+    while i < len(v) { s = s + v[i]; i = i + 1; }
+    let out = [];
+    let j = 0;
+    while j < len(v) {
+        if s > 0.0 { push(out, v[j] / s); } else { push(out, v[j]); }
+        j = j + 1;
+    }
+    return out;
+}
+
+// Returns a new model nudged toward the ideal by learning-rate lr in (0,1]:
+// layers blend toward their orthogonalized (Newton-Schulz) form, the output
+// distribution moves toward the target, and complex weights move toward 1 + 0i.
+fn step_toward_ideal(model, ideal, lr) {
+    let new_layers = [];
+    let i = 0;
+    while i < len(model.layers) {
+        let W = model.layers[i];
+        let NS = newton_schulz_step(W);
+        let row_out = [];
+        let r = 0;
+        let rows = len(W);
+        while r < rows {
+            let wr = W[r];          // hoist the invariant row refs + length out of the inner (column) loop
+            let nr = NS[r];
+            let cols = len(wr);
+            let row = [];
+            let c = 0;
+            while c < cols {
+                push(row, wr[c] + lr * (nr[c] - wr[c]));
+                c = c + 1;
+            }
+            push(row_out, row);
+            r = r + 1;
+        }
+        push(new_layers, row_out);
+        i = i + 1;
+    }
+
+    let new_dist = [];
+    let k = 0;
+    while k < len(model.output_dist) {
+        push(new_dist, model.output_dist[k] + lr * (ideal.target_dist[k] - model.output_dist[k]));
+        k = k + 1;
+    }
+    new_dist = _normalize(new_dist);
+
+    let new_cw = [];
+    let m = 0;
+    while m < len(model.complex_weights) {
+        let w = model.complex_weights[m];
+        push(new_cw, map{
+            re: w.re + lr * (1.0 - w.re),
+            im: w.im + lr * (0.0 - w.im)
+        });
+        m = m + 1;
+    }
+
+    return map{
+        layers: new_layers,
+        output_dist: new_dist,
+        complex_weights: new_cw
+    };
+}
+
+// Run the training-toward-ideal loop for `steps` iterations. Returns the final model
+// and the trajectory of total ideality distances (initial + one entry per step), so
+// callers can verify the current NN is converging toward the Ideal NN.
+fn iterate_toward_ideal(model, ideal, lr, steps) {
+    let distances = [ideality_distance(model, ideal).total];
+    let cur = model;
+    let i = 0;
+    while i < steps {
+        cur = step_toward_ideal(cur, ideal, lr);
+        push(distances, ideality_distance(cur, ideal).total);
+        i = i + 1;
+    }
+    return map{
+        format: "pbai.ideal_nn.run.v1",
+        final: cur,
+        distances: distances,
+        steps: steps,
+        lr: lr
+    };
+}
+
+// Opt-in integration hook: the scalar to add to a task loss,
+//   loss = task_loss + lambda * ideality_regularizer(model, ideal)
+fn ideality_regularizer(model, ideal) {
+    return ideality_distance(model, ideal).total;
+}
+
+export ideal_spec;
+export orthogonality_defect, newton_schulz_step;
+export kl_divergence, hellinger;
+export bhattacharyya, fisher_rao;
+export complex_magnitude_defect, complex_phase_defect, complex_ideality;
+export ideality_distance, step_toward_ideal, iterate_toward_ideal, ideality_regularizer;

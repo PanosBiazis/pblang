@@ -1,0 +1,287 @@
+// Desktop transport PNG validation. Preserve compressed pixels and transparency;
+// omit optional metadata without decoding a second RGBA image or recompressing.
+let Flate = import("stdlib:flate.sapp");
+let SIGNATURE = [137, 80, 78, 71, 13, 10, 26, 10];
+
+fn _u32(bytes, at) {
+    return bytes[at] * 16777216 + bytes[at + 1] * 65536
+        + bytes[at + 2] * 256 + bytes[at + 3];
+}
+fn _append(out, bytes, at, count) {
+    for offset count { array_push(out, bytes[at + offset]); }
+}
+fn _bound(options, key, fallback, low, high) {
+    let v = if map_has(options,key) { options[key] } else { fallback };
+    if type(v) != "number" or v != num_floor(v) or v < low or v > high {
+        throw "invalid PNG bounds";
+    }
+    return v;
+}
+fn _channels(color, depth) {
+    if color == 0 and (depth == 1 or depth == 2 or depth == 4 or depth == 8 or depth == 16) { return 1; }
+    if color == 3 and (depth == 1 or depth == 2 or depth == 4 or depth == 8) { return 1; }
+    if depth != 8 and depth != 16 { throw "unsupported PNG depth"; }
+    if color == 2 { return 3; }
+    if color == 4 { return 2; }
+    if color == 6 { return 4; }
+    throw "invalid PNG color type";
+}
+fn _passes(width, height, bits, interlace) {
+    let layout = if interlace == 0 { [[0, 0, 1, 1]] } else {
+        [[0, 0, 8, 8], [4, 0, 8, 8], [0, 4, 4, 8], [2, 0, 4, 4],
+            [0, 2, 2, 4], [1, 0, 2, 2], [0, 1, 1, 2]]
+    };
+    let passes = []; let total = 0;
+    for p in layout {
+        if width > p[0] and height > p[1] {
+            let w = num_floor((width - p[0] + p[2] - 1) / p[2]);
+            let h = num_floor((height - p[1] + p[3] - 1) / p[3]);
+            let stride = num_floor((w * bits + 7) / 8);
+            array_push(passes, map{ width: w, height: h, stride: stride });
+            total = total + (stride + 1) * h;
+        }
+    }
+    return map{ passes: passes, total: total };
+}
+fn _paeth(a, b, c) {
+    let p = a + b - c;
+    let pa = num_abs(p - a); let pb = num_abs(p - b); let pc = num_abs(p - c);
+    if pa <= pb and pa <= pc { return a; }
+    if pb <= pc { return b; }
+    return c;
+}
+fn _scanlines(raw, passes, color, depth, palette_size) {
+    let at = 0;
+    let check_indices = color == 3 and palette_size < bit_shl(1, depth);
+    for pass in passes {
+        let previous = [];
+        for row_index pass.height {
+            let filter = raw[at]; at = at + 1;
+            if filter > 4 { throw "invalid PNG scanline filter"; }
+            // Non-indexed sample values are valid by construction at every bit
+            // depth. Only palette indices require reconstructing a scanline.
+            if check_indices {
+                let row = [];
+                for x pass.stride {
+                    let left = if x == 0 { 0 } else { row[x - 1] };
+                    let up = if row_index == 0 { 0 } else { previous[x] };
+                    let upper_left = if row_index == 0 or x == 0 { 0 } else { previous[x - 1] };
+                    let v = raw[at + x];
+                    if filter == 1 { v = v + left; }
+                    elif filter == 2 { v = v + up; }
+                    elif filter == 3 { v = v + num_floor((left + up) / 2); }
+                    elif filter == 4 { v = v + _paeth(left, up, upper_left); }
+                    array_push(row, bit_and(v, 255));
+                }
+                let mask = bit_shl(1, depth) - 1;
+                for x pass.width {
+                    let bit_offset = x * depth;
+                    let index = bit_and(bit_shr(row[num_floor(bit_offset / 8)],
+                        8 - depth - bit_offset % 8), mask);
+                    if index >= palette_size { throw "PNG palette index out of range"; }
+                }
+                previous = row;
+            }
+            at = at + pass.stride;
+        }
+    }
+}
+// For direct-color/full-palette images only filter bytes need inspection.
+// Callback state is local and provisional; no image escapes before checksum.
+fn _visit_scanlines(compressed,layout) {
+    let state = map{pass:0,row:0,next:0};
+    fn inspect(chunk,offset) {
+        let end = offset+len(chunk);
+        while state.pass < len(layout.passes) and state.next < end {
+            if state.next < offset or chunk[state.next-offset] > 4 { throw "invalid PNG scanline filter"; }
+            let pass = layout.passes[state.pass];
+            state.next = state.next+pass.stride+1; state.row = state.row+1;
+            if state.row == pass.height { state.pass = state.pass+1; state.row = 0; }
+        }
+    }
+    let decoded = Flate.zlib_visit(compressed,inspect,layout.total,true);
+    if decoded.decoded_bytes != layout.total or state.pass != len(layout.passes)
+        or state.next != layout.total { throw "PNG scanline length mismatch"; }
+    return decoded.decoded_bytes;
+}
+// Indexed PNG filters depend only on the current and preceding pass row.
+// Keep those rows across visitor chunks; never retain the decoded image.
+fn _visit_palette(compressed,layout,depth,palette) {
+    let state = map{pass:0,row_number:0,column:-1,filter:0,row:[],previous:[],offset:0};
+    let per_byte = 8/depth; let mask = bit_shl(1,depth)-1;
+    fn inspect(chunk,offset) {
+        if offset != state.offset { throw "PNG scanline offset mismatch"; }
+        let pi = state.pass; let rn = state.row_number; let col = state.column;
+        let filter = state.filter; let row = state.row; let previous = state.previous;
+        let at = 0;
+        while at < len(chunk) {
+            if pi >= len(layout.passes) { throw "PNG scanline length mismatch"; }
+            let pass = layout.passes[pi];
+            if col == -1 {
+                filter = chunk[at]; at = at+1; col = 0;
+                if filter > 4 { throw "invalid PNG scanline filter"; }
+            }
+            let count = num_min(len(chunk)-at,pass.stride-col);
+            for i count {
+                let x = col+i; let v = chunk[at+i];
+                if filter != 0 {
+                    let left = if x == 0 { 0 } else { row[x-1] };
+                    let up = if rn == 0 { 0 } else { previous[x] };
+                    if filter == 1 { v = v+left; }
+                    elif filter == 2 { v = v+up; }
+                    elif filter == 3 { v = v+num_floor((left+up)/2); }
+                    else {
+                        let upper_left = if rn == 0 or x == 0 { 0 } else { previous[x-1] };
+                        v = v+_paeth(left,up,upper_left);
+                    }
+                    v = bit_and(v,255);
+                }
+                if depth == 8 {
+                    if v >= palette { throw "PNG palette index out of range"; }
+                } else {
+                    // Padding bits after the final pixel are not palette indices.
+                    let pixels = num_min(per_byte,pass.width-x*per_byte);
+                    for p pixels {
+                        if bit_and(bit_shr(v,8-depth*(p+1)),mask) >= palette {
+                            throw "PNG palette index out of range";
+                        }
+                    }
+                }
+                array_push(row,v);
+            }
+            at = at+count; col = col+count;
+            if col == pass.stride {
+                previous = row; row = []; col = -1; rn = rn+1;
+                if rn == pass.height { pi = pi+1; rn = 0; previous = []; }
+            }
+        }
+        state.pass = pi; state.row_number = rn; state.column = col;
+        state.filter = filter; state.row = row; state.previous = previous;
+        state.offset = offset+len(chunk);
+    }
+    let decoded = Flate.zlib_visit(compressed,inspect,layout.total,true);
+    if decoded.decoded_bytes != layout.total or state.pass != len(layout.passes)
+        or state.column != -1 { throw "PNG scanline length mismatch"; }
+    return decoded.decoded_bytes;
+}
+fn _sanitize(bytes, options) {
+    if type(options) != "map" { throw "invalid PNG options"; }
+    for key in map_keys(options) {
+        if key != "max_input_bytes" and key != "max_width" and key != "max_height"
+            and key != "max_decoded_bytes" and key != "max_chunks" and key != "streaming" { throw "unknown PNG option"; }
+    }
+    let streaming = if map_has(options,"streaming") { options.streaming } else { true };
+    if type(streaming) != "bool" { throw "invalid PNG streaming selection"; }
+    let input_limit = _bound(options, "max_input_bytes", 98304, 64, 16777216);
+    let width_limit = _bound(options, "max_width", 1280, 1, 16384);
+    let height_limit = _bound(options, "max_height", 720, 1, 16384);
+    let raw_limit = _bound(options, "max_decoded_bytes", 8388608, 1, 67108864);
+    let chunk_limit = _bound(options, "max_chunks", 1024, 3, 65536);
+    if type(bytes) != "array" or len(bytes) < 57 or len(bytes) > input_limit { throw "invalid PNG input size"; }
+    for byte in bytes {
+        if type(byte) != "number" or byte != num_floor(byte) or byte < 0 or byte > 255 { throw "invalid PNG byte"; }
+    }
+    for i 8 { if bytes[i] != SIGNATURE[i] { throw "invalid PNG signature"; } }
+    let out = slice(bytes, 0, 8); let compressed = [];
+    let at = 8; let chunks = 0; let width = 0; let height = 0; let depth = 0;
+    let color = -1; let palette = 0; let seen_palette = false; let transparency = false;
+    let seen_data = false; let closed_data = false; let ended = false;
+    let layout = nil; let removed = 0; let color_chunks = map{}; let color_profile_removed = false;
+    while at < len(bytes) {
+        chunks = chunks + 1;
+        if chunks > chunk_limit or at + 12 > len(bytes) { throw "PNG chunk bound exceeded"; }
+        let size = _u32(bytes, at);
+        if size > len(bytes) - at - 12 { throw "truncated PNG chunk"; }
+        let data = at + 8;
+        let name = "";
+        for i 4 {
+            let c = bytes[at + 4 + i];
+            if not ((c >= 65 and c <= 90) or (c >= 97 and c <= 122)) { throw "invalid PNG chunk name"; }
+            name = name + strfromcharcode(c);
+        }
+        if bit_and(bytes[at + 6], 32) != 0 { throw "reserved PNG chunk bit"; }
+        if Flate.crc32_range(bytes, at + 4, size + 4) != _u32(bytes, data + size) { throw "PNG chunk CRC mismatch"; }
+        if width == 0 and name != "IHDR" { throw "PNG must start with IHDR"; }
+        let keep = false;
+        if name == "IHDR" {
+            if at != 8 or size != 13 { throw "invalid PNG header"; }
+            width = _u32(bytes, data); height = _u32(bytes, data + 4);
+            depth = bytes[data + 8]; color = bytes[data + 9];
+            let channels = _channels(color, depth);
+            if width < 1 or height < 1 or width > width_limit or height > height_limit
+                or bytes[data + 10] != 0 or bytes[data + 11] != 0 or bytes[data + 12] > 1 { throw "unsupported PNG header"; }
+            layout = _passes(width, height, channels * depth, bytes[data + 12]);
+            if layout.total > raw_limit { throw "PNG decoded size exceeds quota"; }
+            keep = true;
+        } elif name == "PLTE" {
+            if seen_palette or seen_data or transparency or color == 0 or color == 4
+                or size < 3 or size > 768 or size % 3 != 0 { throw "invalid PNG palette"; }
+            palette = size / 3; seen_palette = true;
+            if color == 3 and palette > bit_shl(1, depth) { throw "oversized indexed palette"; }
+            keep = true;
+        } elif name == "tRNS" {
+            if transparency or seen_data { throw "invalid PNG transparency order"; }
+            if color == 3 {
+                if not seen_palette or size < 1 or size > palette { throw "invalid palette transparency"; }
+            } elif color == 0 or color == 2 {
+                let samples = if color == 0 { 1 } else { 3 };
+                if size != samples * 2 { throw "invalid transparency length"; }
+                for i samples {
+                    if bytes[data + 2 * i] * 256 + bytes[data + 2 * i + 1] >= bit_shl(1, depth) { throw "invalid transparent sample"; }
+                }
+            } else { throw "unexpected PNG transparency"; }
+            transparency = true; keep = true;
+        } elif name == "gAMA" or name == "cHRM" or name == "sRGB" {
+            if seen_palette or seen_data or map_has(color_chunks, name) { throw "invalid PNG color metadata order"; }
+            if name == "gAMA" and (size != 4 or _u32(bytes, data) == 0) { throw "invalid gamma"; }
+            if name == "cHRM" and size != 32 { throw "invalid chromaticities"; }
+            if name == "sRGB" and (size != 1 or bytes[data] > 3) { throw "invalid rendering intent"; }
+            color_chunks[name] = true; keep = true;
+        } elif name == "IDAT" {
+            if closed_data or (color == 3 and not seen_palette) { throw "invalid PNG data order"; }
+            _append(compressed, bytes, data, size);
+            seen_data = true; keep = true;
+        } elif name == "IEND" {
+            if size != 0 or not seen_data or at + 12 != len(bytes) { throw "invalid PNG end"; }
+            ended = true; keep = true;
+        } else {
+            if bit_and(bytes[at + 4], 32) == 0 { throw "unknown critical PNG chunk"; }
+            if name == "acTL" or name == "fcTL" or name == "fdAT" { throw "animated PNG is not a desktop frame"; }
+            if name == "iCCP" or name == "cICP" or name == "mDCV" or name == "cLLI" { color_profile_removed = true; }
+            // Ancillary payloads are never decompressed or returned. This also
+            // removes text, EXIF, timestamps, ICC and application-specific data.
+            removed = removed + size + 12;
+        }
+        if seen_data and name != "IDAT" { closed_data = true; }
+        if keep { _append(out, bytes, at, size + 12); }
+        at = at + size + 12;
+    }
+    if not ended or len(compressed) < 6 or bit_shr(compressed[0], 4) > 7 { throw "incomplete PNG data"; }
+    // The exact, dimension-derived ceiling is applied during inflation, before
+    // growth. No independent pixel matrix or second compressed copy is built.
+    let decoded_bytes = 0;
+    let partial_palette = color == 3 and palette < bit_shl(1,depth);
+    // Below two decode windows, visitor copies can cost more than a raw array.
+    // This selects an implementation; it does not reject or cap image sizes.
+    if not streaming or type(_visit_scanlines) == "map"
+        or (partial_palette and layout.total <= 131072) {
+        // The self-hosted VM currently represents callables as maps, so it
+        // keeps the existing array path until typed visitors are supported.
+        let raw = Flate.zlib_decode(compressed, layout.total, true);
+        if len(raw) != layout.total { throw "PNG scanline length mismatch"; }
+        _scanlines(raw, layout.passes, color, depth, palette); decoded_bytes = len(raw);
+    } elif partial_palette {
+        decoded_bytes = _visit_palette(compressed,layout,depth,palette);
+    } else { decoded_bytes = _visit_scanlines(compressed,layout); }
+    return map{ ok: true, bytes: out, width: width, height: height,
+        decoded_bytes: decoded_bytes, removed_bytes: removed,
+        crc_verified: true, checksum_verified: true, metadata_removed: true,
+        color_profile_removed: color_profile_removed };
+}
+fn sanitize(bytes, options = nil) {
+    if options == nil { options = map{}; }
+    let result = try _sanitize(bytes, options) catch nil;
+    if result == nil { return map{ ok: false, error: "Invalid or unsupported bounded desktop PNG" }; }
+    return result;
+}
+export sanitize;

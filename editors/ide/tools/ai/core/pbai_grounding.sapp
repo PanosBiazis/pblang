@@ -1,0 +1,288 @@
+// pbai_grounding.sapp -- truthful provenance contract for pbAI responses.
+//
+// This module does not retrieve, generate, execute, or persist. It accepts only
+// versioned internal evidence, filters unusable hits, and describes how strongly
+// a response is grounded. Verification is deliberately not treated as a citation.
+
+let FORMAT = "pbai.grounding.report.v1";
+let RETRIEVAL = (try import("pbai_retrieval_index.sapp") catch import("editors/ide/tools/ai/core/pbai_retrieval_index.sapp"));
+let MAX_CITATIONS = 5;
+let MAX_SOURCE_CHARS = 256;
+let MAX_SNIPPET_CHARS = 360;
+
+fn _forbidden_codepoint(c) {
+    if c == 9 or c == 10 or c == 13 { return false; }
+    return c < 32 or (c >= 127 and c <= 159)
+        or c == 1564 or (c >= 8203 and c <= 8207)
+        or (c >= 8234 and c <= 8238) or c == 8288
+        or (c >= 8294 and c <= 8297) or c == 65279;
+}
+
+fn _bounded_string(value, maximum_chars, maximum_bytes) {
+    if type(value) != "string" or len(value) > maximum_chars
+        or len(str_to_bytes(value)) > maximum_bytes { return ""; }
+    let i = 0;
+    while i < len(value) {
+        if _forbidden_codepoint(strcharcodeat(value, i)) { return ""; }
+        i = i + 1;
+    }
+    return str_trim(value);
+}
+
+fn _hex64(value) {
+    if type(value) != "string" or len(value) != 64 { return false; }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        if not ((c >= 48 and c <= 57) or (c >= 97 and c <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _opaque(value, prefix) {
+    return type(value) == "string" and str_starts_with(value, prefix)
+        and _hex64(str_slice(value, len(prefix), len(value)));
+}
+
+fn _safe_source(value) {
+    let source = _bounded_string(value, MAX_SOURCE_CHARS, 1024);
+    if source == "" { return ""; }
+    if str_starts_with(source, "/") or str_starts_with(source, "\\")
+        or str_contains(source, "..") or str_contains(source, "\\")
+        or str_contains(source, ":") or str_contains(source, "\x00") {
+        return "";
+    }
+    return source;
+}
+
+fn _positive_score(value) {
+    return type(value) == "number" and value > 0.000001 and value <= 2.0;
+}
+
+fn _new_hit_valid(hit) {
+    if type(hit) != "map" or (try hit.format catch "") != "pbai.retrieval.hit.v1"
+        or not _opaque(try hit.id catch "", "chk-")
+        or not _opaque(try hit.source catch "", "src-")
+        or not _opaque(try hit.record_token catch "", "rec-")
+        or type(try hit.section_tokens catch nil) != "array"
+        or len(hit.section_tokens) < 1 or len(hit.section_tokens) > 64
+        or _bounded_string(try hit.kind catch "", 64, 256) == ""
+        or not _positive_score(try hit.score catch nil)
+        or _bounded_string(try hit.snippet catch "", MAX_SNIPPET_CHARS, 1440) == "" {
+        return false;
+    }
+    let i = 0;
+    while i < len(hit.section_tokens) {
+        if not _opaque(hit.section_tokens[i], "sec-") { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn retrieval_citations(evidence, query = "") {
+    let out = [];
+    if type(evidence) != "map" or type(try evidence.results catch nil) != "array" {
+        return out;
+    }
+    let evidence_format = try evidence.format catch "";
+    let max_memory = evidence_format == "pbai.max.memory_retrieval.v1"
+        and len(evidence.results) <= 64;
+    let section_retrieval = evidence_format == "pbai.retrieval.search.v1"
+        and RETRIEVAL.validate_search_result(evidence, query)
+        and len(evidence.results) <= MAX_CITATIONS;
+    if not max_memory and not section_retrieval { return out; }
+    let i = 0;
+    while i < len(evidence.results) and len(out) < MAX_CITATIONS {
+        let hit = evidence.results[i];
+        let source = "";
+        let score = nil;
+        let snippet = "";
+        let id = "";
+        let kind = "";
+        if max_memory and type(hit) == "map"
+            and (try hit.format catch "") == "pbai.max.memory_hit.v1" {
+            source = _safe_source(try hit.source catch "");
+            score = try hit.score catch nil;
+            snippet = _bounded_string(try hit.snippet catch "", MAX_SNIPPET_CHARS, 1440);
+            id = _bounded_string(try hit.id catch "", 96, 384);
+            kind = _bounded_string(try hit.kind catch "record", 64, 256);
+        } elif section_retrieval and _new_hit_valid(hit) {
+            source = hit.source; score = hit.score;
+            snippet = _bounded_string(hit.snippet, MAX_SNIPPET_CHARS, 1440);
+            id = hit.id;
+            kind = _bounded_string(hit.kind, 64, 256);
+        }
+        if source != "" and id != "" and kind != "" and snippet != ""
+            and _positive_score(score) {
+            push(out, map{
+                format: "pbai.grounding.citation.v1",
+                id: id,
+                source: source,
+                kind: kind,
+                score: score,
+                snippet: snippet,
+                provenance_linked: true
+            });
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn report(lane, prompt = "", evidence = nil, context = nil) {
+    let selected = str_lower(str_trim(str(lane)));
+    let bounded_prompt = _bounded_string(prompt, 1024, 4096);
+    let citations = [];
+    let warnings = [];
+    let level = "ungrounded";
+    let grounded = false;
+    let abstained = false;
+    let verified_model_output = false;
+    let safe_for_public_logging = true;
+    let retrieval_authentication = "not-applicable";
+
+    if selected == "embedded" {
+        level = "implementation-grounded";
+        grounded = true;
+        push(citations, map{
+            format: "pbai.grounding.citation.v1",
+            id: "pbai:embedded-skill",
+            source: "stdlib/pbai.sapp",
+            kind: "implementation",
+            score: 1.0,
+            snippet: "Deterministic PBLang assistant skill selected by the local intent router.",
+            provenance_linked: true
+        });
+        push(warnings, "implementation grounding supports the skill path, not arbitrary external facts");
+    }
+    elif selected == "retrieval" {
+        safe_for_public_logging = false;
+        if type(evidence) == "map"
+            and (try evidence.format catch "") == "pbai.retrieval.search.v1"
+            and RETRIEVAL.validate_search_result(evidence, bounded_prompt) {
+            retrieval_authentication = "process-local-hmac-sha256-v1";
+        } elif type(evidence) == "map"
+            and (try evidence.format catch "") == "pbai.max.memory_retrieval.v1" {
+            retrieval_authentication = "structural-only";
+        }
+        citations = retrieval_citations(evidence, bounded_prompt);
+        if bounded_prompt == "" {
+            push(warnings, "blank retrieval query has no evidential meaning");
+        }
+        if len(citations) > 0 and bounded_prompt != "" {
+            level = "retrieval-grounded";
+            grounded = true;
+        } else {
+            level = "retrieval-abstained";
+            abstained = true;
+            push(warnings, "no positive provenance-linked retrieval hit was available");
+        }
+    }
+    elif selected == "brain" {
+        let memories = try context.live_memory catch [];
+        if type(memories) == "array" and len(memories) > 0 {
+            level = "local-memory-assisted";
+            grounded = true;
+            push(citations, map{
+                format: "pbai.grounding.citation.v1",
+                id: "pbai:live-memory",
+                source: "pbai-live-corpus",
+                kind: "admitted-local-memory",
+                score: 1.0,
+                snippet: "The bounded cognitive loop used one or more admitted local-memory matches.",
+                provenance_linked: true
+            });
+        } else {
+            level = "reasoning-only";
+            push(warnings, "a cognitive loop is not factual evidence by itself");
+        }
+    }
+    elif selected == "max" {
+        verified_model_output = type(evidence) == "map"
+            and (try evidence.format catch "") == "pbai.max.verified_ranked_generation.v1"
+            and (try evidence.passed catch false);
+        level = if verified_model_output { "verified-model-output" } else { "model-only" };
+        push(warnings, "model verification is not a provenance citation");
+    }
+    elif selected == "nano" {
+        level = "model-only";
+        push(warnings, "Nano generation used no retrieved evidence");
+    }
+    else {
+        push(warnings, "no producer lane supplied grounding evidence");
+    }
+
+    return map{
+        format: FORMAT,
+        ok: true,
+        lane: selected,
+        level: level,
+        grounded: grounded,
+        abstained: abstained,
+        evidence_count: len(citations),
+        citations: citations,
+        warnings: warnings,
+        verified_model_output: verified_model_output,
+        authorizes_external_action: false,
+        safe_for_public_logging: safe_for_public_logging,
+        contains_retrieved_content: selected == "retrieval" and len(citations) > 0,
+        provenance_authentication: retrieval_authentication,
+        raw_user_locator_exposed: false
+    };
+}
+
+fn compose_retrieval(prompt, evidence) {
+    let grounding = report("retrieval", prompt, evidence, nil);
+    if not grounding.grounded {
+        return map{
+            format: "pbai.grounding.composition.v1",
+            ok: true,
+            text: "pbAI could not find a positive provenance-linked local memory match. No answer was synthesized from unrelated records.",
+            grounding: grounding, safe_for_public_logging: false,
+            authorizes_external_action: false
+        };
+    }
+    let text = "pbAI provenance-linked local retrieval:\n";
+    let i = 0;
+    while i < len(grounding.citations) {
+        let citation = grounding.citations[i];
+        text = text + "[" + str(i + 1) + "] " + citation.source
+            + " (score=" + str(citation.score) + ")\n"
+            + citation.snippet + "\n";
+        i = i + 1;
+    }
+    return map{
+        format: "pbai.grounding.composition.v1",
+        ok: true,
+        text: text,
+        grounding: grounding, safe_for_public_logging: false,
+        authorizes_external_action: false
+    };
+}
+
+fn status() {
+    return map{
+        format: "pbai.grounding.status.v1",
+        ok: true,
+        report_format: FORMAT,
+        supported_levels: [
+            "implementation-grounded", "retrieval-grounded", "retrieval-abstained",
+            "local-memory-assisted", "reasoning-only", "verified-model-output", "model-only"
+        ],
+        positive_retrieval_score_required: true,
+        provenance_required: true,
+        verification_is_not_citation: true,
+        retrieval_evidence_structurally_revalidated: true,
+        retrieval_process_local_authentication: true,
+        retrieval_query_binding_required: true,
+        retrieval_provenance_authentication: "process-local-hmac-sha256-v1",
+        retrieval_safe_for_public_logging: false,
+        authorizes_external_action: false,
+        raw_user_locator_exposed: false,
+        max_citations: MAX_CITATIONS
+    };
+}
+
+export FORMAT, MAX_CITATIONS, MAX_SOURCE_CHARS, MAX_SNIPPET_CHARS;
+export retrieval_citations, report, compose_retrieval, status;

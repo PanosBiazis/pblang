@@ -1,0 +1,316 @@
+// stdlib/pbai_ingest.sapp -- explicitly admitted local ingestion for pbAI.
+//
+// A path alone is never permission to train. The caller must provide a source manifest
+// accepted by pbai_dataset_policy. Reads are bounded and descriptor-held; raw paths are
+// never written to the live corpus or returned in reports.
+
+let LM = (try import("pbai_lm.sapp") catch import("editors/ide/tools/ai/core/pbai_lm.sapp"));
+let DATA = import("stdlib:llm_data.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
+let POLICY = (try import("pbai_dataset_policy.sapp") catch import("editors/ide/tools/ai/core/pbai_dataset_policy.sapp"));
+let EXTRACT = (try import("pbai_document_extract.sapp") catch import("editors/ide/tools/ai/core/pbai_document_extract.sapp"));
+
+let MAX_FILES = 80;
+let MAX_DEPTH = 4;
+let MAX_TEXT_BYTES = 24000;
+let MAX_DIRECTORY_ENTRIES = 512;
+
+fn _join(a, b) {
+    if a == "" or a == "." { return b; }
+    if str_ends_with(a, "/") { return a + b; }
+    return a + "/" + b;
+}
+
+fn _lower(s) { return str_lower(str(s)); }
+
+fn _skip_component(name) {
+    if name == "" or name == "." { return false; }
+    let n = _lower(name);
+    if n == ".." or str_starts_with(n, ".") { return true; }
+    if n == "target" or n == "node_modules" or n == "__pycache__" or n == ".venv" { return true; }
+    if n == "cache" or n == "tmp" or n == "temp" or n == "build" or n == "dist" { return true; }
+    if n == "bin" or n == "obj" or n == "coverage" or n == "mail" or n == "email" { return true; }
+    if n == "browser" or n == "browsers" or n == "mozilla" or n == "chromium" or n == "chrome" { return true; }
+    if str_contains(n, "credential") or str_contains(n, "password") or str_contains(n, "passwd") { return true; }
+    if str_contains(n, "secret") or str_contains(n, "token") or str_contains(n, "openrouter") { return true; }
+    if str_contains(n, "appsettings") or str_contains(n, "api_key") or str_contains(n, "access_key") { return true; }
+    if str_starts_with(n, "id_ed25519") or str_starts_with(n, "id_rsa") { return true; }
+    if str_ends_with(n, ".pem") or str_ends_with(n, ".p12") or str_ends_with(n, ".pfx") or str_ends_with(n, ".key") { return true; }
+    if str_ends_with(n, ".iso") or str_ends_with(n, ".exe") or str_ends_with(n, ".msi") or str_ends_with(n, ".zip") or str_ends_with(n, ".7z") { return true; }
+    return false;
+}
+
+fn _unsafe_path(path) {
+    if type(path) != "string" or path == "" or len(path) > 4096 or str_contains(path, strfromcharcode(0)) { return true; }
+    let normalized = str_replace_all(path, "\\", "/");
+    let parts = str_split(normalized, "/");
+    let i = 0;
+    while i < len(parts) {
+        if _skip_component(parts[i]) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _would_overflow(chunk) {
+    return not LM.admitted_batch_fits_from_bytes(LM.live_stats().live_bytes, [chunk]);
+}
+
+fn _seen(values, wanted) {
+    let i = 0;
+    while i < len(values) { if values[i] == wanted { return true; } i = i + 1; }
+    return false;
+}
+
+fn _declared_format(path) {
+    let lower = _lower(path);
+    if str_ends_with(lower, ".txt") or str_ends_with(lower, ".me") { return "plain"; }
+    if str_ends_with(lower, ".md") { return "markdown"; }
+    if str_ends_with(lower, ".json") { return "json"; }
+    if str_ends_with(lower, ".csv") { return "csv"; }
+    if str_ends_with(lower, ".sapp") or str_ends_with(lower, ".sap")
+        or str_ends_with(lower, ".bpx") { return "pblang-source"; }
+    return nil;
+}
+
+fn _media_type(declared_format) {
+    if declared_format == "markdown" { return "text/markdown"; }
+    if declared_format == "json" { return "application/json"; }
+    if declared_format == "csv" { return "text/csv"; }
+    if declared_format == "pblang-source" { return "text/x-pblang"; }
+    return "text/plain";
+}
+
+fn _chunk_envelopes(source_result, extraction) {
+    let out = [];
+    let total = len(extraction.chunks);
+    let i = 0;
+    while i < total {
+        push(out, "admitted source " + source_result.source.source_id
+            + ", content chunk " + str(i + 1) + "/" + str(total)
+            + "\n--- content ---\n" + extraction.chunks[i].text);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _public_source_admission(source_result) {
+    if type(source_result) != "map" { return nil; }
+    let source = try source_result.source catch nil;
+    return map{ format: try source_result.format catch "pbai.dataset.admission.v1",
+        policy_version: try source_result.policy_version catch "",
+        passed: try source_result.passed catch false,
+        reasons: try source_result.reasons catch ["invalid-source-admission"],
+        source: if type(source) != "map" { nil } else { map{
+            source_id: try source.source_id catch "",
+            source_kind: try source.source_kind catch "unknown",
+            locator_token: try source.locator_token catch "",
+            training_allowed: try source.training_allowed catch false,
+            retrieval_allowed: try source.retrieval_allowed catch false
+        } }
+    };
+}
+
+fn _record_spec(source_id, raw, normalized, read_result, extraction, declared_format) {
+    let raw_hash = sha256(raw);
+    let normalized_hash = sha256(normalized);
+    return map{
+        record_id: "record-" + str_slice(normalized_hash, 0, 24),
+        source_id: source_id,
+        raw_sha256: raw_hash, normalized_sha256: normalized_hash,
+        extractor: extraction.extractor,
+        transform_chain: ["bounded-prefix", "llm-data-sanitize", "trim",
+            "pblang-document-extraction-v1"],
+        media_type: _media_type(declared_format), bytes: read_result.returned_bytes,
+        chars: len(normalized), section_count: extraction.section_count,
+        extracted_chunk_count: extraction.chunk_count,
+        secret_scan: "missing", pii_scan: "missing", poisoning_scan: "missing",
+        dedupe_cluster: "sha256-" + str_slice(normalized_hash, 0, 32),
+        split: "train", eval_overlap: false,
+        quality_status: if normalized == "" { "failed" } else { "passed" }
+    };
+}
+
+fn _ingest_text_file(path, source_result, options, stats, seen_hashes) {
+    let loaded = SECURE.read_text_prefix(path, MAX_TEXT_BYTES, false);
+    if not loaded.ok {
+        stats.rejected = stats.rejected + 1;
+        stats.read_failures = stats.read_failures + 1;
+        return;
+    }
+    stats.content_reads = stats.content_reads + 1;
+    let sanitized = DATA.sanitize_text(loaded.text);
+    let normalized = str_trim(sanitized.text);
+    let scan = POLICY.scan_text(normalized);
+    stats.redactions = stats.redactions + sanitized.redactions;
+    stats.files = stats.files + 1;
+    if not scan.passed {
+        stats.rejected = stats.rejected + 1;
+        stats.scan_rejected = stats.scan_rejected + 1;
+        return;
+    }
+    let declared_format = _declared_format(path);
+    if declared_format == nil {
+        stats.rejected = stats.rejected + 1;
+        stats.unsupported_formats = stats.unsupported_formats + 1;
+        return;
+    }
+    stats.extraction_attempts = stats.extraction_attempts + 1;
+    let extraction = EXTRACT.extract(normalized, declared_format,
+        map{ chunk_target_chars: 6000 });
+    if not extraction.ok or not extraction.complete or len(extraction.chunks) < 1 {
+        stats.rejected = stats.rejected + 1;
+        stats.extraction_rejected = stats.extraction_rejected + 1;
+        stats.last_extraction_error = try extraction.error_code catch "extraction-failed";
+        return;
+    }
+    let record = _record_spec(source_result.source.source_id, loaded.text, normalized,
+        loaded, extraction, declared_format);
+    record.secret_scan = scan.secret_scan;
+    record.pii_scan = scan.pii_scan;
+    record.poisoning_scan = scan.poisoning_scan;
+    if not POLICY.dataset_admission([source_result.source], [record], options).passed
+        or _seen(seen_hashes, record.normalized_sha256) {
+        stats.rejected = stats.rejected + 1;
+        if _seen(seen_hashes, record.normalized_sha256) { stats.duplicates = stats.duplicates + 1; }
+        return;
+    }
+    let admission = POLICY.dataset_admission([source_result.source], [record], options);
+    let envelopes = _chunk_envelopes(source_result, extraction);
+    let stored = LM.remember_admitted_batch(envelopes, admission);
+    if not stored.ok {
+        if stored.status == "corpus-full" { stats.overflow = stats.overflow + 1; }
+        else { stats.write_failures = stats.write_failures + 1; }
+        stats.status = stored.status;
+        return;
+    }
+    push(seen_hashes, record.normalized_sha256);
+    stats.chunks = stats.chunks + len(envelopes);
+    stats.sections = stats.sections + extraction.section_count;
+    stats.extracted_files = stats.extracted_files + 1;
+    stats.admitted = stats.admitted + 1;
+    if loaded.truncated { stats.truncated = stats.truncated + 1; }
+}
+
+fn _walk(path, depth, source_result, options, stats, seen_hashes) {
+    if stats.files >= stats.max_files or depth > stats.max_depth { return; }
+    if _unsafe_path(path) { stats.skipped = stats.skipped + 1; return; }
+    let listed = SECURE.list_directory(path, MAX_DIRECTORY_ENTRIES);
+    if listed.ok {
+        let i = 0;
+        while i < len(listed.entries) and stats.files < stats.max_files {
+            let item = listed.entries[i];
+            if _skip_component(item) { stats.skipped = stats.skipped + 1; }
+            else { _walk(_join(path, item), depth + 1, source_result, options, stats, seen_hashes); }
+            i = i + 1;
+        }
+        return;
+    }
+    if not DATA.text_like(path) or _declared_format(path) == nil {
+        stats.files = stats.files + 1;
+        stats.metadata = stats.metadata + 1;
+        stats.skipped = stats.skipped + 1;
+        if DATA.text_like(path) { stats.unsupported_formats = stats.unsupported_formats + 1; }
+        return;
+    }
+    _ingest_text_file(path, source_result, options, stats, seen_hashes);
+}
+
+fn _rejected(source_result, before, status) {
+    return map{
+        format: "pbai.ingest.v2", ok: false, status: status,
+        source_admission: _public_source_admission(source_result),
+        content_read: false, training_performed: false,
+        live_before: before, live_after: before, checkpoint: nil
+    };
+}
+
+// Build a fresh policy record rather than attaching the caller's filesystem
+// locator to the caller-owned map. Unknown fields remain non-authoritative, as
+// before, while every field understood by the dataset policy is copied by
+// value into this request-local record.
+fn _source_with_locator(source, path) {
+    let out = map{ locator: path };
+    let known = [
+        "source_id", "source_kind", "discovery_mode", "owner_scope",
+        "acquisition_grant_id", "consent_status", "consent_scope",
+        "rights_status", "license_id", "training_allowed", "training_requested",
+        "retrieval_allowed", "retrieval_requested", "retrieval_use_grant_id",
+        "retrieval_use_scope", "retrieval_audience", "retrieval_purpose",
+        "trust_tier", "collected_at", "locator_token"
+    ];
+    let i = 0;
+    while i < len(known) {
+        if map_has(source, known[i]) { out[known[i]] = source[known[i]]; }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn ingest_path(path, max_files = nil, max_depth = nil, epochs = 4, source = nil,
+    options = nil, train_after_ingest = false) {
+    if max_files == nil { max_files = MAX_FILES; }
+    if max_depth == nil { max_depth = MAX_DEPTH; }
+    let before = LM.live_stats();
+    if type(max_files) != "number" or max_files != num_floor(max_files)
+        or max_files < 1 or max_files > MAX_FILES
+        or type(max_depth) != "number" or max_depth != num_floor(max_depth)
+        or max_depth < 0 or max_depth > MAX_DEPTH
+        or type(epochs) != "number" or epochs != num_floor(epochs)
+        or epochs < 1 or epochs > 100 or type(train_after_ingest) != "bool" {
+        return _rejected(nil, before, "invalid-ingest-limits");
+    }
+    if source == nil or type(source) != "map" {
+        return _rejected(nil, before, "source-admission-required");
+    }
+    let source_spec = _source_with_locator(source, path);
+    let source_result = POLICY.source_admission(source_spec);
+    if not source_result.passed { return _rejected(source_result, before, "source-rejected"); }
+    if _unsafe_path(path) { return _rejected(source_result, before, "unsafe-path-rejected"); }
+    if options == nil or type(options) != "map" { options = map{}; }
+    let stats = map{
+        source_id: source_result.source.source_id,
+        locator_token: source_result.source.locator_token,
+        files: 0, chunks: 0, metadata: 0, redactions: 0, skipped: 0,
+        admitted: 0, rejected: 0, duplicates: 0, truncated: 0,
+        read_failures: 0, write_failures: 0, content_reads: 0, overflow: 0, status: "ok",
+        scan_rejected: 0, unsupported_formats: 0,
+        extraction_attempts: 0, extraction_rejected: 0,
+        extracted_files: 0, sections: 0, last_extraction_error: "",
+        max_files: max_files, max_depth: max_depth
+    };
+    let seen_hashes = [];
+    _walk(path, 0, source_result, options, stats, seen_hashes);
+    let ckpt = nil;
+    if stats.admitted > 0 and train_after_ingest { ckpt = LM.train_nano(epochs, 0.2); }
+    let after = LM.live_stats();
+    return map{
+        format: "pbai.ingest.v2", ok: stats.admitted > 0,
+        status: if stats.admitted > 0 { stats.status } else { "no-admitted-records" },
+        stats: stats, source_admission: _public_source_admission(source_result),
+        content_read: stats.content_reads > 0,
+        training_requested: train_after_ingest,
+        training_required: stats.admitted > 0 and ckpt == nil,
+        training_performed: ckpt != nil,
+        live_before: before, live_after: after,
+        checkpoint: if ckpt == nil { nil } else { map{
+            tier: ckpt.tier, format: ckpt.format,
+            loss_before: ckpt.metrics.loss_before, loss_after: ckpt.metrics.loss_after
+        } }
+    };
+}
+
+fn would_overflow(chunk) { return _would_overflow(chunk); }
+fn would_overflow_from_bytes(current_bytes, sample_bytes) {
+    if type(current_bytes) != "number" or current_bytes != num_floor(current_bytes)
+        or current_bytes < 0 or type(sample_bytes) != "number"
+        or sample_bytes != num_floor(sample_bytes) or sample_bytes < 0 {
+        return true;
+    }
+    // Include the fixed framing used by the live-corpus append path.
+    let framing_bytes = len(str_to_bytes("\n\n### learned sample\n\n"));
+    return current_bytes + sample_bytes + framing_bytes > LM.max_live_corpus_bytes();
+}
+fn max_corpus_bytes() { return LM.max_live_corpus_bytes(); }
+
+export ingest_path, would_overflow, would_overflow_from_bytes, max_corpus_bytes;

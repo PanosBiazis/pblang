@@ -1,0 +1,606 @@
+// stdlib/pbai_training_policy.sapp -- pure, bounded training-control advice for pbAI.
+//
+// This module does not admit data, inspect content, train, stop a worker, restore a
+// checkpoint, or persist anything. It plans whole-cluster dataset splits from already
+// reviewed opaque metadata and evaluates a complete validation-only metric prefix.
+
+let BOUNDED = import("stdlib:validate.sapp");
+
+let POLICY_VERSION = "pbai-training-policy-2026-08-28-bounded-v2";
+let MAX_RECORDS = 1024;
+let MAX_CLUSTERS = 512;
+let MAX_LABELS = 128;
+let MAX_HISTORY = 2048;
+let MAX_ID_BYTES = 128;
+let MAX_LABEL_BYTES = 64;
+
+let OPTIONS_BOUNDS = map{
+    max_depth: 2, max_nodes: 32, max_map_entries: 9, max_array_items: 8,
+    max_string_chars: 128, max_string_bytes: 128,
+    max_total_string_bytes: 4096, max_key_chars: 64, max_key_bytes: 64
+};
+let RECORD_BOUNDS = map{
+    max_depth: 3, max_nodes: 8192, max_map_entries: 8, max_array_items: MAX_RECORDS,
+    max_string_chars: MAX_ID_BYTES, max_string_bytes: MAX_ID_BYTES,
+    max_total_string_bytes: 524288, max_key_chars: 32, max_key_bytes: 32
+};
+let PLAN_BOUNDS = map{
+    max_depth: 6, max_nodes: 16384, max_map_entries: 32, max_array_items: MAX_RECORDS,
+    max_string_chars: MAX_ID_BYTES, max_string_bytes: MAX_ID_BYTES,
+    max_total_string_bytes: 1048576, max_key_chars: 64, max_key_bytes: 64
+};
+let HISTORY_BOUNDS = map{
+    max_depth: 3, max_nodes: 32768, max_map_entries: 6, max_array_items: MAX_HISTORY,
+    max_string_chars: MAX_ID_BYTES, max_string_bytes: MAX_ID_BYTES,
+    max_total_string_bytes: 1048576, max_key_chars: 32, max_key_bytes: 32
+};
+
+fn _bounded(value, limits) { return BOUNDED.inspect_bounded(value, limits).ok; }
+
+fn _base_result(format) {
+    return map{
+        format: format, policy_version: POLICY_VERSION, ok: false,
+        authorizes_training: false, training_performed: false,
+        reads_content: false, persists: false, restores_checkpoint: false,
+        safe_for_public_logging: false
+    };
+}
+
+fn _failure(format, code) {
+    let out = _base_result(format);
+    out.reason = code;
+    return out;
+}
+
+fn _exact_keys(value, allowed) {
+    if type(value) != "map" { return false; }
+    let keys = map_keys(value);
+    if len(keys) != len(allowed) { return false; }
+    let i = 0;
+    while i < len(keys) {
+        let found = false;
+        let j = 0;
+        while j < len(allowed) {
+            if keys[i] == allowed[j] { found = true; }
+            j = j + 1;
+        }
+        if not found { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _allowed_keys(value, allowed) {
+    if type(value) != "map" { return false; }
+    let keys = map_keys(value);
+    let i = 0;
+    while i < len(keys) {
+        let found = false;
+        let j = 0;
+        while j < len(allowed) {
+            if keys[i] == allowed[j] { found = true; }
+            j = j + 1;
+        }
+        if not found { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _safe_ascii_id(value, maximum) {
+    if type(value) != "string" or value == "" or len(value) > maximum
+        or len(str_to_bytes(value)) > maximum or str_trim(value) != value
+        or str_contains(value, "..") { return false; }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        if not ((c >= 48 and c <= 57) or (c >= 65 and c <= 90)
+            or (c >= 97 and c <= 122) or c == 45 or c == 46
+            or c == 58 or c == 95) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _sha256_hex(value) {
+    if type(value) != "string" or len(value) != 64 { return false; }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        if not ((c >= 48 and c <= 57) or (c >= 97 and c <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+
+fn _finite_number(value, minimum, maximum) {
+    if type(value) != "number" { return false; }
+    let text = str_lower(str(value));
+    if str_contains(text, "nan") or str_contains(text, "inf") { return false; }
+    return value >= minimum and value <= maximum;
+}
+
+fn _lex_less(a, b) {
+    let n = len(a);
+    if len(b) < n { n = len(b); }
+    let i = 0;
+    while i < n {
+        let ac = strcharcodeat(a, i);
+        let bc = strcharcodeat(b, i);
+        if ac < bc { return true; }
+        if ac > bc { return false; }
+        i = i + 1;
+    }
+    return len(a) < len(b);
+}
+
+fn _merge_text(left, right) {
+    let out = [];
+    let i = 0;
+    let j = 0;
+    while i < len(left) and j < len(right) {
+        if _lex_less(right[j], left[i]) { push(out, right[j]); j = j + 1; }
+        else { push(out, left[i]); i = i + 1; }
+    }
+    while i < len(left) { push(out, left[i]); i = i + 1; }
+    while j < len(right) { push(out, right[j]); j = j + 1; }
+    return out;
+}
+
+fn _sort_text(values) {
+    if len(values) < 2 {
+        let copy = [];
+        if len(values) == 1 { push(copy, values[0]); }
+        return copy;
+    }
+    let middle = num_floor(len(values) / 2);
+    let left = [];
+    let right = [];
+    let i = 0;
+    while i < len(values) {
+        if i < middle { push(left, values[i]); } else { push(right, values[i]); }
+        i = i + 1;
+    }
+    return _merge_text(_sort_text(left), _sort_text(right));
+}
+
+fn _rank_less(a, b) {
+    if a.rank == b.rank { return _lex_less(a.cluster, b.cluster); }
+    return _lex_less(a.rank, b.rank);
+}
+
+fn _merge_ranked(left, right) {
+    let out = [];
+    let i = 0;
+    let j = 0;
+    while i < len(left) and j < len(right) {
+        if _rank_less(right[j], left[i]) { push(out, right[j]); j = j + 1; }
+        else { push(out, left[i]); i = i + 1; }
+    }
+    while i < len(left) { push(out, left[i]); i = i + 1; }
+    while j < len(right) { push(out, right[j]); j = j + 1; }
+    return out;
+}
+
+fn _sort_ranked(values) {
+    if len(values) < 2 {
+        let copy = [];
+        if len(values) == 1 { push(copy, values[0]); }
+        return copy;
+    }
+    let middle = num_floor(len(values) / 2);
+    let left = [];
+    let right = [];
+    let i = 0;
+    while i < len(values) {
+        if i < middle { push(left, values[i]); } else { push(right, values[i]); }
+        i = i + 1;
+    }
+    return _merge_ranked(_sort_ranked(left), _sort_ranked(right));
+}
+
+fn _split_options(options) {
+    if options == nil { options = map{}; }
+    if not _allowed_keys(options, ["seed", "train_bp", "validation_bp", "test_bp"]) {
+        return map{ ok: false, reason: "invalid-options-schema" };
+    }
+    let seed = try options.seed catch "";
+    let train_bp = try options.train_bp catch 8000;
+    let validation_bp = try options.validation_bp catch 1000;
+    let test_bp = try options.test_bp catch 1000;
+    if not _safe_ascii_id(seed, MAX_ID_BYTES) { return map{ ok: false, reason: "invalid-seed" }; }
+    if not _integer(train_bp, 1, 9998) or not _integer(validation_bp, 1, 9998)
+        or not _integer(test_bp, 1, 9998) or train_bp + validation_bp + test_bp != 10000 {
+        return map{ ok: false, reason: "invalid-split-ratios" };
+    }
+    return map{ ok: true, seed: seed, train_bp: train_bp,
+        validation_bp: validation_bp, test_bp: test_bp };
+}
+
+fn plan_splits(records, options = nil) {
+    let format = "pbai.training.split-plan.v1";
+    if not _bounded(options, OPTIONS_BOUNDS) or not _bounded(records, RECORD_BOUNDS) {
+        return _failure(format, "split-input-bound-exceeded");
+    }
+    let config = _split_options(options);
+    if not config.ok { return _failure(format, config.reason); }
+    if type(records) != "array" or len(records) < 3 or len(records) > MAX_RECORDS {
+        return _failure(format, "invalid-record-count");
+    }
+
+    let record_by_id = map{};
+    let clusters = map{};
+    let labels = map{};
+    let record_ids = [];
+    let cluster_count = 0;
+    let label_count = 0;
+    let i = 0;
+    while i < len(records) {
+        let row = records[i];
+        if not _exact_keys(row, ["record_id", "label", "dedupe_cluster"]) {
+            return _failure(format, "invalid-record-schema");
+        }
+        let record_id = row.record_id;
+        let label = row.label;
+        let cluster = row.dedupe_cluster;
+        if not _safe_ascii_id(record_id, MAX_ID_BYTES)
+            or not _safe_ascii_id(cluster, MAX_ID_BYTES)
+            or not _safe_ascii_id(label, MAX_LABEL_BYTES) {
+            return _failure(format, "invalid-record-identifier");
+        }
+        if map_has(record_by_id, record_id) { return _failure(format, "duplicate-record-id"); }
+        record_by_id[record_id] = map{ record_id: record_id, label: label, dedupe_cluster: cluster };
+        push(record_ids, record_id);
+        if not map_has(clusters, cluster) {
+            cluster_count = cluster_count + 1;
+            if cluster_count > MAX_CLUSTERS { return _failure(format, "cluster-limit-exceeded"); }
+            clusters[cluster] = map{ label: label, record_ids: [] };
+        } elif clusters[cluster].label != label {
+            return _failure(format, "cluster-label-conflict");
+        }
+        push(clusters[cluster].record_ids, record_id);
+        if not map_has(labels, label) {
+            label_count = label_count + 1;
+            if label_count > MAX_LABELS { return _failure(format, "label-limit-exceeded"); }
+            labels[label] = [];
+        }
+        i = i + 1;
+    }
+
+    let cluster_ids = map_keys(clusters);
+    i = 0;
+    while i < len(cluster_ids) {
+        push(labels[clusters[cluster_ids[i]].label], cluster_ids[i]);
+        i = i + 1;
+    }
+    let label_ids = _sort_text(map_keys(labels));
+    let cluster_split = map{};
+    let class_support = [];
+    i = 0;
+    while i < len(label_ids) {
+        let label_id = label_ids[i];
+        let members = labels[label_id];
+        if len(members) < 3 { return _failure(format, "class-insufficient-clusters"); }
+        let ranked = [];
+        let j = 0;
+        while j < len(members) {
+            let cluster_id = members[j];
+            push(ranked, map{
+                cluster: cluster_id,
+                rank: sha256(POLICY_VERSION + "\x00split-rank\x00" + config.seed
+                    + "\x00" + label_id + "\x00" + cluster_id)
+            });
+            j = j + 1;
+        }
+        ranked = _sort_ranked(ranked);
+        let validation_clusters = num_floor(len(ranked) * config.validation_bp / 10000);
+        let test_clusters = num_floor(len(ranked) * config.test_bp / 10000);
+        if validation_clusters < 1 { validation_clusters = 1; }
+        if test_clusters < 1 { test_clusters = 1; }
+        let train_clusters = len(ranked) - validation_clusters - test_clusters;
+        if train_clusters < 1 { return _failure(format, "class-insufficient-clusters"); }
+        j = 0;
+        while j < len(ranked) {
+            let split = "train";
+            if j < validation_clusters { split = "validation"; }
+            elif j < validation_clusters + test_clusters { split = "test"; }
+            cluster_split[ranked[j].cluster] = split;
+            j = j + 1;
+        }
+        push(class_support, map{
+            label_token: sha256(POLICY_VERSION + "\x00label\x00" + config.seed + "\x00" + label_id),
+            clusters: len(ranked), train_clusters: train_clusters,
+            validation_clusters: validation_clusters, test_clusters: test_clusters,
+            exact_record_balance_claimed: false
+        });
+        i = i + 1;
+    }
+
+    record_ids = _sort_text(record_ids);
+    let canonical_records = [];
+    let assignments = [];
+    let train_records = 0;
+    let validation_records = 0;
+    let test_records = 0;
+    i = 0;
+    while i < len(record_ids) {
+        let row = record_by_id[record_ids[i]];
+        let split = cluster_split[row.dedupe_cluster];
+        push(canonical_records, map{ record_id: row.record_id, label: row.label,
+            dedupe_cluster: row.dedupe_cluster });
+        push(assignments, map{ record_id: row.record_id, split: split });
+        if split == "train" { train_records = train_records + 1; }
+        elif split == "validation" { validation_records = validation_records + 1; }
+        else { test_records = test_records + 1; }
+        i = i + 1;
+    }
+    let input_digest = sha256(POLICY_VERSION + "\x00manifest\x00" + json_stringify(canonical_records));
+    let seed_digest = sha256(POLICY_VERSION + "\x00seed\x00" + config.seed);
+    let plan_payload = map{
+        format: format, policy_version: POLICY_VERSION,
+        input_digest: input_digest, seed_digest: seed_digest,
+        ratios_bp: map{ train: config.train_bp, validation: config.validation_bp, test: config.test_bp },
+        assignments: assignments
+    };
+    let out = _base_result(format);
+    out.ok = true;
+    out.reason = "planned";
+    out.input_digest = input_digest;
+    out.seed_digest = seed_digest;
+    out.plan_digest = sha256(json_stringify(plan_payload));
+    out.ratios_bp = plan_payload.ratios_bp;
+    out.assignments = assignments;
+    out.records = len(assignments);
+    out.clusters = cluster_count;
+    out.labels = label_count;
+    out.record_counts = map{ train: train_records, validation: validation_records, test: test_records };
+    out.class_support = class_support;
+    out.group_aware = true;
+    out.input_order_independent = true;
+    out.exact_record_balance_claimed = false;
+    out.cluster_claims_verified_from_content = false;
+    out.digest_authenticated = false;
+    out.adversarial_seed_grinding_resistant = false;
+    out.requires_post_freeze_operator_seed = true;
+    out.requires_fresh_dataset_admission = true;
+    out.test_split_designated = true;
+    out.test_split_enforced = false;
+    out.test_membership_hidden = false;
+    return out;
+}
+
+fn _assignments_match(supplied, expected) {
+    if type(supplied) != "array" or len(supplied) != len(expected)
+        or len(supplied) > MAX_RECORDS { return false; }
+    let seen = map{};
+    let i = 0;
+    while i < len(supplied) {
+        let row = supplied[i];
+        if not _exact_keys(row, ["record_id", "split"])
+            or not _safe_ascii_id(row.record_id, MAX_ID_BYTES)
+            or (row.split != "train" and row.split != "validation" and row.split != "test")
+            or map_has(seen, row.record_id) { return false; }
+        seen[row.record_id] = true;
+        if row.record_id != expected[i].record_id or row.split != expected[i].split {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _ratios_match(supplied, expected) {
+    return _exact_keys(supplied, ["train", "validation", "test"])
+        and _integer(supplied.train, 1, 9998)
+        and _integer(supplied.validation, 1, 9998)
+        and _integer(supplied.test, 1, 9998)
+        and supplied.train + supplied.validation + supplied.test == 10000
+        and supplied.train == expected.train
+        and supplied.validation == expected.validation
+        and supplied.test == expected.test;
+}
+
+fn validate_split_plan(records, plan, options = nil) {
+    let format = "pbai.training.split-validation.v1";
+    if not _bounded(options, OPTIONS_BOUNDS) or not _bounded(records, RECORD_BOUNDS)
+        or not _bounded(plan, PLAN_BOUNDS) {
+        return _failure(format, "plan-input-bound-exceeded");
+    }
+    let expected = plan_splits(records, options);
+    if not expected.ok or type(plan) != "map" { return _failure(format, "plan-validation-failed"); }
+    let supplied_digest = try plan.plan_digest catch "";
+    let supplied_format = try plan.format catch "";
+    let supplied_version = try plan.policy_version catch "";
+    let supplied_input = try plan.input_digest catch "";
+    let supplied_seed = try plan.seed_digest catch "";
+    let supplied_ratios = try plan.ratios_bp catch nil;
+    let supplied_assignments = try plan.assignments catch nil;
+    if not _sha256_hex(supplied_digest)
+        or supplied_format != expected.format or supplied_version != expected.policy_version
+        or supplied_input != expected.input_digest or supplied_seed != expected.seed_digest
+        or not _ratios_match(supplied_ratios, expected.ratios_bp)
+        or not _assignments_match(supplied_assignments, expected.assignments)
+        or not constant_time_eq(expected.plan_digest, supplied_digest) {
+        return _failure(format, "plan-validation-failed");
+    }
+    let out = _base_result(format);
+    out.ok = true;
+    out.reason = "current-metadata-match";
+    out.plan_digest = expected.plan_digest;
+    out.input_digest = expected.input_digest;
+    out.authenticated = false;
+    out.assignment_payload_recomputed = true;
+    out.requires_fresh_dataset_admission = true;
+    return out;
+}
+
+fn _early_options(options) {
+    if options == nil { options = map{}; }
+    if not _allowed_keys(options, ["metric", "patience", "warmup", "min_delta"]) {
+        return map{ ok: false, reason: "invalid-options-schema" };
+    }
+    let metric = try options.metric catch "validation_loss";
+    let patience = try options.patience catch 5;
+    let warmup = try options.warmup catch 0;
+    let min_delta = try options.min_delta catch 0.0;
+    if metric != "validation_loss" and metric != "validation_accuracy" {
+        return map{ ok: false, reason: "unsupported-validation-metric" };
+    }
+    if not _integer(patience, 1, 1000) or not _integer(warmup, 0, MAX_HISTORY)
+        or not _finite_number(min_delta, 0, 1000000) {
+        return map{ ok: false, reason: "invalid-early-stop-config" };
+    }
+    return map{ ok: true, metric: metric, patience: patience,
+        warmup: warmup, min_delta: min_delta,
+        direction: if metric == "validation_loss" { "minimize" } else { "maximize" } };
+}
+
+fn evaluate_early_stopping(history, options = nil) {
+    let format = "pbai.training.early-stop-advice.v1";
+    if not _bounded(options, OPTIONS_BOUNDS) {
+        return _failure(format, "history-input-bound-exceeded");
+    }
+    let history_bound = BOUNDED.inspect_bounded(history, HISTORY_BOUNDS);
+    if not history_bound.ok {
+        if history_bound.reason == "nonfinite-number" {
+            return _failure(format, "invalid-metric-value");
+        }
+        return _failure(format, "history-input-bound-exceeded");
+    }
+    let config = _early_options(options);
+    if not config.ok { return _failure(format, config.reason); }
+    if type(history) != "array" or len(history) < 1 or len(history) > MAX_HISTORY {
+        return _failure(format, "invalid-history-count");
+    }
+    let canonical = [];
+    let run_id = "";
+    let plan_digest = "";
+    let i = 0;
+    while i < len(history) {
+        let row = history[i];
+        if not _exact_keys(row, ["run_id", "plan_digest", "metric", "split", "step", "value"]) {
+            return _failure(format, "invalid-history-schema");
+        }
+        if not _safe_ascii_id(row.run_id, MAX_ID_BYTES) or not _sha256_hex(row.plan_digest)
+            or row.metric != config.metric or row.split != "validation"
+            or not _integer(row.step, 0, MAX_HISTORY - 1) or row.step != i {
+            return _failure(format, "invalid-validation-history");
+        }
+        if config.metric == "validation_loss" {
+            if not _finite_number(row.value, 0, 1000000000) {
+                return _failure(format, "invalid-metric-value");
+            }
+        } elif not _finite_number(row.value, 0, 1) {
+            return _failure(format, "invalid-metric-value");
+        }
+        if i == 0 { run_id = row.run_id; plan_digest = row.plan_digest; }
+        if row.run_id != run_id or row.plan_digest != plan_digest {
+            return _failure(format, "mixed-history-binding");
+        }
+        push(canonical, map{ run_id: row.run_id, plan_digest: row.plan_digest,
+            metric: row.metric, split: row.split, step: row.step, value: row.value });
+        i = i + 1;
+    }
+
+    let best_value = canonical[0].value;
+    let best_step = 0;
+    let anchor_value = canonical[0].value;
+    let anchor_step = 0;
+    let bad_count = 0;
+    let should_stop = false;
+    let stop_step = 0 - 1;
+    i = 1;
+    while i < len(canonical) and not should_stop {
+        let improved = false;
+        if config.direction == "minimize" {
+            improved = canonical[i].value < anchor_value - config.min_delta;
+            if canonical[i].value < best_value {
+                best_value = canonical[i].value;
+                best_step = canonical[i].step;
+            }
+        } else {
+            improved = canonical[i].value > anchor_value + config.min_delta;
+            if canonical[i].value > best_value {
+                best_value = canonical[i].value;
+                best_step = canonical[i].step;
+            }
+        }
+        if improved {
+            anchor_value = canonical[i].value;
+            anchor_step = canonical[i].step;
+            bad_count = 0;
+        } elif canonical[i].step >= config.warmup {
+            bad_count = bad_count + 1;
+        }
+        if canonical[i].step >= config.warmup and bad_count >= config.patience {
+            should_stop = true;
+            stop_step = canonical[i].step;
+        }
+        i = i + 1;
+    }
+    let history_digest = sha256(POLICY_VERSION + "\x00history\x00" + json_stringify(canonical)
+        + "\x00" + json_stringify(map{ metric: config.metric, patience: config.patience,
+            warmup: config.warmup, min_delta: config.min_delta }));
+    let out = _base_result(format);
+    out.ok = true;
+    out.reason = if should_stop { "patience-exhausted" } else { "continue" };
+    out.metric = config.metric;
+    out.direction = config.direction;
+    out.should_stop = should_stop;
+    out.stop_step = stop_step;
+    out.best_step = best_step;
+    out.best_value = best_value;
+    out.policy_anchor_step = anchor_step;
+    out.policy_anchor_value = anchor_value;
+    out.bad_count = bad_count;
+    out.observations_considered = i;
+    out.patience = config.patience;
+    out.warmup = config.warmup;
+    out.min_delta = config.min_delta;
+    out.run_digest = sha256(POLICY_VERSION + "\x00run\x00" + run_id);
+    out.plan_digest = plan_digest;
+    out.history_digest = history_digest;
+    out.advisory_only = true;
+    out.plan_binding_consistent_only = true;
+    out.plan_binding_authenticated = false;
+    out.checkpoint_authorized = false;
+    out.test_metrics_consumed = false;
+    return out;
+}
+
+fn status() {
+    return map{
+        format: "pbai.training.policy-status.v1", policy_version: POLICY_VERSION, ok: true,
+        implementation_language: "pblang", pure_in_memory: true,
+        deterministic_group_split_available: true,
+        input_order_independent: true, whole_cluster_assignment: true,
+        split_digest_authenticated: false,
+        adversarial_seed_grinding_resistant: false,
+        requires_post_freeze_operator_seed: true,
+        cluster_claims_verified_from_content: false,
+        requires_fresh_dataset_admission: true,
+        validation_only_early_stopping: true,
+        test_split_designated: true, test_split_enforced: false,
+        test_membership_hidden: false,
+        early_stopping_advisory_only: true,
+        early_stop_plan_binding_authenticated: false,
+        shared_pblang_bounded_value_validation: true,
+        pre_enumeration_map_width_gate: true,
+        post_materialization_only: true,
+        trusted_local_api_only: true,
+        outer_serialized_request_bound_enforced: false,
+        remote_exposure_ready: false,
+        authorizes_training: false, training_performed: false,
+        reads_content: false, persists: false, restores_checkpoint: false,
+        max_records: MAX_RECORDS, max_clusters: MAX_CLUSTERS,
+        max_labels: MAX_LABELS, max_history: MAX_HISTORY
+    };
+}
+
+export POLICY_VERSION, plan_splits, validate_split_plan,
+       evaluate_early_stopping, status;

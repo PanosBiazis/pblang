@@ -1,0 +1,165 @@
+// Privacy-safe, bounded projection of pbAI runtime metadata into a renderer-neutral graph.
+// This module never retains prompts, answers, memory content, payloads, paths, or effects.
+
+let FORMAT = "pbai.visualization.v1";
+let MAX_ROLES = 64;
+let MAX_NODES = 128;
+let MAX_EDGES = 256;
+
+fn _token(value, name) {
+    if type(value) != "string" or value == "" or len(value) > 64 {
+        throw "pbai_visualizer: invalid " + name;
+    }
+    if not regex_match(value, "^[A-Za-z0-9_:-]+$") { throw "pbai_visualizer: invalid " + name; }
+    return value;
+}
+
+fn _count(value, name, maximum = 1000000) {
+    if type(value) != "number" or value != num_floor(value) or value < 0 or value > maximum {
+        throw "pbai_visualizer: invalid " + name;
+    }
+    return value;
+}
+
+fn _bool(value, name) {
+    if type(value) != "bool" { throw "pbai_visualizer: invalid " + name; }
+    return value;
+}
+
+fn _node(id, kind, group, status, metrics = nil) {
+    if metrics == nil { metrics = map{}; }
+    if type(metrics) != "map" or len(map_keys(metrics)) > 16 {
+        throw "pbai_visualizer: invalid node metrics";
+    }
+    let clean = map{};
+    for key in map_keys(metrics) {
+        let name = _token(str(key), "metric name");
+        let value = metrics[key];
+        if type(value) == "bool" { clean[name] = value; }
+        else { clean[name] = _count(value, "metric value"); }
+    }
+    return map{format:"pbai.visualization.node.v1", id:_token(id, "node id"),
+        kind:_token(kind, "node kind"), group:_token(group, "node group"),
+        status:_token(status, "node status"), metrics:clean};
+}
+
+fn _edge(from, to, relation) {
+    return map{format:"pbai.visualization.edge.v1", from:_token(from, "edge source"),
+        to:_token(to, "edge destination"), relation:_token(relation, "edge relation")};
+}
+
+fn _append_node(nodes, identities, node) {
+    if len(nodes) >= MAX_NODES { throw "pbai_visualizer: node limit exceeded"; }
+    if map_has(identities, node.id) { throw "pbai_visualizer: duplicate node id"; }
+    identities[node.id] = true; array_push(nodes, node);
+}
+
+fn _append_edge(edges, identities, edge, node_ids) {
+    if len(edges) >= MAX_EDGES { throw "pbai_visualizer: edge limit exceeded"; }
+    if not map_has(node_ids, edge.from) or not map_has(node_ids, edge.to) {
+        throw "pbai_visualizer: edge endpoint is missing";
+    }
+    let id = edge.from + "\n" + edge.to + "\n" + edge.relation;
+    if map_has(identities, id) { throw "pbai_visualizer: duplicate edge"; }
+    identities[id] = true; array_push(edges, edge);
+}
+
+fn _brain_nodes(loop, nodes, identities) {
+    if type(loop) != "map" or (try loop.format catch "") != "pbai.brain.loop.v1" {
+        throw "pbai_visualizer: invalid brain loop";
+    }
+    let perception = try loop.perception catch nil;
+    let plan = try loop.plan catch nil; let critique = try loop.critique catch nil;
+    let memory = try loop.memory catch nil; let agents = try loop.agents catch nil;
+    if type(perception) != "map" or type(plan) != "map" or type(critique) != "map"
+       or type(memory) != "map" or type(agents) != "map" {
+        throw "pbai_visualizer: incomplete brain metadata";
+    }
+    _append_node(nodes, identities, _node("stage:perception", "stage", "brain", "observed", map{
+        signal_count:_count(len(try perception.signals catch []), "signal count", 128),
+        modality_count:_count(len(try perception.modalities catch []), "modality count", 128),
+        needs_verification:_bool(try perception.needs_verification catch false, "verification flag")
+    }));
+    _append_node(nodes, identities, _node("stage:planning", "stage", "brain", "planned", map{
+        step_count:_count(len(try plan.steps catch []), "plan step count", 128),
+        tool_ready:_bool(try plan.tool_ready catch false, "tool-ready flag")
+    }));
+    _append_node(nodes, identities, _node("stage:critique", "stage", "brain", "reviewed", map{
+        risk_count:_count(len(try critique.risks catch []), "risk count", 128)
+    }));
+    let verification = try loop.verification catch nil;
+    let verification_status = "absent"; let verification_metrics = map{present:false, passed:false};
+    if verification != nil {
+        if type(verification) != "map" { throw "pbai_visualizer: invalid verification metadata"; }
+        let passed = _bool(try verification.passed catch false, "verification result");
+        verification_status = if passed { "passed" } else { "not-passed" };
+        verification_metrics = map{present:true, passed:passed};
+    }
+    _append_node(nodes, identities, _node("stage:verification", "stage", "brain",
+        verification_status, verification_metrics));
+    _append_node(nodes, identities, _node("stage:reflection", "stage", "brain", "reflected", map{
+        lesson_count:_count(len(try loop.reflection.lessons catch []), "lesson count", 128)
+    }));
+    _append_node(nodes, identities, _node("stage:memory", "stage", "brain", "summarized", map{
+        working:_count(try memory.working catch -1, "working memory count"),
+        episodic:_count(try memory.episodic catch -1, "episodic memory count"),
+        long_term:_count(try memory.long_term catch -1, "long-term memory count")
+    }));
+    _append_node(nodes, identities, _node("stage:agents", "stage", "brain", "described", map{
+        sub_agents:_count(len(try agents.sub_agents catch []), "sub-agent count", 64),
+        atomic_agents:_count(len(try agents.atomic_agents catch []), "atomic-agent count", 64),
+        sub_atomic_agents:_count(len(try agents.sub_atomic_agents catch []), "sub-atomic-agent count", 64)
+    }));
+}
+
+fn project(loop, registry) {
+    if type(registry) != "map" or (try registry.format catch "") != "pbai.role.registry.v1"
+       or type(try registry.roles catch nil) != "array" or len(registry.roles) > MAX_ROLES {
+        throw "pbai_visualizer: invalid role registry";
+    }
+    let nodes = []; let edges = []; let node_ids = map{}; let edge_ids = map{};
+    _brain_nodes(loop, nodes, node_ids);
+    let flow = ["stage:perception", "stage:planning", "stage:critique", "stage:verification",
+        "stage:reflection", "stage:memory", "stage:agents"];
+    let index = 1;
+    while index < len(flow) {
+        _append_edge(edges, edge_ids, _edge(flow[index - 1], flow[index], "next"), node_ids);
+        index = index + 1;
+    }
+
+    for role in registry.roles {
+        if type(role) != "map" or (try role.format catch "") != "pbai.role.descriptor.v1" {
+            throw "pbai_visualizer: invalid role descriptor";
+        }
+        let role_id = "role:" + _token(try role.id catch "", "role id");
+        let enabled = _bool(try role.message_enabled catch false, "message-enabled flag");
+        let protected_role = _bool(try role.protected catch false, "protected-role flag");
+        let sandboxed = _bool(try role.sandbox_enforced catch false, "sandbox flag");
+        let capabilities = try role.requested_capabilities catch nil;
+        if type(capabilities) != "array" or len(capabilities) > 16 {
+            throw "pbai_visualizer: invalid capability count";
+        }
+        _append_node(nodes, node_ids, _node(role_id, "specialist",
+            _token(try role.category catch "", "role category"),
+            _token(try role.implementation_status catch "", "role status"), map{
+                capability_count:len(capabilities), message_enabled:enabled,
+                protected:protected_role, sandbox_enforced:sandboxed
+            }));
+        _append_edge(edges, edge_ids, _edge("stage:agents", role_id, "describes"), node_ids);
+    }
+    return map{ok:true, format:FORMAT, nodes:nodes, edges:edges,
+        node_count:len(nodes), edge_count:len(edges), role_count:len(registry.roles),
+        contains_prompt:false, contains_answer:false, contains_memory_content:false,
+        contains_paths:false, contains_payloads:false, effects:false,
+        authorizes_action:false, activates_models:false, persists:false};
+}
+
+fn status() {
+    return map{ok:true, format:"pbai.visualization.status.v1", implementation_language:"pblang",
+        max_roles:MAX_ROLES, max_nodes:MAX_NODES, max_edges:MAX_EDGES,
+        aggregate_metadata_only:true, prompt_content:false, memory_content:false,
+        payload_content:false, paths:false, effects:false, rendering:false,
+        production_ready:false};
+}
+
+export FORMAT, MAX_ROLES, MAX_NODES, MAX_EDGES, project, status;

@@ -1,0 +1,945 @@
+// pbai_retrieval_index.sapp -- pure, bounded, section-aware local retrieval.
+//
+// This clean-room PBLang module consumes hostile in-memory source specs, record
+// metadata, and pbai_document_extract results. It performs no I/O, persistence,
+// training, model inference, execution, import resolution, or external action.
+
+let POLICY = (try import("pbai_dataset_policy.sapp") catch import("editors/ide/tools/ai/core/pbai_dataset_policy.sapp"));
+
+let INDEX_FORMAT = "pbai.retrieval.index.v1";
+let SEARCH_FORMAT = "pbai.retrieval.search.v1";
+let MAX_SOURCES = 16;
+let MAX_RECORDS = 64;
+let MAX_RECORD_BYTES = 24000;
+let MAX_TOTAL_BYTES = 1048576;
+let MAX_CHUNKS = 512;
+let MAX_SECTIONS = 1024;
+let MAX_TERMS_PER_CHUNK = 256;
+let MAX_TOKEN_BYTES = 64;
+let MAX_UNIQUE_TERMS = 8192;
+let MAX_POSTINGS = 65536;
+let MAX_QUERY_CHARS = 1024;
+let MAX_QUERY_BYTES = 2048;
+let MAX_QUERY_TOKENS = 64;
+let MAX_RESULTS = 5;
+let MAX_SNIPPET_CHARS = 360;
+let MAX_INDEX_OUTPUT_BYTES = 4194304;
+let MAX_SEARCH_OUTPUT_BYTES = 32768;
+let _SEAL_KEY = base64_encode_bytes(random_bytes(32));
+
+fn _negative_flags(out) {
+    out.contains_content = true;
+    out.safe_for_public_logging = false;
+    out.persisted = false;
+    out.training_performed = false;
+    out.executes = false;
+    out.authorizes_action = false;
+    out.authorizes_training = false;
+    return out;
+}
+
+fn _error(format, code) {
+    let out = map{ format: format, ok: false, complete: false,
+        error_code: code, contains_content: false,
+        safe_for_public_logging: true, persisted: false,
+        training_performed: false, executes: false,
+        authorizes_action: false, authorizes_training: false };
+    return out;
+}
+
+fn _bool_field(value, key, wanted) {
+    if type(value) != "map" or not map_has(value, key) { return false; }
+    return type(value[key]) == "bool" and value[key] == wanted;
+}
+
+fn _forbidden_codepoint(c) {
+    if c == 9 or c == 10 or c == 13 { return false; }
+    return c < 32 or (c >= 127 and c <= 159)
+        or c == 1564 or (c >= 8203 and c <= 8207)
+        or (c >= 8234 and c <= 8238) or c == 8288
+        or (c >= 8294 and c <= 8297) or c == 65279;
+}
+
+fn _control_free(value) {
+    if type(value) != "string" { return false; }
+    let i = 0;
+    while i < len(value) {
+        if _forbidden_codepoint(strcharcodeat(value, i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _safe_id(value) {
+    if type(value) != "string" or value == "" or len(value) > 128
+        or len(str_to_bytes(value)) > 128 { return false; }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        if not ((c >= 48 and c <= 57) or (c >= 65 and c <= 90)
+            or (c >= 97 and c <= 122) or c == 45 or c == 46
+            or c == 58 or c == 95) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _sha256_hex(value) {
+    if type(value) != "string" or len(value) != 64 { return false; }
+    let i = 0;
+    while i < len(value) {
+        let c = strcharcodeat(value, i);
+        if not ((c >= 48 and c <= 57) or (c >= 97 and c <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _opaque_token(value, prefix) {
+    if type(value) != "string" or not str_starts_with(value, prefix) { return false; }
+    return _sha256_hex(str_slice(value, len(prefix), len(value)));
+}
+
+fn _contains(values, wanted) {
+    let i = 0;
+    while i < len(values) {
+        if values[i] == wanted { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _word_codepoint(c) {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 90)
+        or (c >= 97 and c <= 122) or c == 45 or c == 95 or c >= 160;
+}
+
+fn _tokens(text, maximum) {
+    if type(text) != "string" or not _control_free(text) {
+        return map{ valid: false, values: [] };
+    }
+    let lowered = str_lower(text);
+    let values = [];
+    let current = "";
+    let i = 0;
+    while i <= len(lowered) {
+        let word = false;
+        if i < len(lowered) { word = _word_codepoint(strcharcodeat(lowered, i)); }
+        if word {
+            current = current + str_slice(lowered, i, i + 1);
+            if len(current) > MAX_TOKEN_BYTES
+                or len(str_to_bytes(current)) > MAX_TOKEN_BYTES {
+                return map{ valid: false, values: [] };
+            }
+        } elif current != "" {
+            if not _contains(values, current) { push(values, current); }
+            current = "";
+            if len(values) > maximum { return map{ valid: false, values: [] }; }
+        }
+        i = i + 1;
+    }
+    return map{ valid: true, values: values };
+}
+
+fn _allowed_format(value) {
+    return value == "plain" or value == "markdown" or value == "json"
+        or value == "csv" or value == "pblang-source";
+}
+
+fn _allowed_section(format, kind, level, index) {
+    if type(kind) != "string" or len(kind) > 32
+        or len(str_to_bytes(kind)) > 32
+        or type(level) != "number" or level != num_floor(level)
+        or level < 0 or level > 6 { return false; }
+    if format == "plain" {
+        return level == 0 and (kind == "paragraph" or kind == "plain-document");
+    }
+    if format == "markdown" {
+        if kind == "markdown-preamble" { return index == 0 and level == 0; }
+        return kind == "markdown-heading" and level >= 1 and level <= 6;
+    }
+    if format == "json" { return kind == "json-document" and level == 0; }
+    if format == "csv" { return kind == "csv-row-group" and level == 0; }
+    return format == "pblang-source" and kind == "pblang-lexical-region"
+        and level == 0;
+}
+
+fn _token(nonce, domain, value) {
+    return domain + "-" + sha256("pbai-retrieval-v1\x00" + nonce
+        + "\x00" + domain + "\x00" + value);
+}
+
+fn _build_options(options) {
+    if type(options) != "map" { return map{ valid: false }; }
+    let audience = try options.audience catch "";
+    let purpose = try options.purpose catch "";
+    let sealed = try options.sealed_eval_hashes catch [];
+    if type(audience) != "string" or type(purpose) != "string"
+        or len(audience) > 32 or len(purpose) > 32
+        or not _control_free(audience) or not _control_free(purpose)
+        or type(sealed) != "array" or len(sealed) > 128 {
+        return map{ valid: false };
+    }
+    let audience_ok = audience == "local-private" or audience == "household-subject"
+        or audience == "organization-internal" or audience == "public";
+    let purpose_ok = purpose == "local-assistance" or purpose == "private-research"
+        or purpose == "organization-reference" or purpose == "public-reference";
+    if not audience_ok or not purpose_ok { return map{ valid: false }; }
+    let i = 0;
+    while i < len(sealed) {
+        if not _sha256_hex(sealed[i]) { return map{ valid: false }; }
+        i = i + 1;
+    }
+    return map{ valid: true, audience: audience, purpose: purpose, sealed: sealed };
+}
+
+fn _sources(source_specs, config, nonce) {
+    if type(source_specs) != "array" or len(source_specs) < 1
+        or len(source_specs) > MAX_SOURCES { return map{ valid: false }; }
+    let results = [];
+    let ids = [];
+    let i = 0;
+    while i < len(source_specs) {
+        let admission = POLICY.retrieval_source_admission(source_specs[i]);
+        if not admission.passed or admission.authorizes_training
+            or admission.source.retrieval_audience != config.audience
+            or admission.source.retrieval_purpose != config.purpose
+            or _contains(ids, admission.source.source_id) {
+            return map{ valid: false };
+        }
+        push(ids, admission.source.source_id);
+        push(results, map{ internal_id: admission.source.source_id,
+            token: _token(nonce, "src", admission.source.source_id),
+            audience: config.audience, purpose: config.purpose });
+        i = i + 1;
+    }
+    return map{ valid: true, values: results };
+}
+
+fn _find_source(sources, source_id) {
+    let i = 0;
+    while i < len(sources) {
+        if sources[i].internal_id == source_id { return sources[i]; }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _section_profiles(content, extraction, nonce, source_token, record_token) {
+    let section_count = try extraction.section_count catch -1;
+    if type(section_count) != "number" or section_count != num_floor(section_count)
+        or section_count < 1 or section_count > 64
+        or type(try extraction.sections catch nil) != "array"
+        or len(extraction.sections) < 1 or len(extraction.sections) > 64
+        or section_count != len(extraction.sections) {
+        return map{ valid: false };
+    }
+    let out = [];
+    let declared_format = try extraction.declared_format catch "";
+    let previous_finish = 0;
+    let i = 0;
+    while i < len(extraction.sections) {
+        let section = extraction.sections[i];
+        let start = try section.start_char catch -1;
+        let finish = try section.end_char catch -1;
+        let kind = try section.kind catch "";
+        let level = try section.level catch -1;
+        if type(section) != "map" or (try section.index catch -1) != i
+            or type(start) != "number" or type(finish) != "number"
+            or start != num_floor(start) or finish != num_floor(finish)
+            or start < 0 or finish <= start or finish > len(content)
+            or (try section.char_count catch -1) != finish - start
+            or not _allowed_section(declared_format, kind, level, i)
+            or not _bool_field(section, "title_returned", false)
+            or (try section.content_digest catch "")
+                != sha256(str_slice(content, start, finish)) {
+            return map{ valid: false };
+        }
+        if declared_format == "markdown" or declared_format == "pblang-source" {
+            if start != previous_finish { return map{ valid: false }; }
+        } elif declared_format == "plain" and start < previous_finish {
+            return map{ valid: false };
+        } elif declared_format == "json" {
+            if section_count != 1 or start != 0 or finish != len(content) {
+                return map{ valid: false };
+            }
+        } elif declared_format == "csv"
+            and (start != 0 or finish != len(content)) {
+            return map{ valid: false };
+        }
+        push(out, map{ index: i, start: start, finish: finish,
+            token: _token(nonce, "sec", source_token + "\x00" + record_token
+                + "\x00" + str(i) + "\x00" + section.content_digest) });
+        previous_finish = finish;
+        i = i + 1;
+    }
+    if (declared_format == "markdown" or declared_format == "pblang-source")
+        and previous_finish != len(content) { return map{ valid: false }; }
+    return map{ valid: true, values: out };
+}
+
+fn _record(record, source, config, nonce, seen_hashes, global_terms,
+           total_postings, total_chunks, total_sections, total_bytes) {
+    if type(record) != "map" or source == nil { return map{ valid: false }; }
+    let record_id = try record.record_id catch "";
+    let source_id = try record.source_id catch "";
+    let raw_hash = try record.raw_sha256 catch "";
+    let normalized_hash = try record.normalized_sha256 catch "";
+    let normalized_chars = try record.normalized_chars catch -1;
+    let normalized_bytes = try record.normalized_bytes catch -1;
+    let extraction = try record.extraction catch nil;
+    if not _safe_id(record_id) or source_id != source.internal_id
+        or not _sha256_hex(raw_hash) or not _sha256_hex(normalized_hash)
+        or _contains(seen_hashes, normalized_hash)
+        or type(normalized_chars) != "number" or type(normalized_bytes) != "number"
+        or normalized_chars != num_floor(normalized_chars)
+        or normalized_bytes != num_floor(normalized_bytes)
+        or normalized_chars < 1 or normalized_chars > MAX_RECORD_BYTES
+        or normalized_bytes < 1 or normalized_bytes > MAX_RECORD_BYTES
+        or (try record.retrieval_use catch "") != "retrieval"
+        or (try record.secret_scan catch "") != "passed"
+        or (try record.pii_scan catch "") != "passed"
+        or (try record.poisoning_scan catch "") != "passed"
+        or (try record.quality_status catch "") != "passed"
+        or not _bool_field(record, "eval_overlap", false)
+        or _contains(config.sealed, normalized_hash)
+        or type(extraction) != "map" {
+        return map{ valid: false };
+    }
+    let chunk_count = try extraction.chunk_count catch -1;
+    let section_count = try extraction.section_count catch -1;
+    if (try extraction.format catch "") != "pbai.document-extraction.v1"
+        or not _bool_field(extraction, "ok", true)
+        or not _bool_field(extraction, "complete", true)
+        or not _bool_field(extraction, "contains_content", true)
+        or not _bool_field(extraction, "safe_for_public_logging", false)
+        or not _bool_field(extraction, "persisted", false)
+        or not _bool_field(extraction, "training_performed", false)
+        or not _bool_field(extraction, "executed", false)
+        or not _bool_field(extraction, "links_followed", false)
+        or not _bool_field(extraction, "imports_resolved", false)
+        or not _bool_field(extraction, "authorizes_action", false)
+        or not _bool_field(extraction, "output_bounded", true)
+        or (try extraction.extractor catch "") != "pblang-native-document-extractor-v1"
+        or not _allowed_format(try extraction.declared_format catch "")
+        or (try extraction.input_digest catch "") != raw_hash
+        or (try extraction.normalized_digest catch "") != normalized_hash
+        or (try extraction.normalized_chars catch -1) != normalized_chars
+        or (try extraction.normalized_bytes catch -1) != normalized_bytes
+        or type(try extraction.chunks catch nil) != "array"
+        or len(extraction.chunks) < 1 or len(extraction.chunks) > 16
+        or type(chunk_count) != "number" or chunk_count != num_floor(chunk_count)
+        or chunk_count != len(extraction.chunks)
+        or type(section_count) != "number" or section_count != num_floor(section_count)
+        or section_count < 1 or section_count > 64 {
+        return map{ valid: false };
+    }
+    if total_chunks + len(extraction.chunks) > MAX_CHUNKS
+        or total_sections + section_count > MAX_SECTIONS
+        or total_bytes + normalized_bytes > MAX_TOTAL_BYTES {
+        return map{ valid: false };
+    }
+    let parts = [];
+    let offset = 0;
+    let i = 0;
+    while i < len(extraction.chunks) {
+        let chunk = extraction.chunks[i];
+        let text = try chunk.text catch nil;
+        if type(chunk) != "map" or type(text) != "string"
+            or len(text) > MAX_RECORD_BYTES or len(str_to_bytes(text)) > MAX_RECORD_BYTES
+            or not _control_free(text) or (try chunk.index catch -1) != i
+            or (try chunk.start_char catch -1) != offset
+            or (try chunk.end_char catch -1) != offset + len(text)
+            or (try chunk.char_count catch -1) != len(text)
+            or (try chunk.byte_count catch -1) != len(str_to_bytes(text))
+            or (try chunk.content_digest catch "") != sha256(text) {
+            return map{ valid: false };
+        }
+        push(parts, text);
+        offset = offset + len(text);
+        i = i + 1;
+    }
+    let content = str_join(parts, "");
+    if offset != normalized_chars or len(str_to_bytes(content)) != normalized_bytes
+        or sha256(content) != normalized_hash
+        or not POLICY.scan_text(content).passed {
+        return map{ valid: false };
+    }
+    let record_token = _token(nonce, "rec", source.token + "\x00" + record_id
+        + "\x00" + normalized_hash);
+    let sections = _section_profiles(content, extraction, nonce, source.token, record_token);
+    if not sections.valid { return map{ valid: false }; }
+    let entries = [];
+    i = 0;
+    while i < len(extraction.chunks) {
+        let chunk = extraction.chunks[i];
+        let terms = _tokens(chunk.text, MAX_TERMS_PER_CHUNK);
+        if not terms.valid or len(terms.values) < 1
+            or total_postings + len(terms.values) > MAX_POSTINGS {
+            return map{ valid: false };
+        }
+        let t = 0;
+        while t < len(terms.values) {
+            let term_key = "t:" + terms.values[t];
+            if not map_has(global_terms, term_key) {
+                if global_terms["@count"] >= MAX_UNIQUE_TERMS {
+                    return map{ valid: false };
+                }
+                global_terms[term_key] = true;
+                global_terms["@count"] = global_terms["@count"] + 1;
+            }
+            t = t + 1;
+        }
+        total_postings = total_postings + len(terms.values);
+        let section_tokens = [];
+        let s = 0;
+        while s < len(sections.values) {
+            if sections.values[s].start < chunk.end_char
+                and sections.values[s].finish > chunk.start_char {
+                push(section_tokens, sections.values[s].token);
+            }
+            s = s + 1;
+        }
+        if len(section_tokens) < 1 { return map{ valid: false }; }
+        push(entries, map{
+            format: "pbai.retrieval.index-entry.v1",
+            source_token: source.token, record_token: record_token,
+            chunk_token: _token(nonce, "chk", record_token + "\x00" + str(i)
+                + "\x00" + chunk.content_digest),
+            section_tokens: section_tokens,
+            kind: extraction.declared_format,
+            text: chunk.text, content_digest: chunk.content_digest,
+            terms: terms.values
+        });
+        i = i + 1;
+    }
+    push(seen_hashes, normalized_hash);
+    return map{ valid: true, entries: entries, postings: total_postings,
+        chunks: len(extraction.chunks), sections: len(sections.values),
+        bytes: normalized_bytes };
+}
+
+fn build(source_specs, records, options = nil) {
+    let config = _build_options(options);
+    if not config.valid { return _error(INDEX_FORMAT, "invalid-build-options"); }
+    if type(records) != "array" or len(records) < 1 or len(records) > MAX_RECORDS {
+        return _error(INDEX_FORMAT, "invalid-record-count");
+    }
+    let nonce = base64_encode_bytes(random_bytes(32));
+    let sources = _sources(source_specs, config, nonce);
+    if not sources.valid { return _error(INDEX_FORMAT, "source-admission-failed"); }
+    let entries = [];
+    let record_ids = [];
+    let seen_hashes = [];
+    let global_terms = map{ "@count": 0 };
+    let total_postings = 0;
+    let total_chunks = 0;
+    let total_sections = 0;
+    let total_bytes = 0;
+    let i = 0;
+    while i < len(records) {
+        let record_id = try records[i].record_id catch "";
+        let source_id = try records[i].source_id catch "";
+        if not _safe_id(record_id) or _contains(record_ids, record_id) {
+            return _error(INDEX_FORMAT, "record-admission-failed");
+        }
+        let validated = _record(records[i], _find_source(sources.values, source_id),
+            config, nonce, seen_hashes, global_terms, total_postings,
+            total_chunks, total_sections, total_bytes);
+        if not validated.valid { return _error(INDEX_FORMAT, "record-admission-failed"); }
+        push(record_ids, record_id);
+        let e = 0;
+        while e < len(validated.entries) { push(entries, validated.entries[e]); e = e + 1; }
+        total_postings = validated.postings;
+        total_chunks = total_chunks + validated.chunks;
+        total_sections = total_sections + validated.sections;
+        total_bytes = total_bytes + validated.bytes;
+        i = i + 1;
+    }
+    let out = map{ format: INDEX_FORMAT, ok: true, complete: true,
+        audience: config.audience, purpose: config.purpose,
+        source_count: len(sources.values), record_count: len(records),
+        entry_count: len(entries), section_count: total_sections,
+        content_bytes: total_bytes, unique_terms: global_terms["@count"],
+        postings: total_postings, entries: entries,
+        implementation_language: "pblang", ranking: "bounded-lexical-overlap-v1",
+        nonce_discarded: true,
+        provenance_authentication: "process-local-hmac-sha256-v1",
+        integrity_scheme: "process-local-hmac-sha256-v1" };
+    out = _negative_flags(out);
+    out.integrity_tag = hmac_sha256(_index_payload(out), _SEAL_KEY);
+    if len(str_to_bytes(json_stringify(out))) > MAX_INDEX_OUTPUT_BYTES {
+        return _error(INDEX_FORMAT, "index-output-cap-reached");
+    }
+    return out;
+}
+
+fn _same_array(a, b) {
+    if type(a) != "array" or type(b) != "array" or len(a) != len(b) { return false; }
+    let i = 0;
+    while i < len(a) { if a[i] != b[i] { return false; } i = i + 1; }
+    return true;
+}
+
+fn _canonical_entries(entries) {
+    let out = [];
+    let i = 0;
+    while i < len(entries) {
+        let entry = entries[i];
+        push(out, map{ format: entry.format,
+            source_token: entry.source_token, record_token: entry.record_token,
+            chunk_token: entry.chunk_token, section_tokens: entry.section_tokens,
+            kind: entry.kind, text: entry.text,
+            content_digest: entry.content_digest, terms: entry.terms });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _index_payload(index) {
+    return json_stringify(map{ format: index.format, ok: index.ok,
+        complete: index.complete, audience: index.audience, purpose: index.purpose,
+        source_count: index.source_count, record_count: index.record_count,
+        entry_count: index.entry_count, section_count: index.section_count,
+        content_bytes: index.content_bytes, unique_terms: index.unique_terms,
+        postings: index.postings, entries: _canonical_entries(index.entries),
+        implementation_language: index.implementation_language,
+        ranking: index.ranking, nonce_discarded: index.nonce_discarded,
+        provenance_authentication: index.provenance_authentication,
+        integrity_scheme: index.integrity_scheme,
+        contains_content: index.contains_content,
+        safe_for_public_logging: index.safe_for_public_logging,
+        persisted: index.persisted, training_performed: index.training_performed,
+        executes: index.executes, authorizes_action: index.authorizes_action,
+        authorizes_training: index.authorizes_training });
+}
+
+fn _term_shape(term) {
+    if type(term) != "string" or term == "" or len(term) > MAX_TOKEN_BYTES
+        or len(str_to_bytes(term)) > MAX_TOKEN_BYTES or not _control_free(term) {
+        return false;
+    }
+    let parsed = _tokens(term, 1);
+    return parsed.valid and len(parsed.values) == 1 and parsed.values[0] == term;
+}
+
+fn _validate_index(index, audience, purpose) {
+    let source_count = try index.source_count catch -1;
+    let record_count = try index.record_count catch -1;
+    let entry_count = try index.entry_count catch -1;
+    let section_count = try index.section_count catch -1;
+    let content_bytes = try index.content_bytes catch -1;
+    let unique_terms = try index.unique_terms catch -1;
+    let declared_postings = try index.postings catch -1;
+    if type(index) != "map" or (try index.format catch "") != INDEX_FORMAT
+        or not _bool_field(index, "ok", true)
+        or not _bool_field(index, "complete", true)
+        or (try index.audience catch "") != audience
+        or (try index.purpose catch "") != purpose
+        or not _bool_field(index, "contains_content", true)
+        or not _bool_field(index, "safe_for_public_logging", false)
+        or not _bool_field(index, "persisted", false)
+        or not _bool_field(index, "training_performed", false)
+        or not _bool_field(index, "executes", false)
+        or not _bool_field(index, "authorizes_action", false)
+        or not _bool_field(index, "authorizes_training", false)
+        or not _bool_field(index, "nonce_discarded", true)
+        or (try index.implementation_language catch "") != "pblang"
+        or (try index.ranking catch "") != "bounded-lexical-overlap-v1"
+        or (try index.provenance_authentication catch "")
+            != "process-local-hmac-sha256-v1"
+        or (try index.integrity_scheme catch "") != "process-local-hmac-sha256-v1"
+        or not _sha256_hex(try index.integrity_tag catch "")
+        or type(try index.entries catch nil) != "array"
+        or len(index.entries) < 1 or len(index.entries) > MAX_CHUNKS
+        or type(source_count) != "number" or source_count != num_floor(source_count)
+        or source_count < 1 or source_count > MAX_SOURCES
+        or type(record_count) != "number" or record_count != num_floor(record_count)
+        or record_count < 1 or record_count > MAX_RECORDS
+        or type(entry_count) != "number" or entry_count != len(index.entries)
+        or type(section_count) != "number" or section_count != num_floor(section_count)
+        or section_count < 1 or section_count > MAX_SECTIONS
+        or type(content_bytes) != "number" or content_bytes != num_floor(content_bytes)
+        or content_bytes < 1 or content_bytes > MAX_TOTAL_BYTES
+        or type(unique_terms) != "number" or unique_terms != num_floor(unique_terms)
+        or unique_terms < 1 or unique_terms > MAX_UNIQUE_TERMS
+        or type(declared_postings) != "number"
+        or declared_postings != num_floor(declared_postings)
+        or declared_postings < 1 or declared_postings > MAX_POSTINGS {
+        return false;
+    }
+    let structural_bytes = 0;
+    let structural_postings = 0;
+    let i = 0;
+    while i < len(index.entries) {
+        let entry = index.entries[i];
+        let text = try entry.text catch nil;
+        let terms = try entry.terms catch nil;
+        let sections = try entry.section_tokens catch nil;
+        if type(entry) != "map" or (try entry.format catch "")
+            != "pbai.retrieval.index-entry.v1"
+            or type(text) != "string" or len(text) > MAX_RECORD_BYTES
+            or len(str_to_bytes(text)) > MAX_RECORD_BYTES or not _control_free(text)
+            or not _sha256_hex(try entry.content_digest catch "")
+            or not _opaque_token(try entry.source_token catch "", "src-")
+            or not _opaque_token(try entry.record_token catch "", "rec-")
+            or not _opaque_token(try entry.chunk_token catch "", "chk-")
+            or not _allowed_format(try entry.kind catch "")
+            or type(terms) != "array" or len(terms) < 1
+            or len(terms) > MAX_TERMS_PER_CHUNK
+            or type(sections) != "array" or len(sections) < 1 or len(sections) > 64 {
+            return false;
+        }
+        let t = 0;
+        while t < len(terms) {
+            if not _term_shape(terms[t]) { return false; }
+            t = t + 1;
+        }
+        let local_sections = map{};
+        let s = 0;
+        while s < len(sections) {
+            if not _opaque_token(sections[s], "sec-")
+                or map_has(local_sections, sections[s]) { return false; }
+            local_sections[sections[s]] = true;
+            s = s + 1;
+        }
+        structural_bytes = structural_bytes + len(str_to_bytes(text));
+        structural_postings = structural_postings + len(terms);
+        if structural_bytes > MAX_TOTAL_BYTES or structural_postings > MAX_POSTINGS {
+            return false;
+        }
+        i = i + 1;
+    }
+    let payload = _index_payload(index);
+    if len(str_to_bytes(payload)) > MAX_INDEX_OUTPUT_BYTES
+        or not constant_time_eq(hmac_sha256(payload, _SEAL_KEY), index.integrity_tag) {
+        return false;
+    }
+    let postings = 0;
+    let unique = map{ "@count": 0 };
+    let sources = map{};
+    let records = map{};
+    let sections_seen = map{};
+    let chunks_seen = map{};
+    let source_total = 0;
+    let record_total = 0;
+    let section_total = 0;
+    let bytes = 0;
+    i = 0;
+    while i < len(index.entries) {
+        let entry = index.entries[i];
+        let text = try entry.text catch nil;
+        let terms = try entry.terms catch nil;
+        let sections = try entry.section_tokens catch nil;
+        if entry.content_digest != sha256(text)
+            or not POLICY.scan_text(text).passed
+            or map_has(chunks_seen, entry.chunk_token) {
+            return false;
+        }
+        chunks_seen[entry.chunk_token] = true;
+        let recomputed = _tokens(text, MAX_TERMS_PER_CHUNK);
+        if not recomputed.valid or not _same_array(terms, recomputed.values) { return false; }
+        let source_token = entry.source_token;
+        let record_token = entry.record_token;
+        if not map_has(sources, source_token) {
+            sources[source_token] = true; source_total = source_total + 1;
+        }
+        if map_has(records, record_token) {
+            if records[record_token] != source_token { return false; }
+        } else {
+            records[record_token] = source_token; record_total = record_total + 1;
+        }
+        bytes = bytes + len(str_to_bytes(text));
+        if bytes > MAX_TOTAL_BYTES { return false; }
+        let t = 0;
+        while t < len(terms) {
+            let term_key = "t:" + terms[t];
+            if not map_has(unique, term_key) {
+                if unique["@count"] >= MAX_UNIQUE_TERMS { return false; }
+                unique[term_key] = true;
+                unique["@count"] = unique["@count"] + 1;
+            }
+            t = t + 1;
+        }
+        let s = 0;
+        while s < len(sections) {
+            if not map_has(sections_seen, sections[s]) {
+                sections_seen[sections[s]] = true; section_total = section_total + 1;
+            }
+            s = s + 1;
+        }
+        postings = postings + len(terms);
+        if postings > MAX_POSTINGS { return false; }
+        i = i + 1;
+    }
+    return source_total == source_count and record_total == record_count
+        and section_total == section_count and bytes == content_bytes
+        and unique["@count"] == unique_terms and postings == declared_postings;
+}
+
+fn _collapse_space(text) {
+    let out = "";
+    let pending = false;
+    let i = 0;
+    while i < len(text) {
+        let c = strcharcodeat(text, i);
+        let whitespace = c == 9 or c == 10 or c == 13 or c == 32;
+        if whitespace { pending = len(out) > 0; }
+        else {
+            if pending { out = out + " "; pending = false; }
+            out = out + str_slice(text, i, i + 1);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _snippet(text, query_terms) {
+    let flat = _collapse_space(text);
+    let lower = str_lower(flat);
+    let found = -1;
+    let i = 0;
+    while i < len(query_terms) and found < 0 {
+        found = str_index_of(lower, query_terms[i]);
+        i = i + 1;
+    }
+    let start = if found > 120 { found - 120 } else { 0 };
+    let finish = start + MAX_SNIPPET_CHARS;
+    if finish > len(flat) { finish = len(flat); }
+    let snippet = str_slice(flat, start, finish);
+    if len(str_to_bytes(snippet)) > 1440 { return ""; }
+    return snippet;
+}
+
+fn _score(entry, query_terms, phrase) {
+    let matches = 0;
+    let i = 0;
+    while i < len(query_terms) {
+        if _contains(entry.terms, query_terms[i]) { matches = matches + 1; }
+        i = i + 1;
+    }
+    if matches < 1 { return 0.0; }
+    let denominator = num_sqrt(len(query_terms) * len(entry.terms));
+    let score = matches / denominator;
+    if phrase != "" and str_contains(str_lower(entry.text), phrase) { score = score + 0.25; }
+    return score;
+}
+
+fn _canonical_hits(results) {
+    let out = [];
+    let i = 0;
+    while i < len(results) {
+        let hit = results[i];
+        push(out, map{ format: hit.format, id: hit.id, source: hit.source,
+            record_token: hit.record_token, section_tokens: hit.section_tokens,
+            kind: hit.kind, score: hit.score, snippet: hit.snippet,
+            provenance_linked: hit.provenance_linked });
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _search_payload(result) {
+    return json_stringify(map{ format: result.format, ok: result.ok,
+        complete: result.complete, audience: result.audience,
+        purpose: result.purpose, results: _canonical_hits(result.results),
+        result_count: result.result_count, ranking: result.ranking,
+        provenance_authentication: result.provenance_authentication,
+        query_nonce: result.query_nonce, query_binding: result.query_binding,
+        repeated_query_disclosure_budget_required_for_remote_use:
+            result.repeated_query_disclosure_budget_required_for_remote_use,
+        integrity_scheme: result.integrity_scheme,
+        contains_content: result.contains_content,
+        safe_for_public_logging: result.safe_for_public_logging,
+        persisted: result.persisted, training_performed: result.training_performed,
+        executes: result.executes, authorizes_action: result.authorizes_action,
+        authorizes_training: result.authorizes_training });
+}
+
+fn _query_binding(query, audience, purpose, nonce) {
+    return hmac_sha256("pbai-retrieval-query-v1\x00" + nonce + "\x00"
+        + audience + "\x00" + purpose + "\x00" + query, _SEAL_KEY);
+}
+
+fn _valid_hit(hit) {
+    if type(hit) != "map" or (try hit.format catch "") != "pbai.retrieval.hit.v1"
+        or not _opaque_token(try hit.id catch "", "chk-")
+        or not _opaque_token(try hit.source catch "", "src-")
+        or not _opaque_token(try hit.record_token catch "", "rec-")
+        or not _allowed_format(try hit.kind catch "")
+        or not _bool_field(hit, "provenance_linked", true)
+        or type(try hit.score catch nil) != "number"
+        or not (hit.score > 0.000001 and hit.score <= 2.0)
+        or type(try hit.snippet catch nil) != "string" or hit.snippet == ""
+        or len(hit.snippet) > MAX_SNIPPET_CHARS
+        or len(str_to_bytes(hit.snippet)) > 1440 or not _control_free(hit.snippet)
+        or type(try hit.section_tokens catch nil) != "array"
+        or len(hit.section_tokens) < 1 or len(hit.section_tokens) > 64 {
+        return false;
+    }
+    let sections = map{};
+    let i = 0;
+    while i < len(hit.section_tokens) {
+        let token = hit.section_tokens[i];
+        if not _opaque_token(token, "sec-") or map_has(sections, token) {
+            return false;
+        }
+        sections[token] = true;
+        i = i + 1;
+    }
+    return true;
+}
+
+fn validate_search_result(result, query, audience = "", purpose = "") {
+    if type(result) != "map" or (try result.format catch "") != SEARCH_FORMAT
+        or not _bool_field(result, "ok", true)
+        or not _bool_field(result, "complete", true)
+        or not _bool_field(result, "contains_content", true)
+        or not _bool_field(result, "safe_for_public_logging", false)
+        or not _bool_field(result, "persisted", false)
+        or not _bool_field(result, "training_performed", false)
+        or not _bool_field(result, "executes", false)
+        or not _bool_field(result, "authorizes_action", false)
+        or not _bool_field(result, "authorizes_training", false)
+        or not _bool_field(result,
+            "repeated_query_disclosure_budget_required_for_remote_use", true)
+        or (try result.ranking catch "") != "bounded-lexical-overlap-v1"
+        or (try result.provenance_authentication catch "")
+            != "process-local-hmac-sha256-v1"
+        or (try result.integrity_scheme catch "") != "process-local-hmac-sha256-v1"
+        or not _sha256_hex(try result.integrity_tag catch "")
+        or type(try result.query_nonce catch nil) != "string"
+        or len(result.query_nonce) < 32 or len(result.query_nonce) > 64
+        or not _control_free(result.query_nonce)
+        or not _sha256_hex(try result.query_binding catch "")
+        or type(try result.results catch nil) != "array"
+        or len(result.results) > MAX_RESULTS
+        or type(try result.result_count catch -1) != "number"
+        or result.result_count != num_floor(result.result_count)
+        or result.result_count != len(result.results) {
+        return false;
+    }
+    let config = _build_options(map{ audience: try result.audience catch "",
+        purpose: try result.purpose catch "", sealed_eval_hashes: [] });
+    if not config.valid { return false; }
+    if audience != "" and audience != config.audience { return false; }
+    if purpose != "" and purpose != config.purpose { return false; }
+    if type(query) != "string" or len(query) > MAX_QUERY_CHARS
+        or len(str_to_bytes(query)) > MAX_QUERY_BYTES or not _control_free(query) {
+        return false;
+    }
+    let normalized_query = str_trim(query);
+    let query_tokens = _tokens(normalized_query, MAX_QUERY_TOKENS);
+    if normalized_query == "" or not query_tokens.valid or len(query_tokens.values) < 1
+        or not constant_time_eq(_query_binding(normalized_query, config.audience,
+            config.purpose, result.query_nonce), result.query_binding) {
+        return false;
+    }
+    let chunks = map{};
+    let records = map{};
+    let i = 0;
+    while i < len(result.results) {
+        let hit = result.results[i];
+        if not _valid_hit(hit) or map_has(chunks, hit.id) { return false; }
+        chunks[hit.id] = true;
+        if map_has(records, hit.record_token) {
+            if records[hit.record_token] != hit.source { return false; }
+        } else { records[hit.record_token] = hit.source; }
+        i = i + 1;
+    }
+    let payload = _search_payload(result);
+    return len(str_to_bytes(payload)) <= MAX_SEARCH_OUTPUT_BYTES
+        and constant_time_eq(hmac_sha256(payload, _SEAL_KEY), result.integrity_tag);
+}
+
+fn search(index, query, top_k = 3, audience = "", purpose = "") {
+    if type(query) != "string" or len(query) > MAX_QUERY_CHARS
+        or len(str_to_bytes(query)) > MAX_QUERY_BYTES or not _control_free(query)
+        or type(top_k) != "number" or top_k != num_floor(top_k)
+        or top_k < 1 or top_k > MAX_RESULTS
+        or type(audience) != "string" or type(purpose) != "string"
+        or len(audience) > 32 or len(purpose) > 32
+        or not _control_free(audience) or not _control_free(purpose) {
+        return _error(SEARCH_FORMAT, "invalid-search-input");
+    }
+    let trimmed = str_trim(query);
+    if trimmed == "" { return _error(SEARCH_FORMAT, "invalid-search-input"); }
+    let query_tokens = _tokens(trimmed, MAX_QUERY_TOKENS);
+    if not query_tokens.valid or len(query_tokens.values) < 1 {
+        return _error(SEARCH_FORMAT, "invalid-search-input");
+    }
+    if not _validate_index(index, audience, purpose) {
+        return _error(SEARCH_FORMAT, "invalid-index");
+    }
+    let scored = [];
+    let phrase = str_lower(trimmed);
+    let i = 0;
+    while i < len(index.entries) {
+        let score = _score(index.entries[i], query_tokens.values, phrase);
+        if score > 0.000001 { push(scored, map{ slot: i, score: score }); }
+        i = i + 1;
+    }
+    let results = [];
+    let used = [];
+    i = 0;
+    while i < top_k and i < len(scored) {
+        let best = -1;
+        let best_score = -1.0;
+        let j = 0;
+        while j < len(scored) {
+            if not _contains(used, j) and scored[j].score > best_score {
+                best = j; best_score = scored[j].score;
+            }
+            j = j + 1;
+        }
+        if best < 0 { i = top_k; }
+        else {
+            push(used, best);
+            let entry = index.entries[scored[best].slot];
+            let snippet = _snippet(entry.text, query_tokens.values);
+            if snippet == "" { return _error(SEARCH_FORMAT, "snippet-cap-reached"); }
+            push(results, map{ format: "pbai.retrieval.hit.v1",
+                id: entry.chunk_token, source: entry.source_token,
+                record_token: entry.record_token,
+                section_tokens: entry.section_tokens,
+                kind: entry.kind, score: scored[best].score,
+                snippet: snippet, provenance_linked: true });
+            i = i + 1;
+        }
+    }
+    let out = map{ format: SEARCH_FORMAT, ok: true, complete: true,
+        audience: audience, purpose: purpose, results: results,
+        result_count: len(results), ranking: "bounded-lexical-overlap-v1",
+        provenance_authentication: "process-local-hmac-sha256-v1",
+        query_nonce: base64_encode_bytes(random_bytes(32)),
+        repeated_query_disclosure_budget_required_for_remote_use: true,
+        integrity_scheme: "process-local-hmac-sha256-v1" };
+    out.query_binding = _query_binding(trimmed, audience, purpose, out.query_nonce);
+    out = _negative_flags(out);
+    out.integrity_tag = hmac_sha256(_search_payload(out), _SEAL_KEY);
+    if len(str_to_bytes(json_stringify(out))) > MAX_SEARCH_OUTPUT_BYTES {
+        return _error(SEARCH_FORMAT, "search-output-cap-reached");
+    }
+    return out;
+}
+
+fn status() {
+    return map{ format: "pbai.retrieval.status.v1", ok: true,
+        implementation_language: "pblang", pure_in_memory: true,
+        section_aware: true, retrieval_admission_separate_from_training: true,
+        source_and_record_inputs_revalidated: true,
+        extraction_schema_topology_and_digests_revalidated: true,
+        content_rescanned_internally: true, sealed_evaluation_excluded: true,
+        opaque_per_build_provenance_tokens: true,
+        deterministic_cpu_ranking: true,
+        process_local_index_and_result_authentication: true,
+        search_results_bound_to_query_audience_and_purpose: true,
+        provenance_authentication: "process-local-hmac-sha256-v1",
+        opens_files: false, persists: false, trains: false,
+        executes: false, network_access: false,
+        remote_exposure_ready: false, cumulative_disclosure_budget_enforced: false,
+        max_sources: MAX_SOURCES, max_records: MAX_RECORDS,
+        max_total_bytes: MAX_TOTAL_BYTES, max_results: MAX_RESULTS };
+}
+
+export INDEX_FORMAT, SEARCH_FORMAT, build, search, validate_search_result, status;
