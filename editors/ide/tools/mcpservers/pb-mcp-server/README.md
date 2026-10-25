@@ -264,28 +264,41 @@ The pblang-native handlers currently implemented are:
   `code_*` heuristics, gzip/archive/PDF/QR/document conversion plans,
   CSV/JSONL/timeseries/parquet data helpers, SQLite plans, file crypto/signing
   plans, git write/stash/worktree plans, protection checks, and privileged
-  `sys_*` action plans. The generated Rust catalog now reports 100% native
-  pblang coverage.
+  `sys_*` action plans. The generated catalog reports **100% native pblang
+  coverage (`629/629` tools)**.
+- **Embedded `pbAI` Cognitive & Agentic Suite (`ai_tools.sapp` + `editors/ide/tools/ai/pbai_embedded_engine.sapp`)**:
+  `pbai_intent_and_skill_dispatch`, `pbai_embedded_vs_standalone_bridge`,
+  `pbai_polyglot_migrate`, `pbai_supply_chain_and_taint_audit`,
+  `pbai_brain_planner_verifier` (4-stage verified DAG + SMT contracts),
+  `pbai_deq_and_lora_trainer` (Joint Embed-Classify-Retrieve + DEQ Fixed-Point Solver + Continual Online LoRA Feedback),
+  `pbai_rag_memory_and_grounding` (3-Tier Memory Store L1/L2/L3 + Hybrid Vector/BM25 RRF + Epistemic Grounding Gate),
+  and `pbai_bpe_quant_and_tool_broker` (Von-Neumann BPE Subword Shield + INT8 Quantizer + Zero-IPC MCP Tool Broker).
+- **Embedded `pbIDE` Multi-OS & Multi-Device Suite (`ide_tools.sapp`)**:
+  `pbide_all_os_device_editions` (`10` OS targets × `8` device classes = `80` combinations),
+  `pbide_polyform_14target_designer`, `pbide_multi_arch_matrix` (`8-bit` to `64-bit`),
+  and `pbide_self_heal_and_rope_engine`.
+- **LLM Cognition & Ecosystem Wave 1..12 Suite (`llm_cognition_tools.sapp` — `51` tools)**:
+  Full pure-offline PBLang suite covering `llm_*` cognition/epistemic/topology/BPE/PQC gates
+  and `pblang_*` compiler/FFI/GC/LSP/Stage-2/HIL/Cleanroom/PolyForm/Flagship-UI/Professions/Lazy-Idle/Omni-Supremacy/AAP-Fabric/Wave-12 engines.
+- **Reverse-Engineering, Decompilation & DOM Scraping Suite (`rea_tools.sapp` — `6` tools)**:
+  `rea_binary_audit`, `rea_decompile_cfg`, `rea_application_graph`,
+  `rea_protocol_reconstruct`, `rea_dom_scrape_extract`, and `rea_evidence_ledger`.
+- **Embedded `pb-mcp-server` Bridge & Live Compiler Suite (`mcp_tools.sapp`)**:
+  `pb_mcp_lazy_router_telemetry`, `pb_mcp_sealed_offline_148_bridge`,
+  `pb_mcp_rea_and_cleanroom_suite`, and `pb_mcp_pblang_compiler_live_suite`.
 
 ## Performance Notes
 
-pblang already has a transparent Cranelift JIT path in `stdlib/jit.sapp`. For
-eligible numeric bytecode functions, run with:
+pblang already has a transparent Cranelift JIT path in `stdlib/jit.sapp`, and `src/router.sapp` uses a **Smart On-Demand Lazy Memoized Router (`_mod(file_name)`)** so tool modules are loaded on demand rather than eagerly at startup. For eligible numeric bytecode functions, run with:
 
 ```sh
 PBLANG_JIT=1 pblang run main.sapp --allow-all -- status
 ```
 
-This port does not need direct register/memory primitives yet. The current
-translation work is mostly string, JSON, catalog, and filesystem logic, where
-correctness and bounded memory behavior matter more than raw register-level
-codegen. Low-level runtime optimization belongs in `pl-dev/pblang` once a
-measured pblang benchmark shows the VM/JIT is the blocker.
-
 `pblang run main.sapp --allow-all -- status` reports:
 
-- `generated_tool_count: 556`
-- `native_catalog_tool_count: 556`
+- `generated_tool_count: 629`
+- `native_catalog_tool_count: 629`
 - `catalog_completion_percent: 100`
 
 ## Remaining Depth Work
