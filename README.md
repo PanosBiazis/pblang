@@ -123,12 +123,20 @@ pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all discover
 | **WebAssembly (`WASM32 / WASI`)** | — *(in archive)* | `pblang-wasm32.tar.gz` |
 | **Bare-Metal / PBOS / Embedded / DOS / CP-M** | — *(in archive)* | `pblang-baremetal.tar.gz` |
 
-### Memory Safety & General Safety Guarantees (`stdlib/safety_guard.sapp`)
+### Memory Safety, General Safety & Supply-Chain/Toolchain Defense (`stdlib/safety_guard.sapp` — `36 / 36` Checks PASS)
 
 - **Spatial Memory Safety**: Bounds-checked array/slice/buffer indexing (`0 <= idx < len`), strict `W^X` (`0` RWX segments across ELF64, PE32+, Mach-O 64, and WASM32), and `NX_COMPAT` non-executable stack.
 - **Temporal Memory Safety**: Epoch-arena + deterministic reference counting + Tricolor cycle GC (`0` Use-After-Free, `0` Double-Free, `0` dangling pointers) and deterministic `defer` file-descriptor/handle cleanup (`fd_delta == 0`).
 - **Initialization, Type & NaN Safety**: Compile-time rejection of undeclared variable reads/assignments, zero-initialized registers (`r13/r12/r14`) and stack frames in native x86-64 prologues, and fail-closed IEEE-754 `NaN`/`Infinity` guards.
 - **Arithmetic & Generalized Reciprocal Safety**: Compile-time and runtime division/modulo-by-zero traps (`ud2` / `pb_div_checked` / `pb_mod_checked`), `INT64_MIN / -1` signed overflow protection, and generalized compile-time Barrett/Granlund-Montgomery reciprocal multiplication for arbitrary constant moduli `m`.
+- **Supply-Chain & Toolchain Attack Defense (`stdlib/manifest_validate.sapp` + `stdlib/safety_guard.sapp`)**:
+  - **Zero-Install-Hook Hermetic Manifests**: Rejects `[scripts]`, `[hooks]`, `preinstall`, `postinstall`, and `build_script` hooks in `pblang.toml` (`0` arbitrary install-time code execution).
+  - **Trojan Source (`CVE-2021-42574`) & Homoglyph Blocker**: Rejects Unicode Bidi override characters (`U+202A..U+202E`, `U+2066..U+2069`) before tokenization.
+  - **Typosquatting & Dependency-Confusion Blocker**: Blocks Levenshtein distance-1 typosquats against core packages (`stdlib`, `crypto`, `tls`, `http`, `json`, `sql`, `safety`, `modern_ui`, `pbai`, `pbos`) and enforces private-scope registry pinning.
+  - **Transitive Dependency Capability Attenuation**: Prevents privilege laundering (`net`/`exec`/`ffi` escalation by pure libraries).
+  - **Diverse Double-Compiling (`DDC`) & Bit-for-Bit Reproducible Builds**: Defeats Ken Thompson "Trusting Trust" compiler backdoors across `codegen_x64` and `c99_transpiler`.
+  - **XZ-Style (`CVE-2024-3094`) Binary Blob & Zip-Slip Guard**: Blocks smuggled `.so`/`.dll`/`.o` test blobs and `../` archive path traversal.
+  - **TOCTOU & Content-Addressed Lockfile (`pblang-package-tree-v2`)**: Verifies cryptographic SHA-256 tree integrity from static analysis through codegen.
 
 ```bash
 pblang run bench/reproducible_core_matrix.sapp --allow-all
@@ -136,6 +144,34 @@ pblang run bench/omni_bench.sapp --allow-all
 pblang run tests/omni_bench_test.sapp --allow-all
 pblang run tests/safety_test.sapp --allow-all
 ```
+
+---
+
+## Compilation & Security Pipeline
+
+```mermaid
+flowchart LR
+    A[".sapp Source & pblang.toml"] --> B["Supply-Chain & Bidi Guard\n(pblang.lock SHA-256 + Zero Hooks)"]
+    B --> C["Static AST Taint & Safety Analyzer\n(Bounds, Init, Capability Attenuation)"]
+    C --> D["IR & E-Graph Superoptimizer\n(Barrett Reciprocal + Constant Folding)"]
+    D --> E1["Native x86-64 / ARM64\n(ELF64, PE32+, Mach-O 64)"]
+    D --> E2["Tier-1 C99 Transpiler\n(pb_div_checked / pb_mod_checked)"]
+    D --> E3["Bytecode VM & Tier-1 JIT\n(WASM32, PBCK, Stage-3 Kernel)"]
+```
+
+## Repository Directory Map
+
+| Directory | Contents & Guide |
+| :--- | :--- |
+| [`stdlib/`](stdlib) | Self-hosted standard library, native `x64`/`ARM64`/`WASM`/`C99` compilers (`stdlib/compiler/`, `stdlib/native/`), UI (`modern_ui.sapp`), AI (`onnx.sapp`, `ai/`), cryptography (`tls.sapp`), and safety (`safety_guard.sapp`). |
+| [`docs/`](docs) | [Documentation Hub (`docs/README.md`)](docs/README.md) — Language reference, security/safety contracts, embedded/OS guides, and [`docs/reports/`](docs/reports). |
+| [`examples/`](examples) | [Runnable Examples & Demos (`examples/README.md`)](examples/README.md) — 90+ `.sapp` examples across security, GUI/Web/Android, AI, and [`examples/demos/`](examples/demos). |
+| [`bench/`](bench) | [Benchmark Suite (`bench/README.md`)](bench/README.md) — Live process matrix (`reproducible_core_matrix.sapp`) and 870-comparison Omni-Benchmark (`omni_bench.sapp`). |
+| [`tests/`](tests) | [Verification Suite (`tests/README.md`)](tests/README.md) — Memory/Supply-Chain safety (`safety_test.sapp`), Omni-Benchmark (`omni_bench_test.sapp`), and semantics tests. |
+| [`emulators/`](emulators) | [Hardware Emulators (`emulators/README.md`)](emulators/README.md) — 6 cycle-accurate register-level emulators & 8-target physical hardware bus manager. |
+| [`runtime_stage3/`](runtime_stage3) | [Stage-3 Runtime (`runtime_stage3/README.md`)](runtime_stage3/README.md) — Zero-Rust direct-syscall `ELF64` emitter, 4KB Page/Slab Arena, Tricolor GC, and Quantum/LIF kernels. |
+| [`tools/`](tools) | [Toolchain Drivers (`tools/README.md`)](tools/README.md) — Self-hosted compiler (`pbc.sapp`) and Stage-3 driver (`pblang_stage3_selfhost_driver.sapp`). |
+| [`src/`](src) | Host CLI, bytecode VM, parser, typechecker, linter, formatter, LSP server, and native IDE (`pblang --ide`). |
 
 ---
 
