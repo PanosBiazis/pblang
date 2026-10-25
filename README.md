@@ -110,18 +110,21 @@ pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all discover
 | **JavaScript (`Node.js`)** | N/A | `34.18 ms` | `41.55 ms` | `42,000 KiB` | N/A |
 | **Python (`Python 3.12`)** | N/A | `14.12 ms` | `185.82 ms` | `10,456 KiB` | N/A |
 
-### Multi-OS & Multi-Architecture Downloads (`v1.0.0`)
+### Multi-OS & Multi-Architecture Downloads (`64-bit`, `32-bit`, `16-bit` & `8-bit` — `v1.0.0`)
 
-| Operating System / Target | Direct Executable | Full SDK Archive (`pblang` + `stdlib`) |
-| :--- | :--- | :--- |
-| **Linux (64-bit `x64`)** | `pblang-linux-x64` | `pblang-linux-x64.tar.gz` |
-| **Linux (`ARM64` / `aarch64`)** | — *(in archive)* | `pblang-linux-arm64.tar.gz` |
-| **Windows (64-bit `x64`)** | `pblang-windows-x64.exe` | `pblang-windows-x64.zip` |
-| **macOS Universal (`Apple Silicon` & `Intel`)** | — *(in archive)* | `pblang-macos.tar.gz` |
-| **FreeBSD (64-bit `x64`)** | — *(in archive)* | `pblang-freebsd-x64.tar.gz` |
-| **Android (`ARM64`)** | — *(in archive)* | `pblang-android-arm64.tar.gz` |
-| **WebAssembly (`WASM32 / WASI`)** | — *(in archive)* | `pblang-wasm32.tar.gz` |
-| **Bare-Metal / PBOS / Embedded / DOS / CP-M** | — *(in archive)* | `pblang-baremetal.tar.gz` |
+| Operating System / Target | Bits | Direct Executable | Full SDK Archive (`pblang` + `stdlib`) |
+| :--- | :---: | :--- | :--- |
+| **Linux (`x64` / `x86_64`)** | **64-bit** | `pblang-linux-x64` | `pblang-linux-x64.tar.gz` |
+| **Linux (`x86` / `i386` / `i686`)** | **32-bit** | — *(in archive)* | `pblang-linux-x86.tar.gz` |
+| **Linux (`ARM64` / `aarch64`)** | **64-bit** | — *(in archive)* | `pblang-linux-arm64.tar.gz` |
+| **Windows (`x64` / `x86_64`)** | **64-bit** | `pblang-windows-x64.exe` | `pblang-windows-x64.zip` |
+| **Windows (`x86` / `i386` / `i686`)** | **32-bit** | `pblang-windows-x86.exe` | `pblang-windows-x86.zip` |
+| **macOS Universal (`Apple Silicon` & `Intel`)** | **64-bit** | — *(in archive)* | `pblang-macos.tar.gz` |
+| **FreeBSD (`x64`)** | **64-bit** | — *(in archive)* | `pblang-freebsd-x64.tar.gz` |
+| **Android (`ARM64`)** | **64-bit** | — *(in archive)* | `pblang-android-arm64.tar.gz` |
+| **WebAssembly (`WASM32 / WASI`)** | **32-bit** | — *(in archive)* | `pblang-wasm32.tar.gz` |
+| **Bare-Metal / PBOS / Embedded (`ARM`/`RISC-V`/`ESP32`)** | **32/64-bit** | — *(in archive)* | `pblang-baremetal.tar.gz` |
+| **Legacy & Retro (`MS-DOS 16-bit`, `CP/M-80 8-bit`, `AVR 8-bit`)** | **16-bit & 8-bit** | — *(in archive)* | `pblang-legacy-8bit-16bit.zip` |
 
 ### Memory Safety, General Safety & Supply-Chain/Toolchain Defense (`stdlib/safety_guard.sapp` — `36 / 36` Checks PASS)
 
