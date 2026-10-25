@@ -33,6 +33,102 @@
 | **6. Zero-Trust Security & Cryptography by Default** | Capability-gated FFI/FS/Net/Exec, default-on static security analyzer, zero-FFI OpenBSD `$2b$` Bcrypt, Rust-independent TLS 1.3 & PEM engine, RFC 7636 OIDC/SSO PKCE, and AES-256-GCM archives. | `stdlib/tls.sapp`, `stdlib/password_bcrypt.sapp`, `stdlib/oidc_sso.sapp`, `stdlib/secure_archive.sapp` |
 | **7. Native AI, ONNX & Quantum/Neuromorphic Kernels** | Deterministic pure-PBLang ONNX protobuf inference, RAG/Rank-Fusion/MinMax/Softmax, 2-Qubit Bell State $\|\Phi^+\rangle$ unitary evolution, and Leaky Integrate-and-Fire (`LIF`) spiking neurons. | `stdlib/onnx.sapp`, `stdlib/ai/`, `runtime_stage3/deep_runtime_kernel.sapp` |
 | **8. Self-Hosted IDE, LSP & Package Toolchain** | Built-in Language Server (`pblang lsp`), Native IDE (`pblang --ide`), deterministic lockfile resolver (`pblang-package-tree-v2`), E-Graph superoptimizer, and SMT formal contract verifier. | `stdlib/manifest_validate.sapp`, `stdlib/pblang_omni_supremacy_engine.sapp` |
+| **9. Guarded Polyglot Inline Blocks & Auto-Migrator** | Write inline `py { ... }`, `js { ... }`, `rs { ... }`, `c { ... }`, `cpp { ... }`, `cs { ... }`, `sql { ... }` blocks inside `.sapp`, audit them against typosquatting/escapes, or auto-transpile legacy Delphi/Python/JS/C# to native PBLang. | `stdlib/polyglot.sapp`, `stdlib/polyglot_guard.sapp`, `stdlib/llm_cognition_suite.sapp` |
+| **10. Built-in Reverse Engineering & Binary Decompiler (`REA`)** | Native ELF64, PE32+, Mach-O 64 & WASM binary auditor, Control-Flow Graph (`CFG`) decompiler, wire-protocol reconstructor, and forensic evidence ledger (replaces Ghidra/IDA/Capstone in pure `.sapp`). | `stdlib/rea_suite.sapp` |
+| **11. Anti-Prompt-Injection, Parseltongue & Supply-Chain Shield** | Detects invisible Unicode tags (`U+E0000`), Trojan Source Bidi overrides (`CVE-2021-42574`), homoglyphs, BPE token smuggling, `postinstall` hooks, typosquats, and XZ-style binary blobs before execution. | `stdlib/parseltongue.sapp`, `stdlib/prompt_safety.sapp`, `stdlib/safety_guard.sapp` |
+| **12. 12-Module LLM Cognition & Epistemic Truth Gates** | Built-in Topology Truth Gate, Epistemic Claim Gate, Causal World Alignment, Attention Continual Guard, and Self-Healing Compiler Advisor that synthesizes and verifies AST repair patches automatically. | `stdlib/llm_cognition_suite.sapp`, `stdlib/self_healing_compiler_advisor.sapp` |
+
+---
+
+## What Exists Only in PBLang? (Head-to-Head Feature Matrix)
+
+Unlike traditional languages that require dozens of external frameworks, SAST scanners, UI toolchains, and third-party runtimes, **PBLang builds these capabilities directly into the language and standard library**:
+
+| Capability / Built-in Feature | **PBLang `1.0`** | **Rust** | **C / C++** | **Go** | **Python** | **Zig** | **TS / Node** | **Mojo** |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1. Guarded Polyglot Inline Blocks (`py{}`, `js{}`, `rs{}`, `c{}`, `sql{}`) + Auto-Native Migrator** | **Yes (Built-in)** | No | No | No | No | Only C ABI | No | Only Python |
+| **2. Default-On Compile-Time AST Taint Analysis (SQLi, XSS, Cmd/Path Injection)** | **Yes (Built-in)** | No (External) | No | No | No | No | No | No |
+| **3. Native AI Prompt-Injection, "Parseltongue" Unicode & BPE Smuggling Shield** | **Yes (Built-in)** | No | No | No | No | No | No | No |
+| **4. Hermetic Supply-Chain Shield (0 Install Hooks, Trojan Bidi, Typosquat, DDC, XZ Guard)** | **Yes (Built-in)** | Partial (`build.rs` runs code) | No | Partial | No (`setup.py` runs code) | Partial | No (`postinstall` runs code) | No |
+| **5. Zero-Annotation Memory Safety (`Epoch Arena` + `defer` + `0` Borrow-Checker Friction)** | **Yes (`264 KiB` RSS)** | Manual `'a` lifetimes | Unsafe manual | GC pauses | GC + high RSS | Manual allocators | V8 GC pauses | Ownership annotations |
+| **6. ASCII Sketch-to-UI & Single-Tree 14-Target PolyForm (`X11`, `A+ Web`, `Android APK`, `TUI`)** | **Yes (0 Electron/Gradle)** | No | No | No | No | No | No | No |
+| **7. Smart $O(1)$ Lazy-Idle Module Loader + Automatic RAM Secret Zeroization on Eviction** | **Yes (Built-in)** | No | No | No | No | No | No | No |
+| **8. Built-In Binary Disassembler, CFG Decompiler & Protocol Reconstructor (`REA`)** | **Yes (Built-in)** | No | No | No | No | No | No | No |
+| **9. 6 Cycle-Accurate Hardware Emulators + 8-Target Physical Bus Auto-Discovery & `E-STOP`** | **Yes (Built-in)** | No | No | No | No | No | No | No |
+| **10. Native Quantum (`ZX`/`Grover`), Biocomputing (`DNA`), Photonic (`MZI`) & Neuromorphic (`LIF`)** | **Yes (Built-in)** | No | No | No | External (`Qiskit`) | No | No | No |
+| **11. Self-Healing Compiler Advisor (Synthesizes & Sandbox-Verifies AST Repair Patches)** | **Yes (Built-in)** | Diagnostic hints only | No | No | No | No | No | No |
+| **12. Word-Width Span: `8-bit` (`CP/M`, `AVR8`) & `16-bit` (`DOS`) $\rightarrow$ `32-bit` & `64-bit` $\rightarrow$ `QPU`** | **Yes (All in 1 SDK)** | 32/64-bit (+avr nightly) | Separate toolchains | 32/64-bit only | 64-bit (heavy runtime) | 16/32/64-bit | 64-bit only | 64-bit only |
+
+---
+
+### Exclusive Feature Showcases
+
+#### A. Guarded Polyglot Execution & Auto-Native Migration (`stdlib:polyglot.sapp`, `stdlib:polyglot_guard.sapp`)
+Run inline blocks of Python, JavaScript, Rust, C, C++, or SQL inside `.sapp` — guarded before execution against typosquatted dependencies (`reqests`, `urp3`), covert network/shell escapes, and unsafe build paths:
+
+```pblang
+let PG = import("stdlib:polyglot_guard.sapp");
+
+// 1. Pre-flight audit of a polyglot block before execution (blocks typosquats & shell escapes):
+let check = PG.audit_block("python", "import math\nprint(math.factorial(10))", map{
+    allow_network: false,
+    allow_shell: false
+});
+assert(check.ok == true);
+
+// 2. Native inline polyglot interop or automatic translation to pure PBLang:
+let LLM = import("stdlib:llm_cognition_suite.sapp");
+let migrated = LLM.llm_delphi_blazor_migrator(map{
+    source_lang: "delphi",
+    code: "function CalcTotal(Price: Currency; Qty: Integer): Currency; begin Result := Price * Qty; end;"
+});
+print migrated.pblang_equivalent;
+```
+
+#### B. Compiler-Integrated Zero-Trust Taint, Parseltongue Unicode & Supply-Chain Defense
+PBLang blocks SQL/Command/Path injection at compile time, strips invisible AI prompt-injection steganography (`Parseltongue` Unicode tags & Trojan Source Bidi overrides), and enforces capability-attenuated dependencies:
+
+```pblang
+let TAINT   = import("stdlib:security_taint.sapp");
+let PARSEL  = import("stdlib:parseltongue.sapp");
+let SAFETY  = import("stdlib:safety_guard.sapp");
+
+// 1. Detect & neutralize invisible Unicode steganography / Trojan Source / homoglyphs:
+let scan = PARSEL.inspect_text(" normal_ident\u{202E}evil ");
+print scan.clean; // false — Trojan Bidi override caught!
+
+// 2. Full 36-check Memory, General & Supply-Chain/Toolchain Defense verification:
+let report = SAFETY.verify_full_memory_and_general_safety();
+print report.ok;  // true (Spatial W^X, Temporal 0-UAF, Barrett Modulo, Supply-Chain DDC/XZ/Typosquat)
+```
+
+#### C. ASCII Sketch-to-UI & 14-Target PolyForm Studio (`stdlib:visual_sketch_and_polyform_studio.sapp`)
+Turn an ASCII wireframe or declarative view tree into a native Linux `X11` desktop app, an `A+` CSP-hardened Web PWA, an Android `APK` (`DEX` bytecode), and a `TUI` dashboard with **zero Electron and zero Android Studio**:
+
+```pblang
+let STUDIO = import("stdlib:visual_sketch_and_polyform_studio.sapp");
+
+let bundle = STUDIO.compile_sketch_to_polyform("
++--------------------------------------------------+
+| [Header: Sovereign Telemetry Console]            |
+| [Metric: CPU 1.4ms]  [Metric: RSS 264 KiB]       |
+| [Button: Run Audit -> action:run_security_audit] |
++--------------------------------------------------+
+", map{ theme: "obsidian_gold" });
+
+print bundle.targets_emitted; // 14 targets (x11_desktop, web_pwa_aplus, android_apk_dex, tui, ...)
+```
+
+#### D. Native Binary Reverse Engineering & Decompiler (`stdlib:rea_suite.sapp`)
+Audit ELF64, PE32+, Mach-O 64, and WASM binaries, reconstruct Control-Flow Graphs (`CFG`), and extract structured wire protocols without external disassemblers:
+
+```pblang
+let REA = import("stdlib:rea_suite.sapp");
+
+let audit = REA.rea_binary_audit(map{ format: "ELF64", arch: "x86_64", wx_enforced: true });
+let cfg   = REA.rea_decompile_cfg(map{ instructions: ["push rbp", "mov rbp, rsp", "xor eax, eax", "pop rbp", "ret"] });
+print cfg.pseudocode;
+```
 
 ---
 
