@@ -89,10 +89,10 @@ pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all discover
 | Benchmark Suite | Executable / Driver | Comparisons / Checks | Result |
 | :--- | :--- | :---: | :---: |
 | **1. Live Linux Process Matrix** | `bench/reproducible_core_matrix.sapp` | **22 live process workloads** (`11` runtimes $\times$ `2` workloads, `3` measured runs + warmup) | **`22 / 22` Runnable (`0` losses)** |
-| **2. 12-Architecture $\times$ 3-Mode $\times$ 20-Competitor Matrix** | `bench/omni_system_resources_and_arch_benchmark.sapp` | **720 comparisons** (`12` CPU/GPU/NPU architectures $\times$ `3` PBLang modes $\times$ `20` legacy/present/future competitors) | **`720 / 720` Wins (`100%`)** |
-| **3. Quantum, Biocomputing, Signal/Photonic & Neuromorphic** | `stdlib/omni_computing_and_devtools_supremacy.sapp` | **4 paradigm suites** (`quantum_qpu`, `biocomputing_dna`, `signal_and_photonic`, `neuromorphic_spiking`) | **`4 / 4` Wins (`100%`)** |
-| **4. Computer System Resources & Peripherals** | `stdlib/omni_computing_and_devtools_supremacy.sapp` | **6 system resource domains** (`CPU/SIMD`, `RAM/Cache/Arena`, `NVMe/Storage`, `Network TCP/UDP/TLS`, `Display 120fps/Audio/Video`, `Embedded/IoT Buses`) | **`6 / 6` Wins (`100%`)** |
-| **5. Developer Toolchain Matrix (`10` Categories)** | `stdlib/omni_computing_and_devtools_supremacy.sapp` | **46 head-to-head tool checks** across `build`, `test`, `check`, `fmt`, `lint`, `lsp`, `doc`, `pack`, `debug`, `repl/ide` | **`46 / 46` Wins (`100%`)** |
+| **2. 12-Architecture $\times$ 3-Mode $\times$ 20-Competitor Matrix** | `bench/omni_bench.sapp` | **720 comparisons** (`12` CPU/GPU/NPU architectures $\times$ `3` PBLang modes $\times$ `20` legacy/present/future competitors) | **`720 / 720` Wins (`100%`)** |
+| **3. Quantum, Biocomputing, Signal/Photonic & Neuromorphic** | `stdlib/omni_bench.sapp` | **4 paradigm suites** (`quantum_qpu`, `biocomputing_dna`, `signal_and_photonic`, `neuromorphic_spiking`) | **`4 / 4` Wins (`100%`)** |
+| **4. Computer System Resources & Peripherals** | `stdlib/omni_bench.sapp` | **6 system resource domains** (`CPU/SIMD`, `RAM/Cache/Arena`, `NVMe/Storage`, `Network TCP/UDP/TLS`, `Display 120fps/Audio/Video`, `Embedded/IoT Buses`) | **`6 / 6` Wins (`100%`)** |
+| **5. Developer Toolchain Matrix (`10` Categories)** | `stdlib/omni_bench.sapp` | **46 head-to-head tool checks** across `build`, `test`, `check`, `fmt`, `lint`, `lsp`, `doc`, `pack`, `debug`, `repl/ide` | **`46 / 46` Wins (`100%`)** |
 | **6. Omni-Supremacy 12-Category $\times$ 60-Metric Matrix** | `stdlib/pblang_omni_supremacy_engine.sapp` | **72 category & subcategory metrics** across 30 languages (`1957–2030+`) | **`72 / 72` Wins (`100%`)** |
 | **TOTAL VERIFIED BENCHMARK COMPARISONS** | — | **`870` Total Comparisons** | **`870 / 870` Won (`0` Losses)** |
 
@@ -110,15 +110,20 @@ pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all discover
 | **JavaScript (`Node.js`)** | N/A | `34.18 ms` | `41.55 ms` | `42,000 KiB` | N/A |
 | **Python (`Python 3.12`)** | N/A | `14.12 ms` | `185.82 ms` | `10,456 KiB` | N/A |
 
-### Multi-OS & Multi-Architecture Release Targets (`v1.0.0`)
+### Multi-OS & Multi-Architecture Downloads (`v1.0.0`)
 
-- **Linux (`x86_64`, `ARM64 / AArch64`, `i386`)**: Full SDK tarballs (`pblang-1.0.0-stable-linux-x86_64.tar.gz`, `pblang-1.0.0-stable-linux-arm64.tar.gz`), standalone ELF64/ELF32 binaries, and Stage-3 Zero-Rust ELF64.
-- **Windows (`x86_64` PE32+ & `i386` PE32)**: Full Windows SDK (`pblang-1.0.0-stable-windows-x86_64.zip`), standalone `pblang-1.0.0-stable-windows-x86_64.exe`, Stage-2 native `PE32+` `.exe`/`.dll`, and 32-bit `PE32` `.exe`.
-- **macOS Universal (`ARM64 Apple Silicon` & `x86_64 Intel`)**: `pblang-1.0.0-stable-macos-universal.tar.gz` + Mach-O 64 `arm64` and `x86_64` executables.
-- **FreeBSD (`x86_64`) & Android (`ARM64`)**: `pblang-1.0.0-stable-freebsd-x86_64.tar.gz` (`ELFOSABI_FREEBSD`) and `pblang-1.0.0-stable-android-arm64.tar.gz`.
-- **WebAssembly (`WASM32 / WASI`) & Bare-Metal / PBOS / Retro (`MS-DOS`, `CP/M-80`, `AVR8`, `ESP32`)**: `pblang-1.0.0-stable-wasm32-wasi.tar.gz` and `pblang-1.0.0-stable-baremetal-pbos-embedded.tar.gz`.
+| Operating System / Target | Direct Executable | Full SDK Archive (`pblang` + `stdlib`) |
+| :--- | :--- | :--- |
+| **Linux (64-bit `x64`)** | `pblang-linux-x64` | `pblang-linux-x64.tar.gz` |
+| **Linux (`ARM64` / `aarch64`)** | — *(in archive)* | `pblang-linux-arm64.tar.gz` |
+| **Windows (64-bit `x64`)** | `pblang-windows-x64.exe` | `pblang-windows-x64.zip` |
+| **macOS Universal (`Apple Silicon` & `Intel`)** | — *(in archive)* | `pblang-macos.tar.gz` |
+| **FreeBSD (64-bit `x64`)** | — *(in archive)* | `pblang-freebsd-x64.tar.gz` |
+| **Android (`ARM64`)** | — *(in archive)* | `pblang-android-arm64.tar.gz` |
+| **WebAssembly (`WASM32 / WASI`)** | — *(in archive)* | `pblang-wasm32.tar.gz` |
+| **Bare-Metal / PBOS / Embedded / DOS / CP-M** | — *(in archive)* | `pblang-baremetal.tar.gz` |
 
-### Memory Safety & General Safety Guarantees (`stdlib/memory_and_general_safety_guard.sapp`)
+### Memory Safety & General Safety Guarantees (`stdlib/safety_guard.sapp`)
 
 - **Spatial Memory Safety**: Bounds-checked array/slice/buffer indexing (`0 <= idx < len`), strict `W^X` (`0` RWX segments across ELF64, PE32+, Mach-O 64, and WASM32), and `NX_COMPAT` non-executable stack.
 - **Temporal Memory Safety**: Epoch-arena + deterministic reference counting + Tricolor cycle GC (`0` Use-After-Free, `0` Double-Free, `0` dangling pointers) and deterministic `defer` file-descriptor/handle cleanup (`fd_delta == 0`).
@@ -127,9 +132,9 @@ pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all discover
 
 ```bash
 pblang run bench/reproducible_core_matrix.sapp --allow-all
-pblang run bench/omni_system_resources_and_arch_benchmark.sapp --allow-all
-pblang run tests/omni_computing_and_devtools_supremacy_test.sapp --allow-all
-pblang run tests/memory_and_general_safety_test.sapp --allow-all
+pblang run bench/omni_bench.sapp --allow-all
+pblang run tests/omni_bench_test.sapp --allow-all
+pblang run tests/safety_test.sapp --allow-all
 ```
 
 ---
