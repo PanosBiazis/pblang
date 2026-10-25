@@ -1,0 +1,506 @@
+let Bytes = (try import("./bytekit.sapp") catch (try import("cleanroom/bytekit.sapp") catch import("editors/ide/tools/mcpservers/pb-mcp-server/src/cleanroom/bytekit.sapp")));
+let Regex = import("stdlib:regex.sapp");
+let Zip = import("stdlib:zipfile.sapp");
+let PDF = (try import("./pdf_cleaner.sapp") catch (try import("cleanroom/pdf_cleaner.sapp") catch import("editors/ide/tools/mcpservers/pb-mcp-server/src/cleanroom/pdf_cleaner.sapp")));
+
+let FORMAT = "pbwatermarks.container.v1";
+
+fn _error(message) { return map{ ok: false, format: FORMAT, error: message }; }
+
+fn _suffix(filename) {
+    let name = str_lower(str(filename));
+    let at = -1;
+    let i = 0;
+    while i < len(name) {
+        if str_slice(name, i, i + 1) == "." { at = i; }
+        i = i + 1;
+    }
+    if at < 0 { return ""; }
+    return str_slice(name, at, len(name));
+}
+
+fn _marker_names() {
+    return [
+        "c2pa", "jumb", "contentcredentials", "content credentials",
+        "digitalSourceType", "trainedAlgorithmicMedia", "algorithmicMedia",
+        "aigc", "ai_generated", "ai-generated", "synthid",
+        "dcterms:provenance", "openai", "anthropic", "chatgpt",
+        "gemini", "midjourney", "stable diffusion"
+    ];
+}
+
+fn _marker_hits_bytes(bytes) {
+    let hits = [];
+    for marker in _marker_names() {
+        if Bytes.contains_ascii(bytes, marker) { array_push(hits, marker); }
+    }
+    return hits;
+}
+
+fn _marker_hits_text(text) { return _marker_hits_bytes(str_to_bytes(text)); }
+
+fn _has_c2pa(hits) {
+    for hit in hits {
+        let lower = str_lower(hit);
+        if lower == "c2pa" or lower == "jumb"
+            or lower == "contentcredentials" or lower == "content credentials" {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn _zip_name_safe(name) {
+    if type(name) != "string" or name == "" or len(name) > 4096
+        or str_starts_with(name, "/") or str_contains(name, "\\")
+        or str_contains(name, strfromcharcode(0)) {
+        return false;
+    }
+    let parts = str_split(name, "/");
+    for part in parts { if part == ".." { return false; } }
+    return not (len(name) >= 2 and str_slice(name, 1, 2) == ":");
+}
+
+fn _metadata_entry(kind, name) {
+    if kind == "docx" {
+        return str_starts_with(name, "docProps/") or str_starts_with(name, "customXml/");
+    }
+    return name == "meta.xml" or name == "META-INF/manifest.xml";
+}
+
+fn _zip_kind(bytes, options) {
+    if len(bytes) < 4 or bytes[0] != 80 or bytes[1] != 75 { return "unknown"; }
+    let entries = try Zip.entries_bounded(bytes, options.max_zip_entries) catch nil;
+    if entries == nil { return "unknown"; }
+    let docx = false;
+    let odt_content = false;
+    let odt_meta = false;
+    for entry in entries {
+        if entry.name == "word/document.xml" { docx = true; }
+        if entry.name == "content.xml" { odt_content = true; }
+        if entry.name == "meta.xml" { odt_meta = true; }
+    }
+    if docx { return "docx"; }
+    if odt_content and odt_meta { return "odt"; }
+    return "unknown";
+}
+
+fn detect(bytes, filename, options) {
+    let ext = _suffix(filename);
+    if len(bytes) >= 5 and Bytes.equals_at(bytes, 0, str_to_bytes("%PDF-")) { return "pdf"; }
+    let zip_kind = _zip_kind(bytes, options);
+    if zip_kind != "unknown" { return zip_kind; }
+    let prefix_count = num_min(len(bytes), 1024);
+    let prefix = str_lower(try bytes_to_str(slice(bytes, 0, prefix_count)) catch "");
+    if str_starts_with(str_trim(prefix), "<") and str_contains(prefix, "<svg") { return "svg"; }
+    if ext == ".html" or ext == ".htm" { return "html"; }
+    if ext == ".md" or ext == ".markdown" or ext == ".mdx" { return "markdown"; }
+    if ext == ".svg" { return "svg"; }
+    if ext == ".pdf" { return "pdf"; }
+    if ext == ".docx" { return "docx"; }
+    if ext == ".odt" { return "odt"; }
+    return "unknown";
+}
+
+fn _finding(state, kind, confidence, detail, location, options) {
+    state.total = state.total + 1;
+    if len(state.findings) >= options.max_findings {
+        state.truncated = true;
+        return;
+    }
+    array_push(state.findings, map{
+        kind: kind, confidence: confidence,
+        detail: detail, location: location
+    });
+}
+
+fn _frontmatter_key(line) {
+    if line == "" or str_starts_with(line, " ") or str_starts_with(line, "\t")
+        or str_starts_with(line, "-") or str_starts_with(str_trim(line), "#") {
+        return "";
+    }
+    let at = str_index_of(line, ":");
+    if at <= 0 { return ""; }
+    return str_lower(str_trim(str_slice(line, 0, at)));
+}
+
+fn _ai_key(key) {
+    return key == "generator" or key == "ai" or key == "ai_generated"
+        or key == "ai-generated" or key == "c2pa" or key == "synthid"
+        or key == "content_credentials" or key == "contentcredentials"
+        or key == "provenance" or key == "digital_source_type"
+        or key == "digitalsourcetype" or key == "created_with"
+        or key == "createdwith" or key == "model" or key == "llm";
+}
+
+fn inspect_markdown(text, options) {
+    let state = map{ findings: [], total: 0, truncated: false };
+    let lines = str_split(text, "\n");
+    let has_frontmatter = len(lines) > 0 and str_trim(lines[0]) == "---";
+    if has_frontmatter {
+        let i = 1;
+        while i < len(lines) and str_trim(lines[i]) != "---" {
+            let key = _frontmatter_key(lines[i]);
+            let hits = _marker_hits_text(lines[i]);
+            if _ai_key(key) or len(hits) > 0 {
+                _finding(state, "frontmatter", "probable",
+                    "AI/provenance frontmatter key: " + key, "line " + str(i + 1), options);
+            }
+            i = i + 1;
+        }
+    }
+    let has_c2pa = false;
+    for finding in state.findings {
+        if str_contains(str_lower(finding.detail), "c2pa")
+            or str_contains(str_lower(finding.detail), "content_credentials") {
+            has_c2pa = true;
+        }
+    }
+    return map{
+        ok: true, format: FORMAT, container_format: "markdown",
+        has_c2pa: has_c2pa, has_ai_metadata: state.total > 0,
+        findings: state.findings, finding_count: state.total,
+        truncated: state.truncated, structure_verified: true,
+        has_frontmatter: has_frontmatter
+    };
+}
+
+fn clean_markdown(text, options) {
+    let lines = str_split(text, "\n");
+    if len(lines) == 0 or str_trim(lines[0]) != "---" {
+        return map{ ok: true, text: text, actions: [], changed: false };
+    }
+    let closing = -1;
+    let i = 1;
+    while i < len(lines) {
+        if str_trim(lines[i]) == "---" { closing = i; break; }
+        i = i + 1;
+    }
+    if closing < 0 { return _error("unterminated Markdown frontmatter"); }
+    let kept = [];
+    let actions = [];
+    let dropping = false;
+    i = 1;
+    while i < closing {
+        let line = lines[i];
+        let trimmed = str_trim(line);
+        if line == "" or str_starts_with(line, " ") or str_starts_with(line, "\t")
+            or str_starts_with(line, "-") or str_starts_with(trimmed, "#") {
+            if not dropping { array_push(kept, line); }
+            i = i + 1;
+            continue;
+        }
+        let key = _frontmatter_key(line);
+        let hits = _marker_hits_text(line);
+        dropping = _ai_key(key) or len(hits) > 0;
+        if dropping { array_push(actions, "drop frontmatter key " + key); }
+        else { array_push(kept, line); }
+        i = i + 1;
+    }
+    let out_lines = [];
+    if len(kept) > 0 {
+        array_push(out_lines, "---");
+        for line in kept { array_push(out_lines, line); }
+        array_push(out_lines, "---");
+    }
+    i = closing + 1;
+    while i < len(lines) { array_push(out_lines, lines[i]); i = i + 1; }
+    let output = str_join(out_lines, "\n");
+    return map{
+        ok: true, text: output, actions: actions,
+        changed: output != text
+    };
+}
+
+fn _scan_html(text, options, kind) {
+    let state = map{ findings: [], total: 0, truncated: false };
+    let lower = str_lower(text);
+    let cursor = 0;
+    while cursor < len(text) {
+        let relative = str_index_of(str_slice(lower, cursor, len(lower)), "<meta");
+        if relative < 0 { break; }
+        let start = cursor + relative;
+        let end_relative = str_index_of(str_slice(lower, start, len(lower)), ">");
+        if end_relative < 0 or end_relative > 8192 { break; }
+        let end = start + end_relative + 1;
+        let tag = str_slice(text, start, end);
+        let hits = _marker_hits_text(tag);
+        if len(hits) > 0 {
+            _finding(state, "meta-tag", "probable",
+                kind + " metadata markers: " + str_join(hits, ", "),
+                "offset " + str(start), options);
+        }
+        cursor = end;
+    }
+    if kind == "svg" and Regex.match(text, "(?is)<metadata\\b") {
+        _finding(state, "metadata-block", "informational",
+            "SVG metadata block present", "document", options);
+    }
+    let all_hits = _marker_hits_text(text);
+    if len(all_hits) > 0 and state.total == 0 {
+        _finding(state, "document-marker", "probable",
+            kind + " markers outside recognized metadata: " + str_join(all_hits, ", "),
+            "document", options);
+    }
+    return map{
+        ok: true, format: FORMAT, container_format: kind,
+        has_c2pa: _has_c2pa(all_hits),
+        has_ai_metadata: len(all_hits) > 0,
+        findings: state.findings, finding_count: state.total,
+        truncated: state.truncated, structure_verified: true
+    };
+}
+
+fn _drop_marker_tags(text, options) {
+    let lower = str_lower(text);
+    let output = "";
+    let cursor = 0;
+    let actions = [];
+    while cursor < len(text) {
+        let relative = str_index_of(str_slice(lower, cursor, len(lower)), "<meta");
+        if relative < 0 {
+            output = output + str_slice(text, cursor, len(text));
+            break;
+        }
+        let start = cursor + relative;
+        let end_relative = str_index_of(str_slice(lower, start, len(lower)), ">");
+        if end_relative < 0 or end_relative > 8192 {
+            return _error("unterminated or oversized metadata tag");
+        }
+        let end = start + end_relative + 1;
+        let tag = str_slice(text, start, end);
+        output = output + str_slice(text, cursor, start);
+        let hits = _marker_hits_text(tag);
+        if len(hits) > 0 {
+            array_push(actions, "drop marker-bearing meta tag");
+        } else { output = output + tag; }
+        cursor = end;
+    }
+    return map{ ok: true, text: output, actions: actions, changed: output != text };
+}
+
+fn _drop_block_if_marked(text, open_pattern, close_pattern, label, options) {
+    let pattern = "(?is)" + open_pattern + ".*?" + close_pattern;
+    let blocks = Regex.find_all(text, pattern);
+    let output = text;
+    let actions = [];
+    for block in blocks {
+        if options.mode == "privacy" or len(_marker_hits_text(block)) > 0 {
+            output = str_replace_all(output, block, "");
+            array_push(actions, "drop " + label);
+        }
+    }
+    return map{ text: output, actions: actions };
+}
+
+fn clean_html(text, options) {
+    let tags = _drop_marker_tags(text, options);
+    if not tags.ok { return tags; }
+    let scripts = _drop_block_if_marked(tags.text,
+        "<script\\b[^>]*application/ld\\+json[^>]*>", "</script\\s*>",
+        "marker-bearing JSON-LD block", options);
+    let output = scripts.text;
+    let actions = tags.actions;
+    for action in scripts.actions { array_push(actions, action); }
+    let attrs = Regex.find_all(output, "(?i)\\sdata-ai[[:alnum:]_-]*\\s*=\\s*[\"'][^\"']*[\"']");
+    for attr in attrs {
+        output = str_replace_all(output, attr, "");
+        array_push(actions, "drop data-ai attribute");
+    }
+    return map{ ok: true, text: output, actions: actions, changed: output != text };
+}
+
+fn clean_svg(text, options) {
+    let metadata = _drop_block_if_marked(text,
+        "<metadata\\b[^>]*>", "</metadata\\s*>", "SVG metadata block", options);
+    let xmp = _drop_block_if_marked(metadata.text,
+        "<[^>]*xmpmeta\\b[^>]*>", "</[^>]*xmpmeta\\s*>", "SVG XMP block", options);
+    let output = xmp.text;
+    let actions = metadata.actions;
+    for action in xmp.actions { array_push(actions, action); }
+    let comments = Regex.find_all(output, "(?is)<!--.*?-->");
+    for comment in comments {
+        if len(_marker_hits_text(comment)) > 0 {
+            output = str_replace_all(output, comment, "");
+            array_push(actions, "drop marker-bearing SVG comment");
+        }
+    }
+    return map{ ok: true, text: output, actions: actions, changed: output != text };
+}
+
+fn _inspect_zip(bytes, kind, options) {
+    let entries = try Zip.entries_bounded(bytes, options.max_zip_entries) catch nil;
+    if entries == nil { return _error("invalid or oversized " + kind + " archive"); }
+    let state = map{ findings: [], total: 0, truncated: false };
+    let total_size = 0;
+    let has_ai = false;
+    let has_c2pa = false;
+    let names = map{};
+    for entry in entries {
+        if not _zip_name_safe(entry.name) or map_has(names, entry.name) {
+            return _error(kind + " archive contains an unsafe or duplicate entry name");
+        }
+        names[entry.name] = true;
+        total_size = total_size + entry.size;
+        if total_size > options.max_input_bytes * 4 {
+            return _error(kind + " decompressed size exceeds aggregate budget");
+        }
+        let payload = try Zip.read_entry(bytes, entry, options.max_zip_entry_bytes) catch nil;
+        if payload == nil { return _error(kind + " entry failed bounded CRC/decompression verification"); }
+        if _metadata_entry(kind, entry.name) {
+            let hits = _marker_hits_bytes(payload);
+            if len(hits) > 0 {
+                has_ai = true;
+                if _has_c2pa(hits) { has_c2pa = true; }
+                _finding(state, "archive-metadata", "probable",
+                    entry.name + " markers: " + str_join(hits, ", "),
+                    entry.name, options);
+            }
+        }
+    }
+    return map{
+        ok: true, format: FORMAT, container_format: kind,
+        has_c2pa: has_c2pa, has_ai_metadata: has_ai,
+        findings: state.findings, finding_count: state.total,
+        truncated: state.truncated, structure_verified: true,
+        crc_verified: true, entries: len(entries),
+        decompressed_bytes: total_size
+    };
+}
+
+fn _drop_xml_elements(text, local_name, always_drop, options) {
+    let escaped = str_replace_all(local_name, "-", "\\-");
+    let qualified = "(?:[A-Za-z_][A-Za-z0-9_.-]*:)?" + escaped;
+    let pattern = "(?is)<" + qualified + "\\b[^>]*(?:/>|>.*?</" + qualified + "\\s*>)";
+    let blocks = Regex.find_all(text, pattern);
+    let output = text;
+    let actions = [];
+    for block in blocks {
+        if always_drop or options.mode == "privacy" or len(_marker_hits_text(block)) > 0 {
+            output = str_replace_all(output, block, "");
+            array_push(actions, "drop XML metadata element " + local_name);
+        }
+    }
+    return map{ text: output, actions: actions };
+}
+
+fn _clean_metadata_xml(text, options) {
+    let output = text;
+    let actions = [];
+    let explicit = ["generator", "provenance", "c2pa", "contentcredentials",
+        "content-credentials", "ai-generated", "aigc", "synthid"];
+    for name in explicit {
+        let result = _drop_xml_elements(output, name, true, options);
+        output = result.text; for action in result.actions { array_push(actions, action); }
+    }
+    let conditional = ["property", "custom-property", "user-defined", "description", "subject"];
+    for name in conditional {
+        let result = _drop_xml_elements(output, name, false, options);
+        output = result.text; for action in result.actions { array_push(actions, action); }
+    }
+    return map{ ok: true, text: output, actions: actions, changed: output != text };
+}
+
+fn _clean_zip(bytes, kind, options) {
+    let entries = try Zip.entries_bounded(bytes, options.max_zip_entries) catch nil;
+    if entries == nil { return _error("invalid or oversized " + kind + " archive"); }
+    let files = [];
+    let names = map{};
+    let actions = [];
+    let changed = false;
+    let total_size = 0;
+    let preserved = map{};
+    for entry in entries {
+        if not _zip_name_safe(entry.name) or map_has(names, entry.name) {
+            return _error(kind + " archive contains an unsafe or duplicate entry name");
+        }
+        names[entry.name] = true;
+        total_size = total_size + entry.size;
+        if total_size > options.max_input_bytes * 4 {
+            return _error(kind + " decompressed size exceeds aggregate budget");
+        }
+        let payload = try Zip.read_entry(bytes, entry, options.max_zip_entry_bytes) catch nil;
+        if payload == nil { return _error(kind + " entry failed bounded CRC/decompression verification"); }
+        let out = payload;
+        if _metadata_entry(kind, entry.name) and len(_marker_hits_bytes(payload)) > 0 {
+            let text = try bytes_to_str(payload) catch nil;
+            if text == nil { return _error(kind + " marker-bearing metadata must be valid UTF-8 XML"); }
+            let cleaned = _clean_metadata_xml(text, options);
+            out = str_to_bytes(cleaned.text);
+            if cleaned.changed {
+                changed = true;
+                for action in cleaned.actions { array_push(actions, entry.name + ": " + action); }
+            }
+        }
+        if not _metadata_entry(kind, entry.name) { preserved[entry.name] = Bytes.digest(payload); }
+        array_push(files, map{ name: entry.name, data: out });
+    }
+    if not changed {
+        return map{ ok: true, format: FORMAT, container_format: kind, bytes: bytes,
+            actions: [], changed: false, input_digest: Bytes.digest(bytes),
+            output_digest: Bytes.digest(bytes), structure_verified: true,
+            crc_verified: true, non_metadata_entries_preserved: true };
+    }
+    let output = try Zip.create(files) catch nil;
+    if output == nil or len(output) > options.max_input_bytes {
+        return _error(kind + " rewritten archive exceeds the configured output budget");
+    }
+    let rewritten = try Zip.entries_bounded(output, options.max_zip_entries) catch nil;
+    if rewritten == nil or len(rewritten) != len(entries) {
+        return _error(kind + " rewritten archive failed structural verification");
+    }
+    for entry in rewritten {
+        let payload = try Zip.read_entry(output, entry, options.max_zip_entry_bytes) catch nil;
+        if payload == nil { return _error(kind + " rewritten entry failed CRC verification"); }
+        if map_has(preserved, entry.name) and Bytes.digest(payload) != preserved[entry.name] {
+            return _error(kind + " non-metadata entry changed during rewrite");
+        }
+    }
+    let after = _inspect_zip(output, kind, options);
+    if not after.ok { return _error(kind + " rewritten archive failed post-inspection"); }
+    return map{
+        ok: true, format: FORMAT, container_format: kind, bytes: output,
+        actions: actions, changed: true, input_digest: Bytes.digest(bytes),
+        output_digest: Bytes.digest(output), post_inspection: after,
+        structure_verified: true, crc_verified: true,
+        non_metadata_entries_preserved: true
+    };
+}
+
+fn inspect(bytes, filename, options) {
+    let kind = detect(bytes, filename, options);
+    if kind == "unknown" { return _error("unsupported container format"); }
+    if kind == "docx" or kind == "odt" { return _inspect_zip(bytes, kind, options); }
+    if kind == "pdf" { return PDF.inspect(bytes, options); }
+    let text = try bytes_to_str(bytes) catch nil;
+    if text == nil { return _error(kind + " must be valid UTF-8"); }
+    if kind == "markdown" { return inspect_markdown(text, options); }
+    return _scan_html(text, options, kind);
+}
+
+fn clean(bytes, filename, options) {
+    let kind = detect(bytes, filename, options);
+    if kind == "docx" or kind == "odt" { return _clean_zip(bytes, kind, options); }
+    if kind == "pdf" { return PDF.clean(bytes, options); }
+    if kind == "unknown" { return _error("unsupported container format"); }
+    let text = try bytes_to_str(bytes) catch nil;
+    if text == nil { return _error(kind + " must be valid UTF-8"); }
+    let result = nil;
+    if kind == "markdown" { result = clean_markdown(text, options); }
+    elif kind == "html" { result = clean_html(text, options); }
+    else { result = clean_svg(text, options); }
+    if not result.ok { return result; }
+    let out = str_to_bytes(result.text);
+    let after = inspect(out, filename, options);
+    return map{
+        ok: true, format: FORMAT, container_format: kind,
+        bytes: out, actions: result.actions,
+        changed: result.changed,
+        input_digest: Bytes.digest(bytes), output_digest: Bytes.digest(out),
+        post_inspection: after,
+        structure_verified: after.ok
+    };
+}
+
+export FORMAT, detect, inspect, clean;
+export inspect_markdown, clean_markdown, clean_html, clean_svg;

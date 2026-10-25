@@ -1,0 +1,369 @@
+// Bounded content-signal processing backed by the PBLang-only PB Cleanroom
+// engine. No filesystem/process effects; model rewriting is explicit and
+// loopback-only while every other operation remains network-free.
+
+// Package imports are resolved from the verified pblang.lock snapshot before
+// the worker artifact is emitted. Runtime package loading is intentionally absent.
+let ENGINE = (try import("cleanroom/engine.sapp") catch (try import("src/cleanroom/engine.sapp") catch import("editors/ide/tools/mcpservers/pb-mcp-server/src/cleanroom/engine.sapp")));
+let POLICY = (try import("cleanroom/policy.sapp") catch (try import("src/cleanroom/policy.sapp") catch import("editors/ide/tools/mcpservers/pb-mcp-server/src/cleanroom/policy.sapp")));
+let REWRITE = (try import("cleanroom/statistical_rewriter.sapp") catch (try import("src/cleanroom/statistical_rewriter.sapp") catch import("editors/ide/tools/mcpservers/pb-mcp-server/src/cleanroom/statistical_rewriter.sapp")));
+let PIXEL = (try import("cleanroom/pixel_cleaner.sapp") catch (try import("src/cleanroom/pixel_cleaner.sapp") catch import("editors/ide/tools/mcpservers/pb-mcp-server/src/cleanroom/pixel_cleaner.sapp")));
+let MASK = (try import("cleanroom/mask_generator.sapp") catch (try import("src/cleanroom/mask_generator.sapp") catch import("editors/ide/tools/mcpservers/pb-mcp-server/src/cleanroom/mask_generator.sapp")));
+
+let MAX_BYTES = 8388608;
+
+fn _args(args, allowed) {
+    if type(args) != "map" { throw "content signal arguments must be an object"; }
+    for key in map_keys(args) {
+        let accepted = false;
+        for candidate in allowed { if key == candidate { accepted = true; } }
+        if not accepted { throw "unknown content signal argument: " + str(key); }
+    }
+    return args;
+}
+
+fn _decode(args) {
+    let filename = try args.filename catch "";
+    if type(filename) != "string" or filename == "" or len(filename) > 255
+        or filename != path_basename(filename) or str_contains(filename, strfromcharcode(0)) {
+        throw "filename must be a bounded basename";
+    }
+    let encoded = try args.data_base64 catch nil;
+    if type(encoded) != "string" or len(encoded) > 11184812 or num_mod(len(encoded), 4) != 0
+        or not regex_match(encoded, "^[A-Za-z0-9+/]*={0,2}$") {
+        throw "data_base64 is invalid or exceeds 8 MiB decoded";
+    }
+    let bytes = try base64_decode_bytes(encoded) catch nil;
+    if type(bytes) != "array" or len(bytes) > MAX_BYTES
+        or not constant_time_eq(base64_encode_bytes(bytes), encoded) {
+        throw "data_base64 must be canonical and at most 8 MiB decoded";
+    }
+    return map{ filename: filename, bytes: bytes };
+}
+
+fn _options(args, operation) {
+    let options = try args.options catch map{};
+    if type(options) != "map" or len(map_keys(options)) > 8 { throw "options must be a bounded object"; }
+    let allowed = ["mode", "max_findings", "aggressive_confusables",
+        "normalize_spaces", "strip_private_use", "strip_emoji_glue", "pdf_password"];
+    for key in map_keys(options) {
+        let accepted = false; for candidate in allowed { if key == candidate { accepted = true; } }
+        if not accepted { throw "unknown content signal option: " + str(key); }
+    }
+    return map{
+        mode: if operation == "inspect" { "inspect" } else { try options.mode catch "conservative" },
+        max_input_bytes: MAX_BYTES,
+        max_findings: try options.max_findings catch 256,
+        aggressive_confusables: try options.aggressive_confusables catch false,
+        normalize_spaces: try options.normalize_spaces catch true,
+        strip_private_use: try options.strip_private_use catch false,
+        strip_emoji_glue: try options.strip_emoji_glue catch false,
+        pdf_password: try options.pdf_password catch nil
+    };
+}
+
+fn _raw_options(args, allowed) {
+    let options = try args.options catch map{};
+    if type(options) != "map" or len(map_keys(options)) > len(allowed) { throw "options must be a bounded object"; }
+    for key in map_keys(options) {
+        let accepted = false; for candidate in allowed { if key == candidate { accepted = true; } }
+        if not accepted { throw "unknown content signal option: " + str(key); }
+    }
+    return options;
+}
+
+fn _decode_field(args, name, max_bytes) {
+    let encoded = try args[name] catch nil;
+    if type(encoded) != "string" or len(encoded) > max_bytes * 2 or num_mod(len(encoded), 4) != 0
+        or not regex_match(encoded, "^[A-Za-z0-9+/]*={0,2}$") { throw name + " is invalid"; }
+    let bytes = try base64_decode_bytes(encoded) catch nil;
+    if type(bytes) != "array" or len(bytes) > max_bytes
+        or not constant_time_eq(base64_encode_bytes(bytes), encoded) { throw name + " must be canonical"; }
+    return bytes;
+}
+
+fn _parse_json_bytes(bytes) {
+    let text = try bytes_to_str(bytes) catch nil;
+    if text == nil { return nil; }
+    return try json_parse(text) catch nil;
+}
+
+fn _strip_report_content(report) {
+    if type(report) != "map" { return report; }
+    for key in ["cleaned", "text", "content", "source", "candidate"] {
+        if map_has(report, key) { map_remove(report, key); }
+    }
+    if map_has(report, "text_report") {
+        report.text_report = _strip_report_content(report.text_report);
+    }
+    return report;
+}
+
+fn _private_content_result(result, remove_digests = false) {
+    for key in ["report", "before", "after"] {
+        if map_has(result, key) { result[key] = _strip_report_content(result[key]); }
+    }
+    if remove_digests {
+        for key in ["digest", "input_digest", "output_digest"] {
+            if map_has(result, key) { map_remove(result, key); }
+        }
+    }
+    result.content_exposed = false;
+    result.credentials_exposed = false;
+    result.absolute_paths_exposed = false;
+    return result;
+}
+
+fn _private_batch_result(result) {
+    for key in ["digest", "input_digest", "output_digest"] {
+        if map_has(result, key) { map_remove(result, key); }
+    }
+    return _private_content_result(result, true);
+}
+
+fn _decode_candidates(args, name, max_count, max_total_bytes) {
+    let encoded = try args[name] catch nil;
+    if type(encoded) != "array" or len(encoded) < 1 or len(encoded) > max_count { throw name + " is invalid"; }
+    let out = []; let total = 0;
+    for value in encoded {
+        let bytes = _decode_field(map{ item: value }, "item", max_total_bytes);
+        total = total + len(bytes); if total > max_total_bytes { throw name + " exceeds its combined byte limit"; }
+        array_push(out, bytes);
+    }
+    return out;
+}
+
+fn content_signal_capabilities(args) {
+    _args(args, []);
+    return map{ format: "pb_mcp.content-signal.capabilities.v1",
+        implementation: "pblang", capabilities: ENGINE.capabilities(),
+        max_decoded_bytes: MAX_BYTES, filesystem_effects: false,
+        default_network_effects: false, rewrite_network_effect: "explicit-loopback-only",
+        process_effects: false };
+}
+
+fn content_signal_inspect(args) {
+    _args(args, ["filename", "data_base64", "options"]);
+    let source = _decode(args);
+    let policy=POLICY.normalize(_options(args,"inspect")); if not policy.ok { return policy; }
+    return _private_content_result(ENGINE.inspect_with_policy(source.bytes, source.filename, policy));
+}
+
+fn content_signal_clean(args) {
+    _args(args, ["filename", "data_base64", "options"]);
+    let source = _decode(args);
+    let policy=POLICY.normalize(_options(args,"clean")); if not policy.ok { return policy; }
+    let result = ENGINE.clean_with_policy(source.bytes, source.filename, policy);
+    if result.ok {
+        result.data_base64 = base64_encode_bytes(result.bytes);
+        map_remove(result, "bytes");
+        result.attribution_preserved = true;
+    }
+    return _private_content_result(result);
+}
+
+fn content_signal_rewrite_evaluate(args) {
+    _args(args, ["source", "candidate"]);
+    let source = try args.source catch nil; let candidate = try args.candidate catch nil;
+    if type(source) != "string" or type(candidate) != "string"
+        or len(source) > 65536 or len(candidate) > 65536 { throw "source and candidate must be bounded text"; }
+    let result=REWRITE.evaluate(source,candidate);
+    if map_has(result,"candidate") { map_remove(result,"candidate"); }
+    result.content_exposed=false; return result;
+}
+
+fn _private_rewrite(result) {
+    if map_has(result,"text") { map_remove(result,"text"); }
+    if map_has(result,"selected") and type(result.selected)=="map" and map_has(result.selected,"candidate") {
+        map_remove(result.selected,"candidate");
+    }
+    if map_has(result,"evidence") and type(result.evidence)=="array" {
+        for item in result.evidence { if type(item)=="map" and map_has(item,"candidate") { map_remove(item,"candidate"); } }
+    }
+    result.content_exposed=false; result.credentials_exposed=false; result.absolute_paths_exposed=false;
+    return result;
+}
+
+fn content_signal_rewrite(args) {
+    _args(args, ["filename", "data_base64", "options"]);
+    if (try env_get("PB_MCP_CONTENT_REWRITE_ENABLE") catch "") != "1" {
+        throw "content rewrite requires PB_MCP_CONTENT_REWRITE_ENABLE=1 and a local Ollama model";
+    }
+    let source = _decode(args); let text = try bytes_to_str(source.bytes) catch nil;
+    if text == nil { throw "rewrite input must be UTF-8 text"; }
+    let options = _raw_options(args, ["model", "mode", "candidates", "max_tokens", "temperature"]);
+    let result = REWRITE.rewrite(text, options);
+    if result.ok { result.data_base64 = base64_encode_bytes(str_to_bytes(result.text)); }
+    return _private_rewrite(result);
+}
+
+fn content_signal_rewrite_select(args) {
+    _args(args, ["filename", "data_base64", "candidates", "options"]);
+    let source = _decode(args); let text = try bytes_to_str(source.bytes) catch nil;
+    if text == nil { throw "rewrite input must be UTF-8 text"; }
+    let options = _raw_options(args, ["minimum_score"]);
+    let result = REWRITE.select_candidates(text, try args.candidates catch nil, options);
+    if result.ok { result.data_base64 = base64_encode_bytes(str_to_bytes(result.text)); }
+    return _private_rewrite(result);
+}
+
+fn content_signal_rewrite_hook_create(args) {
+    _args(args,["filename","data_base64","options","confirm_external_content_sharing"]);
+    if not (try args.confirm_external_content_sharing catch false) {
+        throw "external content sharing requires explicit confirmation";
+    }
+    let source=_decode(args); let text=try bytes_to_str(source.bytes) catch nil;
+    if text==nil { throw "rewrite hook input must be UTF-8 text"; }
+    let options=_raw_options(args,["mode","candidates","privacy_mode","custom_sensitive_terms"]);
+    let result=REWRITE.create_hook_request(text,options);
+    if result.ok { result.request_json_base64=base64_encode_bytes(str_to_bytes(result.request_json));
+        map_remove(result,"request_json"); map_remove(result,"request"); }
+    result.explicit_content_sharing=true; result.credentials_exposed=false;
+    result.absolute_paths_exposed=false; return result;
+}
+
+fn content_signal_rewrite_hook_accept(args) {
+    _args(args,["request_json_base64","response_json_base64","options"]);
+    let request=_parse_json_bytes(_decode_field(args,"request_json_base64",524288));
+    let response=_parse_json_bytes(_decode_field(args,"response_json_base64",524288));
+    if request==nil or response==nil { throw "hook request and response must be valid JSON"; }
+    let result=REWRITE.select_hook_response(request,response,_raw_options(args,["minimum_score"]));
+    if result.ok { result.data_base64=base64_encode_bytes(str_to_bytes(result.text)); }
+    return _private_rewrite(result);
+}
+
+fn content_signal_inpaint(args) {
+    _args(args, ["filename", "data_base64", "mask_base64", "options"]);
+    let source = _decode(args); let mask = _decode_field(args, "mask_base64", 4194304);
+    let options = _raw_options(args, ["threshold", "max_pixels", "max_iterations", "max_mask_fraction"]);
+    let result = PIXEL.inpaint_png(source.bytes, mask, options);
+    if result.ok { result.data_base64 = base64_encode_bytes(result.bytes); map_remove(result, "bytes"); }
+    return result;
+}
+
+fn content_signal_regenerate(args) {
+    _args(args, ["filename", "data_base64", "options"]);
+    let source = _decode(args);
+    let options = _raw_options(args, ["strength", "passes", "max_pixels"]);
+    let result = PIXEL.regenerate_png(source.bytes, options);
+    if result.ok { result.data_base64 = base64_encode_bytes(result.bytes); map_remove(result, "bytes"); }
+    return result;
+}
+
+fn content_signal_regenerate_select(args) {
+    _args(args, ["filename", "data_base64", "candidates_base64", "options"]);
+    let source = _decode(args);
+    let candidates = _decode_candidates(args, "candidates_base64", 8, MAX_BYTES);
+    let options = _raw_options(args, ["max_pixels", "minimum_changed_fraction",
+        "maximum_changed_fraction", "maximum_mean_absolute_error", "preserve_alpha"]);
+    let result = PIXEL.select_regeneration_candidates(source.bytes, candidates, options);
+    if result.ok { result.data_base64 = base64_encode_bytes(result.bytes); map_remove(result, "bytes"); }
+    return result;
+}
+
+fn content_signal_mask(args) {
+    _args(args, ["filename", "data_base64", "options"]);
+    let source = _decode(args);
+    let options = _raw_options(args, ["mode", "region", "regions", "minimum", "maximum",
+        "color", "tolerance", "dilate_radius", "max_pixels", "max_mask_fraction"]);
+    let result = MASK.generate_png(source.bytes, options);
+    if result.ok { result.data_base64 = base64_encode_bytes(result.bytes); map_remove(result, "bytes"); }
+    return result;
+}
+
+fn content_signal_auto_inpaint(args) {
+    _args(args, ["filename", "data_base64", "mask_options", "options"]);
+    let source = _decode(args);
+    let mask_options = try args.mask_options catch map{};
+    if type(mask_options) != "map" or len(map_keys(mask_options)) > 10 { throw "mask_options must be bounded"; }
+    let generated = MASK.generate_png(source.bytes, mask_options); if not generated.ok { return generated; }
+    let options = _raw_options(args, ["threshold", "max_pixels", "max_iterations", "max_mask_fraction"]);
+    let result = PIXEL.inpaint_png(source.bytes, generated.bytes, options);
+    if result.ok {
+        result.data_base64 = base64_encode_bytes(result.bytes); map_remove(result, "bytes");
+        result.mask = map{ mode: generated.mode, selected_pixels: generated.selected_pixels,
+            mask_fraction: generated.mask_fraction };
+    }
+    return result;
+}
+
+fn content_signal_batch(args) {
+    _args(args,["operation","items","options","stop_on_error"]);
+    let operation=str_lower(str(try args.operation catch "inspect"));
+    if operation!="inspect" and operation!="clean" { throw "batch operation must be inspect or clean"; }
+    let items=try args.items catch nil;
+    if type(items)!="array" or len(items)<1 or len(items)>32 { throw "batch items must contain 1..32 inputs"; }
+    let decoded=[]; let total=0;
+    for item in items {
+        _args(item,["filename","data_base64"]);
+        array_push(decoded,_decode(item));
+        total=total+len(decoded[len(decoded)-1].bytes);
+        if total>MAX_BYTES { throw "combined batch input exceeds 8 MiB"; }
+    }
+    let stop_on_error=try args.stop_on_error catch false;
+    if type(stop_on_error)!="bool" { throw "stop_on_error must be boolean"; }
+    let policy=POLICY.normalize(_options(args,operation)); if not policy.ok { return policy; }
+    let reports=[]; let passed=0; let failed=0; let index=0;
+    while index<len(decoded) {
+        let result=if operation=="inspect" {
+            ENGINE.inspect_with_policy(decoded[index].bytes,decoded[index].filename,policy)
+        } else { ENGINE.clean_with_policy(decoded[index].bytes,decoded[index].filename,policy) };
+        if result.ok and operation=="clean" {
+            result.data_base64=base64_encode_bytes(result.bytes); map_remove(result,"bytes");
+        }
+        array_push(reports,_private_batch_result(result));
+        if result.ok { passed=passed+1; } else { failed=failed+1; }
+        if not result.ok and stop_on_error { break; }
+        index=index+1;
+    }
+    return map{ok:failed==0,format:"pb_mcp.content-signal.batch.v1",operation:operation,
+        requested:len(items),processed:len(reports),passed:passed,failed:failed,
+        stopped_early:len(reports)<len(items),reports:reports,policy_reused:true,
+        max_items:32,max_combined_bytes:MAX_BYTES,filesystem_effects:false,
+        process_effects:false,network_effects:false,content_exposed:false,
+        credentials_exposed:false,absolute_paths_exposed:false};
+}
+
+fn tool_list() {
+    return ["content_signal_capabilities", "content_signal_inspect", "content_signal_clean",
+        "content_signal_rewrite_evaluate", "content_signal_rewrite", "content_signal_rewrite_select",
+        "content_signal_rewrite_hook_create", "content_signal_rewrite_hook_accept",
+        "content_signal_inpaint", "content_signal_regenerate", "content_signal_regenerate_select", "content_signal_mask",
+        "content_signal_auto_inpaint", "content_signal_batch"];
+}
+
+fn catalog_entries() {
+    let out=[]; for name in tool_list() {
+        array_push(out,map{name:name,category:"content-signal",profile:"core-code",
+            read_only:true,destructive:false,open_world:false,source:"src/content_signal_tools.sapp",
+            description:"Process bounded in-memory content through the PBLang-native PB Cleanroom engine with private authenticated access, exact schemas, and no server-side paths."});
+    } return out;
+}
+
+fn call_content_signal(tool, args) {
+    if tool == "content_signal_capabilities" { return content_signal_capabilities(args); }
+    if tool == "content_signal_inspect" { return content_signal_inspect(args); }
+    if tool == "content_signal_clean" { return content_signal_clean(args); }
+    if tool == "content_signal_rewrite_evaluate" { return content_signal_rewrite_evaluate(args); }
+    if tool == "content_signal_rewrite" { return content_signal_rewrite(args); }
+    if tool == "content_signal_rewrite_select" { return content_signal_rewrite_select(args); }
+    if tool == "content_signal_rewrite_hook_create" { return content_signal_rewrite_hook_create(args); }
+    if tool == "content_signal_rewrite_hook_accept" { return content_signal_rewrite_hook_accept(args); }
+    if tool == "content_signal_inpaint" { return content_signal_inpaint(args); }
+    if tool == "content_signal_regenerate" { return content_signal_regenerate(args); }
+    if tool == "content_signal_regenerate_select" { return content_signal_regenerate_select(args); }
+    if tool == "content_signal_mask" { return content_signal_mask(args); }
+    if tool == "content_signal_auto_inpaint" { return content_signal_auto_inpaint(args); }
+    if tool == "content_signal_batch" { return content_signal_batch(args); }
+    return nil;
+}
+
+export MAX_BYTES, content_signal_capabilities, content_signal_inspect, content_signal_clean;
+export content_signal_rewrite_evaluate, content_signal_rewrite;
+export content_signal_inpaint, content_signal_regenerate;
+export content_signal_regenerate_select;
+export content_signal_rewrite_select, content_signal_mask, content_signal_auto_inpaint;
+export content_signal_rewrite_hook_create,content_signal_rewrite_hook_accept;
+export content_signal_batch;
+fn implemented_tools() { return tool_list(); }
+export implemented_tools, tool_list, catalog_entries, call_content_signal;

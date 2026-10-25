@@ -1,0 +1,231 @@
+// Opt-in statistical text rewriting through a bounded local PBLang Ollama
+// adapter. Candidate selection is deterministic and reports its evidence.
+
+let Ollama = import("stdlib:ollama.sapp");
+let Regex = import("stdlib:regex.sapp");
+let Hooks = (try import("./model_hooks.sapp") catch (try import("cleanroom/model_hooks.sapp") catch import("editors/ide/tools/mcpservers/pb-mcp-server/src/cleanroom/model_hooks.sapp")));
+
+let FORMAT = "pbwatermarks.statistical-rewrite.v1";
+let MAX_TEXT_CHARS = 65536;
+let MAX_CANDIDATES = 4;
+
+fn _error(message) { return map{ ok: false, format: FORMAT, error: message }; }
+
+fn _separator(cp) {
+    return cp <= 32 or cp == 44 or cp == 46 or cp == 58 or cp == 59
+        or cp == 33 or cp == 63 or cp == 40 or cp == 41 or cp == 91
+        or cp == 93 or cp == 123 or cp == 125 or cp == 34 or cp == 39
+        or cp == 47 or cp == 92 or cp == 124 or cp == 45;
+}
+
+fn _tokens(text) {
+    let out = []; let current = ""; let i = 0;
+    while i < len(text) {
+        let cp = strcharcodeat(text, i);
+        if _separator(cp) {
+            if current != "" { array_push(out, str_lower(current)); current = ""; }
+        } else { current = current + str_slice(text, i, i + 1); }
+        i = i + 1;
+    }
+    if current != "" { array_push(out, str_lower(current)); }
+    return out;
+}
+
+fn _bigrams(tokens) {
+    let out = map{}; let i = 0;
+    while i + 1 < len(tokens) {
+        out[tokens[i] + "\n" + tokens[i + 1]] = true; i = i + 1;
+    }
+    return out;
+}
+
+fn _jaccard_divergence(left, right) {
+    let a = _bigrams(_tokens(left)); let b = _bigrams(_tokens(right));
+    let intersection = 0;
+    for key in map_keys(a) { if map_has(b, key) { intersection = intersection + 1; } }
+    let union = len(map_keys(a)) + len(map_keys(b)) - intersection;
+    if union == 0 { return if left == right { 0.0 } else { 1.0 }; }
+    return 1.0 - intersection / union;
+}
+
+fn _numbers(text) { return Regex.find_all(text, "[0-9]+(?:[.,][0-9]+)?"); }
+
+fn _multiset(values) {
+    let out=map{}; for value in values { if not map_has(out,value) { out[value]=0; } out[value]=out[value]+1; } return out;
+}
+fn _contains_multiset(required,actual) {
+    let need=_multiset(required); let have=_multiset(actual);
+    for key in map_keys(need) {
+        if (try have[key] catch 0)<need[key] { return false; }
+    } return true;
+}
+fn _delimited(text,delimiter) {
+    let out=[]; let start=-1; let i=0;
+    while i<len(text) {
+        if str_slice(text,i,i+1)==delimiter {
+            if start<0 { start=i+1; }
+            else { if i>start { array_push(out,delimiter+str_slice(text,start,i)+delimiter); } start=-1; }
+        }
+        i=i+1;
+    }
+    return out;
+}
+fn _urls(text) {
+    let out=[]; for token in str_split(str_replace_all(text,"\n"," ")," ") {
+        let clean=str_trim(token);
+        while len(clean)>0 and (str_ends_with(clean,".") or str_ends_with(clean,",")
+            or str_ends_with(clean,";") or str_ends_with(clean,":")
+            or str_ends_with(clean,")") or str_ends_with(clean,"]")) {
+            clean=str_slice(clean,0,len(clean)-1);
+        }
+        // pblang-security-ignore-next-line: network.plaintext-http reason=recognizes URL text for semantic-preservation checks and performs no network I/O
+        if str_starts_with(clean,"https://") or str_starts_with(clean,"http://") { array_push(out,clean); }
+    } return out;
+}
+fn _protected_fragments(text) {
+    let out=_urls(text); for value in _delimited(text,"\"") { array_push(out,value); }
+    for value in _delimited(text,"`") { array_push(out,value); } return out;
+}
+fn _negations(text) {
+    let out=[]; let terms=["no","not","never","without","cannot","can't","won't","mustn't"];
+    for token in _tokens(text) { for term in terms { if token==term { array_push(out,"negation"); } } } return out;
+}
+
+fn evaluate(source, candidate) {
+    if type(source) != "string" or type(candidate) != "string" { return _error("source and candidate must be text"); }
+    candidate = str_trim(candidate);
+    if candidate == "" { return _error("candidate is empty"); }
+    let source_len = num_max(1, len(source)); let ratio = len(candidate) / source_len;
+    let numbers_preserved = _contains_multiset(_numbers(source),_numbers(candidate));
+    let fragments=_protected_fragments(source);
+    let protected_fragments_preserved=_contains_multiset(fragments,_protected_fragments(candidate));
+    let negations_preserved=_contains_multiset(_negations(source),_negations(candidate));
+    let acceptable_length = ratio >= 0.65 and ratio <= 1.60;
+    let divergence = _jaccard_divergence(source, candidate);
+    let length_penalty = num_abs(1.0 - ratio) * 0.35;
+    let score = divergence - length_penalty;
+    return map{ ok: true, format: FORMAT, candidate: candidate,
+        accepted: candidate != source and numbers_preserved and protected_fragments_preserved
+            and negations_preserved and acceptable_length,
+        bigram_divergence: divergence, length_ratio: ratio,
+        length_penalty: length_penalty, score: score,
+        numbers_preserved: numbers_preserved, protected_fragments_preserved:protected_fragments_preserved,
+        protected_fragment_count:len(fragments),negations_preserved:negations_preserved,
+        acceptable_length: acceptable_length };
+}
+
+fn _mode(value) {
+    value = str_lower(str(value));
+    if value != "paraphrase" and value != "humanize" and value != "backtranslate"
+        and value != "technical" { return nil; }
+    return value;
+}
+
+fn _prompt(text, mode, attempt) {
+    let instruction = "Rewrite the text using substantially different syntax and word choices";
+    if mode == "humanize" { instruction = "Rewrite the text in natural, varied human prose"; }
+    elif mode == "backtranslate" { instruction = "Re-express the text as if translated through another language and back"; }
+    elif mode == "technical" { instruction = "Rewrite the technical text clearly with a different sentence structure"; }
+    return instruction + ". Preserve meaning, factual claims, numbers, names, code, URLs, and quoted text. "
+        + "Do not add attribution, provenance, commentary, headings, or an explanation. Return only the rewritten text. "
+        + "Candidate variation " + str(attempt) + ".\n\nINPUT:\n" + text;
+}
+
+fn select_candidates(text, candidates, options = nil) {
+    if type(text) != "string" or text == "" or len(text) > MAX_TEXT_CHARS
+        or len(str_to_bytes(text)) > 262144 {
+        return _error("text must contain 1..65536 characters within 256 KiB");
+    }
+    if type(candidates) != "array" or len(candidates) < 1 or len(candidates) > 16 {
+        return _error("candidates must be an array containing 1..16 texts");
+    }
+    if options == nil { options = map{}; }
+    if type(options) != "map" { return _error("selection options must be a map"); }
+    for key in map_keys(options) {
+        if key != "minimum_score" { return _error("unknown selection option"); }
+    }
+    let minimum_score = try options.minimum_score catch -1.0;
+    if type(minimum_score) != "number" or minimum_score < -1 or minimum_score > 1 {
+        return _error("minimum_score must be in -1..1");
+    }
+    let evidence = []; let accepted = []; let total_chars = 0;
+    for candidate in candidates {
+        if type(candidate) != "string" or len(candidate) > MAX_TEXT_CHARS {
+            return _error("every candidate must be bounded UTF-8 text");
+        }
+        total_chars = total_chars + len(candidate);
+        if total_chars > 262144 { return _error("combined candidate text exceeds 256 KiB"); }
+        let item = evaluate(text, candidate); array_push(evidence, item);
+        if item.ok and item.accepted and item.score >= minimum_score { array_push(accepted, item); }
+    }
+    if len(accepted) == 0 {
+        return map{ ok: false, format: FORMAT,
+            error: "no supplied candidate passed bounded preservation checks",
+            candidates_evaluated: len(evidence), evidence: evidence };
+    }
+    let best = accepted[0]; let i = 1;
+    while i < len(accepted) { if accepted[i].score > best.score { best = accepted[i]; } i = i + 1; }
+    return map{ ok: true, format: FORMAT, text: best.candidate,
+        changed: best.candidate != text, candidates_evaluated: len(evidence),
+        candidates_accepted: len(accepted), selected: best, evidence: evidence,
+        source: "provided-candidates", network_access: false, bounded: true,
+        semantic_equivalence_guaranteed: false, detector_bypass_guaranteed: false };
+}
+
+fn rewrite(text, options = nil, post_fn = nil) {
+    if type(text) != "string" or text == "" or len(text) > MAX_TEXT_CHARS
+        or len(str_to_bytes(text)) > 262144 {
+        return _error("text must contain 1..65536 characters within 256 KiB");
+    }
+    if options == nil { options = map{}; }
+    if type(options) != "map" { return _error("rewrite options must be a map"); }
+    let allowed = ["model", "mode", "candidates", "max_tokens", "temperature"];
+    for key in map_keys(options) {
+        let known = false; for item in allowed { if key == item { known = true; } }
+        if not known { return _error("unknown rewrite option"); }
+    }
+    let model = try options.model catch "";
+    if type(model) != "string" or model == "" { return _error("a local Ollama model is required"); }
+    let mode = _mode(try options.mode catch "paraphrase");
+    if mode == nil { return _error("mode must be paraphrase, humanize, backtranslate, or technical"); }
+    let count = try options.candidates catch 3;
+    if type(count) != "number" or num_floor(count) != count or count < 1 or count > MAX_CANDIDATES {
+        return _error("candidates must be an integer in 1..4");
+    }
+    let generated = []; let accepted = []; let attempt = 1;
+    while attempt <= count {
+        let result = try Ollama.generate_result(model, _prompt(text, mode, attempt), map{
+            local_only: true,
+            max_tokens: try options.max_tokens catch 1024,
+            temperature: try options.temperature catch 0.45
+        }, post_fn) catch nil;
+        if result != nil and result.ok {
+            let evidence = evaluate(text, result.text); array_push(generated, evidence);
+            if evidence.ok and evidence.accepted { array_push(accepted, evidence); }
+        }
+        attempt = attempt + 1;
+    }
+    let supplied = []; for item in generated { if item.ok { array_push(supplied, item.candidate); } }
+    let selected = select_candidates(text, supplied);
+    if not selected.ok {
+        selected.error = "no generated candidate passed bounded preservation checks";
+        selected.candidates_requested = count; selected.evidence = generated; return selected;
+    }
+    selected.mode = mode; selected.model = model; selected.candidates_requested = count;
+    selected.local_only = true; selected.source = "local-ollama";
+    return selected;
+}
+
+fn create_hook_request(text,options=nil) { return Hooks.create_rewrite_request(text,options); }
+fn select_hook_response(request,response,options=nil) {
+    let imported=Hooks.accept_rewrite_response(request,response); if not imported.ok { return imported; }
+    let selected=select_candidates(imported.source_text,imported.candidates,options); if not selected.ok { return selected; }
+    selected.source="codex-session-hook"; selected.network_access=false;
+    selected.external_model_execution=true; selected.credentials_used=false;
+    selected.privacy_verified=true; selected.auto_publish_allowed=imported.auto_publish_allowed;
+    selected.human_review_required=true; selected.request_id=imported.request_id;
+    return selected;
+}
+
+export FORMAT, MAX_TEXT_CHARS, MAX_CANDIDATES, evaluate, select_candidates, rewrite;
+export create_hook_request,select_hook_response;

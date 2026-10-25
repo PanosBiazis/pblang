@@ -1,0 +1,176 @@
+// Bounded PNG mask generation from explicit geometric or pixel criteria.
+// Automatic modes require a region of interest and never silently select the
+// entire image. The generated mask is suitable for pixel_cleaner.inpaint_png.
+
+let Pipeline = import("stdlib:image_pipeline.sapp");
+
+let FORMAT = "pbwatermarks.mask.v1";
+let DEFAULT_MAX_PIXELS = 1048576;
+let MAX_PIXELS = 4194304;
+
+fn _error(message) { return map{ ok: false, format: FORMAT, error: message }; }
+
+fn _integer(value, fallback, minimum, maximum) {
+    if value == nil { value = fallback; }
+    if type(value) != "number" or num_floor(value) != value or value < minimum or value > maximum { return nil; }
+    return value;
+}
+
+fn _finite(value) {
+    if type(value) != "number" { return false; }
+    let text = str_lower(str(value)); return text != "nan" and not str_contains(text, "inf");
+}
+
+fn _region(value, width, height) {
+    if type(value) != "map" { return nil; }
+    let x = _integer(try value.x catch nil, nil, 0, width - 1);
+    let y = _integer(try value.y catch nil, nil, 0, height - 1);
+    let w = _integer(try value.width catch nil, nil, 1, width);
+    let h = _integer(try value.height catch nil, nil, 1, height);
+    if x == nil or y == nil or w == nil or h == nil or x + w > width or y + h > height { return nil; }
+    return map{ x: x, y: y, width: w, height: h };
+}
+
+fn _inside(region, x, y) {
+    return x >= region.x and y >= region.y
+        and x < region.x + region.width and y < region.y + region.height;
+}
+
+fn _blank(width, height, value) {
+    let out = []; let y = 0;
+    while y < height {
+        let row = []; let x = 0;
+        while x < width { array_push(row, value); x = x + 1; }
+        array_push(out, row); y = y + 1;
+    }
+    return out;
+}
+
+fn _dilate(selected, width, height, radius) {
+    let pass = 0;
+    while pass < radius {
+        let next = []; let y = 0;
+        while y < height {
+            let row = []; let x = 0;
+            while x < width {
+                let value = selected[y][x];
+                if not value {
+                    let yy = num_max(0, y - 1);
+                    while yy <= num_min(height - 1, y + 1) and not value {
+                        let xx = num_max(0, x - 1);
+                        while xx <= num_min(width - 1, x + 1) {
+                            if selected[yy][xx] { value = true; break; }
+                            xx = xx + 1;
+                        }
+                        yy = yy + 1;
+                    }
+                }
+                array_push(row, value); x = x + 1;
+            }
+            array_push(next, row); y = y + 1;
+        }
+        selected = next; pass = pass + 1;
+    }
+    return selected;
+}
+
+fn generate_png(image_bytes, options = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { return _error("mask options must be a map"); }
+    let allowed = ["mode", "region", "regions", "minimum", "maximum", "color",
+        "tolerance", "dilate_radius", "max_pixels", "max_mask_fraction"];
+    for key in map_keys(options) {
+        let known = false; for item in allowed { if key == item { known = true; } }
+        if not known { return _error("unknown mask option: " + str(key)); }
+    }
+    let decoded = try Pipeline.decode_png(image_bytes) catch nil;
+    if decoded == nil { return _error("input must be a valid bounded RGBA PNG"); }
+    let max_pixels = _integer(try options.max_pixels catch nil,
+        DEFAULT_MAX_PIXELS, 1, MAX_PIXELS);
+    let radius = _integer(try options.dilate_radius catch nil, 1, 0, 4);
+    let max_fraction = try options.max_mask_fraction catch 0.50;
+    if max_pixels == nil or radius == nil or not _finite(max_fraction)
+        or max_fraction <= 0 or max_fraction > 0.90 {
+        return _error("invalid mask resource limits");
+    }
+    if decoded.width * decoded.height > max_pixels { return _error("image exceeds configured pixel budget"); }
+    let mode = str_lower(str(try options.mode catch "regions"));
+    if mode != "regions" and mode != "luminance" and mode != "color" and mode != "alpha" {
+        return _error("mask mode must be regions, luminance, color, or alpha");
+    }
+    let selected = _blank(decoded.width, decoded.height, false);
+    if mode == "regions" {
+        let regions = try options.regions catch [];
+        if type(regions) != "array" or len(regions) < 1 or len(regions) > 64 {
+            return _error("regions mode requires 1..64 bounded rectangles");
+        }
+        for value in regions {
+            let region = _region(value, decoded.width, decoded.height);
+            if region == nil { return _error("one or more mask regions are outside the image"); }
+            let y = region.y;
+            while y < region.y + region.height {
+                let x = region.x;
+                while x < region.x + region.width { selected[y][x] = true; x = x + 1; }
+                y = y + 1;
+            }
+        }
+    } else {
+        let region = _region(try options.region catch nil, decoded.width, decoded.height);
+        if region == nil { return _error("automatic mask modes require a bounded region of interest"); }
+        let minimum = _integer(try options.minimum catch nil, if mode == "alpha" { 1 } else { 192 }, 0, 255);
+        let maximum = _integer(try options.maximum catch nil, 255, 0, 255);
+        let tolerance = _integer(try options.tolerance catch nil, 24, 0, 255);
+        let color = try options.color catch [255, 255, 255];
+        if minimum == nil or maximum == nil or minimum > maximum or tolerance == nil
+            or type(color) != "array" or len(color) != 3 {
+            return _error("automatic mask thresholds are invalid");
+        }
+        for channel in color {
+            if _integer(channel, nil, 0, 255) == nil { return _error("mask color must contain three bytes"); }
+        }
+        let y = region.y;
+        while y < region.y + region.height {
+            let x = region.x;
+            while x < region.x + region.width {
+                let pixel = decoded.image[y][x]; let match = false;
+                if mode == "luminance" {
+                    let value = num_floor(pixel[0] * 0.299 + pixel[1] * 0.587 + pixel[2] * 0.114);
+                    match = value >= minimum and value <= maximum;
+                } elif mode == "alpha" { match = pixel[3] >= minimum and pixel[3] <= maximum; }
+                else {
+                    match = num_abs(pixel[0] - color[0]) <= tolerance
+                        and num_abs(pixel[1] - color[1]) <= tolerance
+                        and num_abs(pixel[2] - color[2]) <= tolerance;
+                }
+                selected[y][x] = match; x = x + 1;
+            }
+            y = y + 1;
+        }
+    }
+    selected = _dilate(selected, decoded.width, decoded.height, radius);
+    let mask = []; let count = 0; let y = 0;
+    while y < decoded.height {
+        let row = []; let x = 0;
+        while x < decoded.width {
+            if selected[y][x] { array_push(row, [255, 255, 255, 255]); count = count + 1; }
+            else { array_push(row, [0, 0, 0, 255]); }
+            x = x + 1;
+        }
+        array_push(mask, row); y = y + 1;
+    }
+    if count == 0 { return _error("mask criteria selected no pixels"); }
+    let fraction = count / (decoded.width * decoded.height);
+    if fraction > max_fraction { return _error("generated mask exceeds configured area fraction"); }
+    let encoded = try Pipeline.encode_png(mask) catch nil;
+    if encoded == nil { return _error("mask encoding failed"); }
+    let verified = try Pipeline.decode_png(encoded) catch nil;
+    if verified == nil or verified.width != decoded.width or verified.height != decoded.height {
+        return _error("generated mask verification failed");
+    }
+    return map{ ok: true, format: FORMAT, bytes: encoded, mode: mode,
+        width: decoded.width, height: decoded.height, selected_pixels: count,
+        mask_fraction: fraction, dilate_radius: radius, structure_verified: true,
+        automatic_detection_guaranteed: false };
+}
+
+export FORMAT, DEFAULT_MAX_PIXELS, MAX_PIXELS, generate_png;

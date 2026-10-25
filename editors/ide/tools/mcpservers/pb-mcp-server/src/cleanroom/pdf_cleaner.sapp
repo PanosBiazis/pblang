@@ -1,0 +1,1179 @@
+// Bounded structural PDF cleaner with classic/xref-stream parsing, incremental
+// revision normalization, object-stream expansion, and Standard Security
+// Handler R2-R6 decryption. Unsupported handlers, crypt filters, malformed
+// object graphs, incorrect passwords, and exhausted budgets fail closed.
+
+let Bytes = (try import("./bytekit.sapp") catch (try import("cleanroom/bytekit.sapp") catch import("editors/ide/tools/mcpservers/pb-mcp-server/src/cleanroom/bytekit.sapp")));
+let Filters = import("stdlib:pdf_filters.sapp");
+let Security = import("stdlib:pdf_security.sapp");
+let AES = import("stdlib:aes_gcm.sapp");
+
+let FORMAT = "pbwatermarks.pdf.v1";
+let MAX_OBJECTS = 8192;
+let MAX_TOKENS_PER_OBJECT = 65536;
+
+fn _error(message) { return map{ ok: false, format: FORMAT, error: message }; }
+
+fn _source(bytes, object) {
+    return try object.source_bytes catch bytes;
+}
+
+fn _white(value) {
+    return value == 0 or value == 9 or value == 10 or value == 12
+        or value == 13 or value == 32;
+}
+
+fn _delimiter(value) {
+    return _white(value) or value == 40 or value == 41 or value == 60
+        or value == 62 or value == 91 or value == 93 or value == 123
+        or value == 125 or value == 47 or value == 37;
+}
+
+fn _skip(bytes, at) {
+    while at < len(bytes) {
+        if _white(bytes[at]) { at = at + 1; }
+        elif bytes[at] == 37 {
+            while at < len(bytes) and bytes[at] != 10 and bytes[at] != 13 { at = at + 1; }
+        } else { break; }
+    }
+    return at;
+}
+
+fn _token(bytes, at) {
+    at = _skip(bytes, at);
+    if at >= len(bytes) { return nil; }
+    let start = at;
+    let value = bytes[at];
+    if value == 40 {
+        let depth = 1; let escaped = false; at = at + 1;
+        while at < len(bytes) and depth > 0 {
+            let current = bytes[at];
+            if escaped { escaped = false; }
+            elif current == 92 { escaped = true; }
+            elif current == 40 { depth = depth + 1; }
+            elif current == 41 { depth = depth - 1; }
+            at = at + 1;
+        }
+        if depth != 0 { throw "unterminated PDF literal string"; }
+        return map{ text: "(string)", start: start, end: at, kind: "string" };
+    }
+    if value == 60 {
+        if at + 1 < len(bytes) and bytes[at + 1] == 60 {
+            return map{ text: "<<", start: start, end: at + 2, kind: "delimiter" };
+        }
+        at = at + 1;
+        while at < len(bytes) and bytes[at] != 62 { at = at + 1; }
+        if at >= len(bytes) { throw "unterminated PDF hexadecimal string"; }
+        return map{ text: "<hex>", start: start, end: at + 1, kind: "hex" };
+    }
+    if value == 62 and at + 1 < len(bytes) and bytes[at + 1] == 62 {
+        return map{ text: ">>", start: start, end: at + 2, kind: "delimiter" };
+    }
+    if value == 91 or value == 93 or value == 123 or value == 125 {
+        return map{ text: strfromcharcode(value), start: start, end: at + 1, kind: "delimiter" };
+    }
+    if value == 47 {
+        at = at + 1;
+        while at < len(bytes) and not _delimiter(bytes[at]) { at = at + 1; }
+        return map{ text: "/" + Bytes.ascii(bytes, start + 1, at - start - 1),
+            start: start, end: at, kind: "name" };
+    }
+    at = at + 1;
+    while at < len(bytes) and not _delimiter(bytes[at]) { at = at + 1; }
+    let text = Bytes.ascii(bytes, start, at - start);
+    if text == "" { throw "non-ASCII PDF syntax outside a stream"; }
+    return map{ text: text, start: start, end: at, kind: "word" };
+}
+
+fn _integer(text) {
+    if type(text) != "string" or not regex_match(text, "^[0-9]+$") { return nil; }
+    let value = try parse_number(text) catch nil;
+    if value == nil or num_floor(value) != value or value < 0 { return nil; }
+    return value;
+}
+
+fn _signed_integer(text) {
+    if type(text)!="string" or not regex_match(text,"^-?[0-9]+$") { return nil; }
+    let value=try parse_number(text) catch nil;
+    if value==nil or num_floor(value)!=value { return nil; } return value;
+}
+
+fn _literal_bytes(bytes,token) {
+    let out=[]; let at=token.start+1; let end=token.end-1;
+    while at<end {
+        let value=bytes[at]; at=at+1;
+        if value!=92 { array_push(out,value); continue; }
+        if at>=end { array_push(out,92); break; }
+        value=bytes[at]; at=at+1;
+        if value==110 { array_push(out,10); }
+        elif value==114 { array_push(out,13); }
+        elif value==116 { array_push(out,9); }
+        elif value==98 { array_push(out,8); }
+        elif value==102 { array_push(out,12); }
+        elif value==10 { }
+        elif value==13 { if at<end and bytes[at]==10 { at=at+1; } }
+        elif value>=48 and value<=55 {
+            let number=value-48; let count=1;
+            while count<3 and at<end and bytes[at]>=48 and bytes[at]<=55 {
+                number=number*8+(bytes[at]-48); at=at+1; count=count+1;
+            }
+            array_push(out,number%256);
+        } else { array_push(out,value); }
+    }
+    return out;
+}
+
+fn _hex_string_bytes(bytes,token) {
+    let out=[]; let high=-1; let at=token.start+1; let end=token.end-1;
+    while at<end {
+        let value=bytes[at]; at=at+1; if _white(value) { continue; }
+        let nibble=-1;
+        if value>=48 and value<=57 { nibble=value-48; }
+        elif value>=65 and value<=70 { nibble=value-55; }
+        elif value>=97 and value<=102 { nibble=value-87; }
+        if nibble<0 { throw "PDF hexadecimal string contains an invalid byte"; }
+        if high<0 { high=nibble; } else { array_push(out,high*16+nibble); high=-1; }
+    }
+    if high>=0 { array_push(out,high*16); } return out;
+}
+
+fn _token_bytes(bytes,token) {
+    if token.kind=="string" { return _literal_bytes(bytes,token); }
+    if token.kind=="hex" { return _hex_string_bytes(bytes,token); }
+    throw "PDF dictionary value is not a byte string";
+}
+
+fn _dictionary_bytes(bytes,tokens,key) {
+    let span=_dictionary_value(tokens,key); if span==nil or span.first!=span.last { return nil; }
+    let token=tokens[span.first]; if token.kind!="string" and token.kind!="hex" { return nil; }
+    return _token_bytes(bytes,token);
+}
+
+fn _dictionary_boolean(tokens,key,fallback) {
+    let span=_dictionary_value(tokens,key); if span==nil { return fallback; }
+    if span.first!=span.last { return nil; }
+    if tokens[span.first].text=="true" { return true; }
+    if tokens[span.first].text=="false" { return false; }
+    return nil;
+}
+
+fn _dictionary_first_array_bytes(bytes,tokens,key) {
+    let span=_dictionary_value(tokens,key); if span==nil or tokens[span.first].text!="[" { return nil; }
+    let token=tokens[span.first+1]; if token.kind!="string" and token.kind!="hex" { return nil; }
+    return _token_bytes(bytes,token);
+}
+
+fn _count_ascii(bytes, needle) {
+    let wanted = str_to_bytes(needle); let count = 0; let at = 0;
+    while at + len(wanted) <= len(bytes) {
+        if Bytes.equals_at(bytes, at, wanted) { count = count + 1; at = at + len(wanted); }
+        else { at = at + 1; }
+    }
+    return count;
+}
+
+fn _stream_start(bytes, at) {
+    if at >= len(bytes) { throw "PDF stream is missing its line ending"; }
+    if bytes[at] == 13 {
+        if at + 1 < len(bytes) and bytes[at + 1] == 10 { return at + 2; }
+        return at + 1;
+    }
+    if bytes[at] == 10 { return at + 1; }
+    throw "PDF stream keyword must be followed by CR, LF, or CRLF";
+}
+
+fn _stream_length(tokens) {
+    let i = 0;
+    while i + 1 < len(tokens) {
+        if tokens[i].text == "/Length" {
+            if i + 3 < len(tokens) and _integer(tokens[i + 1].text) != nil
+                and _integer(tokens[i + 2].text) != nil and tokens[i + 3].text == "R" {
+                return map{ direct: false, number: _integer(tokens[i + 1].text),
+                    generation: _integer(tokens[i + 2].text) };
+            }
+            let value = _integer(tokens[i + 1].text);
+            if value == nil { throw "PDF stream length must be a direct non-negative integer"; }
+            return map{ direct: true, value: value };
+        }
+        i = i + 1;
+    }
+    throw "PDF stream has no /Length";
+}
+
+fn _indirect_stream_end(bytes, stream_start) {
+    let needle = str_to_bytes("endstream"); let at = stream_start;
+    while at + len(needle) <= len(bytes) {
+        if Bytes.equals_at(bytes, at, needle) {
+            let marker = try _token(bytes, at) catch nil;
+            let endobj = if marker == nil { nil } else { try _token(bytes, marker.end) catch nil };
+            if marker != nil and marker.start == at and marker.text == "endstream"
+                and endobj != nil and endobj.text == "endobj" {
+                let data_end = at;
+                if data_end > stream_start and bytes[data_end - 1] == 10 { data_end = data_end - 1; }
+                if data_end > stream_start and bytes[data_end - 1] == 13 { data_end = data_end - 1; }
+                return map{ stream_end: data_end, marker_start: marker.start,
+                    endstream_end: marker.end };
+            }
+            at = at + len(needle);
+        } else { at = at + 1; }
+    }
+    throw "indirect-length PDF stream has no structural endstream";
+}
+
+fn _parse_object(bytes, first, second, obj_token) {
+    let number = _integer(first.text); let generation = _integer(second.text);
+    if number == nil or generation == nil or obj_token.text != "obj" or number < 1 {
+        throw "invalid PDF indirect object header";
+    }
+    let state = map{ tokens: [], at: obj_token.end, content_start: obj_token.end,
+        dict_start: -1, dict_end: -1, dict_depth: 0,
+        stream_token: nil, stream_start: -1, stream_end: -1,
+        endstream_end: -1, stream_length_ref: nil, token_count: 0 };
+    if state.at < 0 { throw "invalid PDF object offset"; }
+    loop {
+        let token = _token(bytes, state.at);
+        if token == nil { throw "unterminated PDF indirect object"; }
+        state.token_count = state.token_count + 1;
+        if state.token_count > MAX_TOKENS_PER_OBJECT { throw "PDF object token budget exceeded"; }
+        if token.text == "<<" {
+            if state.dict_start < 0 { state.dict_start = token.start; }
+            state.dict_depth = state.dict_depth + 1;
+        } elif token.text == ">>" {
+            state.dict_depth = state.dict_depth - 1;
+            if state.dict_depth < 0 { throw "unbalanced PDF dictionary"; }
+            if state.dict_depth == 0 and state.dict_end < 0 { state.dict_end = token.end; }
+        } elif token.text == "stream" {
+            if state.dict_start < 0 or state.dict_end < 0 or state.dict_depth != 0
+                or state.stream_token != nil {
+                throw "invalid PDF stream object";
+            }
+            let length = _stream_length(state.tokens);
+            state.stream_token = token; state.stream_start = _stream_start(bytes, token.end);
+            let endstream = nil;
+            if length.direct {
+                state.stream_end = state.stream_start + length.value;
+                if state.stream_end > len(bytes) { throw "PDF stream exceeds input"; }
+                state.at = state.stream_end;
+                if state.at < len(bytes) and bytes[state.at] == 13 {
+                    state.at = state.at + 1;
+                    if state.at < len(bytes) and bytes[state.at] == 10 { state.at = state.at + 1; }
+                } elif state.at < len(bytes) and bytes[state.at] == 10 { state.at = state.at + 1; }
+                endstream = _token(bytes, state.at);
+                if endstream == nil or endstream.text != "endstream" { throw "PDF stream length does not lead to endstream"; }
+            } else {
+                let located = _indirect_stream_end(bytes, state.stream_start);
+                state.stream_end = located.stream_end; state.stream_length_ref = length;
+                endstream = _token(bytes, located.marker_start);
+                if endstream == nil or endstream.text != "endstream" { throw "invalid indirect-length endstream"; }
+            }
+            state.endstream_end = endstream.end; state.at = endstream.end;
+            array_push(state.tokens, token); array_push(state.tokens, endstream);
+            continue;
+        } elif token.text == "endobj" {
+            if state.dict_depth != 0 { throw "unbalanced PDF object dictionary"; }
+            return map{
+                number: number, generation: generation, start: first.start,
+                content_start: state.content_start, content_end: token.start,
+                end: token.end, dict_start: state.dict_start, dict_end: state.dict_end,
+                stream_token: state.stream_token, stream_start: state.stream_start,
+                stream_end: state.stream_end, endstream_end: state.endstream_end,
+                stream_length_ref: state.stream_length_ref,
+                tokens: state.tokens
+            };
+        }
+        array_push(state.tokens, token); state.at = token.end;
+    }
+}
+
+fn _value_last(tokens, at) {
+    if at >= len(tokens) { throw "PDF dictionary key is missing a value"; }
+    let open = tokens[at].text;
+    if open == "<<" or open == "[" or open == "{" {
+        let close = "}";
+        if open == "<<" { close = ">>"; }
+        elif open == "[" { close = "]"; }
+        let depth = 1; let i = at + 1;
+        while i < len(tokens) and depth > 0 {
+            if tokens[i].text == open { depth = depth + 1; }
+            elif tokens[i].text == close { depth = depth - 1; }
+            i = i + 1;
+        }
+        if depth != 0 { throw "unterminated PDF compound value"; }
+        return i - 1;
+    }
+    if at + 2 < len(tokens) and _integer(tokens[at].text) != nil
+        and _integer(tokens[at + 1].text) != nil and tokens[at + 2].text == "R" {
+        return at + 2;
+    }
+    return at;
+}
+
+fn _explicit_metadata_key(name) {
+    let lower = str_lower(name);
+    return lower == "/c2pa" or lower == "/contentcredentials"
+        or lower == "/content-credentials" or lower == "/aigc"
+        or lower == "/aimodel" or lower == "/provenance"
+        or lower == "/digitalsourcetype" or lower == "/synthid";
+}
+
+fn _markers() {
+    return ["c2pa", "jumb", "contentcredentials", "content credentials",
+        "digitalsourcetype", "trainedalgorithmicmedia", "algorithmicmedia",
+        "aigc", "ai_generated", "ai-generated", "synthid", "openai",
+        "anthropic", "chatgpt", "gemini", "midjourney", "stable diffusion"];
+}
+
+fn _hits(bytes) {
+    let out = [];
+    for marker in _markers() { if Bytes.contains_ascii(bytes, marker) { array_push(out, marker); } }
+    return out;
+}
+
+fn _has_c2pa(hits) {
+    for hit in hits {
+        if hit == "c2pa" or hit == "jumb" or hit == "contentcredentials"
+            or hit == "content credentials" { return true; }
+    }
+    return false;
+}
+
+fn _dictionary_tokens(bytes, start, end) {
+    let out = []; let at = start;
+    while at < end {
+        let token = _token(bytes, at);
+        if token == nil or token.start >= end { break; }
+        array_push(out, token); at = token.end;
+        if len(out) > MAX_TOKENS_PER_OBJECT { throw "PDF dictionary token budget exceeded"; }
+    }
+    return out;
+}
+
+fn _dictionary_metadata(bytes, object) {
+    bytes = _source(bytes, object);
+    if object.dict_start < 0 or object.dict_end < 0 {
+        return map{ metadata: false, embedded: false, hits: [] };
+    }
+    let dictionary = slice(bytes, object.dict_start, object.dict_end);
+    let metadata = Bytes.contains_ascii(dictionary, "/Type")
+        and Bytes.contains_ascii(dictionary, "/Metadata");
+    let embedded = Bytes.contains_ascii(dictionary, "/EmbeddedFile")
+        or Bytes.contains_ascii(dictionary, "/AFRelationship");
+    let hits = _hits(dictionary);
+    if object.stream_start >= 0 and (metadata or embedded or len(hits) > 0) {
+        let stream_hits = _hits(slice(bytes, object.stream_start, object.stream_end));
+        for hit in stream_hits {
+            let exists = false; for old in hits { if old == hit { exists = true; } }
+            if not exists { array_push(hits, hit); }
+        }
+    }
+    return map{ metadata: metadata, embedded: embedded, hits: hits };
+}
+
+fn _rewrite_dictionary(bytes, object, clear_stream) {
+    bytes = _source(bytes, object);
+    let tokens = _dictionary_tokens(bytes, object.dict_start, object.dict_end);
+    let ranges = []; let depth = 0; let i = 0;
+    while i < len(tokens) {
+        let token = tokens[i];
+        if token.text == "<<" { depth = depth + 1; i = i + 1; continue; }
+        if token.text == ">>" { depth = depth - 1; i = i + 1; continue; }
+        if depth == 1 and token.kind == "name" and i + 1 < len(tokens) {
+            let last = _value_last(tokens, i + 1);
+            let value_bytes = slice(bytes, tokens[i + 1].start, tokens[last].end);
+            let remove = _explicit_metadata_key(token.text)
+                or (str_lower(token.text) == "/producer" and len(_hits(value_bytes)) > 0);
+            if clear_stream and (token.text == "/Length" or token.text == "/Filter"
+                or token.text == "/DecodeParms") { remove = true; }
+            if remove {
+                array_push(ranges, map{ start: token.start, end: tokens[last].end });
+                i = last + 1; continue;
+            }
+        }
+        i = i + 1;
+    }
+    let out = []; let cursor = object.dict_start;
+    for range in ranges {
+        Bytes.append(out, bytes, cursor, range.start - cursor); cursor = range.end;
+    }
+    let close_at = object.dict_end - 2;
+    if cursor > close_at { throw "invalid PDF dictionary rewrite range"; }
+    Bytes.append(out, bytes, cursor, close_at - cursor);
+    if clear_stream { Bytes.append(out, str_to_bytes(" /Length 0 ")); }
+    Bytes.append(out, str_to_bytes(">>"));
+    return out;
+}
+
+fn _rewrite_object(bytes, object, metadata) {
+    bytes = _source(bytes, object);
+    if object.dict_start < 0 or object.dict_end < 0 {
+        return map{ bytes: slice(bytes, object.content_start, object.content_end),
+            cleared_stream: false, dictionary_changed: false };
+    }
+    let clear_stream = object.stream_start >= 0
+        and (metadata.metadata or metadata.embedded) and len(metadata.hits) > 0;
+    let dictionary = _rewrite_dictionary(bytes, object, clear_stream);
+    let out = [];
+    Bytes.append(out, bytes, object.content_start, object.dict_start - object.content_start);
+    Bytes.append(out, dictionary);
+    if clear_stream {
+        Bytes.append(out, bytes, object.dict_end, object.stream_token.start - object.dict_end);
+        Bytes.append(out, str_to_bytes("stream\n\nendstream"));
+        Bytes.append(out, bytes, object.endstream_end, object.content_end - object.endstream_end);
+    } else {
+        Bytes.append(out, bytes, object.dict_end, object.content_end - object.dict_end);
+    }
+    return map{ bytes: out, cleared_stream: clear_stream,
+        dictionary_changed: Bytes.digest(dictionary) != Bytes.digest(slice(bytes, object.dict_start, object.dict_end)) };
+}
+
+fn _trailer_ref(tokens, key) {
+    let i = 0;
+    while i + 3 < len(tokens) {
+        if tokens[i].text == key {
+            let number = _integer(tokens[i + 1].text); let generation = _integer(tokens[i + 2].text);
+            if number == nil or generation == nil or tokens[i + 3].text != "R" {
+                throw "invalid PDF trailer reference " + key;
+            }
+            return map{ number: number, generation: generation };
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _dictionary_value(tokens, key) {
+    let depth = 0; let i = 0;
+    while i < len(tokens) {
+        if tokens[i].text == "<<" { depth = depth + 1; i = i + 1; continue; }
+        if tokens[i].text == ">>" { depth = depth - 1; i = i + 1; continue; }
+        if depth == 1 and tokens[i].text == key and i + 1 < len(tokens) {
+            let last = _value_last(tokens, i + 1);
+            return map{ first: i + 1, last: last };
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _dictionary_integer(tokens, key, fallback = nil) {
+    let span = _dictionary_value(tokens, key); if span == nil { return fallback; }
+    if span.first != span.last { return nil; }
+    return _integer(tokens[span.first].text);
+}
+
+fn _dictionary_signed_integer(tokens, key, fallback = nil) {
+    let span = _dictionary_value(tokens, key); if span == nil { return fallback; }
+    if span.first != span.last { return nil; }
+    return _signed_integer(tokens[span.first].text);
+}
+
+fn _dictionary_name(tokens, key, fallback = nil) {
+    let span = _dictionary_value(tokens, key); if span == nil { return fallback; }
+    if span.first != span.last or tokens[span.first].kind != "name" { return nil; }
+    return tokens[span.first].text;
+}
+
+fn _dictionary_ref(tokens, key) {
+    let span = _dictionary_value(tokens, key); if span == nil or span.last - span.first != 2 { return nil; }
+    let number = _integer(tokens[span.first].text); let generation = _integer(tokens[span.first + 1].text);
+    if number == nil or generation == nil or tokens[span.last].text != "R" { return nil; }
+    return map{ number: number, generation: generation };
+}
+
+fn _dictionary_integer_array(tokens, key) {
+    let span = _dictionary_value(tokens, key); if span == nil { return nil; }
+    if tokens[span.first].text != "[" or tokens[span.last].text != "]" { return nil; }
+    let out = []; let i = span.first + 1;
+    while i < span.last {
+        let value = _integer(tokens[i].text); if value == nil { return nil; }
+        array_push(out, value); i = i + 1;
+    }
+    return out;
+}
+
+fn _stream_filters(tokens) {
+    let span = _dictionary_value(tokens, "/Filter"); if span == nil { return []; }
+    let out = [];
+    if span.first == span.last and tokens[span.first].kind == "name" {
+        array_push(out, tokens[span.first].text); return out;
+    }
+    if tokens[span.first].text != "[" or tokens[span.last].text != "]" { return nil; }
+    let i = span.first + 1;
+    while i < span.last {
+        if tokens[i].kind != "name" { return nil; }
+        array_push(out, tokens[i].text); i = i + 1;
+    }
+    return out;
+}
+
+fn _decode_parameters(tokens) {
+    let span = _dictionary_value(tokens, "/DecodeParms");
+    if span == nil { span = _dictionary_value(tokens, "/DP"); }
+    if span == nil { return []; }
+    let sets = []; let starts = [];
+    if tokens[span.first].text == "<<" { array_push(starts, span); }
+    elif tokens[span.first].text == "[" {
+        let depth = 0; let begin = -1; let i = span.first + 1;
+        while i < span.last {
+            if tokens[i].text == "<<" { if depth == 0 { begin = i; } depth = depth + 1; }
+            elif tokens[i].text == ">>" {
+                depth = depth - 1; if depth == 0 { array_push(starts, map{ first: begin, last: i }); }
+            }
+            i = i + 1;
+        }
+    } else { return []; }
+    for bounds in starts {
+        let subset = slice(tokens, bounds.first, bounds.last + 1); let item = map{};
+        for name in ["/Predictor", "/Colors", "/BitsPerComponent", "/Columns", "/EarlyChange"] {
+            let value = _dictionary_integer(subset, name, nil);
+            if value != nil { item[str_slice(name, 1, len(name))] = value; }
+        }
+        array_push(sets, item);
+    }
+    return sets;
+}
+
+fn _decode_stream(bytes, object, maximum, security = nil) {
+    if object.stream_start < 0 { return _error("PDF object has no stream"); }
+    let source = _source(bytes, object); let filters = _stream_filters(object.tokens);
+    if filters == nil { return _error("PDF stream filter dictionary is malformed"); }
+    let payload=slice(source,object.stream_start,object.stream_end);
+    if security!=nil and _dictionary_name(object.tokens,"/Type","")!="/XRef"
+        and not (_dictionary_name(object.tokens,"/Type","")=="/Metadata" and not security.encrypt_metadata) {
+        let decrypted=Security.decrypt_object(payload,security.key,object.number,object.generation,security.stream_method);
+        if not decrypted.ok { return decrypted; } payload=decrypted.bytes;
+    }
+    return Filters.decode(payload,
+        filters, _decode_parameters(object.tokens), maximum);
+}
+
+fn _trailer_tokens(bytes, token) {
+    let open = _token(bytes, token.end);
+    if open == nil or open.text != "<<" { throw "PDF trailer dictionary is missing"; }
+    let state = map{ tokens: [], depth: 0, at: open.start };
+    if state.at < 0 { throw "invalid PDF trailer offset"; }
+    loop {
+        let next = _token(bytes, state.at); if next == nil { throw "unterminated PDF trailer"; }
+        array_push(state.tokens, next);
+        if next.text == "<<" { state.depth = state.depth + 1; }
+        elif next.text == ">>" {
+            state.depth = state.depth - 1;
+            if state.depth == 0 { return map{ tokens: state.tokens, end: next.end }; }
+        }
+        if len(state.tokens) > 4096 { throw "PDF trailer token budget exceeded"; }
+        state.at = next.end;
+    }
+}
+
+fn _classic_xref(bytes, token) {
+    let state = map{ entries: [], at: token.end, trailer_token: nil };
+    loop {
+        let first = _token(bytes, state.at); if first == nil { throw "PDF xref has no trailer"; }
+        if first.text == "trailer" { state.trailer_token = first; break; }
+        let start = _integer(first.text); let count_token = _token(bytes, first.end);
+        let count = if count_token == nil { nil } else { _integer(count_token.text) };
+        if start == nil or count == nil or count < 1 or start + count > MAX_OBJECTS + 1 {
+            throw "invalid PDF xref subsection";
+        }
+        state.at = count_token.end; let index = 0;
+        while index < count {
+            let offset_token = _token(bytes, state.at); let generation_token = _token(bytes, offset_token.end);
+            let state_token = _token(bytes, generation_token.end);
+            let offset = _integer(offset_token.text); let generation = _integer(generation_token.text);
+            if offset == nil or generation == nil or (state_token.text != "n" and state_token.text != "f") {
+                throw "invalid PDF xref entry";
+            }
+            array_push(state.entries, map{ number: start + index,
+                kind: if state_token.text == "n" { 1 } else { 0 },
+                offset: offset, generation: generation });
+            state.at = state_token.end; index = index + 1;
+        }
+    }
+    let trailer = _trailer_tokens(bytes, state.trailer_token);
+    return map{ order: token.start, entries: state.entries, trailer: trailer, end: trailer.end };
+}
+
+fn _uint(bytes, at, width) {
+    if width < 0 or width > 8 or at + width > len(bytes) { throw "PDF xref field exceeds stream"; }
+    let value = 0; let i = 0;
+    while i < width { value = value * 256 + bytes[at + i]; i = i + 1; }
+    return value;
+}
+
+fn _xref_stream_entries(bytes, object, options) {
+    if _dictionary_name(object.tokens, "/Type", "") != "/XRef" { return []; }
+    let widths = _dictionary_integer_array(object.tokens, "/W");
+    let size = _dictionary_integer(object.tokens, "/Size", nil);
+    let indexes = _dictionary_integer_array(object.tokens, "/Index");
+    if widths == nil or len(widths) != 3 or size == nil or size < 1 or size > MAX_OBJECTS + 1 {
+        throw "PDF xref stream has invalid /W or /Size";
+    }
+    for width in widths { if width < 0 or width > 8 { throw "PDF xref stream field width is invalid"; } }
+    if widths[0] + widths[1] + widths[2] < 1 { throw "PDF xref stream entry width is zero"; }
+    if indexes == nil { indexes = [0, size]; }
+    if len(indexes) == 0 or len(indexes) % 2 != 0 { throw "PDF xref stream /Index is invalid"; }
+    let entry_count = 0; let pair = 0;
+    while pair < len(indexes) {
+        if indexes[pair] < 0 or indexes[pair + 1] < 1
+            or indexes[pair] + indexes[pair + 1] > size { throw "PDF xref stream range is invalid"; }
+        entry_count = entry_count + indexes[pair + 1]; pair = pair + 2;
+    }
+    if entry_count > MAX_OBJECTS + 1 { throw "PDF xref stream entry budget exceeded"; }
+    let decoded = _decode_stream(bytes, object,
+        num_min(options.max_input_bytes, entry_count * (widths[0] + widths[1] + widths[2])));
+    if not decoded.ok { throw "PDF xref stream decoding failed"; }
+    let stride = widths[0] + widths[1] + widths[2];
+    if len(decoded.bytes) != entry_count * stride { throw "PDF xref stream byte length does not match /W and /Index"; }
+    let out = []; let at = 0; pair = 0;
+    while pair < len(indexes) {
+        let number = indexes[pair]; let end = number + indexes[pair + 1];
+        while number < end {
+            let kind = if widths[0] == 0 { 1 } else { _uint(decoded.bytes, at, widths[0]) };
+            at = at + widths[0]; let first = _uint(decoded.bytes, at, widths[1]); at = at + widths[1];
+            let second = _uint(decoded.bytes, at, widths[2]); at = at + widths[2];
+            if kind < 0 or kind > 2 { throw "PDF xref stream entry type is invalid"; }
+            let entry = map{ number: number, kind: kind };
+            if kind == 0 { entry.offset = first; entry.generation = second; }
+            elif kind == 1 { entry.offset = first; entry.generation = second; }
+            else { entry.object_stream = first; entry.object_stream_index = second; }
+            array_push(out, entry); number = number + 1;
+        }
+        pair = pair + 2;
+    }
+    return out;
+}
+
+fn _scan_structures(bytes, options) {
+    if type(bytes) != "array" or len(bytes) < 16 or len(bytes) > options.max_input_bytes
+        or not Bytes.equals_at(bytes, 0, str_to_bytes("%PDF-")) {
+        return _error("invalid or oversized PDF input");
+    }
+    let objects = []; let trailers = []; let xrefs = []; let at = 0; let token_count = 0;
+    while at < len(bytes) {
+        let first = _token(bytes, at); if first == nil { break; }
+        token_count = token_count + 1;
+        if token_count > options.max_input_bytes { return _error("PDF lexical scan budget exceeded"); }
+        let number = _integer(first.text);
+        if number != nil {
+            let second = try _token(bytes, first.end) catch nil;
+            let third = if second == nil { nil } else { try _token(bytes, second.end) catch nil };
+            if second != nil and third != nil and _integer(second.text) != nil and third.text == "obj" {
+                let object = _parse_object(bytes, first, second, third);
+                object.source_bytes = bytes; object.order = first.start; object.compressed = false;
+                array_push(objects, object);
+                if len(objects) > MAX_OBJECTS * 4 { return _error("PDF revision object budget exceeded"); }
+                at = object.end; continue;
+            }
+        }
+        if first.text == "trailer" {
+            let trailer = _trailer_tokens(bytes, first); trailer.order = first.start;
+            array_push(trailers, trailer); at = trailer.end; continue;
+        }
+        if first.text == "xref" {
+            let xref = _classic_xref(bytes, first); array_push(xrefs, xref);
+            xref.trailer.order = first.start; array_push(trailers, xref.trailer);
+            at = xref.end; continue;
+        }
+        at = first.end;
+    }
+    if len(objects) == 0 { return _error("PDF contains no indirect objects"); }
+    return map{ ok: true, objects: objects, trailers: trailers, xrefs: xrefs };
+}
+
+fn _synthetic_object(source, number, start, end, order, parent_number, index) {
+    if start < 0 or end < start or end > len(source) { throw "PDF object-stream member range is invalid"; }
+    let tokens = []; let at = start; let dict_start = -1; let dict_end = -1; let depth = 0;
+    while at < end {
+        let token = _token(source, at); if token == nil or token.start >= end { break; }
+        if token.end > end { throw "PDF object-stream member token crosses its boundary"; }
+        array_push(tokens, token);
+        if token.text == "<<" { if depth == 0 and dict_start < 0 { dict_start = token.start; } depth = depth + 1; }
+        elif token.text == ">>" { depth = depth - 1; if depth < 0 { throw "unbalanced object-stream dictionary"; } if depth == 0 and dict_end < 0 { dict_end = token.end; } }
+        if len(tokens) > MAX_TOKENS_PER_OBJECT { throw "PDF object-stream member token budget exceeded"; }
+        at = token.end;
+    }
+    if depth != 0 { throw "unterminated object-stream member dictionary"; }
+    return map{ number: number, generation: 0, start: start, content_start: start,
+        content_end: end, end: end, dict_start: dict_start, dict_end: dict_end,
+        stream_token: nil, stream_start: -1, stream_end: -1, endstream_end: -1,
+        stream_length_ref: nil, tokens: tokens, source_bytes: source,
+        order: order, compressed: true, object_stream: parent_number, object_stream_index: index };
+}
+
+fn _object_stream_members(bytes, object, options, security = nil) {
+    if _dictionary_name(object.tokens, "/Type", "") != "/ObjStm" { return []; }
+    let count = _dictionary_integer(object.tokens, "/N", nil);
+    let first = _dictionary_integer(object.tokens, "/First", nil);
+    if count == nil or first == nil or count < 1 or count > MAX_OBJECTS { throw "PDF object stream has invalid /N or /First"; }
+    let decoded = _decode_stream(bytes, object, options.max_input_bytes,security);
+    if not decoded.ok or first > len(decoded.bytes) { throw "PDF object stream decoding failed"; }
+    let numbers = []; let offsets = []; let at = 0; let i = 0;
+    while i < count {
+        let number_token = _token(decoded.bytes, at);
+        if number_token == nil { throw "PDF object stream header is truncated"; }
+        let offset_token = _token(decoded.bytes, number_token.end);
+        let number = _integer(number_token.text);
+        let offset = if offset_token == nil { nil } else { _integer(offset_token.text) };
+        if number == nil or number < 1 or offset == nil or offset < 0 or offset_token.end > first {
+            throw "PDF object stream header is malformed";
+        }
+        if i > 0 and offset <= offsets[i - 1] { throw "PDF object stream offsets must increase"; }
+        array_push(numbers, number); array_push(offsets, offset); at = offset_token.end; i = i + 1;
+    }
+    let out = []; i = 0;
+    while i < count {
+        let start = first + offsets[i]; let end = if i + 1 < count { first + offsets[i + 1] } else { len(decoded.bytes) };
+        array_push(out, _synthetic_object(decoded.bytes, numbers[i], start, end,
+            object.order + (i + 1) / (count + 1), object.number, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _record_insert(records, record) {
+    let at = len(records); array_push(records, record);
+    while at > 0 and records[at - 1].order > record.order {
+        records[at] = records[at - 1]; at = at - 1;
+    }
+    records[at] = record; return nil;
+}
+
+fn _named_dictionary(tokens,name) {
+    let i=0;
+    while i+1<len(tokens) {
+        if tokens[i].text==name and tokens[i+1].text=="<<" {
+            let depth=0; let at=i+1;
+            while at<len(tokens) {
+                if tokens[at].text=="<<" { depth=depth+1; }
+                elif tokens[at].text==">>" { depth=depth-1; if depth==0 { return slice(tokens,i+1,at+1); } }
+                at=at+1;
+            }
+            return nil;
+        }
+        i=i+1;
+    }
+    return nil;
+}
+
+fn _crypt_method(tokens,version,selector_key) {
+    if version<=2 { return "rc4"; }
+    let selected=_dictionary_name(tokens,selector_key,"/Identity");
+    if selected==nil { return nil; }
+    if selected=="/Identity" { return "identity"; }
+    let dictionary=_named_dictionary(tokens,selected); if dictionary==nil { return nil; }
+    let method=_dictionary_name(dictionary,"/CFM",nil);
+    if method=="/V2" { return "rc4"; }
+    if method=="/AESV2" { return "aesv2"; }
+    if method=="/AESV3" { return "aesv3"; }
+    if method=="/None" { return "identity"; }
+    return nil;
+}
+
+fn _security_context(bytes,encrypt_object,id0,password) {
+    let source=_source(bytes,encrypt_object); let tokens=encrypt_object.tokens;
+    if _dictionary_name(tokens,"/Filter","")!="/Standard" { return _error("PDF uses an unsupported non-standard security handler"); }
+    let version=_dictionary_integer(tokens,"/V",nil); let revision=_dictionary_integer(tokens,"/R",nil);
+    let length_bits=_dictionary_integer(tokens,"/Length",if revision==2 {40}else{128});
+    let permissions=_dictionary_signed_integer(tokens,"/P",nil);
+    let owner=_dictionary_bytes(source,tokens,"/O"); let user=_dictionary_bytes(source,tokens,"/U");
+    let encrypt_metadata=_dictionary_boolean(tokens,"/EncryptMetadata",true);
+    if version==nil or revision==nil or permissions==nil or owner==nil or user==nil
+        or encrypt_metadata==nil or (revision<=4 and id0==nil) {
+        return _error("PDF encryption dictionary is incomplete or malformed");
+    }
+    let modern=(revision==5 or revision==6) and version==5;
+    if not (revision>=2 and revision<=4 and version>=1 and version<=4) and not modern {
+        return _error("PDF security revision and algorithm version are unsupported");
+    }
+    let stream_method=_crypt_method(tokens,version,"/StmF");
+    let string_method=_crypt_method(tokens,version,"/StrF");
+    if stream_method==nil or string_method==nil { return _error("PDF crypt filter configuration is unsupported"); }
+    let authentication=map{revision:revision,length_bits:length_bits,owner:owner,user:user,
+        permissions:permissions,id0:id0,encrypt_metadata:encrypt_metadata};
+    if modern {
+        authentication.owner_encrypted_key=_dictionary_bytes(source,tokens,"/OE");
+        authentication.user_encrypted_key=_dictionary_bytes(source,tokens,"/UE");
+        authentication.encrypted_permissions=_dictionary_bytes(source,tokens,"/Perms");
+    }
+    let authenticated=Security.authenticate(authentication,password);
+    if not authenticated.ok { return authenticated; }
+    return map{ok:true,format:FORMAT,key:authenticated.key,password_role:authenticated.password_role,
+        version:version,revision:revision,length_bits:length_bits,encrypt_metadata:encrypt_metadata,
+        stream_method:stream_method,string_method:string_method,
+        encrypt_object_number:encrypt_object.number,weak_legacy_crypto:revision<4};
+}
+
+fn _hex_serialized(values) { return str_to_bytes("<"+AES.bytes_hex(values)+">"); }
+
+fn _decrypt_range(source,start,end,object,security) {
+    let out=[]; let cursor=start; let at=start;
+    while at<end {
+        let next=_skip(source,at); if next>=end { break; }
+        let token=_token(source,next); if token==nil or token.start>=end { break; }
+        if token.end>end { throw "PDF encrypted token crosses its object boundary"; }
+        if token.kind=="string" or token.kind=="hex" {
+            Bytes.append(out,source,cursor,token.start-cursor);
+            let encrypted=_token_bytes(source,token);
+            let decrypted=Security.decrypt_object(encrypted,security.key,object.number,
+                object.generation,security.string_method);
+            if not decrypted.ok { throw decrypted.error; }
+            Bytes.append(out,_hex_serialized(decrypted.bytes)); cursor=token.end;
+        }
+        at=token.end;
+    }
+    Bytes.append(out,source,cursor,end-cursor); return out;
+}
+
+fn _replace_stream_length_prefix(source,object,length) {
+    let span=_dictionary_value(object.tokens,"/Length");
+    if span==nil { throw "PDF decrypted stream has no /Length"; }
+    let first=object.tokens[span.first]; let last=object.tokens[span.last]; let out=[];
+    Bytes.append(out,source,object.content_start,first.start-object.content_start);
+    Bytes.append(out,str_to_bytes(str(length)));
+    Bytes.append(out,source,last.end,object.stream_start-last.end); return out;
+}
+
+fn _body_object(body,number,generation,order) {
+    let wrapper=str_to_bytes(str(number)+" "+str(generation)+" obj\n");
+    Bytes.append(wrapper,body); Bytes.append(wrapper,str_to_bytes("\nendobj"));
+    let first=_token(wrapper,0); let second=_token(wrapper,first.end); let third=_token(wrapper,second.end);
+    let object=_parse_object(wrapper,first,second,third); object.source_bytes=wrapper;
+    object.order=order; object.compressed=false; object.decrypted=true; return object;
+}
+
+fn _decrypted_object(bytes,object,security) {
+    if security==nil or object.compressed { return object; }
+    let source=_source(bytes,object); let body=[];
+    if object.stream_start<0 {
+        body=_decrypt_range(source,object.content_start,object.content_end,object,security);
+    } else {
+        let encrypted=slice(source,object.stream_start,object.stream_end);
+        let method=security.stream_method;
+        if _dictionary_name(object.tokens,"/Type","")=="/Metadata" and not security.encrypt_metadata { method="identity"; }
+        let clear=Security.decrypt_object(encrypted,security.key,object.number,object.generation,method);
+        if not clear.ok { throw clear.error; }
+        let prefix=_replace_stream_length_prefix(source,object,len(clear.bytes));
+        Bytes.append(body,_decrypt_range(prefix,0,len(prefix),object,security));
+        Bytes.append(body,clear.bytes);
+        Bytes.append(body,_decrypt_range(source,object.stream_end,object.content_end,object,security));
+    }
+    return _body_object(body,object.number,object.generation,object.order);
+}
+
+fn _parse_modern_unchecked(bytes, options) {
+    let scanned = _scan_structures(bytes, options); if not scanned.ok { return scanned; }
+    let records = []; let xref_records = [];
+    for trailer in scanned.trailers {
+        _record_insert(records, map{ order: trailer.order, tokens: trailer.tokens,
+            source: "classic-trailer" });
+    }
+    for xref in scanned.xrefs {
+        _record_insert(xref_records, map{ order: xref.order, entries: xref.entries,
+            source: "classic-xref" });
+    }
+    let object_streams = 0; let xref_streams = 0;
+    for object in scanned.objects {
+        let kind = _dictionary_name(object.tokens, "/Type", "");
+        if kind == "/ObjStm" { object_streams = object_streams + 1; }
+        if kind == "/XRef" {
+            xref_streams = xref_streams + 1;
+            _record_insert(records, map{ order: object.order, tokens: object.tokens,
+                source: "xref-stream" });
+            _record_insert(xref_records, map{ order: object.order,
+                entries: _xref_stream_entries(bytes, object, options), source: "xref-stream" });
+        }
+    }
+    let root = nil; let info = nil; let encrypt = nil; let id0 = nil; let has_prev = false;
+    for record in records {
+        let next_root = _dictionary_ref(record.tokens, "/Root"); if next_root != nil { root = next_root; }
+        let next_info = _dictionary_ref(record.tokens, "/Info"); if next_info != nil { info = next_info; }
+        let next_encrypt = _dictionary_ref(record.tokens, "/Encrypt"); if next_encrypt != nil { encrypt = next_encrypt; }
+        let next_id=_dictionary_first_array_bytes(bytes,record.tokens,"/ID"); if next_id!=nil { id0=next_id; }
+        if _dictionary_integer(record.tokens, "/Prev", nil) != nil { has_prev = true; }
+    }
+    let security=nil;
+    if encrypt!=nil {
+        if options.pdf_password==nil { return _error("encrypted PDF requires pdf_password"); }
+        let encrypt_object=nil;
+        for object in scanned.objects {
+            if object.number==encrypt.number and object.generation==encrypt.generation { encrypt_object=object; }
+        }
+        if encrypt_object==nil { return _error("PDF encryption dictionary object is missing"); }
+        security=_security_context(bytes,encrypt_object,id0,options.pdf_password);
+        if not security.ok { return security; }
+    }
+
+    let candidates = [];
+    for object in scanned.objects {
+        let kind = _dictionary_name(object.tokens, "/Type", "");
+        if kind != "/ObjStm" and kind != "/XRef"
+            and not (encrypt!=nil and object.number==encrypt.number and object.generation==encrypt.generation) {
+            _record_insert(candidates, object);
+        }
+        if kind == "/ObjStm" {
+            let members = _object_stream_members(bytes, object, options,security);
+            for member in members { _record_insert(candidates, member); }
+        }
+    }
+    let by_number = map{};
+    for object in candidates {
+        let key = str(object.number); let previous = try by_number[key] catch nil;
+        if previous == nil or object.order >= previous.order { by_number[key] = object; }
+    }
+    let latest_xref = map{};
+    for record in xref_records { for entry in record.entries { latest_xref[str(entry.number)] = entry; } }
+    let raw_by_offset = map{};
+    for object in scanned.objects { raw_by_offset[str(object.start)] = object; }
+    for key in map_keys(latest_xref) {
+        let entry = latest_xref[key];
+        if entry.kind == 0 {
+            if map_has(by_number, key) { map_remove(by_number, key); }
+        } elif entry.kind == 1 {
+            let physical = try raw_by_offset[str(entry.offset)] catch nil;
+            if physical == nil or physical.number != entry.number
+                or physical.generation != entry.generation {
+                return _error("PDF xref entry " + str(entry.number)
+                    + " offset or generation does not match its indirect object");
+            }
+        } else {
+            let compressed = try by_number[key] catch nil;
+            if compressed == nil or not compressed.compressed
+                or compressed.object_stream != entry.object_stream
+                or compressed.object_stream_index != entry.object_stream_index {
+                return _error("PDF compressed xref entry does not match its object stream");
+            }
+        }
+    }
+    if security!=nil {
+        for key in map_keys(by_number) {
+            let clear=try _decrypted_object(bytes,by_number[key],security) catch nil;
+            if clear==nil { return _error("PDF object "+key+" decryption or normalization failed"); }
+            by_number[key]=clear;
+        }
+    }
+    let max_number = 0;
+    for key in map_keys(by_number) { let number = _integer(key); if number != nil { max_number = num_max(max_number, number); } }
+    if root == nil or not map_has(by_number, str(root.number))
+        or by_number[str(root.number)].generation != root.generation {
+        return _error("PDF revision chain has no valid root object");
+    }
+    let objects = []; let number = 1;
+    while number <= max_number {
+        let object = try by_number[str(number)] catch nil; if object != nil { array_push(objects, object); }
+        number = number + 1;
+    }
+    let has_indirect_stream_lengths = false;
+    for object in scanned.objects {
+        if object.stream_length_ref != nil {
+            has_indirect_stream_lengths = true;
+            let reference = object.stream_length_ref;
+            let length_object = try by_number[str(reference.number)] catch nil;
+            if length_object == nil or length_object.generation != reference.generation
+                or length_object.stream_start >= 0 or len(length_object.tokens) != 1 {
+                return _error("PDF indirect stream length reference is invalid");
+            }
+            let expected_length = _integer(length_object.tokens[0].text);
+            if expected_length == nil or expected_length != object.stream_end - object.stream_start {
+                return _error("PDF indirect stream length does not match stream bytes");
+            }
+        }
+    }
+    let revisions = _count_ascii(bytes, "startxref");
+    if revisions < 1 { return _error("PDF has no startxref revision marker"); }
+    return map{ ok: true, format: FORMAT, objects: objects, by_number: by_number,
+        root: root, info: info, max_number: max_number, trailer_end: len(bytes),
+        classic_xref: xref_streams == 0, xref_stream: xref_streams > 0,
+        xref_stream_count: xref_streams, object_stream_count: object_streams,
+        encrypted: security!=nil, security: security,
+        incremental: revisions > 1 or has_prev,
+        revision_count: revisions, has_indirect_stream_lengths: has_indirect_stream_lengths };
+}
+
+fn _parse_unchecked(bytes, options) {
+    if type(bytes) != "array" or len(bytes) < 16 or len(bytes) > options.max_input_bytes
+        or not Bytes.equals_at(bytes, 0, str_to_bytes("%PDF-")) {
+        return _error("invalid or oversized PDF input");
+    }
+    if _count_ascii(bytes, "startxref") != 1 or _count_ascii(bytes, "%%EOF") != 1 {
+        return _error("incremental or ambiguous PDF revisions are not supported");
+    }
+    if Bytes.contains_ascii(bytes, "/Encrypt") or Bytes.contains_ascii(bytes, "/ObjStm")
+        or Bytes.contains_ascii(bytes, "/XRef") or Bytes.contains_ascii(bytes, "/XRefStm") {
+        return _error("encrypted, object-stream, or xref-stream PDF is not supported");
+    }
+    let objects = []; let by_number = map{}; let at = 0; let xref = nil;
+    loop {
+        let first = _token(bytes, at);
+        if first == nil { throw "PDF is missing xref"; }
+        if first.text == "xref" { xref = first; break; }
+        let second = _token(bytes, first.end); let third = if second == nil { nil } else { _token(bytes, second.end) };
+        if second == nil or third == nil { throw "truncated PDF object header"; }
+        let object = _parse_object(bytes, first, second, third);
+        let key = str(object.number);
+        if map_has(by_number, key) { throw "duplicate PDF object number"; }
+        if len(objects) >= MAX_OBJECTS { throw "PDF object count exceeds bounded limit"; }
+        by_number[key] = object; array_push(objects, object); at = object.end;
+    }
+
+    let xref_entries = map{}; at = xref.end; let trailer_token = nil;
+    loop {
+        let token = _token(bytes, at);
+        if token == nil { throw "PDF xref has no trailer"; }
+        if token.text == "trailer" { trailer_token = token; break; }
+        let start = _integer(token.text); let count_token = _token(bytes, token.end);
+        let count = if count_token == nil { nil } else { _integer(count_token.text) };
+        if start == nil or count == nil or count < 1 or start + count > MAX_OBJECTS + 1 {
+            throw "invalid PDF xref subsection";
+        }
+        at = count_token.end; let index = 0;
+        while index < count {
+            let offset_token = _token(bytes, at); let gen_token = _token(bytes, offset_token.end);
+            let state_token = _token(bytes, gen_token.end);
+            let offset = _integer(offset_token.text); let generation = _integer(gen_token.text);
+            if offset == nil or generation == nil or (state_token.text != "n" and state_token.text != "f") {
+                throw "invalid PDF xref entry";
+            }
+            xref_entries[str(start + index)] = map{ offset: offset, generation: generation, state: state_token.text };
+            at = state_token.end; index = index + 1;
+        }
+    }
+
+    let trailer = _trailer_tokens(bytes, trailer_token);
+    let trailer_tokens = trailer.tokens; let trailer_end = trailer.end;
+    for token in trailer_tokens {
+        if token.text == "/Encrypt" or token.text == "/Prev" or token.text == "/XRefStm" {
+            return _error("encrypted or incremental PDF trailer is not supported");
+        }
+    }
+    let root = try _trailer_ref(trailer_tokens, "/Root") catch nil;
+    let info = try _trailer_ref(trailer_tokens, "/Info") catch nil;
+    if root == nil or not map_has(by_number, str(root.number)) {
+        return _error("PDF trailer has no valid root object");
+    }
+    for object in objects {
+        let entry = try xref_entries[str(object.number)] catch nil;
+        if entry == nil or entry.state != "n" or entry.offset != object.start
+            or entry.generation != object.generation {
+            return _error("PDF xref does not match indirect object offsets");
+        }
+    }
+    let has_indirect_stream_lengths = false;
+    for object in objects {
+        if object.stream_length_ref != nil {
+            has_indirect_stream_lengths = true;
+            let reference = object.stream_length_ref;
+            let length_object = try by_number[str(reference.number)] catch nil;
+            if length_object == nil or length_object.generation != reference.generation
+                or length_object.stream_start >= 0 or len(length_object.tokens) != 1 {
+                return _error("PDF indirect stream length reference is invalid");
+            }
+            let expected_length = _integer(length_object.tokens[0].text);
+            if expected_length == nil or expected_length != object.stream_end - object.stream_start {
+                return _error("PDF indirect stream length does not match stream bytes");
+            }
+        }
+    }
+    let max_number = 0; for object in objects { max_number = num_max(max_number, object.number); }
+    return map{ ok: true, format: FORMAT, objects: objects, by_number: by_number,
+        root: root, info: info, max_number: max_number, trailer_end: trailer_end,
+        classic_xref: true, encrypted: false, incremental: false,
+        has_indirect_stream_lengths: has_indirect_stream_lengths };
+}
+
+fn _parse(bytes, options) {
+    let result = try _parse_modern_unchecked(bytes, options) catch nil;
+    if result == nil { return _error("PDF structure is malformed or outside the bounded structural profile"); }
+    return result;
+}
+
+fn _pad(value, width) {
+    let text = str(value); while len(text) < width { text = "0" + text; }
+    return text;
+}
+
+fn inspect(bytes, options) {
+    let parsed = _parse(bytes, options); if not parsed.ok { return parsed; }
+    let findings = []; let total = 0; let has_c2pa = false;
+    for object in parsed.objects {
+        let metadata = _dictionary_metadata(bytes, object);
+        if (metadata.metadata or metadata.embedded or len(metadata.hits) > 0)
+            and len(metadata.hits) > 0 {
+            total = total + len(metadata.hits);
+            if _has_c2pa(metadata.hits) { has_c2pa = true; }
+            if len(findings) < options.max_findings {
+                array_push(findings, map{ kind: if metadata.metadata { "metadata-stream" } else { "metadata-dictionary" },
+                    confidence: "confirmed", detail: "PDF object " + str(object.number)
+                        + " metadata markers: " + str_join(metadata.hits, ", "),
+                    location: "object " + str(object.number) });
+            }
+        }
+    }
+    return map{ ok: true, format: FORMAT, container_format: "pdf",
+        has_c2pa: has_c2pa, has_ai_metadata: total > 0,
+        findings: findings, finding_count: total, truncated: total > len(findings),
+        structure_verified: true, classic_xref: parsed.classic_xref,
+        xref_stream: parsed.xref_stream, xref_stream_count: parsed.xref_stream_count,
+        object_stream_count: parsed.object_stream_count,
+        indirect_stream_lengths: parsed.has_indirect_stream_lengths,
+        object_count: len(parsed.objects), encrypted: parsed.encrypted,
+        decrypted_for_inspection: parsed.encrypted,
+        incremental: parsed.incremental, revision_count: parsed.revision_count };
+}
+
+fn clean(bytes, options) {
+    let parsed = _parse(bytes, options); if not parsed.ok { return parsed; }
+    let rewritten = map{}; let actions = [];
+    for object in parsed.objects {
+        let metadata = _dictionary_metadata(bytes, object);
+        let result = _rewrite_object(bytes, object, metadata);
+        rewritten[str(object.number)] = result.bytes;
+        if result.cleared_stream { array_push(actions, "clear marker-bearing PDF metadata stream object " + str(object.number)); }
+        if result.dictionary_changed { array_push(actions, "remove explicit PDF provenance dictionary fields from object " + str(object.number)); }
+    }
+    let out = str_to_bytes("%PDF-1.7\n%PBLang structural rewrite\n");
+    let offsets = map{}; let generations = map{}; let number = 1;
+    while number <= parsed.max_number {
+        let object = try parsed.by_number[str(number)] catch nil;
+        if object != nil {
+            offsets[str(number)] = len(out); generations[str(number)] = object.generation;
+            Bytes.append(out, str_to_bytes(str(number) + " " + str(object.generation) + " obj\n"));
+            Bytes.append(out, rewritten[str(number)]); Bytes.append(out, str_to_bytes("\nendobj\n"));
+        }
+        number = number + 1;
+    }
+    let xref_at = len(out);
+    Bytes.append(out, str_to_bytes("xref\n0 " + str(parsed.max_number + 1) + "\n"));
+    Bytes.append(out, str_to_bytes("0000000000 65535 f \n"));
+    number = 1;
+    while number <= parsed.max_number {
+        if map_has(offsets, str(number)) {
+            Bytes.append(out, str_to_bytes(_pad(offsets[str(number)], 10) + " "
+                + _pad(generations[str(number)], 5) + " n \n"));
+        } else { Bytes.append(out, str_to_bytes("0000000000 65535 f \n")); }
+        number = number + 1;
+    }
+    let trailer = "trailer\n<< /Size " + str(parsed.max_number + 1)
+        + " /Root " + str(parsed.root.number) + " " + str(parsed.root.generation) + " R";
+    if parsed.info != nil {
+        trailer = trailer + " /Info " + str(parsed.info.number) + " " + str(parsed.info.generation) + " R";
+    }
+    trailer = trailer + " >>\nstartxref\n" + str(xref_at) + "\n%%EOF\n";
+    Bytes.append(out, str_to_bytes(trailer));
+    if len(out) > options.max_input_bytes { return _error("rewritten PDF exceeds configured output budget"); }
+    let after = inspect(out, options);
+    if not after.ok { return _error("rewritten PDF failed structural verification: " + after.error); }
+    if after.has_ai_metadata { return _error("rewritten PDF retains explicit provenance metadata"); }
+    return map{ ok: true, format: FORMAT, container_format: "pdf", bytes: out,
+        actions: actions, changed: Bytes.digest(out) != Bytes.digest(bytes),
+        input_digest: Bytes.digest(bytes), output_digest: Bytes.digest(out),
+        structure_verified: true, classic_xref: true,
+        normalized_from_incremental: parsed.incremental,
+        normalized_from_xref_stream: parsed.xref_stream,
+        expanded_object_streams: parsed.object_stream_count,
+        source_encrypted: parsed.encrypted,
+        password_role: if parsed.encrypted { parsed.security.password_role } else { "none" },
+        content_streams_preserved: true, attribution_preserved: true,
+        post_inspection: after };
+}
+
+export FORMAT, inspect, clean;
