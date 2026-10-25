@@ -1,0 +1,681 @@
+// Race-resistant PBLang-native agent waiting and two-phase synchronization.
+
+let JSON = import("stdlib:json.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let sec = import("security.sapp");
+let AGENT = import("agent_tools.sapp");
+let RESOURCE = import("resource_store.sapp");
+
+let SYNC_ROOT = ".mint-mcp";
+let SYNC_DIR = "agent-sync";
+let SYNC_LOCK = "agent-sync/state.lock";
+let MAX_SYNC_STATE_BYTES = 262144;
+let MAX_SYNC_FILES = 128;
+let MAX_SYNC_TOTAL_BYTES = 4194304;
+let SYNC_RETENTION_MS = 86400000;
+let DEFAULT_KEYRING = "agent-sync-keyring.json";
+let MAX_KEYRING_BYTES = 65536;
+
+fn _sync_file_limit() {
+    if sec.bool_env("PB_PROJECT_TEST_ENABLE", false) {
+        let raw = try env_get("PB_SYNC_TEST_MAX_FILES") catch nil;
+        let parsed = try parse_number(str(raw)) catch nil;
+        if parsed != nil and parsed == num_floor(parsed) and parsed >= 1 and parsed <= MAX_SYNC_FILES {
+            return parsed;
+        }
+    }
+    return MAX_SYNC_FILES;
+}
+
+fn _sync_byte_limit() {
+    if sec.bool_env("PB_PROJECT_TEST_ENABLE", false) {
+        let raw = try env_get("PB_SYNC_TEST_MAX_BYTES") catch nil;
+        let parsed = try parse_number(str(raw)) catch nil;
+        if parsed != nil and parsed == num_floor(parsed) and parsed >= 512 and parsed <= MAX_SYNC_TOTAL_BYTES {
+            return parsed;
+        }
+    }
+    return MAX_SYNC_TOTAL_BYTES;
+}
+
+fn _now_ms() { return num_floor(try now_ms() catch clock() * 1000.0); }
+
+fn _text(value, name, maximum) {
+    if type(value) != "string" or len(value) < 1 or len(value) > maximum {
+        throw name + " must be a string with 1 to " + str(maximum) + " characters";
+    }
+    if str_contains(value, "\n") or str_contains(value, "\r") or
+       str_contains(value, strfromcharcode(0)) {
+        throw name + " must not contain line breaks or NUL";
+    }
+    return value;
+}
+
+fn _integer(value, name, fallback, minimum, maximum) {
+    if value == nil { value = fallback; }
+    if type(value) != "number" or num_floor(value) != value or
+       value < minimum or value > maximum {
+        throw name + " must be an integer in " + str(minimum) + ".." + str(maximum);
+    }
+    return value;
+}
+
+fn _since(value) {
+    if value == nil { return nil; }
+    return _integer(value, "since_ts_ms", 0, 0, 9007199254740991);
+}
+
+fn _wait_policy(args) {
+    let timeout_cap = if sec.is_public_profile() { 45000 } else { 120000 };
+    let timeout = _integer(try args.timeout_ms catch nil, "timeout_ms", 30000, 0, timeout_cap);
+    let poll = _integer(try args.poll_interval_ms catch nil, "poll_interval_ms", 200, 50, 2000);
+    let adaptive = try args.adaptive_polling catch true;
+    if type(adaptive) != "bool" { throw "adaptive_polling must be boolean"; }
+    let default_max = if poll > 1000 { poll } else { 1000 };
+    let maximum = _integer(try args.max_poll_interval_ms catch nil,
+        "max_poll_interval_ms", if adaptive { default_max } else { poll }, poll, 2000);
+    return map{
+        timeout_ms: timeout, timeout_cap_ms: timeout_cap,
+        initial_poll_ms: poll, max_poll_ms: maximum,
+        adaptive: adaptive, profile: sec.network_profile()
+    };
+}
+
+fn _wait_result(kind, matched, started, polls, policy, messages, context) {
+    let finished = _now_ms();
+    let elapsed = if finished >= started { finished - started } else { 0 };
+    return map{
+        ok: true, format: "pb_mcp.agent_wait.v1", wait_kind: kind,
+        status: if matched { "ready" } else { "timeout" },
+        matched: matched, timed_out: not matched,
+        messages: messages, returned_count: len(messages),
+        elapsed_ms: elapsed, poll_count: polls,
+        policy: policy, context: context,
+        read_only: true, client_polling_preferred: true
+    };
+}
+
+fn _copy_resource_context(source, target) {
+    let context = try source._resource_context catch nil;
+    if context != nil { RESOURCE.validate(context); target._resource_context = context; }
+    return target;
+}
+
+fn agent_inbox_wait(args) {
+    if args == nil { args = map{}; }
+    let who = _text(try args.for_agent catch try args.agent catch nil, "for_agent", 128);
+    let limit = _integer(try args.limit catch nil, "limit", 50, 1, 200);
+    let since = _since(try args.since_ts_ms catch nil);
+    let skip = try args.skip_own_broadcasts catch true;
+    if type(skip) != "bool" { throw "skip_own_broadcasts must be boolean"; }
+    let policy = _wait_policy(args);
+    let started = _now_ms(); let polls = 0; let delay = policy.initial_poll_ms;
+    while true {
+        polls = polls + 1;
+        let query = map{
+            for_agent: who, limit: limit, since_ts_ms: since,
+            skip_own_broadcasts: skip
+        };
+        if try args._bus_path catch nil != nil { query._bus_path = args._bus_path; }
+        _copy_resource_context(args, query);
+        if try args.topic catch nil != nil { query.topic = args.topic; }
+        if try args.kind catch nil != nil { query.kind = args.kind; }
+        if try args.from_agent catch nil != nil { query.from_agent = args.from_agent; }
+        let messages = AGENT.agent_inbox(query);
+        if len(messages) > 0 {
+            return _wait_result("inbox", true, started, polls, policy, messages,
+                map{ for_agent: who, since_ts_ms: since });
+        }
+        let now = _now_ms(); let elapsed = if now >= started { now - started } else { policy.timeout_ms };
+        if elapsed >= policy.timeout_ms {
+            return _wait_result("inbox", false, started, polls, policy, [],
+                map{ for_agent: who, since_ts_ms: since });
+        }
+        let remaining = policy.timeout_ms - elapsed;
+        let sleep_for = if delay < remaining { delay } else { remaining };
+        if sleep_for > 0 { sleep_ms(sleep_for); }
+        if policy.adaptive and delay < policy.max_poll_ms {
+            delay = delay * 2; if delay > policy.max_poll_ms { delay = policy.max_poll_ms; }
+        }
+    }
+}
+
+fn agent_topic_wait(args) {
+    if args == nil { args = map{}; }
+    let topic = _text(try args.topic catch nil, "topic", 256);
+    let excluded = _text(try args.exclude_from_agent catch nil, "exclude_from_agent", 128);
+    let since = _since(try args.since_ts_ms catch nil);
+    if since == nil { since = _now_ms(); }
+    let limit = _integer(try args.limit catch nil, "limit", 80, 1, 200);
+    let policy = _wait_policy(args);
+    let started = _now_ms(); let polls = 0; let delay = policy.initial_poll_ms;
+    while true {
+        polls = polls + 1;
+        let query = map{ topic: topic, limit: limit, since_ts_ms: since };
+        if try args._bus_path catch nil != nil { query._bus_path = args._bus_path; }
+        _copy_resource_context(args, query);
+        let thread = AGENT.agent_thread(query);
+        let replies = [];
+        for i len(thread) {
+            if str(try thread[i].from_agent catch "") != excluded { replies[len(replies)] = thread[i]; }
+        }
+        if len(replies) > 0 {
+            return _wait_result("topic", true, started, polls, policy, replies,
+                map{ topic: topic, exclude_from_agent: excluded, since_ts_ms: since });
+        }
+        let now = _now_ms(); let elapsed = if now >= started { now - started } else { policy.timeout_ms };
+        if elapsed >= policy.timeout_ms {
+            return _wait_result("topic", false, started, polls, policy, [],
+                map{ topic: topic, exclude_from_agent: excluded, since_ts_ms: since });
+        }
+        let remaining = policy.timeout_ms - elapsed;
+        let sleep_for = if delay < remaining { delay } else { remaining };
+        if sleep_for > 0 { sleep_ms(sleep_for); }
+        if policy.adaptive and delay < policy.max_poll_ms {
+            delay = delay * 2; if delay > policy.max_poll_ms { delay = policy.max_poll_ms; }
+        }
+    }
+}
+
+fn _sync_id() {
+    return "sync-" + str_slice(sha256(str(_now_ms()) + ":" +
+        base64_encode_bytes(random_bytes(32))), 0, 32);
+}
+
+fn _sync_path(sync_id) { return SYNC_DIR + "/" + sync_id + ".json"; }
+
+fn _validate_keyring(value) {
+    if type(value) != "map" { throw "agent sync keyring must be a JSON object"; }
+    let names = map_keys(value);
+    if len(names) < 1 or len(names) > 128 { throw "agent sync keyring must contain 1 to 128 identities"; }
+    let out = map{};
+    for i len(names) {
+        let name = _text(names[i], "keyring identity", 128);
+        let key = try value[name] catch nil;
+        if type(key) != "string" or len(key) < 32 or len(key) > 512 or
+           str_contains(key, "\n") or str_contains(key, "\r") or str_contains(key, strfromcharcode(0)) {
+            throw "keyring values must be 32 to 512 character single-line secrets";
+        }
+        out[name] = key;
+    }
+    return out;
+}
+
+fn _without_trailing_slash(path) {
+    let out = path;
+    while len(out) > 1 and str_ends_with(out, "/") { out = str_slice(out, 0, len(out) - 1); }
+    return out;
+}
+
+fn _private_config_root() {
+    let xdg = try env_get("XDG_CONFIG_HOME") catch nil;
+    if xdg != nil and type(xdg) == "string" and str_starts_with(xdg, "/") {
+        return _without_trailing_slash(xdg) + "/pb-mcp-server";
+    }
+    let home = try env_get("HOME") catch nil;
+    if home == nil or type(home) != "string" or not str_starts_with(home, "/") {
+        throw "HOME or XDG_CONFIG_HOME is required for the private agent keyring";
+    }
+    return _without_trailing_slash(home) + "/.config/pb-mcp-server";
+}
+
+fn _read_private_keyring(path, root_override = nil) {
+    if path == nil or path == "" { path = DEFAULT_KEYRING; }
+    path = sec.safe_rel_path(path, DEFAULT_KEYRING);
+    let root_path = if root_override == nil { _private_config_root() } else { root_override };
+    if type(root_path) != "string" or not str_starts_with(root_path, "/") {
+        throw "agent sync keyring root must be an absolute private directory";
+    }
+    let root = DIRFS.open_absolute(root_path, false, true);
+    if not root.ok { throw "agent sync private config root is unavailable or not mode 0700"; }
+    let metadata = DIRFS.metadata(root, path);
+    if not metadata.ok or bit_and(metadata.mode, 511) != 384 {
+        DIRFS.close(root); throw "agent sync keyring must be a descriptor-held regular file with mode 0600";
+    }
+    let loaded = DIRFS.read_bytes(root, path, MAX_KEYRING_BYTES);
+    DIRFS.close(root);
+    if not loaded.ok { throw "agent sync keyring cannot be read safely"; }
+    let parsed = try JSON.parse(bytes_to_str(loaded.bytes)) catch nil;
+    return _validate_keyring(parsed);
+}
+
+fn _keyring(args) {
+    // `_identity_keys` is an internal test/embedder injection and is absent from
+    // the MCP schema. Production calls use only the private descriptor-held file.
+    let injected = try args._identity_keys catch nil;
+    if injected != nil { return _validate_keyring(injected); }
+    return _read_private_keyring(try args._identity_key_path catch nil,
+        try args._identity_key_root catch nil);
+}
+
+fn _confirmation_transcript(sync_id, agent, snapshot_sha256, deadline_ms,
+                            organization_id = nil, initiator = nil) {
+    if organization_id != nil or initiator != nil {
+        organization_id = _text(organization_id, "organization_id", 64);
+        initiator = _text(initiator, "initiator", 128);
+        return "pb_mcp.agent_sync.confirm.v3\n" + organization_id + "\n" + initiator + "\n" +
+            sync_id + "\n" + agent + "\n" + snapshot_sha256 + "\n" + str(deadline_ms);
+    }
+    return "pb_mcp.agent_sync.confirm.v1\n" + sync_id + "\n" + agent + "\n" +
+        snapshot_sha256 + "\n" + str(deadline_ms);
+}
+
+fn confirmation_mac(sync_id, agent, snapshot_sha256, deadline_ms, key,
+                    organization_id = nil, initiator = nil) {
+    _text(sync_id, "sync_id", 64); _text(agent, "agent", 128);
+    if type(snapshot_sha256) != "string" or not regex_match(snapshot_sha256, "^[a-f0-9]{64}$") {
+        throw "snapshot_sha256 must be lowercase hexadecimal";
+    }
+    let checked_key = _validate_keyring(map{ temporary: key }).temporary;
+    return hmac_sha256(_confirmation_transcript(sync_id, agent, snapshot_sha256, deadline_ms,
+        organization_id, initiator), checked_key);
+}
+
+fn _open_sync_root(args = nil) {
+    if platform() != "linux" { throw "agent sync requires the race-resistant Linux DIRFS backend"; }
+    let context = try args._resource_context catch nil;
+    let root = if context == nil { DIRFS.open(SYNC_ROOT, true, false) }
+        else { RESOURCE.open_context(context, true) };
+    if not root.ok { throw "agent sync root cannot be held safely"; }
+    let made = DIRFS.mkdir(root, SYNC_DIR);
+    if not made.ok { DIRFS.close(root); throw "agent sync directory cannot be created safely"; }
+    return root;
+}
+
+fn _acquire_sync(args = nil) {
+    let root = _open_sync_root(args);
+    let lock = DIRFS.acquire_lock(root, SYNC_LOCK, 3000, 10);
+    if not lock.ok { DIRFS.close(root); throw "agent sync state remained busy"; }
+    return map{ root: root, lock: lock };
+}
+
+fn _release_sync(held) {
+    let unlocked = DIRFS.release_lock(held.root, held.lock);
+    let closed = DIRFS.close(held.root);
+    if not unlocked or not closed { throw "agent sync lock cleanup failed"; }
+    return true;
+}
+
+fn _valid_sync_id(value) {
+    return type(value) == "string" and len(value) == 37 and
+        regex_match(value, "^sync-[a-f0-9]{32}$");
+}
+
+fn _state_valid(state, expected_id) {
+    let format = try state.format catch "";
+    if type(state) != "map" or
+       (format != "pb_mcp.agent_sync.v2" and format != "pb_mcp.agent_sync.v3") or
+       (try state.sync_id catch "") != expected_id or type(try state.participants catch nil) != "array" or
+       type(try state.confirmations catch nil) != "array" or type(try state.status catch nil) != "string" or
+       type(try state.initiator catch nil) != "string" or len(state.initiator) < 1 or len(state.initiator) > 128 {
+        return false;
+    }
+    if len(state.participants) < 1 or len(state.participants) > 64 or
+       len(state.confirmations) > len(state.participants) { return false; }
+    let seen_participants = map{};
+    for i len(state.participants) {
+        let participant = state.participants[i];
+        if type(participant) != "string" or len(participant) < 1 or len(participant) > 128 or
+           map_has(seen_participants, participant) { return false; }
+        seen_participants[participant] = true;
+    }
+    if state.participants != array_sort(state.participants) { return false; }
+    let seen_confirmations = map{};
+    for i len(state.confirmations) {
+        let confirmation = state.confirmations[i];
+        if type(confirmation) != "string" or not map_has(seen_participants, confirmation) or
+           map_has(seen_confirmations, confirmation) { return false; }
+        seen_confirmations[confirmation] = true;
+    }
+    if type(try state.created_ms catch nil) != "number" or state.created_ms != state.created_ms or
+       state.created_ms < 0 or state.created_ms > 9007199254740991 or
+       type(try state.deadline_ms catch nil) != "number" or state.deadline_ms != state.deadline_ms or
+       state.deadline_ms < state.created_ms or state.deadline_ms > 9007199254740991 or
+       type(try state.state_snapshot catch nil) != "string" or len(state.state_snapshot) > 65536 or
+       type(try state.snapshot_chars catch nil) != "number" or state.snapshot_chars != len(state.state_snapshot) or
+       type(try state.snapshot_sha256 catch nil) != "string" or len(state.snapshot_sha256) != 64 or
+       state.snapshot_sha256 != sha256(state.state_snapshot) or
+       type(try state.notifications catch []) != "array" or len(try state.notifications catch []) > 64 or
+       type(try state.identity_key_commitments catch nil) != "map" {
+        return false;
+    }
+    let commitment_names = array_sort(map_keys(state.identity_key_commitments));
+    if commitment_names != state.participants { return false; }
+    for i len(commitment_names) {
+        let commitment = state.identity_key_commitments[commitment_names[i]];
+        if type(commitment) != "string" or not regex_match(commitment, "^[a-f0-9]{64}$") { return false; }
+    }
+    if format == "pb_mcp.agent_sync.v3" {
+        if type(try state.organization_id catch nil) != "string" or
+           not regex_match(state.organization_id, "^[a-z][a-z0-9_-]{2,63}$") or
+           not (try state.authenticated_initiator catch false) or
+           (try state.version catch nil) != 3 or
+           not regex_match(state.initiator, "^agent-[a-f0-9]{32}$") {
+            return false;
+        }
+    }
+    if state.status == "confirmed" and len(state.confirmations) != len(state.participants) { return false; }
+    return state.status == "pending" or state.status == "confirmed" or
+        state.status == "expired" or state.status == "aborted";
+}
+
+fn _read_state(root, sync_id) {
+    let loaded = DIRFS.read_bytes(root, _sync_path(sync_id), MAX_SYNC_STATE_BYTES);
+    if not loaded.ok { throw "unknown or unreadable sync_id"; }
+    let state = try JSON.parse(bytes_to_str(loaded.bytes)) catch nil;
+    if not _state_valid(state, sync_id) { throw "persisted sync state is malformed"; }
+    return state;
+}
+
+fn _write_state(root, state, args = nil) {
+    let bytes = str_to_bytes(JSON.stringify(state));
+    if len(bytes) > MAX_SYNC_STATE_BYTES { throw "sync state exceeds its 256 KiB bound"; }
+    let context = try args._resource_context catch nil;
+    let private_mode = context != nil;
+    let inventory = _sync_inventory(root, _now_ms(), false, private_mode);
+    let previous = DIRFS.file_size(root, _sync_path(state.sync_id));
+    let previous_size = if previous.ok { previous.size } else { 0 };
+    if inventory.bytes - previous_size + len(bytes) > inventory.max_bytes {
+        throw "sync state update exceeds the organization aggregate byte quota";
+    }
+    let wrote = nil;
+    if context == nil {
+        let result = DIRFS.write_atomic(root, _sync_path(state.sync_id), bytes, false);
+        wrote = result;
+    } else {
+        wrote = RESOURCE.publish(context, _sync_path(state.sync_id), bytes, MAX_SYNC_STATE_BYTES);
+    }
+    if not wrote.ok { throw "sync state atomic publication failed"; }
+    return wrote;
+}
+
+fn _sync_inventory(root, now, prune = false, require_private_mode = false) {
+    let file_limit = _sync_file_limit();
+    let listed = DIRFS.list(root, SYNC_DIR, file_limit + 2);
+    if not listed.ok or listed.truncated {
+        throw "sync state inventory exceeds its bounded file budget";
+    }
+    let files = 0; let bytes = 0; let removed = 0;
+    for i len(listed.entries) {
+        let name = str(listed.entries[i]);
+        if str_starts_with(name, "sync-") and str_ends_with(name, ".json") {
+            let path = SYNC_DIR + "/" + name;
+            let loaded = DIRFS.read_prefix_bytes(root, path, MAX_SYNC_STATE_BYTES);
+            if not loaded.ok or loaded.truncated or
+               (require_private_mode and bit_and(try loaded.mode catch 0, 511) != 384) {
+                throw "sync state inventory found an unsafe or oversized file";
+            }
+            let state = try JSON.parse(bytes_to_str(loaded.bytes)) catch nil;
+            let stale = false;
+            if type(state) == "map" {
+                let deadline = try state.deadline_ms catch 0;
+                let created = try state.created_ms catch 0;
+                let terminal = (try state.status catch "") != "pending";
+                stale = (type(deadline) == "number" and now > deadline + SYNC_RETENTION_MS) or
+                    (terminal and type(created) == "number" and now > created + SYNC_RETENTION_MS);
+            }
+            if prune and stale {
+                let deleted = DIRFS.remove_file(root, path);
+                if not deleted.ok { throw "expired sync state could not be removed safely"; }
+                removed = removed + 1;
+            } else {
+                files = files + 1; bytes = bytes + loaded.source_size;
+            }
+        }
+    }
+    return map{ files: files, bytes: bytes, removed: removed,
+        max_files: file_limit, max_bytes: _sync_byte_limit() };
+}
+
+fn _contains(values, wanted) {
+    for i len(values) { if values[i] == wanted { return true; } }
+    return false;
+}
+
+fn _participants(args, initiator) {
+    let requested = try args.participants catch nil;
+    let out = [];
+    if requested == nil {
+        let roster = AGENT.agent_roster(_copy_resource_context(args, map{}));
+        let rows = try roster.sender_rows catch [];
+        for i len(rows) {
+            let name = _text(rows[i].agent, "roster agent", 128);
+            if name != initiator and not _contains(out, name) { out[len(out)] = name; }
+        }
+    } else {
+        if type(requested) != "array" or len(requested) < 1 or len(requested) > 64 {
+            throw "participants must contain 1 to 64 agent ids";
+        }
+        for i len(requested) {
+            let name = _text(requested[i], "participants[" + str(i) + "]", 128);
+            if name == initiator { throw "initiator cannot also be a sync participant"; }
+            if _contains(out, name) { throw "participants must be unique"; }
+            out[len(out)] = name;
+        }
+    }
+    if len(out) == 0 { throw "no other agents are available to synchronize"; }
+    return array_sort(out);
+}
+
+fn _summary(state, args = nil) {
+    let context = try args._resource_context catch nil;
+    return map{
+        ok: true, format: state.format, sync_id: state.sync_id,
+        status: state.status, initiator: state.initiator,
+        participants: state.participants, participant_count: len(state.participants),
+        confirmations: state.confirmations, confirmed_count: len(state.confirmations),
+        created_ms: state.created_ms, deadline_ms: state.deadline_ms,
+        snapshot_sha256: state.snapshot_sha256,
+        snapshot_chars: state.snapshot_chars,
+        notifications: try state.notifications catch [],
+        state_path: if context == nil { ".mint-mcp/" + _sync_path(state.sync_id) }
+            else { RESOURCE.display_path(context, _sync_path(state.sync_id)) },
+        persisted: true, atomic: true, lock_serialized: true,
+        identity_authentication: if state.format == "pb_mcp.agent_sync.v3" {
+            "authenticated-initiator-plus-per-agent-hmac-sha256-v3"
+        } else { "per-agent-hmac-sha256-v1" },
+        initiator_identity_authenticated: state.format == "pb_mcp.agent_sync.v3",
+        confirmation_identity_authenticated: true,
+        caller_asserted_identity_accepted: state.format != "pb_mcp.agent_sync.v3"
+    };
+}
+
+fn agent_sync_all_tool(args) {
+    if args == nil { args = map{}; }
+    sec.require_trusted("agent sync all", "PB_AGENT_SYNC_ENABLE");
+    let authenticated_agent = try args._authenticated_agent catch nil;
+    let authenticated_organization = try args._authenticated_organization catch nil;
+    let requested_initiator = try args.from_agent catch if authenticated_agent == nil { "pblang-agent" }
+        else { authenticated_agent };
+    if authenticated_agent != nil and requested_initiator != authenticated_agent {
+        throw "from_agent must match the server-owned authenticated agent identity";
+    }
+    if authenticated_agent != nil and (type(authenticated_organization) != "string" or
+       not regex_match(authenticated_organization, "^[a-z][a-z0-9_-]{2,63}$")) {
+        throw "authenticated organization is missing or malformed";
+    }
+    let initiator = _text(requested_initiator, "from_agent", 128);
+    let participants = _participants(args, initiator);
+    let keys = _keyring(args); let commitments = map{};
+    for pi len(participants) {
+        if not map_has(keys, participants[pi]) { throw "keyring has no key for participant " + participants[pi]; }
+        commitments[participants[pi]] = sha256(keys[participants[pi]]);
+    }
+    let snapshot = try args.state_snapshot catch "{}";
+    if type(snapshot) != "string" or len(snapshot) > 65536 { throw "state_snapshot must be a string with at most 65536 characters"; }
+    if sec.looks_like_secret(snapshot) { throw "state_snapshot appears to contain a secret and cannot enter the durable bus"; }
+    let timeout = _integer(try args.timeout_ms catch nil, "timeout_ms", 30000, 1000, 300000);
+    let created = _now_ms(); let sync_id = _sync_id();
+    let state = map{
+        format: if authenticated_agent == nil { "pb_mcp.agent_sync.v2" }
+            else { "pb_mcp.agent_sync.v3" }, sync_id: sync_id,
+        initiator: initiator, participants: participants, confirmations: [],
+        status: "pending", created_ms: created, deadline_ms: created + timeout,
+        state_snapshot: snapshot, snapshot_sha256: sha256(snapshot), snapshot_chars: len(snapshot),
+        notifications: [], identity_key_commitments: commitments,
+        version: if authenticated_agent == nil { 2 } else { 3 },
+        organization_private: (try args._resource_context catch nil) != nil,
+        organization_id: authenticated_organization,
+        authenticated_initiator: authenticated_agent != nil
+    };
+    let held = _acquire_sync(args);
+    let inventory = try _sync_inventory(held.root, created, true,
+        (try args._resource_context catch nil) != nil) catch nil;
+    let initial_size = len(str_to_bytes(JSON.stringify(state)));
+    if inventory == nil or inventory.files >= inventory.max_files or
+       inventory.bytes + initial_size > MAX_SYNC_TOTAL_BYTES {
+        _release_sync(held); throw "organization sync quota is exhausted after bounded retention cleanup";
+    }
+    let initial_write = _write_state(held.root, state, args);
+    _release_sync(held);
+    if not initial_write.ok { throw "initial sync state could not be persisted"; }
+
+    let notifications = [];
+    let notification_failures = 0;
+    for i len(participants) {
+        let published = try AGENT.agent_send(_copy_resource_context(args, map{
+            from_agent: initiator, to_agent: participants[i],
+            topic: "sync:" + sync_id, kind: "sync_prepare", body: snapshot,
+            extra: map{ sync_id: sync_id, snapshot_sha256: state.snapshot_sha256,
+                        deadline_ms: state.deadline_ms }
+        })) catch nil;
+        notifications[len(notifications)] = map{
+            agent: participants[i], published: published != nil,
+            message_id: if published == nil { nil } else { published.id }
+        };
+        if published == nil { notification_failures = notification_failures + 1; }
+    }
+    let update = _acquire_sync(args);
+    let current = try _read_state(update.root, sync_id) catch nil;
+    if current != nil {
+        current.notifications = notifications;
+        if notification_failures > 0 {
+            current.status = "aborted";
+            current.aborted_ms = _now_ms();
+            current.abort_reason = "one or more prepare notifications could not be published";
+        }
+    }
+    let update_write = if current == nil { nil } else { _write_state(update.root, current, args) };
+    _release_sync(update);
+    if current == nil or update_write == nil { throw "sync notification state could not be persisted"; }
+    if notification_failures > 0 {
+        throw "sync aborted because one or more prepare notifications could not be published";
+    }
+    let out = _summary(current, args);
+    out.sync_quota = inventory;
+    return out;
+}
+
+fn agent_sync_confirm_tool(args) {
+    if args == nil { args = map{}; }
+    sec.require_trusted("agent sync confirm", "PB_AGENT_SYNC_ENABLE");
+    let sync_id = try args.sync_id catch nil;
+    if not _valid_sync_id(sync_id) { throw "sync_id must match sync-[a-f0-9]{32}"; }
+    let agent = _text(try args.agent catch try args.from_agent catch nil, "agent", 128);
+    let authenticated_agent = try args._authenticated_agent catch nil;
+    let authenticated_organization = try args._authenticated_organization catch nil;
+    if authenticated_agent != nil and agent != authenticated_agent {
+        throw "confirming agent must match the server-owned authenticated agent identity";
+    }
+    let supplied_mac = str_lower(_text(try args.confirmation_mac catch nil, "confirmation_mac", 64));
+    if not regex_match(supplied_mac, "^[a-f0-9]{64}$") { throw "confirmation_mac must be 64 hexadecimal characters"; }
+    let held = _acquire_sync(args);
+    let state = try _read_state(held.root, sync_id) catch nil;
+    if state == nil { _release_sync(held); throw "unknown or malformed sync_id"; }
+    if state.format == "pb_mcp.agent_sync.v3" and
+       (authenticated_organization == nil or state.organization_id != authenticated_organization) {
+        _release_sync(held); throw "sync organization does not match the authenticated organization";
+    }
+    if not _contains(state.participants, agent) {
+        _release_sync(held); throw "confirming agent is not a participant in this sync";
+    }
+    let keys = try _keyring(args) catch nil;
+    if keys == nil or not map_has(keys, agent) {
+        _release_sync(held); throw "server-owned keyring has no key for confirming participant";
+    }
+    let key = keys[agent];
+    if not constant_time_eq(sha256(key), state.identity_key_commitments[agent]) {
+        _release_sync(held); throw "participant key does not match the sync identity commitment";
+    }
+    let expected_mac = confirmation_mac(sync_id, agent, state.snapshot_sha256, state.deadline_ms, key,
+        if state.format == "pb_mcp.agent_sync.v3" { state.organization_id } else { nil },
+        if state.format == "pb_mcp.agent_sync.v3" { state.initiator } else { nil });
+    if not constant_time_eq(supplied_mac, expected_mac) {
+        _release_sync(held); throw "agent sync confirmation authentication failed";
+    }
+    let now = _now_ms();
+    if state.status == "pending" and now > state.deadline_ms {
+        state.status = "expired"; state.expired_ms = now;
+        let expired_write = _write_state(held.root, state, args);
+        _release_sync(held);
+        if expired_write == nil { throw "expired sync state could not be persisted"; }
+        throw "sync deadline has expired";
+    }
+    if state.status == "expired" { _release_sync(held); throw "sync has expired"; }
+    if state.status == "aborted" { _release_sync(held); throw "sync has been aborted"; }
+    let newly_recorded = not _contains(state.confirmations, agent);
+    if newly_recorded {
+        state.confirmations[len(state.confirmations)] = agent;
+        state.confirmations = array_sort(state.confirmations);
+        if len(state.confirmations) == len(state.participants) {
+            state.status = "confirmed"; state.confirmed_ms = now;
+        }
+        let confirm_write = _write_state(held.root, state, args);
+        if confirm_write == nil {
+            _release_sync(held); throw "sync confirmation could not be persisted";
+        }
+    }
+    _release_sync(held);
+    let audit = try AGENT.agent_send(_copy_resource_context(args, map{
+        from_agent: agent, to_agent: state.initiator,
+        topic: "sync:" + sync_id, kind: "sync_confirm",
+        body: "confirmed " + sync_id,
+        extra: map{ sync_id: sync_id, newly_recorded: newly_recorded, status: state.status }
+    })) catch nil;
+    let out = _summary(state, args);
+    out.newly_recorded = newly_recorded;
+    out.confirming_agent = agent;
+    out.audit_published = audit != nil;
+    return out;
+}
+
+fn call_agent_coordination(tool, args) {
+    if tool == "agent_inbox_wait" { return agent_inbox_wait(args); }
+    if tool == "agent_topic_wait" { return agent_topic_wait(args); }
+    if tool == "agent_sync_all_tool" { return agent_sync_all_tool(args); }
+    if tool == "agent_sync_confirm_tool" { return agent_sync_confirm_tool(args); }
+    return nil;
+}
+
+fn call_agent_coordination_scoped(tool, args, resource_context,
+                                  authenticated_agent, authenticated_organization) {
+    RESOURCE.validate(resource_context);
+    authenticated_agent = _text(authenticated_agent, "authenticated agent", 128);
+    if not regex_match(authenticated_agent, "^agent-[a-f0-9]{32}$") or
+       type(authenticated_organization) != "string" or
+       authenticated_organization != resource_context.organization_id {
+        throw "authenticated coordination identity does not match the resource context";
+    }
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "agent coordination arguments must be an object"; }
+    let scoped = map{}; let keys = map_keys(args);
+    for i len(keys) {
+        if str_starts_with(keys[i], "_") or keys[i] == "organization_id" or keys[i] == "tenant_id" or
+           keys[i] == "resource_root" {
+            throw "agent coordination scope is server-owned and cannot be supplied in arguments";
+        }
+        scoped[keys[i]] = args[keys[i]];
+    }
+    scoped._resource_context = resource_context;
+    scoped._authenticated_agent = authenticated_agent;
+    scoped._authenticated_organization = authenticated_organization;
+    return call_agent_coordination(tool, scoped);
+}
+
+fn implemented_tools() {
+    return ["agent_inbox_wait", "agent_topic_wait", "agent_sync_all_tool", "agent_sync_confirm_tool"];
+}
+
+export implemented_tools, call_agent_coordination, call_agent_coordination_scoped,
+       agent_inbox_wait, agent_topic_wait, agent_sync_all_tool, agent_sync_confirm_tool,
+       confirmation_mac;

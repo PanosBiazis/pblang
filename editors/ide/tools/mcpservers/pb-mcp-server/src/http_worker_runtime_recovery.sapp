@@ -1,0 +1,238 @@
+// Authenticated, bounded-memory extraction of the PBLang runtime from a
+// previously published self-contained worker launcher.
+
+let JSON = import("stdlib:json.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
+let LIMITS = import("http_worker_limits.sapp");
+
+let INDEX_PATH = "release/PB-MCP-http-workers.json";
+let LAUNCHER_PATH = "release/PB-MCP-http-worker-core-linux-x86_64";
+let MAX_INDEX_BYTES = LIMITS.MAX_INDEX_BYTES;
+let MAX_LAUNCHER_BYTES = LIMITS.MAX_LAUNCHER_BYTES;
+let MAX_PAYLOAD_BYTES = LIMITS.MAX_PAYLOAD_BYTES;
+let MAX_MAGIC_CANDIDATES = 128;
+let MAX_HASHED_BYTES = 536870912;
+
+fn _fail(message) { throw "worker runtime recovery failed: " + message; }
+fn _digest(bytes) { return sha256(base64_encode_bytes(bytes)); }
+fn _hex_digest(value) {
+    return type(value) == "string" and regex_match(value, "^[0-9a-f]{64}$");
+}
+fn _integer(value, minimum, maximum) {
+    return type(value) == "number" and value == num_floor(value)
+        and value >= minimum and value <= maximum;
+}
+fn _exact_keys(value, allowed) {
+    if type(value) != "map" or len(map_keys(value)) != len(allowed) { return false; }
+    for key in map_keys(value) {
+        let found = false;
+        for wanted in allowed { if key == wanted { found = true; } }
+        if not found { return false; }
+    }
+    return true;
+}
+fn _magic(bytes, offset, expected) {
+    if offset < 0 or offset + len(expected) > len(bytes) { return false; }
+    let i = 0;
+    while i < len(expected) {
+        if bytes[offset + i] != expected[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+fn _close_fail(reader, message) {
+    if reader != nil { try SECURE.close_immutable_reader(reader) catch nil; }
+    _fail(message);
+}
+fn _reader_digest(reader, offset, count, label) {
+    let result = SECURE.immutable_reader_base64_sha256(reader, offset, count);
+    if not result.ok { _close_fail(reader, label + " digest could not be computed"); }
+    return result.sha256;
+}
+fn _reader_magic(reader, offset, expected, label) {
+    let loaded = SECURE.immutable_reader_range(reader, offset, len(expected));
+    if type(loaded) != "map" or not loaded.ok {
+        _close_fail(reader, label + " magic range could not be read");
+    }
+    if not _magic(loaded.bytes, 0, expected) {
+        _close_fail(reader, label + " magic does not match the anchored payload type");
+    }
+}
+
+fn _common_shard_valid(shard) {
+    return type(shard) == "map" and (try shard.launcher catch "") == LAUNCHER_PATH
+        and _hex_digest(try shard.launcher_sha256 catch nil)
+        and _hex_digest(try shard.embedded_runtime_sha256 catch nil)
+        and _hex_digest(try shard.embedded_core_sha256 catch nil)
+        and _integer(try shard.launcher_bytes catch nil, 4096, MAX_LAUNCHER_BYTES);
+}
+
+fn _v2_geometry(shard) {
+    let runtime_offset = try shard.embedded_runtime_offset catch nil;
+    let runtime_bytes = try shard.embedded_runtime_bytes catch nil;
+    let core_offset = try shard.embedded_core_offset catch nil;
+    let core_bytes = try shard.embedded_core_bytes catch nil;
+    if not _integer(runtime_offset, 0, shard.launcher_bytes)
+       or not _integer(runtime_bytes, 4, MAX_PAYLOAD_BYTES)
+       or runtime_bytes > shard.launcher_bytes - runtime_offset
+       or not _integer(core_offset, 0, shard.launcher_bytes)
+       or core_offset != runtime_offset + runtime_bytes
+       or not _integer(core_bytes, 5, MAX_PAYLOAD_BYTES)
+       or core_bytes != shard.launcher_bytes - core_offset {
+        return nil;
+    }
+    return map{runtime_offset:runtime_offset,runtime_bytes:runtime_bytes,
+        core_offset:core_offset,core_bytes:core_bytes};
+}
+
+// Compatibility scanner for anchored v1 indexes. Bytes remain in one fixed
+// native window; only bounded candidate offsets enter the VM.
+fn _scan_v1_candidates(reader, launcher_bytes) {
+    if launcher_bytes != reader.size {
+        _close_fail(reader, "legacy launcher size changed before native scan");
+    }
+    let elf = SECURE.immutable_reader_magic_offsets(reader,
+        [0x7F, 0x45, 0x4C, 0x46], MAX_MAGIC_CANDIDATES);
+    let pbck = SECURE.immutable_reader_magic_offsets(reader,
+        [80, 66, 67, 75, 1], MAX_MAGIC_CANDIDATES);
+    if not elf.ok or not pbck.ok {
+        _close_fail(reader, "legacy launcher native magic scan failed or exceeded its budget");
+    }
+    return map{elf:elf.offsets,pbck:pbck.offsets};
+}
+
+fn _resolve_v1(reader, shard) {
+    let candidates = _scan_v1_candidates(reader, shard.launcher_bytes);
+    let hashed_bytes = shard.launcher_bytes; let core_start = -1;
+    let i = len(candidates.pbck) - 1;
+    while i >= 0 and core_start < 0 {
+        let candidate = candidates.pbck[i]; let size = shard.launcher_bytes - candidate;
+        if size >= 5 and size <= MAX_PAYLOAD_BYTES {
+            hashed_bytes = hashed_bytes + size;
+            if hashed_bytes > MAX_HASHED_BYTES {
+                _close_fail(reader, "legacy PBCK candidate hashing budget exhausted");
+            }
+            if _reader_digest(reader, candidate, size, "legacy PBCK candidate") ==
+               shard.embedded_core_sha256 { core_start = candidate; }
+        }
+        i = i - 1;
+    }
+    if core_start < 0 { _close_fail(reader, "embedded PBCK payload could not be authenticated"); }
+    let runtime_start = -1; i = 0;
+    while i < len(candidates.elf) and runtime_start < 0 {
+        let candidate = candidates.elf[i]; let size = core_start - candidate;
+        if candidate < core_start and size >= 4 and size <= MAX_PAYLOAD_BYTES {
+            hashed_bytes = hashed_bytes + size;
+            if hashed_bytes > MAX_HASHED_BYTES {
+                _close_fail(reader, "legacy runtime candidate hashing budget exhausted");
+            }
+            if _reader_digest(reader, candidate, size, "legacy runtime candidate") ==
+               shard.embedded_runtime_sha256 { runtime_start = candidate; }
+        }
+        i = i + 1;
+    }
+    if runtime_start < 0 { _close_fail(reader, "embedded runtime payload could not be authenticated"); }
+    return map{runtime_offset:runtime_start,runtime_bytes:core_start-runtime_start,
+        core_offset:core_start,core_bytes:shard.launcher_bytes-core_start,
+        hashed_bytes:hashed_bytes,runtime_magic_candidates:len(candidates.elf),
+        core_magic_candidates:len(candidates.pbck),legacy_scan:true,
+        range_digests_verified:true};
+}
+
+fn recover(expected_anchor, output) {
+    if not _hex_digest(expected_anchor) or type(output) != "string" or
+       not str_starts_with(output, "/") or len(output) < 2 or len(output) > 4096 or
+       str_contains(output, strfromcharcode(0)) {
+        _fail("external index anchor and bounded absolute output path are required");
+    }
+
+    let index_bytes = SECURE.read_bytes(INDEX_PATH, MAX_INDEX_BYTES);
+    if not index_bytes.ok or _digest(index_bytes.bytes) != expected_anchor {
+        _fail("worker index does not match its external trust anchor");
+    }
+    let index = try JSON.parse(bytes_to_str(index_bytes.bytes)) catch nil;
+    if not _exact_keys(index, ["format", "digest_encoding",
+        "direct_same_uid_invocation", "shards"]) or
+       ((try index.format catch "") != "pb_mcp.http-worker-index.v1" and
+        (try index.format catch "") != "pb_mcp.http-worker-index.v2") or
+       index.digest_encoding != "sha256(base64(bytes))" or
+       index.direct_same_uid_invocation !=
+           "outside-worker-boundary-parent-authentication-required" or
+       type(index.shards) != "array" or len(index.shards) != 1 {
+        _fail("anchored worker index format is unsupported");
+    }
+    let shard = index.shards[0];
+    let shard_keys = ["shard_id", "permission", "owned_tools", "generation_digest",
+        "worker_fingerprint", "launcher", "launcher_sha256", "launcher_bytes",
+        "platform", "architecture", "permission_contract",
+        "embedded_runtime_sha256", "embedded_core_sha256"];
+    if index.format == "pb_mcp.http-worker-index.v2" {
+        array_push(shard_keys, "embedded_runtime_offset");
+        array_push(shard_keys, "embedded_runtime_bytes");
+        array_push(shard_keys, "embedded_core_offset");
+        array_push(shard_keys, "embedded_core_bytes");
+    }
+    if not _exact_keys(shard, shard_keys) or not _common_shard_valid(shard) {
+        _fail("anchored worker shard metadata is invalid");
+    }
+
+    let reader = SECURE.open_immutable_reader(shard.launcher, MAX_LAUNCHER_BYTES, false);
+    if not reader.ok or reader.size != shard.launcher_bytes {
+        if reader.ok { SECURE.close_immutable_reader(reader); }
+        _fail("worker launcher size does not match the anchored index");
+    }
+    if _reader_digest(reader, 0, reader.size, "worker launcher") != shard.launcher_sha256 {
+        _close_fail(reader, "worker launcher does not match its anchored digest");
+    }
+
+    let geometry = nil;
+    if index.format == "pb_mcp.http-worker-index.v2" {
+        geometry = _v2_geometry(shard);
+        if geometry == nil { _close_fail(reader, "anchored v2 payload geometry is invalid"); }
+        geometry.hashed_bytes = shard.launcher_bytes + geometry.runtime_bytes + geometry.core_bytes;
+        geometry.runtime_magic_candidates = 1; geometry.core_magic_candidates = 1;
+        geometry.legacy_scan = false; geometry.range_digests_verified = false;
+    } else { geometry = _resolve_v1(reader, shard); }
+    if geometry.hashed_bytes > MAX_HASHED_BYTES {
+        _close_fail(reader, "authenticated range hashing budget exhausted");
+    }
+    _reader_magic(reader, geometry.runtime_offset, [0x7F, 0x45, 0x4C, 0x46], "runtime");
+    _reader_magic(reader, geometry.core_offset, [80, 66, 67, 75, 1], "PBCK core");
+    if not geometry.range_digests_verified {
+        if _reader_digest(reader, geometry.runtime_offset, geometry.runtime_bytes,
+            "embedded runtime") != shard.embedded_runtime_sha256 {
+            _close_fail(reader, "embedded runtime digest does not match the anchored index");
+        }
+        if _reader_digest(reader, geometry.core_offset, geometry.core_bytes,
+            "embedded PBCK core") != shard.embedded_core_sha256 {
+            _close_fail(reader, "embedded PBCK digest does not match the anchored index");
+        }
+    }
+
+    let published = SECURE.publish_immutable_reader_range_private_temp(reader, output,
+        geometry.runtime_offset, geometry.runtime_bytes, true);
+    if not published.ok {
+        _close_fail(reader, try published.error catch
+            "recovered runtime requires a new atomic output path");
+    }
+    let closed = SECURE.close_immutable_reader(reader);
+    if type(closed) != "map" or not closed.ok {
+        _fail("immutable launcher reader could not be closed cleanly");
+    }
+    return map{ok:true,format:"pb_mcp.recovered-worker-runtime.v2",
+        source_index_format:index.format,bytes:geometry.runtime_bytes,
+        sha256:shard.embedded_runtime_sha256,index_anchor_verified:true,
+        launcher_digest_verified:true,core_digest_verified:true,
+        runtime_digest_verified:true,output_path_persisted:true,
+        atomic_no_replace_publication:true,durability_verified:published.durability_verified,
+        private_output_parent_verified:published.private_parent_verified,
+        sticky_temporary_container_verified:published.sticky_temporary_container_verified,
+        immutable_launcher_snapshot:true,streaming_recovery:true,bounded_memory:true,
+        runtime_offset:geometry.runtime_offset,core_offset:geometry.core_offset,
+        core_magic_candidates:geometry.core_magic_candidates,
+        runtime_magic_candidates:geometry.runtime_magic_candidates,
+        legacy_scan:geometry.legacy_scan,hashed_bytes:geometry.hashed_bytes};
+}
+
+export recover, MAX_INDEX_BYTES, MAX_LAUNCHER_BYTES, MAX_PAYLOAD_BYTES,
+       MAX_MAGIC_CANDIDATES, MAX_HASHED_BYTES;

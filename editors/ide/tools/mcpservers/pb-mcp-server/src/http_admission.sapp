@@ -1,0 +1,174 @@
+// Bounded authenticated HTTP admission for the PBLang MCP server.
+//
+// Client-controlled forwarding headers never select a bucket. The live server
+// supplies a server-owned identity after bearer authentication succeeds.
+
+let DEFAULT_MAX_REQUESTS = 120;
+let DEFAULT_WINDOW_MS = 60000;
+let DEFAULT_AUTH_MAX_FAILURES = 8;
+let DEFAULT_AUTH_WINDOW_MS = 60000;
+let MAX_IDENTITIES = 8;
+
+fn _integer(value, name, minimum, maximum) {
+    if type(value) != "number" or value != num_floor(value)
+       or value < minimum or value > maximum {
+        throw name + " must be an integer in " + str(minimum) + ".." + str(maximum);
+    }
+    return value;
+}
+
+fn _env_integer(name, fallback, minimum, maximum) {
+    let raw = try env_get(name) catch nil;
+    if raw == nil or str_trim(str(raw)) == "" { return fallback; }
+    let parsed = try parse_number(str_trim(str(raw))) catch nil;
+    return _integer(parsed, name, minimum, maximum);
+}
+
+fn create(options = nil) {
+    if options == nil { options = map{}; }
+    if type(options) != "map" { throw "HTTP admission options must be an object"; }
+    let max_requests = _integer(try options.max_requests catch DEFAULT_MAX_REQUESTS,
+        "max_requests", 1, 10000);
+    let window_ms = _integer(try options.window_ms catch DEFAULT_WINDOW_MS,
+        "window_ms", 100, 3600000);
+    let max_identities = _integer(try options.max_identities catch MAX_IDENTITIES,
+        "max_identities", 1, MAX_IDENTITIES);
+    let auth_max_failures = _integer(
+        try options.auth_max_failures catch DEFAULT_AUTH_MAX_FAILURES,
+        "auth_max_failures", 1, 1000);
+    let auth_window_ms = _integer(
+        try options.auth_window_ms catch DEFAULT_AUTH_WINDOW_MS,
+        "auth_window_ms", 100, 3600000);
+    return map{
+        format: "pb_mcp.http-admission.v1", max_requests: max_requests,
+        window_ms: window_ms, max_identities: max_identities, buckets: map{},
+        auth_max_failures: auth_max_failures, auth_window_ms: auth_window_ms,
+        auth_buckets: map{}, accepted: 0, rejected: 0,
+        auth_failures: 0, auth_throttled: 0, clock_regressions: 0
+    };
+}
+
+fn from_environment() {
+    return create(map{
+        max_requests: _env_integer("PB_MCP_RATE_LIMIT_MAX_REQUESTS",
+            DEFAULT_MAX_REQUESTS, 1, 10000),
+        window_ms: _env_integer("PB_MCP_RATE_LIMIT_WINDOW_MS",
+            DEFAULT_WINDOW_MS, 100, 3600000),
+        auth_max_failures: _env_integer("PB_MCP_AUTH_MAX_FAILURES",
+            DEFAULT_AUTH_MAX_FAILURES, 1, 1000),
+        auth_window_ms: _env_integer("PB_MCP_AUTH_WINDOW_MS",
+            DEFAULT_AUTH_WINDOW_MS, 100, 3600000),
+        max_identities: 1
+    });
+}
+
+fn check_auth_failure(admission, identity, current_ms = nil) {
+    if type(admission) != "map" or (try admission.format catch "") != "pb_mcp.http-admission.v1" {
+        throw "invalid HTTP admission state";
+    }
+    if type(identity) != "string" or identity == "" or len(identity) > 128 {
+        throw "authentication identity must be a bounded server-owned string";
+    }
+    let now = if current_ms == nil { now_ms() } else {
+        _integer(current_ms, "current_ms", 0, 9000000000000000)
+    };
+    admission.auth_failures = admission.auth_failures + 1;
+    let bucket = try admission.auth_buckets[identity] catch nil;
+    if bucket == nil {
+        if len(map_keys(admission.auth_buckets)) >= admission.max_identities {
+            admission.auth_throttled = admission.auth_throttled + 1;
+            return map{ allowed: false, status: 429, reason: "auth-identity-capacity",
+                retry_after_ms: admission.auth_window_ms };
+        }
+        admission.auth_buckets[identity] = map{ window_started_ms: now, failures: 1 };
+        return map{ allowed: true, remaining: admission.auth_max_failures - 1,
+            reset_after_ms: admission.auth_window_ms };
+    }
+    if now < bucket.window_started_ms {
+        admission.clock_regressions = admission.clock_regressions + 1;
+        admission.auth_throttled = admission.auth_throttled + 1;
+        return map{ allowed: false, status: 429, reason: "auth-clock-regression",
+            retry_after_ms: admission.auth_window_ms };
+    }
+    let elapsed = now - bucket.window_started_ms;
+    if elapsed >= admission.auth_window_ms {
+        bucket.window_started_ms = now; bucket.failures = 1;
+        admission.auth_buckets[identity] = bucket;
+        return map{ allowed: true, remaining: admission.auth_max_failures - 1,
+            reset_after_ms: admission.auth_window_ms };
+    }
+    if bucket.failures >= admission.auth_max_failures {
+        admission.auth_throttled = admission.auth_throttled + 1;
+        return map{ allowed: false, status: 429, reason: "auth-rate-limit",
+            retry_after_ms: admission.auth_window_ms - elapsed };
+    }
+    bucket.failures = bucket.failures + 1;
+    admission.auth_buckets[identity] = bucket;
+    return map{ allowed: true, remaining: admission.auth_max_failures - bucket.failures,
+        reset_after_ms: admission.auth_window_ms - elapsed };
+}
+
+fn check(admission, identity, current_ms = nil) {
+    if type(admission) != "map" or (try admission.format catch "") != "pb_mcp.http-admission.v1" {
+        throw "invalid HTTP admission state";
+    }
+    if type(identity) != "string" or identity == "" or len(identity) > 128 {
+        throw "admission identity must be a bounded server-owned string";
+    }
+    let now = if current_ms == nil { now_ms() } else {
+        _integer(current_ms, "current_ms", 0, 9000000000000000)
+    };
+    let bucket = try admission.buckets[identity] catch nil;
+    if bucket == nil {
+        if len(map_keys(admission.buckets)) >= admission.max_identities {
+            admission.rejected = admission.rejected + 1;
+            return map{ allowed: false, status: 503, reason: "identity-capacity",
+                retry_after_ms: admission.window_ms };
+        }
+        admission.buckets[identity] = map{ window_started_ms: now, requests: 1 };
+        admission.accepted = admission.accepted + 1;
+        return map{ allowed: true, remaining: admission.max_requests - 1,
+            reset_after_ms: admission.window_ms };
+    }
+    if now < bucket.window_started_ms {
+        admission.clock_regressions = admission.clock_regressions + 1;
+        admission.rejected = admission.rejected + 1;
+        return map{ allowed: false, status: 503, reason: "clock-regression",
+            retry_after_ms: admission.window_ms };
+    }
+    let elapsed = now - bucket.window_started_ms;
+    if elapsed >= admission.window_ms {
+        bucket.window_started_ms = now; bucket.requests = 1;
+        admission.buckets[identity] = bucket;
+        admission.accepted = admission.accepted + 1;
+        return map{ allowed: true, remaining: admission.max_requests - 1,
+            reset_after_ms: admission.window_ms };
+    }
+    if bucket.requests >= admission.max_requests {
+        admission.rejected = admission.rejected + 1;
+        return map{ allowed: false, status: 429, reason: "rate-limit",
+            retry_after_ms: admission.window_ms - elapsed };
+    }
+    bucket.requests = bucket.requests + 1; admission.buckets[identity] = bucket;
+    admission.accepted = admission.accepted + 1;
+    return map{ allowed: true, remaining: admission.max_requests - bucket.requests,
+        reset_after_ms: admission.window_ms - elapsed };
+}
+
+fn status(admission) {
+    return map{
+        format: admission.format, max_requests: admission.max_requests,
+        window_ms: admission.window_ms,
+        active_identities: len(map_keys(admission.buckets)),
+        max_identities: admission.max_identities,
+        accepted: admission.accepted, rejected: admission.rejected,
+        auth_failures: admission.auth_failures,
+        auth_throttled: admission.auth_throttled,
+        auth_max_failures: admission.auth_max_failures,
+        auth_window_ms: admission.auth_window_ms,
+        clock_regressions: admission.clock_regressions,
+        client_headers_trusted: false, fail_closed_configuration: true
+    };
+}
+
+export create, from_environment, check, check_auth_failure, status;

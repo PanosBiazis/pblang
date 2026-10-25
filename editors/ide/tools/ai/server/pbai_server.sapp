@@ -1,0 +1,508 @@
+// tools/pbai_server.sapp -- local pbAI website + API server, written in pblang.
+//
+// Run from the pbAI repository root.
+// Required authentication:
+//   pblang run tools/pbai_server.sapp -- 8088 \
+//     --token-file /protected/path/pbai.token \
+//     --ledger-file /protected/path/pbai-ledger.json
+// Development-only environment fallback:
+//   PBAI_SERVER_TOKEN=<random> pblang run tools/pbai_server.sapp \
+//     -- 8088 --development-env-token \
+//     --ledger-file /protected/path/pbai-ledger.json
+// Staged writes also require --allow-tools --allow-write-tools and the local
+// PBAI_ENABLE_STAGED_WRITES=1 operator opt-in.
+//
+// Then open:
+//   http://127.0.0.1:8088/website/
+
+let http = import("stdlib:http_server.sapp");
+let web = import("../core/pbai_web.sapp");
+let security = import("pbai_server_core.sapp");
+let TRANSPORT = import("pbai_server_transport.sapp");
+let ACTION_POLICY = import("pbai_server_action_policy.sapp");
+
+let MAX_SITE_BODY_CHARS = 140000;
+let MAX_API_BODY_BYTES = TRANSPORT.MAX_BODY_BYTES;
+let SERVER_TOKEN = "";
+let SERVER_LEDGER = security.new_ledger(0);
+
+fn _cli_arg(idx, fallback = "") {
+    let a = os_args();
+    let start = 0;
+    let i = 0;
+    while i < len(a) {
+        if a[i] == "--" { start = i + 1; }
+        i = i + 1;
+    }
+    let real = start + idx;
+    if real < len(a) { return a[real]; }
+    return fallback;
+}
+
+fn _has_flag(flag) {
+    let a = os_args();
+    let i = 0;
+    while i < len(a) {
+        if a[i] == flag { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _server_token() {
+    return SERVER_TOKEN;
+}
+
+fn _flag_value(flag) {
+    let a = os_args();
+    let i = 0;
+    while i + 1 < len(a) {
+        if a[i] == flag { return str(a[i + 1]); }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn _worker_action(action) {
+    return ACTION_POLICY.route(action).mode == "broker-required";
+}
+
+fn _broker_unavailable(action) {
+    return map{ ok: false, status: 503,
+        error: "action " + action
+        + " is disabled until the fixed-method broker attests its runtime, entrypoint, and import closure" };
+}
+
+fn _allowed_origin() {
+    let value = try env_get("PBAI_SERVER_ORIGIN") catch nil;
+    if value != nil and str_trim(str(value)) != "" { return str(value); }
+    return "http://127.0.0.1:" + str(_cli_arg(0, "8088"));
+}
+
+fn _path_only(p) {
+    return str_split(p, "?")[0];
+}
+
+fn _starts(s, prefix) {
+    return str_starts_with(s, prefix);
+}
+
+fn _bad_static_path(rel) {
+    if rel == nil { return true; }
+    let s = str(rel);
+    if s == "" { return false; }
+    if _starts(s, "/") { return true; }
+    if _starts(s, "\\") { return true; }
+    if str_contains(s, "..") { return true; }
+    if str_contains(s, ":") { return true; }
+    if str_contains(s, "\\") { return true; }
+    return false;
+}
+
+fn _request_json(req) {
+    let body = try req.body catch "";
+    if str_trim(body) == "" { return map{}; }
+    let parsed = try json_parse(body) catch nil;
+    if type(parsed) != "map" { return nil; }
+    return parsed;
+}
+
+fn _prompt(req_json) {
+    return try str(req_json.prompt) catch "";
+}
+
+fn _json(status, value) {
+    return map{
+        status: status,
+        json: value,
+        headers: map{
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": _allowed_origin(),
+            "Access-Control-Allow-Headers": "Content-Type, X-pbAI-Token",
+            "Access-Control-Allow-Methods": "GET,POST,OPTIONS"
+        }
+    };
+}
+
+fn _ok(action, value) {
+    return _json(200, map{ ok: true, action: action, value: value });
+}
+
+fn _err(status, message) {
+    return _json(status, map{ ok: false, error: message });
+}
+
+fn _site_headers() {
+    return map{
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Cross-Origin-Resource-Policy": "same-origin"
+    };
+}
+
+fn _site_response(status, view) {
+    return map{
+        status: status,
+        body: web.render(view),
+        content_type: "text/html; charset=utf-8",
+        headers: _site_headers()
+    };
+}
+
+fn _site_css() {
+    return map{
+        status: 200,
+        body: web.stylesheet(),
+        content_type: "text/css; charset=utf-8",
+        headers: _site_headers()
+    };
+}
+
+fn _site_view(prompt = "", lesson = "") {
+    let pbai = import("stdlib/pbai.sapp");
+    return map{
+        format: web.FORMAT,
+        prompt: prompt,
+        lesson: lesson,
+        title: "Ready",
+        notice: "The real local PBLang model will handle each submitted action.",
+        result: nil,
+        result_ok: true,
+        model: pbai.model_status(),
+        policy: pbai.dataset_policy_status(),
+        token_required: _server_token() != ""
+    };
+}
+
+fn _site_authorized(form) {
+    return security.authorized(_server_token(), try str(form.token) catch "", "");
+}
+
+fn _site_execute(form) {
+    let action = try str(form.action) catch "";
+    let prompt = try str(form.prompt) catch "";
+    let lesson = try str(form.lesson) catch "";
+    let view = _site_view(prompt, lesson);
+    if len(prompt) > web.MAX_PROMPT_CHARS or len(lesson) > web.MAX_LESSON_CHARS {
+        view.title = "Input rejected";
+        view.notice = "The submitted text exceeds the bounded PBLang website limit.";
+        view.result_ok = false;
+        return view;
+    }
+    if action == "learn" and str_trim(lesson) == "" {
+        view.title = "Lesson rejected";
+        view.notice = "Enter reviewed text before requesting explicit learning.";
+        view.result_ok = false;
+        return view;
+    }
+    if _worker_action(action) {
+        let worker = _broker_unavailable(action);
+        view.title = "Bounded action blocked";
+        view.notice = worker.error;
+        view.result_ok = false;
+        return view;
+    }
+    let pbai = import("stdlib/pbai.sapp");
+    if action == "status" {
+        view.title = "Model status";
+        view.notice = "Current status was read from the local PBLang implementation.";
+        view.result = view.model;
+    }
+    elif action == "product_health" {
+        view.title = "Product health";
+        view.notice = "Current runtime, grounding, admission and reliability checks ran without training or external access.";
+        view.result = pbai.product_health();
+    }
+    elif action == "grounding_status" {
+        view.title = "Grounding contract";
+        view.notice = "The response evidence and abstention contract was read from the local PBLang implementation.";
+        view.result = pbai.grounding_status();
+    }
+    elif action == "ruler_status" {
+        view.title = "PBRuler status";
+        view.notice = "The deterministic policy evaluator is active; enforcement, sandboxing and adaptive antivirus remain roadmap work.";
+        view.result = pbai.ruler_status();
+    }
+    elif action == "ecosystem_status" {
+        view.title = "Specialist ecosystem";
+        view.notice = "The bounded role and envelope contracts are active; dynamic model activation and transport remain roadmap work.";
+        view.result = pbai.ecosystem_status();
+    }
+    elif action == "optimization_status" {
+        view.title = "Optimization contract";
+        view.notice = "CPU/GPU/NPU, memory, storage and training choices require comparable measured evidence before selection.";
+        view.result = pbai.optimization_status();
+    }
+    elif action == "dataset_policy" {
+        view.title = "Dataset admission policy";
+        view.notice = "Unknown rights, missing consent or unscanned records fail closed.";
+        view.result = view.policy;
+    }
+    else {
+        view.title = "Unknown action";
+        view.notice = "The submitted website action is not supported.";
+        view.result_ok = false;
+    }
+    return view;
+}
+
+fn _site_run(form) {
+    let action = try str(form.action) catch "";
+    if action == "learn" and (try str_trim(str(form.idempotency_key)) catch "") == "" {
+        form.idempotency_key = sha256("pbai-site-lesson|" + (try str(form.lesson) catch ""));
+    }
+    let admission = security.admit(SERVER_LEDGER, action, form,
+    try now_ms() catch num_floor(clock() * 1000.0));
+    if not admission.ok {
+        let denied = _site_view(try str(form.prompt) catch "", try str(form.lesson) catch "");
+        denied.title = "Request blocked";
+        denied.notice = admission.reason;
+        denied.result_ok = false;
+        return map{ view: denied, action: action, admitted: false };
+    }
+    let view = try _site_execute(form) catch nil;
+    if view == nil {
+        security.abort(SERVER_LEDGER, action);
+        let failed = _site_view(try str(form.prompt) catch "", try str(form.lesson) catch "");
+        failed.title = "Request failed";
+        failed.notice = "The bounded pbAI action failed before producing a response.";
+        failed.result_ok = false;
+        return map{ view: failed, action: action, admitted: false };
+    }
+    return map{ view: view, action: action, admitted: true };
+}
+
+fn _header(req, name) {
+    let v = try req.headers[name] catch nil;
+    if v != nil { return v; }
+    return try req.headers[str_lower(name)] catch "";
+}
+
+fn _origin_allowed(req) {
+    let origin = _header(req, "Origin");
+    if origin == "" { return true; }
+    return origin == _allowed_origin();
+}
+
+fn _authorized(req) {
+    let header = _header(req, "X-pbAI-Token");
+    let auth = _header(req, "Authorization");
+    return security.authorized(_server_token(), header, auth);
+}
+
+fn _api_execute(action, data) {
+    let route = ACTION_POLICY.route(action);
+    if route.mode == "disabled" {
+        if action == "ingest_path" {
+            return _err(route.status,
+            "server-side path ingestion is disabled until operator-owned root IDs are implemented");
+        }
+        return _err(route.status, "unknown pbAI action: " + action);
+    }
+    if route.mode == "broker-required" {
+        let worker = _broker_unavailable(action);
+        return _err(try worker.status catch 500,
+        try worker.error catch "fixed-method broker is unavailable");
+    }
+    let pbai = import("stdlib/pbai.sapp");
+    if action == "dataset_policy_status" { return _ok(action, pbai.dataset_policy_status()); }
+    if action == "grounding_status" { return _ok(action, pbai.grounding_status()); }
+    if action == "ruler_status" { return _ok(action, pbai.ruler_status()); }
+    if action == "ecosystem_status" { return _ok(action, pbai.ecosystem_status()); }
+    if action == "optimization_status" { return _ok(action, pbai.optimization_status()); }
+    if action == "tool_broker_status" { return _ok(action, pbai.tool_broker_status()); }
+    if action == "security_status" { return _ok(action, pbai.security_status()); }
+    if action == "isolation_status" { return _ok(action, pbai.isolation_status()); }
+    if action == "product_health" { return _ok(action, pbai.product_health()); }
+    if action == "status" { return _ok(action, pbai.model_status()); }
+    if action == "tool_catalog" { return _ok(action, pbai.tool_catalog()); }
+    if action == "tool_call" {
+        // The operator flag is only an outer opt-in. It cannot expand the
+        // broker-owned allowlist or supply policy/grants/decisions/roots.
+        if not _has_flag("--allow-tools") { return _err(403, "tool_call requires --allow-tools"); }
+        if _server_token() == "" {
+            return _err(503, "tool_call requires PBAI_SERVER_TOKEN when --allow-tools is enabled");
+        }
+        let requested_tool = try str(data.tool) catch "";
+        if (requested_tool == "stage_new_artifact"
+        or requested_tool == "discard_staged_artifact")
+        and not _has_flag("--allow-write-tools") {
+            return _err(403, "staged write tools require --allow-write-tools");
+        }
+        let result = pbai.tool_call(requested_tool, try data.args catch nil);
+        if not result.ok {
+            let status = 403;
+            if result.error_code == "invalid-argument-schema"
+            or result.error_code == "invalid-prompt"
+            or result.error_code == "invalid-text"
+            or result.error_code == "invalid-line-window"
+            or result.error_code == "invalid-line-count"
+            or result.error_code == "input-limit-exceeded" { status = 400; }
+            elif result.error_code == "handler-failed" { status = 500; }
+            elif result.error_code == "output-limit-exceeded"
+            or result.error_code == "output-policy-denied" { status = 502; }
+            return _json(status, map{ ok: false, action: action,
+                error: result.error_code, value: result });
+        }
+        return _ok(action, result);
+    }
+    return _err(404, "unknown pbAI action: " + action);
+}
+
+fn _api(action, req) {
+    if action == "health" { return _json(200, security.public_health()); }
+    let data = _request_json(req);
+    if data == nil { return _err(400, "request must be a valid JSON object"); }
+    let admission = security.admit(SERVER_LEDGER, action, data,
+    try now_ms() catch num_floor(clock() * 1000.0));
+    if not admission.ok { return _err(429, admission.reason); }
+    let response = try _api_execute(action, data) catch nil;
+    if response == nil {
+        let aborted = security.abort(SERVER_LEDGER, action);
+        if not aborted.ok { return _err(503, aborted.reason); }
+        return _err(500, "pbAI action failed before producing a response");
+    }
+    let encoded = try json_stringify(response.json) catch "";
+    let completed = security.complete(SERVER_LEDGER, action, len(str_to_bytes(encoded)),
+    if (try response.status catch 500) < 400 { "complete" } else { "failed" });
+    if not completed.ok {
+        let status = 429;
+        if completed.reason == "durable admission ledger update failed" { status = 503; }
+        return _err(status, completed.reason);
+    }
+    return response;
+}
+
+fn _action_from_path(path) {
+    let parts = str_split(path, "/");
+    if len(parts) >= 4 { return parts[3]; }
+    return "";
+}
+
+fn _site(req, method, path) {
+    if path == "/" or path == "" or path == "/website" {
+        return map{ status: 302, body: "", headers: map{ "Location": "/website/" } };
+    }
+    if path == "/website/" and method == "GET" {
+        return _site_response(200, _site_view());
+    }
+    if path == "/website/pbai.css" and method == "GET" {
+        return _site_css();
+    }
+    if path == "/website/action" and method == "POST" {
+        if not _origin_allowed(req) {
+            return _err(403, "origin not allowed");
+        }
+        let body = try req.body catch "";
+        if type(body) != "string" or len(body) > MAX_SITE_BODY_CHARS {
+            return _err(413, "website form body exceeds limit");
+        }
+        let content_type = str_lower(http.content_type(req));
+        if not str_starts_with(content_type, "application/x-www-form-urlencoded") {
+            return _err(415, "website actions require form encoding");
+        }
+        let form = web.decode_form(body);
+        if form == nil { return _err(400, "malformed website form encoding"); }
+        if not _site_authorized(form) {
+            let denied = _site_view(try str(form.prompt) catch "", try str(form.lesson) catch "");
+            denied.title = "Authorization required";
+            denied.notice = "The local server token was missing or invalid.";
+            denied.result_ok = false;
+            return _site_response(401, denied);
+        }
+        let execution = _site_run(form);
+        let result = execution.view;
+        let response = _site_response(if result.result_ok { 200 } else { 400 }, result);
+        if execution.admitted {
+            let completed = security.complete(SERVER_LEDGER, execution.action,
+            len(str_to_bytes(response.body)),
+            if result.result_ok { "complete" } else { "failed" });
+            if not completed.ok {
+                let denied = _site_view(try str(form.prompt) catch "", try str(form.lesson) catch "");
+                denied.title = "Response blocked";
+                denied.notice = completed.reason;
+                denied.result_ok = false;
+                return _site_response(429, denied);
+            }
+        }
+        return response;
+    }
+    return _err(404, "not found");
+}
+
+fn _static(req_path) {
+    let p = _path_only(req_path);
+    if _starts(p, "/website/") and _bad_static_path(str_slice(p, len("/website/"), len(p))) {
+        return _err(400, "bad website path");
+    }
+    return _err(404, "not found");
+}
+
+fn handler(req) {
+    let method = try req.method catch "GET";
+    let path = _path_only(try req.path catch "/");
+    if method == "OPTIONS" {
+        return _json(200, map{ ok: true });
+    }
+    if path == "/api/health" {
+        return _api("health", req);
+    }
+    if _starts(path, "/api/pbai/") {
+        if method != "POST" {
+            return _err(405, "pbAI API uses POST");
+        }
+        if not _origin_allowed(req) { return _err(403, "origin not allowed"); }
+        if not _authorized(req) { return _err(401, "missing or invalid pbAI server token"); }
+        let body = try req.body catch "";
+        if type(body) != "string" or len(str_to_bytes(body)) > MAX_API_BODY_BYTES {
+            return _err(413, "pbAI API body exceeds the 960 KiB transport limit");
+        }
+        return _api(_action_from_path(path), req);
+    }
+    let site = _site(req, method, path);
+    let site_status = try site.status catch 404;
+    if site_status != 404 { return site; }
+    return _static(path);
+}
+
+fn _http_preflight(req) {
+    let method = try req.method catch "GET";
+    let path = _path_only(try req.path catch "/");
+    if method == "OPTIONS" { return map{allowed:true}; }
+    if _starts(path, "/api/pbai/") {
+        if method != "POST" {
+            return map{allowed:false, response:_err(405, "pbAI API uses POST")};
+        }
+        if not _origin_allowed(req) {
+            return map{allowed:false, response:_err(403, "origin not allowed")};
+        }
+        if not _authorized(req) {
+            return map{allowed:false, response:_err(401, "missing or invalid pbAI server token")};
+        }
+    }
+    if path == "/website/action" and method == "POST" and not _origin_allowed(req) {
+        return map{allowed:false, response:_err(403, "origin not allowed")};
+    }
+    return map{allowed:true};
+}
+
+fn main() {
+    let ambient_state_root = try env_get("PBAI_STATE_ROOT") catch nil;
+    if type(ambient_state_root) == "string" and ambient_state_root != "" {
+        throw "pbAI server rejects ambient PBAI_STATE_ROOT until the fixed-method broker is implemented";
+    }
+    SERVER_TOKEN = security.load_token(_flag_value("--token-file"), _has_flag("--development-env-token"));
+    SERVER_LEDGER = security.load_ledger(_flag_value("--ledger-file"),
+    try now_ms() catch num_floor(clock() * 1000.0));
+    let port = _cli_arg(0, "8088");
+    let addr = "127.0.0.1:" + str(port);
+    print "pbAI pblang server starting";
+    print "website: http://" + addr + "/website/";
+    print "api:     http://" + addr + "/api/health";
+    http.serve_forever_timeout(addr, handler, TRANSPORT.policy(_http_preflight));
+}
+
+main();

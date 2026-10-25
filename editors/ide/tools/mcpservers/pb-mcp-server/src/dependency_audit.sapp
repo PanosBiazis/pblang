@@ -1,0 +1,511 @@
+// Bounded, fail-closed dependency policy and supplied-advisory audit.
+
+let sec = import("security.sapp");
+let core = import("core_tools.sapp");
+let SER = import("stdlib:serialization.sapp");
+let REPRO_LOCK = import("reproducible_lock.sapp");
+
+fn _strict(args, allowed) {
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "dependency audit arguments must be an object"; }
+    let keys = map_keys(args);
+    for i len(keys) {
+        let found = false;
+        for j len(allowed) { if keys[i] == allowed[j] { found = true; break; } }
+        if not found { throw "unknown dependency audit argument: " + str(keys[i]); }
+    }
+    return args;
+}
+
+fn _integer(value, label, low, high, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value) or value < low or value > high {
+        throw label + " must be an integer between " + str(low) + " and " + str(high);
+    }
+    return value;
+}
+
+fn _dep_basename(path) {
+    let parts = str_split(str_replace_all(path, "\\", "/"), "/");
+    if len(parts) == 0 { return ""; }
+    return str_lower(parts[len(parts) - 1]);
+}
+
+fn _dep_parent(path) {
+    let parts = str_split(str_replace_all(path, "\\", "/"), "/");
+    if len(parts) <= 1 { return "."; }
+    let out = "";
+    for i len(parts) - 1 {
+        if out != "" { out = out + "/"; }
+        out = out + parts[i];
+    }
+    return if out == "" { "." } else { out };
+}
+
+fn _dep_unquote(value) {
+    let s = str_trim(str(value));
+    if len(s) >= 2 {
+        let first = str_slice(s, 0, 1);
+        let last = str_slice(s, len(s) - 1, len(s));
+        if (first == "\"" and last == "\"") or (first == "'" and last == "'") {
+            return str_slice(s, 1, len(s) - 1);
+        }
+    }
+    return s;
+}
+
+fn _dep_strip_comment(line) {
+    let out = ""; let quote = ""; let escaped = false;
+    for i len(line) {
+        let ch = str_slice(line, i, i + 1);
+        if quote != "" {
+            out = out + ch;
+            if escaped { escaped = false; }
+            elif ch == "\\" and quote == "\"" { escaped = true; }
+            elif ch == quote { quote = ""; }
+        } else {
+            if ch == "\"" or ch == "'" { quote = ch; out = out + ch; }
+            elif ch == "#" { return str_trim(out); }
+            else { out = out + ch; }
+        }
+    }
+    return str_trim(out);
+}
+
+fn _dep_manager_selected(selected, manager) {
+    if selected == "auto" or selected == "all" { return true; }
+    return selected == manager;
+}
+
+fn _dep_manager(value) {
+    let manager = str_lower(str_trim(str(if value == nil { "auto" } else { value })));
+    if manager == "rust" { manager = "cargo"; }
+    if manager == "node" or manager == "javascript" { manager = "npm"; }
+    if manager == "pip" { manager = "python"; }
+    if manager != "auto" and manager != "all" and manager != "pblang" and
+       manager != "cargo" and manager != "npm" and manager != "python" {
+        throw "manager must be auto, all, pblang, cargo, npm, or python";
+    }
+    return manager;
+}
+
+fn _dep_issue(state, path, manager, severity, code, message, package = nil, version = nil) {
+    if len(state.findings) >= state.max_findings { state.truncated = true; return; }
+    let row = map{ path: path, manager: manager, severity: severity, code: code, issue: message };
+    if package != nil { row.package = package; }
+    if version != nil { row.version = version; }
+    state.findings[len(state.findings)] = row;
+}
+
+fn _dep_error(state, path, manager, code, message) {
+    if len(state.errors) < 100 {
+        state.errors[len(state.errors)] = map{ path: path, manager: manager, code: code, error: message };
+    } else { state.truncated = true; }
+}
+
+fn _dep_component(state, ecosystem, name, version, source) {
+    name = str_lower(str_trim(str(name)));
+    version = str_trim(str(if version == nil { "" } else { version }));
+    if name == "" { return; }
+    let key = ecosystem + ":" + name + ":" + version;
+    if map_has(state.component_seen, key) { return; }
+    if len(state.components) >= state.max_components { state.truncated = true; return; }
+    state.component_seen[key] = true;
+    state.components[len(state.components)] = map{
+        ecosystem: ecosystem, name: name, version: version, source: source,
+        version_known: version != ""
+    };
+}
+
+fn _dep_toml_value_has(value, key) {
+    return regex_match(value, "(?i:(?:^|[,{ \\t])" + key + "[ \\t]*=)");
+}
+
+fn _dep_toml_value_field(value, field) {
+    let found = regex_find(value, "(?i:(?:^|[,{ \\t])" + field + "[ \\t]*=[ \\t]*[\"'][^\"']*[\"'])");
+    if found == nil { return ""; }
+    let eq = str_index_of(found, "=");
+    if eq < 0 { return ""; }
+    return _dep_unquote(str_trim(str_slice(found, eq + 1, len(found))));
+}
+
+fn _dep_dependency_section(section) {
+    let s = str_lower(section);
+    return s == "dependencies" or s == "dev-dependencies" or s == "build-dependencies" or
+           s == "workspace.dependencies" or str_ends_with(s, ".dependencies") or
+           str_ends_with(s, ".dev-dependencies") or str_ends_with(s, ".build-dependencies");
+}
+
+fn _dep_scan_toml_manifest(state, path, raw, manager) {
+    let lines = str_split(raw, "\n");
+    let section = "";
+    for i len(lines) {
+        let line = _dep_strip_comment(lines[i]);
+        if line == "" { continue; }
+        if str_starts_with(line, "[") {
+            let array_table = str_starts_with(line, "[[");
+            let close = if array_table { "]]" } else { "]" };
+            if not str_ends_with(line, close) {
+                _dep_error(state, path, manager, "malformed-toml", "malformed TOML table on line " + str(i + 1));
+                continue;
+            }
+            section = str_trim(str_slice(line, if array_table { 2 } else { 1 }, len(line) - len(close)));
+            continue;
+        }
+        let eq = str_index_of(line, "=");
+        if eq <= 0 {
+            _dep_error(state, path, manager, "malformed-toml", "expected key=value on line " + str(i + 1));
+            continue;
+        }
+        if not _dep_dependency_section(section) { continue; }
+        let name = _dep_unquote(str_trim(str_slice(line, 0, eq)));
+        let value = str_trim(str_slice(line, eq + 1, len(line)));
+        let version = "";
+        if str_starts_with(value, "{") {
+            version = _dep_toml_value_field(value, "version");
+            if _dep_toml_value_has(value, "git") {
+                let pinned = _dep_toml_value_has(value, "rev") or _dep_toml_value_has(value, "tag");
+                _dep_issue(state, path, manager, if pinned { "medium" } else { "high" },
+                    if pinned { "git-dependency" } else { "unpinned-git-dependency" },
+                    if pinned { "git dependency requires source review" } else { "git dependency is not pinned to rev or tag" }, name, version);
+            }
+            if _dep_toml_value_has(value, "path") {
+                let local_path = _dep_toml_value_field(value, "path");
+                _dep_issue(state, path, manager, "medium", "path-dependency",
+                    "local path dependency requires provenance review", name, version);
+                if str_starts_with(local_path, "/") or regex_match(local_path, "^[A-Za-z]:[\\\\/]") {
+                    _dep_issue(state, path, manager, "high", "absolute-path-dependency",
+                        "absolute dependency path is machine-specific", name, version);
+                }
+            }
+        } else { version = _dep_unquote(value); }
+        if version == "*" or version == "latest" {
+            _dep_issue(state, path, manager, "high", "wildcard-version",
+                "dependency version is unbounded", name, version);
+        }
+        _dep_component(state, manager, name, version, path);
+    }
+}
+
+fn _dep_flush_lock_component(state, manager, path, name, version) {
+    if name != "" { _dep_component(state, manager, name, version, path); }
+}
+
+fn _dep_scan_toml_lock(state, path, raw, manager) {
+    if manager == "pblang" {
+        let checked = REPRO_LOCK.inspect_lock(raw);
+        for i len(checked.violations) {
+            _dep_issue(state, path, manager, "high", checked.violations[i].reason,
+                "PBLang lockfile contains an absolute dependency path");
+        }
+        if checked.dependency_count != checked.digest_count {
+            _dep_issue(state, path, manager, "high", "missing-content-digest",
+                "every PBLang locked dependency must carry a SHA-256 digest");
+        }
+    }
+    let current_name = ""; let current_version = "";
+    let lines = str_split(raw, "\n");
+    for i len(lines) {
+        let line = _dep_strip_comment(lines[i]);
+        if str_starts_with(line, "[[package]]") {
+            _dep_flush_lock_component(state, manager, path, current_name, current_version);
+            current_name = ""; current_version = "";
+        } elif manager == "pblang" and str_starts_with(line, "[dependencies.") and str_ends_with(line, "]") {
+            _dep_flush_lock_component(state, manager, path, current_name, current_version);
+            current_name = _dep_unquote(str_slice(line, 14, len(line) - 1)); current_version = "";
+        } else {
+            let eq = str_index_of(line, "=");
+            if eq > 0 {
+                let key = str_trim(str_slice(line, 0, eq));
+                let value = _dep_unquote(str_trim(str_slice(line, eq + 1, len(line))));
+                if key == "name" { current_name = value; }
+                elif key == "version" { current_version = value; }
+            }
+        }
+    }
+    _dep_flush_lock_component(state, manager, path, current_name, current_version);
+}
+
+fn _dep_scan_npm_map(state, path, values, section) {
+    if type(values) != "map" { return; }
+    let names = map_keys(values);
+    for i len(names) {
+        let name = names[i]; let value = values[name]; let version = "";
+        if type(value) == "string" { version = value; }
+        elif type(value) == "map" { version = str(try value.version catch ""); }
+        if version == "*" or str_lower(version) == "latest" {
+            _dep_issue(state, path, "npm", "high", "wildcard-version", section + " dependency is unbounded", name, version);
+        }
+        if str_starts_with(str_lower(version), "git") or str_contains(str_lower(version), "github.com") {
+            _dep_issue(state, path, "npm", "medium", "git-dependency", section + " dependency requires source review", name, version);
+        }
+        if str_starts_with(str_lower(version), "file:") or str_starts_with(str_lower(version), "link:") {
+            _dep_issue(state, path, "npm", "medium", "path-dependency", section + " dependency uses a local path", name, version);
+        }
+        _dep_component(state, "npm", name, version, path);
+    }
+}
+
+fn _dep_scan_package_json(state, path, raw) {
+    let parsed = SER.parse_safe(raw, "json", map{
+        max_input_bytes: state.max_manifest_chars, max_output_bytes: 1024,
+        max_lines: 20000, max_line_bytes: 65536, max_depth: 64, max_items: 50000
+    });
+    if not parsed.ok or type(parsed.value) != "map" {
+        _dep_error(state, path, "npm", "invalid-package-json", "package.json is not valid bounded JSON"); return;
+    }
+    let root = parsed.value;
+    _dep_scan_npm_map(state, path, try root.dependencies catch nil, "runtime");
+    _dep_scan_npm_map(state, path, try root.devDependencies catch nil, "development");
+    _dep_scan_npm_map(state, path, try root.optionalDependencies catch nil, "optional");
+    let scripts = try root.scripts catch nil;
+    if type(scripts) == "map" {
+        let hooks = ["preinstall", "install", "postinstall", "prepare"];
+        for i len(hooks) {
+            if map_has(scripts, hooks[i]) {
+                _dep_issue(state, path, "npm", "medium", "install-hook",
+                    "package lifecycle hook requires execution review: " + hooks[i]);
+            }
+        }
+    }
+}
+
+fn _dep_npm_lock_walk(state, path, node, depth) {
+    if depth > 32 or type(node) != "map" or len(state.components) >= state.max_components { return; }
+    let name = try node.name catch ""; let version = try node.version catch "";
+    if name != "" { _dep_component(state, "npm", name, version, path); }
+    let deps = try node.dependencies catch nil;
+    if type(deps) == "map" {
+        let keys = map_keys(deps);
+        for i len(keys) {
+            let child = deps[keys[i]];
+            if type(child) == "map" {
+                if not map_has(child, "name") { child.name = keys[i]; }
+                _dep_npm_lock_walk(state, path, child, depth + 1);
+            } else { _dep_component(state, "npm", keys[i], child, path); }
+        }
+    }
+    let packages = try node.packages catch nil;
+    if type(packages) == "map" {
+        let keys = map_keys(packages);
+        for i len(keys) {
+            let child = packages[keys[i]];
+            if type(child) == "map" { _dep_npm_lock_walk(state, path, child, depth + 1); }
+        }
+    }
+}
+
+fn _dep_scan_package_lock(state, path, raw) {
+    let parsed = SER.parse_safe(raw, "json", map{
+        max_input_bytes: state.max_manifest_chars, max_output_bytes: 1024,
+        max_lines: 50000, max_line_bytes: 65536, max_depth: 64, max_items: 100000
+    });
+    if not parsed.ok or type(parsed.value) != "map" {
+        _dep_error(state, path, "npm", "invalid-package-lock", "package lock is not valid bounded JSON"); return;
+    }
+    _dep_npm_lock_walk(state, path, parsed.value, 0);
+}
+
+fn _dep_scan_requirements(state, path, raw) {
+    let lines = str_split(raw, "\n");
+    for i len(lines) {
+        let line = str_trim(_dep_strip_comment(lines[i]));
+        if line == "" { continue; }
+        if str_starts_with(line, "-r") or str_starts_with(line, "--requirement") or
+           str_starts_with(line, "-c") or str_starts_with(line, "--constraint") {
+            _dep_issue(state, path, "python", "medium", "external-requirements-file",
+                "included requirements file requires separate bounded audit"); continue;
+        }
+        if str_starts_with(line, "-e") or str_starts_with(str_lower(line), "git+") or
+           str_starts_with(str_lower(line), "http:") or str_starts_with(str_lower(line), "https:") {
+            _dep_issue(state, path, "python", "high", "url-or-editable-dependency",
+                "URL/VCS/editable dependency requires provenance review"); continue;
+        }
+        let exact = str_index_of(line, "==");
+        if exact <= 0 {
+            _dep_issue(state, path, "python", "medium", "unpinned-version",
+                "requirement is not exactly version-pinned", line, "");
+        } else {
+            let name = str_trim(str_slice(line, 0, exact));
+            let version = str_trim(str_slice(line, exact + 2, len(line)));
+            if str_contains(version, ";") { version = str_trim(str_split(version, ";")[0]); }
+            _dep_component(state, "python", name, version, path);
+        }
+    }
+}
+
+fn _dep_load_advisories(args, state) {
+    let supplied = map_has(args, "advisories") or map_has(args, "advisory_path");
+    if not supplied { return map{ supplied: false, source: "none", snapshot_id: nil, rows: [] }; }
+    let raw = try args.advisories catch nil; let source = "caller-inline"; let snapshot_id = try args.advisory_snapshot catch nil;
+    if map_has(args, "advisory_path") {
+        let path = sec.safe_rel_path(args.advisory_path, "");
+        if path == "" { throw "advisory_path must not be empty"; }
+        let info = sec.read_project_text_info(path, state.max_manifest_chars);
+        if info.truncated { throw "advisory database exceeds max_manifest_chars"; }
+        let parsed = SER.parse_safe(info.text, "json", map{
+            max_input_bytes: state.max_manifest_chars, max_output_bytes: 1024,
+            max_lines: 50000, max_line_bytes: 65536, max_depth: 32, max_items: 100000
+        });
+        if not parsed.ok or type(parsed.value) != "map" { throw "advisory database must be a valid JSON object"; }
+        raw = try parsed.value.advisories catch nil;
+        snapshot_id = try parsed.value.snapshot_id catch snapshot_id;
+        source = path;
+    }
+    if type(raw) != "array" or len(raw) > 10000 { throw "advisories must be an array of at most 10000 entries"; }
+    if type(snapshot_id) != "string" or len(str_trim(snapshot_id)) < 1 or len(snapshot_id) > 256 {
+        throw "advisory_snapshot is required when advisories are supplied";
+    }
+    let rows = [];
+    for i len(raw) {
+        if type(raw[i]) != "map" { throw "every advisory must be an object"; }
+        let allowed = ["ecosystem", "name", "package", "version", "id", "severity", "summary"];
+        let keys = map_keys(raw[i]);
+        for j len(keys) {
+            let known = false;
+            for k len(allowed) { if keys[j] == allowed[k] { known = true; break; } }
+            if not known { throw "unknown advisory field: " + str(keys[j]); }
+        }
+        let ecosystem = str_lower(str_trim(str(try raw[i].ecosystem catch "")));
+        let name = str_lower(str_trim(str(try raw[i].name catch try raw[i].package catch "")));
+        let version = str_trim(str(try raw[i].version catch "*"));
+        let id = str_trim(str(try raw[i].id catch ""));
+        let severity = str_lower(str_trim(str(try raw[i].severity catch "unknown")));
+        if ecosystem == "rust" { ecosystem = "cargo"; }
+        if ecosystem == "node" or ecosystem == "javascript" { ecosystem = "npm"; }
+        if ecosystem == "pip" { ecosystem = "python"; }
+        if ecosystem != "pblang" and ecosystem != "cargo" and ecosystem != "npm" and ecosystem != "python" {
+            throw "advisory ecosystem must be pblang, cargo, npm, or python";
+        }
+        if name == "" or id == "" or len(name) > 256 or len(version) > 128 or len(id) > 256 {
+            throw "advisory name, version, or id is invalid";
+        }
+        rows[len(rows)] = map{ ecosystem: ecosystem, name: name, version: version,
+            id: id, severity: severity, summary: str(try raw[i].summary catch "") };
+    }
+    return map{ supplied: true, source: source, snapshot_id: snapshot_id, rows: rows };
+}
+
+fn _dep_match_advisories(state, database) {
+    let vulnerabilities = [];
+    for i len(state.components) {
+        let component = state.components[i];
+        for j len(database.rows) {
+            let advisory = database.rows[j];
+            if advisory.ecosystem == component.ecosystem and advisory.name == component.name and
+               (advisory.version == "*" or advisory.version == component.version) {
+                if len(vulnerabilities) >= state.max_findings { state.truncated = true; return vulnerabilities; }
+                vulnerabilities[len(vulnerabilities)] = map{
+                    ecosystem: component.ecosystem, package: component.name,
+                    version: component.version, advisory_id: advisory.id,
+                    severity: advisory.severity, summary: advisory.summary,
+                    source: component.source
+                };
+            }
+        }
+    }
+    return vulnerabilities;
+}
+
+fn protect_dependency_audit(args) {
+    args = _strict(args, ["path", "manager", "max_files", "max_depth", "max_findings",
+        "max_components", "max_manifest_chars", "advisories", "advisory_path", "advisory_snapshot"]);
+    sec.require_trusted("dependency audit project read", "PB_PROTECT_INSPECT_ENABLE");
+    let inline_advisories = map_has(args, "advisories");
+    let file_advisories = map_has(args, "advisory_path");
+    if inline_advisories {
+        if file_advisories {
+        throw "advisories and advisory_path are mutually exclusive";
+        }
+    }
+    let path = sec.safe_rel_path(try args.path catch ".", ".");
+    let manager = _dep_manager(try args.manager catch nil);
+    let max_files = _integer(try args.max_files catch nil, "max_files", 1, 2000, 500);
+    let max_depth = _integer(try args.max_depth catch nil, "max_depth", 0, 12, 6);
+    let state = map{
+        max_findings: _integer(try args.max_findings catch nil, "max_findings", 1, 2000, 200),
+        max_components: _integer(try args.max_components catch nil, "max_components", 1, 20000, 5000),
+        max_manifest_chars: _integer(try args.max_manifest_chars catch nil, "max_manifest_chars", 1, 4000000, 1000000),
+        findings: [], errors: [], components: [], component_seen: map{}, truncated: false
+    };
+    let files = core.list_files(path, max_files, max_depth);
+    let file_set = map{}; for i len(files) { file_set[files[i]] = true; }
+    let manifests = []; let lockfiles = []; let managers_seen = map{};
+    if len(files) >= max_files { state.truncated = true; }
+    for i len(files) {
+        let file = files[i]; let base = _dep_basename(file); let kind = "";
+        if base == "pblang.toml" and _dep_manager_selected(manager, "pblang") { kind = "pblang-manifest"; }
+        elif base == "pblang.lock" and _dep_manager_selected(manager, "pblang") { kind = "pblang-lock"; }
+        elif base == "cargo.toml" and _dep_manager_selected(manager, "cargo") { kind = "cargo-manifest"; }
+        elif base == "cargo.lock" and _dep_manager_selected(manager, "cargo") { kind = "cargo-lock"; }
+        elif base == "package.json" and _dep_manager_selected(manager, "npm") { kind = "npm-manifest"; }
+        elif base == "package-lock.json" and _dep_manager_selected(manager, "npm") { kind = "npm-lock"; }
+        elif base == "requirements.txt" and _dep_manager_selected(manager, "python") { kind = "python-requirements"; }
+        elif base == "pyproject.toml" and _dep_manager_selected(manager, "python") { kind = "python-pyproject"; }
+        elif base == "poetry.lock" and _dep_manager_selected(manager, "python") { kind = "python-lock"; }
+        if kind == "" { continue; }
+        let info = try sec.read_project_text_info(file, state.max_manifest_chars) catch nil;
+        if info == nil { _dep_error(state, file, "unknown", "read-refused", "confined manifest read failed"); continue; }
+        if info.truncated { _dep_error(state, file, "unknown", "manifest-too-large", "manifest exceeds max_manifest_chars"); continue; }
+        let raw = info.text;
+        if str_ends_with(kind, "-manifest") {
+            manifests[len(manifests)] = file;
+        } elif str_ends_with(kind, "-lock") { lockfiles[len(lockfiles)] = file; }
+        if str_starts_with(kind, "pblang-") {
+            managers_seen.pblang = true;
+            if kind == "pblang-manifest" { _dep_scan_toml_manifest(state, file, raw, "pblang"); }
+            else { _dep_scan_toml_lock(state, file, raw, "pblang"); }
+        } elif str_starts_with(kind, "cargo-") {
+            managers_seen.cargo = true;
+            if kind == "cargo-manifest" { _dep_scan_toml_manifest(state, file, raw, "cargo"); }
+            else { _dep_scan_toml_lock(state, file, raw, "cargo"); }
+        } elif str_starts_with(kind, "npm-") {
+            managers_seen.npm = true;
+            if kind == "npm-manifest" { _dep_scan_package_json(state, file, raw); }
+            else { _dep_scan_package_lock(state, file, raw); }
+        } else {
+            managers_seen.python = true;
+            if kind == "python-requirements" { _dep_scan_requirements(state, file, raw); }
+            elif kind == "python-lock" { _dep_scan_toml_lock(state, file, raw, "python"); }
+            else { _dep_scan_toml_manifest(state, file, raw, "python"); }
+        }
+    }
+    for i len(manifests) {
+        let base = _dep_basename(manifests[i]); let parent = _dep_parent(manifests[i]); let expected = "";
+        if base == "pblang.toml" { expected = sec.join_path(parent, "pblang.lock"); }
+        elif base == "cargo.toml" { expected = sec.join_path(parent, "Cargo.lock"); }
+        elif base == "package.json" { expected = sec.join_path(parent, "package-lock.json"); }
+        if expected != "" and not map_has(file_set, expected) {
+            let owner = "npm";
+            if base == "pblang.toml" { owner = "pblang"; }
+            elif base == "cargo.toml" { owner = "cargo"; }
+            _dep_issue(state, manifests[i], owner, "medium", "lockfile-missing",
+                "manifest has no adjacent deterministic lockfile");
+        }
+    }
+    let database = _dep_load_advisories(args, state);
+    let vulnerabilities = _dep_match_advisories(state, database);
+    let complete = len(state.errors) == 0 and not state.truncated;
+    let policy_ok = len(state.findings) == 0 and complete;
+    let vulnerability_status = "no-match-in-supplied-snapshot";
+    if not database.supplied { vulnerability_status = "not-checked"; }
+    elif len(vulnerabilities) > 0 { vulnerability_status = "known-vulnerable"; }
+    return map{
+        format: "pb_mcp.protect_dependency_audit.v2", ok: policy_ok and database.supplied and len(vulnerabilities) == 0,
+        path: path, manager: manager, managers_seen: array_sort(map_keys(managers_seen)),
+        scanned_manifests: len(manifests), scanned_lockfiles: len(lockfiles), scanned_files: len(manifests) + len(lockfiles),
+        component_count: len(state.components), components: state.components,
+        policy_ok: policy_ok, policy_finding_count: len(state.findings), findings: state.findings,
+        known_vulnerability_count: len(vulnerabilities), vulnerabilities: vulnerabilities,
+        advisory_database_checked: database.supplied, advisory_source: database.source,
+        advisory_snapshot: database.snapshot_id, vulnerability_status: vulnerability_status,
+        external_vulnerability_db: false, caller_supplied_advisory_snapshot: database.supplied,
+        scan_complete: complete, errors: state.errors, error_count: len(state.errors),
+        truncated: state.truncated, bounded: true, subprocesses_executed: false,
+        race_resistant: true, clean_claimed: policy_ok and database.supplied and len(vulnerabilities) == 0
+    };
+}
+
+fn audit(args) { return protect_dependency_audit(args); }
+
+export audit;

@@ -1,0 +1,403 @@
+// GTK4 renderer and temporary libc socket boundary. All policy is PBLang.
+// fd 0 must be the dedicated inherited operator socket, never MCP stdin.
+let Operator = import("desktop_operator.sapp");
+let GTK = import("desktop_gtk.sapp");
+let Overlay = import("desktop_overlay.sapp");
+let Budget = import("desktop_budget.sapp");
+let Trust = import("desktop_trust.sapp");
+let Dashboard = import("desktop_dashboard_gtk.sapp");
+let Memory = import("desktop_memory.sapp");
+fn run() {
+    let maintenance = Memory.new();
+    let native = GTK.open(); let g = native.g; let c = native.c;
+    fn send(message) {
+        let text = json_stringify(message) + "\n"; let size = len(str_to_bytes(text));
+        if size > 4096 or native.send_bytes(text) != size {
+            throw "operator pipe unavailable";
+        }
+    }
+    let startup_preference = try env_get("PB_DESKTOP_SHARING_STARTUP") catch "";
+    if startup_preference == nil { startup_preference = ""; }
+    if startup_preference != "" and startup_preference != "0" and startup_preference != "1" {
+        native.close(); throw "Invalid screen-sharing startup preference";
+    }
+    let model = Operator.new(send, startup_preference == "1");
+    let ui_startup = try env_get("PB_DESKTOP_UI_STARTUP") catch "immediate";
+    if ui_startup == nil or ui_startup == "" { ui_startup = "immediate"; }
+    if ui_startup != "immediate" and ui_startup != "on_demand" { native.close(); throw "Invalid local window startup preference"; }
+    let resources = map{ window: 0, buffer: 0, overlay: nil, trust: nil, dialog: nil, dashboard: nil };
+    let phase = "initialize";
+    fn render() {
+        if not g("gtk_init_check", "->bool", []) { throw "display unavailable"; }
+        resources.overlay = Overlay.open();
+        resources.trust = Trust.open();
+        phase = "window";
+        let window = g("gtk_window_new", "->ptr", []); resources.window = window;
+        g("gtk_window_set_title", "ptr,string->void", [window, "PB-MCP Local Control"]);
+        g("gtk_window_set_hide_on_close", "ptr,bool->void", [window, true]);
+        g("gtk_window_set_default_size", "ptr,i32,i32->void", [window, 520, 590]);
+        let box = g("gtk_box_new", "i32,i32->ptr", [1, 12]);
+        phase = "margins";
+        for side in ["top", "bottom", "start", "end"] {
+            g("gtk_widget_set_margin_" + side, "ptr,i32->void", [box, 18]);
+        }
+        fn label(text) {
+            let widget = g("gtk_label_new", "string->ptr", [text]);
+            g("gtk_label_set_wrap", "ptr,bool->void", [widget, true]);
+            g("gtk_box_append", "ptr,ptr->void", [box, widget]); return widget;
+        }
+        let status = label("Connecting to local session…");
+        phase = "labels";
+        label("Screen content may be sent to your AI provider. Approve only the control you intend to grant.");
+        // Reserve both detail lines even while idle; approval/Stop positions
+        // must not shift when a lease expires or consumes its final event.
+        let details = label("No control request\n");
+        let nonce = g("gtk_entry_new", "->ptr", []);
+        phase = "entry";
+        g("gtk_entry_set_visibility", "ptr,bool->void", [nonce, false]);
+        g("gtk_entry_set_max_length", "ptr,i32->void", [nonce, 256]);
+        g("gtk_entry_set_placeholder_text", "ptr,string->void", [nonce, "Local unlock code"]);
+        g("gtk_box_append", "ptr,ptr->void", [box, nonce]);
+        // Avoid repeated native property notifications when sensitivity is unchanged.
+        let sensitivity = map{};
+        fn sensitive(widget, enabled) {
+            let key = str(widget);
+            if not map_has(sensitivity, key) or sensitivity[key] != enabled {
+                g("gtk_widget_set_sensitive", "ptr,bool->void", [widget, enabled]);
+                sensitivity[key] = enabled;
+            }
+        }
+        let actions = [];
+        phase = "buttons";
+        for item in [["share", "Toggle screen sharing"], ["approve", "Approve displayed request"], ["deny", "Deny / revoke input"], ["stop", "STOP — disconnect immediately"]] {
+            let button = g("gtk_toggle_button_new_with_label", "string->ptr", [item[1]]);
+            g("gtk_box_append", "ptr,ptr->void", [box, button]);
+            array_push(actions, map{ name: item[0], widget: button });
+        }
+        let identity = label(model.snapshot().identity);
+        let context = label(model.snapshot().context);
+        let remember = 0; let ask_connection = 0; let forget = 0;
+        let saved = nil; let admitted = false; let preferences = map{ pending_save: nil };
+        let policy_checked_at = 0;
+        if resources.trust != nil {
+            label("Local connection profile: " + resources.trust.profile + " (not verified AI identity)");
+            remember = g("gtk_check_button_new_with_label", "string->ptr", ["Remember input approval for this AI connection"]);
+            ask_connection = g("gtk_check_button_new_with_label", "string->ptr", ["Confirm each new connection without asking for the code"]);
+            g("gtk_check_button_set_active", "ptr,bool->void", [ask_connection, true]);
+            forget = g("gtk_toggle_button_new_with_label", "string->ptr", ["Forget saved approval and STOP"]);
+            for widget in [remember, ask_connection, forget] { g("gtk_box_append", "ptr,ptr->void", [box, widget]); }
+            saved = resources.trust.policy();
+            if saved != nil {
+                g("gtk_check_button_set_active", "ptr,bool->void", [remember, true]);
+                g("gtk_check_button_set_active", "ptr,bool->void", [ask_connection, saved.mode == "each_connection"]);
+            }
+        }
+        let save_preference = 0;
+        if resources.trust != nil {
+            save_preference = g("gtk_toggle_button_new_with_label", "string->ptr", ["Apply saved confirmation (revoke input first)…"]);
+            g("gtk_box_append", "ptr,ptr->void", [box, save_preference]);
+        }
+        label("Limits per local approval. Revoke input before changing them.");
+        fn limit_row(title, initial, no_limit_label) {
+            let row = g("gtk_box_new", "i32,i32->ptr", [0, 8]);
+            let title_widget = g("gtk_label_new", "string->ptr", [title]);
+            let entry = g("gtk_entry_new", "->ptr", []);
+            g("gtk_entry_set_max_length", "ptr,i32->void", [entry, 16]);
+            g("gtk_editable_set_text", "ptr,string->void", [entry, initial]);
+            let unlimited = g("gtk_check_button_new_with_label", "string->ptr", [no_limit_label]);
+            for widget in [title_widget, entry, unlimited] { g("gtk_box_append", "ptr,ptr->void", [row, widget]); }
+            g("gtk_box_append", "ptr,ptr->void", [box, row]);
+            return map{ entry: entry, unlimited: unlimited };
+        }
+        let duration = limit_row("Duration (seconds)", "120", "No time limit");
+        let events = limit_row("Input events", "512", "No event limit");
+        let limit_note = label("Move + click uses 2 events. Text submission uses 1 event.");
+        if startup_preference == "1" { label("Local startup preference: screen sharing ON when this window is foreground. Turning sharing OFF lasts for this connection."); }
+        let steady_indicator = g("gtk_check_button_new_with_label", "string->ptr", ["Low power: steady sharing indicator (no animation)"]);
+        g("gtk_box_append", "ptr,ptr->void", [box, steady_indicator]);
+        let dashboard_button = g("gtk_toggle_button_new_with_label", "string->ptr", ["Dashboard — live AI connection activity"]);
+        g("gtk_box_append", "ptr,ptr->void", [box, dashboard_button]);
+        resources.dashboard = Dashboard.new(native, window);
+        fn set_limits(limits) {
+            g("gtk_check_button_set_active", "ptr,bool->void", [duration.unlimited, limits.duration_ms == 0]);
+            g("gtk_check_button_set_active", "ptr,bool->void", [events.unlimited, limits.max_events == 0]);
+            if limits.duration_ms != 0 { g("gtk_editable_set_text", "ptr,string->void", [duration.entry, str(limits.duration_ms / 1000)]); }
+            if limits.max_events != 0 { g("gtk_editable_set_text", "ptr,string->void", [events.entry, str(limits.max_events)]); }
+        }
+        fn read_limits() {
+            let milliseconds = 0; let count = 0;
+            if not g("gtk_check_button_get_active", "ptr->bool", [duration.unlimited]) {
+                milliseconds = Budget.parse(g("gtk_editable_get_text", "ptr->string", [duration.entry]), 9007199254740) * 1000;
+            }
+            if not g("gtk_check_button_get_active", "ptr->bool", [events.unlimited]) {
+                count = Budget.parse(g("gtk_editable_get_text", "ptr->string", [events.entry]), 9007199254740991);
+            }
+            return map{ duration_ms: milliseconds, max_events: count };
+        }
+        if saved != nil { set_limits(try saved.limits catch Budget.unlimited()); }
+        fn dismiss() {
+            if resources.dialog != nil {
+                resources.dialog.secret = "";
+                g("gtk_window_destroy", "ptr->void", [resources.dialog.window]);
+                resources.dialog = nil;
+            }
+        }
+        fn confirm_dialog(policy, secret, token, is_saved, updating = false) {
+            phase = "confirmation dialog";
+            if resources.dialog != nil { return; }
+            let dialog = g("gtk_window_new", "->ptr", []);
+            g("gtk_window_set_title", "ptr,string->void", [dialog, "Confirm AI input access"]);
+            g("gtk_window_set_transient_for", "ptr,ptr->void", [dialog, window]);
+            g("gtk_window_set_modal", "ptr,bool->void", [dialog, true]);
+            g("gtk_window_set_hide_on_close", "ptr,bool->void", [dialog, true]);
+            g("gtk_window_set_default_size", "ptr,i32,i32->void", [dialog, 510, 290]);
+            let body = g("gtk_box_new", "i32,i32->ptr", [1, 14]);
+            for side in ["top", "bottom", "start", "end"] { g("gtk_widget_set_margin_" + side, "ptr,i32->void", [body, 18]); }
+            phase = "confirmation text";
+            let profile_name = "This connection only";
+            if resources.trust != nil { profile_name = resources.trust.profile; }
+            let explanation = "Profile: " + profile_name + "\nPermissions: " + str_join(policy.scopes, ", ")
+                + "\nLimits: " + Budget.describe(policy.limits)
+                + "\nThis controls the whole X11 desktop. Any program using this local connection profile receives these permissions. AI names are not authentication.\n";
+            if policy.mode == "once" { explanation = explanation + "This approval applies only to this connection."; }
+            elif policy.mode == "until_revoked" and not Budget.finite(policy.limits) {
+                explanation = explanation + "Future connections will be approved without another prompt until you forget this approval.";
+            } else {
+                explanation = explanation + "Each new connection requires confirmation, without re-entering the code. Finite allowances restart only after local confirmation.";
+            }
+            explanation = explanation + "\nSTOP ends this connection. Forget removes future approval. Screen sharing still requires its separate switch.";
+            if updating {
+                let choice = "Ask for confirmation on every new connection.";
+                if policy.mode == "until_revoked" { choice = "Do not ask again until this approval is revoked. Other programs using this local profile receive the same saved access."; }
+                explanation = "Change the saved confirmation setting for profile: " + profile_name
+                + "\nPermissions and limits stay the same: " + str_join(policy.scopes, ", ") + " · " + Budget.describe(policy.limits)
+                + "\n" + choice + "\nForget removes this saved approval. STOP ends the current connection.";
+            }
+            phase = "confirmation widgets";
+            let notice = g("gtk_label_new", "string->ptr", [explanation]);
+            g("gtk_label_set_wrap", "ptr,bool->void", [notice, true]);
+            g("gtk_box_append", "ptr,ptr->void", [body, notice]);
+            let cancel = g("gtk_toggle_button_new_with_label", "string->ptr", ["Cancel"]);
+            let accept = g("gtk_toggle_button_new_with_label", "string->ptr", ["Confirm this choice"]);
+            let emergency = g("gtk_toggle_button_new_with_label", "string->ptr", ["STOP — disconnect immediately"]);
+            for widget in [cancel, accept, emergency] { g("gtk_box_append", "ptr,ptr->void", [body, widget]); }
+            g("gtk_window_set_child", "ptr,ptr->void", [dialog, body]);
+            phase = "confirmation present";
+            resources.dialog = map{ window: dialog, cancel: cancel, accept: accept,
+                emergency: emergency, policy: policy, secret: secret, token: token, is_saved: is_saved, updating: updating };
+            g("gtk_window_present", "ptr->void", [dialog]);
+        }
+        g("gtk_window_set_child", "ptr,ptr->void", [window, box]);
+        let presented = ui_startup == "immediate";
+        if presented { g("gtk_window_present", "ptr->void", [window]); }
+        phase = "channel";
+        let buffer = c("calloc", "i64,i64->ptr", [4097, 1]); resources.buffer = buffer;
+        if buffer == 0 { throw "operator read buffer unavailable"; }
+        let pending = ""; let last_heartbeat = 0; let last_review = 0;
+        let previous_token = ""; let visible_once = false;
+        let rendered_status = ""; let rendered_details = ""; let rendered_identity = ""; let rendered_context = "";
+        while not model.is_stopped() {
+            phase = "events";
+            for iteration 16 {
+                if native.iterate() == 0 { break; }
+            }
+            let visible = g("gtk_widget_get_visible", "ptr->bool", [window]);
+            let surface = g("gtk_native_get_surface", "ptr->ptr", [window]);
+            let flags = 1;
+            if surface != 0 { flags = g("gdk_toplevel_get_state", "ptr->i32", [surface]); }
+            let shown = visible and surface != 0 and bit_and(flags, 65537) == 0
+                and g("gdk_surface_get_mapped", "ptr->bool", [surface]);
+            if shown { visible_once = true; }
+            elif visible_once and not visible { model.stop(); break; }
+            let foreground = shown and g("gtk_window_is_active", "ptr->bool", [window]);
+            phase = "receive";
+            c("memset", "ptr,i32,i64->ptr", [buffer, 0, 4097]);
+            let count = native.receive(buffer);
+            if count == 0 { model.stop(); break; }
+            if count > 0 {
+                if count > 4096 { throw "operator read overflow"; }
+                let chunk = native.text(buffer);
+                if len(str_to_bytes(chunk)) != count or len(pending) + len(chunk) > 16384 { throw "invalid operator frame"; }
+                pending = pending + chunk;
+                let newline = str_index_of(pending, "\n");
+                while newline >= 0 {
+                    model.receive(json_parse(str_slice(pending, 0, newline)));
+                    pending = str_slice(pending, newline + 1, len(pending));
+                    newline = str_index_of(pending, "\n");
+                }
+            }
+            if not presented and not model.is_stopped() and model.desktop_requested() {
+                g("gtk_window_present", "ptr->void", [window]); presented = true;
+            }
+            model.startup_share(foreground);
+            let view = model.snapshot();
+            phase = "overlay";
+            if g("gtk_check_button_get_active", "ptr->bool", [steady_indicator]) { view.overlay.alpha = 780; }
+            resources.overlay.update(view.overlay, now_ms());
+            phase = "update";
+            if view.review_token != previous_token {
+                g("gtk_editable_set_text", "ptr,string->void", [nonce, ""]);
+                previous_token = view.review_token;
+                if view.review_token != "" and saved == nil { set_limits(view.requested_limits); }
+            }
+            let can_edit_limits = view.can_share and resources.dialog == nil;
+            for row in [duration, events] {
+                sensitive(row.unlimited, can_edit_limits);
+                let unlimited_checked = g("gtk_check_button_get_active", "ptr->bool", [row.unlimited]);
+                sensitive(row.entry, can_edit_limits and not unlimited_checked);
+            }
+            if remember != 0 {
+                sensitive(remember, can_edit_limits);
+                sensitive(ask_connection, can_edit_limits and foreground);
+                sensitive(save_preference, saved != nil and can_edit_limits and foreground);
+                if g("gtk_toggle_button_get_active", "ptr->bool", [save_preference]) {
+                    g("gtk_toggle_button_set_active", "ptr,bool->void", [save_preference, false]);
+                    if saved != nil and can_edit_limits and foreground {
+                        let policy = json_parse(json_stringify(saved));
+                        policy.limits = try saved.limits catch Budget.unlimited();
+                        policy.mode = "until_revoked";
+                        if g("gtk_check_button_get_active", "ptr->bool", [ask_connection]) or Budget.finite(policy.limits) { policy.mode = "each_connection"; }
+                        confirm_dialog(policy, "", "", false, true);
+                    }
+                }
+            }
+            if view.status != rendered_status {
+                g("gtk_label_set_text", "ptr,string->void", [status, view.status]); rendered_status = view.status;
+            }
+            if view.details != rendered_details {
+                g("gtk_label_set_text", "ptr,string->void", [details, view.details]); rendered_details = view.details;
+            }
+            if view.identity != rendered_identity {
+                g("gtk_label_set_text", "ptr,string->void", [identity, view.identity]); rendered_identity = view.identity;
+            }
+            if view.context != rendered_context {
+                g("gtk_label_set_text", "ptr,string->void", [context, view.context]); rendered_context = view.context;
+            }
+            if g("gtk_toggle_button_get_active", "ptr->bool", [dashboard_button]) {
+                g("gtk_toggle_button_set_active", "ptr,bool->void", [dashboard_button, false]); resources.dashboard.open();
+            }
+            if resources.dashboard.poll(view) { model.stop(); break; }
+            sensitive(nonce, view.can_approve and foreground);
+            // Stop is inspected first, even if several buttons were activated.
+            let order = [3, 2, 0, 1];
+            for index in order {
+                let a = actions[index];
+                let enabled = a.name == "stop" or (a.name == "deny" and view.can_deny)
+                    or (a.name == "share" and view.can_share and foreground)
+                    or (a.name == "approve" and view.can_approve and foreground);
+                if g("gtk_toggle_button_get_active", "ptr->bool", [a.widget]) {
+                    g("gtk_toggle_button_set_active", "ptr,bool->void", [a.widget, false]);
+                    let secret = "";
+                    if a.name == "approve" { secret = g("gtk_editable_get_text", "ptr->string", [nonce]); }
+                    if a.name == "approve" { g("gtk_editable_set_text", "ptr,string->void", [nonce, ""]); }
+                    if enabled {
+                        if a.name == "approve" {
+                            let limits = try read_limits() catch nil;
+                            if limits == nil {
+                                g("gtk_label_set_text", "ptr,string->void", [limit_note, "Enter positive whole numbers, or select No limit. Approval was not sent."]);
+                            } else {
+                                let mode = "once";
+                                if remember != 0 and g("gtk_check_button_get_active", "ptr->bool", [remember]) {
+                                    mode = "until_revoked";
+                                    let ask_each = g("gtk_check_button_get_active", "ptr->bool", [ask_connection]);
+                                    if ask_each or Budget.finite(limits) { mode = "each_connection"; }
+                                }
+                                confirm_dialog(map{ mode: mode, scopes: view.scopes, limits: limits }, secret, view.review_token, false);
+                            }
+                        } else { model.action(a.name, secret, foreground); }
+                    }
+                }
+                sensitive(a.widget, enabled);
+            }
+            if resources.trust != nil and not model.is_stopped() {
+                if g("gtk_toggle_button_get_active", "ptr->bool", [forget]) {
+                    let forgotten = resources.trust.forget(); model.stop();
+                    if not forgotten { throw "saved approval could not be removed"; }
+                    break; // Revocation must win over any pending preference save.
+                }
+                if preferences.pending_save != nil and not view.remembered_input and view.can_share and view.review_token == "" {
+                    preferences.pending_save.secret = ""; preferences.pending_save = nil;
+                }
+                if preferences.pending_save != nil and view.remembered_input {
+                    let requested = preferences.pending_save;
+                    if view.input_budget == nil or view.input_budget.duration_ms != requested.limits.duration_ms
+                        or view.input_budget.max_events != requested.limits.max_events
+                        or json_stringify(view.scopes) != json_stringify(requested.scopes) {
+                        throw "local approval acknowledgement does not match saved preference";
+                    }
+                    let write_ok = resources.trust.save(preferences.pending_save.mode, preferences.pending_save.scopes, false, preferences.pending_save.secret, preferences.pending_save.limits);
+                    preferences.pending_save.secret = ""; preferences.pending_save = nil;
+                    if not write_ok { throw "saved approval unavailable"; }
+                    saved = resources.trust.policy(); admitted = true;
+                }
+                if presented and saved != nil and not admitted and view.connected and view.ready and not view.startup_pending {
+                    admitted = true;
+                    let saved_limits = try saved.limits catch Budget.unlimited();
+                    if saved.mode == "until_revoked" and not Budget.finite(saved_limits) {
+                        let current = resources.trust.policy();
+                        if current != nil and json_stringify(current) == json_stringify(saved) {
+                            model.authorize_session(current.scopes, resources.trust.local_secret(), try current.limits catch Budget.unlimited());
+                        }
+                    } else {
+                        let policy = json_parse(json_stringify(saved)); policy.limits = saved_limits;
+                        confirm_dialog(policy, "", "", true);
+                    }
+                }
+                let checked_now = now_ms();
+                if view.remembered_input and saved != nil and (checked_now < policy_checked_at or checked_now - policy_checked_at >= 1000) {
+                    let current = resources.trust.policy(); policy_checked_at = checked_now;
+                    if current == nil or json_stringify(current) != json_stringify(saved) { model.stop(); }
+                }
+            }
+                if resources.dialog != nil {
+                    let dialog = resources.dialog;
+                    if g("gtk_toggle_button_get_active", "ptr->bool", [dialog.emergency]) { model.stop(); dismiss(); }
+                    elif not g("gtk_widget_get_visible", "ptr->bool", [dialog.window])
+                        or g("gtk_toggle_button_get_active", "ptr->bool", [dialog.cancel]) { dismiss(); }
+                    elif g("gtk_toggle_button_get_active", "ptr->bool", [dialog.accept]) {
+                        g("gtk_toggle_button_set_active", "ptr,bool->void", [dialog.accept, false]);
+                        if g("gtk_window_is_active", "ptr->bool", [dialog.window]) {
+                            if dialog.updating and view.can_share {
+                                let current = resources.trust.policy();
+                                if current != nil and json_stringify(current) == json_stringify(saved) {
+                                    if not resources.trust.save(dialog.policy.mode, current.scopes, false, resources.trust.local_secret(), try current.limits catch Budget.unlimited()) { throw "saved confirmation setting unavailable"; }
+                                    saved = resources.trust.policy();
+                                    g("gtk_check_button_set_active", "ptr,bool->void", [ask_connection, saved.mode == "each_connection"]);
+                                }
+                            } elif dialog.is_saved {
+                                let current = resources.trust.policy();
+                                if current != nil and json_stringify(current) == json_stringify(saved) {
+                                    model.authorize_session(current.scopes, resources.trust.local_secret(), try current.limits catch Budget.unlimited());
+                                }
+                            } elif view.can_approve and view.review_token == dialog.token {
+                                if dialog.policy.mode != "once" and resources.trust.matches(dialog.secret) {
+                                    preferences.pending_save = map{ mode: dialog.policy.mode, scopes: dialog.policy.scopes, secret: dialog.secret, limits: dialog.policy.limits };
+                                }
+                                model.action("approve", dialog.secret, true, dialog.policy.limits);
+                            }
+                            dismiss();
+                        }
+                    }
+                }
+            if not model.is_stopped() {
+                let now = now_ms();
+                if now - last_heartbeat >= 200 { send(map{ action: "heartbeat" }); last_heartbeat = now; }
+                if now - last_review >= 1000 { send(map{ action: "review" }); last_review = now; }
+            }
+            maintenance.step();
+            sleep_ms(25);
+        }
+        return true;
+    }
+    let ok = try render() catch false;
+    model.stop();
+    if resources.dashboard != nil { try resources.dashboard.close() catch nil; }
+    if resources.dialog != nil { try g("gtk_window_destroy", "ptr->void", [resources.dialog.window]) catch nil; }
+    if resources.trust != nil { try resources.trust.close() catch nil; }
+    if resources.overlay != nil { try resources.overlay.close() catch nil; }
+    if resources.window != 0 { try g("gtk_window_destroy", "ptr->void", [resources.window]) catch nil; }
+    if resources.buffer != 0 { try c("free", "ptr->void", [resources.buffer]) catch nil; }
+    native.close();
+    if not ok { throw "local operator closed after a UI or channel failure: " + phase; }
+}
+export run;

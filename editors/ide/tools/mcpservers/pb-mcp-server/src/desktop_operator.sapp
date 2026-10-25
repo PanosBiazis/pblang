@@ -1,0 +1,173 @@
+let Budget = import("desktop_budget.sapp");
+// Local operator presentation and decision logic. The renderer supplies real
+// foreground/visibility observations; remote messages cannot call action().
+let Identity = import("desktop_identity.sapp");
+let Context = import("desktop_context.sapp");
+let Overlay = import("desktop_overlay.sapp");
+let Activity = import("desktop_activity.sapp");
+fn _integer(n, low, high) {
+    return type(n) == "number" and n == num_floor(n) and n >= low and n <= high;
+}
+fn _valid(view) {
+    if type(view) != "map" { return false; }
+    if map_has(view, "connection_identity") and not Identity.valid(view.connection_identity) { return false; }
+    if (try view.desktop_context catch nil) != nil and not Context.valid(view.desktop_context) { return false; }
+    if map_has(view, "remembered_input") and type(view.remembered_input) != "bool" { return false; }
+    if (try view.input_budget catch nil) != nil {
+        let b = view.input_budget;
+        if not Budget.valid(map{ duration_ms: b.duration_ms, max_events: b.max_events })
+            or not _integer(b.remaining_ms, 0, b.duration_ms)
+            or not _integer(b.remaining_events, 0, b.max_events) { return false; }
+    }
+    if map_has(view, "active_streams") and not _integer(view.active_streams, 0, 1) { return false; }
+    for key in ["stopped", "busy", "capture_enabled", "input_enabled"] {
+        if type(try view[key] catch nil) != "bool" { return false; }
+    }
+    if not _integer(try view.active_control catch nil, 0, 1)
+        or not _integer(try view.pending_control catch nil, 0, 1)
+        or type(try view.review_token catch nil) != "string" or len(view.review_token) > 128 { return false; }
+    let c = try view.control catch nil;
+    if c == nil { return view.active_control == 0 and view.pending_control == 0; }
+    if type(c) != "map" or (c.state != "pending_local_approval" and c.state != "active")
+        or type(c.scopes) != "array" or len(c.scopes) < 1 or len(c.scopes) > 2
+        or not _integer(c.requested_ttl_ms, 5000, 120000)
+        or not _integer(c.remaining_events, 0, 512)
+        or type(c.expires_at) != "number" or c.expires_at != c.expires_at
+        or c.expires_at < 0 or c.expires_at > 9007199254740991 { return false; }
+    for scope in c.scopes { if scope != "pointer" and scope != "keyboard" { return false; } }
+    if c.state == "pending_local_approval" {
+        return view.pending_control == 1 and view.active_control == 0 and view.review_token != "";
+    }
+    return view.active_control == 1 and view.pending_control == 0 and view.review_token == "";
+}
+fn new(send, startup_sharing = false) {
+    if type(startup_sharing) != "bool" { throw "Invalid local sharing preference"; }
+    let state = map{ activity: nil, startup_pending: startup_sharing, view: nil, waiting: true, stopped: false, note: "Waiting for the local session" };
+    fn is_stopped() { return state.stopped; }
+    fn desktop_requested() {
+        return state.activity != nil and str_starts_with(state.activity.operation, "pbremote_");
+    }
+    fn deliver(message) { send(message); return true; }
+    fn stop() {
+        if not state.stopped {
+            state.stopped = true; state.view = nil; state.waiting = true;
+            try send(map{ action: "stop" }) catch nil;
+        }
+    }
+    fn receive(message) {
+        if state.stopped { return; }
+        // Optional observation only; never influences permission decisions.
+        state.activity = Activity.normalize(try message.activity catch nil);
+        if (try message.event catch "") == "stopped" { stop(); return; }
+        if (try message.event catch "") == "busy" {
+            state.waiting = true; state.note = "Operation in progress; Stop remains available"; return;
+        }
+        if (try message.event catch "") != "view" or not (try _valid(message.view) catch false) {
+            stop(); return;
+        }
+        state.view = json_parse(json_stringify(message.view));
+        state.waiting = false;
+        state.note = if (try message.local_result.ok catch true) { "Local session connected" } else { "Approval or sharing was refused; review the current request" };
+        if state.view.stopped { stop(); }
+    }
+    fn snapshot() {
+        // One observation time per presentation; never cache it across calls.
+        let now = now_ms();
+        let v = state.view;
+        let out = map{ stopped: state.stopped, status: state.note, activity: Activity.describe(state.activity, state.stopped),
+            context: "Displays: unavailable\nFocused application: unavailable\nObservation only; no target restriction",
+            identity: "Client: Not supplied · Model: Not supplied\nClient declarations — identity not verified\nScope: X11 desktop; not restricted to one application\nActivity: waiting for connection",
+            startup_pending: state.startup_pending, ready: false, input_budget: nil, overlay: Overlay.presentation(v, now), remembered_input: false, scopes: [], connected: false,
+            requested_limits: map{ duration_ms: 120000, max_events: 512 },
+            details: "No control request\n", review_token: "", sharing: false,
+            can_share: false, can_approve: false, can_deny: false };
+        if state.stopped { out.status = "Stopped — start a new local session to reconnect"; return out; }
+        if v == nil { return out; }
+        out.remembered_input = try v.remembered_input catch false;
+        out.input_budget = try v.input_budget catch nil;
+        out.connected = map_has(v, "connection_identity");
+        out.ready = not state.waiting and not v.busy;
+        let context = try v.desktop_context catch nil;
+        if context != nil and now >= context.observed_at_ms and now - context.observed_at_ms <= 3000 {
+            out.context = "Displays: " + str(len(context.monitors)) + " · Desktop: " + str(context.root_width) + " × " + str(context.root_height);
+            if context.monitor_source == "root" { out.context = "Display layout unavailable · Virtual desktop: " + str(context.root_width) + " × " + str(context.root_height); }
+            out.context = out.context + "\nFocused application (unverified): " + context.application
+                + "\nRecent sample; focus can change before an action";
+        }
+        if map_has(v, "connection_identity") {
+            out.identity = "Client: " + v.connection_identity.client + " · Model: " + v.connection_identity.model
+                + "\nClient declarations — identity not verified\nScope: X11 desktop; not restricted to one application";
+        } else {
+            out.identity = "Client: Not supplied · Model: Not supplied\nClient declarations — identity not verified\nScope: X11 desktop; not restricted to one application";
+        }
+        if state.waiting or v.busy { out.identity = out.identity + "\nActivity: operation pending"; }
+        else { out.identity = out.identity + "\nActivity: waiting for next request"; }
+        if (try v.active_streams catch 0) == 1 { out.identity = out.identity + " · Screen stream open"; }
+        out.sharing = v.capture_enabled;
+        out.status = if v.capture_enabled { "Screen sharing ON" } else { "Screen sharing OFF" };
+        out.status = out.status + if v.active_control == 1 or out.remembered_input { " · Input control ON" } else { " · Input control OFF" };
+        out.can_share = not state.waiting and not v.busy and v.active_control == 0 and not out.remembered_input;
+        out.can_deny = v.active_control == 1 or v.pending_control == 1 or out.remembered_input;
+        if v.control != nil {
+            let c = v.control;
+            out.requested_limits = map{ duration_ms: c.requested_ttl_ms, max_events: c.remaining_events };
+            // _valid admitted only primitive scope strings. Copy the array so
+            // callers cannot mutate state, without allocating a JSON round trip.
+            out.scopes = slice(c.scopes, 0, len(c.scopes));
+            out.details = if c.state == "active" { "Active: " } else { "Requested: " };
+            out.details = out.details + str_join(c.scopes, ", ") + "\nDuration: "
+                + str(c.requested_ttl_ms / 1000) + " s · Events remaining: " + str(c.remaining_events);
+            out.review_token = v.review_token;
+            out.can_approve = out.can_share and c.state == "pending_local_approval"
+                and c.expires_at > now;
+        }
+        let budget = try v.input_budget catch nil;
+        if budget != nil {
+            out.details = "Approved: " + Budget.describe(map{ duration_ms: budget.duration_ms, max_events: budget.max_events });
+            let time = "unlimited"; let events = "unlimited";
+            if budget.duration_ms != 0 { time = str(num_ceil(budget.remaining_ms / 1000)) + " s"; }
+            if budget.max_events != 0 { events = str(budget.remaining_events); }
+            out.details = out.details + "\nRemaining: " + time + " · " + events + " events";
+        }
+        return out;
+    }
+    fn action(name, nonce = "", foreground = false, limits = nil) {
+        if name == "stop" { stop(); return true; }
+        if state.stopped { return false; }
+        let s = snapshot();
+        let message = map{};
+        if name == "deny" and s.can_deny { message = map{ action: "deny" }; }
+        elif name == "share" and s.can_share and type(foreground) == "bool" and foreground {
+            message = map{ action: "share", enabled: not s.sharing, foreground: true };
+        } elif name == "approve" and s.can_approve and type(foreground) == "bool" and foreground
+            and type(nonce) == "string" and len(nonce) > 0 and len(nonce) <= 256 {
+            if limits != nil and not Budget.valid(limits) { return false; }
+            message = map{ action: "approve", review_token: s.review_token, nonce: nonce, foreground: true };
+            if limits != nil { message.limits = limits; }
+        } else { return false; }
+        // Disable further grants before putting authority on the private pipe.
+        state.waiting = true;
+        if not (try deliver(message) catch false) { stop(); return false; }
+        return true;
+    }
+    fn startup_share(foreground) {
+        if not state.startup_pending or state.stopped { return false; }
+        let s = snapshot();
+        if not state.startup_pending or state.stopped or not s.connected or not s.ready { return false; }
+        if s.sharing { state.startup_pending = false; return false; }
+        if not s.can_share or type(foreground) != "bool" or not foreground { return false; }
+        // One attempt only. Revocation or failure must never auto-enable again.
+        state.startup_pending = false;
+        return action("share", "", foreground);
+    }
+    fn authorize_session(scopes, secret, limits = nil) {
+        if state.stopped { return false; }
+        if limits == nil { limits = Budget.unlimited(); }
+        if not Budget.valid(limits) { return false; }
+        state.waiting = true;
+        if not (try deliver(map{ action: "authorize_session", scopes: scopes, nonce: secret, limits: limits }) catch false) { stop(); return false; }
+        return true;
+    }
+    return map{ desktop_requested: desktop_requested, is_stopped: is_stopped, startup_share: startup_share, authorize_session: authorize_session, receive: receive, snapshot: snapshot, action: action, stop: stop };
+}
+export new;

@@ -1,0 +1,262 @@
+// Privacy-minimized process anomaly observations for Linux.
+
+let SEC = import("security.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let PROCESS = import("stdlib:linux_process.sapp");
+
+fn _strict(args, allowed) {
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "process anomaly arguments must be an object"; }
+    let keys = map_keys(args);
+    for i len(keys) {
+        let found = false;
+        for j len(allowed) { if keys[i] == allowed[j] { found = true; break; } }
+        if not found { throw "unknown process anomaly argument: " + str(keys[i]); }
+    }
+    return args;
+}
+
+fn _integer(value, label, low, high, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value) or value < low or value > high {
+        throw label + " must be an integer between " + str(low) + " and " + str(high);
+    }
+    return value;
+}
+
+fn _number(value, label, low, high, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value < low or value > high {
+        throw label + " must be between " + str(low) + " and " + str(high);
+    }
+    return value;
+}
+
+fn _words(line) {
+    let raw = str_split(str_trim(str_replace_all(str(line), "\t", " ")), " "); let out = [];
+    for i len(raw) { if raw[i] != "" { out[len(out)] = raw[i]; } }
+    return out;
+}
+
+fn _pid(value, allow_zero = false) {
+    if type(value) != "string" or not regex_match(value, "^[0-9]{1,10}$") { return nil; }
+    let parsed = try parse_number(value) catch nil;
+    let minimum = if allow_zero { 0 } else { 1 };
+    if parsed == nil or parsed < minimum or parsed > 4194304 { return nil; }
+    return parsed;
+}
+
+fn _safe_name(value) {
+    let out = str(value);
+    if len(out) > 64 { out = str_slice(out, 0, 64); }
+    return out;
+}
+
+fn _add(finding_state, process, kind, severity, evidence) {
+    finding_state.total = finding_state.total + 1;
+    if len(finding_state.findings) >= finding_state.maximum {
+        finding_state.truncated = true; return;
+    }
+    finding_state.findings[len(finding_state.findings)] = map{
+        pid: process.pid, ppid: process.ppid, uid: process.uid,
+        process_name: process.name, kind: kind, severity: severity,
+        evidence: evidence, heuristic: true, malware_confirmed: false,
+        command_line_exposed: false, environment_exposed: false
+    };
+}
+
+fn parse_snapshot(text, options = nil) {
+    options = _strict(options, ["max_processes", "max_findings", "cpu_percent",
+        "memory_percent", "min_elapsed_seconds"]);
+    let max_processes = _integer(try options.max_processes catch nil,
+        "max_processes", 1, 4000, 1000);
+    let max_findings = _integer(try options.max_findings catch nil,
+        "max_findings", 1, 500, 100);
+    let cpu_threshold = _number(try options.cpu_percent catch nil,
+        "cpu_percent", 1, 10000, 90);
+    let memory_threshold = _number(try options.memory_percent catch nil,
+        "memory_percent", 0.1, 100, 50);
+    let min_elapsed = _integer(try options.min_elapsed_seconds catch nil,
+        "min_elapsed_seconds", 0, 315360000, 30);
+    let state = map{ findings: [], total: 0, maximum: max_findings, truncated: false };
+    let processes = []; let ids = map{}; let malformed = 0; let lines = str_split(str(text), "\n");
+    let valid_total = 0;
+    for i len(lines) {
+        let words = _words(lines[i]);
+        if len(words) == 0 { continue; }
+        if len(words) < 8 {
+            malformed = malformed + 1; continue;
+        }
+        let pid = _pid(words[0]); let ppid = _pid(words[1], true);
+        let uid = try parse_number(words[2]) catch nil;
+        let cpu = try parse_number(words[4]) catch nil;
+        let memory = try parse_number(words[5]) catch nil;
+        let elapsed = try parse_number(words[6]) catch nil;
+        if pid == nil or ppid == nil or uid == nil or cpu == nil or memory == nil or elapsed == nil {
+            malformed = malformed + 1; continue;
+        }
+        valid_total = valid_total + 1;
+        if len(processes) >= max_processes { state.truncated = true; continue; }
+        // The first seven columns are fixed-width scalar fields. Everything
+        // after them is one executable path, so spaces in paths cannot shift
+        // a process-name column or expose argv data.
+        let executable = str_join(slice(words, 7, len(words)), " ");
+        let clean_executable = str_replace_all(executable, " (deleted)", "");
+        let name = if executable == "-" or executable == "" {
+            "[unavailable]"
+        } else {
+            path_basename(clean_executable)
+        };
+        let process = map{
+            pid: pid, ppid: ppid, uid: uid, stat: words[3],
+            cpu_percent: cpu, memory_percent: memory, elapsed_seconds: elapsed,
+            name: _safe_name(name), executable_location: "system"
+        };
+        if str_starts_with(executable, "/tmp/") or str_starts_with(executable, "/dev/shm/") {
+            process.executable_location = "ephemeral";
+        } elif executable == "-" or executable == "[" or executable == "" {
+            process.executable_location = "unavailable";
+        } elif str_contains(executable, " (deleted)") {
+            process.executable_location = "deleted";
+        } elif str_starts_with(executable, "/home/") or str_starts_with(executable, "/media/") {
+            process.executable_location = "user-controlled";
+        }
+        processes[len(processes)] = process; ids[str(pid)] = true;
+        if str_contains(process.stat, "Z") {
+            _add(state, process, "zombie", "medium", "process state contains Z");
+        }
+        if process.executable_location == "ephemeral" {
+            _add(state, process, "ephemeral-executable", "high",
+                "executable resolves beneath /tmp or /dev/shm");
+        }
+        if process.executable_location == "deleted" {
+            _add(state, process, "deleted-executable", "medium",
+                "executable path is marked deleted while process remains alive");
+        }
+        if elapsed >= min_elapsed and cpu >= cpu_threshold {
+            _add(state, process, "cpu-pressure", "low",
+                "lifetime CPU percentage exceeds the caller threshold");
+        }
+        if memory >= memory_threshold {
+            _add(state, process, "memory-pressure", "low",
+                "resident memory percentage exceeds the caller threshold");
+        }
+    }
+    return map{
+        format: "pb_mcp.process-snapshot.v1", ok: malformed == 0 and not state.truncated,
+        processes: processes, process_ids: ids, processes_scanned: len(processes),
+        valid_process_rows: valid_total, malformed_rows: malformed,
+        anomalies: state.findings, anomaly_count: state.total,
+        returned_anomalies: len(state.findings), findings_truncated: state.truncated,
+        snapshot_truncated: valid_total > len(processes),
+        command_lines_exposed: false, environments_exposed: false,
+        executable_paths_exposed: false, heuristic_findings: true,
+        malware_confirmed: false
+    };
+}
+
+fn _numeric_proc_ids(root, maximum = 4096) {
+    let listed = DIRFS.list(root, "root", maximum); let ids = map{};
+    if not listed.ok { return map{ ok: false, ids: ids, truncated: false }; }
+    for i len(listed.entries) {
+        let pid = _pid(str(listed.entries[i]));
+        if pid != nil { ids[str(pid)] = true; }
+    }
+    return map{ ok: true, ids: ids, truncated: listed.truncated };
+}
+
+fn visibility_candidates(before, after, ps_ids, maximum = 100) {
+    maximum = _integer(maximum, "max_findings", 0, 500, 100);
+    let out = []; let total = 0; let keys = map_keys(before);
+    for i len(keys) {
+        let key = keys[i];
+        if map_has(after, key) and not map_has(ps_ids, key) {
+            total = total + 1;
+            if len(out) < maximum {
+                out[len(out)] = map{
+                    pid: parse_number(key), kind: "visibility-mismatch-candidate",
+                    severity: "medium", heuristic: true, hidden_process_confirmed: false,
+                    evidence: "PID existed in both bounded /proc snapshots but not the intervening ps snapshot"
+                };
+            }
+        }
+    }
+    return map{ candidates: out, candidate_count: total,
+        truncated: total > len(out), hidden_processes_confirmed: 0 };
+}
+
+fn _held_ps() {
+    let candidates = ["/usr/bin/ps", "/bin/ps"];
+    for i len(candidates) {
+        let path = candidates[i]; let root = DIRFS.open_absolute(path_dirname(path), false, false);
+        if root.ok {
+            let handoff = DIRFS.child_file_descriptor(root, path_basename(path));
+            if handoff.ok { return map{ ok: true, root: root, handoff: handoff,
+                path: "/proc/self/fd/" + str(handoff.fd) }; }
+            DIRFS.close(root);
+        }
+    }
+    return map{ ok: false };
+}
+
+fn inspect(args) {
+    args = _strict(args, ["max_processes", "max_findings", "cpu_percent",
+        "memory_percent", "min_elapsed_seconds", "timeout_seconds", "max_output_bytes"]);
+    SEC.require_trusted("process anomaly inspection", "PB_PROTECT_INSPECT_ENABLE");
+    if platform() != "linux" { throw "process anomaly inspection currently requires Linux"; }
+    let max_processes = _integer(try args.max_processes catch nil, "max_processes", 1, 4000, 1000);
+    let max_findings = _integer(try args.max_findings catch nil, "max_findings", 1, 500, 100);
+    let timeout = _integer(try args.timeout_seconds catch nil, "timeout_seconds", 1, 15, 5);
+    let output_limit = _integer(try args.max_output_bytes catch nil,
+        "max_output_bytes", 4096, 1048576, 524288);
+    let proc = DIRFS.open_absolute("/proc", false, false);
+    if not proc.ok { throw "procfs cannot be held"; }
+    let before = _numeric_proc_ids(proc);
+    let ps = _held_ps();
+    if not ps.ok { DIRFS.close(proc); throw "trusted ps executable is unavailable"; }
+    let result = try PROCESS.run(ps.path, ["-eo",
+        "pid=,ppid=,uid=,stat=,pcpu=,pmem=,etimes=,exe=", "--sort=-pcpu"], map{
+        timeout_secs: timeout, max_output_bytes: output_limit,
+        max_memory_bytes: 67108864, inherit_environment: false
+    }) catch map{ ok: false, error: "bounded process snapshot failed" };
+    DIRFS.close_child_descriptor(ps.root, ps.handoff); DIRFS.close(ps.root);
+    let after = _numeric_proc_ids(proc); DIRFS.close(proc);
+    if not (try result.ok catch false) or not (try result.command_ok catch false)
+       or not (try result.stdout_utf8 catch false) {
+        return map{ format: "pb_mcp.protect_process_anomaly.v2", ok: false,
+            complete: false, error: "process snapshot command failed",
+            shell_used: false, raw_output_exposed: false };
+    }
+    let parsed = parse_snapshot(result.stdout, map{
+        max_processes: max_processes, max_findings: max_findings,
+        cpu_percent: try args.cpu_percent catch 90,
+        memory_percent: try args.memory_percent catch 50,
+        min_elapsed_seconds: try args.min_elapsed_seconds catch 30
+    });
+    let remaining = max_findings - parsed.returned_anomalies;
+    let visibility = visibility_candidates(before.ids, after.ids,
+        parsed.process_ids, remaining);
+    let anomalies = parsed.anomalies;
+    for i len(visibility.candidates) { anomalies[len(anomalies)] = visibility.candidates[i]; }
+    let complete = parsed.ok and before.ok and after.ok and not before.truncated
+        and not after.truncated and not (try result.output_truncated catch true);
+    return map{
+        format: "pb_mcp.protect_process_anomaly.v2", ok: complete,
+        complete: complete, processes_scanned: parsed.processes_scanned,
+        anomaly_count: parsed.anomaly_count + visibility.candidate_count,
+        anomalies: anomalies, returned_anomalies: len(anomalies),
+        findings_truncated: parsed.findings_truncated or visibility.truncated,
+        visibility_mismatch_candidates: visibility.candidate_count,
+        hidden_processes_confirmed: 0, malware_confirmed: false,
+        command_lines_exposed: false, environments_exposed: false,
+        executable_paths_exposed: false, raw_output_exposed: false,
+        shell_used: false, bounded_output: true, bounded_runtime: true,
+        descriptor_bound_executable: true,
+        process_group_terminated: try result.process_group_terminated catch false,
+        proc_snapshots_complete: before.ok and after.ok and not before.truncated and not after.truncated,
+        snapshot_output_truncated: try result.output_truncated catch false,
+        malformed_rows: parsed.malformed_rows
+    };
+}
+
+export parse_snapshot, visibility_candidates, inspect;

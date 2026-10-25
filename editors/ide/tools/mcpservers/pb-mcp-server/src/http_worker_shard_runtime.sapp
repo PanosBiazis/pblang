@@ -1,0 +1,117 @@
+// Common one-request runtime for statically linked PB-MCP worker shards.
+
+let JSON = import("stdlib:json.sapp");
+let AUTH = import("http_worker_auth.sapp");
+let TOOL_IDENTITY = import("tool_identity.sapp");
+
+let MAX_ENVELOPE_CHARS = 2097152;
+
+fn _exact_keys(value, allowed, maximum) {
+    if type(value) != "map" { return false; }
+    let keys = map_keys(value);
+    if len(keys) != maximum or maximum != len(allowed) { return false; }
+    for i len(keys) {
+        let known = false;
+        for j len(allowed) { if keys[i] == allowed[j] { known = true; } }
+        if not known { return false; }
+    }
+    return true;
+}
+
+fn _contains(values, wanted) {
+    for i len(values) { if values[i] == wanted { return true; } }
+    return false;
+}
+
+fn _response(ok, output = nil) {
+    let value = map{ format: "pb_mcp.http-worker.response.v2", ok: ok };
+    if ok { value.output = output; }
+    else { value.error = "isolated HTTP worker refused or failed the request"; }
+    return value;
+}
+
+fn _validated_envelope(line, shard_id, generation_digest, owned_tools) {
+    if type(line) != "string" or len(line) < 2 or len(line) > MAX_ENVELOPE_CHARS {
+        return nil;
+    }
+    let envelope = try JSON.parse(line) catch nil;
+    let envelope_keys = ["format", "deadline_ms", "call", "context", "shard_id",
+        "generation_digest", "worker_fingerprint"];
+    if not _exact_keys(envelope, envelope_keys, len(envelope_keys)) or
+       (try envelope.format catch "") != "pb_mcp.http-worker.request.v2" or
+       (try envelope.shard_id catch "") != shard_id or
+       (try envelope.generation_digest catch "") != generation_digest {
+        return nil;
+    }
+    let deadline = envelope.deadline_ms;
+    if type(deadline) != "number" or num_floor(deadline) != deadline or
+       deadline < now_ms() or deadline > now_ms() + 60000 {
+        return nil;
+    }
+    let expected = try env_get("PB_MCP_WORKER_FINGERPRINT") catch "";
+    let supplied = try envelope.worker_fingerprint catch "";
+    if type(expected) != "string" or len(expected) != 64 or
+       type(supplied) != "string" or len(supplied) != 64 or
+       not regex_match(expected, "^[0-9a-f]{64}$") or
+       not constant_time_eq(expected, supplied) {
+        return nil;
+    }
+    let call = envelope.call;
+    let call_keys = ["format", "tool_name", "arguments", "protocol_id", "request_id"];
+    if not _exact_keys(call, call_keys, len(call_keys)) or
+       call.format != "pb_mcp.worker-call.v1" or
+       type(call.arguments) != "map" or
+       len(map_keys(call.arguments)) > 256 or
+       type(call.protocol_id) != "string" or
+       len(call.protocol_id) < 1 or len(call.protocol_id) > 64 or
+       type(call.request_id) != "string" or
+       not regex_match(call.request_id, "^[0-9a-f]{24}$") {
+        return nil;
+    }
+    let parsed_tool = TOOL_IDENTITY.parse(try call.tool_name catch nil);
+    if not parsed_tool.ok or not _contains(owned_tools, parsed_tool.name) {
+        return nil;
+    }
+    call.tool_name = parsed_tool.name;
+    return map{ envelope: envelope, call: call };
+}
+
+fn execute(shard_id, generation_digest, owned_tools, permission, handler) {
+    if type(shard_id) != "string" or len(shard_id) < 3 or len(shard_id) > 64 or
+       not regex_match(shard_id, "^[a-z][a-z0-9_-]{2,63}$") or
+       type(generation_digest) != "string" or len(generation_digest) != 64 or
+       not regex_match(generation_digest, "^[0-9a-f]{64}$") or
+       type(owned_tools) != "array" or len(owned_tools) < 1 or len(owned_tools) > 256 or
+       (permission != "tools.read" and permission != "tools.execute") or
+       not is_fn(handler) {
+        return _response(false);
+    }
+    let seen = map{};
+    for i len(owned_tools) {
+        let parsed = TOOL_IDENTITY.parse(owned_tools[i]);
+        if not parsed.ok or map_has(seen, parsed.name) { return _response(false); }
+        seen[parsed.name] = true;
+    }
+    let line = read_line();
+    let extra = read_line();
+    if extra != nil and str_trim(str(extra)) != "" { return _response(false); }
+    let parsed = _validated_envelope(line, shard_id, generation_digest, owned_tools);
+    if parsed == nil { return _response(false); }
+    let authorization = AUTH.resolve(parsed.envelope.context);
+    if not authorization.ok or not authorization.tools_read or
+       (permission == "tools.execute" and not authorization.tools_execute) {
+        return _response(false);
+    }
+    let result = try handler(parsed.call.tool_name, parsed.call.arguments) catch nil;
+    if result == nil { return _response(false); }
+    return _response(true, map{ ok: true, tool: parsed.call.tool_name,
+        value: result, shard_id: shard_id, generation_digest: generation_digest,
+        iam_revision: authorization.iam_revision });
+}
+
+fn run(shard_id, generation_digest, owned_tools, permission, handler) {
+    print JSON.stringify(execute(shard_id, generation_digest, owned_tools,
+        permission, handler));
+}
+
+export execute, run;

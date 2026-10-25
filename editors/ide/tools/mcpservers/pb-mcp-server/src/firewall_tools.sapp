@@ -1,0 +1,273 @@
+// Bounded Linux firewall inspection with honest evidence semantics.
+
+let SEC = import("security.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let PROCESS = import("stdlib:linux_process.sapp");
+
+fn _strict(args, allowed) {
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "firewall arguments must be an object"; }
+    let keys = map_keys(args);
+    for i len(keys) {
+        let found = false;
+        for j len(allowed) { if keys[i] == allowed[j] { found = true; break; } }
+        if not found { throw "unknown firewall argument: " + str(keys[i]); }
+    }
+    return args;
+}
+
+fn _integer(value, label, low, high, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value) or value < low or value > high {
+        throw label + " must be an integer between " + str(low) + " and " + str(high);
+    }
+    return value;
+}
+
+fn _words(line) {
+    let normalized = str_replace_all(str_replace_all(str_replace_all(str(line), "\t", " "),
+        "{", " "), "}", " ");
+    normalized = str_replace_all(str_replace_all(normalized, ",", " "), ";", " ");
+    let raw = str_split(str_trim(normalized), " "); let out = [];
+    for i len(raw) { if raw[i] != "" { out[len(out)] = raw[i]; } }
+    return out;
+}
+
+fn _port(value) {
+    if type(value) != "string" or not regex_match(value, "^[0-9]{1,5}$") { return nil; }
+    let port = try parse_number(value) catch nil;
+    if port == nil or port < 1 or port > 65535 { return nil; }
+    return port;
+}
+
+fn _add_port(state, protocol, port, source) {
+    if protocol != "tcp" and protocol != "udp" { protocol = "unknown"; }
+    if port == nil { return; }
+    let key = protocol + ":" + str(port);
+    if map_has(state.seen_ports, key) { return; }
+    state.seen_ports[key] = true;
+    state.ports[len(state.ports)] = map{
+        port: port, protocol: protocol, source: source,
+        meaning: "firewall-policy-allowed", listening_socket_verified: false
+    };
+}
+
+fn _policy(line) {
+    let lower = str_lower(str_trim(line));
+    if str_contains(lower, "policy drop") or str_contains(lower, "policy reject") { return "deny"; }
+    if str_contains(lower, "policy accept") { return "allow"; }
+    return "unknown";
+}
+
+fn parse_nft(text, max_rules = 500) {
+    max_rules = _integer(max_rules, "max_rules", 1, 5000, 500);
+    let state = map{ ports: [], seen_ports: map{} };
+    let lines = str_split(str(text), "\n"); let rules = []; let total = 0;
+    let chains = 0; let default_deny = 0; let default_allow = 0;
+    for i len(lines) {
+        let line = str_trim(lines[i]); let lower = str_lower(line);
+        if line == "" { continue; }
+        if str_starts_with(lower, "chain ") { chains = chains + 1; }
+        let policy = _policy(lower);
+        if policy == "deny" { default_deny = default_deny + 1; }
+        if policy == "allow" { default_allow = default_allow + 1; }
+        if str_contains(lower, " accept") or str_ends_with(lower, "accept") {
+            total = total + 1;
+            if len(rules) < max_rules {
+                let rule_protocol = "unknown";
+                if str_contains(lower, "udp") { rule_protocol = "udp"; }
+                elif str_contains(lower, "tcp") { rule_protocol = "tcp"; }
+                rules[len(rules)] = map{ action: "allow", protocol: rule_protocol };
+            }
+            let words = _words(lower); let protocol = "unknown"; let collecting = false;
+            for w len(words) {
+                if words[w] == "tcp" or words[w] == "udp" { protocol = words[w]; }
+                elif words[w] == "dport" { collecting = true; }
+                elif collecting {
+                    if words[w] == "accept" or words[w] == "drop" or words[w] == "reject" { collecting = false; }
+                    else { _add_port(state, protocol, _port(words[w]), "nftables"); }
+                }
+            }
+        }
+    }
+    return map{
+        format: "pb_mcp.firewall.parse.nft.v1", parser: "nftables",
+        parse_complete: true, chain_count: chains, allow_rule_count: total,
+        returned_rules: rules, rules_truncated: total > len(rules),
+        policy_allowed_ports: state.ports, default_deny_chains: default_deny,
+        default_allow_chains: default_allow
+    };
+}
+
+fn parse_iptables(text, max_rules = 500) {
+    max_rules = _integer(max_rules, "max_rules", 1, 5000, 500);
+    let state = map{ ports: [], seen_ports: map{} };
+    let lines = str_split(str(text), "\n"); let rules = []; let total = 0;
+    let default_deny = 0; let default_allow = 0;
+    for i len(lines) {
+        let line = str_trim(lines[i]); let words = _words(line);
+        if str_starts_with(line, ":INPUT ") {
+            if str_contains(line, " DROP ") or str_contains(line, " REJECT ") { default_deny = default_deny + 1; }
+            if str_contains(line, " ACCEPT ") { default_allow = default_allow + 1; }
+        }
+        if len(words) > 3 and words[0] == "-A" and words[1] == "INPUT" {
+            let action = "unknown"; let protocol = "unknown"; let port = nil;
+            for w len(words) {
+                if words[w] == "-p" and w + 1 < len(words) { protocol = str_lower(words[w + 1]); }
+                if words[w] == "--dport" and w + 1 < len(words) { port = _port(words[w + 1]); }
+                if words[w] == "-j" and w + 1 < len(words) { action = str_lower(words[w + 1]); }
+            }
+            if action == "accept" {
+                total = total + 1; _add_port(state, protocol, port, "iptables");
+                if len(rules) < max_rules { rules[len(rules)] = map{ action: "allow", protocol: protocol }; }
+            }
+        }
+    }
+    return map{
+        format: "pb_mcp.firewall.parse.iptables.v1", parser: "iptables-save",
+        parse_complete: true, allow_rule_count: total, returned_rules: rules,
+        rules_truncated: total > len(rules), policy_allowed_ports: state.ports,
+        default_deny_chains: default_deny, default_allow_chains: default_allow
+    };
+}
+
+fn parse_ufw(text, max_rules = 500) {
+    max_rules = _integer(max_rules, "max_rules", 1, 5000, 500);
+    let state = map{ ports: [], seen_ports: map{} };
+    let lines = str_split(str(text), "\n"); let active = nil; let total = 0; let rules = [];
+    for i len(lines) {
+        let line = str_trim(lines[i]); let lower = str_lower(line);
+        if str_starts_with(lower, "status:") {
+            active = str_contains(lower, "active") and not str_contains(lower, "inactive");
+        }
+        let words = _words(line);
+        if len(words) >= 2 and str_lower(words[1]) == "allow" {
+            let spec = str_split(words[0], "/");
+            if len(spec) == 2 {
+                let port = _port(spec[0]); let protocol = str_lower(spec[1]);
+                if port != nil {
+                    total = total + 1; _add_port(state, protocol, port, "ufw");
+                    if len(rules) < max_rules { rules[len(rules)] = map{ action: "allow", protocol: protocol }; }
+                }
+            }
+        }
+    }
+    return map{
+        format: "pb_mcp.firewall.parse.ufw.v1", parser: "ufw",
+        parse_complete: active != nil, active: active, allow_rule_count: total,
+        returned_rules: rules, rules_truncated: total > len(rules),
+        policy_allowed_ports: state.ports, default_deny_chains: 0,
+        default_allow_chains: 0
+    };
+}
+
+fn _held_program(candidates) {
+    for i len(candidates) {
+        let path = candidates[i]; let root = DIRFS.open_absolute(path_dirname(path), false, false);
+        if root.ok {
+            let handoff = DIRFS.child_file_descriptor(root, path_basename(path));
+            if handoff.ok {
+                return map{ ok: true, root: root, handoff: handoff,
+                    exec_path: "/proc/self/fd/" + str(handoff.fd), display_path: path };
+            }
+            DIRFS.close(root);
+        }
+    }
+    return map{ ok: false };
+}
+
+fn _close_program(program) {
+    if program != nil and is_map(program) and (try program.ok catch false) {
+        DIRFS.close_child_descriptor(program.root, program.handoff); DIRFS.close(program.root);
+    }
+}
+
+fn _permission_denied(result) {
+    let text = str_lower((try result.stderr catch "") + "\n" + (try result.stdout catch ""));
+    return str_contains(text, "permission denied") or str_contains(text, "operation not permitted")
+        or str_contains(text, "must be root") or str_contains(text, "need to be root");
+}
+
+fn _probe(name, candidates, argv, parser, timeout_seconds, max_output_bytes, max_rules) {
+    let program = _held_program(candidates);
+    if not program.ok {
+        return map{
+            name: name, installed: false, executed: false, accessible: false,
+            permission_denied: false, exit_code: -1, timed_out: false,
+            output_truncated: false, process_group_terminated: true,
+            descriptor_bound_executable: false, shell_used: false,
+            parser_result: nil, raw_output_exposed: false
+        };
+    }
+    let result = try PROCESS.run(program.exec_path, argv, map{
+        timeout_secs: timeout_seconds, max_output_bytes: max_output_bytes,
+        max_memory_bytes: 67108864, inherit_environment: false
+    }) catch map{ ok: false, error: "bounded firewall process failed" };
+    _close_program(program);
+    let accessible = (try result.ok catch false) and (try result.command_ok catch false)
+        and (try result.stdout_utf8 catch false) and not (try result.output_truncated catch true);
+    let parsed = nil;
+    if accessible { parsed = parser(result.stdout, max_rules); }
+    return map{
+        name: name, installed: true, executed: try result.completed catch false,
+        accessible: accessible, permission_denied: _permission_denied(result),
+        exit_code: try result.exit_code catch -1,
+        timed_out: try result.timed_out catch false,
+        output_truncated: try result.output_truncated catch false,
+        process_group_terminated: try result.process_group_terminated catch false,
+        descriptor_bound_executable: true, shell_used: false,
+        parser_result: parsed, raw_output_exposed: false
+    };
+}
+
+fn status(args) {
+    args = _strict(args, ["timeout_seconds", "max_output_bytes", "max_rules", "include_rules"]);
+    SEC.require_trusted("firewall status", "PB_PROTECT_INSPECT_ENABLE");
+    if platform() != "linux" { throw "firewall status currently requires Linux native probes"; }
+    let timeout = _integer(try args.timeout_seconds catch nil, "timeout_seconds", 1, 15, 5);
+    let output_limit = _integer(try args.max_output_bytes catch nil, "max_output_bytes", 1024, 1048576, 262144);
+    let max_rules = _integer(try args.max_rules catch nil, "max_rules", 1, 5000, 500);
+    let include_rules = try args.include_rules catch false;
+    if type(include_rules) != "bool" { throw "include_rules must be boolean"; }
+    let probes = [
+        _probe("nftables", ["/usr/sbin/nft", "/usr/bin/nft"], ["list", "ruleset"], parse_nft, timeout, output_limit, max_rules),
+        _probe("iptables", ["/usr/sbin/iptables-save", "/usr/bin/iptables-save"], [], parse_iptables, timeout, output_limit, max_rules),
+        _probe("ufw", ["/usr/sbin/ufw", "/usr/bin/ufw"], ["status"], parse_ufw, timeout, output_limit, max_rules)
+    ];
+    let installed = 0; let accessible = 0; let denied = 0; let ports = []; let seen = map{};
+    let default_deny = 0; let default_allow = 0; let rules = [];
+    for i len(probes) {
+        if probes[i].installed { installed = installed + 1; }
+        if probes[i].permission_denied { denied = denied + 1; }
+        if probes[i].accessible {
+            accessible = accessible + 1; let parsed = probes[i].parser_result;
+            default_deny = default_deny + parsed.default_deny_chains;
+            default_allow = default_allow + parsed.default_allow_chains;
+            for p len(parsed.policy_allowed_ports) {
+                let row = parsed.policy_allowed_ports[p]; let key = row.protocol + ":" + str(row.port);
+                if not map_has(seen, key) { seen[key] = true; ports[len(ports)] = row; }
+            }
+            if include_rules { for r len(parsed.returned_rules) { rules[len(rules)] = parsed.returned_rules[r]; } }
+        }
+    }
+    let state = "unavailable";
+    if accessible > 0 {
+        state = if default_deny > 0 { "configured-default-deny" }
+            elif default_allow > 0 or len(ports) > 0 { "configured" } else { "no-rules-observed" };
+    } elif installed > 0 and denied > 0 { state = "permission-denied"; }
+    elif installed > 0 { state = "inspection-failed"; }
+    return map{
+        format: "pb_mcp.protect_firewall_status.v2",
+        ok: accessible > 0, state: state, platform: "linux",
+        installed_backend_count: installed, accessible_backend_count: accessible,
+        permission_denied_backend_count: denied, probes: probes,
+        policy_allowed_ports: ports, policy_allowed_port_count: len(ports),
+        listening_ports_verified: false, default_deny_chains: default_deny,
+        default_allow_chains: default_allow,
+        normalized_rules: rules, rules_included: include_rules,
+        raw_output_exposed: false, complete: accessible > 0,
+        bounded_output: true, bounded_runtime: true, shell_used: false
+    };
+}
+
+export parse_nft, parse_iptables, parse_ufw, status;

@@ -1,0 +1,84 @@
+// Only the local transport may supply channel envelopes. Never expose handle()
+// directly to an MCP connection: its local channel is the operator's authority.
+let Protocol = import("desktop_protocol.sapp");
+let Identity = import("desktop_identity.sapp");
+let Memory = import("desktop_memory.sapp");
+
+fn _keys(value, allowed) {
+    if type(value) != "map" { return false; }
+    for key in map_keys(value) {
+        let found = false;
+        for item in allowed { if item == key { found = true; } }
+        if not found { return false; }
+    }
+    return true;
+}
+fn new(bridge) {
+    let session = Protocol.new(bridge);
+    let state = map{ sequence: 0, closed: false, identity: nil };
+    fn view() {
+        let current = bridge.local.review();
+        if state.identity != nil { current.connection_identity = json_parse(json_stringify(state.identity)); }
+        return current;
+    }
+    fn handle(envelope) {
+        if state.closed { throw "desktop worker closed"; }
+        if not _keys(envelope, ["sequence", "channel", "message"])
+            or (try envelope.sequence catch nil) != state.sequence + 1 {
+            state.closed = true; session.disconnect(); throw "invalid private envelope";
+        }
+        state.sequence = envelope.sequence;
+        let output = map{ response: nil };
+        if envelope.channel == "mcp" {
+            output.response = session.handle(envelope.message);
+            if state.identity == nil and (try envelope.message.method catch nil) == "initialize"
+                and (try output.response.result.serverInfo.name catch nil) == "pb-mcp-desktop-pblang" {
+                state.identity = Identity.from_initialize(envelope.message.params);
+            }
+        } elif envelope.channel == "local" {
+            let command = envelope.message;
+            if not _keys(command, ["action", "review_token", "nonce", "enabled", "foreground", "scopes", "limits"]) {
+                throw "invalid operator message";
+            }
+            if command.action == "review" and _keys(command, ["action"]) {
+                try bridge.local.refresh_context() catch nil;
+                output.response = map{ ok: true };
+            } elif command.action == "share" and _keys(command, ["action", "enabled", "foreground"])
+                and type(command.enabled) == "bool" and type(command.foreground) == "bool" {
+                output.response = bridge.local.share(command.enabled,
+                    map{ source: "local_ui", foreground: command.foreground, at_ms: num_floor(now_ms()) });
+            } elif command.action == "approve" and _keys(command, ["action", "review_token", "nonce", "foreground", "limits"])
+                and type(try command.foreground catch nil) == "bool" and command.foreground
+                and type(try command.nonce catch nil) == "string" and len(command.nonce) <= 256 {
+                output.response = bridge.local.approve_review(command.review_token, command.nonce, try command.limits catch nil);
+            } elif command.action == "authorize_session" and _keys(command, ["action", "scopes", "nonce", "limits"]) {
+                output.response = bridge.local.authorize_session(command.scopes, command.nonce, try command.limits catch nil);
+            } elif command.action == "deny" and _keys(command, ["action"]) {
+                output.response = bridge.local.deny();
+            } else { throw "unsupported operator message"; }
+        } else { throw "invalid private channel"; }
+        return map{ sequence: state.sequence, channel: envelope.channel,
+            response: output.response, view: view() };
+    }
+    fn close() { state.closed = true; return session.disconnect(); }
+    return map{ handle: handle, close: close, view: view };
+}
+fn serve(bridge) {
+    let worker = new(bridge);
+    let maintenance = Memory.new();
+    print json_stringify(map{ sequence: 0, channel: "ready", response: nil, view: worker.view() });
+    let running = true;
+    while running {
+        // The supervising pipe boundary has already bounded each UTF-8 frame
+        // before writing it. This is deliberately not a public stdin server.
+        let line = read_line();
+        if line == nil or line == "" { running = false; }
+        else {
+            let result = try worker.handle(json_parse(line)) catch nil;
+            if result == nil { running = false; }
+            else { print json_stringify(result); maintenance.step(); }
+        }
+    }
+    worker.close();
+}
+export new, serve;

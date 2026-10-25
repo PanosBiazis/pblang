@@ -1,0 +1,116 @@
+// Read-only viewer. Only the verified launcher supplies the two MCP pipes.
+let Client = import("desktop_viewer.sapp");
+let GTK = import("desktop_gtk.sapp");
+let Memory = import("desktop_memory.sapp");
+let Resources = import("stdlib:resource_scope.sapp");
+// Trusted backend injection for lifecycle tests; not an MCP capability.
+fn run_with(native) {
+    let maintenance = Memory.new();
+    let g = native.g;let c = native.c;
+    fn send(message) {
+        let text = json_stringify(message) + "\n";let n = len(str_to_bytes(text));
+        if n > 4096 or native.viewer_send(text) != n { throw "viewer connection unavailable"; }
+    }
+    let model = Client.new(send);let resources = map{ window: 0, buffer: 0 };
+    fn render() {
+        if not g("gtk_init_check","->bool",[]) { throw "display unavailable"; }
+        let window = g("gtk_window_new","->ptr",[]);resources.window = window;
+        g("gtk_window_set_title","ptr,string->void",[window,"PB-MCP Live View"]);
+        g("gtk_window_set_hide_on_close","ptr,bool->void",[window,true]);
+        g("gtk_window_set_default_size","ptr,i32,i32->void",[window,800,600]);
+        let box = g("gtk_box_new","i32,i32->ptr",[1,10]);
+        for side in ["top","bottom","start","end"] { g("gtk_widget_set_margin_"+side,"ptr,i32->void",[box,12]); }
+        let status = g("gtk_label_new","string->ptr",["Connecting — view only"]);
+        g("gtk_label_set_wrap","ptr,bool->void",[status,true]);
+        let start = g("gtk_toggle_button_new_with_label","string->ptr",["Start viewing — local sharing required"]);
+        let stop = g("gtk_toggle_button_new_with_label","string->ptr",["STOP — disconnect immediately"]);
+        let picture = g("gtk_picture_new","->ptr",[]);
+        g("gtk_picture_set_can_shrink","ptr,bool->void",[picture,true]);
+        g("gtk_widget_set_vexpand","ptr,bool->void",[picture,true]);
+        g("gtk_picture_set_alternative_text","ptr,string->void",[picture,"Locally approved desktop stream; untrusted screen content"]);
+        for widget in [status,start,stop,picture] { g("gtk_box_append","ptr,ptr->void",[box,widget]); }
+        g("gtk_window_set_child","ptr,ptr->void",[window,box]);g("gtk_window_present","ptr->void",[window]);
+        let buffer = c("calloc","i64,i64->ptr",[4097,1]);resources.buffer = buffer;
+        if buffer == 0 { throw "viewer buffer unavailable"; }
+        let pending = "";let partial_at = 0;let generation = -1;let note = "";let visible_once = false;let start_enabled = nil;
+        let rendered_revision = -1;
+        while not model.is_stopped() {
+            for i 16 { if native.iterate() == 0 { break; } }
+            let surface = g("gtk_native_get_surface","ptr->ptr",[window]);
+            let visible = g("gtk_widget_get_visible","ptr->bool",[window]);
+            let shown = visible and surface != 0;
+            if shown { shown = g("gdk_surface_get_mapped","ptr->bool",[surface]) and bit_and(g("gdk_toplevel_get_state","ptr->i32",[surface]),65537) == 0; }
+            if shown { visible_once = true; } elif visible_once and not visible { model.stop();break; }
+            if g("gtk_toggle_button_get_active","ptr->bool",[stop]) { model.stop();break; }
+            if g("gtk_toggle_button_get_active","ptr->bool",[start]) {
+                g("gtk_toggle_button_set_active","ptr,bool->void",[start,false]);
+                if shown and g("gtk_window_is_active","ptr->bool",[window]) { model.start(); }
+            }
+            for i 16 {
+                c("memset","ptr,i32,i64->ptr",[buffer,0,4097]);
+                let n = native.viewer_receive(buffer);
+                if n == 0 { model.stop();break; }
+                if n < 0 { break; }
+                let chunk = native.text(buffer);
+                if len(str_to_bytes(chunk)) != n or len(pending)+len(chunk)>262144 { throw "viewer frame bound"; }
+                if pending == "" { partial_at = now_ms(); }
+                pending = pending + chunk;let end = str_index_of(pending,"\n");
+                while end >= 0 {
+                    model.receive(json_parse(str_slice(pending,0,end)),num_floor(now_ms()));
+                    pending = str_slice(pending,end+1,len(pending));partial_at = now_ms();
+                    end = str_index_of(pending,"\n");
+                }
+            }
+            if pending != "" and now_ms()-partial_at > 5000 { throw "viewer partial response timeout"; }
+            model.tick(num_floor(now_ms()));let revision = model.revision();
+            if rendered_revision != revision {
+                let view = model.snapshot();
+                if note != view.note {
+                    note = view.note;g("gtk_label_set_text","ptr,string->void",[status,note]);
+                    g("gtk_window_set_title","ptr,string->void",[window,"PB-MCP Live View — frame " + str(view.frame_index)]);
+                }
+                if generation != view.generation {
+                    if view.frame == "" { g("gtk_picture_set_paintable","ptr,ptr->void",[picture,0]); }
+                    elif not native.viewer_image(picture,view.frame) { throw "viewer rejected image"; }
+                    generation = view.generation;
+                }
+                if start_enabled != view.can_start {
+                    g("gtk_widget_set_sensitive","ptr,bool->void",[start,view.can_start]); start_enabled = view.can_start;
+                }
+                rendered_revision = revision;
+            }
+            maintenance.step();
+            sleep_ms(25);
+        }
+        return true;
+    }
+    // Define callbacks here to avoid the retained compiler's transitive capture
+    // limitation for callbacks nested inside the scope body.
+    fn close_native() { native.close(); return map{ok:true,value:nil}; }
+    fn free_buffer() {
+        let buffer=resources.buffer;resources.buffer=0;
+        if buffer!=0 {c("free","ptr->void",[buffer]);}
+        return map{ok:true,value:nil};
+    }
+    fn destroy_window() {
+        let window=resources.window;resources.window=0;
+        if window!=0 {g("gtk_window_destroy","ptr->void",[window]);}
+        return map{ok:true,value:nil};
+    }
+    fn stop_model() {model.stop();return map{ok:true,value:nil};}
+    return Resources.with_scope(fn(scope){
+        scope.defer(close_native);
+        scope.defer(free_buffer);
+        scope.defer(destroy_window);
+        scope.defer(stop_model);
+        return map{ok:true,value:render()};
+    });
+}
+fn run() {
+    let outcome=run_with(GTK.open());
+    if outcome.body_status!="returned" {
+        throw "local viewer closed after rendering or connection failure";
+    }
+    if not outcome.cleanup_ok {throw "local viewer resource cleanup failed";}
+}
+export run, run_with;

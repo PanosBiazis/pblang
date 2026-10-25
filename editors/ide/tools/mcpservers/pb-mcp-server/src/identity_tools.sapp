@@ -1,0 +1,543 @@
+// PBLang-native authenticated users, organizations, memberships, and RBAC.
+
+let IAM = import("stdlib:iam.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let JSON = import("stdlib:json.sapp");
+let sec = import("security.sapp");
+
+let STATE_FILE = "iam.json";
+let LOCK_FILE = "iam.lock";
+let MAX_STATE_BYTES = 4194304;
+let TOOLS = [
+    "identity_bootstrap", "identity_self", "identity_status",
+    "user_create", "user_get", "user_update", "user_status_set", "user_list",
+    "system_admin_set",
+    "organization_create", "organization_get", "organization_update",
+    "organization_status_set", "organization_list", "organization_members", "organization_member_set",
+    "organization_member_remove", "organization_authorize", "organization_metrics",
+    "identity_credential_create", "identity_credential_list", "identity_credential_revoke"
+];
+
+fn _id(value, name) {
+    if type(value) != "string" or not regex_match(value, "^[a-z][a-z0-9_-]{2,63}$") {
+        throw name + " must match ^[a-z][a-z0-9_-]{2,63}$";
+    }
+    return value;
+}
+
+fn _name(value, name) {
+    if type(value) != "string" { throw name + " must be a string"; }
+    let out = str_trim(value);
+    if len(out) < 1 or len(out) > 128 or str_contains(out, "\r") or str_contains(out, "\n") {
+        throw name + " must contain 1 to 128 single-line characters";
+    }
+    return out;
+}
+
+fn _credential_id(value) {
+    if type(value) != "string" or not regex_match(value, "^key_[a-f0-9]{24}$") {
+        throw "credential_id must match ^key_[a-f0-9]{24}$";
+    }
+    return value;
+}
+
+fn _new_credential_id(state) {
+    let i = 0;
+    while i < 8 {
+        let id = "key_" + str_slice(sha256(base64_encode_bytes(random_bytes(24)) + ":" +
+            str(now_ms()) + ":" + str(i)), 0, 24);
+        let collision = false; let rows = try state.credentials catch map{};
+        if type(rows) == "map" and map_has(rows, id) { collision = true; }
+        if not collision { return id; }
+        i = i + 1;
+    }
+    throw "credential identifier generation remained unavailable";
+}
+
+fn _new_credential_secret() {
+    return str_slice(sha256(base64_encode_bytes(random_bytes(48)) + ":" + str(now_ms())), 0, 64);
+}
+
+fn _parse_credential_token(token) {
+    if type(token) != "string" or len(token) != 99 or
+       not str_starts_with(token, "pbmcp_key_") or str_contains(token, "\r") or
+       str_contains(token, "\n") { return nil; }
+    let parts = str_split(token, ".");
+    if len(parts) != 2 { return nil; }
+    let id = str_slice(parts[0], 6, len(parts[0]));
+    if not regex_match(id, "^key_[a-f0-9]{24}$") or
+       not regex_match(parts[1], "^[a-f0-9]{64}$") { return nil; }
+    return map{ id: id, secret_sha256: sha256(parts[1]) };
+}
+
+fn _args(args, allowed) {
+    if args == nil { return map{}; }
+    if type(args) != "map" { throw "identity tool arguments must be an object"; }
+    let keys = map_keys(args);
+    for i len(keys) {
+        let accepted = false;
+        for ai len(allowed) { if keys[i] == allowed[ai] { accepted = true; } }
+        if not accepted { throw "unknown identity argument: " + str(keys[i]); }
+    }
+    return args;
+}
+
+fn _without_trailing_slash(path) {
+    let out = path;
+    while len(out) > 1 and str_ends_with(out, "/") { out = str_slice(out, 0, len(out) - 1); }
+    return out;
+}
+
+fn default_root() {
+    let xdg = try env_get("XDG_CONFIG_HOME") catch nil;
+    if type(xdg) == "string" and str_starts_with(xdg, "/") {
+        return _without_trailing_slash(xdg) + "/pb-mcp-server/identity";
+    }
+    let home = try env_get("HOME") catch nil;
+    if type(home) != "string" or not str_starts_with(home, "/") {
+        throw "HOME or XDG_CONFIG_HOME is required for the private identity store";
+    }
+    return _without_trailing_slash(home) + "/.config/pb-mcp-server/identity";
+}
+
+fn store(root_override = nil) {
+    let root = if root_override == nil { default_root() } else { root_override };
+    if platform() != "linux" { throw "private identity storage requires a directory-handle backend"; }
+    if type(root) != "string" or not str_starts_with(root, "/") or len(root) > 4096 {
+        throw "identity store root must be a bounded absolute path";
+    }
+    return map{ format: "pb_mcp.identity-store.v1", root: root };
+}
+
+fn _open(storage) {
+    if type(storage) != "map" or (try storage.format catch "") != "pb_mcp.identity-store.v1" {
+        throw "invalid identity store";
+    }
+    let root = DIRFS.open_absolute(storage.root, true, true);
+    if not root.ok {
+        throw "private identity store cannot be opened safely: " +
+            str(try root.error catch "directory-handle backend refused");
+    }
+    return root;
+}
+
+fn _load(root) {
+    let metadata = DIRFS.metadata(root, STATE_FILE);
+    if not metadata.ok {
+        let listed = DIRFS.list(root, "root", 4096);
+        if not listed.ok or listed.truncated {
+            throw "identity store cannot prove that state is absent";
+        }
+        for li len(listed.entries) {
+            if listed.entries[li] == STATE_FILE {
+                throw "identity state exists but cannot be inspected safely";
+            }
+        }
+        return IAM.new_state();
+    }
+    if bit_and(try metadata.mode catch 0, 511) != 384 { throw "identity state must have mode 0600"; }
+    let loaded = DIRFS.read_bytes(root, STATE_FILE, MAX_STATE_BYTES);
+    if not loaded.ok { throw "identity state cannot be read within its bound"; }
+    let state = try JSON.parse(bytes_to_str(loaded.bytes)) catch nil;
+    let checked = if state == nil { map{ ok: false } } else { IAM.validate(state) };
+    if not checked.ok { throw "persisted identity state is malformed"; }
+    return state;
+}
+
+fn _publish(root, state) {
+    let checked = IAM.validate(state);
+    if not checked.ok { throw "identity state validation failed before publication"; }
+    let bytes = str_to_bytes(JSON.stringify(state));
+    if len(bytes) > MAX_STATE_BYTES { throw "identity state exceeds its 4 MiB bound"; }
+    let wrote = DIRFS.write_atomic(root, STATE_FILE, bytes, false);
+    if not wrote.ok { throw "identity state atomic publication failed"; }
+    let protected = DIRFS.protect_file(root, STATE_FILE);
+    if not protected.ok { throw "identity state permissions cannot be verified"; }
+    return wrote;
+}
+
+fn read_state(storage) {
+    let root = _open(storage);
+    let state = try _load(root) catch nil;
+    let closed = DIRFS.close(root);
+    if state == nil or not closed { throw "identity state read failed"; }
+    return state;
+}
+
+fn update_state(storage, transform) {
+    if type(transform) != "fn" and type(transform) != "closure" { throw "identity transform must be a function"; }
+    let root = _open(storage);
+    let lock = DIRFS.acquire_lock(root, LOCK_FILE, 5000, 10);
+    if not lock.ok { DIRFS.close(root); throw "identity state remained busy"; }
+    let state = try _load(root) catch nil;
+    if state == nil {
+        DIRFS.release_lock(root, lock); DIRFS.close(root); throw "identity state load failed";
+    }
+    let result = try transform(state) catch nil;
+    if type(result) != "map" or not map_has(result, "value") {
+        DIRFS.release_lock(root, lock); DIRFS.close(root); throw "identity transaction failed";
+    }
+    let wrote = try _publish(root, state) catch nil;
+    let unlocked = DIRFS.release_lock(root, lock); let closed = DIRFS.close(root);
+    if wrote == nil or not unlocked or not closed { throw "identity transaction publication or cleanup failed"; }
+    return map{ value: result.value, revision: state.revision, persisted: true,
+        atomic: true, lock_serialized: true, private_store: true };
+}
+
+fn _read(storage, principal, operation) {
+    principal = _id(principal, "authenticated principal");
+    let state = read_state(storage);
+    if not IAM.is_active_user(state, principal) { throw "authenticated principal is not active"; }
+    return operation(state, principal);
+}
+
+fn _mutation(storage, principal, operation) {
+    principal = _id(principal, "authenticated principal");
+    sec.require_trusted("identity mutation", "PB_IAM_WRITE_ENABLE");
+    return update_state(storage, fn(state) {
+        if not IAM.is_active_user(state, principal) { throw "authenticated principal is not active"; }
+        return map{ value: operation(state, principal) };
+    });
+}
+
+fn _with_metadata(value, principal, revision) {
+    return map{ ok: true, format: "pb_mcp.identity.v1", principal: principal,
+        value: value, revision: revision, caller_asserted_principal_accepted: false,
+        identity_domain_isolation: true, organization_scoped_authorization: true,
+        project_resource_storage_isolated_per_organization: false,
+        agent_history_resources_isolated_per_organization: true };
+}
+
+fn _scope(organization_scope) {
+    if organization_scope == nil { return nil; }
+    return _id(organization_scope, "authenticated organization scope");
+}
+
+fn _require_scope(requested, organization_scope) {
+    requested = _id(requested, "organization_id");
+    organization_scope = _scope(organization_scope);
+    if organization_scope != nil and requested != organization_scope {
+        throw "organization is outside the authenticated credential scope";
+    }
+    return requested;
+}
+
+fn _scoped_credentials(state, principal, organization_scope) {
+    let rows = IAM.list_credentials(state, principal); let out = [];
+    for i len(rows) {
+        if organization_scope == nil or rows[i].organization_id == organization_scope {
+            out[len(out)] = rows[i];
+        }
+    }
+    return out;
+}
+
+fn call_with_store(tool, args, principal, storage, organization_scope = nil) {
+    principal = _id(principal, "authenticated principal");
+    organization_scope = _scope(organization_scope);
+    if tool == "identity_bootstrap" {
+        if organization_scope != nil { throw "identity bootstrap requires global administrator context"; }
+        args = _args(args, ["display_name", "organization_id", "organization_name"]);
+        sec.require_trusted("identity bootstrap", "PB_IAM_ADMIN_ENABLE");
+        let result = update_state(storage, fn(state) {
+            let status = IAM.status(state);
+            if status.users != 0 or status.organizations != 0 or state.revision != 0 {
+                throw "identity bootstrap is allowed only for an empty store";
+            }
+            IAM.create_user(state, principal, _name(try args.display_name catch principal, "display_name"), num_floor(now_ms()));
+            IAM.bootstrap_system_admin(state, principal);
+            let organization_id = _id(try args.organization_id catch "default_org", "organization_id");
+            IAM.create_organization(state, principal, organization_id,
+                _name(try args.organization_name catch "Default Organization", "organization_name"), num_floor(now_ms()));
+            return map{ value: map{ user: IAM.user(state, principal),
+                organization: IAM.organization(state, organization_id), role: "owner",
+                system_admin: true } };
+        });
+        return _with_metadata(result.value, principal, result.revision);
+    }
+    if tool == "identity_self" {
+        _args(args, []); let state = read_state(storage); let account = IAM.user(state, principal);
+        if account == nil or not IAM.is_active_user(state, principal) {
+            throw "authenticated principal is not active";
+        }
+        let organizations = IAM.list_organizations(state, principal);
+        if organization_scope != nil {
+            let scoped = [];
+            for i len(organizations) {
+                if organizations[i].organization.id == organization_scope { scoped[len(scoped)] = organizations[i]; }
+            }
+            if len(scoped) != 1 { throw "authenticated principal is not a member of its organization scope"; }
+            organizations = scoped;
+        }
+        return _with_metadata(map{ user: account, organizations: organizations,
+            organization_scope: organization_scope }, principal, state.revision);
+    }
+    if tool == "identity_status" {
+        _args(args, []); let state = read_state(storage);
+        if not IAM.is_active_user(state, principal) { throw "authenticated principal is not active"; }
+        if organization_scope != nil {
+            let role = IAM.role_for(state, principal, organization_scope);
+            if role == nil { throw "authenticated principal is not a member of its organization scope"; }
+            return _with_metadata(map{ organization: IAM.organization(state, organization_scope),
+                role: role, member_count: len(IAM.list_members(state, principal, organization_scope)),
+                credential_count: len(_scoped_credentials(state, principal, organization_scope)),
+                global_counts_exposed: false }, principal, state.revision);
+        }
+        if not IAM.is_system_admin(state, principal) {
+            throw "system administrator role is required for global identity status";
+        }
+        return _with_metadata(IAM.status(state), principal, state.revision);
+    }
+    if tool == "user_create" {
+        if organization_scope != nil { throw "global user creation requires global administrator context"; }
+        args = _args(args, ["user_id", "display_name"]);
+        sec.require_trusted("global user creation", "PB_IAM_ADMIN_ENABLE");
+        let result = update_state(storage, fn(state) {
+            if IAM.user(state, principal) == nil { throw "authenticated principal is not registered"; }
+            if not IAM.is_system_admin(state, principal) { throw "system administrator role is required"; }
+            return map{ value: IAM.create_user(state, _id(try args.user_id catch nil, "user_id"),
+                _name(try args.display_name catch nil, "display_name"), num_floor(now_ms())) };
+        });
+        return _with_metadata(result.value, principal, result.revision);
+    }
+    if tool == "user_get" {
+        args = _args(args, []); return _read(storage, principal, fn(state, actor) {
+            return _with_metadata(IAM.user(state, actor), actor, state.revision);
+        });
+    }
+    if tool == "user_update" {
+        args = _args(args, ["user_id", "display_name"]);
+        let target = _id(try args.user_id catch principal, "user_id");
+        if organization_scope != nil and target != principal {
+            throw "organization-scoped credentials may update only their authenticated user";
+        }
+        if target != principal {
+            sec.require_trusted("profile update for another user", "PB_IAM_ADMIN_ENABLE");
+        }
+        let result = _mutation(storage, principal, fn(state, actor) {
+            return IAM.update_user(state, actor, target,
+                _name(try args.display_name catch nil, "display_name"), num_floor(now_ms()));
+        });
+        return _with_metadata(result.value, principal, result.revision);
+    }
+    if tool == "user_list" {
+        _args(args, []); return _read(storage, principal, fn(state, actor) {
+            if organization_scope != nil {
+                return _with_metadata(map{ users: IAM.list_members(state, actor, organization_scope),
+                    scope: "organization", organization_id: organization_scope }, actor, state.revision);
+            }
+            if not IAM.is_system_admin(state, actor) { throw "system administrator role is required"; }
+            return _with_metadata(map{ users: IAM.list_users(state), scope: "global" }, actor, state.revision);
+        });
+    }
+    if tool == "system_admin_set" {
+        if organization_scope != nil { throw "system administrator changes require global administrator context"; }
+        args = _args(args, ["user_id", "enabled"]);
+        sec.require_trusted("system administrator change", "PB_IAM_ADMIN_ENABLE");
+        let enabled = try args.enabled catch nil;
+        if type(enabled) != "bool" { throw "enabled must be a boolean"; }
+        let result = _mutation(storage, principal, fn(state, actor) {
+            return IAM.set_system_admin(state, actor,
+                _id(try args.user_id catch nil, "user_id"), enabled, num_floor(now_ms()));
+        });
+        return _with_metadata(result.value, principal, result.revision);
+    }
+    if tool == "user_status_set" {
+        if organization_scope != nil { throw "user lifecycle changes require global administrator context"; }
+        args = _args(args, ["user_id", "status"]);
+        sec.require_trusted("user lifecycle change", "PB_IAM_ADMIN_ENABLE");
+        let result = _mutation(storage, principal, fn(state, actor) {
+            return IAM.set_user_status(state, actor,
+                _id(try args.user_id catch nil, "user_id"), try args.status catch nil,
+                num_floor(now_ms()));
+        });
+        return _with_metadata(result.value, principal, result.revision);
+    }
+    if tool == "organization_create" {
+        args = _args(args, ["organization_id", "name"]);
+        if organization_scope != nil { throw "organization creation requires global administrator context"; }
+        let result = _mutation(storage, principal, fn(state, actor) {
+            return IAM.create_organization(state, actor,
+                _id(try args.organization_id catch nil, "organization_id"),
+                _name(try args.name catch nil, "name"), num_floor(now_ms()));
+        });
+        return _with_metadata(result.value, principal, result.revision);
+    }
+    if tool == "organization_list" {
+        _args(args, []); return _read(storage, principal, fn(state, actor) {
+            let organizations = IAM.list_organizations(state, actor);
+            if organization_scope != nil {
+                let scoped = [];
+                for i len(organizations) {
+                    if organizations[i].organization.id == organization_scope { scoped[len(scoped)] = organizations[i]; }
+                }
+                organizations = scoped;
+            }
+            return _with_metadata(organizations, actor, state.revision);
+        });
+    }
+    if tool == "organization_get" {
+        args = _args(args, ["organization_id"]); let organization_id = _require_scope(try args.organization_id catch nil, organization_scope);
+        return _read(storage, principal, fn(state, actor) {
+            IAM.require_permission(state, actor, organization_id, "organization.read");
+            return _with_metadata(map{ organization: IAM.organization(state, organization_id),
+                role: IAM.role_for(state, actor, organization_id) }, actor, state.revision);
+        });
+    }
+    if tool == "organization_update" {
+        args = _args(args, ["organization_id", "name"]);
+        let organization_id = _require_scope(try args.organization_id catch nil, organization_scope);
+        let result = _mutation(storage, principal, fn(state, actor) {
+            return IAM.update_organization(state, actor, organization_id,
+                _name(try args.name catch nil, "name"), num_floor(now_ms()));
+        });
+        return _with_metadata(result.value, principal, result.revision);
+    }
+    if tool == "organization_status_set" {
+        if organization_scope != nil { throw "organization lifecycle changes require global administrator context"; }
+        args = _args(args, ["organization_id", "status"]);
+        sec.require_trusted("organization lifecycle change", "PB_IAM_ADMIN_ENABLE");
+        let result = _mutation(storage, principal, fn(state, actor) {
+            return IAM.set_organization_status(state, actor,
+                _id(try args.organization_id catch nil, "organization_id"),
+                try args.status catch nil, num_floor(now_ms()));
+        });
+        return _with_metadata(result.value, principal, result.revision);
+    }
+    if tool == "organization_metrics" {
+        args = _args(args, ["organization_id"]);
+        let organization_id = _require_scope(try args.organization_id catch nil, organization_scope);
+        return _read(storage, principal, fn(state, actor) {
+            // Authorization runs before reading/counting tenant member data.
+            let members = IAM.list_members(state, actor, organization_id);
+            let roles = map{owner:0,admin:0,member:0,viewer:0}; let active = 0; let disabled = 0;
+            for row in members {
+                roles[row.role] = roles[row.role] + 1;
+                if row.user.status == "active" { active = active + 1; }
+                if row.user.status != "active" { disabled = disabled + 1; }
+            }
+            let table = []; for role in ["owner","admin","member","viewer"] {
+                table[len(table)] = map{role:role,count:roles[role]};
+            }
+            return _with_metadata(map{organization_id:organization_id,member_count:len(members),
+                active_members:active,disabled_members:disabled,roles:roles,table:table,
+                global_counts_exposed:false,member_identifiers_included:false,
+                credentials_included:false,usage_statistics_included:false},actor,state.revision);
+        });
+    }
+    if tool == "organization_members" {
+        args = _args(args, ["organization_id"]); let organization_id = _require_scope(try args.organization_id catch nil, organization_scope);
+        return _read(storage, principal, fn(state, actor) {
+            return _with_metadata(IAM.list_members(state, actor, organization_id), actor, state.revision);
+        });
+    }
+    if tool == "organization_member_set" {
+        args = _args(args, ["organization_id", "user_id", "role"]);
+        let result = _mutation(storage, principal, fn(state, actor) {
+            return IAM.set_member(state, actor, _require_scope(try args.organization_id catch nil, organization_scope),
+                _id(try args.user_id catch nil, "user_id"), try args.role catch nil, num_floor(now_ms()));
+        });
+        return _with_metadata(result.value, principal, result.revision);
+    }
+    if tool == "organization_member_remove" {
+        args = _args(args, ["organization_id", "user_id"]);
+        let result = _mutation(storage, principal, fn(state, actor) {
+            return IAM.remove_member(state, actor, _require_scope(try args.organization_id catch nil, organization_scope),
+                _id(try args.user_id catch nil, "user_id"), num_floor(now_ms()));
+        });
+        return _with_metadata(result.value, principal, result.revision);
+    }
+    if tool == "organization_authorize" {
+        args = _args(args, ["organization_id", "permission"]);
+        let organization_id = _require_scope(try args.organization_id catch nil, organization_scope);
+        let permission = try args.permission catch nil;
+        if type(permission) != "string" or len(permission) < 1 or len(permission) > 64 {
+            throw "permission must contain 1 to 64 characters";
+        }
+        return _read(storage, principal, fn(state, actor) {
+            return _with_metadata(map{ organization_id: organization_id, permission: permission,
+                role: IAM.role_for(state, actor, organization_id), allowed: IAM.can(state, actor, organization_id, permission) },
+                actor, state.revision);
+        });
+    }
+    if tool == "identity_credential_create" {
+        args = _args(args, ["label", "user_id", "organization_id"]);
+        let label = _name(try args.label catch "MCP client", "label");
+        let target = _id(try args.user_id catch principal, "user_id");
+        let organization_id = _require_scope(try args.organization_id catch nil, organization_scope);
+        if organization_scope != nil and target != principal {
+            throw "organization-scoped credentials may issue only for their authenticated principal";
+        }
+        if target != principal {
+            sec.require_trusted("credential issuance for another user", "PB_IAM_ADMIN_ENABLE");
+        }
+        let result = _mutation(storage, principal, fn(state, actor) {
+            if target != actor and not IAM.is_system_admin(state, actor) {
+                throw "system administrator role is required to issue another user's credential";
+            }
+            let secret = _new_credential_secret();
+            let id = _new_credential_id(state);
+            let credential = IAM.issue_credential(state, target, organization_id, id, label,
+                sha256(secret), num_floor(now_ms()));
+            return map{ credential: credential, token: "pbmcp_" + id + "." + secret };
+        });
+        return _with_metadata(map{ credential: result.value.credential,
+            token: result.value.token, token_returned_once: true,
+            persisted_plaintext_secret: false,
+            issued_by_system_admin: target != principal }, principal, result.revision);
+    }
+    if tool == "identity_credential_list" {
+        _args(args, []); return _read(storage, principal, fn(state, actor) {
+            return _with_metadata(map{ credentials: _scoped_credentials(state, actor, organization_scope),
+                secret_fields_returned: false }, actor, state.revision);
+        });
+    }
+    if tool == "identity_credential_revoke" {
+        args = _args(args, ["credential_id"]);
+        let credential_id = _credential_id(try args.credential_id catch nil);
+        let result = _mutation(storage, principal, fn(state, actor) {
+            let rows = _scoped_credentials(state, actor, organization_scope); let found = false;
+            for i len(rows) { if rows[i].id == credential_id { found = true; } }
+            if not found { throw "credential does not exist in authenticated organization scope"; }
+            return IAM.revoke_credential(state, actor, credential_id, num_floor(now_ms()));
+        });
+        return _with_metadata(result.value, principal, result.revision);
+    }
+    return nil;
+}
+
+fn authenticate_token_with_store(token, storage) {
+    let parsed = _parse_credential_token(token);
+    if parsed == nil { return nil; }
+    let state = try read_state(storage) catch nil;
+    if state == nil { return nil; }
+    let authenticated = IAM.authenticate_credential(state, parsed.id, parsed.secret_sha256);
+    if authenticated == nil { return nil; }
+    return map{ principal: authenticated.user_id,
+        organization_id: authenticated.organization_id,
+        credential_id: authenticated.credential_id,
+        tools_read: IAM.can(state, authenticated.user_id, authenticated.organization_id, "tools.read"),
+        tools_execute: IAM.can(state, authenticated.user_id, authenticated.organization_id, "tools.execute"),
+        server_owned_principal: true, caller_asserted_principal_accepted: false };
+}
+
+fn authorize_credential_with_store(credential_id, principal, organization_id,
+        permission, storage) {
+    let state = try read_state(storage) catch nil;
+    if state == nil { return nil; }
+    return IAM.authorize_credential(state, credential_id, principal,
+        organization_id, permission);
+}
+
+fn authenticate_token(token) { return authenticate_token_with_store(token, store()); }
+
+fn call_identity(tool, args, principal) {
+    for i len(TOOLS) { if TOOLS[i] == tool { return call_with_store(tool, args, principal, store()); } }
+    return nil;
+}
+
+fn tool_list() { return TOOLS; }
+
+export default_root, store, read_state, update_state, authenticate_token_with_store,
+       authenticate_token, authorize_credential_with_store,
+       call_with_store, call_identity, tool_list;

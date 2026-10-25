@@ -1,0 +1,364 @@
+// Authenticated protocol contracts for a federated PBLang model network.
+// This module creates and verifies envelopes. It never opens a socket or
+// executes a requested tool; verified capability grants feed audited adapters.
+
+let JSON = import("stdlib:json.sapp");
+
+let REQUEST_FORMAT = "pb_mcp.model_network.request.v1";
+let ANSWER_FORMAT = "pb_mcp.model_network.answer.v1";
+let REVIEW_FORMAT = "pb_mcp.model_network.review.v1";
+let MAX_SAFE_INTEGER = 9007199254740991;
+
+fn _now_ms() { return num_floor(try now_ms() catch try clock() catch 0); }
+fn _nonce() { return str_slice(sha256(base64_encode_bytes(random_bytes(24))), 0, 32); }
+
+fn _bounded_string(value, name, min_chars, max_chars) {
+    if type(value) != "string" or len(value) < min_chars or len(value) > max_chars {
+        throw name + " must be a string with " + str(min_chars) + " to " + str(max_chars) + " characters";
+    }
+    if str_contains(value, "\u0000") { throw name + " must not contain NUL"; }
+    return value;
+}
+
+fn _safe_id(value, name) {
+    value = _bounded_string(value, name, 1, 128);
+    if not regex_match(value, "^[A-Za-z0-9_.-]+$") {
+        throw name + " must contain only ASCII letters, digits, dot, hyphen, or underscore";
+    }
+    return value;
+}
+
+fn _safe_time(value, name) {
+    if type(value) != "number" or num_floor(value) != value or value < 0 or value > MAX_SAFE_INTEGER {
+        throw name + " must be a non-negative safe integer";
+    }
+    return value;
+}
+
+fn _safe_key(value, name) {
+    return _bounded_string(value, name, 32, 512);
+}
+
+fn _unique_sorted_strings(values, name, minimum, maximum, item_max, id_mode = false) {
+    if type(values) != "array" or len(values) < minimum or len(values) > maximum {
+        throw name + " must contain " + str(minimum) + " to " + str(maximum) + " strings";
+    }
+    let seen = map{};
+    let out = [];
+    for i len(values) {
+        let value = if id_mode { _safe_id(values[i], name + "[" + str(i) + "]") }
+                    else { _bounded_string(values[i], name + "[" + str(i) + "]", 1, item_max) };
+        if map_has(seen, value) { throw name + " must not contain duplicates"; }
+        seen[value] = true;
+        out[len(out)] = value;
+    }
+    return array_sort(out);
+}
+
+fn _field(name, value) {
+    let encoded = JSON.stringify(value);
+    return name + ":" + str(len(str_to_bytes(encoded))) + ":" + encoded + "\n";
+}
+
+fn _request_payload(v) {
+    return _field("format", v.format) + _field("request_id", v.request_id) +
+           _field("requester_id", v.requester_id) + _field("prompt", v.prompt) +
+           _field("model_ids", v.model_ids) + _field("quorum", v.quorum) +
+           _field("required_reviews", v.required_reviews) +
+           _field("tool_capabilities", v.tool_capabilities) +
+           _field("issued_ts_ms", v.issued_ts_ms) +
+           _field("expires_ts_ms", v.expires_ts_ms) + _field("nonce", v.nonce);
+}
+
+fn _answer_payload(v) {
+    return _field("format", v.format) + _field("answer_id", v.answer_id) +
+           _field("request_id", v.request_id) + _field("model_id", v.model_id) +
+           _field("answer", v.answer) + _field("confidence", v.confidence) +
+           _field("evidence", v.evidence) + _field("requested_tools", v.requested_tools) +
+           _field("issued_ts_ms", v.issued_ts_ms) + _field("nonce", v.nonce);
+}
+
+fn _review_payload(v) {
+    return _field("format", v.format) + _field("review_id", v.review_id) +
+           _field("request_id", v.request_id) + _field("answer_id", v.answer_id) +
+           _field("reviewer_id", v.reviewer_id) + _field("verdict", v.verdict) +
+           _field("score", v.score) + _field("rationale", v.rationale) +
+           _field("evidence", v.evidence) + _field("issued_ts_ms", v.issued_ts_ms) +
+           _field("nonce", v.nonce);
+}
+
+fn _tag(payload, key) { return hmac_sha256(payload, _safe_key(key, "authentication key")); }
+
+fn _valid_tag(payload, key, tag) {
+    if type(tag) != "string" or len(tag) != 64 or not regex_match(tag, "^[0-9A-Fa-f]{64}$") {
+        return false;
+    }
+    return constant_time_eq(str_lower(tag), str_lower(_tag(payload, key)));
+}
+
+fn _generated_id(prefix, identity, issued, nonce) {
+    return prefix + "-" + str_slice(sha256(identity + "\u0000" + str(issued) + "\u0000" + nonce), 0, 24);
+}
+
+fn create_request(args) {
+    if args == nil { args = map{}; }
+    let requester = _safe_id(try args.requester_id catch nil, "requester_id");
+    let prompt = _bounded_string(try args.prompt catch nil, "prompt", 1, 200000);
+    let models = _unique_sorted_strings(try args.model_ids catch nil, "model_ids", 1, 32, 128, true);
+    let capabilities = _unique_sorted_strings(try args.tool_capabilities catch [], "tool_capabilities", 0, 64, 128, true);
+    let quorum = try args.quorum catch len(models);
+    let reviews = try args.required_reviews catch 1;
+    if type(quorum) != "number" or num_floor(quorum) != quorum or quorum < 1 or quorum > len(models) {
+        throw "quorum must be an integer in 1..model count";
+    }
+    if type(reviews) != "number" or num_floor(reviews) != reviews or reviews < 0 or reviews > 8 {
+        throw "required_reviews must be an integer in 0..8";
+    }
+    let issued = _safe_time(try args.issued_ts_ms catch _now_ms(), "issued_ts_ms");
+    let expires = _safe_time(try args.expires_ts_ms catch issued + 300000, "expires_ts_ms");
+    if expires <= issued or expires - issued > 86400000 {
+        throw "request lifetime must be greater than zero and at most 24 hours";
+    }
+    let nonce = _safe_id(try args.nonce catch _nonce(), "nonce");
+    let request_id = _safe_id(try args.request_id catch _generated_id("req", requester, issued, nonce), "request_id");
+    let out = map{
+        format: REQUEST_FORMAT, request_id: request_id, requester_id: requester,
+        prompt: prompt, model_ids: models, quorum: quorum, required_reviews: reviews,
+        tool_capabilities: capabilities, issued_ts_ms: issued,
+        expires_ts_ms: expires, nonce: nonce
+    };
+    out.auth_tag = _tag(_request_payload(out), try args.key catch nil);
+    return out;
+}
+
+fn verify_request(request, key, at_ms = nil) {
+    return try _validate_request(request, key, at_ms) catch map{
+        ok: false,
+        error: "invalid, expired, or unauthenticated model-network request"
+    };
+}
+
+fn _validate_request(request, key, at_ms = nil) {
+    if type(request) != "map" or (try request.format catch "") != REQUEST_FORMAT {
+        throw "invalid model-network request format";
+    }
+    _safe_id(request.request_id, "request_id");
+    _safe_id(request.requester_id, "requester_id");
+    _bounded_string(request.prompt, "prompt", 1, 200000);
+    let models = _unique_sorted_strings(request.model_ids, "model_ids", 1, 32, 128, true);
+    let capabilities = _unique_sorted_strings(request.tool_capabilities, "tool_capabilities", 0, 64, 128, true);
+    if JSON.stringify(models) != JSON.stringify(request.model_ids) or
+       JSON.stringify(capabilities) != JSON.stringify(request.tool_capabilities) {
+        throw "request arrays must use canonical sorted order";
+    }
+    if type(request.quorum) != "number" or num_floor(request.quorum) != request.quorum or
+       request.quorum < 1 or request.quorum > len(models) { throw "invalid request quorum"; }
+    if type(request.required_reviews) != "number" or num_floor(request.required_reviews) != request.required_reviews or
+       request.required_reviews < 0 or request.required_reviews > 8 { throw "invalid required_reviews"; }
+    _safe_time(request.issued_ts_ms, "issued_ts_ms");
+    _safe_time(request.expires_ts_ms, "expires_ts_ms");
+    if request.expires_ts_ms <= request.issued_ts_ms or request.expires_ts_ms - request.issued_ts_ms > 86400000 {
+        throw "invalid request lifetime";
+    }
+    _safe_id(request.nonce, "nonce");
+    let now = _safe_time(if at_ms == nil { _now_ms() } else { at_ms }, "verification time");
+    if now > request.expires_ts_ms { throw "request expired"; }
+    if not _valid_tag(_request_payload(request), key, try request.auth_tag catch nil) {
+        throw "request authentication failed";
+    }
+    return map{ ok: true, request: request, expires_in_ms: request.expires_ts_ms - now };
+}
+
+fn create_answer(args) {
+    if args == nil { args = map{}; }
+    let request = try args.request catch nil;
+    if type(request) != "map" { throw "request is required"; }
+    let model = _safe_id(try args.model_id catch nil, "model_id");
+    if not _contains(request.model_ids, model) { throw "model_id is not selected by the request"; }
+    let answer = _bounded_string(try args.answer catch nil, "answer", 1, 200000);
+    let confidence = try args.confidence catch 0;
+    if type(confidence) != "number" or confidence != confidence or confidence < 0 or confidence > 1 {
+        throw "confidence must be a finite number in 0..1";
+    }
+    let evidence = _unique_sorted_strings(try args.evidence catch [], "evidence", 0, 16, 2000);
+    let tools = _unique_sorted_strings(try args.requested_tools catch [], "requested_tools", 0, 32, 128, true);
+    for i len(tools) {
+        if not _contains(request.tool_capabilities, tools[i]) {
+            throw "requested tool is not granted by the request: " + tools[i];
+        }
+    }
+    let issued = _safe_time(try args.issued_ts_ms catch _now_ms(), "issued_ts_ms");
+    let nonce = _safe_id(try args.nonce catch _nonce(), "nonce");
+    let out = map{
+        format: ANSWER_FORMAT,
+        answer_id: _safe_id(try args.answer_id catch _generated_id("ans", model, issued, nonce), "answer_id"),
+        request_id: request.request_id, model_id: model, answer: answer,
+        confidence: confidence, evidence: evidence, requested_tools: tools,
+        issued_ts_ms: issued, nonce: nonce
+    };
+    out.auth_tag = _tag(_answer_payload(out), try args.key catch nil);
+    return out;
+}
+
+fn _contains(values, wanted) {
+    for i len(values) { if values[i] == wanted { return true; } }
+    return false;
+}
+
+fn _validate_answer(request, answer, key) {
+    if type(answer) != "map" or (try answer.format catch "") != ANSWER_FORMAT { throw "invalid answer format"; }
+    _safe_id(answer.answer_id, "answer_id");
+    if answer.request_id != request.request_id { throw "answer request_id mismatch"; }
+    _safe_id(answer.model_id, "model_id");
+    if not _contains(request.model_ids, answer.model_id) { throw "answer model is not selected"; }
+    _bounded_string(answer.answer, "answer", 1, 200000);
+    if type(answer.confidence) != "number" or answer.confidence != answer.confidence or
+       answer.confidence < 0 or answer.confidence > 1 { throw "invalid answer confidence"; }
+    let evidence = _unique_sorted_strings(answer.evidence, "evidence", 0, 16, 2000);
+    let tools = _unique_sorted_strings(answer.requested_tools, "requested_tools", 0, 32, 128, true);
+    if JSON.stringify(evidence) != JSON.stringify(answer.evidence) or JSON.stringify(tools) != JSON.stringify(answer.requested_tools) {
+        throw "answer arrays must use canonical sorted order";
+    }
+    for i len(tools) { if not _contains(request.tool_capabilities, tools[i]) { throw "answer requests an ungranted tool"; } }
+    _safe_time(answer.issued_ts_ms, "issued_ts_ms");
+    if answer.issued_ts_ms < request.issued_ts_ms or answer.issued_ts_ms > request.expires_ts_ms {
+        throw "answer timestamp is outside the request lifetime";
+    }
+    _safe_id(answer.nonce, "nonce");
+    if not _valid_tag(_answer_payload(answer), key, try answer.auth_tag catch nil) { throw "answer authentication failed"; }
+    return answer;
+}
+
+fn create_review(args) {
+    if args == nil { args = map{}; }
+    let request = try args.request catch nil;
+    let answer = try args.answer catch nil;
+    if type(request) != "map" or type(answer) != "map" { throw "request and answer are required"; }
+    let reviewer = _safe_id(try args.reviewer_id catch nil, "reviewer_id");
+    if reviewer == answer.model_id { throw "a model must not review its own answer"; }
+    let verdict = try args.verdict catch nil;
+    if verdict != "confirm" and verdict != "reject" and verdict != "abstain" { throw "invalid review verdict"; }
+    let score = try args.score catch 0;
+    if type(score) != "number" or score != score or score < 0 or score > 1 { throw "score must be a finite number in 0..1"; }
+    let rationale = _bounded_string(try args.rationale catch nil, "rationale", 1, 20000);
+    let evidence = _unique_sorted_strings(try args.evidence catch [], "evidence", 0, 16, 2000);
+    let issued = _safe_time(try args.issued_ts_ms catch _now_ms(), "issued_ts_ms");
+    let nonce = _safe_id(try args.nonce catch _nonce(), "nonce");
+    let out = map{
+        format: REVIEW_FORMAT,
+        review_id: _safe_id(try args.review_id catch _generated_id("rev", reviewer, issued, nonce), "review_id"),
+        request_id: request.request_id, answer_id: answer.answer_id,
+        reviewer_id: reviewer, verdict: verdict, score: score,
+        rationale: rationale, evidence: evidence, issued_ts_ms: issued, nonce: nonce
+    };
+    out.auth_tag = _tag(_review_payload(out), try args.key catch nil);
+    return out;
+}
+
+fn _validate_review(request, answer_by_id, review, key) {
+    if type(review) != "map" or (try review.format catch "") != REVIEW_FORMAT { throw "invalid review format"; }
+    _safe_id(review.review_id, "review_id");
+    if review.request_id != request.request_id { throw "review request_id mismatch"; }
+    _safe_id(review.answer_id, "answer_id");
+    if not map_has(answer_by_id, review.answer_id) { throw "review references an unknown answer"; }
+    _safe_id(review.reviewer_id, "reviewer_id");
+    if review.reviewer_id == answer_by_id[review.answer_id].model_id { throw "self-review is forbidden"; }
+    if review.verdict != "confirm" and review.verdict != "reject" and review.verdict != "abstain" { throw "invalid review verdict"; }
+    if type(review.score) != "number" or review.score != review.score or review.score < 0 or review.score > 1 { throw "invalid review score"; }
+    _bounded_string(review.rationale, "rationale", 1, 20000);
+    let evidence = _unique_sorted_strings(review.evidence, "evidence", 0, 16, 2000);
+    if JSON.stringify(evidence) != JSON.stringify(review.evidence) { throw "review evidence must use canonical sorted order"; }
+    _safe_time(review.issued_ts_ms, "issued_ts_ms");
+    if review.issued_ts_ms < request.issued_ts_ms or review.issued_ts_ms > request.expires_ts_ms { throw "review timestamp is outside request lifetime"; }
+    _safe_id(review.nonce, "nonce");
+    if not _valid_tag(_review_payload(review), key, try review.auth_tag catch nil) { throw "review authentication failed"; }
+    return review;
+}
+
+fn _key_for(keyring, identity) {
+    if type(keyring) != "map" or not map_has(keyring, identity) { throw "missing authentication key for " + identity; }
+    return _safe_key(keyring[identity], "keyring entry");
+}
+
+fn resolve(args) {
+    if args == nil { args = map{}; }
+    let request = try args.request catch nil;
+    let keyring = try args.keyring catch nil;
+    if type(request) != "map" { throw "request is required"; }
+    let verified_request = _validate_request(request, _key_for(keyring, request.requester_id), try args.at_ms catch nil).request;
+    let supplied_answers = try args.answers catch [];
+    let supplied_reviews = try args.reviews catch [];
+    if type(supplied_answers) != "array" or len(supplied_answers) > 32 { throw "answers must contain at most 32 records"; }
+    if type(supplied_reviews) != "array" or len(supplied_reviews) > 256 { throw "reviews must contain at most 256 records"; }
+
+    let answer_by_id = map{};
+    let answer_by_model = map{};
+    let seen_nonces = map{};
+    seen_nonces[verified_request.nonce] = true;
+    for i len(supplied_answers) {
+        let model = try supplied_answers[i].model_id catch "";
+        let answer = _validate_answer(verified_request, supplied_answers[i], _key_for(keyring, model));
+        if map_has(answer_by_id, answer.answer_id) or map_has(answer_by_model, answer.model_id) {
+            throw "duplicate answer identity or model";
+        }
+        if map_has(seen_nonces, answer.nonce) { throw "replayed model-network nonce"; }
+        seen_nonces[answer.nonce] = true;
+        answer_by_id[answer.answer_id] = answer;
+        answer_by_model[answer.model_id] = answer;
+    }
+
+    let tallies = map{};
+    let review_pairs = map{};
+    let valid_reviews = 0;
+    for i len(supplied_reviews) {
+        let reviewer = try supplied_reviews[i].reviewer_id catch "";
+        let review = _validate_review(verified_request, answer_by_id, supplied_reviews[i], _key_for(keyring, reviewer));
+        let pair = review.answer_id + "\u0000" + review.reviewer_id;
+        if map_has(review_pairs, pair) { throw "duplicate reviewer for answer"; }
+        if map_has(seen_nonces, review.nonce) { throw "replayed model-network nonce"; }
+        seen_nonces[review.nonce] = true;
+        review_pairs[pair] = true;
+        if not map_has(tallies, review.answer_id) {
+            tallies[review.answer_id] = map{ confirm: 0, reject: 0, abstain: 0, score_sum: 0 };
+        }
+        let tally = tallies[review.answer_id];
+        tally[review.verdict] = tally[review.verdict] + 1;
+        tally.score_sum = tally.score_sum + review.score;
+        tallies[review.answer_id] = tally;
+        valid_reviews = valid_reviews + 1;
+    }
+
+    let eligible = [];
+    let model_ids = array_sort(map_keys(answer_by_model));
+    for i len(model_ids) {
+        let answer = answer_by_model[model_ids[i]];
+        let tally = try tallies[answer.answer_id] catch map{ confirm: 0, reject: 0, abstain: 0, score_sum: 0 };
+        if tally.confirm >= verified_request.required_reviews and tally.reject == 0 {
+            eligible[len(eligible)] = map{ answer: answer, tally: tally };
+        }
+    }
+    if len(answer_by_model) < verified_request.quorum {
+        return map{ ok: false, status: "insufficient_answers", valid_answers: len(answer_by_model), required_answers: verified_request.quorum, valid_reviews: valid_reviews };
+    }
+    if len(eligible) == 0 {
+        return map{ ok: false, status: "insufficient_reviews", valid_answers: len(answer_by_model), eligible_answers: 0, valid_reviews: valid_reviews };
+    }
+    let best = eligible[0];
+    for i in 1 to len(eligible) - 1 {
+        let candidate = eligible[i];
+        if candidate.tally.confirm > best.tally.confirm or
+           (candidate.tally.confirm == best.tally.confirm and candidate.answer.confidence > best.answer.confidence) {
+            best = candidate;
+        }
+    }
+    return map{
+        ok: true, status: "resolved", request_id: verified_request.request_id,
+        selected_answer: best.answer, selected_tally: best.tally,
+        eligible_answers: len(eligible), valid_answers: len(answer_by_model),
+        valid_reviews: valid_reviews, approved_tools: best.answer.requested_tools,
+        tool_execution_performed: false,
+        tool_policy: "verified capability intersection; execution requires a separately allowlisted adapter"
+    };
+}
+
+export create_request, verify_request, create_answer, create_review, resolve;

@@ -1,0 +1,210 @@
+// Binary-safe, bounded integrity-manifest generation and verification.
+
+let SEC = import("security.sapp");
+let CORE = import("core_tools.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+let SER = import("stdlib:serialization.sapp");
+
+let MAX_FILE_BYTES = 4194304;
+let MAX_MANIFEST_CHARS = 1000000;
+
+fn _strict(args, allowed) {
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "integrity arguments must be an object"; }
+    let keys = map_keys(args);
+    for i len(keys) {
+        let known = false;
+        for j len(allowed) { if keys[i] == allowed[j] { known = true; break; } }
+        if not known { throw "unknown integrity argument: " + str(keys[i]); }
+    }
+    return args;
+}
+
+fn _integer(value, label, low, high, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value) or value < low or value > high {
+        throw label + " must be an integer between " + str(low) + " and " + str(high);
+    }
+    return value;
+}
+
+fn _bool(value, label, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "bool" { throw label + " must be boolean"; }
+    return value;
+}
+
+fn _add_unique(out, seen, path, max_files) {
+    path = SEC.safe_rel_path(path, "");
+    if path == "" { throw "integrity path must not be empty"; }
+    if map_has(seen, path) { throw "duplicate integrity path: " + path; }
+    if len(out) >= max_files { throw "integrity path count exceeds max_files"; }
+    seen[path] = true; out[len(out)] = path;
+}
+
+fn _is_directory(path) {
+    return (try SEC.list_project_dir(path, 1) catch nil) != nil;
+}
+
+fn _expand_sources(args, expected, excluded, max_files, max_depth) {
+    let raw = [];
+    if map_has(args, "path") and map_has(args, "paths") {
+        throw "path and paths are mutually exclusive";
+    }
+    if map_has(args, "paths") {
+        if type(args.paths) != "array" or len(args.paths) < 1 or len(args.paths) > max_files {
+            throw "paths must contain 1..max_files relative paths";
+        }
+        for i len(args.paths) {
+            if type(args.paths[i]) != "string" { throw "paths must contain strings"; }
+            raw[len(raw)] = args.paths[i];
+        }
+    } elif map_has(args, "path") {
+        if type(args.path) != "string" or len(args.path) < 1 or len(args.path) > 4096 {
+            throw "path must be a non-empty relative path";
+        }
+        let root = SEC.safe_rel_path(args.path, "");
+        if _is_directory(root) {
+            let listed = CORE.list_files(root, max_files + 1, max_depth);
+            if len(listed) > max_files { throw "directory expansion exceeds max_files"; }
+            for i len(listed) { if not _is_directory(listed[i]) { raw[len(raw)] = listed[i]; } }
+        } else { raw[0] = root; }
+    } elif expected != nil {
+        let keys = map_keys(expected);
+        if len(keys) < 1 or len(keys) > max_files { throw "manifest entry count is outside max_files"; }
+        for i len(keys) { raw[len(raw)] = keys[i]; }
+    } else { throw "path, paths, or a non-empty manifest is required"; }
+
+    raw = array_sort(raw);
+    let out = []; let seen = map{};
+    for i len(raw) {
+        let normalized = SEC.safe_rel_path(raw[i], "");
+        if normalized != "" and not map_has(excluded, normalized) {
+            _add_unique(out, seen, normalized, max_files);
+        }
+    }
+    if len(out) == 0 { throw "no integrity files remain after exclusions"; }
+    return out;
+}
+
+fn _validate_manifest(value, max_files) {
+    if type(value) != "map" { throw "manifest must be a JSON object mapping path to SHA-256"; }
+    let keys = map_keys(value);
+    if len(keys) < 1 or len(keys) > max_files { throw "manifest entry count is outside max_files"; }
+    let out = map{};
+    for i len(keys) {
+        let path = SEC.safe_rel_path(keys[i], "");
+        if path == "" or path != keys[i] { throw "manifest paths must be normalized project-relative paths"; }
+        let hash = try value[keys[i]] catch nil;
+        if type(hash) != "string" or not regex_match(hash, "^[0-9A-Fa-f]{64}$") {
+            throw "manifest values must be 64-digit hexadecimal SHA-256 strings";
+        }
+        if map_has(out, path) { throw "duplicate normalized manifest path: " + path; }
+        out[path] = str_lower(hash);
+    }
+    return out;
+}
+
+fn _load_manifest(args, max_files, max_chars) {
+    if map_has(args, "manifest") and map_has(args, "manifest_path") {
+        throw "manifest and manifest_path are mutually exclusive";
+    }
+    if map_has(args, "manifest") { return _validate_manifest(args.manifest, max_files); }
+    if not map_has(args, "manifest_path") { return nil; }
+    let path = SEC.safe_rel_path(args.manifest_path, "");
+    if path == "" { throw "manifest_path must not be empty"; }
+    let loaded = SEC.read_project_text_info(path, max_chars);
+    if loaded.truncated { throw "manifest file exceeds max_manifest_chars"; }
+    let parsed = SER.parse_safe(loaded.text, "json", map{
+        max_input_bytes: max_chars, max_output_bytes: 1024,
+        max_lines: 50000, max_line_bytes: 65536, max_depth: 8,
+        max_items: max_files + 10
+    });
+    if not parsed.ok { throw "manifest file is not valid bounded JSON"; }
+    return _validate_manifest(parsed.value, max_files);
+}
+
+fn _hash_paths(paths, max_file_bytes) {
+    let hashes = map{}; let errors = [];
+    for i len(paths) {
+        let loaded = try SEC.read_project_bytes_info(paths[i], max_file_bytes) catch nil;
+        if loaded == nil {
+            errors[len(errors)] = map{ path: paths[i], code: "read-refused", error: "confined binary read failed" };
+        } elif loaded.truncated {
+            errors[len(errors)] = map{ path: paths[i], code: "file-too-large", error: "file exceeds max_file_bytes", source_size: loaded.source_size };
+        } else { hashes[paths[i]] = SHA256.sha256_hex_bytes(loaded.bytes); }
+    }
+    return map{ hashes: hashes, errors: errors };
+}
+
+fn _compare(actual, expected) {
+    let mismatches = []; let matched = 0;
+    let actual_keys = map_keys(actual); let expected_keys = map_keys(expected);
+    for i len(expected_keys) {
+        let path = expected_keys[i];
+        if not map_has(actual, path) {
+            mismatches[len(mismatches)] = map{ path: path, issue: "missing-or-unreadable", expected: expected[path], actual: nil };
+        } elif actual[path] != expected[path] {
+            mismatches[len(mismatches)] = map{ path: path, issue: "hash-mismatch", expected: expected[path], actual: actual[path] };
+        } else { matched = matched + 1; }
+    }
+    for i len(actual_keys) {
+        let path = actual_keys[i];
+        if not map_has(expected, path) {
+            mismatches[len(mismatches)] = map{ path: path, issue: "unexpected-path", expected: nil, actual: actual[path] };
+        }
+    }
+    return map{ matched: matched, mismatches: mismatches };
+}
+
+fn check(args) {
+    args = _strict(args, ["path", "paths", "manifest", "manifest_path", "output_path", "update",
+        "max_files", "max_depth", "max_file_bytes", "max_manifest_chars"]);
+    SEC.require_trusted("integrity project read", "PB_PROTECT_INSPECT_ENABLE");
+    let max_files = _integer(try args.max_files catch nil, "max_files", 1, 1000, 200);
+    let max_depth = _integer(try args.max_depth catch nil, "max_depth", 0, 12, 6);
+    let max_file_bytes = _integer(try args.max_file_bytes catch nil, "max_file_bytes", 1, MAX_FILE_BYTES, MAX_FILE_BYTES);
+    let max_manifest_chars = _integer(try args.max_manifest_chars catch nil, "max_manifest_chars", 1, MAX_MANIFEST_CHARS, 200000);
+    let output_path = try args.output_path catch nil;
+    if output_path != nil and (type(output_path) != "string" or len(output_path) < 1 or len(output_path) > 4096) {
+        throw "output_path must be a non-empty relative path";
+    }
+    let update = _bool(try args.update catch nil, "update", false) or output_path != nil;
+    if update and map_has(args, "manifest") { throw "inline manifest cannot be combined with update"; }
+    if update and output_path == nil and map_has(args, "manifest_path") { output_path = args.manifest_path; }
+    if update and output_path == nil { throw "update requires output_path or manifest_path"; }
+    let expected = if update { nil } else { _load_manifest(args, max_files, max_manifest_chars) };
+    let excluded = map{};
+    if map_has(args, "manifest_path") { excluded[SEC.safe_rel_path(args.manifest_path, "")] = true; }
+    if output_path != nil { excluded[SEC.safe_rel_path(output_path, "")] = true; }
+    let paths = _expand_sources(args, expected, excluded, max_files, max_depth);
+    let snapshot = _hash_paths(paths, max_file_bytes);
+    let complete = len(snapshot.errors) == 0 and len(map_keys(snapshot.hashes)) == len(paths);
+    let mode = "manifest-generated"; let comparison = nil;
+    if expected != nil and not update {
+        mode = "verified"; comparison = _compare(snapshot.hashes, expected);
+    }
+    if update {
+        SEC.require_trusted("integrity manifest publication", "PB_PROTECT_WRITE_ENABLE");
+        if not complete { throw "incomplete integrity snapshot cannot be published"; }
+        let encoded = json_stringify(snapshot.hashes);
+        if len(encoded) > max_manifest_chars { throw "generated manifest exceeds max_manifest_chars"; }
+        SEC.write_project_text_atomic(output_path, encoded);
+        mode = "manifest-written";
+    }
+    let mismatches = if comparison == nil { [] } else { comparison.mismatches };
+    let matched = if comparison == nil { 0 } else { comparison.matched };
+    let ok = complete and (comparison == nil or len(mismatches) == 0);
+    return map{
+        format: "pb_mcp.protect_integrity.v2", ok: ok, mode: mode,
+        manifest: snapshot.hashes, output_path: output_path,
+        requested: len(paths), checked: len(map_keys(snapshot.hashes)), matched: matched,
+        mismatches: mismatches, mismatched: mismatches, errors: snapshot.errors,
+        error_count: len(snapshot.errors), scan_complete: complete,
+        binary_safe: true, race_resistant: true, immutable_snapshots: true,
+        max_file_bytes: max_file_bytes, max_files: max_files,
+        partial_hashes_returned: false, exact_path_set_verified: comparison != nil
+    };
+}
+
+export check;

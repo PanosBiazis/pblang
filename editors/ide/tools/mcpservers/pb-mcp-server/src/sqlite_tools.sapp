@@ -1,0 +1,420 @@
+// Descriptor-confined, process-isolated SQLite read tools implemented in PBLang.
+
+let SEC = import("security.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let PROCESS = import("stdlib:linux_process.sapp");
+let SHA = import("stdlib:sha256_pb.sapp");
+let JSON = import("stdlib:json.sapp");
+
+let MAX_DB_BYTES = 4194304;
+let MAX_SQL_CHARS = 65536;
+let MAX_PARAMS = 128;
+let MAX_ROWS = 1000;
+let DEFAULT_ROWS = 100;
+let WORKER_OUTPUT_BYTES = 6291456;
+
+fn _reject_unknown(args, allowed, tool) {
+    if args == nil { return; }
+    if type(args) != "map" { throw tool + " arguments must be an object"; }
+    let keys = map_keys(args);
+    for i len(keys) {
+        let accepted = false;
+        for j len(allowed) { if keys[i] == allowed[j] { accepted = true; break; } }
+        if not accepted { throw tool + " received unknown argument: " + str(keys[i]); }
+    }
+}
+
+fn _one_alias(args, names, required, label) {
+    let found = 0; let value = nil;
+    for i len(names) {
+        if map_has(args, names[i]) { found = found + 1; value = args[names[i]]; }
+    }
+    if found > 1 { throw label + " aliases are mutually exclusive"; }
+    if required and found == 0 { throw label + " is required"; }
+    return value;
+}
+
+fn _integer(value, fallback, minimum, maximum, label) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value)
+       or value < minimum or value > maximum {
+        throw label + " must be an integer in " + str(minimum) + ".." + str(maximum);
+    }
+    return value;
+}
+
+fn _validate_param(value, depth = 0) {
+    if value == nil or type(value) == "string" or type(value) == "bool" or type(value) == "number" {
+        if type(value) == "string" and len(value) > 1048576 { throw "SQLite text parameter exceeds 1048576 characters"; }
+        return value;
+    }
+    if type(value) == "array" and depth == 0 {
+        if len(value) > 1048576 { throw "SQLite blob parameter exceeds 1048576 bytes"; }
+        for i len(value) {
+            if type(value[i]) != "number" or value[i] != num_floor(value[i])
+               or value[i] < 0 or value[i] > 255 { throw "SQLite blob parameter contains a non-byte value"; }
+        }
+        return value;
+    }
+    throw "SQLite parameters support number, bool, string, nil, or byte arrays";
+}
+
+fn _params(args) {
+    let params = try args.params catch [];
+    if type(params) != "array" or len(params) > MAX_PARAMS { throw "params must contain at most 128 values"; }
+    let out = [];
+    for i len(params) { out[len(out)] = _validate_param(params[i]); }
+    return out;
+}
+
+fn _single_statement_sql(sql, label) {
+    if type(sql) != "string" or str_trim(sql) == "" { throw label + " must not be empty"; }
+    if len(sql) > MAX_SQL_CHARS or len(str_to_bytes(sql)) > MAX_SQL_CHARS * 4 {
+        throw label + " exceeds its bounded size";
+    }
+    if str_contains(sql, strfromcharcode(0)) { throw label + " contains a NUL byte"; }
+
+    let mode = "normal"; let block_depth = 0; let i = 0;
+    while i < len(sql) {
+        let c = str_slice(sql, i, i + 1);
+        let next = if i + 1 < len(sql) { str_slice(sql, i + 1, i + 2) } else { "" };
+        if mode == "line-comment" {
+            if c == "\n" or c == "\r" { mode = "normal"; }
+        } elif mode == "block-comment" {
+            if c == "/" and next == "*" { block_depth = block_depth + 1; i = i + 1; }
+            elif c == "*" and next == "/" {
+                block_depth = block_depth - 1; i = i + 1;
+                if block_depth == 0 { mode = "normal"; }
+            }
+        } elif mode == "single" {
+            if c == "'" {
+                if next == "'" { i = i + 1; } else { mode = "normal"; }
+            }
+        } elif mode == "double" {
+            if c == "\"" {
+                if next == "\"" { i = i + 1; } else { mode = "normal"; }
+            }
+        } elif mode == "backtick" {
+            if c == "`" {
+                if next == "`" { i = i + 1; } else { mode = "normal"; }
+            }
+        } elif mode == "bracket" {
+            if c == "]" { mode = "normal"; }
+        } else {
+            if c == "-" and next == "-" { mode = "line-comment"; i = i + 1; }
+            elif c == "/" and next == "*" { mode = "block-comment"; block_depth = 1; i = i + 1; }
+            elif c == "'" { mode = "single"; }
+            elif c == "\"" { mode = "double"; }
+            elif c == "`" { mode = "backtick"; }
+            elif c == "[" { mode = "bracket"; }
+            elif c == ";" { throw label + " must contain exactly one statement without a trailing semicolon"; }
+        }
+        i = i + 1;
+    }
+    if mode == "block-comment" or mode == "single" or mode == "double"
+       or mode == "backtick" or mode == "bracket" { throw label + " contains an unterminated SQL token"; }
+
+    let leading = str_trim(sql);
+    while str_starts_with(leading, "--") or str_starts_with(leading, "/*") {
+        if str_starts_with(leading, "--") {
+            let newline = str_index_of(leading, "\n");
+            if newline < 0 { leading = ""; } else { leading = str_trim(str_slice(leading, newline + 1, len(leading))); }
+        } else {
+            let close = str_index_of(leading, "*/");
+            if close < 0 { throw label + " contains an unterminated leading comment"; }
+            leading = str_trim(str_slice(leading, close + 2, len(leading)));
+        }
+    }
+    if leading == "" { throw label + " must contain a statement"; }
+    return map{ sql: sql, leading_lower: str_lower(leading) };
+}
+
+fn _keyword(text, keyword) {
+    if text == keyword { return true; }
+    return str_starts_with(text, keyword + " ") or str_starts_with(text, keyword + "\n")
+        or str_starts_with(text, keyword + "\r") or str_starts_with(text, keyword + "\t");
+}
+
+fn _read_only_sql(sql) {
+    let checked = _single_statement_sql(sql, "query");
+    let lower = checked.leading_lower;
+    let select = _keyword(lower, "select");
+    let with_query = _keyword(lower, "with");
+    if not select and not with_query { throw "only SELECT or WITH...SELECT queries are accepted"; }
+    return checked.sql;
+}
+
+fn _mutation_sql(sql) {
+    let checked = _single_statement_sql(sql, "statement");
+    let lower = checked.leading_lower;
+    let accepted = _keyword(lower, "insert") or _keyword(lower, "update")
+        or _keyword(lower, "delete") or _keyword(lower, "replace")
+        or str_starts_with(lower, "create table ")
+        or str_starts_with(lower, "create table\n")
+        or str_starts_with(lower, "create table\r")
+        or str_starts_with(lower, "create table\t")
+        or str_starts_with(lower, "create index ")
+        or str_starts_with(lower, "create unique index ")
+        or str_starts_with(lower, "alter table ");
+    if not accepted {
+        throw "only INSERT, UPDATE, DELETE, REPLACE, CREATE TABLE/INDEX, or ALTER TABLE statements are accepted";
+    }
+    return checked.sql;
+}
+
+fn _statement_kind(sql) {
+    let lower = _single_statement_sql(sql, "statement").leading_lower;
+    for kind in ["insert", "update", "delete", "replace", "create", "alter"] {
+        if _keyword(lower, kind) { return str_upper(kind); }
+    }
+    return "UNKNOWN";
+}
+
+fn _sidecar_exists(path) {
+    return SEC.project_path_exists(path + "-journal") or SEC.project_path_exists(path + "-wal")
+        or SEC.project_path_exists(path + "-shm");
+}
+
+fn _sqlite_header(bytes) {
+    let expected = [83, 81, 76, 105, 116, 101, 32, 102, 111, 114, 109, 97, 116, 32, 51, 0];
+    if len(bytes) < 100 { return false; }
+    for i len(expected) { if bytes[i] != expected[i] { return false; } }
+    return true;
+}
+
+fn _stable_snapshot(path) {
+    let confined = SEC.safe_rel_path(path, "");
+    if confined == "" { throw "db_path is required"; }
+    if platform() != "linux" { throw "descriptor-confined SQLite reads are currently available only on Linux"; }
+    if _sidecar_exists(confined) { throw "active SQLite journal/WAL sidecars require an application-level backup snapshot"; }
+    let first = SEC.read_project_bytes_info(confined, MAX_DB_BYTES);
+    if first.truncated { throw "SQLite database exceeds the 4194304-byte snapshot limit"; }
+    let second = SEC.read_project_bytes_info(confined, MAX_DB_BYTES);
+    if second.truncated { throw "SQLite database exceeds the 4194304-byte snapshot limit"; }
+    let first_digest = SHA.sha256_hex_bytes(first.bytes);
+    let second_digest = SHA.sha256_hex_bytes(second.bytes);
+    if first.source_size != second.source_size or first_digest != second_digest {
+        throw "SQLite database changed while its bounded snapshot was captured";
+    }
+    if _sidecar_exists(confined) { throw "SQLite database entered a journal/WAL transaction during snapshot"; }
+    if not _sqlite_header(second.bytes) { throw "db_path is not a supported SQLite 3 database"; }
+    if second.bytes[18] == 2 or second.bytes[19] == 2 {
+        throw "WAL-mode databases require an application-level backup snapshot";
+    }
+    return map{ path: confined, bytes: second.bytes, size: second.source_size,
+        sha256: second_digest, stable_double_snapshot: true, nofollow: true };
+}
+
+fn _runtime_candidates() {
+    let out = [];
+    let configured = try env_get("PBLANG_BIN") catch nil;
+    if configured != nil and type(configured) == "string" and str_starts_with(configured, "/")
+       and path_basename(configured) == "pblang" { out[len(out)] = configured; }
+    let local = path_join(path_dirname(cwd()), "pblang/target/release/pblang");
+    if len(out) == 0 or out[0] != local { out[len(out)] = local; }
+    return out;
+}
+
+fn _cleanup_worker_workspace(root, path) {
+    if root != nil and (try root.ok catch false) {
+        try DIRFS.remove_file(root, "snapshot.db") catch nil;
+        try DIRFS.remove_file(root, "snapshot.db-journal") catch nil;
+        try DIRFS.remove_file(root, "snapshot.db-wal") catch nil;
+        try DIRFS.remove_file(root, "snapshot.db-shm") catch nil;
+        DIRFS.close(root);
+    }
+    let parent = DIRFS.open_absolute("/tmp", false, false);
+    if parent.ok { try DIRFS.remove(parent, path_basename(path)) catch nil; DIRFS.close(parent); }
+}
+
+fn _worker(snapshot, request) {
+    let token = str_slice(sha256(base64_encode_bytes(random_bytes(32)) + str(now_ms())), 0, 32);
+    let workspace_path = "/tmp/pb-mcp-sqlite-worker-" + token;
+    let workspace = DIRFS.open_absolute(workspace_path, true, true);
+    if not workspace.ok { throw "private SQLite worker directory cannot be created"; }
+    let workspace_handoff = DIRFS.child_descriptor(workspace);
+    if not workspace_handoff.ok {
+        _cleanup_worker_workspace(workspace, workspace_path);
+        throw "private SQLite workspace descriptor cannot be inherited";
+    }
+    request.format = "pb_mcp.sqlite-worker.request.v1";
+    request.database_base64 = base64_encode_bytes(snapshot.bytes);
+    request.database_digest = sha256(request.database_base64);
+    let encoded = JSON.stringify(request) + "\n";
+    let root = DIRFS.open(".", false, false);
+    if not root.ok {
+        DIRFS.close_child_descriptor(workspace, workspace_handoff);
+        _cleanup_worker_workspace(workspace, workspace_path);
+        throw "project root cannot be held for SQLite worker execution";
+    }
+    let worker = DIRFS.child_file_descriptor(root, "tools/sqlite_read_worker.sapp");
+    if not worker.ok {
+        DIRFS.close(root); DIRFS.close_child_descriptor(workspace, workspace_handoff);
+        _cleanup_worker_workspace(workspace, workspace_path);
+        throw "SQLite worker source cannot be held safely";
+    }
+    let result = try PROCESS.run_fixed(_runtime_candidates(),
+        ["run", "/proc/self/fd/" + str(worker.fd), "--allow-all", "--",
+         str(workspace_handoff.fd)], map{
+        timeout_secs: 10, max_output_bytes: WORKER_OUTPUT_BYTES,
+        max_memory_bytes: 1342177280, stdin_bytes: str_to_bytes(encoded),
+        inherit_environment: false
+    }) catch map{ ok: false, error: "supervised SQLite worker launch failed" };
+    let worker_closed = DIRFS.close_child_descriptor(root, worker);
+    let root_closed = DIRFS.close(root);
+    let cwd_closed = DIRFS.close_child_descriptor(workspace, workspace_handoff);
+    _cleanup_worker_workspace(workspace, workspace_path);
+    if not worker_closed or not root_closed or not cwd_closed {
+        throw "SQLite worker descriptor cleanup failed";
+    }
+    if not result.ok or not result.command_ok or result.timed_out or result.output_truncated
+       or not result.process_group_terminated or not result.stdout_utf8 {
+        throw "bounded SQLite worker failed, timed out, exceeded limits, or left a process group"
+            + " (exit=" + str(try result.exit_code catch -1) + ")";
+    }
+    let response = try JSON.parse(str_trim(result.stdout)) catch nil;
+    let mutation = (try request.operation catch "") == "exec";
+    if response == nil or not (try response.ok catch false)
+       or (try response.format catch "") != "pb_mcp.sqlite-worker.response.v1"
+       or (not mutation and not (try response.query_only catch false))
+       or (not mutation and not (try response.namespace_unlinked_before_query catch false))
+       or (mutation and not (try response.transaction_committed catch false))
+       or (mutation and not (try response.private_namespace_cleaned catch false))
+       or (try response.source_aliased catch true) {
+        throw "bounded SQLite worker returned an invalid or failed response at stage "
+            + str(try response.stage catch "response-validation");
+    }
+    return response.value;
+}
+
+fn db_sqlite_query(args) {
+    if args == nil { args = map{}; }
+    _reject_unknown(args, ["db_path", "path", "query", "sql", "params", "max_rows"], "db_sqlite_query");
+    let path = _one_alias(args, ["db_path", "path"], true, "database path");
+    let query = _read_only_sql(_one_alias(args, ["query", "sql"], true, "query"));
+    let params = _params(args);
+    let max_rows = _integer(try args.max_rows catch nil, DEFAULT_ROWS, 1, MAX_ROWS, "max_rows");
+    let snapshot = _stable_snapshot(path);
+    let wrapped = "SELECT * FROM (" + query + ") AS pb_mcp_read_query LIMIT ?";
+    params[len(params)] = max_rows + 1;
+    let result = _worker(snapshot, map{ operation: "query", query: wrapped, params: params });
+    let rows = try result.rows catch [];
+    if type(rows) != "array" { throw "SQLite worker returned invalid rows"; }
+    let out = []; let count = num_min(len(rows), max_rows);
+    for i count { out[len(out)] = rows[i]; }
+    return map{
+        format: "pb_mcp.sqlite-query.v1", db_path: snapshot.path,
+        rows: out, row_count: len(out), truncated: len(rows) > max_rows,
+        max_rows: max_rows, database_bytes: snapshot.size, database_sha256: snapshot.sha256,
+        read_only: true, query_only_enforced: true, process_isolated: true,
+        timeout_seconds: 10, virtual_memory_limit_bytes: 1342177280,
+        stable_double_snapshot: true, source_nofollow: true, source_aliased: false
+    };
+}
+
+fn db_sqlite_schema(args) {
+    if args == nil { args = map{}; }
+    _reject_unknown(args, ["db_path", "path", "table_name", "table"], "db_sqlite_schema");
+    let path = _one_alias(args, ["db_path", "path"], true, "database path");
+    let table = _one_alias(args, ["table_name", "table"], false, "table name");
+    if table != nil and (type(table) != "string" or len(table) < 1 or len(table) > 255
+       or str_contains(table, strfromcharcode(0))) { throw "table_name must contain 1..255 NUL-free characters"; }
+    let snapshot = _stable_snapshot(path);
+    let result = _worker(snapshot, map{ operation: "schema", table_name: table });
+    return map{
+        format: "pb_mcp.sqlite-schema.v1", db_path: snapshot.path,
+        objects: try result.objects catch [], tables: try result.tables catch [],
+        database_bytes: snapshot.size, database_sha256: snapshot.sha256,
+        read_only: true, query_only_enforced: true, process_isolated: true,
+        stable_double_snapshot: true, source_nofollow: true, source_aliased: false
+    };
+}
+
+fn _hex_digest(value, label) {
+    if value == nil { return nil; }
+    if type(value) != "string" or not regex_match(value, "^[0-9a-f]{64}$") {
+        throw label + " must be 64 lowercase hexadecimal characters";
+    }
+    return value;
+}
+
+fn _execute_mutation_locked(root, path, statement, params, expected) {
+    let before = _stable_snapshot(path);
+    if expected != nil and before.sha256 != expected {
+        throw "expected_sha256 does not match the current database";
+    }
+    let changed = _worker(before, map{
+        operation: "exec", statement: statement, params: params
+    });
+    let encoded = try changed.database_base64 catch "";
+    let bytes = try base64_decode_bytes(encoded) catch nil;
+    if bytes == nil or len(bytes) < 100 or len(bytes) > MAX_DB_BYTES
+       or base64_encode_bytes(bytes) != encoded
+       or SHA.sha256_hex_bytes(bytes) != (try changed.database_sha256 catch "")
+       or not _sqlite_header(bytes) {
+        throw "SQLite worker returned an invalid committed database";
+    }
+    let current = _stable_snapshot(path);
+    if current.sha256 != before.sha256 or current.size != before.size {
+        throw "SQLite database changed before atomic publication";
+    }
+    let wrote = DIRFS.write_atomic(root, before.path, bytes, false);
+    if not wrote.ok { throw "SQLite atomic publication failed"; }
+    let published = _stable_snapshot(path);
+    if published.sha256 != changed.database_sha256 or published.size != len(bytes) {
+        throw "SQLite publication postcondition failed";
+    }
+    return map{
+        format: "pb_mcp.sqlite-exec.v1", db_path: before.path,
+        statement_kind: _statement_kind(statement),
+        changed_rows: try changed.changed_rows catch 0,
+        last_insert_rowid: try changed.last_insert_rowid catch 0,
+        previous_sha256: before.sha256, database_sha256: published.sha256,
+        expected_sha256_matched: expected == nil or expected == before.sha256,
+        database_bytes: published.size, transaction_committed: true,
+        atomic_publication: true, cooperative_writer_serialization: true,
+        external_writer_conflict_rechecked: true,
+        arbitrary_external_writer_lock_enforced: false,
+        process_isolated: true, timeout_seconds: 10,
+        virtual_memory_limit_bytes: 1342177280,
+        source_nofollow: true, source_aliased: false
+    };
+}
+
+fn db_sqlite_exec(args) {
+    if args == nil { args = map{}; }
+    _reject_unknown(args,
+        ["db_path", "path", "statement", "sql", "params", "expected_sha256"],
+        "db_sqlite_exec");
+    SEC.require_trusted("SQLite database mutation", "PB_DB_WRITE_ENABLE");
+    let path = _one_alias(args, ["db_path", "path"], true, "database path");
+    let statement = _mutation_sql(_one_alias(args, ["statement", "sql"], true, "statement"));
+    let params = _params(args);
+    let expected = _hex_digest(try args.expected_sha256 catch nil, "expected_sha256");
+    if platform() != "linux" { throw "descriptor-confined SQLite mutation is currently available only on Linux"; }
+
+    let root = DIRFS.open(".", false, false);
+    if not root.ok { throw "project root cannot be held for SQLite mutation"; }
+    let lock = DIRFS.acquire_lock(root,
+        ".pb-mcp-private/locks/sqlite-" + sha256(SEC.safe_rel_path(path, "")) + ".lock",
+        5000, 10);
+    if not lock.ok { DIRFS.close(root); throw "SQLite mutation remained busy"; }
+
+    let value = try _execute_mutation_locked(root, path, statement, params, expected) catch nil;
+    let unlocked = DIRFS.release_lock(root, lock);
+    let closed = DIRFS.close(root);
+    if not unlocked or not closed { throw "SQLite mutation lock cleanup failed"; }
+    if value == nil { throw "SQLite mutation failed or conflicted"; }
+    return value;
+}
+
+fn call_sqlite(tool, args) {
+    if tool == "db_sqlite_query" { return db_sqlite_query(args); }
+    if tool == "db_sqlite_schema" { return db_sqlite_schema(args); }
+    if tool == "db_sqlite_exec" { return db_sqlite_exec(args); }
+    return nil;
+}
+
+fn implemented_tools() { return ["db_sqlite_query", "db_sqlite_schema", "db_sqlite_exec"]; }
+
+export implemented_tools, call_sqlite, db_sqlite_query, db_sqlite_schema, db_sqlite_exec;

@@ -1,0 +1,513 @@
+// Trusted, bounded HTTPS request adapter for pb-mcp-server.
+//
+// The PBLang runtime does not yet expose a generic custom-method HTTP client,
+// so curl is the narrow system adapter. Caller data is written to mode-0600
+// files below a held mode-0700 directory and never appears in process argv.
+
+let sec = import("security.sapp");
+let URL = import("stdlib:url.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+let PROCESS = import("stdlib:linux_process.sapp");
+
+let RUNTIME_ROOT = "/tmp/pb-mcp-network-runtime";
+let MAX_URL_CHARS = 8192;
+let MAX_HEADERS = 32;
+let MAX_HEADER_CHARS = 4096;
+let MAX_HEADER_TOTAL_CHARS = 16384;
+let MAX_BODY_BYTES = 1048576;
+let MAX_RESPONSE_BYTES = 524288;
+let METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+let BLOCKED_HEADERS = [
+    "host", "content-length", "transfer-encoding", "connection",
+    "proxy-authorization", "proxy-connection", "te", "trailer", "upgrade",
+    "expect", "accept-encoding"
+];
+
+fn _contains(values, value) {
+    for i len(values) { if values[i] == value { return true; } }
+    return false;
+}
+
+fn _control(value) {
+    for i len(value) {
+        let code = strcharcodeat(value, i);
+        if code <= 31 or code == 127 { return true; }
+    }
+    return false;
+}
+
+fn _header_name(value) {
+    if value == "" or len(value) > 128 { return false; }
+    let allowed = "!#$%&'*+-.^_`|~abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for i len(value) {
+        if not str_contains(allowed, str_slice(value, i, i + 1)) { return false; }
+    }
+    return true;
+}
+
+fn _validated_header(line) {
+    if type(line) != "string" or len(line) > MAX_HEADER_CHARS or _control(line) {
+        throw "each network header must be a bounded single-line string";
+    }
+    let colon = str_index_of(line, ":");
+    if colon <= 0 { throw "network headers must use Name: Value format"; }
+    let name = str_trim(str_slice(line, 0, colon));
+    let value = str_trim(str_slice(line, colon + 1, len(line)));
+    if not _header_name(name) { throw "network header name is invalid"; }
+    let lower = str_lower(name);
+    if _contains(BLOCKED_HEADERS, lower) {
+        throw "network header is controlled by the sandbox: " + name;
+    }
+    return map{ name: name, lower: lower, line: name + ": " + value };
+}
+
+fn _headers(args) {
+    let list = try args.headers catch nil;
+    let mapped = try args.header_map catch nil;
+    if list != nil and mapped != nil { throw "provide headers or header_map, not both"; }
+    let raw = [];
+    if list != nil {
+        if type(list) != "array" or len(list) > MAX_HEADERS {
+            throw "headers must contain at most 32 Name: Value strings";
+        }
+        for i len(list) { raw[len(raw)] = list[i]; }
+    } elif mapped != nil {
+        if type(mapped) != "map" { throw "header_map must be an object"; }
+        let keys = array_sort(map_keys(mapped));
+        if len(keys) > MAX_HEADERS { throw "header_map must contain at most 32 entries"; }
+        for i len(keys) {
+            if type(mapped[keys[i]]) != "string" { throw "header_map values must be strings"; }
+            raw[len(raw)] = str(keys[i]) + ": " + mapped[keys[i]];
+        }
+    }
+    let out = []; let names = []; let total = 0;
+    for i len(raw) {
+        let checked = _validated_header(raw[i]);
+        total = total + len(checked.line);
+        if total > MAX_HEADER_TOTAL_CHARS { throw "network headers exceed the total character limit"; }
+        if _contains(names, checked.lower) { throw "duplicate network header: " + checked.name; }
+        names[len(names)] = checked.lower; out[len(out)] = checked.line;
+    }
+    return out;
+}
+
+fn _host_chars(host) {
+    let allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-:";
+    if host == "" or len(host) > 253 or str_contains(host, "%") { return false; }
+    for i len(host) {
+        if not str_contains(allowed, str_slice(host, i, i + 1)) { return false; }
+    }
+    return true;
+}
+
+fn _ipv4(value) {
+    let parts = str_split(value, ".");
+    if len(parts) != 4 { return nil; }
+    let octets = [];
+    for i 4 {
+        if parts[i] == "" or len(parts[i]) > 3 { return nil; }
+        for j len(parts[i]) {
+            if not str_contains("0123456789", str_slice(parts[i], j, j + 1)) { return nil; }
+        }
+        let octet = try parse_number(parts[i]) catch nil;
+        if octet == nil or octet != num_floor(octet) or octet < 0 or octet > 255 { return nil; }
+        octets[i] = octet;
+    }
+    return octets;
+}
+
+fn _public_ipv4(o) {
+    if o[0] == 0 or o[0] == 10 or o[0] == 127 or o[0] >= 224 { return false; }
+    if o[0] == 100 and o[1] >= 64 and o[1] <= 127 { return false; }
+    if o[0] == 169 and o[1] == 254 { return false; }
+    if o[0] == 172 and o[1] >= 16 and o[1] <= 31 { return false; }
+    if o[0] == 192 and o[1] == 168 { return false; }
+    if o[0] == 192 and o[1] == 0 and o[2] == 0 { return false; }
+    if o[0] == 192 and o[1] == 0 and o[2] == 2 { return false; }
+    if o[0] == 192 and o[1] == 88 and o[2] == 99 { return false; }
+    if o[0] == 198 and (o[1] == 18 or o[1] == 19) { return false; }
+    if o[0] == 198 and o[1] == 51 and o[2] == 100 { return false; }
+    if o[0] == 203 and o[1] == 0 and o[2] == 113 { return false; }
+    return true;
+}
+
+fn _all_zero_hex(value) {
+    let compact = str_replace_all(value, ":", "");
+    compact = str_replace_all(compact, "0", "");
+    return compact == "";
+}
+
+fn _public_ipv6(value) {
+    let ip = str_lower(value);
+    if str_starts_with(ip, "::ffff:") {
+        let mapped = _ipv4(str_slice(ip, 7, len(ip)));
+        return mapped != nil and _public_ipv4(mapped);
+    }
+    for i len(ip) {
+        if not str_contains("0123456789abcdef:.", str_slice(ip, i, i + 1)) { return false; }
+    }
+    if not str_contains(ip, ":") or _all_zero_hex(ip) { return false; }
+    // Globally routable unicast IPv6 is currently 2000::/3. A conservative
+    // allow-range avoids omissions in an ever-growing private/reserved denylist.
+    if not (str_starts_with(ip, "2") or str_starts_with(ip, "3")) { return false; }
+    if str_starts_with(ip, "2001:db8:") or str_starts_with(ip, "2001:2:") { return false; }
+    return true;
+}
+
+fn public_ip(value) {
+    let ip = str_trim(str(value));
+    let v4 = _ipv4(ip);
+    if v4 != nil { return _public_ipv4(v4); }
+    return _public_ipv6(ip);
+}
+
+fn _first_word(line) {
+    let clean = str_trim(line); let end = 0;
+    while end < len(clean) and not str_contains(" \t\r\n", str_slice(clean, end, end + 1)) {
+        end = end + 1;
+    }
+    return str_slice(clean, 0, end);
+}
+
+fn _authority_valid(url, parsed) {
+    let rest = str_slice(url, 8, len(url));
+    let slash = str_index_of(rest, "/");
+    let query = str_index_of(rest, "?");
+    let end = len(rest);
+    if slash >= 0 and slash < end { end = slash; }
+    if query >= 0 and query < end { end = query; }
+    let authority = str_slice(rest, 0, end);
+    if authority == "" or str_contains(authority, "\\") { return false; }
+    if str_starts_with(authority, "[") {
+        let close = str_index_of(authority, "]");
+        if close <= 1 { return false; }
+        let suffix = str_slice(authority, close + 1, len(authority));
+        if suffix == "" { return true; }
+        return str_starts_with(suffix, ":") and parsed.port != nil;
+    }
+    let colon = str_index_of(authority, ":");
+    if colon < 0 { return true; }
+    return colon > 0 and parsed.port != nil;
+}
+
+fn validate_request_for(args, action, capability) {
+    if args == nil { args = map{}; }
+    sec.require_trusted(action, capability);
+    let url = str_trim(str(try args.url catch ""));
+    if url == "" or len(url) > MAX_URL_CHARS or _control(url) { throw "url is missing or outside policy"; }
+    let parsed = URL.parse(url);
+    if str_lower(parsed.scheme) != "https" { throw "sandbox network requests require HTTPS"; }
+    if not _authority_valid(url, parsed) { throw "URL authority or port is invalid"; }
+    if parsed.host == "" or parsed.userinfo != "" { throw "URL host is required and embedded credentials are forbidden"; }
+    if parsed.fragment != "" { throw "URL fragments are not sent and are refused to avoid ambiguity"; }
+    let host = str_lower(parsed.host);
+    if str_starts_with(host, "[") and str_ends_with(host, "]") { host = str_slice(host, 1, len(host) - 1); }
+    if not _host_chars(host) { throw "URL host contains unsupported characters"; }
+    if host == "localhost" or str_ends_with(host, ".localhost") or str_ends_with(host, ".local") {
+        throw "private and local URL hosts are forbidden";
+    }
+    let literal_v4 = _ipv4(host);
+    if literal_v4 != nil and not _public_ipv4(literal_v4) { throw "private IPv4 URL literal is forbidden"; }
+    if str_contains(host, ":") and not _public_ipv6(host) { throw "non-public IPv6 URL literal is forbidden"; }
+    let port = if parsed.port == nil { 443 } else { parsed.port };
+    if port < 1 or port > 65535 { throw "URL port is invalid"; }
+    let method = str_upper(str_trim(str(try args.method catch "GET")));
+    if not _contains(METHODS, method) { throw "unsupported HTTP method"; }
+    let headers = _headers(args);
+    let body = try args.body catch nil;
+    if body != nil and type(body) != "string" { throw "body must be a string"; }
+    if body == nil { body = ""; }
+    let body_bytes = len(str_to_bytes(body));
+    if body_bytes > MAX_BODY_BYTES { throw "request body exceeds one MiB"; }
+    if body != "" and not (method == "POST" or method == "PUT" or method == "PATCH") {
+        throw "request bodies are accepted only for POST, PUT, or PATCH";
+    }
+    let timeout_secs = try args.timeout_secs catch 30;
+    if type(timeout_secs) != "number" or timeout_secs != num_floor(timeout_secs)
+       or timeout_secs < 1 or timeout_secs > 300 { throw "timeout_secs must be an integer from 1 to 300"; }
+    let max_response_bytes = try args.max_response_bytes catch MAX_RESPONSE_BYTES;
+    if type(max_response_bytes) != "number" or max_response_bytes != num_floor(max_response_bytes)
+       or max_response_bytes < 1 or max_response_bytes > MAX_RESPONSE_BYTES {
+        throw "max_response_bytes must be an integer from 1 to 524288";
+    }
+    return map{
+        ok: true, format: "pb_mcp.sandbox_network_request.validation.v1",
+        url: url, host: host, port: port, method: method, headers: headers,
+        body: body, body_bytes: body_bytes, timeout_secs: timeout_secs,
+        max_response_bytes: max_response_bytes, secure_transport: true,
+        redirects_allowed: false, credentials_in_argv: false
+    };
+}
+
+fn validate_request(args) {
+    return validate_request_for(args, "sandbox network request", "PB_SANDBOX_NETWORK_ENABLE");
+}
+
+fn _resolve_raw(host) {
+    let ran = PROCESS.run_fixed(["/usr/bin/getent", "/bin/getent"], ["ahosts", host], map{
+        timeout_secs: 5, max_output_bytes: 65536,
+        max_memory_bytes: 67108864, inherit_environment: false,
+        environment: map{ LC_ALL: "C" }
+    });
+    if not ran.ok or not ran.command_ok or ran.output_truncated {
+        return map{ ok: false, error: "bounded DNS resolution failed" };
+    }
+    let output = str(ran.stdout);
+    let addresses = [];
+    let lines = str_split(output, "\n");
+    for i len(lines) {
+        let ip = _first_word(lines[i]);
+        if ip != "" and not _contains(addresses, ip) { addresses[len(addresses)] = ip; }
+        if len(addresses) > 16 { return map{ ok: false, error: "DNS returned too many addresses" }; }
+    }
+    if len(addresses) == 0 { return map{ ok: false, error: "DNS returned no address" }; }
+    return map{ ok: true, addresses: addresses, selected: addresses[0] };
+}
+
+fn _resolve(host) {
+    let result = _resolve_raw(host);
+    if not result.ok { return result; }
+    for i len(result.addresses) {
+        if not public_ip(result.addresses[i]) {
+            return map{ ok: false, error: "DNS returned a non-public address", address: result.addresses[i] };
+        }
+    }
+    result.all_public = true;
+    return result;
+}
+
+fn resolve_public(host, action, capability) {
+    sec.require_trusted(action, capability);
+    host = str_lower(str_trim(str(host)));
+    if not _host_chars(host) or host == "localhost" or str_ends_with(host, ".localhost") or
+       str_ends_with(host, ".local") { throw "DNS host is missing, local, or malformed"; }
+    let literal_v4 = _ipv4(host);
+    if literal_v4 != nil and not _public_ipv4(literal_v4) { throw "private IPv4 host is forbidden"; }
+    if str_contains(host, ":") and not _public_ipv6(host) { throw "non-public IPv6 host is forbidden"; }
+    let result = _resolve(host);
+    result.host = host; result.ssrf_fail_closed = true;
+    return result;
+}
+
+fn resolve_target(host, action, capability, allow_private = false) {
+    sec.require_trusted(action, capability);
+    if type(allow_private) != "bool" { throw "allow_private must be boolean"; }
+    host = str_lower(str_trim(str(host)));
+    if not _host_chars(host) { throw "network target host is missing or malformed"; }
+    if allow_private and not sec.bool_env("PB_NET_PRIVATE_ENABLE", false) {
+        throw "private network targets require PB_NET_PRIVATE_ENABLE=1";
+    }
+    let result = _resolve_raw(host);
+    if not result.ok { result.host = host; result.ssrf_fail_closed = true; return result; }
+    let public_count = 0;
+    for i len(result.addresses) { if public_ip(result.addresses[i]) { public_count = public_count + 1; } }
+    if public_count > 0 and public_count < len(result.addresses) {
+        return map{ ok: false, host: host, error: "DNS returned mixed public and private addresses",
+            ssrf_fail_closed: true, mixed_trust_zone: true };
+    }
+    let private_target = public_count == 0;
+    if private_target and not allow_private {
+        return map{ ok: false, host: host, error: "private network target requires explicit opt-in",
+            ssrf_fail_closed: true, private_target: true };
+    }
+    result.host = host; result.private_target = private_target;
+    result.all_public = not private_target; result.dns_pinned = true;
+    result.ssrf_fail_closed = true;
+    return result;
+}
+
+fn _quote(value) {
+    let escaped = str_replace_all(str(value), "\\", "\\\\");
+    escaped = str_replace_all(escaped, "\"", "\\\"");
+    return "\"" + escaped + "\"";
+}
+
+fn _config_line(name, value) { return name + " = " + _quote(value) + "\n"; }
+
+fn _cleanup(root, id) {
+    let suffixes = [".curl", ".request", ".body"];
+    for i len(suffixes) { try DIRFS.remove(root, id + suffixes[i]) catch nil; }
+}
+
+fn request_for(args, action, capability) {
+    let spec = validate_request_for(args, action, capability);
+    if platform() != "linux" or not DIRFS.available().ok {
+        return map{ ok: false, error: "race-resistant network requests currently require Linux" };
+    }
+    let dns = _resolve(spec.host);
+    if not dns.ok { return map{ ok: false, error: dns.error, ssrf_blocked: true,
+        detail: try dns.address catch nil } }
+    let root = DIRFS.open_absolute(RUNTIME_ROOT, true, true);
+    if not root.ok { return map{ ok: false, error: "private network runtime cannot be opened safely" }; }
+    let id = str_slice(SHA256.sha256_hex_bytes(random_bytes(32)), 0, 32);
+    _cleanup(root, id);
+    let held = DIRFS.descriptor_path(root);
+    if not held.ok { DIRFS.close(root); return map{ ok: false, error: "private runtime descriptor is unavailable" }; }
+    let prefix = held.path + "/" + id;
+    let pinned = dns.selected;
+    if str_contains(pinned, ":") { pinned = "[" + pinned + "]"; }
+    let config = "silent\nshow-error\nfail-early\ntlsv1.2\n"
+        + _config_line("proto", "=https") + _config_line("proto-redir", "=https")
+        + _config_line("noproxy", "*")
+        + _config_line("max-time", str(spec.timeout_secs))
+        + _config_line("connect-timeout", str(if spec.timeout_secs < 10 { spec.timeout_secs } else { 10 }))
+        + _config_line("max-filesize", str(spec.max_response_bytes))
+        + _config_line("request", spec.method) + _config_line("url", spec.url)
+        + _config_line("resolve", spec.host + ":" + str(spec.port) + ":" + pinned)
+        + _config_line("output", prefix + ".body");
+    for i len(spec.headers) { config = config + _config_line("header", spec.headers[i]); }
+    if spec.body_bytes > 0 { config = config + _config_line("data-binary", "@" + prefix + ".request"); }
+    let config_write = DIRFS.write_atomic(root, id + ".curl", str_to_bytes(config), false);
+    let body_write = DIRFS.write_atomic(root, id + ".body", [], false);
+    let request_write = map{ ok: true };
+    if spec.body_bytes > 0 { request_write = DIRFS.write_atomic(root, id + ".request", str_to_bytes(spec.body), false); }
+    if not config_write.ok or not body_write.ok or not request_write.ok {
+        _cleanup(root, id); DIRFS.close(root);
+        return map{ ok: false, error: "private network request publication failed" };
+    }
+    let marker = "%{http_code}|%{size_download}|%{remote_ip}";
+    let ran = PROCESS.run_fixed(["/usr/bin/curl", "/bin/curl"], [
+        "--disable", "--config", prefix + ".curl", "--write-out", marker
+    ], map{
+        timeout_secs: spec.timeout_secs + 2, max_output_bytes: 8192,
+        max_memory_bytes: 134217728, inherit_environment: false,
+        environment: map{ LC_ALL: "C" }
+    });
+    let response = DIRFS.read_bytes(root, id + ".body", spec.max_response_bytes);
+    _cleanup(root, id); DIRFS.close(root);
+    if not ran.ok or not ran.command_ok or ran.output_truncated {
+        return map{ ok: false, error: "bounded HTTPS request failed", exit_code: try ran.exit_code catch -1,
+            timed_out: try ran.timed_out catch false,
+            output_truncated: try ran.output_truncated catch false,
+            process_group_terminated: try ran.process_group_terminated catch false,
+            stderr: _clip(try ran.stderr catch "", 4096) };
+    }
+    if not response.ok {
+        return map{ ok: false, error: "HTTPS response exceeded a configured bound" };
+    }
+    let facts = str_split(str_trim(str(try ran.stdout catch "")), "|");
+    if len(facts) != 3 or str_lower(facts[2]) != str_lower(dns.selected) {
+        return map{ ok: false, error: "HTTPS peer did not match the pinned DNS address" };
+    }
+    let status = try parse_number(facts[0]) catch 0;
+    let text = try bytes_to_str(response.bytes) catch nil;
+    let transport_ok = status >= 100 and status <= 599;
+    let http_ok = status >= 200 and status <= 299;
+    return map{
+        ok: http_ok, transport_ok: transport_ok, http_ok: http_ok,
+        format: "pb_mcp.sandbox_network_request.v1", status: status,
+        method: spec.method, host: spec.host, port: spec.port,
+        body_bytes: response.size,
+        body_text: if text == nil { "" } else { text },
+        body_base64: if text == nil { base64_encode_bytes(response.bytes) } else { "" },
+        body_encoding: if text == nil { "base64" } else { "utf-8" },
+        exit_code: ran.exit_code, timed_out: false, secure_transport: true,
+        process_group_terminated: ran.process_group_terminated,
+        bounded_process_supervisor: true,
+        tls_verification: true, redirects_followed: false, dns_pinned: true,
+        resolved_address_count: len(dns.addresses), credentials_in_argv: false,
+        request_body_bytes: spec.body_bytes, custom_header_count: len(spec.headers)
+    };
+}
+
+fn request(args) {
+    return request_for(args, "sandbox network request", "PB_SANDBOX_NETWORK_ENABLE");
+}
+
+fn _download_metrics(text, pinned_address, maximum_bytes) {
+    let facts = str_split(str_trim(str(text)), "|");
+    if len(facts) != 5 or str_lower(str_trim(facts[4])) != str_lower(pinned_address) {
+        return map{ ok: false, error: "download metrics or pinned peer address were invalid" };
+    }
+    let status = try parse_number(facts[0]) catch 0;
+    let bytes = try parse_number(facts[1]) catch -1;
+    let speed = try parse_number(facts[2]) catch -1;
+    let elapsed_secs = try parse_number(facts[3]) catch -1;
+    if status < 100 or status > 599 or bytes < 0 or bytes > maximum_bytes
+        or bytes != num_floor(bytes) or speed < 0 or elapsed_secs < 0 {
+        return map{ ok: false, error: "download metrics exceeded policy or were malformed" };
+    }
+    let transport_ok = true; let http_ok = status >= 200 and status <= 299;
+    return map{ ok: http_ok, transport_ok: transport_ok, http_ok: http_ok,
+        status: status, download_bytes: bytes, download_bytes_per_sec: speed,
+        throughput_mbps: speed * 8 / 1000000, elapsed_ms: elapsed_secs * 1000 };
+}
+
+fn measure_download_for(args, action, capability) {
+    if type(args) != "map" { throw "download measurement arguments must be an object"; }
+    let keys = map_keys(args); let allowed = ["url", "timeout_secs", "max_download_bytes"];
+    for i len(keys) { if not _contains(allowed, keys[i]) { throw "unknown download measurement argument: " + keys[i]; } }
+    let maximum = try args.max_download_bytes catch 1048576;
+    if type(maximum) != "number" or maximum != num_floor(maximum)
+        or maximum < 16384 or maximum > 8388608 {
+        throw "max_download_bytes must be an integer from 16384 to 8388608";
+    }
+    let spec = validate_request_for(map{ url: try args.url catch "",
+        method: "GET", timeout_secs: try args.timeout_secs catch 30,
+        max_response_bytes: 1 }, action, capability);
+    if platform() != "linux" or not DIRFS.available().ok or not PROCESS.status().available {
+        return map{ ok: false, executed: false,
+            error: "bounded download measurement currently requires Linux process and directory handles" };
+    }
+    let dns = _resolve(spec.host);
+    if not dns.ok { return map{ ok: false, executed: false, error: dns.error,
+        ssrf_blocked: true, detail: try dns.address catch nil }; }
+    let root = DIRFS.open_absolute(RUNTIME_ROOT, true, true);
+    if not root.ok { return map{ ok: false, executed: false,
+        error: "private network runtime cannot be opened safely" }; }
+    let id = str_slice(SHA256.sha256_hex_bytes(random_bytes(32)), 0, 32);
+    _cleanup(root, id);
+    let held = DIRFS.descriptor_path(root);
+    if not held.ok { DIRFS.close(root); return map{ ok: false, executed: false,
+        error: "private runtime descriptor is unavailable" }; }
+    let pinned = dns.selected;
+    let configured_ip = if str_contains(pinned, ":") { "[" + pinned + "]" } else { pinned };
+    let config = "silent\nshow-error\nfail-early\ntlsv1.2\n"
+        + _config_line("proto", "=https") + _config_line("proto-redir", "=https")
+        + _config_line("noproxy", "*") + _config_line("max-time", str(spec.timeout_secs))
+        + _config_line("connect-timeout", str(if spec.timeout_secs < 10 { spec.timeout_secs } else { 10 }))
+        + _config_line("max-filesize", str(maximum))
+        + _config_line("request", "GET") + _config_line("url", spec.url)
+        + _config_line("resolve", spec.host + ":" + str(spec.port) + ":" + configured_ip)
+        + _config_line("output", "/dev/null");
+    let wrote = DIRFS.write_atomic(root, id + ".curl", str_to_bytes(config), false);
+    if not wrote.ok { _cleanup(root, id); DIRFS.close(root);
+        return map{ ok: false, executed: false, error: "private download configuration failed" }; }
+    let marker = "%{http_code}|%{size_download}|%{speed_download}|%{time_total}|%{remote_ip}";
+    let result = PROCESS.run_fixed(["/usr/bin/curl", "/bin/curl"], ["--disable", "--config",
+        held.path + "/" + id + ".curl", "--write-out", marker], map{
+        timeout_secs: spec.timeout_secs + 2, startup_timeout_ms: 5000,
+        max_output_bytes: 8192, max_memory_bytes: 134217728,
+        inherit_environment: false, environment: map{ LC_ALL: "C" }
+    });
+    _cleanup(root, id); DIRFS.close(root);
+    if not result.ok or not result.command_ok or result.output_truncated {
+        return map{ ok: false, executed: try result.completed catch false,
+            error: try result.stderr catch try result.error catch "bounded download failed",
+            exit_code: try result.exit_code catch -1,
+            timed_out: try result.timed_out catch false,
+            output_truncated: try result.output_truncated catch false };
+    }
+    let metrics = _download_metrics(result.stdout, pinned, maximum);
+    metrics.executed = true; metrics.format = "pb_mcp.sandbox-download-measurement.v1";
+    metrics.url = spec.url; metrics.host = spec.host; metrics.port = spec.port;
+    metrics.max_download_bytes = maximum; metrics.secure_transport = true;
+    metrics.tls_verification = true; metrics.redirects_followed = false;
+    metrics.dns_pinned = true; metrics.target_address = pinned;
+    metrics.resolved_address_count = len(dns.addresses);
+    metrics.payload_retained = false; metrics.output_path = "/dev/null";
+    metrics.credentials_in_argv = false; metrics.shell_used = false;
+    metrics.process_group_terminated = result.process_group_terminated;
+    return metrics;
+}
+
+fn _clip(value, maximum) {
+    let text = str(value);
+    if len(text) <= maximum { return text; }
+    return str_slice(text, 0, maximum);
+}
+
+export request, request_for, validate_request, validate_request_for,
+       measure_download_for, _download_metrics,
+       resolve_public, resolve_target, public_ip;

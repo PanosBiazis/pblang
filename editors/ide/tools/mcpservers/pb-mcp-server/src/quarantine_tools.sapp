@@ -1,0 +1,257 @@
+// Descriptor-confined quarantine lifecycle implemented entirely in PBLang.
+
+let SEC = import("security.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+let ROOT = ".pb-mcp-private/quarantine";
+let OBJECTS = ROOT + "/objects";
+let RECORDS = ROOT + "/records";
+let MAX_BYTES = 67108864;
+
+fn _strict(args, allowed) {
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "quarantine arguments must be an object"; }
+    let keys = map_keys(args);
+    for i len(keys) {
+        let found = false;
+        for j len(allowed) { if keys[i] == allowed[j] { found = true; break; } }
+        if not found { throw "unknown quarantine argument: " + str(keys[i]); }
+    }
+    return args;
+}
+
+fn _integer(value, label, low, high, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value) or value < low or value > high {
+        throw label + " must be an integer between " + str(low) + " and " + str(high);
+    }
+    return value;
+}
+
+fn _id(value) {
+    if type(value) != "string" or not regex_match(value, "^[0-9a-f]{40}$") {
+        throw "id must be a 40-digit lowercase hexadecimal quarantine identifier";
+    }
+    return value;
+}
+
+fn _new_id() {
+    return str_slice(SHA256.sha256_hex_bytes(random_bytes(32)), 0, 40);
+}
+
+fn _object_path(id) { return OBJECTS + "/" + id + ".bin"; }
+fn _record_path(id) { return RECORDS + "/" + id + ".json"; }
+
+fn _open(create) {
+    if platform() != "linux" { throw "quarantine currently requires Linux directory handles"; }
+    let root = DIRFS.open(".", false, false);
+    if not root.ok { throw "project root cannot be held for quarantine"; }
+    if create {
+        let made_objects = DIRFS.mkdir(root, OBJECTS);
+        let made_records = DIRFS.mkdir(root, RECORDS);
+        if not made_objects.ok or not made_records.ok {
+            DIRFS.close(root); throw "private quarantine directories cannot be created";
+        }
+        let protected_root = DIRFS.open(ROOT, false, true);
+        root.quarantine_private_mode_verified = protected_root.ok;
+        if protected_root.ok { DIRFS.close(protected_root); }
+    }
+    return root;
+}
+
+fn _read_record(root, id) {
+    let loaded = DIRFS.read_bytes(root, _record_path(id), 65536);
+    if not loaded.ok { throw "quarantine record does not exist or is unreadable"; }
+    let record = try json_parse(bytes_to_str(loaded.bytes)) catch nil;
+    if type(record) != "map" or (try record.format catch "") != "pb_mcp.quarantine.record.v1"
+       or (try record.id catch "") != id
+       or (try record.object_path catch "") != _object_path(id)
+       or type(try record.original_path catch nil) != "string"
+       or not regex_match(try record.sha256 catch "", "^[0-9a-f]{64}$") {
+        throw "quarantine record failed structural validation";
+    }
+    return record;
+}
+
+fn _verify_object(root, record, max_bytes) {
+    let loaded = DIRFS.read_bytes(root, record.object_path, max_bytes);
+    if not loaded.ok { return map{ ok: false, error: "quarantined object is missing or exceeds its byte limit" }; }
+    let digest = SHA256.sha256_hex_bytes(loaded.bytes);
+    if digest != record.sha256 or len(loaded.bytes) != record.size {
+        return map{ ok: false, error: "quarantined object integrity verification failed" };
+    }
+    return map{ ok: true, sha256: digest, size: len(loaded.bytes) };
+}
+
+fn _rollback(root, object_path, original_path) {
+    let moved = DIRFS.move_new_exclusive(root, object_path, original_path, false);
+    return map{ ok: moved.ok, result: moved,
+        manual_recovery_required: not moved.ok, object_path: object_path,
+        original_path: original_path };
+}
+
+fn quarantine_file(args) {
+    args = _strict(args, ["path", "max_bytes"]);
+    SEC.require_trusted("quarantine file", "PB_PROTECT_WRITE_ENABLE");
+    let path = SEC.safe_rel_path(try args.path catch "", "");
+    if path == "" or path == "." or str_starts_with(path, ".pb-mcp-private/") {
+        throw "path must name a project file outside the private MCP state";
+    }
+    let max_bytes = _integer(try args.max_bytes catch nil, "max_bytes", 1, MAX_BYTES, MAX_BYTES);
+    let root = _open(true);
+    let id = ""; let object_path = ""; let moved = nil;
+    for attempt 8 {
+        id = _new_id(); object_path = _object_path(id);
+        moved = DIRFS.move_new_exclusive(root, path, object_path, false);
+        if moved.ok { break; }
+    }
+    if moved == nil or not moved.ok {
+        DIRFS.close(root); throw "source cannot be quarantined with atomic no-replace semantics";
+    }
+    let loaded = DIRFS.read_bytes(root, object_path, max_bytes);
+    if not loaded.ok {
+        let rollback = _rollback(root, object_path, path); DIRFS.close(root);
+        if rollback.ok { throw "source is not a bounded regular file; quarantine was rolled back"; }
+        throw "source validation failed after quarantine and automatic rollback failed; manual recovery is required at " + object_path;
+    }
+    let protected = DIRFS.protect_file(root, object_path);
+    let private_mode_verified = protected.ok and
+        (try root.quarantine_private_mode_verified catch false);
+    let digest = SHA256.sha256_hex_bytes(loaded.bytes);
+    let record = map{
+        format: "pb_mcp.quarantine.record.v1", id: id,
+        original_path: path, object_path: object_path,
+        sha256: digest, size: len(loaded.bytes), quarantined_ms: num_floor(now_ms()),
+        state: "quarantined", move_atomic: true, destination_no_replace: true
+    };
+    let record_bytes = str_to_bytes(json_stringify(record));
+    let published = DIRFS.write_new_atomic(root, _record_path(id), record_bytes, true);
+    let verified_record = published.ok
+        and (try _read_record(root, id).sha256 catch "") == digest;
+    if not verified_record {
+        if published.ok { DIRFS.remove_file(root, _record_path(id)); }
+        let rollback = _rollback(root, object_path, path); DIRFS.close(root);
+        if rollback.ok { throw "quarantine metadata could not be verified; quarantine was rolled back"; }
+        throw "metadata publication and rollback both failed; manual recovery is required at " + object_path;
+    }
+    DIRFS.close(root);
+    return map{
+        format: "pb_mcp.protect_quarantine.v2", ok: true, quarantined: true,
+        id: id, original_path: path, quarantine_path: object_path,
+        sha256: digest, size: len(loaded.bytes), source_removed: true,
+        namespace_move_atomic: true, destination_no_replace: true,
+        descriptor_bound_parents: true,
+        permissions: if protected.ok { "0600" } else { "mount-controlled" },
+        private_root: if (try root.quarantine_private_mode_verified catch false) { "0700" } else { "mount-controlled" },
+        private_mode_verified: private_mode_verified,
+        confidentiality_boundary: if private_mode_verified { "unix-owner-only" } else { "filesystem-mount-policy" },
+        metadata_path: _record_path(id), metadata_verified: true,
+        metadata_atomic_visibility: true, metadata_no_replace: true,
+        content_hash_at_quarantine: true, content_immutable: false,
+        note: "open descriptors created before quarantine remain an operating-system boundary"
+    };
+}
+
+fn list(args) {
+    args = _strict(args, ["max_entries"]);
+    SEC.require_trusted("list quarantine", "PB_PROTECT_INSPECT_ENABLE");
+    let maximum = _integer(try args.max_entries catch nil, "max_entries", 1, 1000, 100);
+    let root = _open(false);
+    let listed = DIRFS.list(root, RECORDS, maximum + 1);
+    if not listed.ok { DIRFS.close(root); return map{ format: "pb_mcp.quarantine.list.v1", ok: true, entries: [], count: 0, truncated: false }; }
+    let entries = []; let errors = []; let limit = len(listed.entries);
+    if limit > maximum { limit = maximum; }
+    for i limit {
+        let name = listed.entries[i];
+        if regex_match(name, "^[0-9a-f]{40}\\.json$") {
+            let id = str_slice(name, 0, 40);
+            let record = try _read_record(root, id) catch nil;
+            if record == nil {
+                errors[len(errors)] = map{ id: id, error: "invalid record" };
+            } else {
+                let verified = _verify_object(root, record, if record.size > MAX_BYTES { MAX_BYTES } else { record.size });
+                entries[len(entries)] = map{
+                    id: id, original_path: record.original_path, size: record.size,
+                    sha256: record.sha256, quarantined_ms: record.quarantined_ms,
+                    integrity_ok: verified.ok
+                };
+            }
+        }
+    }
+    DIRFS.close(root);
+    return map{
+        format: "pb_mcp.quarantine.list.v1", ok: len(errors) == 0,
+        entries: entries, count: len(entries), errors: errors,
+        truncated: len(listed.entries) > maximum, max_entries: maximum
+    };
+}
+
+fn restore(args) {
+    args = _strict(args, ["id", "confirm"]);
+    SEC.require_trusted("restore quarantined file", "PB_PROTECT_WRITE_ENABLE");
+    let id = _id(try args.id catch nil);
+    if (try args.confirm catch false) != true { throw "confirm=true is required to restore a quarantined file"; }
+    let root = _open(false); let record = _read_record(root, id);
+    let verified = _verify_object(root, record, MAX_BYTES);
+    if not verified.ok { DIRFS.close(root); throw verified.error; }
+    let moved = DIRFS.move_new_exclusive(root, record.object_path, record.original_path, false);
+    if not moved.ok { DIRFS.close(root); throw "original path is occupied or cannot be restored without replacement"; }
+    let metadata_removed = DIRFS.remove_file(root, _record_path(id)).ok;
+    DIRFS.close(root);
+    return map{
+        format: "pb_mcp.quarantine.restore.v1", ok: metadata_removed,
+        restored: true, id: id, path: record.original_path,
+        sha256: record.sha256, size: record.size,
+        destination_no_replace: true, namespace_move_atomic: true,
+        metadata_removed: metadata_removed,
+        warning: if metadata_removed { nil } else { "stale quarantine metadata requires cleanup" }
+    };
+}
+
+fn delete_permanently(args) {
+    args = _strict(args, ["id", "confirmation"]);
+    SEC.require_trusted("delete quarantined file", "PB_PROTECT_DELETE_ENABLE");
+    let id = _id(try args.id catch nil);
+    if (try args.confirmation catch "") != "DELETE:" + id {
+        throw "confirmation must equal DELETE:<id>";
+    }
+    let root = _open(false); let record = _read_record(root, id);
+    let verified = _verify_object(root, record, MAX_BYTES);
+    if not verified.ok { DIRFS.close(root); throw verified.error; }
+    let object_removed = DIRFS.remove_file(root, record.object_path);
+    if not object_removed.ok { DIRFS.close(root); throw "quarantined object could not be removed"; }
+    let metadata_removed = DIRFS.remove_file(root, _record_path(id)).ok;
+    DIRFS.close(root);
+    return map{
+        format: "pb_mcp.quarantine.delete.v1", ok: metadata_removed,
+        deleted: true, id: id, sha256: record.sha256, size: record.size,
+        object_removed: true, metadata_removed: metadata_removed,
+        recoverable: false
+    };
+}
+
+fn implemented_tools() {
+    return ["protect_quarantine_file", "protect_quarantine_list",
+        "protect_quarantine_restore", "protect_quarantine_delete"];
+}
+
+fn catalog_entries() {
+    return [
+        map{ name: "protect_quarantine_list", category: "protect", profile: "local-power",
+            read_only: true, destructive: false, open_world: false,
+            source: "src/quarantine_tools.sapp",
+            description: "List bounded, integrity-checked private quarantine records." },
+        map{ name: "protect_quarantine_restore", category: "protect", profile: "local-power",
+            read_only: false, destructive: false, open_world: false,
+            source: "src/quarantine_tools.sapp",
+            description: "Restore a quarantined file atomically without replacing an occupied destination." },
+        map{ name: "protect_quarantine_delete", category: "protect", profile: "local-power",
+            read_only: false, destructive: true, open_world: false,
+            source: "src/quarantine_tools.sapp",
+            description: "Permanently delete one integrity-verified quarantined object with bound confirmation." }
+    ];
+}
+
+export quarantine_file, list, restore, delete_permanently,
+       implemented_tools, catalog_entries;

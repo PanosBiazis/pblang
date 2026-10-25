@@ -1,0 +1,318 @@
+// Parent-side asynchronous executor for statically linked PB-MCP worker shards.
+
+let JSON = import("stdlib:json.sapp");
+let PATH = import("stdlib:path.sapp");
+let PROCESS = import("stdlib:linux_process.sapp");
+let SECURE = import("stdlib:secure_file.sapp");
+let TOOL_IDENTITY = import("tool_identity.sapp");
+let LIMITS = import("http_worker_limits.sapp");
+
+let DEFAULT_INDEX = "release/PB-MCP-http-workers.json";
+let MAX_INDEX_BYTES = LIMITS.MAX_INDEX_BYTES;
+let MAX_WORKER_OUTPUT_BYTES = LIMITS.MAX_WORKER_OUTPUT_BYTES;
+
+fn _exact_keys(value, allowed) {
+    if type(value) != "map" or len(map_keys(value)) != len(allowed) { return false; }
+    for key in map_keys(value) {
+        let found = false;
+        for wanted in allowed { if key == wanted { found = true; } }
+        if not found { return false; }
+    }
+    return true;
+}
+
+fn _digest(value) { return sha256(base64_encode_bytes(value)); }
+fn _hex_digest(value) {
+    return type(value) == "string" and regex_match(value, "^[0-9a-f]{64}$");
+}
+
+fn _load_index(path, expected_digest) {
+    if not _hex_digest(expected_digest) or path != DEFAULT_INDEX {
+        throw "HTTP worker index trust anchor is invalid";
+    }
+    let loaded = SECURE.read_bytes(path, MAX_INDEX_BYTES);
+    if not loaded.ok or _digest(loaded.bytes) != expected_digest {
+        throw "HTTP worker index does not match the external trust anchor";
+    }
+    let index = try JSON.parse(bytes_to_str(loaded.bytes)) catch nil;
+    if not _exact_keys(index, ["format", "digest_encoding",
+        "direct_same_uid_invocation", "shards"]) or
+       (index.format != "pb_mcp.http-worker-index.v1" and
+        index.format != "pb_mcp.http-worker-index.v2") or
+       index.digest_encoding != "sha256(base64(bytes))" or
+       index.direct_same_uid_invocation !=
+           "outside-worker-boundary-parent-authentication-required" or
+       type(index.shards) != "array" or len(index.shards) < 1 or len(index.shards) > 64 {
+        throw "HTTP worker index schema is invalid";
+    }
+    let tools = map{}; let shards = map{};
+    for i len(index.shards) {
+        let shard = index.shards[i];
+        let allowed = ["shard_id", "permission", "owned_tools",
+            "generation_digest", "worker_fingerprint", "launcher",
+            "launcher_sha256", "launcher_bytes", "platform", "architecture",
+            "permission_contract", "embedded_runtime_sha256",
+            "embedded_core_sha256"];
+        if index.format == "pb_mcp.http-worker-index.v2" {
+            array_push(allowed, "embedded_runtime_offset");
+            array_push(allowed, "embedded_runtime_bytes");
+            array_push(allowed, "embedded_core_offset");
+            array_push(allowed, "embedded_core_bytes");
+        }
+        if not _exact_keys(shard, allowed) or
+           type(shard.shard_id) != "string" or
+           not regex_match(shard.shard_id, "^[a-z][a-z0-9_-]{2,63}$") or
+           map_has(shards, shard.shard_id) or
+           (shard.permission != "tools.read" and shard.permission != "tools.execute") or
+           type(shard.owned_tools) != "array" or len(shard.owned_tools) < 1 or
+           len(shard.owned_tools) > 256 or
+           not _hex_digest(shard.generation_digest) or
+           not _hex_digest(shard.worker_fingerprint) or
+           not _hex_digest(shard.launcher_sha256) or
+           not _hex_digest(shard.embedded_runtime_sha256) or
+           not _hex_digest(shard.embedded_core_sha256) or
+           type(shard.launcher_bytes) != "number" or
+           shard.launcher_bytes != num_floor(shard.launcher_bytes) or
+           shard.launcher_bytes < 4096 or
+           shard.launcher_bytes > LIMITS.MAX_LAUNCHER_BYTES or
+           type(shard.launcher) != "string" or
+           not regex_match(shard.launcher,
+               "^release/PB-MCP-http-worker-[A-Za-z0-9_.-]+$") or
+           shard.platform != "linux" or shard.architecture != "x86_64" or
+           (shard.permission_contract != "private-0700" and
+            shard.permission_contract != "public-code-0755-fixed-mount-mode") {
+            throw "HTTP worker shard metadata is invalid";
+        }
+        if index.format == "pb_mcp.http-worker-index.v2" {
+            let runtime_offset = try shard.embedded_runtime_offset catch -1;
+            let runtime_bytes = try shard.embedded_runtime_bytes catch -1;
+            let core_offset = try shard.embedded_core_offset catch -1;
+            let core_bytes = try shard.embedded_core_bytes catch -1;
+            if type(runtime_offset) != "number" or runtime_offset != num_floor(runtime_offset)
+               or runtime_offset < 0 or type(runtime_bytes) != "number"
+               or runtime_bytes != num_floor(runtime_bytes) or runtime_bytes < 4
+               or runtime_bytes > shard.launcher_bytes - runtime_offset
+               or type(core_offset) != "number" or core_offset != num_floor(core_offset)
+               or core_offset != runtime_offset + runtime_bytes
+               or type(core_bytes) != "number" or core_bytes != num_floor(core_bytes)
+               or core_bytes < 5 or core_offset > shard.launcher_bytes
+               or core_bytes != shard.launcher_bytes - core_offset {
+                throw "HTTP worker v2 payload geometry is invalid";
+            }
+        }
+        for j len(shard.owned_tools) {
+            let parsed = TOOL_IDENTITY.parse(shard.owned_tools[j]);
+            if not parsed.ok or map_has(tools, parsed.name) {
+                throw "HTTP worker tool ownership is invalid or duplicated";
+            }
+            tools[parsed.name] = shard.shard_id;
+        }
+        shards[shard.shard_id] = shard;
+    }
+    let process = PROCESS.status();
+    if not process.available or
+       (process.architecture != "x86_64" and process.architecture != "amd64") {
+        throw "HTTP worker release does not match this process platform";
+    }
+    return map{ index: index, tools: tools, shards: shards,
+        index_sha256: expected_digest };
+}
+
+fn _prepare_launchers(release) {
+    let prepared = [];
+    for shard_id in map_keys(release.shards) {
+        let shard = release.shards[shard_id];
+        let launcher_path = try PATH.absolute(shard.launcher) catch nil;
+        if type(launcher_path) != "string" or not str_starts_with(launcher_path, "/") {
+            for item in prepared { try PROCESS.close_prepared_verified(item) catch nil; }
+            throw "HTTP worker launcher path is unavailable";
+        }
+        let verified = try PROCESS.prepare_fixed_verified([launcher_path],
+            shard.launcher_sha256, shard.launcher_bytes) catch nil;
+        if type(verified) != "map" or not (try verified.ok catch false) {
+            for item in prepared { try PROCESS.close_prepared_verified(item) catch nil; }
+            throw "HTTP worker launcher failed startup digest verification";
+        }
+        shard.prepared_launcher = verified;
+        array_push(prepared, verified);
+    }
+    return prepared;
+}
+
+fn _call(req) {
+    let path = str_split(try req.path catch "", "?")[0];
+    if (try req.method catch "") != "POST" or (path != "/call" and path != "/mcp") {
+        return map{ eligible: false };
+    }
+    let body = try JSON.parse(try req.body catch "") catch nil;
+    if type(body) != "map" { return map{ eligible: false }; }
+    if path == "/call" {
+        let parsed = TOOL_IDENTITY.parse(try body.tool catch nil);
+        let args = try body.args catch map{};
+        if not parsed.ok or type(args) != "map" { return map{ eligible: false }; }
+        return map{ eligible: true, protocol: "call-v1", tool: parsed.name,
+            args: args, response_id: nil };
+    }
+    if (try body.jsonrpc catch nil) != "2.0" or
+       (try body.method catch nil) != "tools/call" or not map_has(body, "id") or
+       type(try body.params catch nil) != "map" {
+        return map{ eligible: false };
+    }
+    let parsed = TOOL_IDENTITY.parse(try body.params.name catch nil);
+    let args = try body.params.arguments catch map{};
+    if not parsed.ok or type(args) != "map" { return map{ eligible: false }; }
+    return map{ eligible: true, protocol: "mcp-jsonrpc-v1", tool: parsed.name,
+        args: args, response_id: body.id };
+}
+
+fn create(options) {
+    if type(options) != "map" or not is_fn(try options.fallback catch nil) or
+       not is_fn(try options.admit catch nil) or
+       not is_fn(try options.format_success catch nil) or
+       not is_fn(try options.format_failure catch nil) {
+        throw "HTTP executor requires fallback, admission and formatter callbacks";
+    }
+    let index = _load_index(try options.index_path catch DEFAULT_INDEX,
+        try options.index_sha256 catch "");
+    let identity_root = try options.identity_root catch nil;
+    if identity_root != nil and (type(identity_root) != "string" or
+       not str_starts_with(identity_root, "/") or len(identity_root) > 4096 or
+       str_contains(identity_root, strfromcharcode(0))) {
+        throw "HTTP executor identity authority path is invalid";
+    }
+    let prepared_launchers = _prepare_launchers(index);
+    let state = map{ release: index, identity_root: identity_root,
+        fallback: options.fallback, admit: options.admit,
+        format_success: options.format_success,
+        format_failure: options.format_failure };
+
+    let start = fn(req, deadline_ms) {
+        let call = _call(req);
+        if not call.eligible or not map_has(state.release.tools, try call.tool catch "") {
+            return map{ ok: true, job: map{ kind: "immediate",
+                output: state.fallback(req) } };
+        }
+        let context = try req._pb_mcp_context catch nil;
+        if type(context) == "map" { call.request_id = try context.request_id catch nil; }
+        let admission = try state.admit(call, context) catch nil;
+        if type(admission) != "map" or not (try admission.ok catch false) {
+            return map{ ok: true, job: map{ kind: "immediate",
+                output: state.format_failure(call, admission) } };
+        }
+        let shard = state.release.shards[state.release.tools[call.tool]];
+        if admission.permission != shard.permission or
+           type(deadline_ms) != "number" or deadline_ms != num_floor(deadline_ms) or
+           deadline_ms <= now_ms() or deadline_ms > now_ms() + 60000 {
+            return map{ ok: true, job: map{ kind: "immediate",
+                output: state.format_failure(call, map{ ok: false,
+                    error: "isolated execution policy refused the call" }) } };
+        }
+        let envelope = map{
+            format: "pb_mcp.http-worker.request.v2", deadline_ms: deadline_ms,
+            shard_id: shard.shard_id, generation_digest: shard.generation_digest,
+            worker_fingerprint: shard.worker_fingerprint,
+            context: context,
+            call: map{ format: "pb_mcp.worker-call.v1", tool_name: call.tool,
+                arguments: call.args, protocol_id: call.protocol,
+                request_id: context.request_id }
+        };
+        let environment = map{ PB_MCP_WORKER_FINGERPRINT: shard.worker_fingerprint };
+        if context.identity_mode == "legacy" { environment.PB_MCP_LEGACY_WORKER = "1"; }
+        elif context.identity_mode == "multi-user" and state.identity_root != nil {
+            environment.PB_MCP_IDENTITY_ROOT = state.identity_root;
+        }
+        let remaining = num_floor(deadline_ms - now_ms());
+        if remaining < 50 {
+            return map{ ok: true, job: map{ kind: "immediate",
+                output: state.format_failure(call, map{ ok: false,
+                    stage: "deadline-exhausted",
+                    error: "isolated execution deadline was exhausted" }) } };
+        }
+        let seconds = num_ceil(remaining / 1000); if seconds < 1 { seconds = 1; }
+        let launched = try PROCESS.start_prepared_verified(shard.prepared_launcher,
+            [], map{
+                timeout_secs: seconds, max_output_bytes: MAX_WORKER_OUTPUT_BYTES,
+                max_file_bytes: 67108864, max_memory_bytes: 536870912,
+                max_cpu_seconds: seconds, max_open_files: 64, max_processes: 2048,
+                startup_timeout_ms: if remaining < 5000 { remaining } else { 5000 },
+                max_executable_bytes: shard.launcher_bytes,
+                stdin_bytes: str_to_bytes(JSON.stringify(envelope) + "\n"),
+                environment: environment, inherit_environment: false
+            }) catch nil;
+        if type(launched) != "map" or not (try launched.ok catch false) {
+            let launch_stage = "launcher-refused";
+            if launched == nil { launch_stage = "launcher-exception"; }
+            return map{ ok: true, job: map{ kind: "immediate",
+                output: state.format_failure(call, map{ ok: false,
+                    stage: launch_stage,
+                    error: "isolated worker is unavailable" }) } };
+        }
+        return map{ ok: true, job: map{ kind: "worker", process: launched,
+            call: call, shard: shard } };
+    };
+
+    let poll = fn(job) {
+        if type(job) != "map" { return map{ ok: false }; }
+        if (try job.kind catch "") == "immediate" {
+            return map{ ok: true, complete: true, terminated: false };
+        }
+        if (try job.kind catch "") != "worker" { return map{ ok: false }; }
+        return PROCESS.poll(job.process);
+    };
+    let cancel = fn(job) {
+        if type(job) != "map" { return map{ ok: false }; }
+        if (try job.kind catch "") == "immediate" {
+            return map{ ok: true, requested: true, terminated: true };
+        }
+        return PROCESS.request_cancel(job.process, 100);
+    };
+    let finish = fn(job) {
+        if type(job) != "map" { return map{ ok: false }; }
+        if (try job.kind catch "") == "immediate" {
+            return map{ ok: true, output: job.output };
+        }
+        let result = PROCESS.finish(job.process, 0);
+        if not result.ok or not result.command_ok or not result.process_group_terminated or
+           not result.executable_digest_verified or result.output_truncated or
+           result.stderr != "" {
+            return map{ ok: true, output: state.format_failure(job.call,
+                map{ ok: false, error: "isolated worker failed closed",
+                    stage: "process-result-contract", result_ok: try result.ok catch false,
+                    command_ok: try result.command_ok catch false,
+                    terminated: try result.process_group_terminated catch false,
+                    digest_verified: try result.executable_digest_verified catch false,
+                    output_truncated: try result.output_truncated catch true,
+                    stderr_empty: (try result.stderr catch "unavailable") == "" }) };
+        }
+        let response = try JSON.parse(str_trim(result.stdout)) catch nil;
+        if not _exact_keys(response, ["format", "ok", "output"]) or
+           response.format != "pb_mcp.http-worker.response.v2" or not response.ok or
+           not _exact_keys(response.output, ["ok", "tool", "value", "shard_id",
+               "generation_digest", "iam_revision"]) or not response.output.ok or
+           response.output.tool != job.call.tool or
+           response.output.shard_id != job.shard.shard_id or
+           response.output.generation_digest != job.shard.generation_digest {
+            return map{ ok: true, output: state.format_failure(job.call,
+                map{ ok: false, error: "isolated worker response was refused" }) };
+        }
+        return map{ ok: true, output: state.format_success(job.call, response.output) };
+    };
+    let close = fn() {
+        let all_closed = true;
+        for prepared in prepared_launchers {
+            let closed = try PROCESS.close_prepared_verified(prepared) catch nil;
+            if type(closed) != "map" or not (try closed.ok catch false) {
+                all_closed = false;
+            }
+        }
+        return map{ ok: all_closed, closed: all_closed,
+            prepared_launchers: len(prepared_launchers) };
+    };
+    return map{ start: start, poll: poll, cancel: cancel, finish: finish, close: close,
+        format: "pb_mcp.http-executor.v1", partial_isolation: true,
+        launcher_verification: "startup-held-descriptor",
+        isolated_tools: len(map_keys(index.tools)), shard_count: len(index.index.shards),
+        index_sha256: index.index_sha256 };
+}
+
+export create;

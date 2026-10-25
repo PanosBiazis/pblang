@@ -1,0 +1,262 @@
+// Private organization-scoped storage for stateful PB-MCP resources.
+
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+
+let FORMAT = "pb_mcp.organization-resource-context.v1";
+let MAX_FILE_BYTES = 1048576;
+
+fn _organization_id(value) {
+    if type(value) != "string" or not regex_match(value, "^[a-z][a-z0-9_-]{2,63}$") {
+        throw "organization resource scope must be a canonical organization id";
+    }
+    return value;
+}
+
+fn _storage_root(storage) {
+    if type(storage) != "map" or (try storage.format catch "") != "pb_mcp.identity-store.v1" or
+       type(try storage.root catch nil) != "string" or not str_starts_with(storage.root, "/") or
+       len(storage.root) > 4096 or str_contains(storage.root, strfromcharcode(0)) {
+        throw "organization resources require the verified private identity store";
+    }
+    return storage.root;
+}
+
+fn _namespace(organization_id) {
+    return "org-" + str_slice(sha256("pb-mcp-resource-v1\n" + organization_id), 0, 40);
+}
+
+fn _resource_path(value) {
+    if type(value) != "string" or len(value) < 1 or len(value) > 512 or
+       str_starts_with(value, "/") or str_contains(value, strfromcharcode(0)) {
+        throw "organization resource path must be a bounded relative path";
+    }
+    let parts = str_split(value, "/");
+    for i len(parts) {
+        if parts[i] == "" or parts[i] == "." or parts[i] == ".." or len(parts[i]) > 128 or
+           not regex_match(parts[i], "^[A-Za-z0-9._-]+$") {
+            throw "organization resource path contains an unsafe component";
+        }
+    }
+    return value;
+}
+
+fn _byte_bound(value) {
+    if value == nil { return MAX_FILE_BYTES; }
+    if type(value) != "number" or num_floor(value) != value or value < 1 or value > MAX_FILE_BYTES {
+        throw "organization resource byte bound must be an integer in 1..1048576";
+    }
+    return value;
+}
+
+fn _entry_exists(root, path) {
+    let parent = path_dirname(path); let name = path_basename(path);
+    if parent == "." { parent = "root"; }
+    let listed = DIRFS.list(root, parent, 4096);
+    if not listed.ok or listed.truncated { throw "organization resource parent cannot prove entry absence"; }
+    for i len(listed.entries) { if listed.entries[i] == name { return true; } }
+    return false;
+}
+
+fn context(storage, organization_id) {
+    organization_id = _organization_id(organization_id);
+    let storage_root = _storage_root(storage);
+    let root = storage_root + "/resources/" + _namespace(organization_id);
+    if platform() != "linux" { throw "organization resources require the Linux directory-handle backend"; }
+    let held = DIRFS.open_absolute(storage_root, false, false);
+    if not held.ok {
+        throw "private identity resource root cannot be verified";
+    }
+    if not DIRFS.close(held) { throw "private identity resource root could not be closed safely"; }
+    return map{
+        format: FORMAT, root: root, storage_root: storage_root, organization_id: organization_id,
+        namespace: _namespace(organization_id), verified: true,
+        descriptor_required: true, client_selectable: false
+    };
+}
+
+fn validate(value) {
+    if type(value) != "map" or (try value.format catch "") != FORMAT or
+       not (try value.verified catch false) or
+       (try value.client_selectable catch true) {
+        throw "invalid organization resource context";
+    }
+    let organization_id = _organization_id(try value.organization_id catch nil);
+    if type(try value.namespace catch nil) != "string" or value.namespace != _namespace(organization_id) or
+       type(try value.storage_root catch nil) != "string" or not str_starts_with(value.storage_root, "/") or
+       type(try value.root catch nil) != "string" or not str_starts_with(value.root, "/") or
+       value.root != value.storage_root + "/resources/" + value.namespace or
+       not str_ends_with(value.root, "/resources/" + value.namespace) or
+       len(value.root) > 4096 or len(value.storage_root) > 4096 or
+       str_contains(value.root, strfromcharcode(0)) or
+       str_contains(value.storage_root, strfromcharcode(0)) {
+        throw "organization resource context failed namespace validation";
+    }
+    return value;
+}
+
+fn open_context(value, create = false) {
+    let checked = validate(value);
+    if platform() != "linux" { throw "organization resources require the Linux directory-handle backend"; }
+    let held = DIRFS.open_absolute(checked.root, create, create);
+    if not held.ok { throw "private organization resource root is unavailable or unsafe"; }
+    return held;
+}
+
+fn display_path(value, path) {
+    validate(value);
+    return "organization-private:/" + _resource_path(path);
+}
+
+fn _root_absent(value) {
+    value = validate(value);
+    let storage = DIRFS.open_absolute(value.storage_root, false, false);
+    if not storage.ok { throw "private identity resource root is unavailable"; }
+    let top = DIRFS.list(storage, "root", 4096);
+    DIRFS.close(storage);
+    if not top.ok or top.truncated { throw "private identity root cannot prove resource absence"; }
+    let resources_present = false;
+    for i len(top.entries) { if top.entries[i] == "resources" { resources_present = true; } }
+    if not resources_present { return true; }
+    let resources = DIRFS.open_absolute(value.storage_root + "/resources", false, false);
+    if not resources.ok { throw "private resource namespace exists but is unsafe"; }
+    let organizations = DIRFS.list(resources, "root", 4096);
+    DIRFS.close(resources);
+    if not organizations.ok or organizations.truncated {
+        throw "private resource namespace cannot prove organization absence";
+    }
+    for i len(organizations.entries) {
+        if organizations.entries[i] == value.namespace { return false; }
+    }
+    return true;
+}
+
+fn snapshot(value, path, max_bytes = nil) {
+    validate(value);
+    path = _resource_path(path);
+    max_bytes = _byte_bound(max_bytes);
+    let root = try open_context(value, false) catch nil;
+    if root == nil {
+        if _root_absent(value) {
+            return map{ ok: true, exists: false, bytes: [], size_bytes: 0,
+                truncated: false, race_resistant: true, path: display_path(value, path) };
+        }
+        throw "organization resource root exists but cannot be opened safely";
+    }
+    let loaded = DIRFS.read_prefix_bytes(root, path, max_bytes);
+    if not loaded.ok {
+        let exists = try _entry_exists(root, path) catch nil;
+        DIRFS.close(root);
+        if exists == nil { throw "organization resource parent cannot prove file absence"; }
+        if exists { throw "organization resource exists but cannot be inspected safely"; }
+        return map{ ok: true, exists: false, bytes: [], size_bytes: 0,
+            truncated: false, race_resistant: true, path: display_path(value, path) };
+    }
+    if (try loaded.kind catch "") != "file" or bit_and(try loaded.mode catch 0, 511) != 384 or
+       not (try loaded.descriptor_bound_metadata catch false) {
+        DIRFS.close(root); throw "organization resource must be a descriptor-held mode-0600 regular file";
+    }
+    DIRFS.close(root);
+    return map{ ok: true, exists: true, bytes: loaded.bytes,
+        size_bytes: loaded.source_size,
+        truncated: try loaded.truncated catch false, race_resistant: true,
+        path: display_path(value, path) };
+}
+
+fn publish(value, path, bytes, max_bytes = nil) {
+    validate(value);
+    path = _resource_path(path);
+    max_bytes = _byte_bound(max_bytes);
+    if type(bytes) != "array" or len(bytes) > max_bytes {
+        throw "organization resource publication exceeds its byte bound";
+    }
+    let root = open_context(value, true);
+    let wrote = DIRFS.write_atomic(root, path, bytes, true);
+    if not wrote.ok { DIRFS.close(root); throw "organization resource atomic publication failed"; }
+    let protected = DIRFS.protect_file(root, path);
+    if not protected.ok { DIRFS.close(root); throw "organization resource permission verification failed"; }
+    if not DIRFS.close(root) { throw "organization resource cleanup failed"; }
+    return map{ ok: true, bytes: len(bytes), atomic: true, mode: "0600",
+        race_resistant: true, path: display_path(value, path) };
+}
+
+fn append_locked(value, path, lock_path, batch, max_bytes = nil) {
+    validate(value);
+    path = _resource_path(path); lock_path = _resource_path(lock_path);
+    max_bytes = _byte_bound(max_bytes);
+    if type(batch) != "array" or len(batch) < 1 or len(batch) > max_bytes {
+        throw "organization resource append batch violates its byte bound";
+    }
+    let root = open_context(value, true);
+    let lock = DIRFS.acquire_lock(root, lock_path, 2000, 10);
+    if not lock.ok { DIRFS.close(root); throw "organization resource remained busy"; }
+    let wrote = DIRFS.append_bytes_bounded(root, path, batch, max_bytes, true);
+    if not wrote.ok {
+        DIRFS.release_lock(root, lock); DIRFS.close(root);
+        throw "organization resource append publication failed or reached its byte bound";
+    }
+    if not DIRFS.release_lock(root, lock) { DIRFS.close(root); throw "organization resource lock cleanup failed"; }
+    if not DIRFS.close(root) { throw "organization resource descriptor cleanup failed"; }
+    return map{ ok: true, appended_bytes: len(batch), total_bytes: wrote.size,
+        atomic: false, single_append: true, lock_serialized: true, race_resistant: true,
+        path: display_path(value, path) };
+}
+
+fn append_journal(value, path, lock_path, batch, max_bytes = nil) {
+    validate(value); path = _resource_path(path); lock_path = _resource_path(lock_path);
+    max_bytes = _byte_bound(max_bytes);
+    if type(batch) != "array" or len(batch) < 1 or len(batch) > max_bytes {
+        throw "organization journal batch violates its byte bound";
+    }
+    let root = open_context(value, true);
+    let lock = DIRFS.acquire_lock(root, lock_path, 2000, 10);
+    if not lock.ok { DIRFS.close(root); throw "organization journal remained busy"; }
+    let existing = DIRFS.read_prefix_bytes(root, path, max_bytes);
+    let existing_bytes = []; let existing_size = 0;
+    if existing.ok {
+        if existing.truncated or bit_and(try existing.mode catch 0, 511) != 384 {
+            DIRFS.release_lock(root, lock); DIRFS.close(root);
+            throw "organization journal is oversized or not mode 0600";
+        }
+        existing_size = existing.source_size;
+        for i len(existing.bytes) { existing_bytes[len(existing_bytes)] = existing.bytes[i]; }
+    } else {
+        let exists = try _entry_exists(root, path) catch nil;
+        if exists == nil or exists {
+            DIRFS.release_lock(root, lock); DIRFS.close(root);
+            throw "organization journal target cannot be inspected safely";
+        }
+    }
+    let rotated = existing_size + len(batch) > max_bytes;
+    let publication = [];
+    if not rotated { for i len(existing_bytes) { publication[len(publication)] = existing_bytes[i]; } }
+    for i len(batch) { publication[len(publication)] = batch[i]; }
+    let wrote = DIRFS.write_atomic(root, path, publication, true);
+    if not wrote.ok {
+        DIRFS.release_lock(root, lock); DIRFS.close(root);
+        throw "organization journal publication failed";
+    }
+    let protected = DIRFS.protect_file(root, path);
+    if not protected.ok {
+        DIRFS.release_lock(root, lock); DIRFS.close(root);
+        throw "organization journal permission verification failed";
+    }
+    if not DIRFS.release_lock(root, lock) { DIRFS.close(root); throw "organization journal lock cleanup failed"; }
+    if not DIRFS.close(root) { throw "organization journal descriptor cleanup failed"; }
+    return map{ ok: true, appended_bytes: len(batch),
+        total_bytes: if rotated { len(batch) } else { wrote.size },
+        rotated: rotated, dropped_previous_bytes: if rotated { existing_size } else { 0 },
+        bounded_retention: true, atomic: true, lock_serialized: true, race_resistant: true,
+        path: display_path(value, path) };
+}
+
+fn remove(value, path) {
+    validate(value); path = _resource_path(path);
+    let root = open_context(value, false);
+    let removed = DIRFS.remove_file(root, path);
+    let closed = DIRFS.close(root);
+    if not removed.ok or not closed { throw "organization resource removal failed safely"; }
+    return map{ ok: true, removed: true, path: display_path(value, path) };
+}
+
+export context, validate, open_context, display_path, snapshot, publish, append_locked,
+       append_journal, remove;

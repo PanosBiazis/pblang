@@ -1,0 +1,293 @@
+// Privacy-minimized Linux socket inventory and explicit anomaly-policy checks.
+
+let SEC = import("security.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+
+fn _strict(args, allowed) {
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "network anomaly arguments must be an object"; }
+    let keys = map_keys(args);
+    for i len(keys) {
+        let found = false;
+        for j len(allowed) { if keys[i] == allowed[j] { found = true; break; } }
+        if not found { throw "unknown network anomaly argument: " + str(keys[i]); }
+    }
+    return args;
+}
+
+fn _integer(value, label, low, high, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value) or value < low or value > high {
+        throw label + " must be an integer between " + str(low) + " and " + str(high);
+    }
+    return value;
+}
+
+fn _boolean(value, label, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "bool" { throw label + " must be boolean"; }
+    return value;
+}
+
+fn _hex_digit(code) {
+    if code >= 48 and code <= 57 { return code - 48; }
+    if code >= 65 and code <= 70 { return code - 55; }
+    if code >= 97 and code <= 102 { return code - 87; }
+    return -1;
+}
+
+fn _hex(value) {
+    if type(value) != "string" or value == "" { return nil; }
+    let out = 0;
+    for i len(value) {
+        let digit = _hex_digit(strcharcodeat(value, i)); if digit < 0 { return nil; }
+        out = out * 16 + digit;
+    }
+    return out;
+}
+
+fn _hex_bytes(value) {
+    if type(value) != "string" or len(value) % 2 != 0 { return nil; }
+    let out = []; let i = 0;
+    while i < len(value) {
+        let byte = _hex(str_slice(value, i, i + 2)); if byte == nil { return nil; }
+        out[len(out)] = byte; i = i + 2;
+    }
+    return out;
+}
+
+fn _address_bytes(value, family) {
+    let raw = _hex_bytes(value); if raw == nil { return nil; }
+    if family == "ipv4" {
+        if len(raw) != 4 { return nil; }
+        return [raw[3], raw[2], raw[1], raw[0]];
+    }
+    if family != "ipv6" or len(raw) != 16 { return nil; }
+    let out = [];
+    let group = 0;
+    while group < 4 {
+        let start = group * 4;
+        out[len(out)] = raw[start + 3]; out[len(out)] = raw[start + 2];
+        out[len(out)] = raw[start + 1]; out[len(out)] = raw[start];
+        group = group + 1;
+    }
+    return out;
+}
+
+fn _all_zero(bytes) {
+    for i len(bytes) { if bytes[i] != 0 { return false; } }
+    return true;
+}
+
+fn address_scope(value, family) {
+    let bytes = _address_bytes(value, family); if bytes == nil { return "invalid"; }
+    if _all_zero(bytes) { return "wildcard"; }
+    if family == "ipv4" {
+        if bytes[0] == 127 { return "loopback"; }
+        if bytes[0] == 10 or (bytes[0] == 172 and bytes[1] >= 16 and bytes[1] <= 31)
+           or (bytes[0] == 192 and bytes[1] == 168) { return "private"; }
+        if bytes[0] == 169 and bytes[1] == 254 { return "link-local"; }
+        if bytes[0] >= 224 { return "special"; }
+        return "public";
+    }
+    let loopback = true;
+    for i 15 { if bytes[i] != 0 { loopback = false; } }
+    if loopback and bytes[15] == 1 { return "loopback"; }
+    if bit_and(bytes[0], 254) == 252 { return "private"; }
+    if bytes[0] == 254 and bit_and(bytes[1], 192) == 128 { return "link-local"; }
+    if bytes[0] == 255 { return "special"; }
+    return "public";
+}
+
+fn _ports(value, label) {
+    if value == nil { return map{}; }
+    if type(value) != "array" or len(value) > 1024 { throw label + " must contain at most 1024 ports"; }
+    let out = map{};
+    for i len(value) {
+        if type(value[i]) != "number" or value[i] != num_floor(value[i])
+           or value[i] < 1 or value[i] > 65535 { throw label + " contains an invalid port"; }
+        out[str(value[i])] = true;
+    }
+    return out;
+}
+
+fn _words(line) {
+    let raw = str_split(str_trim(str_replace_all(line, "\t", " ")), " "); let out = [];
+    for i len(raw) { if raw[i] != "" { out[len(out)] = raw[i]; } }
+    return out;
+}
+
+fn _endpoint(value, family) {
+    let split = str_split(value, ":");
+    if len(split) != 2 { return nil; }
+    let port = _hex(split[1]);
+    let scope = address_scope(split[0], family);
+    if port == nil or port < 0 or port > 65535 or scope == "invalid" { return nil; }
+    return map{ port: port, scope: scope };
+}
+
+fn _add(state, protocol, family, kind, severity, local, remote, reason) {
+    state.total = state.total + 1;
+    if len(state.findings) >= state.maximum { state.truncated = true; return; }
+    state.findings[len(state.findings)] = map{
+        protocol: protocol, family: family, kind: kind, severity: severity,
+        local_port: local.port, local_scope: local.scope,
+        remote_port: remote.port, remote_scope: remote.scope, reason: reason,
+        local_address_exposed: false, remote_address_exposed: false,
+        process_identity_exposed: false, heuristic: true,
+        malicious_connection_confirmed: false
+    };
+}
+
+fn parse_proc_table(text, protocol, family, options = nil) {
+    options = _strict(options, ["max_entries", "max_findings", "expected_listener_ports",
+        "denied_remote_ports", "flag_wildcard_listeners", "include_listeners"]);
+    if type(text) != "string" or len(text) > 4194304 { throw "proc socket table exceeds parser limit"; }
+    if protocol != "tcp" and protocol != "udp" { throw "protocol must be tcp or udp"; }
+    if family != "ipv4" and family != "ipv6" { throw "family must be ipv4 or ipv6"; }
+    let max_entries = _integer(try options.max_entries catch nil, "max_entries", 1, 100000, 10000);
+    let max_findings = _integer(try options.max_findings catch nil, "max_findings", 1, 1000, 100);
+    let expected = _ports(try options.expected_listener_ports catch nil, "expected_listener_ports");
+    let denied = _ports(try options.denied_remote_ports catch nil, "denied_remote_ports");
+    let flag_wildcard = _boolean(try options.flag_wildcard_listeners catch nil,
+        "flag_wildcard_listeners", true);
+    let include_listeners = _boolean(try options.include_listeners catch nil,
+        "include_listeners", true);
+    let state = map{ findings: [], total: 0, maximum: max_findings, truncated: false };
+    let listeners = []; let total = 0; let malformed = 0; let listener_count = 0;
+    let established = 0; let other = 0; let rows = str_split(text, "\n");
+    for i len(rows) {
+        let words = _words(rows[i]);
+        if len(words) == 0 or words[0] == "sl" { continue; }
+        if len(words) < 10 { malformed = malformed + 1; continue; }
+        let local = _endpoint(words[1], family); let remote = _endpoint(words[2], family);
+        let uid = try parse_number(words[7]) catch nil;
+        let inode = try parse_number(words[9]) catch nil;
+        if local == nil or remote == nil or uid == nil or inode == nil
+           or not regex_match(words[3], "^[0-9A-Fa-f]{2}$") {
+            malformed = malformed + 1; continue;
+        }
+        total = total + 1;
+        if total > max_entries { state.truncated = true; continue; }
+        let socket_state = str_upper(words[3]);
+        let listening = (protocol == "tcp" and socket_state == "0A")
+            or (protocol == "udp" and socket_state == "07" and remote.port == 0);
+        let connected = socket_state == "01";
+        if listening {
+            listener_count = listener_count + 1;
+            if include_listeners and len(listeners) < max_findings {
+                listeners[len(listeners)] = map{ protocol: protocol, family: family,
+                    local_port: local.port, local_scope: local.scope,
+                    address_exposed: false, process_identity_exposed: false };
+            }
+            if len(map_keys(expected)) > 0 and not map_has(expected, str(local.port)) {
+                _add(state, protocol, family, "listener-not-in-expected-policy", "medium",
+                    local, remote, "local port is absent from the caller-supplied expected listener policy");
+            } elif flag_wildcard and local.scope == "wildcard" {
+                _add(state, protocol, family, "wildcard-listener-review", "low",
+                    local, remote, "listener is bound to every address and requires exposure review");
+            }
+        } elif connected {
+            established = established + 1;
+            if remote.port > 0 and map_has(denied, str(remote.port)) {
+                _add(state, protocol, family, "remote-port-policy-denied", "high",
+                    local, remote, "remote port matches the caller-supplied deny policy");
+            }
+        } else { other = other + 1; }
+    }
+    return map{
+        format: "pb_mcp.proc-net-parse.v1", protocol: protocol, family: family,
+        socket_count: total, listener_count: listener_count,
+        established_count: established, other_state_count: other,
+        listeners: listeners, findings: state.findings, finding_count: state.total,
+        returned_findings: len(state.findings), malformed_rows: malformed,
+        entries_truncated: total > max_entries, findings_truncated: state.truncated,
+        parse_complete: malformed == 0 and total <= max_entries,
+        local_addresses_exposed: false, remote_addresses_exposed: false,
+        process_identities_exposed: false, heuristic_findings: true,
+        malicious_connections_confirmed: 0
+    };
+}
+
+fn inspect(args) {
+    args = _strict(args, ["max_entries", "max_findings", "max_file_bytes",
+        "expected_listener_ports", "denied_remote_ports", "flag_wildcard_listeners",
+        "include_listeners"]);
+    SEC.require_trusted("network anomaly inspection", "PB_PROTECT_INSPECT_ENABLE");
+    if platform() != "linux" { throw "network anomaly inspection currently requires Linux procfs"; }
+    let max_entries = _integer(try args.max_entries catch nil, "max_entries", 1, 100000, 10000);
+    let max_findings = _integer(try args.max_findings catch nil, "max_findings", 1, 1000, 100);
+    let max_file_bytes = _integer(try args.max_file_bytes catch nil,
+        "max_file_bytes", 1024, 4194304, 1048576);
+    // Validate policy before opening procfs.
+    _ports(try args.expected_listener_ports catch nil, "expected_listener_ports");
+    _ports(try args.denied_remote_ports catch nil, "denied_remote_ports");
+    _boolean(try args.flag_wildcard_listeners catch nil, "flag_wildcard_listeners", true);
+    _boolean(try args.include_listeners catch nil, "include_listeners", true);
+    let root = DIRFS.open_current_process_net();
+    if not root.ok { throw "procfs network table root cannot be held"; }
+    let listed = DIRFS.list(root, "root", 4096);
+    if not listed.ok or listed.truncated { DIRFS.close(root); throw "procfs network inventory is unavailable"; }
+    let available = map{}; for i len(listed.entries) { available[str(listed.entries[i])] = true; }
+    let specs = [map{ file: "tcp", protocol: "tcp", family: "ipv4" },
+        map{ file: "tcp6", protocol: "tcp", family: "ipv6" },
+        map{ file: "udp", protocol: "udp", family: "ipv4" },
+        map{ file: "udp6", protocol: "udp", family: "ipv6" }];
+    let tables = []; let findings = []; let listeners = []; let sockets = 0;
+    let listener_count = 0; let established = 0; let read_errors = 0; let finding_total = 0;
+    let truncated = false; let remaining_entries = max_entries; let remaining_findings = max_findings;
+    for i len(specs) {
+        if not map_has(available, specs[i].file) {
+            tables[len(tables)] = map{ source: specs[i].file, state: "absent", complete: true };
+            continue;
+        }
+        if remaining_entries < 1 { truncated = true; break; }
+        let loaded = DIRFS.read_stream_bytes(root, specs[i].file, max_file_bytes);
+        if not loaded.ok or loaded.truncated {
+            read_errors = read_errors + 1;
+            tables[len(tables)] = map{ source: specs[i].file, state: "refused-or-truncated", complete: false };
+            continue;
+        }
+        let text = try bytes_to_str(loaded.bytes) catch nil;
+        if text == nil { read_errors = read_errors + 1; continue; }
+        let parsed = parse_proc_table(text, specs[i].protocol, specs[i].family, map{
+            max_entries: remaining_entries, max_findings: if remaining_findings < 1 { 1 } else { remaining_findings },
+            expected_listener_ports: try args.expected_listener_ports catch [],
+            denied_remote_ports: try args.denied_remote_ports catch [],
+            flag_wildcard_listeners: try args.flag_wildcard_listeners catch true,
+            include_listeners: try args.include_listeners catch true
+        });
+        sockets = sockets + parsed.socket_count; listener_count = listener_count + parsed.listener_count;
+        established = established + parsed.established_count;
+        finding_total = finding_total + parsed.finding_count;
+        remaining_entries = remaining_entries - parsed.socket_count;
+        for f len(parsed.findings) {
+            if remaining_findings > 0 { findings[len(findings)] = parsed.findings[f]; remaining_findings = remaining_findings - 1; }
+            else { truncated = true; }
+        }
+        for l len(parsed.listeners) {
+            if len(listeners) < max_findings { listeners[len(listeners)] = parsed.listeners[l]; }
+            else { truncated = true; }
+        }
+        if not parsed.parse_complete or parsed.finding_count > len(parsed.findings) { truncated = true; }
+        tables[len(tables)] = map{ source: specs[i].file, state: "audited",
+            complete: parsed.parse_complete, socket_count: parsed.socket_count };
+    }
+    DIRFS.close(root);
+    let complete = read_errors == 0 and not truncated;
+    return map{
+        format: "pb_mcp.protect_network_anomaly.v2", ok: complete and len(findings) == 0,
+        complete: complete, platform: "linux", socket_count: sockets,
+        listener_count: listener_count, established_count: established,
+        listeners: listeners, findings: findings, finding_count: len(findings),
+        finding_total: finding_total,
+        findings_truncated: truncated, read_errors: read_errors, tables: tables,
+        local_addresses_exposed: false, remote_addresses_exposed: false,
+        process_identities_exposed: false, raw_tables_exposed: false,
+        heuristic_findings: true, malicious_connections_confirmed: 0,
+        race_resistant: true, symlinks_followed: false,
+        external_process_used: false, shell_used: false, bounded_reads: true
+    };
+}
+
+export address_scope, parse_proc_table, inspect;

@@ -1,0 +1,208 @@
+// Bounded, race-resistant integrity verification for the retained Rust reference.
+
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let PROCESS = import("stdlib:linux_process.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+let EXPECTED_FILE_COUNT = 58;
+let EXPECTED_AGGREGATE_SHA256 = "b5c9517dd61d1256351f35428fde79fdf61650ef04c6d4c6185b5994a4f6e653";
+let MAX_FILES = 128;
+let MAX_DEPTH = 16;
+let MAX_FILE_BYTES = 4194304;
+let MAX_TOTAL_BYTES = 16777216;
+
+fn _contains(values, wanted) {
+    for i len(values) { if values[i] == wanted { return true; } }
+    return false;
+}
+
+fn _excluded_artifact(path) {
+    return str_ends_with(path, "/.cargo-ok") or str_ends_with(path, "/Cargo.lock");
+}
+
+fn _scan(root, state) {
+    let pending = [map{ path: "vendor", depth: 0 }];
+    while len(pending) > 0 {
+        let cursor = pending[len(pending) - 1]; array_pop(pending);
+        state.phase = "list"; state.last_path = cursor.path;
+        if cursor.depth > MAX_DEPTH { throw "vendor tree exceeds depth limit"; }
+        let listed = DIRFS.list(root, cursor.path, MAX_FILES + 1);
+        if not listed.ok or listed.truncated { throw "vendor directory exceeds entry limit"; }
+        let entries = array_sort(listed.entries);
+        for i len(entries) {
+            let child = if cursor.path == "vendor" {
+                "vendor/" + entries[i]
+            } else { cursor.path + "/" + entries[i] };
+            state.phase = "metadata"; state.last_path = child;
+            let metadata = DIRFS.metadata(root, child);
+            if not metadata.ok { throw "vendor entry is unreadable or symbolic: " + child; }
+            if metadata.kind == "directory" {
+                if len(pending) >= MAX_FILES { throw "vendor directory work queue exceeds limit"; }
+                pending[len(pending)] = map{ path: child, depth: cursor.depth + 1 };
+            } elif metadata.kind == "file" {
+                if _excluded_artifact(child) { state.excluded_artifacts[len(state.excluded_artifacts)] = child; continue; }
+                if state.file_count >= MAX_FILES { throw "vendor tree exceeds file limit"; }
+                if metadata.size > MAX_FILE_BYTES or state.total_bytes + metadata.size > MAX_TOTAL_BYTES {
+                    throw "vendor tree exceeds byte limit";
+                }
+                state.phase = "read";
+                let loaded = DIRFS.read_bytes(root, child, MAX_FILE_BYTES);
+                if not loaded.ok or loaded.size != metadata.size { throw "vendor file snapshot failed: " + child; }
+                let relative = str_slice(child, len("vendor/"), len(child));
+                state.phase = "hash";
+                state.records[len(state.records)] = map{
+                    path: relative, bytes: loaded.size,
+                    sha256: SHA256.sha256_hex_bytes(loaded.bytes)
+                };
+                state.file_count = state.file_count + 1;
+                state.total_bytes = state.total_bytes + loaded.size;
+            } else { throw "vendor tree contains a non-file entry: " + child; }
+        }
+    }
+    state.phase = "scan-complete";
+    return true;
+}
+
+fn _aggregate(records) {
+    let rows = [];
+    for i len(records) { rows[len(rows)] = records[i].path + "\t" + records[i].sha256 + "\n"; }
+    rows = array_sort(rows);
+    let canonical = "";
+    for i len(rows) { canonical = canonical + rows[i]; }
+    // Each payload was already hashed with the pure-PBLang binary SHA-256.
+    // The aggregate hashes only bounded ASCII manifest rows; the VM builtin
+    // avoids a second expensive byte-array expansion for this metadata.
+    return sha256(canonical);
+}
+
+fn _tracked_paths(root) {
+    let handoff = DIRFS.child_descriptor(root);
+    if not handoff.ok { return map{ ok: false, paths: [], error: "repository descriptor unavailable" }; }
+    let result = PROCESS.run_fixed(["/usr/bin/git", "/bin/git"], ["ls-files", "--", "vendor"], map{
+        cwd_fd: handoff.fd, timeout_secs: 30, max_output_bytes: 131072,
+        max_memory_bytes: 268435456, inherit_environment: true
+    });
+    let closed = DIRFS.close_child_descriptor(root, handoff);
+    if not closed or not result.ok or not result.command_ok {
+        return map{ ok: false, paths: [], error: "git tracked-file inventory failed" };
+    }
+    let paths = [];
+    let lines = str_split(str_trim(result.stdout), "\n");
+    for i len(lines) { if str_starts_with(lines[i], "vendor/") { paths[len(paths)] = lines[i]; } }
+    return map{ ok: true, paths: paths };
+}
+
+fn dependency_policy(root_path) {
+    if platform() != "linux" { return map{
+        ok: false, format: "pb_mcp.rust-dependency-policy.v1",
+        platform_supported: false, vendor_required: false,
+        clean_checkout_dependency_ready: false,
+        error: "Linux descriptor backend required"
+    }; }
+    let root = if str_starts_with(root_path, "/") {
+        DIRFS.open_absolute(root_path, false, false)
+    } else { DIRFS.open(root_path, false, false) };
+    if not root.ok { return map{
+        ok: false, format: "pb_mcp.rust-dependency-policy.v1",
+        platform_supported: true, vendor_required: false,
+        clean_checkout_dependency_ready: false,
+        error: "Rust reference root cannot be held"
+    }; }
+    let loaded = DIRFS.read_bytes(root, "Cargo.toml", 1048576);
+    DIRFS.close(root);
+    if not loaded.ok { return map{
+        ok: false, format: "pb_mcp.rust-dependency-policy.v1",
+        platform_supported: true, vendor_required: false,
+        clean_checkout_dependency_ready: false,
+        error: "Cargo.toml cannot be read within its bound"
+    }; }
+    let text = bytes_to_str(loaded.bytes);
+    let lines = str_split(text, "\n");
+    let patch_sections = []; let vendor_references = [];
+    for i len(lines) {
+        let line = str_trim(lines[i]);
+        if line == "" or str_starts_with(line, "#") { continue; }
+        if str_starts_with(line, "[patch.") {
+            patch_sections[len(patch_sections)] = line;
+        }
+        if str_contains(line, "vendor/") {
+            vendor_references[len(vendor_references)] = map{ line: i + 1, text: line };
+        }
+    }
+    let vendor_required = len(patch_sections) > 0 or len(vendor_references) > 0;
+    return map{
+        ok: true, format: "pb_mcp.rust-dependency-policy.v1",
+        platform_supported: true, bounded_manifest_read: true,
+        descriptor_confined: true, manifest_bytes: loaded.size,
+        patch_sections: patch_sections, vendor_references: vendor_references,
+        vendor_required: vendor_required,
+        clean_checkout_dependency_ready: not vendor_required
+    };
+}
+
+fn verify(root_path) {
+    if platform() != "linux" { return map{ ok: false, format: "pb_mcp.rust-vendor-integrity.v1",
+        platform_supported: false, clean_checkout_ready: false, error: "Linux descriptor backend required" }; }
+    let root = if str_starts_with(root_path, "/") {
+        DIRFS.open_absolute(root_path, false, false)
+    } else { DIRFS.open(root_path, false, false) };
+    if not root.ok { return map{ ok: false, format: "pb_mcp.rust-vendor-integrity.v1",
+        platform_supported: true, clean_checkout_ready: false, error: "Rust reference root cannot be held" }; }
+
+    let state = map{ records: [], excluded_artifacts: [], file_count: 0, total_bytes: 0,
+        phase: "start", last_path: "" };
+    let scan_error = nil;
+    _scan(root, state);
+    state.phase = "aggregate";
+    let aggregate = if scan_error == nil { try _aggregate(state.records) catch "" } else { "" };
+    let content_ok = scan_error == nil and state.file_count == EXPECTED_FILE_COUNT
+        and aggregate == EXPECTED_AGGREGATE_SHA256;
+    let tracked = _tracked_paths(root);
+    let missing_tracked = [];
+    if tracked.ok {
+        for i len(state.records) {
+            let wanted = "vendor/" + state.records[i].path;
+            if not _contains(tracked.paths, wanted) { missing_tracked[len(missing_tracked)] = wanted; }
+        }
+    }
+    let result = map{
+        ok: content_ok and tracked.ok and len(missing_tracked) == 0,
+        format: "pb_mcp.rust-vendor-integrity.v1",
+        platform_supported: true,
+        root: root_path,
+        bounded_scan: true,
+        descriptor_confined: true,
+        symlink_following: false,
+        file_count: state.file_count,
+        expected_file_count: EXPECTED_FILE_COUNT,
+        total_bytes: state.total_bytes,
+        diagnostic_phase: state.phase,
+        diagnostic_path: state.last_path,
+        aggregate_sha256: aggregate,
+        expected_aggregate_sha256: EXPECTED_AGGREGATE_SHA256,
+        content_integrity_ready: content_ok,
+        tracked_inventory_available: tracked.ok,
+        tracked_vendor_files: if tracked.ok { len(tracked.paths) } else { 0 },
+        missing_tracked_files: missing_tracked,
+        excluded_local_artifacts: state.excluded_artifacts,
+        clean_checkout_ready: content_ok and tracked.ok and len(missing_tracked) == 0,
+        upstream_archives: [
+            map{ crate: "eframe", version: "0.35.0", sha256: "8dc8234e2f681b2afd2b2e8c332fa614de2fddbdcb28d0acf5c420449682ea90",
+                allowed_modified_files: ["Cargo.toml"] },
+            map{ crate: "libp2p", version: "0.56.0", sha256: "ce71348bf5838e46449ae240631117b487073d5f347c06d434caddcb91dceb5a",
+                allowed_modified_files: ["Cargo.toml"] }
+        ]
+    };
+    if scan_error != nil { result.error = scan_error; }
+    elif not content_ok { result.error = "vendored source digest or file count changed"; }
+    elif not tracked.ok { result.error = tracked.error; }
+    elif len(missing_tracked) > 0 { result.error = "vendored source exists but is not present in the Git index"; }
+    DIRFS.close(root);
+    return result;
+}
+
+fn default_root() {
+    return path_join(path_dirname(path_dirname(cwd())), "library/tools/rust/pb-mcp-server");
+}
+
+export verify, dependency_policy, default_root;

@@ -1,0 +1,511 @@
+// Unified bounded, descriptor-confined file discovery and text search.
+
+let SEC = import("security.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+
+let MAX_FILES = 2000;
+let MAX_FILE_BYTES = 1048576;
+let MAX_TOTAL_BYTES = 16777216;
+let MAX_MATCHES = 400;
+let MAX_OUTPUT_CHARS = 200000;
+
+fn _strict(args, allowed) {
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "search arguments must be an object"; }
+    let keys = map_keys(args);
+    for i len(keys) {
+        let found = false;
+        for j len(allowed) { if keys[i] == allowed[j] { found = true; break; } }
+        if not found { throw "unknown search argument: " + str(keys[i]); }
+    }
+    return args;
+}
+
+fn _integer(value, label, low, high, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value) or value < low or value > high {
+        throw label + " must be an integer between " + str(low) + " and " + str(high);
+    }
+    return value;
+}
+
+fn _boolean(value, label, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "bool" { throw label + " must be boolean"; }
+    return value;
+}
+
+fn _root(args) {
+    if map_has(args, "path") and map_has(args, "dir") { throw "path and dir are mutually exclusive"; }
+    return SEC.safe_rel_path(try args.path catch try args.dir catch ".", ".");
+}
+
+fn _private_name(name) {
+    let n = str_lower(str(name));
+    return n == "." or n == ".." or n == ".git" or n == ".svn" or n == ".hg"
+    or n == ".pb-mcp-private" or n == ".mint-mcp" or n == ".ssh" or n == ".gnupg"
+    or n == ".env" or str_starts_with(n, ".env.") or str_contains(n, "credential")
+    or str_contains(n, "password") or str_contains(n, "secret") or n == "token.json"
+    or str_starts_with(n, "id_ed25519") or str_starts_with(n, "id_rsa")
+    or str_ends_with(n, ".pem") or str_ends_with(n, ".p12")
+    or str_ends_with(n, ".pfx") or str_ends_with(n, ".key");
+}
+
+fn _generated_name(name) {
+    let n = str_lower(str(name));
+    return n == "target" or n == "node_modules" or n == "__pycache__"
+    or n == ".venv" or n == "venv" or n == "vendor" or n == ".gradle"
+    or n == "build" or n == "dist" or n == "cache" or n == "graphify-out";
+}
+
+fn _join(parent, name) {
+    if parent == "." or parent == "root" { return str(name); }
+    return parent + "/" + str(name);
+}
+
+fn _inventory(path, max_entries, max_depth, respect_ignores, one_directory = false) {
+    if platform() != "linux" { throw "descriptor-confined search currently requires Linux"; }
+    let fs = DIRFS.open(".", false, false);
+    if not fs.ok { throw "project root cannot be held"; }
+    let files = []; let entries_out = []; let errors = [];
+    let truncated = false; let visited = 0;
+    let root_info = if path == "." { map{ ok: true, kind: "directory" } }
+    else { DIRFS.metadata(fs, path) };
+    if not root_info.ok { DIRFS.close(fs); throw "search path is unavailable or unsafe"; }
+    if root_info.kind == "file" {
+        files[0] = path; entries_out[0] = map{ path: path, kind: "file" };
+    } elif root_info.kind == "directory" {
+        let queue = [map{ path: path, depth: 0 }]; let q = 0;
+        while q < len(queue) and visited < max_entries {
+            let current = queue[q]; q = q + 1;
+            let remaining = max_entries - visited;
+            let listed = DIRFS.list(fs, if current.path == "." { "root" } else { current.path }, remaining + 1);
+            if not listed.ok {
+                if len(errors) < 50 { errors[len(errors)] = map{ path: current.path, error: "directory cannot be listed safely" }; }
+                continue;
+            }
+            if listed.truncated or len(listed.entries) > remaining { truncated = true; }
+            for i len(listed.entries) {
+                if visited >= max_entries { truncated = true; break; }
+                let name = str(listed.entries[i]);
+                if _private_name(name) or (respect_ignores and _generated_name(name)) { continue; }
+                let child = _join(current.path, name);
+                let info = DIRFS.metadata(fs, child);
+                if not info.ok {
+                    if len(errors) < 50 { errors[len(errors)] = map{ path: child, error: "entry metadata is unavailable or unsafe" }; }
+                    continue;
+                }
+                visited = visited + 1;
+                entries_out[len(entries_out)] = map{ path: child, kind: info.kind };
+                if info.kind == "file" { files[len(files)] = child; }
+                elif info.kind == "directory" and not one_directory and current.depth < max_depth {
+                    queue[len(queue)] = map{ path: child, depth: current.depth + 1 };
+                }
+            }
+        }
+        if q < len(queue) { truncated = true; }
+    } else {
+        DIRFS.close(fs); throw "search path must be a regular file or directory";
+    }
+    DIRFS.close(fs);
+    files = array_sort(files);
+    let paths = [];
+    for i len(entries_out) { paths[len(paths)] = entries_out[i].path; }
+    paths = array_sort(paths);
+    return map{ files: files, paths: paths, visited_entries: visited,
+        truncated: truncated, errors: errors, error_count: len(errors),
+        complete: not truncated and len(errors) == 0, ignore_policy: if respect_ignores {
+            "private/VCS/secret and common generated paths"
+        } else { "private/VCS/secret paths only" }, descriptor_confined: true };
+}
+
+fn _read(fs, path, max_bytes) {
+    let loaded = DIRFS.read_prefix_bytes(fs, path, max_bytes);
+    if not loaded.ok { return map{ ok: false, error: "file cannot be read safely" }; }
+    let has_nul = false;
+    for i len(loaded.bytes) { if loaded.bytes[i] == 0 { has_nul = true; break; } }
+    if has_nul { return map{ ok: false, binary: true, error: "binary file skipped" }; }
+    let text = try bytes_to_str(loaded.bytes) catch nil;
+    if text == nil { return map{ ok: false, binary: true, error: "non-UTF-8 file skipped" }; }
+    return map{ ok: true, text: text, bytes: len(loaded.bytes), truncated: loaded.truncated,
+        source_size: loaded.source_size };
+}
+
+fn _matcher(pattern, literal, case_sensitive) {
+    if type(pattern) != "string" or len(pattern) < 1 or len(pattern) > 4096 { throw "pattern must contain 1 to 4096 characters"; }
+    if literal { return map{ pattern: pattern, literal: true, case_sensitive: case_sensitive }; }
+    let expression = if case_sensitive { pattern } else { "(?i)" + pattern };
+    let valid = try { regex_match("", expression); true } catch false;
+    if not valid { throw "pattern is not a valid regular expression"; }
+    return map{ pattern: expression, literal: false, case_sensitive: case_sensitive };
+}
+
+fn _matches(line, matcher) {
+    if not matcher.literal { return regex_match(line, matcher.pattern); }
+    if matcher.case_sensitive { return str_contains(line, matcher.pattern); }
+    return str_contains(str_lower(line), str_lower(matcher.pattern));
+}
+
+fn _clip_line(line) {
+    if len(line) <= 4096 { return map{ text: line, truncated: false }; }
+    return map{ text: str_slice(line, 0, 4096), truncated: true };
+}
+
+fn _common_scan_args(args, extra) {
+    let allowed = ["path", "dir", "max_entries", "max_depth",
+        "respect_gitignore", "detailed"];
+    for i len(extra) { allowed[len(allowed)] = extra[i]; }
+    args = _strict(args, allowed);
+    return map{ args: args, path: _root(args),
+        max_entries: _integer(try args.max_entries catch nil, "max_entries", 1, MAX_FILES, 1000),
+        max_depth: _integer(try args.max_depth catch nil, "max_depth", 0, 12, 6),
+        max_file_bytes: _integer(try args.max_file_bytes catch nil, "max_file_bytes", 1, MAX_FILE_BYTES, 200000),
+        max_total_bytes: _integer(try args.max_total_bytes catch nil, "max_total_bytes", 1, MAX_TOTAL_BYTES, 8388608),
+        respect_ignores: _boolean(try args.respect_gitignore catch nil, "respect_gitignore", true),
+        detailed: _boolean(try args.detailed catch nil, "detailed", false) };
+}
+
+fn list_files(args) {
+    args = _strict(args, ["path", "dir", "max_entries", "respect_gitignore", "detailed"]);
+    let options = map{ path: _root(args),
+        max_entries: _integer(try args.max_entries catch nil, "max_entries", 1, MAX_FILES, 500),
+        respect_ignores: _boolean(try args.respect_gitignore catch nil, "respect_gitignore", true),
+        detailed: _boolean(try args.detailed catch nil, "detailed", false) };
+    let inv = _inventory(options.path, options.max_entries, 0, options.respect_ignores, true);
+    if not options.detailed { return inv.paths; }
+    return map{ format: "pb_mcp.list-files.v2", path: options.path, entries: inv.paths,
+        returned: len(inv.paths), complete: inv.complete, truncated: inv.truncated,
+        errors: inv.errors, descriptor_confined: true, ignore_policy: inv.ignore_policy };
+}
+
+fn _wildcard_match(pattern, text) {
+    if pattern == "*" or pattern == "**" or pattern == "**/*" { return true; }
+    if str_starts_with(pattern, "**/") and _wildcard_match(str_slice(pattern, 3, len(pattern)), text) { return true; }
+    if not str_contains(pattern, "*") { return pattern == text; }
+    let parts = str_split(pattern, "*"); let position = 0;
+    for i len(parts) {
+        if parts[i] == "" { continue; }
+        let at = str_index_of(str_slice(text, position, len(text)), parts[i]);
+        if at < 0 { return false; }
+        position = position + at + len(parts[i]);
+    }
+    if not str_starts_with(pattern, "*") and not str_starts_with(text, parts[0]) { return false; }
+    if not str_ends_with(pattern, "*") and not str_ends_with(text, parts[len(parts) - 1]) { return false; }
+    return true;
+}
+
+fn find_files(args) {
+    let options = _common_scan_args(args, ["glob", "pattern", "max_files", "max_results"]);
+    if map_has(args, "glob") and map_has(args, "pattern") { throw "glob and pattern are mutually exclusive"; }
+    if map_has(args, "max_files") and map_has(args, "max_results") { throw "max_files and max_results are mutually exclusive"; }
+    let glob = try args.glob catch try args.pattern catch "*";
+    if type(glob) != "string" or len(glob) < 1 or len(glob) > 4096 { throw "glob must contain 1 to 4096 characters"; }
+    let limit = _integer(try args.max_files catch try args.max_results catch nil,
+    "max_files", 1, 600, 500);
+    let inv = _inventory(options.path, options.max_entries, options.max_depth, options.respect_ignores);
+    let out = []; let matched_total = 0;
+    for i len(inv.files) {
+        let relative = inv.files[i];
+        if options.path != "." and str_starts_with(relative, options.path + "/") {
+            relative = str_slice(relative, len(options.path) + 1, len(relative));
+        }
+        if _wildcard_match(glob, relative) {
+            matched_total = matched_total + 1;
+            if len(out) < limit { out[len(out)] = inv.files[i]; }
+        }
+    }
+    let truncated = inv.truncated or matched_total > len(out);
+    if not options.detailed { return out; }
+    return map{ format: "pb_mcp.find-files.v2", path: options.path, glob: glob,
+        files: out, returned: len(out), matched_total: matched_total,
+        complete: inv.complete and not truncated, truncated: truncated,
+        scanned_files: len(inv.files), errors: inv.errors,
+        descriptor_confined: true, ignore_policy: inv.ignore_policy };
+}
+
+fn find_files_by_name(args) {
+    let options = _common_scan_args(args, ["substring", "query", "name", "case_insensitive",
+    "max_files", "max_results"]);
+    if map_has(args, "max_files") and map_has(args, "max_results") {
+        throw "max_files and max_results are mutually exclusive";
+    }
+    let aliases = 0;
+    if map_has(args, "substring") { aliases = aliases + 1; }
+    if map_has(args, "query") { aliases = aliases + 1; }
+    if map_has(args, "name") { aliases = aliases + 1; }
+    if aliases > 1 { throw "substring, query, and name are mutually exclusive"; }
+    let needle = str_trim(str(try args.substring catch try args.query catch try args.name catch ""));
+    if len(needle) < 1 or len(needle) > 4096 { throw "substring must contain 1 to 4096 characters"; }
+    let insensitive = _boolean(try args.case_insensitive catch nil, "case_insensitive", false);
+    let limit = _integer(try args.max_files catch try args.max_results catch nil,
+    "max_files", 1, 600, 500);
+    let inv = _inventory(options.path, options.max_entries, options.max_depth, options.respect_ignores);
+    let out = []; let matched_total = 0;
+    for i len(inv.files) {
+        let haystack = if insensitive { str_lower(inv.files[i]) } else { inv.files[i] };
+        let wanted = if insensitive { str_lower(needle) } else { needle };
+        if str_contains(haystack, wanted) {
+            matched_total = matched_total + 1;
+            if len(out) < limit { out[len(out)] = inv.files[i]; }
+        }
+    }
+    let truncated = inv.truncated or matched_total > len(out);
+    if not options.detailed { return out; }
+    return map{ format: "pb_mcp.find-files-by-name.v2", path: options.path,
+        substring: needle, case_insensitive: insensitive, files: out,
+        returned: len(out), matched_total: matched_total,
+        complete: inv.complete and not truncated, truncated: truncated,
+        scanned_files: len(inv.files), errors: inv.errors,
+        descriptor_confined: true, ignore_policy: inv.ignore_policy };
+}
+
+fn grep_code(args) {
+    let options = _common_scan_args(args, ["pattern", "literal", "case_sensitive",
+        "max_matches", "max_file_bytes", "max_total_bytes"]);
+    let matcher = _matcher(try args.pattern catch nil,
+    _boolean(try args.literal catch nil, "literal", false),
+    _boolean(try args.case_sensitive catch nil, "case_sensitive", true));
+    let limit = _integer(try args.max_matches catch nil, "max_matches", 1, MAX_MATCHES, 200);
+    let inv = _inventory(options.path, options.max_entries, options.max_depth, options.respect_ignores);
+    let fs = DIRFS.open(".", false, false);
+    if not fs.ok { throw "project root cannot be held"; }
+    let matches = []; let scanned_files = 0; let scanned_bytes = 0; let skipped = 0;
+    let output_chars = 0; let truncated = inv.truncated;
+    let i = 0;
+    while i < len(inv.files) and len(matches) < limit and scanned_bytes < options.max_total_bytes {
+        let remaining = options.max_total_bytes - scanned_bytes;
+        let cap = options.max_file_bytes; if cap > remaining { cap = remaining; }
+        if cap < 1 { truncated = true; break; }
+        let loaded = _read(fs, inv.files[i], cap);
+        if not loaded.ok { skipped = skipped + 1; i = i + 1; continue; }
+        scanned_files = scanned_files + 1; scanned_bytes = scanned_bytes + loaded.bytes;
+        if loaded.truncated { truncated = true; }
+        let lines = str_split(loaded.text, "\n");
+        let j = 0;
+        while j < len(lines) and len(matches) < limit and output_chars < MAX_OUTPUT_CHARS {
+            if _matches(lines[j], matcher) {
+                let clipped = _clip_line(lines[j]);
+                matches[len(matches)] = map{ path: inv.files[i], line: j + 1,
+                    text: clipped.text, line_truncated: clipped.truncated };
+                output_chars = output_chars + len(inv.files[i]) + len(clipped.text) + 32;
+                if clipped.truncated { truncated = true; }
+            }
+            j = j + 1;
+        }
+        if j < len(lines) or output_chars >= MAX_OUTPUT_CHARS { truncated = true; }
+        i = i + 1;
+    }
+    DIRFS.close(fs);
+    if i < len(inv.files) or len(matches) >= limit or scanned_bytes >= options.max_total_bytes { truncated = true; }
+    if not options.detailed { return matches; }
+    return map{ format: "pb_mcp.grep-code.v2", path: options.path,
+        matches: matches, returned: len(matches), scanned_files: scanned_files,
+        scanned_bytes: scanned_bytes, skipped_nontext_or_unsafe_files: skipped,
+        complete: inv.complete and not truncated and skipped == 0, truncated: truncated,
+        errors: inv.errors, descriptor_confined: true, bounded_output: true,
+        literal: matcher.literal, case_sensitive: matcher.case_sensitive,
+        ignore_policy: inv.ignore_policy };
+}
+
+fn _snippet(lines, path, index, context) {
+    let start = index - context; if start < 0 { start = 0; }
+    let end = index + context; let rows = [];
+    let i = start;
+    while i <= end and i < len(lines) {
+        let clipped = _clip_line(lines[i]);
+        rows[len(rows)] = map{ line: i + 1, text: clipped.text,
+            match: i == index, line_truncated: clipped.truncated };
+        i = i + 1;
+    }
+    return map{ path: path, line: index + 1, rows: rows };
+}
+
+fn _extract(text, path, matcher, context, limit, max_chars, line_offset = 0) {
+    let lines = str_split(text, "\n"); let out = []; let used = 0; let truncated = false;
+    for i len(lines) {
+        if _matches(lines[i], matcher) {
+            if len(out) >= limit { truncated = true; break; }
+            let item = _snippet(lines, path, i, context); item.line = item.line + line_offset;
+            for j len(item.rows) { item.rows[j].line = item.rows[j].line + line_offset; }
+            let cost = len(path) + 32;
+            for j len(item.rows) { cost = cost + len(item.rows[j].text) + 24; }
+            if used + cost > max_chars { truncated = true; break; }
+            out[len(out)] = item; used = used + cost;
+        }
+    }
+    return map{ snippets: out, returned: len(out), output_chars_estimate: used,
+        truncated: truncated };
+}
+
+fn extract_snippets(args) {
+    args = _strict(args, ["text", "pattern", "literal", "case_sensitive", "context",
+    "context_lines", "max_matches", "max_snippets", "max_chars", "path", "detailed"]);
+    let text = try args.text catch nil;
+    if type(text) != "string" or len(text) > 1048576 { throw "text must be a string of at most 1048576 characters"; }
+    if map_has(args, "context") and map_has(args, "context_lines") { throw "context and context_lines are mutually exclusive"; }
+    if map_has(args, "max_matches") and map_has(args, "max_snippets") { throw "max_matches and max_snippets are mutually exclusive"; }
+    let matcher = _matcher(try args.pattern catch nil,
+    _boolean(try args.literal catch nil, "literal", false),
+    _boolean(try args.case_sensitive catch nil, "case_sensitive", true));
+    let context = _integer(try args.context_lines catch try args.context catch nil, "context_lines", 0, 20, 2);
+    let limit = _integer(try args.max_snippets catch try args.max_matches catch nil, "max_snippets", 1, 200, 50);
+    let max_chars = _integer(try args.max_chars catch nil, "max_chars", 1, MAX_OUTPUT_CHARS, 20000);
+    let result = _extract(text, try args.path catch "[text]", matcher, context, limit, max_chars);
+    let detailed = _boolean(try args.detailed catch nil, "detailed", false);
+    if not detailed { return result.snippets; }
+    result.format = "pb_mcp.extract-snippets.v2"; result.complete = not result.truncated;
+    result.literal = matcher.literal; result.case_sensitive = matcher.case_sensitive;
+    return result;
+}
+
+fn extract_snippets_from_file(args) {
+    args = _strict(args, ["path", "pattern", "literal", "case_sensitive", "context",
+    "context_lines", "max_matches", "max_snippets", "max_chars", "max_file_bytes",
+    "start_line", "end_line", "detailed"]);
+    if not map_has(args, "path") { throw "path is required"; }
+    if map_has(args, "context") and map_has(args, "context_lines") {
+        throw "context and context_lines are mutually exclusive";
+    }
+    if map_has(args, "max_matches") and map_has(args, "max_snippets") {
+        throw "max_matches and max_snippets are mutually exclusive";
+    }
+    let path = SEC.safe_rel_path(args.path, "");
+    if path == "" { throw "path is required"; }
+    let fs = DIRFS.open(".", false, false); if not fs.ok { throw "project root cannot be held"; }
+    let max_bytes = _integer(try args.max_file_bytes catch nil, "max_file_bytes", 1, MAX_FILE_BYTES, 200000);
+    let loaded = _read(fs, path, max_bytes); DIRFS.close(fs);
+    if not loaded.ok { throw loaded.error; }
+    let start = _integer(try args.start_line catch nil, "start_line", 1, 1000000000, 1);
+    let lines = str_split(loaded.text, "\n");
+    if start > len(lines) { throw "start_line exceeds the bounded file snapshot"; }
+    let finish = _integer(try args.end_line catch nil, "end_line", start, 1000000000, len(lines));
+    let selected = [];
+    let i = start - 1; while i < finish and i < len(lines) { selected[len(selected)] = lines[i]; i = i + 1; }
+    let forwarded = map{ text: str_join(selected, "\n"), pattern: try args.pattern catch nil,
+        literal: try args.literal catch false, case_sensitive: try args.case_sensitive catch true,
+        context_lines: try args.context_lines catch try args.context catch 2,
+        max_snippets: try args.max_snippets catch try args.max_matches catch 50,
+        max_chars: try args.max_chars catch 20000, path: path, detailed: true };
+    let result = extract_snippets(forwarded);
+    for n len(result.snippets) {
+        result.snippets[n].line = result.snippets[n].line + start - 1;
+        for j len(result.snippets[n].rows) { result.snippets[n].rows[j].line = result.snippets[n].rows[j].line + start - 1; }
+    }
+    result.format = "pb_mcp.extract-snippets-file.v2";
+    result.source_truncated = loaded.truncated; result.complete = result.complete and not loaded.truncated;
+    result.descriptor_confined = true;
+    if not _boolean(try args.detailed catch nil, "detailed", false) { return result.snippets; }
+    return result;
+}
+
+fn grep_snippets(args) {
+    args = _strict(args, ["path", "dir", "pattern", "literal", "case_sensitive",
+        "respect_gitignore", "context", "context_lines", "max_snippets",
+        "max_matches", "max_chars", "max_entries", "max_depth", "max_file_bytes",
+        "max_total_bytes", "detailed"]);
+    if map_has(args, "context") and map_has(args, "context_lines") {
+        throw "context and context_lines are mutually exclusive";
+    }
+    if map_has(args, "max_snippets") and map_has(args, "max_matches") {
+        throw "max_snippets and max_matches are mutually exclusive";
+    }
+    let detailed = _boolean(try args.detailed catch nil, "detailed", false);
+    let forwarded = map{}; let keys = map_keys(args);
+    for i len(keys) { forwarded[keys[i]] = args[keys[i]]; }
+    forwarded.detailed = true;
+    if map_has(forwarded, "context") { map_remove(forwarded, "context"); }
+    if map_has(forwarded, "context_lines") { map_remove(forwarded, "context_lines"); }
+    if map_has(forwarded, "max_snippets") { forwarded.max_matches = forwarded.max_snippets; map_remove(forwarded, "max_snippets"); }
+    if map_has(forwarded, "max_chars") { map_remove(forwarded, "max_chars"); }
+    let matches = grep_code(forwarded);
+    let context = _integer(try args.context_lines catch try args.context catch nil, "context_lines", 0, 20, 2);
+    let max_chars = _integer(try args.max_chars catch nil, "max_chars", 1, MAX_OUTPUT_CHARS, 20000);
+    let cache = map{}; let snippets = []; let used = 0; let truncated = matches.truncated;
+    let fs = DIRFS.open(".", false, false); if not fs.ok { throw "project root cannot be held"; }
+    for i len(matches.matches) {
+        let path = matches.matches[i].path;
+        if not map_has(cache, path) {
+            let loaded = _read(fs, path, try args.max_file_bytes catch 200000);
+            cache[path] = if loaded.ok { str_split(loaded.text, "\n") } else { [] };
+        }
+        let rows = cache[path]; if len(rows) == 0 { continue; }
+        let item = _snippet(rows, path, matches.matches[i].line - 1, context);
+        let cost = len(path) + 32;
+        for j len(item.rows) { cost = cost + len(item.rows[j].text) + 24; }
+        if used + cost > max_chars { truncated = true; break; }
+        snippets[len(snippets)] = item; used = used + cost;
+    }
+    DIRFS.close(fs);
+    if not detailed { return snippets; }
+    return map{ format: "pb_mcp.grep-snippets.v2", snippets: snippets,
+        returned: len(snippets), complete: matches.complete and not truncated,
+        truncated: truncated, scanned_files: matches.scanned_files,
+        scanned_bytes: matches.scanned_bytes, descriptor_confined: true,
+        bounded_output: true, errors: matches.errors };
+}
+
+fn json_validate_file(args) {
+    args = _strict(args, ["path", "max_bytes"]);
+    let requested = try args.path catch nil;
+    if requested == nil { throw "path is required"; }
+    let path = SEC.safe_rel_path(requested, "");
+    if path == "" { throw "path is required"; }
+    let max_bytes = _integer(try args.max_bytes catch nil, "max_bytes", 1, MAX_FILE_BYTES, MAX_FILE_BYTES);
+    let fs = DIRFS.open(".", false, false);
+    if not fs.ok { throw "project root cannot be held"; }
+    let loaded = _read(fs, path, max_bytes);
+    DIRFS.close(fs);
+    if not loaded.ok {
+        return map{ format: "pb_mcp.json-validate-file.v2", ok: false,
+            path: path, valid: false, error: loaded.error, descriptor_confined: true };
+    }
+    if loaded.truncated {
+        return map{ format: "pb_mcp.json-validate-file.v2", ok: false,
+            path: path, valid: false, error: "JSON file exceeds max_bytes",
+            truncated: true, descriptor_confined: true };
+    }
+    let parsed = try map{ ok: true, value: json_parse(loaded.text) }
+        catch map{ ok: false, value: nil };
+    if not parsed.ok {
+        return map{ format: "pb_mcp.json-validate-file.v2", ok: false,
+            path: path, valid: false, error: "invalid JSON", descriptor_confined: true };
+    }
+    let value = parsed.value;
+    let runtime_kind = type(value);
+    let public_kind = "scalar";
+    let count = 0;
+    let keys = [];
+    if runtime_kind == "map" {
+        public_kind = "object";
+        keys = array_sort(map_keys(value));
+        count = len(keys);
+        if len(keys) > 40 { keys = slice(keys, 0, 40); }
+    } elif runtime_kind == "array" {
+        public_kind = "array";
+        count = len(value);
+    }
+    return map{ format: "pb_mcp.json-validate-file.v2", ok: true, valid: true,
+        path: path, kind: public_kind, item_count: count, key_sample: keys,
+        key_sample_truncated: runtime_kind == "map" and count > len(keys),
+        bytes: loaded.bytes, value_exposed: false, descriptor_confined: true };
+}
+
+fn call_search(tool, args) {
+    if tool == "list_files" { return list_files(args); }
+    if tool == "find_files" { return find_files(args); }
+    if tool == "find_files_by_name" { return find_files_by_name(args); }
+    if tool == "grep_code" { return grep_code(args); }
+    if tool == "extract_snippets" { return extract_snippets(args); }
+    if tool == "extract_snippets_from_file" { return extract_snippets_from_file(args); }
+    if tool == "grep_snippets" { return grep_snippets(args); }
+    if tool == "json_validate_file" { return json_validate_file(args); }
+    return nil;
+}
+
+fn implemented_tools() { return ["list_files", "find_files", "find_files_by_name",
+    "grep_code", "extract_snippets", "extract_snippets_from_file", "grep_snippets",
+    "json_validate_file"]; }
+
+export call_search, implemented_tools, list_files, find_files, find_files_by_name,
+grep_code, extract_snippets, extract_snippets_from_file, grep_snippets,
+json_validate_file;

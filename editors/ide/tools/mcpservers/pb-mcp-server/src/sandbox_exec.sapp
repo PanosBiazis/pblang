@@ -1,0 +1,323 @@
+// Fail-closed, bounded diagnostic execution for trusted pb-mcp-server profiles.
+//
+// This is deliberately not a shell. Caller-selected programs come from a
+// command-specific allowlist whose output is intrinsically bounded. Linux
+// bubblewrap supplies fresh user/PID/network/IPC/UTS and mount namespaces;
+// the selected workspace root is held by descriptor and mounted read-only.
+
+let sec = import("security.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let PROCESS = import("stdlib:linux_process.sapp");
+
+let COMMANDS = ["echo", "true", "false", "pwd", "uname"];
+let MAX_ARGS = 16;
+let MAX_ARG_BYTES = 4096;
+let MAX_ARG_TOTAL_BYTES = 16384;
+let MAX_OUTPUT_BYTES = 32768;
+
+fn _contains(values, value) {
+    for i len(values) { if values[i] == value { return true; } }
+    return false;
+}
+
+fn _integer(value, fallback, minimum, maximum, name) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value)
+       or value < minimum or value > maximum {
+        throw name + " must be an integer between " + str(minimum) + " and " + str(maximum);
+    }
+    return value;
+}
+
+fn _one_alias(args, primary, alias, required, label) {
+    let a = try args[primary] catch nil;
+    let b = try args[alias] catch nil;
+    if a != nil and b != nil { throw "provide " + primary + " or " + alias + ", not both"; }
+    let value = if a != nil { a } else { b };
+    if required and value == nil { throw label + " is required"; }
+    return value;
+}
+
+fn _safe_args(raw) {
+    if raw == nil { return []; }
+    if type(raw) != "array" or len(raw) > MAX_ARGS {
+        throw "exec_args/argv must contain at most 16 strings";
+    }
+    let out = []; let total = 0;
+    for i len(raw) {
+        if type(raw[i]) != "string" or str_contains(raw[i], strfromcharcode(0)) {
+            throw "each sandbox argument must be a NUL-free string";
+        }
+        let bytes = len(str_to_bytes(raw[i]));
+        if bytes > MAX_ARG_BYTES { throw "each sandbox argument is limited to 4096 UTF-8 bytes"; }
+        total = total + bytes;
+        if total > MAX_ARG_TOTAL_BYTES { throw "sandbox arguments exceed 16384 UTF-8 bytes"; }
+        out[len(out)] = raw[i];
+    }
+    return out;
+}
+
+fn _uname_arg(value) {
+    if len(value) < 2 { return false; }
+    if len(value) > 9 { return false; }
+    if not str_starts_with(value, "-") { return false; }
+    let allowed = "asnrvmio";
+    let i = 1;
+    while i < len(value) {
+        if not str_contains(allowed, str_slice(value, i, i + 1)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _command_policy(program, argv) {
+    if not _contains(COMMANDS, program) {
+        throw "sandbox_exec program must be echo, true, false, pwd, or uname";
+    }
+    if (program == "true" or program == "false" or program == "pwd") and len(argv) != 0 {
+        throw program + " does not accept sandbox arguments";
+    }
+    if program == "uname" {
+        if len(argv) > 4 { throw "uname accepts at most four bounded option groups"; }
+        for i len(argv) {
+            if not _uname_arg(argv[i]) { throw "uname accepts only short information flags"; }
+        }
+    }
+    return true;
+}
+
+fn validate_request(args) {
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "sandbox_exec arguments must be an object"; }
+    sec.require_trusted("sandbox exec", "PB_SANDBOX_EXEC_ENABLE");
+    let raw_program = _one_alias(args, "program", "command", true, "program/command");
+    if type(raw_program) != "string" { throw "program/command must be a string"; }
+    let program = str_trim(raw_program);
+    if program == "" or str_contains(program, "/") or str_contains(program, "\\")
+       or str_contains(program, "..") {
+        throw "program/command must be a bare allowlisted name";
+    }
+    let argv = _safe_args(_one_alias(args, "argv", "exec_args", false, "argv/exec_args"));
+    _command_policy(program, argv);
+    let cwd = sec.safe_rel_path(try args.cwd catch ".", ".");
+    let timeout_secs = _integer(try args.timeout_secs catch nil, 10, 1, 30, "timeout_secs");
+    let max_output_bytes = _integer(try args.max_output_bytes catch nil,
+        MAX_OUTPUT_BYTES, 1, MAX_OUTPUT_BYTES, "max_output_bytes");
+    let memory_mb = _integer(try args.memory_mb catch nil, 128, 32, 512, "memory_mb");
+    return map{
+        ok: true, format: "pb_mcp.sandbox_exec.request.v1",
+        program: program, argv: argv, cwd: cwd,
+        timeout_secs: timeout_secs, max_output_bytes: max_output_bytes,
+        memory_mb: memory_mb, shell_used: false,
+        output_intrinsically_bounded: true,
+        command_policy: "diagnostic-v1"
+    };
+}
+
+fn _fixed_path(candidates) {
+    for i len(candidates) {
+        if try fs_exists(candidates[i]) catch false { return candidates[i]; }
+    }
+    return "";
+}
+
+fn _host_tools() {
+    return map{
+        bwrap: _fixed_path(["/usr/bin/bwrap", "/bin/bwrap"]),
+        timeout: _fixed_path(["/usr/bin/timeout", "/bin/timeout"]),
+        prlimit: _fixed_path(["/usr/bin/prlimit", "/bin/prlimit"])
+    };
+}
+
+fn _payload(program, argv) {
+    let executable = ""; let args = [];
+    if program == "echo" {
+        // A fixed printf format avoids echo's implementation-dependent option
+        // parsing while retaining familiar space-joined echo output.
+        executable = _fixed_path(["/usr/bin/printf", "/bin/printf"]);
+        let line = "";
+        for i len(argv) {
+            if i > 0 { line = line + " "; }
+            line = line + argv[i];
+        }
+        args = ["%s\n", line];
+    } else {
+        executable = _fixed_path(["/usr/bin/" + program, "/bin/" + program]);
+        for i len(argv) { args[len(args)] = argv[i]; }
+    }
+    if executable == "" {
+        return map{ ok: false, error: "fixed sandbox payload is unavailable for " + program };
+    }
+    return map{ ok: true, executable: executable, args: args };
+}
+
+fn _append_bind(argv, source, destination) {
+    if try fs_exists(source) catch false {
+        argv[len(argv)] = "--ro-bind"; argv[len(argv)] = source; argv[len(argv)] = destination;
+    }
+}
+
+fn _clip_utf8(value, maximum) {
+    value = str(value); let original = len(str_to_bytes(value));
+    if original <= maximum {
+        return map{ text: value, truncated: false, original_bytes: original, returned_bytes: original };
+    }
+    let out = ""; let used = 0;
+    for i len(value) {
+        let ch = str_slice(value, i, i + 1); let bytes = len(str_to_bytes(ch));
+        if used + bytes > maximum { break; }
+        out = out + ch; used = used + bytes;
+    }
+    return map{ text: out, truncated: true, original_bytes: original, returned_bytes: used };
+}
+
+fn _spawn(root, tools, executable, payload_args, timeout_secs, memory_mb) {
+    let held = DIRFS.child_descriptor(root);
+    if not held.ok { return map{ ok: false, error: "workspace descriptor handoff is unavailable" }; }
+    let argv = [
+        "--signal=TERM", "--kill-after=1s", str(timeout_secs) + "s",
+        tools.bwrap,
+        "--unshare-user", "--unshare-pid", "--unshare-net", "--unshare-ipc", "--unshare-uts",
+        "--die-with-parent", "--new-session", "--disable-userns",
+        "--clearenv", "--setenv", "PATH", "/usr/bin:/bin",
+        "--setenv", "HOME", "/tmp", "--setenv", "LANG", "C", "--setenv", "LC_ALL", "C"
+    ];
+    _append_bind(argv, "/usr", "/usr"); _append_bind(argv, "/bin", "/bin");
+    _append_bind(argv, "/lib", "/lib"); _append_bind(argv, "/lib64", "/lib64");
+    argv[len(argv)] = "--proc"; argv[len(argv)] = "/proc";
+    argv[len(argv)] = "--dev"; argv[len(argv)] = "/dev";
+    argv[len(argv)] = "--tmpfs"; argv[len(argv)] = "/tmp";
+    argv[len(argv)] = "--dir"; argv[len(argv)] = "/workspace";
+    argv[len(argv)] = "--ro-bind-fd"; argv[len(argv)] = str(held.fd); argv[len(argv)] = "/workspace";
+    argv[len(argv)] = "--chdir"; argv[len(argv)] = "/workspace";
+    argv[len(argv)] = "--cap-drop"; argv[len(argv)] = "ALL";
+    argv[len(argv)] = "--"; argv[len(argv)] = tools.prlimit;
+    argv[len(argv)] = "--as=" + str(memory_mb * 1048576);
+    argv[len(argv)] = "--cpu=" + str(timeout_secs + 1);
+    argv[len(argv)] = "--nproc=32"; argv[len(argv)] = "--nofile=64";
+    argv[len(argv)] = "--fsize=" + str(MAX_OUTPUT_BYTES); argv[len(argv)] = "--";
+    argv[len(argv)] = executable;
+    for i len(payload_args) { argv[len(argv)] = payload_args[i]; }
+    let ran = try PROCESS.run(tools.timeout, argv, map{
+        timeout_secs: timeout_secs + 3,
+        max_output_bytes: MAX_OUTPUT_BYTES
+    }) catch nil;
+    DIRFS.close_child_descriptor(root, held);
+    if ran == nil { return map{ ok: false, error: "sandbox process could not start" }; }
+    let stderr = str(try ran.stderr catch "");
+    let bootstrap_failed = str_contains(stderr, "bwrap:") or str_contains(stderr, "prlimit:");
+    return map{
+        ok: not bootstrap_failed, bootstrap_failed: bootstrap_failed,
+        exit_code: try ran.exit_code catch -1,
+        stdout: str(try ran.stdout catch ""), stderr: stderr,
+        output_truncated: try ran.output_truncated catch false,
+        process_group_terminated: try ran.process_group_terminated catch false,
+        bounded_process_supervisor: true
+    };
+}
+
+fn run(args) {
+    let request = validate_request(args);
+    if platform() != "linux" or not DIRFS.available().ok {
+        return map{ ok: false, executed: false,
+            error: "race-resistant sandbox_exec currently requires Linux directory handles" };
+    }
+    let tools = _host_tools();
+    if tools.bwrap == "" or tools.timeout == "" or tools.prlimit == "" {
+        return map{ ok: false, executed: false,
+            error: "sandbox_exec requires fixed bubblewrap, timeout, and prlimit adapters" };
+    }
+    let payload = _payload(request.program, request.argv);
+    if not payload.ok { return map{ ok: false, executed: false, error: payload.error }; }
+    let root = DIRFS.open(request.cwd, false, false);
+    if not root.ok { return map{ ok: false, executed: false,
+        error: "sandbox cwd is missing, unsafe, or not a directory" }; }
+    let raw = _spawn(root, tools, payload.executable, payload.args,
+        request.timeout_secs, request.memory_mb);
+    DIRFS.close(root);
+    if not raw.ok {
+        return map{ ok: false, executed: false,
+            error: "sandbox namespace or resource-limit bootstrap failed",
+            stderr: _clip_utf8(try raw.stderr catch "", request.max_output_bytes).text };
+    }
+    let stdout = _clip_utf8(raw.stdout, request.max_output_bytes);
+    let stderr_budget = request.max_output_bytes - stdout.returned_bytes;
+    let stderr = _clip_utf8(raw.stderr, stderr_budget);
+    return map{
+        ok: true, format: "pb_mcp.sandbox_exec.v1", executed: true,
+        command_ok: raw.exit_code == 0, exit_code: raw.exit_code,
+        timed_out: raw.exit_code == 124, program: request.program,
+        argv: request.argv, cwd: request.cwd,
+        stdout: stdout.text, stderr: stderr.text,
+        output_truncated: stdout.truncated or stderr.truncated
+            or (try raw.output_truncated catch false),
+        stdout_original_bytes: stdout.original_bytes,
+        stderr_original_bytes: stderr.original_bytes,
+        timeout_secs: request.timeout_secs, memory_mb: request.memory_mb,
+        max_output_bytes: request.max_output_bytes,
+        namespace_isolated: true, network_isolated: true,
+        workspace_read_only: true, environment_cleared: true,
+        capabilities_dropped: true, nested_user_namespaces_disabled: true,
+        descriptor_bound_workspace: true, shell_used: false,
+        output_intrinsically_bounded: true,
+        bounded_process_supervisor: try raw.bounded_process_supervisor catch false,
+        process_group_terminated: try raw.process_group_terminated catch false,
+        command_policy: request.command_policy
+    };
+}
+
+// Fixed internal probes verify the two most important namespace postconditions
+// without widening the caller-visible command allowlist.
+fn isolation_selftest(cwd = ".") {
+    sec.require_trusted("sandbox exec isolation selftest", "PB_SANDBOX_EXEC_ENABLE");
+    if platform() != "linux" or not DIRFS.available().ok {
+        return map{ ok: false, error: "Linux sandbox facilities are unavailable" };
+    }
+    let tools = _host_tools();
+    if tools.bwrap == "" or tools.timeout == "" or tools.prlimit == "" {
+        return map{ ok: false, error: "sandbox system adapters are unavailable" };
+    }
+    let safe = sec.safe_rel_path(cwd, ".");
+    let root = DIRFS.open(safe, false, false);
+    if not root.ok { return map{ ok: false, error: "selftest cwd cannot be held" }; }
+    let marker = ".pb-mcp-sandbox-exec-write-probe-"
+        + str_slice(sha256(str(now_ms()) + str(random_bytes(8))), 0, 16);
+    let write_probe = _spawn(root, tools, "/usr/bin/touch", ["/workspace/" + marker], 3, 64);
+    let net_probe = _spawn(root, tools, "/usr/bin/cat", ["/proc/net/dev"], 3, 64);
+    DIRFS.close(root);
+    let host_marker = if safe == "." { marker } else { safe + "/" + marker };
+    let write_denied = write_probe.ok and write_probe.exit_code != 0 and not fs_exists(host_marker);
+    if fs_exists(host_marker) { try fs_remove(host_marker) catch nil; }
+    let net_only_loopback = net_probe.ok and net_probe.exit_code == 0;
+    let saw_loopback = false;
+    if net_only_loopback {
+        let lines = str_split(net_probe.stdout, "\n");
+        for i len(lines) {
+            let colon = str_index_of(lines[i], ":");
+            if colon >= 0 {
+                let iface = str_trim(str_slice(lines[i], 0, colon));
+                if iface == "lo" { saw_loopback = true; }
+                elif iface != "" { net_only_loopback = false; }
+            }
+        }
+        if not saw_loopback { net_only_loopback = false; }
+    }
+    return map{
+        ok: write_denied and net_only_loopback,
+        workspace_write_denied: write_denied,
+        network_only_loopback: net_only_loopback,
+        namespace_bootstrap: write_probe.ok and net_probe.ok,
+        write_probe_exit_code: try write_probe.exit_code catch -1,
+        write_probe_stderr: _clip_utf8(try write_probe.stderr catch "", 4096).text,
+        network_probe_exit_code: try net_probe.exit_code catch -1,
+        network_probe_stderr: _clip_utf8(try net_probe.stderr catch "", 4096).text,
+        network_probe_stdout: _clip_utf8(try net_probe.stdout catch "", 4096).text,
+        shell_used: false
+    };
+}
+
+fn supported_commands() {
+    let out = []; for i len(COMMANDS) { out[len(out)] = COMMANDS[i]; } return out;
+}
+
+export validate_request, run, isolation_selftest, supported_commands;

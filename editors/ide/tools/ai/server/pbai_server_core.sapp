@@ -1,0 +1,410 @@
+// Security and cumulative admission core for the local pbAI HTTP server.
+let SECURE_FILE = import("stdlib:secure_file.sapp");
+let LINUX_DIRFS = import("stdlib:linux_dirfs.sapp");
+
+let TOKEN_MIN = 32;
+let TOKEN_MAX = 256;
+let MAX_REQUESTS_PER_MINUTE = 60;
+let MAX_GENERATED_TOKENS_PER_REQUEST = 4096;
+let MAX_GENERATED_TOKENS_TOTAL = 100000;
+let MAX_LEARNING_EPOCHS_PER_REQUEST = 16;
+let MAX_LEARNING_EPOCHS_TOTAL = 128;
+let MAX_INGEST_FILES_PER_REQUEST = 256;
+let MAX_INGEST_FILES_TOTAL = 1024;
+let MAX_INGEST_DEPTH = 8;
+let MAX_DISCLOSURE_BYTES_PER_RESPONSE = 1048576;
+let MAX_DISCLOSURE_BYTES_TOTAL = 67108864;
+let MAX_IDEMPOTENCY_KEYS = 2048;
+let LEDGER_MAX_BYTES = 262144;
+
+fn valid_token(value) {
+    return type(value) == "string" and len(value) >= TOKEN_MIN and len(value) <= TOKEN_MAX;
+}
+
+fn load_token(path, allow_environment = false) {
+    let token = "";
+    if type(path) == "string" and str_trim(path) != "" {
+        let loaded = SECURE_FILE.read_text(path, 4096, true);
+        if not (try loaded.ok catch false) {
+            throw "pbAI server token must be a regular file inside a private directory: "
+            + str(try loaded.error catch "secure read rejected");
+        }
+        token = str_trim(loaded.text);
+    } elif allow_environment {
+        token = str_trim(str(try env_get("PBAI_SERVER_TOKEN") catch ""));
+    } else {
+        throw "pbAI server requires --token-file; environment tokens require --development-env-token";
+    }
+    if not valid_token(token) { throw "pbAI server token must contain 32..256 characters"; }
+    return token;
+}
+
+fn authorized(expected, supplied, bearer = "") {
+    if not valid_token(expected) { return false; }
+    if type(supplied) == "string" and constant_time_eq(expected, supplied) { return true; }
+    let prefix = "Bearer ";
+    if type(bearer) != "string" or not str_starts_with(bearer, prefix) { return false; }
+    return constant_time_eq(expected, str_slice(bearer, len(prefix), len(bearer)));
+}
+
+fn new_ledger(now_ms = 0, ledger_path = "") {
+    return map{ format: "pbai.server.admission.v2", window_started_ms: now_ms,
+        requests_in_window: 0, generated_tokens: 0, learning_epochs: 0,
+        ingest_files: 0, disclosure_bytes: 0, disclosure_reserved_bytes: 0,
+        completed_requests: 0,
+        active_inference: 0, active_learning: 0, idempotency: map{},
+        active_learning_key: "", ledger_path: ledger_path, ledger_lock: nil };
+}
+
+fn _integer(value, fallback) {
+    let n = try value catch fallback;
+    if type(n) != "number" or n != num_floor(n) { return nil; }
+    return n;
+}
+
+fn _deny(reason) { return map{ ok: false, admitted: false, reason: reason }; }
+
+fn _nonnegative_integer(value, maximum) {
+    let n = _integer(value, nil);
+    if n == nil or n < 0 or n > maximum { return nil; }
+    return n;
+}
+
+fn _durable_view(ledger) {
+    return map{
+        format: "pbai.server.admission.v2",
+        window_started_ms: ledger.window_started_ms,
+        requests_in_window: ledger.requests_in_window,
+        generated_tokens: ledger.generated_tokens,
+        learning_epochs: ledger.learning_epochs,
+        ingest_files: ledger.ingest_files,
+        disclosure_bytes: ledger.disclosure_bytes,
+        disclosure_reserved_bytes: ledger.disclosure_reserved_bytes,
+        completed_requests: ledger.completed_requests,
+        idempotency: ledger.idempotency
+    };
+}
+
+fn persist_ledger(ledger) {
+    let path = try str(ledger.ledger_path) catch "";
+    if path == "" { return map{ ok: true, durable: false }; }
+    let encoded = json_stringify(_durable_view(ledger));
+    if len(str_to_bytes(encoded)) > LEDGER_MAX_BYTES {
+        return map{ ok: false, error: "pbAI server ledger exceeds its persistence limit" };
+    }
+    let written = SECURE_FILE.write_text_atomic(path, encoded, true, true);
+    if not (try written.ok catch false) {
+        return map{ ok: false, error: "pbAI server ledger could not be persisted securely" };
+    }
+    return map{ ok: true, durable: true };
+}
+
+fn _restore(target, snapshot) {
+    target.window_started_ms = snapshot.window_started_ms;
+    target.requests_in_window = snapshot.requests_in_window;
+    target.generated_tokens = snapshot.generated_tokens;
+    target.learning_epochs = snapshot.learning_epochs;
+    target.ingest_files = snapshot.ingest_files;
+    target.disclosure_bytes = snapshot.disclosure_bytes;
+    target.disclosure_reserved_bytes = snapshot.disclosure_reserved_bytes;
+    target.completed_requests = snapshot.completed_requests;
+    target.active_inference = snapshot.active_inference;
+    target.active_learning = snapshot.active_learning;
+    target.active_learning_key = snapshot.active_learning_key;
+    target.idempotency = snapshot.idempotency;
+}
+
+fn _snapshot(ledger) {
+    return map{
+        window_started_ms: ledger.window_started_ms,
+        requests_in_window: ledger.requests_in_window,
+        generated_tokens: ledger.generated_tokens,
+        learning_epochs: ledger.learning_epochs,
+        ingest_files: ledger.ingest_files,
+        disclosure_bytes: ledger.disclosure_bytes,
+        disclosure_reserved_bytes: ledger.disclosure_reserved_bytes,
+        completed_requests: ledger.completed_requests,
+        active_inference: ledger.active_inference,
+        active_learning: ledger.active_learning,
+        active_learning_key: ledger.active_learning_key,
+        idempotency: json_parse(json_stringify(ledger.idempotency))
+    };
+}
+
+fn _valid_idempotency(value) {
+    if type(value) != "map" or len(map_keys(value)) > MAX_IDEMPOTENCY_KEYS { return false; }
+    for key in map_keys(value) {
+        let state = try str(value[key]) catch "";
+        if type(key) != "string" or len(key) != 64
+        or (state != "pending" and state != "complete" and state != "failed") {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn _release_lock_holder(holder) {
+    if holder == nil or type(holder) != "map" { return false; }
+    let released = try LINUX_DIRFS.release_lock(holder.fs, holder.lock) catch false;
+    let closed = try LINUX_DIRFS.close(holder.fs) catch false;
+    return released and closed;
+}
+
+fn _acquire_ledger_lock(path) {
+    if platform() != "linux" {
+        throw "pbAI durable server ledger locking is currently available only on Linux";
+    }
+    let parent = path_dirname(path);
+    if parent == "" { parent = "."; }
+    let fs = if str_starts_with(parent, "/") {
+        LINUX_DIRFS.open_absolute(parent, false, false)
+    } else {
+        LINUX_DIRFS.open(parent, false, false)
+    };
+    if not (try fs.ok catch false) {
+        throw "pbAI server ledger parent cannot be opened securely";
+    }
+    let private = LINUX_DIRFS.private_root_status(fs);
+    if not (try private.ok catch false) {
+        LINUX_DIRFS.close(fs);
+        throw "pbAI server ledger parent must be owned by the current user with mode 0700";
+    }
+    let lock = LINUX_DIRFS.acquire_lock(fs, path_basename(path) + ".lock", 0, 10);
+    if not (try lock.ok catch false) {
+        LINUX_DIRFS.close(fs);
+        throw "another pbAI server already owns this durable ledger";
+    }
+    return map{ fs: fs, lock: lock };
+}
+
+fn close_ledger(ledger) {
+    let holder = try ledger.ledger_lock catch nil;
+    ledger.ledger_lock = nil;
+    return _release_lock_holder(holder);
+}
+
+fn load_ledger(path, now_ms = 0) {
+    if type(path) != "string" or path == "" or len(path) > 4096 {
+        throw "pbAI server requires a bounded --ledger-file path";
+    }
+    let holder = _acquire_ledger_lock(path);
+    let loaded = SECURE_FILE.read_optional_text(path, LEDGER_MAX_BYTES, true);
+    if not (try loaded.ok catch false) {
+        _release_lock_holder(holder);
+        throw "pbAI server ledger parent must already exist, be private, and be race-resistant";
+    }
+    if try loaded.missing catch false {
+        let fresh = new_ledger(now_ms, path);
+        fresh.ledger_lock = holder;
+        let created = persist_ledger(fresh);
+        if not created.ok {
+            _release_lock_holder(holder);
+            throw created.error;
+        }
+        return fresh;
+    }
+    let raw = try json_parse(loaded.text) catch nil;
+    if type(raw) != "map" or (try raw.format catch "") != "pbai.server.admission.v2" {
+        _release_lock_holder(holder);
+        throw "pbAI server ledger is malformed or has an unsupported schema";
+    }
+    let ledger = new_ledger(now_ms, path);
+    ledger.window_started_ms = _nonnegative_integer(try raw.window_started_ms catch nil, 9007199254740991);
+    ledger.requests_in_window = _nonnegative_integer(try raw.requests_in_window catch nil, MAX_REQUESTS_PER_MINUTE);
+    ledger.generated_tokens = _nonnegative_integer(try raw.generated_tokens catch nil, MAX_GENERATED_TOKENS_TOTAL);
+    ledger.learning_epochs = _nonnegative_integer(try raw.learning_epochs catch nil, MAX_LEARNING_EPOCHS_TOTAL);
+    ledger.ingest_files = _nonnegative_integer(try raw.ingest_files catch nil, MAX_INGEST_FILES_TOTAL);
+    ledger.disclosure_bytes = _nonnegative_integer(try raw.disclosure_bytes catch nil, MAX_DISCLOSURE_BYTES_TOTAL);
+    ledger.disclosure_reserved_bytes = _nonnegative_integer(
+    try raw.disclosure_reserved_bytes catch nil, MAX_DISCLOSURE_BYTES_TOTAL);
+    ledger.completed_requests = _nonnegative_integer(try raw.completed_requests catch nil, 9007199254740991);
+    ledger.idempotency = try raw.idempotency catch nil;
+    if ledger.window_started_ms == nil or ledger.requests_in_window == nil
+    or ledger.generated_tokens == nil or ledger.learning_epochs == nil
+    or ledger.ingest_files == nil or ledger.disclosure_bytes == nil
+    or ledger.disclosure_reserved_bytes == nil
+    or ledger.completed_requests == nil or not _valid_idempotency(ledger.idempotency) {
+        _release_lock_holder(holder);
+        throw "pbAI server ledger contains invalid or out-of-policy counters";
+    }
+    // Active work is process-local. A restart proves that no old worker is
+    // owned by this server process, so stale active counters never survive.
+    ledger.active_inference = 0;
+    ledger.active_learning = 0;
+    ledger.active_learning_key = "";
+    ledger.disclosure_reserved_bytes = 0;
+    ledger.ledger_lock = holder;
+    let recovered = persist_ledger(ledger);
+    if not recovered.ok {
+        _release_lock_holder(holder);
+        throw recovered.error;
+    }
+    return ledger;
+}
+
+fn _work_class(action) {
+    if action == "learn" or action == "ingest_path" { return "learning"; }
+    if action == "respond" or action == "analyze" or action == "think"
+    or action == "generate" or action == "tokenize" or action == "self_eval"
+    or action == "verify" or action == "brain" or action == "dataset_admission"
+    or action == "security_scan" or action == "tool_call" { return "inference"; }
+    return "light";
+}
+
+fn admit(ledger, action, data = nil, now_ms = 0) {
+    if type(ledger) != "map" or (try ledger.format catch "") != "pbai.server.admission.v2" {
+        return _deny("invalid server admission ledger");
+    }
+    let snapshot = _snapshot(ledger);
+    if now_ms < ledger.window_started_ms {
+        return _deny("server clock moved backwards; operator review is required");
+    }
+    if now_ms - ledger.window_started_ms >= 60000 {
+        ledger.window_started_ms = now_ms;
+        ledger.requests_in_window = 0;
+    }
+    if ledger.requests_in_window >= MAX_REQUESTS_PER_MINUTE { return _deny("request budget exhausted"); }
+
+    let n = _integer(try data.n catch 80, 80);
+    let epochs = _integer(try data.epochs catch 8, 8);
+    let files = _integer(try data.max_files catch 80, 80);
+    let depth = _integer(try data.max_depth catch 4, 4);
+    if n == nil or n < 0 or n > MAX_GENERATED_TOKENS_PER_REQUEST {
+        return _deny("generated token request exceeds server limit");
+    }
+    if epochs == nil or epochs < 0 or epochs > MAX_LEARNING_EPOCHS_PER_REQUEST {
+        return _deny("learning epoch request exceeds server limit");
+    }
+    if files == nil or files < 0 or files > MAX_INGEST_FILES_PER_REQUEST
+    or depth == nil or depth < 0 or depth > MAX_INGEST_DEPTH {
+        return _deny("ingest request exceeds server limit");
+    }
+
+    if (action == "learn" or action == "ingest_path") and epochs < 1 {
+        return _deny("state-changing learning requires at least one epoch");
+    }
+    if action == "ingest_path" and files < 1 {
+        return _deny("state-changing ingestion requires at least one file");
+    }
+    let generated = if action == "generate" or action == "respond"
+    or action == "think" or action == "brain" { n } else { 0 };
+    let learned = if action == "learn" or action == "ingest_path" { epochs } else { 0 };
+    let ingested = if action == "ingest_path" { files } else { 0 };
+    if ledger.generated_tokens + generated > MAX_GENERATED_TOKENS_TOTAL {
+        return _deny("cumulative generated token budget exhausted");
+    }
+    if ledger.learning_epochs + learned > MAX_LEARNING_EPOCHS_TOTAL {
+        return _deny("cumulative learning budget exhausted");
+    }
+    if ledger.ingest_files + ingested > MAX_INGEST_FILES_TOTAL {
+        return _deny("cumulative ingest budget exhausted");
+    }
+    if action == "learn" or action == "ingest_path" {
+        let raw_key = str_trim(str(try data.idempotency_key catch ""));
+        if raw_key == "" or len(raw_key) > 128 { return _deny("state-changing request requires a bounded idempotency_key"); }
+        let key = sha256("pbai-idempotency-v1|" + action + "|" + raw_key);
+        if map_has(ledger.idempotency, key) { return _deny("duplicate idempotency_key"); }
+        if len(map_keys(ledger.idempotency)) >= MAX_IDEMPOTENCY_KEYS {
+            return _deny("idempotency ledger capacity exhausted; operator rotation is required");
+        }
+        ledger.idempotency[key] = "pending";
+        ledger.active_learning_key = key;
+    }
+    let work_class = _work_class(action);
+    if work_class == "inference" and ledger.active_inference >= 1 {
+        _restore(ledger, snapshot); return _deny("concurrent inference limit reached");
+    }
+    if work_class == "learning" and ledger.active_learning >= 1 {
+        _restore(ledger, snapshot); return _deny("concurrent learning limit reached");
+    }
+    if ledger.disclosure_bytes + ledger.disclosure_reserved_bytes
+    + MAX_DISCLOSURE_BYTES_PER_RESPONSE > MAX_DISCLOSURE_BYTES_TOTAL {
+        _restore(ledger, snapshot);
+        return _deny("insufficient disclosure budget for a bounded response reservation");
+    }
+    ledger.requests_in_window = ledger.requests_in_window + 1;
+    ledger.generated_tokens = ledger.generated_tokens + generated;
+    ledger.learning_epochs = ledger.learning_epochs + learned;
+    ledger.ingest_files = ledger.ingest_files + ingested;
+    ledger.disclosure_reserved_bytes = ledger.disclosure_reserved_bytes
+    + MAX_DISCLOSURE_BYTES_PER_RESPONSE;
+    if work_class == "inference" { ledger.active_inference = ledger.active_inference + 1; }
+    if work_class == "learning" { ledger.active_learning = ledger.active_learning + 1; }
+    let persisted = persist_ledger(ledger);
+    if not persisted.ok {
+        _restore(ledger, snapshot);
+        return _deny("durable admission ledger update failed");
+    }
+    return map{ ok: true, admitted: true, action: action, work_class: work_class };
+}
+
+fn _release_active(ledger, action) {
+    let work_class = _work_class(action);
+    if work_class == "inference" and ledger.active_inference > 0 {
+        ledger.active_inference = ledger.active_inference - 1;
+    }
+    if work_class == "learning" and ledger.active_learning > 0 {
+        ledger.active_learning = ledger.active_learning - 1;
+    }
+}
+
+fn _settle_idempotency(ledger, action, outcome) {
+    if action != "learn" and action != "ingest_path" { return; }
+    let key = try ledger.active_learning_key catch "";
+    if key != "" and map_has(ledger.idempotency, key) {
+        ledger.idempotency[key] = outcome;
+    }
+    ledger.active_learning_key = "";
+}
+
+fn _release_disclosure_reservation(ledger) {
+    if ledger.disclosure_reserved_bytes >= MAX_DISCLOSURE_BYTES_PER_RESPONSE {
+        ledger.disclosure_reserved_bytes = ledger.disclosure_reserved_bytes
+        - MAX_DISCLOSURE_BYTES_PER_RESPONSE;
+    } else {
+        ledger.disclosure_reserved_bytes = 0;
+    }
+}
+
+fn complete(ledger, action, disclosed_bytes, outcome = "complete") {
+    if outcome != "complete" and outcome != "failed" {
+        return _deny("invalid durable idempotency outcome");
+    }
+    let bytes = _nonnegative_integer(disclosed_bytes, MAX_DISCLOSURE_BYTES_PER_RESPONSE);
+    _release_active(ledger, action);
+    _release_disclosure_reservation(ledger);
+    _settle_idempotency(ledger, action, outcome);
+    if bytes == nil {
+        let persisted = persist_ledger(ledger);
+        if not persisted.ok { return _deny("durable admission ledger update failed"); }
+        return _deny("response exceeds the per-response disclosure limit");
+    }
+    if ledger.disclosure_bytes + bytes > MAX_DISCLOSURE_BYTES_TOTAL {
+        let persisted = persist_ledger(ledger);
+        if not persisted.ok { return _deny("durable admission ledger update failed"); }
+        return _deny("cumulative disclosure budget exhausted");
+    }
+    ledger.disclosure_bytes = ledger.disclosure_bytes + bytes;
+    ledger.completed_requests = ledger.completed_requests + 1;
+    let persisted = persist_ledger(ledger);
+    if not persisted.ok { return _deny("durable admission ledger update failed"); }
+    return map{ ok: true, completed: true, disclosed_bytes: bytes,
+        cumulative_disclosure_bytes: ledger.disclosure_bytes };
+}
+
+fn abort(ledger, action) {
+    _release_active(ledger, action);
+    _release_disclosure_reservation(ledger);
+    _settle_idempotency(ledger, action, "failed");
+    let persisted = persist_ledger(ledger);
+    if not persisted.ok { return _deny("durable admission ledger update failed"); }
+    return map{ ok: true, aborted: true };
+}
+
+fn public_health() { return map{ ok: true, server: "pbai-local-pblang", runtime: "pblang" }; }
+
+export valid_token, load_token, authorized, new_ledger, load_ledger,
+close_ledger, persist_ledger, admit, complete, abort, public_health;
+export TOKEN_MIN, TOKEN_MAX, MAX_REQUESTS_PER_MINUTE, MAX_GENERATED_TOKENS_PER_REQUEST;
+export MAX_LEARNING_EPOCHS_PER_REQUEST, MAX_INGEST_FILES_PER_REQUEST, MAX_INGEST_DEPTH;
+export MAX_DISCLOSURE_BYTES_PER_RESPONSE, MAX_DISCLOSURE_BYTES_TOTAL;

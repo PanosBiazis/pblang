@@ -1,0 +1,144 @@
+// Local composition only. Requests still require an approved PBRemote lease.
+// Discovery uses a local PID and child indexes, without explicit label/text queries.
+let Implementations=import("implementation_switch.sapp");
+let Lifetime=import("desktop_target_lifetime.sapp");
+// GObject type registrations outlive a dlclose. Keep this one ABI mapping for
+// the worker lifetime and require a fresh worker after any native open attempt.
+let native_lifetime=map{attempted:false,library:nil};
+fn integer(v,low,high) { return type(v)=="number" and v>=low and v<=high and v==num_floor(v); }
+fn valid_bus_address(value) {
+    if type(value)!="string" or len(value)<12 or len(value)>4096 or not str_starts_with(value,"unix:path=/") { return false; }
+    let fields=str_split(value,",");if len(fields)>2 { return false; }
+    let path=str_slice(fields[0],10,len(fields[0]));
+    if len(path)<2 { return false; }
+    for c in str_to_bytes(path) {
+        if not ((c>=65 and c<=90) or (c>=97 and c<=122) or (c>=48 and c<=57) or c==47 or c==95 or c==45 or c==46) { return false; }
+    }
+    if len(fields)==2 {
+        if len(fields[1])!=37 or not str_starts_with(fields[1],"guid=") { return false; }
+        for c in str_to_bytes(str_slice(fields[1],5,37)) {
+            if not ((c>=48 and c<=57) or (c>=97 and c<=102)) { return false; }
+        }
+    }
+    return true;
+}
+fn new(native) {
+    let s=map{ closed:false,bound:false,cleanup_ok:true,pid:0,app:0,target:0,refs:[],chain:[],path:[],watched:[] };
+    fn own(p) { if not integer(p,1,9007199254740991) { throw "accessible object unavailable"; }array_push(s.refs,p);return p; }
+    fn discard(p) { native.release(p);return true; }
+    fn release_last() {
+        let p=s.refs[len(s.refs)-1];array_pop(s.refs);
+        if (try discard(p) catch false)!=true { s.cleanup_ok=false;throw "accessible release failed"; }
+        return true;
+    }
+    fn close_native() { native.close();return true; }
+    fn close() {
+        if not s.closed {
+            s.closed=true;s.bound=false;
+            while len(s.refs)>0 { try release_last() catch nil; }
+            if (try close_native() catch false)!=true { s.cleanup_ok=false; }
+        }
+        return map{ok:s.cleanup_ok,closed:true};
+    }
+    fn valid_target() {
+        if s.closed or s.target==0 or native.pid(s.app)!=s.pid or native.pid(s.target)!=s.pid { return false; }
+        if not Lifetime.permits(native.events(),s.watched) { return false; }
+        // Some toolkits report SHOWING for hidden objects. Require the same
+        // live path as well; never silently bind the replacement at that index.
+        let parent=s.app;
+        for i len(s.chain) {
+            let count=native.count(parent);
+            if not integer(count,1,256) or s.path[i]>=count { return false; }
+            let child=own(native.child(parent,s.path[i]));let same=child==s.chain[i];release_last();
+            if not same or native.pid(child)!=s.pid { return false; }
+            parent=child;
+        }
+        let role=native.role(s.target);
+        // Public AtspiRole enum: TEXT=61, ENTRY=79. Reported password roles
+        // are excluded; GTK can misreport a masked field, so keep disabled.
+        if role!=61 and role!=79 { return false; }
+        let flags=native.flags(s.target);
+        return integer(flags,0,511) and bit_and(flags,31)==31 and bit_and(flags,480)==0
+            and Lifetime.permits(native.events(),s.watched);
+    }
+    fn select(pid,path) {
+        if s.closed or s.bound or not integer(pid,1,2147483647) or type(path)!="array" or len(path)<1 or len(path)>16 { return false; }
+        for index in path { if not integer(index,0,255) { return false; } }
+        let root=own(native.root());let count=native.count(root);
+        if not integer(count,0,64) { return false; }
+        for i count {
+            let app=own(native.child(root,i));let found=native.pid(app);
+            if not integer(found,1,2147483647) { return false; }
+            if found==pid {
+                if s.app!=0 { return false; }
+                s.app=app;
+            } else { release_last(); }
+        }
+        if s.app==0 { return false; }
+        s.pid=pid;let current=s.app;array_push(s.watched,s.app);
+        for index in path {
+            let n=native.count(current);
+            if not integer(n,1,256) or index>=n { return false; }
+            current=own(native.child(current,index));
+            if native.pid(current)!=pid { return false; }
+            array_push(s.chain,current);array_push(s.path,index);
+            array_push(s.watched,current);
+        }
+        s.target=current;if not valid_target() { return false; }
+        s.bound=true;return true;
+    }
+    fn bind(pid,path) {
+        if s.closed or s.bound { return false; }
+        let ok=try select(pid,path) catch false;
+        if ok!=true { close();return false; }return true;
+    }
+    fn status() {
+        if s.bound and (try valid_target() catch false)!=true { close(); }
+        return map{bound:s.bound,closed:s.closed,cleanup_confirmed:s.closed and s.cleanup_ok,scope:"selected-editable-text",capture_restricted:false,
+            pointer_supported:false,password_detection_guaranteed:false,lifetime_event_latching:true,
+            lifetime_coverage:"reported-atspi-events",application_behavior_isolated:false};
+    }
+    fn apply(action) {
+        if not s.bound or not valid_target() or type(action)!="map" { return false; }
+        for key in map_keys(action) { if key!="format" and key!="kind" and key!="text" { return false; } }
+        if action.format!="pblang.input.event.v1" or action.kind!="type" or type(action.text)!="string" { return false; }
+        let bytes=str_to_bytes(action.text);if len(bytes)<1 or len(bytes)>4096 { return false; }
+        for b in bytes { if b==0 or b==127 or (b<32 and b!=9 and b!=10) { return false; } }
+        let offset=native.caret(s.target);if not integer(offset,0,2147483647) { return false; }
+        // Re-check after the caret query; the call still addresses the bound object.
+        if not valid_target() { return false; }
+        return native.insert(s.target,action.text)==true;
+    }
+    fn execute(action) {
+        let ok=try apply(action) catch false;
+        if ok!=true { close();return map{ok:false,error:"Selected text field unavailable or operation refused; no fallback or retry"}; }
+        return map{ok:true,result:map{backend:"atspi-editable-text",operation:"insert",application_reported_success:true}};
+    }
+    return map{bind:bind,status:status,execute:execute,close:close};
+}
+fn open_native() {
+    if platform()!="linux" { throw "text accessibility backend unavailable"; }
+    if not valid_bus_address(env_get("AT_SPI_BUS_ADDRESS")) { throw "one explicit local accessibility bus required"; }
+    if native_lifetime.attempted { throw "text backend requires a fresh worker"; }
+    native_lifetime.attempted=true;
+    let lib=ffi_load(cwd()+"/transport/desktop_text_abi.so");native_lifetime.library=lib;
+    let state=map{closed:false};
+    let owner=try ffi_call_typed(lib,"pbtext_open","->i64",[]) catch 0;
+    if owner==0 { throw "explicit local accessibility bus unavailable or already owned"; }
+    fn call(name,sig,args) { if state.closed { throw "text backend closed"; }return ffi_call_typed(lib,"pbtext_"+name,sig,args); }
+    fn close() {
+        if not state.closed {
+            state.closed=true;let ok=try ffi_call_typed(lib,"pbtext_close","i64->i64",[owner]) catch 0;
+            if ok!=1 { throw "native text cleanup unconfirmed"; }
+        }
+    }
+    return new(map{root:fn() { return call("root","->i64",[]); },count:fn(p) { return call("count","i64->i64",[p]); },
+        child:fn(p,i) { return call("child","i64,i64->i64",[p,i]); },pid:fn(p) { return call("pid","i64->i64",[p]); },
+        role:fn(p) { return call("role","i64->i64",[p]); },flags:fn(p) { return call("flags","i64->i64",[p]); },
+        events:fn() { return json_parse(call("events","->string",[])); },
+        caret:fn(p) { return call("caret","i64->i64",[p]); },
+        insert:fn(p,t) { return call("insert","i64,string->i64",[p,t])==1; },
+        release:fn(p) { call("unref","i64->i64",[p]); },close:close});
+}
+fn open(enabled=false) { return Implementations.open(enabled,"atspi_text",map{atspi_text:open_native}); }
+export new,open,valid_bus_address;

@@ -1,0 +1,275 @@
+// Privacy-minimized SSH key and permission audit for the current Linux user.
+
+let SEC = import("security.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let SHA256 = import("stdlib:sha256_pb.sapp");
+
+fn _strict(args, allowed) {
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "SSH key audit arguments must be an object"; }
+    let keys = map_keys(args);
+    for i len(keys) {
+        let found = false;
+        for j len(allowed) { if keys[i] == allowed[j] { found = true; break; } }
+        if not found { throw "unknown SSH key audit argument: " + str(keys[i]); }
+    }
+    return args;
+}
+
+fn _integer(value, label, low, high, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value) or value < low or value > high {
+        throw label + " must be an integer between " + str(low) + " and " + str(high);
+    }
+    return value;
+}
+
+fn _words(line) {
+    let raw = str_split(str_trim(str_replace_all(str(line), "\t", " ")), " "); let out = [];
+    for i len(raw) { if raw[i] != "" { out[len(out)] = raw[i]; } }
+    return out;
+}
+
+fn _known_type(value) {
+    return value == "ssh-dss" or value == "ssh-rsa" or value == "ssh-ed25519"
+        or str_starts_with(value, "ecdsa-sha2-")
+        or str_starts_with(value, "sk-ssh-ed25519@")
+        or str_starts_with(value, "sk-ecdsa-sha2-")
+        or str_contains(value, "-cert-v01@openssh.com");
+}
+
+fn _u32(bytes, offset) {
+    if offset < 0 or offset + 4 > len(bytes) { return nil; }
+    return bytes[offset] * 16777216 + bytes[offset + 1] * 65536
+        + bytes[offset + 2] * 256 + bytes[offset + 3];
+}
+
+fn _field(bytes, offset) {
+    let size = _u32(bytes, offset);
+    if size == nil or size < 0 or size > 16384 or offset + 4 + size > len(bytes) { return nil; }
+    return map{ value: slice(bytes, offset + 4, offset + 4 + size), next: offset + 4 + size };
+}
+
+fn _integer_bits(bytes) {
+    let i = 0;
+    while i < len(bytes) and bytes[i] == 0 { i = i + 1; }
+    if i >= len(bytes) { return 0; }
+    let first = bytes[i]; let leading = 0; let mask = 128;
+    while mask > 0 and bit_and(first, mask) == 0 { leading = leading + 1; mask = num_floor(mask / 2); }
+    return (len(bytes) - i) * 8 - leading;
+}
+
+fn rsa_bits(blob) {
+    if type(blob) != "array" or len(blob) > 16384 { return nil; }
+    let algorithm = _field(blob, 0); if algorithm == nil { return nil; }
+    let algorithm_text = try bytes_to_str(algorithm.value) catch "";
+    if algorithm_text != "ssh-rsa" { return nil; }
+    let exponent = _field(blob, algorithm.next); if exponent == nil { return nil; }
+    let modulus = _field(blob, exponent.next); if modulus == nil or modulus.next != len(blob) { return nil; }
+    return _integer_bits(modulus.value);
+}
+
+fn _add(state, line, key_type, fingerprint, issue, severity) {
+    state.issue_total = state.issue_total + 1;
+    if len(state.issues) >= state.maximum { state.truncated = true; return; }
+    state.issues[len(state.issues)] = map{
+        line: line, key_type: key_type, fingerprint_sha256_hex: fingerprint,
+        issue: issue, severity: severity, key_material_exposed: false,
+        comment_exposed: false, heuristic: false
+    };
+}
+
+fn analyze_authorized_keys(text, options = nil) {
+    options = _strict(options, ["max_keys", "max_issues"]);
+    if type(text) != "string" or len(text) > 1048576 {
+        throw "authorized_keys text must be at most 1048576 characters";
+    }
+    let max_keys = _integer(try options.max_keys catch nil, "max_keys", 1, 10000, 1000);
+    let max_issues = _integer(try options.max_issues catch nil, "max_issues", 1, 500, 100);
+    let state = map{ issues: [], issue_total: 0, maximum: max_issues, truncated: false };
+    let keys = 0; let valid = 0; let lines = str_split(text, "\n"); let seen = map{};
+    // authorized_keys frequently repeats the same key with different options.
+    // Cache only validated public metadata for this bounded call; no secret or
+    // comment is retained, and the cache disappears with the result.
+    let decoded_cache = map{};
+    let keys_truncated = false;
+    for i len(lines) {
+        let line = str_trim(lines[i]);
+        if line == "" or str_starts_with(line, "#") { continue; }
+        keys = keys + 1;
+        if keys > max_keys { keys_truncated = true; continue; }
+        let words = _words(line); let type_index = -1;
+        for w len(words) {
+            if type_index < 0 and _known_type(words[w]) { type_index = w; }
+        }
+        if type_index < 0 or type_index + 1 >= len(words) {
+            _add(state, i + 1, "unknown", "", "malformed-or-unknown-key-entry", "high");
+            continue;
+        }
+        let key_type = words[type_index]; let encoded = words[type_index + 1];
+        if len(encoded) < 16 or len(encoded) > 32768
+           or not regex_match(encoded, "^[A-Za-z0-9+/]+={0,2}$") {
+            _add(state, i + 1, key_type, "", "invalid-public-key-encoding", "high");
+            continue;
+        }
+        let cache_key = key_type + ":" + encoded;
+        let metadata = try decoded_cache[cache_key] catch nil;
+        if metadata == nil {
+            let blob = try base64_decode_bytes(encoded) catch nil;
+            if blob == nil or len(blob) < 8 or len(blob) > 16384 {
+                _add(state, i + 1, key_type, "", "invalid-public-key-blob", "high");
+                continue;
+            }
+            let embedded = _field(blob, 0);
+            let embedded_type = if embedded == nil { "" } else { try bytes_to_str(embedded.value) catch "" };
+            metadata = map{ valid_type: embedded != nil and embedded_type == key_type,
+                fingerprint: SHA256.sha256_hex_bytes(blob), rsa_bits: nil };
+            if key_type == "ssh-rsa" { metadata.rsa_bits = rsa_bits(blob); }
+            decoded_cache[cache_key] = metadata;
+        }
+        let fingerprint = metadata.fingerprint;
+        if not metadata.valid_type {
+            _add(state, i + 1, key_type, fingerprint, "key-type-blob-mismatch", "high");
+            continue;
+        }
+        valid = valid + 1;
+        if map_has(seen, fingerprint) {
+            _add(state, i + 1, key_type, fingerprint, "duplicate-authorized-key", "medium");
+        } else { seen[fingerprint] = true; }
+        if key_type == "ssh-dss" {
+            _add(state, i + 1, key_type, fingerprint, "deprecated-dsa-key", "high");
+        } elif key_type == "ssh-rsa" {
+            let bits = metadata.rsa_bits;
+            if bits == nil {
+                _add(state, i + 1, key_type, fingerprint, "malformed-rsa-wire-blob", "high");
+            } elif bits < 2048 {
+                _add(state, i + 1, key_type, fingerprint, "rsa-modulus-below-2048-bits", "high");
+            }
+        }
+    }
+    return map{
+        format: "pb_mcp.authorized-keys-audit.v1", key_entries: keys,
+        valid_keys: valid, unique_valid_keys: len(map_keys(seen)),
+        issues: state.issues, issue_count: state.issue_total,
+        returned_issues: len(state.issues), issues_truncated: state.truncated,
+        keys_truncated: keys_truncated, parse_complete: not keys_truncated,
+        key_material_exposed: false, comments_exposed: false,
+        raw_lines_exposed: false, fingerprints_are_public_key_hashes: true
+        , decoded_public_key_cache_entries: len(map_keys(decoded_cache))
+    };
+}
+
+fn _mode_issue(mode, kind) {
+    let permissions = bit_and(mode, 4095);
+    if kind == "directory" and bit_and(permissions, 63) != 0 { return "ssh-directory-group-or-world-accessible"; }
+    if kind == "authorized-keys" and bit_and(permissions, 18) != 0 { return "authorized-keys-group-or-world-writable"; }
+    if kind == "private-key" and bit_and(permissions, 63) != 0 { return "private-key-group-or-world-accessible"; }
+    return nil;
+}
+
+fn _private_name(name) {
+    return (str_starts_with(name, "id_") and not str_ends_with(name, ".pub"))
+        or str_ends_with(name, ".pem") or str_ends_with(name, ".key");
+}
+
+fn _home() {
+    let home = try env_get("HOME") catch nil;
+    if type(home) != "string" or not str_starts_with(home, "/") or len(home) < 2
+       or len(home) > 4096 or str_contains(home, str_from_char_code(0)) {
+        throw "a safe absolute HOME is required for SSH key audit";
+    }
+    return home;
+}
+
+fn _ssh_present(home) {
+    let root = DIRFS.open_absolute(home, false, false);
+    if not root.ok { return map{ known: false, present: false }; }
+    let listed = DIRFS.list(root, "root", 4096); DIRFS.close(root);
+    if not listed.ok or listed.truncated { return map{ known: false, present: false }; }
+    for i len(listed.entries) { if listed.entries[i] == ".ssh" { return map{ known: true, present: true }; } }
+    return map{ known: true, present: false };
+}
+
+fn audit(args) {
+    args = _strict(args, ["path", "max_files", "max_keys", "max_issues", "max_authorized_key_bytes"]);
+    SEC.require_trusted("SSH key audit", "PB_PROTECT_INSPECT_ENABLE");
+    if platform() != "linux" { throw "SSH key audit currently requires Linux descriptor backends"; }
+    let home = _home(); let expected = home + "/.ssh";
+    let requested = try args.path catch expected;
+    if type(requested) != "string" or requested != expected {
+        throw "SSH key audit is restricted to the current HOME/.ssh boundary";
+    }
+    let max_files = _integer(try args.max_files catch nil, "max_files", 1, 500, 100);
+    let max_keys = _integer(try args.max_keys catch nil, "max_keys", 1, 10000, 1000);
+    let max_issues = _integer(try args.max_issues catch nil, "max_issues", 1, 500, 100);
+    let max_bytes = _integer(try args.max_authorized_key_bytes catch nil,
+        "max_authorized_key_bytes", 1, 1048576, 262144);
+    let present = _ssh_present(home);
+    if present.known and not present.present {
+        return map{ format: "pb_mcp.protect_ssh_key_audit.v2", ok: true,
+            complete: true, ssh_directory_present: false, keys_found: 0,
+            private_key_files: 0, issues: [], issue_count: 0,
+            key_material_exposed: false, comments_exposed: false,
+            home_path_exposed: false, race_resistant: true, symlinks_followed: false };
+    }
+    let fs = DIRFS.open_absolute(expected, false, false);
+    if not fs.ok { throw "HOME/.ssh is missing, unsafe, or cannot be held without following links"; }
+    let state = map{ issues: [], issue_total: 0, maximum: max_issues, truncated: false };
+    let directory_meta = DIRFS.metadata(fs, "root");
+    if not directory_meta.ok { DIRFS.close(fs); throw "held SSH directory metadata is unavailable"; }
+    let directory_issue = _mode_issue(directory_meta.mode, "directory");
+    if directory_issue != nil { _add(state, 0, "filesystem", "", directory_issue, "high"); }
+    let listed = DIRFS.list(fs, "root", max_files + 1);
+    if not listed.ok { DIRFS.close(fs); throw "held SSH directory cannot be listed"; }
+    let files_truncated = listed.truncated or len(listed.entries) > max_files;
+    let keys_found = 0; let valid_keys = 0; let private_files = 0; let read_errors = 0;
+    let inspected = 0;
+    for i len(listed.entries) {
+        if inspected >= max_files { break; }
+        let name = str(listed.entries[i]);
+        if name != "authorized_keys" and name != "authorized_keys2" and not _private_name(name) { continue; }
+        inspected = inspected + 1; let metadata = DIRFS.metadata(fs, name);
+        if not metadata.ok or metadata.kind != "file" {
+            read_errors = read_errors + 1;
+            _add(state, 0, "filesystem", "", "SSH-key-file-refused-or-symlink", "high");
+            continue;
+        }
+        if name == "authorized_keys" or name == "authorized_keys2" {
+            let mode_issue = _mode_issue(metadata.mode, "authorized-keys");
+            if mode_issue != nil { _add(state, 0, "filesystem", "", mode_issue, "high"); }
+            let loaded = DIRFS.read_prefix_bytes(fs, name, max_bytes);
+            if not loaded.ok or loaded.truncated {
+                read_errors = read_errors + 1; continue;
+            }
+            let text = try bytes_to_str(loaded.bytes) catch nil;
+            if text == nil { read_errors = read_errors + 1; continue; }
+            let parsed = analyze_authorized_keys(text, map{ max_keys: max_keys, max_issues: max_issues });
+            keys_found = keys_found + parsed.key_entries; valid_keys = valid_keys + parsed.valid_keys;
+            state.issue_total = state.issue_total + parsed.issue_count;
+            for p len(parsed.issues) {
+                if len(state.issues) < state.maximum { state.issues[len(state.issues)] = parsed.issues[p]; }
+                else { state.truncated = true; }
+            }
+            if parsed.issues_truncated or parsed.keys_truncated { state.truncated = true; }
+        } else {
+            private_files = private_files + 1;
+            let mode_issue = _mode_issue(metadata.mode, "private-key");
+            if mode_issue != nil { _add(state, 0, "private-key", "", mode_issue, "high"); }
+        }
+    }
+    DIRFS.close(fs);
+    let complete = not files_truncated and read_errors == 0 and not state.truncated;
+    return map{
+        format: "pb_mcp.protect_ssh_key_audit.v2", ok: complete and state.issue_total == 0,
+        complete: complete, ssh_directory_present: true, files_inspected: inspected,
+        keys_found: keys_found, valid_keys: valid_keys, private_key_files: private_files,
+        issues: state.issues, issue_count: state.issue_total,
+        returned_issues: len(state.issues), issues_truncated: state.truncated,
+        files_truncated: files_truncated, read_errors: read_errors,
+        key_material_exposed: false, comments_exposed: false, raw_lines_exposed: false,
+        home_path_exposed: false, other_users_supported: false,
+        race_resistant: true, symlinks_followed: false, descriptor_bound_metadata: true
+    };
+}
+
+export rsa_bits, analyze_authorized_keys, audit;

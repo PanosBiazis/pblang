@@ -1,0 +1,798 @@
+// Bounded native PBLang data-analysis tools.
+
+let CSV = import("stdlib:csv.sapp");
+let JSON = import("stdlib:json.sapp");
+let PARQUET = import("stdlib:parquet.sapp");
+let sec = import("security.sapp");
+
+let DATA_TOOLS = [
+    "data_csv_analyze", "data_diff_jsonl", "data_json_flatten", "data_regex_extract",
+    "data_timeseries_detect", "data_parquet_read"
+];
+let MAX_JSONL_CHARS = 2000000;
+let MAX_JSONL_RECORDS = 100000;
+let MAX_JSONL_LINE_CHARS = 100000;
+let MAX_DIFF_DETAIL_CHARS = 250000;
+let MAX_REGEX_CHARS = 4096;
+let MAX_REGEX_LINES = 20000;
+let MAX_REGEX_LINE_CHARS = 20000;
+let MAX_REGEX_DETAIL_CHARS = 250000;
+let MAX_FLATTEN_ENTRIES = 100000;
+let MAX_FLATTEN_DEPTH = 64;
+let MAX_FLATTEN_OUTPUT_CHARS = 500000;
+let MAX_PARQUET_BYTES = 4194304;
+
+fn _contains(items, value) {
+    for item_index len(items) {
+        if items[item_index] == value { return true; }
+    }
+    return false;
+}
+
+fn _bounded_text(value, limit) {
+    let text = str(value);
+    if len(text) <= limit { return text; }
+    return str_slice(text, 0, limit);
+}
+
+fn _validate_csv_structure(text, delimiter) {
+    let bytes = str_to_bytes(text);
+    let delimiter_byte = str_to_bytes(delimiter)[0];
+    let quoted = false;
+    let field_start = true;
+    let quote_closed = false;
+    let index = 0;
+    while index < len(bytes) {
+        let byte = bytes[index];
+        if byte == 34 {
+            if quoted and index + 1 < len(bytes) and bytes[index + 1] == 34 {
+                index = index + 2;
+                continue;
+            }
+            if quoted {
+                quoted = false;
+                quote_closed = true;
+            } else {
+                if not field_start { throw "CSV quote must begin at the start of a field"; }
+                quoted = true;
+                field_start = false;
+            }
+        } else if not quoted and byte == delimiter_byte {
+            field_start = true;
+            quote_closed = false;
+        } else if not quoted and byte == 10 {
+            field_start = true;
+            quote_closed = false;
+        } else if not quoted and byte == 13 {
+            if index + 1 >= len(bytes) or bytes[index + 1] != 10 {
+                throw "CSV carriage return must be followed by a newline";
+            }
+        } else {
+            if quote_closed { throw "CSV field contains data after its closing quote"; }
+            field_start = false;
+        }
+        index = index + 1;
+    }
+    if quoted { throw "CSV contains an unterminated quoted field"; }
+}
+
+fn _is_null_cell(value) {
+    let normalized = str_lower(str_trim(value));
+    return normalized == "" or normalized == "null" or normalized == "n/a" or
+           normalized == "na" or normalized == "\\n";
+}
+
+fn _is_numeric_cell(value) {
+    let normalized = str_lower(str_trim(value));
+    if normalized == "" or normalized == "nan" or normalized == "+nan" or normalized == "-nan" or
+       normalized == "inf" or normalized == "+inf" or normalized == "-inf" or
+       normalized == "infinity" or normalized == "+infinity" or normalized == "-infinity" {
+        return false;
+    }
+    let parsed = try parse_number(normalized) catch nil;
+    return parsed != nil;
+}
+
+fn data_csv_analyze(args) {
+    if args == nil or not map_has(args, "text") or type(args.text) != "string" {
+        throw "text must be a non-empty CSV string";
+    }
+    let text = args.text;
+    let delimiter = try args.delimiter catch ",";
+    let max_rows = try args.max_rows catch 1000;
+    if len(text) == 0 { throw "CSV text must not be empty"; }
+    if len(text) > 2000000 { throw "CSV text exceeds the 2000000-character limit"; }
+    if type(delimiter) != "string" or not _contains([",", ";", "\t", "|"], delimiter) {
+        throw "delimiter must be comma, semicolon, tab, or pipe";
+    }
+    if type(max_rows) != "number" or num_floor(max_rows) != max_rows or
+       max_rows < 1 or max_rows > 100000 {
+        throw "max_rows must be an integer in 1..100000";
+    }
+    _validate_csv_structure(text, delimiter);
+    let rows = CSV.parse_options(text, map{
+        delimiter: delimiter, header: false, typed: false,
+        max_chars: 2000000, max_rows: 100001, max_columns: 256
+    });
+    if len(rows) == 0 { throw "CSV has no non-empty records"; }
+    let raw_headers = rows[0];
+    if type(raw_headers) != "array" or len(raw_headers) == 0 or len(raw_headers) > 256 {
+        throw "CSV header must contain 1 to 256 columns";
+    }
+    let headers = [];
+    for header_index len(raw_headers) {
+        let name = str_trim(raw_headers[header_index]);
+        if name == "" or len(name) > 256 { throw "CSV headers must contain 1 to 256 characters"; }
+        if _contains(headers, name) { throw "duplicate CSV header: " + name; }
+        headers[header_index] = name;
+    }
+
+    let available_rows = len(rows) - 1;
+    let row_count = if available_rows < max_rows { available_rows } else { max_rows };
+    let null_counts = [];
+    let numeric_counts = [];
+    let samples = [];
+    for init_index len(headers) {
+        null_counts[init_index] = 0;
+        numeric_counts[init_index] = 0;
+        samples[init_index] = [];
+    }
+    let preview = [];
+    for row_index row_count {
+        let row = rows[row_index + 1];
+        if type(row) != "array" or len(row) > len(headers) {
+            throw "CSV row " + str(row_index + 2) + " has more fields than the header";
+        }
+        let preview_row = map{};
+        for cell_index len(headers) {
+            let cell = if cell_index < len(row) { str(row[cell_index]) } else { "" };
+            if len(cell) > 20000 { throw "CSV cells are capped at 20000 characters"; }
+            if _is_null_cell(cell) {
+                null_counts[cell_index] = null_counts[cell_index] + 1;
+            } else {
+                if _is_numeric_cell(cell) {
+                    numeric_counts[cell_index] = numeric_counts[cell_index] + 1;
+                }
+                if len(samples[cell_index]) < 5 {
+                    samples[cell_index][len(samples[cell_index])] = _bounded_text(str_trim(cell), 512);
+                }
+            }
+            if row_index < 3 {
+                preview_row[headers[cell_index]] = _bounded_text(cell, 512);
+            }
+        }
+        if row_index < 3 { preview[len(preview)] = preview_row; }
+    }
+
+    let column_stats = [];
+    for stats_index len(headers) {
+        let non_null = row_count - null_counts[stats_index];
+        let inferred = "unknown";
+        if non_null > 0 {
+            inferred = if numeric_counts[stats_index] / non_null >= 0.9 { "numeric" } else { "string" };
+        }
+        column_stats[stats_index] = map{
+            name: headers[stats_index], type: inferred,
+            null_count: null_counts[stats_index], numeric_count: numeric_counts[stats_index],
+            sample_values: samples[stats_index]
+        };
+    }
+    return map{
+        format: "pb_mcp.data_csv_analysis.v1",
+        row_count: row_count, available_row_count: available_rows,
+        columns: len(headers), col_count: len(headers), column_stats: column_stats,
+        header: headers, preview: preview,
+        delimiter: delimiter, truncated: available_rows > row_count,
+        max_rows: max_rows, sample_value_max_chars: 512
+    };
+}
+
+fn _parse_jsonl(text, label, max_records) {
+    if type(text) != "string" or len(text) == 0 { throw label + " must be a non-empty JSONL string"; }
+    if len(text) > MAX_JSONL_CHARS { throw label + " exceeds the 2000000-character limit"; }
+    let lines = str_split(text, "\n");
+    let records = [];
+    let source_lines = [];
+    for line_index len(lines) {
+        let line = str_trim(lines[line_index]);
+        if line != "" {
+            if len(records) >= max_records { throw label + " exceeds max_records"; }
+            if len(line) > MAX_JSONL_LINE_CHARS {
+                throw label + " line " + str(line_index + 1) + " exceeds 100000 characters";
+            }
+            let decoded = try map{ ok: true, value: JSON.parse(line) } catch map{ ok: false };
+            if not decoded.ok {
+                throw label + " line " + str(line_index + 1) + " is malformed JSON";
+            }
+            if type(decoded.value) != "map" {
+                throw label + " line " + str(line_index + 1) + " must contain a JSON object";
+            }
+            records[len(records)] = decoded.value;
+            source_lines[len(source_lines)] = line_index + 1;
+        }
+    }
+    return map{ records: records, source_lines: source_lines };
+}
+
+fn _typed_key(value, label, line, key_field) {
+    let kind = type(value);
+    if kind != "string" and kind != "number" and kind != "bool" {
+        throw label + " line " + str(line) + " field '" + key_field +
+              "' must be a string, number, or boolean";
+    }
+    return str_slice(kind, 0, 1) + ":" + JSON.stringify(value);
+}
+
+fn _key_index(parsed, label, key_field) {
+    let records = parsed.records;
+    let index = map{};
+    let display = map{};
+    let order = [];
+    for record_index len(records) {
+        let record = records[record_index];
+        let line = parsed.source_lines[record_index];
+        if not map_has(record, key_field) {
+            throw label + " line " + str(line) + " is missing key field '" + key_field + "'";
+        }
+        let encoded = _typed_key(record[key_field], label, line, key_field);
+        if map_has(index, encoded) {
+            throw label + " contains duplicate key " + JSON.stringify(record[key_field]);
+        }
+        index[encoded] = record;
+        display[encoded] = record[key_field];
+        order[len(order)] = encoded;
+    }
+    return map{ records: index, display: display, order: order };
+}
+
+fn _emit_detail(state, destination, value, max_changes) {
+    let encoded_chars = len(JSON.stringify(value));
+    if state.emitted >= max_changes or state.chars + encoded_chars > MAX_DIFF_DETAIL_CHARS {
+        state.truncated = true;
+        return;
+    }
+    destination[len(destination)] = value;
+    state.emitted = state.emitted + 1;
+    state.chars = state.chars + encoded_chars;
+}
+
+fn data_diff_jsonl(args) {
+    if args == nil { args = map{}; }
+    let text_a = try args.text_a catch nil;
+    let text_b = try args.text_b catch nil;
+    let key_field = try args.key_field catch "";
+    let max_records = try args.max_records catch 100000;
+    let max_changes = try args.max_changes catch 1000;
+    if type(key_field) != "string" or len(key_field) > 256 {
+        throw "key_field must be a string of at most 256 characters";
+    }
+    if type(max_records) != "number" or num_floor(max_records) != max_records or
+       max_records < 1 or max_records > MAX_JSONL_RECORDS {
+        throw "max_records must be an integer in 1..100000";
+    }
+    if type(max_changes) != "number" or num_floor(max_changes) != max_changes or
+       max_changes < 0 or max_changes > 10000 {
+        throw "max_changes must be an integer in 0..10000";
+    }
+    let left = _parse_jsonl(text_a, "text_a", max_records);
+    let right = _parse_jsonl(text_b, "text_b", max_records);
+    let added = [];
+    let removed = [];
+    let modified = [];
+    let added_count = 0;
+    let removed_count = 0;
+    let modified_count = 0;
+    let unchanged_count = 0;
+    let detail = map{ emitted: 0, chars: 0, truncated: false };
+
+    if key_field != "" {
+        let left_index = _key_index(left, "text_a", key_field);
+        let right_index = _key_index(right, "text_b", key_field);
+        for order_index len(left_index.order) {
+            let encoded = left_index.order[order_index];
+            let before = left_index.records[encoded];
+            if not map_has(right_index.records, encoded) {
+                removed_count = removed_count + 1;
+                _emit_detail(detail, removed, before, max_changes);
+            } else if not JSON.equal(before, right_index.records[encoded]) {
+                modified_count = modified_count + 1;
+                _emit_detail(detail, modified, map{
+                    key: left_index.display[encoded], before: before,
+                    after: right_index.records[encoded]
+                }, max_changes);
+            } else {
+                unchanged_count = unchanged_count + 1;
+            }
+        }
+        for order_index len(right_index.order) {
+            let encoded = right_index.order[order_index];
+            if not map_has(left_index.records, encoded) {
+                added_count = added_count + 1;
+                _emit_detail(detail, added, right_index.records[encoded], max_changes);
+            }
+        }
+    } else {
+        let common = if len(left.records) < len(right.records) { len(left.records) } else { len(right.records) };
+        for position common {
+            if JSON.equal(left.records[position], right.records[position]) {
+                unchanged_count = unchanged_count + 1;
+            } else {
+                modified_count = modified_count + 1;
+                _emit_detail(detail, modified, map{
+                    position: position, before: left.records[position], after: right.records[position]
+                }, max_changes);
+            }
+        }
+        let position = common;
+        while position < len(left.records) {
+            removed_count = removed_count + 1;
+            _emit_detail(detail, removed, left.records[position], max_changes);
+            position = position + 1;
+        }
+        position = common;
+        while position < len(right.records) {
+            added_count = added_count + 1;
+            _emit_detail(detail, added, right.records[position], max_changes);
+            position = position + 1;
+        }
+    }
+    return map{
+        format: "pb_mcp.data_jsonl_diff.v1", mode: if key_field == "" { "position" } else { "key" },
+        key_field: if key_field == "" { nil } else { key_field },
+        left_count: len(left.records), right_count: len(right.records),
+        left_lines: len(left.records), right_lines: len(right.records),
+        added_count: added_count, removed_count: removed_count,
+        modified_count: modified_count, unchanged_count: unchanged_count,
+        change_count: added_count + removed_count + modified_count,
+        equal: added_count == 0 and removed_count == 0 and modified_count == 0,
+        added: added, removed: removed, modified: modified,
+        details_emitted: detail.emitted, details_truncated: detail.truncated,
+        max_changes: max_changes, detail_max_chars: MAX_DIFF_DETAIL_CHARS
+    };
+}
+
+fn _flatten_key(prefix, component, separator, array_component) {
+    if prefix == "" { return component; }
+    if array_component and separator == "brackets" { return prefix + "[" + component + "]"; }
+    return prefix + separator + component;
+}
+
+fn _flatten_emit(state, key, value) {
+    if key == "" { key = "$"; }
+    if len(key) > 4096 { throw "flattened JSON key exceeds 4096 characters"; }
+    if map_has(state.output, key) { throw "flattened JSON key collision: " + key; }
+    if state.count >= state.max_entries { throw "flattened JSON exceeds max_entries"; }
+    let added_chars = len(key) + len(JSON.stringify(value));
+    if state.chars + added_chars > MAX_FLATTEN_OUTPUT_CHARS {
+        throw "flattened JSON exceeds the 500000-character output budget";
+    }
+    state.output[key] = value;
+    state.count = state.count + 1;
+    state.chars = state.chars + added_chars;
+}
+
+fn _flatten_json_value(value, prefix, separator, array_style, depth, state) {
+    if depth > MAX_FLATTEN_DEPTH { throw "JSON nesting exceeds the 64-level flatten limit"; }
+    if type(value) == "map" {
+        let keys = map_keys(value);
+        if len(keys) == 0 { _flatten_emit(state, prefix, map{}); return; }
+        for key_index len(keys) {
+            let component = str(keys[key_index]);
+            if len(component) > 1024 { throw "JSON object keys are capped at 1024 characters"; }
+            let next = _flatten_key(prefix, component, separator, false);
+            _flatten_json_value(value[keys[key_index]], next, separator, array_style,
+                depth + 1, state);
+        }
+        return;
+    }
+    if type(value) == "array" {
+        if len(value) == 0 { _flatten_emit(state, prefix, []); return; }
+        for item_index len(value) {
+            let component = str(item_index);
+            let next = _flatten_key(prefix, component,
+                if array_style == "brackets" { "brackets" } else { separator }, true);
+            _flatten_json_value(value[item_index], next, separator, array_style,
+                depth + 1, state);
+        }
+        return;
+    }
+    _flatten_emit(state, prefix, value);
+}
+
+fn data_json_flatten(args) {
+    if args == nil { args = map{}; }
+    let text = try args.text catch nil;
+    let separator = try args.separator catch ".";
+    let array_style = try args.array_style catch "separator";
+    let max_entries = try args.max_entries catch 10000;
+    if type(text) != "string" or len(text) == 0 or len(text) > MAX_JSONL_CHARS {
+        throw "text must contain 1 to 2000000 JSON characters";
+    }
+    if type(separator) != "string" or len(separator) < 1 or len(separator) > 8 or
+       str_contains(separator, "[") or str_contains(separator, "]") {
+        throw "separator must contain 1 to 8 characters without brackets";
+    }
+    if array_style != "separator" and array_style != "brackets" {
+        throw "array_style must be separator or brackets";
+    }
+    if type(max_entries) != "number" or num_floor(max_entries) != max_entries or
+       max_entries < 1 or max_entries > MAX_FLATTEN_ENTRIES {
+        throw "max_entries must be an integer in 1..100000";
+    }
+    let decoded = try map{ ok: true, value: JSON.parse(text) } catch map{ ok: false };
+    if not decoded.ok { throw "text contains malformed JSON"; }
+    let state = map{ output: map{}, count: 0, chars: 0, max_entries: max_entries };
+    _flatten_json_value(decoded.value, "", separator, array_style, 0, state);
+    return state.output;
+}
+
+fn _regex_group_keys(pattern) {
+    let keys = ["0"];
+    let escaped = false;
+    let in_class = false;
+    let index = 0;
+    while index < len(pattern) {
+        let character = str_slice(pattern, index, index + 1);
+        if escaped {
+            escaped = false;
+        } else if character == "\\" {
+            escaped = true;
+        } else if character == "[" and not in_class {
+            in_class = true;
+        } else if character == "]" and in_class {
+            in_class = false;
+        } else if character == "(" and not in_class {
+            let capturing = true;
+            let name = "";
+            if index + 1 < len(pattern) and str_slice(pattern, index + 1, index + 2) == "?" {
+                capturing = false;
+                let name_start = -1;
+                if index + 3 < len(pattern) and str_slice(pattern, index + 2, index + 4) == "P<" {
+                    name_start = index + 4;
+                } else if index + 2 < len(pattern) and
+                          str_slice(pattern, index + 2, index + 3) == "<" {
+                    name_start = index + 3;
+                }
+                if name_start >= 0 {
+                    let name_end = name_start;
+                    while name_end < len(pattern) and
+                          str_slice(pattern, name_end, name_end + 1) != ">" {
+                        name_end = name_end + 1;
+                    }
+                    if name_end < len(pattern) {
+                        name = str_slice(pattern, name_start, name_end);
+                        capturing = true;
+                    }
+                }
+            }
+            if capturing {
+                let group_index = len(keys);
+                keys[group_index] = if name == "" { str(group_index) } else { name };
+            }
+        }
+        index = index + 1;
+    }
+    return keys;
+}
+
+fn _regex_single_line_fast_path(pattern, text) {
+    if len(text) > 500000 { return false; }
+    if str_contains(text, "\r") or str_contains(pattern, "\n") or
+       str_contains(pattern, "\r") { return false; }
+    let cross_line_tokens = [
+        "\\s", "\\W", "\\D", "\\n", "\\r", "\\A", "\\z",
+        "\\x", "\\u", "\\p", "\\P", "[", "(?-m"
+    ];
+    for token_index len(cross_line_tokens) {
+        if str_contains(pattern, cross_line_tokens[token_index]) { return false; }
+    }
+    if regex_match(pattern, "\\(\\?[A-Za-z-]*s") { return false; }
+    return true;
+}
+
+fn _newline_count(text) {
+    let count = 0;
+    let bytes = str_to_bytes(text);
+    let index = 0;
+    while index < len(bytes) {
+        if bytes[index] == 10 { count = count + 1; }
+        index = index + 1;
+    }
+    return count;
+}
+
+fn _regex_groups(value, pattern, group_keys, cache) {
+    if map_has(cache, value) { return cache[value]; }
+    let captures = regex_capture(value, pattern);
+    let groups = map{};
+    if captures != nil {
+        let group_limit = if len(captures) < len(group_keys) {
+            len(captures)
+        } else {
+            len(group_keys)
+        };
+        for group_index group_limit {
+            if captures[group_index] != nil {
+                groups[group_keys[group_index]] = captures[group_index];
+            }
+        }
+    }
+    cache[value] = groups;
+    return groups;
+}
+
+fn _emit_regex_match(state, line_number, line, value, pattern, group_keys,
+                     group_cache, max_matches) {
+    state.total = state.total + 1;
+    if len(state.matches) >= max_matches {
+        state.truncated = true;
+        return;
+    }
+    let record = map{
+        line: line_number, text: line, match: value,
+        groups: _regex_groups(value, pattern, group_keys, group_cache)
+    };
+    let record_chars = len(JSON.stringify(record));
+    if state.chars + record_chars > MAX_REGEX_DETAIL_CHARS {
+        state.truncated = true;
+        return;
+    }
+    state.matches[len(state.matches)] = record;
+    state.chars = state.chars + record_chars;
+}
+
+fn data_regex_extract(args) {
+    if args == nil { args = map{}; }
+    let text = try args.text catch nil;
+    let pattern = try args.pattern catch nil;
+    let max_matches = try args.max_matches catch 100;
+    if type(text) != "string" or len(text) == 0 {
+        throw "text must be a non-empty string";
+    }
+    if len(text) > MAX_JSONL_CHARS { throw "text exceeds the 2000000-character limit"; }
+    if type(pattern) != "string" or len(pattern) == 0 or len(pattern) > MAX_REGEX_CHARS {
+        throw "pattern must contain 1 to 4096 characters";
+    }
+    if type(max_matches) != "number" or num_floor(max_matches) != max_matches or
+       max_matches < 0 or max_matches > 10000 {
+        throw "max_matches must be an integer in 0..10000";
+    }
+    let syntax = try map{ ok: true, empty: regex_match("", pattern) } catch map{ ok: false };
+    if not syntax.ok { throw "pattern is not a valid RE2-style regular expression"; }
+    if syntax.empty { throw "patterns that match an empty string are not supported"; }
+
+    let lines = str_split(text, "\n");
+    let line_count = len(lines);
+    if line_count > 0 and lines[line_count - 1] == "" { line_count = line_count - 1; }
+    if line_count > MAX_REGEX_LINES { throw "text exceeds the 20000-line regex limit"; }
+    if line_count * len(pattern) > 20000000 {
+        throw "regex compilation work exceeds the 20000000-character budget";
+    }
+    let group_keys = _regex_group_keys(pattern);
+    for line_index line_count {
+        let raw_line = lines[line_index];
+        let line_chars = len(raw_line) - if str_ends_with(raw_line, "\r") { 1 } else { 0 };
+        if line_chars > MAX_REGEX_LINE_CHARS {
+            throw "line " + str(line_index + 1) + " exceeds 20000 characters";
+        }
+    }
+    let state = map{ matches: [], total: 0, chars: 0, truncated: false };
+    let group_cache = map{};
+    let method = "bounded-line-regex-v1";
+    if _regex_single_line_fast_path(pattern, text) {
+        method = "single-compile-line-safe-regex-v1";
+        let effective_pattern = "(?m:" + pattern + ")";
+        let found = regex_find_all(text, effective_pattern);
+        let parts = regex_split(text, effective_pattern);
+        if len(parts) != len(found) + 1 { throw "regex engine returned an inconsistent split"; }
+        let line_number = 1;
+        for match_index len(found) {
+            line_number = line_number + _newline_count(parts[match_index]);
+            if str_contains(found[match_index], "\n") or str_contains(found[match_index], "\r") {
+                throw "regex matches must remain within one source line";
+            }
+            let source_line = lines[line_number - 1];
+            if str_ends_with(source_line, "\r") {
+                source_line = str_slice(source_line, 0, len(source_line) - 1);
+            }
+            _emit_regex_match(state, line_number, source_line, found[match_index],
+                effective_pattern, group_keys, group_cache, max_matches);
+        }
+    } else {
+        for fallback_line_index line_count {
+            let line = lines[fallback_line_index];
+            if str_ends_with(line, "\r") { line = str_slice(line, 0, len(line) - 1); }
+            let found = regex_find_all(line, pattern);
+            for match_index len(found) {
+                _emit_regex_match(state, fallback_line_index + 1, line, found[match_index],
+                    pattern, group_keys, group_cache, max_matches);
+            }
+        }
+    }
+    return map{
+        format: "pb_mcp.data_regex_extract.v1", source: "inline", path: nil,
+        pattern: pattern, syntax: "RE2-style", method: method, matches: state.matches,
+        total_matches: state.total, count: state.total,
+        details_emitted: len(state.matches), truncated: state.truncated,
+        max_matches: max_matches, detail_max_chars: MAX_REGEX_DETAIL_CHARS
+    };
+}
+
+fn _finite_number(value, label) {
+    let numeric_text = str_lower(str(value));
+    if type(value) != "number" or numeric_text == "nan" or numeric_text == "+nan" or numeric_text == "-nan" or
+       numeric_text == "inf" or numeric_text == "+inf" or numeric_text == "-inf" or
+       numeric_text == "infinity" or numeric_text == "+infinity" or numeric_text == "-infinity" or
+       value > 1000000000000 or value < -1000000000000 {
+        throw label + " must contain finite numbers in [-1e12, 1e12]";
+    }
+    return value;
+}
+
+fn _round6(value) {
+    if value >= 0 { return num_floor(value * 1000000 + 0.5) / 1000000; }
+    return num_ceil(value * 1000000 - 0.5) / 1000000;
+}
+
+fn data_timeseries_detect(args) {
+    if args == nil or not map_has(args, "values") or type(args.values) != "array" {
+        throw "values must be a numeric array";
+    }
+    let values = args.values;
+    if len(values) < 2 or len(values) > 100000 {
+        throw "values must contain 2 to 100000 points";
+    }
+    let window = try args.window catch 20;
+    let threshold = try args.threshold catch 2.5;
+    let max_anomalies = try args.max_anomalies catch 1000;
+    if type(window) != "number" or num_floor(window) != window or window < 2 or window > len(values) {
+        throw "window must be an integer in 2..len(values)";
+    }
+    let threshold_text = str_lower(str(threshold));
+    if type(threshold) != "number" or threshold_text == "nan" or str_contains(threshold_text, "inf") or
+       threshold < 0.1 or threshold > 100 {
+        throw "threshold must be a finite number in [0.1, 100]";
+    }
+    if type(max_anomalies) != "number" or num_floor(max_anomalies) != max_anomalies or
+       max_anomalies < 0 or max_anomalies > 10000 {
+        throw "max_anomalies must be an integer in 0..10000";
+    }
+
+    let global_mean = 0.0;
+    let global_m2 = 0.0;
+    let minimum = 0.0;
+    let maximum = 0.0;
+    for value_index len(values) {
+        let value = _finite_number(values[value_index], "values");
+        if value_index == 0 { minimum = value; maximum = value; }
+        if value < minimum { minimum = value; }
+        if value > maximum { maximum = value; }
+        let count = value_index + 1;
+        let delta = value - global_mean;
+        global_mean = global_mean + delta / count;
+        global_m2 = global_m2 + delta * (value - global_mean);
+    }
+
+    let rolling_count = 0;
+    let rolling_mean = 0.0;
+    let rolling_m2 = 0.0;
+    let anomaly_count = 0;
+    let anomalies = [];
+    let details_truncated = false;
+    for value_index len(values) {
+        if value_index >= window {
+            let expired = values[value_index - window];
+            let old_count = rolling_count;
+            rolling_count = rolling_count - 1;
+            if rolling_count == 0 {
+                rolling_mean = 0.0;
+                rolling_m2 = 0.0;
+            } else {
+                let next_mean = (rolling_mean * old_count - expired) / rolling_count;
+                rolling_m2 = rolling_m2 - (expired - rolling_mean) * (expired - next_mean);
+                if rolling_m2 < 0 and rolling_m2 > -0.000000001 { rolling_m2 = 0.0; }
+                rolling_mean = next_mean;
+            }
+        }
+        rolling_count = rolling_count + 1;
+        let current = values[value_index];
+        let delta = current - rolling_mean;
+        rolling_mean = rolling_mean + delta / rolling_count;
+        rolling_m2 = rolling_m2 + delta * (current - rolling_mean);
+        let variance = rolling_m2 / rolling_count;
+        if variance < 0 { variance = 0.0; }
+        let rolling_std = num_sqrt(variance);
+        if rolling_std > 0.000000000001 {
+            let zscore = (current - rolling_mean) / rolling_std;
+            let magnitude = if zscore < 0 { 0 - zscore } else { zscore };
+            if magnitude > threshold {
+                anomaly_count = anomaly_count + 1;
+                if len(anomalies) < max_anomalies {
+                    anomalies[len(anomalies)] = map{
+                        index: value_index, value: current, zscore: _round6(zscore),
+                        rolling_mean: _round6(rolling_mean), rolling_std: _round6(rolling_std),
+                        window_start: if value_index + 1 > window { value_index + 1 - window } else { 0 }
+                    };
+                } else {
+                    details_truncated = true;
+                }
+            }
+        }
+    }
+    let global_variance = global_m2 / len(values);
+    if global_variance < 0 { global_variance = 0.0; }
+    return map{
+        format: "pb_mcp.data_timeseries_anomalies.v1", method: "rolling-population-zscore-welford-v1",
+        total_points: len(values), window: window, threshold: threshold,
+        anomaly_count: anomaly_count, anomalies: anomalies,
+        details_emitted: len(anomalies), details_truncated: details_truncated,
+        max_anomalies: max_anomalies,
+        stats: map{
+            mean: _round6(global_mean), std: _round6(num_sqrt(global_variance)),
+            min: minimum, max: maximum
+        }
+    };
+}
+
+fn data_parquet_read(args) {
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "data_parquet_read arguments must be a map"; }
+    let allowed = ["path", "limit", "max_file_bytes", "max_footer_bytes"];
+    let keys = map_keys(args);
+    for key_index len(keys) {
+        if not _contains(allowed, keys[key_index]) {
+            throw "data_parquet_read unknown argument: " + str(keys[key_index]);
+        }
+    }
+    if not map_has(args, "path") or type(args.path) != "string" or str_trim(args.path) == "" {
+        throw "data_parquet_read requires a non-empty project-relative path";
+    }
+    let limit = try args.limit catch 100;
+    let max_file_bytes = try args.max_file_bytes catch MAX_PARQUET_BYTES;
+    let max_footer_bytes = try args.max_footer_bytes catch 1048576;
+    if type(limit) != "number" or num_floor(limit) != limit or limit < 0 or limit > 10000 {
+        throw "limit must be an integer in 0..10000";
+    }
+    if type(max_file_bytes) != "number" or num_floor(max_file_bytes) != max_file_bytes or
+       max_file_bytes < 12 or max_file_bytes > MAX_PARQUET_BYTES {
+        throw "max_file_bytes must be an integer in 12..4194304";
+    }
+    if type(max_footer_bytes) != "number" or num_floor(max_footer_bytes) != max_footer_bytes or
+       max_footer_bytes < 1 or max_footer_bytes > 1048576 {
+        throw "max_footer_bytes must be an integer in 1..1048576";
+    }
+    sec.require_trusted("read a local Parquet dataset", "PB_DATA_READ_ENABLE");
+    let loaded = sec.read_project_bytes_info(args.path, max_file_bytes);
+    if loaded.truncated { throw "Parquet file exceeds max_file_bytes"; }
+    let decoded = PARQUET.read(loaded.bytes, map{
+        max_file_bytes: max_file_bytes, max_footer_bytes: max_footer_bytes,
+        max_rows: limit, max_columns: 256, max_thrift_items: 100000,
+        max_thrift_depth: 32, max_binary_bytes: 1048576
+    });
+    decoded.path = loaded.path;
+    decoded.source_size = loaded.source_size;
+    decoded.race_resistant = loaded.race_resistant;
+    decoded.bounded_snapshot = loaded.bounded_prefix;
+    decoded.capability = "PB_DATA_READ_ENABLE";
+    return decoded;
+}
+
+fn call_data(tool, args) {
+    if tool == "data_csv_analyze" { return data_csv_analyze(args); }
+    if tool == "data_diff_jsonl" { return data_diff_jsonl(args); }
+    if tool == "data_json_flatten" { return data_json_flatten(args); }
+    if tool == "data_regex_extract" { return data_regex_extract(args); }
+    if tool == "data_timeseries_detect" { return data_timeseries_detect(args); }
+    if tool == "data_parquet_read" { return data_parquet_read(args); }
+    return nil;
+}
+
+fn implemented_tools() {
+    let out = [];
+    for tool_index len(DATA_TOOLS) { out[tool_index] = DATA_TOOLS[tool_index]; }
+    return out;
+}
+
+export data_csv_analyze, data_diff_jsonl, data_json_flatten, data_regex_extract,
+       data_timeseries_detect, data_parquet_read,
+       call_data, implemented_tools, DATA_TOOLS;

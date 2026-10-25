@@ -1,0 +1,139 @@
+// Consolidated, fail-closed readiness classification for both implementations.
+
+let PARITY = import("tools/generate_parity_manifest.sapp");
+let LOCK = import("reproducible_lock.sapp");
+let SEC = import("security.sapp");
+let VENDOR = import("rust_reference_vendor.sapp");
+let WINDOWS_EVIDENCE = import("windows_dirfs_evidence.sapp");
+let RELEASE_INPUTS = import("release_inputs.sapp");
+
+fn _load_json(path, limit) {
+    let loaded = SEC.read_project_text_info(path, limit);
+    if loaded.truncated { throw path + " exceeds its report size bound"; }
+    let parsed = try json_parse(loaded.text) catch nil;
+    if type(parsed) != "map" { throw path + " is not a JSON object"; }
+    return map{ value: parsed, sha256: sha256(loaded.text) };
+}
+
+fn _semantic_test_count() {
+    let names = fs_listdir("tests/semantics");
+    let total = 0;
+    for i len(names) { if str_ends_with(names[i], ".sapp") { total = total + 1; } }
+    return total;
+}
+
+fn _blocker(id, implementation, reason, action) {
+    return map{ id: id, implementation: implementation, reason: reason, action: action };
+}
+
+fn generate() {
+    let parity = PARITY.generate();
+    let lock = LOCK.inspect_lock(SEC.read_project_text("pblang.lock", 1000000));
+    let semantic_source = _load_json("release/PB-MCP-semantic-matrix.json", 8388608);
+    let semantic = semantic_source.value;
+    let discovered = _semantic_test_count();
+    let release_inputs = RELEASE_INPUTS.current();
+    let semantic_current = not (try semantic.focused catch true)
+        and (try semantic.complete catch false)
+        and (try semantic.production_gate_passed catch false)
+        and (try semantic.discovered catch -1) == discovered
+        and (try semantic.passed catch -1) == discovered
+        and (try semantic.failed catch -1) == 0
+        and (try semantic.release_inputs_sha256 catch "") == release_inputs.sha256
+        and (try semantic.release_input_file_count catch -1) == release_inputs.file_count;
+    let rust_checks_source = _load_json("release/PB-MCP-rust-reference-checks.json", 1048576);
+    let rust_checks = rust_checks_source.value;
+    let rust_checks_ready = (try rust_checks.production_gate_passed catch false)
+        and (try rust_checks.total catch 0) == 4
+        and (try rust_checks.passed catch 0) == 4
+        and (try rust_checks.failed catch -1) == 0;
+    let vendor = VENDOR.verify(VENDOR.default_root());
+    let dependency_policy = VENDOR.dependency_policy(VENDOR.default_root());
+    let filesystem = SEC.filesystem_boundary_status();
+    let expected_stdlib_sha256 = try lock.dependency_digests.stdlib catch nil;
+    let windows_evidence_source = try _load_json(
+        "release/PB-MCP-windows-dirfs-matrix.json", 1048576) catch nil;
+    let windows_evidence = map{ ok: false, format: "pb_mcp.windows-dirfs-evidence.v1",
+        errors: ["physical Windows evidence report is absent"] };
+    if windows_evidence_source != nil {
+        windows_evidence = WINDOWS_EVIDENCE.verify(windows_evidence_source.value,
+            expected_stdlib_sha256, WINDOWS_EVIDENCE.EXPECTED_TEST_SOURCE_SHA256);
+        windows_evidence.report_sha256 = windows_evidence_source.sha256;
+    }
+    filesystem.windows_handle_backend_ready = windows_evidence.ok;
+    filesystem.windows_physical_verification_pending = not windows_evidence.ok;
+    filesystem.global_handle_backend_complete = windows_evidence.ok
+        and filesystem.linux_handle_backend_ready
+        and filesystem.macos_handle_backend_ready;
+    filesystem.windows_evidence_errors = windows_evidence.errors;
+    filesystem.windows_evidence_report_sha256 = try windows_evidence.report_sha256 catch nil;
+
+    let blockers = [];
+    for i len(parity.remaining_tools) {
+        let tool = parity.remaining_tools[i];
+        blockers[len(blockers)] = _blocker("tool:" + tool.name, "pblang",
+            tool.status + " generated-reference parity", tool.work_required);
+    }
+    if not lock.ok { blockers[len(blockers)] = _blocker("pblang-lock", "pblang",
+        "pblang.lock is not portable and content-addressed", "regenerate a repository-relative lock and rerun its contract test"); }
+    if not semantic_current { blockers[len(blockers)] = _blocker("semantic-matrix", "pblang",
+        "full semantic matrix is missing, stale, focused, or failing", "run the complete bounded semantic matrix after the latest source/test change"); }
+    if not dependency_policy.ok { blockers[len(blockers)] = _blocker("rust-dependency-policy", "rust-reference",
+        "Cargo dependency policy could not be inspected", "restore descriptor-held Cargo.toml inspection and rerun the release gate"); }
+    elif dependency_policy.vendor_required and not vendor.content_integrity_ready {
+        blockers[len(blockers)] = _blocker("rust-vendor-integrity", "rust-reference",
+            "an active vendored dependency differs from the reviewed manifest", "review the diff and update provenance only after approval");
+    } elif dependency_policy.vendor_required and not vendor.clean_checkout_ready {
+        blockers[len(blockers)] = _blocker("rust-vendor-tracking", "rust-reference",
+            "an active vendored dependency is absent from the Git index", "track every required vendor source file and prove a clean clone build");
+    }
+    if not rust_checks_ready { blockers[len(blockers)] = _blocker("rust-reference-checks", "rust-reference",
+        "gateway or control-plane verification is failing or incomplete", "rerun the PBLang-supervised Rust reference checks and resolve every failure"); }
+    if not filesystem.global_handle_backend_complete {
+        blockers[len(blockers)] = _blocker("filesystem-handle-backends", "pblang",
+            if (try filesystem.windows_handle_backend_implemented catch false) {
+                "PBLang-native Windows root-relative handle confinement is implemented but current physical Windows evidence is absent or invalid"
+            } else { "descriptor-held filesystem confinement is not implemented on every declared platform" },
+            if (try filesystem.windows_handle_backend_implemented catch false) {
+                "run the published root/reparse/replacement/bounded-I/O/lock matrix on a physical Windows x86-64 host using the current stdlib, test source, and runtime"
+            } else { "implement and physically verify a PBLang-native Windows root-relative handle backend" });
+    }
+
+    let production_ready = len(blockers) == 0;
+    return map{
+        format: "pb_mcp.dual-implementation-readiness.v1",
+        generated_at_ms: now_ms(),
+        production_ready: production_ready,
+        retirement_ready: parity.generated_parity_ready and production_ready,
+        blocker_count: len(blockers), blockers: blockers,
+        pblang: map{
+            lock_portable: lock.ok,
+            generated_reference_total: parity.generated_tool_count,
+            functionally_complete: parity.counts.complete,
+            remaining: parity.remaining_count,
+            generated_parity_ready: parity.generated_parity_ready,
+            functional_completion_percent: parity.functional_completion_percent,
+            semantic_tests_discovered: discovered,
+            semantic_matrix_current: semantic_current,
+            semantic_matrix_sha256: semantic_source.sha256,
+            release_inputs_sha256: release_inputs.sha256,
+            release_input_file_count: release_inputs.file_count
+        },
+        rust_reference: map{
+            retained_reference_only: true,
+            dependency_policy_ready: dependency_policy.ok,
+            clean_checkout_dependency_ready: dependency_policy.clean_checkout_dependency_ready,
+            vendor_required: dependency_policy.vendor_required,
+            vendor_content_integrity_ready: vendor.content_integrity_ready,
+            vendor_clean_checkout_ready: vendor.clean_checkout_ready,
+            vendor_file_count: vendor.file_count,
+            vendor_aggregate_sha256: vendor.aggregate_sha256,
+            checks_ready: rust_checks_ready,
+            checks_report_sha256: rust_checks_source.sha256
+        },
+        filesystem_boundary: filesystem,
+        windows_physical_evidence: windows_evidence
+    };
+}
+
+export generate;

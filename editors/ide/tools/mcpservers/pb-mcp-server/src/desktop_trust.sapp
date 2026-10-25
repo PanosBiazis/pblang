@@ -1,0 +1,67 @@
+let Budget = import("desktop_budget.sapp");
+// Local connection-profile preferences. Never consume MCP identity as authority.
+// The fixed OS boundary supplies owner-private storage and the local verifier.
+fn valid(value, profile) {
+    if type(value) != "map" { return false; }
+    if (try value.version catch nil) == 1 {
+        if len(map_keys(value)) != 5 { return false; }
+    } elif (try value.version catch nil) == 2 {
+        if len(map_keys(value)) != 6 or not Budget.valid(try value.limits catch nil) { return false; }
+    } else { return false; }
+    if (try value.profile catch nil) != profile { return false; }
+    if value.mode != "each_connection" and value.mode != "until_revoked" { return false; }
+    if value.sharing != false or type(value.scopes) != "array"
+        or len(value.scopes) < 1 or len(value.scopes) > 2 { return false; }
+    for item in value.scopes { if item != "keyboard" and item != "pointer" { return false; } }
+    return len(value.scopes) == 1 or value.scopes[0] != value.scopes[1];
+}
+fn seal(value, key) {
+    let body = json_stringify(value);
+    return json_stringify(map{ body: body, tag: hmac_sha256(body, key) });
+}
+fn unseal(text, key, profile) {
+    if text == "" { return nil; }
+    let parsed = try json_parse(text) catch nil;
+    if type(parsed) != "map" or len(map_keys(parsed)) != 2 { return nil; }
+    if type(try parsed.body catch nil) != "string" or len(parsed.body) > 1024
+        or type(try parsed.tag catch nil) != "string" or len(parsed.tag) != 64 { return nil; }
+    if not constant_time_eq(hmac_sha256(parsed.body, key), parsed.tag) { return nil; }
+    let value = try json_parse(parsed.body) catch nil;
+    if not (try valid(value, profile) catch false) { return nil; }
+    return value;
+}
+fn open() {
+    let profile = try env_get("PB_DESKTOP_PROFILE") catch "";
+    if profile == nil or profile == "" { return nil; }
+    let abi = ffi_load(cwd() + "/transport/desktop_trust_abi.so");
+    fn call(name, signature, args) { return ffi_call_typed(abi, "pbt_" + name, signature, args); }
+    if call("open", "->i64", []) != 1 { ffi_close(abi); throw "local profile storage unavailable"; }
+    let key = call("key", "->string", []);
+    let state = map{ closed: false, saved: unseal(call("read", "->string", []), key, profile) };
+    fn policy() {
+        state.saved = unseal(call("read", "->string", []), key, profile);
+        return json_parse(json_stringify(state.saved));
+    }
+    fn matches(secret) { return type(secret) == "string" and constant_time_eq(secret, key); }
+    fn save(mode, scopes, sharing, secret, limits = nil) {
+        if state.closed or not matches(secret) { return false; }
+        if limits == nil { limits = Budget.unlimited(); }
+        let value = map{ version: 2, profile: profile, mode: mode, scopes: scopes, sharing: sharing, limits: limits };
+        if not (try valid(value, profile) catch false) { return false; }
+        if call("write", "string->i64", [seal(value, key)]) != 1 { return false; }
+        state.saved = json_parse(json_stringify(value)); return true;
+    }
+    fn forget() {
+        state.saved = nil;
+        return call("forget", "->i64", []) == 1;
+    }
+    // Callable only by the trusted local renderer after a local preference or
+    // connection confirmation. This value is never part of a public snapshot.
+    fn local_secret() { if state.closed { throw "profile closed"; } return key; }
+    fn close() {
+        if not state.closed { state.closed = true; key = ""; call("close", "->i64", []); ffi_close(abi); }
+    }
+    return map{ profile: profile, policy: policy, matches: matches, save: save,
+        forget: forget, local_secret: local_secret, close: close };
+}
+export open, valid, seal, unseal;

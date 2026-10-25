@@ -1,0 +1,95 @@
+// Fresh authorization boundary shared by every isolated HTTP worker shard.
+
+let IDENTITY = import("identity_tools.sapp");
+
+fn _exact_keys(value, allowed, maximum) {
+    if type(value) != "map" { return false; }
+    let keys = map_keys(value);
+    if len(keys) != maximum or maximum != len(allowed) { return false; }
+    for i len(keys) {
+        let known = false;
+        for j len(allowed) { if keys[i] == allowed[j] { known = true; } }
+        if not known { return false; }
+    }
+    return true;
+}
+
+fn _canonical_id(value) {
+    return type(value) == "string" and
+        regex_match(value, "^[a-z][a-z0-9_-]{2,63}$");
+}
+
+fn resolve(context, identity_root_override = nil) {
+    let allowed = ["format", "request_id", "options", "identity_mode",
+        "principal", "organization_id", "credential_id", "tools_read",
+        "tools_execute"];
+    if not _exact_keys(context, allowed, len(allowed)) or
+       (try context.format catch "") != "pb_mcp.http-context.v2" or
+       type(try context.request_id catch nil) != "string" or
+       not regex_match(context.request_id, "^[0-9a-f]{24}$") or
+       type(try context.options catch nil) != "bool" {
+        return map{ ok: false, error: "invalid worker authorization context" };
+    }
+    let mode = try context.identity_mode catch "";
+    if context.options {
+        if mode != "options" or (try context.principal catch nil) != nil or
+           (try context.organization_id catch nil) != nil or
+           (try context.credential_id catch nil) != nil {
+            return map{ ok: false, error: "invalid OPTIONS worker context" };
+        }
+        return map{ ok: true, options: true, principal: nil,
+            organization_id: nil, storage: nil, tools_read: true,
+            tools_execute: false, iam_revision: nil };
+    }
+    if mode == "multi-user" {
+        let principal = try context.principal catch nil;
+        let organization_id = try context.organization_id catch nil;
+        let credential_id = try context.credential_id catch nil;
+        if not _canonical_id(principal) or not _canonical_id(organization_id) or
+           type(credential_id) != "string" or
+           not regex_match(credential_id, "^key_[a-f0-9]{24}$") {
+            return map{ ok: false, error: "invalid multi-user worker identity" };
+        }
+        let identity_root = if identity_root_override == nil {
+            try env_get("PB_MCP_IDENTITY_ROOT") catch nil
+        } else { identity_root_override };
+        if type(identity_root) != "string" or len(identity_root) < 2 or
+           len(identity_root) > 4096 or not str_starts_with(identity_root, "/") or
+           str_contains(identity_root, strfromcharcode(0)) {
+            return map{ ok: false, error: "worker identity authority is unavailable" };
+        }
+        let storage = try IDENTITY.store(identity_root) catch nil;
+        if storage == nil {
+            return map{ ok: false, error: "worker identity store is unavailable" };
+        }
+        let read = try IDENTITY.authorize_credential_with_store(credential_id,
+            principal, organization_id, "tools.read", storage) catch nil;
+        if read == nil {
+            return map{ ok: false, error: "credential is no longer authorized" };
+        }
+        let execute = try IDENTITY.authorize_credential_with_store(credential_id,
+            principal, organization_id, "tools.execute", storage) catch nil;
+        return map{ ok: true, options: false, principal: principal,
+            organization_id: organization_id, credential_id: credential_id,
+            storage: storage, tools_read: true, tools_execute: execute != nil,
+            iam_revision: read.revision };
+    }
+    if mode == "legacy" {
+        if (try env_get("PB_MCP_LEGACY_WORKER") catch "") != "1" or
+           not _canonical_id(try context.principal catch nil) or
+           (try context.organization_id catch nil) != nil or
+           (try context.credential_id catch nil) != nil or
+           type(try context.tools_read catch nil) != "bool" or
+           type(try context.tools_execute catch nil) != "bool" or
+           not context.tools_read {
+            return map{ ok: false, error: "legacy worker authority is unavailable" };
+        }
+        return map{ ok: true, options: false, principal: context.principal,
+            organization_id: nil, credential_id: nil, storage: nil,
+            tools_read: true, tools_execute: context.tools_execute,
+            iam_revision: nil };
+    }
+    return map{ ok: false, error: "unknown worker identity mode" };
+}
+
+export resolve;

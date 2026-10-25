@@ -1,0 +1,333 @@
+// Privacy-minimized, descriptor-confined Linux cron security audit.
+
+let SEC = import("security.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let PROCESS = import("stdlib:linux_process.sapp");
+
+fn _strict(args, allowed) {
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "cron audit arguments must be an object"; }
+    let keys = map_keys(args);
+    for i len(keys) {
+        let found = false;
+        for j len(allowed) { if keys[i] == allowed[j] { found = true; break; } }
+        if not found { throw "unknown cron audit argument: " + str(keys[i]); }
+    }
+    return args;
+}
+
+fn _integer(value, label, low, high, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value) or value < low or value > high {
+        throw label + " must be an integer between " + str(low) + " and " + str(high);
+    }
+    return value;
+}
+
+fn _words(line) {
+    let raw = str_split(str_trim(str_replace_all(str(line), "\t", " ")), " "); let out = [];
+    for i len(raw) { if raw[i] != "" { out[len(out)] = raw[i]; } }
+    return out;
+}
+
+fn _reason(out, seen, name) {
+    if not map_has(seen, name) { seen[name] = true; out[len(out)] = name; }
+}
+
+fn command_reasons(command) {
+    let lower = str_lower(str(command)); let reasons = []; let seen = map{};
+    let download = str_contains(lower, "curl ") or str_contains(lower, "wget ");
+    let shell_pipe = str_contains(lower, "|sh") or str_contains(lower, "| sh")
+        or str_contains(lower, "|bash") or str_contains(lower, "| bash");
+    if download and shell_pipe { _reason(reasons, seen, "download-piped-to-shell"); }
+    if str_contains(lower, "/dev/shm/") { _reason(reasons, seen, "shared-memory-execution-path"); }
+    if str_contains(lower, "/tmp/") { _reason(reasons, seen, "temporary-execution-path"); }
+    if str_contains(lower, "base64") and
+       (str_contains(lower, " -d") or str_contains(lower, "--decode")) {
+        _reason(reasons, seen, "base64-decode");
+    }
+    if str_contains(lower, "nc ") or str_contains(lower, "ncat ")
+       or str_contains(lower, "netcat ") {
+        _reason(reasons, seen, "netcat-use");
+    }
+    if str_contains(lower, "/dev/tcp/") or str_contains(lower, "/dev/udp/") {
+        _reason(reasons, seen, "shell-network-redirection");
+    }
+    if str_contains(lower, "chmod 777") or str_contains(lower, "chmod +x") {
+        _reason(reasons, seen, "permission-or-executable-bit-change");
+    }
+    return reasons;
+}
+
+fn _add_finding(state, source, line, kind, severity, reasons) {
+    state.finding_total = state.finding_total + 1;
+    if len(state.findings) >= state.max_findings { state.findings_truncated = true; return; }
+    state.findings[len(state.findings)] = map{
+        source: source, line: line, kind: kind, severity: severity,
+        reasons: reasons, command_redacted: true, content_exposed: false,
+        heuristic: true, compromise_confirmed: false
+    };
+}
+
+fn _command_from(words, syntax) {
+    if len(words) == 0 { return nil; }
+    if str_contains(words[0], "=") { return map{ environment: true }; }
+    let start = -1;
+    if syntax == "user" {
+        if str_starts_with(words[0], "@") and len(words) >= 2 { start = 1; }
+        elif len(words) >= 6 { start = 5; }
+    } elif syntax == "system" {
+        if str_starts_with(words[0], "@") and len(words) >= 3 { start = 2; }
+        elif len(words) >= 7 { start = 6; }
+    }
+    if start < 0 { return nil; }
+    return map{ environment: false, command: str_join(slice(words, start, len(words)), " ") };
+}
+
+fn analyze_text(text, source, syntax = "user", options = nil) {
+    options = _strict(options, ["max_entries", "max_findings"]);
+    if type(text) != "string" or len(text) > 1048576 {
+        throw "cron text must be a string of at most 1048576 characters";
+    }
+    if type(source) != "string" or source == "" or len(source) > 4096 {
+        throw "cron source is required";
+    }
+    if syntax != "user" and syntax != "system" and syntax != "script" {
+        throw "cron syntax must be user, system, or script";
+    }
+    let max_entries = _integer(try options.max_entries catch nil, "max_entries", 1, 10000, 1000);
+    let max_findings = _integer(try options.max_findings catch nil, "max_findings", 1, 500, 100);
+    let state = map{ findings: [], finding_total: 0, max_findings: max_findings,
+        findings_truncated: false };
+    let lines = str_split(str(text), "\n"); let entries = 0; let malformed = 0;
+    let environment_entries = 0; let entries_truncated = false;
+    for i len(lines) {
+        let line = str_trim(lines[i]);
+        if line == "" or str_starts_with(line, "#") { continue; }
+        if syntax == "script" {
+            let reasons = command_reasons(line);
+            if len(reasons) > 0 {
+                _add_finding(state, source, i + 1, "suspicious-script-content", "high", reasons);
+            }
+            continue;
+        }
+        let parsed = _command_from(_words(line), syntax);
+        if parsed == nil { malformed = malformed + 1; continue; }
+        if parsed.environment { environment_entries = environment_entries + 1; continue; }
+        entries = entries + 1;
+        if entries > max_entries { entries_truncated = true; continue; }
+        let reasons = command_reasons(parsed.command);
+        if len(reasons) > 0 {
+            _add_finding(state, source, i + 1, "suspicious-cron-command", "high", reasons);
+        }
+    }
+    if syntax == "script" and str_trim(str(text)) != "" { entries = 1; }
+    return map{
+        format: "pb_mcp.cron-content-audit.v1", source: source, syntax: syntax,
+        entry_count: entries, malformed_entries: malformed,
+        environment_entries_omitted: environment_entries,
+        findings: state.findings, finding_count: state.finding_total,
+        returned_findings: len(state.findings), findings_truncated: state.findings_truncated,
+        entries_truncated: entries_truncated, parse_complete: malformed == 0 and not entries_truncated,
+        command_text_exposed: false, environment_exposed: false,
+        content_exposed: false, heuristic_findings: true, compromise_confirmed: false
+    };
+}
+
+fn _merge(state, parsed) {
+    state.entries = state.entries + parsed.entry_count;
+    state.malformed = state.malformed + parsed.malformed_entries;
+    if parsed.entries_truncated { state.truncated = true; }
+    state.finding_total = state.finding_total + parsed.finding_count;
+    for i len(parsed.findings) {
+        if len(state.findings) < state.max_findings { state.findings[len(state.findings)] = parsed.findings[i]; }
+        else { state.truncated = true; }
+    }
+    if parsed.findings_truncated { state.truncated = true; }
+}
+
+fn _mode_finding(state, source, mode, kind) {
+    if bit_and(mode, 2) != 0 {
+        _add_finding(state, source, 0, "world-writable-" + kind, "high", ["world-writable"]);
+    }
+}
+
+fn _read_file(fs, relative, source, syntax, state, limits) {
+    if state.files >= limits.max_files { state.truncated = true; return; }
+    let metadata = DIRFS.metadata(fs, relative);
+    if not metadata.ok or metadata.kind != "file" {
+        state.read_errors = state.read_errors + 1; return;
+    }
+    state.files = state.files + 1; _mode_finding(state, source, metadata.mode, "cron-file");
+    let remaining = limits.max_total_bytes - state.bytes;
+    if remaining <= 0 { state.truncated = true; return; }
+    let ceiling = limits.max_file_bytes; if ceiling > remaining { ceiling = remaining; }
+    let loaded = DIRFS.read_prefix_bytes(fs, relative, ceiling);
+    if not loaded.ok { state.read_errors = state.read_errors + 1; return; }
+    state.bytes = state.bytes + len(loaded.bytes);
+    if loaded.truncated { state.truncated = true; }
+    let text = try bytes_to_str(loaded.bytes) catch nil;
+    if text == nil { state.read_errors = state.read_errors + 1; return; }
+    _merge(state, analyze_text(text, source, syntax, map{
+        max_entries: limits.max_entries, max_findings: limits.max_findings
+    }));
+}
+
+fn _exists_in_etc(name) {
+    let etc = DIRFS.open_absolute("/etc", false, false);
+    if not etc.ok { return map{ known: false, exists: false }; }
+    let listed = DIRFS.list(etc, "root", 4096); DIRFS.close(etc);
+    if not listed.ok or listed.truncated { return map{ known: false, exists: false }; }
+    for i len(listed.entries) { if listed.entries[i] == name { return map{ known: true, exists: true }; } }
+    return map{ known: true, exists: false };
+}
+
+fn _scan_system_file(path, state, limits) {
+    let existence = _exists_in_etc(path_basename(path));
+    if existence.known and not existence.exists {
+        state.sources[len(state.sources)] = map{ source: path, state: "absent", complete: true };
+        return;
+    }
+    let fs = DIRFS.open_absolute(path_dirname(path), false, false);
+    if not fs.ok {
+        state.read_errors = state.read_errors + 1;
+        state.sources[len(state.sources)] = map{ source: path, state: "inaccessible", complete: false };
+        return;
+    }
+    let before_errors = state.read_errors; _read_file(fs, path_basename(path), path, "system", state, limits);
+    DIRFS.close(fs);
+    state.sources[len(state.sources)] = map{ source: path,
+        state: if state.read_errors == before_errors { "audited" } else { "refused" },
+        complete: state.read_errors == before_errors };
+}
+
+fn _scan_system_dir(path, syntax, state, limits) {
+    let existence = _exists_in_etc(path_basename(path));
+    if existence.known and not existence.exists {
+        state.sources[len(state.sources)] = map{ source: path, state: "absent", complete: true };
+        return;
+    }
+    let fs = DIRFS.open_absolute(path, false, false);
+    if not fs.ok {
+        state.read_errors = state.read_errors + 1;
+        state.sources[len(state.sources)] = map{ source: path, state: "inaccessible", complete: false };
+        return;
+    }
+    let root_meta = DIRFS.metadata(fs, "root");
+    if root_meta.ok { _mode_finding(state, path, root_meta.mode, "directory"); }
+    else { state.read_errors = state.read_errors + 1; }
+    let listed = DIRFS.list(fs, "root", limits.max_files + 1);
+    if not listed.ok { state.read_errors = state.read_errors + 1; DIRFS.close(fs); return; }
+    if listed.truncated { state.truncated = true; }
+    let before_errors = state.read_errors;
+    for i len(listed.entries) {
+        if state.files >= limits.max_files { state.truncated = true; break; }
+        let name = str(listed.entries[i]);
+        if name == ".placeholder" { continue; }
+        _read_file(fs, name, path + "/" + name, syntax, state, limits);
+    }
+    DIRFS.close(fs);
+    state.sources[len(state.sources)] = map{ source: path,
+        state: if state.read_errors == before_errors { "audited" } else { "partially-refused" },
+        complete: state.read_errors == before_errors and not listed.truncated };
+}
+
+fn _held_crontab() {
+    let paths = ["/usr/bin/crontab", "/bin/crontab"];
+    for i len(paths) {
+        let root = DIRFS.open_absolute(path_dirname(paths[i]), false, false);
+        if root.ok {
+            let handoff = DIRFS.child_file_descriptor(root, path_basename(paths[i]));
+            if handoff.ok { return map{ ok: true, root: root, handoff: handoff,
+                path: "/proc/self/fd/" + str(handoff.fd) }; }
+            DIRFS.close(root);
+        }
+    }
+    return map{ ok: false };
+}
+
+fn _scan_user(state, limits) {
+    let program = _held_crontab();
+    if not program.ok {
+        state.user_complete = false;
+        state.sources[len(state.sources)] = map{ source: "current-user-crontab",
+            state: "backend-unavailable", complete: false };
+        return;
+    }
+    let result = try PROCESS.run(program.path, ["-l"], map{
+        timeout_secs: limits.timeout_seconds, max_output_bytes: limits.max_output_bytes,
+        max_memory_bytes: 67108864, inherit_environment: false
+    }) catch map{ ok: false };
+    DIRFS.close_child_descriptor(program.root, program.handoff); DIRFS.close(program.root);
+    if not (try result.ok catch false) or not (try result.completed catch false)
+       or not (try result.process_group_terminated catch false)
+       or (try result.output_truncated catch true) {
+        state.user_complete = false;
+        state.sources[len(state.sources)] = map{ source: "current-user-crontab",
+            state: "inspection-failed", complete: false };
+        return;
+    }
+    if (try result.command_ok catch false) and (try result.stdout_utf8 catch false) {
+        _merge(state, analyze_text(result.stdout, "current-user-crontab", "user", map{
+            max_entries: limits.max_entries, max_findings: limits.max_findings
+        }));
+        state.sources[len(state.sources)] = map{ source: "current-user-crontab",
+            state: "audited", complete: true };
+        return;
+    }
+    let no_crontab = (try result.exit_code catch -1) == 1
+        and str_contains(str_lower(try result.stderr catch ""), "no crontab for");
+    if no_crontab {
+        state.sources[len(state.sources)] = map{ source: "current-user-crontab",
+            state: "absent", complete: true };
+    } else {
+        state.user_complete = false;
+        state.sources[len(state.sources)] = map{ source: "current-user-crontab",
+            state: "inspection-failed", complete: false };
+    }
+}
+
+fn audit(args) {
+    args = _strict(args, ["max_files", "max_entries", "max_findings", "max_file_bytes",
+        "max_total_bytes", "timeout_seconds", "max_output_bytes"]);
+    SEC.require_trusted("cron security audit", "PB_PROTECT_INSPECT_ENABLE");
+    if platform() != "linux" { throw "cron audit currently requires Linux descriptor backends"; }
+    let limits = map{
+        max_files: _integer(try args.max_files catch nil, "max_files", 1, 500, 200),
+        max_entries: _integer(try args.max_entries catch nil, "max_entries", 1, 10000, 1000),
+        max_findings: _integer(try args.max_findings catch nil, "max_findings", 1, 500, 100),
+        max_file_bytes: _integer(try args.max_file_bytes catch nil, "max_file_bytes", 1, 262144, 65536),
+        max_total_bytes: _integer(try args.max_total_bytes catch nil, "max_total_bytes", 1, 8388608, 1048576),
+        timeout_seconds: _integer(try args.timeout_seconds catch nil, "timeout_seconds", 1, 15, 5),
+        max_output_bytes: _integer(try args.max_output_bytes catch nil, "max_output_bytes", 1024, 1048576, 262144)
+    };
+    let state = map{ files: 0, entries: 0, bytes: 0, malformed: 0,
+        findings: [], finding_total: 0, max_findings: limits.max_findings,
+        findings_truncated: false, truncated: false, read_errors: 0,
+        user_complete: true, sources: [] };
+    _scan_user(state, limits);
+    _scan_system_file("/etc/crontab", state, limits);
+    _scan_system_dir("/etc/cron.d", "system", state, limits);
+    _scan_system_dir("/etc/cron.hourly", "script", state, limits);
+    _scan_system_dir("/etc/cron.daily", "script", state, limits);
+    _scan_system_dir("/etc/cron.weekly", "script", state, limits);
+    _scan_system_dir("/etc/cron.monthly", "script", state, limits);
+    let complete = state.user_complete and state.read_errors == 0 and not state.truncated;
+    return map{
+        format: "pb_mcp.protect_cron_audit.v2", ok: complete and state.finding_total == 0,
+        complete: complete, platform: "linux", files_audited: state.files,
+        cron_entries_audited: state.entries, bytes_inspected: state.bytes,
+        malformed_entries: state.malformed, findings: state.findings,
+        finding_count: state.finding_total, returned_findings: len(state.findings),
+        findings_truncated: state.findings_truncated or state.truncated,
+        read_errors: state.read_errors, sources: state.sources,
+        standard_sources_covered: 7, systemd_timers_in_scope: false,
+        command_text_exposed: false, environment_exposed: false, raw_output_exposed: false,
+        heuristic_findings: true, compromise_confirmed: false,
+        race_resistant_system_reads: true, symlinks_followed: false,
+        descriptor_bound_executable: true, bounded_output: true,
+        bounded_runtime: true, shell_used: false
+    };
+}
+
+export command_reasons, analyze_text, audit;

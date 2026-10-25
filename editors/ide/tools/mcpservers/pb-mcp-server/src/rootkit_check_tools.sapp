@@ -1,0 +1,260 @@
+// Bounded Linux rootkit-indicator audit. Findings are evidence for review,
+// never proof of compromise or absence of a rootkit.
+
+let SEC = import("security.sapp");
+let DIRFS = import("stdlib:linux_dirfs.sapp");
+let PROCESS = import("stdlib:linux_process.sapp");
+let PROCESS_ANOMALY = import("process_anomaly_tools.sapp");
+
+fn _strict(args, allowed) {
+    if args == nil { args = map{}; }
+    if type(args) != "map" { throw "rootkit check arguments must be an object"; }
+    let keys = map_keys(args);
+    for i len(keys) {
+        let found = false;
+        for j len(allowed) { if keys[i] == allowed[j] { found = true; break; } }
+        if not found { throw "unknown rootkit check argument: " + str(keys[i]); }
+    }
+    return args;
+}
+
+fn _integer(value, label, low, high, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "number" or value != num_floor(value) or value < low or value > high {
+        throw label + " must be an integer between " + str(low) + " and " + str(high);
+    }
+    return value;
+}
+
+fn _boolean(value, label, fallback) {
+    if value == nil { return fallback; }
+    if type(value) != "bool" { throw label + " must be boolean"; }
+    return value;
+}
+
+fn analyze_preload(text, maximum = 100) {
+    maximum = _integer(maximum, "max_entries", 1, 1000, 100);
+    if type(text) != "string" or len(text) > 1048576 { throw "preload text exceeds parser limit"; }
+    let lines = str_split(text, "\n"); let active = 0; let truncated = false;
+    for i len(lines) {
+        let line = str_trim(lines[i]);
+        if line != "" and not str_starts_with(line, "#") {
+            active = active + 1; if active > maximum { truncated = true; }
+        }
+    }
+    return map{ active_entry_count: active, active: active > 0,
+        entries_truncated: truncated, content_exposed: false,
+        preload_paths_exposed: false, compromise_confirmed: false };
+}
+
+fn parse_scanner_output(name, stdout, stderr, exit_code, timed_out, output_truncated) {
+    if name != "rkhunter" and name != "chkrootkit" and name != "unhide" {
+        throw "unknown rootkit scanner";
+    }
+    if type(stdout) != "string" or type(stderr) != "string"
+       or len(stdout) + len(stderr) > 2097152 { throw "scanner output exceeds parser limit"; }
+    let lines = str_split(str_lower(stdout + "\n" + stderr), "\n");
+    let warning_lines = 0; let infected_lines = 0; let suspicious_lines = 0;
+    for i len(lines) {
+        let line = str_trim(lines[i]);
+        if line == "" { continue; }
+        if str_contains(line, "warning") and not str_contains(line, "warnings: 0")
+           and not str_contains(line, "warnings found: 0")
+           and not str_contains(line, "0 warning") and not str_contains(line, "no warning") {
+            warning_lines = warning_lines + 1;
+        }
+        if str_contains(line, "infected") and not str_contains(line, "not infected")
+           and not str_contains(line, "infected files: 0")
+           and not str_contains(line, "0 infected") and not str_contains(line, "no infected") {
+            infected_lines = infected_lines + 1;
+        }
+        if str_contains(line, "suspicious") and not str_contains(line, "not suspicious")
+           and not str_contains(line, "0 suspicious") and not str_contains(line, "no suspicious") {
+            suspicious_lines = suspicious_lines + 1;
+        }
+    }
+    let indicators = warning_lines + infected_lines + suspicious_lines;
+    let complete = not timed_out and not output_truncated;
+    return map{ scanner: name, exit_code: exit_code, complete: complete,
+        timed_out: timed_out, output_truncated: output_truncated,
+        warning_lines: warning_lines, infected_lines: infected_lines,
+        suspicious_lines: suspicious_lines, indicator_line_count: indicators,
+        raw_output_exposed: false, matched_lines_exposed: false,
+        rootkit_confirmed: false, clean_claimed: false };
+}
+
+fn _fixed_indicator(filesystem, path) {
+    let parts = str_split(path, "/"); let current = "root"; let i = 1;
+    while i < len(parts) {
+        let listed = DIRFS.list(filesystem, current, 4096);
+        if not listed.ok or listed.truncated { return map{ complete: false, present: false, path: path }; }
+        let next_present = false;
+        for n len(listed.entries) { if listed.entries[n] == parts[i] { next_present = true; break; } }
+        if not next_present { return map{ complete: true, present: false, path: path }; }
+        if i + 1 < len(parts) {
+            current = if current == "root" { parts[i] } else { current + "/" + parts[i] };
+        }
+        i = i + 1;
+    }
+    let metadata = DIRFS.metadata(filesystem, str_slice(path, 1, len(path)));
+    if not metadata.ok { return map{ complete: false, present: true, path: path }; }
+    return map{ complete: true, present: true, path: path,
+        kind: metadata.kind, symlink_followed: false };
+}
+
+fn _preload(filesystem, max_bytes, max_entries) {
+    let probe = _fixed_indicator(filesystem, "/etc/ld.so.preload");
+    if not probe.complete { return map{ complete: false, present: probe.present,
+        active: false, active_entry_count: 0, content_exposed: false }; }
+    if not probe.present { return map{ complete: true, present: false, active: false,
+        active_entry_count: 0, content_exposed: false }; }
+    let loaded = DIRFS.read_prefix_bytes(filesystem, "etc/ld.so.preload", max_bytes);
+    if not loaded.ok or loaded.truncated { return map{ complete: false, present: true,
+        active: false, active_entry_count: 0, content_exposed: false }; }
+    let text = try bytes_to_str(loaded.bytes) catch nil;
+    if text == nil { return map{ complete: false, present: true, active: false,
+        active_entry_count: 0, content_exposed: false }; }
+    let parsed = analyze_preload(text, max_entries); parsed.present = true;
+    parsed.complete = not parsed.entries_truncated; return parsed;
+}
+
+fn _held_program(path) {
+    let root = DIRFS.open_absolute(path_dirname(path), false, false);
+    if not root.ok { return map{ ok: false }; }
+    let handoff = DIRFS.child_file_descriptor(root, path_basename(path));
+    if not handoff.ok { DIRFS.close(root); return map{ ok: false }; }
+    return map{ ok: true, root: root, handoff: handoff,
+        path: "/proc/self/fd/" + str(handoff.fd) };
+}
+
+fn _external(name, path, argv, timeout, output_limit) {
+    let program = _held_program(path);
+    if not program.ok { return map{ scanner: name, installed: false, complete: false,
+        raw_output_exposed: false, clean_claimed: false, rootkit_confirmed: false }; }
+    let result = try PROCESS.run(program.path, argv, map{ timeout_secs: timeout,
+        max_output_bytes: output_limit, max_memory_bytes: 536870912,
+        inherit_environment: false }) catch map{ ok: false };
+    DIRFS.close_child_descriptor(program.root, program.handoff); DIRFS.close(program.root);
+    if not (try result.ok catch false) or not (try result.completed catch false)
+       or not (try result.stdout_utf8 catch false) or not (try result.stderr_utf8 catch false) {
+        return map{ scanner: name, installed: true, complete: false,
+            timed_out: try result.timed_out catch false,
+            output_truncated: try result.output_truncated catch false,
+            raw_output_exposed: false, clean_claimed: false, rootkit_confirmed: false };
+    }
+    let parsed = parse_scanner_output(name, result.stdout, result.stderr,
+        result.exit_code, result.timed_out, result.output_truncated);
+    parsed.installed = true; parsed.descriptor_bound_executable = true;
+    parsed.process_group_terminated = result.process_group_terminated;
+    return parsed;
+}
+
+fn check(args) {
+    args = _strict(args, ["max_findings", "max_preload_bytes", "max_preload_entries",
+        "run_external_scanners", "timeout_seconds", "max_output_bytes"]);
+    SEC.require_trusted("rootkit indicator check", "PB_PROTECT_INSPECT_ENABLE");
+    if platform() != "linux" { throw "rootkit indicator check currently requires Linux"; }
+    let max_findings = _integer(try args.max_findings catch nil, "max_findings", 1, 500, 100);
+    let max_preload_bytes = _integer(try args.max_preload_bytes catch nil,
+        "max_preload_bytes", 1, 1048576, 65536);
+    let max_preload_entries = _integer(try args.max_preload_entries catch nil,
+        "max_preload_entries", 1, 1000, 100);
+    let run_external = _boolean(try args.run_external_scanners catch nil,
+        "run_external_scanners", false);
+    let timeout = _integer(try args.timeout_seconds catch nil, "timeout_seconds", 1, 600, 120);
+    let output_limit = _integer(try args.max_output_bytes catch nil,
+        "max_output_bytes", 4096, 2097152, 524288);
+    if run_external { SEC.require_trusted("external rootkit scanners", "PB_PROTECT_SCAN_ENABLE"); }
+
+    let indicator_paths = ["/usr/bin/.hidden", "/etc/.hidden", "/usr/lib/libsh.so",
+        "/usr/lib/libsh.so.interpreter", "/usr/lib/libsh/bash", "/etc/sh.conf",
+        "/dev/.shit", "/dev/.shdev", "/dev/.shpid", "/dev/.shdir", "/dev/.shproc",
+        "/lib/.sh-", "/usr/lib/libsh", "/sbin/adore", "/usr/bin/.spad", "/dev/.devfsd"];
+    let findings = []; let checks = []; let complete = true; let total = 0; let truncated = false;
+    let filesystem = DIRFS.open_absolute("/", false, false);
+    if not filesystem.ok { throw "filesystem root cannot be held"; }
+    for i len(indicator_paths) {
+        let probe = _fixed_indicator(filesystem, indicator_paths[i]);
+        if not probe.complete { complete = false; }
+        if probe.present {
+            total = total + 1;
+            if len(findings) < max_findings { findings[len(findings)] = map{
+                kind: "legacy-rootkit-indicator-path", severity: "high", path: probe.path,
+                object_kind: try probe.kind catch "unknown", heuristic: true,
+                rootkit_confirmed: false, content_exposed: false }; }
+            else { truncated = true; }
+        }
+    }
+    checks[len(checks)] = map{ check: "legacy-indicator-paths", complete: complete,
+        checked_count: len(indicator_paths), finding_count: total };
+    let preload = _preload(filesystem, max_preload_bytes, max_preload_entries);
+    DIRFS.close(filesystem);
+    if not preload.complete { complete = false; }
+    if preload.active {
+        total = total + 1;
+        if len(findings) < max_findings { findings[len(findings)] = map{
+            kind: "active-ld-so-preload", severity: "high",
+            active_entry_count: preload.active_entry_count, heuristic: true,
+            rootkit_confirmed: false, content_exposed: false }; }
+        else { truncated = true; }
+    }
+    checks[len(checks)] = map{ check: "ld-so-preload", complete: preload.complete,
+        present: preload.present, active: preload.active,
+        active_entry_count: preload.active_entry_count, content_exposed: false };
+
+    let processes = PROCESS_ANOMALY.inspect(map{ max_processes: 4000,
+        max_findings: max_findings, cpu_percent: 10000, memory_percent: 100,
+        min_elapsed_seconds: 315360000, timeout_seconds: 5,
+        max_output_bytes: 1048576 });
+    if not processes.complete { complete = false; }
+    if processes.visibility_mismatch_candidates > 0 {
+        total = total + processes.visibility_mismatch_candidates;
+        for i len(processes.anomalies) {
+            if processes.anomalies[i].kind == "visibility-mismatch-candidate" {
+                if len(findings) < max_findings { findings[len(findings)] = processes.anomalies[i]; }
+                else { truncated = true; }
+            }
+        }
+    }
+    checks[len(checks)] = map{ check: "double-proc-process-visibility",
+        complete: processes.proc_snapshots_complete,
+        candidate_count: processes.visibility_mismatch_candidates,
+        hidden_processes_confirmed: 0 };
+
+    let scanners = [];
+    if run_external {
+        scanners = [
+            _external("rkhunter", "/usr/bin/rkhunter",
+                ["--check", "--skip-keypress", "--nocolors", "--report-warnings-only", "--nolog"], timeout, output_limit),
+            _external("chkrootkit", "/usr/sbin/chkrootkit", ["-q", "-n"], timeout, output_limit),
+            _external("unhide", "/usr/sbin/unhide", ["quick"], timeout, output_limit)
+        ];
+        for i len(scanners) {
+            if not scanners[i].complete { complete = false; }
+            let count = try scanners[i].indicator_line_count catch 0;
+            if count > 0 {
+                total = total + count;
+                if len(findings) < max_findings { findings[len(findings)] = map{
+                    kind: "external-scanner-indicator-lines", severity: "medium",
+                    scanner: scanners[i].scanner, indicator_line_count: count,
+                    heuristic: true, rootkit_confirmed: false, raw_output_exposed: false }; }
+                else { truncated = true; }
+            }
+        }
+    }
+    if truncated { complete = false; }
+    return map{
+        format: "pb_mcp.protect_rootkit_check.v2", ok: complete and total == 0,
+        complete: complete, platform: "linux", checks: checks,
+        findings: findings, finding_count: total, returned_findings: len(findings),
+        findings_truncated: truncated, external_scanners_requested: run_external,
+        external_scanners: scanners, raw_output_exposed: false,
+        preload_content_exposed: false, rootkit_confirmed: false,
+        rootkit_absence_proven: false, heuristic_findings: true,
+        pid_gaps_treated_as_evidence: false, hidden_processes_confirmed: 0,
+        race_resistant_fixed_path_checks: true, symlinks_followed: false,
+        bounded_output: true, bounded_runtime: true, shell_used: false
+    };
+}
+
+export analyze_preload, parse_scanner_output, check;

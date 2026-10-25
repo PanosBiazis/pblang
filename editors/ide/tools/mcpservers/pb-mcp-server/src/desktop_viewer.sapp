@@ -1,0 +1,104 @@
+// Read-only MCP client state. Transport/rendering are separate local boundaries.
+fn integer(n, low, high) {
+    if type(n) != "number" or not (n >= low and n <= high) or n != num_floor(n) { throw "invalid viewer counter"; }
+    return n;
+}
+fn delay(n) {
+    // PBRemote's measured timings can contain fractional milliseconds.
+    if type(n) != "number" or not (n >= 0 and n <= 1000) { throw "invalid viewer delay"; }
+    return num_ceil(n);
+}
+fn new(send) {
+    let s = map{ id: 0, pending: "", deadline: 0, ready: false, wanted: false,
+        stopped: false, phase: "initialize", due: 0, frame: "", generation: 0,
+        index: 0, revision: 0, note: "Connecting; viewing grants no input control" };
+    fn request(method, params, kind, now) {
+        s.id = s.id + 1;
+        if s.id > 4000 { throw "viewer session capacity reached"; }
+        s.pending = kind;s.deadline = now + 35000;
+        s.revision = s.revision + 1;
+        send(map{ jsonrpc: "2.0", id: s.id, method: method, params: params });
+    }
+    fn tool(name, args, kind, now) { request("tools/call",map{ name: name, arguments: args },kind,now); }
+    fn stop() {
+        if not s.stopped {
+            s.stopped = true;s.frame = "";s.generation = s.generation + 1;s.note = "Stopped";
+            s.revision = s.revision + 1;
+            try send(map{ jsonrpc: "2.0", id: s.id + 1, method: "tools/call",
+                params: map{ name: "pbremote_desktop_stop", arguments: map{} } }) catch nil;
+        }
+    }
+    fn tick(now) {
+        integer(now,0,9007199254740991);
+        if s.stopped { return; }
+        if s.pending != "" { if now >= s.deadline { stop(); } return; }
+        if not s.ready {
+            request("initialize",map{ protocolVersion: "2025-06-18",
+                clientInfo: map{ name: "PB-MCP Local Viewer", version: "1.0.0" } },"initialize",now);return;
+        }
+        if not s.wanted or now < s.due { return; }
+        if s.phase == "consent" { tool("pbremote_desktop_status",map{},"consent",now); }
+        elif s.phase == "open" { tool("pbremote_stream_open",map{ fps: 2, max_frames: 120 },"open",now); }
+        elif s.phase == "next" { tool("pbremote_stream_next",map{},"next",now); }
+    }
+    fn start() {
+        if s.stopped or not s.ready or s.wanted or s.pending != "" { return false; }
+        s.wanted = true;s.phase = "consent";s.due = 0;s.index = 0;
+        s.frame = "";s.generation = s.generation + 1;
+        s.revision = s.revision + 1;
+        s.note = "Enable screen sharing in Local Control; no input is requested";return true;
+    }
+    fn consume(message, now) {
+        if type(message) != "map" or message.jsonrpc != "2.0" or message.id != s.id
+            or s.pending == "" or s.stopped { throw "unexpected viewer response"; }
+        let kind = s.pending;s.pending = "";
+        s.revision = s.revision + 1;
+        if map_has(message,"error") { throw "viewer request failed"; }
+        let result = message.result;
+        if kind == "initialize" {
+            if result.protocolVersion != "2025-06-18" { throw "unsupported viewer protocol"; }
+            send(map{ jsonrpc: "2.0", method: "notifications/initialized" });
+            s.ready = true;s.note = "Ready — Start viewing, then approve sharing locally";return;
+        }
+        if type(result.isError) != "bool" or result.isError { throw "desktop viewing was refused or revoked"; }
+        let data = result.structuredContent;
+        if kind == "consent" {
+            if data.stopped { throw "desktop session stopped"; }
+            if data.local_capture_consent { s.phase = "open";s.due = now; }
+            else { s.due = now + 1000; }
+            return;
+        }
+        if kind == "open" {
+            if data.state != "open" { throw "stream did not open"; }
+            s.phase = "next";s.due = now + delay(data.next_frame_in_ms);return;
+        }
+        if data.state == "wait" { s.due = now + delay(data.retry_after_ms);return; }
+        let index = integer(data.frame_index,1,120);
+        if index != s.index + 1 { throw "viewer frame sequence changed"; }
+        if data.state == "frame" {
+            let content = result.content;
+            if type(content) != "array" or len(content) != 2 or content[1].type != "image"
+                or content[1].mimeType != "image/png" or type(content[1].data) != "string"
+                or len(content[1].data) < 76 or len(content[1].data) > 131072 { throw "invalid viewer image"; }
+            s.frame = content[1].data;s.generation = s.generation + 1;
+        } elif data.state != "unchanged" or s.frame == "" { throw "missing viewer image base"; }
+        s.index = index;s.due = now + delay(data.next_frame_in_ms);
+        s.note = "Viewing frame " + str(index) + " · Local viewer · No AI model or input control";
+        if integer(data.remaining_frames,0,119) == 0 {
+            s.wanted = false;s.note = "Frame budget finished — Start for a new stream";
+            s.frame = "";s.generation = s.generation + 1;
+        }
+    }
+    fn receive(message, now) {
+        let accepted = try consume(message,now) catch false;
+        if accepted == false { stop(); }
+    }
+    fn snapshot() { return map{ stopped: s.stopped, can_start: s.ready and not s.wanted and s.pending == "",
+        note: s.note, frame: s.frame, generation: s.generation, frame_index: s.index }; }
+    fn is_stopped() { return s.stopped; }
+    // A scalar change marker lets renderers avoid allocating idle snapshots.
+    // snapshot() still returns a fresh envelope; no mutable internal map escapes.
+    fn revision() { return s.revision; }
+    return map{ is_stopped: is_stopped, start: start, stop: stop, tick: tick, receive: receive, snapshot: snapshot, revision: revision };
+}
+export new;

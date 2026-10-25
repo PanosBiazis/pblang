@@ -1,0 +1,340 @@
+let APP_ACCESS=import("app_access.sapp");
+// Bounded MCP 2025-06-18 JSON-RPC protocol surface.
+//
+// This module is transport-independent. It intentionally advertises only the
+// tools capability: there is no SSE stream, server-initiated notification,
+// resource, prompt, or stateful session implementation in this product yet.
+
+let JSON = import("stdlib:json.sapp");
+let catalog = import("catalog.sapp");
+let router = import("router.sapp");
+let functional = import("functional_registry.sapp");
+let TOOL_IDENTITY = import("tool_identity.sapp");
+
+let SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+let MAX_METHOD_CHARS = 128;
+let MAX_CURSOR_CHARS = 16;
+let TOOLS_PAGE_SIZE = 100;
+let _public_discoverable_cache = [];
+let _public_discoverable_ready = false;
+let _authenticated_discoverable_cache = [];
+let _authenticated_discoverable_ready = false;
+let _multi_user_discoverable_cache = [];
+let _multi_user_discoverable_ready = false;
+
+fn _contains(values, wanted) {
+    for i len(values) { if values[i] == wanted { return true; } }
+    return false;
+}
+
+fn _valid_id(value) {
+    return type(value) == "string" or type(value) == "number";
+}
+
+fn _error(id, code, message, data = nil) {
+    let detail = map{ code: code, message: message };
+    if data != nil { detail.data = data; }
+    return map{ jsonrpc: "2.0", id: id, error: detail };
+}
+
+fn _result(id, value) {
+    return map{ jsonrpc: "2.0", id: id, result: value };
+}
+
+fn _tool_descriptor(entry) {
+    let state = try entry.functional_status catch "missing";
+    let visibility = if try entry.public_mcp catch false { "public" } else { "authenticated" };
+    let status_note = "[PBLang functional status: " + state + ".] ";
+    return map{
+        name: entry.name,
+        title: entry.name,
+        description: status_note + entry.description,
+        inputSchema: try entry.input_schema catch map{ type: "object", properties: map{}, required: [], additionalProperties: false },
+        annotations: map{
+            readOnlyHint: try entry.read_only catch false,
+            destructiveHint: try entry.destructive catch false,
+            openWorldHint: try entry.open_world catch false
+        },
+        _meta: map{
+            "pblang/functionalStatus": state,
+            "pblang/routingStatus": try entry.port_status catch "routed",
+            "pblang/visibility": visibility,
+            "pblang/evidenceIds": try entry.evidence_ids catch []
+        }
+    };
+}
+
+fn _entry_named(entries, name) {
+    for i len(entries) { if entries[i].name == name { return true; } }
+    return false;
+}
+
+fn _native_annotations(name) {
+    let read_only = name == "identity_self" or name == "identity_status" or
+        name == "user_get" or name == "user_list" or name == "organization_get" or
+        name == "organization_list" or name == "organization_metrics" or name == "organization_members" or
+        name == "organization_authorize" or name == "identity_credential_list";
+    return map{ read_only: read_only,
+        destructive: name == "organization_member_remove" or
+            name == "identity_credential_revoke" or name == "user_status_set" or
+            name == "organization_status_set" or name == "system_admin_set",
+        open_world: false };
+}
+
+fn _discoverable_entries(authenticated = false, multi_user = false) {
+    if multi_user and _multi_user_discoverable_ready { return _multi_user_discoverable_cache; }
+    if authenticated and _authenticated_discoverable_ready {
+        return _authenticated_discoverable_cache;
+    }
+    if not authenticated and _public_discoverable_ready {
+        return _public_discoverable_cache;
+    }
+    let all = catalog.implemented_catalog();
+    let entries = [];
+    for ai len(all) {
+        if (authenticated or (try all[ai].public_mcp catch false)) and
+           (not multi_user or router.multi_user_available(all[ai].name)) {
+            entries[len(entries)] = all[ai];
+        }
+    }
+    let metadata = router.discovery_metadata();
+    let meta_tools = metadata.tools;
+    for i len(meta_tools) {
+        let item = meta_tools[i];
+        if not _entry_named(entries, item.name) and
+           (not multi_user or router.multi_user_available(item.name)) {
+            let record = functional.classify(item.name, true);
+            entries[len(entries)] = map{
+                name: item.name,
+                description: try item.desc catch "PBLang-native server metadata tool",
+                read_only: true, destructive: false, open_world: false,
+                functional_status: record.status, port_status: "native",
+                input_schema: record.input_schema, evidence_ids: record.evidence_ids,
+                public_mcp: record.public_mcp
+            };
+        }
+    }
+    let groups = metadata.groups;
+    for gi len(groups) {
+        let names = try groups[gi].tools catch [];
+        for ni len(names) {
+            let name = str(names[ni]);
+            let record = functional.classify(name, true);
+            if record.public_mcp and not _entry_named(entries, name) and
+               (not multi_user or router.multi_user_available(name)) {
+                let annotations = _native_annotations(name);
+                entries[len(entries)] = map{
+                    name: name,
+                    description: "PBLang-native " + str(groups[gi].name) + " extension tool",
+                    read_only: annotations.read_only, destructive: annotations.destructive,
+                    open_world: annotations.open_world,
+                    functional_status: record.status, port_status: "native",
+                    input_schema: record.input_schema, evidence_ids: record.evidence_ids,
+                    public_mcp: true
+                };
+            }
+        }
+    }
+    if authenticated {
+        if multi_user {
+            _multi_user_discoverable_cache = entries;
+            _multi_user_discoverable_ready = true;
+            return _multi_user_discoverable_cache;
+        }
+        _authenticated_discoverable_cache = entries;
+        _authenticated_discoverable_ready = true;
+        return _authenticated_discoverable_cache;
+    }
+    _public_discoverable_cache = entries;
+    _public_discoverable_ready = true;
+    return _public_discoverable_cache;
+}
+
+fn _parse_cursor(params) {
+    let raw = str(try params.cursor catch "0");
+    if raw == "" { raw = "0"; }
+    if len(raw) > MAX_CURSOR_CHARS { return map{ ok: false, error: "cursor is too long" }; }
+    let offset = try parse_number(raw) catch nil;
+    if offset == nil or offset < 0 or num_floor(offset) != offset or str(offset) != raw {
+        return map{ ok: false, error: "cursor must be a canonical non-negative integer" };
+    }
+    return map{ ok: true, offset: offset };
+}
+
+fn _tools_list(params, principal = nil, identity_store = nil) {
+    let cursor = _parse_cursor(params);
+    if not cursor.ok { return cursor; }
+    let all_entries = _discoverable_entries(principal != nil, identity_store != nil);
+    let entries=[];for i len(all_entries){if APP_ACCESS.available(all_entries[i].name){entries[len(entries)]=all_entries[i];}}
+    let page = [];
+    let stop = cursor.offset + TOOLS_PAGE_SIZE;
+    if stop > len(entries) { stop = len(entries); }
+    let i = cursor.offset;
+    while i < stop {
+        page[len(page)] = _tool_descriptor(entries[i]);
+        i = i + 1;
+    }
+    let value = map{ tools: page };
+    if stop < len(entries) { value.nextCursor = str(stop); }
+    return map{ ok: true, value: value };
+}
+
+fn _tool_content(value) {
+    if type(value) == "string" { return value; }
+    return try JSON.stringify(value) catch str(value);
+}
+
+fn _tools_call(params, principal = nil, identity_store = nil, organization_scope = nil) {
+    let parsed_name = TOOL_IDENTITY.parse(try params.name catch nil);
+    if not parsed_name.ok {
+        return map{ protocol_error: true, code: -32602,
+            error: "tools/call refused: " + parsed_name.error };
+    }
+    let name = parsed_name.name;
+    let args = try params.arguments catch map{};
+    if type(args) != "map" {
+        return map{ protocol_error: true, code: -32602, error: "tools/call params.arguments must be an object" };
+    }
+    // Discovery visibility is an authorization boundary, not merely UI
+    // metadata. A caller must not bypass a private/trusted tool by guessing its
+    // name and invoking tools/call directly.
+    let access = functional.classify(name, true);
+    if access.status == "missing" {
+        return map{
+            protocol_error: true, code: -32602,
+            error: "tools/call refused: " + access.reason
+        };
+    }
+    if access.status == "blocked" or
+       (not (try access.public_mcp catch false) and principal == nil) {
+        return map{
+            protocol_error: true, code: -32001,
+            error: "tools/call refused: private tool requires an authenticated principal"
+        };
+    }
+    let validation = functional.validate_arguments(name, args);
+    if not validation.ok {
+        let code = -32602;
+        if validation.status == "blocked" { code = -32001; }
+        return map{ protocol_error: true, code: code, error: "tools/call refused: " + validation.error };
+    }
+    let called = router.call_as(name, args, principal, identity_store, organization_scope);
+    if called.ok {
+        let structured = if type(called.value) == "map" { called.value } else { map{ value: called.value } };
+        return map{ ok: true, value: map{
+            content: [map{ type: "text", text: _tool_content(called.value) }],
+            structuredContent: structured,
+            isError: false
+        } };
+    }
+    return map{ ok: true, value: map{
+        content: [map{ type: "text", text: str(try called.error catch "tool failed") }],
+        isError: true
+    } };
+}
+
+fn _initialize(params) {
+    let requested = try params.protocolVersion catch nil;
+    if type(requested) != "string" or requested == "" {
+        return map{ ok: false, code: -32602, error: "initialize requires params.protocolVersion" };
+    }
+    let selected = if _contains(SUPPORTED_PROTOCOL_VERSIONS, requested) { requested } else { SUPPORTED_PROTOCOL_VERSIONS[0] };
+    return map{ ok: true, value: map{
+        protocolVersion: selected,
+        capabilities: map{ tools: map{ listChanged: false } },
+        serverInfo: map{
+            name: "pb-mcp-server-pblang",
+            title: "PB MCP Server",
+            version: "0.2.0"
+        },
+        instructions: "Project-scoped PBLang tools. Inspect annotations and tool results; external or privileged effects may remain explicitly blocked or plan-only."
+    } };
+}
+
+// Returns {kind:"response", value}, {kind:"notification"}, or
+// {kind:"invalid", value}. HTTP and future stdio transports share this exact
+// validation and dispatch contract.
+fn handle_as(message, principal = nil, identity_store = nil, organization_scope = nil) {
+    if type(message) != "map" {
+        return map{ kind: "invalid", value: _error(nil, -32600, "Invalid Request: a single JSON object is required") };
+    }
+    if (try message.jsonrpc catch nil) != "2.0" {
+        return map{ kind: "invalid", value: _error(nil, -32600, "Invalid Request: jsonrpc must be '2.0'") };
+    }
+    let method = try message.method catch nil;
+    if type(method) != "string" or method == "" or len(method) > MAX_METHOD_CHARS {
+        return map{ kind: "invalid", value: _error(nil, -32600, "Invalid Request: method must be a bounded non-empty string") };
+    }
+    let params = try message.params catch map{};
+    if type(params) != "map" {
+        let bad_id = if map_has(message, "id") and _valid_id(message.id) { message.id } else { nil };
+        return map{ kind: "invalid", value: _error(bad_id, -32602, "Invalid params: an object is required") };
+    }
+
+    let notification = not map_has(message, "id");
+    if notification {
+        if method == "notifications/initialized" or method == "notifications/cancelled" {
+            return map{ kind: "notification", accepted: true };
+        }
+        return map{ kind: "invalid", notification: true, value: _error(nil, -32601, "Method not found: " + method) };
+    }
+    if not _valid_id(message.id) {
+        return map{ kind: "invalid", value: _error(nil, -32600, "Invalid Request: id must be a string or number") };
+    }
+    let id = message.id;
+
+    if method == "initialize" {
+        let initialized = _initialize(params);
+        if initialized.ok { return map{ kind: "response", value: _result(id, initialized.value) }; }
+        return map{ kind: "response", value: _error(id, initialized.code, initialized.error) };
+    }
+    if method == "ping" { return map{ kind: "response", value: _result(id, map{}) }; }
+    if method == "tools/list" {
+        let listed = _tools_list(params, principal, identity_store);
+        if listed.ok { return map{ kind: "response", value: _result(id, listed.value) }; }
+        return map{ kind: "response", value: _error(id, -32602, listed.error) };
+    }
+    if method == "tools/call" {
+        let called = _tools_call(params, principal, identity_store, organization_scope);
+        if try called.protocol_error catch false {
+            return map{ kind: "response", value: _error(id, called.code, called.error) };
+        }
+        return map{ kind: "response", value: _result(id, called.value) };
+    }
+    return map{ kind: "response", value: _error(id, -32601, "Method not found: " + method) };
+}
+
+fn handle(message) { return handle_as(message, nil); }
+
+fn supported_versions() { return SUPPORTED_PROTOCOL_VERSIONS; }
+
+// Standard MCP stdio transport: one compact JSON-RPC message per input line and
+// no non-protocol output on stdout. EOF terminates the child process cleanly.
+fn serve_stdio() {
+    let principal = try env_get("PB_MCP_PRINCIPAL") catch nil;
+    if principal != nil and (type(principal) != "string" or
+       not regex_match(principal, "^[a-z][a-z0-9_-]{2,63}$")) {
+        throw "PB_MCP_PRINCIPAL must match ^[a-z][a-z0-9_-]{2,63}$ when configured";
+    }
+    loop {
+        let line = read_line();
+        if line == nil { return; }
+        if str_trim(line) == "" {
+            print JSON.stringify(_error(nil, -32700, "Parse error: empty input line"));
+        } else {
+            let parsed = try JSON.parse(line) catch nil;
+            if parsed == nil {
+                print JSON.stringify(_error(nil, -32700, "Parse error: malformed JSON"));
+            } else {
+                let handled = handle_as(parsed, principal);
+                // Valid notifications deliberately produce no stdout message.
+                // Invalid notifications are also silent under JSON-RPC 2.0.
+                if handled.kind == "response" or (handled.kind == "invalid" and not (try handled.notification catch false)) {
+                    print JSON.stringify(handled.value);
+                }
+            }
+        }
+    }
+}
+
+export handle, handle_as, supported_versions, serve_stdio;
