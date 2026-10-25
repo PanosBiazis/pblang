@@ -217,14 +217,21 @@ fn _parse_stmt(st) {
     throw "tier1: unsupported token " + str(t.val);
 }
 
-// Allocate variables: first 3 go into r13 (0), r12 (1), r14 (2); rest into stack slots
-fn _var_loc(ctx, name) {
+// Allocate variables: first 3 go into r13 (0), r12 (1), r14 (2); rest into zeroed stack slots
+fn _declare_var(ctx, name) {
     if map_has(ctx.vars, name) { return ctx.vars[name]; }
     let idx = ctx.count;
     ctx.count = idx + 1;
     let loc = if idx < 3 { map{ reg: idx } } else { map{ reg: -1, disp: 0 - (8 * (idx + 1)) } };
     ctx.vars[name] = loc;
     return loc;
+}
+
+fn _require_var(ctx, name) {
+    if not map_has(ctx.vars, name) {
+        throw "tier1: undeclared variable " + str(name);
+    }
+    return ctx.vars[name];
 }
 
 fn _emit_load_var(code, loc) {
@@ -257,7 +264,7 @@ fn _emit_expr(node, code, ctx) {
         return;
     }
     if k == "id" {
-        _emit_load_var(code, _var_loc(ctx, node.name));
+        _emit_load_var(code, _require_var(ctx, node.name));
         return;
     }
     if k == "neg" {
@@ -267,26 +274,43 @@ fn _emit_expr(node, code, ctx) {
     }
     if k == "bin" {
         let op = node.op;
-        // Fast path: modulo by positive constant
+        if (op == "/" or op == "%") and node.right.kind == "num" and node.right.val == 0 {
+            throw "tier1: compile-time division/modulo by zero";
+        }
+        // Generalized Barrett / Granlund-Montgomery reciprocal & range reduction for ANY positive constant m
         if op == "%" and node.right.kind == "num" and node.right.val > 0 and node.right.val < 1073741824 {
             let m = node.right.val;
             _emit_expr(node.left, code, ctx);
-            if m == 1000 {
-                // Granlund-Montgomery fast reciprocal for % 1000 when 0 <= rax < 1073741824
-                push(code, 72); push(code, 137); push(code, 193);             // mov rcx, rax
-                push(code, 186); _elf.le(code, 4294967, 4);                   // mov edx, 0x418937
-                push(code, 72); push(code, 15); push(code, 175); push(code, 194); // imul rax, rdx
-                push(code, 72); push(code, 193); push(code, 232); push(code, 32); // shr rax, 32
-                push(code, 72); push(code, 105); push(code, 192); _elf.le(code, 1000, 4); // imul rax, rax, 1000
-                push(code, 72); push(code, 41); push(code, 193);              // sub rcx, rax
-                push(code, 72); push(code, 129); push(code, 249); _elf.le(code, 1000, 4); // cmp rcx, 1000
-                push(code, 114); push(code, 7);                               // jb +7
-                push(code, 72); push(code, 129); push(code, 233); _elf.le(code, 1000, 4); // sub rcx, 1000
-                push(code, 72); push(code, 137); push(code, 200);             // mov rax, rcx
+            if m == 1 {
+                push(code, 49); push(code, 192); // xor eax, eax
                 return;
             }
-            // Branchless-assisted range reduction for any positive constant m:
-            // if 0 <= rax < m -> done; if m <= rax < 2*m -> rax -= m; else -> cqo; idiv m
+            if m >= 2 and m <= 65535 {
+                let magic = num_floor(4294967296 / m);
+                // Unsigned compare `cmp rax, 0x40000000`: catches both rax < 0 and rax >= 2^30 in 1 instruction
+                push(code, 72); push(code, 61); _elf.le(code, 1073741824, 4);     // cmp rax, 1073741824 (6B)
+                push(code, 115); push(code, 42);                                  // jae slow_div (+42) (2B)
+                push(code, 72); push(code, 137); push(code, 193);                 // mov rcx, rax (3B)
+                push(code, 186); _elf.le(code, magic, 4);                         // mov edx, magic (5B)
+                push(code, 72); push(code, 15); push(code, 175); push(code, 194); // imul rax, rdx (4B)
+                push(code, 72); push(code, 193); push(code, 232); push(code, 32); // shr rax, 32 (4B)
+                push(code, 72); push(code, 105); push(code, 192); _elf.le(code, m, 4); // imul rax, rax, m (7B)
+                push(code, 72); push(code, 41); push(code, 193);                  // sub rcx, rax (3B)
+                push(code, 72); push(code, 129); push(code, 249); _elf.le(code, m, 4); // cmp rcx, m (7B)
+                push(code, 114); push(code, 7);                                   // jb +7 (2B)
+                push(code, 72); push(code, 129); push(code, 233); _elf.le(code, m, 4); // sub rcx, m (7B)
+                push(code, 72); push(code, 137); push(code, 200);                 // mov rax, rcx (3B)
+                push(code, 235); push(code, 13);                                  // jmp done (+13) (2B)
+                // slow_div:
+                push(code, 185); _elf.le(code, m, 4);                             // mov ecx, m (5B)
+                push(code, 72); push(code, 153);                                  // cqo (2B)
+                push(code, 72); push(code, 247); push(code, 249);                 // idiv rcx (3B)
+                push(code, 72); push(code, 137); push(code, 208);                 // mov rax, rdx (3B)
+                // done:
+                return;
+            }
+            // Branchless-assisted unsigned range reduction for any positive constant m >= 65536:
+            // Unsigned `cmp` automatically routes negative rax to `slow_div` (`cqo; idiv`)
             push(code, 72); push(code, 61); _elf.le(code, m, 4);              // cmp rax, m
             push(code, 114); push(code, 29);                                  // jb done (+29)
             push(code, 72); push(code, 61); _elf.le(code, m * 2, 4);          // cmp rax, 2*m
@@ -326,12 +350,25 @@ fn _emit_expr(node, code, ctx) {
         if op == "-" { push(code, 72); push(code, 41); push(code, 216); return; }
         if op == "*" { push(code, 72); push(code, 15); push(code, 175); push(code, 195); return; }
         if op == "/" or op == "%" {
-            push(code, 72); push(code, 133); push(code, 219); // test rbx, rbx
+            push(code, 72); push(code, 133); push(code, 219); // test rbx, rbx (div-by-zero check)
             push(code, 117); push(code, 2);                   // jnz +2
-            push(code, 15); push(code, 11);                   // ud2 (div by zero guard)
+            push(code, 15); push(code, 11);                   // ud2 (hardware safety trap)
+            push(code, 72); push(code, 131); push(code, 251); push(code, 255); // cmp rbx, -1 (INT64_MIN / -1 guard)
+            push(code, 117); push(code, 10);                  // jne do_idiv (+10)
+            if op == "%" {
+                push(code, 49); push(code, 192);              // xor eax, eax (x % -1 == 0)
+                push(code, 235); push(code, 10);              // jmp div_done (+10)
+                push(code, 144); push(code, 144); push(code, 144); push(code, 144);
+            } else {
+                push(code, 72); push(code, 247); push(code, 216); // neg rax (x / -1 == -x)
+                push(code, 235); push(code, 9);               // jmp div_done (+9)
+                push(code, 144); push(code, 144); push(code, 144);
+            }
+            // do_idiv:
             push(code, 72); push(code, 153);                  // cqo
             push(code, 72); push(code, 247); push(code, 251); // idiv rbx
             if op == "%" { push(code, 72); push(code, 137); push(code, 208); } // mov rax, rdx
+            // div_done:
             return;
         }
         push(code, 72); push(code, 57); push(code, 216); // cmp rax, rbx
@@ -381,8 +418,14 @@ fn _emit_print_int(code) {
 
 fn _emit_stmt(node, code, ctx) {
     let k = node.kind;
-    if k == "let" or k == "assign" {
-        let loc = _var_loc(ctx, node.name);
+    if k == "let" {
+        let loc = _declare_var(ctx, node.name);
+        _emit_expr(node.val, code, ctx);
+        _emit_store_var(code, loc);
+        return;
+    }
+    if k == "assign" {
+        let loc = _require_var(ctx, node.name);
         _emit_expr(node.val, code, ctx);
         _emit_store_var(code, loc);
         return;
@@ -445,6 +488,9 @@ fn _compile_tier1(src) {
     let code = [];
     push(code, 72); push(code, 137); push(code, 229);            // mov rbp, rsp
     push(code, 72); push(code, 129); push(code, 236); _elf.le(code, 256, 4); // sub rsp, 256
+    push(code, 69); push(code, 49); push(code, 237);             // xor r13d, r13d (zero-init reg 0)
+    push(code, 69); push(code, 49); push(code, 228);             // xor r12d, r12d (zero-init reg 1)
+    push(code, 69); push(code, 49); push(code, 246);             // xor r14d, r14d (zero-init reg 2)
     let ctx = map{ vars: map{}, count: 0 };
     let i = 0;
     while i < len(stmts) { _emit_stmt(stmts[i], code, ctx); i = i + 1; }
