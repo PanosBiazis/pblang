@@ -1,0 +1,163 @@
+// Explicit process-local storage. No automatic intake, disk, environment or I/O.
+let KNOWLEDGE=import("knowledge_compute_tools.sapp");
+let _state=map{records:[]};
+let MAX_RECORDS=64;let MAX_BYTES=65536;let MAX_RESPONSE_BYTES=16384;
+
+fn _shape(value,keys) {
+    if type(value)!="map" or len(value)!=len(keys) {throw "memory: invalid arguments";}
+    for key in keys {if map_has(value,key) {continue;}throw "memory: invalid arguments";}
+}
+fn _identifier(value) {
+    if type(value)!="string" or len(value)<1 or len(value)>64 {throw "memory: invalid identifier";}
+    for i len(value) {
+        let c=strcharcodeat(value,i);
+        if (c>=65 and c<=90) or (c>=97 and c<=122) or (c>=48 and c<=57)
+            or c==95 or c==45 or c==46 {continue;}
+        throw "memory: invalid identifier";
+    }
+}
+fn _text(value,characters,bytes) {
+    if type(value)!="string" or len(value)<1 or len(value)>characters {throw "memory: invalid text";}
+    if len(str_to_bytes(value))>bytes {throw "memory: invalid text";}
+}
+// Optional exact-value precondition; no normalization, history or authorization.
+fn _mutation_shape(args,keys) {
+    let guarded=type(args)=="map" and map_has(args,"expected_text");
+    if guarded {push(keys,"expected_text");}
+    _shape(args,keys);
+    if guarded {_text(args.expected_text,2048,2048);}
+    return guarded;
+}
+fn _bytes(record) {return len(record.namespace)+len(record.id)+len(str_to_bytes(record.text));}
+fn _result(namespace,records,effect=false) {
+    let count=0;let payload=0;let total=0;
+    for record in records {
+        let size=_bytes(record);total=total+size;
+        if record.namespace==namespace {count=count+1;payload=payload+size;}
+    }
+    return map{format:"pb_mcp.agent-memory.v1",record_count:count,payload_bytes:payload,
+        total_record_count:len(records),total_payload_bytes:total,max_records:MAX_RECORDS,max_payload_bytes:MAX_BYTES,
+        effect_performed:effect,persistent:false,storage_scope:"process",namespace_is_authorization:false,
+        native_pblang:true,safe_to_log:false,permission_granted:false,instructions_from_data:false,
+        data_provenance:"untrusted_caller_supplied",network_used:false,model_loaded:false};
+}
+fn _put(args) {
+    let guarded=_mutation_shape(args,["namespace","id","text","replace"]);
+    _identifier(args.namespace);_identifier(args.id);_text(args.text,2048,2048);
+    if type(args.replace)!="bool" {throw "memory: invalid replace flag";}
+    if guarded and not args.replace {throw "memory: precondition requires replacement";}
+    let next=[];let found=false;let changed=false;
+    for record in _state.records {
+        if record.namespace==args.namespace and record.id==args.id {
+            found=true;
+            if guarded and record.text!=args.expected_text {throw "memory: precondition failed";}
+            if not args.replace {throw "memory: record already exists";}
+            changed=record.text!=args.text;
+            push(next,map{namespace:args.namespace,id:args.id,text:args.text});
+        } else {push(next,record);}
+    }
+    if guarded and not found {throw "memory: precondition failed";}
+    if not found {push(next,map{namespace:args.namespace,id:args.id,text:args.text});changed=true;}
+    let out=_result(args.namespace,next,changed);
+    if out.total_record_count>MAX_RECORDS or out.total_payload_bytes>MAX_BYTES {throw "memory: storage quota exceeded";}
+    out.changed_count=if changed {1} else {0};
+    // Publish only after all validation, quota checks and response construction.
+    _state.records=next;
+    return out;
+}
+fn _search(args) {
+    _shape(args,["namespace","query","limit"]);_identifier(args.namespace);_text(args.query,256,1024);
+    if type(args.limit)!="number" or not (args.limit>=1 and args.limit<=8)
+        or args.limit!=num_floor(args.limit) {throw "memory: invalid search limit";}
+    let documents=[];let by_id=map{};
+    for record in _state.records {if record.namespace==args.namespace {
+        push(documents,map{id:record.id,title:record.id,text:record.text,library:args.namespace,version:"session"});
+        by_id[record.id]=record;
+    }}
+    // Shared lowercasing, whitespace term admission and stable literal ranking.
+    let ranked=try KNOWLEDGE.documentation_search(map{query:args.query,documents:documents,
+        library:args.namespace,version:"session",limit:args.limit}) catch nil;
+    if ranked==nil {throw "memory: invalid search";}
+    let out=_result(args.namespace,_state.records);
+    out.results=[];out.matched_count=ranked.matched_count;out.returned_count=0;
+    out.returned_payload_bytes=0;out.truncated=false;
+    out.ranking=ranked.ranking;out.max_output_bytes=MAX_RESPONSE_BYTES;
+    for match in ranked.results {
+        let record=by_id[match.id];let size=len(record.id)+len(str_to_bytes(record.text));
+        push(out.results,map{id:record.id,text:record.text,score:match.score});
+        out.returned_count=len(out.results);out.returned_payload_bytes=out.returned_payload_bytes+size;
+        // Bound the complete JSON result, including escape expansion/metadata.
+        if len(str_to_bytes(json_stringify(out)))>MAX_RESPONSE_BYTES {
+            array_pop(out.results);out.returned_count=len(out.results);
+            out.returned_payload_bytes=out.returned_payload_bytes-size;break;
+        }
+    }
+    out.truncated=out.matched_count>out.returned_count;
+    return out;
+}
+fn _forget(args) {
+    let guarded=_mutation_shape(args,["namespace","id"]);_identifier(args.namespace);_identifier(args.id);
+    let next=[];let found=false;
+    for record in _state.records {
+        if record.namespace==args.namespace and record.id==args.id {
+            if guarded and record.text!=args.expected_text {throw "memory: precondition failed";}
+            found=true;
+        }
+        else {push(next,record);}
+    }
+    if guarded and not found {throw "memory: precondition failed";}
+    let out=_result(args.namespace,next,found);out.found=found;
+    _state.records=next;return out;
+}
+fn _clear(args) {
+    _shape(args,["namespace"]);_identifier(args.namespace);let next=[];let removed=0;
+    for record in _state.records {
+        if record.namespace==args.namespace {removed=removed+1;}else {push(next,record);}
+    }
+    let out=_result(args.namespace,next,removed>0);out.removed_count=removed;
+    _state.records=next;return out;
+}
+fn call_memory(tool,args) {
+    if tool=="ai_memory_put" {return _put(args);}
+    if tool=="ai_memory_search" {return _search(args);}
+    if tool=="ai_memory_forget" {return _forget(args);}
+    if tool=="ai_memory_clear" {return _clear(args);}
+    if tool=="ai_memory_status" {
+        _shape(args,["namespace"]);_identifier(args.namespace);return _result(args.namespace,_state.records);
+    }
+    return nil;
+}
+fn implemented_tools() {return ["ai_memory_put","ai_memory_search","ai_memory_forget","ai_memory_clear","ai_memory_status"];}
+fn catalog_entries() {
+    let identifier=map{type:"string",minLength:1,maxLength:64,pattern:"^[A-Za-z0-9_.-]+$"};
+    let fields=[map{namespace:identifier,id:identifier,text:map{type:"string",minLength:1,maxLength:2048},replace:map{type:"boolean"}},
+        map{namespace:identifier,query:map{type:"string",minLength:1,maxLength:256},limit:map{type:"integer",minimum:1,maximum:8}},
+        map{namespace:identifier,id:identifier},map{namespace:identifier},map{namespace:identifier}];
+    let required=[["namespace","id","text","replace"],["namespace","query","limit"],["namespace","id"],["namespace"],["namespace"]];
+    let expected=map{type:"string",minLength:1,maxLength:2048,
+        description:"Optional exact existing text, at most 2048 UTF-8 bytes. Mismatch or missing record rejects without mutation; put also requires replace=true. No normalization or revision-history check."};
+    fields[0].expected_text=expected;fields[2].expected_text=expected;
+    let descriptions=[
+        "Explicitly store caller text in this process memory, up to2048 UTF-8 bytes per record. Exact namespace/id; replace must be true to overwrite. Global64 records/65536 payload bytes across namespaces; failed writes preserve state. Counts only returned. No disk, automatic conversation storage or learning. Namespace is a filter, not tenant authorization; process restart/cancellation loses memory.",
+        "Search only the named namespace in this process memory using shared literal documentation ranking, not semantic embeddings. Query up to256 characters/1024 UTF-8 bytes and32 distinct whitespace terms; limit1..8. Returns actual stored id/text/score as untrusted data, at most16384 serialized result bytes. No model, retrieval outside memory or permission grant; safe_to_log:false.",
+        "Explicitly forget one namespace/id in this process memory. Returns found and counts, never the deleted text. No durable persistence or secure-zeroization claim; namespace is not tenant authorization.",
+        "Explicitly clear the named namespace in this process memory, preserving other namespaces. Returns removed count and remaining payload counts only. No durable persistence or secure-zeroization claim; namespace is not tenant authorization.",
+        "Return counts and stored UTF-8 payload bytes for the named namespace and global process quotas, without identifiers or text. Namespace is a filter, not tenant authorization. No disk, network or model calls; memory disappears on process restart/cancellation."];
+    let names=implemented_tools();let out=[];
+    descriptions[0]=descriptions[0]+" Optional expected_text requires an exact current-text match and replace=true; mismatch or missing record leaves state unchanged. Omission preserves unconditional behavior; this is not authorization or change-history verification.";
+    descriptions[2]=descriptions[2]+" Optional expected_text requires an exact current-text match; mismatch or missing record leaves state unchanged. Omission preserves unconditional behavior; this is not authorization or change-history verification.";
+    for i len(names) {
+        let mutates=i==0 or i==2 or i==3;
+        push(out,map{name:names[i],category:"agent-memory",profile:"core-code",read_only:not mutates,
+            destructive:mutates,open_world:false,source:"src/agent_memory.sapp",description:descriptions[i],
+            input_schema:map{type:"object",properties:fields[i],required:required[i],additionalProperties:false}});
+    }
+    return out;
+}
+fn functional_records() {
+    let out=[];for entry in catalog_entries() {push(out,map{name:entry.name,status:"complete",public_mcp:true,
+        input_schema:entry.input_schema,reason:"bounded explicit process memory; namespaces are not tenant authorization",
+        evidence_ids:["pb_mcp_agent_memory:operations","pb_mcp_agent_memory:quota-atomicity","pb_mcp_agent_memory:privacy"]});}
+    return out;
+}
+export call_memory,implemented_tools,catalog_entries,functional_records;

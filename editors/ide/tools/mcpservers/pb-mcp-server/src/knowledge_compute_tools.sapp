@@ -1,0 +1,310 @@
+let VECTORS = import("vector_search.sapp");
+let CONTEXT = import("context_budget.sapp");
+let FUSION = import("rank_fusion.sapp");
+// Independent, offline PBLang implementations. Caller data is never executed,
+// fetched, loaded as a model, or persisted. Limits belong to MCP requests only.
+let NEURAL = import("neural_preprocess.sapp");
+
+fn _object(value, allowed, required) {
+    if type(value) != "map" { throw "expected an object"; }
+    let keys = map_keys(value);
+    for i len(keys) {
+        let found = false;
+        for j len(allowed) { if keys[i] == allowed[j] { found = true; } }
+        if not found { throw "unsupported property"; }
+    }
+    for i len(required) { if not map_has(value, required[i]) { throw "required property missing"; } }
+}
+fn _text(value, maximum, nonempty = true) {
+    if type(value) != "string" { throw "expected text"; }
+    if len(value) > maximum or (nonempty and str_trim(value) == "") { throw "text length outside request bounds"; }
+    return value;
+}
+fn _array(value, maximum, minimum = 0) {
+    if type(value) != "array" { throw "expected an array"; }
+    if len(value) < minimum or len(value) > maximum { throw "array length outside request bounds"; }
+    return value;
+}
+fn _number(value, low, high, integer = false) {
+    if type(value) != "number" { throw "expected a number"; }
+    if not (value >= low and value <= high) { throw "number outside finite request bounds"; }
+    if integer and value != num_floor(value) { throw "expected an integer"; }
+    return value;
+}
+fn _result(kind) {
+    return map{ format: "pb_mcp." + kind + ".v1", native_pblang: true,
+        effect_performed: false, network_used: false, model_loaded: false,
+        data_provenance: "untrusted_caller_supplied", instructions_from_data: false };
+}
+
+// Exact library/version filters precede ranking. Return identifiers and scores
+// only: source text remains caller-owned data, never privileged instructions.
+fn documentation_search(args) {
+    _object(args, ["query", "documents", "library", "version", "limit"], ["query", "documents"]);
+    let query = str_lower(_text(args.query, 256));
+    let docs = _array(args.documents, 256);
+    let library = _text(try args.library catch "", 128, false);
+    let version = _text(try args.version catch "", 64, false);
+    let limit = _number(try args.limit catch 10, 1, 50, true);
+    let words = str_split(regex_replace_all(query, "[\\s]+", " "), " ");
+    let terms = []; let seen_terms = map{};
+    for i len(words) {
+        if words[i] != "" and not map_has(seen_terms, words[i]) {
+            terms[len(terms)] = words[i]; seen_terms[words[i]] = true;
+        }
+    }
+    if len(terms) == 0 or len(terms) > 32 { throw "query requires 1..32 distinct terms"; }
+    let ids = map{}; let total = 0; let matches = []; let matched = 0;
+    for i len(docs) {
+        let d = docs[i];
+        _object(d, ["id", "library", "version", "title", "text"], ["id", "library", "version", "title", "text"]);
+        _text(d.id, 128); _text(d.library, 128); _text(d.version, 64);
+        _text(d.title, 256); _text(d.text, 16384, false);
+        if map_has(ids, d.id) { throw "document identifiers must be unique"; }
+        ids[d.id] = true;
+        total = total + len(d.text) + len(d.title);
+        if total > 262144 { throw "document batch exceeds text budget"; }
+        if (library == "" or d.library == library) and (version == "" or d.version == version) {
+            let title = str_lower(d.title); let body = str_lower(d.text); let score = 0;
+            for j len(terms) {
+                if str_contains(title, terms[j]) { score = score + 3; }
+                if str_contains(body, terms[j]) { score = score + 1; }
+            }
+            if score > 0 {
+                matched = matched + 1;
+                let row = map{ id: d.id, library: d.library, version: d.version, score: score };
+                let at = len(matches);
+                while at > 0 and matches[at - 1].score < score { at = at - 1; }
+                if at < limit {
+                    let end = len(matches);
+                    if end >= limit { end = limit - 1; }
+                    while end > at { matches[end] = matches[end - 1]; end = end - 1; }
+                    matches[at] = row;
+                }
+            }
+        }
+    }
+    let out = _result("documentation_search"); out.results = matches;
+    out.matched_count = matched; out.truncated = matched > len(matches);
+    out.ranking = "literal term overlap; title weight 3; stable input order ties";
+    return out;
+}
+
+// Graphify exports can be projected to identifiers + source/target links by the
+// caller. No file paths, labels or embedded graph content are dereferenced.
+fn knowledge_graph_path(args) {
+    _object(args, ["nodes", "edges", "start", "end", "directed"], ["nodes", "edges", "start", "end"]);
+    let nodes = _array(args.nodes, 2048, 1); let edges = _array(args.edges, 8192);
+    let start = _text(args.start, 128); let end = _text(args.end, 128);
+    let directed = try args.directed catch true;
+    if type(directed) != "bool" { throw "directed must be boolean"; }
+    let adjacency = map{};
+    for i len(nodes) {
+        _text(nodes[i], 128);
+        if map_has(adjacency, nodes[i]) { throw "node identifiers must be unique"; }
+        adjacency[nodes[i]] = [];
+    }
+    if not map_has(adjacency, start) or not map_has(adjacency, end) { throw "path endpoints must exist"; }
+    for i len(edges) {
+        let e = edges[i]; _object(e, ["source", "target"], ["source", "target"]);
+        _text(e.source, 128); _text(e.target, 128);
+        if not map_has(adjacency, e.source) or not map_has(adjacency, e.target) { throw "edge endpoint must exist"; }
+        let next = adjacency[e.source]; next[len(next)] = e.target; adjacency[e.source] = next;
+        if not directed { let back = adjacency[e.target]; back[len(back)] = e.source; adjacency[e.target] = back; }
+    }
+    let queue = [start]; let head = 0; let parent = map{}; parent[start] = nil;
+    while head < len(queue) and not map_has(parent, end) {
+        let node = queue[head]; head = head + 1;
+        let next = adjacency[node];
+        for i len(next) {
+            if not map_has(parent, next[i]) {
+                parent[next[i]] = node; queue[len(queue)] = next[i];
+            }
+        }
+    }
+    let path = []; let distance = -1;
+    if map_has(parent, end) {
+        let reversed = []; let node = end;
+        while node != nil { reversed[len(reversed)] = node; node = parent[node]; }
+        let i = len(reversed) - 1;
+        while i >= 0 { path[len(path)] = reversed[i]; i = i - 1; }
+        distance = len(path) - 1;
+    }
+    let out = _result("knowledge_graph_path"); out.found = distance >= 0;
+    out.path = path; out.distance = if distance < 0 { nil } else { distance }; out.directed = directed;
+    return out;
+}
+
+// Analyze pre-extracted numeric request metrics. URLs, headers and response
+// bodies are deliberately outside the input/output contract.
+fn browser_metrics_summary(args) {
+    _object(args, ["requests"], ["requests"]);
+    let rows = _array(args.requests, 4096); let durations = [];
+    let bytes = 0; let sum = 0; let failed = 0; let classes = map{};
+    for i len(rows) {
+        let r = rows[i]; _object(r, ["status", "duration_ms", "transfer_bytes"], ["status", "duration_ms", "transfer_bytes"]);
+        _number(r.status, 0, 599, true);
+        if r.status > 0 and r.status < 100 { throw "invalid HTTP status"; }
+        _number(r.duration_ms, 0, 86400000); _number(r.transfer_bytes, 0, 1000000000000, true);
+        let bucket = if r.status == 0 { "network_error" } else { str(num_floor(r.status / 100)) + "xx" };
+        classes[bucket] = (try classes[bucket] catch 0) + 1;
+        if r.status == 0 or r.status >= 400 { failed = failed + 1; }
+        durations[len(durations)] = r.duration_ms;
+        sum = sum + r.duration_ms; bytes = bytes + r.transfer_bytes;
+    }
+    let sorted = array_sort(durations); let n = len(rows); let out = _result("browser_metrics_summary");
+    out.request_count = n; out.failed_count = failed; out.status_classes = classes;
+    out.transfer_bytes = bytes; out.sum_duration_ms = sum;
+    out.mean_duration_ms = if n == 0 { nil } else { sum / n };
+    out.p95_duration_ms = if n == 0 { nil } else { sorted[num_ceil(n * 0.95) - 1] };
+    out.duration_note = "request durations may overlap; sum is not page load time";
+    return out;
+}
+
+fn neural_dense_forward(args) {
+    _object(args, ["input", "weights", "bias", "activation"], ["input", "weights", "bias"]);
+    let input = _array(args.input, 1024, 1); let weights = _array(args.weights, 1024, 1);
+    let bias = _array(args.bias, 1024, 1);
+    let activation = try args.activation catch "linear";
+    if activation != "linear" and activation != "relu" and activation != "sigmoid" { throw "unsupported activation"; }
+    if len(weights) != len(bias) or len(weights) * len(input) > 65536 { throw "dense layer shape or operation budget mismatch"; }
+    for i len(input) { _number(input[i], -1000000, 1000000); }
+    let values = [];
+    for i len(weights) {
+        let row = _array(weights[i], 1024, 1);
+        if len(row) != len(input) { throw "dense layer width mismatch"; }
+        let value = _number(bias[i], -1000000000000, 1000000000000);
+        for j len(row) { value = value + _number(row[j], -1000000, 1000000) * input[j]; }
+        if activation == "relu" and value < 0 { value = 0; }
+        if activation == "sigmoid" {
+            if value >= 0 { value = 1 / (1 + num_exp(0 - value)); }
+            else { let e = num_exp(value); value = e / (1 + e); }
+        }
+        values[len(values)] = value;
+    }
+    let out = _result("neural_dense_forward"); out.output = values;
+    out.activation = activation; out.multiply_adds = len(input) * len(weights);
+    out.weights_layout = "output neurons by input features";
+    return out;
+}
+
+fn _s(maximum, minimum = 1) { return map{ type: "string", minLength: minimum, maxLength: maximum }; }
+fn _n(low, high, integer = false) { return map{ type: if integer { "integer" } else { "number" }, minimum: low, maximum: high }; }
+fn _a(items, maximum, minimum = 0) { return map{ type: "array", items: items, minItems: minimum, maxItems: maximum }; }
+fn _o(properties, required) { return map{ type: "object", properties: properties, required: required, additionalProperties: false }; }
+fn _schemas() {
+    let sample = _n(-1000000000000, 1000000000000);
+    let matrix = _a(_a(sample, 1024, 1), 4096, 1);
+    let calibration = _o(map{
+        format: map{ type: "string", enum: ["pb_mcp.minmax_calibration.v1"] },
+        minima: _a(sample, 1024, 1), maxima: _a(sample, 1024, 1)
+    }, ["format", "minima", "maxima"]);
+    return map{
+        ai_vector_diversify: _o(map{query:_a(sample,1024,1),items:_a(_o(map{id:_s(128),vector:_a(sample,1024,1)},["id","vector"]),4096),top_k:_n(1,100,true),relevance_weight:_n(0,1)},["query","items","top_k","relevance_weight"]),
+        ai_document_chunks: _o(map{length:_n(0,1000000000000,true),chunk_size:_n(1,65536,true),overlap:_n(0,65535,true),start_chunk:_n(0,1000000000000,true),limit:_n(1,4096,true)},["length","chunk_size","overlap","start_chunk","limit"]),
+        ai_rank_fusion: _o(map{rankings:_a(_a(_s(128),4096),16,1),rank_constant:_n(1,10000,true),top_k:_n(1,100,true)},["rankings","rank_constant","top_k"]),
+        ai_vector_search: _o(map{query:_a(sample,1024,1),items:_a(_o(map{id:_s(128),vector:_a(sample,1024,1)},["id","vector"]),4096),top_k:_n(1,100,true)},["query","items","top_k"]),
+        ai_context_budget: _o(map{ budget: _n(0,1000000,true), reserve: _n(0,1000000,true),
+            items: _a(_o(map{ id: _s(128), cost: _n(0,1000000,true), required: map{type:"boolean"}},["id","cost","required"]),4096) },["items","budget","reserve"]),
+        pblang_form_check: _o(map{source:_s(65536,0)},["source"]),
+        documentation_search: _o(map{ query: _s(256), library: _s(128, 0), version: _s(64, 0), limit: _n(1, 50, true),
+            documents: _a(_o(map{ id: _s(128), library: _s(128), version: _s(64), title: _s(256), text: _s(16384, 0) },
+                ["id", "library", "version", "title", "text"]), 256) }, ["query", "documents"]),
+        knowledge_graph_path: _o(map{ nodes: _a(_s(128), 2048, 1), edges: _a(_o(map{ source: _s(128), target: _s(128) }, ["source", "target"]), 8192),
+            start: _s(128), end: _s(128), directed: map{ type: "boolean" } }, ["nodes", "edges", "start", "end"]),
+        browser_metrics_summary: _o(map{ requests: _a(_o(map{ status: _n(0, 599, true), duration_ms: _n(0, 86400000),
+            transfer_bytes: _n(0, 1000000000000, true) }, ["status", "duration_ms", "transfer_bytes"]), 4096) }, ["requests"]),
+        neural_dense_forward: _o(map{ input: _a(_n(-1000000, 1000000), 1024, 1),
+            weights: _a(_a(_n(-1000000, 1000000), 1024, 1), 1024, 1), bias: _a(_n(-1000000000000, 1000000000000), 1024, 1),
+            activation: map{ type: "string", enum: ["linear", "relu", "sigmoid"] } }, ["input", "weights", "bias"]),
+        neural_minmax_fit: _o(map{ samples: matrix }, ["samples"]),
+        neural_minmax_transform: _o(map{ samples: matrix, calibration: calibration, clip: map{ type: "boolean" } }, ["samples", "calibration"]),
+        neural_softmax: _o(map{ logits: _a(sample, 65536, 1), temperature: _n(0.000001, 1000000) }, ["logits"]),
+        pblang_source_graph: _o(map{ modules: _a(_o(map{ id: _s(128), source: _s(65536, 0) }, ["id", "source"]), 64, 1) }, ["modules"]),
+        neural_dense_train_step: _o(map{
+            samples: _a(_a(_n(-1000000, 1000000), 1024, 1), 4096, 1), targets: matrix,
+            weights: _a(_a(_n(-1000000, 1000000), 1024, 1), 1024, 1), bias: _a(sample, 1024, 1),
+            activation: map{ type: "string", enum: ["linear", "relu", "sigmoid"] },
+            learning_rate: _n(0.000000000001, 1000000)
+        }, ["samples", "targets", "weights", "bias", "learning_rate"])
+    };
+}
+// Shared structural checker; no file lookup or foreign handler execution.
+fn pblang_form_check(args) {
+    _object(args,["source"],["source"]);
+    let source=_text(args.source,65536,false);
+    if len(str_to_bytes(source))>65536 {throw "form source exceeds byte budget";}
+    let Forms=import("stdlib:ui_form_check.sapp");
+    let result=Forms.analyze_dfm(source);
+    result.effect_performed=false;result.network_used=false;result.source_executed=false;result.native_pblang=true;
+    result.data_provenance="untrusted_caller_supplied";result.instructions_from_data=false;
+    return result;
+}
+fn implemented_tools() { return ["documentation_search", "knowledge_graph_path", "browser_metrics_summary", "neural_dense_forward",
+    "neural_minmax_fit", "neural_minmax_transform", "neural_softmax", "pblang_source_graph", "neural_dense_train_step", "ai_context_budget", "ai_vector_search", "ai_rank_fusion", "ai_document_chunks", "ai_vector_diversify", "pblang_form_check"]; }
+fn catalog_entries() {
+    let names = implemented_tools(); let schemas = _schemas(); let out = [];
+    let descriptions = [
+        "Search caller-supplied documentation with exact library/version filters and stable literal ranking; return identifiers only, without fetching or executing content.",
+        "Find a shortest unweighted path in caller-supplied graph identifiers and source/target edges, including projected Graphify exports; no files or graph commands are opened.",
+        "Summarize caller-supplied HTTP status, transfer size and duration measurements; no browser access, URLs, headers or response bodies.",
+        "Compute one dense neural layer from caller-supplied numeric weights, bias and input with linear, ReLU or stable sigmoid activation; CPU-only, without loading files or training.",
+        "Fit per-feature min/max calibration on supplied numeric training samples; at most 65,536 cells with equal row widths. Returns calibration for reuse without loading or training a model.",
+        "Transform supplied samples using supplied min/max calibration without refitting; at most 65,536 cells. Constant columns use denominator 1; extrapolation is default, clipping is explicit.",
+        "Compute stable softmax over supplied logits with optional positive temperature; CPU-only normalized weights, not a claim of calibrated confidence. No model loading or training.",
+        "Parse supplied PBLang modules into a Graphify-compatible AST structure graph with callable/call-syntax containment and exact supplied-module import links. Does not execute source, open imports or resolve dynamic call targets.",
+        "Compute one explicit mini-batch SGD step on supplied dense-layer parameters and numeric samples/targets using half mean squared error. Return new parameters and before/after loss without mutating, persisting or automatically training a model; CPU-only, at most 65,536 sample-feature-output products.",
+        "Select caller-ranked context identifiers within caller-supplied integer costs and a reserved budget. Preserve required items or fail; return omissions explicitly. No text copying, tokenizer, inference, model call or persistence; selection is greedy, not claimed optimal.",
+        "Rank supplied nonzero embedding vectors by cosine similarity to a supplied query. Return only top-k identifiers and scores with stable input-order ties; no document/model loading or embedding generation. CPU-only; at most 65,536 candidate cells and 100 results.",
+        "Combine caller-supplied ranked identifier lists using reciprocal rank fusion with an explicit positive rank constant. Each source votes once per ID; ties preserve first-seen order. Return top-k IDs and scores, not probabilities. No retrieval, text/model loading or persistence; at most 16 sources, 16,384 entries and 100 results.",
+        "Plan a page of overlapping document chunks from a caller-supplied Unicode scalar length only. Return zero-based, end-exclusive offsets without receiving, copying or persisting text. Explicit chunk size, overlap, start index and page limit; not token, word or grapheme segmentation. Caller must bind all pages to the same document version.",
+        "Select supplied embedding identifiers with greedy maximal marginal relevance: seed by query cosine, then balance relevance against similarity to selected results using explicit relevance_weight (0..1). Stable input-order ties. No text/model loading or persistence. At most 65,536 candidate cells and 1,048,576 admitted candidate-cell-selection products; not an optimal or calibrated ranking.",
+        "Check caller-supplied text Delphi DFM against the shared PBLang web renderer without executing it. Up to 65,536 UTF-8 bytes; returns counts and unsupported/missing semantics without names, labels, values or paths. Renderable does not mean complete application conversion. No file, network or model access."
+    ];
+    for i len(names) { out[len(out)] = map{ name: names[i], category: "knowledge-compute", profile: "core-code", read_only: true,
+        destructive: false, open_world: false, source: "src/knowledge_compute_tools.sapp", description: descriptions[i], input_schema: schemas[names[i]] }; }
+    return out;
+}
+fn _evidence(name) {
+    if name=="pblang_form_check" {return ["pb_mcp_form_check:positive","pb_mcp_form_check:negative","pb_mcp_form_check:privacy","pb_mcp_form_check:protocol"];}
+    if name == "ai_vector_diversify" { return ["pb_mcp_vector_diversify:positive", "pb_mcp_vector_diversify:negative", "pb_mcp_vector_diversify:reference", "pb_mcp_vector_diversify:protocol"]; }
+    if name == "ai_document_chunks" { return ["pb_mcp_document_chunks:positive", "pb_mcp_document_chunks:negative", "pb_mcp_document_chunks:reference", "pb_mcp_document_chunks:protocol"]; }
+    if name == "ai_rank_fusion" { return ["pb_mcp_rank_fusion:positive", "pb_mcp_rank_fusion:negative", "pb_mcp_rank_fusion:reference", "pb_mcp_rank_fusion:protocol"]; }
+    if name == "ai_vector_search" { return ["pb_mcp_vector_search:positive", "pb_mcp_vector_search:negative", "pb_mcp_vector_search:reference", "pb_mcp_vector_search:protocol"]; }
+    if name == "ai_context_budget" { return ["pb_mcp_context_budget:positive", "pb_mcp_context_budget:negative", "pb_mcp_context_budget:protocol"]; }
+    if name == "neural_dense_train_step" { return ["pb_mcp_neural_training:positive", "pb_mcp_neural_training:negative", "pb_mcp_neural_training:reference", "pb_mcp_neural_training:privacy"]; }
+    if name == "pblang_source_graph" { return ["pb_mcp_source_graph:positive", "pb_mcp_source_graph:negative", "pb_mcp_source_graph:privacy", "pb_mcp_source_graph:graphify"]; }
+    return ["pb_mcp_knowledge_compute:positive", "pb_mcp_knowledge_compute:negative", "pb_mcp_knowledge_compute:protocol", "pb_mcp_neural_preprocess:regression"];
+}
+fn functional_records() {
+    let names = implemented_tools(); let schemas = _schemas(); let out = [];
+    for i len(names) { out[len(out)] = map{ name: names[i], status: "complete", public_mcp: true,
+        input_schema: schemas[names[i]], reason: "offline native PBLang computation on bounded caller data",
+        evidence_ids: _evidence(names[i]) }; }
+
+    return out;
+}
+fn call_knowledge_compute(tool, args) {
+    if tool=="pblang_form_check" {return pblang_form_check(args);}
+    if tool == "ai_vector_diversify" { return VECTORS.diversify(args); }
+    if tool == "ai_document_chunks" { return CONTEXT.chunks(args); }
+    if tool == "ai_rank_fusion" { return FUSION.fuse(args); }
+    if tool == "ai_vector_search" { return VECTORS.search(args); }
+    if tool == "ai_context_budget" { return CONTEXT.select(args); }
+    if tool == "documentation_search" { return documentation_search(args); }
+    if tool == "knowledge_graph_path" { return knowledge_graph_path(args); }
+    if tool == "browser_metrics_summary" { return browser_metrics_summary(args); }
+    if tool == "neural_dense_forward" { return neural_dense_forward(args); }
+    if tool == "neural_minmax_fit" { return NEURAL.minmax_fit(args); }
+    if tool == "neural_minmax_transform" { return NEURAL.minmax_transform(args); }
+    if tool == "neural_softmax" { return NEURAL.softmax(args); }
+    if tool == "neural_dense_train_step" {
+                return TRAINING.dense_train_step(args);
+    }
+    if tool == "pblang_source_graph" {
+                return SOURCE_GRAPH.source_graph(args);
+    }
+    return nil;
+}
+export implemented_tools, catalog_entries, functional_records, call_knowledge_compute,
+    documentation_search, knowledge_graph_path, browser_metrics_summary, neural_dense_forward, pblang_form_check;

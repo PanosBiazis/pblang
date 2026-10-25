@@ -1,0 +1,124 @@
+let DOT=import("vector_dot.sapp");
+// Original CPU-only cosine ranking. Embeddings are supplied data, never code.
+fn object(value, keys) {
+    if type(value) != "map" or len(map_keys(value)) != len(keys) { throw "invalid vector object"; }
+    for key in keys { if not map_has(value,key) { throw "invalid vector object"; } }
+}
+fn scale(vector, width) {
+    if type(vector) != "array" or len(vector) != width { throw "vector width mismatch"; }
+    let largest = 0.0;
+    for value in vector {
+        if type(value) != "number" or not (value >= -1000000000000 and value <= 1000000000000) { throw "invalid vector number"; }
+        let magnitude = value; if magnitude < 0 { magnitude = 0 - magnitude; }
+        if magnitude > largest { largest = magnitude; }
+    }
+    if largest == 0 { throw "zero vector has no cosine direction"; }
+    return largest;
+}
+fn search(args) {
+    object(args,["query","items","top_k"]);
+    if type(args.query) != "array" or len(args.query) < 1 or len(args.query) > 1024 { throw "invalid query vector"; }
+    if type(args.items) != "array" or len(args.items) > 4096 or len(args.items)*len(args.query) > 65536 { throw "vector batch exceeds work budget"; }
+    if type(args.top_k) != "number" or not (args.top_k >= 1 and args.top_k <= 100) or args.top_k != num_floor(args.top_k) { throw "invalid result count"; }
+    let width = len(args.query); let query_scale = scale(args.query,width);
+    let query = []; let query_square = 0.0;
+    for value in args.query { let x = value/query_scale; array_push(query,x); query_square = query_square+x*x; }
+    let query_norm = num_sqrt(query_square);
+    let ids = map{}; let best = [];
+    for item in args.items {
+        object(item,["id","vector"]);
+        if type(item.id) != "string" or len(item.id) < 1 or len(item.id) > 128 or map_has(ids,item.id) { throw "invalid vector identity"; }
+        ids[item.id] = true;
+        let maximum = scale(item.vector,width);
+        let score=DOT.cosine(query,query_norm,item.vector,maximum);
+        if score > 1 { score = 1.0; } elif score < -1 { score = -1.0; }
+        // A full list cannot admit a later score tied with or below its tail.
+        // Validate and score every item first, including rejected/invalid tails.
+        if len(best)==args.top_k and score<=best[len(best)-1].score {continue;}
+        // Strict comparison preserves input order for equal scores. Keep at
+        // most k scored records; never copy the supplied embedding matrix.
+        let at = 0;
+        while at < len(best) and best[at].score >= score { at = at+1; }
+        if at < args.top_k {
+            if len(best) < args.top_k { array_push(best,nil); }
+            let j = len(best)-1;
+            while j > at { best[j] = best[j-1]; j = j-1; }
+            best[at] = map{id:item.id,score:score};
+        }
+    }
+    return map{format:"pb_mcp.vector-search.v1",ok:true,native_pblang:true,
+        effect_performed:false,network_used:false,model_loaded:false,persisted:false,
+        data_provenance:"untrusted_caller_supplied",instructions_from_data:false,
+        metric:"cosine",tie_break:"input_order",embedding_model_used:false,
+        evaluated:len(args.items),results:best};
+}
+fn _unit(vector, maximum) {
+    let out=[];let square=0.0;
+    for value in vector { let x=value/maximum;array_push(out,x);square=square+x*x; }
+    let norm=num_sqrt(square);
+    for i len(out) { out[i]=out[i]/norm; }
+    return out;
+}
+fn _cosine(a,b) {
+    let total=DOT.unit(a,b);
+    if total>1 { return 1.0; } elif total< -1 { return -1.0; }
+    return total;
+}
+// Independent greedy MMR. Cache one maximum per candidate, never an N*N
+// similarity matrix or the candidate text. Scores are not probabilities.
+fn diversify(args) {
+    object(args,["query","items","top_k","relevance_weight"]);
+    if type(args.query)!="array" or len(args.query)<1 or len(args.query)>1024 { throw "invalid query vector"; }
+    if type(args.items)!="array" or len(args.items)>4096 or len(args.items)*len(args.query)>65536 { throw "vector batch exceeds work budget"; }
+    if type(args.top_k)!="number" or not (args.top_k>=1 and args.top_k<=100) or args.top_k!=num_floor(args.top_k) { throw "invalid result count"; }
+    let weight=args.relevance_weight;
+    if type(weight)!="number" or not (weight>=0 and weight<=1) { throw "invalid relevance weight"; }
+    let width=len(args.query);let count=len(args.items);let k=args.top_k;
+    if k>count { k=count; }
+    if count*width*k>1048576 { throw "diversification work budget exceeded"; }
+    let query_max=scale(args.query,width);let maxima=[];let ids=map{};
+    // Validate the complete batch before allocating the normalized matrix.
+    for item in args.items {
+        object(item,["id","vector"]);
+        if type(item.id)!="string" or len(item.id)<1 or len(item.id)>128 or map_has(ids,item.id) { throw "invalid vector identity"; }
+        ids[item.id]=true;array_push(maxima,scale(item.vector,width));
+    }
+    let query=_unit(args.query,query_max);let vectors=[];let relevance=[];
+    let redundancy=[];let selected=[];
+    for i count {
+        let unit=_unit(args.items[i].vector,maxima[i]);array_push(vectors,unit);
+        array_push(relevance,_cosine(query,unit));array_push(redundancy,-1.0);array_push(selected,false);
+    }
+    let out=[];let comparisons=0;
+    for step k {
+        let best=-1;let best_value=-3.0;
+        for i count {
+            if not selected[i] {
+                // Always seed with the most query-relevant candidate, including
+                // weight zero. Exact computed-score ties retain input order.
+                let value=if step==0 { relevance[i] } else { weight*relevance[i]-(1-weight)*redundancy[i] };
+                if best<0 or value>best_value { best=i;best_value=value; }
+            }
+        }
+        selected[best]=true;
+        array_push(out,map{id:args.items[best].id,relevance:relevance[best],
+            redundancy:if step==0 { nil } else { redundancy[best] },
+            selection_score:if step==0 { weight*relevance[best] } else { best_value }});
+        if step+1<k {
+            for i count {
+                if not selected[i] {
+                    let similarity=_cosine(vectors[i],vectors[best]);comparisons=comparisons+1;
+                    if similarity>redundancy[i] { redundancy[i]=similarity; }
+                }
+            }
+        }
+    }
+    return map{format:"pb_mcp.vector-diversify.v1",ok:true,native_pblang:true,
+        effect_performed:false,network_used:false,model_loaded:false,persisted:false,
+        data_provenance:"untrusted_caller_supplied",instructions_from_data:false,
+        method:"greedy_mmr",metric:"cosine",tie_break:"input_order",
+        first_selection:"highest_query_similarity",relevance_weight:weight,
+        score_is_probability:false,embedding_model_used:false,
+        evaluated:count,pair_comparisons:comparisons,results:out};
+}
+export search, diversify;

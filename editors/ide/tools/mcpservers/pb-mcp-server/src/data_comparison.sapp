@@ -1,0 +1,162 @@
+// Deterministic comparisons of explicit caller data; no I/O or model inference.
+fn _fail() { throw "Invalid comparison arguments"; }
+fn _number(value, low, high) {
+    if type(value)!="number" or not (value>=low and value<=high) { _fail(); }
+}
+fn _integer(value, low, high) {
+    _number(value,low,high);
+    if value!=num_floor(value) { _fail(); }
+}
+fn _fields(args, allowed) {
+    if type(args)!="map" { _fail(); }
+    if not map_has(args,"baseline") or not map_has(args,"current") { _fail(); }
+    for key in map_keys(args) {
+        let known=false;
+        for field in allowed { if key==field { known=true; } }
+        if not known { _fail(); }
+    }
+}
+fn _text(value) {
+    if type(value)!="string" or len(value)>2048 or len(str_to_bytes(value))>2048 { _fail(); }
+}
+fn _admit(value, depth, state) {
+    if depth>8 { _fail(); }
+    state.nodes=state.nodes+1;
+    if state.nodes>512 { _fail(); }
+    let kind=type(value);
+    if kind=="map" {
+        if len(value)>128 { _fail(); }
+        for key in map_keys(value) { _text(key); _admit(value[key],depth+1,state); }
+    } elif kind=="array" {
+        if len(value)>256 { _fail(); }
+        for item in value { _admit(item,depth+1,state); }
+    } elif kind=="string" { _text(value); } elif kind=="number" { _number(value,-num_pow(10,100),num_pow(10,100)); } elif kind!="nil" and kind!="bool" { _fail(); }
+}
+fn _pointer(key) { return str_replace_all(str_replace_all(key,"~","~0"),"/","~1"); }
+fn _emit(state, row) {
+    state.total=state.total+1;
+    if len(state.changes)<state.maximum { state.changes[len(state.changes)]=row; }
+}
+fn _walk(before, after, path, state) {
+    let a=type(before);let b=type(after);
+    if a!=b { _emit(state,map{path:path,kind:"type_changed",before_type:a,after_type:b});return; }
+    if a=="map" {
+        let keys=map{};
+        for key in map_keys(before) { keys[key]=true; }
+        for key in map_keys(after) { keys[key]=true; }
+        for key in array_sort(map_keys(keys)) {
+            let next=path+"/"+_pointer(key);
+            if not map_has(before,key) { _emit(state,map{path:next,kind:"added",before_type:"missing",after_type:type(after[key])}); }
+            elif not map_has(after,key) { _emit(state,map{path:next,kind:"removed",before_type:type(before[key]),after_type:"missing"}); }
+            else { _walk(before[key],after[key],next,state); }
+        }
+    } elif a=="array" {
+        let count=if len(before)>len(after) {len(before)} else {len(after)};
+        for i count {
+            let next=path+"/"+str(i);
+            if i>=len(before) { _emit(state,map{path:next,kind:"added",before_type:"missing",after_type:type(after[i])}); }
+            elif i>=len(after) { _emit(state,map{path:next,kind:"removed",before_type:type(before[i]),after_type:"missing"}); }
+            else { _walk(before[i],after[i],next,state); }
+        }
+    } elif before!=after { _emit(state,map{path:path,kind:"value_changed",before_type:a,after_type:b}); }
+}
+fn _base(name, state) {
+    return map{format:"pb_mcp."+name+".v1",changes:state.changes,
+        difference_count:state.total,details_truncated:state.total>len(state.changes),
+        max_changes:state.maximum,native_pblang:true,data_source:"caller_supplied",
+        input_values_included:false,safe_to_log:false,automatic_deletion:false,
+        semantic_equivalence_verified:false,effects_performed:false,network_used:false,model_loaded:false};
+}
+fn _json(args) {
+    _admit(args.baseline,0,map{nodes:0});_admit(args.current,0,map{nodes:0});
+    if len(str_to_bytes(json_stringify(args)))>16384 { _fail(); }
+    let state=map{changes:[],total:0,maximum:try args.max_changes catch 32};
+    _walk(args.baseline,args.current,"",state);
+    let out=_base("data_compare_json",state);out.equal=state.total==0;
+    out.path_format="json_pointer";out.array_matching="position";
+    out.object_key_order="sorted";out.number_semantics="binary64";
+    out.normalization="none";out.change_unit="changed_leaf_or_added_removed_type_changed_subtree";
+    return out;
+}
+fn _numeric(args) {
+    if type(args.baseline)!="array" or type(args.current)!="array" { _fail(); }
+    if len(args.baseline)>256 or len(args.current)>256 { _fail(); }
+    for value in args.baseline { _number(value,-num_pow(10,100),num_pow(10,100)); }
+    for value in args.current { _number(value,-num_pow(10,100),num_pow(10,100)); }
+    let absolute=try args.absolute_tolerance catch 0;
+    let relative=try args.relative_tolerance catch 0;
+    _number(absolute,0,num_pow(10,100));_number(relative,0,1);
+    if len(str_to_bytes(json_stringify(args)))>16384 { _fail(); }
+    let state=map{changes:[],total:0,maximum:try args.max_changes catch 32};
+    let common=if len(args.baseline)<len(args.current) {len(args.baseline)} else {len(args.current)};
+    let maximum=if len(args.baseline)>len(args.current) {len(args.baseline)} else {len(args.current)};
+    let max_error=0;let max_relative=0;let outside=0;
+    for i maximum {
+        if i>=len(args.baseline) { _emit(state,map{index:i,kind:"added"}); }
+        elif i>=len(args.current) { _emit(state,map{index:i,kind:"removed"}); }
+        else {
+            let a=args.baseline[i];let b=args.current[i];let error=num_abs(a-b);
+            let scale=if num_abs(a)>num_abs(b) {num_abs(a)} else {num_abs(b)};
+            let ratio=if scale==0 {0} else {error/scale};
+            if error>max_error { max_error=error; }
+            if ratio>max_relative { max_relative=ratio; }
+            let threshold=if absolute>relative*scale {absolute} else {relative*scale};
+            if error>threshold {
+                outside=outside+1;
+                _emit(state,map{index:i,kind:"outside_tolerance",absolute_error:error,relative_error:ratio});
+            }
+        }
+    }
+    let out=_base("data_compare_numeric",state);
+    out.within_tolerance=state.total==0;out.baseline_count=len(args.baseline);out.current_count=len(args.current);
+    out.compared_count=common;out.within_count=common-outside;out.outside_count=outside;
+    out.max_absolute_error=if common==0 {nil} else {max_error};
+    out.max_relative_error=if common==0 {nil} else {max_relative};
+    out.absolute_tolerance=absolute;out.relative_tolerance=relative;
+    out.tolerance_rule="abs(a-b)<=max(absolute_tolerance,relative_tolerance*max(abs(a),abs(b)))";
+    out.alignment="position";out.number_semantics="binary64";
+    return out;
+}
+fn implemented_tools() { return ["data_compare_json","data_compare_numeric"]; }
+fn call_comparison(name,args) {
+    if name!="data_compare_json" and name!="data_compare_numeric" { return nil; }
+    let fields=["baseline","current","max_changes"];
+    if name=="data_compare_numeric" { push(fields,"absolute_tolerance");push(fields,"relative_tolerance"); }
+    _fields(args,fields);_integer(try args.max_changes catch 32,1,128);
+    let result=if name=="data_compare_json" {_json(args)} else {_numeric(args)};
+    if len(str_to_bytes(json_stringify(result)))>65536 { _fail(); }
+    return result;
+}
+fn catalog_entries() {
+    let changes=map{type:"integer",minimum:1,maximum:128,default:32};
+    let number=map{type:"number",minimum:-num_pow(10,100),maximum:num_pow(10,100)};
+    let series=map{type:"array",maxItems:256,items:number};
+    let json_value=map{description:"Already decoded JSON value; maximum depth8(root0),512 nodes per value,128 keys/object,256 items/array,2048 UTF8bytes per string/key; numbers finite and absolute value<=1e100. Entire arguments<=16384 serialized UTF8bytes."};
+    let schemas=[map{baseline:json_value,current:json_value,max_changes:changes},
+        map{baseline:series,current:series,max_changes:changes,
+            absolute_tolerance:map{type:"number",minimum:0,maximum:num_pow(10,100),default:0},
+            relative_tolerance:map{type:"number",minimum:0,maximum:1,default:0}}];
+    let descriptions=[
+        "Compare supplied decoded JSON values with type-sensitive equality, sorted object keys and positional arrays. Return escaped JSON Pointer paths and types, never scalar values. Added/removed/type-changed subtrees count once; other changes count at leaves. Complete difference_count/equal even when details truncate. Duplicate-key parsing has already happened; raw JSON spellings and decimal precision are not compared. Paths may be private.",
+        "Compare two numeric arrays by position using abs(a-b)<=max(absolute_tolerance,relative_tolerance*max(abs(a),abs(b))). Length changes count as differences. Return changed indices, derived errors, complete counts and maxima across common positions, capped details. Empty common range has null maxima; zero/zero relative error is0. Binary64 arithmetic, no semantic or statistical equivalence claim. Derived errors may be private."
+    ];
+    let names=implemented_tools();let out=[];
+    for i len(names) {
+        push(out,map{name:names[i],category:"data-comparison",profile:"core-code",read_only:true,
+            destructive:false,open_world:false,source:"src/data_comparison.sapp",
+            description:descriptions[i]+" Closed arguments<=16384 serialized UTF8bytes; output<=65536bytes. safe_to_log:false. No file/network/model/storage/automatic collection or deletion.",
+            input_schema:map{type:"object",required:["baseline","current"],additionalProperties:false,properties:schemas[i]}});
+    }
+    return out;
+}
+fn functional_records() {
+    let out=[];
+    for entry in catalog_entries() {
+        push(out,map{name:entry.name,status:"complete",public_mcp:true,input_schema:entry.input_schema,
+            reason:"bounded deterministic comparison of explicit caller data; no I/O or semantic attestation",
+            evidence_ids:["pb_mcp_data_comparison:typed_paths","pb_mcp_data_comparison:tolerance",
+                "pb_mcp_data_comparison:bounds","pb_mcp_data_comparison:privacy","pb_mcp_data_comparison:parity"]});
+    }
+    return out;
+}
+export call_comparison,implemented_tools,catalog_entries,functional_records;

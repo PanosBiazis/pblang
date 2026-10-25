@@ -1,0 +1,138 @@
+// Offline PBLang AST graph. Never execute source or follow caller imports.
+fn _object(value, keys) {
+    if type(value) != "map" or len(map_keys(value)) != len(keys) { throw "invalid graph object"; }
+    for key in keys { if not map_has(value, key) { throw "invalid graph object"; } }
+}
+fn _module_id(value) {
+    if type(value) != "string" or len(value) < 1 or len(value) > 128 { throw "invalid logical module identifier"; }
+    if not regex_match(value, "^[\\p{L}\\p{N}_./-]+$") { throw "invalid logical module identifier"; }
+    for part in str_split(value, "/") {
+        if part == "" or part == "." or part == ".." { throw "invalid logical module identifier"; }
+    }
+}
+fn _parse(source, remaining) {
+    let Tokens = import("stdlib:compiler/tokenizer.sapp");
+    let Parser = import("stdlib:compiler/parser.sapp");
+    let lexed = try Tokens.tokenize_bounded(source, remaining) catch nil;
+    if lexed == nil or not lexed.ok { throw "source graph token budget exceeded"; }
+    let nesting = [];
+    for token in lexed.tokens {
+        if token.kind == "invalid" or (try token.unterminated catch false) { throw "source graph invalid token"; }
+        if token.kind == "punct" or token.kind == "operator" {
+            let t = token.text;
+            if t == "(" or t == "[" or t == "{" or t == "?[" {
+                if len(nesting) >= 64 { throw "source graph nesting budget exceeded"; }
+                array_push(nesting, if t == "?[" { "[" } else { t });
+            } elif t == ")" or t == "]" or t == "}" {
+                if len(nesting) == 0 { throw "source graph invalid delimiter"; }
+                let open = array_pop(nesting);
+                if (t == ")" and open != "(") or (t == "]" and open != "[") or (t == "}" and open != "{") {
+                    throw "source graph invalid delimiter";
+                }
+            }
+        }
+    }
+    if len(nesting) != 0 { throw "source graph incomplete delimiter"; }
+    let ast = try Parser.parse(lexed.tokens) catch nil;
+    // Parser globals retain tokens between calls. Clear them before returning
+    // or rejecting; no source is intentionally cached by this tool.
+    let cleared = try Parser.parse([]) catch nil;
+    if ast == nil or cleared == nil or type(ast.stmts) != "array" or len(ast.errors) != 0 {
+        throw "source graph parsing failed";
+    }
+    return map{ ast: ast.stmts, tokens: lexed.token_count };
+}
+fn _callee(value) {
+    let parts = []; let current = value;
+    for step 16 {
+        if type(current) != "map" { return map{ label: "computed", form: "computed" }; }
+        if current.kind == "ident" {
+            array_push(parts, current.name);
+            let label = ""; let i = len(parts) - 1;
+            while i >= 0 { label = label + (if label == "" { "" } else { "." }) + parts[i]; i = i - 1; }
+            if len(label) > 128 { throw "source graph symbol budget exceeded"; }
+            return map{ label: label, form: if len(parts) == 1 { "named" } else { "member" } };
+        }
+        if current.kind != "member" and current.kind != "opt_member" { return map{ label: "computed", form: "computed" }; }
+        array_push(parts, current.name); current = current.obj;
+    }
+    return map{ label: "computed", form: "computed" };
+}
+fn source_graph(args) {
+    _object(args, ["modules"]);
+    let modules = args.modules;
+    if type(modules) != "array" or len(modules) < 1 or len(modules) > 64 { throw "source graph module budget exceeded"; }
+    let ids = map{}; let total_bytes = 0; let nodes = []; let links = [];
+    for i len(modules) {
+        let module = modules[i]; _object(module, ["id", "source"]); _module_id(module.id);
+        if map_has(ids, module.id) { throw "source graph duplicate module"; }
+        if type(module.source) != "string" or len(module.source) > 65536 { throw "source graph source budget exceeded"; }
+        let bytes = len(str_to_bytes(module.source)); total_bytes = total_bytes + bytes;
+        if bytes > 65536 or total_bytes > 262144 { throw "source graph source budget exceeded"; }
+        let id = "m" + str(i); ids[module.id] = id;
+        array_push(nodes, map{ id: id, label: module.id, kind: "module", file_type: "code", source_file: module.id, source_location: "L1" });
+    }
+    let token_count = 0; let visits = 0; let unresolved_imports = 0; let computed_calls = 0;
+    fn link(source, target, relation, module, location) {
+        if len(links) >= 8192 { throw "source graph edge budget exceeded"; }
+        array_push(links, map{ source: source, target: target, relation: relation, confidence: "EXTRACTED",
+            confidence_score: 1, weight: 1, source_file: module, source_location: location });
+    }
+    for module in modules {
+        if token_count >= 32768 { throw "source graph token budget exceeded"; }
+        let parsed = _parse(module.source, 32768 - token_count); token_count = token_count + parsed.tokens;
+        let stack = [map{ value: parsed.ast, owner: ids[module.id] }];
+        while len(stack) > 0 {
+            visits = visits + 1;
+            if visits > 65536 { throw "source graph traversal budget exceeded"; }
+            let item = array_pop(stack); let value = item.value; let owner = item.owner;
+            if type(value) == "map" {
+                let kind = try value.kind catch "";
+                let callable = kind == "fn" and map_has(value, "body") and map_has(value, "name");
+                let anonymous = kind == "fn_lit"; let call = kind == "call"; let importing = kind == "import";
+                let location = if (try value.line catch 0) > 0 { "L" + str(value.line) } else { "" };
+                if callable or anonymous or call or importing {
+                    if len(nodes) >= 2048 { throw "source graph node budget exceeded"; }
+                    let id = "n" + str(len(nodes)); let description = map{ label: "import", form: "named" };
+                    if call { description = _callee(value.func); }
+                    if callable { description.label = value.name; }
+                    if anonymous { description.label = "anonymous"; }
+                    if len(description.label) > 128 { throw "source graph symbol budget exceeded"; }
+                    let node = map{ id: id, label: description.label, kind: if callable or anonymous { "callable_ast" } else { "call_syntax" },
+                        file_type: "code", source_file: module.id, source_location: location };
+                    if call { node.callee_form = description.form; }
+                    if call and description.form == "computed" { computed_calls = computed_calls + 1; }
+                    array_push(nodes, node); link(owner, id, "contains", module.id, location); owner = id;
+                    let literal = nil; let import_call = importing;
+                    if importing { literal = value.path; }
+                    if call and value.func.kind == "ident" and value.func.name == "import" {
+                        import_call = true;
+                        if len(value.args) == 1 and value.args[0].kind == "string" { literal = value.args[0].value; }
+                    }
+                    if import_call {
+                        if type(literal) == "string" and map_has(ids, literal) { link(id, ids[literal], "imports_literal", module.id, location); }
+                        else { unresolved_imports = unresolved_imports + 1; }
+                    }
+                }
+                let keys = array_sort(map_keys(value)); let index = len(keys) - 1;
+                while index >= 0 {
+                    let child = value[keys[index]];
+                    if type(child) == "map" or type(child) == "array" { array_push(stack, map{ value: child, owner: owner }); }
+                    index = index - 1;
+                }
+            } elif type(value) == "array" {
+                let index = len(value) - 1;
+                while index >= 0 {
+                    if type(value[index]) == "map" or type(value[index]) == "array" { array_push(stack, map{ value: value[index], owner: owner }); }
+                    index = index - 1;
+                }
+            }
+        }
+    }
+    return map{ format: "pb_mcp.pblang_source_graph.v1", native_pblang: true, effect_performed: false,
+        network_used: false, model_loaded: false, data_provenance: "untrusted_caller_supplied", instructions_from_data: false,
+        representation: "self_hosted_ast_after_desugaring", call_target_resolution: false,
+        unresolved_imports: unresolved_imports, computed_calls: computed_calls, token_count: token_count,
+        graph: map{ directed: true, multigraph: false, graph: map{ language: "pblang", source_execution: false }, nodes: nodes, links: links } };
+}
+export source_graph;

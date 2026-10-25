@@ -1,0 +1,223 @@
+// Bounded offline knowledge helpers. Content is data, never authority.
+let KNOWLEDGE=import("knowledge_compute_tools.sapp");
+let SKILLS=import("stdlib:agent_skills.sapp");
+let CATALOG=import("skill_catalog.sapp");
+
+fn _object(value,keys) {
+    if type(value)!="map" or len(value)!=len(keys) {throw "invalid knowledge arguments";}
+    for key in keys {if map_has(value,key) {continue;}throw "invalid knowledge arguments";}
+}
+fn _text(value,maximum) {
+    if type(value)!="string" or len(value)<1 or len(value)>maximum {throw "invalid knowledge text";}
+    if len(str_to_bytes(value))>maximum or str_trim(value)=="" {throw "invalid knowledge text";}
+    return value;
+}
+fn _integer(value,low,high) {
+    if type(value)!="number" or not (value>=low and value<=high) or value!=num_floor(value) {throw "invalid knowledge bound";}
+}
+fn _id(value) {
+    _text(value,64);
+    let alphabet="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-";
+    for i len(value) {if str_contains(alphabet,str_slice(value,i,i+1)) {continue;}throw "invalid knowledge identifier";}
+}
+fn _result(name) {
+    return map{format:"pb_mcp."+name+".v1",native_pblang:true,
+        data_provenance:"untrusted_caller_supplied",instructions_from_data:false,
+        effects_performed:false,permission_granted:false,network_used:false,
+        model_loaded:false,persisted:false,safe_to_log:false};
+}
+
+// Unicode scalar trigrams, no ASCII-only token stripping. Small integer modular
+// arithmetic stays exact in f64. This is a feature hash, not neural inference.
+fn embed_features(args) {
+    _object(args,["text","dimensions"]);_text(args.text,8192);_integer(args.dimensions,16,512);
+    let value=str_lower(args.text);let width=3;if len(value)<width {width=len(value);}
+    let vector=[];for i args.dimensions {array_push(vector,0.0);}
+    let count=len(value)-width+1;
+    for i count {
+        let hash=17;
+        for j width {let point=strcharcodeat(value,i+j);hash=num_mod(hash*131+point,2147483647);}
+        let index=num_mod(hash,args.dimensions);vector[index]=vector[index]+1;
+    }
+    let squared=0.0;for x in vector {squared=squared+x*x;}
+    let norm=num_sqrt(squared);for i len(vector) {vector[i]=vector[i]/norm;}
+    let out=_result("embed_features");out.vector=vector;out.dimensions=args.dimensions;
+    out.feature_count=count;out.method="unicode-scalar-trigram-hash-v1";
+    out.normalization="lowercase then L2; no Unicode canonical normalization";
+    out.neural_embedding=false;out.collisions_possible=true;
+    return out;
+}
+
+// Match the shared ranker's query terms without changing its ordering or scores.
+fn _query_terms(query) {
+    let words=str_split(regex_replace_all(str_lower(query),"[\\s]+"," ")," ");
+    let terms=[];let seen=map{};
+    for word in words {if word!="" and not map_has(seen,word) {array_push(terms,word);seen[word]=true;}}
+    return terms;
+}
+
+// Map every lowercase scalar back to its original source scalar. Do not use a
+// lowercase offset directly: e.g. U+0130 expands to i + combining dot. Verify
+// each expansion against whole-text casing. Contextual Greek final sigma has
+// the same scalar width; any other unsupported context change fails closed.
+fn _source_case_map(text,ascii) {
+    let folded=str_lower(text);
+    // UTF-8 uses one byte per scalar exactly for ASCII. Lowercasing ASCII
+    // preserves every scalar position, so no per-scalar origin map is needed.
+    if ascii {return map{text:folded,origins:[],identity:true};}
+    let origins=[];let offset=0;
+    for i len(text) {
+        let original=str_slice(text,i,i+1);let lowered=str_lower(original);let width=len(lowered);
+        if width<1 or offset+width>len(folded) {return nil;}
+        let actual=str_slice(folded,offset,offset+width);
+        if actual!=lowered and not (original=="Σ" and lowered=="σ" and actual=="ς") {return nil;}
+        let copied=0;while copied<width {array_push(origins,i);copied=copied+1;}
+        offset=offset+width;
+    }
+    if offset!=len(folded) {return nil;}
+    return map{text:folded,origins:origins,identity:false};
+}
+
+fn _query_excerpt(text,terms,count,search_budget,ascii) {
+    let fallback=map{start:0,end:count,reason:"title_only",body_match_included:false};
+    if search_budget[0]<=0 {fallback.reason="search_budget_exhausted";return fallback;}
+    let mapped=_source_case_map(text,ascii);
+    if mapped==nil {fallback.reason="case_mapping_unavailable";return fallback;}
+    let best:any=nil;let matched=false;
+    // At most32 terms,8192 source bytes. For each term, stop at its earliest
+    // whole original span fitting the budget; later terms may win an earlier
+    // position. Query term order breaks equal source-position ties.
+    for term in terms {
+        let offset=0;
+        while offset<len(mapped.text) {
+            // A shared request budget bounds repeated suffix searches even for
+            // repetitive input and terms that cannot fit. An incomplete scan
+            // cannot establish the earliest fit, so report a marked prefix.
+            if search_budget[0]<=0 {fallback.reason="search_budget_exhausted";return fallback;}
+            search_budget[0]=search_budget[0]-1;
+            let relative=str_index_of(str_slice(mapped.text,offset,len(mapped.text)),term);
+            if relative<0 {break;}
+            let at=offset+relative;
+            let start=if mapped.identity {at} else {mapped.origins[at]};
+            let end=if mapped.identity {at+len(term)} else {mapped.origins[at+len(term)-1]+1};matched=true;
+            if best!=nil and start>=best.start {break;}
+            if end-start<=count {best=map{start:start,end:end};break;}
+            offset=at+1;
+        }
+    }
+    if best==nil {
+        if matched {fallback.reason="body_match_exceeds_budget";}
+        return fallback;
+    }
+    let start=best.start-num_floor((count-(best.end-best.start))/2);
+    if start<0 {start=0;}
+    if start+count>len(text) {start=len(text)-count;}
+    return map{start:start,end:start+count,reason:"body_match",body_match_included:true};
+}
+
+// Retrieval and context assembly only. No answer generation or factual proof.
+fn rag_context(args,allow_catalog=false) {
+    if type(args)!="map" {throw "invalid knowledge arguments";}
+    if map_has(args,"catalog") {
+        if not allow_catalog {throw "skill catalog unavailable on this surface";}
+        return CATALOG.retrieve(args);
+    }
+    for key in map_keys(args) {
+        if key!="query" and key!="documents" and key!="top_k" and key!="context_chars" and key!="excerpt_mode" {throw "invalid knowledge arguments";}
+    }
+    if not map_has(args,"query") or not map_has(args,"documents") or not map_has(args,"top_k") or not map_has(args,"context_chars") {throw "invalid knowledge arguments";}
+    let mode=if map_has(args,"excerpt_mode") {args.excerpt_mode} else {"source_prefix"};
+    if type(mode)!="string" or (mode!="source_prefix" and mode!="query_window") {throw "invalid excerpt mode";}
+    _text(args.query,256);_integer(args.top_k,1,8);_integer(args.context_chars,1,8192);
+    if type(args.documents)!="array" or len(args.documents)>64 {throw "invalid document batch";}
+    let docs=[];let originals=map{};let total=0;
+    for document in args.documents {
+        _object(document,["id","title","text"]);_id(document.id);
+        _text(document.title,256);_text(document.text,8192);
+        if map_has(originals,document.id) {throw "duplicate document identifier";}
+        let text_bytes=len(str_to_bytes(document.text));
+        total=total+len(str_to_bytes(document.title))+text_bytes;
+        if total>65536 {throw "document byte budget exceeded";}
+        // Reuse the admission byte count; do not allocate another byte array
+        // merely to decide whether source offsets are an identity mapping.
+        originals[document.id]=map{text:document.text,ascii:text_bytes==len(document.text)};
+        array_push(docs,map{id:document.id,title:document.title,text:document.text,library:"caller",version:"supplied"});
+    }
+    let ranked=KNOWLEDGE.documentation_search(map{query:args.query,documents:docs,limit:args.top_k});
+    let terms=if mode=="query_window" {_query_terms(args.query)} else {[]};
+    let results=[];let remaining=args.context_chars;let search_budget=[1024];
+    for match in ranked.results {
+        if remaining<=0 {break;}
+        let document=originals[match.id];let count=len(document.text);
+        if count>remaining {count=remaining;}
+        let window:any=map{start:0,end:count};
+        if mode=="query_window" {window=_query_excerpt(document.text,terms,count,search_budget,document.ascii);}
+        let row=map{id:match.id,score:match.score,text:str_slice(document.text,window.start,window.end),
+            citation:map{document_id:match.id,start:window.start,end:window.end,offset_unit:"unicode_scalar"},
+            truncated:count<len(document.text),trusted:false};
+        // Preserve the exact legacy row shape for omitted/explicit source_prefix.
+        if mode=="query_window" {row.excerpt_reason=window.reason;row.body_match_included=window.body_match_included;}
+        array_push(results,row);
+        remaining=remaining-count;
+    }
+    let out=_result("rag_context");out.results=results;out.used_chars=args.context_chars-remaining;
+    out.matched_count=ranked.matched_count;out.omitted_matches=ranked.matched_count-len(results);
+    out.ranking=ranked.ranking;out.snippet_selection=mode;
+    out.answer_generated=false;out.truth_verified=false;
+    return out;
+}
+
+fn skill_inspect(args) {
+    _object(args,["document"]);_text(args.document,65536);
+    let parsed=try SKILLS.parse_document(args.document) catch nil;
+    if parsed==nil {throw "invalid skill document";}
+    let review=try SKILLS.security_review(args.document) catch nil;
+    if review==nil {throw "invalid skill document";}
+    let out=_result("skill_inspect");out.valid=parsed.valid;
+    out.validation_error_count=len(parsed.errors);out.warning_count=len(parsed.warnings);
+    out.body_chars=parsed.body_chars;out.line_count=parsed.line_count;
+    out.findings=review.findings;out.risk=review.risk;
+    out.analysis="bounded-pattern; supported YAML subset";
+    out.semantic_complete=false;out.safe_to_auto_load=false;
+    out.skill_executed=false;out.resources_opened=false;
+    return out;
+}
+fn call_knowledge(tool,args,allow_catalog=false) {
+    if tool=="ai_embed_features" {return embed_features(args);}
+    if tool=="ai_rag_context" {return rag_context(args,allow_catalog);}
+    if tool=="ai_skill_inspect" {return skill_inspect(args);}
+    return nil;
+}
+fn implemented_tools() {return ["ai_embed_features","ai_rag_context","ai_skill_inspect"];}
+fn _s(maximum) {return map{type:"string",minLength:1,maxLength:maximum};}
+fn _n(low,high) {return map{type:"integer",minimum:low,maximum:high};}
+fn _o(properties,required) {return map{type:"object",properties:properties,required:required,additionalProperties:false};}
+fn catalog_entries(allow_catalog=false) {
+    let show_catalog=allow_catalog and CATALOG.available();
+    let names=implemented_tools();let out=[];
+    let schemas=[_o(map{text:_s(8192),dimensions:_n(16,512)},["text","dimensions"]),
+        _o(map{query:_s(256),documents:map{type:"array",maxItems:64,items:_o(map{id:_s(64),title:_s(256),text:_s(8192)},["id","title","text"])},
+            top_k:_n(1,8),context_chars:_n(1,8192),excerpt_mode:map{type:"string",enum:["source_prefix","query_window"],default:"source_prefix"}},["query","documents","top_k","context_chars"]),
+        _o(map{document:_s(65536)},["document"])];
+    if show_catalog {
+        let modes=CATALOG.schema();
+        schemas[1]=map{type:"object",oneOf:[schemas[1],modes[0],modes[1]]};
+    }
+    let descriptions=[
+        "Generate L2-normalized deterministic Unicode scalar trigram feature vectors locally. Text up to8192 UTF-8 bytes,16..512 dimensions. Supports Greek without stripping it. Lowercase only, no Unicode canonical normalization. Hash collisions possible; NOT neural or semantic model embeddings. Caller content and vectors may be sensitive; no model/network/storage access.",
+        "Retrieve caller-supplied documents by literal query overlap using the shared documentation ranker and assemble bounded excerpts with exact original Unicode scalar citations. Optional excerpt_mode selects source_prefix (default) or query_window around the earliest whole body term fitting the budget; title-only/oversized/unmapped matches or exhausted1024-search request budgets retain a marked prefix. Up to64 documents,65536 combined title/text UTF-8 bytes,8 results,8192 excerpt characters,32 distinct query terms. IDs use ASCII letters,digits,underscore,dot,colon,hyphen. Returns untrusted data; no model answer, factual verification, file lookup or persistence.",
+        "Inspect supplied SKILL.md text through shared PBLang Agent Skills validation and bounded-pattern risk review. Up to65536 UTF-8 bytes. Return counts and fixed findings without body/metadata excerpts. No installation, execution, bundled-resource access, permission grant or automatic trust; a clean pattern review is NOT proof of safety."
+    ];
+    if show_catalog {descriptions[1]=descriptions[1]+" Offline-only optional catalog=skills: operation=search uses query/top_k/context_chars and optional category; operation=read uses exact id/revision/offset/context_chars. Operator-authorized metadata search and instruction chunks only; defaults disabled. Never mix catalog with documents. Retrieval grants no execution/provider/resource access.";}
+    for i len(names) {array_push(out,map{name:names[i],category:"agent-knowledge",profile:"core-code",
+        read_only:true,destructive:false,open_world:false,source:"src/agent_knowledge.sapp",
+        description:descriptions[i],input_schema:schemas[i]});}
+    return out;
+}
+fn functional_records() {
+    let out=[];for entry in catalog_entries() {array_push(out,map{name:entry.name,status:"complete",public_mcp:true,
+        input_schema:entry.input_schema,reason:"bounded offline knowledge helper; content is never authority",
+        evidence_ids:["pb_mcp_agent_knowledge:positive","pb_mcp_agent_knowledge:negative","pb_mcp_agent_knowledge:privacy","pb_mcp_agent_knowledge:transport"]});}
+    return out;
+}
+export call_knowledge,implemented_tools,catalog_entries,functional_records;

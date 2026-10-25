@@ -1,0 +1,139 @@
+// Read-only instruction discovery. A catalog record is never execution authority.
+let CONFIG=import("skill_catalog_config.sapp");
+let RANK=import("knowledge_compute_tools.sapp");
+fn _require(value) {if not value {throw "invalid skill catalog input";}}
+
+fn _fields(value,allowed,required) {
+    if type(value)!="map" {throw "invalid skill catalog input";}
+    for key in map_keys(value) {_require(_has(allowed,key));}
+    for key in required {_require(map_has(value,key));}
+}
+fn _has(values,value) {for item in values {if item==value {return true;}}return false;}
+fn _text(value,maximum,empty=false) {
+    if type(value)!="string" or len(value)>maximum or len(str_to_bytes(value))>maximum {throw "invalid skill catalog text";}
+    if not empty and str_trim(value)=="" {throw "invalid skill catalog text";}
+    return value;
+}
+fn _id(value) {
+    _text(value,96);
+    let chars="abcdefghijklmnopqrstuvwxyz0123456789-_.:";
+    if not str_contains("abcdefghijklmnopqrstuvwxyz0123456789",str_slice(value,0,1)) or str_contains(value,"..") {throw "invalid skill catalog identifier";}
+    for i len(value) {_require(str_contains(chars,str_slice(value,i,i+1)));}
+    return value;
+}
+fn _revision(value) {
+    _text(value,64);if len(value)!=64 {throw "invalid skill catalog revision";}
+    for i 64 {_require(str_contains("0123456789abcdef",str_slice(value,i,i+1)));}
+    return value;
+}
+fn _integer(value,low,high) {
+    if type(value)!="number" or not (value>=low and value<=high) or value!=num_floor(value) {throw "invalid skill catalog bound";}
+}
+fn compile(config) {
+    _fields(config,["enabled","profile","allow_categories","records"],["enabled","profile","allow_categories","records"]);
+    if type(config.enabled)!="bool" {throw "invalid skill catalog configuration";}
+    _id(config.profile);
+    if type(config.allow_categories)!="array" or len(config.allow_categories)>32 or type(config.records)!="array" or len(config.records)>128 {throw "invalid skill catalog configuration";}
+    let allowed=[];
+    for category in config.allow_categories {_id(category);if _has(allowed,category) {throw "duplicate skill catalog category";}array_push(allowed,category);}
+    let seen=map{};let rows=[];let bytes=0;let metadata=0;
+    for record in config.records {
+        _fields(record,["id","title","summary","keywords","category","provider","version","revision","source_ref","execution","document"],
+            ["id","title","summary","keywords","category","provider","version","revision","source_ref","execution","document"]);
+        _id(record.id);_id(record.category);_id(record.provider);_id(record.source_ref);
+        _text(record.title,128);_text(record.summary,512);_text(record.keywords,512,true);_text(record.version,64);_revision(record.revision);
+        _text(record.document,65536);
+        if not _has(["host_workflow","external_provider","pb_tools"],record.execution) {throw "invalid skill catalog execution classification";}
+        if map_has(seen,record.id) {throw "duplicate skill catalog identifier";}seen[record.id]=true;
+        bytes=bytes+len(str_to_bytes(record.document));
+        metadata=metadata+len(str_to_bytes(record.title))+len(str_to_bytes(record.summary))+len(str_to_bytes(record.keywords));
+        if bytes>2097152 or metadata>196608 {throw "skill catalog exceeds byte budget";}
+        if config.enabled and _has(allowed,record.category) {
+            // Detached maps, immutable scalar values; neither callers nor results
+            // retain the source configuration's mutable record containers.
+            array_push(rows,map{id:record.id,title:record.title,summary:record.summary,keywords:record.keywords,
+                category:record.category,provider:record.provider,version:record.version,revision:record.revision,
+                source_ref:record.source_ref,execution:record.execution,document:record.document});
+        }
+    }
+    return map{enabled:config.enabled,profile:config.profile,categories:allowed,records:rows};
+}
+fn _result(policy,operation) {
+    return map{format:"pb_mcp.skill_catalog.v1",operation:operation,profile:policy.profile,
+        native_pblang:true,data_provenance:"operator_installed_untrusted_instructions",instructions_from_data:false,
+        permission_granted:false,skill_executed:false,resources_opened:false,network_used:false,
+        provider_verified:false,effects_performed:false,safe_to_log:false,revision_is_authentication:false};
+}
+fn _metadata(record) {
+    return map{id:record.id,title:record.title,summary:record.summary,category:record.category,
+        provider:record.provider,version:record.version,revision:record.revision,source_ref:record.source_ref,
+        kind:"instructions",execution:record.execution,document_chars:len(record.document),trusted:false};
+}
+fn call(policy,args) {
+    if policy==nil or not policy.enabled {throw "skill catalog unavailable";}
+    if type(args)!="map" or (try args.catalog catch nil)!="skills" {throw "invalid skill catalog input";}
+    let operation=try args.operation catch nil;
+    if operation=="search" {
+        _fields(args,["catalog","operation","query","top_k","context_chars","category"],["catalog","operation","query","top_k","context_chars"]);
+        _text(args.query,256);_integer(args.top_k,1,8);_integer(args.context_chars,2,8192);
+        let category=try args.category catch "";
+        if category!="" {_id(category);if not _has(policy.categories,category) {throw "skill catalog unavailable";}}
+        let documents=[];let originals=map{};
+        for row in policy.records {
+            if category=="" or row.category==category {
+                array_push(documents,map{id:row.id,title:row.title,text:row.id+" "+row.summary+" "+row.keywords,
+                    library:row.category,version:row.version});originals[row.id]=row;
+            }
+        }
+        let ranked=RANK.documentation_search(map{query:args.query,documents:documents,limit:args.top_k});
+        let results=[];let used=2;
+        for ranked_match in ranked.results {
+            let record=originals[ranked_match.id];let row=_metadata(record);row.score=ranked_match.score;
+            // Count the entire JSON-encoded dynamic descriptor, including escapes,
+            // field names, provenance, score, commas and the enclosing array.
+            let cost=len(json_stringify(row));if len(results)>0 {cost=cost+1;}
+            if used+cost>args.context_chars {break;}
+            array_push(results,row);used=used+cost;
+        }
+        let out=_result(policy,operation);out.results=results;out.used_chars=used;
+        out.matched_count=ranked.matched_count;out.omitted_matches=ranked.matched_count-len(results);
+        out.ranking=ranked.ranking;out.searched="authorized metadata only";out.document_text_returned=false;
+        out.budget_unit="JSON-encoded results array Unicode scalars; fixed envelope excluded";
+        out.ambiguous=ranked.matched_count>1;
+        return out;
+    }
+    if operation=="read" {
+        _fields(args,["catalog","operation","id","revision","offset","context_chars"],["catalog","operation","id","revision","offset","context_chars"]);
+        _id(args.id);_revision(args.revision);_integer(args.offset,0,65536);_integer(args.context_chars,1,8192);
+        for record in policy.records {
+            if record.id==args.id and record.revision==args.revision {
+                if args.offset>len(record.document) {throw "invalid skill catalog offset";}
+                let end=args.offset+args.context_chars;if end>len(record.document) {end=len(record.document);}
+                let out=_result(policy,operation);out.record=_metadata(record);
+                out.text=str_slice(record.document,args.offset,end);
+                out.citation=map{document_id:record.id,revision:record.revision,start:args.offset,end:end,offset_unit:"unicode_scalar"};
+                out.next_offset=if end<len(record.document) {end} else {nil};out.reached_document_end=end==len(record.document);
+                out.complete_document=args.offset==0 and end==len(record.document);
+                out.used_chars=end-args.offset;out.bundled_resources_available=false;
+                return out;
+            }
+        }
+        // Missing, disallowed and stale records share the same public failure.
+        throw "skill catalog unavailable";
+    }
+    throw "invalid skill catalog operation";
+}
+let _active=try compile(CONFIG.configuration()) catch nil;
+fn available() {if _active==nil {return false;}return _active.enabled and len(_active.records)>0;}
+fn retrieve(args) {return call(_active,args);}
+fn schema() {
+    let text=map{type:"string",minLength:1,maxLength:256};
+    let bound=map{type:"integer",minimum:1,maximum:8192};
+    return [map{type:"object",additionalProperties:false,required:["catalog","operation","query","top_k","context_chars"],
+        properties:map{catalog:map{const:"skills"},operation:map{const:"search"},query:text,
+            category:map{type:"string",minLength:1,maxLength:96},top_k:map{type:"integer",minimum:1,maximum:8},context_chars:map{type:"integer",minimum:2,maximum:8192}}},
+        map{type:"object",additionalProperties:false,required:["catalog","operation","id","revision","offset","context_chars"],
+        properties:map{catalog:map{const:"skills"},operation:map{const:"read"},id:map{type:"string",minLength:1,maxLength:96},
+            revision:map{type:"string",pattern:"^[0-9a-f]{64}$"},offset:map{type:"integer",minimum:0,maximum:65536},context_chars:bound}}];
+}
+export compile,call,retrieve,schema,available;

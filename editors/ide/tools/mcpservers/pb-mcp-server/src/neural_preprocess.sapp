@@ -1,0 +1,118 @@
+// Pure CPU arithmetic for caller-supplied arrays. No model loading or effects.
+// Batch sizes belong to this helper contract, not to the PBLang language.
+fn _object(value, allowed, required) {
+    if type(value) != "map" { throw "expected an object"; }
+    let keys = map_keys(value);
+    for i len(keys) {
+        let found = false;
+        for j len(allowed) { if keys[i] == allowed[j] { found = true; } }
+        if not found { throw "unsupported property"; }
+    }
+    for i len(required) { if not map_has(value, required[i]) { throw "required property missing"; } }
+}
+fn _number(value, low, high) {
+    if type(value) != "number" { throw "expected a number"; }
+    if not (value >= low and value <= high) { throw "number outside finite arithmetic bounds"; }
+    return value;
+}
+fn _vector(value, maximum) {
+    if type(value) != "array" { throw "expected an array"; }
+    if len(value) == 0 or len(value) > maximum { throw "array length outside batch bounds"; }
+    return value;
+}
+fn _matrix(samples) {
+    _vector(samples, 4096);
+    let width = len(_vector(samples[0], 1024));
+    if len(samples) * width > 65536 { throw "matrix exceeds cell budget"; }
+    for i len(samples) {
+        _vector(samples[i], 1024);
+        if len(samples[i]) != width { throw "sample widths must match"; }
+        for j width { _number(samples[i][j], -1000000000000, 1000000000000); }
+    }
+    return width;
+}
+fn _result(kind) {
+    return map{ format: "pb_mcp." + kind + ".v1", native_pblang: true,
+        effect_performed: false, network_used: false, model_loaded: false,
+        data_provenance: "untrusted_caller_supplied", instructions_from_data: false };
+}
+
+// Fit once on training samples. Later batches reuse the returned calibration.
+fn minmax_fit(args) {
+    _object(args, ["samples"], ["samples"]);
+    let width = _matrix(args.samples);
+    let minima = []; let maxima = [];
+    for j width { minima[j] = args.samples[0][j]; maxima[j] = args.samples[0][j]; }
+    for i len(args.samples) {
+        for j width {
+            let value = args.samples[i][j];
+            if value < minima[j] { minima[j] = value; }
+            if value > maxima[j] { maxima[j] = value; }
+        }
+    }
+    let out = _result("neural_minmax_fit");
+    out.sample_count = len(args.samples); out.feature_count = width;
+    out.calibration = map{ format: "pb_mcp.minmax_calibration.v1", minima: minima, maxima: maxima };
+    return out;
+}
+
+// Constant training columns use denominator 1: unseen values retain their delta.
+// Extrapolation is intentional unless the caller explicitly selects clipping.
+fn minmax_transform(args) {
+    _object(args, ["samples", "calibration", "clip"], ["samples", "calibration"]);
+    let width = _matrix(args.samples);
+    let calibration = args.calibration;
+    _object(calibration, ["format", "minima", "maxima"], ["format", "minima", "maxima"]);
+    if calibration.format != "pb_mcp.minmax_calibration.v1" { throw "unsupported calibration format"; }
+    _vector(calibration.minima, 1024); _vector(calibration.maxima, 1024);
+    if len(calibration.minima) != width or len(calibration.maxima) != width { throw "calibration width mismatch"; }
+    let clip = try args.clip catch false;
+    if type(clip) != "bool" { throw "clip must be boolean"; }
+    let ranges = [];
+    for j width {
+        let low = _number(calibration.minima[j], -1000000000000, 1000000000000);
+        let high = _number(calibration.maxima[j], -1000000000000, 1000000000000);
+        if high < low { throw "calibration maximum below minimum"; }
+        ranges[j] = if high == low { 1 } else { high - low };
+    }
+    let rows = []; let finite_limit = num_pow(10, 308);
+    for i len(args.samples) {
+        let row = [];
+        for j width {
+            let delta = args.samples[i][j] - calibration.minima[j];
+            let value = 0.0;
+            // Clip before dividing; extremely narrow ranges need not overflow.
+            if clip and delta <= 0 { value = 0.0; }
+            else if clip and delta >= ranges[j] { value = 1.0; }
+            else { value = _number(delta / ranges[j], -finite_limit, finite_limit); }
+            row[j] = value;
+        }
+        rows[i] = row;
+    }
+    let out = _result("neural_minmax_transform");
+    out.samples = rows; out.sample_count = len(rows); out.feature_count = width;
+    out.clipped = clip; out.constant_feature_denominator = 1;
+    return out;
+}
+
+fn softmax(args) {
+    _object(args, ["logits", "temperature"], ["logits"]);
+    let logits = _vector(args.logits, 65536);
+    let temperature = _number(try args.temperature catch 1, 0.000001, 1000000);
+    let peak = _number(logits[0], -1000000000000, 1000000000000);
+    for i len(logits) {
+        let value = _number(logits[i], -1000000000000, 1000000000000);
+        if value > peak { peak = value; }
+    }
+    let probabilities = []; let total = 0.0;
+    for i len(logits) {
+        let weight = num_exp((logits[i] - peak) / temperature);
+        probabilities[i] = weight; total = total + weight;
+    }
+    // At least one shifted logit is zero, so total is finite and at least 1.
+    for i len(probabilities) { probabilities[i] = probabilities[i] / total; }
+    let out = _result("neural_softmax");
+    out.probabilities = probabilities; out.temperature = temperature;
+    return out;
+}
+export minmax_fit, minmax_transform, softmax;
