@@ -546,8 +546,359 @@ fn vocab_size(vocab) { return vocab.size; }
 // perplexity(loss) — exp of the average cross-entropy loss (standard LM metric).
 fn perplexity(loss) { return num_exp(loss); }
 
+// ── Real O(N) Kernelized Linear Attention Transformer with RoPE (v57.0) ───────────────
+fn _elu_plus_one(x) {
+    if x >= 0.0 { return x + 1.0; }
+    if x < -20.0 { return 0.000001; }
+    return num_exp(x) + 0.000001;
+}
+
+fn _rope_rotate_pair(x0, x1, pos, freq) {
+    let tau = 0.5 * pos * freq;
+    let denom = 1.0 + tau * tau;
+    let c = (1.0 - tau * tau) / denom;
+    let s = (2.0 * tau) / denom;
+    return [x0 * c - x1 * s, x0 * s + x1 * c];
+}
+
+fn linear_transformer_new(vsize, d_model = 8, d_head = 8, seed = 42) {
+    let scale_e = num_sqrt(2.0 / (vsize + d_model));
+    let scale_qkv = num_sqrt(2.0 / (d_model + d_head));
+    let scale_out = num_sqrt(2.0 / (d_head + vsize));
+
+    let E = [];
+    let v = 0;
+    while v < vsize {
+        let row = [];
+        let d = 0;
+        while d < d_model {
+            push(row, _rand(seed, v, d) * scale_e);
+            d = d + 1;
+        }
+        push(E, row);
+        v = v + 1;
+    }
+
+    let Wq = [];
+    let Wk = [];
+    let Wv = [];
+    let d = 0;
+    while d < d_model {
+        let rq = [];
+        let rk = [];
+        let rv = [];
+        let h = 0;
+        while h < d_head {
+            push(rq, _rand(seed + 11, d, h) * scale_qkv);
+            push(rk, _rand(seed + 23, d, h) * scale_qkv);
+            push(rv, _rand(seed + 37, d, h) * scale_qkv);
+            h = h + 1;
+        }
+        push(Wq, rq);
+        push(Wk, rk);
+        push(Wv, rv);
+        d = d + 1;
+    }
+
+    let Wout = [];
+    let h = 0;
+    while h < d_head {
+        let ro = [];
+        let j = 0;
+        while j < vsize {
+            push(ro, _rand(seed + 53, h, j) * scale_out);
+            j = j + 1;
+        }
+        push(Wout, ro);
+        h = h + 1;
+    }
+
+    let bout = _zeros(vsize);
+    return map{
+        arch: "pbAI-Symplectic-Linear-Flash-Transformer-RoPE-O(N)",
+        vsize: vsize,
+        d_model: d_model,
+        d_head: d_head,
+        E: E,
+        Wq: Wq,
+        Wk: Wk,
+        Wv: Wv,
+        Wout: Wout,
+        bout: bout
+    };
+}
+
+fn linear_transformer_forward(m, ids) {
+    let n = len(ids);
+    let d_model = m.d_model;
+    let d_head = m.d_head;
+    let vsize = m.vsize;
+
+    let S = _zeros2(d_head, d_head);
+    let Z = _zeros(d_head);
+
+    let probs_seq = [];
+    let attn_seq = [];
+    let phi_q_seq = [];
+    let phi_k_seq = [];
+    let v_seq = [];
+    let rope_max_norm_drift = 0.0;
+
+    let t = 0;
+    while t < n {
+        let tok = ids[t];
+        if tok < 0 or tok >= vsize { tok = 0; }
+        let x = m.E[tok];
+
+        let q = _zeros(d_head);
+        let k = _zeros(d_head);
+        let v_vec = _zeros(d_head);
+        let h = 0;
+        while h < d_head {
+            let sq = 0.0;
+            let sk = 0.0;
+            let sv = 0.0;
+            let d = 0;
+            while d < d_model {
+                let xd = x[d];
+                sq = sq + xd * m.Wq[d][h];
+                sk = sk + xd * m.Wk[d][h];
+                sv = sv + xd * m.Wv[d][h];
+                d = d + 1;
+            }
+            q[h] = sq;
+            k[h] = sk;
+            v_vec[h] = sv;
+            h = h + 1;
+        }
+
+        let q_rot = _zeros(d_head);
+        let k_rot = _zeros(d_head);
+        let norm_before = 0.0;
+        let norm_after = 0.0;
+        let p = 0;
+        while p + 1 < d_head {
+            let freq = 1.0 / num_exp(((p * 1.0) / (d_head * 1.0)) * num_ln(100.0));
+            norm_before = norm_before + q[p] * q[p] + q[p + 1] * q[p + 1];
+            let rq = _rope_rotate_pair(q[p], q[p + 1], t + 1, freq);
+            let rk = _rope_rotate_pair(k[p], k[p + 1], t + 1, freq);
+            q_rot[p] = rq[0];
+            q_rot[p + 1] = rq[1];
+            k_rot[p] = rk[0];
+            k_rot[p + 1] = rk[1];
+            norm_after = norm_after + rq[0] * rq[0] + rq[1] * rq[1];
+            p = p + 2;
+        }
+        if p < d_head {
+            q_rot[p] = q[p];
+            k_rot[p] = k[p];
+            norm_before = norm_before + q[p] * q[p];
+            norm_after = norm_after + q_rot[p] * q_rot[p];
+        }
+        let drift = num_abs(norm_after - norm_before);
+        if drift > rope_max_norm_drift { rope_max_norm_drift = drift; }
+
+        let phi_q = _zeros(d_head);
+        let phi_k = _zeros(d_head);
+        let hi = 0;
+        while hi < d_head {
+            phi_q[hi] = _elu_plus_one(q_rot[hi]);
+            phi_k[hi] = _elu_plus_one(k_rot[hi]);
+            hi = hi + 1;
+        }
+
+        let i = 0;
+        while i < d_head {
+            let pki = phi_k[i];
+            Z[i] = Z[i] + pki;
+            let row_s = S[i];
+            let j = 0;
+            while j < d_head {
+                row_s[j] = row_s[j] + pki * v_vec[j];
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+
+        let denom = 0.000001;
+        let i2 = 0;
+        while i2 < d_head {
+            denom = denom + phi_q[i2] * Z[i2];
+            i2 = i2 + 1;
+        }
+        let attn = _zeros(d_head);
+        let j2 = 0;
+        while j2 < d_head {
+            let num = 0.0;
+            let i3 = 0;
+            while i3 < d_head {
+                num = num + phi_q[i3] * S[i3][j2];
+                i3 = i3 + 1;
+            }
+            let res = if j2 < d_model { x[j2] } else { 0.0 };
+            attn[j2] = (num / denom) + res;
+            j2 = j2 + 1;
+        }
+
+        let logits = _zeros(vsize);
+        let v_idx = 0;
+        while v_idx < vsize {
+            let acc = m.bout[v_idx];
+            let h2 = 0;
+            while h2 < d_head {
+                acc = acc + attn[h2] * m.Wout[h2][v_idx];
+                h2 = h2 + 1;
+            }
+            logits[v_idx] = acc;
+            v_idx = v_idx + 1;
+        }
+        let probs = softmax_temp(logits, 1.0);
+
+        push(probs_seq, probs);
+        push(attn_seq, attn);
+        push(phi_q_seq, phi_q);
+        push(phi_k_seq, phi_k);
+        push(v_seq, v_vec);
+        t = t + 1;
+    }
+
+    return map{
+        probs_seq: probs_seq,
+        attn_seq: attn_seq,
+        phi_q_seq: phi_q_seq,
+        phi_k_seq: phi_k_seq,
+        v_seq: v_seq,
+        rope_max_norm_drift: rope_max_norm_drift
+    };
+}
+
+fn linear_transformer_loss_and_perplexity(m, ids) {
+    let n = len(ids);
+    if n < 2 {
+        return map{ loss: 0.0, perplexity: 1.0, rope_max_norm_drift: 0.0, tokens_evaluated: 0 };
+    }
+    let fw = linear_transformer_forward(m, ids);
+    let total_nll = 0.0;
+    let count = 0;
+    let t = 0;
+    while t < n - 1 {
+        let target = ids[t + 1];
+        let p = fw.probs_seq[t][target];
+        if p < 0.000000001 { p = 0.000000001; }
+        total_nll = total_nll - num_ln(p);
+        count = count + 1;
+        t = t + 1;
+    }
+    let avg_nll = total_nll / (count * 1.0);
+    let ppl = num_exp(avg_nll);
+    return map{
+        loss: avg_nll,
+        perplexity: ppl,
+        rope_max_norm_drift: fw.rope_max_norm_drift,
+        tokens_evaluated: count
+    };
+}
+
+fn linear_transformer_train(m, ids, epochs = 6, lr = 0.25) {
+    let n = len(ids);
+    if n < 2 { return m; }
+    let d_head = m.d_head;
+    let d_model = m.d_model;
+    let vsize = m.vsize;
+    let ep = 0;
+    let cur_lr = lr;
+    while ep < epochs {
+        let fw = linear_transformer_forward(m, ids);
+        let step_scale = cur_lr / ((n - 1) * 1.0);
+        let t = 0;
+        while t < n - 1 {
+            let target = ids[t + 1];
+            let probs = fw.probs_seq[t];
+            let attn = fw.attn_seq[t];
+            let tok = ids[t];
+
+            let dlogits = _zeros(vsize);
+            let v = 0;
+            while v < vsize {
+                dlogits[v] = probs[v];
+                v = v + 1;
+            }
+            dlogits[target] = dlogits[target] - 1.0;
+
+            let dattn = _zeros(d_head);
+            let h = 0;
+            while h < d_head {
+                let da = 0.0;
+                let ah = attn[h];
+                let row_w = m.Wout[h];
+                let v2 = 0;
+                while v2 < vsize {
+                    let dl = dlogits[v2];
+                    da = da + dl * row_w[v2];
+                    row_w[v2] = row_w[v2] - step_scale * ah * dl;
+                    v2 = v2 + 1;
+                }
+                dattn[h] = da;
+                h = h + 1;
+            }
+            let v3 = 0;
+            while v3 < vsize {
+                m.bout[v3] = m.bout[v3] - step_scale * dlogits[v3];
+                v3 = v3 + 1;
+            }
+
+            let x = m.E[tok];
+            let d = 0;
+            while d < d_model {
+                let xd = x[d];
+                let row_wv = m.Wv[d];
+                let h2 = 0;
+                while h2 < d_head {
+                    row_wv[h2] = row_wv[h2] - step_scale * 0.5 * xd * dattn[h2];
+                    h2 = h2 + 1;
+                }
+                if d < d_head {
+                    x[d] = x[d] - step_scale * 0.5 * dattn[d];
+                }
+                d = d + 1;
+            }
+            t = t + 1;
+        }
+        cur_lr = cur_lr * 0.95;
+        ep = ep + 1;
+    }
+    return m;
+}
+
+fn linear_transformer_selftest() {
+    let sample = "fn solve(a, b) { return a + b; } fn verify(x) { return x * 2; }";
+    let vocab = vocab_build(sample);
+    let ids = encode(vocab, sample);
+    let tr = linear_transformer_new(vocab.size, 8, 8, 42);
+    let before = linear_transformer_loss_and_perplexity(tr, ids);
+    linear_transformer_train(tr, ids, 6, 0.35);
+    let after = linear_transformer_loss_and_perplexity(tr, ids);
+    return map{
+        ok: after.loss < before.loss and after.perplexity < before.perplexity and after.rope_max_norm_drift < 0.000000001,
+        arch: tr.arch,
+        vocab_size: vocab.size,
+        sequence_length: len(ids),
+        d_model: tr.d_model,
+        d_head: tr.d_head,
+        loss_before: before.loss,
+        loss_after: after.loss,
+        perplexity_before: before.perplexity,
+        perplexity_after: after.perplexity,
+        rope_max_norm_drift: after.rope_max_norm_drift
+    };
+}
+
 export vocab_build, encode, model_new, train_step, train, avg_loss, next_id, generate,
        source_corpus, checkpoint, checkpoint_generate, train_nano, generate_nano,
-       vocab_size, perplexity;
+       vocab_size, perplexity,
+       linear_transformer_new, linear_transformer_forward,
+       linear_transformer_loss_and_perplexity, linear_transformer_train,
+       linear_transformer_selftest;
 export softmax_temp, top_k_filter, sample_from, next_id_sampled, generate_sampled;
 export top_p_filter, apply_repetition_penalty, generate_decode;
+
