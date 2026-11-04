@@ -2,12 +2,12 @@
 
 <img src="assets/brand/icon.svg" width="96" height="96" alt="PBLang icon" />
 
-# PBLang `1.0.0-stable`
+# PBLang `1.1.0-stable`
 
 **The Sovereign Full-Stack, Systems, AI/Quantum & Hardware Programming Language.**  
 *Write once in `.sapp` — compile natively to `x86-64 ELF64`, `ARM64 ELF64`, `WebAssembly`, `C99`, `Android APK`, `Web/PWA`, and `Embedded Microcontrollers` with Zero-Trust Security by default.*
 
-[![Release](https://img.shields.io/badge/release-v1.0.0--stable-0A84FF?style=for-the-badge)](https://github.com/PanosBiazis/pblang/releases/tag/v1.0.0)
+[![Release](https://img.shields.io/badge/release-v1.1.0--stable-0A84FF?style=for-the-badge)](https://github.com/PanosBiazis/pblang/releases/tag/v1.1.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2EA043?style=for-the-badge)](LICENSE)
 [![Backends](https://img.shields.io/badge/Backends-7_Verified_(x64_%7C_ARM64_%7C_WASM_%7C_C99_%7C_PBCK)-8A2BE2?style=for-the-badge)](#100-pblang-native-compilation-x64-arm64-wasm-pbck)
 [![Stage-3 Host](https://img.shields.io/badge/Stage--3-Zero--Rust_Direct_Syscall_ELF64-FF6B00?style=for-the-badge)](#stage-3-zero-rust-native-host--deep-runtime-kernel)
@@ -21,7 +21,7 @@
 
 ## Why PBLang 1.0?
 
-**PBLang (`1.0.0-stable`, Edition 2026)** unifies high-level developer ergonomics with deterministic systems control, built-in static taint/security auditing, multi-surface UI generation, and cycle-accurate hardware emulation + physical bus management in a single cohesive toolchain:
+**PBLang (`1.1.0-stable`, Edition 2026)** unifies high-level developer ergonomics with deterministic systems control, built-in static taint/security auditing, multi-surface UI generation, and cycle-accurate hardware emulation + physical bus management in a single cohesive toolchain:
 
 | Pillar | Capability Highlights | Key Modules |
 | :--- | :--- | :--- |

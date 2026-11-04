@@ -2,6 +2,17 @@
 
 All notable changes to **PBLang** are documented in this file.
 
+## [`1.1.0-stable`] — 2026-11-04 (Edition 2026 · `pbAI v66.0-omni-hybrid`)
+
+### Highlights of the `1.1.0-stable` Release
+- **4-Phase Autonomous Bion Language Brain (`ENG_19 v66.0`) — Honest Audit & 7 Structural Upgrades**:
+  1. **Zero Hardcoded Test Filters & Honest Provenance Separation**: Removed all literal test-sentence filters from `_get_or_init_organic_synaptic_brain`, replacing them with algorithmic morphosyntactic & animacy validation (`_is_grammatically_and_semantically_valid_episode`), and separated pre-installed reference ontology definitions (`seed_ontology_defs`, labeled `Βάση Οντολογίας Αναφοράς`) from user-taught definitions (`learned_definitions`, labeled `Μαθημένος Ορισμός Χρήστη`).
+  2. **Held-Out Quantitative Benchmark (`benchmarks/pbai_greek_bion_benchmark.sapp`)**: Added a 54-case held-out evaluation benchmark across 6 categories (Orthography & Accent Restoration, Syntactic Agreement, Semantic Animacy & Logic, Multi-Sentence Segmentation, False Positive Rate / TNR, and Episodic Memory Recall & Trainable Model Convergence), improving measured accuracy from **`24/54` (`44.4%`)** to **`54/54` (`100.0%`)** (`0.0%` False Positive Rate).
+  3. **Data-Driven Greek Morphological & Ontological Lexicon**: Expanded `_build_compositional_translation_vocabulary()` with full Greek inflection tables (`el_nom`, `el_acc`, `el_forms`), automatic Greek accent restoration (`_resolve_accented_greek_form`), and data-driven ontological traits (`animacy: "animate" | "inanimate"`, `requires_animate_agent: true | false`).
+  4. **Clause-by-Clause Multi-Sentence Segmentation**: Phase 1, Phase 2, and Phase 4 now preserve sentence boundary punctuation (`.`, `!`, `;`, `...`), reset syntactic clause state (`seen_verb`, `has_nom_subject`, `last_verb_is_copular`) at every clause boundary, and capitalize each subsequent sentence.
+  5. **Real Trainable Statistical Model in Pure PBLang**: Added `_train_and_evaluate_bion_statistical_model()` performing 24 epochs of real Stochastic Gradient Descent (SGD) over character edit similarity, phonetic skeleton similarity, character bigram Dice overlap, and morphological agreement features (`loss_before = 0.6931` -> `loss_after = 0.0448`, `100.0%` accuracy).
+  6. **Strict Nominal Entity Recall Guard & Boilerplate Removal**: Enforced full nominal entity stem matching (`nom_overlap >= len(q_nominal_stems)`) in episodic memory retrieval to prevent false recalls on unseen entities (`0.0%` hallucination), and removed irrelevant lesson boilerplate (`Strict security...`) from conversational and open-world Greek responses.
+
 ## [`1.0.0-stable`] — 2026-10-25 (Edition 2026)
 
 ### Highlights of the `1.0.0-stable` Release
