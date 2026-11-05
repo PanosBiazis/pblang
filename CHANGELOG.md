@@ -2,6 +2,26 @@
 
 All notable changes to **PBLang** are documented in this file.
 
+## [`1.2.1-stable`] — 2026-11-05 (pbAI embedded engine · true-negative / do-no-harm)
+
+> Note: `pblang.toml` had already been set to `1.2.0` without a changelog entry or tag; this release documents the changes since `1.1.0-stable`.
+
+### pbAI Greek grammar engine — fewer false alarms on correct text
+- **Lexicon as data, not code**: `editors/ide/tools/ai/data/el_wordforms_opensubtitles_full_min10.txt` (199,343 Greek word forms, frequency ≥ 10, unaccented polysyllables removed) built in PBLang by `data/build_el_wordforms.sapp` from hermitdave/FrequencyWords `el_full.txt` (CC BY-SA 4.0; provenance and hashes in `data/el_wordforms.SOURCE.md`). Known word forms are never changed by fuzzy correction; capitalized non-initial tokens (proper nouns) are left alone. Optional `PBAI_DATA_DIR`.
+- **Minimal-edit text rebuild**: the corrected sentence is rebuilt from the original text by applying only diagnosed word/phrase edits (whole-word, once); punctuation, quotes and casing are preserved and an unchanged input is returned byte-identical.
+- **Grammar rules narrowed with general linguistic conditions**: genitive articles (`του/της/των/ενός/μιας`) recognised; gender/case rules skip proper nouns (except `τον` + masculine `-ος`); subject-case rule requires an adjacent verb; article/clitic-only "phrases" (e.g. possessive `τους`) are not corrected; `σε` + article contraction replaces the preposition too; unaccented `-ύς` adjectives restore the standard feminine `-ιά`.
+- **Benchmarks**: new `benchmarks/pbai_true_negative_dev_eval.sapp` (generic dev harness) and `benchmarks/compare/` (same-prompt comparison against other models, `score_compare.sapp`).
+
+### Measured results (one heavy job at a time, 4 GB cgroup cap)
+| Set | Before (`69a527f4`) | After |
+|---|---|---|
+| Dev: 150 correct sentences from UD Greek-GDT dev (tuning set) | 1/150 strict, 287 false flags | 139/150, 12 false flags |
+| Locked user held-out 150 (sha256 `49652fc7…`), measured once, no tuning on it | 0/150 | **134/150** |
+| `pbai_greek_bion_benchmark` (54) | 54/54 | 54/54 |
+| `pbai_independent_heldout_150_benchmark` | 150/150 | 150/150 |
+
+Known limitations: remaining false flags involve clitics (`το` before verbs), English loanwords (`link`, `save`, `post`) and neuter nouns in `-ος`; engine memory grows per sentence (≈2 GB over 150 sentences, not yet fixed); some rule narrowings were guided by dev-set failures.
+
 ## [`1.1.0-stable`] — 2026-11-04 (Edition 2026 · `pbAI v66.0-omni-hybrid`)
 
 ### Highlights of the `1.1.0-stable` Release
