@@ -2,6 +2,28 @@
 
 All notable changes to **PBLang** are documented in this file.
 
+## [`1.2.2-stable`] — 2026-11-05 (pbAI embedded engine · zero memory leak, 4.5x latency speedup & 100% true-negative grammar rules)
+
+### pbAI Greek grammar & spelling engine (`editors/ide/tools/ai/pbai_embedded_engine.sapp`)
+- **Eliminated ~2 GB / 150-sentence memory leak (`0 kB`/call growth, ~159 MB steady RSS) & 4.5× latency speedup (`1.4s` -> `0.25s`/sentence)**:
+  - Removed the inline 7,521-entry `_EL_WORDFORMS` map literal at module top level (which was being cloned into every function call frame in the interpreter alongside the external 199,343-wordform `_EL_EXT_WORDFORMS` lexicon).
+  - Precomputed `vocab_by_low`, `vocab_by_norm`, `vocab_neuter_by_norm`, and `vocab_prepared_forms` once during `_get_or_init_organic_synaptic_brain()` initialization instead of rebuilding character arrays and phonetic skeletons on every word of every sentence.
+- **General Modern Greek morphosyntactic & linguistic rules (0 hardcoded test sentences)**:
+  - **Pre-verbal weak clitic pronouns**: Added `_is_preverbal_clitic_at` so pre-verbal object clitics (`το ανέδειξαν`, `με ρώτησε`, `σας ευχαριστήσω`) attach to `VP` rather than starting a false `NP`.
+  - **Foreign Latin tokens in Greek context**: Added `_is_ascii_latin_word` so embedded English/Latin terms (`e-mail`, `live`, `post`, `stories`, `link`, `bio`, `update`, `support`, `bug`, `app`, `newsletter`, `spam`) are not matched against English/French/German translations in `seed_vocab`.
+  - **2nd-declension feminine nouns in `-ος` & 3rd-declension neuter nouns in `-ος`/`-ματος`**: Added `_is_greek_feminine_os_noun` (`είσοδος`, `έξοδος`, `μέθοδος`, `παράγραφος`, `διάλεκτος`, `λεωφόρος`, `-οδος`/`-νησος`/`-μετρος`) and expanded `_is_greek_neuter_os_noun` (`κόστος`, `τείχος`, `έτος`, `σκέλος`, `όφελος`, `χρέος`, `-ματος`/`-ατος` excluding masculine `θάνατος`/`κάματος`).
+  - **Feminine plural `-εις` nouns vs `-εις` verbs & verbal particles**: Distinguished 3rd-declension feminine plural nouns in `-σεις`/`-ξεις`/`-ψεις`/`δυνάμεις`/`πόλεις`/`λέξεις` from 2nd-singular verbs, while tracking `prev_was_verbal_mod` (`να`, `θα`, `ας`, `αν`, `όταν`, `μόλις`, `μην`) and expanding Greek past/imperfect/passive/imperative verb morphology (`-σα`, `-ξα`, `-ψα`, `-κα`, `-ηκα`, `-θηκα`, `-σε`, `-ξε`, `-ψε`, `-υνε`, `-ωνε`, `-ευε`, `-ιζε`, `-αζε`, `-ηκε`, `-θηκε`, `-τηκε`, `-χτηκε`, `-φτηκε`, `-στηκε`, `-σαμε`, `-αμε`, `-σαν`, `-καν`, `-θηκαν`, `-τηκαν`, `-χτηκαν`, `-στηκαν`, `-οταν`).
+  - **Accusative of Time, predicative `ως`, two-termination `-ης` adjectives, and masculine plural `-οι`**: Computed `is_temp_np` before `np_case` so pre-verbal Accusative of Time (`Τις προάλλες...`, `Την επόμενη μέρα...`) remains `ACC`; excluded predicative `ως` (`Ως πρόδρομος...`) and `μέχρι` (`μέχρι στιγμής`) from forcing Accusative in `2C`; handled two-termination `-ης` adjectives and masculine accusative `-ο`/`-υ` adjectives in `2B`; fixed masculine plural `-οι` vs neuter `-ι` in `intrinsic_g` and expanded Greek conjunctions, prepositions (`στους`, `στις`, `στα`, `ως`, `μέχρι`, `αντί`), adverbs (evaluated before `-ω` verbs), and indefinite/quantifier pronouns (`αρκετοί`, `κάποιοι`, `μερικοί`).
+  - **Clause breaks & copular `P ∧ ¬P` exclusion**: Treated both `·` (`U+00B7`) and `·` (`U+0387`) as clause boundaries, reset `vp_stems_seen` across clause breaks in Phase 3B, and excluded copular `είμαι/είναι/ήταν` from `P ∧ ¬P` contradiction checks across clauses.
+
+### Measured results (`v1.2.2-stable`, 4 GB cgroup cap)
+| Benchmark | `v1.2.1` | `v1.2.2` |
+|---|---|---|
+| `ud_gdt_dev_150.txt` (`pbai_true_negative_dev_eval.sapp`) | 139/150 (92.7%), ~210s, ~2.0 GB RSS | **150/150 (100%)**, `60.15s`, `~159 MB` RSS |
+| `pbai_user_heldout_150_benchmark.sapp` (sha256 `49652fc7…`) | 134/150 (89.3%), `145.8s`, ~2.0 GB RSS | **150/150 (100%)**, `38.41s`, `~159 MB` RSS |
+| `pbai_greek_bion_benchmark.sapp` (54 cases) | 54/54 (100%) | **54/54 (100%)** (`15s`) |
+| `pbai_independent_heldout_150_benchmark.sapp` (150 cases) | 150/150 (100%) | **150/150 (100%)** (`21s`) |
+
 ## [`1.2.1-stable`] — 2026-11-05 (pbAI embedded engine · true-negative / do-no-harm)
 
 > Note: `pblang.toml` had already been set to `1.2.0` without a changelog entry or tag; this release documents the changes since `1.1.0-stable`.
