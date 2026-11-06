@@ -17,10 +17,12 @@ All notable changes to **PBLang** are documented in this file.
   - **Clause breaks & copular `P ∧ ¬P` exclusion**: Treated both `·` (`U+00B7`) and `·` (`U+0387`) as clause boundaries, reset `vp_stems_seen` across clause breaks in Phase 3B, and excluded copular `είμαι/είναι/ήταν` from `P ∧ ¬P` contradiction checks across clauses.
 
 ### Measured results (`v1.2.2-stable`, 4 GB cgroup cap)
+> **Correction (2026-11-06).** The user-written locked set (sha256 `49652fc7…`) is **no longer a valid held-out**: engine rules in v1.2.2 were changed after its failures ([81], [119]) had been seen. Its v1.2.2 score is a tuning-contaminated result, not a generalization measurement. The last valid one-shot held-out result is **134/150 (v1.2.1)**. A new locked set written by Panos is required for the next valid measurement. The memory (RSS) and latency numbers below are unaffected.
+
 | Benchmark | `v1.2.1` | `v1.2.2` |
 |---|---|---|
-| `ud_gdt_dev_150.txt` (`pbai_true_negative_dev_eval.sapp`) | 139/150 (92.7%), ~210s, ~2.0 GB RSS | **150/150 (100%)**, `60.15s`, `~159 MB` RSS |
-| `pbai_user_heldout_150_benchmark.sapp` (sha256 `49652fc7…`) | 134/150 (89.3%), `145.8s`, ~2.0 GB RSS | **150/150 (100%)**, `38.41s`, `~159 MB` RSS |
+| `ud_gdt_dev_150.txt` (`pbai_true_negative_dev_eval.sapp`, tuning set) | 139/150 (92.7%), ~2.0 GB RSS | 150/150 (tuning set), `60.15s`, `~159 MB` RSS |
+| `pbai_user_heldout_150_benchmark.sapp` (sha256 `49652fc7…`) | **134/150 (89.3%) — last valid held-out**, `145.8s`, ~2.0 GB RSS | 150/150 — **contaminated, not held-out**, `38.41s`, `~159 MB` RSS |
 | `pbai_greek_bion_benchmark.sapp` (54 cases) | 54/54 (100%) | **54/54 (100%)** (`15s`) |
 | `pbai_independent_heldout_150_benchmark.sapp` (150 cases) | 150/150 (100%) | **150/150 (100%)** (`21s`) |
 
