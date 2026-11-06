@@ -2,6 +2,16 @@
 
 All notable changes to **PBLang** are documented in this file.
 
+## [`1.3.0-stable`] — 2026-11-06 (De-embedding `pbai` and `pb-mcp-server` into standalone repositories)
+
+### Architectural Separation & Repository Boundaries
+- **Removed embedded `pbai` and `pb-mcp-server` copies from `pblang`**:
+  - All `pbai` files (`stdlib/ai/pbai`, `stdlib/pbai*.sapp`, `stdlib/pb_mcp.sapp`, `stdlib/combined_mllm.sapp`, `editors/ide/tools/ai`, and associated tests/benchmarks/examples/docs) now live exclusively in the standalone [`pbai`](https://github.com/PanosBiazis/pbai) repository (`v0.3.0`), while the new SNO organism project lives in [`noophyon`](https://github.com/PanosBiazis/noophyon) (`v0.1.0`).
+  - All `pb-mcp-server` files (`editors/ide/tools/mcpservers/pb-mcp-server` and associated tests/docs) now live exclusively in the standalone [`pb-mcp-server`](https://github.com/PanosBiazis/pb-mcp-server) repository (`v0.2.0`).
+  - Before removal, all diverged files were 3-way merged (`git merge-file` against common blob history) into the standalone repositories and documented in `docs/RECONCILIATION_2026-11-06.md`; the final pre-removal state of `pblang` is tagged `embedded-pbai-mcp-final`.
+- **Optional IDE AI bridge (`editors/ide/pbai_optional.sapp`)**:
+  - `pbIDE` (`editors/ide/pbide.sapp` and `editors/ide/pbide_surface.sapp`) now resolves `pbai_lite.sapp` dynamically via `PBAI_HOME` or a sibling `../pbai` checkout, degrading cleanly when `pbAI` is not installed.
+
 ## [`1.2.2-stable`] — 2026-11-05 (pbAI embedded engine · zero memory leak, 4.5x latency speedup & 100% true-negative grammar rules)
 
 ### pbAI Greek grammar & spelling engine (`editors/ide/tools/ai/pbai_embedded_engine.sapp`)

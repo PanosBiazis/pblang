@@ -1104,7 +1104,7 @@ fn show_help() {
     println!("CLI helpers (run without entering the REPL):");
     println!("  pblang init            Create pblang.toml in current directory");
     println!("  pblang --ide [--allow-*]   Launch the trusted executable-relative pblang-native IDE: editor, terminal,");
-    println!("                          visual designer, AI panel (pbAI), and browser. Host effects are denied by");
+    println!("                          visual designer, AI panel (optional external pbAI), and browser. Host effects are denied by");
     println!("                          default; opt in explicitly (for example --allow-exec for the terminal).");
     println!("  pblang run [file.sapp|file.bpx|dir] [--allow-*] [--deny-*] [--allow-all|--sandbox] [-- script-args...]");
     println!("                          Execute a script, or run the package entry from a manifest dir/current dir.");

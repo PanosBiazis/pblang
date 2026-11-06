@@ -2647,11 +2647,6 @@ sapp_test!(
     "dataframe_stdlib_pass"
 );
 sapp_test!(
-    pbai_assets_pass,
-    "pbai_assets_test.sapp",
-    "pbai_assets_pass"
-);
-sapp_test!(
     systems_stdlib_pass,
     "systems_test.sapp",
     "systems_stdlib_pass"
