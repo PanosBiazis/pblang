@@ -13,3 +13,4 @@ pub(crate) mod doc;
 pub(crate) mod fmt;
 pub(crate) mod lint;
 pub(crate) mod test;
+pub(crate) mod update;

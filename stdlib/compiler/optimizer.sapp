@@ -175,12 +175,50 @@ fn constant_at(chunk, idx) {
 }
 
 fn add_constant(chunk, value) {
+    let vt = type(value);
+    if vt == "number" or vt == "string" or vt == "bool" or value == nil {
+        let is_nan = vt == "number" and value != value;
+        if not is_nan {
+            let i = 0;
+            let n = len(chunk.constants);
+            while i < n {
+                let cur = chunk.constants[i];
+                if type(cur) == vt and cur == value {
+                    if vt == "number" and value == 0 {
+                        if (1 / cur) == (1 / value) { return i; }
+                    } else {
+                        return i;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+    }
     array_push(chunk.constants, value);
     return len(chunk.constants) - 1;
 }
 
 fn is_number(val) {
     return type(val) == "number";
+}
+
+fn _is_scalar_const(val) {
+    let t = type(val);
+    return val == nil or t == "bool" or t == "number" or t == "string";
+}
+
+fn _scalar_truthy(val) {
+    if val == nil { return false; }
+    let t = type(val);
+    if t == "bool" { return val; }
+    if t == "number" { return val != 0; }
+    if t == "string" { return len(val) > 0; }
+    return true;
+}
+
+fn _pushes_bool(op) {
+    return op == OP_EQ or op == OP_NOT_EQ or op == OP_LT or op == OP_LE
+        or op == OP_GT or op == OP_GE or op == OP_NOT;
 }
 
 // True for every opcode whose operand is an absolute instruction index (a jump
@@ -236,6 +274,19 @@ fn _compact_and_remap(chunk) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn try_eval_binary(a_val, b_val, op) {
+    if type(a_val) == "string" and type(b_val) == "string" {
+        if op == OP_ADD and (len(a_val) + len(b_val)) <= 4096 {
+            return a_val + b_val;
+        }
+        if op == OP_EQ { return a_val == b_val; }
+        if op == OP_NOT_EQ { return a_val != b_val; }
+        return nil;
+    }
+    if _is_scalar_const(a_val) and _is_scalar_const(b_val) and (not is_number(a_val) or not is_number(b_val)) {
+        if op == OP_EQ { return a_val == b_val; }
+        if op == OP_NOT_EQ { return a_val != b_val; }
+        return nil;
+    }
     if not is_number(a_val) or not is_number(b_val) { return nil; }
     if op == OP_ADD { return a_val + b_val; }
     if op == OP_SUB { return a_val - b_val; }
@@ -324,17 +375,78 @@ fn constant_folding_pass(chunk) {
         i = i + 1;
     }
 
-    // Clean up instructions marked with op == -1, remapping jump targets so the
-    // folded-away CONSTANT/CONSTANT pairs don't desync `and`/`or` short-circuit
-    // jumps (this was the cause of `(a and b) or c` returning the wrong value /
-    // skipping the following statement entirely).
-    _compact_and_remap(chunk);
-    return folded;
+    if folded > 0 { _compact_and_remap(chunk); }
+
+    // Sub-pass: fold `OP_CONSTANT(scalar) + OP_NOT`, boolean double-negation,
+    // and constant conditional branches (`if true` / `if false`).
+    let targets2 = _jump_target_set(chunk);
+    let ufolded = 0;
+    let k = 0;
+    while k + 1 < chunk_len(chunk) {
+        if map_has(targets2, str(k + 1)) {
+            k = k + 1;
+            continue;
+        }
+        let first = inst_at(chunk, k);
+        let second = inst_at(chunk, k + 1);
+        if first != nil and second != nil and first.op == OP_CONSTANT {
+            let cval = constant_at(chunk, first.operand);
+            if _is_scalar_const(cval) {
+                if second.op == OP_NOT {
+                    let b_idx = add_constant(chunk, not _scalar_truthy(cval));
+                    set_inst(chunk, k, make_inst(-1, 0));
+                    set_inst(chunk, k + 1, make_inst(OP_CONSTANT, b_idx));
+                    ufolded = ufolded + 1;
+                    k = k + 2;
+                    continue;
+                }
+                if second.op == OP_JUMP_IF_FALSE {
+                    if _scalar_truthy(cval) {
+                        set_inst(chunk, k, make_inst(-1, 0));
+                        set_inst(chunk, k + 1, make_inst(-1, 0));
+                    } else {
+                        set_inst(chunk, k, make_inst(-1, 0));
+                        set_inst(chunk, k + 1, make_inst(OP_JUMP, second.operand));
+                    }
+                    ufolded = ufolded + 1;
+                    k = k + 2;
+                    continue;
+                }
+                if second.op == OP_JUMP_IF_TRUE {
+                    if _scalar_truthy(cval) {
+                        set_inst(chunk, k, make_inst(-1, 0));
+                        set_inst(chunk, k + 1, make_inst(OP_JUMP, second.operand));
+                    } else {
+                        set_inst(chunk, k, make_inst(-1, 0));
+                        set_inst(chunk, k + 1, make_inst(-1, 0));
+                    }
+                    ufolded = ufolded + 1;
+                    k = k + 2;
+                    continue;
+                }
+            }
+        }
+        if first != nil and second != nil and k + 2 < chunk_len(chunk)
+           and not map_has(targets2, str(k + 2)) {
+            let third = inst_at(chunk, k + 2);
+            if third != nil and _pushes_bool(first.op)
+               and second.op == OP_NOT and third.op == OP_NOT {
+                set_inst(chunk, k + 1, make_inst(-1, 0));
+                set_inst(chunk, k + 2, make_inst(-1, 0));
+                ufolded = ufolded + 1;
+                k = k + 3;
+                continue;
+            }
+        }
+        k = k + 1;
+    }
+    if ufolded > 0 { _compact_and_remap(chunk); }
+    return folded + ufolded;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Pass 2: Dead code elimination
-// Remove unreachable instructions after OP_RETURN (conservative)
+// Remove unreachable instructions after OP_RETURN or unconditional OP_JUMP
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn dead_code_pass(chunk) {
@@ -349,7 +461,7 @@ fn dead_code_pass(chunk) {
     let n = chunk_len(chunk);
     while i < n {
         let inst = inst_at(chunk, i);
-        if inst != nil and inst.op == OP_RETURN {
+        if inst != nil and (inst.op == OP_RETURN or inst.op == OP_JUMP) {
             // Scan forward: mark instructions dead until we see a potential
             // entry point (OP_CLOSURE, OP_DEFINE_GLOBAL) or a jump target.
             let j = i + 1;
@@ -358,12 +470,12 @@ fn dead_code_pass(chunk) {
                 if nxt == nil { break; }
                 if nxt.op == OP_CLOSURE or nxt.op == OP_DEFINE_GLOBAL { break; }
                 if map_has(targets, str(j)) { break; }
-                // Mark dead (op == -1); compaction + jump remap happens below so
-                // surviving jumps don't shift onto the wrong target.
                 set_inst(chunk, j, make_inst(-1, 0));
                 removed = removed + 1;
                 j = j + 1;
             }
+            i = j;
+            continue;
         }
         i = i + 1;
     }
@@ -413,10 +525,19 @@ fn jump_optimization_pass(chunk) {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Pass 4: Strength reduction
-// Fold a numeric literal pair ending in zero, never an unknown stack value.
-// Algebraic identities on unknown values can suppress overloads/errors and
-// change floating-point behavior. Evaluate the actual operation instead.
+// Fold numeric literal identities (+0, -0, *0, *1, /1, *2^k), never an unknown
+// stack value (which could carry __add__/__sub__/__mul__ map overloads).
 // ═══════════════════════════════════════════════════════════════════════════════
+
+fn _is_pow2_num(v) {
+    if not is_number(v) or v < 2 or v != num_floor(v) { return false; }
+    let x = v;
+    while x > 1 {
+        if (x % 2) != 0 { return false; }
+        x = x / 2;
+    }
+    return true;
+}
 
 fn strength_reduction_pass(chunk) {
     let reduced = 0;
@@ -431,10 +552,19 @@ fn strength_reduction_pass(chunk) {
         let b = inst_at(chunk, i + 1);
         let op = inst_at(chunk, i + 2);
         if a.op == OP_CONSTANT and b.op == OP_CONSTANT
-           and (op.op == OP_ADD or op.op == OP_SUB or op.op == OP_MUL) {
+           and (op.op == OP_ADD or op.op == OP_SUB or op.op == OP_MUL or op.op == OP_DIV) {
+            let left = constant_at(chunk, a.operand);
             let right = constant_at(chunk, b.operand);
-            if is_number(right) and right == 0 {
-                let result = try_eval_binary(constant_at(chunk, a.operand), right, op.op);
+            let eligible = false;
+            if is_number(left) and is_number(right) {
+                if right == 0 and (op.op == OP_ADD or op.op == OP_SUB or op.op == OP_MUL) { eligible = true; }
+                elif left == 0 and (op.op == OP_ADD or op.op == OP_MUL) { eligible = true; }
+                elif right == 1 and (op.op == OP_MUL or op.op == OP_DIV) { eligible = true; }
+                elif left == 1 and op.op == OP_MUL { eligible = true; }
+                elif op.op == OP_MUL and (_is_pow2_num(right) or _is_pow2_num(left)) { eligible = true; }
+            }
+            if eligible {
+                let result = try_eval_binary(left, right, op.op);
                 if result != nil {
                     let idx = add_constant(chunk, result);
                     set_inst(chunk, i, make_inst(-1, 0));

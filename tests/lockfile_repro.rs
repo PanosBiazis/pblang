@@ -186,3 +186,49 @@ version = "0.1.0"
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn lockfile_local_sibling_paths_stay_portable_relative() {
+    let base = unique_temp_dir("pblang-lockfile-portable-rel");
+    let sibling_stdlib = base.join("pblang").join("stdlib");
+    let app_dir = base.join("my-app");
+    std::fs::create_dir_all(&sibling_stdlib).expect("create sibling stdlib");
+    std::fs::create_dir_all(&app_dir).expect("create app dir");
+
+    std::fs::write(
+        sibling_stdlib.join("math_ext.sapp"),
+        "fn twice(x) { return x * 2; }\nexport twice;\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        app_dir.join("pblang.toml"),
+        r#"[package]
+name = "portable-app"
+version = "0.1.0"
+
+[dependencies]
+stdlib = { paths = ["../pblang/stdlib", "stdlib"] }
+"#,
+    )
+    .unwrap();
+
+    let lock = generate_lockfile(&app_dir).expect("generate lockfile with sibling paths");
+    let serialized = write_lockfile(&lock).expect("serialize lockfile");
+    let stdlib_dep = lock.dependencies.get("stdlib").expect("stdlib locked dep");
+    assert_eq!(stdlib_dep.path, "../pblang/stdlib");
+    assert!(
+        !serialized.contains("/home/")
+            && !serialized.contains("/media/")
+            && !serialized.contains("/Users/")
+            && !serialized.contains("/tmp/"),
+        "lockfile leaked absolute path: {serialized}"
+    );
+
+    std::fs::write(app_dir.join("pblang.lock"), &serialized).unwrap();
+    let resolved = pblang_pm::resolve_import("stdlib:math_ext.sapp", Some(&app_dir), &base)
+        .expect("resolve stdlib import from relative lockfile path");
+    assert!(resolved.ends_with("math_ext.sapp"));
+
+    let _ = std::fs::remove_dir_all(&base);
+}

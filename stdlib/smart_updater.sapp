@@ -1,0 +1,272 @@
+// stdlib/smart_updater.sapp — 100% PBLang Smart Polymorphic Target Classifier,
+// SSRF & Archive Traversal Security Guard, Privacy Scrubber & CLI Bridge for
+// `pblang update` (v1.5.0).
+
+let FORMAT = "pblang.smart-updater.v1";
+
+fn _resolve_pblang_cli() {
+    if fs_exists("target/release/pblang") { return "./target/release/pblang"; }
+    if fs_exists("target/debug/pblang") { return "./target/debug/pblang"; }
+    let pb_home = try env_get("PBLANG_HOME") catch nil;
+    if type(pb_home) == "string" and len(pb_home) > 0 and fs_exists(pb_home + "/bin/pblang") {
+        return pb_home + "/bin/pblang";
+    }
+    return "pblang";
+}
+
+fn _scrub_prefix_seg(text, prefix, repl) {
+    let out = text;
+    let guard = 0;
+    while str_contains(out, prefix) and guard < 32 {
+        let parts = str_split(out, prefix);
+        let built = parts[0];
+        let k = 1;
+        while k < len(parts) {
+            let tail = parts[k];
+            let slash_parts = str_split(tail, "/");
+            let rebuilt_tail = "";
+            if len(slash_parts) > 1 {
+                let rest = [];
+                let m = 1;
+                while m < len(slash_parts) { array_push(rest, slash_parts[m]); m = m + 1; }
+                rebuilt_tail = repl + "/" + str_join(rest, "/");
+            } else {
+                rebuilt_tail = repl;
+            }
+            built = built + rebuilt_tail;
+            k = k + 1;
+        }
+        out = built;
+        guard = guard + 1;
+    }
+    return out;
+}
+
+// Scrub local home directories, mount roots, usernames, and hostnames from receipts/manifests.
+fn scrub_privacy_text(text) {
+    if type(text) != "string" { return ""; }
+    let out = text;
+    let home = try env_get("HOME") catch nil;
+    if type(home) == "string" and len(home) >= 3 {
+        out = str_replace_all(out, home, "~");
+    }
+    let user = try env_get("USER") catch nil;
+    if type(user) == "string" and len(user) >= 3 and user != "user" and user != "root" {
+        out = str_replace_all(out, "/" + "home/" + user, "~");
+        out = str_replace_all(out, "/" + "media/" + user, "<MEDIA>");
+        out = str_replace_all(out, "/" + "Users/" + user, "~");
+    }
+    let host = try env_get("HOSTNAME") catch nil;
+    if type(host) == "string" and len(host) >= 3 and host != "localhost" {
+        out = str_replace_all(out, host, "<HOST>");
+    }
+    out = _scrub_prefix_seg(out, "/" + "home/", "~");
+    out = _scrub_prefix_seg(out, "/" + "media/", "<MEDIA>");
+    out = _scrub_prefix_seg(out, "/" + "Users/", "~");
+    return out;
+}
+
+fn scrub_text(text) { return scrub_privacy_text(text); }
+
+// Validate archive relative entry path against traversal, leading slashes, NUL, and drive letters.
+fn validate_archive_entry_path(raw_path) {
+    if type(raw_path) != "string" or len(raw_path) == 0 or len(raw_path) > 1024 {
+        return map{ ok: false, reason: "empty or oversized archive entry path" };
+    }
+    if str_starts_with(raw_path, "/") or str_starts_with(raw_path, "\\") {
+        return map{ ok: false, reason: "forbidden leading slash in archive entry" };
+    }
+    if len(raw_path) >= 2 and str_slice(raw_path, 1, 2) == ":" {
+        return map{ ok: false, reason: "forbidden Windows drive prefix in archive entry" };
+    }
+    let i = 0;
+    while i < len(raw_path) {
+        let cp = strcharcodeat(raw_path, i);
+        if cp != nil and cp < 32 {
+            return map{ ok: false, reason: "NUL or control character in archive entry" };
+        }
+        i = i + 1;
+    }
+    let norm = str_replace_all(raw_path, "\\", "/");
+    let segs = str_split(norm, "/");
+    let clean = [];
+    let j = 0;
+    while j < len(segs) {
+        let sg = segs[j];
+        if sg == ".." {
+            return map{ ok: false, reason: "path traversal '..' in archive entry" };
+        }
+        if len(sg) > 0 and sg != "." {
+            array_push(clean, sg);
+        }
+        j = j + 1;
+    }
+    if len(clean) == 0 {
+        return map{ ok: false, reason: "archive entry normalized to empty path" };
+    }
+    return map{ ok: true, normalized: str_join(clean, "/") };
+}
+
+fn _parse_u8_dec(s) {
+    let n = parse_number(s);
+    if n == nil or n < 0 or n > 255 or num_floor(n) != n { return -1; }
+    return n;
+}
+
+// SSRF guard blocking non-HTTPS schemes and loopback/private/link-local/metadata endpoints.
+fn is_ssrf_blocked_url(url) {
+    if type(url) != "string" or not str_starts_with(url, "https://") {
+        return map{ blocked: true, reason: "only explicit https:// URLs are permitted" };
+    }
+    let rest = str_slice(url, 8, len(url));
+    let parts = str_split(rest, "/");
+    let auth = parts[0];
+    if len(auth) == 0 or str_contains(auth, "@") {
+        return map{ blocked: true, reason: "invalid or credential-bearing authority" };
+    }
+    let host = auth;
+    if str_starts_with(auth, "[") {
+        let br = str_split(str_slice(auth, 1, len(auth)), "]");
+        host = br[0];
+    } else {
+        let hp = str_split(auth, ":");
+        host = hp[0];
+    }
+    let low = str_lower(host);
+    if low == "localhost" or low == "::1" or low == "0:0:0:0:0:0:0:1"
+        or str_ends_with(low, ".localhost") or str_ends_with(low, ".local")
+        or str_ends_with(low, ".internal") or str_starts_with(low, "fe80:")
+        or str_starts_with(low, "fc") or str_starts_with(low, "fd") {
+        return map{ blocked: true, reason: "loopback or private IPv6/local hostname blocked" };
+    }
+    let oct = str_split(low, ".");
+    if len(oct) == 4 {
+        let o0 = _parse_u8_dec(oct[0]);
+        let o1 = _parse_u8_dec(oct[1]);
+        let o2 = _parse_u8_dec(oct[2]);
+        let o3 = _parse_u8_dec(oct[3]);
+        if o0 >= 0 and o1 >= 0 and o2 >= 0 and o3 >= 0 {
+            if o0 == 127 or o0 == 10 or o0 == 0
+                or (o0 == 172 and o1 >= 16 and o1 <= 31)
+                or (o0 == 192 and o1 == 168)
+                or (o0 == 169 and o1 == 254)
+                or (o0 == 100 and o1 >= 64 and o1 <= 127) {
+                return map{ blocked: true, reason: "private/loopback/link-local IPv4 blocked" };
+            }
+        }
+    }
+    return map{ blocked: false, host: host };
+}
+
+// Auto-detect polymorphic target kind without mutating disk.
+fn classify_target(target) {
+    let t = if target == nil or target == "" { "." } else { str(target) };
+    if t == "stdlib" { return "stdlib"; }
+    if t == "self" { return "self_toolchain"; }
+    let low = str_lower(t);
+    if str_ends_with(low, ".zip") or str_ends_with(low, ".tar.gz")
+        or str_ends_with(low, ".tgz") or str_ends_with(low, ".tar") {
+        return "archive";
+    }
+    if str_ends_with(low, ".sapp") or str_ends_with(low, ".sap") {
+        return "sapp_source";
+    }
+    if str_ends_with(low, ".pbck") {
+        return "pbck_artifact";
+    }
+    if str_ends_with(low, "pblang.toml") or str_ends_with(low, "pblang.lock") {
+        return "project";
+    }
+    if fs_exists(t) {
+        if fs_exists(t + "/pblang.toml") { return "project"; }
+        if fs_exists(t + "/MANIFEST.sha256.json") or fs_exists(t + "/installation.json") {
+            return "sealed_app";
+        }
+        let bytes = try fs_read_bytes(t) catch [];
+        if len(bytes) >= 4 and bytes[0] == 127 and bytes[1] == 69 and bytes[2] == 76 and bytes[3] == 70 {
+            return "elf_executable";
+        }
+        if len(bytes) >= 2 and bytes[0] == 35 and bytes[1] == 33 {
+            return "launcher_script";
+        }
+    }
+    return "project";
+}
+
+// Invoke `pblang update` with structured options and return the parsed JSON receipt.
+fn update_target(target = ".", options = nil) {
+    let opts = if type(options) == "map" { options } else { map{} };
+    let cli = _resolve_pblang_cli();
+    let argv = ["update"];
+    if type(target) == "array" {
+        let k = 0;
+        while k < len(target) {
+            array_push(argv, str(target[k]));
+            k = k + 1;
+        }
+    } elif type(target) == "string" and len(target) > 0 {
+        array_push(argv, target);
+    }
+    array_push(argv, "--json");
+    if map_has(opts, "dry_run") and opts["dry_run"] == true { array_push(argv, "--dry-run"); }
+    if map_has(opts, "check") and opts["check"] == true { array_push(argv, "--check"); }
+    if map_has(opts, "rollback") and opts["rollback"] == true { array_push(argv, "--rollback"); }
+    if map_has(opts, "from") and type(opts["from"]) == "string" and len(opts["from"]) > 0 {
+        array_push(argv, "--from");
+        array_push(argv, opts["from"]);
+    }
+    if map_has(opts, "expected_sha256") and type(opts["expected_sha256"]) == "string" {
+        array_push(argv, "--expected-sha256");
+        array_push(argv, opts["expected_sha256"]);
+    }
+    if map_has(opts, "pubkey") and type(opts["pubkey"]) == "string" {
+        array_push(argv, "--pubkey");
+        array_push(argv, opts["pubkey"]);
+    }
+    if map_has(opts, "install_root") and type(opts["install_root"]) == "string" {
+        array_push(argv, "--install-root");
+        array_push(argv, opts["install_root"]);
+    }
+    if map_has(opts, "bin_dir") and type(opts["bin_dir"]) == "string" {
+        array_push(argv, "--bin-dir");
+        array_push(argv, opts["bin_dir"]);
+    }
+    let res = proc_spawn_wait(cli, argv);
+    let parsed = try json_parse(res.stdout) catch nil;
+    return map{
+        ok: res.exit_code == 0 or (map_has(opts, "check") and opts["check"] == true and res.exit_code == 2),
+        exit_code: res.exit_code,
+        receipt: parsed,
+        stdout: scrub_privacy_text(res.stdout),
+        stderr: scrub_privacy_text(res.stderr)
+    };
+}
+
+fn check_target(target = ".", options = nil) {
+    let base = if type(options) == "map" { options } else { map{} };
+    base["check"] = true;
+    return update_target(target, base);
+}
+
+fn rollback_target(target = ".", options = nil) {
+    let base = if type(options) == "map" { options } else { map{} };
+    base["rollback"] = true;
+    return update_target(target, base);
+}
+
+fn validate_remote_source_url(url, expected_sha256 = "", pubkey = "") {
+    let ssrf = is_ssrf_blocked_url(url);
+    if ssrf.blocked {
+        return map{ ok: false, reason: ssrf.reason };
+    }
+    let has_sha = type(expected_sha256) == "string" and len(expected_sha256) == 64;
+    let has_pk = type(pubkey) == "string" and len(pubkey) == 64;
+    if not has_sha and not has_pk {
+        return map{ ok: false, reason: "remote https:// source requires --expected-sha256 or --pubkey" };
+    }
+    return map{ ok: true, host: ssrf.host };
+}
+
+export FORMAT, scrub_privacy_text, scrub_text, validate_archive_entry_path,
+       is_ssrf_blocked_url, validate_remote_source_url,
+       classify_target, update_target, check_target, rollback_target;

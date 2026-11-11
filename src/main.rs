@@ -186,6 +186,11 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Smart polymorphic atomic updater for projects, .sapp/.pbck, launchers, archives, stdlib, and self
+    Update {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 fn clear_terminal() {
@@ -1135,6 +1140,7 @@ fn show_help() {
     println!("  pblang --lock [--registry-index <url>] [--require-registry-sha256] [path]  Generate pblang.lock; registry SHA-256 is always required (legacy flag retained)");
     println!("  pblang build [--registry-index <url>] [--require-registry-sha256] [path]  Generate lockfile + typecheck main entry; registry SHA-256 is always required");
     println!("  pblang install [--registry-index <url>] [--require-registry-sha256] [path | <name>@<version>]  Install into cache; registry SHA-256 is always required");
+    println!("  pblang update [targets...] [--dry-run] [--check] [--rollback] [--from <path>] [--pubkey <hex>] [--expected-sha256 <hex>] [--json]  Smart polymorphic atomic updater (project/lockfile, .sapp/.pbck, launchers/ELF/apps, .zip/.tar.gz/.tar, stdlib, self)");
     println!("  pblang manifest-check [path]  Validate pblang.toml using pblang stdlib validator and print JSON report");
     println!("  pblang manifest-parity [path]  Compare Rust and pblang manifest parsing/validation and print parity JSON report");
     println!("  env PBLANG_STRICT_MANIFEST_VALIDATOR=1  Fail manifest-based commands when pblang-side validator reports errors");
@@ -1686,6 +1692,7 @@ fn run_cli() {
             Some(Commands::Run { args }) => return handle_run(args),
             Some(Commands::Compile { args }) => return handle_compile(args),
             Some(Commands::BuildPolyglot { args }) => return handle_build_polyglot(args),
+            Some(Commands::Update { args }) => return cli::update::handle_update(args),
             // No subcommand given -> fall through to legacy (REPL path etc.).
             None => {}
         },
@@ -5436,6 +5443,11 @@ fn legacy_dispatch(args: Vec<String>) {
 
     if args.first().map(|s| s.as_str()) == Some("build-polyglot") {
         cli::build_polyglot::handle_build_polyglot(args);
+        return;
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("update") {
+        cli::update::handle_update(args.into_iter().skip(1).collect());
         return;
     }
 

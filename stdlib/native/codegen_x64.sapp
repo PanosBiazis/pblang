@@ -452,6 +452,10 @@ fn _ge(node, code, slots, calls) {
         // constant). Big win for the ubiquitous `x OP const` (fib's n-1, n-2, n<2).
         if node.right.kind == "number" {
             let val = parse_number(node.right.value);
+            if val == 0 and not _ovf_state.on and (op == "+" or op == "-") {
+                _ge(node.left, code, slots, calls);
+                return true;
+            }
             _ge(node.left, code, slots, calls);
             push(code, 88);                                                  // pop rax  (left)
             if op == "+" { if val >= 0 and val <= 127 { push(code, 72); push(code, 131); push(code, 192); push(code, val); } else { push(code, 72); push(code, 5); _elf.le(code, val, 4); } _ovf(code); push(code, 80); return true; }   // add rax, imm8/imm32
@@ -593,12 +597,23 @@ fn _emit_mul_const(code, val) {
     if val == 1 { return; }                                                     // x*1 = x (no-op)
     // In overflow-check mode the shl/lea strength reductions are skipped: they don't set OF, so a checked
     // multiply must use imul (which does) + the `jno;ud2` trap. Correctness (safe mode) beats the peephole.
-    if not _ovf_state.on and val > 1 {
-        let sh = _log2_pow2(val);
-        if sh >= 0 { push(code, 72); push(code, 193); push(code, 224); push(code, sh); return; }  // shl rax, k  (x*2^k)
-        if val == 3 { push(code, 72); push(code, 141); push(code, 4); push(code, 64);  return; }  // lea rax,[rax+rax*2]  (x*3)
-        if val == 5 { push(code, 72); push(code, 141); push(code, 4); push(code, 128); return; }  // lea rax,[rax+rax*4]  (x*5)
-        if val == 9 { push(code, 72); push(code, 141); push(code, 4); push(code, 192); return; }  // lea rax,[rax+rax*8]  (x*9)
+    if not _ovf_state.on {
+        if val == 0 - 1 { push(code, 72); push(code, 247); push(code, 216); return; }  // neg rax (x * -1)
+        if val > 1 {
+            let sh = _log2_pow2(val);
+            if sh >= 0 and sh <= 62 { push(code, 72); push(code, 193); push(code, 224); push(code, sh); return; }  // shl rax, k  (x*2^k)
+            if val == 3 { push(code, 72); push(code, 141); push(code, 4); push(code, 64);  return; }  // lea rax,[rax+rax*2]  (x*3)
+            if val == 5 { push(code, 72); push(code, 141); push(code, 4); push(code, 128); return; }  // lea rax,[rax+rax*4]  (x*5)
+            if val == 9 { push(code, 72); push(code, 141); push(code, 4); push(code, 192); return; }  // lea rax,[rax+rax*8]  (x*9)
+        }
+        if val < 0 - 1 {
+            let nsh = _log2_pow2(0 - val);
+            if nsh >= 0 and nsh <= 62 {
+                push(code, 72); push(code, 193); push(code, 224); push(code, nsh); // shl rax, k
+                push(code, 72); push(code, 247); push(code, 216);                  // neg rax
+                return;
+            }
+        }
     }
     push(code, 72); push(code, 105); push(code, 192); _elf.le(code, val, 4);     // imul rax, rax, imm32 (fast default)
     _ovf(code);
@@ -608,6 +623,15 @@ fn _fold(node) {
     if k == "unary" {
         let o = _fold(node.operand);
         if node.op == "-" and o.kind == "number" { return _numlit(0 - parse_number(o.value)); }
+        if node.op == "-" and not _ovf_state.on and o.kind == "unary" and o.op == "-" { return o.operand; }
+        if (node.op == "not" or node.op == "!") and o.kind == "number" {
+            if parse_number(o.value) == 0 { return _numlit(1); }
+            return _numlit(0);
+        }
+        if (node.op == "not" or node.op == "!") and o.kind == "bool" {
+            if o.value { return _numlit(0); }
+            return _numlit(1);
+        }
         return map{ kind: "unary", op: node.op, operand: o };
     }
     if k == "binary" {
@@ -636,11 +660,38 @@ fn _fold(node) {
             if op == "+" and rv == 0 { return l; }
             if op == "-" and rv == 0 { return l; }
             if op == "*" and rv == 1 { return l; }
+            // Associative constant reassociation: (x + c1) + c2 → x + (c1 + c2), (x * c1) * c2 → x * (c1 * c2)
+            if not _ovf_state.on and l.kind == "binary" and l.right.kind == "number" {
+                let c1 = parse_number(l.right.value);
+                if op == "+" and l.op == "+" {
+                    let s = c1 + rv;
+                    if s >= 0 - 1073741824 and s <= 1073741823 {
+                        if s == 0 { return l.left; }
+                        return map{ kind: "binary", op: "+", left: l.left, right: _numlit(s) };
+                    }
+                }
+                if op == "-" and l.op == "-" {
+                    let s = c1 + rv;
+                    if s >= 0 - 1073741824 and s <= 1073741823 {
+                        if s == 0 { return l.left; }
+                        return map{ kind: "binary", op: "-", left: l.left, right: _numlit(s) };
+                    }
+                }
+                if op == "*" and l.op == "*" {
+                    let p = c1 * rv;
+                    if p >= 0 - 1073741824 and p <= 1073741823 {
+                        if p == 1 { return l.left; }
+                        return map{ kind: "binary", op: "*", left: l.left, right: _numlit(p) };
+                    }
+                }
+            }
         }
         if l.kind == "number" {
             let lv = parse_number(l.value);
             if op == "+" and lv == 0 { return r; }
             if op == "*" and lv == 1 { return r; }
+            // Normalize `c * expr` → `expr * c` so immediate/shift/lea fast paths always trigger!
+            if op == "*" and r.kind != "number" { return map{ kind: "binary", op: "*", left: r, right: l }; }
             // 0 - x  →  -x  (a single `neg` instead of `mov rax,0; ...; sub`). Safe: x is still evaluated,
             // so any side effect in x is preserved (unlike x*0 → 0, which we do NOT fold).
             if op == "-" and lv == 0 { return map{ kind: "unary", op: "-", operand: r }; }
@@ -1887,12 +1938,19 @@ fn _ge_rax(node0, code, slots, calls) {
             if op == "%" { push(code, 72); push(code, 137); push(code, 208); }  // mov rax, rdx (remainder)
             return true;
         }
+        if op == "+" and node.left.kind == "number" and node.right.kind != "number" {
+            return _ge_rax(map{ kind: "binary", op: "+", left: node.right, right: node.left }, code, slots, calls);
+        }
         if node.right.kind == "number" {
             let val = parse_number(node.right.value);
             // These folds all use a 32-bit immediate (add/sub/cmp sign-extend it; lea disp is 32-bit; imul
             // imm32). A constant outside signed-32 range would be truncated, so only fold when it FITS —
             // otherwise fall through to the general path, which materialises the constant with movabs (exact).
             if val >= 0 - 2147483648 and val <= 2147483647 {
+                if val == 0 and not _ovf_state.on and (op == "+" or op == "-") {
+                    _ge_rax(node.left, code, slots, calls);
+                    return true;
+                }
                 // LEA FOLD: `regvar ± const` → one `lea rax, [reg±disp]` (saves the mov+add). Only for a left
                 // operand already pinned to a register (r12/r13/r14) and only for +/- (lea can't multiply here).
                 if (op == "+" or op == "-") and node.left.kind == "ident" {

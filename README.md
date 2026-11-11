@@ -2,15 +2,15 @@
 
 <img src="assets/brand/icon.svg" width="96" height="96" alt="PBLang icon" />
 
-# PBLang `1.4.0`
+# PBLang `1.5.0`
 
 **Full-Stack, Systems & Security-Focused Programming Language & Multi-Backend Toolchain.**  
-*Write `.sapp` programs targeting the capability-gated bytecode VM, portable `C99`, native subset compilers (`x86-64 ELF64`, `ARM64 ELF64`, `WebAssembly`), desktop/web UI surfaces, and embedded targets.*
+*Write `.sapp` programs targeting the capability-gated bytecode VM, standalone pure-C99 Zero-Rust `.pbck` VM, portable `C99`, native subset compilers (`x86-64 ELF64`, `ARM64 ELF64`, `WebAssembly`), scientific/quantum/PQC workloads, desktop/web UI surfaces, and embedded targets.*
 
-[![Release](https://img.shields.io/badge/release-v1.4.0-0A84FF?style=for-the-badge)](https://github.com/PanosBiazis/pblang/releases/tag/v1.4.0)
+[![Release](https://img.shields.io/badge/release-v1.5.0-0A84FF?style=for-the-badge)](https://github.com/PanosBiazis/pblang/releases/tag/v1.5.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2EA043?style=for-the-badge)](LICENSE)
-[![Backends](https://img.shields.io/badge/Backends-VM_%7C_C99_%7C_x64_%7C_ARM64_%7C_WASM_%7C_PBCK-8A2BE2?style=for-the-badge)](#100-pblang-native-compilation-x64-arm64-wasm-pbck)
-[![TLS 1.3](https://img.shields.io/badge/TLS_1.3-rustls_%2B_ring_Built--In-FF6B00?style=for-the-badge)](#architecture--implemented-surface)
+[![Backends](https://img.shields.io/badge/Backends-VM_%7C_Zero--Rust_PBCK_%7C_C99_%7C_x64_%7C_ARM64_%7C_WASM-8A2BE2?style=for-the-badge)](#100-pblang-native-compilation-x64-arm64-wasm-pbck)
+[![TLS 1.3 & PQC](https://img.shields.io/badge/Crypto-TLS_1.3_%2B_FIPS_203_ML--KEM--768-FF6B00?style=for-the-badge)](#architecture--implemented-surface)
 [![Security](https://img.shields.io/badge/Security-Capability_Sandbox_%2B_Static_Taint-00C7B7?style=for-the-badge)](SECURITY.md)
 
 [Quick Start](#quick-start) · [Why PBLang?](#why-pblang) · [Examples](examples) · [Documentation](docs) · [Tests](tests) · [Security Policy](SECURITY.md) · [Changelog](CHANGELOG.md) · [Releases](https://github.com/PanosBiazis/pblang/releases)
@@ -21,18 +21,18 @@
 
 ## Why PBLang?
 
-**PBLang (`1.4.0`, Edition 2026)** pairs a fast, capability-gated Rust bytecode VM (`pblang-vm` with automatic cycle GC, out-of-the-box `ring` TLS 1.3, and usable `--sandbox` isolation) with a rich pure-PBLang standard library, self-hosted compiler pipeline, native subset code generators, declarative UI builders, and deterministic hardware emulators:
+**PBLang (`1.5.0`, Edition 2026)** pairs a fast, capability-gated Rust bytecode VM (`pblang-vm` with automatic cycle GC, out-of-the-box `ring` TLS 1.3, and usable `--sandbox` isolation) and a standalone Stage-3 Zero-Rust C99 `.pbck` VM (`pblang-zero-rust`) with an optimizing pure-PBLang compiler pipeline, polymorphic `pblang update` toolchain/project updater, scientific/quantum/bioinformatics/post-quantum cryptography standard library modules, declarative UI builders, and deterministic hardware emulators:
 
 | Pillar | Capability Highlights | Key Modules |
 | :--- | :--- | :--- |
-| **1. Production Bytecode VM & Multi-Backend Compilers** | Rust host VM (`pblang-vm`) with automatic trial-deletion/root-tracing cycle GC across arrays, maps, modules, upvalues, and closures, plus pure-PBLang self-hosted compilers (`selfhost_vm`, `selfhost_interp`, `native_pbck`, `c99_transpiler`, and numeric/subset emitters for `x86_64_elf`, `arm64_elf`, and `wasm32`). | `crates/pblang-vm/`, `tools/pbc.sapp`, `stdlib/compiler/backend_parity.sapp` |
+| **1. Production Bytecode VM, Zero-Rust `.pbck` VM & Optimizing Compilers** | Rust host VM (`pblang-vm`) with automatic cycle GC, standalone pure-C99 `.pbck` stack VM (`runtime_stage3/pblang_zero_rust_vm.c`, zero Rust dependencies), and optimizing pure-PBLang compilers (`optimizer.sapp`, `codegen_x64.sapp`, `native_pbck.sapp`, `ctranspile.sapp`, `arm64_elf`, `wasm32`). | `crates/pblang-vm/`, `runtime_stage3/pblang_zero_rust_vm.c`, `stdlib/compiler/optimizer.sapp`, `tools/pbc.sapp` |
 | **2. Usable `--sandbox` & Out-of-the-Box TLS 1.3** | `pblang run script.sapp --sandbox` permits canonicalized, traversal-safe `stdlib:...` imports while denying filesystem, network, HTTP, SQLite, FFI, subprocess, spawn, and env access; `stdlib/tls.sapp` works out of the box via built-in `rustls` + `ring` TLS 1.3. | `src/main.rs`, `crates/pblang-vm/src/vm/net.rs`, `stdlib/tls.sapp` |
 | **3. Declarative UI & Multi-Surface Builders** | Build Desktop (`X11`), Hardened Web (`CSP/HSTS`), Android (`APK/DEX`), CLI, and TUI surfaces from declarative view trees (`stdlib/modern_ui.sapp`, `stdlib/app.sapp`). | `stdlib/modern_ui.sapp`, `stdlib/app.sapp`, `stdlib/flagship_default_ui_engine.sapp` |
 | **4. Safe Linux Descriptor-Anchored File & Process Ops** | Race-resistant directory-descriptor file operations (`openat` / `O_NOFOLLOW`, `stdlib/linux_dirfs.sapp`, `stdlib/secure_file.sapp`), `pidfd` signaling (`stdlib/linux_pidfd.sapp`), and shell-free `execve` process supervision (`stdlib/linux_process.sapp`). | `stdlib/secure_file.sapp`, `stdlib/linux_dirfs.sapp`, `stdlib/linux_process.sapp` |
 | **5. Deterministic Hardware Emulators & Embedded AVR8** | Pure-PBLang register-level device emulators (`Arduino Uno R4 WiFi`, `ESP32-D`, `Bosch BME688`, `3D Printer/CNC G-code`, `NFC/BLE`, `Stylus/TouchBoard`) and direct ATmega328P AVR8 firmware emission. | `emulators/hardware_emulators_suite.sapp`, `stdlib/embedded.sapp` |
-| **6. Zero-Trust Security & Cryptography** | Capability-gated FFI/FS/Net/Exec, default-on static build security analysis, pure-PBLang OpenBSD `$2b$` Bcrypt, RFC 7636 OIDC/SSO PKCE, and AES-256-GCM archives. | `stdlib/tls.sapp`, `stdlib/password_bcrypt.sapp`, `stdlib/oidc_sso.sapp`, `stdlib/secure_archive.sapp` |
-| **7. Native CPU Tensors, Float Quantization & ONNX Subset** | Deterministic multi-core `f64` `tensor_matmul` (with opt-in `wgpu` `f32` offload), arbitrary-width `fN` quantization (`stdlib/floatn.sapp`), and bounded pure-PBLang CPU ONNX inference (`stdlib/onnx.sapp`). | `stdlib/onnx.sapp`, `stdlib/floatn.sapp`, `stdlib/gguf.sapp` |
-| **8. Self-Hosted IDE, Formatter, Linter, LSP & Lockfiles** | Built-in Language Server (`pblang lsp`), Native IDE (`pblang --ide`, `editors/ide/pbide.sapp`), formatter (`pblang fmt`), linter (`pblang lint`), and content-addressed package lockfiles (`pblang.lock`). | `editors/ide/pbide.sapp`, `tools/pblock.sapp`, `stdlib/manifest_validate.sapp` |
+| **6. Zero-Trust Security & Post-Quantum Cryptography** | Capability-gated FFI/FS/Net/Exec, default-on static build security analysis, NIST FIPS 202 `SHA-3`/`SHAKE` & FIPS 203 `ML-KEM-768` (`stdlib/pqc_mlkem768.sapp`), OpenBSD `$2b$` Bcrypt, RFC 7636 OIDC/SSO PKCE, and AES-256-GCM archives. | `stdlib/pqc_mlkem768.sapp`, `stdlib/tls.sapp`, `stdlib/password_bcrypt.sapp`, `stdlib/secure_archive.sapp` |
+| **7. Scientific, Quantum QPU, DNA & Native Tensor Computing** | 24 first-principles algorithms (`stdlib/algorithms_24.sapp`), `1..20`-qubit statevector simulator + Grover/VQE + OpenQASM 3.0/Cirq + IBM/Google Cloud QPU clients (`stdlib/quantum_computing.sapp`), DNA alignment & De Bruijn assembly (`stdlib/bioinformatics_dna.sapp`), and CPU ONNX (`stdlib/onnx.sapp`). | `stdlib/algorithms_24.sapp`, `stdlib/quantum_computing.sapp`, `stdlib/bioinformatics_dna.sapp`, `stdlib/onnx.sapp` |
+| **8. Smart Polymorphic `pblang update`, Portable Lockfiles, IDE & LSP** | Polymorphic `pblang update [self\|workspace\|file\|dir]` (`src/cli/update.rs`, `stdlib/smart_updater.sapp`), portable relative `pblang.lock` resolution, built-in LSP (`pblang lsp`), Native IDE (`pblang --ide`), formatter (`pblang fmt`), and linter (`pblang lint`). | `src/cli/update.rs`, `stdlib/smart_updater.sapp`, `crates/pblang-pm/`, `editors/ide/pbide.sapp` |
 | **9. Guarded Polyglot Interop** | Audit and run structured `polyglot` blocks (`stdlib/polyglot.sapp`, `stdlib/polyglot_guard.sapp`) with explicit `exec` capability gating and pre-flight dependency checks. | `stdlib/polyglot.sapp`, `stdlib/polyglot_guard.sapp` |
 | **10. Binary Inspection & Unicode/Supply-Chain Guards** | Pure-PBLang ELF64/PE32+/Mach-O/WASM format inspectors (`stdlib/rea_suite.sapp`), Trojan Source Bidi & invisible Unicode scanners (`stdlib/parseltongue.sapp`), and hermetic zero-hook manifests. | `stdlib/rea_suite.sapp`, `stdlib/parseltongue.sapp`, `stdlib/safety_guard.sapp` |
 
@@ -87,18 +87,37 @@ let cfg   = REA.rea_decompile_cfg(map{ instructions: ["push rbp", "mov rbp, rsp"
 print cfg.pseudocode;
 ```
 
+#### E. Quantum Circuits, Post-Quantum `ML-KEM-768` & Bioinformatics (`stdlib:quantum_computing.sapp`, `stdlib:pqc_mlkem768.sapp`)
+Simulate exact statevectors, run Grover's search or Ising VQE (with OpenQASM 3.0 / Cirq export and optional IBM/Google QPU submission), and establish NIST FIPS 203 `ML-KEM-768` post-quantum shared secrets:
+
+```pblang
+let QC  = import("stdlib:quantum_computing.sapp");
+let PQC = import("stdlib:pqc_mlkem768.sapp");
+
+let grover = QC.grover_search(4, 11, nil);
+assert(grover.top_state == 11 and grover.target_probability > 0.95);
+
+let kp  = PQC.mlkem768_keygen("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f");
+let enc = PQC.mlkem768_encaps(kp.ek_hex, "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210");
+let dec = PQC.mlkem768_decaps(kp.dk_hex, enc.ct_hex);
+assert(dec.shared_secret_hex == enc.shared_secret_hex);
+```
+
 ---
 
 ## Architecture & Implemented Surface
 
-### Primary Production Surface (`1.4.0`)
+### Primary Production Surface (`1.5.0`)
 
 - **Rust Bytecode VM (`crates/pblang-vm`) & Tree Interpreter** with closures, lexical upvalue cells, modules, structured `try`/`catch`/`defer` unwinding, arrays/maps, automatic trial-deletion + root-tracing cycle GC across all reference types (including self-capturing closures), and runtime diagnostics.
-- **Parser, compiler, type checker, linter, formatter, Self-Healing Compiler Advisor, and CLI**.
+- **Stage-3 Zero-Rust Native `.pbck` Stack VM (`runtime_stage3/pblang_zero_rust_vm.c`, `pblang-zero-rust`)**: standalone pure-C99 bytecode VM executing `PBCK\x01` chunks emitted by `tools/pbc.sapp --target pbck` with functions, recursion, arrays, maps, `try`/`catch`/`throw` unwinding, mark-and-sweep GC, and core builtins — compiled directly with a system C99 compiler and zero Rust dependencies.
+- **Smart Polymorphic `pblang update` & Portable Relative Lockfiles (`src/cli/update.rs`, `crates/pblang-pm`, `stdlib/smart_updater.sapp`)**: unified updater across `self` release bundles, `pblang.toml` workspaces, standalone `.sapp` scripts, git repositories, and project directories with portable relative `pblang.lock` paths, `pblang-package-tree-v2` SHA-256 verification, atomic `.bak` rollback, and privacy/hygiene guards.
+- **Parser, optimizing compiler (`stdlib/compiler/optimizer.sapp`), type checker, linter, formatter, Self-Healing Compiler Advisor, and CLI**.
 - **Capability-based sandboxing & embedding controls** through `StdlibConfig` (including `stdlib_import` for safe `--sandbox` execution of trusted `stdlib:...` modules), `VmLimits`, and fail-closed `FfiPolicy`.
-- **Built-in TLS 1.3 (`rustls` + `ring`)** initialized automatically at startup and on first TLS socket call (`stdlib:tls.sapp` `listen` / `listen_tls` / `connect` / `connect_tls` / `wrap_tls`).
+- **Built-in TLS 1.3 (`rustls` + `ring`) & Post-Quantum Cryptography (`stdlib:pqc_mlkem768.sapp`)**: automatic TLS 1.3 provider initialization (`stdlib:tls.sapp`) alongside pure-PBLang NIST FIPS 202 `SHA-3`/`SHAKE` and FIPS 203 `ML-KEM-768` key encapsulation.
+- **Scientific, Algorithmic, Quantum & Bioinformatics Modules**: 24 first-principles algorithms + topological Betti invariants + portfolio meta-solver (`stdlib:algorithms_24.sapp`), `1..20`-qubit statevector simulator + Grover/VQE + OpenQASM 3.0/Cirq + IBM/Google Quantum cloud REST clients (`stdlib:quantum_computing.sapp`), and Needleman-Wunsch / Smith-Waterman / ORF / De Bruijn assembly (`stdlib:bioinformatics_dna.sapp`).
 - **Default-on PBLang-native build security analysis** with audited scoped suppressions, `protect`/`strict`/`audit` modes, bounded custom rules, and an explicit opt-out. Selectable quality/performance/completeness analysis is available separately through `pbanalyze`; see [source security and analysis](docs/Security_Analysis.md).
-- **Package manager** with manifests (`pblang.toml`), content-addressed lockfiles (`pblang.lock`), SPDX license compatibility checks, 3-color DFS cycle detection, and publisher release attestations.
+- **Package manager** with manifests (`pblang.toml`), portable relative content-addressed lockfiles (`pblang.lock`), SPDX license compatibility checks, 3-color DFS cycle detection, and publisher release attestations.
 - **Standard library** for files, paths, JSON, strings, arrays, maps, HTTP helpers, bounded memory/SQLite/Redis data stores, provider-neutral edge/regional CDN caching, native SQLite, bounded native Parquet metadata/PLAIN-page reading, crypto, threading, async-style helpers, testing, templates, logging, regex, tensors, and more. `stdlib:onnx.sapp` provides bounded deterministic ONNX protobuf decoding and PBLang-native CPU inference for a documented operator subset, failing closed on unsupported models without Python or ONNX Runtime. `stdlib:command_argv.sapp` converts legacy command text to bounded literal argv without shell evaluation and rejects operators, redirects, substitutions, comments and controls; new APIs should accept structured argv directly. See [data storage](docs/Data_Storage.md) and [CDN caching](docs/CDN_Caching.md).
 - **Portable coding-agent skills** through `stdlib:agent_skills.sapp`: bounded `SKILL.md` frontmatter/body parsing, strict portable names and metadata, compatibility reports, effect-indicator review, and deterministic in-memory bundles. It performs no discovery, file access, placeholder expansion, plugin loading, hook registration, or command execution.
 - **Bounded identity and organization policy** through `stdlib:iam.sapp`: users, organizations, memberships, system administrators, `owner`/`admin`/`member`/`viewer` RBAC, explicit permissions, tenant-scoped queries, and last-owner/last-admin invariants.
@@ -106,8 +125,8 @@ print cfg.pseudocode;
 - **Strict cron expressions** through `stdlib:cron.sapp` and **carrier-independent transport guard** through `stdlib:transport_security.sapp`.
 - **LSP server** with diagnostics, completions, hover, goto-definition, workspace symbols, and semantic tokens.
 - **Native pblang IDE** via `pblang --ide`: code editor, Rope buffer & symbol indexer, terminal, visual designer, optional pbAI panel (external [pbai](https://github.com/PanosBiazis/pbai) checkout via `PBAI_HOME`), and pblang-native browser panel.
-- **Self-hosted compiler pipeline & native subset codegens** under `stdlib/compiler/` and `stdlib/native/` (`codegen_x64.sapp`, `codegen_x64_tier1.sapp`, `codegen_arm64_ast.sapp`, `codegen_wasm.sapp`, `ctranspile.sapp`).
-- **Experimental Direct-Syscall Smoke Stub & In-VM Kernel Prototypes (`runtime_stage3/`)**: `stage3_native_host_runtime.sapp` emits a minimal standalone Linux `x86-64` syscall smoke-test ELF64 stub (`artifact_kind: "minimal_elf64_syscall_smoke_stub"`, `is_full_language_runtime: false`), and `deep_runtime_kernel.sapp` exercises in-VM simulations (`mode: "in_vm_simulation"`) of slab allocation, tricolor cycle collection, and small numerical kernels. They are prototype building blocks, not replacements for the Rust `pblang-vm` host.
+- **Self-hosted compiler pipeline & optimizing native subset codegens** under `stdlib/compiler/` and `stdlib/native/` (`optimizer.sapp`, `codegen_x64.sapp`, `codegen_x64_tier1.sapp`, `codegen_arm64_ast.sapp`, `codegen_wasm.sapp`, `ctranspile.sapp`).
+- **Stage-3 Zero-Rust `.pbck` VM, Direct-Syscall Smoke Stub & In-VM Kernel Prototypes (`runtime_stage3/`)**: `pblang_zero_rust_vm.c` provides a real standalone C99 stack VM for `.pbck` bytecode chunks (`build_zero_rust_pbck_vm` / `run_pbck_on_zero_rust_vm` in `stage3_native_host_runtime.sapp`), alongside the minimal Linux `x86-64` syscall smoke-test ELF64 stub (`artifact_kind: "minimal_elf64_syscall_smoke_stub"`, `is_full_language_runtime: false`) and `deep_runtime_kernel.sapp` in-VM allocator/GC/kernel simulations (`mode: "in_vm_simulation"`).
 
 ### Reproducible Live Benchmarks vs. Synthetic Catalog Models
 
@@ -144,27 +163,27 @@ pblang run tests/safety_test.sapp --allow-all
 
 ```mermaid
 flowchart LR
-    A[".sapp Source & pblang.toml"] --> B["Supply-Chain & Bidi Guard\n(pblang.lock SHA-256 + Zero Hooks)"]
+    A[".sapp Source & pblang.toml"] --> B["Supply-Chain & Bidi Guard\n(Portable pblang.lock SHA-256 + Zero Hooks)"]
     B --> C["Static AST Taint & Safety Analyzer\n(Bounds, Init, Capability Attenuation)"]
-    C --> D["Bytecode Compiler / Self-Hosted IR\n(Typecheck + Constant Folding)"]
+    C --> D["Optimizing Bytecode / Self-Hosted IR\n(Const Dedup, Branch Fold, Strength Reduction)"]
     D --> E1["Rust Bytecode VM (pblang-vm)\n(Auto Cycle GC + TLS 1.3 + --sandbox)"]
-    D --> E2["Portable C99 Transpiler\n(pb_div_checked / pb_mod_checked)"]
-    D --> E3["Subset Native Emitters\n(x86-64 ELF64, ARM64 ELF64, WASM32, PBCK)"]
+    D --> E2["Zero-Rust C99 .pbck VM & C99 Transpiler\n(pblang-zero-rust + pb_div_checked)"]
+    D --> E3["Optimizing Native Emitters\n(x86-64 ELF64, ARM64 ELF64, WASM32, PBCK)"]
 ```
 
 ## Repository Directory Map
 
 | Directory | Contents & Guide |
 | :--- | :--- |
-| [`stdlib/`](stdlib) | Self-hosted standard library, native `x64`/`ARM64`/`WASM`/`C99` compilers (`stdlib/compiler/`, `stdlib/native/`), UI (`modern_ui.sapp`), AI (`onnx.sapp`, `ai/`), cryptography (`tls.sapp`), and safety (`safety_guard.sapp`). |
+| [`stdlib/`](stdlib) | Self-hosted standard library, optimizing `x64`/`ARM64`/`WASM`/`C99` compilers (`stdlib/compiler/`, `stdlib/native/`), 24 algorithms (`algorithms_24.sapp`), quantum (`quantum_computing.sapp`), DNA (`bioinformatics_dna.sapp`), PQC (`pqc_mlkem768.sapp`), smart updater (`smart_updater.sapp`), UI (`modern_ui.sapp`), AI (`onnx.sapp`), crypto (`tls.sapp`), and safety (`safety_guard.sapp`). |
 | [`docs/`](docs) | [Documentation Hub (`docs/README.md`)](docs/README.md) — Language reference, security/safety contracts, embedded/OS guides, and [`docs/reports/`](docs/reports). |
 | [`examples/`](examples) | [Runnable Examples & Demos (`examples/README.md`)](examples/README.md) — `.sapp` examples across security, GUI/Web/Android, AI, and [`examples/demos/`](examples/demos). |
 | [`bench/`](bench) | [Benchmark Suite (`bench/README.md`)](bench/README.md) — Live OS process matrix (`reproducible_core_matrix.sapp`) and synthetic catalog models (`omni_bench.sapp`). |
-| [`tests/`](tests) | [Verification Suite (`tests/README.md`)](tests/README.md) — Rust unit/integration tests, memory/supply-chain safety (`safety_test.sapp`), benchmark honesty (`omni_bench_test.sapp`), and semantics tests. |
+| [`tests/`](tests) | [Verification Suite (`tests/README.md`)](tests/README.md) — Rust unit/integration tests, Zero-Rust VM (`zero_rust_vm_test.sapp`), smart updater (`smart_updater_test.sapp`), algorithms/quantum/DNA/PQC (`algorithms_quantum_pqc_bio_test.sapp`), safety (`safety_test.sapp`), and semantics tests. |
 | [`emulators/`](emulators) | [Hardware Emulators (`emulators/README.md`)](emulators/README.md) — 6 deterministic register-level device emulators & hardware bus manager. |
-| [`runtime_stage3/`](runtime_stage3) | [Stage-3 Prototypes (`runtime_stage3/README.md`)](runtime_stage3/README.md) — Minimal direct-syscall Linux `ELF64` smoke-stub emitter and in-VM allocator/GC/kernel simulations. |
+| [`runtime_stage3/`](runtime_stage3) | [Stage-3 Runtime & Prototypes (`runtime_stage3/README.md`)](runtime_stage3/README.md) — Standalone pure-C99 Zero-Rust `.pbck` VM (`pblang_zero_rust_vm.c`), minimal direct-syscall Linux `ELF64` smoke-stub emitter, and in-VM kernel simulations. |
 | [`tools/`](tools) | [Toolchain Drivers (`tools/README.md`)](tools/README.md) — Self-hosted compiler (`pbc.sapp`), lock publisher (`pblock.sapp`), and security auditors (`pbsecure.sapp`, `pbaudit.sapp`). |
-| [`src/`](src) & [`crates/`](crates) | Production Rust CLI, `pblang-vm` bytecode VM, parser, typechecker, linter, formatter, LSP server, and native IDE (`pblang --ide`). |
+| [`src/`](src) & [`crates/`](crates) | Production Rust CLI (`pblang update`, `run`, `build`, `check`, `lint`, `fmt`, `lsp`), `pblang-vm` bytecode VM, `pblang-pm` package manager, and native IDE (`pblang --ide`). |
 
 ---
 

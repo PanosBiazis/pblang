@@ -1471,9 +1471,49 @@ pub fn resolve_dependency_root(
     dep_name: &str,
     dep: &LockedDep,
 ) -> Result<PathBuf, String> {
-    let path = Path::new(&dep.path);
-    if path.is_dir() {
-        return verify_locked_dep_content(dep).map(|_| path.to_path_buf());
+    let raw_path = Path::new(&dep.path);
+    let primary = if raw_path.is_relative() {
+        man_dir.join(raw_path)
+    } else {
+        raw_path.to_path_buf()
+    };
+    if primary.is_dir() {
+        return verify_locked_dep_content(&LockedDep {
+            path: primary.to_string_lossy().to_string(),
+            ..dep.clone()
+        })
+        .map(|_| primary);
+    }
+
+    if dep.source.is_none() {
+        let man_path = man_dir.join("pblang.toml");
+        if let Ok(man_str) = std::fs::read_to_string(&man_path) {
+            if let Ok(manifest) = parse_manifest(&man_str) {
+                if let Some(spec) = manifest.dependencies.get(dep_name) {
+                    for cand in spec.path_candidates() {
+                        let expanded = expand_dep_path(cand);
+                        let p = Path::new(&expanded);
+                        let joined = if p.is_relative() {
+                            man_dir.join(p)
+                        } else {
+                            p.to_path_buf()
+                        };
+                        if joined.is_dir() {
+                            verify_package_tree_for_path_dep(&joined)?;
+                            return verify_locked_dep_content(&LockedDep {
+                                path: joined.to_string_lossy().to_string(),
+                                ..dep.clone()
+                            })
+                            .map(|_| joined);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if raw_path.is_dir() {
+        return verify_locked_dep_content(dep).map(|_| raw_path.to_path_buf());
     }
 
     match dep.source.as_deref() {
@@ -1995,26 +2035,47 @@ pub fn generate_lockfile_with_registry_policy(
                 );
             }
         } else {
-            let rel = spec.path().ok_or_else(|| {
-                format!(
+            let candidates = spec.path_candidates();
+            if candidates.is_empty() {
+                return Err(format!(
                     "dependency '{}' has no path (and is not a registry/git dep)",
                     name
-                )
-            })?;
-            let dep_root = manifest_dir.join(rel);
-            let dep_root = canonicalize_existing(&dep_root).ok_or_else(|| {
-                format!(
-                    "dep '{}' path not found: {} ({})",
-                    name,
-                    rel,
-                    dep_root.display()
-                )
-            })?;
+                ));
+            }
+            let mut chosen_raw: Option<&str> = None;
+            let mut chosen_root: Option<PathBuf> = None;
+            for cand in &candidates {
+                let expanded = expand_dep_path(cand);
+                let probe = Path::new(&expanded);
+                let joined = if probe.is_relative() {
+                    manifest_dir.join(probe)
+                } else {
+                    probe.to_path_buf()
+                };
+                if let Some(canon) = canonicalize_existing(&joined) {
+                    if canon.is_dir() {
+                        chosen_raw = Some(*cand);
+                        chosen_root = Some(canon);
+                        break;
+                    }
+                }
+            }
+            let (raw_cand, dep_root) = match (chosen_raw, chosen_root) {
+                (Some(r), Some(c)) => (r, c),
+                _ => {
+                    let first = candidates[0];
+                    return Err(format!(
+                        "dep '{}' path not found: {}",
+                        name, first
+                    ));
+                }
+            };
             let dep_hash = hash_dir(&dep_root)?;
+            let recorded_path = portable_local_lock_path(manifest_dir, &dep_root, raw_cand);
             deps.insert(
                 name.clone(),
                 LockedDep {
-                    path: dep_root.to_string_lossy().to_string(),
+                    path: recorded_path,
                     sha256: dep_hash,
                     name: None,
                     version: None,
@@ -2032,6 +2093,65 @@ pub fn generate_lockfile_with_registry_policy(
         content_hash_algorithm: LOCKFILE_CONTENT_HASH_ALGORITHM.to_string(),
         dependencies: deps,
     })
+}
+
+fn diff_relative_path(base: &Path, target: &Path) -> Option<String> {
+    use std::path::Component;
+    let base_comps: Vec<Component<'_>> = base.components().collect();
+    let targ_comps: Vec<Component<'_>> = target.components().collect();
+    if base_comps.is_empty() || targ_comps.is_empty() {
+        return None;
+    }
+    if base_comps[0] != targ_comps[0] {
+        return None;
+    }
+    let mut common = 0usize;
+    while common < base_comps.len()
+        && common < targ_comps.len()
+        && base_comps[common] == targ_comps[common]
+    {
+        common += 1;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for c in &base_comps[common..] {
+        if matches!(c, Component::Normal(_)) {
+            parts.push("..".to_string());
+        }
+    }
+    for c in &targ_comps[common..] {
+        if let Component::Normal(os) = c {
+            parts.push(os.to_string_lossy().to_string());
+        }
+    }
+    if parts.is_empty() {
+        Some(".".to_string())
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn portable_local_lock_path(manifest_dir: &Path, dep_root_canon: &Path, raw_cand: &str) -> String {
+    let trimmed = raw_cand.trim();
+    let has_env_or_tilde = trimmed.starts_with('~') || trimmed.contains("${");
+    let looks_win_abs = trimmed.len() >= 2
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+        && trimmed.as_bytes()[1] == b':';
+    if !has_env_or_tilde
+        && !looks_win_abs
+        && !trimmed.starts_with('/')
+        && !trimmed.starts_with('\\')
+    {
+        return trimmed.replace('\\', "/");
+    }
+    if let Some(man_canon) = canonicalize_existing(manifest_dir) {
+        if let Some(rel) = diff_relative_path(&man_canon, dep_root_canon) {
+            return rel;
+        }
+    }
+    dep_root_canon
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string())
 }
 
 struct PackageTreeEntry {

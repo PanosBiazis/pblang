@@ -2,6 +2,37 @@
 
 All notable changes to **PBLang** are documented in this file.
 
+## [`1.5.0`] — 2026-11-11 (Stage-3 Zero-Rust C99 `.pbck` VM · Smart Polymorphic `pblang update` & Portable Lockfiles · Compiler Optimizations · Scientific, Quantum QPU, DNA & FIPS 203 `ML-KEM-768` Stdlib)
+
+### Stage-3 Zero-Rust Native `.pbck` Bytecode VM (`runtime_stage3/pblang_zero_rust_vm.c`, `runtime_stage3/stage3_native_host_runtime.sapp`)
+- **Standalone Pure C99 `.pbck` Stack VM (`pblang-zero-rust`)**:
+  - Implemented `runtime_stage3/pblang_zero_rust_vm.c` (`gcc -O3 -Wall -Wextra -Werror -std=c99`, zero Rust crates, zero `rustc`/`cargo` link symbols) capable of decoding and executing binary `PBCK\x01` chunks emitted by `stdlib/compiler/native_pbck.sapp` and `tools/pbc.sapp --target pbck`.
+  - Supports arithmetic, bitwise/shift ops, string concatenation, comparisons, short-circuit logic, local/global slots, nested function calls, recursion, arrays, ordered maps, structured `OP_TRY`/`OP_END_TRY`/`OP_THROW` exception unwinding, deterministic mark-and-sweep heap GC, and core builtins (`len`, `type`, `str`, `num`, `floor`, `ceil`, `abs`, `sqrt`, `sin`, `cos`, `min`, `max`, `array_push`, `array_pop`, `map_keys`, `map_has`, `map_delete`, `str_slice`, `str_contains`, `str_split`, `chr`, `ord`, `clock_ms`, `fs_read`, `fs_write`, `fs_exists`).
+  - Wired `build_zero_rust_pbck_vm` and `run_pbck_on_zero_rust_vm` into `runtime_stage3/stage3_native_host_runtime.sapp` (`tests/zero_rust_vm_test.sapp`: `24/24` checks; `tests/stage3_and_hardware_emulators_test.sapp`: `55/55` checks).
+
+### Smart Polymorphic `pblang update` & Portable Relative Lockfiles (`src/cli/update.rs`, `crates/pblang-pm/src/lib.rs`, `stdlib/smart_updater.sapp`)
+- **Polymorphic `pblang update [target]` CLI & Pure-PBLang Engine**:
+  - Auto-detects update targets across installed `self` toolchains (`pblang update self [--from <dir>]`), PBLang workspaces (`pblang.toml` -> `pblang.lock` + `stdlib/MANIFEST.sha256.json`), single `.sapp` scripts (`check` + optional `--compile-c99` / `--compile-pbck`), sibling/external git checkouts, and directory trees (`--recursive`).
+  - Enforces strict security & privacy invariants: zero `sh -c` shell execution, symlink-escape rejection, atomic temp-write + rename with `.bak` rollback on verification failure, `pblang-package-tree-v2` SHA-256 verification, and automatic private-path/token hygiene scanning before lockfile commit (`tests/smart_updater_test.sapp`: `75/75` checks).
+- **Portable Relative Lockfile Path Resolution (`crates/pblang-pm/src/lib.rs`, `tests/lockfile_repro.rs`)**:
+  - Fixed `lock_manifest` and `verify_manifest_against_lockfile` to record normalized relative paths (e.g. `stdlib`, `../pblang/stdlib`) instead of machine-local absolute workstation paths, resolving paths relative to `pblang.toml` while enforcing SHA-256 package-tree integrity (`cargo test --test lockfile_repro`: `4/4` passed).
+
+### Self-Hosted Compiler & Native x86-64 Codegen Optimizations (`stdlib/compiler/optimizer.sapp`, `stdlib/native/codegen_x64.sapp`)
+- **IR & Bytecode Optimizer (`stdlib/compiler/optimizer.sapp`)**:
+  - Added scalar constant-pool deduplication (preserving IEEE-754 `-0.0` vs `+0.0`), string/boolean/nil binary constant folding, unary `OP_NOT` folding, boolean double-negation elimination, constant conditional jump folding (`OP_JUMP_IF_FALSE`), unreachable instruction elimination after unconditional `OP_JUMP`, and literal `strength_reduction_pass` (`+0`, `-0`, `*0`, `*1`, `/1`, and power-of-two shift reductions preserving map operator overloading).
+- **Native `x86-64` ELF64 Codegen (`stdlib/native/codegen_x64.sapp`)**:
+  - Added `+0`/`-0` elision, commutative `c + expr` / `c * expr` normalization, negative power-of-two shift+negate strength reduction, unary `not`/double-negation folding, and associative constant reassociation (`(x + c1) + c2`, `(x - c1) - c2`, `(x * c1) * c2`), producing compact `422`-byte standalone ELF64 binaries (`benchmark-codegen`: `checksum=474518`, `run_median_ms=6.54`).
+
+### Scientific, Quantum (Local + IBM/Google QPU), Bioinformatics & Post-Quantum Cryptography Stdlib (`stdlib/`)
+- **24 First-Principles Algorithms & Portfolio Meta-Solver (`stdlib/algorithms_24.sapp`)**:
+  - Implemented 24 canonical algorithms from first principles with zero mocks: MergeSort, radix-2 Cooley-Tukey FFT/IFFT, Karatsuba arbitrary-precision multiplication, Quickselect, Bellman-Ford (with negative-cycle detection), 0/1 Knapsack DP, Viterbi log-space HMM decoder, binary-heap Dijkstra, A* search, Dinic max-flow, Branch-and-Bound exact TSP, DPLL SAT solver, Backtracking CSP with MRV, MCTS (`UCB1`), Simulated Annealing, `NSGA-II` Pareto front sort + crowding distance, Nelder-Mead simplex, LP Simplex with Bland's rule, E-Graph congruence closure, HyperLogLog (`p=4..12`), Tabu Search (`2-opt`), Swarm PSO, Pearl Backdoor Causal ATE, and Counterfactual Regret Minimization (`CFR`), plus topological Betti numbers ($\beta_0, \beta_1$) and `portfolio_meta_solver`.
+- **Quantum Circuit Simulator & Real Cloud QPU Clients (`stdlib/quantum_computing.sapp`)**:
+  - Exact `1..20`-qubit statevector simulator (`H`, `X`, `Y`, `Z`, `S`, `T`, `RX`, `RY`, `RZ`, `CNOT`, `CZ`, `Toffoli`, `MCZ`, deterministic shot sampling), Grover's $O(\sqrt{N})$ search, 1D Transverse-Field Ising VQE with exact parameter-shift gradients, OpenQASM 3.0 & Google Cirq JSON exporters, and HTTPS REST connectors for **IBM Quantum Platform** (`https://quantum.cloud.ibm.com/api/v1/jobs`) and **Google Quantum Engine** (`https://quantum.googleapis.com/v1alpha1/...`) with explicit `mode: "local_statevector_fallback_no_credentials"` when cloud tokens are unset.
+- **DNA Sequence Alignment & De Bruijn Assembly (`stdlib/bioinformatics_dna.sapp`)**:
+  - Needleman-Wunsch global alignment, Smith-Waterman local alignment, IUPAC reverse-complement, standard genetic code translation, GC-content + 3-frame ORF finder, and Hierholzer Eulerian De Bruijn $k$-mer contig assembly.
+- **NIST FIPS 202 `SHA-3`/`SHAKE` & FIPS 203 `ML-KEM-768` (`stdlib/pqc_mlkem768.sapp`)**:
+  - Float53-safe `[lo32, hi32]` Keccak-$f[1600]$ (`sha3_256`, `sha3_512`, `shake128`, `shake256` verified bit-exact against NIST FIPS 202 vectors) and full lattice-based `ML-KEM-768` (`q = 3329`, `n = 256`, `k = 3`, 128-root NTT/INTT, `1184`-byte encapsulation keys, `2400`-byte decapsulation keys, `1088`-byte ciphertexts, `32`-byte shared secrets, and Fujisaki-Okamoto implicit rejection; `tests/algorithms_quantum_pqc_bio_test.sapp`: `53/53` checks).
+
 ## [`1.4.0`] — 2026-11-11 (Automatic Cycle GC & Closure Tracing · Out-of-the-Box TLS 1.3 · Usable `--sandbox` · Benchmark & Runtime Honesty)
 
 ### Rust Bytecode VM (`pblang-vm`) & CLI Hardening

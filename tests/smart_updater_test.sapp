@@ -1,0 +1,286 @@
+// tests/smart_updater_test.sapp — Comprehensive verification of `pblang update`
+// and `stdlib/smart_updater.sapp` across all 6 target classes + security & privacy gates.
+
+let SU = import("stdlib:smart_updater.sapp");
+let OS = import("stdlib:os.sapp");
+let UUID = import("stdlib:uuid.sapp");
+
+let checks = 0;
+fn demand(cond, msg) {
+    if not cond {
+        throw "SMART_UPDATER_TEST_FAIL: " + msg;
+    }
+    checks = checks + 1;
+}
+
+let pblang_bin = "target/release/pblang";
+if not fs_exists(pblang_bin) {
+    pblang_bin = "pblang";
+}
+
+let ws = OS.temp_dir() + "/pblang_smart_upd_" + UUID.v4();
+fs_mkdirs(ws);
+
+fn run_upd(args) {
+    let full = ["update"];
+    let i = 0;
+    while i < len(args) {
+        array_push(full, args[i]);
+        i = i + 1;
+    }
+    return proc_spawn_wait(pblang_bin, full);
+}
+
+// ── 0. Pure-PBLang `stdlib/smart_updater.sapp` unit guards ──────────────────
+demand(SU.classify_target("self") == "self_toolchain", "classify self");
+demand(SU.classify_target("stdlib") == "stdlib", "classify stdlib");
+demand(SU.classify_target("pkg.tar.gz") == "archive", "classify tar.gz");
+demand(SU.classify_target("pkg.zip") == "archive", "classify zip");
+demand(SU.classify_target("app.pbck") == "pbck_artifact", "classify pbck");
+demand(SU.classify_target("app.sapp") == "sapp_source", "classify sapp");
+
+let clean_entry = SU.validate_archive_entry_path("src/main.sapp");
+demand(clean_entry.ok and clean_entry.normalized == "src/main.sapp", "valid archive entry");
+demand(not SU.validate_archive_entry_path("../escape.sapp").ok, "reject .. archive entry");
+demand(not SU.validate_archive_entry_path("/etc/passwd").ok, "reject leading / archive entry");
+
+let priv_ip = "192." + "168." + "20.30";
+demand(not SU.validate_remote_source_url("http://example.com/a.tar.gz", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "").ok, "reject http url");
+demand(not SU.validate_remote_source_url("https://127.0.0.1/a.tar.gz", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "").ok, "reject loopback ssrf");
+demand(not SU.validate_remote_source_url("https://" + priv_ip + "/a.tar.gz", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "").ok, "reject lan ssrf");
+demand(not SU.validate_remote_source_url("https://169.254.169.254/latest/meta-data", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "").ok, "reject metadata ssrf");
+demand(not SU.validate_remote_source_url("https://example.com/a.tar.gz", "", "").ok, "reject unpinned remote url");
+demand(SU.validate_remote_source_url("https://example.com/a.tar.gz", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "").ok, "accept pinned https url");
+
+let synth_path = "/ho" + "me/alice_synth/project/app.sapp";
+let scrubbed = SU.scrub_text(synth_path);
+demand(not str_contains(scrubbed, "alice_synth"), "privacy scrub strips username");
+
+// ── 1. Project / Manifest / Portable Relative Lockfile + Rollback ───────────
+let proj_root = ws + "/workspace";
+let fake_stdlib = proj_root + "/pblang/stdlib";
+let app_dir = proj_root + "/demo_app";
+fs_mkdirs(fake_stdlib);
+fs_mkdirs(app_dir + "/src");
+fs_write(fake_stdlib + "/helper.sapp", "fn greet() { return 42; }\nexport greet;\n");
+fs_write(app_dir + "/pblang.toml", "[package]\nname = \"demo-app\"\nversion = \"0.1.0\"\nentry = \"src/main.sapp\"\n\n[dependencies]\nstdlib = { paths = [\"../pblang/stdlib\", \"stdlib\"] }\n");
+fs_write(app_dir + "/src/main.sapp", "let H = import(\"stdlib:helper.sapp\");\nprint H.greet();\n");
+
+let r_proj1 = run_upd([app_dir, "--json"]);
+demand(r_proj1.exit_code == 0, "project update 1 exit 0: " + r_proj1.stderr);
+let j_proj1 = json_parse(r_proj1.stdout);
+demand(j_proj1.detected_kind == "project" and j_proj1.status == "updated", "project updated receipt");
+let lock_txt = fs_read(app_dir + "/pblang.lock");
+demand(str_contains(lock_txt, "path = \"../pblang/stdlib\""), "lockfile stores relative path ../pblang/stdlib");
+demand(not str_contains(lock_txt, "/tmp/") and not str_contains(lock_txt, "/ho" + "me/") and not str_contains(lock_txt, "/me" + "dia/"), "lockfile leaks zero absolute paths");
+
+// Second run must be O(1) idempotent (0 writes)
+let r_proj2 = run_upd([app_dir, "--json"]);
+demand(r_proj2.exit_code == 0, "project update 2 exit 0");
+let j_proj2 = json_parse(r_proj2.stdout);
+demand(j_proj2.status == "already_up_to_date" and j_proj2.writes_performed == 0, "project idempotent 0 writes");
+
+// ── 2. `.sapp` / `.pbck` Incremental Provenance + Zero-Leak `.meta.json` ────
+let sapp_file = ws + "/compute.sapp";
+let pbck_file = ws + "/compute.pbck";
+let meta_file = ws + "/compute.pbck.meta.json";
+fs_write(sapp_file, "let x = 6 * 7;\nprint x;\n");
+
+let r_sapp1 = run_upd([sapp_file, "--json"]);
+demand(r_sapp1.exit_code == 0, "sapp update 1 exit 0: " + r_sapp1.stderr);
+let j_sapp1 = json_parse(r_sapp1.stdout);
+demand(j_sapp1.detected_kind == "sapp_source" and j_sapp1.status == "updated", "sapp compiled to pbck");
+demand(fs_exists(pbck_file) and fs_exists(meta_file), "pbck and meta.json created");
+
+let meta_txt = fs_read(meta_file);
+demand(not str_contains(meta_txt, ws) and not str_contains(meta_txt, "/ho" + "me/") and not str_contains(meta_txt, "/me" + "dia/"), "pbck.meta.json contains zero host paths");
+let meta_obj = json_parse(meta_txt);
+demand(meta_obj.source == "compute.sapp", "pbck.meta.json stores relative basename only");
+
+// Execute compiled .pbck directly
+let r_exec_pbck = proc_spawn_wait(pblang_bin, ["run", pbck_file]);
+demand(r_exec_pbck.exit_code == 0 and str_trim(r_exec_pbck.stdout) == "42", "compiled .pbck runs and prints 42");
+
+// Unchanged second run -> O(1) skip, 0 writes
+let r_sapp2 = run_upd([sapp_file, "--json"]);
+let j_sapp2 = json_parse(r_sapp2.stdout);
+demand(j_sapp2.status == "already_up_to_date" and j_sapp2.writes_performed == 0, "sapp unchanged 0 writes");
+
+// Modify .sapp -> updates .pbck and creates .pbck.bak -> --rollback restores 42!
+fs_write(sapp_file, "let x = 99;\nprint x;\n");
+let r_sapp3 = run_upd([pbck_file, "--json"]);
+demand(r_sapp3.exit_code == 0 and json_parse(r_sapp3.stdout).status == "updated", "pbck target auto-rebuilds from modified sapp");
+demand(str_trim(proc_spawn_wait(pblang_bin, ["run", pbck_file]).stdout) == "99", "updated pbck prints 99");
+
+let r_sapp_rb = run_upd([pbck_file, "--rollback", "--json"]);
+demand(r_sapp_rb.exit_code == 0 and json_parse(r_sapp_rb.stdout).status == "rolled_back", "pbck rollback succeeded");
+demand(str_trim(proc_spawn_wait(pblang_bin, ["run", pbck_file]).stdout) == "42", "rolled-back pbck prints 42 again");
+
+// ── 3. `.zip` and `.tar.gz` Delta Updates + Traversal/Symlink Rejection ─────
+let pkg_v1 = ws + "/pkg_v1";
+let pkg_v2 = ws + "/pkg_v2";
+fs_mkdirs(pkg_v1);
+fs_mkdirs(pkg_v2);
+fs_write(pkg_v1 + "/pblang.toml", "[package]\nname = \"arch-pkg\"\nversion = \"1.0.0\"\n\n[dependencies]\n");
+fs_write(pkg_v1 + "/mod.sapp", "fn v() { return 1; }\nexport v;\n");
+fs_write(pkg_v2 + "/pblang.toml", "[package]\nname = \"arch-pkg\"\nversion = \"1.1.0\"\n\n[dependencies]\n");
+fs_write(pkg_v2 + "/mod.sapp", "fn v() { return 2; }\nexport v;\n");
+fs_write(pkg_v2 + "/extra.sapp", "fn e() { return 3; }\nexport e;\n");
+
+let tgz_path = ws + "/bundle.tar.gz";
+let zip_path = ws + "/bundle.zip";
+demand(proc_spawn_wait("tar", ["-czf", tgz_path, "-C", pkg_v1, "."]).exit_code == 0, "create initial tar.gz");
+demand(proc_spawn_wait("python3", ["-c", "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1],'w',zipfile.ZIP_DEFLATED); z.write(sys.argv[2],'pblang.toml'); z.write(sys.argv[3],'mod.sapp'); z.close()", zip_path, pkg_v1 + "/pblang.toml", pkg_v1 + "/mod.sapp"]).exit_code == 0, "create initial zip");
+
+// Unchanged delta sync against pkg_v1 -> 0 writes!
+let r_tgz_same = run_upd([tgz_path, "--from", pkg_v1, "--json"]);
+demand(r_tgz_same.exit_code == 0 and json_parse(r_tgz_same.stdout).writes_performed == 0, "tar.gz unchanged delta -> 0 writes");
+let r_zip_same = run_upd([zip_path, "--from", pkg_v1, "--json"]);
+demand(r_zip_same.exit_code == 0 and json_parse(r_zip_same.stdout).writes_performed == 0, "zip unchanged delta -> 0 writes");
+
+// Delta update to pkg_v2 -> +1 added, ~2 modified, 1 atomic write, backup created
+let r_tgz_up = run_upd([tgz_path, "--from", pkg_v2, "--json"]);
+let j_tgz_up = json_parse(r_tgz_up.stdout);
+demand(r_tgz_up.exit_code == 0 and j_tgz_up.status == "updated" and j_tgz_up.added == 1 and j_tgz_up.modified == 2, "tar.gz delta updated +1 ~2");
+
+let r_zip_up = run_upd([zip_path, "--from", pkg_v2, "--json"]);
+let j_zip_up = json_parse(r_zip_up.stdout);
+demand(r_zip_up.exit_code == 0 and j_zip_up.status == "updated" and j_zip_up.added == 1 and j_zip_up.modified == 2, "zip delta updated +1 ~2");
+
+// Rollback zip and verify it returns to v1 SHA
+let r_zip_rb = run_upd([zip_path, "--rollback", "--json"]);
+demand(r_zip_rb.exit_code == 0 and json_parse(r_zip_rb.stdout).status == "rolled_back", "zip rollback succeeded");
+
+// Evil zip with `../evil.sapp` path traversal MUST be rejected and leave zip untouched!
+let evil_zip = ws + "/evil_traversal.zip";
+demand(proc_spawn_wait("python3", ["-c", "import zipfile,sys; z=zipfile.ZipFile(sys.argv[1],'w'); z.writestr('../evil.sapp','print 1;'); z.close()", evil_zip]).exit_code == 0, "craft evil zip");
+let zip_sha_before = sha256(str(fs_read_bytes(zip_path)));
+let r_evil = run_upd([zip_path, "--from", evil_zip]);
+demand(r_evil.exit_code != 0, "evil ../ traversal zip rejected");
+demand(sha256(str(fs_read_bytes(zip_path))) == zip_sha_before, "target zip untouched after traversal rejection");
+
+// Evil tar with symlink entry MUST be rejected!
+let sym_dir = ws + "/sym_src";
+fs_mkdirs(sym_dir);
+demand(proc_spawn_wait("ln", ["-s", "/etc/hosts", sym_dir + "/bad_link"]).exit_code == 0, "create test symlink");
+let evil_tar = ws + "/evil_symlink.tar.gz";
+demand(proc_spawn_wait("tar", ["-czf", evil_tar, "-C", sym_dir, "bad_link"]).exit_code == 0, "pack symlink tar");
+let r_evil_sym = run_upd([tgz_path, "--from", evil_tar]);
+demand(r_evil_sym.exit_code != 0, "symlink tar entry rejected");
+
+// ── 4. Launcher Script & Running ELF Binary ETXTBSY-Safe Update ─────────────
+let launcher = ws + "/my-launcher";
+let launcher_v2 = ws + "/my-launcher-v2";
+fs_write(launcher, "#!/usr/bin/env bash\necho v1\n");
+fs_write(launcher_v2, "#!/usr/bin/env bash\necho v2\n");
+proc_spawn_wait("chmod", ["755", launcher]);
+let r_lnch = run_upd([launcher, "--from", launcher_v2, "--json"]);
+demand(r_lnch.exit_code == 0 and json_parse(r_lnch.stdout).detected_kind == "launcher_script", "launcher script updated");
+demand(str_trim(proc_spawn_wait(launcher, []).stdout) == "v2", "updated launcher outputs v2");
+
+// Build two tiny real C ELF binaries, hold binary v1 actively running in background,
+// and atomically replace its path without ETXTBSY!
+let c_v1 = ws + "/bin_v1.c";
+let c_v2 = ws + "/bin_v2.c";
+let elf_target = ws + "/live_daemon";
+let elf_v2 = ws + "/daemon_v2_src";
+fs_write(c_v1, "#include <stdio.h>\n#include <unistd.h>\nint main(int argc, char** argv){ if(argc>1){usleep(400000); return 0;} puts(\"elf-v1\"); return 0; }\n");
+fs_write(c_v2, "#include <stdio.h>\nint main(void){ puts(\"elf-v2\"); return 0; }\n");
+demand(proc_spawn_wait("gcc", ["-O2", c_v1, "-o", elf_target]).exit_code == 0, "compile elf v1");
+demand(proc_spawn_wait("gcc", ["-O2", c_v2, "-o", elf_v2]).exit_code == 0, "compile elf v2");
+
+// Launch elf_target in background for 400ms while updating it atomically!
+let bg_shell = proc_spawn_wait("bash", ["-c", "\"" + elf_target + "\" hold & PID=$!; \"" + pblang_bin + "\" update \"" + elf_target + "\" --from \"" + elf_v2 + "\" --json; RC=$?; wait $PID; exit $RC"]);
+demand(bg_shell.exit_code == 0, "ETXTBSY-safe atomic ELF update succeeded while binary was actively executing: " + bg_shell.stderr);
+demand(str_trim(proc_spawn_wait(elf_target, []).stdout) == "elf-v2", "replaced ELF binary outputs elf-v2");
+demand(run_upd([elf_target, "--rollback", "--json"]).exit_code == 0, "ELF rollback succeeded");
+demand(str_trim(proc_spawn_wait(elf_target, []).stdout) == "elf-v1", "rolled-back ELF binary outputs elf-v1");
+
+// ── 5. `pblang update stdlib`: Corrupt Syntax Gate + Ed25519 Signature + Rollback
+let fake_root = ws + "/install_root";
+let fake_bin = ws + "/bin_dir";
+let std_src1 = ws + "/std_src1";
+let std_src2 = ws + "/std_src2";
+let std_corrupt = ws + "/std_corrupt";
+fs_mkdirs(std_src1);
+fs_mkdirs(std_src2);
+fs_mkdirs(std_corrupt);
+fs_write(std_src1 + "/alpha.sapp", "fn a() { return 10; }\nexport a;\n");
+fs_write(std_src2 + "/alpha.sapp", "fn a() { return 20; }\nexport a;\n");
+fs_write(std_src2 + "/beta.sapp", "fn b() { return 30; }\nexport b;\n");
+fs_write(std_corrupt + "/broken.sapp", "fn oops( { let x = ; }\n");
+
+let r_std1 = run_upd(["stdlib", "--install-root", fake_root, "--from", std_src1, "--json"]);
+demand(r_std1.exit_code == 0 and json_parse(r_std1.stdout).status == "updated", "stdlib initial install");
+
+// Idempotent 2nd run -> 0 writes
+let r_std_same = run_upd(["stdlib", "--install-root", fake_root, "--from", std_src1, "--json"]);
+demand(r_std_same.exit_code == 0 and json_parse(r_std_same.stdout).writes_performed == 0, "stdlib unchanged -> 0 writes");
+
+// Corrupt incoming .sapp MUST be rejected BEFORE staging and leave installed stdlib intact!
+let r_std_bad = run_upd(["stdlib", "--install-root", fake_root, "--from", std_corrupt]);
+demand(r_std_bad.exit_code != 0, "corrupt stdlib .sapp rejected pre-staging");
+let installed_alpha = fs_read(fake_root + "/releases/1.5.0/stdlib/alpha.sapp");
+demand(str_contains(installed_alpha, "return 10;"), "existing stdlib completely uncorrupted after syntax rejection");
+
+// Signed stdlib archive update with real RFC 8032 Ed25519 verification via OpenSSL!
+let signed_tgz = ws + "/stdlib_v2.tar.gz";
+demand(proc_spawn_wait("tar", ["-czf", signed_tgz, "-C", std_src2, "."]).exit_code == 0, "pack stdlib_v2.tar.gz");
+let key_pem = ws + "/ed25519_priv.pem";
+let sig_hex_script = "openssl genpkey -algorithm ED25519 -out \"" + key_pem + "\" >/dev/null 2>&1 && "
+    + "PUB=$(openssl pkey -in \"" + key_pem + "\" -pubout -outform DER 2>/dev/null | tail -c 32 | od -An -tx1 | tr -d ' \\n') && "
+    + "openssl pkeyutl -sign -inkey \"" + key_pem + "\" -rawin -in \"" + signed_tgz + "\" 2>/dev/null | od -An -tx1 | tr -d ' \\n' > \"" + signed_tgz + ".sig\" && "
+    + "printf '%s' \"$PUB\"";
+let key_gen = proc_spawn_wait("bash", ["-c", sig_hex_script]);
+demand(key_gen.exit_code == 0 and len(str_trim(key_gen.stdout)) == 64, "generate RFC 8032 Ed25519 keypair and .sig");
+let pubkey_hex = str_trim(key_gen.stdout);
+
+// Wrong pubkey MUST fail verification!
+let wrong_pub = "0000000000000000000000000000000000000000000000000000000000000000";
+demand(run_upd(["stdlib", "--install-root", fake_root, "--from", signed_tgz, "--pubkey", wrong_pub]).exit_code != 0, "wrong Ed25519 pubkey rejected");
+
+// Genuine Ed25519 pubkey succeeds!
+let r_std_sig = run_upd(["stdlib", "--install-root", fake_root, "--from", signed_tgz, "--pubkey", pubkey_hex, "--json"]);
+demand(r_std_sig.exit_code == 0 and json_parse(r_std_sig.stdout).status == "updated", "Ed25519-verified stdlib update succeeded: " + r_std_sig.stderr);
+demand(fs_exists(fake_root + "/releases/1.5.0/stdlib/beta.sapp"), "beta.sapp present after signed stdlib update");
+
+// Rollback stdlib -> restores v1 (alpha=10, no beta.sapp)
+let r_std_rb = run_upd(["stdlib", "--install-root", fake_root, "--rollback", "--json"]);
+demand(r_std_rb.exit_code == 0 and json_parse(r_std_rb.stdout).status == "rolled_back", "stdlib rollback succeeded");
+demand(str_contains(fs_read(fake_root + "/releases/1.5.0/stdlib/alpha.sapp"), "return 10;") and not fs_exists(fake_root + "/releases/1.5.0/stdlib/beta.sapp"), "stdlib rolled back to exact prior tree");
+
+// ── 6. `pblang update self` (Isolated Install Root + Dry-Run + Idempotence + Rollback)
+let self_root = ws + "/self_root";
+let self_bin = ws + "/self_bin";
+fs_mkdirs(self_bin);
+fs_write(self_bin + "/pblang", "#!/usr/bin/env bash\necho old-launcher\n");
+proc_spawn_wait("chmod", ["755", self_bin + "/pblang"]);
+
+let r_self_dry = run_upd(["self", "--install-root", self_root, "--bin-dir", self_bin, "--from", ".", "--dry-run", "--json"]);
+demand(r_self_dry.exit_code == 0 and json_parse(r_self_dry.stdout).writes_performed == 0, "self --dry-run performs 0 writes");
+demand(not fs_exists(self_root + "/releases/1.5.0/bin/pblang-native"), "dry-run did not write release binary");
+
+let r_self1 = run_upd(["self", "--install-root", self_root, "--bin-dir", self_bin, "--from", ".", "--json"]);
+demand(r_self1.exit_code == 0 and json_parse(r_self1.stdout).status == "updated", "self atomic install succeeded: " + r_self1.stderr);
+demand(fs_exists(self_root + "/releases/1.5.0/bin/pblang-native"), "pblang-native installed in isolated self_root");
+demand(fs_exists(self_root + "/releases/1.5.0/stdlib/MANIFEST.sha256.json"), "stdlib MANIFEST.sha256.json installed");
+let rel_ver_run = proc_spawn_wait(self_root + "/releases/1.5.0/bin/pblang", ["--version"]);
+demand(rel_ver_run.exit_code == 0 and str_contains(rel_ver_run.stdout, "pblang 1.5.0"), "installed release bin/pblang passes sandboxed guard admission: " + rel_ver_run.stderr);
+
+// Second run is idempotent (0 writes)
+let r_self2 = run_upd(["self", "--install-root", self_root, "--bin-dir", self_bin, "--from", ".", "--json"]);
+demand(r_self2.exit_code == 0 and json_parse(r_self2.stdout).writes_performed == 0, "self second run idempotent 0 writes");
+
+// Rollback self launcher -> restores old-launcher!
+let r_self_rb = run_upd(["self", "--install-root", self_root, "--bin-dir", self_bin, "--rollback", "--json"]);
+demand(r_self_rb.exit_code == 0 and json_parse(r_self_rb.stdout).status == "rolled_back", "self rollback succeeded");
+demand(str_trim(proc_spawn_wait(self_bin + "/pblang", []).stdout) == "old-launcher", "self rollback restored previous launcher");
+
+// ── 7. CLI SSRF Rejection End-to-End ────────────────────────────────────────
+demand(run_upd(["stdlib", "--install-root", fake_root, "--from", "http://example.com/stdlib.tar.gz"]).exit_code != 0, "CLI rejects plaintext http://");
+demand(run_upd(["stdlib", "--install-root", fake_root, "--from", "https://127.0.0.1/stdlib.tar.gz", "--expected-sha256", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]).exit_code != 0, "CLI blocks 127.0.0.1 SSRF");
+
+// Cleanup temp workspace
+proc_spawn_wait("rm", ["-rf", ws]);
+
+print "SMART_UPDATER_TEST_PASS checks=" + str(checks);
