@@ -1116,9 +1116,9 @@ fn show_help() {
     println!("                            --ffi-symbol=NAME  Allow one native symbol (repeatable)");
     println!("                            Raw FFI profiles are unsupported; grant exact libraries and symbols only");
     println!("                            --allow-all     Enable every capability (use only for trusted code)");
-    println!("                            --sandbox       Locked deny profile: exec/ffi/net/fs/http/sqlite/spawn/gfx/env/import/process-exit OFF");
+                            println!("                            --sandbox       Sandbox profile: trusted stdlib:... imports ON; host fs/net/http/exec/ffi/sqlite/spawn/gfx/env/file-import/process-exit OFF unless explicitly granted");
     println!("                            --allow-env / --deny-env  Allow/deny env_get reading process env vars (default allow; --sandbox denies)");
-    println!("                            --allow-import / --deny-import  Allow/deny source-module loading (default allow; --sandbox denies)");
+    println!("                            --allow-import / --deny-import  Allow/deny source-module loading (default allow; --sandbox allows trusted stdlib:... only)");
     println!("                            --deny-<cap>    Disable a specific capability (fs/net/http/sqlite/spawn/gfx/env/import)");
     println!("                            --io-timeout-ms=N  Bound each VM filesystem/network I/O operation (100..120000 ms)");
     println!("                          Env-var equivalents: PBLANG_ALLOW_EXEC=1, PBLANG_ALLOW_FFI=1, PBLANG_ALLOW_ALL=1, PBLANG_SANDBOX=1, etc.");
@@ -1561,6 +1561,7 @@ pub(crate) fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std:
 const CLI_WORKER_STACK_BYTES: usize = 256 * 1024 * 1024;
 
 fn main() {
+    pblang_vm::ensure_tls_crypto_provider();
     // Run the whole CLI on a large-stack worker so deeply-nested (but otherwise
     // valid) source can't overflow the recursive front-end's native stack and
     // abort the process uncatchably. Error exits inside the worker still call
@@ -2089,9 +2090,11 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
     }
     if env_on("PBLANG_ALLOW_IMPORT") {
         cfg.import = true;
+        cfg.stdlib_import = true;
     }
     if env_on("PBLANG_DENY_IMPORT") {
         cfg.import = false;
+        cfg.stdlib_import = false;
     }
     if env_on("PBLANG_ALLOW_ENV") {
         cfg.env = true;
@@ -2109,10 +2112,13 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
         cfg.spawn = true;
         cfg.gfx = true;
         cfg.import = true;
+        cfg.stdlib_import = true;
         cfg.env = true;
         cfg.ffi_allow_all = true;
     }
-    let sandbox_requested = env_on("PBLANG_SANDBOX") || args.iter().any(|a| a == "--sandbox");
+    let env_sandbox = env_on("PBLANG_SANDBOX");
+    let sandbox_requested = env_sandbox || args.iter().any(|a| a == "--sandbox");
+    let deny_import_env = env_on("PBLANG_DENY_IMPORT");
     if sandbox_requested {
         cfg.exec = false;
         cfg.ffi = false;
@@ -2123,6 +2129,7 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
         cfg.spawn = false;
         cfg.gfx = false;
         cfg.import = false;
+        cfg.stdlib_import = !deny_import_env;
         cfg.env = false;
         cfg.process_exit = false;
         cfg.ffi_allow_all = false;
@@ -2170,6 +2177,9 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
     *args = retained;
 
     // 2. CLI flag scan + strip.
+    // Note: `--allow-all` never widens `--sandbox` (in either flag order), while
+    // explicit narrow `--allow-<cap>` flags placed after `--sandbox` may grant
+    // individual capabilities unless `PBLANG_SANDBOX=1` locked the process externally.
     args.retain(|a| match a.as_str() {
         "--allow-exec" => {
             cfg.exec = true;
@@ -2205,6 +2215,7 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
         }
         "--allow-import" => {
             cfg.import = true;
+            cfg.stdlib_import = true;
             false
         }
         "--allow-env" => {
@@ -2248,6 +2259,7 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
         }
         "--deny-import" => {
             cfg.import = false;
+            cfg.stdlib_import = false;
             false
         }
         "--deny-env" => {
@@ -2255,17 +2267,20 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
             false
         }
         "--allow-all" => {
-            cfg.exec = true;
-            cfg.ffi = true;
-            cfg.net = true;
-            cfg.fs = true;
-            cfg.http = true;
-            cfg.sqlite = true;
-            cfg.spawn = true;
-            cfg.gfx = true;
-            cfg.import = true;
-            cfg.env = true;
-            cfg.ffi_allow_all = true;
+            if !sandbox_requested {
+                cfg.exec = true;
+                cfg.ffi = true;
+                cfg.net = true;
+                cfg.fs = true;
+                cfg.http = true;
+                cfg.sqlite = true;
+                cfg.spawn = true;
+                cfg.gfx = true;
+                cfg.import = true;
+                cfg.stdlib_import = true;
+                cfg.env = true;
+                cfg.ffi_allow_all = true;
+            }
             false
         }
         "--sandbox" => {
@@ -2278,17 +2293,18 @@ pub(crate) fn parse_capability_flags(args: &mut Vec<String>) -> StdlibConfig {
             cfg.spawn = false;
             cfg.gfx = false;
             cfg.import = false;
+            cfg.stdlib_import = !deny_import_env;
             cfg.env = false;
             cfg.process_exit = false;
+            cfg.ffi_allow_all = false;
+            cfg.ffi_allowed_libs.clear();
+            cfg.ffi_allowed_symbols.clear();
             false
         }
         _ => true,
     });
 
-    // Re-apply the locked profile after the order-sensitive flag scan. This
-    // prevents `--sandbox --allow-all` and the reverse order from producing
-    // different authority, and prevents allow env vars from widening it.
-    if sandbox_requested {
+    if env_sandbox {
         cfg.exec = false;
         cfg.ffi = false;
         cfg.net = false;
@@ -3256,7 +3272,11 @@ fn legacy_dispatch(args: Vec<String>) {
         print_cfg(&chunk, use_dot);
         return;
     }
-    if args.first().map(|s| s.as_str()) == Some("build") {
+    if args.first().map(|s| s.as_str()) == Some("build")
+        && !args.iter().skip(1).any(|a| {
+            a == "-o" || a == "--cc" || a.ends_with(".sapp") || a.ends_with(".sap")
+        })
+    {
         // Strip the `--warm-polyglot` flag from rest before registry-options
         // parsing so the existing positionals logic doesn't see it.
         let mut rest: Vec<String> = args.iter().skip(1).cloned().collect();
@@ -3436,18 +3456,56 @@ fn legacy_dispatch(args: Vec<String>) {
             opt_level: 2,
         };
         let output = pblang_ctranspiler::transpile(stmts, &opts);
-        // Write intermediate C file
-        let c_path = std::env::temp_dir().join(format!(
-            "pblang_build_{}.c",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        if let Err(e) = std::fs::write(&c_path, &output.c_source) {
+        // Write intermediate C file exclusively (O_CREAT | O_EXCL, 0600 on Unix)
+        // to eliminate predictable /tmp symlink and concurrent collision races.
+        static BUILD_TMP_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let pid = std::process::id();
+        let (c_path, mut c_file) = {
+            let tmp_dir = std::env::temp_dir();
+            let mut created = None;
+            for attempt in 0u32..1024 {
+                let seq = BUILD_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let candidate = tmp_dir.join(format!(
+                    "pblang_build_{pid}_{nanos}_{seq}_{attempt}.c"
+                ));
+                let mut open_opts = std::fs::OpenOptions::new();
+                open_opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    open_opts.mode(0o600);
+                }
+                match open_opts.open(&candidate) {
+                    Ok(f) => {
+                        created = Some((candidate, f));
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => {
+                        eprintln!("pblang build: cannot create temporary C file: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            created.unwrap_or_else(|| {
+                eprintln!("pblang build: failed to allocate unique temporary C file");
+                std::process::exit(1);
+            })
+        };
+        if let Err(e) = std::io::Write::write_all(&mut c_file, output.c_source.as_bytes())
+            .and_then(|_| std::io::Write::flush(&mut c_file))
+        {
+            drop(c_file);
+            let _ = std::fs::remove_file(&c_path);
             eprintln!("pblang build: cannot write C source: {}", e);
             std::process::exit(1);
         }
+        drop(c_file);
         // Compile C → executable
         let status = std::process::Command::new(&cc)
             .arg(if cfg!(target_os = "windows") {
@@ -3891,7 +3949,7 @@ fn legacy_dispatch(args: Vec<String>) {
                                             ffi_allow_all: false,
                                             ffi_allowed_libs: Default::default(),
                                             ffi_allowed_symbols: Default::default(),
-                                            exec: false, gfx: false, import: false, spawn: false,
+                                            exec: false, gfx: false, import: false, stdlib_import: true, spawn: false,
                                             env: false, process_exit: false,
                                         });
                                         vm.set_limits(Some(VmLimits {

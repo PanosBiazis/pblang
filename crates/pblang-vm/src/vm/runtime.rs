@@ -168,7 +168,7 @@ pub(super) fn exec(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, Run
 }
 
 pub(super) fn import(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value, RuntimeError> {
-    if !host.allow_import() {
+    if !host.allow_import() && !host.allow_stdlib_import() {
         return Err(host.err("import access denied".into()));
     }
     if args.len() != 1 {
@@ -185,11 +185,13 @@ pub(super) fn gc_stats(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Value,
         return Err(host.err(format!("gc_stats() takes no arguments, got {}", args.len())));
     }
     Ok(alloc_string(format!(
-        "string_allocs={} array_allocs={} map_allocs={} module_allocs={}",
+        "string_allocs={} array_allocs={} map_allocs={} module_allocs={} live_tracked={} collections={}",
         string_alloc_count(),
         ARRAY_ALLOCS.load(Ordering::Relaxed),
         MAP_ALLOCS.load(Ordering::Relaxed),
-        MODULE_ALLOCS.load(Ordering::Relaxed)
+        MODULE_ALLOCS.load(Ordering::Relaxed),
+        super::gc_live_tracked_count(),
+        super::gc_collection_count()
     )))
 }
 

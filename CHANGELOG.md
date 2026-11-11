@@ -2,6 +2,29 @@
 
 All notable changes to **PBLang** are documented in this file.
 
+## [`1.4.0`] — 2026-11-11 (Automatic Cycle GC & Closure Tracing · Out-of-the-Box TLS 1.3 · Usable `--sandbox` · Benchmark & Runtime Honesty)
+
+### Rust Bytecode VM (`pblang-vm`) & CLI Hardening
+- **Automatic Cycle Garbage Collection & Full Closure/Upvalue Tracing (`crates/pblang-vm/src/vm/gc.rs`, `vm.rs`, `spawn.rs`, `spawn_wire.rs`)**:
+  - Expanded thread-local GC tracking across all 5 reference-capable heap types (`Array`, `Map`, `Module`, `Upvalue`, and `Closure`) and upgraded cycle collection to trial-deletion + VM-root mark-and-sweep (`stack`, `frames`, `defers`, `open_upvalues`, `unwinds.pending`, `module`, `builtins`, `module_cache`, and `signal_handlers`) with non-recursive clearing to prevent deep `Drop` stack overflows.
+  - Added automatic allocation-driven GC triggers with adaptive high-watermarks (`max(8192, live * 2)`) checked at bytecode loop safepoints, eliminating memory leaks on long-running cyclic workloads (verified on 50,000+ cyclic map/array/self-capturing closure iterations without manual `gc_collect()`).
+- **TLS 1.3 Working Out-of-the-Box (`src/main.rs`, `crates/pblang-vm/src/vm/net.rs`, `stdlib/tls.sapp`)**:
+  - Installed the `rustls` `ring` crypto provider idempotently (`ensure_tls_crypto_provider()`) at CLI startup and lazily inside `tcp_listen_tls`, `tcp_connect_tls`, and `tcp_wrap_tls` so embedders and CLI scripts never panic on unconfigured providers.
+  - Removed the artificial `PBLANG_TLS_PROVIDER_READY=1` gate from `stdlib/tls.sapp` and exported `listen` / `connect` aliases alongside `listen_tls` / `connect_tls`.
+- **Usable `--sandbox` Mode with Trusted `stdlib:...` Imports (`src/main.rs`, `crates/pblang-ir`, `crates/pblang-vm`)**:
+  - Added `StdlibConfig.stdlib_import` (`VmHost::allow_stdlib_import`) so `--sandbox` permits canonicalized, symlink-free `stdlib:...` imports from the trusted bundled/installed standard library while continuing to deny arbitrary relative/absolute/package imports, path traversal (`stdlib:../...`), filesystem, network, HTTP, SQLite, FFI, subprocess, spawn, and environment access.
+- **Exclusive Temporary File Creation in `pblang build` (`src/main.rs`)**:
+  - Replaced predictable `/tmp/pblang_build_<nanos>.c` writes with `OpenOptions::new().write(true).create_new(true)` (`0600` permissions on Unix) and collision-safe retry naming.
+
+### Benchmark, Stage-3 & HIL Honesty (`stdlib/repro_benchmark.sapp`, `stdlib/stage2_bootstrap_and_hil_wave4.sapp`, `stdlib/omni_bench.sapp`, `runtime_stage3/`, `README.md`)
+- **Honest Reproducible Process Benchmarks (`stdlib/repro_benchmark.sapp`)**:
+  - Removed the hidden `.jit_tier1.out` native ELF substitution from `pblang-interpreter` (`_run_plan` always runs `pblang run <source>` on the bytecode VM) and added an explicit `pblang-tier1-x64` compiled row whose compilation time is measured in `_compile()`.
+  - Removed `/tmp/pblang_c99_obj_cache` from `pblang-c99` so every cold and warm compile sample honestly measures both `.sapp -> .c` transpilation and `gcc -O3` native compilation.
+  - Replaced hardcoded `"pblang 1.0.0 ..."` version reporting in `repro_benchmark.version()` with live `--version` querying of the resolved binary.
+- **Explicit Labeling of Synthetic Catalogs, Stubs & Simulations**:
+  - Marked `stdlib/omni_bench.sapp` and `stdlib/pblang_omni_supremacy_engine.sapp` outputs with `measured_live: false` and `mode: "synthetic_catalog_model"` (and marked `omni_bench` rows in `repro_benchmark.coverage()` as `status: "synthetic_model"`).
+  - Removed fabricated fallback `linux_kernel_executed = true` results and `bash -c` shell execution in `stdlib/stage2_bootstrap_and_hil_wave4.sapp`, and labeled `pe32_mode: "banner_exit_stub"`, `hil_mode: "simulated_file_loopback"`, `physical_hardware_io: false`, `artifact_kind: "minimal_elf64_syscall_smoke_stub"`, `is_full_language_runtime: false`, and `mode: "in_vm_simulation"` across Wave 4 and `runtime_stage3/`.
+
 ## [`1.3.0-stable`] — 2026-11-06 (De-embedding `pbai` and `pb-mcp-server` into standalone repositories)
 
 ### Architectural Separation & Repository Boundaries

@@ -503,6 +503,12 @@ pub trait VmHost {
         false
     }
 
+    /// Whether trusted `stdlib:...` modules from the bundled/installed stdlib
+    /// directory may be loaded when general host path `import` is disabled.
+    fn allow_stdlib_import(&self) -> bool {
+        false
+    }
+
     /// FFI guardrails are fail-closed unless a concrete host supplies policy.
     fn ffi_allowed_library(&self, _path: &str) -> bool {
         false

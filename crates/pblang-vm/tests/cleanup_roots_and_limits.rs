@@ -200,3 +200,58 @@ fn gc_keeps_outer_pending_values_during_nested_caught_unwind() {
     assert_eq!(result.unwrap_err(), "primary");
     assert_eq!(numbers(&vm, "log"), vec![8.0, 7.0]);
 }
+
+#[test]
+fn automatic_gc_reclaims_50k_cyclic_maps_arrays_and_self_capturing_closures() {
+    let source = r#"
+        let live_map = map{ seed: 100, nested: [10, 20, 30] };
+        let live_counter = 0;
+        let bump_live = fn(delta) {
+            live_counter = live_counter + delta;
+            return live_counter + live_map.seed + live_map.nested[1];
+        };
+
+        fn churn_cycles(iterations) {
+            let local_survivor = map{ tag: 777, items: [1, 2, 3] };
+            let i = 0;
+            while i < iterations {
+                let m = map{ idx: i };
+                let a = [i];
+                let self_fn = nil;
+                self_fn = fn(x) {
+                    if x <= 0 { return m.idx + a[0]; }
+                    return self_fn(x - 1);
+                };
+                m.self_map = m;
+                m.arr = a;
+                m.cb = self_fn;
+                push(a, a);
+                push(a, m);
+                push(a, self_fn);
+                i = i + 1;
+            }
+            return local_survivor.tag + local_survivor.items[2];
+        }
+
+        // 50,000 iterations * 4 tracked cyclic objects/iter = 200,000+ cyclic objects,
+        // with ZERO manual gc_collect() calls.
+        let survivor_check = churn_cycles(50000);
+        let after_bump = bump_live(5);
+        let log = [survivor_check, after_bump, live_map.nested[2]];
+    "#;
+
+    let (vm, result) = vm_with_program(source, None);
+    assert!(result.is_ok(), "50k cycle churn failed: {result:?}");
+    assert_eq!(numbers(&vm, "log"), vec![780.0, 125.0, 30.0]);
+    assert!(
+        vm.gc_collection_count() >= 5,
+        "expected automatic cycle GC to trigger multiple times without manual gc_collect(), got {}",
+        vm.gc_collection_count()
+    );
+    assert!(
+        vm.gc_tracked_live_count() < 16_384,
+        "expected bounded live tracked objects (< 16384 out of >200,000 allocated), got {}",
+        vm.gc_tracked_live_count()
+    );
+}
+

@@ -264,3 +264,108 @@ fn minimal_vm_has_no_builtins() {
         err.message
     );
 }
+
+fn sandbox_profile_config() -> StdlibConfig {
+    StdlibConfig {
+        core: true,
+        fs: false,
+        net: false,
+        http: false,
+        json: true,
+        crypto: true,
+        sqlite: false,
+        ffi: false,
+        ffi_allow_all: false,
+        ffi_allowed_libs: HashSet::new(),
+        ffi_allowed_symbols: HashSet::new(),
+        exec: false,
+        gfx: false,
+        import: false,
+        stdlib_import: true,
+        spawn: false,
+        env: false,
+        process_exit: false,
+    }
+}
+
+#[test]
+fn sandbox_allows_trusted_stdlib_import_and_denies_traversal_and_host_io() {
+    let ok_res = run_with_config(
+        sandbox_profile_config(),
+        r#"
+        let math = import("stdlib:math.sapp");
+        if math.abs(-42) != 42 { throw "unexpected math.abs result"; }
+        "#,
+    );
+    assert!(
+        ok_res.is_ok(),
+        "trusted stdlib:math.sapp import must succeed in sandbox profile: {ok_res:?}"
+    );
+
+    for (label, forbidden_snippet) in [
+        ("stdlib parent traversal", r#"import("stdlib:../pblang.toml");"#),
+        ("relative local import", r#"import("./evil.sapp");"#),
+        ("parent relative import", r#"import("../secret.sapp");"#),
+        ("fs_read", r#"fs_read("Cargo.toml");"#),
+        ("tcp_connect", r#"tcp_connect("127.0.0.1:80");"#),
+        ("ffi_load", r#"ffi_load("./libnope.so");"#),
+        ("exec", r#"exec("ls");"#),
+    ] {
+        let err = run_with_config(sandbox_profile_config(), forbidden_snippet)
+            .unwrap_err();
+        assert!(
+            err.message.contains("denied")
+                || err.message.contains("escape")
+                || err.message.contains("traversal")
+                || err.message.contains("disallowed"),
+            "{label} must fail with access/traversal denial, got: {}",
+            err.message
+        );
+    }
+}
+
+#[test]
+fn cli_sandbox_flag_runs_pure_stdlib_from_temp_dir_and_blocks_escapes() {
+    let bin = env!("CARGO_BIN_EXE_pblang");
+    let work = std::env::temp_dir().join(format!(
+        "pblang_cli_sandbox_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&work).expect("mkdir temp test dir");
+    let ok_script = work.join("ok_stdlib.sapp");
+    std::fs::write(
+        &ok_script,
+        "let m = import(\"stdlib:math.sapp\");\nprint m.abs(-99);\n",
+    )
+    .expect("write ok_stdlib.sapp");
+
+    let out = std::process::Command::new(bin)
+        .current_dir(&work)
+        .args(["run", ok_script.to_str().unwrap(), "--sandbox"])
+        .output()
+        .expect("spawn pblang --sandbox");
+    assert!(
+        out.status.success(),
+        "CLI --sandbox stdlib import failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "99");
+
+    let bad_script = work.join("bad_escape.sapp");
+    std::fs::write(&bad_script, "import(\"stdlib:../Cargo.toml\");\n").expect("write bad_escape");
+    let bad_out = std::process::Command::new(bin)
+        .current_dir(&work)
+        .args(["run", bad_script.to_str().unwrap(), "--sandbox"])
+        .output()
+        .expect("spawn pblang --sandbox traversal");
+    assert!(
+        !bad_out.status.success(),
+        "CLI --sandbox must reject stdlib:../Cargo.toml traversal"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}

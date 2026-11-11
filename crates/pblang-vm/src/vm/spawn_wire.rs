@@ -249,13 +249,17 @@ pub(super) fn spawn_closure_from_wire(
     let mut upvalues = Vec::with_capacity(c.upvalues.len());
     for v in &c.upvalues {
         let vv = spawn_value_from_wire(v, module.clone())?;
-        upvalues.push(Rc::new(RefCell::new(Upvalue::Closed(vv))));
+        let uv_rc = Rc::new(RefCell::new(Upvalue::Closed(vv)));
+        super::gc::gc_register_upvalue(&uv_rc);
+        upvalues.push(uv_rc);
     }
-    Ok(Rc::new(Closure {
+    let closure_rc = Rc::new(Closure {
         function,
         upvalues,
         module,
-    }))
+    });
+    super::gc::gc_register_closure(&closure_rc);
+    Ok(closure_rc)
 }
 
 pub(super) fn spawn_value_from_wire(
@@ -301,6 +305,7 @@ pub(super) fn spawn_value_from_wire(
                 parent: builtins_parent,
                 exports: Default::default(),
             }));
+            super::gc::gc_register_module(&new_mod);
             // Recursively hydrate the contained values into a Vec
             // *before* taking the mutable borrow on `new_mod`, because
             // a nested entry might itself be a Module that needs to

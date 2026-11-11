@@ -70,7 +70,10 @@ mod sync;
 mod tensor;
 mod time;
 
-use gc::{gc_register_array, gc_register_map, gc_register_module};
+use gc::{
+    gc_collection_count, gc_live_tracked_count, gc_register_array, gc_register_closure,
+    gc_register_map, gc_register_module, gc_register_upvalue, gc_should_collect,
+};
 // handles::{value_to_handle, vm_handles}, spawn_wire::*, dispatch_ffi /
 // parse_ffi_sig — all consumed only inside their sibling vm/* submodules
 // now (handles by atomics/sync/memory/ffi/spawn, spawn_wire by spawn).
@@ -251,6 +254,8 @@ struct TryHandler {
 }
 
 /// Configuration for which stdlib builtins to register. Used for embedding and sandboxing.
+pub use net::ensure_tls_crypto_provider;
+
 #[derive(Debug, Clone)]
 pub struct StdlibConfig {
     pub core: bool,
@@ -272,6 +277,10 @@ pub struct StdlibConfig {
     pub gfx: bool,
     /// If true, source modules may be loaded from configured host paths.
     pub import: bool,
+    /// If true, trusted `stdlib:...` imports from the bundled/installed stdlib
+    /// directory are allowed even when arbitrary host `import` is disabled
+    /// (e.g. `--sandbox`).
+    pub stdlib_import: bool,
     /// If true, spawn/join builtins are available; if false, spawn returns "spawn not allowed".
     pub spawn: bool,
     /// If true, `env_get` may read process environment variables; if false it is
@@ -300,6 +309,7 @@ impl Default for StdlibConfig {
             exec: false,
             gfx: true,
             import: true,
+            stdlib_import: true,
             spawn: true,
             env: true,
             process_exit: true,
@@ -851,7 +861,7 @@ impl VM {
                 map.insert("parse".to_string(), Value::Builtin(json_parse));
                 map.insert("stringify".to_string(), Value::Builtin(json_stringify));
                 m.globals
-                    .insert("json".to_string(), Value::Map(Rc::new(RefCell::new(map))));
+                    .insert("json".to_string(), alloc_map(map));
             }
         }
     }
@@ -915,6 +925,7 @@ impl VM {
             }
         }
         let uv = std::rc::Rc::new(std::cell::RefCell::new(crate::Upvalue::Open(stack_index)));
+        gc_register_upvalue(&uv);
         self.open_upvalues.push(uv.clone());
         uv
     }
@@ -1175,6 +1186,7 @@ impl VM {
             upvalues: vec![],
             module: self.module.clone(),
         });
+        gc_register_closure(&script_closure);
 
         // Calling convention: [callee, arg1..argN]
         self.stack.push(Value::Closure(script_closure));
@@ -1222,6 +1234,11 @@ impl VM {
                 continue;
             }
             instruction_count = instruction_count.saturating_add(1);
+            // Automatic cycle GC safepoint: runs between instructions (never mid-builtin)
+            // when allocations since the last collection reach the adaptive watermark.
+            if (instruction_count & 0x3F) == 0 && gc_should_collect() {
+                let _ = self.gc_collect_cycles_impl();
+            }
             // GIL cooperative yield: periodically hand the lock to another waiting
             // thread so threads interleave. No-op (one predictable branch) when off.
             if gil_reg.gil.enabled && (instruction_count & 0x1FFF) == 0 {
@@ -2249,6 +2266,7 @@ impl VM {
                                 frame.closure.module.clone()
                             },
                         });
+                        gc_register_closure(&closure_rc);
                         self.stack.push(Value::Closure(closure_rc));
                     }
 
@@ -2635,11 +2653,13 @@ impl VM {
                     .last()
                     .map(|f| f.closure.module.clone())
                     .unwrap_or_else(|| self.module.clone());
-                Rc::new(Closure {
+                let c = Rc::new(Closure {
                     function: f,
                     upvalues: vec![],
                     module,
-                })
+                });
+                gc_register_closure(&c);
+                c
             }
             // Map with a __call entry: class constructor call like `Point(x, y)`.
             // Replace the callee on the stack with the __call value and retry.
@@ -3291,6 +3311,13 @@ impl VmHost for VM {
             .unwrap_or(false)
     }
 
+    fn allow_stdlib_import(&self) -> bool {
+        self.stdlib_config
+            .as_ref()
+            .map(|c| c.stdlib_import || c.import)
+            .unwrap_or(false)
+    }
+
     /// Library allowlist check. A missing policy denies access. When a policy is
     /// set, the path is canonicalised
     /// (best-effort) so `./lib.so` and `lib.so` resolve to the same entry, and
@@ -3374,9 +3401,23 @@ impl VmHost for VM {
                     .map(|p| p.to_path_buf())
             });
 
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let resolved = pblang_pm::resolve_import(path, base_dir.as_deref(), &cwd)
-            .map_err(|m| self.make_err(format!("import '{path}': {m}")))?;
+        let resolved = if !self.allow_import() {
+            if !self.allow_stdlib_import() {
+                return Err(self.make_err("import access denied"));
+            }
+            resolve_trusted_stdlib_import(path, base_dir.as_deref())
+                .map_err(|m| self.make_err(m))?
+        } else {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match pblang_pm::resolve_import(path, base_dir.as_deref(), &cwd) {
+                Ok(p) => p,
+                Err(m) if path.starts_with("stdlib:") && m == "could not find pblang.toml" => {
+                    resolve_trusted_stdlib_import(path, base_dir.as_deref())
+                        .map_err(|_| self.make_err(format!("import '{path}': {m}")))?
+                }
+                Err(m) => return Err(self.make_err(format!("import '{path}': {m}"))),
+            }
+        };
         let key = resolved.to_string_lossy().to_string();
 
         {
@@ -3441,3 +3482,144 @@ impl VmHost for VM {
         result
     }
 }
+
+/// Locate the canonical trusted `stdlib/` directory bundled with or adjacent to
+/// the running executable or system share root. Never consults CWD or ambient
+/// environment variables so untrusted working directories cannot hijack
+/// `stdlib:...` imports in `--sandbox` mode.
+fn locate_trusted_stdlib_dir() -> Option<std::path::PathBuf> {
+    fn check_stdlib_candidate(base: impl AsRef<std::path::Path>) -> Option<std::path::PathBuf> {
+        let stdlib_dir = base.as_ref().join("stdlib");
+        if stdlib_dir.join("math.sapp").is_file() {
+            return stdlib_dir.canonicalize().ok();
+        }
+        None
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..7 {
+            if let Some(d) = &dir {
+                if let Some(canon) = check_stdlib_candidate(d) {
+                    return Some(canon);
+                }
+                dir = d.parent().map(|p| p.to_path_buf());
+            }
+        }
+        if let Some(exe_dir) = exe.parent() {
+            for rel in [
+                "../share/pblang",
+                "../../share/pblang",
+                "../lib/pblang",
+                "../../lib/pblang",
+            ] {
+                if let Some(canon) = check_stdlib_candidate(exe_dir.join(rel)) {
+                    return Some(canon);
+                }
+            }
+        }
+    }
+    for sys_base in ["/usr/local/share/pblang", "/usr/share/pblang"] {
+        if let Some(canon) = check_stdlib_candidate(sys_base) {
+            return Some(canon);
+        }
+    }
+    None
+}
+
+fn resolve_subpath_within_stdlib(
+    canon_stdlib: &std::path::Path,
+    sub: &str,
+) -> Result<std::path::PathBuf, String> {
+    if sub.is_empty()
+        || sub.contains('\0')
+        || sub.contains('\\')
+        || sub.starts_with('/')
+        || sub.starts_with('.') && (sub == "." || sub == ".." || sub.starts_with("./") || sub.starts_with("../"))
+    {
+        return Err("import access denied: invalid stdlib import path".into());
+    }
+    let rel = std::path::Path::new(sub);
+    for comp in rel.components() {
+        if !matches!(comp, std::path::Component::Normal(_)) {
+            return Err("import access denied: path traversal rejected in stdlib import".into());
+        }
+    }
+
+    let mut candidates = Vec::with_capacity(4);
+    candidates.push(canon_stdlib.join(rel));
+    if !sub.ends_with(".sapp") && !sub.ends_with(".sap") {
+        candidates.push(canon_stdlib.join(format!("{sub}.sapp")));
+        candidates.push(canon_stdlib.join(format!("{sub}.sap")));
+        candidates.push(canon_stdlib.join(rel).join("mod.sapp"));
+        candidates.push(canon_stdlib.join(rel).join("index.sapp"));
+    }
+
+    for cand in candidates {
+        if let Ok(meta) = std::fs::symlink_metadata(&cand) {
+            if meta.file_type().is_symlink() {
+                return Err("import access denied: symlink rejected in stdlib import".into());
+            }
+            if meta.is_file() {
+                let canon = cand
+                    .canonicalize()
+                    .map_err(|_| "import access denied: cannot canonicalize stdlib module".to_string())?;
+                if !canon.starts_with(canon_stdlib) {
+                    return Err("import access denied: stdlib path escaped root".into());
+                }
+                return Ok(canon);
+            }
+        }
+    }
+    Err(format!("import 'stdlib:{sub}': stdlib module not found"))
+}
+
+fn resolve_trusted_stdlib_import(
+    path: &str,
+    caller_base_dir: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
+    let canon_stdlib = locate_trusted_stdlib_dir()
+        .ok_or_else(|| "import access denied: trusted stdlib directory not found".to_string())?;
+
+    if let Some(sub) = path.strip_prefix("stdlib:") {
+        return resolve_subpath_within_stdlib(&canon_stdlib, sub);
+    }
+
+    // Permit internal relative/stdlib-prefixed imports ONLY when initiated by an
+    // already-verified module executing from within `canon_stdlib`, and ONLY if
+    // the resolved file remains strictly inside `canon_stdlib`.
+    if let Some(base) = caller_base_dir {
+        if let Ok(canon_caller) = base.canonicalize() {
+            if canon_caller.starts_with(&canon_stdlib) {
+                if let Some(sub) = path.strip_prefix("stdlib/") {
+                    return resolve_subpath_within_stdlib(&canon_stdlib, sub);
+                }
+                if !path.is_empty() && !path.contains('\0') && !std::path::Path::new(path).is_absolute() {
+                    let mut candidates = vec![canon_caller.join(path)];
+                    if !path.ends_with(".sapp") && !path.ends_with(".sap") {
+                        candidates.push(canon_caller.join(format!("{path}.sapp")));
+                        candidates.push(canon_caller.join(format!("{path}.sap")));
+                    }
+                    for cand in candidates {
+                        if let Ok(meta) = std::fs::symlink_metadata(&cand) {
+                            if meta.file_type().is_symlink() {
+                                return Err("import access denied".into());
+                            }
+                            if meta.is_file() {
+                                if let Ok(canon_target) = cand.canonicalize() {
+                                    if canon_target.starts_with(&canon_stdlib) {
+                                        return Ok(canon_target);
+                                    }
+                                }
+                                return Err("import access denied".into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err("import access denied".into())
+}
+

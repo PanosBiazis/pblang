@@ -147,6 +147,7 @@ pub(super) fn spawn_builtin(
             parent: None,
             exports: Default::default(),
         }));
+        super::gc::gc_register_module(&module);
         let mut vm = VM::with_stdlib(config);
         vm.set_ffi_policy(spawn_ffi_policy);
         vm.handle_registry = child_handles;

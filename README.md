@@ -2,125 +2,82 @@
 
 <img src="assets/brand/icon.svg" width="96" height="96" alt="PBLang icon" />
 
-# PBLang `1.3.0-stable`
+# PBLang `1.4.0`
 
-**The Sovereign Full-Stack, Systems, AI/Quantum & Hardware Programming Language.**  
-*Write once in `.sapp` — compile natively to `x86-64 ELF64`, `ARM64 ELF64`, `WebAssembly`, `C99`, `Android APK`, `Web/PWA`, and `Embedded Microcontrollers` with Zero-Trust Security by default.*
+**Full-Stack, Systems & Security-Focused Programming Language & Multi-Backend Toolchain.**  
+*Write `.sapp` programs targeting the capability-gated bytecode VM, portable `C99`, native subset compilers (`x86-64 ELF64`, `ARM64 ELF64`, `WebAssembly`), desktop/web UI surfaces, and embedded targets.*
 
-[![Release](https://img.shields.io/badge/release-v1.3.0--stable-0A84FF?style=for-the-badge)](https://github.com/PanosBiazis/pblang/releases/tag/v1.3.0)
+[![Release](https://img.shields.io/badge/release-v1.4.0-0A84FF?style=for-the-badge)](https://github.com/PanosBiazis/pblang/releases/tag/v1.4.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2EA043?style=for-the-badge)](LICENSE)
-[![Backends](https://img.shields.io/badge/Backends-7_Verified_(x64_%7C_ARM64_%7C_WASM_%7C_C99_%7C_PBCK)-8A2BE2?style=for-the-badge)](#100-pblang-native-compilation-x64-arm64-wasm-pbck)
-[![Stage-3 Host](https://img.shields.io/badge/Stage--3-Zero--Rust_Direct_Syscall_ELF64-FF6B00?style=for-the-badge)](#stage-3-zero-rust-native-host--deep-runtime-kernel)
-[![Security](https://img.shields.io/badge/Security-Capability_Sandbox_%2B_A%2B_Web_Default-00C7B7?style=for-the-badge)](SECURITY.md)
+[![Backends](https://img.shields.io/badge/Backends-VM_%7C_C99_%7C_x64_%7C_ARM64_%7C_WASM_%7C_PBCK-8A2BE2?style=for-the-badge)](#100-pblang-native-compilation-x64-arm64-wasm-pbck)
+[![TLS 1.3](https://img.shields.io/badge/TLS_1.3-rustls_%2B_ring_Built--In-FF6B00?style=for-the-badge)](#architecture--implemented-surface)
+[![Security](https://img.shields.io/badge/Security-Capability_Sandbox_%2B_Static_Taint-00C7B7?style=for-the-badge)](SECURITY.md)
 
-[Quick Start](#quick-start) · [Why PBLang 1.0?](#why-pblang-10) · [Examples](examples) · [Documentation](docs) · [Tests](tests) · [Security Policy](SECURITY.md) · [Changelog](CHANGELOG.md) · [Releases](https://github.com/PanosBiazis/pblang/releases)
+[Quick Start](#quick-start) · [Why PBLang?](#why-pblang) · [Examples](examples) · [Documentation](docs) · [Tests](tests) · [Security Policy](SECURITY.md) · [Changelog](CHANGELOG.md) · [Releases](https://github.com/PanosBiazis/pblang/releases)
 
 </div>
 
 ---
 
-## Why PBLang 1.0?
+## Why PBLang?
 
-**PBLang (`1.3.0-stable`, Edition 2026)** unifies high-level developer ergonomics with deterministic systems control, built-in static taint/security auditing, multi-surface UI generation, and cycle-accurate hardware emulation + physical bus management in a single cohesive toolchain:
+**PBLang (`1.4.0`, Edition 2026)** pairs a fast, capability-gated Rust bytecode VM (`pblang-vm` with automatic cycle GC, out-of-the-box `ring` TLS 1.3, and usable `--sandbox` isolation) with a rich pure-PBLang standard library, self-hosted compiler pipeline, native subset code generators, declarative UI builders, and deterministic hardware emulators:
 
 | Pillar | Capability Highlights | Key Modules |
 | :--- | :--- | :--- |
-| **1. Multi-Backend Native Compilation** | Differential parity across **7 backends**: `selfhost_vm`, `selfhost_interp`, `native_pbck`, `c99_transpiler`, `x86_64_elf`, `arm64_elf`, and `wasm32`. | `tools/pbc.sapp`, `stdlib/compiler/backend_parity.sapp` |
-| **2. Stage-3 Zero-Rust ELF64 Emitter & Deep Kernel** | Direct Linux `x86-64`/`ARM64` syscall `ELF64` emission (`sys_mmap`, `sys_write`, `sys_munmap`, `sys_exit_group` with `0` Rust and `0` `libc` dependencies), 4KB Page/Slab Arena with generation tags, Tricolor Mark-Sweep-Compact Cycle GC + SMP Safepoints, and LIFO FFI Unwind. | `runtime_stage3/stage3_native_host_runtime.sapp`, `runtime_stage3/deep_runtime_kernel.sapp` |
-| **3. Flagship UI & 14-Target PolyForm Studio** | Build Desktop (`X11`), Hardened Web (`A+ CSP/HSTS`), Android (`APK/DEX`), CLI, and TUI apps from a single declarative view tree or ASCII sketch with **12 luxury themes** and **42 reactive components**. | `stdlib/modern_ui.sapp`, `stdlib/flagship_default_ui_engine.sapp`, `stdlib/visual_sketch_and_polyform_studio.sapp` |
-| **4. Smart Lazy-Idle Module & Memory Optimizer** | Loads only boot-critical modules on startup (`>88%` cold-start reduction), prewarms secondary modules during CPU idle slices, and zeroizes ephemeral secrets on eviction. | `stdlib/smart_lazy_idle_optimizer.sapp` |
-| **5. Cycle-Accurate Hardware Emulators & Physical Bus Manager** | **6 cycle-accurate register-level emulators** (`Arduino Uno R4 WiFi`, `ESP32-D Dual-Core`, `Bosch BME688`, `3D Printer/CNC G-code`, `NFC ISO-14443A + BLE M2543T1`, `Stylus/TouchBoard/Mobile`) + **8-target physical hardware auto-discovery**, `BOSSA`/`esptool` flashing, hot-unplug recovery & hardware `E-STOP`. | `emulators/hardware_emulators_suite.sapp`, `emulators/physical_hardware_manager.sapp` |
-| **6. Zero-Trust Security & Cryptography by Default** | Capability-gated FFI/FS/Net/Exec, default-on static security analyzer, zero-FFI OpenBSD `$2b$` Bcrypt, Rust-independent TLS 1.3 & PEM engine, RFC 7636 OIDC/SSO PKCE, and AES-256-GCM archives. | `stdlib/tls.sapp`, `stdlib/password_bcrypt.sapp`, `stdlib/oidc_sso.sapp`, `stdlib/secure_archive.sapp` |
-| **7. Native AI, ONNX & Quantum/Neuromorphic Kernels** | Deterministic pure-PBLang ONNX protobuf inference, RAG/Rank-Fusion/MinMax/Softmax, 2-Qubit Bell State $\|\Phi^+\rangle$ unitary evolution, and Leaky Integrate-and-Fire (`LIF`) spiking neurons. | `stdlib/onnx.sapp`, `stdlib/ai/`, `runtime_stage3/deep_runtime_kernel.sapp` |
-| **8. Self-Hosted IDE, LSP & Package Toolchain** | Built-in Language Server (`pblang lsp`), Native IDE (`pblang --ide`), deterministic lockfile resolver (`pblang-package-tree-v2`), E-Graph superoptimizer, and SMT formal contract verifier. | `stdlib/manifest_validate.sapp`, `stdlib/pblang_omni_supremacy_engine.sapp` |
-| **9. Guarded Polyglot Inline Blocks & Auto-Migrator** | Write inline `py { ... }`, `js { ... }`, `rs { ... }`, `c { ... }`, `cpp { ... }`, `cs { ... }`, `sql { ... }` blocks inside `.sapp`, audit them against typosquatting/escapes, or auto-transpile legacy Delphi/Python/JS/C# to native PBLang. | `stdlib/polyglot.sapp`, `stdlib/polyglot_guard.sapp`, `stdlib/llm_cognition_suite.sapp` |
-| **10. Built-in Reverse Engineering & Binary Decompiler (`REA`)** | Native ELF64, PE32+, Mach-O 64 & WASM binary auditor, Control-Flow Graph (`CFG`) decompiler, wire-protocol reconstructor, and forensic evidence ledger (replaces Ghidra/IDA/Capstone in pure `.sapp`). | `stdlib/rea_suite.sapp` |
-| **11. Anti-Prompt-Injection, Parseltongue & Supply-Chain Shield** | Detects invisible Unicode tags (`U+E0000`), Trojan Source Bidi overrides (`CVE-2021-42574`), homoglyphs, BPE token smuggling, `postinstall` hooks, typosquats, and XZ-style binary blobs before execution. | `stdlib/parseltongue.sapp`, `stdlib/prompt_safety.sapp`, `stdlib/safety_guard.sapp` |
-| **12. 12-Module LLM Cognition & Epistemic Truth Gates** | Built-in Topology Truth Gate, Epistemic Claim Gate, Causal World Alignment, Attention Continual Guard, and Self-Healing Compiler Advisor that synthesizes and verifies AST repair patches automatically. | `stdlib/llm_cognition_suite.sapp`, `stdlib/self_healing_compiler_advisor.sapp` |
+| **1. Production Bytecode VM & Multi-Backend Compilers** | Rust host VM (`pblang-vm`) with automatic trial-deletion/root-tracing cycle GC across arrays, maps, modules, upvalues, and closures, plus pure-PBLang self-hosted compilers (`selfhost_vm`, `selfhost_interp`, `native_pbck`, `c99_transpiler`, and numeric/subset emitters for `x86_64_elf`, `arm64_elf`, and `wasm32`). | `crates/pblang-vm/`, `tools/pbc.sapp`, `stdlib/compiler/backend_parity.sapp` |
+| **2. Usable `--sandbox` & Out-of-the-Box TLS 1.3** | `pblang run script.sapp --sandbox` permits canonicalized, traversal-safe `stdlib:...` imports while denying filesystem, network, HTTP, SQLite, FFI, subprocess, spawn, and env access; `stdlib/tls.sapp` works out of the box via built-in `rustls` + `ring` TLS 1.3. | `src/main.rs`, `crates/pblang-vm/src/vm/net.rs`, `stdlib/tls.sapp` |
+| **3. Declarative UI & Multi-Surface Builders** | Build Desktop (`X11`), Hardened Web (`CSP/HSTS`), Android (`APK/DEX`), CLI, and TUI surfaces from declarative view trees (`stdlib/modern_ui.sapp`, `stdlib/app.sapp`). | `stdlib/modern_ui.sapp`, `stdlib/app.sapp`, `stdlib/flagship_default_ui_engine.sapp` |
+| **4. Safe Linux Descriptor-Anchored File & Process Ops** | Race-resistant directory-descriptor file operations (`openat` / `O_NOFOLLOW`, `stdlib/linux_dirfs.sapp`, `stdlib/secure_file.sapp`), `pidfd` signaling (`stdlib/linux_pidfd.sapp`), and shell-free `execve` process supervision (`stdlib/linux_process.sapp`). | `stdlib/secure_file.sapp`, `stdlib/linux_dirfs.sapp`, `stdlib/linux_process.sapp` |
+| **5. Deterministic Hardware Emulators & Embedded AVR8** | Pure-PBLang register-level device emulators (`Arduino Uno R4 WiFi`, `ESP32-D`, `Bosch BME688`, `3D Printer/CNC G-code`, `NFC/BLE`, `Stylus/TouchBoard`) and direct ATmega328P AVR8 firmware emission. | `emulators/hardware_emulators_suite.sapp`, `stdlib/embedded.sapp` |
+| **6. Zero-Trust Security & Cryptography** | Capability-gated FFI/FS/Net/Exec, default-on static build security analysis, pure-PBLang OpenBSD `$2b$` Bcrypt, RFC 7636 OIDC/SSO PKCE, and AES-256-GCM archives. | `stdlib/tls.sapp`, `stdlib/password_bcrypt.sapp`, `stdlib/oidc_sso.sapp`, `stdlib/secure_archive.sapp` |
+| **7. Native CPU Tensors, Float Quantization & ONNX Subset** | Deterministic multi-core `f64` `tensor_matmul` (with opt-in `wgpu` `f32` offload), arbitrary-width `fN` quantization (`stdlib/floatn.sapp`), and bounded pure-PBLang CPU ONNX inference (`stdlib/onnx.sapp`). | `stdlib/onnx.sapp`, `stdlib/floatn.sapp`, `stdlib/gguf.sapp` |
+| **8. Self-Hosted IDE, Formatter, Linter, LSP & Lockfiles** | Built-in Language Server (`pblang lsp`), Native IDE (`pblang --ide`, `editors/ide/pbide.sapp`), formatter (`pblang fmt`), linter (`pblang lint`), and content-addressed package lockfiles (`pblang.lock`). | `editors/ide/pbide.sapp`, `tools/pblock.sapp`, `stdlib/manifest_validate.sapp` |
+| **9. Guarded Polyglot Interop** | Audit and run structured `polyglot` blocks (`stdlib/polyglot.sapp`, `stdlib/polyglot_guard.sapp`) with explicit `exec` capability gating and pre-flight dependency checks. | `stdlib/polyglot.sapp`, `stdlib/polyglot_guard.sapp` |
+| **10. Binary Inspection & Unicode/Supply-Chain Guards** | Pure-PBLang ELF64/PE32+/Mach-O/WASM format inspectors (`stdlib/rea_suite.sapp`), Trojan Source Bidi & invisible Unicode scanners (`stdlib/parseltongue.sapp`), and hermetic zero-hook manifests. | `stdlib/rea_suite.sapp`, `stdlib/parseltongue.sapp`, `stdlib/safety_guard.sapp` |
 
 ---
 
-## What Exists Only in PBLang? (Head-to-Head Feature Matrix)
+### Feature Showcases
 
-Unlike traditional languages that require dozens of external frameworks, SAST scanners, UI toolchains, and third-party runtimes, **PBLang builds these capabilities directly into the language and standard library**:
-
-| Capability / Built-in Feature | **PBLang `1.0`** | **Rust** | **C / C++** | **Go** | **Python** | **Zig** | **TS / Node** | **Mojo** |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **1. Guarded Polyglot Inline Blocks (`py{}`, `js{}`, `rs{}`, `c{}`, `sql{}`) + Auto-Native Migrator** | **Yes (Built-in)** | No | No | No | No | Only C ABI | No | Only Python |
-| **2. Default-On Compile-Time AST Taint Analysis (SQLi, XSS, Cmd/Path Injection)** | **Yes (Built-in)** | No (External) | No | No | No | No | No | No |
-| **3. Native AI Prompt-Injection, "Parseltongue" Unicode & BPE Smuggling Shield** | **Yes (Built-in)** | No | No | No | No | No | No | No |
-| **4. Hermetic Supply-Chain Shield (0 Install Hooks, Trojan Bidi, Typosquat, DDC, XZ Guard)** | **Yes (Built-in)** | Partial (`build.rs` runs code) | No | Partial | No (`setup.py` runs code) | Partial | No (`postinstall` runs code) | No |
-| **5. Zero-Annotation Memory Safety (`Epoch Arena` + `defer` + `0` Borrow-Checker Friction)** | **Yes (`264 KiB` RSS)** | Manual `'a` lifetimes | Unsafe manual | GC pauses | GC + high RSS | Manual allocators | V8 GC pauses | Ownership annotations |
-| **6. ASCII Sketch-to-UI & Single-Tree 14-Target PolyForm (`X11`, `A+ Web`, `Android APK`, `TUI`)** | **Yes (0 Electron/Gradle)** | No | No | No | No | No | No | No |
-| **7. Smart $O(1)$ Lazy-Idle Module Loader + Automatic RAM Secret Zeroization on Eviction** | **Yes (Built-in)** | No | No | No | No | No | No | No |
-| **8. Built-In Binary Disassembler, CFG Decompiler & Protocol Reconstructor (`REA`)** | **Yes (Built-in)** | No | No | No | No | No | No | No |
-| **9. 6 Cycle-Accurate Hardware Emulators + 8-Target Physical Bus Auto-Discovery & `E-STOP`** | **Yes (Built-in)** | No | No | No | No | No | No | No |
-| **10. Native Quantum (`ZX`/`Grover`), Biocomputing (`DNA`), Photonic (`MZI`) & Neuromorphic (`LIF`)** | **Yes (Built-in)** | No | No | No | External (`Qiskit`) | No | No | No |
-| **11. Self-Healing Compiler Advisor (Synthesizes & Sandbox-Verifies AST Repair Patches)** | **Yes (Built-in)** | Diagnostic hints only | No | No | No | No | No | No |
-| **12. Word-Width Span: `8-bit` (`CP/M`, `AVR8`) & `16-bit` (`DOS`) $\rightarrow$ `32-bit` & `64-bit` $\rightarrow$ `QPU`** | **Yes (All in 1 SDK)** | 32/64-bit (+avr nightly) | Separate toolchains | 32/64-bit only | 64-bit (heavy runtime) | 16/32/64-bit | 64-bit only | 64-bit only |
-
----
-
-### Exclusive Feature Showcases
-
-#### A. Guarded Polyglot Execution & Auto-Native Migration (`stdlib:polyglot.sapp`, `stdlib:polyglot_guard.sapp`)
-Run inline blocks of Python, JavaScript, Rust, C, C++, or SQL inside `.sapp` — guarded before execution against typosquatted dependencies (`reqests`, `urp3`), covert network/shell escapes, and unsafe build paths:
+#### A. Guarded Polyglot Pre-Flight Auditing (`stdlib:polyglot_guard.sapp`)
+Audit polyglot code snippets before execution against typosquatted dependencies (`reqests`, `urp3`) and unauthorized network/shell usage:
 
 ```pblang
 let PG = import("stdlib:polyglot_guard.sapp");
 
-// 1. Pre-flight audit of a polyglot block before execution (blocks typosquats & shell escapes):
 let check = PG.audit_block("python", "import math\nprint(math.factorial(10))", map{
     allow_network: false,
     allow_shell: false
 });
 assert(check.ok == true);
-
-// 2. Native inline polyglot interop or automatic translation to pure PBLang:
-let LLM = import("stdlib:llm_cognition_suite.sapp");
-let migrated = LLM.llm_delphi_blazor_migrator(map{
-    source_lang: "delphi",
-    code: "function CalcTotal(Price: Currency; Qty: Integer): Currency; begin Result := Price * Qty; end;"
-});
-print migrated.pblang_equivalent;
 ```
 
-#### B. Compiler-Integrated Zero-Trust Taint, Parseltongue Unicode & Supply-Chain Defense
-PBLang blocks SQL/Command/Path injection at compile time, strips invisible AI prompt-injection steganography (`Parseltongue` Unicode tags & Trojan Source Bidi overrides), and enforces capability-attenuated dependencies:
+#### B. Compiler-Integrated Taint, Unicode & Supply-Chain Defense
+PBLang checks SQL/Command/Path taint flows, flags Trojan Source Bidi overrides (`CVE-2021-42574`) and invisible Unicode tags, and enforces capability-attenuated manifests:
 
 ```pblang
-let TAINT   = import("stdlib:security_taint.sapp");
-let PARSEL  = import("stdlib:parseltongue.sapp");
-let SAFETY  = import("stdlib:safety_guard.sapp");
+let PARSEL = import("stdlib:parseltongue.sapp");
+let SAFETY = import("stdlib:safety_guard.sapp");
 
-// 1. Detect & neutralize invisible Unicode steganography / Trojan Source / homoglyphs:
 let scan = PARSEL.inspect_text(" normal_ident\u{202E}evil ");
 print scan.clean; // false — Trojan Bidi override caught!
 
-// 2. Full 36-check Memory, General & Supply-Chain/Toolchain Defense verification:
 let report = SAFETY.verify_full_memory_and_general_safety();
-print report.ok;  // true (Spatial W^X, Temporal 0-UAF, Barrett Modulo, Supply-Chain DDC/XZ/Typosquat)
+print report.ok;  // true
 ```
 
-#### C. ASCII Sketch-to-UI & 14-Target PolyForm Studio (`stdlib:visual_sketch_and_polyform_studio.sapp`)
-Turn an ASCII wireframe or declarative view tree into a native Linux `X11` desktop app, an `A+` CSP-hardened Web PWA, an Android `APK` (`DEX` bytecode), and a `TUI` dashboard with **zero Electron and zero Android Studio**:
+#### C. Out-of-the-Box TLS 1.3 & Usable `--sandbox`
+Run pure `.sapp` programs safely with `--sandbox` (trusted `stdlib:...` imports enabled; host I/O, traversal, FFI, and subprocesses denied), or establish TLS 1.3 listeners/connections directly via `stdlib:tls.sapp`:
 
 ```pblang
-let STUDIO = import("stdlib:visual_sketch_and_polyform_studio.sapp");
-
-let bundle = STUDIO.compile_sketch_to_polyform("
-+--------------------------------------------------+
-| [Header: Sovereign Telemetry Console]            |
-| [Metric: CPU 1.4ms]  [Metric: RSS 264 KiB]       |
-| [Button: Run Audit -> action:run_security_audit] |
-+--------------------------------------------------+
-", map{ theme: "obsidian_gold" });
-
-print bundle.targets_emitted; // 14 targets (x11_desktop, web_pwa_aplus, android_apk_dex, tui, ...)
+// Runs cleanly under: pblang run math_demo.sapp --sandbox
+let math = import("stdlib:math.sapp");
+print math.abs(-42);
 ```
 
-#### D. Native Binary Reverse Engineering & Decompiler (`stdlib:rea_suite.sapp`)
-Audit ELF64, PE32+, Mach-O 64, and WASM binaries, reconstruct Control-Flow Graphs (`CFG`), and extract structured wire protocols without external disassemblers:
+#### D. Binary Format Auditing & CFG Reconstruction (`stdlib:rea_suite.sapp`)
+Inspect ELF64, PE32+, Mach-O 64, and WASM headers and reconstruct basic control-flow graphs in pure `.sapp`:
 
 ```pblang
 let REA = import("stdlib:rea_suite.sapp");
@@ -134,115 +91,52 @@ print cfg.pseudocode;
 
 ## Architecture & Implemented Surface
 
-### Primary Production Surface (`1.0.0-stable`)
+### Primary Production Surface (`1.4.0`)
 
-- **Stack-based bytecode VM & Tree Interpreter** with closures, lexical upvalue cells, modules, structured errors, arrays/maps, Tricolor cycle GC, and runtime diagnostics.
+- **Rust Bytecode VM (`crates/pblang-vm`) & Tree Interpreter** with closures, lexical upvalue cells, modules, structured `try`/`catch`/`defer` unwinding, arrays/maps, automatic trial-deletion + root-tracing cycle GC across all reference types (including self-capturing closures), and runtime diagnostics.
 - **Parser, compiler, type checker, linter, formatter, Self-Healing Compiler Advisor, and CLI**.
-- **Capability-based embedding controls** through `StdlibConfig`, `VmLimits`, and `FfiPolicy`.
-- **Default-on PBLang-native build security analysis** with audited scoped
-  suppressions, `protect`/`strict`/`audit` modes, bounded custom rules and an
-  explicit opt-out. Selectable quality/performance/completeness analysis is
-  available separately through `pbanalyze`; see
-  [source security and analysis](docs/Security_Analysis.md).
+- **Capability-based sandboxing & embedding controls** through `StdlibConfig` (including `stdlib_import` for safe `--sandbox` execution of trusted `stdlib:...` modules), `VmLimits`, and fail-closed `FfiPolicy`.
+- **Built-in TLS 1.3 (`rustls` + `ring`)** initialized automatically at startup and on first TLS socket call (`stdlib:tls.sapp` `listen` / `listen_tls` / `connect` / `connect_tls` / `wrap_tls`).
+- **Default-on PBLang-native build security analysis** with audited scoped suppressions, `protect`/`strict`/`audit` modes, bounded custom rules, and an explicit opt-out. Selectable quality/performance/completeness analysis is available separately through `pbanalyze`; see [source security and analysis](docs/Security_Analysis.md).
 - **Package manager** with manifests (`pblang.toml`), content-addressed lockfiles (`pblang.lock`), SPDX license compatibility checks, 3-color DFS cycle detection, and publisher release attestations.
 - **Standard library** for files, paths, JSON, strings, arrays, maps, HTTP helpers, bounded memory/SQLite/Redis data stores, provider-neutral edge/regional CDN caching, native SQLite, bounded native Parquet metadata/PLAIN-page reading, crypto, threading, async-style helpers, testing, templates, logging, regex, tensors, and more. `stdlib:onnx.sapp` provides bounded deterministic ONNX protobuf decoding and PBLang-native CPU inference for a documented operator subset, failing closed on unsupported models without Python or ONNX Runtime. `stdlib:command_argv.sapp` converts legacy command text to bounded literal argv without shell evaluation and rejects operators, redirects, substitutions, comments and controls; new APIs should accept structured argv directly. See [data storage](docs/Data_Storage.md) and [CDN caching](docs/CDN_Caching.md).
-- **Portable coding-agent skills** through `stdlib:agent_skills.sapp`: bounded
-  `SKILL.md` frontmatter/body parsing, strict portable names and metadata,
-  Codex/Claude Code/OpenCode compatibility reports, effect-indicator review,
-  and deterministic in-memory bundles. It performs no discovery, file access,
-  placeholder expansion, plugin loading, hook registration, or command execution.
-- **Bounded identity and organization policy** through `stdlib:iam.sapp`:
-  users, organizations, memberships, system administrators,
-  `owner`/`admin`/`member`/`viewer` RBAC, explicit permissions, tenant-scoped
-  queries, and last-owner/last-admin invariants. Authentication and persistence
-  remain product-owned trust boundaries; the library never accepts a
-  caller-asserted principal as proof of identity.
+- **Portable coding-agent skills** through `stdlib:agent_skills.sapp`: bounded `SKILL.md` frontmatter/body parsing, strict portable names and metadata, compatibility reports, effect-indicator review, and deterministic in-memory bundles. It performs no discovery, file access, placeholder expansion, plugin loading, hook registration, or command execution.
+- **Bounded identity and organization policy** through `stdlib:iam.sapp`: users, organizations, memberships, system administrators, `owner`/`admin`/`member`/`viewer` RBAC, explicit permissions, tenant-scoped queries, and last-owner/last-admin invariants.
 - **PBLang-native Linux x86-64 process supervision** through `stdlib:linux_process.sapp`: direct `execve(argv)` without shell parsing, private process groups, wall/address-space limits, an independent 64 MiB child-file ceiling, separately bounded retained stdout/stderr, asynchronous `start/poll/cancel/finish`, descriptor-held fixed executable fallback through `run_fixed`, and verified process-group termination. See `examples/bounded_process/main.sapp`.
-- **Strict cron expressions** through `stdlib:cron.sapp`: complete bounded
-  five-field grammar/domain validation, field-specific diagnostics, Sunday
-  `0`/`7` compatibility and deterministic matching. Invalid list members,
-  ranges, values and steps fail closed.
-- **Carrier-independent transport guard** through
-  `stdlib:transport_security.sapp`: identity/certificate/channel pins,
-  downgrade and replay rejection, charge-only USB data blocking, and redacted
-  anomaly signals without blanket distrust of a carrier type.
+- **Strict cron expressions** through `stdlib:cron.sapp` and **carrier-independent transport guard** through `stdlib:transport_security.sapp`.
 - **LSP server** with diagnostics, completions, hover, goto-definition, workspace symbols, and semantic tokens.
 - **Native pblang IDE** via `pblang --ide`: code editor, Rope buffer & symbol indexer, terminal, visual designer, optional pbAI panel (external [pbai](https://github.com/PanosBiazis/pbai) checkout via `PBAI_HOME`), and pblang-native browser panel.
-- **Self-hosted compiler pipeline** under `stdlib/compiler/`, including tokenizer, parser, semantic analysis, type checking, IR, E-Graph optimizer, codegen, and a pblang bytecode interpreter.
+- **Self-hosted compiler pipeline & native subset codegens** under `stdlib/compiler/` and `stdlib/native/` (`codegen_x64.sapp`, `codegen_x64_tier1.sapp`, `codegen_arm64_ast.sapp`, `codegen_wasm.sapp`, `ctranspile.sapp`).
+- **Experimental Direct-Syscall Smoke Stub & In-VM Kernel Prototypes (`runtime_stage3/`)**: `stage3_native_host_runtime.sapp` emits a minimal standalone Linux `x86-64` syscall smoke-test ELF64 stub (`artifact_kind: "minimal_elf64_syscall_smoke_stub"`, `is_full_language_runtime: false`), and `deep_runtime_kernel.sapp` exercises in-VM simulations (`mode: "in_vm_simulation"`) of slab allocation, tricolor cycle collection, and small numerical kernels. They are prototype building blocks, not replacements for the Rust `pblang-vm` host.
 
-### Stage-3 Zero-Rust Native Host & Hardware Emulation / Dual-Mode Engine
+### Reproducible Live Benchmarks vs. Synthetic Catalog Models
 
-```bash
-# Emit and inspect the Stage-3 Zero-Rust Linux ELF64 executable, Deep Kernel,
-# 6 Cycle-Accurate Hardware Emulators & 8-Target Physical Hardware Manager:
-pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all
-pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all emulators
-pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all discover
-```
+PBLang strictly separates **live OS process benchmarks** from **synthetic architectural models**:
 
-### Verified Live & Omni-System Benchmark Supremacy (`1.0.0-stable` — `870 / 870` Benchmarks Won, `0` Losses)
-
-| Benchmark Suite | Executable / Driver | Comparisons / Checks | Result |
-| :--- | :--- | :---: | :---: |
-| **1. Live Linux Process Matrix** | `bench/reproducible_core_matrix.sapp` | **22 live process workloads** (`11` runtimes $\times$ `2` workloads, `3` measured runs + warmup) | **`22 / 22` Runnable (`0` losses)** |
-| **2. 12-Architecture $\times$ 3-Mode $\times$ 20-Competitor Matrix** | `bench/omni_bench.sapp` | **720 comparisons** (`12` CPU/GPU/NPU architectures $\times$ `3` PBLang modes $\times$ `20` legacy/present/future competitors) | **`720 / 720` Wins (`100%`)** |
-| **3. Quantum, Biocomputing, Signal/Photonic & Neuromorphic** | `stdlib/omni_bench.sapp` | **4 paradigm suites** (`quantum_qpu`, `biocomputing_dna`, `signal_and_photonic`, `neuromorphic_spiking`) | **`4 / 4` Wins (`100%`)** |
-| **4. Computer System Resources & Peripherals** | `stdlib/omni_bench.sapp` | **6 system resource domains** (`CPU/SIMD`, `RAM/Cache/Arena`, `NVMe/Storage`, `Network TCP/UDP/TLS`, `Display 120fps/Audio/Video`, `Embedded/IoT Buses`) | **`6 / 6` Wins (`100%`)** |
-| **5. Developer Toolchain Matrix (`10` Categories)** | `stdlib/omni_bench.sapp` | **46 head-to-head tool checks** across `build`, `test`, `check`, `fmt`, `lint`, `lsp`, `doc`, `pack`, `debug`, `repl/ide` | **`46 / 46` Wins (`100%`)** |
-| **6. Omni-Supremacy 12-Category $\times$ 60-Metric Matrix** | `stdlib/pblang_omni_supremacy_engine.sapp` | **72 category & subcategory metrics** across 30 languages (`1957–2030+`) | **`72 / 72` Wins (`100%`)** |
-| **TOTAL VERIFIED BENCHMARK COMPARISONS** | — | **`870` Total Comparisons** | **`870 / 870` Won (`0` Losses)** |
-
-| Mode / Language | Compile Median | Startup Median | `integer_kernel` (1M ops) | Peak RSS | Binary Size |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **`pblang-codegen-x64`** | **`10.38 ms`** | **`1.41 ms`** | **`4.19 ms`** | **`264 KiB`** | **`222 – 390 B`** |
-| **`pblang-c99`** | **`7.36 – 7.41 ms`** | **`1.78 ms`** | **`3.97 ms`** | **`1,560 KiB`** | **`15,960 B`** |
-| **`pblang-interpreter` (Tier-1 JIT)** | **N/A (`1.2 ms` JIT)** | **`1.33 ms`** | **`4.20 ms`** | **`264 KiB`** | **N/A** |
-| **C (`gcc 13.3 -O3`)** | `45.32 ms` | `1.59 ms` | `7.32 ms` | `1,664 KiB` | `15,960 B` |
-| **Rust (`rustc 1.94 -O`)** | `74.79 ms` | `1.88 ms` | `7.60 ms` | `2,084 KiB` | `3,893,264 B` |
-| **C++ (`g++ 13.3 -O3`)** | `69.98 – 340.41 ms` | `2.65 ms` | `7.90 ms` | `3,456 KiB` | `16,248 B` |
-| **Go (`go 1.22.2`)** | `40.96 – 149.42 ms` | `2.83 ms` | `8.47 ms` | `2,716 KiB` | `1,401,561 B` |
-| **C# (`.NET 8 / Mono`)** | `153.78 ms` | `17.26 ms` | `25.95 ms` | `16,064 KiB` | `3,072 B` |
-| **Java (`OpenJDK 21`)** | `363.26 ms` | `32.42 ms` | `42.26 ms` | `36,220 KiB` | `421 B (+JVM)` |
-| **JavaScript (`Node.js`)** | N/A | `34.18 ms` | `41.55 ms` | `42,000 KiB` | N/A |
-| **Python (`Python 3.12`)** | N/A | `14.12 ms` | `185.82 ms` | `10,456 KiB` | N/A |
-
-### Multi-OS & Multi-Architecture Downloads (`64-bit`, `32-bit`, `16-bit` & `8-bit` — `v1.0.0`)
-
-| Operating System / Target | Bits | Direct Executable | Full SDK Archive (`pblang` + `stdlib`) |
-| :--- | :---: | :--- | :--- |
-| **Linux (`x64` / `x86_64`)** | **64-bit** | `pblang-linux-x64` | `pblang-linux-x64.tar.gz` |
-| **Linux (`x86` / `i386` / `i686`)** | **32-bit** | — *(in archive)* | `pblang-linux-x86.tar.gz` |
-| **Linux (`ARM64` / `aarch64`)** | **64-bit** | — *(in archive)* | `pblang-linux-arm64.tar.gz` |
-| **Windows (`x64` / `x86_64`)** | **64-bit** | `pblang-windows-x64.exe` | `pblang-windows-x64.zip` |
-| **Windows (`x86` / `i386` / `i686`)** | **32-bit** | `pblang-windows-x86.exe` | `pblang-windows-x86.zip` |
-| **macOS Universal (`Apple Silicon` & `Intel`)** | **64-bit** | — *(in archive)* | `pblang-macos.tar.gz` |
-| **FreeBSD (`x64`)** | **64-bit** | — *(in archive)* | `pblang-freebsd-x64.tar.gz` |
-| **Android (`ARM64`)** | **64-bit** | — *(in archive)* | `pblang-android-arm64.tar.gz` |
-| **WebAssembly (`WASM32 / WASI`)** | **32-bit** | — *(in archive)* | `pblang-wasm32.tar.gz` |
-| **Bare-Metal / PBOS / Embedded (`ARM`/`RISC-V`/`ESP32`)** | **32/64-bit** | — *(in archive)* | `pblang-baremetal.tar.gz` |
-| **Legacy & Retro (`MS-DOS 16-bit`, `CP/M-80 8-bit`, `AVR 8-bit`)** | **16-bit & 8-bit** | — *(in archive)* | `pblang-legacy-8bit-16bit.zip` |
-
-### Memory Safety, General Safety & Supply-Chain/Toolchain Defense (`stdlib/safety_guard.sapp` — `36 / 36` Checks PASS)
-
-- **Spatial Memory Safety**: Bounds-checked array/slice/buffer indexing (`0 <= idx < len`), strict `W^X` (`0` RWX segments across ELF64, PE32+, Mach-O 64, and WASM32), and `NX_COMPAT` non-executable stack.
-- **Temporal Memory Safety**: Epoch-arena + deterministic reference counting + Tricolor cycle GC (`0` Use-After-Free, `0` Double-Free, `0` dangling pointers) and deterministic `defer` file-descriptor/handle cleanup (`fd_delta == 0`).
-- **Initialization, Type & NaN Safety**: Compile-time rejection of undeclared variable reads/assignments, zero-initialized registers (`r13/r12/r14`) and stack frames in native x86-64 prologues, and fail-closed IEEE-754 `NaN`/`Infinity` guards.
-- **Arithmetic & Generalized Reciprocal Safety**: Compile-time and runtime division/modulo-by-zero traps (`ud2` / `pb_div_checked` / `pb_mod_checked`), `INT64_MIN / -1` signed overflow protection, and generalized compile-time Barrett/Granlund-Montgomery reciprocal multiplication for arbitrary constant moduli `m`.
-- **Supply-Chain & Toolchain Attack Defense (`stdlib/manifest_validate.sapp` + `stdlib/safety_guard.sapp`)**:
-  - **Zero-Install-Hook Hermetic Manifests**: Rejects `[scripts]`, `[hooks]`, `preinstall`, `postinstall`, and `build_script` hooks in `pblang.toml` (`0` arbitrary install-time code execution).
-  - **Trojan Source (`CVE-2021-42574`) & Homoglyph Blocker**: Rejects Unicode Bidi override characters (`U+202A..U+202E`, `U+2066..U+2069`) before tokenization.
-  - **Typosquatting & Dependency-Confusion Blocker**: Blocks Levenshtein distance-1 typosquats against core packages (`stdlib`, `crypto`, `tls`, `http`, `json`, `sql`, `safety`, `modern_ui`, `pbai`, `pbos`) and enforces private-scope registry pinning.
-  - **Transitive Dependency Capability Attenuation**: Prevents privilege laundering (`net`/`exec`/`ffi` escalation by pure libraries).
-  - **Diverse Double-Compiling (`DDC`) & Bit-for-Bit Reproducible Builds**: Defeats Ken Thompson "Trusting Trust" compiler backdoors across `codegen_x64` and `c99_transpiler`.
-  - **XZ-Style (`CVE-2024-3094`) Binary Blob & Zip-Slip Guard**: Blocks smuggled `.so`/`.dll`/`.o` test blobs and `../` archive path traversal.
-  - **TOCTOU & Content-Addressed Lockfile (`pblang-package-tree-v2`)**: Verifies cryptographic SHA-256 tree integrity from static analysis through codegen.
+- **Live Process Benchmark Harness (`stdlib/repro_benchmark.sapp`, `bench/reproducible_core_matrix.sapp`)**:
+  - Measures real subprocess execution via `timeout` + GNU `time`, verifying stdout checksums and recording cold/warm wall time, user/system CPU time, peak RSS, and artifact size.
+  - Evaluates **4 distinct PBLang execution paths** honestly alongside installed system toolchains (`c`, `cpp`, `rust`, `go`, `java`, `csharp`, `python`, `javascript`, `zig`):
+    1. `pblang-interpreter`: runs `.sapp` source directly on the `pblang` bytecode VM (no hidden AOT binary substitution).
+    2. `pblang-c99`: measures both `.sapp -> .c` transpilation and `gcc -O3` compilation without cross-run object caching, then benchmarks the native binary.
+    3. `pblang-codegen-x64` & `pblang-tier1-x64`: measures native Linux `x86-64` ELF64 subset compilation in the compile phase, then benchmarks the standalone ELF64 binary.
+- **Synthetic Catalog Models (`stdlib/omni_bench.sapp`, `stdlib/pblang_omni_supremacy_engine.sapp`)**:
+  - Analytical/catalog models explicitly tagged with `measured_live: false` and `mode: "synthetic_catalog_model"` (and marked `status: "synthetic_model"` in `repro_benchmark.coverage()`).
 
 ```bash
 pblang run bench/reproducible_core_matrix.sapp --allow-all
-pblang run bench/omni_bench.sapp --allow-all
 pblang run tests/omni_bench_test.sapp --allow-all
 pblang run tests/safety_test.sapp --allow-all
 ```
+
+### Memory Safety, General Safety & Supply-Chain/Toolchain Defense (`stdlib/safety_guard.sapp`)
+
+- **Spatial Memory Safety**: Bounds-checked array/slice/buffer indexing (`0 <= idx < len`), strict `W^X` (`0` RWX segments across emitted ELF64, PE32+, Mach-O 64, and WASM32), and `NX_COMPAT` non-executable stack.
+- **Temporal Memory Safety**: Reference counting + automatic trial-deletion/root-tracing cycle GC in `pblang-vm` and deterministic `defer` file-descriptor/handle cleanup.
+- **Arithmetic & Generalized Reciprocal Safety**: Division/modulo-by-zero checks (`ud2` / `pb_div_checked` / `pb_mod_checked`), `INT64_MIN / -1` signed overflow protection, and Barrett/Granlund-Montgomery reciprocal multiplication for constant moduli.
+- **Supply-Chain & Toolchain Defense (`stdlib/manifest_validate.sapp` + `stdlib/safety_guard.sapp`)**:
+  - **Zero-Install-Hook Hermetic Manifests**: Rejects `[scripts]`, `[hooks]`, `preinstall`, `postinstall`, and `build_script` hooks in `pblang.toml`.
+  - **Trojan Source (`CVE-2021-42574`) Blocker**: Rejects Unicode Bidi override characters (`U+202A..U+202E`, `U+2066..U+2069`) before tokenization.
+  - **Typosquatting, Capability Attenuation & Content-Addressed Lockfiles (`pblang-package-tree-v2`)**: Enforces SHA-256 package tree verification and blocks path traversal.
 
 ---
 
@@ -252,10 +146,10 @@ pblang run tests/safety_test.sapp --allow-all
 flowchart LR
     A[".sapp Source & pblang.toml"] --> B["Supply-Chain & Bidi Guard\n(pblang.lock SHA-256 + Zero Hooks)"]
     B --> C["Static AST Taint & Safety Analyzer\n(Bounds, Init, Capability Attenuation)"]
-    C --> D["IR & E-Graph Superoptimizer\n(Barrett Reciprocal + Constant Folding)"]
-    D --> E1["Native x86-64 / ARM64\n(ELF64, PE32+, Mach-O 64)"]
-    D --> E2["Tier-1 C99 Transpiler\n(pb_div_checked / pb_mod_checked)"]
-    D --> E3["Bytecode VM & Tier-1 JIT\n(WASM32, PBCK, Stage-3 Kernel)"]
+    C --> D["Bytecode Compiler / Self-Hosted IR\n(Typecheck + Constant Folding)"]
+    D --> E1["Rust Bytecode VM (pblang-vm)\n(Auto Cycle GC + TLS 1.3 + --sandbox)"]
+    D --> E2["Portable C99 Transpiler\n(pb_div_checked / pb_mod_checked)"]
+    D --> E3["Subset Native Emitters\n(x86-64 ELF64, ARM64 ELF64, WASM32, PBCK)"]
 ```
 
 ## Repository Directory Map
@@ -264,13 +158,13 @@ flowchart LR
 | :--- | :--- |
 | [`stdlib/`](stdlib) | Self-hosted standard library, native `x64`/`ARM64`/`WASM`/`C99` compilers (`stdlib/compiler/`, `stdlib/native/`), UI (`modern_ui.sapp`), AI (`onnx.sapp`, `ai/`), cryptography (`tls.sapp`), and safety (`safety_guard.sapp`). |
 | [`docs/`](docs) | [Documentation Hub (`docs/README.md`)](docs/README.md) — Language reference, security/safety contracts, embedded/OS guides, and [`docs/reports/`](docs/reports). |
-| [`examples/`](examples) | [Runnable Examples & Demos (`examples/README.md`)](examples/README.md) — 90+ `.sapp` examples across security, GUI/Web/Android, AI, and [`examples/demos/`](examples/demos). |
-| [`bench/`](bench) | [Benchmark Suite (`bench/README.md`)](bench/README.md) — Live process matrix (`reproducible_core_matrix.sapp`) and 870-comparison Omni-Benchmark (`omni_bench.sapp`). |
-| [`tests/`](tests) | [Verification Suite (`tests/README.md`)](tests/README.md) — Memory/Supply-Chain safety (`safety_test.sapp`), Omni-Benchmark (`omni_bench_test.sapp`), and semantics tests. |
-| [`emulators/`](emulators) | [Hardware Emulators (`emulators/README.md`)](emulators/README.md) — 6 cycle-accurate register-level emulators & 8-target physical hardware bus manager. |
-| [`runtime_stage3/`](runtime_stage3) | [Stage-3 Runtime (`runtime_stage3/README.md`)](runtime_stage3/README.md) — Zero-Rust direct-syscall `ELF64` emitter, 4KB Page/Slab Arena, Tricolor GC, and Quantum/LIF kernels. |
-| [`tools/`](tools) | [Toolchain Drivers (`tools/README.md`)](tools/README.md) — Self-hosted compiler (`pbc.sapp`) and Stage-3 driver (`pblang_stage3_selfhost_driver.sapp`). |
-| [`src/`](src) | Host CLI, bytecode VM, parser, typechecker, linter, formatter, LSP server, and native IDE (`pblang --ide`). |
+| [`examples/`](examples) | [Runnable Examples & Demos (`examples/README.md`)](examples/README.md) — `.sapp` examples across security, GUI/Web/Android, AI, and [`examples/demos/`](examples/demos). |
+| [`bench/`](bench) | [Benchmark Suite (`bench/README.md`)](bench/README.md) — Live OS process matrix (`reproducible_core_matrix.sapp`) and synthetic catalog models (`omni_bench.sapp`). |
+| [`tests/`](tests) | [Verification Suite (`tests/README.md`)](tests/README.md) — Rust unit/integration tests, memory/supply-chain safety (`safety_test.sapp`), benchmark honesty (`omni_bench_test.sapp`), and semantics tests. |
+| [`emulators/`](emulators) | [Hardware Emulators (`emulators/README.md`)](emulators/README.md) — 6 deterministic register-level device emulators & hardware bus manager. |
+| [`runtime_stage3/`](runtime_stage3) | [Stage-3 Prototypes (`runtime_stage3/README.md`)](runtime_stage3/README.md) — Minimal direct-syscall Linux `ELF64` smoke-stub emitter and in-VM allocator/GC/kernel simulations. |
+| [`tools/`](tools) | [Toolchain Drivers (`tools/README.md`)](tools/README.md) — Self-hosted compiler (`pbc.sapp`), lock publisher (`pblock.sapp`), and security auditors (`pbsecure.sapp`, `pbaudit.sapp`). |
+| [`src/`](src) & [`crates/`](crates) | Production Rust CLI, `pblang-vm` bytecode VM, parser, typechecker, linter, formatter, LSP server, and native IDE (`pblang --ide`). |
 
 ---
 
@@ -674,9 +568,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         crypto: true,
         sqlite: false,
         ffi: false,
+        ffi_allow_all: false,
+        ffi_allowed_libs: Default::default(),
+        ffi_allowed_symbols: Default::default(),
         exec: false,
         gfx: false,
         import: false,
+        stdlib_import: false,
         spawn: false,
         env: false,
         process_exit: false,

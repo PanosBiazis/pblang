@@ -409,6 +409,17 @@ pub(super) fn tcp_local_addr(
 
 // ---- TLS builtins (W4-gamma) ----
 
+/// Install the `ring` crypto provider as the process-wide default for `rustls` 0.23.
+/// Safe and idempotent across multiple threads/invocations (`Once`), preventing
+/// `ServerConfig::builder()` / `ClientConfig::builder()` panics when workspace
+/// dependencies compile both `ring` and `aws-lc-rs` features into `rustls`.
+pub fn ensure_tls_crypto_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// `tcp_listen_tls(addr, cert_pem_path, key_pem_path)` → listener handle.
 /// Creates a TLS-wrapped TCP listener using rustls.
 pub(super) fn tcp_listen_tls(
@@ -418,6 +429,7 @@ pub(super) fn tcp_listen_tls(
     if !host.allow_net() {
         return Err(vm_cap!(host, "tcp_listen_tls", "net"));
     }
+    ensure_tls_crypto_provider();
     if args.len() != 3 {
         return Err(host.err(format!(
             "tcp_listen_tls() expects 3 arguments (addr, cert_path, key_path), got {}",
@@ -481,6 +493,7 @@ pub(super) fn tcp_connect_tls(
     if !host.allow_net() {
         return Err(vm_cap!(host, "tcp_connect_tls", "net"));
     }
+    ensure_tls_crypto_provider();
     if args.len() != 2 {
         return Err(host.err(format!(
             "tcp_connect_tls() expects 2 arguments (host, port), got {}",
@@ -548,6 +561,7 @@ pub(super) fn tcp_wrap_tls(host: &mut dyn VmHost, args: Vec<Value>) -> Result<Va
     if !host.allow_net() {
         return Err(vm_cap!(host, "tcp_wrap_tls", "net"));
     }
+    ensure_tls_crypto_provider();
     if args.len() != 3 {
         return Err(host.err(format!(
             "tcp_wrap_tls() expects 3 arguments (handle, cert_path, key_path), got {}",

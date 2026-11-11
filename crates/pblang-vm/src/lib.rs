@@ -17,5 +17,6 @@ pub use pblang_ir::{
     Value, VmHost,
 };
 pub use vm::{
-    bounded_json_parse, FfiPolicy, StdlibConfig, VmLimits, DEFAULT_MAX_EXTERNAL_JSON_BYTES, VM,
+    bounded_json_parse, ensure_tls_crypto_provider, FfiPolicy, StdlibConfig, VmLimits,
+    DEFAULT_MAX_EXTERNAL_JSON_BYTES, VM,
 };
