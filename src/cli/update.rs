@@ -2687,6 +2687,24 @@ fn update_self_target(opts: &UpdateOpts) -> Result<TargetReceipt, String> {
             }
         }
 
+        // Refresh rel_dir/pblang.lock after writing stdlib/MANIFEST.sha256.json so
+        // `pblang-package-tree-v2` verification inside the installed release succeeds.
+        if rel_dir.join("pblang.toml").is_file() {
+            if let Ok(rel_lock) =
+                pblang_pm::generate_lockfile_with_registry_policy(&rel_dir, None, false, false)
+            {
+                if let Ok(rel_lock_txt) = pblang_pm::write_lockfile(&rel_lock) {
+                    let clean_lock = scrub_privacy_text(&rel_lock_txt);
+                    write_atomic_with_backup(
+                        &rel_dir.join("pblang.lock"),
+                        clean_lock.as_bytes(),
+                        0o644,
+                        false,
+                    )?;
+                }
+            }
+        }
+
         fs::create_dir_all(&bin_dir).map_err(|e| format!("mkdir bin_dir: {e}"))?;
         write_atomic_with_backup(&launcher_path, &wrapper_bytes, 0o755, true)?;
         write_atomic_with_backup(&active_file, target_ver.as_bytes(), 0o644, false)?;
