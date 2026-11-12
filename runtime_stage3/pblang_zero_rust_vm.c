@@ -1,5 +1,5 @@
 /* ============================================================================
- * pblang Sovereign Zero-Rust Native Runtime & Compiler — v2.2.0
+ * pblang Sovereign Zero-Rust Native Runtime & Compiler — v2.3.0
  *
  * 100% Rust-independent cross-platform & multi-device C99 implementation of:
  *   - Native `.sapp -> .pbck` v1 preprocessor, Unicode lexer, parser,
@@ -27,7 +27,7 @@
 #include <dirent.h>
 #endif
 
-#define PBLANG_ZR_VERSION_STR "pblang 2.2.0 (sovereign zero-rust runtime; compat 1.5.0)"
+#define PBLANG_ZR_VERSION_STR "pblang 2.3.0 (sovereign zero-rust runtime; compat 1.5.0)"
 
 static void zr_print_version(void) {
     printf("%s\n", PBLANG_ZR_VERSION_STR);

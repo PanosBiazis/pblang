@@ -1,4 +1,4 @@
-# Contributing to PBLang (`2.2.0`)
+# Contributing to PBLang (`2.3.0`)
 
 Thank you for your interest in contributing to **PBLang**! This guide covers building the Sovereign Zero-Rust host runtime, working on the self-hosted compiler & standard library, running verification suites, and maintaining public repository hygiene.
 
@@ -6,11 +6,11 @@ Thank you for your interest in contributing to **PBLang**! This guide covers bui
 
 ### Prerequisites
 
-- **Primary (`PBLang 2.2.0` Sovereign Zero-Rust Runtime & Universal `64/32/16/8-bit` Toolchain)**:
+- **Primary (`PBLang 2.3.0` Sovereign Zero-Rust Runtime & Universal `64/32/16/8-bit` Toolchain)**:
   - Linux / macOS: C99 compiler (`gcc` or `clang`) + `git`
   - Windows (`x86-64` / `x86` / `ARM64`): `MinGW-w64` (`x86_64-w64-mingw32-gcc`, `i686-w64-mingw32-gcc`) + `git`
 - **Optional (Legacy Reference Workspace `crates/*` only)**:
-  - Rust stable toolchain (`rustup`) — *not required to build, run, or test `pblang 2.2.0`*.
+  - Rust stable toolchain (`rustup`) — *not required to build, run, or test `pblang 2.3.0`*.
 
 ### Build & Quick Verification
 
