@@ -4692,27 +4692,82 @@ static void zr_polyglot_lang_cmd(const char *lang, const char **bin, const char 
     *flag = "-c";
     if (strcmp(low, "python") == 0 || strcmp(low, "py") == 0 || strcmp(low, "python3") == 0) { *bin = "python3"; *flag = "-c"; }
     else if (strcmp(low, "js") == 0 || strcmp(low, "javascript") == 0 || strcmp(low, "node") == 0) { *bin = "node"; *flag = "-e"; }
+    else if (strcmp(low, "deno") == 0) { *bin = "deno"; *flag = "eval"; }
+    else if (strcmp(low, "bun") == 0) { *bin = "bun"; *flag = "-e"; }
     else if (strcmp(low, "bash") == 0) { *bin = "bash"; *flag = "-c"; }
-    else if (strcmp(low, "sh") == 0 || strcmp(low, "shell") == 0) { *bin = "sh"; *flag = "-c"; }
+    else if (strcmp(low, "sh") == 0 || strcmp(low, "shell") == 0 || strcmp(low, "posix-sh") == 0) { *bin = "sh"; *flag = "-c"; }
+    else if (strcmp(low, "zsh") == 0) { *bin = "zsh"; *flag = "-c"; }
+    else if (strcmp(low, "fish") == 0) { *bin = "fish"; *flag = "-c"; }
+    else if (strcmp(low, "pwsh") == 0 || strcmp(low, "powershell") == 0 || strcmp(low, "ps1") == 0) { *bin = "pwsh"; *flag = "-c"; }
     else if (strcmp(low, "ruby") == 0 || strcmp(low, "rb") == 0) { *bin = "ruby"; *flag = "-e"; }
     else if (strcmp(low, "perl") == 0 || strcmp(low, "pl") == 0) { *bin = "perl"; *flag = "-e"; }
+    else if (strcmp(low, "raku") == 0 || strcmp(low, "perl6") == 0) { *bin = "raku"; *flag = "-e"; }
     else if (strcmp(low, "lua") == 0) { *bin = "lua"; *flag = "-e"; }
+    else if (strcmp(low, "luajit") == 0) { *bin = "luajit"; *flag = "-e"; }
     else if (strcmp(low, "php") == 0) { *bin = "php"; *flag = "-r"; }
-    else if (strcmp(low, "r") == 0) { *bin = "Rscript"; *flag = "-e"; }
+    else if (strcmp(low, "r") == 0 || strcmp(low, "rscript") == 0) { *bin = "Rscript"; *flag = "-e"; }
+    else if (strcmp(low, "tcl") == 0 || strcmp(low, "tclsh") == 0) { *bin = "tclsh"; *flag = "-c"; }
+    else if (strcmp(low, "awk") == 0 || strcmp(low, "gawk") == 0) { *bin = "awk"; *flag = ""; }
+    else if (strcmp(low, "sed") == 0) { *bin = "sed"; *flag = "-e"; }
+    else if (strcmp(low, "m4") == 0) { *bin = "m4"; *flag = ""; }
+    else if (strcmp(low, "jq") == 0) { *bin = "jq"; *flag = "-r"; }
+    else if (strcmp(low, "bc") == 0) { *bin = "bc"; *flag = "-l"; }
+    else if (strcmp(low, "dc") == 0) { *bin = "dc"; *flag = "-e"; }
+    else if (strcmp(low, "gnuplot") == 0) { *bin = "gnuplot"; *flag = "-e"; }
     else if (strcmp(low, "julia") == 0 || strcmp(low, "jl") == 0) { *bin = "julia"; *flag = "-e"; }
-    else if (strcmp(low, "deno") == 0) { *bin = "deno"; *flag = "eval"; }
-    else if (strcmp(low, "pwsh") == 0 || strcmp(low, "powershell") == 0) { *bin = "pwsh"; *flag = "-c"; }
+    else if (strcmp(low, "octave") == 0 || strcmp(low, "matlab") == 0) { *bin = "octave"; *flag = "--eval"; }
+    else if (strcmp(low, "maxima") == 0) { *bin = "maxima"; *flag = "--batch-string"; }
+    else if (strcmp(low, "gap") == 0) { *bin = "gap"; *flag = "-c"; }
+    else if (strcmp(low, "pari") == 0 || strcmp(low, "gp") == 0) { *bin = "gp"; *flag = "-q"; }
+    else if (strcmp(low, "lisp") == 0 || strcmp(low, "commonlisp") == 0 || strcmp(low, "sbcl") == 0) { *bin = "sbcl"; *flag = "--eval"; }
+    else if (strcmp(low, "scheme") == 0 || strcmp(low, "guile") == 0) { *bin = "guile"; *flag = "-c"; }
+    else if (strcmp(low, "racket") == 0 || strcmp(low, "rkt") == 0) { *bin = "racket"; *flag = "-e"; }
+    else if (strcmp(low, "clojure") == 0 || strcmp(low, "clj") == 0) { *bin = "clojure"; *flag = "-e"; }
+    else if (strcmp(low, "janet") == 0) { *bin = "janet"; *flag = "-e"; }
+    else if (strcmp(low, "fennel") == 0) { *bin = "fennel"; *flag = "-e"; }
+    else if (strcmp(low, "elixir") == 0 || strcmp(low, "ex") == 0 || strcmp(low, "exs") == 0) { *bin = "elixir"; *flag = "-e"; }
+    else if (strcmp(low, "groovy") == 0) { *bin = "groovy"; *flag = "-e"; }
+    else if (strcmp(low, "ocaml") == 0) { *bin = "ocaml"; *flag = "-e"; }
+    else if (strcmp(low, "scala") == 0) { *bin = "scala"; *flag = "-e"; }
+    else if (strcmp(low, "prolog") == 0 || strcmp(low, "swipl") == 0) { *bin = "swipl"; *flag = "-g"; }
+    else if (strcmp(low, "smalltalk") == 0 || strcmp(low, "gst") == 0) { *bin = "gst"; *flag = "-e"; }
+    else if (strcmp(low, "forth") == 0 || strcmp(low, "gforth") == 0 || strcmp(low, "fth") == 0) { *bin = "gforth"; *flag = "-e"; }
+    else if (strcmp(low, "idris") == 0 || strcmp(low, "idris2") == 0) { *bin = "idris2"; *flag = "--exec"; }
+    else if (strcmp(low, "qsharp") == 0 || strcmp(low, "qs") == 0 || strcmp(low, "q#") == 0) { *bin = "python3"; *flag = "-c"; }
+    else if (strcmp(low, "sql") == 0 || strcmp(low, "sqlite") == 0) { *bin = "sqlite3"; *flag = ":memory:"; }
+    else if (strcmp(low, "postgresql") == 0 || strcmp(low, "psql") == 0) { *bin = "psql"; *flag = "-c"; }
+    else if (strcmp(low, "mysql") == 0 || strcmp(low, "mariadb") == 0) { *bin = "mysql"; *flag = "-e"; }
+    else if (strcmp(low, "duckdb") == 0) { *bin = "duckdb"; *flag = "-c"; }
+    else if (strcmp(low, "mongodb") == 0 || strcmp(low, "mongosh") == 0) { *bin = "mongosh"; *flag = "--eval"; }
+    else if (strcmp(low, "redis") == 0) { *bin = "redis-cli"; *flag = "--eval"; }
+    else if (strcmp(low, "sass") == 0 || strcmp(low, "scss") == 0) { *bin = "sass"; *flag = "--stdin"; }
+    else if (strcmp(low, "less") == 0) { *bin = "lessc"; *flag = "-"; }
     else { *bin = NULL; *flag = NULL; }
 }
 
 static bool bi_polyglot_detect(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     (void)argc; (void)argv;
     static const struct { const char *name; const char *bin; } probes[] = {
-        {"python", "python3"}, {"js", "node"}, {"bash", "bash"}, {"sh", "sh"},
-        {"ruby", "ruby"}, {"perl", "perl"}, {"lua", "lua"}, {"php", "php"},
-        {"c", "gcc"}, {"cpp", "g++"}, {"rust", "rustc"}, {"go", "go"}
+        {"python", "python3"}, {"js", "node"}, {"deno", "deno"}, {"bun", "bun"},
+        {"bash", "bash"}, {"sh", "sh"}, {"zsh", "zsh"}, {"fish", "fish"}, {"pwsh", "pwsh"},
+        {"ruby", "ruby"}, {"perl", "perl"}, {"raku", "raku"}, {"lua", "lua"}, {"php", "php"},
+        {"r", "Rscript"}, {"tcl", "tclsh"}, {"awk", "awk"}, {"sed", "sed"}, {"m4", "m4"},
+        {"jq", "jq"}, {"bc", "bc"}, {"dc", "dc"}, {"gnuplot", "gnuplot"},
+        {"julia", "julia"}, {"octave", "octave"}, {"lisp", "sbcl"}, {"scheme", "guile"},
+        {"racket", "racket"}, {"clojure", "clojure"}, {"elixir", "elixir"}, {"erlang", "erl"},
+        {"prolog", "swipl"}, {"smalltalk", "gst"}, {"forth", "gforth"}, {"ocaml", "ocaml"},
+        {"scala", "scala"}, {"groovy", "groovy"}, {"haskell", "ghc"}, {"idris2", "idris2"},
+        {"lean", "lean"}, {"coq", "coqc"}, {"z3", "z3"},
+        {"c", "gcc"}, {"clang", "clang"}, {"cpp", "g++"}, {"rust", "rustc"}, {"go", "go"},
+        {"zig", "zig"}, {"pascal", "fpc"}, {"fortran", "gfortran"}, {"cobol", "cobc"},
+        {"ada", "gnatmake"}, {"d", "gdc"}, {"nim", "nim"}, {"crystal", "crystal"},
+        {"swift", "swiftc"}, {"java", "javac"}, {"kotlin", "kotlinc"}, {"dotnet", "dotnet"},
+        {"nasm", "nasm"}, {"gas", "as"}, {"avr-gcc", "avr-gcc"},
+        {"verilog", "iverilog"}, {"vhdl", "ghdl"}, {"spice", "ngspice"}, {"openscad", "openscad"},
+        {"sqlite", "sqlite3"}, {"psql", "psql"}, {"mysql", "mysql"}, {"duckdb", "duckdb"},
+        {"latex", "pdflatex"}, {"graphviz", "dot"}, {"lilypond", "lilypond"}
     };
-    PbMap *m = pb_map_new_raw(vm, 32);
+    PbMap *m = pb_map_new_raw(vm, 128);
     vm_push_root(vm, val_obj(m));
     for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
         PbValue arg = val_obj(pb_str_new(vm, probes[i].bin, strlen(probes[i].bin)));
@@ -4758,7 +4813,9 @@ static bool bi_polyglot_exec(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (!bin) return vm_error(vm, "polyglot_exec(): unsupported language '%s'", AS_STR(argv[0])->chars);
     PbArray *ca = pb_array_new_raw(vm, 2);
     vm_push_root(vm, val_obj(ca));
-    pb_array_push(vm, ca, val_obj(pb_str_new(vm, flag, strlen(flag))));
+    if (flag && flag[0] != '\0') {
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, flag, strlen(flag))));
+    }
     pb_array_push(vm, ca, argv[1]);
     PbValue sargs[2];
     sargs[0] = val_obj(pb_str_new(vm, bin, strlen(bin)));
@@ -4784,7 +4841,9 @@ static bool bi_polyglot_exec_with_input(PbVM *vm, int argc, PbValue *argv, PbVal
     if (!bin) return vm_error(vm, "polyglot_exec_with_input(): unsupported language '%s'", AS_STR(argv[0])->chars);
     PbArray *ca = pb_array_new_raw(vm, 2);
     vm_push_root(vm, val_obj(ca));
-    pb_array_push(vm, ca, val_obj(pb_str_new(vm, flag, strlen(flag))));
+    if (flag && flag[0] != '\0') {
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, flag, strlen(flag))));
+    }
     pb_array_push(vm, ca, argv[1]);
     PbMap *opts = pb_map_new_raw(vm, 4);
     vm_push_root(vm, val_obj(opts));
@@ -4809,12 +4868,36 @@ static bool bi_polyglot_exec_compiled(PbVM *vm, int argc, PbValue *argv, PbValue
     if (argc != 2 || !is_obj_type(argv[0], OBJ_STR) || !is_obj_type(argv[1], OBJ_STR)) {
         return vm_error(vm, "polyglot_exec_compiled(lang, code) expects 2 string arguments");
     }
-    const char *lang = AS_STR(argv[0])->chars;
-    const char *ext = ".c", *compiler = "gcc";
-    if (strcmp(lang, "cpp") == 0 || strcmp(lang, "c++") == 0) { ext = ".cpp"; compiler = "g++"; }
-    else if (strcmp(lang, "rust") == 0 || strcmp(lang, "rs") == 0) { ext = ".rs"; compiler = "rustc"; }
-    else if (strcmp(lang, "c") != 0) {
-        return vm_error(vm, "polyglot_exec_compiled(): unsupported compiled language '%s'", lang);
+    char low[32];
+    size_t li = 0;
+    const char *raw_lang = AS_STR(argv[0])->chars;
+    while (raw_lang[li] && li < 31) { low[li] = (char)tolower((unsigned char)raw_lang[li]); li++; }
+    low[li] = '\0';
+
+    const char *ext = ".c", *compiler = "gcc", *runner = NULL;
+    int mode = 0; /* 0: compiler src -o bin; 1: compiler run src (go/zig); 2: fpc -FEdir -obin src; 3: cobc -x -o bin src; 4: iverilog -o bin src + vvp bin */
+    if (strcmp(low, "c") == 0 || strcmp(low, "c99") == 0 || strcmp(low, "c11") == 0) { ext = ".c"; compiler = "gcc"; }
+    else if (strcmp(low, "cpp") == 0 || strcmp(low, "c++") == 0 || strcmp(low, "cxx") == 0) { ext = ".cpp"; compiler = "g++"; }
+    else if (strcmp(low, "rust") == 0 || strcmp(low, "rs") == 0) { ext = ".rs"; compiler = "rustc"; }
+    else if (strcmp(low, "fortran") == 0 || strcmp(low, "f90") == 0 || strcmp(low, "f95") == 0 || strcmp(low, "f77") == 0) { ext = ".f90"; compiler = "gfortran"; }
+    else if (strcmp(low, "d") == 0) { ext = ".d"; compiler = "gdc"; }
+    else if (strcmp(low, "haskell") == 0 || strcmp(low, "hs") == 0) { ext = ".hs"; compiler = "ghc"; }
+    else if (strcmp(low, "objc") == 0 || strcmp(low, "objective-c") == 0) { ext = ".m"; compiler = "gcc"; }
+    else if (strcmp(low, "ada") == 0 || strcmp(low, "adb") == 0) { ext = ".adb"; compiler = "gnatmake"; }
+    else if (strcmp(low, "swift") == 0) { ext = ".swift"; compiler = "swiftc"; }
+    else if (strcmp(low, "vala") == 0) { ext = ".vala"; compiler = "valac"; }
+    else if (strcmp(low, "go") == 0 || strcmp(low, "golang") == 0) { ext = ".go"; compiler = "go"; mode = 1; }
+    else if (strcmp(low, "zig") == 0) { ext = ".zig"; compiler = "zig"; mode = 1; }
+    else if (strcmp(low, "nim") == 0) { ext = ".nim"; compiler = "nim"; mode = 1; }
+    else if (strcmp(low, "crystal") == 0 || strcmp(low, "cr") == 0) { ext = ".cr"; compiler = "crystal"; mode = 1; }
+    else if (strcmp(low, "odin") == 0) { ext = ".odin"; compiler = "odin"; mode = 1; }
+    else if (strcmp(low, "v") == 0 || strcmp(low, "vlang") == 0) { ext = ".v"; compiler = "v"; mode = 1; }
+    else if (strcmp(low, "mojo") == 0) { ext = ".mojo"; compiler = "mojo"; mode = 1; }
+    else if (strcmp(low, "pascal") == 0 || strcmp(low, "pas") == 0 || strcmp(low, "delphi") == 0 || strcmp(low, "fpc") == 0) { ext = ".pas"; compiler = "fpc"; mode = 2; }
+    else if (strcmp(low, "cobol") == 0 || strcmp(low, "cob") == 0) { ext = ".cob"; compiler = "cobc"; mode = 3; }
+    else if (strcmp(low, "verilog") == 0 || strcmp(low, "sv") == 0 || strcmp(low, "systemverilog") == 0) { ext = ".v"; compiler = "iverilog"; runner = "vvp"; mode = 4; }
+    else {
+        return vm_error(vm, "polyglot_exec_compiled(): unsupported compiled language '%s'", raw_lang);
     }
     const char *tmpd = getenv("TMPDIR");
 #ifdef _WIN32
@@ -4823,27 +4906,61 @@ static bool bi_polyglot_exec_compiled(PbVM *vm, int argc, PbValue *argv, PbValue
 #else
     if (!tmpd || !*tmpd) tmpd = "/tmp";
 #endif
-    char hex_hash[25];
-    zr_sha256_short_hex(AS_STR(argv[1])->chars, AS_STR(argv[1])->len, hex_hash);
-    hex_hash[16] = '\0';
+    uint8_t rnd[8];
+    zr_csprng_bytes(rnd, sizeof(rnd));
+    char rnd_hex[17];
+    for (int r = 0; r < 8; r++) snprintf(rnd_hex + r * 2, 3, "%02x", rnd[r]);
     char src_path[512], bin_path[512];
 #ifdef _WIN32
-    snprintf(src_path, sizeof(src_path), "%s\\pb_poly_%s%s", tmpd, hex_hash, ext);
-    snprintf(bin_path, sizeof(bin_path), "%s\\pb_poly_%s.exe", tmpd, hex_hash);
+    snprintf(src_path, sizeof(src_path), "%s\\pb_poly_%s%s", tmpd, rnd_hex, ext);
+    snprintf(bin_path, sizeof(bin_path), "%s\\pb_poly_%s.exe", tmpd, rnd_hex);
 #else
-    snprintf(src_path, sizeof(src_path), "%s/pb_poly_%s%s", tmpd, hex_hash, ext);
-    snprintf(bin_path, sizeof(bin_path), "%s/pb_poly_%s", tmpd, hex_hash);
+    snprintf(src_path, sizeof(src_path), "%s/pb_poly_%s%s", tmpd, rnd_hex, ext);
+    snprintf(bin_path, sizeof(bin_path), "%s/pb_poly_%s", tmpd, rnd_hex);
 #endif
     FILE *fp = fopen(src_path, "wb");
     if (!fp) return vm_error(vm, "polyglot_exec_compiled(): cannot write temp source");
     fwrite(AS_STR(argv[1])->chars, 1, AS_STR(argv[1])->len, fp);
     fclose(fp);
 
-    PbArray *ca = pb_array_new_raw(vm, 4);
+    if (mode == 1) {
+        PbArray *ca = pb_array_new_raw(vm, 2);
+        vm_push_root(vm, val_obj(ca));
+        const char *subcmd = (strcmp(compiler, "nim") == 0) ? "r" : "run";
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, subcmd, strlen(subcmd))));
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, src_path, strlen(src_path))));
+        PbValue cargs[2];
+        cargs[0] = val_obj(pb_str_new(vm, compiler, strlen(compiler)));
+        cargs[1] = val_obj(ca);
+        vm_push_root(vm, cargs[0]);
+        PbValue rm = val_nil();
+        bool rok = bi_proc_spawn_wait(vm, 2, cargs, &rm);
+        vm_pop_roots(vm, 2);
+        remove(src_path);
+        if (!rok) return false;
+        vm_push_root(vm, rm);
+        bool fok = zr_polyglot_format_result(vm, rm, out);
+        vm_pop_roots(vm, 1);
+        return fok;
+    }
+
+    PbArray *ca = pb_array_new_raw(vm, 5);
     vm_push_root(vm, val_obj(ca));
-    pb_array_push(vm, ca, val_obj(pb_str_new(vm, src_path, strlen(src_path))));
-    pb_array_push(vm, ca, val_obj(pb_str_new(vm, "-o", 2)));
-    pb_array_push(vm, ca, val_obj(pb_str_new(vm, bin_path, strlen(bin_path))));
+    if (mode == 2) {
+        char oarg[540];
+        snprintf(oarg, sizeof(oarg), "-o%s", bin_path);
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, oarg, strlen(oarg))));
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, src_path, strlen(src_path))));
+    } else if (mode == 3) {
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, "-x", 2)));
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, "-o", 2)));
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, bin_path, strlen(bin_path))));
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, src_path, strlen(src_path))));
+    } else {
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, src_path, strlen(src_path))));
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, "-o", 2)));
+        pb_array_push(vm, ca, val_obj(pb_str_new(vm, bin_path, strlen(bin_path))));
+    }
     PbValue cargs[2];
     cargs[0] = val_obj(pb_str_new(vm, compiler, strlen(compiler)));
     cargs[1] = val_obj(ca);
@@ -4864,7 +4981,12 @@ static bool bi_polyglot_exec_compiled(PbVM *vm, int argc, PbValue *argv, PbValue
     PbArray *ra = pb_array_new_raw(vm, 1);
     vm_push_root(vm, val_obj(ra));
     PbValue rargs[2];
-    rargs[0] = val_obj(pb_str_new(vm, bin_path, strlen(bin_path)));
+    if (runner) {
+        pb_array_push(vm, ra, val_obj(pb_str_new(vm, bin_path, strlen(bin_path))));
+        rargs[0] = val_obj(pb_str_new(vm, runner, strlen(runner)));
+    } else {
+        rargs[0] = val_obj(pb_str_new(vm, bin_path, strlen(bin_path)));
+    }
     rargs[1] = val_obj(ra);
     vm_push_root(vm, rargs[0]);
     PbValue rm = val_nil();
@@ -4886,6 +5008,7 @@ static bool bi_polyglot_compile_cached(PbVM *vm, int argc, PbValue *argv, PbValu
     const char *lang = AS_STR(argv[0])->chars;
     const char *ext = ".c", *compiler = "gcc";
     if (strcmp(lang, "cpp") == 0 || strcmp(lang, "c++") == 0) { ext = ".cpp"; compiler = "g++"; }
+    else if (strcmp(lang, "fortran") == 0 || strcmp(lang, "f90") == 0) { ext = ".f90"; compiler = "gfortran"; }
     else if (strcmp(lang, "c") != 0) {
         return vm_error(vm, "polyglot_compile_cached(): unsupported shared-lib language '%s'", lang);
     }

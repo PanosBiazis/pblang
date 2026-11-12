@@ -1,6 +1,6 @@
 # PBLang Verification & Safety Test Suite (`tests/`)
 
-This directory contains the automated verification tests for **PBLang `2.1.0`**, covering the Sovereign Zero-Rust Host VM & `.sapp` compiler, universal `64/32/16/8-bit` native machine-code compilers, Hardware Governor & Sovereign Studio UI, smart polymorphic `pblang update`, 24 algorithms / Quantum / DNA / FIPS 203 `ML-KEM-768`, memory safety, and public release hygiene.
+This directory contains the automated verification tests for **PBLang `2.2.0`**, covering the Sovereign Zero-Rust Host VM & `.sapp` compiler, universal `64/32/16/8-bit` native machine-code compilers, Hardware Governor & Sovereign Studio UI, smart polymorphic `pblang update`, 24 algorithms / Quantum / DNA / FIPS 203 `ML-KEM-768`, memory safety, and public release hygiene.
 
 ---
 

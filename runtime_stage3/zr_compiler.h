@@ -200,12 +200,13 @@ static bool zr_preprocess_sapp(const char *raw,
             continue;
         }
 
-        /* Polyglot block @lang [name] [(attrs)] { ... } */
-        if (c == '@' && i + 1 < raw_len && (isalpha((unsigned char)buf[i + 1]) || buf[i + 1] == '_')) {
+        /* Polyglot block @lang [name] [(attrs) | [attrs]] { ... } */
+        if (c == '@' && i + 1 < raw_len && (isalnum((unsigned char)buf[i + 1]) || buf[i + 1] == '_')) {
             size_t start_pos = i;
             uint32_t blk_line = line;
             size_t p = i + 1;
-            while (p < raw_len && (isalnum((unsigned char)buf[p]) || buf[p] == '_' || buf[p] == '+')) p++;
+            while (p < raw_len && (isalnum((unsigned char)buf[p]) || buf[p] == '_' ||
+                                   buf[p] == '+' || buf[p] == '-' || buf[p] == '#' || buf[p] == '.')) p++;
             char *lang = zr_xstrndup(buf + i + 1, p - (i + 1));
 
             while (p < raw_len && (buf[p] == ' ' || buf[p] == '\t')) p++;
@@ -219,17 +220,19 @@ static bool zr_preprocess_sapp(const char *raw,
 
             char **akeys = NULL, **avals = NULL;
             size_t acount = 0;
-            if (p < raw_len && buf[p] == '(') {
+            if (p < raw_len && (buf[p] == '(' || buf[p] == '[')) {
+                char close_ch = (buf[p] == '[') ? ']' : ')';
                 p++;
-                while (p < raw_len && buf[p] != ')') {
+                while (p < raw_len && buf[p] != close_ch) {
                     while (p < raw_len && (isspace((unsigned char)buf[p]) || buf[p] == ',')) p++;
-                    if (p >= raw_len || buf[p] == ')') break;
+                    if (p >= raw_len || buf[p] == close_ch) break;
                     size_t ks = p;
-                    while (p < raw_len && (isalnum((unsigned char)buf[p]) || buf[p] == '_')) p++;
+                    while (p < raw_len && (isalnum((unsigned char)buf[p]) || buf[p] == '_' || buf[p] == '-')) p++;
+                    if (p == ks) { p++; continue; }
                     char *k = zr_xstrndup(buf + ks, p - ks);
                     while (p < raw_len && (buf[p] == ' ' || buf[p] == '\t')) p++;
                     char *v = zr_xstrdup("true");
-                    if (p < raw_len && buf[p] == '=') {
+                    if (p < raw_len && (buf[p] == '=' || buf[p] == ':')) {
                         p++;
                         while (p < raw_len && (buf[p] == ' ' || buf[p] == '\t')) p++;
                         free(v);
@@ -241,9 +244,12 @@ static bool zr_preprocess_sapp(const char *raw,
                             if (p < raw_len && buf[p] == aq) p++;
                         } else {
                             size_t vs = p;
-                            while (p < raw_len && buf[p] != ',' && buf[p] != ')' && !isspace((unsigned char)buf[p])) p++;
+                            while (p < raw_len && buf[p] != ',' && buf[p] != close_ch && !isspace((unsigned char)buf[p])) p++;
                             v = zr_xstrndup(buf + vs, p - vs);
                         }
+                    }
+                    if (!bname && strcmp(k, "name") == 0 && v[0] != '\0') {
+                        bname = zr_xstrdup(v);
                     }
                     akeys = (char **)zr_xrealloc(akeys, (acount + 1) * sizeof(char *));
                     avals = (char **)zr_xrealloc(avals, (acount + 1) * sizeof(char *));
@@ -251,7 +257,7 @@ static bool zr_preprocess_sapp(const char *raw,
                     avals[acount] = v;
                     acount++;
                 }
-                if (p < raw_len && buf[p] == ')') p++;
+                if (p < raw_len && buf[p] == close_ch) p++;
             }
             while (p < raw_len && isspace((unsigned char)buf[p])) p++;
             if (p < raw_len && buf[p] == '{') {
@@ -259,8 +265,18 @@ static bool zr_preprocess_sapp(const char *raw,
                 int bdepth = 1;
                 p++;
                 while (p < raw_len && bdepth > 0) {
-                    if (buf[p] == '{') bdepth++;
-                    else if (buf[p] == '}') bdepth--;
+                    char pc = buf[p];
+                    if (pc == '"') {
+                        p++;
+                        while (p < raw_len && buf[p] != '"') {
+                            if (buf[p] == '\\' && p + 1 < raw_len) p += 2;
+                            else p++;
+                        }
+                        if (p < raw_len) p++;
+                        continue;
+                    }
+                    if (pc == '{') bdepth++;
+                    else if (pc == '}') bdepth--;
                     if (bdepth > 0) p++;
                 }
                 if (bdepth == 0) {

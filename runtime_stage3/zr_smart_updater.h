@@ -25,7 +25,7 @@
 #include <sys/stat.h>
 #endif
 
-#define ZR_SU_SEMVER "2.1.0"
+#define ZR_SU_SEMVER "2.2.0"
 #define ZR_SU_MAX_ENTRIES 10000
 #define ZR_SU_MAX_BYTES   (256ULL * 1024ULL * 1024ULL)
 

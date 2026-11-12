@@ -2,45 +2,46 @@
 
 <img src="assets/brand/icon.svg" width="96" height="96" alt="PBLang icon" />
 
-# PBLang `2.1.0`
+# PBLang `2.2.0`
 
-**Sovereign Zero-Rust Universal Programming Language (`64-bit · 32-bit · 16-bit · 8-bit · WASM`), `~411 KiB` Host Runtime & Self-Hosting Polyglot Toolchain.**  
-*Write `.sapp` programs targeting newest-to-oldest devices across 50 years of computing: the `~411 KiB` Linux / `~416 KiB` Windows / `~562 KiB` WASI-WASM Zero-Rust sovereign VM (`0` Rust dependencies), 32-bit `x86`/`ARMv7`/`ARMv6`/`MIPS`/`PowerPC`/`RISC-V` systems, 3-stage self-hosting pure-PBLang native compilers (`x64`, `x64-dyn`, `pe64`, `arm64`, `wasm`, `x86` ELF32, `pe32`, `rv32`, `dos16` 8086, `cpm80` 8080/Z80, `c64` 6502, `avr8` ATmega328P), freestanding `10.35 KiB` 8/16/32-bit MCU VM, first-class `@c`/`@python`/`@js` polyglot blocks, and quantum/PQC workloads.*
+**Sovereign Zero-Rust Universal Programming Language (`64-bit · 32-bit · 16-bit · 8-bit · WASM`), `~415 KiB` Host Runtime & Omni-Polyglot Engine (`1940s–Futuristic`).**  
+*Write `.sapp` programs targeting newest-to-oldest devices across 80 years of computing: the `~415 KiB` Linux / `~420 KiB` Windows / `~565 KiB` WASI-WASM Zero-Rust sovereign VM (`0` Rust dependencies), 32-bit `x86`/`ARMv7`/`ARMv6`/`MIPS`/`PowerPC`/`RISC-V` systems, 3-stage self-hosting pure-PBLang native compilers (`x64`, `x64-dyn`, `pe64`, `arm64`, `wasm`, `x86` ELF32, `pe32`, `rv32`, `dos16` 8086, `cpm80` 8080/Z80, `c64` 6502, `avr8` ATmega328P), freestanding `10.35 KiB` 8/16/32-bit MCU VM, and **Omni-Polyglot `@<lang>` blocks across 124+ programming & non-programming languages (`1945 Plankalkül`, `FORTRAN`, `COBOL`, `LISP`, `APL`, `Pascal`, `C/C++/C#/Rust/Python/JS`, `SQL/YAML/LaTeX/PostScript/G-code/Verilog/SPICE/ABC-Music`, `OpenQASM 3.0`, `FASTA/CRISPR/DNA-DSD`, `SMILES`, `Neuromorphic SNN`, `Photonic MZI`, `Reversible Janus` & `Zero-Knowledge R1CS`)**.*
 
-[![Release](https://img.shields.io/badge/release-v2.1.0-0A84FF?style=for-the-badge)](https://github.com/PanosBiazis/pblang/releases/tag/v2.1.0)
+[![Release](https://img.shields.io/badge/release-v2.2.0-0A84FF?style=for-the-badge)](https://github.com/PanosBiazis/pblang/releases/tag/v2.2.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2EA043?style=for-the-badge)](LICENSE)
-[![Devices](https://img.shields.io/badge/Devices-64--bit_%7C_32--bit_%7C_16--bit_%7C_8--bit_%7C_WASM-8A2BE2?style=for-the-badge)](#universal-newest-to-oldest-device-matrix-v210)
+[![Devices](https://img.shields.io/badge/Devices-64--bit_%7C_32--bit_%7C_16--bit_%7C_8--bit_%7C_WASM-8A2BE2?style=for-the-badge)](#universal-newest-to-oldest-device-matrix-v220)
+[![Polyglot](https://img.shields.io/badge/Omni--Polyglot-1940s_to_Futuristic_%28124%2B_Langs%29-E91E63?style=for-the-badge)](#a-omni-polyglot-across-all-eras-programming--non-programming)
 [![TLS 1.3 & PQC](https://img.shields.io/badge/Crypto-TLS_1.3_%2B_FIPS_203_ML--KEM--768-FF6B00?style=for-the-badge)](#architecture--implemented-surface)
 [![Security](https://img.shields.io/badge/Security-Capability_Sandbox_%2B_Static_Taint-00C7B7?style=for-the-badge)](SECURITY.md)
 
-[Quick Start](#quick-start) · [Universal Devices (`64/32/16/8-bit`)](#universal-newest-to-oldest-device-matrix-v210) · [Why PBLang?](#why-pblang) · [Examples](examples) · [Documentation](docs/README.md) · [Tests](tests/README.md) · [Security Policy](SECURITY.md) · [Changelog](CHANGELOG.md) · [Releases](https://github.com/PanosBiazis/pblang/releases)
+[Quick Start](#quick-start) · [Universal Devices (`64/32/16/8-bit`)](#universal-newest-to-oldest-device-matrix-v220) · [Why PBLang?](#why-pblang) · [Examples](examples) · [Documentation](docs/README.md) · [Tests](tests/README.md) · [Security Policy](SECURITY.md) · [Changelog](CHANGELOG.md) · [Releases](https://github.com/PanosBiazis/pblang/releases)
 
 </div>
 
 ---
 
-## Universal Newest-to-Oldest Device Matrix (`v2.1.0`)
+## Universal Newest-to-Oldest Device Matrix (`v2.2.0`)
 
-Every release of `PBLang 2.1.0` ships **verified standalone executables, static zero-GLIBC bundles, freestanding MCU firmware, and retro executables** spanning modern 64-bit AI workstations down to 32-bit PCs/routers/SBCs, 16-bit MS-DOS/FreeDOS, and 8-bit microcontrollers/home computers — built reproducibly via PBLang's `@polyglot` engine (`tools/build_universal_devices.sapp`):
+Every release of `PBLang 2.2.0` ships **verified standalone executables, static zero-GLIBC bundles, freestanding MCU firmware, and retro executables** spanning modern 64-bit AI workstations down to 32-bit PCs/routers/SBCs, 16-bit MS-DOS/FreeDOS, and 8-bit microcontrollers/home computers — built reproducibly via PBLang's `@polyglot` engine (`tools/build_universal_devices.sapp`):
 
 | Era / Word Width | Target Systems & Devices | Release Executables / Packages | Direct `pblang build --target` |
 | :--- | :--- | :--- | :--- |
-| **Newest 64-bit Desktop, Cloud, AI-PC & Mobile** | Linux `x86_64` & `ARM64` (dynamic + static `musl`), Windows 11 `x86_64` & `ARM64` (Snapdragon/Copilot+), macOS Universal (`Apple Silicon` + `Intel` fat Mach-O), Android `ARM64`/`x86_64`, FreeBSD `x86_64`/`ARM64`, Linux `RISC-V 64`, `LoongArch64`, `PowerPC64LE`, `IBM s390x` | `pblang-2.1.0-linux-{x86_64,arm64,riscv64,workstation-alt64}.tar.gz`, `pblang-2.1.0-windows-{x86_64,arm64}.zip`, `pblang-2.1.0-macos-universal.tar.gz`, `pblang-2.1.0-android-arm64-x86_64.tar.gz`, `pblang-2.1.0-freebsd-x86_64-arm64.tar.gz` | `--target x64`, `x64-dyn`, `pe64`, `arm64`, `pbck` |
-| **Universal Web & Edge WASI (`32-bit` Linear Memory)** | Browser, Node.js WASI, `wasmtime`, `wasmer`, Cloudflare/Edge workers (`562 KiB` full Sovereign `.sapp` compiler + VM in `pblang-2.1.0-wasm32.wasm`) | `pblang-2.1.0-wasm32.wasm`, `pblang-2.1.0-wasm32.tar.gz` | `--target wasm` |
-| **`32-bit` Older PCs, SBCs, Routers & Bare-Metal MCUs** | Windows XP/7/8/10 `32-bit i686` (`PE32`), older 32-bit Linux `i386/i686` (`ELF32` static `musl`), Raspberry Pi 1/Zero (`ARMv6` soft-float `armel`) & Pi 2/3 (`ARMv7` `armhf`), OpenWrt `MIPS32`/`MIPSEL`, `PowerPC 32`, `RISC-V 32`, `ARM Cortex-M0/M4` & `ESP32` | `pblang-2.1.0-windows-x86.{exe,zip}`, `pblang-2.1.0-linux-x86{,.tar.gz}`, `pblang-2.1.0-linux-armv7{,-armel.tar.gz}`, `pblang-2.1.0-linux-routers-classic32.tar.gz`, `pblang-2.1.0-mcu-32bit-cortexm-rv32.tar.gz` | `--target x86` (`ELF32`), `--target pe32` (`.exe`), `--target rv32` (`RV32IM`) |
-| **`16-bit` & `8-bit` Retro Systems & Microcontrollers** | `16-bit 8086` MS-DOS / FreeDOS (`pblang16.com`), `8-bit Intel 8080 / Z80` CP/M-80 (`pblang80.com`), `8-bit MOS 6502` Commodore 64 (`pblang64.prg`), `8-bit Atmel AVR ATmega328P` Arduino Uno (`10.35 KiB` Flash `.pbck` Micro-VM + `.hex`) | `pblang-2.1.0-legacy-8bit-16bit.zip` (`runtime_stage3/pblang_micro_vm.c` + `pblang_dos16_vm.asm`) | `--target dos16`, `--target cpm80`, `--target c64`, `--target avr8` |
+| **Newest 64-bit Desktop, Cloud, AI-PC & Mobile** | Linux `x86_64` & `ARM64` (dynamic + static `musl`), Windows 11 `x86_64` & `ARM64` (Snapdragon/Copilot+), macOS Universal (`Apple Silicon` + `Intel` fat Mach-O), Android `ARM64`/`x86_64`, FreeBSD `x86_64`/`ARM64`, Linux `RISC-V 64`, `LoongArch64`, `PowerPC64LE`, `IBM s390x` | `pblang-2.2.0-linux-{x86_64,arm64,riscv64,workstation-alt64}.tar.gz`, `pblang-2.2.0-windows-{x86_64,arm64}.zip`, `pblang-2.2.0-macos-universal.tar.gz`, `pblang-2.2.0-android-arm64-x86_64.tar.gz`, `pblang-2.2.0-freebsd-x86_64-arm64.tar.gz` | `--target x64`, `x64-dyn`, `pe64`, `arm64`, `pbck` |
+| **Universal Web & Edge WASI (`32-bit` Linear Memory)** | Browser, Node.js WASI, `wasmtime`, `wasmer`, Cloudflare/Edge workers (`~565 KiB` full Sovereign `.sapp` compiler + VM in `pblang-2.2.0-wasm32.wasm`) | `pblang-2.2.0-wasm32.wasm`, `pblang-2.2.0-wasm32.tar.gz` | `--target wasm` |
+| **`32-bit` Older PCs, SBCs, Routers & Bare-Metal MCUs** | Windows XP/7/8/10 `32-bit i686` (`PE32`), older 32-bit Linux `i386/i686` (`ELF32` static `musl`), Raspberry Pi 1/Zero (`ARMv6` soft-float `armel`) & Pi 2/3 (`ARMv7` `armhf`), OpenWrt `MIPS32`/`MIPSEL`, `PowerPC 32`, `RISC-V 32`, `ARM Cortex-M0/M4` & `ESP32` | `pblang-2.2.0-windows-x86.{exe,zip}`, `pblang-2.2.0-linux-x86{,.tar.gz}`, `pblang-2.2.0-linux-armv7{,-armel.tar.gz}`, `pblang-2.2.0-linux-routers-classic32.tar.gz`, `pblang-2.2.0-mcu-32bit-cortexm-rv32.tar.gz` | `--target x86` (`ELF32`), `--target pe32` (`.exe`), `--target rv32` (`RV32IM`) |
+| **`16-bit` & `8-bit` Retro Systems & Microcontrollers** | `16-bit 8086` MS-DOS / FreeDOS (`pblang16.com`), `8-bit Intel 8080 / Z80` CP/M-80 (`pblang80.com`), `8-bit MOS 6502` Commodore 64 (`pblang64.prg`), `8-bit Atmel AVR ATmega328P` Arduino Uno (`10.35 KiB` Flash `.pbck` Micro-VM + `.hex`) | `pblang-2.2.0-legacy-8bit-16bit.zip` (`runtime_stage3/pblang_micro_vm.c` + `pblang_dos16_vm.asm`) | `--target dos16`, `--target cpm80`, `--target c64`, `--target avr8` |
 
 ---
 
 ## Why PBLang?
 
-**PBLang (`2.1.0`, Edition 2026)** achieves 100% independence from any Rust runtime or toolchain across **64-bit, 32-bit, 16-bit, 8-bit, and WebAssembly** systems: it pairs a **`~411 KiB` Linux / `~416 KiB` Windows / `~562 KiB` WASI Sovereign Zero-Rust Host VM & `.sapp` Compiler (`runtime_stage3/`, 319 builtins)** with **pure-PBLang native machine-code compilers** (`64-bit` self-hosting `ELF64`/`PE32+`/`ARM64` + `<= 32-bit` `ELF32`/`PE32`/`RV32IM`/`8086`/`8080`/`6502`/`AVR8`), a **`10.35 KiB` freestanding `.pbck` Micro-VM** (`pblang_micro_vm.c`), **first-class `@c`/`@python`/`@js` Polyglot orchestration**, an **explainable `8/16/32/64-bit` Hardware Governor**, **Sovereign Studio UI**, and scientific/quantum/PQC modules:
+**PBLang (`2.2.0`, Edition 2026)** achieves 100% independence from any Rust runtime or toolchain across **64-bit, 32-bit, 16-bit, 8-bit, and WebAssembly** systems: it pairs a **`~415 KiB` Linux / `~420 KiB` Windows / `~565 KiB` WASI Sovereign Zero-Rust Host VM & `.sapp` Compiler (`runtime_stage3/`, 319 builtins)** with **pure-PBLang native machine-code compilers** (`64-bit` self-hosting `ELF64`/`PE32+`/`ARM64` + `<= 32-bit` `ELF32`/`PE32`/`RV32IM`/`8086`/`8080`/`6502`/`AVR8`), a **`10.35 KiB` freestanding `.pbck` Micro-VM** (`pblang_micro_vm.c`), **Sovereign Omni-Polyglot (`1945 Plankalkül` to Futuristic Quantum/DNA/Photonic/Reversible/ZK + Non-Programming Languages)**, an **explainable `8/16/32/64-bit` Hardware Governor**, **Sovereign Studio UI**, and scientific/quantum/PQC modules:
 
 | Pillar | Capability Highlights | Key Modules |
 | :--- | :--- | :--- |
 | **1. Sovereign Zero-Rust Universal Host VM & Compiler (`64-bit`, `32-bit` & `WASM32`)** | Complete C99 `.sapp -> .pbck` v1 compiler, SHA-256 disk bytecode cache, `O(1)` FNV-1a maps, 32-bit (`512 KiB`) & 64-bit (`2 MiB`) adaptive GC, 319 builtins, freestanding `10.35 KiB` `8/16/32-bit` `.pbck` Micro-VM (`pblang_micro_vm.c`), and polymorphic `pblang update`. | `runtime_stage3/pblang_zero_rust_vm.c`, `runtime_stage3/pblang_micro_vm.c`, `runtime_stage3/pblang_dos16_vm.asm` |
 | **2. Pure-PBLang `64-bit -> 8-bit` Native Machine-Code Compilers (`0` Rust & `0` C)** | Self-hosting `x86-64` `ELF64` (`stage2 == stage3 == 55,272 B`), `x64-dyn`, Windows `PE32+`, `ARM64`, `WASM`, **plus direct `<= 32-bit` native emitters**: `32-bit i386 ELF32` (`x86`), `32-bit Windows PE32` (`pe32`), `32-bit RISC-V RV32IM` (`rv32`), `16-bit 8086 DOS .COM` (`dos16`), `8-bit CP/M-80 .COM` (`cpm80`), `8-bit 6502 C64 .PRG` (`c64`), and `8-bit AVR Intel HEX` (`avr8`). | `stdlib/native/codegen_x64.sapp`, `stdlib/native/codegen_sub32.sapp`, `stdlib/native/codegen_pe64.sapp`, `tools/pbc.sapp` |
-| **3. Multi-Accelerator & `8/16/32/64-bit` Hardware Governor + Polyglot Engine** | Probes word width (`8/16/32/64` bits), `CPU` SIMD, `RAM` pressure, `GPU`, `NPU`, `TPU`, and battery/AC; enforces address-space-safe 32-bit/low-RAM budgets, zero-idle UI pacing, `@c`/`@python`/`@js` `@polyglot` blocks (`__polyglot`), and WCAG AAA Sovereign Studio (`pblang studio`). | `stdlib/hardware_governor.sapp`, `stdlib/sovereign_studio_ui.sapp`, `tools/build_universal_devices.sapp` |
+| **3. Omni-Polyglot Engine (`1945–Futuristic` Programming & Non-Programming) + Hardware Governor** | `@<lang>` syntax across **124+ canonical families (`340+` IDs/aliases)**: `40+` pure-PBLang zero-subprocess evaluators (`Plankalkül`, `FORTRAN`, `LISP`, `COBOL`, `ALGOL-60`, `APL`, `BASIC`, `Forth`, `Pascal`, `Prolog`, `SQL`, `YAML`, `TOML`, `LaTeX`, `PostScript`, `G-code`, `Verilog`, `SPICE`, `ABC-Music`, `OpenQASM 3.0`, `FASTA/CRISPR`, `DNA-DSD`, `SMILES`, `SNN`, `Photonic MZI`, `Janus`, `ZK-R1CS`, `Cellular`) + fail-closed hash-bound host bridges (`75+` compilers/interpreters) + `8/16/32/64-bit` Hardware Governor. | `stdlib/polyglot_universal.sapp`, `stdlib/polyglot.sapp`, `stdlib/polyglot_registry.sapp`, `stdlib/hardware_governor.sapp` |
 | **4. Usable `--sandbox` & Native TLS 1.3 / WinHTTP** | `pblang run script.sapp --sandbox` permits canonicalized, traversal-safe `stdlib:...` imports while denying ambient filesystem, network, HTTP, SQLite, FFI, subprocess, spawn, and env access; dynamic OpenSSL TLS 1.2/1.3 & Windows `WinHTTP` HTTPS with SSRF cloud-metadata blocking. | `runtime_stage3/zr_net_http_tls.h`, `stdlib/tls.sapp` |
 | **5. Safe Linux Descriptor-Anchored File & Process Ops** | Race-resistant directory-descriptor file operations (`openat` / `O_NOFOLLOW`, `stdlib/linux_dirfs.sapp`, `stdlib/secure_file.sapp`), `pidfd` signaling (`stdlib/linux_pidfd.sapp`), and shell-free `execve` process supervision (`stdlib/linux_process.sapp`). | `stdlib/secure_file.sapp`, `stdlib/linux_dirfs.sapp`, `stdlib/linux_process.sapp` |
 | **6. Deterministic Hardware Emulators & Embedded AVR8** | Pure-PBLang register-level device emulators (`Arduino Uno R4 WiFi`, `ESP32-D`, `Bosch BME688`, `3D Printer/CNC G-code`, `NFC/BLE`, `Stylus/TouchBoard`) and direct ATmega328P AVR8 firmware emission. | `emulators/hardware_emulators_suite.sapp`, `stdlib/embedded.sapp` |
@@ -53,17 +54,20 @@ Every release of `PBLang 2.1.0` ships **verified standalone executables, static 
 
 ### Feature Showcases
 
-#### A. Guarded Polyglot Pre-Flight Auditing (`stdlib:polyglot_guard.sapp`)
-Audit polyglot code snippets before execution against typosquatted dependencies (`reqests`, `urp3`) and unauthorized network/shell usage:
+#### A. Omni-Polyglot Across All Eras — Programming & Non-Programming (`stdlib:polyglot.sapp`)
+Embed `@<lang>` blocks from 1945 (`@plankalkul`, `@fortran`, `@lisp`, `@cobol`) to non-programming notations (`@g-code`, `@verilog`, `@spice`, `@latex`, `@postscript`, `@abc-music`) and futuristic paradigms (`@openqasm`, `@fasta`, `@smiles`, `@janus`, `@zk-r1cs`) and execute them safely in-memory via `POLY.eval_block` (plus pre-flight auditing via `stdlib:polyglot_guard.sapp`):
 
 ```pblang
-let PG = import("stdlib:polyglot_guard.sapp");
+let POLY = import("stdlib:polyglot.sapp");
 
-let check = PG.audit_block("python", "import math\nprint(math.factorial(10))", map{
-    allow_network: false,
-    allow_shell: false
-});
-assert(check.ok == true);
+@plankalkul [name="zuse_1945"] { V0 => Z0; Z0 * Z0 => R0 }
+@openqasm [name="bell_pair"] { OPENQASM 3.0; qubit[2] q; h q[0]; cx q[0], q[1]; }
+@g-code [name="cnc_cut"] { G21 G90 G1 X10 Y20 Z0.2 E1.5 F1200 }
+
+let pk = POLY.eval_block(__polyglot.by_name["zuse_1945"], [9]);
+let qm = POLY.eval_block(__polyglot.by_name["bell_pair"]);
+let gc = POLY.eval_block(__polyglot.by_name["cnc_cut"]);
+assert(pk.result == 81 and qm.probabilities["00"] > 0.49 and gc.ok == true);
 ```
 
 #### B. Compiler-Integrated Taint, Unicode & Supply-Chain Defense
