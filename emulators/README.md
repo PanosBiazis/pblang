@@ -1,17 +1,17 @@
-# PBLang Cycle-Accurate Hardware Emulators & Physical Bus Manager (`emulators/`)
+# PBLang Deterministic Hardware Emulators & Bus Manager (`emulators/`)
 
-This directory contains the **6 cycle-accurate register-level hardware emulators** and the **8-target physical hardware auto-discovery & bus manager** written in 100% Pure PBLang.
+This directory contains **6 deterministic register-level hardware simulation models** and the **8-target hardware bus manager** written in 100% Pure PBLang (`2.0.0`).
 
 ---
 
 ## Quick Run
 
 ```bash
-# Run all 6 cycle-accurate hardware emulators:
-pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all emulators
+# Run all 6 deterministic hardware emulator models:
+pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all -- emulators
 
-# Run physical hardware bus discovery & dual-mode verification:
-pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all discover
+# Run physical hardware bus discovery & simulation verification:
+pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all -- discover
 ```
 
 ---
@@ -20,5 +20,5 @@ pblang run tools/pblang_stage3_selfhost_driver.sapp --allow-all discover
 
 | File | Description |
 | :--- | :--- |
-| [hardware_emulators_suite.sapp](hardware_emulators_suite.sapp) | Cycle-accurate register-level emulators for **Arduino Uno R4 WiFi** (`RA4M1 48MHz` + `12x8 LED Matrix`), **ESP32-D Dual-Core** (`Xtensa LX6 240MHz`), **Bosch BME688** (`10-step gas/pressure/humidity/temperature`), **3D Printer / CNC G-Code** (`Bresenham stepper + PID thermal runaway guard`), **NFC ISO-14443A + BLE M2543T1**, and **Stylus / TouchBoard / Mobile**. |
-| [physical_hardware_manager.sapp](physical_hardware_manager.sapp) | Physical bus auto-discovery (`/dev/ttyACM*`, `/dev/ttyUSB*`, `sysfs` USB VID:PID, `i2c-dev`, `spidev`, `gpiochip`, `bluetooth`, `input/event*`), firmware flashing (`BOSSA`/`esptool`), hot-unplug fault recovery, and hardware `E-STOP` (`M112`). |
+| [hardware_emulators_suite.sapp](hardware_emulators_suite.sapp) | Deterministic register-level simulation models (`mode: "in_vm_simulation"`) for **Arduino Uno R4 WiFi** (`RA4M1` + `12x8 LED Matrix`), **ESP32-D Dual-Core**, **Bosch BME688** (`gas/pressure/humidity/temperature`), **3D Printer / CNC G-Code** (`Bresenham stepper + PID thermal runaway guard`), **NFC ISO-14443A + BLE**, and **Stylus / TouchBoard / Mobile**. |
+| [physical_hardware_manager.sapp](physical_hardware_manager.sapp) | Linux bus inspection (`/dev/ttyACM*`, `/dev/ttyUSB*`, `sysfs` USB VID:PID, `i2c-dev`, `spidev`, `gpiochip`, `bluetooth`, `input/event*`), flashing workflow descriptors (`BOSSA`/`esptool`), fault recovery, and emergency stop (`M112`). |

@@ -4,16 +4,16 @@
 
 # PBLang `2.0.0`
 
-**Sovereign Zero-Rust Cross-Platform Programming Language, `~371 KB` Host Runtime & Self-Hosting Native Toolchain.**  
-*Write `.sapp` programs targeting the `~371 KB` Linux / `~363 KB` Windows Zero-Rust sovereign VM & compiler (`0` Rust dependencies), 3-stage self-hosting pure-PBLang native compilers (`x86-64 ELF64`, `x86-64 Dynamic ELF64`, `Windows PE32+`, `ARM64 ELF64`, `WebAssembly`), scientific/quantum/PQC workloads, adaptive multi-accelerator hardware governance, and WCAG AAA desktop/web UI surfaces.*
+**Sovereign Zero-Rust Cross-Platform Programming Language, `~375 KiB` Host Runtime & Self-Hosting Native Toolchain.**  
+*Write `.sapp` programs targeting the `~375 KiB` Linux / `~365 KiB` Windows Zero-Rust sovereign VM & compiler (`0` Rust dependencies), 3-stage self-hosting pure-PBLang native compilers (`x86-64 ELF64`, `x86-64 Dynamic ELF64`, `Windows PE32+`, `ARM64 ELF64`, `WebAssembly`), scientific/quantum/PQC workloads, adaptive multi-accelerator hardware governance, and WCAG AAA desktop/web UI surfaces.*
 
 [![Release](https://img.shields.io/badge/release-v2.0.0-0A84FF?style=for-the-badge)](https://github.com/PanosBiazis/pblang/releases/tag/v2.0.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2EA043?style=for-the-badge)](LICENSE)
-[![Backends](https://img.shields.io/badge/Backends-Zero--Rust_VM_%7C_Pure_x64_%7C_PE32%2B_%7C_ARM64_%7C_WASM-8A2BE2?style=for-the-badge)](#100-pblang-native-compilation-x64-arm64-wasm-pbck)
+[![Backends](https://img.shields.io/badge/Backends-Zero--Rust_VM_%7C_Pure_x64_%7C_PE32%2B_%7C_ARM64_%7C_WASM-8A2BE2?style=for-the-badge)](#100-pblang-native-compilation-x64-x64-dyn-pe64-arm64-wasm-pbck)
 [![TLS 1.3 & PQC](https://img.shields.io/badge/Crypto-TLS_1.3_%2B_FIPS_203_ML--KEM--768-FF6B00?style=for-the-badge)](#architecture--implemented-surface)
 [![Security](https://img.shields.io/badge/Security-Capability_Sandbox_%2B_Static_Taint-00C7B7?style=for-the-badge)](SECURITY.md)
 
-[Quick Start](#quick-start) · [Why PBLang?](#why-pblang) · [Examples](examples) · [Documentation](docs) · [Tests](tests) · [Security Policy](SECURITY.md) · [Changelog](CHANGELOG.md) · [Releases](https://github.com/PanosBiazis/pblang/releases)
+[Quick Start](#quick-start) · [Why PBLang?](#why-pblang) · [Examples](examples) · [Documentation](docs/README.md) · [Tests](tests/README.md) · [Security Policy](SECURITY.md) · [Changelog](CHANGELOG.md) · [Releases](https://github.com/PanosBiazis/pblang/releases)
 
 </div>
 
@@ -21,11 +21,11 @@
 
 ## Why PBLang?
 
-**PBLang (`2.0.0`, Edition 2026)** achieves 100% independence from any Rust runtime or toolchain: it pairs a **`~371 KB` Linux `ELF64` / `~363 KB` Windows `PE32+` Sovereign Zero-Rust Host VM & `.sapp` Compiler (`runtime_stage3/`, `~2.6 MiB` cold RSS RAM, 319 builtins)** with **3-stage self-hosting pure-PBLang native machine-code compilers** (`x86-64` static & dynamic `ELF64` + Windows `PE32+`), an **explainable multi-accelerator Hardware Governor** (`CPU`, `RAM`, `Storage`, `GPU`, `NPU`, `TPU`), **Sovereign Studio UI** (`pblang studio`), and scientific/quantum/PQC modules:
+**PBLang (`2.0.0`, Edition 2026)** achieves 100% independence from any Rust runtime or toolchain: it pairs a **`~375 KiB` (`383,536 B`) Linux `ELF64` / `~365 KiB` (`373,760 B`) Windows `PE32+` Sovereign Zero-Rust Host VM & `.sapp` Compiler (`runtime_stage3/`, `~2.6 MiB` cold RSS RAM, 319 builtins)** with **3-stage self-hosting pure-PBLang native machine-code compilers** (`x86-64` static & dynamic `ELF64` + Windows `PE32+`), an **explainable multi-accelerator Hardware Governor** (`CPU`, `RAM`, `Storage`, `GPU`, `NPU`, `TPU`), **Sovereign Studio UI** (`pblang studio`), and scientific/quantum/PQC modules:
 
 | Pillar | Capability Highlights | Key Modules |
 | :--- | :--- | :--- |
-| **1. Sovereign Zero-Rust Cross-Platform Host VM & Compiler (`~371 KB`)** | Complete C99 `.sapp -> .pbck` v1 compiler, SHA-256 disk bytecode cache, `O(1)` FNV-1a maps, safe-point adaptive GC, 319 builtins (SQLite, OpenSSL/WinHTTP HTTPS, X11+FreeType2/Win32GDI GUI, FFI, BigInt/Rational/Decimal), and `PBLZREXE` single-file executables (`>110x` smaller than legacy 42 MB Rust binary). | `runtime_stage3/pblang_zero_rust_vm.c`, `runtime_stage3/zr_*.h` |
+| **1. Sovereign Zero-Rust Cross-Platform Host VM & Compiler (`~375 KiB`)** | Complete C99 `.sapp -> .pbck` v1 compiler, SHA-256 disk bytecode cache, `O(1)` FNV-1a maps, safe-point adaptive GC, 319 builtins (SQLite, OpenSSL/WinHTTP HTTPS, X11+FreeType2/Win32GDI GUI, FFI, BigInt/Rational/Decimal), and `PBLZREXE` single-file executables (`>105x` smaller than legacy 42 MB Rust binary). | `runtime_stage3/pblang_zero_rust_vm.c`, `runtime_stage3/zr_*.h` |
 | **2. Pure-PBLang 3-Stage Self-Hosting Native Compilers (`0` Rust & `0` C)** | Self-hosting Linux `x86-64` `ELF64` compiler (`stage2_elf == stage3_elf == 55,272 B` fixed-point, Cheney GC + `MADV_DONTNEED`, closures, `try/catch/throw`), dynamic `ELF64` OS FFI (`--target x64-dyn`), and Windows 11 `PE32+` `.exe` compiler (`--target pe64`). | `stdlib/native/codegen_x64.sapp`, `stdlib/native/elf_dyn_x64.sapp`, `stdlib/native/codegen_pe64.sapp`, `tools/pbc.sapp` |
 | **3. Multi-Accelerator Hardware Governor & Sovereign Studio UI** | Probes `CPU` SIMD, `RAM` pressure, `GPU`, `NPU`, `TPU`, battery/AC, and peripherals; enforces zero-idle frame pacing (`~0.0%` idle CPU), bilingual EL/EN explainability, and WCAG AAA Obsidian/Alabaster native + offline HTML5 Studio (`pblang studio`). | `stdlib/hardware_governor.sapp`, `stdlib/sovereign_studio_ui.sapp`, `stdlib/modern_ui.sapp` |
 | **4. Usable `--sandbox` & Native TLS 1.3 / WinHTTP** | `pblang run script.sapp --sandbox` permits canonicalized, traversal-safe `stdlib:...` imports while denying ambient filesystem, network, HTTP, SQLite, FFI, subprocess, spawn, and env access; dynamic OpenSSL TLS 1.2/1.3 & Windows `WinHTTP` HTTPS with SSRF cloud-metadata blocking. | `runtime_stage3/zr_net_http_tls.h`, `stdlib/tls.sapp` |
@@ -109,7 +109,7 @@ assert(dec.shared_secret_hex == enc.shared_secret_hex);
 
 ### Primary Production Surface (`2.0.0` Sovereign Zero-Rust)
 
-- **Sovereign Zero-Rust Cross-Platform Host VM & `.sapp` Compiler (`runtime_stage3/pblang_zero_rust_vm.c`, `~371 KB` Linux `ELF64` / `~363 KB` Windows `PE32+`)**: Complete C99 `.sapp -> .pbck` v1 compiler, SHA-256 disk bytecode cache, `O(1)` FNV-1a maps, closures & lexical upvalue cells, structured `try`/`catch`/`defer` unwinding, bytecode safe-point adaptive mark-and-sweep GC, 319 host builtins (SQLite, OpenSSL/WinHTTP HTTPS, X11+FreeType2/Win32GDI GUI, FFI, BigInt/Rational/Decimal), and `PBLZREXE` single-file standalone executable bundling — **zero Rust crates or toolchain required** (`crates/` retained solely as optional legacy reference).
+- **Sovereign Zero-Rust Cross-Platform Host VM & `.sapp` Compiler (`runtime_stage3/pblang_zero_rust_vm.c`, `~375 KiB` Linux `ELF64` / `~365 KiB` Windows `PE32+`)**: Complete C99 `.sapp -> .pbck` v1 compiler, SHA-256 disk bytecode cache, `O(1)` FNV-1a maps, closures & lexical upvalue cells, structured `try`/`catch`/`defer` unwinding, bytecode safe-point adaptive mark-and-sweep GC, 319 host builtins (SQLite, OpenSSL/WinHTTP HTTPS, X11+FreeType2/Win32GDI GUI, FFI, BigInt/Rational/Decimal), and `PBLZREXE` single-file standalone executable bundling — **zero Rust crates or toolchain required** (`crates/` retained solely as optional legacy reference).
 - **Pure-PBLang 3-Stage Self-Hosting Native Compilers (`stdlib/native/codegen_x64.sapp`, `elf_dyn_x64.sapp`, `codegen_pe64.sapp`)**: Self-hosting Linux `x86-64` `ELF64` compiler (`stage2_elf == stage3_elf == 55,272 B` fixed-point with Cheney GC + `MADV_DONTNEED`, closures, hash maps, `try/catch/throw`), dynamic `ELF64` OS FFI (`--target x64-dyn`), and Windows 11 `PE32+` `.exe` compiler (`--target pe64`) with **zero `rustc` and zero `gcc`**.
 - **Explainable Multi-Accelerator Hardware Governor & Sovereign Studio UI (`stdlib/hardware_governor.sapp`, `stdlib/sovereign_studio_ui.sapp`)**: Probes `CPU` SIMD, `RAM` pressure, `Storage`, `GPU`, `NPU`, `TPU`, battery/AC, and peripherals; governs workers, GC watermarks, Sparse-Hive LRU budgets, and zero-idle frame pacing (`pblang studio`, `pblang studio --export-html <file>`).
 - **Smart Polymorphic `pblang update` & Portable Relative Lockfiles (`stdlib/smart_updater.sapp`)**: unified updater across `self` release bundles, `pblang.toml` workspaces, standalone `.sapp` scripts, archives, and project directories with portable relative `pblang.lock` paths, `pblang-package-tree-v2` SHA-256 verification, atomic `.bak` rollback, and privacy/hygiene guards.
@@ -165,7 +165,7 @@ flowchart LR
     A[".sapp Source & pblang.toml"] --> B["Supply-Chain & Bidi Guard\n(Portable pblang.lock SHA-256 + Zero Hooks)"]
     B --> C["Static AST Taint & Safety Analyzer\n(Bounds, Init, Capability Attenuation)"]
     C --> D["Optimizing Bytecode / Self-Hosted IR\n(Const Dedup, Branch Fold, Strength Reduction)"]
-    D --> E1["Sovereign Zero-Rust Host VM (~371 KB)\n(319 Builtins + Safe-Point GC + --sandbox)"]
+    D --> E1["Sovereign Zero-Rust Host VM (~375 KiB)\n(319 Builtins + Safe-Point GC + --sandbox)"]
     D --> E2["Pure-PBLang Self-Hosting Compilers\n(x86-64 ELF64, ELF64-dyn, Windows PE32+)"]
     D --> E3["Portable Targets\n(ARM64 ELF64, WASM32, C99, PBCK)"]
 ```
@@ -272,7 +272,7 @@ their real runtimes are linked. Native `gui.button(...)` controls also accept
 semantic `primary`, `secondary`, `navigation`, `ghost` and `danger` variants;
 older calls remain primary by default and custom palettes can override the
 corresponding selected, focus, danger and on-accent roles.
-See [`docs/MODERN_UI.md`](docs/MODERN_UI.md).
+See [`docs/Visual_Designer.md`](docs/Visual_Designer.md).
 
 ### Native embedded programming
 
@@ -331,7 +331,7 @@ For bounded Linux control-plane connections, `stdlib:native_tcp.sapp` provides
 nonblocking IPv4 connect/accept/read/write deadlines, ephemeral listeners,
 independently owned accepted sockets, close-on-exec descriptors and
 binary-safe UTF-8 copying. Unsupported ABIs fail closed; this is not a TLS
-layer. See [`docs/NATIVE_TCP.md`](docs/NATIVE_TCP.md).
+layer. See [`docs/Protocols.md`](docs/Protocols.md) and [`docs/TLS_notes.md`](docs/TLS_notes.md).
 
 ---
 
@@ -339,36 +339,24 @@ layer. See [`docs/NATIVE_TCP.md`](docs/NATIVE_TCP.md).
 
 | Command | Description |
 |---|---|
-| `pblang run <file|dir>` | Run a script or package. |
-| `pblang <file|dir>` | Short `run` alias; recognized source/bytecode paths never enter the REPL. |
-| `pblang test [dir]` | Run pblang tests. |
-| `pblang fmt [files...]` | Format source files. |
-| `pblang lint [files...]` | Parse, type-check, and lint files. |
-| `pblang build [path]` | Generate lockfile and type-check the package entry. |
-| `pblang run tools/pbbuild.sapp --allow-all -- SOURCE OUTPUT` | Plan and run a cached adaptive native build with explicit fallbacks. |
-| `pblang run tools/pbsecure.sapp --allow-all -- SOURCE` | Dependency-wide policy and interprocedural semantic taint/control-flow audit. |
-| `pblang run tools/pbaudit.sapp --allow-all -- --module-by-module --resume --json-output=audit.json roots...` | Atomic resumable per-module repository triage without a shared finding early-stop or raw source lines in reports. |
-| `pblang init` | Create a `pblang.toml`. |
-| `pblang new <name>` | Scaffold a new project. |
-| `pblang install` | Install dependencies. |
-| `pblang publish` | Publish a package. |
-| `pblang search <query>` | Search the package registry. |
-| `pblang bundle [--self-extract]` | Disabled by the qualified Linux launcher: the retained native command can truncate sources. See [source-integrity guard and alternatives](docs/NATIVE_BUNDLE_SOURCE_INTEGRITY.md). |
-| `pblang lsp` | Start the language server. |
-| `pblang --ide` | Launch the native pblang IDE. |
-| `pblang --check <file>` | Parse and type-check only. |
-| `pblang --check --via-pblang <file>` | PBLang source analysis with failing diagnostic status through the [qualified Linux launcher](docs/PUBLIC_SELFHOST_CHECK.md); `--self-host` is an alias. |
-| `pblang --check --via-pblang --retained-source <file>` | Explicit compatibility preflight for known retained-compiler capture hazards; [contract and PBCK route](docs/PUBLIC_RETAINED_SOURCE_CHECK.md). |
-| `pblang --check --via-pblang --bounded-source=65536 <FFI grants> <file>` | Opt-in Linux source-byte admission before allocation; stricter no-follow paths, explicit library/symbol grants. See [contract](docs/PUBLIC_SELFHOST_CHECK.md#opt-in-bounded-source-admission). |
-| `pblang --dump-bytecode <file>` | Print bytecode disassembly. |
-| `pblang --cfg <file>` | Dump a control-flow graph. |
+| `pblang run <file\|dir> [--allow-all\|--sandbox]` | Execute a `.sapp` source file, `.pbck` bytecode file, or `pblang.toml` package on the Sovereign Zero-Rust VM. |
+| `pblang <file\|dir>` | Short `run` alias; recognized source/bytecode paths execute directly without entering the REPL. |
+| `pblang check <file>` | Parse and compile-verify `.sapp` syntax, bindings, and structure with zero execution side effects. |
+| `pblang test [dir]` | Discover and execute `.sapp` verification suites. |
+| `pblang doctor` | Inspect the Sovereign Zero-Rust host runtime, `stdlib` discovery, cache directory, and detected OS/hardware capabilities. |
+| `pblang update [target]` | Polymorphic atomic updater across `self`, `pblang.toml` workspaces, `.sapp` scripts, and archives (`--dry-run`, `--rollback`, `--json`). |
+| `pblang studio [--export-html <file>]` | Launch the WCAG AAA Obsidian/Alabaster Sovereign Studio native window or export a 100% offline self-contained HTML5 dashboard. |
+| `pblang --ide` | Launch the native `pbIDE` editor & visual designer (`editors/ide/pbide.sapp`). |
+| `pblang build <file> --bundle-exe -o <out>` | Package a `.sapp` program + precompiled `.pbck` into a standalone single-file Zero-Rust executable (`PBLZREXE`). |
+| `pblang run tools/pbc.sapp --allow-all -- <src> --target <t> --out <out>` | Pure-PBLang compiler driver targeting `x64` (3-stage static `ELF64`), `x64-dyn` (dynamic OS-FFI `ELF64`), `pe64` (Windows 11 `PE32+` `.exe`), `arm64`, `wasm`, `c`, or `pbck`. |
+| `pblang run tools/pbsecure.sapp --allow-all -- <src>` | Interprocedural semantic taint, sink, and capability policy analyzer. |
+| `pblang run tools/pbaudit.sapp --allow-all -- --module-by-module --resume --json-output=audit.json <roots...>` | Atomic resumable per-module repository security and quality auditor. |
+| `pblang run tools/pblock.sapp --allow-all -- <project>` | Validate `pblang.toml` and publish a portable relative `pblang.lock` (`pblang-package-tree-v2`). |
+| `pblang fmt [files...]` | Format `.sapp` source files. |
+| `pblang lint [files...]` | Parse, type-check, and lint `.sapp` source files. |
+| `pblang lsp` | Start the Language Server Protocol (`LSP`) server. |
 
-Large product test runners can use `stdlib:test_scheduler.sapp` to cap workers
-by CPU and available memory. Physical-device and sustained-soak profiles always
-serialize access to each device and expose adaptive, fail-closed battery,
-temperature and memory policy. Warm test caches remain an optimization, not an
-evidence substitute; product runners must invalidate them from the complete
-import/source graph.
+Large product test runners can use `stdlib:test_scheduler.sapp` and `stdlib:hardware_governor.sapp` to cap workers by CPU topology, battery/AC state, and available RAM. Warm `.pbck` caches accelerate repeated runs while invalidating automatically on any SHA-256 source change.
 
 ---
 
@@ -400,7 +388,7 @@ let result = match 200 {
 print result;
 ```
 
-The PBLang-native compiler also accepts value-producing `elif` chains:
+Both the Sovereign Zero-Rust compiler (`runtime_stage3/zr_compiler.h`) and the pure-PBLang self-hosted compiler (`stdlib/compiler/parser.sapp`) support value-producing `elif` and `else if` chains:
 
 ```pblang
 let class_name = if score >= 90 { "excellent" }
@@ -409,102 +397,41 @@ let class_name = if score >= 90 { "excellent" }
     else { "retry" };
 ```
 
-`elif` and the older `else if` spelling lower to the same conditional AST, so
-branch selection, type widening, bytecode and C99 output remain compatible.
-Chains are bounded to 256 arms. During bootstrap migration, compile this exact
-expression spelling through the PBLang-native `tools/pbselfc.sapp`; the retained
-host parser continues to accept the equivalent `else if` spelling.
-
 ---
 
-## Tensor compute and hardware acceleration
+## Hardware Governor, Tensor Compute & Arbitrary-Width Floats
 
-pblang ships CPU tensor kernels (the `tensor_*` builtins). Matrix multiply is the hot
-path and has two backends:
+### Explainable Multi-Accelerator Hardware Governor (`stdlib/hardware_governor.sapp`)
 
-- **CPU (default).** `tensor_matmul` runs **multi-core** via rayon, parallelised over
-  output rows. It is **deterministic and exact (f64)**: identical inputs produce
-  bit-identical results regardless of core count, so the default build is fully
-  reproducible.
-- **GPU (opt-in).** Build with the `gpu` feature to compile a wgpu compute-shader matmul,
-  then enable it at runtime:
-
-  ```bash
-  cargo build --release --features gpu
-  PBLANG_GPU=1 pblang run your_script.sapp
-  ```
-
-  The GPU path is **f32** (GPUs lack f64 in compute shaders), so it trades precision for
-  throughput on large matmuls — which is exactly why it is opt-in and the default stays
-  exact f64 on the CPU. A `gpu`-enabled binary still runs everything on the CPU unless
-  `PBLANG_GPU=1` is set, and only large matmuls are offloaded.
-
-Query what the running binary actually supports with the `tensor_backend()` builtin:
+`stdlib/hardware_governor.sapp` combines the Zero-Rust VM's native `hardware_probe()` builtin with cross-platform topology discovery (`Linux` `/proc` + `/sys` + `/dev/dri` + `/dev/accel*` and `Windows` Win32 memory/CPU APIs) to govern workloads across every computational resource:
 
 ```pblang
-print tensor_backend();
-// { cpu_threads, parallel_matmul,
-//   gpu_feature, gpu_available, gpu_enabled, gpu_adapter, note }
+let HG = import("stdlib:hardware_governor.sapp");
+let profile = HG.probe_system_topology();
+let plan    = HG.govern_workload("ai_inference", map{ dataset_mb: 64, latency_sensitive: true });
+print plan.explanation_el;
+print plan.explanation_en;
 ```
 
-`gpu_feature` is `true` only when built with `--features gpu`; `gpu_enabled` is `true`
-only when offload actually ran (feature on + `PBLANG_GPU=1` + a matmul large enough to
-offload). With the `gpu` feature, `tensor_backend().gpu_adapters` lists **every** GPU wgpu
-can see (name/type/backend — discrete, integrated, and software). Only one adapter is used
-at a time (pblang does not split a matmul across GPUs); choose which with
-`PBLANG_GPU_ADAPTER` — an index, a device type (`integrated`/`discrete`/`cpu`), or a name
-substring — so e.g. an integrated GPU can be selected explicitly. There is **no NPU
-compute backend**: NPUs are driven by vendor stacks
-(ONNX Runtime + Vitis AI / OpenVINO / QNN, on quantized graphs) that don't map to
-pblang's f64 tensor kernels, so a present NPU is detectable but not usable for compute
-from pblang.
+- **Adaptive Resource Governance**: Dynamically tunes worker thread counts, safe-point GC high-watermarks, Sparse-Hive LRU cell budgets, and zero-idle UI frame pacing (`~0.0%` CPU when idle, `60/120 Hz` during active interaction).
+- **Machine Inventory (`stdlib/hwinfo.sapp`)**: Vendor-agnostic device survey across CPU, RAM, NVMe/SSD/HDD storage, integrated & discrete GPUs, NPU (`/dev/accel*`), and peripherals (`hw.survey()`, `hw.compute_plan()`), reporting honestly which accelerators have active compute backends versus inventory/telemetry detection.
 
-> Windows build notes: if cargo fails TLS with `CRYPT_E_NO_REVOCATION_CHECK`, set
-> `CARGO_HTTP_CHECK_REVOKE=false`. The `gpu` feature needs the `HighPerformance` adapter
-> to pick a discrete GPU rather than the software (WARP) renderer — pblang already
-> requests it.
+### Tensor Compute (`tensor_*` & `stdlib/onnx.sapp`)
 
-### Arbitrary-width floats (`fN`)
+- **Deterministic CPU Tensor Kernels (Default)**: Exact `f64` matrix multiplication and elementwise tensor ops with reproducible outputs across core counts, paired with pure-PBLang bounded CPU ONNX inference (`stdlib/onnx.sapp`) and Safetensors-to-GGUF v3 conversion (`stdlib/gguf.sapp`).
+- **Optional Legacy `wgpu` Prototype**: The optional legacy Rust reference workspace (`crates/`) retains an opt-in `f32` `wgpu` shader path (`cargo build --release --features gpu` + `PBLANG_GPU=1`); the Sovereign Zero-Rust `2.0.0` binary keeps zero `wgpu`/Rust bloat (`~375 KiB` total binary size) and defaults to exact `f64` CPU execution. See [`docs/GPU_Stack.md`](docs/GPU_Stack.md).
 
-`stdlib/floatn.sapp` is a pblang-native engine for representing and quantizing floats in
-**any** bit width — `f0`, `f1`, `f2`, `f4`, `f8` (`f8e4m3`/`f8e5m2`), `f16`, `bf16`,
-`tf32`, `f32`, `f64`, `f128`, and arbitrary custom `fN`. It powers low-bit ML quantization
-(shrinking model weights), minifloats for old/embedded targets, and is the foundation for
-future language-level `fN` types.
+### Arbitrary-Width Floats (`fN` — `stdlib/floatn.sapp`)
+
+`stdlib/floatn.sapp` represents and quantizes floating-point formats of **any** bit width — `f0`, `f1`, `f2`, `f4`, `f8` (`f8e4m3`/`f8e5m2`), `f16`, `bf16`, `tf32`, `f32`, `f64`, `f128`, and custom `fN` — for low-bit ML weight packing and embedded targets:
 
 ```pblang
 let F = import("stdlib:floatn.sapp");
-F.quantize(3.14159, "bf16")    // 3.140625   (nearest bf16 value, as f64)
-F.info("f8e4m3").max_finite    // 448
-F.matmul(A, B, "f16")          // emulated low-precision matmul (rounds each result to f16)
-let bytes = F.pack(weights, "f8e4m3")   // 4x smaller than f64 on disk
+F.quantize(3.14159, "bf16")             // 3.140625 (nearest bf16 value, as f64)
+F.info("f8e4m3").max_finite             // 448
+F.matmul(A, B, "f16")                   // emulated f16-rounded matmul
+let bytes = F.pack(weights, "f8e4m3")   // 8x smaller than f64 on disk
 ```
-
-**Honest model:** hardware computes only in f32/f64, so the engine computes in f64 and
-uses `fN` as a representation/quantization layer (`fN` arithmetic = compute in f64, round
-to `fN`). f64 is the precision ceiling: wider formats (`f128`, big `fN`) are *described*
-and quantized within f64 precision, but their exact >52-bit patterns can't be assembled in
-an f64 — `info().encodable`/`faithful` report this and `encode()` raises rather than lie.
-
-### Machine inventory (`hwinfo`)
-
-`stdlib/hwinfo.sapp` detects **every device** on the machine — CPU, RAM, drives (SSD/HDD),
-every GPU (integrated + discrete), NPU, network and sound cards, and a class histogram of
-all other PnP devices — **vendor-agnostically** (NVIDIA, AMD, Intel, Apple, Qualcomm, …;
-`vendor(name)` classifies any device). `survey()` returns the whole inventory and
-`compute_plan()` auto-selects the best compute path.
-
-```pblang
-let hw = import("stdlib:hwinfo.sapp");
-hw.survey();         // full inventory (needs --allow-exec for live probing)
-hw.compute_plan();   // best CPU/GPU config; lists everything else as not-compute
-```
-
-**Honest by construction:** only the **CPU** (all cores) and a **GPU** (opt-in, one adapter
-at a time) can be *used for compute*. NPU/RAM/disks/network/sound are detected but are
-storage and I/O devices, not processing units — the library says so rather than pretend
-otherwise. Detection uses `proc_spawn_wait` + CIM on Windows; other platforms degrade to
-notes.
 
 ---
 
@@ -512,161 +439,96 @@ notes.
 
 ```text
 pblang/
-├── src/main.rs              # CLI entry point and command dispatch
-├── src/cli/                 # CLI helpers and reports
-├── crates/                  # Rust workspace crates
-│   ├── pblang-core/         # Parser and AST
-│   ├── pblang-ir/           # Bytecode, opcodes, values
-│   ├── pblang-vm/           # VM, builtins, GC, sandbox hooks
-│   ├── pblang-compiler/     # AST → bytecode compiler
-│   ├── pblang-typeck/       # Type checker
-│   ├── pblang-lint/         # Lints
-│   ├── pblang-pm/           # Package manager
-│   ├── pblang-lsp/          # Language server
-│   ├── pblang-cranelift/    # JIT / AOT prototype backend
-│   ├── pblang-ctranspiler/  # C99 transpiler
-│   ├── pblang-llvm/         # LLVM IR emitter
-│   ├── pblang-wasm/         # WAT/WASM emitter
-│   ├── pblang-ai/           # AI provider helpers
-│   ├── pblang-quantum/      # Quantum bridge
-│   └── pblang-stub/         # Self-extracting bundle launcher
-├── stdlib/                  # pblang standard library modules
-├── stdlib/compiler/         # self-hosted compiler written in pblang
-├── editors/ide/             # native pblang IDE
-├── tests/                   # Rust and pblang tests
-├── examples/                # example projects
-├── docs/                    # design, safety, tooling, and status docs
-└── benches/                 # benchmarks
+├── runtime_stage3/              # Sovereign Zero-Rust Host VM & .sapp -> .pbck Compiler (v2.0.0)
+│   ├── pblang_zero_rust_vm.c    # Cross-platform C99 entry, CLI, bundle runner (~375 KiB stripped)
+│   ├── zr_vm_core.h             # 48-opcode stack VM, O(1) FNV-1a maps, closures, adaptive GC
+│   ├── zr_compiler.h            # Native C99 Unicode lexer, parser & .pbck v1 compiler
+│   ├── zr_loader.h              # Portable stdlib/pblang.lock discovery & SHA-256 .pbck cache
+│   ├── zr_net_http_tls.h        # POSIX/Winsock2 TCP, OpenSSL TLS 1.3, WinHTTP HTTPS, WebSocket
+│   ├── zr_sqlite_ffi.h          # Dynamic libsqlite3 / winsqlite3.dll & capability-gated FFI
+│   ├── zr_gfx.h                 # Native X11 + FreeType2 (Linux) & Win32 GDI (Windows) GUI
+│   └── zr_{common,pbck_io,fs_os,json_crypto,builtins_core}.h
+├── stdlib/                      # 100% Pure-PBLang Standard Library & Self-Hosted Compilers
+│   ├── compiler/                # Self-hosted tokenizer, parser, optimizer, C99 & .pbck emitters
+│   ├── native/                  # 3-stage self-hosting x64 ELF64, x64-dyn, Windows PE32+, ARM64, WASM
+│   ├── hardware_governor.sapp   # Multi-accelerator CPU/RAM/GPU/NPU/TPU governor
+│   ├── sovereign_studio_ui.sapp # WCAG AAA Obsidian/Alabaster native + HTML5 Studio
+│   ├── smart_updater.sapp       # Polymorphic atomic updater & portable lockfile sync
+│   ├── algorithms_24.sapp       # 24 canonical algorithms + portfolio meta-solver
+│   ├── quantum_computing.sapp   # 1..20-qubit statevector simulator + IBM/Google QPU clients
+│   ├── pqc_mlkem768.sapp        # NIST FIPS 202 SHA-3/SHAKE & FIPS 203 ML-KEM-768
+│   └── bioinformatics_dna.sapp  # Needleman-Wunsch, Smith-Waterman, ORF & De Bruijn assembly
+├── tools/                       # Pure-PBLang CLI drivers (pbc.sapp, pbsecure.sapp, pbaudit.sapp, pblock.sapp)
+├── editors/                     # Native pbIDE (editors/ide/) & VS Code extension (editors/vscode/)
+├── emulators/                   # 6 deterministic register-level hardware simulation models
+├── tests/                       # Comprehensive .sapp verification & safety suites
+├── bench/                       # Live OS process benchmarks & synthetic catalog models
+├── examples/                    # Runnable .sapp demos across security, UI, AI, and embedded
+├── docs/                        # Documentation hub, contracts, and benchmark/validation reports
+└── src/ & crates/               # Optional legacy reference bootstrap workspace (not required in v2.0.0)
 ```
 
-`tools/pblock.sapp` is the PBLang-native publication step for local path
-dependencies while the retained bootstrap package manager remains available.
-It validates `pblang.toml`, preserves content digests, rejects absolute or
-mismatched dependency roots, and atomically rewrites only local lock paths. Run
-it as trusted maintenance code with
-`pblang run tools/pblock.sapp --allow-all -- <project>`. Nested source
-dependencies should not ship their own bootstrap lock
-until the self-hosted loader owns nested relative-path resolution end to end.
-The PBLang-native `pbbuild --project` path now performs this publication
-automatically after a successful build and removes the produced artifact if
-portable lock publication fails. Direct retained-bootstrap `pblang build`
-still requires `pblock` as its explicit final publication step.
-
-For a retained-runtime installation launched from other working directories,
-`tools/pblock_install.sapp` materializes local dependency paths at the final
-installation location while preserving all digests. Keep that host-bound lock
-local; source/release locks stay portable. See
-[`Installed dependency locks`](docs/INSTALLED_DEPENDENCY_LOCKS.md).
-
-[Controlled modularity](docs/CONTROLLED_MODULARITY.md) adds exact versioned
-interface contracts, bounded required/optional dependency resolution and explicit
-fallback planning for PBLang tools and products. `pbmodules` reports compatibility;
-`pbc --module-contract FILE --module-root ID` rejects incompatible declarations
-before compiling. Capability declarations do not grant runtime permissions.
-
-See [`STRUCTURE.md`](STRUCTURE.md) for the crate map and [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md) for the current test/status snapshot.
+See [`docs/Lockfile_contract.md`](docs/Lockfile_contract.md) for portable `pblang.lock` (`pblang-package-tree-v2`) rules and [`docs/README.md`](docs/README.md) for the complete documentation index.
 
 ---
 
-## Embedding safely in Rust
+## Building from Source & Capability Sandboxing
 
-```rust
-use pblang_core::parse;
-use pblang_compiler::compile;
-use pblang_vm::{StdlibConfig, VmLimits, VM};
+### Building the Sovereign Zero-Rust Binary (`Linux` & `Windows`)
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let source = r#"print "Hello from embedded pblang!";"#;
-    let ast = parse(source)?;
-    let chunk = compile(ast)?;
+```bash
+# Linux (x86-64 / ARM64 POSIX — produces ~375 KiB stripped ELF64):
+gcc -O3 -std=gnu99 -Wall -Wno-unused-function \
+  runtime_stage3/pblang_zero_rust_vm.c -ldl -lpthread -lm -s -o pblang
 
-    let config = StdlibConfig {
-        core: true,
-        fs: false,
-        net: false,
-        http: false,
-        json: true,
-        crypto: true,
-        sqlite: false,
-        ffi: false,
-        ffi_allow_all: false,
-        ffi_allowed_libs: Default::default(),
-        ffi_allowed_symbols: Default::default(),
-        exec: false,
-        gfx: false,
-        import: false,
-        stdlib_import: false,
-        spawn: false,
-        env: false,
-        process_exit: false,
-    };
-
-    let mut vm = VM::with_stdlib(config);
-    vm.set_limits(Some(VmLimits {
-        max_instructions: Some(100_000),
-        max_stack_depth: Some(64),
-        ..Default::default()
-    }));
-
-    vm.run(&chunk)?;
-    Ok(())
-}
+# Windows x86-64 (MinGW-w64 — produces ~365 KiB stripped PE32+ .exe):
+x86_64-w64-mingw32-gcc -O3 -std=gnu99 -Wall -Wno-unused-function \
+  runtime_stage3/pblang_zero_rust_vm.c -lws2_32 -lwinhttp -lgdi32 -luser32 -lbcrypt -s -o pblang.exe
 ```
 
-Use `fs`, `net`, `http`, `exec`, `ffi`, `env`, `import`, `spawn`, `gfx`, and
-`process_exit` only when the script and its host boundary justify them. The
-historical `StdlibConfig::default()` is CLI-compatible, not an untrusted-code
-profile; construct the deny profile explicitly as above.
+### Capability-Sandboxed Execution
 
-The standard library also includes bounded native model-container support:
-`stdlib/onnx.sapp` executes a deterministic CPU subset of ONNX without Python
-or ONNX Runtime, while `stdlib/gguf.sapp` converts dense F32/F16/BF16
-Safetensors snapshots to deterministic GGUF v3 and validates the complete
-published container. Unsupported operators, tensor types, dynamic shapes,
-malformed offsets, and exceeded resource budgets fail closed.
+Run untrusted or pure-computation scripts under `--sandbox` (canonicalized `stdlib:...` imports allowed; filesystem, network, HTTP, SQLite, FFI, subprocesses, and environment mutations denied by default) or selective `--deny-*` / `--allow-*` flags:
 
-`stdlib/linux_pidfd.sapp` provides race-resistant Linux process identity and
-signalling through `pidfd_open` and `pidfd_send_signal`. It exposes no classic
-PID-based fallback: unsupported kernels/libcs, PID 1, invalid signals, stale
-handles, and closed handles fail closed.
+```bash
+pblang run script.sapp --sandbox
+pblang run web_app.sapp --allow-net --deny-exec --deny-ffi
+```
+
+*(For host applications embedding the optional legacy Rust `pblang-vm` crate, see [`docs/Embedding.md`](docs/Embedding.md) and [`docs/Embedding_lifecycle.md`](docs/Embedding_lifecycle.md).)*
 
 ---
 
 ## Documentation
 
-- [`docs/USAGE_GUIDE.md`](docs/USAGE_GUIDE.md)
-- [`docs/TUTORIALS.md`](docs/TUTORIALS.md)
-- [`docs/Language_Semantics.md`](docs/Language_Semantics.md)
-- [`docs/Tooling.md`](docs/Tooling.md)
-- [`docs/Safety.md`](docs/Safety.md)
-- [`docs/Capability_model.md`](docs/Capability_model.md)
-- [`docs/PB_IDE.md`](docs/PB_IDE.md)
-- [`docs/Visual_Designer.md`](docs/Visual_Designer.md)
-- [`docs/Performance_Contracts.md`](docs/Performance_Contracts.md)
-- [`docs/CURRENT_STATUS.md`](docs/CURRENT_STATUS.md)
-- [`docs/Tasks.md`](docs/Tasks.md)
+- **Documentation Hub**: [`docs/README.md`](docs/README.md)
+- **Language Semantics & Pipeline**: [`docs/Language_Semantics.md`](docs/Language_Semantics.md) · [`docs/Execution_pipeline.md`](docs/Execution_pipeline.md) · [`docs/Executable_targets.md`](docs/Executable_targets.md)
+- **Security, Safety & Capabilities**: [`SECURITY.md`](SECURITY.md) · [`docs/Safety.md`](docs/Safety.md) · [`docs/Security_Analysis.md`](docs/Security_Analysis.md) · [`docs/Capability_model.md`](docs/Capability_model.md) · [`docs/Lockfile_contract.md`](docs/Lockfile_contract.md)
+- **Tooling, Studio UI & Performance**: [`docs/Tooling.md`](docs/Tooling.md) · [`docs/Visual_Designer.md`](docs/Visual_Designer.md) · [`docs/Performance_Contracts.md`](docs/Performance_Contracts.md) · [`docs/Benchmarking.md`](docs/Benchmarking.md)
 
 ---
 
 ## Testing
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace -- -D warnings
-cargo test --workspace
-cargo build --workspace --examples
+# Sovereign Zero-Rust VM, C99 .sapp compiler, SQLite, HTTP/TLS & single-file bundle:
+./pblang run tests/zero_rust_vm_test.sapp --allow-all
+
+# Pure-PBLang 3-Stage Self-Hosting Native Compilers (ELF64 fixed-point, x64-dyn, Windows PE32+):
+./pblang run tests/path_b_native_sovereign_test.sapp --allow-all
+
+# Multi-Accelerator Hardware Governor & Sovereign Studio UI:
+./pblang run tests/hardware_governor_and_studio_ui_test.sapp --allow-all
+
+# Smart Polymorphic `pblang update`, 24 Algorithms / Quantum / PQC, Safety & Release Readiness:
+./pblang run tests/smart_updater_test.sapp --allow-all
+./pblang run tests/algorithms_quantum_pqc_bio_test.sapp --allow-all
+./pblang run tests/safety_test.sapp --allow-all
+./pblang run tests/public_release_readiness_test.sapp --allow-all
 ```
 
 ---
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
-
-### Retained import-origin checking
-
-Use the opt-in [import-origin source profile](docs/IMPORT_ORIGIN_CHECK.md) to reject deferred or escaped imports before release. It performs no dependency execution and does not repair the retained host or replace per-dependency qualification.
-
-### Default argument correctness
-
-The PBLang compiler preserves explicit `nil` arguments and fills only omitted parameters. See [default arguments and PBCS v4 compatibility](docs/COMPILER_DEFAULT_ARGUMENTS.md).
+Dual-licensed under MIT (`LICENSE` / `LICENSE-MIT`) and Apache-2.0 (`LICENSE-APACHE`). See [`LICENSE`](LICENSE).

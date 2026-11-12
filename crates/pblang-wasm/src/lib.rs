@@ -247,6 +247,7 @@ struct WasmCtx {
     /// Parallel to `string_table`: the linear-memory offset assigned to each
     /// interned string (its 4-byte length prefix). Cumulative, not fixed-stride.
     string_offsets: Vec<u32>,
+    #[allow(dead_code)]
     string_offset: u32,
     /// Next free offset for the string arena; advances by the actual bytes each
     /// string uses (a fixed stride overlapped/corrupted strings > the stride).

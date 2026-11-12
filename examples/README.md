@@ -1,19 +1,19 @@
 # PBLang Runnable Examples & Demos (`examples/`)
 
-This directory contains runnable `.sapp` programs demonstrating every major capability of **PBLang `1.0.0-stable`**, from standalone systems programming and zero-trust security to native GUI apps, AI/ONNX inference, quantum/neuromorphic simulation, and embedded hardware control.
+This directory contains runnable `.sapp` programs demonstrating the capabilities of **PBLang `2.0.0`**, from Zero-Rust systems programming, capability sandboxing, and post-quantum security to native desktop/web UI apps, ONNX CPU inference, quantum statevector simulation, and embedded hardware descriptors.
 
 ---
 
 ## Quick Run
 
 ```bash
-# Run the unified flagship showcase:
-pblang run examples/chat_ideas_omni_showcase.sapp --allow-all
-
 # Run security & taint analysis examples:
 pblang run examples/security_analysis_basic.sapp --allow-all
 pblang run examples/security_config_redaction.sapp --allow-all
 pblang run examples/security_transport_guard.sapp --allow-all
+
+# Export the Sovereign Studio dashboard HTML:
+pblang studio --export-html /tmp/pblang_studio.html
 ```
 
 ---
@@ -22,10 +22,10 @@ pblang run examples/security_transport_guard.sapp --allow-all
 
 | Category | Key Examples | What It Demonstrates |
 | :--- | :--- | :--- |
-| **1. Flagship All-in-One Showcase** | `chat_ideas_omni_showcase.sapp`, `historical_4sources_ideas_engine.sapp` | Smart O(1) lazy-idle module loader, Omni-Supremacy benchmark verifier, Flagship UI themes, and strict `[REDACTED]` confidentiality. |
-| **2. Security, Privacy & Sandbox** | `security_analysis_basic.sapp`, `security_config_redaction.sapp`, `security_transport_guard.sapp`, `bounded_process/` | Static AST taint analysis, secret redaction, carrier-independent TLS/USB transport guard, and bounded Linux child process supervision (`execve`). |
-| **3. Desktop, Web & Mobile UI** | `modern_ui_demo/`, `declarative_browser/`, `crud_website/`, `android_dev_example/` | Single declarative view tree (`stdlib:modern_ui.sapp`) rendered to Desktop `X11`, hardened Web (`A+ CSP`), Android `APK`, and TUI. |
-| **4. Native Compilation & Cross-Target** | `demos/arm64/`, `demos/wasm/`, `cross_target_artifacts/`, `compiler_batch/` | Pre-verified ARM64 `ELF64` binaries (`fibseq`, `sort`, `palindrome`, `caesar`), WebAssembly modules (`fib.wasm`), and C99 transpilation. |
-| **5. AI, ONNX & Cognitive Agents** | `ai_chat_toolcall/`, `ai_plugin_minimal/`, `ai_turn_budget/`, `pbai_modularity.sapp` | Deterministic ONNX inference, tool-calling agents, turn budgets, and `pbAI` student checkpoint verification. |
-| **6. Data, SQL, Cache & Concurrency** | `data_store/`, `cdn_cache/`, `db_owned.sapp`, `async_pool/`, `concurrent_tasks/` | Native SQLite/Redis stores, regional CDN caching, structured async worker pools, and automatic lifetime cleanup. |
-| **7. Embedded & Hardware Studio** | `uno_r4_led_studio/`, `embedded_control_center/` | Arduino Uno R4 WiFi LED matrix studio, ESP32-D firmware generation, and cycle-accurate hardware simulation. |
+| **1. Security, Privacy & Sandbox** | `security_analysis_basic.sapp`, `security_config_redaction.sapp`, `security_transport_guard.sapp`, `bounded_process/` | Static AST taint analysis, `[REDACTED]` secret scrubbing, carrier-independent TLS/USB transport guard, and bounded Linux child process supervision (`execve`). |
+| **2. Desktop, Web & Mobile UI** | `modern_ui_demo/`, `one_line_apps/`, `declarative_browser/`, `crud_website/`, `android_dev_example/` | Single declarative view tree (`stdlib:modern_ui.sapp`) rendered to Desktop (`X11` / `Win32 GDI`), hardened Web (`A+ CSP`), Android `APK`, and TUI. |
+| **3. Native Compilation & Cross-Target** | `demos/arm64/`, `demos/wasm/`, `cross_target_artifacts/`, `compiler_batch/` | Native `x86-64 ELF64`, Windows `PE32+`, `ARM64 ELF64` (`fibseq`, `sort`, `palindrome`, `caesar`), WebAssembly (`fib.wasm`), and hosted `C99` transpilation. |
+| **4. AI, ONNX & Agent Budgets** | `ai_chat_toolcall/`, `ai_plugin_minimal/`, `ai_turn_budget/` | Deterministic CPU ONNX inference (`stdlib:onnx.sapp`), tool-calling workflows, and bounded agent turn budgets. |
+| **5. Data, SQL, Cache & Concurrency** | `data_store/`, `cdn_cache/`, `db_owned.sapp`, `async_pool/`, `concurrent_tasks/` | Native SQLite/Redis stores, regional CDN caching, structured async worker pools, and deterministic `defer` cleanup. |
+| **6. Embedded & Hardware Studio** | `embedded_blink/`, `embedded_circuit/`, `embedded_inspector/`, `uno_r4_led_studio/`, `embedded_control_center/` | ATmega328P AVR8 Intel HEX emission, Arduino Uno R4 WiFi LED matrix studio, and deterministic register-level hardware simulation. |
+| **7. Showcase & Catalog Runners** | `chat_ideas_omni_showcase.sapp`, `historical_4sources_ideas_engine.sapp` | Lazy-idle module loading, UI theme showcases, and synthetic architecture catalog inspection. |

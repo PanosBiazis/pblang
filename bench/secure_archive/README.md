@@ -1,6 +1,6 @@
 # Archive mode comparison
 
-Run each file with the same PBLang0.6.0 runtime, from the repository root:
+Run each file with the current `PBLang 2.0.0` runtime, from the repository root:
 `pblang run bench/secure_archive/binary_fast.sapp --allow-all`.
 Use the matching `auto` file as the existing-mode baseline. Each process packs
 four identical768-byte payloads; the final printed number is ZIP byte length.

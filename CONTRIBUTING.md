@@ -1,134 +1,97 @@
-# Contributing to pblang
+# Contributing to PBLang (`2.0.0`)
 
-Thank you for your interest in contributing to pblang! This document provides
-guidelines and information to get you started.
+Thank you for your interest in contributing to **PBLang**! This guide covers building the Sovereign Zero-Rust host runtime, working on the self-hosted compiler & standard library, running verification suites, and maintaining public repository hygiene.
 
 ## Getting Started
 
 ### Prerequisites
 
-- Rust 1.70+ (install via [rustup](https://rustup.rs/))
-- Git
+- **Primary (`PBLang 2.0.0` Sovereign Zero-Rust Runtime & Toolchain)**:
+  - Linux / macOS: C99 compiler (`gcc` or `clang`) + `git`
+  - Windows x86-64: `MinGW-w64` (`x86_64-w64-mingw32-gcc` or MSYS2 `gcc`) + `git`
+- **Optional (Legacy Reference Workspace `crates/*` only)**:
+  - Rust stable toolchain (`rustup`) — *not required to build, run, or test `pblang 2.0.0`*.
 
-### Setup
+### Build & Quick Verification
 
 ```bash
-git clone https://github.com/your-username/pblang.git
+git clone https://github.com/PanosBiazis/pblang.git
 cd pblang
-cargo build
-cargo test
+
+# Build the ~375 KiB Sovereign Zero-Rust Linux binary:
+gcc -O3 -std=gnu99 -Wall -Wno-unused-function \
+  runtime_stage3/pblang_zero_rust_vm.c -ldl -lpthread -lm -s -o pblang
+
+./pblang --version
+./pblang run tests/zero_rust_vm_test.sapp --allow-all
+./pblang run tests/path_b_native_sovereign_test.sapp --allow-all
+```
+
+For Windows `PE32+` cross-compilation:
+
+```bash
+x86_64-w64-mingw32-gcc -O3 -std=gnu99 -Wall -Wno-unused-function \
+  runtime_stage3/pblang_zero_rust_vm.c -lws2_32 -lwinhttp -lgdi32 -luser32 -lbcrypt -s -o pblang.exe
 ```
 
 ## Development Workflow
 
-### Branch Strategy
+### Branch Strategy & Making Changes
 
-- `main` — stable, always passes CI
-- Feature branches — `feature/<description>` or `fix/<description>`
-
-### Making Changes
-
-1. Create a branch from `main`
-2. Make your changes
-3. Add or update tests for your changes
-4. Run the full test suite: `cargo test --workspace`
-5. Run clippy: `cargo clippy --workspace`
-6. Run formatter: `cargo fmt --all`
-7. Submit a pull request
+1. Create a focused branch from `main` (`feat/<description>` or `fix/<description>`).
+2. Implement bounded, tested changes with zero regressions.
+3. If you modify files under `stdlib/`, refresh `pblang.lock` (`./pblang update .`) and verify that `path = "stdlib"` remains strictly relative.
+4. Run the verification suites before opening a pull request.
 
 ### Commit Messages
 
-Use clear, descriptive commit messages:
+Use clear Conventional Commit style messages:
 
-```
-<area>: <short description>
-
-<optional longer description>
+```text
+<type>(<scope>): <short summary>
 ```
 
 Examples:
-- `vm: fix stack overflow on deeply nested closures`
-- `pm: add SHA256 verification for registry packages`
-- `stdlib: add websocket write_frame helper`
+- `feat(vm): add O(1) FNV-1a open-addressing map index`
+- `fix(codegen-x64): preserve register callee-saves across nested try/catch`
+- `docs(readme): align binary footprint metrics with v2.0.0 release`
 
 ## Project Structure
 
-See [STRUCTURE.md](STRUCTURE.md) for a detailed map of the codebase.
+- **Sovereign Zero-Rust Host VM & `.sapp -> .pbck` Compiler (`C99`)** — `runtime_stage3/pblang_zero_rust_vm.c` and `runtime_stage3/zr_*.h`
+- **Pure-PBLang Self-Hosted Compiler Pipeline** — `stdlib/compiler/` (`tokenizer.sapp`, `parser.sapp`, `optimizer.sapp`, `native_pbck.sapp`, `ctranspile.sapp`)
+- **Pure-PBLang Native Machine-Code Emitters** — `stdlib/native/` (`codegen_x64.sapp`, `elf_dyn_x64.sapp`, `codegen_pe64.sapp`, `codegen_arm64_ast.sapp`, `codegen_wasm.sapp`)
+- **Standard Library (`100% .sapp`)** — `stdlib/*.sapp` (Hardware Governor, Sovereign Studio UI, 24 Algorithms, Quantum Simulator + QPU clients, FIPS 203 `ML-KEM-768`, Bioinformatics, Smart Updater, Modern UI, Security/Safety)
+- **Toolchain CLI Drivers** — `tools/` (`pbc.sapp`, `pbsecure.sapp`, `pbaudit.sapp`, `pblock.sapp`)
+- **IDE & Editor Extensions** — `editors/ide/` and `editors/vscode/`
+- **Verification & Benchmarks** — `tests/` and `bench/`
+- **Optional Legacy Reference Crates** — `src/` and `crates/`
 
-Key areas:
-- **Parser/AST** — `crates/pblang-core/src/parser.rs`
-- **Compiler** — `crates/pblang-compiler/src/lib.rs`
-- **VM** — `crates/pblang-vm/src/vm.rs`
-- **Builtins** — registered in the VM crate
-- **Stdlib** — `stdlib/*.sapp` (written in pblang itself)
-- **CLI** — `src/main.rs`
-
-## Testing
-
-### Running Tests
+## Testing & Public Hygiene Rules
 
 ```bash
-# All tests
-cargo test --workspace
+# Core Zero-Rust VM, compiler, SQLite, HTTP/TLS, and bundle checks:
+./pblang run tests/zero_rust_vm_test.sapp --allow-all
 
-# Semantics tests only (language behavior)
-cargo test --test semantics
+# 3-stage native ELF64 fixed-point, x64-dyn FFI, and Windows PE32+ checks:
+./pblang run tests/path_b_native_sovereign_test.sapp --allow-all
 
-# Specific test
-cargo test my_test_name
+# Hardware Governor & Sovereign Studio UI checks:
+./pblang run tests/hardware_governor_and_studio_ui_test.sapp --allow-all
 
-# With output
-cargo test -- --nocapture
+# Smart updater, portable lockfiles, safety, and public release hygiene:
+./pblang run tests/smart_updater_test.sapp --allow-all
+./pblang run tests/safety_test.sapp --allow-all
+./pblang run tests/public_release_readiness_test.sapp --allow-all
 ```
 
-### Adding Tests
+### Mandatory Security, Privacy & Honesty Standards
 
-- **Language semantics**: Add a `.sapp` file in `tests/semantics/` and register
-  it in `tests/semantics.rs`
-- **Unit tests**: Add `#[test]` functions in the relevant crate
-- **Integration tests**: Add a file in `tests/`
+- **Zero Local Path or Secret Leaks**: Never commit hardcoded workstation paths (`/home/...`, `/media/...`, `C:\Users\...`), usernames, hostnames, RFC1918 LAN IPs, or tokens/keys anywhere in code, tests, docs, or `pblang.lock`.
+- **Engineering Honesty**: Clearly distinguish live OS measurements (`measured_live: true`) from synthetic models or in-VM simulations (`measured_live: false`, `mode: "in_vm_simulation"`). Never hardcode fake benchmark or hardware numbers.
+- **Capability Discipline**: Respect `--sandbox` and explicit `--allow-*` / `--deny-*` boundaries.
 
-### Test Conventions
+## Documentation & Release Notes
 
-- Test names should be descriptive: `closure_captures_outer_local_via_fn_literal`
-- Use `run_collect()` for testing print output
-- Use `run_err()` for testing error conditions
-- Flaky network tests should be marked `#[ignore]`
-
-## Code Style
-
-- Follow standard Rust formatting (`cargo fmt`)
-- Use `cargo clippy` to catch common issues
-- Prefer explicit error handling over `.unwrap()` in library code
-- Add doc comments (`///`) to public APIs
-- Keep functions focused and under ~50 lines when practical
-
-## Areas for Contribution
-
-Check [docs/Tasks.md](docs/Tasks.md) for the active backlog. Good first issues:
-
-- Adding stdlib modules (pure `.sapp` files)
-- Improving error messages
-- Adding test cases for edge cases
-- Documentation improvements
-- VS Code extension enhancements
-
-## Architecture Notes
-
-- The VM uses **reference counting** with a cycle-breaking GC
-- Threading uses **VM-per-thread** isolation (no shared heap)
-- Security is **capability-based** (embedders control what scripts can do)
-- The parser uses the **chumsky** combinator library
-- Bytecode is a flat array of `OpCode` enums with absolute jump targets
-
-## Release Notes
-
-User-visible changes are summarised in [CHANGELOG.md](CHANGELOG.md). Add an
-`[Unreleased]` entry for any change that affects behaviour, the public API,
-the CLI, or the stdlib surface.
-
-## Questions?
-
-- Check the `docs/` directory for design documents
-- Open an issue for bugs or feature requests
-- See `docs/CURRENT_STATUS.md` for what's working and what's planned
+- Browse [`docs/README.md`](docs/README.md) for architecture, safety, and target guides.
+- Document user-visible changes in [`CHANGELOG.md`](CHANGELOG.md).

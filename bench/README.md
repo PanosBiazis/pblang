@@ -1,6 +1,6 @@
 # PBLang Benchmark & Modeling Suite (`bench/`)
 
-This directory contains the live, correctness-gated OS process benchmark harness (`reproducible_core_matrix.sapp`) and the synthetic architectural/toolchain catalog runner (`omni_bench.sapp`) for **PBLang `1.4.0`**.
+This directory contains the live, correctness-gated OS process benchmark harness (`reproducible_core_matrix.sapp`) and the synthetic architectural/toolchain catalog runner (`omni_bench.sapp`) for **PBLang `2.0.0`**.
 
 ---
 
