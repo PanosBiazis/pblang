@@ -2,6 +2,30 @@
 
 All notable changes to **PBLang** are documented in this file.
 
+## [`2.1.0`] — 2026-11-12 (Universal Newest-to-Oldest Device Support: `64-bit / 32-bit / 16-bit / 8-bit / WASM32-WASI` Executables & Packages · Pure-PBLang `<= 32-bit` Machine-Code Compilers · Freestanding `10.35 KiB` MCU `.pbck` VM · `@polyglot` Multi-Target Builder · Public OPSEC Hardening)
+
+### Pure-PBLang `<= 32-bit` Native Machine-Code Compilers (`stdlib/native/codegen_sub32.sapp`, `tools/pbc.sapp`, `pblang build --target`)
+- Added **7 zero-external-toolchain `<= 32-bit` native machine-code backends** directly in pure PBLang (`stdlib/native/codegen_sub32.sapp`) and wired them into `tools/pbc.sapp` and `pblang build <file.sapp> [-o <out>] --target <arch>`:
+  - `--target x86` — **32-bit Linux `i386` `ELF32`** standalone executable (`ELFCLASS32=1`, `EM_386=3`, `cdecl` stack frames, recursion, signed 32-bit `idiv`/`imul`, `int 0x80` `sys_write`/`sys_exit`; verified via live Linux kernel execution).
+  - `--target pe32` — **32-bit Windows `i686` `PE32` `.exe`** (`IMAGE_FILE_MACHINE_I386 = 0x014C`, `OptionalHeader32` `Magic = 0x010B`, `SubsystemVersion 4.0` compatible from Windows 95/NT4/XP through Windows 11, importing `KERNEL32.dll` `GetStdHandle`, `WriteFile`, `ExitProcess`).
+  - `--target rv32` — **32-bit RISC-V `RV32IM` `ELF32`** standalone executable (`EM_RISCV = 243`, hardware `MUL`/`DIV`/`REM`, `ecall` `64`/`93`).
+  - `--target dos16` — **16-bit Real-Mode `8086` MS-DOS / FreeDOS `.COM`** (`ORG 0x0100`, pure 1978 `8086` opcodes, `bp` frames, recursion, `INT 21h` `AH=02h`/`4Ch`).
+  - `--target cpm80` — **8-bit `Intel 8080 / Z80` CP/M-80 `.COM`** (`ORG 0x0100`, 16-bit `HL`/`DE` math, recursive stack-saved call frames, CP/M BDOS `CALL 0x0005`).
+  - `--target c64` — **8-bit `MOS 6502` Commodore 64 `.PRG`** (`$0801` load header + `10 SYS 2061` BASIC autostart stub + 6502 machine code + KERNAL `JSR $FFD2` `CHROUT`).
+  - `--target avr8` — **8-bit `Atmel AVR ATmega328P` Intel HEX** firmware (`9600` 8N1 `UART0` `UDR0` transmitter + checksum-verified `:llaaaatt...cc` records).
+  - Bundled deterministic instruction-level ISA step-verifiers (`emulate_dos16_com`, `emulate_cpm80_com`, `emulate_c64_prg`, `emulate_avr8_hex`) verified in `tests/sub32_and_universal_devices_test.sapp`.
+
+### Universal `64-bit / 32-bit / 16-bit / 8-bit / WASM32-WASI` Runtime Portability & `@polyglot` Builder (`runtime_stage3/`, `tools/build_universal_devices.sapp`)
+- **Full Sovereign Host Runtime Portability Across `32-bit`, `64-bit`, BSD, Mobile & `WASM32-WASI` (`runtime_stage3/zr_*.h`)**:
+  - Added full `wasm32-wasi` (`__wasi__`) compilation & execution support (`562 KiB` `pblang-2.1.0-wasm32.wasm` running full `.sapp` compilation + `stdlib` imports under WASI runtimes), 32-bit `512 KiB` adaptive GC watermarks (`sizeof(void*) <= 4`), `word_bits` (`32`/`64`) in `hardware_probe()`, and universal architecture/OS detection (`x86_64`, `aarch64`, `riscv64`, `loongarch64`, `powerpc64`, `s390x`, `x86`, `armv7`, `arm`, `riscv32`, `mipsel`, `mips`, `powerpc`, `m68k`, `wasm32`; `linux`, `windows`, `macos`, `android`, `freebsd`, `wasi`).
+- **Freestanding `8/16/32-bit` Microcontrollers & Retro VMs**:
+  - Added `runtime_stage3/pblang_micro_vm.c` (`10.35 KiB` AVR8 Flash / `1.77 KiB` SRAM on `ATmega328P`, zero `malloc`, zero hardware FPU, executing real `pblang build` `.pbck` v1 bytecode across 8-bit AVR, 32-bit ARM Cortex-M0/M4, 32-bit RISC-V, ESP32, and legacy 32-bit hosts) and `runtime_stage3/pblang_dos16_vm.asm` (`1.2 KiB` 16-bit Real-Mode `8086` MS-DOS/FreeDOS VM).
+- **Polyglot Universal Device Builder (`tools/build_universal_devices.sapp`) & `8/16/32/64-bit` Hardware Governor (`stdlib/hardware_governor.sapp`)**:
+  - Implemented `tools/build_universal_devices.sapp` leveraging PBLang's native `@c`, `@js`, and `@python` `@polyglot` blocks (`__polyglot`, `polyglot_exec`) to reproducibly cross-compile, verify, Mach-O universal `lipo`-pack (`0xCAFEBABE`), and deterministically package **16 newest-to-oldest device archives & executables** locally with zero GitHub Actions quota consumption and zero local path leaks (`-ffile-prefix-map`).
+  - Upgraded `stdlib/hardware_governor.sapp` (`v2.1.0`) with `detect_word_bits` (`8 | 16 | 32 | 64`), `device_era_tier` (`retro_8_16bit`, `legacy_or_embedded_32bit`, `modern_64bit`), and 32-bit virtual-address-safe heap caps.
+- **Public Repository Privacy & OPSEC Hardening**:
+  - Removed tracked temporary scan scratch file, scrubbed volume names from historical reports, hardened `.gitignore`, and upgraded `.github/workflows/ci.yml` to scan all tracked files (`git ls-files`) against local mount/home/email markers on every push and pull request.
+
 ## [`2.0.0`] — 2026-11-12 (Sovereign Zero-Rust Architecture: Cross-Platform `~411 KiB` Host Runtime & `.sapp` Compiler · Pure-PBLang 3-Stage Self-Hosting `x86-64` / `ELF64-dyn` / `PE32+` Compilers · Multi-Accelerator Hardware Governor & Sovereign Studio UI)
 
 ### Path A — Complete Cross-Platform Zero-Rust Sovereign Host VM, `.sapp -> .pbck` Compiler, Polymorphic Updater & 319 Builtins (`runtime_stage3/`)

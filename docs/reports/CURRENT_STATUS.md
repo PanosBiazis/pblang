@@ -118,7 +118,7 @@ failures or ignored tests.
 
 After an independent security GO and a final focused 1/1 rerun, new disposable
 processes completed two stable depth-one passes for PBLang (59 path-free
-records), AAP (18), ExtHD (7) and SPSSDT7 (8). One earlier SPSSDT7 attempt was
+records), AAP (18), external-drive (7) and external-ssd (8). One earlier external-ssd attempt was
 discarded in full as `child-evidence-rejected`; a new process then completed the
 stable admitted result. Every admitted result verified the seventeen-module
 manifest, reconstructed graph, linked source, runtime, enumerator closure,
@@ -162,8 +162,8 @@ broad semantic run completed 895/895 with zero failures, restoring the
 previously incomplete 892/895 repository baseline.
 
 Fresh disposable depth-one metadata shards completed two stable passes for the
-PBLang repository (59 path-free records), AAP root (18), SPSSDT7 root (8) and
-ExtHD root (7). Each process retained the 512 MiB external address-space limit,
+PBLang repository (59 path-free records), AAP root (18), external-ssd root (8) and
+external-drive root (7). Each process retained the 512 MiB external address-space limit,
 256-descriptor ceiling and 20-second external deadline. These are operational
 guards, not VM-enforced hard heap or preemption guarantees. Every report still
 states `hard_heap_bound=false`, `hard_wall_timeout=false`,

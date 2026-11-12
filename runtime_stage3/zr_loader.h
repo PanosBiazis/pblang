@@ -8,7 +8,7 @@
 
 #include "zr_compiler.h"
 
-#define ZR_PBCK_CACHE_SALT "PBLANG-ZR-2.0.0-r5|"
+#define ZR_PBCK_CACHE_SALT "PBLANG-ZR-2.1.0-r1|"
 
 static bool zr_file_exists_reg(const char *path) {
     if (!path || !path[0]) return false;
@@ -61,7 +61,7 @@ static void zr_canonicalize_path(const char *in_path, char out[4096]) {
     if (!in_path || !in_path[0]) { out[0] = '\0'; return; }
 #if defined(_WIN32)
     if (_fullpath(out, in_path, 4096)) return;
-#else
+#elif !defined(__wasi__)
     char *rp = realpath(in_path, NULL);
     if (rp) {
         snprintf(out, 4096, "%s", rp);

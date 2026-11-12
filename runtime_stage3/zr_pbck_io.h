@@ -512,7 +512,7 @@ static char *zr_resolve_self_exe(const char *argv0) {
     char buf[MAX_PATH * 4];
     DWORD n = GetModuleFileNameA(NULL, buf, sizeof(buf));
     if (n > 0 && n < sizeof(buf)) return zr_xstrndup(buf, (size_t)n);
-#else
+#elif !defined(__wasi__)
     char buf[4096];
     ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (n > 0) {
@@ -614,7 +614,7 @@ static bool zr_write_bundled_exe(const char *host_exe_path,
         snprintf(err_out, 256, "bundle-exe: write failed for '%.180s'", out_exe_path);
         return false;
     }
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
     chmod(out_exe_path, 0755);
 #endif
     return true;

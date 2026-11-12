@@ -18,7 +18,7 @@
 //   * Adaptive Planner & Zero-Idle UI Frame Governor: plan_execution(), govern_frame_pace(), apply_runtime_tuning()
 //          with transparent Greek & English explainability (explanation_el, explanation_en, decision_factors).
 
-let GOVERNOR_VERSION = "2.0.0";
+let GOVERNOR_VERSION = "2.1.0";
 let PROFILE_FORMAT = "pblang.hardware_governor.profile.v2";
 let PLAN_FORMAT = "pblang.hardware_governor.plan.v2";
 let PACE_FORMAT = "pblang.hardware_governor.frame_pace.v2";
@@ -96,11 +96,11 @@ fn _exec_stdout(cmd, argv) {
     return str_trim(str(out));
 }
 
-// ── OS & Architecture Detection ──────────────────────────────────────────────
+// ── OS, Architecture & Word-Bit Width Detection (8 / 16 / 32 / 64-bit) ──────
 
 fn detect_os() {
     let p = try platform() catch "unknown";
-    if p == "linux" or p == "windows" or p == "macos" {
+    if p == "linux" or p == "windows" or p == "macos" or p == "android" or p == "freebsd" or p == "wasi" {
         return p;
     }
     let path_env = try env_get("PATH") catch nil;
@@ -117,7 +117,31 @@ fn detect_os() {
     return "posix";
 }
 
+fn detect_word_bits(arch) {
+    let a = str_lower(str_trim(str(arch)));
+    if a == "avr8" or a == "avr" or str_starts_with(a, "avr") or str_contains(a, "atmega")
+        or a == "z80" or a == "8080" or str_contains(a, "cpm80") or a == "6502" or str_contains(a, "c64") {
+        return 8;
+    }
+    if a == "x86_16" or a == "8086" or a == "i8086" or str_contains(a, "dos16") or str_contains(a, "8086") or str_starts_with(a, "msp430") {
+        return 16;
+    }
+    if a == "x86" or a == "i386" or a == "i486" or a == "i586" or a == "i686" or str_starts_with(a, "i386-") or str_starts_with(a, "i686-") or str_starts_with(a, "x86-")
+        or a == "armv7" or a == "armv7l" or a == "armv6" or a == "armv6l" or a == "arm" or a == "armel" or a == "armhf" or str_starts_with(a, "arm-") or str_starts_with(a, "thumbv")
+        or a == "cortex-m0" or a == "cortex-m3" or a == "cortex-m4"
+        or str_starts_with(a, "riscv32") or str_starts_with(a, "rv32")
+        or ((str_starts_with(a, "mips") or str_starts_with(a, "powerpc") or a == "ppc") and not str_contains(a, "64"))
+        or a == "m68k" or str_starts_with(a, "wasm32") or a == "wasm" or a == "xtensa" or a == "esp32" {
+        return 32;
+    }
+    return 64;
+}
+
 fn _detect_arch(os_name, cpuinfo_text) {
+    let rt_arch = try os_arch() catch "";
+    if rt_arch != nil and str_trim(str(rt_arch)) != "" and str_trim(str(rt_arch)) != "unknown" {
+        return str_lower(str_trim(str(rt_arch)));
+    }
     let karch = _read_trimmed("/proc/sys/kernel/arch");
     if karch != nil and karch != "" {
         return str_lower(karch);
@@ -330,15 +354,22 @@ fn _probe_cpu(os_name) {
     }
 
     // On Windows x86_64 without /proc/cpuinfo, probe AVX2/SSE4.2 conservatively if arch is x86_64
+    let wbits = detect_word_bits(arch);
+    let hp_bits = _parse_int_or(try hardware_probe().word_bits catch 0, 0);
+    if hp_bits == 8 or hp_bits == 16 or hp_bits == 32 or hp_bits == 64 {
+        wbits = hp_bits;
+    }
     if flags_line == "" and os_name == "windows" and arch == "x86_64" {
         flags_line = "sse4_2 avx2 aes";
     }
-    let simd = parse_simd_flags(flags_line, arch);
+    // 32-bit x86 binaries running on 64-bit /proc/cpuinfo hosts should not claim 64-bit AVX-512/AMX registers
+    let simd = if wbits <= 16 { parse_simd_flags("", arch) } else { parse_simd_flags(flags_line, arch) };
 
     return map{
         logical_cores: cores,
         model_name: model_name,
         arch: arch,
+        word_bits: wbits,
         simd: simd,
         governor: governor,
         cur_freq_khz: cur_khz,
@@ -905,6 +936,7 @@ fn discover_hardware(overrides = nil) {
         format: PROFILE_FORMAT,
         version: GOVERNOR_VERSION,
         os: os_name,
+        word_bits: cpu.word_bits,
         cpu: cpu,
         memory: mem,
         ram_total_mb: mem.ram_total_mb,
@@ -948,15 +980,19 @@ fn discover_hardware(overrides = nil) {
     return profile;
 }
 
-// Helper constructor for deterministic simulation & multi-device edge testing
+// Helper constructor for deterministic simulation & multi-device edge testing (8-bit to 64-bit)
 fn synthetic_hardware_profile(spec) {
     let cores = _max(1, _parse_int_or(try spec.cores catch 4, 4));
     let arch = str(try spec.arch catch "x86_64");
-    let flags = str(try spec.simd_flags catch "sse4_2 avx2 aes");
+    let wbits = _parse_int_or(try spec.word_bits catch detect_word_bits(arch), detect_word_bits(arch));
+    let def_flags = if wbits == 64 and arch == "x86_64" { "sse4_2 avx2 aes" } else { "" };
+    let flags = str(try spec.simd_flags catch def_flags);
     let simd = parse_simd_flags(flags, arch);
 
-    let ram_total = _max(256, _parse_int_or(try spec.ram_total_mb catch 4096, 4096));
-    let ram_avail = _clamp(_parse_int_or(try spec.ram_available_mb catch num_floor(ram_total * 0.5), 1024), 0, ram_total);
+    let min_ram_mb = if wbits <= 32 { 1 } else { 256 };
+    let def_ram_mb = if wbits <= 16 { 1 } elif wbits == 32 { 512 } else { 4096 };
+    let ram_total = _max(min_ram_mb, _parse_int_or(try spec.ram_total_mb catch def_ram_mb, def_ram_mb));
+    let ram_avail = _clamp(_parse_int_or(try spec.ram_available_mb catch _max(1, num_floor(ram_total * 0.5)), 1), 0, ram_total);
     let ram_used = ram_total - ram_avail;
     let ram_pct = _round1((ram_used * 100) / ram_total);
     let tier = compute_pressure_tier(ram_pct);
@@ -1010,10 +1046,12 @@ fn synthetic_hardware_profile(spec) {
         format: PROFILE_FORMAT,
         version: GOVERNOR_VERSION,
         os: str(try spec.os catch "linux"),
+        word_bits: wbits,
         cpu: map{
             logical_cores: cores,
             model_name: str(try spec.model_name catch (arch + " Synthetic Device")),
             arch: arch,
+            word_bits: wbits,
             simd: simd,
             governor: gov_str,
             cur_freq_khz: _parse_int_or(try spec.cur_freq_khz catch 2400000, 2400000),
@@ -1080,17 +1118,19 @@ fn govern_frame_pace(is_dirty, hw = nil) {
     let pmode = "desktop_steady";
     let throttled = false;
     let tier = "optimal";
+    let wbits = 64;
     if hw != nil and is_map(hw) {
         pmode = str(try hw.power_mode catch (try hw.power.power_mode catch "desktop_steady"));
         throttled = _is_true(try hw.power.thermal_throttled catch false);
         tier = str(try hw.pressure_tier catch (try hw.memory.pressure_tier catch "optimal"));
+        wbits = _parse_int_or(try hw.word_bits catch (try hw.cpu.word_bits catch 64), 64);
     }
 
     let fps_cap = 60;
     let active_ms = 16;
     let idle_ms = 25;
     let active_mode = "interactive_smooth_60fps";
-    if pmode == "battery_eco" or throttled or tier == "critical" {
+    if pmode == "battery_eco" or throttled or tier == "critical" or wbits <= 16 {
         fps_cap = 30;
         active_ms = 33;
         idle_ms = 40;
@@ -1170,10 +1210,15 @@ fn plan_execution(task_profile = nil, hw = nil) {
         profile = discover_hardware();
     }
 
+    let arch_str = str(try profile.cpu.arch catch "x86_64");
+    let wbits = _parse_int_or(try profile.word_bits catch (try profile.cpu.word_bits catch detect_word_bits(arch_str)), detect_word_bits(arch_str));
+    let device_era_tier = if wbits <= 16 { "retro_8_16bit" } elif wbits == 32 { "legacy_or_embedded_32bit" } else { "modern_64bit" };
+
     let cores = _max(1, _parse_int_or(try profile.cpu.logical_cores catch 1, 1));
     let task = _normalize_task_profile(task_profile, cores);
 
-    let ram_total = _max(256, _parse_int_or(try profile.ram_total_mb catch (try profile.memory.ram_total_mb catch 4096), 4096));
+    let min_ram = if wbits <= 32 { 1 } else { 256 };
+    let ram_total = _max(min_ram, _parse_int_or(try profile.ram_total_mb catch (try profile.memory.ram_total_mb catch 4096), 4096));
     let ram_avail = _clamp(_parse_int_or(try profile.ram_available_mb catch (try profile.memory.ram_available_mb catch 2048), 2048), 0, ram_total);
     let ram_pct = try profile.ram_used_pct catch (try profile.memory.ram_used_pct catch 50.0);
     let tier = compute_pressure_tier(ram_pct);
@@ -1185,7 +1230,7 @@ fn plan_execution(task_profile = nil, hw = nil) {
     if cores >= 4 and task.kind != "batch_compute_max" {
         workers = _min(workers, cores - 1);
     }
-    if task.micro_task or tier == "critical" {
+    if wbits <= 16 or (wbits == 32 and ram_total <= 512) or task.micro_task or tier == "critical" {
         workers = 1;
     } else if pmode == "battery_eco" or throttled {
         if ram_total <= 2560 or tier == "constrained" {
@@ -1195,15 +1240,19 @@ fn plan_execution(task_profile = nil, hw = nil) {
         }
     } else if tier == "constrained" {
         workers = _max(1, _min(workers, _max(1, num_floor(cores / 2))));
-    } else if ram_total <= 4608 {
-        workers = _max(1, _min(workers, 3));
+    } else if ram_total <= 4608 or wbits == 32 {
+        workers = _max(1, _min(workers, 2));
+        if wbits == 64 { workers = _max(1, _min(_min(cores, task.parallelism), 3)); }
     }
     workers = _clamp(workers, 1, cores);
 
-    // 2. GC Watermark & Sparse Hive LRU Cells (scales gracefully from 2 GB SBC to 64 GB Workstation)
+    // 2. GC Watermark & Sparse Hive LRU Cells (scales from 8/16/32-bit devices up to 64 GB Workstations)
     let gc_watermark_mb = 8;
     let lru_cells = 8;
-    if ram_total <= 4608 or tier == "constrained" or tier == "critical" {
+    if wbits <= 16 or (wbits == 32 and ram_total <= 512) {
+        gc_watermark_mb = 1;
+        lru_cells = 1;
+    } else if wbits == 32 or ram_total <= 4608 or tier == "constrained" or tier == "critical" {
         gc_watermark_mb = 2;
         lru_cells = 2;
     } else if ram_total <= 12288 {
@@ -1221,9 +1270,13 @@ fn plan_execution(task_profile = nil, hw = nil) {
         lru_cells = 8;
     }
 
-    // Bounded working heap budget in MiB so low-RAM machines never swap-thrash
+    // Bounded working heap budget in MiB so low-RAM & <= 32-bit machines never swap-thrash or overflow 32-bit VA
     let max_heap_budget_mb = _max(48, num_floor(ram_avail * 0.45));
-    if tier == "critical" {
+    if wbits <= 16 or (wbits == 32 and ram_total <= 512) {
+        max_heap_budget_mb = _max(1, _min(64, _max(1, num_floor(ram_avail * 0.35))));
+    } else if wbits == 32 {
+        max_heap_budget_mb = _max(16, _min(512, num_floor(ram_avail * 0.35)));
+    } else if tier == "critical" {
         max_heap_budget_mb = _max(32, _min(192, num_floor(ram_avail * 0.30)));
     } else if tier == "constrained" or ram_total <= 2560 {
         max_heap_budget_mb = _max(48, _min(384, num_floor(ram_avail * 0.35)));
@@ -1243,6 +1296,11 @@ fn plan_execution(task_profile = nil, hw = nil) {
 
     // 5. Structured Explainable Decision Factors + Greek & English Narratives
     let decision_factors = [
+        map{
+            factor: "word_bits_and_era_tier",
+            observed: str(wbits) + "-bit (" + arch_str + ", era=" + device_era_tier + ")",
+            decision: "address_space_safe_gc_and_heap=true"
+        },
         map{
             factor: "memory_pressure",
             observed: str(ram_avail) + " MiB free / " + str(ram_total) + " MiB total (" + str(ram_pct) + "% used, tier=" + tier + ")",
@@ -1265,8 +1323,8 @@ fn plan_execution(task_profile = nil, hw = nil) {
         }
     ];
 
-    let explanation_el = "Ο Έξυπνος Κυβερνήτης Πόρων PBLang 2.0 ανίχνευσε " + str(cores)
-        + " λογικούς πυρήνες CPU (" + str(try profile.cpu.arch catch "x86_64") + "), "
+    let explanation_el = "Ο Έξυπνος Κυβερνήτης Πόρων PBLang 2.1 ανίχνευσε αρχιτεκτονική " + str(wbits) + "-bit ("
+        + arch_str + ") με " + str(cores) + " λογικούς πυρήνες CPU, "
         + str(ram_avail) + " MiB διαθέσιμη RAM από " + str(ram_total) + " MiB ("
         + str(ram_pct) + "% χρήση, βαθμίδα πίεσης «" + tier + "») και προφίλ ενέργειας «"
         + pmode + "». Επέλεξε " + str(workers) + " νήματα εργασίας ώστε να μην μπλοκάρεται η απόκριση του λειτουργικού, "
@@ -1276,8 +1334,8 @@ fn plan_execution(task_profile = nil, hw = nil) {
         + "), και οδηγούμενο από συμβάντα ρυθμό UI " + str(ui_fps_cap)
         + " FPS με ύπνο αδράνειας " + str(idle_sleep_ms) + " ms (~0.0% CPU όταν δεν υπάρχει αλληλεπίδραση).";
 
-    let explanation_en = "PBLang 2.0 Smart Resource Governor detected " + str(cores)
-        + " logical CPU cores (" + str(try profile.cpu.arch catch "x86_64") + "), "
+    let explanation_en = "PBLang 2.1 Smart Resource Governor detected " + str(wbits) + "-bit ("
+        + arch_str + ") architecture with " + str(cores) + " logical CPU cores, "
         + str(ram_avail) + " MiB available RAM out of " + str(ram_total) + " MiB ("
         + str(ram_pct) + "% used, pressure tier '" + tier + "'), and power envelope '"
         + pmode + "'. Selected " + str(workers) + " worker threads to preserve OS interactivity, "
@@ -1291,6 +1349,8 @@ fn plan_execution(task_profile = nil, hw = nil) {
     return map{
         format: PLAN_FORMAT,
         version: GOVERNOR_VERSION,
+        word_bits: wbits,
+        device_era_tier: device_era_tier,
         task_kind: task.kind,
         worker_threads: workers,
         gc_watermark_mb: gc_watermark_mb,
@@ -1354,6 +1414,6 @@ fn apply_runtime_tuning(hw = nil, task_profile = nil) {
 }
 
 export GOVERNOR_VERSION, PROFILE_FORMAT, PLAN_FORMAT, PACE_FORMAT,
-       detect_os, parse_simd_flags, parse_meminfo, compute_pressure_tier,
+       detect_os, detect_word_bits, parse_simd_flags, parse_meminfo, compute_pressure_tier,
        discover_hardware, synthetic_hardware_profile,
        govern_frame_pace, plan_execution, apply_runtime_tuning;

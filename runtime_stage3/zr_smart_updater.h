@@ -25,7 +25,7 @@
 #include <sys/stat.h>
 #endif
 
-#define ZR_SU_SEMVER "2.0.0"
+#define ZR_SU_SEMVER "2.1.0"
 #define ZR_SU_MAX_ENTRIES 10000
 #define ZR_SU_MAX_BYTES   (256ULL * 1024ULL * 1024ULL)
 
@@ -152,7 +152,7 @@ static bool zr_su_ends_with_ci(const char *s, const char *suf) {
 }
 
 static bool zr_su_is_symlink(const char *path) {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
     struct stat st;
     if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) return true;
 #else
@@ -262,7 +262,7 @@ static bool zr_su_write_atomic(const char *target, const uint8_t *data, size_t l
 
     static unsigned int s_seq = 0;
     char stage[4200];
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
     int fd = -1;
     for (int attempt = 0; attempt < 32; attempt++) {
         snprintf(stage, sizeof(stage), "%s/.pblang-upd-%d-%u.tmp",
@@ -280,7 +280,8 @@ static bool zr_su_write_atomic(const char *target, const uint8_t *data, size_t l
     (void)fchmod(fd, (mode_t)(mode & 0755));
     close(fd);
 #else
-    snprintf(stage, sizeof(stage), "%s\\.pblang-upd-%u.tmp", parent, ++s_seq);
+    (void)mode;
+    snprintf(stage, sizeof(stage), "%s/.pblang-upd-%u.tmp", parent, ++s_seq);
     FILE *fp = fopen(stage, "wb");
     if (!fp) { snprintf(err, 256, "cannot open staging file"); return false; }
     if (len > 0 && fwrite(data, 1, len, fp) != len) {
@@ -308,7 +309,7 @@ static bool zr_su_write_atomic(const char *target, const uint8_t *data, size_t l
         snprintf(err, 256, "atomic rename failed for '%s'", zr_su_basename(target));
         return false;
     }
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__wasi__)
     chmod(target, (mode_t)(mode & 0755));
 #endif
     return true;

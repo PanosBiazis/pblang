@@ -1,6 +1,6 @@
 # PBLang Deterministic Hardware Emulators & Bus Manager (`emulators/`)
 
-This directory contains **6 deterministic register-level hardware simulation models** and the **8-target hardware bus manager** written in 100% Pure PBLang (`2.0.0`).
+This directory contains **6 deterministic register-level hardware simulation models** and the **8-target hardware bus manager** written in 100% Pure PBLang (`2.1.0`).
 
 ---
 

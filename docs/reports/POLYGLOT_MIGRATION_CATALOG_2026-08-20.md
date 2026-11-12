@@ -31,7 +31,7 @@ separate provenance check before source is read or reimplemented.
   other projects. Deduplicate; do not merge it directly into active repositories.
 - `TESTER`: primarily Delphi and vendor utility material. Use only documented
   behavior as architectural inspiration after ownership review.
-- `SPSSDT7`: primarily installed games and platform-managed content. Excluded
+- `external-media-volume`: primarily installed games and platform-managed content. Excluded
   from migration unless a separately owned source directory is explicitly
   approved.
 - System filesystems are excluded from broad project discovery.

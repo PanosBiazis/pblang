@@ -1,0 +1,596 @@
+// tools/build_universal_devices.sapp — PBLang v2.1.0 Polyglot Universal Device Builder
+//
+// Uses PBLang's native @polyglot blocks (@c, @js, @python) + pure-PBLang sub-32-bit
+// native machine-code emitters (stdlib/native/codegen_sub32.sapp) to build standalone
+// executables and portable packages from the newest 64-bit systems down to 32-bit,
+// 16-bit (8086 MS-DOS), and 8-bit (8080/Z80 CP/M, MOS 6502 C64, Atmel AVR ATmega328P).
+//
+// Zero personal paths, zero secrets, zero paid cloud CI runners required.
+
+let Sub32 = import("stdlib:native/codegen_sub32.sapp");
+
+@c mcu_baremetal_entry (target="cortex-m-rv32", freestanding="true") {
+#define PBMICRO_FREESTANDING 1
+#if defined(__riscv)
+#define PBMICRO_PUTC_MMIO 0x10000000u
+#else
+#define PBMICRO_PUTC_MMIO 0x40004404u
+#endif
+#include "pblang_micro_vm.c"
+
+int pblang_mcu_entry(void) {
+    pbm_puts_c(PBMICRO_VERSION_STR "\r\n");
+    return pbmicro_load_and_run(&g_micro_vm, g_pbmicro_selftest_pbck, (uint32_t)sizeof(g_pbmicro_selftest_pbck)) ? 0 : 1;
+}
+
+void _start(void) {
+    (void)pblang_mcu_entry();
+    for (;;) {}
+}
+
+#if defined(__arm__) || defined(__thumb__)
+extern unsigned int __stack_top __attribute__((weak));
+void Reset_Handler(void) { _start(); }
+__attribute__((section(".isr_vector"), used))
+const void *const g_pblang_isr_vector[2] = {
+    (const void *)0x20004000u,
+    (const void *)Reset_Handler
+};
+#endif
+}
+
+@js wasi_universal_runner (runtime="node18+", target="wasm32-wasi") {
+#!/usr/bin/env node
+// run-wasi.mjs — Universal WASI Runner for pblang.wasm (Node.js 18+ / Bun / Deno)
+import { readFile } from "node:fs/promises";
+import { WASI } from "node:wasi";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const rootDir = resolve(here, "..");
+const wasmPath = resolve(here, "pblang.wasm");
+
+const wasi = new WASI({
+  version: "preview1",
+  args: ["pblang", ...process.argv.slice(2)],
+  env: {
+    ...process.env,
+    PBLANG_STDLIB: process.env.PBLANG_STDLIB || "/stdlib"
+  },
+  preopens: {
+    "/": process.cwd(),
+    "/stdlib": resolve(rootDir, "stdlib"),
+    "/tools": resolve(rootDir, "tools")
+  }
+});
+
+const wasmBytes = await readFile(wasmPath);
+const mod = await WebAssembly.compile(wasmBytes);
+const instance = await WebAssembly.instantiate(mod, wasi.getImportObject());
+const exitCode = wasi.start(instance);
+process.exit(typeof exitCode === "number" ? exitCode : 0);
+}
+
+@python universal_fat_and_packager (deterministic="true") {
+import sys, os, json, struct, hashlib, tarfile, zipfile, shutil
+
+FIXED_MTIME = 1762905600
+
+def build_apple_fat_macho(x64_path, arm64_path, out_path):
+    with open(x64_path, "rb") as f:
+        b_x64 = f.read()
+    with open(arm64_path, "rb") as f:
+        b_arm = f.read()
+    m_x64 = struct.unpack("<I", b_x64[:4])[0]
+    m_arm = struct.unpack("<I", b_arm[:4])[0]
+    if m_x64 != 0xFEEDFACF or m_arm != 0xFEEDFACF:
+        raise RuntimeError("Expected 64-bit Mach-O slices")
+    align_bits = 14
+    page = 1 << align_bits
+    off_x64 = page
+    off_arm = ((off_x64 + len(b_x64) + page - 1) // page) * page
+    hdr = struct.pack(">II", 0xCAFEBABE, 2)
+    arch_x64 = struct.pack(">iiIII", 0x01000007, 3, off_x64, len(b_x64), align_bits)
+    arch_arm = struct.pack(">iiIII", 0x0100000C, 0, off_arm, len(b_arm), align_bits)
+    with open(out_path, "wb") as out:
+        out.write(hdr + arch_x64 + arch_arm)
+        out.write(b"\x00" * (off_x64 - out.tell()))
+        out.write(b_x64)
+        out.write(b"\x00" * (off_arm - out.tell()))
+        out.write(b_arm)
+    os.chmod(out_path, 0o755)
+
+def add_tar_file(tf, src_path, arc_path, exec_bit=False):
+    with open(src_path, "rb") as f:
+        data = f.read()
+    ti = tarfile.TarInfo(name=arc_path)
+    ti.size = len(data)
+    ti.mtime = FIXED_MTIME
+    ti.uid = 0
+    ti.gid = 0
+    ti.uname = "root"
+    ti.gname = "root"
+    ti.mode = 0o755 if exec_bit else 0o644
+    import io
+    tf.addfile(ti, io.BytesIO(data))
+
+def add_tar_tree(tf, src_dir, arc_prefix):
+    for root, dirs, files in os.walk(src_dir):
+        dirs.sort()
+        files.sort()
+        rel_root = os.path.relpath(root, src_dir)
+        for fn in files:
+            if fn.startswith(".") or fn.endswith(".bak"):
+                continue
+            sp = os.path.join(root, fn)
+            ap = os.path.join(arc_prefix, fn) if rel_root == "." else os.path.join(arc_prefix, rel_root, fn)
+            ap = ap.replace("\\", "/")
+            add_tar_file(tf, sp, ap, fn.endswith(".sh") or fn.endswith(".mjs"))
+
+def make_tar_gz(out_tar_gz, top_dir, items, repo_root, include_runtime_tree=True):
+    import gzip
+    raw_tar = out_tar_gz + ".tmp.tar"
+    with tarfile.open(raw_tar, "w") as tf:
+        for it in items:
+            add_tar_file(tf, it["src"], top_dir + "/" + it["dst"], bool(it.get("exec", False)))
+        if include_runtime_tree:
+            add_tar_tree(tf, os.path.join(repo_root, "stdlib"), top_dir + "/stdlib")
+            add_tar_tree(tf, os.path.join(repo_root, "tools"), top_dir + "/tools")
+            for doc in ["README.md", "CHANGELOG.md", "pblang.toml", "pblang.lock"]:
+                dp = os.path.join(repo_root, doc)
+                if os.path.isfile(dp):
+                    add_tar_file(tf, dp, top_dir + "/" + doc, False)
+    with open(raw_tar, "rb") as fin, gzip.GzipFile(filename="", mode="wb", fileobj=open(out_tar_gz, "wb"), mtime=FIXED_MTIME) as gz:
+        shutil.copyfileobj(fin, gz)
+    os.remove(raw_tar)
+
+def add_zip_file(zf, src_path, arc_path, exec_bit=False):
+    with open(src_path, "rb") as f:
+        data = f.read()
+    zi = zipfile.ZipInfo(filename=arc_path.replace("\\", "/"), date_time=(2026, 11, 12, 0, 0, 0))
+    zi.compress_type = zipfile.ZIP_DEFLATED
+    zi.create_system = 3
+    mode = 0o100755 if exec_bit else 0o100644
+    zi.external_attr = mode << 16
+    zf.writestr(zi, data)
+
+def add_zip_tree(zf, src_dir, arc_prefix):
+    for root, dirs, files in os.walk(src_dir):
+        dirs.sort()
+        files.sort()
+        rel_root = os.path.relpath(root, src_dir)
+        for fn in files:
+            if fn.startswith(".") or fn.endswith(".bak"):
+                continue
+            sp = os.path.join(root, fn)
+            ap = os.path.join(arc_prefix, fn) if rel_root == "." else os.path.join(arc_prefix, rel_root, fn)
+            add_zip_file(zf, sp, ap, fn.endswith(".sh") or fn.endswith(".exe") or fn.endswith(".com"))
+
+def make_zip(out_zip, top_dir, items, repo_root, include_runtime_tree=True):
+    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for it in items:
+            add_zip_file(zf, it["src"], top_dir + "/" + it["dst"], bool(it.get("exec", False)))
+        if include_runtime_tree:
+            add_zip_tree(zf, os.path.join(repo_root, "stdlib"), top_dir + "/stdlib")
+            add_zip_tree(zf, os.path.join(repo_root, "tools"), top_dir + "/tools")
+            for doc in ["README.md", "CHANGELOG.md", "pblang.toml", "pblang.lock"]:
+                dp = os.path.join(repo_root, doc)
+                if os.path.isfile(dp):
+                    add_zip_file(zf, dp, top_dir + "/" + doc, False)
+
+def privacy_scan(paths, forbidden_tokens):
+    for p in paths:
+        if not os.path.isfile(p):
+            continue
+        with open(p, "rb") as f:
+            blob = f.read()
+        for tok in forbidden_tokens:
+            if not tok:
+                continue
+            if tok.encode("utf-8") in blob:
+                raise RuntimeError("Privacy scan blocked token in " + os.path.basename(p))
+
+cfg = json.loads(sys.stdin.read())
+op = cfg["op"]
+if op == "fat_macho":
+    build_apple_fat_macho(cfg["x64"], cfg["arm64"], cfg["out"])
+    print(json.dumps(dict(ok=True, size=os.path.getsize(cfg["out"]))))
+elif op == "package_all":
+    repo_root = cfg["repo_root"]
+    out_dir = cfg["out_dir"]
+    for pkg in cfg["packages"]:
+        p_out = os.path.join(out_dir, pkg["filename"])
+        if pkg["format"] == "tar.gz":
+            make_tar_gz(p_out, pkg["top_dir"], pkg["items"], repo_root, pkg.get("include_tree", True))
+        else:
+            make_zip(p_out, pkg["filename"][:-4], pkg["items"], repo_root, pkg.get("include_tree", True))
+    for cp_item in cfg["standalone_copies"]:
+        dst = os.path.join(out_dir, cp_item["dst"])
+        shutil.copy2(cp_item["src"], dst)
+        if cp_item.get("exec", False):
+            os.chmod(dst, 0o755)
+    all_files = sorted(f for f in os.listdir(out_dir) if f != "SHA256SUMS.txt" and os.path.isfile(os.path.join(out_dir, f)))
+    privacy_scan([os.path.join(out_dir, f) for f in all_files], cfg.get("forbidden", []))
+    lines = []
+    manifest = []
+    for fn in all_files:
+        fp = os.path.join(out_dir, fn)
+        h = hashlib.sha256(open(fp, "rb").read()).hexdigest()
+        sz = os.path.getsize(fp)
+        lines.append(h + "  " + fn)
+        manifest.append(dict(file=fn, sha256=h, bytes=sz))
+    with open(os.path.join(out_dir, "SHA256SUMS.txt"), "w", encoding="utf-8") as sf:
+        sf.write("\n".join(lines) + "\n")
+    print(json.dumps(dict(ok=True, count=len(manifest), assets=manifest)))
+}
+
+fn _run_cmd(bin: string, cmd_args: any, label: string) {
+    let r = proc_spawn_wait(bin, cmd_args);
+    if r.exit_code != 0 {
+        throw "Command failed [" + label + "] (" + bin + "): " + str(r.stderr) + " " + str(r.stdout);
+    }
+    return r;
+}
+
+fn _find_zig() {
+    let env_z = env_get("ZIG_BIN");
+    if env_z != nil and env_z != "" and fs_exists(env_z) {
+        return env_z;
+    }
+    let tmp_z = "/tmp/zig_toolchain/zig-linux-x86_64-0.13.0/zig";
+    if fs_exists(tmp_z) {
+        return tmp_z;
+    }
+    return "zig";
+}
+
+fn _parse_out_dir() {
+    let raw = env_get("PBLANG_SCRIPT_ARGS");
+    if raw == nil or raw == "" {
+        return "/tmp/pblang_v210_dist";
+    }
+    let parts = str_split(raw, "\n");
+    let i = 0;
+    while i < len(parts) {
+        if parts[i] == "--out-dir" and i + 1 < len(parts) {
+            return parts[i + 1];
+        }
+        i = i + 1;
+    }
+    return "/tmp/pblang_v210_dist";
+}
+
+fn _compile_zr_zig(zig_bin: string, target: string, repo_root: string, out_bin: string, extra_flags: any) {
+    let pmap = "-ffile-prefix-map=" + repo_root + "=.";
+    let cargs = [
+        "cc", "-target", target,
+        "-Os", "-std=gnu99", pmap,
+        "-Wno-unused-function",
+        repo_root + "/runtime_stage3/pblang_zero_rust_vm.c"
+    ];
+    let i = 0;
+    while i < len(extra_flags) {
+        push(cargs, extra_flags[i]);
+        i = i + 1;
+    }
+    push(cargs, "-o");
+    push(cargs, out_bin);
+    _run_cmd(zig_bin, cargs, "zig-cc:" + target);
+}
+
+fn build_all_universal_devices(out_dir: string) {
+    let repo_root = cwd();
+    let stage = out_dir + "/.staging";
+    fs_mkdirs(stage);
+    fs_mkdirs(out_dir);
+
+    let zig_bin = _find_zig();
+    let pmap = "-ffile-prefix-map=" + repo_root + "=.";
+    let zr_src = repo_root + "/runtime_stage3/pblang_zero_rust_vm.c";
+    let micro_src = repo_root + "/runtime_stage3/pblang_micro_vm.c";
+    let dos_asm = repo_root + "/runtime_stage3/pblang_dos16_vm.asm";
+
+    println("[1/7] Building Tier-1 Modern 64-bit Desktops, Workstations, Mobile & Servers...");
+    // 1. Linux x86_64 (dynamic full + static musl)
+    let bin_lx64 = stage + "/pblang-linux-x86_64";
+    _run_cmd("gcc", ["-Os", "-std=gnu99", pmap, "-s", zr_src, "-ldl", "-lpthread", "-lm", "-o", bin_lx64], "gcc:linux-x86_64");
+    let bin_lx64_static = stage + "/pblang-linux-x86_64-static";
+    _compile_zr_zig(zig_bin, "x86_64-linux-musl", repo_root, bin_lx64_static, ["-s", "-lm"]);
+
+    // 2. Linux ARM64 (Raspberry Pi 4/5, Graviton, Jetson, Asahi)
+    let bin_larm64 = stage + "/pblang-linux-arm64";
+    _compile_zr_zig(zig_bin, "aarch64-linux-musl", repo_root, bin_larm64, ["-s", "-lm"]);
+
+    // 3. Windows x86_64 (PE32+) & Windows ARM64 (PE32+ Copilot+ / Snapdragon)
+    let bin_wx64 = stage + "/pblang-windows-x86_64.exe";
+    _run_cmd("x86_64-w64-mingw32-gcc", ["-Os", "-std=gnu99", pmap, "-s", zr_src, "-lws2_32", "-lwinhttp", "-lgdi32", "-luser32", "-lbcrypt", "-o", bin_wx64], "mingw64:windows-x86_64");
+    let bin_warm64 = stage + "/pblang-windows-arm64.exe";
+    _compile_zr_zig(zig_bin, "aarch64-windows-gnu", repo_root, bin_warm64, ["-s", "-lws2_32", "-lwinhttp", "-lgdi32", "-luser32", "-lbcrypt"]);
+
+    // 4. macOS Apple Silicon (arm64) + Intel (x86_64) + Universal2 Fat Mach-O via @python polyglot!
+    let bin_mac_arm64 = stage + "/pblang-macos-arm64";
+    let bin_mac_x64 = stage + "/pblang-macos-x86_64";
+    let bin_mac_univ = stage + "/pblang-macos-universal";
+    _compile_zr_zig(zig_bin, "aarch64-macos", repo_root, bin_mac_arm64, ["-lc", "-lm"]);
+    _compile_zr_zig(zig_bin, "x86_64-macos", repo_root, bin_mac_x64, ["-lc", "-lm"]);
+    let py_code = __polyglot.by_name["universal_fat_and_packager"].code;
+    let fat_res = json_parse(polyglot_exec_with_input("python", py_code, json_stringify({
+        op: "fat_macho",
+        x64: bin_mac_x64,
+        arm64: bin_mac_arm64,
+        out: bin_mac_univ
+    })));
+    if not fat_res.success {
+        throw "Fat Mach-O creation failed: " + str(fat_res.stderr);
+    }
+
+    // 5. Android / Termux (ARM64 + x86_64 static Linux-kernel binaries + Termux installer)
+    let bin_and_arm64 = stage + "/pblang-android-arm64";
+    let bin_and_x64 = stage + "/pblang-android-x86_64";
+    _compile_zr_zig(zig_bin, "aarch64-linux-musl", repo_root, bin_and_arm64, ["-s", "-lm"]);
+    _compile_zr_zig(zig_bin, "x86_64-linux-musl", repo_root, bin_and_x64, ["-s", "-lm"]);
+    let android_sh = stage + "/install-android.sh";
+    fs_write(android_sh, "#!/bin/sh\nset -e\nARCH=$(uname -m)\nPREFIX_BIN=\"${PREFIX:-$HOME/.local}/bin\"\nmkdir -p \"$PREFIX_BIN\"\nif [ \"$ARCH\" = \"aarch64\" ]; then cp bin/pblang-android-arm64 \"$PREFIX_BIN/pblang\"; else cp bin/pblang-android-x86_64 \"$PREFIX_BIN/pblang\"; fi\nchmod 755 \"$PREFIX_BIN/pblang\"\necho \"Installed PBLang 2.1.0 to $PREFIX_BIN/pblang\"\n");
+
+    // 6. Linux RISC-V 64, PowerPC64LE & MIPS64EL
+    let bin_rv64 = stage + "/pblang-linux-riscv64";
+    let bin_ppc64le = stage + "/pblang-linux-powerpc64le";
+    let bin_mips64el = stage + "/pblang-linux-mips64el";
+    _compile_zr_zig(zig_bin, "riscv64-linux-musl", repo_root, bin_rv64, ["-s", "-lm"]);
+    _compile_zr_zig(zig_bin, "powerpc64le-linux-musl", repo_root, bin_ppc64le, ["-s", "-lm"]);
+    _compile_zr_zig(zig_bin, "mips64el-linux-musl", repo_root, bin_mips64el, ["-s", "-lm"]);
+
+    println("[2/7] Building Tier-2 Portable WebAssembly (32-bit wasm32-wasi) + @js Runner...");
+    let bin_wasm = stage + "/pblang.wasm";
+    _compile_zr_zig(zig_bin, "wasm32-wasi", repo_root, bin_wasm, ["-s", "-lc", "-lm"]);
+    let js_runner = stage + "/run-wasi.mjs";
+    fs_write(js_runner, __polyglot.by_name["wasi_universal_runner"].code);
+
+    println("[3/7] Building Tier-3 <= 32-bit Desktops, Netbooks, SBCs & OpenWrt Routers...");
+    // 32-bit Windows i686 (PE32 — Windows XP/7/8/10 32-bit)
+    let bin_wx86 = stage + "/pblang-windows-x86.exe";
+    _run_cmd("i686-w64-mingw32-gcc", ["-Os", "-std=gnu99", pmap, "-s", zr_src, "-lws2_32", "-lwinhttp", "-lgdi32", "-luser32", "-lbcrypt", "-o", bin_wx86], "mingw32:windows-x86");
+
+    // 32-bit Linux x86 (i386/i686 static musl — zero glibc lock-in on old 32-bit PCs!)
+    let bin_lx86 = stage + "/pblang-linux-x86";
+    _compile_zr_zig(zig_bin, "x86-linux-musl", repo_root, bin_lx86, ["-s", "-lm"]);
+
+    // 32-bit ARMv7 hard-float (Pi 2/3, BeagleBone) & ARMv6/v5 soft-float (Pi 1/Zero, ARM9)
+    let bin_larmv7 = stage + "/pblang-linux-armv7hf";
+    let bin_larmel = stage + "/pblang-linux-armel";
+    _compile_zr_zig(zig_bin, "arm-linux-musleabihf", repo_root, bin_larmv7, ["-s", "-lm"]);
+    _compile_zr_zig(zig_bin, "arm-linux-musleabi", repo_root, bin_larmel, ["-s", "-lm"]);
+
+    // 32-bit OpenWrt Routers & Classic Embedded Linux (MIPS32 LE, MIPS32 BE, PowerPC32)
+    let bin_mipsel = stage + "/pblang-linux-mipsel";
+    let bin_mips = stage + "/pblang-linux-mips";
+    let bin_ppc32 = stage + "/pblang-linux-powerpc32";
+    _compile_zr_zig(zig_bin, "mipsel-linux-musl", repo_root, bin_mipsel, ["-s", "-lm"]);
+    _compile_zr_zig(zig_bin, "mips-linux-musl", repo_root, bin_mips, ["-s", "-lm"]);
+    _compile_zr_zig(zig_bin, "powerpc-linux-musl", repo_root, bin_ppc32, ["-s", "-lm"]);
+
+    println("[4/7] Building Tier-4 Bare-Metal 32-bit Microcontrollers via @c Polyglot Block...");
+    let mcu_c_path = stage + "/mcu_baremetal_entry.c";
+    fs_write(mcu_c_path, __polyglot.by_name["mcu_baremetal_entry"].code);
+    let mcu_inc = "-I" + repo_root + "/runtime_stage3";
+    let pmap_stage = "-ffile-prefix-map=" + stage + "=.";
+
+    let mcu_cm0_elf = stage + "/pblang-mcu-cortex-m0.elf";
+    let mcu_cm4_elf = stage + "/pblang-mcu-cortex-m4.elf";
+    let mcu_rv32_elf = stage + "/pblang-mcu-rv32im.elf";
+    _run_cmd(zig_bin, ["cc", "-target", "thumb-freestanding-eabi", "-mcpu=cortex_m0", "-Os", "-ffreestanding", "-nostdlib", pmap, pmap_stage, mcu_inc, "-Wl,-e,_start", mcu_c_path, "-o", mcu_cm0_elf], "mcu:cortex-m0");
+    _run_cmd(zig_bin, ["cc", "-target", "thumb-freestanding-eabi", "-mcpu=cortex_m4", "-Os", "-ffreestanding", "-nostdlib", pmap, pmap_stage, mcu_inc, "-Wl,-e,_start", mcu_c_path, "-o", mcu_cm4_elf], "mcu:cortex-m4");
+    _run_cmd(zig_bin, ["cc", "-target", "riscv32-freestanding-none", "-mcpu=generic_rv32+m", "-Os", "-ffreestanding", "-nostdlib", pmap, pmap_stage, mcu_inc, "-Wl,-e,_start", mcu_c_path, "-o", mcu_rv32_elf], "mcu:rv32im");
+
+    // Pure-PBLang native RV32IM ELF32 demo
+    let demo_sapp = "fn fib(n) { if n <= 1 { return n; } return fib(n - 1) + fib(n - 2); }\nprint \"PBLANG-SUB32-OK\";\nprint fib(10);\n";
+    let demo_rv32_elf = stage + "/demo-native-rv32im.elf";
+    fs_write_bytes(demo_rv32_elf, Sub32.compile_elf32_rv32(demo_sapp));
+
+    println("[5/7] Building Tier-5 Legacy 16-bit (8086 DOS) & 8-bit (Z80 CP/M, 6502 C64, AVR8) Targets...");
+    // 16-bit Real-Mode 8086 MS-DOS / FreeDOS .pbck VM (NASM) + pure-PBLang DOS .COM demo
+    let dos16_vm_com = stage + "/pblang16.com";
+    _run_cmd("nasm", ["-f", "bin", dos_asm, "-o", dos16_vm_com], "nasm:dos16");
+    let dos16_demo_com = stage + "/demo16.com";
+    fs_write_bytes(dos16_demo_com, Sub32.compile_dos16_com(demo_sapp));
+
+    // 8-bit Intel 8080 / Zilog Z80 CP/M-80 .COM
+    let cpm80_com = stage + "/pblang80.com";
+    fs_write_bytes(cpm80_com, Sub32.compile_cpm80_com(demo_sapp));
+
+    // 8-bit MOS 6502 Commodore 64 .PRG
+    let c64_demo_sapp = "let a = 7;\nlet b = 6;\nlet s = 0;\nlet i = 1;\nwhile i <= 5 { s = s + i; i = i + 1; }\nprint \"PBLANG64\";\nprint a * b;\nprint s;\n";
+    let c64_prg = stage + "/pblang64.prg";
+    fs_write_bytes(c64_prg, Sub32.compile_c64_prg(c64_demo_sapp));
+
+    // 8-bit Atmel AVR ATmega328P (Arduino Uno / Nano): full pblang_micro_vm.c + pure-PBLang Intel HEX
+    let avr_elf = stage + "/pblang-avr8-atmega328p.elf";
+    let avr_hex = stage + "/pblang-avr8-atmega328p.hex";
+    _run_cmd("avr-gcc", ["-mmcu=atmega328p", "-Os", "-std=gnu99", pmap, micro_src, "-o", avr_elf], "avr-gcc:atmega328p");
+    _run_cmd("avr-objcopy", ["-O", "ihex", "-R", ".eeprom", avr_elf, avr_hex], "avr-objcopy:ihex");
+    let avr_demo_hex = stage + "/demo-avr8.hex";
+    fs_write_bytes(avr_demo_hex, Sub32.compile_avr8_hex("let a = 21 * 2;\nprint \"AVR8-PBLANG\";\nprint a;\n"));
+
+    // 32-bit static micro-VM binary (runs on any 32-bit/64-bit x86 Linux in < 20 KB)
+    let micro_lx86 = stage + "/pblang-micro-vm-linux-x86";
+    let micro_lx64 = stage + "/pblang-micro-vm";
+    _run_cmd(zig_bin, ["cc", "-target", "x86-linux-musl", "-Os", "-std=gnu99", pmap, "-s", micro_src, "-o", micro_lx86], "zig:micro-vm-x86");
+    _run_cmd(zig_bin, ["cc", "-target", "x86_64-linux-musl", "-Os", "-std=gnu99", pmap, "-s", micro_src, "-o", micro_lx64], "zig:micro-vm-x64");
+
+    let legacy_readme = stage + "/README-LEGACY-DEVICES.md";
+    fs_write(legacy_readme, "# PBLang v2.1.0 — 8-bit, 16-bit & 32-bit Legacy / MCU Package\n\n" +
+        "## Included Binaries\n" +
+        "- `dos16/pblang16.com` — 16-bit Real-Mode 8086 MS-DOS / FreeDOS `.pbck` VM (`pblang16 prog.pbc` or `pblang16 --selftest`)\n" +
+        "- `dos16/demo16.com` — Standalone 16-bit DOS `.COM` compiled by `pblang build --target dos16`\n" +
+        "- `cpm80/pblang80.com` — 8-bit Intel 8080 / Zilog Z80 CP/M-80 `.COM` compiled by `pblang build --target cpm80`\n" +
+        "- `c64/pblang64.prg` — 8-bit MOS 6502 Commodore 64 `.PRG` (`LOAD\"PBLANG64.PRG\",8,1` then `RUN`)\n" +
+        "- `avr8/pblang-avr8-atmega328p.hex` — 8-bit AVR ATmega328P `.pbck` Micro-VM (`10.35 KiB` Flash, `< 1.8 KiB` SRAM)\n" +
+        "- `avr8/demo-avr8.hex` — Direct UART0 Intel HEX firmware compiled by `pblang build --target avr8`\n" +
+        "- `micro_vm/pblang-micro-vm-linux-x86` — Static 32-bit i386 Linux Micro-VM\n" +
+        "- `src/pblang_micro_vm.c` & `src/pblang_dos16_vm.asm` — Portable C89/C99 & 8086 ASM sources\n");
+
+    println("[6/7] Live-Verifying Built Executables (x86_64, 32-bit i386, WASI, Micro-VM)...");
+    let v1 = _run_cmd(bin_lx64, ["--version"], "verify:linux-x86_64");
+    let v2 = _run_cmd(bin_lx86, ["--version"], "verify:linux-x86-32bit");
+    let v3 = _run_cmd(micro_lx86, ["--selftest"], "verify:micro-vm-32bit");
+    if not str_contains(v1.stdout, "2.1.0") or not str_contains(v2.stdout, "2.1.0") {
+        throw "Version mismatch in built host binaries: " + v1.stdout + " / " + v2.stdout;
+    }
+    if not str_contains(v3.stdout, "42") {
+        throw "Micro-VM 32-bit selftest failed: " + v3.stdout;
+    }
+
+    println("[7/7] Packaging Deterministic Archives, Running Privacy Scan & Writing SHA256SUMS.txt...");
+    let packages = [
+        {
+            filename: "pblang-2.1.0-linux-x86_64.tar.gz", format: "tar.gz", top_dir: "pblang-2.1.0-linux-x86_64", include_tree: true,
+            items: [
+                { src: bin_lx64, dst: "bin/pblang", exec: true },
+                { src: bin_lx64_static, dst: "bin/pblang-static", exec: true },
+                { src: micro_lx64, dst: "bin/pblang-micro-vm", exec: true }
+            ]
+        },
+        {
+            filename: "pblang-2.1.0-linux-arm64.tar.gz", format: "tar.gz", top_dir: "pblang-2.1.0-linux-arm64", include_tree: true,
+            items: [{ src: bin_larm64, dst: "bin/pblang", exec: true }]
+        },
+        {
+            filename: "pblang-2.1.0-windows-x86_64.zip", format: "zip", top_dir: "pblang-2.1.0-windows-x86_64", include_tree: true,
+            items: [{ src: bin_wx64, dst: "bin/pblang.exe", exec: true }]
+        },
+        {
+            filename: "pblang-2.1.0-windows-arm64.zip", format: "zip", top_dir: "pblang-2.1.0-windows-arm64", include_tree: true,
+            items: [{ src: bin_warm64, dst: "bin/pblang.exe", exec: true }]
+        },
+        {
+            filename: "pblang-2.1.0-macos-universal.tar.gz", format: "tar.gz", top_dir: "pblang-2.1.0-macos-universal", include_tree: true,
+            items: [
+                { src: bin_mac_univ, dst: "bin/pblang", exec: true },
+                { src: bin_mac_arm64, dst: "bin/pblang-arm64", exec: true },
+                { src: bin_mac_x64, dst: "bin/pblang-x86_64", exec: true }
+            ]
+        },
+        {
+            filename: "pblang-2.1.0-android-arm64-x86_64.tar.gz", format: "tar.gz", top_dir: "pblang-2.1.0-android", include_tree: true,
+            items: [
+                { src: bin_and_arm64, dst: "bin/pblang-android-arm64", exec: true },
+                { src: bin_and_x64, dst: "bin/pblang-android-x86_64", exec: true },
+                { src: android_sh, dst: "install-android.sh", exec: true }
+            ]
+        },
+        {
+            filename: "pblang-2.1.0-linux-riscv64.tar.gz", format: "tar.gz", top_dir: "pblang-2.1.0-linux-riscv64", include_tree: true,
+            items: [{ src: bin_rv64, dst: "bin/pblang", exec: true }]
+        },
+        {
+            filename: "pblang-2.1.0-linux-workstation-alt64.tar.gz", format: "tar.gz", top_dir: "pblang-2.1.0-linux-alt64", include_tree: true,
+            items: [
+                { src: bin_ppc64le, dst: "bin/pblang-powerpc64le", exec: true },
+                { src: bin_mips64el, dst: "bin/pblang-mips64el", exec: true }
+            ]
+        },
+        {
+            filename: "pblang-2.1.0-wasm32.tar.gz", format: "tar.gz", top_dir: "pblang-2.1.0-wasm32", include_tree: true,
+            items: [
+                { src: bin_wasm, dst: "bin/pblang.wasm", exec: false },
+                { src: js_runner, dst: "bin/run-wasi.mjs", exec: true }
+            ]
+        },
+        {
+            filename: "pblang-2.1.0-windows-x86.zip", format: "zip", top_dir: "pblang-2.1.0-windows-x86", include_tree: true,
+            items: [{ src: bin_wx86, dst: "bin/pblang.exe", exec: true }]
+        },
+        {
+            filename: "pblang-2.1.0-linux-x86.tar.gz", format: "tar.gz", top_dir: "pblang-2.1.0-linux-x86", include_tree: true,
+            items: [
+                { src: bin_lx86, dst: "bin/pblang", exec: true },
+                { src: micro_lx86, dst: "bin/pblang-micro-vm", exec: true }
+            ]
+        },
+        {
+            filename: "pblang-2.1.0-linux-armv7-armel.tar.gz", format: "tar.gz", top_dir: "pblang-2.1.0-linux-arm32", include_tree: true,
+            items: [
+                { src: bin_larmv7, dst: "bin/pblang-armv7hf", exec: true },
+                { src: bin_larmel, dst: "bin/pblang-armel", exec: true }
+            ]
+        },
+        {
+            filename: "pblang-2.1.0-linux-routers-classic32.tar.gz", format: "tar.gz", top_dir: "pblang-2.1.0-linux-classic32", include_tree: true,
+            items: [
+                { src: bin_mipsel, dst: "bin/pblang-mipsel", exec: true },
+                { src: bin_mips, dst: "bin/pblang-mips", exec: true },
+                { src: bin_ppc32, dst: "bin/pblang-powerpc32", exec: true },
+                { src: demo_rv32_elf, dst: "bin/demo-native-riscv32", exec: true }
+            ]
+        },
+        {
+            filename: "pblang-2.1.0-mcu-32bit-cortexm-rv32.tar.gz", format: "tar.gz", top_dir: "pblang-2.1.0-mcu-32bit", include_tree: false,
+            items: [
+                { src: mcu_cm0_elf, dst: "firmware/pblang-mcu-cortex-m0.elf", exec: false },
+                { src: mcu_cm4_elf, dst: "firmware/pblang-mcu-cortex-m4.elf", exec: false },
+                { src: mcu_rv32_elf, dst: "firmware/pblang-mcu-rv32im.elf", exec: false },
+                { src: demo_rv32_elf, dst: "firmware/demo-native-rv32im.elf", exec: true },
+                { src: micro_src, dst: "src/pblang_micro_vm.c", exec: false },
+                { src: mcu_c_path, dst: "src/mcu_baremetal_entry.c", exec: false }
+            ]
+        },
+        {
+            filename: "pblang-2.1.0-legacy-8bit-16bit.zip", format: "zip", top_dir: "pblang-2.1.0-legacy-8bit-16bit", include_tree: false,
+            items: [
+                { src: dos16_vm_com, dst: "dos16/pblang16.com", exec: true },
+                { src: dos16_demo_com, dst: "dos16/demo16.com", exec: true },
+                { src: cpm80_com, dst: "cpm80/pblang80.com", exec: true },
+                { src: c64_prg, dst: "c64/pblang64.prg", exec: false },
+                { src: avr_elf, dst: "avr8/pblang-avr8-atmega328p.elf", exec: false },
+                { src: avr_hex, dst: "avr8/pblang-avr8-atmega328p.hex", exec: false },
+                { src: avr_demo_hex, dst: "avr8/demo-avr8.hex", exec: false },
+                { src: micro_lx86, dst: "micro_vm/pblang-micro-vm-linux-x86", exec: true },
+                { src: micro_src, dst: "src/pblang_micro_vm.c", exec: false },
+                { src: dos_asm, dst: "src/pblang_dos16_vm.asm", exec: false },
+                { src: legacy_readme, dst: "README.md", exec: false }
+            ]
+        }
+    ];
+
+    let standalone_copies = [
+        { src: bin_lx64, dst: "pblang-2.1.0-linux-x86_64", exec: true },
+        { src: bin_larm64, dst: "pblang-2.1.0-linux-arm64", exec: true },
+        { src: bin_wx64, dst: "pblang-2.1.0-windows-x86_64.exe", exec: true },
+        { src: bin_warm64, dst: "pblang-2.1.0-windows-arm64.exe", exec: true },
+        { src: bin_wasm, dst: "pblang-2.1.0-wasm32.wasm", exec: false },
+        { src: bin_wx86, dst: "pblang-2.1.0-windows-x86.exe", exec: true },
+        { src: bin_lx86, dst: "pblang-2.1.0-linux-x86", exec: true },
+        { src: bin_larmv7, dst: "pblang-2.1.0-linux-armv7hf", exec: true }
+    ];
+
+    let user_env = env_get("USER");
+    let forbidden = [repo_root];
+    if user_env != nil and user_env != "" {
+        push(forbidden, "/home/" + user_env);
+        push(forbidden, "/media/" + user_env);
+    }
+
+    let pkg_raw = polyglot_exec_with_input("python", py_code, json_stringify({
+        op: "package_all",
+        repo_root: repo_root,
+        out_dir: out_dir,
+        packages: packages,
+        standalone_copies: standalone_copies,
+        forbidden: forbidden
+    }));
+    let pkg_res = json_parse(pkg_raw);
+    if not pkg_res.success {
+        throw "Universal packager failed: " + str(pkg_res.stderr) + " " + str(pkg_res.stdout);
+    }
+    let summary = json_parse(pkg_res.stdout);
+    println("[DONE] Built & verified " + str(summary.count) + " universal release assets in " + out_dir);
+    return summary;
+}
+
+if env_get("PBLANG_BUILD_UNIVERSAL_LIB") != "1" {
+    let out_dir = _parse_out_dir();
+    build_all_universal_devices(out_dir);
+}
+
+export build_all_universal_devices;

@@ -34,7 +34,26 @@
 typedef SOCKET zr_sock_t;
 #define ZR_INVALID_SOCK INVALID_SOCKET
 #define zr_closesocket(s) closesocket(s)
+#elif defined(__wasi__)
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#include <unistd.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+typedef int zr_sock_t;
+#define ZR_INVALID_SOCK (-1)
+#define zr_closesocket(s) close(s)
 #else
+#ifdef __APPLE__
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
+#endif
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -63,6 +82,9 @@ typedef int zr_sock_t;
 #define zr_closesocket(s) close(s)
 #endif
 
+#ifndef _WIN32
+#include <strings.h>
+#endif
 #include <ctype.h>
 #include <errno.h>
 #include <float.h>
@@ -78,8 +100,8 @@ typedef int zr_sock_t;
 #include <string.h>
 #include <time.h>
 
-#define PBLANG_ZR_VERSION "2.0.0"
-#define PBLANG_ZR_BANNER  "pblang 2.0.0 (sovereign zero-rust runtime)"
+#define PBLANG_ZR_VERSION "2.1.0"
+#define PBLANG_ZR_BANNER  "pblang 2.1.0 (sovereign zero-rust runtime)"
 
 /* ---- Memory Helpers ---- */
 
@@ -284,6 +306,32 @@ static inline void *zr_dlopen(const char *path) { return (void *)LoadLibraryA(pa
 static inline void *zr_dlsym(void *handle, const char *sym) { return (void *)GetProcAddress((HMODULE)handle, sym); }
 static inline void zr_dlclose(void *handle) { if (handle) FreeLibrary((HMODULE)handle); }
 static inline const char *zr_dlerror(void) { return "LoadLibrary/GetProcAddress error"; }
+
+#elif defined(__wasi__)
+typedef struct { bool init; } ZrMutex;
+typedef struct { bool init; } ZrCond;
+typedef int ZrThread;
+
+static inline void zr_mutex_init(ZrMutex *m) { m->init = true; }
+static inline void zr_mutex_destroy(ZrMutex *m) { m->init = false; }
+static inline void zr_mutex_lock(ZrMutex *m) { (void)m; }
+static inline bool zr_mutex_trylock(ZrMutex *m) { (void)m; return true; }
+static inline void zr_mutex_unlock(ZrMutex *m) { (void)m; }
+
+static inline void zr_cond_init(ZrCond *c) { c->init = true; }
+static inline void zr_cond_destroy(ZrCond *c) { c->init = false; }
+static inline void zr_cond_signal(ZrCond *c) { (void)c; }
+static inline void zr_cond_broadcast(ZrCond *c) { (void)c; }
+static inline void zr_cond_wait(ZrCond *c, ZrMutex *m) { (void)c; (void)m; }
+static inline bool zr_cond_timedwait_ms(ZrCond *c, ZrMutex *m, uint64_t ms) { (void)c; (void)m; (void)ms; return false; }
+
+static inline bool zr_thread_create(ZrThread *t, void *(*fn)(void *), void *arg) { (void)t; (void)fn; (void)arg; return false; }
+static inline void zr_thread_join(ZrThread t) { (void)t; }
+
+static inline void *zr_dlopen(const char *path) { (void)path; return NULL; }
+static inline void *zr_dlsym(void *handle, const char *sym) { (void)handle; (void)sym; return NULL; }
+static inline void zr_dlclose(void *handle) { (void)handle; }
+static inline const char *zr_dlerror(void) { return "dynamic loading unavailable under WASI"; }
 
 #else
 typedef struct { pthread_mutex_t mu; bool init; } ZrMutex;

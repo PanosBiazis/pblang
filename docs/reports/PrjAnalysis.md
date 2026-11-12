@@ -155,7 +155,7 @@ PBIDE drawing GPU-accelerated.
 ## 2. Build and toolchain health
 
 ### Cargo build
-- **`cargo build --workspace`**: clean (only `hard linking files in the incremental compilation cache failed. copying files instead.` filesystem advisory on the ExtHD mount — not a code warning).
+- **`cargo build --workspace`**: clean (only `hard linking files in the incremental compilation cache failed. copying files instead.` filesystem advisory on the external-drive mount — not a code warning).
 - **`cargo test --workspace`**: all integration suites pass; 1 semantics test `os_env_set_pass` is intentionally `#[ignore]` (security audit boundary). 3 `http_server.rs` tests are `#[ignore]` (network/timing-sensitive).
 - **Per-crate build warnings (clean rebuild, lib only, excluding clippy):**
   - `pblang-core` 1, `pblang-compiler` 1, `pblang-typeck` 1, `pblang-ctranspiler` 1, `pblang-wasm` 1, `pblang-llvm` 1 → **6 pre-existing 1-warning-each crates**. `pblang-vm` and the `pblang` binary build with **0 warnings** after the cleanup.
@@ -2827,7 +2827,7 @@ cargo test --test new_cmd test_exact_selects_only_one_test_id
 Result: passed. Focused Rust CLI regressions passed. The real semantics-suite
 skip run reported **181 passed / 5 filtered out**, and the full quiet-mode
 pblang semantics suite passed **186 passed / 0 failed / 0 ignored** through the
-extracted handler. Cargo emitted only the known ExtHD incremental-cache
+extracted handler. Cargo emitted only the known external-drive incremental-cache
 hard-link warning, not a code warning.
 
 ## 131. CLI maintainability: `pblang lint` handler extracted (2026-06-14)
@@ -2859,7 +2859,7 @@ git diff --check
 Result: passed. The Rust lint integration suite passed **5/0**, formatting and
 diff whitespace checks are clean for the touched modules, and the full
 quiet-mode pblang semantics suite passed **186 passed / 0 failed / 0 ignored**.
-Cargo emitted only the known ExtHD incremental-cache hard-link warning.
+Cargo emitted only the known external-drive incremental-cache hard-link warning.
 
 ## 132. CLI maintainability: `pblang --doc` handler extracted (2026-06-14)
 
@@ -2890,7 +2890,7 @@ git diff --check
 Result: passed. The doc CLI integration test passed **1/0**, formatting and
 diff whitespace checks are clean for the touched modules, and the full
 quiet-mode pblang semantics suite passed **186 passed / 0 failed / 0 ignored**.
-Cargo emitted only the known ExtHD incremental-cache hard-link warning.
+Cargo emitted only the known external-drive incremental-cache hard-link warning.
 
 ## 133. CLI maintainability: `pblang build-polyglot` handler extracted (2026-06-14)
 
@@ -2923,7 +2923,7 @@ Result: passed. The extracted command produced source, `.pyc`, and manifest
 files from a real polyglot block; formatting and diff whitespace checks are
 clean for the touched modules; and the full quiet-mode pblang semantics suite
 passed **186 passed / 0 failed / 0 ignored**. Cargo emitted only the known
-ExtHD incremental-cache hard-link warning.
+external-drive incremental-cache hard-link warning.
 
 ## 134. CLI maintainability: `pblang bundle` handler extracted (2026-06-14)
 
@@ -2952,7 +2952,7 @@ rustfmt --check src/main.rs src/cli.rs src/cli/bundle.rs src/cli/build_polyglot.
 ./target/debug/pblang test tests/semantics --allow-all --quiet
 ```
 
-Result: passed. `cargo check` and `cargo build` emitted only the known ExtHD
+Result: passed. `cargo check` and `cargo build` emitted only the known external-drive
 incremental-cache hard-link warning. The filtered bundle integration run passed
 **9 passed / 0 failed / 17 filtered out**, and the fresh debug `pblang`
 semantic suite passed **186 passed / 0 failed / 0 ignored**.
@@ -2992,7 +2992,7 @@ git diff --check
 ```
 
 Result: passed for the focused runs completed in this section. `cargo check`
-emitted only the known ExtHD incremental-cache hard-link warning. Compile-cache
+emitted only the known external-drive incremental-cache hard-link warning. Compile-cache
 regressions passed **2/0**, test-cache regression passed **1/0**, the linker
 fixture printed `linker_pass`, the AirLLM-style offload fixture printed
 `llm_offload_pass`, the Max foundation fixture printed
@@ -3062,7 +3062,7 @@ cargo build --bin pblang
 ./target/debug/pblang test tests/semantics --allow-all --quiet --jobs auto
 ```
 
-Result: passed. `cargo check` emitted only the known ExtHD incremental-cache
+Result: passed. `cargo check` emitted only the known external-drive incremental-cache
 hard-link warning. The Rust regression passed **1/0**, and the real LLM subset
 through the pblang runner passed **3 passed / 0 failed / 186 filtered out**.
 The full rebuilt parallel semantics suite passed **189 passed / 0 failed /
@@ -4186,7 +4186,7 @@ Results:
 - `pblang test llm`: **3 passed / 0 failed / 186 filtered out**.
 - `pblang test semantics`: **189 passed / 0 failed / 0 ignored**.
 
-Environment note: Cargo still warns that the ExtHD target directory cannot use
+Environment note: Cargo still warns that the external-drive target directory cannot use
 hard links for incremental-cache files and falls back to copying. That is not a
 pblang code failure, but it is a real build-speed issue on this mount. A
 Linux-native SSD/tmp `CARGO_TARGET_DIR` is the next environment-level speed

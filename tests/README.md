@@ -1,6 +1,6 @@
 # PBLang Verification & Safety Test Suite (`tests/`)
 
-This directory contains the automated verification tests for **PBLang `2.0.0`**, covering the Sovereign Zero-Rust Host VM & `.sapp` compiler, 3-stage self-hosting native `x86-64` / `ELF64-dyn` / Windows `PE32+` compilers, Hardware Governor & Sovereign Studio UI, smart polymorphic `pblang update`, 24 algorithms / Quantum / DNA / FIPS 203 `ML-KEM-768`, memory safety, and public release hygiene.
+This directory contains the automated verification tests for **PBLang `2.1.0`**, covering the Sovereign Zero-Rust Host VM & `.sapp` compiler, universal `64/32/16/8-bit` native machine-code compilers, Hardware Governor & Sovereign Studio UI, smart polymorphic `pblang update`, 24 algorithms / Quantum / DNA / FIPS 203 `ML-KEM-768`, memory safety, and public release hygiene.
 
 ---
 
@@ -13,19 +13,22 @@ pblang run tests/zero_rust_vm_test.sapp --allow-all
 # 2. Pure-PBLang 3-Stage Self-Hosting Native Compilers — ELF64, ELF64-dyn & Windows PE32+:
 pblang run tests/path_b_native_sovereign_test.sapp --allow-all
 
-# 3. Multi-Accelerator Hardware Governor & Sovereign Studio UI (76/76 checks):
+# 3. Universal <= 32-bit Native Codegen (32-bit x86/PE32/RV32, 16-bit 8086 DOS, 8-bit Z80/6502/AVR8) & @polyglot:
+pblang run tests/sub32_and_universal_devices_test.sapp --allow-all
+
+# 4. Multi-Accelerator Hardware Governor & Sovereign Studio UI (76/76 checks):
 pblang run tests/hardware_governor_and_studio_ui_test.sapp --allow-all
 
-# 4. Smart Polymorphic `pblang update` & Portable Relative Lockfiles (75/75 checks):
+# 5. Smart Polymorphic `pblang update` & Portable Relative Lockfiles (75/75 checks):
 pblang run tests/smart_updater_test.sapp --allow-all
 
-# 5. 24 Algorithms, Quantum Simulator + QPU, DNA Bioinformatics & ML-KEM-768 (53/53 checks):
+# 6. 24 Algorithms, Quantum Simulator + QPU, DNA Bioinformatics & ML-KEM-768 (53/53 checks):
 pblang run tests/algorithms_quantum_pqc_bio_test.sapp --allow-all
 
-# 6. Memory Safety, General Safety & Supply-Chain/Toolchain Security (36/36 checks):
+# 7. Memory Safety, General Safety & Supply-Chain/Toolchain Security (36/36 checks):
 pblang run tests/safety_test.sapp --allow-all
 
-# 7. Public Release Readiness, Zero-Leak Privacy Hygiene & Multi-Backend Parity (36/36 checks):
+# 8. Public Release Readiness, Zero-Leak Privacy Hygiene & Multi-Backend Parity (36/36 checks):
 pblang run tests/public_release_readiness_test.sapp --allow-all
 ```
 

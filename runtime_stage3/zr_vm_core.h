@@ -1409,7 +1409,7 @@ static void vm_collect_garbage(PbVM *vm, size_t *out_arr, size_t *out_map, size_
         }
     }
 
-    size_t min_thresh = 2 * 1024 * 1024;
+    size_t min_thresh = (sizeof(void *) <= 4) ? (512u * 1024u) : (2u * 1024u * 1024u);
     size_t doubled = vm->live_bytes * 2;
     vm->next_gc_bytes = (doubled > min_thresh) ? doubled : min_thresh;
     vm->gc_collections++;
@@ -2386,7 +2386,7 @@ static void vm_register_builtin(PbVM *vm, const char *name, PbBuiltinFn fn) {
 static void vm_init(PbVM *vm) {
     memset(vm, 0, sizeof(*vm));
     vm->gc_inhibit = 1;
-    vm->next_gc_bytes = 2 * 1024 * 1024;
+    vm->next_gc_bytes = (sizeof(void *) <= 4) ? (512u * 1024u) : (2u * 1024u * 1024u);
     vm->stack_cap = ZR_STACK_INIT;
     vm->stack = (PbValue *)zr_xcalloc(vm->stack_cap, sizeof(PbValue));
     zr_caps_init_default(&vm->caps);

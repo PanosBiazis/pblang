@@ -7,14 +7,21 @@
 #define PBLANG_ZR_FS_OS_H
 
 #include "zr_loader.h"
+#if !defined(__wasi__)
 #include <signal.h>
+#endif
 
-#if !defined(_WIN32)
+#if defined(__linux__)
 #include <sys/sysinfo.h>
 #endif
 
 /* ---- Async-Signal-Safe Pending Signal Table ---- */
-static volatile sig_atomic_t g_zr_sig_pending[64];
+#if defined(__wasi__)
+typedef int zr_sig_atomic_t;
+#else
+typedef sig_atomic_t zr_sig_atomic_t;
+#endif
+static volatile zr_sig_atomic_t g_zr_sig_pending[64];
 
 static void zr_c_signal_handler(int sig) {
     if (sig > 0 && sig < 64) g_zr_sig_pending[sig]++;
@@ -32,8 +39,12 @@ static int zr_resolve_signal_num(const char *raw_name, char canon_out[32]) {
     const char *core = (strncmp(up, "SIG", 3) == 0) ? (up + 3) : up;
     snprintf(canon_out, 32, "SIG%.28s", core);
 
+#ifdef SIGINT
     if (strcmp(core, "INT") == 0)  return SIGINT;
+#endif
+#ifdef SIGTERM
     if (strcmp(core, "TERM") == 0) return SIGTERM;
+#endif
 #ifdef SIGHUP
     if (strcmp(core, "HUP") == 0)  return SIGHUP;
 #endif
@@ -493,7 +504,9 @@ static bool bi_os_signal_trap(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     char canon[32];
     int signum = zr_resolve_signal_num(raw, canon);
     if (signum < 0) { vm_raise(vm, "os_signal_trap(): unsupported signal '%s'", raw); return false; }
+#if !defined(__wasi__)
     signal(signum, zr_c_signal_handler);
+#endif
     map_set(vm->signal_handlers, vm_new_cstr(vm, canon), argv[1]);
 
     PbMap *m = vm_new_map(vm, 4);
@@ -511,7 +524,7 @@ static bool bi_os_signal_pending(PbVM *vm, int argc, PbValue *argv, PbValue *out
     char canon[32];
     int signum = zr_resolve_signal_num(((PbStr *)val_as_obj(argv[0]))->chars, canon);
     if (signum < 0) { vm_raise(vm, "os_signal_pending(): unsupported signal"); return false; }
-    sig_atomic_t cnt = g_zr_sig_pending[signum];
+    zr_sig_atomic_t cnt = g_zr_sig_pending[signum];
     g_zr_sig_pending[signum] = 0;
     *out = val_num((double)cnt);
     return true;
@@ -528,7 +541,7 @@ static bool bi_os_signal_poll(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
             char canon[32];
             int signum = zr_resolve_signal_num(e->key->chars, canon);
             if (signum > 0 && signum < 64) {
-                sig_atomic_t cnt = g_zr_sig_pending[signum];
+                zr_sig_atomic_t cnt = g_zr_sig_pending[signum];
                 g_zr_sig_pending[signum] = 0;
                 if (cnt > 0) map_set(res, e->key, val_num((double)cnt));
             }
@@ -556,6 +569,12 @@ static bool bi_platform(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     *out = val_obj(vm_const_str(vm, "windows"));
 #elif defined(__APPLE__)
     *out = val_obj(vm_const_str(vm, "macos"));
+#elif defined(__ANDROID__)
+    *out = val_obj(vm_const_str(vm, "android"));
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    *out = val_obj(vm_const_str(vm, "freebsd"));
+#elif defined(__wasi__)
+    *out = val_obj(vm_const_str(vm, "wasi"));
 #else
     *out = val_obj(vm_const_str(vm, "linux"));
 #endif
@@ -569,8 +588,36 @@ static bool bi_os_arch(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     *out = val_obj(vm_const_str(vm, "aarch64"));
 #elif defined(__x86_64__) || defined(_M_X64)
     *out = val_obj(vm_const_str(vm, "x86_64"));
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    *out = val_obj(vm_const_str(vm, "riscv64"));
+#elif defined(__loongarch64)
+    *out = val_obj(vm_const_str(vm, "loongarch64"));
+#elif defined(__powerpc64__) || defined(__ppc64__)
+    *out = val_obj(vm_const_str(vm, "powerpc64"));
+#elif defined(__s390x__)
+    *out = val_obj(vm_const_str(vm, "s390x"));
 #elif defined(__i386__) || defined(_M_IX86)
     *out = val_obj(vm_const_str(vm, "x86"));
+#elif defined(__arm__) || defined(_M_ARM)
+#  if defined(__ARM_ARCH) && (__ARM_ARCH >= 7)
+    *out = val_obj(vm_const_str(vm, "armv7"));
+#  else
+    *out = val_obj(vm_const_str(vm, "arm"));
+#  endif
+#elif defined(__riscv) && (__riscv_xlen == 32)
+    *out = val_obj(vm_const_str(vm, "riscv32"));
+#elif defined(__mips__) && defined(__MIPSEL__)
+    *out = val_obj(vm_const_str(vm, "mipsel"));
+#elif defined(__mips__)
+    *out = val_obj(vm_const_str(vm, "mips"));
+#elif defined(__powerpc__) || defined(__ppc__)
+    *out = val_obj(vm_const_str(vm, "powerpc"));
+#elif defined(__m68k__)
+    *out = val_obj(vm_const_str(vm, "m68k"));
+#elif defined(__wasm64__)
+    *out = val_obj(vm_const_str(vm, "wasm64"));
+#elif defined(__wasm32__)
+    *out = val_obj(vm_const_str(vm, "wasm32"));
 #else
     *out = val_obj(vm_const_str(vm, "unknown"));
 #endif
@@ -661,6 +708,10 @@ static bool bi_exec(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     CloseHandle(pi.hThread);
     *out = val_num((double)code);
     return true;
+#elif defined(__wasi__)
+    (void)out;
+    vm_raise(vm, "exec('%s'): subprocess spawning is unavailable in WASI sandbox", cmd);
+    return false;
 #else
     pid_t pid = fork();
     if (pid < 0) { vm_raise(vm, "exec(): fork failed: %s", strerror(errno)); return false; }
@@ -715,9 +766,23 @@ static unsigned __stdcall zr_win_pipe_reader(void *arg) {
 
 static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (!vm_check_cap(vm, vm->caps.allow_exec, "proc_spawn_wait", "exec")) return false;
-    if (argc != 2 || !val_is_obj(argv[0], OBJ_STR) || !val_is_obj(argv[1], OBJ_ARRAY)) {
-        vm_raise(vm, "proc_spawn_wait(cmd, args) expects (string, array)");
+    if ((argc != 2 && argc != 3) || !val_is_obj(argv[0], OBJ_STR) || !val_is_obj(argv[1], OBJ_ARRAY)) {
+        vm_raise(vm, "proc_spawn_wait(cmd, args[, opts]) expects (string, array[, map])");
         return false;
+    }
+    const char *stdin_data = NULL;
+    size_t stdin_len = 0;
+    if (argc == 3 && argv[2].tag != VAL_NIL) {
+        if (!val_is_obj(argv[2], OBJ_MAP)) {
+            vm_raise(vm, "proc_spawn_wait(): opts must be a map");
+            return false;
+        }
+        PbValue sv = val_nil();
+        if (pb_map_get_cstr((PbMap *)val_as_obj(argv[2]), "stdin", &sv) && val_is_obj(sv, OBJ_STR)) {
+            PbStr *ss = (PbStr *)val_as_obj(sv);
+            stdin_data = ss->chars;
+            stdin_len = ss->len;
+        }
     }
     const char *prog = ((PbStr *)val_as_obj(argv[0]))->chars;
     PbArray *args_arr = (PbArray *)val_as_obj(argv[1]);
@@ -736,14 +801,18 @@ static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
 #if defined(_WIN32)
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(sa); sa.bInheritHandle = TRUE; sa.lpSecurityDescriptor = NULL;
-    HANDLE out_r = NULL, out_w = NULL, err_r = NULL, err_w = NULL;
-    if (!CreatePipe(&out_r, &out_w, &sa, 0) || !CreatePipe(&err_r, &err_w, &sa, 0)) {
+    HANDLE out_r = NULL, out_w = NULL, err_r = NULL, err_w = NULL, in_r = NULL, in_w = NULL;
+    if (!CreatePipe(&out_r, &out_w, &sa, 0) || !CreatePipe(&err_r, &err_w, &sa, 0) ||
+        (stdin_data && !CreatePipe(&in_r, &in_w, &sa, 0))) {
+        if (out_r) CloseHandle(out_r); if (out_w) CloseHandle(out_w);
+        if (err_r) CloseHandle(err_r); if (err_w) CloseHandle(err_w);
         zr_buf_free(&out_b); zr_buf_free(&err_b);
         vm_raise(vm, "proc_spawn_wait(): CreatePipe failed");
         return false;
     }
     SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
+    if (in_w) SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0);
 
     ZrBuf cmdline;
     zr_buf_init(&cmdline);
@@ -756,7 +825,7 @@ static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
     STARTUPINFOA si; PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdInput = stdin_data ? in_r : GetStdHandle(STD_INPUT_HANDLE);
     si.hStdOutput = out_w;
     si.hStdError = err_w;
     memset(&pi, 0, sizeof(pi));
@@ -765,7 +834,9 @@ static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
     zr_buf_free(&cmdline);
     CloseHandle(out_w);
     CloseHandle(err_w);
+    if (in_r) CloseHandle(in_r);
     if (!ok) {
+        if (in_w) CloseHandle(in_w);
         CloseHandle(out_r); CloseHandle(err_r);
         zr_buf_free(&out_b); zr_buf_free(&err_b);
         vm_raise(vm, "proc_spawn_wait('%s'): CreateProcessA failed", prog);
@@ -774,6 +845,16 @@ static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
     ZrPipeReaderArg pra_o = { out_r, &out_b }, pra_e = { err_r, &err_b };
     HANDLE th_o = (HANDLE)_beginthreadex(NULL, 0, zr_win_pipe_reader, &pra_o, 0, NULL);
     HANDLE th_e = (HANDLE)_beginthreadex(NULL, 0, zr_win_pipe_reader, &pra_e, 0, NULL);
+    if (in_w) {
+        size_t off = 0;
+        while (off < stdin_len) {
+            DWORD chunk = (stdin_len - off > 65536) ? 65536 : (DWORD)(stdin_len - off);
+            DWORD wr = 0;
+            if (!WriteFile(in_w, stdin_data + off, chunk, &wr, NULL) || wr == 0) break;
+            off += (size_t)wr;
+        }
+        CloseHandle(in_w);
+    }
     WaitForSingleObject(pi.hProcess, INFINITE);
     if (th_o) { WaitForSingleObject(th_o, INFINITE); CloseHandle(th_o); }
     if (th_e) { WaitForSingleObject(th_e, INFINITE); CloseHandle(th_e); }
@@ -783,9 +864,16 @@ static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
     exit_code = (int)dcode;
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+#elif defined(__wasi__)
+    (void)stdin_data; (void)stdin_len;
+    zr_buf_free(&out_b);
+    zr_buf_free(&err_b);
+    vm_raise(vm, "proc_spawn_wait('%s'): subprocess spawning is unavailable in WASI sandbox", prog);
+    return false;
 #else
-    int p_out[2], p_err[2], p_exec_err[2];
-    if (pipe(p_out) != 0 || pipe(p_err) != 0 || pipe(p_exec_err) != 0) {
+    int p_out[2], p_err[2], p_exec_err[2], p_in[2] = {-1, -1};
+    if (pipe(p_out) != 0 || pipe(p_err) != 0 || pipe(p_exec_err) != 0 ||
+        (stdin_data && pipe(p_in) != 0)) {
         zr_buf_free(&out_b); zr_buf_free(&err_b);
         vm_raise(vm, "proc_spawn_wait(): pipe() failed");
         return false;
@@ -804,12 +892,18 @@ static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
         free(cargv);
         close(p_out[0]); close(p_out[1]); close(p_err[0]); close(p_err[1]);
         close(p_exec_err[0]); close(p_exec_err[1]);
+        if (p_in[0] >= 0) { close(p_in[0]); close(p_in[1]); }
         zr_buf_free(&out_b); zr_buf_free(&err_b);
         vm_raise(vm, "proc_spawn_wait(): fork() failed: %s", strerror(errno));
         return false;
     }
     if (pid == 0) {
         close(p_out[0]); close(p_err[0]); close(p_exec_err[0]);
+        if (p_in[0] >= 0) {
+            close(p_in[1]);
+            dup2(p_in[0], STDIN_FILENO);
+            close(p_in[0]);
+        }
         dup2(p_out[1], STDOUT_FILENO);
         dup2(p_err[1], STDERR_FILENO);
         close(p_out[1]); close(p_err[1]);
@@ -821,16 +915,27 @@ static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
     }
     free(cargv);
     close(p_out[1]); close(p_err[1]); close(p_exec_err[1]);
+    if (p_in[0] >= 0) close(p_in[0]);
 
     int child_errno = 0;
     ssize_t er = read(p_exec_err[0], &child_errno, sizeof(child_errno));
     close(p_exec_err[0]);
     if (er == (ssize_t)sizeof(child_errno) && child_errno != 0) {
+        if (p_in[1] >= 0) close(p_in[1]);
         close(p_out[0]); close(p_err[0]);
         int st = 0; waitpid(pid, &st, 0);
         zr_buf_free(&out_b); zr_buf_free(&err_b);
         vm_raise(vm, "proc_spawn_wait('%s'): %s", prog, strerror(child_errno));
         return false;
+    }
+    if (p_in[1] >= 0) {
+        size_t off = 0;
+        while (off < stdin_len) {
+            ssize_t wr = write(p_in[1], stdin_data + off, stdin_len - off);
+            if (wr <= 0) break;
+            off += (size_t)wr;
+        }
+        close(p_in[1]);
     }
 
     /* Drain both stdout and stderr concurrently via poll() to avoid pipe deadlock */
@@ -877,8 +982,8 @@ static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
 static void zr_collect_hw_info(int *out_cores, uint64_t *out_total_mb, uint64_t *out_avail_mb,
                                const char **out_disp, bool *out_gpu) {
     *out_cores = 1;
-    *out_total_mb = 512;
-    *out_avail_mb = 256;
+    *out_total_mb = (sizeof(void *) <= 4) ? 256 : 512;
+    *out_avail_mb = (sizeof(void *) <= 4) ? 128 : 256;
     *out_disp = "headless";
     *out_gpu = false;
 #if defined(_WIN32)
@@ -893,9 +998,17 @@ static void zr_collect_hw_info(int *out_cores, uint64_t *out_total_mb, uint64_t 
     }
     *out_disp = "win32-gdi";
     *out_gpu = true;
+#elif defined(__wasi__)
+    *out_cores = 1;
+    *out_total_mb = 256;
+    *out_avail_mb = 192;
+    *out_disp = "wasi-headless";
+    *out_gpu = false;
 #else
+#if defined(_SC_NPROCESSORS_ONLN)
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu > 0) *out_cores = (int)ncpu;
+#endif
 
     FILE *mi = fopen("/proc/meminfo", "r");
     if (mi) {
@@ -909,13 +1022,16 @@ static void zr_collect_hw_info(int *out_cores, uint64_t *out_total_mb, uint64_t 
         fclose(mi);
         if (kb_tot > 0) *out_total_mb = kb_tot / 1024ULL;
         if (kb_av > 0)  *out_avail_mb = kb_av / 1024ULL;
-    } else {
+    }
+#if defined(__linux__)
+    else {
         struct sysinfo sinfo;
         if (sysinfo(&sinfo) == 0) {
             *out_total_mb = ((uint64_t)sinfo.totalram * (uint64_t)sinfo.mem_unit) / (1024ULL * 1024ULL);
             *out_avail_mb = ((uint64_t)sinfo.freeram * (uint64_t)sinfo.mem_unit) / (1024ULL * 1024ULL);
         }
     }
+#endif
     const char *wl = getenv("WAYLAND_DISPLAY");
     const char *x11 = getenv("DISPLAY");
     if (wl && wl[0] && x11 && x11[0]) *out_disp = "wayland+x11";
@@ -936,8 +1052,9 @@ static bool bi_hardware_probe(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     const char *disp = "headless";
     bool has_gpu = false;
     zr_collect_hw_info(&cores, &total_mb, &avail_mb, &disp, &has_gpu);
+    int word_bits = (int)(sizeof(void *) * 8u);
 
-    const char *tier = "minimal";
+    const char *tier = (word_bits <= 32) ? "legacy_32bit" : "minimal";
     if (cores >= 8 && total_mb >= 16384) tier = "workstation";
     else if (cores >= 4 && total_mb >= 4096) tier = "standard";
     else if (cores >= 2 && total_mb >= 1024) tier = "compact";
@@ -949,6 +1066,7 @@ static bool bi_hardware_probe(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     bi_os_arch(vm, 0, NULL, &arch_v);
     map_set(m, vm_const_str(vm, "os"), plat_v);
     map_set(m, vm_const_str(vm, "arch"), arch_v);
+    map_set(m, vm_const_str(vm, "word_bits"), val_num((double)word_bits));
     map_set(m, vm_const_str(vm, "cpu_cores"), val_num((double)cores));
     map_set(m, vm_const_str(vm, "cpu_logical_cores"), val_num((double)cores));
     map_set(m, vm_const_str(vm, "ram_total_mb"), val_num((double)total_mb));
@@ -956,7 +1074,7 @@ static bool bi_hardware_probe(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     map_set(m, vm_const_str(vm, "display_server"), val_obj(vm_new_cstr(vm, disp)));
     map_set(m, vm_const_str(vm, "has_gpu"), val_bool(has_gpu));
     map_set(m, vm_const_str(vm, "tier"), val_obj(vm_new_cstr(vm, tier)));
-    map_set(m, vm_const_str(vm, "runtime"), val_obj(vm_const_str(vm, "zero-rust-c99-v2")));
+    map_set(m, vm_const_str(vm, "runtime"), val_obj(vm_const_str(vm, "zero-rust-c99-v2.1")));
     vm_temp_pop(vm, 1);
     *out = val_obj(m);
     return true;

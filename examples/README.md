@@ -1,6 +1,6 @@
 # PBLang Runnable Examples & Demos (`examples/`)
 
-This directory contains runnable `.sapp` programs demonstrating the capabilities of **PBLang `2.0.0`**, from Zero-Rust systems programming, capability sandboxing, and post-quantum security to native desktop/web UI apps, ONNX CPU inference, quantum statevector simulation, and embedded hardware descriptors.
+This directory contains runnable `.sapp` programs demonstrating the capabilities of **PBLang `2.1.0`**, from Zero-Rust systems programming, `@polyglot` orchestration, capability sandboxing, and post-quantum security to native desktop/web UI apps, ONNX CPU inference, quantum statevector simulation, and `8/16/32/64-bit` embedded hardware targets.
 
 ---
 

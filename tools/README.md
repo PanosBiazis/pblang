@@ -1,6 +1,6 @@
 # PBLang Self-Hosted Compiler & Toolchain Drivers (`tools/`)
 
-This directory contains the self-hosted compiler driver (`pbc.sapp`), security/audit tools, and portable lockfile drivers written in 100% Pure PBLang (`2.0.0`).
+This directory contains the self-hosted compiler driver (`pbc.sapp`), the `@polyglot` universal newest-to-oldest device builder (`build_universal_devices.sapp`), security/audit tools, and portable lockfile drivers written in PBLang (`2.1.0`).
 
 ---
 
@@ -8,7 +8,8 @@ This directory contains the self-hosted compiler driver (`pbc.sapp`), security/a
 
 | File | Description |
 | :--- | :--- |
-| [pbc.sapp](pbc.sapp) | Self-hosted PBLang compiler driver supporting `.pbck` v1 bytecode (`--target pbck`), hosted `C99` (`--target c`), 3-stage self-hosting static Linux `x86-64 ELF64` (`--target x64`), dynamic OS-FFI `ELF64` (`--target x64-dyn`), Windows 11 `PE32+` `.exe` (`--target pe64`), `ARM64 ELF64` (`--target arm64`), and `WASM32` (`--target wasm`). |
+| [pbc.sapp](pbc.sapp) | Self-hosted PBLang compiler driver supporting `.pbck` v1 bytecode (`--target pbck`), hosted `C99` (`--target c`), 3-stage self-hosting static Linux `x86-64 ELF64` (`--target x64`), dynamic OS-FFI `ELF64` (`--target x64-dyn`), Windows 11 `PE32+` `.exe` (`--target pe64`), `ARM64 ELF64` (`--target arm64`), `WASM32` (`--target wasm`), and `<= 32-bit` targets (`--target x86`, `pe32`, `rv32`, `dos16`, `cpm80`, `c64`, `avr8`). |
+| [build_universal_devices.sapp](build_universal_devices.sapp) | `@polyglot` (`@c`, `@js`, `@python`) universal device builder producing standalone executables & deterministic packages across 64-bit, 32-bit, 16-bit, 8-bit, MCU, and WASI targets. |
 | [pbsecure.sapp](pbsecure.sapp) | Interprocedural static taint, sink, and capability policy analyzer. |
 | [pbaudit.sapp](pbaudit.sapp) | Atomic resumable per-module repository security & quality auditor. |
 | [pblock.sapp](pblock.sapp) | Portable relative `pblang.lock` (`pblang-package-tree-v2`) validator and publisher. |

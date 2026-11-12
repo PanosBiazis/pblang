@@ -219,6 +219,8 @@ static void zr_set_sock_timeouts(ZrSock s, uint64_t timeout_ms) {
     DWORD tv = (DWORD)timeout_ms;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+#elif defined(__wasi__)
+    (void)s;
 #else
     struct timeval tv;
     tv.tv_sec  = (time_t)(timeout_ms / 1000ULL);
@@ -308,6 +310,11 @@ static bool zr_split_host_port(const char *addr, char host[512], char port[32]) 
 }
 
 static ZrSock zr_bind_tcp_listener(const char *addr, char err_out[256]) {
+#if defined(__wasi__)
+    (void)addr;
+    snprintf(err_out, 256, "raw TCP listeners unavailable in WASI preview1 sandbox");
+    return ZR_INVALID_SOCK;
+#else
     zr_net_ensure_init();
     char host[512], port[32];
     if (!zr_split_host_port(addr, host, port)) {
@@ -336,9 +343,15 @@ static ZrSock zr_bind_tcp_listener(const char *addr, char err_out[256]) {
     freeaddrinfo(res);
     if (s == ZR_INVALID_SOCK) snprintf(err_out, 256, "bind/listen failed for '%s'", addr);
     return s;
+#endif
 }
 
 static ZrSock zr_connect_tcp_raw(const char *host, const char *port, uint64_t timeout_ms, char err_out[256]) {
+#if defined(__wasi__)
+    (void)host; (void)port; (void)timeout_ms;
+    snprintf(err_out, 256, "raw TCP sockets unavailable in WASI preview1 sandbox");
+    return ZR_INVALID_SOCK;
+#else
     zr_net_ensure_init();
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
@@ -360,6 +373,7 @@ static ZrSock zr_connect_tcp_raw(const char *host, const char *port, uint64_t ti
     freeaddrinfo(res);
     if (s == ZR_INVALID_SOCK) snprintf(err_out, 256, "connect failed to '%s:%s'", host, port);
     return s;
+#endif
 }
 
 static ssize_t zr_stream_read_some(ZrNetEntry *e, uint8_t *buf, size_t cap, char err_out[256]) {
@@ -372,6 +386,10 @@ static ssize_t zr_stream_read_some(ZrNetEntry *e, uint8_t *buf, size_t cap, char
     int n = recv(e->sock, (char *)buf, (int)cap, 0);
     if (n < 0) { snprintf(err_out, 256, "recv failed (%d)", WSAGetLastError()); return -1; }
     return (ssize_t)n;
+#elif defined(__wasi__)
+    (void)buf; (void)cap;
+    snprintf(err_out, 256, "recv unavailable in WASI");
+    return -1;
 #else
     ssize_t n;
     do { n = recv(e->sock, buf, cap, 0); } while (n < 0 && errno == EINTR);
@@ -392,6 +410,10 @@ static ssize_t zr_stream_write_all(ZrNetEntry *e, const uint8_t *buf, size_t len
             int n = send(e->sock, (const char *)(buf + sent), (int)(len - sent), 0);
             if (n <= 0) { snprintf(err_out, 256, "send failed (%d)", WSAGetLastError()); return -1; }
             sent += (size_t)n;
+#elif defined(__wasi__)
+            (void)buf;
+            snprintf(err_out, 256, "send unavailable in WASI");
+            return -1;
 #else
             ssize_t n;
             do { n = send(e->sock, buf + sent, len - sent, 0); } while (n < 0 && errno == EINTR);
@@ -524,6 +546,12 @@ static bool bi_tcp_accept(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         return false;
     }
 
+#if defined(__wasi__)
+    zr_net_checkin(le);
+    (void)out;
+    vm_raise(vm, "tcp_accept(): unavailable in WASI sandbox");
+    return false;
+#else
     struct sockaddr_storage ss;
 #if defined(_WIN32)
     int slen = (int)sizeof(ss);
@@ -569,6 +597,7 @@ static bool bi_tcp_accept(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     }
     *out = val_num((double)sid);
     return true;
+#endif
 }
 
 static bool bi_tcp_read(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
@@ -755,6 +784,12 @@ static bool bi_tcp_local_addr(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (!zr_net_arg_handle(vm, argv[0], "tcp_local_addr", &id)) return false;
     ZrNetEntry *e = zr_net_checkout(id);
     if (!e) { vm_raise(vm, "tcp_local_addr(): invalid handle"); return false; }
+#if defined(__wasi__)
+    zr_net_checkin(e);
+    (void)out;
+    vm_raise(vm, "tcp_local_addr(): unavailable in WASI sandbox");
+    return false;
+#else
     struct sockaddr_storage ss;
 #if defined(_WIN32)
     int slen = (int)sizeof(ss);
@@ -767,6 +802,12 @@ static bool bi_tcp_local_addr(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         return false;
     }
     zr_net_checkin(e);
+#ifndef NI_MAXHOST
+#define NI_MAXHOST 1025
+#endif
+#ifndef NI_MAXSERV
+#define NI_MAXSERV 32
+#endif
     char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
     if (getnameinfo((struct sockaddr *)&ss, slen, hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
                     NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
@@ -778,6 +819,7 @@ static bool bi_tcp_local_addr(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     else snprintf(full, sizeof(full), "%s:%s", hbuf, sbuf);
     *out = val_obj(vm_new_cstr(vm, full));
     return true;
+#endif
 }
 
 static bool bi_tcp_listen_tls(PbVM *vm, int argc, PbValue *argv, PbValue *out) {

@@ -1,20 +1,21 @@
 /* ============================================================================
- * pblang Sovereign Zero-Rust Native Runtime & Compiler — v2.0.0
+ * pblang Sovereign Zero-Rust Native Runtime & Compiler — v2.1.0
  *
- * 100% Rust-independent cross-platform C99 implementation of:
+ * 100% Rust-independent cross-platform & multi-device C99 implementation of:
  *   - Native `.sapp -> .pbck` v1 preprocessor, Unicode lexer, parser,
  *     AST desugarer, bytecode compiler & `.pbck` serializer/deserializer
  *   - Stack VM with closures, upvalues, `defer`, `try/catch`, adaptive GC,
  *     `BigInt` / `Rational` / `Decimal`, and 260+ native host builtins
  *   - Automatic `stdlib` discovery, `pblang.toml` / `pblang.lock` / workspace
  *     module resolution, in-VM module cache & SHA-256 `.pbck` disk cache
- *   - Standalone single-file executable bundler (`PBLZREXE` trailer)
+ *   - Standalone single-file executable bundler (`PBLZREXE` trailer) &
+ *     universal `64-bit / 32-bit / 16-bit / 8-bit / WASM` `--target` builder
  *
  * Linux build:
  *   gcc -O3 -std=gnu99 -Wall -Wno-unused-function \
  *       runtime_stage3/pblang_zero_rust_vm.c -ldl -lpthread -lm -s -o pblang
  *
- * Windows PE32+ cross-build:
+ * Windows PE32+ / PE32 cross-build:
  *   x86_64-w64-mingw32-gcc -O3 -std=gnu99 -s \
  *       runtime_stage3/pblang_zero_rust_vm.c \
  *       -lws2_32 -lwinhttp -lgdi32 -luser32 -lbcrypt -o pblang.exe
@@ -26,7 +27,7 @@
 #include <dirent.h>
 #endif
 
-#define PBLANG_ZR_VERSION_STR "pblang 2.0.0 (sovereign zero-rust runtime; compat 1.5.0)"
+#define PBLANG_ZR_VERSION_STR "pblang 2.1.0 (sovereign zero-rust runtime; compat 1.5.0)"
 
 static void zr_print_version(void) {
     printf("%s\n", PBLANG_ZR_VERSION_STR);
@@ -41,7 +42,8 @@ static void zr_print_help(const char *prog) {
     printf("  %s -e <code_string> [args...]                 Evaluate inline pblang code\n", p);
     printf("  %s test [flags] [files_or_dirs...]            Run test suites (`fn test_*` & scripts)\n", p);
     printf("  %s check <file.sapp>                          Compile-check `.sapp` without running\n", p);
-    printf("  %s build <file.sapp> [-o <out>] [--bundle-exe] Compile `.pbck` or single-file native binary\n", p);
+    printf("  %s build <file.sapp> [-o <out>] [--target <t> | --bundle-exe] Compile `.pbck` or native target\n", p);
+    printf("      Targets: pbck | x64 | x64-dyn | pe64 | arm64 | wasm | x86 | pe32 | rv32 | dos16 | cpm80 | c64 | avr8\n");
     printf("  %s doctor | hardware                          Inspect runtime, stdlib & host capabilities\n", p);
     printf("  %s update [--check]                           Show sovereign runtime version & update info\n", p);
     printf("  %s --version | -V                             Print version\n", p);
@@ -306,15 +308,24 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
     const char *input_path = NULL;
     const char *out_path = NULL;
     const char *stdlib_override = NULL;
+    const char *target_arch = NULL;
     bool bundle_exe = false;
+    bool safe_flag = false;
+    bool overflow_flag = false;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--bundle-exe") == 0 || strcmp(argv[i], "--exe") == 0 || strcmp(argv[i], "--standalone") == 0) {
             bundle_exe = true;
-        } else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) {
+        } else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) {
             out_path = argv[++i];
+        } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+            target_arch = argv[++i];
         } else if (strcmp(argv[i], "--stdlib") == 0 && i + 1 < argc) {
             stdlib_override = argv[++i];
+        } else if (strcmp(argv[i], "--safe") == 0) {
+            safe_flag = true;
+        } else if (strcmp(argv[i], "--overflow") == 0 || strcmp(argv[i], "--checked-arith") == 0) {
+            overflow_flag = true;
         } else if (argv[i][0] != '-' && !input_path) {
             input_path = argv[i];
         } else if (argv[i][0] != '-' && !out_path) {
@@ -322,8 +333,43 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
         }
     }
     if (!input_path) {
-        fprintf(stderr, "Usage: pblang build <input.sapp> [-o <output>] [--bundle-exe]\n");
+        fprintf(stderr, "Usage: pblang build <input.sapp> [-o <output>] [--target <arch> | --bundle-exe]\n");
         return 1;
+    }
+
+    if (target_arch && strcmp(target_arch, "pbck") != 0) {
+        PbVM dvm;
+        vm_init(&dvm);
+        zr_configure_vm_paths(&dvm, self_exe, input_path, stdlib_override);
+        char pbc_path[4096];
+        pbc_path[0] = '\0';
+        if (zr_file_exists_reg("tools/pbc.sapp")) {
+            snprintf(pbc_path, sizeof(pbc_path), "tools/pbc.sapp");
+        } else if (dvm.stdlib_root && *dvm.stdlib_root) {
+            char cand[4160];
+            snprintf(cand, sizeof(cand), "%s/../tools/pbc.sapp", dvm.stdlib_root);
+            if (zr_file_exists_reg(cand)) snprintf(pbc_path, sizeof(pbc_path), "%.4090s", cand);
+        }
+        vm_free(&dvm);
+        if (!pbc_path[0]) {
+            fprintf(stderr, "build --target %s: tools/pbc.sapp not found\n", target_arch);
+            return 1;
+        }
+        ZrCaps pcaps;
+        zr_caps_allow_all(&pcaps);
+        char *pargs[10];
+        int pn = 0;
+        pargs[pn++] = pbc_path;
+        pargs[pn++] = (char *)input_path;
+        pargs[pn++] = (char *)"--target";
+        pargs[pn++] = (char *)target_arch;
+        if (out_path) {
+            pargs[pn++] = (char *)"--out";
+            pargs[pn++] = (char *)out_path;
+        }
+        if (safe_flag) pargs[pn++] = (char *)"--safe";
+        if (overflow_flag) pargs[pn++] = (char *)"--overflow";
+        return zr_cmd_run_file(self_exe, pbc_path, &pcaps, stdlib_override, pn, pargs);
     }
 
     uint8_t *raw = NULL;

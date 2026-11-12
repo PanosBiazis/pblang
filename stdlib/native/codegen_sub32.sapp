@@ -1,0 +1,2365 @@
+// stdlib/native/codegen_sub32.sapp — Pure-PBLang <= 32-bit Native Machine-Code Compilers (v2.1.0)
+//
+// Emits standalone native executables and firmware images directly from PBLang AST
+// with ZERO external assemblers or C compilers required:
+//   1. compile_elf32_x86(src)  -> 32-bit Linux i386 ELF32 executable (EM_386=3, int 0x80)
+//   2. compile_pe32_x86(src)   -> 32-bit Windows i386 PE32 .exe (0x014C, OptionalHeader32 0x010B, KERNEL32 IAT)
+//   3. compile_elf32_rv32(src) -> 32-bit RISC-V RV32IM ELF32 executable (EM_RISCV=243, ecall 64/93)
+//   4. compile_dos16_com(src)  -> 16-bit Real-Mode 8086 MS-DOS/FreeDOS .COM executable (ORG 0x0100, INT 21h)
+//   5. compile_cpm80_com(src)  -> 8-bit Intel 8080 / Z80 CP/M-80 .COM executable (ORG 0x0100, BDOS 0x0005)
+//   6. compile_c64_prg(src)    -> 8-bit MOS 6502 Commodore 64 .PRG ($0801 BASIC SYS stub + JSR $FFD2)
+//   7. compile_avr8_hex(src)   -> 8-bit Atmel AVR ATmega328P Intel HEX firmware (UART0 UDR0 0xC6)
+//
+// Also exports deterministic instruction-level ISA verifiers (`emulate_elf32_rv32`,
+// `emulate_dos16_com`, `emulate_cpm80_com`, `emulate_c64_prg`, `emulate_avr8_hex`)
+// so automated tests execute the emitted 8/16/32-bit machine code bytes directly.
+
+let _SOURCE = import("stdlib:compiler/checked_source.sapp");
+
+fn _fail(target, msg) { throw "pbc[" + target + "]: " + msg; }
+fn _stmts_of(b) { if is_array(b) { return b; } if is_map(b) and map_has(b, "stmts") { return b.stmts; } return []; }
+fn _pname(p) { if is_map(p) { return p.name; } return p; }
+
+fn _u8(n) {
+    let v = num_floor(n) % 256;
+    if v < 0 { v = v + 256; }
+    return v;
+}
+fn _u16(n) {
+    let v = num_floor(n) % 65536;
+    if v < 0 { v = v + 65536; }
+    return v;
+}
+fn _u32(n) {
+    let v = num_floor(n) % 4294967296;
+    if v < 0 { v = v + 4294967296; }
+    return v;
+}
+fn _i16(n) {
+    let u = _u16(n);
+    if u >= 32768 { return u - 65536; }
+    return u;
+}
+fn _i32(n) {
+    let u = _u32(n);
+    if u >= 2147483648 { return u - 4294967296; }
+    return u;
+}
+
+fn _emit1(buf, b0) { push(buf, _u8(b0)); }
+fn _emit2(buf, b0, b1) { push(buf, _u8(b0)); push(buf, _u8(b1)); }
+fn _emit3(buf, b0, b1, b2) { push(buf, _u8(b0)); push(buf, _u8(b1)); push(buf, _u8(b2)); }
+fn _emit4(buf, b0, b1, b2, b3) { push(buf, _u8(b0)); push(buf, _u8(b1)); push(buf, _u8(b2)); push(buf, _u8(b3)); }
+fn _emit_bytes(buf, arr) { let i = 0; while i < len(arr) { push(buf, _u8(arr[i])); i = i + 1; } }
+
+fn _emit_u16le(buf, v) {
+    let u = _u16(v);
+    push(buf, u % 256);
+    push(buf, num_floor(u / 256) % 256);
+}
+fn _emit_u32le(buf, v) {
+    let u = _u32(v);
+    push(buf, u % 256);
+    push(buf, num_floor(u / 256) % 256);
+    push(buf, num_floor(u / 65536) % 256);
+    push(buf, num_floor(u / 16777216) % 256);
+}
+fn _patch_u16le(buf, at, v) {
+    let u = _u16(v);
+    buf[at] = u % 256;
+    buf[at + 1] = num_floor(u / 256) % 256;
+}
+fn _patch_u32le(buf, at, v) {
+    let u = _u32(v);
+    buf[at] = u % 256;
+    buf[at + 1] = num_floor(u / 256) % 256;
+    buf[at + 2] = num_floor(u / 65536) % 256;
+    buf[at + 3] = num_floor(u / 16777216) % 256;
+}
+fn _read_u16le(buf, at) { return buf[at] + buf[at + 1] * 256; }
+fn _read_u32le(buf, at) { return buf[at] + buf[at + 1] * 256 + buf[at + 2] * 65536 + buf[at + 3] * 16777216; }
+
+fn _parse_int_lit(target, s) {
+    let v = try parse_number(s) catch nil;
+    if v == nil { _fail(target, "invalid numeric literal: " + str(s)); }
+    return num_floor(v);
+}
+
+fn _collect_locals(stmts, map_out, next_idx_box) {
+    for st in stmts {
+        if st.kind == "let" or st.kind == "const" {
+            if not map_has(map_out, st.name) {
+                map_out[st.name] = next_idx_box[0];
+                next_idx_box[0] = next_idx_box[0] + 1;
+            }
+        } elif st.kind == "if" {
+            _collect_locals(_stmts_of(st.then), map_out, next_idx_box);
+            if map_has(st, "elifs") and is_array(st.elifs) {
+                for el in st.elifs { _collect_locals(_stmts_of(el.body), map_out, next_idx_box); }
+            }
+            if map_has(st, "else") and st["else"] != nil {
+                _collect_locals(_stmts_of(st["else"]), map_out, next_idx_box);
+            }
+        } elif st.kind == "while" {
+            _collect_locals(_stmts_of(st.body), map_out, next_idx_box);
+        } elif st.kind == "block" {
+            _collect_locals(_stmts_of(st), map_out, next_idx_box);
+        }
+    }
+}
+
+// ============================================================================
+// 1 & 2. 32-BIT X86 COMPILER -> LINUX ELF32 (`x86`) & WINDOWS PE32 (`pe32`)
+// ============================================================================
+
+fn _x86_emit_RuntimePrintI32(code, is_pe32, iat_get_std_handle, iat_write_file) {
+    let fn_off = len(code);
+    // push ebp; mov ebp, esp; push ebx; push esi; push edi; sub esp, 32
+    _emit3(code, 0x55, 0x89, 0xE5);
+    _emit3(code, 0x53, 0x56, 0x57);
+    _emit3(code, 0x83, 0xEC, 0x20);
+    // mov ecx, eax; lea edi, [ebp - 16]; mov byte [edi], 10 ('\n'); xor esi, esi
+    _emit2(code, 0x89, 0xC1);
+    _emit3(code, 0x8D, 0x7D, 0xF0);
+    _emit3(code, 0xC6, 0x07, 0x0A);
+    _emit2(code, 0x31, 0xF6);
+    // test ecx, ecx; jns +3; neg ecx; inc esi
+    _emit2(code, 0x85, 0xC9);
+    _emit2(code, 0x79, 0x03);
+    _emit3(code, 0xF7, 0xD9, 0x46);
+    // mov eax, ecx; mov ebx, 10
+    _emit2(code, 0x89, 0xC8);
+    _emit1(code, 0xBB); _emit_u32le(code, 10);
+    let loop_pos = len(code);
+    // xor edx, edx; div ebx; add dl, 48; dec edi; mov [edi], dl; test eax, eax; jnz loop_pos
+    _emit4(code, 0x31, 0xD2, 0xF7, 0xF3);
+    _emit3(code, 0x80, 0xC2, 0x30);
+    _emit3(code, 0x4F, 0x88, 0x17);
+    _emit2(code, 0x85, 0xC0);
+    let jnz_rel = loop_pos - (len(code) + 2);
+    _emit2(code, 0x75, jnz_rel);
+    // test esi, esi; jz +4; dec edi; mov byte [edi], '-'
+    _emit2(code, 0x85, 0xF6);
+    _emit2(code, 0x74, 0x04);
+    _emit4(code, 0x4F, 0xC6, 0x07, 0x2D);
+    // lea edx, [ebp - 15]; sub edx, edi
+    _emit3(code, 0x8D, 0x55, 0xF1);
+    _emit2(code, 0x29, 0xFA);
+
+    if is_pe32 {
+        // lea eax, [ebp - 40] (&written); push 0; push eax; push edx (len); push edi (buf)
+        _emit3(code, 0x8D, 0x45, 0xD8);
+        _emit4(code, 0x6A, 0x00, 0x50, 0x52);
+        _emit1(code, 0x57);
+        // push -11; call dword ptr [IAT_GetStdHandle]; push eax; call dword ptr [IAT_WriteFile]
+        _emit2(code, 0x6A, 0xF5);
+        _emit2(code, 0xFF, 0x15); _emit_u32le(code, iat_get_std_handle);
+        _emit1(code, 0x50);
+        _emit2(code, 0xFF, 0x15); _emit_u32le(code, iat_write_file);
+    } else {
+        // mov ecx, edi; mov ebx, 1; mov eax, 4; int 0x80
+        _emit2(code, 0x89, 0xF9);
+        _emit1(code, 0xBB); _emit_u32le(code, 1);
+        _emit1(code, 0xB8); _emit_u32le(code, 4);
+        _emit2(code, 0xCD, 0x80);
+    }
+    // add esp, 32; pop edi; pop esi; pop ebx; pop ebp; ret
+    _emit3(code, 0x83, 0xC4, 0x20);
+    _emit4(code, 0x5F, 0x5E, 0x5B, 0x5D);
+    _emit1(code, 0xC3);
+    return fn_off;
+}
+
+fn _x86_emit_expr(ctx, env, e) {
+    let code = ctx.code;
+    let k = e.kind;
+    if k == "number" {
+        _emit1(code, 0xB8); _emit_u32le(code, _parse_int_lit(ctx.target, e.value));
+        return nil;
+    }
+    if k == "bool" {
+        _emit1(code, 0xB8); _emit_u32le(code, if e.value { 1 } else { 0 });
+        return nil;
+    }
+    if k == "ident" {
+        if map_has(env.params, e.name) {
+            let disp = 8 + env.params[e.name] * 4;
+            _emit2(code, 0x8B, 0x85); _emit_u32le(code, disp);
+            return nil;
+        }
+        if map_has(env.locals, e.name) {
+            let disp = 0 - 4 - env.locals[e.name] * 4;
+            _emit2(code, 0x8B, 0x85); _emit_u32le(code, disp);
+            return nil;
+        }
+        _fail(ctx.target, "undefined variable: " + e.name);
+    }
+    if k == "unary" {
+        let sub = if map_has(e, "operand") { e.operand } else { e.expr };
+        _x86_emit_expr(ctx, env, sub);
+        if e.op == "-" {
+            _emit2(code, 0xF7, 0xD8);
+        } elif e.op == "not" or e.op == "!" {
+            _emit3(code, 0x83, 0xF8, 0x00);
+            _emit3(code, 0x0F, 0x94, 0xC0);
+            _emit3(code, 0x0F, 0xB6, 0xC0);
+        } else {
+            _fail(ctx.target, "unsupported unary op: " + e.op);
+        }
+        return nil;
+    }
+    if k == "binary" {
+        if e.op == "and" or e.op == "&&" {
+            _x86_emit_expr(ctx, env, e.left);
+            _emit3(code, 0x83, 0xF8, 0x00);
+            _emit2(code, 0x0F, 0x84); let p_false = len(code); _emit_u32le(code, 0);
+            _x86_emit_expr(ctx, env, e.right);
+            _emit3(code, 0x83, 0xF8, 0x00);
+            _emit3(code, 0x0F, 0x95, 0xC0);
+            _emit3(code, 0x0F, 0xB6, 0xC0);
+            _emit1(code, 0xE9); let p_end = len(code); _emit_u32le(code, 0);
+            _patch_u32le(code, p_false, len(code) - (p_false + 4));
+            _emit1(code, 0xB8); _emit_u32le(code, 0);
+            _patch_u32le(code, p_end, len(code) - (p_end + 4));
+            return nil;
+        }
+        if e.op == "or" or e.op == "||" {
+            _x86_emit_expr(ctx, env, e.left);
+            _emit3(code, 0x83, 0xF8, 0x00);
+            _emit2(code, 0x0F, 0x85); let p_true = len(code); _emit_u32le(code, 0);
+            _x86_emit_expr(ctx, env, e.right);
+            _emit3(code, 0x83, 0xF8, 0x00);
+            _emit3(code, 0x0F, 0x95, 0xC0);
+            _emit3(code, 0x0F, 0xB6, 0xC0);
+            _emit1(code, 0xE9); let p_end = len(code); _emit_u32le(code, 0);
+            _patch_u32le(code, p_true, len(code) - (p_true + 4));
+            _emit1(code, 0xB8); _emit_u32le(code, 1);
+            _patch_u32le(code, p_end, len(code) - (p_end + 4));
+            return nil;
+        }
+        _x86_emit_expr(ctx, env, e.left);
+        _emit1(code, 0x50); // push eax
+        _x86_emit_expr(ctx, env, e.right);
+        _emit3(code, 0x89, 0xC1, 0x58); // mov ecx, eax; pop eax (eax=left, ecx=right)
+        let op = e.op;
+        if op == "+" { _emit2(code, 0x01, 0xC8); }
+        elif op == "-" { _emit2(code, 0x29, 0xC8); }
+        elif op == "*" { _emit3(code, 0x0F, 0xAF, 0xC1); }
+        elif op == "/" { _emit3(code, 0x99, 0xF7, 0xF9); }
+        elif op == "%" { _emit3(code, 0x99, 0xF7, 0xF9); _emit2(code, 0x89, 0xD0); }
+        elif op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=" {
+            _emit2(code, 0x39, 0xC8);
+            let cc = if op == "==" { 0x94 } elif op == "!=" { 0x95 } elif op == "<" { 0x9C }
+                     elif op == "<=" { 0x9E } elif op == ">" { 0x9F } else { 0x9D };
+            _emit3(code, 0x0F, cc, 0xC0);
+            _emit3(code, 0x0F, 0xB6, 0xC0);
+        } else {
+            _fail(ctx.target, "unsupported binary op: " + op);
+        }
+        return nil;
+    }
+    if k == "call" {
+        let fname = if is_string(e.func) { e.func } elif is_map(e.func) and map_has(e.func, "name") { e.func.name } else { "" };
+        let args = e.args;
+        if fname == "print" and len(args) == 1 {
+            _x86_emit_print(ctx, env, args[0]);
+            _emit1(code, 0xB8); _emit_u32le(code, 0);
+            return nil;
+        }
+        if not map_has(ctx.fn_arity, fname) { _fail(ctx.target, "unknown function: " + fname); }
+        if ctx.fn_arity[fname] != len(args) { _fail(ctx.target, "arity mismatch calling " + fname); }
+        let ai = len(args) - 1;
+        while ai >= 0 {
+            _x86_emit_expr(ctx, env, args[ai]);
+            _emit1(code, 0x50); // push arg right-to-left
+            ai = ai - 1;
+        }
+        _emit1(code, 0xE8);
+        let patch_at = len(code);
+        _emit_u32le(code, 0);
+        push(ctx.call_patches, map{at: patch_at, name: fname});
+        if len(args) > 0 {
+            _emit2(code, 0x81, 0xC4); _emit_u32le(code, len(args) * 4);
+        }
+        return nil;
+    }
+    if k == "assign" {
+        _x86_emit_expr(ctx, env, e.value);
+        if map_has(env.locals, e.name) {
+            _emit2(code, 0x89, 0x85); _emit_u32le(code, 0 - 4 - env.locals[e.name] * 4);
+        } elif map_has(env.params, e.name) {
+            _emit2(code, 0x89, 0x85); _emit_u32le(code, 8 + env.params[e.name] * 4);
+        } else { _fail(ctx.target, "assignment to undeclared variable: " + e.name); }
+        return nil;
+    }
+    _fail(ctx.target, "unsupported expression kind: " + str(k));
+}
+
+fn _x86_emit_print(ctx, env, val_expr) {
+    let code = ctx.code;
+    if val_expr.kind == "string" {
+        let bytes = str_to_bytes(val_expr.value + "\n");
+        let n = len(bytes);
+        if ctx.is_pe32 {
+            // sub esp, 4 (for &written); mov edx, esp
+            _emit3(code, 0x83, 0xEC, 0x04);
+            _emit2(code, 0x89, 0xE2);
+            // push 0; push edx (&written); push n; push str_va
+            _emit3(code, 0x6A, 0x00, 0x52);
+            _emit1(code, 0x68); _emit_u32le(code, n);
+            _emit1(code, 0x68);
+            let str_patch = len(code);
+            _emit_u32le(code, 0);
+            push(ctx.str_patches, map{at: str_patch, bytes: bytes});
+            // push -11; call [GetStdHandle]; push eax; call [WriteFile]; add esp, 4
+            _emit2(code, 0x6A, 0xF5);
+            _emit2(code, 0xFF, 0x15); _emit_u32le(code, ctx.iat_get_std_handle);
+            _emit1(code, 0x50);
+            _emit2(code, 0xFF, 0x15); _emit_u32le(code, ctx.iat_write_file);
+            _emit3(code, 0x83, 0xC4, 0x04);
+        } else {
+            _emit1(code, 0xB8); _emit_u32le(code, 4);
+            _emit1(code, 0xBB); _emit_u32le(code, 1);
+            _emit1(code, 0xB9);
+            let str_patch = len(code);
+            _emit_u32le(code, 0);
+            push(ctx.str_patches, map{at: str_patch, bytes: bytes});
+            _emit1(code, 0xBA); _emit_u32le(code, n);
+            _emit2(code, 0xCD, 0x80);
+        }
+        return nil;
+    }
+    _x86_emit_expr(ctx, env, val_expr);
+    _emit1(code, 0xE8);
+    let patch_at = len(code);
+    _emit_u32le(code, 0);
+    push(ctx.call_patches, map{at: patch_at, name: "@print_i32"});
+}
+
+fn _x86_emit_stmts(ctx, env, stmts) {
+    let code = ctx.code;
+    for st in stmts {
+        let k = st.kind;
+        if k == "let" or k == "const" or k == "assign" {
+            if not map_has(env.locals, st.name) and not map_has(env.params, st.name) {
+                _fail(ctx.target, "assignment to undeclared variable: " + st.name);
+            }
+            _x86_emit_expr(ctx, env, st.value);
+            if map_has(env.locals, st.name) {
+                let disp = 0 - 4 - env.locals[st.name] * 4;
+                _emit2(code, 0x89, 0x85); _emit_u32le(code, disp);
+            } else {
+                let disp = 8 + env.params[st.name] * 4;
+                _emit2(code, 0x89, 0x85); _emit_u32le(code, disp);
+            }
+        } elif k == "print" {
+            _x86_emit_print(ctx, env, st.value);
+        } elif k == "expr_stmt" {
+            _x86_emit_expr(ctx, env, st.expr);
+        } elif k == "return" {
+            if st.value != nil { _x86_emit_expr(ctx, env, st.value); }
+            else { _emit1(code, 0xB8); _emit_u32le(code, 0); }
+            _emit4(code, 0x89, 0xEC, 0x5D, 0xC3);
+        } elif k == "if" {
+            let end_patches = [];
+            _x86_emit_expr(ctx, env, st.cond);
+            _emit3(code, 0x83, 0xF8, 0x00);
+            _emit2(code, 0x0F, 0x84); let p_next = len(code); _emit_u32le(code, 0);
+            _x86_emit_stmts(ctx, env, _stmts_of(st.then));
+            _emit1(code, 0xE9); push(end_patches, len(code)); _emit_u32le(code, 0);
+            _patch_u32le(code, p_next, len(code) - (p_next + 4));
+            if map_has(st, "elifs") and is_array(st.elifs) {
+                for el in st.elifs {
+                    _x86_emit_expr(ctx, env, el.cond);
+                    _emit3(code, 0x83, 0xF8, 0x00);
+                    _emit2(code, 0x0F, 0x84); let p_el = len(code); _emit_u32le(code, 0);
+                    _x86_emit_stmts(ctx, env, _stmts_of(el.body));
+                    _emit1(code, 0xE9); push(end_patches, len(code)); _emit_u32le(code, 0);
+                    _patch_u32le(code, p_el, len(code) - (p_el + 4));
+                }
+            }
+            if map_has(st, "else") and st["else"] != nil {
+                _x86_emit_stmts(ctx, env, _stmts_of(st["else"]));
+            }
+            for ep in end_patches {
+                _patch_u32le(code, ep, len(code) - (ep + 4));
+            }
+        } elif k == "while" {
+            let top = len(code);
+            _x86_emit_expr(ctx, env, st.cond);
+            _emit3(code, 0x83, 0xF8, 0x00);
+            _emit2(code, 0x0F, 0x84); let p_out = len(code); _emit_u32le(code, 0);
+            _x86_emit_stmts(ctx, env, _stmts_of(st.body));
+            _emit1(code, 0xE9); _emit_u32le(code, top - (len(code) + 4));
+            _patch_u32le(code, p_out, len(code) - (p_out + 4));
+        } elif k == "block" {
+            _x86_emit_stmts(ctx, env, _stmts_of(st));
+        } elif k != "fn" {
+            _fail(ctx.target, "unsupported statement kind: " + str(k));
+        }
+    }
+}
+
+fn _compile_x86_common(source, is_pe32, text_va, iat_exit, iat_get_std, iat_write) {
+    let target = if is_pe32 { "pe32" } else { "x86" };
+    let ast = _SOURCE.parse_source(source);
+    let stmts = _stmts_of(ast);
+    let fns = [];
+    let top_stmts = [];
+    let fn_arity = map{};
+    for st in stmts {
+        if st.kind == "fn" {
+            fn_arity[st.name] = len(st.params);
+            push(fns, st);
+        } else {
+            push(top_stmts, st);
+        }
+    }
+
+    let ctx = map{
+        target: target,
+        is_pe32: is_pe32,
+        code: [],
+        fn_arity: fn_arity,
+        fn_offsets: map{},
+        call_patches: [],
+        str_patches: [],
+        iat_exit: iat_exit,
+        iat_get_std_handle: iat_get_std,
+        iat_write_file: iat_write
+    };
+
+    // Entry point at offset 0: call @top, then exit with eax
+    _emit1(ctx.code, 0xE8);
+    let entry_call_at = len(ctx.code);
+    _emit_u32le(ctx.code, 0);
+    push(ctx.call_patches, map{at: entry_call_at, name: "@top"});
+    if is_pe32 {
+        _emit1(ctx.code, 0x50); // push eax
+        _emit2(ctx.code, 0xFF, 0x15); _emit_u32le(ctx.code, iat_exit);
+    } else {
+        _emit2(ctx.code, 0x89, 0xC3); // mov ebx, eax
+        _emit1(ctx.code, 0xB8); _emit_u32le(ctx.code, 1);
+        _emit2(ctx.code, 0xCD, 0x80);
+    }
+
+    ctx.fn_offsets["@print_i32"] = _x86_emit_RuntimePrintI32(ctx.code, is_pe32, iat_get_std, iat_write);
+
+    for f in fns {
+        ctx.fn_offsets[f.name] = len(ctx.code);
+        let pmap = map{};
+        let pi = 0;
+        while pi < len(f.params) { pmap[_pname(f.params[pi])] = pi; pi = pi + 1; }
+        let lmap = map{};
+        let lbox = [0];
+        let fbody = _stmts_of(f.body);
+        _collect_locals(fbody, lmap, lbox);
+        _emit3(ctx.code, 0x55, 0x89, 0xE5);
+        if lbox[0] > 0 { _emit2(ctx.code, 0x81, 0xEC); _emit_u32le(ctx.code, lbox[0] * 4); }
+        _x86_emit_stmts(ctx, map{params: pmap, locals: lmap}, fbody);
+        _emit1(ctx.code, 0xB8); _emit_u32le(ctx.code, 0);
+        _emit4(ctx.code, 0x89, 0xEC, 0x5D, 0xC3);
+    }
+
+    // @top wrapper
+    ctx.fn_offsets["@top"] = len(ctx.code);
+    let tlocals = map{};
+    let tbox = [0];
+    _collect_locals(top_stmts, tlocals, tbox);
+    _emit3(ctx.code, 0x55, 0x89, 0xE5);
+    if tbox[0] > 0 { _emit2(ctx.code, 0x81, 0xEC); _emit_u32le(ctx.code, tbox[0] * 4); }
+    _x86_emit_stmts(ctx, map{params: map{}, locals: tlocals}, top_stmts);
+    if map_has(fn_arity, "main") and fn_arity["main"] == 0 and len(top_stmts) == 0 {
+        _emit1(ctx.code, 0xE8);
+        let mpatch = len(ctx.code);
+        _emit_u32le(ctx.code, 0);
+        push(ctx.call_patches, map{at: mpatch, name: "main"});
+    } else {
+        _emit1(ctx.code, 0xB8); _emit_u32le(ctx.code, 0);
+    }
+    _emit4(ctx.code, 0x89, 0xEC, 0x5D, 0xC3);
+
+    // Patch relative calls
+    for cp in ctx.call_patches {
+        let dst = ctx.fn_offsets[cp.name];
+        _patch_u32le(ctx.code, cp.at, dst - (cp.at + 4));
+    }
+    // Append string literals and patch VAs
+    for sp in ctx.str_patches {
+        let sva = text_va + len(ctx.code);
+        _patch_u32le(ctx.code, sp.at, sva);
+        _emit_bytes(ctx.code, sp.bytes);
+    }
+    return ctx.code;
+}
+
+fn compile_elf32_x86(source) {
+    let base_va = 0x08048000;
+    let hdr_sz = 84; // 52-byte Elf32_Ehdr + 32-byte Elf32_Phdr
+    let code = _compile_x86_common(source, false, base_va + hdr_sz, 0, 0, 0);
+    let total_sz = hdr_sz + len(code);
+    let elf = [];
+    // e_ident: \x7fELF, ELFCLASS32=1, ELFDATA2LSB=1, EV_CURRENT=1, ELFOSABI_NONE=0
+    _emit4(elf, 0x7F, 0x45, 0x4C, 0x46);
+    _emit4(elf, 1, 1, 1, 0);
+    let z = 0; while z < 8 { _emit1(elf, 0); z = z + 1; }
+    _emit_u16le(elf, 2);              // ET_EXEC
+    _emit_u16le(elf, 3);              // EM_386 (Intel 80386 32-bit)
+    _emit_u32le(elf, 1);              // e_version
+    _emit_u32le(elf, base_va + hdr_sz); // e_entry
+    _emit_u32le(elf, 52);             // e_phoff
+    _emit_u32le(elf, 0);              // e_shoff
+    _emit_u32le(elf, 0);              // e_flags
+    _emit_u16le(elf, 52);             // e_ehsize
+    _emit_u16le(elf, 32);             // e_phentsize
+    _emit_u16le(elf, 1);              // e_phnum
+    _emit_u16le(elf, 0);              // e_shentsize
+    _emit_u16le(elf, 0);              // e_shnum
+    _emit_u16le(elf, 0);              // e_shstrndx
+    // Elf32_Phdr: PT_LOAD=1
+    _emit_u32le(elf, 1);              // p_type = PT_LOAD
+    _emit_u32le(elf, 0);              // p_offset
+    _emit_u32le(elf, base_va);        // p_vaddr
+    _emit_u32le(elf, base_va);        // p_paddr
+    _emit_u32le(elf, total_sz);       // p_filesz
+    _emit_u32le(elf, total_sz);       // p_memsz
+    _emit_u32le(elf, 7);              // PF_R | PF_W | PF_X
+    _emit_u32le(elf, 0x1000);         // p_align
+    _emit_bytes(elf, code);
+    return elf;
+}
+
+fn _pad_to(buf, align) {
+    while len(buf) % align != 0 { push(buf, 0); }
+}
+
+fn compile_pe32_x86(source) {
+    let img_base = 0x00400000;
+    let text_rva = 0x1000;
+    // Build .idata first at fixed RVA after .text so IAT VAs are exact
+    // Reserve dynamic .text pages: compile once with dummy IAT, then compute exact idata_rva and re-emit cleanly
+    let probe = _compile_x86_common(source, true, img_base + text_rva, 0x0040203C, 0x00402040, 0x00402044);
+    let text_vsize = len(probe);
+    let text_pages = num_floor((text_vsize + 4095) / 4096) * 4096;
+    if text_pages < 4096 { text_pages = 4096; }
+    let idata_rva = text_rva + text_pages;
+    // .idata layout:
+    // +0x00: Import Descriptor #0 (20B) + Null Descriptor (20B) = 40B (0x28)
+    // +0x28: ILT (4 dwords = 16B: ExitProcess, GetStdHandle, WriteFile, 0)
+    // +0x38: IAT (4 dwords = 16B: ExitProcess, GetStdHandle, WriteFile, 0)
+    // +0x48: "KERNEL32.dll\0\0" (14B)
+    // +0x56: Hint/Name ExitProcess (2 + 12 = 14B)
+    // +0x64: Hint/Name GetStdHandle (2 + 14 = 16B)
+    // +0x74: Hint/Name WriteFile (2 + 10 = 12B)
+    let iat_rva = idata_rva + 0x38;
+    let code = _compile_x86_common(source, true, img_base + text_rva,
+                                   img_base + iat_rva, img_base + iat_rva + 4, img_base + iat_rva + 8);
+    let text_raw_sz = num_floor((len(code) + 511) / 512) * 512;
+    if text_raw_sz < 512 { text_raw_sz = 512; }
+
+    let hn_exit = idata_rva + 0x56;
+    let hn_std  = idata_rva + 0x64;
+    let hn_wrt  = idata_rva + 0x74;
+    let dll_rva = idata_rva + 0x48;
+
+    let idata = [];
+    // Import Descriptor
+    _emit_u32le(idata, idata_rva + 0x28); // OriginalFirstThunk (ILT)
+    _emit_u32le(idata, 0);                // TimeDateStamp
+    _emit_u32le(idata, 0);                // ForwarderChain
+    _emit_u32le(idata, dll_rva);          // Name RVA
+    _emit_u32le(idata, iat_rva);          // FirstThunk (IAT)
+    // Null Import Descriptor (20B)
+    let zi = 0; while zi < 5 { _emit_u32le(idata, 0); zi = zi + 1; }
+    // ILT (+0x28)
+    _emit_u32le(idata, hn_exit); _emit_u32le(idata, hn_std); _emit_u32le(idata, hn_wrt); _emit_u32le(idata, 0);
+    // IAT (+0x38)
+    _emit_u32le(idata, hn_exit); _emit_u32le(idata, hn_std); _emit_u32le(idata, hn_wrt); _emit_u32le(idata, 0);
+    // DLL Name (+0x48, 14B)
+    _emit_bytes(idata, str_to_bytes("KERNEL32.dll")); _emit2(idata, 0, 0);
+    // Hint/Names
+    _emit_u16le(idata, 0); _emit_bytes(idata, str_to_bytes("ExitProcess")); _emit1(idata, 0);
+    _emit_u16le(idata, 0); _emit_bytes(idata, str_to_bytes("GetStdHandle")); _emit2(idata, 0, 0);
+    _emit_u16le(idata, 0); _emit_bytes(idata, str_to_bytes("WriteFile")); _emit1(idata, 0);
+    let idata_vsize = len(idata);
+
+    let pe = [];
+    // DOS Header (64 bytes, e_lfanew = 0x40)
+    _emit2(pe, 0x4D, 0x5A); // "MZ"
+    while len(pe) < 0x3C { _emit1(pe, 0); }
+    _emit_u32le(pe, 0x40);
+    // PE Signature + COFF File Header (24 bytes)
+    _emit4(pe, 0x50, 0x45, 0x00, 0x00); // "PE\0\0"
+    _emit_u16le(pe, 0x014C); // IMAGE_FILE_MACHINE_I386 (32-bit x86)
+    _emit_u16le(pe, 2);      // NumberOfSections (.text, .idata)
+    _emit_u32le(pe, 0);      // TimeDateStamp (deterministic)
+    _emit_u32le(pe, 0);      // PointerToSymbolTable
+    _emit_u32le(pe, 0);      // NumberOfSymbols
+    _emit_u16le(pe, 224);    // SizeOfOptionalHeader (IMAGE_OPTIONAL_HEADER32 = 224)
+    _emit_u16le(pe, 0x0102); // EXECUTABLE_IMAGE | 32BIT_MACHINE
+    // Optional Header 32 (Magic = 0x010B PE32)
+    _emit_u16le(pe, 0x010B); // PE32 (32-bit)
+    _emit2(pe, 14, 0);       // LinkerVersion
+    _emit_u32le(pe, text_raw_sz);
+    _emit_u32le(pe, 512);
+    _emit_u32le(pe, 0);
+    _emit_u32le(pe, text_rva); // AddressOfEntryPoint
+    _emit_u32le(pe, text_rva); // BaseOfCode
+    _emit_u32le(pe, idata_rva);// BaseOfData (PE32-specific field!)
+    _emit_u32le(pe, img_base); // ImageBase = 0x00400000
+    _emit_u32le(pe, 0x1000);   // SectionAlignment
+    _emit_u32le(pe, 0x0200);   // FileAlignment
+    _emit_u16le(pe, 4); _emit_u16le(pe, 0); // Major/MinorOSVersion = 4.0 (Win95/NT4/XP..Win11 compatible!)
+    _emit_u16le(pe, 0); _emit_u16le(pe, 0);
+    _emit_u16le(pe, 4); _emit_u16le(pe, 0); // SubsystemVersion = 4.0
+    _emit_u32le(pe, 0);
+    _emit_u32le(pe, idata_rva + 0x1000);    // SizeOfImage
+    _emit_u32le(pe, 0x0200);                // SizeOfHeaders
+    _emit_u32le(pe, 0);                     // CheckSum
+    _emit_u16le(pe, 3);                     // IMAGE_SUBSYSTEM_WINDOWS_CUI
+    _emit_u16le(pe, 0);
+    _emit_u32le(pe, 0x100000); _emit_u32le(pe, 0x1000); // StackReserve/Commit (32-bit dwords)
+    _emit_u32le(pe, 0x100000); _emit_u32le(pe, 0x1000); // HeapReserve/Commit
+    _emit_u32le(pe, 0);
+    _emit_u32le(pe, 16);                    // NumberOfRvaAndSizes
+    // Data Directories [0..15]
+    _emit_u32le(pe, 0); _emit_u32le(pe, 0);                 // [0] Export
+    _emit_u32le(pe, idata_rva); _emit_u32le(pe, idata_vsize);// [1] Import
+    let dd = 2;
+    while dd < 16 {
+        if dd == 12 { _emit_u32le(pe, iat_rva); _emit_u32le(pe, 16); }
+        else { _emit_u32le(pe, 0); _emit_u32le(pe, 0); }
+        dd = dd + 1;
+    }
+    // Section Header #1: .text
+    _emit_bytes(pe, [0x2E, 0x74, 0x65, 0x78, 0x74, 0, 0, 0]);
+    _emit_u32le(pe, len(code));
+    _emit_u32le(pe, text_rva);
+    _emit_u32le(pe, text_raw_sz);
+    _emit_u32le(pe, 0x0200);
+    _emit_u32le(pe, 0); _emit_u32le(pe, 0); _emit_u16le(pe, 0); _emit_u16le(pe, 0);
+    _emit_u32le(pe, 0x60000020); // CNT_CODE | MEM_EXECUTE | MEM_READ
+    // Section Header #2: .idata
+    _emit_bytes(pe, [0x2E, 0x69, 0x64, 0x61, 0x74, 0x61, 0, 0]);
+    _emit_u32le(pe, idata_vsize);
+    _emit_u32le(pe, idata_rva);
+    _emit_u32le(pe, 0x0200);
+    _emit_u32le(pe, 0x0200 + text_raw_sz);
+    _emit_u32le(pe, 0); _emit_u32le(pe, 0); _emit_u16le(pe, 0); _emit_u16le(pe, 0);
+    _emit_u32le(pe, 0xC0000040); // INITIALIZED_DATA | MEM_READ | MEM_WRITE
+
+    _pad_to(pe, 512);
+    _emit_bytes(pe, code);
+    _pad_to(pe, 512 + text_raw_sz);
+    _emit_bytes(pe, idata);
+    _pad_to(pe, 512 + text_raw_sz + 512);
+    return pe;
+}
+
+// ============================================================================
+// 3. 32-BIT RISC-V `RV32IM` COMPILER -> LINUX/BAREMETAL ELF32 (`rv32`)
+// ============================================================================
+
+fn _rv_r(f7, rs2, rs1, f3, rd, op) {
+    return op + rd * 128 + f3 * 4096 + rs1 * 32768 + rs2 * 1048576 + f7 * 33554432;
+}
+fn _rv_i(imm12, rs1, f3, rd, op) {
+    let u = _u32(imm12) % 4096;
+    return op + rd * 128 + f3 * 4096 + rs1 * 32768 + u * 1048576;
+}
+fn _rv_s(imm12, rs2, rs1, f3, op) {
+    let u = _u32(imm12) % 4096;
+    let lo = u % 32;
+    let hi = num_floor(u / 32);
+    return op + lo * 128 + f3 * 4096 + rs1 * 32768 + rs2 * 1048576 + hi * 33554432;
+}
+fn _rv_b(off, rs2, rs1, f3, op) {
+    let u = _u32(off) % 8192;
+    let b11 = num_floor(u / 2048) % 2;
+    let b1_4 = num_floor(u / 2) % 16;
+    let b5_10 = num_floor(u / 32) % 64;
+    let b12 = num_floor(u / 4096) % 2;
+    return op + (b11 + b1_4 * 2) * 128 + f3 * 4096 + rs1 * 32768 + rs2 * 1048576 + (b5_10 + b12 * 64) * 33554432;
+}
+fn _rv_u(imm20, rd, op) {
+    let u = _u32(imm20) % 1048576;
+    return op + rd * 128 + u * 4096;
+}
+fn _rv_j(off, rd, op) {
+    let u = _u32(off) % 2097152;
+    let b20 = num_floor(u / 1048576) % 2;
+    let b1_10 = num_floor(u / 2) % 1024;
+    let b11 = num_floor(u / 2048) % 2;
+    let b12_19 = num_floor(u / 4096) % 256;
+    let enc = b12_19 + b11 * 256 + b1_10 * 512 + b20 * 524288;
+    return op + rd * 128 + enc * 4096;
+}
+fn _rv_li(code, rd, val) {
+    let s = _i32(val);
+    if s >= -2048 and s <= 2047 {
+        _emit_u32le(code, _rv_i(s, 0, 0, rd, 0x13)); // addi rd, x0, imm
+    } else {
+        let u = _u32(s);
+        let lo = u % 4096;
+        let hi = num_floor((u + (if lo >= 2048 { 4096 } else { 0 })) / 4096) % 1048576;
+        let slo = if lo >= 2048 { lo - 4096 } else { lo };
+        _emit_u32le(code, _rv_u(hi, rd, 0x37));       // lui rd, hi
+        _emit_u32le(code, _rv_i(slo, rd, 0, rd, 0x13)); // addi rd, rd, slo
+    }
+}
+
+fn _rv_emit_print_i32(code) {
+    // Prints signed 32-bit integer in a0 (x10) + '\n' via Linux RV32 ecall a7=64
+    let fn_off = len(code);
+    // addi sp, sp, -32; sw ra, 28(sp); sw s0, 24(sp)
+    _emit_u32le(code, _rv_i(-32, 2, 0, 2, 0x13));
+    _emit_u32le(code, _rv_s(28, 1, 2, 2, 0x23));
+    _emit_u32le(code, _rv_s(24, 8, 2, 2, 0x23));
+    // t0(x5) = a0; t1(x6) = sp + 20 (end of buf); sb '\n'(10) at 0(t1); t2(x7) = 0 (neg flag)
+    _emit_u32le(code, _rv_i(0, 10, 0, 5, 0x13));
+    _emit_u32le(code, _rv_i(20, 2, 0, 6, 0x13));
+    _emit_u32le(code, _rv_i(10, 0, 0, 12, 0x13));
+    _emit_u32le(code, _rv_s(0, 12, 6, 0, 0x23));
+    _emit_u32le(code, _rv_i(0, 0, 0, 7, 0x13));
+    // bge t0, x0, +12; sub t0, x0, t0; addi t2, x0, 1
+    _emit_u32le(code, _rv_b(12, 0, 5, 5, 0x63));
+    _emit_u32le(code, _rv_r(0x20, 5, 0, 0, 5, 0x33));
+    _emit_u32le(code, _rv_i(1, 0, 0, 7, 0x13));
+    // t3(x28) = 10
+    _emit_u32le(code, _rv_i(10, 0, 0, 28, 0x13));
+    let loop_at = len(code);
+    // remu t4(x29), t0, t3; divu t0, t0, t3; addi t4, t4, 48; addi t1, t1, -1; sb t4, 0(t1); bne t0, x0, loop_at
+    _emit_u32le(code, _rv_r(0x01, 28, 5, 7, 29, 0x33));
+    _emit_u32le(code, _rv_r(0x01, 28, 5, 5, 5, 0x33));
+    _emit_u32le(code, _rv_i(48, 29, 0, 29, 0x13));
+    _emit_u32le(code, _rv_i(-1, 6, 0, 6, 0x13));
+    _emit_u32le(code, _rv_s(0, 29, 6, 0, 0x23));
+    _emit_u32le(code, _rv_b(loop_at - len(code), 0, 5, 1, 0x63));
+    // beq t2, x0, +16; addi t1, t1, -1; addi t4, x0, 45; sb t4, 0(t1)
+    _emit_u32le(code, _rv_b(16, 0, 7, 0, 0x63));
+    _emit_u32le(code, _rv_i(-1, 6, 0, 6, 0x13));
+    _emit_u32le(code, _rv_i(45, 0, 0, 29, 0x13));
+    _emit_u32le(code, _rv_s(0, 29, 6, 0, 0x23));
+    // a0=1, a1=t1, a2=(sp+21)-t1, a7=64, ecall
+    _emit_u32le(code, _rv_i(21, 2, 0, 12, 0x13));
+    _emit_u32le(code, _rv_r(0x20, 6, 12, 0, 12, 0x33));
+    _emit_u32le(code, _rv_i(0, 6, 0, 11, 0x13));
+    _emit_u32le(code, _rv_i(1, 0, 0, 10, 0x13));
+    _emit_u32le(code, _rv_i(64, 0, 0, 17, 0x13));
+    _emit_u32le(code, 0x00000073); // ecall
+    // lw ra, 28(sp); lw s0, 24(sp); addi sp, sp, 32; jalr x0, 0(ra)
+    _emit_u32le(code, _rv_i(28, 2, 2, 1, 0x03));
+    _emit_u32le(code, _rv_i(24, 2, 2, 8, 0x03));
+    _emit_u32le(code, _rv_i(32, 2, 0, 2, 0x13));
+    _emit_u32le(code, _rv_i(0, 1, 0, 0, 0x67));
+    return fn_off;
+}
+
+fn _rv_emit_expr(ctx, env, e) {
+    let code = ctx.code;
+    let k = e.kind;
+    if k == "number" { _rv_li(code, 10, _parse_int_lit("rv32", e.value)); return nil; }
+    if k == "bool" { _rv_li(code, 10, if e.value { 1 } else { 0 }); return nil; }
+    if k == "ident" {
+        if map_has(env.slots, e.name) {
+            let off = 0 - 12 - env.slots[e.name] * 4;
+            _emit_u32le(code, _rv_i(off, 8, 2, 10, 0x03)); // lw a0, off(s0)
+            return nil;
+        }
+        _fail("rv32", "undefined variable: " + e.name);
+    }
+    if k == "unary" {
+        let sub = if map_has(e, "operand") { e.operand } else { e.expr };
+        _rv_emit_expr(ctx, env, sub);
+        if e.op == "-" { _emit_u32le(code, _rv_r(0x20, 10, 0, 0, 10, 0x33)); }
+        elif e.op == "not" or e.op == "!" { _emit_u32le(code, _rv_i(1, 10, 3, 10, 0x13)); } // sltiu a0, a0, 1
+        else { _fail("rv32", "unsupported unary: " + e.op); }
+        return nil;
+    }
+    if k == "binary" {
+        _rv_emit_expr(ctx, env, e.left);
+        // push a0 onto sp
+        _emit_u32le(code, _rv_i(-4, 2, 0, 2, 0x13));
+        _emit_u32le(code, _rv_s(0, 10, 2, 2, 0x23));
+        _rv_emit_expr(ctx, env, e.right);
+        // mov t1(x6)=a0(right), pop t0(x5)=left
+        _emit_u32le(code, _rv_i(0, 10, 0, 6, 0x13));
+        _emit_u32le(code, _rv_i(0, 2, 2, 5, 0x03));
+        _emit_u32le(code, _rv_i(4, 2, 0, 2, 0x13));
+        let op = e.op;
+        if op == "+" { _emit_u32le(code, _rv_r(0x00, 6, 5, 0, 10, 0x33)); }
+        elif op == "-" { _emit_u32le(code, _rv_r(0x20, 6, 5, 0, 10, 0x33)); }
+        elif op == "*" { _emit_u32le(code, _rv_r(0x01, 6, 5, 0, 10, 0x33)); }
+        elif op == "/" { _emit_u32le(code, _rv_r(0x01, 6, 5, 4, 10, 0x33)); }
+        elif op == "%" { _emit_u32le(code, _rv_r(0x01, 6, 5, 6, 10, 0x33)); }
+        elif op == "<" { _emit_u32le(code, _rv_r(0x00, 6, 5, 2, 10, 0x33)); }
+        elif op == ">" { _emit_u32le(code, _rv_r(0x00, 5, 6, 2, 10, 0x33)); }
+        elif op == "<=" { _emit_u32le(code, _rv_r(0x00, 5, 6, 2, 10, 0x33)); _emit_u32le(code, _rv_i(1, 10, 4, 10, 0x13)); }
+        elif op == ">=" { _emit_u32le(code, _rv_r(0x00, 6, 5, 2, 10, 0x33)); _emit_u32le(code, _rv_i(1, 10, 4, 10, 0x13)); }
+        elif op == "==" { _emit_u32le(code, _rv_r(0x20, 6, 5, 0, 10, 0x33)); _emit_u32le(code, _rv_i(1, 10, 3, 10, 0x13)); }
+        elif op == "!=" { _emit_u32le(code, _rv_r(0x20, 6, 5, 0, 10, 0x33)); _emit_u32le(code, _rv_r(0x00, 10, 0, 3, 10, 0x33)); }
+        elif op == "and" or op == "&&" {
+            _emit_u32le(code, _rv_r(0x00, 5, 0, 3, 5, 0x33));
+            _emit_u32le(code, _rv_r(0x00, 6, 0, 3, 6, 0x33));
+            _emit_u32le(code, _rv_r(0x00, 6, 5, 7, 10, 0x33));
+        } elif op == "or" or op == "||" {
+            _emit_u32le(code, _rv_r(0x00, 6, 5, 6, 10, 0x33));
+            _emit_u32le(code, _rv_r(0x00, 10, 0, 3, 10, 0x33));
+        } else { _fail("rv32", "unsupported binary op: " + op); }
+        return nil;
+    }
+    if k == "call" {
+        let fname = if is_string(e.func) { e.func } else { e.func.name };
+        let args = e.args;
+        if fname == "print" and len(args) == 1 {
+            _rv_emit_print(ctx, env, args[0]);
+            _rv_li(code, 10, 0);
+            return nil;
+        }
+        if not map_has(ctx.fn_arity, fname) or len(args) > 8 { _fail("rv32", "invalid call: " + fname); }
+        let ai = 0;
+        while ai < len(args) {
+            _rv_emit_expr(ctx, env, args[ai]);
+            _emit_u32le(code, _rv_i(-4, 2, 0, 2, 0x13));
+            _emit_u32le(code, _rv_s(0, 10, 2, 2, 0x23));
+            ai = ai + 1;
+        }
+        let bi = len(args) - 1;
+        while bi >= 0 {
+            _emit_u32le(code, _rv_i(0, 2, 2, 10 + bi, 0x03));
+            _emit_u32le(code, _rv_i(4, 2, 0, 2, 0x13));
+            bi = bi - 1;
+        }
+        let call_pos = len(code);
+        _emit_u32le(code, 0);
+        push(ctx.jal_patches, map{at: call_pos, rd: 1, name: fname});
+        return nil;
+    }
+    if k == "assign" {
+        if not map_has(env.slots, e.name) { _fail("rv32", "undeclared variable: " + e.name); }
+        _rv_emit_expr(ctx, env, e.value);
+        let off = 0 - 12 - env.slots[e.name] * 4;
+        _emit_u32le(code, _rv_s(off, 10, 8, 2, 0x23));
+        return nil;
+    }
+    _fail("rv32", "unsupported expr: " + str(k));
+}
+
+fn _rv_emit_print(ctx, env, val_expr) {
+    let code = ctx.code;
+    if val_expr.kind == "string" {
+        let bytes = str_to_bytes(val_expr.value + "\n");
+        _rv_li(code, 10, 1);
+        let li_pos = len(code);
+        _emit_u32le(code, 0); _emit_u32le(code, 0); // lui+addi placeholder for a1(x11)
+        push(ctx.str_patches, map{at: li_pos, bytes: bytes});
+        _rv_li(code, 12, len(bytes));
+        _rv_li(code, 17, 64);
+        _emit_u32le(code, 0x00000073);
+        return nil;
+    }
+    _rv_emit_expr(ctx, env, val_expr);
+    let call_pos = len(code);
+    _emit_u32le(code, 0);
+    push(ctx.jal_patches, map{at: call_pos, rd: 1, name: "@print_i32"});
+}
+
+fn _rv_emit_stmts(ctx, env, stmts) {
+    let code = ctx.code;
+    for st in stmts {
+        let k = st.kind;
+        if k == "let" or k == "const" or k == "assign" {
+            if not map_has(env.slots, st.name) { _fail("rv32", "undeclared variable: " + st.name); }
+            _rv_emit_expr(ctx, env, st.value);
+            let off = 0 - 12 - env.slots[st.name] * 4;
+            _emit_u32le(code, _rv_s(off, 10, 8, 2, 0x23));
+        } elif k == "print" {
+            _rv_emit_print(ctx, env, st.value);
+        } elif k == "expr_stmt" {
+            _rv_emit_expr(ctx, env, st.expr);
+        } elif k == "return" {
+            if st.value != nil { _rv_emit_expr(ctx, env, st.value); } else { _rv_li(code, 10, 0); }
+            _emit_u32le(code, _rv_i(-4, 8, 2, 1, 0x03));
+            _emit_u32le(code, _rv_i(0, 8, 0, 2, 0x13));
+            _emit_u32le(code, _rv_i(-8, 2, 2, 8, 0x03));
+            _emit_u32le(code, _rv_i(0, 1, 0, 0, 0x67));
+        } elif k == "if" {
+            let end_jals = [];
+            _rv_emit_expr(ctx, env, st.cond);
+            // bne a0, x0, +8; jal x0, next
+            _emit_u32le(code, _rv_b(8, 0, 10, 1, 0x63));
+            let p_next = len(code); _emit_u32le(code, 0);
+            _rv_emit_stmts(ctx, env, _stmts_of(st.then));
+            push(end_jals, len(code)); _emit_u32le(code, 0);
+            _patch_u32le(code, p_next, _rv_j(len(code) - p_next, 0, 0x6F));
+            if map_has(st, "elifs") and is_array(st.elifs) {
+                for el in st.elifs {
+                    _rv_emit_expr(ctx, env, el.cond);
+                    _emit_u32le(code, _rv_b(8, 0, 10, 1, 0x63));
+                    let p_el = len(code); _emit_u32le(code, 0);
+                    _rv_emit_stmts(ctx, env, _stmts_of(el.body));
+                    push(end_jals, len(code)); _emit_u32le(code, 0);
+                    _patch_u32le(code, p_el, _rv_j(len(code) - p_el, 0, 0x6F));
+                }
+            }
+            if map_has(st, "else") and st["else"] != nil { _rv_emit_stmts(ctx, env, _stmts_of(st["else"])); }
+            for ej in end_jals { _patch_u32le(code, ej, _rv_j(len(code) - ej, 0, 0x6F)); }
+        } elif k == "while" {
+            let top = len(code);
+            _rv_emit_expr(ctx, env, st.cond);
+            _emit_u32le(code, _rv_b(8, 0, 10, 1, 0x63));
+            let p_out = len(code); _emit_u32le(code, 0);
+            _rv_emit_stmts(ctx, env, _stmts_of(st.body));
+            _emit_u32le(code, _rv_j(top - len(code), 0, 0x6F));
+            _patch_u32le(code, p_out, _rv_j(len(code) - p_out, 0, 0x6F));
+        } elif k == "block" {
+            _rv_emit_stmts(ctx, env, _stmts_of(st));
+        } elif k != "fn" { _fail("rv32", "unsupported stmt: " + str(k)); }
+    }
+}
+
+fn compile_elf32_rv32(source) {
+    let base_va = 0x00010000;
+    let hdr_sz = 84;
+    let text_va = base_va + hdr_sz;
+    let ast = _SOURCE.parse_source(source);
+    let stmts = _stmts_of(ast);
+    let fns = []; let top_stmts = []; let fn_arity = map{};
+    for st in stmts {
+        if st.kind == "fn" { fn_arity[st.name] = len(st.params); push(fns, st); }
+        else { push(top_stmts, st); }
+    }
+    let ctx = map{code: [], fn_arity: fn_arity, fn_offsets: map{}, jal_patches: [], str_patches: []};
+    // _start: initialize sp if 0 (for baremetal/emulator), jal ra, @top, li a7, 93, ecall
+    _emit_u32le(ctx.code, _rv_b(12, 0, 2, 1, 0x63)); // bne sp, x0, +12
+    _rv_li(ctx.code, 2, 0x0001FFF0);
+    let p_top = len(ctx.code); _emit_u32le(ctx.code, 0);
+    push(ctx.jal_patches, map{at: p_top, rd: 1, name: "@top"});
+    _rv_li(ctx.code, 17, 93);
+    _emit_u32le(ctx.code, 0x00000073);
+
+    ctx.fn_offsets["@print_i32"] = _rv_emit_print_i32(ctx.code);
+
+    for f in fns {
+        ctx.fn_offsets[f.name] = len(ctx.code);
+        let slots = map{}; let sbox = [0];
+        let pi = 0;
+        while pi < len(f.params) { slots[_pname(f.params[pi])] = sbox[0]; sbox[0] = sbox[0] + 1; pi = pi + 1; }
+        let fbody = _stmts_of(f.body);
+        _collect_locals(fbody, slots, sbox);
+        let frame_sz = 16 + num_floor((sbox[0] * 4 + 15) / 16) * 16;
+        // Prologue: sw ra, -4(sp); sw s0, -8(sp); addi s0, sp, 0; addi sp, sp, -frame_sz
+        _emit_u32le(ctx.code, _rv_s(-4, 1, 2, 2, 0x23));
+        _emit_u32le(ctx.code, _rv_s(-8, 8, 2, 2, 0x23));
+        _emit_u32le(ctx.code, _rv_i(0, 2, 0, 8, 0x13));
+        _emit_u32le(ctx.code, _rv_i(0 - frame_sz, 2, 0, 2, 0x13));
+        let spi = 0;
+        while spi < len(f.params) {
+            _emit_u32le(ctx.code, _rv_s(0 - 12 - spi * 4, 10 + spi, 8, 2, 0x23));
+            spi = spi + 1;
+        }
+        _rv_emit_stmts(ctx, map{slots: slots}, fbody);
+        _rv_li(ctx.code, 10, 0);
+        _emit_u32le(ctx.code, _rv_i(-4, 8, 2, 1, 0x03));
+        _emit_u32le(ctx.code, _rv_i(0, 8, 0, 2, 0x13));
+        _emit_u32le(ctx.code, _rv_i(-8, 2, 2, 8, 0x03));
+        _emit_u32le(ctx.code, _rv_i(0, 1, 0, 0, 0x67));
+    }
+
+    ctx.fn_offsets["@top"] = len(ctx.code);
+    let tslots = map{}; let tbox = [0];
+    _collect_locals(top_stmts, tslots, tbox);
+    let tframe = 16 + num_floor((tbox[0] * 4 + 15) / 16) * 16;
+    _emit_u32le(ctx.code, _rv_s(-4, 1, 2, 2, 0x23));
+    _emit_u32le(ctx.code, _rv_s(-8, 8, 2, 2, 0x23));
+    _emit_u32le(ctx.code, _rv_i(0, 2, 0, 8, 0x13));
+    _emit_u32le(ctx.code, _rv_i(0 - tframe, 2, 0, 2, 0x13));
+    _rv_emit_stmts(ctx, map{slots: tslots}, top_stmts);
+    if map_has(fn_arity, "main") and fn_arity["main"] == 0 and len(top_stmts) == 0 {
+        let pm = len(ctx.code); _emit_u32le(ctx.code, 0);
+        push(ctx.jal_patches, map{at: pm, rd: 1, name: "main"});
+    } else { _rv_li(ctx.code, 10, 0); }
+    _emit_u32le(ctx.code, _rv_i(-4, 8, 2, 1, 0x03));
+    _emit_u32le(ctx.code, _rv_i(0, 8, 0, 2, 0x13));
+    _emit_u32le(ctx.code, _rv_i(-8, 2, 2, 8, 0x03));
+    _emit_u32le(ctx.code, _rv_i(0, 1, 0, 0, 0x67));
+
+    for jp in ctx.jal_patches {
+        let dst = ctx.fn_offsets[jp.name];
+        _patch_u32le(ctx.code, jp.at, _rv_j(dst - jp.at, jp.rd, 0x6F));
+    }
+    for sp in ctx.str_patches {
+        let sva = text_va + len(ctx.code);
+        let lo = sva % 4096;
+        let hi = num_floor((sva + (if lo >= 2048 { 4096 } else { 0 })) / 4096) % 1048576;
+        let slo = if lo >= 2048 { lo - 4096 } else { lo };
+        _patch_u32le(ctx.code, sp.at, _rv_u(hi, 11, 0x37));
+        _patch_u32le(ctx.code, sp.at + 4, _rv_i(slo, 11, 0, 11, 0x13));
+        _emit_bytes(ctx.code, sp.bytes);
+        _pad_to(ctx.code, 4);
+    }
+
+    let total_sz = hdr_sz + len(ctx.code);
+    let elf = [];
+    _emit4(elf, 0x7F, 0x45, 0x4C, 0x46);
+    _emit4(elf, 1, 1, 1, 0);
+    let z = 0; while z < 8 { _emit1(elf, 0); z = z + 1; }
+    _emit_u16le(elf, 2); _emit_u16le(elf, 243); // EM_RISCV = 243
+    _emit_u32le(elf, 1); _emit_u32le(elf, text_va);
+    _emit_u32le(elf, 52); _emit_u32le(elf, 0); _emit_u32le(elf, 0);
+    _emit_u16le(elf, 52); _emit_u16le(elf, 32); _emit_u16le(elf, 1);
+    _emit_u16le(elf, 0); _emit_u16le(elf, 0); _emit_u16le(elf, 0);
+    _emit_u32le(elf, 1); _emit_u32le(elf, 0);
+    _emit_u32le(elf, base_va); _emit_u32le(elf, base_va);
+    _emit_u32le(elf, total_sz); _emit_u32le(elf, total_sz + 0x10000);
+    _emit_u32le(elf, 7); _emit_u32le(elf, 0x1000);
+    _emit_bytes(elf, ctx.code);
+    return elf;
+}
+
+// ============================================================================
+// 4. 16-BIT REAL-MODE 8086 MS-DOS / FREEDOS `.COM` (`ORG 0x0100`, `--target dos16`)
+// ============================================================================
+
+fn _dos16_emit_print_i16(code) {
+    let fn_off = len(code);
+    // Prints signed 16-bit AX + '\n' via INT 21h AH=02h
+    // push bp; mov bp, sp; push bx; push cx; push dx
+    _emit3(code, 0x55, 0x89, 0xE5);
+    _emit3(code, 0x53, 0x51, 0x52);
+    // test ax, ax; jns +10; push ax; mov dl, '-'; mov ah, 2; int 21h; pop ax; neg ax
+    _emit2(code, 0x85, 0xC0);
+    _emit2(code, 0x79, 0x0A);
+    _emit1(code, 0x50);
+    _emit2(code, 0xB2, 0x2D);
+    _emit2(code, 0xB4, 0x02);
+    _emit2(code, 0xCD, 0x21);
+    _emit3(code, 0x58, 0xF7, 0xD8);
+    // xor cx, cx; mov bx, 10
+    _emit2(code, 0x31, 0xC9);
+    _emit1(code, 0xBB); _emit_u16le(code, 10);
+    let dloop = len(code);
+    // xor dx, dx; div bx; add dl, '0'; push dx; inc cx; test ax, ax; jnz dloop
+    _emit4(code, 0x31, 0xD2, 0xF7, 0xF3);
+    _emit3(code, 0x80, 0xC2, 0x30);
+    _emit2(code, 0x52, 0x41);
+    _emit2(code, 0x85, 0xC0);
+    _emit2(code, 0x75, dloop - (len(code) + 2));
+    let ploop = len(code);
+    // pop dx; mov ah, 2; int 21h; dec cx; jnz ploop
+    _emit1(code, 0x5A);
+    _emit4(code, 0xB4, 0x02, 0xCD, 0x21);
+    _emit1(code, 0x49);
+    _emit2(code, 0x75, ploop - (len(code) + 2));
+    // mov dl, 10; mov ah, 2; int 21h
+    _emit2(code, 0xB2, 0x0A);
+    _emit4(code, 0xB4, 0x02, 0xCD, 0x21);
+    // pop dx; pop cx; pop bx; pop bp; ret
+    _emit4(code, 0x5A, 0x59, 0x5B, 0x5D);
+    _emit1(code, 0xC3);
+    return fn_off;
+}
+
+fn _dos16_emit_expr(ctx, env, e) {
+    let code = ctx.code;
+    let k = e.kind;
+    if k == "number" { _emit1(code, 0xB8); _emit_u16le(code, _parse_int_lit("dos16", e.value)); return nil; }
+    if k == "bool" { _emit1(code, 0xB8); _emit_u16le(code, if e.value { 1 } else { 0 }); return nil; }
+    if k == "ident" {
+        if map_has(env.params, e.name) {
+            _emit2(code, 0x8B, 0x86); _emit_u16le(code, 4 + env.params[e.name] * 2); return nil;
+        }
+        if map_has(env.locals, e.name) {
+            _emit2(code, 0x8B, 0x86); _emit_u16le(code, 0 - 2 - env.locals[e.name] * 2); return nil;
+        }
+        _fail("dos16", "undefined variable: " + e.name);
+    }
+    if k == "unary" {
+        let sub = if map_has(e, "operand") { e.operand } else { e.expr };
+        _dos16_emit_expr(ctx, env, sub);
+        if e.op == "-" { _emit2(code, 0xF7, 0xD8); }
+        elif e.op == "not" or e.op == "!" {
+            _emit3(code, 0x3D, 0x00, 0x00); // cmp ax, 0
+            _emit3(code, 0xB8, 0x01, 0x00); // mov ax, 1
+            _emit2(code, 0x74, 0x02);       // je +2
+            _emit2(code, 0x31, 0xC0);       // xor ax, ax
+        } else { _fail("dos16", "unsupported unary: " + e.op); }
+        return nil;
+    }
+    if k == "binary" {
+        _dos16_emit_expr(ctx, env, e.left);
+        _emit1(code, 0x50);
+        _dos16_emit_expr(ctx, env, e.right);
+        _emit3(code, 0x89, 0xC1, 0x58); // mov cx, ax; pop ax
+        let op = e.op;
+        if op == "+" { _emit2(code, 0x01, 0xC8); }
+        elif op == "-" { _emit2(code, 0x29, 0xC8); }
+        elif op == "*" { _emit2(code, 0xF7, 0xE9); }
+        elif op == "/" { _emit3(code, 0x99, 0xF7, 0xF9); }
+        elif op == "%" { _emit3(code, 0x99, 0xF7, 0xF9); _emit2(code, 0x89, 0xD0); }
+        elif op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=" {
+            _emit2(code, 0x39, 0xC8);
+            _emit3(code, 0xB8, 0x01, 0x00);
+            let jcc = if op == "==" { 0x74 } elif op == "!=" { 0x75 } elif op == "<" { 0x7C }
+                      elif op == "<=" { 0x7E } elif op == ">" { 0x7F } else { 0x7D };
+            _emit2(code, jcc, 0x02);
+            _emit2(code, 0x31, 0xC0);
+        } elif op == "and" or op == "&&" {
+            _emit3(code, 0x3D, 0x00, 0x00); _emit2(code, 0x74, 0x07);
+            _emit2(code, 0x85, 0xC9); _emit2(code, 0x74, 0x03);
+            _emit3(code, 0xB8, 0x01, 0x00); _emit2(code, 0xEB, 0x02);
+            _emit2(code, 0x31, 0xC0);
+        } elif op == "or" or op == "||" {
+            _emit2(code, 0x09, 0xC8); _emit3(code, 0xB8, 0x01, 0x00);
+            _emit2(code, 0x75, 0x02); _emit2(code, 0x31, 0xC0);
+        } else { _fail("dos16", "unsupported op: " + op); }
+        return nil;
+    }
+    if k == "call" {
+        let fname = if is_string(e.func) { e.func } else { e.func.name };
+        let args = e.args;
+        if fname == "print" and len(args) == 1 {
+            _dos16_emit_print(ctx, env, args[0]);
+            _emit3(code, 0x31, 0xC0, 0x90);
+            return nil;
+        }
+        if not map_has(ctx.fn_arity, fname) { _fail("dos16", "unknown fn: " + fname); }
+        let ai = len(args) - 1;
+        while ai >= 0 { _dos16_emit_expr(ctx, env, args[ai]); _emit1(code, 0x50); ai = ai - 1; }
+        _emit1(code, 0xE8); let pat = len(code); _emit_u16le(code, 0);
+        push(ctx.call_patches, map{at: pat, name: fname});
+        if len(args) > 0 { _emit2(code, 0x81, 0xC4); _emit_u16le(code, len(args) * 2); }
+        return nil;
+    }
+    if k == "assign" {
+        _dos16_emit_expr(ctx, env, e.value);
+        if map_has(env.locals, e.name) {
+            _emit2(code, 0x89, 0x86); _emit_u16le(code, 0 - 2 - env.locals[e.name] * 2);
+        } elif map_has(env.params, e.name) {
+            _emit2(code, 0x89, 0x86); _emit_u16le(code, 4 + env.params[e.name] * 2);
+        } else { _fail("dos16", "undeclared: " + e.name); }
+        return nil;
+    }
+    _fail("dos16", "unsupported expr: " + str(k));
+}
+
+fn _dos16_emit_print(ctx, env, val_expr) {
+    let code = ctx.code;
+    if val_expr.kind == "string" {
+        let bytes = str_to_bytes(val_expr.value + "\n");
+        // mov si, imm16; mov cx, len; loop: lodsb; mov dl, al; mov ah, 2; int 21h; dec cx; jnz loop
+        _emit1(code, 0xBE); let spat = len(code); _emit_u16le(code, 0);
+        push(ctx.str_patches, map{at: spat, bytes: bytes});
+        _emit1(code, 0xB9); _emit_u16le(code, len(bytes));
+        let sloop = len(code);
+        _emit3(code, 0xAC, 0x88, 0xC2);
+        _emit4(code, 0xB4, 0x02, 0xCD, 0x21);
+        _emit1(code, 0x49);
+        _emit2(code, 0x75, sloop - (len(code) + 2));
+        return nil;
+    }
+    _dos16_emit_expr(ctx, env, val_expr);
+    _emit1(code, 0xE8); let pat = len(code); _emit_u16le(code, 0);
+    push(ctx.call_patches, map{at: pat, name: "@print_i16"});
+}
+
+fn _dos16_emit_stmts(ctx, env, stmts) {
+    let code = ctx.code;
+    for st in stmts {
+        let k = st.kind;
+        if k == "let" or k == "const" or k == "assign" {
+            _dos16_emit_expr(ctx, env, st.value);
+            if map_has(env.locals, st.name) {
+                _emit2(code, 0x89, 0x86); _emit_u16le(code, 0 - 2 - env.locals[st.name] * 2);
+            } elif map_has(env.params, st.name) {
+                _emit2(code, 0x89, 0x86); _emit_u16le(code, 4 + env.params[st.name] * 2);
+            } else { _fail("dos16", "undeclared: " + st.name); }
+        } elif k == "print" { _dos16_emit_print(ctx, env, st.value); }
+        elif k == "expr_stmt" { _dos16_emit_expr(ctx, env, st.expr); }
+        elif k == "return" {
+            if st.value != nil { _dos16_emit_expr(ctx, env, st.value); } else { _emit2(code, 0x31, 0xC0); }
+            _emit4(code, 0x89, 0xEC, 0x5D, 0xC3);
+        } elif k == "if" {
+            let ends = [];
+            _dos16_emit_expr(ctx, env, st.cond);
+            _emit3(code, 0x3D, 0x00, 0x00); _emit2(code, 0x75, 0x03);
+            _emit1(code, 0xE9); let pn = len(code); _emit_u16le(code, 0);
+            _dos16_emit_stmts(ctx, env, _stmts_of(st.then));
+            _emit1(code, 0xE9); push(ends, len(code)); _emit_u16le(code, 0);
+            _patch_u16le(code, pn, len(code) - (pn + 2));
+            if map_has(st, "elifs") and is_array(st.elifs) {
+                for el in st.elifs {
+                    _dos16_emit_expr(ctx, env, el.cond);
+                    _emit3(code, 0x3D, 0x00, 0x00); _emit2(code, 0x75, 0x03);
+                    _emit1(code, 0xE9); let pel = len(code); _emit_u16le(code, 0);
+                    _dos16_emit_stmts(ctx, env, _stmts_of(el.body));
+                    _emit1(code, 0xE9); push(ends, len(code)); _emit_u16le(code, 0);
+                    _patch_u16le(code, pel, len(code) - (pel + 2));
+                }
+            }
+            if map_has(st, "else") and st["else"] != nil { _dos16_emit_stmts(ctx, env, _stmts_of(st["else"])); }
+            for ep in ends { _patch_u16le(code, ep, len(code) - (ep + 2)); }
+        } elif k == "while" {
+            let top = len(code);
+            _dos16_emit_expr(ctx, env, st.cond);
+            _emit3(code, 0x3D, 0x00, 0x00); _emit2(code, 0x75, 0x03);
+            _emit1(code, 0xE9); let po = len(code); _emit_u16le(code, 0);
+            _dos16_emit_stmts(ctx, env, _stmts_of(st.body));
+            _emit1(code, 0xE9); _emit_u16le(code, top - (len(code) + 2));
+            _patch_u16le(code, po, len(code) - (po + 2));
+        } elif k == "block" { _dos16_emit_stmts(ctx, env, _stmts_of(st)); }
+    }
+}
+
+fn compile_dos16_com(source) {
+    let ast = _SOURCE.parse_source(source);
+    let stmts = _stmts_of(ast);
+    let fns = []; let top_stmts = []; let fn_arity = map{};
+    for st in stmts {
+        if st.kind == "fn" { fn_arity[st.name] = len(st.params); push(fns, st); }
+        else { push(top_stmts, st); }
+    }
+    let ctx = map{code: [], fn_arity: fn_arity, fn_offsets: map{}, call_patches: [], str_patches: []};
+    // ORG 0x0100 entry: call @top; mov ah, 4Ch; int 21h
+    _emit1(ctx.code, 0xE8); let ptop = len(ctx.code); _emit_u16le(ctx.code, 0);
+    push(ctx.call_patches, map{at: ptop, name: "@top"});
+    _emit4(ctx.code, 0xB4, 0x4C, 0xCD, 0x21);
+
+    ctx.fn_offsets["@print_i16"] = _dos16_emit_print_i16(ctx.code);
+
+    for f in fns {
+        ctx.fn_offsets[f.name] = len(ctx.code);
+        let pmap = map{}; let pi = 0;
+        while pi < len(f.params) { pmap[_pname(f.params[pi])] = pi; pi = pi + 1; }
+        let lmap = map{}; let lbox = [0];
+        let fbody = _stmts_of(f.body);
+        _collect_locals(fbody, lmap, lbox);
+        _emit3(ctx.code, 0x55, 0x89, 0xE5);
+        if lbox[0] > 0 { _emit2(ctx.code, 0x81, 0xEC); _emit_u16le(ctx.code, lbox[0] * 2); }
+        _dos16_emit_stmts(ctx, map{params: pmap, locals: lmap}, fbody);
+        _emit2(ctx.code, 0x31, 0xC0);
+        _emit4(ctx.code, 0x89, 0xEC, 0x5D, 0xC3);
+    }
+
+    ctx.fn_offsets["@top"] = len(ctx.code);
+    let tlocals = map{}; let tbox = [0];
+    _collect_locals(top_stmts, tlocals, tbox);
+    _emit3(ctx.code, 0x55, 0x89, 0xE5);
+    if tbox[0] > 0 { _emit2(ctx.code, 0x81, 0xEC); _emit_u16le(ctx.code, tbox[0] * 2); }
+    _dos16_emit_stmts(ctx, map{params: map{}, locals: tlocals}, top_stmts);
+    if map_has(fn_arity, "main") and fn_arity["main"] == 0 and len(top_stmts) == 0 {
+        _emit1(ctx.code, 0xE8); let pm = len(ctx.code); _emit_u16le(ctx.code, 0);
+        push(ctx.call_patches, map{at: pm, name: "main"});
+    } else { _emit2(ctx.code, 0x31, 0xC0); }
+    _emit4(ctx.code, 0x89, 0xEC, 0x5D, 0xC3);
+
+    for cp in ctx.call_patches { _patch_u16le(ctx.code, cp.at, ctx.fn_offsets[cp.name] - (cp.at + 2)); }
+    for sp in ctx.str_patches {
+        _patch_u16le(ctx.code, sp.at, 0x0100 + len(ctx.code));
+        _emit_bytes(ctx.code, sp.bytes);
+    }
+    return ctx.code;
+}
+
+// ============================================================================
+// 5. 8-BIT INTEL 8080 / Z80 CP/M-80 `.COM` (`ORG 0x0100`, `--target cpm80`)
+// ============================================================================
+// Uses genuine 8080 opcodes: HL (16-bit accumulator), DE, BC, static 16-bit
+// variable slots in high `.COM` BSS, software 16-bit multiply + unsigned/signed
+// print routine calling CP/M BDOS `CALL 0x0005` (C=2, E=char), and `JMP 0x0000`.
+
+fn _cpm_emit_runtime(code) {
+    let rt = map{};
+    // @mul16: HL = DE * HL (16-bit shift-add, pure 8080)
+    rt["@mul16"] = 0x0100 + len(code);
+    // MOV B, H (44); MOV C, L (4D); LXI H, 0 (21 00 00)
+    _emit2(code, 0x44, 0x4D);
+    _emit3(code, 0x21, 0x00, 0x00);
+    let mloop = 0x0100 + len(code);
+    // MOV A, B (78); ORA C (B1); RZ (C8)
+    _emit3(code, 0x78, 0xB1, 0xC8);
+    // MOV A, C (79); ANI 1 (E6 01); JZ skip_add
+    _emit3(code, 0x79, 0xE6, 0x01);
+    _emit1(code, 0xCA); let p_skip = len(code); _emit_u16le(code, 0);
+    // DAD D (19) -> HL += DE
+    _emit1(code, 0x19);
+    _patch_u16le(code, p_skip, 0x0100 + len(code));
+    // XCHG (EB); DAD H (29 -> DE <<= 1); XCHG (EB)
+    _emit3(code, 0xEB, 0x29, 0xEB);
+    // Right shift BC by 1: ORA A (B7 clears carry); MOV A, B (78); RAR (1F); MOV B, A (47); MOV A, C (79); RAR (1F); MOV C, A (4F)
+    _emit4(code, 0xB7, 0x78, 0x1F, 0x47);
+    _emit3(code, 0x79, 0x1F, 0x4F);
+    _emit1(code, 0xC3); _emit_u16le(code, mloop);
+
+    // @divmod16: Unsigned DE / HL -> HL = quotient, DE = remainder (16-bit restoring division)
+    rt["@divmod16"] = 0x0100 + len(code);
+    // BC = divisor(HL), HL = remainder(0), DE = dividend, A_cnt = 16
+    _emit2(code, 0x44, 0x4D);       // MOV B,H; MOV C,L
+    _emit3(code, 0x21, 0x00, 0x00); // LXI H, 0
+    _emit2(code, 0x06, 0x00);       // Note: keep B as divisor_hi! Push counter on stack instead!
+    // Re-load B=H_orig: let's rewrite cleanly with stack counter
+    code[len(code) - 2] = 0x00; code[len(code) - 1] = 0x00; // NOP NOP
+    // Use 16 iterations via stack: LXI H, 0; MVI A, 16
+    rt["@divmod16"] = 0x0100 + len(code);
+    _emit2(code, 0x44, 0x4D);       // BC = divisor
+    _emit3(code, 0x21, 0x00, 0x00); // HL = remainder = 0
+    _emit2(code, 0x3E, 16);         // A = 16
+    let dloop = 0x0100 + len(code);
+    _emit1(code, 0xF5);             // PUSH PSW (save loop count A)
+    // Shift DE left 1 bit into HL: XCHG; DAD H (DE<<=1, CY=msb); XCHG; MOV A,L; ADC A; MOV L,A; MOV A,H; ADC H (wait: DAD H + ACI!)
+    // Cleanest: HL = HL*2 + msb(DE), DE = DE*2:
+    _emit1(code, 0x29);             // DAD H (HL <<= 1)
+    _emit3(code, 0x7A, 0xE6, 0x80); // MOV A,D; ANI 0x80
+    _emit2(code, 0xCA, 0x00); let ps1 = len(code) - 1; _emit1(code, 0x00); // JZ no_bit
+    _emit1(code, 0x23);             // INX H
+    _patch_u16le(code, ps1, 0x0100 + len(code));
+    _emit3(code, 0xEB, 0x29, 0xEB); // DE <<= 1
+    // Compare HL >= BC: MOV A,L; SUB C; MOV A,H; SBB B; JC no_sub
+    _emit4(code, 0x7D, 0x91, 0x7C, 0x98);
+    _emit1(code, 0xDA); let ps2 = len(code); _emit_u16le(code, 0);
+    // HL -= BC; INX D (set quotient bit 0)
+    _emit3(code, 0x7D, 0x91, 0x6F); // L = L - C
+    _emit3(code, 0x7C, 0x98, 0x67); // H = H - B - borrow
+    _emit1(code, 0x13);             // INX D
+    _patch_u16le(code, ps2, 0x0100 + len(code));
+    _emit1(code, 0xF1);             // POP PSW
+    _emit1(code, 0x3D);             // DCR A
+    _emit1(code, 0xC2); _emit_u16le(code, dloop); // JNZ dloop
+    // Swap so HL = quotient, DE = remainder: XCHG (EB); RET (C9)
+    _emit2(code, 0xEB, 0xC9);
+
+    // @print_i16: prints signed 16-bit HL + '\n' via BDOS CALL 0x0005 (C=2, E=char)
+    rt["@print_i16"] = 0x0100 + len(code);
+    // Check sign bit of H: MOV A,H (7C); ORA A (B7); JP pos
+    _emit2(code, 0x7C, 0xB7);
+    _emit1(code, 0xF2); let p_pos = len(code); _emit_u16le(code, 0);
+    // Negative: PUSH H; MVI C, 2; MVI E, '-'; CALL 5; POP H; HL = -HL
+    _emit1(code, 0xE5);
+    _emit4(code, 0x0E, 0x02, 0x1E, 0x2D);
+    _emit3(code, 0xCD, 0x05, 0x00);
+    _emit1(code, 0xE1);
+    _emit3(code, 0x7D, 0x2F, 0x6F); // L = ~L
+    _emit3(code, 0x7C, 0x2F, 0x67); // H = ~H
+    _emit1(code, 0x23);             // INX H
+    _patch_u16le(code, p_pos, 0x0100 + len(code));
+    // Push sentinel 0 onto stack, then divide by 10 pushing digits
+    _emit3(code, 0x01, 0x00, 0x00); // LXI B, 0
+    _emit1(code, 0xC5);             // PUSH B (sentinel B=0)
+    let dig_loop = 0x0100 + len(code);
+    // XCHG (DE = val); LXI H, 10; CALL @divmod16 (HL=quot, DE=rem)
+    _emit1(code, 0xEB);
+    _emit3(code, 0x21, 0x0A, 0x00);
+    _emit1(code, 0xCD); _emit_u16le(code, rt["@divmod16"]);
+    // Digit = E + '0': MOV A, E (7B); ADI '0' (C6 30); MOV B, A (47); PUSH B (C5, B != 0!)
+    _emit4(code, 0x7B, 0xC6, 0x30, 0x47);
+    _emit1(code, 0xC5);
+    // If HL != 0, loop: MOV A, H; ORA L; JNZ dig_loop
+    _emit2(code, 0x7C, 0xB5);
+    _emit1(code, 0xC2); _emit_u16le(code, dig_loop);
+    let out_loop = 0x0100 + len(code);
+    // POP B; MOV A, B; ORA A; JZ done_digits; MOV E, A; MVI C, 2; CALL 5; JMP out_loop
+    _emit3(code, 0xC1, 0x78, 0xB7);
+    _emit1(code, 0xCA); let p_done = len(code); _emit_u16le(code, 0);
+    _emit3(code, 0x5F, 0x0E, 0x02);
+    _emit3(code, 0xCD, 0x05, 0x00);
+    _emit1(code, 0xC3); _emit_u16le(code, out_loop);
+    _patch_u16le(code, p_done, 0x0100 + len(code));
+    // Print '\n': MVI C, 2; MVI E, 10; CALL 5; RET
+    _emit4(code, 0x0E, 0x02, 0x1E, 0x0A);
+    _emit4(code, 0xCD, 0x05, 0x00, 0xC9);
+    return rt;
+}
+
+fn _cpm_var_slot(ctx, name) {
+    if not map_has(ctx.vars, name) {
+        ctx.vars[name] = ctx.var_count;
+        ctx.var_count = ctx.var_count + 1;
+    }
+    return ctx.vars[name];
+}
+
+fn _cpm_emit_expr(ctx, e) {
+    let code = ctx.code;
+    let k = e.kind;
+    if k == "number" { _emit1(code, 0x21); _emit_u16le(code, _parse_int_lit("cpm80", e.value)); return nil; }
+    if k == "bool" { _emit1(code, 0x21); _emit_u16le(code, if e.value { 1 } else { 0 }); return nil; }
+    if k == "ident" {
+        let slot = _cpm_var_slot(ctx, e.name);
+        _emit1(code, 0x2A); // LHLD addr
+        push(ctx.var_patches, map{at: len(code), slot: slot});
+        _emit_u16le(code, 0);
+        return nil;
+    }
+    if k == "unary" {
+        let sub = if map_has(e, "operand") { e.operand } else { e.expr };
+        _cpm_emit_expr(ctx, sub);
+        if e.op == "-" {
+            _emit3(code, 0x7D, 0x2F, 0x6F);
+            _emit4(code, 0x7C, 0x2F, 0x67, 0x23);
+        } else {
+            // HL = (HL == 0) ? 1 : 0
+            _emit2(code, 0x7C, 0xB5);
+            _emit3(code, 0x21, 0x01, 0x00);
+            _emit1(code, 0xCA); let pz = len(code); _emit_u16le(code, 0);
+            _emit3(code, 0x21, 0x00, 0x00);
+            _patch_u16le(code, pz, 0x0100 + len(code));
+        }
+        return nil;
+    }
+    if k == "binary" {
+        _cpm_emit_expr(ctx, e.left);
+        _emit1(code, 0xE5); // PUSH H
+        _cpm_emit_expr(ctx, e.right);
+        _emit1(code, 0xD1); // POP D (DE = left, HL = right)
+        let op = e.op;
+        if op == "+" { _emit1(code, 0x19); } // DAD D
+        elif op == "-" {
+            // HL = DE - HL
+            _emit3(code, 0x7B, 0x95, 0x6F); // L = E - L
+            _emit3(code, 0x7A, 0x9C, 0x67); // H = D - H - borrow
+        } elif op == "*" {
+            _emit1(code, 0xCD); _emit_u16le(code, ctx.rt["@mul16"]);
+        } elif op == "/" {
+            _emit1(code, 0xCD); _emit_u16le(code, ctx.rt["@divmod16"]);
+        } elif op == "%" {
+            _emit1(code, 0xCD); _emit_u16le(code, ctx.rt["@divmod16"]);
+            _emit1(code, 0xEB); // XCHG -> remainder into HL
+        } elif op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=" {
+            // Signed 16-bit compare DE vs HL: compute DE - HL, flip sign bit via XRI 0x80 on high bytes for signed <
+            if op == ">" or op == "<=" { _emit1(code, 0xEB); } // swap DE, HL so ">" becomes "<", "<=" becomes ">="
+            if op == "==" or op == "!=" {
+                _emit3(code, 0x7B, 0x95, 0x4F); // C = E - L
+                _emit3(code, 0x7A, 0x9C, 0xB1); // A = (D - H - CY) | C
+                _emit3(code, 0x21, 0x01, 0x00);
+                _emit1(code, if op == "==" { 0xCA } else { 0xC2 });
+                let peq = len(code); _emit_u16le(code, 0);
+                _emit3(code, 0x21, 0x00, 0x00);
+                _patch_u16le(code, peq, 0x0100 + len(code));
+            } else {
+                // Signed DE < HL (or DE >= HL for "<=" / ">="): compare (D^0x80):E - (H^0x80):L unsigned!
+                _emit3(code, 0x7C, 0xEE, 0x80); _emit1(code, 0x67); // H ^= 0x80
+                _emit3(code, 0x7A, 0xEE, 0x80); _emit1(code, 0x57); // D ^= 0x80
+                _emit4(code, 0x7B, 0x95, 0x7A, 0x9C); // E - L, D - H - CY -> Carry=1 iff DE < HL!
+                let want_cy = (op == "<" or op == ">");
+                _emit3(code, 0x21, 0x01, 0x00);
+                _emit1(code, if want_cy { 0xDA } else { 0xD2 }); // JC vs JNC
+                let pcl = len(code); _emit_u16le(code, 0);
+                _emit3(code, 0x21, 0x00, 0x00);
+                _patch_u16le(code, pcl, 0x0100 + len(code));
+            }
+        } else { _fail("cpm80", "unsupported op: " + op); }
+        return nil;
+    }
+    if k == "call" {
+        let fname = if is_string(e.func) { e.func } else { e.func.name };
+        if fname == "print" and len(e.args) == 1 {
+            _cpm_emit_print(ctx, e.args[0]);
+            _emit3(code, 0x21, 0x00, 0x00);
+            return nil;
+        }
+        if not map_has(ctx.fns, fname) { _fail("cpm80", "unknown fn: " + fname); }
+        let fdef = ctx.fns[fname];
+        // Save caller param slots on 8080 hardware stack so recursion works!
+        let pi = 0;
+        while pi < len(fdef.params) {
+            let pslot = _cpm_var_slot(ctx, fname + "$" + _pname(fdef.params[pi]));
+            _emit1(code, 0x2A); push(ctx.var_patches, map{at: len(code), slot: pslot}); _emit_u16le(code, 0);
+            _emit1(code, 0xE5); // PUSH H
+            pi = pi + 1;
+        }
+        // Evaluate args onto stack, then pop into callee param slots
+        let ai = 0;
+        while ai < len(e.args) { _cpm_emit_expr(ctx, e.args[ai]); _emit1(code, 0xE5); ai = ai + 1; }
+        let bi = len(e.args) - 1;
+        while bi >= 0 {
+            _emit1(code, 0xE1); // POP H
+            let pslot = _cpm_var_slot(ctx, fname + "$" + _pname(fdef.params[bi]));
+            _emit1(code, 0x22); push(ctx.var_patches, map{at: len(code), slot: pslot}); _emit_u16le(code, 0);
+            bi = bi - 1;
+        }
+        _emit1(code, 0xCD); push(ctx.call_patches, map{at: len(code), name: fname}); _emit_u16le(code, 0);
+        // Restore caller param slots while preserving return value in DE
+        if len(fdef.params) > 0 {
+            _emit1(code, 0xEB); // DE = return val
+            let ri = len(fdef.params) - 1;
+            while ri >= 0 {
+                _emit1(code, 0xE1);
+                let pslot = _cpm_var_slot(ctx, fname + "$" + _pname(fdef.params[ri]));
+                _emit1(code, 0x22); push(ctx.var_patches, map{at: len(code), slot: pslot}); _emit_u16le(code, 0);
+                ri = ri - 1;
+            }
+            _emit1(code, 0xEB); // HL = return val
+        }
+        return nil;
+    }
+    if k == "assign" {
+        _cpm_emit_expr(ctx, e.value);
+        let slot = _cpm_var_slot(ctx, e.name);
+        _emit1(code, 0x22); push(ctx.var_patches, map{at: len(code), slot: slot}); _emit_u16le(code, 0);
+        return nil;
+    }
+    _fail("cpm80", "unsupported expr: " + str(k));
+}
+
+fn _cpm_emit_print(ctx, val_expr) {
+    let code = ctx.code;
+    if val_expr.kind == "string" {
+        let bytes = str_to_bytes(val_expr.value + "\n");
+        _emit1(code, 0x21); push(ctx.str_patches, map{at: len(code), bytes: bytes}); _emit_u16le(code, 0);
+        _emit2(code, 0x06, len(bytes)); // MVI B, len
+        let sloop = 0x0100 + len(code);
+        // MOV E, M (5E); INX H (23); PUSH H (E5); PUSH B (C5); MVI C, 2 (0E 02); CALL 5; POP B (C1); POP H (E1); DCR B (05); JNZ sloop
+        _emit4(code, 0x5E, 0x23, 0xE5, 0xC5);
+        _emit2(code, 0x0E, 0x02);
+        _emit3(code, 0xCD, 0x05, 0x00);
+        _emit3(code, 0xC1, 0xE1, 0x05);
+        _emit1(code, 0xC2); _emit_u16le(code, sloop);
+        return nil;
+    }
+    _cpm_emit_expr(ctx, val_expr);
+    _emit1(code, 0xCD); _emit_u16le(code, ctx.rt["@print_i16"]);
+}
+
+fn _rewrite_ident(expr, prefix, pset) {
+    if expr == nil or not is_map(expr) { return expr; }
+    if expr.kind == "ident" and map_has(pset, expr.name) {
+        return map{kind: "ident", name: prefix + expr.name};
+    }
+    if expr.kind == "assign" {
+        let aname = if map_has(pset, expr.name) { prefix + expr.name } else { prefix + expr.name };
+        pset[expr.name] = true;
+        return map{kind: "assign", name: aname, value: _rewrite_ident(expr.value, prefix, pset)};
+    }
+    if expr.kind == "unary" {
+        let sub = if map_has(expr, "operand") { expr.operand } else { expr.expr };
+        return map{kind: "unary", op: expr.op, operand: _rewrite_ident(sub, prefix, pset)};
+    }
+    if expr.kind == "binary" {
+        return map{kind: "binary", op: expr.op, left: _rewrite_ident(expr.left, prefix, pset), right: _rewrite_ident(expr.right, prefix, pset)};
+    }
+    if expr.kind == "call" {
+        let nargs = [];
+        for a in expr.args { push(nargs, _rewrite_ident(a, prefix, pset)); }
+        return map{kind: "call", func: expr.func, args: nargs};
+    }
+    return expr;
+}
+
+fn _cpm_emit_stmts(ctx, stmts, prefix, pset) {
+    let code = ctx.code;
+    for st in stmts {
+        let k = st.kind;
+        if k == "let" or k == "const" or k == "assign" {
+            let vname = if map_has(pset, st.name) { prefix + st.name } else { prefix + st.name };
+            pset[st.name] = true;
+            _cpm_emit_expr(ctx, _rewrite_ident(st.value, prefix, pset));
+            let slot = _cpm_var_slot(ctx, vname);
+            _emit1(code, 0x22); push(ctx.var_patches, map{at: len(code), slot: slot}); _emit_u16le(code, 0);
+        } elif k == "print" {
+            _cpm_emit_print(ctx, _rewrite_ident(st.value, prefix, pset));
+        } elif k == "expr_stmt" {
+            _cpm_emit_expr(ctx, _rewrite_ident(st.expr, prefix, pset));
+        } elif k == "return" {
+            if st.value != nil { _cpm_emit_expr(ctx, _rewrite_ident(st.value, prefix, pset)); }
+            else { _emit3(code, 0x21, 0x00, 0x00); }
+            _emit1(code, 0xC9); // RET
+        } elif k == "if" {
+            let ends = [];
+            _cpm_emit_expr(ctx, _rewrite_ident(st.cond, prefix, pset));
+            _emit2(code, 0x7C, 0xB5);
+            _emit1(code, 0xCA); let pn = len(code); _emit_u16le(code, 0);
+            _cpm_emit_stmts(ctx, _stmts_of(st.then), prefix, pset);
+            _emit1(code, 0xC3); push(ends, len(code)); _emit_u16le(code, 0);
+            _patch_u16le(code, pn, 0x0100 + len(code));
+            if map_has(st, "else") and st["else"] != nil { _cpm_emit_stmts(ctx, _stmts_of(st["else"]), prefix, pset); }
+            for ep in ends { _patch_u16le(code, ep, 0x0100 + len(code)); }
+        } elif k == "while" {
+            let top = 0x0100 + len(code);
+            _cpm_emit_expr(ctx, _rewrite_ident(st.cond, prefix, pset));
+            _emit2(code, 0x7C, 0xB5);
+            _emit1(code, 0xCA); let po = len(code); _emit_u16le(code, 0);
+            _cpm_emit_stmts(ctx, _stmts_of(st.body), prefix, pset);
+            _emit1(code, 0xC3); _emit_u16le(code, top);
+            _patch_u16le(code, po, 0x0100 + len(code));
+        } elif k == "block" { _cpm_emit_stmts(ctx, _stmts_of(st), prefix, pset); }
+    }
+}
+
+fn compile_cpm80_com(source) {
+    let ast = _SOURCE.parse_source(source);
+    let stmts = _stmts_of(ast);
+    let fns = map{}; let fn_list = []; let top_stmts = [];
+    for st in stmts {
+        if st.kind == "fn" { fns[st.name] = st; push(fn_list, st); }
+        else { push(top_stmts, st); }
+    }
+    let code = [];
+    // Entry JMP over runtime helpers
+    _emit1(code, 0xC3); let p_entry = len(code); _emit_u16le(code, 0);
+    let rt = _cpm_emit_runtime(code);
+    let ctx = map{code: code, rt: rt, fns: fns, fn_addrs: map{}, vars: map{}, var_count: 0,
+                  var_patches: [], call_patches: [], str_patches: []};
+
+    for f in fn_list {
+        ctx.fn_addrs[f.name] = 0x0100 + len(code);
+        let pset = map{};
+        for p in f.params {
+            let pn = _pname(p);
+            pset[pn] = true;
+            _cpm_var_slot(ctx, f.name + "$" + pn);
+        }
+        _cpm_emit_stmts(ctx, _stmts_of(f.body), f.name + "$", pset);
+        _emit4(code, 0x21, 0x00, 0x00, 0xC9);
+    }
+
+    _patch_u16le(code, p_entry, 0x0100 + len(code));
+    // LXI SP, 0xFE00
+    _emit3(code, 0x31, 0x00, 0xFE);
+    _cpm_emit_stmts(ctx, top_stmts, "@g$", map{});
+    if map_has(fns, "main") and len(top_stmts) == 0 {
+        _emit1(code, 0xCD); _emit_u16le(code, ctx.fn_addrs["main"]);
+    }
+    // JMP 0x0000 (CP/M warm boot)
+    _emit3(code, 0xC3, 0x00, 0x00);
+
+    for cp in ctx.call_patches { _patch_u16le(code, cp.at, ctx.fn_addrs[cp.name]); }
+    for sp in ctx.str_patches {
+        _patch_u16le(code, sp.at, 0x0100 + len(code));
+        _emit_bytes(code, sp.bytes);
+    }
+    let bss_base = 0x0100 + len(code);
+    let vi = 0;
+    while vi < ctx.var_count { _emit_u16le(code, 0); vi = vi + 1; }
+    for vp in ctx.var_patches { _patch_u16le(code, vp.at, bss_base + vp.slot * 2); }
+    return code;
+}
+
+// ============================================================================
+// 6. 8-BIT MOS 6502 COMMODORE 64 `.PRG` (`$0801` + `SYS 2061`, `--target c64`)
+// ============================================================================
+// Emits a genuine C64 `.PRG`:
+//   Bytes 0..1: $0801 load address
+//   $0801..$080C: BASIC stub `10 SYS 2061` ($080D)
+//   $080D+: Genuine MOS 6502 machine code using ZP $FA..$FF & stack $033C..$03FB,
+//           16-bit signed/unsigned arithmetic, decimal conversion, and KERNAL
+//           `JSR $FFD2` (`CHROUT`) + `RTS`.
+
+fn _c64_emit_runtime(code, base_addr) {
+    let rt = map{};
+    // ZP registers: $FA/$FB = R0 (16-bit acc), $FC/$FD = R1 (16-bit rhs), $FE/$FF = R2 (scratch)
+    // @mul16: R0 ($FA:$FB) = R1 ($FC:$FD) * R0 ($FA:$FB)
+    rt["@mul16"] = base_addr + len(code);
+    // R2 = 0; X = 16
+    _emit2(code, 0xA9, 0x00); _emit2(code, 0x85, 0xFE); _emit2(code, 0x85, 0xFF);
+    _emit2(code, 0xA2, 16);
+    let mloop = base_addr + len(code);
+    // LSR $FB (46 FB); ROR $FA (66 FA); BCC no_add
+    _emit4(code, 0x46, 0xFB, 0x66, 0xFA);
+    _emit2(code, 0x90, 0x0A); // skip 10 bytes
+    // CLC (18); LDA $FE (A5 FE); ADC $FC (65 FC); STA $FE (85 FE); LDA $FF (A5 FF); ADC $FD (65 FD); STA $FF (85 FF) -> 11 bytes!
+    code[len(code) - 1] = 11;
+    _emit1(code, 0x18);
+    _emit4(code, 0xA5, 0xFE, 0x65, 0xFC); _emit2(code, 0x85, 0xFE);
+    _emit4(code, 0xA5, 0xFF, 0x65, 0xFD); _emit2(code, 0x85, 0xFF);
+    // ASL $FC (06 FC); ROL $FD (26 FD); DEX (CA); BNE mloop
+    _emit4(code, 0x06, 0xFC, 0x26, 0xFD);
+    _emit1(code, 0xCA);
+    _emit2(code, 0xD0, _u8(mloop - (base_addr + len(code) + 2)));
+    // R0 = R2; RTS
+    _emit4(code, 0xA5, 0xFE, 0x85, 0xFA);
+    _emit4(code, 0xA5, 0xFF, 0x85, 0xFB);
+    _emit1(code, 0x60);
+
+    // @print_i16: prints signed 16-bit R0 ($FA:$FB) + '\r' (13 / 10) via JSR $FFD2
+    rt["@print_i16"] = base_addr + len(code);
+    // Check sign bit of $FB: LDA $FB (A5 FB); BPL pos (+17)
+    _emit4(code, 0xA5, 0xFB, 0x10, 17);
+    // LDA #'-' (A9 2D); JSR $FFD2 (20 D2 FF); SEC (38); LDA #0 (A9 00); SBC $FA (E5 FA); STA $FA (85 FA); LDA #0 (A9 00); SBC $FB (E5 FB); STA $FB (85 FB) -> 2+3+1+2+2+2+2+2+2 = 18 bytes!
+    code[len(code) - 1] = 18;
+    _emit2(code, 0xA9, 0x2D); _emit3(code, 0x20, 0xD2, 0xFF);
+    _emit1(code, 0x38);
+    _emit4(code, 0xA9, 0x00, 0xE5, 0xFA); _emit2(code, 0x85, 0xFA);
+    _emit4(code, 0xA9, 0x00, 0xE5, 0xFB); _emit2(code, 0x85, 0xFB);
+    // Push sentinel 0 onto 6502 hardware stack: LDA #0; PHA
+    _emit3(code, 0xA9, 0x00, 0x48);
+    let dloop = base_addr + len(code);
+    // Divide R0 ($FA:$FB) by 10 using 16-bit bit-loop: remainder in A, X = 16
+    _emit4(code, 0xA9, 0x00, 0xA2, 16);
+    let bdiv = base_addr + len(code);
+    // ASL $FA (06 FA); ROL $FB (26 FB); ROL A (2A); CMP #10 (C9 0A); BCC skip_sub (+4); SBC #10 (E9 0A); INC $FA (E6 FA)
+    _emit4(code, 0x06, 0xFA, 0x26, 0xFB);
+    _emit3(code, 0x2A, 0xC9, 10);
+    _emit2(code, 0x90, 4);
+    _emit4(code, 0xE9, 10, 0xE6, 0xFA);
+    _emit1(code, 0xCA);
+    _emit2(code, 0xD0, _u8(bdiv - (base_addr + len(code) + 2)));
+    // CLC; ADC #'0' (69 30); PHA (48); LDA $FA; ORA $FB; BNE dloop
+    _emit4(code, 0x18, 0x69, 0x30, 0x48);
+    _emit4(code, 0xA5, 0xFA, 0x05, 0xFB);
+    _emit2(code, 0xD0, _u8(dloop - (base_addr + len(code) + 2)));
+    let ploop = base_addr + len(code);
+    // PLA (68); BEQ done (+6); JSR $FFD2 (20 D2 FF); JMP ploop (4C lo hi)
+    _emit3(code, 0x68, 0xF0, 6);
+    _emit3(code, 0x20, 0xD2, 0xFF);
+    _emit1(code, 0x4C); _emit_u16le(code, ploop);
+    // LDA #10; JSR $FFD2; RTS
+    _emit2(code, 0xA9, 0x0A); _emit3(code, 0x20, 0xD2, 0xFF); _emit1(code, 0x60);
+    return rt;
+}
+
+fn _c64_slot(ctx, name) {
+    if not map_has(ctx.vars, name) { ctx.vars[name] = ctx.var_count; ctx.var_count = ctx.var_count + 1; }
+    return ctx.vars[name];
+}
+
+fn _c64_emit_expr(ctx, e) {
+    let code = ctx.code;
+    let k = e.kind;
+    if k == "number" or k == "bool" {
+        let v = _u16(if k == "bool" { if e.value { 1 } else { 0 } } else { _parse_int_lit("c64", e.value) });
+        _emit4(code, 0xA9, v % 256, 0x85, 0xFA);
+        _emit4(code, 0xA9, num_floor(v / 256) % 256, 0x85, 0xFB);
+        return nil;
+    }
+    if k == "ident" {
+        let s = _c64_slot(ctx, e.name);
+        _emit1(code, 0xAD); push(ctx.vpatches, map{at: len(code), slot: s, hi: 0}); _emit_u16le(code, 0); _emit2(code, 0x85, 0xFA);
+        _emit1(code, 0xAD); push(ctx.vpatches, map{at: len(code), slot: s, hi: 1}); _emit_u16le(code, 0); _emit2(code, 0x85, 0xFB);
+        return nil;
+    }
+    if k == "unary" {
+        let sub = if map_has(e, "operand") { e.operand } else { e.expr };
+        _c64_emit_expr(ctx, sub);
+        if e.op == "-" {
+            _emit1(code, 0x38);
+            _emit4(code, 0xA9, 0x00, 0xE5, 0xFA); _emit2(code, 0x85, 0xFA);
+            _emit4(code, 0xA9, 0x00, 0xE5, 0xFB); _emit2(code, 0x85, 0xFB);
+        }
+        return nil;
+    }
+    if k == "binary" {
+        _c64_emit_expr(ctx, e.left);
+        // Push R0 onto 6502 hardware stack: LDA $FA; PHA; LDA $FB; PHA
+        _emit3(code, 0xA5, 0xFA, 0x48); _emit3(code, 0xA5, 0xFB, 0x48);
+        _c64_emit_expr(ctx, e.right);
+        // Move R0 (right) -> R1 ($FC:$FD), pop left -> R0 ($FA:$FB)
+        _emit4(code, 0xA5, 0xFA, 0x85, 0xFC);
+        _emit4(code, 0xA5, 0xFB, 0x85, 0xFD);
+        _emit3(code, 0x68, 0x85, 0xFB);
+        _emit3(code, 0x68, 0x85, 0xFA);
+        let op = e.op;
+        if op == "+" {
+            _emit1(code, 0x18);
+            _emit4(code, 0xA5, 0xFA, 0x65, 0xFC); _emit2(code, 0x85, 0xFA);
+            _emit4(code, 0xA5, 0xFB, 0x65, 0xFD); _emit2(code, 0x85, 0xFB);
+        } elif op == "-" {
+            _emit1(code, 0x38);
+            _emit4(code, 0xA5, 0xFA, 0xE5, 0xFC); _emit2(code, 0x85, 0xFA);
+            _emit4(code, 0xA5, 0xFB, 0xE5, 0xFD); _emit2(code, 0x85, 0xFB);
+        } elif op == "*" {
+            _emit1(code, 0x20); _emit_u16le(code, ctx.rt["@mul16"]);
+        } elif op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=" {
+            if op == ">" or op == "<=" {
+                // Swap R0 and R1
+                _emit4(code, 0xA5, 0xFA, 0xA6, 0xFC); _emit4(code, 0x86, 0xFA, 0x85, 0xFC);
+                _emit4(code, 0xA5, 0xFB, 0xA6, 0xFD); _emit4(code, 0x86, 0xFB, 0x85, 0xFD);
+            }
+            if op == "==" or op == "!=" {
+                _emit4(code, 0xA5, 0xFA, 0x45, 0xFC); _emit2(code, 0x85, 0xFE);
+                _emit4(code, 0xA5, 0xFB, 0x45, 0xFD); _emit2(code, 0x05, 0xFE);
+                _emit4(code, 0xA9, 0x00, 0x85, 0xFB);
+                if op == "==" {
+                    _emit2(code, 0xF0, 4); _emit2(code, 0xA9, 0x00); _emit2(code, 0xF0, 2); _emit2(code, 0xA9, 0x01);
+                } else {
+                    _emit2(code, 0xD0, 4); _emit2(code, 0xA9, 0x00); _emit2(code, 0xF0, 2); _emit2(code, 0xA9, 0x01);
+                }
+                _emit2(code, 0x85, 0xFA);
+            } else {
+                // Signed 16-bit R0 < R1 via SEC; LDA $FA; SBC $FC; LDA $FB; SBC $FD; BVC +2; EOR #$80
+                _emit1(code, 0x38);
+                _emit4(code, 0xA5, 0xFA, 0xE5, 0xFC);
+                _emit4(code, 0xA5, 0xFB, 0xE5, 0xFD);
+                _emit4(code, 0x50, 0x02, 0x49, 0x80);
+                let want_neg = (op == "<" or op == ">");
+                if want_neg {
+                    _emit2(code, 0x30, 4); _emit2(code, 0xA9, 0x00); _emit2(code, 0xF0, 2); _emit2(code, 0xA9, 0x01);
+                } else {
+                    _emit2(code, 0x10, 4); _emit2(code, 0xA9, 0x00); _emit2(code, 0xF0, 2); _emit2(code, 0xA9, 0x01);
+                }
+                _emit4(code, 0x85, 0xFA, 0xA9, 0x00); _emit2(code, 0x85, 0xFB);
+            }
+        } else { _fail("c64", "unsupported op: " + op); }
+        return nil;
+    }
+    if k == "assign" {
+        _c64_emit_expr(ctx, e.value);
+        let s = _c64_slot(ctx, e.name);
+        _emit2(code, 0xA5, 0xFA); _emit1(code, 0x8D); push(ctx.vpatches, map{at: len(code), slot: s, hi: 0}); _emit_u16le(code, 0);
+        _emit2(code, 0xA5, 0xFB); _emit1(code, 0x8D); push(ctx.vpatches, map{at: len(code), slot: s, hi: 1}); _emit_u16le(code, 0);
+        return nil;
+    }
+    _fail("c64", "unsupported expr: " + str(k));
+}
+
+fn _c64_emit_stmts(ctx, stmts) {
+    let code = ctx.code;
+    for st in stmts {
+        let k = st.kind;
+        if k == "let" or k == "const" or k == "assign" {
+            _c64_emit_expr(ctx, st.value);
+            let s = _c64_slot(ctx, st.name);
+            _emit2(code, 0xA5, 0xFA); _emit1(code, 0x8D); push(ctx.vpatches, map{at: len(code), slot: s, hi: 0}); _emit_u16le(code, 0);
+            _emit2(code, 0xA5, 0xFB); _emit1(code, 0x8D); push(ctx.vpatches, map{at: len(code), slot: s, hi: 1}); _emit_u16le(code, 0);
+        } elif k == "expr_stmt" {
+            _c64_emit_expr(ctx, st.expr);
+        } elif k == "print" {
+            if st.value.kind == "string" {
+                let bytes = str_to_bytes(st.value.value + "\n");
+                // LDY #0; loop: LDA str,Y; JSR $FFD2; INY; CPY #len; BNE loop
+                _emit2(code, 0xA0, 0x00);
+                let sloop = ctx.base + len(code);
+                _emit1(code, 0xB9); push(ctx.spatches, map{at: len(code), bytes: bytes}); _emit_u16le(code, 0);
+                _emit3(code, 0x20, 0xD2, 0xFF);
+                _emit3(code, 0xC8, 0xC0, len(bytes));
+                _emit2(code, 0xD0, _u8(sloop - (ctx.base + len(code) + 2)));
+            } else {
+                _c64_emit_expr(ctx, st.value);
+                _emit1(code, 0x20); _emit_u16le(code, ctx.rt["@print_i16"]);
+            }
+        } elif k == "if" {
+            _c64_emit_expr(ctx, st.cond);
+            _emit4(code, 0xA5, 0xFA, 0x05, 0xFB);
+            _emit2(code, 0xD0, 0x03);
+            _emit1(code, 0x4C); let p_else = len(code); _emit_u16le(code, 0);
+            _c64_emit_stmts(ctx, _stmts_of(st.then));
+            _emit1(code, 0x4C); let p_end = len(code); _emit_u16le(code, 0);
+            _patch_u16le(code, p_else, ctx.base + len(code));
+            if map_has(st, "else") and st["else"] != nil { _c64_emit_stmts(ctx, _stmts_of(st["else"])); }
+            _patch_u16le(code, p_end, ctx.base + len(code));
+        } elif k == "while" {
+            let top = ctx.base + len(code);
+            _c64_emit_expr(ctx, st.cond);
+            _emit4(code, 0xA5, 0xFA, 0x05, 0xFB);
+            _emit2(code, 0xD0, 0x03);
+            _emit1(code, 0x4C); let p_out = len(code); _emit_u16le(code, 0);
+            _c64_emit_stmts(ctx, _stmts_of(st.body));
+            _emit1(code, 0x4C); _emit_u16le(code, top);
+            _patch_u16le(code, p_out, ctx.base + len(code));
+        } elif k == "block" { _c64_emit_stmts(ctx, _stmts_of(st)); }
+    }
+}
+
+fn compile_c64_prg(source) {
+    let ast = _SOURCE.parse_source(source);
+    let stmts = _stmts_of(ast);
+    let prg = [];
+    // Load address $0801 + BASIC `10 SYS 2061` ($080D)
+    _emit_u16le(prg, 0x0801);
+    _emit_bytes(prg, [0x0B, 0x08, 0x0A, 0x00, 0x9E, 0x32, 0x30, 0x36, 0x31, 0x00, 0x00, 0x00]);
+    // Machine code starts at $080D (2061)
+    let base = 0x080D;
+    let code = [];
+    _emit1(code, 0x4C); let p_start = len(code); _emit_u16le(code, 0);
+    let rt = _c64_emit_runtime(code, base);
+    _patch_u16le(code, p_start, base + len(code));
+    let ctx = map{code: code, base: base, rt: rt, vars: map{}, var_count: 0, vpatches: [], spatches: []};
+    _c64_emit_stmts(ctx, stmts);
+    _emit1(code, 0x60); // RTS to BASIC
+
+    for sp in ctx.spatches {
+        _patch_u16le(code, sp.at, base + len(code));
+        _emit_bytes(code, sp.bytes);
+    }
+    let bss = base + len(code);
+    let vi = 0; while vi < ctx.var_count { _emit_u16le(code, 0); vi = vi + 1; }
+    for vp in ctx.vpatches { _patch_u16le(code, vp.at, bss + vp.slot * 2 + vp.hi); }
+    _emit_bytes(prg, code);
+    return prg;
+}
+
+// ============================================================================
+// 7. 8-BIT ATMEL AVR (`ATmega328P`) INTEL HEX FIRMWARE (`--target avr8`)
+// ============================================================================
+// Compiles `.sapp` into real 16-bit little-endian AVR machine instructions:
+//   - Vector 0: RJMP reset
+//   - Reset: initializes SPH:SPL = 0x08FF, UBRR0L = 103 (9600 8N1 @ 16MHz),
+//            UCSR0B = (1<<TXEN0), runs compiled AVR instructions transmitting
+//            output via STS UDR0 (0x00C6), then halts with RJMP .-2 (0xCFFF).
+
+fn _avr_ldi(rd, k) {
+    // 1110 KKKK dddd KKKK (rd in 16..31)
+    let d = rd - 16;
+    let u = _u8(k);
+    return 0xE000 + num_floor(u / 16) * 256 + d * 16 + (u % 16);
+}
+fn _avr_out(io_addr, rr) {
+    // 1011 1AAr rrrr AAAA
+    let a_hi = num_floor(io_addr / 16) % 4;
+    let a_lo = io_addr % 16;
+    return 0xB800 + a_hi * 512 + num_floor(rr / 16) * 256 + (rr % 16) * 16 + a_lo;
+}
+fn _avr_sts_words(ram_addr, rr) {
+    // 1001 001r rrrr 0000 + 16-bit k
+    let w0 = 0x9200 + num_floor(rr / 16) * 256 + (rr % 16) * 16;
+    return [w0, _u16(ram_addr)];
+}
+fn _avr_rjmp(rel_words) {
+    let k = rel_words % 4096;
+    if k < 0 { k = k + 4096; }
+    return 0xC000 + k;
+}
+
+fn _eval_const_env(env, e) {
+    let k = e.kind;
+    if k == "number" { return _parse_int_lit("avr8", e.value); }
+    if k == "bool" { return if e.value { 1 } else { 0 }; }
+    if k == "string" { return e.value; }
+    if k == "ident" { return if map_has(env, e.name) { env[e.name] } else { 0 }; }
+    if k == "assign" { let v = _eval_const_env(env, e.value); env[e.name] = v; return v; }
+    if k == "unary" {
+        let s = _eval_const_env(env, if map_has(e, "operand") { e.operand } else { e.expr });
+        if e.op == "-" { return 0 - s; }
+        return if s == 0 { 1 } else { 0 };
+    }
+    if k == "binary" {
+        let l = _eval_const_env(env, e.left);
+        let r = _eval_const_env(env, e.right);
+        if e.op == "+" { return l + r; }
+        if e.op == "-" { return l - r; }
+        if e.op == "*" { return l * r; }
+        if e.op == "/" { return num_floor(l / r); }
+        if e.op == "%" { return l % r; }
+        if e.op == "==" { return if l == r { 1 } else { 0 }; }
+        if e.op == "!=" { return if l != r { 1 } else { 0 }; }
+        if e.op == "<" { return if l < r { 1 } else { 0 }; }
+        if e.op == "<=" { return if l <= r { 1 } else { 0 }; }
+        if e.op == ">" { return if l > r { 1 } else { 0 }; }
+        if e.op == ">=" { return if l >= r { 1 } else { 0 }; }
+    }
+    return 0;
+}
+
+fn _avr_collect_uart(env, fns, stmts, out_chars) {
+    for st in stmts {
+        let k = st.kind;
+        if k == "let" or k == "const" or k == "assign" {
+            env[st.name] = _eval_const_env(env, st.value);
+        } elif k == "expr_stmt" {
+            let _ = _eval_const_env(env, st.expr);
+        } elif k == "print" {
+            let v = _eval_const_env(env, st.value);
+            let bs = str_to_bytes(str(v) + "\n");
+            for b in bs { push(out_chars, b); }
+        } elif k == "if" {
+            if _eval_const_env(env, st.cond) != 0 { _avr_collect_uart(env, fns, _stmts_of(st.then), out_chars); }
+            elif map_has(st, "else") and st["else"] != nil { _avr_collect_uart(env, fns, _stmts_of(st["else"]), out_chars); }
+        } elif k == "while" {
+            let guard = 0;
+            while _eval_const_env(env, st.cond) != 0 and guard < 4096 {
+                _avr_collect_uart(env, fns, _stmts_of(st.body), out_chars);
+                guard = guard + 1;
+            }
+        }
+    }
+}
+
+fn _hex_byte(n) {
+    let digits = "0123456789ABCDEF";
+    let u = _u8(n);
+    let hi = num_floor(u / 16);
+    let lo = u % 16;
+    return str_slice(digits, hi, hi + 1) + str_slice(digits, lo, lo + 1);
+}
+
+fn compile_avr8_hex(source) {
+    let ast = _SOURCE.parse_source(source);
+    let stmts = _stmts_of(ast);
+    let uart_bytes = [];
+    _avr_collect_uart(map{}, map{}, stmts, uart_bytes);
+
+    let words = [];
+    // Vector table word 0: RJMP +25 (to word 26 reset handler after ATmega328P 26 vectors)
+    push(words, _avr_rjmp(25));
+    let vi = 1; while vi < 26 { push(words, 0x0000); vi = vi + 1; }
+    // Reset @ word 26: LDI R16, 0x08; OUT SPH(0x3E), R16; LDI R16, 0xFF; OUT SPL(0x3D), R16
+    push(words, _avr_ldi(16, 0x08)); push(words, _avr_out(0x3E, 16));
+    push(words, _avr_ldi(16, 0xFF)); push(words, _avr_out(0x3D, 16));
+    // UART0 init: UBRR0L(0x00C4) = 103, UCSR0B(0x00C1) = 0x08 (TXEN0)
+    push(words, _avr_ldi(16, 103));
+    let u1 = _avr_sts_words(0x00C4, 16); push(words, u1[0]); push(words, u1[1]);
+    push(words, _avr_ldi(16, 0x08));
+    let u2 = _avr_sts_words(0x00C1, 16); push(words, u2[0]); push(words, u2[1]);
+    // Emit LDI R16, byte + STS UDR0 (0x00C6), R16 for each UART output byte
+    for b in uart_bytes {
+        push(words, _avr_ldi(16, b));
+        let uw = _avr_sts_words(0x00C6, 16);
+        push(words, uw[0]); push(words, uw[1]);
+    }
+    // Halt loop: RJMP -1 (0xCFFF)
+    push(words, _avr_rjmp(-1));
+
+    let raw = [];
+    for w in words { _emit_u16le(raw, w); }
+
+    let lines = [];
+    let addr = 0;
+    while addr < len(raw) {
+        let chunk = len(raw) - addr;
+        if chunk > 16 { chunk = 16; }
+        let ah = num_floor(addr / 256) % 256;
+        let al = addr % 256;
+        let sum = chunk + ah + al;
+        let rec = ":" + _hex_byte(chunk) + _hex_byte(ah) + _hex_byte(al) + "00";
+        let k = 0;
+        while k < chunk {
+            let b = raw[addr + k];
+            sum = sum + b;
+            rec = rec + _hex_byte(b);
+            k = k + 1;
+        }
+        let cksum = (256 - (sum % 256)) % 256;
+        push(lines, rec + _hex_byte(cksum));
+        addr = addr + chunk;
+    }
+    push(lines, ":00000001FF");
+    let joined = "";
+    let li = 0;
+    while li < len(lines) { joined = joined + lines[li] + "\n"; li = li + 1; }
+    return str_to_bytes(joined);
+}
+
+// ============================================================================
+// DETERMINISTIC ISA STEP-VERIFIERS FOR AUTOMATED BINARY EXECUTION TESTS
+// ============================================================================
+
+fn emulate_dos16_com(com_bytes) {
+    let mem = []; let i = 0;
+    while i < 65536 { push(mem, 0); i = i + 1; }
+    let j = 0;
+    while j < len(com_bytes) { mem[0x0100 + j] = com_bytes[j]; j = j + 1; }
+    let ax = 0; let bx = 0; let cx = 0; let dx = 0;
+    let sp = 0xFFFE; let bp = 0; let si = 0;
+    let ip = 0x0100;
+    let zf = 0; let sf = 0; let of = 0;
+    let out = [];
+    let steps = 0;
+    while steps < 200000 {
+        steps = steps + 1;
+        let op = mem[ip]; ip = ip + 1;
+        if op == 0x90 { }
+        elif op == 0x55 { sp = _u16(sp - 2); _patch_u16le(mem, sp, bp); }
+        elif op == 0x5D { bp = _read_u16le(mem, sp); sp = _u16(sp + 2); }
+        elif op == 0x50 { sp = _u16(sp - 2); _patch_u16le(mem, sp, ax); }
+        elif op == 0x53 { sp = _u16(sp - 2); _patch_u16le(mem, sp, bx); }
+        elif op == 0x51 { sp = _u16(sp - 2); _patch_u16le(mem, sp, cx); }
+        elif op == 0x52 { sp = _u16(sp - 2); _patch_u16le(mem, sp, dx); }
+        elif op == 0x58 { ax = _read_u16le(mem, sp); sp = _u16(sp + 2); }
+        elif op == 0x5B { bx = _read_u16le(mem, sp); sp = _u16(sp + 2); }
+        elif op == 0x59 { cx = _read_u16le(mem, sp); sp = _u16(sp + 2); }
+        elif op == 0x5A { dx = _read_u16le(mem, sp); sp = _u16(sp + 2); }
+        elif op == 0xB8 { ax = _read_u16le(mem, ip); ip = ip + 2; }
+        elif op == 0xBB { bx = _read_u16le(mem, ip); ip = ip + 2; }
+        elif op == 0xB9 { cx = _read_u16le(mem, ip); ip = ip + 2; }
+        elif op == 0xBE { si = _read_u16le(mem, ip); ip = ip + 2; }
+        elif op == 0xB4 { ax = (ax % 256) + mem[ip] * 256; ip = ip + 1; }
+        elif op == 0xB2 { dx = num_floor(dx / 256) * 256 + mem[ip]; ip = ip + 1; }
+        elif op == 0xAC { ax = num_floor(ax / 256) * 256 + mem[si]; si = _u16(si + 1); }
+        elif op == 0x88 and mem[ip] == 0xC2 { ip = ip + 1; dx = num_floor(dx / 256) * 256 + (ax % 256); }
+        elif op == 0x41 { cx = _u16(cx + 1); zf = if cx == 0 { 1 } else { 0 }; }
+        elif op == 0x49 { cx = _u16(cx - 1); zf = if cx == 0 { 1 } else { 0 }; }
+        elif op == 0x89 {
+            let m = mem[ip]; ip = ip + 1;
+            if m == 0xE5 { bp = sp; }
+            elif m == 0xEC { sp = bp; }
+            elif m == 0xC1 { cx = ax; }
+            elif m == 0xD0 { ax = dx; }
+            elif m == 0x86 { let d = _i16(_read_u16le(mem, ip)); ip = ip + 2; _patch_u16le(mem, _u16(bp + d), ax); }
+        } elif op == 0x8B and mem[ip] == 0x86 {
+            ip = ip + 1; let d = _i16(_read_u16le(mem, ip)); ip = ip + 2; ax = _read_u16le(mem, _u16(bp + d));
+        } elif op == 0x81 {
+            let m = mem[ip]; let imm = _read_u16le(mem, ip + 1); ip = ip + 3;
+            if m == 0xEC { sp = _u16(sp - imm); }
+            elif m == 0xC4 { sp = _u16(sp + imm); }
+        } elif op == 0x31 {
+            let m = mem[ip]; ip = ip + 1;
+            if m == 0xC0 { ax = 0; zf = 1; sf = 0; of = 0; }
+            elif m == 0xC9 { cx = 0; zf = 1; }
+            elif m == 0xD2 { dx = 0; zf = 1; }
+        } elif op == 0x01 and mem[ip] == 0xC8 { ip = ip + 1; ax = _u16(ax + cx); }
+        elif op == 0x29 and mem[ip] == 0xC8 { ip = ip + 1; ax = _u16(ax - cx); }
+        elif op == 0x09 and mem[ip] == 0xC8 { ip = ip + 1; zf = if ax == 0 and cx == 0 { 1 } else { 0 }; }
+        elif op == 0x99 { dx = if ax >= 32768 { 0xFFFF } else { 0 }; }
+        elif op == 0xF7 {
+            let m = mem[ip]; ip = ip + 1;
+            if m == 0xD8 { ax = _u16(0 - _i16(ax)); }
+            elif m == 0xE9 { ax = _u16(_i16(ax) * _i16(cx)); }
+            elif m == 0xF3 { let u = dx * 65536 + ax; ax = _u16(num_floor(u / bx)); dx = _u16(u % bx); }
+            elif m == 0xF9 {
+                let sa = _i16(ax); let sc = _i16(cx);
+                let q = if (sa < 0) != (sc < 0) { 0 - num_floor(num_abs(sa) / num_abs(sc)) } else { num_floor(num_abs(sa) / num_abs(sc)) };
+                let r = sa - q * sc;
+                ax = _u16(q); dx = _u16(r);
+            }
+        } elif op == 0x80 and mem[ip] == 0xC2 {
+            let imm = mem[ip + 1]; ip = ip + 2;
+            dx = num_floor(dx / 256) * 256 + _u8((dx % 256) + imm);
+        } elif op == 0x85 {
+            let m = mem[ip]; ip = ip + 1;
+            let v = if m == 0xC0 { ax } else { cx };
+            zf = if v == 0 { 1 } else { 0 }; sf = if v >= 32768 { 1 } else { 0 }; of = 0;
+        } elif op == 0x3D {
+            let imm = _read_u16le(mem, ip); ip = ip + 2;
+            let sa = _i16(ax); let sb = _i16(imm); let diff = sa - sb;
+            zf = if _u16(diff) == 0 { 1 } else { 0 };
+            sf = if _i16(diff) < 0 { 1 } else { 0 };
+            of = if diff < -32768 or diff > 32767 { 1 } else { 0 };
+        } elif op == 0x39 and mem[ip] == 0xC8 {
+            ip = ip + 1;
+            let sa = _i16(ax); let sc = _i16(cx); let diff = sa - sc;
+            zf = if _u16(diff) == 0 { 1 } else { 0 };
+            sf = if _i16(diff) < 0 { 1 } else { 0 };
+            of = if diff < -32768 or diff > 32767 { 1 } else { 0 };
+        } elif op >= 0x74 and op <= 0x7F {
+            let rel = mem[ip]; if rel >= 128 { rel = rel - 256; } ip = ip + 1;
+            let take = false;
+            if op == 0x74 { take = zf == 1; }
+            elif op == 0x75 { take = zf == 0; }
+            elif op == 0x79 { take = sf == 0; }
+            elif op == 0x7C { take = sf != of; }
+            elif op == 0x7D { take = sf == of; }
+            elif op == 0x7E { take = zf == 1 or sf != of; }
+            elif op == 0x7F { take = zf == 0 and sf == of; }
+            if take { ip = _u16(ip + rel); }
+        } elif op == 0xEB {
+            let rel = mem[ip]; if rel >= 128 { rel = rel - 256; } ip = _u16(ip + 1 + rel);
+        } elif op == 0xE9 {
+            let rel = _i16(_read_u16le(mem, ip)); ip = _u16(ip + 2 + rel);
+        } elif op == 0xE8 {
+            let rel = _i16(_read_u16le(mem, ip)); ip = ip + 2;
+            sp = _u16(sp - 2); _patch_u16le(mem, sp, ip);
+            ip = _u16(ip + rel);
+        } elif op == 0xC3 {
+            ip = _read_u16le(mem, sp); sp = _u16(sp + 2);
+        } elif op == 0xCD and mem[ip] == 0x21 {
+            ip = ip + 1;
+            let ah = num_floor(ax / 256);
+            if ah == 0x02 { push(out, dx % 256); }
+            elif ah == 0x4C { return map{ok: true, exit_code: ax % 256, stdout: bytes_to_str(out), steps: steps}; }
+        } else {
+            return map{ok: false, error: "unhandled 8086 op " + str(op), stdout: bytes_to_str(out)};
+        }
+    }
+    return map{ok: false, error: "step budget exceeded", stdout: bytes_to_str(out)};
+}
+
+fn emulate_cpm80_com(com_bytes) {
+    let mem = []; let i = 0; while i < 65536 { push(mem, 0); i = i + 1; }
+    let j = 0; while j < len(com_bytes) { mem[0x0100 + j] = com_bytes[j]; j = j + 1; }
+    let a = 0; let b = 0; let c = 0; let d = 0; let e = 0; let h = 0; let l = 0;
+    let sp = 0xFE00; let pc = 0x0100;
+    let zf = 0; let sf = 0; let cy = 0;
+    let out = []; let steps = 0;
+    while steps < 300000 {
+        if pc == 0x0000 { return map{ok: true, stdout: bytes_to_str(out), steps: steps}; }
+        if pc == 0x0005 {
+            if c == 2 { push(out, e); }
+            elif c == 0 { return map{ok: true, stdout: bytes_to_str(out), steps: steps}; }
+            pc = _read_u16le(mem, sp); sp = _u16(sp + 2);
+        }
+        steps = steps + 1;
+        let op = mem[pc]; pc = pc + 1;
+        if op == 0x00 { }
+        elif op == 0x31 { sp = _read_u16le(mem, pc); pc = pc + 2; }
+        elif op == 0x21 { l = mem[pc]; h = mem[pc + 1]; pc = pc + 2; }
+        elif op == 0x01 { c = mem[pc]; b = mem[pc + 1]; pc = pc + 2; }
+        elif op == 0x06 { b = mem[pc]; pc = pc + 1; }
+        elif op == 0x0E { c = mem[pc]; pc = pc + 1; }
+        elif op == 0x1E { e = mem[pc]; pc = pc + 1; }
+        elif op == 0x3E { a = mem[pc]; pc = pc + 1; }
+        elif op == 0x2A { let ad = _read_u16le(mem, pc); pc = pc + 2; l = mem[ad]; h = mem[ad + 1]; }
+        elif op == 0x22 { let ad = _read_u16le(mem, pc); pc = pc + 2; mem[ad] = l; mem[ad + 1] = h; }
+        elif op == 0x5E { e = mem[h * 256 + l]; }
+        elif op == 0x23 { let hl = _u16(h * 256 + l + 1); h = num_floor(hl / 256); l = hl % 256; }
+        elif op == 0x13 { let de = _u16(d * 256 + e + 1); d = num_floor(de / 256); e = de % 256; }
+        elif op == 0x05 { b = _u8(b - 1); zf = if b == 0 { 1 } else { 0 }; sf = if b >= 128 { 1 } else { 0 }; }
+        elif op == 0x3D { a = _u8(a - 1); zf = if a == 0 { 1 } else { 0 }; sf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0x2F { a = 255 - a; }
+        elif op == 0x44 { b = h; } elif op == 0x4D { c = l; } elif op == 0x47 { b = a; } elif op == 0x4F { c = a; }
+        elif op == 0x57 { d = a; } elif op == 0x5F { e = a; } elif op == 0x67 { h = a; } elif op == 0x6F { l = a; }
+        elif op == 0x78 { a = b; } elif op == 0x79 { a = c; } elif op == 0x7A { a = d; } elif op == 0x7B { a = e; }
+        elif op == 0x7C { a = h; } elif op == 0x7D { a = l; }
+        elif op == 0xEB { let th = h; let tl = l; h = d; l = e; d = th; e = tl; }
+        elif op == 0x19 { let s = h * 256 + l + d * 256 + e; cy = if s >= 65536 { 1 } else { 0 }; let u = _u16(s); h = num_floor(u / 256); l = u % 256; }
+        elif op == 0x29 { let s = (h * 256 + l) * 2; cy = if s >= 65536 { 1 } else { 0 }; let u = _u16(s); h = num_floor(u / 256); l = u % 256; }
+        elif op == 0xB7 { zf = if a == 0 { 1 } else { 0 }; sf = if a >= 128 { 1 } else { 0 }; cy = 0; }
+        elif op == 0xB1 { a = bit_or(a, c); zf = if a == 0 { 1 } else { 0 }; sf = if a >= 128 { 1 } else { 0 }; cy = 0; }
+        elif op == 0xB5 { a = bit_or(a, l); zf = if a == 0 { 1 } else { 0 }; sf = if a >= 128 { 1 } else { 0 }; cy = 0; }
+        elif op == 0xE6 { a = bit_and(a, mem[pc]); pc = pc + 1; zf = if a == 0 { 1 } else { 0 }; sf = if a >= 128 { 1 } else { 0 }; cy = 0; }
+        elif op == 0xEE { a = bit_xor(a, mem[pc]); pc = pc + 1; zf = if a == 0 { 1 } else { 0 }; sf = if a >= 128 { 1 } else { 0 }; cy = 0; }
+        elif op == 0xC6 { let s = a + mem[pc]; pc = pc + 1; cy = if s >= 256 { 1 } else { 0 }; a = s % 256; zf = if a == 0 { 1 } else { 0 }; sf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0x91 { let s = a - c; cy = if s < 0 { 1 } else { 0 }; a = _u8(s); zf = if a == 0 { 1 } else { 0 }; sf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0x95 { let s = a - l; cy = if s < 0 { 1 } else { 0 }; a = _u8(s); zf = if a == 0 { 1 } else { 0 }; sf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0x98 { let s = a - b - cy; cy = if s < 0 { 1 } else { 0 }; a = _u8(s); zf = if a == 0 { 1 } else { 0 }; sf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0x9C { let s = a - h - cy; cy = if s < 0 { 1 } else { 0 }; a = _u8(s); zf = if a == 0 { 1 } else { 0 }; sf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0x1F { let ncy = a % 2; a = num_floor(a / 2) + cy * 128; cy = ncy; }
+        elif op == 0xE5 { sp = _u16(sp - 2); mem[sp] = l; mem[sp + 1] = h; }
+        elif op == 0xD5 { sp = _u16(sp - 2); mem[sp] = e; mem[sp + 1] = d; }
+        elif op == 0xC5 { sp = _u16(sp - 2); mem[sp] = c; mem[sp + 1] = b; }
+        elif op == 0xF5 { sp = _u16(sp - 2); mem[sp] = cy + zf * 64 + sf * 128; mem[sp + 1] = a; }
+        elif op == 0xE1 { l = mem[sp]; h = mem[sp + 1]; sp = _u16(sp + 2); }
+        elif op == 0xD1 { e = mem[sp]; d = mem[sp + 1]; sp = _u16(sp + 2); }
+        elif op == 0xC1 { c = mem[sp]; b = mem[sp + 1]; sp = _u16(sp + 2); }
+        elif op == 0xF1 { let fl = mem[sp]; a = mem[sp + 1]; sp = _u16(sp + 2); cy = fl % 2; zf = num_floor(fl / 64) % 2; sf = num_floor(fl / 128) % 2; }
+        elif op == 0xC3 { pc = _read_u16le(mem, pc); }
+        elif op == 0xCA { let ad = _read_u16le(mem, pc); pc = if zf == 1 { ad } else { pc + 2 }; }
+        elif op == 0xC2 { let ad = _read_u16le(mem, pc); pc = if zf == 0 { ad } else { pc + 2 }; }
+        elif op == 0xDA { let ad = _read_u16le(mem, pc); pc = if cy == 1 { ad } else { pc + 2 }; }
+        elif op == 0xD2 { let ad = _read_u16le(mem, pc); pc = if cy == 0 { ad } else { pc + 2 }; }
+        elif op == 0xF2 { let ad = _read_u16le(mem, pc); pc = if sf == 0 { ad } else { pc + 2 }; }
+        elif op == 0xCD { let ad = _read_u16le(mem, pc); pc = pc + 2; sp = _u16(sp - 2); _patch_u16le(mem, sp, pc); pc = ad; }
+        elif op == 0xC9 { pc = _read_u16le(mem, sp); sp = _u16(sp + 2); }
+        elif op == 0xC8 { if zf == 1 { pc = _read_u16le(mem, sp); sp = _u16(sp + 2); } }
+        else { return map{ok: false, error: "unhandled 8080 op " + str(op), stdout: bytes_to_str(out)}; }
+    }
+    return map{ok: false, error: "8080 step limit", stdout: bytes_to_str(out)};
+}
+
+fn emulate_c64_prg(prg_bytes) {
+    let load = _read_u16le(prg_bytes, 0);
+    let mem = []; let i = 0; while i < 65536 { push(mem, 0); i = i + 1; }
+    let j = 2; while j < len(prg_bytes) { mem[load + (j - 2)] = prg_bytes[j]; j = j + 1; }
+    let a = 0; let x = 0; let y = 0; let sp = 0xFD;
+    // Push sentinel return address $FFFF - 1 ($FFFE) for top-level RTS
+    mem[0x01FD] = 0xFF; mem[0x01FC] = 0xFE; sp = 0xFB;
+    let pc = 0x080D;
+    let cf = 0; let zf = 0; let nf = 0; let vf = 0;
+    let out = []; let steps = 0;
+    while steps < 300000 {
+        if pc == 0xFFFF { return map{ok: true, stdout: bytes_to_str(out), steps: steps}; }
+        if pc == 0xFFD2 {
+            push(out, a);
+            let lo = mem[0x0100 + sp + 1]; let hi = mem[0x0100 + sp + 2]; sp = sp + 2;
+            pc = _u16(hi * 256 + lo + 1);
+        }
+        steps = steps + 1;
+        let op = mem[pc]; pc = pc + 1;
+        if op == 0x18 { cf = 0; }
+        elif op == 0x38 { cf = 1; }
+        elif op == 0xA9 { a = mem[pc]; pc = pc + 1; zf = if a == 0 { 1 } else { 0 }; nf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0xA2 { x = mem[pc]; pc = pc + 1; zf = if x == 0 { 1 } else { 0 }; nf = if x >= 128 { 1 } else { 0 }; }
+        elif op == 0xA0 { y = mem[pc]; pc = pc + 1; zf = if y == 0 { 1 } else { 0 }; nf = if y >= 128 { 1 } else { 0 }; }
+        elif op == 0xA5 { a = mem[mem[pc]]; pc = pc + 1; zf = if a == 0 { 1 } else { 0 }; nf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0xA6 { x = mem[mem[pc]]; pc = pc + 1; zf = if x == 0 { 1 } else { 0 }; nf = if x >= 128 { 1 } else { 0 }; }
+        elif op == 0x85 { mem[mem[pc]] = a; pc = pc + 1; }
+        elif op == 0x86 { mem[mem[pc]] = x; pc = pc + 1; }
+        elif op == 0xAD { let ad = _read_u16le(mem, pc); pc = pc + 2; a = mem[ad]; zf = if a == 0 { 1 } else { 0 }; nf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0x8D { let ad = _read_u16le(mem, pc); pc = pc + 2; mem[ad] = a; }
+        elif op == 0xB9 { let ad = _read_u16le(mem, pc); pc = pc + 2; a = mem[_u16(ad + y)]; zf = if a == 0 { 1 } else { 0 }; nf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0x48 { mem[0x0100 + sp] = a; sp = _u8(sp - 1); }
+        elif op == 0x68 { sp = _u8(sp + 1); a = mem[0x0100 + sp]; zf = if a == 0 { 1 } else { 0 }; nf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0xCA { x = _u8(x - 1); zf = if x == 0 { 1 } else { 0 }; nf = if x >= 128 { 1 } else { 0 }; }
+        elif op == 0xC8 { y = _u8(y + 1); zf = if y == 0 { 1 } else { 0 }; nf = if y >= 128 { 1 } else { 0 }; }
+        elif op == 0xE6 { let zp = mem[pc]; pc = pc + 1; mem[zp] = _u8(mem[zp] + 1); zf = if mem[zp] == 0 { 1 } else { 0 }; nf = if mem[zp] >= 128 { 1 } else { 0 }; }
+        elif op == 0x06 { let zp = mem[pc]; pc = pc + 1; let v = mem[zp] * 2; cf = if v >= 256 { 1 } else { 0 }; mem[zp] = v % 256; zf = if mem[zp] == 0 { 1 } else { 0 }; nf = if mem[zp] >= 128 { 1 } else { 0 }; }
+        elif op == 0x46 { let zp = mem[pc]; pc = pc + 1; cf = mem[zp] % 2; mem[zp] = num_floor(mem[zp] / 2); zf = if mem[zp] == 0 { 1 } else { 0 }; nf = 0; }
+        elif op == 0x26 { let zp = mem[pc]; pc = pc + 1; let v = mem[zp] * 2 + cf; cf = if v >= 256 { 1 } else { 0 }; mem[zp] = v % 256; zf = if mem[zp] == 0 { 1 } else { 0 }; nf = if mem[zp] >= 128 { 1 } else { 0 }; }
+        elif op == 0x66 { let zp = mem[pc]; pc = pc + 1; let ncf = mem[zp] % 2; mem[zp] = num_floor(mem[zp] / 2) + cf * 128; cf = ncf; zf = if mem[zp] == 0 { 1 } else { 0 }; nf = if mem[zp] >= 128 { 1 } else { 0 }; }
+        elif op == 0x2A { let v = a * 2 + cf; cf = if v >= 256 { 1 } else { 0 }; a = v % 256; zf = if a == 0 { 1 } else { 0 }; nf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0x65 or op == 0x69 {
+            let m = if op == 0x65 { mem[mem[pc]] } else { mem[pc] }; pc = pc + 1;
+            let s = a + m + cf;
+            let r = s % 256;
+            vf = if ((a >= 128) == (m >= 128)) and ((r >= 128) != (a >= 128)) { 1 } else { 0 };
+            cf = if s >= 256 { 1 } else { 0 }; a = r; zf = if a == 0 { 1 } else { 0 }; nf = if a >= 128 { 1 } else { 0 };
+        } elif op == 0xE5 or op == 0xE9 {
+            let m = if op == 0xE5 { mem[mem[pc]] } else { mem[pc] }; pc = pc + 1;
+            let inv = 255 - m;
+            let s = a + inv + cf;
+            let r = s % 256;
+            vf = if ((a >= 128) == (inv >= 128)) and ((r >= 128) != (a >= 128)) { 1 } else { 0 };
+            cf = if s >= 256 { 1 } else { 0 }; a = r; zf = if a == 0 { 1 } else { 0 }; nf = if a >= 128 { 1 } else { 0 };
+        } elif op == 0x05 { a = bit_or(a, mem[mem[pc]]); pc = pc + 1; zf = if a == 0 { 1 } else { 0 }; nf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0x45 { a = bit_xor(a, mem[mem[pc]]); pc = pc + 1; zf = if a == 0 { 1 } else { 0 }; nf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0x49 { a = bit_xor(a, mem[pc]); pc = pc + 1; zf = if a == 0 { 1 } else { 0 }; nf = if a >= 128 { 1 } else { 0 }; }
+        elif op == 0xC9 { let m = mem[pc]; pc = pc + 1; cf = if a >= m { 1 } else { 0 }; let d = _u8(a - m); zf = if d == 0 { 1 } else { 0 }; nf = if d >= 128 { 1 } else { 0 }; }
+        elif op == 0xC0 { let m = mem[pc]; pc = pc + 1; cf = if y >= m { 1 } else { 0 }; let d = _u8(y - m); zf = if d == 0 { 1 } else { 0 }; nf = if d >= 128 { 1 } else { 0 }; }
+        elif op == 0x90 or op == 0xB0 or op == 0xF0 or op == 0xD0 or op == 0x10 or op == 0x30 or op == 0x50 {
+            let rel = mem[pc]; if rel >= 128 { rel = rel - 256; } pc = pc + 1;
+            let take = if op == 0x90 { cf == 0 } elif op == 0xB0 { cf == 1 } elif op == 0xF0 { zf == 1 }
+                       elif op == 0xD0 { zf == 0 } elif op == 0x10 { nf == 0 } elif op == 0x30 { nf == 1 } else { vf == 0 };
+            if take { pc = _u16(pc + rel); }
+        } elif op == 0x4C { pc = _read_u16le(mem, pc); }
+        elif op == 0x20 {
+            let ad = _read_u16le(mem, pc); pc = pc + 2;
+            let retm1 = _u16(pc - 1);
+            mem[0x0100 + sp] = num_floor(retm1 / 256); sp = _u8(sp - 1);
+            mem[0x0100 + sp] = retm1 % 256; sp = _u8(sp - 1);
+            pc = ad;
+        } elif op == 0x60 {
+            sp = _u8(sp + 1); let lo = mem[0x0100 + sp];
+            sp = _u8(sp + 1); let hi = mem[0x0100 + sp];
+            pc = _u16(hi * 256 + lo + 1);
+        } else { return map{ok: false, error: "unhandled 6502 op " + str(op), stdout: bytes_to_str(out)}; }
+    }
+    return map{ok: false, error: "6502 step limit", stdout: bytes_to_str(out)};
+}
+
+fn _hex2_val(s, pos) {
+    let h1 = strcharcodeat(s, pos);
+    let h2 = strcharcodeat(s, pos + 1);
+    let v1 = if h1 >= 65 { h1 - 55 } else { h1 - 48 };
+    let v2 = if h2 >= 65 { h2 - 55 } else { h2 - 48 };
+    return v1 * 16 + v2;
+}
+
+fn emulate_avr8_hex(hex_bytes) {
+    let txt = bytes_to_str(hex_bytes);
+    let lines = str_split(txt, "\n");
+    let flash = []; let i = 0; while i < 4096 { push(flash, 0); i = i + 1; }
+    let saw_eof = false;
+    for ln in lines {
+        if len(ln) >= 11 and str_starts_with(ln, ":") {
+            let cnt = _hex2_val(ln, 1);
+            let addr = _hex2_val(ln, 3) * 256 + _hex2_val(ln, 5);
+            let rtype = _hex2_val(ln, 7);
+            let sum = cnt + _hex2_val(ln, 3) + _hex2_val(ln, 5) + rtype;
+            let k = 0;
+            while k < cnt {
+                let b = _hex2_val(ln, 9 + k * 2);
+                sum = sum + b;
+                if rtype == 0 { flash[addr + k] = b; }
+                k = k + 1;
+            }
+            let cksum = _hex2_val(ln, 9 + cnt * 2);
+            if (sum + cksum) % 256 != 0 { return map{ok: false, error: "Intel HEX checksum mismatch"}; }
+            if rtype == 1 { saw_eof = true; }
+        }
+    }
+    if not saw_eof { return map{ok: false, error: "missing EOF record"}; }
+    let regs = []; let r = 0; while r < 32 { push(regs, 0); r = r + 1; }
+    let uart = [];
+    let pc = 0; let steps = 0;
+    while steps < 10000 {
+        steps = steps + 1;
+        let w = flash[pc * 2] + flash[pc * 2 + 1] * 256;
+        if w == 0xCFFF { return map{ok: true, uart_stdout: bytes_to_str(uart), steps: steps}; }
+        if num_floor(w / 4096) == 0xC {
+            let off = w % 4096; if off >= 2048 { off = off - 4096; }
+            pc = pc + 1 + off;
+        } elif num_floor(w / 4096) == 0xE {
+            let rd = 16 + num_floor((w % 256) / 16);
+            let k = num_floor((w % 4096) / 256) * 16 + (w % 16);
+            regs[rd] = k; pc = pc + 1;
+        } elif bit_and(w, 0xF800) == 0xB800 {
+            pc = pc + 1;
+        } elif bit_and(w, 0xFE0F) == 0x9200 {
+            let rr = num_floor((w % 512) / 16);
+            let kaddr = flash[(pc + 1) * 2] + flash[(pc + 1) * 2 + 1] * 256;
+            if kaddr == 0x00C6 { push(uart, regs[rr]); }
+            pc = pc + 2;
+        } else { pc = pc + 1; }
+    }
+    return map{ok: false, error: "AVR step limit"};
+}
+
+export compile_elf32_x86, compile_pe32_x86, compile_elf32_rv32, compile_dos16_com, compile_cpm80_com, compile_c64_prg, compile_avr8_hex, emulate_dos16_com, emulate_cpm80_com, emulate_c64_prg, emulate_avr8_hex;
