@@ -1761,7 +1761,7 @@ static ZrExpr *zp_parse_primary(ZrParser *p) {
             if (!zp_expect(p, TOK_FN, "'fn'")) { p->depth--; return NULL; }
             const char *fname = NULL;
             if (!zp_check(p, TOK_LPAREN)) {
-                fname = zp_expect_decl_name(p, "function name");
+                fname = zp_expect_any_name(p, "function name");
                 if (!fname) { p->depth--; return NULL; }
             }
             ZrParam *params = NULL; size_t pcount = 0;
@@ -2987,7 +2987,7 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
             if (zp_peek_n(p, fn_off)->kind == TOK_FN && zp_peek_n(p, fn_off + 1)->kind != TOK_LPAREN) {
                 bool is_async = zp_match(p, TOK_ASYNC);
                 zp_advance(p); /* fn */
-                const char *fname = zp_expect_decl_name(p, "function name");
+                const char *fname = zp_expect_any_name(p, "function name");
                 if (!fname) break;
                 ZrParam *params = NULL; size_t pcount = 0;
                 if (!zp_parse_param_list(p, &params, &pcount)) break;

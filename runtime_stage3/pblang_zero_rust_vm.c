@@ -686,33 +686,7 @@ static int zr_cmd_doctor(const char *self_exe) {
     return 0;
 }
 
-static int zr_cmd_update(int argc, char **argv) {
-    bool remote = false;
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--remote") == 0) remote = true;
-    }
-    printf("%s\n", PBLANG_ZR_VERSION_STR);
-    printf("Sovereign C99 runtime is active (zero Rust toolchain dependency).\n");
-    if (remote) {
-        PbVM vm;
-        vm_init(&vm);
-        zr_caps_allow_all(&vm.caps);
-        const char *api = "https://api.github.com/repos/PanosBiazis/pblang/releases/latest";
-        PbValue u = val_obj(pb_str_new(&vm, api, strlen(api)));
-        vm_push_root(&vm, u);
-        PbValue resp = val_nil();
-        if (bi_http_get(&vm, 1, &u, &resp) && is_obj_type(resp, OBJ_STR)) {
-            printf("Latest GitHub release metadata fetched (%zu bytes).\n", AS_STR(resp)->len);
-        } else {
-            printf("Remote release check unavailable (%s).\n", vm.err_msg[0] ? vm.err_msg : "offline");
-        }
-        vm_pop_roots(&vm, 1);
-        vm_free(&vm);
-    } else {
-        printf("Rebuild locally anytime with: gcc -O3 -std=gnu99 runtime_stage3/pblang_zero_rust_vm.c -ldl -lpthread -lm -s -o pblang\n");
-    }
-    return 0;
-}
+#include "zr_smart_updater.h"
 
 int main(int argc, char **argv) {
     zr_net_subsystem_init();
@@ -806,7 +780,7 @@ int main(int argc, char **argv) {
         return rc;
     }
     if (strcmp(sub, "update") == 0) {
-        int rc = zr_cmd_update(argc - 2, argv + 2);
+        int rc = zr_cmd_update(self_exe, argc - 2, argv + 2);
         free(self_exe);
         return rc;
     }
