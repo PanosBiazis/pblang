@@ -1,6 +1,6 @@
 # PBLang Self-Hosted Compiler & Toolchain Drivers (`tools/`)
 
-This directory contains the self-hosted compiler driver (`pbc.sapp`), the `@polyglot` universal newest-to-oldest device builder (`build_universal_devices.sapp`), security/audit tools, and portable lockfile drivers written in PBLang (`2.4.0`).
+This directory contains the self-hosted compiler driver (`pbc.sapp`), the `@polyglot` universal newest-to-oldest device builder (`build_universal_devices.sapp`), security/audit tools, and portable lockfile drivers written in PBLang (`2.5.0`).
 
 ---
 

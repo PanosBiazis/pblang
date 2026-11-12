@@ -8,7 +8,7 @@
 
 #include "zr_compiler.h"
 
-#define ZR_PBCK_CACHE_SALT "PBLANG-ZR-2.4.0-r1|"
+#define ZR_PBCK_CACHE_SALT "PBLANG-ZR-2.5.0-r1|"
 
 static bool zr_file_exists_reg(const char *path) {
     if (!path || !path[0]) return false;

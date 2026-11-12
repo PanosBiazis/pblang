@@ -15,7 +15,7 @@
 // ── Adaptive Resource Governor & Legacy Exported Constants ────────────────────
 
 let GOV = import("stdlib:math/resource_governor.sapp");
-let CAS_VERSION = "2.4.0";
+let CAS_VERSION = "2.5.0";
 let MAX_INPUT_LEN = 8192;
 let MAX_AST_DEPTH = 128;
 let MAX_AST_NODES = 4096;
@@ -29,6 +29,10 @@ let _BI_ONE = bigint(1);
 let _BI_NEG_ONE = bigint(-1);
 let _BI_TWO = bigint(2);
 let _BI_TEN = bigint(10);
+
+let _USER_FUNCS = map{};
+let _EVAL_CALL_DEPTH = 0;
+let _DIFF_CALL_DEPTH = 0;
 
 // ── Numeric & BigInt Helpers ──────────────────────────────────────────────────
 
@@ -762,6 +766,56 @@ fn subst_ast(node, env) {
     return node;
 }
 
+fn _parse_prime_fn_name(fn_nm) {
+    let n = len(fn_nm);
+    if n > 4 and str_slice(fn_nm, n - 4, n - 1) == "__d" {
+        let ord_ch = str_slice(fn_nm, n - 1, n);
+        if ord_ch == "1" { return map{ "base": str_slice(fn_nm, 0, n - 4), "order": 1 }; }
+        if ord_ch == "2" { return map{ "base": str_slice(fn_nm, 0, n - 4), "order": 2 }; }
+        if ord_ch == "3" { return map{ "base": str_slice(fn_nm, 0, n - 4), "order": 3 }; }
+        if ord_ch == "4" { return map{ "base": str_slice(fn_nm, 0, n - 4), "order": 4 }; }
+    }
+    return map{ "base": fn_nm, "order": 0 };
+}
+
+fn _clone_env_with_params(base_env, params, vals) {
+    let c = map{};
+    if base_env != nil and type(base_env) == "map" {
+        let ks = map_keys(base_env);
+        let i = 0;
+        while i < len(ks) {
+            c[ks[i]] = base_env[ks[i]];
+            i = i + 1;
+        }
+    }
+    let j = 0;
+    while j < len(params) and j < len(vals) {
+        c[params[j]] = vals[j];
+        j = j + 1;
+    }
+    return c;
+}
+
+fn _eval_rel_cond(cond_node, env) {
+    if cond_node == nil or type(cond_node) != "map" { return false; }
+    if cond_node["kind"] == "rel" {
+        let lv = eval_ast(cond_node["lhs"], env);
+        let rv = eval_ast(cond_node["rhs"], env);
+        if lv == nil or rv == nil { return false; }
+        let op = cond_node["op"];
+        if op == "<" { return lv < rv; }
+        if op == "<=" { return lv <= rv; }
+        if op == ">" { return lv > rv; }
+        if op == ">=" { return lv >= rv; }
+        if op == "=" { return num_abs(lv - rv) <= 1.0e-12; }
+        if op == "!=" { return num_abs(lv - rv) > 1.0e-12; }
+        return false;
+    }
+    let v = eval_ast(cond_node, env);
+    if v == nil { return false; }
+    return num_abs(v) > 0.0;
+}
+
 // Safe floating-point evaluation of AST node under env map{ "x": 2.5 }.
 // Returns nil on domain violation (sqrt(<0), ln(<=0), division by 0, unbound symbol).
 fn eval_ast(node, env = nil) {
@@ -867,11 +921,140 @@ fn eval_ast(node, env = nil) {
     if k == "call" {
         let fn_nm = node["fn_name"];
         let args = node["args"];
+        // 1. Short-circuit piecewise(cond1, val1, cond2, val2, ..., [default_val])
+        if fn_nm == "piecewise" {
+            let na = len(args);
+            let pi_idx = 0;
+            while pi_idx + 1 < na {
+                if _eval_rel_cond(args[pi_idx], env) {
+                    return eval_ast(args[pi_idx + 1], env);
+                }
+                pi_idx = pi_idx + 2;
+            }
+            if na - num_floor(na / 2) * 2 == 1 {
+                return eval_ast(args[na - 1], env);
+            }
+            return nil;
+        }
+        // 2. User-defined functions & Lagrange prime derivatives f'(x), f''(x)
+        let pf = _parse_prime_fn_name(fn_nm);
+        if pf["order"] > 0 or map_has(_USER_FUNCS, fn_nm) {
+            let arg_vals = [];
+            let ai = 0;
+            while ai < len(args) {
+                let av = eval_ast(args[ai], env);
+                if av == nil { return nil; }
+                push(arg_vals, av);
+                ai = ai + 1;
+            }
+            if _EVAL_CALL_DEPTH >= 64 {
+                throw "MathGovernor[symbolic_cas]: maximum custom function recursion depth (64) exceeded in '" + pf["base"] + "'";
+            }
+            let b_nm = pf["base"];
+            let d_ord = pf["order"];
+            if map_has(_USER_FUNCS, b_nm) {
+                let uf = _USER_FUNCS[b_nm];
+                let p_names = uf["params"];
+                if len(p_names) != len(arg_vals) { return nil; }
+                let target_ast = uf["body_ast"];
+                if d_ord > 0 {
+                    if len(p_names) == 0 { return 0.0; }
+                    let cache_k = "d" + str(d_ord) + "_ast";
+                    if map_has(uf, cache_k) and uf[cache_k] != nil {
+                        target_ast = uf[cache_k];
+                    } else {
+                        let cur_d = target_ast;
+                        let di = 0;
+                        while di < d_ord {
+                            cur_d = diff_ast(cur_d, p_names[0]);
+                            di = di + 1;
+                        }
+                        uf[cache_k] = cur_d;
+                        target_ast = cur_d;
+                    }
+                }
+                let call_env = _clone_env_with_params(env, p_names, arg_vals);
+                _EVAL_CALL_DEPTH = _EVAL_CALL_DEPTH + 1;
+                let r_uf = try eval_ast(target_ast, call_env) catch err {
+                    _EVAL_CALL_DEPTH = _EVAL_CALL_DEPTH - 1;
+                    throw err;
+                };
+                _EVAL_CALL_DEPTH = _EVAL_CALL_DEPTH - 1;
+                return r_uf;
+            } else if d_ord > 0 and _is_known_func(b_nm) and len(arg_vals) == 1 {
+                let cur_d = ast_call(b_nm, [ast_sym("__p0")]);
+                let di = 0;
+                while di < d_ord {
+                    cur_d = diff_ast(cur_d, "__p0");
+                    di = di + 1;
+                }
+                let p_env = _env1("__p0", arg_vals[0]);
+                _EVAL_CALL_DEPTH = _EVAL_CALL_DEPTH + 1;
+                let r_bi = try eval_ast(cur_d, p_env) catch err {
+                    _EVAL_CALL_DEPTH = _EVAL_CALL_DEPTH - 1;
+                    throw err;
+                };
+                _EVAL_CALL_DEPTH = _EVAL_CALL_DEPTH - 1;
+                return r_bi;
+            }
+            return nil;
+        }
         if len(args) == 0 { return nil; }
+        if fn_nm == "min" or fn_nm == "max" {
+            let best = eval_ast(args[0], env);
+            if best == nil { return nil; }
+            let mi = 1;
+            while mi < len(args) {
+                let mv = eval_ast(args[mi], env);
+                if mv == nil { return nil; }
+                if fn_nm == "min" and mv < best { best = mv; }
+                if fn_nm == "max" and mv > best { best = mv; }
+                mi = mi + 1;
+            }
+            return best;
+        }
+        if fn_nm == "clamp" and len(args) == 3 {
+            let xv = eval_ast(args[0], env);
+            let lo_v = eval_ast(args[1], env);
+            let hi_v = eval_ast(args[2], env);
+            if xv == nil or lo_v == nil or hi_v == nil { return nil; }
+            return _clamp_num(xv, lo_v, hi_v);
+        }
         let u = eval_ast(args[0], env);
         if u == nil { return nil; }
         let res = nil;
         if fn_nm == "abs" { res = num_abs(u); }
+        else if fn_nm == "heaviside" {
+            let z_def = 0.5;
+            if len(args) >= 2 {
+                let zv = eval_ast(args[1], env);
+                if zv == nil { return nil; }
+                z_def = zv;
+            }
+            if u < 0.0 { res = 0.0; }
+            else if u > 0.0 { res = 1.0; }
+            else { res = z_def; }
+        }
+        else if fn_nm == "sign" {
+            if u > 0.0 { res = 1.0; }
+            else if u < 0.0 { res = -1.0; }
+            else { res = 0.0; }
+        }
+        else if fn_nm == "round" { res = num_round(u); }
+        else if fn_nm == "sinc" {
+            if num_abs(u) < 1.0e-9 { res = 1.0 - (u * u) / 6.0; }
+            else { res = num_sin(u) / u; }
+        }
+        else if fn_nm == "hypot" and len(args) >= 2 {
+            let v2 = eval_ast(args[1], env);
+            if v2 == nil { return nil; }
+            res = num_sqrt(u * u + v2 * v2);
+        }
+        else if fn_nm == "mod" and len(args) >= 2 {
+            let v2 = eval_ast(args[1], env);
+            if v2 == nil or num_abs(v2) == 0.0 { return nil; }
+            res = u - num_floor(u / v2) * v2;
+        }
         else if fn_nm == "sqrt" {
             if u < -0.0000000000001 { return nil; }
             if u < 0.0 { u = 0.0; }
@@ -1259,6 +1442,79 @@ fn diff_ast(node, v_name) {
     if k == "call" {
         let fn_nm = node["fn_name"];
         let args = node["args"];
+        if fn_nm == "piecewise" {
+            let pw_out = [];
+            let na = len(args);
+            let pi_idx = 0;
+            while pi_idx + 1 < na {
+                push(pw_out, args[pi_idx]);
+                push(pw_out, diff_ast(args[pi_idx + 1], v_name));
+                pi_idx = pi_idx + 2;
+            }
+            if na - num_floor(na / 2) * 2 == 1 {
+                push(pw_out, diff_ast(args[na - 1], v_name));
+            }
+            return ast_call("piecewise", pw_out);
+        }
+        // User-defined functions & Lagrange prime calls: apply exact multivariable Chain Rule!
+        let pf = _parse_prime_fn_name(fn_nm);
+        if pf["order"] > 0 or map_has(_USER_FUNCS, fn_nm) {
+            if _DIFF_CALL_DEPTH >= 24 {
+                throw "MathGovernor[symbolic_cas.diff]: maximum custom function derivative recursion depth (24) exceeded in '" + pf["base"] + "'";
+            }
+            let b_nm = pf["base"];
+            let d_ord = pf["order"];
+            if map_has(_USER_FUNCS, b_nm) {
+                let uf = _USER_FUNCS[b_nm];
+                let p_names = uf["params"];
+                if len(p_names) != len(args) { return RAT_ZERO; }
+                _DIFF_CALL_DEPTH = _DIFF_CALL_DEPTH + 1;
+                let base_body = uf["body_ast"];
+                let oi = 0;
+                while oi < d_ord and len(p_names) > 0 {
+                    base_body = diff_ast(base_body, p_names[0]);
+                    oi = oi + 1;
+                }
+                let sub_map = map{};
+                let si = 0;
+                while si < len(p_names) {
+                    sub_map[p_names[si]] = args[si];
+                    si = si + 1;
+                }
+                let chain_terms = [];
+                let pi = 0;
+                while pi < len(p_names) {
+                    let d_arg = diff_ast(args[pi], v_name);
+                    if not is_zero_node(d_arg) {
+                        let d_param = try diff_ast(base_body, p_names[pi]) catch err {
+                            _DIFF_CALL_DEPTH = _DIFF_CALL_DEPTH - 1;
+                            throw err;
+                        };
+                        let d_sub = subst_ast(d_param, sub_map);
+                        push(chain_terms, ast_mul([d_sub, d_arg]));
+                    }
+                    pi = pi + 1;
+                }
+                _DIFF_CALL_DEPTH = _DIFF_CALL_DEPTH - 1;
+                if len(chain_terms) == 0 { return RAT_ZERO; }
+                if len(chain_terms) == 1 { return chain_terms[0]; }
+                return ast_add(chain_terms);
+            } else if d_ord > 0 and _is_known_func(b_nm) and len(args) == 1 {
+                let cur_d = ast_call(b_nm, [ast_sym("__p0")]);
+                let oi = 0;
+                while oi <= d_ord {
+                    cur_d = diff_ast(cur_d, "__p0");
+                    oi = oi + 1;
+                }
+                let sub_d = subst_ast(cur_d, map{ "__p0": args[0] });
+                return ast_mul([sub_d, diff_ast(args[0], v_name)]);
+            } else if len(args) == 1 and d_ord < 4 {
+                // Symbolic abstract function f(u(x)) -> f'(u(x)) * u'(x)
+                let next_ord = d_ord + 1;
+                return ast_mul([ast_call(b_nm + "__d" + str(next_ord), [args[0]]), diff_ast(args[0], v_name)]);
+            }
+            return RAT_ZERO;
+        }
         if len(args) == 0 { return RAT_ZERO; }
         let u = args[0];
         let du = diff_ast(u, v_name);
@@ -1266,6 +1522,18 @@ fn diff_ast(node, v_name) {
         if fn_nm == "cos" { return ast_neg(ast_mul([ast_call("sin", [u]), du])); }
         if fn_nm == "tan" { return ast_div(du, ast_pow(ast_call("cos", [u]), RAT_TWO)); }
         if fn_nm == "cot" { return ast_neg(ast_div(du, ast_pow(ast_call("sin", [u]), RAT_TWO))); }
+        if fn_nm == "sinh" { return ast_mul([ast_call("cosh", [u]), du]); }
+        if fn_nm == "cosh" { return ast_mul([ast_call("sinh", [u]), du]); }
+        if fn_nm == "tanh" { return ast_div(du, ast_pow(ast_call("cosh", [u]), RAT_TWO)); }
+        if fn_nm == "asin" { return ast_div(du, ast_call("sqrt", [ast_sub(RAT_ONE, ast_pow(u, RAT_TWO))])); }
+        if fn_nm == "acos" { return ast_neg(ast_div(du, ast_call("sqrt", [ast_sub(RAT_ONE, ast_pow(u, RAT_TWO))]))); }
+        if fn_nm == "atan" { return ast_div(du, ast_add([RAT_ONE, ast_pow(u, RAT_TWO)])); }
+        if fn_nm == "sinc" {
+            return ast_mul([ast_div(ast_sub(ast_mul([u, ast_call("cos", [u])]), ast_call("sin", [u])), ast_pow(u, RAT_TWO)), du]);
+        }
+        if fn_nm == "heaviside" or fn_nm == "sign" or fn_nm == "floor" or fn_nm == "ceil" or fn_nm == "round" {
+            return RAT_ZERO;
+        }
         if fn_nm == "exp" { return ast_mul([ast_call("exp", [u]), du]); }
         if fn_nm == "ln" or fn_nm == "log" { return ast_div(du, u); }
         if fn_nm == "sqrt" { return ast_div(du, ast_mul([RAT_TWO, ast_call("sqrt", [u])])); }
@@ -1322,13 +1590,43 @@ fn _is_known_func(nm) {
         or nm == "atan" or nm == "atan2" or nm == "sinh" or nm == "cosh"
         or nm == "tanh" or nm == "sqrt" or nm == "cbrt" or nm == "abs"
         or nm == "ln" or nm == "log" or nm == "log10" or nm == "log2"
-        or nm == "exp" or nm == "floor" or nm == "ceil"
+        or nm == "exp" or nm == "floor" or nm == "ceil" or nm == "round"
+        or nm == "piecewise" or nm == "heaviside" or nm == "sign"
+        or nm == "min" or nm == "max" or nm == "clamp" or nm == "hypot"
+        or nm == "mod" or nm == "sinc"
         or nm == "erf" or nm == "erfc" or nm == "erfi"
         or nm == "Ei" or nm == "li" or nm == "Si" or nm == "Ci"
         or nm == "FresnelS" or nm == "FresnelC"
         or nm == "Li2" or nm == "lambertw"
         or nm == "gamma" or nm == "igamma" or nm == "beta"
         or nm == "zeta" or nm == "besselj";
+}
+
+fn _is_callable_ident(nm) {
+    let pf = _parse_prime_fn_name(nm);
+    if pf["order"] > 0 { return true; }
+    return _is_known_func(nm) or map_has(_USER_FUNCS, nm);
+}
+
+fn _has_top_comma_in_parens(toks, lparen_idx) {
+    let n = len(toks);
+    if lparen_idx < 0 or lparen_idx >= n or toks[lparen_idx]["t"] != "LPAREN" {
+        return false;
+    }
+    let d = 1;
+    let m = lparen_idx + 1;
+    while m < n and d > 0 {
+        let tt = toks[m]["t"];
+        if tt == "LPAREN" { d = d + 1; }
+        else if tt == "RPAREN" {
+            d = d - 1;
+            if d == 0 { return false; }
+        } else if tt == "COMMA" and d == 1 {
+            return true;
+        }
+        m = m + 1;
+    }
+    return false;
 }
 
 fn _superscript_char_map(cp) {
@@ -1644,7 +1942,24 @@ fn _tokenize_raw(s) {
                 if _is_alpha_cp(c2) or _is_digit_cp(c2) { j = j + 1; }
                 else { break; }
             }
-            push(toks, map{ "t": "IDENT", "v": str_slice(s, i, j) });
+            let ident_nm = str_slice(s, i, j);
+            // Support Lagrange prime derivative notation f'(x), f''(x), f'''(x)
+            let p_cnt = 0;
+            let pj = j;
+            while pj < n and p_cnt < 4 {
+                let pcp = strcharcodeat(s, pj);
+                if pcp == 39 or pcp == 8242 {
+                    p_cnt = p_cnt + 1;
+                    pj = pj + 1;
+                } else {
+                    break;
+                }
+            }
+            if p_cnt > 0 {
+                ident_nm = ident_nm + "__d" + str(p_cnt);
+                j = pj;
+            }
+            push(toks, map{ "t": "IDENT", "v": ident_nm });
             i = j;
         } else {
             let ch = str_slice(s, i, i + 1);
@@ -1720,7 +2035,7 @@ fn _rewrite_abs_bars(toks) {
             }
         } else if tt == "NUM" or tt == "IDENT" {
             push(out, tk);
-            prev_is_val = not (tt == "IDENT" and _is_known_func(tk["v"]) and i + 1 < len(toks) and (toks[i + 1]["t"] == "LPAREN" or (toks[i + 1]["t"] == "OP" and toks[i + 1]["v"] == "^")));
+            prev_is_val = not (tt == "IDENT" and _is_callable_ident(tk["v"]) and i + 1 < len(toks) and (toks[i + 1]["t"] == "LPAREN" or (toks[i + 1]["t"] == "OP" and toks[i + 1]["v"] == "^")));
         } else {
             push(out, tk);
             prev_is_val = false;
@@ -1735,7 +2050,7 @@ fn _rewrite_abs_bars(toks) {
 
 // Insert implicit '*' between adjacent multiplicative tokens:
 // 2x -> 2*x, 3(x+1) -> 3*(x+1), (x-1)(x+2) -> (x-1)*(x+2), 2 sin(x) -> 2*sin(x), x y -> x*y, a(x+1) -> a*(x+1)
-// Also support trig power shorthand sin^2(x) -> (sin(x))^2 in the parser (so keep IDENT(func) '^' intact!).
+// Preserves registered custom functions f(x), prime derivatives f'(x), and multi-argument calls g(x, a)!
 fn _insert_implicit_mul(toks) {
     if len(toks) <= 1 { return toks; }
     // Precompute matching LPAREN index for each RPAREN so \sin^{2}(x) -> sin^(2)(x) keeps (2) attached to (x)
@@ -1762,12 +2077,12 @@ fn _insert_implicit_mul(toks) {
             let nt = nxt["t"];
             let need_mul = false;
             let is_fn_exp = false;
-            if i >= 2 and toks[i - 1]["t"] == "OP" and toks[i - 1]["v"] == "^" and toks[i - 2]["t"] == "IDENT" and _is_known_func(toks[i - 2]["v"]) {
+            if i >= 2 and toks[i - 1]["t"] == "OP" and toks[i - 1]["v"] == "^" and toks[i - 2]["t"] == "IDENT" and _is_callable_ident(toks[i - 2]["v"]) {
                 is_fn_exp = true;
             }
             if ct == "RPAREN" and map_has(match_open, str(i)) {
                 let open_i = match_open[str(i)];
-                if open_i >= 2 and toks[open_i - 1]["t"] == "OP" and toks[open_i - 1]["v"] == "^" and toks[open_i - 2]["t"] == "IDENT" and _is_known_func(toks[open_i - 2]["v"]) {
+                if open_i >= 2 and toks[open_i - 1]["t"] == "OP" and toks[open_i - 1]["v"] == "^" and toks[open_i - 2]["t"] == "IDENT" and _is_callable_ident(toks[open_i - 2]["v"]) {
                     is_fn_exp = true;
                 }
             }
@@ -1777,9 +2092,18 @@ fn _insert_implicit_mul(toks) {
                 } else if ct == "RPAREN" {
                     if nt == "NUM" or nt == "IDENT" or nt == "LPAREN" { need_mul = true; }
                 } else if ct == "IDENT" {
-                    let is_fn = _is_known_func(cur["v"]);
-                    if not is_fn {
-                        if nt == "NUM" or nt == "IDENT" or nt == "LPAREN" { need_mul = true; }
+                    let is_known = _is_known_func(cur["v"]);
+                    let is_call_id = _is_callable_ident(cur["v"]);
+                    if is_known {
+                        need_mul = false;
+                    } else if is_call_id {
+                        if nt == "NUM" or nt == "IDENT" { need_mul = true; }
+                    } else {
+                        if nt == "LPAREN" and _has_top_comma_in_parens(toks, i + 1) {
+                            need_mul = false;
+                        } else if nt == "NUM" or nt == "IDENT" or nt == "LPAREN" {
+                            need_mul = true;
+                        }
                     }
                 }
             }
@@ -1838,8 +2162,8 @@ fn _parse_primary(st) {
     } else if tk["t"] == "IDENT" {
         _p_next(st);
         let nm = tk["v"];
+        let nx = _p_peek(st);
         if _is_known_func(nm) {
-            let nx = _p_peek(st);
             // Support sin^2(x) or sin^(2)(x) -> pow(call(sin, [x]), 2)
             if nx != nil and nx["t"] == "OP" and nx["v"] == "^" {
                 _p_next(st);
@@ -1862,6 +2186,28 @@ fn _parse_primary(st) {
             } else {
                 res = ast_sym(nm);
             }
+        } else if _is_callable_ident(nm) {
+            if nx != nil and nx["t"] == "OP" and nx["v"] == "^" {
+                let saved_pos = st["pos"];
+                _p_next(st);
+                let fn_exp = _parse_atom_for_fn_exp(st);
+                let lp = _p_peek(st);
+                if lp != nil and lp["t"] == "LPAREN" {
+                    let args = _parse_arg_list(st);
+                    res = ast_pow(ast_call(nm, args), fn_exp);
+                } else {
+                    st["pos"] = saved_pos;
+                    res = ast_sym(nm);
+                }
+            } else if nx != nil and nx["t"] == "LPAREN" {
+                let args = _parse_arg_list(st);
+                res = ast_call(nm, args);
+            } else {
+                res = ast_sym(nm);
+            }
+        } else if nx != nil and nx["t"] == "LPAREN" and _has_top_comma_in_parens(st["toks"], st["pos"]) {
+            let args = _parse_arg_list(st);
+            res = ast_call(nm, args);
         } else {
             res = ast_sym(nm);
         }
@@ -1897,6 +2243,17 @@ fn _parse_atom_for_fn_exp(st) {
     throw "Expected exponent after function '^'";
 }
 
+fn _parse_arg_expr_or_rel(st) {
+    let lhs = _parse_add(st);
+    let pk = _p_peek(st);
+    if pk != nil and pk["t"] == "REL" {
+        let op = _p_next(st)["v"];
+        let rhs = _parse_add(st);
+        return ast_rel(op, lhs, rhs);
+    }
+    return lhs;
+}
+
 fn _parse_arg_list(st) {
     _p_next(st); // consume '('
     let args = [];
@@ -1906,7 +2263,7 @@ fn _parse_arg_list(st) {
         return args;
     }
     while true {
-        push(args, _parse_add(st));
+        push(args, _parse_arg_expr_or_rel(st));
         let sep = _p_peek(st);
         if sep != nil and sep["t"] == "COMMA" {
             _p_next(st);
@@ -2274,7 +2631,14 @@ fn _ascii_inner(node, parent_prec) {
     }
     if k == "call" {
         let args = node["args"];
-        let s = node["fn_name"] + "(";
+        let pf = _parse_prime_fn_name(node["fn_name"]);
+        let disp_fn = node["fn_name"];
+        if pf["order"] > 0 {
+            disp_fn = pf["base"];
+            let pi = 0;
+            while pi < pf["order"] { disp_fn = disp_fn + "'"; pi = pi + 1; }
+        }
+        let s = disp_fn + "(";
         let i = 0;
         while i < len(args) {
             if i > 0 { s = s + ", "; }
@@ -2456,7 +2820,14 @@ fn _unicode_inner(node, parent_prec) {
         if fn_nm == "besselj" and len(args) == 2 {
             return "J_" + _unicode_inner(args[0], 45) + "(" + _unicode_inner(args[1], 0) + ")";
         }
-        let s = fn_nm + "(";
+        let pf_u = _parse_prime_fn_name(fn_nm);
+        let disp_u = fn_nm;
+        if pf_u["order"] > 0 {
+            disp_u = pf_u["base"];
+            let pi = 0;
+            while pi < pf_u["order"] { disp_u = disp_u + "'"; pi = pi + 1; }
+        }
+        let s = disp_u + "(";
         let i = 0;
         while i < len(args) {
             if i > 0 { s = s + ", "; }
@@ -2480,9 +2851,19 @@ fn _latex_op(op) {
 }
 
 fn _latex_func_cmd(fn_nm) {
+    let pf = _parse_prime_fn_name(fn_nm);
+    if pf["order"] > 0 {
+        let base_cmd = pf["base"];
+        if len(base_cmd) > 1 { base_cmd = _latex_func_cmd(base_cmd); }
+        let pr_s = "";
+        let pi = 0;
+        while pi < pf["order"] { pr_s = pr_s + "'"; pi = pi + 1; }
+        return base_cmd + pr_s;
+    }
     if fn_nm == "sin" or fn_nm == "cos" or fn_nm == "tan" or fn_nm == "cot"
         or fn_nm == "sec" or fn_nm == "csc" or fn_nm == "sinh" or fn_nm == "cosh"
-        or fn_nm == "tanh" or fn_nm == "ln" or fn_nm == "log" or fn_nm == "exp" {
+        or fn_nm == "tanh" or fn_nm == "ln" or fn_nm == "log" or fn_nm == "exp"
+        or fn_nm == "min" or fn_nm == "max" {
         return "\\" + fn_nm;
     }
     if fn_nm == "asin" { return "\\arcsin"; }
@@ -2493,6 +2874,7 @@ fn _latex_func_cmd(fn_nm) {
     if fn_nm == "Li2" { return "\\operatorname{Li}_{2}"; }
     if fn_nm == "lambertw" { return "W_{0}"; }
     if fn_nm == "beta" { return "\\mathrm{B}"; }
+    if len(fn_nm) == 1 { return fn_nm; }
     return "\\operatorname{" + fn_nm + "}";
 }
 
@@ -2619,6 +3001,22 @@ fn _latex_inner(node, parent_prec) {
     if k == "call" {
         let fn_nm = node["fn_name"];
         let args = node["args"];
+        if fn_nm == "piecewise" and len(args) >= 2 {
+            let pw_ltx = "\\begin{cases} ";
+            let pi_idx = 0;
+            let row_k = 0;
+            while pi_idx + 1 < len(args) {
+                if row_k > 0 { pw_ltx = pw_ltx + " \\\\ "; }
+                pw_ltx = pw_ltx + _latex_inner(args[pi_idx + 1], 0) + " & " + _latex_inner(args[pi_idx], 0);
+                pi_idx = pi_idx + 2;
+                row_k = row_k + 1;
+            }
+            if len(args) - num_floor(len(args) / 2) * 2 == 1 {
+                if row_k > 0 { pw_ltx = pw_ltx + " \\\\ "; }
+                pw_ltx = pw_ltx + _latex_inner(args[len(args) - 1], 0) + " & \\text{otherwise}";
+            }
+            return pw_ltx + " \\end{cases}";
+        }
         if fn_nm == "sqrt" and len(args) == 1 {
             return "\\sqrt{" + _latex_inner(args[0], 0) + "}";
         }
@@ -5553,6 +5951,13 @@ fn transform(input, goal = "auto", opts = nil) {
     let ctx = _new_ctx();
     let parsed = parse_math(input);
     _record_step(ctx, "input_parsed", parsed);
+    if not (map_has(opts, "keep_custom") and opts["keep_custom"]) and _contains_user_or_prime_call(parsed) {
+        let exp_u = expand_user_functions(parsed, 0);
+        if not ast_eq(exp_u, parsed) {
+            parsed = exp_u;
+            _record_step(ctx, "expand_custom_functions", parsed);
+        }
+    }
 
     let result_ast = parsed;
     let extra = map{};
@@ -7709,7 +8114,7 @@ fn _order_system_vars(raw_vars) {
     return out;
 }
 
-// ── Parametric Case-Splitting & Guarded Indeterminacy Classifiers (v2.4.0) ────
+// ── Parametric Case-Splitting & Guarded Indeterminacy Classifiers (v2.5.0) ────
 
 fn _extract_poly_coeffs_in_var(expr, v, ctx) {
     let exp_e = _expand_node(expr, ctx);
@@ -8803,6 +9208,13 @@ fn solve(input, vars = nil, opts = nil) {
     let ctx = _new_ctx();
     let parsed = parse_math(input);
     _record_step(ctx, "input_parsed", parsed);
+    if not (map_has(opts, "keep_custom") and opts["keep_custom"]) and _contains_user_or_prime_call(parsed) {
+        let exp_u = expand_user_functions(parsed, 0);
+        if not ast_eq(exp_u, parsed) {
+            parsed = exp_u;
+            _record_step(ctx, "expand_custom_functions", parsed);
+        }
+    }
 
     // 1. System of equations or 1D inequalities
     if parsed["kind"] == "system" {
@@ -9856,6 +10268,330 @@ fn plot_svg(expr_or_list, xmin = -10, xmax = 10, opts = nil) {
     return rep["svg"];
 }
 
+// ── User-Defined Custom Function Registry & Symbolic Composition Engine ──────
+
+fn _ast_calls_fn(node, target_nm) {
+    if node == nil or type(node) != "map" or not map_has(node, "kind") { return false; }
+    let k = node["kind"];
+    if k == "call" {
+        let pf = _parse_prime_fn_name(node["fn_name"]);
+        if node["fn_name"] == target_nm or pf["base"] == target_nm { return true; }
+        let i = 0;
+        while i < len(node["args"]) {
+            if _ast_calls_fn(node["args"][i], target_nm) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    if k == "neg" { return _ast_calls_fn(node["arg"], target_nm); }
+    if k == "sub" { return _ast_calls_fn(node["left"], target_nm) or _ast_calls_fn(node["right"], target_nm); }
+    if k == "div" { return _ast_calls_fn(node["num"], target_nm) or _ast_calls_fn(node["den"], target_nm); }
+    if k == "pow" { return _ast_calls_fn(node["base"], target_nm) or _ast_calls_fn(node["exp"], target_nm); }
+    if k == "rel" { return _ast_calls_fn(node["lhs"], target_nm) or _ast_calls_fn(node["rhs"], target_nm); }
+    if k == "add" or k == "mul" {
+        let i = 0;
+        while i < len(node["args"]) {
+            if _ast_calls_fn(node["args"][i], target_nm) { return true; }
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+fn _contains_user_or_prime_call(node) {
+    if node == nil or type(node) != "map" or not map_has(node, "kind") { return false; }
+    let k = node["kind"];
+    if k == "call" {
+        let pf = _parse_prime_fn_name(node["fn_name"]);
+        if pf["order"] > 0 or map_has(_USER_FUNCS, node["fn_name"]) { return true; }
+        let i = 0;
+        while i < len(node["args"]) {
+            if _contains_user_or_prime_call(node["args"][i]) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    if k == "neg" { return _contains_user_or_prime_call(node["arg"]); }
+    if k == "sub" { return _contains_user_or_prime_call(node["left"]) or _contains_user_or_prime_call(node["right"]); }
+    if k == "div" { return _contains_user_or_prime_call(node["num"]) or _contains_user_or_prime_call(node["den"]); }
+    if k == "pow" { return _contains_user_or_prime_call(node["base"]) or _contains_user_or_prime_call(node["exp"]); }
+    if k == "rel" { return _contains_user_or_prime_call(node["lhs"]) or _contains_user_or_prime_call(node["rhs"]); }
+    if k == "chain_rel" {
+        let i = 0;
+        while i < len(node["parts"]) {
+            if _contains_user_or_prime_call(node["parts"][i]) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    if k == "system" {
+        let i = 0;
+        while i < len(node["items"]) {
+            if _contains_user_or_prime_call(node["items"][i]) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+    if k == "add" or k == "mul" {
+        let i = 0;
+        while i < len(node["args"]) {
+            if _contains_user_or_prime_call(node["args"][i]) { return true; }
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+fn expand_user_functions(node, depth = 0) {
+    if node == nil or type(node) != "map" or not map_has(node, "kind") { return node; }
+    if depth > 24 {
+        throw "MathGovernor[symbolic_cas]: cyclic or excessive custom function expansion depth (> 24)";
+    }
+    let k = node["kind"];
+    if k == "rat" or k == "num" or k == "sym" { return node; }
+    if k == "neg" { return ast_neg(expand_user_functions(node["arg"], depth)); }
+    if k == "sub" { return ast_sub(expand_user_functions(node["left"], depth), expand_user_functions(node["right"], depth)); }
+    if k == "div" { return ast_div(expand_user_functions(node["num"], depth), expand_user_functions(node["den"], depth)); }
+    if k == "pow" { return ast_pow(expand_user_functions(node["base"], depth), expand_user_functions(node["exp"], depth)); }
+    if k == "rel" { return ast_rel(node["op"], expand_user_functions(node["lhs"], depth), expand_user_functions(node["rhs"], depth)); }
+    if k == "chain_rel" {
+        let pts = [];
+        let i = 0;
+        while i < len(node["parts"]) { push(pts, expand_user_functions(node["parts"][i], depth)); i = i + 1; }
+        return map{ "kind": "chain_rel", "parts": pts };
+    }
+    if k == "system" {
+        let items = [];
+        let i = 0;
+        while i < len(node["items"]) { push(items, expand_user_functions(node["items"][i], depth)); i = i + 1; }
+        return map{ "kind": "system", "items": items };
+    }
+    if k == "add" or k == "mul" {
+        let out = [];
+        let i = 0;
+        while i < len(node["args"]) { push(out, expand_user_functions(node["args"][i], depth)); i = i + 1; }
+        return map{ "kind": k, "args": out };
+    }
+    if k == "call" {
+        let exp_args = [];
+        let i = 0;
+        while i < len(node["args"]) {
+            push(exp_args, expand_user_functions(node["args"][i], depth));
+            i = i + 1;
+        }
+        let fn_nm = node["fn_name"];
+        let pf = _parse_prime_fn_name(fn_nm);
+        let b_nm = pf["base"];
+        let d_ord = pf["order"];
+        if map_has(_USER_FUNCS, b_nm) {
+            let uf = _USER_FUNCS[b_nm];
+            if uf["is_piecewise_rec"] {
+                return ast_call(fn_nm, exp_args);
+            }
+            let p_names = uf["params"];
+            if len(p_names) == len(exp_args) {
+                let target_body = uf["body_ast"];
+                if d_ord > 0 and len(p_names) > 0 {
+                    let oi = 0;
+                    while oi < d_ord {
+                        target_body = diff_ast(target_body, p_names[0]);
+                        oi = oi + 1;
+                    }
+                }
+                let sub_m = map{};
+                let pi = 0;
+                while pi < len(p_names) {
+                    sub_m[p_names[pi]] = exp_args[pi];
+                    pi = pi + 1;
+                }
+                let inlined = subst_ast(target_body, sub_m);
+                let expanded_inner = expand_user_functions(inlined, depth + 1);
+                check_ast_bounds(expanded_inner);
+                return expanded_inner;
+            }
+        } else if d_ord > 0 and _is_known_func(b_nm) and len(exp_args) == 1 {
+            let cur_d = ast_call(b_nm, [ast_sym("__p0")]);
+            let oi = 0;
+            while oi < d_ord {
+                cur_d = diff_ast(cur_d, "__p0");
+                oi = oi + 1;
+            }
+            return subst_ast(cur_d, map{ "__p0": exp_args[0] });
+        }
+        return ast_call(fn_nm, exp_args);
+    }
+    return node;
+}
+
+fn _invalidate_user_func_caches() {
+    let ks = map_keys(_USER_FUNCS);
+    let i = 0;
+    while i < len(ks) {
+        let e = _USER_FUNCS[ks[i]];
+        e["d1_ast"] = nil;
+        e["d2_ast"] = nil;
+        e["d3_ast"] = nil;
+        e["d4_ast"] = nil;
+        i = i + 1;
+    }
+}
+
+fn define_function(def_or_name, params_opt = nil, body_opt = nil) {
+    let fn_nm = "";
+    let params = [];
+    let rhs_str = "";
+
+    if body_opt != nil {
+        fn_nm = str_trim(str(def_or_name));
+        if type(params_opt) == "array" {
+            let i = 0;
+            while i < len(params_opt) { push(params, str_trim(str(params_opt[i]))); i = i + 1; }
+        } else if type(params_opt) == "string" and str_trim(params_opt) != "" {
+            let sp = str_split(params_opt, ",");
+            let i = 0;
+            while i < len(sp) { push(params, str_trim(sp[i])); i = i + 1; }
+        }
+        rhs_str = str_trim(str(body_opt));
+    } else {
+        let s = str_trim(str(def_or_name));
+        // Split on top-level ':=' or '=' (outside parentheses so piecewise(x <= 0, ...) on RHS is untouched!)
+        let eq_pos = -1;
+        let eq_len = 1;
+        let p_depth = 0;
+        let idx = 0;
+        while idx < len(s) {
+            let ch = str_slice(s, idx, idx + 1);
+            if ch == "(" or ch == "[" { p_depth = p_depth + 1; }
+            else if ch == ")" or ch == "]" { if p_depth > 0 { p_depth = p_depth - 1; } }
+            else if p_depth == 0 {
+                if idx + 1 < len(s) and str_slice(s, idx, idx + 2) == ":=" {
+                    eq_pos = idx;
+                    eq_len = 2;
+                    break;
+                }
+                if ch == "=" {
+                    let prev_c = if idx > 0 { str_slice(s, idx - 1, idx) } else { "" };
+                    let next_c = if idx + 1 < len(s) { str_slice(s, idx + 1, idx + 2) } else { "" };
+                    if prev_c != "<" and prev_c != ">" and prev_c != "!" and prev_c != "=" and next_c != "=" {
+                        eq_pos = idx;
+                        eq_len = 1;
+                        break;
+                    }
+                }
+            }
+            idx = idx + 1;
+        }
+        if eq_pos <= 0 {
+            throw "define_function: expected 'name(p1, ...) = expression', got '" + s + "'";
+        }
+        let lhs_sig = str_trim(str_slice(s, 0, eq_pos));
+        rhs_str = str_trim(str_slice(s, eq_pos + eq_len, len(s)));
+        let lp = str_index_of(lhs_sig, "(");
+        let rp = len(lhs_sig) - 1;
+        if lp <= 0 or str_slice(lhs_sig, rp, rp + 1) != ")" {
+            throw "define_function: invalid signature '" + lhs_sig + "' (expected f(x) or g(x, y))";
+        }
+        fn_nm = str_trim(str_slice(lhs_sig, 0, lp));
+        let p_inner = str_trim(str_slice(lhs_sig, lp + 1, rp));
+        if p_inner != "" {
+            let raw_ps = str_split(p_inner, ",");
+            let pi = 0;
+            while pi < len(raw_ps) {
+                let pn = str_trim(raw_ps[pi]);
+                if pn == "" { throw "define_function: empty parameter name in '" + lhs_sig + "'"; }
+                push(params, pn);
+                pi = pi + 1;
+            }
+        }
+    }
+
+    if fn_nm == "" or is_const_sym(fn_nm) or _is_known_func(fn_nm) {
+        throw "define_function: cannot redefine reserved math symbol or built-in function '" + fn_nm + "'";
+    }
+
+    let had_prev = map_has(_USER_FUNCS, fn_nm);
+    let prev_entry = if had_prev { _USER_FUNCS[fn_nm] } else { nil };
+
+    // Register placeholder so self-recursive piecewise functions parse self-calls cleanly!
+    _USER_FUNCS[fn_nm] = map{
+        "name": fn_nm,
+        "params": params,
+        "body_str": rhs_str,
+        "body_ast": RAT_ZERO,
+        "is_piecewise_rec": false,
+        "d1_ast": nil,
+        "d2_ast": nil
+    };
+
+    let body_ast = try parse_math(rhs_str) catch err {
+        if had_prev { _USER_FUNCS[fn_nm] = prev_entry; }
+        else { map_remove(_USER_FUNCS, fn_nm); }
+        throw err;
+    };
+
+    let self_rec = _ast_calls_fn(body_ast, fn_nm);
+    let has_pw = _ast_calls_fn(body_ast, "piecewise");
+    let entry = map{
+        "ok": true,
+        "name": fn_nm,
+        "params": params,
+        "signature": fn_nm + "(" + str_replace_all(str_replace_all(str_replace_all(json_stringify(params), "[", ""), "]", ""), "\"", "") + ")",
+        "body_str": rhs_str,
+        "body_ast": body_ast,
+        "ascii": to_ascii(body_ast),
+        "unicode": to_unicode(body_ast),
+        "latex": to_latex(body_ast),
+        "is_recursive": self_rec,
+        "is_piecewise_rec": self_rec and has_pw,
+        "d1_ast": nil,
+        "d2_ast": nil
+    };
+    _USER_FUNCS[fn_nm] = entry;
+    _invalidate_user_func_caches();
+    return entry;
+}
+
+fn undefine_function(fn_nm) {
+    let nm = str_trim(str(fn_nm));
+    if map_has(_USER_FUNCS, nm) {
+        map_remove(_USER_FUNCS, nm);
+        _invalidate_user_func_caches();
+        return true;
+    }
+    return false;
+}
+
+fn clear_functions() {
+    _USER_FUNCS = map{};
+    return true;
+}
+
+fn get_function(fn_nm) {
+    let nm = str_trim(str(fn_nm));
+    if map_has(_USER_FUNCS, nm) { return _USER_FUNCS[nm]; }
+    return nil;
+}
+
+fn list_functions() {
+    let ks = _sort_strings(map_keys(_USER_FUNCS));
+    let out = [];
+    let i = 0;
+    while i < len(ks) {
+        let uf = _USER_FUNCS[ks[i]];
+        push(out, map{
+            "name": uf["name"],
+            "params": uf["params"],
+            "body_str": uf["body_str"],
+            "ascii": uf["ascii"],
+            "unicode": uf["unicode"],
+            "latex": uf["latex"],
+            "is_recursive": uf["is_recursive"]
+        });
+        i = i + 1;
+    }
+    return out;
+}
+
 // Convenience top-level wrappers
 fn simplify(input) { return transform(input, "simplify"); }
 fn expand(input) { return transform(input, "expand"); }
@@ -9863,6 +10599,9 @@ fn factor(input) { return transform(input, "factor"); }
 fn diff(input, v_name = "x") {
     let parsed = parse_math(input);
     let d_raw = diff_ast(parsed, v_name);
+    if _contains_user_or_prime_call(d_raw) {
+        d_raw = expand_user_functions(d_raw, 0);
+    }
     let ctx = _new_ctx();
     let d_simp = simplify_node(d_raw, ctx);
     return map{
@@ -9878,6 +10617,8 @@ fn diff(input, v_name = "x") {
 export CAS_VERSION, MAX_INPUT_LEN, MAX_AST_DEPTH, MAX_AST_NODES, MAX_REWRITE_STEPS, MAX_EXPAND_DEGREE;
 export rat, rat_add, rat_sub, rat_mul, rat_div, rat_neg, rat_pow_int, rat_cmp, rat_eq, rat_to_float, rat_to_str;
 export normalize_math_text, parse_math, check_ast_bounds, free_vars, subst_ast, eval_ast, diff_ast, diff;
+export define_function, undefine_function, clear_functions, get_function, list_functions, expand_user_functions;
 export to_ascii, to_unicode, to_latex;
 export simplify_node, to_rational_nd, rref_rat, poly_gcd, poly_factor_Q, solve_polynomial_all;
 export transform, simplify, expand, factor, solve, solve_parametric, analyze_indeterminacy, plot_svg, plot_svg_report, svg_escape;
+

@@ -1,20 +1,20 @@
-# Security & Privacy Policy (`PBLang 2.4.0`)
+# Security & Privacy Policy (`PBLang 2.5.0`)
 
 ## Supported Versions
 
 | Version | Channel | Supported | Security Updates |
 | :--- | :--- | :--- | :--- |
 | **`2.4.x`** | **`stable`** | ✅ **Yes** | Active support — Sovereign Zero-Rust Host VM, Adaptive-Governed `MSC2020` Mathematics Suite, Omni-Polyglot Engine & Universal `64/32/16/8-bit` Toolchain |
-| `2.0.x – 2.3.x` | `maintenance` | ✅ Yes | Sovereign Zero-Rust `2.x` series; upgrade to `2.4.0` recommended |
-| `1.4.x – 1.5.x` | `maintenance` | ⚠️ Security fixes only | Legacy transition series; upgrade to `2.4.0` recommended |
-| `1.0.x – 1.3.x` | `legacy` | ❌ No | Superseded by `2.4.0` |
+| `2.0.x – 2.3.x` | `maintenance` | ✅ Yes | Sovereign Zero-Rust `2.x` series; upgrade to `2.5.0` recommended |
+| `1.4.x – 1.5.x` | `maintenance` | ⚠️ Security fixes only | Legacy transition series; upgrade to `2.5.0` recommended |
+| `1.0.x – 1.3.x` | `legacy` | ❌ No | Superseded by `2.5.0` |
 | `< 1.0.0` | `alpha` / `beta` | ❌ No | Unsupported historical snapshots |
 
 ---
 
 ## Built-In Security Architecture
 
-PBLang `2.4.0` is engineered around **Zero-Trust Capability Isolation**, **Hardware- & Complexity-Adaptive Symbolic/Exact Computation (`AdaptiveMathGovernor`)**, **Post-Quantum Cryptography**, and **By-Default Hardening**:
+PBLang `2.5.0` is engineered around **Zero-Trust Capability Isolation**, **Hardware- & Complexity-Adaptive Symbolic/Exact Computation (`AdaptiveMathGovernor`)**, **Post-Quantum Cryptography**, and **By-Default Hardening**:
 
 1. **Capability-Gated Execution Sandbox (`--sandbox`, `--deny-*`, `--allow-*`)**:
    - `pblang run script.sapp --sandbox` permits canonicalized, symlink-free `stdlib:...` imports from the trusted standard library while denying ambient file system (`--deny-fs`), network (`--deny-net`), HTTP (`--deny-http`), SQLite, subprocess (`--deny-exec`), environment, and native FFI (`--deny-ffi`) operations unless explicitly granted (`--allow-fs`, `--allow-net`, `--allow-http`, `--allow-exec`, `--allow-ffi`, `--ffi-lib`, `--ffi-symbol`).
