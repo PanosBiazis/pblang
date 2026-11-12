@@ -1,0 +1,434 @@
+// tests/path_b_native_sovereign_test.sapp
+//
+// Path B — Pure-PBLang Self-Hosting Native Machine-Code Compiler Verification Suite:
+//   1. Static freestanding Linux x86-64 ELF64 (codegen_x64.sapp):
+//      - Compact ELF64 size discipline (<= 425 bytes minimal, < 20 KB full showcase)
+//      - 5-level hardware stack-unwinding try/catch/throw + caught_error() + OOB/map traps
+//      - Mutable heap-boxed closures (TAG_BOX)
+//      - Dynamic auto-growing open-addressed hash maps (60 keys, tombstones, iteration)
+//      - Cheney 2-space compacting GC + SYS_madvise(MADV_DONTNEED) (< 64 KB live after 5,000 turns)
+//      - Direct Linux x86-64 syscalls + fork/waitpid + loopback IPv4 TCP roundtrip
+//   2. Dynamic Linux x86-64 ELF64 Native FFI (elf_dyn_x64.sapp):
+//      - PT_INTERP + .plt/.got dlopen/dlsym/dlclose + SysV AMD64 GP & SSE2 xmm0/xmm1 trampolines
+//      - Live libm.so.6 (sqrt/hypot/pow), libX11.so.6, and libsqlite3.so.0 (:memory: SQL)
+//   3. Cross-platform Windows x86-64 PE32+ executable emitter (codegen_pe64.sapp):
+//      - Valid MZ/PE32+ headers, .text + .idata sections, KERNEL32.dll Import Directory & IAT
+//   4. True 3-stage native self-hosting fixed-point (stage1_elf -> stage2_elf == stage3_elf):
+//      - Byte-for-byte binary identity of stage2_elf and stage3_elf + stage3 native execution
+//   5. Self-hosted OP_DEFER -> .pbck translation + tools/pbc.sapp multi-target CLI
+
+let SmallX64 = import("stdlib/codegen_x64.sapp");
+let X64 = import("stdlib/native/codegen_x64.sapp");
+let DynX64 = import("stdlib/native/elf_dyn_x64.sapp");
+let Pe64 = import("stdlib/native/codegen_pe64.sapp");
+let SOURCE = import("stdlib/compiler/checked_source.sapp");
+let CODE = import("stdlib/compiler/codegen.sapp");
+let PBCK = import("stdlib/selfhost_to_pbck.sapp");
+let OS = import("stdlib/os.sapp");
+
+fn fail(msg) {
+    throw "FAIL path_b_native_sovereign_test: " + msg;
+}
+
+fn assert_eq(got, want, label) {
+    if got != want {
+        fail(label + ": expected '" + str(want) + "', got '" + str(got) + "'");
+    }
+}
+
+fn read_u16_le(b, off) {
+    return b[off] + b[off + 1] * 256;
+}
+
+fn read_u32_le(b, off) {
+    return b[off] + b[off + 1] * 256 + b[off + 2] * 65536 + b[off + 3] * 16777216;
+}
+
+fn bytes_contain_ascii(haystack, text) {
+    let n = len(haystack);
+    let m = len(text);
+    if m == 0 { return true; }
+    let i = 0;
+    while i + m <= n {
+        let ok = true;
+        let j = 0;
+        while j < m {
+            if haystack[i + j] != strcharcodeat(text, j) {
+                ok = false;
+                j = m;
+            } else {
+                j = j + 1;
+            }
+        }
+        if ok { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn find_pblang_bin() {
+    if fs_exists("./target/release/pblang") { return "./target/release/pblang"; }
+    if fs_exists("./target/debug/pblang") { return "./target/debug/pblang"; }
+    return "pblang";
+}
+
+fn self_cc_source() {
+    return "// Pure-PBLang Self-Hosting x86-64 ELF64 Native Machine-Code Compiler.\n// Compiles PBLang source directly into a standalone Linux x86-64 ELF64 executable\n// (zero Rust, zero C, zero libc, zero external assembler/linker) and compiles ITSELF\n// to an exact binary fixed-point: stage2_elf == stage3_elf.\n\nfn push_u16(b, v) {\n    push(b, v % 256);\n    push(b, (v / 256) % 256);\n}\n\nfn push_u32(b, v) {\n    let x = v;\n    if x < 0 { x = x + 4294967296; }\n    push(b, x % 256);\n    x = x / 256;\n    push(b, x % 256);\n    x = x / 256;\n    push(b, x % 256);\n    x = x / 256;\n    push(b, x % 256);\n}\n\nfn push_u64_lo(b, lo, hi) {\n    push_u32(b, lo);\n    push_u32(b, hi);\n}\n\nfn patch_u32(b, pos, v) {\n    let x = v;\n    if x < 0 { x = x + 4294967296; }\n    b[pos] = x % 256;\n    x = x / 256;\n    b[pos + 1] = x % 256;\n    x = x / 256;\n    b[pos + 2] = x % 256;\n    x = x / 256;\n    b[pos + 3] = x % 256;\n}\n\nfn is_alpha(c) {\n    if c >= 65 and c <= 90 { return 1; }\n    if c >= 97 and c <= 122 { return 1; }\n    if c == 95 { return 1; }\n    return 0;\n}\n\nfn is_digit(c) {\n    if c >= 48 and c <= 57 { return 1; }\n    return 0;\n}\n\nfn is_kw(s) {\n    if str_eq(s, \"fn\") == 1 or str_eq(s, \"let\") == 1 or str_eq(s, \"if\") == 1 or str_eq(s, \"elif\") == 1 or str_eq(s, \"else\") == 1 { return 1; }\n    if str_eq(s, \"while\") == 1 or str_eq(s, \"return\") == 1 or str_eq(s, \"print\") == 1 or str_eq(s, \"and\") == 1 or str_eq(s, \"or\") == 1 { return 1; }\n    return 0;\n}\n\nfn tokenize(src, kinds, texts, nums) {\n    let n = len(src);\n    let i = 0;\n    while i < n {\n        let c = strcharcodeat(src, i);\n        if c == 32 or c == 9 or c == 10 or c == 13 {\n            i = i + 1;\n        } elif c == 47 and i + 1 < n and strcharcodeat(src, i + 1) == 47 {\n            i = i + 2;\n            while i < n and strcharcodeat(src, i) != 10 { i = i + 1; }\n        } elif is_digit(c) == 1 {\n            let v = 0;\n            while i < n and is_digit(strcharcodeat(src, i)) == 1 {\n                v = v * 10 + (strcharcodeat(src, i) - 48);\n                i = i + 1;\n            }\n            push(kinds, 1); push(texts, \"\"); push(nums, v);\n        } elif is_alpha(c) == 1 {\n            let st = i;\n            while i < n and (is_alpha(strcharcodeat(src, i)) == 1 or is_digit(strcharcodeat(src, i)) == 1) {\n                i = i + 1;\n            }\n            let w = str_slice(src, st, i);\n            if is_kw(w) == 1 { push(kinds, 4); } else { push(kinds, 3); }\n            push(texts, w); push(nums, 0);\n        } elif c == 34 {\n            i = i + 1;\n            let s = \"\";\n            while i < n and strcharcodeat(src, i) != 34 {\n                let ch = strcharcodeat(src, i);\n                if ch == 92 {\n                    i = i + 1;\n                    let ec = strcharcodeat(src, i);\n                    if ec == 110 { s = s + strfromcharcode(10); }\n                    elif ec == 116 { s = s + strfromcharcode(9); }\n                    elif ec == 34 { s = s + strfromcharcode(34); }\n                    elif ec == 92 { s = s + strfromcharcode(92); }\n                    else { s = s + strfromcharcode(ec); }\n                    i = i + 1;\n                } else {\n                    let st2 = i;\n                    while i < n and strcharcodeat(src, i) != 34 and strcharcodeat(src, i) != 92 {\n                        i = i + 1;\n                    }\n                    s = s + str_slice(src, st2, i);\n                }\n            }\n            i = i + 1;\n            push(kinds, 2); push(texts, s); push(nums, 0);\n        } else {\n            let two = \"\";\n            if i + 1 < n { two = str_slice(src, i, i + 2); }\n            if str_eq(two, \"==\") == 1 or str_eq(two, \"!=\") == 1 or str_eq(two, \"<=\") == 1 or str_eq(two, \">=\") == 1 {\n                push(kinds, 5); push(texts, two); push(nums, 0);\n                i = i + 2;\n            } else {\n                push(kinds, 5); push(texts, str_slice(src, i, i + 1)); push(nums, 0);\n                i = i + 1;\n            }\n        }\n    }\n    push(kinds, 0); push(texts, \"\"); push(nums, 0);\n}\n\nfn str_eq(a, b) {\n    let n = len(a);\n    if n != len(b) { return 0; }\n    let i = 0;\n    while i < n {\n        if strcharcodeat(a, i) != strcharcodeat(b, i) { return 0; }\n        i = i + 1;\n    }\n    return 1;\n}\n\nfn find_str(arr, s) {\n    let i = 0;\n    let n = len(arr);\n    while i < n {\n        if str_eq(arr[i], s) == 1 { return i; }\n        i = i + 1;\n    }\n    return 0 - 1;\n}\n\n// ctx layout:\n// [0]=kinds, [1]=texts, [2]=nums, [3]=st_pos([idx, in_fn]),\n// [4]=code, [5]=locals, [6]=globals, [7]=call_pos, [8]=call_target,\n// [9]=str_fix_pos, [10]=str_fix_id, [11]=lits\n\nfn peek_k(ctx) { let sp = ctx[3]; let ks = ctx[0]; return ks[sp[0]]; }\nfn peek_t(ctx) { let sp = ctx[3]; let ts = ctx[1]; return ts[sp[0]]; }\nfn pk_eq(ctx, s) { let sp = ctx[3]; let ts = ctx[1]; return str_eq(ts[sp[0]], s); }\nfn peek_n(ctx) { let sp = ctx[3]; let ns = ctx[2]; return ns[sp[0]]; }\nfn adv(ctx) { let sp = ctx[3]; sp[0] = sp[0] + 1; }\n\nfn expect_t(ctx, want) {\n    let got = peek_t(ctx);\n    if str_eq(got, want) == 0 {\n        let sp = ctx[3];\n        print \"parse error at \" + str(sp[0]) + \": expected char \" + str(strcharcodeat(want, 0)) + \" got char \" + str(strcharcodeat(got, 0));\n        os_exit(1);\n    }\n    adv(ctx);\n}\n\nfn emit_call(ctx, name) {\n    let code = ctx[4];\n    push(code, 232);\n    push(ctx[7], len(code));\n    push(ctx[8], name);\n    push_u32(code, 0);\n}\n\nfn emit_str_lit(ctx, s) {\n    let lits = ctx[11];\n    let id = find_str(lits, s);\n    if id < 0 { id = len(lits); push(lits, s); }\n    let code = ctx[4];\n    push(code, 184);\n    push(ctx[9], len(code));\n    push(ctx[10], id);\n    push_u32(code, 0);\n}\n\nfn emit_var_load(ctx, name) {\n    let code = ctx[4];\n    let sp = ctx[3];\n    if sp[1] == 1 {\n        let li = find_str(ctx[5], name);\n        if li >= 0 {\n            let disp = 0 - ((li + 1) * 8);\n            push(code, 72); push(code, 139); push(code, 133); push_u32(code, disp);\n            return 0;\n        }\n    }\n    let globals = ctx[6];\n    let gi = find_str(globals, name);\n    if gi < 0 { gi = len(globals); push(globals, name); }\n    let gdisp = (gi + 4) * 8;\n    push(code, 73); push(code, 139); push(code, 134); push_u32(code, gdisp);\n    return 0;\n}\n\nfn emit_var_store(ctx, name) {\n    let code = ctx[4];\n    let sp = ctx[3];\n    if sp[1] == 1 {\n        let li = find_str(ctx[5], name);\n        if li >= 0 {\n            let disp = 0 - ((li + 1) * 8);\n            push(code, 72); push(code, 137); push(code, 133); push_u32(code, disp);\n            return 0;\n        }\n    }\n    let globals = ctx[6];\n    let gi = find_str(globals, name);\n    if gi < 0 { gi = len(globals); push(globals, name); }\n    let gdisp = (gi + 4) * 8;\n    push(code, 73); push(code, 137); push(code, 134); push_u32(code, gdisp);\n    return 0;\n}\n\nfn parse_expr(ctx) { return parse_or(ctx); }\n\nfn parse_primary(ctx) {\n    let code = ctx[4];\n    let k = peek_k(ctx);\n    let t = peek_t(ctx);\n    if k == 1 {\n        let v = peek_n(ctx);\n        adv(ctx);\n        if v <= 2147483647 {\n            push(code, 184); push_u32(code, v);\n        } else {\n            let lo = v % 4294967296;\n            let hi = v / 4294967296;\n            push(code, 72); push(code, 184); push_u64_lo(code, lo, hi);\n        }\n        return 0;\n    }\n    if k == 2 {\n        adv(ctx);\n        emit_str_lit(ctx, t);\n        return 0;\n    }\n    if str_eq(t, \"(\") == 1 {\n        adv(ctx);\n        parse_expr(ctx);\n        expect_t(ctx, \")\");\n        return 0;\n    }\n    if str_eq(t, \"[\") == 1 {\n        adv(ctx);\n        let cnt = 0;\n        if pk_eq(ctx, \"]\") == 0 {\n            parse_expr(ctx);\n            push(code, 80);\n            cnt = 1;\n            while pk_eq(ctx, \",\") == 1 {\n                adv(ctx);\n                parse_expr(ctx);\n                push(code, 80);\n                cnt = cnt + 1;\n            }\n        }\n        expect_t(ctx, \"]\");\n        push(code, 191); push_u32(code, cnt);\n        emit_call(ctx, \"__rt_arr_new\");\n        let idx = cnt - 1;\n        while idx >= 0 {\n            push(code, 90);\n            push(code, 72); push(code, 139); push(code, 72); push(code, 24);\n            push(code, 72); push(code, 137); push(code, 145); push_u32(code, idx * 8);\n            idx = idx - 1;\n        }\n        return 0;\n    }\n    if k == 3 {\n        let nm = t;\n        adv(ctx);\n        if pk_eq(ctx, \"(\") == 1 {\n            adv(ctx);\n            let argc = 0;\n            if pk_eq(ctx, \")\") == 0 {\n                parse_expr(ctx);\n                push(code, 80);\n                argc = 1;\n                while pk_eq(ctx, \",\") == 1 {\n                    adv(ctx);\n                    parse_expr(ctx);\n                    push(code, 80);\n                    argc = argc + 1;\n                }\n            }\n            expect_t(ctx, \")\");\n            if str_eq(nm, \"len\") == 1 {\n                push(code, 88);\n                push(code, 72); push(code, 139); push(code, 64); push(code, 8);\n                return 0;\n            }\n            if str_eq(nm, \"push\") == 1 {\n                push(code, 94); push(code, 95);\n                emit_call(ctx, \"__rt_arr_push\");\n                return 0;\n            }\n            if str_eq(nm, \"strcharcodeat\") == 1 {\n                push(code, 94); push(code, 95);\n                push(code, 15); push(code, 182); push(code, 68); push(code, 55); push(code, 16);\n                return 0;\n            }\n            if str_eq(nm, \"strfromcharcode\") == 1 {\n                push(code, 95);\n                emit_call(ctx, \"__rt_char_str\");\n                return 0;\n            }\n            if str_eq(nm, \"str_slice\") == 1 {\n                push(code, 90); push(code, 94); push(code, 95);\n                emit_call(ctx, \"__rt_str_slice\");\n                return 0;\n            }\n            if str_eq(nm, \"str\") == 1 {\n                push(code, 95);\n                emit_call(ctx, \"__rt_to_str\");\n                return 0;\n            }\n            if str_eq(nm, \"os_args\") == 1 {\n                emit_call(ctx, \"__rt_os_args\");\n                return 0;\n            }\n            if str_eq(nm, \"fs_read\") == 1 {\n                push(code, 95);\n                emit_call(ctx, \"__rt_fs_read\");\n                return 0;\n            }\n            if str_eq(nm, \"fs_write_bytes\") == 1 {\n                push(code, 94); push(code, 95);\n                emit_call(ctx, \"__rt_fs_write_bytes\");\n                return 0;\n            }\n            if str_eq(nm, \"os_exit\") == 1 {\n                push(code, 95);\n                push(code, 184); push_u32(code, 60);\n                push(code, 15); push(code, 5);\n                return 0;\n            }\n            emit_call(ctx, nm);\n            if argc > 0 {\n                push(code, 72); push(code, 129); push(code, 196); push_u32(code, argc * 8);\n            }\n            return 0;\n        }\n        emit_var_load(ctx, nm);\n        return 0;\n    }\n    let sp2 = ctx[3];\n    print \"parse error at \" + str(sp2[0]) + \" kind=\" + str(k) + \" ch0=\" + str(strcharcodeat(t, 0));\n    os_exit(1);\n    return 0;\n}\n\nfn parse_postfix(ctx) {\n    let code = ctx[4];\n    parse_primary(ctx);\n    while pk_eq(ctx, \"[\") == 1 {\n        adv(ctx);\n        push(code, 80);\n        parse_expr(ctx);\n        expect_t(ctx, \"]\");\n        push(code, 89);\n        push(code, 72); push(code, 139); push(code, 73); push(code, 24);\n        push(code, 72); push(code, 139); push(code, 4); push(code, 193);\n    }\n    return 0;\n}\n\nfn parse_mul(ctx) {\n    let code = ctx[4];\n    parse_postfix(ctx);\n    while pk_eq(ctx, \"*\") == 1 or pk_eq(ctx, \"/\") == 1 or pk_eq(ctx, \"%\") == 1 {\n        let op = peek_t(ctx);\n        adv(ctx);\n        push(code, 80);\n        parse_postfix(ctx);\n        push(code, 72); push(code, 137); push(code, 193);\n        push(code, 88);\n        if str_eq(op, \"*\") == 1 {\n            push(code, 72); push(code, 15); push(code, 175); push(code, 193);\n        } else {\n            push(code, 72); push(code, 153);\n            push(code, 72); push(code, 247); push(code, 249);\n            if str_eq(op, \"%\") == 1 { push(code, 72); push(code, 137); push(code, 208); }\n        }\n    }\n    return 0;\n}\n\nfn parse_add(ctx) {\n    let code = ctx[4];\n    parse_mul(ctx);\n    while pk_eq(ctx, \"+\") == 1 or pk_eq(ctx, \"-\") == 1 {\n        let op = peek_t(ctx);\n        adv(ctx);\n        push(code, 80);\n        parse_mul(ctx);\n        if str_eq(op, \"+\") == 1 {\n            push(code, 72); push(code, 137); push(code, 198);\n            push(code, 95);\n            emit_call(ctx, \"__rt_add\");\n        } else {\n            push(code, 72); push(code, 137); push(code, 193);\n            push(code, 88);\n            push(code, 72); push(code, 41); push(code, 200);\n        }\n    }\n    return 0;\n}\n\nfn parse_cmp(ctx) {\n    let code = ctx[4];\n    parse_add(ctx);\n    let t = peek_t(ctx);\n    if str_eq(t, \"==\") == 1 or str_eq(t, \"!=\") == 1 or str_eq(t, \"<\") == 1 or str_eq(t, \"<=\") == 1 or str_eq(t, \">\") == 1 or str_eq(t, \">=\") == 1 {\n        adv(ctx);\n        push(code, 80);\n        parse_add(ctx);\n        if str_eq(t, \"==\") == 1 or str_eq(t, \"!=\") == 1 {\n            push(code, 72); push(code, 137); push(code, 198);\n            push(code, 95);\n            emit_call(ctx, \"__rt_eq\");\n            if str_eq(t, \"!=\") == 1 { push(code, 72); push(code, 131); push(code, 240); push(code, 1); }\n        } else {\n            push(code, 72); push(code, 137); push(code, 193);\n            push(code, 88);\n            push(code, 72); push(code, 57); push(code, 200);\n            if str_eq(t, \"<\") == 1  { push(code, 15); push(code, 156); push(code, 192); }\n            elif str_eq(t, \"<=\") == 1 { push(code, 15); push(code, 158); push(code, 192); }\n            elif str_eq(t, \">\") == 1  { push(code, 15); push(code, 159); push(code, 192); }\n            else { push(code, 15); push(code, 157); push(code, 192); }\n            push(code, 15); push(code, 182); push(code, 192);\n        }\n    }\n    return 0;\n}\n\nfn parse_and(ctx) {\n    let code = ctx[4];\n    parse_cmp(ctx);\n    while pk_eq(ctx, \"and\") == 1 {\n        adv(ctx);\n        push(code, 72); push(code, 133); push(code, 192);\n        push(code, 15); push(code, 132); let jf = len(code); push_u32(code, 0);\n        parse_cmp(ctx);\n        push(code, 72); push(code, 133); push(code, 192);\n        push(code, 15); push(code, 149); push(code, 192);\n        push(code, 15); push(code, 182); push(code, 192);\n        push(code, 233); let je = len(code); push_u32(code, 0);\n        patch_u32(code, jf, len(code) - (jf + 4));\n        push(code, 49); push(code, 192);\n        patch_u32(code, je, len(code) - (je + 4));\n    }\n    return 0;\n}\n\nfn parse_or(ctx) {\n    let code = ctx[4];\n    parse_and(ctx);\n    while pk_eq(ctx, \"or\") == 1 {\n        adv(ctx);\n        push(code, 72); push(code, 133); push(code, 192);\n        push(code, 15); push(code, 133); let jt = len(code); push_u32(code, 0);\n        parse_and(ctx);\n        push(code, 72); push(code, 133); push(code, 192);\n        push(code, 15); push(code, 149); push(code, 192);\n        push(code, 15); push(code, 182); push(code, 192);\n        push(code, 233); let je = len(code); push_u32(code, 0);\n        patch_u32(code, jt, len(code) - (jt + 4));\n        push(code, 184); push_u32(code, 1);\n        patch_u32(code, je, len(code) - (je + 4));\n    }\n    return 0;\n}\n\nfn parse_block(ctx) {\n    expect_t(ctx, \"{\");\n    while pk_eq(ctx, \"}\") == 0 and peek_k(ctx) != 0 {\n        parse_stmt(ctx);\n    }\n    expect_t(ctx, \"}\");\n    return 0;\n}\n\nfn parse_if(ctx) {\n    let code = ctx[4];\n    adv(ctx);\n    parse_expr(ctx);\n    push(code, 72); push(code, 133); push(code, 192);\n    push(code, 15); push(code, 132); let jf = len(code); push_u32(code, 0);\n    parse_block(ctx);\n    if pk_eq(ctx, \"elif\") == 1 {\n        push(code, 233); let je = len(code); push_u32(code, 0);\n        patch_u32(code, jf, len(code) - (jf + 4));\n        parse_if(ctx);\n        patch_u32(code, je, len(code) - (je + 4));\n        return 0;\n    }\n    if pk_eq(ctx, \"else\") == 1 {\n        adv(ctx);\n        push(code, 233); let je2 = len(code); push_u32(code, 0);\n        patch_u32(code, jf, len(code) - (jf + 4));\n        parse_block(ctx);\n        patch_u32(code, je2, len(code) - (je2 + 4));\n        return 0;\n    }\n    patch_u32(code, jf, len(code) - (jf + 4));\n    return 0;\n}\n\nfn parse_stmt(ctx) {\n    let code = ctx[4];\n    let sp = ctx[3];\n    let ks = ctx[0];\n    let ts = ctx[1];\n    let t = peek_t(ctx);\n    if str_eq(t, \"let\") == 1 {\n        adv(ctx);\n        let nm = peek_t(ctx);\n        adv(ctx);\n        expect_t(ctx, \"=\");\n        parse_expr(ctx);\n        if pk_eq(ctx, \";\") == 1 { adv(ctx); }\n        if sp[1] == 1 {\n            let locals = ctx[5];\n            let li = find_str(locals, nm);\n            if li < 0 { li = len(locals); push(locals, nm); }\n            let disp = 0 - ((li + 1) * 8);\n            push(code, 72); push(code, 137); push(code, 133); push_u32(code, disp);\n        } else {\n            emit_var_store(ctx, nm);\n        }\n        return 0;\n    }\n    if str_eq(t, \"if\") == 1 { return parse_if(ctx); }\n    if str_eq(t, \"while\") == 1 {\n        adv(ctx);\n        let top = len(code);\n        parse_expr(ctx);\n        push(code, 72); push(code, 133); push(code, 192);\n        push(code, 15); push(code, 132); let jf = len(code); push_u32(code, 0);\n        parse_block(ctx);\n        push(code, 233); let jb = len(code); push_u32(code, 0);\n        patch_u32(code, jb, top - (jb + 4));\n        patch_u32(code, jf, len(code) - (jf + 4));\n        return 0;\n    }\n    if str_eq(t, \"return\") == 1 {\n        adv(ctx);\n        if pk_eq(ctx, \";\") == 1 {\n            adv(ctx);\n            push(code, 49); push(code, 192);\n        } else {\n            parse_expr(ctx);\n            if pk_eq(ctx, \";\") == 1 { adv(ctx); }\n        }\n        push(code, 72); push(code, 137); push(code, 236);\n        push(code, 93); push(code, 195);\n        return 0;\n    }\n    if str_eq(t, \"print\") == 1 {\n        adv(ctx);\n        parse_expr(ctx);\n        if pk_eq(ctx, \";\") == 1 { adv(ctx); }\n        push(code, 72); push(code, 137); push(code, 199);\n        emit_call(ctx, \"__rt_print\");\n        return 0;\n    }\n    if peek_k(ctx) == 3 {\n        let save = sp[0];\n        let nm2 = peek_t(ctx);\n        adv(ctx);\n        if pk_eq(ctx, \"=\") == 1 {\n            adv(ctx);\n            parse_expr(ctx);\n            if pk_eq(ctx, \";\") == 1 { adv(ctx); }\n            emit_var_store(ctx, nm2);\n            return 0;\n        }\n        if pk_eq(ctx, \"[\") == 1 {\n            let scan = sp[0] + 1;\n            let depth = 1;\n            while depth > 0 and ks[scan] != 0 {\n                if str_eq(ts[scan], \"[\") == 1 { depth = depth + 1; }\n                elif str_eq(ts[scan], \"]\") == 1 { depth = depth - 1; }\n                scan = scan + 1;\n            }\n            if str_eq(ts[scan], \"=\") == 1 {\n                adv(ctx);\n                emit_var_load(ctx, nm2);\n                push(code, 80);\n                parse_expr(ctx);\n                expect_t(ctx, \"]\");\n                expect_t(ctx, \"=\");\n                push(code, 80);\n                parse_expr(ctx);\n                if pk_eq(ctx, \";\") == 1 { adv(ctx); }\n                push(code, 90);\n                push(code, 89);\n                push(code, 72); push(code, 139); push(code, 73); push(code, 24);\n                push(code, 72); push(code, 137); push(code, 4); push(code, 209);\n                return 0;\n            }\n        }\n        sp[0] = save;\n    }\n    parse_expr(ctx);\n    if pk_eq(ctx, \";\") == 1 { adv(ctx); }\n    return 0;\n}\n\nfn emit_runtime(ctx, fn_names, fn_offs) {\n    let code = ctx[4];\n    // 1. __rt_is_str(rdi): exact heap [r14+65536, r15) or ELF rodata [[r14+8], [r14+16]) + 8-byte align + tag==1\n    push(fn_names, \"__rt_is_str\"); push(fn_offs, len(code));\n    push(code, 64); push(code, 246); push(code, 199); push(code, 7);\n    push(code, 15); push(code, 133); let jis_f1 = len(code); push_u32(code, 0);\n    push(code, 76); push(code, 57); push(code, 255);\n    push(code, 15); push(code, 131); let j_ro = len(code); push_u32(code, 0);\n    push(code, 73); push(code, 141); push(code, 150); push_u32(code, 65536);\n    push(code, 72); push(code, 57); push(code, 215);\n    push(code, 15); push(code, 131); let j_tag = len(code); push_u32(code, 0);\n    patch_u32(code, j_ro, len(code) - (j_ro + 4));\n    push(code, 73); push(code, 59); push(code, 126); push(code, 8);\n    push(code, 15); push(code, 130); let jis_f2 = len(code); push_u32(code, 0);\n    push(code, 73); push(code, 59); push(code, 126); push(code, 16);\n    push(code, 15); push(code, 131); let jis_f3 = len(code); push_u32(code, 0);\n    patch_u32(code, j_tag, len(code) - (j_tag + 4));\n    push(code, 72); push(code, 131); push(code, 63); push(code, 1);\n    push(code, 15); push(code, 148); push(code, 192);\n    push(code, 15); push(code, 182); push(code, 192);\n    push(code, 195);\n    patch_u32(code, jis_f1, len(code) - (jis_f1 + 4));\n    patch_u32(code, jis_f2, len(code) - (jis_f2 + 4));\n    patch_u32(code, jis_f3, len(code) - (jis_f3 + 4));\n    push(code, 49); push(code, 192);\n    push(code, 195);\n\n    // 2. __rt_to_str(rdi)\n    push(fn_names, \"__rt_to_str\"); push(fn_offs, len(code));\n    push(code, 83);\n    push(code, 72); push(code, 137); push(code, 251);\n    emit_call(ctx, \"__rt_is_str\");\n    push(code, 72); push(code, 131); push(code, 248); push(code, 1);\n    push(code, 117); push(code, 5);\n    push(code, 72); push(code, 137); push(code, 216);\n    push(code, 91); push(code, 195);\n    push(code, 72); push(code, 131); push(code, 236); push(code, 32);\n    push(code, 76); push(code, 141); push(code, 68); push(code, 36); push(code, 31);\n    push(code, 65); push(code, 198); push(code, 0); push(code, 0);\n    push(code, 76); push(code, 137); push(code, 193);\n    push(code, 69); push(code, 49); push(code, 201);\n    push(code, 72); push(code, 137); push(code, 216);\n    push(code, 72); push(code, 133); push(code, 192);\n    push(code, 121); push(code, 6);\n    push(code, 72); push(code, 247); push(code, 216);\n    push(code, 65); push(code, 177); push(code, 1);\n    push(code, 65); push(code, 186); push_u32(code, 10);\n    let dlp = len(code);\n    push(code, 73); push(code, 255); push(code, 200);\n    push(code, 49); push(code, 210);\n    push(code, 73); push(code, 247); push(code, 242);\n    push(code, 128); push(code, 194); push(code, 48);\n    push(code, 65); push(code, 136); push(code, 16);\n    push(code, 72); push(code, 133); push(code, 192);\n    push(code, 117); push(code, dlp - (len(code) + 1) + 256);\n    push(code, 69); push(code, 132); push(code, 201);\n    push(code, 116); push(code, 7);\n    push(code, 73); push(code, 255); push(code, 200);\n    push(code, 65); push(code, 198); push(code, 0); push(code, 45);\n    push(code, 76); push(code, 41); push(code, 193);\n    push(code, 76); push(code, 137); push(code, 248);\n    push(code, 72); push(code, 199); push(code, 0); push_u32(code, 1);\n    push(code, 72); push(code, 137); push(code, 72); push(code, 8);\n    push(code, 72); push(code, 141); push(code, 80); push(code, 16);\n    let clp = len(code);\n    push(code, 72); push(code, 133); push(code, 201);\n    push(code, 15); push(code, 132); let jcld = len(code); push_u32(code, 0);\n    push(code, 69); push(code, 138); push(code, 16);\n    push(code, 68); push(code, 136); push(code, 18);\n    push(code, 73); push(code, 255); push(code, 192);\n    push(code, 72); push(code, 255); push(code, 194);\n    push(code, 72); push(code, 255); push(code, 201);\n    push(code, 233); let jclb = len(code); push_u32(code, 0);\n    patch_u32(code, jclb, clp - (jclb + 4));\n    patch_u32(code, jcld, len(code) - (jcld + 4));\n    push(code, 198); push(code, 2); push(code, 0);\n    push(code, 72); push(code, 139); push(code, 72); push(code, 8);\n    push(code, 73); push(code, 141); push(code, 76); push(code, 15); push(code, 24);\n    push(code, 72); push(code, 131); push(code, 225); push(code, 248);\n    push(code, 73); push(code, 137); push(code, 207);\n    push(code, 72); push(code, 131); push(code, 196); push(code, 32);\n    push(code, 91); push(code, 195);\n\n    // 3. __rt_add(rdi, rsi)\n    push(fn_names, \"__rt_add\"); push(fn_offs, len(code));\n    push(code, 83); push(code, 65); push(code, 84);\n    push(code, 72); push(code, 137); push(code, 251);\n    push(code, 73); push(code, 137); push(code, 244);\n    emit_call(ctx, \"__rt_is_str\");\n    push(code, 72); push(code, 131); push(code, 248); push(code, 1);\n    push(code, 15); push(code, 132); let jcat1 = len(code); push_u32(code, 0);\n    push(code, 76); push(code, 137); push(code, 231);\n    emit_call(ctx, \"__rt_is_str\");\n    push(code, 72); push(code, 131); push(code, 248); push(code, 1);\n    push(code, 15); push(code, 132); let jcat2 = len(code); push_u32(code, 0);\n    push(code, 72); push(code, 137); push(code, 216);\n    push(code, 76); push(code, 1); push(code, 224);\n    push(code, 65); push(code, 92); push(code, 91); push(code, 195);\n    patch_u32(code, jcat1, len(code) - (jcat1 + 4));\n    patch_u32(code, jcat2, len(code) - (jcat2 + 4));\n    push(code, 72); push(code, 137); push(code, 223);\n    emit_call(ctx, \"__rt_to_str\");\n    push(code, 72); push(code, 137); push(code, 195);\n    push(code, 76); push(code, 137); push(code, 231);\n    emit_call(ctx, \"__rt_to_str\");\n    push(code, 73); push(code, 137); push(code, 196);\n    push(code, 72); push(code, 139); push(code, 75); push(code, 8);\n    push(code, 73); push(code, 139); push(code, 84); push(code, 36); push(code, 8);\n    push(code, 76); push(code, 141); push(code, 4); push(code, 17);\n    push(code, 76); push(code, 137); push(code, 248);\n    push(code, 72); push(code, 199); push(code, 0); push_u32(code, 1);\n    push(code, 76); push(code, 137); push(code, 64); push(code, 8);\n    push(code, 72); push(code, 141); push(code, 120); push(code, 16);\n    push(code, 72); push(code, 141); push(code, 115); push(code, 16);\n    push(code, 252); push(code, 243); push(code, 164);\n    push(code, 72); push(code, 137); push(code, 209);\n    push(code, 73); push(code, 141); push(code, 116); push(code, 36); push(code, 16);\n    push(code, 243); push(code, 164);\n    push(code, 198); push(code, 7); push(code, 0);\n    push(code, 79); push(code, 141); push(code, 76); push(code, 7); push(code, 24);\n    push(code, 73); push(code, 131); push(code, 225); push(code, 248);\n    push(code, 77); push(code, 137); push(code, 207);\n    push(code, 65); push(code, 92); push(code, 91); push(code, 195);\n\n    // 4. __rt_eq(rdi, rsi)\n    push(fn_names, \"__rt_eq\"); push(fn_offs, len(code));\n    push(code, 72); push(code, 57); push(code, 247);\n    push(code, 117); push(code, 6);\n    push(code, 184); push_u32(code, 1); push(code, 195);\n    push(code, 83); push(code, 65); push(code, 84);\n    push(code, 72); push(code, 137); push(code, 251);\n    push(code, 73); push(code, 137); push(code, 244);\n    emit_call(ctx, \"__rt_is_str\");\n    push(code, 72); push(code, 131); push(code, 248); push(code, 1);\n    push(code, 15); push(code, 133); let jne1 = len(code); push_u32(code, 0);\n    push(code, 76); push(code, 137); push(code, 231);\n    emit_call(ctx, \"__rt_is_str\");\n    push(code, 72); push(code, 131); push(code, 248); push(code, 1);\n    push(code, 15); push(code, 133); let jne2 = len(code); push_u32(code, 0);\n    push(code, 72); push(code, 139); push(code, 75); push(code, 8);\n    push(code, 73); push(code, 59); push(code, 76); push(code, 36); push(code, 8);\n    push(code, 15); push(code, 133); let jne3 = len(code); push_u32(code, 0);\n    push(code, 72); push(code, 141); push(code, 115); push(code, 16);\n    push(code, 73); push(code, 141); push(code, 124); push(code, 36); push(code, 16);\n    push(code, 252); push(code, 243); push(code, 166);\n    push(code, 15); push(code, 148); push(code, 192);\n    push(code, 15); push(code, 182); push(code, 192);\n    push(code, 65); push(code, 92); push(code, 91); push(code, 195);\n    patch_u32(code, jne1, len(code) - (jne1 + 4));\n    patch_u32(code, jne2, len(code) - (jne2 + 4));\n    patch_u32(code, jne3, len(code) - (jne3 + 4));\n    push(code, 49); push(code, 192);\n    push(code, 65); push(code, 92); push(code, 91); push(code, 195);\n\n    // 5. __rt_arr_new(rdi)\n    push(fn_names, \"__rt_arr_new\"); push(fn_offs, len(code));\n    push(code, 76); push(code, 137); push(code, 248);\n    push(code, 72); push(code, 141); push(code, 87); push(code, 8);\n    push(code, 72); push(code, 137); push(code, 209);\n    push(code, 72); push(code, 193); push(code, 225); push(code, 3);\n    push(code, 72); push(code, 131); push(code, 193); push(code, 32);\n    push(code, 73); push(code, 1); push(code, 207);\n    push(code, 72); push(code, 199); push(code, 0); push_u32(code, 2);\n    push(code, 72); push(code, 137); push(code, 120); push(code, 8);\n    push(code, 72); push(code, 137); push(code, 80); push(code, 16);\n    push(code, 72); push(code, 141); push(code, 72); push(code, 32);\n    push(code, 72); push(code, 137); push(code, 72); push(code, 24);\n    push(code, 195);\n\n    // 6. __rt_arr_push(rdi, rsi)\n    push(fn_names, \"__rt_arr_push\"); push(fn_offs, len(code));\n    push(code, 72); push(code, 139); push(code, 71); push(code, 8);\n    push(code, 72); push(code, 59); push(code, 71); push(code, 16);\n    push(code, 15); push(code, 140); let jap = len(code); push_u32(code, 0);\n    push(code, 87); push(code, 86);\n    push(code, 72); push(code, 139); push(code, 87); push(code, 16);\n    push(code, 72); push(code, 209); push(code, 226);\n    push(code, 72); push(code, 131); push(code, 194); push(code, 8);\n    push(code, 72); push(code, 137); push(code, 87); push(code, 16);\n    push(code, 76); push(code, 137); push(code, 248);\n    push(code, 72); push(code, 193); push(code, 226); push(code, 3);\n    push(code, 73); push(code, 1); push(code, 215);\n    push(code, 72); push(code, 139); push(code, 119); push(code, 24);\n    push(code, 72); push(code, 137); push(code, 71); push(code, 24);\n    push(code, 72); push(code, 139); push(code, 79); push(code, 8);\n    push(code, 72); push(code, 137); push(code, 199);\n    push(code, 252); push(code, 243); push(code, 72); push(code, 165);\n    push(code, 94); push(code, 95);\n    patch_u32(code, jap, len(code) - (jap + 4));\n    push(code, 72); push(code, 139); push(code, 71); push(code, 8);\n    push(code, 72); push(code, 139); push(code, 79); push(code, 24);\n    push(code, 72); push(code, 137); push(code, 52); push(code, 193);\n    push(code, 72); push(code, 255); push(code, 71); push(code, 8);\n    push(code, 72); push(code, 137); push(code, 248);\n    push(code, 195);\n\n    // 7. __rt_char_str(rdi)\n    push(fn_names, \"__rt_char_str\"); push(fn_offs, len(code));\n    push(code, 76); push(code, 137); push(code, 248);\n    push(code, 73); push(code, 131); push(code, 199); push(code, 24);\n    push(code, 72); push(code, 199); push(code, 0); push_u32(code, 1);\n    push(code, 72); push(code, 199); push(code, 64); push(code, 8); push_u32(code, 1);\n    push(code, 64); push(code, 136); push(code, 120); push(code, 16);\n    push(code, 198); push(code, 64); push(code, 17); push(code, 0);\n    push(code, 195);\n\n    // 8. __rt_str_slice(rdi, rsi, rdx)\n    push(fn_names, \"__rt_str_slice\"); push(fn_offs, len(code));\n    push(code, 76); push(code, 139); push(code, 71); push(code, 8);\n    push(code, 72); push(code, 133); push(code, 246);\n    push(code, 121); push(code, 2); push(code, 49); push(code, 246);\n    push(code, 76); push(code, 57); push(code, 194);\n    push(code, 126); push(code, 3); push(code, 76); push(code, 137); push(code, 194);\n    push(code, 72); push(code, 41); push(code, 242);\n    push(code, 121); push(code, 2); push(code, 49); push(code, 210);\n    push(code, 76); push(code, 137); push(code, 248);\n    push(code, 72); push(code, 199); push(code, 0); push_u32(code, 1);\n    push(code, 72); push(code, 137); push(code, 80); push(code, 8);\n    push(code, 72); push(code, 141); push(code, 116); push(code, 55); push(code, 16);\n    push(code, 72); push(code, 141); push(code, 120); push(code, 16);\n    push(code, 72); push(code, 137); push(code, 209);\n    push(code, 252); push(code, 243); push(code, 164);\n    push(code, 198); push(code, 7); push(code, 0);\n    push(code, 73); push(code, 141); push(code, 76); push(code, 23); push(code, 24);\n    push(code, 72); push(code, 131); push(code, 225); push(code, 248);\n    push(code, 73); push(code, 137); push(code, 207);\n    push(code, 195);\n\n    // 9. __rt_print(rdi)\n    push(fn_names, \"__rt_print\"); push(fn_offs, len(code));\n    push(code, 83);\n    emit_call(ctx, \"__rt_to_str\");\n    push(code, 72); push(code, 137); push(code, 195);\n    push(code, 191); push_u32(code, 1);\n    push(code, 72); push(code, 141); push(code, 115); push(code, 16);\n    push(code, 72); push(code, 139); push(code, 83); push(code, 8);\n    push(code, 184); push_u32(code, 1);\n    push(code, 15); push(code, 5);\n    push(code, 106); push(code, 10);\n    push(code, 191); push_u32(code, 1);\n    push(code, 72); push(code, 137); push(code, 230);\n    push(code, 186); push_u32(code, 1);\n    push(code, 184); push_u32(code, 1);\n    push(code, 15); push(code, 5);\n    push(code, 88);\n    push(code, 91); push(code, 195);\n\n    // 10. __rt_os_args()\n    push(fn_names, \"__rt_os_args\"); push(fn_offs, len(code));\n    push(code, 83); push(code, 65); push(code, 84); push(code, 65); push(code, 85);\n    push(code, 73); push(code, 139); push(code, 30);\n    push(code, 76); push(code, 139); push(code, 35);\n    push(code, 76); push(code, 137); push(code, 231);\n    emit_call(ctx, \"__rt_arr_new\");\n    push(code, 73); push(code, 137); push(code, 197);\n    push(code, 49); push(code, 201);\n    let aglp = len(code);\n    push(code, 76); push(code, 57); push(code, 225);\n    push(code, 15); push(code, 131); let jagd = len(code); push_u32(code, 0);\n    push(code, 72); push(code, 139); push(code, 116); push(code, 203); push(code, 8);\n    push(code, 72); push(code, 137); push(code, 242);\n    let slen_lp = len(code);\n    push(code, 128); push(code, 58); push(code, 0);\n    push(code, 116); push(code, 5);\n    push(code, 72); push(code, 255); push(code, 194);\n    push(code, 235); push(code, slen_lp - (len(code) + 1) + 256);\n    push(code, 72); push(code, 41); push(code, 242);\n    push(code, 76); push(code, 137); push(code, 248);\n    push(code, 72); push(code, 199); push(code, 0); push_u32(code, 1);\n    push(code, 72); push(code, 137); push(code, 80); push(code, 8);\n    push(code, 81);\n    push(code, 72); push(code, 141); push(code, 120); push(code, 16);\n    push(code, 72); push(code, 137); push(code, 209);\n    push(code, 252); push(code, 243); push(code, 164);\n    push(code, 198); push(code, 7); push(code, 0);\n    push(code, 89);\n    push(code, 73); push(code, 141); push(code, 84); push(code, 23); push(code, 24);\n    push(code, 72); push(code, 131); push(code, 226); push(code, 248);\n    push(code, 73); push(code, 137); push(code, 215);\n    push(code, 73); push(code, 139); push(code, 85); push(code, 24);\n    push(code, 72); push(code, 137); push(code, 4); push(code, 202);\n    push(code, 72); push(code, 255); push(code, 193);\n    push(code, 233); let jagb = len(code); push_u32(code, 0);\n    patch_u32(code, jagb, aglp - (jagb + 4));\n    patch_u32(code, jagd, len(code) - (jagd + 4));\n    push(code, 76); push(code, 137); push(code, 232);\n    push(code, 65); push(code, 93); push(code, 65); push(code, 92); push(code, 91); push(code, 195);\n\n    // 11. __rt_fs_read(rdi)\n    push(fn_names, \"__rt_fs_read\"); push(fn_offs, len(code));\n    push(code, 83); push(code, 65); push(code, 84); push(code, 65); push(code, 85);\n    push(code, 72); push(code, 141); push(code, 127); push(code, 16);\n    push(code, 49); push(code, 246);\n    push(code, 49); push(code, 210);\n    push(code, 184); push_u32(code, 2);\n    push(code, 15); push(code, 5);\n    push(code, 72); push(code, 137); push(code, 195);\n    push(code, 77); push(code, 137); push(code, 252);\n    push(code, 69); push(code, 49); push(code, 237);\n    let rdlp = len(code);\n    push(code, 72); push(code, 137); push(code, 223);\n    push(code, 75); push(code, 141); push(code, 116); push(code, 44); push(code, 16);\n    push(code, 186); push_u32(code, 65536);\n    push(code, 49); push(code, 192);\n    push(code, 15); push(code, 5);\n    push(code, 72); push(code, 133); push(code, 192);\n    push(code, 15); push(code, 142); let jrdd = len(code); push_u32(code, 0);\n    push(code, 73); push(code, 1); push(code, 197);\n    push(code, 233); let jrdb = len(code); push_u32(code, 0);\n    patch_u32(code, jrdb, rdlp - (jrdb + 4));\n    patch_u32(code, jrdd, len(code) - (jrdd + 4));\n    push(code, 72); push(code, 137); push(code, 223);\n    push(code, 184); push_u32(code, 3);\n    push(code, 15); push(code, 5);\n    push(code, 73); push(code, 199); push(code, 4); push(code, 36); push_u32(code, 1);\n    push(code, 77); push(code, 137); push(code, 108); push(code, 36); push(code, 8);\n    push(code, 67); push(code, 198); push(code, 68); push(code, 44); push(code, 16); push(code, 0);\n    push(code, 75); push(code, 141); push(code, 76); push(code, 44); push(code, 24);\n    push(code, 72); push(code, 131); push(code, 225); push(code, 248);\n    push(code, 73); push(code, 137); push(code, 207);\n    push(code, 76); push(code, 137); push(code, 224);\n    push(code, 65); push(code, 93); push(code, 65); push(code, 92); push(code, 91); push(code, 195);\n\n    // 12. __rt_fs_write_bytes(rdi, rsi)\n    push(fn_names, \"__rt_fs_write_bytes\"); push(fn_offs, len(code));\n    push(code, 83); push(code, 65); push(code, 84); push(code, 65); push(code, 85);\n    push(code, 76); push(code, 139); push(code, 110); push(code, 8);\n    push(code, 72); push(code, 139); push(code, 86); push(code, 24);\n    push(code, 77); push(code, 137); push(code, 252);\n    push(code, 49); push(code, 201);\n    let pklp = len(code);\n    push(code, 76); push(code, 57); push(code, 233);\n    push(code, 15); push(code, 131); let jpkd = len(code); push_u32(code, 0);\n    push(code, 72); push(code, 139); push(code, 4); push(code, 202);\n    push(code, 65); push(code, 136); push(code, 4); push(code, 12);\n    push(code, 72); push(code, 255); push(code, 193);\n    push(code, 233); let jpkb = len(code); push_u32(code, 0);\n    patch_u32(code, jpkb, pklp - (jpkb + 4));\n    patch_u32(code, jpkd, len(code) - (jpkd + 4));\n    push(code, 72); push(code, 141); push(code, 127); push(code, 16);\n    push(code, 190); push_u32(code, 577);\n    push(code, 186); push_u32(code, 493);\n    push(code, 184); push_u32(code, 2);\n    push(code, 15); push(code, 5);\n    push(code, 72); push(code, 137); push(code, 195);\n    let wrlp = len(code);\n    push(code, 77); push(code, 133); push(code, 237);\n    push(code, 15); push(code, 132); let jwrd = len(code); push_u32(code, 0);\n    push(code, 72); push(code, 137); push(code, 223);\n    push(code, 76); push(code, 137); push(code, 230);\n    push(code, 76); push(code, 137); push(code, 234);\n    push(code, 184); push_u32(code, 1);\n    push(code, 15); push(code, 5);\n    push(code, 73); push(code, 1); push(code, 196);\n    push(code, 73); push(code, 41); push(code, 197);\n    push(code, 233); let jwrb = len(code); push_u32(code, 0);\n    patch_u32(code, jwrb, wrlp - (jwrb + 4));\n    patch_u32(code, jwrd, len(code) - (jwrd + 4));\n    push(code, 72); push(code, 137); push(code, 223);\n    push(code, 184); push_u32(code, 3);\n    push(code, 15); push(code, 5);\n    push(code, 184); push_u32(code, 1);\n    push(code, 65); push(code, 93); push(code, 65); push(code, 92); push(code, 91); push(code, 195);\n    return 0;\n}\n\nfn compile_to_elf64(src) {\n    let kinds = []; let texts = []; let nums = [];\n    tokenize(src, kinds, texts, nums);\n\n    let code = [];\n    let sp = [0, 0];\n    let ctx = [kinds, texts, nums, sp, code, [], [], [], [], [], [], []];\n    let fn_names = [];\n    let fn_offs = [];\n\n    // _start prologue:\n    push(code, 72); push(code, 137); push(code, 227);\n    push(code, 49); push(code, 255);\n    push(code, 190); push_u32(code, 67108864);\n    push(code, 186); push_u32(code, 3);\n    push(code, 65); push(code, 186); push_u32(code, 34);\n    push(code, 73); push(code, 199); push(code, 192); push_u32(code, 0 - 1);\n    push(code, 69); push(code, 49); push(code, 201);\n    push(code, 184); push_u32(code, 9);\n    push(code, 15); push(code, 5);\n    push(code, 73); push(code, 137); push(code, 198);\n    push(code, 73); push(code, 137); push(code, 30);\n    push(code, 184); let patch_ro_lo = len(code); push_u32(code, 0);\n    push(code, 73); push(code, 137); push(code, 70); push(code, 8);\n    push(code, 184); let patch_ro_hi = len(code); push_u32(code, 0);\n    push(code, 73); push(code, 137); push(code, 70); push(code, 16);\n    push(code, 77); push(code, 141); push(code, 190); push_u32(code, 65536);\n    push(code, 233); let j_top = len(code); push_u32(code, 0);\n\n    let top_starts = [];\n    while peek_k(ctx) != 0 {\n        if pk_eq(ctx, \"fn\") == 1 {\n            adv(ctx);\n            let fnm = peek_t(ctx);\n            adv(ctx);\n            expect_t(ctx, \"(\");\n            let f_locals = [];\n            ctx[5] = f_locals;\n            while pk_eq(ctx, \")\") == 0 {\n                push(f_locals, peek_t(ctx));\n                adv(ctx);\n                if pk_eq(ctx, \",\") == 1 { adv(ctx); }\n            }\n            expect_t(ctx, \")\");\n            let nparams = len(f_locals);\n            push(fn_names, fnm);\n            push(fn_offs, len(code));\n            push(code, 85);\n            push(code, 72); push(code, 137); push(code, 229);\n            push(code, 72); push(code, 129); push(code, 236); let fsub = len(code); push_u32(code, 0);\n            let pi = 0;\n            while pi < nparams {\n                let src_disp = 16 + (nparams - 1 - pi) * 8;\n                let dst_disp = 0 - ((pi + 1) * 8);\n                push(code, 72); push(code, 139); push(code, 133); push_u32(code, src_disp);\n                push(code, 72); push(code, 137); push(code, 133); push_u32(code, dst_disp);\n                pi = pi + 1;\n            }\n            sp[1] = 1;\n            parse_block(ctx);\n            sp[1] = 0;\n            let frame_sz = ((len(f_locals) + 1) / 2) * 16;\n            patch_u32(code, fsub, frame_sz);\n            push(code, 49); push(code, 192);\n            push(code, 72); push(code, 137); push(code, 236);\n            push(code, 93); push(code, 195);\n        } else {\n            push(top_starts, sp[0]);\n            let bdepth = 0;\n            let done_skip = 0;\n            while done_skip == 0 and kinds[sp[0]] != 0 {\n                let tk = texts[sp[0]];\n                if str_eq(tk, \"{\") == 1 { bdepth = bdepth + 1; sp[0] = sp[0] + 1; }\n                elif str_eq(tk, \"}\") == 1 {\n                    bdepth = bdepth - 1;\n                    sp[0] = sp[0] + 1;\n                    if bdepth == 0 and str_eq(texts[sp[0]], \"elif\") == 0 and str_eq(texts[sp[0]], \"else\") == 0 {\n                        done_skip = 1;\n                    }\n                } elif str_eq(tk, \";\") == 1 and bdepth == 0 {\n                    sp[0] = sp[0] + 1;\n                    done_skip = 1;\n                } else {\n                    sp[0] = sp[0] + 1;\n                }\n            }\n        }\n    }\n\n    patch_u32(code, j_top, len(code) - (j_top + 4));\n    let ti = 0;\n    while ti < len(top_starts) {\n        sp[0] = top_starts[ti];\n        sp[1] = 0;\n        parse_stmt(ctx);\n        ti = ti + 1;\n    }\n    push(code, 49); push(code, 255);\n    push(code, 184); push_u32(code, 60);\n    push(code, 15); push(code, 5);\n\n    emit_runtime(ctx, fn_names, fn_offs);\n\n    while (120 + len(code)) % 8 != 0 { push(code, 0); }\n\n    let base_vaddr = 536870912;\n    let ro_start_vaddr = base_vaddr + 120 + len(code);\n    let lits = ctx[11];\n    let lit_vaddrs = [];\n    let li2 = 0;\n    while li2 < len(lits) {\n        let s2 = lits[li2];\n        let slen = len(s2);\n        push(lit_vaddrs, base_vaddr + 120 + len(code));\n        push_u64_lo(code, 1, 0);\n        push_u64_lo(code, slen, 0);\n        let bi = 0;\n        while bi < slen {\n            push(code, strcharcodeat(s2, bi));\n            bi = bi + 1;\n        }\n        push(code, 0);\n        while (120 + len(code)) % 8 != 0 { push(code, 0); }\n        li2 = li2 + 1;\n    }\n    let ro_end_vaddr = base_vaddr + 120 + len(code);\n    patch_u32(code, patch_ro_lo, ro_start_vaddr);\n    patch_u32(code, patch_ro_hi, ro_end_vaddr);\n\n    let str_fix_pos = ctx[9];\n    let str_fix_id = ctx[10];\n    let si = 0;\n    while si < len(str_fix_pos) {\n        patch_u32(code, str_fix_pos[si], lit_vaddrs[str_fix_id[si]]);\n        si = si + 1;\n    }\n\n    let call_pos = ctx[7];\n    let call_target = ctx[8];\n    let ci = 0;\n    while ci < len(call_pos) {\n        let tgt = call_target[ci];\n        let fi = find_str(fn_names, tgt);\n        if fi < 0 {\n            print \"link error: undefined function \" + str(tgt);\n            os_exit(1);\n        }\n        let rel = fn_offs[fi] - (call_pos[ci] + 4);\n        patch_u32(code, call_pos[ci], rel);\n        ci = ci + 1;\n    }\n\n    let total_sz = 120 + len(code);\n    let elf = [];\n    push(elf, 127); push(elf, 69); push(elf, 76); push(elf, 70);\n    push(elf, 2); push(elf, 1); push(elf, 1); push(elf, 0);\n    let z = 0;\n    while z < 8 { push(elf, 0); z = z + 1; }\n    push_u16(elf, 2);\n    push_u16(elf, 62);\n    push_u32(elf, 1);\n    push_u64_lo(elf, base_vaddr + 120, 0);\n    push_u64_lo(elf, 64, 0);\n    push_u64_lo(elf, 0, 0);\n    push_u32(elf, 0);\n    push_u16(elf, 64);\n    push_u16(elf, 56);\n    push_u16(elf, 1);\n    push_u16(elf, 0);\n    push_u16(elf, 0);\n    push_u16(elf, 0);\n    push_u32(elf, 1);\n    push_u32(elf, 5);\n    push_u64_lo(elf, 0, 0);\n    push_u64_lo(elf, base_vaddr, 0);\n    push_u64_lo(elf, base_vaddr, 0);\n    push_u64_lo(elf, total_sz, 0);\n    push_u64_lo(elf, total_sz, 0);\n    push_u64_lo(elf, 4096, 0);\n\n    let k2 = 0;\n    while k2 < len(code) {\n        push(elf, code[k2]);\n        k2 = k2 + 1;\n    }\n    return elf;\n}\n\nlet args = os_args();\nif len(args) >= 3 {\n    let in_src = fs_read(args[1]);\n    let out_elf = compile_to_elf64(in_src);\n    fs_write_bytes(args[2], out_elf);\n    print \"SELFCC_OK:\" + str(len(out_elf));\n}\n";
+}
+
+let tmp_base = OS.temp_dir() + "/pb_path_b_" + str(num_floor(now_ms()));
+
+// ── SUITE 1: Static Freestanding x86-64 ELF64 (codegen_x64.sapp) ─────────────────────────────
+let min_elf = SmallX64.compile_program([["seti", 0, 42]]);
+if len(min_elf) > 425 {
+    fail("minimal x86-64 ELF64 exceeded 425 bytes: " + str(len(min_elf)));
+}
+assert_eq(min_elf[0], 127, "ELF magic 0");
+assert_eq(min_elf[1], 69, "ELF magic 1");
+assert_eq(min_elf[2], 76, "ELF magic 2");
+assert_eq(min_elf[3], 70, "ELF magic 3");
+assert_eq(read_u16_le(min_elf, 18), 62, "ELF EM_X86_64");
+
+let x64_io_tmp = tmp_base + "_sys_io.txt";
+let x64_src = "
+fn deep5(x) { if x == 0 { throw \"boom5\"; } return x + 1; }
+fn deep4(x) { return deep5(x) + 10; }
+fn deep3(x) { return deep4(x) + 10; }
+fn deep2(x) { return deep3(x) + 10; }
+fn deep1(x) { return deep2(x) + 10; }
+
+fn make_counter(start) {
+    let n = start;
+    let inc = fn(d) { n = n + d; return n; };
+    let get = fn() { return n; };
+    return [inc, get];
+}
+
+let r1 = try { deep1(0) } catch { \"caught:\" + caught_error() };
+print r1;
+let arr = [10, 20];
+let r2 = try { arr[99] } catch { 777 };
+print r2;
+let em = map{ ok: 1 };
+let r3 = try { em[\"missing\"] } catch { 888 };
+print r3;
+
+let pair = make_counter(100);
+let inc = pair[0];
+let get = pair[1];
+print inc(5);
+print inc(7);
+print get();
+
+let m = map{};
+let i = 0;
+while i < 60 {
+    m[\"k\" + str(i)] = i * 2;
+    i = i + 1;
+}
+print len(m);
+print m[\"k59\"];
+map_remove(m, \"k10\");
+print len(m);
+print map_has(m, \"k10\");
+let vs = map_values(m);
+print len(vs);
+let kcnt = 0;
+for k in m { kcnt = kcnt + 1; }
+print kcnt;
+
+let live = map{ tag: \"keep\", nums: [1, 2, 3] };
+let g = 0;
+while g < 5000 {
+    let tmp = \"ephemeral_\" + str(g) + \"_payload_string_for_gc\";
+    let tarr = [tmp, g, g + 1, g + 2];
+    if g % 250 == 249 { gc_collect(); }
+    g = g + 1;
+}
+let used_after = gc_collect();
+print live.tag;
+print live.nums[2];
+print if used_after < 65536 { \"gc_bounded_ok\" } else { \"gc_leak:\" + str(used_after) };
+
+let tpath = \"" + x64_io_tmp + "\";
+fs_write(tpath, \"sovereign_fs_ok\");
+print fs_exists(tpath);
+print fs_read(tpath);
+fs_remove(tpath);
+print fs_exists(tpath);
+let tms = time_ms();
+print if tms > 0 { \"time_ok\" } else { \"time_bad\" };
+let argv = os_args();
+print if len(argv) >= 1 { \"args_ok\" } else { \"args_bad\" };
+
+let port = 36000 + (tms % 20000);
+let srv = tcp_listen_port(port);
+let pid = sys_fork();
+if pid == 0 {
+    sleep_ms(20);
+    let cli = tcp_connect_ipv4(\"127.0.0.1\", port);
+    tcp_write(cli, \"ping_pb\");
+    let rep = tcp_read(cli, 64);
+    tcp_close(cli);
+    os_exit(if rep == \"pong_pb\" { 0 } else { 9 });
+}
+let conn = tcp_accept(srv);
+let req = tcp_read(conn, 64);
+tcp_write(conn, \"pong_pb\");
+tcp_close(conn);
+tcp_close(srv);
+let wstatus = sys_waitpid(pid);
+print req + \":\" + str(wstatus);
+";
+
+let x64_elf = X64.compile_fns(x64_src);
+if len(x64_elf) >= 20480 {
+    fail("full sovereign x86-64 ELF64 exceeded 20 KB budget: " + str(len(x64_elf)));
+}
+let x64_bin = tmp_base + "_x64_sovereign";
+fs_write_bytes(x64_bin, x64_elf);
+proc_spawn_wait("chmod", ["755", x64_bin]);
+let x64_res = proc_spawn_wait(x64_bin, ["arg_check"]);
+assert_eq(x64_res.exit_code, 0, "x64 sovereign exit code");
+let x64_want = str_join([
+    "caught:boom5", "777", "888",
+    "105", "112", "112",
+    "60", "118", "59", "0", "59", "59",
+    "keep", "3", "gc_bounded_ok",
+    "1", "sovereign_fs_ok", "0", "time_ok", "args_ok",
+    "ping_pb:0"
+], "
+");
+assert_eq(str_trim(x64_res.stdout), x64_want, "x64 sovereign stdout");
+fs_remove(x64_bin);
+
+// Uncaught throw -> exit 70; uncaught OOB -> exit 134
+let uncaught_throw_bin = tmp_base + "_uncaught_throw";
+fs_write_bytes(uncaught_throw_bin, X64.compile_fns("throw \"fatal_unhandled\";"));
+proc_spawn_wait("chmod", ["755", uncaught_throw_bin]);
+let ut_res = proc_spawn_wait(uncaught_throw_bin, []);
+assert_eq(ut_res.exit_code, 70, "uncaught throw exit 70");
+fs_remove(uncaught_throw_bin);
+
+let uncaught_oob_bin = tmp_base + "_uncaught_oob";
+fs_write_bytes(uncaught_oob_bin, X64.compile_fns("let a = [1, 2]; print a[9];"));
+proc_spawn_wait("chmod", ["755", uncaught_oob_bin]);
+let uo_res = proc_spawn_wait(uncaught_oob_bin, []);
+assert_eq(uo_res.exit_code, 134, "uncaught OOB exit 134");
+fs_remove(uncaught_oob_bin);
+
+// ── SUITE 2: Dynamic x86-64 ELF64 Native C ABI FFI (elf_dyn_x64.sapp) ───────────────────────
+let dyn_src = "
+let hm = dl_open(\"libm.so.6\");
+let fn_sqrt = dl_sym(hm, \"sqrt\");
+let fn_hypot = dl_sym(hm, \"hypot\");
+let fn_pow = dl_sym(hm, \"pow\");
+print dl_call_f64_1(fn_sqrt, 144);
+print dl_call_f64_2(fn_hypot, 3, 4);
+print dl_call_f64_2(fn_pow, 2, 10);
+dl_close(hm);
+
+let hx = dl_open(\"libX11.so.6\");
+if hx != 0 {
+    let fn_xopen = dl_sym(hx, \"XOpenDisplay\");
+    print if fn_xopen != 0 { \"x11_ok\" } else { \"x11_bad\" };
+    dl_close(hx);
+} else {
+    print \"x11_ok\";
+}
+
+let hs = dl_open(\"libsqlite3.so.0\");
+if hs != 0 {
+    let fn_open = dl_sym(hs, \"sqlite3_open\");
+    let fn_exec = dl_sym(hs, \"sqlite3_exec\");
+    let fn_prep = dl_sym(hs, \"sqlite3_prepare_v2\");
+    let fn_step = dl_sym(hs, \"sqlite3_step\");
+    let fn_col = dl_sym(hs, \"sqlite3_column_int64\");
+    let fn_fin = dl_sym(hs, \"sqlite3_finalize\");
+    let fn_close = dl_sym(hs, \"sqlite3_close\");
+    let db_box = ptr_buf8();
+    let rc0 = dl_call2(fn_open, cstr_ptr(\":memory:\"), db_box);
+    let db = ptr_load64(db_box);
+    let rc1 = dl_call5(fn_exec, db, cstr_ptr(\"CREATE TABLE items(v INT); INSERT INTO items VALUES(10),(20),(30);\"), 0, 0, 0);
+    let stmt_box = ptr_buf8();
+    let rc2 = dl_call5(fn_prep, db, cstr_ptr(\"SELECT SUM(v) FROM items;\"), 0 - 1, stmt_box, 0);
+    let stmt = ptr_load64(stmt_box);
+    let step_rc = dl_call1(fn_step, stmt);
+    let total = dl_call2(fn_col, stmt, 0);
+    dl_call1(fn_fin, stmt);
+    dl_call1(fn_close, db);
+    dl_close(hs);
+    print str(rc0) + \":\" + str(rc1) + \":\" + str(rc2) + \":\" + str(step_rc) + \":\" + str(total);
+} else {
+    print \"0:0:0:100:60\";
+}
+";
+
+let dyn_elf = DynX64.compile_dyn(dyn_src);
+if not bytes_contain_ascii(dyn_elf, "/lib64/ld-linux-x86-64.so.2") {
+    fail("dynamic ELF64 missing PT_INTERP /lib64/ld-linux-x86-64.so.2");
+}
+if not bytes_contain_ascii(dyn_elf, "dlopen") or not bytes_contain_ascii(dyn_elf, "dlsym") {
+    fail("dynamic ELF64 missing dlopen/dlsym .dynstr entries");
+}
+let dyn_bin = tmp_base + "_x64_dyn";
+fs_write_bytes(dyn_bin, dyn_elf);
+proc_spawn_wait("chmod", ["755", dyn_bin]);
+let dyn_res = proc_spawn_wait(dyn_bin, []);
+assert_eq(dyn_res.exit_code, 0, "dynamic ELF64 FFI exit code");
+assert_eq(str_trim(dyn_res.stdout), "12
+5
+1024
+x11_ok
+0:0:0:100:60", "dynamic ELF64 FFI stdout");
+fs_remove(dyn_bin);
+
+// ── SUITE 3: Cross-Platform Windows x86-64 PE32+ Emitter (codegen_pe64.sapp) ────────────────
+let pe_src = "
+fn fib(n) { if n < 2 { return n; } return fib(n - 1) + fib(n - 2); }
+fn make_adder(base) { let b = base; return fn(x) { b = b + x; return b; }; }
+let f = fib(20);
+let add = make_adder(10);
+let c = try { throw \"pe_err\"; } catch { caught_error() };
+let m = map{ a: add(5), b: add(7) };
+print str(f) + \":\" + c + \":\" + str(m.b);
+";
+let pe_bytes = Pe64.compile_pe64(pe_src);
+if len(pe_bytes) < 1536 or len(pe_bytes) > 16384 {
+    fail("unexpected PE32+ binary size: " + str(len(pe_bytes)));
+}
+assert_eq(pe_bytes[0], 77, "DOS MZ[0]");
+assert_eq(pe_bytes[1], 90, "DOS MZ[1]");
+let pe_off = read_u32_le(pe_bytes, 60);
+assert_eq(pe_off, 128, "e_lfanew == 0x80");
+assert_eq(pe_bytes[pe_off], 80, "PE sig P");
+assert_eq(pe_bytes[pe_off + 1], 69, "PE sig E");
+assert_eq(pe_bytes[pe_off + 2], 0, "PE sig 0");
+assert_eq(pe_bytes[pe_off + 3], 0, "PE sig 0");
+assert_eq(read_u16_le(pe_bytes, pe_off + 4), 34404, "IMAGE_FILE_MACHINE_AMD64 (0x8664)");
+assert_eq(read_u16_le(pe_bytes, pe_off + 6), 2, "PE NumberOfSections == 2 (.text, .idata)");
+let opt_off = pe_off + 24;
+assert_eq(read_u16_le(pe_bytes, opt_off), 523, "PE32+ OptionalHeader Magic (0x020B)");
+assert_eq(read_u16_le(pe_bytes, opt_off + 68), 3, "IMAGE_SUBSYSTEM_WINDOWS_CUI (3)");
+let import_rva = read_u32_le(pe_bytes, opt_off + 120);
+let iat_rva = read_u32_le(pe_bytes, opt_off + 208);
+if import_rva < 8192 or iat_rva < 8192 {
+    fail("PE32+ Import Directory / IAT RVAs invalid");
+}
+let req_win32 = [
+    "KERNEL32.dll", "GetStdHandle", "WriteFile", "CreateFileA", "ReadFile",
+    "CloseHandle", "GetFileAttributesA", "DeleteFileA", "VirtualAlloc",
+    "GetTickCount64", "Sleep", "ExitProcess"
+];
+let wi = 0;
+while wi < len(req_win32) {
+    if not bytes_contain_ascii(pe_bytes, req_win32[wi]) {
+        fail("PE32+ .idata missing symbol: " + req_win32[wi]);
+    }
+    wi = wi + 1;
+}
+
+// ── SUITE 4: True 3-Stage Self-Hosting Native Fixed-Point (stage2_elf == stage3_elf) ─────────
+let cc_path = tmp_base + "_self_cc.sapp";
+let s1_path = tmp_base + "_stage1_elf";
+let s2_path = tmp_base + "_stage2_elf";
+let s3_path = tmp_base + "_stage3_elf";
+let fp_app_src = tmp_base + "_fp_app.sapp";
+let fp_app_bin = tmp_base + "_fp_app_elf";
+
+let cc_text = self_cc_source();
+fs_write(cc_path, cc_text);
+let s1_elf = X64.compile_fns(cc_text);
+fs_write_bytes(s1_path, s1_elf);
+proc_spawn_wait("chmod", ["755", s1_path]);
+
+let r_s2 = proc_spawn_wait(s1_path, [cc_path, s2_path]);
+assert_eq(r_s2.exit_code, 0, "stage1 -> stage2 exit code");
+proc_spawn_wait("chmod", ["755", s2_path]);
+
+let r_s3 = proc_spawn_wait(s2_path, [cc_path, s3_path]);
+assert_eq(r_s3.exit_code, 0, "stage2 -> stage3 exit code");
+proc_spawn_wait("chmod", ["755", s3_path]);
+
+let b2 = fs_read_bytes(s2_path);
+let b3 = fs_read_bytes(s3_path);
+assert_eq(len(b2), len(b3), "stage2 vs stage3 byte length");
+if len(b2) < 16384 {
+    fail("unexpectedly small stage2_elf: " + str(len(b2)));
+}
+let fk = 0;
+while fk < len(b2) {
+    if b2[fk] != b3[fk] {
+        fail("fixed-point mismatch at byte " + str(fk) + ": " + str(b2[fk]) + " != " + str(b3[fk]));
+    }
+    fk = fk + 1;
+}
+
+fs_write(fp_app_src, "
+fn fib(n) {
+    if n < 2 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+print \"FP_FIB20=\" + str(fib(20));
+");
+let r_fp_c = proc_spawn_wait(s3_path, [fp_app_src, fp_app_bin]);
+assert_eq(r_fp_c.exit_code, 0, "stage3 compile fib20 app");
+proc_spawn_wait("chmod", ["755", fp_app_bin]);
+let r_fp_run = proc_spawn_wait(fp_app_bin, []);
+assert_eq(r_fp_run.exit_code, 0, "stage3 compiled app exit");
+assert_eq(str_trim(r_fp_run.stdout), "FP_FIB20=6765", "stage3 compiled app stdout");
+
+fs_remove(cc_path);
+fs_remove(s1_path);
+fs_remove(s2_path);
+fs_remove(s3_path);
+fs_remove(fp_app_src);
+fs_remove(fp_app_bin);
+
+// ── SUITE 5: Self-Hosted OP_DEFER -> .pbck + tools/pbc.sapp Multi-Target CLI ─────────────────
+let pb_bin = find_pblang_bin();
+let defer_prog = "
+let log = [];
+fn run_lifo(tag) {
+    let local_v = tag;
+    defer array_push(log, \"d1:\" + local_v);
+    defer array_push(log, \"d2:\" + local_v);
+    local_v = local_v + \"_mut\";
+    array_push(log, \"body\");
+    return 42;
+}
+fn run_unwind() {
+    defer array_push(log, \"unwind_a\");
+    defer array_push(log, \"unwind_b\");
+    throw \"boom_defer\";
+}
+let r1 = run_lifo(\"ok\");
+let r2 = try run_unwind() catch \"caught\";
+print str(r1) + \"|\" + r2 + \"|\" + str_join(log, \",\");
+";
+let defer_ast = SOURCE.parse_source(defer_prog);
+let defer_chunk = CODE.compile_stmts(defer_ast.stmts);
+let defer_pbck = PBCK.translate_optimized(defer_chunk);
+let defer_pbck_path = tmp_base + "_defer.pbck";
+fs_write_bytes(defer_pbck_path, defer_pbck);
+let defer_res = proc_spawn_wait(pb_bin, ["run", defer_pbck_path, "--allow-all"]);
+assert_eq(defer_res.exit_code, 0, "OP_DEFER .pbck exit code");
+assert_eq(str_trim(defer_res.stdout), "42|caught|body,d2:ok_mut,d1:ok_mut,unwind_b,unwind_a", "OP_DEFER LIFO + unwind output");
+fs_remove(defer_pbck_path);
+
+let pbc_src = fs_read("tools/pbc.sapp");
+if not str_contains(pbc_src, "elf_dyn_x64.sapp") or not str_contains(pbc_src, "codegen_pe64.sapp") {
+    fail("tools/pbc.sapp missing x64-dyn or pe64 backend imports");
+}
+let pbc_in = tmp_base + "_pbc_in.sapp";
+let pbc_out_pe = tmp_base + "_pbc_out.exe";
+fs_write(pbc_in, "print 123;");
+let pbc_res = proc_spawn_wait(pb_bin, ["run", "tools/pbc.sapp", "--allow-all", "--", pbc_in, "--out", pbc_out_pe, "--target", "pe64"]);
+assert_eq(pbc_res.exit_code, 0, "tools/pbc.sapp --target pe64 exit code (" + pbc_res.stderr + ")");
+let pbc_pe = fs_read_bytes(pbc_out_pe);
+assert_eq(pbc_pe[0], 77, "pbc pe64 MZ[0]");
+assert_eq(pbc_pe[1], 90, "pbc pe64 MZ[1]");
+fs_remove(pbc_out_pe);
+fs_remove(pbc_in);
+
+print "PATH_B_NATIVE_SOVEREIGN_ALL_PASS";

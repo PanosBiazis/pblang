@@ -2,6 +2,27 @@
 
 All notable changes to **PBLang** are documented in this file.
 
+## [`2.0.0`] — 2026-11-12 (Sovereign Zero-Rust Architecture: Cross-Platform `~371 KB` Host Runtime & `.sapp` Compiler · Pure-PBLang 3-Stage Self-Hosting `x86-64` / `ELF64-dyn` / `PE32+` Compilers · Multi-Accelerator Hardware Governor & Sovereign Studio UI)
+
+### Path A — Complete Cross-Platform Zero-Rust Sovereign Host VM, `.sapp -> .pbck` Compiler & 319 Builtins (`runtime_stage3/`)
+- **100% Rust-Independent Cross-Platform Host Binary (`~371 KB` Linux `ELF64` & `~363 KB` Windows `PE32+` — >110× smaller than the legacy `42 MB` Rust binary)**:
+  - Modularized `runtime_stage3/` (`pblang_zero_rust_vm.c`, `zr_common.h`, `zr_vm_core.h`, `zr_pbck_io.h`, `zr_compiler.h`, `zr_loader.h`, `zr_fs_os.h`, `zr_net_http_tls.h`, `zr_sqlite_ffi.h`, `zr_gfx.h`, `zr_json_crypto.h`, `zr_builtins_core.h`) compiling cleanly with zero warnings on Linux (`gcc -O3 -std=gnu99`) and Windows x64 (`x86_64-w64-mingw32-gcc -O3 -std=gnu99`), with `0` Rust symbols and `~2.6 MiB` cold RSS RAM.
+  - **Full Native C99 `.sapp -> .pbck` v1 Compiler (`zr_compiler.h`) & SHA-256 Disk Cache (`zr_loader.h`)**: Unicode-aware lexer, recursive-descent parser (`fn` hoisting, default/vararg params, closures & lexical upvalues, `f"..."` strings, `map{}` & `{}` literals, `?.`, `?[i]`, `??`, postfix `?`, `try/catch/throw`, `defer`, `match`, `@polyglot`), `.pbck` v1 serializer/deserializer, automatic `stdlib` & `pblang.toml`/`pblang.lock` discovery, content-addressed `.pbck` disk cache, and `PBLZREXE` single-file standalone executable bundling (`pblang build --bundle-exe`).
+  - **319 Host Builtins & Full OS Integration**: `O(1)` FNV-1a open-addressing maps, bytecode safe-point adaptive mark-and-sweep GC (`gc_stats`, `gc_collect`), `BigInt`/`Rational`/`Decimal`, `sha1`/`sha256`/`sha512`/`hmac_sha256`/`constant_time_eq`/CSPRNG `random_bytes`, POSIX + Win32 sockets, dynamic OpenSSL TLS 1.2/1.3 & Windows `WinHTTP` HTTPS (with SSRF cloud-metadata blocking), dynamic `libsqlite3.so` / `winsqlite3.dll` parameterized SQLite, dynamic `dlopen`/`LoadLibraryA` FFI, FreeType2 + X11 / Win32 GDI anti-aliased Greek & English `gfx*` GUI windows, and `hardware_probe()`.
+
+### Path B — Pure-PBLang 3-Stage Self-Hosting Native Machine-Code Compilers (`stdlib/native/`, `tools/pbc.sapp`)
+- **Upgraded Pure-PBLang Linux `x86-64` Native Compiler (`stdlib/native/codegen_x64.sapp`)**:
+  - Added hardware frame-pointer/handler-stack exception unwinding (`try { ... } catch e { ... }`, `throw`, `caught_error()`), mutable multi-capture heap `TAG_BOX` closures, auto-growing linear-probing hash maps, Cheney 2-space copying GC with `SYS_madvise(MADV_DONTNEED)` OS RAM reclamation, and direct Linux `x86-64` syscalls (`fs_*`, `env_get`, `clock_ms`, `tcp_*`) with `0` `rustc` and `0` `gcc`.
+  - Proven **3-Stage Native Self-Hosting Fixed-Point**: Stage-1 compiles the compiler into native `ELF64` (`stage1_elf`), `stage1_elf` compiles the compiler into `stage2_elf` (`55,272` bytes), and `stage2_elf` compiles `stage3_elf` (`55,272` bytes) with **100% byte-for-byte SHA-256 identity** (`tests/path_b_native_sovereign_test.sapp`).
+- **Dynamic `ELF64` Native OS FFI Emitter (`stdlib/native/elf_dyn_x64.sapp`, `tools/pbc.sapp --target x64-dyn`)**:
+  - Emits dynamic `ELF64` binaries (`PT_INTERP` `/lib64/ld-linux-x86-64.so.2`, `DT_NEEDED` `libdl`/`libc`, `.dynsym`/`.rela.plt`/`.plt`) calling `libm.so.6`, `libX11.so.6`, and `libsqlite3.so.0` directly from pure PBLang with zero C compiler or linker.
+- **Pure-PBLang Windows 11 `x86-64` `PE32+` Native `.exe` Compiler (`stdlib/native/codegen_pe64.sapp`, `tools/pbc.sapp --target pe64`)**:
+  - Emits standalone Windows `PE32+` executables directly from `.sapp` source (`IMAGE_FILE_MACHINE_AMD64`, `NX_COMPAT`, `W^X`, Microsoft x64 ABI `rcx/rdx/r8/r9` + 32-byte shadow space, `KERNEL32.dll` IAT for console/file/heap/timing APIs).
+
+### Smart Multi-Accelerator Hardware Governor & Sovereign Studio UI (`stdlib/hardware_governor.sapp`, `stdlib/sovereign_studio_ui.sapp`)
+- **Explainable Multi-Device Hardware Governor (`stdlib/hardware_governor.sapp`)**: Probes CPU topology/SIMD (`AVX2`/`AVX-512`/`NEON`), RAM pressure, storage kind, `GPU` (`DRM`/`NVIDIA`/`DirectX`), `NPU` (`/dev/accel*` Intel NPU / AMD XDNA / EdgeTPU), battery/AC power mode, and peripherals; computes bounded worker counts, GC watermarks, Sparse-Hive LRU budgets, zero-idle frame pacing (`~0.0%` idle CPU), and bilingual Greek/English explanations.
+- **Sovereign Studio UI (`stdlib/sovereign_studio_ui.sapp`, `pblang studio`)**: WCAG AAA Obsidian Dark & Alabaster Light native X11/Win32 desktop window plus 100% offline self-contained HTML5/SVG studio (`pblang studio --export-html <file>`, `tests/hardware_governor_and_studio_ui_test.sapp`: `76/76` checks).
+
 ## [`1.5.0`] — 2026-11-11 (Stage-3 Zero-Rust C99 `.pbck` VM · Smart Polymorphic `pblang update` & Portable Lockfiles · Compiler Optimizations · Scientific, Quantum QPU, DNA & FIPS 203 `ML-KEM-768` Stdlib)
 
 ### Stage-3 Zero-Rust Native `.pbck` Bytecode VM (`runtime_stage3/pblang_zero_rust_vm.c`, `runtime_stage3/stage3_native_host_runtime.sapp`)

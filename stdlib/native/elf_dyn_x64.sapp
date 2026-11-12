@@ -1,0 +1,236 @@
+// stdlib/native/elf_dyn_x64.sapp — Pure-PBLang Dynamic ELF64 + Native FFI Linker (x86-64 Linux).
+//
+// Emits a genuine dynamically-linked 64-bit Linux ELF executable (`ET_EXEC`) with `.interp`,
+// `.dynamic`, `.dynstr`, `.dynsym`, SysV `.hash`, `.rela.dyn` (`R_X86_64_GLOB_DAT`), `.got`,
+// and `.plt` stubs for `dlopen`, `dlsym`, and `dlclose` — with ZERO C, ZERO Rust, ZERO `ld`.
+// Any host shared library (`libsqlite3.so.0`, `libX11.so.6`, `libm.so.6`, `libc.so.6`, ...)
+// can be loaded and invoked directly from pure PBLang native machine code via `dl_open`,
+// `dl_sym`, `dl_call0..dl_call6`, `dl_call_f64_1`, `dl_call_f64_2`, and `dl_close`.
+
+let _elf = import("./elf_x64.sapp");
+let _cg = import("./codegen_x64.sapp");
+
+fn _push_bytes(dst, src) {
+    let i = 0;
+    while i < len(src) { push(dst, src[i]); i = i + 1; }
+}
+
+fn _push_zeros(dst, n) {
+    let i = 0;
+    while i < n { push(dst, 0); i = i + 1; }
+}
+
+fn _align_pad(buf, align) {
+    while (len(buf) % align) != 0 { push(buf, 0); }
+}
+
+fn _add_cstr(buf, s) {
+    let off = len(buf);
+    let b = str_to_bytes(s);
+    let i = 0;
+    while i < len(b) { push(buf, b[i]); i = i + 1; }
+    push(buf, 0);
+    return off;
+}
+
+fn _patch_le32(buf, pos, val) {
+    let tmp = [];
+    _elf.le(tmp, val, 4);
+    buf[pos] = tmp[0]; buf[pos + 1] = tmp[1]; buf[pos + 2] = tmp[2]; buf[pos + 3] = tmp[3];
+}
+
+fn _patch_le64(buf, pos, val) {
+    let tmp = [];
+    _elf.le(tmp, val, 8);
+    let i = 0;
+    while i < 8 { buf[pos + i] = tmp[i]; i = i + 1; }
+}
+
+fn _emit_sym(buf, name_off, info) {
+    _elf.le(buf, name_off, 4);  // st_name
+    push(buf, info);            // st_info (0x12 = STB_GLOBAL | STT_FUNC)
+    push(buf, 0);               // st_other
+    _elf.le(buf, 0, 2);         // st_shndx = SHN_UNDEF
+    _elf.le(buf, 0, 8);         // st_value
+    _elf.le(buf, 0, 8);         // st_size
+}
+
+fn _emit_dyn_entry(buf, tag, val) {
+    _elf.le(buf, tag, 8);
+    _elf.le(buf, val, 8);
+}
+
+fn _emit_phdr(buf, ptype, flags, offset, vaddr, filesz, memsz, align) {
+    _elf.le(buf, ptype, 4);
+    _elf.le(buf, flags, 4);
+    _elf.le(buf, offset, 8);
+    _elf.le(buf, vaddr, 8);
+    _elf.le(buf, vaddr, 8);
+    _elf.le(buf, filesz, 8);
+    _elf.le(buf, memsz, 8);
+    _elf.le(buf, align, 8);
+}
+
+// Compile PBLang source `src` into a dynamically-linked x86-64 Linux ELF64 executable (byte array).
+fn compile_dyn(src) {
+    let VBASE = 4194304;      // 0x400000 (RX PT_LOAD base)
+    let RW_VBASE = 6291456;   // 0x600000 (RW PT_LOAD base; preserves vaddr % 4096 == offset % 4096)
+    let EHSIZE = 64;
+    let PHSIZE = 56;
+    let PHNUM = 4;            // PT_INTERP, PT_LOAD (RX), PT_LOAD (RW), PT_DYNAMIC
+    let HDR_END = EHSIZE + PHSIZE * PHNUM; // 288
+
+    // Build RX dynamic linker tables starting at file offset 288.
+    let rx = [];
+
+    // 1. .interp: "/lib64/ld-linux-x86-64.so.2\0"
+    let interp_off = HDR_END + len(rx);
+    let interp_str = "/lib64/ld-linux-x86-64.so.2";
+    _add_cstr(rx, interp_str);
+    let interp_len = len(interp_str) + 1;
+    _align_pad(rx, 8);
+
+    // 2. .dynstr
+    let dynstr_off = HDR_END + len(rx);
+    let dynstr = [];
+    push(dynstr, 0);
+    let s_libc = _add_cstr(dynstr, "libc.so.6");
+    let s_libdl = _add_cstr(dynstr, "libdl.so.2");
+    let s_dlopen = _add_cstr(dynstr, "dlopen");
+    let s_dlsym = _add_cstr(dynstr, "dlsym");
+    let s_dlclose = _add_cstr(dynstr, "dlclose");
+    let dynstr_sz = len(dynstr);
+    _push_bytes(rx, dynstr);
+    _align_pad(rx, 8);
+
+    // 3. .dynsym (4 entries: STN_UNDEF, dlopen, dlsym, dlclose)
+    let dynsym_off = HDR_END + len(rx);
+    _emit_sym(rx, 0, 0);
+    _emit_sym(rx, s_dlopen, 18);
+    _emit_sym(rx, s_dlsym, 18);
+    _emit_sym(rx, s_dlclose, 18);
+
+    // 4. SysV .hash (nbucket=1, nchain=4, bucket=[1], chain=[0, 2, 3, 0])
+    let hash_off = HDR_END + len(rx);
+    _elf.le(rx, 1, 4);
+    _elf.le(rx, 4, 4);
+    _elf.le(rx, 1, 4);
+    _elf.le(rx, 0, 4);
+    _elf.le(rx, 2, 4);
+    _elf.le(rx, 3, 4);
+    _elf.le(rx, 0, 4);
+    _align_pad(rx, 8);
+
+    // 5. .rela.dyn (3 x 24B Elf64_Rela with R_X86_64_GLOB_DAT = 6; r_offset patched after .text)
+    let rela_off = HDR_END + len(rx);
+    let rela_rx_pos = len(rx);
+    let sym_i = 1;
+    while sym_i <= 3 {
+        _elf.le(rx, 0, 8);      // r_offset placeholder -> GOT[3 + (sym_i - 1)]
+        _elf.le(rx, 6, 4);      // r_info low u32 = R_X86_64_GLOB_DAT (6)
+        _elf.le(rx, sym_i, 4);  // r_info high u32 = dynsym index (1..3)
+        _elf.le(rx, 0, 8);      // r_addend = 0
+        sym_i = sym_i + 1;
+    }
+    let rela_sz = 72;
+
+    // 6. .plt (3 x 8-byte slots: `jmp qword [rip + disp32]; nop; nop`)
+    let plt_off = HDR_END + len(rx);
+    let plt_rx_pos = len(rx);
+    let pk = 0;
+    while pk < 3 {
+        push(rx, 255); push(rx, 37); _elf.le(rx, 0, 4); // FF 25 <disp32>
+        push(rx, 144); push(rx, 144);                   // 90 90
+        pk = pk + 1;
+    }
+    _align_pad(rx, 16);
+
+    let plt0_vaddr = VBASE + plt_off;
+    let plt1_vaddr = VBASE + plt_off + 8;
+    let plt2_vaddr = VBASE + plt_off + 16;
+
+    // 7. .text + .rodata emitted directly by codegen_x64
+    let text_off = HDR_END + len(rx);
+    let entry_vaddr = VBASE + text_off;
+    let dyn_plt = map{
+        dlopen: plt0_vaddr,
+        dlsym: plt1_vaddr,
+        dlclose: plt2_vaddr
+    };
+    let text = _cg.compile_x64_raw(src, entry_vaddr, dyn_plt);
+    _push_bytes(rx, text);
+
+    let rx_filesz = HDR_END + len(rx);
+    // Align file offset to 8 bytes before RW segment
+    while (rx_filesz % 8) != 0 {
+        push(rx, 0);
+        rx_filesz = rx_filesz + 1;
+    }
+
+    // 8. RW segment (.dynamic + .got) mapped at RW_VBASE + rw_off
+    let rw_off = rx_filesz;
+    let dyn_vaddr = RW_VBASE + rw_off;
+    // .dynamic has 12 entries (192 bytes), followed immediately by .got (6 * 8 = 48 bytes; slots 0..2 reserved for PLTGOT, slots 3..5 for dlopen/dlsym/dlclose)
+    let dyn_count = 12;
+    let dyn_sz = dyn_count * 16;
+    let got_vaddr = dyn_vaddr + dyn_sz;
+
+    // Patch .rela.dyn r_offset and .plt RIP-relative displacements now that got_vaddr is known!
+    let gi = 0;
+    while gi < 3 {
+        let slot_vaddr = got_vaddr + (3 + gi) * 8;
+        _patch_le64(rx, rela_rx_pos + gi * 24, slot_vaddr);
+        let insn_end_vaddr = (VBASE + plt_off + gi * 8) + 6;
+        _patch_le32(rx, plt_rx_pos + gi * 8 + 2, slot_vaddr - insn_end_vaddr);
+        gi = gi + 1;
+    }
+
+    let rw = [];
+    _emit_dyn_entry(rw, 1, s_libdl);              // DT_NEEDED: libdl.so.2
+    _emit_dyn_entry(rw, 1, s_libc);               // DT_NEEDED: libc.so.6
+    _emit_dyn_entry(rw, 4, VBASE + hash_off);     // DT_HASH
+    _emit_dyn_entry(rw, 5, VBASE + dynstr_off);   // DT_STRTAB
+    _emit_dyn_entry(rw, 6, VBASE + dynsym_off);   // DT_SYMTAB
+    _emit_dyn_entry(rw, 7, VBASE + rela_off);     // DT_RELA
+    _emit_dyn_entry(rw, 8, rela_sz);              // DT_RELASZ
+    _emit_dyn_entry(rw, 9, 24);                   // DT_RELAENT
+    _emit_dyn_entry(rw, 10, dynstr_sz);           // DT_STRSZ
+    _emit_dyn_entry(rw, 11, 24);                  // DT_SYMENT
+    _emit_dyn_entry(rw, 3, got_vaddr);            // DT_PLTGOT
+    _emit_dyn_entry(rw, 0, 0);                    // DT_NULL
+    _push_zeros(rw, 48);                          // .got: 6 qwords (0..2 reserved, 3=dlopen, 4=dlsym, 5=dlclose)
+    let rw_sz = len(rw);
+
+    // 9. Assemble complete ELF64 image
+    let out = [];
+    push(out, 127); push(out, 69); push(out, 76); push(out, 70); // 0x7F 'E' 'L' 'F'
+    push(out, 2); push(out, 1); push(out, 1); push(out, 0);      // 64-bit, LE, v1, SysV
+    _push_zeros(out, 8);
+    _elf.le(out, 2, 2);             // e_type = ET_EXEC
+    _elf.le(out, 62, 2);            // e_machine = EM_X86_64
+    _elf.le(out, 1, 4);             // e_version = 1
+    _elf.le(out, entry_vaddr, 8);   // e_entry
+    _elf.le(out, EHSIZE, 8);        // e_phoff = 64
+    _elf.le(out, 0, 8);             // e_shoff = 0
+    _elf.le(out, 0, 4);             // e_flags = 0
+    _elf.le(out, EHSIZE, 2);        // e_ehsize = 64
+    _elf.le(out, PHSIZE, 2);        // e_phentsize = 56
+    _elf.le(out, PHNUM, 2);         // e_phnum = 4
+    _elf.le(out, 0, 2);             // e_shentsize
+    _elf.le(out, 0, 2);             // e_shnum
+    _elf.le(out, 0, 2);             // e_shstrndx
+
+    // Program Headers (4 x 56 bytes)
+    _emit_phdr(out, 3, 4, interp_off, VBASE + interp_off, interp_len, interp_len, 1); // PT_INTERP (R)
+    _emit_phdr(out, 1, 5, 0, VBASE, rx_filesz, rx_filesz, 4096);                      // PT_LOAD (R+X)
+    _emit_phdr(out, 1, 6, rw_off, dyn_vaddr, rw_sz, rw_sz, 4096);                     // PT_LOAD (R+W)
+    _emit_phdr(out, 2, 6, rw_off, dyn_vaddr, dyn_sz, dyn_sz, 8);                      // PT_DYNAMIC (R+W)
+
+    _push_bytes(out, rx);
+    _push_bytes(out, rw);
+    return out;
+}
+
+fn compile_fns(src) { return compile_dyn(src); }
+
+export compile_dyn, compile_fns;

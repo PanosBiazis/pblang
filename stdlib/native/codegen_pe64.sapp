@@ -1,0 +1,2162 @@
+// stdlib/native/codegen_pe64.sapp — Pure-PBLang Windows x86-64 PE32+ (.exe) Native Compiler.
+//
+// Cross-compiles PBLang source directly into a native 64-bit Windows executable (`PE32+`,
+// `IMAGE_FILE_MACHINE_AMD64 = 0x8664`, `IMAGE_SUBSYSTEM_WINDOWS_CUI = 3`) with ZERO C,
+// ZERO Rust, ZERO MinGW, and ZERO external assembler/linker.
+//
+// Architectural highlights:
+// - 100% RIP-relative addressing (`[rip + disp32]`) for IAT calls, `.rodata` string literals,
+//   closure code pointers, `try/catch` landing pads, and RW globals — works at `ImageBase`
+//   (`0x140000000`) AND under arbitrary Windows 10/11 ASLR relocation without `.reloc` fixups.
+// - Strict Microsoft x64 ABI compliance (`rcx, rdx, r8, r9` + 32-byte shadow space + guaranteed
+//   16-byte stack alignment prior to every `KERNEL32.dll` IAT call).
+// - Full runtime support: recursion, first-class closures + mutable `TAG_BOX` upvalues,
+//   hardware stack-unwinding `try / catch / throw` + `caught_error()`, strings, dynamic arrays,
+//   auto-growing dynamic maps (`map_has`, `map_keys`, `map_values`, `map_remove`, `for`),
+//   and direct `KERNEL32.dll` I/O (`print`, `fs_write`, `fs_read`, `fs_exists`, `fs_remove`,
+//   `time_ms`, `sleep_ms`, `os_exit`).
+
+let _SOURCE = import("../compiler/checked_source.sapp");
+let _elf = import("./elf_x64.sapp");
+
+fn _align_up(v, a) {
+    let r = v % a;
+    if r == 0 { return v; }
+    return v + (a - r);
+}
+
+fn _push_bytes(dst, src) {
+    let i = 0;
+    while i < len(src) { push(dst, src[i]); i = i + 1; }
+}
+
+fn _push_zeros(dst, n) {
+    let i = 0;
+    while i < n { push(dst, 0); i = i + 1; }
+}
+
+fn _patch32(buf, pos, val) {
+    let tmp = [];
+    _elf.le(tmp, val, 4);
+    buf[pos] = tmp[0]; buf[pos + 1] = tmp[1]; buf[pos + 2] = tmp[2]; buf[pos + 3] = tmp[3];
+}
+
+fn _stmts_of(b) {
+    if b == nil { return []; }
+    if is_array(b) { return b; }
+    if is_map(b) { let s = try b.stmts catch nil; if s != nil { return s; } }
+    return [b];
+}
+
+fn _param_name(p) {
+    if is_string(p) { return p; }
+    if is_map(p) { return p.name; }
+    return str(p);
+}
+
+// Record a RIP-relative fixup against a symbolic target (`kind`: "iat", "ro_str", "ro_bounds_lo",
+// "ro_bounds_hi", "rw", "fn", "lbl"). Resolved once `.text`, `.rodata`, and `.idata` RVAs are finalized.
+fn _add_rip_fix(fixes, disp_pos, kind, key) {
+    push(fixes, map{ pos: disp_pos, kind: kind, key: key });
+}
+
+fn _emit_call_rel(code, calls, name) {
+    push(code, 232); let at = len(code); _elf.le(code, 0, 4);
+    push(calls, map{ at: at, name: name });
+}
+
+fn _emit_win32_call(code, fixes, api_name) {
+    push(code, 255); push(code, 21); let at = len(code); _elf.le(code, 0, 4); // call qword [rip + disp32]
+    _add_rip_fix(fixes, at, "iat", api_name);
+}
+
+fn _emit_mov_rax_rw(code, fixes, rw_key) {
+    push(code, 72); push(code, 139); push(code, 5); let at = len(code); _elf.le(code, 0, 4);
+    _add_rip_fix(fixes, at, "rw", rw_key);
+}
+
+fn _emit_mov_rw_rax(code, fixes, rw_key) {
+    push(code, 72); push(code, 137); push(code, 5); let at = len(code); _elf.le(code, 0, 4);
+    _add_rip_fix(fixes, at, "rw", rw_key);
+}
+
+fn _emit_lea_rcx_rw(code, fixes, rw_key) {
+    push(code, 72); push(code, 141); push(code, 13); let at = len(code); _elf.le(code, 0, 4);
+    _add_rip_fix(fixes, at, "rw", rw_key);
+}
+
+fn _intern_ro_str(st, s) {
+    if map_has(st.str_idx, s) { return st.str_idx[s]; }
+    let id = len(st.str_list);
+    st.str_idx[s] = id;
+    push(st.str_list, s);
+    return id;
+}
+
+// ── Closure & Mutable Upvalue (`TAG_BOX`) Static Analysis ─────────────────────────────
+fn _is_builtin_pe(nm) {
+    return nm == "len" or nm == "push" or nm == "array_push" or nm == "pop" or nm == "array_pop"
+        or nm == "str" or nm == "str_slice" or nm == "slice" or nm == "str_split"
+        or nm == "strcharcodeat" or nm == "strfromcharcode" or nm == "parse_number"
+        or nm == "is_string" or nm == "is_array" or nm == "is_map" or nm == "is_number"
+        or nm == "map_has" or nm == "map_keys" or nm == "map_values" or nm == "map_remove" or nm == "delete"
+        or nm == "caught_error" or nm == "fs_write" or nm == "fs_read" or nm == "fs_exists" or nm == "fs_remove"
+        or nm == "time_ms" or nm == "now_ms" or nm == "sleep_ms" or nm == "os_exit"
+        or nm == "bit_and" or nm == "bit_or" or nm == "bit_xor" or nm == "bit_shl" or nm == "bit_shr" or nm == "bit_not";
+}
+
+fn _copy_set(m) {
+    let out = map{};
+    if m == nil { return out; }
+    let ks = map_keys(m); let i = 0;
+    while i < len(ks) { out[ks[i]] = m[ks[i]]; i = i + 1; }
+    return out;
+}
+
+fn _fv_expr(node, bound, out, seen) {
+    if not is_map(node) { return; }
+    let k = try node.kind catch nil;
+    if k == "ident" {
+        let nm = node.name;
+        if (not map_has(bound, nm)) and (not map_has(seen, nm)) and (not _is_builtin_pe(nm)) {
+            seen[nm] = true; push(out, nm);
+        }
+        return;
+    }
+    if k == "binary" { _fv_expr(node.left, bound, out, seen); _fv_expr(node.right, bound, out, seen); return; }
+    if k == "unary" { _fv_expr(node.operand, bound, out, seen); return; }
+    if k == "assign" {
+        let nm = node.name;
+        if (not map_has(bound, nm)) and (not map_has(seen, nm)) and (not _is_builtin_pe(nm)) {
+            seen[nm] = true; push(out, nm);
+        }
+        _fv_expr(node.value, bound, out, seen);
+        return;
+    }
+    if k == "assign_to" { _fv_expr(node.target, bound, out, seen); _fv_expr(node.value, bound, out, seen); return; }
+    if k == "call" {
+        _fv_expr(node.func, bound, out, seen);
+        let i = 0; while i < len(node.args) { _fv_expr(node.args[i], bound, out, seen); i = i + 1; }
+        return;
+    }
+    if k == "index" { _fv_expr(node.obj, bound, out, seen); _fv_expr(node.index, bound, out, seen); return; }
+    if k == "member" { _fv_expr(node.obj, bound, out, seen); return; }
+    if k == "array" { let i = 0; while i < len(node.items) { _fv_expr(node.items[i], bound, out, seen); i = i + 1; } return; }
+    if k == "map" { let i = 0; while i < len(node.entries) { _fv_expr(node.entries[i].value, bound, out, seen); i = i + 1; } return; }
+    if k == "try" { _fv_expr(node.body, bound, out, seen); if node.handler != nil { _fv_expr(node.handler, bound, out, seen); } return; }
+    if k == "throw" { let v = try node.value catch nil; if v == nil { v = try node.expr catch nil; } _fv_expr(v, bound, out, seen); return; }
+    if k == "if_expr" {
+        _fv_expr(node.cond, bound, out, seen);
+        _fv_stmts(_stmts_of(node.then), _copy_set(bound), out, seen);
+        let el = try node.else catch nil;
+        if el != nil { _fv_stmts(_stmts_of(el), _copy_set(bound), out, seen); }
+        return;
+    }
+    if k == "fn_lit" {
+        let b2 = _copy_set(bound);
+        let i = 0; while i < len(node.params) { b2[_param_name(node.params[i])] = true; i = i + 1; }
+        _fv_stmts(_stmts_of(node.body), b2, out, seen);
+        return;
+    }
+}
+
+fn _fv_stmts(stmts, bound, out, seen) {
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i]; let k = s.kind;
+        if k == "let" or k == "const" {
+            let v = try s.value catch nil;
+            if v != nil { _fv_expr(v, bound, out, seen); }
+            bound[s.name] = true;
+        } elif k == "return" or k == "print" {
+            let v = try s.value catch nil;
+            if v != nil { _fv_expr(v, bound, out, seen); }
+        } elif k == "expr_stmt" { _fv_expr(s.expr, bound, out, seen); }
+        elif k == "assign" {
+            if (not map_has(bound, s.name)) and (not map_has(seen, s.name)) and (not _is_builtin_pe(s.name)) {
+                seen[s.name] = true; push(out, s.name);
+            }
+            _fv_expr(s.value, bound, out, seen);
+        } elif k == "block" { _fv_stmts(_stmts_of(s), _copy_set(bound), out, seen); }
+        elif k == "if" {
+            _fv_expr(s.cond, bound, out, seen);
+            _fv_stmts(_stmts_of(s.then), _copy_set(bound), out, seen);
+            let el = try s.elifs catch nil;
+            if el != nil { let j = 0; while j < len(el) { _fv_expr(el[j].cond, bound, out, seen); _fv_stmts(_stmts_of(el[j].body), _copy_set(bound), out, seen); j = j + 1; } }
+            let e = try s.else catch nil;
+            if e != nil { _fv_stmts(_stmts_of(e), _copy_set(bound), out, seen); }
+        } elif k == "while" {
+            _fv_expr(s.cond, bound, out, seen);
+            _fv_stmts(_stmts_of(s.body), _copy_set(bound), out, seen);
+        } elif k == "for_in" {
+            _fv_expr(s.iter, bound, out, seen);
+            let b2 = _copy_set(bound); b2[s.name] = true;
+            _fv_stmts(_stmts_of(s.body), b2, out, seen);
+        } elif k == "for_range" {
+            _fv_expr(s.start, bound, out, seen); _fv_expr(s.end, bound, out, seen);
+            let b2 = _copy_set(bound); b2[s.name] = true;
+            _fv_stmts(_stmts_of(s.body), b2, out, seen);
+        }
+        i = i + 1;
+    }
+}
+
+fn _free_vars_pe(params, body, skip) {
+    let bound = _copy_set(skip);
+    let i = 0; while i < len(params) { bound[_param_name(params[i])] = true; i = i + 1; }
+    let out = []; let seen = map{};
+    _fv_stmts(body, bound, out, seen);
+    return out;
+}
+
+fn _scan_caps_muts_expr(node, capset, mutset, skip) {
+    if not is_map(node) { return; }
+    let k = try node.kind catch nil;
+    if k == "fn_lit" {
+        let fvs = _free_vars_pe(node.params, _stmts_of(node.body), skip);
+        let i = 0; while i < len(fvs) { capset[fvs[i]] = true; i = i + 1; }
+        _scan_caps_muts_stmts(_stmts_of(node.body), capset, mutset, skip);
+        return;
+    }
+    if k == "assign" { mutset[node.name] = true; _scan_caps_muts_expr(node.value, capset, mutset, skip); return; }
+    if k == "assign_to" { _scan_caps_muts_expr(node.target, capset, mutset, skip); _scan_caps_muts_expr(node.value, capset, mutset, skip); return; }
+    if k == "binary" { _scan_caps_muts_expr(node.left, capset, mutset, skip); _scan_caps_muts_expr(node.right, capset, mutset, skip); return; }
+    if k == "unary" { _scan_caps_muts_expr(node.operand, capset, mutset, skip); return; }
+    if k == "call" { _scan_caps_muts_expr(node.func, capset, mutset, skip); let i = 0; while i < len(node.args) { _scan_caps_muts_expr(node.args[i], capset, mutset, skip); i = i + 1; } return; }
+    if k == "index" { _scan_caps_muts_expr(node.obj, capset, mutset, skip); _scan_caps_muts_expr(node.index, capset, mutset, skip); return; }
+    if k == "member" { _scan_caps_muts_expr(node.obj, capset, mutset, skip); return; }
+    if k == "array" { let i = 0; while i < len(node.items) { _scan_caps_muts_expr(node.items[i], capset, mutset, skip); i = i + 1; } return; }
+    if k == "map" { let i = 0; while i < len(node.entries) { _scan_caps_muts_expr(node.entries[i].value, capset, mutset, skip); i = i + 1; } return; }
+    if k == "try" { _scan_caps_muts_expr(node.body, capset, mutset, skip); if node.handler != nil { _scan_caps_muts_expr(node.handler, capset, mutset, skip); } return; }
+    if k == "throw" { let v = try node.value catch nil; if v == nil { v = try node.expr catch nil; } _scan_caps_muts_expr(v, capset, mutset, skip); return; }
+    if k == "if_expr" { _scan_caps_muts_expr(node.cond, capset, mutset, skip); _scan_caps_muts_stmts(_stmts_of(node.then), capset, mutset, skip); let el = try node.else catch nil; if el != nil { _scan_caps_muts_stmts(_stmts_of(el), capset, mutset, skip); } return; }
+}
+
+fn _scan_caps_muts_stmts(stmts, capset, mutset, skip) {
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i]; let k = s.kind;
+        if k == "let" or k == "const" or k == "return" or k == "print" { let v = try s.value catch nil; if v != nil { _scan_caps_muts_expr(v, capset, mutset, skip); } }
+        elif k == "expr_stmt" { _scan_caps_muts_expr(s.expr, capset, mutset, skip); }
+        elif k == "assign" { mutset[s.name] = true; _scan_caps_muts_expr(s.value, capset, mutset, skip); }
+        elif k == "block" { _scan_caps_muts_stmts(_stmts_of(s), capset, mutset, skip); }
+        elif k == "if" {
+            _scan_caps_muts_expr(s.cond, capset, mutset, skip);
+            _scan_caps_muts_stmts(_stmts_of(s.then), capset, mutset, skip);
+            let el = try s.elifs catch nil;
+            if el != nil { let j = 0; while j < len(el) { _scan_caps_muts_expr(el[j].cond, capset, mutset, skip); _scan_caps_muts_stmts(_stmts_of(el[j].body), capset, mutset, skip); j = j + 1; } }
+            let e = try s.else catch nil; if e != nil { _scan_caps_muts_stmts(_stmts_of(e), capset, mutset, skip); }
+        } elif k == "while" { _scan_caps_muts_expr(s.cond, capset, mutset, skip); _scan_caps_muts_stmts(_stmts_of(s.body), capset, mutset, skip); }
+        elif k == "for_in" { _scan_caps_muts_expr(s.iter, capset, mutset, skip); _scan_caps_muts_stmts(_stmts_of(s.body), capset, mutset, skip); }
+        elif k == "for_range" { _scan_caps_muts_expr(s.start, capset, mutset, skip); _scan_caps_muts_expr(s.end, capset, mutset, skip); _scan_caps_muts_stmts(_stmts_of(s.body), capset, mutset, skip); }
+        i = i + 1;
+    }
+}
+
+fn _collect_local_decls(stmts, out) {
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i]; let k = s.kind;
+        if k == "let" or k == "const" { out[s.name] = true; }
+        elif k == "block" { _collect_local_decls(_stmts_of(s), out); }
+        elif k == "if" {
+            _collect_local_decls(_stmts_of(s.then), out);
+            let el = try s.elifs catch nil;
+            if el != nil { let j = 0; while j < len(el) { _collect_local_decls(_stmts_of(el[j].body), out); j = j + 1; } }
+            let e = try s.else catch nil; if e != nil { _collect_local_decls(_stmts_of(e), out); }
+        } elif k == "while" { _collect_local_decls(_stmts_of(s.body), out); }
+        elif k == "for_in" or k == "for_range" { out[s.name] = true; _collect_local_decls(_stmts_of(s.body), out); }
+        i = i + 1;
+    }
+}
+
+fn _find_boxed_pe(params, stmts, skip) {
+    let capset = map{}; let mutset = map{};
+    _scan_caps_muts_stmts(stmts, capset, mutset, skip);
+    let decls = map{};
+    let i = 0; while i < len(params) { decls[_param_name(params[i])] = true; i = i + 1; }
+    _collect_local_decls(stmts, decls);
+    let boxed = map{};
+    let ks = map_keys(capset); let j = 0;
+    while j < len(ks) {
+        let nm = ks[j];
+        if map_has(mutset, nm) and map_has(decls, nm) and (not map_has(skip, nm)) { boxed[nm] = true; }
+        j = j + 1;
+    }
+    return boxed;
+}
+
+// ── Stack Slot & Variable Access Helpers ──────────────────────────────────────────────
+fn _alloc_slot(env, name) {
+    if map_has(env.slots, name) { return env.slots[name]; }
+    let idx = env.nslots;
+    env.slots[name] = idx;
+    env.nslots = idx + 1;
+    return idx;
+}
+
+fn _emit_load_slot_rax(code, idx) {
+    let disp = 0 - 8 * (idx + 1);
+    push(code, 72); push(code, 139); push(code, 133); _elf.le(code, disp, 4); // mov rax, [rbp + disp32]
+}
+
+fn _emit_store_slot_rax(code, idx) {
+    let disp = 0 - 8 * (idx + 1);
+    push(code, 72); push(code, 137); push(code, 133); _elf.le(code, disp, 4); // mov [rbp + disp32], rax
+}
+
+fn _emit_alloc_box_rax(code) {
+    push(code, 72); push(code, 137); push(code, 194);                         // mov rdx, rax
+    push(code, 76); push(code, 137); push(code, 248);                         // mov rax, r15
+    push(code, 73); push(code, 131); push(code, 199); push(code, 16);         // add r15, 16
+    push(code, 72); push(code, 199); push(code, 0); _elf.le(code, 5, 4);      // mov qword [rax], TAG_BOX (5)
+    push(code, 72); push(code, 137); push(code, 80); push(code, 8);           // mov [rax+8], rdx
+}
+
+fn _pop_argreg_pe(code, idx) {
+    if idx == 0 { push(code, 95); return; }                 // pop rdi
+    if idx == 1 { push(code, 94); return; }                 // pop rsi
+    if idx == 2 { push(code, 90); return; }                 // pop rdx
+    if idx == 3 { push(code, 89); return; }                 // pop rcx
+    if idx == 4 { push(code, 65); push(code, 88); return; } // pop r8
+    if idx == 5 { push(code, 65); push(code, 89); return; } // pop r9
+    throw "codegen_pe64: max 6 call arguments supported";
+}
+
+fn _emit_spill_argreg_to_rax(code, idx) {
+    if idx == 0 { push(code, 72); push(code, 137); push(code, 248); return; } // mov rax, rdi
+    if idx == 1 { push(code, 72); push(code, 137); push(code, 240); return; } // mov rax, rsi
+    if idx == 2 { push(code, 72); push(code, 137); push(code, 208); return; } // mov rax, rdx
+    if idx == 3 { push(code, 72); push(code, 137); push(code, 200); return; } // mov rax, rcx
+    if idx == 4 { push(code, 76); push(code, 137); push(code, 192); return; } // mov rax, r8
+    if idx == 5 { push(code, 76); push(code, 137); push(code, 200); return; } // mov rax, r9
+}
+
+// ── AST Expression & Statement Code Generation ────────────────────────────────────────
+fn _emit_expr(node, code, env, st) {
+    if node == nil { push(code, 49); push(code, 192); return; }
+    let k = node.kind;
+    if k == "nil" { push(code, 49); push(code, 192); return; }
+    if k == "bool" {
+        if node.value { push(code, 184); _elf.le(code, 1, 4); }
+        else { push(code, 49); push(code, 192); }
+        return;
+    }
+    if k == "number" {
+        let v = parse_number(node.value);
+        if v == 0 { push(code, 49); push(code, 192); return; }
+        if v > 0 and v <= 2147483647 { push(code, 184); _elf.le(code, v, 4); return; }
+        if v >= 0 - 2147483648 and v < 0 { push(code, 72); push(code, 199); push(code, 192); _elf.le(code, v, 4); return; }
+        push(code, 72); push(code, 184); _elf.le(code, v, 8);
+        return;
+    }
+    if k == "string" {
+        let sid = _intern_ro_str(st, node.value);
+        push(code, 72); push(code, 141); push(code, 5); let at = len(code); _elf.le(code, 0, 4); // lea rax, [rip + disp32]
+        _add_rip_fix(st.fixes, at, "ro_str", str(sid));
+        return;
+    }
+    if k == "ident" {
+        let nm = node.name;
+        if map_has(env.slots, nm) {
+            _emit_load_slot_rax(code, env.slots[nm]);
+            if map_has(env.boxed, nm) or map_has(env.boxcaps, nm) {
+                push(code, 72); push(code, 139); push(code, 64); push(code, 8); // mov rax, [rax+8]
+            }
+            return;
+        }
+        if map_has(st.globals, nm) {
+            _emit_mov_rax_rw(code, st.fixes, "g_" + nm);
+            return;
+        }
+        if map_has(st.fnnames, nm) {
+            // Wrap named function as 0-capture TAG_CLO [4, code_ptr, 0]
+            push(code, 72); push(code, 141); push(code, 13); let at = len(code); _elf.le(code, 0, 4);
+            _add_rip_fix(st.fixes, at, "fn", nm);
+            push(code, 76); push(code, 137); push(code, 248);                 // mov rax, r15
+            push(code, 73); push(code, 131); push(code, 199); push(code, 24); // add r15, 24
+            push(code, 72); push(code, 199); push(code, 0); _elf.le(code, 4, 4);
+            push(code, 72); push(code, 137); push(code, 72); push(code, 8);
+            push(code, 72); push(code, 199); push(code, 64); push(code, 16); _elf.le(code, 0, 4);
+            return;
+        }
+        throw "codegen_pe64: undefined identifier '" + nm + "'";
+    }
+    if k == "unary" {
+        _emit_expr(node.operand, code, env, st);
+        if node.op == "-" { push(code, 72); push(code, 247); push(code, 216); return; }
+        if node.op == "not" or node.op == "!" {
+            push(code, 72); push(code, 133); push(code, 192);
+            push(code, 15); push(code, 148); push(code, 192); // sete al
+            push(code, 15); push(code, 182); push(code, 192); // movzx eax, al
+            return;
+        }
+        throw "codegen_pe64: unsupported unary op " + node.op;
+    }
+    if k == "binary" {
+        let op = node.op;
+        if op == "and" {
+            _emit_expr(node.left, code, env, st);
+            push(code, 72); push(code, 133); push(code, 192);
+            push(code, 15); push(code, 132); let jz = len(code); _elf.le(code, 0, 4);
+            _emit_expr(node.right, code, env, st);
+            push(code, 72); push(code, 133); push(code, 192);
+            push(code, 15); push(code, 149); push(code, 192);
+            push(code, 15); push(code, 182); push(code, 192);
+            _patch32(code, jz, len(code) - (jz + 4));
+            return;
+        }
+        if op == "or" {
+            _emit_expr(node.left, code, env, st);
+            push(code, 72); push(code, 133); push(code, 192);
+            push(code, 15); push(code, 133); let jnz = len(code); _elf.le(code, 0, 4);
+            _emit_expr(node.right, code, env, st);
+            push(code, 72); push(code, 133); push(code, 192);
+            push(code, 15); push(code, 149); push(code, 192);
+            push(code, 15); push(code, 182); push(code, 192);
+            push(code, 233); let jend = len(code); _elf.le(code, 0, 4);
+            _patch32(code, jnz, len(code) - (jnz + 4));
+            push(code, 184); _elf.le(code, 1, 4);
+            _patch32(code, jend, len(code) - (jend + 4));
+            return;
+        }
+        _emit_expr(node.left, code, env, st);
+        push(code, 80);                                                       // push left
+        _emit_expr(node.right, code, env, st);
+        push(code, 72); push(code, 137); push(code, 194);                     // mov rdx, rax (right)
+        push(code, 89);                                                       // pop rcx      (left)
+        if op == "+" { _emit_call_rel(code, st.calls, "__pe_add"); return; }
+        if op == "==" { _emit_call_rel(code, st.calls, "__pe_eq"); return; }
+        if op == "!=" {
+            _emit_call_rel(code, st.calls, "__pe_eq");
+            push(code, 72); push(code, 131); push(code, 240); push(code, 1);  // xor rax, 1
+            return;
+        }
+        push(code, 72); push(code, 137); push(code, 200);                     // mov rax, rcx (left)
+        if op == "-" { push(code, 72); push(code, 41); push(code, 208); return; }
+        if op == "*" { push(code, 72); push(code, 15); push(code, 175); push(code, 194); return; }
+        if op == "/" or op == "%" {
+            push(code, 73); push(code, 137); push(code, 210);                 // mov r10, rdx (divisor)
+            push(code, 72); push(code, 153);                                  // cqo
+            push(code, 73); push(code, 247); push(code, 250);                 // idiv r10
+            if op == "%" { push(code, 72); push(code, 137); push(code, 208); } // mov rax, rdx
+            return;
+        }
+        push(code, 72); push(code, 57); push(code, 208);                      // cmp rax, rdx
+        if op == "<"  { push(code, 15); push(code, 156); push(code, 192); }
+        elif op == "<=" { push(code, 15); push(code, 158); push(code, 192); }
+        elif op == ">"  { push(code, 15); push(code, 159); push(code, 192); }
+        elif op == ">=" { push(code, 15); push(code, 157); push(code, 192); }
+        else { throw "codegen_pe64: unsupported binary op " + op; }
+        push(code, 15); push(code, 182); push(code, 192);
+        return;
+    }
+    if k == "assign" {
+        _emit_expr(node.value, code, env, st);
+        _emit_assign_name(node.name, code, env, st);
+        return;
+    }
+    if k == "assign_to" {
+        let tgt = node.target;
+        if tgt.kind == "member" {
+            _emit_expr(tgt.obj, code, env, st); push(code, 80);
+            let sid = _intern_ro_str(st, tgt.name);
+            push(code, 72); push(code, 141); push(code, 5); let at = len(code); _elf.le(code, 0, 4);
+            _add_rip_fix(st.fixes, at, "ro_str", str(sid));
+            push(code, 80);
+            _emit_expr(node.value, code, env, st);
+            push(code, 73); push(code, 137); push(code, 192);                 // mov r8, rax (val)
+            push(code, 90);                                                   // pop rdx (key)
+            push(code, 89);                                                   // pop rcx (map)
+            _emit_call_rel(code, st.calls, "__pe_map_set");
+            return;
+        }
+        if tgt.kind == "index" {
+            _emit_expr(tgt.obj, code, env, st); push(code, 80);
+            _emit_expr(tgt.index, code, env, st); push(code, 80);
+            _emit_expr(node.value, code, env, st);
+            push(code, 73); push(code, 137); push(code, 192);                 // mov r8, rax (val)
+            push(code, 90);                                                   // pop rdx (idx/key)
+            push(code, 89);                                                   // pop rcx (obj)
+            _emit_call_rel(code, st.calls, "__pe_idx_set");
+            return;
+        }
+        throw "codegen_pe64: unsupported assign_to target";
+    }
+    if k == "array" {
+        let n = len(node.items);
+        let cap = if n < 8 { 8 } else { n * 2 };
+        // Evaluate items onto stack first so nested allocations don't interleave
+        let i = 0;
+        while i < n { _emit_expr(node.items[i], code, env, st); push(code, 80); i = i + 1; }
+        push(code, 76); push(code, 137); push(code, 248);                     // mov rax, r15 (arr header)
+        push(code, 73); push(code, 129); push(code, 199); _elf.le(code, 32 + cap * 8, 4); // add r15, 32+cap*8
+        push(code, 72); push(code, 199); push(code, 0); _elf.le(code, 2, 4);  // [rax] = TAG_ARR (2)
+        push(code, 72); push(code, 199); push(code, 64); push(code, 8); _elf.le(code, n, 4);   // len
+        push(code, 72); push(code, 199); push(code, 64); push(code, 16); _elf.le(code, cap, 4);// cap
+        push(code, 72); push(code, 141); push(code, 72); push(code, 32);      // lea rcx, [rax+32]
+        push(code, 72); push(code, 137); push(code, 72); push(code, 24);      // [rax+24] = data_ptr
+        let j = n - 1;
+        while j >= 0 {
+            push(code, 90);                                                   // pop rdx
+            push(code, 72); push(code, 137); push(code, 145); _elf.le(code, j * 8, 4); // mov [rcx+j*8], rdx
+            j = j - 1;
+        }
+        return;
+    }
+    if k == "map" {
+        let n = len(node.entries);
+        let cap = if n < 8 { 8 } else { n * 2 };
+        push(code, 76); push(code, 137); push(code, 248);                     // mov rax, r15 (map header)
+        push(code, 73); push(code, 129); push(code, 199); _elf.le(code, 32 + cap * 16, 4);
+        push(code, 72); push(code, 199); push(code, 0); _elf.le(code, 3, 4);  // [rax] = TAG_MAP (3)
+        push(code, 72); push(code, 199); push(code, 64); push(code, 8); _elf.le(code, 0, 4);
+        push(code, 72); push(code, 199); push(code, 64); push(code, 16); _elf.le(code, cap, 4);
+        push(code, 72); push(code, 141); push(code, 72); push(code, 32);
+        push(code, 72); push(code, 137); push(code, 72); push(code, 24);
+        let i = 0;
+        while i < n {
+            push(code, 80);                                                   // save map ptr
+            let e = node.entries[i];
+            let sid = _intern_ro_str(st, e.key);
+            _emit_expr(e.value, code, env, st);
+            push(code, 73); push(code, 137); push(code, 192);                 // mov r8, rax (val)
+            push(code, 72); push(code, 141); push(code, 21); let at = len(code); _elf.le(code, 0, 4); // lea rdx, [rip+disp32]
+            _add_rip_fix(st.fixes, at, "ro_str", str(sid));
+            push(code, 89);                                                   // pop rcx (map)
+            push(code, 81);                                                   // keep map on stack
+            _emit_call_rel(code, st.calls, "__pe_map_set");
+            push(code, 88);                                                   // pop rax (map)
+            i = i + 1;
+        }
+        return;
+    }
+    if k == "member" {
+        _emit_expr(node.obj, code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);                     // mov rcx, rax (map)
+        let sid = _intern_ro_str(st, node.name);
+        push(code, 72); push(code, 141); push(code, 21); let at = len(code); _elf.le(code, 0, 4); // lea rdx, [rip+disp32]
+        _add_rip_fix(st.fixes, at, "ro_str", str(sid));
+        _emit_call_rel(code, st.calls, "__pe_map_get");
+        return;
+    }
+    if k == "index" {
+        _emit_expr(node.obj, code, env, st); push(code, 80);
+        _emit_expr(node.index, code, env, st);
+        push(code, 72); push(code, 137); push(code, 194);                     // mov rdx, rax (idx/key)
+        push(code, 89);                                                       // pop rcx (obj)
+        _emit_call_rel(code, st.calls, "__pe_idx_get");
+        return;
+    }
+    if k == "fn_lit" {
+        let skip = _copy_set(st.fnnames);
+        let gks = map_keys(st.globals); let gi = 0;
+        while gi < len(gks) {
+            if not map_has(env.slots, gks[gi]) { skip[gks[gi]] = true; }
+            gi = gi + 1;
+        }
+        let caps = _free_vars_pe(node.params, _stmts_of(node.body), skip);
+        let child_boxcaps = map{};
+        let ci = 0;
+        while ci < len(caps) {
+            let cn = caps[ci];
+            if map_has(env.boxed, cn) or map_has(env.boxcaps, cn) { child_boxcaps[cn] = true; }
+            ci = ci + 1;
+        }
+        let fid = len(st.funlits);
+        let lbl = "__fnlit_" + str(fid);
+        push(st.funlits, map{ lbl: lbl, params: node.params, body: _stmts_of(node.body), caps: caps, boxcaps: child_boxcaps });
+        // Push captured values/boxes first, then allocate [TAG_CLO=4, code_ptr, ncaps, cap0...]
+        let j = 0;
+        while j < len(caps) {
+            let cn = caps[j];
+            _emit_load_slot_rax(code, env.slots[cn]);
+            push(code, 80);
+            j = j + 1;
+        }
+        let nc = len(caps);
+        push(code, 76); push(code, 137); push(code, 248);                     // mov rax, r15
+        push(code, 73); push(code, 129); push(code, 199); _elf.le(code, 24 + nc * 8, 4);
+        push(code, 72); push(code, 199); push(code, 0); _elf.le(code, 4, 4);  // TAG_CLO = 4
+        push(code, 72); push(code, 141); push(code, 13); let at = len(code); _elf.le(code, 0, 4);
+        _add_rip_fix(st.fixes, at, "lbl", lbl);
+        push(code, 72); push(code, 137); push(code, 72); push(code, 8);       // [rax+8] = code_ptr
+        push(code, 72); push(code, 199); push(code, 64); push(code, 16); _elf.le(code, nc, 4);
+        let m = nc - 1;
+        while m >= 0 {
+            push(code, 90);
+            push(code, 72); push(code, 137); push(code, 144); _elf.le(code, 24 + m * 8, 4);
+            m = m - 1;
+        }
+        return;
+    }
+    if k == "throw" {
+        let v = try node.value catch nil;
+        if v == nil { v = try node.expr catch nil; }
+        _emit_expr(v, code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);                     // mov rcx, rax
+        _emit_call_rel(code, st.calls, "__pe_throw");
+        return;
+    }
+    if k == "try" {
+        let tid = st.ntry; st.ntry = tid + 1;
+        let catch_lbl = "__catch_" + str(tid);
+        // Push 32-byte frame: [prev, outer_rsp, rbp, catch_rip]
+        push(code, 72); push(code, 141); push(code, 5); let at = len(code); _elf.le(code, 0, 4); // lea rax, [rip + catch_lbl]
+        _add_rip_fix(st.fixes, at, "lbl", catch_lbl);
+        push(code, 80);                                                       // [rsp+24] = catch_rip
+        push(code, 85);                                                       // [rsp+16] = rbp
+        push(code, 72); push(code, 141); push(code, 68); push(code, 36); push(code, 16); // lea rax, [rsp+16] (outer_rsp)
+        push(code, 80);                                                       // [rsp+8] = outer_rsp
+        _emit_mov_rax_rw(code, st.fixes, "exc_top");
+        push(code, 80);                                                       // [rsp+0] = prev
+        push(code, 72); push(code, 137); push(code, 224);                     // mov rax, rsp
+        _emit_mov_rw_rax(code, st.fixes, "exc_top");
+        env.try_depth = env.try_depth + 1;
+        _emit_expr(node.body, code, env, st);
+        env.try_depth = env.try_depth - 1;
+        // Normal exit: unlink handler and pop 32B frame while preserving rax!
+        push(code, 72); push(code, 137); push(code, 194);                     // mov rdx, rax (save result)
+        push(code, 72); push(code, 139); push(code, 4); push(code, 36);       // mov rax, [rsp] (prev)
+        _emit_mov_rw_rax(code, st.fixes, "exc_top");
+        push(code, 72); push(code, 131); push(code, 196); push(code, 32);     // add rsp, 32
+        push(code, 72); push(code, 137); push(code, 208);                     // mov rax, rdx (restore result)
+        push(code, 233); let jdone = len(code); _elf.le(code, 0, 4);
+        st.labels[catch_lbl] = len(code);
+        if node.handler != nil { _emit_expr(node.handler, code, env, st); }
+        else { push(code, 49); push(code, 192); }
+        _patch32(code, jdone, len(code) - (jdone + 4));
+        return;
+    }
+    if k == "if_expr" {
+        _emit_expr(node.cond, code, env, st);
+        push(code, 72); push(code, 133); push(code, 192);
+        push(code, 15); push(code, 132); let jelse = len(code); _elf.le(code, 0, 4);
+        _emit_block_expr(node.then, code, env, st);
+        push(code, 233); let jend = len(code); _elf.le(code, 0, 4);
+        _patch32(code, jelse, len(code) - (jelse + 4));
+        let el = try node.else catch nil;
+        if el != nil { _emit_block_expr(el, code, env, st); }
+        else { push(code, 49); push(code, 192); }
+        _patch32(code, jend, len(code) - (jend + 4));
+        return;
+    }
+    if k == "call" {
+        // Parser block expression `{ stmt; ...; expr }` lowers as `call` with `block_expr == true`
+        if (try node.block_expr catch false) {
+            let bst = _stmts_of(node.func.body);
+            let bi = 0;
+            while bi < len(bst) {
+                let s = bst[bi];
+                if bi == len(bst) - 1 and s.kind == "return" and (try node.block_tail catch false) {
+                    _emit_expr(s.value, code, env, st);
+                } else {
+                    _emit_stmt(s, code, env, st);
+                    if bi == len(bst) - 1 { push(code, 49); push(code, 192); }
+                }
+                bi = bi + 1;
+            }
+            if len(bst) == 0 { push(code, 49); push(code, 192); }
+            return;
+        }
+        if node.func.kind == "ident" and _emit_builtin_call_pe(node.func.name, node.args, code, env, st) {
+            return;
+        }
+        // Direct call to known user function (when not shadowed by a local/closure variable)
+        if node.func.kind == "ident" and map_has(st.fnnames, node.func.name) and (not map_has(env.slots, node.func.name)) {
+            let na = len(node.args);
+            let ai = 0;
+            while ai < na { _emit_expr(node.args[ai], code, env, st); push(code, 80); ai = ai + 1; }
+            let aj = na - 1;
+            while aj >= 0 { _pop_argreg_pe(code, aj); aj = aj - 1; }
+            _emit_call_rel(code, st.calls, "fn$" + node.func.name);
+            return;
+        }
+        // Indirect closure call (`TAG_CLO = 4`: `[4, code_ptr, ncaps, cap0...]`)
+        _emit_expr(node.func, code, env, st);
+        push(code, 80);                                                       // push closure ptr
+        let na = len(node.args);
+        let ai = 0;
+        while ai < na { _emit_expr(node.args[ai], code, env, st); push(code, 80); ai = ai + 1; }
+        let aj = na - 1;
+        while aj >= 0 { _pop_argreg_pe(code, aj); aj = aj - 1; }
+        push(code, 65); push(code, 91);                                       // pop r11 (closure ptr)
+        push(code, 65); push(code, 255); push(code, 83); push(code, 8);       // call qword [r11+8]
+        return;
+    }
+    throw "codegen_pe64: unsupported expr kind " + str(k);
+}
+
+fn _emit_block_expr(b, code, env, st) {
+    let stmts = _stmts_of(b);
+    let n = len(stmts);
+    if n == 0 { push(code, 49); push(code, 192); return; }
+    let i = 0;
+    while i < n - 1 { _emit_stmt(stmts[i], code, env, st); i = i + 1; }
+    let last = stmts[n - 1];
+    if last.kind == "expr_stmt" { _emit_expr(last.expr, code, env, st); }
+    else { _emit_stmt(last, code, env, st); push(code, 49); push(code, 192); }
+}
+
+fn _emit_builtin_call_pe(nm, args, code, env, st) {
+    let na = len(args);
+    if (nm == "println" or nm == "print") and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);                     // mov rcx, rax
+        _emit_call_rel(code, st.calls, "__pe_print_val");
+        push(code, 49); push(code, 192);                                      // xor eax, eax
+        return true;
+    }
+    if nm == "len" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 139); push(code, 64); push(code, 8);       // mov rax, [rax+8]
+        return true;
+    }
+    if (nm == "push" or nm == "array_push") and na == 2 {
+        _emit_expr(args[0], code, env, st); push(code, 80);
+        _emit_expr(args[1], code, env, st);
+        push(code, 72); push(code, 137); push(code, 194);                     // mov rdx, rax (val)
+        push(code, 89);                                                       // pop rcx (arr)
+        _emit_call_rel(code, st.calls, "__pe_arr_push");
+        return true;
+    }
+    if (nm == "pop" or nm == "array_pop") and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 255); push(code, 72); push(code, 8);       // dec qword [rax+8]
+        push(code, 72); push(code, 139); push(code, 72); push(code, 8);       // mov rcx, [rax+8]
+        push(code, 72); push(code, 139); push(code, 80); push(code, 24);      // mov rdx, [rax+24]
+        push(code, 72); push(code, 139); push(code, 4); push(code, 202);      // mov rax, [rdx+rcx*8]
+        return true;
+    }
+    if nm == "str" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_to_str");
+        return true;
+    }
+    if (nm == "str_slice" or nm == "slice") and na == 3 {
+        _emit_expr(args[0], code, env, st); push(code, 80);
+        _emit_expr(args[1], code, env, st); push(code, 80);
+        _emit_expr(args[2], code, env, st);
+        push(code, 73); push(code, 137); push(code, 192);                     // mov r8, rax
+        push(code, 90);                                                       // pop rdx
+        push(code, 89);                                                       // pop rcx
+        _emit_call_rel(code, st.calls, "__pe_str_slice");
+        return true;
+    }
+    if nm == "strcharcodeat" and na == 2 {
+        _emit_expr(args[0], code, env, st); push(code, 80);
+        _emit_expr(args[1], code, env, st);
+        push(code, 72); push(code, 137); push(code, 194);
+        push(code, 89);
+        push(code, 15); push(code, 182); push(code, 68); push(code, 17); push(code, 16); // movzx eax, byte [rcx+rdx+16]
+        return true;
+    }
+    if nm == "strfromcharcode" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 194);
+        push(code, 76); push(code, 137); push(code, 248);
+        push(code, 73); push(code, 131); push(code, 199); push(code, 24);
+        push(code, 72); push(code, 199); push(code, 0); _elf.le(code, 1, 4);
+        push(code, 72); push(code, 199); push(code, 64); push(code, 8); _elf.le(code, 1, 4);
+        push(code, 136); push(code, 80); push(code, 16);                      // mov [rax+16], dl
+        push(code, 198); push(code, 64); push(code, 17); push(code, 0);       // mov byte [rax+17], 0
+        return true;
+    }
+    if nm == "parse_number" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_parse_num");
+        return true;
+    }
+    if nm == "map_has" and na == 2 {
+        _emit_expr(args[0], code, env, st); push(code, 80);
+        _emit_expr(args[1], code, env, st);
+        push(code, 72); push(code, 137); push(code, 194);
+        push(code, 89);
+        _emit_call_rel(code, st.calls, "__pe_map_has");
+        return true;
+    }
+    if nm == "map_keys" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_map_keys");
+        return true;
+    }
+    if nm == "map_values" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_map_values");
+        return true;
+    }
+    if (nm == "map_remove" or nm == "delete") and na == 2 {
+        _emit_expr(args[0], code, env, st); push(code, 80);
+        _emit_expr(args[1], code, env, st);
+        push(code, 72); push(code, 137); push(code, 194);
+        push(code, 89);
+        _emit_call_rel(code, st.calls, "__pe_map_remove");
+        return true;
+    }
+    if nm == "is_string" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_obj_tag");
+        push(code, 72); push(code, 131); push(code, 248); push(code, 1);
+        push(code, 15); push(code, 148); push(code, 192);
+        push(code, 15); push(code, 182); push(code, 192);
+        return true;
+    }
+    if nm == "is_array" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_obj_tag");
+        push(code, 72); push(code, 131); push(code, 248); push(code, 2);
+        push(code, 15); push(code, 148); push(code, 192);
+        push(code, 15); push(code, 182); push(code, 192);
+        return true;
+    }
+    if nm == "is_map" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_obj_tag");
+        push(code, 72); push(code, 131); push(code, 248); push(code, 3);
+        push(code, 15); push(code, 148); push(code, 192);
+        push(code, 15); push(code, 182); push(code, 192);
+        return true;
+    }
+    if nm == "is_number" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_obj_tag");
+        push(code, 72); push(code, 133); push(code, 192);
+        push(code, 15); push(code, 148); push(code, 192);
+        push(code, 15); push(code, 182); push(code, 192);
+        return true;
+    }
+    if nm == "caught_error" and na == 0 {
+        _emit_mov_rax_rw(code, st.fixes, "exc_val");
+        return true;
+    }
+    if nm == "fs_write" and na == 2 {
+        _emit_expr(args[0], code, env, st); push(code, 80);
+        _emit_expr(args[1], code, env, st);
+        push(code, 72); push(code, 137); push(code, 194);
+        push(code, 89);
+        _emit_call_rel(code, st.calls, "__pe_fs_write");
+        return true;
+    }
+    if nm == "fs_read" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_fs_read");
+        return true;
+    }
+    if nm == "fs_exists" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_fs_exists");
+        return true;
+    }
+    if nm == "fs_remove" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_fs_remove");
+        return true;
+    }
+    if (nm == "time_ms" or nm == "now_ms") and na == 0 {
+        _emit_call_rel(code, st.calls, "__pe_time_ms");
+        return true;
+    }
+    if nm == "sleep_ms" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_sleep_ms");
+        return true;
+    }
+    if nm == "os_exit" and na == 1 {
+        _emit_expr(args[0], code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_exit");
+        return true;
+    }
+    if nm == "bit_and" and na == 2 {
+        _emit_expr(args[0], code, env, st); push(code, 80);
+        _emit_expr(args[1], code, env, st); push(code, 91); push(code, 72); push(code, 33); push(code, 216);
+        return true;
+    }
+    if nm == "bit_or" and na == 2 {
+        _emit_expr(args[0], code, env, st); push(code, 80);
+        _emit_expr(args[1], code, env, st); push(code, 91); push(code, 72); push(code, 9); push(code, 216);
+        return true;
+    }
+    if nm == "bit_xor" and na == 2 {
+        _emit_expr(args[0], code, env, st); push(code, 80);
+        _emit_expr(args[1], code, env, st); push(code, 91); push(code, 72); push(code, 49); push(code, 216);
+        return true;
+    }
+    if nm == "bit_shl" and na == 2 {
+        _emit_expr(args[0], code, env, st); push(code, 80);
+        _emit_expr(args[1], code, env, st); push(code, 72); push(code, 137); push(code, 193); push(code, 88);
+        push(code, 72); push(code, 211); push(code, 224);
+        return true;
+    }
+    if nm == "bit_shr" and na == 2 {
+        _emit_expr(args[0], code, env, st); push(code, 80);
+        _emit_expr(args[1], code, env, st); push(code, 72); push(code, 137); push(code, 193); push(code, 88);
+        push(code, 72); push(code, 211); push(code, 232);
+        return true;
+    }
+    return false;
+}
+
+fn _emit_assign_name(nm, code, env, st) {
+    if map_has(env.slots, nm) {
+        if map_has(env.boxed, nm) or map_has(env.boxcaps, nm) {
+            push(code, 72); push(code, 137); push(code, 194);                 // mov rdx, rax
+            _emit_load_slot_rax(code, env.slots[nm]);
+            push(code, 72); push(code, 137); push(code, 80); push(code, 8);   // mov [rax+8], rdx
+            push(code, 72); push(code, 137); push(code, 208);                 // mov rax, rdx
+        } else {
+            _emit_store_slot_rax(code, env.slots[nm]);
+        }
+        return;
+    }
+    if map_has(st.globals, nm) {
+        _emit_mov_rw_rax(code, st.fixes, "g_" + nm);
+        return;
+    }
+    throw "codegen_pe64: assignment to undefined variable '" + nm + "'";
+}
+
+fn _emit_unlink_tries(code, count, st) {
+    let i = 0;
+    while i < count {
+        push(code, 72); push(code, 139); push(code, 12); push(code, 36);       // mov rcx, [rsp]
+        push(code, 72); push(code, 137); push(code, 13); let at = len(code); _elf.le(code, 0, 4);
+        _add_rip_fix(st.fixes, at, "rw", "exc_top");
+        push(code, 72); push(code, 131); push(code, 196); push(code, 32);      // add rsp, 32
+        i = i + 1;
+    }
+}
+
+fn _emit_stmt(s, code, env, st) {
+    let k = s.kind;
+    if k == "let" or k == "const" {
+        if s.value != nil { _emit_expr(s.value, code, env, st); }
+        else { push(code, 49); push(code, 192); }
+        if env.top_level and env.scope_depth == 0 and map_has(st.globals, s.name) {
+            _emit_mov_rw_rax(code, st.fixes, "g_" + s.name);
+            return;
+        }
+        let idx = _alloc_slot(env, s.name);
+        if map_has(env.boxed, s.name) { _emit_alloc_box_rax(code); }
+        _emit_store_slot_rax(code, idx);
+        return;
+    }
+    if k == "assign" {
+        _emit_expr(s.value, code, env, st);
+        _emit_assign_name(s.name, code, env, st);
+        return;
+    }
+    if k == "expr_stmt" {
+        _emit_expr(s.expr, code, env, st);
+        return;
+    }
+    if k == "print" {
+        _emit_expr(s.value, code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_print_val");
+        return;
+    }
+    if k == "return" {
+        if s.value != nil { _emit_expr(s.value, code, env, st); }
+        else { push(code, 49); push(code, 192); }
+        if env.try_depth > 0 { _emit_unlink_tries(code, env.try_depth, st); }
+        if env.top_level {
+            push(code, 72); push(code, 137); push(code, 193);
+            _emit_call_rel(code, st.calls, "__pe_exit");
+        } else {
+            push(code, 72); push(code, 137); push(code, 236);                 // mov rsp, rbp
+            push(code, 93);                                                   // pop rbp
+            push(code, 195);                                                  // ret
+        }
+        return;
+    }
+    if k == "block" {
+        env.scope_depth = env.scope_depth + 1;
+        let bs = _stmts_of(s); let i = 0;
+        while i < len(bs) { _emit_stmt(bs[i], code, env, st); i = i + 1; }
+        env.scope_depth = env.scope_depth - 1;
+        return;
+    }
+    if k == "if" {
+        let end_patches = [];
+        _emit_expr(s.cond, code, env, st);
+        push(code, 72); push(code, 133); push(code, 192);
+        push(code, 15); push(code, 132); let jnext = len(code); _elf.le(code, 0, 4);
+        env.scope_depth = env.scope_depth + 1;
+        let ts = _stmts_of(s.then); let ti = 0;
+        while ti < len(ts) { _emit_stmt(ts[ti], code, env, st); ti = ti + 1; }
+        env.scope_depth = env.scope_depth - 1;
+        push(code, 233); push(end_patches, len(code)); _elf.le(code, 0, 4);
+        _patch32(code, jnext, len(code) - (jnext + 4));
+
+        let el = try s.elifs catch nil;
+        if el != nil {
+            let ei = 0;
+            while ei < len(el) {
+                _emit_expr(el[ei].cond, code, env, st);
+                push(code, 72); push(code, 133); push(code, 192);
+                push(code, 15); push(code, 132); let jnx = len(code); _elf.le(code, 0, 4);
+                env.scope_depth = env.scope_depth + 1;
+                let ebs = _stmts_of(el[ei].body); let bi = 0;
+                while bi < len(ebs) { _emit_stmt(ebs[bi], code, env, st); bi = bi + 1; }
+                env.scope_depth = env.scope_depth - 1;
+                push(code, 233); push(end_patches, len(code)); _elf.le(code, 0, 4);
+                _patch32(code, jnx, len(code) - (jnx + 4));
+                ei = ei + 1;
+            }
+        }
+        let els = try s.else catch nil;
+        if els != nil {
+            env.scope_depth = env.scope_depth + 1;
+            let es = _stmts_of(els); let si = 0;
+            while si < len(es) { _emit_stmt(es[si], code, env, st); si = si + 1; }
+            env.scope_depth = env.scope_depth - 1;
+        }
+        let pi = 0;
+        while pi < len(end_patches) {
+            let p = end_patches[pi];
+            _patch32(code, p, len(code) - (p + 4));
+            pi = pi + 1;
+        }
+        return;
+    }
+    if k == "while" {
+        let ltop = len(code);
+        let lp = map{ breaks: [], conts: [], cont_target: ltop, try_base: env.try_depth };
+        push(env.loops, lp);
+        _emit_expr(s.cond, code, env, st);
+        push(code, 72); push(code, 133); push(code, 192);
+        push(code, 15); push(code, 132); let jexit = len(code); _elf.le(code, 0, 4);
+        env.scope_depth = env.scope_depth + 1;
+        let bs = _stmts_of(s.body); let bi = 0;
+        while bi < len(bs) { _emit_stmt(bs[bi], code, env, st); bi = bi + 1; }
+        env.scope_depth = env.scope_depth - 1;
+        push(code, 233); let jb = len(code); _elf.le(code, 0, 4); _patch32(code, jb, ltop - (jb + 4));
+        _patch32(code, jexit, len(code) - (jexit + 4));
+        pop(env.loops);
+        let k1 = 0; while k1 < len(lp.breaks) { let p = lp.breaks[k1]; _patch32(code, p, len(code) - (p + 4)); k1 = k1 + 1; }
+        let k2 = 0; while k2 < len(lp.conts) { let p = lp.conts[k2]; _patch32(code, p, ltop - (p + 4)); k2 = k2 + 1; }
+        return;
+    }
+    if k == "for_in" {
+        // Desugar `for x in seq` over arrays or maps (via __pe_iter_seq)
+        _emit_expr(s.iter, code, env, st);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_call_rel(code, st.calls, "__pe_iter_seq");
+        let seq_slot = _alloc_slot(env, "__for_seq_" + str(env.nslots));
+        _emit_store_slot_rax(code, seq_slot);
+        let idx_slot = _alloc_slot(env, "__for_idx_" + str(env.nslots));
+        push(code, 49); push(code, 192);
+        _emit_store_slot_rax(code, idx_slot);
+        let var_slot = _alloc_slot(env, s.name);
+
+        let ltop = len(code);
+        let lp = map{ breaks: [], conts: [], cont_target: 0 - 1, try_base: env.try_depth };
+        push(env.loops, lp);
+        _emit_load_slot_rax(code, seq_slot);
+        push(code, 72); push(code, 139); push(code, 72); push(code, 8);       // rcx = len(seq)
+        _emit_load_slot_rax(code, idx_slot);
+        push(code, 72); push(code, 57); push(code, 200);                      // cmp rax, rcx
+        push(code, 15); push(code, 131); let jexit = len(code); _elf.le(code, 0, 4);
+        push(code, 72); push(code, 137); push(code, 194);                     // rdx = idx
+        _emit_load_slot_rax(code, seq_slot);
+        push(code, 72); push(code, 139); push(code, 64); push(code, 24);      // rax = data_ptr
+        push(code, 72); push(code, 139); push(code, 4); push(code, 208);      // rax = data_ptr[rdx]
+        if map_has(env.boxed, s.name) { _emit_alloc_box_rax(code); }
+        _emit_store_slot_rax(code, var_slot);
+
+        env.scope_depth = env.scope_depth + 1;
+        let bs = _stmts_of(s.body); let bi = 0;
+        while bi < len(bs) { _emit_stmt(bs[bi], code, env, st); bi = bi + 1; }
+        env.scope_depth = env.scope_depth - 1;
+
+        let step_pos = len(code);
+        _emit_load_slot_rax(code, idx_slot);
+        push(code, 72); push(code, 255); push(code, 192);                     // inc rax
+        _emit_store_slot_rax(code, idx_slot);
+        push(code, 233); let jb = len(code); _elf.le(code, 0, 4); _patch32(code, jb, ltop - (jb + 4));
+        _patch32(code, jexit, len(code) - (jexit + 4));
+        pop(env.loops);
+        let k1 = 0; while k1 < len(lp.breaks) { let p = lp.breaks[k1]; _patch32(code, p, len(code) - (p + 4)); k1 = k1 + 1; }
+        let k2 = 0; while k2 < len(lp.conts) { let p = lp.conts[k2]; _patch32(code, p, step_pos - (p + 4)); k2 = k2 + 1; }
+        return;
+    }
+    if k == "for_range" {
+        _emit_expr(s.start, code, env, st);
+        let idx_slot = _alloc_slot(env, s.name);
+        if map_has(env.boxed, s.name) { _emit_alloc_box_rax(code); }
+        _emit_store_slot_rax(code, idx_slot);
+        _emit_expr(s.end, code, env, st);
+        let end_slot = _alloc_slot(env, "__for_end_" + str(env.nslots));
+        _emit_store_slot_rax(code, end_slot);
+
+        let ltop = len(code);
+        let lp = map{ breaks: [], conts: [], cont_target: 0 - 1, try_base: env.try_depth };
+        push(env.loops, lp);
+        _emit_load_slot_rax(code, end_slot);
+        push(code, 72); push(code, 137); push(code, 193);
+        _emit_load_slot_rax(code, idx_slot);
+        if map_has(env.boxed, s.name) { push(code, 72); push(code, 139); push(code, 64); push(code, 8); }
+        push(code, 72); push(code, 57); push(code, 200);
+        push(code, 15); push(code, 141); let jexit = len(code); _elf.le(code, 0, 4); // jge exit
+
+        env.scope_depth = env.scope_depth + 1;
+        let bs = _stmts_of(s.body); let bi = 0;
+        while bi < len(bs) { _emit_stmt(bs[bi], code, env, st); bi = bi + 1; }
+        env.scope_depth = env.scope_depth - 1;
+
+        let step_pos = len(code);
+        _emit_load_slot_rax(code, idx_slot);
+        if map_has(env.boxed, s.name) {
+            push(code, 72); push(code, 255); push(code, 64); push(code, 8);
+        } else {
+            push(code, 72); push(code, 255); push(code, 192);
+            _emit_store_slot_rax(code, idx_slot);
+        }
+        push(code, 233); let jb = len(code); _elf.le(code, 0, 4); _patch32(code, jb, ltop - (jb + 4));
+        _patch32(code, jexit, len(code) - (jexit + 4));
+        pop(env.loops);
+        let k1 = 0; while k1 < len(lp.breaks) { let p = lp.breaks[k1]; _patch32(code, p, len(code) - (p + 4)); k1 = k1 + 1; }
+        let k2 = 0; while k2 < len(lp.conts) { let p = lp.conts[k2]; _patch32(code, p, step_pos - (p + 4)); k2 = k2 + 1; }
+        return;
+    }
+    if k == "break" {
+        let lp = env.loops[len(env.loops) - 1];
+        if env.try_depth > lp.try_base { _emit_unlink_tries(code, env.try_depth - lp.try_base, st); }
+        push(code, 233); push(lp.breaks, len(code)); _elf.le(code, 0, 4);
+        return;
+    }
+    if k == "continue" {
+        let lp = env.loops[len(env.loops) - 1];
+        if env.try_depth > lp.try_base { _emit_unlink_tries(code, env.try_depth - lp.try_base, st); }
+        push(code, 233); push(lp.conts, len(code)); _elf.le(code, 0, 4);
+        return;
+    }
+    if k == "fn" { return; }
+    throw "codegen_pe64: unsupported stmt kind " + str(k);
+}
+
+fn _emit_fn_pe(code, lbl_name, params, body, caps, boxcaps, st) {
+    st.labels[lbl_name] = len(code);
+    push(code, 85);                                                           // push rbp
+    push(code, 72); push(code, 137); push(code, 229);                         // mov rbp, rsp
+    push(code, 72); push(code, 129); push(code, 236); let frame_at = len(code); _elf.le(code, 64, 4); // sub rsp, <frame>
+
+    let skip = _copy_set(st.fnnames);
+    let gks = map_keys(st.globals); let gi = 0;
+    while gi < len(gks) { skip[gks[gi]] = true; gi = gi + 1; }
+    let pi = 0; while pi < len(params) { if map_has(skip, _param_name(params[pi])) { map_remove(skip, _param_name(params[pi])); } pi = pi + 1; }
+    let ci = 0; while ci < len(caps) { if map_has(skip, caps[ci]) { map_remove(skip, caps[ci]); } ci = ci + 1; }
+    let boxed = _find_boxed_pe(params, body, skip);
+
+    let env = map{
+        slots: map{}, nslots: 0, boxed: boxed, boxcaps: boxcaps,
+        loops: [], try_depth: 0, top_level: false, scope_depth: 1
+    };
+
+    // Spill captured upvalues from r11 (`[r11 + 24 + c*8]`)
+    let c = 0;
+    while c < len(caps) {
+        let cslot = _alloc_slot(env, caps[c]);
+        push(code, 73); push(code, 139); push(code, 131); _elf.le(code, 24 + c * 8, 4); // mov rax, [r11 + 24 + c*8]
+        _emit_store_slot_rax(code, cslot);
+        c = c + 1;
+    }
+
+    // Spill parameters from rdi, rsi, rdx, rcx, r8, r9 (boxing if mutated inside inner closure)
+    let p = 0;
+    while p < len(params) {
+        let pnm = _param_name(params[p]);
+        let pslot = _alloc_slot(env, pnm);
+        _emit_spill_argreg_to_rax(code, p);
+        if map_has(boxed, pnm) { _emit_alloc_box_rax(code); }
+        _emit_store_slot_rax(code, pslot);
+        p = p + 1;
+    }
+
+    let bi = 0;
+    while bi < len(body) { _emit_stmt(body[bi], code, env, st); bi = bi + 1; }
+
+    let frame = _align_up(env.nslots * 8, 16);
+    _patch32(code, frame_at, frame);
+    push(code, 49); push(code, 192);                                          // default nil (0)
+    push(code, 72); push(code, 137); push(code, 236);                         // mov rsp, rbp
+    push(code, 93);                                                           // pop rbp
+    push(code, 195);                                                          // ret
+}
+
+// ── Windows x64 Runtime Helpers (`KERNEL32.dll` + Tagged Heap Ops) ────────────────────
+fn _emit_pe_runtime(code, st) {
+    // 1. __pe_obj_tag(rcx) -> rax = tag (1..5) if rcx is an 8B-aligned pointer inside [arena_base, r15) or [ro_lo, ro_hi), else 0!
+    st.labels["__pe_obj_tag"] = len(code);
+    push(code, 246); push(code, 193); push(code, 7);                          // test cl, 7
+    push(code, 15); push(code, 133); let jnot0 = len(code); _elf.le(code, 0, 4);
+    _emit_mov_rax_rw(code, st.fixes, "arena_base");
+    push(code, 72); push(code, 57); push(code, 193);                          // cmp rcx, rax
+    push(code, 15); push(code, 130); let jchkro = len(code); _elf.le(code, 0, 4);
+    push(code, 76); push(code, 57); push(code, 249);                          // cmp rcx, r15
+    push(code, 15); push(code, 130); let jisobj = len(code); _elf.le(code, 0, 4);
+    _patch32(code, jchkro, len(code) - (jchkro + 4));
+    push(code, 72); push(code, 141); push(code, 5); let rlo = len(code); _elf.le(code, 0, 4);
+    _add_rip_fix(st.fixes, rlo, "ro_bounds_lo", "");
+    push(code, 72); push(code, 57); push(code, 193);                          // cmp rcx, ro_lo
+    push(code, 15); push(code, 130); let jnot1 = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 141); push(code, 5); let rhi = len(code); _elf.le(code, 0, 4);
+    _add_rip_fix(st.fixes, rhi, "ro_bounds_hi", "");
+    push(code, 72); push(code, 57); push(code, 193);                          // cmp rcx, ro_hi
+    push(code, 15); push(code, 131); let jnot2 = len(code); _elf.le(code, 0, 4);
+    _patch32(code, jisobj, len(code) - (jisobj + 4));
+    push(code, 72); push(code, 139); push(code, 1);                           // mov rax, [rcx]
+    push(code, 72); push(code, 131); push(code, 248); push(code, 1);
+    push(code, 15); push(code, 140); let jnot3 = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 131); push(code, 248); push(code, 5);
+    push(code, 15); push(code, 143); let jnot4 = len(code); _elf.le(code, 0, 4);
+    push(code, 195);                                                          // ret (rax = 1..5)
+    _patch32(code, jnot0, len(code) - (jnot0 + 4));
+    _patch32(code, jnot1, len(code) - (jnot1 + 4));
+    _patch32(code, jnot2, len(code) - (jnot2 + 4));
+    _patch32(code, jnot3, len(code) - (jnot3 + 4));
+    _patch32(code, jnot4, len(code) - (jnot4 + 4));
+    push(code, 49); push(code, 192);                                          // xor eax, eax
+    push(code, 195);
+
+    // 2. __pe_to_str(rcx = val) -> rax = TAG_STR
+    st.labels["__pe_to_str"] = len(code);
+    push(code, 83);                                                           // push rbx
+    push(code, 72); push(code, 137); push(code, 203);                         // mov rbx, rcx
+    _emit_call_rel(code, st.calls, "__pe_obj_tag");
+    push(code, 72); push(code, 131); push(code, 248); push(code, 1);
+    push(code, 117); push(code, 5);
+    push(code, 72); push(code, 137); push(code, 216);                         // mov rax, rbx (already TAG_STR)
+    push(code, 91); push(code, 195);
+    // Convert signed 64-bit integer in rbx to TAG_STR on r15
+    push(code, 72); push(code, 131); push(code, 236); push(code, 32);         // sub rsp, 32 (digit scratch)
+    push(code, 76); push(code, 141); push(code, 68); push(code, 36); push(code, 31); // lea r8, [rsp+31]
+    push(code, 65); push(code, 198); push(code, 0); push(code, 0);            // mov byte [r8], 0
+    push(code, 76); push(code, 137); push(code, 193);                         // mov rcx, r8 (end)
+    push(code, 69); push(code, 49); push(code, 201);                          // xor r9d, r9d (neg_flag)
+    push(code, 72); push(code, 137); push(code, 216);                         // mov rax, rbx
+    push(code, 72); push(code, 133); push(code, 192);
+    push(code, 121); push(code, 6);                                           // jns +6
+    push(code, 72); push(code, 247); push(code, 216);                         // neg rax (3B)
+    push(code, 65); push(code, 177); push(code, 1);                           // mov r9b, 1 (3B)
+    push(code, 65); push(code, 186); _elf.le(code, 10, 4);                    // mov r10d, 10
+    let dlp = len(code);
+    push(code, 73); push(code, 255); push(code, 200);                         // .dlp: dec r8
+    push(code, 49); push(code, 210);                                          // xor edx, edx
+    push(code, 73); push(code, 247); push(code, 242);                         // div r10
+    push(code, 128); push(code, 194); push(code, 48);                         // add dl, '0'
+    push(code, 65); push(code, 136); push(code, 16);                          // mov [r8], dl
+    push(code, 72); push(code, 133); push(code, 192);
+    push(code, 117); push(code, dlp - (len(code) + 1) + 256);
+    push(code, 69); push(code, 132); push(code, 201);                         // test r9b, r9b
+    push(code, 116); push(code, 7);                                           // jz +7
+    push(code, 73); push(code, 255); push(code, 200);                         // dec r8 (3B)
+    push(code, 65); push(code, 198); push(code, 0); push(code, 45);           // mov byte [r8], '-' (4B)
+    push(code, 76); push(code, 41); push(code, 193);                          // sub rcx, r8 (rcx = slen)
+    push(code, 76); push(code, 137); push(code, 248);                         // mov rax, r15 (str header)
+    push(code, 72); push(code, 199); push(code, 0); _elf.le(code, 1, 4);      // [rax] = TAG_STR (1)
+    push(code, 72); push(code, 137); push(code, 72); push(code, 8);           // [rax+8] = slen
+    push(code, 72); push(code, 141); push(code, 80); push(code, 16);          // lea rdx, [rax+16]
+    let clp = len(code);
+    push(code, 72); push(code, 133); push(code, 201);                         // test rcx, rcx
+    push(code, 15); push(code, 132); let jcld = len(code); _elf.le(code, 0, 4); // jz done
+    push(code, 69); push(code, 138); push(code, 16);                          // mov r10b, [r8]
+    push(code, 68); push(code, 136); push(code, 18);                          // mov [rdx], r10b
+    push(code, 73); push(code, 255); push(code, 192);                         // inc r8
+    push(code, 72); push(code, 255); push(code, 194);                         // inc rdx
+    push(code, 72); push(code, 255); push(code, 201);                         // dec rcx
+    push(code, 233); let jclb = len(code); _elf.le(code, 0, 4);
+    _patch32(code, jclb, clp - (jclb + 4));
+    _patch32(code, jcld, len(code) - (jcld + 4));
+    push(code, 198); push(code, 2); push(code, 0);                            // mov byte [rdx], 0
+    push(code, 72); push(code, 139); push(code, 72); push(code, 8);           // mov rcx, [rax+8]
+    push(code, 73); push(code, 141); push(code, 76); push(code, 15); push(code, 24); // lea rcx, [r15+rcx+24]
+    push(code, 72); push(code, 131); push(code, 225); push(code, 248);        // and rcx, -8
+    push(code, 73); push(code, 137); push(code, 207);                         // mov r15, rcx
+    push(code, 72); push(code, 131); push(code, 196); push(code, 32);         // add rsp, 32
+    push(code, 91); push(code, 195);
+
+    // 3. __pe_add(rcx = left, rdx = right) -> integer add OR string concat if either is TAG_STR!
+    st.labels["__pe_add"] = len(code);
+    push(code, 83); push(code, 65); push(code, 84);                           // push rbx; push r12
+    push(code, 72); push(code, 137); push(code, 203);                         // mov rbx, rcx (left)
+    push(code, 73); push(code, 137); push(code, 212);                         // mov r12, rdx (right)
+    _emit_call_rel(code, st.calls, "__pe_obj_tag");
+    push(code, 72); push(code, 131); push(code, 248); push(code, 1);
+    push(code, 15); push(code, 132); let jcat = len(code); _elf.le(code, 0, 4);
+    push(code, 76); push(code, 137); push(code, 225);                         // mov rcx, r12
+    _emit_call_rel(code, st.calls, "__pe_obj_tag");
+    push(code, 72); push(code, 131); push(code, 248); push(code, 1);
+    push(code, 15); push(code, 132); let jcat2 = len(code); _elf.le(code, 0, 4);
+    // Plain integer addition
+    push(code, 72); push(code, 137); push(code, 216);                         // mov rax, rbx
+    push(code, 76); push(code, 1); push(code, 224);                           // add rax, r12
+    push(code, 65); push(code, 92); push(code, 91); push(code, 195);
+    _patch32(code, jcat, len(code) - (jcat + 4));
+    _patch32(code, jcat2, len(code) - (jcat2 + 4));
+    push(code, 72); push(code, 137); push(code, 217);                         // mov rcx, rbx
+    _emit_call_rel(code, st.calls, "__pe_to_str");
+    push(code, 72); push(code, 137); push(code, 195);                         // rbx = left str
+    push(code, 76); push(code, 137); push(code, 225);                         // mov rcx, r12
+    _emit_call_rel(code, st.calls, "__pe_to_str");
+    push(code, 73); push(code, 137); push(code, 196);                         // r12 = right str
+    push(code, 72); push(code, 139); push(code, 75); push(code, 8);           // rcx = len1
+    push(code, 73); push(code, 139); push(code, 84); push(code, 36); push(code, 8); // rdx = len2 ([r12+8])
+    push(code, 76); push(code, 141); push(code, 4); push(code, 17);           // lea r8, [rcx+rdx] (total)
+    push(code, 76); push(code, 137); push(code, 248);                         // mov rax, r15
+    push(code, 72); push(code, 199); push(code, 0); _elf.le(code, 1, 4);
+    push(code, 76); push(code, 137); push(code, 64); push(code, 8);           // [rax+8] = total
+    push(code, 87); push(code, 86);                                           // push rdi; push rsi
+    push(code, 72); push(code, 141); push(code, 120); push(code, 16);         // lea rdi, [rax+16]
+    push(code, 72); push(code, 141); push(code, 115); push(code, 16);         // lea rsi, [rbx+16]
+    push(code, 252); push(code, 243); push(code, 164);                        // cld; rep movsb
+    push(code, 72); push(code, 137); push(code, 209);                         // mov rcx, rdx (len2)
+    push(code, 73); push(code, 141); push(code, 116); push(code, 36); push(code, 16); // lea rsi, [r12+16]
+    push(code, 243); push(code, 164);                                         // rep movsb
+    push(code, 198); push(code, 7); push(code, 0);                            // mov byte [rdi], 0
+    push(code, 94); push(code, 95);                                           // pop rsi; pop rdi
+    push(code, 79); push(code, 141); push(code, 76); push(code, 7); push(code, 24); // lea r9, [r15+r8+24]
+    push(code, 73); push(code, 131); push(code, 225); push(code, 248);        // and r9, -8
+    push(code, 77); push(code, 137); push(code, 207);                         // mov r15, r9
+    push(code, 65); push(code, 92); push(code, 91); push(code, 195);
+
+    // 4. __pe_eq(rcx = a, rdx = b) -> 1 if equal (pointer/int eq OR byte-equal TAG_STR), else 0
+    st.labels["__pe_eq"] = len(code);
+    push(code, 72); push(code, 57); push(code, 209);                          // cmp rcx, rdx
+    push(code, 117); push(code, 6);
+    push(code, 184); _elf.le(code, 1, 4); push(code, 195);
+    push(code, 83); push(code, 65); push(code, 84);
+    push(code, 72); push(code, 137); push(code, 203);                         // rbx = a
+    push(code, 73); push(code, 137); push(code, 212);                         // r12 = b
+    _emit_call_rel(code, st.calls, "__pe_obj_tag");
+    push(code, 72); push(code, 131); push(code, 248); push(code, 1);
+    push(code, 15); push(code, 133); let jne1 = len(code); _elf.le(code, 0, 4);
+    push(code, 76); push(code, 137); push(code, 225);
+    _emit_call_rel(code, st.calls, "__pe_obj_tag");
+    push(code, 72); push(code, 131); push(code, 248); push(code, 1);
+    push(code, 15); push(code, 133); let jne2 = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 139); push(code, 75); push(code, 8);           // rcx = [rbx+8]
+    push(code, 73); push(code, 59); push(code, 76); push(code, 36); push(code, 8); // cmp rcx, [r12+8]
+    push(code, 15); push(code, 133); let jne3 = len(code); _elf.le(code, 0, 4);
+    push(code, 87); push(code, 86);
+    push(code, 72); push(code, 141); push(code, 115); push(code, 16);
+    push(code, 73); push(code, 141); push(code, 124); push(code, 36); push(code, 16);
+    push(code, 252); push(code, 243); push(code, 166);                        // cld; repe cmpsb
+    push(code, 15); push(code, 148); push(code, 192);
+    push(code, 15); push(code, 182); push(code, 192);
+    push(code, 94); push(code, 95);
+    push(code, 65); push(code, 92); push(code, 91); push(code, 195);
+    _patch32(code, jne1, len(code) - (jne1 + 4));
+    _patch32(code, jne2, len(code) - (jne2 + 4));
+    _patch32(code, jne3, len(code) - (jne3 + 4));
+    push(code, 49); push(code, 192);
+    push(code, 65); push(code, 92); push(code, 91); push(code, 195);
+
+    // 5. __pe_arr_push(rcx = arr, rdx = val) -> grows cap*2+8 if len >= cap
+    st.labels["__pe_arr_push"] = len(code);
+    push(code, 72); push(code, 139); push(code, 65); push(code, 8);           // rax = len
+    push(code, 72); push(code, 59); push(code, 65); push(code, 16);           // cmp rax, cap
+    push(code, 15); push(code, 140); let jap = len(code); _elf.le(code, 0, 4);
+    push(code, 87); push(code, 86); push(code, 82); push(code, 81);           // push rdi, rsi, rdx, rcx
+    push(code, 72); push(code, 139); push(code, 81); push(code, 16);          // rdx = old_cap
+    push(code, 72); push(code, 209); push(code, 226);                         // shl rdx, 1
+    push(code, 72); push(code, 131); push(code, 194); push(code, 8);          // add rdx, 8 (new_cap)
+    push(code, 72); push(code, 137); push(code, 81); push(code, 16);          // [rcx+16] = new_cap
+    push(code, 76); push(code, 137); push(code, 255);                         // mov rdi, r15 (new data_ptr)
+    push(code, 72); push(code, 193); push(code, 226); push(code, 3);          // shl rdx, 3 (bytes)
+    push(code, 73); push(code, 1); push(code, 215);                           // add r15, rdx
+    push(code, 72); push(code, 139); push(code, 113); push(code, 24);         // mov rsi, [rcx+24] (old data_ptr)
+    push(code, 72); push(code, 137); push(code, 121); push(code, 24);         // [rcx+24] = rdi
+    push(code, 72); push(code, 139); push(code, 73); push(code, 8);           // mov rcx, len
+    push(code, 252); push(code, 243); push(code, 72); push(code, 165);        // cld; rep movsq
+    push(code, 89); push(code, 90); push(code, 94); push(code, 95);           // pop rcx, rdx, rsi, rdi
+    _patch32(code, jap, len(code) - (jap + 4));
+    push(code, 72); push(code, 139); push(code, 65); push(code, 8);           // mov rax, [rcx+8] (len)
+    push(code, 76); push(code, 139); push(code, 65); push(code, 24);          // mov r8, [rcx+24] (data_ptr)
+    push(code, 73); push(code, 137); push(code, 20); push(code, 192);         // mov [r8+rax*8], rdx
+    push(code, 72); push(code, 255); push(code, 65); push(code, 8);           // inc qword [rcx+8]
+    push(code, 72); push(code, 137); push(code, 200);                         // mov rax, rcx
+    push(code, 195);
+
+    // 6. __pe_str_slice(rcx = str, rdx = start, r8 = end) -> rax = TAG_STR
+    st.labels["__pe_str_slice"] = len(code);
+    push(code, 87); push(code, 86);
+    push(code, 76); push(code, 139); push(code, 73); push(code, 8);           // mov r9, [rcx+8]
+    push(code, 72); push(code, 133); push(code, 210);                         // if start < 0 -> 0
+    push(code, 121); push(code, 2); push(code, 49); push(code, 210);
+    push(code, 77); push(code, 57); push(code, 200);                          // cmp r8, r9 (end > slen?)
+    push(code, 126); push(code, 3); push(code, 77); push(code, 137); push(code, 200); // jle +3; mov r8, r9
+    push(code, 73); push(code, 41); push(code, 208);                          // sub r8, rdx (sub_len = end - start)
+    push(code, 121); push(code, 3); push(code, 69); push(code, 49); push(code, 192);  // jns +3; xor r8d, r8d
+    push(code, 76); push(code, 137); push(code, 248);                         // mov rax, r15
+    push(code, 72); push(code, 199); push(code, 0); _elf.le(code, 1, 4);
+    push(code, 76); push(code, 137); push(code, 64); push(code, 8);           // [rax+8] = r8
+    push(code, 72); push(code, 141); push(code, 116); push(code, 17); push(code, 16); // lea rsi, [rcx+rdx+16]
+    push(code, 72); push(code, 141); push(code, 120); push(code, 16);         // lea rdi, [rax+16]
+    push(code, 76); push(code, 137); push(code, 193);                         // mov rcx, r8
+    push(code, 252); push(code, 243); push(code, 164);                        // cld; rep movsb
+    push(code, 198); push(code, 7); push(code, 0);                            // trailing NUL
+    push(code, 79); push(code, 141); push(code, 76); push(code, 7); push(code, 24); // lea r9, [r15+r8+24]
+    push(code, 73); push(code, 131); push(code, 225); push(code, 248);
+    push(code, 77); push(code, 137); push(code, 207);
+    push(code, 94); push(code, 95); push(code, 195);
+
+    // 7. __pe_parse_num(rcx = TAG_STR) -> rax = signed i64
+    st.labels["__pe_parse_num"] = len(code);
+    push(code, 72); push(code, 139); push(code, 81); push(code, 8);           // rdx = slen
+    push(code, 72); push(code, 141); push(code, 73); push(code, 16);          // rcx = ptr
+    push(code, 49); push(code, 192);                                          // rax = 0
+    push(code, 69); push(code, 49); push(code, 192);                          // r8d = neg (0)
+    push(code, 72); push(code, 133); push(code, 210);
+    push(code, 15); push(code, 132); let jpnd = len(code); _elf.le(code, 0, 4);
+    push(code, 128); push(code, 57); push(code, 45);                          // cmp byte [rcx], '-'
+    push(code, 117); push(code, 9);
+    push(code, 65); push(code, 176); push(code, 1);                           // mov r8b, 1 (3B)
+    push(code, 72); push(code, 255); push(code, 193);                         // inc rcx (3B)
+    push(code, 72); push(code, 255); push(code, 202);                         // dec rdx (3B)
+    let pnlp = len(code);
+    push(code, 72); push(code, 133); push(code, 210);
+    push(code, 15); push(code, 132); let jpne = len(code); _elf.le(code, 0, 4);
+    push(code, 68); push(code, 15); push(code, 182); push(code, 9);           // movzx r9d, byte [rcx]
+    push(code, 65); push(code, 131); push(code, 233); push(code, 48);         // sub r9d, '0'
+    push(code, 72); push(code, 107); push(code, 192); push(code, 10);         // imul rax, rax, 10
+    push(code, 76); push(code, 1); push(code, 200);                           // add rax, r9
+    push(code, 72); push(code, 255); push(code, 193);
+    push(code, 72); push(code, 255); push(code, 202);
+    push(code, 233); let jpnb = len(code); _elf.le(code, 0, 4); _patch32(code, jpnb, pnlp - (jpnb + 4));
+    _patch32(code, jpne, len(code) - (jpne + 4));
+    push(code, 69); push(code, 132); push(code, 192);
+    push(code, 116); push(code, 3);
+    push(code, 72); push(code, 247); push(code, 216);                         // neg rax
+    _patch32(code, jpnd, len(code) - (jpnd + 4));
+    push(code, 195);
+
+    // 8. Map helpers: __pe_map_find(rcx = map, rdx = key_str) -> rax = index (0..count-1) or -1
+    st.labels["__pe_map_find"] = len(code);
+    push(code, 83); push(code, 65); push(code, 84); push(code, 65); push(code, 85); push(code, 65); push(code, 86); // push rbx, r12, r13, r14
+    push(code, 72); push(code, 137); push(code, 203);                         // rbx = map
+    push(code, 73); push(code, 137); push(code, 212);                         // r12 = key
+    push(code, 76); push(code, 139); push(code, 107); push(code, 8);          // r13 = count
+    push(code, 69); push(code, 49); push(code, 246);                          // r14 = i = 0
+    let mflp = len(code);
+    push(code, 77); push(code, 57); push(code, 238);                          // cmp r14, r13
+    push(code, 15); push(code, 131); let jmfn = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 139); push(code, 67); push(code, 24);          // rax = entries_ptr
+    push(code, 76); push(code, 137); push(code, 241);                         // rcx = i
+    push(code, 72); push(code, 193); push(code, 225); push(code, 4);          // shl rcx, 4
+    push(code, 72); push(code, 139); push(code, 12); push(code, 8);           // rcx = entries[i].key
+    push(code, 76); push(code, 137); push(code, 226);                         // rdx = key
+    _emit_call_rel(code, st.calls, "__pe_eq");
+    push(code, 72); push(code, 133); push(code, 192);
+    push(code, 15); push(code, 133); let jmff = len(code); _elf.le(code, 0, 4);
+    push(code, 73); push(code, 255); push(code, 198);                         // inc r14
+    push(code, 233); let jmfb = len(code); _elf.le(code, 0, 4); _patch32(code, jmfb, mflp - (jmfb + 4));
+    _patch32(code, jmff, len(code) - (jmff + 4));
+    push(code, 76); push(code, 137); push(code, 240);                         // rax = i
+    push(code, 65); push(code, 94); push(code, 65); push(code, 93); push(code, 65); push(code, 92); push(code, 91); push(code, 195);
+    _patch32(code, jmfn, len(code) - (jmfn + 4));
+    push(code, 72); push(code, 199); push(code, 192); _elf.le(code, 0 - 1, 4);
+    push(code, 65); push(code, 94); push(code, 65); push(code, 93); push(code, 65); push(code, 92); push(code, 91); push(code, 195);
+
+    // __pe_map_get(rcx = map, rdx = key) -> rax = val (throws on missing key)
+    st.labels["__pe_map_get"] = len(code);
+    push(code, 83);
+    push(code, 72); push(code, 137); push(code, 203);                         // rbx = map
+    _emit_call_rel(code, st.calls, "__pe_map_find");
+    push(code, 72); push(code, 133); push(code, 192);
+    push(code, 15); push(code, 136); let jmgm = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 193); push(code, 224); push(code, 4);
+    push(code, 72); push(code, 139); push(code, 75); push(code, 24);
+    push(code, 72); push(code, 139); push(code, 68); push(code, 1); push(code, 8); // mov rax, [rcx+rax+8]
+    push(code, 91); push(code, 195);
+    _patch32(code, jmgm, len(code) - (jmgm + 4));
+    push(code, 91);
+    let miss_sid = _intern_ro_str(st, "missing map key");
+    push(code, 72); push(code, 141); push(code, 13); let mat = len(code); _elf.le(code, 0, 4);
+    _add_rip_fix(st.fixes, mat, "ro_str", str(miss_sid));
+    _emit_call_rel(code, st.calls, "__pe_throw");
+
+    // __pe_map_has(rcx = map, rdx = key) -> rax = 1/0
+    st.labels["__pe_map_has"] = len(code);
+    _emit_call_rel(code, st.calls, "__pe_map_find");
+    push(code, 72); push(code, 133); push(code, 192);
+    push(code, 15); push(code, 157); push(code, 192);                         // setge al
+    push(code, 15); push(code, 182); push(code, 192);
+    push(code, 195);
+
+    // __pe_map_set(rcx = map, rdx = key, r8 = val) -> rax = val (grows cap*2+8 if full)
+    st.labels["__pe_map_set"] = len(code);
+    push(code, 83); push(code, 65); push(code, 84); push(code, 65); push(code, 85); // push rbx, r12, r13
+    push(code, 72); push(code, 137); push(code, 203);                         // rbx = map
+    push(code, 73); push(code, 137); push(code, 212);                         // r12 = key
+    push(code, 77); push(code, 137); push(code, 197);                         // r13 = val
+    _emit_call_rel(code, st.calls, "__pe_map_find");
+    push(code, 72); push(code, 133); push(code, 192);
+    push(code, 15); push(code, 136); let jmsn = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 193); push(code, 224); push(code, 4);
+    push(code, 72); push(code, 139); push(code, 75); push(code, 24);
+    push(code, 76); push(code, 137); push(code, 108); push(code, 1); push(code, 8); // [rcx+rax+8] = r13
+    push(code, 76); push(code, 137); push(code, 232);
+    push(code, 65); push(code, 93); push(code, 65); push(code, 92); push(code, 91); push(code, 195);
+    _patch32(code, jmsn, len(code) - (jmsn + 4));
+    // New key: check count < cap
+    push(code, 72); push(code, 139); push(code, 67); push(code, 8);           // rax = count
+    push(code, 72); push(code, 59); push(code, 67); push(code, 16);           // cmp rax, cap
+    push(code, 15); push(code, 140); let jmsa = len(code); _elf.le(code, 0, 4);
+    push(code, 87); push(code, 86);                                           // push rdi, rsi
+    push(code, 72); push(code, 139); push(code, 83); push(code, 16);          // rdx = old_cap
+    push(code, 72); push(code, 209); push(code, 226);                         // shl rdx, 1
+    push(code, 72); push(code, 131); push(code, 194); push(code, 8);          // add rdx, 8
+    push(code, 72); push(code, 137); push(code, 83); push(code, 16);          // [rbx+16] = new_cap
+    push(code, 76); push(code, 137); push(code, 255);                         // rdi = r15
+    push(code, 72); push(code, 193); push(code, 226); push(code, 4);          // shl rdx, 4 (bytes)
+    push(code, 73); push(code, 1); push(code, 215);                           // add r15, rdx
+    push(code, 72); push(code, 139); push(code, 115); push(code, 24);         // rsi = old entries
+    push(code, 72); push(code, 137); push(code, 123); push(code, 24);         // [rbx+24] = rdi
+    push(code, 72); push(code, 139); push(code, 75); push(code, 8);           // rcx = count
+    push(code, 72); push(code, 209); push(code, 225);                         // shl rcx, 1 (count*2 qwords)
+    push(code, 252); push(code, 243); push(code, 72); push(code, 165);
+    push(code, 94); push(code, 95);
+    _patch32(code, jmsa, len(code) - (jmsa + 4));
+    push(code, 72); push(code, 139); push(code, 67); push(code, 8);           // rax = count
+    push(code, 72); push(code, 193); push(code, 224); push(code, 4);
+    push(code, 72); push(code, 139); push(code, 75); push(code, 24);
+    push(code, 76); push(code, 137); push(code, 36); push(code, 1);           // [rcx+rax] = r12 (key)
+    push(code, 76); push(code, 137); push(code, 108); push(code, 1); push(code, 8); // [rcx+rax+8] = r13 (val)
+    push(code, 72); push(code, 255); push(code, 67); push(code, 8);           // inc count
+    push(code, 76); push(code, 137); push(code, 232);
+    push(code, 65); push(code, 93); push(code, 65); push(code, 92); push(code, 91); push(code, 195);
+
+    // __pe_map_remove(rcx = map, rdx = key) -> rax = 1 if removed else 0
+    st.labels["__pe_map_remove"] = len(code);
+    push(code, 83); push(code, 87); push(code, 86);
+    push(code, 72); push(code, 137); push(code, 203);                         // rbx = map
+    _emit_call_rel(code, st.calls, "__pe_map_find");
+    push(code, 72); push(code, 133); push(code, 192);
+    push(code, 15); push(code, 136); let jmrn = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 139); push(code, 75); push(code, 8);           // rcx = count
+    push(code, 72); push(code, 255); push(code, 201);                         // count - 1
+    push(code, 72); push(code, 137); push(code, 75); push(code, 8);           // [rbx+8] = count - 1
+    push(code, 72); push(code, 41); push(code, 193);                          // rcx = (count - 1) - idx (tail entries)
+    push(code, 72); push(code, 209); push(code, 225);                         // shl rcx, 1 (tail qwords)
+    push(code, 72); push(code, 193); push(code, 224); push(code, 4);          // idx * 16
+    push(code, 72); push(code, 139); push(code, 123); push(code, 24);         // entries_ptr
+    push(code, 72); push(code, 1); push(code, 199);                           // rdi = &entries[idx]
+    push(code, 72); push(code, 141); push(code, 119); push(code, 16);         // rsi = &entries[idx+1]
+    push(code, 252); push(code, 243); push(code, 72); push(code, 165);
+    push(code, 184); _elf.le(code, 1, 4);
+    push(code, 94); push(code, 95); push(code, 91); push(code, 195);
+    _patch32(code, jmrn, len(code) - (jmrn + 4));
+    push(code, 49); push(code, 192);
+    push(code, 94); push(code, 95); push(code, 91); push(code, 195);
+
+    // __pe_map_keys(rcx = map) / __pe_map_values(rcx = map) -> TAG_ARR
+    st.labels["__pe_map_keys"] = len(code);
+    push(code, 49); push(code, 210);                                          // edx = 0 (offset 0 = key)
+    push(code, 235); push(code, 5);
+    st.labels["__pe_map_values"] = len(code);
+    push(code, 186); _elf.le(code, 8, 4);                                     // edx = 8 (offset 8 = val)
+    push(code, 76); push(code, 139); push(code, 65); push(code, 8);           // mov r8, [rcx+8] (count)
+    push(code, 77); push(code, 141); push(code, 72); push(code, 8);           // lea r9, [r8+8] (cap)
+    push(code, 76); push(code, 137); push(code, 248);                         // rax = r15
+    push(code, 77); push(code, 137); push(code, 202);                         // mov r10, r9
+    push(code, 73); push(code, 193); push(code, 226); push(code, 3);          // shl r10, 3
+    push(code, 73); push(code, 131); push(code, 194); push(code, 32);         // add r10, 32
+    push(code, 77); push(code, 1); push(code, 215);                           // add r15, r10
+    push(code, 72); push(code, 199); push(code, 0); _elf.le(code, 2, 4);      // TAG_ARR = 2
+    push(code, 76); push(code, 137); push(code, 64); push(code, 8);           // len = r8
+    push(code, 76); push(code, 137); push(code, 72); push(code, 16);          // cap = r9
+    push(code, 76); push(code, 141); push(code, 80); push(code, 32);          // lea r10, [rax+32]
+    push(code, 76); push(code, 137); push(code, 80); push(code, 24);          // data_ptr = r10
+    push(code, 72); push(code, 139); push(code, 73); push(code, 24);          // rcx = entries_ptr
+    push(code, 72); push(code, 1); push(code, 209);                           // add rcx, rdx (offset 0 or 8)
+    let mkvlp = len(code);
+    push(code, 77); push(code, 133); push(code, 192);                         // test r8, r8
+    push(code, 15); push(code, 132); let jmkvd = len(code); _elf.le(code, 0, 4); // jz done
+    push(code, 76); push(code, 139); push(code, 9);                           // mov r9, [rcx]
+    push(code, 77); push(code, 137); push(code, 10);                          // mov [r10], r9
+    push(code, 72); push(code, 131); push(code, 193); push(code, 16);         // add rcx, 16
+    push(code, 73); push(code, 131); push(code, 194); push(code, 8);          // add r10, 8
+    push(code, 73); push(code, 255); push(code, 200);                         // dec r8
+    push(code, 233); let jmkvb = len(code); _elf.le(code, 0, 4); _patch32(code, jmkvb, mkvlp - (jmkvb + 4));
+    _patch32(code, jmkvd, len(code) - (jmkvd + 4));
+    push(code, 195);
+
+    // 9. __pe_idx_get(rcx = obj, rdx = idx_or_key), __pe_idx_set(rcx = obj, rdx = idx_or_key, r8 = val), __pe_iter_seq(rcx = obj)
+    st.labels["__pe_idx_get"] = len(code);
+    push(code, 72); push(code, 139); push(code, 1);                           // rax = [rcx] (tag)
+    push(code, 72); push(code, 131); push(code, 248); push(code, 3);          // TAG_MAP?
+    push(code, 15); push(code, 132); let jigm = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 131); push(code, 248); push(code, 1);          // TAG_STR?
+    push(code, 15); push(code, 132); let jigs = len(code); _elf.le(code, 0, 4);
+    // TAG_ARR bounds-checked read
+    push(code, 72); push(code, 133); push(code, 210);
+    push(code, 15); push(code, 136); let jigo1 = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 59); push(code, 81); push(code, 8);
+    push(code, 15); push(code, 131); let jigo2 = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 139); push(code, 65); push(code, 24);
+    push(code, 72); push(code, 139); push(code, 4); push(code, 208);
+    push(code, 195);
+    _patch32(code, jigm, len(code) - (jigm + 4));
+    _emit_call_rel(code, st.calls, "__pe_map_get");
+    push(code, 195);
+    _patch32(code, jigs, len(code) - (jigs + 4));
+    push(code, 76); push(code, 141); push(code, 66); push(code, 1);           // lea r8, [rdx+1]
+    _emit_call_rel(code, st.calls, "__pe_str_slice");
+    push(code, 195);
+    _patch32(code, jigo1, len(code) - (jigo1 + 4));
+    _patch32(code, jigo2, len(code) - (jigo2 + 4));
+    let oob_sid = _intern_ro_str(st, "array index out of bounds");
+    push(code, 72); push(code, 141); push(code, 13); let oat = len(code); _elf.le(code, 0, 4);
+    _add_rip_fix(st.fixes, oat, "ro_str", str(oob_sid));
+    _emit_call_rel(code, st.calls, "__pe_throw");
+
+    st.labels["__pe_idx_set"] = len(code);
+    push(code, 72); push(code, 139); push(code, 1);
+    push(code, 72); push(code, 131); push(code, 248); push(code, 3);
+    push(code, 15); push(code, 132); let jism = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 133); push(code, 210);
+    push(code, 15); push(code, 136); let jiso1 = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 59); push(code, 81); push(code, 8);
+    push(code, 15); push(code, 131); let jiso2 = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 139); push(code, 65); push(code, 24);
+    push(code, 76); push(code, 137); push(code, 4); push(code, 208);          // mov [rax+rdx*8], r8
+    push(code, 76); push(code, 137); push(code, 192);
+    push(code, 195);
+    _patch32(code, jism, len(code) - (jism + 4));
+    _emit_call_rel(code, st.calls, "__pe_map_set");
+    push(code, 195);
+    _patch32(code, jiso1, len(code) - (jiso1 + 4));
+    _patch32(code, jiso2, len(code) - (jiso2 + 4));
+    push(code, 72); push(code, 141); push(code, 13); let oat2 = len(code); _elf.le(code, 0, 4);
+    _add_rip_fix(st.fixes, oat2, "ro_str", str(oob_sid));
+    _emit_call_rel(code, st.calls, "__pe_throw");
+
+    st.labels["__pe_iter_seq"] = len(code);
+    push(code, 72); push(code, 139); push(code, 1);
+    push(code, 72); push(code, 131); push(code, 248); push(code, 3);
+    push(code, 117); push(code, 6);
+    _emit_call_rel(code, st.calls, "__pe_map_keys");
+    push(code, 195);
+    push(code, 72); push(code, 137); push(code, 200);
+    push(code, 195);
+
+    // 10. __pe_throw(rcx = err_val) -> unwinds [prev, outer_rsp, rbp, catch_rip] or ExitProcess(70)
+    st.labels["__pe_throw"] = len(code);
+    push(code, 72); push(code, 137); push(code, 200);                         // mov rax, rcx
+    _emit_mov_rw_rax(code, st.fixes, "exc_val");
+    _emit_mov_rax_rw(code, st.fixes, "exc_top");
+    push(code, 72); push(code, 133); push(code, 192);
+    push(code, 15); push(code, 132); let junc = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 137); push(code, 194);                         // rdx = frame
+    push(code, 72); push(code, 139); push(code, 2);                           // rax = [rdx+0] (prev)
+    _emit_mov_rw_rax(code, st.fixes, "exc_top");
+    push(code, 72); push(code, 139); push(code, 106); push(code, 16);         // rbp = [rdx+16]
+    push(code, 72); push(code, 139); push(code, 66); push(code, 24);          // rax = [rdx+24] (catch_rip)
+    push(code, 72); push(code, 139); push(code, 98); push(code, 8);           // rsp = [rdx+8]  (outer_rsp)
+    push(code, 255); push(code, 224);                                         // jmp rax
+    _patch32(code, junc, len(code) - (junc + 4));
+    push(code, 185); _elf.le(code, 70, 4);                                    // ecx = 70 (uncaught throw)
+    _emit_call_rel(code, st.calls, "__pe_exit");
+
+    // 11. Microsoft x64 ABI Win32 Wrappers (strict 16B stack alignment + 32B shadow space!)
+    // __pe_write_stdout(rcx = buf_ptr, rdx = byte_len)
+    st.labels["__pe_write_stdout"] = len(code);
+    push(code, 85); push(code, 72); push(code, 137); push(code, 229);
+    push(code, 72); push(code, 131); push(code, 228); push(code, 240);        // and rsp, -16
+    push(code, 72); push(code, 131); push(code, 236); push(code, 64);         // sub rsp, 64
+    push(code, 73); push(code, 137); push(code, 208);                         // mov r8, rdx (len)
+    push(code, 72); push(code, 137); push(code, 202);                         // mov rdx, rcx (buf)
+    _emit_mov_rax_rw(code, st.fixes, "stdout_h");
+    push(code, 72); push(code, 137); push(code, 193);                         // mov rcx, stdout_h
+    push(code, 76); push(code, 141); push(code, 13); let wat = len(code); _elf.le(code, 0, 4); // lea r9, [rip + written_dw]
+    _add_rip_fix(st.fixes, wat, "rw", "written_dw");
+    push(code, 72); push(code, 199); push(code, 68); push(code, 36); push(code, 32); _elf.le(code, 0, 4); // [rsp+32] = NULL
+    _emit_win32_call(code, st.fixes, "WriteFile");
+    push(code, 72); push(code, 137); push(code, 236); push(code, 93); push(code, 195);
+
+    // __pe_print_val(rcx = val) -> prints TAG_STR or signed i64 + '\n'
+    st.labels["__pe_print_val"] = len(code);
+    push(code, 85); push(code, 72); push(code, 137); push(code, 229);
+    push(code, 83); push(code, 72); push(code, 131); push(code, 236); push(code, 24);
+    _emit_call_rel(code, st.calls, "__pe_to_str");
+    push(code, 72); push(code, 137); push(code, 195);                         // rbx = str
+    push(code, 72); push(code, 141); push(code, 75); push(code, 16);          // rcx = &str[16]
+    push(code, 72); push(code, 139); push(code, 83); push(code, 8);           // rdx = len
+    _emit_call_rel(code, st.calls, "__pe_write_stdout");
+    push(code, 198); push(code, 69); push(code, 240); push(code, 10);         // mov byte [rbp-16], '\n'
+    push(code, 72); push(code, 141); push(code, 77); push(code, 240);         // lea rcx, [rbp-16]
+    push(code, 186); _elf.le(code, 1, 4);                                     // edx = 1
+    _emit_call_rel(code, st.calls, "__pe_write_stdout");
+    push(code, 72); push(code, 131); push(code, 196); push(code, 24); push(code, 91); push(code, 93); push(code, 195);
+
+    // __pe_fs_write(rcx = path_str, rdx = content_str) -> rax = 1/0
+    st.labels["__pe_fs_write"] = len(code);
+    push(code, 85); push(code, 72); push(code, 137); push(code, 229);
+    push(code, 83); push(code, 65); push(code, 84);                           // push rbx; push r12
+    push(code, 72); push(code, 131); push(code, 228); push(code, 240);
+    push(code, 72); push(code, 131); push(code, 236); push(code, 64);
+    push(code, 73); push(code, 137); push(code, 212);                         // r12 = content_str
+    push(code, 72); push(code, 141); push(code, 73); push(code, 16);          // rcx = &path[16]
+    push(code, 186); _elf.le(code, 1073741824, 4);                            // edx = GENERIC_WRITE (0x40000000)
+    push(code, 69); push(code, 49); push(code, 192);                          // r8d = 0
+    push(code, 69); push(code, 49); push(code, 201);                          // r9d = 0
+    push(code, 72); push(code, 199); push(code, 68); push(code, 36); push(code, 32); _elf.le(code, 2, 4);   // CREATE_ALWAYS
+    push(code, 72); push(code, 199); push(code, 68); push(code, 36); push(code, 40); _elf.le(code, 128, 4); // FILE_ATTRIBUTE_NORMAL
+    push(code, 72); push(code, 199); push(code, 68); push(code, 36); push(code, 48); _elf.le(code, 0, 4);   // NULL
+    _emit_win32_call(code, st.fixes, "CreateFileA");
+    push(code, 72); push(code, 131); push(code, 248); push(code, 255);        // cmp rax, -1 (INVALID_HANDLE_VALUE)
+    push(code, 15); push(code, 132); let jfwe = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 137); push(code, 195);                         // rbx = hFile
+    push(code, 72); push(code, 137); push(code, 217);                         // rcx = hFile
+    push(code, 73); push(code, 141); push(code, 84); push(code, 36); push(code, 16); // rdx = &content[16]
+    push(code, 77); push(code, 139); push(code, 68); push(code, 36); push(code, 8);  // r8 = content.len
+    push(code, 76); push(code, 141); push(code, 13); let wat2 = len(code); _elf.le(code, 0, 4);
+    _add_rip_fix(st.fixes, wat2, "rw", "written_dw");
+    push(code, 72); push(code, 199); push(code, 68); push(code, 36); push(code, 32); _elf.le(code, 0, 4);
+    _emit_win32_call(code, st.fixes, "WriteFile");
+    push(code, 72); push(code, 137); push(code, 217);                         // rcx = hFile
+    _emit_win32_call(code, st.fixes, "CloseHandle");
+    push(code, 184); _elf.le(code, 1, 4);
+    push(code, 233); let jfwd = len(code); _elf.le(code, 0, 4);
+    _patch32(code, jfwe, len(code) - (jfwe + 4));
+    push(code, 49); push(code, 192);
+    _patch32(code, jfwd, len(code) - (jfwd + 4));
+    push(code, 72); push(code, 141); push(code, 101); push(code, 240);        // lea rsp, [rbp-16]
+    push(code, 65); push(code, 92); push(code, 91); push(code, 93); push(code, 195);
+
+    // __pe_fs_read(rcx = path_str) -> rax = TAG_STR
+    st.labels["__pe_fs_read"] = len(code);
+    push(code, 85); push(code, 72); push(code, 137); push(code, 229);
+    push(code, 83); push(code, 65); push(code, 84);                           // push rbx; push r12
+    push(code, 72); push(code, 131); push(code, 228); push(code, 240);
+    push(code, 72); push(code, 131); push(code, 236); push(code, 64);
+    push(code, 72); push(code, 141); push(code, 73); push(code, 16);          // rcx = &path[16]
+    push(code, 186); _elf.le(code, 0 - 2147483648, 4);                        // edx = GENERIC_READ (0x80000000)
+    push(code, 65); push(code, 184); _elf.le(code, 1, 4);                     // r8d = FILE_SHARE_READ (1)
+    push(code, 69); push(code, 49); push(code, 201);                          // r9d = 0
+    push(code, 72); push(code, 199); push(code, 68); push(code, 36); push(code, 32); _elf.le(code, 3, 4);   // OPEN_EXISTING
+    push(code, 72); push(code, 199); push(code, 68); push(code, 36); push(code, 40); _elf.le(code, 128, 4); // FILE_ATTRIBUTE_NORMAL
+    push(code, 72); push(code, 199); push(code, 68); push(code, 36); push(code, 48); _elf.le(code, 0, 4);
+    _emit_win32_call(code, st.fixes, "CreateFileA");
+    push(code, 72); push(code, 131); push(code, 248); push(code, 255);
+    push(code, 15); push(code, 132); let jfre = len(code); _elf.le(code, 0, 4);
+    push(code, 72); push(code, 137); push(code, 195);                         // rbx = hFile
+    push(code, 77); push(code, 137); push(code, 252);                         // r12 = r15 (TAG_STR dst)
+    push(code, 49); push(code, 192);
+    _emit_mov_rw_rax(code, st.fixes, "written_dw");
+    push(code, 72); push(code, 137); push(code, 217);                         // rcx = hFile
+    push(code, 73); push(code, 141); push(code, 84); push(code, 36); push(code, 16); // rdx = &r12[16]
+    push(code, 65); push(code, 184); _elf.le(code, 65536, 4);                 // r8d = 65536
+    push(code, 76); push(code, 141); push(code, 13); let rat = len(code); _elf.le(code, 0, 4);
+    _add_rip_fix(st.fixes, rat, "rw", "written_dw");
+    push(code, 72); push(code, 199); push(code, 68); push(code, 36); push(code, 32); _elf.le(code, 0, 4);
+    _emit_win32_call(code, st.fixes, "ReadFile");
+    push(code, 72); push(code, 137); push(code, 217);
+    _emit_win32_call(code, st.fixes, "CloseHandle");
+    push(code, 139); push(code, 5); let rat2 = len(code); _elf.le(code, 0, 4); // mov eax, dword [rip + written_dw]
+    _add_rip_fix(st.fixes, rat2, "rw", "written_dw");
+    push(code, 73); push(code, 199); push(code, 4); push(code, 36); _elf.le(code, 1, 4); // [r12] = TAG_STR (1)
+    push(code, 73); push(code, 137); push(code, 68); push(code, 36); push(code, 8);      // [r12+8] = bytes_read
+    push(code, 65); push(code, 198); push(code, 68); push(code, 4); push(code, 16); push(code, 0); // [r12+rax+16] = 0
+    push(code, 73); push(code, 141); push(code, 76); push(code, 4); push(code, 24);      // lea rcx, [r12+rax+24]
+    push(code, 72); push(code, 131); push(code, 225); push(code, 248);
+    push(code, 73); push(code, 137); push(code, 207);                         // mov r15, rcx
+    push(code, 76); push(code, 137); push(code, 224);                         // mov rax, r12
+    push(code, 72); push(code, 141); push(code, 101); push(code, 240);
+    push(code, 65); push(code, 92); push(code, 91); push(code, 93); push(code, 195);
+    _patch32(code, jfre, len(code) - (jfre + 4));
+    push(code, 72); push(code, 141); push(code, 101); push(code, 240);
+    push(code, 65); push(code, 92); push(code, 91); push(code, 93);
+    let rerr_sid = _intern_ro_str(st, "fs_read failed");
+    push(code, 72); push(code, 141); push(code, 13); let reat = len(code); _elf.le(code, 0, 4);
+    _add_rip_fix(st.fixes, reat, "ro_str", str(rerr_sid));
+    _emit_call_rel(code, st.calls, "__pe_throw");
+
+    // __pe_fs_exists(rcx = path_str) -> rax = 1/0
+    st.labels["__pe_fs_exists"] = len(code);
+    push(code, 85); push(code, 72); push(code, 137); push(code, 229);
+    push(code, 72); push(code, 131); push(code, 228); push(code, 240);
+    push(code, 72); push(code, 131); push(code, 236); push(code, 32);
+    push(code, 72); push(code, 141); push(code, 73); push(code, 16);
+    _emit_win32_call(code, st.fixes, "GetFileAttributesA");
+    push(code, 131); push(code, 248); push(code, 255);                        // cmp eax, -1 (0xFFFFFFFF)
+    push(code, 15); push(code, 149); push(code, 192);                         // setne al
+    push(code, 15); push(code, 182); push(code, 192);
+    push(code, 72); push(code, 137); push(code, 236); push(code, 93); push(code, 195);
+
+    // __pe_fs_remove(rcx = path_str) -> rax = 1/0
+    st.labels["__pe_fs_remove"] = len(code);
+    push(code, 85); push(code, 72); push(code, 137); push(code, 229);
+    push(code, 72); push(code, 131); push(code, 228); push(code, 240);
+    push(code, 72); push(code, 131); push(code, 236); push(code, 32);
+    push(code, 72); push(code, 141); push(code, 73); push(code, 16);
+    _emit_win32_call(code, st.fixes, "DeleteFileA");
+    push(code, 133); push(code, 192);
+    push(code, 15); push(code, 149); push(code, 192);
+    push(code, 15); push(code, 182); push(code, 192);
+    push(code, 72); push(code, 137); push(code, 236); push(code, 93); push(code, 195);
+
+    // __pe_time_ms() -> rax = GetTickCount64()
+    st.labels["__pe_time_ms"] = len(code);
+    push(code, 85); push(code, 72); push(code, 137); push(code, 229);
+    push(code, 72); push(code, 131); push(code, 228); push(code, 240);
+    push(code, 72); push(code, 131); push(code, 236); push(code, 32);
+    _emit_win32_call(code, st.fixes, "GetTickCount64");
+    push(code, 72); push(code, 137); push(code, 236); push(code, 93); push(code, 195);
+
+    // __pe_sleep_ms(rcx = ms) -> rax = 0
+    st.labels["__pe_sleep_ms"] = len(code);
+    push(code, 85); push(code, 72); push(code, 137); push(code, 229);
+    push(code, 72); push(code, 131); push(code, 228); push(code, 240);
+    push(code, 72); push(code, 131); push(code, 236); push(code, 32);
+    _emit_win32_call(code, st.fixes, "Sleep");
+    push(code, 49); push(code, 192);
+    push(code, 72); push(code, 137); push(code, 236); push(code, 93); push(code, 195);
+
+    // __pe_exit(rcx = exit_code) -> ExitProcess(ecx)
+    st.labels["__pe_exit"] = len(code);
+    push(code, 85); push(code, 72); push(code, 137); push(code, 229);
+    push(code, 72); push(code, 131); push(code, 228); push(code, 240);
+    push(code, 72); push(code, 131); push(code, 236); push(code, 32);
+    _emit_win32_call(code, st.fixes, "ExitProcess");
+    push(code, 15); push(code, 11);                                           // ud2 (unreachable)
+}
+
+// ── PE32+ Container Assembly (`MZ` + `PE\0\0` + `.text` + `.idata`) ──────────────────
+fn _emit_sec_hdr(buf, name8, virt_sz, rva, raw_sz, raw_ptr, chars) {
+    let b = str_to_bytes(name8);
+    let i = 0;
+    while i < 8 {
+        if i < len(b) { push(buf, b[i]); } else { push(buf, 0); }
+        i = i + 1;
+    }
+    _elf.le(buf, virt_sz, 4);
+    _elf.le(buf, rva, 4);
+    _elf.le(buf, raw_sz, 4);
+    _elf.le(buf, raw_ptr, 4);
+    _elf.le(buf, 0, 4);         // PointerToRelocations
+    _elf.le(buf, 0, 4);         // PointerToLinenumbers
+    _elf.le(buf, 0, 2);         // NumberOfRelocations
+    _elf.le(buf, 0, 2);         // NumberOfLinenumbers
+    _elf.le(buf, chars, 4);
+}
+
+// Compile PBLang source `src` into a standalone 64-bit Windows `PE32+` executable (`.exe` byte array).
+fn compile_pe64(src) {
+    let ast = _SOURCE.parse_source(src);
+    let fns = [];
+    let fnnames = map{};
+    let globals = map{};
+    let main_stmts = [];
+
+    let i = 0;
+    while i < len(ast.stmts) {
+        let s = ast.stmts[i];
+        if s.kind == "fn" {
+            push(fns, s);
+            fnnames[s.name] = true;
+        } else {
+            push(main_stmts, s);
+            if (s.kind == "let" or s.kind == "const") and (not map_has(globals, s.name)) {
+                globals[s.name] = len(globals);
+            }
+        }
+        i = i + 1;
+    }
+
+    let st = map{
+        calls: [], fixes: [], labels: map{},
+        str_idx: map{}, str_list: [],
+        funlits: [], globals: globals, fnnames: fnnames, ntry: 0
+    };
+
+    let code = [];
+    // ---- Entry point `_start` at TEXT_RVA (0x1000) ----
+    push(code, 85); push(code, 72); push(code, 137); push(code, 229);         // push rbp; mov rbp, rsp
+    push(code, 72); push(code, 131); push(code, 228); push(code, 240);        // and rsp, -16
+    push(code, 72); push(code, 129); push(code, 236); let main_frame_at = len(code); _elf.le(code, 64, 4);
+
+    // Allocate 64 MiB RW arena via VirtualAlloc(NULL, 64 MiB, MEM_COMMIT|MEM_RESERVE=0x3000, PAGE_READWRITE=4)
+    push(code, 72); push(code, 131); push(code, 236); push(code, 32);         // 32B Win32 shadow space
+    push(code, 49); push(code, 201);                                          // xor ecx, ecx
+    push(code, 186); _elf.le(code, 67108864, 4);                              // mov edx, 64 MiB
+    push(code, 65); push(code, 184); _elf.le(code, 12288, 4);                 // mov r8d, 0x3000
+    push(code, 65); push(code, 185); _elf.le(code, 4, 4);                     // mov r9d, PAGE_READWRITE (4)
+    _emit_win32_call(code, st.fixes, "VirtualAlloc");
+    push(code, 72); push(code, 133); push(code, 192);
+    push(code, 117); push(code, 10);                                          // jnz +10
+    push(code, 185); _elf.le(code, 134, 4);                                   // mov ecx, 134 (5B)
+    _emit_call_rel(code, st.calls, "__pe_exit");                              // call __pe_exit (5B)
+    push(code, 73); push(code, 137); push(code, 199);                         // mov r15, rax
+    _emit_mov_rw_rax(code, st.fixes, "arena_base");
+
+    // Cache GetStdHandle(STD_OUTPUT_HANDLE = -11)
+    push(code, 185); _elf.le(code, 0 - 11, 4);                                // mov ecx, -11 (0xFFFFFFF5)
+    _emit_win32_call(code, st.fixes, "GetStdHandle");
+    _emit_mov_rw_rax(code, st.fixes, "stdout_h");
+    push(code, 72); push(code, 131); push(code, 196); push(code, 32);         // add rsp, 32
+
+    // Compile top-level statements
+    let mskip = _copy_set(fnnames);
+    let gks = map_keys(globals); let gi = 0;
+    while gi < len(gks) { mskip[gks[gi]] = true; gi = gi + 1; }
+    let mboxed = _find_boxed_pe([], main_stmts, mskip);
+    let menv = map{
+        slots: map{}, nslots: 0, boxed: mboxed, boxcaps: map{},
+        loops: [], try_depth: 0, top_level: true, scope_depth: 0
+    };
+    let mi = 0;
+    while mi < len(main_stmts) { _emit_stmt(main_stmts[mi], code, menv, st); mi = mi + 1; }
+    _patch32(code, main_frame_at, _align_up(menv.nslots * 8, 16));
+
+    if len(main_stmts) == 0 and map_has(st.fnnames, "main") {
+        _emit_call_rel(code, st.calls, "fn$main");
+        push(code, 72); push(code, 137); push(code, 193);                     // mov rcx, rax
+        _emit_call_rel(code, st.calls, "__pe_exit");
+    } else {
+        // Default clean exit: ExitProcess(0)
+        push(code, 49); push(code, 201);
+        _emit_call_rel(code, st.calls, "__pe_exit");
+    }
+
+    // Compile user functions
+    let fi = 0;
+    while fi < len(fns) {
+        let f = fns[fi];
+        _emit_fn_pe(code, "fn$" + f.name, f.params, _stmts_of(f.body), [], map{}, st);
+        fi = fi + 1;
+    }
+
+    // Compile closure literals (including nested closures discovered during outer closure emission!)
+    let fli = 0;
+    while fli < len(st.funlits) {
+        let fl = st.funlits[fli];
+        _emit_fn_pe(code, fl.lbl, fl.params, fl.body, fl.caps, fl.boxcaps, st);
+        fli = fli + 1;
+    }
+
+    // Emit runtime helpers (note: runtime helpers may intern error message literals into st.str_list!)
+    _emit_pe_runtime(code, st);
+
+    // Append 8-byte aligned `.rodata` TAG_STR pool inside `.text` section
+    while (len(code) % 8) != 0 { push(code, 0); }
+    let TEXT_RVA = 4096; // 0x1000
+    let ro_lo_rva = TEXT_RVA + len(code);
+    let ro_str_rvas = map{};
+    let si = 0;
+    while si < len(st.str_list) {
+        ro_str_rvas[str(si)] = TEXT_RVA + len(code);
+        let sb = str_to_bytes(st.str_list[si]);
+        _elf.le(code, 1, 8);             // TAG_STR = 1
+        _elf.le(code, len(sb), 8);       // byte length
+        _push_bytes(code, sb);
+        push(code, 0);                   // NUL terminator for Win32 ANSI APIs!
+        while (len(code) % 8) != 0 { push(code, 0); }
+        si = si + 1;
+    }
+    let ro_hi_rva = TEXT_RVA + len(code);
+    if ro_hi_rva == ro_lo_rva {
+        _push_zeros(code, 8);
+        ro_hi_rva = TEXT_RVA + len(code);
+    }
+
+    let text_virt_sz = len(code);
+    let text_raw_sz = _align_up(text_virt_sz, 512);
+    let IDATA_RVA = TEXT_RVA + _align_up(text_virt_sz, 4096);
+
+    // ---- Build `.idata` (KERNEL32.dll Import Table + IAT + RW Runtime & Program Globals) ----
+    let api_names = [
+        "GetStdHandle", "WriteFile", "CreateFileA", "ReadFile", "CloseHandle",
+        "GetFileAttributesA", "DeleteFileA", "VirtualAlloc", "GetTickCount64",
+        "Sleep", "ExitProcess"
+    ];
+    let napi = len(api_names);
+    let imp_dir_sz = 40;                  // 2 x 20B IMAGE_IMPORT_DESCRIPTOR
+    let ilt_off = imp_dir_sz;             // 40
+    let ilt_sz = (napi + 1) * 8;          // 96
+    let iat_off = ilt_off + ilt_sz;       // 136
+    let iat_sz = (napi + 1) * 8;          // 96
+    let names_off = iat_off + iat_sz;     // 232
+
+    let names_blob = [];
+    let dll_name_rel = len(names_blob);
+    _push_bytes(names_blob, str_to_bytes("KERNEL32.dll"));
+    push(names_blob, 0);
+    if (len(names_blob) % 2) != 0 { push(names_blob, 0); }
+
+    let hn_rvas = [];
+    let iat_rvas = map{};
+    let ai = 0;
+    while ai < napi {
+        let nm = api_names[ai];
+        let hn_rva = IDATA_RVA + names_off + len(names_blob);
+        push(hn_rvas, hn_rva);
+        iat_rvas[nm] = IDATA_RVA + iat_off + ai * 8;
+        _elf.le(names_blob, 0, 2);        // Hint = 0
+        _push_bytes(names_blob, str_to_bytes(nm));
+        push(names_blob, 0);
+        if (len(names_blob) % 2) != 0 { push(names_blob, 0); }
+        ai = ai + 1;
+    }
+
+    let idata = [];
+    // Import Descriptor 0: KERNEL32.dll
+    _elf.le(idata, IDATA_RVA + ilt_off, 4);                // OriginalFirstThunk (ILT RVA)
+    _elf.le(idata, 0, 4);                                  // TimeDateStamp
+    _elf.le(idata, 0, 4);                                  // ForwarderChain
+    _elf.le(idata, IDATA_RVA + names_off + dll_name_rel, 4); // Name RVA
+    _elf.le(idata, IDATA_RVA + iat_off, 4);                // FirstThunk (IAT RVA)
+    // Import Descriptor 1: Null terminator (20B)
+    _push_zeros(idata, 20);
+
+    // ILT (64-bit Hint/Name RVAs + trailing 0)
+    let k1 = 0;
+    while k1 < napi { _elf.le(idata, hn_rvas[k1], 8); k1 = k1 + 1; }
+    _elf.le(idata, 0, 8);
+
+    // IAT (identical 64-bit Hint/Name RVAs before loader binding + trailing 0)
+    let k2 = 0;
+    while k2 < napi { _elf.le(idata, hn_rvas[k2], 8); k2 = k2 + 1; }
+    _elf.le(idata, 0, 8);
+
+    _push_bytes(idata, names_blob);
+    while (len(idata) % 8) != 0 { push(idata, 0); }
+
+    // RW Runtime Slots + Program Globals (zero-initialized inside `.idata` RW section!)
+    let rw_rvas = map{};
+    let sys_keys = ["exc_top", "exc_val", "arena_base", "stdout_h", "written_dw"];
+    let sk = 0;
+    while sk < len(sys_keys) {
+        rw_rvas[sys_keys[sk]] = IDATA_RVA + len(idata);
+        _push_zeros(idata, 8);
+        sk = sk + 1;
+    }
+    let gk = 0;
+    while gk < len(gks) {
+        rw_rvas["g_" + gks[gk]] = IDATA_RVA + len(idata);
+        _push_zeros(idata, 8);
+        gk = gk + 1;
+    }
+
+    let idata_virt_sz = len(idata);
+    let idata_raw_sz = _align_up(idata_virt_sz, 512);
+
+    // ---- Resolve all relative `call rel32` and RIP-relative `[rip + disp32]` fixups ----
+    let ci = 0;
+    while ci < len(st.calls) {
+        let c = st.calls[ci];
+        if not map_has(st.labels, c.name) { throw "codegen_pe64: unresolved call target " + c.name; }
+        let tgt_off = st.labels[c.name];
+        _patch32(code, c.at, tgt_off - (c.at + 4));
+        ci = ci + 1;
+    }
+
+    let fxi = 0;
+    while fxi < len(st.fixes) {
+        let fx = st.fixes[fxi];
+        let next_rip_rva = TEXT_RVA + fx.pos + 4;
+        let tgt_rva = 0;
+        if fx.kind == "iat" { tgt_rva = iat_rvas[fx.key]; }
+        elif fx.kind == "ro_str" { tgt_rva = ro_str_rvas[fx.key]; }
+        elif fx.kind == "ro_bounds_lo" { tgt_rva = ro_lo_rva; }
+        elif fx.kind == "ro_bounds_hi" { tgt_rva = ro_hi_rva; }
+        elif fx.kind == "rw" { tgt_rva = rw_rvas[fx.key]; }
+        elif fx.kind == "fn" { tgt_rva = TEXT_RVA + st.labels["fn$" + fx.key]; }
+        elif fx.kind == "lbl" { tgt_rva = TEXT_RVA + st.labels[fx.key]; }
+        else { throw "codegen_pe64: unknown fixup kind " + fx.kind; }
+        _patch32(code, fx.pos, tgt_rva - next_rip_rva);
+        fxi = fxi + 1;
+    }
+
+    // ---- Assemble PE32+ Executable Image ----
+    let HDR_RAW_SZ = 1024; // 0x400
+    let size_of_image = IDATA_RVA + _align_up(idata_virt_sz, 4096);
+    let pe = [];
+
+    // 1. MS-DOS Header (`MZ`, `e_lfanew = 0x80` at offset `0x3C`, padded to 128 bytes)
+    push(pe, 77); push(pe, 90);                   // 'M', 'Z'
+    _push_zeros(pe, 58);                          // 0x02 .. 0x3B
+    _elf.le(pe, 128, 4);                          // 0x3C: e_lfanew = 0x80
+    _push_zeros(pe, 64);                          // 0x40 .. 0x7F (minimal DOS stub space)
+
+    // 2. PE Signature (`"PE\0\0"` at 0x80)
+    push(pe, 80); push(pe, 69); push(pe, 0); push(pe, 0);
+
+    // 3. COFF File Header (20 bytes)
+    _elf.le(pe, 34404, 2);                        // Machine = IMAGE_FILE_MACHINE_AMD64 (0x8664)
+    _elf.le(pe, 2, 2);                            // NumberOfSections = 2 (.text, .idata)
+    _elf.le(pe, 0, 4);                            // TimeDateStamp
+    _elf.le(pe, 0, 4);                            // PointerToSymbolTable
+    _elf.le(pe, 0, 4);                            // NumberOfSymbols
+    _elf.le(pe, 240, 2);                          // SizeOfOptionalHeader = 240 (0xF0)
+    _elf.le(pe, 35, 2);                           // Characteristics = 0x0023 (RELOCS_STRIPPED | EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE)
+
+    // 4. Optional Header PE32+ (240 bytes)
+    _elf.le(pe, 523, 2);                          // Magic = PE32+ (0x020B)
+    push(pe, 14); push(pe, 0);                    // LinkerVersion 14.0
+    _elf.le(pe, text_raw_sz, 4);                  // SizeOfCode
+    _elf.le(pe, idata_raw_sz, 4);                 // SizeOfInitializedData
+    _elf.le(pe, 0, 4);                            // SizeOfUninitializedData
+    _elf.le(pe, TEXT_RVA, 4);                     // AddressOfEntryPoint = 0x1000
+    _elf.le(pe, TEXT_RVA, 4);                     // BaseOfCode = 0x1000
+    _elf.le(pe, 0, 4); _elf.le(pe, 1, 4);         // ImageBase = 0x0000000140000000
+    _elf.le(pe, 4096, 4);                         // SectionAlignment = 0x1000
+    _elf.le(pe, 512, 4);                          // FileAlignment = 0x0200
+    _elf.le(pe, 6, 2); _elf.le(pe, 0, 2);         // OperatingSystemVersion = 6.0
+    _elf.le(pe, 0, 2); _elf.le(pe, 0, 2);         // ImageVersion = 0.0
+    _elf.le(pe, 6, 2); _elf.le(pe, 0, 2);         // SubsystemVersion = 6.0 (Windows Vista/7/10/11)
+    _elf.le(pe, 0, 4);                            // Win32VersionValue = 0
+    _elf.le(pe, size_of_image, 4);                // SizeOfImage
+    _elf.le(pe, HDR_RAW_SZ, 4);                   // SizeOfHeaders = 0x0400
+    _elf.le(pe, 0, 4);                            // CheckSum = 0
+    _elf.le(pe, 3, 2);                            // Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI (3)
+    _elf.le(pe, 0, 2);                            // DllCharacteristics = 0 (plus 100% RIP-relative PIC!)
+    _elf.le(pe, 8388608, 8);                      // SizeOfStackReserve = 8 MiB
+    _elf.le(pe, 65536, 8);                        // SizeOfStackCommit = 64 KiB
+    _elf.le(pe, 1048576, 8);                      // SizeOfHeapReserve = 1 MiB
+    _elf.le(pe, 4096, 8);                         // SizeOfHeapCommit = 4 KiB
+    _elf.le(pe, 0, 4);                            // LoaderFlags = 0
+    _elf.le(pe, 16, 4);                           // NumberOfRvaAndSizes = 16
+
+    // 16 Data Directories (16 x 8 = 128 bytes)
+    _elf.le(pe, 0, 8);                                                // [0] Export
+    _elf.le(pe, IDATA_RVA, 4); _elf.le(pe, imp_dir_sz, 4);            // [1] Import Table
+    let dd = 2;
+    while dd < 12 { _elf.le(pe, 0, 8); dd = dd + 1; }                 // [2..11]
+    _elf.le(pe, IDATA_RVA + iat_off, 4); _elf.le(pe, iat_sz, 4);      // [12] IAT
+    _elf.le(pe, 0, 8); _elf.le(pe, 0, 8); _elf.le(pe, 0, 8);          // [13..15]
+
+    // 5. Section Headers (2 x 40 = 80 bytes)
+    // .text: 0x60000020 (CNT_CODE | MEM_EXECUTE | MEM_READ = 1610612768)
+    _emit_sec_hdr(pe, ".text", text_virt_sz, TEXT_RVA, text_raw_sz, HDR_RAW_SZ, 1610612768);
+    // .idata: 0xC0000040 (CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE = -1073741760 signed i32)
+    _emit_sec_hdr(pe, ".idata", idata_virt_sz, IDATA_RVA, idata_raw_sz, HDR_RAW_SZ + text_raw_sz, 0 - 1073741760);
+
+    // Pad headers to 0x400
+    while len(pe) < HDR_RAW_SZ { push(pe, 0); }
+
+    // 6. Emit `.text` padded to `text_raw_sz` and `.idata` padded to `idata_raw_sz`
+    _push_bytes(pe, code);
+    _push_zeros(pe, text_raw_sz - len(code));
+    _push_bytes(pe, idata);
+    _push_zeros(pe, idata_raw_sz - len(idata));
+    return pe;
+}
+
+fn compile_fns(src) { return compile_pe64(src); }
+
+export compile_pe64, compile_fns;

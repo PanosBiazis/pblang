@@ -1,0 +1,241 @@
+// tests/hardware_governor_and_studio_ui_test.sapp — Comprehensive Verification of
+// `stdlib/hardware_governor.sapp` and `stdlib/sovereign_studio_ui.sapp` (PBLang v2.0.0).
+
+let Gov = try import("stdlib/hardware_governor.sapp") catch import("stdlib:hardware_governor.sapp");
+let Studio = try import("stdlib/sovereign_studio_ui.sapp") catch import("stdlib:sovereign_studio_ui.sapp");
+let OS = try import("stdlib/os.sapp") catch import("stdlib:os.sapp");
+let UUID = try import("stdlib/uuid.sapp") catch import("stdlib:uuid.sapp");
+
+let passed = 0;
+let total = 0;
+
+fn check(cond, msg) {
+    total = total + 1;
+    if not cond {
+        throw "HW_GOV_STUDIO_UI_TEST_FAIL: " + msg;
+    }
+    passed = passed + 1;
+}
+
+fn is_bool_val(v) {
+    return type(v) == "bool";
+}
+
+// ── 1. Live OS Hardware Discovery (100% Real Telemetry, Zero Fake Numbers) ──
+
+let live_hw = Gov.discover_hardware();
+check(live_hw.format == Gov.PROFILE_FORMAT, "live profile format matches v2");
+check(live_hw.os == "linux" or live_hw.os == "windows" or live_hw.os == "macos" or live_hw.os == "posix", "valid detected OS");
+check(live_hw.cpu.logical_cores >= 1, "live logical CPU cores >= 1");
+check(type(live_hw.cpu.model_name) == "string" and len(live_hw.cpu.model_name) > 0, "non-empty CPU model_name");
+check(type(live_hw.cpu.arch) == "string" and len(live_hw.cpu.arch) > 0, "non-empty CPU arch");
+check(is_map(live_hw.cpu.simd) and is_array(live_hw.cpu.simd.extensions), "structured CPU SIMD extensions");
+
+check(live_hw.ram_total_mb > 0, "live ram_total_mb > 0");
+check(live_hw.ram_available_mb >= 0 and live_hw.ram_available_mb <= live_hw.ram_total_mb, "live ram_available_mb within [0, ram_total_mb]");
+check(live_hw.ram_used_pct >= 0 and live_hw.ram_used_pct <= 100, "live ram_used_pct within [0, 100]");
+check(
+    live_hw.pressure_tier == "optimal" or live_hw.pressure_tier == "balanced"
+    or live_hw.pressure_tier == "constrained" or live_hw.pressure_tier == "critical",
+    "valid live memory pressure_tier"
+);
+check(
+    live_hw.power_mode == "battery_eco" or live_hw.power_mode == "ac_performance"
+    or live_hw.power_mode == "desktop_steady",
+    "valid live power_mode"
+);
+
+// Honest boolean flags for GPU / NPU / TPU + peripheral array structures
+check(is_bool_val(live_hw.gpu.present) and is_array(live_hw.gpus), "honest GPU boolean + gpus array");
+check(is_bool_val(live_hw.npu.present) and is_array(live_hw.npu.devices), "honest NPU boolean + devices array");
+check(is_bool_val(live_hw.tpu.present) and is_array(live_hw.tpu.devices), "honest TPU boolean + devices array");
+check(live_hw.npu.present == (len(live_hw.npu.devices) > 0), "NPU present strictly equals non-empty discovered devices");
+check(live_hw.tpu.present == (len(live_hw.tpu.devices) > 0), "TPU present strictly equals non-empty discovered devices");
+
+check(is_map(live_hw.peripherals), "peripherals map present");
+check(is_array(live_hw.peripherals.serial_mcu), "serial_mcu peripheral array");
+check(is_array(live_hw.peripherals.i2c), "i2c peripheral array");
+check(is_array(live_hw.peripherals.spi), "spi peripheral array");
+check(is_array(live_hw.peripherals.cameras), "cameras peripheral array");
+check(is_array(live_hw.peripherals.audio_pcm), "audio_pcm peripheral array");
+check(is_map(live_hw.storage) and is_array(live_hw.storage.devices), "storage block devices array");
+
+// ── 2. Pressure Tier Boundaries & SIMD Parser Unit Verification ─────────────
+
+check(Gov.compute_pressure_tier(42.0) == "optimal", "tier < 65% is optimal");
+check(Gov.compute_pressure_tier(65.0) == "balanced", "tier 65% is balanced");
+check(Gov.compute_pressure_tier(82.0) == "balanced", "tier 82% is balanced");
+check(Gov.compute_pressure_tier(88.5) == "constrained", "tier 88.5% is constrained");
+check(Gov.compute_pressure_tier(95.2) == "critical", "tier > 92% is critical");
+
+let simd_x86 = Gov.parse_simd_flags("fpu sse4_2 avx2 avx512f aes sha_ni", "x86_64");
+check(simd_x86.avx512f and simd_x86.avx2 and simd_x86.sse4_2 and simd_x86.aes and simd_x86.sha_ni, "x86_64 SIMD flags parsed");
+check(simd_x86.best_vector_isa == "avx512", "x86_64 best ISA avx512");
+
+let simd_arm = Gov.parse_simd_flags("fp asimd aes sha2", "aarch64");
+check(simd_arm.neon and simd_arm.asimd and simd_arm.aes and simd_arm.sha_ni, "aarch64 SIMD flags parsed");
+check(simd_arm.best_vector_isa == "neon", "aarch64 best ISA neon");
+
+// ── 3. Multi-Device Adaptive Resource Planner (`plan_execution`) ────────────
+
+// (a) 2 GB constrained SBC on battery
+let hw_sbc_2gb = Gov.synthetic_hardware_profile(map{
+    cores: 4,
+    arch: "aarch64",
+    simd_flags: "fp asimd aes",
+    ram_total_mb: 2048,
+    ram_available_mb: 260,
+    power_mode: "battery_eco",
+    gpu_present: false,
+    npu_present: false,
+    tpu_present: false
+});
+let plan_sbc = Gov.plan_execution("ai_infer", hw_sbc_2gb);
+check(plan_sbc.pressure_tier == "constrained", "2 GB SBC pressure tier is constrained");
+check(plan_sbc.worker_threads == 1, "2 GB battery constrained SBC caps worker_threads to 1");
+check(plan_sbc.gc_watermark_mb == 2 and plan_sbc.sparse_hive_lru_cells == 2, "2 GB SBC shrinks GC to 2 MiB & 2 LRU cells");
+check(plan_sbc.max_heap_budget_mb <= 384, "2 GB SBC bounds max heap budget strictly");
+check(plan_sbc.accelerator_route == "cpu-neon", "2 GB ARM64 SBC routes to cpu-neon");
+check(plan_sbc.ui_fps_cap == 30, "battery SBC caps UI at 30 FPS");
+check(len(plan_sbc.explanation_el) > 40 and len(plan_sbc.explanation_en) > 40, "2 GB SBC has Greek & English explanations");
+
+// (b) 4 GB laptop
+let hw_laptop_4gb = Gov.synthetic_hardware_profile(map{
+    cores: 4,
+    arch: "x86_64",
+    simd_flags: "sse4_2 avx2 aes",
+    ram_total_mb: 4096,
+    ram_available_mb: 1600,
+    power_mode: "ac_performance",
+    gpu_present: false,
+    npu_present: false,
+    tpu_present: false
+});
+let plan_laptop = Gov.plan_execution("compile", hw_laptop_4gb);
+check(plan_laptop.gc_watermark_mb == 2 and plan_laptop.sparse_hive_lru_cells == 2, "4 GB laptop uses 2 MiB GC & 2 LRU cells");
+check(plan_laptop.worker_threads >= 1 and plan_laptop.worker_threads <= 3, "4 GB laptop preserves OS interactivity (<= 3 workers)");
+check(plan_laptop.accelerator_route == "cpu-avx2", "4 GB x86_64 laptop selects cpu-avx2");
+check(plan_laptop.ui_fps_cap == 60, "AC laptop enables 60 FPS UI cap");
+check(len(plan_laptop.explanation_el) > 40 and len(plan_laptop.explanation_en) > 40, "4 GB laptop has Greek & English explanations");
+
+// (c) 32 GB workstation with GPU + NPU
+let hw_ws_32gb = Gov.synthetic_hardware_profile(map{
+    cores: 16,
+    arch: "x86_64",
+    simd_flags: "avx512f avx2 sse4_2 aes sha_ni",
+    ram_total_mb: 32768,
+    ram_available_mb: 24576,
+    power_mode: "desktop_steady",
+    gpu_present: true,
+    gpu_vendor: "NVIDIA",
+    gpu_vram_mb: 12288,
+    npu_present: true,
+    tpu_present: false
+});
+let plan_ws = Gov.plan_execution("ai_infer", hw_ws_32gb);
+check(plan_ws.pressure_tier == "optimal", "32 GB workstation pressure tier is optimal");
+check(plan_ws.gc_watermark_mb == 16 and plan_ws.sparse_hive_lru_cells == 16, "32 GB workstation scales to 16 MiB GC & 16 LRU cells");
+check(plan_ws.worker_threads >= 8 and plan_ws.worker_threads <= 15, "32 GB workstation scales worker threads cleanly");
+check(plan_ws.accelerator_route == "npu", "32 GB workstation with GPU+NPU routes to NPU first");
+check(
+    len(plan_ws.fallback_chain) == 4 and plan_ws.fallback_chain[0] == "npu"
+    and plan_ws.fallback_chain[1] == "gpu" and plan_ws.fallback_chain[2] == "cpu-avx2"
+    and plan_ws.fallback_chain[3] == "cpu-scalar",
+    "32 GB workstation builds complete priority fallback chain"
+);
+check(len(plan_ws.explanation_el) > 40 and len(plan_ws.explanation_en) > 40, "32 GB workstation has Greek & English explanations");
+
+// (d) Edge TPU top-priority route check + apply_runtime_tuning
+let hw_tpu_edge = Gov.synthetic_hardware_profile(map{
+    cores: 8,
+    arch: "x86_64",
+    simd_flags: "avx2 sse4_2",
+    ram_total_mb: 16384,
+    ram_available_mb: 10240,
+    power_mode: "desktop_steady",
+    gpu_present: true,
+    npu_present: true,
+    tpu_present: true
+});
+let plan_tpu = Gov.plan_execution("ai_infer", hw_tpu_edge);
+check(plan_tpu.accelerator_route == "tpu", "TPU takes top accelerator priority when present");
+check(plan_tpu.gc_watermark_mb == 8 and plan_tpu.sparse_hive_lru_cells == 8, "16 GB node uses 8 MiB GC & 8 LRU cells");
+
+let tuned = Gov.apply_runtime_tuning(live_hw, "ui_studio");
+check(tuned.applied and is_map(tuned.plan), "apply_runtime_tuning succeeds on live hardware");
+
+// ── 4. Event-Driven Zero-Idle Frame Pace Governor (`govern_frame_pace`) ─────
+
+let idle_ac = Gov.govern_frame_pace(false, hw_ws_32gb);
+check(not idle_ac.render_frame, "govern_frame_pace skips rendering when is_dirty == false");
+check(idle_ac.sleep_ms >= 16 and idle_ac.sleep_ms <= 50, "idle sleep_ms within [16, 50] ms");
+check(idle_ac.target_fps == 0 and idle_ac.estimated_idle_cpu_pct == 0.0, "idle target_fps is 0 (~0.0% idle CPU)");
+
+let active_ac = Gov.govern_frame_pace(true, hw_ws_32gb);
+check(active_ac.render_frame, "govern_frame_pace renders immediately when is_dirty == true");
+check(active_ac.sleep_ms == 16 and active_ac.ui_fps_cap == 60, "AC active frame pace is 16 ms (60 FPS)");
+
+let active_bat = Gov.govern_frame_pace(true, hw_sbc_2gb);
+check(active_bat.render_frame and active_bat.sleep_ms == 33 and active_bat.ui_fps_cap == 30, "Battery eco active frame pace is 33 ms (30 FPS)");
+
+// ── 5. Sovereign Studio UI Themes, Native Mode & Offline HTML5 Dashboard ────
+
+let td = Studio.theme_dark();
+let tl = Studio.theme_light();
+check(td.wcag_level == "AAA" and td.contrast_primary >= 15.0, "dark theme meets WCAG AAA contrast");
+check(tl.wcag_level == "AAA" and tl.contrast_primary >= 15.0, "light theme meets WCAG AAA contrast");
+
+let tabs = Studio.studio_tabs();
+check(len(tabs) == 4, "Sovereign Studio defines 4 core tabs");
+check(str_contains(tabs[0].label, "Επισκόπηση") and str_contains(tabs[0].label, "Sovereign Overview"), "Tab 1 label verified");
+check(str_contains(tabs[1].label, "Υλικό") and str_contains(tabs[1].label, "CPU/GPU/NPU/TPU"), "Tab 2 label verified");
+check(str_contains(tabs[2].label, "Μεταγλωττιστές") and str_contains(tabs[2].label, "Zero-Rust"), "Tab 3 label verified");
+check(str_contains(tabs[3].label, "Εξηγησιμότητα") and str_contains(tabs[3].label, "Explainable Governor"), "Tab 4 label verified");
+
+let models = Studio.frontier_llm_catalog();
+check(len(models) == 6 and models[0] == "Gemini 4 Argon" and models[5] == "Grok 4.7", "Nov 2026 Frontier LLM catalog verified");
+
+// Verify graceful headless native studio execution + bounded live window / headless loop
+let headless_res = Studio.run_native_studio_window(map{
+    force_headless: true,
+    headless_ok: true,
+    hw_profile: hw_ws_32gb
+});
+check(headless_res.ok and headless_res.headless and headless_res.tabs_count == 4, "headless native studio fallback works cleanly");
+
+let live_win_res = Studio.run_native_studio_window(map{
+    max_ticks: 3,
+    headless_ok: true,
+    hw_profile: live_hw
+});
+check(live_win_res.ok and (live_win_res.headless or (live_win_res.rendered_frames >= 1 and live_win_res.skipped_idle_ticks >= 1)), "native studio window renders initial frame and skips idle ticks");
+
+// Generate and inspect self-contained HTML5 + inline SVG Studio Dashboard
+let live_plan = Gov.plan_execution("ui_studio", live_hw);
+let html = Studio.render_studio_html(live_hw, live_plan);
+check(str_starts_with(html, "<!DOCTYPE html>"), "HTML5 doctype present");
+check(str_contains(html, "<svg") and str_contains(html, "</svg>"), "inline SVG gauges present");
+check(str_contains(html, "320 KB") and str_contains(html, "42,000 KB") and str_contains(html, "99.2%"), "binary footprint 320 KB vs 42,000 KB (99.2%) present");
+check(str_contains(html, "Επισκόπηση") and str_contains(html, "Explainable Governor"), "bilingual Greek & English UI labels present");
+check(str_contains(html, "Gemini 4 Argon") and str_contains(html, "Claude Opus 5.5"), "current frontier LLMs rendered accurately");
+check(not str_contains(html, "http://") and not str_contains(html, "https://"), "ZERO external http/https CDN links (100% offline privacy)");
+
+// Verify file export to temporary path and clean up
+let tmp_dir = OS.temp_dir() + "/pblang_studio_ui_test_" + UUID.v4();
+fs_mkdirs(tmp_dir);
+let out_html = tmp_dir + "/sovereign_studio.html";
+let exp_res = Studio.export_studio_html(out_html, live_hw, live_plan);
+check(exp_res.ok and fs_exists(out_html) and exp_res.bytes > 4096, "export_studio_html wrote self-contained dashboard");
+fs_remove(out_html);
+try fs_remove(tmp_dir) catch nil;
+
+print "HW_GOV_AND_STUDIO_UI_TEST_PASS checks=" + str(passed) + "/" + str(total)
+    + " live_cores=" + str(live_hw.cpu.logical_cores)
+    + " live_arch=" + live_hw.cpu.arch
+    + " live_ram_mb=" + str(live_hw.ram_available_mb) + "/" + str(live_hw.ram_total_mb)
+    + " tier=" + live_hw.pressure_tier
+    + " power=" + live_hw.power_mode
+    + " gpu=" + str(live_hw.gpu.present)
+    + " npu=" + str(live_hw.npu.present)
+    + " tpu=" + str(live_hw.tpu.present)
+    + " route=" + live_plan.accelerator_route;
