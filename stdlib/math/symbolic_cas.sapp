@@ -12,9 +12,10 @@
 //   let sol  = cas.solve("(x^2 - 4)/(x - 1) >= 0");
 //   let svg  = cas.plot_svg("1/(x - 1)", -6, 6);
 
-// ── Security & DoS Resource Limits ────────────────────────────────────────────
+// ── Adaptive Resource Governor & Legacy Exported Constants ────────────────────
 
-let CAS_VERSION = "2.3.0";
+let GOV = import("stdlib:math/resource_governor.sapp");
+let CAS_VERSION = "2.4.0";
 let MAX_INPUT_LEN = 8192;
 let MAX_AST_DEPTH = 128;
 let MAX_AST_NODES = 4096;
@@ -455,14 +456,14 @@ fn int_val_of(n) {
     return num_round(bi_to_float(n["p"]));
 }
 
-// Enforce MAX_AST_DEPTH and MAX_AST_NODES on any AST node.
+// Enforce adaptive max_ast_depth and max_ast_nodes on any AST node.
 fn _measure_ast(node, depth, state) {
-    if depth > MAX_AST_DEPTH {
-        throw "CAS limit exceeded: expression AST depth > " + str(MAX_AST_DEPTH);
+    if depth > state["lim_depth"] {
+        throw "MathGovernor[symbolic_cas]: resource budget exceeded (AST depth > " + str(state["lim_depth"]) + ")";
     }
     state["count"] = state["count"] + 1;
-    if state["count"] > MAX_AST_NODES {
-        throw "CAS limit exceeded: expression AST node count > " + str(MAX_AST_NODES);
+    if state["count"] > state["lim_nodes"] {
+        throw "MathGovernor[symbolic_cas]: resource budget exceeded (AST node count > " + str(state["lim_nodes"]) + ")";
     }
     if depth > state["max_depth"] { state["max_depth"] = depth; }
     if node == nil or type(node) != "map" or not map_has(node, "kind") {
@@ -508,7 +509,13 @@ fn _measure_ast(node, depth, state) {
 }
 
 fn check_ast_bounds(node) {
-    let st = map{ "count": 0, "max_depth": 0 };
+    let lim = GOV.current_limits();
+    let st = map{
+        "count": 0,
+        "max_depth": 0,
+        "lim_depth": lim["max_ast_depth"],
+        "lim_nodes": lim["max_ast_nodes"]
+    };
     _measure_ast(node, 1, st);
     return st;
 }
@@ -938,10 +945,253 @@ fn eval_ast(node, env = nil) {
         }
         else if fn_nm == "floor" { res = num_floor(u); }
         else if fn_nm == "ceil" { res = num_ceil(u); }
+        else if fn_nm == "erf" or fn_nm == "erfc" {
+            let ax = num_abs(u);
+            let erf_pos = 0.0;
+            let erfc_pos = 1.0;
+            if ax <= 2.5 {
+                let term = ax;
+                let s_er = ax;
+                let u2 = ax * ax;
+                let ki = 1;
+                while ki <= 40 {
+                    term = (0.0 - term * u2) / ki;
+                    let contrib = term / (2 * ki + 1);
+                    s_er = s_er + contrib;
+                    if num_abs(contrib) < 1.0e-16 * num_abs(s_er) { break; }
+                    ki = ki + 1;
+                }
+                erf_pos = (2.0 / num_sqrt(_PI_VAL)) * s_er;
+                erfc_pos = 1.0 - erf_pos;
+            } else if ax <= 28.0 {
+                // Laplace continued fraction for erfc(ax): exp(-ax^2)/(sqrt(pi) * (ax + 0.5/(ax + 1/(ax + ...))))
+                let cf = ax;
+                let ki = 30;
+                while ki >= 1 {
+                    cf = ax + (0.5 * ki) / cf;
+                    ki = ki - 1;
+                }
+                erfc_pos = num_exp(0.0 - ax * ax) / (num_sqrt(_PI_VAL) * cf);
+                erf_pos = 1.0 - erfc_pos;
+            } else {
+                erf_pos = 1.0;
+                erfc_pos = 0.0;
+            }
+            if fn_nm == "erf" {
+                if u < 0.0 { res = 0.0 - erf_pos; } else { res = erf_pos; }
+            } else {
+                if u < 0.0 { res = 2.0 - erfc_pos; } else { res = erfc_pos; }
+            }
+        }
+        else if fn_nm == "erfi" {
+            if num_abs(u) <= 6.0 {
+                let term = u;
+                let s_ei = u;
+                let u2 = u * u;
+                let ki = 1;
+                while ki <= 40 {
+                    term = (term * u2) / ki;
+                    s_ei = s_ei + term / (2 * ki + 1);
+                    ki = ki + 1;
+                }
+                res = (2.0 / num_sqrt(_PI_VAL)) * s_ei;
+            }
+        }
+        else if fn_nm == "gamma" {
+            res = _num_gamma_eval(u);
+        }
+        else if fn_nm == "beta" and len(args) >= 2 {
+            let v2 = eval_ast(args[1], env);
+            if v2 != nil {
+                let ga = _num_gamma_eval(u);
+                let gb = _num_gamma_eval(v2);
+                let gab = _num_gamma_eval(u + v2);
+                if ga != nil and gb != nil and gab != nil and num_abs(gab) > 1e-300 {
+                    res = (ga * gb) / gab;
+                }
+            }
+        }
+        else if fn_nm == "lambertw" {
+            res = _num_lambertw0_eval(u);
+        }
+        else if fn_nm == "Li2" {
+            if u <= 1.0 and num_abs(u) <= 0.999999 {
+                let s_l2 = 0.0;
+                let pk = u;
+                let ki = 1;
+                while ki <= 80 {
+                    s_l2 = s_l2 + pk / (ki * ki);
+                    pk = pk * u;
+                    ki = ki + 1;
+                }
+                res = s_l2;
+            } else if u == 1.0 {
+                res = (_PI_VAL * _PI_VAL) / 6.0;
+            }
+        }
+        else if fn_nm == "Si" {
+            if num_abs(u) <= 25.0 {
+                let term = u;
+                let acc_si = u;
+                let u2 = u * u;
+                let ki = 1;
+                while ki <= 45 {
+                    term = (0.0 - term * u2) / ((2 * ki) * (2 * ki + 1));
+                    acc_si = acc_si + term / (2 * ki + 1);
+                    ki = ki + 1;
+                }
+                res = acc_si;
+            }
+        }
+        else if fn_nm == "Ci" {
+            if u > 0.0 and u <= 25.0 {
+                let euler_gamma = 0.5772156649015329;
+                let acc_ci = euler_gamma + num_ln(u);
+                let u2 = u * u;
+                let term = 1.0;
+                let ki = 1;
+                while ki <= 45 {
+                    term = (0.0 - term * u2) / ((2 * ki - 1) * (2 * ki));
+                    acc_ci = acc_ci + term / (2 * ki);
+                    ki = ki + 1;
+                }
+                res = acc_ci;
+            }
+        }
+        else if fn_nm == "Ei" {
+            if u != 0.0 and num_abs(u) <= 30.0 {
+                let euler_gamma = 0.5772156649015329;
+                let acc_e = euler_gamma + num_ln(num_abs(u));
+                let term = 1.0;
+                let ki = 1;
+                while ki <= 60 {
+                    term = (term * u) / ki;
+                    acc_e = acc_e + term / ki;
+                    ki = ki + 1;
+                }
+                res = acc_e;
+            }
+        }
+        else if fn_nm == "li" {
+            if u > 0.0 and u != 1.0 {
+                let lu = num_ln(u);
+                if num_abs(lu) <= 30.0 {
+                    res = eval_ast(ast_call("Ei", [ast_num(lu)]), map{});
+                }
+            }
+        }
+        else if fn_nm == "FresnelS" or fn_nm == "FresnelC" {
+            if num_abs(u) <= 6.0 {
+                // Composite Simpson integration on [0, u]
+                let n_sp = 64;
+                let h_sp = u / n_sp;
+                let sum_sp = 0.0;
+                let si = 0;
+                while si <= n_sp {
+                    let t_sp = si * h_sp;
+                    let ang = 0.5 * _PI_VAL * t_sp * t_sp;
+                    let fv = 0.0;
+                    if fn_nm == "FresnelS" { fv = num_sin(ang); } else { fv = num_cos(ang); }
+                    let wt = 2.0;
+                    if si == 0 or si == n_sp { wt = 1.0; }
+                    else if si - num_floor(si / 2) * 2 == 1 { wt = 4.0; }
+                    sum_sp = sum_sp + wt * fv;
+                    si = si + 1;
+                }
+                res = (h_sp / 3.0) * sum_sp;
+            }
+        }
+        else if fn_nm == "zeta" {
+            if u > 1.0 {
+                let n_em = 32.0;
+                let s_em = 0.0;
+                let ki = 1;
+                while ki < 32 {
+                    s_em = s_em + 1.0 / num_pow(ki * 1.0, u);
+                    ki = ki + 1;
+                }
+                let n_neg_s = num_pow(n_em, 0.0 - u);
+                let inv_n2 = 1.0 / (n_em * n_em);
+                let c2 = (u / 12.0) * (n_neg_s / n_em);
+                let c4 = (u * (u + 1.0) * (u + 2.0) / 720.0) * (n_neg_s / n_em) * inv_n2;
+                let c6 = (u * (u + 1.0) * (u + 2.0) * (u + 3.0) * (u + 4.0) / 30240.0) * (n_neg_s / n_em) * inv_n2 * inv_n2;
+                res = s_em + (n_em * n_neg_s) / (u - 1.0) + 0.5 * n_neg_s + c2 - c4 + c6;
+            }
+        }
+        else if fn_nm == "besselj" and len(args) >= 2 {
+            let x_bj = eval_ast(args[1], env);
+            if x_bj != nil and num_abs(u - num_round(u)) < 1e-9 and num_abs(x_bj) <= 25.0 {
+                let n_ord = num_round(u);
+                let m_abs = num_round(num_abs(n_ord));
+                let half_x = 0.5 * x_bj;
+                let term = num_pow(half_x, m_abs);
+                let f_m = 1.0;
+                let fi = 2;
+                while fi <= m_abs { f_m = f_m * fi; fi = fi + 1; }
+                term = term / f_m;
+                let acc_bj = term;
+                let ki = 1;
+                while ki <= 40 {
+                    term = (0.0 - term * half_x * half_x) / (ki * (ki + m_abs));
+                    acc_bj = acc_bj + term;
+                    ki = ki + 1;
+                }
+                if n_ord < 0 and (m_abs - num_floor(m_abs / 2) * 2 == 1) {
+                    acc_bj = 0.0 - acc_bj;
+                }
+                res = acc_bj;
+            }
+        }
         if res != nil and is_finite_num(res) { return res; }
         return nil;
     }
     return nil;
+}
+
+fn _num_gamma_eval(z) {
+    if z <= 0.0 and num_abs(z - num_round(z)) < 1e-12 { return nil; }
+    if z < 0.5 {
+        let g1 = _num_gamma_eval(1.0 - z);
+        if g1 == nil { return nil; }
+        let sv = num_sin(_PI_VAL * z);
+        if num_abs(sv) < 1e-15 { return nil; }
+        return _PI_VAL / (sv * g1);
+    }
+    let x = z - 1.0;
+    let p0 = 0.99999999999980993;
+    let coeffs = [
+        676.5203681218851, -1259.1392167224028, 771.32342877765313,
+        -176.61502916214059, 12.507343278686905, -0.13857109526572012,
+        0.0000099843695780195716, 0.00000015056327351493116
+    ];
+    let acc = p0;
+    let i = 0;
+    while i < len(coeffs) {
+        acc = acc + coeffs[i] / (x + i + 1.0);
+        i = i + 1;
+    }
+    let t = x + 7.5;
+    return num_sqrt(2.0 * _PI_VAL) * num_pow(t, x + 0.5) * num_exp(0.0 - t) * acc;
+}
+
+fn _num_lambertw0_eval(x) {
+    let min_dom = -1.0 / _E_VAL;
+    if x < min_dom - 1e-12 { return nil; }
+    if num_abs(x - min_dom) <= 1e-12 { return -1.0; }
+    let w = 0.0;
+    if x < 1.0 { w = x; } else { w = num_ln(x + 1.0); }
+    let it = 0;
+    while it < 30 {
+        let ew = num_exp(w);
+        let wew = w * ew;
+        let f = wew - x;
+        if num_abs(f) < 1e-14 { return w; }
+        let denom = ew * (w + 1.0) - ((w + 2.0) * f) / (2.0 * w + 2.0);
+        if num_abs(denom) < 1e-15 { break; }
+        w = w - f / denom;
+        it = it + 1;
+    }
+    return w;
 }
 
 // Symbolic derivative d(node)/d(v_name) (raw AST; caller may simplify).
@@ -1015,10 +1265,51 @@ fn diff_ast(node, v_name) {
         if fn_nm == "sin" { return ast_mul([ast_call("cos", [u]), du]); }
         if fn_nm == "cos" { return ast_neg(ast_mul([ast_call("sin", [u]), du])); }
         if fn_nm == "tan" { return ast_div(du, ast_pow(ast_call("cos", [u]), RAT_TWO)); }
+        if fn_nm == "cot" { return ast_neg(ast_div(du, ast_pow(ast_call("sin", [u]), RAT_TWO))); }
         if fn_nm == "exp" { return ast_mul([ast_call("exp", [u]), du]); }
         if fn_nm == "ln" or fn_nm == "log" { return ast_div(du, u); }
         if fn_nm == "sqrt" { return ast_div(du, ast_mul([RAT_TWO, ast_call("sqrt", [u])])); }
         if fn_nm == "abs" { return ast_div(ast_mul([u, du]), ast_call("abs", [u])); }
+        if fn_nm == "erf" {
+            return ast_mul([ast_div(RAT_TWO, ast_call("sqrt", [ast_sym("pi")])), ast_call("exp", [ast_neg(ast_pow(u, RAT_TWO))]), du]);
+        }
+        if fn_nm == "erfc" {
+            return ast_neg(ast_mul([ast_div(RAT_TWO, ast_call("sqrt", [ast_sym("pi")])), ast_call("exp", [ast_neg(ast_pow(u, RAT_TWO))]), du]));
+        }
+        if fn_nm == "erfi" {
+            return ast_mul([ast_div(RAT_TWO, ast_call("sqrt", [ast_sym("pi")])), ast_call("exp", [ast_pow(u, RAT_TWO)]), du]);
+        }
+        if fn_nm == "Ei" { return ast_mul([ast_div(ast_call("exp", [u]), u), du]); }
+        if fn_nm == "li" { return ast_div(du, ast_call("ln", [u])); }
+        if fn_nm == "Si" { return ast_mul([ast_div(ast_call("sin", [u]), u), du]); }
+        if fn_nm == "Ci" { return ast_mul([ast_div(ast_call("cos", [u]), u), du]); }
+        if fn_nm == "FresnelS" {
+            return ast_mul([ast_call("sin", [ast_div(ast_mul([ast_sym("pi"), ast_pow(u, RAT_TWO)]), RAT_TWO)]), du]);
+        }
+        if fn_nm == "FresnelC" {
+            return ast_mul([ast_call("cos", [ast_div(ast_mul([ast_sym("pi"), ast_pow(u, RAT_TWO)]), RAT_TWO)]), du]);
+        }
+        if fn_nm == "Li2" {
+            return ast_mul([ast_neg(ast_div(ast_call("ln", [ast_sub(RAT_ONE, u)]), u)), du]);
+        }
+        if fn_nm == "lambertw" {
+            let w_u = ast_call("lambertw", [u]);
+            return ast_mul([ast_div(w_u, ast_mul([u, ast_add([RAT_ONE, w_u])])), du]);
+        }
+        if fn_nm == "igamma" and len(args) >= 2 and not contains_var(args[0], v_name) {
+            let s_arg = args[0];
+            let x_arg = args[1];
+            return ast_neg(ast_mul([ast_pow(x_arg, ast_sub(s_arg, RAT_ONE)), ast_call("exp", [ast_neg(x_arg)]), diff_ast(x_arg, v_name)]));
+        }
+        if fn_nm == "besselj" and len(args) >= 2 and not contains_var(args[0], v_name) {
+            let n_arg = args[0];
+            let x_arg = args[1];
+            return ast_mul([
+                RAT_HALF,
+                ast_sub(ast_call("besselj", [ast_sub(n_arg, RAT_ONE), x_arg]), ast_call("besselj", [ast_add([n_arg, RAT_ONE]), x_arg])),
+                diff_ast(x_arg, v_name)
+            ]);
+        }
     }
     return RAT_ZERO;
 }
@@ -1031,7 +1322,13 @@ fn _is_known_func(nm) {
         or nm == "atan" or nm == "atan2" or nm == "sinh" or nm == "cosh"
         or nm == "tanh" or nm == "sqrt" or nm == "cbrt" or nm == "abs"
         or nm == "ln" or nm == "log" or nm == "log10" or nm == "log2"
-        or nm == "exp" or nm == "floor" or nm == "ceil";
+        or nm == "exp" or nm == "floor" or nm == "ceil"
+        or nm == "erf" or nm == "erfc" or nm == "erfi"
+        or nm == "Ei" or nm == "li" or nm == "Si" or nm == "Ci"
+        or nm == "FresnelS" or nm == "FresnelC"
+        or nm == "Li2" or nm == "lambertw"
+        or nm == "gamma" or nm == "igamma" or nm == "beta"
+        or nm == "zeta" or nm == "besselj";
 }
 
 fn _superscript_char_map(cp) {
@@ -1052,7 +1349,8 @@ fn _superscript_char_map(cp) {
 }
 
 fn _is_alpha_cp(cp) {
-    return (cp >= 65 and cp <= 90) or (cp >= 97 and cp <= 122) or cp == 95;
+    return (cp >= 65 and cp <= 90) or (cp >= 97 and cp <= 122) or cp == 95
+        or (cp >= 913 and cp <= 969 and cp != 960);
 }
 
 fn _is_digit_cp(cp) {
@@ -1180,7 +1478,27 @@ fn _normalize_latex(s, depth = 0) {
                             i = j;
                         }
                     }
-                } else if cmd == "le" or cmd == "leq" { out = out + " <= "; i = j; }
+                } else if cmd == "operatorname" {
+                    let k1 = _skip_spaces(s, j);
+                    let g = _extract_braced(s, k1);
+                    if g != nil {
+                        let op_nm = str_trim(g["content"]);
+                        let next_i = g["next_pos"];
+                        if op_nm == "Li" and next_i + 1 < n and str_slice(s, next_i, next_i + 2) == "_2" {
+                            op_nm = "Li2";
+                            next_i = next_i + 2;
+                        } else if op_nm == "Li" and next_i + 3 < n and str_slice(s, next_i, next_i + 4) == "_{2}" {
+                            op_nm = "Li2";
+                            next_i = next_i + 4;
+                        }
+                        out = out + " " + op_nm;
+                        i = next_i;
+                    } else {
+                        i = j;
+                    }
+                } else if cmd == "Gamma" { out = out + " gamma"; i = j; }
+                else if cmd == "zeta" { out = out + " zeta"; i = j; }
+                else if cmd == "le" or cmd == "leq" { out = out + " <= "; i = j; }
                 else if cmd == "ge" or cmd == "geq" { out = out + " >= "; i = j; }
                 else if cmd == "ne" or cmd == "neq" { out = out + " != "; i = j; }
                 else if cmd == "cdot" or cmd == "times" { out = out + " * "; i = j; }
@@ -1216,8 +1534,9 @@ fn _normalize_latex(s, depth = 0) {
 // Normalize Unicode math symbols, superscripts, radicals, and LaTeX into clean ASCII tokens.
 fn normalize_math_text(raw_s) {
     let s = str(raw_s);
-    if len(s) > MAX_INPUT_LEN {
-        throw "CAS limit exceeded: input length " + str(len(s)) + " > " + str(MAX_INPUT_LEN);
+    let max_in = GOV.current_limits()["max_ast_nodes"] * 4;
+    if len(s) > max_in {
+        throw "MathGovernor[symbolic_cas]: resource budget exceeded (input length " + str(len(s)) + " > " + str(max_in) + ")";
     }
     // Pass 1: Unicode scalar normalization + superscript grouping + √ handling
     let buf = "";
@@ -1285,6 +1604,7 @@ fn normalize_math_text(raw_s) {
 
 // Lex normalized string into raw tokens: NUM, IDENT, OP, LPAREN, RPAREN, COMMA, BAR, REL
 fn _tokenize_raw(s) {
+    let max_tok = GOV.current_limits()["max_ast_nodes"] * 2;
     let toks = [];
     let n = len(s);
     let i = 0;
@@ -1360,8 +1680,8 @@ fn _tokenize_raw(s) {
                 throw "Unexpected character '" + ch + "' in math input";
             }
         }
-        if len(toks) > MAX_AST_NODES * 2 {
-            throw "CAS limit exceeded: too many tokens";
+        if len(toks) > max_tok {
+            throw "MathGovernor[symbolic_cas]: resource budget exceeded (token count > " + str(max_tok) + ")";
         }
     }
     return toks;
@@ -1486,8 +1806,10 @@ fn _p_next(st) {
 
 fn _p_enter(st) {
     st["depth"] = st["depth"] + 1;
-    if st["depth"] > MAX_AST_DEPTH {
-        throw "CAS limit exceeded: parse nesting depth > " + str(MAX_AST_DEPTH);
+    let max_d = MAX_AST_DEPTH;
+    if map_has(st, "max_depth") { max_d = st["max_depth"]; }
+    if st["depth"] > max_d {
+        throw "MathGovernor[symbolic_cas.parse]: resource budget exceeded (parse nesting depth > " + str(max_d) + ")";
     }
 }
 
@@ -1735,8 +2057,9 @@ fn parse_math(input) {
     }
     let raw = str_trim(str(input));
     if len(raw) == 0 { throw "parse_math: empty expression string"; }
-    if len(raw) > MAX_INPUT_LEN {
-        throw "CAS limit exceeded: input length " + str(len(raw)) + " > " + str(MAX_INPUT_LEN);
+    let lim = GOV.current_limits();
+    if len(raw) > lim["max_input_len"] {
+        throw "MathGovernor[symbolic_cas.parse]: resource budget exceeded (input length " + str(len(raw)) + " > " + str(lim["max_input_len"]) + ")";
     }
     if str_contains(raw, ";") {
         let raw_parts = str_split(raw, ";");
@@ -1765,7 +2088,7 @@ fn parse_math(input) {
     if len(raw_toks) == 0 { throw "parse_math: no tokens found"; }
     let bar_toks = _rewrite_abs_bars(raw_toks);
     let mul_toks = _insert_implicit_mul(bar_toks);
-    let st = map{ "toks": mul_toks, "pos": 0, "depth": 0 };
+    let st = map{ "toks": mul_toks, "pos": 0, "depth": 0, "max_depth": lim["max_ast_depth"] };
     let ast = _parse_relation_or_expr(st);
     check_ast_bounds(ast);
     return ast;
@@ -2115,6 +2438,24 @@ fn _unicode_inner(node, parent_prec) {
         if fn_nm == "abs" and len(args) == 1 {
             return "|" + _unicode_inner(args[0], 0) + "|";
         }
+        if fn_nm == "gamma" and len(args) == 1 {
+            return "Γ(" + _unicode_inner(args[0], 0) + ")";
+        }
+        if fn_nm == "igamma" and len(args) == 2 {
+            return "Γ(" + _unicode_inner(args[0], 0) + ", " + _unicode_inner(args[1], 0) + ")";
+        }
+        if fn_nm == "zeta" and len(args) == 1 {
+            return "ζ(" + _unicode_inner(args[0], 0) + ")";
+        }
+        if fn_nm == "lambertw" and len(args) == 1 {
+            return "W₀(" + _unicode_inner(args[0], 0) + ")";
+        }
+        if fn_nm == "Li2" and len(args) == 1 {
+            return "Li₂(" + _unicode_inner(args[0], 0) + ")";
+        }
+        if fn_nm == "besselj" and len(args) == 2 {
+            return "J_" + _unicode_inner(args[0], 45) + "(" + _unicode_inner(args[1], 0) + ")";
+        }
         let s = fn_nm + "(";
         let i = 0;
         while i < len(args) {
@@ -2147,6 +2488,11 @@ fn _latex_func_cmd(fn_nm) {
     if fn_nm == "asin" { return "\\arcsin"; }
     if fn_nm == "acos" { return "\\arccos"; }
     if fn_nm == "atan" { return "\\arctan"; }
+    if fn_nm == "gamma" or fn_nm == "igamma" { return "\\Gamma"; }
+    if fn_nm == "zeta" { return "\\zeta"; }
+    if fn_nm == "Li2" { return "\\operatorname{Li}_{2}"; }
+    if fn_nm == "lambertw" { return "W_{0}"; }
+    if fn_nm == "beta" { return "\\mathrm{B}"; }
     return "\\operatorname{" + fn_nm + "}";
 }
 
@@ -2279,6 +2625,9 @@ fn _latex_inner(node, parent_prec) {
         if fn_nm == "abs" and len(args) == 1 {
             return "\\left|" + _latex_inner(args[0], 0) + "\\right|";
         }
+        if fn_nm == "besselj" and len(args) == 2 {
+            return "J_{" + _latex_inner(args[0], 0) + "}\\left(" + _latex_inner(args[1], 0) + "\\right)";
+        }
         let cmd = _latex_func_cmd(fn_nm);
         let s = cmd + "\\left(";
         let i = 0;
@@ -2299,19 +2648,25 @@ fn to_latex(node) {
 // ── Step-Trace & Domain-Guard Context ─────────────────────────────────────────
 
 fn _new_ctx() {
+    let lim = GOV.current_limits();
     return map{
         "steps": [],
         "guards": [],
         "guard_map": map{},
-        "rewrites": 0
+        "rewrites": 0,
+        "lim": lim,
+        "trk": GOV.new_tracker("symbolic_cas")
     };
 }
 
 fn _bump_rewrite(ctx) {
     if ctx == nil { return; }
     ctx["rewrites"] = ctx["rewrites"] + 1;
-    if ctx["rewrites"] > MAX_REWRITE_STEPS {
-        throw "CAS limit exceeded: rewrite steps > " + str(MAX_REWRITE_STEPS);
+    GOV.tick(ctx["trk"], 1);
+    let max_rw = MAX_REWRITE_STEPS;
+    if map_has(ctx, "lim") { max_rw = ctx["lim"]["max_rewrite_steps"]; }
+    if ctx["rewrites"] > max_rw {
+        throw "MathGovernor[symbolic_cas]: resource budget exceeded (rewrite steps > " + str(max_rw) + ")";
     }
 }
 
@@ -2542,8 +2897,9 @@ fn poly_mul(a, b) {
     if poly_is_zero(a) or poly_is_zero(b) { return [RAT_ZERO]; }
     let da = len(a) - 1;
     let db = len(b) - 1;
-    if da + db > MAX_EXPAND_DEGREE * 2 {
-        throw "CAS limit exceeded: polynomial degree > " + str(MAX_EXPAND_DEGREE * 2);
+    let max_deg = GOV.current_limits()["max_expand_degree"];
+    if da + db > max_deg * 2 {
+        throw "MathGovernor[symbolic_cas.poly_mul]: resource budget exceeded (polynomial degree > " + str(max_deg * 2) + ")";
     }
     let out = [];
     let k = 0;
@@ -2568,13 +2924,16 @@ fn poly_pow(p, exp_int) {
     if exp_int < 0 { return nil; }
     if exp_int == 0 { return [RAT_ONE]; }
     let d = poly_deg(p);
-    if d > 0 and d * exp_int > MAX_EXPAND_DEGREE {
-        throw "CAS limit exceeded: expansion degree " + str(d * exp_int) + " > " + str(MAX_EXPAND_DEGREE);
+    let max_deg = GOV.current_limits()["max_expand_degree"];
+    if d > 0 and d * exp_int > max_deg {
+        throw "MathGovernor[symbolic_cas.poly_pow]: resource budget exceeded (expansion degree " + str(d * exp_int) + " > " + str(max_deg) + ")";
     }
+    let trk = GOV.new_tracker("symbolic_cas.poly_pow");
     let res = [RAT_ONE];
     let base_p = p;
     let e = exp_int;
     while e > 0 {
+        GOV.tick(trk, len(res) + len(base_p));
         let half = num_floor(e / 2);
         if e - half * 2 == 1 { res = poly_mul(res, base_p); }
         e = half;
@@ -2595,8 +2954,9 @@ fn poly_divmod(a, b) {
     let i = 0;
     while i < q_len { push(quot, RAT_ZERO); i = i + 1; }
     let lc_b = poly_lc(b);
+    let max_deg = GOV.current_limits()["max_expand_degree"];
     let guard = 0;
-    while not poly_is_zero(rem) and poly_deg(rem) >= db and guard <= MAX_EXPAND_DEGREE * 4 {
+    while not poly_is_zero(rem) and poly_deg(rem) >= db and guard <= max_deg * 4 {
         let d_cur = poly_deg(rem);
         let shift = d_cur - db;
         let coeff = rat_div(poly_lc(rem), lc_b);
@@ -2692,11 +3052,12 @@ fn ast_to_poly(node, v_name) {
     if k == "mul" {
         let acc = [RAT_ONE];
         let arr = node["args"];
+        let max_deg = GOV.current_limits()["max_expand_degree"];
         let i = 0;
         while i < len(arr) {
             let pi = ast_to_poly(arr[i], v_name);
             if pi == nil { return nil; }
-            if poly_deg(acc) >= 0 and poly_deg(pi) >= 0 and poly_deg(acc) + poly_deg(pi) > MAX_EXPAND_DEGREE {
+            if poly_deg(acc) >= 0 and poly_deg(pi) >= 0 and poly_deg(acc) + poly_deg(pi) > max_deg {
                 return nil;
             }
             acc = poly_mul(acc, pi);
@@ -2720,8 +3081,9 @@ fn ast_to_poly(node, v_name) {
             let ei = int_val_of(node["exp"]);
             if ei >= 0 {
                 let d = poly_deg(pb);
-                if d > 0 and d * ei > MAX_EXPAND_DEGREE {
-                    throw "CAS limit exceeded: polynomial power degree " + str(d * ei) + " > " + str(MAX_EXPAND_DEGREE);
+                let max_deg = GOV.current_limits()["max_expand_degree"];
+                if d > 0 and d * ei > max_deg {
+                    throw "MathGovernor[symbolic_cas.ast_to_poly]: resource budget exceeded (polynomial power degree " + str(d * ei) + " > " + str(max_deg) + ")";
                 }
                 return poly_pow(pb, ei);
             }
@@ -3437,9 +3799,11 @@ fn _simplify_pow(b, e, ctx) {
         return simplify_node(ast_neg(pos_pow), ctx);
     }
     // (A * B)^n -> A^n * B^n for integer n
+    let max_deg_p = GOV.current_limits()["max_expand_degree"];
+    if ctx != nil and map_has(ctx, "lim") { max_deg_p = ctx["lim"]["max_expand_degree"]; }
     if b["kind"] == "mul" and is_int_node(e) {
         let ei = int_val_of(e);
-        if num_abs(ei) <= MAX_EXPAND_DEGREE {
+        if num_abs(ei) <= max_deg_p {
             let parts = [];
             let i = 0;
             while i < len(b["args"]) {
@@ -3452,7 +3816,7 @@ fn _simplify_pow(b, e, ctx) {
     // (A / B)^n -> A^n / B^n for integer n
     if b["kind"] == "div" and is_int_node(e) {
         let ei = int_val_of(e);
-        if num_abs(ei) <= MAX_EXPAND_DEGREE {
+        if num_abs(ei) <= max_deg_p {
             if ei > 0 {
                 return simplify_node(ast_div(_simplify_pow(b["num"], e, ctx), _simplify_pow(b["den"], e, ctx)), ctx);
             }
@@ -3953,7 +4317,9 @@ fn to_rational_nd(node, ctx = nil) {
             let pos_pow = ast_pow(node["base"], rat(0 - ei, 1));
             return map{ "num": RAT_ONE, "den": pos_pow, "orig_dens": [pos_pow] };
         }
-        if ei >= 0 and ei <= MAX_EXPAND_DEGREE {
+        let max_deg_r = GOV.current_limits()["max_expand_degree"];
+        if ctx != nil and map_has(ctx, "lim") { max_deg_r = ctx["lim"]["max_expand_degree"]; }
+        if ei >= 0 and ei <= max_deg_r {
             let rb = to_rational_nd(node["base"], ctx);
             if not is_one_node(rb["den"]) {
                 return map{
@@ -4016,14 +4382,27 @@ fn _distribute_two(a, b, ctx) {
     let b_terms = [b];
     if a["kind"] == "add" { a_terms = a["args"]; }
     if b["kind"] == "add" { b_terms = b["args"]; }
-    if len(a_terms) * len(b_terms) > MAX_AST_NODES {
-        throw "CAS limit exceeded: distributive expansion term blowup";
+    let lim = nil;
+    let trk = nil;
+    if ctx != nil and map_has(ctx, "lim") {
+        lim = ctx["lim"];
+        trk = ctx["trk"];
+    } else {
+        lim = GOV.current_limits();
+    }
+    let prod_terms = len(a_terms) * len(b_terms);
+    if trk != nil {
+        GOV.check_swell(trk, prod_terms);
+    }
+    if prod_terms > lim["max_ast_nodes"] {
+        throw "MathGovernor[symbolic_cas.expand]: resource budget exceeded (distributive expansion term blowup " + str(prod_terms) + " > " + str(lim["max_ast_nodes"]) + ")";
     }
     let out = [];
     let i = 0;
     while i < len(a_terms) {
         let j = 0;
         while j < len(b_terms) {
+            if trk != nil { GOV.tick(trk, 1); }
             push(out, simplify_node(ast_mul([a_terms[i], b_terms[j]]), ctx));
             j = j + 1;
         }
@@ -4069,15 +4448,34 @@ fn _expand_node(node, ctx) {
         let ee = _expand_node(node["exp"], ctx);
         if is_int_node(ee) {
             let ei = int_val_of(ee);
-            if ei > MAX_EXPAND_DEGREE {
-                throw "CAS limit exceeded: expand exponent " + str(ei) + " > " + str(MAX_EXPAND_DEGREE);
+            let max_deg_e = GOV.current_limits()["max_expand_degree"];
+            if ctx != nil and map_has(ctx, "lim") { max_deg_e = ctx["lim"]["max_expand_degree"]; }
+            if ei > max_deg_e {
+                throw "MathGovernor[symbolic_cas.expand]: resource budget exceeded (expand exponent " + str(ei) + " > " + str(max_deg_e) + ")";
             }
             if ei >= 2 and eb["kind"] == "add" {
-                let acc = eb;
-                let step_i = 1;
-                while step_i < ei {
-                    acc = _distribute_two(acc, eb, ctx);
-                    step_i = step_i + 1;
+                // Fast exact BigInt polynomial power for univariate bases (e.g. (x + 1)^100 in < 10 ms!)
+                let fvs_eb = free_vars(eb);
+                if len(fvs_eb) == 1 {
+                    let pb = ast_to_poly(eb, fvs_eb[0]);
+                    if pb != nil {
+                        return poly_to_ast(poly_pow(pb, ei), fvs_eb[0]);
+                    }
+                }
+                // Multivariate binary exponentiation guarded by MathGovernor ticks & swell bounds
+                let acc = RAT_ONE;
+                let base_cur = eb;
+                let rem_e = ei;
+                while rem_e > 0 {
+                    let half_e = num_floor(rem_e / 2);
+                    if rem_e - half_e * 2 == 1 {
+                        if is_one_node(acc) { acc = base_cur; }
+                        else { acc = _distribute_two(acc, base_cur, ctx); }
+                    }
+                    rem_e = half_e;
+                    if rem_e > 0 {
+                        base_cur = _distribute_two(base_cur, base_cur, ctx);
+                    }
                 }
                 return acc;
             }
@@ -7311,6 +7709,1094 @@ fn _order_system_vars(raw_vars) {
     return out;
 }
 
+// ── Parametric Case-Splitting & Guarded Indeterminacy Classifiers (v2.4.0) ────
+
+fn _extract_poly_coeffs_in_var(expr, v, ctx) {
+    let exp_e = _expand_node(expr, ctx);
+    let terms = [exp_e];
+    if exp_e["kind"] == "add" { terms = exp_e["args"]; }
+    let deg_buckets = map{};
+    let max_d = 0;
+    let i = 0;
+    while i < len(terms) {
+        let t = terms[i];
+        if not contains_var(t, v) {
+            if not map_has(deg_buckets, "0") { deg_buckets["0"] = []; }
+            push(deg_buckets["0"], t);
+        } else if t["kind"] == "sym" and t["name"] == v {
+            if not map_has(deg_buckets, "1") { deg_buckets["1"] = []; }
+            push(deg_buckets["1"], RAT_ONE);
+            if 1 > max_d { max_d = 1; }
+        } else if t["kind"] == "neg" and t["arg"]["kind"] == "sym" and t["arg"]["name"] == v {
+            if not map_has(deg_buckets, "1") { deg_buckets["1"] = []; }
+            push(deg_buckets["1"], RAT_NEG_ONE);
+            if 1 > max_d { max_d = 1; }
+        } else if t["kind"] == "pow" and t["base"]["kind"] == "sym" and t["base"]["name"] == v and is_int_node(t["exp"]) {
+            let dk = int_val_of(t["exp"]);
+            if dk < 0 or dk > 16 { return nil; }
+            let ks = str(dk);
+            if not map_has(deg_buckets, ks) { deg_buckets[ks] = []; }
+            push(deg_buckets[ks], RAT_ONE);
+            if dk > max_d { max_d = dk; }
+        } else if t["kind"] == "neg" and t["arg"]["kind"] == "pow" and t["arg"]["base"]["kind"] == "sym" and t["arg"]["base"]["name"] == v and is_int_node(t["arg"]["exp"]) {
+            let dk = int_val_of(t["arg"]["exp"]);
+            if dk < 0 or dk > 16 { return nil; }
+            let ks = str(dk);
+            if not map_has(deg_buckets, ks) { deg_buckets[ks] = []; }
+            push(deg_buckets[ks], RAT_NEG_ONE);
+            if dk > max_d { max_d = dk; }
+        } else if t["kind"] == "mul" {
+            let deg_t = 0;
+            let rest = [];
+            let j = 0;
+            while j < len(t["args"]) {
+                let fj = t["args"][j];
+                if fj["kind"] == "sym" and fj["name"] == v {
+                    deg_t = deg_t + 1;
+                } else if fj["kind"] == "pow" and fj["base"]["kind"] == "sym" and fj["base"]["name"] == v and is_int_node(fj["exp"]) {
+                    let ek = int_val_of(fj["exp"]);
+                    if ek < 0 { return nil; }
+                    deg_t = deg_t + ek;
+                } else if contains_var(fj, v) {
+                    return nil;
+                } else {
+                    push(rest, fj);
+                }
+                j = j + 1;
+            }
+            if deg_t > 16 { return nil; }
+            let ks = str(deg_t);
+            if not map_has(deg_buckets, ks) { deg_buckets[ks] = []; }
+            push(deg_buckets[ks], ast_mul(rest));
+            if deg_t > max_d { max_d = deg_t; }
+        } else {
+            return nil;
+        }
+        i = i + 1;
+    }
+    let coeffs = [];
+    let d = 0;
+    while d <= max_d {
+        let ks = str(d);
+        if map_has(deg_buckets, ks) {
+            push(coeffs, simplify_node(ast_add(deg_buckets[ks]), ctx));
+        } else {
+            push(coeffs, RAT_ZERO);
+        }
+        d = d + 1;
+    }
+    while len(coeffs) > 1 and is_zero_node(coeffs[len(coeffs) - 1]) {
+        let trimmed = [];
+        let ti = 0;
+        while ti < len(coeffs) - 1 { push(trimmed, coeffs[ti]); ti = ti + 1; }
+        coeffs = trimmed;
+    }
+    return coeffs;
+}
+
+fn _normalize_lead_pair(a_in, b_in) {
+    let a_c = simplify_node(a_in, nil);
+    let b_c = simplify_node(b_in, nil);
+    let sp_a = _split_term_sign(a_c);
+    let sp_b = _split_term_sign(b_c);
+    if sp_a[0] and sp_b[0] {
+        return [simplify_node(sp_a[1], nil), simplify_node(sp_b[1], nil)];
+    }
+    if a_c["kind"] == "add" {
+        let all_neg = true;
+        let k = 0;
+        while k < len(a_c["args"]) {
+            if not _split_term_sign(a_c["args"][k])[0] { all_neg = false; break; }
+            k = k + 1;
+        }
+        if all_neg {
+            return [simplify_node(ast_neg(a_c), nil), simplify_node(ast_neg(b_c), nil)];
+        }
+    }
+    return [a_c, b_c];
+}
+
+fn _intervals_to_param_cond(ivs, p_name) {
+    if ivs == nil or len(ivs) == 0 { return nil; }
+    let p_ltx = to_latex(ast_sym(p_name));
+    if len(ivs) == 1 {
+        let iv = ivs[0];
+        if iv["lo_inf"] and iv["hi_inf"] {
+            return map{
+                "ascii": p_name + " in (-inf, +inf)",
+                "unicode": p_name + " ∈ ℝ",
+                "latex": p_ltx + " \\in \\mathbb{R}"
+            };
+        }
+        if iv["lo_inf"] {
+            let oa = "<"; let ou = "<"; let ol = "<";
+            if iv["hi_closed"] { oa = "<="; ou = "≤"; ol = "\\le"; }
+            return map{
+                "ascii": p_name + " " + oa + " " + iv["hi_ascii"],
+                "unicode": p_name + " " + ou + " " + iv["hi_unicode"],
+                "latex": p_ltx + " " + ol + " " + iv["hi_latex"]
+            };
+        }
+        if iv["hi_inf"] {
+            let oa = ">"; let ou = ">"; let ol = ">";
+            if iv["lo_closed"] { oa = ">="; ou = "≥"; ol = "\\ge"; }
+            return map{
+                "ascii": p_name + " " + oa + " " + iv["lo_ascii"],
+                "unicode": p_name + " " + ou + " " + iv["lo_unicode"],
+                "latex": p_ltx + " " + ol + " " + iv["lo_latex"]
+            };
+        }
+        let o1a = "<"; let o1u = "<"; let o1l = "<";
+        if iv["lo_closed"] { o1a = "<="; o1u = "≤"; o1l = "\\le"; }
+        let o2a = "<"; let o2u = "<"; let o2l = "<";
+        if iv["hi_closed"] { o2a = "<="; o2u = "≤"; o2l = "\\le"; }
+        return map{
+            "ascii": iv["lo_ascii"] + " " + o1a + " " + p_name + " " + o2a + " " + iv["hi_ascii"],
+            "unicode": iv["lo_unicode"] + " " + o1u + " " + p_name + " " + o2u + " " + iv["hi_unicode"],
+            "latex": iv["lo_latex"] + " " + o1l + " " + p_ltx + " " + o2l + " " + iv["hi_latex"]
+        };
+    }
+    if len(ivs) == 2 {
+        let iv0 = ivs[0];
+        let iv1 = ivs[1];
+        // Punctured interval at single excluded point r: (..., r) U (r, ...)
+        if not iv0["hi_closed"] and not iv1["lo_closed"] and iv0["hi_ascii"] == iv1["lo_ascii"] {
+            let r_a = iv0["hi_ascii"];
+            let r_u = iv0["hi_unicode"];
+            let r_l = iv0["hi_latex"];
+            if iv0["lo_inf"] and iv1["hi_inf"] {
+                return map{
+                    "ascii": p_name + " != " + r_a,
+                    "unicode": p_name + " ≠ " + r_u,
+                    "latex": p_ltx + " \\neq " + r_l
+                };
+            }
+            if iv0["lo_inf"] and not iv1["hi_inf"] {
+                let oa = "<"; let ou = "<"; let ol = "<";
+                if iv1["hi_closed"] { oa = "<="; ou = "≤"; ol = "\\le"; }
+                return map{
+                    "ascii": p_name + " " + oa + " " + iv1["hi_ascii"] + " and " + p_name + " != " + r_a,
+                    "unicode": p_name + " " + ou + " " + iv1["hi_unicode"] + " ∧ " + p_name + " ≠ " + r_u,
+                    "latex": p_ltx + " " + ol + " " + iv1["hi_latex"] + " \\land " + p_ltx + " \\neq " + r_l
+                };
+            }
+            if not iv0["lo_inf"] and iv1["hi_inf"] {
+                let oa = ">"; let ou = ">"; let ol = ">";
+                if iv0["lo_closed"] { oa = ">="; ou = "≥"; ol = "\\ge"; }
+                return map{
+                    "ascii": p_name + " " + oa + " " + iv0["lo_ascii"] + " and " + p_name + " != " + r_a,
+                    "unicode": p_name + " " + ou + " " + iv0["lo_unicode"] + " ∧ " + p_name + " ≠ " + r_u,
+                    "latex": p_ltx + " " + ol + " " + iv0["lo_latex"] + " \\land " + p_ltx + " \\neq " + r_l
+                };
+            }
+        }
+        // Disjoint rays: (-inf, a) U (b, +inf)
+        if iv0["lo_inf"] and iv1["hi_inf"] {
+            let o1a = "<"; let o1u = "<"; let o1l = "<";
+            if iv0["hi_closed"] { o1a = "<="; o1u = "≤"; o1l = "\\le"; }
+            let o2a = ">"; let o2u = ">"; let o2l = ">";
+            if iv1["lo_closed"] { o2a = ">="; o2u = "≥"; o2l = "\\ge"; }
+            return map{
+                "ascii": p_name + " " + o1a + " " + iv0["hi_ascii"] + " or " + p_name + " " + o2a + " " + iv1["lo_ascii"],
+                "unicode": p_name + " " + o1u + " " + iv0["hi_unicode"] + " ∨ " + p_name + " " + o2u + " " + iv1["lo_unicode"],
+                "latex": p_ltx + " " + o1l + " " + iv0["hi_latex"] + " \\lor " + p_ltx + " " + o2l + " " + iv1["lo_latex"]
+            };
+        }
+    }
+    return map{
+        "ascii": p_name + " in " + _format_intervals(ivs, "ascii"),
+        "unicode": p_name + " ∈ " + _format_intervals(ivs, "unicode"),
+        "latex": p_ltx + " \\in " + _format_intervals(ivs, "latex")
+    };
+}
+
+fn _ineq_ray_strings(op, bound_node) {
+    let ba = to_ascii(bound_node);
+    let bu = to_unicode(bound_node);
+    let bl = to_latex(bound_node);
+    if op == "<" {
+        return map{ "ascii": "(-inf, " + ba + ")", "unicode": "(-∞, " + bu + ")", "latex": "(-\\infty, " + bl + ")" };
+    }
+    if op == "<=" {
+        return map{ "ascii": "(-inf, " + ba + "]", "unicode": "(-∞, " + bu + "]", "latex": "(-\\infty, " + bl + "]" };
+    }
+    if op == ">" {
+        return map{ "ascii": "(" + ba + ", +inf)", "unicode": "(" + bu + ", +∞)", "latex": "(" + bl + ", +\\infty)" };
+    }
+    if op == ">=" {
+        return map{ "ascii": "[" + ba + ", +inf)", "unicode": "[" + bu + ", +∞)", "latex": "[" + bl + ", +\\infty)" };
+    }
+    return map{ "ascii": "(-inf, " + ba + ") U (" + ba + ", +inf)", "unicode": "(-∞, " + bu + ") ∪ (" + bu + ", +∞)", "latex": "(-\\infty, " + bl + ") \\cup (" + bl + ", +\\infty)" };
+}
+
+fn _zero_lhs_holds_num(op, b_val) {
+    if op == "<" { return b_val > 1.0e-12; }
+    if op == "<=" { return b_val >= -1.0e-12; }
+    if op == ">" { return b_val < -1.0e-12; }
+    if op == ">=" { return b_val <= 1.0e-12; }
+    if op == "!=" { return num_abs(b_val) > 1.0e-12; }
+    return false;
+}
+
+fn _solve_parametric_inequality_cases(rel_node, target_v, param_vars, ctx) {
+    let op = rel_node["op"];
+    let lhs = simplify_node(rel_node["lhs"], ctx);
+    let rhs = simplify_node(rel_node["rhs"], ctx);
+    let lin_l = _extract_linear_in_var(lhs, target_v, ctx);
+    let lin_r = _extract_linear_in_var(rhs, target_v, ctx);
+    if not (lin_l["is_linear"] and lin_r["is_linear"]) {
+        return [];
+    }
+    let A = simplify_node(ast_sub(lin_l["a"], lin_r["a"]), ctx);
+    let B = simplify_node(ast_sub(lin_r["b"], lin_l["b"]), ctx);
+    let cases = [];
+    let v_ltx = to_latex(ast_sym(target_v));
+
+    // Determine condition on B for `0 [op] B` to hold when A = 0
+    let b_true_op = ">=";
+    let b_false_op = "<";
+    if op == "<" { b_true_op = ">"; b_false_op = "<="; }
+    else if op == "<=" { b_true_op = ">="; b_false_op = "<"; }
+    else if op == ">" { b_true_op = "<"; b_false_op = ">="; }
+    else if op == ">=" { b_true_op = "<="; b_false_op = ">"; }
+    else if op == "!=" { b_true_op = "!="; b_false_op = "="; }
+
+    if is_zero_node(A) {
+        let bv = eval_ast(B, map{});
+        if bv != nil {
+            if _zero_lhs_holds_num(op, bv) {
+                push(cases, map{
+                    "condition": "always",
+                    "condition_unicode": "∀",
+                    "condition_latex": "\\text{always}",
+                    "regime": "indeterminate_always_true",
+                    "status": "indeterminate_always_true",
+                    "infinite_solutions": true,
+                    "solutions": "all_real_numbers",
+                    "interval_ascii": "(-inf, +inf)",
+                    "interval_unicode": "(-∞, +∞)",
+                    "interval_latex": "(-\\infty, +\\infty)"
+                });
+            } else {
+                push(cases, map{
+                    "condition": "always",
+                    "condition_unicode": "∀",
+                    "condition_latex": "\\text{always}",
+                    "regime": "impossible_never_true",
+                    "status": "impossible_never_true",
+                    "infinite_solutions": false,
+                    "solutions": [],
+                    "interval_ascii": "empty",
+                    "interval_unicode": "∅",
+                    "interval_latex": "\\emptyset"
+                });
+            }
+            return cases;
+        }
+        let cond_t = ast_rel(b_true_op, B, RAT_ZERO);
+        let cond_f = ast_rel(b_false_op, B, RAT_ZERO);
+        push(cases, map{
+            "condition": to_ascii(cond_t),
+            "condition_unicode": to_unicode(cond_t),
+            "condition_latex": to_latex(cond_t),
+            "regime": "indeterminate_always_true",
+            "status": "indeterminate_always_true",
+            "infinite_solutions": true,
+            "solutions": "all_real_numbers",
+            "interval_ascii": "(-inf, +inf)",
+            "interval_unicode": "(-∞, +∞)",
+            "interval_latex": "(-\\infty, +\\infty)"
+        });
+        push(cases, map{
+            "condition": to_ascii(cond_f),
+            "condition_unicode": to_unicode(cond_f),
+            "condition_latex": to_latex(cond_f),
+            "regime": "impossible_never_true",
+            "status": "impossible_never_true",
+            "infinite_solutions": false,
+            "solutions": [],
+            "interval_ascii": "empty",
+            "interval_unicode": "∅",
+            "interval_latex": "\\emptyset"
+        });
+        return cases;
+    }
+
+    let q_bound = simplify_node(ast_div(B, A), nil);
+    let fl_op = _flip_ineq_op(op);
+    let ray_pos = _ineq_ray_strings(op, q_bound);
+    let ray_neg = _ineq_ray_strings(fl_op, q_bound);
+    let sol_pos_ast = ast_rel(op, ast_sym(target_v), q_bound);
+    let sol_neg_ast = ast_rel(fl_op, ast_sym(target_v), q_bound);
+
+    // 1. Positive leading coefficient regime: A > 0 (inequality direction preserved)
+    if len(param_vars) == 1 {
+        let p = param_vars[0];
+        let pos_in = try _solve_single_inequality(ast_rel(">", A, RAT_ZERO), p, _new_ctx()) catch nil;
+        if pos_in != nil and len(pos_in["intervals"]) > 0 {
+            let pc = _intervals_to_param_cond(pos_in["intervals"], p);
+            push(cases, map{
+                "condition": pc["ascii"],
+                "condition_unicode": pc["unicode"],
+                "condition_latex": pc["latex"],
+                "regime": "positive_lead_preserved",
+                "status": "unique_interval",
+                "direction_flipped": false,
+                "ascii": to_ascii(sol_pos_ast),
+                "unicode": to_unicode(sol_pos_ast),
+                "latex": to_latex(sol_pos_ast),
+                "solutions": to_ascii(sol_pos_ast),
+                "interval_ascii": ray_pos["ascii"],
+                "interval_unicode": ray_pos["unicode"],
+                "interval_latex": ray_pos["latex"]
+            });
+        }
+        let neg_in = try _solve_single_inequality(ast_rel("<", A, RAT_ZERO), p, _new_ctx()) catch nil;
+        if neg_in != nil and len(neg_in["intervals"]) > 0 {
+            let nc = _intervals_to_param_cond(neg_in["intervals"], p);
+            push(cases, map{
+                "condition": nc["ascii"],
+                "condition_unicode": nc["unicode"],
+                "condition_latex": nc["latex"],
+                "regime": "negative_lead_flipped",
+                "status": "unique_interval_flipped",
+                "direction_flipped": (op != "!="),
+                "ascii": to_ascii(sol_neg_ast),
+                "unicode": to_unicode(sol_neg_ast),
+                "latex": to_latex(sol_neg_ast),
+                "solutions": to_ascii(sol_neg_ast),
+                "interval_ascii": ray_neg["ascii"],
+                "interval_unicode": ray_neg["unicode"],
+                "interval_latex": ray_neg["latex"]
+            });
+        }
+        // Zero leading coefficient roots: A(p) = 0
+        let z_eq = try _solve_single_eq(A, RAT_ZERO, p, _new_ctx(), 1) catch nil;
+        if z_eq != nil and len(z_eq["solutions"]) > 0 {
+            let zi = 0;
+            while zi < len(z_eq["solutions"]) {
+                let zs = z_eq["solutions"][zi];
+                let b_sub = simplify_node(subst_ast(B, _env1(p, zs["ast"])), nil);
+                let bv = eval_ast(b_sub, map{});
+                let c_asc = p + " = " + zs["ascii"];
+                let c_uni = p + " = " + zs["unicode"];
+                let c_ltx = to_latex(ast_sym(p)) + " = " + zs["latex"];
+                if bv != nil and _zero_lhs_holds_num(op, bv) {
+                    push(cases, map{
+                        "condition": c_asc,
+                        "condition_unicode": c_uni,
+                        "condition_latex": c_ltx,
+                        "regime": "indeterminate_always_true",
+                        "status": "indeterminate_always_true",
+                        "infinite_solutions": true,
+                        "solutions": "all_real_numbers",
+                        "ascii": target_v + " in (-inf, +inf)",
+                        "unicode": target_v + " ∈ ℝ",
+                        "latex": v_ltx + " \\in \\mathbb{R}",
+                        "interval_ascii": "(-inf, +inf)",
+                        "interval_unicode": "(-∞, +∞)",
+                        "interval_latex": "(-\\infty, +\\infty)"
+                    });
+                } else {
+                    push(cases, map{
+                        "condition": c_asc,
+                        "condition_unicode": c_uni,
+                        "condition_latex": c_ltx,
+                        "regime": "impossible_never_true",
+                        "status": "impossible_never_true",
+                        "infinite_solutions": false,
+                        "solutions": [],
+                        "ascii": "no solution",
+                        "unicode": "∅",
+                        "latex": "\\emptyset",
+                        "interval_ascii": "empty",
+                        "interval_unicode": "∅",
+                        "interval_latex": "\\emptyset"
+                    });
+                }
+                zi = zi + 1;
+            }
+        }
+        return cases;
+    }
+
+    // Multi-parameter linear inequality (e.g., `a*x <= b`)
+    let c_pos = ast_rel(">", A, RAT_ZERO);
+    let c_neg = ast_rel("<", A, RAT_ZERO);
+    let c_zero = ast_rel("=", A, RAT_ZERO);
+    push(cases, map{
+        "condition": to_ascii(c_pos),
+        "condition_unicode": to_unicode(c_pos),
+        "condition_latex": to_latex(c_pos),
+        "regime": "positive_lead_preserved",
+        "status": "unique_interval",
+        "direction_flipped": false,
+        "ascii": to_ascii(sol_pos_ast),
+        "unicode": to_unicode(sol_pos_ast),
+        "latex": to_latex(sol_pos_ast),
+        "solutions": to_ascii(sol_pos_ast),
+        "interval_ascii": ray_pos["ascii"],
+        "interval_unicode": ray_pos["unicode"],
+        "interval_latex": ray_pos["latex"]
+    });
+    push(cases, map{
+        "condition": to_ascii(c_neg),
+        "condition_unicode": to_unicode(c_neg),
+        "condition_latex": to_latex(c_neg),
+        "regime": "negative_lead_flipped",
+        "status": "unique_interval_flipped",
+        "direction_flipped": (op != "!="),
+        "ascii": to_ascii(sol_neg_ast),
+        "unicode": to_unicode(sol_neg_ast),
+        "latex": to_latex(sol_neg_ast),
+        "solutions": to_ascii(sol_neg_ast),
+        "interval_ascii": ray_neg["ascii"],
+        "interval_unicode": ray_neg["unicode"],
+        "interval_latex": ray_neg["latex"]
+    });
+    let b_const = eval_ast(B, map{});
+    if b_const != nil {
+        if _zero_lhs_holds_num(op, b_const) {
+            push(cases, map{
+                "condition": to_ascii(c_zero),
+                "condition_unicode": to_unicode(c_zero),
+                "condition_latex": to_latex(c_zero),
+                "regime": "indeterminate_always_true",
+                "status": "indeterminate_always_true",
+                "infinite_solutions": true,
+                "solutions": "all_real_numbers",
+                "interval_ascii": "(-inf, +inf)",
+                "interval_unicode": "(-∞, +∞)",
+                "interval_latex": "(-\\infty, +\\infty)"
+            });
+        } else {
+            push(cases, map{
+                "condition": to_ascii(c_zero),
+                "condition_unicode": to_unicode(c_zero),
+                "condition_latex": to_latex(c_zero),
+                "regime": "impossible_never_true",
+                "status": "impossible_never_true",
+                "infinite_solutions": false,
+                "solutions": [],
+                "interval_ascii": "empty",
+                "interval_unicode": "∅",
+                "interval_latex": "\\emptyset"
+            });
+        }
+    } else {
+        let bt_rel = ast_rel(b_true_op, B, RAT_ZERO);
+        let bf_rel = ast_rel(b_false_op, B, RAT_ZERO);
+        push(cases, map{
+            "condition": to_ascii(c_zero) + " and " + to_ascii(bt_rel),
+            "condition_unicode": to_unicode(c_zero) + " ∧ " + to_unicode(bt_rel),
+            "condition_latex": to_latex(c_zero) + " \\land " + to_latex(bt_rel),
+            "regime": "indeterminate_always_true",
+            "status": "indeterminate_always_true",
+            "infinite_solutions": true,
+            "solutions": "all_real_numbers",
+            "ascii": target_v + " in (-inf, +inf)",
+            "unicode": target_v + " ∈ ℝ",
+            "latex": v_ltx + " \\in \\mathbb{R}",
+            "interval_ascii": "(-inf, +inf)",
+            "interval_unicode": "(-∞, +∞)",
+            "interval_latex": "(-\\infty, +\\infty)"
+        });
+        push(cases, map{
+            "condition": to_ascii(c_zero) + " and " + to_ascii(bf_rel),
+            "condition_unicode": to_unicode(c_zero) + " ∧ " + to_unicode(bf_rel),
+            "condition_latex": to_latex(c_zero) + " \\land " + to_latex(bf_rel),
+            "regime": "impossible_never_true",
+            "status": "impossible_never_true",
+            "infinite_solutions": false,
+            "solutions": [],
+            "ascii": "no solution",
+            "unicode": "∅",
+            "latex": "\\emptyset",
+            "interval_ascii": "empty",
+            "interval_unicode": "∅",
+            "interval_latex": "\\emptyset"
+        });
+    }
+    return cases;
+}
+
+fn _solve_parametric_equation_full(lhs_in, rhs_in, target_v, param_vars, ctx) {
+    let diff_nd = to_rational_nd(ast_sub(lhs_in, rhs_in), ctx);
+    let od_i = 0;
+    while od_i < len(diff_nd["orig_dens"]) {
+        let den_d = simplify_node(diff_nd["orig_dens"][od_i], ctx);
+        if len(free_vars(den_d)) > 0 {
+            _add_guard(ctx, to_ascii(den_d) + " != 0");
+        }
+        od_i = od_i + 1;
+    }
+    let coeffs = _extract_poly_coeffs_in_var(diff_nd["num"], target_v, ctx);
+    let v_ltx = to_latex(ast_sym(target_v));
+
+    // Degree 0 in target_v: C0(params) = 0
+    if coeffs != nil and len(coeffs) == 1 {
+        let c0 = coeffs[0];
+        if is_zero_node(c0) {
+            let c_id = map{
+                "condition": "always",
+                "condition_unicode": "∀",
+                "condition_latex": "\\text{always}",
+                "regime": "indeterminate_identity",
+                "status": "indeterminate_identity",
+                "infinite_solutions": true,
+                "solutions": "all_real_numbers"
+            };
+            return map{
+                "ok": true,
+                "kind": "parametric_equation",
+                "status": "indeterminate_identity",
+                "infinite_solutions": true,
+                "var": target_v,
+                "parameters": param_vars,
+                "solutions": [],
+                "values": [],
+                "exact_solutions": [],
+                "complex_solutions": [],
+                "excluded_poles": [],
+                "rejected_extraneous": [],
+                "parametric_cases": [c_id],
+                "cases": [c_id],
+                "domain_guards": ctx["guards"],
+                "domain_guard": _guards_joined(ctx),
+                "steps": ctx["steps"]
+            };
+        }
+        let c_imp = map{
+            "condition": to_ascii(ast_rel("!=", c0, RAT_ZERO)),
+            "condition_unicode": to_unicode(ast_rel("!=", c0, RAT_ZERO)),
+            "condition_latex": to_latex(ast_rel("!=", c0, RAT_ZERO)),
+            "regime": "inconsistent_impossible",
+            "status": "inconsistent_impossible",
+            "infinite_solutions": false,
+            "solutions": []
+        };
+        let p_cases = [c_imp];
+        if len(free_vars(c0)) > 0 {
+            push(p_cases, map{
+                "condition": to_ascii(ast_rel("=", c0, RAT_ZERO)),
+                "condition_unicode": to_unicode(ast_rel("=", c0, RAT_ZERO)),
+                "condition_latex": to_latex(ast_rel("=", c0, RAT_ZERO)),
+                "regime": "indeterminate_identity",
+                "status": "indeterminate_identity",
+                "infinite_solutions": true,
+                "solutions": "all_real_numbers"
+            });
+        }
+        return map{
+            "ok": true,
+            "kind": "parametric_equation",
+            "status": "parametric_branched",
+            "var": target_v,
+            "parameters": param_vars,
+            "solutions": [],
+            "values": [],
+            "exact_solutions": [],
+            "complex_solutions": [],
+            "excluded_poles": [],
+            "rejected_extraneous": [],
+            "parametric_cases": p_cases,
+            "cases": p_cases,
+            "domain_guards": ctx["guards"],
+            "domain_guard": _guards_joined(ctx),
+            "steps": ctx["steps"]
+        };
+    }
+
+    // Degree 1 in target_v: A(p)*x + C0(p) = 0  <=>  A(p)*x = B(p)
+    if coeffs != nil and len(coeffs) == 2 {
+        let ab = _normalize_lead_pair(coeffs[1], simplify_node(ast_neg(coeffs[0]), ctx));
+        let A = ab[0];
+        let B = ab[1];
+        let q_sol = simplify_node(ast_div(B, A), nil);
+        let gen_sol = _make_real_sol(q_sol, nil);
+        let p_cases = [];
+
+        if len(free_vars(A)) == 0 {
+            // Leading coefficient A is a non-zero constant!
+            push(p_cases, map{
+                "condition": "always",
+                "condition_unicode": "∀",
+                "condition_latex": "\\text{always}",
+                "regime": "unique_solution",
+                "status": "unique_solution",
+                "solutions": [gen_sol["ascii"]],
+                "solution_ast": q_sol,
+                "ascii": target_v + " = " + gen_sol["ascii"],
+                "unicode": target_v + " = " + gen_sol["unicode"],
+                "latex": v_ltx + " = " + gen_sol["latex"]
+            });
+        } else if len(param_vars) == 1 {
+            let p = param_vars[0];
+            let p_ltx = to_latex(ast_sym(p));
+            _add_guard(ctx, to_ascii(A) + " != 0");
+            let a_eq = try _solve_single_eq(A, RAT_ZERO, p, _new_ctx(), 1) catch nil;
+            let a_roots = [];
+            if a_eq != nil { a_roots = a_eq["solutions"]; }
+
+            let neq_a_parts = [];
+            let neq_u_parts = [];
+            let neq_l_parts = [];
+            let ri = 0;
+            while ri < len(a_roots) {
+                let rs = a_roots[ri];
+                let b_at_r = simplify_node(subst_ast(B, _env1(p, rs["ast"])), nil);
+                let bv = eval_ast(b_at_r, map{});
+                let is_b_zero = is_zero_node(b_at_r) or (bv != nil and num_abs(bv) <= 1.0e-11);
+                let c_asc = p + " = " + rs["ascii"];
+                let c_uni = p + " = " + rs["unicode"];
+                let c_ltx = p_ltx + " = " + rs["latex"];
+                push(neq_a_parts, p + " != " + rs["ascii"]);
+                push(neq_u_parts, p + " ≠ " + rs["unicode"]);
+                push(neq_l_parts, p_ltx + " \\neq " + rs["latex"]);
+                if is_b_zero {
+                    push(p_cases, map{
+                        "condition": c_asc,
+                        "condition_unicode": c_uni,
+                        "condition_latex": c_ltx,
+                        "regime": "indeterminate_identity",
+                        "status": "indeterminate_identity",
+                        "infinite_solutions": true,
+                        "solutions": "all_real_numbers",
+                        "ascii": target_v + " in (-inf, +inf)",
+                        "unicode": target_v + " ∈ ℝ",
+                        "latex": v_ltx + " \\in \\mathbb{R}",
+                        "meaning_el": "Αόριστη εξίσωση (0·" + target_v + " = 0) — ταυτότητα για κάθε " + target_v + " ∈ ℝ"
+                    });
+                } else {
+                    push(p_cases, map{
+                        "condition": c_asc,
+                        "condition_unicode": c_uni,
+                        "condition_latex": c_ltx,
+                        "regime": "inconsistent_impossible",
+                        "status": "inconsistent_impossible",
+                        "infinite_solutions": false,
+                        "solutions": [],
+                        "ascii": "no solution",
+                        "unicode": "∅",
+                        "latex": "\\emptyset",
+                        "meaning_el": "Αδύνατη εξίσωση (0·" + target_v + " = " + to_unicode(b_at_r) + " ≠ 0) — καμία λύση"
+                    });
+                }
+                ri = ri + 1;
+            }
+
+            let gen_cond_a = to_ascii(A) + " != 0";
+            let gen_cond_u = to_unicode(A) + " ≠ 0";
+            let gen_cond_l = to_latex(A) + " \\neq 0";
+            if len(neq_a_parts) > 0 {
+                gen_cond_a = ""; gen_cond_u = ""; gen_cond_l = "";
+                let ni = 0;
+                while ni < len(neq_a_parts) {
+                    if ni > 0 {
+                        gen_cond_a = gen_cond_a + " and ";
+                        gen_cond_u = gen_cond_u + " ∧ ";
+                        gen_cond_l = gen_cond_l + " \\land ";
+                    }
+                    gen_cond_a = gen_cond_a + neq_a_parts[ni];
+                    gen_cond_u = gen_cond_u + neq_u_parts[ni];
+                    gen_cond_l = gen_cond_l + neq_l_parts[ni];
+                    ni = ni + 1;
+                }
+            } else if a_eq != nil and len(a_eq["complex_solutions"]) > 0 {
+                gen_cond_a = p + " in (-inf, +inf)";
+                gen_cond_u = p + " ∈ ℝ";
+                gen_cond_l = p_ltx + " \\in \\mathbb{R}";
+            }
+            push(p_cases, map{
+                "condition": gen_cond_a,
+                "condition_unicode": gen_cond_u,
+                "condition_latex": gen_cond_l,
+                "regime": "unique_solution",
+                "status": "unique_solution",
+                "solutions": [gen_sol["ascii"]],
+                "solution_ast": q_sol,
+                "ascii": target_v + " = " + gen_sol["ascii"],
+                "unicode": target_v + " = " + gen_sol["unicode"],
+                "latex": v_ltx + " = " + gen_sol["latex"],
+                "meaning_el": "Μοναδική λύση"
+            });
+        } else {
+            // Multi-parameter linear equation (e.g. a*x = b)
+            _add_guard(ctx, to_ascii(A) + " != 0");
+            let a_nz = ast_rel("!=", A, RAT_ZERO);
+            let a_z = ast_rel("=", A, RAT_ZERO);
+            push(p_cases, map{
+                "condition": to_ascii(a_nz),
+                "condition_unicode": to_unicode(a_nz),
+                "condition_latex": to_latex(a_nz),
+                "regime": "unique_solution",
+                "status": "unique_solution",
+                "solutions": [gen_sol["ascii"]],
+                "solution_ast": q_sol,
+                "ascii": target_v + " = " + gen_sol["ascii"],
+                "unicode": target_v + " = " + gen_sol["unicode"],
+                "latex": v_ltx + " = " + gen_sol["latex"]
+            });
+            if is_zero_node(B) {
+                push(p_cases, map{
+                    "condition": to_ascii(a_z),
+                    "condition_unicode": to_unicode(a_z),
+                    "condition_latex": to_latex(a_z),
+                    "regime": "indeterminate_identity",
+                    "status": "indeterminate_identity",
+                    "infinite_solutions": true,
+                    "solutions": "all_real_numbers"
+                });
+            } else if len(free_vars(B)) == 0 {
+                push(p_cases, map{
+                    "condition": to_ascii(a_z),
+                    "condition_unicode": to_unicode(a_z),
+                    "condition_latex": to_latex(a_z),
+                    "regime": "inconsistent_impossible",
+                    "status": "inconsistent_impossible",
+                    "infinite_solutions": false,
+                    "solutions": []
+                });
+            } else {
+                let b_z = ast_rel("=", B, RAT_ZERO);
+                let b_nz = ast_rel("!=", B, RAT_ZERO);
+                push(p_cases, map{
+                    "condition": to_ascii(a_z) + " and " + to_ascii(b_z),
+                    "condition_unicode": to_unicode(a_z) + " ∧ " + to_unicode(b_z),
+                    "condition_latex": to_latex(a_z) + " \\land " + to_latex(b_z),
+                    "regime": "indeterminate_identity",
+                    "status": "indeterminate_identity",
+                    "infinite_solutions": true,
+                    "solutions": "all_real_numbers"
+                });
+                push(p_cases, map{
+                    "condition": to_ascii(a_z) + " and " + to_ascii(b_nz),
+                    "condition_unicode": to_unicode(a_z) + " ∧ " + to_unicode(b_nz),
+                    "condition_latex": to_latex(a_z) + " \\land " + to_latex(b_nz),
+                    "regime": "inconsistent_impossible",
+                    "status": "inconsistent_impossible",
+                    "infinite_solutions": false,
+                    "solutions": []
+                });
+            }
+        }
+
+        _record_step(ctx, "parametric_linear_case_split", ast_rel("=", ast_sym(target_v), q_sol));
+        return map{
+            "ok": true,
+            "kind": "parametric_equation",
+            "status": "parametric_branched",
+            "degree": 1,
+            "var": target_v,
+            "parameters": param_vars,
+            "solutions": [gen_sol],
+            "values": [],
+            "exact_solutions": [gen_sol["exact"]],
+            "rhs_ascii": gen_sol["ascii"],
+            "rhs_unicode": gen_sol["unicode"],
+            "rhs_latex": gen_sol["latex"],
+            "complex_solutions": [],
+            "excluded_poles": [],
+            "rejected_extraneous": [],
+            "parametric_cases": p_cases,
+            "cases": p_cases,
+            "domain_guards": ctx["guards"],
+            "domain_guard": _guards_joined(ctx),
+            "steps": ctx["steps"]
+        };
+    }
+
+    // Degree 2 in target_v: A(p)*x^2 + B(p)*x + C(p) = 0
+    if coeffs != nil and len(coeffs) == 3 {
+        let A = coeffs[2];
+        let B = coeffs[1];
+        let C = coeffs[0];
+        let disc = simplify_node(_expand_node(ast_sub(ast_pow(B, RAT_TWO), ast_mul([rat(4, 1), A, C])), ctx), ctx);
+        let neg_b = simplify_node(ast_neg(B), ctx);
+        let two_a = simplify_node(ast_mul([RAT_TWO, A]), ctx);
+        let x_dbl_gen = simplify_node(ast_div(neg_b, two_a), nil);
+        let r_minus = simplify_node(ast_div(ast_sub(neg_b, ast_call("sqrt", [disc])), two_a), nil);
+        let r_plus = simplify_node(ast_div(ast_add([neg_b, ast_call("sqrt", [disc])]), two_a), nil);
+        let neg_disc = simplify_node(ast_neg(disc), nil);
+        let c_minus_str = "(" + to_ascii(neg_b) + " - i*sqrt(" + to_ascii(neg_disc) + "))/(" + to_ascii(two_a) + ")";
+        let c_plus_str = "(" + to_ascii(neg_b) + " + i*sqrt(" + to_ascii(neg_disc) + "))/(" + to_ascii(two_a) + ")";
+        if is_zero_node(neg_b) {
+            c_minus_str = "-i*sqrt(" + to_ascii(neg_disc) + ")/(" + to_ascii(two_a) + ")";
+            c_plus_str = "i*sqrt(" + to_ascii(neg_disc) + ")/(" + to_ascii(two_a) + ")";
+        }
+
+        let p_cases = [];
+        if len(param_vars) == 1 {
+            let p = param_vars[0];
+            let p_ltx = to_latex(ast_sym(p));
+            let a_deg_vals = [];
+
+            // 1. Linear degeneration A(p) = 0
+            if len(free_vars(A)) > 0 {
+                let a_eq = try _solve_single_eq(A, RAT_ZERO, p, _new_ctx(), 1) catch nil;
+                if a_eq != nil {
+                    let ai = 0;
+                    while ai < len(a_eq["solutions"]) {
+                        let asol = a_eq["solutions"][ai];
+                        if asol["value"] != nil { push(a_deg_vals, asol["value"]); }
+                        let b_sub = simplify_node(subst_ast(B, _env1(p, asol["ast"])), nil);
+                        let c_sub = simplify_node(subst_ast(C, _env1(p, asol["ast"])), nil);
+                        let c_asc = p + " = " + asol["ascii"];
+                        let c_uni = p + " = " + asol["unicode"];
+                        let c_ltx = p_ltx + " = " + asol["latex"];
+                        if is_zero_node(b_sub) and is_zero_node(c_sub) {
+                            push(p_cases, map{
+                                "condition": c_asc,
+                                "condition_unicode": c_uni,
+                                "condition_latex": c_ltx,
+                                "regime": "indeterminate_identity",
+                                "status": "indeterminate_identity",
+                                "infinite_solutions": true,
+                                "solutions": "all_real_numbers"
+                            });
+                        } else if is_zero_node(b_sub) {
+                            push(p_cases, map{
+                                "condition": c_asc,
+                                "condition_unicode": c_uni,
+                                "condition_latex": c_ltx,
+                                "regime": "inconsistent_impossible",
+                                "status": "inconsistent_impossible",
+                                "infinite_solutions": false,
+                                "solutions": []
+                            });
+                        } else {
+                            let lin_x = simplify_node(ast_div(ast_neg(c_sub), b_sub), nil);
+                            push(p_cases, map{
+                                "condition": c_asc,
+                                "condition_unicode": c_uni,
+                                "condition_latex": c_ltx,
+                                "regime": "linear_degeneration",
+                                "status": "linear_degeneration",
+                                "degree": 1,
+                                "solutions": [to_ascii(lin_x)],
+                                "solution_ast": lin_x,
+                                "ascii": target_v + " = " + to_ascii(lin_x),
+                                "unicode": target_v + " = " + to_unicode(lin_x),
+                                "latex": v_ltx + " = " + to_latex(lin_x),
+                                "meaning_el": "Εκφυλισμός σε πρωτοβάθμια εξίσωση — μοναδική πραγματική ρίζα"
+                            });
+                        }
+                        ai = ai + 1;
+                    }
+                }
+            }
+
+            // Non-zero leading mask A(p) != 0
+            let a_nz_ivs = nil;
+            if len(free_vars(A)) > 0 {
+                let anz = try _solve_single_inequality(ast_rel("!=", A, RAT_ZERO), p, _new_ctx()) catch nil;
+                if anz != nil { a_nz_ivs = anz["intervals"]; }
+            }
+
+            // 2. Discriminant Delta(p) = 0 -> Double real root
+            if is_zero_node(disc) {
+                let dbl_cond = map{ "ascii": p + " in (-inf, +inf)", "unicode": p + " ∈ ℝ", "latex": p_ltx + " \\in \\mathbb{R}" };
+                if a_nz_ivs != nil {
+                    let c_tmp = _intervals_to_param_cond(a_nz_ivs, p);
+                    if c_tmp != nil { dbl_cond = c_tmp; }
+                }
+                push(p_cases, map{
+                    "condition": dbl_cond["ascii"],
+                    "condition_unicode": dbl_cond["unicode"],
+                    "condition_latex": dbl_cond["latex"],
+                    "regime": "double_real_root",
+                    "status": "double_real_root",
+                    "multiplicity": 2,
+                    "solutions": [to_ascii(x_dbl_gen)],
+                    "ascii": target_v + " = " + to_ascii(x_dbl_gen),
+                    "unicode": target_v + " = " + to_unicode(x_dbl_gen),
+                    "latex": v_ltx + " = " + to_latex(x_dbl_gen)
+                });
+            } else {
+                let d_eq = try _solve_single_eq(disc, RAT_ZERO, p, _new_ctx(), 1) catch nil;
+                if d_eq != nil {
+                    let di = 0;
+                    while di < len(d_eq["solutions"]) {
+                        let dsol = d_eq["solutions"][di];
+                        let collides_a = false;
+                        if dsol["value"] != nil {
+                            let k = 0;
+                            while k < len(a_deg_vals) {
+                                if num_abs(dsol["value"] - a_deg_vals[k]) <= 1.0e-10 { collides_a = true; }
+                                k = k + 1;
+                            }
+                        }
+                        if not collides_a {
+                            let dbl_sub = simplify_node(subst_ast(x_dbl_gen, _env1(p, dsol["ast"])), nil);
+                            push(p_cases, map{
+                                "condition": p + " = " + dsol["ascii"],
+                                "condition_unicode": p + " = " + dsol["unicode"],
+                                "condition_latex": p_ltx + " = " + dsol["latex"],
+                                "regime": "double_real_root",
+                                "status": "double_real_root",
+                                "multiplicity": 2,
+                                "solutions": [to_ascii(dbl_sub)],
+                                "solution_ast": dbl_sub,
+                                "ascii": target_v + " = " + to_ascii(dbl_sub),
+                                "unicode": target_v + " = " + to_unicode(dbl_sub),
+                                "latex": v_ltx + " = " + to_latex(dbl_sub),
+                                "meaning_el": "Διπλή πραγματική ρίζα (Δ = 0)"
+                            });
+                        }
+                        di = di + 1;
+                    }
+                }
+
+                // 3. Discriminant Delta(p) > 0 and A(p) != 0 -> Two distinct real roots
+                let d_pos = try _solve_single_inequality(ast_rel(">", disc, RAT_ZERO), p, _new_ctx()) catch nil;
+                if d_pos != nil {
+                    let pos_ivs = d_pos["intervals"];
+                    if a_nz_ivs != nil { pos_ivs = interval_set_intersect(pos_ivs, a_nz_ivs); }
+                    if len(pos_ivs) > 0 {
+                        let pc = _intervals_to_param_cond(pos_ivs, p);
+                        push(p_cases, map{
+                            "condition": pc["ascii"],
+                            "condition_unicode": pc["unicode"],
+                            "condition_latex": pc["latex"],
+                            "interval_unicode": _format_intervals(pos_ivs, "unicode"),
+                            "regime": "two_distinct_real_roots",
+                            "status": "two_distinct_real_roots",
+                            "solutions": [to_ascii(r_minus), to_ascii(r_plus)],
+                            "ascii": target_v + " = " + to_ascii(r_minus) + ", " + to_ascii(r_plus),
+                            "unicode": target_v + " = " + to_unicode(r_minus) + ", " + to_unicode(r_plus),
+                            "latex": v_ltx + " = " + to_latex(r_minus) + ", " + to_latex(r_plus),
+                            "meaning_el": "Δύο άνισες πραγματικές ρίζες (Δ > 0)"
+                        });
+                    }
+                }
+
+                // 4. Discriminant Delta(p) < 0 and A(p) != 0 -> Complex conjugate roots
+                let d_neg = try _solve_single_inequality(ast_rel("<", disc, RAT_ZERO), p, _new_ctx()) catch nil;
+                if d_neg != nil {
+                    let neg_ivs = d_neg["intervals"];
+                    if a_nz_ivs != nil { neg_ivs = interval_set_intersect(neg_ivs, a_nz_ivs); }
+                    if len(neg_ivs) > 0 {
+                        let nc = _intervals_to_param_cond(neg_ivs, p);
+                        push(p_cases, map{
+                            "condition": nc["ascii"],
+                            "condition_unicode": nc["unicode"],
+                            "condition_latex": nc["latex"],
+                            "interval_unicode": _format_intervals(neg_ivs, "unicode"),
+                            "regime": "complex_conjugate_roots",
+                            "status": "complex_conjugate_roots",
+                            "real_solutions": [],
+                            "solutions": [],
+                            "complex_solutions": [c_minus_str, c_plus_str],
+                            "meaning_el": "Δύο συζυγείς μιγαδικές ρίζες / καμία πραγματική ρίζα (Δ < 0)"
+                        });
+                    }
+                }
+            }
+        } else {
+            // Multi-parameter quadratic equation (e.g. a*x^2 + b*x + c = 0)
+            if len(free_vars(A)) > 0 {
+                push(p_cases, map{
+                    "condition": to_ascii(A) + " = 0 and " + to_ascii(B) + " != 0",
+                    "regime": "linear_degeneration",
+                    "status": "linear_degeneration",
+                    "solutions": [to_ascii(simplify_node(ast_div(ast_neg(C), B), nil))]
+                });
+            }
+            let a_guard = "";
+            if len(free_vars(A)) > 0 { a_guard = to_ascii(A) + " != 0 and "; }
+            push(p_cases, map{
+                "condition": a_guard + to_ascii(disc) + " = 0",
+                "regime": "double_real_root",
+                "status": "double_real_root",
+                "multiplicity": 2,
+                "solutions": [to_ascii(x_dbl_gen)]
+            });
+            push(p_cases, map{
+                "condition": a_guard + to_ascii(disc) + " > 0",
+                "regime": "two_distinct_real_roots",
+                "status": "two_distinct_real_roots",
+                "solutions": [to_ascii(r_minus), to_ascii(r_plus)]
+            });
+            push(p_cases, map{
+                "condition": a_guard + to_ascii(disc) + " < 0",
+                "regime": "complex_conjugate_roots",
+                "status": "complex_conjugate_roots",
+                "real_solutions": [],
+                "solutions": [],
+                "complex_solutions": [c_minus_str, c_plus_str]
+            });
+        }
+
+        let s1 = _make_real_sol(r_minus, nil);
+        let s2 = _make_real_sol(r_plus, nil);
+        _record_step(ctx, "parametric_quadratic_discriminant_analysis", disc);
+        return map{
+            "ok": true,
+            "kind": "parametric_equation",
+            "status": "parametric_branched",
+            "degree": 2,
+            "var": target_v,
+            "parameters": param_vars,
+            "discriminant": to_ascii(disc),
+            "discriminant_unicode": to_unicode(disc),
+            "discriminant_latex": to_latex(disc),
+            "solutions": [s1, s2],
+            "values": [],
+            "exact_solutions": [s1["exact"], s2["exact"]],
+            "rhs_ascii": s1["ascii"] + ", " + s2["ascii"],
+            "rhs_unicode": s1["unicode"] + ", " + s2["unicode"],
+            "rhs_latex": s1["latex"] + ", " + s2["latex"],
+            "complex_solutions": [],
+            "excluded_poles": [],
+            "rejected_extraneous": [],
+            "parametric_cases": p_cases,
+            "cases": p_cases,
+            "domain_guards": ctx["guards"],
+            "domain_guard": _guards_joined(ctx),
+            "steps": ctx["steps"]
+        };
+    }
+
+    // Fallback for nonlinear / transcendental parametric formulas solvable via _isolate_var
+    let iso_rel = try _isolate_var(ast_rel("=", lhs_in, rhs_in), target_v, ctx) catch nil;
+    if iso_rel != nil {
+        let sol_n = _make_real_sol(iso_rel["rhs"], nil);
+        let g_cond = _guards_joined(ctx);
+        if g_cond == nil or g_cond == "" { g_cond = "domain_valid"; }
+        let fb_case = map{
+            "condition": g_cond,
+            "regime": "unique_solution",
+            "status": "unique_solution",
+            "solutions": [sol_n["ascii"]],
+            "ascii": target_v + " = " + sol_n["ascii"],
+            "unicode": target_v + " = " + sol_n["unicode"],
+            "latex": v_ltx + " = " + sol_n["latex"]
+        };
+        return map{
+            "ok": true,
+            "kind": "parametric_equation",
+            "status": "parametric_branched",
+            "var": target_v,
+            "parameters": param_vars,
+            "solutions": [sol_n],
+            "values": [],
+            "exact_solutions": [sol_n["exact"]],
+            "rhs_ascii": sol_n["ascii"],
+            "rhs_unicode": sol_n["unicode"],
+            "rhs_latex": sol_n["latex"],
+            "complex_solutions": [],
+            "excluded_poles": [],
+            "rejected_extraneous": [],
+            "parametric_cases": [fb_case],
+            "cases": [fb_case],
+            "domain_guards": ctx["guards"],
+            "domain_guard": _guards_joined(ctx),
+            "steps": ctx["steps"]
+        };
+    }
+    return nil;
+}
+
 // Public Universal Solver (`solve(input, vars = nil, opts = nil)`)
 fn solve(input, vars = nil, opts = nil) {
     if opts == nil { opts = map{}; }
@@ -7485,41 +8971,56 @@ fn solve(input, vars = nil, opts = nil) {
         };
     }
 
-    // Determine single target variable
+    // Determine single target variable & auxiliary symbolic parameters
+    let all_fvs = free_vars(parsed);
     let target_v = nil;
     if type(vars) == "string" and vars != "" { target_v = vars; }
     else if type(vars) == "array" and len(vars) > 0 { target_v = vars[0]; }
     else if map_has(opts, "var") { target_v = opts["var"]; }
     else {
-        let fvs = free_vars(parsed);
-        if len(fvs) == 1 { target_v = fvs[0]; }
-        else if len(fvs) > 1 {
-            // Prefer "x" if present, else first variable
-            let j = 0;
-            while j < len(fvs) {
-                if fvs[j] == "x" { target_v = "x"; break; }
-                j = j + 1;
+        if len(all_fvs) == 1 { target_v = all_fvs[0]; }
+        else if len(all_fvs) > 1 {
+            // Prefer canonical unknown ("x", "y", "z", "t") when solving parametrically
+            let pref = ["x", "y", "z", "t"];
+            let pi = 0;
+            while pi < len(pref) and target_v == nil {
+                let j = 0;
+                while j < len(all_fvs) {
+                    if all_fvs[j] == pref[pi] { target_v = pref[pi]; break; }
+                    j = j + 1;
+                }
+                pi = pi + 1;
             }
-            if target_v == nil { target_v = fvs[0]; }
+            if target_v == nil { target_v = all_fvs[0]; }
         } else {
             target_v = "x";
         }
     }
+    let param_vars = [];
+    let pvi = 0;
+    while pvi < len(all_fvs) {
+        if all_fvs[pvi] != target_v { push(param_vars, all_fvs[pvi]); }
+        pvi = pvi + 1;
+    }
+    param_vars = _sort_strings(param_vars);
 
     // 3. Single Inequality (`<`, `<=`, `>`, `>=`, `!=`)
     if parsed["kind"] == "rel" and parsed["op"] != "=" {
-        // Check if symbolic parameters exist in inequality -> isolate!
-        let fvs_all = free_vars(parsed);
-        if len(fvs_all) > 1 {
-            let iso = _isolate_var(parsed, target_v, ctx);
+        if len(param_vars) > 0 {
+            let p_cases = _solve_parametric_inequality_cases(parsed, target_v, param_vars, ctx);
+            let iso = try _isolate_var(parsed, target_v, ctx) catch parsed;
             return map{
                 "ok": true,
                 "kind": "parametric_inequality",
+                "status": "parametric_branched",
                 "var": target_v,
+                "parameters": param_vars,
                 "ast": iso,
                 "ascii": to_ascii(iso),
                 "unicode": to_unicode(iso),
                 "latex": to_latex(iso),
+                "parametric_cases": p_cases,
+                "cases": p_cases,
                 "domain_guard": _guards_joined(ctx),
                 "steps": ctx["steps"]
             };
@@ -7527,13 +9028,20 @@ fn solve(input, vars = nil, opts = nil) {
         return _solve_single_inequality(parsed, target_v, ctx);
     }
 
-    // 4. Single-Variable (or Parametric) Equation
+    // 4. Single-Variable or Parametric Equation
     let lhs_e = parsed;
     let rhs_e = RAT_ZERO;
     if parsed["kind"] == "rel" {
         lhs_e = parsed["lhs"];
         rhs_e = parsed["rhs"];
     }
+    if len(param_vars) > 0 {
+        let param_res = _solve_parametric_equation_full(lhs_e, rhs_e, target_v, param_vars, ctx);
+        if param_res != nil {
+            return param_res;
+        }
+    }
+
     let eq_res = _solve_single_eq(lhs_e, rhs_e, target_v, ctx, 0);
     let sols = eq_res["solutions"];
     let vals = [];
@@ -7548,6 +9056,8 @@ fn solve(input, vars = nil, opts = nil) {
     let out = map{
         "ok": true,
         "kind": "equation",
+        "status": "solved",
+        "infinite_solutions": false,
         "var": target_v,
         "solutions": sols,
         "values": vals,
@@ -7571,9 +9081,416 @@ fn solve(input, vars = nil, opts = nil) {
         out["general_families"] = eq_res["general_families"];
     }
     if map_has(eq_res, "identity") and eq_res["identity"] {
-        out["status"] = "all_reals";
+        out["status"] = "indeterminate_identity";
+        out["solution_set"] = "all_reals";
+        out["infinite_solutions"] = true;
+        out["interval_ascii"] = "(-inf, +inf)";
+        out["interval_unicode"] = "(-∞, +∞)";
+        out["interval_latex"] = "(-\\infty, +\\infty)";
+        out["meaning_el"] = "Αόριστη εξίσωση / Ταυτότητα — αληθεύει για κάθε πραγματικό αριθμό";
+    } else if len(sols) == 0 and len(eq_res["complex_solutions"]) == 0 and not (map_has(eq_res, "is_trig") and eq_res["is_trig"]) {
+        out["status"] = "inconsistent_impossible";
+        out["infinite_solutions"] = false;
+        out["meaning_el"] = "Αδύνατη εξίσωση — καμία λύση";
     }
     return out;
+}
+
+// Explicit Parametric Branching Entrypoint (`solve_parametric(input, vars = nil, opts = nil)`)
+fn solve_parametric(input, vars = nil, opts = nil) {
+    let res = solve(input, vars, opts);
+    if not map_has(res, "parametric_cases") {
+        let syn_cases = [];
+        if map_has(res, "status") and res["status"] == "indeterminate_identity" {
+            push(syn_cases, map{
+                "condition": "always",
+                "regime": "indeterminate_identity",
+                "status": "indeterminate_identity",
+                "infinite_solutions": true,
+                "solutions": "all_real_numbers"
+            });
+        } else if map_has(res, "status") and res["status"] == "inconsistent_impossible" {
+            push(syn_cases, map{
+                "condition": "always",
+                "regime": "inconsistent_impossible",
+                "status": "inconsistent_impossible",
+                "infinite_solutions": false,
+                "solutions": []
+            });
+        } else if map_has(res, "exact_solutions") {
+            push(syn_cases, map{
+                "condition": "always",
+                "regime": "solved",
+                "status": "solved",
+                "solutions": res["exact_solutions"]
+            });
+        }
+        res["parametric_cases"] = syn_cases;
+        res["cases"] = syn_cases;
+    }
+    return res;
+}
+
+// ── Guarded Algebraic Indeterminacy Classifier (`analyze_indeterminacy`) ──────
+
+fn _classify_tendency_seq(v1, v2, v3) {
+    if v3 == nil or v3 != v3 { return map{ "kind": "undef", "label": "undefined" }; }
+    if v3 > 1.0e150 { return map{ "kind": "+inf", "label": "+inf", "sign": 1 }; }
+    if v3 < -1.0e150 { return map{ "kind": "-inf", "label": "-inf", "sign": -1 }; }
+    if v1 == nil or v2 == nil or v1 != v1 or v2 != v2 {
+        if v3 > 1.0e7 { return map{ "kind": "+inf", "label": "+inf", "sign": 1 }; }
+        if v3 < -1.0e7 { return map{ "kind": "-inf", "label": "-inf", "sign": -1 }; }
+        if num_abs(v3) < 1.0e-5 { return map{ "kind": "zero", "val": 0.0, "label": 0 }; }
+        if num_abs(v3 - 1.0) < 1.0e-5 { return map{ "kind": "one", "val": 1.0, "label": 1 }; }
+        return map{ "kind": "finite", "val": v3, "label": v3 };
+    }
+    let d1 = v2 - v1;
+    let d2 = v3 - v2;
+    let ad1 = num_abs(d1);
+    let ad2 = num_abs(d2);
+
+    // 1. Divergence to ±infinity (covers fast power/pole/exp growth AND logarithmic growth!)
+    let fast_div = (num_abs(v3) > 500.0 and num_abs(v3) > 4.0 * num_abs(v2) and num_abs(v2) > 4.0 * num_abs(v1));
+    let log_div = (num_abs(v3) > 5.0 and d1 * d2 > 0.0 and ad1 > 0.15 and ad2 >= 0.70 * ad1);
+    if fast_div or log_div {
+        if v3 > 0.0 { return map{ "kind": "+inf", "label": "+inf", "sign": 1 }; }
+        return map{ "kind": "-inf", "label": "-inf", "sign": -1 };
+    }
+
+    // 2. Convergence to zero (covers polynomial, radical, and 1/ln(x) decay)
+    if (num_abs(v3) < 1.0e-6 and ad2 < 1.0e-5)
+        or (num_abs(v3) < 0.08 and num_abs(v3) < 0.80 * num_abs(v2) and num_abs(v2) < 0.80 * num_abs(v1)) {
+        return map{ "kind": "zero", "val": 0.0, "label": 0 };
+    }
+
+    // 3. Convergence to finite non-zero limit
+    let snapped = num_round(v3);
+    if num_abs(v3 - snapped) < 1.0e-4 and (ad2 < 1.0e-4 or num_abs(v3 - snapped) <= 0.25 * num_abs(v2 - snapped) + 1.0e-12) {
+        if snapped == 0 { return map{ "kind": "zero", "val": 0.0, "label": 0 }; }
+        if snapped == 1 { return map{ "kind": "one", "val": 1.0, "label": 1 }; }
+        return map{ "kind": "finite", "val": snapped * 1.0, "label": snapped };
+    }
+    return map{ "kind": "finite", "val": v3, "label": v3 };
+}
+
+fn _eval_tendency_pts(node, v_name, pts, base_env) {
+    if v_name == nil or pts == nil or len(pts) == 0 {
+        let v0 = eval_ast(node, base_env);
+        return _classify_tendency_seq(v0, v0, v0);
+    }
+    let e1 = map{}; let e2 = map{}; let e3 = map{};
+    let ks = map_keys(base_env);
+    let i = 0;
+    while i < len(ks) {
+        e1[ks[i]] = base_env[ks[i]];
+        e2[ks[i]] = base_env[ks[i]];
+        e3[ks[i]] = base_env[ks[i]];
+        i = i + 1;
+    }
+    e1[v_name] = pts[0];
+    e2[v_name] = pts[1];
+    e3[v_name] = pts[2];
+    let v1 = eval_ast(node, e1);
+    let v2 = eval_ast(node, e2);
+    let v3 = eval_ast(node, e3);
+    return _classify_tendency_seq(v1, v2, v3);
+}
+
+fn _is_inf_tend(t) {
+    return t != nil and (t["kind"] == "+inf" or t["kind"] == "-inf");
+}
+
+fn _indet_metadata(form_str) {
+    if form_str == "0/0" {
+        return map{
+            "lattice_form": "0/0",
+            "meaning_el": "Απροσδιόριστη μορφή 0/0 (μηδέν διά μηδέν)",
+            "meaning_en": "Indeterminate form 0/0",
+            "suggested_resolution": "factor_cancel_or_lhopital_or_taylor"
+        };
+    }
+    if form_str == "inf/inf" {
+        return map{
+            "lattice_form": "inf/inf",
+            "meaning_el": "Απροσδιόριστη μορφή ∞/∞ (άπειρο διά άπειρο)",
+            "meaning_en": "Indeterminate form inf/inf",
+            "suggested_resolution": "dominant_term_extraction_or_lhopital"
+        };
+    }
+    if form_str == "0 * inf" {
+        return map{
+            "lattice_form": "0*inf",
+            "meaning_el": "Απροσδιόριστη μορφή 0·∞ (μηδέν επί άπειρο)",
+            "meaning_en": "Indeterminate form 0 * inf",
+            "suggested_resolution": "rewrite_as_quotient_0_over_0_or_inf_over_inf"
+        };
+    }
+    if form_str == "inf - inf" {
+        return map{
+            "lattice_form": "inf-inf",
+            "meaning_el": "Απροσδιόριστη μορφή ∞ - ∞ (διαφορά απείρων)",
+            "meaning_en": "Indeterminate form inf - inf",
+            "suggested_resolution": "common_denominator_or_algebraic_conjugate"
+        };
+    }
+    if form_str == "0^0" {
+        return map{
+            "lattice_form": "0^0",
+            "meaning_el": "Απροσδιόριστη εκθετική μορφή 0⁰ (στην ανάλυση· στην άλγεβρα/συνδυαστική ισούται με 1)",
+            "meaning_en": "Analytic indeterminate exponential form 0^0 (1 in combinatorial/polynomial algebra)",
+            "suggested_resolution": "logarithmic_transform_exp_g_ln_f"
+        };
+    }
+    if form_str == "1^inf" {
+        return map{
+            "lattice_form": "1^inf",
+            "meaning_el": "Απροσδιόριστη εκθετική μορφή 1^∞ (τύπου Euler)",
+            "meaning_en": "Indeterminate exponential form 1^inf",
+            "suggested_resolution": "logarithmic_transform_exp_lim_g_times_f_minus_1"
+        };
+    }
+    if form_str == "inf^0" {
+        return map{
+            "lattice_form": "inf^0",
+            "meaning_el": "Απροσδιόριστη εκθετική μορφή ∞⁰",
+            "meaning_en": "Indeterminate exponential form inf^0",
+            "suggested_resolution": "logarithmic_transform_exp_g_ln_f"
+        };
+    }
+    return map{
+        "lattice_form": form_str,
+        "meaning_el": "Μαθηματική έκφραση",
+        "meaning_en": "Mathematical expression",
+        "suggested_resolution": "direct_evaluation"
+    };
+}
+
+fn _classify_ast_on_pts(raw_ast, v_name, pts, base_env) {
+    if raw_ast == nil or type(raw_ast) != "map" { return nil; }
+    let k = raw_ast["kind"];
+
+    if k == "div" {
+        let tn = _eval_tendency_pts(raw_ast["num"], v_name, pts, base_env);
+        let td = _eval_tendency_pts(raw_ast["den"], v_name, pts, base_env);
+        if tn["kind"] == "zero" and td["kind"] == "zero" {
+            return map{ "indeterminate": true, "form": "0/0", "num_t": tn, "den_t": td };
+        }
+        if _is_inf_tend(tn) and _is_inf_tend(td) {
+            return map{ "indeterminate": true, "form": "inf/inf", "num_t": tn, "den_t": td };
+        }
+        if td["kind"] == "zero" and tn["kind"] != "undef" and tn["kind"] != "zero" {
+            return map{ "indeterminate": false, "form": "pole_singularity", "num_t": tn, "den_t": td };
+        }
+    }
+
+    if k == "pow" {
+        let tb = _eval_tendency_pts(raw_ast["base"], v_name, pts, base_env);
+        let te = _eval_tendency_pts(raw_ast["exp"], v_name, pts, base_env);
+        if tb["kind"] == "zero" and te["kind"] == "zero" {
+            return map{ "indeterminate": true, "form": "0^0", "base_t": tb, "exp_t": te };
+        }
+        if tb["kind"] == "one" and _is_inf_tend(te) {
+            return map{ "indeterminate": true, "form": "1^inf", "base_t": tb, "exp_t": te };
+        }
+        if _is_inf_tend(tb) and te["kind"] == "zero" {
+            return map{ "indeterminate": true, "form": "inf^0", "base_t": tb, "exp_t": te };
+        }
+    }
+
+    if k == "mul" {
+        let has_z = false;
+        let has_inf = false;
+        let i = 0;
+        while i < len(raw_ast["args"]) {
+            let ti = _eval_tendency_pts(raw_ast["args"][i], v_name, pts, base_env);
+            if ti["kind"] == "zero" { has_z = true; }
+            if _is_inf_tend(ti) { has_inf = true; }
+            i = i + 1;
+        }
+        if has_z and has_inf {
+            return map{ "indeterminate": true, "form": "0 * inf" };
+        }
+    }
+
+    if k == "add" or k == "sub" {
+        let terms = [];
+        if k == "sub" { terms = [raw_ast["left"], ast_neg(raw_ast["right"])]; }
+        else { terms = raw_ast["args"]; }
+        let has_pinf = false;
+        let has_ninf = false;
+        let i = 0;
+        while i < len(terms) {
+            let ti = _eval_tendency_pts(terms[i], v_name, pts, base_env);
+            if ti["kind"] == "+inf" { has_pinf = true; }
+            if ti["kind"] == "-inf" { has_ninf = true; }
+            i = i + 1;
+        }
+        if has_pinf and has_ninf {
+            return map{ "indeterminate": true, "form": "inf - inf" };
+        }
+    }
+
+    return nil;
+}
+
+fn analyze_indeterminacy(expr_str, env = nil) {
+    let raw_ast = parse_math(expr_str);
+    let expr_ascii = to_ascii(raw_ast);
+    let fvs = free_vars(raw_ast);
+
+    let v_name = nil;
+    let target_mode = "static"; // "static" | "finite" | "+inf" | "-inf"
+    let x0 = 0.0;
+    let target_label = nil;
+    let base_env = map{};
+
+    if env != nil and type(env) == "map" {
+        let ks = map_keys(env);
+        if len(ks) > 0 {
+            v_name = ks[0];
+            let tv = env[v_name];
+            let ki = 1;
+            while ki < len(ks) {
+                if type(env[ks[ki]]) == "number" or type(env[ks[ki]]) == "bigint" {
+                    base_env[ks[ki]] = env[ks[ki]] * 1.0;
+                }
+                ki = ki + 1;
+            }
+            if type(tv) == "string" {
+                let ts = str_lower(str_trim(tv));
+                if ts == "inf" or ts == "+inf" or ts == "infinity" or ts == "+infinity" or ts == "∞" or ts == "+∞" {
+                    target_mode = "+inf";
+                    target_label = "+inf";
+                } else if ts == "-inf" or ts == "-infinity" or ts == "-∞" {
+                    target_mode = "-inf";
+                    target_label = "-inf";
+                } else {
+                    let parsed_tv = eval_ast(parse_math(tv), map{});
+                    x0 = 0.0;
+                    if parsed_tv != nil { x0 = parsed_tv * 1.0; }
+                    target_mode = "finite";
+                    target_label = x0;
+                }
+            } else if type(tv) == "number" or type(tv) == "bigint" {
+                x0 = tv * 1.0;
+                target_mode = "finite";
+                target_label = tv;
+            }
+        }
+    } else if env != nil and (type(env) == "number" or type(env) == "bigint") {
+        if len(fvs) > 0 { v_name = fvs[0]; } else { v_name = "x"; }
+        x0 = env * 1.0;
+        target_mode = "finite";
+        target_label = env;
+    } else {
+        // Auto-detect literal `inf` symbol (e.g. "1^inf", "inf - inf", "0 * inf") or default x -> 0
+        let has_inf_sym = false;
+        let i = 0;
+        while i < len(fvs) {
+            if fvs[i] == "inf" { has_inf_sym = true; }
+            i = i + 1;
+        }
+        if has_inf_sym {
+            v_name = "inf";
+            target_mode = "+inf";
+            target_label = "+inf";
+        } else if len(fvs) > 0 {
+            v_name = fvs[0];
+            x0 = 0.0;
+            target_mode = "finite";
+            target_label = 0;
+        }
+    }
+
+    let pts_right = [];
+    let pts_left = [];
+    if target_mode == "+inf" {
+        pts_right = [10000.0, 1000000.0, 100000000.0];
+    } else if target_mode == "-inf" {
+        pts_right = [-10000.0, -1000000.0, -100000000.0];
+    } else if target_mode == "finite" {
+        pts_right = [x0 + 0.001, x0 + 0.00001, x0 + 0.0000001];
+        pts_left = [x0 - 0.001, x0 - 0.00001, x0 - 0.0000001];
+    }
+
+    let cls = _classify_ast_on_pts(raw_ast, v_name, pts_right, base_env);
+    if cls == nil and len(pts_left) > 0 {
+        cls = _classify_ast_on_pts(raw_ast, v_name, pts_left, base_env);
+    }
+
+    if cls != nil and cls["indeterminate"] {
+        let fm = cls["form"];
+        let meta = _indet_metadata(fm);
+        let lat = GOV.indeterminate(meta["lattice_form"], expr_ascii, "analytic");
+        let out_ind = map{
+            "ok": true,
+            "input": str(expr_str),
+            "expression": expr_ascii,
+            "var": v_name,
+            "point": target_label,
+            "indeterminate": true,
+            "form": fm,
+            "lattice_form": meta["lattice_form"],
+            "meaning_el": meta["meaning_el"],
+            "meaning_en": meta["meaning_en"],
+            "suggested_resolution": meta["suggested_resolution"],
+            "governor_lattice": lat
+        };
+        if map_has(cls, "num_t") {
+            out_ind["numerator_limit"] = cls["num_t"]["label"];
+            out_ind["denominator_limit"] = cls["den_t"]["label"];
+        }
+        return out_ind;
+    }
+
+    // Check pole singularity (e.g. 1/x at x = 0, tan(pi/2), etc.)
+    let right_whole = _eval_tendency_pts(raw_ast, v_name, pts_right, base_env);
+    let left_whole = right_whole;
+    if len(pts_left) > 0 {
+        left_whole = _eval_tendency_pts(raw_ast, v_name, pts_left, base_env);
+    }
+    if (cls != nil and cls["form"] == "pole_singularity")
+        or (target_mode == "finite" and (_is_inf_tend(right_whole) or _is_inf_tend(left_whole))) {
+        let two_sided_lbl = "does_not_exist_jump_infinity";
+        if left_whole["label"] == right_whole["label"] {
+            two_sided_lbl = right_whole["label"];
+        }
+        let out_pole = map{
+            "ok": true,
+            "input": str(expr_str),
+            "expression": expr_ascii,
+            "var": v_name,
+            "point": target_label,
+            "indeterminate": false,
+            "form": "pole_singularity",
+            "left_limit": left_whole["label"],
+            "right_limit": right_whole["label"],
+            "two_sided_limit": two_sided_lbl,
+            "meaning_el": "Πόλος / Ασυμπτωτική απειρία (μη απροσδιόριστη μορφή c/0 με c ≠ 0)",
+            "meaning_en": "Determinate pole / infinite asymptotic singularity (c/0 with c != 0)",
+            "suggested_resolution": "evaluate_one_sided_limits"
+        };
+        if cls != nil and map_has(cls, "num_t") {
+            out_pole["numerator_limit"] = cls["num_t"]["label"];
+            out_pole["denominator_limit"] = cls["den_t"]["label"];
+        }
+        return out_pole;
+    }
+
+    return map{
+        "ok": true,
+        "input": str(expr_str),
+        "expression": expr_ascii,
+        "var": v_name,
+        "point": target_label,
+        "indeterminate": false,
+        "form": "determinate",
+        "value": right_whole["label"],
+        "left_limit": left_whole["label"],
+        "right_limit": right_whole["label"],
+        "meaning_el": "Ορισμένη / Προσδιορισμένη τιμή",
+        "meaning_en": "Determinate expression value"
+    };
 }
 
 // ── Crisp Self-Contained Vector SVG Plotter (`plot_svg`) ──────────────────────
@@ -7963,4 +9880,4 @@ export rat, rat_add, rat_sub, rat_mul, rat_div, rat_neg, rat_pow_int, rat_cmp, r
 export normalize_math_text, parse_math, check_ast_bounds, free_vars, subst_ast, eval_ast, diff_ast, diff;
 export to_ascii, to_unicode, to_latex;
 export simplify_node, to_rational_nd, rref_rat, poly_gcd, poly_factor_Q, solve_polynomial_all;
-export transform, simplify, expand, factor, solve, plot_svg, plot_svg_report, svg_escape;
+export transform, simplify, expand, factor, solve, solve_parametric, analyze_indeterminacy, plot_svg, plot_svg_report, svg_escape;

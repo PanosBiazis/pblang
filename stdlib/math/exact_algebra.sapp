@@ -20,13 +20,16 @@
 
 // ── Bounded Resource Safety Constants ─────────────────────────────────────────
 
+let GOV = import("stdlib:math/resource_governor.sapp");
+
+// Legacy exported constants preserved for 100% backward compatibility;
+// live runtime bounds adapt dynamically via `GOV.current_limits()`.
 let MAX_BITS = 16384;
 let MAX_DEGREE = 512;
 let MAX_STEPS = 50000;
 
-let _MAX_DEC_SAFE = 4932;
-let _MAX_DEC_HARD = 4933;
-let _TWO_POW_MAX_BITS = bigint(2) ** 16384;
+let _LOG10_2 = 0.3010299956639812;
+let _ACTIVE_EXACT_TRACKER = map{ trk: nil, op: "" };
 
 let PI = 3.141592653589793;
 let HALF_PI = 1.5707963267948966;
@@ -50,26 +53,43 @@ fn _b_sign(x) {
     return 0;
 }
 
+fn _max_dec_safe_for_bits(max_bits) {
+    return num_floor(max_bits * _LOG10_2);
+}
+
 fn _guard_bigint(b, ctx = "exact_algebra") {
+    let lim = GOV.current_limits();
+    let max_bits = lim["max_bits"];
+    let safe_dec = _max_dec_safe_for_bits(max_bits);
+    let hard_dec = safe_dec + 2;
     let ab = _b_abs(b);
     let n_digits = len(str(ab));
-    if n_digits <= _MAX_DEC_SAFE { return b; }
-    if n_digits > _MAX_DEC_HARD or ab >= _TWO_POW_MAX_BITS {
-        throw ctx + ": integer exceeds MAX_BITS (" + str(MAX_BITS) + ") resource limit";
+    if n_digits <= safe_dec { return b; }
+    if n_digits > hard_dec or ab >= (_B2 ** max_bits) {
+        throw "MathGovernor[" + ctx + "]: integer exceeds adaptive max_bits (" + str(max_bits) + ") resource limit";
     }
     return b;
 }
 
 fn _guard_degree(deg, ctx = "exact_algebra") {
-    if deg > MAX_DEGREE {
-        throw ctx + ": polynomial degree " + str(deg) + " exceeds MAX_DEGREE (" + str(MAX_DEGREE) + ")";
+    let lim = GOV.current_limits();
+    let max_deg = lim["max_degree"];
+    if deg > max_deg {
+        throw "MathGovernor[" + ctx + "]: polynomial degree " + str(deg) + " exceeds adaptive max_degree (" + str(max_deg) + ")";
     }
 }
 
 fn _guard_steps(step, ctx = "exact_algebra") {
-    if step > MAX_STEPS {
-        throw ctx + ": iteration count exceeds MAX_STEPS (" + str(MAX_STEPS) + ")";
+    let lim = GOV.current_limits();
+    let max_steps = lim["max_steps"];
+    if step > max_steps {
+        throw "MathGovernor[" + ctx + "]: iteration count " + str(step) + " exceeds adaptive max_steps (" + str(max_steps) + ")";
     }
+    if step <= 1 or _ACTIVE_EXACT_TRACKER["trk"] == nil or _ACTIVE_EXACT_TRACKER["trk"]["profile"] != lim["profile"] {
+        _ACTIVE_EXACT_TRACKER["trk"] = GOV.new_tracker(ctx);
+        _ACTIVE_EXACT_TRACKER["op"] = ctx;
+    }
+    GOV.tick(_ACTIVE_EXACT_TRACKER["trk"], 1);
 }
 
 fn _is_digits_only(s) {
@@ -104,8 +124,10 @@ fn _parse_bigint_str(raw, ctx = "exact_algebra") {
         idx = idx + 1;
     }
     s = str_slice(s, idx, len(s));
-    if len(s) > _MAX_DEC_HARD {
-        throw ctx + ": integer string exceeds MAX_BITS (" + str(MAX_BITS) + ") resource limit";
+    let lim = GOV.current_limits();
+    let hard_dec = _max_dec_safe_for_bits(lim["max_bits"]) + 2;
+    if len(s) > hard_dec {
+        throw "MathGovernor[" + ctx + "]: integer string exceeds adaptive max_bits (" + str(lim["max_bits"]) + ") resource limit";
     }
     let val = bigint(s);
     if neg { val = _B0 - val; }
@@ -194,10 +216,12 @@ fn _b_isqrt(n) {
         steps = steps + 1;
         _guard_steps(steps, "isqrt");
         x = y;
-        y = (x + n / x) / _B2;
+        y = (x + n / x) / _BI_TWO_SAFE();
     }
     return x;
 }
+
+fn _BI_TWO_SAFE() { return _B2; }
 
 fn _b_pow_guarded(base, exp_nonneg, ctx = "pow") {
     let b = _guard_bigint(base, ctx);
@@ -210,21 +234,25 @@ fn _b_pow_guarded(base, exp_nonneg, ctx = "pow") {
         if b < _B0 and (e % _B2 == _B1) { return _BM1; }
         return _B1;
     }
-    // Since |b| >= 2, |b|^e >= 2^e, so e >= MAX_BITS immediately exceeds 2^MAX_BITS!
-    if e >= bigint(MAX_BITS) {
-        throw ctx + ": exponent " + str(e) + " exceeds MAX_BITS (" + str(MAX_BITS) + ") bound";
+    let lim = GOV.current_limits();
+    let max_bits_bi = bigint(lim["max_bits"]);
+    // Since |b| >= 2, |b|^e >= 2^e, so e >= max_bits immediately exceeds 2^max_bits!
+    if e >= max_bits_bi {
+        throw "MathGovernor[" + ctx + "]: exponent " + str(e) + " exceeds adaptive max_bits (" + str(lim["max_bits"]) + ") bound";
     }
     // Pre-estimate decimal digits to fail closed before big multiplications
     let approx_bits_minus_1 = (len(str(ab)) - 1) * 3;
-    if approx_bits_minus_1 > 0 and e * bigint(approx_bits_minus_1) > bigint(MAX_BITS) {
-        throw ctx + ": power exceeds MAX_BITS (" + str(MAX_BITS) + ") resource limit";
+    if approx_bits_minus_1 > 0 and e * bigint(approx_bits_minus_1) > max_bits_bi {
+        throw "MathGovernor[" + ctx + "]: power exceeds adaptive max_bits (" + str(lim["max_bits"]) + ") resource limit";
     }
+    let trk = GOV.new_tracker(ctx);
     let res = _B1;
     let cur = b;
     let rem = e;
     let steps = 0;
     while rem > _B0 {
         steps = steps + 1;
+        GOV.tick(trk, 1);
         _guard_steps(steps, ctx);
         if rem % _B2 == _B1 {
             res = _guard_bigint(res * cur, ctx);
@@ -329,8 +357,9 @@ fn _parse_decimal_or_sci_to_rat(s) {
         let exp_str = str_slice(txt, e_pos + 1, len(txt));
         txt = str_slice(txt, 0, e_pos);
         let exp_b = _parse_bigint_str(exp_str, "rat_from_str");
-        if _b_abs(exp_b) > bigint(_MAX_DEC_SAFE) {
-            throw "rat_from_str: decimal exponent exceeds MAX_BITS resource limit";
+        let lim_r = GOV.current_limits();
+        if _b_abs(exp_b) > bigint(_max_dec_safe_for_bits(lim_r["max_bits"])) {
+            throw "MathGovernor[rat_from_str]: decimal exponent exceeds adaptive max_bits resource limit";
         }
         exp10 = parse_number(str(exp_b));
     }
@@ -956,8 +985,9 @@ fn _float_pow_int(x, n_nonneg) {
 fn ival_pow_int(A, n) {
     let ia = _as_ival(A);
     let nb = _to_bigint(n, "ival_pow_int");
-    if _b_abs(nb) > bigint(MAX_STEPS) {
-        throw "ival_pow_int: exponent exceeds MAX_STEPS bound";
+    let lim_iv = GOV.current_limits();
+    if _b_abs(nb) > bigint(lim_iv["max_steps"]) {
+        throw "MathGovernor[ival_pow_int]: exponent exceeds adaptive max_steps bound";
     }
     let ni = parse_number(str(nb));
     if ni == 0 {
@@ -1567,8 +1597,9 @@ fn all_divisors(n) {
         let p = pf[i].prime;
         let e = pf[i].exp;
         let cur_len = len(divs);
-        if cur_len * (e + 1) > MAX_STEPS {
-            throw "all_divisors: divisor count exceeds MAX_STEPS (" + str(MAX_STEPS) + ")";
+        let lim_ad = GOV.current_limits();
+        if cur_len * (e + 1) > lim_ad["max_steps"] {
+            throw "MathGovernor[all_divisors]: divisor count exceeds adaptive max_steps (" + str(lim_ad["max_steps"]) + ")";
         }
         let p_pow = _B1;
         let j = 1;
@@ -1729,16 +1760,20 @@ fn discrete_log(g, h, p) {
     let inv_pref = mod_inv(prefix_mul, pp);
     hh = (hh * inv_pref) % pp;
 
+    let lim = GOV.current_limits();
+    let max_steps_dyn = lim["max_steps"];
     let m_step = _b_isqrt(pp - _B1) + _B1;
-    if m_step > bigint(MAX_STEPS) {
-        throw "discrete_log: sqrt(p) exceeds MAX_STEPS (" + str(MAX_STEPS) + ") bound";
+    if m_step > bigint(max_steps_dyn) {
+        throw "MathGovernor[discrete_log]: sqrt(p) exceeds adaptive max_steps (" + str(max_steps_dyn) + ") bound";
     }
+    let trk = GOV.new_tracker("exact_algebra.discrete_log");
     let m_int = parse_number(str(m_step));
 
     let baby = map{};
     let cur = _B1;
     let j = 0;
     while j < m_int {
+        GOV.tick(trk, 1);
         let key = str(cur);
         if not map_has(baby, key) {
             baby[key] = j;
@@ -1752,6 +1787,7 @@ fn discrete_log(g, h, p) {
     let gamma = hh;
     let i = 0;
     while i <= m_int {
+        GOV.tick(trk, 1);
         let key = str(gamma);
         if map_has(baby, key) {
             let ans = bigint(i) * m_step + bigint(baby[key]) + prefix_k;
@@ -1817,9 +1853,7 @@ fn solve_pell(D) {
 // Canonical polynomial P in Q[x]: ascending array `[c_0, c_1, ..., c_d]` of `rat`,
 // with trailing zeros removed (`[]` = zero polynomial, `deg([]) == -1`).
 fn poly_trim(P) {
-    if len(P) - 1 > MAX_DEGREE {
-        _guard_degree(len(P) - 1, "poly_trim");
-    }
+    _guard_degree(len(P) - 1, "poly_trim");
     let out = [];
     let i = 0;
     while i < len(P) {
@@ -2962,9 +2996,7 @@ fn _check_gf_prime(p, ctx) {
 
 fn gf_poly_trim(A, p) {
     let pp = _check_gf_prime(p, "gf_poly_trim");
-    if len(A) - 1 > MAX_DEGREE {
-        _guard_degree(len(A) - 1, "gf_poly_trim");
-    }
+    _guard_degree(len(A) - 1, "gf_poly_trim");
     let out = [];
     let i = 0;
     while i < len(A) {

@@ -1,0 +1,899 @@
+// stdlib/math/resource_governor.sapp — Adaptive Hardware-, Memory-, Deadline- &
+// Complexity-Velocity Security Governor + Guarded Algebraic Indeterminacy Lattice (PBLang v2.4.0).
+//
+// Replaces rigid magic constants with live OS/VM telemetry envelopes (`hardware_probe()`,
+// `memory_stats()`, `gc_stats()`, `time_ms()`), nested execution budgets (`with_budget`),
+// exponential expression-swell velocity detection, and a full Guarded Indeterminacy Lattice
+// so callers never receive silent meaningless NaN.
+//
+// Zero network I/O, zero host path exposure, 100% pure PBLang.
+
+let GOVERNOR_VERSION = "2.4.0";
+
+let _MIB = 1048576;
+let _DEFAULT_FALLBACK_RAM_BYTES = 256 * 1048576; // 256 MiB conservative fallback
+
+let _STATE = map{
+    profile: "adaptive_auto",
+    overrides: map{},
+    stack: [],
+    rev: 1,
+    cached_rev: -1,
+    cached_limits: nil,
+    hw_cache: nil,
+    hw_last_ms: -100000.0,
+    fast_reads: 0,
+    scope_deadline_ms: nil,
+    scope_baseline_bytes: nil
+};
+
+fn _min(a, b) {
+    if a < b { return a; }
+    return b;
+}
+
+fn _max(a, b) {
+    if a > b { return a; }
+    return b;
+}
+
+fn _clamp_int(v, lo, hi) {
+    let iv = num_floor(v);
+    if iv < lo { return lo; }
+    if iv > hi { return hi; }
+    return iv;
+}
+
+fn _copy_map(src) {
+    let out = map{};
+    if src == nil or type(src) != "map" { return out; }
+    let ks = map_keys(src);
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        out[k] = src[k];
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _merge_maps(base_m, extra_m) {
+    let out = _copy_map(base_m);
+    if extra_m == nil or type(extra_m) != "map" { return out; }
+    let ks = map_keys(extra_m);
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        if extra_m[k] != nil {
+            out[k] = extra_m[k];
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _parse_gc_stats_text(s) {
+    let m = map{};
+    let parts = str_split(str(s), " ");
+    let i = 0;
+    while i < len(parts) {
+        let kv = str_split(parts[i], "=");
+        if len(kv) == 2 {
+            let v = try parse_number(kv[1]) catch nil;
+            if v != nil { m[kv[0]] = v; }
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+fn _read_live_heap_bytes() {
+    let ms = try memory_stats() catch map{};
+    if type(ms) == "map" {
+        if map_has(ms, "gc_live_bytes") and type(ms["gc_live_bytes"]) == "number" {
+            return ms["gc_live_bytes"];
+        }
+        if map_has(ms, "live_bytes") and type(ms["live_bytes"]) == "number" {
+            return ms["live_bytes"];
+        }
+    }
+    let gs = try gc_stats() catch map{};
+    if type(gs) == "map" {
+        if map_has(gs, "live_bytes") and type(gs["live_bytes"]) == "number" {
+            return gs["live_bytes"];
+        }
+        if map_has(gs, "live_tracked") and type(gs["live_tracked"]) == "number" {
+            return gs["live_tracked"] * 96;
+        }
+    } else if type(gs) == "string" {
+        let parsed = _parse_gc_stats_text(gs);
+        if map_has(parsed, "live_bytes") { return parsed["live_bytes"]; }
+        if map_has(parsed, "live_tracked") { return parsed["live_tracked"] * 96; }
+    }
+    return 0;
+}
+
+fn _now_ms_safe() {
+    let t = try time_ms() catch nil;
+    if t != nil and type(t) == "number" { return t; }
+    let t2 = try now_ms() catch 0.0;
+    if t2 != nil and type(t2) == "number" { return t2; }
+    return 0.0;
+}
+
+// Probe live OS hardware & VM heap telemetry safely (with 500ms hardware cache unless force=true).
+fn probe_telemetry(force = false) {
+    let now = _now_ms_safe();
+    if not force and _STATE["hw_cache"] != nil and (now - _STATE["hw_last_ms"]) >= 0.0 and (now - _STATE["hw_last_ms"]) < 500.0 {
+        let cached = _copy_map(_STATE["hw_cache"]);
+        cached["live_bytes"] = _read_live_heap_bytes();
+        cached["ts_ms"] = now;
+        return cached;
+    }
+
+    let hw = try hardware_probe() catch map{};
+    if type(hw) != "map" { hw = map{}; }
+
+    let total_ram_bytes = _DEFAULT_FALLBACK_RAM_BYTES;
+    if map_has(hw, "total_ram_bytes") and type(hw["total_ram_bytes"]) == "number" and hw["total_ram_bytes"] > 0 {
+        total_ram_bytes = num_floor(hw["total_ram_bytes"]);
+    } else if map_has(hw, "ram_total_mb") and type(hw["ram_total_mb"]) == "number" and hw["ram_total_mb"] > 0 {
+        total_ram_bytes = num_floor(hw["ram_total_mb"] * _MIB);
+    }
+
+    let avail_ram_bytes = _DEFAULT_FALLBACK_RAM_BYTES;
+    let probe_ok = false;
+    if map_has(hw, "avail_ram_bytes") and type(hw["avail_ram_bytes"]) == "number" and hw["avail_ram_bytes"] > 0 {
+        avail_ram_bytes = num_floor(hw["avail_ram_bytes"]);
+        probe_ok = true;
+    } else if map_has(hw, "ram_available_mb") and type(hw["ram_available_mb"]) == "number" and hw["ram_available_mb"] > 0 {
+        avail_ram_bytes = num_floor(hw["ram_available_mb"] * _MIB);
+        probe_ok = true;
+    } else if map_has(hw, "total_ram_bytes") and type(hw["total_ram_bytes"]) == "number" and hw["total_ram_bytes"] > 0 {
+        avail_ram_bytes = num_floor(hw["total_ram_bytes"] * 0.5);
+        probe_ok = true;
+    } else if map_has(hw, "ram_total_mb") and type(hw["ram_total_mb"]) == "number" and hw["ram_total_mb"] > 0 {
+        avail_ram_bytes = num_floor(hw["ram_total_mb"] * _MIB * 0.5);
+        probe_ok = true;
+    }
+
+    let cpu_cores = 2;
+    if map_has(hw, "cpu_cores") and type(hw["cpu_cores"]) == "number" and hw["cpu_cores"] >= 1 {
+        cpu_cores = num_floor(hw["cpu_cores"]);
+    } else if map_has(hw, "cpu_logical_cores") and type(hw["cpu_logical_cores"]) == "number" and hw["cpu_logical_cores"] >= 1 {
+        cpu_cores = num_floor(hw["cpu_logical_cores"]);
+    }
+
+    let snap = map{
+        probe_available: probe_ok,
+        avail_ram_bytes: avail_ram_bytes,
+        total_ram_bytes: _max(total_ram_bytes, avail_ram_bytes),
+        avail_ram_mb: num_floor(avail_ram_bytes / _MIB),
+        cpu_cores: cpu_cores,
+        live_bytes: _read_live_heap_bytes(),
+        ts_ms: now
+    };
+    _STATE["hw_cache"] = snap;
+    _STATE["hw_last_ms"] = now;
+    return _copy_map(snap);
+}
+
+fn _validate_profile_name(p) {
+    if p == "untrusted_sandbox" or p == "adaptive_auto" or p == "scientific_unbounded_guarded" {
+        return p;
+    }
+    throw "MathGovernor: unknown policy profile '" + str(p) + "' (expected 'untrusted_sandbox', 'adaptive_auto', or 'scientific_unbounded_guarded')";
+}
+
+// ── Dynamic Policy Management (`get_policy`, `set_policy`, `reset_policy`, `with_budget`) ──
+
+fn get_policy() {
+    return map{
+        profile: _STATE["profile"],
+        overrides: _copy_map(_STATE["overrides"]),
+        nesting_depth: len(_STATE["stack"]),
+        limits: current_limits(nil)
+    };
+}
+
+fn set_policy(opts) {
+    if opts == nil { return get_policy(); }
+    if type(opts) == "string" {
+        _STATE["profile"] = _validate_profile_name(opts);
+        _STATE["overrides"] = map{};
+    } else if type(opts) == "map" {
+        if map_has(opts, "profile") and opts["profile"] != nil {
+            _STATE["profile"] = _validate_profile_name(opts["profile"]);
+        }
+        let next_ov = _copy_map(_STATE["overrides"]);
+        let ks = map_keys(opts);
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            if k != "profile" and opts[k] != nil {
+                next_ov[k] = opts[k];
+            }
+            i = i + 1;
+        }
+        _STATE["overrides"] = next_ov;
+    } else {
+        throw "MathGovernor: set_policy expects profile string or options map";
+    }
+    _STATE["rev"] = _STATE["rev"] + 1;
+    _STATE["cached_limits"] = nil;
+    return get_policy();
+}
+
+fn reset_policy() {
+    _STATE["profile"] = "adaptive_auto";
+    _STATE["overrides"] = map{};
+    _STATE["rev"] = _STATE["rev"] + 1;
+    _STATE["cached_limits"] = nil;
+    return get_policy();
+}
+
+// Scoped execution budget with guaranteed unwind restoration even when fn_cb() throws.
+fn with_budget(opts, fn_cb) {
+    if type(fn_cb) != "function" {
+        throw "MathGovernor: with_budget expects a callback function as second argument";
+    }
+    let saved = map{
+        profile: _STATE["profile"],
+        overrides: _copy_map(_STATE["overrides"]),
+        scope_deadline_ms: _STATE["scope_deadline_ms"],
+        scope_baseline_bytes: _STATE["scope_baseline_bytes"]
+    };
+    array_push(_STATE["stack"], saved);
+
+    // When entering a new explicit profile inside with_budget, start from clean overrides for that profile
+    // unless inheriting the current profile's overrides.
+    if type(opts) == "string" {
+        _STATE["profile"] = _validate_profile_name(opts);
+        _STATE["overrides"] = map{};
+    } else if type(opts) == "map" {
+        if map_has(opts, "profile") and opts["profile"] != nil {
+            _STATE["profile"] = _validate_profile_name(opts["profile"]);
+            _STATE["overrides"] = map{};
+        }
+        let merged = _copy_map(_STATE["overrides"]);
+        let ks = map_keys(opts);
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            if k != "profile" and opts[k] != nil {
+                merged[k] = opts[k];
+            }
+            i = i + 1;
+        }
+        _STATE["overrides"] = merged;
+    }
+    _STATE["rev"] = _STATE["rev"] + 1;
+    _STATE["cached_limits"] = nil;
+
+    let scope_lim = current_limits(nil);
+    let enter_ms = _now_ms_safe();
+    let cand_deadline = enter_ms + scope_lim["budget_ms"];
+    if _STATE["scope_deadline_ms"] == nil or cand_deadline < _STATE["scope_deadline_ms"] {
+        _STATE["scope_deadline_ms"] = cand_deadline;
+    }
+    if _STATE["scope_baseline_bytes"] == nil {
+        _STATE["scope_baseline_bytes"] = _read_live_heap_bytes();
+    }
+
+    let failed = false;
+    let err_val = nil;
+    let res = try {
+        fn_cb()
+    } catch e {
+        failed = true;
+        err_val = e;
+        nil
+    };
+
+    let popped = pop(_STATE["stack"]);
+    _STATE["profile"] = popped["profile"];
+    _STATE["overrides"] = popped["overrides"];
+    _STATE["scope_deadline_ms"] = popped["scope_deadline_ms"];
+    _STATE["scope_baseline_bytes"] = popped["scope_baseline_bytes"];
+    _STATE["rev"] = _STATE["rev"] + 1;
+    _STATE["cached_limits"] = nil;
+
+    if failed {
+        throw err_val;
+    }
+    return res;
+}
+
+// ── Dynamic Hardware-Scaled Limit Computation (`current_limits`) ──────────────
+
+fn _compute_limits_from(profile_name, eff_opts) {
+    let tele = probe_telemetry(false);
+    let avail_bytes = tele["avail_ram_bytes"];
+    let cores = tele["cpu_cores"];
+
+    if map_has(eff_opts, "avail_ram_bytes") and type(eff_opts["avail_ram_bytes"]) == "number" and eff_opts["avail_ram_bytes"] > 0 {
+        avail_bytes = num_floor(eff_opts["avail_ram_bytes"]);
+    } else if map_has(eff_opts, "ram_available_mb") and type(eff_opts["ram_available_mb"]) == "number" and eff_opts["ram_available_mb"] > 0 {
+        avail_bytes = num_floor(eff_opts["ram_available_mb"] * _MIB);
+    }
+    if map_has(eff_opts, "cpu_cores") and type(eff_opts["cpu_cores"]) == "number" and eff_opts["cpu_cores"] >= 1 {
+        cores = num_floor(eff_opts["cpu_cores"]);
+    }
+
+    let avail_mb = _max(16.0, avail_bytes / (_MIB * 1.0));
+    // Smooth sublinear memory scaling normalized to 1.0 at 256 MiB available RAM:
+    //   64 MiB -> 0.5x | 256 MiB -> 1.0x | 1 GiB -> 2.0x | 4 GiB -> 4.0x | 8 GiB -> 5.66x | 16 GiB -> 8.0x
+    let mem_scale = num_sqrt(avail_mb / 256.0);
+    if mem_scale < 0.25 { mem_scale = 0.25; }
+    if mem_scale > 16.0 { mem_scale = 16.0; }
+    let core_boost = 1.0 + _min(0.5, (cores - 1) * 0.04);
+
+    let lim = nil;
+    if profile_name == "untrusted_sandbox" {
+        lim = map{
+            profile: "untrusted_sandbox",
+            avail_ram_bytes: avail_bytes,
+            cpu_cores: cores,
+            budget_ms: 250,
+            max_heap_growth_bytes: _min(8 * _MIB, _max(2 * _MIB, num_floor(avail_bytes * 0.05))),
+            max_bits: 4096,
+            max_degree: 96,
+            max_steps: 8000,
+            max_matrix_dim: 64,
+            max_ast_depth: 64,
+            max_ast_nodes: 1024,
+            max_rewrite_steps: 192,
+            max_expand_degree: 24,
+            max_milp_nodes: 512,
+            max_opt_iter: 400,
+            exact_qm_table_vars: 10,
+            max_swell_ratio: 5.0,
+            max_swell_delta: 512,
+            max_swell_strikes: 2
+        };
+    } else if profile_name == "scientific_unbounded_guarded" {
+        let sci_scale = _max(2.0, mem_scale * 2.0);
+        lim = map{
+            profile: "scientific_unbounded_guarded",
+            avail_ram_bytes: avail_bytes,
+            cpu_cores: cores,
+            budget_ms: 30000,
+            max_heap_growth_bytes: _max(16 * _MIB, num_floor(avail_bytes * 0.25)),
+            max_bits: _clamp_int(32768.0 * sci_scale, 32768, 1048576),
+            max_degree: _clamp_int(1024.0 * sci_scale, 1024, 16384),
+            max_steps: _clamp_int(100000.0 * sci_scale * core_boost, 100000, 2000000),
+            max_matrix_dim: _clamp_int(512.0 * num_sqrt(sci_scale), 512, 4096),
+            max_ast_depth: 1024,
+            max_ast_nodes: _clamp_int(16384.0 * sci_scale, 16384, 262144),
+            max_rewrite_steps: _clamp_int(2048.0 * sci_scale, 2048, 32768),
+            max_expand_degree: _clamp_int(256.0 * num_sqrt(sci_scale), 256, 2048),
+            max_milp_nodes: _clamp_int(16384.0 * sci_scale, 8192, 262144),
+            max_opt_iter: _clamp_int(5000.0 * num_sqrt(sci_scale), 4000, 25000),
+            exact_qm_table_vars: 12,
+            max_swell_ratio: 16.0,
+            max_swell_delta: 16384,
+            max_swell_strikes: 4
+        };
+    } else {
+        // Default: "adaptive_auto"
+        let qm_vars = 12;
+        if avail_mb < 96.0 { qm_vars = 10; }
+        else if avail_mb < 256.0 { qm_vars = 11; }
+
+        let heap_cap = _min(256 * _MIB, _max(4 * _MIB, num_floor(avail_bytes * 0.10)));
+        lim = map{
+            profile: "adaptive_auto",
+            avail_ram_bytes: avail_bytes,
+            cpu_cores: cores,
+            budget_ms: 5000,
+            max_heap_growth_bytes: heap_cap,
+            max_bits: _clamp_int(16384.0 * mem_scale, 4096, 262144),
+            max_degree: _clamp_int(512.0 * mem_scale, 128, 4096),
+            max_steps: _clamp_int(50000.0 * mem_scale * core_boost, 10000, 500000),
+            max_matrix_dim: _clamp_int(256.0 * mem_scale, 64, 2048),
+            max_ast_depth: _clamp_int(128.0 * _min(mem_scale, 4.0), 64, 512),
+            max_ast_nodes: _clamp_int(4096.0 * mem_scale, 1024, 65536),
+            max_rewrite_steps: _clamp_int(768.0 * mem_scale, 256, 8192),
+            max_expand_degree: _clamp_int(64.0 * mem_scale, 24, 512),
+            max_milp_nodes: _clamp_int(4096.0 * mem_scale, 512, 65536),
+            max_opt_iter: _clamp_int(2000.0 * _min(mem_scale, 5.0), 500, 10000),
+            exact_qm_table_vars: qm_vars,
+            max_swell_ratio: 8.0,
+            max_swell_delta: 2048,
+            max_swell_strikes: 3
+        };
+    }
+
+    // Apply explicit overrides (accepting friendly aliases like max_time_ms / max_memory_bytes)
+    if map_has(eff_opts, "budget_ms") { lim["budget_ms"] = eff_opts["budget_ms"]; }
+    if map_has(eff_opts, "max_time_ms") { lim["budget_ms"] = eff_opts["max_time_ms"]; }
+    if map_has(eff_opts, "max_heap_growth_bytes") { lim["max_heap_growth_bytes"] = eff_opts["max_heap_growth_bytes"]; }
+    if map_has(eff_opts, "max_memory_bytes") { lim["max_heap_growth_bytes"] = eff_opts["max_memory_bytes"]; }
+
+    let overridable_keys = [
+        "max_bits", "max_degree", "max_steps", "max_matrix_dim",
+        "max_ast_depth", "max_ast_nodes", "max_rewrite_steps",
+        "max_expand_degree", "max_milp_nodes", "max_opt_iter",
+        "exact_qm_table_vars", "max_swell_ratio", "max_swell_delta", "max_swell_strikes"
+    ];
+    let i = 0;
+    while i < len(overridable_keys) {
+        let k = overridable_keys[i];
+        if map_has(eff_opts, k) and eff_opts[k] != nil {
+            lim[k] = eff_opts[k];
+        }
+        i = i + 1;
+    }
+    // Convenience aliases matching prompt terminology
+    lim["max_exact_bits"] = lim["max_bits"];
+    lim["max_poly_degree"] = lim["max_degree"];
+    lim["max_search_nodes"] = lim["max_milp_nodes"];
+    lim["max_input_len"] = _max(4096, lim["max_ast_nodes"] * 2);
+    return lim;
+}
+
+fn current_limits(opts = nil) {
+    if opts == nil {
+        _STATE["fast_reads"] = _STATE["fast_reads"] + 1;
+        if _STATE["cached_limits"] != nil and _STATE["cached_rev"] == _STATE["rev"] and (_STATE["fast_reads"] % 256) != 0 {
+            return _STATE["cached_limits"];
+        }
+        let lim = _compute_limits_from(_STATE["profile"], _STATE["overrides"]);
+        _STATE["cached_limits"] = lim;
+        _STATE["cached_rev"] = _STATE["rev"];
+        return lim;
+    }
+    let prof = _STATE["profile"];
+    if type(opts) == "map" and map_has(opts, "profile") and opts["profile"] != nil {
+        prof = _validate_profile_name(opts["profile"]);
+    } else if type(opts) == "string" {
+        prof = _validate_profile_name(opts);
+        opts = map{};
+    }
+    let merged = _merge_maps(_STATE["overrides"], opts);
+    return _compute_limits_from(prof, merged);
+}
+
+// ── Low-Overhead Execution Tracker (`new_tracker` & `tick`) ───────────────────
+
+fn new_tracker(op_name, opts = nil) {
+    let lim = current_limits(opts);
+    let now = _now_ms_safe();
+    let base_heap = _read_live_heap_bytes();
+    if opts == nil and _STATE["scope_baseline_bytes"] != nil {
+        base_heap = _STATE["scope_baseline_bytes"];
+    }
+    let deadline_ms = now + lim["budget_ms"];
+    if opts == nil and _STATE["scope_deadline_ms"] != nil and _STATE["scope_deadline_ms"] < deadline_ms {
+        deadline_ms = _STATE["scope_deadline_ms"];
+    }
+    return map{
+        op: str(op_name),
+        profile: lim["profile"],
+        start_ms: now,
+        deadline_ms: deadline_ms,
+        budget_ms: lim["budget_ms"],
+        max_heap_growth: lim["max_heap_growth_bytes"],
+        baseline_live_bytes: base_heap,
+        steps: 0,
+        work_units: 0,
+        prev_window_work: 0,
+        prev_work: 0,
+        prev_delta_work: 0,
+        swell_strikes: 0,
+        limits: lim
+    };
+}
+
+// Amortized O(1) guard (< 0.1% overhead: probes clock & heap only every 64 ticks or heavy bursts).
+fn tick(tracker, work_units = 1) {
+    if tracker == nil { return; }
+    let wu = work_units;
+    if wu == nil or wu < 1 { wu = 1; }
+
+    let steps = tracker["steps"] + 1;
+    let total_work = tracker["work_units"] + wu;
+    tracker["steps"] = steps;
+    tracker["prev_work"] = tracker["work_units"];
+    tracker["work_units"] = total_work;
+
+    let lim = tracker["limits"];
+    if steps > lim["max_steps"] {
+        throw "MathGovernor[" + tracker["op"] + "]: resource budget exceeded (steps " + str(steps) + " > " + str(lim["max_steps"]) + " under profile '" + tracker["profile"] + "')";
+    }
+
+    // Immediate burst complexity check if a single step attempts huge quadratic/exponential expansion
+    if wu > lim["max_ast_nodes"] * 4 {
+        throw "MathGovernor[" + tracker["op"] + "]: resource budget exceeded (complexity burst work_units=" + str(wu) + " > allowed envelope under profile '" + tracker["profile"] + "')";
+    }
+
+    if (steps % 64) == 0 or wu >= 256 {
+        let now = _now_ms_safe();
+        if now > tracker["deadline_ms"] {
+            let elapsed = now - tracker["start_ms"];
+            throw "MathGovernor[" + tracker["op"] + "]: resource budget exceeded (deadline exceeded, elapsed=" + str(num_floor(elapsed)) + "ms, budget=" + str(tracker["budget_ms"]) + "ms under profile '" + tracker["profile"] + "')";
+        }
+
+        let live_now = _read_live_heap_bytes();
+        let heap_growth = live_now - tracker["baseline_live_bytes"];
+        if heap_growth > tracker["max_heap_growth"] {
+            throw "MathGovernor[" + tracker["op"] + "]: resource budget exceeded (heap growth " + str(heap_growth) + "B > " + str(tracker["max_heap_growth"]) + "B under profile '" + tracker["profile"] + "')";
+        }
+
+        // Exponential node-swell velocity detector: delta_work accelerating geometrically across windows
+        let delta_work = total_work - tracker["prev_window_work"];
+        let prev_delta = tracker["prev_delta_work"];
+        if prev_delta >= lim["max_swell_delta"] and delta_work > prev_delta * lim["max_swell_ratio"] {
+            tracker["swell_strikes"] = tracker["swell_strikes"] + 1;
+            if tracker["swell_strikes"] >= lim["max_swell_strikes"] {
+                throw "MathGovernor[" + tracker["op"] + "]: resource budget exceeded (exponential expression-swell velocity DoS bomb detected)";
+            }
+        } else if delta_work <= prev_delta {
+            if tracker["swell_strikes"] > 0 {
+                tracker["swell_strikes"] = tracker["swell_strikes"] - 1;
+            }
+        }
+        tracker["prev_delta_work"] = delta_work;
+        tracker["prev_window_work"] = total_work;
+    }
+}
+
+fn check_swell(tracker, metric_size) {
+    if tracker == nil or metric_size == nil { return; }
+    let lim = tracker["limits"];
+    if not map_has(tracker, "base_metric") {
+        let bm = metric_size;
+        if bm < 8 { bm = 8; }
+        tracker["base_metric"] = bm;
+    }
+    if metric_size > lim["max_ast_nodes"] * 2 {
+        throw "MathGovernor[" + tracker["op"] + "]: resource budget exceeded (expression swell size " + str(metric_size) + " > " + str(lim["max_ast_nodes"] * 2) + " under profile '" + tracker["profile"] + "')";
+    }
+    let ov = _STATE["overrides"];
+    if map_has(ov, "max_swell_factor") and ov["max_swell_factor"] != nil {
+        if metric_size > tracker["base_metric"] * ov["max_swell_factor"] {
+            throw "MathGovernor[" + tracker["op"] + "]: resource budget exceeded (expression swell factor exceeded: " + str(metric_size) + " vs base " + str(tracker["base_metric"]) + ")";
+        }
+    }
+    if metric_size >= 64 {
+        let now = _now_ms_safe();
+        if now > tracker["deadline_ms"] {
+            let elapsed = now - tracker["start_ms"];
+            throw "MathGovernor[" + tracker["op"] + "]: resource budget exceeded (deadline exceeded during swell check, elapsed=" + str(num_floor(elapsed)) + "ms)";
+        }
+    }
+}
+
+// ── Guarded Algebraic Indeterminacy Lattice ───────────────────────────────────
+
+fn _indeterminacy_catalog(form, context) {
+    if form == "0/0" {
+        return map{
+            meaning_el: "Απροσδιόριστη μορφή 0/0: αριθμητής και παρονομαστής τείνουν ταυτόχρονα στο μηδέν· η τιμή εξαρτάται από τον σχετικό ρυθμό σύγκλισης.",
+            meaning_en: "Indeterminate form 0/0: both numerator and denominator vanish; limiting value depends on relative asymptotic rates.",
+            strategies: ["factor_and_cancel_gcd", "lhopital_rule", "taylor_maclaurin_series"]
+        };
+    }
+    if form == "inf/inf" {
+        return map{
+            meaning_el: "Απροσδιόριστη μορφή ∞/∞: λόγος δύο απειριζόμενων μεγεθών· απαιτείται σύγκριση τάξης μεγέθους ή κανόνας L'Hôpital.",
+            meaning_en: "Indeterminate form inf/inf: ratio of diverging magnitudes; resolve via dominant-term extraction or L'Hopital's rule.",
+            strategies: ["divide_by_dominant_term", "lhopital_rule", "asymptotic_expansion"]
+        };
+    }
+    if form == "0*inf" or form == "0 * inf" {
+        return map{
+            meaning_el: "Απροσδιόριστη μορφή 0·∞: γινόμενο μηδενιζόμενου επί απειριζόμενο παράγοντα· αναδιατυπώνεται σε 0/0 ή ∞/∞.",
+            meaning_en: "Indeterminate form 0*inf: product of vanishing and diverging factors; rewrite as f/(1/g) -> 0/0 or g/(1/f) -> inf/inf.",
+            strategies: ["rewrite_as_quotient_0_over_0", "rewrite_as_quotient_inf_over_inf", "taylor_series"]
+        };
+    }
+    if form == "inf-inf" or form == "inf - inf" {
+        return map{
+            meaning_el: "Απροσδιόριστη μορφή ∞ − ∞: διαφορά ομόσημων απειριών· επιλύεται με ενοποίηση κλασμάτων, συζυγή παράσταση ή ανάπτυγμα Taylor.",
+            meaning_en: "Indeterminate form inf-inf: difference of competing infinities; combine over common denominator, rationalize, or expand Taylor series.",
+            strategies: ["common_denominator", "conjugate_rationalization", "laurent_taylor_expansion"]
+        };
+    }
+    if form == "0^0" {
+        return map{
+            meaning_el: "Απροσδιόριστη αναλυτική μορφή 0⁰ (στο όριο f(x)^g(x) με f→0, g→0· αντιδιαστέλλεται από τη συνδυαστική/αλγεβρική σύμβαση x⁰ = 1).",
+            meaning_en: "Analytic indeterminate form 0^0 for f(x)^g(x) -> 0^0 (distinct from the combinatorial/polynomial convention x^0 = 1); rewrite via exp(g*ln(f)).",
+            strategies: ["logarithmic_transform_exp_g_ln_f", "distinguish_combinatorial_convention_1"]
+        };
+    }
+    if form == "1^inf" {
+        return map{
+            meaning_el: "Απροσδιόριστη εκθετική μορφή 1^∞: βάση τείνει στη μονάδα ενώ ο εκθέτης απειρίζεται· επιλύεται μέσω exp(lim g(x)·(f(x) − 1)).",
+            meaning_en: "Indeterminate exponential form 1^inf: base approaches 1 while exponent diverges; resolve via exp(lim g(x)*(f(x) - 1)).",
+            strategies: ["exponential_limit_exp_g_times_f_minus_1", "logarithmic_lhopital"]
+        };
+    }
+    if form == "inf^0" {
+        return map{
+            meaning_el: "Απροσδιόριστη εκθετική μορφή ∞⁰: απειριζόμενη βάση σε μηδενιζόμενο εκθέτη· επιλύεται μέσω exp(lim g(x)·ln(f(x))).",
+            meaning_en: "Indeterminate exponential form inf^0: diverging base raised to vanishing exponent; resolve via exp(lim g(x)*ln(f(x))).",
+            strategies: ["logarithmic_transform_exp_g_ln_f", "lhopital_on_exponent_log_product"]
+        };
+    }
+    if form == "mod_zero" {
+        return map{
+            meaning_el: "Απροσδιόριστο υπόλοιπο modulo 0 (a mod 0): η ευκλείδεια διαίρεση με μηδενικό διαιρέτη δεν ορίζει μοναδικό πηλίκο.",
+            meaning_en: "Undefined modulo zero (a % 0): Euclidean division by zero divisor has no canonical quotient.",
+            strategies: ["guard_nonzero_modulus", "ideal_congruence_a_equiv_b_mod_0_iff_a_eq_b"]
+        };
+    }
+    return map{
+        meaning_el: "Ανωμαλία πεδίου ορισμού / πόλος (π.χ. διαίρεση μη μηδενικού με 0, ln(0), tan(π/2))· απαιτείται ανάλυση πλευρικών ορίων ή επέκταση στο ℂ.",
+        meaning_en: "Domain singularity or pole (e.g. nonzero/0, ln(0), tan(pi/2)); inspect one-sided limits (+/-inf) or analytic continuation.",
+        strategies: ["one_sided_limits", "principal_value_or_complex_branch", "domain_exclusion_guard"]
+    };
+}
+
+fn indeterminate(form, expr_str, context = "analytic") {
+    let f = str(form);
+    let info = _indeterminacy_catalog(f, context);
+    return map{
+        kind: "indeterminate",
+        indeterminate: true,
+        form: f,
+        context: str(context),
+        expr: str(expr_str),
+        meaning_el: info["meaning_el"],
+        meaning_en: info["meaning_en"],
+        resolution_strategies: info["strategies"]
+    };
+}
+
+fn is_indeterminate(v) {
+    return type(v) == "map" and map_has(v, "kind") and v["kind"] == "indeterminate" and map_has(v, "indeterminate") and v["indeterminate"] == true;
+}
+
+// Classify scalar/symbolic operand into { cls: "indet" | "inf" | "zero" | "one" | "finite", sign, val }
+fn _classify_operand(x) {
+    if is_indeterminate(x) {
+        return map{ cls: "indet", obj: x };
+    }
+    if type(x) == "string" {
+        let s = str_lower(str_trim(x));
+        if s == "inf" or s == "+inf" or s == "infinity" or s == "+infinity" or s == "∞" or s == "+∞" {
+            return map{ cls: "inf", sign: 1, str: "+inf" };
+        }
+        if s == "-inf" or s == "-infinity" or s == "-∞" {
+            return map{ cls: "inf", sign: -1, str: "-inf" };
+        }
+        let nv = try parse_number(s) catch nil;
+        if nv != nil { x = nv; }
+    }
+    if type(x) == "map" {
+        if map_has(x, "kind") and x["kind"] == "inf" {
+            let sg = 1;
+            if map_has(x, "sign") and x["sign"] < 0 { sg = -1; }
+            return map{ cls: "inf", sign: sg, str: if sg > 0 { "+inf" } else { "-inf" } };
+        }
+        if map_has(x, "num") and map_has(x, "den") {
+            if x["den"] == bigint(0) {
+                if x["num"] == bigint(0) { return map{ cls: "indet", obj: indeterminate("0/0", "0/0", "analytic") }; }
+                return map{ cls: "inf", sign: if x["num"] > bigint(0) { 1 } else { -1 }, str: "inf" };
+            }
+            if x["num"] == bigint(0) { return map{ cls: "zero", sign: 0, val: 0.0, str: "0" }; }
+            if x["num"] == x["den"] { return map{ cls: "one", sign: 1, val: 1.0, str: "1" }; }
+            let fv = parse_number(str(x["num"])) / parse_number(str(x["den"]));
+            return map{ cls: "finite", sign: if fv > 0 { 1 } else { -1 }, val: fv, str: str(x["num"]) + "/" + str(x["den"]) };
+        }
+        if map_has(x, "p") and map_has(x, "q") {
+            if x["p"] == bigint(0) { return map{ cls: "zero", sign: 0, val: 0.0, str: "0" }; }
+            if x["p"] == x["q"] { return map{ cls: "one", sign: 1, val: 1.0, str: "1" }; }
+            let fv = parse_number(str(x["p"])) / parse_number(str(x["q"]));
+            return map{ cls: "finite", sign: if fv > 0 { 1 } else { -1 }, val: fv, str: str(x["p"]) + "/" + str(x["q"]) };
+        }
+    }
+    if type(x) == "bigint" {
+        if x == bigint(0) { return map{ cls: "zero", sign: 0, val: 0.0, str: "0" }; }
+        if x == bigint(1) { return map{ cls: "one", sign: 1, val: 1.0, str: "1" }; }
+        let fv = parse_number(str(x));
+        return map{ cls: "finite", sign: if x > bigint(0) { 1 } else { -1 }, val: fv, str: str(x) };
+    }
+    if type(x) == "number" {
+        if not (x == x) {
+            return map{ cls: "indet", obj: indeterminate("0/0", "NaN", "analytic") };
+        }
+        if (x - x) != 0.0 {
+            let sg = 1;
+            if x < 0.0 { sg = -1; }
+            return map{ cls: "inf", sign: sg, str: if sg > 0 { "+inf" } else { "-inf" } };
+        }
+        if x == 0.0 { return map{ cls: "zero", sign: 0, val: 0.0, str: "0" }; }
+        if x == 1.0 { return map{ cls: "one", sign: 1, val: 1.0, str: "1" }; }
+        return map{ cls: "finite", sign: if x > 0.0 { 1 } else { -1 }, val: x, str: str(x) };
+    }
+    return map{ cls: "unknown", str: str(x) };
+}
+
+// Guarded evaluation over extended reals + algebraic indeterminacy lattice.
+fn eval_guarded_op(op, a, b = nil, context = "analytic") {
+    let ca = _classify_operand(a);
+    if ca["cls"] == "indet" { return ca["obj"]; }
+
+    // Unary domain-guarded operations: "ln", "log", "tan", "cot", "sqrt"
+    if op == "ln" or op == "log" {
+        if ca["cls"] == "zero" {
+            return indeterminate("domain_singularity", op + "(0)", context);
+        }
+        if (ca["cls"] == "finite" and ca["val"] < 0.0) or (ca["cls"] == "inf" and ca["sign"] < 0) {
+            return indeterminate("domain_singularity", op + "(" + ca["str"] + ")", context);
+        }
+        if ca["cls"] == "inf" { return "+inf"; }
+        if ca["cls"] == "one" { return 0.0; }
+        if ca["cls"] == "finite" { return num_ln(ca["val"]); }
+    }
+    if op == "tan" {
+        if ca["cls"] == "inf" {
+            return indeterminate("domain_singularity", "tan(" + ca["str"] + ")", context);
+        }
+        if ca["cls"] == "zero" { return 0.0; }
+        if ca["cls"] == "one" or ca["cls"] == "finite" {
+            let v = ca["val"];
+            let c = num_cos(v);
+            if num_abs(c) < 1e-15 {
+                return indeterminate("domain_singularity", "tan(" + ca["str"] + ")", context);
+            }
+            return num_sin(v) / c;
+        }
+    }
+    if op == "cot" {
+        if ca["cls"] == "zero" or ca["cls"] == "inf" {
+            return indeterminate("domain_singularity", "cot(" + ca["str"] + ")", context);
+        }
+        if ca["cls"] == "one" or ca["cls"] == "finite" {
+            let v = ca["val"];
+            let s = num_sin(v);
+            if num_abs(s) < 1e-15 {
+                return indeterminate("domain_singularity", "cot(" + ca["str"] + ")", context);
+            }
+            return num_cos(v) / s;
+        }
+    }
+
+    let cb = _classify_operand(b);
+    if cb["cls"] == "indet" { return cb["obj"]; }
+    let expr_repr = ca["str"] + " " + str(op) + " " + cb["str"];
+
+    // Division: 0/0, inf/inf, nonzero/0
+    if op == "/" or op == "div" {
+        if ca["cls"] == "zero" and cb["cls"] == "zero" {
+            return indeterminate("0/0", "0/0", context);
+        }
+        if ca["cls"] == "inf" and cb["cls"] == "inf" {
+            return indeterminate("inf/inf", expr_repr, context);
+        }
+        if cb["cls"] == "zero" {
+            return indeterminate("domain_singularity", ca["str"] + "/0", context);
+        }
+        if cb["cls"] == "inf" { return 0.0; }
+        if ca["cls"] == "inf" {
+            let sg = ca["sign"] * cb["sign"];
+            return if sg >= 0 { "+inf" } else { "-inf" };
+        }
+        if ca["cls"] == "zero" { return 0.0; }
+        return ca["val"] / cb["val"];
+    }
+
+    // Modulo: a % 0, inf % b
+    if op == "%" or op == "mod" {
+        if cb["cls"] == "zero" {
+            return indeterminate("mod_zero", ca["str"] + " % 0", context);
+        }
+        if ca["cls"] == "inf" {
+            return indeterminate("domain_singularity", expr_repr, context);
+        }
+        if cb["cls"] == "inf" {
+            if ca["cls"] == "zero" { return 0.0; }
+            return ca["val"];
+        }
+        if ca["cls"] == "zero" { return 0.0; }
+        return ca["val"] - num_floor(ca["val"] / cb["val"]) * cb["val"];
+    }
+
+    // Multiplication: 0 * inf
+    if op == "*" or op == "mul" {
+        if (ca["cls"] == "zero" and cb["cls"] == "inf") or (ca["cls"] == "inf" and cb["cls"] == "zero") {
+            return indeterminate("0*inf", expr_repr, context);
+        }
+        if ca["cls"] == "zero" or cb["cls"] == "zero" { return 0.0; }
+        if ca["cls"] == "inf" or cb["cls"] == "inf" {
+            let sg = ca["sign"] * cb["sign"];
+            return if sg >= 0 { "+inf" } else { "-inf" };
+        }
+        return ca["val"] * cb["val"];
+    }
+
+    // Addition / Subtraction: inf - inf
+    if op == "+" or op == "add" {
+        if ca["cls"] == "inf" and cb["cls"] == "inf" {
+            if ca["sign"] != cb["sign"] {
+                return indeterminate("inf-inf", expr_repr, context);
+            }
+            return if ca["sign"] >= 0 { "+inf" } else { "-inf" };
+        }
+        if ca["cls"] == "inf" { return if ca["sign"] >= 0 { "+inf" } else { "-inf" }; }
+        if cb["cls"] == "inf" { return if cb["sign"] >= 0 { "+inf" } else { "-inf" }; }
+        let va = if ca["cls"] == "zero" { 0.0 } else { ca["val"] };
+        let vb = if cb["cls"] == "zero" { 0.0 } else { cb["val"] };
+        return va + vb;
+    }
+
+    if op == "-" or op == "sub" {
+        if ca["cls"] == "inf" and cb["cls"] == "inf" {
+            if ca["sign"] == cb["sign"] {
+                return indeterminate("inf-inf", expr_repr, context);
+            }
+            return if ca["sign"] >= 0 { "+inf" } else { "-inf" };
+        }
+        if ca["cls"] == "inf" { return if ca["sign"] >= 0 { "+inf" } else { "-inf" }; }
+        if cb["cls"] == "inf" { return if cb["sign"] >= 0 { "-inf" } else { "+inf" }; }
+        let va = if ca["cls"] == "zero" { 0.0 } else { ca["val"] };
+        let vb = if cb["cls"] == "zero" { 0.0 } else { cb["val"] };
+        return va - vb;
+    }
+
+    // Exponentiation: 0^0 (context-sensitive!), 1^inf, inf^0
+    if op == "^" or op == "**" or op == "pow" {
+        if ca["cls"] == "zero" and cb["cls"] == "zero" {
+            let ctx_low = str_lower(str(context));
+            if ctx_low == "combinatorial_algebraic" or ctx_low == "combinatorial" or ctx_low == "polynomial" or ctx_low == "discrete" {
+                return 1;
+            }
+            return indeterminate("0^0", "0^0", context);
+        }
+        if ca["cls"] == "one" and cb["cls"] == "inf" {
+            return indeterminate("1^inf", expr_repr, context);
+        }
+        if ca["cls"] == "inf" and cb["cls"] == "zero" {
+            return indeterminate("inf^0", expr_repr, context);
+        }
+        if ca["cls"] == "zero" {
+            if cb["cls"] == "inf" {
+                if cb["sign"] > 0 { return 0.0; }
+                return indeterminate("domain_singularity", "0^(-inf)", context);
+            }
+            if cb["val"] < 0.0 {
+                return indeterminate("domain_singularity", "0^(" + cb["str"] + ")", context);
+            }
+            return 0.0;
+        }
+        if cb["cls"] == "zero" { return 1.0; }
+        if ca["cls"] == "one" { return 1.0; }
+        if ca["cls"] == "inf" {
+            if cb["cls"] == "inf" {
+                if ca["sign"] > 0 { return if cb["sign"] > 0 { "+inf" } else { 0.0 }; }
+                return indeterminate("domain_singularity", expr_repr, context);
+            }
+            if ca["sign"] > 0 {
+                return if cb["val"] > 0.0 { "+inf" } else { 0.0 };
+            }
+            return indeterminate("domain_singularity", expr_repr, context);
+        }
+        if cb["cls"] == "inf" {
+            let mag = num_abs(ca["val"]);
+            if mag > 1.0 and ca["val"] > 0.0 {
+                return if cb["sign"] > 0 { "+inf" } else { 0.0 };
+            }
+            if mag < 1.0 {
+                return if cb["sign"] > 0 { 0.0 } else { "+inf" };
+            }
+            return indeterminate("domain_singularity", expr_repr, context);
+        }
+        if ca["val"] < 0.0 and num_floor(cb["val"]) != cb["val"] {
+            return indeterminate("domain_singularity", expr_repr, context);
+        }
+        return num_pow(ca["val"], cb["val"]);
+    }
+
+    throw "MathGovernor: unsupported guarded operator '" + str(op) + "'";
+}
+
+export GOVERNOR_VERSION;
+export probe_telemetry, get_policy, set_policy, reset_policy, with_budget;
+export current_limits, new_tracker, tick, check_swell;
+export indeterminate, is_indeterminate, eval_guarded_op;

@@ -17,7 +17,9 @@ let _LN2 = 0.6931471805599453;
 let _INF = 1e308;
 let _NEG_INF = -1e308;
 
-// Mandatory combinatorial and iteration safety caps
+// Legacy exported constants (preserved for 100% backward compatibility; live budgets governed by GOV)
+let GOV = import("stdlib:math/resource_governor.sapp");
+let LG = import("stdlib:math/linalg_geometry.sapp");
 let MAX_MILP_NODES = 4096;
 let MAX_OPT_ITER = 2000;
 let MAX_QM_VARS = 12;
@@ -1440,99 +1442,189 @@ fn ks_test_normal(sample, mu, sigma) {
 
 // 1.3 Multivariate Regression, Polynomial Regression, Logistic Regression & PCA
 
-fn multiple_linear_regression(X_rows, y, add_intercept = true) {
-    let n = len(X_rows);
-    if n != len(y) or n < 2 {
-        return error("multiple_linear_regression: mismatched or insufficient observations");
+fn ols_fit(X_rows, y, add_intercept = true) {
+    if type(X_rows) != "array" or type(y) != "array" {
+        return error("ols_fit: X_rows and y must be arrays");
     }
-    let d_raw = len(X_rows[0]);
+    let n = len(X_rows);
+    if n != len(y) or n < 1 {
+        return error("ols_fit: mismatched or empty observations");
+    }
+    let use_intercept = true;
+    if type(add_intercept) == "bool" {
+        use_intercept = add_intercept;
+    } else if type(add_intercept) == "map" and map_has(add_intercept, "add_intercept") {
+        use_intercept = add_intercept["add_intercept"] == true;
+    }
+
+    let norm_rows = [];
+    let ri = 0;
+    while ri < n {
+        if type(X_rows[ri]) == "array" {
+            array_push(norm_rows, X_rows[ri]);
+        } else {
+            array_push(norm_rows, [X_rows[ri]]);
+        }
+        ri = ri + 1;
+    }
+
+    let d_raw = len(norm_rows[0]);
     let p = d_raw;
-    if add_intercept { p = d_raw + 1; }
-    if n <= p {
-        return error("multiple_linear_regression: need n > number of parameters");
+    if use_intercept { p = d_raw + 1; }
+    if p < 1 {
+        return error("ols_fit: design matrix must have at least 1 column");
     }
 
     let X = _mat_zeros(n, p);
     let i = 0;
     while i < n {
-        if add_intercept {
+        if use_intercept {
             X[i][0] = 1.0;
             let j = 0;
-            while j < d_raw { X[i][j + 1] = X_rows[i][j]; j = j + 1; }
+            while j < d_raw { X[i][j + 1] = norm_rows[i][j] + 0.0; j = j + 1; }
         } else {
             let j = 0;
-            while j < d_raw { X[i][j] = X_rows[i][j]; j = j + 1; }
+            while j < d_raw { X[i][j] = norm_rows[i][j] + 0.0; j = j + 1; }
         }
         i = i + 1;
     }
 
-    let Xt = _mat_transpose(X);
-    let XtX = _mat_mul(Xt, X);
-    let Xty = _mat_vec(Xt, y);
-    let inv_XtX = _mat_inv(XtX);
-    let beta = _mat_vec(inv_XtX, Xty);
+    let y_vec = [];
+    i = 0;
+    while i < n { array_push(y_vec, y[i] + 0.0); i = i + 1; }
 
-    let y_mean = _sample_mean(y);
+    let svd_res = LG.svd(X);
+    let eff_rank = svd_res.rank;
+    let is_collinear = (eff_rank < p);
+    let use_pinv = is_collinear or (n <= p) or (svd_res.cond_2 > 1e12);
+
+    let beta = [];
+    let cov_unscaled_diag = _zeros(p);
+    let method_used = "normal_equations";
+
+    if !use_pinv {
+        let Xt = _mat_transpose(X);
+        let XtX = _mat_mul(Xt, X);
+        let Xty = _mat_vec(Xt, y_vec);
+        let inv_ok = false;
+        let inv_XtX = nil;
+        try {
+            inv_XtX = _mat_inv(XtX);
+            inv_ok = true;
+        } catch _e {
+            inv_ok = false;
+        }
+        if inv_ok and inv_XtX != nil {
+            beta = _mat_vec(inv_XtX, Xty);
+            let jj = 0;
+            while jj < p {
+                cov_unscaled_diag[jj] = _max(0.0, inv_XtX[jj][jj]);
+                jj = jj + 1;
+            }
+        } else {
+            use_pinv = true;
+            is_collinear = true;
+        }
+    }
+
+    if use_pinv {
+        method_used = "svd_moore_penrose_pinv";
+        let X_pinv = LG.pinv(X);
+        beta = _mat_vec(X_pinv, y_vec);
+        let jj = 0;
+        while jj < p {
+            let sq_sum = 0.0;
+            let kk = 0;
+            while kk < n {
+                let pv = X_pinv[jj][kk];
+                sq_sum = sq_sum + pv * pv;
+                kk = kk + 1;
+            }
+            cov_unscaled_diag[jj] = sq_sum;
+            jj = jj + 1;
+        }
+    }
+
+    let y_mean = _sample_mean(y_vec);
     let rss = 0.0;
     let tss = 0.0;
+    let residuals = [];
     i = 0;
     while i < n {
         let y_hat = _dot(X[i], beta);
-        let e = y[i] - y_hat;
+        let e = y_vec[i] - y_hat;
+        array_push(residuals, e);
         rss = rss + e * e;
-        if add_intercept {
-            let dy = y[i] - y_mean;
+        if use_intercept {
+            let dy = y_vec[i] - y_mean;
             tss = tss + dy * dy;
         } else {
-            tss = tss + y[i] * y[i];
+            tss = tss + y_vec[i] * y_vec[i];
         }
         i = i + 1;
     }
 
-    let df_resid = n - p;
-    let df_model = p;
-    if add_intercept { df_model = p - 1; }
-    let sigma2 = rss / df_resid;
+    let df_resid = _max(0, n - eff_rank);
+    let df_model = eff_rank;
+    if use_intercept and df_model > 0 { df_model = df_model - 1; }
+    let sigma2 = 0.0;
+    if df_resid > 0 { sigma2 = rss / df_resid; }
 
     let std_errors = [];
     let t_stats = [];
     let p_values = [];
     let j = 0;
     while j < p {
-        let se_j = num_sqrt(_max(0.0, sigma2 * inv_XtX[j][j]));
+        let se_j = 0.0;
+        if df_resid > 0 {
+            se_j = num_sqrt(_max(0.0, sigma2 * cov_unscaled_diag[j]));
+        }
         array_push(std_errors, se_j);
-        if se_j > 0 {
+        if se_j > 0.0 and df_resid > 0 {
             let tj = beta[j] / se_j;
             array_push(t_stats, tj);
             array_push(p_values, 2.0 * (1.0 - student_t_cdf(num_abs(tj), df_resid)));
         } else {
             array_push(t_stats, 0.0);
-            array_push(p_values, 0.0);
+            array_push(p_values, 1.0);
         }
         j = j + 1;
     }
 
     let r2 = 1.0;
-    if tss > 0 { r2 = 1.0 - rss / tss; }
-    let adj_r2 = 1.0 - (1.0 - r2) * (n - 1.0) / df_resid;
+    if tss > 0.0 {
+        r2 = 1.0 - rss / tss;
+    } else if rss > 1e-24 {
+        r2 = 0.0;
+    }
+    let adj_r2 = r2;
+    if df_resid > 0 and n > 1 {
+        adj_r2 = 1.0 - (1.0 - r2) * (n - 1.0) / df_resid;
+    }
     let f_stat = 0.0;
-    let f_p_value = 0.0;
-    if df_model > 0 and sigma2 > 0 {
-        f_stat = ((tss - rss) / df_model) / sigma2;
+    let f_p_value = 1.0;
+    if df_model > 0 and df_resid > 0 and sigma2 > 0.0 {
+        f_stat = ((_max(0.0, tss - rss)) / df_model) / sigma2;
         f_p_value = 1.0 - f_dist_cdf(_max(0.0, f_stat), df_model, df_resid);
-    } else if df_model > 0 and sigma2 == 0 {
+    } else if df_model > 0 and df_resid > 0 and sigma2 == 0.0 {
         f_stat = _INF;
         f_p_value = 0.0;
     }
 
     let rss_safe = _max(rss, 1e-300);
     let ll = -0.5 * n * (num_ln(_TWO_PI) + num_ln(rss_safe / n) + 1.0);
-    let k_aic = p + 1.0;
-    let aic = -2.0 * ll + 2.0 * p;
-    let bic = -2.0 * ll + p * num_ln(n);
+    let k_eff = eff_rank + 1.0;
+    let aic = -2.0 * ll + 2.0 * eff_rank;
+    let bic = -2.0 * ll + eff_rank * num_ln(_max(1.0, n + 0.0));
 
     let pred_fn = fn(x_row) {
-        if add_intercept and len(x_row) == d_raw {
+        if type(x_row) != "array" {
+            if use_intercept and d_raw == 1 {
+                return beta[0] + beta[1] * x_row;
+            }
+            return beta[0] * x_row;
+        }
+        if use_intercept and len(x_row) == d_raw {
             let acc = beta[0];
             let c = 0;
             while c < d_raw { acc = acc + beta[c + 1] * x_row[c]; c = c + 1; }
@@ -1542,7 +1634,21 @@ fn multiple_linear_regression(X_rows, y, add_intercept = true) {
     };
 
     return map{
+        ok: true,
+        method: method_used,
+        indeterminate_collinear: is_collinear,
+        rank_deficient_indeterminacy: (eff_rank < p),
+        effective_rank: eff_rank,
+        rank: eff_rank,
+        num_parameters: p,
+        singular_values: svd_res.singular_values,
+        cond_number: svd_res.cond_2,
         coefficients: beta,
+        beta: beta,
+        params: beta,
+        residuals: residuals,
+        rss: rss,
+        tss: tss,
         std_errors: std_errors,
         t_stats: t_stats,
         p_values: p_values,
@@ -1552,10 +1658,14 @@ fn multiple_linear_regression(X_rows, y, add_intercept = true) {
         f_p_value: f_p_value,
         aic: aic,
         bic: bic,
-        aic_full: -2.0 * ll + 2.0 * k_aic,
+        aic_full: -2.0 * ll + 2.0 * k_eff,
         df_resid: df_resid,
         predict: pred_fn
     };
+}
+
+fn multiple_linear_regression(X_rows, y, add_intercept = true) {
+    return ols_fit(X_rows, y, add_intercept);
 }
 
 fn polynomial_regression(x, y, degree) {
@@ -1628,9 +1738,12 @@ fn logistic_regression(X_rows, y_binary, add_intercept = true, l2_ridge = 1e-6) 
         i = i + 1;
     }
 
+    let max_opt = GOV.current_limits()["max_opt_iter"];
+    let trk = GOV.new_tracker("stats_opt_applied.logistic_regression");
     let w = _zeros(p);
     let iter = 0;
-    while iter < MAX_OPT_ITER {
+    while iter < max_opt {
+        GOV.tick(trk, n);
         let grad = _zeros(p);
         let H = _mat_zeros(p, p);
         i = 0;
@@ -1984,8 +2097,11 @@ fn _simplex_pivot(T, basis, piv_row, piv_col) {
 fn _simplex_run(T, basis, n_vars_active) {
     let m = len(T) - 1;
     let rhs_col = len(T[0]) - 1;
+    let max_opt = GOV.current_limits()["max_opt_iter"];
+    let trk = GOV.new_tracker("stats_opt_applied.linprog_simplex");
     let iter = 0;
-    while iter < MAX_OPT_ITER {
+    while iter < max_opt {
+        GOV.tick(trk, m + 1);
         let use_bland = iter > 40;
         let enter = -1;
         let best_rc = 1e-9;
@@ -2020,7 +2136,7 @@ fn _simplex_run(T, basis, n_vars_active) {
         _simplex_pivot(T, basis, leave, enter);
         iter = iter + 1;
     }
-    return error("linprog_simplex: exceeded MAX_OPT_ITER");
+    return error("MathGovernor[linprog_simplex]: exceeded adaptive max_opt_iter (" + str(max_opt) + ")");
 }
 
 // Two-Phase Simplex LP solver:
@@ -2273,13 +2389,16 @@ fn milp_solve(c, A_ub, b_ub, int_indices, maximize = true) {
     let best_obj = _NEG_INF;
     if !maximize { best_obj = _INF; }
 
+    let max_nodes = GOV.current_limits()["max_milp_nodes"];
+    let trk = GOV.new_tracker("stats_opt_applied.milp_solve");
     let stack = [map{ A: _mat_copy(A_ub), b: _vec_copy(b_ub) }];
     let nodes = 0;
 
     while len(stack) > 0 {
         nodes = nodes + 1;
-        if nodes > MAX_MILP_NODES {
-            return error("milp_solve: exceeded MAX_MILP_NODES cap (" + str(MAX_MILP_NODES) + ")");
+        GOV.tick(trk, 1);
+        if nodes > max_nodes {
+            return error("MathGovernor[milp_solve]: exceeded adaptive max_milp_nodes cap (" + str(max_nodes) + ")");
         }
         let node = pop(stack);
         let lp = linprog_simplex(c, node.A, node.b, nil, nil, maximize);
@@ -2386,8 +2505,11 @@ fn minimize_1d_brent(f, ax, bx, tol = 1e-10) {
     let d = 0.0;
     let e = 0.0;
 
+    let max_opt = GOV.current_limits()["max_opt_iter"];
+    let trk = GOV.new_tracker("stats_opt_applied.minimize_1d_brent");
     let iter = 0;
-    while iter < MAX_OPT_ITER {
+    while iter < max_opt {
+        GOV.tick(trk, 1);
         let xm = 0.5 * (a + b);
         let tol1 = tol * num_abs(x) + zeps;
         let tol2 = 2.0 * tol1;
@@ -2468,8 +2590,11 @@ fn minimize_bfgs(f, x0, tol = 1e-8) {
     let g = _central_grad(f, x);
     let H = _mat_eye(n);
 
+    let max_opt = GOV.current_limits()["max_opt_iter"];
+    let trk = GOV.new_tracker("stats_opt_applied.minimize_bfgs");
     let iter = 0;
-    while iter < MAX_OPT_ITER {
+    while iter < max_opt {
+        GOV.tick(trk, n);
         let gnorm = _vec_inf_norm(g);
         if gnorm <= tol {
             return map{ x: x, fun: fx, grad_norm: gnorm, iterations: iter, converged: true };
@@ -2574,11 +2699,14 @@ fn curve_fit_lm(model_fn, x_data, y_data, params0) {
         i = i + 1;
     }
 
+    let max_opt = GOV.current_limits()["max_opt_iter"];
+    let trk = GOV.new_tracker("stats_opt_applied.curve_fit_lm");
     let lam = 1e-3;
     let iter = 0;
     let converged = false;
 
-    while iter < MAX_OPT_ITER {
+    while iter < max_opt {
+        GOV.tick(trk, n);
         if ssr < 1e-28 { converged = true; break; }
 
         // Numerical Jacobian J[i][j] = d model_fn(x_i, theta) / d theta_j
@@ -3447,7 +3575,9 @@ fn _quine_mccluskey(minterms, n_vars, vars) {
             p_idx = p_idx + 1;
         }
 
-        // Exact recursive branch-and-bound on uncovered minterms (bounded by MAX_MILP_NODES)
+        // Exact recursive branch-and-bound on uncovered minterms (governed by adaptive max_milp_nodes)
+        let max_bnb_nodes = GOV.current_limits()["max_milp_nodes"];
+        let bnb_trk = GOV.new_tracker("stats_opt_applied.quine_mccluskey");
         let best_state = map{
             best_pick: nil,
             best_terms: 999999,
@@ -3456,7 +3586,8 @@ fn _quine_mccluskey(minterms, n_vars, vars) {
         };
 
         let search_stack = [map{ cov_flags: _zeros(len(rem_mts)), picked: [], lits: 0 }];
-        while len(search_stack) > 0 and best_state.nodes < MAX_MILP_NODES {
+        while len(search_stack) > 0 and best_state.nodes < max_bnb_nodes {
+            GOV.tick(bnb_trk, 1);
             best_state["nodes"] = best_state.nodes + 1;
             let st = pop(search_stack);
             if len(st.picked) > best_state.best_terms { continue; }
@@ -3582,28 +3713,723 @@ fn _quine_mccluskey(minterms, n_vars, vars) {
     };
 }
 
+// ── Large-Scale Boolean Engine (> exact_qm_table_vars): Tseitin-DPLL + Espresso ──
+
+fn _tseitin_alloc(st) {
+    let v = st["next_var"];
+    st["next_var"] = v + 1;
+    return v;
+}
+
+fn _tseitin_encode(node, var_id_map, st) {
+    let op = node.op;
+    if op == "CONST" {
+        if st["true_var"] == 0 {
+            let tv = _tseitin_alloc(st);
+            st["true_var"] = tv;
+            array_push(st["clauses"], [tv]);
+        }
+        let tv2 = st["true_var"];
+        if node.val { return tv2; }
+        return 0 - tv2;
+    }
+    if op == "VAR" {
+        return var_id_map[node.name];
+    }
+    if op == "NOT" {
+        return 0 - _tseitin_encode(node.child, var_id_map, st);
+    }
+    let a = _tseitin_encode(node.left, var_id_map, st);
+    let b = _tseitin_encode(node.right, var_id_map, st);
+    let z = _tseitin_alloc(st);
+    let cls = st["clauses"];
+    if op == "AND" {
+        array_push(cls, [0 - z, a]);
+        array_push(cls, [0 - z, b]);
+        array_push(cls, [z, 0 - a, 0 - b]);
+        return z;
+    }
+    if op == "OR" {
+        array_push(cls, [z, 0 - a]);
+        array_push(cls, [z, 0 - b]);
+        array_push(cls, [0 - z, a, b]);
+        return z;
+    }
+    if op == "IMPLIES" {
+        // z <-> (!a | b)
+        array_push(cls, [z, a]);
+        array_push(cls, [z, 0 - b]);
+        array_push(cls, [0 - z, 0 - a, b]);
+        return z;
+    }
+    if op == "XOR" {
+        array_push(cls, [0 - z, a, b]);
+        array_push(cls, [0 - z, 0 - a, 0 - b]);
+        array_push(cls, [z, 0 - a, b]);
+        array_push(cls, [z, a, 0 - b]);
+        return z;
+    }
+    if op == "IFF" {
+        array_push(cls, [0 - z, 0 - a, b]);
+        array_push(cls, [0 - z, a, 0 - b]);
+        array_push(cls, [z, a, b]);
+        array_push(cls, [z, 0 - a, 0 - b]);
+        return z;
+    }
+    return z;
+}
+
+fn _int_copy(arr) {
+    let out = [];
+    let i = 0;
+    while i < len(arr) {
+        array_push(out, arr[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _dpll_propagate(clauses, assign, trk) {
+    let changed = true;
+    while changed {
+        changed = false;
+        GOV.tick(trk, 1);
+        let ci = 0;
+        let n_cl = len(clauses);
+        while ci < n_cl {
+            let cl = clauses[ci];
+            let sat_cl = false;
+            let un_cnt = 0;
+            let last_lit = 0;
+            let li = 0;
+            let cl_len = len(cl);
+            while li < cl_len {
+                let lit = cl[li];
+                let v = lit;
+                let want = 1;
+                if lit < 0 { v = 0 - lit; want = -1; }
+                let av = assign[v];
+                if av == want {
+                    sat_cl = true;
+                    break;
+                }
+                if av == 0 {
+                    un_cnt = un_cnt + 1;
+                    last_lit = lit;
+                }
+                li = li + 1;
+            }
+            if !sat_cl {
+                if un_cnt == 0 { return false; }
+                if un_cnt == 1 {
+                    let uv = last_lit;
+                    let uw = 1;
+                    if last_lit < 0 { uv = 0 - last_lit; uw = -1; }
+                    assign[uv] = uw;
+                    changed = true;
+                }
+            }
+            ci = ci + 1;
+        }
+    }
+    return true;
+}
+
+fn _dpll_rec(clauses, num_vars, assign, branch_lit, trk) {
+    GOV.tick(trk, 1);
+    if branch_lit != 0 {
+        let bv = branch_lit;
+        let bw = 1;
+        if branch_lit < 0 { bv = 0 - branch_lit; bw = -1; }
+        if assign[bv] != 0 and assign[bv] != bw {
+            return map{ sat: false, assign: nil };
+        }
+        assign[bv] = bw;
+    }
+    if !_dpll_propagate(clauses, assign, trk) {
+        return map{ sat: false, assign: nil };
+    }
+
+    // Check satisfaction and select unassigned literal from shortest active clause
+    let best_len = 999999;
+    let pick_lit = 0;
+    let ci = 0;
+    let n_cl = len(clauses);
+    while ci < n_cl {
+        let cl = clauses[ci];
+        let sat_cl = false;
+        let un_cnt = 0;
+        let first_un = 0;
+        let li = 0;
+        let cl_len = len(cl);
+        while li < cl_len {
+            let lit = cl[li];
+            let v = lit;
+            let want = 1;
+            if lit < 0 { v = 0 - lit; want = -1; }
+            let av = assign[v];
+            if av == want { sat_cl = true; break; }
+            if av == 0 {
+                if first_un == 0 { first_un = lit; }
+                un_cnt = un_cnt + 1;
+            }
+            li = li + 1;
+        }
+        if !sat_cl {
+            if un_cnt == 0 { return map{ sat: false, assign: nil }; }
+            if un_cnt < best_len {
+                best_len = un_cnt;
+                pick_lit = first_un;
+                if best_len <= 2 { break; }
+            }
+        }
+        ci = ci + 1;
+    }
+
+    if pick_lit == 0 {
+        return map{ sat: true, assign: assign };
+    }
+
+    let a1 = _int_copy(assign);
+    let r1 = _dpll_rec(clauses, num_vars, a1, pick_lit, trk);
+    if r1.sat { return r1; }
+
+    let a2 = _int_copy(assign);
+    return _dpll_rec(clauses, num_vars, a2, 0 - pick_lit, trk);
+}
+
+fn _dpll_solve(clauses, num_vars, assumptions, trk) {
+    let assign = [];
+    let i = 0;
+    while i <= num_vars {
+        array_push(assign, 0);
+        i = i + 1;
+    }
+    let ai = 0;
+    while ai < len(assumptions) {
+        let lit = assumptions[ai];
+        let v = lit;
+        let w = 1;
+        if lit < 0 { v = 0 - lit; w = -1; }
+        if assign[v] != 0 and assign[v] != w {
+            return map{ sat: false, assign: nil };
+        }
+        assign[v] = w;
+        ai = ai + 1;
+    }
+    return _dpll_rec(clauses, num_vars, assign, 0, trk);
+}
+
+fn _ast_to_nnf(node, neg) {
+    let op = node.op;
+    if op == "CONST" {
+        let v = node.val;
+        if neg { v = !v; }
+        return map{ op: "CONST", val: v };
+    }
+    if op == "VAR" {
+        return map{ op: "LIT", name: node.name, pos: !neg };
+    }
+    if op == "NOT" {
+        return _ast_to_nnf(node.child, !neg);
+    }
+    if op == "AND" {
+        if !neg {
+            return map{ op: "AND", left: _ast_to_nnf(node.left, false), right: _ast_to_nnf(node.right, false) };
+        }
+        return map{ op: "OR", left: _ast_to_nnf(node.left, true), right: _ast_to_nnf(node.right, true) };
+    }
+    if op == "OR" {
+        if !neg {
+            return map{ op: "OR", left: _ast_to_nnf(node.left, false), right: _ast_to_nnf(node.right, false) };
+        }
+        return map{ op: "AND", left: _ast_to_nnf(node.left, true), right: _ast_to_nnf(node.right, true) };
+    }
+    if op == "IMPLIES" {
+        if !neg {
+            return map{ op: "OR", left: _ast_to_nnf(node.left, true), right: _ast_to_nnf(node.right, false) };
+        }
+        return map{ op: "AND", left: _ast_to_nnf(node.left, false), right: _ast_to_nnf(node.right, true) };
+    }
+    // XOR / IFF
+    let want_same = (op == "IFF" and !neg) or (op == "XOR" and neg);
+    if want_same {
+        return map{
+            op: "OR",
+            left: map{ op: "AND", left: _ast_to_nnf(node.left, false), right: _ast_to_nnf(node.right, false) },
+            right: map{ op: "AND", left: _ast_to_nnf(node.left, true), right: _ast_to_nnf(node.right, true) }
+        };
+    }
+    return map{
+        op: "OR",
+        left: map{ op: "AND", left: _ast_to_nnf(node.left, false), right: _ast_to_nnf(node.right, true) },
+        right: map{ op: "AND", left: _ast_to_nnf(node.left, true), right: _ast_to_nnf(node.right, false) }
+    };
+}
+
+fn _cube_empty(n_vars) {
+    let c = [];
+    let i = 0;
+    while i < n_vars { array_push(c, 0); i = i + 1; }
+    return c;
+}
+
+// True iff cube_a covers cube_b (cube_a is at least as general as cube_b)
+fn _cube_covers(ca, cb, n_vars) {
+    let i = 0;
+    while i < n_vars {
+        let va = ca[i];
+        if va != 0 and va != cb[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _cube_lit_count(c, n_vars) {
+    let cnt = 0;
+    let i = 0;
+    while i < n_vars {
+        if c[i] != 0 { cnt = cnt + 1; }
+        i = i + 1;
+    }
+    return cnt;
+}
+
+fn _cube_to_pattern(c, n_vars) {
+    let s = "";
+    let i = 0;
+    while i < n_vars {
+        if c[i] == 1 { s = s + "1"; }
+        else if c[i] == -1 { s = s + "0"; }
+        else { s = s + "-"; }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn _cubes_absorb(cubes, n_vars, trk) {
+    let m = len(cubes);
+    if m <= 1 { return cubes; }
+    let dead = [];
+    let i = 0;
+    while i < m { array_push(dead, false); i = i + 1; }
+    i = 0;
+    while i < m {
+        if !dead[i] {
+            GOV.tick(trk, 1);
+            let j = 0;
+            while j < m {
+                if i != j and !dead[j] {
+                    if _cube_covers(cubes[i], cubes[j], n_vars) {
+                        dead[j] = true;
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    let out = [];
+    i = 0;
+    while i < m {
+        if !dead[i] { array_push(out, cubes[i]); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _cube_intersect(c1, c2, n_vars) {
+    let out = [];
+    let i = 0;
+    while i < n_vars {
+        let a = c1[i];
+        let b = c2[i];
+        if a == 0 {
+            array_push(out, b);
+        } else if b == 0 or a == b {
+            array_push(out, a);
+        } else {
+            return nil; // contradiction x_i & !x_i
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _nnf_to_cubes(nnf, var_idx_map, n_vars, max_cubes, trk) {
+    GOV.tick(trk, 1);
+    let op = nnf.op;
+    if op == "CONST" {
+        if nnf.val { return map{ ok: true, cubes: [_cube_empty(n_vars)] }; }
+        return map{ ok: true, cubes: [] };
+    }
+    if op == "LIT" {
+        let c = _cube_empty(n_vars);
+        let idx = var_idx_map[nnf.name];
+        if nnf.pos { c[idx] = 1; } else { c[idx] = -1; }
+        return map{ ok: true, cubes: [c] };
+    }
+    if op == "OR" {
+        let rl = _nnf_to_cubes(nnf.left, var_idx_map, n_vars, max_cubes, trk);
+        if !rl.ok { return rl; }
+        let rr = _nnf_to_cubes(nnf.right, var_idx_map, n_vars, max_cubes, trk);
+        if !rr.ok { return rr; }
+        let joined = [];
+        let i = 0;
+        while i < len(rl.cubes) { array_push(joined, rl.cubes[i]); i = i + 1; }
+        i = 0;
+        while i < len(rr.cubes) { array_push(joined, rr.cubes[i]); i = i + 1; }
+        if len(joined) > max_cubes * 2 {
+            joined = _cubes_absorb(joined, n_vars, trk);
+        }
+        if len(joined) > max_cubes {
+            return map{ ok: false, cubes: [] };
+        }
+        return map{ ok: true, cubes: _cubes_absorb(joined, n_vars, trk) };
+    }
+    if op == "AND" {
+        let rl = _nnf_to_cubes(nnf.left, var_idx_map, n_vars, max_cubes, trk);
+        if !rl.ok { return rl; }
+        let rr = _nnf_to_cubes(nnf.right, var_idx_map, n_vars, max_cubes, trk);
+        if !rr.ok { return rr; }
+        if len(rl.cubes) == 0 or len(rr.cubes) == 0 {
+            return map{ ok: true, cubes: [] };
+        }
+        if len(rl.cubes) * len(rr.cubes) > max_cubes * 4 {
+            return map{ ok: false, cubes: [] };
+        }
+        let prod = [];
+        let i = 0;
+        while i < len(rl.cubes) {
+            let j = 0;
+            while j < len(rr.cubes) {
+                let m_cube = _cube_intersect(rl.cubes[i], rr.cubes[j], n_vars);
+                if m_cube != nil {
+                    array_push(prod, m_cube);
+                    if len(prod) > max_cubes * 2 {
+                        prod = _cubes_absorb(prod, n_vars, trk);
+                        if len(prod) > max_cubes {
+                            return map{ ok: false, cubes: [] };
+                        }
+                    }
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        prod = _cubes_absorb(prod, n_vars, trk);
+        if len(prod) > max_cubes {
+            return map{ ok: false, cubes: [] };
+        }
+        return map{ ok: true, cubes: prod };
+    }
+    return map{ ok: false, cubes: [] };
+}
+
+fn _format_nnf_fallback(nnf) {
+    let op = nnf.op;
+    if op == "CONST" { if nnf.val { return "1"; } return "0"; }
+    if op == "LIT" { if nnf.pos { return nnf.name; } return "!" + nnf.name; }
+    if op == "AND" { return "(" + _format_nnf_fallback(nnf.left) + " & " + _format_nnf_fallback(nnf.right) + ")"; }
+    if op == "OR" { return "(" + _format_nnf_fallback(nnf.left) + " | " + _format_nnf_fallback(nnf.right) + ")"; }
+    return "?";
+}
+
+fn _boolean_analyze_large(ast, vars) {
+    let trk = GOV.new_tracker("stats_opt_applied.boolean_analyze_large");
+    let n_vars = len(vars);
+    let var_id_map = map{};
+    let var_idx_map = map{};
+    let i = 0;
+    while i < n_vars {
+        var_id_map[vars[i]] = i + 1;
+        var_idx_map[vars[i]] = i;
+        i = i + 1;
+    }
+
+    // 1. Build linear-size Tseitin CNF and run exact DPLL SAT & Tautology checks
+    let t_state = map{ next_var: n_vars + 1, clauses: [], true_var: 0 };
+    let root_lit = _tseitin_encode(ast, var_id_map, t_state);
+    let total_cnf_vars = t_state["next_var"] - 1;
+    let base_clauses = t_state["clauses"];
+
+    let sat_res = _dpll_solve(base_clauses, total_cnf_vars, [root_lit], trk);
+    if !sat_res.sat {
+        return map{
+            ok: true,
+            method: "espresso_dpll_large_scale",
+            n_vars: n_vars,
+            variables: vars,
+            minimal_sop: "0",
+            quine_mccluskey: "0",
+            prime_implicants: [],
+            essential_prime_implicants: [],
+            is_tautology: false,
+            is_contradiction: true,
+            satisfiable: false,
+            is_satisfiable: false,
+            satisfying_assignment: nil,
+            truth_table: nil
+        };
+    }
+
+    let sat_env = map{};
+    i = 0;
+    while i < n_vars {
+        let av = sat_res.assign[i + 1];
+        sat_env[vars[i]] = (av == 1);
+        i = i + 1;
+    }
+
+    let neg_sat_res = _dpll_solve(base_clauses, total_cnf_vars, [0 - root_lit], trk);
+    if !neg_sat_res.sat {
+        return map{
+            ok: true,
+            method: "espresso_dpll_large_scale",
+            n_vars: n_vars,
+            variables: vars,
+            minimal_sop: "1",
+            quine_mccluskey: "1",
+            prime_implicants: ["1"],
+            essential_prime_implicants: ["1"],
+            is_tautology: true,
+            is_contradiction: false,
+            satisfiable: true,
+            is_satisfiable: true,
+            satisfying_assignment: sat_env,
+            truth_table: nil
+        };
+    }
+
+    // 2. Algebraic NNF + Bounded Cube Extraction + Espresso Prime-Expand & Irredundant Cover
+    let nnf = _ast_to_nnf(ast, false);
+    let cube_ext = _nnf_to_cubes(nnf, var_idx_map, n_vars, 384, trk);
+    if !cube_ext.ok {
+        let alg_str = _format_nnf_fallback(nnf);
+        return map{
+            ok: true,
+            method: "espresso_dpll_large_scale",
+            n_vars: n_vars,
+            variables: vars,
+            minimal_sop: alg_str,
+            quine_mccluskey: alg_str,
+            prime_implicants: [alg_str],
+            essential_prime_implicants: [],
+            is_tautology: false,
+            is_contradiction: false,
+            satisfiable: true,
+            is_satisfiable: true,
+            satisfying_assignment: sat_env,
+            truth_table: nil
+        };
+    }
+
+    let cubes = _cubes_absorb(cube_ext.cubes, n_vars, trk);
+
+    // Phase A: Distance-1 algebraic merging pass
+    let merged_changed = true;
+    while merged_changed and len(cubes) > 1 {
+        merged_changed = false;
+        let m_len = len(cubes);
+        let a_idx = 0;
+        while a_idx < m_len and !merged_changed {
+            let b_idx = a_idx + 1;
+            while b_idx < m_len {
+                let diffs = 0;
+                let dpos = -1;
+                let k = 0;
+                while k < n_vars {
+                    if cubes[a_idx][k] != cubes[b_idx][k] {
+                        if cubes[a_idx][k] == 0 or cubes[b_idx][k] == 0 {
+                            diffs = 2;
+                            break;
+                        }
+                        diffs = diffs + 1;
+                        dpos = k;
+                        if diffs > 1 { break; }
+                    }
+                    k = k + 1;
+                }
+                if diffs == 1 {
+                    let mc = _int_copy(cubes[a_idx]);
+                    mc[dpos] = 0;
+                    array_push(cubes, mc);
+                    cubes = _cubes_absorb(cubes, n_vars, trk);
+                    merged_changed = true;
+                    break;
+                }
+                b_idx = b_idx + 1;
+            }
+            a_idx = a_idx + 1;
+        }
+    }
+
+    // Phase B: Exact SAT-guided Espresso EXPAND (raise each cube to a Prime Implicant of F)
+    let ci = 0;
+    while ci < len(cubes) {
+        let c_cur = cubes[ci];
+        let v_idx = 0;
+        while v_idx < n_vars {
+            if c_cur[v_idx] != 0 {
+                // Test if dropping literal v_idx still implies F (i.e. c' & !F is UNSAT)
+                let assumps = [0 - root_lit];
+                let u = 0;
+                while u < n_vars {
+                    if u != v_idx and c_cur[u] != 0 {
+                        if c_cur[u] == 1 { array_push(assumps, u + 1); }
+                        else { array_push(assumps, 0 - (u + 1)); }
+                    }
+                    u = u + 1;
+                }
+                let check = _dpll_solve(base_clauses, total_cnf_vars, assumps, trk);
+                if !check.sat {
+                    c_cur[v_idx] = 0;
+                }
+            }
+            v_idx = v_idx + 1;
+        }
+        cubes[ci] = c_cur;
+        ci = ci + 1;
+    }
+    cubes = _cubes_absorb(cubes, n_vars, trk);
+
+    // Sort cubes descending by literal count so more specific/consensus cubes are tested for redundancy first
+    let s1 = 1;
+    while s1 < len(cubes) {
+        let key_c = cubes[s1];
+        let key_l = _cube_lit_count(key_c, n_vars);
+        let s2 = s1 - 1;
+        while s2 >= 0 and _cube_lit_count(cubes[s2], n_vars) < key_l {
+            cubes[s2 + 1] = cubes[s2];
+            s2 = s2 - 1;
+        }
+        cubes[s2 + 1] = key_c;
+        s1 = s1 + 1;
+    }
+
+    // Phase C: Exact SAT-guided Espresso IRREDUNDANT cover (drop consensus/covered cubes)
+    let active = [];
+    ci = 0;
+    while ci < len(cubes) { array_push(active, true); ci = ci + 1; }
+    ci = 0;
+    while ci < len(cubes) {
+        let other_clauses = [];
+        let cj = 0;
+        while cj < len(cubes) {
+            if cj != ci and active[cj] {
+                // !(cube cj) is a disjunction of negated literals of cj
+                let cl_neg = [];
+                let v = 0;
+                while v < n_vars {
+                    if cubes[cj][v] == 1 { array_push(cl_neg, 0 - (v + 1)); }
+                    else if cubes[cj][v] == -1 { array_push(cl_neg, v + 1); }
+                    v = v + 1;
+                }
+                if len(cl_neg) == 0 {
+                    // An empty negated clause means another cube is "1" (covers everything)
+                    other_clauses = [[]];
+                    break;
+                }
+                array_push(other_clauses, cl_neg);
+            }
+            cj = cj + 1;
+        }
+        if len(other_clauses) > 0 {
+            let assumps_cov = [];
+            let v = 0;
+            while v < n_vars {
+                if cubes[ci][v] == 1 { array_push(assumps_cov, v + 1); }
+                else if cubes[ci][v] == -1 { array_push(assumps_cov, 0 - (v + 1)); }
+                v = v + 1;
+            }
+            let red_check = _dpll_solve(other_clauses, n_vars, assumps_cov, trk);
+            if !red_check.sat {
+                active[ci] = false;
+            }
+        }
+        ci = ci + 1;
+    }
+
+    // Collect minimal prime implicants in canonical lexicographical pattern order
+    let pat_list = [];
+    ci = 0;
+    while ci < len(cubes) {
+        if active[ci] {
+            array_push(pat_list, _cube_to_pattern(cubes[ci], n_vars));
+        }
+        ci = ci + 1;
+    }
+    pat_list = array_sort(pat_list);
+    // Reverse so '1' patterns precede '0'/'-' nicely
+    let terms = [];
+    let pi = len(pat_list) - 1;
+    while pi >= 0 {
+        array_push(terms, _qm_format_implicant(pat_list[pi], vars));
+        pi = pi - 1;
+    }
+
+    let sop = "0";
+    if len(terms) == 1 {
+        let single = terms[0];
+        if len(single) >= 2 and str_slice(single, 0, 1) == "(" and str_slice(single, len(single) - 1, len(single)) == ")" {
+            sop = str_slice(single, 1, len(single) - 1);
+        } else {
+            sop = single;
+        }
+    } else if len(terms) > 1 {
+        sop = terms[0];
+        let ti = 1;
+        while ti < len(terms) {
+            sop = sop + " | " + terms[ti];
+            ti = ti + 1;
+        }
+    }
+
+    return map{
+        ok: true,
+        method: "espresso_dpll_large_scale",
+        n_vars: n_vars,
+        variables: vars,
+        minimal_sop: sop,
+        quine_mccluskey: sop,
+        prime_implicants: terms,
+        essential_prime_implicants: terms,
+        is_tautology: false,
+        is_contradiction: false,
+        satisfiable: true,
+        is_satisfiable: true,
+        satisfying_assignment: sat_env,
+        truth_table: nil
+    };
+}
+
 fn boolean_analyze(expr_str) {
     let lex = _bool_tokenize(expr_str);
     let vars = lex.vars;
     let n_vars = len(vars);
-    if n_vars > MAX_QM_VARS {
-        return error("boolean_analyze: variable count exceeds MAX_QM_VARS (" + str(MAX_QM_VARS) + ")");
-    }
     let st = map{ tokens: lex.tokens, pos: 0 };
     let ast = _bparse_iff(st);
     if st.tokens[st.pos].kind != "EOF" {
         return error("boolean_analyze: unexpected trailing token");
     }
 
+    let qm_limit = GOV.current_limits()["exact_qm_table_vars"];
+    if n_vars > qm_limit {
+        return _boolean_analyze_large(ast, vars);
+    }
+
+    let trk = GOV.new_tracker("stats_opt_applied.boolean_analyze_qm");
     let total_rows = num_round(num_pow(2, n_vars));
     let truth_table = [];
     let minterms = [];
     let maxterms = [];
     let dnf_clauses = [];
     let cnf_clauses = [];
+    let first_sat_env = nil;
 
     let idx = 0;
     while idx < total_rows {
+        GOV.tick(trk, 1);
         let env = map{};
         let inputs = [];
         let bs = _int_to_bitstr(idx, n_vars);
@@ -3617,6 +4443,7 @@ fn boolean_analyze(expr_str) {
         let out = _beval(ast, env);
         array_push(truth_table, map{ index: idx, inputs: inputs, assignment: env, output: out });
         if out {
+            if first_sat_env == nil { first_sat_env = env; }
             array_push(minterms, idx);
             if n_vars > 0 {
                 array_push(dnf_clauses, _qm_format_implicant(bs, vars));
@@ -3660,10 +4487,15 @@ fn boolean_analyze(expr_str) {
     let qm = _quine_mccluskey(minterms, n_vars, vars);
 
     return map{
+        ok: true,
+        method: "quine_mccluskey_exact",
+        n_vars: n_vars,
         variables: vars,
         truth_table: truth_table,
         is_tautology: len(maxterms) == 0,
+        satisfiable: len(minterms) > 0,
         is_satisfiable: len(minterms) > 0,
+        satisfying_assignment: first_sat_env,
         is_contradiction: len(minterms) == 0,
         minterms: minterms,
         maxterms: maxterms,
@@ -4066,9 +4898,13 @@ fn graph_greedy_and_exact_coloring(n_vertices, edges) {
     i = 0;
     while i < n_vertices { array_push(state.cur_coloring, -1); i = i + 1; }
 
+    let max_col_nodes = GOV.current_limits()["max_milp_nodes"];
+    let col_trk = GOV.new_tracker("stats_opt_applied.graph_coloring");
+
     fn bnb_color(idx, num_used) {
         state["nodes"] = state.nodes + 1;
-        if state.nodes > MAX_MILP_NODES { return nil; }
+        GOV.tick(col_trk, 1);
+        if state.nodes > max_col_nodes { return nil; }
         if num_used >= state.best_k { return nil; }
         if idx == n_vertices {
             state["best_k"] = num_used;
@@ -4091,7 +4927,7 @@ fn graph_greedy_and_exact_coloring(n_vertices, edges) {
                 if c + 1 > next_used { next_used = c + 1; }
                 bnb_color(idx + 1, next_used);
                 state.cur_coloring[v] = -1;
-                if state.nodes > MAX_MILP_NODES { return nil; }
+                if state.nodes > max_col_nodes { return nil; }
             }
             c = c + 1;
         }
@@ -4608,7 +5444,7 @@ export t_test_1samp, t_test_2samp_welch, t_test_paired, z_test_proportions,
        chi2_goodness_of_fit, chi2_independence, anova_oneway,
        mann_whitney_u, ks_test_normal;
 
-export multiple_linear_regression, polynomial_regression,
+export ols_fit, multiple_linear_regression, polynomial_regression,
        logistic_regression, pca;
 
 export bayes_beta_binomial, bayes_normal_normal, bayes_gamma_poisson,

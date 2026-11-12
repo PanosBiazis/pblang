@@ -1,6 +1,6 @@
-# PBLang Documentation Hub (`2.3.0`)
+# PBLang Documentation Hub (`2.4.0`)
 
-Welcome to the official documentation hub for **PBLang `2.3.0`**. Every guide below is organized by topic so you can quickly find language semantics, Sovereign Zero-Rust runtime & universal `64/32/16/8-bit` self-hosting compiler backends, security & supply-chain guarantees, hardware/embedded governance, and performance benchmarks.
+Welcome to the official documentation hub for **PBLang `2.4.0`**. Every guide below is organized by topic so you can quickly find language semantics, Sovereign Zero-Rust runtime & universal `64/32/16/8-bit` self-hosting compiler backends, security & supply-chain guarantees, hardware/embedded governance, and performance benchmarks.
 
 ---
 
