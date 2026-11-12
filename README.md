@@ -531,4 +531,4 @@ pblang run web_app.sapp --allow-net --deny-exec --deny-ffi
 
 ## License
 
-Dual-licensed under MIT (`LICENSE` / `LICENSE-MIT`) and Apache-2.0 (`LICENSE-APACHE`). See [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE).
