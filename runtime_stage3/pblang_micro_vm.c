@@ -1,6 +1,6 @@
 /* ============================================================================
  * pblang_micro_vm.c — Sovereign Freestanding 8-bit / 16-bit / 32-bit Micro-VM
- * Version: 2.5.0
+ * Version: 2.6.0
  *
  * Zero-malloc, zero-FPU, in-place `.pbck` v1 bytecode interpreter engineered
  * for ultra-constrained 8-bit, 16-bit, and 32-bit microcontrollers & legacy OSes:
@@ -22,7 +22,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define PBMICRO_VERSION_STR "pblang-micro-vm 2.5.0 (8/16/32-bit freestanding PBCK v1 engine)"
+#define PBMICRO_VERSION_STR "pblang-micro-vm 2.6.0 (8/16/32-bit freestanding PBCK v1 engine)"
 
 #if defined(__AVR__)
 #include <avr/io.h>

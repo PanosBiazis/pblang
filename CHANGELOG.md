@@ -2,6 +2,24 @@
 
 All notable changes to **PBLang** are documented in this file.
 
+## [`2.6.0`] — 2026-11-13 (`69,700+` LOC Universal 10-Domain Interactive Mathematical Concept Cards · Symbolic 9D SI + Currency + Information Algebra & Exact $\mathbb{Q}$ Buckingham $\Pi$ Engine · 7-Tab Native `gfx*` Math Studio · `PBIDE` `F7` Math/SI Inspector & Ecosystem Synchronization)
+
+### 1. Symbolic 9D SI + Currency + Information Dimensional Algebra & Exact $\mathbb{Q}$ Buckingham $\Pi$ Solver (`stdlib/math/universal_concept_cards.sapp` — `4,484` LOC)
+- **Symbolic 9-Dimension Unit Algebra (`[L, M, T, I, Theta, N, J, EUR, BIT]`)**:
+  - Exact rational $\mathbb{Q}$ exponent vectors (`rat_make`, `dim_pow` supporting fractional roots such as `sqrt(L/g) -> [T^1]`), `130+` SI, engineering, electromagnetism, thermodynamic, photometric, financial (`EUR`, `EUR_cent`, `USD`), and information (`bit`, `B`, `KiB`, `MiB`, `GiB`) units with prefix composition and exact affine temperature conversions (`degC <-> degF <-> K`).
+- **AST Dimensional Consistency Verifier & Independent Multi-Unit Rescaling Proof (`analyze_dimensions`)**:
+  - Traverses any expression, custom function, equation, or inequality AST to enforce additive/relational dimensional compatibility and dimensionless arguments for transcendental functions (`sin`, `exp`, `ln`, `erf`), returning pinpoint bilingual Greek/English violation diagnostics (e.g., `x + v*t + a*t`) and proving true multi-unit invariance under independent base-unit rescaling (`kg -> g, m -> cm, s -> ms` on $Re = \rho v L / \mu$ vs $10^{-7}$ scaling on $\frac{1}{2}mv^2$).
+- **Exact Rational Nullspace Buckingham $\Pi$ Theorem Engine (`buckingham_pi`)**:
+  - Constructs the $9 \times k$ rational dimensional matrix over $\mathbb{Q}$, computes exact Gauss-Jordan RREF rank $r$ and $k - r$ coprime integer dimensionless $\Pi_i$ groups, and automatically identifies isolated-dimension variables that drop out with exponent $0$ (e.g., mass $m$ in the simple pendulum $T, L, m, g$).
+
+### 2. Universal 10-Domain Interactive Concept Card Analyzer & SVG/BMP Renderer (`analyze_universal_concept`, `render_universal_concept_card_svg`, `render_universal_concept_card_bmp`)
+- **Automatic Domain Classification & Pedagogical Card Generation Across All Mathematics**:
+  - Generalizes interactive concept cards beyond statistics to **all 10 mathematical domains**: `statistics`, `physics_si`, `linear_algebra` ($\kappa_2(kA) = \kappa_2(A)$ vs $\det(kA) = k^n \det(A)$), `calculus` (derivatives, Risch/Liouville antiderivatives, limits, Taylor), `ode_control` (damping ratio $\zeta$ invariance vs $\omega_n$, Bode/PID), `equation_inequality` (roots, excluded poles, sign-chart intervals), `multivariate_nd` (`3D`/`4D`/`ND`/Poincaré), `geometry` (Euler line $OG:GH = 1:2$ similarity invariance, conic eccentricity $e$), `finance` (`IRR%` & Black-Scholes $\Delta$ currency-unit invariance vs linear `NPV` scaling), and `function_1d` (arbitrary & custom user functions).
+  - Renders XSS-safe `980×1240` Obsidian-Dark & Alabaster-Light bilingual `<svg>` dashboards (`Header + Invariance Badge` + `5 KPI Cards` + `Dual 0D–ND Visual Panels` + `Before (k=1) vs After Scale/Unit Comparison Table` + `2×2 Βήμα 1..4 Cards`) plus 24-bit `'BM'` BMP rasters, and hardens `omni_dimensional_grapher.sapp` with quiet IEEE-754 `NAN_VAL` pole handling.
+
+### 3. 7-Tab Native `gfx*` Math Studio & `PBIDE` Math/SI Inspector (`stdlib/math/native_math_studio.sapp`, `editors/ide/pbide.sapp`, `stdlib/pbide_product.sapp`)
+- Upgraded `run_native_math_studio` to **7 Tabs** (adding Tab 7 `"7. Κάρτες Εννοιών & SI (Universal Cards & Π)"` with 6 interactive domain presets, live scale $k$ slider, and `render_any_concept_svg`), and integrated `F7` editor formula/SI inspection plus `--math-card`, `--si-check`, and `--math-studio` CLI fast-paths into `PBIDE`.
+
 ## [`2.5.0`] — 2026-11-13 (`64,000+` LOC 100% Pure-PBLang Interactive Mathematics, Custom Functions & Autonomous Real-Time Stepping Lab · PhotoMath 2D OCR & 3-Method Tutor · GeoGebra/Desmos · MATLAB/Control/Simulink · Mathematica Symbolic Rewriting · Statistical & Unit-Scale Invariance Explorers · `0D–ND` Omni-Dimensional Grapher & Native `gfx*` Math Studio)
 
 ### 1. Custom Functions, Free Compositions, Lagrange Prime Derivatives & Autonomous Real-Time Variable Lab (`stdlib/math/symbolic_cas.sapp`, `stdlib/math/interactive_lab.sapp`)

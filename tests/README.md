@@ -1,6 +1,6 @@
 # PBLang Verification & Safety Test Suite (`tests/`)
 
-This directory contains the automated verification tests for **PBLang `2.5.0`**, covering the Sovereign Zero-Rust Host VM & `.sapp` compiler, Complete `MSC2020 (00–97)` & Risch–Liouville Universal Mathematics (`542` assertions across 4 suites), universal `64/32/16/8-bit` native machine-code compilers, Hardware Governor & Sovereign Studio UI, smart polymorphic `pblang update`, 24 algorithms / Quantum / DNA / FIPS 203 `ML-KEM-768`, memory safety, and public release hygiene.
+This directory contains the automated verification tests for **PBLang `2.6.0`**, covering the Sovereign Zero-Rust Host VM & `.sapp` compiler, Complete `MSC2020 (00–97)` & Risch–Liouville Universal Mathematics + Universal Concept Cards & Symbolic SI/Buckingham $\Pi$ (`700` assertions across 6 suites), universal `64/32/16/8-bit` native machine-code compilers, Hardware Governor & Sovereign Studio UI, smart polymorphic `pblang update`, 24 algorithms / Quantum / DNA / FIPS 203 `ML-KEM-768`, memory safety, and public release hygiene.
 
 ---
 
@@ -10,8 +10,8 @@ This directory contains the automated verification tests for **PBLang `2.5.0`**,
 # 1. Sovereign Zero-Rust Host VM, C99 .sapp Compiler, SQLite, HTTP/TLS & Bundle (34/34 checks):
 pblang run tests/zero_rust_vm_test.sapp --allow-all
 
-# 2. Complete MSC2020 (00-97), Risch-Liouville, Indeterminacies, Adaptive Governor & World Canon (542 checks):
-pblang test tests/mathematics_omni_suite_test.sapp tests/math_pure_foundations_test.sapp tests/math_complex_riemann_stochastic_test.sapp tests/math_interdisciplinary_world_canon_test.sapp
+# 2. Complete MSC2020 (00-97), Universal 10-Domain Concept Cards, Symbolic SI/Buckingham Pi, 0D-ND Studio & World Canon (700 checks):
+pblang test tests/mathematics_omni_suite_test.sapp tests/math_interactive_omni_studio_test.sapp tests/universal_concept_cards_and_si_test.sapp tests/math_pure_foundations_test.sapp tests/math_complex_riemann_stochastic_test.sapp tests/math_interdisciplinary_world_canon_test.sapp
 
 # 3. Pure-PBLang 3-Stage Self-Hosting Native Compilers — ELF64, ELF64-dyn & Windows PE32+:
 pblang run tests/path_b_native_sovereign_test.sapp --allow-all
@@ -42,8 +42,9 @@ pblang run tests/public_release_readiness_test.sapp --allow-all
 | Path | Description |
 | :--- | :--- |
 | [zero_rust_vm_test.sapp](zero_rust_vm_test.sapp) | Verifies the `~415 KiB` Zero-Rust Host VM (`runtime_stage3/`), `.sapp -> .pbck` compilation, closures, GC, SQLite, HTTP, `PBLZREXE` bundling, and `--sandbox` (`34/34 PASS`). |
-| [mathematics_omni_suite_test.sapp](mathematics_omni_suite_test.sapp) | Verifies the unified `stdlib/mathematics.sapp` (`v2.5.0`) facade, Risch–Liouville integration, parametric & limit indeterminacies, `AdaptiveMathGovernor`, and `@math`/`@wolfram` polyglot (`61/61 PASS`). |
-| [math_interactive_omni_studio_test.sapp](math_interactive_omni_studio_test.sapp) | Verifies custom functions (`piecewise`, recursion, Lagrange `f'(x)`), autonomous real-time slider stepping, Greek statistical & unit-invariance explorers, pure-PBLang PhotoMath 2D OCR & 3-method tutor, GeoGebra/Desmos, MATLAB/Simulink, Mathematica term-rewriting, `0D–ND` Omni-Dimensional Grapher (`SVG` + `BMP` + `play_live`), and 6-tab Native `gfx*` Math Studio (`55/55 PASS`). |
+| [mathematics_omni_suite_test.sapp](mathematics_omni_suite_test.sapp) | Verifies the unified `stdlib/mathematics.sapp` (`v2.6.0`) facade, Risch–Liouville integration, parametric & limit indeterminacies, `AdaptiveMathGovernor`, and `@math`/`@wolfram` polyglot (`61/61 PASS`). |
+| [math_interactive_omni_studio_test.sapp](math_interactive_omni_studio_test.sapp) | Verifies custom functions (`piecewise`, recursion, Lagrange `f'(x)`), autonomous real-time slider stepping, Greek statistical & unit-invariance explorers, pure-PBLang PhotoMath 2D OCR & 3-method tutor, GeoGebra/Desmos, MATLAB/Simulink, Mathematica term-rewriting, `0D–ND` Omni-Dimensional Grapher (`SVG` + `BMP` + `play_live`), and 7-tab Native `gfx*` Math Studio (`55/55 PASS`). |
+| [universal_concept_cards_and_si_test.sapp](universal_concept_cards_and_si_test.sapp) | Verifies Universal 10-Domain Interactive Concept Cards (`SVG` & `BMP`), Symbolic 9D SI + Currency + Information Algebra (`130+` units, affine `degC`/`degF`/`K`), AST dimensional rescaling proofs, exact $\mathbb{Q}$ Buckingham $\Pi$ dimensionless solver, 7-tab Math Studio, and PBIDE `--si-check` CLI (`103/103 PASS`). |
 | [math_pure_foundations_test.sapp](math_pure_foundations_test.sapp) | Verifies Set/Lattice theory, First-Order Resolution ATP, LTL Model Checking, Category Theory, Galois Theory up to $S_5$, Buchberger Gröbner Bases, Matrix Lie Algebras, and $\mathbb{Z}$-Simplicial/Persistent Homology (`112/112 PASS`). |
 | [math_complex_riemann_stochastic_test.sapp](math_complex_riemann_stochastic_test.sapp) | Verifies Complex Residue Calculus, Analytic $\zeta(s)$, Symbolic Riemannian/Einstein Tensors, Euler-Lagrange, Lyapunov Chaos, Itô/Milstein SDEs, Nash/Shapley, Reed-Solomon, Sparse Krylov, Galerkin FEM & Integral Equations (`141/141 PASS`). |
 | [math_interdisciplinary_world_canon_test.sapp](math_interdisciplinary_world_canon_test.sapp) | Verifies all `63` `MSC2020` divisions, 4-way epistemic filter, Elliptic Curves, Wavelets, Radon CT, DFA/CYK, Kalman/LQR, Physics/Bio/Actuarial/Social Choice, and Scientifically Proven World Mathematical Canons (`228/228 PASS`). |
