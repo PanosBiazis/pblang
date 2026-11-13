@@ -1,0 +1,4514 @@
+// stdlib/math/lean_cic_prover.sapp — Dependent Type Theory Proof Assistant &
+// Trusted Calculus of Inductive Constructions (CIC) Kernel (PBLang v2.7.0).
+//
+// Architecture (De Bruijn Criterion):
+//   1. Small, Unforgeable CIC Trusted Kernel (`CicKernel`):
+//      - Universe hierarchy `Sort(0) = Prop` (impredicative), `Sort(u + 1) = Type u`
+//        (predicative), `Sort(u) : Sort(u + 1)`, `imax(u, 0) = 0`, `imax(u, v) = max(u, v)`.
+//      - Nameless De Bruijn indexed core AST (`Var`, `Sort`, `Const`, `Pi`, `Lam`, `App`, `LetIn`)
+//        with capture-free `lift(term, delta, cutoff)` and `subst(term, arg, depth)`.
+//      - Full beta-delta-iota-zeta-eta WHNF (`kernel_whnf`) and definitional equality
+//        (`kernel_is_def_eq`), including general inductive recursor synthesis and iota-reduction.
+//      - Strict positivity checker (`check_strictly_positive`) blocking Cantor/Curry/Girard paradoxes.
+//      - Transitive constant DAG axiom footprint auditor (`kernel_audit_axioms`, Lean 4 `#print axioms` parity).
+//   2. Lean 4-Style Unicode Pretty-Printer & Surface Syntax Parser (`term_to_unicode`, `parse_term`).
+//   3. Goal-Directed Metavariable Tactic Engine (`new_proof`, `tactic_step`, `prove_with_tactics`, `qed`),
+//      whose output is ALWAYS machine-checked by `kernel_check_type`.
+//   4. Machine-Checked Standard Library (`build_standard_pblib`) — 35+ foundational theorems
+//      across Logic, Equality, Peano Arithmetic (`Nat`), and Polymorphic `List`s with 0 `sorry`.
+//
+// Zero network I/O, zero host path exposure, 100% pure self-contained PBLang.
+
+let CIC_PROVER_VERSION = "2.7.0";
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 1: UNIVERSE LEVEL ALGEBRA (`Sort(u)`, `imax`, POLYMORPHIC LEVELS)
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _is_nonneg_int(v) {
+    return type(v) == "number" and v >= 0 and num_floor(v) == v;
+}
+
+fn _max_int(a, b) {
+    if a > b { return a; }
+    return b;
+}
+
+fn imax_level(u, v) {
+    if _is_nonneg_int(u) and _is_nonneg_int(v) {
+        if v == 0 { return 0; }
+        return _max_int(u, v);
+    }
+    return u_imax(u, v);
+}
+
+fn u_succ(a) {
+    if _is_nonneg_int(a) { return a + 1; }
+    return map{ "u_op": "succ", "a": a };
+}
+
+fn u_max(a, b) {
+    if _is_nonneg_int(a) and _is_nonneg_int(b) { return _max_int(a, b); }
+    if _is_nonneg_int(a) and a == 0 { return b; }
+    if _is_nonneg_int(b) and b == 0 { return a; }
+    if _u_struct_eq(a, b) { return a; }
+    return map{ "u_op": "max", "a": a, "b": b };
+}
+
+fn u_imax(a, b) {
+    if _is_nonneg_int(b) {
+        if b == 0 { return 0; }
+        return u_max(a, b);
+    }
+    if type(b) == "map" and b["u_op"] == "succ" {
+        return u_max(a, b);
+    }
+    if _is_nonneg_int(a) and a == 0 {
+        return b;
+    }
+    if _u_struct_eq(a, b) {
+        return a;
+    }
+    return map{ "u_op": "imax", "a": a, "b": b };
+}
+
+fn _u_struct_eq(a, b) {
+    if type(a) != type(b) { return false; }
+    if type(a) == "number" or type(a) == "string" { return a == b; }
+    if type(a) == "map" {
+        if a["u_op"] != b["u_op"] { return false; }
+        if a["u_op"] == "succ" { return _u_struct_eq(a["a"], b["a"]); }
+        return _u_struct_eq(a["a"], b["a"]) and _u_struct_eq(a["b"], b["b"]);
+    }
+    return false;
+}
+
+fn _arr_contains_str(arr, target) {
+    let i = 0;
+    while i < len(arr) {
+        if arr[i] == target { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _u_valid(lvl, allowed_params) {
+    if _is_nonneg_int(lvl) { return true; }
+    if type(lvl) == "string" {
+        return allowed_params != nil and _arr_contains_str(allowed_params, lvl);
+    }
+    if type(lvl) == "map" and map_has(lvl, "u_op") {
+        let op = lvl["u_op"];
+        if op == "succ" { return _u_valid(lvl["a"], allowed_params); }
+        if op == "max" or op == "imax" {
+            return _u_valid(lvl["a"], allowed_params) and _u_valid(lvl["b"], allowed_params);
+        }
+    }
+    return false;
+}
+
+fn _u_collect_vars(lvl, out) {
+    if type(lvl) == "string" {
+        if not _arr_contains_str(out, lvl) { push(out, lvl); }
+        return out;
+    }
+    if type(lvl) == "map" and map_has(lvl, "u_op") {
+        _u_collect_vars(lvl["a"], out);
+        if lvl["u_op"] == "max" or lvl["u_op"] == "imax" {
+            _u_collect_vars(lvl["b"], out);
+        }
+    }
+    return out;
+}
+
+fn _u_inst(lvl, u_map) {
+    if _is_nonneg_int(lvl) { return lvl; }
+    if type(lvl) == "string" {
+        if u_map != nil and map_has(u_map, lvl) { return u_map[lvl]; }
+        return lvl;
+    }
+    if type(lvl) == "map" and map_has(lvl, "u_op") {
+        let op = lvl["u_op"];
+        if op == "succ" { return u_succ(_u_inst(lvl["a"], u_map)); }
+        if op == "max" { return u_max(_u_inst(lvl["a"], u_map), _u_inst(lvl["b"], u_map)); }
+        if op == "imax" { return u_imax(_u_inst(lvl["a"], u_map), _u_inst(lvl["b"], u_map)); }
+    }
+    throw "CicKernel: invalid universe level expression: " + str(lvl);
+}
+
+fn _u_check_all_assigns(a, b, vars, idx, cur_map, mode) {
+    if idx >= len(vars) {
+        let va = _u_inst(a, cur_map);
+        let vb = _u_inst(b, cur_map);
+        if not _is_nonneg_int(va) or not _is_nonneg_int(vb) { return false; }
+        if mode == "eq" { return va == vb; }
+        return va <= vb;
+    }
+    let vname = vars[idx];
+    let k = 0;
+    while k <= 4 {
+        cur_map[vname] = k;
+        if not _u_check_all_assigns(a, b, vars, idx + 1, cur_map, mode) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+fn _u_eq(a, b) {
+    if _is_nonneg_int(a) and _is_nonneg_int(b) { return a == b; }
+    if _u_struct_eq(a, b) { return true; }
+    let vars = [];
+    _u_collect_vars(a, vars);
+    _u_collect_vars(b, vars);
+    if len(vars) > 4 { return _u_struct_eq(a, b); }
+    return _u_check_all_assigns(a, b, vars, 0, map{}, "eq");
+}
+
+fn _u_leq(a, b) {
+    if _is_nonneg_int(a) and _is_nonneg_int(b) { return a <= b; }
+    if _u_struct_eq(a, b) { return true; }
+    let vars = [];
+    _u_collect_vars(a, vars);
+    _u_collect_vars(b, vars);
+    if len(vars) > 4 { return false; }
+    return _u_check_all_assigns(a, b, vars, 0, map{}, "leq");
+}
+
+fn _u_str(lvl) {
+    if type(lvl) == "number" or type(lvl) == "string" { return str(lvl); }
+    if type(lvl) == "map" and map_has(lvl, "u_op") {
+        let op = lvl["u_op"];
+        if op == "succ" {
+            if _is_nonneg_int(lvl["a"]) { return str(lvl["a"] + 1); }
+            return "(" + _u_str(lvl["a"]) + " + 1)";
+        }
+        return op + "(" + _u_str(lvl["a"]) + ", " + _u_str(lvl["b"]) + ")";
+    }
+    return str(lvl);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 2: NAMELESS DE BRUIJN CORE AST, `lift` & `subst`
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn mk_var(idx) {
+    if not _is_nonneg_int(idx) {
+        throw "CicKernel: De Bruijn index must be a non-negative integer, got " + str(idx);
+    }
+    return map{ "tag": "Var", "idx": idx };
+}
+
+fn mk_sort(level) {
+    if type(level) == "number" and (level < 0 or num_floor(level) != level) {
+        throw "CicKernel: Sort level must be a non-negative integer, got " + str(level);
+    }
+    return map{ "tag": "Sort", "level": level };
+}
+
+fn mk_prop() {
+    return map{ "tag": "Sort", "level": 0 };
+}
+
+fn mk_type(u = 0) {
+    if _is_nonneg_int(u) {
+        return map{ "tag": "Sort", "level": u + 1 };
+    }
+    return map{ "tag": "Sort", "level": u_succ(u) };
+}
+
+fn mk_const(name) {
+    return map{ "tag": "Const", "name": name, "levels": nil };
+}
+
+fn mk_const_u(name, levels) {
+    return map{ "tag": "Const", "name": name, "levels": levels };
+}
+
+fn mk_pi(binder_name, dom, cod) {
+    return map{ "tag": "Pi", "name": binder_name, "dom": dom, "cod": cod };
+}
+
+fn mk_arrow(dom, cod) {
+    return map{ "tag": "Pi", "name": "_", "dom": dom, "cod": lift(cod, 1, 0) };
+}
+
+fn mk_lam(binder_name, dom, body) {
+    return map{ "tag": "Lam", "name": binder_name, "dom": dom, "body": body };
+}
+
+fn mk_app(fn_t, arg_t) {
+    return map{ "tag": "App", "fn_t": fn_t, "arg_t": arg_t };
+}
+
+fn mk_apps(head, args) {
+    let cur = head;
+    let i = 0;
+    while i < len(args) {
+        cur = mk_app(cur, args[i]);
+        i = i + 1;
+    }
+    return cur;
+}
+
+fn mk_letin(binder_name, ty, val, body) {
+    return map{ "tag": "LetIn", "name": binder_name, "ty": ty, "val": val, "body": body };
+}
+
+fn mk_mvar(mvar_id, shift = 0) {
+    return map{ "tag": "MVar", "id": mvar_id, "shift": shift };
+}
+
+fn mk_nat_lit(n) {
+    if not _is_nonneg_int(n) {
+        throw "CicKernel: mk_nat_lit expects non-negative integer, got " + str(n);
+    }
+    let cur = mk_const_u("Nat.zero", []);
+    let succ_c = mk_const_u("Nat.succ", []);
+    let i = 0;
+    while i < n {
+        cur = mk_app(succ_c, cur);
+        i = i + 1;
+    }
+    return cur;
+}
+
+fn dest_nat_lit(term, env = nil) {
+    let acc = 0;
+    let cur = term;
+    while cur != nil and type(cur) == "map" {
+        if env != nil {
+            cur = kernel_whnf(env, cur);
+        }
+        let tg = cur["tag"];
+        if tg == "Const" and cur["name"] == "Nat.zero" {
+            return acc;
+        }
+        if tg == "App" {
+            let fn_node = cur["fn_t"];
+            if fn_node != nil and fn_node["tag"] == "Const" and fn_node["name"] == "Nat.succ" {
+                acc = acc + 1;
+                cur = cur["arg_t"];
+            } else {
+                return nil;
+            }
+        } else {
+            return nil;
+        }
+    }
+    return nil;
+}
+
+fn _unfold_spine(term) {
+    let rev_args = [];
+    let cur = term;
+    while cur != nil and cur["tag"] == "App" {
+        push(rev_args, cur["arg_t"]);
+        cur = cur["fn_t"];
+    }
+    let args = [];
+    let i = len(rev_args) - 1;
+    while i >= 0 {
+        push(args, rev_args[i]);
+        i = i - 1;
+    }
+    return map{ "head": cur, "args": args };
+}
+
+// Capture-avoiding De Bruijn shift `lift(term, delta, cutoff)`.
+fn lift(term, delta, cutoff = 0) {
+    if delta == 0 or term == nil { return term; }
+    let tg = term["tag"];
+    if tg == "Var" {
+        let idx = term["idx"];
+        if idx >= cutoff {
+            return mk_var(idx + delta);
+        }
+        return term;
+    }
+    if tg == "Sort" or tg == "Const" {
+        return term;
+    }
+    if tg == "App" {
+        return mk_app(
+            lift(term["fn_t"], delta, cutoff),
+            lift(term["arg_t"], delta, cutoff)
+        );
+    }
+    if tg == "Pi" {
+        return mk_pi(
+            term["name"],
+            lift(term["dom"], delta, cutoff),
+            lift(term["cod"], delta, cutoff + 1)
+        );
+    }
+    if tg == "Lam" {
+        return mk_lam(
+            term["name"],
+            lift(term["dom"], delta, cutoff),
+            lift(term["body"], delta, cutoff + 1)
+        );
+    }
+    if tg == "LetIn" {
+        return mk_letin(
+            term["name"],
+            lift(term["ty"], delta, cutoff),
+            lift(term["val"], delta, cutoff),
+            lift(term["body"], delta, cutoff + 1)
+        );
+    }
+    if tg == "MVar" {
+        let sh = term["shift"];
+        if cutoff <= sh {
+            return mk_mvar(term["id"], sh + delta);
+        }
+        throw "CicKernel: cannot lift MVar below its creation context";
+    }
+    throw "CicKernel: unknown AST tag in lift: " + str(tg);
+}
+
+// Capture-avoiding De Bruijn substitution `subst(term, arg, depth)`:
+// replaces `Var(depth)` with `lift(arg, depth, 0)` and shifts `Var(idx > depth)` down by 1.
+fn subst(term, arg, depth = 0) {
+    if term == nil { return term; }
+    let tg = term["tag"];
+    if tg == "Var" {
+        let idx = term["idx"];
+        if idx == depth {
+            return lift(arg, depth, 0);
+        }
+        if idx > depth {
+            return mk_var(idx - 1);
+        }
+        return term;
+    }
+    if tg == "Sort" or tg == "Const" {
+        return term;
+    }
+    if tg == "App" {
+        return mk_app(
+            subst(term["fn_t"], arg, depth),
+            subst(term["arg_t"], arg, depth)
+        );
+    }
+    if tg == "Pi" {
+        return mk_pi(
+            term["name"],
+            subst(term["dom"], arg, depth),
+            subst(term["cod"], arg, depth + 1)
+        );
+    }
+    if tg == "Lam" {
+        return mk_lam(
+            term["name"],
+            subst(term["dom"], arg, depth),
+            subst(term["body"], arg, depth + 1)
+        );
+    }
+    if tg == "LetIn" {
+        return mk_letin(
+            term["name"],
+            subst(term["ty"], arg, depth),
+            subst(term["val"], arg, depth),
+            subst(term["body"], arg, depth + 1)
+        );
+    }
+    if tg == "MVar" {
+        let sh = term["shift"];
+        if depth < sh {
+            return mk_mvar(term["id"], sh - 1);
+        }
+        return term;
+    }
+    throw "CicKernel: unknown AST tag in subst: " + str(tg);
+}
+
+fn _inst_term_univs(term, u_map) {
+    if term == nil or u_map == nil { return term; }
+    let tg = term["tag"];
+    if tg == "Var" { return term; }
+    if tg == "Sort" {
+        return mk_sort(_u_inst(term["level"], u_map));
+    }
+    if tg == "Const" {
+        let lvls = term["levels"];
+        if lvls == nil { return term; }
+        let out_lvls = [];
+        let i = 0;
+        while i < len(lvls) {
+            push(out_lvls, _u_inst(lvls[i], u_map));
+            i = i + 1;
+        }
+        return mk_const_u(term["name"], out_lvls);
+    }
+    if tg == "App" {
+        return mk_app(_inst_term_univs(term["fn_t"], u_map), _inst_term_univs(term["arg_t"], u_map));
+    }
+    if tg == "Pi" {
+        return mk_pi(term["name"], _inst_term_univs(term["dom"], u_map), _inst_term_univs(term["cod"], u_map));
+    }
+    if tg == "Lam" {
+        return mk_lam(term["name"], _inst_term_univs(term["dom"], u_map), _inst_term_univs(term["body"], u_map));
+    }
+    if tg == "LetIn" {
+        return mk_letin(
+            term["name"],
+            _inst_term_univs(term["ty"], u_map),
+            _inst_term_univs(term["val"], u_map),
+            _inst_term_univs(term["body"], u_map)
+        );
+    }
+    return term;
+}
+
+// Ensure NO `MVar` or invalid node ever enters the trusted kernel.
+fn _assert_pure_kernel_term(term, allowed_u_params) {
+    if term == nil or type(term) != "map" or not map_has(term, "tag") {
+        throw "CicKernel: malformed term node";
+    }
+    let tg = term["tag"];
+    if tg == "MVar" {
+        throw "CicKernel: unsolved metavariable ?m_" + str(term["id"]) + " rejected by trusted kernel";
+    }
+    if tg == "Var" {
+        if not _is_nonneg_int(term["idx"]) {
+            throw "CicKernel: invalid De Bruijn index";
+        }
+        return true;
+    }
+    if tg == "Sort" {
+        if not _u_valid(term["level"], allowed_u_params) {
+            throw "CicKernel: invalid universe level in Sort: " + str(term["level"]);
+        }
+        return true;
+    }
+    if tg == "Const" {
+        let lvls = term["levels"];
+        if lvls != nil {
+            let i = 0;
+            while i < len(lvls) {
+                if not _u_valid(lvls[i], allowed_u_params) {
+                    throw "CicKernel: invalid universe argument on Const '" + term["name"] + "'";
+                }
+                i = i + 1;
+            }
+        }
+        return true;
+    }
+    if tg == "App" {
+        _assert_pure_kernel_term(term["fn_t"], allowed_u_params);
+        _assert_pure_kernel_term(term["arg_t"], allowed_u_params);
+        return true;
+    }
+    if tg == "Pi" {
+        _assert_pure_kernel_term(term["dom"], allowed_u_params);
+        _assert_pure_kernel_term(term["cod"], allowed_u_params);
+        return true;
+    }
+    if tg == "Lam" {
+        _assert_pure_kernel_term(term["dom"], allowed_u_params);
+        _assert_pure_kernel_term(term["body"], allowed_u_params);
+        return true;
+    }
+    if tg == "LetIn" {
+        _assert_pure_kernel_term(term["ty"], allowed_u_params);
+        _assert_pure_kernel_term(term["val"], allowed_u_params);
+        _assert_pure_kernel_term(term["body"], allowed_u_params);
+        return true;
+    }
+    throw "CicKernel: unknown core AST tag '" + str(tg) + "'";
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 3: TRUSTED `CIC` KERNEL — WHNF, DEF-EQ, TYPECHECKING & POSITIVITY
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _ctx_push(ctx, binder_name, ty, val = nil) {
+    let out = [];
+    let i = 0;
+    while i < len(ctx) {
+        push(out, ctx[i]);
+        i = i + 1;
+    }
+    push(out, map{ "name": binder_name, "ty": ty, "val": val });
+    return out;
+}
+
+fn _make_u_map(param_names, level_vals, decl_name) {
+    let n = len(param_names);
+    if n == 0 {
+        if level_vals != nil and len(level_vals) > 0 {
+            throw "CicKernel: declaration '" + decl_name + "' is not universe-polymorphic, got " + str(len(level_vals)) + " levels";
+        }
+        return nil;
+    }
+    if level_vals == nil or len(level_vals) != n {
+        throw "CicKernel: declaration '" + decl_name + "' expects " + str(n) + " universe level(s)";
+    }
+    let m = map{};
+    let i = 0;
+    while i < n {
+        m[param_names[i]] = level_vals[i];
+        i = i + 1;
+    }
+    return m;
+}
+
+// General CIC iota-reduction on any inductive recursor `Ind.rec`.
+fn _try_iota_reduce(env, ctx, rec_const, args) {
+    let rec_name = rec_const["name"];
+    if not map_has(env["recursors"], rec_name) {
+        return nil;
+    }
+    let rule = env["recursors"][rec_name];
+    let k = rule["num_params"];
+    let m = rule["num_indices"];
+    let ctors_meta = rule["ctors"];
+    let c = len(ctors_meta);
+    let major_pos = k + 1 + c + m;
+    if len(args) <= major_pos {
+        return nil;
+    }
+    let major_whnf = kernel_whnf_ctx(env, ctx, args[major_pos]);
+    let major_sp = _unfold_spine(major_whnf);
+    let m_head = major_sp["head"];
+    if m_head["tag"] != "Const" {
+        return nil;
+    }
+    let ctor_name = m_head["name"];
+    let ctor_idx = -1;
+    let j = 0;
+    while j < c {
+        if ctors_meta[j]["name"] == ctor_name {
+            ctor_idx = j;
+            j = c;
+        } else {
+            j = j + 1;
+        }
+    }
+    if ctor_idx < 0 {
+        return nil;
+    }
+    let cmeta = ctors_meta[ctor_idx];
+    let num_fields = cmeta["num_fields"];
+    let m_args = major_sp["args"];
+    if len(m_args) != k + num_fields {
+        return nil;
+    }
+    let field_args = [];
+    let fi = 0;
+    while fi < num_fields {
+        push(field_args, m_args[k + fi]);
+        fi = fi + 1;
+    }
+    // Prefix arguments `params + [motive] + minors` reused in recursive calls
+    let rec_prefix = [];
+    let pi = 0;
+    while pi < k + 1 + c {
+        push(rec_prefix, args[pi]);
+        pi = pi + 1;
+    }
+    let ih_args = [];
+    let rec_specs = cmeta["rec_fields"];
+    let ri = 0;
+    while ri < len(rec_specs) {
+        let rspec = rec_specs[ri];
+        let f_pos = rspec["field_pos"];
+        let f_val = field_args[f_pos];
+        let idx_tmpls = rspec["idx_templates"];
+        // Substitute constructor params + earlier fields into index templates if indexed
+        let inst_idxs = [];
+        let si = 0;
+        while si < len(idx_tmpls) {
+            let cur_idx_t = idx_tmpls[si];
+            // `cur_idx_t` has De Bruijn vars `0..f_pos-1` = fields `f_pos-1..0`, and `f_pos..f_pos+k-1` = params `k-1..0`
+            let sub_all = [];
+            let pp = 0;
+            while pp < k { push(sub_all, m_args[pp]); pp = pp + 1; }
+            let ff = 0;
+            while ff < f_pos { push(sub_all, field_args[ff]); ff = ff + 1; }
+            let sb = len(sub_all) - 1;
+            while sb >= 0 {
+                cur_idx_t = subst(cur_idx_t, sub_all[sb], 0);
+                sb = sb - 1;
+            }
+            push(inst_idxs, cur_idx_t);
+            si = si + 1;
+        }
+        let rec_call = mk_apps(rec_const, rec_prefix);
+        rec_call = mk_apps(rec_call, inst_idxs);
+        rec_call = mk_app(rec_call, f_val);
+        push(ih_args, rec_call);
+        ri = ri + 1;
+    }
+    let minor_fn = args[k + 1 + ctor_idx];
+    let reduced = mk_apps(minor_fn, field_args);
+    reduced = mk_apps(reduced, ih_args);
+    let extra_i = major_pos + 1;
+    while extra_i < len(args) {
+        reduced = mk_app(reduced, args[extra_i]);
+        extra_i = extra_i + 1;
+    }
+    return reduced;
+}
+
+// Weak Head Normal Form (`beta`, `delta`, `iota`, `zeta`).
+fn kernel_whnf_ctx(env, ctx, term) {
+    let cur = term;
+    while true {
+        let tg = cur["tag"];
+        if tg == "LetIn" {
+            // zeta-reduction
+            cur = subst(cur["body"], cur["val"], 0);
+        } else if tg == "Var" {
+            let idx = cur["idx"];
+            if idx >= 0 and idx < len(ctx) {
+                let entry = ctx[len(ctx) - 1 - idx];
+                if entry["val"] != nil {
+                    // local let-binding zeta-reduction
+                    cur = lift(entry["val"], idx + 1, 0);
+                } else {
+                    return cur;
+                }
+            } else {
+                return cur;
+            }
+        } else if tg == "Const" {
+            let cname = cur["name"];
+            if map_has(env["decls"], cname) {
+                let decl = env["decls"][cname];
+                if decl["kind"] == "def" and decl["value"] != nil {
+                    // delta-reduction
+                    let u_map = nil;
+                    if len(decl["univ_params"]) > 0 and cur["levels"] != nil {
+                        u_map = _make_u_map(decl["univ_params"], cur["levels"], cname);
+                    }
+                    cur = _inst_term_univs(decl["value"], u_map);
+                } else {
+                    return cur;
+                }
+            } else {
+                return cur;
+            }
+        } else if tg == "App" {
+            let sp = _unfold_spine(cur);
+            let hd = kernel_whnf_ctx(env, ctx, sp["head"]);
+            let args = sp["args"];
+            if hd["tag"] == "Lam" and len(args) > 0 {
+                // beta-reduction along spine
+                let acc = hd;
+                let ai = 0;
+                while ai < len(args) and acc["tag"] == "Lam" {
+                    acc = subst(acc["body"], args[ai], 0);
+                    ai = ai + 1;
+                }
+                while ai < len(args) {
+                    acc = mk_app(acc, args[ai]);
+                    ai = ai + 1;
+                }
+                cur = acc;
+            } else if hd["tag"] == "Const" and map_has(env["recursors"], hd["name"]) {
+                let iota_red = _try_iota_reduce(env, ctx, hd, args);
+                if iota_red != nil {
+                    cur = iota_red;
+                } else {
+                    return mk_apps(hd, args);
+                }
+            } else {
+                return mk_apps(hd, args);
+            }
+        } else {
+            return cur;
+        }
+    }
+}
+
+fn kernel_whnf(env, term) {
+    return kernel_whnf_ctx(env, [], term);
+}
+
+fn kernel_norm_ctx(env, ctx, term) {
+    let w = kernel_whnf_ctx(env, ctx, term);
+    let tg = w["tag"];
+    if tg == "Var" or tg == "Sort" or tg == "Const" {
+        return w;
+    }
+    if tg == "App" {
+        let sp = _unfold_spine(w);
+        let nh = kernel_norm_ctx(env, ctx, sp["head"]);
+        let na = [];
+        let i = 0;
+        while i < len(sp["args"]) {
+            push(na, kernel_norm_ctx(env, ctx, sp["args"][i]));
+            i = i + 1;
+        }
+        return mk_apps(nh, na);
+    }
+    if tg == "Pi" {
+        let nd = kernel_norm_ctx(env, ctx, w["dom"]);
+        let ext_ctx = _ctx_push(ctx, w["name"], nd, nil);
+        let nc = kernel_norm_ctx(env, ext_ctx, w["cod"]);
+        return mk_pi(w["name"], nd, nc);
+    }
+    if tg == "Lam" {
+        let nd = kernel_norm_ctx(env, ctx, w["dom"]);
+        let ext_ctx = _ctx_push(ctx, w["name"], nd, nil);
+        let nb = kernel_norm_ctx(env, ext_ctx, w["body"]);
+        return mk_lam(w["name"], nd, nb);
+    }
+    return w;
+}
+
+fn kernel_norm(env, term) {
+    return kernel_norm_ctx(env, [], term);
+}
+
+fn _levels_def_eq(lvls1, lvls2) {
+    if lvls1 == nil or lvls2 == nil { return true; }
+    if len(lvls1) != len(lvls2) { return false; }
+    let i = 0;
+    while i < len(lvls1) {
+        if not _u_eq(lvls1[i], lvls2[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Full beta-delta-iota-zeta-eta definitional equality (`kernel_is_def_eq`).
+fn kernel_is_def_eq_ctx(env, ctx, t1, t2) {
+    if t1 == t2 { return true; }
+    let w1 = kernel_whnf_ctx(env, ctx, t1);
+    let w2 = kernel_whnf_ctx(env, ctx, t2);
+    let tg1 = w1["tag"];
+    let tg2 = w2["tag"];
+
+    // Eta-conversion: `Lam(x, dom, body) == f  <==>  body == App(lift(f, 1, 0), Var(0))`
+    if tg1 == "Lam" and tg2 != "Lam" {
+        let ext_ctx = _ctx_push(ctx, w1["name"], w1["dom"], nil);
+        let rhs_eta = mk_app(lift(w2, 1, 0), mk_var(0));
+        return kernel_is_def_eq_ctx(env, ext_ctx, w1["body"], rhs_eta);
+    }
+    if tg2 == "Lam" and tg1 != "Lam" {
+        let ext_ctx = _ctx_push(ctx, w2["name"], w2["dom"], nil);
+        let lhs_eta = mk_app(lift(w1, 1, 0), mk_var(0));
+        return kernel_is_def_eq_ctx(env, ext_ctx, lhs_eta, w2["body"]);
+    }
+
+    if tg1 != tg2 { return false; }
+
+    if tg1 == "Var" {
+        return w1["idx"] == w2["idx"];
+    }
+    if tg1 == "Sort" {
+        return _u_eq(w1["level"], w2["level"]);
+    }
+    if tg1 == "Const" {
+        if w1["name"] != w2["name"] { return false; }
+        return _levels_def_eq(w1["levels"], w2["levels"]);
+    }
+    if tg1 == "Pi" {
+        if not kernel_is_def_eq_ctx(env, ctx, w1["dom"], w2["dom"]) { return false; }
+        let ext_ctx = _ctx_push(ctx, w1["name"], w1["dom"], nil);
+        return kernel_is_def_eq_ctx(env, ext_ctx, w1["cod"], w2["cod"]);
+    }
+    if tg1 == "Lam" {
+        if not kernel_is_def_eq_ctx(env, ctx, w1["dom"], w2["dom"]) { return false; }
+        let ext_ctx = _ctx_push(ctx, w1["name"], w1["dom"], nil);
+        return kernel_is_def_eq_ctx(env, ext_ctx, w1["body"], w2["body"]);
+    }
+    if tg1 == "App" {
+        let sp1 = _unfold_spine(w1);
+        let sp2 = _unfold_spine(w2);
+        let a1 = sp1["args"];
+        let a2 = sp2["args"];
+        if len(a1) != len(a2) { return false; }
+        if not kernel_is_def_eq_ctx(env, ctx, sp1["head"], sp2["head"]) { return false; }
+        let i = 0;
+        while i < len(a1) {
+            if not kernel_is_def_eq_ctx(env, ctx, a1[i], a2[i]) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn kernel_is_def_eq(env, t1, t2) {
+    return kernel_is_def_eq_ctx(env, [], t1, t2);
+}
+
+// Match universe parameters from expected template against concrete inferred argument type.
+// Soundness note: this is purely an ergonomic hint when `Const(name, nil)` omits explicit
+// levels — the kernel ALWAYS verifies the instantiated Pi declaration type from scratch!
+fn _match_univ_template(env, ctx, tmpl, actual, u_params, u_bindings) {
+    if tmpl == nil or actual == nil { return; }
+    let t_tg = tmpl["tag"];
+    if t_tg == "Sort" {
+        let aw = kernel_whnf_ctx(env, ctx, actual);
+        if aw["tag"] == "Sort" {
+            let p = tmpl["level"];
+            if type(p) == "string" and _arr_contains_str(u_params, p) and not map_has(u_bindings, p) {
+                u_bindings[p] = aw["level"];
+            }
+        }
+        return;
+    }
+    if t_tg == "Const" {
+        let aw = kernel_whnf_ctx(env, ctx, actual);
+        if aw["tag"] == "Const" and aw["name"] == tmpl["name"] and tmpl["levels"] != nil and aw["levels"] != nil {
+            let tl = tmpl["levels"];
+            let al = aw["levels"];
+            if len(tl) == len(al) {
+                let i = 0;
+                while i < len(tl) {
+                    if type(tl[i]) == "string" and _arr_contains_str(u_params, tl[i]) and not map_has(u_bindings, tl[i]) {
+                        u_bindings[tl[i]] = al[i];
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+        return;
+    }
+    if t_tg == "Pi" {
+        let aw = kernel_whnf_ctx(env, ctx, actual);
+        if aw["tag"] == "Pi" {
+            _match_univ_template(env, ctx, tmpl["dom"], aw["dom"], u_params, u_bindings);
+            let ext_ctx = _ctx_push(ctx, aw["name"], aw["dom"], nil);
+            _match_univ_template(env, ext_ctx, tmpl["cod"], aw["cod"], u_params, u_bindings);
+        }
+        return;
+    }
+    if t_tg == "App" {
+        let sp_t = _unfold_spine(tmpl);
+        let aw = kernel_whnf_ctx(env, ctx, actual);
+        let sp_a = _unfold_spine(aw);
+        if len(sp_t["args"]) == len(sp_a["args"]) {
+            _match_univ_template(env, ctx, sp_t["head"], sp_a["head"], u_params, u_bindings);
+            let i = 0;
+            while i < len(sp_t["args"]) {
+                _match_univ_template(env, ctx, sp_t["args"][i], sp_a["args"][i], u_params, u_bindings);
+                i = i + 1;
+            }
+        }
+    }
+}
+
+fn _infer_poly_levels_for_spine(env, ctx, decl, args, allowed_u_params) {
+    let u_params = decl["univ_params"];
+    let u_bindings = map{};
+    let cur_ty = decl["type"];
+    let i = 0;
+    while i < len(args) {
+        if cur_ty["tag"] != "Pi" {
+            cur_ty = kernel_whnf_ctx(env, ctx, cur_ty);
+        }
+        if cur_ty["tag"] != "Pi" {
+            i = len(args);
+        } else {
+            let arg_ty = kernel_infer_type_ctx(env, ctx, args[i], allowed_u_params);
+            _match_univ_template(env, ctx, cur_ty["dom"], arg_ty, u_params, u_bindings);
+            cur_ty = subst(cur_ty["cod"], args[i], 0);
+            i = i + 1;
+        }
+    }
+    let out = [];
+    let j = 0;
+    while j < len(u_params) {
+        let pname = u_params[j];
+        if map_has(u_bindings, pname) and _u_valid(u_bindings[pname], allowed_u_params) {
+            push(out, u_bindings[pname]);
+        } else {
+            // Default unbound motive level to 0 (Prop), data type parameter to 1 (Type 0)
+            if pname == "u_motive" { push(out, 0); } else { push(out, 1); }
+        }
+        j = j + 1;
+    }
+    return out;
+}
+
+fn _infer_sort_level(env, ctx, ty_term, allowed_u_params) {
+    let s = kernel_infer_type_ctx(env, ctx, ty_term, allowed_u_params);
+    let sw = kernel_whnf_ctx(env, ctx, s);
+    if sw["tag"] != "Sort" {
+        throw "CicKernel: expected a type (Sort), but inferred non-Sort for term";
+    }
+    return sw["level"];
+}
+
+// Trusted CIC Type Inference (`kernel_infer_type_ctx`).
+fn kernel_infer_type_ctx(env, ctx, term, allowed_u_params = nil) {
+    _assert_pure_kernel_term(term, allowed_u_params);
+    let tg = term["tag"];
+
+    if tg == "Var" {
+        let idx = term["idx"];
+        if idx < 0 or idx >= len(ctx) {
+            throw "CicKernel: unbound De Bruijn variable Var(" + str(idx) + ") in context of size " + str(len(ctx));
+        }
+        let entry = ctx[len(ctx) - 1 - idx];
+        return lift(entry["ty"], idx + 1, 0);
+    }
+
+    if tg == "Sort" {
+        // Sort(u) : Sort(u + 1) — NEVER Sort(u) : Sort(u) (blocks Girard's paradox!)
+        return mk_sort(u_succ(term["level"]));
+    }
+
+    if tg == "Const" {
+        let cname = term["name"];
+        if not map_has(env["decls"], cname) {
+            throw "CicKernel: unknown constant '" + cname + "'";
+        }
+        let decl = env["decls"][cname];
+        let u_params = decl["univ_params"];
+        let lvls = term["levels"];
+        if len(u_params) > 0 and lvls == nil {
+            lvls = _infer_poly_levels_for_spine(env, ctx, decl, [], allowed_u_params);
+        }
+        let u_map = _make_u_map(u_params, lvls, cname);
+        return _inst_term_univs(decl["type"], u_map);
+    }
+
+    if tg == "Pi" {
+        // Product rule: if A : Sort(u) and B : Sort(v), then Pi(x : A, B) : Sort(imax(u, v))
+        let u = _infer_sort_level(env, ctx, term["dom"], allowed_u_params);
+        let ext_ctx = _ctx_push(ctx, term["name"], term["dom"], nil);
+        let v = _infer_sort_level(env, ext_ctx, term["cod"], allowed_u_params);
+        return mk_sort(imax_level(u, v));
+    }
+
+    if tg == "Lam" {
+        let _u = _infer_sort_level(env, ctx, term["dom"], allowed_u_params);
+        let ext_ctx = _ctx_push(ctx, term["name"], term["dom"], nil);
+        let body_ty = kernel_infer_type_ctx(env, ext_ctx, term["body"], allowed_u_params);
+        return mk_pi(term["name"], term["dom"], body_ty);
+    }
+
+    if tg == "LetIn" {
+        let _u = _infer_sort_level(env, ctx, term["ty"], allowed_u_params);
+        kernel_check_type_ctx(env, ctx, term["val"], term["ty"], allowed_u_params);
+        let ext_ctx = _ctx_push(ctx, term["name"], term["ty"], term["val"]);
+        let body_ty = kernel_infer_type_ctx(env, ext_ctx, term["body"], allowed_u_params);
+        return subst(body_ty, term["val"], 0);
+    }
+
+    if tg == "App" {
+        let sp = _unfold_spine(term);
+        let hd = sp["head"];
+        let args = sp["args"];
+        let fn_ty = nil;
+        if hd["tag"] == "Const" and hd["levels"] == nil and map_has(env["decls"], hd["name"]) {
+            let decl = env["decls"][hd["name"]];
+            if len(decl["univ_params"]) > 0 {
+                let inferred_lvls = _infer_poly_levels_for_spine(env, ctx, decl, args, allowed_u_params);
+                let u_map = _make_u_map(decl["univ_params"], inferred_lvls, hd["name"]);
+                fn_ty = _inst_term_univs(decl["type"], u_map);
+            }
+        }
+        if fn_ty == nil {
+            fn_ty = kernel_infer_type_ctx(env, ctx, hd, allowed_u_params);
+        }
+        let i = 0;
+        while i < len(args) {
+            let w_fn_ty = kernel_whnf_ctx(env, ctx, fn_ty);
+            if w_fn_ty["tag"] != "Pi" {
+                throw "CicKernel: function application head does not have a Pi type";
+            }
+            let arg_ty = kernel_infer_type_ctx(env, ctx, args[i], allowed_u_params);
+            if not kernel_is_def_eq_ctx(env, ctx, arg_ty, w_fn_ty["dom"]) {
+                throw "CicKernel: application argument #" + str(i + 1) + " type mismatch";
+            }
+            fn_ty = subst(w_fn_ty["cod"], args[i], 0);
+            i = i + 1;
+        }
+        return fn_ty;
+    }
+
+    throw "CicKernel: unsupported AST node in kernel_infer_type";
+}
+
+fn kernel_infer_type(env, term) {
+    return kernel_infer_type_ctx(env, [], term, nil);
+}
+
+fn kernel_check_type_ctx(env, ctx, term, expected_type, allowed_u_params = nil) {
+    let _sort_ok = _infer_sort_level(env, ctx, expected_type, allowed_u_params);
+    let inferred = kernel_infer_type_ctx(env, ctx, term, allowed_u_params);
+    if not kernel_is_def_eq_ctx(env, ctx, inferred, expected_type) {
+        throw "CicKernel: type mismatch in kernel_check_type";
+    }
+    return true;
+}
+
+fn kernel_check_type(env, term, expected_type) {
+    return kernel_check_type_ctx(env, [], term, expected_type, nil);
+}
+
+// ── Strict Positivity Checker (`check_strictly_positive`) ──────────────────
+
+fn _term_mentions_const(env, term, target_name) {
+    if term == nil { return false; }
+    let tg = term["tag"];
+    if tg == "Var" or tg == "Sort" { return false; }
+    if tg == "Const" {
+        let cname = term["name"];
+        if cname == target_name { return true; }
+        if env != nil and map_has(env["decls"], cname) {
+            let decl = env["decls"][cname];
+            if decl["kind"] == "def" and decl["value"] != nil {
+                return _term_mentions_const(env, decl["value"], target_name);
+            }
+        }
+        return false;
+    }
+    if tg == "App" {
+        return _term_mentions_const(env, term["fn_t"], target_name) or _term_mentions_const(env, term["arg_t"], target_name);
+    }
+    if tg == "Pi" {
+        return _term_mentions_const(env, term["dom"], target_name) or _term_mentions_const(env, term["cod"], target_name);
+    }
+    if tg == "Lam" {
+        return _term_mentions_const(env, term["dom"], target_name) or _term_mentions_const(env, term["body"], target_name);
+    }
+    if tg == "LetIn" {
+        return _term_mentions_const(env, term["ty"], target_name)
+            or _term_mentions_const(env, term["val"], target_name)
+            or _term_mentions_const(env, term["body"], target_name);
+    }
+    return false;
+}
+
+fn _check_positivity_in_field(env, ctx, ind_name, field_ty) {
+    if not _term_mentions_const(env, field_ty, ind_name) {
+        return true;
+    }
+    let w = field_ty;
+    if env != nil {
+        w = kernel_whnf_ctx(env, ctx, field_ty);
+    }
+    if not _term_mentions_const(env, w, ind_name) {
+        return true;
+    }
+    if w["tag"] == "Pi" {
+        // Negative / left-of-arrow occurrence is STRICTLY FORBIDDEN!
+        if _term_mentions_const(env, w["dom"], ind_name) {
+            return false;
+        }
+        let ext_ctx = _ctx_push(ctx, w["name"], w["dom"], nil);
+        return _check_positivity_in_field(env, ext_ctx, ind_name, w["cod"]);
+    }
+    let sp = _unfold_spine(w);
+    let hd = sp["head"];
+    let args = sp["args"];
+    if hd["tag"] == "Const" and hd["name"] == ind_name {
+        let i = 0;
+        while i < len(args) {
+            if _term_mentions_const(env, args[i], ind_name) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    // Any other occurrence (e.g., inside arguments of another type constructor) rejected conservatively
+    return false;
+}
+
+fn check_strictly_positive(ind_name, ctor_or_field_ty, env = nil, num_params = 0) {
+    let cur = ctor_or_field_ty;
+    let ctx = [];
+    let p = 0;
+    while p < num_params and cur["tag"] == "Pi" {
+        ctx = _ctx_push(ctx, cur["name"], cur["dom"], nil);
+        cur = cur["cod"];
+        p = p + 1;
+    }
+    // If `cur` is a full constructor type ending in `Ind ...`, check every argument domain;
+    // if `cur` is a standalone field type `(Bad -> False)`, check `cur` directly!
+    let sp_end = _unfold_spine(cur);
+    if cur["tag"] == "Pi" {
+        // Walk Pi spine: if final codomain head is `Const(ind_name)`, this is a full constructor type
+        let probe = cur;
+        while probe["tag"] == "Pi" {
+            probe = probe["cod"];
+        }
+        let end_hd = _unfold_spine(probe)["head"];
+        if end_hd["tag"] == "Const" and end_hd["name"] == ind_name {
+            let walk = cur;
+            let wctx = ctx;
+            while walk["tag"] == "Pi" {
+                if not _check_positivity_in_field(env, wctx, ind_name, walk["dom"]) {
+                    return false;
+                }
+                wctx = _ctx_push(wctx, walk["name"], walk["dom"], nil);
+                walk = walk["cod"];
+            }
+            let ret_args = _unfold_spine(walk)["args"];
+            let ri = 0;
+            while ri < len(ret_args) {
+                if _term_mentions_const(env, ret_args[ri], ind_name) {
+                    return false;
+                }
+                ri = ri + 1;
+            }
+            return true;
+        }
+    }
+    if sp_end["head"]["tag"] == "Const" and sp_end["head"]["name"] == ind_name {
+        let rargs = sp_end["args"];
+        let ri = 0;
+        while ri < len(rargs) {
+            if _term_mentions_const(env, rargs[ri], ind_name) { return false; }
+            ri = ri + 1;
+        }
+        return true;
+    }
+    return _check_positivity_in_field(env, ctx, ind_name, cur);
+}
+
+// ── Environment & Declaration Registration ──────────────────────────────────
+
+fn _assert_fresh_decl(env, name) {
+    if map_has(env["decls"], name) {
+        throw "CicKernel: declaration '" + name + "' already exists in environment";
+    }
+}
+
+fn kernel_add_axiom(env, name, ty, univ_params = []) {
+    _assert_fresh_decl(env, name);
+    let _u = _infer_sort_level(env, [], ty, univ_params);
+    env["decls"][name] = map{
+        "kind": "axiom",
+        "name": name,
+        "univ_params": univ_params,
+        "type": ty,
+        "value": nil
+    };
+    push(env["order"], name);
+    return env;
+}
+
+fn kernel_add_def(env, name, ty, val, univ_params = []) {
+    _assert_fresh_decl(env, name);
+    kernel_check_type_ctx(env, [], val, ty, univ_params);
+    env["decls"][name] = map{
+        "kind": "def",
+        "name": name,
+        "univ_params": univ_params,
+        "type": ty,
+        "value": val
+    };
+    push(env["order"], name);
+    return env;
+}
+
+fn kernel_add_theorem(env, name, prop_ty, proof_term, univ_params = []) {
+    _assert_fresh_decl(env, name);
+    // De Bruijn Criterion: EVERY theorem MUST pass `kernel_check_type_ctx`!
+    kernel_check_type_ctx(env, [], proof_term, prop_ty, univ_params);
+    env["decls"][name] = map{
+        "kind": "theorem",
+        "name": name,
+        "univ_params": univ_params,
+        "type": prop_ty,
+        "value": proof_term,
+        "kernel_verified": true
+    };
+    push(env["order"], name);
+    return env;
+}
+
+fn _peel_pis(ty, max_count = -1) {
+    let binders = [];
+    let cur = ty;
+    while cur["tag"] == "Pi" and (max_count < 0 or len(binders) < max_count) {
+        push(binders, map{ "name": cur["name"], "dom": cur["dom"] });
+        cur = cur["cod"];
+    }
+    return map{ "binders": binders, "body": cur };
+}
+
+fn _wrap_pis(binders, body) {
+    let cur = body;
+    let i = len(binders) - 1;
+    while i >= 0 {
+        cur = mk_pi(binders[i]["name"], binders[i]["dom"], cur);
+        i = i - 1;
+    }
+    return cur;
+}
+
+fn _const_with_sym_univs(name, univ_params) {
+    if len(univ_params) == 0 {
+        return mk_const_u(name, []);
+    }
+    let lvls = [];
+    let i = 0;
+    while i < len(univ_params) {
+        push(lvls, univ_params[i]);
+        i = i + 1;
+    }
+    return mk_const_u(name, lvls);
+}
+
+// Register an inductive family `I`, verify strict positivity & universe predicativity,
+// and synthesize its CIC recursor `I.rec` + iota-reduction rule!
+fn kernel_add_inductive(env, spec) {
+    let ind_name = spec["name"];
+    _assert_fresh_decl(env, ind_name);
+    let univ_params = [];
+    if map_has(spec, "univ_params") and spec["univ_params"] != nil {
+        univ_params = spec["univ_params"];
+    }
+    let num_params = 0;
+    if map_has(spec, "num_params") and spec["num_params"] != nil {
+        num_params = spec["num_params"];
+    }
+    let ind_ty = spec["type"];
+    let ctors = spec["ctors"];
+
+    // 1. Check `ind_ty` is a valid Pi telescope ending in `Sort(ind_u)`
+    let _ind_ty_sort = _infer_sort_level(env, [], ind_ty, univ_params);
+    let peeled_ind = _peel_pis(ind_ty, -1);
+    let all_ind_binders = peeled_ind["binders"];
+    if len(all_ind_binders) < num_params {
+        throw "CicKernel: inductive '" + ind_name + "' has fewer Pi binders than num_params";
+    }
+    if peeled_ind["body"]["tag"] != "Sort" {
+        throw "CicKernel: inductive '" + ind_name + "' target must be a Sort";
+    }
+    let ind_u = peeled_ind["body"]["level"];
+    let param_binders = [];
+    let index_binders = [];
+    let bi = 0;
+    while bi < len(all_ind_binders) {
+        if bi < num_params {
+            push(param_binders, all_ind_binders[bi]);
+        } else {
+            push(index_binders, all_ind_binders[bi]);
+        }
+        bi = bi + 1;
+    }
+    let num_indices = len(index_binders);
+
+    // Temporarily register `ind_name` so constructors can reference it; roll back on any failure!
+    env["decls"][ind_name] = map{
+        "kind": "inductive",
+        "name": ind_name,
+        "univ_params": univ_params,
+        "type": ind_ty,
+        "value": nil
+    };
+
+    let ctors_meta = [];
+    let all_fields_in_prop = true;
+    let ok = true;
+    let err_msg = "";
+
+    try {
+        let ci = 0;
+        while ci < len(ctors) {
+            let cspec = ctors[ci];
+            let cname = cspec["name"];
+            _assert_fresh_decl(env, cname);
+            let cty = cspec["type"];
+
+            // Typecheck constructor type in environment with `ind_name`
+            let _cty_sort = _infer_sort_level(env, [], cty, univ_params);
+
+            // Strict positivity check!
+            if not check_strictly_positive(ind_name, cty, env, num_params) {
+                throw "CicKernel: non-strictly-positive occurrence of '" + ind_name + "' in constructor '" + cname + "'";
+            }
+
+            let peeled_p = _peel_pis(cty, num_params);
+            if len(peeled_p["binders"]) != num_params {
+                throw "CicKernel: constructor '" + cname + "' missing uniform parameters";
+            }
+            let p_ctx = [];
+            let pi = 0;
+            while pi < num_params {
+                if not kernel_is_def_eq_ctx(env, p_ctx, peeled_p["binders"][pi]["dom"], param_binders[pi]["dom"]) {
+                    throw "CicKernel: constructor '" + cname + "' parameter #" + str(pi + 1) + " domain mismatch";
+                }
+                p_ctx = _ctx_push(p_ctx, param_binders[pi]["name"], param_binders[pi]["dom"], nil);
+                pi = pi + 1;
+            }
+
+            let peeled_f = _peel_pis(peeled_p["body"], -1);
+            let f_binders = peeled_f["binders"];
+            let c_ret = peeled_f["body"];
+            let f_ctx = p_ctx;
+            let rec_fields = [];
+            let fi = 0;
+            while fi < len(f_binders) {
+                let f_dom = f_binders[fi]["dom"];
+                let field_u = _infer_sort_level(env, f_ctx, f_dom, univ_params);
+                if not _u_eq(field_u, 0) {
+                    all_fields_in_prop = false;
+                }
+                // Predicativity check: if `ind_u` is not `0` (`Prop`), every field sort must satisfy `field_u <= ind_u`!
+                if not _u_eq(ind_u, 0) {
+                    if not _u_leq(field_u, ind_u) {
+                        throw "CicKernel: universe predicativity violation in constructor '" + cname + "' field #" + str(fi + 1);
+                    }
+                }
+                let f_sp = _unfold_spine(kernel_whnf_ctx(env, f_ctx, f_dom));
+                if f_sp["head"]["tag"] == "Const" and f_sp["head"]["name"] == ind_name {
+                    let f_args = f_sp["args"];
+                    if len(f_args) != num_params + num_indices {
+                        throw "CicKernel: malformed recursive field application in '" + cname + "'";
+                    }
+                    let idx_tmpls = [];
+                    let ii = 0;
+                    while ii < num_indices {
+                        push(idx_tmpls, f_args[num_params + ii]);
+                        ii = ii + 1;
+                    }
+                    push(rec_fields, map{ "field_pos": fi, "idx_templates": idx_tmpls });
+                }
+                f_ctx = _ctx_push(f_ctx, f_binders[fi]["name"], f_dom, nil);
+                fi = fi + 1;
+            }
+
+            // Verify constructor return head is `ind_name` applied to the exact uniform parameters
+            let ret_sp = _unfold_spine(c_ret);
+            if ret_sp["head"]["tag"] != "Const" or ret_sp["head"]["name"] != ind_name {
+                throw "CicKernel: constructor '" + cname + "' must return '" + ind_name + "'";
+            }
+            if len(ret_sp["args"]) != num_params + num_indices {
+                throw "CicKernel: constructor '" + cname + "' return arity mismatch";
+            }
+            let rpi = 0;
+            while rpi < num_params {
+                let expected_var = mk_var(len(f_binders) + num_params - 1 - rpi);
+                if not kernel_is_def_eq_ctx(env, f_ctx, ret_sp["args"][rpi], expected_var) {
+                    throw "CicKernel: constructor '" + cname + "' must return uniform parameter #" + str(rpi + 1);
+                }
+                rpi = rpi + 1;
+            }
+
+            push(ctors_meta, map{
+                "name": cname,
+                "type": cty,
+                "field_binders": f_binders,
+                "num_fields": len(f_binders),
+                "rec_fields": rec_fields,
+                "ret": c_ret
+            });
+            ci = ci + 1;
+        }
+    } catch e {
+        ok = false;
+        err_msg = str(e);
+    }
+
+    if not ok {
+        // Rollback temporary inductive entry so failed declarations NEVER pollute `env`!
+        let clean_decls = map{};
+        let dks = map_keys(env["decls"]);
+        let di = 0;
+        while di < len(dks) {
+            let dk = dks[di];
+            if dk != ind_name {
+                clean_decls[dk] = env["decls"][dk];
+            }
+            di = di + 1;
+        }
+        env["decls"] = clean_decls;
+        throw err_msg;
+    }
+
+    push(env["order"], ind_name);
+    let ci2 = 0;
+    while ci2 < len(ctors_meta) {
+        let cm = ctors_meta[ci2];
+        env["decls"][cm["name"]] = map{
+            "kind": "ctor",
+            "name": cm["name"],
+            "univ_params": univ_params,
+            "type": cm["type"],
+            "value": nil,
+            "ind_name": ind_name
+        };
+        push(env["order"], cm["name"]);
+        ci2 = ci2 + 1;
+    }
+
+    // 2. Synthesize recursor `Ind.rec` following Lean 4 large-elimination rules
+    let is_prop_ind = _u_eq(ind_u, 0);
+    let large_elim = true;
+    if is_prop_ind {
+        if len(ctors_meta) > 1 {
+            large_elim = false;
+        } else if len(ctors_meta) == 1 and not all_fields_in_prop {
+            large_elim = false;
+        }
+    }
+
+    let rec_univ_params = [];
+    let ui = 0;
+    while ui < len(univ_params) {
+        push(rec_univ_params, univ_params[ui]);
+        ui = ui + 1;
+    }
+    let motive_sort = mk_sort(0);
+    if large_elim {
+        let mparam = "u";
+        if _arr_contains_str(rec_univ_params, mparam) {
+            mparam = "u_motive";
+        }
+        push(rec_univ_params, mparam);
+        motive_sort = mk_sort(mparam);
+    }
+
+    let ind_sym = _const_with_sym_univs(ind_name, univ_params);
+
+    // Build `MotiveType` at depth `num_params`
+    let param_args_at_km = [];
+    let p_i = 0;
+    while p_i < num_params {
+        push(param_args_at_km, mk_var(num_params - 1 - p_i + num_indices));
+        p_i = p_i + 1;
+    }
+    let idx_args_at_km = [];
+    let x_i = 0;
+    while x_i < num_indices {
+        push(idx_args_at_km, mk_var(num_indices - 1 - x_i));
+        x_i = x_i + 1;
+    }
+    let major_ty_at_km = mk_apps(mk_apps(ind_sym, param_args_at_km), idx_args_at_km);
+    let motive_ty = _wrap_pis(index_binders, mk_pi("t", major_ty_at_km, motive_sort));
+
+    // Build minor premise types `MinorType_j` at depth `num_params + 1 + j`
+    let c_len = len(ctors_meta);
+    let minor_binders = [];
+    let mj = 0;
+    while mj < c_len {
+        let cm = ctors_meta[mj];
+        let f_bs = cm["field_binders"];
+        let f_cnt = cm["num_fields"];
+        let r_fs = cm["rec_fields"];
+        let ih_cnt = len(r_fs);
+
+        let all_minor_bs = [];
+        let fr = 0;
+        while fr < f_cnt {
+            push(all_minor_bs, map{
+                "name": f_bs[fr]["name"],
+                "dom": lift(f_bs[fr]["dom"], 1 + mj, fr)
+            });
+            fr = fr + 1;
+        }
+        let rq = 0;
+        while rq < ih_cnt {
+            let rspec = r_fs[rq];
+            let f_pos = rspec["field_pos"];
+            let idx_tmpls = rspec["idx_templates"];
+            let ih_idxs = [];
+            let si = 0;
+            while si < len(idx_tmpls) {
+                let shifted_p = lift(idx_tmpls[si], 1 + mj, f_pos);
+                let shifted_f = lift(shifted_p, f_cnt - f_pos + rq, 0);
+                push(ih_idxs, shifted_f);
+                si = si + 1;
+            }
+            let motive_var_q = mk_var(mj + f_cnt + rq);
+            let rec_field_var_q = mk_var(f_cnt - 1 - f_pos + rq);
+            let ih_ty = mk_app(mk_apps(motive_var_q, ih_idxs), rec_field_var_q);
+            push(all_minor_bs, map{ "name": "ih", "dom": ih_ty });
+            rq = rq + 1;
+        }
+
+        let ret_shifted_p = lift(cm["ret"], 1 + mj, f_cnt);
+        let ret_shifted_all = lift(ret_shifted_p, ih_cnt, 0);
+        let ret_sp_all = _unfold_spine(ret_shifted_all);
+        let ret_idxs = [];
+        let rii = 0;
+        while rii < num_indices {
+            push(ret_idxs, ret_sp_all["args"][num_params + rii]);
+            rii = rii + 1;
+        }
+
+        let ctor_sym = _const_with_sym_univs(cm["name"], univ_params);
+        let ctor_call_args = [];
+        let cp = 0;
+        while cp < num_params {
+            push(ctor_call_args, mk_var(num_params - 1 - cp + 1 + mj + f_cnt + ih_cnt));
+            cp = cp + 1;
+        }
+        let cf = 0;
+        while cf < f_cnt {
+            push(ctor_call_args, mk_var(f_cnt - 1 - cf + ih_cnt));
+            cf = cf + 1;
+        }
+        let ctor_val = mk_apps(ctor_sym, ctor_call_args);
+        let motive_var_end = mk_var(mj + f_cnt + ih_cnt);
+        let minor_ret = mk_app(mk_apps(motive_var_end, ret_idxs), ctor_val);
+        let minor_ty = _wrap_pis(all_minor_bs, minor_ret);
+        push(minor_binders, map{ "name": "h_" + str(mj), "dom": minor_ty });
+        mj = mj + 1;
+    }
+
+    // Build index + major binders at depth `num_params + 1 + c_len`
+    let shifted_idx_bs = [];
+    let sxi = 0;
+    while sxi < num_indices {
+        push(shifted_idx_bs, map{
+            "name": index_binders[sxi]["name"],
+            "dom": lift(index_binders[sxi]["dom"], 1 + c_len, sxi)
+        });
+        sxi = sxi + 1;
+    }
+    let param_args_end = [];
+    let pe = 0;
+    while pe < num_params {
+        push(param_args_end, mk_var(num_params - 1 - pe + 1 + c_len + num_indices));
+        pe = pe + 1;
+    }
+    let idx_args_end = [];
+    let xe = 0;
+    while xe < num_indices {
+        push(idx_args_end, mk_var(num_indices - 1 - xe));
+        xe = xe + 1;
+    }
+    let major_ty_end = mk_apps(mk_apps(ind_sym, param_args_end), idx_args_end);
+
+    let motive_at_body = mk_var(c_len + num_indices + 1);
+    let idxs_at_body = [];
+    let xb = 0;
+    while xb < num_indices {
+        push(idxs_at_body, mk_var(num_indices - xb));
+        xb = xb + 1;
+    }
+    let rec_cod = mk_app(mk_apps(motive_at_body, idxs_at_body), mk_var(0));
+
+    let rec_outer_bs = [];
+    let ob = 0;
+    while ob < len(param_binders) { push(rec_outer_bs, param_binders[ob]); ob = ob + 1; }
+    push(rec_outer_bs, map{ "name": "motive", "dom": motive_ty });
+    let mb = 0;
+    while mb < len(minor_binders) { push(rec_outer_bs, minor_binders[mb]); mb = mb + 1; }
+    let ib = 0;
+    while ib < len(shifted_idx_bs) { push(rec_outer_bs, shifted_idx_bs[ib]); ib = ib + 1; }
+    push(rec_outer_bs, map{ "name": "t", "dom": major_ty_end });
+
+    let rec_ty = _wrap_pis(rec_outer_bs, rec_cod);
+    let rec_name = ind_name + ".rec";
+    // Kernel-verify the synthesized recursor type itself!
+    let _rec_sort = _infer_sort_level(env, [], rec_ty, rec_univ_params);
+
+    env["decls"][rec_name] = map{
+        "kind": "recursor",
+        "name": rec_name,
+        "univ_params": rec_univ_params,
+        "type": rec_ty,
+        "value": nil,
+        "ind_name": ind_name
+    };
+    env["recursors"][rec_name] = map{
+        "ind_name": ind_name,
+        "num_params": num_params,
+        "num_indices": num_indices,
+        "ctors": ctors_meta
+    };
+    push(env["order"], rec_name);
+    return env;
+}
+
+// ── Transitive Constant DAG Axiom Footprint Auditor (`kernel_audit_axioms`) ──
+
+fn _collect_consts_in_term(term, out_consts) {
+    if term == nil { return; }
+    let tg = term["tag"];
+    if tg == "Const" {
+        let cname = term["name"];
+        if not _arr_contains_str(out_consts, cname) {
+            push(out_consts, cname);
+        }
+        return;
+    }
+    if tg == "App" {
+        _collect_consts_in_term(term["fn_t"], out_consts);
+        _collect_consts_in_term(term["arg_t"], out_consts);
+        return;
+    }
+    if tg == "Pi" {
+        _collect_consts_in_term(term["dom"], out_consts);
+        _collect_consts_in_term(term["cod"], out_consts);
+        return;
+    }
+    if tg == "Lam" {
+        _collect_consts_in_term(term["dom"], out_consts);
+        _collect_consts_in_term(term["body"], out_consts);
+        return;
+    }
+    if tg == "LetIn" {
+        _collect_consts_in_term(term["ty"], out_consts);
+        _collect_consts_in_term(term["val"], out_consts);
+        _collect_consts_in_term(term["body"], out_consts);
+    }
+}
+
+fn kernel_audit_axioms(env, thm_name) {
+    if not map_has(env["decls"], thm_name) {
+        throw "CicKernel: unknown declaration '" + thm_name + "' in kernel_audit_axioms";
+    }
+    let visited = map{};
+    let queue = [thm_name];
+    let axioms_used = [];
+    let deps_visited = [];
+    let qi = 0;
+    while qi < len(queue) {
+        let cur_name = queue[qi];
+        qi = qi + 1;
+        if not map_has(visited, cur_name) {
+            visited[cur_name] = true;
+            if cur_name != thm_name {
+                push(deps_visited, cur_name);
+            }
+            if map_has(env["decls"], cur_name) {
+                let decl = env["decls"][cur_name];
+                if decl["kind"] == "axiom" {
+                    if not _arr_contains_str(axioms_used, cur_name) {
+                        push(axioms_used, cur_name);
+                    }
+                }
+                let refs = [];
+                _collect_consts_in_term(decl["type"], refs);
+                if decl["value"] != nil {
+                    _collect_consts_in_term(decl["value"], refs);
+                }
+                let ri = 0;
+                while ri < len(refs) {
+                    if not map_has(visited, refs[ri]) {
+                        push(queue, refs[ri]);
+                    }
+                    ri = ri + 1;
+                }
+            }
+        }
+    }
+    return map{
+        "theorem": thm_name,
+        "axioms_used": axioms_used,
+        "constructive": len(axioms_used) == 0,
+        "dependencies_checked": len(deps_visited)
+    };
+}
+
+// ── Foundational CIC Prelude (`False`, `True`, `And`, `Or`, `Eq`, `Exists`, `Bool`, `Nat`, `List`) ──
+
+fn _install_cic_prelude(env, include_classical = true) {
+    // 1. `False : Prop` (0 constructors)
+    kernel_add_inductive(env, map{
+        "name": "False",
+        "univ_params": [],
+        "num_params": 0,
+        "type": mk_prop(),
+        "ctors": []
+    });
+
+    // 2. `True : Prop` (`True.intro : True`)
+    kernel_add_inductive(env, map{
+        "name": "True",
+        "univ_params": [],
+        "num_params": 0,
+        "type": mk_prop(),
+        "ctors": [
+            map{ "name": "True.intro", "type": mk_const_u("True", []) }
+        ]
+    });
+
+    // 3. `Not : Prop -> Prop := fun (P : Prop) => P -> False`
+    kernel_add_def(
+        env,
+        "Not",
+        mk_arrow(mk_prop(), mk_prop()),
+        mk_lam("P", mk_prop(), mk_arrow(mk_var(0), mk_const_u("False", []))),
+        []
+    );
+
+    // 4. `And (A B : Prop) : Prop` (`And.intro : ∀ (A B : Prop), A -> B -> And A B`)
+    kernel_add_inductive(env, map{
+        "name": "And",
+        "univ_params": [],
+        "num_params": 2,
+        "type": mk_pi("A", mk_prop(), mk_pi("B", mk_prop(), mk_prop())),
+        "ctors": [
+            map{
+                "name": "And.intro",
+                "type": mk_pi("A", mk_prop(), mk_pi("B", mk_prop(),
+                    mk_pi("left", mk_var(1), mk_pi("right", mk_var(1),
+                        mk_apps(mk_const_u("And", []), [mk_var(3), mk_var(2)])))))
+            }
+        ]
+    });
+
+    // 5. `Or (A B : Prop) : Prop` (`Or.inl`, `Or.inr`)
+    kernel_add_inductive(env, map{
+        "name": "Or",
+        "univ_params": [],
+        "num_params": 2,
+        "type": mk_pi("A", mk_prop(), mk_pi("B", mk_prop(), mk_prop())),
+        "ctors": [
+            map{
+                "name": "Or.inl",
+                "type": mk_pi("A", mk_prop(), mk_pi("B", mk_prop(),
+                    mk_pi("h", mk_var(1), mk_apps(mk_const_u("Or", []), [mk_var(2), mk_var(1)]))))
+            },
+            map{
+                "name": "Or.inr",
+                "type": mk_pi("A", mk_prop(), mk_pi("B", mk_prop(),
+                    mk_pi("h", mk_var(0), mk_apps(mk_const_u("Or", []), [mk_var(2), mk_var(1)]))))
+            }
+        ]
+    });
+
+    // 6. `Iff (A B : Prop) : Prop := And (A -> B) (B -> A)`
+    kernel_add_def(
+        env,
+        "Iff",
+        mk_pi("A", mk_prop(), mk_pi("B", mk_prop(), mk_prop())),
+        mk_lam("A", mk_prop(), mk_lam("B", mk_prop(),
+            mk_apps(mk_const_u("And", []), [
+                mk_arrow(mk_var(1), mk_var(0)),
+                mk_arrow(mk_var(0), mk_var(1))
+            ])
+        )),
+        []
+    );
+
+    // 7. `Eq.{u} (A : Sort u) (x : A) : A -> Prop` (`Eq.refl.{u} : ∀ (A : Sort u) (x : A), Eq.{u} A x x`)
+    kernel_add_inductive(env, map{
+        "name": "Eq",
+        "univ_params": ["u"],
+        "num_params": 2,
+        "type": mk_pi("A", mk_sort("u"), mk_pi("x", mk_var(0), mk_pi("y", mk_var(1), mk_prop()))),
+        "ctors": [
+            map{
+                "name": "Eq.refl",
+                "type": mk_pi("A", mk_sort("u"), mk_pi("x", mk_var(0),
+                    mk_apps(mk_const_u("Eq", ["u"]), [mk_var(1), mk_var(0), mk_var(0)])))
+            }
+        ]
+    });
+
+    // Non-dependent equality eliminator `Eq.ndrec.{u, v}` wrapping `Eq.rec.{u, v}`
+    let eq_ndrec_ty = mk_pi("A", mk_sort("u"),
+        mk_pi("x", mk_var(0),
+            mk_pi("motive", mk_arrow(mk_var(1), mk_sort("v")),
+                mk_pi("refl_case", mk_app(mk_var(0), mk_var(1)),
+                    mk_pi("y", mk_var(3),
+                        mk_pi("h", mk_apps(mk_const_u("Eq", ["u"]), [mk_var(4), mk_var(3), mk_var(0)]),
+                            mk_app(mk_var(3), mk_var(1))))))));
+    let eq_ndrec_val = mk_lam("A", mk_sort("u"),
+        mk_lam("x", mk_var(0),
+            mk_lam("motive", mk_arrow(mk_var(1), mk_sort("v")),
+                mk_lam("refl_case", mk_app(mk_var(0), mk_var(1)),
+                    mk_lam("y", mk_var(3),
+                        mk_lam("h", mk_apps(mk_const_u("Eq", ["u"]), [mk_var(4), mk_var(3), mk_var(0)]),
+                            mk_apps(mk_const_u("Eq.rec", ["u", "v"]), [
+                                mk_var(5),
+                                mk_var(4),
+                                mk_lam("z", mk_var(5),
+                                    mk_lam("_heq", mk_apps(mk_const_u("Eq", ["u"]), [mk_var(6), mk_var(5), mk_var(0)]),
+                                        mk_app(mk_var(5), mk_var(1)))),
+                                mk_var(2),
+                                mk_var(1),
+                                mk_var(0)
+                            ])))))));
+    kernel_add_def(env, "Eq.ndrec", eq_ndrec_ty, eq_ndrec_val, ["u", "v"]);
+
+    // 8. `Exists.{u} (A : Sort u) (P : A -> Prop) : Prop` (`Exists.intro`)
+    kernel_add_inductive(env, map{
+        "name": "Exists",
+        "univ_params": ["u"],
+        "num_params": 2,
+        "type": mk_pi("A", mk_sort("u"), mk_pi("P", mk_arrow(mk_var(0), mk_prop()), mk_prop())),
+        "ctors": [
+            map{
+                "name": "Exists.intro",
+                "type": mk_pi("A", mk_sort("u"),
+                    mk_pi("P", mk_arrow(mk_var(0), mk_prop()),
+                        mk_pi("w", mk_var(1),
+                            mk_pi("hw", mk_app(mk_var(1), mk_var(0)),
+                                mk_apps(mk_const_u("Exists", ["u"]), [mk_var(3), mk_var(2)])))))
+            }
+        ]
+    });
+
+    // 9. `Bool : Type 0` (`Bool.false`, `Bool.true`)
+    kernel_add_inductive(env, map{
+        "name": "Bool",
+        "univ_params": [],
+        "num_params": 0,
+        "type": mk_type(0),
+        "ctors": [
+            map{ "name": "Bool.false", "type": mk_const_u("Bool", []) },
+            map{ "name": "Bool.true", "type": mk_const_u("Bool", []) }
+        ]
+    });
+
+    // 10. `Nat : Type 0` (`Nat.zero : Nat`, `Nat.succ : Nat -> Nat`)
+    let nat_c = mk_const_u("Nat", []);
+    kernel_add_inductive(env, map{
+        "name": "Nat",
+        "univ_params": [],
+        "num_params": 0,
+        "type": mk_type(0),
+        "ctors": [
+            map{ "name": "Nat.zero", "type": nat_c },
+            map{ "name": "Nat.succ", "type": mk_arrow(nat_c, nat_c) }
+        ]
+    });
+
+    // `Nat.add (m n : Nat) : Nat` by recursion on `n`:
+    //   `Nat.add m 0 = m`, `Nat.add m (succ n) = succ (Nat.add m n)`
+    let nat_add_ty = mk_arrow(nat_c, mk_arrow(nat_c, nat_c));
+    let nat_add_val = mk_lam("m", nat_c, mk_lam("n", nat_c,
+        mk_apps(mk_const_u("Nat.rec", [1]), [
+            mk_lam("_k", nat_c, nat_c),
+            mk_var(1),
+            mk_lam("k", nat_c, mk_lam("ih", nat_c, mk_app(mk_const_u("Nat.succ", []), mk_var(0)))),
+            mk_var(0)
+        ])
+    ));
+    kernel_add_def(env, "Nat.add", nat_add_ty, nat_add_val, []);
+
+    // `Nat.mul (m n : Nat) : Nat` by recursion on `n`:
+    //   `Nat.mul m 0 = 0`, `Nat.mul m (succ n) = Nat.add (Nat.mul m n) m`
+    let nat_mul_ty = mk_arrow(nat_c, mk_arrow(nat_c, nat_c));
+    let nat_mul_val = mk_lam("m", nat_c, mk_lam("n", nat_c,
+        mk_apps(mk_const_u("Nat.rec", [1]), [
+            mk_lam("_k", nat_c, nat_c),
+            mk_const_u("Nat.zero", []),
+            mk_lam("k", nat_c, mk_lam("ih", nat_c,
+                mk_apps(mk_const_u("Nat.add", []), [mk_var(0), mk_var(3)])
+            )),
+            mk_var(0)
+        ])
+    ));
+    kernel_add_def(env, "Nat.mul", nat_mul_ty, nat_mul_val, []);
+
+    // 11. `List.{u} (A : Sort u) : Sort (max 1 u)` (`List.nil`, `List.cons`)
+    let list_sort = mk_sort(u_max(1, "u"));
+    kernel_add_inductive(env, map{
+        "name": "List",
+        "univ_params": ["u"],
+        "num_params": 1,
+        "type": mk_pi("A", mk_sort("u"), list_sort),
+        "ctors": [
+            map{
+                "name": "List.nil",
+                "type": mk_pi("A", mk_sort("u"), mk_app(mk_const_u("List", ["u"]), mk_var(0)))
+            },
+            map{
+                "name": "List.cons",
+                "type": mk_pi("A", mk_sort("u"),
+                    mk_pi("hd", mk_var(0),
+                        mk_pi("tl", mk_app(mk_const_u("List", ["u"]), mk_var(1)),
+                            mk_app(mk_const_u("List", ["u"]), mk_var(2)))))
+            }
+        ]
+    });
+
+    // `List.append.{u} (A : Sort u) (xs ys : List.{u} A) : List.{u} A`
+    let list_a0 = mk_app(mk_const_u("List", ["u"]), mk_var(0));
+    let list_append_ty = mk_pi("A", mk_sort("u"), mk_arrow(list_a0, mk_arrow(list_a0, list_a0)));
+    let list_append_val = mk_lam("A", mk_sort("u"),
+        mk_lam("xs", mk_app(mk_const_u("List", ["u"]), mk_var(0)),
+            mk_lam("ys", mk_app(mk_const_u("List", ["u"]), mk_var(1)),
+                mk_apps(mk_const_u("List.rec", ["u", u_max(1, "u")]), [
+                    mk_var(2),
+                    mk_lam("_l", mk_app(mk_const_u("List", ["u"]), mk_var(2)),
+                        mk_app(mk_const_u("List", ["u"]), mk_var(3))),
+                    mk_var(0),
+                    mk_lam("hd", mk_var(2),
+                        mk_lam("tl", mk_app(mk_const_u("List", ["u"]), mk_var(3)),
+                            mk_lam("ih", mk_app(mk_const_u("List", ["u"]), mk_var(4)),
+                                mk_apps(mk_const_u("List.cons", ["u"]), [mk_var(5), mk_var(2), mk_var(0)])))),
+                    mk_var(1)
+                ])
+            )
+        )
+    );
+    kernel_add_def(env, "List.append", list_append_ty, list_append_val, ["u"]);
+
+    // `List.length.{u} (A : Sort u) (xs : List.{u} A) : Nat`
+    let list_length_ty = mk_pi("A", mk_sort("u"), mk_arrow(list_a0, nat_c));
+    let list_length_val = mk_lam("A", mk_sort("u"),
+        mk_lam("xs", mk_app(mk_const_u("List", ["u"]), mk_var(0)),
+            mk_apps(mk_const_u("List.rec", ["u", 1]), [
+                mk_var(1),
+                mk_lam("_l", mk_app(mk_const_u("List", ["u"]), mk_var(1)), nat_c),
+                mk_const_u("Nat.zero", []),
+                mk_lam("hd", mk_var(1),
+                    mk_lam("tl", mk_app(mk_const_u("List", ["u"]), mk_var(2)),
+                        mk_lam("ih", nat_c, mk_app(mk_const_u("Nat.succ", []), mk_var(0))))),
+                mk_var(0)
+            ])
+        )
+    );
+    kernel_add_def(env, "List.length", list_length_ty, list_length_val, ["u"]);
+
+    // 12. Classical Law of Excluded Middle axiom (`Classical.em : ∀ (P : Prop), Or P (Not P)`)
+    if include_classical {
+        kernel_add_axiom(
+            env,
+            "Classical.em",
+            mk_pi("P", mk_prop(),
+                mk_apps(mk_const_u("Or", []), [
+                    mk_var(0),
+                    mk_app(mk_const_u("Not", []), mk_var(0))
+                ])
+            ),
+            []
+        );
+    }
+    return env;
+}
+
+fn new_kernel_env(include_prelude = true) {
+    let env = map{
+        "version": CIC_PROVER_VERSION,
+        "decls": map{},
+        "recursors": map{},
+        "order": []
+    };
+    if include_prelude {
+        _install_cic_prelude(env, true);
+    }
+    return env;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 4: `LEAN 4`-STYLE PRETTY-PRINTER & SURFACE SYNTAX PARSER
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _occurs_var(term, target_idx) {
+    if term == nil { return false; }
+    let tg = term["tag"];
+    if tg == "Var" { return term["idx"] == target_idx; }
+    if tg == "Sort" or tg == "Const" or tg == "MVar" { return false; }
+    if tg == "App" {
+        return _occurs_var(term["fn_t"], target_idx) or _occurs_var(term["arg_t"], target_idx);
+    }
+    if tg == "Pi" {
+        return _occurs_var(term["dom"], target_idx) or _occurs_var(term["cod"], target_idx + 1);
+    }
+    if tg == "Lam" {
+        return _occurs_var(term["dom"], target_idx) or _occurs_var(term["body"], target_idx + 1);
+    }
+    if tg == "LetIn" {
+        return _occurs_var(term["ty"], target_idx)
+            or _occurs_var(term["val"], target_idx)
+            or _occurs_var(term["body"], target_idx + 1);
+    }
+    return false;
+}
+
+fn _freshen_name(raw_name, ctx_names) {
+    let base = raw_name;
+    if base == nil or base == "" or base == "_" { base = "x"; }
+    if not _arr_contains_str(ctx_names, base) { return base; }
+    let k = 1;
+    while true {
+        let cand = base + "_" + str(k);
+        if not _arr_contains_str(ctx_names, cand) { return cand; }
+        k = k + 1;
+    }
+}
+
+fn _push_str_copy(arr, s) {
+    let out = [];
+    let i = 0;
+    while i < len(arr) {
+        push(out, arr[i]);
+        i = i + 1;
+    }
+    push(out, s);
+    return out;
+}
+
+fn _pp_wrap(s, need_parens) {
+    if need_parens { return "(" + s + ")"; }
+    return s;
+}
+
+fn _format_term_prec(term, ctx_names, prec, use_unicode) {
+    if term == nil { return "<nil>"; }
+    let nat_v = dest_nat_lit(term);
+    if nat_v != nil {
+        return str(nat_v);
+    }
+    let tg = term["tag"];
+    if tg == "Var" {
+        let idx = term["idx"];
+        if idx >= 0 and idx < len(ctx_names) {
+            return ctx_names[len(ctx_names) - 1 - idx];
+        }
+        return "#" + str(idx);
+    }
+    if tg == "MVar" {
+        return "?m_" + str(term["id"]);
+    }
+    if tg == "Sort" {
+        let lvl = term["level"];
+        if _is_nonneg_int(lvl) {
+            if lvl == 0 { return "Prop"; }
+            if lvl == 1 { return "Type"; }
+            return _pp_wrap("Type " + str(lvl - 1), prec > 75);
+        }
+        return _pp_wrap("Sort " + _u_str(lvl), prec > 75);
+    }
+    if tg == "Const" {
+        return term["name"];
+    }
+    if tg == "Pi" {
+        if not _occurs_var(term["cod"], 0) {
+            let lhs = _format_term_prec(term["dom"], ctx_names, 21, use_unicode);
+            let ext_names = _push_str_copy(ctx_names, "_");
+            let rhs = _format_term_prec(term["cod"], ext_names, 20, use_unicode);
+            let arrow_tok = " -> ";
+            if use_unicode { arrow_tok = " → "; }
+            return _pp_wrap(lhs + arrow_tok + rhs, prec > 20);
+        }
+        let bname = _freshen_name(term["name"], ctx_names);
+        let dom_s = _format_term_prec(term["dom"], ctx_names, 0, use_unicode);
+        let ext_names = _push_str_copy(ctx_names, bname);
+        let cod_s = _format_term_prec(term["cod"], ext_names, 0, use_unicode);
+        let q_tok = "forall ";
+        if use_unicode { q_tok = "∀ "; }
+        return _pp_wrap(q_tok + "(" + bname + " : " + dom_s + "), " + cod_s, prec > 5);
+    }
+    if tg == "Lam" {
+        let bname = _freshen_name(term["name"], ctx_names);
+        let dom_s = _format_term_prec(term["dom"], ctx_names, 0, use_unicode);
+        let ext_names = _push_str_copy(ctx_names, bname);
+        let body_s = _format_term_prec(term["body"], ext_names, 0, use_unicode);
+        let lam_tok = "fun ";
+        if use_unicode { lam_tok = "λ "; }
+        return _pp_wrap(lam_tok + "(" + bname + " : " + dom_s + ") => " + body_s, prec > 5);
+    }
+    if tg == "LetIn" {
+        let bname = _freshen_name(term["name"], ctx_names);
+        let ty_s = _format_term_prec(term["ty"], ctx_names, 0, use_unicode);
+        let val_s = _format_term_prec(term["val"], ctx_names, 0, use_unicode);
+        let ext_names = _push_str_copy(ctx_names, bname);
+        let body_s = _format_term_prec(term["body"], ext_names, 0, use_unicode);
+        return _pp_wrap("let " + bname + " : " + ty_s + " := " + val_s + " in " + body_s, prec > 5);
+    }
+    if tg == "App" {
+        let sp = _unfold_spine(term);
+        let hd = sp["head"];
+        let args = sp["args"];
+        if hd["tag"] == "Const" {
+            let cname = hd["name"];
+            if cname == "Eq" and len(args) == 3 {
+                let ls = _format_term_prec(args[1], ctx_names, 51, use_unicode);
+                let rs = _format_term_prec(args[2], ctx_names, 51, use_unicode);
+                return _pp_wrap(ls + " = " + rs, prec > 50);
+            }
+            if cname == "And" and len(args) == 2 {
+                let ls = _format_term_prec(args[0], ctx_names, 41, use_unicode);
+                let rs = _format_term_prec(args[1], ctx_names, 40, use_unicode);
+                let op_s = " /\\ ";
+                if use_unicode { op_s = " ∧ "; }
+                return _pp_wrap(ls + op_s + rs, prec > 40);
+            }
+            if cname == "Or" and len(args) == 2 {
+                let ls = _format_term_prec(args[0], ctx_names, 31, use_unicode);
+                let rs = _format_term_prec(args[1], ctx_names, 30, use_unicode);
+                let op_s = " \\/ ";
+                if use_unicode { op_s = " ∨ "; }
+                return _pp_wrap(ls + op_s + rs, prec > 30);
+            }
+            if cname == "Iff" and len(args) == 2 {
+                let ls = _format_term_prec(args[0], ctx_names, 16, use_unicode);
+                let rs = _format_term_prec(args[1], ctx_names, 15, use_unicode);
+                let op_s = " <-> ";
+                if use_unicode { op_s = " ↔ "; }
+                return _pp_wrap(ls + op_s + rs, prec > 15);
+            }
+            if cname == "Not" and len(args) == 1 {
+                let sub = _format_term_prec(args[0], ctx_names, 46, use_unicode);
+                let op_s = "~";
+                if use_unicode { op_s = "¬"; }
+                return _pp_wrap(op_s + sub, prec > 45);
+            }
+            if cname == "Exists" and len(args) == 2 and args[1]["tag"] == "Lam" {
+                let lam_arg = args[1];
+                let bname = _freshen_name(lam_arg["name"], ctx_names);
+                let dom_s = _format_term_prec(args[0], ctx_names, 0, use_unicode);
+                let ext_names = _push_str_copy(ctx_names, bname);
+                let body_s = _format_term_prec(lam_arg["body"], ext_names, 0, use_unicode);
+                let ex_tok = "exists ";
+                if use_unicode { ex_tok = "∃ "; }
+                return _pp_wrap(ex_tok + "(" + bname + " : " + dom_s + "), " + body_s, prec > 5);
+            }
+            if cname == "Nat.add" and len(args) == 2 {
+                let ls = _format_term_prec(args[0], ctx_names, 60, use_unicode);
+                let rs = _format_term_prec(args[1], ctx_names, 61, use_unicode);
+                return _pp_wrap(ls + " + " + rs, prec > 60);
+            }
+            if cname == "Nat.mul" and len(args) == 2 {
+                let ls = _format_term_prec(args[0], ctx_names, 70, use_unicode);
+                let rs = _format_term_prec(args[1], ctx_names, 71, use_unicode);
+                return _pp_wrap(ls + " * " + rs, prec > 70);
+            }
+        }
+        let parts = _format_term_prec(hd, ctx_names, 80, use_unicode);
+        let ai = 0;
+        while ai < len(args) {
+            parts = parts + " " + _format_term_prec(args[ai], ctx_names, 81, use_unicode);
+            ai = ai + 1;
+        }
+        return _pp_wrap(parts, prec > 80);
+    }
+    return "<term>";
+}
+
+fn _extract_ctx_names(ctx_or_names) {
+    if ctx_or_names == nil { return []; }
+    let out = [];
+    let i = 0;
+    while i < len(ctx_or_names) {
+        let item = ctx_or_names[i];
+        if type(item) == "map" {
+            push(out, item["name"]);
+        } else {
+            push(out, str(item));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn term_to_unicode(term, ctx_names = []) {
+    return _format_term_prec(term, _extract_ctx_names(ctx_names), 0, true);
+}
+
+fn term_to_lean_str(term, ctx_names = []) {
+    return _format_term_prec(term, _extract_ctx_names(ctx_names), 0, false);
+}
+
+// ── Surface Syntax Lexer & Recursive-Descent Parser (`parse_term`) ──────────
+
+let _PARSE_CACHE = map{ "default_env": nil };
+
+fn _get_default_parse_env() {
+    if _PARSE_CACHE["default_env"] == nil {
+        _PARSE_CACHE["default_env"] = new_kernel_env(true);
+    }
+    return _PARSE_CACHE["default_env"];
+}
+
+fn _is_digit_cp(cp) {
+    return cp >= 48 and cp <= 57;
+}
+
+fn _is_ident_start_cp(cp) {
+    return (cp >= 65 and cp <= 90)
+        or (cp >= 97 and cp <= 122)
+        or cp == 95
+        or (cp >= 913 and cp <= 969); // Greek letters α..ω
+}
+
+fn _is_ident_cont_cp(cp) {
+    return _is_ident_start_cp(cp) or _is_digit_cp(cp) or cp == 39; // apostrophe x'
+}
+
+fn _tokenize_surface(src) {
+    let toks = [];
+    let n = len(src);
+    let i = 0;
+    while i < n {
+        let cp = strcharcodeat(src, i);
+        // Whitespace
+        if cp == 32 or cp == 9 or cp == 10 or cp == 13 {
+            i = i + 1;
+        } else if i + 1 < n and str_slice(src, i, i + 2) == "--" {
+            // Line comment `-- ...`
+            while i < n and strcharcodeat(src, i) != 10 {
+                i = i + 1;
+            }
+        } else if i + 2 < n and str_slice(src, i, i + 3) == "<->" {
+            push(toks, map{ "k": "IFF", "v": "<->" });
+            i = i + 3;
+        } else if i + 1 < n and str_slice(src, i, i + 2) == "->" {
+            push(toks, map{ "k": "ARROW", "v": "->" });
+            i = i + 2;
+        } else if i + 1 < n and str_slice(src, i, i + 2) == "=>" {
+            push(toks, map{ "k": "FATARROW", "v": "=>" });
+            i = i + 2;
+        } else if i + 1 < n and str_slice(src, i, i + 2) == ":=" {
+            push(toks, map{ "k": "ASSIGN", "v": ":=" });
+            i = i + 2;
+        } else if i + 1 < n and str_slice(src, i, i + 2) == "/\\" {
+            push(toks, map{ "k": "AND", "v": "/\\" });
+            i = i + 2;
+        } else if i + 1 < n and str_slice(src, i, i + 2) == "\\/" {
+            push(toks, map{ "k": "OR", "v": "\\/" });
+            i = i + 2;
+        } else if i + 1 < n and str_slice(src, i, i + 2) == ".{" {
+            push(toks, map{ "k": "DOTLBRACE", "v": ".{" });
+            i = i + 2;
+        } else if cp == 8704 { // ∀
+            push(toks, map{ "k": "FORALL", "v": "∀" });
+            i = i + 1;
+        } else if cp == 8707 { // ∃
+            push(toks, map{ "k": "EXISTS", "v": "∃" });
+            i = i + 1;
+        } else if cp == 955 { // λ
+            push(toks, map{ "k": "FUN", "v": "λ" });
+            i = i + 1;
+        } else if cp == 8594 { // →
+            push(toks, map{ "k": "ARROW", "v": "→" });
+            i = i + 1;
+        } else if cp == 8596 { // ↔
+            push(toks, map{ "k": "IFF", "v": "↔" });
+            i = i + 1;
+        } else if cp == 8743 { // ∧
+            push(toks, map{ "k": "AND", "v": "∧" });
+            i = i + 1;
+        } else if cp == 8744 { // ∨
+            push(toks, map{ "k": "OR", "v": "∨" });
+            i = i + 1;
+        } else if cp == 172 or cp == 126 { // ¬ or ~
+            push(toks, map{ "k": "NOT", "v": "¬" });
+            i = i + 1;
+        } else if cp == 40 { // (
+            push(toks, map{ "k": "LPAREN", "v": "(" });
+            i = i + 1;
+        } else if cp == 41 { // )
+            push(toks, map{ "k": "RPAREN", "v": ")" });
+            i = i + 1;
+        } else if cp == 125 { // }
+            push(toks, map{ "k": "RBRACE", "v": "}" });
+            i = i + 1;
+        } else if cp == 44 { // ,
+            push(toks, map{ "k": "COMMA", "v": "," });
+            i = i + 1;
+        } else if cp == 58 { // :
+            push(toks, map{ "k": "COLON", "v": ":" });
+            i = i + 1;
+        } else if cp == 61 { // =
+            push(toks, map{ "k": "EQ", "v": "=" });
+            i = i + 1;
+        } else if cp == 43 { // +
+            push(toks, map{ "k": "PLUS", "v": "+" });
+            i = i + 1;
+        } else if cp == 42 { // *
+            push(toks, map{ "k": "STAR", "v": "*" });
+            i = i + 1;
+        } else if _is_digit_cp(cp) {
+            let num_val = 0;
+            while i < n and _is_digit_cp(strcharcodeat(src, i)) {
+                num_val = num_val * 10 + (strcharcodeat(src, i) - 48);
+                i = i + 1;
+            }
+            push(toks, map{ "k": "NUM", "v": num_val });
+        } else if _is_ident_start_cp(cp) {
+            let start = i;
+            i = i + 1;
+            let keep_reading = true;
+            while i < n and keep_reading {
+                let c2 = strcharcodeat(src, i);
+                if _is_ident_cont_cp(c2) {
+                    i = i + 1;
+                } else if c2 == 46 and i + 1 < n and _is_ident_start_cp(strcharcodeat(src, i + 1)) {
+                    // Qualified identifier like `Nat.add`, `List.append`, `Classical.em`
+                    i = i + 1;
+                } else {
+                    keep_reading = false;
+                }
+            }
+            let word = str_slice(src, start, i);
+            if word == "forall" {
+                push(toks, map{ "k": "FORALL", "v": word });
+            } else if word == "exists" {
+                push(toks, map{ "k": "EXISTS", "v": word });
+            } else if word == "fun" {
+                push(toks, map{ "k": "FUN", "v": word });
+            } else if word == "let" {
+                push(toks, map{ "k": "LET", "v": word });
+            } else if word == "in" {
+                push(toks, map{ "k": "IN", "v": word });
+            } else {
+                push(toks, map{ "k": "IDENT", "v": word });
+            }
+        } else {
+            throw "CicParser: unexpected character '" + str_slice(src, i, i + 1) + "' at index " + str(i);
+        }
+    }
+    push(toks, map{ "k": "EOF", "v": "" });
+    return toks;
+}
+
+fn _p_peek(st) {
+    return st["toks"][st["pos"]];
+}
+
+fn _p_eat(st, expected_k) {
+    let tok = st["toks"][st["pos"]];
+    if tok["k"] != expected_k {
+        throw "CicParser: expected " + expected_k + ", got " + tok["k"] + " ('" + str(tok["v"]) + "')";
+    }
+    st["pos"] = st["pos"] + 1;
+    return tok;
+}
+
+fn _normalize_local_ctx(local_ctx_or_names) {
+    if local_ctx_or_names == nil { return []; }
+    let out = [];
+    let i = 0;
+    while i < len(local_ctx_or_names) {
+        let e = local_ctx_or_names[i];
+        if type(e) == "map" {
+            let v = nil;
+            if map_has(e, "val") { v = e["val"]; }
+            push(out, map{ "name": e["name"], "ty": e["ty"], "val": v });
+        } else {
+            push(out, map{ "name": str(e), "ty": nil, "val": nil });
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _lookup_local_var(ctx, ident_name) {
+    let i = len(ctx) - 1;
+    while i >= 0 {
+        if ctx[i]["name"] == ident_name {
+            return len(ctx) - 1 - i;
+        }
+        i = i - 1;
+    }
+    return -1;
+}
+
+fn _resolve_prelude_alias(env, name) {
+    if env != nil and map_has(env["decls"], name) { return name; }
+    if name == "succ" { return "Nat.succ"; }
+    if name == "zero" { return "Nat.zero"; }
+    if name == "add" { return "Nat.add"; }
+    if name == "mul" { return "Nat.mul"; }
+    if name == "nil" { return "List.nil"; }
+    if name == "cons" { return "List.cons"; }
+    if name == "append" { return "List.append"; }
+    if name == "length" { return "List.length"; }
+    return name;
+}
+
+fn _infer_eq_carrier_type(env, ctx, lhs, rhs, u_params) {
+    // Check that all local entries referenced have concrete types; otherwise fall back safely
+    let all_typed = true;
+    let i = 0;
+    while i < len(ctx) {
+        if ctx[i]["ty"] == nil { all_typed = false; }
+        i = i + 1;
+    }
+    if all_typed {
+        try {
+            return kernel_infer_type_ctx(env, ctx, lhs, u_params);
+        } catch _e1 {
+            try {
+                return kernel_infer_type_ctx(env, ctx, rhs, u_params);
+            } catch _e2 {
+                return mk_const_u("Nat", []);
+            }
+        }
+    }
+    if dest_nat_lit(lhs) != nil or dest_nat_lit(rhs) != nil {
+        return mk_const_u("Nat", []);
+    }
+    return mk_const_u("Nat", []);
+}
+
+// Parse binder groups `(x y : T) (z : U)` or unparenthesized `x y : T`
+fn _parse_binder_groups(st, ctx) {
+    let groups = [];
+    let cur_ctx = ctx;
+    if _p_peek(st)["k"] == "LPAREN" {
+        while _p_peek(st)["k"] == "LPAREN" {
+            _p_eat(st, "LPAREN");
+            let names = [];
+            while _p_peek(st)["k"] == "IDENT" {
+                push(names, _p_eat(st, "IDENT")["v"]);
+            }
+            if len(names) == 0 {
+                throw "CicParser: expected binder variable name inside '(...)'";
+            }
+            let dom_ty = mk_const_u("Nat", []);
+            if _p_peek(st)["k"] == "COLON" {
+                _p_eat(st, "COLON");
+                dom_ty = _parse_expr(st, cur_ctx);
+            }
+            _p_eat(st, "RPAREN");
+            let ni = 0;
+            while ni < len(names) {
+                let shifted_dom = lift(dom_ty, ni, 0);
+                push(groups, map{ "name": names[ni], "dom": shifted_dom });
+                cur_ctx = _ctx_push(cur_ctx, names[ni], shifted_dom, nil);
+                ni = ni + 1;
+            }
+        }
+        return map{ "binders": groups, "ctx": cur_ctx };
+    }
+
+    // Unparenthesized `x y : T` or bare `x`
+    let names = [];
+    while _p_peek(st)["k"] == "IDENT" {
+        push(names, _p_eat(st, "IDENT")["v"]);
+    }
+    if len(names) == 0 {
+        throw "CicParser: expected binder name after quantifier/lambda";
+    }
+    let dom_ty = mk_const_u("Nat", []);
+    if _p_peek(st)["k"] == "COLON" {
+        _p_eat(st, "COLON");
+        dom_ty = _parse_expr(st, cur_ctx);
+    }
+    let ni = 0;
+    while ni < len(names) {
+        let shifted_dom = lift(dom_ty, ni, 0);
+        push(groups, map{ "name": names[ni], "dom": shifted_dom });
+        cur_ctx = _ctx_push(cur_ctx, names[ni], shifted_dom, nil);
+        ni = ni + 1;
+    }
+    return map{ "binders": groups, "ctx": cur_ctx };
+}
+
+fn _parse_univ_arg(st) {
+    let tok = _p_peek(st);
+    if tok["k"] == "NUM" {
+        return _p_eat(st, "NUM")["v"];
+    }
+    if tok["k"] == "IDENT" {
+        let u_id = _p_eat(st, "IDENT")["v"];
+        if not _arr_contains_str(st["u_params"], u_id) {
+            push(st["u_params"], u_id);
+        }
+        return u_id;
+    }
+    throw "CicParser: expected universe level integer or parameter name";
+}
+
+fn _can_start_atom(k) {
+    return k == "IDENT" or k == "NUM" or k == "LPAREN";
+}
+
+fn _parse_atom(st, ctx) {
+    let tok = _p_peek(st);
+    let k = tok["k"];
+    if k == "NUM" {
+        let v = _p_eat(st, "NUM")["v"];
+        return mk_nat_lit(v);
+    }
+    if k == "LPAREN" {
+        _p_eat(st, "LPAREN");
+        let inner = _parse_expr(st, ctx);
+        _p_eat(st, "RPAREN");
+        return inner;
+    }
+    if k == "IDENT" {
+        let name = _p_eat(st, "IDENT")["v"];
+        if name == "Prop" {
+            return mk_prop();
+        }
+        if name == "Type" {
+            if _p_peek(st)["k"] == "NUM" {
+                let u_n = _p_eat(st, "NUM")["v"];
+                return mk_type(u_n);
+            }
+            return mk_type(0);
+        }
+        if name == "Sort" {
+            if _p_peek(st)["k"] == "NUM" {
+                return mk_sort(_p_eat(st, "NUM")["v"]);
+            }
+            if _p_peek(st)["k"] == "IDENT" {
+                let u_id = _p_eat(st, "IDENT")["v"];
+                if not _arr_contains_str(st["u_params"], u_id) {
+                    push(st["u_params"], u_id);
+                }
+                return mk_sort(u_id);
+            }
+            return mk_sort(0);
+        }
+        let v_idx = _lookup_local_var(ctx, name);
+        if v_idx >= 0 {
+            return mk_var(v_idx);
+        }
+        let resolved = _resolve_prelude_alias(st["env"], name);
+        if _p_peek(st)["k"] == "DOTLBRACE" {
+            _p_eat(st, "DOTLBRACE");
+            let lvls = [_parse_univ_arg(st)];
+            while _p_peek(st)["k"] == "COMMA" {
+                _p_eat(st, "COMMA");
+                push(lvls, _parse_univ_arg(st));
+            }
+            _p_eat(st, "RBRACE");
+            return mk_const_u(resolved, lvls);
+        }
+        if st["env"] != nil and map_has(st["env"]["decls"], resolved) {
+            let decl = st["env"]["decls"][resolved];
+            if len(decl["univ_params"]) == 0 {
+                return mk_const_u(resolved, []);
+            }
+        }
+        return mk_const(resolved);
+    }
+    throw "CicParser: unexpected token " + k + " ('" + str(tok["v"]) + "')";
+}
+
+fn _parse_app(st, ctx) {
+    let head = _parse_atom(st, ctx);
+    while _can_start_atom(_p_peek(st)["k"]) {
+        let arg = _parse_atom(st, ctx);
+        head = mk_app(head, arg);
+    }
+    return head;
+}
+
+fn _parse_mul(st, ctx) {
+    let lhs = _parse_app(st, ctx);
+    while _p_peek(st)["k"] == "STAR" {
+        _p_eat(st, "STAR");
+        let rhs = _parse_app(st, ctx);
+        lhs = mk_apps(mk_const_u("Nat.mul", []), [lhs, rhs]);
+    }
+    return lhs;
+}
+
+fn _parse_add(st, ctx) {
+    let lhs = _parse_mul(st, ctx);
+    while _p_peek(st)["k"] == "PLUS" {
+        _p_eat(st, "PLUS");
+        let rhs = _parse_mul(st, ctx);
+        lhs = mk_apps(mk_const_u("Nat.add", []), [lhs, rhs]);
+    }
+    return lhs;
+}
+
+fn _parse_eq(st, ctx) {
+    let lhs = _parse_add(st, ctx);
+    if _p_peek(st)["k"] == "EQ" {
+        _p_eat(st, "EQ");
+        let rhs = _parse_add(st, ctx);
+        let carrier_ty = _infer_eq_carrier_type(st["env"], ctx, lhs, rhs, st["u_params"]);
+        return mk_apps(mk_const("Eq"), [carrier_ty, lhs, rhs]);
+    }
+    return lhs;
+}
+
+fn _parse_not(st, ctx) {
+    if _p_peek(st)["k"] == "NOT" {
+        _p_eat(st, "NOT");
+        let sub = _parse_not(st, ctx);
+        return mk_app(mk_const_u("Not", []), sub);
+    }
+    return _parse_eq(st, ctx);
+}
+
+fn _parse_and(st, ctx) {
+    let lhs = _parse_not(st, ctx);
+    if _p_peek(st)["k"] == "AND" {
+        _p_eat(st, "AND");
+        let rhs = _parse_and(st, ctx);
+        return mk_apps(mk_const_u("And", []), [lhs, rhs]);
+    }
+    return lhs;
+}
+
+fn _parse_or(st, ctx) {
+    let lhs = _parse_and(st, ctx);
+    if _p_peek(st)["k"] == "OR" {
+        _p_eat(st, "OR");
+        let rhs = _parse_or(st, ctx);
+        return mk_apps(mk_const_u("Or", []), [lhs, rhs]);
+    }
+    return lhs;
+}
+
+fn _parse_arrow(st, ctx) {
+    let lhs = _parse_or(st, ctx);
+    if _p_peek(st)["k"] == "ARROW" {
+        _p_eat(st, "ARROW");
+        let ext_ctx = _ctx_push(ctx, "_", lhs, nil);
+        let rhs = _parse_expr(st, ext_ctx);
+        return mk_pi("_", lhs, rhs);
+    }
+    return lhs;
+}
+
+fn _parse_iff(st, ctx) {
+    let lhs = _parse_arrow(st, ctx);
+    if _p_peek(st)["k"] == "IFF" {
+        _p_eat(st, "IFF");
+        let rhs = _parse_iff(st, ctx);
+        return mk_apps(mk_const_u("Iff", []), [lhs, rhs]);
+    }
+    return lhs;
+}
+
+fn _parse_expr(st, ctx) {
+    let k = _p_peek(st)["k"];
+    if k == "FORALL" {
+        _p_eat(st, "FORALL");
+        let bg = _parse_binder_groups(st, ctx);
+        if _p_peek(st)["k"] == "COMMA" {
+            _p_eat(st, "COMMA");
+        }
+        let body = _parse_expr(st, bg["ctx"]);
+        return _wrap_pis(bg["binders"], body);
+    }
+    if k == "EXISTS" {
+        _p_eat(st, "EXISTS");
+        let bg = _parse_binder_groups(st, ctx);
+        if _p_peek(st)["k"] == "COMMA" {
+            _p_eat(st, "COMMA");
+        }
+        let body = _parse_expr(st, bg["ctx"]);
+        let bs = bg["binders"];
+        let cur = body;
+        let i = len(bs) - 1;
+        while i >= 0 {
+            cur = mk_apps(mk_const("Exists"), [
+                bs[i]["dom"],
+                mk_lam(bs[i]["name"], bs[i]["dom"], cur)
+            ]);
+            i = i - 1;
+        }
+        return cur;
+    }
+    if k == "FUN" {
+        _p_eat(st, "FUN");
+        let bg = _parse_binder_groups(st, ctx);
+        if _p_peek(st)["k"] == "FATARROW" {
+            _p_eat(st, "FATARROW");
+        } else if _p_peek(st)["k"] == "COMMA" {
+            _p_eat(st, "COMMA");
+        }
+        let body = _parse_expr(st, bg["ctx"]);
+        let bs = bg["binders"];
+        let cur = body;
+        let i = len(bs) - 1;
+        while i >= 0 {
+            cur = mk_lam(bs[i]["name"], bs[i]["dom"], cur);
+            i = i - 1;
+        }
+        return cur;
+    }
+    if k == "LET" {
+        _p_eat(st, "LET");
+        let bname = _p_eat(st, "IDENT")["v"];
+        let bty = nil;
+        if _p_peek(st)["k"] == "COLON" {
+            _p_eat(st, "COLON");
+            bty = _parse_expr(st, ctx);
+        }
+        _p_eat(st, "ASSIGN");
+        let bval = _parse_expr(st, ctx);
+        if bty == nil {
+            bty = kernel_infer_type_ctx(st["env"], ctx, bval, st["u_params"]);
+        }
+        _p_eat(st, "IN");
+        let ext_ctx = _ctx_push(ctx, bname, bty, bval);
+        let body = _parse_expr(st, ext_ctx);
+        return mk_letin(bname, bty, bval, body);
+    }
+    return _parse_iff(st, ctx);
+}
+
+fn parse_term(src, env = nil, local_ctx = []) {
+    if type(src) == "map" and map_has(src, "tag") {
+        return src;
+    }
+    let use_env = env;
+    if use_env == nil {
+        use_env = _get_default_parse_env();
+    }
+    let st = map{
+        "toks": _tokenize_surface(src),
+        "pos": 0,
+        "env": use_env,
+        "u_params": []
+    };
+    let norm_ctx = _normalize_local_ctx(local_ctx);
+    let term = _parse_expr(st, norm_ctx);
+    _p_eat(st, "EOF");
+    return term;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 5: GOAL-DIRECTED METAVARIABLE TACTIC ENGINE
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _collect_term_univ_vars(term, out_vars) {
+    if term == nil { return out_vars; }
+    let tg = term["tag"];
+    if tg == "Sort" {
+        _u_collect_vars(term["level"], out_vars);
+        return out_vars;
+    }
+    if tg == "Const" and term["levels"] != nil {
+        let lvls = term["levels"];
+        let i = 0;
+        while i < len(lvls) {
+            _u_collect_vars(lvls[i], out_vars);
+            i = i + 1;
+        }
+        return out_vars;
+    }
+    if tg == "App" {
+        _collect_term_univ_vars(term["fn_t"], out_vars);
+        _collect_term_univ_vars(term["arg_t"], out_vars);
+    } else if tg == "Pi" {
+        _collect_term_univ_vars(term["dom"], out_vars);
+        _collect_term_univ_vars(term["cod"], out_vars);
+    } else if tg == "Lam" {
+        _collect_term_univ_vars(term["dom"], out_vars);
+        _collect_term_univ_vars(term["body"], out_vars);
+    } else if tg == "LetIn" {
+        _collect_term_univ_vars(term["ty"], out_vars);
+        _collect_term_univ_vars(term["val"], out_vars);
+        _collect_term_univ_vars(term["body"], out_vars);
+    }
+    return out_vars;
+}
+
+// Ergonomic Tactic Constructors
+fn tac_intro(name = "h") { return map{ "tactic": "intro", "name": name }; }
+fn tac_intros(names) { return map{ "tactic": "intros", "names": names }; }
+fn tac_exact(term) { return map{ "tactic": "exact", "term": term }; }
+fn tac_assumption() { return map{ "tactic": "assumption" }; }
+fn tac_apply(term) { return map{ "tactic": "apply", "term": term }; }
+fn tac_rfl() { return map{ "tactic": "rfl" }; }
+fn tac_refl() { return map{ "tactic": "refl" }; }
+fn tac_symm() { return map{ "tactic": "symm" }; }
+fn tac_trans(mid) { return map{ "tactic": "trans", "mid": mid }; }
+fn tac_congr_arg(fn_term) { return map{ "tactic": "congr_arg", "fn_term": fn_term }; }
+fn tac_rw(eq_proof, reverse = false) { return map{ "tactic": "rw", "eq_proof": eq_proof, "reverse": reverse }; }
+fn tac_rw_rev(eq_proof) { return map{ "tactic": "rw", "eq_proof": eq_proof, "reverse": true }; }
+fn tac_split() { return map{ "tactic": "split" }; }
+fn tac_left() { return map{ "tactic": "left" }; }
+fn tac_right() { return map{ "tactic": "right" }; }
+fn tac_cases(hyp, names = nil) { return map{ "tactic": "cases", "hyp": hyp, "names": names }; }
+fn tac_exfalso() { return map{ "tactic": "exfalso" }; }
+fn tac_existsi(witness) { return map{ "tactic": "existsi", "witness": witness }; }
+fn tac_induction(var_name, names = nil) { return map{ "tactic": "induction", "var_name": var_name, "names": names }; }
+fn tac_by_contra(hyp_name = "h_contra") { return map{ "tactic": "by_contra", "name": hyp_name }; }
+
+fn _fresh_mvar_goal(state, ctx, target, tag = "subgoal") {
+    let mid = state["next_mvar"];
+    state["next_mvar"] = mid + 1;
+    let g = map{
+        "id": mid,
+        "ctx": ctx,
+        "target": target,
+        "tag": tag
+    };
+    return g;
+}
+
+fn _replace_head_goal(state, new_goals) {
+    let updated = [];
+    let i = 0;
+    while i < len(new_goals) {
+        push(updated, new_goals[i]);
+        i = i + 1;
+    }
+    let j = 1;
+    while j < len(state["goals"]) {
+        push(updated, state["goals"][j]);
+        j = j + 1;
+    }
+    state["goals"] = updated;
+}
+
+fn _assign_mvar(state, mvar_id, sol_term) {
+    state["mvars"][str(mvar_id)] = sol_term;
+}
+
+fn _instantiate_mvars(mvars, term) {
+    if term == nil { return nil; }
+    let tg = term["tag"];
+    if tg == "MVar" {
+        let key = str(term["id"]);
+        if map_has(mvars, key) {
+            let sol = _instantiate_mvars(mvars, mvars[key]);
+            return lift(sol, term["shift"], 0);
+        }
+        return term;
+    }
+    if tg == "Var" or tg == "Sort" or tg == "Const" {
+        return term;
+    }
+    if tg == "App" {
+        return mk_app(_instantiate_mvars(mvars, term["fn_t"]), _instantiate_mvars(mvars, term["arg_t"]));
+    }
+    if tg == "Pi" {
+        return mk_pi(term["name"], _instantiate_mvars(mvars, term["dom"]), _instantiate_mvars(mvars, term["cod"]));
+    }
+    if tg == "Lam" {
+        return mk_lam(term["name"], _instantiate_mvars(mvars, term["dom"]), _instantiate_mvars(mvars, term["body"]));
+    }
+    if tg == "LetIn" {
+        return mk_letin(
+            term["name"],
+            _instantiate_mvars(mvars, term["ty"]),
+            _instantiate_mvars(mvars, term["val"]),
+            _instantiate_mvars(mvars, term["body"])
+        );
+    }
+    return term;
+}
+
+fn new_proof(env, goal_type_or_str, univ_params = nil) {
+    let goal_ty = parse_term(goal_type_or_str, env, []);
+    let u_params = univ_params;
+    if u_params == nil {
+        u_params = _collect_term_univ_vars(goal_ty, []);
+    }
+    let _sort_ok = _infer_sort_level(env, [], goal_ty, u_params);
+    return map{
+        "env": env,
+        "goal_type": goal_ty,
+        "univ_params": u_params,
+        "next_mvar": 1,
+        "mvars": map{},
+        "root": mk_mvar(0, 0),
+        "goals": [map{ "id": 0, "ctx": [], "target": goal_ty, "tag": "main" }],
+        "history": []
+    };
+}
+
+fn proof_goals(state) {
+    return state["goals"];
+}
+
+fn format_proof_state(state) {
+    let gs = state["goals"];
+    if len(gs) == 0 {
+        return "No goals remaining (proof ready for qed).";
+    }
+    let lines = "";
+    let gi = 0;
+    while gi < len(gs) {
+        let g = gs[gi];
+        let ctx = g["ctx"];
+        let cnames = _extract_ctx_names(ctx);
+        lines = lines + "Goal #" + str(gi + 1) + " [" + g["tag"] + "]:\n";
+        let hi = 0;
+        while hi < len(ctx) {
+            let h_names_prefix = [];
+            let pk = 0;
+            while pk < hi {
+                push(h_names_prefix, ctx[pk]["name"]);
+                pk = pk + 1;
+            }
+            lines = lines + "  " + ctx[hi]["name"] + " : " + term_to_unicode(ctx[hi]["ty"], h_names_prefix) + "\n";
+            hi = hi + 1;
+        }
+        lines = lines + "  ⊢ " + term_to_unicode(g["target"], cnames) + "\n";
+        gi = gi + 1;
+    }
+    return lines;
+}
+
+// ── Equality & Simplification Helpers for Tactics ───────────────────────────
+
+fn _dest_eq_type(env, ctx, ty, u_params) {
+    let w = kernel_whnf_ctx(env, ctx, ty);
+    let sp = _unfold_spine(w);
+    let hd = sp["head"];
+    let args = sp["args"];
+    if hd["tag"] == "Const" and hd["name"] == "Eq" and len(args) == 3 {
+        let u_eq = nil;
+        if hd["levels"] != nil and len(hd["levels"]) == 1 {
+            u_eq = hd["levels"][0];
+        } else {
+            u_eq = _infer_sort_level(env, ctx, args[0], u_params);
+        }
+        return map{
+            "u": u_eq,
+            "carrier": args[0],
+            "lhs": args[1],
+            "rhs": args[2]
+        };
+    }
+    return nil;
+}
+
+fn _build_eq_symm_term(u_eq, carrier, a, b, h_ab) {
+    let eq_c = mk_const_u("Eq", [u_eq]);
+    let motive = mk_lam("z", carrier,
+        mk_lam("_heq", mk_apps(eq_c, [lift(carrier, 1, 0), lift(a, 1, 0), mk_var(0)]),
+            mk_apps(eq_c, [lift(carrier, 2, 0), mk_var(1), lift(a, 2, 0)])));
+    let refl_case = mk_apps(mk_const_u("Eq.refl", [u_eq]), [carrier, a]);
+    return mk_apps(mk_const_u("Eq.rec", [u_eq, 0]), [carrier, a, motive, refl_case, b, h_ab]);
+}
+
+// Normalize reducible computational subterms (`Nat.add`, `Nat.mul`, `List.append`, `List.length`)
+// while preserving top-level logical connectives (`Eq`, `And`, `Or`, `Pi`).
+// Soundness: every transformation is definitional WHNF, AND `qed()` re-checks everything in `CicKernel`!
+fn _simplify_computational_subterms(env, ctx, term) {
+    if term == nil { return nil; }
+    let tg = term["tag"];
+    if tg == "Var" or tg == "Sort" or tg == "Const" or tg == "MVar" {
+        return term;
+    }
+    if tg == "Pi" {
+        let d = _simplify_computational_subterms(env, ctx, term["dom"]);
+        let ext_ctx = _ctx_push(ctx, term["name"], d, nil);
+        let c = _simplify_computational_subterms(env, ext_ctx, term["cod"]);
+        return mk_pi(term["name"], d, c);
+    }
+    if tg == "Lam" {
+        let d = _simplify_computational_subterms(env, ctx, term["dom"]);
+        let ext_ctx = _ctx_push(ctx, term["name"], d, nil);
+        let b = _simplify_computational_subterms(env, ext_ctx, term["body"]);
+        return mk_lam(term["name"], d, b);
+    }
+    if tg == "App" {
+        let sp = _unfold_spine(term);
+        let hd = sp["head"];
+        let args = sp["args"];
+        if hd["tag"] == "Const" {
+            let cname = hd["name"];
+            if cname == "Eq" or cname == "And" or cname == "Or" or cname == "Iff" or cname == "Not" or cname == "Nat.succ" or cname == "List.cons" {
+                let norm_args = [];
+                let i = 0;
+                while i < len(args) {
+                    push(norm_args, _simplify_computational_subterms(env, ctx, args[i]));
+                    i = i + 1;
+                }
+                return mk_apps(hd, norm_args);
+            }
+        }
+        let w = kernel_whnf_ctx(env, ctx, term);
+        let wsp = _unfold_spine(w);
+        let whd = wsp["head"];
+        let wargs = wsp["args"];
+        let out_args = [];
+        let j = 0;
+        while j < len(wargs) {
+            push(out_args, _simplify_computational_subterms(env, ctx, wargs[j]));
+            j = j + 1;
+        }
+        return mk_apps(whd, out_args);
+    }
+    return kernel_whnf_ctx(env, ctx, term);
+}
+
+fn _syntactic_eq(t1, t2) {
+    if t1 == nil or t2 == nil { return t1 == t2; }
+    let tg1 = t1["tag"];
+    if tg1 != t2["tag"] { return false; }
+    if tg1 == "Var" { return t1["idx"] == t2["idx"]; }
+    if tg1 == "Sort" { return _u_eq(t1["level"], t2["level"]); }
+    if tg1 == "Const" { return t1["name"] == t2["name"]; }
+    if tg1 == "MVar" { return t1["id"] == t2["id"] and t1["shift"] == t2["shift"]; }
+    if tg1 == "App" {
+        return _syntactic_eq(t1["fn_t"], t2["fn_t"]) and _syntactic_eq(t1["arg_t"], t2["arg_t"]);
+    }
+    if tg1 == "Pi" {
+        return _syntactic_eq(t1["dom"], t2["dom"]) and _syntactic_eq(t1["cod"], t2["cod"]);
+    }
+    if tg1 == "Lam" {
+        return _syntactic_eq(t1["dom"], t2["dom"]) and _syntactic_eq(t1["body"], t2["body"]);
+    }
+    if tg1 == "LetIn" {
+        return _syntactic_eq(t1["ty"], t2["ty"]) and _syntactic_eq(t1["val"], t2["val"]) and _syntactic_eq(t1["body"], t2["body"]);
+    }
+    return false;
+}
+
+// Abstract all occurrences of `old_sub` inside `expr` into `Var(0)` (living in `ctx + [z : carrier]`).
+fn _abstract_occurrences(expr, old_sub, depth) {
+    let shifted_old = lift(old_sub, depth, 0);
+    if _syntactic_eq(expr, shifted_old) {
+        return map{ "term": mk_var(depth), "count": 1 };
+    }
+    let tg = expr["tag"];
+    if tg == "Var" {
+        if expr["idx"] >= depth {
+            return map{ "term": mk_var(expr["idx"] + 1), "count": 0 };
+        }
+        return map{ "term": expr, "count": 0 };
+    }
+    if tg == "Sort" or tg == "Const" {
+        return map{ "term": expr, "count": 0 };
+    }
+    if tg == "App" {
+        let rf = _abstract_occurrences(expr["fn_t"], old_sub, depth);
+        let ra = _abstract_occurrences(expr["arg_t"], old_sub, depth);
+        return map{
+            "term": mk_app(rf["term"], ra["term"]),
+            "count": rf["count"] + ra["count"]
+        };
+    }
+    if tg == "Pi" {
+        let rd = _abstract_occurrences(expr["dom"], old_sub, depth);
+        let rc = _abstract_occurrences(expr["cod"], old_sub, depth + 1);
+        return map{
+            "term": mk_pi(expr["name"], rd["term"], rc["term"]),
+            "count": rd["count"] + rc["count"]
+        };
+    }
+    if tg == "Lam" {
+        let rd = _abstract_occurrences(expr["dom"], old_sub, depth);
+        let rb = _abstract_occurrences(expr["body"], old_sub, depth + 1);
+        return map{
+            "term": mk_lam(expr["name"], rd["term"], rb["term"]),
+            "count": rd["count"] + rb["count"]
+        };
+    }
+    if tg == "LetIn" {
+        let rt = _abstract_occurrences(expr["ty"], old_sub, depth);
+        let rv = _abstract_occurrences(expr["val"], old_sub, depth);
+        let rb = _abstract_occurrences(expr["body"], old_sub, depth + 1);
+        return map{
+            "term": mk_letin(expr["name"], rt["term"], rv["term"], rb["term"]),
+            "count": rt["count"] + rv["count"] + rb["count"]
+        };
+    }
+    return map{ "term": lift(expr, 1, depth), "count": 0 };
+}
+
+// First-order pattern matcher to instantiate universally quantified rewrite lemmas (`rw add_succ`, `rw add_assoc`, etc.)
+fn _match_pattern(env, ctx, pat, num_slots, concrete, bindings) {
+    let ptg = pat["tag"];
+    if ptg == "Var" {
+        let idx = pat["idx"];
+        if idx < num_slots {
+            let slot = num_slots - 1 - idx;
+            if map_has(bindings, str(slot)) {
+                return kernel_is_def_eq_ctx(env, ctx, bindings[str(slot)], concrete);
+            }
+            bindings[str(slot)] = concrete;
+            return true;
+        }
+        return concrete["tag"] == "Var" and concrete["idx"] == idx - num_slots;
+    }
+    if ptg == "Const" {
+        return concrete["tag"] == "Const" and pat["name"] == concrete["name"];
+    }
+    if ptg == "Sort" {
+        return concrete["tag"] == "Sort" and _u_eq(pat["level"], concrete["level"]);
+    }
+    if ptg == "App" {
+        if concrete["tag"] != "App" { return false; }
+        let sp_p = _unfold_spine(pat);
+        let sp_c = _unfold_spine(concrete);
+        if len(sp_p["args"]) != len(sp_c["args"]) { return false; }
+        if not _match_pattern(env, ctx, sp_p["head"], num_slots, sp_c["head"], bindings) {
+            return false;
+        }
+        let i = 0;
+        while i < len(sp_p["args"]) {
+            if not _match_pattern(env, ctx, sp_p["args"][i], num_slots, sp_c["args"][i], bindings) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn _find_subterm_matching_pattern(env, ctx, pat, num_slots, expr) {
+    let try_b = map{};
+    if _match_pattern(env, ctx, pat, num_slots, expr, try_b) {
+        let all_bound = true;
+        let s = 0;
+        while s < num_slots {
+            if not map_has(try_b, str(s)) { all_bound = false; }
+            s = s + 1;
+        }
+        if all_bound {
+            let args = [];
+            let j = 0;
+            while j < num_slots {
+                push(args, try_b[str(j)]);
+                j = j + 1;
+            }
+            return args;
+        }
+    }
+    if expr["tag"] == "App" {
+        let sp = _unfold_spine(expr);
+        let i = 0;
+        while i < len(sp["args"]) {
+            let r = _find_subterm_matching_pattern(env, ctx, pat, num_slots, sp["args"][i]);
+            if r != nil { return r; }
+            i = i + 1;
+        }
+    }
+    return nil;
+}
+
+// Revert the innermost hypothesis in `state["goals"][0]` back into a `Pi` binder on `target`.
+fn _revert_last_hyp(state) {
+    let g = state["goals"][0];
+    let ctx = g["ctx"];
+    if len(ctx) == 0 {
+        throw "TacticEngine: cannot revert from empty context";
+    }
+    let last_h = ctx[len(ctx) - 1];
+    let prefix_ctx = [];
+    let i = 0;
+    while i < len(ctx) - 1 {
+        push(prefix_ctx, ctx[i]);
+        i = i + 1;
+    }
+    let rev_target = mk_pi(last_h["name"], last_h["ty"], g["target"]);
+    let rev_goal = _fresh_mvar_goal(state, prefix_ctx, rev_target, g["tag"]);
+    _assign_mvar(state, g["id"], mk_app(mk_mvar(rev_goal["id"], 1), mk_var(0)));
+    _replace_head_goal(state, [rev_goal]);
+}
+
+// Parse concise string tactic commands like `"intros a b"`, `"rw <- ih"`, `"induction n"`, `"rfl"`.
+fn _parse_string_tactic(raw_cmd) {
+    let s = str_trim(raw_cmd);
+    if s == "rfl" { return tac_rfl(); }
+    if s == "refl" { return tac_refl(); }
+    if s == "assumption" { return tac_assumption(); }
+    if s == "split" { return tac_split(); }
+    if s == "left" { return tac_left(); }
+    if s == "right" { return tac_right(); }
+    if s == "exfalso" { return tac_exfalso(); }
+    if s == "symm" { return tac_symm(); }
+    if s == "intro" { return tac_intro("h"); }
+    if s == "intros" { return tac_intros([]); }
+    if s == "by_contra" { return tac_by_contra("h_contra"); }
+
+    let sp_idx = str_index_of(s, " ");
+    if sp_idx < 0 {
+        throw "TacticEngine: unrecognized tactic string '" + s + "'";
+    }
+    let verb = str_slice(s, 0, sp_idx);
+    let rest = str_trim(str_slice(s, sp_idx + 1, len(s)));
+
+    if verb == "intro" { return tac_intro(rest); }
+    if verb == "intros" {
+        let raw_parts = str_split(rest, " ");
+        let names = [];
+        let i = 0;
+        while i < len(raw_parts) {
+            let p = str_trim(raw_parts[i]);
+            if p != "" { push(names, p); }
+            i = i + 1;
+        }
+        return tac_intros(names);
+    }
+    if verb == "exact" { return tac_exact(rest); }
+    if verb == "apply" { return tac_apply(rest); }
+    if verb == "trans" { return tac_trans(rest); }
+    if verb == "congr_arg" { return tac_congr_arg(rest); }
+    if verb == "existsi" { return tac_existsi(rest); }
+    if verb == "cases" { return tac_cases(rest); }
+    if verb == "induction" { return tac_induction(rest); }
+    if verb == "by_contra" { return tac_by_contra(rest); }
+    if verb == "rw" {
+        if str_starts_with(rest, "<-") {
+            return tac_rw(str_trim(str_slice(rest, 2, len(rest))), true);
+        }
+        if str_starts_with(rest, "←") {
+            return tac_rw(str_trim(str_slice(rest, 1, len(rest))), true);
+        }
+        return tac_rw(rest, false);
+    }
+    throw "TacticEngine: unknown tactic verb '" + verb + "'";
+}
+
+// ── Core `tactic_step(state, raw_tac)` Implementation ──────────────────────
+
+fn tactic_step(state, raw_tac) {
+    if len(state["goals"]) == 0 {
+        throw "TacticEngine: no open goals remaining";
+    }
+    let tac = raw_tac;
+    if type(raw_tac) == "string" {
+        tac = _parse_string_tactic(raw_tac);
+    }
+    let op = tac["tactic"];
+    push(state["history"], op);
+
+    let env = state["env"];
+    let u_params = state["univ_params"];
+    let g = state["goals"][0];
+    let ctx = g["ctx"];
+    let target = g["target"];
+
+    // 1. `intro(name)`
+    if op == "intro" {
+        let w = kernel_whnf_ctx(env, ctx, target);
+        if w["tag"] != "Pi" {
+            throw "TacticEngine [intro]: current goal is not a Pi/implication";
+        }
+        let bname = "h";
+        if map_has(tac, "name") and tac["name"] != nil and tac["name"] != "" {
+            bname = tac["name"];
+        } else if w["name"] != "_" and w["name"] != "" {
+            bname = w["name"];
+        }
+        let ext_ctx = _ctx_push(ctx, bname, w["dom"], nil);
+        let sub_g = _fresh_mvar_goal(state, ext_ctx, w["cod"], g["tag"]);
+        _assign_mvar(state, g["id"], mk_lam(bname, w["dom"], mk_mvar(sub_g["id"], 0)));
+        _replace_head_goal(state, [sub_g]);
+        return state;
+    }
+
+    // 2. `intros(names)`
+    if op == "intros" {
+        let names = tac["names"];
+        if names == nil or len(names) == 0 {
+            let auto_idx = 0;
+            while len(state["goals"]) > 0 {
+                let gcur = state["goals"][0];
+                let wcur = kernel_whnf_ctx(env, gcur["ctx"], gcur["target"]);
+                if wcur["tag"] != "Pi" { break; }
+                let aname = if wcur["name"] != "_" and wcur["name"] != "" { wcur["name"] } else { "_h" + str(auto_idx) };
+                tactic_step(state, tac_intro(aname));
+                auto_idx = auto_idx + 1;
+            }
+            return state;
+        }
+        let i = 0;
+        while i < len(names) {
+            tactic_step(state, tac_intro(names[i]));
+            i = i + 1;
+        }
+        return state;
+    }
+
+    // 3. `exact(term)`
+    if op == "exact" {
+        let t = parse_term(tac["term"], env, ctx);
+        kernel_check_type_ctx(env, ctx, t, target, u_params);
+        _assign_mvar(state, g["id"], t);
+        _replace_head_goal(state, []);
+        return state;
+    }
+
+    // 4. `assumption()`
+    if op == "assumption" {
+        let hi = len(ctx) - 1;
+        while hi >= 0 {
+            let v_idx = len(ctx) - 1 - hi;
+            let h_ty = lift(ctx[hi]["ty"], v_idx + 1, 0);
+            if kernel_is_def_eq_ctx(env, ctx, h_ty, target) {
+                _assign_mvar(state, g["id"], mk_var(v_idx));
+                _replace_head_goal(state, []);
+                return state;
+            }
+            hi = hi - 1;
+        }
+        throw "TacticEngine [assumption]: no local hypothesis matches current goal";
+    }
+
+    // 5. `rfl()` / `refl()`
+    if op == "rfl" or op == "refl" {
+        let eq_info = _dest_eq_type(env, ctx, target, u_params);
+        if eq_info == nil {
+            throw "TacticEngine [rfl]: goal is not an equality `lhs = rhs`";
+        }
+        if not kernel_is_def_eq_ctx(env, ctx, eq_info["lhs"], eq_info["rhs"]) {
+            let cnames = _extract_ctx_names(ctx);
+            throw "TacticEngine [rfl]: terms '" + term_to_unicode(eq_info["lhs"], cnames) + "' and '" + term_to_unicode(eq_info["rhs"], cnames) + "' are not definitionally equal";
+        }
+        let prf = mk_apps(mk_const_u("Eq.refl", [eq_info["u"]]), [eq_info["carrier"], eq_info["lhs"]]);
+        _assign_mvar(state, g["id"], prf);
+        _replace_head_goal(state, []);
+        return state;
+    }
+
+    // 6. `symm()`
+    if op == "symm" {
+        let eq_info = _dest_eq_type(env, ctx, target, u_params);
+        if eq_info == nil {
+            throw "TacticEngine [symm]: goal is not an equality";
+        }
+        let u_eq = eq_info["u"];
+        let carrier = eq_info["carrier"];
+        let lhs = eq_info["lhs"];
+        let rhs = eq_info["rhs"];
+        let flipped_ty = mk_apps(mk_const_u("Eq", [u_eq]), [carrier, rhs, lhs]);
+        let sub_g = _fresh_mvar_goal(state, ctx, flipped_ty, g["tag"]);
+        let prf = _build_eq_symm_term(u_eq, carrier, rhs, lhs, mk_mvar(sub_g["id"], 0));
+        _assign_mvar(state, g["id"], prf);
+        _replace_head_goal(state, [sub_g]);
+        return state;
+    }
+
+    // 7. `trans(mid)`
+    if op == "trans" {
+        let eq_info = _dest_eq_type(env, ctx, target, u_params);
+        if eq_info == nil {
+            throw "TacticEngine [trans]: goal is not an equality";
+        }
+        let u_eq = eq_info["u"];
+        let carrier = eq_info["carrier"];
+        let lhs = eq_info["lhs"];
+        let rhs = eq_info["rhs"];
+        let mid = parse_term(tac["mid"], env, ctx);
+        kernel_check_type_ctx(env, ctx, mid, carrier, u_params);
+
+        let eq_c = mk_const_u("Eq", [u_eq]);
+        let g1 = _fresh_mvar_goal(state, ctx, mk_apps(eq_c, [carrier, lhs, mid]), "trans_left");
+        let g2 = _fresh_mvar_goal(state, ctx, mk_apps(eq_c, [carrier, mid, rhs]), "trans_right");
+
+        let motive = mk_lam("z", carrier,
+            mk_lam("_heq", mk_apps(eq_c, [lift(carrier, 1, 0), lift(mid, 1, 0), mk_var(0)]),
+                mk_apps(eq_c, [lift(carrier, 2, 0), lift(lhs, 2, 0), mk_var(1)])));
+        let prf = mk_apps(mk_const_u("Eq.rec", [u_eq, 0]), [
+            carrier,
+            mid,
+            motive,
+            mk_mvar(g1["id"], 0),
+            rhs,
+            mk_mvar(g2["id"], 0)
+        ]);
+        _assign_mvar(state, g["id"], prf);
+        _replace_head_goal(state, [g1, g2]);
+        return state;
+    }
+
+    // 8. `congr_arg(fn_term)`
+    if op == "congr_arg" {
+        let eq_info = _dest_eq_type(env, ctx, target, u_params);
+        if eq_info == nil {
+            throw "TacticEngine [congr_arg]: goal is not an equality";
+        }
+        let fn_t = parse_term(tac["fn_term"], env, ctx);
+        let fn_ty = kernel_whnf_ctx(env, ctx, kernel_infer_type_ctx(env, ctx, fn_t, u_params));
+        if fn_ty["tag"] != "Pi" {
+            throw "TacticEngine [congr_arg]: supplied term is not a function";
+        }
+        let dom_a = fn_ty["dom"];
+        let u_a = _infer_sort_level(env, ctx, dom_a, u_params);
+        let u_b = eq_info["u"];
+        let carrier_b = eq_info["carrier"];
+
+        // Extract `a1` and `a2` from `lhs` and `rhs` (normalizing computational head if needed)
+        let lhs_w = eq_info["lhs"];
+        let rhs_w = eq_info["rhs"];
+        if lhs_w["tag"] != "App" or not kernel_is_def_eq_ctx(env, ctx, lhs_w["fn_t"], fn_t) {
+            lhs_w = _simplify_computational_subterms(env, ctx, lhs_w);
+        }
+        if rhs_w["tag"] != "App" or not kernel_is_def_eq_ctx(env, ctx, rhs_w["fn_t"], fn_t) {
+            rhs_w = _simplify_computational_subterms(env, ctx, rhs_w);
+        }
+        if lhs_w["tag"] != "App" or rhs_w["tag"] != "App" {
+            throw "TacticEngine [congr_arg]: goal sides are not applications of supplied function";
+        }
+        let a1 = lhs_w["arg_t"];
+        let a2 = rhs_w["arg_t"];
+        if not kernel_is_def_eq_ctx(env, ctx, mk_app(fn_t, a1), eq_info["lhs"]) or not kernel_is_def_eq_ctx(env, ctx, mk_app(fn_t, a2), eq_info["rhs"]) {
+            throw "TacticEngine [congr_arg]: function application does not match goal sides";
+        }
+        let sub_g = _fresh_mvar_goal(state, ctx, mk_apps(mk_const_u("Eq", [u_a]), [dom_a, a1, a2]), g["tag"]);
+        let eq_a_c = mk_const_u("Eq", [u_a]);
+        let eq_b_c = mk_const_u("Eq", [u_b]);
+        let motive = mk_lam("z", dom_a,
+            mk_lam("_heq", mk_apps(eq_a_c, [lift(dom_a, 1, 0), lift(a1, 1, 0), mk_var(0)]),
+                mk_apps(eq_b_c, [
+                    lift(carrier_b, 2, 0),
+                    mk_app(lift(fn_t, 2, 0), lift(a1, 2, 0)),
+                    mk_app(lift(fn_t, 2, 0), mk_var(1))
+                ])));
+        let refl_b = mk_apps(mk_const_u("Eq.refl", [u_b]), [carrier_b, mk_app(fn_t, a1)]);
+        let prf = mk_apps(mk_const_u("Eq.rec", [u_a, 0]), [
+            dom_a,
+            a1,
+            motive,
+            refl_b,
+            a2,
+            mk_mvar(sub_g["id"], 0)
+        ]);
+        _assign_mvar(state, g["id"], prf);
+        _replace_head_goal(state, [sub_g]);
+        return state;
+    }
+
+    // 9. `rw(eq_proof, reverse)`
+    if op == "rw" {
+        let rev = false;
+        if map_has(tac, "reverse") and tac["reverse"] == true { rev = true; }
+        let h_raw = parse_term(tac["eq_proof"], env, ctx);
+
+        // Support polymorphic theorem constants in `rw` (e.g., `rw("append_nil")`, `rw("eq_symm")`)
+        let h_ty = nil;
+        if h_raw["tag"] == "Const" and h_raw["levels"] == nil and map_has(env["decls"], h_raw["name"]) {
+            let decl = env["decls"][h_raw["name"]];
+            if len(decl["univ_params"]) > 0 {
+                // Use current goal's universe params if matching, or infer from matched arguments below
+                let try_lvls = [];
+                let ui = 0;
+                while ui < len(decl["univ_params"]) {
+                    if ui < len(u_params) {
+                        push(try_lvls, u_params[ui]);
+                    } else {
+                        push(try_lvls, 1);
+                    }
+                    ui = ui + 1;
+                }
+                h_raw = mk_const_u(h_raw["name"], try_lvls);
+            }
+        }
+        h_ty = kernel_infer_type_ctx(env, ctx, h_raw, u_params);
+
+        // Peel any universally quantified parameters `∀ x_1 ... x_k, lhs = rhs`
+        let peeled = _peel_pis(h_ty, -1);
+        let p_bs = peeled["binders"];
+        let num_slots = len(p_bs);
+        let work_target = target;
+        let h_inst = h_raw;
+
+        if num_slots > 0 {
+            let ext_p_ctx = ctx;
+            let pi = 0;
+            while pi < num_slots {
+                ext_p_ctx = _ctx_push(ext_p_ctx, p_bs[pi]["name"], p_bs[pi]["dom"], nil);
+                pi = pi + 1;
+            }
+            let body_eq = _dest_eq_type(env, ext_p_ctx, peeled["body"], u_params);
+            if body_eq == nil {
+                throw "TacticEngine [rw]: quantified lemma does not conclude an equality";
+            }
+            let pat = body_eq["lhs"];
+            if rev { pat = body_eq["rhs"]; }
+
+            let slot_args = _find_subterm_matching_pattern(env, ctx, pat, num_slots, work_target);
+            if slot_args == nil {
+                work_target = _simplify_computational_subterms(env, ctx, work_target);
+                slot_args = _find_subterm_matching_pattern(env, ctx, pat, num_slots, work_target);
+            }
+            if slot_args == nil {
+                throw "TacticEngine [rw]: could not find subterm matching rewrite pattern in goal";
+            }
+            // Re-infer polymorphic universe levels if `h_raw` was a polymorphic constant!
+            let base_c = _unfold_spine(tac["eq_proof"] != nil and type(tac["eq_proof"]) == "string" ? parse_term(tac["eq_proof"], env, ctx) : h_raw)["head"];
+            if base_c["tag"] == "Const" and base_c["levels"] == nil and map_has(env["decls"], base_c["name"]) {
+                let d_poly = env["decls"][base_c["name"]];
+                if len(d_poly["univ_params"]) > 0 {
+                    let inf_lvls = _infer_poly_levels_for_spine(env, ctx, d_poly, slot_args, u_params);
+                    h_inst = mk_apps(mk_const_u(base_c["name"], inf_lvls), slot_args);
+                } else {
+                    h_inst = mk_apps(h_raw, slot_args);
+                }
+            } else {
+                h_inst = mk_apps(h_raw, slot_args);
+            }
+        }
+
+        let inst_ty = kernel_infer_type_ctx(env, ctx, h_inst, u_params);
+        let eq_info = _dest_eq_type(env, ctx, inst_ty, u_params);
+        if eq_info == nil {
+            throw "TacticEngine [rw]: supplied proof is not an equality";
+        }
+        let u_eq = eq_info["u"];
+        let carrier = eq_info["carrier"];
+        let old_sub = eq_info["lhs"];
+        let new_sub = eq_info["rhs"];
+        if rev {
+            old_sub = eq_info["rhs"];
+            new_sub = eq_info["lhs"];
+        }
+
+        let abs_res = _abstract_occurrences(work_target, old_sub, 0);
+        if abs_res["count"] == 0 {
+            work_target = _simplify_computational_subterms(env, ctx, work_target);
+            abs_res = _abstract_occurrences(work_target, old_sub, 0);
+        }
+        if abs_res["count"] == 0 {
+            // Also normalize `old_sub` in case `ih` has reducible computational terms
+            let norm_old = _simplify_computational_subterms(env, ctx, old_sub);
+            abs_res = _abstract_occurrences(work_target, norm_old, 0);
+            if abs_res["count"] > 0 {
+                old_sub = norm_old;
+            }
+        }
+        if abs_res["count"] == 0 {
+            throw "TacticEngine [rw]: rewrite target subterm not found in goal";
+        }
+
+        let p_body = abs_res["term"];
+        let new_target = subst(p_body, new_sub, 0);
+        let u_goal = _infer_sort_level(env, ctx, work_target, u_params);
+        let sub_g = _fresh_mvar_goal(state, ctx, new_target, g["tag"]);
+
+        let h_back = h_inst;
+        if not rev {
+            h_back = _build_eq_symm_term(u_eq, carrier, eq_info["lhs"], eq_info["rhs"], h_inst);
+        }
+        let eq_c = mk_const_u("Eq", [u_eq]);
+        let motive = mk_lam("z", carrier,
+            mk_lam("_heq", mk_apps(eq_c, [lift(carrier, 1, 0), lift(new_sub, 1, 0), mk_var(0)]),
+                lift(p_body, 1, 0)));
+        let prf = mk_apps(mk_const_u("Eq.rec", [u_eq, u_goal]), [
+            carrier,
+            new_sub,
+            motive,
+            mk_mvar(sub_g["id"], 0),
+            old_sub,
+            h_back
+        ]);
+        _assign_mvar(state, g["id"], prf);
+        _replace_head_goal(state, [sub_g]);
+        return state;
+    }
+
+    // 10. `split()` (for `And` and `Iff`)
+    if op == "split" {
+        let w = kernel_whnf_ctx(env, ctx, target);
+        let sp = _unfold_spine(w);
+        if sp["head"]["tag"] != "Const" or sp["head"]["name"] != "And" or len(sp["args"]) != 2 {
+            throw "TacticEngine [split]: goal WHNF is not a conjunction `And A B`";
+        }
+        let a_ty = sp["args"][0];
+        let b_ty = sp["args"][1];
+        let g1 = _fresh_mvar_goal(state, ctx, a_ty, "left");
+        let g2 = _fresh_mvar_goal(state, ctx, b_ty, "right");
+        let prf = mk_apps(mk_const_u("And.intro", []), [
+            a_ty,
+            b_ty,
+            mk_mvar(g1["id"], 0),
+            mk_mvar(g2["id"], 0)
+        ]);
+        _assign_mvar(state, g["id"], prf);
+        _replace_head_goal(state, [g1, g2]);
+        return state;
+    }
+
+    // 11. `left()` and `right()` (for `Or`)
+    if op == "left" or op == "right" {
+        let w = kernel_whnf_ctx(env, ctx, target);
+        let sp = _unfold_spine(w);
+        if sp["head"]["tag"] != "Const" or sp["head"]["name"] != "Or" or len(sp["args"]) != 2 {
+            throw "TacticEngine [" + op + "]: goal WHNF is not a disjunction `Or A B`";
+        }
+        let a_ty = sp["args"][0];
+        let b_ty = sp["args"][1];
+        if op == "left" {
+            let sub_g = _fresh_mvar_goal(state, ctx, a_ty, "inl");
+            let prf = mk_apps(mk_const_u("Or.inl", []), [a_ty, b_ty, mk_mvar(sub_g["id"], 0)]);
+            _assign_mvar(state, g["id"], prf);
+            _replace_head_goal(state, [sub_g]);
+        } else {
+            let sub_g = _fresh_mvar_goal(state, ctx, b_ty, "inr");
+            let prf = mk_apps(mk_const_u("Or.inr", []), [a_ty, b_ty, mk_mvar(sub_g["id"], 0)]);
+            _assign_mvar(state, g["id"], prf);
+            _replace_head_goal(state, [sub_g]);
+        }
+        return state;
+    }
+
+    // 12. `exfalso()`
+    if op == "exfalso" {
+        let u_goal = _infer_sort_level(env, ctx, target, u_params);
+        let sub_g = _fresh_mvar_goal(state, ctx, mk_const_u("False", []), "exfalso");
+        let f_motive = mk_lam("_hf", mk_const_u("False", []), lift(target, 1, 0));
+        let prf = mk_apps(mk_const_u("False.rec", [u_goal]), [f_motive, mk_mvar(sub_g["id"], 0)]);
+        _assign_mvar(state, g["id"], prf);
+        _replace_head_goal(state, [sub_g]);
+        return state;
+    }
+
+    // 13. `existsi(witness)`
+    if op == "existsi" {
+        let w_goal = kernel_whnf_ctx(env, ctx, target);
+        let sp = _unfold_spine(w_goal);
+        if sp["head"]["tag"] != "Const" or sp["head"]["name"] != "Exists" or len(sp["args"]) != 2 {
+            throw "TacticEngine [existsi]: goal WHNF is not an existential `Exists A P`";
+        }
+        let dom_a = sp["args"][0];
+        let pred_p = sp["args"][1];
+        let u_a = _infer_sort_level(env, ctx, dom_a, u_params);
+        let wit = parse_term(tac["witness"], env, ctx);
+        kernel_check_type_ctx(env, ctx, wit, dom_a, u_params);
+        let sub_target = mk_app(pred_p, wit);
+        if pred_p["tag"] == "Lam" {
+            sub_target = subst(pred_p["body"], wit, 0);
+        }
+        let sub_g = _fresh_mvar_goal(state, ctx, sub_target, "exists_body");
+        let prf = mk_apps(mk_const_u("Exists.intro", [u_a]), [
+            dom_a,
+            pred_p,
+            wit,
+            mk_mvar(sub_g["id"], 0)
+        ]);
+        _assign_mvar(state, g["id"], prf);
+        _replace_head_goal(state, [sub_g]);
+        return state;
+    }
+
+    // 14. `by_contra(hyp_name)` (Classical Proof by Contradiction via `Classical.em`)
+    if op == "by_contra" {
+        let u_goal = _infer_sort_level(env, ctx, target, u_params);
+        if not _u_eq(u_goal, 0) {
+            throw "TacticEngine [by_contra]: classical proof by contradiction requires a Prop goal";
+        }
+        let hname = "h_contra";
+        if map_has(tac, "name") and tac["name"] != nil and tac["name"] != "" {
+            hname = tac["name"];
+        }
+        let not_g = mk_app(mk_const_u("Not", []), target);
+        let ext_ctx = _ctx_push(ctx, hname, not_g, nil);
+        let sub_g = _fresh_mvar_goal(state, ext_ctx, mk_const_u("False", []), "by_contra");
+
+        let or_ty = mk_apps(mk_const_u("Or", []), [target, not_g]);
+        let motive = mk_lam("_hor", or_ty, lift(target, 1, 0));
+        let branch_pos = mk_lam("hg", target, mk_var(0));
+        let f_motive = mk_lam("_hf", mk_const_u("False", []), lift(target, 2, 0));
+        let branch_neg = mk_lam(hname, not_g,
+            mk_apps(mk_const_u("False.rec", [0]), [f_motive, mk_mvar(sub_g["id"], 0)]));
+        let em_app = mk_app(mk_const_u("Classical.em", []), target);
+        let prf = mk_apps(mk_const_u("Or.rec", []), [
+            target,
+            not_g,
+            motive,
+            branch_pos,
+            branch_neg,
+            em_app
+        ]);
+        _assign_mvar(state, g["id"], prf);
+        _replace_head_goal(state, [sub_g]);
+        return state;
+    }
+
+    // 15. `apply(fn_or_thm)`
+    if op == "apply" {
+        let fn_raw = parse_term(tac["term"], env, ctx);
+        let fn_ty = kernel_infer_type_ctx(env, ctx, fn_raw, u_params);
+        let peeled = _peel_pis(fn_ty, -1);
+        let p_bs = peeled["binders"];
+        let max_k = len(p_bs);
+
+        // Try matching after peeling `j = 0 .. max_k` Pi arguments
+        let chosen_j = -1;
+        let chosen_bindings = nil;
+        let j = 0;
+        while j <= max_k and chosen_j < 0 {
+            let pj = _peel_pis(fn_ty, j);
+            let cod_j = pj["body"];
+            if j == 0 {
+                if kernel_is_def_eq_ctx(env, ctx, cod_j, target) {
+                    chosen_j = 0;
+                    chosen_bindings = map{};
+                }
+            } else {
+                let try_b = map{};
+                let w_cod = cod_j;
+                let w_tgt = target;
+                if _match_pattern(env, ctx, w_cod, j, w_tgt, try_b) {
+                    chosen_j = j;
+                    chosen_bindings = try_b;
+                } else {
+                    let nw_tgt = kernel_whnf_ctx(env, ctx, target);
+                    let try_b2 = map{};
+                    if _match_pattern(env, ctx, kernel_whnf_ctx(env, ctx, w_cod), j, nw_tgt, try_b2) {
+                        chosen_j = j;
+                        chosen_bindings = try_b2;
+                    }
+                }
+            }
+            j = j + 1;
+        }
+
+        if chosen_j < 0 {
+            throw "TacticEngine [apply]: conclusion of supplied term does not unify with current goal";
+        }
+
+        let app_args = [];
+        let sub_goals = [];
+        let s = 0;
+        while s < chosen_j {
+            // Substitute earlier arguments `0 .. s-1` into domain `p_bs[s]["dom"]`
+            let dom_s = p_bs[s]["dom"];
+            let prev = s - 1;
+            while prev >= 0 {
+                dom_s = subst(dom_s, app_args[prev], prev);
+                prev = prev - 1;
+            }
+            if map_has(chosen_bindings, str(s)) {
+                push(app_args, chosen_bindings[str(s)]);
+            } else {
+                let sg = _fresh_mvar_goal(state, ctx, dom_s, "apply_" + str(s + 1));
+                push(sub_goals, sg);
+                push(app_args, mk_mvar(sg["id"], 0));
+            }
+            s = s + 1;
+        }
+
+        let head_fn = fn_raw;
+        if head_fn["tag"] == "Const" and head_fn["levels"] == nil and map_has(env["decls"], head_fn["name"]) {
+            let d_poly = env["decls"][head_fn["name"]];
+            if len(d_poly["univ_params"]) > 0 {
+                let concrete_prefix = [];
+                let ci = 0;
+                while ci < len(app_args) and app_args[ci]["tag"] != "MVar" {
+                    push(concrete_prefix, app_args[ci]);
+                    ci = ci + 1;
+                }
+                let inf_lvls = _infer_poly_levels_for_spine(env, ctx, d_poly, concrete_prefix, u_params);
+                head_fn = mk_const_u(head_fn["name"], inf_lvls);
+            }
+        }
+        let prf = mk_apps(head_fn, app_args);
+        _assign_mvar(state, g["id"], prf);
+        _replace_head_goal(state, sub_goals);
+        return state;
+    }
+
+    // 16. `cases(hyp)` (`False`, `True`, `And`, `Iff`, `Or`, `Exists`, `Eq`, `Nat`, `Bool`, `List`)
+    if op == "cases" {
+        let h_name = tac["hyp"];
+        let v_idx = _lookup_local_var(ctx, h_name);
+        if v_idx < 0 {
+            throw "TacticEngine [cases]: unknown hypothesis '" + h_name + "'";
+        }
+        let h_entry = ctx[len(ctx) - 1 - v_idx];
+        let h_ty = kernel_whnf_ctx(env, ctx, lift(h_entry["ty"], v_idx + 1, 0));
+        let sp = _unfold_spine(h_ty);
+        let hd = sp["head"];
+        let args = sp["args"];
+        let cnames = _extract_ctx_names(ctx);
+        let custom_names = nil;
+        if map_has(tac, "names") { custom_names = tac["names"]; }
+
+        if hd["tag"] != "Const" {
+            throw "TacticEngine [cases]: hypothesis '" + h_name + "' does not have an inductive type";
+        }
+        let iname = hd["name"];
+        let u_goal = _infer_sort_level(env, ctx, target, u_params);
+
+        if iname == "False" {
+            let f_motive = mk_lam("_hf", mk_const_u("False", []), lift(target, 1, 0));
+            let prf = mk_apps(mk_const_u("False.rec", [u_goal]), [f_motive, mk_var(v_idx)]);
+            _assign_mvar(state, g["id"], prf);
+            _replace_head_goal(state, []);
+            return state;
+        }
+        if iname == "And" and len(args) == 2 {
+            let a_ty = args[0];
+            let b_ty = args[1];
+            let n1 = _freshen_name(custom_names != nil and len(custom_names) > 0 ? custom_names[0] : h_name + "_left", cnames);
+            let cnames2 = _push_str_copy(cnames, n1);
+            let n2 = _freshen_name(custom_names != nil and len(custom_names) > 1 ? custom_names[1] : h_name + "_right", cnames2);
+            let ctx1 = _ctx_push(ctx, n1, a_ty, nil);
+            let ctx2 = _ctx_push(ctx1, n2, lift(b_ty, 1, 0), nil);
+            let sg = _fresh_mvar_goal(state, ctx2, lift(target, 2, 0), g["tag"]);
+            let motive = mk_lam("_hand", h_ty, lift(target, 1, 0));
+            let minor = mk_lam(n1, a_ty, mk_lam(n2, lift(b_ty, 1, 0), mk_mvar(sg["id"], 0)));
+            let prf = mk_apps(mk_const_u("And.rec", [u_goal]), [a_ty, b_ty, motive, minor, mk_var(v_idx)]);
+            _assign_mvar(state, g["id"], prf);
+            _replace_head_goal(state, [sg]);
+            return state;
+        }
+        if iname == "Or" and len(args) == 2 {
+            if not _u_eq(u_goal, 0) {
+                throw "TacticEngine [cases]: Or elimination requires a Prop goal";
+            }
+            let a_ty = args[0];
+            let b_ty = args[1];
+            let nl = _freshen_name(custom_names != nil and len(custom_names) > 0 ? custom_names[0] : h_name + "_inl", cnames);
+            let nr = _freshen_name(custom_names != nil and len(custom_names) > 1 ? custom_names[1] : h_name + "_inr", cnames);
+            let ctx_l = _ctx_push(ctx, nl, a_ty, nil);
+            let ctx_r = _ctx_push(ctx, nr, b_ty, nil);
+            let sg_l = _fresh_mvar_goal(state, ctx_l, lift(target, 1, 0), "inl");
+            let sg_r = _fresh_mvar_goal(state, ctx_r, lift(target, 1, 0), "inr");
+            let motive = mk_lam("_hor", h_ty, lift(target, 1, 0));
+            let minor_l = mk_lam(nl, a_ty, mk_mvar(sg_l["id"], 0));
+            let minor_r = mk_lam(nr, b_ty, mk_mvar(sg_r["id"], 0));
+            let prf = mk_apps(mk_const_u("Or.rec", []), [a_ty, b_ty, motive, minor_l, minor_r, mk_var(v_idx)]);
+            _assign_mvar(state, g["id"], prf);
+            _replace_head_goal(state, [sg_l, sg_r]);
+            return state;
+        }
+        if iname == "Exists" and len(args) == 2 {
+            if not _u_eq(u_goal, 0) {
+                throw "TacticEngine [cases]: Exists elimination requires a Prop goal";
+            }
+            let dom_a = args[0];
+            let pred_p = args[1];
+            let u_a = _infer_sort_level(env, ctx, dom_a, u_params);
+            let nw = _freshen_name(custom_names != nil and len(custom_names) > 0 ? custom_names[0] : "w", cnames);
+            let cnames2 = _push_str_copy(cnames, nw);
+            let nh = _freshen_name(custom_names != nil and len(custom_names) > 1 ? custom_names[1] : "hw", cnames2);
+            let ctx1 = _ctx_push(ctx, nw, dom_a, nil);
+            let pw_ty = mk_app(lift(pred_p, 1, 0), mk_var(0));
+            if pred_p["tag"] == "Lam" {
+                pw_ty = pred_p["body"];
+            }
+            let ctx2 = _ctx_push(ctx1, nh, pw_ty, nil);
+            let sg = _fresh_mvar_goal(state, ctx2, lift(target, 2, 0), g["tag"]);
+            let motive = mk_lam("_hex", h_ty, lift(target, 1, 0));
+            let minor = mk_lam(nw, dom_a, mk_lam(nh, pw_ty, mk_mvar(sg["id"], 0)));
+            let prf = mk_apps(mk_const_u("Exists.rec", [u_a]), [dom_a, pred_p, motive, minor, mk_var(v_idx)]);
+            _assign_mvar(state, g["id"], prf);
+            _replace_head_goal(state, [sg]);
+            return state;
+        }
+        if iname == "Eq" and len(args) == 3 {
+            // Rewrite `lhs -> rhs` in goal via `rw`
+            return tactic_step(state, tac_rw(h_name, false));
+        }
+        if iname == "Nat" or iname == "Bool" or iname == "List" {
+            return tactic_step(state, tac_induction(h_name, custom_names));
+        }
+        throw "TacticEngine [cases]: unsupported inductive '" + iname + "'";
+    }
+
+    // 17. `induction(var_name)` (Dependent structural induction on `Nat`, `List`, `Bool`!)
+    if op == "induction" {
+        let vname = tac["var_name"];
+        let v_idx = _lookup_local_var(ctx, vname);
+        if v_idx < 0 {
+            throw "TacticEngine [induction]: variable '" + vname + "' not found in local context";
+        }
+        // Revert any younger hypotheses (`0 .. v_idx - 1`) AND `vname` itself so the head goal becomes
+        // `∀ (v : Ind ...), G_generalized` in `ctx_base`!
+        let reverted_younger_names = [];
+        let r = 0;
+        while r < v_idx {
+            let cur_g = state["goals"][0];
+            let cur_c = cur_g["ctx"];
+            push(reverted_younger_names, cur_c[len(cur_c) - 1]["name"]);
+            _revert_last_hyp(state);
+            r = r + 1;
+        }
+        // Revert `vname` itself
+        _revert_last_hyp(state);
+
+        let base_g = state["goals"][0];
+        let base_ctx = base_g["ctx"];
+        let pi_target = base_g["target"]; // `Pi(vname, V_dom, G_body)`
+        let v_dom = kernel_whnf_ctx(env, base_ctx, pi_target["dom"]);
+        let g_body = pi_target["cod"]; // lives in `base_ctx + [vname : v_dom]`
+        let ext_v_ctx = _ctx_push(base_ctx, vname, v_dom, nil);
+        let u_g = _infer_sort_level(env, ext_v_ctx, g_body, u_params);
+        let base_names = _extract_ctx_names(base_ctx);
+        let custom_names = nil;
+        if map_has(tac, "names") { custom_names = tac["names"]; }
+
+        let dom_sp = _unfold_spine(v_dom);
+        let dom_hd = dom_sp["head"];
+        let dom_args = dom_sp["args"];
+
+        if dom_hd["tag"] == "Const" and dom_hd["name"] == "Nat" {
+            let n_step = _freshen_name(custom_names != nil and len(custom_names) > 0 ? custom_names[0] : vname + "'", base_names);
+            if not _arr_contains_str(base_names, vname) {
+                n_step = custom_names != nil and len(custom_names) > 0 ? custom_names[0] : vname;
+            }
+            let bnames2 = _push_str_copy(base_names, n_step);
+            let ih_name = _freshen_name(custom_names != nil and len(custom_names) > 1 ? custom_names[1] : "ih", bnames2);
+
+            let nat_c = mk_const_u("Nat", []);
+            let motive = mk_lam(vname, nat_c, g_body);
+            let zero_target = subst(g_body, mk_const_u("Nat.zero", []), 0);
+            let succ_in_ctx1 = subst(lift(g_body, 1, 1), mk_app(mk_const_u("Nat.succ", []), mk_var(0)), 0);
+            let step_ctx1 = _ctx_push(base_ctx, n_step, nat_c, nil);
+            let step_ctx2 = _ctx_push(step_ctx1, ih_name, g_body, nil);
+            let step_target = lift(succ_in_ctx1, 1, 0);
+
+            let g_zero = _fresh_mvar_goal(state, base_ctx, zero_target, "Nat.zero");
+            let g_succ = _fresh_mvar_goal(state, step_ctx2, step_target, "Nat.succ");
+
+            let step_lam = mk_lam(n_step, nat_c, mk_lam(ih_name, g_body, mk_mvar(g_succ["id"], 0)));
+            let prf = mk_apps(mk_const_u("Nat.rec", [u_g]), [
+                motive,
+                mk_mvar(g_zero["id"], 0),
+                step_lam
+            ]);
+            _assign_mvar(state, base_g["id"], prf);
+            _replace_head_goal(state, [g_zero, g_succ]);
+
+            // Re-introduce any reverted younger hypotheses in original order on both subgoals!
+            if len(reverted_younger_names) > 0 {
+                let re_names = [];
+                let ri = len(reverted_younger_names) - 1;
+                while ri >= 0 {
+                    push(re_names, reverted_younger_names[ri]);
+                    ri = ri - 1;
+                }
+                // Re-intro on `g_zero` (currently at index 0)
+                tactic_step(state, tac_intros(re_names));
+                // Rotate so `g_succ` is temporarily head if `g_zero` didn't close, re-intro on `g_succ`, then restore order!
+                let cur_gs = state["goals"];
+                if len(cur_gs) >= 2 {
+                    let g0_after = cur_gs[0];
+                    let g1_before = cur_gs[1];
+                    let rest_gs = [];
+                    let rgi = 2;
+                    while rgi < len(cur_gs) { push(rest_gs, cur_gs[rgi]); rgi = rgi + 1; }
+                    let temp_gs = [g1_before, g0_after];
+                    let ti = 0;
+                    while ti < len(rest_gs) { push(temp_gs, rest_gs[ti]); ti = ti + 1; }
+                    state["goals"] = temp_gs;
+                    tactic_step(state, tac_intros(re_names));
+                    let after_gs = state["goals"];
+                    let g1_after = after_gs[0];
+                    let final_gs = [g0_after, g1_after];
+                    let fi = 2;
+                    while fi < len(after_gs) { push(final_gs, after_gs[fi]); fi = fi + 1; }
+                    state["goals"] = final_gs;
+                }
+            }
+            return state;
+        }
+
+        if dom_hd["tag"] == "Const" and dom_hd["name"] == "List" and len(dom_args) == 1 {
+            let elem_ty = dom_args[0];
+            let u_a = _infer_sort_level(env, base_ctx, elem_ty, u_params);
+            let hd_name = _freshen_name(custom_names != nil and len(custom_names) > 0 ? custom_names[0] : "hd", base_names);
+            let bnames2 = _push_str_copy(base_names, hd_name);
+            let tl_name = _freshen_name(custom_names != nil and len(custom_names) > 1 ? custom_names[1] : "tl", bnames2);
+            let bnames3 = _push_str_copy(bnames2, tl_name);
+            let ih_name = _freshen_name(custom_names != nil and len(custom_names) > 2 ? custom_names[2] : "ih", bnames3);
+
+            let list_ty = mk_app(mk_const_u("List", [u_a]), elem_ty);
+            let motive = mk_lam(vname, list_ty, g_body);
+            let nil_val = mk_app(mk_const_u("List.nil", [u_a]), elem_ty);
+            let nil_target = subst(g_body, nil_val, 0);
+
+            let list_ty_1 = lift(list_ty, 1, 0);
+            let ih_ty_2 = lift(g_body, 1, 1);
+            let cons_val_2 = mk_apps(mk_const_u("List.cons", [u_a]), [
+                lift(elem_ty, 2, 0),
+                mk_var(1),
+                mk_var(0)
+            ]);
+            let cons_in_ctx2 = subst(lift(g_body, 2, 1), cons_val_2, 0);
+            let cons_target_3 = lift(cons_in_ctx2, 1, 0);
+
+            let c_ctx1 = _ctx_push(base_ctx, hd_name, elem_ty, nil);
+            let c_ctx2 = _ctx_push(c_ctx1, tl_name, list_ty_1, nil);
+            let c_ctx3 = _ctx_push(c_ctx2, ih_name, ih_ty_2, nil);
+
+            let g_nil = _fresh_mvar_goal(state, base_ctx, nil_target, "List.nil");
+            let g_cons = _fresh_mvar_goal(state, c_ctx3, cons_target_3, "List.cons");
+
+            let cons_lam = mk_lam(hd_name, elem_ty,
+                mk_lam(tl_name, list_ty_1,
+                    mk_lam(ih_name, ih_ty_2, mk_mvar(g_cons["id"], 0))));
+            let prf = mk_apps(mk_const_u("List.rec", [u_a, u_g]), [
+                elem_ty,
+                motive,
+                mk_mvar(g_nil["id"], 0),
+                cons_lam
+            ]);
+            _assign_mvar(state, base_g["id"], prf);
+            _replace_head_goal(state, [g_nil, g_cons]);
+
+            if len(reverted_younger_names) > 0 {
+                let re_names = [];
+                let ri = len(reverted_younger_names) - 1;
+                while ri >= 0 { push(re_names, reverted_younger_names[ri]); ri = ri - 1; }
+                tactic_step(state, tac_intros(re_names));
+                let cur_gs = state["goals"];
+                if len(cur_gs) >= 2 {
+                    let g0_after = cur_gs[0];
+                    let g1_before = cur_gs[1];
+                    let rest_gs = [];
+                    let rgi = 2;
+                    while rgi < len(cur_gs) { push(rest_gs, cur_gs[rgi]); rgi = rgi + 1; }
+                    let temp_gs = [g1_before, g0_after];
+                    let ti = 0;
+                    while ti < len(rest_gs) { push(temp_gs, rest_gs[ti]); ti = ti + 1; }
+                    state["goals"] = temp_gs;
+                    tactic_step(state, tac_intros(re_names));
+                    let after_gs = state["goals"];
+                    let g1_after = after_gs[0];
+                    let final_gs = [g0_after, g1_after];
+                    let fi = 2;
+                    while fi < len(after_gs) { push(final_gs, after_gs[fi]); fi = fi + 1; }
+                    state["goals"] = final_gs;
+                }
+            }
+            return state;
+        }
+
+        if dom_hd["tag"] == "Const" and dom_hd["name"] == "Bool" {
+            let bool_c = mk_const_u("Bool", []);
+            let motive = mk_lam(vname, bool_c, g_body);
+            let f_target = subst(g_body, mk_const_u("Bool.false", []), 0);
+            let t_target = subst(g_body, mk_const_u("Bool.true", []), 0);
+            let g_f = _fresh_mvar_goal(state, base_ctx, f_target, "Bool.false");
+            let g_t = _fresh_mvar_goal(state, base_ctx, t_target, "Bool.true");
+            let prf = mk_apps(mk_const_u("Bool.rec", [u_g]), [
+                motive,
+                mk_mvar(g_f["id"], 0),
+                mk_mvar(g_t["id"], 0)
+            ]);
+            _assign_mvar(state, base_g["id"], prf);
+            _replace_head_goal(state, [g_f, g_t]);
+            return state;
+        }
+
+        throw "TacticEngine [induction]: unsupported induction target domain";
+    }
+
+    throw "TacticEngine: unknown tactic '" + str(op) + "'";
+}
+
+fn qed(state, register_name = nil) {
+    if len(state["goals"]) > 0 {
+        throw "TacticEngine [qed]: " + str(len(state["goals"])) + " unsolved subgoal(s) remain:\n" + format_proof_state(state);
+    }
+    let proof_term = _instantiate_mvars(state["mvars"], state["root"]);
+    // Mandatory De Bruijn Criterion verification in the pure trusted kernel!
+    kernel_check_type_ctx(state["env"], [], proof_term, state["goal_type"], state["univ_params"]);
+    if register_name != nil and register_name != "" {
+        kernel_add_theorem(state["env"], register_name, state["goal_type"], proof_term, state["univ_params"]);
+    }
+    return map{
+        "ok": true,
+        "name": register_name,
+        "verified": true,
+        "kernel_verified": true,
+        "goal_type": state["goal_type"],
+        "goal_unicode": term_to_unicode(state["goal_type"], []),
+        "proof_term": proof_term,
+        "univ_params": state["univ_params"],
+        "tactics_count": len(state["history"])
+    };
+}
+
+// Supports both:
+//   - `prove_with_tactics(env, goal_type_or_str, tactics, univ_params = nil)`
+//   - `prove_with_tactics(env, thm_name, goal_type_or_str, tactics, univ_params = nil)`
+fn prove_with_tactics(env, arg2, arg3, arg4 = nil, arg5 = nil) {
+    let thm_name = nil;
+    let goal_spec = nil;
+    let tactics = nil;
+    let u_params = nil;
+
+    if type(arg3) == "array" {
+        goal_spec = arg2;
+        tactics = arg3;
+        u_params = arg4;
+    } else {
+        thm_name = arg2;
+        goal_spec = arg3;
+        tactics = arg4;
+        u_params = arg5;
+    }
+
+    let st = new_proof(env, goal_spec, u_params);
+    let i = 0;
+    while i < len(tactics) {
+        tactic_step(st, tactics[i]);
+        i = i + 1;
+    }
+    return qed(st, thm_name);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SECTION 6: MACHINE-CHECKED STANDARD THEOREM LIBRARY (`build_standard_pblib`)
+// ══════════════════════════════════════════════════════════════════════════════
+
+let _STD_PBLIB_CACHE = map{ "built": nil };
+
+fn build_standard_pblib(use_cache = false) {
+    if use_cache and _STD_PBLIB_CACHE["built"] != nil {
+        return _STD_PBLIB_CACHE["built"];
+    }
+
+    let env = new_kernel_env(true);
+    let catalog = [];
+
+    fn _reg_thm(category, name, stmt_str, tactics, u_params = nil) {
+        let res = prove_with_tactics(env, name, stmt_str, tactics, u_params);
+        let audit = kernel_audit_axioms(env, name);
+        push(catalog, map{
+            "category": category,
+            "name": name,
+            "statement": res["goal_unicode"],
+            "kernel_verified": res["kernel_verified"],
+            "axioms_used": audit["axioms_used"],
+            "constructive": audit["constructive"],
+            "tactics_count": res["tactics_count"]
+        });
+    }
+
+    // ── A. Propositional, Intuitionistic & Classical Logic (14 Theorems) ────
+    _reg_thm("logic", "id_thm",
+        "∀ (P : Prop), P -> P",
+        [tac_intros(["P", "hp"]), tac_assumption()]);
+
+    _reg_thm("logic", "imp_trans",
+        "∀ (P Q R : Prop), (P -> Q) -> (Q -> R) -> P -> R",
+        [tac_intros(["P", "Q", "R", "hpq", "hqr", "hp"]), tac_exact("hqr (hpq hp)")]);
+
+    _reg_thm("logic", "and_comm",
+        "∀ (P Q : Prop), P /\\ Q -> Q /\\ P",
+        [tac_intros(["P", "Q", "h"]), tac_cases("h", ["hp", "hq"]), tac_split(), tac_exact("hq"), tac_exact("hp")]);
+
+    _reg_thm("logic", "and_assoc",
+        "∀ (P Q R : Prop), (P /\\ Q) /\\ R -> P /\\ (Q /\\ R)",
+        [
+            tac_intros(["P", "Q", "R", "h"]),
+            tac_cases("h", ["hpq", "hr"]),
+            tac_cases("hpq", ["hp", "hq"]),
+            tac_split(),
+            tac_exact("hp"),
+            tac_split(),
+            tac_exact("hq"),
+            tac_exact("hr")
+        ]);
+
+    _reg_thm("logic", "or_comm",
+        "∀ (P Q : Prop), P \\/ Q -> Q \\/ P",
+        [
+            tac_intros(["P", "Q", "h"]),
+            tac_cases("h", ["hp", "hq"]),
+            tac_right(),
+            tac_exact("hp"),
+            tac_left(),
+            tac_exact("hq")
+        ]);
+
+    _reg_thm("logic", "or_assoc",
+        "∀ (P Q R : Prop), (P \\/ Q) \\/ R -> P \\/ (Q \\/ R)",
+        [
+            tac_intros(["P", "Q", "R", "h"]),
+            tac_cases("h", ["hpq", "hr"]),
+            tac_cases("hpq", ["hp", "hq"]),
+            tac_left(),
+            tac_exact("hp"),
+            tac_right(),
+            tac_left(),
+            tac_exact("hq"),
+            tac_right(),
+            tac_right(),
+            tac_exact("hr")
+        ]);
+
+    _reg_thm("logic", "not_false",
+        "¬ False",
+        [tac_intro("hf"), tac_cases("hf")]);
+
+    _reg_thm("logic", "contradiction",
+        "∀ (P Q : Prop), P -> ¬ P -> Q",
+        [tac_intros(["P", "Q", "hp", "hnp"]), tac_exfalso(), tac_exact("hnp hp")]);
+
+    _reg_thm("logic", "modus_ponens",
+        "∀ (P Q : Prop), P -> (P -> Q) -> Q",
+        [tac_intros(["P", "Q", "hp", "hpq"]), tac_exact("hpq hp")]);
+
+    _reg_thm("logic", "curry",
+        "∀ (P Q R : Prop), (P /\\ Q -> R) -> P -> Q -> R",
+        [
+            tac_intros(["P", "Q", "R", "h", "hp", "hq"]),
+            tac_apply("h"),
+            tac_split(),
+            tac_exact("hp"),
+            tac_exact("hq")
+        ]);
+
+    _reg_thm("logic", "uncurry",
+        "∀ (P Q R : Prop), (P -> Q -> R) -> P /\\ Q -> R",
+        [
+            tac_intros(["P", "Q", "R", "h", "hpq"]),
+            tac_cases("hpq", ["hp", "hq"]),
+            tac_exact("h hp hq")
+        ]);
+
+    _reg_thm("logic", "de_morgan_not_or",
+        "∀ (P Q : Prop), ¬ (P \\/ Q) <-> (¬ P /\\ ¬ Q)",
+        [
+            tac_intros(["P", "Q"]),
+            tac_split(),
+            tac_intro("hnor"),
+            tac_split(),
+            tac_intro("hp"),
+            tac_exact("hnor (Or.inl P Q hp)"),
+            tac_intro("hq"),
+            tac_exact("hnor (Or.inr P Q hq)"),
+            tac_intros(["hnpnq", "hor"]),
+            tac_cases("hnpnq", ["hnp", "hnq"]),
+            tac_cases("hor", ["hp", "hq"]),
+            tac_exact("hnp hp"),
+            tac_exact("hnq hq")
+        ]);
+
+    _reg_thm("logic", "double_neg_elim",
+        "∀ (P : Prop), ¬ ¬ P -> P",
+        [tac_intros(["P", "hnnp"]), tac_by_contra("hnp"), tac_exact("hnnp hnp")]);
+
+    _reg_thm("logic", "exists_succ_witness",
+        "∀ (n : Nat), ∃ (m : Nat), m = succ n",
+        [tac_intro("n"), tac_existsi("succ n"), tac_rfl()]);
+
+    // ── B. Universe-Polymorphic Equality (5 Theorems) ───────────────────────
+    _reg_thm("equality", "eq_refl_thm",
+        "∀ (A : Sort u) (x : A), x = x",
+        [tac_intros(["A", "x"]), tac_rfl()],
+        ["u"]);
+
+    _reg_thm("equality", "eq_symm",
+        "∀ (A : Sort u) (x y : A), x = y -> y = x",
+        [tac_intros(["A", "x", "y", "h"]), tac_symm(), tac_exact("h")],
+        ["u"]);
+
+    _reg_thm("equality", "eq_trans",
+        "∀ (A : Sort u) (x y z : A), x = y -> y = z -> x = z",
+        [tac_intros(["A", "x", "y", "z", "hxy", "hyz"]), tac_trans("y"), tac_exact("hxy"), tac_exact("hyz")],
+        ["u"]);
+
+    _reg_thm("equality", "congr_arg",
+        "∀ (A : Sort u) (B : Sort v) (f : A -> B) (x y : A), x = y -> f x = f y",
+        [tac_intros(["A", "B", "f", "x", "y", "h"]), tac_congr_arg("f"), tac_exact("h")],
+        ["u", "v"]);
+
+    _reg_thm("equality", "eq_mp",
+        "∀ (P Q : Prop), P = Q -> P -> Q",
+        [tac_intros(["P", "Q", "heq", "hp"]), tac_rw_rev("heq"), tac_exact("hp")]);
+
+    // ── C. Peano Natural Numbers (`Nat`) by Structural Induction (15 Theorems) ──
+    _reg_thm("nat", "add_zero",
+        "∀ (n : Nat), n + 0 = n",
+        [tac_intro("n"), tac_rfl()]);
+
+    _reg_thm("nat", "zero_add",
+        "∀ (n : Nat), 0 + n = n",
+        [tac_intro("n"), tac_induction("n", ["k", "ih"]), tac_rfl(), tac_rw("ih"), tac_rfl()]);
+
+    _reg_thm("nat", "add_succ",
+        "∀ (m n : Nat), m + succ n = succ (m + n)",
+        [tac_intros(["m", "n"]), tac_rfl()]);
+
+    _reg_thm("nat", "succ_add",
+        "∀ (m n : Nat), succ m + n = succ (m + n)",
+        [tac_intros(["m", "n"]), tac_induction("n", ["k", "ih"]), tac_rfl(), tac_rw("ih"), tac_rfl()]);
+
+    _reg_thm("nat", "add_assoc",
+        "∀ (a b c : Nat), (a + b) + c = a + (b + c)",
+        [tac_intros(["a", "b", "c"]), tac_induction("c", ["k", "ih"]), tac_rfl(), tac_rw("ih"), tac_rfl()]);
+
+    _reg_thm("nat", "add_comm",
+        "∀ (m n : Nat), m + n = n + m",
+        [
+            tac_intros(["m", "n"]),
+            tac_induction("n", ["k", "ih"]),
+            tac_symm(),
+            tac_exact("zero_add m"),
+            tac_rw("succ_add k m"),
+            tac_rw("ih"),
+            tac_rfl()
+        ]);
+
+    _reg_thm("nat", "mul_zero",
+        "∀ (n : Nat), n * 0 = 0",
+        [tac_intro("n"), tac_rfl()]);
+
+    _reg_thm("nat", "zero_mul",
+        "∀ (n : Nat), 0 * n = 0",
+        [tac_intro("n"), tac_induction("n", ["k", "ih"]), tac_rfl(), tac_rw("ih"), tac_rfl()]);
+
+    _reg_thm("nat", "mul_succ",
+        "∀ (m n : Nat), m * succ n = m * n + m",
+        [tac_intros(["m", "n"]), tac_rfl()]);
+
+    _reg_thm("nat", "mul_one",
+        "∀ (n : Nat), n * 1 = n",
+        [tac_intro("n"), tac_exact("zero_add n")]);
+
+    _reg_thm("nat", "one_mul",
+        "∀ (n : Nat), 1 * n = n",
+        [tac_intro("n"), tac_induction("n", ["k", "ih"]), tac_rfl(), tac_rw("ih"), tac_rfl()]);
+
+    _reg_thm("nat", "mul_add_distrib",
+        "∀ (a b c : Nat), a * (b + c) = a * b + a * c",
+        [
+            tac_intros(["a", "b", "c"]),
+            tac_induction("c", ["k", "ih"]),
+            tac_rfl(),
+            tac_rw("ih"),
+            tac_rw("add_assoc (a * b) (a * k) a"),
+            tac_rfl()
+        ]);
+
+    _reg_thm("nat", "add_mul_distrib",
+        "∀ (a b c : Nat), (a + b) * c = a * c + b * c",
+        [
+            tac_intros(["a", "b", "c"]),
+            tac_induction("c", ["k", "ih"]),
+            tac_rfl(),
+            tac_rw("ih"),
+            tac_rw("add_assoc (a * k) (b * k) (a + b)"),
+            tac_rw_rev("add_assoc (b * k) a b"),
+            tac_rw("add_comm (b * k) a"),
+            tac_rw("add_assoc a (b * k) b"),
+            tac_rw_rev("add_assoc (a * k) a (b * k + b)"),
+            tac_rfl()
+        ]);
+
+    _reg_thm("nat", "mul_comm",
+        "∀ (m n : Nat), m * n = n * m",
+        [
+            tac_intros(["m", "n"]),
+            tac_induction("n", ["k", "ih"]),
+            tac_symm(),
+            tac_exact("zero_mul m"),
+            tac_rw("ih"),
+            tac_symm(),
+            tac_trans("(k + 1) * m"),
+            tac_rfl(),
+            tac_rw("add_mul_distrib k 1 m"),
+            tac_rw("one_mul m"),
+            tac_rfl()
+        ]);
+
+    _reg_thm("nat", "mul_assoc",
+        "∀ (a b c : Nat), (a * b) * c = a * (b * c)",
+        [
+            tac_intros(["a", "b", "c"]),
+            tac_induction("c", ["k", "ih"]),
+            tac_rfl(),
+            tac_rw("ih"),
+            tac_rw("mul_add_distrib a (b * k) b"),
+            tac_rfl()
+        ]);
+
+    // ── D. Polymorphic Lists (`List.{u}`) by Structural Induction (3 Theorems) ──
+    _reg_thm("list", "append_nil",
+        "∀ (A : Sort u) (l : List.{u} A), List.append.{u} A l (List.nil.{u} A) = l",
+        [
+            tac_intros(["A", "l"]),
+            tac_induction("l", ["hd", "tl", "ih"]),
+            tac_rfl(),
+            tac_rw("ih"),
+            tac_rfl()
+        ],
+        ["u"]);
+
+    _reg_thm("list", "append_assoc",
+        "∀ (A : Sort u) (xs ys zs : List.{u} A), List.append.{u} A (List.append.{u} A xs ys) zs = List.append.{u} A xs (List.append.{u} A ys zs)",
+        [
+            tac_intros(["A", "xs", "ys", "zs"]),
+            tac_induction("xs", ["hd", "tl", "ih"]),
+            tac_rfl(),
+            tac_rw("ih ys zs"),
+            tac_rfl()
+        ],
+        ["u"]);
+
+    _reg_thm("list", "length_append",
+        "∀ (A : Sort u) (xs ys : List.{u} A), List.length.{u} A (List.append.{u} A xs ys) = List.length.{u} A xs + List.length.{u} A ys",
+        [
+            tac_intros(["A", "xs", "ys"]),
+            tac_induction("xs", ["hd", "tl", "ih"]),
+            tac_symm(),
+            tac_exact("zero_add (List.length.{u} A ys)"),
+            tac_rw("ih ys"),
+            tac_symm(),
+            tac_exact("succ_add (List.length.{u} A tl) (List.length.{u} A ys)")
+        ],
+        ["u"]);
+
+    let theorems_by_name = map{};
+    let constructive_count = 0;
+    let classical_count = 0;
+    let ti = 0;
+    while ti < len(catalog) {
+        let entry = catalog[ti];
+        theorems_by_name[entry["name"]] = entry;
+        if entry["constructive"] {
+            constructive_count = constructive_count + 1;
+        } else {
+            classical_count = classical_count + 1;
+        }
+        ti = ti + 1;
+    }
+
+    let result = map{
+        "version": CIC_PROVER_VERSION,
+        "env": env,
+        "theorems": theorems_by_name,
+        "catalog": catalog,
+        "theorem_count": len(catalog),
+        "constructive_count": constructive_count,
+        "classical_count": classical_count,
+        "all_kernel_verified": true,
+        "sorry_count": 0
+    };
+    _STD_PBLIB_CACHE["built"] = result;
+    return result;
+}
+
+export
+    CIC_PROVER_VERSION,
+    imax_level,
+    u_succ,
+    u_max,
+    u_imax,
+    mk_var,
+    mk_sort,
+    mk_prop,
+    mk_type,
+    mk_const,
+    mk_const_u,
+    mk_pi,
+    mk_arrow,
+    mk_lam,
+    mk_app,
+    mk_apps,
+    mk_letin,
+    mk_nat_lit,
+    dest_nat_lit,
+    lift,
+    subst,
+    new_kernel_env,
+    kernel_whnf,
+    kernel_whnf_ctx,
+    kernel_norm,
+    kernel_norm_ctx,
+    kernel_is_def_eq,
+    kernel_is_def_eq_ctx,
+    kernel_infer_type,
+    kernel_infer_type_ctx,
+    kernel_check_type,
+    kernel_check_type_ctx,
+    check_strictly_positive,
+    kernel_add_axiom,
+    kernel_add_def,
+    kernel_add_theorem,
+    kernel_add_inductive,
+    kernel_audit_axioms,
+    term_to_unicode,
+    term_to_lean_str,
+    parse_term,
+    tac_intro,
+    tac_intros,
+    tac_exact,
+    tac_assumption,
+    tac_apply,
+    tac_rfl,
+    tac_refl,
+    tac_symm,
+    tac_trans,
+    tac_congr_arg,
+    tac_rw,
+    tac_rw_rev,
+    tac_split,
+    tac_left,
+    tac_right,
+    tac_cases,
+    tac_exfalso,
+    tac_existsi,
+    tac_induction,
+    tac_by_contra,
+    new_proof,
+    proof_goals,
+    format_proof_state,
+    tactic_step,
+    qed,
+    prove_with_tactics,
+    build_standard_pblib;

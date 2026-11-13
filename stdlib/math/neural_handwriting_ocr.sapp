@@ -1,0 +1,3148 @@
+// stdlib/math/neural_handwriting_ocr.sapp
+// Offline Neural Handwritten Mathematical Symbol OCR, Multi-Allograph Freehand
+// Stroke & Noisy Bitmap Synthesizer, Sauvola/Otsu Restoration, 154-Feature
+// Topological/Directional Extractor, 2D Spatial Math Grammar & CAS Solver (PBLang v2.7.0).
+//
+// 100% Pure PBLang — Zero external dependencies, zero cloud APIs, offline inference.
+
+let OCR_VERSION = "2.7.0";
+
+let MATH_OCR_CLASSES = [
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "x", "y", "a", "b", "+", "-", "*", "/", "=", "(", ")", "^", "sqrt", "<", ">", "pi"
+];
+
+let NUM_CLASSES = 26;
+let FEATURE_DIM = 154;
+let _PI = 3.141592653589793;
+let _SQRT2 = 1.4142135623730951;
+
+let _CLASS_TO_IDX = map{};
+let _ci = 0;
+while _ci < len(MATH_OCR_CLASSES) {
+    _CLASS_TO_IDX[MATH_OCR_CLASSES[_ci]] = _ci;
+    _ci = _ci + 1;
+}
+
+let _WEIGHTS_CACHE = map{ loaded: false, mod: nil };
+let _CAS_CACHE = map{ loaded: false, mod: nil };
+
+fn _get_weights_module() {
+    if not _WEIGHTS_CACHE.loaded {
+        let m = try import("stdlib:math/neural_handwriting_weights.sapp") catch (
+            try import("stdlib/math/neural_handwriting_weights.sapp") catch (
+                try import("neural_handwriting_weights.sapp") catch nil
+            )
+        );
+        _WEIGHTS_CACHE.mod = m;
+        _WEIGHTS_CACHE.loaded = true;
+    }
+    return _WEIGHTS_CACHE.mod;
+}
+
+fn reload_ocr_weights(custom_weights = nil) {
+    if custom_weights != nil {
+        _WEIGHTS_CACHE.mod = custom_weights;
+        _WEIGHTS_CACHE.loaded = true;
+        return custom_weights;
+    }
+    _WEIGHTS_CACHE.loaded = false;
+    return _get_weights_module();
+}
+
+fn _get_cas() {
+    if not _CAS_CACHE.loaded {
+        let c = try import("stdlib:math/symbolic_cas.sapp") catch (
+            try import("stdlib/math/symbolic_cas.sapp") catch (
+                try import("symbolic_cas.sapp") catch nil
+            )
+        );
+        _CAS_CACHE.mod = c;
+        _CAS_CACHE.loaded = true;
+    }
+    return _CAS_CACHE.mod;
+}
+
+// ============================================================================
+// 1. Numeric & Deterministic Cross-Platform PRNG Utilities
+// ============================================================================
+
+fn _abs(x) { if x < 0.0 { return 0.0 - x; } return x; }
+fn _min(a, b) { if a < b { return a; } return b; }
+fn _max(a, b) { if a > b { return a; } return b; }
+
+fn _clamp(x, lo, hi) {
+    if x < lo { return lo; }
+    if x > hi { return hi; }
+    return x;
+}
+
+fn _round_int(x) {
+    return num_floor(x + 0.5);
+}
+
+fn _imod(a, m) {
+    let q = num_floor(a / m);
+    let r = a - q * m;
+    if r < 0 { r = r + m; }
+    return r;
+}
+
+fn _rng_new(seed) {
+    let s = num_floor(_abs(seed)) + 1;
+    s = _imod(s * 1103515 + 12345, 2147483647);
+    if s <= 0 { s = 1357911; }
+    return map{ state: s };
+}
+
+fn _rng_u01(rng) {
+    let s = _imod(rng.state * 1664525 + 1013904223, 2147483647);
+    if s <= 0 { s = 1; }
+    rng.state = s;
+    return s / 2147483647.0;
+}
+
+fn _rng_range(rng, lo, hi) {
+    return lo + (hi - lo) * _rng_u01(rng);
+}
+
+fn _rng_int(rng, lo, hi_excl) {
+    if hi_excl <= lo { return lo; }
+    let span = hi_excl - lo;
+    let v = lo + num_floor(_rng_u01(rng) * span);
+    if v >= hi_excl { v = hi_excl - 1; }
+    return v;
+}
+
+fn class_index_of(sym) {
+    if map_has(_CLASS_TO_IDX, sym) { return _CLASS_TO_IDX[sym]; }
+    return -1;
+}
+
+// ============================================================================
+// 2. Canonical Multi-Allograph Vector Stroke Prototypes (26 Classes)
+// ============================================================================
+
+fn _arc_pts(cx, cy, rx, ry, deg_start, deg_end, steps) {
+    let pts = [];
+    let n = _max(2, steps);
+    let i = 0;
+    while i <= n {
+        let t = i / (n * 1.0);
+        let ang = (deg_start + (deg_end - deg_start) * t) * _PI / 180.0;
+        push(pts, [cx + rx * num_cos(ang), cy + ry * num_sin(ang)]);
+        i = i + 1;
+    }
+    return pts;
+}
+
+fn _concat_pts(a, b) {
+    let out = [];
+    let i = 0;
+    while i < len(a) { push(out, a[i]); i = i + 1; }
+    let j = 0;
+    while j < len(b) { push(out, b[j]); j = j + 1; }
+    return out;
+}
+
+fn get_canonical_allographs(sym) {
+    if sym == "0" {
+        return [
+            [_arc_pts(0.50, 0.50, 0.28, 0.40, -90.0, 270.0, 24)],
+            [_arc_pts(0.50, 0.50, 0.24, 0.42, -80.0, 280.0, 24)]
+        ];
+    }
+    if sym == "1" {
+        return [
+            // Flagged 1
+            [[[0.30, 0.24], [0.52, 0.09], [0.52, 0.91]]],
+            // Flagged + serif base 1
+            [[[0.30, 0.24], [0.52, 0.09], [0.52, 0.89]], [[0.28, 0.89], [0.76, 0.89]]],
+            // Simple upright 1
+            [[[0.49, 0.09], [0.51, 0.50], [0.50, 0.91]]]
+        ];
+    }
+    if sym == "2" {
+        let top_a = _arc_pts(0.50, 0.30, 0.27, 0.20, -165.0, 25.0, 12);
+        let s_a = _concat_pts(top_a, [[0.22, 0.88], [0.82, 0.88]]);
+        let top_b = _arc_pts(0.49, 0.29, 0.26, 0.19, -155.0, 30.0, 12);
+        let s_b = _concat_pts(top_b, [[0.20, 0.87], [0.52, 0.84], [0.83, 0.89]]);
+        return [[s_a], [s_b]];
+    }
+    if sym == "3" {
+        let u1 = _arc_pts(0.48, 0.29, 0.26, 0.19, -145.0, 88.0, 13);
+        let l1 = _arc_pts(0.49, 0.69, 0.28, 0.21, -88.0, 148.0, 13);
+        let s_a = _concat_pts(u1, l1);
+        let s_b = _concat_pts([[0.22, 0.12], [0.76, 0.12], [0.45, 0.47]], _arc_pts(0.49, 0.69, 0.28, 0.21, -85.0, 145.0, 13));
+        return [[s_a], [s_b]];
+    }
+    if sym == "4" {
+        return [
+            // Open-top 4
+            [[[0.24, 0.13], [0.20, 0.56], [0.84, 0.56]], [[0.66, 0.13], [0.66, 0.91]]],
+            // Closed-top 4
+            [[[0.67, 0.11], [0.18, 0.60], [0.85, 0.60]], [[0.67, 0.11], [0.67, 0.91]]]
+        ];
+    }
+    if sym == "5" {
+        let belly_a = _arc_pts(0.48, 0.67, 0.28, 0.22, -105.0, 145.0, 14);
+        let s1 = _concat_pts([[0.27, 0.14], [0.24, 0.46]], belly_a);
+        let belly_b = _arc_pts(0.49, 0.67, 0.27, 0.22, -100.0, 145.0, 14);
+        let s2 = _concat_pts([[0.79, 0.14], [0.27, 0.14], [0.24, 0.46]], belly_b);
+        return [
+            [s1, [[0.27, 0.14], [0.79, 0.14]]],
+            [s2]
+        ];
+    }
+    if sym == "6" {
+        let stem_a = _arc_pts(0.56, 0.48, 0.34, 0.38, -65.0, -176.0, 11);
+        let loop_a = _arc_pts(0.50, 0.69, 0.27, 0.20, 180.0, 540.0, 20);
+        let stem_b = [[0.68, 0.10], [0.42, 0.32], [0.23, 0.68]];
+        let loop_b = _arc_pts(0.50, 0.69, 0.27, 0.20, 180.0, 540.0, 20);
+        return [
+            [_concat_pts(stem_a, loop_a)],
+            [_concat_pts(stem_b, loop_b)]
+        ];
+    }
+    if sym == "7" {
+        return [
+            // Classic 7
+            [[[0.18, 0.14], [0.82, 0.14], [0.38, 0.90]]],
+            // Crossed 7
+            [[[0.18, 0.14], [0.82, 0.14], [0.38, 0.90]], [[0.35, 0.52], [0.71, 0.52]]]
+        ];
+    }
+    if sym == "8" {
+        let top_loop = _arc_pts(0.50, 0.29, 0.23, 0.19, -90.0, 270.0, 18);
+        let bot_loop = _arc_pts(0.50, 0.70, 0.26, 0.20, -90.0, 270.0, 18);
+        // Continuous figure-8 closing cleanly at waist & top
+        let fig8_a = _concat_pts(
+            _arc_pts(0.50, 0.29, 0.23, 0.19, 90.0, -270.0, 18),
+            _arc_pts(0.50, 0.70, 0.26, 0.20, -90.0, 270.0, 18)
+        );
+        return [
+            [fig8_a],
+            [top_loop, bot_loop]
+        ];
+    }
+    if sym == "9" {
+        let top_loop = _arc_pts(0.48, 0.31, 0.26, 0.20, -90.0, 270.0, 20);
+        return [
+            [top_loop, [[0.74, 0.31], [0.66, 0.90]]],
+            [top_loop, [[0.74, 0.31], [0.70, 0.74], [0.54, 0.89], [0.34, 0.88]]]
+        ];
+    }
+    if sym == "x" {
+        // Crossed diagonal x vs curved algebraic x
+        let c_left = _arc_pts(0.20, 0.52, 0.27, 0.30, -68.0, 68.0, 12);
+        let c_right = _arc_pts(0.80, 0.52, 0.27, 0.30, 112.0, 248.0, 12);
+        return [
+            [[[0.19, 0.21], [0.81, 0.83]], [[0.81, 0.21], [0.19, 0.83]]],
+            [c_left, c_right]
+        ];
+    }
+    if sym == "y" {
+        let cup = _arc_pts(0.48, 0.34, 0.25, 0.22, 175.0, 5.0, 12);
+        let desc = [[0.73, 0.20], [0.71, 0.76], [0.55, 0.91], [0.30, 0.91]];
+        return [
+            [[[0.20, 0.20], [0.49, 0.56]], [[0.80, 0.20], [0.28, 0.92]]],
+            [cup, desc]
+        ];
+    }
+    if sym == "a" {
+        let bowl = _arc_pts(0.43, 0.56, 0.24, 0.26, -90.0, 270.0, 20);
+        return [
+            [bowl, [[0.68, 0.28], [0.68, 0.79], [0.84, 0.84]]],
+            [bowl, [[0.67, 0.25], [0.68, 0.82], [0.82, 0.83]]]
+        ];
+    }
+    if sym == "b" {
+        let belly = _concat_pts([[0.23, 0.53]], _concat_pts(_arc_pts(0.49, 0.68, 0.27, 0.21, -142.0, 142.0, 18), [[0.23, 0.83]]));
+        return [
+            [[[0.23, 0.08], [0.23, 0.88]], belly],
+            [_concat_pts([[0.23, 0.08], [0.23, 0.88], [0.23, 0.53]], _concat_pts(_arc_pts(0.49, 0.68, 0.27, 0.21, -142.0, 142.0, 18), [[0.23, 0.83]]))]
+        ];
+    }
+    if sym == "+" {
+        return [
+            // 2-stroke +
+            [[[0.50, 0.16], [0.50, 0.84]], [[0.16, 0.50], [0.84, 0.50]]],
+            // 1-stroke retraced +
+            [[[0.50, 0.16], [0.50, 0.84], [0.50, 0.50], [0.16, 0.50], [0.84, 0.50]]]
+        ];
+    }
+    if sym == "-" {
+        return [
+            [[[0.12, 0.50], [0.50, 0.50], [0.88, 0.50]]],
+            [[[0.14, 0.51], [0.50, 0.49], [0.86, 0.50]]]
+        ];
+    }
+    if sym == "*" {
+        return [
+            // 6-ray star (vertical + two diagonals)
+            [[[0.50, 0.14], [0.50, 0.86]], [[0.19, 0.29], [0.81, 0.71]], [[0.81, 0.29], [0.19, 0.71]]],
+            // 6-ray star (horizontal + two diagonals)
+            [[[0.15, 0.50], [0.85, 0.50]], [[0.25, 0.19], [0.75, 0.81]], [[0.75, 0.19], [0.25, 0.81]]]
+        ];
+    }
+    if sym == "/" {
+        return [
+            [[[0.82, 0.10], [0.50, 0.50], [0.18, 0.90]]],
+            [[[0.84, 0.12], [0.50, 0.50], [0.16, 0.88]]]
+        ];
+    }
+    if sym == "=" {
+        return [
+            [[[0.14, 0.36], [0.86, 0.36]], [[0.14, 0.64], [0.86, 0.64]]],
+            [[[0.16, 0.35], [0.84, 0.35]], [[0.15, 0.65], [0.85, 0.65]]]
+        ];
+    }
+    if sym == "(" {
+        return [
+            [_arc_pts(0.76, 0.50, 0.50, 0.43, 132.0, 228.0, 16)],
+            [_arc_pts(0.72, 0.50, 0.45, 0.43, 128.0, 232.0, 16)]
+        ];
+    }
+    if sym == ")" {
+        return [
+            [_arc_pts(0.24, 0.50, 0.50, 0.43, -48.0, 48.0, 16)],
+            [_arc_pts(0.28, 0.50, 0.45, 0.43, -52.0, 52.0, 16)]
+        ];
+    }
+    if sym == "^" {
+        return [
+            [[[0.16, 0.72], [0.50, 0.22], [0.84, 0.72]]],
+            [[[0.18, 0.74], [0.50, 0.20], [0.82, 0.74]]]
+        ];
+    }
+    if sym == "sqrt" {
+        return [
+            // 1-stroke radical with vinculum roof
+            [[[0.08, 0.56], [0.19, 0.49], [0.34, 0.88], [0.53, 0.14], [0.94, 0.14]]],
+            // 2-stroke radical + roof
+            [[[0.08, 0.55], [0.19, 0.49], [0.34, 0.88], [0.53, 0.14]], [[0.51, 0.14], [0.94, 0.14]]]
+        ];
+    }
+    if sym == "<" {
+        return [
+            [[[0.82, 0.20], [0.18, 0.50], [0.82, 0.80]]],
+            [[[0.80, 0.18], [0.19, 0.50], [0.80, 0.82]]]
+        ];
+    }
+    if sym == ">" {
+        return [
+            [[[0.18, 0.20], [0.82, 0.50], [0.18, 0.80]]],
+            [[[0.20, 0.18], [0.81, 0.50], [0.20, 0.82]]]
+        ];
+    }
+    if sym == "pi" {
+        return [
+            // Classic pi with flat top bar + two legs
+            [[[0.13, 0.25], [0.87, 0.25]], [[0.35, 0.25], [0.27, 0.88]], [[0.65, 0.25], [0.67, 0.84], [0.78, 0.88]]],
+            // Wavy-top pi
+            [[[0.12, 0.28], [0.32, 0.22], [0.68, 0.26], [0.88, 0.22]], [[0.36, 0.24], [0.29, 0.88]], [[0.65, 0.25], [0.66, 0.88]]]
+        ];
+    }
+    throw "neural_handwriting_ocr: unsupported symbol '" + str(sym) + "'";
+}
+
+fn _subdivide_stroke(pts, max_seg = 0.045) {
+    if len(pts) <= 1 { return pts; }
+    let out = [pts[0]];
+    let i = 0;
+    while i + 1 < len(pts) {
+        let p0 = pts[i];
+        let p1 = pts[i + 1];
+        let dx = p1[0] - p0[0];
+        let dy = p1[1] - p0[1];
+        let dist = num_sqrt(dx * dx + dy * dy);
+        let steps = _max(1, num_ceil(dist / max_seg));
+        let k = 1;
+        while k <= steps {
+            let t = k / (steps * 1.0);
+            push(out, [p0[0] + dx * t, p0[1] + dy * t]);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Rasterizes freehand polyline strokes [[[x0,y0], [x1,y1], ...], ...] onto a 2D bitmap.
+// Returns map{ width, height, bitmap (grayscale 0..255 paper=light/ink=dark OR binary), binary_bitmap }.
+fn strokes_to_bitmap(strokes, width = 44, height = 44, opts = nil) {
+    let w = _max(8, _round_int(width));
+    let h = _max(8, _round_int(height));
+    let radius = if opts != nil and map_has(opts, "stroke_radius") { opts.stroke_radius } else { 1.55 };
+    let paper_base = if opts != nil and map_has(opts, "paper_level") { opts.paper_level } else { 246.0 };
+    let ink_base = if opts != nil and map_has(opts, "ink_level") { opts.ink_level } else { 24.0 };
+    let shade_grad_x = if opts != nil and map_has(opts, "shade_grad_x") { opts.shade_grad_x } else { 0.0 };
+    let shade_grad_y = if opts != nil and map_has(opts, "shade_grad_y") { opts.shade_grad_y } else { 0.0 };
+    let noise_prob = if opts != nil and map_has(opts, "noise_prob") { opts.noise_prob } else { 0.0 };
+    let noise_seed = if opts != nil and map_has(opts, "noise_seed") { opts.noise_seed } else { 17 };
+
+    // Coverage buffer in [0.0, 1.0]
+    let cov = [];
+    let y = 0;
+    while y < h {
+        let row = [];
+        let x = 0;
+        while x < w { push(row, 0.0); x = x + 1; }
+        push(cov, row);
+        y = y + 1;
+    }
+
+    let r_full = _max(0.65, radius - 0.35);
+    let r_aa = r_full + 0.90;
+    let r_pad = num_ceil(r_aa + 1.0);
+
+    let si = 0;
+    while si < len(strokes) {
+        let st = strokes[si];
+        if len(st) == 1 {
+            let px = st[0][0];
+            let py = st[0][1];
+            let y0 = _max(0, num_floor(py - r_pad));
+            let y1 = _min(h - 1, num_floor(py + r_pad));
+            let x0 = _max(0, num_floor(px - r_pad));
+            let x1 = _min(w - 1, num_floor(px + r_pad));
+            let yy = y0;
+            while yy <= y1 {
+                let xx = x0;
+                while xx <= x1 {
+                    let d = num_sqrt((xx - px) * (xx - px) + (yy - py) * (yy - py));
+                    if d < r_aa {
+                        let c = if d <= r_full { 1.0 } else { (r_aa - d) / (r_aa - r_full) };
+                        if c > cov[yy][xx] { cov[yy][xx] = c; }
+                    }
+                    xx = xx + 1;
+                }
+                yy = yy + 1;
+            }
+        } else {
+            let pi = 0;
+            while pi + 1 < len(st) {
+                let ax = st[pi][0];
+                let ay = st[pi][1];
+                let bx = st[pi + 1][0];
+                let by = st[pi + 1][1];
+                let vx = bx - ax;
+                let vy = by - ay;
+                let vlen2 = vx * vx + vy * vy;
+                let y0 = _max(0, num_floor(_min(ay, by) - r_pad));
+                let y1 = _min(h - 1, num_floor(_max(ay, by) + r_pad));
+                let x0 = _max(0, num_floor(_min(ax, bx) - r_pad));
+                let x1 = _min(w - 1, num_floor(_max(ax, bx) + r_pad));
+                let yy = y0;
+                while yy <= y1 {
+                    let xx = x0;
+                    while xx <= x1 {
+                        let t = 0.0;
+                        if vlen2 > 1e-8 {
+                            t = ((xx - ax) * vx + (yy - ay) * vy) / vlen2;
+                            t = _clamp(t, 0.0, 1.0);
+                        }
+                        let qx = ax + t * vx;
+                        let qy = ay + t * vy;
+                        let d = num_sqrt((xx - qx) * (xx - qx) + (yy - qy) * (yy - qy));
+                        if d < r_aa {
+                            let c = if d <= r_full { 1.0 } else { (r_aa - d) / (r_aa - r_full) };
+                            if c > cov[yy][xx] { cov[yy][xx] = c; }
+                        }
+                        xx = xx + 1;
+                    }
+                    yy = yy + 1;
+                }
+                pi = pi + 1;
+            }
+        }
+        si = si + 1;
+    }
+
+    let rng = _rng_new(noise_seed);
+    let bmp = [];
+    let bin = [];
+    let ry = 0;
+    while ry < h {
+        let ny_rel = (ry / _max(1.0, h - 1.0)) - 0.5;
+        let grow = [];
+        let brow = [];
+        let rx = 0;
+        while rx < w {
+            let nx_rel = (rx / _max(1.0, w - 1.0)) - 0.5;
+            let bg = _clamp(paper_base + shade_grad_x * nx_rel + shade_grad_y * ny_rel, 155.0, 255.0);
+            let c = cov[ry][rx];
+            let val = bg * (1.0 - c) + ink_base * c;
+            if noise_prob > 0.0 {
+                let u = _rng_u01(rng);
+                if u < noise_prob * 0.35 {
+                    // Isolated single-pixel pepper noise
+                    val = _rng_range(rng, 25.0, 85.0);
+                } else {
+                    if u < noise_prob * 2.5 {
+                        // Camera sensor grain
+                        val = val + _rng_range(rng, -18.0, 18.0);
+                    }
+                }
+            }
+            push(grow, _round_int(_clamp(val, 0.0, 255.0)));
+            push(brow, if c >= 0.42 { 1 } else { 0 });
+            rx = rx + 1;
+        }
+        push(bmp, grow);
+        push(bin, brow);
+        ry = ry + 1;
+    }
+
+    return map{
+        width: w,
+        height: h,
+        bitmap: bmp,
+        binary_bitmap: bin
+    };
+}
+
+// Synthesizes a realistic multi-allograph freehand handwritten mathematical glyph
+// with affine slant/italic shear (+/-18 deg), rotation (+/-10 deg), non-uniform X/Y
+// aspect scaling, continuous elastic Bezier/sinusoidal hand tremor, variable pen
+// stroke radius (1..3 px), grayscale shading, and optional background speckle noise.
+fn synthesize_handwritten_glyph(sym, variant_seed = 0, style_opts = nil) {
+    let cls_idx = class_index_of(sym);
+    if cls_idx < 0 {
+        throw "synthesize_handwritten_glyph: unknown symbol '" + str(sym) + "'";
+    }
+    let allos = get_canonical_allographs(sym);
+    let rng = _rng_new(variant_seed * 7919 + cls_idx * 104729 + 31);
+
+    let out_w = if style_opts != nil and map_has(style_opts, "width") { _round_int(style_opts.width) } else { 44 };
+    let out_h = if style_opts != nil and map_has(style_opts, "height") { _round_int(style_opts.height) } else { 44 };
+    let allo_idx = if style_opts != nil and map_has(style_opts, "allograph") {
+        _imod(_round_int(style_opts.allograph), len(allos))
+    } else {
+        _rng_int(rng, 0, len(allos))
+    };
+
+    let jitter_scale = if style_opts != nil and map_has(style_opts, "jitter") { style_opts.jitter } else { 1.0 };
+    let slant_limit = if sym == "1" or sym == "/" { 9.5 } else { if sym == "-" or sym == "=" { 6.0 } else { 18.0 } };
+    let rot_limit = if sym == "-" or sym == "=" or sym == "/" or sym == "1" { 5.5 } else { 10.0 };
+
+    let slant_deg = if style_opts != nil and map_has(style_opts, "slant_deg") {
+        style_opts.slant_deg
+    } else {
+        _rng_range(rng, 0.0 - slant_limit, slant_limit) * jitter_scale
+    };
+    let rot_deg = if style_opts != nil and map_has(style_opts, "rot_deg") {
+        style_opts.rot_deg
+    } else {
+        _rng_range(rng, 0.0 - rot_limit, rot_limit) * jitter_scale
+    };
+
+    let sx = if style_opts != nil and map_has(style_opts, "scale_x") {
+        style_opts.scale_x
+    } else {
+        _rng_range(rng, 0.86, 1.14)
+    };
+    let sy = if style_opts != nil and map_has(style_opts, "scale_y") {
+        style_opts.scale_y
+    } else {
+        _rng_range(rng, 0.86, 1.14)
+    };
+
+    // Continuous Simard-style spatial elastic hand-tremor parameters (preserves closed loops!)
+    let amp_x = _rng_range(rng, 0.008, 0.028) * jitter_scale;
+    let amp_y = _rng_range(rng, 0.008, 0.028) * jitter_scale;
+    let freq1 = _rng_range(rng, 3.8, 7.6);
+    let freq2 = _rng_range(rng, 3.8, 7.6);
+    let ph1 = _rng_range(rng, 0.0, 6.28318);
+    let ph2 = _rng_range(rng, 0.0, 6.28318);
+    let ph3 = _rng_range(rng, 0.0, 6.28318);
+
+    let shear_tan = num_tan(slant_deg * _PI / 180.0);
+    let rot_rad = rot_deg * _PI / 180.0;
+    let cr = num_cos(rot_rad);
+    let sr = num_sin(rot_rad);
+
+    let base_strokes = allos[allo_idx];
+    let warped_norm = [];
+    let min_u = 999.0;
+    let max_u = -999.0;
+    let min_v = 999.0;
+    let max_v = -999.0;
+
+    let si = 0;
+    while si < len(base_strokes) {
+        let fine = _subdivide_stroke(base_strokes[si], 0.045);
+        let wpts = [];
+        let pi = 0;
+        while pi < len(fine) {
+            let u0 = fine[pi][0];
+            let v0 = fine[pi][1];
+            // Elastic Bezier/sinusoidal tremor field
+            let du = amp_x * num_sin(freq1 * v0 + ph1) + 0.45 * amp_x * num_cos(freq2 * u0 + ph3);
+            let dv = amp_y * num_cos(freq2 * u0 + ph2) + 0.45 * amp_y * num_sin(freq1 * v0 + ph1);
+            let uc = (u0 + du - 0.5) * sx;
+            let vc = (v0 + dv - 0.5) * sy;
+            // Italic slant shear (top shifts horizontally opposite to bottom)
+            let us = uc - shear_tan * vc;
+            let vs = vc;
+            // Rotation
+            let ur = us * cr - vs * sr + 0.5;
+            let vr = us * sr + vs * cr + 0.5;
+            if ur < min_u { min_u = ur; }
+            if ur > max_u { max_u = ur; }
+            if vr < min_v { min_v = vr; }
+            if vr > max_v { max_v = vr; }
+            push(wpts, [ur, vr]);
+            pi = pi + 1;
+        }
+        push(warped_norm, wpts);
+        si = si + 1;
+    }
+
+    // Fit cleanly inside canvas with safe margin while preserving natural aspect ratio!
+    let margin = _max(4.0, _min(out_w, out_h) * 0.13);
+    let avail_w = _max(4.0, out_w - 2.0 * margin);
+    let avail_h = _max(4.0, out_h - 2.0 * margin);
+    let span_u = _max(0.08, max_u - min_u);
+    let span_v = _max(0.08, max_v - min_v);
+    let fit_scale = _min(avail_w / span_u, avail_h / span_v);
+    let cx_u = 0.5 * (min_u + max_u);
+    let cy_v = 0.5 * (min_v + max_v);
+
+    let px_strokes = [];
+    let sj = 0;
+    while sj < len(warped_norm) {
+        let pst = [];
+        let pj = 0;
+        while pj < len(warped_norm[sj]) {
+            let px = (out_w * 0.5) + (warped_norm[sj][pj][0] - cx_u) * fit_scale;
+            let py = (out_h * 0.5) + (warped_norm[sj][pj][1] - cy_v) * fit_scale;
+            push(pst, [px, py]);
+            pj = pj + 1;
+        }
+        push(px_strokes, pst);
+        sj = sj + 1;
+    }
+
+    let max_safe_r = _min(2.6, _max(1.15, _min(out_w, out_h) * 0.052));
+    let pen_r = if style_opts != nil and map_has(style_opts, "stroke_radius") {
+        _clamp(style_opts.stroke_radius, 0.9, 3.0)
+    } else {
+        _rng_range(rng, 1.05, max_safe_r)
+    };
+    let noise_p = if style_opts != nil and map_has(style_opts, "noise_prob") {
+        style_opts.noise_prob
+    } else {
+        _rng_range(rng, 0.0, 0.018)
+    };
+    let rast = strokes_to_bitmap(px_strokes, out_w, out_h, map{
+        stroke_radius: pen_r,
+        paper_level: _rng_range(rng, 232.0, 252.0),
+        ink_level: _rng_range(rng, 12.0, 58.0),
+        shade_grad_x: _rng_range(rng, -24.0, 24.0),
+        shade_grad_y: _rng_range(rng, -24.0, 24.0),
+        noise_prob: noise_p,
+        noise_seed: variant_seed * 313 + cls_idx * 19 + 7
+    });
+
+    return map{
+        ok: true,
+        symbol: sym,
+        class_index: cls_idx,
+        allograph_index: allo_idx,
+        width: out_w,
+        height: out_h,
+        strokes: px_strokes,
+        norm_strokes: warped_norm,
+        bitmap: rast.bitmap,
+        binary_bitmap: rast.binary_bitmap,
+        style: map{
+            slant_deg: slant_deg,
+            rot_deg: rot_deg,
+            scale_x: sx,
+            scale_y: sy,
+            stroke_radius: pen_r,
+            noise_prob: noise_p
+        }
+    };
+}
+
+// ============================================================================
+// 3. 24-bit Windows BMP Codec (Encode & Decode)
+// ============================================================================
+
+fn _put_u16_le(arr, v) {
+    let n = _imod(_round_int(v), 65536);
+    push(arr, _imod(n, 256));
+    push(arr, num_floor(n / 256));
+}
+
+fn _put_u32_le(arr, v) {
+    let n = _round_int(v);
+    if n < 0 { n = n + 4294967296; }
+    let b0 = _imod(n, 256);
+    let n1 = num_floor(n / 256);
+    let b1 = _imod(n1, 256);
+    let n2 = num_floor(n1 / 256);
+    let b2 = _imod(n2, 256);
+    let b3 = _imod(num_floor(n2 / 256), 256);
+    push(arr, b0); push(arr, b1); push(arr, b2); push(arr, b3);
+}
+
+fn _read_u16_le(b, off) {
+    return b[off] + b[off + 1] * 256;
+}
+
+fn _read_u32_le(b, off) {
+    return b[off] + b[off + 1] * 256 + b[off + 2] * 65536 + b[off + 3] * 16777216;
+}
+
+fn _read_i32_le(b, off) {
+    let u = _read_u32_le(b, off);
+    if u >= 2147483648 { return u - 4294967296; }
+    return u;
+}
+
+// Encodes a 2D grayscale (0..255 or 0..1) or RGB image into 24-bit BMP byte array.
+fn encode_bmp24(bmp_2d) {
+    let src = if type(bmp_2d) == "map" and map_has(bmp_2d, "bitmap") { bmp_2d.bitmap } else { bmp_2d };
+    let h = len(src);
+    let w = if h > 0 { len(src[0]) } else { 0 };
+    let row_raw = w * 3;
+    let pad = _imod(4 - _imod(row_raw, 4), 4);
+    let stride = row_raw + pad;
+    let img_bytes = stride * h;
+    let file_size = 54 + img_bytes;
+
+    // Detect if binary 0/1 (0=bg, 1=ink -> render black ink on white paper for standard BMP)
+    let max_v = 0.0;
+    let cy = 0;
+    while cy < h {
+        let cx = 0;
+        while cx < w {
+            let p = src[cy][cx];
+            let lv = if type(p) == "array" { p[0] } else { p };
+            if lv > max_v { max_v = lv; }
+            cx = cx + 1;
+        }
+        cy = cy + 1;
+    }
+
+    let out = [];
+    // 'B', 'M'
+    push(out, 66); push(out, 77);
+    _put_u32_le(out, file_size);
+    _put_u16_le(out, 0);
+    _put_u16_le(out, 0);
+    _put_u32_le(out, 54);
+    // BITMAPINFOHEADER (40 bytes)
+    _put_u32_le(out, 40);
+    _put_u32_le(out, w);
+    _put_u32_le(out, h); // bottom-up
+    _put_u16_le(out, 1);
+    _put_u16_le(out, 24);
+    _put_u32_le(out, 0);
+    _put_u32_le(out, img_bytes);
+    _put_u32_le(out, 2835);
+    _put_u32_le(out, 2835);
+    _put_u32_le(out, 0);
+    _put_u32_le(out, 0);
+
+    let y = h - 1;
+    while y >= 0 {
+        let x = 0;
+        while x < w {
+            let p = src[y][x];
+            if type(p) == "array" and len(p) >= 3 {
+                push(out, _round_int(_clamp(p[2], 0, 255)));
+                push(out, _round_int(_clamp(p[1], 0, 255)));
+                push(out, _round_int(_clamp(p[0], 0, 255)));
+            } else {
+                let g = if max_v <= 1.0 {
+                    _round_int(_clamp((1.0 - p) * 255.0, 0.0, 255.0))
+                } else {
+                    _round_int(_clamp(p, 0.0, 255.0))
+                };
+                push(out, g); push(out, g); push(out, g);
+            }
+            x = x + 1;
+        }
+        let k = 0;
+        while k < pad { push(out, 0); k = k + 1; }
+        y = y - 1;
+    }
+    return out;
+}
+
+fn decode_bmp24(bmp_bytes) {
+    if len(bmp_bytes) < 54 or bmp_bytes[0] != 66 or bmp_bytes[1] != 77 {
+        throw "decode_bmp24: invalid BMP header";
+    }
+    let data_off = _read_u32_le(bmp_bytes, 10);
+    let w = _read_i32_le(bmp_bytes, 18);
+    let raw_h = _read_i32_le(bmp_bytes, 22);
+    let bpp = _read_u16_le(bmp_bytes, 28);
+    if w <= 0 or raw_h == 0 or (bpp != 24 and bpp != 32 and bpp != 8) {
+        throw "decode_bmp24: unsupported BMP dimensions or bpp=" + str(bpp);
+    }
+    let top_down = raw_h < 0;
+    let h = if raw_h < 0 { 0 - raw_h } else { raw_h };
+    let bytes_pp = num_floor(bpp / 8);
+    let row_raw = w * bytes_pp;
+    let pad = if bpp == 32 { 0 } else { _imod(4 - _imod(row_raw, 4), 4) };
+    let stride = row_raw + pad;
+
+    let img = [];
+    let y = 0;
+    while y < h {
+        let src_row = if top_down { y } else { h - 1 - y };
+        let base = data_off + src_row * stride;
+        let row = [];
+        let x = 0;
+        while x < w {
+            let off = base + x * bytes_pp;
+            if bytes_pp >= 3 {
+                let b = bmp_bytes[off];
+                let g = bmp_bytes[off + 1];
+                let r = bmp_bytes[off + 2];
+                push(row, _round_int(0.299 * r + 0.587 * g + 0.114 * b));
+            } else {
+                push(row, bmp_bytes[off]);
+            }
+            x = x + 1;
+        }
+        push(img, row);
+        y = y + 1;
+    }
+    return img;
+}
+
+// ============================================================================
+// 4. Adaptive Sauvola / Otsu Restoration, Denoising & Moment Slant Deskewing
+// ============================================================================
+
+fn _otsu_threshold(hist, total_px) {
+    if total_px <= 0 { return 128.0; }
+    let sum_all = 0.0;
+    let i = 0;
+    while i < 256 {
+        sum_all = sum_all + i * hist[i];
+        i = i + 1;
+    }
+    let sum_b = 0.0;
+    let w_b = 0.0;
+    let max_var = -1.0;
+    let best_t = 128.0;
+    let t = 0;
+    while t < 256 {
+        w_b = w_b + hist[t];
+        if w_b > 0.0 {
+            let w_f = total_px - w_b;
+            if w_f <= 0.0 { return best_t; }
+            sum_b = sum_b + t * hist[t];
+            let m_b = sum_b / w_b;
+            let m_f = (sum_all - sum_b) / w_f;
+            let diff = m_b - m_f;
+            let between = w_b * w_f * diff * diff;
+            if between > max_var {
+                max_var = between;
+                best_t = t * 1.0;
+            }
+        }
+        t = t + 1;
+    }
+    return best_t;
+}
+
+fn _denoise_binary_3x3(bin) {
+    let h = len(bin);
+    if h == 0 { return []; }
+    let w = len(bin[0]);
+    if w == 0 { return []; }
+
+    // Count neighbors for every pixel
+    let nbr = [];
+    let y = 0;
+    while y < h {
+        let nr = [];
+        let x = 0;
+        while x < w {
+            let cnt = 0;
+            let dy = -1;
+            while dy <= 1 {
+                let ny = y + dy;
+                if ny >= 0 and ny < h {
+                    let dx = -1;
+                    while dx <= 1 {
+                        let nx = x + dx;
+                        if (dx != 0 or dy != 0) and nx >= 0 and nx < w {
+                            if bin[ny][nx] > 0 { cnt = cnt + 1; }
+                        }
+                        dx = dx + 1;
+                    }
+                }
+                dy = dy + 1;
+            }
+            push(nr, cnt);
+            x = x + 1;
+        }
+        push(nbr, nr);
+        y = y + 1;
+    }
+
+    let out = [];
+    let y2 = 0;
+    while y2 < h {
+        let row = [];
+        let x2 = 0;
+        while x2 < w {
+            let v = bin[y2][x2];
+            let n8 = nbr[y2][x2];
+            if v > 0 {
+                if n8 == 0 {
+                    // Isolated single-pixel speckle -> remove
+                    v = 0;
+                } else {
+                    if n8 == 1 {
+                        // Remove isolated 2-pixel micro-speck (both pixels have n8 == 1)
+                        let sole_nbr_n8 = 2;
+                        let dy = -1;
+                        while dy <= 1 {
+                            let ny = y2 + dy;
+                            if ny >= 0 and ny < h {
+                                let dx = -1;
+                                while dx <= 1 {
+                                    let nx = x2 + dx;
+                                    if (dx != 0 or dy != 0) and nx >= 0 and nx < w and bin[ny][nx] > 0 {
+                                        sole_nbr_n8 = nbr[ny][nx];
+                                    }
+                                    dx = dx + 1;
+                                }
+                            }
+                            dy = dy + 1;
+                        }
+                        if sole_nbr_n8 <= 1 { v = 0; }
+                    }
+                }
+            } else {
+                // Heal interior 1-pixel pinhole surrounded by >= 7 ink neighbors
+                if n8 >= 7 { v = 1; }
+            }
+            push(row, v);
+            x2 = x2 + 1;
+        }
+        push(out, row);
+        y2 = y2 + 1;
+    }
+    return out;
+}
+
+// Moment-based slant deskewing (mu11 / mu02 shear correction).
+// Preserves pure diagonal slashes ('/') by checking thin single-line slash geometry.
+fn deskew_glyph_bitmap(bin_bmp) {
+    let h = len(bin_bmp);
+    if h == 0 { return []; }
+    let w = len(bin_bmp[0]);
+    if w == 0 { return []; }
+
+    let m00 = 0.0;
+    let sx = 0.0;
+    let sy = 0.0;
+    let min_x = w; let max_x = -1;
+    let min_y = h; let max_y = -1;
+    let y = 0;
+    while y < h {
+        let x = 0;
+        while x < w {
+            if bin_bmp[y][x] > 0 {
+                m00 = m00 + 1.0;
+                sx = sx + x;
+                sy = sy + y;
+                if x < min_x { min_x = x; }
+                if x > max_x { max_x = x; }
+                if y < min_y { min_y = y; }
+                if y > max_y { max_y = y; }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if m00 < 4.0 { return bin_bmp; }
+    let bw = max_x - min_x + 1;
+    let bh = max_y - min_y + 1;
+    if bh < 5 { return bin_bmp; }
+
+    let cx = sx / m00;
+    let cy = sy / m00;
+    let mu20 = 0.0;
+    let mu02 = 0.0;
+    let mu11 = 0.0;
+    let y2 = min_y;
+    while y2 <= max_y {
+        let x2 = min_x;
+        while x2 <= max_x {
+            if bin_bmp[y2][x2] > 0 {
+                let dx = x2 - cx;
+                let dy = y2 - cy;
+                mu20 = mu20 + dx * dx;
+                mu02 = mu02 + dy * dy;
+                mu11 = mu11 + dx * dy;
+            }
+            x2 = x2 + 1;
+        }
+        y2 = y2 + 1;
+    }
+    if mu02 < 1e-5 { return bin_bmp; }
+    let raw_slant = mu11 / mu02;
+
+    // Check PCA minor/major eigenvalue ratio so pure straight forward slash '/' is NOT turned into '|'
+    let tr = mu20 + mu02;
+    let det_term = num_sqrt((mu20 - mu02) * (mu20 - mu02) + 4.0 * mu11 * mu11);
+    let lam_max = 0.5 * (tr + det_term);
+    let lam_min = _max(0.0, 0.5 * (tr - det_term));
+    let thinness = lam_min / _max(lam_max, 1e-6);
+    if _abs(raw_slant) > 0.48 and thinness < 0.045 {
+        return bin_bmp;
+    }
+    if _abs(raw_slant) < 0.06 {
+        return bin_bmp;
+    }
+
+    let alpha = _clamp(0.72 * raw_slant, -0.34, 0.34);
+    let pad_x = num_ceil(_abs(alpha) * bh) + 2;
+    let nw = w + 2 * pad_x;
+    let out = [];
+    let oy = 0;
+    while oy < h {
+        let row = [];
+        let dy = oy - cy;
+        let ox = 0;
+        while ox < nw {
+            let src_x = _round_int((ox - pad_x) + alpha * dy);
+            if src_x >= 0 and src_x < w and bin_bmp[oy][src_x] > 0 {
+                push(row, 1);
+            } else {
+                push(row, 0);
+            }
+            ox = ox + 1;
+        }
+        push(out, row);
+        oy = oy + 1;
+    }
+    return out;
+}
+
+// Restores noisy grayscale/shadowed/RGB/BMP or binary math bitmaps into clean 0/1 ink bitmaps.
+fn preprocess_math_bitmap(bmp, opts = nil) {
+    if bmp == nil { return []; }
+    let src = bmp;
+    if type(src) == "map" {
+        if map_has(src, "bitmap") { src = src.bitmap; }
+        else {
+            if map_has(src, "binary_bitmap") { src = src.binary_bitmap; }
+            else {
+                if map_has(src, "pixels") { src = src.pixels; }
+            }
+        }
+    }
+    // Check if raw 24-bit BMP byte array or bytes
+    if type(src) == "bytes" {
+        let barr = [];
+        let bi = 0;
+        while bi < len(src) { push(barr, src[bi]); bi = bi + 1; }
+        src = decode_bmp24(barr);
+    } else {
+        if type(src) == "array" and len(src) >= 54 and type(src[0]) == "number" and src[0] == 66 and src[1] == 77 {
+            src = decode_bmp24(src);
+        }
+    }
+
+    let h = len(src);
+    if h == 0 { return []; }
+    let w = len(src[0]);
+    if w == 0 { return []; }
+
+    // Convert to scalar 2D matrix and find range
+    let mat = [];
+    let min_v = 1e9;
+    let max_v = -1e9;
+    let y = 0;
+    while y < h {
+        let row = [];
+        let x = 0;
+        while x < w {
+            let p = src[y][x];
+            let lv = if type(p) == "array" {
+                if len(p) >= 3 { 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2] } else { p[0] }
+            } else {
+                p * 1.0
+            };
+            if lv < min_v { min_v = lv; }
+            if lv > max_v { max_v = lv; }
+            push(row, lv);
+            x = x + 1;
+        }
+        push(mat, row);
+        y = y + 1;
+    }
+
+    // Case 1: Already binary / normalized [0..1]
+    if max_v <= 1.0001 and min_v >= -0.0001 {
+        // Check perimeter average to detect if 0=bg (standard ink=1) or 1=white paper
+        let b_sum = 0.0;
+        let b_cnt = 0.0;
+        let bx = 0;
+        while bx < w {
+            b_sum = b_sum + mat[0][bx] + mat[h - 1][bx];
+            b_cnt = b_cnt + 2.0;
+            bx = bx + 1;
+        }
+        let by = 1;
+        while by + 1 < h {
+            b_sum = b_sum + mat[by][0] + mat[by][w - 1];
+            b_cnt = b_cnt + 2.0;
+            by = by + 1;
+        }
+        let invert_01 = (b_cnt > 0.0 and (b_sum / b_cnt) > 0.65);
+        let bin01 = [];
+        let yy = 0;
+        while yy < h {
+            let r01 = [];
+            let xx = 0;
+            while xx < w {
+                let v = if invert_01 { 1.0 - mat[yy][xx] } else { mat[yy][xx] };
+                push(r01, if v >= 0.45 { 1 } else { 0 });
+                xx = xx + 1;
+            }
+            push(bin01, r01);
+            yy = yy + 1;
+        }
+        let do_denoise = if opts != nil and map_has(opts, "denoise") { opts.denoise } else { false };
+        let res01 = if do_denoise { _denoise_binary_3x3(bin01) } else { bin01 };
+        if opts != nil and map_has(opts, "deskew") and opts.deskew == true {
+            return deskew_glyph_bitmap(res01);
+        }
+        return res01;
+    }
+
+    // Case 2: Grayscale [0..255]. Normalize polarity so paper background is high (~240) and ink is dark (~20).
+    let border_sum = 0.0;
+    let border_cnt = 0.0;
+    let bx2 = 0;
+    while bx2 < w {
+        border_sum = border_sum + mat[0][bx2] + mat[h - 1][bx2];
+        border_cnt = border_cnt + 2.0;
+        bx2 = bx2 + 1;
+    }
+    let by2 = 1;
+    while by2 + 1 < h {
+        border_sum = border_sum + mat[by2][0] + mat[by2][w - 1];
+        border_cnt = border_cnt + 2.0;
+        by2 = by2 + 1;
+    }
+    let dark_bg = (border_cnt > 0.0 and (border_sum / border_cnt) < 127.5);
+
+    let hist = [];
+    let hi = 0;
+    while hi < 256 { push(hist, 0.0); hi = hi + 1; }
+
+    let norm_gray = [];
+    // Integral images (h+1) x (w+1) for O(1) Sauvola window mean & variance
+    let int_s = [];
+    let int_sq = [];
+    let zrow0 = [];
+    let zsq0 = [];
+    let zx = 0;
+    while zx <= w { push(zrow0, 0.0); push(zsq0, 0.0); zx = zx + 1; }
+    push(int_s, zrow0);
+    push(int_sq, zsq0);
+
+    let gy = 0;
+    while gy < h {
+        let grow = [];
+        let srow = [0.0];
+        let sqrow = [0.0];
+        let row_s = 0.0;
+        let row_sq = 0.0;
+        let gx = 0;
+        while gx < w {
+            let gv = _clamp(if dark_bg { 255.0 - mat[gy][gx] } else { mat[gy][gx] }, 0.0, 255.0);
+            let gi = _round_int(gv);
+            hist[gi] = hist[gi] + 1.0;
+            push(grow, gv);
+            row_s = row_s + gv;
+            row_sq = row_sq + gv * gv;
+            push(srow, int_s[gy][gx + 1] + row_s);
+            push(sqrow, int_sq[gy][gx + 1] + row_sq);
+            gx = gx + 1;
+        }
+        push(norm_gray, grow);
+        push(int_s, srow);
+        push(int_sq, sqrow);
+        gy = gy + 1;
+    }
+
+    if max_v - min_v < 12.0 {
+        let empty = [];
+        let ey = 0;
+        while ey < h {
+            let er = [];
+            let ex = 0;
+            while ex < w { push(er, 0); ex = ex + 1; }
+            push(empty, er);
+            ey = ey + 1;
+        }
+        return empty;
+    }
+
+    let t_otsu = _otsu_threshold(hist, w * h * 1.0);
+    let win_r = _max(5, _min(12, _round_int(_min(w, h) * 0.18)));
+    let k_sauv = 0.20;
+
+    let raw_bin = [];
+    let ty = 0;
+    while ty < h {
+        let y0 = _max(0, ty - win_r);
+        let y1 = _min(h - 1, ty + win_r);
+        let brow = [];
+        let tx = 0;
+        while tx < w {
+            let x0 = _max(0, tx - win_r);
+            let x1 = _min(w - 1, tx + win_r);
+            let area = ((y1 - y0 + 1) * (x1 - x0 + 1)) * 1.0;
+            let sum_w = int_s[y1 + 1][x1 + 1] - int_s[y0][x1 + 1] - int_s[y1 + 1][x0] + int_s[y0][x0];
+            let sq_w = int_sq[y1 + 1][x1 + 1] - int_sq[y0][x1 + 1] - int_sq[y1 + 1][x0] + int_sq[y0][x0];
+            let mean_w = sum_w / area;
+            let var_w = _max(0.0, (sq_w / area) - mean_w * mean_w);
+            let std_w = num_sqrt(var_w);
+            let t_sauv = mean_w * (1.0 - k_sauv * (1.0 - (std_w / 128.0)));
+            let t_hybrid = 0.70 * t_sauv + 0.30 * t_otsu;
+            let pv = norm_gray[ty][tx];
+            let is_ink = (pv < t_hybrid and (mean_w - pv > 16.0 or pv < t_otsu - 10.0));
+            push(brow, if is_ink { 1 } else { 0 });
+            tx = tx + 1;
+        }
+        push(raw_bin, brow);
+        ty = ty + 1;
+    }
+
+    let clean_bin = _denoise_binary_3x3(raw_bin);
+    if opts != nil and map_has(opts, "deskew") and opts.deskew == true {
+        return deskew_glyph_bitmap(clean_bin);
+    }
+    return clean_bin;
+}
+
+// ============================================================================
+// 5. Topological Hole Counter & 154-Feature Discriminative Extractor
+// ============================================================================
+
+fn _tight_crop_binary(bin) {
+    let h = len(bin);
+    if h == 0 { return map{ empty: true, bmp: [], w: 0, h: 0, ink: 0 }; }
+    let w = len(bin[0]);
+    let min_x = w; let max_x = -1;
+    let min_y = h; let max_y = -1;
+    let ink = 0;
+    let y = 0;
+    while y < h {
+        let x = 0;
+        while x < w {
+            if bin[y][x] > 0 {
+                ink = ink + 1;
+                if x < min_x { min_x = x; }
+                if x > max_x { max_x = x; }
+                if y < min_y { min_y = y; }
+                if y > max_y { max_y = y; }
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    if ink == 0 {
+        return map{ empty: true, bmp: [], w: 0, h: 0, ink: 0 };
+    }
+    let cw = max_x - min_x + 1;
+    let ch = max_y - min_y + 1;
+    let cropped = [];
+    let cy = min_y;
+    while cy <= max_y {
+        let row = [];
+        let cx = min_x;
+        while cx <= max_x {
+            push(row, if bin[cy][cx] > 0 { 1 } else { 0 });
+            cx = cx + 1;
+        }
+        push(cropped, row);
+        cy = cy + 1;
+    }
+    return map{ empty: false, bmp: cropped, w: cw, h: ch, ink: ink };
+}
+
+// Counts topological Euler enclosed background holes via border 4-connected flood-fill.
+fn count_glyph_holes(bin_bmp) {
+    let tc = _tight_crop_binary(bin_bmp);
+    if tc.empty {
+        return map{ count: 0, hole_cx: 0.5, hole_cy: 0.5, hole_area_ratio: 0.0 };
+    }
+    let bw = tc.w;
+    let bh = tc.h;
+    let pw = bw + 2;
+    let ph = bh + 2;
+
+    // 0 = unvisited background, 1 = ink, 2 = exterior/visited background
+    let grid = [];
+    let y = 0;
+    while y < ph {
+        let r = [];
+        let x = 0;
+        while x < pw {
+            if y == 0 or y == ph - 1 or x == 0 or x == pw - 1 {
+                push(r, 0);
+            } else {
+                push(r, tc.bmp[y - 1][x - 1]);
+            }
+            x = x + 1;
+        }
+        push(grid, r);
+        y = y + 1;
+    }
+
+    // Flood-fill exterior background from (0, 0)
+    let qx = [0];
+    let qy = [0];
+    grid[0][0] = 2;
+    let head = 0;
+    while head < len(qx) {
+        let cx = qx[head];
+        let cy = qy[head];
+        head = head + 1;
+        if cx > 0 and grid[cy][cx - 1] == 0 { grid[cy][cx - 1] = 2; push(qx, cx - 1); push(qy, cy); }
+        if cx + 1 < pw and grid[cy][cx + 1] == 0 { grid[cy][cx + 1] = 2; push(qx, cx + 1); push(qy, cy); }
+        if cy > 0 and grid[cy - 1][cx] == 0 { grid[cy - 1][cx] = 2; push(qx, cx); push(qy, cy - 1); }
+        if cy + 1 < ph and grid[cy + 1][cx] == 0 { grid[cy + 1][cx] = 2; push(qx, cx); push(qy, cy + 1); }
+    }
+
+    // Find enclosed interior background holes
+    let min_hole_px = _max(3, _round_int(bw * bh * 0.010));
+    let hole_count = 0;
+    let total_hole_px = 0.0;
+    let weighted_hx = 0.0;
+    let weighted_hy = 0.0;
+
+    let hy = 1;
+    while hy <= bh {
+        let hx = 1;
+        while hx <= bw {
+            if grid[hy][hx] == 0 {
+                let hqx = [hx];
+                let hqy = [hy];
+                grid[hy][hx] = 3;
+                let hhead = 0;
+                let sum_x = 0.0;
+                let sum_y = 0.0;
+                while hhead < len(hqx) {
+                    let ux = hqx[hhead];
+                    let uy = hqy[hhead];
+                    hhead = hhead + 1;
+                    sum_x = sum_x + (ux - 1);
+                    sum_y = sum_y + (uy - 1);
+                    if grid[uy][ux - 1] == 0 { grid[uy][ux - 1] = 3; push(hqx, ux - 1); push(hqy, uy); }
+                    if grid[uy][ux + 1] == 0 { grid[uy][ux + 1] = 3; push(hqx, ux + 1); push(hqy, uy); }
+                    if grid[uy - 1][ux] == 0 { grid[uy - 1][ux] = 3; push(hqx, ux); push(hqy, uy - 1); }
+                    if grid[uy + 1][ux] == 0 { grid[uy + 1][ux] = 3; push(hqx, ux); push(hqy, uy + 1); }
+                }
+                let h_area = len(hqx);
+                if h_area >= min_hole_px {
+                    hole_count = hole_count + 1;
+                    total_hole_px = total_hole_px + h_area;
+                    weighted_hx = weighted_hx + sum_x;
+                    weighted_hy = weighted_hy + sum_y;
+                }
+            }
+            hx = hx + 1;
+        }
+        hy = hy + 1;
+    }
+
+    let hcx = if total_hole_px > 0.0 { (weighted_hx / total_hole_px) / _max(1.0, bw - 1.0) } else { 0.5 };
+    let hcy = if total_hole_px > 0.0 { (weighted_hy / total_hole_px) / _max(1.0, bh - 1.0) } else { 0.5 };
+    return map{
+        count: hole_count,
+        hole_cx: _clamp(hcx, 0.0, 1.0),
+        hole_cy: _clamp(hcy, 0.0, 1.0),
+        hole_area_ratio: _clamp(total_hole_px / _max(1.0, bw * bh * 1.0), 0.0, 1.0)
+    };
+}
+
+fn _count_sub_blobs(bin) {
+    let h = len(bin);
+    if h == 0 { return 0; }
+    let w = len(bin[0]);
+    let vis = [];
+    let y = 0;
+    while y < h {
+        let r = [];
+        let x = 0;
+        while x < w { push(r, 0); x = x + 1; }
+        push(vis, r);
+        y = y + 1;
+    }
+    let blobs = 0;
+    let sy = 0;
+    while sy < h {
+        let sx = 0;
+        while sx < w {
+            if bin[sy][sx] > 0 and vis[sy][sx] == 0 {
+                let qx = [sx];
+                let qy = [sy];
+                vis[sy][sx] = 1;
+                let hd = 0;
+                while hd < len(qx) {
+                    let ux = qx[hd];
+                    let uy = qy[hd];
+                    hd = hd + 1;
+                    let dy = -1;
+                    while dy <= 1 {
+                        let ny = uy + dy;
+                        if ny >= 0 and ny < h {
+                            let dx = -1;
+                            while dx <= 1 {
+                                let nx = ux + dx;
+                                if nx >= 0 and nx < w and bin[ny][nx] > 0 and vis[ny][nx] == 0 {
+                                    vis[ny][nx] = 1;
+                                    push(qx, nx);
+                                    push(qy, ny);
+                                }
+                                dx = dx + 1;
+                            }
+                        }
+                        dy = dy + 1;
+                    }
+                }
+                if len(qx) >= 2 { blobs = blobs + 1; }
+            }
+            sx = sx + 1;
+        }
+        sy = sy + 1;
+    }
+    return blobs;
+}
+
+fn _scanline_runs_row(bin, y) {
+    let h = len(bin);
+    if h == 0 { return 0; }
+    let ry = _clamp(_round_int(y), 0, h - 1);
+    let w = len(bin[0]);
+    let runs = 0;
+    let in_run = false;
+    let x = 0;
+    while x < w {
+        if bin[ry][x] > 0 {
+            if not in_run { runs = runs + 1; in_run = true; }
+        } else {
+            in_run = false;
+        }
+        x = x + 1;
+    }
+    return runs;
+}
+
+fn _scanline_runs_col(bin, x) {
+    let h = len(bin);
+    if h == 0 { return 0; }
+    let w = len(bin[0]);
+    let cx = _clamp(_round_int(x), 0, w - 1);
+    let runs = 0;
+    let in_run = false;
+    let y = 0;
+    while y < h {
+        if bin[y][cx] > 0 {
+            if not in_run { runs = runs + 1; in_run = true; }
+        } else {
+            in_run = false;
+        }
+        y = y + 1;
+    }
+    return runs;
+}
+
+// Extracts 154 compact, invariant features from a segmented glyph bitmap:
+//   [0..99]   (100): 10x10 aspect-ratio-aware anti-aliased ink density grid
+//   [100..135] (36): 3x3x4 directional gradient orientation zones (|dx|, |dy|, |dx+dy|/sqrt2, |dx-dy|/sqrt2)
+//   [136..153] (18): Euler hole topology (0/1/2 flags, hole cx/cy/area), aspect ratios,
+//                    pre-deskew slant moment, ink fill, center of mass, blob count, and 6 scanline crossings.
+fn extract_glyph_features(comp_bmp) {
+    let bin_in = preprocess_math_bitmap(comp_bmp, map{ denoise: false });
+    let raw_tc = _tight_crop_binary(bin_in);
+    if raw_tc.empty {
+        let z = [];
+        let zi = 0;
+        while zi < FEATURE_DIM { push(z, 0.0); zi = zi + 1; }
+        return z;
+    }
+
+    // Raw pre-deskew moments & aspect
+    let rbw = raw_tc.w * 1.0;
+    let rbh = raw_tc.h * 1.0;
+    let r_sum_x = 0.0;
+    let r_sum_y = 0.0;
+    let ry = 0;
+    while ry < raw_tc.h {
+        let rx = 0;
+        while rx < raw_tc.w {
+            if raw_tc.bmp[ry][rx] > 0 {
+                r_sum_x = r_sum_x + rx;
+                r_sum_y = r_sum_y + ry;
+            }
+            rx = rx + 1;
+        }
+        ry = ry + 1;
+    }
+    let r_cx = r_sum_x / raw_tc.ink;
+    let r_cy = r_sum_y / raw_tc.ink;
+    let mu11 = 0.0;
+    let mu02 = 0.0;
+    let ry2 = 0;
+    while ry2 < raw_tc.h {
+        let rx2 = 0;
+        while rx2 < raw_tc.w {
+            if raw_tc.bmp[ry2][rx2] > 0 {
+                let dy = ry2 - r_cy;
+                mu11 = mu11 + (rx2 - r_cx) * dy;
+                mu02 = mu02 + dy * dy;
+            }
+            rx2 = rx2 + 1;
+        }
+        ry2 = ry2 + 1;
+    }
+    let raw_slant = if mu02 > 1e-5 { _clamp((mu11 / mu02) / 1.2, -1.0, 1.0) } else { 0.0 };
+
+    // Topological invariants (holes + sub-blobs)
+    let holes = count_glyph_holes(raw_tc.bmp);
+    let sub_blobs = _count_sub_blobs(raw_tc.bmp);
+
+    // Deskewed tight glyph for canonical grid & gradient extraction
+    let deskewed = deskew_glyph_bitmap(raw_tc.bmp);
+    let dtc = _tight_crop_binary(deskewed);
+    let gbmp = if dtc.empty { raw_tc.bmp } else { dtc.bmp };
+    let gw = if dtc.empty { raw_tc.w } else { dtc.w };
+    let gh = if dtc.empty { raw_tc.h } else { dtc.h };
+
+    // Build standardized 24x24 aspect-ratio-aware anti-aliased raster (damped square frame)
+    let max_dim = _max(gw, gh) * 1.0;
+    let frame_w = 0.68 * gw + 0.32 * max_dim;
+    let frame_h = 0.68 * gh + 0.32 * max_dim;
+    let x_off = 0.5 * (frame_w - gw);
+    let y_off = 0.5 * (frame_h - gh);
+
+    let N24 = 24;
+    let std24 = [];
+    let sy = 0;
+    while sy < N24 {
+        let srow = [];
+        let sx = 0;
+        while sx < N24 {
+            // 2x2 sub-pixel anti-aliased supersampling
+            let acc = 0.0;
+            let ky = 0;
+            while ky < 2 {
+                let v_norm = (sy + (ky + 0.5) * 0.5) / (N24 * 1.0);
+                let fy = _round_int(v_norm * frame_h - y_off - 0.5);
+                let kx = 0;
+                while kx < 2 {
+                    let u_norm = (sx + (kx + 0.5) * 0.5) / (N24 * 1.0);
+                    let fx = _round_int(u_norm * frame_w - x_off - 0.5);
+                    if fy >= 0 and fy < gh and fx >= 0 and fx < gw {
+                        acc = acc + gbmp[fy][fx];
+                    }
+                    kx = kx + 1;
+                }
+                ky = ky + 1;
+            }
+            push(srow, acc * 0.25);
+            sx = sx + 1;
+        }
+        push(std24, srow);
+        sy = sy + 1;
+    }
+
+    let feat = [];
+
+    // 1) 10x10 = 100 anti-aliased ink density grid pooled smoothly from std24
+    let gy = 0;
+    while gy < 10 {
+        let y_a = num_floor(gy * N24 / 10.0);
+        let y_b = _max(y_a + 1, num_ceil((gy + 1) * N24 / 10.0));
+        let gx = 0;
+        while gx < 10 {
+            let x_a = num_floor(gx * N24 / 10.0);
+            let x_b = _max(x_a + 1, num_ceil((gx + 1) * N24 / 10.0));
+            let s = 0.0;
+            let c = 0.0;
+            let py = y_a;
+            while py < y_b and py < N24 {
+                let px = x_a;
+                while px < x_b and px < N24 {
+                    s = s + std24[py][px];
+                    c = c + 1.0;
+                    px = px + 1;
+                }
+                py = py + 1;
+            }
+            push(feat, if c > 0.0 { s / c } else { 0.0 });
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+
+    // 2) 3x3x4 = 36 directional gradient orientation zones on std24 (8x8 per zone)
+    let zy = 0;
+    while zy < 3 {
+        let zx = 0;
+        while zx < 3 {
+            let e_dx = 0.0;
+            let e_dy = 0.0;
+            let e_d1 = 0.0;
+            let e_d2 = 0.0;
+            let py = zy * 8;
+            while py < (zy + 1) * 8 {
+                let px = zx * 8;
+                while px < (zx + 1) * 8 {
+                    let l = if px > 0 { std24[py][px - 1] } else { 0.0 };
+                    let r = if px + 1 < N24 { std24[py][px + 1] } else { 0.0 };
+                    let u = if py > 0 { std24[py - 1][px] } else { 0.0 };
+                    let d = if py + 1 < N24 { std24[py + 1][px] } else { 0.0 };
+                    let dx = r - l;
+                    let dy = d - u;
+                    e_dx = e_dx + _abs(dx);
+                    e_dy = e_dy + _abs(dy);
+                    e_d1 = e_d1 + _abs(dx + dy) / _SQRT2;
+                    e_d2 = e_d2 + _abs(dx - dy) / _SQRT2;
+                    px = px + 1;
+                }
+                py = py + 1;
+            }
+            let norm_g = _max(4.0, e_dx + e_dy + 1e-5);
+            push(feat, _clamp(e_dx / norm_g, 0.0, 1.0));
+            push(feat, _clamp(e_dy / norm_g, 0.0, 1.0));
+            push(feat, _clamp(e_d1 / norm_g, 0.0, 1.0));
+            push(feat, _clamp(e_d2 / norm_g, 0.0, 1.0));
+            zx = zx + 1;
+        }
+        zy = zy + 1;
+    }
+
+    // 3) 18 Topological, Geometric & Scanline Crossing Invariants
+    push(feat, if holes.count == 0 { 1.0 } else { 0.0 });
+    push(feat, if holes.count == 1 { 1.0 } else { 0.0 });
+    push(feat, if holes.count >= 2 { 1.0 } else { 0.0 });
+    push(feat, holes.hole_cx);
+    push(feat, holes.hole_cy);
+    push(feat, _clamp(holes.hole_area_ratio * 2.5, 0.0, 1.0));
+    push(feat, _clamp((rbw / _max(rbh, 1.0)) / 3.5, 0.0, 1.0));
+    push(feat, _clamp((rbh / _max(rbw, 1.0)) / 3.5, 0.0, 1.0));
+    push(feat, raw_slant);
+    push(feat, _clamp(raw_tc.ink / _max(1.0, rbw * rbh), 0.0, 1.0));
+    push(feat, _clamp(r_cx / _max(1.0, rbw - 1.0), 0.0, 1.0));
+    push(feat, _clamp(r_cy / _max(1.0, rbh - 1.0), 0.0, 1.0));
+    push(feat, _clamp((sub_blobs - 1.0) / 2.0, 0.0, 1.0));
+
+    // Horizontal scanline runs at top (22%), middle (50%), bottom (78%) + Vertical at 22%, 50%, 78%
+    push(feat, _clamp(_scanline_runs_row(gbmp, (gh - 1.0) * 0.22) / 3.0, 0.0, 1.0));
+    push(feat, _clamp(_scanline_runs_row(gbmp, (gh - 1.0) * 0.50) / 3.0, 0.0, 1.0));
+    push(feat, _clamp(_scanline_runs_row(gbmp, (gh - 1.0) * 0.78) / 3.0, 0.0, 1.0));
+    push(feat, _clamp(_scanline_runs_col(gbmp, (gw - 1.0) * 0.50) / 3.0, 0.0, 1.0));
+    push(feat, _clamp((_scanline_runs_col(gbmp, (gw - 1.0) * 0.25) + _scanline_runs_col(gbmp, (gw - 1.0) * 0.75)) / 6.0, 0.0, 1.0));
+
+    return feat;
+}
+
+// ============================================================================
+// 6. 2-Layer MLP Forward Inference (154 -> 96 -> 48 -> 26, ReLU + Softmax)
+// ============================================================================
+
+fn _mlp_forward_logits(feat, wobj) {
+    let t_x = map{ shape: [1, FEATURE_DIM], data: feat, dtype: "f32" };
+    let t_w1 = map{ shape: [FEATURE_DIM, 96], data: wobj.w1, dtype: "f32" };
+    let z1 = tensor_matmul(t_x, t_w1).data;
+    let h1 = [];
+    let i = 0;
+    while i < 96 {
+        let v = z1[i] + wobj.b1[i];
+        push(h1, if v > 0.0 { v } else { 0.0 });
+        i = i + 1;
+    }
+
+    let t_h1 = map{ shape: [1, 96], data: h1, dtype: "f32" };
+    let t_w2 = map{ shape: [96, 48], data: wobj.w2, dtype: "f32" };
+    let z2 = tensor_matmul(t_h1, t_w2).data;
+    let h2 = [];
+    let j = 0;
+    while j < 48 {
+        let v2 = z2[j] + wobj.b2[j];
+        push(h2, if v2 > 0.0 { v2 } else { 0.0 });
+        j = j + 1;
+    }
+
+    let t_h2 = map{ shape: [1, 48], data: h2, dtype: "f32" };
+    let t_w3 = map{ shape: [48, NUM_CLASSES], data: wobj.w3, dtype: "f32" };
+    let z3 = tensor_matmul(t_h2, t_w3).data;
+    let logits = [];
+    let k = 0;
+    while k < NUM_CLASSES {
+        push(logits, z3[k] + wobj.b3[k]);
+        k = k + 1;
+    }
+    return logits;
+}
+
+fn _softmax_probs(logits) {
+    let max_l = logits[0];
+    let i = 1;
+    while i < len(logits) {
+        if logits[i] > max_l { max_l = logits[i]; }
+        i = i + 1;
+    }
+    let exps = [];
+    let sum_e = 0.0;
+    let j = 0;
+    while j < len(logits) {
+        let ev = num_exp(_clamp(logits[j] - max_l, -50.0, 50.0));
+        push(exps, ev);
+        sum_e = sum_e + ev;
+        j = j + 1;
+    }
+    let probs = [];
+    let k = 0;
+    while k < len(exps) {
+        push(probs, exps[k] / _max(sum_e, 1e-12));
+        k = k + 1;
+    }
+    return probs;
+}
+
+fn classify_glyph_features(feat, custom_weights = nil) {
+    let wobj = if custom_weights != nil {
+        custom_weights
+    } else {
+        let wm = _get_weights_module();
+        if wm == nil { throw "neural_handwriting_ocr: weights module not found"; }
+        wm.get_mlp_weights()
+    };
+    let logits = _mlp_forward_logits(feat, wobj);
+    let probs = _softmax_probs(logits);
+
+    // Find top-3 predictions
+    let best1 = 0; let best2 = -1; let best3 = -1;
+    let i = 1;
+    while i < NUM_CLASSES {
+        if probs[i] > probs[best1] { best1 = i; }
+        i = i + 1;
+    }
+    let j = 0;
+    while j < NUM_CLASSES {
+        if j != best1 and (best2 < 0 or probs[j] > probs[best2]) { best2 = j; }
+        j = j + 1;
+    }
+    let k = 0;
+    while k < NUM_CLASSES {
+        if k != best1 and k != best2 and (best3 < 0 or probs[k] > probs[best3]) { best3 = k; }
+        k = k + 1;
+    }
+
+    return map{
+        symbol: MATH_OCR_CLASSES[best1],
+        class_index: best1,
+        confidence: probs[best1],
+        top3: [
+            map{ symbol: MATH_OCR_CLASSES[best1], confidence: probs[best1] },
+            map{ symbol: MATH_OCR_CLASSES[best2], confidence: probs[best2] },
+            map{ symbol: MATH_OCR_CLASSES[best3], confidence: probs[best3] }
+        ],
+        probs: probs
+    };
+}
+
+fn classify_glyph_bitmap(comp_bmp, custom_weights = nil) {
+    let feat = extract_glyph_features(comp_bmp);
+    return classify_glyph_features(feat, custom_weights);
+}
+
+// ============================================================================
+// 7. Smart 2D Connected-Component Segmentation (`segment_math_components`)
+// ============================================================================
+
+fn _build_blob_from_pixels(id, pixels, full_w, full_h) {
+    let min_x = full_w; let max_x = -1;
+    let min_y = full_h; let max_y = -1;
+    let sx = 0.0; let sy = 0.0;
+    let i = 0;
+    while i < len(pixels) {
+        let px = pixels[i][0];
+        let py = pixels[i][1];
+        sx = sx + px;
+        sy = sy + py;
+        if px < min_x { min_x = px; }
+        if px > max_x { max_x = px; }
+        if py < min_y { min_y = py; }
+        if py > max_y { max_y = py; }
+        i = i + 1;
+    }
+    let bw = max_x - min_x + 1;
+    let bh = max_y - min_y + 1;
+    let bmp = [];
+    let y = 0;
+    while y < bh {
+        let row = [];
+        let x = 0;
+        while x < bw { push(row, 0); x = x + 1; }
+        push(bmp, row);
+        y = y + 1;
+    }
+    let j = 0;
+    while j < len(pixels) {
+        bmp[pixels[j][1] - min_y][pixels[j][0] - min_x] = 1;
+        j = j + 1;
+    }
+    return map{
+        id: id,
+        kind: "GLYPH",
+        x0: min_x,
+        y0: min_y,
+        x1: max_x,
+        y1: max_y,
+        w: bw,
+        h: bh,
+        area: len(pixels),
+        cx: sx / _max(1, len(pixels)),
+        cy: sy / _max(1, len(pixels)),
+        pixels: pixels,
+        bitmap: bmp,
+        enclosed_ids: []
+    };
+}
+
+fn _x_overlap(a, b) {
+    return _max(0, _min(a.x1, b.x1) - _max(a.x0, b.x0) + 1);
+}
+
+fn _is_horiz_bar(b) {
+    return b.w >= 5 and (b.w * 1.0) >= 2.0 * _max(1.0, b.h * 1.0);
+}
+
+fn _normalize_extended_sqrt_bitmap(comp, inner_x0) {
+    // Rescales an extended vinculum roof horizontally back to canonical single-glyph sqrt aspect
+    let split_local = _clamp(_round_int(inner_x0 - comp.x0), 3, comp.w - 1);
+    let target_tail = _max(6, _round_int(comp.h * 0.48));
+    let new_w = split_local + target_tail;
+    let out = [];
+    let y = 0;
+    while y < comp.h {
+        let row = [];
+        let x = 0;
+        while x < new_w {
+            if x < split_local {
+                push(row, comp.bitmap[y][x]);
+            } else {
+                let u = (x - split_local) / _max(1.0, target_tail - 1.0);
+                let src_x = _clamp(split_local + _round_int(u * (comp.w - 1 - split_local)), 0, comp.w - 1);
+                push(row, comp.bitmap[y][src_x]);
+            }
+            x = x + 1;
+        }
+        push(out, row);
+        y = y + 1;
+    }
+    return out;
+}
+
+// Extracts connected ink components via 8-connected flood-fill and applies smart 2D math grouping:
+// - Merges slightly lifted cap strokes (e.g. multi-stroke pi/5/sqrt within <= 3px vertical gap)
+// - Merges two vertically-stacked horizontal bars into '='
+// - Marks wide horizontal bars with ink strictly above AND below as 'FRACTION_BAR'
+// - Identifies 'SQRT_RADICAL' roofs enclosing inner radicand components!
+fn segment_math_components(bmp_in) {
+    let bin = preprocess_math_bitmap(bmp_in);
+    let h = len(bin);
+    if h == 0 { return []; }
+    let w = len(bin[0]);
+    if w == 0 { return []; }
+
+    let vis = [];
+    let y = 0;
+    while y < h {
+        let r = [];
+        let x = 0;
+        while x < w { push(r, 0); x = x + 1; }
+        push(vis, r);
+        y = y + 1;
+    }
+
+    let raw_blobs = [];
+    let sy = 0;
+    while sy < h {
+        let sx = 0;
+        while sx < w {
+            if bin[sy][sx] > 0 and vis[sy][sx] == 0 {
+                let qx = [sx];
+                let qy = [sy];
+                vis[sy][sx] = 1;
+                let pts = [];
+                let hd = 0;
+                while hd < len(qx) {
+                    let ux = qx[hd];
+                    let uy = qy[hd];
+                    hd = hd + 1;
+                    push(pts, [ux, uy]);
+                    let dy = -1;
+                    while dy <= 1 {
+                        let ny = uy + dy;
+                        if ny >= 0 and ny < h {
+                            let dx = -1;
+                            while dx <= 1 {
+                                let nx = ux + dx;
+                                if nx >= 0 and nx < w and bin[ny][nx] > 0 and vis[ny][nx] == 0 {
+                                    vis[ny][nx] = 1;
+                                    push(qx, nx);
+                                    push(qy, ny);
+                                }
+                                dx = dx + 1;
+                            }
+                        }
+                        dy = dy + 1;
+                    }
+                }
+                push(raw_blobs, _build_blob_from_pixels(len(raw_blobs), pts, w, h));
+            }
+            sx = sx + 1;
+        }
+        sy = sy + 1;
+    }
+
+    // Filter tiny residual dust blobs (<= 2 px) when real components exist
+    let blobs = [];
+    let bi = 0;
+    while bi < len(raw_blobs) {
+        if raw_blobs[bi].area > 2 or len(raw_blobs) == 1 {
+            push(blobs, raw_blobs[bi]);
+        }
+        bi = bi + 1;
+    }
+    if len(blobs) <= 1 { return blobs; }
+
+    // Sort left-to-right by x0
+    let s1 = 0;
+    while s1 < len(blobs) {
+        let s2 = s1 + 1;
+        while s2 < len(blobs) {
+            if blobs[s2].x0 < blobs[s1].x0 {
+                let tmp = blobs[s1];
+                blobs[s1] = blobs[s2];
+                blobs[s2] = tmp;
+            }
+            s2 = s2 + 1;
+        }
+        s1 = s1 + 1;
+    }
+
+    // Pass A: Reattach slightly lifted cap/leg strokes (<= 3px pixel distance & strong X overlap, NOT two parallel '=' bars)
+    let changed = true;
+    let guard = 0;
+    while changed and guard < 16 {
+        changed = false;
+        guard = guard + 1;
+        let i = 0;
+        while i < len(blobs) and not changed {
+            let j = i + 1;
+            while j < len(blobs) and not changed {
+                let a = blobs[i];
+                let b = blobs[j];
+                let xov = _x_overlap(a, b);
+                let min_w = _min(a.w, b.w);
+                let both_bars = _is_horiz_bar(a) and _is_horiz_bar(b);
+                let v_gap = _max(0, _max(a.y0 - b.y1, b.y0 - a.y1));
+                if not both_bars and xov >= 0.45 * min_w and v_gap <= 3 {
+                    // Check true minimum pixel-to-pixel Chebyshev distance <= 3
+                    let close_px = false;
+                    let pa = 0;
+                    while pa < len(a.pixels) and not close_px {
+                        let pb = 0;
+                        while pb < len(b.pixels) and not close_px {
+                            let dx = _abs(a.pixels[pa][0] - b.pixels[pb][0]);
+                            let dy = _abs(a.pixels[pa][1] - b.pixels[pb][1]);
+                            if dx <= 3 and dy <= 3 { close_px = true; }
+                            pb = pb + 1;
+                        }
+                        pa = pa + 1;
+                    }
+                    if close_px {
+                        let merged_pts = _concat_pts(a.pixels, b.pixels);
+                        blobs[i] = _build_blob_from_pixels(a.id, merged_pts, w, h);
+                        let next_blobs = [];
+                        let k = 0;
+                        while k < len(blobs) {
+                            if k != j { push(next_blobs, blobs[k]); }
+                            k = k + 1;
+                        }
+                        blobs = next_blobs;
+                        changed = true;
+                    }
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Pass B: Merge two vertically-stacked horizontal bars of similar width & strong X-overlap into '='
+    let used = [];
+    let ui = 0;
+    while ui < len(blobs) { push(used, false); ui = ui + 1; }
+    let merged_eq = [];
+
+    let ei = 0;
+    while ei < len(blobs) {
+        if not used[ei] {
+            let a = blobs[ei];
+            let best_j = -1;
+            if _is_horiz_bar(a) {
+                let ej = ei + 1;
+                while ej < len(blobs) {
+                    if not used[ej] and _is_horiz_bar(blobs[ej]) {
+                        let b = blobs[ej];
+                        let xov = _x_overlap(a, b);
+                        let min_w = _min(a.w, b.w) * 1.0;
+                        let max_w = _max(a.w, b.w) * 1.0;
+                        let top_b = if a.cy < b.cy { a } else { b };
+                        let bot_b = if a.cy < b.cy { b } else { a };
+                        let gap_y = bot_b.y0 - top_b.y1;
+                        if xov >= 0.55 * min_w and (min_w / max_w) >= 0.52 and gap_y >= 1 and gap_y <= _max(8.0, 1.35 * max_w) {
+                            // Ensure no third blob lies strictly between top_b and bot_b horizontally overlapping them
+                            let mid_blocked = false;
+                            let mk = 0;
+                            while mk < len(blobs) {
+                                if mk != ei and mk != ej and not used[mk] {
+                                    let c = blobs[mk];
+                                    if _x_overlap(c, top_b) >= 2 and c.cy > top_b.y0 and c.cy < bot_b.y1 {
+                                        mid_blocked = true;
+                                    }
+                                }
+                                mk = mk + 1;
+                            }
+                            if not mid_blocked {
+                                best_j = ej;
+                            }
+                        }
+                    }
+                    ej = ej + 1;
+                }
+            }
+            if best_j >= 0 {
+                used[ei] = true;
+                used[best_j] = true;
+                let eq_blob = _build_blob_from_pixels(a.id, _concat_pts(a.pixels, blobs[best_j].pixels), w, h);
+                eq_blob.kind = "EQUALS";
+                push(merged_eq, eq_blob);
+            } else {
+                used[ei] = true;
+                push(merged_eq, a);
+            }
+        }
+        ei = ei + 1;
+    }
+
+    // Re-assign sequential IDs sorted left-to-right
+    let si2 = 0;
+    while si2 < len(merged_eq) {
+        let sj2 = si2 + 1;
+        while sj2 < len(merged_eq) {
+            if merged_eq[sj2].x0 < merged_eq[si2].x0 {
+                let t2 = merged_eq[si2];
+                merged_eq[si2] = merged_eq[sj2];
+                merged_eq[sj2] = t2;
+            }
+            sj2 = sj2 + 1;
+        }
+        merged_eq[si2].id = si2;
+        si2 = si2 + 1;
+    }
+
+    // Pass C: Detect structural SQRT_RADICAL roofs enclosing inner radicand components
+    let ri = 0;
+    while ri < len(merged_eq) {
+        let r = merged_eq[ri];
+        if r.kind == "GLYPH" and r.w >= 14 and r.h >= 10 {
+            let enclosed = [];
+            let inner_min_x = r.x1;
+            let rj = 0;
+            while rj < len(merged_eq) {
+                if rj != ri {
+                    let c = merged_eq[rj];
+                    if c.cx >= r.x0 + 0.16 * r.w and c.cx <= r.x1 + 0.15 * r.h
+                       and c.cy >= r.y0 + 2 and c.cy <= r.y1 + 0.30 * r.h
+                       and (c.w < 0.92 * r.w or c.h < 0.90 * r.h) {
+                        push(enclosed, c.id);
+                        if c.x0 < inner_min_x { inner_min_x = c.x0; }
+                    }
+                }
+                rj = rj + 1;
+            }
+            if len(enclosed) > 0 {
+                // Verify radical signature: left region descends low AND top roof spans over enclosed region
+                let has_left_hook = false;
+                let roof_cols = 0;
+                let span_cols = _max(1, r.x1 - inner_min_x + 1);
+                let px = inner_min_x - r.x0;
+                while px < r.w {
+                    if px >= 0 {
+                        let has_top_ink = false;
+                        let py = 0;
+                        while py <= _min(r.h - 1, _round_int(r.h * 0.36)) {
+                            if r.bitmap[py][px] > 0 { has_top_ink = true; }
+                            py = py + 1;
+                        }
+                        if has_top_ink { roof_cols = roof_cols + 1; }
+                    }
+                    px = px + 1;
+                }
+                let ly = _round_int(r.h * 0.65);
+                while ly < r.h {
+                    let lx = 0;
+                    while lx <= _min(r.w - 1, _max(2, inner_min_x - r.x0 + 2)) {
+                        if r.bitmap[ly][lx] > 0 { has_left_hook = true; }
+                        lx = lx + 1;
+                    }
+                    ly = ly + 1;
+                }
+                if has_left_hook and roof_cols >= 0.45 * span_cols {
+                    r.kind = "SQRT_RADICAL";
+                    r.enclosed_ids = enclosed;
+                    r.norm_sqrt_bitmap = _normalize_extended_sqrt_bitmap(r, inner_min_x);
+                }
+            }
+        }
+        ri = ri + 1;
+    }
+
+    // Pass D: Detect structural FRACTION_BAR (wide horizontal bar with >=1 component strictly above AND >=1 strictly below)
+    let fi = 0;
+    while fi < len(merged_eq) {
+        let f = merged_eq[fi];
+        if f.kind == "GLYPH" and f.w >= 10 and (f.w * 1.0) >= 2.2 * _max(1.0, f.h * 1.0) {
+            let above_ids = [];
+            let below_ids = [];
+            let fj = 0;
+            while fj < len(merged_eq) {
+                if fj != fi {
+                    let c = merged_eq[fj];
+                    let xov = _x_overlap(c, f);
+                    let horiz_in = (xov >= 0.30 * _min(c.w, f.w)) or (c.cx >= f.x0 - 2 and c.cx <= f.x1 + 2);
+                    if horiz_in {
+                        if c.cy < f.y0 and c.y1 <= f.y1 + 2 {
+                            push(above_ids, c.id);
+                        } else {
+                            if c.cy > f.y1 and c.y0 >= f.y0 - 2 {
+                                push(below_ids, c.id);
+                            }
+                        }
+                    }
+                }
+                fj = fj + 1;
+            }
+            if len(above_ids) > 0 and len(below_ids) > 0 {
+                f.kind = "FRACTION_BAR";
+            }
+        }
+        fi = fi + 1;
+    }
+
+    return merged_eq;
+}
+
+// ============================================================================
+// 8. 2D Spatial Mathematical Grammar & Expression Parser
+// ============================================================================
+
+fn _contains_id(arr, id) {
+    let i = 0;
+    while i < len(arr) {
+        if arr[i] == id { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _is_base_for_superscript(node) {
+    if node.kind == "frac" or node.kind == "sqrt" { return true; }
+    let s = node.symbol;
+    if s == ")" or s == "x" or s == "y" or s == "a" or s == "b" or s == "pi" { return true; }
+    if s == "0" or s == "1" or s == "2" or s == "3" or s == "4" or s == "5" or s == "6" or s == "7" or s == "8" or s == "9" {
+        return true;
+    }
+    return false;
+}
+
+fn _is_binary_spacing_op(sym) {
+    return sym == "+" or sym == "-" or sym == "=" or sym == "<" or sym == ">";
+}
+
+fn _is_operator_token(sym) {
+    return sym == "+" or sym == "-" or sym == "*" or sym == "/" or sym == "=" or sym == "<" or sym == ">" or sym == "(" or sym == "^";
+}
+
+fn _format_baseline_tokens(items) {
+    if len(items) == 0 { return ""; }
+    let out = "";
+    let i = 0;
+    while i < len(items) {
+        let cur = items[i];
+        let tok = cur.expr;
+        if i == 0 {
+            out = tok;
+        } else {
+            let prev = items[i - 1];
+            let ps = prev.symbol;
+            let cs = cur.symbol;
+            // Unary minus right after raw '(' or '=' or '<' or '>' or '^' operator symbol
+            let is_unary_minus = (cs == "-" and prev.kind == "symbol" and _is_operator_token(ps));
+            if is_unary_minus {
+                if ps == "(" or ps == "^" {
+                    out = out + "-";
+                } else {
+                    out = out + " -";
+                }
+            } else {
+                if _is_binary_spacing_op(cs) {
+                    out = out + " " + tok;
+                } else {
+                    if _is_binary_spacing_op(ps) {
+                        out = out + " " + tok;
+                    } else {
+                        // Implicit multiplication handling for 'pi' followed by symbol/digit
+                        if (ps == "pi" and (cs == "x" or cs == "y" or cs == "a" or cs == "b" or cs == "pi")) {
+                            out = out + "*" + tok;
+                        } else {
+                            out = out + tok;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _needs_parens_in_frac(expr_str, item_count) {
+    if item_count <= 1 { return false; }
+    // Check if already wrapped in matching outer parens
+    if len(expr_str) >= 2 and str_slice(expr_str, 0, 1) == "(" and str_slice(expr_str, len(expr_str) - 1, len(expr_str)) == ")" {
+        let depth = 0;
+        let all_inside = true;
+        let i = 0;
+        while i < len(expr_str) {
+            let ch = str_slice(expr_str, i, i + 1);
+            if ch == "(" { depth = depth + 1; }
+            else {
+                if ch == ")" {
+                    depth = depth - 1;
+                    if depth == 0 and i + 1 < len(expr_str) { all_inside = false; }
+                }
+            }
+            i = i + 1;
+        }
+        if all_inside and depth == 0 { return false; }
+    }
+    // Check if single multi-digit number like "12" or single term like "2x" or "x^2" without +, -, *, /
+    let has_low_prec = (str_index_of(expr_str, "+") >= 0 or str_index_of(expr_str, "-") >= 0 or str_index_of(expr_str, "/") >= 0);
+    return has_low_prec;
+}
+
+fn _parse_2d_subset(comps, conf_accum, layout_nodes, wobj, depth) {
+    if len(comps) == 0 or depth > 12 { return ""; }
+
+    // Sort subset left-to-right by x0
+    let sorted = [];
+    let ci = 0;
+    while ci < len(comps) { push(sorted, comps[ci]); ci = ci + 1; }
+    let a = 0;
+    while a < len(sorted) {
+        let b = a + 1;
+        while b < len(sorted) {
+            if sorted[b].x0 < sorted[a].x0 {
+                let t = sorted[a];
+                sorted[a] = sorted[b];
+                sorted[b] = t;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+
+    let consumed = [];
+    let k0 = 0;
+    while k0 < len(sorted) { push(consumed, false); k0 = k0 + 1; }
+
+    let stage_items = [];
+
+    // 1. Group widest enclosing FRACTION_BARs first, then SQRT_RADICALs, then individual symbols
+    let idx = 0;
+    while idx < len(sorted) {
+        if not consumed[idx] {
+            let c = sorted[idx];
+            if c.kind == "FRACTION_BAR" {
+                // Collect all unconsumed components horizontally overlapping this fraction bar
+                let num_comps = [];
+                let den_comps = [];
+                let m = 0;
+                while m < len(sorted) {
+                    if m != idx and not consumed[m] {
+                        let sub = sorted[m];
+                        let xov = _x_overlap(sub, c);
+                        let horiz_in = (xov >= 0.28 * _min(sub.w, c.w)) or (sub.cx >= c.x0 - 4 and sub.cx <= c.x1 + 4);
+                        if horiz_in {
+                            if sub.cy < c.y0 {
+                                push(num_comps, sub);
+                                consumed[m] = true;
+                            } else {
+                                if sub.cy > c.y1 {
+                                    push(den_comps, sub);
+                                    consumed[m] = true;
+                                }
+                            }
+                        }
+                    }
+                    m = m + 1;
+                }
+                if len(num_comps) > 0 and len(den_comps) > 0 {
+                    consumed[idx] = true;
+                    let bar_cls = classify_glyph_bitmap(c.bitmap, wobj);
+                    let bar_conf = _max(0.96, bar_cls.confidence);
+                    push(conf_accum, map{ symbol: "/", role: "fraction_bar", confidence: bar_conf, bbox: [c.x0, c.y0, c.x1, c.y1] });
+
+                    let num_str = _parse_2d_subset(num_comps, conf_accum, layout_nodes, wobj, depth + 1);
+                    let den_str = _parse_2d_subset(den_comps, conf_accum, layout_nodes, wobj, depth + 1);
+                    let num_wrapped = if _needs_parens_in_frac(num_str, len(num_comps)) { "(" + num_str + ")" } else { num_str };
+                    let den_wrapped = if _needs_parens_in_frac(den_str, len(den_comps)) { "(" + den_str + ")" } else { den_str };
+                    let frac_expr = num_wrapped + "/" + den_wrapped;
+
+                    let min_fx = c.x0; let max_fx = c.x1;
+                    let min_fy = c.y0; let max_fy = c.y1;
+                    let ni = 0;
+                    while ni < len(num_comps) {
+                        if num_comps[ni].x0 < min_fx { min_fx = num_comps[ni].x0; }
+                        if num_comps[ni].x1 > max_fx { max_fx = num_comps[ni].x1; }
+                        if num_comps[ni].y0 < min_fy { min_fy = num_comps[ni].y0; }
+                        ni = ni + 1;
+                    }
+                    let di = 0;
+                    while di < len(den_comps) {
+                        if den_comps[di].x0 < min_fx { min_fx = den_comps[di].x0; }
+                        if den_comps[di].x1 > max_fx { max_fx = den_comps[di].x1; }
+                        if den_comps[di].y1 > max_fy { max_fy = den_comps[di].y1; }
+                        di = di + 1;
+                    }
+                    let fnode = map{
+                        kind: "frac",
+                        symbol: "frac",
+                        expr: frac_expr,
+                        numerator: num_str,
+                        denominator: den_str,
+                        x0: min_fx, y0: min_fy, x1: max_fx, y1: max_fy,
+                        w: max_fx - min_fx + 1, h: max_fy - min_fy + 1,
+                        cx: 0.5 * (min_fx + max_fx), cy: 0.5 * (min_fy + max_fy)
+                    };
+                    push(layout_nodes, fnode);
+                    push(stage_items, fnode);
+                }
+            }
+        }
+        idx = idx + 1;
+    }
+
+    // 2. Group SQRT_RADICAL roofs and remaining atomic symbols
+    let idx2 = 0;
+    while idx2 < len(sorted) {
+        if not consumed[idx2] {
+            let c = sorted[idx2];
+            if c.kind == "SQRT_RADICAL" and len(c.enclosed_ids) > 0 {
+                let rad_comps = [];
+                let m2 = 0;
+                while m2 < len(sorted) {
+                    if m2 != idx2 and not consumed[m2] and _contains_id(c.enclosed_ids, sorted[m2].id) {
+                        push(rad_comps, sorted[m2]);
+                        consumed[m2] = true;
+                    }
+                    m2 = m2 + 1;
+                }
+                if len(rad_comps) > 0 {
+                    consumed[idx2] = true;
+                    let sqrt_bmp = if map_has(c, "norm_sqrt_bitmap") { c.norm_sqrt_bitmap } else { c.bitmap };
+                    let s_cls = classify_glyph_bitmap(sqrt_bmp, wobj);
+                    let s_conf = if s_cls.symbol == "sqrt" { s_cls.confidence } else { _max(0.95, s_cls.confidence) };
+                    push(conf_accum, map{ symbol: "sqrt", role: "radical", confidence: s_conf, bbox: [c.x0, c.y0, c.x1, c.y1] });
+
+                    let inner_str = _parse_2d_subset(rad_comps, conf_accum, layout_nodes, wobj, depth + 1);
+                    let rad_expr = "sqrt(" + inner_str + ")";
+                    let rnode = map{
+                        kind: "sqrt",
+                        symbol: "sqrt",
+                        expr: rad_expr,
+                        radicand: inner_str,
+                        x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1,
+                        w: c.w, h: c.h,
+                        cx: c.cx, cy: c.cy
+                    };
+                    push(layout_nodes, rnode);
+                    push(stage_items, rnode);
+                }
+            }
+            if not consumed[idx2] {
+                consumed[idx2] = true;
+                let pred = classify_glyph_bitmap(c.bitmap, wobj);
+                let sym = pred.symbol;
+                let conf = pred.confidence;
+                if c.kind == "EQUALS" and sym != "=" {
+                    sym = "=";
+                    conf = _max(0.95, conf);
+                }
+                push(conf_accum, map{
+                    symbol: sym,
+                    role: "glyph",
+                    confidence: conf,
+                    bbox: [c.x0, c.y0, c.x1, c.y1]
+                });
+                let gnode = map{
+                    kind: "symbol",
+                    symbol: sym,
+                    expr: sym,
+                    confidence: conf,
+                    x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1,
+                    w: c.w, h: c.h,
+                    cx: c.cx, cy: c.cy
+                };
+                push(layout_nodes, gnode);
+                push(stage_items, gnode);
+            }
+        }
+        idx2 = idx2 + 1;
+    }
+
+    // Sort stage_items left-to-right by x0
+    let p1 = 0;
+    while p1 < len(stage_items) {
+        let p2 = p1 + 1;
+        while p2 < len(stage_items) {
+            if stage_items[p2].x0 < stage_items[p1].x0 {
+                let ts = stage_items[p1];
+                stage_items[p1] = stage_items[p2];
+                stage_items[p2] = ts;
+            }
+            p2 = p2 + 1;
+        }
+        p1 = p1 + 1;
+    }
+
+    // 3. Detect 2D Superscripts / Exponents (e.g., x^2, (x+1)^2)
+    let baseline_items = [];
+    let k = 0;
+    while k < len(stage_items) {
+        let base = stage_items[k];
+        if _is_base_for_superscript(base) and k + 1 < len(stage_items) {
+            let nxt = stage_items[k + 1];
+            let disallowed_sup = (nxt.symbol == "=" or nxt.symbol == "<" or nxt.symbol == ">" or nxt.symbol == "^" or nxt.symbol == "+" or nxt.symbol == "*" or nxt.symbol == "/");
+            // '-' only starts a superscript if elevated AND followed immediately by an elevated digit/var (e.g. x^{-1})
+            if nxt.symbol == "-" {
+                if k + 2 >= len(stage_items) {
+                    disallowed_sup = true;
+                } else {
+                    let after_minus = stage_items[k + 2];
+                    if not (after_minus.cy < base.y0 + 0.42 * base.h and after_minus.y1 < base.y0 + 0.72 * base.h) {
+                        disallowed_sup = true;
+                    }
+                }
+            }
+
+            let is_elevated = (not disallowed_sup)
+                and (nxt.cy < base.y0 + 0.40 * base.h)
+                and (nxt.y1 < base.y0 + 0.72 * base.h)
+                and (nxt.h <= 0.88 * base.h)
+                and (nxt.x0 <= base.x1 + 1.15 * _max(base.h, base.w));
+
+            if is_elevated {
+                let sup_tokens = [nxt];
+                let sup_ref_y1 = nxt.y1;
+                let m = k + 2;
+                let keep_sup = true;
+                while m < len(stage_items) and keep_sup {
+                    let cand = stage_items[m];
+                    if cand.cy < base.y0 + 0.44 * base.h and cand.y1 <= _max(sup_ref_y1 + 6, base.y0 + 0.72 * base.h)
+                       and cand.x0 <= sup_tokens[len(sup_tokens) - 1].x1 + 1.1 * base.h {
+                        push(sup_tokens, cand);
+                        m = m + 1;
+                    } else {
+                        keep_sup = false;
+                    }
+                }
+                let sup_expr = _format_baseline_tokens(sup_tokens);
+                let wrapped_sup = if len(sup_tokens) > 1 { "(" + sup_expr + ")" } else { sup_expr };
+                let pow_expr = base.expr + "^" + wrapped_sup;
+                let last_s = sup_tokens[len(sup_tokens) - 1];
+                let pnode = map{
+                    kind: "superscript",
+                    symbol: "^",
+                    expr: pow_expr,
+                    base: base.expr,
+                    exponent: sup_expr,
+                    x0: base.x0,
+                    y0: _min(base.y0, nxt.y0),
+                    x1: last_s.x1,
+                    y1: base.y1,
+                    w: last_s.x1 - base.x0 + 1,
+                    h: base.y1 - _min(base.y0, nxt.y0) + 1,
+                    cx: 0.5 * (base.x0 + last_s.x1),
+                    cy: base.cy
+                };
+                push(layout_nodes, pnode);
+                push(baseline_items, pnode);
+                k = m;
+            } else {
+                push(baseline_items, base);
+                k = k + 1;
+            }
+        } else {
+            push(baseline_items, base);
+            k = k + 1;
+        }
+    }
+
+    return _format_baseline_tokens(baseline_items);
+}
+
+fn _expr_to_latex_safe(expr_str) {
+    if expr_str == "" { return ""; }
+    let cas = _get_cas();
+    if cas != nil {
+        let ltx = try cas.to_latex(cas.parse_math(expr_str)) catch nil;
+        if ltx != nil and type(ltx) == "string" and ltx != "" {
+            return ltx;
+        }
+    }
+    return str_replace_all(expr_str, "pi", "\\pi");
+}
+
+// Recognizes a 1D or 2D handwritten mathematical expression from a bitmap or BMP bytes.
+fn recognize_handwritten_bitmap(bmp, opts = nil) {
+    let custom_w = if opts != nil and map_has(opts, "weights") { opts.weights } else { nil };
+    let wobj = if custom_w != nil {
+        custom_w
+    } else {
+        let wm = _get_weights_module();
+        if wm == nil { throw "recognize_handwritten_bitmap: weights module not found"; }
+        wm.get_mlp_weights()
+    };
+
+    let comps = segment_math_components(bmp);
+    if len(comps) == 0 {
+        return map{
+            ok: false,
+            recognized_expr: "",
+            recognized_latex: "",
+            symbol_confidences: [],
+            mean_confidence: 0.0,
+            layout_2d_nodes: [],
+            component_count: 0
+        };
+    }
+
+    let conf_accum = [];
+    let layout_nodes = [];
+    let expr = _parse_2d_subset(comps, conf_accum, layout_nodes, wobj, 0);
+
+    let sum_c = 0.0;
+    let i = 0;
+    while i < len(conf_accum) {
+        sum_c = sum_c + conf_accum[i].confidence;
+        i = i + 1;
+    }
+    let mean_c = if len(conf_accum) > 0 { sum_c / len(conf_accum) } else { 0.0 };
+
+    return map{
+        ok: expr != "",
+        recognized_expr: expr,
+        recognized_latex: _expr_to_latex_safe(expr),
+        symbol_confidences: conf_accum,
+        mean_confidence: mean_c,
+        layout_2d_nodes: layout_nodes,
+        component_count: len(comps)
+    };
+}
+
+// Recognizes freehand polyline strokes [[[x0,y0], [x1,y1], ...], ...] directly.
+fn recognize_handwritten_strokes(strokes, width = nil, height = nil, opts = nil) {
+    if strokes == nil or len(strokes) == 0 {
+        return map{
+            ok: false,
+            recognized_expr: "",
+            recognized_latex: "",
+            symbol_confidences: [],
+            mean_confidence: 0.0,
+            layout_2d_nodes: [],
+            component_count: 0
+        };
+    }
+    // Auto-bound canvas if width/height not provided
+    let max_x = 40.0;
+    let max_y = 40.0;
+    let min_x = 1e9;
+    let min_y = 1e9;
+    let si = 0;
+    while si < len(strokes) {
+        let pi = 0;
+        while pi < len(strokes[si]) {
+            let px = strokes[si][pi][0];
+            let py = strokes[si][pi][1];
+            if px > max_x { max_x = px; }
+            if py > max_y { max_y = py; }
+            if px < min_x { min_x = px; }
+            if py < min_y { min_y = py; }
+            pi = pi + 1;
+        }
+        si = si + 1;
+    }
+
+    let cw = if width != nil { _round_int(width) } else { _round_int(max_x + _max(14.0, min_x)) };
+    let ch = if height != nil { _round_int(height) } else { _round_int(max_y + _max(14.0, min_y)) };
+    let pen_r = if opts != nil and map_has(opts, "stroke_radius") { opts.stroke_radius } else { 1.65 };
+    let rast = strokes_to_bitmap(strokes, _max(32, cw), _max(32, ch), map{
+        stroke_radius: pen_r,
+        paper_level: 250.0,
+        ink_level: 16.0,
+        noise_prob: 0.0
+    });
+    return recognize_handwritten_bitmap(rast.binary_bitmap, opts);
+}
+
+// End-to-end Handwritten Math OCR -> Symbolic CAS Equation/Inequality Solver & Step-by-Step Transformer.
+fn solve_handwritten_math(input_bmp_or_strokes, opts = nil) {
+    let is_stroke_list = (
+        type(input_bmp_or_strokes) == "array"
+        and len(input_bmp_or_strokes) > 0
+        and type(input_bmp_or_strokes[0]) == "array"
+        and len(input_bmp_or_strokes[0]) > 0
+        and type(input_bmp_or_strokes[0][0]) == "array"
+        and len(input_bmp_or_strokes[0][0]) == 2
+    );
+
+    let rec = if is_stroke_list {
+        recognize_handwritten_strokes(input_bmp_or_strokes, nil, nil, opts)
+    } else {
+        recognize_handwritten_bitmap(input_bmp_or_strokes, opts)
+    };
+
+    if not rec.ok or rec.recognized_expr == "" {
+        return map{
+            ok: false,
+            recognized_expr: "",
+            recognized_latex: "",
+            symbol_confidences: rec.symbol_confidences,
+            mean_confidence: rec.mean_confidence,
+            layout_2d_nodes: rec.layout_2d_nodes,
+            cas_solution: nil,
+            steps: []
+        };
+    }
+
+    let expr = rec.recognized_expr;
+    let cas = _get_cas();
+    let cas_sol = nil;
+    let steps = [];
+
+    if cas != nil {
+        let is_rel = (str_index_of(expr, "=") >= 0 or str_index_of(expr, "<") >= 0 or str_index_of(expr, ">") >= 0);
+        if is_rel {
+            cas_sol = try cas.solve(expr) catch map{ ok: false, status: "parse_or_solve_error", expr: expr };
+        } else {
+            let goal = if opts != nil and map_has(opts, "goal") { opts.goal } else { "simplify" };
+            cas_sol = try cas.transform(expr, goal) catch map{ ok: false, status: "parse_or_transform_error", expr: expr };
+        }
+        if cas_sol != nil and type(cas_sol) == "map" and map_has(cas_sol, "steps") {
+            steps = cas_sol.steps;
+        }
+    }
+
+    return map{
+        ok: true,
+        recognized_expr: expr,
+        recognized_latex: rec.recognized_latex,
+        symbol_confidences: rec.symbol_confidences,
+        mean_confidence: rec.mean_confidence,
+        layout_2d_nodes: rec.layout_2d_nodes,
+        cas_solution: cas_sol,
+        steps: steps
+    };
+}
+
+// ============================================================================
+// 9. 2D Spatial Handwritten Expression Synthesizer (`render_handwritten_expression_bitmap`)
+// ============================================================================
+
+fn _tokenize_layout_expr(s) {
+    let toks = [];
+    let n = len(s);
+    let i = 0;
+    while i < n {
+        let ch = str_slice(s, i, i + 1);
+        if ch == " " or ch == "\t" or ch == "\n" {
+            i = i + 1;
+        } else {
+            if i + 4 <= n and str_slice(s, i, i + 4) == "sqrt" {
+                push(toks, "sqrt");
+                i = i + 4;
+            } else {
+                if i + 2 <= n and str_slice(s, i, i + 2) == "pi" {
+                    push(toks, "pi");
+                    i = i + 2;
+                } else {
+                    push(toks, ch);
+                    i = i + 1;
+                }
+            }
+        }
+    }
+    return toks;
+}
+
+// Parses expression into a 2D spatial layout box tree preserving exact user tokens (implicit 2x, 2D frac, 2D sup, 2D sqrt).
+fn _parse_layout_rel(toks, st) {
+    let lhs = _parse_layout_add(toks, st);
+    while st.pos < len(toks) and (toks[st.pos] == "=" or toks[st.pos] == "<" or toks[st.pos] == ">") {
+        let op = toks[st.pos];
+        st.pos = st.pos + 1;
+        let rhs = _parse_layout_add(toks, st);
+        lhs = map{ kind: "seq", items: [lhs, map{ kind: "sym", sym: op }, rhs] };
+    }
+    return lhs;
+}
+
+fn _parse_layout_add(toks, st) {
+    let items = [];
+    if st.pos < len(toks) and toks[st.pos] == "-" {
+        st.pos = st.pos + 1;
+        push(items, map{ kind: "sym", sym: "-" });
+    }
+    push(items, _parse_layout_mul(toks, st));
+    while st.pos < len(toks) and (toks[st.pos] == "+" or toks[st.pos] == "-") {
+        let op = toks[st.pos];
+        st.pos = st.pos + 1;
+        push(items, map{ kind: "sym", sym: op });
+        push(items, _parse_layout_mul(toks, st));
+    }
+    if len(items) == 1 { return items[0]; }
+    return map{ kind: "seq", items: items };
+}
+
+fn _is_implicit_factor_next(tok) {
+    return tok == "x" or tok == "y" or tok == "a" or tok == "b" or tok == "pi" or tok == "sqrt" or tok == "("
+        or tok == "0" or tok == "1" or tok == "2" or tok == "3" or tok == "4"
+        or tok == "5" or tok == "6" or tok == "7" or tok == "8" or tok == "9";
+}
+
+fn _unwrap_paren_box(node) {
+    if node.kind == "paren" { return node.inner; }
+    return node;
+}
+
+fn _parse_layout_mul(toks, st) {
+    let cur = _parse_layout_pow(toks, st);
+    let keep = true;
+    while st.pos < len(toks) and keep {
+        let tk = toks[st.pos];
+        if tk == "*" {
+            st.pos = st.pos + 1;
+            let rhs = _parse_layout_pow(toks, st);
+            cur = map{ kind: "seq", items: [cur, map{ kind: "sym", sym: "*" }, rhs] };
+        } else {
+            if tk == "/" {
+                st.pos = st.pos + 1;
+                let rhs = _parse_layout_pow(toks, st);
+                if st.inline_slash {
+                    cur = map{ kind: "seq", items: [cur, map{ kind: "sym", sym: "/" }, rhs] };
+                } else {
+                    cur = map{ kind: "frac", num: _unwrap_paren_box(cur), den: _unwrap_paren_box(rhs) };
+                }
+            } else {
+                if _is_implicit_factor_next(tk) {
+                    let rhs2 = _parse_layout_pow(toks, st);
+                    cur = map{ kind: "seq", items: [cur, rhs2] };
+                } else {
+                    keep = false;
+                }
+            }
+        }
+    }
+    return cur;
+}
+
+fn _parse_layout_pow(toks, st) {
+    let base = _parse_layout_atom(toks, st);
+    if st.pos < len(toks) and toks[st.pos] == "^" {
+        st.pos = st.pos + 1;
+        let exp_node = _parse_layout_atom(toks, st);
+        if st.explicit_caret {
+            return map{ kind: "seq", items: [base, map{ kind: "sym", sym: "^" }, exp_node] };
+        }
+        return map{ kind: "sup", base: base, exp: _unwrap_paren_box(exp_node) };
+    }
+    return base;
+}
+
+fn _parse_layout_atom(toks, st) {
+    if st.pos >= len(toks) { return map{ kind: "sym", sym: "0" }; }
+    let tk = toks[st.pos];
+    if tk == "(" {
+        st.pos = st.pos + 1;
+        let inner = _parse_layout_rel(toks, st);
+        if st.pos < len(toks) and toks[st.pos] == ")" { st.pos = st.pos + 1; }
+        return map{ kind: "paren", inner: inner };
+    }
+    if tk == "sqrt" {
+        st.pos = st.pos + 1;
+        if st.pos < len(toks) and toks[st.pos] == "(" {
+            st.pos = st.pos + 1;
+            let rad = _parse_layout_rel(toks, st);
+            if st.pos < len(toks) and toks[st.pos] == ")" { st.pos = st.pos + 1; }
+            return map{ kind: "sqrt", inner: rad };
+        }
+        let rad2 = _parse_layout_atom(toks, st);
+        return map{ kind: "sqrt", inner: rad2 };
+    }
+    st.pos = st.pos + 1;
+    return map{ kind: "sym", sym: tk };
+}
+
+fn _shift_strokes(strokes, dx, dy) {
+    let out = [];
+    let i = 0;
+    while i < len(strokes) {
+        let s = [];
+        let j = 0;
+        while j < len(strokes[i]) {
+            push(s, [strokes[i][j][0] + dx, strokes[i][j][1] + dy]);
+            j = j + 1;
+        }
+        push(out, s);
+        i = i + 1;
+    }
+    return out;
+}
+
+// Recursively lays out 2D freehand strokes returning map{ w, h, mid_y, strokes }
+fn _layout_box_strokes(node, scale, seed_box, style_opts) {
+    if node.kind == "sym" {
+        let sym = node.sym;
+        seed_box.counter = seed_box.counter + 1;
+        let g_h = _max(22, _round_int(44.0 * scale));
+        let g_w = if sym == "1" or sym == "(" or sym == ")" {
+            _max(16, _round_int(30.0 * scale))
+        } else {
+            if sym == "-" or sym == "=" {
+                _max(22, _round_int(40.0 * scale))
+            } else {
+                _max(22, _round_int(40.0 * scale))
+            }
+        };
+        let jitter = if style_opts != nil and map_has(style_opts, "jitter") { style_opts.jitter } else { 0.72 };
+        let g = synthesize_handwritten_glyph(sym, seed_box.base_seed + seed_box.counter * 37, map{
+            width: g_w,
+            height: g_h,
+            jitter: jitter,
+            stroke_radius: 1.45
+        });
+        return map{
+            w: g_w * 1.0,
+            h: g_h * 1.0,
+            mid_y: g_h * 0.5,
+            strokes: g.strokes
+        };
+    }
+
+    if node.kind == "paren" {
+        let inner = _layout_box_strokes(node.inner, scale, seed_box, style_opts);
+        let ph = _max(inner.h + 6.0, 44.0 * scale);
+        let pw = _max(16.0, 26.0 * scale);
+        seed_box.counter = seed_box.counter + 1;
+        let lp = synthesize_handwritten_glyph("(", seed_box.base_seed + seed_box.counter * 37, map{ width: pw, height: ph, jitter: 0.55 });
+        seed_box.counter = seed_box.counter + 1;
+        let rp = synthesize_handwritten_glyph(")", seed_box.base_seed + seed_box.counter * 37, map{ width: pw, height: ph, jitter: 0.55 });
+
+        let mid = ph * 0.5;
+        let gap = 4.0 * scale;
+        let inner_y = mid - inner.mid_y;
+        let all_s = _concat_pts(
+            lp.strokes,
+            _concat_pts(
+                _shift_strokes(inner.strokes, pw + gap, inner_y),
+                _shift_strokes(rp.strokes, pw + gap + inner.w + gap, 0.0)
+            )
+        );
+        return map{
+            w: pw + gap + inner.w + gap + pw,
+            h: ph,
+            mid_y: mid,
+            strokes: all_s
+        };
+    }
+
+    if node.kind == "seq" {
+        let boxes = [];
+        let max_above = 0.0;
+        let max_below = 0.0;
+        let i = 0;
+        while i < len(node.items) {
+            let b = _layout_box_strokes(node.items[i], scale, seed_box, style_opts);
+            push(boxes, b);
+            if b.mid_y > max_above { max_above = b.mid_y; }
+            if (b.h - b.mid_y) > max_below { max_below = b.h - b.mid_y; }
+            i = i + 1;
+        }
+        let total_h = max_above + max_below;
+        let cur_x = 0.0;
+        let all_s = [];
+        let j = 0;
+        while j < len(boxes) {
+            let dy = max_above - boxes[j].mid_y;
+            all_s = _concat_pts(all_s, _shift_strokes(boxes[j].strokes, cur_x, dy));
+            let next_gap = 7.0 * scale;
+            if j + 1 < len(node.items) {
+                let is_op_a = (node.items[j].kind == "sym" and _is_binary_spacing_op(node.items[j].sym));
+                let is_op_b = (node.items[j + 1].kind == "sym" and _is_binary_spacing_op(node.items[j + 1].sym));
+                if is_op_a or is_op_b { next_gap = 10.0 * scale; }
+            }
+            cur_x = cur_x + boxes[j].w + next_gap;
+            j = j + 1;
+        }
+        if len(boxes) > 0 { cur_x = cur_x - 7.0 * scale; }
+        return map{
+            w: _max(10.0, cur_x),
+            h: total_h,
+            mid_y: max_above,
+            strokes: all_s
+        };
+    }
+
+    if node.kind == "sup" {
+        let b_box = _layout_box_strokes(node.base, scale, seed_box, style_opts);
+        let e_box = _layout_box_strokes(node.exp, _max(0.62, scale * 0.65), seed_box, style_opts);
+        let top_lift = _max(12.0 * scale, e_box.h * 0.62);
+        let base_y = top_lift;
+        let exp_x = b_box.w + 3.0 * scale;
+        let exp_y = 0.0;
+        let total_h = _max(base_y + b_box.h, e_box.h);
+        let all_s = _concat_pts(
+            _shift_strokes(b_box.strokes, 0.0, base_y),
+            _shift_strokes(e_box.strokes, exp_x, exp_y)
+        );
+        return map{
+            w: exp_x + e_box.w,
+            h: total_h,
+            mid_y: base_y + b_box.mid_y,
+            strokes: all_s
+        };
+    }
+
+    if node.kind == "frac" {
+        let n_box = _layout_box_strokes(node.num, _max(0.82, scale * 0.88), seed_box, style_opts);
+        let d_box = _layout_box_strokes(node.den, _max(0.82, scale * 0.88), seed_box, style_opts);
+        let bar_w = _max(n_box.w, d_box.w) + 18.0 * scale;
+        let v_pad = 9.0 * scale;
+        let bar_y = n_box.h + v_pad;
+        let den_y = bar_y + v_pad;
+        let num_x = 0.5 * (bar_w - n_box.w);
+        let den_x = 0.5 * (bar_w - d_box.w);
+
+        // Freehand fraction bar stroke with slight organic wave
+        let rng = _rng_new(seed_box.base_seed + seed_box.counter * 97 + 13);
+        let bar_pts = [];
+        let steps = 12;
+        let k = 0;
+        while k <= steps {
+            let t = k / (steps * 1.0);
+            let wy = bar_y + _rng_range(rng, -0.6, 0.6) * num_sin(t * _PI);
+            push(bar_pts, [2.0 + t * (bar_w - 4.0), wy]);
+            k = k + 1;
+        }
+        let all_s = _concat_pts(
+            _shift_strokes(n_box.strokes, num_x, 0.0),
+            _concat_pts([bar_pts], _shift_strokes(d_box.strokes, den_x, den_y))
+        );
+        return map{
+            w: bar_w,
+            h: den_y + d_box.h,
+            mid_y: bar_y,
+            strokes: all_s
+        };
+    }
+
+    if node.kind == "sqrt" {
+        let in_box = _layout_box_strokes(node.inner, _max(0.85, scale * 0.90), seed_box, style_opts);
+        let hook_w = 24.0 * scale;
+        let roof_pad_y = 10.0 * scale;
+        let inner_x = hook_w + 6.0 * scale;
+        let inner_y = roof_pad_y;
+        let total_w = inner_x + in_box.w + 8.0 * scale;
+        let total_h = inner_y + in_box.h + 4.0 * scale;
+
+        // Radical V-hook + horizontal vinculum roof spanning completely over inner radicand
+        let rad_stroke = _subdivide_stroke([
+            [2.0, total_h * 0.56],
+            [hook_w * 0.36, total_h * 0.49],
+            [hook_w * 0.68, total_h - 3.0],
+            [hook_w, 3.0],
+            [total_w - 2.0, 3.0]
+        ], 4.0);
+        let all_s = _concat_pts([rad_stroke], _shift_strokes(in_box.strokes, inner_x, inner_y));
+        return map{
+            w: total_w,
+            h: total_h,
+            mid_y: inner_y + in_box.mid_y,
+            strokes: all_s
+        };
+    }
+
+    return map{ w: 20.0, h: 20.0, mid_y: 10.0, strokes: [] };
+}
+
+// Renders any 1D or 2D mathematical expression (including fractions, exponents, radicals, equations)
+// into a realistic freehand handwritten bitmap, stroke array, and 24-bit BMP buffer.
+fn render_handwritten_expression_bitmap(expr_str, variant_seed = 42, style_opts = nil) {
+    let toks = _tokenize_layout_expr(expr_str);
+    let st = map{
+        pos: 0,
+        inline_slash: (style_opts != nil and map_has(style_opts, "inline_slash") and style_opts.inline_slash == true),
+        explicit_caret: (style_opts != nil and map_has(style_opts, "explicit_caret") and style_opts.explicit_caret == true)
+    };
+    let tree = _parse_layout_rel(toks, st);
+    let scale = if style_opts != nil and map_has(style_opts, "scale") { style_opts.scale } else { 1.0 };
+    let seed_box = map{ base_seed: variant_seed * 131 + 7, counter: 0 };
+    let laid = _layout_box_strokes(tree, scale, seed_box, style_opts);
+
+    let pad = 14.0;
+    let out_w = _round_int(laid.w + 2.0 * pad);
+    let out_h = _round_int(laid.h + 2.0 * pad);
+    let final_strokes = _shift_strokes(laid.strokes, pad, pad);
+
+    let pen_r = if style_opts != nil and map_has(style_opts, "stroke_radius") { style_opts.stroke_radius } else { 1.55 };
+    let noise_p = if style_opts != nil and map_has(style_opts, "noise_prob") { style_opts.noise_prob } else { 0.006 };
+    let shade_gx = if style_opts != nil and map_has(style_opts, "shade_grad_x") { style_opts.shade_grad_x } else { 14.0 };
+    let shade_gy = if style_opts != nil and map_has(style_opts, "shade_grad_y") { style_opts.shade_grad_y } else { -12.0 };
+
+    let rast = strokes_to_bitmap(final_strokes, out_w, out_h, map{
+        stroke_radius: pen_r,
+        paper_level: 244.0,
+        ink_level: 22.0,
+        shade_grad_x: shade_gx,
+        shade_grad_y: shade_gy,
+        noise_prob: noise_p,
+        noise_seed: variant_seed * 977 + 19
+    });
+
+    return map{
+        ok: true,
+        expr: expr_str,
+        width: out_w,
+        height: out_h,
+        strokes: final_strokes,
+        bitmap: rast.bitmap,
+        binary_bitmap: rast.binary_bitmap,
+        bmp24_bytes: encode_bmp24(rast.bitmap)
+    };
+}
+
+// ============================================================================
+// 10. Live Mouse/Stylus Interactive Ink Canvas API (for Native Math Studio Tab 8)
+// ============================================================================
+
+fn create_ink_canvas(width = 640, height = 260) {
+    return map{
+        width: _max(64, _round_int(width)),
+        height: _max(48, _round_int(height)),
+        stroke_radius: 1.75,
+        strokes: [],
+        dirty: true,
+        cached_bitmap: nil
+    };
+}
+
+fn canvas_add_stroke(canvas, points) {
+    if canvas == nil or points == nil or len(points) == 0 { return canvas; }
+    let clean_pts = [];
+    let i = 0;
+    while i < len(points) {
+        let p = points[i];
+        if type(p) == "array" and len(p) >= 2 {
+            push(clean_pts, [p[0] * 1.0, p[1] * 1.0]);
+        } else {
+            if type(p) == "map" and map_has(p, "x") and map_has(p, "y") {
+                push(clean_pts, [p.x * 1.0, p.y * 1.0]);
+            }
+        }
+        i = i + 1;
+    }
+    if len(clean_pts) > 0 {
+        push(canvas.strokes, clean_pts);
+        canvas.dirty = true;
+    }
+    return canvas;
+}
+
+fn canvas_clear(canvas) {
+    if canvas == nil { return create_ink_canvas(640, 260); }
+    canvas.strokes = [];
+    canvas.dirty = true;
+    canvas.cached_bitmap = nil;
+    return canvas;
+}
+
+fn canvas_to_bitmap(canvas) {
+    if canvas == nil { return []; }
+    if not canvas.dirty and canvas.cached_bitmap != nil {
+        return canvas.cached_bitmap;
+    }
+    let rast = strokes_to_bitmap(canvas.strokes, canvas.width, canvas.height, map{
+        stroke_radius: canvas.stroke_radius,
+        paper_level: 248.0,
+        ink_level: 18.0,
+        noise_prob: 0.0
+    });
+    canvas.cached_bitmap = rast.bitmap;
+    canvas.dirty = false;
+    return rast.bitmap;
+}
+
+fn canvas_recognize_and_solve(canvas) {
+    if canvas == nil or len(canvas.strokes) == 0 {
+        return map{
+            ok: false,
+            recognized_expr: "",
+            recognized_latex: "",
+            symbol_confidences: [],
+            mean_confidence: 0.0,
+            layout_2d_nodes: [],
+            cas_solution: nil,
+            steps: []
+        };
+    }
+    let bmp = canvas_to_bitmap(canvas);
+    return solve_handwritten_math(bmp, nil);
+}
+
+export OCR_VERSION, MATH_OCR_CLASSES, NUM_CLASSES, FEATURE_DIM;
+export class_index_of, get_canonical_allographs, strokes_to_bitmap, synthesize_handwritten_glyph;
+export encode_bmp24, decode_bmp24;
+export preprocess_math_bitmap, deskew_glyph_bitmap, count_glyph_holes, extract_glyph_features;
+export reload_ocr_weights, classify_glyph_features, classify_glyph_bitmap;
+export segment_math_components, recognize_handwritten_bitmap, recognize_handwritten_strokes;
+export solve_handwritten_math, render_handwritten_expression_bitmap;
+export create_ink_canvas, canvas_add_stroke, canvas_clear, canvas_to_bitmap, canvas_recognize_and_solve;

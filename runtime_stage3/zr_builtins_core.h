@@ -16,6 +16,7 @@
 #include "zr_net_http_tls.h"
 #include "zr_sqlite_ffi.h"
 #include "zr_gfx.h"
+#include "zr_hpc_compute.h"
 
 /* ============================================================================
  * 1. Math, BigInt / Rational / Decimal Constructors & Bitwise Builtins
@@ -5459,7 +5460,17 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"polyglot_exec_compiled", bi_polyglot_exec_compiled},
         {"polyglot_compile_cached", bi_polyglot_compile_cached},
         {"polyglot_cache_info", bi_polyglot_cache_info},
-        {"polyglot_cache_clear", bi_polyglot_cache_clear}
+        {"polyglot_cache_clear", bi_polyglot_cache_clear},
+
+        /* Native C99 SIMD + Multi-Core + OpenCL GPU HPC Engine (8 builtins) */
+        {"hpc_probe", bi_hpc_probe},
+        {"hpc_gemm", bi_hpc_gemm},
+        {"hpc_csr_spmv", bi_hpc_csr_spmv},
+        {"hpc_csr_cg_solve", bi_hpc_csr_cg_solve},
+        {"hpc_cg_poisson_solve", bi_hpc_cg_poisson_solve},
+        {"hpc_fft_1d", bi_hpc_fft_1d},
+        {"hpc_mlp_train_batch", bi_hpc_mlp_train_batch},
+        {"hpc_mlp_forward", bi_hpc_mlp_forward}
     };
 
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {

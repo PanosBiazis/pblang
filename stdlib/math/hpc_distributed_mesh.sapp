@@ -1,0 +1,923 @@
+// stdlib/math/hpc_distributed_mesh.sapp — Sovereign Multi-Workstation Compute Mesh
+// Orchestrator & Anti-Server Policy Guard (PBLang v2.7.0).
+//
+// Coordinates local multi-core SIMD / OpenCL GPU execution together with authorized
+// personal/workstation SSH compute nodes (`local`, `ssh_posix`, `ssh_windows`)
+// while strictly forbidding cloud/hosted server connections by policy.
+//
+// Public-safe: zero hardcoded hostnames, SSH aliases, IP addresses, usernames,
+// or machine-specific filesystem paths. All node descriptors are supplied at runtime.
+
+let MESH_VERSION = "2.7.0";
+
+let _FORBIDDEN_SERVER_PATTERNS = [
+    "gcp",
+    "sovereign",
+    "hetzner",
+    "blazor",
+    "finland",
+    "replica",
+    "verpserver",
+    "server",
+    ".nip.io",
+    "amazonaws",
+    "googleusercontent",
+    "compute.internal",
+    "ec2-",
+    "digitalocean",
+    "linode",
+    "vultr",
+    "azure",
+    "cloudflare"
+];
+
+let _FORBIDDEN_WIN_DIR_SEGMENTS = [
+    "\\users\\",
+    "\\windows\\",
+    "\\program files",
+    "\\programdata\\",
+    "\\documents\\",
+    "\\appdata\\",
+    "\\onedrive\\",
+    "/users/",
+    "/windows/",
+    "/program files"
+];
+
+fn _now_ms_val() {
+    let t = try time_ms() catch nil;
+    if t != nil and type(t) == "number" { return t; }
+    let t2 = try now_ms() catch 0.0;
+    if t2 != nil and type(t2) == "number" { return t2; }
+    return 0.0;
+}
+
+fn _map_get_or(m, k, def_val) {
+    if m == nil or type(m) != "map" { return def_val; }
+    if map_has(m, k) and m[k] != nil { return m[k]; }
+    return def_val;
+}
+
+fn process_run(cmd, args, opts = nil) {
+    if opts != nil {
+        return proc_spawn_wait(cmd, args, opts);
+    }
+    return proc_spawn_wait(cmd, args);
+}
+
+fn _has_shell_meta(s) {
+    let bad = [";", "&", "|", "`", "$", ">", "<", "\n", "\r", "'", "\"", " ", "\t"];
+    let i = 0;
+    while i < len(bad) {
+        if str_contains(s, bad[i]) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _is_ascii_alpha(ch) {
+    if len(ch) != 1 { return false; }
+    let c = strcharcodeat(ch, 0);
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122);
+}
+
+fn _check_windows_sandbox_dir(work_dir, sandbox_prefix) {
+    if len(work_dir) < 8 {
+        return map{ ok: false, reason: "WINDOWS_SANDBOX_PATH_TOO_SHORT" };
+    }
+    let d0 = str_slice(work_dir, 0, 1);
+    let sep = str_slice(work_dir, 1, 3);
+    if not _is_ascii_alpha(d0) or (sep != ":\\" and sep != ":/") {
+        return map{ ok: false, reason: "WINDOWS_WORK_DIR_MUST_BE_DRIVE_ABSOLUTE" };
+    }
+    let norm = str_replace_all(str_lower(work_dir), "/", "\\");
+    if str_contains(norm, "..") {
+        return map{ ok: false, reason: "PATH_TRAVERSAL_FORBIDDEN" };
+    }
+    let i = 0;
+    while i < len(_FORBIDDEN_WIN_DIR_SEGMENTS) {
+        if str_contains(norm, _FORBIDDEN_WIN_DIR_SEGMENTS[i]) {
+            return map{ ok: false, reason: "WINDOWS_SYSTEM_OR_USER_TREE_FORBIDDEN" };
+        }
+        i = i + 1;
+    }
+    // Require at least two directory levels below drive root (`<Drive>:\<SandboxRoot>\<AppDir>`)
+    let trimmed = norm;
+    while len(trimmed) > 3 and str_ends_with(trimmed, "\\") {
+        trimmed = str_slice(trimmed, 0, len(trimmed) - 1);
+    }
+    let parts = str_split(trimmed, "\\");
+    if len(parts) < 3 or len(parts[1]) == 0 or len(parts[2]) == 0 {
+        return map{ ok: false, reason: "WINDOWS_ISOLATED_SUBDIR_REQUIRED" };
+    }
+    if sandbox_prefix != nil and type(sandbox_prefix) == "string" and len(sandbox_prefix) > 0 {
+        let pnorm = str_replace_all(str_lower(sandbox_prefix), "/", "\\");
+        if not str_starts_with(norm, pnorm) {
+            return map{ ok: false, reason: "WINDOWS_SANDBOX_PREFIX_MISMATCH" };
+        }
+    }
+    return map{ ok: true, reason: nil };
+}
+
+// 1. HARD ANTI-SERVER & SANDBOX POLICY GUARD
+fn validate_node_policy(node, opts = nil) {
+    if node == nil or type(node) != "map" {
+        return map{
+            ok: false,
+            blocked_reason: "INVALID_NODE_DESCRIPTOR",
+            matched_pattern: nil,
+            node_name: ""
+        };
+    }
+
+    let allow_servers = _map_get_or(opts, "allow_servers", false) == true;
+    let kind = str(_map_get_or(node, "kind", "local"));
+    let raw_name = str(_map_get_or(node, "name", ""));
+    let raw_host = str(_map_get_or(node, "host", ""));
+    let raw_ssh  = str(_map_get_or(node, "ssh_target", raw_host));
+    let work_dir = str(_map_get_or(node, "work_dir", ""));
+    let pblang_bin = str(_map_get_or(node, "pblang_bin", ""));
+
+    let fields = [str_lower(raw_name), str_lower(raw_host), str_lower(raw_ssh)];
+    if not allow_servers {
+        let fi = 0;
+        while fi < len(fields) {
+            let fld = fields[fi];
+            if len(fld) > 0 {
+                let pi = 0;
+                while pi < len(_FORBIDDEN_SERVER_PATTERNS) {
+                    let pat = _FORBIDDEN_SERVER_PATTERNS[pi];
+                    if str_contains(fld, pat) {
+                        return map{
+                            ok: false,
+                            blocked_reason: "SERVER_FORBIDDEN_BY_POLICY",
+                            matched_pattern: pat,
+                            node_name: raw_name,
+                            target: if len(raw_ssh) > 0 { raw_ssh } else { raw_host }
+                        };
+                    }
+                    pi = pi + 1;
+                }
+            }
+            fi = fi + 1;
+        }
+    }
+
+    if kind != "local" and kind != "ssh_posix" and kind != "ssh_windows" {
+        return map{
+            ok: false,
+            blocked_reason: "UNSUPPORTED_NODE_KIND",
+            kind: kind,
+            node_name: raw_name
+        };
+    }
+
+    if len(work_dir) > 0 and str_contains(work_dir, "..") {
+        return map{
+            ok: false,
+            blocked_reason: "PATH_TRAVERSAL_FORBIDDEN",
+            node_name: raw_name
+        };
+    }
+    if len(pblang_bin) > 0 and str_contains(pblang_bin, "..") {
+        return map{
+            ok: false,
+            blocked_reason: "PATH_TRAVERSAL_FORBIDDEN",
+            node_name: raw_name
+        };
+    }
+
+    if kind == "ssh_posix" or kind == "ssh_windows" {
+        if len(raw_ssh) == 0 {
+            return map{
+                ok: false,
+                blocked_reason: "MISSING_SSH_TARGET",
+                node_name: raw_name
+            };
+        }
+        if str_starts_with(raw_ssh, "-") {
+            return map{
+                ok: false,
+                blocked_reason: "SSH_OPTION_INJECTION_FORBIDDEN",
+                node_name: raw_name
+            };
+        }
+        if _has_shell_meta(raw_ssh) {
+            return map{
+                ok: false,
+                blocked_reason: "UNSAFE_SSH_TARGET_CHARS",
+                node_name: raw_name
+            };
+        }
+    }
+
+    if kind == "ssh_windows" {
+        let req_prefix = _map_get_or(node, "sandbox_prefix", _map_get_or(opts, "windows_sandbox_prefix", nil));
+        let wchk = _check_windows_sandbox_dir(work_dir, req_prefix);
+        if not wchk["ok"] {
+            return map{
+                ok: false,
+                blocked_reason: wchk["reason"],
+                node_name: raw_name
+            };
+        }
+        if len(pblang_bin) > 0 and (str_contains(pblang_bin, ":\\") or str_contains(pblang_bin, ":/")) {
+            let bnorm = str_replace_all(str_lower(pblang_bin), "/", "\\");
+            let wnorm = str_replace_all(str_lower(work_dir), "/", "\\");
+            if not str_ends_with(wnorm, "\\") { wnorm = wnorm + "\\"; }
+            if not str_starts_with(bnorm, wnorm) {
+                return map{
+                    ok: false,
+                    blocked_reason: "WINDOWS_BINARY_OUTSIDE_SANDBOX_WORK_DIR",
+                    node_name: raw_name
+                };
+            }
+        }
+    }
+
+    let eff_name = raw_name;
+    if len(eff_name) == 0 {
+        eff_name = if kind == "local" { "local" } else { raw_ssh };
+    }
+    return map{
+        ok: true,
+        blocked_reason: nil,
+        kind: kind,
+        node_name: eff_name,
+        ssh_target: raw_ssh
+    };
+}
+
+fn assert_mesh_policy(nodes, opts = nil) {
+    if nodes == nil or type(nodes) != "array" or len(nodes) == 0 {
+        throw "HPC_MESH_ERROR: nodes must be a non-empty array";
+    }
+    let i = 0;
+    while i < len(nodes) {
+        let verdict = validate_node_policy(nodes[i], opts);
+        if not verdict["ok"] {
+            let reason = str(_map_get_or(verdict, "blocked_reason", "POLICY_REJECTED"));
+            let pat = _map_get_or(verdict, "matched_pattern", nil);
+            let detail = if pat != nil { " [pattern=" + str(pat) + "]" } else { "" };
+            throw "HPC_MESH_POLICY_VIOLATION: " + reason + detail;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- Shell-Safe Quoting & Remote Invocation Helpers ----
+
+fn _posix_single_quote(s) {
+    return "'" + str_replace_all(s, "'", "'\\''") + "'";
+}
+
+fn _flatten_code_single_line(code) {
+    let lines = str_split(str_replace_all(code, "\r\n", "\n"), "\n");
+    let kept = [];
+    let i = 0;
+    while i < len(lines) {
+        let ln = str_trim(lines[i]);
+        if len(ln) > 0 and not str_starts_with(ln, "//") {
+            push(kept, ln);
+        }
+        i = i + 1;
+    }
+    return str_join(kept, " ");
+}
+
+fn _win_cmd_escape_eval(code) {
+    let one = _flatten_code_single_line(code);
+    let out = "";
+    let cmd_quoted = true;
+    let n = len(one);
+    let bs_run = 0;
+    let i = 0;
+    while i < n {
+        let ch = str_slice(one, i, i + 1);
+        if ch == "\\" {
+            bs_run = bs_run + 1;
+            i = i + 1;
+        } else if ch == "\"" {
+            // Double all preceding backslashes + emit \" for CommandLineToArgvW;
+            // the emitted '"' toggles cmd.exe's quote parity!
+            let k = 0;
+            while k < bs_run * 2 {
+                out = out + "\\";
+                k = k + 1;
+            }
+            bs_run = 0;
+            out = out + "\\\"";
+            cmd_quoted = not cmd_quoted;
+            i = i + 1;
+        } else {
+            let k = 0;
+            while k < bs_run {
+                out = out + "\\";
+                k = k + 1;
+            }
+            bs_run = 0;
+            if not cmd_quoted and (ch == "^" or ch == "&" or ch == "|" or ch == "<" or ch == ">" or ch == "(" or ch == ")") {
+                out = out + "^" + ch;
+            } else {
+                out = out + ch;
+            }
+            i = i + 1;
+        }
+    }
+    let k = 0;
+    while k < bs_run * 2 {
+        out = out + "\\";
+        k = k + 1;
+    }
+    return out;
+}
+
+fn _extract_last_json_line(raw_out) {
+    let trimmed = str_trim(str_replace_all(str(raw_out), "\r\n", "\n"));
+    if len(trimmed) == 0 { return nil; }
+    let lines = str_split(trimmed, "\n");
+    let idx = len(lines) - 1;
+    while idx >= 0 {
+        let ln = str_trim(lines[idx]);
+        if str_starts_with(ln, "{") or str_starts_with(ln, "[") {
+            let parsed = try json_parse(ln) catch nil;
+            if parsed != nil { return parsed; }
+        }
+        idx = idx - 1;
+    }
+    return try json_parse(trimmed) catch nil;
+}
+
+fn _run_node_eval(node, code_str, stdin_text, timeout_sec) {
+    let kind = str(_map_get_or(node, "kind", "local"));
+    let ssh_target = str(_map_get_or(node, "ssh_target", _map_get_or(node, "host", "")));
+    let work_dir = str(_map_get_or(node, "work_dir", ""));
+    let pblang_bin = str(_map_get_or(node, "pblang_bin", ""));
+    let proc_opts = if stdin_text != nil { map{ stdin: stdin_text } } else { nil };
+
+    if kind == "local" {
+        if stdin_text == nil and code_str == "println(json_stringify(hpc_probe()));" {
+            return map{ ok: true, parsed: hpc_probe(), exit_code: 0, stderr: "" };
+        }
+        let bin = if len(pblang_bin) > 0 { pblang_bin } else { "pblang" };
+        let r = try process_run(bin, ["-e", code_str], proc_opts) catch nil;
+        if r == nil {
+            return map{ ok: false, error: "local pblang spawn failed", exit_code: -1 };
+        }
+        let parsed = _extract_last_json_line(r["stdout"]);
+        return map{
+            ok: r["exit_code"] == 0 and parsed != nil,
+            parsed: parsed,
+            exit_code: r["exit_code"],
+            stdout: r["stdout"],
+            stderr: r["stderr"]
+        };
+    }
+
+    let t_str = str(timeout_sec);
+    let ssh_base = [
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=" + t_str
+    ];
+    let extra_ssh = _map_get_or(node, "ssh_args", nil);
+    if extra_ssh != nil and type(extra_ssh) == "array" {
+        let j = 0;
+        while j < len(extra_ssh) {
+            push(ssh_base, str(extra_ssh[j]));
+            j = j + 1;
+        }
+    }
+    push(ssh_base, ssh_target);
+
+    if kind == "ssh_posix" {
+        let bin = if len(pblang_bin) > 0 { pblang_bin } else { "$HOME/.local/bin/pblang" };
+        let cmd = "";
+        if len(work_dir) > 0 {
+            cmd = "cd " + _posix_single_quote(work_dir) + " && ";
+        }
+        let bin_expr = if str_starts_with(bin, "$HOME/") {
+            "\"$HOME\"/" + _posix_single_quote(str_slice(bin, 6, len(bin)))
+        } else {
+            _posix_single_quote(bin)
+        };
+        cmd = cmd + bin_expr + " -e " + _posix_single_quote(code_str);
+        push(ssh_base, cmd);
+    } else if kind == "ssh_windows" {
+        let bin = pblang_bin;
+        if len(bin) == 0 {
+            let sep = if str_ends_with(work_dir, "\\") or str_ends_with(work_dir, "/") { "" } else { "\\" };
+            bin = work_dir + sep + "pblang.exe";
+        }
+        let esc_code = _win_cmd_escape_eval(code_str);
+        let cmd = "cd /d \"" + work_dir + "\" && \"" + bin + "\" -e \"" + esc_code + "\"";
+        push(ssh_base, cmd);
+    }
+
+    let r = try process_run("ssh", ssh_base, proc_opts) catch nil;
+    if r == nil {
+        return map{ ok: false, error: "ssh subprocess invocation failed", exit_code: -1 };
+    }
+    let parsed = _extract_last_json_line(r["stdout"]);
+    return map{
+        ok: r["exit_code"] == 0 and parsed != nil,
+        parsed: parsed,
+        exit_code: r["exit_code"],
+        stdout: r["stdout"],
+        stderr: r["stderr"]
+    };
+}
+
+// ---- 2. Parallel Mesh Probing (`probe_mesh`) ----
+
+fn _probe_node_worker(req) {
+    let node = req["node"];
+    let idx = req["index"];
+    let timeout_sec = req["timeout_sec"];
+    let v = validate_node_policy(node, req["opts"]);
+    if not v["ok"] {
+        return map{
+            index: idx,
+            name: v["node_name"],
+            kind: _map_get_or(node, "kind", "unknown"),
+            ok: false,
+            blocked_reason: v["blocked_reason"],
+            cpu_threads: 0,
+            opencl_available: false,
+            opencl_compute_units: 0
+        };
+    }
+
+    let t0 = _now_ms_val();
+    let res = _run_node_eval(node, "println(json_stringify(hpc_probe()));", nil, timeout_sec);
+    let dt = _now_ms_val() - t0;
+
+    if not res["ok"] or type(res["parsed"]) != "map" {
+        return map{
+            index: idx,
+            name: v["node_name"],
+            kind: v["kind"],
+            ok: false,
+            probe_ms: dt,
+            exit_code: _map_get_or(res, "exit_code", -1),
+            error: str(_map_get_or(res, "stderr", _map_get_or(res, "error", "probe failed"))),
+            cpu_threads: 0,
+            opencl_available: false,
+            opencl_compute_units: 0
+        };
+    }
+
+    let p = res["parsed"];
+    return map{
+        index: idx,
+        name: v["node_name"],
+        kind: v["kind"],
+        ok: true,
+        probe_ms: dt,
+        cpu_threads: _map_get_or(p, "cpu_threads", 1),
+        simd_isa: _map_get_or(p, "simd_isa", "scalar"),
+        opencl_available: _map_get_or(p, "opencl_available", false),
+        opencl_platform: _map_get_or(p, "opencl_platform", ""),
+        opencl_device: _map_get_or(p, "opencl_device", ""),
+        opencl_compute_units: _map_get_or(p, "opencl_compute_units", 0),
+        opencl_mem_mb: _map_get_or(p, "opencl_mem_mb", 0),
+        opencl_fp64: _map_get_or(p, "opencl_fp64", false),
+        probe: p
+    };
+}
+
+fn probe_mesh(nodes, opts = nil) {
+    assert_mesh_policy(nodes, opts);
+    let timeout_sec = _map_get_or(opts, "timeout_sec", 10);
+    let t0 = _now_ms_val();
+
+    let handles = [];
+    let i = 0;
+    while i < len(nodes) {
+        let req = map{
+            node: nodes[i],
+            index: i,
+            timeout_sec: timeout_sec,
+            opts: opts
+        };
+        push(handles, spawn(_probe_node_worker, req));
+        i = i + 1;
+    }
+
+    let reports = join_all(handles);
+    let total_threads = 0;
+    let active_nodes = 0;
+    let gpu_nodes = 0;
+    let total_gpu_cus = 0;
+
+    let k = 0;
+    while k < len(reports) {
+        let r = reports[k];
+        if r["ok"] {
+            active_nodes = active_nodes + 1;
+            total_threads = total_threads + r["cpu_threads"];
+            if r["opencl_available"] {
+                gpu_nodes = gpu_nodes + 1;
+                total_gpu_cus = total_gpu_cus + r["opencl_compute_units"];
+            }
+        }
+        k = k + 1;
+    }
+
+    return map{
+        ok: active_nodes > 0,
+        mesh_version: MESH_VERSION,
+        total_nodes: len(nodes),
+        active_nodes: active_nodes,
+        total_cpu_threads: total_threads,
+        gpu_nodes: gpu_nodes,
+        total_gpu_compute_units: total_gpu_cus,
+        probe_elapsed_ms: _now_ms_val() - t0,
+        nodes: reports
+    };
+}
+
+// ---- 3. Thread-Weighted Concurrent Map-Reduce (`distribute_map_reduce`) ----
+
+fn _build_worker_wrapper(worker_code_template) {
+    let has_map_fn = str_contains(worker_code_template, "fn map_task") or str_contains(worker_code_template, "fn worker_map");
+    let fn_call = if str_contains(worker_code_template, "fn map_task") { "map_task" } else { "worker_map" };
+
+    if has_map_fn {
+        return "let _REQ = json_parse(read_line()); " +
+               "let SHARD = _REQ; " +
+               "let TASKS = _REQ[\"tasks\"]; " +
+               worker_code_template + " " +
+               "let _OUT = []; let _idx = 0; " +
+               "while _idx < len(TASKS) { push(_OUT, " + fn_call + "(TASKS[_idx])); _idx = _idx + 1; } " +
+               "println(json_stringify(map{ ok: true, results: _OUT, probe: hpc_probe() }));";
+    }
+
+    return "let _REQ = json_parse(read_line()); " +
+           "let SHARD = _REQ; " +
+           "let TASKS = _REQ[\"tasks\"]; " +
+           "let RESULTS = []; " +
+           worker_code_template + " " +
+           "println(json_stringify(map{ ok: true, results: RESULTS, probe: hpc_probe() }));";
+}
+
+fn _exec_shard_worker(req) {
+    let node = req["node"];
+    let node_name = req["node_name"];
+    let shard_tasks = req["tasks"];
+    let wrapper_code = req["wrapper_code"];
+    let timeout_sec = req["timeout_sec"];
+
+    if len(shard_tasks) == 0 {
+        return map{
+            ok: true,
+            node_name: node_name,
+            shard_index: req["shard_index"],
+            task_count: 0,
+            weight: req["weight"],
+            share_ratio: req["share_ratio"],
+            elapsed_ms: 0.0,
+            results: []
+        };
+    }
+
+    let kind = str(_map_get_or(node, "kind", "local"));
+    let payload = json_stringify(map{
+        node_name: node_name,
+        shard_index: req["shard_index"],
+        weight: req["weight"],
+        total_weight: req["total_weight"],
+        tasks: shard_tasks
+    }) + "\n";
+
+    let t0 = _now_ms_val();
+    // On local node, if pblang_bin is omitted, discover current executable via env or PATH
+    let res = _run_node_eval(node, wrapper_code, payload, timeout_sec);
+    let dt = _now_ms_val() - t0;
+
+    if not res["ok"] or type(res["parsed"]) != "map" {
+        return map{
+            ok: false,
+            node_name: node_name,
+            kind: kind,
+            shard_index: req["shard_index"],
+            task_count: len(shard_tasks),
+            weight: req["weight"],
+            share_ratio: req["share_ratio"],
+            elapsed_ms: dt,
+            error: str(_map_get_or(res, "stderr", _map_get_or(res, "error", "worker failed"))),
+            results: []
+        };
+    }
+
+    let body = res["parsed"];
+    return map{
+        ok: _map_get_or(body, "ok", true) == true,
+        node_name: node_name,
+        kind: kind,
+        shard_index: req["shard_index"],
+        task_count: len(shard_tasks),
+        weight: req["weight"],
+        share_ratio: req["share_ratio"],
+        elapsed_ms: dt,
+        probe: _map_get_or(body, "probe", nil),
+        results: _map_get_or(body, "results", [])
+    };
+}
+
+fn distribute_map_reduce(nodes, tasks, worker_code_template, reduce_fn = nil, opts = nil) {
+    assert_mesh_policy(nodes, opts);
+    if tasks == nil or type(tasks) != "array" {
+        throw "HPC_MESH_ERROR: tasks must be an array";
+    }
+
+    let t0 = _now_ms_val();
+    let timeout_sec = _map_get_or(opts, "timeout_sec", 30);
+    let pre_probe = _map_get_or(opts, "mesh_probe", nil);
+    if pre_probe == nil {
+        pre_probe = probe_mesh(nodes, opts);
+    }
+    if not pre_probe["ok"] or pre_probe["total_cpu_threads"] <= 0 {
+        throw "HPC_MESH_ERROR: zero active workstation compute nodes available";
+    }
+
+    // Collect active nodes and their measured `cpu_threads` weights
+    let active_entries = [];
+    let total_weight = 0;
+    let ni = 0;
+    while ni < len(pre_probe["nodes"]) {
+        let rep = pre_probe["nodes"][ni];
+        if rep["ok"] and rep["cpu_threads"] > 0 {
+            let w = rep["cpu_threads"];
+            total_weight = total_weight + w;
+            push(active_entries, map{
+                node: nodes[rep["index"]],
+                report: rep,
+                weight: w
+            });
+        }
+        ni = ni + 1;
+    }
+
+    let n_tasks = len(tasks);
+    let wrapper_code = _build_worker_wrapper(worker_code_template);
+    let shard_plan = [];
+    let handles = [];
+    let cum_weight = 0;
+
+    let si = 0;
+    while si < len(active_entries) {
+        let ent = active_entries[si];
+        let w = ent["weight"];
+        let i_start = round((cum_weight * n_tasks) / total_weight);
+        cum_weight = cum_weight + w;
+        let i_end = if si + 1 == len(active_entries) {
+            n_tasks
+        } else {
+            round((cum_weight * n_tasks) / total_weight)
+        };
+        if i_end < i_start { i_end = i_start; }
+
+        let shard_slice = slice(tasks, i_start, i_end);
+        let ratio = w / total_weight;
+        push(shard_plan, map{
+            node_name: ent["report"]["name"],
+            kind: ent["report"]["kind"],
+            cpu_threads: w,
+            share_ratio: ratio,
+            task_start: i_start,
+            task_end: i_end,
+            task_count: len(shard_slice)
+        });
+
+        let sreq = map{
+            node: ent["node"],
+            node_name: ent["report"]["name"],
+            shard_index: si,
+            weight: w,
+            total_weight: total_weight,
+            share_ratio: ratio,
+            tasks: shard_slice,
+            wrapper_code: wrapper_code,
+            timeout_sec: timeout_sec
+        };
+        push(handles, spawn(_exec_shard_worker, sreq));
+        si = si + 1;
+    }
+
+    let shard_outputs = join_all(handles);
+    let flat_results = [];
+    let node_metrics = [];
+
+    let oi = 0;
+    while oi < len(shard_outputs) {
+        let so = shard_outputs[oi];
+        if not so["ok"] {
+            throw "HPC_MESH_WORKER_ERROR on '" + str(so["node_name"]) + "': " + str(_map_get_or(so, "error", "unknown"));
+        }
+        push(node_metrics, map{
+            node_name: so["node_name"],
+            shard_index: so["shard_index"],
+            weight: so["weight"],
+            share_ratio: so["share_ratio"],
+            task_count: so["task_count"],
+            elapsed_ms: so["elapsed_ms"]
+        });
+        let rlist = so["results"];
+        let ri = 0;
+        while ri < len(rlist) {
+            push(flat_results, rlist[ri]);
+            ri = ri + 1;
+        }
+        oi = oi + 1;
+    }
+
+    let reduced_val = if reduce_fn != nil { reduce_fn(flat_results) } else { flat_results };
+
+    return map{
+        ok: true,
+        total_tasks: n_tasks,
+        active_nodes: len(active_entries),
+        total_cpu_threads: total_weight,
+        shard_plan: shard_plan,
+        node_metrics: node_metrics,
+        results: flat_results,
+        reduced: reduced_val,
+        elapsed_ms: _now_ms_val() - t0
+    };
+}
+
+// ---- 4. Multi-Workstation Scientific Benchmark (`distributed_monte_carlo_and_pde_benchmark`) ----
+
+fn _pde_node_worker(req) {
+    let node = req["node"];
+    let rep  = req["report"];
+    let nx   = req["nx"];
+    let ny   = req["ny"];
+    let nz   = req["nz"];
+    let backend = req["backend"];
+    let timeout_sec = req["timeout_sec"];
+
+    let code = "let s = hpc_cg_poisson_solve(" + str(nx) + ", " + str(ny) + ", " + str(nz) +
+               ", 1e-8, 1500, map{ backend: \"" + backend + "\" }); " +
+               "println(json_stringify(map{ ok: s[\"ok\"], dof: s[\"dof\"], iterations: s[\"iterations\"], " +
+               "outer_refinements: s[\"outer_refinements\"], relative_residual: s[\"relative_residual\"], " +
+               "u_center: s[\"u_center\"], elapsed_ms: s[\"elapsed_ms\"], " +
+               "throughput_mdof_per_sec: s[\"throughput_mdof_per_sec\"], backend: s[\"backend\"], " +
+               "threads_used: s[\"threads_used\"], gpu_used: s[\"gpu_used\"] }));";
+
+    let t0 = _now_ms_val();
+    let res = _run_node_eval(node, code, nil, timeout_sec);
+    let wall_ms = _now_ms_val() - t0;
+
+    if not res["ok"] {
+        return map{
+            ok: false,
+            node_name: rep["name"],
+            wall_ms: wall_ms,
+            error: str(_map_get_or(res, "stderr", _map_get_or(res, "error", "pde solve failed")))
+        };
+    }
+    let p = res["parsed"];
+    p["node_name"] = rep["name"];
+    p["wall_ms"] = wall_ms;
+    return p;
+}
+
+fn distributed_monte_carlo_and_pde_benchmark(nodes, opts = nil) {
+    assert_mesh_policy(nodes, opts);
+    let t_total0 = _now_ms_val();
+    let mesh = probe_mesh(nodes, opts);
+    if not mesh["ok"] {
+        throw "HPC_MESH_ERROR: mesh probe found no reachable authorized workstations";
+    }
+
+    let n_shards = _map_get_or(opts, "num_shards", 52);
+    let samples_per_shard = _map_get_or(opts, "samples_per_shard", 25000);
+    let tasks = [];
+    let s = 0;
+    while s < n_shards {
+        push(tasks, map{
+            shard_id: s,
+            n_samples: samples_per_shard,
+            seed_offset: s * samples_per_shard
+        });
+        s = s + 1;
+    }
+
+    // 5D Gaussian-oscillatory integral over [0, 1]^5 via deterministic Halton/Weyl quasi-random sequence:
+    // I = \int_{[0,1]^5} exp(-(x1^2 + x2^2 + x3^2 + x4^2 + x5^2)/2) * (1 + 0.25*cos(pi*(x1 - x2))) dx
+    let worker_code =
+        "fn map_task(t) { " +
+        "  let n = t[\"n_samples\"]; " +
+        "  let base = t[\"seed_offset\"]; " +
+        "  let acc = 0.0; let sq = 0.0; let i = 1; " +
+        "  while i <= n { " +
+        "    let k = base + i; " +
+        "    let x1 = (k * 0.6180339887498949) - floor(k * 0.6180339887498949); " +
+        "    let x2 = (k * 0.4142135623730951) - floor(k * 0.4142135623730951); " +
+        "    let x3 = (k * 0.7320508075688772) - floor(k * 0.7320508075688772); " +
+        "    let x4 = (k * 0.2360679774997897) - floor(k * 0.2360679774997897); " +
+        "    let x5 = (k * 0.3162277660168379) - floor(k * 0.3162277660168379); " +
+        "    let r2 = x1*x1 + x2*x2 + x3*x3 + x4*x4 + x5*x5; " +
+        "    let v = num_exp(-0.5 * r2) * (1.0 + 0.25 * cos(3.141592653589793 * (x1 - x2))); " +
+        "    acc = acc + v; sq = sq + v * v; " +
+        "    i = i + 1; " +
+        "  } " +
+        "  return map{ count: n, sum: acc, sum_sq: sq }; " +
+        "}";
+
+    let reduce_integral = fn(shard_res) {
+        let tot_n = 0;
+        let tot_s = 0.0;
+        let tot_sq = 0.0;
+        let idx = 0;
+        while idx < len(shard_res) {
+            let item = shard_res[idx];
+            tot_n = tot_n + item["count"];
+            tot_s = tot_s + item["sum"];
+            tot_sq = tot_sq + item["sum_sq"];
+            idx = idx + 1;
+        }
+        let mean = tot_s / tot_n;
+        let variance = max(0.0, (tot_sq / tot_n) - mean * mean);
+        return map{
+            total_samples: tot_n,
+            integral_estimate: mean,
+            std_error: sqrt(variance / tot_n)
+        };
+    };
+
+    let mr_opts = map{
+        mesh_probe: mesh,
+        timeout_sec: _map_get_or(opts, "timeout_sec", 45),
+        windows_sandbox_prefix: _map_get_or(opts, "windows_sandbox_prefix", nil)
+    };
+    let mr = distribute_map_reduce(nodes, tasks, worker_code, reduce_integral, mr_opts);
+
+    // Concurrent multi-device PDE solve (`1,000,000` DOF on >= 8-core / GPU nodes, `250,000` DOF on compact 2-core nodes)
+    let pde_handles = [];
+    let pi = 0;
+    while pi < len(mesh["nodes"]) {
+        let rep = mesh["nodes"][pi];
+        if rep["ok"] {
+            let is_heavy = rep["cpu_threads"] >= 8 or rep["opencl_available"];
+            let p_nx = if is_heavy { 1000 } else { 500 };
+            let p_ny = if is_heavy { 1000 } else { 500 };
+            let p_backend = if rep["opencl_available"] { "hybrid" } else { "cpu" };
+            push(pde_handles, spawn(_pde_node_worker, map{
+                node: nodes[rep["index"]],
+                report: rep,
+                nx: p_nx,
+                ny: p_ny,
+                nz: 1,
+                backend: p_backend,
+                timeout_sec: _map_get_or(opts, "timeout_sec", 45)
+            }));
+        }
+        pi = pi + 1;
+    }
+    let pde_reports = join_all(pde_handles);
+
+    let total_dof_solved = 0;
+    let all_pde_ok = true;
+    let qi = 0;
+    while qi < len(pde_reports) {
+        if pde_reports[qi]["ok"] {
+            total_dof_solved = total_dof_solved + pde_reports[qi]["dof"];
+        } else {
+            all_pde_ok = false;
+        }
+        qi = qi + 1;
+    }
+
+    return map{
+        ok: mr["ok"] and all_pde_ok,
+        mesh_summary: map{
+            active_nodes: mesh["active_nodes"],
+            total_cpu_threads: mesh["total_cpu_threads"],
+            gpu_nodes: mesh["gpu_nodes"],
+            total_gpu_compute_units: mesh["total_gpu_compute_units"]
+        },
+        map_reduce_benchmark: map{
+            total_shards: n_shards,
+            total_samples: mr["reduced"]["total_samples"],
+            integral_estimate: mr["reduced"]["integral_estimate"],
+            std_error: mr["reduced"]["std_error"],
+            shard_plan: mr["shard_plan"],
+            node_metrics: mr["node_metrics"],
+            elapsed_ms: mr["elapsed_ms"]
+        },
+        distributed_pde_benchmark: map{
+            all_ok: all_pde_ok,
+            total_dof_solved: total_dof_solved,
+            node_solves: pde_reports
+        },
+        total_elapsed_ms: _now_ms_val() - t_total0
+    };
+}
+
+export MESH_VERSION;
+export process_run;
+export validate_node_policy, assert_mesh_policy;
+export probe_mesh, distribute_map_reduce, distributed_monte_carlo_and_pde_benchmark;

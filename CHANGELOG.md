@@ -2,6 +2,34 @@
 
 All notable changes to **PBLang** are documented in this file.
 
+## [`2.7.0`] — 2026-11-13 (`90,000+` LOC Complete Decidable Mathematics Frontier (`Tarski–Collins–Hong CAD` · `Cooper Presburger` · `Hasse/MRDP` · `LLL`) · `Lean 4`-Class Dependent Type Theory (`CIC`) Trusted Proof Kernel & 37-Theorem Library · Native C99 `SIMD + Multi-Core + OpenCL GPU` HPC (`1,000,000+` DOF) & Zero-Server Mesh · Offline Neural Handwritten 2D Math OCR · 8-Tab Native `gfx*` Math Studio)
+
+### 1. Complete Decidable Mathematics Frontier (`stdlib/math/decidable_frontier.sapp` — `6,315` LOC)
+- **Tarski–Collins–Hong Cylindrical Algebraic Decomposition (`CAD`) over Real Closed Fields $\mathbb{R}$ (`quantifier_eliminate_real`, `cad_decide`, `prove_real_inequality`, `cad_build_cells`)**:
+  - Recursive multivariate rational polynomial algebra (`rpoly_*`), subresultant/projection polynomial set construction, Sturm real root isolation & algebraic sample-point lifting across cylindrical cells, and exact quantifier elimination synthesizing closed quantifier-free conditions (e.g., `"exists x: x^2 + b*x + c == 0"` $\implies$ `"b^2 - 4*c >= 0"`; exact real inequality proving without numerical sampling).
+- **Cooper's Exact Quantifier Elimination for Presburger Arithmetic over $\mathbb{Z}$ (`presburger_decide`, `presburger_eliminate`)**:
+  - Decides arbitrary quantified linear integer arithmetic with divisibility predicates $m \mid t$ via LCM coefficient normalization and Cooper's $-\infty$ / bounded residue-class elimination (e.g., proves Frobenius coin theorem $\forall n \ge 8,\ \exists a, b \ge 0:\ 3a + 5b = n \implies \text{true}$, while $n \ge 7$ returns exact minimal counterexample $n = 7$).
+- **Diophantine Local-Global (`Hasse` / `MRDP`) Obstruction Auditor, `LLL` Lattice Reduction & Exact $\overline{\mathbb{Q}}$ (`diophantine_obstruction_audit`, `lll_reduce`, `find_integer_relation`, `algebraic_number`)**:
+  - Audits polynomial Diophantine equations for Archimedean sign, $\gcd$, modular (`mod 4/8/9`), and $p$-adic Hensel obstructions while explicitly demarcating Matiyasevich–Robinson–Davis–Putnam (`MRDP`) undecidability boundaries and Hasse-principle failures (such as Selmer's cubic $3x^3 + 4y^3 + 5z^3 = 0$); includes exact Lovász `LLL` basis reduction ($\delta = 3/4$), PSLQ/`LLL` minimal polynomial & integer-relation recovery (e.g., $\sqrt{2}+\sqrt{3} \implies x^4 - 10x^2 + 1$), and exact real algebraic arithmetic in $\overline{\mathbb{Q}}$.
+
+### 2. `Lean 4` / `Coq`-Class Dependent Type Theory (`CIC`) Trusted Proof Kernel & Standard Library (`stdlib/math/lean_cic_prover.sapp` — `4,500` LOC)
+- **Pure Small-Step Trusted De Bruijn `CIC` Kernel (`new_kernel_env`, `kernel_infer_type`, `kernel_check_type`, `kernel_is_def_eq`, `kernel_audit_axioms`)**:
+  - Dependent products $\Pi (x : A), B$, impredicative `Prop` (`Sort 0`, `imax_level(u, 0) = 0`) + predicative universe hierarchy `Type u` (`Sort (u+1)`), full $\beta\delta\iota\zeta\eta$ definitional equality, strict positivity enforcement on inductive types (rejecting `Bad := mk : (Bad -> False) -> Bad` and Girard's `Sort u : Sort u`), recursor $\iota$-reduction, and recursive axiom/completeness auditing (`sorry_count == 0`).
+- **Interactive Metavariable Tactic Engine & 37-Theorem Machine-Checked `PBLib` (`build_standard_pblib`, `cic_prove`)**:
+  - `Lean 4`-style Unicode/ASCII term parser & pretty-printer plus goal-directed tactics (`intro`/`intros`, `exact`, `assumption`, `apply`, `rfl`, `symm`, `trans`, `congr_arg`, `rw`/`rw_rev`, `split`, `left`, `right`, `cases`, `exfalso`, `existsi`, `induction`, `by_contra`), shipping **37 kernel-verified theorems** across Propositional/Predicate Logic, Polymorphic Equality, Peano `Nat` (`add_comm`, `add_assoc`, `mul_comm`, `mul_assoc`, `mul_add_distrib`), and Universe-Polymorphic `List.{u}` (`append_nil`, `append_assoc`, `length_append`).
+
+### 3. Native C99 `SIMD + Multi-Core + OpenCL GPU` HPC (`1,000,000+` DOF) & Zero-Server Workstation Mesh (`runtime_stage3/zr_hpc_compute.h` — `3,424` LOC, `stdlib/math/hpc_distributed_mesh.sapp` — `882` LOC)
+- **8 Native HPC Builtins (`hpc_probe`, `hpc_gemm`, `hpc_csr_spmv`, `hpc_csr_cg_solve`, `hpc_cg_poisson_solve`, `hpc_fft_1d`, `hpc_mlp_train_batch`, `hpc_mlp_forward`)**:
+  - Runtime `CPUID`/`XGETBV` dispatch (`AVX-512F`, `AVX2+FMA`, `SSE2`, scalar fallback — zero `SIGILL` on older `SSE2`-only CPUs), native POSIX `pthread` / Win32 thread pool, and dynamic `dlopen`/`LoadLibraryA` `OpenCL` GPU dispatch including **Ozaki-4 mantissa-splitting `fp64`-accurate GPU GEMM** on `fp32`-only GPUs (`~1.8e-12` error) and Geometric Multigrid Preconditioned Conjugate Gradient (`MG-PCG`) solving **`1,000,000` DOF** 2D/3D Poisson PDEs in `135–225 ms` on CPU SIMD and `< 710 ms` on OpenCL GPU + `fp64` defect refinement.
+- **Strict Zero-Server Workstation Compute Mesh (`validate_node_policy`, `probe_mesh`, `distribute_map_reduce`)**:
+  - Hard fail-closed policy guard rejecting cloud/VPS server hostnames (`SERVER_FORBIDDEN_BY_POLICY`) while coordinating authorized personal/workstation nodes.
+
+### 4. Offline Neural Handwritten 2D Math OCR, 8-Tab Native Math Studio & `PBIDE` (`stdlib/math/neural_handwriting_ocr.sapp` — `3,148` LOC, `stdlib/math/neural_handwriting_weights.sapp` — `1,350` LOC)
+- **Trained `154 -> 96 -> 48 -> 26` MLP Handwritten Symbol Classifier & 2D Spatial Parser (`recognize_handwritten_bitmap`, `recognize_handwritten_strokes`, `solve_handwritten_math`, `create_ink_canvas`)**:
+  - Pure-PBLang offline neural weights (`20,810` parameters trained on `16,900` augmented stroke glyphs across 26 math classes) paired with 8-connected component analysis, Zhang-Suen / morphological stroke normalization, 154-feature zoning + Hu-moment + directional-crossing extraction, and recursive 2D fraction-bar / radical-vinculum / raised-superscript / subscript AST reconstruction + step-by-step solving.
+- **8-Tab Native `gfx*` Math Studio & `PBIDE` CLI Fast-Paths (`stdlib/math/native_math_studio.sapp`, `editors/ide/pbide.sapp`)**:
+  - Upgraded `run_native_math_studio` to **8 Tabs** (adding Tab 8 `"8. Χειρόγραφο ΤΝ, Αποδείξεις CIC & HPC"` with live freehand mouse ink canvas, neural OCR + step-by-step solver, `CIC` proof-kernel telemetry, and `hpc_probe()` hardware status) plus `--cad`, `--prove`, and `--handwrite` CLI fast-paths in `PBIDE`.
+
 ## [`2.6.0`] — 2026-11-13 (`69,700+` LOC Universal 10-Domain Interactive Mathematical Concept Cards · Symbolic 9D SI + Currency + Information Algebra & Exact $\mathbb{Q}$ Buckingham $\Pi$ Engine · 7-Tab Native `gfx*` Math Studio · `PBIDE` `F7` Math/SI Inspector & Ecosystem Synchronization)
 
 ### 1. Symbolic 9D SI + Currency + Information Dimensional Algebra & Exact $\mathbb{Q}$ Buckingham $\Pi$ Solver (`stdlib/math/universal_concept_cards.sapp` — `4,484` LOC)
