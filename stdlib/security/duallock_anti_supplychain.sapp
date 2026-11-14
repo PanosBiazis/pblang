@@ -1,0 +1,2074 @@
+// stdlib/security/duallock_anti_supplychain.sapp — Dual-Lock Sovereign Control Plane,
+// Triple-Anchored Anti-Clock-Tamper Ratchet & GitHub-Compromise / Supply-Chain
+// Immunity Engine (PBLang v4.1.0).
+//
+// 100% Pure PBLang (Zero C, Zero Python, Zero external dependencies, Zero PII/telemetry).
+//
+// Three Interlocking Sovereign Security Pillars:
+//   1. Pillar 1 — Ergonomic Developer-Optional Dual-Lock ("Διπλό Κλείδωμα") Protocol
+//      (`PBDL1.` & `PBDL1_CONT.`): ChaCha20-Poly1305 encrypted zero-metadata wire
+//      envelopes, 256-bit CSPRNG anti-replay nonces, 4 Sovereign Safeguards
+//      (Revocation/Manual Arm, Dead-Man Switch, Canary Tamper Tripwire, Isolation Modes),
+//      Dual Cryptographic Signatures (HMAC-SHA256 + RFC 8032 Ed25519), and Offline
+//      Autonomous Continuity Bundles (`PBDL1_CONT.`).
+//   2. Pillar 2 — Triple-Anchored Anti-Clock-Tamper Engine (`PBCLK1`):
+//      HMAC-SHA256 signed high-water state, Server Authoritative UTC override with
+//      tamper detection, Monotonic Uptime vs Wall-Clock drift/freeze guard, and
+//      High-Water monotonic floor enforcement.
+//   3. Pillar 3 — GitHub-Compromise & Supply-Chain Redirect Immunity (`PBORIGIN1.` &
+//      `PBREL2OF2.`): Air-gapped `cold_root` vs `ci_builder` key separation, pre-connect
+//      URL/host/port/SPKI/key pinning (blocking userinfo `@` confusion, SSRF, cross-edition
+//      replay, and stolen-CI redirects with 0 bytes sent), and 2-of-2 Threshold Release
+//      Signing + Verification.
+
+let _ED_VERIFY = import("stdlib:ed25519_verify.sapp");
+
+let DUALLOCK_VERSION = "4.1.0";
+let DUALLOCK_ENVELOPE_PREFIX = "PBDL1";
+let CONTINUITY_BUNDLE_PREFIX = "PBDL1_CONT";
+let PINNED_ORIGIN_PREFIX = "PBORIGIN1";
+let RELEASE_2OF2_PREFIX = "PBREL2OF2";
+
+let ISOLATION_NORMAL = "NORMAL";
+let ISOLATION_SECOND_LOCK_REQUIRED = "SECOND_LOCK_REQUIRED";
+let ISOLATION_READ_ONLY_FREEZE = "READ_ONLY_FREEZE";
+let ISOLATION_FULL_KILL_SWITCH = "FULL_KILL_SWITCH";
+
+let _MASK32 = 4294967295;
+let _MOD32 = 4294967296;
+let _HEX_CHARS = "0123456789abcdef";
+
+// RFC 8032 Curve25519 / Ed25519 constants
+let _BI_ZERO = bigint(0);
+let _BI_ONE = bigint(1);
+let _BI_TWO = bigint(2);
+let _BI_256 = bigint(256);
+let _ED_P = bigint("57896044618658097711785492504343953926634992332820282019728792003956564819949");
+let _ED_L = bigint("7237005577332262213973186563042994240857116359379907606001950938285454250989");
+let _ED_D = bigint("37095705934669439343138083508754565189542113879843219016388785533085940283555");
+let _ED_BASE_X = bigint("15112221349535400772501151409588531511454012693041857206046113283949847762202");
+let _ED_BASE_Y = bigint("46316835694926478169428394003475163141307993866256225615783033603165251855960");
+
+// RFC 8439 Poly1305 constants (2^130 - 5 and 2^128)
+let _POLY_P = bigint("1361129467683753853853498429727072845819");
+let _POLY_MOD128 = bigint("340282366920938463463374607431768211456");
+
+let _FORBIDDEN_CANARY_ACTIONS = map{
+    "BULK_EXPORT": true,
+    "BYPASS_PRIMARY_LOCK": true,
+    "DISABLE_AUDIT": true,
+    "REDIRECT_ORIGIN": true
+};
+
+let _ISOLATION_RANK = map{
+    "NORMAL": 0,
+    "SECOND_LOCK_REQUIRED": 1,
+    "READ_ONLY_FREEZE": 2,
+    "FULL_KILL_SWITCH": 3
+};
+
+fn _err(msg) {
+    throw "duallock_anti_supplychain: " + str(msg);
+}
+
+fn _opt(m, key, fallback) {
+    if m == nil or not is_map(m) { return fallback; }
+    if not map_has(m, key) { return fallback; }
+    let val = m[key];
+    if val == nil { return fallback; }
+    return val;
+}
+
+fn _now_unix() {
+    return num_floor(time_ms() / 1000);
+}
+
+fn _array_contains_str(arr, needle) {
+    if not is_array(arr) or not is_string(needle) { return false; }
+    let idx = 0;
+    while idx < len(arr) {
+        let item = arr[idx];
+        if is_string(item) and constant_time_eq(item, needle) {
+            return true;
+        }
+        idx = idx + 1;
+    }
+    return false;
+}
+
+fn _max_isolation_mode(mode_a, mode_b) {
+    let rank_a = _opt(_ISOLATION_RANK, mode_a, 0);
+    let rank_b = _opt(_ISOLATION_RANK, mode_b, 0);
+    if rank_b > rank_a { return mode_b; }
+    return mode_a;
+}
+
+// ── Hex, Byte, Constant-Time, Base64URL & Canonical JSON Utilities ───────────
+
+fn _bytes_to_hex(bytes) {
+    return str_lower(hex_encode(bytes_to_str(bytes)));
+}
+
+fn _hex_nibble(code, strict_lower) {
+    if code >= 48 and code <= 57 { return code - 48; }
+    if code >= 97 and code <= 102 { return code - 87; }
+    if not strict_lower and code >= 65 and code <= 70 { return code - 55; }
+    return 0 - 1;
+}
+
+fn _hex_to_bytes_checked(hex_str, exact_byte_len, strict_lower) {
+    if not is_string(hex_str) { return nil; }
+    if len(hex_str) % 2 != 0 { return nil; }
+    if exact_byte_len != nil and len(hex_str) != exact_byte_len * 2 { return nil; }
+    let out = [];
+    let idx = 0;
+    while idx < len(hex_str) {
+        let hi = _hex_nibble(strcharcodeat(hex_str, idx), strict_lower);
+        let lo = _hex_nibble(strcharcodeat(hex_str, idx + 1), strict_lower);
+        if hi < 0 or lo < 0 { return nil; }
+        array_push(out, hi * 16 + lo);
+        idx = idx + 2;
+    }
+    return out;
+}
+
+fn _is_valid_hex(hex_str, exact_byte_len) {
+    return _hex_to_bytes_checked(hex_str, exact_byte_len, false) != nil;
+}
+
+fn _as_bytes(val) {
+    if is_array(val) {
+        let out = [];
+        let idx = 0;
+        while idx < len(val) {
+            let b = val[idx];
+            if not is_number(b) or num_floor(b) != b or b < 0 or b > 255 {
+                _err("byte array must contain integers 0..255");
+            }
+            array_push(out, b);
+            idx = idx + 1;
+        }
+        return out;
+    }
+    if is_string(val) {
+        return str_to_bytes(val);
+    }
+    _err("expected string or byte array");
+}
+
+fn _ct_eq_bytes(a, b) {
+    if not is_array(a) or not is_array(b) { return false; }
+    if len(a) != len(b) { return false; }
+    let diff = 0;
+    let idx = 0;
+    while idx < len(a) {
+        diff = bit_or(diff, bit_xor(bit_and(a[idx], 255), bit_and(b[idx], 255)));
+        idx = idx + 1;
+    }
+    return diff == 0;
+}
+
+fn _ct_eq_hex_norm(a, b, expected_hex_len) {
+    if not is_string(a) or not is_string(b) { return false; }
+    if expected_hex_len != nil and (len(a) != expected_hex_len or len(b) != expected_hex_len) {
+        return false;
+    }
+    if not _is_valid_hex(a, nil) or not _is_valid_hex(b, nil) {
+        return false;
+    }
+    return constant_time_eq(str_lower(a), str_lower(b));
+}
+
+fn base64url_encode_bytes(bytes) {
+    let b64 = base64_encode_bytes(bytes);
+    let step1 = str_replace_all(b64, "+", "-");
+    let step2 = str_replace_all(step1, "/", "_");
+    return str_replace_all(step2, "=", "");
+}
+
+fn base64url_decode_bytes_strict(b64u) {
+    if not is_string(b64u) or len(b64u) == 0 { return nil; }
+    let rem = len(b64u) % 4;
+    if rem == 1 { return nil; }
+    let idx = 0;
+    while idx < len(b64u) {
+        let ch = strcharcodeat(b64u, idx);
+        let ok_ch = (ch >= 65 and ch <= 90)
+            or (ch >= 97 and ch <= 122)
+            or (ch >= 48 and ch <= 57)
+            or ch == 45 or ch == 95;
+        if not ok_ch { return nil; }
+        idx = idx + 1;
+    }
+    let std = str_replace_all(str_replace_all(b64u, "-", "+"), "_", "/");
+    if rem == 2 { std = std + "=="; }
+    if rem == 3 { std = std + "="; }
+    let decoded = try base64_decode_bytes(std) catch nil;
+    if decoded == nil { return nil; }
+    if base64url_encode_bytes(decoded) != b64u { return nil; }
+    return decoded;
+}
+
+fn canonical_json_encode(val) {
+    if val == nil { return "null"; }
+    if is_bool(val) { return if val { "true" } else { "false" }; }
+    if is_number(val) { return json_stringify(val); }
+    if is_string(val) { return json_stringify(val); }
+    if is_array(val) {
+        let parts = [];
+        let idx = 0;
+        while idx < len(val) {
+            array_push(parts, canonical_json_encode(val[idx]));
+            idx = idx + 1;
+        }
+        return "[" + str_join(parts, ",") + "]";
+    }
+    if is_map(val) {
+        let sorted_keys = array_sort(map_keys(val));
+        let parts = [];
+        let idx = 0;
+        while idx < len(sorted_keys) {
+            let k = str(sorted_keys[idx]);
+            array_push(parts, json_stringify(k) + ":" + canonical_json_encode(val[k]));
+            idx = idx + 1;
+        }
+        return "{" + str_join(parts, ",") + "}";
+    }
+    _err("unsupported type in canonical_json_encode: " + type(val));
+}
+
+// Rejects strings containing filesystem paths, emails, userinfo, or whitespace
+fn _has_pii_or_path_leak(raw_text) {
+    if not is_string(raw_text) { return true; }
+    if str_contains(raw_text, "@") or str_contains(raw_text, "/") or str_contains(raw_text, "\\") {
+        return true;
+    }
+    if str_contains(raw_text, ":") or str_contains(raw_text, " ") {
+        return true;
+    }
+    return false;
+}
+
+// ── RFC 8032 Pure-PBLang Ed25519 (with Fast Native SHA-512 Digest) ───────────
+
+fn _ed_mod_p(val) {
+    let rem = val % _ED_P;
+    if rem < _BI_ZERO { rem = rem + _ED_P; }
+    return rem;
+}
+
+fn _ed_pow_mod_p(base_val, exp_val) {
+    let res = _BI_ONE;
+    let factor = _ed_mod_p(base_val);
+    let rem = exp_val;
+    while rem > _BI_ZERO {
+        if rem % _BI_TWO == _BI_ONE { res = _ed_mod_p(res * factor); }
+        factor = _ed_mod_p(factor * factor);
+        rem = rem / _BI_TWO;
+    }
+    return res;
+}
+
+fn _le_bytes_to_bigint(bytes) {
+    let acc = _BI_ZERO;
+    let factor = _BI_ONE;
+    let idx = 0;
+    while idx < len(bytes) {
+        acc = acc + bigint(bit_and(bytes[idx], 255)) * factor;
+        factor = factor * _BI_256;
+        idx = idx + 1;
+    }
+    return acc;
+}
+
+fn _bigint_to_le_bytes(val, nbytes) {
+    let out = [];
+    let cur = val;
+    let idx = 0;
+    while idx < nbytes {
+        let b_bi = cur % _BI_256;
+        array_push(out, parse_number(str(b_bi)));
+        cur = cur / _BI_256;
+        idx = idx + 1;
+    }
+    return out;
+}
+
+fn _ed_point_add(left, right) {
+    let a = _ed_mod_p((left.y - left.x) * (right.y - right.x));
+    let b = _ed_mod_p((left.y + left.x) * (right.y + right.x));
+    let c = _ed_mod_p(_BI_TWO * _ED_D * left.t * right.t);
+    let d2 = _ed_mod_p(_BI_TWO * left.z * right.z);
+    let e = _ed_mod_p(b - a);
+    let f = _ed_mod_p(d2 - c);
+    let g = _ed_mod_p(d2 + c);
+    let h = _ed_mod_p(b + a);
+    return map{
+        x: _ed_mod_p(e * f),
+        y: _ed_mod_p(g * h),
+        z: _ed_mod_p(f * g),
+        t: _ed_mod_p(e * h)
+    };
+}
+
+fn _ed_point_double(pt) {
+    let a = _ed_mod_p(pt.x * pt.x);
+    let b = _ed_mod_p(pt.y * pt.y);
+    let c = _ed_mod_p(_BI_TWO * pt.z * pt.z);
+    let d2 = _ed_mod_p(_BI_ZERO - a);
+    let e = _ed_mod_p((pt.x + pt.y) * (pt.x + pt.y) - a - b);
+    let g = _ed_mod_p(d2 + b);
+    let f = _ed_mod_p(g - c);
+    let h = _ed_mod_p(d2 - b);
+    return map{
+        x: _ed_mod_p(e * f),
+        y: _ed_mod_p(g * h),
+        z: _ed_mod_p(f * g),
+        t: _ed_mod_p(e * h)
+    };
+}
+
+fn _ed_scalar_mult_base(scalar) {
+    let res = map{ x: _BI_ZERO, y: _BI_ONE, z: _BI_ONE, t: _BI_ZERO };
+    let addend = map{ x: _ED_BASE_X, y: _ED_BASE_Y, z: _BI_ONE, t: _ed_mod_p(_ED_BASE_X * _ED_BASE_Y) };
+    let rem = scalar;
+    while rem > _BI_ZERO {
+        if rem % _BI_TWO == _BI_ONE { res = _ed_point_add(res, addend); }
+        addend = _ed_point_double(addend);
+        rem = rem / _BI_TWO;
+    }
+    return res;
+}
+
+fn _ed_encode_point(pt) {
+    let z_inv = _ed_pow_mod_p(pt.z, _ED_P - _BI_TWO);
+    let x = _ed_mod_p(pt.x * z_inv);
+    let y = _ed_mod_p(pt.y * z_inv);
+    let enc = _bigint_to_le_bytes(y, 32);
+    if x % _BI_TWO == _BI_ONE {
+        enc[31] = enc[31] + 128;
+    }
+    return enc;
+}
+
+fn _sha512_bytes(input_bytes) {
+    let digest_hex = sha512(bytes_to_str(input_bytes));
+    return _hex_to_bytes_checked(digest_hex, 64, false);
+}
+
+fn _ed_expand_seed(seed32) {
+    let h = _sha512_bytes(seed32);
+    let clamped = slice(h, 0, 32);
+    clamped[0] = bit_and(clamped[0], 248);
+    clamped[31] = bit_or(bit_and(clamped[31], 127), 64);
+    let prefix = slice(h, 32, 64);
+    let scalar_a = _le_bytes_to_bigint(clamped);
+    let pub_bytes = _ed_encode_point(_ed_scalar_mult_base(scalar_a));
+    return map{
+        scalar_a: scalar_a,
+        prefix: prefix,
+        pk_bytes: pub_bytes,
+        pk_hex: _bytes_to_hex(pub_bytes)
+    };
+}
+
+fn ed25519_keygen(seed_hex = nil) {
+    let raw_hex = if seed_hex == nil { csprng_hex(32) } else { str_lower(seed_hex) };
+    let seed32 = _hex_to_bytes_checked(raw_hex, 32, false);
+    if seed32 == nil { _err("ed25519 seed must be 64 hex chars"); }
+    let expanded = _ed_expand_seed(seed32);
+    let sk_norm = _bytes_to_hex(seed32);
+    return map{
+        pk_hex: expanded.pk_hex,
+        sk_hex: sk_norm,
+        pk: expanded.pk_hex,
+        sk: sk_norm
+    };
+}
+
+fn ed25519_sign_msg(sk_hex, msg_str_or_bytes) {
+    let seed32 = _hex_to_bytes_checked(sk_hex, 32, false);
+    if seed32 == nil { _err("ed25519 secret key must be 64 hex chars"); }
+    let msg_bytes = _as_bytes(msg_str_or_bytes);
+    let expanded = _ed_expand_seed(seed32);
+
+    let r_input = [];
+    let idx = 0;
+    while idx < 32 { array_push(r_input, expanded.prefix[idx]); idx = idx + 1; }
+    idx = 0;
+    while idx < len(msg_bytes) { array_push(r_input, msg_bytes[idx]); idx = idx + 1; }
+    let r_digest = _sha512_bytes(r_input);
+    let r_scalar = _le_bytes_to_bigint(r_digest) % _ED_L;
+    let r_bytes = _ed_encode_point(_ed_scalar_mult_base(r_scalar));
+
+    let k_input = [];
+    idx = 0;
+    while idx < 32 { array_push(k_input, r_bytes[idx]); idx = idx + 1; }
+    idx = 0;
+    while idx < 32 { array_push(k_input, expanded.pk_bytes[idx]); idx = idx + 1; }
+    idx = 0;
+    while idx < len(msg_bytes) { array_push(k_input, msg_bytes[idx]); idx = idx + 1; }
+    let k_digest = _sha512_bytes(k_input);
+    let k_scalar = _le_bytes_to_bigint(k_digest) % _ED_L;
+
+    let s_scalar = (r_scalar + k_scalar * expanded.scalar_a) % _ED_L;
+    let s_bytes = _bigint_to_le_bytes(s_scalar, 32);
+
+    let sig64 = [];
+    idx = 0;
+    while idx < 32 { array_push(sig64, r_bytes[idx]); idx = idx + 1; }
+    idx = 0;
+    while idx < 32 { array_push(sig64, s_bytes[idx]); idx = idx + 1; }
+    return _bytes_to_hex(sig64);
+}
+
+fn ed25519_verify_msg(pk_hex, msg_str_or_bytes, sig_hex) {
+    let pk32 = _hex_to_bytes_checked(pk_hex, 32, false);
+    let sig64 = _hex_to_bytes_checked(sig_hex, 64, true);
+    if pk32 == nil or sig64 == nil { return false; }
+    let msg_bytes = try _as_bytes(msg_str_or_bytes) catch nil;
+    if msg_bytes == nil { return false; }
+    return _ED_VERIFY.verify(pk32, msg_bytes, sig64);
+}
+
+// ── RFC 8439 Pure-PBLang ChaCha20-Poly1305 AEAD ──────────────────────────────
+
+fn _rotl32(x, n) {
+    let xm = bit_and(x, _MASK32);
+    if n <= 0 { return xm; }
+    let keep = bit_shr(_MASK32, n);
+    let lo = bit_and(xm, keep);
+    return bit_or(bit_shl(lo, n), bit_shr(xm, 32 - n));
+}
+
+fn _add32(a, b) {
+    return num_mod(bit_and(a, _MASK32) + bit_and(b, _MASK32), _MOD32);
+}
+
+fn _le32(b, off) {
+    return b[off] + b[off + 1] * 256 + b[off + 2] * 65536 + b[off + 3] * 16777216;
+}
+
+fn _push_le32(out, w) {
+    array_push(out, bit_and(w, 255));
+    array_push(out, bit_and(bit_shr(w, 8), 255));
+    array_push(out, bit_and(bit_shr(w, 16), 255));
+    array_push(out, bit_and(bit_shr(w, 24), 255));
+}
+
+fn _push_le64(out, n) {
+    let lo = num_mod(n, _MOD32);
+    let hi = num_floor(n / _MOD32);
+    _push_le32(out, lo);
+    _push_le32(out, hi);
+}
+
+fn _chacha_qr(w, a, b, c, d) {
+    w[a] = _add32(w[a], w[b]); w[d] = _rotl32(bit_xor(w[d], w[a]), 16);
+    w[c] = _add32(w[c], w[d]); w[b] = _rotl32(bit_xor(w[b], w[c]), 12);
+    w[a] = _add32(w[a], w[b]); w[d] = _rotl32(bit_xor(w[d], w[a]), 8);
+    w[c] = _add32(w[c], w[d]); w[b] = _rotl32(bit_xor(w[b], w[c]), 7);
+}
+
+fn chacha20_block_rfc8439(key32, counter, nonce12) {
+    let s = [1634760805, 857760878, 2036477234, 1797285236];
+    let k = 0;
+    while k < 8 {
+        array_push(s, _le32(key32, k * 4));
+        k = k + 1;
+    }
+    array_push(s, num_mod(counter, _MOD32));
+    array_push(s, _le32(nonce12, 0));
+    array_push(s, _le32(nonce12, 4));
+    array_push(s, _le32(nonce12, 8));
+
+    let w = [];
+    let idx = 0;
+    while idx < 16 { array_push(w, s[idx]); idx = idx + 1; }
+    let rnd = 0;
+    while rnd < 10 {
+        _chacha_qr(w, 0, 4, 8, 12); _chacha_qr(w, 1, 5, 9, 13);
+        _chacha_qr(w, 2, 6, 10, 14); _chacha_qr(w, 3, 7, 11, 15);
+        _chacha_qr(w, 0, 5, 10, 15); _chacha_qr(w, 1, 6, 11, 12);
+        _chacha_qr(w, 2, 7, 8, 13); _chacha_qr(w, 3, 4, 9, 14);
+        rnd = rnd + 1;
+    }
+    let out = [];
+    idx = 0;
+    while idx < 16 {
+        _push_le32(out, _add32(w[idx], s[idx]));
+        idx = idx + 1;
+    }
+    return out;
+}
+
+fn chacha20_stream_xor(data_bytes, key32, nonce12, initial_counter) {
+    let out = [];
+    let ctr = initial_counter;
+    let idx = 0;
+    while idx < len(data_bytes) {
+        let ks = chacha20_block_rfc8439(key32, ctr, nonce12);
+        let j = 0;
+        while j < 64 and idx < len(data_bytes) {
+            array_push(out, bit_xor(bit_and(data_bytes[idx], 255), ks[j]));
+            idx = idx + 1;
+            j = j + 1;
+        }
+        ctr = ctr + 1;
+    }
+    return out;
+}
+
+fn poly1305_mac_rfc8439(msg_bytes, otk32) {
+    let r_bytes = slice(otk32, 0, 16);
+    let s_bytes = slice(otk32, 16, 32);
+    r_bytes[3] = bit_and(r_bytes[3], 15);
+    r_bytes[7] = bit_and(r_bytes[7], 15);
+    r_bytes[11] = bit_and(r_bytes[11], 15);
+    r_bytes[15] = bit_and(r_bytes[15], 15);
+    r_bytes[4] = bit_and(r_bytes[4], 252);
+    r_bytes[8] = bit_and(r_bytes[8], 252);
+    r_bytes[12] = bit_and(r_bytes[12], 252);
+
+    let r_bi = _le_bytes_to_bigint(r_bytes);
+    let s_bi = _le_bytes_to_bigint(s_bytes);
+    let acc = _BI_ZERO;
+    let idx = 0;
+    let total = len(msg_bytes);
+    while idx < total {
+        let chunk = [];
+        let j = 0;
+        while j < 16 and idx + j < total {
+            array_push(chunk, bit_and(msg_bytes[idx + j], 255));
+            j = j + 1;
+        }
+        array_push(chunk, 1);
+        let n_bi = _le_bytes_to_bigint(chunk);
+        acc = ((acc + n_bi) * r_bi) % _POLY_P;
+        idx = idx + 16;
+    }
+    let tag_bi = (acc + s_bi) % _POLY_MOD128;
+    return _bigint_to_le_bytes(tag_bi, 16);
+}
+
+fn _build_poly1305_aead_input(aad_bytes, ct_bytes) {
+    let buf = [];
+    let idx = 0;
+    while idx < len(aad_bytes) { array_push(buf, aad_bytes[idx]); idx = idx + 1; }
+    while len(buf) % 16 != 0 { array_push(buf, 0); }
+    idx = 0;
+    while idx < len(ct_bytes) { array_push(buf, ct_bytes[idx]); idx = idx + 1; }
+    while len(buf) % 16 != 0 { array_push(buf, 0); }
+    _push_le64(buf, len(aad_bytes));
+    _push_le64(buf, len(ct_bytes));
+    return buf;
+}
+
+fn chacha20_poly1305_encrypt(key_hex, nonce_hex, plaintext_str_or_bytes, aad_str = "") {
+    let key32 = _hex_to_bytes_checked(key_hex, 32, false);
+    let nonce12 = _hex_to_bytes_checked(nonce_hex, 12, false);
+    if key32 == nil { _err("ChaCha20-Poly1305 key_hex must be 64 hex chars (32 bytes)"); }
+    if nonce12 == nil { _err("ChaCha20-Poly1305 nonce_hex must be 24 hex chars (12 bytes)"); }
+    let pt_bytes = _as_bytes(plaintext_str_or_bytes);
+    let aad_bytes = str_to_bytes(str(aad_str));
+    let otk = slice(chacha20_block_rfc8439(key32, 0, nonce12), 0, 32);
+    let ct = chacha20_stream_xor(pt_bytes, key32, nonce12, 1);
+    let mac_in = _build_poly1305_aead_input(aad_bytes, ct);
+    let tag16 = poly1305_mac_rfc8439(mac_in, otk);
+    return map{
+        nonce_hex: _bytes_to_hex(nonce12),
+        ciphertext_bytes: ct,
+        ciphertext_b64url: base64url_encode_bytes(ct),
+        tag_bytes: tag16,
+        tag_hex: _bytes_to_hex(tag16)
+    };
+}
+
+fn chacha20_poly1305_decrypt(key_hex, nonce_hex, ciphertext_bytes, tag_hex, aad_str = "") {
+    let key32 = _hex_to_bytes_checked(key_hex, 32, false);
+    let nonce12 = _hex_to_bytes_checked(nonce_hex, 12, false);
+    let tag16 = _hex_to_bytes_checked(tag_hex, 16, true);
+    if key32 == nil or nonce12 == nil or tag16 == nil or not is_array(ciphertext_bytes) {
+        return map{ ok: false, plaintext_bytes: nil, plaintext_str: nil };
+    }
+    let aad_bytes = str_to_bytes(str(aad_str));
+    let otk = slice(chacha20_block_rfc8439(key32, 0, nonce12), 0, 32);
+    let mac_in = _build_poly1305_aead_input(aad_bytes, ciphertext_bytes);
+    let expected_tag = poly1305_mac_rfc8439(mac_in, otk);
+    if not _ct_eq_bytes(expected_tag, tag16) {
+        return map{ ok: false, plaintext_bytes: nil, plaintext_str: nil };
+    }
+    let pt = chacha20_stream_xor(ciphertext_bytes, key32, nonce12, 1);
+    return map{ ok: true, plaintext_bytes: pt, plaintext_str: bytes_to_str(pt) };
+}
+
+fn _seal_pbdl1_envelope(key_hex, plaintext_json, aad_context) {
+    let nonce_hex = str_lower(csprng_hex(12));
+    let aad_bound = aad_context + ":" + nonce_hex;
+    let sealed = chacha20_poly1305_encrypt(key_hex, nonce_hex, plaintext_json, aad_bound);
+    return DUALLOCK_ENVELOPE_PREFIX + "." + sealed.nonce_hex + "." + sealed.ciphertext_b64url + "." + sealed.tag_hex;
+}
+
+fn _open_pbdl1_envelope(key_hex, envelope_str, aad_context) {
+    if not is_string(envelope_str) { return nil; }
+    let parts = str_split(envelope_str, ".");
+    if len(parts) != 4 or parts[0] != DUALLOCK_ENVELOPE_PREFIX { return nil; }
+    let nonce_hex = parts[1];
+    let ct_b64u = parts[2];
+    let tag_hex = parts[3];
+    if _hex_to_bytes_checked(nonce_hex, 12, true) == nil { return nil; }
+    if _hex_to_bytes_checked(tag_hex, 16, true) == nil { return nil; }
+    let ct_bytes = base64url_decode_bytes_strict(ct_b64u);
+    if ct_bytes == nil { return nil; }
+    let aad_bound = aad_context + ":" + nonce_hex;
+    let dec = chacha20_poly1305_decrypt(key_hex, nonce_hex, ct_bytes, tag_hex, aad_bound);
+    if not dec.ok or dec.plaintext_str == nil { return nil; }
+    let parsed = try json_parse(dec.plaintext_str) catch nil;
+    if not is_map(parsed) { return nil; }
+    return parsed;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PILLAR 1: Ergonomic Developer-Optional Dual-Lock ("Διπλό Κλείδωμα") Protocol
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn create_duallock_authority(seed_hex = nil) {
+    let kp = ed25519_keygen(seed_hex);
+    let aead_key = str_lower(csprng_hex(32));
+    let pepper = str_lower(csprng_hex(32));
+    return map{
+        owner_ed25519_pk: kp.pk_hex,
+        owner_ed25519_sk: kp.sk_hex,
+        transport_aead_key_hex: aead_key,
+        hmac_pepper_hex: pepper
+    };
+}
+
+fn create_default_duallock_server_state(now_unix = nil, dead_man_days = 30) {
+    let ts = if now_unix == nil { _now_unix() } else { num_floor(now_unix) };
+    return map{
+        manual_sovereign_arm: false,
+        revoked_editions: [],
+        revoked_seats: [],
+        last_owner_checkin_unix: ts,
+        dead_man_days: dead_man_days,
+        isolation_mode: ISOLATION_NORMAL,
+        lease_ttl_sec: 3600,
+        feature_unlock_mask: 65535,
+        canary_tripped: false
+    };
+}
+
+fn blind_seat_commitment(product_id, raw_device_token) {
+    if not is_string(product_id) or len(product_id) == 0 {
+        _err("product_id must be a non-empty string");
+    }
+    return "seat_" + str_slice(hmac_sha256(str(raw_device_token), "PBDL1-SEAT-BLIND:" + product_id), 0, 32);
+}
+
+fn build_duallock_challenge_request(product_id, edition, blinded_seat_id, transport_aead_key_hex, opts = nil) {
+    if not is_string(product_id) or len(product_id) == 0 or _has_pii_or_path_leak(product_id) {
+        _err("product_id must be a clean identifier with zero PII or paths");
+    }
+    if not is_string(edition) or len(edition) == 0 or _has_pii_or_path_leak(edition) {
+        _err("edition must be a clean identifier with zero PII or paths");
+    }
+    if not is_string(blinded_seat_id) or len(blinded_seat_id) == 0 or _has_pii_or_path_leak(blinded_seat_id) {
+        _err("blinded_seat_id must be a privacy-blinded seat commitment (zero PII, zero username/hostname/paths)");
+    }
+    if not _is_valid_hex(transport_aead_key_hex, 32) {
+        _err("transport_aead_key_hex must be 64 hex chars (256-bit key)");
+    }
+
+    let client_nonce = str_lower(csprng_hex(32));
+    let local_ts = _now_unix();
+    let req_action = "HEARTBEAT_LEASE";
+    let req_actions = [];
+
+    if is_string(opts) and len(opts) > 0 {
+        req_action = opts;
+    } else if is_map(opts) {
+        local_ts = num_floor(_opt(opts, "client_local_unix", local_ts));
+        req_action = str(_opt(opts, "requested_action", _opt(opts, "action", req_action)));
+        let extra = _opt(opts, "actions", []);
+        if is_array(extra) { req_actions = extra; }
+    }
+
+    let req_obj = map{
+        v: 1,
+        product_id: product_id,
+        edition: edition,
+        blinded_seat_id: blinded_seat_id,
+        client_nonce: client_nonce,
+        client_local_unix: local_ts,
+        requested_action: req_action,
+        actions: req_actions
+    };
+    let canon = canonical_json_encode(req_obj);
+    let env = _seal_pbdl1_envelope(transport_aead_key_hex, canon, "PBDL1-REQ-V1");
+
+    return map{
+        request_envelope: env,
+        expected_client_nonce: client_nonce,
+        client_local_unix: local_ts
+    };
+}
+
+fn _request_trips_canary(req_map) {
+    let act = str(_opt(req_map, "requested_action", ""));
+    if map_has(_FORBIDDEN_CANARY_ACTIONS, act) {
+        return true;
+    }
+    let act_list = _opt(req_map, "actions", []);
+    if is_array(act_list) {
+        let idx = 0;
+        while idx < len(act_list) {
+            if map_has(_FORBIDDEN_CANARY_ACTIONS, str(act_list[idx])) {
+                return true;
+            }
+            idx = idx + 1;
+        }
+    }
+    return false;
+}
+
+fn evaluate_and_sign_duallock_lease(server_state, request_envelope, authority_keys, server_now_unix) {
+    if not is_map(server_state) or not is_map(authority_keys) or not is_number(server_now_unix) {
+        return map{ ok: false, error_code: "DUALLOCK_INVALID_SERVER_ARGS", response_envelope: nil };
+    }
+    let aead_key = _opt(authority_keys, "transport_aead_key_hex", "");
+    let sk_hex = _opt(authority_keys, "owner_ed25519_sk", "");
+    let pepper_hex = _opt(authority_keys, "hmac_pepper_hex", "");
+    if not _is_valid_hex(aead_key, 32) or not _is_valid_hex(sk_hex, 32) or not _is_valid_hex(pepper_hex, 32) {
+        return map{ ok: false, error_code: "DUALLOCK_INVALID_AUTHORITY_KEYS", response_envelope: nil };
+    }
+
+    let req = _open_pbdl1_envelope(aead_key, request_envelope, "PBDL1-REQ-V1");
+    if req == nil or _opt(req, "v", 0) != 1 {
+        return map{ ok: false, error_code: "DUALLOCK_INVALID_REQUEST_ENVELOPE", response_envelope: nil };
+    }
+    let prod_id = _opt(req, "product_id", "");
+    let ed = _opt(req, "edition", "");
+    let seat_id = _opt(req, "blinded_seat_id", "");
+    let c_nonce = _opt(req, "client_nonce", "");
+    if not is_string(prod_id) or len(prod_id) == 0 or not is_string(ed) or len(ed) == 0
+       or not is_string(seat_id) or len(seat_id) == 0 or not _is_valid_hex(c_nonce, 32) {
+        return map{ ok: false, error_code: "DUALLOCK_MALFORMED_REQUEST_FIELDS", response_envelope: nil };
+    }
+
+    let now_sec = num_floor(server_now_unix);
+    let configured_mode = str(_opt(server_state, "isolation_mode", ISOLATION_NORMAL));
+    if not map_has(_ISOLATION_RANK, configured_mode) {
+        configured_mode = ISOLATION_SECOND_LOCK_REQUIRED;
+    }
+
+    let mode = configured_mode;
+    let dual_lock_armed = mode != ISOLATION_NORMAL;
+    let revoked = false;
+    let dead_man_triggered = false;
+    let canary_tripped = _opt(server_state, "canary_tripped", false) == true;
+
+    // Safeguard A: manual_sovereign_arm / revoked_editions / revoked_seats
+    let revoked_editions = _opt(server_state, "revoked_editions", []);
+    let revoked_seats = _opt(server_state, "revoked_seats", []);
+    if _array_contains_str(revoked_editions, ed) or _array_contains_str(revoked_seats, seat_id) {
+        revoked = true;
+        dual_lock_armed = true;
+        mode = _max_isolation_mode(mode, ISOLATION_FULL_KILL_SWITCH);
+    }
+    if _opt(server_state, "manual_sovereign_arm", false) == true {
+        dual_lock_armed = true;
+        mode = _max_isolation_mode(mode, ISOLATION_SECOND_LOCK_REQUIRED);
+    }
+
+    // Safeguard B: dead_man_switch (owner inactivity auto-arms second lock)
+    let dead_man_days = _opt(server_state, "dead_man_days", 30);
+    let last_checkin = _opt(server_state, "last_owner_checkin_unix", now_sec);
+    if is_number(dead_man_days) and dead_man_days > 0 {
+        if (now_sec - last_checkin) > (dead_man_days * 86400) {
+            dead_man_triggered = true;
+            dual_lock_armed = true;
+            mode = _max_isolation_mode(mode, ISOLATION_SECOND_LOCK_REQUIRED);
+        }
+    }
+
+    // Safeguard C: canary_tamper_tripwire (forbidden actions -> instant FULL_KILL_SWITCH)
+    if canary_tripped or _request_trips_canary(req) {
+        canary_tripped = true;
+        dual_lock_armed = true;
+        mode = ISOLATION_FULL_KILL_SWITCH;
+        server_state["canary_tripped"] = true;
+        server_state["isolation_mode"] = ISOLATION_FULL_KILL_SWITCH;
+    }
+
+    // Safeguard D: isolation_mode lease & feature mask calculation
+    let base_ttl = _opt(server_state, "lease_ttl_sec", 3600);
+    if not is_number(base_ttl) or base_ttl < 0 { base_ttl = 3600; }
+    let base_mask = _opt(server_state, "feature_unlock_mask", 65535);
+
+    let lease_expires_unix = now_sec + num_floor(base_ttl);
+    let feature_mask = base_mask;
+
+    if mode == ISOLATION_FULL_KILL_SWITCH {
+        lease_expires_unix = now_sec;
+        feature_mask = 0;
+        dual_lock_armed = true;
+    } else if mode == ISOLATION_READ_ONLY_FREEZE {
+        feature_mask = 1;
+        dual_lock_armed = true;
+    } else if mode == ISOLATION_SECOND_LOCK_REQUIRED {
+        feature_mask = 0;
+        dual_lock_armed = true;
+    }
+
+    let response_payload = map{
+        v: 1,
+        product_id: prod_id,
+        edition: ed,
+        blinded_seat_id: seat_id,
+        client_nonce: str_lower(c_nonce),
+        server_utc_unix: now_sec,
+        lease_expires_unix: lease_expires_unix,
+        isolation_mode: mode,
+        dual_lock_armed: dual_lock_armed,
+        feature_unlock_mask: feature_mask,
+        dead_man_triggered: dead_man_triggered,
+        canary_tripped: canary_tripped,
+        revoked: revoked
+    };
+
+    let canon_resp = canonical_json_encode(response_payload);
+    let hmac_sig = str_lower(hmac_sha256("PBDL1-LEASE-HMAC-V1:" + canon_resp, str_lower(pepper_hex)));
+    let ed_sig = ed25519_sign_msg(sk_hex, "PBDL1-LEASE-ED25519-V1:" + canon_resp);
+
+    let signed_bundle = map{
+        payload: response_payload,
+        hmac_sha256_hex: hmac_sig,
+        ed25519_sig_hex: ed_sig
+    };
+    let encrypted_resp = _seal_pbdl1_envelope(aead_key, canonical_json_encode(signed_bundle), "PBDL1-RES-V1");
+
+    return map{
+        ok: true,
+        response_envelope: encrypted_resp,
+        isolation_mode: mode,
+        dual_lock_armed: dual_lock_armed,
+        dead_man_triggered: dead_man_triggered,
+        canary_tripped: canary_tripped,
+        revoked: revoked,
+        server_utc_unix: now_sec,
+        lease_expires_unix: lease_expires_unix,
+        feature_unlock_mask: feature_mask
+    };
+}
+
+fn verify_duallock_lease_response(
+    response_envelope,
+    expected_client_nonce,
+    product_id,
+    edition,
+    owner_ed25519_pk,
+    hmac_pepper_hex,
+    transport_aead_key_hex,
+    opts = nil
+) {
+    let fail = fn(code) {
+        return map{
+            ok: false,
+            allowed_to_execute: false,
+            read_only_mode: false,
+            server_utc_unix: nil,
+            lease_expires_unix: nil,
+            isolation_mode: ISOLATION_FULL_KILL_SWITCH,
+            dual_lock_armed: true,
+            feature_unlock_mask: 0,
+            error_code: code
+        };
+    };
+
+    if not _is_valid_hex(expected_client_nonce, 32) {
+        return fail("DUALLOCK_INVALID_EXPECTED_NONCE");
+    }
+    if not _is_valid_hex(owner_ed25519_pk, 32) or not _is_valid_hex(hmac_pepper_hex, 32) or not _is_valid_hex(transport_aead_key_hex, 32) {
+        return fail("DUALLOCK_INVALID_VERIFIER_KEYS");
+    }
+
+    let bundle = _open_pbdl1_envelope(transport_aead_key_hex, response_envelope, "PBDL1-RES-V1");
+    if bundle == nil {
+        return fail("DUALLOCK_AEAD_DECRYPT_FAILED");
+    }
+
+    let payload = _opt(bundle, "payload", nil);
+    let got_hmac = _opt(bundle, "hmac_sha256_hex", "");
+    let got_ed = _opt(bundle, "ed25519_sig_hex", "");
+    if not is_map(payload) or _opt(payload, "v", 0) != 1 {
+        return fail("DUALLOCK_INVALID_PAYLOAD_SCHEMA");
+    }
+
+    // Verify BOTH HMAC-SHA256 AND RFC 8032 Ed25519 BEFORE trusting payload fields
+    let canon_resp = canonical_json_encode(payload);
+    let expected_hmac = str_lower(hmac_sha256("PBDL1-LEASE-HMAC-V1:" + canon_resp, str_lower(hmac_pepper_hex)));
+    let hmac_ok = _ct_eq_hex_norm(got_hmac, expected_hmac, 64);
+    let ed_ok = ed25519_verify_msg(owner_ed25519_pk, "PBDL1-LEASE-ED25519-V1:" + canon_resp, got_ed);
+    if not hmac_ok or not ed_ok {
+        return fail("DUALLOCK_DUAL_SIGNATURE_INVALID");
+    }
+
+    // Constant-time anti-replay nonce check (blocks HTTP / mitmproxy replay 100%)
+    let resp_nonce = str(_opt(payload, "client_nonce", ""));
+    if not _ct_eq_hex_norm(resp_nonce, expected_client_nonce, 64) {
+        return fail("DUALLOCK_NONCE_REPLAY_DETECTED");
+    }
+
+    // Per-product & per-edition cryptographic isolation
+    let resp_prod = str(_opt(payload, "product_id", ""));
+    let resp_ed = str(_opt(payload, "edition", ""));
+    if not is_string(product_id) or not constant_time_eq(resp_prod, product_id) {
+        return fail("DUALLOCK_PRODUCT_MISMATCH");
+    }
+    if not is_string(edition) or not constant_time_eq(resp_ed, edition) {
+        return fail("DUALLOCK_EDITION_ISOLATION_MISMATCH");
+    }
+
+    if is_map(opts) and map_has(opts, "expected_blinded_seat_id") and opts["expected_blinded_seat_id"] != nil {
+        let resp_seat = str(_opt(payload, "blinded_seat_id", ""));
+        if not constant_time_eq(resp_seat, str(opts["expected_blinded_seat_id"])) {
+            return fail("DUALLOCK_SEAT_MISMATCH");
+        }
+    }
+
+    let mode = str(_opt(payload, "isolation_mode", ""));
+    if not map_has(_ISOLATION_RANK, mode) {
+        return fail("DUALLOCK_UNKNOWN_ISOLATION_MODE");
+    }
+
+    let server_utc = _opt(payload, "server_utc_unix", nil);
+    let lease_exp = _opt(payload, "lease_expires_unix", nil);
+    if not is_number(server_utc) or not is_number(lease_exp) {
+        return fail("DUALLOCK_INVALID_TIMESTAMPS");
+    }
+
+    let ref_now = if is_map(opts) and is_number(_opt(opts, "now_unix", nil)) {
+        num_floor(opts["now_unix"])
+    } else {
+        server_utc
+    };
+
+    let lease_live = lease_exp > ref_now;
+    let allowed = false;
+    let read_only = false;
+
+    if mode == ISOLATION_NORMAL {
+        allowed = lease_live;
+        read_only = false;
+    } else if mode == ISOLATION_READ_ONLY_FREEZE {
+        allowed = lease_live;
+        read_only = true;
+    } else {
+        // SECOND_LOCK_REQUIRED or FULL_KILL_SWITCH blocks unapproved execution
+        allowed = false;
+        read_only = false;
+    }
+
+    return map{
+        ok: true,
+        allowed_to_execute: allowed,
+        read_only_mode: read_only,
+        server_utc_unix: server_utc,
+        lease_expires_unix: lease_exp,
+        isolation_mode: mode,
+        dual_lock_armed: _opt(payload, "dual_lock_armed", mode != ISOLATION_NORMAL),
+        feature_unlock_mask: _opt(payload, "feature_unlock_mask", 0),
+        dead_man_triggered: _opt(payload, "dead_man_triggered", false),
+        canary_tripped: _opt(payload, "canary_tripped", false),
+        revoked: _opt(payload, "revoked", false),
+        error_code: nil
+    };
+}
+
+// Offline Autonomous Continuity Bundle (`PBDL1_CONT.`) for e.g. 72h offline operation
+fn issue_autonomous_continuity_bundle(authority_keys, spec) {
+    if not is_map(authority_keys) or not is_map(spec) {
+        _err("authority_keys and spec maps are required");
+    }
+    let sk_hex = _opt(authority_keys, "owner_ed25519_sk", "");
+    let pepper_hex = _opt(authority_keys, "hmac_pepper_hex", "");
+    if not _is_valid_hex(sk_hex, 32) or not _is_valid_hex(pepper_hex, 32) {
+        _err("authority_keys must include valid 64-hex owner_ed25519_sk and hmac_pepper_hex");
+    }
+
+    let prod_id = str(_opt(spec, "product_id", ""));
+    let ed = str(_opt(spec, "edition", ""));
+    if len(prod_id) == 0 or _has_pii_or_path_leak(prod_id) or len(ed) == 0 or _has_pii_or_path_leak(ed) {
+        _err("spec.product_id and spec.edition must be clean non-empty identifiers");
+    }
+
+    let seat_id = _opt(spec, "blinded_seat_id", "*");
+    if seat_id == nil { seat_id = "*"; }
+    if seat_id != "*" and _has_pii_or_path_leak(str(seat_id)) {
+        _err("spec.blinded_seat_id contains forbidden PII/path characters");
+    }
+
+    let issued_unix = num_floor(_opt(spec, "issued_unix", _now_unix()));
+    let hours = _opt(spec, "continuity_hours", 72);
+    if not is_number(hours) or hours <= 0 { _err("continuity_hours must be > 0"); }
+    let expires_unix = num_floor(_opt(spec, "expires_unix", issued_unix + num_floor(hours * 3600)));
+
+    let mode = str(_opt(spec, "isolation_mode", ISOLATION_NORMAL));
+    if mode != ISOLATION_NORMAL and mode != ISOLATION_READ_ONLY_FREEZE {
+        _err("continuity bundle isolation_mode must be NORMAL or READ_ONLY_FREEZE");
+    }
+
+    let bundle_payload = map{
+        v: 1,
+        schema: "pbdl1-continuity-v1",
+        bundle_id: str(_opt(spec, "bundle_id", "cont_" + str_lower(csprng_hex(8)))),
+        product_id: prod_id,
+        edition: ed,
+        blinded_seat_id: str(seat_id),
+        issued_unix: issued_unix,
+        continuity_hours: hours,
+        expires_unix: expires_unix,
+        isolation_mode: mode,
+        feature_unlock_mask: _opt(spec, "feature_unlock_mask", 65535)
+    };
+
+    let canon = canonical_json_encode(bundle_payload);
+    let b64u = base64url_encode_bytes(str_to_bytes(canon));
+    let hmac_sig = str_lower(hmac_sha256("PBDL1-CONT-HMAC-V1:" + b64u, str_lower(pepper_hex)));
+    let ed_sig = ed25519_sign_msg(sk_hex, "PBDL1-CONT-ED25519-V1:" + b64u);
+    return CONTINUITY_BUNDLE_PREFIX + "." + b64u + "." + hmac_sig + "." + ed_sig;
+}
+
+fn verify_autonomous_continuity_bundle(
+    bundle_token,
+    product_id,
+    edition,
+    blinded_seat_id,
+    owner_ed25519_pk,
+    hmac_pepper_hex,
+    verified_now_unix
+) {
+    let fail = fn(code) {
+        return map{
+            ok: false,
+            allowed_to_execute: false,
+            read_only_mode: false,
+            issued_unix: nil,
+            expires_unix: nil,
+            remaining_sec: 0,
+            isolation_mode: ISOLATION_FULL_KILL_SWITCH,
+            feature_unlock_mask: 0,
+            error_code: code
+        };
+    };
+
+    if not is_string(bundle_token) or not is_number(verified_now_unix) {
+        return fail("CONTINUITY_INVALID_ARGS");
+    }
+    if not _is_valid_hex(owner_ed25519_pk, 32) or not _is_valid_hex(hmac_pepper_hex, 32) {
+        return fail("CONTINUITY_INVALID_KEYS");
+    }
+    let parts = str_split(bundle_token, ".");
+    if len(parts) != 4 or parts[0] != CONTINUITY_BUNDLE_PREFIX {
+        return fail("CONTINUITY_MALFORMED_TOKEN");
+    }
+    let b64u = parts[1];
+    let got_hmac = parts[2];
+    let got_ed = parts[3];
+
+    let expected_hmac = str_lower(hmac_sha256("PBDL1-CONT-HMAC-V1:" + b64u, str_lower(hmac_pepper_hex)));
+    let hmac_ok = _ct_eq_hex_norm(got_hmac, expected_hmac, 64);
+    let ed_ok = ed25519_verify_msg(owner_ed25519_pk, "PBDL1-CONT-ED25519-V1:" + b64u, got_ed);
+    if not hmac_ok or not ed_ok {
+        return fail("CONTINUITY_DUAL_SIGNATURE_INVALID");
+    }
+
+    let raw_bytes = base64url_decode_bytes_strict(b64u);
+    if raw_bytes == nil { return fail("CONTINUITY_INVALID_ENCODING"); }
+    let payload = try json_parse(bytes_to_str(raw_bytes)) catch nil;
+    if not is_map(payload) or _opt(payload, "v", 0) != 1 {
+        return fail("CONTINUITY_INVALID_SCHEMA");
+    }
+
+    if not constant_time_eq(str(_opt(payload, "product_id", "")), str(product_id)) {
+        return fail("CONTINUITY_PRODUCT_MISMATCH");
+    }
+    if not constant_time_eq(str(_opt(payload, "edition", "")), str(edition)) {
+        return fail("CONTINUITY_EDITION_MISMATCH");
+    }
+    let bound_seat = str(_opt(payload, "blinded_seat_id", "*"));
+    if bound_seat != "*" {
+        if not is_string(blinded_seat_id) or not constant_time_eq(bound_seat, blinded_seat_id) {
+            return fail("CONTINUITY_SEAT_MISMATCH");
+        }
+    }
+
+    let issued_unix = _opt(payload, "issued_unix", 0);
+    let expires_unix = _opt(payload, "expires_unix", 0);
+    let now_sec = num_floor(verified_now_unix);
+    if now_sec + 120 < issued_unix {
+        return fail("CONTINUITY_NOT_YET_VALID");
+    }
+    if now_sec >= expires_unix {
+        return fail("CONTINUITY_BUNDLE_EXPIRED");
+    }
+
+    let mode = str(_opt(payload, "isolation_mode", ISOLATION_NORMAL));
+    return map{
+        ok: true,
+        allowed_to_execute: true,
+        read_only_mode: mode == ISOLATION_READ_ONLY_FREEZE,
+        issued_unix: issued_unix,
+        expires_unix: expires_unix,
+        remaining_sec: expires_unix - now_sec,
+        isolation_mode: mode,
+        feature_unlock_mask: _opt(payload, "feature_unlock_mask", 65535),
+        bundle_id: _opt(payload, "bundle_id", ""),
+        error_code: nil
+    };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PILLAR 2: Triple-Anchored Anti-Clock-Tamper Engine (`Tamper-Proof Time`)
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _clock_ratchet_mac(seq, high_water_unix, anchor_mono_ms, anchor_wall_unix, ratchet_hmac_key_hex) {
+    let msg = "PBCLK1:" + str(seq) + ":" + str(high_water_unix) + ":" + str(anchor_mono_ms) + ":" + str(anchor_wall_unix);
+    return str_lower(hmac_sha256(msg, str(ratchet_hmac_key_hex)));
+}
+
+fn init_clock_ratchet(build_floor_unix, ratchet_hmac_key_hex, initial_mono_ms = nil) {
+    if not is_number(build_floor_unix) or build_floor_unix <= 0 {
+        _err("build_floor_unix must be a positive unix timestamp");
+    }
+    if not is_string(ratchet_hmac_key_hex) or len(ratchet_hmac_key_hex) < 16 {
+        _err("ratchet_hmac_key_hex must be at least 16 chars");
+    }
+    let floor_sec = num_floor(build_floor_unix);
+    let mono_ms = if initial_mono_ms == nil { time_ms() } else { initial_mono_ms };
+    let seq = 1;
+    let mac = _clock_ratchet_mac(seq, floor_sec, mono_ms, floor_sec, ratchet_hmac_key_hex);
+    return map{
+        seq: seq,
+        high_water_unix: floor_sec,
+        anchor_mono_ms: mono_ms,
+        anchor_wall_unix: floor_sec,
+        mac_hex: mac
+    };
+}
+
+fn verify_and_advance_clock(
+    ratchet_state,
+    current_wall_unix,
+    current_mono_ms,
+    server_signed_utc_or_nil,
+    ratchet_hmac_key_hex,
+    max_skew_sec = 120
+) {
+    if not is_map(ratchet_state) or not is_number(current_wall_unix) or not is_number(current_mono_ms) {
+        return map{
+            ok: false,
+            error_code: "CLOCK_INVALID_ARGUMENTS",
+            local_clock_tampered: true,
+            effective_time: nil,
+            ratchet_state: nil
+        };
+    }
+    if not is_string(ratchet_hmac_key_hex) or len(ratchet_hmac_key_hex) < 16 {
+        return map{
+            ok: false,
+            error_code: "CLOCK_INVALID_HMAC_KEY",
+            local_clock_tampered: true,
+            effective_time: nil,
+            ratchet_state: nil
+        };
+    }
+
+    let seq = _opt(ratchet_state, "seq", nil);
+    let hw_unix = _opt(ratchet_state, "high_water_unix", nil);
+    let anc_mono = _opt(ratchet_state, "anchor_mono_ms", nil);
+    let anc_wall = _opt(ratchet_state, "anchor_wall_unix", nil);
+    let got_mac = _opt(ratchet_state, "mac_hex", "");
+
+    if not is_number(seq) or seq < 1 or not is_number(hw_unix) or not is_number(anc_mono)
+       or not is_number(anc_wall) or not is_string(got_mac) {
+        return map{
+            ok: false,
+            error_code: "CLOCK_RATCHET_STATE_CORRUPT",
+            local_clock_tampered: true,
+            effective_time: nil,
+            ratchet_state: nil
+        };
+    }
+
+    // Check 1: Ratchet MAC Integrity (prevents editing saved timestamp state on disk)
+    let expected_mac = _clock_ratchet_mac(seq, hw_unix, anc_mono, anc_wall, ratchet_hmac_key_hex);
+    if not _ct_eq_hex_norm(got_mac, expected_mac, 64) {
+        return map{
+            ok: false,
+            error_code: "CLOCK_RATCHET_MAC_TAMPERED",
+            local_clock_tampered: true,
+            effective_time: nil,
+            ratchet_state: nil
+        };
+    }
+
+    let skew = if is_number(max_skew_sec) and max_skew_sec >= 0 { max_skew_sec } else { 120 };
+
+    // Check 2: Server Authoritative Time Override
+    if server_signed_utc_or_nil != nil {
+        if not is_number(server_signed_utc_or_nil) {
+            return map{
+                ok: false,
+                error_code: "CLOCK_INVALID_SERVER_UTC",
+                local_clock_tampered: true,
+                effective_time: nil,
+                ratchet_state: nil
+            };
+        }
+        let srv_utc = num_floor(server_signed_utc_or_nil);
+        if srv_utc + skew < hw_unix {
+            return map{
+                ok: false,
+                error_code: "CLOCK_ROLLBACK_BELOW_HIGH_WATER",
+                local_clock_tampered: true,
+                effective_time: srv_utc,
+                ratchet_state: nil
+            };
+        }
+        let local_tampered = num_abs(current_wall_unix - srv_utc) > skew;
+        let next_seq = seq + 1;
+        let next_hw = num_max(hw_unix, srv_utc);
+        let next_anc_mono = current_mono_ms;
+        let next_anc_wall = srv_utc;
+        let next_mac = _clock_ratchet_mac(next_seq, next_hw, next_anc_mono, next_anc_wall, ratchet_hmac_key_hex);
+        let next_state = map{
+            seq: next_seq,
+            high_water_unix: next_hw,
+            anchor_mono_ms: next_anc_mono,
+            anchor_wall_unix: next_anc_wall,
+            mac_hex: next_mac
+        };
+        return map{
+            ok: true,
+            error_code: nil,
+            seq: next_seq,
+            high_water_unix: next_hw,
+            effective_time: srv_utc,
+            effective_unix: srv_utc,
+            local_clock_tampered: local_tampered,
+            server_authoritative: true,
+            ratchet_state: next_state,
+            next_state: next_state
+        };
+    }
+
+    // Offline Checks (no server UTC available):
+    // Check 4 (High-Water Monotonic Floor): catches wall-clock rollback below high-water
+    if current_wall_unix + skew < hw_unix {
+        return map{
+            ok: false,
+            error_code: "CLOCK_ROLLBACK_BELOW_HIGH_WATER",
+            local_clock_tampered: true,
+            effective_time: nil,
+            ratchet_state: nil
+        };
+    }
+
+    // Check 3 (Monotonic Uptime vs Wall-Clock Drift): catches clock freeze or slow-down
+    let next_anc_mono = anc_mono;
+    let next_anc_wall = anc_wall;
+    if current_mono_ms >= anc_mono {
+        let mono_elapsed_sec = (current_mono_ms - anc_mono) / 1000.0;
+        let wall_elapsed_sec = current_wall_unix - anc_wall;
+        if (mono_elapsed_sec - wall_elapsed_sec) > skew {
+            return map{
+                ok: false,
+                error_code: "CLOCK_TAMPER_MONOTONIC_DRIFT",
+                local_clock_tampered: true,
+                mono_elapsed_sec: mono_elapsed_sec,
+                wall_elapsed_sec: wall_elapsed_sec,
+                effective_time: nil,
+                ratchet_state: nil
+            };
+        }
+    } else {
+        // Monotonic counter reset across clean reboot while wall clock >= high_water - skew
+        next_anc_mono = current_mono_ms;
+        next_anc_wall = num_floor(current_wall_unix);
+    }
+
+    let eff_time = num_floor(current_wall_unix);
+    let next_seq = seq + 1;
+    let next_hw = num_max(hw_unix, eff_time);
+    let next_mac = _clock_ratchet_mac(next_seq, next_hw, next_anc_mono, next_anc_wall, ratchet_hmac_key_hex);
+    let next_state = map{
+        seq: next_seq,
+        high_water_unix: next_hw,
+        anchor_mono_ms: next_anc_mono,
+        anchor_wall_unix: next_anc_wall,
+        mac_hex: next_mac
+    };
+
+    return map{
+        ok: true,
+        error_code: nil,
+        seq: next_seq,
+        high_water_unix: next_hw,
+        effective_time: eff_time,
+        effective_unix: eff_time,
+        local_clock_tampered: false,
+        server_authoritative: false,
+        ratchet_state: next_state,
+        next_state: next_state
+    };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PILLAR 3: GitHub-Compromise & Supply-Chain Redirect Immunity
+// (`Cold-Root Pinned Origin & 2-of-2 Threshold Release Guard`)
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn generate_supplychain_keys(cold_seed_hex = nil, ci_seed_hex = nil) {
+    let cold_kp = ed25519_keygen(cold_seed_hex);
+    let ci_kp = ed25519_keygen(ci_seed_hex);
+    if constant_time_eq(cold_kp.pk_hex, ci_kp.pk_hex) {
+        _err("cold_root and ci_builder keys must be cryptographically independent");
+    }
+    return map{
+        cold_root: map{
+            pk: cold_kp.pk_hex,
+            sk: cold_kp.sk_hex,
+            pk_hex: cold_kp.pk_hex,
+            sk_hex: cold_kp.sk_hex,
+            air_gapped_offline: true
+        },
+        ci_builder: map{
+            pk: ci_kp.pk_hex,
+            sk: ci_kp.sk_hex,
+            pk_hex: ci_kp.pk_hex,
+            sk_hex: ci_kp.sk_hex,
+            air_gapped_offline: false
+        }
+    };
+}
+
+fn _parse_strict_uint(text, min_val, max_val) {
+    if not is_string(text) or len(text) == 0 or len(text) > 10 { return nil; }
+    if len(text) > 1 and strcharcodeat(text, 0) == 48 { return nil; }
+    let val = 0;
+    let idx = 0;
+    while idx < len(text) {
+        let ch = strcharcodeat(text, idx);
+        if ch < 48 or ch > 57 { return nil; }
+        val = val * 10 + (ch - 48);
+        idx = idx + 1;
+    }
+    if val < min_val or val > max_val { return nil; }
+    return val;
+}
+
+fn _classify_host_security(host_lower) {
+    if not is_string(host_lower) or len(host_lower) == 0 {
+        return map{ valid: false, is_loopback_127: false, is_private_or_ssrf: true };
+    }
+    if host_lower == "localhost" or str_ends_with(host_lower, ".localhost") or str_ends_with(host_lower, ".local") {
+        return map{ valid: true, is_loopback_127: false, is_private_or_ssrf: true };
+    }
+    // Reject IPv6 literals or colons inside host (blocks [::1], [::ffff:...], etc.)
+    if str_contains(host_lower, "[") or str_contains(host_lower, "]") or str_contains(host_lower, ":") {
+        return map{ valid: false, is_loopback_127: false, is_private_or_ssrf: true };
+    }
+    if str_starts_with(host_lower, ".") or str_ends_with(host_lower, ".") or str_contains(host_lower, "..") {
+        return map{ valid: false, is_loopback_127: false, is_private_or_ssrf: true };
+    }
+
+    let labels = str_split(host_lower, ".");
+    let all_numeric_or_hex = true;
+    let idx = 0;
+    while idx < len(labels) {
+        let lbl = labels[idx];
+        if len(lbl) == 0 {
+            return map{ valid: false, is_loopback_127: false, is_private_or_ssrf: true };
+        }
+        let j = 0;
+        while j < len(lbl) {
+            let c = strcharcodeat(lbl, j);
+            let is_digit = c >= 48 and c <= 57;
+            let is_alpha = c >= 97 and c <= 122;
+            let is_dash = c == 45;
+            if not is_digit and not is_alpha and not is_dash {
+                return map{ valid: false, is_loopback_127: false, is_private_or_ssrf: true };
+            }
+            if not is_digit and c != 120 and not (c >= 97 and c <= 102) {
+                all_numeric_or_hex = false;
+            }
+            j = j + 1;
+        }
+        let c0 = strcharcodeat(lbl, 0);
+        if c0 < 48 or c0 > 57 {
+            all_numeric_or_hex = false;
+        }
+        idx = idx + 1;
+    }
+
+    // Check IPv4 / numeric-host SSRF tricks
+    if len(labels) == 4 {
+        let o0 = _parse_strict_uint(labels[0], 0, 255);
+        let o1 = _parse_strict_uint(labels[1], 0, 255);
+        let o2 = _parse_strict_uint(labels[2], 0, 255);
+        let o3 = _parse_strict_uint(labels[3], 0, 255);
+        if o0 != nil and o1 != nil and o2 != nil and o3 != nil {
+            let exact_loopback = (o0 == 127 and o1 == 0 and o2 == 0 and o3 == 1);
+            if exact_loopback {
+                return map{ valid: true, is_loopback_127: true, is_private_or_ssrf: false };
+            }
+            let priv = (o0 == 0)
+                or (o0 == 10)
+                or (o0 == 127)
+                or (o0 == 169 and o1 == 254)
+                or (o0 == 172 and o1 >= 16 and o1 <= 31)
+                or (o0 == 192 and o1 == 168)
+                or (o0 == 100 and o1 >= 64 and o1 <= 127)
+                or (o0 >= 224);
+            return map{ valid: true, is_loopback_127: false, is_private_or_ssrf: priv };
+        }
+    }
+
+    // Block obfuscated integer/hex/octal IP representations (e.g. 2130706433 or 0177.0.0.1)
+    if all_numeric_or_hex {
+        return map{ valid: false, is_loopback_127: false, is_private_or_ssrf: true };
+    }
+
+    return map{ valid: true, is_loopback_127: false, is_private_or_ssrf: false };
+}
+
+fn _parse_strict_outbound_url(raw_url) {
+    if not is_string(raw_url) or len(raw_url) < 9 or len(raw_url) > 2048 {
+        return map{ ok: false, detail: "URL_EMPTY_OR_BAD_LENGTH" };
+    }
+
+    // Reject control chars, spaces, backslashes, fragments, or percent-encoded authority tricks
+    let idx = 0;
+    while idx < len(raw_url) {
+        let ch = strcharcodeat(raw_url, idx);
+        if ch <= 32 or ch >= 127 or ch == 92 or ch == 35 {
+            return map{ ok: false, detail: "URL_FORBIDDEN_CONTROL_OR_BACKSLASH" };
+        }
+        idx = idx + 1;
+    }
+
+    let scheme = "";
+    let rest = "";
+    if str_starts_with(raw_url, "https://") {
+        scheme = "https";
+        rest = str_slice(raw_url, 8, len(raw_url));
+    } else if str_starts_with(raw_url, "http://") {
+        scheme = "http";
+        rest = str_slice(raw_url, 7, len(raw_url));
+    } else {
+        return map{ ok: false, detail: "URL_UNTRUSTED_SCHEME" };
+    }
+
+    let slash_pos = str_index_of(rest, "/");
+    let q_pos = str_index_of(rest, "?");
+    let auth_end = len(rest);
+    if slash_pos >= 0 and slash_pos < auth_end { auth_end = slash_pos; }
+    if q_pos >= 0 and q_pos < auth_end {
+        // Query before '/' (`https://host?x`) rejected for strict canonical endpoint routing
+        return map{ ok: false, detail: "URL_AMBIGUOUS_AUTHORITY_QUERY" };
+    }
+
+    let authority = str_slice(rest, 0, auth_end);
+    let path_part = if slash_pos >= 0 { str_slice(rest, slash_pos, len(rest)) } else { "/" };
+    if len(authority) == 0 {
+        return map{ ok: false, detail: "URL_EMPTY_AUTHORITY" };
+    }
+
+    // Block `@` userinfo / credential URL parser confusion (`https://trusted.com@evil.com`)
+    if str_contains(authority, "@") or str_contains(authority, "%") {
+        return map{ ok: false, detail: "URL_USERINFO_OR_PERCENT_CONFUSION_BLOCKED" };
+    }
+
+    // Block path traversal `..`
+    if str_contains(path_part, "..") {
+        return map{ ok: false, detail: "URL_PATH_TRAVERSAL_BLOCKED" };
+    }
+
+    let colon_pos = str_index_of(authority, ":");
+    let host_raw = authority;
+    let port_num = if scheme == "https" { 443 } else { 80 };
+    if colon_pos >= 0 {
+        host_raw = str_slice(authority, 0, colon_pos);
+        let port_str = str_slice(authority, colon_pos + 1, len(authority));
+        if str_contains(port_str, ":") {
+            return map{ ok: false, detail: "URL_MULTIPLE_COLONS_BLOCKED" };
+        }
+        let parsed_port = _parse_strict_uint(port_str, 1, 65535);
+        if parsed_port == nil {
+            return map{ ok: false, detail: "URL_INVALID_PORT" };
+        }
+        port_num = parsed_port;
+    }
+
+    let host_low = str_lower(host_raw);
+    let host_cls = _classify_host_security(host_low);
+    if not host_cls.valid {
+        return map{ ok: false, detail: "URL_INVALID_OR_OBFUSCATED_HOST" };
+    }
+    if host_cls.is_private_or_ssrf {
+        return map{ ok: false, detail: "URL_PRIVATE_IP_OR_SSRF_BLOCKED" };
+    }
+
+    let clean_path = path_part;
+    let q_in_path = str_index_of(clean_path, "?");
+    if q_in_path >= 0 {
+        clean_path = str_slice(clean_path, 0, q_in_path);
+    }
+
+    return map{
+        ok: true,
+        scheme: scheme,
+        host: host_low,
+        port: port_num,
+        path: clean_path,
+        is_loopback_127: host_cls.is_loopback_127
+    };
+}
+
+fn sign_pinned_endpoint_manifest(cold_root_sk_hex, spec) {
+    if not _is_valid_hex(cold_root_sk_hex, 32) {
+        _err("cold_root_sk_hex must be a 64-character hex Ed25519 seed");
+    }
+    if not is_map(spec) {
+        _err("spec must be a map");
+    }
+
+    let prod_id = str(_opt(spec, "product_id", ""));
+    let ed = str(_opt(spec, "edition", ""));
+    let manifest_seq = _opt(spec, "manifest_seq", nil);
+    let expires_unix = _opt(spec, "expires_unix", nil);
+    let allow_loopback_dev = _opt(spec, "allow_loopback_dev", false) == true;
+    let origins_in = _opt(spec, "allowed_origins", []);
+
+    if len(prod_id) == 0 or _has_pii_or_path_leak(prod_id) {
+        _err("spec.product_id must be a clean non-empty string");
+    }
+    if len(ed) == 0 or _has_pii_or_path_leak(ed) {
+        _err("spec.edition must be a clean non-empty string");
+    }
+    if not is_number(manifest_seq) or num_floor(manifest_seq) != manifest_seq or manifest_seq < 1 {
+        _err("spec.manifest_seq must be an integer >= 1");
+    }
+    if not is_number(expires_unix) or expires_unix <= 0 {
+        _err("spec.expires_unix must be a positive unix timestamp");
+    }
+    if not is_array(origins_in) or len(origins_in) == 0 {
+        _err("spec.allowed_origins must be a non-empty array");
+    }
+
+    let normalized_origins = [];
+    let idx = 0;
+    while idx < len(origins_in) {
+        let orig = origins_in[idx];
+        if not is_map(orig) { _err("each allowed_origin must be a map"); }
+        let u = str(_opt(orig, "url", ""));
+        let parsed_u = _parse_strict_outbound_url(u);
+        if not parsed_u.ok {
+            _err("invalid allowed_origin url: " + parsed_u.detail);
+        }
+        if parsed_u.scheme != "https" and not (allow_loopback_dev and parsed_u.is_loopback_127) {
+            _err("allowed_origin must use https:// unless allow_loopback_dev is true for 127.0.0.1");
+        }
+        if parsed_u.is_loopback_127 and not allow_loopback_dev {
+            _err("127.0.0.1 origin requires explicit allow_loopback_dev: true");
+        }
+        let h = str_lower(str(_opt(orig, "host", parsed_u.host)));
+        let p = num_floor(_opt(orig, "port", parsed_u.port));
+        if h != parsed_u.host or p != parsed_u.port {
+            _err("allowed_origin host/port must match url authority");
+        }
+        let pinned_pk = str_lower(str(_opt(orig, "pinned_server_pk_hex", "")));
+        if not _is_valid_hex(pinned_pk, 32) {
+            _err("allowed_origin.pinned_server_pk_hex must be 64 hex chars");
+        }
+        let spki_pin = str_lower(str(_opt(orig, "tls_spki_sha256", "")));
+        if len(spki_pin) > 0 and not _is_valid_hex(spki_pin, 32) {
+            _err("allowed_origin.tls_spki_sha256 must be 64 hex chars when provided");
+        }
+
+        array_push(normalized_origins, map{
+            url: u,
+            host: h,
+            port: p,
+            path_prefix: parsed_u.path,
+            pinned_server_pk_hex: pinned_pk,
+            tls_spki_sha256: spki_pin
+        });
+        idx = idx + 1;
+    }
+
+    let manifest_payload = map{
+        v: 1,
+        product_id: prod_id,
+        edition: ed,
+        manifest_seq: manifest_seq,
+        allow_loopback_dev: allow_loopback_dev,
+        allowed_origins: normalized_origins,
+        expires_unix: num_floor(expires_unix)
+    };
+
+    let canon = canonical_json_encode(manifest_payload);
+    let b64u = base64url_encode_bytes(str_to_bytes(canon));
+    let sig_hex = ed25519_sign_msg(cold_root_sk_hex, "PBORIGIN1-COLD-ROOT-V1:" + b64u);
+    return PINNED_ORIGIN_PREFIX + "." + b64u + "." + sig_hex;
+}
+
+fn _path_matches_prefix(candidate_path, prefix_path) {
+    if prefix_path == "/" or len(prefix_path) == 0 { return true; }
+    if candidate_path == prefix_path { return true; }
+    let norm_prefix = if str_ends_with(prefix_path, "/") { prefix_path } else { prefix_path + "/" };
+    return str_starts_with(candidate_path, norm_prefix);
+}
+
+fn authorize_outbound_server_url(
+    candidate_url,
+    candidate_server_pk_hex,
+    pinned_manifest_token,
+    cold_root_pk_hex,
+    expected_product_id,
+    expected_edition,
+    min_manifest_seq,
+    now_unix,
+    candidate_tls_spki_sha256 = nil
+) {
+    let block = fn(detail_code) {
+        return map{
+            ok: false,
+            blocked_before_connect: true,
+            bytes_sent_on_wire: 0,
+            reason: "SUPPLY_CHAIN_UNTRUSTED_ENDPOINT_BLOCKED",
+            detail_code: detail_code
+        };
+    };
+
+    if not _is_valid_hex(cold_root_pk_hex, 32) or not _is_valid_hex(candidate_server_pk_hex, 32) {
+        return block("INVALID_PINNED_PUBLIC_KEY_FORMAT");
+    }
+    if not is_string(pinned_manifest_token) or not is_number(min_manifest_seq) or not is_number(now_unix) {
+        return block("INVALID_MANIFEST_OR_POLICY_ARGS");
+    }
+
+    // 1. Verify air-gapped `cold_root_pk_hex` Ed25519 signature on `pinned_manifest_token` FIRST
+    let parts = str_split(pinned_manifest_token, ".");
+    if len(parts) != 3 or parts[0] != PINNED_ORIGIN_PREFIX {
+        return block("MALFORMED_PINNED_MANIFEST_TOKEN");
+    }
+    let b64u = parts[1];
+    let sig_hex = parts[2];
+    if not ed25519_verify_msg(cold_root_pk_hex, "PBORIGIN1-COLD-ROOT-V1:" + b64u, sig_hex) {
+        return block("COLD_ROOT_SIGNATURE_VERIFICATION_FAILED");
+    }
+
+    let raw_bytes = base64url_decode_bytes_strict(b64u);
+    if raw_bytes == nil { return block("MANIFEST_BASE64URL_INVALID"); }
+    let manifest = try json_parse(bytes_to_str(raw_bytes)) catch nil;
+    if not is_map(manifest) or _opt(manifest, "v", 0) != 1 {
+        return block("MANIFEST_SCHEMA_INVALID");
+    }
+
+    // 2. Strict URL parsing (blocks `@` userinfo confusion, SSRF private IPs, bad schemes)
+    let parsed_url = _parse_strict_outbound_url(candidate_url);
+    if not parsed_url.ok {
+        return block(parsed_url.detail);
+    }
+
+    let allow_loopback_dev = _opt(manifest, "allow_loopback_dev", false) == true;
+    if parsed_url.is_loopback_127 and not allow_loopback_dev {
+        return block("LOOPBACK_NOT_AUTHORIZED_BY_COLD_ROOT");
+    }
+    if parsed_url.scheme != "https" {
+        if not (allow_loopback_dev and parsed_url.is_loopback_127) {
+            return block("HTTPS_SCHEME_REQUIRED");
+        }
+    }
+
+    // 3. Exact `product_id` AND `edition` match (cross-edition manifest replay blocked!)
+    if not is_string(expected_product_id) or not constant_time_eq(str(_opt(manifest, "product_id", "")), expected_product_id) {
+        return block("MANIFEST_PRODUCT_ID_MISMATCH");
+    }
+    if not is_string(expected_edition) or not constant_time_eq(str(_opt(manifest, "edition", "")), expected_edition) {
+        return block("MANIFEST_CROSS_EDITION_ISOLATION_MISMATCH");
+    }
+
+    // 4. Anti-downgrade `manifest_seq` & manifest expiration
+    let m_seq = _opt(manifest, "manifest_seq", 0);
+    if not is_number(m_seq) or m_seq < min_manifest_seq {
+        return block("MANIFEST_SEQ_DOWNGRADE_REJECTED");
+    }
+    let exp_unix = _opt(manifest, "expires_unix", 0);
+    if not is_number(exp_unix) or now_unix >= exp_unix {
+        return block("MANIFEST_EXPIRED");
+    }
+
+    // 5. Exact `host`, `port`, path boundary, and `pinned_server_pk_hex` match against `allowed_origins`
+    let origins = _opt(manifest, "allowed_origins", []);
+    if not is_array(origins) or len(origins) == 0 {
+        return block("MANIFEST_EMPTY_ORIGINS");
+    }
+
+    let idx = 0;
+    while idx < len(origins) {
+        let orig = origins[idx];
+        if is_map(orig) {
+            let o_host = str_lower(str(_opt(orig, "host", "")));
+            let o_port = _opt(orig, "port", 0 - 1);
+            let o_prefix = str(_opt(orig, "path_prefix", "/"));
+            let o_pk = str_lower(str(_opt(orig, "pinned_server_pk_hex", "")));
+            let o_spki = str_lower(str(_opt(orig, "tls_spki_sha256", "")));
+
+            if constant_time_eq(parsed_url.host, o_host)
+               and parsed_url.port == o_port
+               and _path_matches_prefix(parsed_url.path, o_prefix)
+               and _ct_eq_hex_norm(candidate_server_pk_hex, o_pk, 64) {
+                if candidate_tls_spki_sha256 != nil and len(o_spki) == 64 {
+                    if not _ct_eq_hex_norm(str(candidate_tls_spki_sha256), o_spki, 64) {
+                        return block("TLS_SPKI_PIN_MISMATCH");
+                    }
+                }
+                return map{
+                    ok: true,
+                    blocked_before_connect: false,
+                    bytes_sent_on_wire: 0,
+                    reason: "AUTHORIZED_COLD_ROOT_PINNED_ENDPOINT",
+                    matched_host: o_host,
+                    matched_port: o_port,
+                    pinned_server_pk_hex: o_pk,
+                    tls_spki_sha256: o_spki,
+                    manifest_seq: m_seq,
+                    product_id: expected_product_id,
+                    edition: expected_edition
+                };
+            }
+        }
+        idx = idx + 1;
+    }
+
+    return block("ORIGIN_OR_SERVER_KEY_NOT_IN_PINNED_MANIFEST");
+}
+
+// ── 2-of-2 Threshold Release Guard (`ci_builder` + Air-Gapped `cold_root`) ──
+
+fn _normalize_binary_sha256(binary_bytes_or_sha256) {
+    if is_string(binary_bytes_or_sha256) and _is_valid_hex(binary_bytes_or_sha256, 32) {
+        return str_lower(binary_bytes_or_sha256);
+    }
+    if is_array(binary_bytes_or_sha256) {
+        let clean_bytes = _as_bytes(binary_bytes_or_sha256);
+        return str_lower(sha256(bytes_to_str(clean_bytes)));
+    }
+    if is_string(binary_bytes_or_sha256) {
+        return str_lower(sha256(binary_bytes_or_sha256));
+    }
+    _err("binary_bytes_or_sha256 must be a byte array, binary string, or 64-char SHA-256 hex digest");
+}
+
+fn sign_release_2of2(
+    binary_bytes_or_sha256,
+    product_id,
+    edition,
+    version_seq,
+    ci_builder_sk_hex,
+    cold_root_sk_hex
+) {
+    if not _is_valid_hex(ci_builder_sk_hex, 32) or not _is_valid_hex(cold_root_sk_hex, 32) {
+        _err("ci_builder_sk_hex and cold_root_sk_hex must both be 64-char hex Ed25519 seeds");
+    }
+    if constant_time_eq(str_lower(ci_builder_sk_hex), str_lower(cold_root_sk_hex)) {
+        _err("2-of-2 release threshold requires independent ci_builder and cold_root secret keys");
+    }
+    if not is_string(product_id) or len(product_id) == 0 or _has_pii_or_path_leak(product_id) {
+        _err("product_id must be a clean non-empty identifier");
+    }
+    if not is_string(edition) or len(edition) == 0 or _has_pii_or_path_leak(edition) {
+        _err("edition must be a clean non-empty identifier");
+    }
+    if not is_number(version_seq) or num_floor(version_seq) != version_seq or version_seq < 1 {
+        _err("version_seq must be an integer >= 1");
+    }
+
+    let bin_sha256 = _normalize_binary_sha256(binary_bytes_or_sha256);
+    let cert_payload = map{
+        v: 1,
+        schema: "pbrel-2of2-v1",
+        product_id: product_id,
+        edition: edition,
+        version_seq: version_seq,
+        binary_sha256: bin_sha256
+    };
+
+    let canon = canonical_json_encode(cert_payload);
+    let b64u = base64url_encode_bytes(str_to_bytes(canon));
+    let ci_sig = ed25519_sign_msg(ci_builder_sk_hex, "PBREL2OF2-CI-BUILDER-V1:" + b64u);
+    let cold_sig = ed25519_sign_msg(cold_root_sk_hex, "PBREL2OF2-COLD-ROOT-V1:" + b64u);
+    return RELEASE_2OF2_PREFIX + "." + b64u + "." + ci_sig + "." + cold_sig;
+}
+
+// Helper for simulating/constructing a single-signer CI-only certificate (e.g. during
+// security audits proving that a compromised CI runner without `cold_root` is rejected)
+fn build_ci_only_untrusted_release_cert(
+    binary_bytes_or_sha256,
+    product_id,
+    edition,
+    version_seq,
+    stolen_ci_builder_sk_hex,
+    forged_second_sk_hex = nil
+) {
+    let bin_sha256 = _normalize_binary_sha256(binary_bytes_or_sha256);
+    let cert_payload = map{
+        v: 1,
+        schema: "pbrel-2of2-v1",
+        product_id: product_id,
+        edition: edition,
+        version_seq: version_seq,
+        binary_sha256: bin_sha256
+    };
+    let canon = canonical_json_encode(cert_payload);
+    let b64u = base64url_encode_bytes(str_to_bytes(canon));
+    let ci_sig = ed25519_sign_msg(stolen_ci_builder_sk_hex, "PBREL2OF2-CI-BUILDER-V1:" + b64u);
+    let fake_sk = if forged_second_sk_hex == nil { stolen_ci_builder_sk_hex } else { forged_second_sk_hex };
+    let fake_cold_sig = ed25519_sign_msg(fake_sk, "PBREL2OF2-COLD-ROOT-V1:" + b64u);
+    return RELEASE_2OF2_PREFIX + "." + b64u + "." + ci_sig + "." + fake_cold_sig;
+}
+
+fn verify_release_2of2(
+    binary_bytes_or_sha256,
+    release_cert,
+    ci_builder_pk_hex,
+    cold_root_pk_hex,
+    expected_product_id,
+    expected_edition,
+    min_version_seq
+) {
+    let fail = fn(code, ci_ok, cold_ok) {
+        return map{
+            ok: false,
+            ci_builder_sig_valid: ci_ok,
+            cold_root_sig_valid: cold_ok,
+            threshold_2of2_satisfied: false,
+            error_code: code
+        };
+    };
+
+    if not _is_valid_hex(ci_builder_pk_hex, 32) or not _is_valid_hex(cold_root_pk_hex, 32) {
+        return fail("RELEASE_INVALID_PUBLIC_KEYS", false, false);
+    }
+    if _ct_eq_hex_norm(ci_builder_pk_hex, cold_root_pk_hex, 64) {
+        return fail("RELEASE_KEYS_NOT_INDEPENDENT", false, false);
+    }
+    if not is_string(release_cert) or not is_number(min_version_seq) {
+        return fail("RELEASE_INVALID_CERT_OR_MIN_VERSION", false, false);
+    }
+
+    let parts = str_split(release_cert, ".");
+    if len(parts) != 4 or parts[0] != RELEASE_2OF2_PREFIX {
+        return fail("RELEASE_MALFORMED_CERT_TOKEN", false, false);
+    }
+    let b64u = parts[1];
+    let ci_sig = parts[2];
+    let cold_sig = parts[3];
+
+    let ci_ok = ed25519_verify_msg(ci_builder_pk_hex, "PBREL2OF2-CI-BUILDER-V1:" + b64u, ci_sig);
+    let cold_ok = ed25519_verify_msg(cold_root_pk_hex, "PBREL2OF2-COLD-ROOT-V1:" + b64u, cold_sig);
+    if not ci_ok or not cold_ok {
+        let code = if ci_ok and not cold_ok {
+            "RELEASE_MISSING_VALID_COLD_ROOT_SIGNATURE"
+        } else if not ci_ok and cold_ok {
+            "RELEASE_MISSING_VALID_CI_BUILDER_SIGNATURE"
+        } else {
+            "RELEASE_BOTH_SIGNATURES_INVALID"
+        };
+        return fail(code, ci_ok, cold_ok);
+    }
+
+    let raw_bytes = base64url_decode_bytes_strict(b64u);
+    if raw_bytes == nil { return fail("RELEASE_INVALID_BASE64URL", ci_ok, cold_ok); }
+    let payload = try json_parse(bytes_to_str(raw_bytes)) catch nil;
+    if not is_map(payload) or _opt(payload, "v", 0) != 1 {
+        return fail("RELEASE_INVALID_PAYLOAD_SCHEMA", ci_ok, cold_ok);
+    }
+
+    let actual_sha256 = try _normalize_binary_sha256(binary_bytes_or_sha256) catch nil;
+    let signed_sha256 = str(_opt(payload, "binary_sha256", ""));
+    if actual_sha256 == nil or not _ct_eq_hex_norm(actual_sha256, signed_sha256, 64) {
+        return fail("RELEASE_BINARY_SHA256_MISMATCH", ci_ok, cold_ok);
+    }
+
+    if not is_string(expected_product_id) or not constant_time_eq(str(_opt(payload, "product_id", "")), expected_product_id) {
+        return fail("RELEASE_PRODUCT_ID_MISMATCH", ci_ok, cold_ok);
+    }
+    if not is_string(expected_edition) or not constant_time_eq(str(_opt(payload, "edition", "")), expected_edition) {
+        return fail("RELEASE_EDITION_MISMATCH", ci_ok, cold_ok);
+    }
+
+    let ver_seq = _opt(payload, "version_seq", 0);
+    if not is_number(ver_seq) or ver_seq < min_version_seq {
+        return fail("RELEASE_VERSION_ROLLBACK_REJECTED", ci_ok, cold_ok);
+    }
+
+    return map{
+        ok: true,
+        ci_builder_sig_valid: true,
+        cold_root_sig_valid: true,
+        threshold_2of2_satisfied: true,
+        binary_sha256: signed_sha256,
+        product_id: expected_product_id,
+        edition: expected_edition,
+        version_seq: ver_seq,
+        error_code: nil
+    };
+}
+
+// ── 1-Call Ergonomic Sovereign Gate Combining All 3 Pillars ──────────────────
+// Combines Primary Offline License (Lock #1), Anti-Clock-Tamper Ratchet, and
+// Optional Second Lock (Live Encrypted Lease OR Offline Continuity Bundle).
+fn enforce_sovereign_duallock_gate(gate_cfg) {
+    if not is_map(gate_cfg) {
+        return map{ ok: false, allowed_to_execute: false, error_code: "GATE_INVALID_CONFIG" };
+    }
+    let lock1_ok = _opt(gate_cfg, "primary_license_ok", false) == true;
+    if not lock1_ok {
+        return map{
+            ok: false,
+            allowed_to_execute: false,
+            read_only_mode: false,
+            error_code: "PRIMARY_LOCK_REJECTED"
+        };
+    }
+
+    let second_lock_enabled = _opt(gate_cfg, "require_second_lock", false) == true;
+    let ratchet_state = _opt(gate_cfg, "ratchet_state", nil);
+    let ratchet_key = _opt(gate_cfg, "ratchet_hmac_key_hex", "");
+    let wall_now = _opt(gate_cfg, "current_wall_unix", _now_unix());
+    let mono_now = _opt(gate_cfg, "current_mono_ms", time_ms());
+    let max_skew = _opt(gate_cfg, "max_skew_sec", 120);
+
+    let lease_ver = nil;
+    let srv_utc = nil;
+    if map_has(gate_cfg, "response_envelope") and gate_cfg["response_envelope"] != nil {
+        lease_ver = verify_duallock_lease_response(
+            gate_cfg["response_envelope"],
+            _opt(gate_cfg, "expected_client_nonce", ""),
+            _opt(gate_cfg, "product_id", ""),
+            _opt(gate_cfg, "edition", ""),
+            _opt(gate_cfg, "owner_ed25519_pk", ""),
+            _opt(gate_cfg, "hmac_pepper_hex", ""),
+            _opt(gate_cfg, "transport_aead_key_hex", "")
+        );
+        if not lease_ver.ok {
+            return map{
+                ok: false,
+                allowed_to_execute: false,
+                read_only_mode: false,
+                error_code: lease_ver.error_code
+            };
+        }
+        srv_utc = lease_ver.server_utc_unix;
+    }
+
+    let eff_now = wall_now;
+    let next_ratchet = ratchet_state;
+    let local_tampered = false;
+    if ratchet_state != nil {
+        let clk = verify_and_advance_clock(ratchet_state, wall_now, mono_now, srv_utc, ratchet_key, max_skew);
+        if not clk.ok {
+            return map{
+                ok: false,
+                allowed_to_execute: false,
+                read_only_mode: false,
+                error_code: clk.error_code
+            };
+        }
+        eff_now = clk.effective_time;
+        next_ratchet = clk.ratchet_state;
+        local_tampered = clk.local_clock_tampered;
+    }
+
+    if not second_lock_enabled and lease_ver == nil {
+        return map{
+            ok: true,
+            allowed_to_execute: true,
+            read_only_mode: false,
+            effective_time: eff_now,
+            local_clock_tampered: local_tampered,
+            ratchet_state: next_ratchet,
+            mode: "SINGLE_LOCK_OFFLINE",
+            error_code: nil
+        };
+    }
+
+    if lease_ver != nil {
+        let lease_still_valid = lease_ver.lease_expires_unix > eff_now;
+        let can_exec = lease_ver.allowed_to_execute and lease_still_valid;
+        return map{
+            ok: can_exec,
+            allowed_to_execute: can_exec,
+            read_only_mode: lease_ver.read_only_mode,
+            isolation_mode: lease_ver.isolation_mode,
+            effective_time: eff_now,
+            local_clock_tampered: local_tampered,
+            ratchet_state: next_ratchet,
+            mode: "DUAL_LOCK_LIVE_LEASE",
+            error_code: if can_exec { nil } else { "SECOND_LOCK_BLOCKED_OR_EXPIRED" }
+        };
+    }
+
+    if map_has(gate_cfg, "continuity_bundle") and gate_cfg["continuity_bundle"] != nil {
+        let cont = verify_autonomous_continuity_bundle(
+            gate_cfg["continuity_bundle"],
+            _opt(gate_cfg, "product_id", ""),
+            _opt(gate_cfg, "edition", ""),
+            _opt(gate_cfg, "blinded_seat_id", "*"),
+            _opt(gate_cfg, "owner_ed25519_pk", ""),
+            _opt(gate_cfg, "hmac_pepper_hex", ""),
+            eff_now
+        );
+        return map{
+            ok: cont.ok and cont.allowed_to_execute,
+            allowed_to_execute: cont.allowed_to_execute,
+            read_only_mode: cont.read_only_mode,
+            isolation_mode: cont.isolation_mode,
+            effective_time: eff_now,
+            local_clock_tampered: local_tampered,
+            ratchet_state: next_ratchet,
+            mode: "DUAL_LOCK_CONTINUITY_BUNDLE",
+            error_code: cont.error_code
+        };
+    }
+
+    return map{
+        ok: false,
+        allowed_to_execute: false,
+        read_only_mode: false,
+        effective_time: eff_now,
+        local_clock_tampered: local_tampered,
+        ratchet_state: next_ratchet,
+        mode: "DUAL_LOCK_MISSING_SECOND_FACTOR",
+        error_code: "SECOND_LOCK_LEASE_OR_CONTINUITY_REQUIRED"
+    };
+}
+
+export DUALLOCK_VERSION, DUALLOCK_ENVELOPE_PREFIX, CONTINUITY_BUNDLE_PREFIX, PINNED_ORIGIN_PREFIX, RELEASE_2OF2_PREFIX;
+export ISOLATION_NORMAL, ISOLATION_SECOND_LOCK_REQUIRED, ISOLATION_READ_ONLY_FREEZE, ISOLATION_FULL_KILL_SWITCH;
+export base64url_encode_bytes, base64url_decode_bytes_strict, canonical_json_encode;
+export ed25519_keygen, ed25519_sign_msg, ed25519_verify_msg;
+export chacha20_block_rfc8439, chacha20_stream_xor, poly1305_mac_rfc8439;
+export chacha20_poly1305_encrypt, chacha20_poly1305_decrypt;
+export create_duallock_authority, create_default_duallock_server_state, blind_seat_commitment;
+export build_duallock_challenge_request, evaluate_and_sign_duallock_lease, verify_duallock_lease_response;
+export issue_autonomous_continuity_bundle, verify_autonomous_continuity_bundle;
+export init_clock_ratchet, verify_and_advance_clock;
+export generate_supplychain_keys, sign_pinned_endpoint_manifest, authorize_outbound_server_url;
+export sign_release_2of2, build_ci_only_untrusted_release_cert, verify_release_2of2;
+export enforce_sovereign_duallock_gate;

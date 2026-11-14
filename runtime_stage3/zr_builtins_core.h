@@ -1,9 +1,9 @@
 /* ============================================================================
- * pblang Sovereign Zero-Rust Native Runtime v4.0.0 — zr_builtins_core.h
+ * pblang Sovereign Zero-Rust Native Runtime v4.1.0 — zr_builtins_core.h
  * Math, BigNum, Bitwise, Strings, Zero-Copy Buffers, Unboxed Packed Structs,
  * CSR Graph Kernels, PBR 3D Rasterizer, Taint, Capabilities, Replay, JIT,
  * Generational GC, Regex, GIL-Free Threads/Channels, Arenas, Tensors, Quantum,
- * AI, Polyglot & Master Builtin Registration Table.
+ * AI, Polyglot, Polymorphic PBSH Shield, Anti-Debug, Anti-Screenshot & Builtins.
  * ============================================================================ */
 #ifndef PBLANG_ZR_BUILTINS_CORE_H
 #define PBLANG_ZR_BUILTINS_CORE_H
@@ -2475,6 +2475,7 @@ static PbValue zr_xfer_unpack(PbVM *vm, const ZrXferVal *x) {
             }
             if (cl_mod) vm_push_root(vm, val_obj(cl_mod));
             ZrPbckReader r;
+            memset(&r, 0, sizeof(r));
             r.buf = x->u.cl.pbck;
             r.len = x->u.cl.pbck_len;
             r.pos = 5;
@@ -5296,6 +5297,79 @@ static bool bi_eprint(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     return true;
 }
 
+static bool bi_security_is_debugger_present(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    (void)argv;
+    if (argc != 0) return vm_error(vm, "security_is_debugger_present() expects 0 arguments");
+    *out = val_bool(zr_is_debugger_attached());
+    return true;
+}
+
+static bool bi_pbck_shield_inspect(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (argc != 1) return vm_error(vm, "pbck_shield_inspect(bytes_or_path) expects 1 argument");
+
+    const uint8_t *raw_ptr = NULL;
+    size_t raw_len = 0;
+    uint8_t *owned_buf = NULL;
+
+    if (is_obj_type(argv[0], OBJ_BYTES)) {
+        PbBytes *bb = AS_BYTES(argv[0]);
+        raw_ptr = bb->data;
+        raw_len = bb->len;
+    } else if (is_obj_type(argv[0], OBJ_ARRAY)) {
+        PbArray *arr = AS_ARRAY(argv[0]);
+        owned_buf = (uint8_t *)zr_xmalloc(arr->len ? arr->len : 1u);
+        raw_len = arr->len;
+        for (size_t i = 0; i < raw_len; i++) {
+            if (arr->items[i].tag != VAL_NUM || arr->items[i].as.num < 0.0 || arr->items[i].as.num > 255.0) {
+                free(owned_buf);
+                return vm_error(vm, "pbck_shield_inspect(): byte array element %zu out of range 0..255", i);
+            }
+            owned_buf[i] = (uint8_t)arr->items[i].as.num;
+        }
+        raw_ptr = owned_buf;
+    } else if (is_obj_type(argv[0], OBJ_STR)) {
+        PbStr *s = AS_STR(argv[0]);
+        if (s->len >= 5u && (memcmp(s->chars, "PBSH", 4) == 0 || memcmp(s->chars, "PBCK", 4) == 0)) {
+            raw_ptr = (const uint8_t *)s->chars;
+            raw_len = s->len;
+        } else {
+            if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "pbck_shield_inspect", "fs")) return false;
+            if (!zr_read_entire_file(s->chars, &owned_buf, &raw_len)) {
+                return vm_error(vm, "pbck_shield_inspect(): cannot read '%s'", s->chars);
+            }
+            raw_ptr = owned_buf;
+        }
+    } else {
+        return vm_error(vm, "pbck_shield_inspect(): expected bytes, byte array, or file path, got %s",
+                        zr_val_type_name(argv[0]));
+    }
+
+    ZrShieldInspectInfo info;
+    zr_inspect_shield_bytes(raw_ptr, raw_len, &info);
+    free(owned_buf);
+
+    PbMap *m = pb_map_new_raw(vm, 16);
+    vm_push_root(vm, val_obj(m));
+    pb_map_set_cstr(vm, m, "ok", val_bool(info.ok));
+    pb_map_set_cstr(vm, m, "shielded", val_bool(info.shielded));
+    pb_map_set_cstr(vm, m, "format", val_obj(pb_str_c(vm, info.format)));
+    pb_map_set_cstr(vm, m, "version", val_num((double)info.version));
+    pb_map_set_cstr(vm, m, "bundled_exe", val_bool(info.bundled_exe));
+    pb_map_set_cstr(vm, m, "ip_sealed", val_bool(info.ip_sealed));
+    pb_map_set_cstr(vm, m, "ip_mode", val_obj(pb_str_c(vm, info.ip_mode)));
+    pb_map_set_cstr(vm, m, "stripped", val_bool(info.stripped));
+    pb_map_set_cstr(vm, m, "opcode_permuted", val_bool(info.opcode_permuted));
+    pb_map_set_cstr(vm, m, "encrypted", val_bool(info.encrypted));
+    pb_map_set_cstr(vm, m, "anti_debug", val_bool(info.anti_debug));
+    pb_map_set_cstr(vm, m, "integrity_ok", val_bool(info.integrity_ok));
+    pb_map_set_cstr(vm, m, "artifact_bytes", val_num((double)info.artifact_bytes));
+    pb_map_set_cstr(vm, m, "payload_bytes", val_num((double)info.payload_bytes));
+    pb_map_set_cstr(vm, m, "shannon_entropy", val_num(info.shannon_entropy));
+    vm_pop_roots(vm, 1);
+    *out = val_obj(m);
+    return true;
+}
+
 static void zr_register_all_builtins(PbVM *vm) {
     static const struct { const char *name; PbBuiltinFn fn; } table[] = {
         /* Console & Core */
@@ -5597,6 +5671,10 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"gfxdrawtextaa", bi_gfxdrawtextaa},
         {"gfxtextprofile", bi_gfxtextprofile},
         {"gfxbackendprofile", bi_gfxbackendprofile},
+        {"gfx_set_capture_shield", bi_gfx_set_capture_shield},
+        {"gfxsetcaptureshield", bi_gfx_set_capture_shield},
+        {"gfx_capture_shield_status", bi_gfx_capture_shield_status},
+        {"gfx_simulate_capture_event", bi_gfx_simulate_capture_event},
 
         /* Threads, Channels, Atomics & Sync */
         {"spawn", bi_spawn},
@@ -5726,7 +5804,11 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"graph_bfs_shortest_path", bi_graph_bfs_shortest_path},
         {"graph_dijkstra_f64", bi_graph_dijkstra_f64},
         {"gfx3d_raster_triangles", bi_gfx3d_raster_triangles},
-        {"aot_build_native", bi_aot_build_native}
+        {"aot_build_native", bi_aot_build_native},
+
+        /* v4.1.0 Polymorphic Bytecode Shield (`PBSH`) & Anti-Debug */
+        {"pbck_shield_inspect", bi_pbck_shield_inspect},
+        {"security_is_debugger_present", bi_security_is_debugger_present}
     };
 
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {

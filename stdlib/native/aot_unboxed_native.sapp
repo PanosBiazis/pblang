@@ -24,7 +24,7 @@
 let SC = import("stdlib:static_checker.sapp");
 let ELF_BASE = import("stdlib:native/elf_x64.sapp");
 
-let AOT_NATIVE_VERSION = "4.0.0";
+let AOT_NATIVE_VERSION = "4.1.0";
 
 // x86-64 GPR encoding constants
 let REG_RAX = 0;
@@ -386,6 +386,12 @@ fn _emit_add_rr(code, dst, src) {
 fn _emit_sub_rr(code, dst, src) {
     push(code, _rex_w(src, 0, dst));
     push(code, 41); // 0x29
+    push(code, _modrm(3, src, dst));
+}
+
+fn _emit_xor_rr(code, dst, src) {
+    push(code, _rex_w(src, 0, dst));
+    push(code, 49); // 0x31
     push(code, _modrm(3, src, dst));
 }
 
@@ -1236,7 +1242,12 @@ fn _emit_expr_i64(st, fctx, expr) {
     }
     if k == "str" {
         let sidx = _intern_str(st, expr["val"]);
-        _emit_lea_rip(st, REG_RAX, "ro_str", str(sidx));
+        if st["obfuscate_strings"] {
+            _emit_lea_rip(st, REG_RDI, "ro_str", str(sidx));
+            _emit_call_sym(st, "rt$unseal_ro_str");
+        } else {
+            _emit_lea_rip(st, REG_RAX, "ro_str", str(sidx));
+        }
         return;
     }
     if k == "ident" {
@@ -2448,13 +2459,58 @@ fn _emit_runtime_routines(st, is_pe64) {
     _emit_pop(code, REG_RBP);
     push(code, 195);
 
-    // 4. `rt$print_nl`
-    let nl_id = _intern_str(st, "\n");
+    // 3b. `rt$unseal_ro_str` (rdi = sealed `[u64 len][u8 seed][xor_bytes][0]` -> returns heap `[u64 len][bytes]` in RAX)
+    if st["obfuscate_strings"] {
+        st["labels"]["rt$unseal_ro_str"] = len(code);
+        _emit_push(code, REG_RBP);
+        _emit_mov_rr(code, REG_RBP, REG_RSP);
+        _emit_push(code, REG_RBX);
+        _emit_push(code, REG_R12);
+        push(code, 72); push(code, 131); push(code, 228); push(code, 240); // and rsp, -16
+        _emit_mov_rr(code, REG_RBX, REG_RDI); // rbx = sealed ro_ptr
+        _emit_load64(code, REG_R12, REG_RBX, 0); // r12 = byte_len
+        _emit_mov_rr(code, REG_RDI, REG_R12);
+        _emit_add_imm(code, REG_RDI, 16);
+        _emit_call_sym(st, "rt$alloc"); // rax = zeroed heap str_ptr
+        _emit_store64(code, REG_RAX, 0, REG_R12);
+        _emit_load_u8(code, REG_R8, REG_RBX, 8); // r8 = rolling seed
+        _emit_mov_imm64(code, REG_RCX, 0); // rcx = bi
+        let unseal_loop = len(code);
+        _emit_cmp_rr(code, REG_RCX, REG_R12);
+        let j_unseal_done = _emit_jcc(code, 141); // jge
+        _emit_imul_imm(code, REG_RDX, REG_RCX, 29);
+        _emit_add_rr(code, REG_RDX, REG_R8);
+        _emit_add_imm(code, REG_RDX, 19);
+        _emit_mov_rr(code, REG_RSI, REG_RBX);
+        _emit_add_rr(code, REG_RSI, REG_RCX);
+        _emit_load_u8(code, REG_R9, REG_RSI, 9);
+        _emit_xor_rr(code, REG_RDX, REG_R9);
+        _emit_mov_rr(code, REG_RDI, REG_RAX);
+        _emit_add_rr(code, REG_RDI, REG_RCX);
+        _emit_store_u8(code, REG_RDI, 8, REG_RDX);
+        _emit_add_imm(code, REG_RCX, 1);
+        let j_unseal_back = _emit_jmp(code);
+        _patch_rel(code, j_unseal_back, unseal_loop);
+        _patch_rel(code, j_unseal_done, len(code));
+        _emit_lea(code, REG_RSP, REG_RBP, -16);
+        _emit_pop(code, REG_R12);
+        _emit_pop(code, REG_RBX);
+        _emit_pop(code, REG_RBP);
+        push(code, 195);
+    }
+
+    // 4. `rt$print_nl` (stack-immediate byte 10 so even '\n' needs no .rodata literal)
     st["labels"]["rt$print_nl"] = len(code);
-    _emit_lea_rip(st, REG_RSI, "ro_str", str(nl_id));
-    _emit_add_imm(code, REG_RSI, 8);
+    _emit_push(code, REG_RBP);
+    _emit_mov_rr(code, REG_RBP, REG_RSP);
+    _emit_sub_imm(code, REG_RSP, 16);
+    _emit_mov_imm64(code, REG_RDX, 10);
+    _emit_store_u8(code, REG_RSP, 0, REG_RDX);
+    _emit_mov_rr(code, REG_RSI, REG_RSP);
     _emit_mov_imm64(code, REG_RDX, 1);
     _emit_call_sym(st, "rt$write");
+    _emit_add_imm(code, REG_RSP, 16);
+    _emit_pop(code, REG_RBP);
     push(code, 195);
 
     // 5. `rt$print_str` (rdi = str_ptr -> [rdi]=len, rdi+8=bytes)
@@ -2468,12 +2524,26 @@ fn _emit_runtime_routines(st, is_pe64) {
     let true_id = _intern_str(st, "true");
     let false_id = _intern_str(st, "false");
     st["labels"]["rt$bool_to_str"] = len(code);
+    _emit_push(code, REG_RBP);
+    _emit_mov_rr(code, REG_RBP, REG_RSP);
     _emit_test_rr(code, REG_RDI, REG_RDI);
     let jb_f = _emit_jcc(code, 132);
-    _emit_lea_rip(st, REG_RAX, "ro_str", str(true_id));
+    if st["obfuscate_strings"] {
+        _emit_lea_rip(st, REG_RDI, "ro_str", str(true_id));
+        _emit_call_sym(st, "rt$unseal_ro_str");
+    } else {
+        _emit_lea_rip(st, REG_RAX, "ro_str", str(true_id));
+    }
+    _emit_pop(code, REG_RBP);
     push(code, 195);
     _patch_rel(code, jb_f, len(code));
-    _emit_lea_rip(st, REG_RAX, "ro_str", str(false_id));
+    if st["obfuscate_strings"] {
+        _emit_lea_rip(st, REG_RDI, "ro_str", str(false_id));
+        _emit_call_sym(st, "rt$unseal_ro_str");
+    } else {
+        _emit_lea_rip(st, REG_RAX, "ro_str", str(false_id));
+    }
+    _emit_pop(code, REG_RBP);
     push(code, 195);
 
     st["labels"]["rt$print_bool"] = len(code);
@@ -2598,7 +2668,13 @@ fn _emit_runtime_routines(st, is_pe64) {
     _emit_cmp_imm(code, REG_RAX, 45);
     let jf_hasminus = _emit_jcc(code, 132);
     let minus_id = _intern_str(st, "-");
-    _emit_lea_rip(st, REG_RDI, "ro_str", str(minus_id));
+    if st["obfuscate_strings"] {
+        _emit_lea_rip(st, REG_RDI, "ro_str", str(minus_id));
+        _emit_call_sym(st, "rt$unseal_ro_str");
+        _emit_mov_rr(code, REG_RDI, REG_RAX);
+    } else {
+        _emit_lea_rip(st, REG_RDI, "ro_str", str(minus_id));
+    }
     _emit_mov_rr(code, REG_RSI, REG_RBX);
     _emit_call_sym(st, "rt$str_concat");
     _emit_mov_rr(code, REG_RBX, REG_RAX);
@@ -2750,7 +2826,23 @@ fn _emit_runtime_routines(st, is_pe64) {
 
 // ── Top-Level Pure-PBLang Compilation Driver (`ELF64` & `PE32+`) ──────────────
 
-fn _compile_unboxed_core(source, is_pe64) {
+fn _resolve_aot_shield_opts(opts) {
+    let o = if opts != nil and type(opts) == "map" { opts } else { map{} };
+    let is_free = (map_has(o, "mode") and str_lower(str(o["mode"])) == "free")
+        or (map_has(o, "ip_mode") and str_lower(str(o["ip_mode"])) == "free");
+    let strip_syms = not is_free;
+    if map_has(o, "strip_symbols") { strip_syms = o["strip_symbols"] == true; }
+    if map_has(o, "open_symbols") and o["open_symbols"] == true { strip_syms = false; }
+    let obf_strs = not is_free;
+    if map_has(o, "obfuscate_strings") { obf_strs = o["obfuscate_strings"] == true; }
+    return map{
+        strip_symbols: strip_syms,
+        obfuscate_strings: obf_strs
+    };
+}
+
+fn _compile_unboxed_core(source, is_pe64, opts = nil) {
+    let shield = _resolve_aot_shield_opts(opts);
     let parsed = SC.parse_sapp_ast(source);
     if len(parsed["errors"]) > 0 {
         throw "aot_unboxed_native: syntax error: " + parsed["errors"][0]["message"];
@@ -2775,7 +2867,10 @@ fn _compile_unboxed_core(source, is_pe64) {
         schemas: map{},
         buf_schemas: map{},
         fn_ret_types: map{},
-        fn_param_types: map{}
+        fn_param_types: map{},
+        strip_symbols: shield["strip_symbols"],
+        obfuscate_strings: shield["obfuscate_strings"],
+        fn_names: []
     };
 
     let fn_decls = [];
@@ -2806,6 +2901,7 @@ fn _compile_unboxed_core(source, is_pe64) {
             st["schemas"][s["name"]] = _build_schema_layout(fspecs);
         } elif sk == "fn_decl" {
             push(fn_decls, s);
+            push(st["fn_names"], s["name"]);
             if s["name"] == "main" { has_user_main = true; }
             let rt = _norm_annot_type(s["ret_annot"]);
             if rt == "" { rt = "i64"; }
@@ -2902,7 +2998,9 @@ fn _compile_unboxed_core(source, is_pe64) {
         ci = ci + 1;
     }
 
-    // Build `.rodata` string pool (`[u64 byte_len][utf8 bytes...][0]` 8-byte aligned)
+    // Build `.rodata` string pool:
+    //   - Default proprietary (`obfuscate_strings == true`): `[u64 byte_len][u8 seed][rolling_xor_bytes...][0]`
+    //   - Open/free (`obfuscate_strings == false`): `[u64 byte_len][utf8 bytes...][0]`
     let rodata = [];
     let ro_str_offs = map{};
     let si = 0;
@@ -2911,8 +3009,19 @@ fn _compile_unboxed_core(source, is_pe64) {
         ro_str_offs[str(si)] = len(rodata);
         let sbytes = str_to_bytes(st["str_list"][si]);
         _le(rodata, len(sbytes), 8);
-        let bi = 0;
-        while bi < len(sbytes) { push(rodata, sbytes[bi]); bi = bi + 1; }
+        if st["obfuscate_strings"] {
+            let seed = bit_and(167 + si * 37, 255);
+            push(rodata, seed);
+            let bi = 0;
+            while bi < len(sbytes) {
+                let mask = bit_and(seed + bi * 29 + 19, 255);
+                push(rodata, bit_xor(sbytes[bi], mask));
+                bi = bi + 1;
+            }
+        } else {
+            let bi = 0;
+            while bi < len(sbytes) { push(rodata, sbytes[bi]); bi = bi + 1; }
+        }
         push(rodata, 0);
         si = si + 1;
     }
@@ -2922,6 +3031,18 @@ fn _compile_unboxed_core(source, is_pe64) {
         return _pack_elf64_image(st, rodata, ro_str_offs);
     }
     return _pack_pe64_image(st, rodata, ro_str_offs);
+}
+
+fn _append_open_symtab_note(bin_buf, st) {
+    if st["strip_symbols"] { return; }
+    _push_slice(bin_buf, str_to_bytes("PBLANG_SYMTAB:"));
+    push(bin_buf, 0);
+    let i = 0;
+    while i < len(st["fn_names"]) {
+        _push_slice(bin_buf, str_to_bytes(st["fn_names"][i]));
+        push(bin_buf, 0);
+        i = i + 1;
+    }
 }
 
 fn _pack_elf64_image(st, rodata, ro_str_offs) {
@@ -2978,7 +3099,7 @@ fn _pack_elf64_image(st, rodata, ro_str_offs) {
     _le(elf, 1, 4);
     _le(elf, VBASE + code_off, 8); // e_entry
     _le(elf, EHSIZE, 8);           // e_phoff
-    _le(elf, 0, 8);                // e_shoff
+    _le(elf, 0, 8);                // e_shoff (0 = stripped section/symbol headers)
     _le(elf, 0, 4);
     _le(elf, EHSIZE, 2);
     _le(elf, PHSIZE, 2);
@@ -3001,6 +3122,7 @@ fn _pack_elf64_image(st, rodata, ro_str_offs) {
     _push_zeros(elf, code_pad);
     _push_slice(elf, rodata);
     _push_zeros(elf, ro_pad);
+    _append_open_symtab_note(elf, st);
     return elf;
 }
 
@@ -3114,7 +3236,7 @@ fn _pack_pe64_image(st, rodata, ro_str_offs) {
     push(pe, 80); push(pe, 69); push(pe, 0); push(pe, 0); // 'PE\0\0'
     _le(pe, 34404, 2); // AMD64
     _le(pe, 2, 2);
-    _le(pe, 0, 4); _le(pe, 0, 4); _le(pe, 0, 4);
+    _le(pe, 0, 4); _le(pe, 0, 4); _le(pe, 0, 4); // PointerToSymbolTable = 0, NumberOfSymbols = 0
     _le(pe, 240, 2);
     _le(pe, 35, 2);
 
@@ -3161,6 +3283,7 @@ fn _pack_pe64_image(st, rodata, ro_str_offs) {
     _push_zeros(pe, text_raw_sz - text_virt_sz);
     _push_slice(pe, idata);
     _push_zeros(pe, idata_raw_sz - len(idata));
+    _append_open_symtab_note(pe, st);
     return pe;
 }
 
@@ -3174,9 +3297,10 @@ fn can_compile_unboxed(source) {
 
 fn compile_aot_elf64(source, opts = nil) {
     let o = if opts != nil and type(opts) == "map" { opts } else { map{} };
+    let shield = _resolve_aot_shield_opts(o);
     let strict_unboxed = map_has(o, "strict_unboxed") and o["strict_unboxed"] == true;
     if can_compile_unboxed(source) {
-        let bin = _compile_unboxed_core(source, false);
+        let bin = _compile_unboxed_core(source, false, o);
         return map{
             ok: true,
             binary: bin,
@@ -3184,6 +3308,8 @@ fn compile_aot_elf64(source, opts = nil) {
             target: "aot-native",
             format: "ELF64",
             mode: "pure_pblang_unboxed_x64",
+            strip_symbols: shield["strip_symbols"],
+            obfuscate_strings: shield["obfuscate_strings"],
             zero_external_toolchain: true
         };
     }
@@ -3199,15 +3325,18 @@ fn compile_aot_elf64(source, opts = nil) {
         target: "aot-native",
         format: "ELF64",
         mode: "hybrid_pure_pblang_x64",
+        strip_symbols: shield["strip_symbols"],
+        obfuscate_strings: false,
         zero_external_toolchain: true
     };
 }
 
 fn compile_aot_pe64(source, opts = nil) {
     let o = if opts != nil and type(opts) == "map" { opts } else { map{} };
+    let shield = _resolve_aot_shield_opts(o);
     let strict_unboxed = map_has(o, "strict_unboxed") and o["strict_unboxed"] == true;
     if can_compile_unboxed(source) {
-        let bin = _compile_unboxed_core(source, true);
+        let bin = _compile_unboxed_core(source, true, o);
         return map{
             ok: true,
             binary: bin,
@@ -3215,6 +3344,8 @@ fn compile_aot_pe64(source, opts = nil) {
             target: "aot-pe64",
             format: "PE32+",
             mode: "pure_pblang_unboxed_pe64",
+            strip_symbols: shield["strip_symbols"],
+            obfuscate_strings: shield["obfuscate_strings"],
             zero_external_toolchain: true
         };
     }
@@ -3230,6 +3361,8 @@ fn compile_aot_pe64(source, opts = nil) {
         target: "aot-pe64",
         format: "PE32+",
         mode: "hybrid_pure_pblang_pe64",
+        strip_symbols: shield["strip_symbols"],
+        obfuscate_strings: false,
         zero_external_toolchain: true
     };
 }
@@ -3257,6 +3390,8 @@ fn build_aot_native(src_path, out_path, opts = nil) {
         target: rep["target"],
         format: rep["format"],
         mode: rep["mode"],
+        strip_symbols: rep["strip_symbols"],
+        obfuscate_strings: rep["obfuscate_strings"],
         zero_external_toolchain: true,
         compile_ms: dt
     };

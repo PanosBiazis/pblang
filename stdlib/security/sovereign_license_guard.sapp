@@ -1,0 +1,1581 @@
+// stdlib/security/sovereign_license_guard.sapp — Privacy-First Asymmetric Ed25519
+// + Key-Gated Anti-Crack Software Licensing Engine (PBLang v4.1.0).
+//
+// 100% Pure PBLang (Zero C, Zero Python, Zero external toolchains, Zero telemetry).
+// Works identically across Desktop, CLI, Server, Mobile, and Web/WASM:
+//   1. Asymmetric Ed25519 Vendor Key Management (RFC 8032; offline secret key,
+//      public-key-only binary embedding -> 0% keygen feasibility).
+//   2. Privacy-Preserving Unlinkable Seat Commitment (`compute_privacy_seat_id`)
+//      via domain-separated HMAC-SHA256 -> 0 PII leakage & cross-app unlinkability.
+//   3. Armored `PBLIC1.<base64url>.<sig_hex>` License Issuance (`perpetual`,
+//      `subscription`, `trial`, `floating`, `evaluation`) with wrapped `feature_keys`.
+//   4. 100% Air-Gapped Offline Verification + Monotonic Anti-Clock-Rollback Guard
+//      (`> 300s` backward clock jump detection) + Signed Offline CRL (`PBCRL1.`).
+//   5. Anti-NOP-Patch Key-Gated Feature Vault (`seal_licensed_feature_vault` /
+//      `unlock_licensed_feature_vault` / `execute_licensed_sapp_vault`) backed by
+//      RFC 8439 ChaCha20-Poly1305 AEAD + key-committing HMAC-SHA256.
+//   6. Zero-CDN Offline WebCrypto + Pure-JS Ed25519 PWA License Gate Snippet.
+
+let _SHA256 = import("stdlib:sha256_pb.sapp");
+let _SHA512 = import("stdlib:sha512_pb.sapp");
+let _ED25519_VERIFY = import("stdlib:ed25519_verify.sapp");
+let _SEMVER = import("stdlib:semver.sapp");
+let _NATIVE_PBCK = import("stdlib:compiler/native_pbck.sapp");
+let _HOST_VM = import("stdlib:host_pbck_vm.sapp");
+
+let GUARD_VERSION = "4.1.0";
+let TOKEN_PREFIX = "PBLIC1";
+let CRL_PREFIX = "PBCRL1";
+let CLOCK_ROLLBACK_TOLERANCE_SECONDS = 300;
+
+let _MASK32 = 4294967295;
+let _MOD32 = 4294967296;
+let _HEX_DIGITS = "0123456789abcdef";
+let _B64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+// RFC 8032 Curve25519 / Ed25519 constants
+let _BI_ZERO = bigint(0);
+let _BI_ONE = bigint(1);
+let _BI_TWO = bigint(2);
+let _BI_256 = bigint(256);
+let _ED_P = bigint("57896044618658097711785492504343953926634992332820282019728792003956564819949");
+let _ED_L = bigint("7237005577332262213973186563042994240857116359379907606001950938285454250989");
+let _ED_D = bigint("37095705934669439343138083508754565189542113879843219016388785533085940283555");
+let _ED_BASE_X = bigint("15112221349535400772501151409588531511454012693041857206046113283949847762202");
+let _ED_BASE_Y = bigint("46316835694926478169428394003475163141307993866256225615783033603165251855960");
+
+// RFC 8439 Poly1305 constants (2^130 - 5 and 2^128)
+let _POLY_P = bigint("1361129467683753853853498429727072845819");
+let _POLY_MOD128 = bigint("340282366920938463463374607431768211456");
+
+let _VALID_LICENSE_TYPES = map{
+    "perpetual": true,
+    "subscription": true,
+    "trial": true,
+    "floating": true,
+    "evaluation": true
+};
+
+fn _err(msg) {
+    throw "sovereign_license_guard: " + str(msg);
+}
+
+fn _opt(m, key, fallback) {
+    if m == nil or not is_map(m) { return fallback; }
+    if not map_has(m, key) { return fallback; }
+    let v = m[key];
+    if v == nil { return fallback; }
+    return v;
+}
+
+fn _now_unix_default() {
+    return num_floor(now_ms() / 1000);
+}
+
+// ── Hex, Byte, Constant-Time & Base64URL Utilities ───────────────────────────
+
+fn _bytes_to_hex(bytes) {
+    let parts = [];
+    let i = 0;
+    while i < len(bytes) {
+        let b = bit_and(bytes[i], 255);
+        let hi = bit_and(bit_shr(b, 4), 15);
+        let lo = bit_and(b, 15);
+        array_push(parts, str_slice(_HEX_DIGITS, hi, hi + 1) + str_slice(_HEX_DIGITS, lo, lo + 1));
+        i = i + 1;
+    }
+    return str_join(parts, "");
+}
+
+fn _hex_nibble_any(code) {
+    if code >= 48 and code <= 57 { return code - 48; }
+    if code >= 97 and code <= 102 { return code - 87; }
+    if code >= 65 and code <= 70 { return code - 55; }
+    return 0 - 1;
+}
+
+fn _hex_nibble_lower_strict(code) {
+    if code >= 48 and code <= 57 { return code - 48; }
+    if code >= 97 and code <= 102 { return code - 87; }
+    return 0 - 1;
+}
+
+fn _hex_to_bytes_checked(hex_str, exact_byte_len, require_lowercase) {
+    if not is_string(hex_str) { return nil; }
+    if len(hex_str) % 2 != 0 { return nil; }
+    if exact_byte_len != nil and len(hex_str) != exact_byte_len * 2 { return nil; }
+    let out = [];
+    let i = 0;
+    while i < len(hex_str) {
+        let c0 = strcharcodeat(hex_str, i);
+        let c1 = strcharcodeat(hex_str, i + 1);
+        let hi = if require_lowercase { _hex_nibble_lower_strict(c0) } else { _hex_nibble_any(c0) };
+        let lo = if require_lowercase { _hex_nibble_lower_strict(c1) } else { _hex_nibble_any(c1) };
+        if hi < 0 or lo < 0 { return nil; }
+        array_push(out, hi * 16 + lo);
+        i = i + 2;
+    }
+    return out;
+}
+
+fn _is_valid_hex(hex_str, exact_byte_len) {
+    return _hex_to_bytes_checked(hex_str, exact_byte_len, false) != nil;
+}
+
+fn _as_bytes(val) {
+    if is_array(val) {
+        let out = [];
+        let i = 0;
+        while i < len(val) {
+            let b = val[i];
+            if not is_number(b) or num_floor(b) != b or b < 0 or b > 255 {
+                _err("byte array must contain integers 0..255");
+            }
+            array_push(out, b);
+            i = i + 1;
+        }
+        return out;
+    }
+    if is_string(val) {
+        return str_to_bytes(val);
+    }
+    _err("expected string or byte array");
+}
+
+fn _ct_eq_bytes(a, b) {
+    if not is_array(a) or not is_array(b) { return false; }
+    if len(a) != len(b) { return false; }
+    let diff = 0;
+    let i = 0;
+    while i < len(a) {
+        diff = bit_or(diff, bit_xor(bit_and(a[i], 255), bit_and(b[i], 255)));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+fn _ct_eq_str(a, b) {
+    if not is_string(a) or not is_string(b) { return false; }
+    if len(a) != len(b) { return false; }
+    return constant_time_eq(a, b);
+}
+
+fn _sha256_bytes(bytes) {
+    return _hex_to_bytes_checked(_SHA256.sha256_hex_bytes(bytes), 32, false);
+}
+
+fn _sha256_str_hex(s) {
+    return _SHA256.sha256_hex(str(s));
+}
+
+// RFC 4648 §5 Base64URL (unpadded, canonical)
+fn base64url_encode_bytes(bytes) {
+    let b64 = base64_encode_bytes(bytes);
+    let step1 = str_replace_all(b64, "+", "-");
+    let step2 = str_replace_all(step1, "/", "_");
+    return str_replace_all(step2, "=", "");
+}
+
+fn base64url_decode_bytes_strict(b64u) {
+    if not is_string(b64u) or len(b64u) == 0 { return nil; }
+    let rem = len(b64u) % 4;
+    if rem == 1 { return nil; }
+    let i = 0;
+    while i < len(b64u) {
+        let ch = strcharcodeat(b64u, i);
+        let ok_ch = (ch >= 65 and ch <= 90)
+            or (ch >= 97 and ch <= 122)
+            or (ch >= 48 and ch <= 57)
+            or ch == 45 or ch == 95;
+        if not ok_ch { return nil; }
+        i = i + 1;
+    }
+    let std = str_replace_all(str_replace_all(b64u, "-", "+"), "_", "/");
+    if rem == 2 { std = std + "=="; }
+    if rem == 3 { std = std + "="; }
+    let decoded = try base64_decode_bytes(std) catch nil;
+    if decoded == nil { return nil; }
+    // Enforce canonical trailing bits so ANY 1-character mutation is rejected!
+    if base64url_encode_bytes(decoded) != b64u { return nil; }
+    return decoded;
+}
+
+// ── Deterministic Canonical JSON Serializer ──────────────────────────────────
+
+fn _escape_json_str(s) {
+    return json_stringify(str(s));
+}
+
+fn canonical_json_encode(val) {
+    if val == nil { return "null"; }
+    if is_bool(val) { return if val { "true" } else { "false" }; }
+    if is_number(val) { return json_stringify(val); }
+    if is_string(val) { return _escape_json_str(val); }
+    if is_array(val) {
+        let parts = [];
+        let i = 0;
+        while i < len(val) {
+            array_push(parts, canonical_json_encode(val[i]));
+            i = i + 1;
+        }
+        return "[" + str_join(parts, ",") + "]";
+    }
+    if is_map(val) {
+        let keys = array_sort(map_keys(val));
+        let parts = [];
+        let i = 0;
+        while i < len(keys) {
+            let k = str(keys[i]);
+            let v = val[k];
+            array_push(parts, _escape_json_str(k) + ":" + canonical_json_encode(v));
+            i = i + 1;
+        }
+        return "{" + str_join(parts, ",") + "}";
+    }
+    _err("unsupported value type in canonical JSON: " + type(val));
+}
+
+// ── RFC 8032 Pure-PBLang Ed25519 (with Host Builtin Fast-Path Probe) ─────────
+
+fn _ed_mod_p(v) {
+    let r = v % _ED_P;
+    if r < _BI_ZERO { r = r + _ED_P; }
+    return r;
+}
+
+fn _ed_pow_mod_p(base_val, exp_val) {
+    let res = _BI_ONE;
+    let factor = _ed_mod_p(base_val);
+    let rem = exp_val;
+    while rem > _BI_ZERO {
+        if rem % _BI_TWO == _BI_ONE { res = _ed_mod_p(res * factor); }
+        factor = _ed_mod_p(factor * factor);
+        rem = rem / _BI_TWO;
+    }
+    return res;
+}
+
+fn _le_bytes_to_bigint(bytes) {
+    let acc = _BI_ZERO;
+    let factor = _BI_ONE;
+    let i = 0;
+    while i < len(bytes) {
+        acc = acc + bigint(bit_and(bytes[i], 255)) * factor;
+        factor = factor * _BI_256;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn _bigint_to_le_bytes(val, nbytes) {
+    let out = [];
+    let cur = val;
+    let i = 0;
+    while i < nbytes {
+        let b_bi = cur % _BI_256;
+        array_push(out, parse_number(str(b_bi)));
+        cur = cur / _BI_256;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _ed_point_add(left, right) {
+    let a = _ed_mod_p((left.y - left.x) * (right.y - right.x));
+    let b = _ed_mod_p((left.y + left.x) * (right.y + right.x));
+    let c = _ed_mod_p(_BI_TWO * _ED_D * left.t * right.t);
+    let d2 = _ed_mod_p(_BI_TWO * left.z * right.z);
+    let e = _ed_mod_p(b - a);
+    let f = _ed_mod_p(d2 - c);
+    let g = _ed_mod_p(d2 + c);
+    let h = _ed_mod_p(b + a);
+    return map{
+        x: _ed_mod_p(e * f),
+        y: _ed_mod_p(g * h),
+        z: _ed_mod_p(f * g),
+        t: _ed_mod_p(e * h)
+    };
+}
+
+fn _ed_point_double(pt) {
+    let a = _ed_mod_p(pt.x * pt.x);
+    let b = _ed_mod_p(pt.y * pt.y);
+    let c = _ed_mod_p(_BI_TWO * pt.z * pt.z);
+    let d2 = _ed_mod_p(_BI_ZERO - a);
+    let e = _ed_mod_p((pt.x + pt.y) * (pt.x + pt.y) - a - b);
+    let g = _ed_mod_p(d2 + b);
+    let f = _ed_mod_p(g - c);
+    let h = _ed_mod_p(d2 - b);
+    return map{
+        x: _ed_mod_p(e * f),
+        y: _ed_mod_p(g * h),
+        z: _ed_mod_p(f * g),
+        t: _ed_mod_p(e * h)
+    };
+}
+
+fn _ed_scalar_mult_base(scalar) {
+    let res = map{ x: _BI_ZERO, y: _BI_ONE, z: _BI_ONE, t: _BI_ZERO };
+    let addend = map{ x: _ED_BASE_X, y: _ED_BASE_Y, z: _BI_ONE, t: _ed_mod_p(_ED_BASE_X * _ED_BASE_Y) };
+    let rem = scalar;
+    while rem > _BI_ZERO {
+        if rem % _BI_TWO == _BI_ONE { res = _ed_point_add(res, addend); }
+        addend = _ed_point_double(addend);
+        rem = rem / _BI_TWO;
+    }
+    return res;
+}
+
+fn _ed_encode_point(pt) {
+    let z_inv = _ed_pow_mod_p(pt.z, _ED_P - _BI_TWO);
+    let x = _ed_mod_p(pt.x * z_inv);
+    let y = _ed_mod_p(pt.y * z_inv);
+    let enc = _bigint_to_le_bytes(y, 32);
+    if x % _BI_TWO == _BI_ONE {
+        enc[31] = enc[31] + 128;
+    }
+    return enc;
+}
+
+fn _ed_expand_seed(seed32) {
+    let h_hex = _SHA512.sha512_hex_bytes(seed32);
+    let h = _hex_to_bytes_checked(h_hex, 64, false);
+    let clamped = slice(h, 0, 32);
+    clamped[0] = bit_and(clamped[0], 248);
+    clamped[31] = bit_or(bit_and(clamped[31], 127), 64);
+    let prefix = slice(h, 32, 64);
+    let scalar_a = _le_bytes_to_bigint(clamped);
+    let pub_bytes = _ed_encode_point(_ed_scalar_mult_base(scalar_a));
+    return map{
+        scalar_a: scalar_a,
+        prefix: prefix,
+        pk_bytes: pub_bytes,
+        pk_hex: _bytes_to_hex(pub_bytes)
+    };
+}
+
+fn derive_vendor_public_key(vendor_sk_hex) {
+    let seed32 = _hex_to_bytes_checked(vendor_sk_hex, 32, false);
+    if seed32 == nil { _err("vendor_sk_hex must be a 64-character hex Ed25519 seed"); }
+    return _ed_expand_seed(seed32).pk_hex;
+}
+
+// 1. Asymmetric Vendor Key Management (`generate_vendor_keypair`)
+fn generate_vendor_keypair(seed_hex = nil) {
+    if seed_hex == nil {
+        let native_kp = try ed25519_keypair() catch nil;
+        if is_map(native_kp) {
+            let n_sk = _opt(native_kp, "sk_hex", _opt(native_kp, "secret_key", ""));
+            let n_pk = _opt(native_kp, "pk_hex", _opt(native_kp, "public_key", ""));
+            if _is_valid_hex(n_sk, 32) and _is_valid_hex(n_pk, 32) {
+                let sk_low = str_lower(n_sk);
+                let pk_low = str_lower(n_pk);
+                return map{
+                    algorithm: "ed25519",
+                    sk_hex: sk_low,
+                    pk_hex: pk_low,
+                    secret_key: sk_low,
+                    public_key: pk_low,
+                    embed_in_client_binary: pk_low,
+                    keep_strictly_offline: true
+                };
+            }
+        }
+    }
+    let seed32 = if seed_hex == nil {
+        random_bytes(32)
+    } else {
+        _hex_to_bytes_checked(seed_hex, 32, false)
+    };
+    if seed32 == nil or len(seed32) != 32 {
+        _err("seed_hex must be a 64-character hex string");
+    }
+    let exp = _ed_expand_seed(seed32);
+    let sk_low = _bytes_to_hex(seed32);
+    return map{
+        algorithm: "ed25519",
+        sk_hex: sk_low,
+        pk_hex: exp.pk_hex,
+        secret_key: sk_low,
+        public_key: exp.pk_hex,
+        embed_in_client_binary: exp.pk_hex,
+        keep_strictly_offline: true
+    };
+}
+
+fn ed25519_sign_message(vendor_sk_hex, msg_str_or_bytes) {
+    let seed32 = _hex_to_bytes_checked(vendor_sk_hex, 32, false);
+    if seed32 == nil { _err("vendor_sk_hex must be 64 hex chars"); }
+    let msg_bytes = _as_bytes(msg_str_or_bytes);
+
+    let native_sig = try ed25519_sign(str_lower(vendor_sk_hex), msg_bytes) catch nil;
+    if is_string(native_sig) and _is_valid_hex(native_sig, 64) {
+        return str_lower(native_sig);
+    }
+
+    let exp = _ed_expand_seed(seed32);
+    let r_input = [];
+    let i = 0;
+    while i < 32 { array_push(r_input, exp.prefix[i]); i = i + 1; }
+    i = 0;
+    while i < len(msg_bytes) { array_push(r_input, msg_bytes[i]); i = i + 1; }
+    let r_digest = _hex_to_bytes_checked(_SHA512.sha512_hex_bytes(r_input), 64, false);
+    let r_scalar = _le_bytes_to_bigint(r_digest) % _ED_L;
+    let r_bytes = _ed_encode_point(_ed_scalar_mult_base(r_scalar));
+
+    let k_input = [];
+    i = 0;
+    while i < 32 { array_push(k_input, r_bytes[i]); i = i + 1; }
+    i = 0;
+    while i < 32 { array_push(k_input, exp.pk_bytes[i]); i = i + 1; }
+    i = 0;
+    while i < len(msg_bytes) { array_push(k_input, msg_bytes[i]); i = i + 1; }
+    let k_digest = _hex_to_bytes_checked(_SHA512.sha512_hex_bytes(k_input), 64, false);
+    let k_scalar = _le_bytes_to_bigint(k_digest) % _ED_L;
+
+    let s_scalar = (r_scalar + k_scalar * exp.scalar_a) % _ED_L;
+    let s_bytes = _bigint_to_le_bytes(s_scalar, 32);
+
+    let sig64 = [];
+    i = 0;
+    while i < 32 { array_push(sig64, r_bytes[i]); i = i + 1; }
+    i = 0;
+    while i < 32 { array_push(sig64, s_bytes[i]); i = i + 1; }
+    return _bytes_to_hex(sig64);
+}
+
+fn ed25519_verify_message(vendor_pk_hex, msg_str_or_bytes, sig_hex) {
+    let pk32 = _hex_to_bytes_checked(vendor_pk_hex, 32, false);
+    let sig64 = _hex_to_bytes_checked(sig_hex, 64, true);
+    if pk32 == nil or sig64 == nil { return false; }
+    let msg_bytes = try _as_bytes(msg_str_or_bytes) catch nil;
+    if msg_bytes == nil { return false; }
+
+    let native_ok = try ed25519_verify(pk32, msg_bytes, sig64) catch nil;
+    if is_bool(native_ok) { return native_ok; }
+    return _ED25519_VERIFY.verify(pk32, msg_bytes, sig64);
+}
+
+// ── RFC 8439 ChaCha20-Poly1305 Authenticated Encryption (AEAD) ───────────────
+
+fn _rotl32(x, n) {
+    let xm = bit_and(x, _MASK32);
+    if n <= 0 { return xm; }
+    let keep = bit_shr(_MASK32, n);
+    let lo = bit_and(xm, keep);
+    return bit_or(bit_shl(lo, n), bit_shr(xm, 32 - n));
+}
+
+fn _add32(a, b) {
+    return num_mod(bit_and(a, _MASK32) + bit_and(b, _MASK32), _MOD32);
+}
+
+fn _le32(b, off) {
+    return b[off] + b[off + 1] * 256 + b[off + 2] * 65536 + b[off + 3] * 16777216;
+}
+
+fn _push_le32(out, w) {
+    array_push(out, bit_and(w, 255));
+    array_push(out, bit_and(bit_shr(w, 8), 255));
+    array_push(out, bit_and(bit_shr(w, 16), 255));
+    array_push(out, bit_and(bit_shr(w, 24), 255));
+}
+
+fn _push_le64(out, n) {
+    let lo = num_mod(n, _MOD32);
+    let hi = num_floor(n / _MOD32);
+    _push_le32(out, lo);
+    _push_le32(out, hi);
+}
+
+fn _chacha_qr(w, a, b, c, d) {
+    w[a] = _add32(w[a], w[b]); w[d] = _rotl32(bit_xor(w[d], w[a]), 16);
+    w[c] = _add32(w[c], w[d]); w[b] = _rotl32(bit_xor(w[b], w[c]), 12);
+    w[a] = _add32(w[a], w[b]); w[d] = _rotl32(bit_xor(w[d], w[a]), 8);
+    w[c] = _add32(w[c], w[d]); w[b] = _rotl32(bit_xor(w[b], w[c]), 7);
+}
+
+fn chacha20_block_rfc8439(key32, counter, nonce12) {
+    let s = [1634760805, 857760878, 2036477234, 1797285236];
+    let k = 0;
+    while k < 8 {
+        array_push(s, _le32(key32, k * 4));
+        k = k + 1;
+    }
+    array_push(s, num_mod(counter, _MOD32));
+    array_push(s, _le32(nonce12, 0));
+    array_push(s, _le32(nonce12, 4));
+    array_push(s, _le32(nonce12, 8));
+
+    let w = [];
+    let i = 0;
+    while i < 16 { array_push(w, s[i]); i = i + 1; }
+    let r = 0;
+    while r < 10 {
+        _chacha_qr(w, 0, 4, 8, 12); _chacha_qr(w, 1, 5, 9, 13);
+        _chacha_qr(w, 2, 6, 10, 14); _chacha_qr(w, 3, 7, 11, 15);
+        _chacha_qr(w, 0, 5, 10, 15); _chacha_qr(w, 1, 6, 11, 12);
+        _chacha_qr(w, 2, 7, 8, 13); _chacha_qr(w, 3, 4, 9, 14);
+        r = r + 1;
+    }
+    let out = [];
+    i = 0;
+    while i < 16 {
+        _push_le32(out, _add32(w[i], s[i]));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn chacha20_stream_xor(data_bytes, key32, nonce12, initial_counter) {
+    let out = [];
+    let ctr = initial_counter;
+    let i = 0;
+    while i < len(data_bytes) {
+        let ks = chacha20_block_rfc8439(key32, ctr, nonce12);
+        let j = 0;
+        while j < 64 and i < len(data_bytes) {
+            array_push(out, bit_xor(bit_and(data_bytes[i], 255), ks[j]));
+            i = i + 1;
+            j = j + 1;
+        }
+        ctr = ctr + 1;
+    }
+    return out;
+}
+
+fn poly1305_mac_rfc8439(msg_bytes, otk32) {
+    let r_bytes = slice(otk32, 0, 16);
+    let s_bytes = slice(otk32, 16, 32);
+    r_bytes[3] = bit_and(r_bytes[3], 15);
+    r_bytes[7] = bit_and(r_bytes[7], 15);
+    r_bytes[11] = bit_and(r_bytes[11], 15);
+    r_bytes[15] = bit_and(r_bytes[15], 15);
+    r_bytes[4] = bit_and(r_bytes[4], 252);
+    r_bytes[8] = bit_and(r_bytes[8], 252);
+    r_bytes[12] = bit_and(r_bytes[12], 252);
+
+    let r_bi = _le_bytes_to_bigint(r_bytes);
+    let s_bi = _le_bytes_to_bigint(s_bytes);
+    let acc = _BI_ZERO;
+    let idx = 0;
+    let total = len(msg_bytes);
+    while idx < total {
+        let chunk = [];
+        let j = 0;
+        while j < 16 and idx + j < total {
+            array_push(chunk, bit_and(msg_bytes[idx + j], 255));
+            j = j + 1;
+        }
+        array_push(chunk, 1);
+        let n_bi = _le_bytes_to_bigint(chunk);
+        acc = ((acc + n_bi) * r_bi) % _POLY_P;
+        idx = idx + 16;
+    }
+    let tag_bi = (acc + s_bi) % _POLY_MOD128;
+    return _bigint_to_le_bytes(tag_bi, 16);
+}
+
+fn _build_poly1305_aead_input(aad_bytes, ct_bytes) {
+    let buf = [];
+    let i = 0;
+    while i < len(aad_bytes) { array_push(buf, aad_bytes[i]); i = i + 1; }
+    while len(buf) % 16 != 0 { array_push(buf, 0); }
+    i = 0;
+    while i < len(ct_bytes) { array_push(buf, ct_bytes[i]); i = i + 1; }
+    while len(buf) % 16 != 0 { array_push(buf, 0); }
+    _push_le64(buf, len(aad_bytes));
+    _push_le64(buf, len(ct_bytes));
+    return buf;
+}
+
+fn chacha20_poly1305_aead_encrypt(key32, nonce12, plaintext_bytes, aad_bytes) {
+    if len(key32) != 32 { _err("ChaCha20-Poly1305 key must be 32 bytes"); }
+    if len(nonce12) != 12 { _err("ChaCha20-Poly1305 nonce must be 12 bytes"); }
+    let otk = slice(chacha20_block_rfc8439(key32, 0, nonce12), 0, 32);
+    let ct = chacha20_stream_xor(plaintext_bytes, key32, nonce12, 1);
+    let mac_input = _build_poly1305_aead_input(aad_bytes, ct);
+    let tag16 = poly1305_mac_rfc8439(mac_input, otk);
+    return map{
+        ciphertext_bytes: ct,
+        ciphertext_hex: _bytes_to_hex(ct),
+        tag_bytes: tag16,
+        tag_hex: _bytes_to_hex(tag16)
+    };
+}
+
+fn chacha20_poly1305_aead_decrypt(key32, nonce12, ciphertext_bytes, tag16, aad_bytes) {
+    if len(key32) != 32 or len(nonce12) != 12 or len(tag16) != 16 {
+        return map{ ok: false, plaintext_bytes: nil };
+    }
+    let otk = slice(chacha20_block_rfc8439(key32, 0, nonce12), 0, 32);
+    let mac_input = _build_poly1305_aead_input(aad_bytes, ciphertext_bytes);
+    let expected_tag = poly1305_mac_rfc8439(mac_input, otk);
+    if not _ct_eq_bytes(expected_tag, tag16) {
+        return map{ ok: false, plaintext_bytes: nil };
+    }
+    let pt = chacha20_stream_xor(ciphertext_bytes, key32, nonce12, 1);
+    return map{ ok: true, plaintext_bytes: pt };
+}
+
+fn shannon_entropy_bits(data) {
+    let bytes = _as_bytes(data);
+    let n = len(bytes);
+    if n == 0 { return 0.0; }
+    let counts = [];
+    let i = 0;
+    while i < 256 { array_push(counts, 0); i = i + 1; }
+    i = 0;
+    while i < n {
+        let b = bit_and(bytes[i], 255);
+        counts[b] = counts[b] + 1;
+        i = i + 1;
+    }
+    let ln2 = num_ln(2.0);
+    let ent = 0.0;
+    i = 0;
+    while i < 256 {
+        if counts[i] > 0 {
+            let p = counts[i] / n;
+            ent = ent - p * (num_ln(p) / ln2);
+        }
+        i = i + 1;
+    }
+    return ent;
+}
+
+// ── 2. Privacy-Preserving Unlinkable Machine/Seat Commitment & PII Scrubber ──
+
+fn _contains_pii_pattern(s) {
+    if not is_string(s) or len(s) == 0 { return false; }
+    let n = len(s);
+    let i = 0;
+    let colon_count = 0;
+    let dot_digits_runs = 0;
+    let cur_digits = 0;
+    while i < n {
+        let c = strcharcodeat(s, i);
+        // Reject raw path separators ('/' = 47, '\' = 92) and email '@' (= 64)
+        if c == 47 or c == 92 or c == 64 { return true; }
+        if c == 58 { colon_count = colon_count + 1; }
+        if c >= 48 and c <= 57 {
+            cur_digits = cur_digits + 1;
+        } else {
+            if c == 46 and cur_digits > 0 and cur_digits <= 3 {
+                dot_digits_runs = dot_digits_runs + 1;
+            } else {
+                dot_digits_runs = 0;
+            }
+            cur_digits = 0;
+        }
+        i = i + 1;
+    }
+    // MAC address / URI colons or IPv4 address pattern
+    if colon_count >= 1 { return true; }
+    if dot_digits_runs >= 3 and cur_digits > 0 and cur_digits <= 3 { return true; }
+    return false;
+}
+
+fn scrub_pii_tag(raw_alias, privacy_strict = true) {
+    if raw_alias == nil { return nil; }
+    let trimmed = str_trim(str(raw_alias));
+    if len(trimmed) == 0 { return nil; }
+    if privacy_strict == false { return trimmed; }
+    if len(trimmed) > 64 or _contains_pii_pattern(trimmed) {
+        return "anon_" + str_slice(_sha256_str_hex("PBLIC1-SCRUB-ALIAS-V1|" + trimmed), 0, 16);
+    }
+    return trimmed;
+}
+
+fn _canonical_anonymous_traits(traits_override) {
+    if traits_override == nil {
+        // Strictly coarse, zero-PII runtime architecture descriptor (never reads user/host/path/MAC!)
+        let os_fam = str_lower(str(platform()));
+        let tb = str_lower(str(try tensor_backend() catch "scalar"));
+        let blinded_os = str_slice(_sha256_str_hex("PBLIC1-ANON-OS|" + os_fam), 0, 24);
+        let blinded_tb = str_slice(_sha256_str_hex("PBLIC1-ANON-TB|" + tb), 0, 24);
+        return "schema=v1|os_commit=" + blinded_os + "|cap_commit=" + blinded_tb;
+    }
+    if is_map(traits_override) {
+        let keys = array_sort(map_keys(traits_override));
+        let parts = ["schema=v1"];
+        let i = 0;
+        while i < len(keys) {
+            let k = str(keys[i]);
+            let v_str = canonical_json_encode(traits_override[k]);
+            // Pre-blind every field individually so raw strings are never even concatenated in memory
+            let k_blind = str_slice(_sha256_str_hex("PBLIC1-TRAIT-KEY|" + k), 0, 16);
+            let v_blind = str_slice(_sha256_str_hex("PBLIC1-TRAIT-VAL|" + k + "|" + v_str), 0, 32);
+            array_push(parts, k_blind + "=" + v_blind);
+            i = i + 1;
+        }
+        return str_join(parts, "|");
+    }
+    let s_blind = _sha256_str_hex("PBLIC1-TRAIT-SCALAR|" + str(traits_override));
+    return "schema=v1|opaque=" + s_blind;
+}
+
+fn compute_privacy_seat_id(app_domain_salt, traits_override = nil) {
+    if not is_string(app_domain_salt) or len(str_trim(app_domain_salt)) < 2 {
+        _err("app_domain_salt must be a non-empty domain string (at least 2 chars)");
+    }
+    let clean_salt = str_trim(app_domain_salt);
+    let anon_traits = _canonical_anonymous_traits(traits_override);
+    let domain_key = "PBLANG-BLINDED-SEAT-V1|" + clean_salt;
+    let full_mac = hmac_sha256(anon_traits, domain_key);
+    return str_lower(str_slice(full_mac, 0, 32));
+}
+
+// ── 3. License Issuance & Armored `PBLIC1.` Token Format ─────────────────────
+
+fn _derive_feature_wrap_key(vendor_pk_hex, license_id, product_id, edition, seat_id) {
+    let seat_part = if seat_id == nil or seat_id == "" { "PORTABLE" } else { str_lower(str(seat_id)) };
+    let material = "PBLIC1-FEATURE-KEYWRAP-V1|"
+        + str_lower(vendor_pk_hex) + "|"
+        + str(license_id) + "|"
+        + str(product_id) + "|"
+        + str(edition) + "|"
+        + seat_part;
+    return _sha256_bytes(str_to_bytes(material));
+}
+
+fn _normalize_features(raw_features) {
+    if raw_features == nil { return []; }
+    if not is_array(raw_features) { _err("features must be an array of strings"); }
+    let seen = map{};
+    let list = [];
+    let i = 0;
+    while i < len(raw_features) {
+        let f = str_trim(str(raw_features[i]));
+        if f == "" { _err("feature name cannot be empty"); }
+        if not map_has(seen, f) {
+            seen[f] = true;
+            array_push(list, f);
+        }
+        i = i + 1;
+    }
+    return array_sort(list);
+}
+
+fn issue_license(vendor_sk_hex, spec) {
+    if not is_map(spec) { _err("license spec must be a map"); }
+    let pk_hex = derive_vendor_public_key(vendor_sk_hex);
+
+    let product_id = str_trim(str(_opt(spec, "product_id", "")));
+    if product_id == "" { _err("spec.product_id is required"); }
+
+    let license_type = str_lower(str_trim(str(_opt(spec, "license_type", "perpetual"))));
+    if not map_has(_VALID_LICENSE_TYPES, license_type) {
+        _err("unsupported license_type: " + license_type);
+    }
+
+    let edition = str_lower(str_trim(str(_opt(spec, "edition", "standard"))));
+    if edition == "" { _err("spec.edition cannot be empty"); }
+
+    let issued_at = _opt(spec, "issued_at", _now_unix_default());
+    if not is_number(issued_at) or issued_at < 0 { _err("issued_at must be a non-negative unix timestamp"); }
+    issued_at = num_floor(issued_at);
+
+    let not_before = _opt(spec, "not_before", issued_at);
+    if not is_number(not_before) or not_before < 0 { _err("not_before must be a non-negative unix timestamp"); }
+    not_before = num_floor(not_before);
+
+    let raw_exp = if map_has(spec, "expires_at") { spec.expires_at } else { nil };
+    let expires_at = nil;
+    if raw_exp != nil and raw_exp != 0 {
+        if not is_number(raw_exp) or raw_exp <= 0 {
+            _err("expires_at must be nil, 0, or a positive unix timestamp");
+        }
+        expires_at = num_floor(raw_exp);
+        if expires_at < not_before {
+            _err("expires_at cannot precede not_before");
+        }
+    } else if license_type != "perpetual" {
+        _err("non-perpetual license (" + license_type + ") requires a positive expires_at timestamp");
+    }
+
+    let max_version = _opt(spec, "max_version", nil);
+    if max_version != nil and max_version != "" {
+        max_version = str_trim(str(max_version));
+        if not _SEMVER.valid(max_version) {
+            _err("spec.max_version must be a valid SemVer string: " + max_version);
+        }
+    } else {
+        max_version = nil;
+    }
+
+    let seat_id = _opt(spec, "seat_id", nil);
+    if seat_id != nil and seat_id != "" {
+        seat_id = str_lower(str_trim(str(seat_id)));
+        if len(seat_id) != 32 or not _is_valid_hex(seat_id, 16) {
+            _err("spec.seat_id must be nil (portable) or a 32-char blinded hex token from compute_privacy_seat_id");
+        }
+    } else {
+        seat_id = nil;
+    }
+
+    let privacy_strict = _opt(spec, "privacy_strict", true);
+    let licensee_alias = scrub_pii_tag(_opt(spec, "licensee_alias", nil), privacy_strict);
+    let features = _normalize_features(_opt(spec, "features", ["core"]));
+
+    let max_seats = _opt(spec, "max_seats", 1);
+    if not is_number(max_seats) or max_seats < 1 { max_seats = 1; }
+    max_seats = num_floor(max_seats);
+
+    let license_id = str_trim(str(_opt(spec, "license_id", "")));
+    if license_id == "" {
+        let rand_hex = _bytes_to_hex(random_bytes(16));
+        license_id = "lic_" + str_slice(_sha256_str_hex(product_id + "|" + str(issued_at) + "|" + rand_hex), 0, 24);
+    }
+
+    // Wrap key-gated feature vault keys under license-bound ChaCha20-Poly1305 AEAD
+    let wrapped_feature_keys = map{};
+    let raw_fkeys = _opt(spec, "feature_keys", nil);
+    if raw_fkeys != nil {
+        if not is_map(raw_fkeys) { _err("spec.feature_keys must be a map of feature -> 64-hex key"); }
+        let wrap_key32 = _derive_feature_wrap_key(pk_hex, license_id, product_id, edition, seat_id);
+        let fk_names = array_sort(map_keys(raw_fkeys));
+        let fi = 0;
+        while fi < len(fk_names) {
+            let fname = str(fk_names[fi]);
+            let fkey_hex = str_lower(str_trim(str(raw_fkeys[fname])));
+            let fkey_bytes = _hex_to_bytes_checked(fkey_hex, 32, false);
+            if fkey_bytes == nil {
+                _err("feature_keys['" + fname + "'] must be a 64-character hex key (256-bit)");
+            }
+            let nonce12 = random_bytes(12);
+            let aad = str_to_bytes("PBLIC1-KEYWRAP-AAD|" + license_id + "|" + fname);
+            let sealed = chacha20_poly1305_aead_encrypt(wrap_key32, nonce12, fkey_bytes, aad);
+            wrapped_feature_keys[fname] = map{
+                n: _bytes_to_hex(nonce12),
+                c: sealed.ciphertext_hex,
+                t: sealed.tag_hex
+            };
+            fi = fi + 1;
+        }
+    }
+
+    let payload = map{
+        schema: "pblic-v1",
+        license_id: license_id,
+        product_id: product_id,
+        edition: edition,
+        license_type: license_type,
+        features: features,
+        issued_at: issued_at,
+        not_before: not_before,
+        expires_at: if expires_at == nil { 0 } else { expires_at },
+        max_version: max_version,
+        max_seats: max_seats,
+        seat_id: seat_id,
+        licensee_alias: licensee_alias,
+        wrapped_feature_keys: wrapped_feature_keys
+    };
+
+    let canonical_payload = canonical_json_encode(payload);
+    let payload_bytes = str_to_bytes(canonical_payload);
+    let sig_hex = ed25519_sign_message(vendor_sk_hex, payload_bytes);
+    let armored = TOKEN_PREFIX + "." + base64url_encode_bytes(payload_bytes) + "." + sig_hex;
+    return armored;
+}
+
+// ── 4. Offline Signed Revocation List (CRL) & Monotonic Clock Guard ──────────
+
+fn issue_signed_crl(vendor_sk_hex, crl_spec) {
+    if not is_map(crl_spec) { _err("crl_spec must be a map"); }
+    let _ = derive_vendor_public_key(vendor_sk_hex);
+    let product_id = str_trim(str(_opt(crl_spec, "product_id", "*")));
+    let issued_at = num_floor(_opt(crl_spec, "issued_at", _now_unix_default()));
+    let sequence = num_floor(_opt(crl_spec, "sequence", 1));
+    let raw_ids = _opt(crl_spec, "revoked_license_ids", []);
+    if not is_array(raw_ids) { _err("revoked_license_ids must be an array"); }
+    let clean_ids = [];
+    let seen = map{};
+    let i = 0;
+    while i < len(raw_ids) {
+        let lid = str_trim(str(raw_ids[i]));
+        if lid != "" and not map_has(seen, lid) {
+            seen[lid] = true;
+            array_push(clean_ids, lid);
+        }
+        i = i + 1;
+    }
+    clean_ids = array_sort(clean_ids);
+    let crl_payload = map{
+        schema: "pbcrl-v1",
+        product_id: product_id,
+        sequence: sequence,
+        issued_at: issued_at,
+        revoked_license_ids: clean_ids
+    };
+    let canon = canonical_json_encode(crl_payload);
+    let cbytes = str_to_bytes(canon);
+    let sig_hex = ed25519_sign_message(vendor_sk_hex, cbytes);
+    return CRL_PREFIX + "." + base64url_encode_bytes(cbytes) + "." + sig_hex;
+}
+
+fn verify_signed_crl(crl_token, vendor_pk_hex) {
+    if not is_string(crl_token) or not _is_valid_hex(vendor_pk_hex, 32) {
+        return map{ ok: false, status: "malformed_crl", revoked_license_ids: [], revoked_map: map{} };
+    }
+    let parts = str_split(crl_token, ".");
+    if len(parts) != 3 or parts[0] != CRL_PREFIX {
+        return map{ ok: false, status: "malformed_crl", revoked_license_ids: [], revoked_map: map{} };
+    }
+    let payload_bytes = base64url_decode_bytes_strict(parts[1]);
+    if payload_bytes == nil {
+        return map{ ok: false, status: "malformed_crl_base64", revoked_license_ids: [], revoked_map: map{} };
+    }
+    if not ed25519_verify_message(vendor_pk_hex, payload_bytes, parts[2]) {
+        return map{ ok: false, status: "invalid_crl_signature", revoked_license_ids: [], revoked_map: map{} };
+    }
+    let payload_str = try bytes_to_str(payload_bytes) catch nil;
+    let obj = if payload_str == nil { nil } else { try json_parse(payload_str) catch nil };
+    if not is_map(obj) or _opt(obj, "schema", "") != "pbcrl-v1" {
+        return map{ ok: false, status: "invalid_crl_schema", revoked_license_ids: [], revoked_map: map{} };
+    }
+    let ids = _opt(obj, "revoked_license_ids", []);
+    if not is_array(ids) {
+        return map{ ok: false, status: "invalid_crl_entries", revoked_license_ids: [], revoked_map: map{} };
+    }
+    let rev_map = map{};
+    let i = 0;
+    while i < len(ids) {
+        rev_map[str(ids[i])] = true;
+        i = i + 1;
+    }
+    return map{
+        ok: true,
+        status: "valid",
+        product_id: _opt(obj, "product_id", "*"),
+        sequence: _opt(obj, "sequence", 1),
+        issued_at: _opt(obj, "issued_at", 0),
+        revoked_license_ids: ids,
+        revoked_map: rev_map
+    };
+}
+
+fn _clock_state_mac(max_seen_unix, obs_count, vendor_pk_hex) {
+    let msg = "PBCLK-V1|" + str(num_floor(max_seen_unix)) + "|" + str(num_floor(obs_count));
+    let key = "PBLANG-CLOCK-HIGHWATER-V1|" + str_lower(str(vendor_pk_hex));
+    return hmac_sha256(msg, key);
+}
+
+fn check_and_advance_clock_guard(high_water_state, now_unix, vendor_pk_hex) {
+    if not is_number(now_unix) or now_unix < 0 {
+        return map{ ok: false, status: "invalid_timestamp", rollback_detected: false };
+    }
+    if not _is_valid_hex(vendor_pk_hex, 32) {
+        return map{ ok: false, status: "invalid_vendor_public_key", rollback_detected: false };
+    }
+    let cur_now = num_floor(now_unix);
+    if high_water_state == nil {
+        let mac0 = _clock_state_mac(cur_now, 1, vendor_pk_hex);
+        let st0 = map{
+            max_seen_unix: cur_now,
+            observation_count: 1,
+            guard_mac_hex: mac0
+        };
+        return map{
+            ok: true,
+            status: "ok",
+            rollback_detected: false,
+            rollback_seconds: 0,
+            tolerance_seconds: CLOCK_ROLLBACK_TOLERANCE_SECONDS,
+            max_seen_unix: cur_now,
+            observation_count: 1,
+            guard_mac_hex: mac0,
+            state: st0
+        };
+    }
+
+    let inner = if is_map(high_water_state) and map_has(high_water_state, "state") and is_map(high_water_state.state) {
+        high_water_state.state
+    } else {
+        high_water_state
+    };
+
+    if is_number(inner) {
+        inner = map{ max_seen_unix: num_floor(inner), observation_count: 1 };
+    }
+    if not is_map(inner) or not map_has(inner, "max_seen_unix") or not is_number(inner.max_seen_unix) {
+        return map{ ok: false, status: "malformed_clock_state", rollback_detected: true };
+    }
+
+    let prev_max = num_floor(inner.max_seen_unix);
+    let prev_obs = num_floor(_opt(inner, "observation_count", 1));
+    if map_has(inner, "guard_mac_hex") and inner.guard_mac_hex != nil {
+        let expected_mac = _clock_state_mac(prev_max, prev_obs, vendor_pk_hex);
+        if not _ct_eq_str(str(inner.guard_mac_hex), expected_mac) {
+            return map{
+                ok: false,
+                status: "clock_state_tampered",
+                rollback_detected: true,
+                rollback_seconds: 0,
+                tolerance_seconds: CLOCK_ROLLBACK_TOLERANCE_SECONDS,
+                max_seen_unix: prev_max,
+                state: inner
+            };
+        }
+    }
+
+    if cur_now < prev_max - CLOCK_ROLLBACK_TOLERANCE_SECONDS {
+        let delta_back = prev_max - cur_now;
+        return map{
+            ok: false,
+            status: "clock_rollback_detected",
+            rollback_detected: true,
+            rollback_seconds: delta_back,
+            tolerance_seconds: CLOCK_ROLLBACK_TOLERANCE_SECONDS,
+            max_seen_unix: prev_max,
+            observation_count: prev_obs,
+            guard_mac_hex: _clock_state_mac(prev_max, prev_obs, vendor_pk_hex),
+            state: inner
+        };
+    }
+
+    let next_max = if cur_now > prev_max { cur_now } else { prev_max };
+    let next_obs = prev_obs + 1;
+    let next_mac = _clock_state_mac(next_max, next_obs, vendor_pk_hex);
+    let next_state = map{
+        max_seen_unix: next_max,
+        observation_count: next_obs,
+        guard_mac_hex: next_mac
+    };
+    return map{
+        ok: true,
+        status: "ok",
+        rollback_detected: false,
+        rollback_seconds: if cur_now < prev_max { prev_max - cur_now } else { 0 },
+        tolerance_seconds: CLOCK_ROLLBACK_TOLERANCE_SECONDS,
+        max_seen_unix: next_max,
+        observation_count: next_obs,
+        guard_mac_hex: next_mac,
+        state: next_state
+    };
+}
+
+fn _reject_license(status_code, detail_msg, extra_fields) {
+    let base = map{
+        ok: false,
+        status: status_code,
+        error: detail_msg,
+        license_id: _opt(extra_fields, "license_id", nil),
+        product_id: _opt(extra_fields, "product_id", nil),
+        edition: _opt(extra_fields, "edition", nil),
+        license_type: _opt(extra_fields, "license_type", nil),
+        features: [],
+        unlocked_keys: map{},
+        remaining_seconds: 0,
+        clock_guard: _opt(extra_fields, "clock_guard", nil),
+        privacy_zero_telemetry: true
+    };
+    return base;
+}
+
+// 4. Air-Gapped Offline Verification (`verify_license`)
+fn verify_license(token_str, vendor_pk_hex, ctx = nil) {
+    if not is_string(token_str) or len(token_str) < 20 or len(token_str) > 32768 {
+        return _reject_license("malformed_token", "token string missing or out of bounds", nil);
+    }
+    if not _is_valid_hex(vendor_pk_hex, 32) {
+        return _reject_license("invalid_vendor_key", "vendor_pk_hex must be 64 hex characters", nil);
+    }
+    let pk_low = str_lower(vendor_pk_hex);
+
+    let parts = str_split(token_str, ".");
+    if len(parts) != 3 or parts[0] != TOKEN_PREFIX {
+        return _reject_license("malformed_token", "expected PBLIC1.<payload>.<sig_hex> framing", nil);
+    }
+
+    let payload_bytes = base64url_decode_bytes_strict(parts[1]);
+    if payload_bytes == nil {
+        return _reject_license("malformed_payload_encoding", "non-canonical or corrupted base64url payload", nil);
+    }
+
+    if not ed25519_verify_message(pk_low, payload_bytes, parts[2]) {
+        return _reject_license("invalid_signature", "Ed25519 signature verification failed", nil);
+    }
+
+    let payload_text = try bytes_to_str(payload_bytes) catch nil;
+    let payload = if payload_text == nil { nil } else { try json_parse(payload_text) catch nil };
+    if not is_map(payload) or _opt(payload, "schema", "") != "pblic-v1" {
+        return _reject_license("invalid_payload_schema", "unrecognized license payload schema", nil);
+    }
+
+    let license_id = str(_opt(payload, "license_id", ""));
+    let product_id = str(_opt(payload, "product_id", ""));
+    let edition = str(_opt(payload, "edition", ""));
+    let license_type = str(_opt(payload, "license_type", ""));
+    let meta = map{
+        license_id: license_id,
+        product_id: product_id,
+        edition: edition,
+        license_type: license_type
+    };
+
+    if license_id == "" or product_id == "" or not map_has(_VALID_LICENSE_TYPES, license_type) {
+        return _reject_license("invalid_payload_fields", "missing required license claims", meta);
+    }
+
+    // Check 1: Expected product_id
+    let expected_product = _opt(ctx, "expected_product_id", nil);
+    if expected_product != nil and expected_product != "" {
+        if not _ct_eq_str(product_id, str(expected_product)) {
+            return _reject_license("product_mismatch", "license product_id does not match expected application", meta);
+        }
+    }
+
+    // Check 2: Offline Revocation (raw list/map and/or Ed25519-signed offline CRL)
+    let revoked_list = _opt(ctx, "revoked_license_ids", nil);
+    if is_array(revoked_list) {
+        let ri = 0;
+        while ri < len(revoked_list) {
+            if _ct_eq_str(license_id, str(revoked_list[ri])) {
+                return _reject_license("license_revoked", "license_id is revoked in offline revocation list", meta);
+            }
+            ri = ri + 1;
+        }
+    } else if is_map(revoked_list) {
+        if _opt(revoked_list, license_id, false) == true {
+            return _reject_license("license_revoked", "license_id is revoked in offline revocation map", meta);
+        }
+    }
+
+    let crl_tok = _opt(ctx, "crl_token", _opt(ctx, "signed_crl", nil));
+    if crl_tok != nil {
+        let crl_res = if is_string(crl_tok) {
+            verify_signed_crl(crl_tok, pk_low)
+        } else {
+            crl_tok
+        };
+        if not is_map(crl_res) or _opt(crl_res, "ok", false) != true {
+            return _reject_license("invalid_crl", "offline signed CRL failed Ed25519 verification", meta);
+        }
+        let crl_prod = str(_opt(crl_res, "product_id", "*"));
+        if crl_prod == "*" or crl_prod == product_id {
+            let rmap = _opt(crl_res, "revoked_map", map{});
+            if is_map(rmap) and _opt(rmap, license_id, false) == true {
+                return _reject_license("license_revoked", "license_id is revoked by vendor-signed CRL", meta);
+            }
+        }
+    }
+
+    // Check 3: Clock guard + temporal validity (`not_before`, `expires_at`)
+    let now_unix = num_floor(_opt(ctx, "now_unix", _now_unix_default()));
+    let hw_state = _opt(ctx, "high_water_state", _opt(ctx, "clock_guard_state", nil));
+    let clock_res = nil;
+    if hw_state != nil {
+        clock_res = check_and_advance_clock_guard(hw_state, now_unix, pk_low);
+        meta["clock_guard"] = clock_res;
+        if not clock_res.ok {
+            return _reject_license(clock_res.status, "monotonic clock rollback guard triggered", meta);
+        }
+    }
+
+    let issued_at = num_floor(_opt(payload, "issued_at", 0));
+    let not_before = num_floor(_opt(payload, "not_before", 0));
+    let expires_at = num_floor(_opt(payload, "expires_at", 0));
+
+    if now_unix < issued_at - CLOCK_ROLLBACK_TOLERANCE_SECONDS {
+        return _reject_license("clock_rollback_detected", "system clock precedes license issuance timestamp", meta);
+    }
+    if not_before > 0 and now_unix < not_before {
+        return _reject_license("not_yet_valid", "license not_before timestamp has not been reached", meta);
+    }
+
+    let is_perpetual = (expires_at == 0);
+    let remaining_seconds = nil;
+    if not is_perpetual {
+        if now_unix >= expires_at {
+            return _reject_license("license_expired", "license expiration timestamp has passed", meta);
+        }
+        remaining_seconds = expires_at - now_unix;
+    }
+
+    // Check 4: Privacy-preserving `seat_id` node-lock check
+    let token_seat = _opt(payload, "seat_id", nil);
+    if token_seat != nil and token_seat != "" {
+        let ctx_seat = _opt(ctx, "seat_id", nil);
+        if not is_string(ctx_seat) or not _ct_eq_str(str_lower(str(token_seat)), str_lower(ctx_seat)) {
+            return _reject_license("seat_mismatch", "blinded privacy seat_id does not match licensed machine commitment", meta);
+        }
+    }
+
+    // Check 5: SemVer ceiling (`max_version`)
+    let max_ver = _opt(payload, "max_version", nil);
+    let app_ver = _opt(ctx, "app_version", nil);
+    if max_ver != nil and max_ver != "" and app_ver != nil and app_ver != "" {
+        if not _SEMVER.valid(str(max_ver)) or not _SEMVER.valid(str(app_ver)) {
+            return _reject_license("invalid_version", "invalid SemVer in max_version or ctx.app_version", meta);
+        }
+        if _SEMVER.compare(str(app_ver), str(max_ver)) > 0 {
+            return _reject_license("version_exceeds_ceiling", "application version exceeds licensed max_version ceiling", meta);
+        }
+    }
+
+    // Check 6: Entitled feature list + optional required_feature check
+    let features = _opt(payload, "features", []);
+    if not is_array(features) { features = []; }
+    let req_feat = _opt(ctx, "required_feature", nil);
+    if req_feat != nil and req_feat != "" {
+        let found_f = false;
+        let fi = 0;
+        while fi < len(features) {
+            if str(features[fi]) == str(req_feat) { found_f = true; }
+            fi = fi + 1;
+        }
+        if not found_f {
+            return _reject_license("feature_not_entitled", "required feature is not entitled by this license", meta);
+        }
+    }
+
+    // Check 7: Unwrap Anti-NOP-Patch key-gated feature keys ONLY after full verification
+    let unlocked_keys = map{};
+    let wrapped_map = _opt(payload, "wrapped_feature_keys", map{});
+    if is_map(wrapped_map) {
+        let effective_seat = if token_seat != nil and token_seat != "" { _opt(ctx, "seat_id", token_seat) } else { nil };
+        let wrap_key32 = _derive_feature_wrap_key(pk_low, license_id, product_id, edition, effective_seat);
+        let wkeys = array_sort(map_keys(wrapped_map));
+        let wi = 0;
+        while wi < len(wkeys) {
+            let fname = str(wkeys[wi]);
+            let entry = wrapped_map[fname];
+            if is_map(entry) {
+                let n12 = _hex_to_bytes_checked(_opt(entry, "n", ""), 12, false);
+                let ct_b = _hex_to_bytes_checked(_opt(entry, "c", ""), 32, false);
+                let tg16 = _hex_to_bytes_checked(_opt(entry, "t", ""), 16, false);
+                if n12 != nil and ct_b != nil and tg16 != nil {
+                    let aad = str_to_bytes("PBLIC1-KEYWRAP-AAD|" + license_id + "|" + fname);
+                    let dec = chacha20_poly1305_aead_decrypt(wrap_key32, n12, ct_b, tg16, aad);
+                    if not dec.ok {
+                        return _reject_license("corrupted_feature_key_vault", "failed to unwrap key-gated feature key", meta);
+                    }
+                    unlocked_keys[fname] = _bytes_to_hex(dec.plaintext_bytes);
+                }
+            }
+            wi = wi + 1;
+        }
+    }
+
+    return map{
+        ok: true,
+        status: "valid",
+        license_id: license_id,
+        product_id: product_id,
+        edition: edition,
+        license_type: license_type,
+        features: features,
+        unlocked_keys: unlocked_keys,
+        is_perpetual: is_perpetual,
+        issued_at: issued_at,
+        not_before: not_before,
+        expires_at: if is_perpetual { nil } else { expires_at },
+        remaining_seconds: remaining_seconds,
+        max_version: max_ver,
+        max_seats: _opt(payload, "max_seats", 1),
+        seat_id: token_seat,
+        licensee_alias: _opt(payload, "licensee_alias", nil),
+        clock_guard: clock_res,
+        privacy_zero_telemetry: true
+    };
+}
+
+// ── 5. Anti-Crack Key-Gated Code / Formula / Asset Vault ─────────────────────
+
+fn generate_feature_vault_key(seed_material = nil) {
+    if seed_material == nil {
+        return _bytes_to_hex(random_bytes(32));
+    }
+    return _sha256_str_hex("PBLIC1-FEATURE-KEYGEN-V1|" + str(seed_material));
+}
+
+fn _derive_vault_subkeys(feature_name, feature_key_hex) {
+    let raw_key = _hex_to_bytes_checked(feature_key_hex, 32, false);
+    if raw_key == nil { return nil; }
+    let norm_hex = _bytes_to_hex(raw_key);
+    let enc_key32 = _sha256_bytes(str_to_bytes("PBLIC1-VAULT-CHACHA20-KEY-V1|" + feature_name + "|" + norm_hex));
+    let commit_key_hex = _sha256_str_hex("PBLIC1-VAULT-COMMIT-MAC-V1|" + feature_name + "|" + norm_hex);
+    return map{
+        enc_key32: enc_key32,
+        commit_key_hex: commit_key_hex
+    };
+}
+
+fn seal_licensed_feature_vault(plaintext_str_or_bytes, feature_name, feature_key_hex) {
+    let fname = str_trim(str(feature_name));
+    if fname == "" { _err("feature_name cannot be empty"); }
+    let subkeys = _derive_vault_subkeys(fname, feature_key_hex);
+    if subkeys == nil { _err("feature_key_hex must be a 64-character hex key (256-bit)"); }
+
+    let pt_bytes = _as_bytes(plaintext_str_or_bytes);
+    let nonce12 = random_bytes(12);
+    let nonce_hex = _bytes_to_hex(nonce12);
+    let aad = str_to_bytes("PBLIC1-VAULT-AAD-V1|" + fname + "|" + nonce_hex);
+
+    let aead = chacha20_poly1305_aead_encrypt(subkeys.enc_key32, nonce12, pt_bytes, aad);
+    // Key-committing MAC over Poly1305 AEAD tag + feature + nonce + ciphertext
+    let mac_msg = "PBLIC1-VAULT-ETM-V1|" + fname + "|" + nonce_hex + "|" + aead.tag_hex + "|" + aead.ciphertext_hex;
+    let mac_hex = str_lower(hmac_sha256(mac_msg, subkeys.commit_key_hex));
+
+    // CRITICAL: Contains ONLY { vault_version, feature, nonce_hex, ciphertext_hex, mac_hex }.
+    // Zero `feature_key_hex` or plaintext metadata is ever stored in the shipped binary!
+    return map{
+        vault_version: 1,
+        feature: fname,
+        nonce_hex: nonce_hex,
+        ciphertext_hex: aead.ciphertext_hex,
+        mac_hex: mac_hex
+    };
+}
+
+fn unlock_licensed_feature_vault(vault_map, verified_license_result, feature_name) {
+    let fname = str_trim(str(feature_name));
+    if not is_map(vault_map) or _opt(vault_map, "vault_version", 0) != 1 {
+        return map{ ok: false, status: "invalid_vault_format", error: "unsupported or malformed feature vault" };
+    }
+    if str(_opt(vault_map, "feature", "")) != fname {
+        return map{ ok: false, status: "vault_feature_mismatch", error: "vault feature tag does not match requested feature" };
+    }
+    if not is_map(verified_license_result) {
+        return map{ ok: false, status: "unlicensed", error: "missing verified license result" };
+    }
+
+    // NOTE: Even if an attacker NOP-patches `verified_license_result.ok = true` in the caller,
+    // decryption STILL strictly depends on the 256-bit cryptographic `feature_key_hex` inside
+    // `unlocked_keys[feature_name]`, which does not exist in the binary!
+    let ukeys = _opt(verified_license_result, "unlocked_keys", nil);
+    if not is_map(ukeys) or not map_has(ukeys, fname) {
+        return map{ ok: false, status: "missing_feature_key", error: "license does not carry cryptographic key for feature: " + fname };
+    }
+
+    let candidate_key_hex = str(ukeys[fname]);
+    let subkeys = _derive_vault_subkeys(fname, candidate_key_hex);
+    if subkeys == nil {
+        return map{ ok: false, status: "invalid_feature_key", error: "malformed cryptographic feature key" };
+    }
+
+    let nonce_hex = str(_opt(vault_map, "nonce_hex", ""));
+    let ct_hex = str(_opt(vault_map, "ciphertext_hex", ""));
+    let mac_hex = str(_opt(vault_map, "mac_hex", ""));
+
+    let nonce12 = _hex_to_bytes_checked(nonce_hex, 12, true);
+    let ct_bytes = _hex_to_bytes_checked(ct_hex, nil, true);
+    if nonce12 == nil or ct_bytes == nil or len(mac_hex) != 64 or not _is_valid_hex(mac_hex, 32) {
+        return map{ ok: false, status: "corrupted_vault_payload", error: "vault nonce, ciphertext, or MAC encoding invalid" };
+    }
+
+    let aad = str_to_bytes("PBLIC1-VAULT-AAD-V1|" + fname + "|" + nonce_hex);
+    let otk = slice(chacha20_block_rfc8439(subkeys.enc_key32, 0, nonce12), 0, 32);
+    let poly_tag16 = poly1305_mac_rfc8439(_build_poly1305_aead_input(aad, ct_bytes), otk);
+    let poly_tag_hex = _bytes_to_hex(poly_tag16);
+
+    let expected_mac = str_lower(hmac_sha256(
+        "PBLIC1-VAULT-ETM-V1|" + fname + "|" + nonce_hex + "|" + poly_tag_hex + "|" + ct_hex,
+        subkeys.commit_key_hex
+    ));
+    if not _ct_eq_str(expected_mac, mac_hex) {
+        return map{ ok: false, status: "vault_mac_mismatch", error: "ChaCha20-Poly1305 / HMAC authentication failed (invalid or forged key)" };
+    }
+
+    let pt_bytes = chacha20_stream_xor(ct_bytes, subkeys.enc_key32, nonce12, 1);
+    let pt_str = try bytes_to_str(pt_bytes) catch nil;
+    return map{
+        ok: true,
+        status: "unlocked",
+        feature: fname,
+        plaintext_bytes: pt_bytes,
+        plaintext_str: pt_str
+    };
+}
+
+// Execute an encrypted `.sapp` module/expression directly in-memory after cryptographic unlock
+fn execute_licensed_sapp_vault(vault_map, verified_license_result, feature_name, inputs = nil, vm_options = nil) {
+    let unlocked = unlock_licensed_feature_vault(vault_map, verified_license_result, feature_name);
+    if not unlocked.ok {
+        return map{
+            ok: false,
+            status: unlocked.status,
+            error: unlocked.error,
+            feature: feature_name
+        };
+    }
+    if unlocked.plaintext_str == nil {
+        return map{
+            ok: false,
+            status: "not_utf8_sapp_source",
+            error: "unlocked vault payload is binary, not UTF-8 .sapp source",
+            feature: feature_name
+        };
+    }
+    let full_src = unlocked.plaintext_str;
+    if inputs != nil {
+        let encoded_inputs = canonical_json_encode(inputs);
+        full_src = "let vault_inputs = json_parse(" + _escape_json_str(encoded_inputs) + ");\n" + full_src;
+    }
+    let pbck_bytes = try _NATIVE_PBCK.compile_source(full_src) catch nil;
+    if pbck_bytes == nil {
+        return map{
+            ok: false,
+            status: "vault_compile_failed",
+            error: "unlocked .sapp module failed compilation",
+            feature: feature_name
+        };
+    }
+    let vm_res = try _HOST_VM.run_bytes(pbck_bytes, vm_options, nil) catch nil;
+    if vm_res == nil {
+        return map{
+            ok: false,
+            status: "vault_execution_failed",
+            error: "unlocked .sapp module faulted during execution",
+            feature: feature_name
+        };
+    }
+    let resolved_exports = map{};
+    if is_map(vm_res.exports) {
+        let ek = map_keys(vm_res.exports);
+        let ei = 0;
+        while ei < len(ek) {
+            let nm = str(ek[ei]);
+            resolved_exports[nm] = vm_res.exports[nm];
+            ei = ei + 1;
+        }
+    }
+    if is_map(vm_res.globals) and map_has(vm_res.globals, "__exports__") and is_array(vm_res.globals.__exports__) {
+        let exp_list = vm_res.globals.__exports__;
+        let gi = 0;
+        while gi < len(exp_list) {
+            let gname = str(exp_list[gi]);
+            if map_has(vm_res.globals, gname) {
+                resolved_exports[gname] = vm_res.globals[gname];
+            }
+            gi = gi + 1;
+        }
+    }
+    return map{
+        ok: true,
+        status: "executed",
+        feature: feature_name,
+        value: vm_res.value,
+        exports: resolved_exports,
+        globals: vm_res.globals,
+        output: vm_res.output,
+        steps: vm_res.runtime.steps
+    };
+}
+
+// ── 6. Zero-CDN Offline Web / PWA Ed25519 License Gate Snippet ───────────────
+
+fn _html_escape(s) {
+    let out = str_replace_all(str(s), "&", "&amp;");
+    out = str_replace_all(out, "<", "&lt;");
+    out = str_replace_all(out, ">", "&gt;");
+    out = str_replace_all(out, "\"", "&quot;");
+    out = str_replace_all(out, "'", "&#39;");
+    return out;
+}
+
+fn generate_web_license_gate_snippet(vendor_pk_hex, product_id) {
+    if not _is_valid_hex(vendor_pk_hex, 32) {
+        _err("vendor_pk_hex must be a valid 64-character hex Ed25519 public key");
+    }
+    let clean_prod = str_trim(str(product_id));
+    if clean_prod == "" {
+        _err("product_id must be a non-empty string");
+    }
+    let pk_low = str_lower(vendor_pk_hex);
+    let safe_prod_html = _html_escape(clean_prod);
+    let safe_prod_js = canonical_json_encode(clean_prod);
+    let safe_pk_js = canonical_json_encode(pk_low);
+
+    return "<!-- PBLang Sovereign License Guard v4.1.0 — 100% Offline Zero-CDN Web/PWA Gate -->\n"
+        + "<dialog id=\"pblang-license-gate-modal\" style=\"max-width:520px;width:92%;border:1px solid #334155;border-radius:12px;background:#0f172a;color:#f8fafc;padding:24px;font-family:system-ui,sans-serif;\">\n"
+        + "  <h3 style=\"margin:0 0 8px 0;font-size:18px;\">Activate " + safe_prod_html + "</h3>\n"
+        + "  <p style=\"margin:0 0 14px 0;font-size:13px;color:#94a3b8;\">100% Air-Gapped Offline Ed25519 Verification &bull; Zero Telemetry</p>\n"
+        + "  <textarea id=\"pblang-license-token-input\" rows=\"4\" placeholder=\"PBLIC1....\" style=\"width:100%;box-sizing:border-box;background:#020617;color:#e2e8f0;border:1px solid #475569;border-radius:8px;padding:10px;font-family:monospace;font-size:12px;\"></textarea>\n"
+        + "  <div id=\"pblang-license-status\" style=\"margin-top:10px;font-size:13px;min-height:20px;color:#cbd5e1;\"></div>\n"
+        + "  <div style=\"margin-top:14px;display:flex;justify-content:flex-end;gap:8px;\">\n"
+        + "    <button type=\"button\" id=\"pblang-license-verify-btn\" style=\"background:#2563eb;color:#ffffff;border:none;border-radius:8px;padding:8px 16px;font-weight:600;cursor:pointer;\">Verify Offline</button>\n"
+        + "  </div>\n"
+        + "</dialog>\n"
+        + "<script>\n"
+        + "(function() {\n"
+        + "  \"use strict\";\n"
+        + "  const VENDOR_PK_HEX = " + safe_pk_js + ";\n"
+        + "  const EXPECTED_PRODUCT_ID = " + safe_prod_js + ";\n"
+        + "  const CLOCK_TOLERANCE_SEC = 300;\n"
+        + "  const HW_STORAGE_KEY = \"pblang_clk_hw_\" + EXPECTED_PRODUCT_ID;\n"
+        + "\n"
+        + "  function hexToBytes(hex) {\n"
+        + "    if (typeof hex !== \"string\" || hex.length % 2 !== 0) return null;\n"
+        + "    const out = new Uint8Array(hex.length / 2);\n"
+        + "    for (let i = 0; i < hex.length; i += 2) {\n"
+        + "      const v = parseInt(hex.slice(i, i + 2), 16);\n"
+        + "      if (Number.isNaN(v)) return null;\n"
+        + "      out[i / 2] = v;\n"
+        + "    }\n"
+        + "    return out;\n"
+        + "  }\n"
+        + "\n"
+        + "  function base64UrlToBytes(b64u) {\n"
+        + "    if (typeof b64u !== \"string\" || b64u.length === 0 || b64u.length % 4 === 1) return null;\n"
+        + "    const pad = b64u.length % 4 === 0 ? \"\" : \"=\".repeat(4 - (b64u.length % 4));\n"
+        + "    const bin = atob(b64u.replace(/-/g, \"+\").replace(/_/g, \"/\") + pad);\n"
+        + "    const out = new Uint8Array(bin.length);\n"
+        + "    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);\n"
+        + "    return out;\n"
+        + "  }\n"
+        + "\n"
+        + "  async function verifyPblic1Offline(tokenStr, nowUnixOverride) {\n"
+        + "    if (typeof tokenStr !== \"string\") return { ok: false, status: \"malformed_token\" };\n"
+        + "    const parts = tokenStr.trim().split(\".\");\n"
+        + "    if (parts.length !== 3 || parts[0] !== \"PBLIC1\" || parts[2].length !== 128) {\n"
+        + "      return { ok: false, status: \"malformed_token\" };\n"
+        + "    }\n"
+        + "    const payloadBytes = base64UrlToBytes(parts[1]);\n"
+        + "    const sigBytes = hexToBytes(parts[2]);\n"
+        + "    const pkBytes = hexToBytes(VENDOR_PK_HEX);\n"
+        + "    if (!payloadBytes || !sigBytes || !pkBytes) return { ok: false, status: \"malformed_encoding\" };\n"
+        + "    const pubKey = await crypto.subtle.importKey(\"raw\", pkBytes, { name: \"Ed25519\" }, false, [\"verify\"]);\n"
+        + "    const sigOk = await crypto.subtle.verify(\"Ed25519\", pubKey, sigBytes, payloadBytes);\n"
+        + "    if (!sigOk) return { ok: false, status: \"invalid_signature\" };\n"
+        + "    const payload = JSON.parse(new TextDecoder().decode(payloadBytes));\n"
+        + "    if (payload.schema !== \"pblic-v1\" || payload.product_id !== EXPECTED_PRODUCT_ID) {\n"
+        + "      return { ok: false, status: \"product_mismatch\" };\n"
+        + "    }\n"
+        + "    const nowSec = typeof nowUnixOverride === \"number\" ? Math.floor(nowUnixOverride) : Math.floor(Date.now() / 1000);\n"
+        + "    const prevHw = Number(localStorage.getItem(HW_STORAGE_KEY) || \"0\");\n"
+        + "    if (prevHw > 0 && nowSec < prevHw - CLOCK_TOLERANCE_SEC) {\n"
+        + "      return { ok: false, status: \"clock_rollback_detected\" };\n"
+        + "    }\n"
+        + "    if (nowSec > prevHw) localStorage.setItem(HW_STORAGE_KEY, String(nowSec));\n"
+        + "    if (payload.not_before && nowSec < payload.not_before) return { ok: false, status: \"not_yet_valid\" };\n"
+        + "    if (payload.expires_at && payload.expires_at > 0 && nowSec >= payload.expires_at) {\n"
+        + "      return { ok: false, status: \"license_expired\" };\n"
+        + "    }\n"
+        + "    return {\n"
+        + "      ok: true,\n"
+        + "      status: \"valid\",\n"
+        + "      product_id: payload.product_id,\n"
+        + "      edition: payload.edition,\n"
+        + "      license_type: payload.license_type,\n"
+        + "      features: payload.features || [],\n"
+        + "      privacy_zero_telemetry: true\n"
+        + "    };\n"
+        + "  }\n"
+        + "\n"
+        + "  window.PBLangSovereignLicenseGate = { verifyPblic1Offline, VENDOR_PK_HEX, EXPECTED_PRODUCT_ID };\n"
+        + "})();\n"
+        + "</script>\n";
+}
+
+export GUARD_VERSION, TOKEN_PREFIX, CRL_PREFIX, CLOCK_ROLLBACK_TOLERANCE_SECONDS;
+export base64url_encode_bytes, base64url_decode_bytes_strict, canonical_json_encode;
+export generate_vendor_keypair, derive_vendor_public_key, ed25519_sign_message, ed25519_verify_message;
+export chacha20_block_rfc8439, chacha20_stream_xor, poly1305_mac_rfc8439;
+export chacha20_poly1305_aead_encrypt, chacha20_poly1305_aead_decrypt, shannon_entropy_bits;
+export scrub_pii_tag, compute_privacy_seat_id;
+export issue_license, verify_license;
+export issue_signed_crl, verify_signed_crl, check_and_advance_clock_guard;
+export generate_feature_vault_key, seal_licensed_feature_vault, unlock_licensed_feature_vault, execute_licensed_sapp_vault;
+export generate_web_license_gate_snippet;

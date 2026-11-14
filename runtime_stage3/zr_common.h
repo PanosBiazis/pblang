@@ -97,8 +97,8 @@ typedef int zr_sock_t;
 #include <string.h>
 #include <time.h>
 
-#define PBLANG_ZR_VERSION "4.0.0"
-#define PBLANG_ZR_BANNER  "pblang 4.0.0 (sovereign zero-rust runtime)"
+#define PBLANG_ZR_VERSION "4.1.0"
+#define PBLANG_ZR_BANNER  "pblang 4.1.0 (sovereign zero-rust runtime)"
 
 /* ---- Memory Helpers ---- */
 
@@ -1661,6 +1661,40 @@ static inline int zr_strncasecmp_ascii(const char *a, const char *b, size_t n) {
         if (ca != cb || ca == 0) return (int)ca - (int)cb;
     }
     return 0;
+}
+
+static inline void zr_secure_zero(void *ptr, size_t len) {
+    if (!ptr || len == 0) return;
+    volatile uint8_t *vp = (volatile uint8_t *)ptr;
+    for (size_t i = 0; i < len; i++) vp[i] = 0;
+}
+
+static inline bool zr_is_debugger_attached(void) {
+#if defined(_WIN32)
+    return IsDebuggerPresent() != 0;
+#elif defined(__linux__)
+    int fd = open("/proc/self/status", O_RDONLY);
+    if (fd < 0) return false;
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    const char *p = buf;
+    while (*p) {
+        if (strncmp(p, "TracerPid:", 10) == 0) {
+            p += 10;
+            while (*p == ' ' || *p == '\t') p++;
+            return atoi(p) > 0;
+        }
+        const char *nl = strchr(p, '\n');
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return false;
+#else
+    return false;
+#endif
 }
 
 #endif /* PBLANG_ZR_COMMON_H */

@@ -41,6 +41,7 @@ let wcg = import("stdlib:codegen_wasm.sapp");
 let acg = import("stdlib:codegen_arm64_ast.sapp");
 let s32 = import("stdlib/native/codegen_sub32.sapp");
 let ipr = import("stdlib:ip_rights_provenance.sapp");
+let cshield = import("stdlib:security/closed_source_shield.sapp");
 
 fn _bad_option(message) { print "pbc: " + message; os_exit(2); }
 fn _count(text) {
@@ -81,12 +82,26 @@ fn main() {
     let hybrid_mode = false; let freestanding_mode = false;
     let ip_explicit = false; let ip_disable = false;
     let ip_mode = "proprietary"; let ip_spdx: any = nil; let ip_holder: any = nil; let sign_env_name: any = nil;
+    let capture_shield = true; let capture_shield_explicit = false;
+    let open_symbols = false; let obfuscate_mode = false; let split_out: any = nil;
     while i < len(a) {
         let arg = a[i];
         if arg == "--out" {
             if out != nil or i + 1 >= len(a) { _bad_option("invalid or duplicate output option"); }
             if _is_flag(a[i + 1]) { _bad_option("output option requires a path"); }
             out = a[i + 1]; i = i + 1;
+        } elif arg == "--split-out" {
+            if split_out != nil or i + 1 >= len(a) { _bad_option("invalid or duplicate --split-out option"); }
+            if _is_flag(a[i + 1]) { _bad_option("--split-out requires a server vault .sapp path"); }
+            split_out = a[i + 1]; i = i + 1;
+        } elif arg == "--capture-shield" {
+            capture_shield = true; capture_shield_explicit = true;
+        } elif arg == "--no-capture-shield" {
+            capture_shield = false; capture_shield_explicit = true;
+        } elif arg == "--open-symbols" {
+            open_symbols = true;
+        } elif arg == "--obfuscate" {
+            obfuscate_mode = true;
         } elif arg=="--module-contract" or arg=="--module-root" or arg=="--module-capability" {
             if i+1>=len(a) or _is_flag(a[i+1]) { _bad_option("module option requires a value"); }
             if arg=="--module-contract" {
@@ -187,17 +202,18 @@ fn main() {
     if validated == nil { _bad_option("invalid source budget"); }
     if target == "pbck" and (safe or overflow) { _bad_option("pbck does not implement --safe or --overflow"); }
     if out == nil {
-        let sfx = if target == "pbck" { ".pbck" }
-                  elif target == "pe64" or target == "pe32" or target == "aot-pe64" { ".exe" }
-                  elif target == "baremetal-x64" or target == "baremetal-x86" { ".elf" }
-                  elif target == "android-apk" { ".apk" }
-                  elif target == "android-dex" { ".dex" }
-                  elif target == "ios-macho" { ".macho" }
-                  elif target == "ios-app" { "_ios_dist" }
-                  elif target == "dos16" or target == "cpm80" { ".com" }
-                  elif target == "c64" { ".prg" }
-                  elif target == "avr8" { ".hex" }
-                  else { "" };
+        let sfx = "";
+        if split_out != nil and not target_set { sfx = ".client.sapp"; }
+        elif target == "pbck" { sfx = ".pbck"; }
+        elif target == "pe64" or target == "pe32" or target == "aot-pe64" { sfx = ".exe"; }
+        elif target == "baremetal-x64" or target == "baremetal-x86" { sfx = ".elf"; }
+        elif target == "android-apk" { sfx = ".apk"; }
+        elif target == "android-dex" { sfx = ".dex"; }
+        elif target == "ios-macho" { sfx = ".macho"; }
+        elif target == "ios-app" { sfx = "_ios_dist"; }
+        elif target == "dos16" or target == "cpm80" { sfx = ".com"; }
+        elif target == "c64" { sfx = ".prg"; }
+        elif target == "avr8" { sfx = ".hex"; }
         out = _default_out(src) + sfx;
     }
     if target == "pbck" and (out == src or not _has_suffix(out, ".pbck")) {
@@ -224,13 +240,38 @@ fn main() {
 
     // The optional byte budget applies after this existing whole-file read.
     let source = fs_read(src);
+    let prevent_ss = if capture_shield_explicit { capture_shield } else { ip_mode != "free" };
     let ip_opts = map{ mode: ip_mode };
     if ip_spdx != nil { ip_opts["license"] = ip_spdx; }
     if ip_holder != nil { ip_opts["holder"] = ip_holder; }
     let seal_exec_default = (not ip_disable) and (not local_source);
     let seal_explicit_only = (not ip_disable) and ip_explicit;
 
+    // ── Split-Execution Server Vault Extraction (`--split-out <server_vault.sapp>`) ──
+    if split_out != nil {
+        let split_res = cshield.compile_split_application(source);
+        fs_write(split_out, split_res.server_vault_code);
+        source = split_res.client_stub_code;
+        if not target_set and _has_suffix(out, ".sapp") {
+            let client_src = if obfuscate_mode { cshield.obfuscate_sapp_source(source).code } else { source };
+            fs_write(out, client_src);
+            print "pbc: split-compiled '" + str(src) + "' → client '" + str(out) + "' + vault '" + str(split_out) + "' (" + str(len(split_res.server_functions)) + " @server_only fn(s))";
+            return nil;
+        }
+    }
+
+    // ── Source-to-Source AST Obfuscation (`--obfuscate` with `.sapp` output) ──
+    if obfuscate_mode and not target_set and _has_suffix(out, ".sapp") {
+        let obf_res = cshield.obfuscate_sapp_source(source);
+        fs_write(out, obf_res.code);
+        print "pbc: obfuscated '" + str(src) + "' → '" + str(out) + "' (" + str(obf_res.renamed_count) + " symbols, " + str(obf_res.encrypted_strings) + " strings)";
+        return nil;
+    }
+
     if target == "pbck" {
+        if obfuscate_mode {
+            source = cshield.obfuscate_sapp_source(source).code;
+        }
         // Finish lexical, semantic and translation checks before touching output.
         let bytes:any=nil;
         if initialize != nil { bytes=bridge.compile_source_with_lifecycle(source,initialize,entry,cleanup); }
@@ -258,15 +299,23 @@ fn main() {
     if target == "android-dex" or target == "android-apk" or target == "ios-macho" or target == "ios-app" {
         let mob = import("stdlib:native/mobile_native_ios_android.sapp");
         let app_nm = _default_out(src);
+        let mob_spec = map{
+            app_name: app_nm,
+            package_name: "org.pblang.app." + str_lower(app_nm),
+            bundle_id: "org.pblang.ios." + str_lower(app_nm),
+            title: app_nm,
+            mode: ip_mode,
+            prevent_screenshots: prevent_ss
+        };
         if target == "android-dex" {
-            let dbin = mob.build_android_dex(map{ app_name: app_nm, package_name: "org.pblang.app." + str_lower(app_nm) });
+            let dbin = mob.build_android_dex(mob_spec);
             dbin = _maybe_seal_bytes(dbin, "auto", seal_explicit_only, ip_opts, sign_env_name);
             fs_write_bytes(out, dbin);
             print "pbc: compiled '" + str(src) + "' → '" + str(out) + "' (" + str(len(dbin)) + " bytes, Dalvik classes.dex 035)";
             return nil;
         }
         if target == "android-apk" {
-            let abin = mob.build_android_apk(map{ app_name: app_nm, package_name: "org.pblang.app." + str_lower(app_nm), title: app_nm }, out);
+            let abin = mob.build_android_apk(mob_spec, out);
             if seal_explicit_only {
                 let sealed_apk = _maybe_seal_bytes(abin.apk_bytes, "auto", true, ip_opts, sign_env_name);
                 fs_write_bytes(out, sealed_apk);
@@ -277,13 +326,13 @@ fn main() {
             return nil;
         }
         if target == "ios-macho" {
-            let mbin = mob.build_ios_arm64_macho(map{ app_name: app_nm, bundle_id: "org.pblang.ios." + str_lower(app_nm) });
+            let mbin = mob.build_ios_arm64_macho(mob_spec);
             mbin = _maybe_seal_bytes(mbin, "auto", seal_exec_default, ip_opts, sign_env_name);
             fs_write_bytes(out, mbin);
             print "pbc: compiled '" + str(src) + "' → '" + str(out) + "' (" + str(len(mbin)) + " bytes, Apple iOS ARM64 Mach-O)";
             return nil;
         }
-        let ibun = mob.build_ios_app_bundle(map{ app_name: app_nm, bundle_id: "org.pblang.ios." + str_lower(app_nm), title: app_nm }, out);
+        let ibun = mob.build_ios_app_bundle(mob_spec, out);
         print "pbc: compiled '" + str(src) + "' → '" + str(ibun.bundle_dir) + "' (" + str(ibun.macho_size) + " bytes Mach-O + Info.plist)";
         return nil;
     }
@@ -314,7 +363,15 @@ fn main() {
     // ── Pure-PBLang Unboxed Native x86-64 AOT (`aot-native` ELF64 & `aot-pe64` Windows PE32+) ──
     if target == "aot-native" or target == "aot-pe64" {
         let ucg = import("stdlib:native/aot_unboxed_native.sapp");
-        let aopts = map{ target: target, hybrid: hybrid_mode, freestanding: freestanding_mode };
+        let aopts = map{
+            target: target,
+            hybrid: hybrid_mode,
+            freestanding: freestanding_mode,
+            mode: ip_mode,
+            open_symbols: open_symbols,
+            strip_symbols: (not open_symbols) and (ip_mode != "free"),
+            obfuscate_strings: if obfuscate_mode { true } else { ip_mode != "free" }
+        };
         let rep = ucg.compile_aot_native(source, aopts);
         let abin = _maybe_seal_bytes(rep["binary"], "auto", seal_exec_default, ip_opts, sign_env_name);
         fs_write_bytes(out, abin);

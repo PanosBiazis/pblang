@@ -1,20 +1,20 @@
 /* ============================================================================
- * pblang Sovereign Zero-Rust Native Runtime & Compiler — v4.0.0
+ * pblang Sovereign Zero-Rust Native Runtime & Compiler — v4.1.0
  *
  * 100% Rust-independent cross-platform & multi-device C99 implementation of:
- *   - Native `.sapp -> .pbck` v1 preprocessor, Unicode lexer, parser,
+ *   - Native `.sapp -> .pbck` v1 / `PBSH` v1 preprocessor, Unicode lexer, parser,
  *     SI unit annotations, `requires`/`ensures` contracts, `@nogc`/`@packed`
  *     attributes, sandboxed `comptime`, AST desugarer, bytecode compiler &
- *     `.pbck` serializer/deserializer
+ *     zero-overhead polymorphic encrypted/stripped serializer & deserializer
  *   - Computed-Goto threaded VM, peephole superinstructions, monomorphic ICs,
  *     W^X `x86_64` SSE2 native JIT, two-generation nursery GC, zero-copy
  *     `OBJ_BYTES`/`OBJ_F64BUF` + unboxed `OBJ_STRUCT_BUF` tables, CSR graph
  *     kernels, 3D PBR rasterizer, per-module call-stack capabilities, VM taint
  *     tracking, deterministic `.pbrec` flight-recorder/replay, unrestricted
- *     10-arg FFI + C callbacks, and 315+ native host builtins
+ *     10-arg FFI + C callbacks, OS anti-screenshot shield & 320+ host builtins
  *   - Unified native CLI: `run`, `repl`, `test`, `check`, `fmt`, `doc`, `lsp`,
- *     `debug`, `prof`, `replay`, `build` (`--aot-native`, `--freestanding`,
- *     `--target baremetal-x64|baremetal-x86`, `--bundle-exe`, `--target web`)
+ *     `debug`, `prof`, `replay`, `shield-inspect`, `build` (`--aot-native`,
+ *     `--freestanding`, `--target baremetal-x64|baremetal-x86`, `--bundle-exe`)
  *
  * Linux build:
  *   gcc -std=c99 -O3 -Wall -Wextra -Wno-unused-parameter \
@@ -35,7 +35,7 @@
 #include <dirent.h>
 #endif
 
-#define PBLANG_ZR_VERSION_STR "pblang 4.0.0 (sovereign zero-rust runtime; compat 1.5.0)"
+#define PBLANG_ZR_VERSION_STR "pblang 4.1.0 (sovereign zero-rust runtime; compat 1.5.0)"
 
 static void zr_print_version(void) {
     printf("%s\n", PBLANG_ZR_VERSION_STR);
@@ -57,8 +57,9 @@ static void zr_print_help(const char *prog) {
     printf("  %s debug <file.sapp> [args...]                      Interactive bytecode/source debugger\n", p);
     printf("  %s prof [--json] [--svg <out.svg>] <file.sapp>      Run hotspot profiler & flame-bar report\n", p);
     printf("  %s replay <trace.pbrec> <file.sapp> [args...]       Deterministic time-travel replay\n", p);
-    printf("  %s build <file.sapp> [-o <out>] [--aot-native | --freestanding | --target <t> | --bundle-exe] [--free | --license <SPDX> | --stealth]\n", p);
+    printf("  %s build <file.sapp> [-o <out>] [--aot-native | --freestanding | --target <t> | --bundle-exe] [--shield | --open-symbols | --anti-debug] [--free | --license <SPDX> | --stealth]\n", p);
     printf("      Targets: pbck | web | aot-native | aot-pe64 | baremetal-x64 | baremetal-x86 | android-apk | android-dex | ios-macho | ios-app | x64 | x64-dyn | pe64 | arm64 | wasm | x86 | pe32 | rv32 | dos16 | cpm80 | c64 | avr8\n");
+    printf("  %s shield-inspect <file>                            Inspect PBSH-v1 shield, entropy & integrity\n", p);
     printf("  %s ip-seal <file> [-o <out>] [--free | --license <SPDX> | --copyright-holder <name> | --stealth]\n", p);
     printf("  %s ip-inspect <file> | ip-verify <file> [--sign-env <ENV_VAR>]\n", p);
     printf("  %s license | credits                                Show Apache-2.0 license, NOTICE & creator attribution\n", p);
@@ -297,6 +298,30 @@ static int zr_cmd_eval(const char *self_exe, const char *code_str, const ZrCaps 
     return zr_cmd_eval_ex(self_exe, code_str, caps, stdlib_override, NULL, script_argc, script_argv);
 }
 
+static PbFunc *zr_load_file_pbsh_aware(PbVM *vm, const char *path, char err_buf[512]) {
+    FILE *fp = fopen(path, "rb");
+    if (fp) {
+        uint8_t magic[4];
+        size_t n = fread(magic, 1, 4, fp);
+        fclose(fp);
+        if (n == 4 && (memcmp(magic, "PBSH", 4) == 0 || memcmp(magic, "PBCK", 4) == 0)) {
+            uint8_t *raw = NULL;
+            size_t raw_len = 0;
+            if (!zr_read_entire_file(path, &raw, &raw_len)) {
+                snprintf(err_buf, 512, "cannot read '%s'", path);
+                return NULL;
+            }
+            char derr[256];
+            derr[0] = '\0';
+            PbFunc *fn = pbck_deserialize_script(vm, raw, raw_len, derr);
+            free(raw);
+            if (!fn) snprintf(err_buf, 512, "%s", derr[0] ? derr : "corrupt bytecode container");
+            return fn;
+        }
+    }
+    return zr_load_or_compile_file(vm, path, err_buf);
+}
+
 static int zr_cmd_run_file_ex(const char *self_exe, const char *target_file, const ZrCaps *caps,
                               const char *stdlib_override, const ZrRunOpts *opts,
                               int script_argc, char **script_argv) {
@@ -332,7 +357,7 @@ static int zr_cmd_run_file_ex(const char *self_exe, const char *target_file, con
 
     char lerr[512];
     lerr[0] = '\0';
-    PbFunc *fn = zr_load_or_compile_file(vmp, vmp->current_file ? vmp->current_file : target_file, lerr);
+    PbFunc *fn = zr_load_file_pbsh_aware(vmp, vmp->current_file ? vmp->current_file : target_file, lerr);
     if (!fn) {
         fprintf(stderr, "%s\n", lerr[0] ? lerr : "Failed to load or compile script");
         zr_flight_cleanup_vm(vmp);
@@ -430,7 +455,7 @@ static int zr_cmd_check_file_ex(const char *self_exe, const char *target_file,
         fprintf(stderr, "check: cannot read '%s'\n", target_file);
         return 1;
     }
-    bool is_pbck = (raw_len >= 4 && memcmp(raw, "PBCK", 4) == 0);
+    bool is_pbck = (raw_len >= 4 && (memcmp(raw, "PBCK", 4) == 0 || memcmp(raw, "PBSH", 4) == 0));
     PbVM vm;
     vm_init(&vm);
     zr_configure_vm_paths(&vm, self_exe, target_file, stdlib_override);
@@ -642,7 +667,7 @@ static bool zr_emit_web_bundle(const char *input_path, const uint8_t *pbck_bytes
 
     /* 2. Emit `pblang_web_host.js` */
     static const char *js_code =
-        "// PBLang v4.0.0 WebAssembly Host Loader\n"
+        "// PBLang v4.1.0 WebAssembly Host Loader\n"
         "export async function loadPBLangWasm(wasmUrl = './app.wasm') {\n"
         "  const resp = await fetch(wasmUrl);\n"
         "  const bytes = await resp.arrayBuffer();\n"
@@ -665,9 +690,9 @@ static bool zr_emit_web_bundle(const char *input_path, const uint8_t *pbck_bytes
     fprintf(hf,
         "<!doctype html>\n"
         "<html lang=\"en\">\n"
-        "<head><meta charset=\"utf-8\"/><title>PBLang 4.0.0 Web App</title></head>\n"
+        "<head><meta charset=\"utf-8\"/><title>PBLang 4.1.0 Web App</title></head>\n"
         "<body style=\"background:#0f172a;color:#f8fafc;font-family:monospace;padding:24px\">\n"
-        "  <h2>PBLang v4.0.0 WebAssembly Target</h2>\n"
+        "  <h2>PBLang v4.1.0 WebAssembly Target</h2>\n"
         "  <pre id=\"out\">Loading app.wasm (%s)...</pre>\n"
         "  <script type=\"module\">\n"
         "    import { loadPBLangWasm } from './pblang_web_host.js';\n"
@@ -698,6 +723,9 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
     bool aot_native_flag = false;
     bool hybrid_flag = false;
     bool freestanding_flag = false;
+    bool open_symbols_flag = false;
+    bool shield_flag = false;
+    bool anti_debug_flag = false;
     bool ip_explicit = false;
     bool ip_disable = false;
     const char *ip_mode_flag = NULL;
@@ -714,6 +742,12 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
             hybrid_flag = true;
         } else if (strcmp(argv[i], "--freestanding") == 0 || strcmp(argv[i], "--baremetal") == 0) {
             freestanding_flag = true;
+        } else if (strcmp(argv[i], "--open-symbols") == 0 || strcmp(argv[i], "--no-obfuscate") == 0 || strcmp(argv[i], "--no-shield") == 0) {
+            open_symbols_flag = true;
+        } else if (strcmp(argv[i], "--obfuscate") == 0 || strcmp(argv[i], "--shield") == 0) {
+            shield_flag = true;
+        } else if (strcmp(argv[i], "--anti-debug") == 0) {
+            anti_debug_flag = true;
         } else if (strcmp(argv[i], "--ip-seal") == 0) {
             ip_explicit = true;
         } else if (strcmp(argv[i], "--no-ip-seal") == 0) {
@@ -753,7 +787,7 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
         }
     }
     if (!input_path) {
-        fprintf(stderr, "Usage: pblang build <input.sapp> [-o <output>] [--aot-native | --freestanding | --target <arch> | --bundle-exe] [--free | --license <SPDX> | --stealth]\n");
+        fprintf(stderr, "Usage: pblang build <input.sapp> [-o <output>] [--aot-native | --freestanding | --target <arch> | --bundle-exe] [--shield | --open-symbols | --anti-debug] [--free | --license <SPDX> | --stealth]\n");
         return 1;
     }
 
@@ -860,6 +894,21 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
         return rc;
     }
 
+    bool is_open_mode =
+        (ip_mode_flag && (strcmp(ip_mode_flag, "--free") == 0 || strcmp(ip_mode_flag, "--free-attribution") == 0)) ||
+        (ip_license != NULL) ||
+        open_symbols_flag;
+
+    bool is_web_target = (target_arch && strcmp(target_arch, "web") == 0);
+    bool use_shield = false;
+    if (is_web_target) {
+        use_shield = shield_flag || anti_debug_flag;
+    } else if (bundle_exe) {
+        use_shield = shield_flag || anti_debug_flag || !is_open_mode;
+    } else {
+        use_shield = shield_flag || anti_debug_flag;
+    }
+
     uint8_t *raw = NULL;
     size_t raw_len = 0;
     if (!zr_read_entire_file(input_path, &raw, &raw_len)) {
@@ -873,10 +922,30 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
 
     uint8_t *pbck_bytes = NULL;
     size_t pbck_len = 0;
-    if (raw_len >= 4 && memcmp(raw, "PBCK", 4) == 0) {
-        pbck_bytes = raw;
-        pbck_len = raw_len;
-        raw = NULL;
+    bool input_is_pbc = (raw_len >= 4 && (memcmp(raw, "PBCK", 4) == 0 || memcmp(raw, "PBSH", 4) == 0));
+    if (input_is_pbc) {
+        bool already_pbsh = (memcmp(raw, "PBSH", 4) == 0);
+        if (already_pbsh == use_shield && !anti_debug_flag) {
+            pbck_bytes = raw;
+            pbck_len = raw_len;
+            raw = NULL;
+        } else {
+            char derr[256];
+            derr[0] = '\0';
+            PbFunc *fn = pbck_deserialize_script(&vm, raw, raw_len, derr);
+            free(raw);
+            raw = NULL;
+            if (!fn) {
+                fprintf(stderr, "build error (%s): %s\n", input_path, derr[0] ? derr : "corrupt bytecode");
+                vm_free(&vm);
+                return 1;
+            }
+            vm_push_root(&vm, val_obj(fn));
+            pbck_bytes = use_shield
+                ? pbck_serialize_shielded(fn, anti_debug_flag, &pbck_len)
+                : pbck_serialize_script(fn, &pbck_len);
+            vm_pop_roots(&vm, 1);
+        }
     } else {
         char cerr[512];
         cerr[0] = '\0';
@@ -889,11 +958,13 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
             return 1;
         }
         vm_push_root(&vm, val_obj(fn));
-        pbck_bytes = pbck_serialize_script(fn, &pbck_len);
+        pbck_bytes = use_shield
+            ? pbck_serialize_shielded(fn, anti_debug_flag, &pbck_len)
+            : pbck_serialize_script(fn, &pbck_len);
         vm_pop_roots(&vm, 1);
     }
 
-    if (target_arch && strcmp(target_arch, "web") == 0) {
+    if (is_web_target) {
         const char *web_dir = out_path ? out_path : "dist_web";
         char w_cand[4160];
         w_cand[0] = '\0';
@@ -998,7 +1069,8 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
 #endif
             }
         }
-        printf("Built standalone executable: %s (%zu bytes bytecode embedded)\n", out_path, pbck_len);
+        printf("Built standalone executable: %s (%zu bytes %s bytecode embedded)\n",
+               out_path, pbck_len, use_shield ? "PBSH-v1 shielded" : "PBCK-v1 open");
     } else {
         FILE *fp = fopen(out_path, "wb");
         if (!fp || fwrite(pbck_bytes, 1, pbck_len, fp) != pbck_len) {
@@ -1009,7 +1081,8 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
             return 1;
         }
         fclose(fp);
-        printf("Built bytecode: %s (%zu bytes)\n", out_path, pbck_len);
+        printf("Built bytecode: %s (%zu bytes, %s)\n",
+               out_path, pbck_len, use_shield ? "PBSH-v1 shielded" : "PBCK-v1");
     }
 
     free(pbck_bytes);
@@ -1707,7 +1780,7 @@ static int zr_cmd_debug(const char *self_exe, int argc, char **argv) {
 
     char lerr[512];
     lerr[0] = '\0';
-    PbFunc *fn = zr_load_or_compile_file(&vm, vm.current_file ? vm.current_file : target, lerr);
+    PbFunc *fn = zr_load_file_pbsh_aware(&vm, vm.current_file ? vm.current_file : target, lerr);
     if (!fn) {
         fprintf(stderr, "debug: %s\n", lerr[0] ? lerr : "compile failed");
         vm_free(&vm);
@@ -1962,7 +2035,7 @@ static int zr_cmd_test(const char *self_exe, int argc, char **argv) {
 
         char lerr[512];
         lerr[0] = '\0';
-        PbFunc *fn = zr_load_or_compile_file(&vm, vm.current_file ? vm.current_file : fpath, lerr);
+        PbFunc *fn = zr_load_file_pbsh_aware(&vm, vm.current_file ? vm.current_file : fpath, lerr);
         if (!fn) {
             fprintf(stderr, "FAIL %s (compile): %s\n", fpath, lerr);
             failed_units++;
@@ -2113,10 +2186,55 @@ static int zr_cmd_license_credits(void) {
     printf("Official Repository       : https://github.com/PanosBiazis/pblang\n");
     printf("Engine & Stdlib License   : Apache License 2.0 (SPDX: Apache-2.0) + Binding NOTICE (Section 4(d))\n");
     printf("Compiler Output Policy    : Sovereign Developer Choice (Apache-2.0 never infects user binaries)\n");
-    printf("  - Default binary policy : All Rights Reserved + Tamper-Evident SHA-256 PBIPSEAL\n");
-    printf("  - Open-Source choice    : --free / --license <SPDX> (MIT, Apache-2.0, GPL-3.0-only, BSD-3-Clause, MPL-2.0, CC0-1.0, ...)\n");
-    printf("  - Attribution-free/anon : --stealth (Redacted holder, SOURCE_DATE_EPOCH=0, zero OS/path/clock leaks)\n");
+    printf("  - Default binary policy : All Rights Reserved + Zero-Overhead PBSH-v1 Polymorphic Shield + PBIPSEAL\n");
+    printf("  - Open-Source choice    : --free / --license <SPDX> / --open-symbols (MIT, Apache-2.0, GPL-3.0-only, BSD-3-Clause, ...)\n");
+    printf("  - Attribution-free/anon : --stealth (Redacted holder, SOURCE_DATE_EPOCH=0, PBSH-v1 encrypted, zero leaks)\n");
     return 0;
+}
+
+static int zr_cmd_shield_inspect(int argc, char **argv) {
+    const char *target_file = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (argv[i][0] != '-' && !target_file) {
+            target_file = argv[i];
+        }
+    }
+    if (!target_file) {
+        fprintf(stderr, "Usage: pblang shield-inspect <artifact_or_pbck_file>\n");
+        return 1;
+    }
+
+    PbVM vm;
+    vm_init(&vm);
+    zr_caps_allow_all(&vm.caps);
+
+    PbValue arg = val_obj(pb_str_c(&vm, target_file));
+    vm_push_root(&vm, arg);
+    PbValue info_val = val_nil();
+    if (!bi_pbck_shield_inspect(&vm, 1, &arg, &info_val)) {
+        fprintf(stderr, "shield-inspect: %s\n", vm.err_msg[0] ? vm.err_msg : "inspection failed");
+        vm_pop_roots(&vm, 1);
+        vm_free(&vm);
+        return 1;
+    }
+    vm_push_root(&vm, info_val);
+
+    PbValue json_val = val_nil();
+    if (bi_json_stringify(&vm, 1, &info_val, &json_val) && is_obj_type(json_val, OBJ_STR)) {
+        printf("%s\n", AS_STR(json_val)->chars);
+    }
+
+    bool ok_flag = false;
+    if (is_obj_type(info_val, OBJ_MAP)) {
+        PbValue ok_v = val_nil();
+        if (pb_map_get_cstr(AS_MAP(info_val), "ok", &ok_v) && ok_v.tag == VAL_BOOL) {
+            ok_flag = ok_v.as.b;
+        }
+    }
+
+    vm_pop_roots(&vm, 2);
+    vm_free(&vm);
+    return ok_flag ? 0 : 1;
 }
 
 static int zr_cmd_ip_tool(const char *self_exe, const char *action, int argc, char **argv) {
@@ -2223,6 +2341,11 @@ int main(int argc, char **argv) {
     }
     if (strcmp(sub, "license") == 0 || strcmp(sub, "--license-info") == 0 || strcmp(sub, "credits") == 0 || strcmp(sub, "attribution") == 0) {
         int rc = zr_cmd_license_credits();
+        free(self_exe);
+        return rc;
+    }
+    if (strcmp(sub, "shield-inspect") == 0 || strcmp(sub, "--shield-inspect") == 0) {
+        int rc = zr_cmd_shield_inspect(argc - 2, argv + 2);
         free(self_exe);
         return rc;
     }

@@ -1,6 +1,7 @@
 /* ============================================================================
- * pblang Sovereign Zero-Rust Native Runtime v3.0.0 — zr_gfx.h
- * Native Cross-Platform Framebuffer GUI + Anti-Aliased Greek & Latin Text:
+ * pblang Sovereign Zero-Rust Native Runtime v4.1.0 — zr_gfx.h
+ * Native Cross-Platform Framebuffer GUI + Anti-Aliased Greek & Latin Text
+ * + Hardware/OS Anti-Screenshot & Focus-Loss Blur Veil (`gfx_set_capture_shield`):
  *   - Headless Virtual ARGB8888 Framebuffer (`PBLANG_GFX_HEADLESS=1`)
  *   - Linux: Lazy-dlopen X11 (`libX11.so.6`) + FreeType2 (`libfreetype.so.6`)
  *   - Windows: Win32 Window + GDI `StretchDIBits` + `Segoe UI` ClearType/AA
@@ -255,10 +256,12 @@ typedef union {
 #define ZR_X_ButtonPress      4
 #define ZR_X_ButtonRelease    5
 #define ZR_X_MotionNotify     6
+#define ZR_X_FocusIn          9
+#define ZR_X_FocusOut         10
 #define ZR_X_ConfigureNotify  22
 #define ZR_X_ClientMessage    33
 #define ZR_X_ZPixmap          2
-#define ZR_X_EventMask        (1L<<0 | 1L<<1 | 1L<<2 | 1L<<3 | 1L<<6 | 1L<<15 | 1L<<17)
+#define ZR_X_EventMask        (1L<<0 | 1L<<1 | 1L<<2 | 1L<<3 | 1L<<6 | 1L<<15 | 1L<<17 | 1L<<21)
 
 typedef struct {
     bool        tried;
@@ -394,6 +397,14 @@ typedef struct {
     float     mouse_x, mouse_y;
     bool      has_mouse;
     bool      left_down, right_down;
+    bool      capture_shield;
+    bool      blur_on_unfocus;
+    bool      block_print_save;
+    bool      shield_veiled;
+    bool      hw_affinity_active;
+    bool      crisp_dirty;
+    uint32_t  capture_attempts;
+    uint32_t *saved_crisp_buf;
 #if defined(_WIN32)
     HWND      hwnd;
     bool      close_req;
@@ -409,6 +420,145 @@ typedef struct {
 static ZrGfxWin g_zr_wins[ZR_MAX_GFX_WINS];
 static size_t   g_zr_gfx_next_id = 1;
 
+static void zr_gfx_present_surface(ZrGfxWin *gw) {
+    if (!gw || gw->headless || !gw->is_open || !gw->buf) return;
+#if defined(_WIN32)
+    if (gw->hwnd) {
+        HDC hdc = GetDC(gw->hwnd);
+        BITMAPINFO bmi;
+        memset(&bmi, 0, sizeof(bmi));
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = (LONG)gw->w;
+        bmi.bmiHeader.biHeight = -(LONG)gw->h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        StretchDIBits(hdc, 0, 0, (int)gw->w, (int)gw->h, 0, 0, (int)gw->w, (int)gw->h,
+                      gw->buf, &bmi, DIB_RGB_COLORS, SRCCOPY);
+        ReleaseDC(gw->hwnd, hdc);
+    }
+#else
+    if (gw->xdpy && gw->xwin) {
+        int scr = g_zr_x11.XDefaultScreen(gw->xdpy);
+        void *vis = g_zr_x11.XDefaultVisual(gw->xdpy, scr);
+        int depth = g_zr_x11.XDefaultDepth(gw->xdpy, scr);
+        void *gc = g_zr_x11.XDefaultGC(gw->xdpy, scr);
+        ZrXImage *img = g_zr_x11.XCreateImage(gw->xdpy, vis, (unsigned int)depth, ZR_X_ZPixmap, 0,
+                                              (char *)gw->buf, (unsigned int)gw->w, (unsigned int)gw->h,
+                                              32, (int)(gw->w * 4));
+        if (img) {
+            g_zr_x11.XPutImage(gw->xdpy, gw->xwin, gc, img, 0, 0, 0, 0, (unsigned int)gw->w, (unsigned int)gw->h);
+            img->data = NULL;
+            if (img->f.destroy_image) img->f.destroy_image(img);
+            g_zr_x11.XFlush(gw->xdpy);
+        }
+    }
+#endif
+}
+
+/* O(W*H) 2-pass separable horizontal + vertical box blur (radius = 14) + dark frosted tint */
+static void zr_gfx_apply_frosted_blur(const uint32_t *src, uint32_t *dst, size_t w, size_t h, int radius) {
+    if (!src || !dst || w == 0 || h == 0) return;
+    if (radius < 1) radius = 1;
+    uint32_t diam = (uint32_t)(2 * radius + 1);
+    uint32_t *tmp = (uint32_t *)zr_xmalloc(w * h * sizeof(uint32_t));
+    int iw = (int)w, ih = (int)h;
+
+    /* Pass 1: Horizontal sliding-window sum */
+    for (int y = 0; y < ih; y++) {
+        const uint32_t *srow = src + (size_t)y * w;
+        uint32_t *drow = tmp + (size_t)y * w;
+        uint32_t sr = 0, sg = 0, sb = 0;
+        for (int k = -radius; k <= radius; k++) {
+            int ix = k < 0 ? 0 : (k >= iw ? iw - 1 : k);
+            uint32_t p = srow[ix];
+            sr += (p >> 16) & 0xFFu;
+            sg += (p >> 8) & 0xFFu;
+            sb += p & 0xFFu;
+        }
+        drow[0] = 0xFF000000u | ((sr / diam) << 16) | ((sg / diam) << 8) | (sb / diam);
+        for (int x = 1; x < iw; x++) {
+            int out_x = x - 1 - radius;
+            int in_x  = x + radius;
+            if (out_x < 0) out_x = 0;
+            if (in_x >= iw) in_x = iw - 1;
+            uint32_t po = srow[out_x], pi = srow[in_x];
+            sr = sr - ((po >> 16) & 0xFFu) + ((pi >> 16) & 0xFFu);
+            sg = sg - ((po >> 8) & 0xFFu) + ((pi >> 8) & 0xFFu);
+            sb = sb - (po & 0xFFu) + (pi & 0xFFu);
+            drow[x] = 0xFF000000u | ((sr / diam) << 16) | ((sg / diam) << 8) | (sb / diam);
+        }
+    }
+
+    /* Pass 2: Vertical sliding-window sum + dark frosted slate tint */
+    for (int x = 0; x < iw; x++) {
+        uint32_t sr = 0, sg = 0, sb = 0;
+        for (int k = -radius; k <= radius; k++) {
+            int iy = k < 0 ? 0 : (k >= ih ? ih - 1 : k);
+            uint32_t p = tmp[(size_t)iy * w + (size_t)x];
+            sr += (p >> 16) & 0xFFu;
+            sg += (p >> 8) & 0xFFu;
+            sb += p & 0xFFu;
+        }
+        uint32_t br = sr / diam, bg = sg / diam, bb = sb / diam;
+        uint32_t or_ = (br * 166u + 14u * 89u) / 255u;
+        uint32_t og  = (bg * 166u + 20u * 89u) / 255u;
+        uint32_t ob  = (bb * 166u + 32u * 89u) / 255u;
+        dst[x] = 0xFF000000u | (or_ << 16) | (og << 8) | ob;
+
+        for (int y = 1; y < ih; y++) {
+            int out_y = y - 1 - radius;
+            int in_y  = y + radius;
+            if (out_y < 0) out_y = 0;
+            if (in_y >= ih) in_y = ih - 1;
+            uint32_t po = tmp[(size_t)out_y * w + (size_t)x];
+            uint32_t pi = tmp[(size_t)in_y * w + (size_t)x];
+            sr = sr - ((po >> 16) & 0xFFu) + ((pi >> 16) & 0xFFu);
+            sg = sg - ((po >> 8) & 0xFFu) + ((pi >> 8) & 0xFFu);
+            sb = sb - (po & 0xFFu) + (pi & 0xFFu);
+            br = sr / diam; bg = sg / diam; bb = sb / diam;
+            or_ = (br * 166u + 14u * 89u) / 255u;
+            og  = (bg * 166u + 20u * 89u) / 255u;
+            ob  = (bb * 166u + 32u * 89u) / 255u;
+            dst[(size_t)y * w + (size_t)x] = 0xFF000000u | (or_ << 16) | (og << 8) | ob;
+        }
+    }
+    free(tmp);
+}
+
+static void zr_gfx_engage_blur_veil(ZrGfxWin *gw) {
+    if (!gw || !gw->buf || gw->w == 0 || gw->h == 0 || gw->shield_veiled) return;
+    size_t nbytes = gw->w * gw->h * sizeof(uint32_t);
+    if (!gw->saved_crisp_buf) {
+        gw->saved_crisp_buf = (uint32_t *)zr_xmalloc(nbytes);
+    }
+    memcpy(gw->saved_crisp_buf, gw->buf, nbytes);
+    zr_gfx_apply_frosted_blur(gw->saved_crisp_buf, gw->buf, gw->w, gw->h, 14);
+    gw->shield_veiled = true;
+    gw->crisp_dirty = false;
+    zr_gfx_present_surface(gw);
+}
+
+static void zr_gfx_restore_crisp(ZrGfxWin *gw) {
+    if (!gw || !gw->shield_veiled) return;
+    if (gw->saved_crisp_buf && gw->buf && gw->w > 0 && gw->h > 0) {
+        memcpy(gw->buf, gw->saved_crisp_buf, gw->w * gw->h * sizeof(uint32_t));
+    }
+    free(gw->saved_crisp_buf);
+    gw->saved_crisp_buf = NULL;
+    gw->shield_veiled = false;
+    gw->crisp_dirty = false;
+    zr_gfx_present_surface(gw);
+}
+
+static inline uint32_t *zr_gfx_draw_buf(ZrGfxWin *gw) {
+    if (gw->shield_veiled && gw->saved_crisp_buf) {
+        gw->crisp_dirty = true;
+        return gw->saved_crisp_buf;
+    }
+    return gw->buf;
+}
+
 #if defined(_WIN32)
 static LRESULT CALLBACK zr_win32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     ZrGfxWin *gw = (ZrGfxWin *)GetWindowLongPtrA(hwnd, GWLP_USERDATA);
@@ -419,6 +569,24 @@ static LRESULT CALLBACK zr_win32_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
     if (msg == WM_DESTROY) {
         if (gw) gw->is_open = false;
         return 0;
+    }
+    if (gw && gw->capture_shield) {
+        if (msg == WM_KILLFOCUS || (msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE)) {
+            if (gw->blur_on_unfocus) zr_gfx_engage_blur_veil(gw);
+        } else if (msg == WM_SETFOCUS || (msg == WM_ACTIVATE && LOWORD(wp) != WA_INACTIVE)) {
+            zr_gfx_restore_crisp(gw);
+        } else if ((msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP) && wp == 0x2Cu /* VK_SNAPSHOT */) {
+            if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || !gw->shield_veiled) {
+                gw->capture_attempts++;
+                zr_gfx_engage_blur_veil(gw);
+            }
+            return 0;
+        } else if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && gw->block_print_save &&
+                   (GetKeyState(VK_CONTROL) & 0x8000) != 0 && (wp == 0x50u || wp == 0x53u)) {
+            gw->capture_attempts++;
+            zr_gfx_engage_blur_veil(gw);
+            return 0;
+        }
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
@@ -552,8 +720,8 @@ static void zr_draw_line(uint32_t *buf, size_t w, size_t h, int64_t ix0, int64_t
 /* ---- Builtins ---- */
 static bool bi_gfxcreatewindow(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_GFX), "gfxcreatewindow", "gfx")) return false;
-    if (argc != 3 || !val_is_obj(argv[0], OBJ_STR) || argv[1].tag != VAL_NUM || argv[2].tag != VAL_NUM) {
-        vm_raise(vm, "gfxcreatewindow(title, width, height) expects (string, number, number)");
+    if ((argc != 3 && argc != 4) || !val_is_obj(argv[0], OBJ_STR) || argv[1].tag != VAL_NUM || argv[2].tag != VAL_NUM) {
+        vm_raise(vm, "gfxcreatewindow(title, width, height[, headless_or_opts]) expects (string, number, number[, bool|map])");
         return false;
     }
     const char *title = ((PbStr *)val_as_obj(argv[0]))->chars;
@@ -582,6 +750,27 @@ static bool bi_gfxcreatewindow(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
 
     const char *hl_env = getenv("PBLANG_GFX_HEADLESS");
     bool want_headless = (hl_env && (strcmp(hl_env, "1") == 0 || strcmp(hl_env, "true") == 0));
+    if (argc == 4 && argv[3].tag != VAL_NIL) {
+        if (argv[3].tag == VAL_BOOL) {
+            want_headless = want_headless || argv[3].u.b;
+        } else if (argv[3].tag == VAL_NUM) {
+            want_headless = want_headless || (argv[3].u.num != 0.0);
+        } else if (val_is_obj(argv[3], OBJ_MAP)) {
+            PbMap *om = (PbMap *)val_as_obj(argv[3]);
+            PbValue vh, vcs;
+            if (map_get_cstr(om, "headless", &vh) && vh.tag != VAL_NIL) {
+                want_headless = want_headless || ((vh.tag == VAL_BOOL) ? vh.u.b : (vh.tag == VAL_NUM ? vh.u.num != 0.0 : true));
+            }
+            if (map_get_cstr(om, "capture_shield", &vcs) && vcs.tag != VAL_NIL) {
+                bool cs_on = (vcs.tag == VAL_BOOL) ? vcs.u.b : (vcs.tag == VAL_NUM ? vcs.u.num != 0.0 : true);
+                if (cs_on) {
+                    slot->capture_shield = true;
+                    slot->blur_on_unfocus = true;
+                    slot->block_print_save = true;
+                }
+            }
+        }
+    }
 
     if (want_headless) {
         slot->headless = true;
@@ -613,6 +802,18 @@ static bool bi_gfxcreatewindow(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
     } else {
         SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)slot);
         slot->hwnd = hwnd;
+        if (slot->capture_shield) {
+            typedef BOOL (WINAPI *ZrSetWinDispAffinityFn)(HWND, DWORD);
+            HMODULE u32 = GetModuleHandleA("user32.dll");
+            ZrSetWinDispAffinityFn pfn = u32
+                ? (ZrSetWinDispAffinityFn)(void *)GetProcAddress(u32, "SetWindowDisplayAffinity")
+                : NULL;
+            if (pfn) {
+                BOOL ok_aff = pfn(hwnd, 0x00000011u /* WDA_EXCLUDEFROMCAPTURE */);
+                if (!ok_aff) ok_aff = pfn(hwnd, 0x00000001u /* WDA_MONITOR */);
+                slot->hw_affinity_active = (ok_aff != 0);
+            }
+        }
     }
 #else
     const char *disp_env = getenv("DISPLAY");
@@ -678,6 +879,7 @@ static bool bi_gfxclose(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
             }
             free(gw->ximg_buf);
 #endif
+            free(gw->saved_crisp_buf);
             free(gw->buf);
             memset(gw, 0, sizeof(*gw));
             break;
@@ -705,8 +907,9 @@ static bool bi_gfxclear(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     uint32_t c = 0;
     if (!zr_gfx_parse_color(vm, argv[1], "gfxclear", &c)) return false;
     uint32_t solid = 0xff000000u | (c & 0x00ffffffu);
+    uint32_t *dst = zr_gfx_draw_buf(gw);
     size_t n = gw->w * gw->h;
-    for (size_t i = 0; i < n; i++) gw->buf[i] = solid;
+    for (size_t i = 0; i < n; i++) dst[i] = solid;
     *out = val_nil();
     return true;
 }
@@ -720,9 +923,10 @@ static bool bi_gfxdrawpoint(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (!gw) return false;
     uint32_t c = 0;
     if (!zr_gfx_parse_color(vm, argv[3], "gfxdrawpoint", &c)) return false;
+    uint32_t *dst = zr_gfx_draw_buf(gw);
     int64_t x = (int64_t)argv[1].u.num, y = (int64_t)argv[2].u.num;
     if (x >= 0 && x < (int64_t)gw->w && y >= 0 && y < (int64_t)gw->h) {
-        zr_blend_argb(&gw->buf[(size_t)y * gw->w + (size_t)x], c, 255);
+        zr_blend_argb(&dst[(size_t)y * gw->w + (size_t)x], c, 255);
     }
     *out = val_nil();
     return true;
@@ -738,7 +942,7 @@ static bool bi_gfxdrawline(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (!gw) return false;
     uint32_t c = 0;
     if (!zr_gfx_parse_color(vm, argv[5], "gfxdrawline", &c)) return false;
-    zr_draw_line(gw->buf, gw->w, gw->h,
+    zr_draw_line(zr_gfx_draw_buf(gw), gw->w, gw->h,
                  (int64_t)argv[1].u.num, (int64_t)argv[2].u.num,
                  (int64_t)argv[3].u.num, (int64_t)argv[4].u.num, c);
     *out = val_nil();
@@ -755,7 +959,7 @@ static bool bi_gfxdrawrect(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (!gw) return false;
     uint32_t c = 0;
     if (!zr_gfx_parse_color(vm, argv[5], "gfxdrawrect", &c)) return false;
-    zr_fill_rect(gw->buf, gw->w, gw->h,
+    zr_fill_rect(zr_gfx_draw_buf(gw), gw->w, gw->h,
                  (int64_t)argv[1].u.num, (int64_t)argv[2].u.num,
                  (int64_t)argv[3].u.num, (int64_t)argv[4].u.num, c);
     *out = val_nil();
@@ -775,6 +979,7 @@ static bool bi_gfxdrawrects(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         if (!zr_gfx_parse_color(vm, argv[2], "gfxdrawrects", &def_c)) return false;
         has_def_c = true;
     }
+    uint32_t *dst = zr_gfx_draw_buf(gw);
     PbArray *rects = (PbArray *)val_as_obj(argv[1]);
     for (size_t i = 0; i < rects->len; i++) {
         PbValue rv = rects->items[i];
@@ -794,7 +999,7 @@ static bool bi_gfxdrawrects(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
             vm_raise(vm, "gfxdrawrects: rect missing color and no default color given");
             return false;
         }
-        zr_fill_rect(gw->buf, gw->w, gw->h,
+        zr_fill_rect(dst, gw->w, gw->h,
                      (int64_t)vx.u.num, (int64_t)vy.u.num,
                      (int64_t)vw.u.num, (int64_t)vh.u.num, rc);
     }
@@ -806,40 +1011,11 @@ static bool bi_gfxpresent(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 1) { vm_raise(vm, "gfxpresent expects 1 argument"); return false; }
     ZrGfxWin *gw = zr_gfx_get_win(vm, argv[0], "gfxpresent");
     if (!gw) return false;
-    if (gw->headless || !gw->is_open) { *out = val_nil(); return true; }
-
-#if defined(_WIN32)
-    if (gw->hwnd) {
-        HDC hdc = GetDC(gw->hwnd);
-        BITMAPINFO bmi;
-        memset(&bmi, 0, sizeof(bmi));
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = (LONG)gw->w;
-        bmi.bmiHeader.biHeight = -(LONG)gw->h; /* top-down */
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        StretchDIBits(hdc, 0, 0, (int)gw->w, (int)gw->h, 0, 0, (int)gw->w, (int)gw->h,
-                      gw->buf, &bmi, DIB_RGB_COLORS, SRCCOPY);
-        ReleaseDC(gw->hwnd, hdc);
+    if (gw->shield_veiled && gw->crisp_dirty && gw->saved_crisp_buf) {
+        zr_gfx_apply_frosted_blur(gw->saved_crisp_buf, gw->buf, gw->w, gw->h, 14);
+        gw->crisp_dirty = false;
     }
-#else
-    if (gw->xdpy && gw->xwin) {
-        int scr = g_zr_x11.XDefaultScreen(gw->xdpy);
-        void *vis = g_zr_x11.XDefaultVisual(gw->xdpy, scr);
-        int depth = g_zr_x11.XDefaultDepth(gw->xdpy, scr);
-        void *gc = g_zr_x11.XDefaultGC(gw->xdpy, scr);
-        ZrXImage *img = g_zr_x11.XCreateImage(gw->xdpy, vis, (unsigned int)depth, ZR_X_ZPixmap, 0,
-                                              (char *)gw->buf, (unsigned int)gw->w, (unsigned int)gw->h,
-                                              32, (int)(gw->w * 4));
-        if (img) {
-            g_zr_x11.XPutImage(gw->xdpy, gw->xwin, gc, img, 0, 0, 0, 0, (unsigned int)gw->w, (unsigned int)gw->h);
-            img->data = NULL; /* keep gw->buf owned by ZrGfxWin */
-            if (img->f.destroy_image) img->f.destroy_image(img);
-            g_zr_x11.XFlush(gw->xdpy);
-        }
-    }
-#endif
+    zr_gfx_present_surface(gw);
     *out = val_nil();
     return true;
 }
@@ -869,6 +1045,24 @@ static bool bi_gfxpollevents(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 #if defined(_WIN32)
     MSG msg;
     while (PeekMessageA(&msg, gw->hwnd, 0, 0, PM_REMOVE)) {
+        if (gw->capture_shield) {
+            if ((msg.message == WM_KEYDOWN || msg.message == WM_KEYUP ||
+                 msg.message == WM_SYSKEYDOWN || msg.message == WM_SYSKEYUP) &&
+                msg.wParam == 0x2Cu /* VK_SNAPSHOT */) {
+                if (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN || !gw->shield_veiled) {
+                    gw->capture_attempts++;
+                    zr_gfx_engage_blur_veil(gw);
+                }
+                continue;
+            }
+            if ((msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) &&
+                gw->block_print_save && (GetKeyState(VK_CONTROL) & 0x8000) != 0 &&
+                (msg.wParam == 0x50u || msg.wParam == 0x53u)) {
+                gw->capture_attempts++;
+                zr_gfx_engage_blur_veil(gw);
+                continue;
+            }
+        }
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
         if (msg.message == WM_MOUSEMOVE) {
@@ -904,10 +1098,22 @@ static bool bi_gfxpollevents(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
                 PbMap *m = vm_new_map(vm, 2);
                 map_set(m, vm_const_str(vm, "type"), val_obj(vm_const_str(vm, "close")));
                 arr_push(events, val_obj(m));
+            } else if (ev.type == ZR_X_FocusOut) {
+                if (gw->capture_shield && gw->blur_on_unfocus) {
+                    zr_gfx_engage_blur_veil(gw);
+                }
+            } else if (ev.type == ZR_X_FocusIn) {
+                if (gw->shield_veiled) {
+                    zr_gfx_restore_crisp(gw);
+                }
             } else if (ev.type == ZR_X_ConfigureNotify) {
                 size_t nw = ev.xconfigure.width > 0 ? (size_t)ev.xconfigure.width : gw->w;
                 size_t nh = ev.xconfigure.height > 0 ? (size_t)ev.xconfigure.height : gw->h;
                 if ((nw != gw->w || nh != gw->h) && nw <= ZR_MAX_FB_DIM && nh <= ZR_MAX_FB_DIM) {
+                    free(gw->saved_crisp_buf);
+                    gw->saved_crisp_buf = NULL;
+                    gw->shield_veiled = false;
+                    gw->crisp_dirty = false;
                     gw->w = nw; gw->h = nh;
                     gw->buf = (uint32_t *)zr_xrealloc(gw->buf, nw * nh * sizeof(uint32_t));
                     memset(gw->buf, 0, nw * nh * sizeof(uint32_t));
@@ -942,16 +1148,31 @@ static bool bi_gfxpollevents(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
                 }
             } else if (ev.type == ZR_X_KeyPress || ev.type == ZR_X_KeyRelease) {
                 const char *kname = "Unknown";
+                unsigned long ks = 0;
                 if (g_zr_x11.XLookupKeysym && g_zr_x11.XKeysymToString) {
-                    unsigned long ks = g_zr_x11.XLookupKeysym(&ev.xkey, 0);
+                    ks = g_zr_x11.XLookupKeysym(&ev.xkey, 0);
                     char *s = g_zr_x11.XKeysymToString(ks);
                     if (s && s[0]) kname = s;
+                }
+                bool ctrl_held = (ev.xkey.state & 4u) != 0;
+                if (gw->capture_shield) {
+                    bool is_print_key = (ks == 0xFF61UL || ks == 0xFD1DUL ||
+                                         strcmp(kname, "Print") == 0 || strcmp(kname, "Sys_Req") == 0);
+                    bool is_print_save_chord = gw->block_print_save && ctrl_held &&
+                                               (ks == 'p' || ks == 'P' || ks == 's' || ks == 'S');
+                    if (is_print_key || is_print_save_chord) {
+                        if (ev.type == ZR_X_KeyPress) {
+                            gw->capture_attempts++;
+                            zr_gfx_engage_blur_veil(gw);
+                        }
+                        continue;
+                    }
                 }
                 PbMap *m = vm_new_map(vm, 8);
                 map_set(m, vm_const_str(vm, "type"), val_obj(vm_const_str(vm, ev.type == ZR_X_KeyPress ? "keydown" : "keyup")));
                 map_set(m, vm_const_str(vm, "key"), val_obj(vm_new_cstr(vm, kname)));
                 map_set(m, vm_const_str(vm, "shift"), val_bool((ev.xkey.state & 1u) != 0));
-                map_set(m, vm_const_str(vm, "ctrl"), val_bool((ev.xkey.state & 4u) != 0));
+                map_set(m, vm_const_str(vm, "ctrl"), val_bool(ctrl_held));
                 map_set(m, vm_const_str(vm, "alt"), val_bool((ev.xkey.state & 8u) != 0));
                 arr_push(events, val_obj(m));
             }
@@ -1100,6 +1321,7 @@ static bool bi_gfxdrawtextaa(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     double pen_x = (double)base_x;
     size_t glyphs = 0, hits = 0, loads = 0;
 
+    uint32_t *dst_buf = zr_gfx_draw_buf(gw);
     size_t pos = 0;
     while (pos < text->len) {
         size_t uadv = 1;
@@ -1125,7 +1347,7 @@ static bool bi_gfxdrawtextaa(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
                 if (px_c < 0 || px_c >= (int)gw->w) continue;
                 uint8_t cov = ge->alpha[row * ge->w + col];
                 if (cov > 0) {
-                    zr_blend_argb(&gw->buf[(size_t)py * gw->w + (size_t)px_c], color, cov);
+                    zr_blend_argb(&dst_buf[(size_t)py * gw->w + (size_t)px_c], color, cov);
                 }
             }
         }
@@ -1210,6 +1432,198 @@ static bool bi_gfxbackendprofile(PbVM *vm, int argc, PbValue *argv, PbValue *out
     map_set(m, vm_const_str(vm, "resize_events"), val_bool(true));
     map_set(m, vm_const_str(vm, "mouse_xy_events"), val_bool(true));
     map_set(m, vm_const_str(vm, "scroll_events"), val_bool(true));
+    map_set(m, vm_const_str(vm, "capture_shield_supported"), val_bool(true));
+    vm_temp_pop(vm, 1);
+    *out = val_obj(m);
+    return true;
+}
+
+static inline bool zr_gfx_val_truthy(PbValue v) {
+    if (v.tag == VAL_BOOL) return v.u.b;
+    if (v.tag == VAL_NIL) return false;
+    if (v.tag == VAL_NUM) return v.u.num != 0.0;
+    return true;
+}
+
+/* gfx_set_capture_shield(handle, enabled_bool[, opts_map]) */
+static bool bi_gfx_set_capture_shield(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_GFX), "gfx_set_capture_shield", "gfx")) return false;
+    if (argc < 2 || argc > 3) {
+        vm_raise(vm, "gfx_set_capture_shield(handle, enabled[, opts_map]) expects 2 or 3 arguments");
+        return false;
+    }
+    ZrGfxWin *gw = zr_gfx_get_win(vm, argv[0], "gfx_set_capture_shield");
+    if (!gw) return false;
+
+    bool en = zr_gfx_val_truthy(argv[1]);
+    if (en) {
+        bool blur_unfocus = true;
+        bool block_ps = true;
+        if (argc == 3 && argv[2].tag != VAL_NIL) {
+            if (!val_is_obj(argv[2], OBJ_MAP)) {
+                vm_raise(vm, "gfx_set_capture_shield: 3rd argument must be opts map or nil");
+                return false;
+            }
+            PbMap *om = (PbMap *)val_as_obj(argv[2]);
+            PbValue vb, vp;
+            if (map_get_cstr(om, "blur_on_unfocus", &vb) && vb.tag != VAL_NIL) {
+                blur_unfocus = zr_gfx_val_truthy(vb);
+            }
+            if (map_get_cstr(om, "block_print_save", &vp) && vp.tag != VAL_NIL) {
+                block_ps = zr_gfx_val_truthy(vp);
+            }
+        }
+        gw->capture_shield = true;
+        gw->blur_on_unfocus = blur_unfocus;
+        gw->block_print_save = block_ps;
+#if defined(_WIN32)
+        if (gw->hwnd && !gw->headless) {
+            typedef BOOL (WINAPI *ZrSetWinDispAffinityFn)(HWND, DWORD);
+            HMODULE u32 = GetModuleHandleA("user32.dll");
+            ZrSetWinDispAffinityFn pfn = u32
+                ? (ZrSetWinDispAffinityFn)(void *)GetProcAddress(u32, "SetWindowDisplayAffinity")
+                : NULL;
+            if (pfn) {
+                BOOL ok_aff = pfn(gw->hwnd, 0x00000011u /* WDA_EXCLUDEFROMCAPTURE */);
+                if (!ok_aff) ok_aff = pfn(gw->hwnd, 0x00000001u /* WDA_MONITOR */);
+                gw->hw_affinity_active = (ok_aff != 0);
+            }
+        }
+#endif
+    } else {
+        zr_gfx_restore_crisp(gw);
+        gw->capture_shield = false;
+        gw->hw_affinity_active = false;
+#if defined(_WIN32)
+        if (gw->hwnd && !gw->headless) {
+            typedef BOOL (WINAPI *ZrSetWinDispAffinityFn)(HWND, DWORD);
+            HMODULE u32 = GetModuleHandleA("user32.dll");
+            ZrSetWinDispAffinityFn pfn = u32
+                ? (ZrSetWinDispAffinityFn)(void *)GetProcAddress(u32, "SetWindowDisplayAffinity")
+                : NULL;
+            if (pfn) (void)pfn(gw->hwnd, 0x00000000u /* WDA_NONE */);
+        }
+#endif
+    }
+
+    PbMap *m = vm_new_map(vm, 8);
+    vm_temp_push(vm, val_obj(m));
+    map_set(m, vm_const_str(vm, "ok"), val_bool(true));
+    map_set(m, vm_const_str(vm, "capture_shield"), val_bool(gw->capture_shield));
+    map_set(m, vm_const_str(vm, "hw_affinity_active"), val_bool(gw->hw_affinity_active));
+    map_set(m, vm_const_str(vm, "blur_on_unfocus"), val_bool(gw->blur_on_unfocus));
+    map_set(m, vm_const_str(vm, "block_print_save"), val_bool(gw->block_print_save));
+    map_set(m, vm_const_str(vm, "veiled"), val_bool(gw->shield_veiled));
+    map_set(m, vm_const_str(vm, "capture_attempts"), val_num((double)gw->capture_attempts));
+    vm_temp_pop(vm, 1);
+    *out = val_obj(m);
+    return true;
+}
+
+/* gfx_capture_shield_status(handle) */
+static bool bi_gfx_capture_shield_status(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_GFX), "gfx_capture_shield_status", "gfx")) return false;
+    if (argc != 1) {
+        vm_raise(vm, "gfx_capture_shield_status(handle) expects 1 argument");
+        return false;
+    }
+    ZrGfxWin *gw = zr_gfx_get_win(vm, argv[0], "gfx_capture_shield_status");
+    if (!gw) return false;
+
+    uint32_t px = (gw->buf && gw->w > 0 && gw->h > 0)
+        ? gw->buf[(gw->h / 2u) * gw->w + (gw->w / 2u)]
+        : 0u;
+    int r_c = (int)((px >> 16) & 0xFFu);
+    int g_c = (int)((px >> 8) & 0xFFu);
+    int b_c = (int)(px & 0xFFu);
+
+    uint8_t digest[32];
+    size_t fb_bytes = gw->w * gw->h * sizeof(uint32_t);
+    zr_sha256((const uint8_t *)gw->buf, gw->buf ? fb_bytes : 0u, digest);
+    static const char hex_lut[] = "0123456789abcdef";
+    char sha_hex[65];
+    for (int i = 0; i < 32; i++) {
+        sha_hex[i * 2]     = hex_lut[(digest[i] >> 4) & 0x0Fu];
+        sha_hex[i * 2 + 1] = hex_lut[digest[i] & 0x0Fu];
+    }
+    sha_hex[64] = '\0';
+
+    PbArray *rgb1 = vm_new_array(vm, 3);
+    vm_temp_push(vm, val_obj(rgb1));
+    arr_push(rgb1, val_num((double)r_c));
+    arr_push(rgb1, val_num((double)g_c));
+    arr_push(rgb1, val_num((double)b_c));
+
+    PbArray *rgb2 = vm_new_array(vm, 3);
+    vm_temp_push(vm, val_obj(rgb2));
+    arr_push(rgb2, val_num((double)r_c));
+    arr_push(rgb2, val_num((double)g_c));
+    arr_push(rgb2, val_num((double)b_c));
+
+    PbMap *m = vm_new_map(vm, 12);
+    vm_temp_push(vm, val_obj(m));
+    map_set(m, vm_const_str(vm, "ok"), val_bool(true));
+    map_set(m, vm_const_str(vm, "capture_shield"), val_bool(gw->capture_shield));
+    map_set(m, vm_const_str(vm, "hw_affinity_active"), val_bool(gw->hw_affinity_active));
+    map_set(m, vm_const_str(vm, "blur_on_unfocus"), val_bool(gw->blur_on_unfocus));
+    map_set(m, vm_const_str(vm, "block_print_save"), val_bool(gw->block_print_save));
+    map_set(m, vm_const_str(vm, "veiled"), val_bool(gw->shield_veiled));
+    map_set(m, vm_const_str(vm, "capture_attempts"), val_num((double)gw->capture_attempts));
+    map_set(m, vm_const_str(vm, "sample_rgb"), val_obj(rgb1));
+    map_set(m, vm_const_str(vm, "center_rgb"), val_obj(rgb2));
+    map_set(m, vm_const_str(vm, "frame_sha256"), val_obj(vm_new_cstr(vm, sha_hex)));
+    vm_temp_pop(vm, 3);
+    *out = val_obj(m);
+    return true;
+}
+
+/* gfx_simulate_capture_event(handle, event_str) */
+static bool bi_gfx_simulate_capture_event(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_GFX), "gfx_simulate_capture_event", "gfx")) return false;
+    if (argc != 2 || !val_is_obj(argv[1], OBJ_STR)) {
+        vm_raise(vm, "gfx_simulate_capture_event(handle, event_str) expects (handle, string)");
+        return false;
+    }
+    ZrGfxWin *gw = zr_gfx_get_win(vm, argv[0], "gfx_simulate_capture_event");
+    if (!gw) return false;
+
+    const char *ev = ((PbStr *)val_as_obj(argv[1]))->chars;
+    bool blocked = false;
+
+    if (strcmp(ev, "printscreen") == 0) {
+        if (gw->capture_shield) {
+            gw->capture_attempts++;
+            zr_gfx_engage_blur_veil(gw);
+            blocked = true;
+        }
+    } else if (strcmp(ev, "focus_out") == 0) {
+        if (gw->capture_shield && gw->blur_on_unfocus) {
+            zr_gfx_engage_blur_veil(gw);
+            blocked = true;
+        }
+    } else if (strcmp(ev, "focus_in") == 0) {
+        if (gw->shield_veiled) {
+            zr_gfx_restore_crisp(gw);
+        }
+        blocked = false;
+    } else if (strcmp(ev, "ctrl_p") == 0 || strcmp(ev, "ctrl_s") == 0) {
+        if (gw->capture_shield && gw->block_print_save) {
+            gw->capture_attempts++;
+            zr_gfx_engage_blur_veil(gw);
+            blocked = true;
+        }
+    } else {
+        vm_raise(vm, "gfx_simulate_capture_event: unknown event '%s' (expected printscreen, focus_out, focus_in, ctrl_p, ctrl_s)", ev);
+        return false;
+    }
+
+    PbMap *m = vm_new_map(vm, 8);
+    vm_temp_push(vm, val_obj(m));
+    map_set(m, vm_const_str(vm, "ok"), val_bool(true));
+    map_set(m, vm_const_str(vm, "event"), val_obj(vm_new_cstr(vm, ev)));
+    map_set(m, vm_const_str(vm, "veiled"), val_bool(gw->shield_veiled));
+    map_set(m, vm_const_str(vm, "blocked"), val_bool(blocked));
+    map_set(m, vm_const_str(vm, "capture_attempts"), val_num((double)gw->capture_attempts));
     vm_temp_pop(vm, 1);
     *out = val_obj(m);
     return true;

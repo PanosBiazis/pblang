@@ -1,4 +1,4 @@
-// PBLang VS Code Extension v4.0.0
+// PBLang VS Code Extension v4.1.0
 // Connects VS Code to `pblang lsp` (JSON-RPC 2.0 LSP 3.17) with rich SI/Currency dimensional
 // hover cards, Tarski CAD / Presburger contract verification badges, Levenshtein quick-fix
 // code actions, and canonical `.sapp` document formatting.

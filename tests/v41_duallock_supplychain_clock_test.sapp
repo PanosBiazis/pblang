@@ -1,0 +1,717 @@
+// tests/v41_duallock_supplychain_clock_test.sapp — Comprehensive Verification Suite
+// for `stdlib/security/duallock_anti_supplychain.sapp` (PBLang v4.1.0).
+//
+// Zero network sockets opened, zero telemetry, zero host/user PII paths.
+
+let DL = import("stdlib:security/duallock_anti_supplychain.sapp");
+
+let assertions = 0;
+
+fn check(cond, msg) {
+    if not cond {
+        throw "DUALLOCK_SUPPLYCHAIN_CLOCK_TEST_FAIL [" + str(assertions + 1) + "]: " + str(msg);
+    }
+    assertions = assertions + 1;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 1. Core RFC 8032 Ed25519 & RFC 8439 ChaCha20-Poly1305 Test Vectors
+// ══════════════════════════════════════════════════════════════════════════════
+
+let rfc_kp = DL.ed25519_keygen("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+check(rfc_kp.pk_hex == "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "RFC 8032 Vector #1 public key");
+let rfc_sig = DL.ed25519_sign_msg(rfc_kp.sk_hex, "");
+check(rfc_sig == "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b", "RFC 8032 Vector #1 signature");
+check(DL.ed25519_verify_msg(rfc_kp.pk_hex, "", rfc_sig), "RFC 8032 Vector #1 verify passes");
+check(not DL.ed25519_verify_msg(rfc_kp.pk_hex, "tamper", rfc_sig), "RFC 8032 rejects tampered message");
+
+let aead_key_hex = "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f";
+let aead_nonce_hex = "070000004041424344454647";
+let aead_pt = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+let aead_aad = bytes_to_str([80, 81, 82, 83, 192, 193, 194, 195, 196, 197, 198, 199]);
+let aead_enc = DL.chacha20_poly1305_encrypt(aead_key_hex, aead_nonce_hex, aead_pt, aead_aad);
+check(aead_enc.tag_hex == "1ae10b594f09e26a7e902ecbd0600691", "RFC 8439 §2.8.2 Poly1305 tag exact match");
+let aead_dec = DL.chacha20_poly1305_decrypt(aead_key_hex, aead_nonce_hex, aead_enc.ciphertext_bytes, aead_enc.tag_hex, aead_aad);
+check(aead_dec.ok and aead_dec.plaintext_str == aead_pt, "RFC 8439 §2.8.2 ChaCha20-Poly1305 roundtrip");
+let aead_bad = DL.chacha20_poly1305_decrypt(aead_key_hex, aead_nonce_hex, aead_enc.ciphertext_bytes, aead_enc.tag_hex, "wrong-aad");
+check(not aead_bad.ok and aead_bad.plaintext_str == nil, "RFC 8439 ChaCha20-Poly1305 rejects tampered AAD");
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 2. Pillar 1 — Dual-Lock ("Διπλό Κλείδωμα") Protocol (`PBDL1.` & `PBDL1_CONT.`)
+// ══════════════════════════════════════════════════════════════════════════════
+
+let auth = DL.create_duallock_authority();
+check(len(auth.owner_ed25519_pk) == 64 and len(auth.owner_ed25519_sk) == 64, "authority Ed25519 key lengths");
+check(len(auth.transport_aead_key_hex) == 64 and len(auth.hmac_pepper_hex) == 64, "authority symmetric & pepper key lengths");
+check(auth.owner_ed25519_pk != auth.owner_ed25519_sk and auth.transport_aead_key_hex != auth.hmac_pepper_hex, "authority keys are distinct");
+
+let seat_alpha = DL.blind_seat_commitment("studio-pro", "synthetic-hw-seed-001");
+let seat_beta = DL.blind_seat_commitment("studio-pro", "synthetic-hw-seed-002");
+check(str_starts_with(seat_alpha, "seat_") and seat_alpha != seat_beta, "blinded seat commitments are distinct and non-PII");
+
+let t0 = 1765000000;
+let req1 = DL.build_duallock_challenge_request("studio-pro", "desktop", seat_alpha, auth.transport_aead_key_hex, map{
+    client_local_unix: t0
+});
+let req2 = DL.build_duallock_challenge_request("studio-pro", "desktop", seat_alpha, auth.transport_aead_key_hex, map{
+    client_local_unix: t0
+});
+check(str_starts_with(req1.request_envelope, "PBDL1."), "challenge request uses PBDL1. AEAD envelope");
+check(len(req1.expected_client_nonce) == 64 and req1.expected_client_nonce != req2.expected_client_nonce, "fresh 256-bit CSPRNG client_nonce per challenge");
+check(not str_contains(req1.request_envelope, "studio-pro") and not str_contains(req1.request_envelope, "desktop"), "zero cleartext product/edition metadata on wire");
+check(not str_contains(req1.request_envelope, seat_alpha) and not str_contains(req1.request_envelope, req1.expected_client_nonce), "zero cleartext seat_id or nonce on wire");
+
+// Reject unblinded PII in challenge builder
+let pii_rejected = try (DL.build_duallock_challenge_request("studio-pro", "desktop", "alice" + "@" + "example.invalid", auth.transport_aead_key_hex) == nil) catch true;
+check(pii_rejected, "challenge builder rejects unblinded email/PII seat strings");
+
+// 2a. Normal Challenge-Response Roundtrip
+let srv_state = DL.create_default_duallock_server_state(t0, 30);
+let lease1 = DL.evaluate_and_sign_duallock_lease(srv_state, req1.request_envelope, auth, t0 + 5);
+check(lease1.ok and str_starts_with(lease1.response_envelope, "PBDL1."), "server evaluates and AEAD-seals normal lease");
+check(not str_contains(lease1.response_envelope, "NORMAL") and not str_contains(lease1.response_envelope, "studio-pro"), "response envelope leaks zero cleartext metadata");
+
+let ver1 = DL.verify_duallock_lease_response(
+    lease1.response_envelope,
+    req1.expected_client_nonce,
+    "studio-pro",
+    "desktop",
+    auth.owner_ed25519_pk,
+    auth.hmac_pepper_hex,
+    auth.transport_aead_key_hex
+);
+check(ver1.ok and ver1.allowed_to_execute and not ver1.read_only_mode, "NORMAL lease verified and execution allowed");
+check(ver1.isolation_mode == "NORMAL" and ver1.server_utc_unix == t0 + 5, "NORMAL lease carries authoritative server UTC");
+check(ver1.lease_expires_unix == t0 + 3605 and ver1.feature_unlock_mask == 65535, "NORMAL lease TTL and feature mask intact");
+
+// 2b. HTTP / mitmproxy Replay Attack with Old `client_nonce` -> 100% Rejected
+let replay_ver = DL.verify_duallock_lease_response(
+    lease1.response_envelope,
+    req2.expected_client_nonce,
+    "studio-pro",
+    "desktop",
+    auth.owner_ed25519_pk,
+    auth.hmac_pepper_hex,
+    auth.transport_aead_key_hex
+);
+check(not replay_ver.ok and not replay_ver.allowed_to_execute, "HTTP replay of old lease against new nonce fails");
+check(replay_ver.error_code == "DUALLOCK_NONCE_REPLAY_DETECTED", "replay failure sets DUALLOCK_NONCE_REPLAY_DETECTED");
+
+// 2c. Cross-Edition Replay (`desktop` lease replayed into `web` edition) -> Rejected
+let cross_ed_ver = DL.verify_duallock_lease_response(
+    lease1.response_envelope,
+    req1.expected_client_nonce,
+    "studio-pro",
+    "web",
+    auth.owner_ed25519_pk,
+    auth.hmac_pepper_hex,
+    auth.transport_aead_key_hex
+);
+check(not cross_ed_ver.ok and cross_ed_ver.error_code == "DUALLOCK_EDITION_ISOLATION_MISMATCH", "cross-edition lease replay rejected");
+
+// 2d. Dual-Signature Verification (Wrong HMAC pepper OR Wrong Ed25519 PK rejected)
+let other_auth = DL.create_duallock_authority();
+let bad_pepper_ver = DL.verify_duallock_lease_response(
+    lease1.response_envelope,
+    req1.expected_client_nonce,
+    "studio-pro",
+    "desktop",
+    auth.owner_ed25519_pk,
+    other_auth.hmac_pepper_hex,
+    auth.transport_aead_key_hex
+);
+check(not bad_pepper_ver.ok and bad_pepper_ver.error_code == "DUALLOCK_DUAL_SIGNATURE_INVALID", "wrong HMAC pepper rejected despite valid Ed25519 signature");
+
+let bad_ed_ver = DL.verify_duallock_lease_response(
+    lease1.response_envelope,
+    req1.expected_client_nonce,
+    "studio-pro",
+    "desktop",
+    other_auth.owner_ed25519_pk,
+    auth.hmac_pepper_hex,
+    auth.transport_aead_key_hex
+);
+check(not bad_ed_ver.ok and bad_ed_ver.error_code == "DUALLOCK_DUAL_SIGNATURE_INVALID", "wrong Ed25519 public key rejected despite valid HMAC");
+
+// 2e. Safeguard B — Dead-Man Switch Auto-Arms After 30 Days of Owner Inactivity
+let dm_state = DL.create_default_duallock_server_state(t0, 30);
+let req_day29 = DL.build_duallock_challenge_request("studio-pro", "desktop", seat_alpha, auth.transport_aead_key_hex);
+let lease_day29 = DL.evaluate_and_sign_duallock_lease(dm_state, req_day29.request_envelope, auth, t0 + 29 * 86400);
+check(lease_day29.isolation_mode == "NORMAL" and not lease_day29.dead_man_triggered, "dead-man switch remains NORMAL at day 29");
+
+let req_day31 = DL.build_duallock_challenge_request("studio-pro", "desktop", seat_alpha, auth.transport_aead_key_hex);
+let lease_day31 = DL.evaluate_and_sign_duallock_lease(dm_state, req_day31.request_envelope, auth, t0 + 30 * 86400 + 1);
+check(lease_day31.isolation_mode == "SECOND_LOCK_REQUIRED" and lease_day31.dead_man_triggered and lease_day31.dual_lock_armed, "dead-man switch auto-arms SECOND_LOCK_REQUIRED after 30 days");
+let ver_day31 = DL.verify_duallock_lease_response(
+    lease_day31.response_envelope,
+    req_day31.expected_client_nonce,
+    "studio-pro",
+    "desktop",
+    auth.owner_ed25519_pk,
+    auth.hmac_pepper_hex,
+    auth.transport_aead_key_hex
+);
+check(ver_day31.ok and ver_day31.isolation_mode == "SECOND_LOCK_REQUIRED" and not ver_day31.allowed_to_execute, "client enforces auto-armed dead-man SECOND_LOCK_REQUIRED");
+
+// 2f. Safeguard A — Seat Revocation, Edition Revocation & Manual Sovereign Arm
+let rev_state = DL.create_default_duallock_server_state(t0, 30);
+rev_state["revoked_seats"] = [seat_beta];
+rev_state["revoked_editions"] = ["preview"];
+
+let req_rev_seat = DL.build_duallock_challenge_request("studio-pro", "desktop", seat_beta, auth.transport_aead_key_hex);
+let lease_rev_seat = DL.evaluate_and_sign_duallock_lease(rev_state, req_rev_seat.request_envelope, auth, t0 + 10);
+check(lease_rev_seat.revoked and lease_rev_seat.isolation_mode == "FULL_KILL_SWITCH", "revoked seat triggers FULL_KILL_SWITCH");
+
+let req_ok_seat = DL.build_duallock_challenge_request("studio-pro", "desktop", seat_alpha, auth.transport_aead_key_hex);
+let lease_ok_seat = DL.evaluate_and_sign_duallock_lease(rev_state, req_ok_seat.request_envelope, auth, t0 + 10);
+check(not lease_ok_seat.revoked and lease_ok_seat.isolation_mode == "NORMAL", "unrevoked seat continues normally alongside revoked seat");
+
+let req_rev_ed = DL.build_duallock_challenge_request("studio-pro", "preview", seat_alpha, auth.transport_aead_key_hex);
+let lease_rev_ed = DL.evaluate_and_sign_duallock_lease(rev_state, req_rev_ed.request_envelope, auth, t0 + 10);
+check(lease_rev_ed.revoked and lease_rev_ed.isolation_mode == "FULL_KILL_SWITCH", "revoked edition triggers FULL_KILL_SWITCH");
+
+// 2g. Safeguard D — READ_ONLY_FREEZE Mode
+let ro_state = DL.create_default_duallock_server_state(t0, 30);
+ro_state["isolation_mode"] = "READ_ONLY_FREEZE";
+let req_ro = DL.build_duallock_challenge_request("studio-pro", "desktop", seat_alpha, auth.transport_aead_key_hex);
+let lease_ro = DL.evaluate_and_sign_duallock_lease(ro_state, req_ro.request_envelope, auth, t0 + 20);
+let ver_ro = DL.verify_duallock_lease_response(
+    lease_ro.response_envelope,
+    req_ro.expected_client_nonce,
+    "studio-pro",
+    "desktop",
+    auth.owner_ed25519_pk,
+    auth.hmac_pepper_hex,
+    auth.transport_aead_key_hex
+);
+check(ver_ro.ok and ver_ro.allowed_to_execute and ver_ro.read_only_mode and ver_ro.feature_unlock_mask == 1, "READ_ONLY_FREEZE permits read-only execution with mask=1");
+
+// 2h. Safeguard C — Canary Tamper Tripwire (`BULK_EXPORT`, `BYPASS_PRIMARY_LOCK`, `DISABLE_AUDIT`, `REDIRECT_ORIGIN`)
+let canary_state = DL.create_default_duallock_server_state(t0, 30);
+let req_canary = DL.build_duallock_challenge_request("studio-pro", "desktop", seat_alpha, auth.transport_aead_key_hex, "BYPASS_PRIMARY_LOCK");
+let lease_canary = DL.evaluate_and_sign_duallock_lease(canary_state, req_canary.request_envelope, auth, t0 + 30);
+check(lease_canary.canary_tripped and lease_canary.isolation_mode == "FULL_KILL_SWITCH" and lease_canary.feature_unlock_mask == 0, "canary forbidden action trips instant FULL_KILL_SWITCH");
+check(canary_state.canary_tripped == true and canary_state.isolation_mode == "FULL_KILL_SWITCH", "canary tripwire latches sticky FULL_KILL_SWITCH on server_state");
+
+let ver_canary = DL.verify_duallock_lease_response(
+    lease_canary.response_envelope,
+    req_canary.expected_client_nonce,
+    "studio-pro",
+    "desktop",
+    auth.owner_ed25519_pk,
+    auth.hmac_pepper_hex,
+    auth.transport_aead_key_hex
+);
+check(ver_canary.ok and ver_canary.isolation_mode == "FULL_KILL_SWITCH" and not ver_canary.allowed_to_execute, "client enforces canary FULL_KILL_SWITCH");
+
+// 2i. Offline Autonomous Continuity Bundle (`PBDL1_CONT.`) — 72-Hour Laptop-Closed Continuity
+let cont_bundle = DL.issue_autonomous_continuity_bundle(auth, map{
+    product_id: "studio-pro",
+    edition: "desktop",
+    blinded_seat_id: seat_alpha,
+    issued_unix: t0,
+    continuity_hours: 72
+});
+check(str_starts_with(cont_bundle, "PBDL1_CONT."), "continuity bundle uses PBDL1_CONT. prefix");
+
+let cont_48h = DL.verify_autonomous_continuity_bundle(
+    cont_bundle, "studio-pro", "desktop", seat_alpha, auth.owner_ed25519_pk, auth.hmac_pepper_hex, t0 + 48 * 3600
+);
+check(cont_48h.ok and cont_48h.allowed_to_execute and cont_48h.remaining_sec == 24 * 3600, "72h continuity bundle valid offline at +48h");
+
+let cont_73h = DL.verify_autonomous_continuity_bundle(
+    cont_bundle, "studio-pro", "desktop", seat_alpha, auth.owner_ed25519_pk, auth.hmac_pepper_hex, t0 + 73 * 3600
+);
+check(not cont_73h.ok and not cont_73h.allowed_to_execute and cont_73h.error_code == "CONTINUITY_BUNDLE_EXPIRED", "72h continuity bundle expires cleanly at +73h");
+
+let cont_wrong_ed = DL.verify_autonomous_continuity_bundle(
+    cont_bundle, "studio-pro", "enterprise", seat_alpha, auth.owner_ed25519_pk, auth.hmac_pepper_hex, t0 + 3600
+);
+check(not cont_wrong_ed.ok and cont_wrong_ed.error_code == "CONTINUITY_EDITION_MISMATCH", "continuity bundle rejects cross-edition reuse");
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 3. Pillar 2 — Triple-Anchored Anti-Clock-Tamper Engine (`Tamper-Proof Time`)
+// ══════════════════════════════════════════════════════════════════════════════
+
+let ratchet_key = csprng_hex(32);
+let mono0 = 5000000.0;
+let r1 = DL.init_clock_ratchet(t0, ratchet_key, mono0);
+check(r1.seq == 1 and r1.high_water_unix == t0 and len(r1.mac_hex) == 64, "initial clock ratchet signed at seq=1");
+
+// Normal forward clock advance (+60s wall, +60000ms monotonic)
+let step_ok = DL.verify_and_advance_clock(r1, t0 + 60, mono0 + 60000.0, nil, ratchet_key, 120);
+check(step_ok.ok and step_ok.seq == 2 and step_ok.ratchet_state.seq == 2, "normal forward clock advances seq to 2");
+check(step_ok.effective_time == t0 + 60 and not step_ok.local_clock_tampered, "normal forward clock reports untampered effective_time");
+let r2 = step_ok.ratchet_state;
+
+// Defense 1: Tampered Disk Ratchet MAC Caught
+let forged_disk_ratchet = map{
+    seq: r2.seq,
+    high_water_unix: r2.high_water_unix - 86400,
+    anchor_mono_ms: r2.anchor_mono_ms,
+    anchor_wall_unix: r2.anchor_wall_unix,
+    mac_hex: r2.mac_hex
+};
+let mac_tamper_res = DL.verify_and_advance_clock(forged_disk_ratchet, t0 + 120, mono0 + 120000.0, nil, ratchet_key, 120);
+check(not mac_tamper_res.ok and mac_tamper_res.error_code == "CLOCK_RATCHET_MAC_TAMPERED", "edited high_water_unix on disk caught via HMAC-SHA256");
+
+// Defense 2: Wall-Clock Rollback Below High-Water Caught (including across machine reboot)
+let rollback_res = DL.verify_and_advance_clock(r2, t0 - 3600, 15000.0, nil, ratchet_key, 120);
+check(not rollback_res.ok and rollback_res.error_code == "CLOCK_ROLLBACK_BELOW_HIGH_WATER", "wall-clock rollback below high_water_unix caught");
+
+// Defense 3: Monotonic Uptime vs Wall-Clock Freeze/Drift Caught
+// Process stays alive +600s (mono0 + 660000ms), while attacker freezes OS wall clock at t0 + 60!
+let freeze_res = DL.verify_and_advance_clock(r2, t0 + 60, mono0 + 660000.0, nil, ratchet_key, 120);
+check(not freeze_res.ok and freeze_res.error_code == "CLOCK_TAMPER_MONOTONIC_DRIFT", "frozen OS clock caught by monotonic-vs-wall drift detector");
+
+// Defense 4: Server Authoritative Signed UTC Overrides Year-2020 Tampered Local Clock
+let year_2020_unix = 1577836800;
+let real_server_utc = t0 + 7200;
+let srv_override_res = DL.verify_and_advance_clock(r2, year_2020_unix, mono0 + 180000.0, real_server_utc, ratchet_key, 120);
+check(srv_override_res.ok and srv_override_res.effective_time == real_server_utc, "server signed UTC overrides year-2020 tampered local OS clock");
+check(srv_override_res.local_clock_tampered == true and srv_override_res.ratchet_state.high_water_unix == real_server_utc, "year-2020 local clock flagged as tampered and high_water ratcheted to server UTC");
+
+// 1-Call Sovereign Gate: Year-2020 local clock CANNOT revive an expired continuity bundle once ratcheted!
+let gate_expired = DL.enforce_sovereign_duallock_gate(map{
+    primary_license_ok: true,
+    require_second_lock: true,
+    product_id: "studio-pro",
+    edition: "desktop",
+    blinded_seat_id: seat_alpha,
+    owner_ed25519_pk: auth.owner_ed25519_pk,
+    hmac_pepper_hex: auth.hmac_pepper_hex,
+    ratchet_state: srv_override_res.ratchet_state,
+    ratchet_hmac_key_hex: ratchet_key,
+    current_wall_unix: year_2020_unix,
+    current_mono_ms: mono0 + 190000.0,
+    continuity_bundle: cont_bundle
+});
+check(not gate_expired.ok and gate_expired.error_code == "CLOCK_ROLLBACK_BELOW_HIGH_WATER", "gate blocks year-2020 rollback offline using ratcheted high-water floor");
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 4. Pillar 3 — Simulated Full GitHub Compromise & Supply-Chain Attack
+// ══════════════════════════════════════════════════════════════════════════════
+
+let sc_keys = DL.generate_supplychain_keys();
+let server_identity = DL.ed25519_keygen();
+let spki_pin_sha256 = sha256("pinned-tls-spki-der-material-v1");
+
+check(len(sc_keys.cold_root.pk) == 64 and len(sc_keys.ci_builder.pk) == 64, "supply-chain cold_root and ci_builder keys generated");
+check(sc_keys.cold_root.pk != sc_keys.ci_builder.pk and sc_keys.cold_root.sk != sc_keys.ci_builder.sk, "cold_root and ci_builder keys are cryptographically separate");
+
+// Legitimate Air-Gapped `cold_root` signs pinned endpoint manifest for `enterprise` edition
+let legit_manifest = DL.sign_pinned_endpoint_manifest(sc_keys.cold_root.sk, map{
+    product_id: "studio-pro",
+    edition: "enterprise",
+    manifest_seq: 5,
+    allowed_origins: [
+        map{
+            url: "https://control.sovereign-app.example/v1",
+            host: "control.sovereign-app.example",
+            port: 443,
+            pinned_server_pk_hex: server_identity.pk_hex,
+            tls_spki_sha256: spki_pin_sha256
+        }
+    ],
+    expires_unix: t0 + 86400 * 90
+});
+check(str_starts_with(legit_manifest, "PBORIGIN1."), "cold-root manifest uses PBORIGIN1. token format");
+
+// Legitimate outbound connection check -> Authorized
+let auth_legit = DL.authorize_outbound_server_url(
+    "https://control.sovereign-app.example/v1/lease",
+    server_identity.pk_hex,
+    legit_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    5,
+    t0 + 100,
+    spki_pin_sha256
+);
+check(auth_legit.ok and not auth_legit.blocked_before_connect and auth_legit.matched_host == "control.sovereign-app.example", "legitimate cold-root pinned origin authorized");
+
+// ATTACK 1: Attacker compromises GitHub, steals `ci_builder.sk`, signs forged manifest
+// redirecting deployed clients to `https://evil-attacker.example/api`!
+let attacker_srv = DL.ed25519_keygen();
+let github_attacker_manifest = DL.sign_pinned_endpoint_manifest(sc_keys.ci_builder.sk, map{
+    product_id: "studio-pro",
+    edition: "enterprise",
+    manifest_seq: 99,
+    allowed_origins: [
+        map{
+            url: "https://evil-attacker.example/api",
+            host: "evil-attacker.example",
+            port: 443,
+            pinned_server_pk_hex: attacker_srv.pk_hex,
+            tls_spki_sha256: sha256("attacker-spki")
+        }
+    ],
+    expires_unix: t0 + 86400 * 365
+});
+
+let atk1_forged_manifest = DL.authorize_outbound_server_url(
+    "https://evil-attacker.example/api",
+    attacker_srv.pk_hex,
+    github_attacker_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    5,
+    t0 + 100
+);
+check(not atk1_forged_manifest.ok and atk1_forged_manifest.blocked_before_connect == true, "GitHub-compromised CI-signed manifest blocked before connect");
+check(atk1_forged_manifest.reason == "SUPPLY_CHAIN_UNTRUSTED_ENDPOINT_BLOCKED" and atk1_forged_manifest.bytes_sent_on_wire == 0, "0 bytes leave client toward attacker server on forged manifest");
+
+// Attacker also tries redirecting config URL directly while keeping legitimate manifest
+let atk1_config_redirect = DL.authorize_outbound_server_url(
+    "https://evil-attacker.example/api",
+    server_identity.pk_hex,
+    legit_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    5,
+    t0 + 100
+);
+check(not atk1_config_redirect.ok and atk1_config_redirect.blocked_before_connect == true, "config URL redirect to evil-attacker.example blocked before connect");
+
+// ATTACK 2: URL Userinfo `@` Parser Confusion (`https://legit.example@evil-attacker.example/api`)
+let atk2_url_confusion = DL.authorize_outbound_server_url(
+    "https://control.sovereign-app.example" + "@" + "evil-attacker.example/v1/lease",
+    server_identity.pk_hex,
+    legit_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    5,
+    t0 + 100
+);
+check(not atk2_url_confusion.ok and atk2_url_confusion.blocked_before_connect == true, "URL userinfo @ parser confusion blocked before connect");
+check(atk2_url_confusion.detail_code == "URL_USERINFO_OR_PERCENT_CONFUSION_BLOCKED", "URL confusion explicitly caught by authority @ blocker");
+
+// ATTACK 3: Cross-Edition Manifest Replay (`web` manifest replayed onto `enterprise` binary)
+let web_manifest = DL.sign_pinned_endpoint_manifest(sc_keys.cold_root.sk, map{
+    product_id: "studio-pro",
+    edition: "web",
+    manifest_seq: 10,
+    allowed_origins: [
+        map{
+            url: "https://web-telemetry-free.sovereign-app.example/v1",
+            host: "web-telemetry-free.sovereign-app.example",
+            port: 443,
+            pinned_server_pk_hex: server_identity.pk_hex,
+            tls_spki_sha256: spki_pin_sha256
+        }
+    ],
+    expires_unix: t0 + 86400 * 30
+});
+let atk3_cross_edition = DL.authorize_outbound_server_url(
+    "https://web-telemetry-free.sovereign-app.example/v1/lease",
+    server_identity.pk_hex,
+    web_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    5,
+    t0 + 100
+);
+check(not atk3_cross_edition.ok and atk3_cross_edition.blocked_before_connect == true, "cross-edition manifest replay (web -> enterprise) blocked before connect");
+check(atk3_cross_edition.detail_code == "MANIFEST_CROSS_EDITION_ISOLATION_MISMATCH", "cross-edition isolation reason verified");
+
+// Additional Pre-Connect Hardening: Downgrade `manifest_seq`, HTTP cleartext, SSRF private IP, wrong SPKI
+let atk_downgrade = DL.authorize_outbound_server_url(
+    "https://control.sovereign-app.example/v1/lease",
+    server_identity.pk_hex,
+    legit_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    6,
+    t0 + 100
+);
+check(not atk_downgrade.ok and atk_downgrade.blocked_before_connect and atk_downgrade.detail_code == "MANIFEST_SEQ_DOWNGRADE_REJECTED", "manifest_seq downgrade rejected");
+
+let atk_http = DL.authorize_outbound_server_url(
+    "http://control.sovereign-app.example/v1/lease",
+    server_identity.pk_hex,
+    legit_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    5,
+    t0 + 100
+);
+check(not atk_http.ok and atk_http.blocked_before_connect and atk_http.detail_code == "HTTPS_SCHEME_REQUIRED", "cleartext http:// scheme blocked");
+
+let rfc1918_url = "https://" + "10" + "." + "0" + "." + "0" + "." + "5" + "/v1/lease";
+let atk_ssrf = DL.authorize_outbound_server_url(
+    rfc1918_url,
+    server_identity.pk_hex,
+    legit_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    5,
+    t0 + 100
+);
+check(not atk_ssrf.ok and atk_ssrf.blocked_before_connect and atk_ssrf.detail_code == "URL_PRIVATE_IP_OR_SSRF_BLOCKED", "private IPv4 SSRF target blocked before connect");
+
+let atk_spki = DL.authorize_outbound_server_url(
+    "https://control.sovereign-app.example/v1/lease",
+    server_identity.pk_hex,
+    legit_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    5,
+    t0 + 100,
+    sha256("mitm-substituted-tls-spki")
+);
+check(not atk_spki.ok and atk_spki.blocked_before_connect and atk_spki.detail_code == "TLS_SPKI_PIN_MISMATCH", "MITM substituted TLS SPKI pin blocked before connect");
+
+// ATTACK 4: 2-of-2 Threshold Release Guard (`ci_builder` + Air-Gapped `cold_root`)
+let legit_binary = "PBLANG_RELEASE_IMAGE_V4_1_0_CLEAN_ARTIFACT";
+let trojan_binary = "PBLANG_RELEASE_IMAGE_V4_1_0_BACKDOORED_BY_CI_ATTACKER";
+
+// Attacker steals `ci_builder.sk` from GitHub Actions and signs trojanized binary without `cold_root.sk`!
+let trojan_ci_only_cert = DL.build_ci_only_untrusted_release_cert(
+    trojan_binary,
+    "studio-pro",
+    "enterprise",
+    410,
+    sc_keys.ci_builder.sk
+);
+let trojan_ver = DL.verify_release_2of2(
+    trojan_binary,
+    trojan_ci_only_cert,
+    sc_keys.ci_builder.pk,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    400
+);
+check(not trojan_ver.ok and not trojan_ver.threshold_2of2_satisfied, "trojanized binary signed with stolen ci_builder_sk ONLY is 100% REJECTED");
+check(trojan_ver.ci_builder_sig_valid == true and trojan_ver.cold_root_sig_valid == false, "verifier pinpoints valid CI sig but missing air-gapped cold_root sig");
+check(trojan_ver.error_code == "RELEASE_MISSING_VALID_COLD_ROOT_SIGNATURE", "exact error_code for stolen-CI release forgery");
+
+// Legitimate 2-of-2 Release Signing (`ci_builder.sk` + offline `cold_root.sk`) -> PASSES!
+let legit_cert = DL.sign_release_2of2(
+    legit_binary,
+    "studio-pro",
+    "enterprise",
+    410,
+    sc_keys.ci_builder.sk,
+    sc_keys.cold_root.sk
+);
+check(str_starts_with(legit_cert, "PBREL2OF2."), "2-of-2 release cert uses PBREL2OF2. prefix");
+
+let legit_rel_ver = DL.verify_release_2of2(
+    legit_binary,
+    legit_cert,
+    sc_keys.ci_builder.pk,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    410
+);
+check(legit_rel_ver.ok and legit_rel_ver.threshold_2of2_satisfied and legit_rel_ver.version_seq == 410, "legitimate 2-of-2 release (ci_builder + cold_root) PASSES");
+
+// Tampered binary bytes against legitimate 2-of-2 cert -> REJECTED
+let tampered_bin_ver = DL.verify_release_2of2(
+    trojan_binary,
+    legit_cert,
+    sc_keys.ci_builder.pk,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    410
+);
+check(not tampered_bin_ver.ok and tampered_bin_ver.error_code == "RELEASE_BINARY_SHA256_MISMATCH", "1-byte binary substitution against valid 2-of-2 cert rejected");
+
+// Anti-rollback `version_seq` check -> REJECTED
+let rollback_rel_ver = DL.verify_release_2of2(
+    legit_binary,
+    legit_cert,
+    sc_keys.ci_builder.pk,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    411
+);
+check(not rollback_rel_ver.ok and rollback_rel_ver.error_code == "RELEASE_VERSION_ROLLBACK_REJECTED", "downgrade/rollback to older version_seq rejected");
+
+// Cross-edition release replay (`enterprise` cert presented to `desktop` updater) -> REJECTED
+let cross_ed_rel_ver = DL.verify_release_2of2(
+    legit_binary,
+    legit_cert,
+    sc_keys.ci_builder.pk,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "desktop",
+    410
+);
+check(not cross_ed_rel_ver.ok and cross_ed_rel_ver.error_code == "RELEASE_EDITION_MISMATCH", "cross-edition 2-of-2 release certificate replay rejected");
+
+// Duplicate public key collapse attempt (`ci_builder.pk` passed twice) -> REJECTED
+let collapse_pk_ver = DL.verify_release_2of2(
+    trojan_binary,
+    trojan_ci_only_cert,
+    sc_keys.ci_builder.pk,
+    sc_keys.ci_builder.pk,
+    "studio-pro",
+    "enterprise",
+    400
+);
+check(not collapse_pk_ver.ok and collapse_pk_ver.error_code == "RELEASE_KEYS_NOT_INDEPENDENT", "verifier forbids collapsing ci_builder_pk and cold_root_pk to same key");
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 5. Additional Sovereign Safeguards, Loopback Policy & 1-Call Gate Modes
+// ══════════════════════════════════════════════════════════════════════════════
+
+// 5a. Manual Sovereign Arm (`manual_sovereign_arm: true`)
+let man_arm_state = DL.create_default_duallock_server_state(t0, 30);
+man_arm_state["manual_sovereign_arm"] = true;
+let req_man = DL.build_duallock_challenge_request("studio-pro", "desktop", seat_alpha, auth.transport_aead_key_hex);
+let lease_man = DL.evaluate_and_sign_duallock_lease(man_arm_state, req_man.request_envelope, auth, t0 + 15);
+check(lease_man.dual_lock_armed and lease_man.isolation_mode == "SECOND_LOCK_REQUIRED", "manual_sovereign_arm activates SECOND_LOCK_REQUIRED");
+
+// 5b. Remaining Canary Tripwires (`BULK_EXPORT`, `DISABLE_AUDIT`, `REDIRECT_ORIGIN`)
+let canary_actions = ["BULK_EXPORT", "DISABLE_AUDIT", "REDIRECT_ORIGIN"];
+let c_idx = 0;
+while c_idx < len(canary_actions) {
+    let st_c = DL.create_default_duallock_server_state(t0, 30);
+    let rq_c = DL.build_duallock_challenge_request("studio-pro", "desktop", seat_alpha, auth.transport_aead_key_hex, map{
+        actions: ["READ_STATUS", canary_actions[c_idx]]
+    });
+    let ls_c = DL.evaluate_and_sign_duallock_lease(st_c, rq_c.request_envelope, auth, t0 + 25);
+    check(ls_c.canary_tripped and ls_c.isolation_mode == "FULL_KILL_SWITCH", "canary action array trips FULL_KILL_SWITCH: " + canary_actions[c_idx]);
+    c_idx = c_idx + 1;
+}
+
+// 5c. Loopback `127.0.0.1` Dev Policy: Blocked by default, allowed ONLY when explicitly signed by `cold_root`
+let loopback_url = "http://" + "127" + ".0.0.1:8443/dev-lease";
+let loop_blocked = DL.authorize_outbound_server_url(
+    loopback_url,
+    server_identity.pk_hex,
+    legit_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    5,
+    t0 + 100
+);
+check(not loop_blocked.ok and loop_blocked.blocked_before_connect and loop_blocked.detail_code == "LOOPBACK_NOT_AUTHORIZED_BY_COLD_ROOT", "127.0.0.1 blocked when allow_loopback_dev is false");
+
+let dev_loop_manifest = DL.sign_pinned_endpoint_manifest(sc_keys.cold_root.sk, map{
+    product_id: "studio-pro",
+    edition: "dev",
+    manifest_seq: 1,
+    allow_loopback_dev: true,
+    allowed_origins: [
+        map{
+            url: loopback_url,
+            host: "127" + ".0.0.1",
+            port: 8443,
+            pinned_server_pk_hex: server_identity.pk_hex,
+            tls_spki_sha256: ""
+        }
+    ],
+    expires_unix: t0 + 3600
+});
+let loop_allowed = DL.authorize_outbound_server_url(
+    loopback_url,
+    server_identity.pk_hex,
+    dev_loop_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "dev",
+    1,
+    t0 + 100
+);
+check(loop_allowed.ok and not loop_allowed.blocked_before_connect, "127.0.0.1 dev loopback allowed ONLY when cold_root signs allow_loopback_dev=true");
+
+// Expired manifest blocked before connect
+let exp_manifest_chk = DL.authorize_outbound_server_url(
+    loopback_url,
+    server_identity.pk_hex,
+    dev_loop_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "dev",
+    1,
+    t0 + 7200
+);
+check(not exp_manifest_chk.ok and exp_manifest_chk.blocked_before_connect and exp_manifest_chk.detail_code == "MANIFEST_EXPIRED", "expired cold-root manifest blocked before connect");
+
+// Unpinned server public key blocked before connect
+let unpinned_pk_chk = DL.authorize_outbound_server_url(
+    "https://control.sovereign-app.example/v1/lease",
+    attacker_srv.pk_hex,
+    legit_manifest,
+    sc_keys.cold_root.pk,
+    "studio-pro",
+    "enterprise",
+    5,
+    t0 + 100
+);
+check(not unpinned_pk_chk.ok and unpinned_pk_chk.blocked_before_connect and unpinned_pk_chk.detail_code == "ORIGIN_OR_SERVER_KEY_NOT_IN_PINNED_MANIFEST", "unpinned server Ed25519 public key blocked before connect");
+
+// 5d. Byte-Array Binary 2-of-2 Signing & Pre-Hashed SHA-256 Verification Equivalence
+let raw_elf_bytes = [127, 69, 76, 70, 2, 1, 1, 0, 42, 99, 255, 0, 128];
+let byte_cert = DL.sign_release_2of2(raw_elf_bytes, "studio-pro", "cli", 12, sc_keys.ci_builder.sk, sc_keys.cold_root.sk);
+let byte_ver_raw = DL.verify_release_2of2(raw_elf_bytes, byte_cert, sc_keys.ci_builder.pk, sc_keys.cold_root.pk, "studio-pro", "cli", 12);
+let byte_ver_hash = DL.verify_release_2of2(byte_ver_raw.binary_sha256, byte_cert, sc_keys.ci_builder.pk, sc_keys.cold_root.pk, "studio-pro", "cli", 12);
+check(byte_ver_raw.ok and byte_ver_hash.ok, "2-of-2 release verification works identically on raw byte arrays and SHA-256 hex digests");
+
+// 5e. 1-Call Ergonomic `enforce_sovereign_duallock_gate` Modes
+let gate_single = DL.enforce_sovereign_duallock_gate(map{
+    primary_license_ok: true,
+    require_second_lock: false,
+    ratchet_state: r1,
+    ratchet_hmac_key_hex: ratchet_key,
+    current_wall_unix: t0 + 30,
+    current_mono_ms: mono0 + 30000.0
+});
+check(gate_single.ok and gate_single.allowed_to_execute and gate_single.mode == "SINGLE_LOCK_OFFLINE", "1-call gate supports optional single-lock offline developer mode");
+
+let gate_live = DL.enforce_sovereign_duallock_gate(map{
+    primary_license_ok: true,
+    require_second_lock: true,
+    product_id: "studio-pro",
+    edition: "desktop",
+    expected_client_nonce: req1.expected_client_nonce,
+    response_envelope: lease1.response_envelope,
+    owner_ed25519_pk: auth.owner_ed25519_pk,
+    hmac_pepper_hex: auth.hmac_pepper_hex,
+    transport_aead_key_hex: auth.transport_aead_key_hex,
+    ratchet_state: r1,
+    ratchet_hmac_key_hex: ratchet_key,
+    current_wall_unix: t0 + 5,
+    current_mono_ms: mono0 + 5000.0
+});
+check(gate_live.ok and gate_live.allowed_to_execute and gate_live.mode == "DUAL_LOCK_LIVE_LEASE", "1-call gate verifies Dual-Lock live encrypted lease + clock ratchet");
+
+let gate_cont = DL.enforce_sovereign_duallock_gate(map{
+    primary_license_ok: true,
+    require_second_lock: true,
+    product_id: "studio-pro",
+    edition: "desktop",
+    blinded_seat_id: seat_alpha,
+    continuity_bundle: cont_bundle,
+    owner_ed25519_pk: auth.owner_ed25519_pk,
+    hmac_pepper_hex: auth.hmac_pepper_hex,
+    ratchet_state: r1,
+    ratchet_hmac_key_hex: ratchet_key,
+    current_wall_unix: t0 + 3600,
+    current_mono_ms: mono0 + 3600000.0
+});
+check(gate_cont.ok and gate_cont.allowed_to_execute and gate_cont.mode == "DUAL_LOCK_CONTINUITY_BUNDLE", "1-call gate verifies offline 72h continuity bundle fallback");
+
+let gate_lock1_fail = DL.enforce_sovereign_duallock_gate(map{
+    primary_license_ok: false,
+    require_second_lock: true
+});
+check(not gate_lock1_fail.ok and gate_lock1_fail.error_code == "PRIMARY_LOCK_REJECTED", "1-call gate immediately rejects when Lock #1 fails");
+
+print("PASS v41_duallock_supplychain_clock_test.sapp — " + str(assertions) + " assertions verified (0 network packets, 0 PII)");
