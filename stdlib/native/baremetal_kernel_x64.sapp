@@ -1,0 +1,2188 @@
+// stdlib/native/baremetal_kernel_x64.sapp — Sovereign Pure-PBLang Bare-Metal Ring-0 OS Kernel Compiler (v4.0.0)
+//
+// 100% pure PBLang (ZERO external tools: NO ld, NO nasm, NO grub-mkrescue, NO gcc, NO python).
+// Compiles `@nogc` freestanding PBLang programs directly into standalone bootable Ring-0 OS kernels:
+//   - `baremetal-x64` : ELF64 + Multiboot1 + Multiboot2 + Xen PVH (`XEN_ELFNOTE_PHYS32_ENTRY`),
+//                       32-bit Protected-Mode bootstrap -> 4-level identity page tables (1 GiB 2MiB pages) ->
+//                       PAE + IA32_EFER.LME + CR0.PG -> 64-bit Ring-0 Long Mode (`CS=0x08`),
+//                       256-entry 64-bit IDT + 8259 PIC remap + 8254 PIT 1000 Hz `IRQ0` zero-GC ISR (`iretq`)
+//                       with hardware `rdtsc` cycle telemetry (< 2,500 cycles), COM1 115200 UART + 0xB8000 VGA,
+//                       4 KiB physical page-frame bitmap allocator (`pmm_alloc_frame` / `pmm_free_frame`),
+//                       compiled `@nogc` PBLang functions, and `isa-debug-exit` (`0xF4`) clean shutdown.
+//   - `baremetal-x86` : ELF32 + Multiboot1 + Multiboot2 + PVH 32-bit Protected-Mode Ring-0 kernel (`CS=0x18`)
+//                       with 32-bit IDT + PIC + PIT `IRQ0` zero-GC ISR (`iretd`), `rdtsc`, PMM, VGA + COM1.
+
+let SC = import("stdlib:static_checker.sapp");
+
+let BAREMETAL_VERSION = "4.0.0";
+
+// Fixed Physical Memory Map (1 MiB .. 2 MiB reserved in PT_LOAD p_memsz = 0x100000):
+//   0x00100000 .. 0x00100FFF : ELF64/ELF32 + PT_LOAD + PT_NOTE(PVH) + Multiboot1 + Multiboot2 headers
+//   0x00101000 .. 0x00101FFF : 32-bit Protected-Mode bootstrap + GDT64/GDT32 (0x101200) + GDTR (0x101220)
+//   0x00102000 .. 0x0013FFFF : Ring-0 kernel runtime + zero-GC ISRs + compiled `@nogc` PBLang code + .rodata
+//   0x00140000 .. 0x00142FFF : 4-level identity page tables (PML4 @ 0x140000, PDPT @ 0x141000, PD @ 0x142000)
+//   0x00143000 .. 0x00143FFF : 256-entry IDT (IDT64 = 4096 B, IDT32 = 2048 B)
+//   0x00144000 .. 0x0014400F : IDTR descriptor (limit + base)
+//   0x00145000 .. 0x00145FFF : Kernel telemetry & `@nogc` global variables:
+//       0x145000 = irq0_ticks (u64)
+//       0x145008 = isr_last_cycles (u64)
+//       0x145010 = isr_min_cycles (u64)
+//       0x145018 = vga_cursor (u64)
+//       0x145020 = pmm_base_addr (u64 = 0x400000)
+//       0x145028 = pmm_total_frames (u64 = 4096)
+//       0x145030 = pmm_used_frames (u64)
+//       0x145100+ = user `@nogc` globals (8 bytes each)
+//   0x00146000 .. 0x00146FFF : PMM 4 KiB frame bitmap (4096 frames = 512 bytes, up to 32,768 frames)
+//   0x00150000 .. 0x00180000 : 192 KiB Ring-0 Kernel Stack (initial RSP/ESP = 0x00180000)
+
+let PHYS_LOAD_BASE  = 1048576; // 0x00100000
+let PHYS_ENTRY32    = 1052672; // 0x00101000
+let PHYS_GDT        = 1053184; // 0x00101200
+let PHYS_GDTR       = 1053216; // 0x00101220
+let PHYS_KERNEL64   = 1056768; // 0x00102000
+let PHYS_PML4       = 1310720; // 0x00140000
+let PHYS_PDPT       = 1314816; // 0x00141000
+let PHYS_PD         = 1318912; // 0x00142000
+let PHYS_IDT        = 1323008; // 0x00143000
+let PHYS_IDTR       = 1327104; // 0x00144000
+let PHYS_KSTATE     = 1331200; // 0x00145000
+let PHYS_GLOBALS    = 1331456; // 0x00145100
+let PHYS_PMM_BITMAP = 1335296; // 0x00146000
+let PHYS_STACK_TOP  = 1572864; // 0x00180000
+let PHYS_VGA_TEXT   = 753664;  // 0x000B8000
+let PHYS_PMM_POOL   = 4194304; // 0x00400000
+
+// x86-64 Register Indices
+let R_RAX = 0;
+let R_RCX = 1;
+let R_RDX = 2;
+let R_RBX = 3;
+let R_RSP = 4;
+let R_RBP = 5;
+let R_RSI = 6;
+let R_RDI = 7;
+let R_R8  = 8;
+let R_R9  = 9;
+let R_R10 = 10;
+let R_R11 = 11;
+
+// ── Byte & Little-Endian Helpers ──────────────────────────────────────────────
+
+fn _b(n) {
+    let r = n % 256;
+    if r < 0 { r = r + 256; }
+    return r;
+}
+
+fn _le(buf, val, count) {
+    let v = val;
+    let i = 0;
+    while i < count {
+        let rem = v % 256;
+        if rem < 0 { rem = rem + 256; }
+        push(buf, rem);
+        v = (v - rem) / 256;
+        i = i + 1;
+    }
+}
+
+fn _patch32(buf, pos, val) {
+    let v = val;
+    let i = 0;
+    while i < 4 {
+        let rem = v % 256;
+        if rem < 0 { rem = rem + 256; }
+        buf[pos + i] = rem;
+        v = (v - rem) / 256;
+        i = i + 1;
+    }
+}
+
+fn _push_zeros(buf, count) {
+    let i = 0;
+    while i < count { push(buf, 0); i = i + 1; }
+}
+
+fn _push_bytes(dst, src) {
+    let i = 0;
+    while i < len(src) { push(dst, src[i]); i = i + 1; }
+}
+
+fn _align_up(v, a) {
+    let r = v % a;
+    if r == 0 { return v; }
+    return v + (a - r);
+}
+
+fn _parse_int_lit(s) {
+    if len(s) > 2 and (str_starts_with(s, "0x") or str_starts_with(s, "0X")) {
+        let acc = 0;
+        let i = 2;
+        while i < len(s) {
+            let c = strcharcodeat(s, i);
+            let d = 0;
+            if c >= 48 and c <= 57 { d = c - 48; }
+            elif c >= 65 and c <= 70 { d = c - 55; }
+            elif c >= 97 and c <= 102 { d = c - 87; }
+            acc = acc * 16 + d;
+            i = i + 1;
+        }
+        return acc;
+    }
+    return floor(parse_number(s));
+}
+
+// ── Static Freestanding & `@nogc` Enforcement ─────────────────────────────────
+
+fn _validate_freestanding_ast(source) {
+    let parsed = SC.parse_sapp_ast(source);
+    if len(parsed["errors"]) > 0 {
+        let e0 = parsed["errors"][0];
+        throw "baremetal_kernel_x64: syntax error at line " + str(e0["line"]) + ": " + e0["message"];
+    }
+    // Enforce explicit `@nogc` rules on annotated functions first
+    let ng = SC.check_nogc_functions(parsed);
+    if not ng["ok"] {
+        let v0 = ng["violations"][0];
+        throw "baremetal_kernel_x64: " + v0["code"] + " at line " + str(v0["line"]) + ": " + v0["message"];
+    }
+    // Also synthesize `@nogc` verification across ALL top-level functions in freestanding kernel mode
+    let ast = parsed["ast"];
+    let stmts = ast["stmts"];
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        if s != nil and type(s) == "map" {
+            let sk = s["kind"];
+            if sk == "export_stmt" and s["decl"] != nil { s = s["decl"]; sk = s["kind"]; }
+            if sk == "fn_decl" {
+                if not map_has(s, "attrs") or s["attrs"] == nil { s["attrs"] = ["nogc"]; }
+                else {
+                    let has_ng = false;
+                    let ai = 0;
+                    while ai < len(s["attrs"]) {
+                        if s["attrs"][ai] == "nogc" { has_ng = true; }
+                        ai = ai + 1;
+                    }
+                    if not has_ng { push(s["attrs"], "nogc"); }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    let ng_all = SC.check_nogc_functions(parsed);
+    if not ng_all["ok"] {
+        let v1 = ng_all["violations"][0];
+        throw "baremetal_kernel_x64: freestanding Ring-0 violation (" + v1["code"] + ") at line " + str(v1["line"]) + ": " + v1["message"];
+    }
+    return parsed["ast"];
+}
+
+// ── Header Page Builder (ELF64 / ELF32 + PVH PT_NOTE + Multiboot1 + Multiboot2) ──
+
+fn _build_header_page(is_x64, total_file_bytes) {
+    let hdr = [];
+    if is_x64 {
+        // Elf64_Ehdr (64 bytes)
+        push(hdr, 127); push(hdr, 69); push(hdr, 76); push(hdr, 70); // \x7FELF
+        push(hdr, 2); push(hdr, 1); push(hdr, 1); push(hdr, 0);      // ELFCLASS64, LSB, v1, SYSV
+        _push_zeros(hdr, 8);
+        _le(hdr, 2, 2);             // ET_EXEC
+        _le(hdr, 62, 2);            // EM_X86_64
+        _le(hdr, 1, 4);             // EV_CURRENT
+        _le(hdr, PHYS_ENTRY32, 8);  // e_entry (0x101000)
+        _le(hdr, 64, 8);            // e_phoff
+        _le(hdr, 0, 8);             // e_shoff
+        _le(hdr, 0, 4);             // e_flags
+        _le(hdr, 64, 2);            // e_ehsize
+        _le(hdr, 56, 2);            // e_phentsize
+        _le(hdr, 2, 2);             // e_phnum (PT_LOAD + PT_NOTE)
+        _le(hdr, 64, 2);            // e_shentsize
+        _le(hdr, 0, 2);             // e_shnum
+        _le(hdr, 0, 2);             // e_shstrndx
+
+        // Phdr[0]: PT_LOAD mapping file 0..total_file_bytes -> phys 0x100000..0x200000 (1 MiB memsz)
+        _le(hdr, 1, 4);             // PT_LOAD
+        _le(hdr, 7, 4);             // PF_R | PF_W | PF_X
+        _le(hdr, 0, 8);             // p_offset = 0
+        _le(hdr, PHYS_LOAD_BASE, 8);// p_vaddr  = 0x100000
+        _le(hdr, PHYS_LOAD_BASE, 8);// p_paddr  = 0x100000
+        _le(hdr, total_file_bytes, 8);
+        _le(hdr, 1048576, 8);       // p_memsz  = 1 MiB (covers page tables, IDT, globals, PMM bitmap, stack)
+        _le(hdr, 4096, 8);          // p_align
+
+        // Phdr[1]: PT_NOTE (XEN_ELFNOTE_PHYS32_ENTRY at file offset 0xC0 = 192)
+        _le(hdr, 4, 4);             // PT_NOTE
+        _le(hdr, 4, 4);             // PF_R
+        _le(hdr, 192, 8);           // p_offset = 0xC0
+        _le(hdr, PHYS_LOAD_BASE + 192, 8);
+        _le(hdr, PHYS_LOAD_BASE + 192, 8);
+        _le(hdr, 20, 8);            // p_filesz = 20
+        _le(hdr, 20, 8);            // p_memsz  = 20
+        _le(hdr, 4, 8);             // p_align  = 4
+    } else {
+        // Elf32_Ehdr (52 bytes)
+        push(hdr, 127); push(hdr, 69); push(hdr, 76); push(hdr, 70);
+        push(hdr, 1); push(hdr, 1); push(hdr, 1); push(hdr, 0);      // ELFCLASS32, LSB
+        _push_zeros(hdr, 8);
+        _le(hdr, 2, 2);             // ET_EXEC
+        _le(hdr, 3, 2);             // EM_386
+        _le(hdr, 1, 4);             // EV_CURRENT
+        _le(hdr, PHYS_ENTRY32, 4);  // e_entry (0x101000)
+        _le(hdr, 52, 4);            // e_phoff
+        _le(hdr, 0, 4);             // e_shoff
+        _le(hdr, 0, 4);             // e_flags
+        _le(hdr, 52, 2);            // e_ehsize
+        _le(hdr, 32, 2);            // e_phentsize
+        _le(hdr, 2, 2);             // e_phnum
+        _le(hdr, 40, 2);            // e_shentsize
+        _le(hdr, 0, 2);             // e_shnum
+        _le(hdr, 0, 2);             // e_shstrndx
+
+        // Elf32_Phdr[0]: PT_LOAD
+        _le(hdr, 1, 4);
+        _le(hdr, 0, 4);             // p_offset
+        _le(hdr, PHYS_LOAD_BASE, 4);// p_vaddr
+        _le(hdr, PHYS_LOAD_BASE, 4);// p_paddr
+        _le(hdr, total_file_bytes, 4);
+        _le(hdr, 1048576, 4);       // p_memsz = 1 MiB
+        _le(hdr, 7, 4);             // PF_R | PF_W | PF_X
+        _le(hdr, 4096, 4);          // p_align
+
+        // Elf32_Phdr[1]: PT_NOTE
+        _le(hdr, 4, 4);
+        _le(hdr, 192, 4);
+        _le(hdr, PHYS_LOAD_BASE + 192, 4);
+        _le(hdr, PHYS_LOAD_BASE + 192, 4);
+        _le(hdr, 20, 4);
+        _le(hdr, 20, 4);
+        _le(hdr, 4, 4);
+        _le(hdr, 4, 4);
+    }
+
+    while len(hdr) < 192 { push(hdr, 0); }
+
+    // Offset 0x00C0 (192): Xen PVH Note (`XEN_ELFNOTE_PHYS32_ENTRY = 18`)
+    _le(hdr, 4, 4);                 // namesz = 4 ("Xen\0")
+    _le(hdr, 4, 4);                 // descsz = 4 (32-bit phys entry)
+    _le(hdr, 18, 4);                // type = 0x12 (XEN_ELFNOTE_PHYS32_ENTRY)
+    push(hdr, 88); push(hdr, 101); push(hdr, 110); push(hdr, 0); // "Xen\0"
+    _le(hdr, PHYS_ENTRY32, 4);      // desc = 0x00101000
+
+    while len(hdr) < 256 { push(hdr, 0); }
+
+    // Offset 0x0100 (256): Multiboot1 Header with `AOUT_KLUDGE` (`flags = 0x00010003`)
+    // Allows `qemu-system-x86_64 -kernel` to boot true 64-bit `ELF64` (`EM_X86_64`) AND `ELF32` (`EM_386`)
+    // directly at `PHYS_ENTRY32` (`0x101000`) -> 64-bit Ring-0 Long Mode without external option ROMs!
+    _le(hdr, 464367618, 4);                        // magic = 0x1BADB002
+    _le(hdr, 65539, 4);                            // flags = 0x00010003 (PAGE_ALIGN | MEMORY_INFO | AOUT_KLUDGE)
+    _le(hdr, 3830534139, 4);                       // checksum = -(0x1BADB002 + 0x00010003) mod 2^32 = 0xE4514FFB
+    _le(hdr, PHYS_LOAD_BASE + 256, 4);             // header_addr   = 0x00100100
+    _le(hdr, PHYS_LOAD_BASE, 4);                   // load_addr     = 0x00100000
+    _le(hdr, PHYS_LOAD_BASE + total_file_bytes, 4);// load_end_addr = 0x00100000 + filesz
+    _le(hdr, PHYS_LOAD_BASE + 1048576, 4);         // bss_end_addr  = 0x00200000 (1 MiB zeroed BSS/tables/stack)
+    _le(hdr, PHYS_ENTRY32, 4);                     // entry_addr    = 0x00101000
+
+    while len(hdr) < 288 { push(hdr, 0); }
+
+    // Offset 0x0120 (288, 8-byte aligned): Multiboot2 Header (magic 0xE85250D6, arch 0, len 24, csum 0x17ADAF12)
+    _le(hdr, 3897708758, 4);
+    _le(hdr, 0, 4);
+    _le(hdr, 24, 4);
+    _le(hdr, 397258514, 4);
+    // Multiboot2 End Tag (type=0, flags=0, size=8)
+    _le(hdr, 0, 2);
+    _le(hdr, 0, 2);
+    _le(hdr, 8, 4);
+
+    while len(hdr) < 4096 { push(hdr, 0); }
+    return hdr;
+}
+
+// ── Page 1 (0x101000 .. 0x101FFF): 32-bit Protected-Mode Bootstrap + Ring-0 GDT ─
+
+fn _build_bootstrap_page(is_x64) {
+    let boot = [];
+
+    // 0x101000: cli; cld; mov esp, 0x00180000
+    push(boot, 250); // FA: cli
+    push(boot, 252); // FC: cld
+    push(boot, 188); _le(boot, PHYS_STACK_TOP, 4); // BC <esp>: mov esp, 0x180000
+
+    // lgdt [0x00101220] (`0F 01 15 <addr32>`)
+    push(boot, 15); push(boot, 1); push(boot, 21); _le(boot, PHYS_GDTR, 4);
+
+    // Reload DS, ES, FS, GS, SS = 0x0010 (Ring-0 Data Segment)
+    push(boot, 102); push(boot, 184); _le(boot, 16, 2); // 66 B8 10 00: mov ax, 0x10
+    push(boot, 142); push(boot, 216); // 8E D8: mov ds, ax
+    push(boot, 142); push(boot, 192); // 8E C0: mov es, ax
+    push(boot, 142); push(boot, 224); // 8E E0: mov fs, ax
+    push(boot, 142); push(boot, 232); // 8E E8: mov gs, ax
+    push(boot, 142); push(boot, 208); // 8E D0: mov ss, ax
+
+    if is_x64 {
+        // 1. Zero 12 KiB (3072 dwords) at PHYS_PML4 (0x140000..0x142FFF) via `rep stosd`
+        push(boot, 191); _le(boot, PHYS_PML4, 4); // BF: mov edi, 0x140000
+        push(boot, 49); push(boot, 192);          // 31 C0: xor eax, eax
+        push(boot, 185); _le(boot, 3072, 4);      // B9: mov ecx, 3072
+        push(boot, 243); push(boot, 171);         // F3 AB: rep stosd
+
+        // 2. PML4[0] = PHYS_PDPT | 3 (Present | RW)
+        push(boot, 199); push(boot, 5); _le(boot, PHYS_PML4, 4); _le(boot, PHYS_PDPT + 3, 4);
+
+        // 3. PDPT[0] = PHYS_PD | 3 (Present | RW)
+        push(boot, 199); push(boot, 5); _le(boot, PHYS_PDPT, 4); _le(boot, PHYS_PD + 3, 4);
+
+        // 4. Fill 512 2-MiB huge pages in PD (0x142000) covering 0x00000000 .. 0x3FFFFFFF (1 GiB)
+        push(boot, 191); _le(boot, PHYS_PD, 4);   // mov edi, 0x142000
+        push(boot, 184); _le(boot, 131, 4);       // mov eax, 0x83 (Present | RW | PS)
+        push(boot, 185); _le(boot, 512, 4);       // mov ecx, 512
+        let pd_loop = len(boot);
+        push(boot, 137); push(boot, 7);           // 89 07: mov [edi], eax
+        push(boot, 199); push(boot, 71); push(boot, 4); _le(boot, 0, 4); // C7 47 04 00..: mov dword [edi+4], 0
+        push(boot, 5); _le(boot, 2097152, 4);     // 05 00 00 20 00: add eax, 0x200000
+        push(boot, 131); push(boot, 199); push(boot, 8); // 83 C7 08: add edi, 8
+        push(boot, 73);                           // 49: dec ecx
+        push(boot, 117); push(boot, _b(pd_loop - (len(boot) + 1))); // 75 rel8: jnz pd_loop
+
+        // 5. Enable CR4.PAE (bit 5) | CR4.OSFXSR (bit 9) | CR4.OSXMMEXCPT (bit 10) = 0x620
+        push(boot, 15); push(boot, 32); push(boot, 224); // 0F 20 E0: mov eax, cr4
+        push(boot, 13); _le(boot, 1568, 4);              // 0D 20 06 00 00: or eax, 0x620
+        push(boot, 15); push(boot, 34); push(boot, 224); // 0F 22 E0: mov cr4, eax
+
+        // 6. Load CR3 = PHYS_PML4 (0x140000)
+        push(boot, 184); _le(boot, PHYS_PML4, 4);        // mov eax, 0x140000
+        push(boot, 15); push(boot, 34); push(boot, 216); // 0F 22 D8: mov cr3, eax
+
+        // 7. Set IA32_EFER.LME (MSR 0xC0000080, bit 8 = 0x100)
+        push(boot, 185); _le(boot, 3221225600, 4);       // mov ecx, 0xC0000080
+        push(boot, 15); push(boot, 50);                  // 0F 32: rdmsr
+        push(boot, 13); _le(boot, 256, 4);               // or eax, 0x100
+        push(boot, 15); push(boot, 48);                  // 0F 30: wrmsr
+
+        // 8. Enable Paging + Protected Mode + MP (`CR0 = (CR0 & ~4) | 0x80000003`)
+        push(boot, 15); push(boot, 32); push(boot, 192); // 0F 20 C0: mov eax, cr0
+        push(boot, 131); push(boot, 224); push(boot, 251); // 83 E0 FB: and eax, ~4
+        push(boot, 13); _le(boot, 2147483651, 4);        // 0D 03 00 00 80: or eax, 0x80000003
+        push(boot, 15); push(boot, 34); push(boot, 192); // 0F 22 C0: mov cr0, eax
+
+        // 9. Far Jump `jmp 0x0008:0x00102000` into 64-bit Ring-0 Long Mode!
+        push(boot, 234); _le(boot, PHYS_KERNEL64, 4); _le(boot, 8, 2);
+    } else {
+        // 32-bit Protected-Mode Ring-0 setup: enable SSE & far-jump `0x0018:0x00102000`
+        push(boot, 15); push(boot, 32); push(boot, 192); // mov eax, cr0
+        push(boot, 131); push(boot, 224); push(boot, 251); // and eax, ~4
+        push(boot, 131); push(boot, 200); push(boot, 2);   // or eax, 2
+        push(boot, 15); push(boot, 34); push(boot, 192); // mov cr0, eax
+        push(boot, 15); push(boot, 32); push(boot, 224); // mov eax, cr4
+        push(boot, 13); _le(boot, 1536, 4);              // or eax, 0x600
+        push(boot, 15); push(boot, 34); push(boot, 224); // mov cr4, eax
+        push(boot, 234); _le(boot, PHYS_KERNEL64, 4); _le(boot, 24, 2); // jmp 0x0018:0x00102000
+    }
+
+    while len(boot) < 512 { push(boot, 0); }
+
+    // 0x101200 (offset 512): GDT Table (4 * 8 = 32 bytes)
+    // [0] 0x00: Null descriptor
+    _push_zeros(boot, 8);
+    // [1] 0x08: 64-bit Ring-0 Code (`access=0x9A`, `gran=0xAF` [L=1, D=0, G=1])
+    push(boot, 255); push(boot, 255); push(boot, 0); push(boot, 0);
+    push(boot, 0); push(boot, 154); push(boot, 175); push(boot, 0);
+    // [2] 0x10: Ring-0 Data (`access=0x92`, `gran=0xCF` [D/B=1, G=1])
+    push(boot, 255); push(boot, 255); push(boot, 0); push(boot, 0);
+    push(boot, 0); push(boot, 146); push(boot, 207); push(boot, 0);
+    // [3] 0x18: 32-bit Ring-0 Code (`access=0x9A`, `gran=0xCF` [D=1, L=0, G=1])
+    push(boot, 255); push(boot, 255); push(boot, 0); push(boot, 0);
+    push(boot, 0); push(boot, 154); push(boot, 207); push(boot, 0);
+
+    // 0x101220 (offset 544): GDTR Descriptor (`limit = 31`, `base = 0x00101200`)
+    _le(boot, 31, 2);
+    _le(boot, PHYS_GDT, 8);
+
+    while len(boot) < 4096 { push(boot, 0); }
+    return boot;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 64-BIT RING-0 LONG-MODE KERNEL & `@nogc` COMPILER (`baremetal-x64`)
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _x64_rex(w, r, x, b) {
+    return 64 + (w * 8) + (r * 4) + (x * 2) + b;
+}
+
+fn _x64_modrm(mod, reg, rm) {
+    return (mod * 64) + ((reg % 8) * 8) + (rm % 8);
+}
+
+fn _x64_push(code, reg) {
+    if reg >= 8 { push(code, 65); }
+    push(code, 80 + (reg % 8));
+}
+
+fn _x64_pop(code, reg) {
+    if reg >= 8 { push(code, 65); }
+    push(code, 88 + (reg % 8));
+}
+
+fn _x64_mov_rr(code, dst, src) {
+    if dst == src { return; }
+    push(code, _x64_rex(1, if src >= 8 { 1 } else { 0 }, 0, if dst >= 8 { 1 } else { 0 }));
+    push(code, 137);
+    push(code, _x64_modrm(3, src, dst));
+}
+
+fn _x64_mov_imm(code, dst, val) {
+    if val >= 0 and val <= 2147483647 {
+        if dst >= 8 { push(code, 65); }
+        push(code, 184 + (dst % 8));
+        _le(code, val, 4);
+        return;
+    }
+    if val >= -2147483648 and val < 0 {
+        push(code, _x64_rex(1, 0, 0, if dst >= 8 { 1 } else { 0 }));
+        push(code, 199);
+        push(code, _x64_modrm(3, 0, dst));
+        _le(code, val, 4);
+        return;
+    }
+    push(code, _x64_rex(1, 0, 0, if dst >= 8 { 1 } else { 0 }));
+    push(code, 184 + (dst % 8));
+    _le(code, val, 8);
+}
+
+fn _x64_add_imm(code, dst, imm) {
+    if imm == 0 { return; }
+    push(code, _x64_rex(1, 0, 0, if dst >= 8 { 1 } else { 0 }));
+    if imm >= -128 and imm <= 127 {
+        push(code, 131); push(code, _x64_modrm(3, 0, dst)); push(code, _b(imm));
+    } else {
+        push(code, 129); push(code, _x64_modrm(3, 0, dst)); _le(code, imm, 4);
+    }
+}
+
+fn _x64_sub_imm(code, dst, imm) {
+    if imm == 0 { return; }
+    push(code, _x64_rex(1, 0, 0, if dst >= 8 { 1 } else { 0 }));
+    if imm >= -128 and imm <= 127 {
+        push(code, 131); push(code, _x64_modrm(3, 5, dst)); push(code, _b(imm));
+    } else {
+        push(code, 129); push(code, _x64_modrm(3, 5, dst)); _le(code, imm, 4);
+    }
+}
+
+fn _x64_load_rbp(code, dst, disp) {
+    push(code, _x64_rex(1, if dst >= 8 { 1 } else { 0 }, 0, 0));
+    push(code, 139);
+    if disp >= -128 and disp <= 127 {
+        push(code, _x64_modrm(1, dst, R_RBP)); push(code, _b(disp));
+    } else {
+        push(code, _x64_modrm(2, dst, R_RBP)); _le(code, disp, 4);
+    }
+}
+
+fn _x64_store_rbp(code, disp, src) {
+    push(code, _x64_rex(1, if src >= 8 { 1 } else { 0 }, 0, 0));
+    push(code, 137);
+    if disp >= -128 and disp <= 127 {
+        push(code, _x64_modrm(1, src, R_RBP)); push(code, _b(disp));
+    } else {
+        push(code, _x64_modrm(2, src, R_RBP)); _le(code, disp, 4);
+    }
+}
+
+fn _x64_jmp(code) {
+    push(code, 233);
+    let pos = len(code);
+    _le(code, 0, 4);
+    return pos;
+}
+
+fn _x64_jcc(code, cc2) {
+    push(code, 15); push(code, cc2);
+    let pos = len(code);
+    _le(code, 0, 4);
+    return pos;
+}
+
+fn _x64_call_sym(st, sym) {
+    let code = st["code"];
+    push(code, 232);
+    let pos = len(code);
+    _le(code, 0, 4);
+    push(st["calls"], map{ at: pos, name: sym });
+}
+
+fn _x64_lea_str(st, dst, s) {
+    let code = st["code"];
+    let idx = 0;
+    if map_has(st["str_pool"], s) {
+        idx = st["str_pool"][s];
+    } else {
+        idx = len(st["str_list"]);
+        st["str_pool"][s] = idx;
+        push(st["str_list"], s);
+    }
+    // Emit `mov dst32, <patched_phys_addr>` (5 or 6 bytes, zero-extended to 64-bit!)
+    if dst >= 8 { push(code, 65); }
+    push(code, 184 + (dst % 8));
+    let pos = len(code);
+    _le(code, 0, 4);
+    push(st["str_fixes"], map{ at: pos, idx: idx });
+}
+
+fn _x64_outb_imm(code, port, val_byte) {
+    push(code, 102); push(code, 186); _le(code, port, 2); // 66 BA <u16>: mov dx, port
+    push(code, 176); push(code, _b(val_byte));            // B0 <u8>: mov al, val
+    push(code, 238);                                      // EE: out dx, al
+}
+
+// Emit all Ring-0 hardware runtime & ISR routines into `st["code"]`
+fn _x64_emit_ring0_runtime(st, has_user_irq0) {
+    let code = st["code"];
+
+    // ── `rt$serial_putc` (dil = byte) ──
+    st["labels"]["rt$serial_putc"] = len(code);
+    push(code, 185); _le(code, 65536, 4); // mov ecx, 65536 (bounded UART THRE spin)
+    let wait_tx = len(code);
+    push(code, 102); push(code, 186); _le(code, 1021, 2); // mov dx, 0x3FD (COM1 LSR)
+    push(code, 236);                                      // EC: in al, dx
+    push(code, 168); push(code, 32);                      // A8 20: test al, 0x20
+    let j_rdy = _x64_jcc(code, 133);                      // jne rdy
+    push(code, 255); push(code, 201);                     // FF C9: dec ecx
+    let j_agn = _x64_jcc(code, 133);                      // jne wait_tx
+    _patch32(code, j_agn, wait_tx - (j_agn + 4));
+    _patch32(code, j_rdy, len(code) - (j_rdy + 4));
+    push(code, 102); push(code, 186); _le(code, 1016, 2); // mov dx, 0x3F8 (COM1 THR)
+    push(code, 64); push(code, 136); push(code, 248);     // 40 88 F8: mov al, dil
+    push(code, 238);                                      // EE: out dx, al
+    push(code, 195);                                      // C3: ret
+
+    // ── `rt$serial_puts` (rdi = NUL-terminated ASCII pointer) ──
+    st["labels"]["rt$serial_puts"] = len(code);
+    _x64_push(code, R_RBX);
+    _x64_mov_rr(code, R_RBX, R_RDI);
+    let sp_loop = len(code);
+    push(code, 15); push(code, 182); push(code, 59); // 0F B6 3B: movzx edi, byte [rbx]
+    push(code, 133); push(code, 255);                // 85 FF: test edi, edi
+    let j_sp_done = _x64_jcc(code, 132);             // je done
+    _x64_call_sym(st, "rt$serial_putc");
+    _x64_add_imm(code, R_RBX, 1);
+    let j_sp_back = _x64_jmp(code);
+    _patch32(code, j_sp_back, sp_loop - (j_sp_back + 4));
+    _patch32(code, j_sp_done, len(code) - (j_sp_done + 4));
+    _x64_pop(code, R_RBX);
+    push(code, 195);
+
+    // ── `rt$serial_put_crlf` ──
+    st["labels"]["rt$serial_put_crlf"] = len(code);
+    _x64_mov_imm(code, R_RDI, 13);
+    _x64_call_sym(st, "rt$serial_putc");
+    _x64_mov_imm(code, R_RDI, 10);
+    _x64_call_sym(st, "rt$serial_putc");
+    push(code, 195);
+
+    // ── `rt$serial_put_dec` (rdi = signed i64) ──
+    st["labels"]["rt$serial_put_dec"] = len(code);
+    _x64_push(code, R_RBP);
+    _x64_mov_rr(code, R_RBP, R_RSP);
+    _x64_push(code, R_RBX);
+    _x64_sub_imm(code, R_RSP, 40);
+    _x64_mov_rr(code, R_RAX, R_RDI);
+    push(code, 72); push(code, 133); push(code, 192); // test rax, rax
+    let j_pos = _x64_jcc(code, 141); // jge pos
+    _x64_push(code, R_RAX);
+    _x64_mov_imm(code, R_RDI, 45); // '-'
+    _x64_call_sym(st, "rt$serial_putc");
+    _x64_pop(code, R_RAX);
+    push(code, 72); push(code, 247); push(code, 216); // neg rax
+    _patch32(code, j_pos, len(code) - (j_pos + 4));
+
+    // Format digits backwards from `[rbp - 16]`
+    push(code, 72); push(code, 141); push(code, 93); push(code, 240); // 48 8D 5D F0: lea rbx, [rbp - 16]
+    push(code, 198); push(code, 3); push(code, 0);                    // C6 03 00: mov byte [rbx], 0
+    _x64_mov_imm(code, R_RCX, 10);
+    let d_loop = len(code);
+    _x64_sub_imm(code, R_RBX, 1);
+    push(code, 49); push(code, 210);                  // 31 D2: xor edx, edx
+    push(code, 72); push(code, 247); push(code, 241); // 48 F7 F1: div rcx
+    push(code, 128); push(code, 194); push(code, 48); // 80 C2 30: add dl, '0'
+    push(code, 136); push(code, 19);                  // 88 13: mov [rbx], dl
+    push(code, 72); push(code, 133); push(code, 192); // test rax, rax
+    let j_dmore = _x64_jcc(code, 133);                // jne d_loop
+    _patch32(code, j_dmore, d_loop - (j_dmore + 4));
+    _x64_mov_rr(code, R_RDI, R_RBX);
+    _x64_call_sym(st, "rt$serial_puts");
+    _x64_add_imm(code, R_RSP, 40);
+    _x64_pop(code, R_RBX);
+    _x64_pop(code, R_RBP);
+    push(code, 195);
+
+    // ── `rt$serial_put_hex` (rdi = u64 -> prints `0x` + 8..16 hex digits) ──
+    st["labels"]["rt$serial_put_hex"] = len(code);
+    _x64_push(code, R_RBX);
+    _x64_push(code, R_RBP);
+    _x64_mov_rr(code, R_RBX, R_RDI);
+    _x64_mov_imm(code, R_RDI, 48); _x64_call_sym(st, "rt$serial_putc"); // '0'
+    _x64_mov_imm(code, R_RDI, 120); _x64_call_sym(st, "rt$serial_putc"); // 'x'
+    _x64_mov_imm(code, R_RBP, 28); // print 8 hex nibbles (32-bit phys range)
+    let hx_loop = len(code);
+    _x64_mov_rr(code, R_RAX, R_RBX);
+    _x64_mov_rr(code, R_RCX, R_RBP);
+    push(code, 72); push(code, 211); push(code, 232); // 48 D3 E8: shr rax, cl
+    push(code, 131); push(code, 224); push(code, 15); // 83 E0 0F: and eax, 15
+    push(code, 131); push(code, 248); push(code, 10); // 83 F8 0A: cmp eax, 10
+    let j_af = _x64_jcc(code, 141); // jge A..F
+    push(code, 131); push(code, 192); push(code, 48); // add eax, 48
+    let j_hchr = _x64_jmp(code);
+    _patch32(code, j_af, len(code) - (j_af + 4));
+    push(code, 131); push(code, 192); push(code, 55); // add eax, 55 ('A'-10)
+    _patch32(code, j_hchr, len(code) - (j_hchr + 4));
+    _x64_mov_rr(code, R_RDI, R_RAX);
+    _x64_call_sym(st, "rt$serial_putc");
+    _x64_sub_imm(code, R_RBP, 4);
+    let j_hnxt = _x64_jcc(code, 141); // jge hx_loop
+    _patch32(code, j_hnxt, hx_loop - (j_hnxt + 4));
+    _x64_pop(code, R_RBP);
+    _x64_pop(code, R_RBX);
+    push(code, 195);
+
+    // ── `rt$vga_puts` (rdi = NUL-terminated str, rsi = color attr byte) ──
+    st["labels"]["rt$vga_puts"] = len(code);
+    push(code, 185); _le(code, PHYS_KSTATE + 24, 4);  // rcx = &vga_cursor (0x145018)
+    push(code, 72); push(code, 139); push(code, 17);  // mov rdx, [rcx] (cell index)
+    push(code, 184); _le(code, PHYS_VGA_TEXT, 4);     // rax = 0xB8000
+    let vg_loop = len(code);
+    push(code, 68); push(code, 15); push(code, 182); push(code, 7); // 44 0F B6 07: movzx r8d, byte [rdi]
+    push(code, 69); push(code, 133); push(code, 192);               // 45 85 C0: test r8d, r8d
+    let j_vg_done = _x64_jcc(code, 132);
+    // Write `ch | (attr << 8)` to `[0xB8000 + rdx*2]`
+    push(code, 68); push(code, 136); push(code, 4); push(code, 80); // 44 88 04 50: mov [rax + rdx*2], r8b
+    push(code, 64); push(code, 136); push(code, 116); push(code, 80); push(code, 1); // 40 88 74 50 01: mov [rax + rdx*2 + 1], sil
+    _x64_add_imm(code, R_RDX, 1);
+    _x64_add_imm(code, R_RDI, 1);
+    let j_vg_back = _x64_jmp(code);
+    _patch32(code, j_vg_back, vg_loop - (j_vg_back + 4));
+    _patch32(code, j_vg_done, len(code) - (j_vg_done + 4));
+    push(code, 72); push(code, 137); push(code, 17);  // mov [rcx], rdx
+    push(code, 195);
+
+    // ── `rt$pmm_alloc_frame` (-> returns 4 KiB-aligned zeroed physical frame in RAX, or 0 if full) ──
+    st["labels"]["rt$pmm_alloc_frame"] = len(code);
+    push(code, 190); _le(code, PHYS_PMM_BITMAP, 4);   // rsi = 0x146000 (4096-entry byte map for 4096 4KiB frames = 16 MiB)
+    _x64_mov_imm(code, R_RCX, 0);
+    let pm_scan = len(code);
+    push(code, 72); push(code, 129); push(code, 249); _le(code, 4096, 4); // cmp rcx, 4096
+    let j_pm_oom = _x64_jcc(code, 141); // jge oom
+    push(code, 128); push(code, 60); push(code, 14); push(code, 0);       // 80 3C 0E 00: cmp byte [rsi + rcx], 0
+    let j_pm_found = _x64_jcc(code, 132); // je found
+    _x64_add_imm(code, R_RCX, 1);
+    let j_pm_nxt = _x64_jmp(code);
+    _patch32(code, j_pm_nxt, pm_scan - (j_pm_nxt + 4));
+    _patch32(code, j_pm_found, len(code) - (j_pm_found + 4));
+    push(code, 198); push(code, 4); push(code, 14); push(code, 1);        // C6 04 0E 01: mov byte [rsi + rcx], 1
+    // Increment `pmm_used_frames` at `0x145030`
+    push(code, 186); _le(code, PHYS_KSTATE + 48, 4);
+    push(code, 72); push(code, 255); push(code, 2);                       // 48 FF 02: inc qword [rdx]
+    // Compute `addr = PHYS_PMM_POOL + (rcx << 12)` and zero 4096 bytes (`512` qwords)
+    _x64_mov_rr(code, R_RAX, R_RCX);
+    push(code, 72); push(code, 193); push(code, 224); push(code, 12);     // 48 C1 E0 0C: shl rax, 12
+    _x64_add_imm(code, R_RAX, PHYS_PMM_POOL);
+    _x64_mov_rr(code, R_RDX, R_RAX);
+    _x64_mov_rr(code, R_RDI, R_RAX);
+    push(code, 49); push(code, 192);                                      // xor eax, eax
+    push(code, 185); _le(code, 512, 4);                                   // mov ecx, 512
+    push(code, 243); push(code, 72); push(code, 171);                     // F3 48 AB: rep stosq
+    _x64_mov_rr(code, R_RAX, R_RDX);
+    push(code, 195);
+    _patch32(code, j_pm_oom, len(code) - (j_pm_oom + 4));
+    _x64_mov_imm(code, R_RAX, 0);
+    push(code, 195);
+
+    // ── `rt$pmm_free_frame` (rdi = frame phys addr -> returns 1 if freed, 0 otherwise) ──
+    st["labels"]["rt$pmm_free_frame"] = len(code);
+    _x64_mov_rr(code, R_RAX, R_RDI);
+    _x64_sub_imm(code, R_RAX, PHYS_PMM_POOL);
+    let j_pf_bad1 = _x64_jcc(code, 140); // jl bad
+    push(code, 72); push(code, 193); push(code, 232); push(code, 12); // 48 C1 E8 0C: shr rax, 12
+    push(code, 72); push(code, 61); _le(code, 4096, 4);               // cmp rax, 4096
+    let j_pf_bad2 = _x64_jcc(code, 141); // jge bad
+    push(code, 190); _le(code, PHYS_PMM_BITMAP, 4);
+    push(code, 198); push(code, 4); push(code, 6); push(code, 0);     // C6 04 06 00: mov byte [rsi + rax], 0
+    push(code, 186); _le(code, PHYS_KSTATE + 48, 4);
+    push(code, 72); push(code, 255); push(code, 10);                  // 48 FF 0A: dec qword [rdx]
+    _x64_mov_imm(code, R_RAX, 1);
+    push(code, 195);
+    let pf_bad_pos = len(code);
+    _patch32(code, j_pf_bad1, pf_bad_pos - (j_pf_bad1 + 4));
+    _patch32(code, j_pf_bad2, pf_bad_pos - (j_pf_bad2 + 4));
+    _x64_mov_imm(code, R_RAX, 0);
+    push(code, 195);
+
+    // ── `rt$qemu_exit` (rdi = status -> `outb(0xF4, status)`) ──
+    st["labels"]["rt$qemu_exit"] = len(code);
+    push(code, 102); push(code, 186); _le(code, 244, 2); // mov dx, 0xF4
+    push(code, 64); push(code, 136); push(code, 248);    // mov al, dil
+    push(code, 238);                                     // out dx, al
+    let q_halt = len(code);
+    push(code, 250); push(code, 244);                    // cli; hlt
+    let j_qh = _x64_jmp(code);
+    _patch32(code, j_qh, q_halt - (j_qh + 4));
+
+    // ── Zero-GC Default Spurious Hardware ISR (`iretq`) ──
+    st["labels"]["isr$spurious"] = len(code);
+    _x64_push(code, R_RAX);
+    push(code, 176); push(code, 32); // mov al, 0x20
+    push(code, 230); push(code, 160);// out 0xA0, al
+    push(code, 230); push(code, 32); // out 0x20, al
+    _x64_pop(code, R_RAX);
+    push(code, 72); push(code, 207); // 48 CF: iretq
+
+    // ── Zero-GC `IRQ0` (`0x20`) Hardware Timer ISR (`rdtsc` cycle-measured + `iretq`) ──
+    st["labels"]["isr$irq0"] = len(code);
+    // 10 GPR pushes + `sub rsp, 8` = 88 bytes (+ 40-byte CPU interrupt frame = 128 bytes -> 16B aligned!)
+    _x64_push(code, R_RAX);
+    _x64_push(code, R_RCX);
+    _x64_push(code, R_RDX);
+    _x64_push(code, R_RBX);
+    _x64_push(code, R_RDI);
+    _x64_push(code, R_RSI);
+    _x64_push(code, R_R8);
+    _x64_push(code, R_R9);
+    _x64_push(code, R_R10);
+    _x64_push(code, R_R11);
+    _x64_sub_imm(code, R_RSP, 8);
+
+    // Read starting `rdtsc` -> RBX
+    push(code, 15); push(code, 49);                               // 0F 31: rdtsc
+    push(code, 72); push(code, 193); push(code, 226); push(code, 32); // 48 C1 E2 20: shl rdx, 32
+    push(code, 72); push(code, 9); push(code, 208);               // 48 09 D0: or rax, rdx
+    _x64_mov_rr(code, R_RBX, R_RAX);
+
+    // Increment `irq0_ticks` at `0x145000` -> RDI
+    push(code, 185); _le(code, PHYS_KSTATE, 4);                   // mov ecx, 0x145000
+    push(code, 72); push(code, 139); push(code, 57);              // 48 8B 39: mov rdi, [rcx]
+    push(code, 72); push(code, 255); push(code, 199);             // 48 FF C7: inc rdi
+    push(code, 72); push(code, 137); push(code, 57);              // 48 89 39: mov [rcx], rdi
+
+    if has_user_irq0 {
+        _x64_call_sym(st, "fn$irq0_handler");
+    }
+
+    // Read ending `rdtsc`, compute `elapsed = end - start`, update `isr_last_cycles` & `isr_min_cycles`
+    push(code, 15); push(code, 49);                               // 0F 31: rdtsc
+    push(code, 72); push(code, 193); push(code, 226); push(code, 32);
+    push(code, 72); push(code, 9); push(code, 208);
+    push(code, 72); push(code, 41); push(code, 216);              // 48 29 D8: sub rax, rbx
+    push(code, 185); _le(code, PHYS_KSTATE + 8, 4);               // mov ecx, 0x145008
+    push(code, 72); push(code, 137); push(code, 1);               // 48 89 01: mov [rcx], rax
+    push(code, 185); _le(code, PHYS_KSTATE + 16, 4);              // mov ecx, 0x145010
+    push(code, 72); push(code, 59); push(code, 1);                // 48 3B 01: cmp rax, [rcx]
+    push(code, 115); push(code, 3);                               // 73 03: jae +3
+    push(code, 72); push(code, 137); push(code, 1);               // 48 89 01: mov [rcx], rax
+
+    // Send 8259 Master PIC EOI (`out 0x20, 0x20`)
+    push(code, 176); push(code, 32);                              // B0 20: mov al, 0x20
+    push(code, 230); push(code, 32);                              // E6 20: out 0x20, al
+
+    _x64_add_imm(code, R_RSP, 8);
+    _x64_pop(code, R_R11);
+    _x64_pop(code, R_R10);
+    _x64_pop(code, R_R9);
+    _x64_pop(code, R_R8);
+    _x64_pop(code, R_RSI);
+    _x64_pop(code, R_RDI);
+    _x64_pop(code, R_RBX);
+    _x64_pop(code, R_RDX);
+    _x64_pop(code, R_RCX);
+    _x64_pop(code, R_RAX);
+    push(code, 72); push(code, 207); // 48 CF: iretq
+}
+
+// ── `@nogc` User Function & Expression Compiler (64-bit Ring-0) ───────────────
+
+fn _bm_prescan_locals(stmt, fctx) {
+    if stmt == nil or type(stmt) != "map" { return; }
+    let k = stmt["kind"];
+    if k == "block" or k == "program" {
+        let i = 0;
+        while i < len(stmt["stmts"]) { _bm_prescan_locals(stmt["stmts"][i], fctx); i = i + 1; }
+        return;
+    }
+    if k == "var_decl" {
+        let nm = stmt["name"];
+        if not map_has(fctx["slots"], nm) {
+            fctx["n_locals"] = fctx["n_locals"] + 1;
+            fctx["slots"][nm] = 0 - (fctx["n_locals"] * 8);
+        }
+        return;
+    }
+    if k == "for_stmt" {
+        let nm = stmt["var1"]["val"];
+        if not map_has(fctx["slots"], nm) {
+            fctx["n_locals"] = fctx["n_locals"] + 1;
+            fctx["slots"][nm] = 0 - (fctx["n_locals"] * 8);
+        }
+        _bm_prescan_locals(stmt["body"], fctx);
+        return;
+    }
+    if k == "if_stmt" {
+        _bm_prescan_locals(stmt["then_block"], fctx);
+        if stmt["else_block"] != nil { _bm_prescan_locals(stmt["else_block"], fctx); }
+        return;
+    }
+    if k == "while_stmt" or k == "loop_stmt" {
+        _bm_prescan_locals(stmt["body"], fctx);
+    }
+}
+
+fn _x64_get_var(st, fctx, nm, dst) {
+    let code = st["code"];
+    if map_has(fctx["slots"], nm) {
+        _x64_load_rbp(code, dst, fctx["slots"][nm]);
+        return;
+    }
+    if map_has(st["globals"], nm) {
+        let gaddr = st["globals"][nm];
+        push(code, 185); _le(code, gaddr, 4); // mov ecx, gaddr
+        push(code, _x64_rex(1, if dst >= 8 { 1 } else { 0 }, 0, 0));
+        push(code, 139); push(code, _x64_modrm(0, dst, R_RCX));
+        return;
+    }
+    _x64_mov_imm(code, dst, 0);
+}
+
+fn _x64_set_var(st, fctx, nm, src) {
+    let code = st["code"];
+    if map_has(fctx["slots"], nm) {
+        _x64_store_rbp(code, fctx["slots"][nm], src);
+        return;
+    }
+    if map_has(st["globals"], nm) {
+        let gaddr = st["globals"][nm];
+        push(code, 185); _le(code, gaddr, 4); // mov ecx, gaddr
+        push(code, _x64_rex(1, if src >= 8 { 1 } else { 0 }, 0, 0));
+        push(code, 137); push(code, _x64_modrm(0, src, R_RCX));
+    }
+}
+
+fn _x64_emit_expr(st, fctx, expr) {
+    let code = st["code"];
+    if expr == nil { _x64_mov_imm(code, R_RAX, 0); return; }
+    let k = expr["kind"];
+    if k == "num" {
+        _x64_mov_imm(code, R_RAX, _parse_int_lit(expr["val"]));
+        return;
+    }
+    if k == "bool" {
+        _x64_mov_imm(code, R_RAX, if expr["val"] { 1 } else { 0 });
+        return;
+    }
+    if k == "nil" {
+        _x64_mov_imm(code, R_RAX, 0);
+        return;
+    }
+    if k == "str" {
+        _x64_lea_str(st, R_RAX, expr["val"]);
+        return;
+    }
+    if k == "ident" {
+        _x64_get_var(st, fctx, expr["name"], R_RAX);
+        return;
+    }
+    if k == "unary" {
+        let op = expr["op"];
+        _x64_emit_expr(st, fctx, expr["arg"]);
+        if op == "-" { push(code, 72); push(code, 247); push(code, 216); return; }
+        if op == "~" { push(code, 72); push(code, 247); push(code, 208); return; }
+        if op == "not" or op == "!" {
+            push(code, 72); push(code, 133); push(code, 192);
+            push(code, 15); push(code, 148); push(code, 192);
+            push(code, 15); push(code, 182); push(code, 192);
+        }
+        return;
+    }
+    if k == "binary" {
+        let op = expr["op"];
+        if op == "and" {
+            _x64_emit_expr(st, fctx, expr["left"]);
+            push(code, 72); push(code, 133); push(code, 192);
+            let jf = _x64_jcc(code, 132);
+            _x64_emit_expr(st, fctx, expr["right"]);
+            push(code, 72); push(code, 133); push(code, 192);
+            push(code, 15); push(code, 149); push(code, 192);
+            push(code, 15); push(code, 182); push(code, 192);
+            let jd = _x64_jmp(code);
+            _patch32(code, jf, len(code) - (jf + 4));
+            _x64_mov_imm(code, R_RAX, 0);
+            _patch32(code, jd, len(code) - (jd + 4));
+            return;
+        }
+        if op == "or" {
+            _x64_emit_expr(st, fctx, expr["left"]);
+            push(code, 72); push(code, 133); push(code, 192);
+            let jt = _x64_jcc(code, 133);
+            _x64_emit_expr(st, fctx, expr["right"]);
+            push(code, 72); push(code, 133); push(code, 192);
+            push(code, 15); push(code, 149); push(code, 192);
+            push(code, 15); push(code, 182); push(code, 192);
+            let jd = _x64_jmp(code);
+            _patch32(code, jt, len(code) - (jt + 4));
+            _x64_mov_imm(code, R_RAX, 1);
+            _patch32(code, jd, len(code) - (jd + 4));
+            return;
+        }
+        _x64_emit_expr(st, fctx, expr["left"]);
+        _x64_push(code, R_RAX);
+        _x64_emit_expr(st, fctx, expr["right"]);
+        _x64_mov_rr(code, R_RCX, R_RAX);
+        _x64_pop(code, R_RAX);
+        if op == "+" { push(code, 72); push(code, 1); push(code, 200); return; }
+        if op == "-" { push(code, 72); push(code, 41); push(code, 200); return; }
+        if op == "*" { push(code, 72); push(code, 15); push(code, 175); push(code, 193); return; }
+        if op == "/" { push(code, 72); push(code, 153); push(code, 72); push(code, 247); push(code, 249); return; }
+        if op == "%" { push(code, 72); push(code, 153); push(code, 72); push(code, 247); push(code, 249); _x64_mov_rr(code, R_RAX, R_RDX); return; }
+        if op == "&" { push(code, 72); push(code, 33); push(code, 200); return; }
+        if op == "|" { push(code, 72); push(code, 9); push(code, 200); return; }
+        if op == "^" { push(code, 72); push(code, 49); push(code, 200); return; }
+        if op == "<<" { push(code, 72); push(code, 211); push(code, 224); return; }
+        if op == ">>" { push(code, 72); push(code, 211); push(code, 248); return; }
+        if op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=" {
+            push(code, 72); push(code, 57); push(code, 200); // 48 39 C8: cmp rax, rcx
+            let sc = if op == "==" { 148 } elif op == "!=" { 149 } elif op == "<" { 156 } elif op == "<=" { 158 } elif op == ">" { 159 } else { 157 };
+            push(code, 15); push(code, sc); push(code, 192);
+            push(code, 15); push(code, 182); push(code, 192);
+        }
+        return;
+    }
+    if k == "if_expr" {
+        _x64_emit_expr(st, fctx, expr["cond"]);
+        push(code, 72); push(code, 133); push(code, 192);
+        let jf = _x64_jcc(code, 132);
+        _x64_emit_expr(st, fctx, expr["then_expr"]);
+        let jd = _x64_jmp(code);
+        _patch32(code, jf, len(code) - (jf + 4));
+        _x64_emit_expr(st, fctx, expr["else_expr"]);
+        _patch32(code, jd, len(code) - (jd + 4));
+        return;
+    }
+    if k == "call" {
+        let cn = expr["callee"]["name"];
+        let args = expr["args"];
+        // Ring-0 Hardware Intrinsics!
+        if cn == "port_outb" {
+            _x64_emit_expr(st, fctx, args[0]);
+            _x64_push(code, R_RAX);
+            _x64_emit_expr(st, fctx, args[1]);
+            _x64_pop(code, R_RDX);
+            push(code, 238); // out dx, al
+            _x64_mov_imm(code, R_RAX, 0);
+            return;
+        }
+        if cn == "port_inb" {
+            _x64_emit_expr(st, fctx, args[0]);
+            _x64_mov_rr(code, R_RDX, R_RAX);
+            push(code, 49); push(code, 192); // xor eax, eax
+            push(code, 236);                 // in al, dx
+            return;
+        }
+        if cn == "port_outw" {
+            _x64_emit_expr(st, fctx, args[0]); _x64_push(code, R_RAX);
+            _x64_emit_expr(st, fctx, args[1]); _x64_pop(code, R_RDX);
+            push(code, 102); push(code, 239); // 66 EF: out dx, ax
+            return;
+        }
+        if cn == "port_inw" {
+            _x64_emit_expr(st, fctx, args[0]); _x64_mov_rr(code, R_RDX, R_RAX);
+            push(code, 49); push(code, 192);
+            push(code, 102); push(code, 237); // 66 ED: in ax, dx
+            return;
+        }
+        if cn == "port_outl" {
+            _x64_emit_expr(st, fctx, args[0]); _x64_push(code, R_RAX);
+            _x64_emit_expr(st, fctx, args[1]); _x64_pop(code, R_RDX);
+            push(code, 239); // EF: out dx, eax
+            return;
+        }
+        if cn == "port_inl" {
+            _x64_emit_expr(st, fctx, args[0]); _x64_mov_rr(code, R_RDX, R_RAX);
+            push(code, 49); push(code, 192);
+            push(code, 237); // ED: in eax, dx
+            return;
+        }
+        if cn == "rdtsc" {
+            push(code, 15); push(code, 49); // rdtsc
+            push(code, 72); push(code, 193); push(code, 226); push(code, 32);
+            push(code, 72); push(code, 9); push(code, 208);
+            return;
+        }
+        if cn == "cli" { push(code, 250); _x64_mov_imm(code, R_RAX, 0); return; }
+        if cn == "sti" { push(code, 251); _x64_mov_imm(code, R_RAX, 0); return; }
+        if cn == "hlt" { push(code, 244); _x64_mov_imm(code, R_RAX, 0); return; }
+        if cn == "serial_putc" {
+            _x64_emit_expr(st, fctx, args[0]);
+            _x64_mov_rr(code, R_RDI, R_RAX);
+            _x64_call_sym(st, "rt$serial_putc");
+            return;
+        }
+        if cn == "serial_puts" {
+            _x64_emit_expr(st, fctx, args[0]);
+            _x64_mov_rr(code, R_RDI, R_RAX);
+            _x64_call_sym(st, "rt$serial_puts");
+            return;
+        }
+        if cn == "serial_put_dec" {
+            _x64_emit_expr(st, fctx, args[0]);
+            _x64_mov_rr(code, R_RDI, R_RAX);
+            _x64_call_sym(st, "rt$serial_put_dec");
+            return;
+        }
+        if cn == "serial_put_hex" {
+            _x64_emit_expr(st, fctx, args[0]);
+            _x64_mov_rr(code, R_RDI, R_RAX);
+            _x64_call_sym(st, "rt$serial_put_hex");
+            return;
+        }
+        if cn == "vga_putc" {
+            // `vga_putc(idx, ch, attr)` -> `0xB8000 + idx * 2`
+            _x64_emit_expr(st, fctx, args[0]); _x64_push(code, R_RAX);
+            _x64_emit_expr(st, fctx, args[1]); _x64_push(code, R_RAX);
+            if len(args) >= 3 { _x64_emit_expr(st, fctx, args[2]); } else { _x64_mov_imm(code, R_RAX, 15); }
+            _x64_mov_rr(code, R_RDX, R_RAX); // attr
+            _x64_pop(code, R_RCX);           // ch
+            _x64_pop(code, R_RDI);           // cell idx
+            push(code, 184); _le(code, PHYS_VGA_TEXT, 4);
+            push(code, 136); push(code, 12); push(code, 120); // 88 0C 78: mov [rax + rdi*2], cl
+            push(code, 136); push(code, 84); push(code, 120); push(code, 1); // 88 54 78 01: mov [rax + rdi*2 + 1], dl
+            _x64_mov_imm(code, R_RAX, 0);
+            return;
+        }
+        if cn == "vga_puts" {
+            _x64_emit_expr(st, fctx, args[0]); _x64_push(code, R_RAX);
+            if len(args) >= 2 { _x64_emit_expr(st, fctx, args[1]); } else { _x64_mov_imm(code, R_RAX, 10); }
+            _x64_mov_rr(code, R_RSI, R_RAX);
+            _x64_pop(code, R_RDI);
+            _x64_call_sym(st, "rt$vga_puts");
+            return;
+        }
+        if cn == "pmm_alloc_frame" {
+            _x64_call_sym(st, "rt$pmm_alloc_frame");
+            return;
+        }
+        if cn == "pmm_free_frame" {
+            _x64_emit_expr(st, fctx, args[0]);
+            _x64_mov_rr(code, R_RDI, R_RAX);
+            _x64_call_sym(st, "rt$pmm_free_frame");
+            return;
+        }
+        if cn == "mmio_read32" {
+            _x64_emit_expr(st, fctx, args[0]);
+            push(code, 139); push(code, 0); // 8B 00: mov eax, [rax]
+            return;
+        }
+        if cn == "mmio_write32" {
+            _x64_emit_expr(st, fctx, args[0]); _x64_push(code, R_RAX);
+            _x64_emit_expr(st, fctx, args[1]); _x64_pop(code, R_RCX);
+            push(code, 137); push(code, 1); // 89 01: mov [rcx], eax
+            return;
+        }
+        if cn == "mmio_read64" {
+            _x64_emit_expr(st, fctx, args[0]);
+            push(code, 72); push(code, 139); push(code, 0); // 48 8B 00: mov rax, [rax]
+            return;
+        }
+        if cn == "mmio_write64" {
+            _x64_emit_expr(st, fctx, args[0]); _x64_push(code, R_RAX);
+            _x64_emit_expr(st, fctx, args[1]); _x64_pop(code, R_RCX);
+            push(code, 72); push(code, 137); push(code, 1); // 48 89 01: mov [rcx], rax
+            return;
+        }
+        if cn == "irq_ticks" {
+            push(code, 185); _le(code, PHYS_KSTATE, 4);
+            push(code, 72); push(code, 139); push(code, 1);
+            return;
+        }
+        if cn == "isr_cycles" {
+            push(code, 185); _le(code, PHYS_KSTATE + 16, 4);
+            push(code, 72); push(code, 139); push(code, 1);
+            return;
+        }
+        if cn == "qemu_exit" {
+            if len(args) > 0 { _x64_emit_expr(st, fctx, args[0]); } else { _x64_mov_imm(code, R_RAX, 16); }
+            _x64_mov_rr(code, R_RDI, R_RAX);
+            _x64_call_sym(st, "rt$qemu_exit");
+            return;
+        }
+        if cn == "print" or cn == "println" {
+            let ai = 0;
+            while ai < len(args) {
+                if ai > 0 { _x64_mov_imm(code, R_RDI, 32); _x64_call_sym(st, "rt$serial_putc"); }
+                let a = args[ai];
+                if a["kind"] == "str" {
+                    _x64_lea_str(st, R_RDI, a["val"]);
+                    _x64_call_sym(st, "rt$serial_puts");
+                } else {
+                    _x64_emit_expr(st, fctx, a);
+                    _x64_mov_rr(code, R_RDI, R_RAX);
+                    _x64_call_sym(st, "rt$serial_put_dec");
+                }
+                ai = ai + 1;
+            }
+            if cn == "println" or len(args) > 0 {
+                _x64_call_sym(st, "rt$serial_put_crlf");
+            }
+            _x64_mov_imm(code, R_RAX, 0);
+            return;
+        }
+
+        // User `@nogc` function call (SysV AMD64 ABI: rdi, rsi, rdx, rcx, r8, r9)
+        let pregs = [R_RDI, R_RSI, R_RDX, R_RCX, R_R8, R_R9];
+        let na = if len(args) < 6 { len(args) } else { 6 };
+        let pi = 0;
+        while pi < na {
+            _x64_emit_expr(st, fctx, args[pi]);
+            _x64_push(code, R_RAX);
+            pi = pi + 1;
+        }
+        let pj = na - 1;
+        while pj >= 0 {
+            _x64_pop(code, pregs[pj]);
+            pj = pj - 1;
+        }
+        _x64_call_sym(st, "fn$" + cn);
+    }
+}
+
+fn _x64_emit_stmt(st, fctx, stmt) {
+    if stmt == nil or type(stmt) != "map" { return; }
+    let code = st["code"];
+    let k = stmt["kind"];
+    if k == "empty" or k == "export_stmt" or k == "struct_decl" or k == "fn_decl" { return; }
+    if k == "block" or k == "program" {
+        let i = 0;
+        while i < len(stmt["stmts"]) { _x64_emit_stmt(st, fctx, stmt["stmts"][i]); i = i + 1; }
+        if map_has(stmt, "tail_expr") and stmt["tail_expr"] != nil {
+            _x64_emit_expr(st, fctx, stmt["tail_expr"]);
+        }
+        return;
+    }
+    if k == "var_decl" {
+        _x64_emit_expr(st, fctx, stmt["init"]);
+        _x64_set_var(st, fctx, stmt["name"], R_RAX);
+        return;
+    }
+    if k == "assign" {
+        let nm = stmt["target"]["name"];
+        let op = stmt["op"];
+        if op == "=" {
+            _x64_emit_expr(st, fctx, stmt["val"]);
+            _x64_set_var(st, fctx, nm, R_RAX);
+        } else {
+            let bop = str_slice(op, 0, 1);
+            let syn = map{ kind: "binary", op: bop, left: map{ kind: "ident", name: nm }, right: stmt["val"] };
+            _x64_emit_expr(st, fctx, syn);
+            _x64_set_var(st, fctx, nm, R_RAX);
+        }
+        return;
+    }
+    if k == "print_stmt" {
+        let ai = 0;
+        while ai < len(stmt["args"]) {
+            if ai > 0 { _x64_mov_imm(code, R_RDI, 32); _x64_call_sym(st, "rt$serial_putc"); }
+            let a = stmt["args"][ai];
+            if a["kind"] == "str" {
+                _x64_lea_str(st, R_RDI, a["val"]);
+                _x64_call_sym(st, "rt$serial_puts");
+            } else {
+                _x64_emit_expr(st, fctx, a);
+                _x64_mov_rr(code, R_RDI, R_RAX);
+                _x64_call_sym(st, "rt$serial_put_dec");
+            }
+            ai = ai + 1;
+        }
+        _x64_call_sym(st, "rt$serial_put_crlf");
+        return;
+    }
+    if k == "expr_stmt" { _x64_emit_expr(st, fctx, stmt["expr"]); return; }
+    if k == "return_stmt" {
+        _x64_emit_expr(st, fctx, stmt["val"]);
+        push(fctx["ret_jumps"], _x64_jmp(code));
+        return;
+    }
+    if k == "if_stmt" {
+        _x64_emit_expr(st, fctx, stmt["cond"]);
+        push(code, 72); push(code, 133); push(code, 192);
+        let jf = _x64_jcc(code, 132);
+        _x64_emit_stmt(st, fctx, stmt["then_block"]);
+        if stmt["else_block"] != nil {
+            let jd = _x64_jmp(code);
+            _patch32(code, jf, len(code) - (jf + 4));
+            _x64_emit_stmt(st, fctx, stmt["else_block"]);
+            _patch32(code, jd, len(code) - (jd + 4));
+        } else {
+            _patch32(code, jf, len(code) - (jf + 4));
+        }
+        return;
+    }
+    if k == "while_stmt" {
+        let top = len(code);
+        let lc = map{ breaks: [], continues: [] };
+        push(fctx["loops"], lc);
+        _x64_emit_expr(st, fctx, stmt["cond"]);
+        push(code, 72); push(code, 133); push(code, 192);
+        let jx = _x64_jcc(code, 132);
+        _x64_emit_stmt(st, fctx, stmt["body"]);
+        let jb = _x64_jmp(code);
+        _patch32(code, jb, top - (jb + 4));
+        let lend = len(code);
+        _patch32(code, jx, lend - (jx + 4));
+        let bi = 0; while bi < len(lc["breaks"]) { _patch32(code, lc["breaks"][bi], lend - (lc["breaks"][bi] + 4)); bi = bi + 1; }
+        let ci = 0; while ci < len(lc["continues"]) { _patch32(code, lc["continues"][ci], top - (lc["continues"][ci] + 4)); ci = ci + 1; }
+        pop(fctx["loops"]);
+        return;
+    }
+    if k == "loop_stmt" {
+        let top = len(code);
+        let lc = map{ breaks: [], continues: [] };
+        push(fctx["loops"], lc);
+        _x64_emit_stmt(st, fctx, stmt["body"]);
+        let jb = _x64_jmp(code);
+        _patch32(code, jb, top - (jb + 4));
+        let lend = len(code);
+        let bi = 0; while bi < len(lc["breaks"]) { _patch32(code, lc["breaks"][bi], lend - (lc["breaks"][bi] + 4)); bi = bi + 1; }
+        let ci = 0; while ci < len(lc["continues"]) { _patch32(code, lc["continues"][ci], top - (lc["continues"][ci] + 4)); ci = ci + 1; }
+        pop(fctx["loops"]);
+        return;
+    }
+    if k == "for_stmt" {
+        let vnm = stmt["var1"]["val"];
+        _x64_emit_expr(st, fctx, stmt["iter"]);
+        _x64_set_var(st, fctx, vnm, R_RAX);
+        let top = len(code);
+        let lc = map{ breaks: [], continues: [] };
+        push(fctx["loops"], lc);
+        let cmp_n = map{ kind: "binary", op: "<=", left: map{ kind: "ident", name: vnm }, right: stmt["range_end"] };
+        _x64_emit_expr(st, fctx, cmp_n);
+        push(code, 72); push(code, 133); push(code, 192);
+        let jx = _x64_jcc(code, 132);
+        _x64_emit_stmt(st, fctx, stmt["body"]);
+        let step_p = len(code);
+        _x64_get_var(st, fctx, vnm, R_RAX);
+        _x64_add_imm(code, R_RAX, 1);
+        _x64_set_var(st, fctx, vnm, R_RAX);
+        let jb = _x64_jmp(code);
+        _patch32(code, jb, top - (jb + 4));
+        let lend = len(code);
+        _patch32(code, jx, lend - (jx + 4));
+        let bi = 0; while bi < len(lc["breaks"]) { _patch32(code, lc["breaks"][bi], lend - (lc["breaks"][bi] + 4)); bi = bi + 1; }
+        let ci = 0; while ci < len(lc["continues"]) { _patch32(code, lc["continues"][ci], step_p - (lc["continues"][ci] + 4)); ci = ci + 1; }
+        pop(fctx["loops"]);
+        return;
+    }
+    if k == "break_stmt" and len(fctx["loops"]) > 0 {
+        push(fctx["loops"][len(fctx["loops"]) - 1]["breaks"], _x64_jmp(code));
+        return;
+    }
+    if k == "continue_stmt" and len(fctx["loops"]) > 0 {
+        push(fctx["loops"][len(fctx["loops"]) - 1]["continues"], _x64_jmp(code));
+    }
+}
+
+fn _x64_compile_fn(st, fn_name, params, body_stmt) {
+    let code = st["code"];
+    st["labels"]["fn$" + fn_name] = len(code);
+    let fctx = map{ n_locals: 0, slots: map{}, loops: [], ret_jumps: [] };
+    let pi = 0;
+    while pi < len(params) {
+        fctx["n_locals"] = fctx["n_locals"] + 1;
+        fctx["slots"][params[pi]["name"]] = 0 - (fctx["n_locals"] * 8);
+        pi = pi + 1;
+    }
+    _bm_prescan_locals(body_stmt, fctx);
+    let fbytes = _align_up(fctx["n_locals"] * 8, 16);
+
+    _x64_push(code, R_RBP);
+    _x64_mov_rr(code, R_RBP, R_RSP);
+    if fbytes > 0 { _x64_sub_imm(code, R_RSP, fbytes); }
+
+    let pregs = [R_RDI, R_RSI, R_RDX, R_RCX, R_R8, R_R9];
+    let ai = 0;
+    while ai < len(params) and ai < 6 {
+        _x64_store_rbp(code, fctx["slots"][params[ai]["name"]], pregs[ai]);
+        ai = ai + 1;
+    }
+
+    _x64_mov_imm(code, R_RAX, 0);
+    _x64_emit_stmt(st, fctx, body_stmt);
+
+    let ep_pos = len(code);
+    let ri = 0;
+    while ri < len(fctx["ret_jumps"]) {
+        _patch32(code, fctx["ret_jumps"][ri], ep_pos - (fctx["ret_jumps"][ri] + 4));
+        ri = ri + 1;
+    }
+    if fbytes > 0 { _x64_add_imm(code, R_RSP, fbytes); }
+    _x64_pop(code, R_RBP);
+    push(code, 195);
+}
+
+fn _compile_kernel_x64_payload(ast) {
+    let st = map{
+        code: [],
+        labels: map{},
+        calls: [],
+        globals: map{},
+        str_pool: map{},
+        str_list: [],
+        str_fixes: [],
+        addr_fixes: []
+    };
+
+    let fn_decls = [];
+    let top_stmts = [];
+    let has_kernel_main = false;
+    let has_user_irq0 = false;
+    let next_glob = PHYS_GLOBALS;
+
+    let i = 0;
+    while i < len(ast["stmts"]) {
+        let s = ast["stmts"][i];
+        if s != nil and type(s) == "map" {
+            let sk = s["kind"];
+            if sk == "export_stmt" and s["decl"] != nil { s = s["decl"]; sk = s["kind"]; }
+            if sk == "fn_decl" {
+                push(fn_decls, s);
+                if s["name"] == "kernel_main" or s["name"] == "main" { has_kernel_main = true; }
+                if s["name"] == "irq0_handler" { has_user_irq0 = true; }
+            } elif sk != "empty" and sk != "struct_decl" {
+                if sk == "var_decl" {
+                    st["globals"][s["name"]] = next_glob;
+                    next_glob = next_glob + 8;
+                }
+                push(top_stmts, s);
+            }
+        }
+        i = i + 1;
+    }
+
+    let code = st["code"];
+
+    // ── 64-bit Ring-0 Entry at `0x102000` (`PHYS_KERNEL64`) ──
+    _x64_mov_imm(code, R_RSP, PHYS_STACK_TOP);
+
+    // 1. Zero IDT + IDTR + KSTATE + PMM_BITMAP (`0x143000 .. 0x146FFF` = 16 KiB = 2048 qwords)
+    push(code, 191); _le(code, PHYS_IDT, 4);      // mov edi, 0x143000
+    push(code, 49); push(code, 192);              // xor eax, eax
+    push(code, 185); _le(code, 2048, 4);          // mov ecx, 2048
+    push(code, 243); push(code, 72); push(code, 171); // rep stosq
+
+    // 2. Initialize KSTATE (`isr_min_cycles = 0x7FFFFFFF`, `pmm_base = 0x400000`, `pmm_total = 4096`)
+    push(code, 185); _le(code, PHYS_KSTATE + 16, 4);
+    _x64_mov_imm(code, R_RAX, 2147483647);
+    push(code, 72); push(code, 137); push(code, 1);
+    push(code, 185); _le(code, PHYS_KSTATE + 32, 4);
+    _x64_mov_imm(code, R_RAX, PHYS_PMM_POOL);
+    push(code, 72); push(code, 137); push(code, 1);
+    push(code, 185); _le(code, PHYS_KSTATE + 40, 4);
+    _x64_mov_imm(code, R_RAX, 4096);
+    push(code, 72); push(code, 137); push(code, 1);
+
+    // 3. Initialize COM1 (0x3F8) 115200 8N1 UART
+    _x64_outb_imm(code, 1017, 0);   // 0x3F9: disable UART IRQs
+    _x64_outb_imm(code, 1019, 128); // 0x3FB: enable DLAB
+    _x64_outb_imm(code, 1016, 1);   // 0x3F8: divisor low = 1 (115200 baud)
+    _x64_outb_imm(code, 1017, 0);   // 0x3F9: divisor high = 0
+    _x64_outb_imm(code, 1019, 3);   // 0x3FB: 8N1
+    _x64_outb_imm(code, 1018, 199); // 0x3FA: FIFO enable/clear
+    _x64_outb_imm(code, 1020, 11);  // 0x3FC: RTS/DSR
+
+    // 4. Write VGA banner to 0xB8000 + COM1 boot telemetry
+    _x64_lea_str(st, R_RDI, "PBLANG v4.0.0 RING-0 X86_64 KERNEL");
+    _x64_mov_imm(code, R_RSI, 31); // bright white on blue
+    _x64_call_sym(st, "rt$vga_puts");
+
+    _x64_lea_str(st, R_RDI, "PBLANG_BAREMETAL_V4=BOOT\r\nARCH=x86_64\r\nGDT=OK\r\nPAGING_64=OK\r\n");
+    _x64_call_sym(st, "rt$serial_puts");
+
+    // 5. Populate 256-entry 64-bit IDT at `0x143000` (16 bytes per Interrupt Gate)
+    // Load `isr$spurious` physical address into RDX
+    push(code, 186);
+    let fix_spur = len(code); _le(code, 0, 4);
+    push(st["addr_fixes"], map{ at: fix_spur, name: "isr$spurious" });
+
+    push(code, 191); _le(code, PHYS_IDT, 4); // rdi = 0x143000
+    _x64_mov_imm(code, R_RCX, 256);
+    let idt_fill = len(code);
+    // Gate word 0: offset_15_0 | (0x0008 << 16)
+    _x64_mov_rr(code, R_RAX, R_RDX);
+    push(code, 37); _le(code, 65535, 4);        // 25 FF FF 00 00: and eax, 0xFFFF
+    push(code, 13); _le(code, 524288, 4);       // 0D 00 00 08 00: or eax, (0x0008 << 16)
+    push(code, 137); push(code, 7);             // mov [rdi], eax
+    // Gate word 1: (offset_31_16 << 16) | 0x8E00
+    _x64_mov_rr(code, R_RAX, R_RDX);
+    push(code, 37); _le(code, 4294901760, 4);   // and eax, 0xFFFF0000
+    push(code, 13); _le(code, 36352, 4);        // or eax, 0x8E00 (Present, DPL=0, 64-bit Interrupt Gate)
+    push(code, 137); push(code, 71); push(code, 4); // mov [rdi + 4], eax
+    // Gate words 2 & 3 = 0 (already zeroed!)
+    _x64_add_imm(code, R_RDI, 16);
+    push(code, 255); push(code, 201);           // dec ecx
+    let j_idtf = _x64_jcc(code, 133);
+    _patch32(code, j_idtf, idt_fill - (j_idtf + 4));
+
+    // Overwrite vector `0x20` (`32`, `0x143000 + 512 = 0x143200`) with `isr$irq0`!
+    push(code, 186);
+    let fix_irq0 = len(code); _le(code, 0, 4);
+    push(st["addr_fixes"], map{ at: fix_irq0, name: "isr$irq0" });
+    push(code, 191); _le(code, PHYS_IDT + 512, 4);
+    _x64_mov_rr(code, R_RAX, R_RDX);
+    push(code, 37); _le(code, 65535, 4);
+    push(code, 13); _le(code, 524288, 4);
+    push(code, 137); push(code, 7);
+    _x64_mov_rr(code, R_RAX, R_RDX);
+    push(code, 37); _le(code, 4294901760, 4);
+    push(code, 13); _le(code, 36352, 4);
+    push(code, 137); push(code, 71); push(code, 4);
+
+    // Write IDTR (`limit = 4095`, `base = 0x143000`) at `0x144000` and execute `lidt [rax]`
+    push(code, 184); _le(code, PHYS_IDTR, 4);
+    push(code, 102); push(code, 199); push(code, 0); _le(code, 4095, 2); // 66 C7 00 FF 0F: mov word [rax], 4095
+    push(code, 72); push(code, 199); push(code, 64); push(code, 2); _le(code, PHYS_IDT, 4); // mov qword [rax+2], 0x143000
+    push(code, 15); push(code, 1); push(code, 24); // 0F 01 18: lidt [rax]
+
+    // 6. Remap 8259 Master/Slave PIC (`0x20..0x2F`) & configure 8254 PIT Channel 0 (`1000 Hz`, divisor `1193 = 0x04A9`)
+    _x64_outb_imm(code, 32, 17);   // Master ICW1
+    _x64_outb_imm(code, 160, 17);  // Slave  ICW1
+    _x64_outb_imm(code, 33, 32);   // Master ICW2: offset 0x20
+    _x64_outb_imm(code, 161, 40);  // Slave  ICW2: offset 0x28
+    _x64_outb_imm(code, 33, 4);    // Master ICW3
+    _x64_outb_imm(code, 161, 2);   // Slave  ICW3
+    _x64_outb_imm(code, 33, 1);    // Master ICW4: 8086
+    _x64_outb_imm(code, 161, 1);   // Slave  ICW4: 8086
+    _x64_outb_imm(code, 33, 254);  // Unmask ONLY IRQ0 timer (0xFE)
+    _x64_outb_imm(code, 161, 255); // Mask all Slave IRQs (0xFF)
+
+    _x64_outb_imm(code, 67, 54);   // PIT cmd 0x43 = 0x36 (ch0, mode 3)
+    _x64_outb_imm(code, 64, 169);  // PIT data 0x40 = 0xA9 (1193 & 0xFF)
+    _x64_outb_imm(code, 64, 4);    // PIT data 0x40 = 0x04 (1193 >> 8)
+
+    // 7. Enable hardware interrupts (`sti`) and wait (`hlt`) until >= 3 live `IRQ0` timer ISRs fire!
+    push(code, 251); // FB: sti
+    let wait_irq = len(code);
+    push(code, 244); // F4: hlt
+    push(code, 185); _le(code, PHYS_KSTATE, 4);
+    push(code, 72); push(code, 131); push(code, 57); push(code, 3); // 48 83 39 03: cmp qword [rcx], 3
+    let j_wirq = _x64_jcc(code, 140); // jl wait_irq
+    _patch32(code, j_wirq, wait_irq - (j_wirq + 4));
+
+    push(code, 250); // FA: cli
+    _x64_outb_imm(code, 33, 255); // Mask PIC after sampling timer ticks so user code runs deterministically unless it calls `sti()`
+
+    // Emit `IDT_IRQ0_TICKS=<n>` and `ISR_CYCLES=<cycles>` over COM1
+    _x64_lea_str(st, R_RDI, "IDT_IRQ0_TICKS=");
+    _x64_call_sym(st, "rt$serial_puts");
+    push(code, 185); _le(code, PHYS_KSTATE, 4);
+    push(code, 72); push(code, 139); push(code, 57); // mov rdi, [rcx]
+    _x64_call_sym(st, "rt$serial_put_dec");
+    _x64_call_sym(st, "rt$serial_put_crlf");
+
+    _x64_lea_str(st, R_RDI, "ISR_CYCLES=");
+    _x64_call_sym(st, "rt$serial_puts");
+    push(code, 185); _le(code, PHYS_KSTATE + 16, 4);
+    push(code, 72); push(code, 139); push(code, 57);
+    _x64_call_sym(st, "rt$serial_put_dec");
+    _x64_call_sym(st, "rt$serial_put_crlf");
+
+    // 8. Verify PMM 4 KiB frame allocation (`0x400000`) & release it back so user starts with clean pool
+    _x64_call_sym(st, "rt$pmm_alloc_frame");
+    _x64_push(code, R_RAX);
+    _x64_lea_str(st, R_RDI, "PMM_FRAME=");
+    _x64_call_sym(st, "rt$serial_puts");
+    _x64_pop(code, R_RDI);
+    _x64_push(code, R_RDI);
+    _x64_call_sym(st, "rt$serial_put_hex");
+    _x64_call_sym(st, "rt$serial_put_crlf");
+    _x64_pop(code, R_RDI);
+    _x64_call_sym(st, "rt$pmm_free_frame");
+
+    // 9. Execute `@nogc` top-level init + user `kernel_main()` / `main()`
+    _x64_call_sym(st, "fn$__kernel_top");
+    if has_kernel_main {
+        let entry_fn = "fn$kernel_main";
+        let fi = 0;
+        let found_km = false;
+        while fi < len(fn_decls) {
+            if fn_decls[fi]["name"] == "kernel_main" { found_km = true; }
+            fi = fi + 1;
+        }
+        if not found_km { entry_fn = "fn$main"; }
+        _x64_call_sym(st, entry_fn);
+    }
+    _x64_push(code, R_RAX);
+    _x64_lea_str(st, R_RDI, "KERNEL_MAIN_RET=");
+    _x64_call_sym(st, "rt$serial_puts");
+    _x64_pop(code, R_RDI);
+    _x64_call_sym(st, "rt$serial_put_dec");
+    _x64_call_sym(st, "rt$serial_put_crlf");
+
+    // 10. Clean QEMU `isa-debug-exit` (`outb(0xF4, 0x10)` -> host exit status `(0x10 << 1) | 1 = 33`)
+    _x64_mov_imm(code, R_RDI, 16);
+    _x64_call_sym(st, "rt$qemu_exit");
+
+    // Compile `__kernel_top`, all user `@nogc` functions, and Ring-0 runtime + ISRs
+    _x64_compile_fn(st, "__kernel_top", [], map{ kind: "block", stmts: top_stmts, tail_expr: nil });
+    let fdi = 0;
+    while fdi < len(fn_decls) {
+        let fd = fn_decls[fdi];
+        _x64_compile_fn(st, fd["name"], fd["params"], fd["body"]);
+        fdi = fdi + 1;
+    }
+    _x64_emit_ring0_runtime(st, has_user_irq0);
+
+    // Resolve all relative `call` targets
+    let ci = 0;
+    while ci < len(st["calls"]) {
+        let c = st["calls"][ci];
+        if not map_has(st["labels"], c["name"]) {
+            throw "baremetal_kernel_x64: unresolved symbol '" + c["name"] + "'";
+        }
+        _patch32(code, c["at"], st["labels"][c["name"]] - (c["at"] + 4));
+        ci = ci + 1;
+    }
+
+    // Resolve physical ISR addresses (`PHYS_KERNEL64 + label_off`)
+    let afi = 0;
+    while afi < len(st["addr_fixes"]) {
+        let af = st["addr_fixes"][afi];
+        _patch32(code, af["at"], PHYS_KERNEL64 + st["labels"][af["name"]]);
+        afi = afi + 1;
+    }
+
+    // Append `.rodata` NUL-terminated strings right after aligned code
+    while (len(code) % 16) != 0 { push(code, 0); }
+    let str_phys = map{};
+    let si = 0;
+    while si < len(st["str_list"]) {
+        str_phys[str(si)] = PHYS_KERNEL64 + len(code);
+        let sb = str_to_bytes(st["str_list"][si]);
+        _push_bytes(code, sb);
+        push(code, 0);
+        si = si + 1;
+    }
+    while (len(code) % 16) != 0 { push(code, 0); }
+
+    let sfi = 0;
+    while sfi < len(st["str_fixes"]) {
+        let sf = st["str_fixes"][sfi];
+        _patch32(code, sf["at"], str_phys[str(sf["idx"])]);
+        sfi = sfi + 1;
+    }
+
+    return code;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 32-BIT PROTECTED-MODE RING-0 KERNEL & `@nogc` COMPILER (`baremetal-x86`)
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _x86_jmp(code) { push(code, 233); let p = len(code); _le(code, 0, 4); return p; }
+fn _x86_jcc(code, cc2) { push(code, 15); push(code, cc2); let p = len(code); _le(code, 0, 4); return p; }
+fn _x86_call_sym(st, sym) { let code = st["code"]; push(code, 232); let p = len(code); _le(code, 0, 4); push(st["calls"], map{ at: p, name: sym }); }
+
+fn _x86_lea_str(st, reg32, s) {
+    let code = st["code"];
+    let idx = 0;
+    if map_has(st["str_pool"], s) { idx = st["str_pool"][s]; }
+    else { idx = len(st["str_list"]); st["str_pool"][s] = idx; push(st["str_list"], s); }
+    push(code, 184 + reg32);
+    let p = len(code);
+    _le(code, 0, 4);
+    push(st["str_fixes"], map{ at: p, idx: idx });
+}
+
+fn _x86_emit_ring0_runtime(st, has_user_irq0) {
+    let code = st["code"];
+
+    // `rt$serial_putc` (eax = byte)
+    st["labels"]["rt$serial_putc"] = len(code);
+    push(code, 83); // push ebx
+    push(code, 137); push(code, 195); // mov ebx, eax
+    push(code, 185); _le(code, 65536, 4);
+    let wtx = len(code);
+    push(code, 102); push(code, 186); _le(code, 1021, 2);
+    push(code, 236); push(code, 168); push(code, 32);
+    let jrdy = _x86_jcc(code, 133);
+    push(code, 73); // dec ecx
+    let jagn = _x86_jcc(code, 133);
+    _patch32(code, jagn, wtx - (jagn + 4));
+    _patch32(code, jrdy, len(code) - (jrdy + 4));
+    push(code, 102); push(code, 186); _le(code, 1016, 2);
+    push(code, 137); push(code, 216); // mov eax, ebx
+    push(code, 238);                  // out dx, al
+    push(code, 91);                   // pop ebx
+    push(code, 195);
+
+    // `rt$serial_puts` (eax = str ptr)
+    st["labels"]["rt$serial_puts"] = len(code);
+    push(code, 86); // push esi
+    push(code, 137); push(code, 198); // mov esi, eax
+    let spl = len(code);
+    push(code, 15); push(code, 182); push(code, 6); // movzx eax, byte [esi]
+    push(code, 133); push(code, 192);
+    let jdone = _x86_jcc(code, 132);
+    _x86_call_sym(st, "rt$serial_putc");
+    push(code, 70); // inc esi
+    let jb = _x86_jmp(code);
+    _patch32(code, jb, spl - (jb + 4));
+    _patch32(code, jdone, len(code) - (jdone + 4));
+    push(code, 94); // pop esi
+    push(code, 195);
+
+    // `rt$serial_put_crlf`
+    st["labels"]["rt$serial_put_crlf"] = len(code);
+    push(code, 184); _le(code, 13, 4); _x86_call_sym(st, "rt$serial_putc");
+    push(code, 184); _le(code, 10, 4); _x86_call_sym(st, "rt$serial_putc");
+    push(code, 195);
+
+    // `rt$serial_put_dec` (eax = signed i32)
+    st["labels"]["rt$serial_put_dec"] = len(code);
+    push(code, 85); push(code, 137); push(code, 229); // push ebp; mov ebp, esp
+    push(code, 83); push(code, 131); push(code, 236); push(code, 24);
+    push(code, 133); push(code, 192);
+    let jpos = _x86_jcc(code, 141);
+    push(code, 80);
+    push(code, 184); _le(code, 45, 4); _x86_call_sym(st, "rt$serial_putc");
+    push(code, 88);
+    push(code, 247); push(code, 216); // neg eax
+    _patch32(code, jpos, len(code) - (jpos + 4));
+    push(code, 141); push(code, 93); push(code, 248); // lea ebx, [ebp - 8]
+    push(code, 198); push(code, 3); push(code, 0);
+    push(code, 185); _le(code, 10, 4);
+    let dlp = len(code);
+    push(code, 75); // dec ebx
+    push(code, 49); push(code, 210); // xor edx, edx
+    push(code, 247); push(code, 241); // div ecx
+    push(code, 128); push(code, 194); push(code, 48);
+    push(code, 136); push(code, 19);
+    push(code, 133); push(code, 192);
+    let jdm = _x86_jcc(code, 133);
+    _patch32(code, jdm, dlp - (jdm + 4));
+    push(code, 137); push(code, 216);
+    _x86_call_sym(st, "rt$serial_puts");
+    push(code, 131); push(code, 196); push(code, 24);
+    push(code, 91); push(code, 93); push(code, 195);
+
+    // `rt$pmm_alloc_frame`
+    st["labels"]["rt$pmm_alloc_frame"] = len(code);
+    push(code, 86); push(code, 87);
+    push(code, 190); _le(code, PHYS_PMM_BITMAP, 4);
+    push(code, 49); push(code, 201);
+    let psc = len(code);
+    push(code, 129); push(code, 249); _le(code, 4096, 4);
+    let joom = _x86_jcc(code, 141);
+    push(code, 128); push(code, 60); push(code, 14); push(code, 0);
+    let jfnd = _x86_jcc(code, 132);
+    push(code, 65);
+    let jpn = _x86_jmp(code);
+    _patch32(code, jpn, psc - (jpn + 4));
+    _patch32(code, jfnd, len(code) - (jfnd + 4));
+    push(code, 198); push(code, 4); push(code, 14); push(code, 1);
+    push(code, 137); push(code, 200);
+    push(code, 193); push(code, 224); push(code, 12);
+    push(code, 5); _le(code, PHYS_PMM_POOL, 4);
+    push(code, 137); push(code, 194);
+    push(code, 137); push(code, 199);
+    push(code, 49); push(code, 192);
+    push(code, 185); _le(code, 1024, 4);
+    push(code, 243); push(code, 171); // rep stosd
+    push(code, 137); push(code, 208);
+    push(code, 95); push(code, 94); push(code, 195);
+    _patch32(code, joom, len(code) - (joom + 4));
+    push(code, 49); push(code, 192);
+    push(code, 95); push(code, 94); push(code, 195);
+
+    // `rt$pmm_free_frame` (eax = addr)
+    st["labels"]["rt$pmm_free_frame"] = len(code);
+    push(code, 45); _le(code, PHYS_PMM_POOL, 4);
+    let jfb = _x86_jcc(code, 140);
+    push(code, 193); push(code, 232); push(code, 12);
+    push(code, 61); _le(code, 4096, 4);
+    let jfb2 = _x86_jcc(code, 141);
+    push(code, 198); push(code, 128); _le(code, PHYS_PMM_BITMAP, 4); push(code, 0); // mov byte [0x146000 + eax], 0
+    push(code, 184); _le(code, 1, 4); push(code, 195);
+    let fbp = len(code);
+    _patch32(code, jfb, fbp - (jfb + 4));
+    _patch32(code, jfb2, fbp - (jfb2 + 4));
+    push(code, 49); push(code, 192); push(code, 195);
+
+    // `rt$qemu_exit` (eax = status)
+    st["labels"]["rt$qemu_exit"] = len(code);
+    push(code, 102); push(code, 186); _le(code, 244, 2);
+    push(code, 238);
+    let qh32 = len(code);
+    push(code, 250); push(code, 244);
+    let jq32 = _x86_jmp(code);
+    _patch32(code, jq32, qh32 - (jq32 + 4));
+
+    // Spurious 32-bit ISR (`iretd`)
+    st["labels"]["isr$spurious"] = len(code);
+    push(code, 80);
+    push(code, 176); push(code, 32);
+    push(code, 230); push(code, 160);
+    push(code, 230); push(code, 32);
+    push(code, 88);
+    push(code, 207); // CF: iretd
+
+    // Zero-GC 32-bit `IRQ0` Timer ISR (`pushad`, `rdtsc`, EOI, `popad`, `iretd`)
+    st["labels"]["isr$irq0"] = len(code);
+    push(code, 96); // 60: pushad
+    push(code, 15); push(code, 49); // rdtsc -> eax low
+    push(code, 137); push(code, 195); // mov ebx, eax
+    push(code, 255); push(code, 5); _le(code, PHYS_KSTATE, 4); // inc dword [0x145000]
+    if has_user_irq0 {
+        push(code, 255); push(code, 53); _le(code, PHYS_KSTATE, 4); // push dword [0x145000]
+        _x86_call_sym(st, "fn$irq0_handler");
+        push(code, 131); push(code, 196); push(code, 4);
+    }
+    push(code, 15); push(code, 49); // rdtsc
+    push(code, 41); push(code, 216); // sub eax, ebx
+    push(code, 163); _le(code, PHYS_KSTATE + 8, 4); // mov [0x145008], eax
+    push(code, 59); push(code, 5); _le(code, PHYS_KSTATE + 16, 4); // cmp eax, [0x145010]
+    push(code, 115); push(code, 5); // jae +5
+    push(code, 163); _le(code, PHYS_KSTATE + 16, 4); // A3 <u32> (5 bytes)
+    push(code, 176); push(code, 32); push(code, 230); push(code, 32); // EOI
+    push(code, 97);  // 61: popad
+    push(code, 207); // CF: iretd
+}
+
+fn _x86_emit_expr(st, fctx, expr) {
+    let code = st["code"];
+    if expr == nil { push(code, 49); push(code, 192); return; }
+    let k = expr["kind"];
+    if k == "num" { push(code, 184); _le(code, _parse_int_lit(expr["val"]), 4); return; }
+    if k == "bool" { push(code, 184); _le(code, if expr["val"] { 1 } else { 0 }, 4); return; }
+    if k == "nil" { push(code, 49); push(code, 192); return; }
+    if k == "str" { _x86_lea_str(st, 0, expr["val"]); return; }
+    if k == "ident" {
+        let nm = expr["name"];
+        if map_has(fctx["slots"], nm) {
+            push(code, 139); push(code, 133); _le(code, fctx["slots"][nm], 4); // mov eax, [ebp + disp32]
+        } elif map_has(st["globals"], nm) {
+            push(code, 161); _le(code, st["globals"][nm], 4); // mov eax, [gaddr]
+        } else {
+            push(code, 49); push(code, 192);
+        }
+        return;
+    }
+    if k == "unary" {
+        _x86_emit_expr(st, fctx, expr["arg"]);
+        if expr["op"] == "-" { push(code, 247); push(code, 216); }
+        elif expr["op"] == "~" { push(code, 247); push(code, 208); }
+        else { push(code, 133); push(code, 192); push(code, 15); push(code, 148); push(code, 192); push(code, 15); push(code, 182); push(code, 192); }
+        return;
+    }
+    if k == "binary" {
+        let op = expr["op"];
+        _x86_emit_expr(st, fctx, expr["left"]);
+        push(code, 80); // push eax
+        _x86_emit_expr(st, fctx, expr["right"]);
+        push(code, 137); push(code, 193); // mov ecx, eax
+        push(code, 88); // pop eax
+        if op == "+" { push(code, 1); push(code, 200); return; }
+        if op == "-" { push(code, 41); push(code, 200); return; }
+        if op == "*" { push(code, 15); push(code, 175); push(code, 193); return; }
+        if op == "/" { push(code, 153); push(code, 247); push(code, 249); return; }
+        if op == "%" { push(code, 153); push(code, 247); push(code, 249); push(code, 137); push(code, 208); return; }
+        if op == "&" { push(code, 33); push(code, 200); return; }
+        if op == "|" { push(code, 9); push(code, 200); return; }
+        if op == "^" { push(code, 49); push(code, 200); return; }
+        if op == "<<" { push(code, 211); push(code, 224); return; }
+        if op == ">>" { push(code, 211); push(code, 248); return; }
+        push(code, 57); push(code, 200);
+        let sc = if op == "==" { 148 } elif op == "!=" { 149 } elif op == "<" { 156 } elif op == "<=" { 158 } elif op == ">" { 159 } elif op == ">=" { 157 } else { 149 };
+        push(code, 15); push(code, sc); push(code, 192); push(code, 15); push(code, 182); push(code, 192);
+        return;
+    }
+    if k == "call" {
+        let cn = expr["callee"]["name"];
+        let args = expr["args"];
+        if cn == "port_outb" {
+            _x86_emit_expr(st, fctx, args[0]); push(code, 80);
+            _x86_emit_expr(st, fctx, args[1]); push(code, 90); push(code, 238); return;
+        }
+        if cn == "port_inb" {
+            _x86_emit_expr(st, fctx, args[0]); push(code, 137); push(code, 194);
+            push(code, 49); push(code, 192); push(code, 236); return;
+        }
+        if cn == "port_outw" {
+            _x86_emit_expr(st, fctx, args[0]); push(code, 80);
+            _x86_emit_expr(st, fctx, args[1]); push(code, 90); push(code, 102); push(code, 239); return;
+        }
+        if cn == "port_inw" {
+            _x86_emit_expr(st, fctx, args[0]); push(code, 137); push(code, 194);
+            push(code, 49); push(code, 192); push(code, 102); push(code, 237); return;
+        }
+        if cn == "port_outl" {
+            _x86_emit_expr(st, fctx, args[0]); push(code, 80);
+            _x86_emit_expr(st, fctx, args[1]); push(code, 90); push(code, 239); return;
+        }
+        if cn == "port_inl" {
+            _x86_emit_expr(st, fctx, args[0]); push(code, 137); push(code, 194);
+            push(code, 49); push(code, 192); push(code, 237); return;
+        }
+        if cn == "rdtsc" { push(code, 15); push(code, 49); return; }
+        if cn == "cli" { push(code, 250); push(code, 49); push(code, 192); return; }
+        if cn == "sti" { push(code, 251); push(code, 49); push(code, 192); return; }
+        if cn == "hlt" { push(code, 244); push(code, 49); push(code, 192); return; }
+        if cn == "serial_putc" { _x86_emit_expr(st, fctx, args[0]); _x86_call_sym(st, "rt$serial_putc"); return; }
+        if cn == "serial_puts" { _x86_emit_expr(st, fctx, args[0]); _x86_call_sym(st, "rt$serial_puts"); return; }
+        if cn == "serial_put_dec" { _x86_emit_expr(st, fctx, args[0]); _x86_call_sym(st, "rt$serial_put_dec"); return; }
+        if cn == "pmm_alloc_frame" { _x86_call_sym(st, "rt$pmm_alloc_frame"); return; }
+        if cn == "pmm_free_frame" { _x86_emit_expr(st, fctx, args[0]); _x86_call_sym(st, "rt$pmm_free_frame"); return; }
+        if cn == "mmio_read32" or cn == "mmio_read64" {
+            _x86_emit_expr(st, fctx, args[0]);
+            push(code, 139); push(code, 0); // 8B 00: mov eax, [eax]
+            return;
+        }
+        if cn == "mmio_write32" or cn == "mmio_write64" {
+            _x86_emit_expr(st, fctx, args[0]); push(code, 80); // push addr
+            _x86_emit_expr(st, fctx, args[1]); push(code, 89); // pop ecx
+            push(code, 137); push(code, 1);                    // 89 01: mov [ecx], eax
+            return;
+        }
+        if cn == "irq_ticks" { push(code, 161); _le(code, PHYS_KSTATE, 4); return; }
+        if cn == "isr_cycles" { push(code, 161); _le(code, PHYS_KSTATE + 16, 4); return; }
+        if cn == "qemu_exit" {
+            if len(args) > 0 { _x86_emit_expr(st, fctx, args[0]); } else { push(code, 184); _le(code, 16, 4); }
+            _x86_call_sym(st, "rt$qemu_exit"); return;
+        }
+        if cn == "vga_putc" {
+            _x86_emit_expr(st, fctx, args[0]); push(code, 80);
+            _x86_emit_expr(st, fctx, args[1]); push(code, 80);
+            if len(args) >= 3 { _x86_emit_expr(st, fctx, args[2]); } else { push(code, 184); _le(code, 15, 4); }
+            push(code, 137); push(code, 194); push(code, 89); push(code, 95);
+            push(code, 136); push(code, 140); push(code, 127); _le(code, PHYS_VGA_TEXT, 4);
+            push(code, 136); push(code, 148); push(code, 127); _le(code, PHYS_VGA_TEXT + 1, 4);
+            return;
+        }
+        if cn == "print" or cn == "println" {
+            let pai = 0;
+            while pai < len(args) {
+                if pai > 0 { push(code, 184); _le(code, 32, 4); _x86_call_sym(st, "rt$serial_putc"); }
+                let pa = args[pai];
+                if pa["kind"] == "str" {
+                    _x86_lea_str(st, 0, pa["val"]);
+                    _x86_call_sym(st, "rt$serial_puts");
+                } else {
+                    _x86_emit_expr(st, fctx, pa);
+                    _x86_call_sym(st, "rt$serial_put_dec");
+                }
+                pai = pai + 1;
+            }
+            if cn == "println" or len(args) > 0 { _x86_call_sym(st, "rt$serial_put_crlf"); }
+            push(code, 49); push(code, 192);
+            return;
+        }
+        // cdecl user call (push args right-to-left)
+        let ai = len(args) - 1;
+        while ai >= 0 {
+            _x86_emit_expr(st, fctx, args[ai]);
+            push(code, 80);
+            ai = ai - 1;
+        }
+        _x86_call_sym(st, "fn$" + cn);
+        if len(args) > 0 { push(code, 129); push(code, 196); _le(code, len(args) * 4, 4); }
+    }
+}
+
+fn _x86_set_var(st, fctx, nm) {
+    let code = st["code"];
+    if map_has(fctx["slots"], nm) {
+        push(code, 137); push(code, 133); _le(code, fctx["slots"][nm], 4);
+    } elif map_has(st["globals"], nm) {
+        push(code, 163); _le(code, st["globals"][nm], 4);
+    }
+}
+
+fn _x86_emit_stmt(st, fctx, stmt) {
+    if stmt == nil or type(stmt) != "map" { return; }
+    let code = st["code"];
+    let k = stmt["kind"];
+    if k == "empty" or k == "export_stmt" or k == "struct_decl" or k == "fn_decl" { return; }
+    if k == "block" or k == "program" {
+        let i = 0; while i < len(stmt["stmts"]) { _x86_emit_stmt(st, fctx, stmt["stmts"][i]); i = i + 1; }
+        if map_has(stmt, "tail_expr") and stmt["tail_expr"] != nil { _x86_emit_expr(st, fctx, stmt["tail_expr"]); }
+        return;
+    }
+    if k == "var_decl" { _x86_emit_expr(st, fctx, stmt["init"]); _x86_set_var(st, fctx, stmt["name"]); return; }
+    if k == "assign" {
+        let nm = stmt["target"]["name"];
+        if stmt["op"] == "=" { _x86_emit_expr(st, fctx, stmt["val"]); }
+        else { _x86_emit_expr(st, fctx, map{ kind: "binary", op: str_slice(stmt["op"], 0, 1), left: map{ kind: "ident", name: nm }, right: stmt["val"] }); }
+        _x86_set_var(st, fctx, nm);
+        return;
+    }
+    if k == "expr_stmt" { _x86_emit_expr(st, fctx, stmt["expr"]); return; }
+    if k == "return_stmt" { _x86_emit_expr(st, fctx, stmt["val"]); push(fctx["ret_jumps"], _x86_jmp(code)); return; }
+    if k == "if_stmt" {
+        _x86_emit_expr(st, fctx, stmt["cond"]); push(code, 133); push(code, 192);
+        let jf = _x86_jcc(code, 132);
+        _x86_emit_stmt(st, fctx, stmt["then_block"]);
+        if stmt["else_block"] != nil {
+            let jd = _x86_jmp(code);
+            _patch32(code, jf, len(code) - (jf + 4));
+            _x86_emit_stmt(st, fctx, stmt["else_block"]);
+            _patch32(code, jd, len(code) - (jd + 4));
+        } else {
+            _patch32(code, jf, len(code) - (jf + 4));
+        }
+        return;
+    }
+    if k == "while_stmt" {
+        let top = len(code);
+        _x86_emit_expr(st, fctx, stmt["cond"]); push(code, 133); push(code, 192);
+        let jx = _x86_jcc(code, 132);
+        _x86_emit_stmt(st, fctx, stmt["body"]);
+        let jb = _x86_jmp(code);
+        _patch32(code, jb, top - (jb + 4));
+        _patch32(code, jx, len(code) - (jx + 4));
+    }
+}
+
+fn _x86_compile_fn(st, fn_name, params, body_stmt) {
+    let code = st["code"];
+    st["labels"]["fn$" + fn_name] = len(code);
+    let fctx = map{ n_locals: 0, slots: map{}, ret_jumps: [] };
+    let pi = 0;
+    while pi < len(params) {
+        fctx["slots"][params[pi]["name"]] = 8 + pi * 4;
+        pi = pi + 1;
+    }
+    _bm_prescan_locals(body_stmt, fctx);
+    let fbytes = _align_up(fctx["n_locals"] * 8, 16);
+    push(code, 85); push(code, 137); push(code, 229); // push ebp; mov ebp, esp
+    if fbytes > 0 { push(code, 129); push(code, 236); _le(code, fbytes, 4); }
+    push(code, 49); push(code, 192);
+    _x86_emit_stmt(st, fctx, body_stmt);
+    let ep = len(code);
+    let ri = 0;
+    while ri < len(fctx["ret_jumps"]) { _patch32(code, fctx["ret_jumps"][ri], ep - (fctx["ret_jumps"][ri] + 4)); ri = ri + 1; }
+    push(code, 137); push(code, 236); push(code, 93); push(code, 195); // mov esp, ebp; pop ebp; ret
+}
+
+fn _compile_kernel_x86_payload(ast) {
+    let st = map{ code: [], labels: map{}, calls: [], globals: map{}, str_pool: map{}, str_list: [], str_fixes: [], addr_fixes: [] };
+    let fn_decls = []; let top_stmts = []; let has_km = false; let has_irq = false; let next_g = PHYS_GLOBALS;
+    let i = 0;
+    while i < len(ast["stmts"]) {
+        let s = ast["stmts"][i];
+        if s != nil and type(s) == "map" {
+            let sk = s["kind"];
+            if sk == "export_stmt" and s["decl"] != nil { s = s["decl"]; sk = s["kind"]; }
+            if sk == "fn_decl" {
+                push(fn_decls, s);
+                if s["name"] == "kernel_main" or s["name"] == "main" { has_km = true; }
+                if s["name"] == "irq0_handler" { has_irq = true; }
+            } elif sk != "empty" and sk != "struct_decl" {
+                if sk == "var_decl" { st["globals"][s["name"]] = next_g; next_g = next_g + 4; }
+                push(top_stmts, s);
+            }
+        }
+        i = i + 1;
+    }
+
+    let code = st["code"];
+    push(code, 188); _le(code, PHYS_STACK_TOP, 4); // mov esp, 0x180000
+    push(code, 191); _le(code, PHYS_IDT, 4);
+    push(code, 49); push(code, 192);
+    push(code, 185); _le(code, 4096, 4);
+    push(code, 243); push(code, 171); // rep stosd
+    push(code, 199); push(code, 5); _le(code, PHYS_KSTATE + 16, 4); _le(code, 2147483647, 4);
+
+    // Init COM1
+    _x64_outb_imm(code, 1017, 0);
+    _x64_outb_imm(code, 1019, 128);
+    _x64_outb_imm(code, 1016, 1);
+    _x64_outb_imm(code, 1017, 0);
+    _x64_outb_imm(code, 1019, 3);
+    _x64_outb_imm(code, 1018, 199);
+    _x64_outb_imm(code, 1020, 11);
+
+    _x86_lea_str(st, 0, "PBLANG_BAREMETAL_V4=BOOT\r\nARCH=x86_32\r\nGDT=OK\r\nPROT_32=OK\r\n");
+    _x86_call_sym(st, "rt$serial_puts");
+
+    // Build 256-entry 32-bit IDT (8 bytes per gate, selector = 0x0018)
+    push(code, 186); let fsp = len(code); _le(code, 0, 4); push(st["addr_fixes"], map{ at: fsp, name: "isr$spurious" });
+    push(code, 191); _le(code, PHYS_IDT, 4);
+    push(code, 185); _le(code, 256, 4);
+    let ifl = len(code);
+    push(code, 137); push(code, 208); push(code, 37); _le(code, 65535, 4); push(code, 13); _le(code, 1572864, 4); // (0x0018 << 16)
+    push(code, 137); push(code, 7);
+    push(code, 137); push(code, 208); push(code, 37); _le(code, 4294901760, 4); push(code, 13); _le(code, 36352, 4); // 0x8E00
+    push(code, 137); push(code, 71); push(code, 4);
+    push(code, 131); push(code, 199); push(code, 8);
+    push(code, 73);
+    let jif = _x86_jcc(code, 133); _patch32(code, jif, ifl - (jif + 4));
+
+    // Vector 0x20 (`0x143000 + 32*8 = 0x143100`) -> `isr$irq0`
+    push(code, 186); let firq = len(code); _le(code, 0, 4); push(st["addr_fixes"], map{ at: firq, name: "isr$irq0" });
+    push(code, 191); _le(code, PHYS_IDT + 256, 4);
+    push(code, 137); push(code, 208); push(code, 37); _le(code, 65535, 4); push(code, 13); _le(code, 1572864, 4);
+    push(code, 137); push(code, 7);
+    push(code, 137); push(code, 208); push(code, 37); _le(code, 4294901760, 4); push(code, 13); _le(code, 36352, 4);
+    push(code, 137); push(code, 71); push(code, 4);
+
+    // IDTR (`limit = 2047`, `base = 0x143000`) -> `lidt [eax]`
+    push(code, 184); _le(code, PHYS_IDTR, 4);
+    push(code, 102); push(code, 199); push(code, 0); _le(code, 2047, 2);
+    push(code, 199); push(code, 64); push(code, 2); _le(code, PHYS_IDT, 4);
+    push(code, 15); push(code, 1); push(code, 24);
+
+    // Remap PIC + PIT 1000 Hz + wait >= 3 IRQ0 ticks
+    _x64_outb_imm(code, 32, 17); _x64_outb_imm(code, 160, 17);
+    _x64_outb_imm(code, 33, 32); _x64_outb_imm(code, 161, 40);
+    _x64_outb_imm(code, 33, 4);  _x64_outb_imm(code, 161, 2);
+    _x64_outb_imm(code, 33, 1);  _x64_outb_imm(code, 161, 1);
+    _x64_outb_imm(code, 33, 254); _x64_outb_imm(code, 161, 255);
+    _x64_outb_imm(code, 67, 54); _x64_outb_imm(code, 64, 169); _x64_outb_imm(code, 64, 4);
+
+    push(code, 251); // sti
+    let w32 = len(code);
+    push(code, 244); // hlt
+    push(code, 131); push(code, 61); _le(code, PHYS_KSTATE, 4); push(code, 3);
+    let jw32 = _x86_jcc(code, 140); _patch32(code, jw32, w32 - (jw32 + 4));
+    push(code, 250); // cli
+    _x64_outb_imm(code, 33, 255);
+
+    _x86_lea_str(st, 0, "IDT_IRQ0_TICKS="); _x86_call_sym(st, "rt$serial_puts");
+    push(code, 161); _le(code, PHYS_KSTATE, 4); _x86_call_sym(st, "rt$serial_put_dec"); _x86_call_sym(st, "rt$serial_put_crlf");
+    _x86_lea_str(st, 0, "ISR_CYCLES="); _x86_call_sym(st, "rt$serial_puts");
+    push(code, 161); _le(code, PHYS_KSTATE + 16, 4); _x86_call_sym(st, "rt$serial_put_dec"); _x86_call_sym(st, "rt$serial_put_crlf");
+
+    _x86_call_sym(st, "fn$__kernel_top");
+    if has_km {
+        let efn = "fn$kernel_main";
+        let fi = 0; let fkm = false;
+        while fi < len(fn_decls) { if fn_decls[fi]["name"] == "kernel_main" { fkm = true; } fi = fi + 1; }
+        if not fkm { efn = "fn$main"; }
+        _x86_call_sym(st, efn);
+    }
+    push(code, 80);
+    _x86_lea_str(st, 0, "KERNEL_MAIN_RET="); _x86_call_sym(st, "rt$serial_puts");
+    push(code, 88); _x86_call_sym(st, "rt$serial_put_dec"); _x86_call_sym(st, "rt$serial_put_crlf");
+    push(code, 184); _le(code, 16, 4); _x86_call_sym(st, "rt$qemu_exit");
+
+    _x86_compile_fn(st, "__kernel_top", [], map{ kind: "block", stmts: top_stmts, tail_expr: nil });
+    let fdi = 0;
+    while fdi < len(fn_decls) { _x86_compile_fn(st, fn_decls[fdi]["name"], fn_decls[fdi]["params"], fn_decls[fdi]["body"]); fdi = fdi + 1; }
+    _x86_emit_ring0_runtime(st, has_irq);
+
+    let ci = 0;
+    while ci < len(st["calls"]) {
+        let c = st["calls"][ci];
+        _patch32(code, c["at"], st["labels"][c["name"]] - (c["at"] + 4));
+        ci = ci + 1;
+    }
+    let afi = 0;
+    while afi < len(st["addr_fixes"]) {
+        let af = st["addr_fixes"][afi];
+        _patch32(code, af["at"], PHYS_KERNEL64 + st["labels"][af["name"]]);
+        afi = afi + 1;
+    }
+    while (len(code) % 16) != 0 { push(code, 0); }
+    let sp = map{};
+    let si = 0;
+    while si < len(st["str_list"]) {
+        sp[str(si)] = PHYS_KERNEL64 + len(code);
+        _push_bytes(code, str_to_bytes(st["str_list"][si]));
+        push(code, 0);
+        si = si + 1;
+    }
+    while (len(code) % 16) != 0 { push(code, 0); }
+    let sfi = 0;
+    while sfi < len(st["str_fixes"]) {
+        let sf = st["str_fixes"][sfi];
+        _patch32(code, sf["at"], sp[str(sf["idx"])]);
+        sfi = sfi + 1;
+    }
+    return code;
+}
+
+// ── Public Pure-PBLang Bare-Metal API ─────────────────────────────────────────
+
+fn compile_baremetal_x64(source, opts = nil) {
+    let ast = _validate_freestanding_ast(source);
+    let boot = _build_bootstrap_page(true);
+    let kcode = _compile_kernel_x64_payload(ast);
+    let total_sz = 4096 + len(boot) + len(kcode);
+    let hdr = _build_header_page(true, total_sz);
+    let img = [];
+    _push_bytes(img, hdr);
+    _push_bytes(img, boot);
+    _push_bytes(img, kcode);
+    return map{
+        ok: true,
+        binary: img,
+        bytes: len(img),
+        target: "baremetal-x64",
+        format: "ELF64-Multiboot-PVH",
+        entry_phys: PHYS_ENTRY32,
+        kernel64_phys: PHYS_KERNEL64,
+        zero_external_toolchain: true
+    };
+}
+
+fn compile_baremetal_x86(source, opts = nil) {
+    let ast = _validate_freestanding_ast(source);
+    let boot = _build_bootstrap_page(false);
+    let kcode = _compile_kernel_x86_payload(ast);
+    let total_sz = 4096 + len(boot) + len(kcode);
+    let hdr = _build_header_page(false, total_sz);
+    let img = [];
+    _push_bytes(img, hdr);
+    _push_bytes(img, boot);
+    _push_bytes(img, kcode);
+    return map{
+        ok: true,
+        binary: img,
+        bytes: len(img),
+        target: "baremetal-x86",
+        format: "ELF32-Multiboot-PVH",
+        entry_phys: PHYS_ENTRY32,
+        kernel32_phys: PHYS_KERNEL64,
+        zero_external_toolchain: true
+    };
+}
+
+fn compile_baremetal_kernel(source, opts = nil) {
+    let o = if opts != nil and type(opts) == "map" { opts } else { map{} };
+    let tgt = if map_has(o, "target") { o["target"] } else { "baremetal-x64" };
+    if tgt == "baremetal-x86" {
+        return compile_baremetal_x86(source, o);
+    }
+    return compile_baremetal_x64(source, o);
+}
+
+fn build_baremetal_kernel(src_path, out_path, opts = nil) {
+    let t0 = time_ms();
+    let source = fs_read(src_path);
+    let rep = compile_baremetal_kernel(source, opts);
+    fs_write_bytes(out_path, rep["binary"]);
+    let dt = time_ms() - t0;
+    return map{
+        ok: true,
+        input: src_path,
+        output: out_path,
+        bytes: rep["bytes"],
+        target: rep["target"],
+        format: rep["format"],
+        entry_phys: rep["entry_phys"],
+        zero_external_toolchain: true,
+        compile_ms: dt
+    };
+}
+
+export BAREMETAL_VERSION,
+       compile_baremetal_x64,
+       compile_baremetal_x86,
+       compile_baremetal_kernel,
+       build_baremetal_kernel;

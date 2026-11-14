@@ -106,8 +106,9 @@ typedef enum {
     OBJ_BIGINT   = 8,
     OBJ_RATIONAL = 9,
     OBJ_DECIMAL  = 10,
-    OBJ_BYTES    = 11,
-    OBJ_F64BUF   = 12
+    OBJ_BYTES      = 11,
+    OBJ_F64BUF     = 12,
+    OBJ_STRUCT_BUF = 13
 } PbObjType;
 
 typedef struct PbObj PbObj;
@@ -163,7 +164,7 @@ typedef struct {
 
 typedef struct {
     volatile int32_t refcount;
-    uint8_t          kind; /* 1 = bytes, 2 = f64buf */
+    uint8_t          kind; /* 1 = bytes, 2 = f64buf, 3 = struct_buf */
     size_t           byte_len;
     void            *raw;
 } ZrSharedBacking;
@@ -207,6 +208,33 @@ typedef struct {
     bool             shared;
     ZrSharedBacking *backing;
 } PbF64Buf;
+
+enum {
+    ZR_SFIELD_I64 = 1,
+    ZR_SFIELD_F64 = 2,
+    ZR_SFIELD_I32 = 3,
+    ZR_SFIELD_U8  = 4
+};
+
+typedef struct {
+    char     name[48];
+    uint8_t  kind;   /* ZR_SFIELD_* */
+    uint8_t  size;   /* 8, 8, 4, or 1 */
+    uint16_t offset; /* packed byte offset inside each record */
+} PbStructField;
+
+typedef struct {
+    PbObj            obj;
+    uint8_t         *data;
+    size_t           len;
+    size_t           cap;
+    size_t           stride;
+    uint16_t         field_count;
+    bool             is_schema;
+    bool             shared;
+    PbStructField   *fields;
+    ZrSharedBacking *backing;
+} PbStructBuf;
 
 typedef struct {
     PbStr  *key;
@@ -360,8 +388,9 @@ static inline bool is_obj_type(PbValue v, PbObjType t) {
 #define AS_BIGINT(v)   ((PbBigIntObj *)(v).as.obj)
 #define AS_RATIONAL(v) ((PbRationalObj *)(v).as.obj)
 #define AS_DECIMAL(v)  ((PbDecimalObj *)(v).as.obj)
-#define AS_BYTES(v)    ((PbBytes *)(v).as.obj)
-#define AS_F64BUF(v)   ((PbF64Buf *)(v).as.obj)
+#define AS_BYTES(v)      ((PbBytes *)(v).as.obj)
+#define AS_F64BUF(v)     ((PbF64Buf *)(v).as.obj)
+#define AS_STRUCT_BUF(v) ((PbStructBuf *)(v).as.obj)
 
 /* Matches VM::is_truthy in crates/pblang-vm/src/vm.rs */
 static inline bool val_truthy(PbValue v) {
@@ -372,15 +401,16 @@ static inline bool val_truthy(PbValue v) {
         case VAL_BUILTIN: return true;
         case VAL_OBJ:
             switch (v.as.obj->type) {
-                case OBJ_STR:      return AS_STR(v)->len > 0;
-                case OBJ_ARRAY:    return AS_ARRAY(v)->len > 0;
-                case OBJ_MAP:      return AS_MAP(v)->len > 0;
-                case OBJ_BIGINT:   return AS_BIGINT(v)->v.sign != 0;
-                case OBJ_RATIONAL: return AS_RATIONAL(v)->v.num.sign != 0;
-                case OBJ_DECIMAL:  return AS_DECIMAL(v)->v.coeff.sign != 0;
-                case OBJ_BYTES:    return AS_BYTES(v)->len > 0;
-                case OBJ_F64BUF:   return AS_F64BUF(v)->len > 0;
-                default:           return true;
+                case OBJ_STR:        return AS_STR(v)->len > 0;
+                case OBJ_ARRAY:      return AS_ARRAY(v)->len > 0;
+                case OBJ_MAP:        return AS_MAP(v)->len > 0;
+                case OBJ_BIGINT:     return AS_BIGINT(v)->v.sign != 0;
+                case OBJ_RATIONAL:   return AS_RATIONAL(v)->v.num.sign != 0;
+                case OBJ_DECIMAL:    return AS_DECIMAL(v)->v.coeff.sign != 0;
+                case OBJ_BYTES:      return AS_BYTES(v)->len > 0;
+                case OBJ_F64BUF:     return AS_F64BUF(v)->len > 0;
+                case OBJ_STRUCT_BUF: return AS_STRUCT_BUF(v)->is_schema ? (AS_STRUCT_BUF(v)->field_count > 0) : (AS_STRUCT_BUF(v)->len > 0);
+                default:             return true;
             }
     }
     return false;
@@ -394,18 +424,19 @@ static inline const char *zr_val_type_name(PbValue v) {
         case VAL_BUILTIN: return "fn";
         case VAL_OBJ:
             switch (v.as.obj->type) {
-                case OBJ_STR:      return "string";
-                case OBJ_ARRAY:    return "array";
-                case OBJ_MAP:      return "map";
+                case OBJ_STR:        return "string";
+                case OBJ_ARRAY:      return "array";
+                case OBJ_MAP:        return "map";
                 case OBJ_FUNC:
-                case OBJ_CLOSURE:  return "fn";
-                case OBJ_MODULE:   return "module";
-                case OBJ_BIGINT:   return "bigint";
-                case OBJ_RATIONAL: return "rational";
-                case OBJ_DECIMAL:  return "decimal";
-                case OBJ_BYTES:    return "bytes";
-                case OBJ_F64BUF:   return "f64buf";
-                default:           return "object";
+                case OBJ_CLOSURE:    return "fn";
+                case OBJ_MODULE:     return "module";
+                case OBJ_BIGINT:     return "bigint";
+                case OBJ_RATIONAL:   return "rational";
+                case OBJ_DECIMAL:    return "decimal";
+                case OBJ_BYTES:      return "bytes";
+                case OBJ_F64BUF:     return "f64buf";
+                case OBJ_STRUCT_BUF: return AS_STRUCT_BUF(v)->is_schema ? "struct_schema" : "struct_buf";
+                default:             return "object";
             }
     }
     return "nil";
@@ -1192,6 +1223,15 @@ static void vm_format_value_rec(PbVM *vm, ZrBuf *b, PbValue v, int depth) {
                 case OBJ_F64BUF:
                     zr_buf_printf(b, "<f64buf len=%zu>", AS_F64BUF(v)->len);
                     return;
+                case OBJ_STRUCT_BUF:
+                    if (AS_STRUCT_BUF(v)->is_schema) {
+                        zr_buf_printf(b, "<struct_schema fields=%u stride=%zu>",
+                                      (unsigned)AS_STRUCT_BUF(v)->field_count, AS_STRUCT_BUF(v)->stride);
+                    } else {
+                        zr_buf_printf(b, "<struct_buf len=%zu stride=%zu>",
+                                      AS_STRUCT_BUF(v)->len, AS_STRUCT_BUF(v)->stride);
+                    }
+                    return;
                 case OBJ_ARRAY: {
                     PbArray *arr = AS_ARRAY(v);
                     zr_buf_push(b, '[');
@@ -1298,6 +1338,14 @@ static bool val_equal(PbValue a, PbValue b) {
                     if (ba->data[i] != bb->data[i]) return false;
                 }
                 return true;
+            }
+            if (a.as.obj->type == OBJ_STRUCT_BUF) {
+                PbStructBuf *sa = AS_STRUCT_BUF(a), *sb = AS_STRUCT_BUF(b);
+                if (sa->is_schema != sb->is_schema || sa->len != sb->len || sa->stride != sb->stride || sa->field_count != sb->field_count)
+                    return false;
+                if (sa->is_schema) return memcmp(sa->fields, sb->fields, sa->field_count * sizeof(PbStructField)) == 0;
+                size_t nb = sa->len * sa->stride;
+                return nb == 0 || memcmp(sa->data, sb->data, nb) == 0;
             }
             if (a.as.obj->type == OBJ_ARRAY) {
                 PbArray *aa = AS_ARRAY(a), *ab = AS_ARRAY(b);
@@ -1613,6 +1661,7 @@ static void gc_mark_obj(PbObj *o) {
         case OBJ_DECIMAL:
         case OBJ_BYTES:
         case OBJ_F64BUF:
+        case OBJ_STRUCT_BUF:
             break;
         case OBJ_ARRAY: {
             PbArray *a = (PbArray *)o;
@@ -1670,6 +1719,7 @@ static void gc_scan_children_nursery(PbObj *o) {
         case OBJ_DECIMAL:
         case OBJ_BYTES:
         case OBJ_F64BUF:
+        case OBJ_STRUCT_BUF:
             break;
         case OBJ_ARRAY: {
             PbArray *a = (PbArray *)o;
@@ -1743,6 +1793,13 @@ static void gc_free_obj(PbVM *vm, PbObj *o) {
             PbF64Buf *b = (PbF64Buf *)o;
             if (b->backing) zr_shared_release(b->backing);
             else free(b->data);
+            break;
+        }
+        case OBJ_STRUCT_BUF: {
+            PbStructBuf *sb = (PbStructBuf *)o;
+            if (sb->backing) zr_shared_release(sb->backing);
+            else free(sb->data);
+            free(sb->fields);
             break;
         }
         case OBJ_ARRAY:
@@ -3860,6 +3917,14 @@ static inline void vm_format_value(PbValue v, ZrBuf *b) {
                 zr_buf_printf(b, "<bytes len=%zu>", AS_BYTES(v)->len);
             } else if (v.as.obj->type == OBJ_F64BUF) {
                 zr_buf_printf(b, "<f64buf len=%zu>", AS_F64BUF(v)->len);
+            } else if (v.as.obj->type == OBJ_STRUCT_BUF) {
+                if (AS_STRUCT_BUF(v)->is_schema) {
+                    zr_buf_printf(b, "<struct_schema fields=%u stride=%zu>",
+                                  (unsigned)AS_STRUCT_BUF(v)->field_count, AS_STRUCT_BUF(v)->stride);
+                } else {
+                    zr_buf_printf(b, "<struct_buf len=%zu stride=%zu>",
+                                  AS_STRUCT_BUF(v)->len, AS_STRUCT_BUF(v)->stride);
+                }
             } else {
                 zr_buf_printf(b, "<%s>", zr_val_type_name(v));
             }

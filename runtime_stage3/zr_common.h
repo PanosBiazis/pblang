@@ -97,8 +97,8 @@ typedef int zr_sock_t;
 #include <string.h>
 #include <time.h>
 
-#define PBLANG_ZR_VERSION "3.0.0"
-#define PBLANG_ZR_BANNER  "pblang 3.0.0 (sovereign zero-rust runtime)"
+#define PBLANG_ZR_VERSION "4.0.0"
+#define PBLANG_ZR_BANNER  "pblang 4.0.0 (sovereign zero-rust runtime)"
 
 /* ---- Memory Helpers ---- */
 

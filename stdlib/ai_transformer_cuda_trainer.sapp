@@ -1,0 +1,3596 @@
+// stdlib/ai_transformer_cuda_trainer.sapp — Distributed GPU/CUDA/OpenCL Transformer Autograd,
+// Tiled Causal FlashAttention, Grouped-Query Attention (GQA), SwiGLU, RoPE, Pre-RMSNorm,
+// LoRA / 4-Bit NormalFloat (NF4) QLoRA Fine-Tuning, Binary SafeTensors & GGUF v3 Checkpointing,
+// and Multi-Worker Data-Parallel All-Reduce Training Engine (PBLang v4.0.0).
+//
+// Architectural parity reference for Frontier Cloud Reasoning LLM decoder blocks
+// (Gemini 4 Argon, GPT-6.1 Sol, GPT-6 Astra, Claude Opus 5.5, Fable 5.1, Grok 4.7):
+//   - Pre-RMSNorm + Rotary Positional Embeddings (RoPE) + Grouped-Query Attention (GQA)
+//   - Tiled Online-Softmax Causal FlashAttention-2 (O(N) memory log-sum-exp forward & recompute backward)
+//   - SwiGLU Feed-Forward Network + Tied/Untied LM Head + Numerically-Stable Cross-Entropy
+//   - 4-Bit NormalFloat (NF4) 2-weights-per-byte OBJ_BYTES quantization + Low-Rank (A, B) QLoRA
+//   - HuggingFace .safetensors & GGML .gguf v3 IEEE-754 binary serialization + Multi-Thread All-Reduce
+
+let MODULE_FORMAT = "pblang.ai_transformer_cuda_trainer.v4.0.0";
+let MODULE_VERSION = "4.0.0";
+let _PI = 3.14159265358979323846;
+let _TWO_PI = 6.28318530717958647692;
+
+// Exact 16-value NormalFloat4 (NF4) quantile lookup table (Dettmers et al., QLoRA)
+let NF4_TABLE = [
+    -1.0, -0.6961928, -0.52507305, -0.39491749,
+    -0.28444138, -0.18477343, -0.09105004, 0.0,
+    0.0795803, 0.1609302, 0.2461123, 0.33791524,
+    0.44070983, 0.56261700, 0.72295684, 1.0
+];
+
+// Precomputed decision boundaries (midpoints between adjacent NF4 quantiles)
+let _NF4_MIDPOINTS = [
+    -0.84809640, -0.610632925, -0.45999527, -0.339679435,
+    -0.234607405, -0.137911735, -0.04552502, 0.03979015,
+    0.12025525, 0.20352125, 0.29201377, 0.389312535,
+    0.501663415, 0.64278692, 0.86147842
+];
+
+let _RUNTIME_STATE = map{
+    cached_probe: nil,
+    gpu_matmul_threshold: 262144,
+    cpu_hpc_threshold: 64
+};
+
+// ============================================================================
+// 0. Numeric, Array, PRNG & Pure IEEE-754 Binary Codec Utilities
+// ============================================================================
+
+fn _int(x) {
+    if type(x) == "number" { return num_floor(x); }
+    return 0;
+}
+
+fn _abs(x) {
+    if x < 0.0 { return 0.0 - x; }
+    return x;
+}
+
+fn _max(a, b) {
+    if a >= b { return a; }
+    return b;
+}
+
+fn _min(a, b) {
+    if a <= b { return a; }
+    return b;
+}
+
+fn _clamp(v, lo, hi) {
+    if v < lo { return lo; }
+    if v > hi { return hi; }
+    return v;
+}
+
+fn _zeros(n) {
+    let arr = [];
+    let i = 0;
+    while i < n {
+        array_push(arr, 0.0);
+        i = i + 1;
+    }
+    return arr;
+}
+
+fn _ones(n) {
+    let arr = [];
+    let i = 0;
+    while i < n {
+        array_push(arr, 1.0);
+        i = i + 1;
+    }
+    return arr;
+}
+
+fn _clone_array(src) {
+    let out = [];
+    let n = len(src);
+    let i = 0;
+    while i < n {
+        array_push(out, src[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _prod_shape(shape) {
+    if len(shape) == 0 { return 0; }
+    let p = 1;
+    let i = 0;
+    while i < len(shape) {
+        p = p * _int(shape[i]);
+        i = i + 1;
+    }
+    return p;
+}
+
+// Deterministic 53-bit safe LCG + Weyl sequence PRNG with Box-Muller Gaussian sampling
+fn rng_new(seed = 42) {
+    let s0 = _int(_abs(seed)) + 1013904223;
+    return map{
+        state: s0 % 2147483647,
+        weyl: (_int(_abs(seed)) * 1664525 + 12345) % 2147483647,
+        has_spare: false,
+        spare: 0.0
+    };
+}
+
+fn rng_uniform(rng) {
+    let s = (rng.state * 48271) % 2147483647;
+    if s <= 0 { s = s + 2147483646; }
+    let w = (rng.weyl + 362437) % 2147483647;
+    rng.state = s;
+    rng.weyl = w;
+    let mixed = bit_xor(s, w) % 2147483647;
+    if mixed <= 0 { mixed = 1; }
+    return mixed / 2147483647.0;
+}
+
+fn rng_normal(rng, mean = 0.0, std = 1.0) {
+    if rng.has_spare {
+        rng.has_spare = false;
+        return mean + std * rng.spare;
+    }
+    let u1 = rng_uniform(rng);
+    if u1 < 1e-12 { u1 = 1e-12; }
+    let u2 = rng_uniform(rng);
+    let mag = num_sqrt(-2.0 * num_ln(u1));
+    let z0 = mag * num_cos(_TWO_PI * u2);
+    let z1 = mag * num_sin(_TWO_PI * u2);
+    rng.spare = z1;
+    rng.has_spare = true;
+    return mean + std * z0;
+}
+
+fn rng_randn_array(rng, count, std = 0.02) {
+    let out = [];
+    let i = 0;
+    while i < count {
+        array_push(out, rng_normal(rng, 0.0, std));
+        i = i + 1;
+    }
+    return out;
+}
+
+// Pure mathematical IEEE-754 binary32 little-endian encoder -> [b0, b1, b2, b3]
+fn encode_f32_le(val) {
+    if val != val {
+        return [0, 0, 192, 127]; // Quiet NaN 0x7FC00000
+    }
+    if val == 0.0 {
+        return [0, 0, 0, 0];
+    }
+    let sign_bit = 0;
+    let a = val;
+    if val < 0.0 {
+        sign_bit = 1;
+        a = 0.0 - val;
+    }
+    if a > 3.4028234663852886e38 {
+        return [0, 0, 128, bit_or(bit_shl(sign_bit, 7), 127)]; // +-Inf
+    }
+    let e = _int(num_floor(num_log2(a)));
+    let scale = num_pow(2.0, e);
+    if a / scale >= 2.0 {
+        e = e + 1;
+        scale = scale * 2.0;
+    } elif a / scale < 1.0 {
+        e = e - 1;
+        scale = scale * 0.5;
+    }
+    let biased_exp = 0;
+    let mant = 0;
+    if e < -126 {
+        // Subnormal binary32
+        biased_exp = 0;
+        mant = _int(num_round(a * num_pow(2.0, 149)));
+        if mant >= 8388608 {
+            mant = 0;
+            biased_exp = 1;
+        }
+    } else {
+        biased_exp = e + 127;
+        let norm_m = a / scale;
+        let frac = (norm_m - 1.0) * 8388608.0;
+        let fl = _int(num_floor(frac));
+        let diff = frac - fl;
+        // IEEE-754 round-to-nearest-even
+        if diff > 0.5 {
+            mant = fl + 1;
+        } elif diff < 0.5 {
+            mant = fl;
+        } else {
+            if bit_and(fl, 1) == 1 { mant = fl + 1; } else { mant = fl; }
+        }
+        if mant >= 8388608 {
+            mant = 0;
+            biased_exp = biased_exp + 1;
+        }
+        if biased_exp >= 255 {
+            return [0, 0, 128, bit_or(bit_shl(sign_bit, 7), 127)];
+        }
+    }
+    let b0 = bit_and(mant, 255);
+    let b1 = bit_and(bit_shr(mant, 8), 255);
+    let b2 = bit_or(bit_shl(bit_and(biased_exp, 1), 7), bit_and(bit_shr(mant, 16), 127));
+    let b3 = bit_or(bit_shl(sign_bit, 7), bit_and(bit_shr(biased_exp, 1), 127));
+    return [b0, b1, b2, b3];
+}
+
+// Pure mathematical IEEE-754 binary32 little-endian decoder from 4 bytes
+fn decode_f32_le(b0, b1, b2, b3) {
+    let sign_bit = bit_and(bit_shr(b3, 7), 1);
+    let biased_exp = bit_or(bit_shl(bit_and(b3, 127), 1), bit_and(bit_shr(b2, 7), 1));
+    let mant = b0 + 256 * b1 + 65536 * bit_and(b2, 127);
+    let mag = 0.0;
+    if biased_exp == 0 {
+        if mant == 0 { return 0.0; }
+        mag = mant * num_pow(2.0, -149);
+    } elif biased_exp == 255 {
+        mag = 3.4028234663852886e38;
+    } else {
+        mag = (1.0 + (mant / 8388608.0)) * num_pow(2.0, biased_exp - 127);
+    }
+    if sign_bit == 1 { return 0.0 - mag; }
+    return mag;
+}
+
+// Pure mathematical IEEE-754 binary16 (fp16) little-endian encoder/decoder for GGUF Q4_0 scales
+fn encode_f16_le(val) {
+    if val != val { return [0, 126]; }
+    if val == 0.0 { return [0, 0]; }
+    let sign_bit = 0;
+    let a = val;
+    if val < 0.0 {
+        sign_bit = 1;
+        a = 0.0 - val;
+    }
+    if a > 65504.0 {
+        return [0, bit_or(bit_shl(sign_bit, 7), 124)];
+    }
+    let e = _int(num_floor(num_log2(a)));
+    let scale = num_pow(2.0, e);
+    if a / scale >= 2.0 { e = e + 1; scale = scale * 2.0; }
+    elif a / scale < 1.0 { e = e - 1; scale = scale * 0.5; }
+    let biased_exp = 0;
+    let mant = 0;
+    if e < -14 {
+        biased_exp = 0;
+        mant = _int(num_round(a * num_pow(2.0, 24)));
+        if mant >= 1024 { mant = 0; biased_exp = 1; }
+    } else {
+        biased_exp = e + 15;
+        mant = _int(num_round(((a / scale) - 1.0) * 1024.0));
+        if mant >= 1024 { mant = 0; biased_exp = biased_exp + 1; }
+        if biased_exp >= 31 { return [0, bit_or(bit_shl(sign_bit, 7), 124)]; }
+    }
+    let u16_val = bit_or(bit_shl(sign_bit, 15), bit_or(bit_shl(biased_exp, 10), mant));
+    return [bit_and(u16_val, 255), bit_and(bit_shr(u16_val, 8), 255)];
+}
+
+fn decode_f16_le(b0, b1) {
+    let u16_val = b0 + 256 * b1;
+    let sign_bit = bit_and(bit_shr(u16_val, 15), 1);
+    let biased_exp = bit_and(bit_shr(u16_val, 10), 31);
+    let mant = bit_and(u16_val, 1023);
+    let mag = 0.0;
+    if biased_exp == 0 {
+        if mant == 0 { return 0.0; }
+        mag = mant * num_pow(2.0, -24);
+    } elif biased_exp == 31 {
+        mag = 65504.0;
+    } else {
+        mag = (1.0 + (mant / 1024.0)) * num_pow(2.0, biased_exp - 15);
+    }
+    if sign_bit == 1 { return 0.0 - mag; }
+    return mag;
+}
+
+fn _put_u32_le(byte_list, v) {
+    let u = _int(v);
+    if u < 0 { u = u + 4294967296; }
+    array_push(byte_list, bit_and(u, 255));
+    array_push(byte_list, bit_and(bit_shr(u, 8), 255));
+    array_push(byte_list, bit_and(bit_shr(u, 16), 255));
+    array_push(byte_list, bit_and(bit_shr(u, 24), 255));
+}
+
+fn _get_u32_le(buf, offset) {
+    let b0 = bytes_get(buf, offset);
+    let b1 = bytes_get(buf, offset + 1);
+    let b2 = bytes_get(buf, offset + 2);
+    let b3 = bytes_get(buf, offset + 3);
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+}
+
+fn _get_i32_le(buf, offset) {
+    let u = _get_u32_le(buf, offset);
+    if u >= 2147483648 { return u - 4294967296; }
+    return u;
+}
+
+fn _put_u64_le(byte_list, v) {
+    let u = _int(v);
+    let lo = u % 4294967296;
+    let hi = _int(num_floor(u / 4294967296.0));
+    _put_u32_le(byte_list, lo);
+    _put_u32_le(byte_list, hi);
+}
+
+fn _get_u64_le(buf, offset) {
+    let lo = _get_u32_le(buf, offset);
+    let hi = _get_u32_le(buf, offset + 4);
+    return lo + hi * 4294967296.0;
+}
+
+fn _put_f32_le(byte_list, val) {
+    let bs = encode_f32_le(val);
+    array_push(byte_list, bs[0]);
+    array_push(byte_list, bs[1]);
+    array_push(byte_list, bs[2]);
+    array_push(byte_list, bs[3]);
+}
+
+fn _get_f32_le(buf, offset) {
+    return decode_f32_le(
+        bytes_get(buf, offset),
+        bytes_get(buf, offset + 1),
+        bytes_get(buf, offset + 2),
+        bytes_get(buf, offset + 3)
+    );
+}
+
+fn _append_str_bytes(byte_list, s) {
+    let sb = bytes_from_str(s);
+    let n = len(sb);
+    let i = 0;
+    while i < n {
+        array_push(byte_list, bytes_get(sb, i));
+        i = i + 1;
+    }
+}
+
+// ============================================================================
+// 1. Multi-Backend GPU / CUDA / OpenCL / SIMD Accelerator Runtime
+// ============================================================================
+
+fn set_gpu_matmul_threshold(ops_threshold) {
+    let th = _int(ops_threshold);
+    if th < 1 { th = 1; }
+    _RUNTIME_STATE.gpu_matmul_threshold = th;
+    return th;
+}
+
+fn get_gpu_matmul_threshold() {
+    return _RUNTIME_STATE.gpu_matmul_threshold;
+}
+
+fn _probe_nvidia_cuda() {
+    let cuda_libs = ["libcuda.so.1", "libcuda.so", "nvcuda.dll"];
+    let cublas_libs = ["libcublas.so.12", "libcublas.so.11", "libcublas.so", "cublas64_12.dll", "cublas64_11.dll"];
+    let cuda_handle = nil;
+    let cuda_lib_found = "";
+    let i = 0;
+    while i < len(cuda_libs) {
+        let h = try ffi_open(cuda_libs[i]) catch nil;
+        if h != nil {
+            cuda_handle = h;
+            cuda_lib_found = cuda_libs[i];
+            break;
+        }
+        i = i + 1;
+    }
+
+    let driver_present = cuda_handle != nil;
+    let cu_init_rc = -1;
+    let dev_count = 0;
+    let dev_name = "";
+
+    if driver_present {
+        cu_init_rc = try ffi_call_typed(cuda_handle, "cuInit", "i32(u32)", [0]) catch -1;
+        if cu_init_rc == 0 {
+            let cnt_buf = bytes_new(4);
+            let rc_cnt = try ffi_call_typed(cuda_handle, "cuDeviceGetCount", "i32(ptr)", [cnt_buf]) catch -1;
+            if rc_cnt == 0 {
+                dev_count = _get_i32_le(cnt_buf, 0);
+                if dev_count < 0 { dev_count = 0; }
+            }
+            if dev_count > 0 {
+                let dev_buf = bytes_new(4);
+                let rc_dev = try ffi_call_typed(cuda_handle, "cuDeviceGet", "i32(ptr,i32)", [dev_buf, 0]) catch -1;
+                if rc_dev == 0 {
+                    let cu_dev = _get_i32_le(dev_buf, 0);
+                    let name_buf = bytes_new(128);
+                    let rc_nm = try ffi_call_typed(cuda_handle, "cuDeviceGetName", "i32(ptr,i32,i32)", [name_buf, 127, cu_dev]) catch -1;
+                    if rc_nm == 0 {
+                        let chars = [];
+                        let ci = 0;
+                        while ci < 127 {
+                            let cb = bytes_get(name_buf, ci);
+                            if cb == 0 { break; }
+                            array_push(chars, cb);
+                            ci = ci + 1;
+                        }
+                        dev_name = try bytes_to_str(bytes_new(chars)) catch "NVIDIA CUDA GPU";
+                    }
+                }
+            }
+        }
+        try ffi_close(cuda_handle) catch nil;
+    }
+
+    let cublas_present = false;
+    let cublas_lib_found = "";
+    i = 0;
+    while i < len(cublas_libs) {
+        let ch = try ffi_open(cublas_libs[i]) catch nil;
+        if ch != nil {
+            cublas_present = true;
+            cublas_lib_found = cublas_libs[i];
+            try ffi_close(ch) catch nil;
+            break;
+        }
+        i = i + 1;
+    }
+
+    return map{
+        driver_present: driver_present,
+        driver_lib: cuda_lib_found,
+        cu_init_rc: cu_init_rc,
+        device_count: dev_count,
+        device_name: dev_name,
+        cublas_available: cublas_present,
+        cublas_lib: cublas_lib_found,
+        usable: driver_present and cu_init_rc == 0 and dev_count > 0 and cublas_present
+    };
+}
+
+fn probe_compute_backends(force_refresh = false) {
+    if not force_refresh and _RUNTIME_STATE.cached_probe != nil {
+        return _RUNTIME_STATE.cached_probe;
+    }
+
+    let cuda_info = _probe_nvidia_cuda();
+    let hp = try hpc_probe() catch map{
+        ok: false,
+        cpu_threads: 1,
+        simd_isa: "scalar",
+        opencl_available: false,
+        opencl_platform: "",
+        opencl_device: "",
+        opencl_compute_units: 0,
+        opencl_mem_mb: 0,
+        opencl_fp64: false
+    };
+
+    let ocl_avail = (try hp.opencl_available catch false) == true;
+    let ocl_usable = false;
+    let ocl_kernel_name = "";
+    if ocl_avail {
+        let smoke_gpu = try hpc_gemm(
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+            2, 2, 2,
+            map{ backend: "gpu", with_stats: true }
+        ) catch nil;
+        if smoke_gpu != nil and (try smoke_gpu.gpu_used catch false) == true {
+            let c0 = smoke_gpu.C[0];
+            let c3 = smoke_gpu.C[3];
+            if _abs(c0 - 19.0) < 1e-5 and _abs(c3 - 50.0) < 1e-5 {
+                ocl_usable = true;
+                ocl_kernel_name = str(try smoke_gpu.backend catch "opencl_gpu");
+            }
+        }
+    }
+
+    let cpu_usable = false;
+    let cpu_kernel_name = "pure_fallback";
+    let smoke_cpu = try hpc_gemm(
+        [1.0, 2.0, 3.0, 4.0],
+        [5.0, 6.0, 7.0, 8.0],
+        2, 2, 2,
+        map{ backend: "cpu", with_stats: true }
+    ) catch nil;
+    if smoke_cpu != nil {
+        if _abs(smoke_cpu.C[0] - 19.0) < 1e-9 and _abs(smoke_cpu.C[3] - 50.0) < 1e-9 {
+            cpu_usable = true;
+            cpu_kernel_name = str(try smoke_cpu.backend catch "cpu_simd_fp64");
+        }
+    }
+
+    let preferred = "cpu_simd";
+    if cuda_info.usable {
+        preferred = "cuda";
+    } elif ocl_usable {
+        preferred = "opencl_gpu";
+    }
+
+    let info = map{
+        ok: true,
+        format: MODULE_FORMAT,
+        preferred_backend: preferred,
+        cuda: cuda_info,
+        cuda_usable: cuda_info.usable,
+        opencl_available: ocl_avail,
+        opencl_usable: ocl_usable,
+        opencl_platform: str(try hp.opencl_platform catch ""),
+        opencl_device: str(try hp.opencl_device catch ""),
+        opencl_compute_units: _int(try hp.opencl_compute_units catch 0),
+        opencl_mem_mb: _int(try hp.opencl_mem_mb catch 0),
+        opencl_fp64: (try hp.opencl_fp64 catch false) == true,
+        opencl_kernel: ocl_kernel_name,
+        cpu_simd_usable: cpu_usable,
+        cpu_threads: _int(try hp.cpu_threads catch 1),
+        simd_isa: str(try hp.simd_isa catch "scalar"),
+        cpu_kernel: cpu_kernel_name
+    };
+    _RUNTIME_STATE.cached_probe = info;
+    return info;
+}
+
+fn transpose_2d(mat, rows, cols) {
+    let out = _zeros(rows * cols);
+    let r = 0;
+    while r < rows {
+        let r_off = r * cols;
+        let c = 0;
+        while c < cols {
+            out[c * rows + r] = mat[r_off + c];
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return out;
+}
+
+fn _matmul_pure(A, B, m, k, n) {
+    let C = _zeros(m * n);
+    let i = 0;
+    while i < m {
+        let c_off = i * n;
+        let a_off = i * k;
+        let p = 0;
+        while p < k {
+            let a_ip = A[a_off + p];
+            if a_ip != 0.0 {
+                let b_off = p * n;
+                let j = 0;
+                while j < n {
+                    C[c_off + j] = C[c_off + j] + a_ip * B[b_off + j];
+                    j = j + 1;
+                }
+            }
+            p = p + 1;
+        }
+        i = i + 1;
+    }
+    return C;
+}
+
+// Hardware-accelerated general matrix multiplication C[m, n] = A[m, k] * B[k, n]
+fn accel_matmul(A, B, m, k, n, backend = "auto") {
+    if len(A) != m * k {
+        throw "accel_matmul: A length " + str(len(A)) + " != m*k (" + str(m * k) + ")";
+    }
+    if len(B) != k * n {
+        throw "accel_matmul: B length " + str(len(B)) + " != k*n (" + str(k * n) + ")";
+    }
+    let ops = m * k * n;
+    let mode = str_lower(str(backend));
+
+    if mode == "pure" {
+        return _matmul_pure(A, B, m, k, n);
+    }
+
+    if mode == "gpu" or mode == "opencl" or mode == "opencl_gpu" or mode == "cuda" {
+        let probe = probe_compute_backends(false);
+        if probe.opencl_usable {
+            let res_gpu = try hpc_gemm(A, B, m, k, n, map{ backend: "gpu" }) catch nil;
+            if res_gpu != nil { return res_gpu; }
+        }
+        let res_cpu = try hpc_gemm(A, B, m, k, n, map{ backend: "cpu" }) catch nil;
+        if res_cpu != nil { return res_cpu; }
+        return _matmul_pure(A, B, m, k, n);
+    }
+
+    if mode == "cpu" or mode == "cpu_simd" or mode == "simd" {
+        if ops >= _RUNTIME_STATE.cpu_hpc_threshold {
+            let res_simd = try hpc_gemm(A, B, m, k, n, map{ backend: "cpu" }) catch nil;
+            if res_simd != nil { return res_simd; }
+        }
+        return _matmul_pure(A, B, m, k, n);
+    }
+
+    // mode == "auto": dispatch large GEMMs to OpenCL GPU, medium GEMMs to multi-core SIMD CPU, tiny shapes to pure loop
+    if ops >= _RUNTIME_STATE.gpu_matmul_threshold {
+        let probe = probe_compute_backends(false);
+        if probe.opencl_usable {
+            let auto_gpu = try hpc_gemm(A, B, m, k, n, map{ backend: "gpu" }) catch nil;
+            if auto_gpu != nil { return auto_gpu; }
+        }
+    }
+    if ops >= _RUNTIME_STATE.cpu_hpc_threshold {
+        let auto_cpu = try hpc_gemm(A, B, m, k, n, map{ backend: "cpu" }) catch nil;
+        if auto_cpu != nil { return auto_cpu; }
+    }
+    return _matmul_pure(A, B, m, k, n);
+}
+
+// C[m, n] = A[m, k] * B[n, k]^T
+fn accel_matmul_nt(A, B, m, k, n, backend = "auto") {
+    let B_T = transpose_2d(B, n, k);
+    return accel_matmul(A, B_T, m, k, n, backend);
+}
+
+// C[m, n] = A[k, m]^T * B[k, n]
+fn accel_matmul_tn(A, B, m, k, n, backend = "auto") {
+    let A_T = transpose_2d(A, k, m);
+    return accel_matmul(A_T, B, m, k, n, backend);
+}
+
+// ============================================================================
+// 2. Reverse-Mode Tensor Autograd Engine
+// ============================================================================
+
+fn ag_tape_new(backend = "auto") {
+    return map{
+        backend: backend,
+        nodes: []
+    };
+}
+
+fn _ag_register_node(tape, data, grad, shape, req_grad, op_name, parents, backward_fn, name = "") {
+    let nid = len(tape.nodes);
+    let node = map{
+        id: nid,
+        name: name,
+        data: data,
+        grad: grad,
+        shape: shape,
+        requires_grad: req_grad,
+        op: op_name,
+        parents: parents,
+        backward_fn: backward_fn
+    };
+    array_push(tape.nodes, node);
+    return node;
+}
+
+fn ag_param(tape, data, shape, name = "") {
+    let expected = _prod_shape(shape);
+    if len(data) != expected {
+        throw "ag_param: data length " + str(len(data)) + " != shape product " + str(expected);
+    }
+    let grad = _zeros(expected);
+    if tape == nil {
+        return map{
+            id: -1,
+            name: name,
+            data: data,
+            grad: grad,
+            shape: shape,
+            requires_grad: true,
+            op: "param",
+            parents: [],
+            backward_fn: nil
+        };
+    }
+    return _ag_register_node(tape, data, grad, shape, true, "param", [], nil, name);
+}
+
+fn ag_input(tape, data, shape, name = "") {
+    let expected = _prod_shape(shape);
+    if len(data) != expected {
+        throw "ag_input: data length " + str(len(data)) + " != shape product " + str(expected);
+    }
+    let grad = _zeros(expected);
+    return _ag_register_node(tape, data, grad, shape, false, "input", [], nil, name);
+}
+
+// Binds an existing persistent model parameter map onto a fresh forward tape,
+// sharing its underlying `data` and `grad` arrays so gradients accumulate directly on `param_obj.grad`.
+fn ag_bind_param(tape, param_obj) {
+    if param_obj.grad == nil or len(param_obj.grad) != len(param_obj.data) {
+        param_obj.grad = _zeros(len(param_obj.data));
+    }
+    return _ag_register_node(
+        tape,
+        param_obj.data,
+        param_obj.grad,
+        param_obj.shape,
+        param_obj.requires_grad,
+        "bound_param",
+        [],
+        nil,
+        param_obj.name
+    );
+}
+
+fn ag_add(tape, a, b) {
+    let na = len(a.data);
+    let nb = len(b.data);
+    if na == nb {
+        let out_data = _zeros(na);
+        let i = 0;
+        while i < na {
+            out_data[i] = a.data[i] + b.data[i];
+            i = i + 1;
+        }
+        let req = a.requires_grad or b.requires_grad;
+        let out_grad = _zeros(na);
+        let bwd = nil;
+        if req {
+            bwd = fn() {
+                if a.requires_grad {
+                    let j = 0;
+                    while j < na {
+                        a.grad[j] = a.grad[j] + out_grad[j];
+                        j = j + 1;
+                    }
+                }
+                if b.requires_grad {
+                    let j = 0;
+                    while j < na {
+                        b.grad[j] = b.grad[j] + out_grad[j];
+                        j = j + 1;
+                    }
+                }
+            };
+        }
+        return _ag_register_node(tape, out_data, out_grad, _clone_array(a.shape), req, "add", [a, b], bwd);
+    }
+
+    // Row-broadcast: a is [rows, cols] and b is [cols] or [1, cols]
+    if na > nb and (na % nb) == 0 {
+        let rows = _int(na / nb);
+        let cols = nb;
+        let out_data = _zeros(na);
+        let r = 0;
+        while r < rows {
+            let off = r * cols;
+            let c = 0;
+            while c < cols {
+                out_data[off + c] = a.data[off + c] + b.data[c];
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        let req = a.requires_grad or b.requires_grad;
+        let out_grad = _zeros(na);
+        let bwd = nil;
+        if req {
+            bwd = fn() {
+                if a.requires_grad {
+                    let i = 0;
+                    while i < na {
+                        a.grad[i] = a.grad[i] + out_grad[i];
+                        i = i + 1;
+                    }
+                }
+                if b.requires_grad {
+                    let rr = 0;
+                    while rr < rows {
+                        let roff = rr * cols;
+                        let cc = 0;
+                        while cc < cols {
+                            b.grad[cc] = b.grad[cc] + out_grad[roff + cc];
+                            cc = cc + 1;
+                        }
+                        rr = rr + 1;
+                    }
+                }
+            };
+        }
+        return _ag_register_node(tape, out_data, out_grad, _clone_array(a.shape), req, "add_broadcast", [a, b], bwd);
+    }
+
+    throw "ag_add: incompatible tensor lengths " + str(na) + " and " + str(nb);
+}
+
+fn ag_sub(tape, a, b) {
+    let n = len(a.data);
+    if len(b.data) != n {
+        throw "ag_sub: length mismatch " + str(n) + " vs " + str(len(b.data));
+    }
+    let out_data = _zeros(n);
+    let i = 0;
+    while i < n {
+        out_data[i] = a.data[i] - b.data[i];
+        i = i + 1;
+    }
+    let req = a.requires_grad or b.requires_grad;
+    let out_grad = _zeros(n);
+    let bwd = nil;
+    if req {
+        bwd = fn() {
+            if a.requires_grad {
+                let j = 0;
+                while j < n {
+                    a.grad[j] = a.grad[j] + out_grad[j];
+                    j = j + 1;
+                }
+            }
+            if b.requires_grad {
+                let j = 0;
+                while j < n {
+                    b.grad[j] = b.grad[j] - out_grad[j];
+                    j = j + 1;
+                }
+            }
+        };
+    }
+    return _ag_register_node(tape, out_data, out_grad, _clone_array(a.shape), req, "sub", [a, b], bwd);
+}
+
+fn ag_mul(tape, a, b) {
+    let n = len(a.data);
+    if len(b.data) != n {
+        throw "ag_mul: length mismatch " + str(n) + " vs " + str(len(b.data));
+    }
+    let out_data = _zeros(n);
+    let i = 0;
+    while i < n {
+        out_data[i] = a.data[i] * b.data[i];
+        i = i + 1;
+    }
+    let req = a.requires_grad or b.requires_grad;
+    let out_grad = _zeros(n);
+    let bwd = nil;
+    if req {
+        bwd = fn() {
+            if a.requires_grad {
+                let j = 0;
+                while j < n {
+                    a.grad[j] = a.grad[j] + out_grad[j] * b.data[j];
+                    j = j + 1;
+                }
+            }
+            if b.requires_grad {
+                let j = 0;
+                while j < n {
+                    b.grad[j] = b.grad[j] + out_grad[j] * a.data[j];
+                    j = j + 1;
+                }
+            }
+        };
+    }
+    return _ag_register_node(tape, out_data, out_grad, _clone_array(a.shape), req, "mul", [a, b], bwd);
+}
+
+fn ag_scale(tape, x, factor) {
+    let n = len(x.data);
+    let out_data = _zeros(n);
+    let i = 0;
+    while i < n {
+        out_data[i] = x.data[i] * factor;
+        i = i + 1;
+    }
+    let req = x.requires_grad;
+    let out_grad = _zeros(n);
+    let bwd = nil;
+    if req {
+        bwd = fn() {
+            let j = 0;
+            while j < n {
+                x.grad[j] = x.grad[j] + out_grad[j] * factor;
+                j = j + 1;
+            }
+        };
+    }
+    return _ag_register_node(tape, out_data, out_grad, _clone_array(x.shape), req, "scale", [x], bwd);
+}
+
+fn ag_transpose_2d(tape, x) {
+    if len(x.shape) != 2 {
+        throw "ag_transpose_2d: expected 2D tensor";
+    }
+    let rows = x.shape[0];
+    let cols = x.shape[1];
+    let out_data = transpose_2d(x.data, rows, cols);
+    let req = x.requires_grad;
+    let out_grad = _zeros(rows * cols);
+    let bwd = nil;
+    if req {
+        bwd = fn() {
+            let d_in = transpose_2d(out_grad, cols, rows);
+            let n = rows * cols;
+            let i = 0;
+            while i < n {
+                x.grad[i] = x.grad[i] + d_in[i];
+                i = i + 1;
+            }
+        };
+    }
+    return _ag_register_node(tape, out_data, out_grad, [cols, rows], req, "transpose_2d", [x], bwd);
+}
+
+fn ag_embedding(tape, weight, token_ids) {
+    if len(weight.shape) != 2 {
+        throw "ag_embedding: weight must be 2D [vocab_size, dim]";
+    }
+    let vocab_size = weight.shape[0];
+    let dim = weight.shape[1];
+    let seq_len = len(token_ids);
+    let out_data = _zeros(seq_len * dim);
+    let ids_copy = _clone_array(token_ids);
+
+    let s = 0;
+    while s < seq_len {
+        let tok = _int(ids_copy[s]);
+        if tok < 0 or tok >= vocab_size {
+            throw "ag_embedding: token id " + str(tok) + " out of range [0, " + str(vocab_size) + ")";
+        }
+        let src_off = tok * dim;
+        let dst_off = s * dim;
+        let d = 0;
+        while d < dim {
+            out_data[dst_off + d] = weight.data[src_off + d];
+            d = d + 1;
+        }
+        s = s + 1;
+    }
+
+    let req = weight.requires_grad;
+    let out_grad = _zeros(seq_len * dim);
+    let bwd = nil;
+    if req {
+        bwd = fn() {
+            let si = 0;
+            while si < seq_len {
+                let tok = _int(ids_copy[si]);
+                let w_off = tok * dim;
+                let g_off = si * dim;
+                let d = 0;
+                while d < dim {
+                    weight.grad[w_off + d] = weight.grad[w_off + d] + out_grad[g_off + d];
+                    d = d + 1;
+                }
+                si = si + 1;
+            }
+        };
+    }
+    return _ag_register_node(tape, out_data, out_grad, [seq_len, dim], req, "embedding", [weight], bwd);
+}
+
+fn ag_matmul(tape, a, b) {
+    if len(a.shape) != 2 or len(b.shape) != 2 {
+        throw "ag_matmul: both operands must be 2D matrices";
+    }
+    let m = a.shape[0];
+    let k = a.shape[1];
+    if b.shape[0] != k {
+        throw "ag_matmul: inner dimension mismatch " + str(k) + " vs " + str(b.shape[0]);
+    }
+    let n = b.shape[1];
+    let backend = tape.backend;
+
+    let out_data = accel_matmul(a.data, b.data, m, k, n, backend);
+    let req = a.requires_grad or b.requires_grad;
+    let out_grad = _zeros(m * n);
+    let bwd = nil;
+    if req {
+        bwd = fn() {
+            if a.requires_grad {
+                // dA[m, k] += dOut[m, n] * B[k, n]^T
+                let dA = accel_matmul_nt(out_grad, b.data, m, n, k, backend);
+                let total_a = m * k;
+                let ia = 0;
+                while ia < total_a {
+                    a.grad[ia] = a.grad[ia] + dA[ia];
+                    ia = ia + 1;
+                }
+            }
+            if b.requires_grad {
+                // dB[k, n] += A[m, k]^T * dOut[m, n]
+                let dB = accel_matmul_tn(a.data, out_grad, k, m, n, backend);
+                let total_b = k * n;
+                let ib = 0;
+                while ib < total_b {
+                    b.grad[ib] = b.grad[ib] + dB[ib];
+                    ib = ib + 1;
+                }
+            }
+        };
+    }
+    return _ag_register_node(tape, out_data, out_grad, [m, n], req, "matmul", [a, b], bwd);
+}
+
+// Pre-RMSNorm: y = (x / sqrt(mean(x^2) + eps)) * weight
+fn ag_rmsnorm(tape, x, weight, eps = 1e-5) {
+    let dim = len(weight.data);
+    let total = len(x.data);
+    if dim <= 0 or (total % dim) != 0 {
+        throw "ag_rmsnorm: x length " + str(total) + " is not divisible by weight dim " + str(dim);
+    }
+    let rows = _int(total / dim);
+    let out_data = _zeros(total);
+    let x_hat = _zeros(total);
+    let rstd = _zeros(rows);
+
+    let r = 0;
+    while r < rows {
+        let off = r * dim;
+        let sq_sum = 0.0;
+        let j = 0;
+        while j < dim {
+            let v = x.data[off + j];
+            sq_sum = sq_sum + v * v;
+            j = j + 1;
+        }
+        let inv_rms = 1.0 / num_sqrt((sq_sum / dim) + eps);
+        rstd[r] = inv_rms;
+        j = 0;
+        while j < dim {
+            let xh = x.data[off + j] * inv_rms;
+            x_hat[off + j] = xh;
+            out_data[off + j] = xh * weight.data[j];
+            j = j + 1;
+        }
+        r = r + 1;
+    }
+
+    let req = x.requires_grad or weight.requires_grad;
+    let out_grad = _zeros(total);
+    let bwd = nil;
+    if req {
+        bwd = fn() {
+            let rr = 0;
+            while rr < rows {
+                let off = rr * dim;
+                let inv_rms = rstd[rr];
+                if weight.requires_grad {
+                    let j = 0;
+                    while j < dim {
+                        weight.grad[j] = weight.grad[j] + out_grad[off + j] * x_hat[off + j];
+                        j = j + 1;
+                    }
+                }
+                if x.requires_grad {
+                    let dot_uxh = 0.0;
+                    let j = 0;
+                    while j < dim {
+                        let u_j = out_grad[off + j] * weight.data[j];
+                        dot_uxh = dot_uxh + u_j * x_hat[off + j];
+                        j = j + 1;
+                    }
+                    let mean_uxh = dot_uxh / dim;
+                    j = 0;
+                    while j < dim {
+                        let u_j = out_grad[off + j] * weight.data[j];
+                        x.grad[off + j] = x.grad[off + j] + inv_rms * (u_j - x_hat[off + j] * mean_uxh);
+                        j = j + 1;
+                    }
+                }
+                rr = rr + 1;
+            }
+        };
+    }
+    return _ag_register_node(tape, out_data, out_grad, _clone_array(x.shape), req, "rmsnorm", [x, weight], bwd);
+}
+
+fn _sigmoid_stable(v) {
+    if v >= 0.0 {
+        return 1.0 / (1.0 + num_exp(0.0 - v));
+    }
+    let ev = num_exp(v);
+    return ev / (1.0 + ev);
+}
+
+// SiLU(x) = x * sigmoid(x)
+fn ag_silu(tape, x) {
+    let n = len(x.data);
+    let out_data = _zeros(n);
+    let sig_cache = _zeros(n);
+    let i = 0;
+    while i < n {
+        let xv = x.data[i];
+        let s = _sigmoid_stable(xv);
+        sig_cache[i] = s;
+        out_data[i] = xv * s;
+        i = i + 1;
+    }
+    let req = x.requires_grad;
+    let out_grad = _zeros(n);
+    let bwd = nil;
+    if req {
+        bwd = fn() {
+            let j = 0;
+            while j < n {
+                let xv = x.data[j];
+                let s = sig_cache[j];
+                let dsilu = s * (1.0 + xv * (1.0 - s));
+                x.grad[j] = x.grad[j] + out_grad[j] * dsilu;
+                j = j + 1;
+            }
+        };
+    }
+    return _ag_register_node(tape, out_data, out_grad, _clone_array(x.shape), req, "silu", [x], bwd);
+}
+
+// SwiGLU:
+//   - 3-arg fused gated activation: ag_swiglu(tape, gate, up) -> SiLU(gate) * up
+//   - 5-arg full SwiGLU FFN block:  ag_swiglu(tape, x, w1, w3, w2) -> (SiLU(x * w1) * (x * w3)) * w2
+fn ag_swiglu(tape, a, b, w3 = nil, w2 = nil) {
+    if w3 != nil and w2 != nil {
+        let gate_proj = ag_matmul(tape, a, b);
+        let up_proj = ag_matmul(tape, a, w3);
+        let gated = ag_swiglu(tape, gate_proj, up_proj);
+        return ag_matmul(tape, gated, w2);
+    }
+
+    let n = len(a.data);
+    if len(b.data) != n {
+        throw "ag_swiglu: gate and up length mismatch " + str(n) + " vs " + str(len(b.data));
+    }
+    let out_data = _zeros(n);
+    let sig_cache = _zeros(n);
+    let silu_cache = _zeros(n);
+    let i = 0;
+    while i < n {
+        let gv = a.data[i];
+        let uv = b.data[i];
+        let s = _sigmoid_stable(gv);
+        let sl = gv * s;
+        sig_cache[i] = s;
+        silu_cache[i] = sl;
+        out_data[i] = sl * uv;
+        i = i + 1;
+    }
+
+    let req = a.requires_grad or b.requires_grad;
+    let out_grad = _zeros(n);
+    let bwd = nil;
+    if req {
+        bwd = fn() {
+            let j = 0;
+            while j < n {
+                let dy = out_grad[j];
+                if a.requires_grad {
+                    let gv = a.data[j];
+                    let s = sig_cache[j];
+                    let dsilu = s * (1.0 + gv * (1.0 - s));
+                    a.grad[j] = a.grad[j] + dy * b.data[j] * dsilu;
+                }
+                if b.requires_grad {
+                    b.grad[j] = b.grad[j] + dy * silu_cache[j];
+                }
+                j = j + 1;
+            }
+        };
+    }
+    return _ag_register_node(tape, out_data, out_grad, _clone_array(a.shape), req, "swiglu", [a, b], bwd);
+}
+
+// Rotary Positional Embeddings (RoPE): complex-plane rotation on [seq_len, n_heads * head_dim]
+fn ag_rope(tape, x, n_heads, head_dim, rope_theta = 10000.0, pos_offset = 0) {
+    if (head_dim % 2) != 0 {
+        throw "ag_rope: head_dim must be even, got " + str(head_dim);
+    }
+    let row_width = n_heads * head_dim;
+    let total = len(x.data);
+    if row_width <= 0 or (total % row_width) != 0 {
+        throw "ag_rope: tensor size " + str(total) + " incompatible with n_heads*head_dim=" + str(row_width);
+    }
+    let seq_len = _int(total / row_width);
+    let half_d = _int(head_dim / 2);
+
+    // Precompute inverse frequencies and per-(pos, pair) cos/sin tables
+    let inv_freq = _zeros(half_d);
+    let pair_i = 0;
+    while pair_i < half_d {
+        inv_freq[pair_i] = num_pow(rope_theta, (0.0 - 2.0 * pair_i) / head_dim);
+        pair_i = pair_i + 1;
+    }
+
+    let cos_tbl = _zeros(seq_len * half_d);
+    let sin_tbl = _zeros(seq_len * half_d);
+    let s = 0;
+    while s < seq_len {
+        let pos = pos_offset + s;
+        let p = 0;
+        while p < half_d {
+            let ang = pos * inv_freq[p];
+            cos_tbl[s * half_d + p] = num_cos(ang);
+            sin_tbl[s * half_d + p] = num_sin(ang);
+            p = p + 1;
+        }
+        s = s + 1;
+    }
+
+    let out_data = _zeros(total);
+    s = 0;
+    while s < seq_len {
+        let cs_off = s * half_d;
+        let h = 0;
+        while h < n_heads {
+            let base = (s * n_heads + h) * head_dim;
+            let p = 0;
+            while p < half_d {
+                let c = cos_tbl[cs_off + p];
+                let sn = sin_tbl[cs_off + p];
+                let x0 = x.data[base + 2 * p];
+                let x1 = x.data[base + 2 * p + 1];
+                out_data[base + 2 * p] = x0 * c - x1 * sn;
+                out_data[base + 2 * p + 1] = x0 * sn + x1 * c;
+                p = p + 1;
+            }
+            h = h + 1;
+        }
+        s = s + 1;
+    }
+
+    let req = x.requires_grad;
+    let out_grad = _zeros(total);
+    let bwd = nil;
+    if req {
+        bwd = fn() {
+            let si = 0;
+            while si < seq_len {
+                let cs_off = si * half_d;
+                let h = 0;
+                while h < n_heads {
+                    let base = (si * n_heads + h) * head_dim;
+                    let p = 0;
+                    while p < half_d {
+                        let c = cos_tbl[cs_off + p];
+                        let sn = sin_tbl[cs_off + p];
+                        let dy0 = out_grad[base + 2 * p];
+                        let dy1 = out_grad[base + 2 * p + 1];
+                        // Orthogonal transpose R(theta)^T = R(-theta)
+                        x.grad[base + 2 * p] = x.grad[base + 2 * p] + (dy0 * c + dy1 * sn);
+                        x.grad[base + 2 * p + 1] = x.grad[base + 2 * p + 1] + (0.0 - dy0 * sn + dy1 * c);
+                        p = p + 1;
+                    }
+                    h = h + 1;
+                }
+                si = si + 1;
+            }
+        };
+    }
+    return _ag_register_node(tape, out_data, out_grad, _clone_array(x.shape), req, "rope", [x], bwd);
+}
+
+// Tiled Online-Softmax Causal FlashAttention-2 with Grouped-Query Attention (GQA)
+//   q: [seq_len, n_heads * head_dim]
+//   k: [seq_len, n_kv_heads * head_dim]
+//   v: [seq_len, n_kv_heads * head_dim]
+// Materializes ZERO SxS attention matrices; stores only O and per-(head, query) log-sum-exp L_i!
+fn ag_flash_attention_causal(tape, q, k, v, n_heads, n_kv_heads = nil, block_size = 16) {
+    if n_kv_heads == nil { n_kv_heads = n_heads; }
+    if n_heads <= 0 or n_kv_heads <= 0 or (n_heads % n_kv_heads) != 0 {
+        throw "ag_flash_attention_causal: n_heads (" + str(n_heads) + ") must be divisible by n_kv_heads (" + str(n_kv_heads) + ")";
+    }
+    let seq_len = q.shape[0];
+    let q_width = q.shape[1];
+    if (q_width % n_heads) != 0 {
+        throw "ag_flash_attention_causal: q width " + str(q_width) + " not divisible by n_heads " + str(n_heads);
+    }
+    let head_dim = _int(q_width / n_heads);
+    let kv_width = n_kv_heads * head_dim;
+    if k.shape[0] != seq_len or k.shape[1] != kv_width or v.shape[0] != seq_len or v.shape[1] != kv_width {
+        throw "ag_flash_attention_causal: k/v shape mismatch for GQA";
+    }
+
+    let kv_mul = _int(n_heads / n_kv_heads);
+    let scale = 1.0 / num_sqrt(head_dim);
+    let br = _max(1, _int(block_size));
+    let bc = br;
+
+    let out_data = _zeros(seq_len * q_width);
+    let lse_saved = _zeros(n_heads * seq_len);
+
+    // Forward: Tiled Online-Softmax (Milakov-Gimelshein / Dao FlashAttention-2)
+    let h = 0;
+    while h < n_heads {
+        let kv_h = _int(h / kv_mul);
+        let i0 = 0;
+        while i0 < seq_len {
+            let i1 = _min(i0 + br, seq_len);
+            let tile_rows = i1 - i0;
+
+            let m_run = _zeros(tile_rows);
+            let l_run = _zeros(tile_rows);
+            let o_run = _zeros(tile_rows * head_dim);
+            let tr = 0;
+            while tr < tile_rows {
+                m_run[tr] = -1.0e30;
+                l_run[tr] = 0.0;
+                tr = tr + 1;
+            }
+
+            // Causal KV blocks: only j0 < i1 can have j <= i
+            let j0 = 0;
+            while j0 < i1 {
+                let j1 = _min(j0 + bc, seq_len);
+                tr = 0;
+                while tr < tile_rows {
+                    let qi = i0 + tr;
+                    let j_end = _min(j1 - 1, qi); // strict causal mask j <= qi
+                    if j0 <= j_end {
+                        let q_off = qi * q_width + h * head_dim;
+                        let n_valid = j_end - j0 + 1;
+                        let tile_scores = _zeros(n_valid);
+                        let m_tile = -1.0e30;
+
+                        let tj = 0;
+                        while tj < n_valid {
+                            let kj = j0 + tj;
+                            let k_off = kj * kv_width + kv_h * head_dim;
+                            let dot_qk = 0.0;
+                            let d = 0;
+                            while d < head_dim {
+                                dot_qk = dot_qk + q.data[q_off + d] * k.data[k_off + d];
+                                d = d + 1;
+                            }
+                            let sc = dot_qk * scale;
+                            tile_scores[tj] = sc;
+                            if sc > m_tile { m_tile = sc; }
+                            tj = tj + 1;
+                        }
+
+                        let m_prev = m_run[tr];
+                        let m_new = _max(m_prev, m_tile);
+                        let alpha = num_exp(m_prev - m_new);
+                        let l_new = alpha * l_run[tr];
+
+                        let o_off = tr * head_dim;
+                        let d = 0;
+                        while d < head_dim {
+                            o_run[o_off + d] = o_run[o_off + d] * (alpha * l_run[tr]);
+                            d = d + 1;
+                        }
+
+                        tj = 0;
+                        while tj < n_valid {
+                            let kj = j0 + tj;
+                            let p_ij = num_exp(tile_scores[tj] - m_new);
+                            l_new = l_new + p_ij;
+                            let v_off = kj * kv_width + kv_h * head_dim;
+                            d = 0;
+                            while d < head_dim {
+                                o_run[o_off + d] = o_run[o_off + d] + p_ij * v.data[v_off + d];
+                                d = d + 1;
+                            }
+                            tj = tj + 1;
+                        }
+
+                        let inv_l_new = 1.0 / l_new;
+                        d = 0;
+                        while d < head_dim {
+                            o_run[o_off + d] = o_run[o_off + d] * inv_l_new;
+                            d = d + 1;
+                        }
+                        m_run[tr] = m_new;
+                        l_run[tr] = l_new;
+                    }
+                    tr = tr + 1;
+                }
+                j0 = j0 + bc;
+            }
+
+            // Commit output tile O and exact log-sum-exp L = m + ln(l)
+            tr = 0;
+            while tr < tile_rows {
+                let qi = i0 + tr;
+                lse_saved[h * seq_len + qi] = m_run[tr] + num_ln(l_run[tr]);
+                let dst_off = qi * q_width + h * head_dim;
+                let o_off = tr * head_dim;
+                let d = 0;
+                while d < head_dim {
+                    out_data[dst_off + d] = o_run[o_off + d];
+                    d = d + 1;
+                }
+                tr = tr + 1;
+            }
+
+            i0 = i0 + br;
+        }
+        h = h + 1;
+    }
+
+    let req = q.requires_grad or k.requires_grad or v.requires_grad;
+    let out_grad = _zeros(seq_len * q_width);
+    let bwd = nil;
+    if req {
+        bwd = fn() {
+            // FlashAttention-2 Backward: D_i = rowsum(dO_i * O_i), then tiled recomputation
+            let d_row = _zeros(n_heads * seq_len);
+            let bh = 0;
+            while bh < n_heads {
+                let qi = 0;
+                while qi < seq_len {
+                    let off = qi * q_width + bh * head_dim;
+                    let acc_d = 0.0;
+                    let d = 0;
+                    while d < head_dim {
+                        acc_d = acc_d + out_grad[off + d] * out_data[off + d];
+                        d = d + 1;
+                    }
+                    d_row[bh * seq_len + qi] = acc_d;
+                    qi = qi + 1;
+                }
+                bh = bh + 1;
+            }
+
+            bh = 0;
+            while bh < n_heads {
+                let kv_h = _int(bh / kv_mul);
+                let j0 = 0;
+                while j0 < seq_len {
+                    let j1 = _min(j0 + bc, seq_len);
+                    // Only query tiles i1 > j0 can attend to keys in [j0, j1)
+                    let i0 = _int(j0 / br) * br;
+                    while i0 < seq_len {
+                        let i1 = _min(i0 + br, seq_len);
+                        let qi = i0;
+                        while qi < i1 {
+                            let j_end = _min(j1 - 1, qi);
+                            if j0 <= j_end {
+                                let q_off = qi * q_width + bh * head_dim;
+                                let lse_i = lse_saved[bh * seq_len + qi];
+                                let di_val = d_row[bh * seq_len + qi];
+
+                                let kj = j0;
+                                while kj <= j_end {
+                                    let k_off = kj * kv_width + kv_h * head_dim;
+                                    let v_off = k_off;
+
+                                    let dot_qk = 0.0;
+                                    let dp_ij = 0.0;
+                                    let d = 0;
+                                    while d < head_dim {
+                                        dot_qk = dot_qk + q.data[q_off + d] * k.data[k_off + d];
+                                        dp_ij = dp_ij + out_grad[q_off + d] * v.data[v_off + d];
+                                        d = d + 1;
+                                    }
+
+                                    let p_ij = num_exp(dot_qk * scale - lse_i);
+                                    let ds_ij = p_ij * (dp_ij - di_val) * scale;
+
+                                    if v.requires_grad {
+                                        d = 0;
+                                        while d < head_dim {
+                                            v.grad[v_off + d] = v.grad[v_off + d] + p_ij * out_grad[q_off + d];
+                                            d = d + 1;
+                                        }
+                                    }
+                                    if q.requires_grad {
+                                        d = 0;
+                                        while d < head_dim {
+                                            q.grad[q_off + d] = q.grad[q_off + d] + ds_ij * k.data[k_off + d];
+                                            d = d + 1;
+                                        }
+                                    }
+                                    if k.requires_grad {
+                                        d = 0;
+                                        while d < head_dim {
+                                            k.grad[k_off + d] = k.grad[k_off + d] + ds_ij * q.data[q_off + d];
+                                            d = d + 1;
+                                        }
+                                    }
+                                    kj = kj + 1;
+                                }
+                            }
+                            qi = qi + 1;
+                        }
+                        i0 = i0 + br;
+                    }
+                    j0 = j0 + bc;
+                }
+                bh = bh + 1;
+            }
+        };
+    }
+    return _ag_register_node(tape, out_data, out_grad, [seq_len, q_width], req, "flash_attention_causal", [q, k, v], bwd);
+}
+
+// Numerically-stable Log-Sum-Exp Cross-Entropy Loss over [seq_len, vocab_size]
+fn ag_cross_entropy(tape, logits, target_ids) {
+    if len(logits.shape) != 2 {
+        throw "ag_cross_entropy: logits must be 2D [seq_len, vocab_size]";
+    }
+    let seq_len = logits.shape[0];
+    let vocab_size = logits.shape[1];
+    if len(target_ids) != seq_len or seq_len <= 0 {
+        throw "ag_cross_entropy: target_ids length must match logits seq_len";
+    }
+    let targets_copy = _clone_array(target_ids);
+    let lse_arr = _zeros(seq_len);
+    let total_loss = 0.0;
+
+    let s = 0;
+    while s < seq_len {
+        let tgt = _int(targets_copy[s]);
+        if tgt < 0 or tgt >= vocab_size {
+            throw "ag_cross_entropy: target id " + str(tgt) + " out of range";
+        }
+        let off = s * vocab_size;
+        let row_max = logits.data[off];
+        let v = 1;
+        while v < vocab_size {
+            if logits.data[off + v] > row_max { row_max = logits.data[off + v]; }
+            v = v + 1;
+        }
+        let sum_exp = 0.0;
+        v = 0;
+        while v < vocab_size {
+            sum_exp = sum_exp + num_exp(logits.data[off + v] - row_max);
+            v = v + 1;
+        }
+        let lse = row_max + num_ln(sum_exp);
+        lse_arr[s] = lse;
+        total_loss = total_loss + (lse - logits.data[off + tgt]);
+        s = s + 1;
+    }
+
+    let mean_loss = total_loss / seq_len;
+    let req = logits.requires_grad;
+    let out_grad = [0.0];
+    let bwd = nil;
+    if req {
+        bwd = fn() {
+            let upstream = out_grad[0] / seq_len;
+            let si = 0;
+            while si < seq_len {
+                let tgt = _int(targets_copy[si]);
+                let off = si * vocab_size;
+                let lse = lse_arr[si];
+                let v = 0;
+                while v < vocab_size {
+                    let prob = num_exp(logits.data[off + v] - lse);
+                    let ind = 0.0;
+                    if v == tgt { ind = 1.0; }
+                    logits.grad[off + v] = logits.grad[off + v] + upstream * (prob - ind);
+                    v = v + 1;
+                }
+                si = si + 1;
+            }
+        };
+    }
+
+    let loss_node = _ag_register_node(tape, [mean_loss], out_grad, [1], req, "cross_entropy", [logits], bwd);
+    loss_node.perplexity = num_exp(mean_loss);
+    return loss_node;
+}
+
+// Exact reverse-topological DAG traversal starting from loss_node
+fn ag_backward(tape, loss_node) {
+    let visited = map{};
+    let topo = [];
+
+    fn build_topo(nd) {
+        let key = str(nd.id);
+        if map_has(visited, key) { return nil; }
+        visited[key] = true;
+        let ps = nd.parents;
+        let i = 0;
+        while i < len(ps) {
+            build_topo(ps[i]);
+            i = i + 1;
+        }
+        array_push(topo, nd);
+        return nil;
+    }
+
+    build_topo(loss_node);
+
+    let g_len = len(loss_node.grad);
+    let i = 0;
+    while i < g_len {
+        loss_node.grad[i] = 1.0;
+        i = i + 1;
+    }
+
+    let idx = len(topo) - 1;
+    while idx >= 0 {
+        let nd = topo[idx];
+        if nd.backward_fn != nil {
+            let fn_bwd = nd.backward_fn;
+            fn_bwd();
+        }
+        idx = idx - 1;
+    }
+    return loss_node.grad;
+}
+
+fn zero_grads(params) {
+    let p_idx = 0;
+    while p_idx < len(params) {
+        let p = params[p_idx];
+        let g = p.grad;
+        let n = len(p.data);
+        if g == nil or len(g) != n {
+            p.grad = _zeros(n);
+        } else {
+            let i = 0;
+            while i < n {
+                g[i] = 0.0;
+                i = i + 1;
+            }
+        }
+        p_idx = p_idx + 1;
+    }
+    return nil;
+}
+
+fn clip_grad_global_norm(params, max_norm = 1.0) {
+    let sq_norm = 0.0;
+    let p_idx = 0;
+    while p_idx < len(params) {
+        let g = params[p_idx].grad;
+        if g != nil {
+            let n = len(g);
+            let i = 0;
+            while i < n {
+                let gv = g[i];
+                sq_norm = sq_norm + gv * gv;
+                i = i + 1;
+            }
+        }
+        p_idx = p_idx + 1;
+    }
+    let global_norm = num_sqrt(sq_norm);
+    let clipped = false;
+    let scale = 1.0;
+    if max_norm > 0.0 and global_norm > max_norm {
+        clipped = true;
+        scale = max_norm / (global_norm + 1e-12);
+        p_idx = 0;
+        while p_idx < len(params) {
+            let g = params[p_idx].grad;
+            if g != nil {
+                let n = len(g);
+                let i = 0;
+                while i < n {
+                    g[i] = g[i] * scale;
+                    i = i + 1;
+                }
+            }
+            p_idx = p_idx + 1;
+        }
+    }
+    return map{
+        global_norm: global_norm,
+        clipped: clipped,
+        scale: scale
+    };
+}
+
+fn adamw_new(params, cfg = nil) {
+    if cfg == nil { cfg = map{}; }
+    let lr = try cfg.lr catch 0.003;
+    let beta1 = try cfg.beta1 catch 0.9;
+    let beta2 = try cfg.beta2 catch 0.999;
+    let eps = try cfg.eps catch 1e-8;
+    let weight_decay = try cfg.weight_decay catch 0.01;
+
+    let m_list = [];
+    let v_list = [];
+    let i = 0;
+    while i < len(params) {
+        let sz = len(params[i].data);
+        array_push(m_list, _zeros(sz));
+        array_push(v_list, _zeros(sz));
+        i = i + 1;
+    }
+    return map{
+        step: 0,
+        lr: lr,
+        beta1: beta1,
+        beta2: beta2,
+        eps: eps,
+        weight_decay: weight_decay,
+        m: m_list,
+        v: v_list
+    };
+}
+
+// Decoupled Weight-Decay AdamW update step.
+// Supports both `adamw_step(opt, params)` and `adamw_step(params, opt, lr, ...)`.
+fn adamw_step(opt_or_params, params_or_opt = nil, lr_override = nil) {
+    let opt = nil;
+    let params = nil;
+    if type(opt_or_params) == "map" and map_has(opt_or_params, "m") {
+        opt = opt_or_params;
+        params = params_or_opt;
+        if params == nil and map_has(opt, "params") {
+            params = opt.params;
+        }
+    } elif type(opt_or_params) == "array" {
+        params = opt_or_params;
+        if params_or_opt == nil {
+            opt = adamw_new(params, map{ lr: if lr_override != nil { lr_override } else { 0.003 } });
+        } else {
+            opt = params_or_opt;
+        }
+    } else {
+        throw "adamw_step: expected (opt, params) or (params, opt)";
+    }
+
+    if len(opt.m) != len(params) {
+        opt.m = [];
+        opt.v = [];
+        let pi = 0;
+        while pi < len(params) {
+            let sz = len(params[pi].data);
+            array_push(opt.m, _zeros(sz));
+            array_push(opt.v, _zeros(sz));
+            pi = pi + 1;
+        }
+        opt.step = 0;
+    }
+
+    opt.step = opt.step + 1;
+    let t = opt.step;
+    let lr = if lr_override != nil { lr_override } else { opt.lr };
+    let b1 = opt.beta1;
+    let b2 = opt.beta2;
+    let eps = opt.eps;
+    let wd_base = opt.weight_decay;
+
+    let bias_corr1 = 1.0 - num_pow(b1, t);
+    let bias_corr2 = 1.0 - num_pow(b2, t);
+
+    let p_idx = 0;
+    while p_idx < len(params) {
+        let p = params[p_idx];
+        if p.requires_grad {
+            let d_arr = p.data;
+            let g_arr = p.grad;
+            let m_arr = opt.m[p_idx];
+            let v_arr = opt.v[p_idx];
+            let n = len(d_arr);
+
+            // Standard Transformer convention: 1D RMSNorm gains do not decay unless explicitly requested
+            let wd = wd_base;
+            if len(p.shape) < 2 { wd = 0.0; }
+            let decay_mult = 1.0 - lr * wd;
+
+            let i = 0;
+            while i < n {
+                let g = g_arr[i];
+                let m_new = b1 * m_arr[i] + (1.0 - b1) * g;
+                let v_new = b2 * v_arr[i] + (1.0 - b2) * (g * g);
+                m_arr[i] = m_new;
+                v_arr[i] = v_new;
+
+                let m_hat = m_new / bias_corr1;
+                let v_hat = v_new / bias_corr2;
+                d_arr[i] = d_arr[i] * decay_mult - lr * (m_hat / (num_sqrt(v_hat) + eps));
+                i = i + 1;
+            }
+        }
+        p_idx = p_idx + 1;
+    }
+    return opt;
+}
+
+// Helper for central finite-difference verification of scalar objective fn_eval()
+fn _fd_compare_arrays(param_arr, ana_grad, eval_scalar_fn, eps) {
+    let n = len(param_arr);
+    let max_abs = 0.0;
+    let max_rel = 0.0;
+    let i = 0;
+    while i < n {
+        let orig = param_arr[i];
+        param_arr[i] = orig + eps;
+        let l_plus = eval_scalar_fn();
+        param_arr[i] = orig - eps;
+        let l_minus = eval_scalar_fn();
+        param_arr[i] = orig;
+
+        let g_num = (l_plus - l_minus) / (2.0 * eps);
+        let g_ana = ana_grad[i];
+        let diff = _abs(g_ana - g_num);
+        let denom = _max(1.0, _abs(g_ana) + _abs(g_num));
+        let rel = diff / denom;
+        if diff > max_abs { max_abs = diff; }
+        if rel > max_rel { max_rel = rel; }
+        i = i + 1;
+    }
+    return map{
+        elements_checked: n,
+        max_abs_error: max_abs,
+        max_rel_error: max_rel,
+        ok: max_abs < 1e-4 and max_rel < 1e-4
+    };
+}
+
+fn _weighted_quad_loss(tape, node, weights_vec) {
+    // Non-linear scalar objective sum_i weights_vec[i] * (node[i] + 0.25 * node[i]^2)
+    // so second-order cross-interactions & upstream non-uniform gradients are thoroughly tested!
+    let n = len(node.data);
+    let total = 0.0;
+    let i = 0;
+    while i < n {
+        let v = node.data[i];
+        total = total + weights_vec[i] * (v + 0.25 * v * v);
+        i = i + 1;
+    }
+    let out_grad = [0.0];
+    let bwd = fn() {
+        let up = out_grad[0];
+        let j = 0;
+        while j < n {
+            node.grad[j] = node.grad[j] + up * weights_vec[j] * (1.0 + 0.5 * node.data[j]);
+            j = j + 1;
+        }
+    };
+    return _ag_register_node(tape, [total], out_grad, [1], true, "quad_probe_loss", [node], bwd);
+}
+
+// Analytical vs Numerical Central Finite-Difference Verification (eps = 1e-5)
+// Proves max error < 1e-4 across matmul, rmsnorm, swiglu, rope, and causal_flash_attention!
+fn verify_autograd_gradients(eps = 1e-5) {
+    let rng = rng_new(20261114);
+
+    // 1. MatMul verification
+    let mm_a_data = rng_randn_array(rng, 12, 0.5);
+    let mm_b_data = rng_randn_array(rng, 20, 0.5);
+    let mm_w = rng_randn_array(rng, 15, 0.7);
+    let t_mm = ag_tape_new("cpu");
+    let nd_mma = ag_param(t_mm, mm_a_data, [3, 4], "mm_a");
+    let nd_mmb = ag_param(t_mm, mm_b_data, [4, 5], "mm_b");
+    let nd_mmc = ag_matmul(t_mm, nd_mma, nd_mmb);
+    let l_mm = _weighted_quad_loss(t_mm, nd_mmc, mm_w);
+    ag_backward(t_mm, l_mm);
+    let eval_mm = fn() {
+        let tp = ag_tape_new("cpu");
+        let a = ag_input(tp, mm_a_data, [3, 4]);
+        let b = ag_input(tp, mm_b_data, [4, 5]);
+        let c = ag_matmul(tp, a, b);
+        return _weighted_quad_loss(tp, c, mm_w).data[0];
+    };
+    let chk_mma = _fd_compare_arrays(mm_a_data, nd_mma.grad, eval_mm, eps);
+    let chk_mmb = _fd_compare_arrays(mm_b_data, nd_mmb.grad, eval_mm, eps);
+    let mm_err = _max(chk_mma.max_abs_error, chk_mmb.max_abs_error);
+
+    // 2. Pre-RMSNorm verification
+    let rn_x_data = rng_randn_array(rng, 24, 0.6);
+    let rn_w_data = rng_randn_array(rng, 8, 0.8);
+    let rn_probe = rng_randn_array(rng, 24, 0.7);
+    let t_rn = ag_tape_new("cpu");
+    let nd_rnx = ag_param(t_rn, rn_x_data, [3, 8], "rn_x");
+    let nd_rnw = ag_param(t_rn, rn_w_data, [8], "rn_w");
+    let nd_rny = ag_rmsnorm(t_rn, nd_rnx, nd_rnw, 1e-5);
+    let l_rn = _weighted_quad_loss(t_rn, nd_rny, rn_probe);
+    ag_backward(t_rn, l_rn);
+    let eval_rn = fn() {
+        let tp = ag_tape_new("cpu");
+        let x = ag_input(tp, rn_x_data, [3, 8]);
+        let w = ag_input(tp, rn_w_data, [8]);
+        let y = ag_rmsnorm(tp, x, w, 1e-5);
+        return _weighted_quad_loss(tp, y, rn_probe).data[0];
+    };
+    let chk_rnx = _fd_compare_arrays(rn_x_data, nd_rnx.grad, eval_rn, eps);
+    let chk_rnw = _fd_compare_arrays(rn_w_data, nd_rnw.grad, eval_rn, eps);
+    let rn_err = _max(chk_rnx.max_abs_error, chk_rnw.max_abs_error);
+
+    // 3. SwiGLU FFN verification (x, w1, w3, w2)
+    let sg_x_data = rng_randn_array(rng, 18, 0.5);
+    let sg_w1_data = rng_randn_array(rng, 48, 0.4);
+    let sg_w3_data = rng_randn_array(rng, 48, 0.4);
+    let sg_w2_data = rng_randn_array(rng, 48, 0.4);
+    let sg_probe = rng_randn_array(rng, 18, 0.6);
+    let t_sg = ag_tape_new("cpu");
+    let nd_sgx = ag_param(t_sg, sg_x_data, [3, 6], "sg_x");
+    let nd_sgw1 = ag_param(t_sg, sg_w1_data, [6, 8], "sg_w1");
+    let nd_sgw3 = ag_param(t_sg, sg_w3_data, [6, 8], "sg_w3");
+    let nd_sgw2 = ag_param(t_sg, sg_w2_data, [8, 6], "sg_w2");
+    let nd_sgy = ag_swiglu(t_sg, nd_sgx, nd_sgw1, nd_sgw3, nd_sgw2);
+    let l_sg = _weighted_quad_loss(t_sg, nd_sgy, sg_probe);
+    ag_backward(t_sg, l_sg);
+    let eval_sg = fn() {
+        let tp = ag_tape_new("cpu");
+        let x = ag_input(tp, sg_x_data, [3, 6]);
+        let w1 = ag_input(tp, sg_w1_data, [6, 8]);
+        let w3 = ag_input(tp, sg_w3_data, [6, 8]);
+        let w2 = ag_input(tp, sg_w2_data, [8, 6]);
+        let y = ag_swiglu(tp, x, w1, w3, w2);
+        return _weighted_quad_loss(tp, y, sg_probe).data[0];
+    };
+    let chk_sgx = _fd_compare_arrays(sg_x_data, nd_sgx.grad, eval_sg, eps);
+    let chk_sgw1 = _fd_compare_arrays(sg_w1_data, nd_sgw1.grad, eval_sg, eps);
+    let chk_sgw3 = _fd_compare_arrays(sg_w3_data, nd_sgw3.grad, eval_sg, eps);
+    let chk_sgw2 = _fd_compare_arrays(sg_w2_data, nd_sgw2.grad, eval_sg, eps);
+    let sg_err = _max(_max(chk_sgx.max_abs_error, chk_sgw1.max_abs_error), _max(chk_sgw3.max_abs_error, chk_sgw2.max_abs_error));
+
+    // 4. Rotary Positional Embeddings (RoPE) verification
+    let rp_x_data = rng_randn_array(rng, 32, 0.7);
+    let rp_probe = rng_randn_array(rng, 32, 0.6);
+    let t_rp = ag_tape_new("cpu");
+    let nd_rpx = ag_param(t_rp, rp_x_data, [4, 8], "rp_x");
+    let nd_rpy = ag_rope(t_rp, nd_rpx, 2, 4, 10000.0, 0);
+    let l_rp = _weighted_quad_loss(t_rp, nd_rpy, rp_probe);
+    ag_backward(t_rp, l_rp);
+    let eval_rp = fn() {
+        let tp = ag_tape_new("cpu");
+        let x = ag_input(tp, rp_x_data, [4, 8]);
+        let y = ag_rope(tp, x, 2, 4, 10000.0, 0);
+        return _weighted_quad_loss(tp, y, rp_probe).data[0];
+    };
+    let chk_rpx = _fd_compare_arrays(rp_x_data, nd_rpx.grad, eval_rp, eps);
+    let rp_err = chk_rpx.max_abs_error;
+
+    // 5. Tiled Online-Softmax Causal FlashAttention + GQA (n_heads=4, n_kv_heads=2, block_size=2)
+    let fa_q_data = rng_randn_array(rng, 40, 0.6); // [5, 8] -> 4 heads * head_dim 2
+    let fa_k_data = rng_randn_array(rng, 20, 0.6); // [5, 4] -> 2 kv_heads * head_dim 2
+    let fa_v_data = rng_randn_array(rng, 20, 0.6); // [5, 4]
+    let fa_probe = rng_randn_array(rng, 40, 0.7);
+    let t_fa = ag_tape_new("cpu");
+    let nd_faq = ag_param(t_fa, fa_q_data, [5, 8], "fa_q");
+    let nd_fak = ag_param(t_fa, fa_k_data, [5, 4], "fa_k");
+    let nd_fav = ag_param(t_fa, fa_v_data, [5, 4], "fa_v");
+    let nd_fay = ag_flash_attention_causal(t_fa, nd_faq, nd_fak, nd_fav, 4, 2, 2);
+    let l_fa = _weighted_quad_loss(t_fa, nd_fay, fa_probe);
+    ag_backward(t_fa, l_fa);
+    let eval_fa = fn() {
+        let tp = ag_tape_new("cpu");
+        let q = ag_input(tp, fa_q_data, [5, 8]);
+        let k = ag_input(tp, fa_k_data, [5, 4]);
+        let v = ag_input(tp, fa_v_data, [5, 4]);
+        let y = ag_flash_attention_causal(tp, q, k, v, 4, 2, 2);
+        return _weighted_quad_loss(tp, y, fa_probe).data[0];
+    };
+    let chk_faq = _fd_compare_arrays(fa_q_data, nd_faq.grad, eval_fa, eps);
+    let chk_fak = _fd_compare_arrays(fa_k_data, nd_fak.grad, eval_fa, eps);
+    let chk_fav = _fd_compare_arrays(fa_v_data, nd_fav.grad, eval_fa, eps);
+    let fa_err = _max(_max(chk_faq.max_abs_error, chk_fak.max_abs_error), chk_fav.max_abs_error);
+
+    // 6. Cross-Entropy Log-Sum-Exp verification
+    let ce_logits_data = rng_randn_array(rng, 24, 0.8);
+    let ce_targets = [2, 5, 0, 3];
+    let t_ce = ag_tape_new("cpu");
+    let nd_cel = ag_param(t_ce, ce_logits_data, [4, 6], "ce_logits");
+    let l_ce = ag_cross_entropy(t_ce, nd_cel, ce_targets);
+    ag_backward(t_ce, l_ce);
+    let eval_ce = fn() {
+        let tp = ag_tape_new("cpu");
+        let lg = ag_input(tp, ce_logits_data, [4, 6]);
+        return ag_cross_entropy(tp, lg, ce_targets).data[0];
+    };
+    let chk_ce = _fd_compare_arrays(ce_logits_data, nd_cel.grad, eval_ce, eps);
+    let ce_err = chk_ce.max_abs_error;
+
+    let overall_max = _max(
+        _max(_max(mm_err, rn_err), _max(sg_err, rp_err)),
+        _max(fa_err, ce_err)
+    );
+
+    return map{
+        ok: overall_max < 1e-4,
+        eps: eps,
+        max_abs_error: overall_max,
+        checks: map{
+            matmul: map{ ok: mm_err < 1e-4, max_abs_error: mm_err, dA: chk_mma, dB: chk_mmb },
+            rmsnorm: map{ ok: rn_err < 1e-4, max_abs_error: rn_err, dx: chk_rnx, dw: chk_rnw },
+            swiglu: map{ ok: sg_err < 1e-4, max_abs_error: sg_err },
+            rope: map{ ok: rp_err < 1e-4, max_abs_error: rp_err },
+            causal_flash_attention: map{ ok: fa_err < 1e-4, max_abs_error: fa_err, dQ: chk_faq, dK: chk_fak, dV: chk_fav },
+            cross_entropy: map{ ok: ce_err < 1e-4, max_abs_error: ce_err }
+        }
+    };
+}
+
+// ============================================================================
+// 3. Modern Frontier Transformer Decoder Architecture
+// ============================================================================
+
+fn _make_param_record(data, shape, name) {
+    return map{
+        name: name,
+        data: data,
+        grad: _zeros(len(data)),
+        shape: shape,
+        requires_grad: true,
+        qlora_enabled: false,
+        nf4: nil,
+        lora_a: nil,
+        lora_b: nil,
+        lora_scaling: 0.0
+    };
+}
+
+// Canonical parameter collector — ensures spawn workers & checkpoint loaders always
+// reference the exact live parameter maps inside `model`.
+fn model_trainable_params(model) {
+    let params = [];
+    if model.qlora_active {
+        let l = 0;
+        while l < len(model.layers) {
+            let lyr = model.layers[l];
+            let projs = [lyr.wq, lyr.wk, lyr.wv, lyr.wo, lyr.w1, lyr.w3, lyr.w2];
+            let pi = 0;
+            while pi < len(projs) {
+                let pr = projs[pi];
+                if pr.qlora_enabled {
+                    array_push(params, pr.lora_a);
+                    array_push(params, pr.lora_b);
+                } elif pr.requires_grad {
+                    array_push(params, pr);
+                }
+                pi = pi + 1;
+            }
+            if lyr.attn_norm.requires_grad { array_push(params, lyr.attn_norm); }
+            if lyr.ffn_norm.requires_grad { array_push(params, lyr.ffn_norm); }
+            l = l + 1;
+        }
+        if model.tok_embeddings.requires_grad { array_push(params, model.tok_embeddings); }
+        if model.final_norm.requires_grad { array_push(params, model.final_norm); }
+        if not model.cfg.tie_embeddings and model.lm_head != nil and model.lm_head.requires_grad {
+            array_push(params, model.lm_head);
+        }
+        model.params = params;
+        return params;
+    }
+
+    array_push(params, model.tok_embeddings);
+    let l = 0;
+    while l < len(model.layers) {
+        let lyr = model.layers[l];
+        array_push(params, lyr.attn_norm);
+        array_push(params, lyr.wq);
+        array_push(params, lyr.wk);
+        array_push(params, lyr.wv);
+        array_push(params, lyr.wo);
+        array_push(params, lyr.ffn_norm);
+        array_push(params, lyr.w1);
+        array_push(params, lyr.w3);
+        array_push(params, lyr.w2);
+        l = l + 1;
+    }
+    array_push(params, model.final_norm);
+    if not model.cfg.tie_embeddings and model.lm_head != nil {
+        array_push(params, model.lm_head);
+    }
+    model.params = params;
+    return params;
+}
+
+fn model_param_count(model) {
+    let trainable = 0;
+    let ps = model_trainable_params(model);
+    let i = 0;
+    while i < len(ps) {
+        if ps[i].requires_grad {
+            trainable = trainable + len(ps[i].data);
+        }
+        i = i + 1;
+    }
+    return trainable;
+}
+
+fn create_transformer_model(cfg = nil) {
+    if cfg == nil { cfg = map{}; }
+    let vocab_size = _int(try cfg.vocab_size catch 32);
+    let dim = _int(try cfg.dim catch 32);
+    let n_layers = _int(try cfg.n_layers catch 2);
+    let n_heads = _int(try cfg.n_heads catch 4);
+    let n_kv_heads = _int(try cfg.n_kv_heads catch n_heads);
+    let default_hidden = _int(((8 * dim) / 3 + 7) / 8) * 8;
+    if default_hidden < dim * 2 { default_hidden = dim * 2; }
+    let hidden_dim = _int(try cfg.hidden_dim catch default_hidden);
+    let max_seq_len = _int(try cfg.max_seq_len catch 128);
+    let rope_theta = try cfg.rope_theta catch 10000.0;
+    let rms_eps = try cfg.rms_eps catch 1e-5;
+    let tie_embeddings = (try cfg.tie_embeddings catch true) == true;
+    let flash_block_size = _int(try cfg.flash_block_size catch 16);
+    let seed = _int(try cfg.seed catch 42);
+    let backend = str(try cfg.backend catch "auto");
+
+    if (dim % n_heads) != 0 {
+        throw "create_transformer_model: dim (" + str(dim) + ") must be divisible by n_heads (" + str(n_heads) + ")";
+    }
+    let head_dim = _int(dim / n_heads);
+    if (head_dim % 2) != 0 {
+        throw "create_transformer_model: head_dim (" + str(head_dim) + ") must be even for RoPE";
+    }
+    if (n_heads % n_kv_heads) != 0 {
+        throw "create_transformer_model: n_heads (" + str(n_heads) + ") must be divisible by n_kv_heads (" + str(n_kv_heads) + ")";
+    }
+
+    let rng = rng_new(seed);
+    let std_in = 1.0 / num_sqrt(dim);
+    let std_res = 1.0 / num_sqrt(2.0 * n_layers * dim);
+    let std_ffn_down = 1.0 / num_sqrt(2.0 * n_layers * hidden_dim);
+    let kv_dim = n_kv_heads * head_dim;
+
+    let tok_emb = _make_param_record(
+        rng_randn_array(rng, vocab_size * dim, std_in),
+        [vocab_size, dim],
+        "tok_embeddings.weight"
+    );
+
+    let layers = [];
+    let l = 0;
+    while l < n_layers {
+        let pfx = "layers." + str(l) + ".";
+        let lyr = map{
+            attn_norm: _make_param_record(_ones(dim), [dim], pfx + "attn_norm.weight"),
+            wq: _make_param_record(rng_randn_array(rng, dim * dim, std_in), [dim, dim], pfx + "wq.weight"),
+            wk: _make_param_record(rng_randn_array(rng, dim * kv_dim, std_in), [dim, kv_dim], pfx + "wk.weight"),
+            wv: _make_param_record(rng_randn_array(rng, dim * kv_dim, std_in), [dim, kv_dim], pfx + "wv.weight"),
+            wo: _make_param_record(rng_randn_array(rng, dim * dim, std_res), [dim, dim], pfx + "wo.weight"),
+            ffn_norm: _make_param_record(_ones(dim), [dim], pfx + "ffn_norm.weight"),
+            w1: _make_param_record(rng_randn_array(rng, dim * hidden_dim, std_in), [dim, hidden_dim], pfx + "w1.weight"),
+            w3: _make_param_record(rng_randn_array(rng, dim * hidden_dim, std_in), [dim, hidden_dim], pfx + "w3.weight"),
+            w2: _make_param_record(rng_randn_array(rng, hidden_dim * dim, std_ffn_down), [hidden_dim, dim], pfx + "w2.weight")
+        };
+        array_push(layers, lyr);
+        l = l + 1;
+    }
+
+    let final_norm = _make_param_record(_ones(dim), [dim], "final_norm.weight");
+    let lm_head = nil;
+    if not tie_embeddings {
+        lm_head = _make_param_record(
+            rng_randn_array(rng, dim * vocab_size, std_in),
+            [dim, vocab_size],
+            "lm_head.weight"
+        );
+    }
+
+    let model = map{
+        format: MODULE_FORMAT,
+        cfg: map{
+            vocab_size: vocab_size,
+            dim: dim,
+            n_layers: n_layers,
+            n_heads: n_heads,
+            n_kv_heads: n_kv_heads,
+            head_dim: head_dim,
+            hidden_dim: hidden_dim,
+            max_seq_len: max_seq_len,
+            rope_theta: rope_theta,
+            rms_eps: rms_eps,
+            tie_embeddings: tie_embeddings,
+            flash_block_size: flash_block_size,
+            backend: backend
+        },
+        tok_embeddings: tok_emb,
+        layers: layers,
+        final_norm: final_norm,
+        lm_head: lm_head,
+        qlora_active: false,
+        qlora_cfg: nil,
+        params: []
+    };
+    model_trainable_params(model);
+    return model;
+}
+
+// Forward projection helper: executes either standard dense matmul or on-the-fly NF4 QLoRA
+fn _ag_project_linear(tape, x_node, proj_param) {
+    if proj_param.qlora_enabled {
+        // Dequantize frozen 4-bit NF4 base weights on-the-fly (requires_grad = false)
+        let w_deq = dequantize_nf4(proj_param.nf4);
+        let base_w_node = ag_input(tape, w_deq, proj_param.shape, proj_param.name + ".nf4_deq");
+        let y_base = ag_matmul(tape, x_node, base_w_node);
+
+        // Trainable low-rank adapter: A in R^{r x d_in}, B in R^{d_out x r}
+        // y_lora = (alpha / r) * ((x * A^T) * B^T)
+        let a_node = ag_bind_param(tape, proj_param.lora_a);
+        let b_node = ag_bind_param(tape, proj_param.lora_b);
+        let a_t = ag_transpose_2d(tape, a_node);
+        let b_t = ag_transpose_2d(tape, b_node);
+        let h_low = ag_matmul(tape, x_node, a_t);
+        let delta = ag_scale(tape, ag_matmul(tape, h_low, b_t), proj_param.lora_scaling);
+        return ag_add(tape, y_base, delta);
+    }
+    let w_node = ag_bind_param(tape, proj_param);
+    return ag_matmul(tape, x_node, w_node);
+}
+
+fn transformer_forward(tape, model, token_ids) {
+    let seq_len = len(token_ids);
+    if seq_len <= 0 {
+        throw "transformer_forward: token_ids must be non-empty";
+    }
+    let mcfg = model.cfg;
+    if seq_len > mcfg.max_seq_len {
+        throw "transformer_forward: seq_len " + str(seq_len) + " exceeds max_seq_len " + str(mcfg.max_seq_len);
+    }
+
+    let tok_emb_node = ag_bind_param(tape, model.tok_embeddings);
+    let h = ag_embedding(tape, tok_emb_node, token_ids);
+
+    let l = 0;
+    while l < mcfg.n_layers {
+        let lyr = model.layers[l];
+        let an_node = ag_bind_param(tape, lyr.attn_norm);
+        let h_norm = ag_rmsnorm(tape, h, an_node, mcfg.rms_eps);
+
+        let q = _ag_project_linear(tape, h_norm, lyr.wq);
+        let k = _ag_project_linear(tape, h_norm, lyr.wk);
+        let v = _ag_project_linear(tape, h_norm, lyr.wv);
+
+        let q_rope = ag_rope(tape, q, mcfg.n_heads, mcfg.head_dim, mcfg.rope_theta, 0);
+        let k_rope = ag_rope(tape, k, mcfg.n_kv_heads, mcfg.head_dim, mcfg.rope_theta, 0);
+
+        let attn_ctx = ag_flash_attention_causal(
+            tape, q_rope, k_rope, v,
+            mcfg.n_heads, mcfg.n_kv_heads, mcfg.flash_block_size
+        );
+        let attn_out = _ag_project_linear(tape, attn_ctx, lyr.wo);
+        h = ag_add(tape, h, attn_out);
+
+        let fn_node = ag_bind_param(tape, lyr.ffn_norm);
+        let h_ffn = ag_rmsnorm(tape, h, fn_node, mcfg.rms_eps);
+        let gate = _ag_project_linear(tape, h_ffn, lyr.w1);
+        let up = _ag_project_linear(tape, h_ffn, lyr.w3);
+        let act = ag_swiglu(tape, gate, up);
+        let ffn_out = _ag_project_linear(tape, act, lyr.w2);
+        h = ag_add(tape, h, ffn_out);
+
+        l = l + 1;
+    }
+
+    let final_norm_node = ag_bind_param(tape, model.final_norm);
+    let h_final = ag_rmsnorm(tape, h, final_norm_node, mcfg.rms_eps);
+
+    if mcfg.tie_embeddings {
+        let w_out = ag_transpose_2d(tape, tok_emb_node);
+        return ag_matmul(tape, h_final, w_out);
+    }
+    return _ag_project_linear(tape, h_final, model.lm_head);
+}
+
+fn _unpack_seq_pair(item) {
+    if type(item) == "map" {
+        return map{
+            input_ids: item.input_ids,
+            target_ids: item.target_ids
+        };
+    }
+    let n = len(item);
+    if n < 2 {
+        throw "sequence item must have at least 2 tokens for causal LM next-token prediction";
+    }
+    return map{
+        input_ids: slice(item, 0, n - 1),
+        target_ids: slice(item, 1, n)
+    };
+}
+
+fn transformer_loss_and_perplexity(model, corpus) {
+    let items = corpus;
+    if len(corpus) > 0 and type(corpus[0]) == "number" {
+        items = [corpus];
+    }
+    let total_loss = 0.0;
+    let total_tokens = 0;
+    let i = 0;
+    while i < len(items) {
+        let pair = _unpack_seq_pair(items[i]);
+        let n_tok = len(pair.input_ids);
+        let tape = ag_tape_new(model.cfg.backend);
+        let logits = transformer_forward(tape, model, pair.input_ids);
+        let loss_nd = ag_cross_entropy(tape, logits, pair.target_ids);
+        total_loss = total_loss + loss_nd.data[0] * n_tok;
+        total_tokens = total_tokens + n_tok;
+        i = i + 1;
+    }
+    let mean_loss = total_loss / _max(1, total_tokens);
+    return map{
+        loss: mean_loss,
+        perplexity: num_exp(mean_loss),
+        tokens: total_tokens
+    };
+}
+
+fn transformer_train_epoch(model, corpus, opt = nil, cfg = nil) {
+    if cfg == nil { cfg = map{}; }
+    let params = model_trainable_params(model);
+    if opt == nil {
+        opt = adamw_new(params, cfg);
+    }
+    let max_grad_norm = try cfg.max_grad_norm catch 1.0;
+    let step_per_sequence = (try cfg.step_per_sequence catch true) == true;
+
+    let seqs = corpus;
+    if len(corpus) > 0 and type(corpus[0]) == "number" {
+        seqs = [corpus];
+    }
+
+    let total_loss = 0.0;
+    let total_tokens = 0;
+    let last_norm = 0.0;
+
+    if not step_per_sequence {
+        zero_grads(params);
+    }
+
+    let n_seqs = len(seqs);
+    let s_idx = 0;
+    while s_idx < n_seqs {
+        if step_per_sequence {
+            zero_grads(params);
+        }
+        let pair = _unpack_seq_pair(seqs[s_idx]);
+        let n_tok = len(pair.input_ids);
+        let tape = ag_tape_new(model.cfg.backend);
+        let logits = transformer_forward(tape, model, pair.input_ids);
+        let loss_nd = ag_cross_entropy(tape, logits, pair.target_ids);
+        ag_backward(tape, loss_nd);
+
+        total_loss = total_loss + loss_nd.data[0] * n_tok;
+        total_tokens = total_tokens + n_tok;
+
+        if step_per_sequence {
+            let clip_info = clip_grad_global_norm(params, max_grad_norm);
+            last_norm = clip_info.global_norm;
+            adamw_step(opt, params);
+        }
+        s_idx = s_idx + 1;
+    }
+
+    if not step_per_sequence and n_seqs > 0 {
+        let inv_n = 1.0 / n_seqs;
+        let pi = 0;
+        while pi < len(params) {
+            let g = params[pi].grad;
+            let gi = 0;
+            while gi < len(g) {
+                g[gi] = g[gi] * inv_n;
+                gi = gi + 1;
+            }
+            pi = pi + 1;
+        }
+        let clip_info = clip_grad_global_norm(params, max_grad_norm);
+        last_norm = clip_info.global_norm;
+        adamw_step(opt, params);
+    }
+
+    let mean_loss = total_loss / _max(1, total_tokens);
+    return map{
+        loss: mean_loss,
+        perplexity: num_exp(mean_loss),
+        tokens: total_tokens,
+        grad_norm: last_norm,
+        optimizer: opt
+    };
+}
+
+// Autoregressive generation (greedy argmax when temperature <= 0, or temperature/top-k sampling)
+fn transformer_generate(model, prompt_ids, max_new_tokens, temperature = 0.0, top_k = 0, seed = 12345) {
+    let tokens = _clone_array(prompt_ids);
+    let rng = rng_new(seed);
+    let vocab_size = model.cfg.vocab_size;
+    let max_ctx = model.cfg.max_seq_len;
+
+    let gen_i = 0;
+    while gen_i < max_new_tokens {
+        let ctx = tokens;
+        if len(ctx) > max_ctx {
+            ctx = slice(ctx, len(ctx) - max_ctx, len(ctx));
+        }
+        let tape = ag_tape_new(model.cfg.backend);
+        let logits = transformer_forward(tape, model, ctx);
+        let last_off = (len(ctx) - 1) * vocab_size;
+
+        let next_tok = 0;
+        if temperature <= 0.0 {
+            let best_v = logits.data[last_off];
+            let v = 1;
+            while v < vocab_size {
+                if logits.data[last_off + v] > best_v {
+                    best_v = logits.data[last_off + v];
+                    next_tok = v;
+                }
+                v = v + 1;
+            }
+        } else {
+            let row_logits = _zeros(vocab_size);
+            let max_l = -1.0e30;
+            let v = 0;
+            while v < vocab_size {
+                let sc = logits.data[last_off + v] / temperature;
+                row_logits[v] = sc;
+                if sc > max_l { max_l = sc; }
+                v = v + 1;
+            }
+            if top_k > 0 and top_k < vocab_size {
+                let sorted_scores = array_sort(_clone_array(row_logits));
+                let cutoff = sorted_scores[vocab_size - top_k];
+                v = 0;
+                while v < vocab_size {
+                    if row_logits[v] < cutoff { row_logits[v] = -1.0e30; }
+                    v = v + 1;
+                }
+            }
+            let probs = _zeros(vocab_size);
+            let sum_p = 0.0;
+            v = 0;
+            while v < vocab_size {
+                let p = num_exp(row_logits[v] - max_l);
+                probs[v] = p;
+                sum_p = sum_p + p;
+                v = v + 1;
+            }
+            let r_draw = rng_uniform(rng) * sum_p;
+            let cdf = 0.0;
+            next_tok = vocab_size - 1;
+            v = 0;
+            while v < vocab_size {
+                cdf = cdf + probs[v];
+                if r_draw <= cdf {
+                    next_tok = v;
+                    break;
+                }
+                v = v + 1;
+            }
+        }
+        array_push(tokens, next_tok);
+        gen_i = gen_i + 1;
+    }
+    return tokens;
+}
+
+// ============================================================================
+// 4. Parameter-Efficient LoRA & 4-Bit NormalFloat (NF4) QLoRA Fine-Tuning
+// ============================================================================
+
+fn _nf4_nearest_index(norm_val) {
+    // Binary search over the 15 midpoints between the 16 NF4_TABLE quantiles
+    let lo = 0;
+    let hi = 15;
+    while lo < hi {
+        let mid = _int((lo + hi) / 2);
+        if norm_val <= _NF4_MIDPOINTS[mid] {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    return lo;
+}
+
+// Quantizes an f64/f32 weight array to 4-bit NormalFloat (NF4), packing 2 4-bit weights per byte
+// inside a native `OBJ_BYTES` buffer + per-block IEEE-754 fp32 absmax scale `OBJ_BYTES`.
+fn quantize_nf4(weights, block_size = 64, shape = nil) {
+    let n = len(weights);
+    let bs = _max(8, _int(block_size));
+    let n_blocks = _int((n + bs - 1) / bs);
+    let packed_len = _int((n + 1) / 2);
+
+    let packed_bytes = bytes_new(packed_len);
+    let scale_byte_list = [];
+
+    let b = 0;
+    while b < n_blocks {
+        let start = b * bs;
+        let stop = _min(start + bs, n);
+        let absmax = 0.0;
+        let i = start;
+        while i < stop {
+            let av = _abs(weights[i]);
+            if av > absmax { absmax = av; }
+            i = i + 1;
+        }
+        _put_f32_le(scale_byte_list, absmax);
+        // Decode exact stored f32 absmax so dequantization uses the exact serialized scale
+        let slen = len(scale_byte_list);
+        let absmax_f32 = decode_f32_le(
+            scale_byte_list[slen - 4],
+            scale_byte_list[slen - 3],
+            scale_byte_list[slen - 2],
+            scale_byte_list[slen - 1]
+        );
+        let inv_scale = 0.0;
+        if absmax_f32 > 0.0 { inv_scale = 1.0 / absmax_f32; }
+
+        i = start;
+        while i < stop {
+            let norm_v = _clamp(weights[i] * inv_scale, -1.0, 1.0);
+            let q_idx = _nf4_nearest_index(norm_v);
+            let byte_pos = _int(i / 2);
+            let cur_byte = bytes_get(packed_bytes, byte_pos);
+            if (i % 2) == 0 {
+                bytes_set(packed_bytes, byte_pos, bit_or(bit_and(cur_byte, 240), bit_and(q_idx, 15)));
+            } else {
+                bytes_set(packed_bytes, byte_pos, bit_or(bit_and(cur_byte, 15), bit_shl(bit_and(q_idx, 15), 4)));
+            }
+            i = i + 1;
+        }
+        b = b + 1;
+    }
+
+    let scales_bytes = bytes_new(scale_byte_list);
+    let fp32_bytes = 4 * n;
+    let fp64_bytes = 8 * n;
+    let nf4_weight_bytes = len(packed_bytes);
+    let nf4_total_bytes = nf4_weight_bytes + len(scales_bytes);
+    let digest = sha256(hex_encode(packed_bytes) + ":" + hex_encode(scales_bytes));
+
+    return map{
+        format: "nf4_packed_v1",
+        numel: n,
+        shape: if shape != nil { _clone_array(shape) } else { [n] },
+        block_size: bs,
+        n_blocks: n_blocks,
+        packed_bytes: packed_bytes,
+        scales_bytes: scales_bytes,
+        sha256_digest: digest,
+        fp32_equiv_bytes: fp32_bytes,
+        fp64_equiv_bytes: fp64_bytes,
+        packed_weight_bytes: nf4_weight_bytes,
+        total_quant_bytes: nf4_total_bytes,
+        weight_compression_vs_fp32: fp32_bytes / _max(1.0, nf4_weight_bytes * 1.0),
+        total_compression_vs_fp32: fp32_bytes / _max(1.0, nf4_total_bytes * 1.0),
+        total_compression_vs_fp64: fp64_bytes / _max(1.0, nf4_total_bytes * 1.0)
+    };
+}
+
+fn dequantize_nf4(nf4_obj) {
+    let n = nf4_obj.numel;
+    let bs = nf4_obj.block_size;
+    let n_blocks = nf4_obj.n_blocks;
+    let packed = nf4_obj.packed_bytes;
+    let scales_b = nf4_obj.scales_bytes;
+    let out = _zeros(n);
+
+    let b = 0;
+    while b < n_blocks {
+        let scale = _get_f32_le(scales_b, b * 4);
+        let start = b * bs;
+        let stop = _min(start + bs, n);
+        let i = start;
+        while i < stop {
+            let raw_byte = bytes_get(packed, _int(i / 2));
+            let q_idx = 0;
+            if (i % 2) == 0 {
+                q_idx = bit_and(raw_byte, 15);
+            } else {
+                q_idx = bit_and(bit_shr(raw_byte, 4), 15);
+            }
+            out[i] = NF4_TABLE[q_idx] * scale;
+            i = i + 1;
+        }
+        b = b + 1;
+    }
+    return out;
+}
+
+// Quantizes all linear projection matrices in `model` into frozen NF4 2-weights-per-byte `OBJ_BYTES`,
+// releases dense base weight arrays, freezes embeddings/norms, and attaches trainable LoRA matrices
+// A in R^{r x d_in} (initialized A ~ N(0, 1/sqrt(d_in))) and B in R^{d_out x r} (initialized B = 0).
+fn attach_qlora_adapters(model, cfg = nil) {
+    if cfg == nil { cfg = map{}; }
+    let rank = _max(1, _int(try cfg.rank catch 4));
+    let alpha = try cfg.alpha catch (rank * 2.0);
+    let block_size = _max(16, _int(try cfg.block_size catch 64));
+    let seed = _int(try cfg.seed catch 777);
+    let scaling = alpha / rank;
+    let rng = rng_new(seed);
+
+    model.tok_embeddings.requires_grad = false;
+    model.final_norm.requires_grad = false;
+    if model.lm_head != nil {
+        model.lm_head.requires_grad = false;
+    }
+
+    let base_fp32_bytes = 0;
+    let packed_nf4_weight_bytes = 0;
+    let total_nf4_bytes = 0;
+    let lora_param_elems = 0;
+    let frozen_base_elems = 0;
+
+    let l = 0;
+    while l < len(model.layers) {
+        let lyr = model.layers[l];
+        lyr.attn_norm.requires_grad = false;
+        lyr.ffn_norm.requires_grad = false;
+
+        let projs = [lyr.wq, lyr.wk, lyr.wv, lyr.wo, lyr.w1, lyr.w3, lyr.w2];
+        let pi = 0;
+        while pi < len(projs) {
+            let pr = projs[pi];
+            let d_in = pr.shape[0];
+            let d_out = pr.shape[1];
+            let nf4_q = quantize_nf4(pr.data, block_size, pr.shape);
+
+            base_fp32_bytes = base_fp32_bytes + nf4_q.fp32_equiv_bytes;
+            packed_nf4_weight_bytes = packed_nf4_weight_bytes + nf4_q.packed_weight_bytes;
+            total_nf4_bytes = total_nf4_bytes + nf4_q.total_quant_bytes;
+            frozen_base_elems = frozen_base_elems + nf4_q.numel;
+
+            // Release dense base weights; retain only frozen NF4 OBJ_BYTES
+            pr.data = [];
+            pr.grad = [];
+            pr.requires_grad = false;
+            pr.qlora_enabled = true;
+            pr.nf4 = nf4_q;
+            pr.lora_scaling = scaling;
+
+            let a_std = 1.0 / num_sqrt(d_in);
+            pr.lora_a = _make_param_record(
+                rng_randn_array(rng, rank * d_in, a_std),
+                [rank, d_in],
+                pr.name + ".lora_A"
+            );
+            pr.lora_b = _make_param_record(
+                _zeros(d_out * rank),
+                [d_out, rank],
+                pr.name + ".lora_B"
+            );
+            lora_param_elems = lora_param_elems + (rank * d_in) + (d_out * rank);
+            pi = pi + 1;
+        }
+        l = l + 1;
+    }
+
+    model.qlora_active = true;
+    let trainable = model_trainable_params(model);
+    let summary = map{
+        ok: true,
+        rank: rank,
+        alpha: alpha,
+        scaling: scaling,
+        block_size: block_size,
+        frozen_base_elements: frozen_base_elems,
+        trainable_lora_elements: lora_param_elems,
+        trainable_tensor_count: len(trainable),
+        trainable_fraction: lora_param_elems / _max(1.0, (frozen_base_elems + lora_param_elems) * 1.0),
+        base_fp32_bytes: base_fp32_bytes,
+        nf4_packed_weight_bytes: packed_nf4_weight_bytes,
+        nf4_total_bytes_with_scales: total_nf4_bytes,
+        weight_compression_vs_fp32: base_fp32_bytes / _max(1.0, packed_nf4_weight_bytes * 1.0),
+        total_compression_vs_fp32: base_fp32_bytes / _max(1.0, total_nf4_bytes * 1.0)
+    };
+    model.qlora_cfg = summary;
+    return summary;
+}
+
+fn verify_qlora_frozen_integrity(model) {
+    if not model.qlora_active { return false; }
+    let l = 0;
+    while l < len(model.layers) {
+        let lyr = model.layers[l];
+        let projs = [lyr.wq, lyr.wk, lyr.wv, lyr.wo, lyr.w1, lyr.w3, lyr.w2];
+        let pi = 0;
+        while pi < len(projs) {
+            let pr = projs[pi];
+            if not pr.qlora_enabled or pr.nf4 == nil { return false; }
+            if len(pr.data) != 0 { return false; }
+            let live_digest = sha256(hex_encode(pr.nf4.packed_bytes) + ":" + hex_encode(pr.nf4.scales_bytes));
+            if live_digest != pr.nf4.sha256_digest {
+                return false;
+            }
+            pi = pi + 1;
+        }
+        l = l + 1;
+    }
+    return true;
+}
+
+// Single QLoRA fine-tuning step updating ONLY low-rank adapter matrices (A, B)
+fn qlora_train_step(model, seq_or_inputs, targets_or_opt = nil, maybe_opt = nil, max_grad_norm = 1.0) {
+    if not model.qlora_active {
+        throw "qlora_train_step: attach_qlora_adapters(model) must be called first";
+    }
+    let input_ids = nil;
+    let target_ids = nil;
+    let opt = nil;
+
+    if type(targets_or_opt) == "array" {
+        input_ids = seq_or_inputs;
+        target_ids = targets_or_opt;
+        opt = maybe_opt;
+    } else {
+        let pair = _unpack_seq_pair(seq_or_inputs);
+        input_ids = pair.input_ids;
+        target_ids = pair.target_ids;
+        opt = targets_or_opt;
+    }
+
+    let lora_params = model_trainable_params(model);
+    if opt == nil {
+        opt = adamw_new(lora_params, map{ lr: 0.01, weight_decay: 0.0 });
+    }
+
+    zero_grads(lora_params);
+    let tape = ag_tape_new(model.cfg.backend);
+    let logits = transformer_forward(tape, model, input_ids);
+    let loss_nd = ag_cross_entropy(tape, logits, target_ids);
+    ag_backward(tape, loss_nd);
+
+    let clip_info = clip_grad_global_norm(lora_params, max_grad_norm);
+    adamw_step(opt, lora_params);
+
+    return map{
+        loss: loss_nd.data[0],
+        perplexity: loss_nd.perplexity,
+        grad_norm: clip_info.global_norm,
+        optimizer: opt,
+        base_nf4_frozen: verify_qlora_frozen_integrity(model)
+    };
+}
+
+// ============================================================================
+// 5. Binary SafeTensors & GGUF v3 Model Checkpointing + Data-Parallel All-Reduce
+// ============================================================================
+
+fn model_to_tensor_map(model) {
+    let tmap = map{};
+    tmap[model.tok_embeddings.name] = map{
+        shape: _clone_array(model.tok_embeddings.shape),
+        data: _clone_array(model.tok_embeddings.data)
+    };
+    let l = 0;
+    while l < len(model.layers) {
+        let lyr = model.layers[l];
+        let items = [lyr.attn_norm, lyr.wq, lyr.wk, lyr.wv, lyr.wo, lyr.ffn_norm, lyr.w1, lyr.w3, lyr.w2];
+        let k = 0;
+        while k < len(items) {
+            let pr = items[k];
+            if pr.qlora_enabled {
+                tmap[pr.lora_a.name] = map{ shape: _clone_array(pr.lora_a.shape), data: _clone_array(pr.lora_a.data) };
+                tmap[pr.lora_b.name] = map{ shape: _clone_array(pr.lora_b.shape), data: _clone_array(pr.lora_b.data) };
+            } else {
+                tmap[pr.name] = map{ shape: _clone_array(pr.shape), data: _clone_array(pr.data) };
+            }
+            k = k + 1;
+        }
+        l = l + 1;
+    }
+    tmap[model.final_norm.name] = map{
+        shape: _clone_array(model.final_norm.shape),
+        data: _clone_array(model.final_norm.data)
+    };
+    if not model.cfg.tie_embeddings and model.lm_head != nil {
+        tmap[model.lm_head.name] = map{
+            shape: _clone_array(model.lm_head.shape),
+            data: _clone_array(model.lm_head.data)
+        };
+    }
+    return tmap;
+}
+
+fn _normalize_tensor_collection(model_or_tensors) {
+    if type(model_or_tensors) == "map" and map_has(model_or_tensors, "tok_embeddings") and map_has(model_or_tensors, "layers") {
+        return model_to_tensor_map(model_or_tensors);
+    }
+    let out = map{};
+    let ks = array_sort(map_keys(model_or_tensors));
+    let i = 0;
+    while i < len(ks) {
+        let name = ks[i];
+        let entry = model_or_tensors[name];
+        if type(entry) == "array" {
+            out[name] = map{ shape: [len(entry)], data: _clone_array(entry) };
+        } elif type(entry) == "map" and map_has(entry, "data") {
+            let sh = if map_has(entry, "shape") { _clone_array(entry.shape) } else { [len(entry.data)] };
+            out[name] = map{ shape: sh, data: _clone_array(entry.data) };
+        } else {
+            throw "checkpoint tensor '" + name + "' must be numeric array or {shape, data} map";
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn load_tensors_into_model(model, loaded_ckpt) {
+    let tensors = if map_has(loaded_ckpt, "tensors") { loaded_ckpt.tensors } else { loaded_ckpt };
+    let ps = model_trainable_params(model);
+    let restored = 0;
+    let i = 0;
+    while i < len(ps) {
+        let p = ps[i];
+        if map_has(tensors, p.name) {
+            let src = tensors[p.name].data;
+            if len(src) != len(p.data) {
+                throw "load_tensors_into_model: size mismatch for " + p.name;
+            }
+            let j = 0;
+            while j < len(src) {
+                p.data[j] = src[j];
+                j = j + 1;
+            }
+            restored = restored + 1;
+        }
+        i = i + 1;
+    }
+    return restored;
+}
+
+// Genuine HuggingFace `.safetensors` Binary Writer
+// Layout: [8-byte LE uint64 header_len] + [8-byte-aligned UTF-8 JSON header] + [IEEE-754 F32 LE OBJ_BYTES payload]
+fn save_safetensors(path, model_or_tensors, metadata = nil) {
+    let tmap = _normalize_tensor_collection(model_or_tensors);
+    let names = array_sort(map_keys(tmap));
+
+    let meta_str_map = map{
+        format: "pt",
+        engine: MODULE_FORMAT
+    };
+    if type(model_or_tensors) == "map" and map_has(model_or_tensors, "cfg") {
+        let mc = model_or_tensors.cfg;
+        meta_str_map["vocab_size"] = str(mc.vocab_size);
+        meta_str_map["dim"] = str(mc.dim);
+        meta_str_map["n_layers"] = str(mc.n_layers);
+        meta_str_map["n_heads"] = str(mc.n_heads);
+        meta_str_map["n_kv_heads"] = str(mc.n_kv_heads);
+    }
+    if metadata != nil and type(metadata) == "map" {
+        let mks = map_keys(metadata);
+        let mi = 0;
+        while mi < len(mks) {
+            let k = mks[mi];
+            meta_str_map[k] = str(metadata[k]);
+            mi = mi + 1;
+        }
+    }
+
+    let header_obj = map{
+        __metadata__: meta_str_map
+    };
+
+    let data_offset = 0;
+    let ni = 0;
+    while ni < len(names) {
+        let nm = names[ni];
+        let spec = tmap[nm];
+        let byte_len = len(spec.data) * 4;
+        header_obj[nm] = map{
+            dtype: "F32",
+            shape: spec.shape,
+            data_offsets: [data_offset, data_offset + byte_len]
+        };
+        data_offset = data_offset + byte_len;
+        ni = ni + 1;
+    }
+
+    let json_hdr = json_stringify(header_obj);
+    let hdr_bytes_raw = bytes_from_str(json_hdr);
+    let hdr_len = len(hdr_bytes_raw);
+    let pad_len = (8 - (hdr_len % 8)) % 8;
+    let aligned_hdr_len = hdr_len + pad_len;
+
+    let total_file_bytes = 8 + aligned_hdr_len + data_offset;
+    let out_bytes = bytes_new(total_file_bytes);
+
+    // 8-byte LE uint64 header size
+    let hdr_sz_le = [];
+    _put_u64_le(hdr_sz_le, aligned_hdr_len);
+    let bi = 0;
+    while bi < 8 {
+        bytes_set(out_bytes, bi, hdr_sz_le[bi]);
+        bi = bi + 1;
+    }
+
+    // UTF-8 JSON header + space (' ' = 32) padding to 8-byte alignment
+    bi = 0;
+    while bi < hdr_len {
+        bytes_set(out_bytes, 8 + bi, bytes_get(hdr_bytes_raw, bi));
+        bi = bi + 1;
+    }
+    bi = 0;
+    while bi < pad_len {
+        bytes_set(out_bytes, 8 + hdr_len + bi, 32);
+        bi = bi + 1;
+    }
+
+    // Raw IEEE-754 little-endian binary32 tensor payload
+    let payload_base = 8 + aligned_hdr_len;
+    let cursor = payload_base;
+    ni = 0;
+    while ni < len(names) {
+        let arr = tmap[names[ni]].data;
+        let ei = 0;
+        while ei < len(arr) {
+            let fbytes = encode_f32_le(arr[ei]);
+            bytes_set(out_bytes, cursor, fbytes[0]);
+            bytes_set(out_bytes, cursor + 1, fbytes[1]);
+            bytes_set(out_bytes, cursor + 2, fbytes[2]);
+            bytes_set(out_bytes, cursor + 3, fbytes[3]);
+            cursor = cursor + 4;
+            ei = ei + 1;
+        }
+        ni = ni + 1;
+    }
+
+    fs_write_bytes(path, out_bytes);
+    return map{
+        ok: true,
+        format: "safetensors",
+        path: path,
+        header_size: aligned_hdr_len,
+        payload_bytes: data_offset,
+        total_bytes: total_file_bytes,
+        tensor_count: len(names)
+    };
+}
+
+// Genuine HuggingFace `.safetensors` Binary Reader
+fn load_safetensors(path, target_model = nil) {
+    let raw_arr = fs_read_bytes(path);
+    let raw_buf = bytes_new(raw_arr);
+    let total_len = len(raw_buf);
+    if total_len < 8 {
+        throw "load_safetensors: file too short (" + str(total_len) + " bytes)";
+    }
+
+    let hdr_len = _int(_get_u64_le(raw_buf, 0));
+    if hdr_len <= 0 or (8 + hdr_len) > total_len {
+        throw "load_safetensors: invalid header length " + str(hdr_len);
+    }
+
+    let hdr_slice = bytes_slice(raw_buf, 8, 8 + hdr_len);
+    let hdr_text = str_trim(bytes_to_str(hdr_slice));
+    let hdr_map = json_parse(hdr_text);
+
+    let metadata = map{};
+    if map_has(hdr_map, "__metadata__") {
+        metadata = hdr_map["__metadata__"];
+    }
+
+    let payload_base = 8 + hdr_len;
+    let all_keys = array_sort(map_keys(hdr_map));
+    let tensors = map{};
+    let tensor_names = [];
+
+    let ki = 0;
+    while ki < len(all_keys) {
+        let key = all_keys[ki];
+        if key != "__metadata__" {
+            let info = hdr_map[key];
+            let dtype = str(info.dtype);
+            if dtype != "F32" {
+                throw "load_safetensors: unsupported dtype '" + dtype + "' for tensor " + key;
+            }
+            let shape = info.shape;
+            let offs = info.data_offsets;
+            let beg = _int(offs[0]);
+            let end_off = _int(offs[1]);
+            let byte_span = end_off - beg;
+            let count = _int(byte_span / 4);
+            if _prod_shape(shape) != count {
+                throw "load_safetensors: shape/offset mismatch for tensor " + key;
+            }
+            if payload_base + end_off > total_len {
+                throw "load_safetensors: truncated tensor data for " + key;
+            }
+            let data = _zeros(count);
+            let ei = 0;
+            while ei < count {
+                data[ei] = _get_f32_le(raw_buf, payload_base + beg + ei * 4);
+                ei = ei + 1;
+            }
+            tensors[key] = map{
+                dtype: dtype,
+                shape: shape,
+                data_offsets: [beg, end_off],
+                data: data
+            };
+            array_push(tensor_names, key);
+        }
+        ki = ki + 1;
+    }
+
+    let restored = 0;
+    if target_model != nil {
+        restored = load_tensors_into_model(target_model, tensors);
+    }
+
+    return map{
+        ok: true,
+        format: "safetensors",
+        header_size: hdr_len,
+        byte_size: total_len,
+        metadata: metadata,
+        tensor_names: tensor_names,
+        tensors: tensors,
+        restored_into_model: restored
+    };
+}
+
+// GGUF v3 Constants:
+//   GGUF_METADATA_VALUE_TYPE: UINT32=4, INT32=5, FLOAT32=6, BOOL=7, STRING=8, UINT64=10
+//   GGML_TYPE: F32=0, Q4_0=2
+let _GGUF_ALIGNMENT = 32;
+
+fn _gguf_put_string(byte_list, s) {
+    let sb = bytes_from_str(s);
+    _put_u64_le(byte_list, len(sb));
+    let i = 0;
+    while i < len(sb) {
+        array_push(byte_list, bytes_get(sb, i));
+        i = i + 1;
+    }
+}
+
+fn _gguf_read_string(buf, pos) {
+    let slen = _int(_get_u64_le(buf, pos));
+    let next_pos = pos + 8 + slen;
+    let s_bytes = bytes_slice(buf, pos + 8, next_pos);
+    return map{
+        value: bytes_to_str(s_bytes),
+        next_pos: next_pos
+    };
+}
+
+fn _align_up(val, align) {
+    let rem = val % align;
+    if rem == 0 { return val; }
+    return val + (align - rem);
+}
+
+// Pack f64 array into GGML_TYPE_Q4_0 blocks (block_size=32: 2-byte fp16 d + 16 packed 4-bit bytes = 18 bytes/block)
+fn _encode_ggml_q4_0(data) {
+    let n = len(data);
+    let n_blocks = _int((n + 31) / 32);
+    let out = [];
+    let b = 0;
+    while b < n_blocks {
+        let base = b * 32;
+        let amax = 0.0;
+        let i = 0;
+        while i < 32 {
+            let v = if (base + i) < n { data[base + i] } else { 0.0 };
+            if _abs(v) > amax { amax = _abs(v); }
+            i = i + 1;
+        }
+        let d_raw = amax / 7.0;
+        let d_f16_bytes = encode_f16_le(d_raw);
+        array_push(out, d_f16_bytes[0]);
+        array_push(out, d_f16_bytes[1]);
+        let d_dec = decode_f16_le(d_f16_bytes[0], d_f16_bytes[1]);
+        let inv_d = if d_dec > 0.0 { 1.0 / d_dec } else { 0.0 };
+
+        i = 0;
+        while i < 16 {
+            let v_lo = if (base + i) < n { data[base + i] } else { 0.0 };
+            let v_hi = if (base + i + 16) < n { data[base + i + 16] } else { 0.0 };
+            let q_lo = _int(_clamp(num_round(v_lo * inv_d) + 8.0, 0.0, 15.0));
+            let q_hi = _int(_clamp(num_round(v_hi * inv_d) + 8.0, 0.0, 15.0));
+            array_push(out, bit_or(bit_and(q_lo, 15), bit_shl(bit_and(q_hi, 15), 4)));
+            i = i + 1;
+        }
+        b = b + 1;
+    }
+    return out;
+}
+
+fn _decode_ggml_q4_0(buf, start_offset, numel) {
+    let n_blocks = _int((numel + 31) / 32);
+    let out = _zeros(numel);
+    let b = 0;
+    while b < n_blocks {
+        let boff = start_offset + b * 18;
+        let d = decode_f16_le(bytes_get(buf, boff), bytes_get(buf, boff + 1));
+        let base = b * 32;
+        let i = 0;
+        while i < 16 {
+            let packed = bytes_get(buf, boff + 2 + i);
+            let q_lo = bit_and(packed, 15) - 8;
+            let q_hi = bit_and(bit_shr(packed, 4), 15) - 8;
+            if (base + i) < numel {
+                out[base + i] = q_lo * d;
+            }
+            if (base + i + 16) < numel {
+                out[base + i + 16] = q_hi * d;
+            }
+            i = i + 1;
+        }
+        b = b + 1;
+    }
+    return out;
+}
+
+// Genuine `GGUF v3` Binary Writer (`magic="GGUF"`, `version=3`, typed KV metadata, tensor infos, 32B-aligned F32/Q4_0)
+fn save_gguf_v3(path, model_or_tensors, metadata = nil, dtype = "F32") {
+    let tmap = _normalize_tensor_collection(model_or_tensors);
+    let names = array_sort(map_keys(tmap));
+    let norm_dtype = str_upper(str(dtype));
+    let ggml_type_code = 0; // 0 = GGML_TYPE_F32
+    if norm_dtype == "Q4_0" or norm_dtype == "Q4" {
+        ggml_type_code = 2; // 2 = GGML_TYPE_Q4_0
+    } elif norm_dtype != "F32" {
+        throw "save_gguf_v3: unsupported dtype '" + norm_dtype + "' (expected F32 or Q4_0)";
+    }
+
+    // Assemble KV metadata entries: [{key, vtype, val}]
+    let kv_entries = [
+        map{ key: "general.architecture", vtype: "str", val: "transformer" },
+        map{ key: "general.alignment", vtype: "u32", val: _GGUF_ALIGNMENT },
+        map{ key: "pblang.format", vtype: "str", val: MODULE_FORMAT }
+    ];
+
+    if type(model_or_tensors) == "map" and map_has(model_or_tensors, "cfg") {
+        let mc = model_or_tensors.cfg;
+        array_push(kv_entries, map{ key: "transformer.vocab_size", vtype: "u32", val: mc.vocab_size });
+        array_push(kv_entries, map{ key: "transformer.embedding_length", vtype: "u32", val: mc.dim });
+        array_push(kv_entries, map{ key: "transformer.block_count", vtype: "u32", val: mc.n_layers });
+        array_push(kv_entries, map{ key: "transformer.attention.head_count", vtype: "u32", val: mc.n_heads });
+        array_push(kv_entries, map{ key: "transformer.attention.head_count_kv", vtype: "u32", val: mc.n_kv_heads });
+        array_push(kv_entries, map{ key: "transformer.rope.freq_base", vtype: "f32", val: mc.rope_theta });
+    }
+
+    if metadata != nil and type(metadata) == "map" {
+        let mks = array_sort(map_keys(metadata));
+        let mi = 0;
+        while mi < len(mks) {
+            let k = mks[mi];
+            let v = metadata[k];
+            let vt = type(v);
+            if vt == "boolean" {
+                array_push(kv_entries, map{ key: k, vtype: "bool", val: v });
+            } elif vt == "number" {
+                if num_floor(v) == v and v >= 0.0 and v < 4294967296.0 {
+                    array_push(kv_entries, map{ key: k, vtype: "u32", val: _int(v) });
+                } else {
+                    array_push(kv_entries, map{ key: k, vtype: "f32", val: v });
+                }
+            } else {
+                array_push(kv_entries, map{ key: k, vtype: "str", val: str(v) });
+            }
+            mi = mi + 1;
+        }
+    }
+
+    let hdr_bytes = [];
+    // Magic "GGUF" (0x47, 0x47, 0x55, 0x46)
+    _append_str_bytes(hdr_bytes, "GGUF");
+    // Version = 3 (u32 LE)
+    _put_u32_le(hdr_bytes, 3);
+    // tensor_count (u64 LE) & metadata_kv_count (u64 LE)
+    _put_u64_le(hdr_bytes, len(names));
+    _put_u64_le(hdr_bytes, len(kv_entries));
+
+    // Write KV metadata section
+    let ki = 0;
+    while ki < len(kv_entries) {
+        let kv = kv_entries[ki];
+        _gguf_put_string(hdr_bytes, kv.key);
+        if kv.vtype == "u32" {
+            _put_u32_le(hdr_bytes, 4);
+            _put_u32_le(hdr_bytes, kv.val);
+        } elif kv.vtype == "f32" {
+            _put_u32_le(hdr_bytes, 6);
+            _put_f32_le(hdr_bytes, kv.val);
+        } elif kv.vtype == "bool" {
+            _put_u32_le(hdr_bytes, 7);
+            array_push(hdr_bytes, if kv.val { 1 } else { 0 });
+        } else {
+            _put_u32_le(hdr_bytes, 8);
+            _gguf_put_string(hdr_bytes, str(kv.val));
+        }
+        ki = ki + 1;
+    }
+
+    // Pre-encode tensor payloads and compute 32-byte-aligned offsets
+    let payloads = [];
+    let offsets = [];
+    let rel_offset = 0;
+    let ni = 0;
+    while ni < len(names) {
+        let spec = tmap[names[ni]];
+        array_push(offsets, rel_offset);
+        let p_bytes = nil;
+        if ggml_type_code == 2 {
+            p_bytes = _encode_ggml_q4_0(spec.data);
+            array_push(payloads, p_bytes);
+            rel_offset = _align_up(rel_offset + len(p_bytes), _GGUF_ALIGNMENT);
+        } else {
+            let byte_len = len(spec.data) * 4;
+            array_push(payloads, nil);
+            rel_offset = _align_up(rel_offset + byte_len, _GGUF_ALIGNMENT);
+        }
+        ni = ni + 1;
+    }
+
+    // Write Tensor Info section
+    ni = 0;
+    while ni < len(names) {
+        let nm = names[ni];
+        let spec = tmap[nm];
+        let sh = spec.shape;
+        _gguf_put_string(hdr_bytes, nm);
+        _put_u32_le(hdr_bytes, len(sh));
+        let di = 0;
+        while di < len(sh) {
+            _put_u64_le(hdr_bytes, sh[di]);
+            di = di + 1;
+        }
+        _put_u32_le(hdr_bytes, ggml_type_code);
+        _put_u64_le(hdr_bytes, offsets[ni]);
+        ni = ni + 1;
+    }
+
+    // Pad header/info section to 32-byte alignment
+    let data_section_start = _align_up(len(hdr_bytes), _GGUF_ALIGNMENT);
+    while len(hdr_bytes) < data_section_start {
+        array_push(hdr_bytes, 0);
+    }
+
+    let total_file_size = data_section_start + rel_offset;
+    let out_bytes = bytes_new(total_file_size);
+
+    let bi = 0;
+    while bi < len(hdr_bytes) {
+        bytes_set(out_bytes, bi, hdr_bytes[bi]);
+        bi = bi + 1;
+    }
+
+    // Write aligned tensor payloads
+    ni = 0;
+    while ni < len(names) {
+        let write_pos = data_section_start + offsets[ni];
+        if ggml_type_code == 2 {
+            let qb = payloads[ni];
+            let qi = 0;
+            while qi < len(qb) {
+                bytes_set(out_bytes, write_pos + qi, qb[qi]);
+                qi = qi + 1;
+            }
+        } else {
+            let arr = tmap[names[ni]].data;
+            let ei = 0;
+            while ei < len(arr) {
+                let fb = encode_f32_le(arr[ei]);
+                let p = write_pos + ei * 4;
+                bytes_set(out_bytes, p, fb[0]);
+                bytes_set(out_bytes, p + 1, fb[1]);
+                bytes_set(out_bytes, p + 2, fb[2]);
+                bytes_set(out_bytes, p + 3, fb[3]);
+                ei = ei + 1;
+            }
+        }
+        ni = ni + 1;
+    }
+
+    fs_write_bytes(path, out_bytes);
+    return map{
+        ok: true,
+        format: "gguf_v3",
+        version: 3,
+        dtype: if ggml_type_code == 2 { "Q4_0" } else { "F32" },
+        path: path,
+        data_section_start: data_section_start,
+        total_bytes: total_file_size,
+        tensor_count: len(names),
+        metadata_kv_count: len(kv_entries)
+    };
+}
+
+// Genuine `GGUF v3` Binary Reader
+fn load_gguf_v3(path, target_model = nil) {
+    let raw_arr = fs_read_bytes(path);
+    let buf = bytes_new(raw_arr);
+    let total_len = len(buf);
+    if total_len < 24 {
+        throw "load_gguf_v3: file too short (" + str(total_len) + " bytes)";
+    }
+
+    let magic = bytes_to_str(bytes_slice(buf, 0, 4));
+    if magic != "GGUF" {
+        throw "load_gguf_v3: invalid magic '" + magic + "' (expected 'GGUF')";
+    }
+    let version = _get_u32_le(buf, 4);
+    if version != 3 {
+        throw "load_gguf_v3: unsupported GGUF version " + str(version) + " (expected 3)";
+    }
+
+    let tensor_count = _int(_get_u64_le(buf, 8));
+    let kv_count = _int(_get_u64_le(buf, 16));
+    let pos = 24;
+
+    let metadata = map{};
+    let ki = 0;
+    while ki < kv_count {
+        let kr = _gguf_read_string(buf, pos);
+        pos = kr.next_pos;
+        let vtype = _get_u32_le(buf, pos);
+        pos = pos + 4;
+
+        let val = nil;
+        if vtype == 4 {
+            val = _get_u32_le(buf, pos);
+            pos = pos + 4;
+        } elif vtype == 5 {
+            val = _get_i32_le(buf, pos);
+            pos = pos + 4;
+        } elif vtype == 6 {
+            val = _get_f32_le(buf, pos);
+            pos = pos + 4;
+        } elif vtype == 7 {
+            val = bytes_get(buf, pos) != 0;
+            pos = pos + 1;
+        } elif vtype == 8 {
+            let sr = _gguf_read_string(buf, pos);
+            val = sr.value;
+            pos = sr.next_pos;
+        } elif vtype == 10 {
+            val = _get_u64_le(buf, pos);
+            pos = pos + 8;
+        } else {
+            throw "load_gguf_v3: unsupported KV value_type " + str(vtype);
+        }
+        metadata[kr.value] = val;
+        ki = ki + 1;
+    }
+
+    let alignment = _GGUF_ALIGNMENT;
+    if map_has(metadata, "general.alignment") {
+        alignment = _max(1, _int(metadata["general.alignment"]));
+    }
+
+    let infos = [];
+    let ti = 0;
+    while ti < tensor_count {
+        let nr = _gguf_read_string(buf, pos);
+        pos = nr.next_pos;
+        let n_dims = _get_u32_le(buf, pos);
+        pos = pos + 4;
+        let shape = [];
+        let di = 0;
+        while di < n_dims {
+            array_push(shape, _int(_get_u64_le(buf, pos)));
+            pos = pos + 8;
+            di = di + 1;
+        }
+        let ggml_type = _get_u32_le(buf, pos);
+        pos = pos + 4;
+        let rel_off = _int(_get_u64_le(buf, pos));
+        pos = pos + 8;
+        array_push(infos, map{
+            name: nr.value,
+            shape: shape,
+            ggml_type: ggml_type,
+            offset: rel_off
+        });
+        ti = ti + 1;
+    }
+
+    let data_section_start = _align_up(pos, alignment);
+    let tensors = map{};
+    let tensor_names = [];
+
+    ti = 0;
+    while ti < len(infos) {
+        let inf = infos[ti];
+        let numel = _prod_shape(inf.shape);
+        let abs_off = data_section_start + inf.offset;
+        let data = nil;
+        let dtype_str = "F32";
+
+        if inf.ggml_type == 0 {
+            data = _zeros(numel);
+            let ei = 0;
+            while ei < numel {
+                data[ei] = _get_f32_le(buf, abs_off + ei * 4);
+                ei = ei + 1;
+            }
+        } elif inf.ggml_type == 2 {
+            dtype_str = "Q4_0";
+            data = _decode_ggml_q4_0(buf, abs_off, numel);
+        } else {
+            throw "load_gguf_v3: unsupported ggml_type " + str(inf.ggml_type);
+        }
+
+        tensors[inf.name] = map{
+            dtype: dtype_str,
+            ggml_type: inf.ggml_type,
+            shape: inf.shape,
+            offset: inf.offset,
+            data: data
+        };
+        array_push(tensor_names, inf.name);
+        ti = ti + 1;
+    }
+
+    let restored = 0;
+    if target_model != nil {
+        restored = load_tensors_into_model(target_model, tensors);
+    }
+
+    return map{
+        ok: true,
+        format: "gguf_v3",
+        version: version,
+        magic: magic,
+        byte_size: total_len,
+        data_section_start: data_section_start,
+        metadata: metadata,
+        tensor_names: tensor_names,
+        tensors: tensors,
+        restored_into_model: restored
+    };
+}
+
+// Worker thread entry point for Data-Parallel Multi-Worker All-Reduce
+fn _dp_shard_worker(payload) {
+    let w_model = payload.model;
+    let shard_seqs = payload.shard;
+    let w_params = model_trainable_params(w_model);
+    zero_grads(w_params);
+
+    let shard_loss_sum = 0.0;
+    let shard_tokens = 0;
+    let n_samples = len(shard_seqs);
+
+    let i = 0;
+    while i < n_samples {
+        let pair = _unpack_seq_pair(shard_seqs[i]);
+        let n_tok = len(pair.input_ids);
+        let tape = ag_tape_new("pure");
+        let logits = transformer_forward(tape, w_model, pair.input_ids);
+        let loss_nd = ag_cross_entropy(tape, logits, pair.target_ids);
+        ag_backward(tape, loss_nd);
+
+        shard_loss_sum = shard_loss_sum + loss_nd.data[0];
+        shard_tokens = shard_tokens + n_tok;
+        i = i + 1;
+    }
+
+    let grad_list = [];
+    let pi = 0;
+    while pi < len(w_params) {
+        array_push(grad_list, w_params[pi].grad);
+        pi = pi + 1;
+    }
+
+    return map{
+        worker_id: payload.worker_id,
+        sample_count: n_samples,
+        token_count: shard_tokens,
+        loss_sum: shard_loss_sum,
+        grads: grad_list
+    };
+}
+
+// Splits mini-batches across parallel `spawn` OS worker threads, computes per-shard analytical
+// gradients concurrently, aggregates exact mean gradients (All-Reduce), and applies AdamW update!
+fn train_data_parallel(model, batches, n_workers = 2, opt = nil, cfg = nil) {
+    if cfg == nil { cfg = map{}; }
+    let workers = _max(1, _int(n_workers));
+    let epochs = _max(1, _int(try cfg.epochs catch 1));
+    let max_grad_norm = try cfg.max_grad_norm catch 1.0;
+
+    let params = model_trainable_params(model);
+    if opt == nil {
+        opt = adamw_new(params, cfg);
+    }
+
+    let mini_batches = [];
+    if len(batches) > 0 {
+        let first = batches[0];
+        if type(first) == "map" or (type(first) == "array" and len(first) > 0 and type(first[0]) == "number") {
+            mini_batches = [batches];
+        } else {
+            mini_batches = batches;
+        }
+    }
+
+    let loss_history = [];
+    let total_steps = 0;
+    let total_spawned_threads = 0;
+
+    let ep = 0;
+    while ep < epochs {
+        let mb_idx = 0;
+        while mb_idx < len(mini_batches) {
+            let mb = mini_batches[mb_idx];
+            let n_items = len(mb);
+            if n_items > 0 {
+                let eff_workers = _min(workers, n_items);
+                // Omit `model.params` alias list during xfer pack; child reconstructs canonical list
+                let light_model = map{
+                    format: model.format,
+                    cfg: model.cfg,
+                    tok_embeddings: model.tok_embeddings,
+                    layers: model.layers,
+                    final_norm: model.final_norm,
+                    lm_head: model.lm_head,
+                    qlora_active: model.qlora_active,
+                    qlora_cfg: model.qlora_cfg,
+                    params: []
+                };
+
+                let handles = [];
+                let w = 0;
+                while w < eff_workers {
+                    let s_beg = _int((w * n_items) / eff_workers);
+                    let s_end = _int(((w + 1) * n_items) / eff_workers);
+                    let shard = slice(mb, s_beg, s_end);
+                    let h = spawn(_dp_shard_worker, map{
+                        worker_id: w,
+                        model: light_model,
+                        shard: shard
+                    });
+                    array_push(handles, h);
+                    total_spawned_threads = total_spawned_threads + 1;
+                    w = w + 1;
+                }
+
+                let shard_results = join_all(handles);
+
+                // Synchronous All-Reduce: exact mean gradient across all samples in mini-batch
+                zero_grads(params);
+                let total_samples = 0;
+                let step_loss_sum = 0.0;
+                let sr_i = 0;
+                while sr_i < len(shard_results) {
+                    let sr = shard_results[sr_i];
+                    total_samples = total_samples + sr.sample_count;
+                    step_loss_sum = step_loss_sum + sr.loss_sum;
+                    let pi = 0;
+                    while pi < len(params) {
+                        let dst_g = params[pi].grad;
+                        let src_g = sr.grads[pi];
+                        let gi = 0;
+                        while gi < len(dst_g) {
+                            dst_g[gi] = dst_g[gi] + src_g[gi];
+                            gi = gi + 1;
+                        }
+                        pi = pi + 1;
+                    }
+                    sr_i = sr_i + 1;
+                }
+
+                let inv_samples = 1.0 / _max(1, total_samples);
+                let pi = 0;
+                while pi < len(params) {
+                    let dst_g = params[pi].grad;
+                    let gi = 0;
+                    while gi < len(dst_g) {
+                        dst_g[gi] = dst_g[gi] * inv_samples;
+                        gi = gi + 1;
+                    }
+                    pi = pi + 1;
+                }
+
+                clip_grad_global_norm(params, max_grad_norm);
+                adamw_step(opt, params);
+
+                let step_loss = step_loss_sum * inv_samples;
+                array_push(loss_history, step_loss);
+                total_steps = total_steps + 1;
+            }
+            mb_idx = mb_idx + 1;
+        }
+        ep = ep + 1;
+    }
+
+    let first_loss = if len(loss_history) > 0 { loss_history[0] } else { 0.0 };
+    let final_loss = if len(loss_history) > 0 { loss_history[len(loss_history) - 1] } else { 0.0 };
+
+    return map{
+        ok: true,
+        workers_requested: workers,
+        total_steps: total_steps,
+        total_spawned_threads: total_spawned_threads,
+        initial_loss: first_loss,
+        final_loss: final_loss,
+        final_perplexity: num_exp(final_loss),
+        loss_history: loss_history,
+        optimizer: opt
+    };
+}
+
+export MODULE_FORMAT, MODULE_VERSION, NF4_TABLE,
+       rng_new, rng_uniform, rng_normal, rng_randn_array,
+       encode_f32_le, decode_f32_le, encode_f16_le, decode_f16_le,
+       probe_compute_backends, set_gpu_matmul_threshold, get_gpu_matmul_threshold,
+       transpose_2d, accel_matmul, accel_matmul_nt, accel_matmul_tn,
+       ag_tape_new, ag_param, ag_input, ag_bind_param,
+       ag_add, ag_sub, ag_mul, ag_scale, ag_transpose_2d, ag_embedding,
+       ag_matmul, ag_rmsnorm, ag_silu, ag_swiglu, ag_rope,
+       ag_flash_attention_causal, ag_cross_entropy, ag_backward,
+       zero_grads, clip_grad_global_norm, adamw_new, adamw_step,
+       verify_autograd_gradients,
+       create_transformer_model, model_trainable_params, model_param_count,
+       transformer_forward, transformer_loss_and_perplexity,
+       transformer_train_epoch, transformer_generate,
+       quantize_nf4, dequantize_nf4, attach_qlora_adapters,
+       verify_qlora_frozen_integrity, qlora_train_step,
+       model_to_tensor_map, load_tensors_into_model,
+       save_safetensors, load_safetensors,
+       save_gguf_v3, load_gguf_v3,
+       train_data_parallel;

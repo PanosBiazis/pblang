@@ -1,8 +1,9 @@
 /* ============================================================================
- * pblang Sovereign Zero-Rust Native Runtime v3.0.0 — zr_builtins_core.h
- * Math, BigNum, Bitwise, Strings, Zero-Copy Buffers, Taint, Capabilities,
- * Replay, JIT, Generational GC, Regex, GIL-Free Threads/Channels, Arenas,
- * Tensors, Quantum, AI, Polyglot & Master Builtin Registration Table.
+ * pblang Sovereign Zero-Rust Native Runtime v4.0.0 — zr_builtins_core.h
+ * Math, BigNum, Bitwise, Strings, Zero-Copy Buffers, Unboxed Packed Structs,
+ * CSR Graph Kernels, PBR 3D Rasterizer, Taint, Capabilities, Replay, JIT,
+ * Generational GC, Regex, GIL-Free Threads/Channels, Arenas, Tensors, Quantum,
+ * AI, Polyglot & Master Builtin Registration Table.
  * ============================================================================ */
 #ifndef PBLANG_ZR_BUILTINS_CORE_H
 #define PBLANG_ZR_BUILTINS_CORE_H
@@ -19,6 +20,7 @@
 #include "zr_sqlite_ffi.h"
 #include "zr_gfx.h"
 #include "zr_hpc_compute.h"
+#include "zr_unboxed_aot.h"
 
 /* ============================================================================
  * 1. Math, BigInt / Rational / Decimal Constructors & Bitwise Builtins
@@ -508,6 +510,10 @@ static bool bi_len(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     }
     if (is_obj_type(v, OBJ_F64BUF)) {
         *out = val_num((double)AS_F64BUF(v)->len);
+        return true;
+    }
+    if (is_obj_type(v, OBJ_STRUCT_BUF)) {
+        *out = val_num((double)AS_STRUCT_BUF(v)->len);
         return true;
     }
     if (is_obj_type(v, OBJ_ARRAY)) {
@@ -5701,7 +5707,26 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"hpc_cg_poisson_solve", bi_hpc_cg_poisson_solve},
         {"hpc_fft_1d", bi_hpc_fft_1d},
         {"hpc_mlp_train_batch", bi_hpc_mlp_train_batch},
-        {"hpc_mlp_forward", bi_hpc_mlp_forward}
+        {"hpc_mlp_forward", bi_hpc_mlp_forward},
+
+        /* v4.0.0 Unboxed Contiguous Packed Structs, CSR Graph, 3D PBR & Pure-PBLang AOT (17 builtins) */
+        {"struct_schema", bi_struct_schema},
+        {"struct_schema_info", bi_struct_schema_info},
+        {"struct_buf_new", bi_struct_buf_new},
+        {"struct_buf_len", bi_struct_buf_len},
+        {"struct_buf_stride", bi_struct_buf_stride},
+        {"struct_buf_ptr", bi_struct_buf_ptr},
+        {"struct_buf_push", bi_struct_buf_push},
+        {"struct_get_i64", bi_struct_get_i64},
+        {"struct_set_i64", bi_struct_set_i64},
+        {"struct_get_f64", bi_struct_get_f64},
+        {"struct_set_f64", bi_struct_set_f64},
+        {"struct_sort_by", bi_struct_sort_by},
+        {"struct_reduce_f64", bi_struct_reduce_f64},
+        {"graph_bfs_shortest_path", bi_graph_bfs_shortest_path},
+        {"graph_dijkstra_f64", bi_graph_dijkstra_f64},
+        {"gfx3d_raster_triangles", bi_gfx3d_raster_triangles},
+        {"aot_build_native", bi_aot_build_native}
     };
 
     for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {

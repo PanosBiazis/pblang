@@ -1,0 +1,2693 @@
+// stdlib/gfx3d_pbr_vulkan_engine.sapp — Sovereign 3D PBR + SAH-BVH Ray-Tracer +
+// Vulkan/OpenGL/OpenCL/WebGPU Scene & Rigid-Body Physics Engine (PBLang v4.0.0)
+//
+// Capabilities:
+//   1. Dynamic GPU Backend Discovery (probe_gpu_3d_backends): Vulkan, OpenGL, GLES2 via FFI + OpenCL/SIMD via hpc_probe().
+//   2. Exact 3D Linear Algebra: vec3, vec4, quat (SLERP + rotation), mat4 (perspective_fov, look_at, trs_matrix,
+//      mat4_mul, Gribb-Hartmann frustum plane extraction & AABB frustum culling).
+//   3. Procedural Geometry & Mesh I/O: mesh_cube, mesh_uv_sphere, mesh_plane, mesh_torus,
+//      Wavefront OBJ loader/exporter (parse_obj_mesh, export_obj_mesh), and Khronos glTF 2.0 JSON+Base64 exporter (export_gltf2_json).
+//   4. Physically-Based Rendering (Cook-Torrance Metallic-Roughness BRDF): GGX NDF, Smith-Schlick Geometry,
+//      Fresnel-Schlick, energy-conserving diffuse/specular, Reinhard & ACES Filmic tone mapping + sRGB gamma.
+//   5. SAH-BVH Accelerated Ray & Path Tracer (build_bvh, raytrace_scene): Surface-Area-Heuristic binary BVH,
+//      Moller-Trumbore ray-triangle + analytic sphere intersection, hard/soft shadows, multi-bounce reflections, sky hemisphere IBL.
+//   6. High-Speed Tile Z-Buffer Rasterizer + GPU Matrix Transform (render_scene_raster): hpc_gemm batch vertex transform,
+//      optional gfx3d_raster_triangles native fast-path, pure-PBLang bytes_new + f64buf_new Z-buffer rasterizer,
+//      24-bit BMP encoder (encode_rgba_to_bmp), 3D shaded SVG (render_scene_svg), and interactive WebGPU+WebGL2 HTML5 bundle.
+//   7. 3D Rigid-Body Physics Engine (physics_world_new, physics_add_body, physics_step): semi-implicit Euler,
+//      sphere-sphere & sphere-ground-plane impulse resolution with restitution e and Coulomb friction.
+
+let GFX3D_ENGINE_VERSION = "4.0.0";
+let PI = 3.14159265358979323846;
+let TWO_PI = 6.28318530717958647692;
+let HALF_PI = 1.57079632679489661923;
+let INV_PI = 0.31830988618379067154;
+let EPS = 0.000001;
+
+fn _opts(o) {
+    if o == nil { return map{}; }
+    return o;
+}
+
+fn _get(m, k, fb) {
+    if m == nil { return fb; }
+    if not is_map(m) { return fb; }
+    if not map_has(m, k) { return fb; }
+    let v = m[k];
+    if v == nil { return fb; }
+    return v;
+}
+
+fn _clamp(x, lo, hi) {
+    if x < lo { return lo; }
+    if x > hi { return hi; }
+    return x;
+}
+
+fn _saturate(x) {
+    if x < 0.0 { return 0.0; }
+    if x > 1.0 { return 1.0; }
+    return x;
+}
+
+fn _lerp(a, b, t) {
+    return a + (b - a) * t;
+}
+
+fn _acos_safe(x) {
+    let c = _clamp(x, -1.0, 1.0);
+    let s = sqrt(max(0.0, 1.0 - c * c));
+    return atan2(s, c);
+}
+
+fn _fmt_num(x) {
+    let r = round(x * 100000.0) / 100000.0;
+    return str(r);
+}
+
+fn _html_escape(s) {
+    let out = str(s);
+    out = str_replace_all(out, "&", "&amp;");
+    out = str_replace_all(out, "<", "&lt;");
+    out = str_replace_all(out, ">", "&gt;");
+    out = str_replace_all(out, "\"", "&quot;");
+    return out;
+}
+
+// ============================================================================
+// 1. Dynamic GPU Backend Discovery (`probe_gpu_3d_backends`)
+// ============================================================================
+
+fn _try_probe_shared_libs(candidates) {
+    let idx = 0;
+    while idx < len(candidates) {
+        let cname = candidates[idx];
+        let loaded_ok = false;
+        try {
+            let h = ffi_open(cname);
+            if h != nil {
+                loaded_ok = true;
+                try { ffi_close(h); } catch _e2 {}
+            }
+        } catch _e1 {
+            loaded_ok = false;
+        }
+        if loaded_ok {
+            return map{ present: true, library: cname };
+        }
+        idx = idx + 1;
+    }
+    return map{ present: false, library: "" };
+}
+
+fn probe_gpu_3d_backends() {
+    let os_name = try platform() catch "unknown";
+    let vk_libs = ["libvulkan.so.1", "libvulkan.so", "vulkan-1.dll", "libvulkan.1.dylib"];
+    let gl_libs = ["libGL.so.1", "libGL.so", "opengl32.dll", "libGL.1.dylib"];
+    let gles_libs = ["libGLESv2.so.2", "libGLESv2.so", "libGLESv2.dll"];
+
+    let vk_res = _try_probe_shared_libs(vk_libs);
+    let gl_res = _try_probe_shared_libs(gl_libs);
+    let gles_res = _try_probe_shared_libs(gles_libs);
+
+    let hpc = try hpc_probe() catch map{
+        ok: false,
+        cpu_threads: 1,
+        simd_isa: "scalar",
+        opencl_available: false,
+        opencl_device: "",
+        opencl_platform: "",
+        opencl_compute_units: 0,
+        opencl_mem_mb: 0
+    };
+
+    let ocl_ok = _get(hpc, "opencl_available", false);
+    let ocl_dev = _get(hpc, "opencl_device", "");
+    let ocl_cu = _get(hpc, "opencl_compute_units", 0);
+    let ocl_mem = _get(hpc, "opencl_mem_mb", 0);
+    let threads = _get(hpc, "cpu_threads", 1);
+    let simd_isa = _get(hpc, "simd_isa", "scalar");
+
+    let rec = "cpu-simd-bvh";
+    if vk_res.present and ocl_ok {
+        rec = "vulkan-opencl-hybrid-pbr";
+    } elif vk_res.present {
+        rec = "vulkan-hw-pbr";
+    } elif ocl_ok {
+        rec = "opencl-gpu-simd-pbr";
+    } elif gl_res.present or gles_res.present {
+        rec = "opengl-hw-pbr";
+    }
+
+    return map{
+        ok: true,
+        engine_version: GFX3D_ENGINE_VERSION,
+        os_platform: os_name,
+        vulkan_loader_present: vk_res.present,
+        vulkan_library: vk_res.library,
+        opengl_present: gl_res.present,
+        opengl_library: gl_res.library,
+        gles2_present: gles_res.present,
+        gles2_library: gles_res.library,
+        opencl_gpu_present: ocl_ok,
+        opencl_device: ocl_dev,
+        opencl_compute_units: ocl_cu,
+        opencl_mem_mb: ocl_mem,
+        cpu_threads: threads,
+        simd_isa: simd_isa,
+        recommended_pipeline: rec
+    };
+}
+
+// ============================================================================
+// 2. 3D Math: Vectors, Quaternions (SLERP), 4x4 Matrices & Frustum Culling
+// ============================================================================
+
+fn vec3(x, y, z) {
+    return [x + 0.0, y + 0.0, z + 0.0];
+}
+
+fn vec4(x, y, z, w) {
+    return [x + 0.0, y + 0.0, z + 0.0, w + 0.0];
+}
+
+fn vec3_add(a, b) {
+    return [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+}
+
+fn vec3_sub(a, b) {
+    return [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+}
+
+fn vec3_scale(a, s) {
+    return [a[0] * s, a[1] * s, a[2] * s];
+}
+
+fn vec3_mul(a, b) {
+    return [a[0] * b[0], a[1] * b[1], a[2] * b[2]];
+}
+
+fn vec3_neg(a) {
+    return [-a[0], -a[1], -a[2]];
+}
+
+fn vec3_dot(a, b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+fn vec3_cross(a, b) {
+    return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0]
+    ];
+}
+
+fn vec3_len_sq(a) {
+    return a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
+}
+
+fn vec3_len(a) {
+    return sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+}
+
+fn vec3_normalize(a) {
+    let lsq = a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
+    if lsq <= 1e-24 {
+        return [0.0, 0.0, 0.0];
+    }
+    let inv = 1.0 / sqrt(lsq);
+    return [a[0] * inv, a[1] * inv, a[2] * inv];
+}
+
+fn vec3_lerp(a, b, t) {
+    return [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t
+    ];
+}
+
+fn vec3_reflect(incident, normal) {
+    // R = I - 2 * dot(I, N) * N
+    let d2 = 2.0 * vec3_dot(incident, normal);
+    return [
+        incident[0] - d2 * normal[0],
+        incident[1] - d2 * normal[1],
+        incident[2] - d2 * normal[2]
+    ];
+}
+
+fn vec3_min(a, b) {
+    return [min(a[0], b[0]), min(a[1], b[1]), min(a[2], b[2])];
+}
+
+fn vec3_max(a, b) {
+    return [max(a[0], b[0]), max(a[1], b[1]), max(a[2], b[2])];
+}
+
+fn vec4_dot(a, b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+}
+
+// Quaternion stored as [x, y, z, w] where w is scalar part
+fn quat(x, y, z, w) {
+    return [x + 0.0, y + 0.0, z + 0.0, w + 0.0];
+}
+
+fn quat_identity() {
+    return [0.0, 0.0, 0.0, 1.0];
+}
+
+fn quat_normalize(q) {
+    let lsq = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    if lsq <= 1e-24 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let inv = 1.0 / sqrt(lsq);
+    return [q[0] * inv, q[1] * inv, q[2] * inv, q[3] * inv];
+}
+
+fn quat_from_axis_angle(axis, angle_rad) {
+    let n = vec3_normalize(axis);
+    let half_a = angle_rad * 0.5;
+    let s = sin(half_a);
+    return quat_normalize([n[0] * s, n[1] * s, n[2] * s, cos(half_a)]);
+}
+
+fn quat_from_euler(pitch_x, yaw_y, roll_z) {
+    let cx = cos(pitch_x * 0.5);
+    let sx = sin(pitch_x * 0.5);
+    let cy = cos(yaw_y * 0.5);
+    let sy = sin(yaw_y * 0.5);
+    let cz = cos(roll_z * 0.5);
+    let sz = sin(roll_z * 0.5);
+    return quat_normalize([
+        sx * cy * cz - cx * sy * sz,
+        cx * sy * cz + sx * cy * sz,
+        cx * cy * sz - sx * sy * cz,
+        cx * cy * cz + sx * sy * sz
+    ]);
+}
+
+fn quat_conjugate(q) {
+    return [-q[0], -q[1], -q[2], q[3]];
+}
+
+fn quat_mul(a, b) {
+    return [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]
+    ];
+}
+
+fn quat_rotate_vec3(q, v) {
+    // Fast exact Rodrigues-equivalent: v' = v + 2*w*(u x v) + 2*(u x (u x v))
+    let u = [q[0], q[1], q[2]];
+    let w = q[3];
+    let uv = vec3_cross(u, v);
+    let uuv = vec3_cross(u, uv);
+    return [
+        v[0] + 2.0 * (w * uv[0] + uuv[0]),
+        v[1] + 2.0 * (w * uv[1] + uuv[1]),
+        v[2] + 2.0 * (w * uv[2] + uuv[2])
+    ];
+}
+
+fn quat_slerp(q0, q1, t) {
+    let a = quat_normalize(q0);
+    let b = quat_normalize(q1);
+    let dot_val = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    if dot_val < 0.0 {
+        b = [-b[0], -b[1], -b[2], -b[3]];
+        dot_val = -dot_val;
+    }
+    if dot_val > 0.9995 {
+        return quat_normalize([
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+            a[3] + (b[3] - a[3]) * t
+        ]);
+    }
+    let theta_0 = _acos_safe(dot_val);
+    let sin_theta_0 = sin(theta_0);
+    let theta = theta_0 * t;
+    let s0 = sin(theta_0 - theta) / sin_theta_0;
+    let s1 = sin(theta) / sin_theta_0;
+    return quat_normalize([
+        s0 * a[0] + s1 * b[0],
+        s0 * a[1] + s1 * b[1],
+        s0 * a[2] + s1 * b[2],
+        s0 * a[3] + s1 * b[3]
+    ]);
+}
+
+// 4x4 row-major flat array of 16 numbers: m[row * 4 + col]
+fn mat4_identity() {
+    return [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0
+    ];
+}
+
+fn mat4_transpose(m) {
+    return [
+        m[0], m[4], m[8],  m[12],
+        m[1], m[5], m[9],  m[13],
+        m[2], m[6], m[10], m[14],
+        m[3], m[7], m[11], m[15]
+    ];
+}
+
+fn mat4_mul(a, b) {
+    let out = [
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0
+    ];
+    let r = 0;
+    while r < 4 {
+        let r4 = r * 4;
+        let a0 = a[r4];
+        let a1 = a[r4 + 1];
+        let a2 = a[r4 + 2];
+        let a3 = a[r4 + 3];
+        out[r4]     = a0 * b[0] + a1 * b[4] + a2 * b[8]  + a3 * b[12];
+        out[r4 + 1] = a0 * b[1] + a1 * b[5] + a2 * b[9]  + a3 * b[13];
+        out[r4 + 2] = a0 * b[2] + a1 * b[6] + a2 * b[10] + a3 * b[14];
+        out[r4 + 3] = a0 * b[3] + a1 * b[7] + a2 * b[11] + a3 * b[15];
+        r = r + 1;
+    }
+    return out;
+}
+
+fn mat4_transform_vec4(m, v) {
+    let x = v[0];
+    let y = v[1];
+    let z = v[2];
+    let w = v[3];
+    return [
+        m[0] * x + m[1] * y + m[2]  * z + m[3]  * w,
+        m[4] * x + m[5] * y + m[6]  * z + m[7]  * w,
+        m[8] * x + m[9] * y + m[10] * z + m[11] * w,
+        m[12] * x + m[13] * y + m[14] * z + m[15] * w
+    ];
+}
+
+fn mat4_transform_point(m, p) {
+    let x = p[0];
+    let y = p[1];
+    let z = p[2];
+    let w = m[12] * x + m[13] * y + m[14] * z + m[15];
+    let rx = m[0] * x + m[1] * y + m[2] * z + m[3];
+    let ry = m[4] * x + m[5] * y + m[6] * z + m[7];
+    let rz = m[8] * x + m[9] * y + m[10] * z + m[11];
+    if abs(w - 1.0) > 1e-9 and abs(w) > 1e-12 {
+        let iw = 1.0 / w;
+        return [rx * iw, ry * iw, rz * iw];
+    }
+    return [rx, ry, rz];
+}
+
+fn mat4_transform_dir(m, d) {
+    let x = d[0];
+    let y = d[1];
+    let z = d[2];
+    return vec3_normalize([
+        m[0] * x + m[1] * y + m[2]  * z,
+        m[4] * x + m[5] * y + m[6]  * z,
+        m[8] * x + m[9] * y + m[10] * z
+    ]);
+}
+
+fn trs_matrix(translation, rotation_quat, scale_vec) {
+    let q = quat_normalize(rotation_quat);
+    let x = q[0]; let y = q[1]; let z = q[2]; let w = q[3];
+    let xx = x * x; let yy = y * y; let zz = z * z;
+    let xy = x * y; let xz = x * z; let yz = y * z;
+    let wx = w * x; let wy = w * y; let wz = w * z;
+
+    let sx = scale_vec[0];
+    let sy = scale_vec[1];
+    let sz = scale_vec[2];
+
+    return [
+        (1.0 - 2.0 * (yy + zz)) * sx, (2.0 * (xy - wz)) * sy,       (2.0 * (xz + wy)) * sz,       translation[0],
+        (2.0 * (xy + wz)) * sx,       (1.0 - 2.0 * (xx + zz)) * sy, (2.0 * (yz - wx)) * sz,       translation[1],
+        (2.0 * (xz - wy)) * sx,       (2.0 * (yz + wx)) * sy,       (1.0 - 2.0 * (xx + yy)) * sz, translation[2],
+        0.0,                          0.0,                          0.0,                          1.0
+    ];
+}
+
+fn look_at(eye, target_pt, up_dir) {
+    let f = vec3_normalize(vec3_sub(target_pt, eye));
+    let s = vec3_normalize(vec3_cross(f, up_dir));
+    if vec3_len_sq(s) < 1e-12 {
+        s = [1.0, 0.0, 0.0];
+    }
+    let u = vec3_cross(s, f);
+    return [
+         s[0],  s[1],  s[2], -vec3_dot(s, eye),
+         u[0],  u[1],  u[2], -vec3_dot(u, eye),
+        -f[0], -f[1], -f[2],  vec3_dot(f, eye),
+         0.0,   0.0,   0.0,   1.0
+    ];
+}
+
+fn perspective_fov(fov_y_rad, aspect, z_near, z_far) {
+    let f = 1.0 / tan(fov_y_rad * 0.5);
+    let nf = 1.0 / (z_near - z_far);
+    return [
+        f / aspect, 0.0, 0.0,                   0.0,
+        0.0,        f,   0.0,                   0.0,
+        0.0,        0.0, (z_far + z_near) * nf, (2.0 * z_far * z_near) * nf,
+        0.0,        0.0, -1.0,                  0.0
+    ];
+}
+
+fn _norm_plane(p) {
+    let l = sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+    if l <= 1e-12 { return p; }
+    let inv = 1.0 / l;
+    return [p[0] * inv, p[1] * inv, p[2] * inv, p[3] * inv];
+}
+
+// Gribb-Hartmann frustum plane extraction from row-major View-Projection matrix
+fn extract_frustum_planes(vp) {
+    let r0 = [vp[0],  vp[1],  vp[2],  vp[3]];
+    let r1 = [vp[4],  vp[5],  vp[6],  vp[7]];
+    let r2 = [vp[8],  vp[9],  vp[10], vp[11]];
+    let r3 = [vp[12], vp[13], vp[14], vp[15]];
+
+    let left_p   = _norm_plane([r3[0] + r0[0], r3[1] + r0[1], r3[2] + r0[2], r3[3] + r0[3]]);
+    let right_p  = _norm_plane([r3[0] - r0[0], r3[1] - r0[1], r3[2] - r0[2], r3[3] - r0[3]]);
+    let bottom_p = _norm_plane([r3[0] + r1[0], r3[1] + r1[1], r3[2] + r1[2], r3[3] + r1[3]]);
+    let top_p    = _norm_plane([r3[0] - r1[0], r3[1] - r1[1], r3[2] - r1[2], r3[3] - r1[3]]);
+    let near_p   = _norm_plane([r3[0] + r2[0], r3[1] + r2[1], r3[2] + r2[2], r3[3] + r2[3]]);
+    let far_p    = _norm_plane([r3[0] - r2[0], r3[1] - r2[1], r3[2] - r2[2], r3[3] - r2[3]]);
+    return [left_p, right_p, bottom_p, top_p, near_p, far_p];
+}
+
+// Returns true if AABB is inside or intersecting frustum, false if completely outside
+fn frustum_cull_aabb(planes, aabb_min, aabb_max) {
+    let idx = 0;
+    while idx < len(planes) {
+        let pl = planes[idx];
+        let px = aabb_min[0];
+        if pl[0] >= 0.0 { px = aabb_max[0]; }
+        let py = aabb_min[1];
+        if pl[1] >= 0.0 { py = aabb_max[1]; }
+        let pz = aabb_min[2];
+        if pl[2] >= 0.0 { pz = aabb_max[2]; }
+        if (pl[0] * px + pl[1] * py + pl[2] * pz + pl[3]) < 0.0 {
+            return false;
+        }
+        idx = idx + 1;
+    }
+    return true;
+}
+
+// ============================================================================
+// 3. Procedural Geometry, OBJ Mesh I/O & Khronos glTF 2.0 Exporter
+// ============================================================================
+
+fn compute_mesh_bounds_and_normals(name_str, vertices, normals, uvs, indices) {
+    let bmin = [1e18, 1e18, 1e18];
+    let bmax = [-1e18, -1e18, -1e18];
+    if len(vertices) == 0 {
+        bmin = [0.0, 0.0, 0.0];
+        bmax = [0.0, 0.0, 0.0];
+    } else {
+        let vi = 0;
+        while vi < len(vertices) {
+            bmin = vec3_min(bmin, vertices[vi]);
+            bmax = vec3_max(bmax, vertices[vi]);
+            vi = vi + 1;
+        }
+    }
+
+    let out_normals = normals;
+    if out_normals == nil or len(out_normals) != len(vertices) {
+        out_normals = [];
+        let k = 0;
+        while k < len(vertices) {
+            array_push(out_normals, [0.0, 0.0, 0.0]);
+            k = k + 1;
+        }
+        let fi = 0;
+        while fi < len(indices) {
+            let tri = indices[fi];
+            let i0 = tri[0]; let i1 = tri[1]; let i2 = tri[2];
+            let v0 = vertices[i0];
+            let v1 = vertices[i1];
+            let v2 = vertices[i2];
+            let fnrm = vec3_cross(vec3_sub(v1, v0), vec3_sub(v2, v0));
+            out_normals[i0] = vec3_add(out_normals[i0], fnrm);
+            out_normals[i1] = vec3_add(out_normals[i1], fnrm);
+            out_normals[i2] = vec3_add(out_normals[i2], fnrm);
+            fi = fi + 1;
+        }
+        let ni = 0;
+        while ni < len(out_normals) {
+            let nrm = vec3_normalize(out_normals[ni]);
+            if vec3_len_sq(nrm) < 1e-12 { nrm = [0.0, 1.0, 0.0]; }
+            out_normals[ni] = nrm;
+            ni = ni + 1;
+        }
+    }
+
+    let out_uvs = uvs;
+    if out_uvs == nil or len(out_uvs) != len(vertices) {
+        out_uvs = [];
+        let ui = 0;
+        while ui < len(vertices) {
+            array_push(out_uvs, [0.0, 0.0]);
+            ui = ui + 1;
+        }
+    }
+
+    return map{
+        format: "pblang.gfx3d.mesh.v1",
+        name: name_str,
+        vertices: vertices,
+        normals: out_normals,
+        uvs: out_uvs,
+        indices: indices,
+        aabb_min: bmin,
+        aabb_max: bmax
+    };
+}
+
+fn mesh_cube(size = 1.0) {
+    let h = size * 0.5;
+    // 6 faces x 4 vertices = 24 vertices for crisp per-face normals
+    let verts = [
+        // +Z front
+        [-h, -h,  h], [ h, -h,  h], [ h,  h,  h], [-h,  h,  h],
+        // -Z back
+        [ h, -h, -h], [-h, -h, -h], [-h,  h, -h], [ h,  h, -h],
+        // +X right
+        [ h, -h,  h], [ h, -h, -h], [ h,  h, -h], [ h,  h,  h],
+        // -X left
+        [-h, -h, -h], [-h, -h,  h], [-h,  h,  h], [-h,  h, -h],
+        // +Y top
+        [-h,  h,  h], [ h,  h,  h], [ h,  h, -h], [-h,  h, -h],
+        // -Y bottom
+        [-h, -h, -h], [ h, -h, -h], [ h, -h,  h], [-h, -h,  h]
+    ];
+    let nrms = [
+        [ 0.0,  0.0,  1.0], [ 0.0,  0.0,  1.0], [ 0.0,  0.0,  1.0], [ 0.0,  0.0,  1.0],
+        [ 0.0,  0.0, -1.0], [ 0.0,  0.0, -1.0], [ 0.0,  0.0, -1.0], [ 0.0,  0.0, -1.0],
+        [ 1.0,  0.0,  0.0], [ 1.0,  0.0,  0.0], [ 1.0,  0.0,  0.0], [ 1.0,  0.0,  0.0],
+        [-1.0,  0.0,  0.0], [-1.0,  0.0,  0.0], [-1.0,  0.0,  0.0], [-1.0,  0.0,  0.0],
+        [ 0.0,  1.0,  0.0], [ 0.0,  1.0,  0.0], [ 0.0,  1.0,  0.0], [ 0.0,  1.0,  0.0],
+        [ 0.0, -1.0,  0.0], [ 0.0, -1.0,  0.0], [ 0.0, -1.0,  0.0], [ 0.0, -1.0,  0.0]
+    ];
+    let uvs = [];
+    let indices = [];
+    let f = 0;
+    while f < 6 {
+        let base = f * 4;
+        array_push(uvs, [0.0, 0.0]);
+        array_push(uvs, [1.0, 0.0]);
+        array_push(uvs, [1.0, 1.0]);
+        array_push(uvs, [0.0, 1.0]);
+        array_push(indices, [base, base + 1, base + 2]);
+        array_push(indices, [base, base + 2, base + 3]);
+        f = f + 1;
+    }
+    return compute_mesh_bounds_and_normals("cube", verts, nrms, uvs, indices);
+}
+
+fn mesh_plane(width = 10.0, depth = 10.0, subdiv_x = 1, subdiv_z = 1) {
+    let sx = max(1, floor(subdiv_x));
+    let sz = max(1, floor(subdiv_z));
+    let verts = [];
+    let nrms = [];
+    let uvs = [];
+    let indices = [];
+
+    let iz = 0;
+    while iz <= sz {
+        let vz = iz / sz;
+        let z = (vz - 0.5) * depth;
+        let ix = 0;
+        while ix <= sx {
+            let ux = ix / sx;
+            let x = (ux - 0.5) * width;
+            array_push(verts, [x, 0.0, z]);
+            array_push(nrms, [0.0, 1.0, 0.0]);
+            array_push(uvs, [ux, vz]);
+            ix = ix + 1;
+        }
+        iz = iz + 1;
+    }
+
+    let stride = sx + 1;
+    let rz = 0;
+    while rz < sz {
+        let rx = 0;
+        while rx < sx {
+            let a = rz * stride + rx;
+            let b = a + 1;
+            let c = (rz + 1) * stride + rx;
+            let d = c + 1;
+            array_push(indices, [a, c, b]);
+            array_push(indices, [b, c, d]);
+            rx = rx + 1;
+        }
+        rz = rz + 1;
+    }
+    return compute_mesh_bounds_and_normals("plane", verts, nrms, uvs, indices);
+}
+
+fn mesh_uv_sphere(radius = 1.0, rings = 14, sectors = 20) {
+    let nr = max(3, floor(rings));
+    let ns = max(4, floor(sectors));
+    let verts = [];
+    let nrms = [];
+    let uvs = [];
+    let indices = [];
+
+    let r = 0;
+    while r <= nr {
+        let v = r / nr;
+        let phi = v * PI;
+        let sp = sin(phi);
+        let cp = cos(phi);
+        let s = 0;
+        while s <= ns {
+            let u = s / ns;
+            let theta = u * TWO_PI;
+            let nx = -sp * sin(theta);
+            let ny = cp;
+            let nz = sp * cos(theta);
+            array_push(verts, [nx * radius, ny * radius, nz * radius]);
+            array_push(nrms, [nx, ny, nz]);
+            array_push(uvs, [u, v]);
+            s = s + 1;
+        }
+        r = r + 1;
+    }
+
+    let stride = ns + 1;
+    let ri = 0;
+    while ri < nr {
+        let si = 0;
+        while si < ns {
+            let k1 = ri * stride + si;
+            let k2 = k1 + stride;
+            if ri != 0 {
+                array_push(indices, [k1, k2, k1 + 1]);
+            }
+            if ri != (nr - 1) {
+                array_push(indices, [k1 + 1, k2, k2 + 1]);
+            }
+            si = si + 1;
+        }
+        ri = ri + 1;
+    }
+    return compute_mesh_bounds_and_normals("uv_sphere", verts, nrms, uvs, indices);
+}
+
+fn mesh_torus(major_r = 1.0, minor_r = 0.35, major_seg = 20, minor_seg = 12) {
+    let n_maj = max(4, floor(major_seg));
+    let n_min = max(4, floor(minor_seg));
+    let verts = [];
+    let nrms = [];
+    let uvs = [];
+    let indices = [];
+
+    let i = 0;
+    while i <= n_maj {
+        let u = i / n_maj;
+        let theta = u * TWO_PI;
+        let ct = cos(theta);
+        let st = sin(theta);
+        let j = 0;
+        while j <= n_min {
+            let v = j / n_min;
+            let phi = v * TWO_PI;
+            let cp = cos(phi);
+            let sp = sin(phi);
+            let ring_r = major_r + minor_r * cp;
+            array_push(verts, [ring_r * ct, minor_r * sp, ring_r * st]);
+            array_push(nrms, vec3_normalize([cp * ct, sp, cp * st]));
+            array_push(uvs, [u, v]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    let stride = n_min + 1;
+    let mi = 0;
+    while mi < n_maj {
+        let mj = 0;
+        while mj < n_min {
+            let a = mi * stride + mj;
+            let b = (mi + 1) * stride + mj;
+            let c = a + 1;
+            let d = b + 1;
+            array_push(indices, [a, c, b]);
+            array_push(indices, [c, d, b]);
+            mj = mj + 1;
+        }
+        mi = mi + 1;
+    }
+    return compute_mesh_bounds_and_normals("torus", verts, nrms, uvs, indices);
+}
+
+fn _split_ws(line_str) {
+    let parts = str_split(str_trim(line_str), " ");
+    let out = [];
+    let idx = 0;
+    while idx < len(parts) {
+        let tok = str_trim(parts[idx]);
+        if tok != "" {
+            array_push(out, tok);
+        }
+        idx = idx + 1;
+    }
+    return out;
+}
+
+fn _resolve_obj_index(raw_str, count) {
+    let n = floor(parse_number(raw_str));
+    if n < 0 {
+        return count + n;
+    }
+    return n - 1;
+}
+
+fn parse_obj_mesh(obj_str) {
+    let lines = str_split(str_replace_all(str(obj_str), "\r\n", "\n"), "\n");
+    let raw_v = [];
+    let raw_vt = [];
+    let raw_vn = [];
+    let out_v = [];
+    let out_vt = [];
+    let out_vn = [];
+    let out_idx = [];
+    let vmap = map{};
+    let mesh_name = "obj_mesh";
+    let has_vn = false;
+
+    let li = 0;
+    while li < len(lines) {
+        let line_s = str_trim(lines[li]);
+        if line_s != "" and not str_starts_with(line_s, "#") {
+            let toks = _split_ws(line_s);
+            if len(toks) > 0 {
+                let head = toks[0];
+                if (head == "o" or head == "g") and len(toks) >= 2 {
+                    mesh_name = toks[1];
+                } elif head == "v" and len(toks) >= 4 {
+                    array_push(raw_v, [
+                        parse_number(toks[1]),
+                        parse_number(toks[2]),
+                        parse_number(toks[3])
+                    ]);
+                } elif head == "vt" and len(toks) >= 3 {
+                    array_push(raw_vt, [
+                        parse_number(toks[1]),
+                        parse_number(toks[2])
+                    ]);
+                } elif head == "vn" and len(toks) >= 4 {
+                    array_push(raw_vn, vec3_normalize([
+                        parse_number(toks[1]),
+                        parse_number(toks[2]),
+                        parse_number(toks[3])
+                    ]));
+                } elif head == "f" and len(toks) >= 4 {
+                    let face_ids = [];
+                    let ti = 1;
+                    while ti < len(toks) {
+                        let spec = toks[ti];
+                        let existing = _get(vmap, spec, -1);
+                        if existing >= 0 {
+                            array_push(face_ids, existing);
+                        } else {
+                            let subs = str_split(spec, "/");
+                            let vi = _resolve_obj_index(subs[0], len(raw_v));
+                            let pos = [0.0, 0.0, 0.0];
+                            if vi >= 0 and vi < len(raw_v) { pos = raw_v[vi]; }
+                            let uv = [0.0, 0.0];
+                            if len(subs) >= 2 and subs[1] != "" {
+                                let vti = _resolve_obj_index(subs[1], len(raw_vt));
+                                if vti >= 0 and vti < len(raw_vt) { uv = raw_vt[vti]; }
+                            }
+                            let nrm = [0.0, 0.0, 0.0];
+                            if len(subs) >= 3 and subs[2] != "" {
+                                let vni = _resolve_obj_index(subs[2], len(raw_vn));
+                                if vni >= 0 and vni < len(raw_vn) {
+                                    nrm = raw_vn[vni];
+                                    has_vn = true;
+                                }
+                            }
+                            let new_id = len(out_v);
+                            array_push(out_v, pos);
+                            array_push(out_vt, uv);
+                            array_push(out_vn, nrm);
+                            vmap[spec] = new_id;
+                            array_push(face_ids, new_id);
+                        }
+                        ti = ti + 1;
+                    }
+                    // Fan triangulate polygon faces
+                    let k = 1;
+                    while k + 1 < len(face_ids) {
+                        array_push(out_idx, [face_ids[0], face_ids[k], face_ids[k + 1]]);
+                        k = k + 1;
+                    }
+                }
+            }
+        }
+        li = li + 1;
+    }
+
+    let final_nrm = nil;
+    if has_vn { final_nrm = out_vn; }
+    return compute_mesh_bounds_and_normals(mesh_name, out_v, final_nrm, out_vt, out_idx);
+}
+
+fn export_obj_mesh(mesh) {
+    let lines = [
+        "# Exported by PBLang Sovereign 3D Engine v" + GFX3D_ENGINE_VERSION,
+        "o " + _get(mesh, "name", "mesh")
+    ];
+    let verts = mesh.vertices;
+    let nrms = mesh.normals;
+    let uvs = mesh.uvs;
+    let indices = mesh.indices;
+
+    let i = 0;
+    while i < len(verts) {
+        let v = verts[i];
+        array_push(lines, "v " + _fmt_num(v[0]) + " " + _fmt_num(v[1]) + " " + _fmt_num(v[2]));
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(uvs) {
+        let uv = uvs[i];
+        array_push(lines, "vt " + _fmt_num(uv[0]) + " " + _fmt_num(uv[1]));
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(nrms) {
+        let n = nrms[i];
+        array_push(lines, "vn " + _fmt_num(n[0]) + " " + _fmt_num(n[1]) + " " + _fmt_num(n[2]));
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(indices) {
+        let tri = indices[i];
+        let a = str(tri[0] + 1);
+        let b = str(tri[1] + 1);
+        let c = str(tri[2] + 1);
+        array_push(lines, "f " + a + "/" + a + "/" + a + " " + b + "/" + b + "/" + b + " " + c + "/" + c + "/" + c);
+        i = i + 1;
+    }
+    return str_join(lines, "\n") + "\n";
+}
+
+// ============================================================================
+// Scene Graph & PBR Materials + Khronos glTF 2.0 JSON + Embedded Buffer Export
+// ============================================================================
+
+fn pbr_material(opts = nil) {
+    opts = _opts(opts);
+    return map{
+        name: _get(opts, "name", "pbr_mat"),
+        albedo: _get(opts, "albedo", [0.8, 0.8, 0.8]),
+        metallic: _saturate(_get(opts, "metallic", 0.0)),
+        roughness: _clamp(_get(opts, "roughness", 0.35), 0.04, 1.0),
+        ao: _saturate(_get(opts, "ao", 1.0)),
+        emissive: _get(opts, "emissive", [0.0, 0.0, 0.0]),
+        reflectivity: _saturate(_get(opts, "reflectivity", 0.0))
+    };
+}
+
+fn scene3d_new(opts = nil) {
+    opts = _opts(opts);
+    return map{
+        format: "pblang.gfx3d.scene.v4",
+        title: _get(opts, "title", "Sovereign 3D PBR Scene"),
+        camera: map{
+            eye: _get(opts, "eye", [0.0, 2.2, 6.0]),
+            target: _get(opts, "target", [0.0, 0.6, 0.0]),
+            up: _get(opts, "up", [0.0, 1.0, 0.0]),
+            fov_y_deg: _get(opts, "fov_y_deg", 50.0),
+            z_near: _get(opts, "z_near", 0.1),
+            z_far: _get(opts, "z_far", 200.0)
+        },
+        environment: map{
+            sky_zenith: _get(opts, "sky_zenith", [0.10, 0.22, 0.48]),
+            sky_horizon: _get(opts, "sky_horizon", [0.52, 0.66, 0.84]),
+            ground_color: _get(opts, "ground_color", [0.08, 0.09, 0.11]),
+            ambient_intensity: _get(opts, "ambient_intensity", 0.16)
+        },
+        nodes: [],
+        spheres: [],
+        lights: []
+    };
+}
+
+fn scene3d_set_camera(sc, cam_opts) {
+    cam_opts = _opts(cam_opts);
+    sc.camera.eye = _get(cam_opts, "eye", sc.camera.eye);
+    sc.camera.target = _get(cam_opts, "target", sc.camera.target);
+    sc.camera.up = _get(cam_opts, "up", sc.camera.up);
+    sc.camera.fov_y_deg = _get(cam_opts, "fov_y_deg", sc.camera.fov_y_deg);
+    sc.camera.z_near = _get(cam_opts, "z_near", sc.camera.z_near);
+    sc.camera.z_far = _get(cam_opts, "z_far", sc.camera.z_far);
+    return sc;
+}
+
+fn scene3d_add_mesh_node(sc, node_id, mesh, material = nil, xform_opts = nil) {
+    xform_opts = _opts(xform_opts);
+    if material == nil { material = pbr_material(nil); }
+    let pos = _get(xform_opts, "position", [0.0, 0.0, 0.0]);
+    let rot = _get(xform_opts, "rotation", quat_identity());
+    let scl = _get(xform_opts, "scale", [1.0, 1.0, 1.0]);
+    let model_mat = trs_matrix(pos, rot, scl);
+    let nd = map{
+        id: node_id,
+        kind: "mesh",
+        mesh: mesh,
+        material: material,
+        position: pos,
+        rotation: rot,
+        scale: scl,
+        model_matrix: model_mat
+    };
+    array_push(sc.nodes, nd);
+    return nd;
+}
+
+fn scene3d_add_sphere_node(sc, node_id, center_pt, radius, material = nil) {
+    if material == nil { material = pbr_material(nil); }
+    let sp = map{
+        id: node_id,
+        kind: "sphere",
+        center: center_pt,
+        radius: radius,
+        material: material
+    };
+    array_push(sc.spheres, sp);
+    return sp;
+}
+
+fn scene3d_add_light(sc, light_opts) {
+    light_opts = _opts(light_opts);
+    let lt = map{
+        kind: _get(light_opts, "kind", "point"), // "point" or "directional"
+        position: _get(light_opts, "position", [4.0, 6.0, 4.0]),
+        direction: vec3_normalize(_get(light_opts, "direction", [-0.5, -1.0, -0.4])),
+        color: _get(light_opts, "color", [1.0, 0.98, 0.94]),
+        intensity: _get(light_opts, "intensity", 28.0),
+        radius: _get(light_opts, "radius", 0.25)
+    };
+    array_push(sc.lights, lt);
+    return lt;
+}
+
+fn _append_bytes_to_arr(dst_arr, b_obj) {
+    let n = len(b_obj);
+    let idx = 0;
+    while idx < n {
+        array_push(dst_arr, bytes_get(b_obj, idx));
+        idx = idx + 1;
+    }
+}
+
+// Emits valid Khronos glTF 2.0 JSON with embedded base64 binary buffer & pbrMetallicRoughness materials
+fn export_gltf2_json(sc) {
+    let bin_bytes = [];
+    let buffer_views = [];
+    let accessors = [];
+    let materials = [];
+    let meshes = [];
+    let gltf_nodes = [];
+    let node_indices = [];
+
+    // Combine explicit mesh nodes + procedural UV spheres for sphere nodes so full scene exports cleanly
+    let all_items = [];
+    let ni = 0;
+    while ni < len(sc.nodes) {
+        array_push(all_items, sc.nodes[ni]);
+        ni = ni + 1;
+    }
+    let si = 0;
+    while si < len(sc.spheres) {
+        let sp = sc.spheres[si];
+        let sph_mesh = mesh_uv_sphere(sp.radius, 10, 14);
+        array_push(all_items, map{
+            id: sp.id,
+            mesh: sph_mesh,
+            material: sp.material,
+            position: sp.center,
+            rotation: quat_identity(),
+            scale: [1.0, 1.0, 1.0]
+        });
+        si = si + 1;
+    }
+
+    let item_i = 0;
+    while item_i < len(all_items) {
+        let item = all_items[item_i];
+        let m = item.mesh;
+        let mat = item.material;
+
+        let mat_idx = len(materials);
+        array_push(materials, map{
+            name: _get(mat, "name", "mat_" + str(mat_idx)),
+            pbrMetallicRoughness: map{
+                baseColorFactor: [mat.albedo[0], mat.albedo[1], mat.albedo[2], 1.0],
+                metallicFactor: mat.metallic,
+                roughnessFactor: mat.roughness
+            },
+            emissiveFactor: mat.emissive
+        });
+
+        let vcount = len(m.vertices);
+        let icount = len(m.indices) * 3;
+
+        // Pack positions (FLOAT VEC3 = 5126)
+        let pos_vals = [];
+        let pmin = [1e18, 1e18, 1e18];
+        let pmax = [-1e18, -1e18, -1e18];
+        let vi = 0;
+        while vi < vcount {
+            let v = m.vertices[vi];
+            pmin = vec3_min(pmin, v);
+            pmax = vec3_max(pmax, v);
+            array_push(pos_vals, v[0]);
+            array_push(pos_vals, v[1]);
+            array_push(pos_vals, v[2]);
+            vi = vi + 1;
+        }
+        if vcount == 0 {
+            pmin = [0.0, 0.0, 0.0];
+            pmax = [0.0, 0.0, 0.0];
+        }
+        let pos_offset = len(bin_bytes);
+        let pos_packed = ffi_struct_pack("<" + str(vcount * 3) + "f", pos_vals);
+        _append_bytes_to_arr(bin_bytes, pos_packed);
+        let pos_bv = len(buffer_views);
+        array_push(buffer_views, map{
+            buffer: 0,
+            byteOffset: pos_offset,
+            byteLength: len(pos_packed),
+            target: 34962
+        });
+        let pos_acc = len(accessors);
+        array_push(accessors, map{
+            bufferView: pos_bv,
+            byteOffset: 0,
+            componentType: 5126,
+            count: vcount,
+            type: "VEC3",
+            min: pmin,
+            max: pmax
+        });
+
+        // Pack normals (FLOAT VEC3 = 5126)
+        let nrm_vals = [];
+        let nri = 0;
+        while nri < vcount {
+            let n = m.normals[nri];
+            array_push(nrm_vals, n[0]);
+            array_push(nrm_vals, n[1]);
+            array_push(nrm_vals, n[2]);
+            nri = nri + 1;
+        }
+        let nrm_offset = len(bin_bytes);
+        let nrm_packed = ffi_struct_pack("<" + str(vcount * 3) + "f", nrm_vals);
+        _append_bytes_to_arr(bin_bytes, nrm_packed);
+        let nrm_bv = len(buffer_views);
+        array_push(buffer_views, map{
+            buffer: 0,
+            byteOffset: nrm_offset,
+            byteLength: len(nrm_packed),
+            target: 34962
+        });
+        let nrm_acc = len(accessors);
+        array_push(accessors, map{
+            bufferView: nrm_bv,
+            byteOffset: 0,
+            componentType: 5126,
+            count: vcount,
+            type: "VEC3"
+        });
+
+        // Pack indices (UNSIGNED_INT SCALAR = 5125)
+        let idx_vals = [];
+        let ti = 0;
+        while ti < len(m.indices) {
+            let tri = m.indices[ti];
+            array_push(idx_vals, tri[0]);
+            array_push(idx_vals, tri[1]);
+            array_push(idx_vals, tri[2]);
+            ti = ti + 1;
+        }
+        let idx_offset = len(bin_bytes);
+        let idx_packed = ffi_struct_pack("<" + str(icount) + "I", idx_vals);
+        _append_bytes_to_arr(bin_bytes, idx_packed);
+        let idx_bv = len(buffer_views);
+        array_push(buffer_views, map{
+            buffer: 0,
+            byteOffset: idx_offset,
+            byteLength: len(idx_packed),
+            target: 34963
+        });
+        let idx_acc = len(accessors);
+        array_push(accessors, map{
+            bufferView: idx_bv,
+            byteOffset: 0,
+            componentType: 5125,
+            count: icount,
+            type: "SCALAR"
+        });
+
+        let mesh_idx = len(meshes);
+        array_push(meshes, map{
+            name: _get(m, "name", "mesh_" + str(mesh_idx)),
+            primitives: [
+                map{
+                    attributes: map{
+                        POSITION: pos_acc,
+                        NORMAL: nrm_acc
+                    },
+                    indices: idx_acc,
+                    material: mat_idx,
+                    mode: 4
+                }
+            ]
+        });
+
+        let gnode_idx = len(gltf_nodes);
+        array_push(gltf_nodes, map{
+            name: str(item.id),
+            mesh: mesh_idx,
+            translation: item.position,
+            rotation: item.rotation,
+            scale: item.scale
+        });
+        array_push(node_indices, gnode_idx);
+
+        item_i = item_i + 1;
+    }
+
+    let b64 = base64_encode_bytes(bin_bytes);
+    let gltf_doc = map{
+        asset: map{
+            version: "2.0",
+            generator: "PBLang v" + GFX3D_ENGINE_VERSION + " Sovereign 3D PBR Engine"
+        },
+        scene: 0,
+        scenes: [
+            map{
+                name: _get(sc, "title", "SovereignScene"),
+                nodes: node_indices
+            }
+        ],
+        nodes: gltf_nodes,
+        meshes: meshes,
+        materials: materials,
+        accessors: accessors,
+        bufferViews: buffer_views,
+        buffers: [
+            map{
+                byteLength: len(bin_bytes),
+                uri: "data:application/octet-stream;base64," + b64
+            }
+        ]
+    };
+    return json_stringify(gltf_doc);
+}
+
+// ============================================================================
+// 4. Physically-Based Rendering (Cook-Torrance Metallic-Roughness BRDF)
+// ============================================================================
+
+fn ndf_ggx(n_dot_h, roughness) {
+    let a = max(roughness * roughness, 0.001);
+    let a2 = a * a;
+    let nh2 = n_dot_h * n_dot_h;
+    let denom = nh2 * (a2 - 1.0) + 1.0;
+    return a2 / (PI * denom * denom + 1e-12);
+}
+
+fn geometry_schlick_ggx(n_dot_v, roughness) {
+    let r = roughness + 1.0;
+    let k = (r * r) / 8.0;
+    return n_dot_v / (n_dot_v * (1.0 - k) + k + 1e-12);
+}
+
+fn geometry_smith(n_dot_v, n_dot_l, roughness) {
+    return geometry_schlick_ggx(n_dot_v, roughness) * geometry_schlick_ggx(n_dot_l, roughness);
+}
+
+fn fresnel_schlick(cos_theta, f0) {
+    let c = _saturate(1.0 - _saturate(cos_theta));
+    let c2 = c * c;
+    let c5 = c2 * c2 * c;
+    return [
+        f0[0] + (1.0 - f0[0]) * c5,
+        f0[1] + (1.0 - f0[1]) * c5,
+        f0[2] + (1.0 - f0[2]) * c5
+    ];
+}
+
+// Exact Cook-Torrance Metallic-Roughness BRDF evaluation
+fn eval_pbr_cook_torrance(normal, view_dir, light_dir, albedo_rgb, metallic, roughness, light_radiance) {
+    let n = vec3_normalize(normal);
+    let v = vec3_normalize(view_dir);
+    let l = vec3_normalize(light_dir);
+    let n_dot_l = max(vec3_dot(n, l), 0.0);
+    let n_dot_v = max(vec3_dot(n, v), 0.0);
+    if n_dot_l <= 0.0 or n_dot_v <= 0.0 {
+        return [0.0, 0.0, 0.0];
+    }
+
+    let h = vec3_normalize(vec3_add(v, l));
+    let n_dot_h = max(vec3_dot(n, h), 0.0);
+    let h_dot_v = max(vec3_dot(h, v), 0.0);
+
+    let met = _saturate(metallic);
+    let rgh = _clamp(roughness, 0.04, 1.0);
+
+    // Dielectric F0 = 0.04 blended toward metallic albedo
+    let f0 = vec3_lerp([0.04, 0.04, 0.04], albedo_rgb, met);
+
+    let d_term = ndf_ggx(n_dot_h, rgh);
+    let g_term = geometry_smith(n_dot_v, n_dot_l, rgh);
+    let f_term = fresnel_schlick(h_dot_v, f0);
+
+    let spec_denom = max(4.0 * n_dot_v * n_dot_l, 0.0001);
+    let dg_over_denom = (d_term * g_term) / spec_denom;
+    let specular = [
+        f_term[0] * dg_over_denom,
+        f_term[1] * dg_over_denom,
+        f_term[2] * dg_over_denom
+    ];
+
+    // Energy conservation: kD = (1 - F) * (1 - metallic)
+    let one_minus_m = 1.0 - met;
+    let kd = [
+        (1.0 - f_term[0]) * one_minus_m,
+        (1.0 - f_term[1]) * one_minus_m,
+        (1.0 - f_term[2]) * one_minus_m
+    ];
+
+    let diffuse = [
+        kd[0] * albedo_rgb[0] * INV_PI,
+        kd[1] * albedo_rgb[1] * INV_PI,
+        kd[2] * albedo_rgb[2] * INV_PI
+    ];
+
+    return [
+        (diffuse[0] + specular[0]) * light_radiance[0] * n_dot_l,
+        (diffuse[1] + specular[1]) * light_radiance[1] * n_dot_l,
+        (diffuse[2] + specular[2]) * light_radiance[2] * n_dot_l
+    ];
+}
+
+fn tonemap_reinhard(hdr) {
+    let r = max(0.0, hdr[0]);
+    let g = max(0.0, hdr[1]);
+    let b = max(0.0, hdr[2]);
+    return [r / (1.0 + r), g / (1.0 + g), b / (1.0 + b)];
+}
+
+fn _aces_ch(x) {
+    let v = max(0.0, x);
+    return _saturate((v * (2.51 * v + 0.03)) / (v * (2.43 * v + 0.59) + 0.14));
+}
+
+fn tonemap_aces_filmic(hdr) {
+    return [_aces_ch(hdr[0]), _aces_ch(hdr[1]), _aces_ch(hdr[2])];
+}
+
+fn linear_to_srgb_u8(lin_rgb) {
+    let inv_gamma = 1.0 / 2.2;
+    let r = floor(_saturate(pow(max(0.0, lin_rgb[0]), inv_gamma)) * 255.0 + 0.5);
+    let g = floor(_saturate(pow(max(0.0, lin_rgb[1]), inv_gamma)) * 255.0 + 0.5);
+    let b = floor(_saturate(pow(max(0.0, lin_rgb[2]), inv_gamma)) * 255.0 + 0.5);
+    return [_clamp(r, 0, 255), _clamp(g, 0, 255), _clamp(b, 0, 255)];
+}
+
+// ============================================================================
+// 5. SAH-BVH Accelerated Ray & Path Tracer (`build_bvh`, `raytrace_scene`)
+// ============================================================================
+
+fn _aabb_surface_area(bmin, bmax) {
+    let dx = max(0.0, bmax[0] - bmin[0]);
+    let dy = max(0.0, bmax[1] - bmin[1]);
+    let dz = max(0.0, bmax[2] - bmin[2]);
+    return 2.0 * (dx * dy + dy * dz + dz * dx);
+}
+
+fn ray_intersect_aabb(orig, inv_dir, aabb_min, aabb_max, t_max) {
+    let tx1 = (aabb_min[0] - orig[0]) * inv_dir[0];
+    let tx2 = (aabb_max[0] - orig[0]) * inv_dir[0];
+    let tmin = min(tx1, tx2);
+    let tmax = max(tx1, tx2);
+
+    let ty1 = (aabb_min[1] - orig[1]) * inv_dir[1];
+    let ty2 = (aabb_max[1] - orig[1]) * inv_dir[1];
+    tmin = max(tmin, min(ty1, ty2));
+    tmax = min(tmax, max(ty1, ty2));
+
+    let tz1 = (aabb_min[2] - orig[2]) * inv_dir[2];
+    let tz2 = (aabb_max[2] - orig[2]) * inv_dir[2];
+    tmin = max(tmin, min(tz1, tz2));
+    tmax = min(tmax, max(tz1, tz2));
+
+    return tmax >= max(tmin, 0.0) and tmin <= t_max;
+}
+
+// Exact Moller-Trumbore Ray-Triangle Intersection
+fn ray_intersect_triangle(orig, dir, v0, v1, v2) {
+    let e1 = vec3_sub(v1, v0);
+    let e2 = vec3_sub(v2, v0);
+    let pvec = vec3_cross(dir, e2);
+    let det = vec3_dot(e1, pvec);
+    if abs(det) < 1e-9 {
+        return map{ hit: false, t: 1e30, u: 0.0, v: 0.0 };
+    }
+    let inv_det = 1.0 / det;
+    let tvec = vec3_sub(orig, v0);
+    let u = vec3_dot(tvec, pvec) * inv_det;
+    if u < 0.0 or u > 1.0 {
+        return map{ hit: false, t: 1e30, u: 0.0, v: 0.0 };
+    }
+    let qvec = vec3_cross(tvec, e1);
+    let v = vec3_dot(dir, qvec) * inv_det;
+    if v < 0.0 or (u + v) > 1.0 {
+        return map{ hit: false, t: 1e30, u: 0.0, v: 0.0 };
+    }
+    let t = vec3_dot(e2, qvec) * inv_det;
+    if t <= 0.0001 {
+        return map{ hit: false, t: 1e30, u: 0.0, v: 0.0 };
+    }
+    return map{ hit: true, t: t, u: u, v: v };
+}
+
+fn ray_intersect_sphere(orig, dir, center_pt, radius) {
+    let oc = vec3_sub(orig, center_pt);
+    let b = vec3_dot(oc, dir);
+    let c = vec3_dot(oc, oc) - radius * radius;
+    let disc = b * b - c;
+    if disc < 0.0 {
+        return map{ hit: false, t: 1e30 };
+    }
+    let s = sqrt(disc);
+    let t0 = -b - s;
+    if t0 > 0.0001 {
+        return map{ hit: true, t: t0 };
+    }
+    let t1 = -b + s;
+    if t1 > 0.0001 {
+        return map{ hit: true, t: t1 };
+    }
+    return map{ hit: false, t: 1e30 };
+}
+
+fn _extract_world_primitives(sc) {
+    let prims = [];
+
+    let si = 0;
+    while si < len(sc.spheres) {
+        let sp = sc.spheres[si];
+        let r = sp.radius;
+        let c = sp.center;
+        array_push(prims, map{
+            kind: "sphere",
+            center: c,
+            radius: r,
+            material: sp.material,
+            aabb_min: [c[0] - r, c[1] - r, c[2] - r],
+            aabb_max: [c[0] + r, c[1] + r, c[2] + r],
+            centroid: c
+        });
+        si = si + 1;
+    }
+
+    let ni = 0;
+    while ni < len(sc.nodes) {
+        let nd = sc.nodes[ni];
+        let m = nd.mesh;
+        let mat_m = nd.model_matrix;
+        let w_verts = [];
+        let w_nrms = [];
+        let vi = 0;
+        while vi < len(m.vertices) {
+            array_push(w_verts, mat4_transform_point(mat_m, m.vertices[vi]));
+            array_push(w_nrms, mat4_transform_dir(mat_m, m.normals[vi]));
+            vi = vi + 1;
+        }
+        let ti = 0;
+        while ti < len(m.indices) {
+            let tri = m.indices[ti];
+            let v0 = w_verts[tri[0]];
+            let v1 = w_verts[tri[1]];
+            let v2 = w_verts[tri[2]];
+            let n0 = w_nrms[tri[0]];
+            let n1 = w_nrms[tri[1]];
+            let n2 = w_nrms[tri[2]];
+            let bmin = vec3_min(vec3_min(v0, v1), v2);
+            let bmax = vec3_max(vec3_max(v0, v1), v2);
+            // Inflate degenerate planar AABBs slightly for robust slab intersection
+            bmin = [bmin[0] - 0.0001, bmin[1] - 0.0001, bmin[2] - 0.0001];
+            bmax = [bmax[0] + 0.0001, bmax[1] + 0.0001, bmax[2] + 0.0001];
+            let cent = [
+                (v0[0] + v1[0] + v2[0]) / 3.0,
+                (v0[1] + v1[1] + v2[1]) / 3.0,
+                (v0[2] + v1[2] + v2[2]) / 3.0
+            ];
+            array_push(prims, map{
+                kind: "triangle",
+                v0: v0, v1: v1, v2: v2,
+                n0: n0, n1: n1, n2: n2,
+                material: nd.material,
+                aabb_min: bmin,
+                aabb_max: bmax,
+                centroid: cent
+            });
+            ti = ti + 1;
+        }
+        ni = ni + 1;
+    }
+
+    return prims;
+}
+
+fn _build_bvh_recursive(prims, depth) {
+    let n = len(prims);
+    if n == 0 {
+        return map{
+            is_leaf: true,
+            aabb_min: [0.0, 0.0, 0.0],
+            aabb_max: [0.0, 0.0, 0.0],
+            prims: [],
+            left: nil,
+            right: nil
+        };
+    }
+
+    let bmin = prims[0].aabb_min;
+    let bmax = prims[0].aabb_max;
+    let cmin = prims[0].centroid;
+    let cmax = prims[0].centroid;
+    let i = 1;
+    while i < n {
+        bmin = vec3_min(bmin, prims[i].aabb_min);
+        bmax = vec3_max(bmax, prims[i].aabb_max);
+        cmin = vec3_min(cmin, prims[i].centroid);
+        cmax = vec3_max(cmax, prims[i].centroid);
+        i = i + 1;
+    }
+
+    if n <= 4 or depth >= 20 {
+        return map{
+            is_leaf: true,
+            aabb_min: bmin,
+            aabb_max: bmax,
+            prims: prims,
+            left: nil,
+            right: nil
+        };
+    }
+
+    // Choose dominant centroid extent axis and evaluate 8-bin Surface Area Heuristic (SAH)
+    let ext = vec3_sub(cmax, cmin);
+    let axis = 0;
+    if ext[1] > ext[0] and ext[1] >= ext[2] { axis = 1; }
+    elif ext[2] > ext[0] and ext[2] > ext[1] { axis = 2; }
+
+    if ext[axis] < 1e-7 {
+        let mid = floor(n / 2);
+        return map{
+            is_leaf: false,
+            aabb_min: bmin,
+            aabb_max: bmax,
+            prims: nil,
+            left: _build_bvh_recursive(slice(prims, 0, mid), depth + 1),
+            right: _build_bvh_recursive(slice(prims, mid, n), depth + 1)
+        };
+    }
+
+    let num_bins = 8;
+    let parent_sa = max(_aabb_surface_area(bmin, bmax), 1e-9);
+    let best_cost = n * 1.0;
+    let best_split_val = cmin[axis] + ext[axis] * 0.5;
+    let found_sah = false;
+
+    let bi = 1;
+    while bi < num_bins {
+        let split_val = cmin[axis] + ext[axis] * (bi / num_bins);
+        let l_cnt = 0;
+        let r_cnt = 0;
+        let l_min = [1e18, 1e18, 1e18];
+        let l_max = [-1e18, -1e18, -1e18];
+        let r_min = [1e18, 1e18, 1e18];
+        let r_max = [-1e18, -1e18, -1e18];
+        let pi = 0;
+        while pi < n {
+            let pr = prims[pi];
+            if pr.centroid[axis] < split_val {
+                l_cnt = l_cnt + 1;
+                l_min = vec3_min(l_min, pr.aabb_min);
+                l_max = vec3_max(l_max, pr.aabb_max);
+            } else {
+                r_cnt = r_cnt + 1;
+                r_min = vec3_min(r_min, pr.aabb_min);
+                r_max = vec3_max(r_max, pr.aabb_max);
+            }
+            pi = pi + 1;
+        }
+        if l_cnt > 0 and r_cnt > 0 {
+            let cost = 0.5 + (_aabb_surface_area(l_min, l_max) * l_cnt + _aabb_surface_area(r_min, r_max) * r_cnt) / parent_sa;
+            if cost < best_cost {
+                best_cost = cost;
+                best_split_val = split_val;
+                found_sah = true;
+            }
+        }
+        bi = bi + 1;
+    }
+
+    let left_list = [];
+    let right_list = [];
+    let k = 0;
+    while k < n {
+        if prims[k].centroid[axis] < best_split_val {
+            array_push(left_list, prims[k]);
+        } else {
+            array_push(right_list, prims[k]);
+        }
+        k = k + 1;
+    }
+
+    if len(left_list) == 0 or len(right_list) == 0 {
+        let mid_i = floor(n / 2);
+        left_list = slice(prims, 0, mid_i);
+        right_list = slice(prims, mid_i, n);
+    }
+
+    return map{
+        is_leaf: false,
+        sah_split: found_sah,
+        aabb_min: bmin,
+        aabb_max: bmax,
+        prims: nil,
+        left: _build_bvh_recursive(left_list, depth + 1),
+        right: _build_bvh_recursive(right_list, depth + 1)
+    };
+}
+
+fn _count_bvh_nodes(node) {
+    if node == nil { return 0; }
+    if node.is_leaf { return 1; }
+    return 1 + _count_bvh_nodes(node.left) + _count_bvh_nodes(node.right);
+}
+
+fn build_bvh(sc) {
+    let prims = _extract_world_primitives(sc);
+    let root = _build_bvh_recursive(prims, 0);
+    return map{
+        format: "pblang.gfx3d.bvh.v1",
+        primitive_count: len(prims),
+        node_count: _count_bvh_nodes(root),
+        root: root
+    };
+}
+
+fn _safe_inv_dir(dir) {
+    let ix = 1e15;
+    if abs(dir[0]) > 1e-15 { ix = 1.0 / dir[0]; }
+    let iy = 1e15;
+    if abs(dir[1]) > 1e-15 { iy = 1.0 / dir[1]; }
+    let iz = 1e15;
+    if abs(dir[2]) > 1e-15 { iz = 1.0 / dir[2]; }
+    return [ix, iy, iz];
+}
+
+fn bvh_trace_ray(bvh, orig, dir, t_max = 1e20) {
+    let root = bvh.root;
+    if root == nil {
+        return map{ hit: false, t: t_max };
+    }
+    let inv_dir = _safe_inv_dir(dir);
+    let best_t = t_max;
+    let best_hit = nil;
+
+    let stack = [root];
+    while len(stack) > 0 {
+        let cur = array_pop(stack);
+        if ray_intersect_aabb(orig, inv_dir, cur.aabb_min, cur.aabb_max, best_t) {
+            if cur.is_leaf {
+                let ps = cur.prims;
+                let i = 0;
+                while i < len(ps) {
+                    let pr = ps[i];
+                    if pr.kind == "sphere" {
+                        let sh = ray_intersect_sphere(orig, dir, pr.center, pr.radius);
+                        if sh.hit and sh.t < best_t {
+                            best_t = sh.t;
+                            let hp = vec3_add(orig, vec3_scale(dir, sh.t));
+                            let hn = vec3_scale(vec3_sub(hp, pr.center), 1.0 / pr.radius);
+                            best_hit = map{
+                                hit: true,
+                                t: sh.t,
+                                point: hp,
+                                normal: hn,
+                                material: pr.material
+                            };
+                        }
+                    } else {
+                        let th = ray_intersect_triangle(orig, dir, pr.v0, pr.v1, pr.v2);
+                        if th.hit and th.t < best_t {
+                            best_t = th.t;
+                            let hp2 = vec3_add(orig, vec3_scale(dir, th.t));
+                            let w0 = 1.0 - th.u - th.v;
+                            let interp_n = vec3_normalize([
+                                pr.n0[0] * w0 + pr.n1[0] * th.u + pr.n2[0] * th.v,
+                                pr.n0[1] * w0 + pr.n1[1] * th.u + pr.n2[1] * th.v,
+                                pr.n0[2] * w0 + pr.n1[2] * th.u + pr.n2[2] * th.v
+                            ]);
+                            if vec3_dot(interp_n, dir) > 0.0 {
+                                interp_n = vec3_neg(interp_n);
+                            }
+                            best_hit = map{
+                                hit: true,
+                                t: th.t,
+                                point: hp2,
+                                normal: interp_n,
+                                material: pr.material
+                            };
+                        }
+                    }
+                    i = i + 1;
+                }
+            } else {
+                if cur.right != nil { array_push(stack, cur.right); }
+                if cur.left != nil { array_push(stack, cur.left); }
+            }
+        }
+    }
+
+    if best_hit == nil {
+        return map{ hit: false, t: t_max };
+    }
+    return best_hit;
+}
+
+fn bvh_occluded(bvh, orig, dir, max_dist) {
+    let root = bvh.root;
+    if root == nil { return false; }
+    let inv_dir = _safe_inv_dir(dir);
+    let stack = [root];
+    while len(stack) > 0 {
+        let cur = array_pop(stack);
+        if ray_intersect_aabb(orig, inv_dir, cur.aabb_min, cur.aabb_max, max_dist) {
+            if cur.is_leaf {
+                let ps = cur.prims;
+                let i = 0;
+                while i < len(ps) {
+                    let pr = ps[i];
+                    if pr.kind == "sphere" {
+                        let sh = ray_intersect_sphere(orig, dir, pr.center, pr.radius);
+                        if sh.hit and sh.t < max_dist { return true; }
+                    } else {
+                        let th = ray_intersect_triangle(orig, dir, pr.v0, pr.v1, pr.v2);
+                        if th.hit and th.t < max_dist { return true; }
+                    }
+                    i = i + 1;
+                }
+            } else {
+                if cur.right != nil { array_push(stack, cur.right); }
+                if cur.left != nil { array_push(stack, cur.left); }
+            }
+        }
+    }
+    return false;
+}
+
+fn _eval_sky_gradient(env, dir) {
+    let t = _saturate(0.5 * (dir[1] + 1.0));
+    if dir[1] < -0.05 {
+        let gt = _saturate((-dir[1] - 0.05) * 2.5);
+        return vec3_lerp(env.sky_horizon, env.ground_color, gt);
+    }
+    return vec3_lerp(env.sky_horizon, env.sky_zenith, pow(t, 0.75));
+}
+
+fn _shade_ray_recursive(sc, bvh, orig, dir, depth, max_bounces, shadow_samples) {
+    let hit = bvh_trace_ray(bvh, orig, dir, 1e20);
+    if not hit.hit {
+        return _eval_sky_gradient(sc.environment, dir);
+    }
+
+    let mat = hit.material;
+    let p = hit.point;
+    let n = hit.normal;
+    let v = vec3_neg(dir);
+    let bias_orig = vec3_add(p, vec3_scale(n, 0.0015));
+
+    // Ambient hemisphere IBL
+    let sky_up = _eval_sky_gradient(sc.environment, n);
+    let amb_scale = sc.environment.ambient_intensity * mat.ao * (1.0 - 0.65 * mat.metallic);
+    let color = [
+        mat.emissive[0] + mat.albedo[0] * sky_up[0] * amb_scale,
+        mat.emissive[1] + mat.albedo[1] * sky_up[1] * amb_scale,
+        mat.emissive[2] + mat.albedo[2] * sky_up[2] * amb_scale
+    ];
+
+    let li = 0;
+    while li < len(sc.lights) {
+        let lt = sc.lights[li];
+        let l_dir = [0.0, 1.0, 0.0];
+        let dist = 1e12;
+        let atten = 1.0;
+
+        if lt.kind == "directional" {
+            l_dir = vec3_neg(lt.direction);
+            atten = lt.intensity;
+        } else {
+            let to_l = vec3_sub(lt.position, p);
+            let dsq = max(vec3_len_sq(to_l), 0.01);
+            dist = sqrt(dsq);
+            l_dir = vec3_scale(to_l, 1.0 / dist);
+            atten = lt.intensity / (1.0 + 0.18 * dsq);
+        }
+
+        let n_dot_l = vec3_dot(n, l_dir);
+        if n_dot_l > 0.0 {
+            let vis = 1.0;
+            if shadow_samples <= 1 {
+                if bvh_occluded(bvh, bias_orig, l_dir, dist - 0.003) {
+                    vis = 0.0;
+                }
+            } else {
+                // Deterministic golden-spiral area-light soft shadow sampling
+                let unoccluded = 0;
+                let tangent = vec3_normalize(vec3_cross(l_dir, [0.0, 1.0, 0.0]));
+                if vec3_len_sq(tangent) < 1e-8 {
+                    tangent = vec3_normalize(vec3_cross(l_dir, [1.0, 0.0, 0.0]));
+                }
+                let bitangent = vec3_cross(l_dir, tangent);
+                let l_rad = _get(lt, "radius", 0.25);
+                let si = 0;
+                while si < shadow_samples {
+                    let frac = (si + 0.5) / shadow_samples;
+                    let ang = si * 2.39996323;
+                    let rr = l_rad * sqrt(frac);
+                    let s_dir = l_dir;
+                    let s_dist = dist - 0.003;
+                    if lt.kind != "directional" {
+                        let sample_pos = vec3_add(
+                            lt.position,
+                            vec3_add(vec3_scale(tangent, rr * cos(ang)), vec3_scale(bitangent, rr * sin(ang)))
+                        );
+                        let delta = vec3_sub(sample_pos, bias_orig);
+                        s_dist = vec3_len(delta) - 0.003;
+                        s_dir = vec3_scale(delta, 1.0 / max(s_dist, 0.001));
+                    }
+                    if not bvh_occluded(bvh, bias_orig, s_dir, s_dist) {
+                        unoccluded = unoccluded + 1;
+                    }
+                    si = si + 1;
+                }
+                vis = unoccluded / shadow_samples;
+            }
+
+            if vis > 0.0 {
+                let rad = vec3_scale(lt.color, atten * vis);
+                let direct = eval_pbr_cook_torrance(n, v, l_dir, mat.albedo, mat.metallic, mat.roughness, rad);
+                color = vec3_add(color, direct);
+            }
+        }
+        li = li + 1;
+    }
+
+    // Multi-bounce Fresnel specular reflections
+    let refl_weight = max(mat.reflectivity, mat.metallic * (1.0 - 0.7 * mat.roughness));
+    if depth < max_bounces and refl_weight > 0.03 {
+        let refl_dir = vec3_normalize(vec3_reflect(dir, n));
+        let f0 = vec3_lerp([0.04, 0.04, 0.04], mat.albedo, mat.metallic);
+        let fres = fresnel_schlick(max(vec3_dot(n, v), 0.0), f0);
+        let refl_col = _shade_ray_recursive(sc, bvh, bias_orig, refl_dir, depth + 1, max_bounces, 1);
+        color = [
+            color[0] + refl_col[0] * fres[0] * refl_weight,
+            color[1] + refl_col[1] * fres[1] * refl_weight,
+            color[2] + refl_col[2] * fres[2] * refl_weight
+        ];
+    }
+
+    return color;
+}
+
+fn raytrace_scene(sc, width, height, opts = nil) {
+    opts = _opts(opts);
+    let t0 = now_ms();
+    let max_bounces = _get(opts, "max_bounces", 2);
+    let shadow_samples = _get(opts, "shadow_samples", 1);
+    let bvh = _get(opts, "bvh", nil);
+    if bvh == nil {
+        bvh = build_bvh(sc);
+    }
+
+    let cam = sc.camera;
+    let eye = cam.eye;
+    let fwd = vec3_normalize(vec3_sub(cam.target, eye));
+    let right_v = vec3_normalize(vec3_cross(fwd, cam.up));
+    let up_v = vec3_cross(right_v, fwd);
+    let aspect = width / max(1.0, height * 1.0);
+    let half_h = tan((cam.fov_y_deg * PI / 180.0) * 0.5);
+    let half_w = aspect * half_h;
+
+    let rgba = bytes_new(width * height * 4);
+    let py = 0;
+    while py < height {
+        let ndc_y = 1.0 - 2.0 * ((py + 0.5) / height);
+        let px = 0;
+        while px < width {
+            let ndc_x = 2.0 * ((px + 0.5) / width) - 1.0;
+            let ray_dir = vec3_normalize([
+                fwd[0] + right_v[0] * (ndc_x * half_w) + up_v[0] * (ndc_y * half_h),
+                fwd[1] + right_v[1] * (ndc_x * half_w) + up_v[1] * (ndc_y * half_h),
+                fwd[2] + right_v[2] * (ndc_x * half_w) + up_v[2] * (ndc_y * half_h)
+            ]);
+            let hdr = _shade_ray_recursive(sc, bvh, eye, ray_dir, 0, max_bounces, shadow_samples);
+            let mapped = tonemap_aces_filmic(hdr);
+            let srgb = linear_to_srgb_u8(mapped);
+            let off = (py * width + px) * 4;
+            bytes_set(rgba, off, srgb[0]);
+            bytes_set(rgba, off + 1, srgb[1]);
+            bytes_set(rgba, off + 2, srgb[2]);
+            bytes_set(rgba, off + 3, 255);
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+
+    let elapsed = now_ms() - t0;
+    return map{
+        ok: true,
+        width: width,
+        height: height,
+        rgba_bytes: rgba,
+        bvh_nodes: bvh.node_count,
+        primitives: bvh.primitive_count,
+        elapsed_ms: elapsed
+    };
+}
+
+// ============================================================================
+// 6. High-Speed Tile Z-Buffer Rasterizer + BMP / SVG / WebGPU+WebGL2 Export
+// ============================================================================
+
+fn render_scene_raster(sc, width, height, opts = nil) {
+    opts = _opts(opts);
+    let t0 = now_ms();
+    let cam = sc.camera;
+    let aspect = width / max(1.0, height * 1.0);
+    let view_m = look_at(cam.eye, cam.target, cam.up);
+    let proj_m = perspective_fov(cam.fov_y_deg * PI / 180.0, aspect, cam.z_near, cam.z_far);
+    let vp_m = mat4_mul(proj_m, view_m);
+    let frustum = extract_frustum_planes(vp_m);
+
+    // Collect mesh nodes + tessellated spheres
+    let draw_items = [];
+    let ni = 0;
+    while ni < len(sc.nodes) {
+        array_push(draw_items, sc.nodes[ni]);
+        ni = ni + 1;
+    }
+    let si = 0;
+    while si < len(sc.spheres) {
+        let sp = sc.spheres[si];
+        array_push(draw_items, map{
+            id: sp.id,
+            mesh: mesh_uv_sphere(sp.radius, 10, 14),
+            material: sp.material,
+            model_matrix: trs_matrix(sp.center, quat_identity(), [1.0, 1.0, 1.0])
+        });
+        si = si + 1;
+    }
+
+    let rgba = bytes_new(width * height * 4);
+    let zbuf = f64buf_new(width * height);
+
+    // Clear framebuffer with sky gradient + zbuf = +inf
+    let cy = 0;
+    while cy < height {
+        let t_sky = 1.0 - (cy / max(1.0, height * 1.0));
+        let sky_lin = vec3_lerp(sc.environment.sky_horizon, sc.environment.sky_zenith, t_sky);
+        let bg_u8 = linear_to_srgb_u8(tonemap_aces_filmic(sky_lin));
+        let cx = 0;
+        while cx < width {
+            let idx_px = cy * width + cx;
+            f64buf_set(zbuf, idx_px, 1e30);
+            let boff = idx_px * 4;
+            bytes_set(rgba, boff, bg_u8[0]);
+            bytes_set(rgba, boff + 1, bg_u8[1]);
+            bytes_set(rgba, boff + 2, bg_u8[2]);
+            bytes_set(rgba, boff + 3, 255);
+            cx = cx + 1;
+        }
+        cy = cy + 1;
+    }
+
+    let culled_nodes = 0;
+    let drawn_tris = 0;
+    let used_hpc_gemm = false;
+    let used_native_raster = false;
+    let gemm_threshold = _get(opts, "hpc_gemm_vertex_threshold", 32);
+    let native_raster_fn = nil;
+    if _get(opts, "prefer_native_raster", true) {
+        native_raster_fn = try gfx3d_raster_triangles catch nil;
+    }
+    let native_tri_batch = [];
+
+    let di = 0;
+    while di < len(draw_items) {
+        let item = draw_items[di];
+        let m = item.mesh;
+        let model_m = item.model_matrix;
+
+        // World-space 8-corner AABB for frustum culling
+        let lmin = m.aabb_min;
+        let lmax = m.aabb_max;
+        let corners = [
+            [lmin[0], lmin[1], lmin[2]], [lmax[0], lmin[1], lmin[2]],
+            [lmin[0], lmax[1], lmin[2]], [lmax[0], lmax[1], lmin[2]],
+            [lmin[0], lmin[1], lmax[2]], [lmax[0], lmin[1], lmax[2]],
+            [lmin[0], lmax[1], lmax[2]], [lmax[0], lmax[1], lmax[2]]
+        ];
+        let wmin = [1e18, 1e18, 1e18];
+        let wmax = [-1e18, -1e18, -1e18];
+        let ci = 0;
+        while ci < 8 {
+            let wp = mat4_transform_point(model_m, corners[ci]);
+            wmin = vec3_min(wmin, wp);
+            wmax = vec3_max(wmax, wp);
+            ci = ci + 1;
+        }
+
+        if not frustum_cull_aabb(frustum, wmin, wmax) {
+            culled_nodes = culled_nodes + 1;
+        } else {
+            let mvp = mat4_mul(vp_m, model_m);
+            let vc = len(m.vertices);
+            let clip_coords = [];
+            let world_pos = [];
+            let world_nrm = [];
+
+            if vc >= gemm_threshold {
+                // Batch homogeneous transform V(N x 4) * MVP^T(4 x 4) via OpenCL/SIMD hpc_gemm!
+                let v_flat = [];
+                let k = 0;
+                while k < vc {
+                    let vv = m.vertices[k];
+                    array_push(v_flat, vv[0]);
+                    array_push(v_flat, vv[1]);
+                    array_push(v_flat, vv[2]);
+                    array_push(v_flat, 1.0);
+                    array_push(world_pos, mat4_transform_point(model_m, vv));
+                    array_push(world_nrm, mat4_transform_dir(model_m, m.normals[k]));
+                    k = k + 1;
+                }
+                let mvp_t = mat4_transpose(mvp);
+                let c_flat = hpc_gemm(v_flat, mvp_t, vc, 4, 4);
+                used_hpc_gemm = true;
+                let k2 = 0;
+                while k2 < vc {
+                    let base = k2 * 4;
+                    array_push(clip_coords, [c_flat[base], c_flat[base + 1], c_flat[base + 2], c_flat[base + 3]]);
+                    k2 = k2 + 1;
+                }
+            } else {
+                let k = 0;
+                while k < vc {
+                    let vv = m.vertices[k];
+                    array_push(world_pos, mat4_transform_point(model_m, vv));
+                    array_push(world_nrm, mat4_transform_dir(model_m, m.normals[k]));
+                    array_push(clip_coords, mat4_transform_vec4(mvp, [vv[0], vv[1], vv[2], 1.0]));
+                    k = k + 1;
+                }
+            }
+
+            let mat = item.material;
+            let ti = 0;
+            while ti < len(m.indices) {
+                let tri = m.indices[ti];
+                let i0 = tri[0]; let i1 = tri[1]; let i2 = tri[2];
+                let c0 = clip_coords[i0];
+                let c1 = clip_coords[i1];
+                let c2 = clip_coords[i2];
+
+                // Near-plane guard
+                if c0[3] > 0.05 and c1[3] > 0.05 and c2[3] > 0.05 {
+                    let inv_w0 = 1.0 / c0[3];
+                    let inv_w1 = 1.0 / c1[3];
+                    let inv_w2 = 1.0 / c2[3];
+
+                    let sx0 = (c0[0] * inv_w0 * 0.5 + 0.5) * width;
+                    let sy0 = (0.5 - c0[1] * inv_w0 * 0.5) * height;
+                    let sz0 = c0[2] * inv_w0;
+
+                    let sx1 = (c1[0] * inv_w1 * 0.5 + 0.5) * width;
+                    let sy1 = (0.5 - c1[1] * inv_w1 * 0.5) * height;
+                    let sz1 = c1[2] * inv_w1;
+
+                    let sx2 = (c2[0] * inv_w2 * 0.5 + 0.5) * width;
+                    let sy2 = (0.5 - c2[1] * inv_w2 * 0.5) * height;
+                    let sz2 = c2[2] * inv_w2;
+
+                    let area = (sx1 - sx0) * (sy2 - sy0) - (sy1 - sy0) * (sx2 - sx0);
+                    if abs(area) > 0.001 {
+                        // Compute per-vertex Cook-Torrance Gouraud/Phong shaded linear colors
+                        let v_cols = [];
+                        let vids = [i0, i1, i2];
+                        let vi_sub = 0;
+                        while vi_sub < 3 {
+                            let vid = vids[vi_sub];
+                            let wp = world_pos[vid];
+                            let wn = world_nrm[vid];
+                            let vdir = vec3_normalize(vec3_sub(cam.eye, wp));
+                            let amb = sc.environment.ambient_intensity * mat.ao;
+                            let vhdr = [
+                                mat.emissive[0] + mat.albedo[0] * amb,
+                                mat.emissive[1] + mat.albedo[1] * amb,
+                                mat.emissive[2] + mat.albedo[2] * amb
+                            ];
+                            let li = 0;
+                            while li < len(sc.lights) {
+                                let lt = sc.lights[li];
+                                let ldir = [0.0, 1.0, 0.0];
+                                let atten = lt.intensity;
+                                if lt.kind == "directional" {
+                                    ldir = vec3_neg(lt.direction);
+                                } else {
+                                    let dl = vec3_sub(lt.position, wp);
+                                    let dsq = max(vec3_len_sq(dl), 0.01);
+                                    ldir = vec3_scale(dl, 1.0 / sqrt(dsq));
+                                    atten = lt.intensity / (1.0 + 0.18 * dsq);
+                                }
+                                let rad = vec3_scale(lt.color, atten);
+                                vhdr = vec3_add(vhdr, eval_pbr_cook_torrance(wn, vdir, ldir, mat.albedo, mat.metallic, mat.roughness, rad));
+                                li = li + 1;
+                            }
+                            array_push(v_cols, linear_to_srgb_u8(tonemap_aces_filmic(vhdr)));
+                            vi_sub = vi_sub + 1;
+                        }
+
+                        if native_raster_fn != nil {
+                            array_push(native_tri_batch, map{
+                                x0: sx0, y0: sy0, z0: sz0, c0: v_cols[0],
+                                x1: sx1, y1: sy1, z1: sz1, c1: v_cols[1],
+                                x2: sx2, y2: sy2, z2: sz2, c2: v_cols[2]
+                            });
+                            drawn_tris = drawn_tris + 1;
+                        } else {
+                            let min_x = _clamp(floor(min(min(sx0, sx1), sx2)), 0, width - 1);
+                            let max_x = _clamp(ceil(max(max(sx0, sx1), sx2)), 0, width - 1);
+                            let min_y = _clamp(floor(min(min(sy0, sy1), sy2)), 0, height - 1);
+                            let max_y = _clamp(ceil(max(max(sy0, sy1), sy2)), 0, height - 1);
+
+                            let inv_area = 1.0 / area;
+                            let col0 = v_cols[0];
+                            let col1 = v_cols[1];
+                            let col2 = v_cols[2];
+
+                            let py = min_y;
+                            while py <= max_y {
+                                let sample_y = py + 0.5;
+                                let px = min_x;
+                                while px <= max_x {
+                                    let sample_x = px + 0.5;
+                                    let w0 = ((sx1 - sample_x) * (sy2 - sample_y) - (sy1 - sample_y) * (sx2 - sample_x)) * inv_area;
+                                    let w1 = ((sx2 - sample_x) * (sy0 - sample_y) - (sy2 - sample_y) * (sx0 - sample_x)) * inv_area;
+                                    let w2 = 1.0 - w0 - w1;
+                                    if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0 {
+                                        let z = w0 * sz0 + w1 * sz1 + w2 * sz2;
+                                        let pidx = py * width + px;
+                                        if z < f64buf_get(zbuf, pidx) {
+                                            f64buf_set(zbuf, pidx, z);
+                                            let r8 = floor(w0 * col0[0] + w1 * col1[0] + w2 * col2[0] + 0.5);
+                                            let g8 = floor(w0 * col0[1] + w1 * col1[1] + w2 * col2[1] + 0.5);
+                                            let b8 = floor(w0 * col0[2] + w1 * col1[2] + w2 * col2[2] + 0.5);
+                                            let boff = pidx * 4;
+                                            bytes_set(rgba, boff, _clamp(r8, 0, 255));
+                                            bytes_set(rgba, boff + 1, _clamp(g8, 0, 255));
+                                            bytes_set(rgba, boff + 2, _clamp(b8, 0, 255));
+                                            bytes_set(rgba, boff + 3, 255);
+                                        }
+                                    }
+                                    px = px + 1;
+                                }
+                                py = py + 1;
+                            }
+                            drawn_tris = drawn_tris + 1;
+                        }
+                    }
+                }
+                ti = ti + 1;
+            }
+        }
+        di = di + 1;
+    }
+
+    if native_raster_fn != nil and len(native_tri_batch) > 0 {
+        try {
+            native_raster_fn(rgba, zbuf, width, height, native_tri_batch);
+            used_native_raster = true;
+        } catch _nre {
+            used_native_raster = false;
+        }
+    }
+
+    let elapsed = now_ms() - t0;
+    return map{
+        ok: true,
+        width: width,
+        height: height,
+        rgba_bytes: rgba,
+        drawn_triangles: drawn_tris,
+        frustum_culled_nodes: culled_nodes,
+        used_hpc_gemm: used_hpc_gemm,
+        used_native_raster: used_native_raster,
+        elapsed_ms: elapsed
+    };
+}
+
+fn _write_u16_le(b, off, val) {
+    let v = floor(val);
+    bytes_set(b, off, bit_and(v, 255));
+    bytes_set(b, off + 1, bit_and(bit_shr(v, 8), 255));
+}
+
+fn _write_u32_le(b, off, val) {
+    let v = floor(val);
+    bytes_set(b, off, bit_and(v, 255));
+    bytes_set(b, off + 1, bit_and(bit_shr(v, 8), 255));
+    bytes_set(b, off + 2, bit_and(bit_shr(v, 16), 255));
+    bytes_set(b, off + 3, bit_and(bit_shr(v, 24), 255));
+}
+
+// Encodes RGBA byte buffer into uncompressed 24-bit Windows BMP bytes
+fn encode_rgba_to_bmp(rgba_bytes, width, height) {
+    let row_stride = floor((width * 3 + 3) / 4) * 4;
+    let img_size = row_stride * height;
+    let file_size = 54 + img_size;
+    let bmp = bytes_new(file_size);
+
+    // 'BM' signature + 14-byte BITMAPFILEHEADER
+    bytes_set(bmp, 0, 66);
+    bytes_set(bmp, 1, 77);
+    _write_u32_le(bmp, 2, file_size);
+    _write_u32_le(bmp, 6, 0);
+    _write_u32_le(bmp, 10, 54);
+
+    // 40-byte BITMAPINFOHEADER
+    _write_u32_le(bmp, 14, 40);
+    _write_u32_le(bmp, 18, width);
+    _write_u32_le(bmp, 22, height);
+    _write_u16_le(bmp, 26, 1);
+    _write_u16_le(bmp, 28, 24);
+    _write_u32_le(bmp, 30, 0);
+    _write_u32_le(bmp, 34, img_size);
+    _write_u32_le(bmp, 38, 2835);
+    _write_u32_le(bmp, 42, 2835);
+    _write_u32_le(bmp, 46, 0);
+    _write_u32_le(bmp, 50, 0);
+
+    // Bottom-up BGR rows
+    let y = 0;
+    while y < height {
+        let src_y = (height - 1) - y;
+        let dst_row = 54 + y * row_stride;
+        let x = 0;
+        while x < width {
+            let soff = (src_y * width + x) * 4;
+            let doff = dst_row + x * 3;
+            bytes_set(bmp, doff, bytes_get(rgba_bytes, soff + 2));     // B
+            bytes_set(bmp, doff + 1, bytes_get(rgba_bytes, soff + 1)); // G
+            bytes_set(bmp, doff + 2, bytes_get(rgba_bytes, soff));     // R
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return bmp;
+}
+
+// Projected 3D PBR-shaded crisp vector SVG renderer
+fn render_scene_svg(sc, width = 800, height = 500) {
+    let cam = sc.camera;
+    let aspect = width / max(1.0, height * 1.0);
+    let vp_m = mat4_mul(
+        perspective_fov(cam.fov_y_deg * PI / 180.0, aspect, cam.z_near, cam.z_far),
+        look_at(cam.eye, cam.target, cam.up)
+    );
+
+    let prims = _extract_world_primitives(sc);
+    let polys = [];
+
+    let pi = 0;
+    while pi < len(prims) {
+        let pr = prims[pi];
+        if pr.kind == "triangle" {
+            let c0 = mat4_transform_vec4(vp_m, [pr.v0[0], pr.v0[1], pr.v0[2], 1.0]);
+            let c1 = mat4_transform_vec4(vp_m, [pr.v1[0], pr.v1[1], pr.v1[2], 1.0]);
+            let c2 = mat4_transform_vec4(vp_m, [pr.v2[0], pr.v2[1], pr.v2[2], 1.0]);
+            if c0[3] > 0.1 and c1[3] > 0.1 and c2[3] > 0.1 {
+                let x0 = (c0[0] / c0[3] * 0.5 + 0.5) * width;
+                let y0 = (0.5 - c0[1] / c0[3] * 0.5) * height;
+                let x1 = (c1[0] / c1[3] * 0.5 + 0.5) * width;
+                let y1 = (0.5 - c1[1] / c1[3] * 0.5) * height;
+                let x2 = (c2[0] / c2[3] * 0.5 + 0.5) * width;
+                let y2 = (0.5 - c2[1] / c2[3] * 0.5) * height;
+                let depth_avg = (c0[3] + c1[3] + c2[3]) / 3.0;
+                let nrm = vec3_normalize(vec3_add(vec3_add(pr.n0, pr.n1), pr.n2));
+                let vdir = vec3_normalize(vec3_sub(cam.eye, pr.centroid));
+                let hdr = vec3_scale(pr.material.albedo, sc.environment.ambient_intensity);
+                if len(sc.lights) > 0 {
+                    let lt = sc.lights[0];
+                    let ldir = vec3_normalize(vec3_sub(lt.position, pr.centroid));
+                    hdr = vec3_add(hdr, eval_pbr_cook_torrance(nrm, vdir, ldir, pr.material.albedo, pr.material.metallic, pr.material.roughness, vec3_scale(lt.color, lt.intensity * 0.15)));
+                }
+                let rgb = linear_to_srgb_u8(tonemap_aces_filmic(hdr));
+                array_push(polys, map{
+                    depth: depth_avg,
+                    svg: "<polygon points=\"" + _fmt_num(x0) + "," + _fmt_num(y0) + " " + _fmt_num(x1) + "," + _fmt_num(y1) + " " + _fmt_num(x2) + "," + _fmt_num(y2) + "\" fill=\"rgb(" + str(rgb[0]) + "," + str(rgb[1]) + "," + str(rgb[2]) + ")\" stroke=\"rgba(0,0,0,0.12)\" stroke-width=\"0.5\"/>"
+                });
+            }
+        } else {
+            let cs = mat4_transform_vec4(vp_m, [pr.center[0], pr.center[1], pr.center[2], 1.0]);
+            if cs[3] > 0.1 {
+                let sx = (cs[0] / cs[3] * 0.5 + 0.5) * width;
+                let sy = (0.5 - cs[1] / cs[3] * 0.5) * height;
+                let sr = max(2.0, (pr.radius / cs[3]) * height * 0.85);
+                let rgb2 = linear_to_srgb_u8(pr.material.albedo);
+                array_push(polys, map{
+                    depth: cs[3],
+                    svg: "<circle cx=\"" + _fmt_num(sx) + "\" cy=\"" + _fmt_num(sy) + "\" r=\"" + _fmt_num(sr) + "\" fill=\"rgb(" + str(rgb2[0]) + "," + str(rgb2[1]) + "," + str(rgb2[2]) + ")\"/>"
+                });
+            }
+        }
+        pi = pi + 1;
+    }
+
+    // Painter's depth sort (far to near)
+    let n = len(polys);
+    let a = 0;
+    while a < n {
+        let b = a + 1;
+        while b < n {
+            if polys[b].depth > polys[a].depth {
+                let tmp = polys[a];
+                polys[a] = polys[b];
+                polys[b] = tmp;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+
+    let out = [
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + str(width) + "\" height=\"" + str(height) + "\" viewBox=\"0 0 " + str(width) + " " + str(height) + "\">",
+        "<defs><linearGradient id=\"skyGrad\" x1=\"0\" y1=\"0\" x2=\"0\" y2=\"1\"><stop offset=\"0%\" stop-color=\"#1a3878\"/><stop offset=\"100%\" stop-color=\"#85a8d6\"/></linearGradient></defs>",
+        "<rect width=\"100%\" height=\"100%\" fill=\"url(#skyGrad)\"/>"
+    ];
+    let k = 0;
+    while k < n {
+        array_push(out, polys[k].svg);
+        k = k + 1;
+    }
+    array_push(out, "</svg>");
+    return str_join(out, "\n");
+}
+
+// Zero-Dependency Interactive WebGPU (WGSL) + WebGL2 (#version 300 es GLSL) Cook-Torrance PBR HTML5 Bundle
+fn export_scene_webgpu_html(sc, opts = nil) {
+    opts = _opts(opts);
+    let title_s = _html_escape(_get(sc, "title", "PBLang Sovereign 3D WebGPU/WebGL2 Viewport"));
+
+    // Flatten scene triangles for GPU upload
+    let gpu_verts = []; // [x,y,z, nx,ny,nz, r,g,b, metallic, roughness]
+    let prims = _extract_world_primitives(sc);
+    let pi = 0;
+    while pi < len(prims) {
+        let pr = prims[pi];
+        if pr.kind == "triangle" {
+            let mat = pr.material;
+            let vs = [pr.v0, pr.v1, pr.v2];
+            let ns = [pr.n0, pr.n1, pr.n2];
+            let k = 0;
+            while k < 3 {
+                let vv = vs[k];
+                let nn = ns[k];
+                array_push(gpu_verts, round(vv[0] * 10000.0) / 10000.0);
+                array_push(gpu_verts, round(vv[1] * 10000.0) / 10000.0);
+                array_push(gpu_verts, round(vv[2] * 10000.0) / 10000.0);
+                array_push(gpu_verts, round(nn[0] * 10000.0) / 10000.0);
+                array_push(gpu_verts, round(nn[1] * 10000.0) / 10000.0);
+                array_push(gpu_verts, round(nn[2] * 10000.0) / 10000.0);
+                array_push(gpu_verts, mat.albedo[0]);
+                array_push(gpu_verts, mat.albedo[1]);
+                array_push(gpu_verts, mat.albedo[2]);
+                array_push(gpu_verts, mat.metallic);
+                array_push(gpu_verts, mat.roughness);
+                k = k + 1;
+            }
+        }
+        pi = pi + 1;
+    }
+
+    let payload = json_stringify(map{
+        camera: sc.camera,
+        lights: sc.lights,
+        spheres: sc.spheres,
+        vertexStrideFloats: 11,
+        vertices: gpu_verts
+    });
+
+    let wgsl_shader = str_join([
+        "struct Uniforms { mvp: mat4x4<f32>, eye: vec4<f32>, lightPos: vec4<f32>, lightCol: vec4<f32> };",
+        "@group(0) @binding(0) var<uniform> u: Uniforms;",
+        "struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) wPos: vec3<f32>, @location(1) wNrm: vec3<f32>, @location(2) albedo: vec3<f32>, @location(3) mr: vec2<f32> };",
+        "@vertex fn vs_main(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) alb: vec3<f32>, @location(3) mr: vec2<f32>) -> VSOut {",
+        "  var o: VSOut; o.pos = u.mvp * vec4<f32>(p, 1.0); o.wPos = p; o.wNrm = n; o.albedo = alb; o.mr = mr; return o;",
+        "}",
+        "@fragment fn fs_main(in: VSOut) -> @location(0) vec4<f32> {",
+        "  let N = normalize(in.wNrm); let V = normalize(u.eye.xyz - in.wPos); let L = normalize(u.lightPos.xyz - in.wPos);",
+        "  let H = normalize(V + L); let NdotL = max(dot(N, L), 0.0); let NdotV = max(dot(N, V), 0.001); let NdotH = max(dot(N, H), 0.0);",
+        "  let a = max(in.mr.y * in.mr.y, 0.001); let a2 = a * a; let denom = NdotH * NdotH * (a2 - 1.0) + 1.0;",
+        "  let D = a2 / (3.14159265 * denom * denom);",
+        "  let k = ((in.mr.y + 1.0) * (in.mr.y + 1.0)) / 8.0;",
+        "  let G = (NdotV / (NdotV * (1.0 - k) + k)) * (NdotL / (NdotL * (1.0 - k) + k));",
+        "  let F0 = mix(vec3<f32>(0.04), in.albedo, in.mr.x);",
+        "  let F = F0 + (vec3<f32>(1.0) - F0) * pow(1.0 - max(dot(H, V), 0.0), 5.0);",
+        "  let spec = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);",
+        "  let kD = (vec3<f32>(1.0) - F) * (1.0 - in.mr.x);",
+        "  var col = in.albedo * 0.14 + (kD * in.albedo / 3.14159265 + spec) * u.lightCol.xyz * NdotL;",
+        "  col = clamp((col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14), vec3<f32>(0.0), vec3<f32>(1.0));",
+        "  return vec4<f32>(pow(col, vec3<f32>(1.0 / 2.2)), 1.0);",
+        "}"
+    ], "\n");
+
+    let glsl_vs = str_join([
+        "#version 300 es",
+        "precision highp float;",
+        "layout(location=0) in vec3 aPos;",
+        "layout(location=1) in vec3 aNrm;",
+        "layout(location=2) in vec3 aAlbedo;",
+        "layout(location=3) in vec2 aMR;",
+        "uniform mat4 uMVP;",
+        "out vec3 vPos; out vec3 vNrm; out vec3 vAlbedo; out vec2 vMR;",
+        "void main() { vPos = aPos; vNrm = aNrm; vAlbedo = aAlbedo; vMR = aMR; gl_Position = uMVP * vec4(aPos, 1.0); }"
+    ], "\n");
+
+    let glsl_fs = str_join([
+        "#version 300 es",
+        "precision highp float;",
+        "in vec3 vPos; in vec3 vNrm; in vec3 vAlbedo; in vec2 vMR;",
+        "uniform vec3 uEye; uniform vec3 uLightPos; uniform vec3 uLightCol;",
+        "out vec4 fragColor;",
+        "void main() {",
+        "  vec3 N = normalize(vNrm); vec3 V = normalize(uEye - vPos); vec3 L = normalize(uLightPos - vPos);",
+        "  vec3 H = normalize(V + L); float NdotL = max(dot(N, L), 0.0); float NdotV = max(dot(N, V), 0.001); float NdotH = max(dot(N, H), 0.0);",
+        "  float a = max(vMR.y * vMR.y, 0.001); float a2 = a * a; float d = NdotH * NdotH * (a2 - 1.0) + 1.0;",
+        "  float D = a2 / (3.14159265 * d * d);",
+        "  float k = ((vMR.y + 1.0) * (vMR.y + 1.0)) / 8.0;",
+        "  float G = (NdotV / (NdotV * (1.0 - k) + k)) * (NdotL / (NdotL * (1.0 - k) + k));",
+        "  vec3 F0 = mix(vec3(0.04), vAlbedo, vMR.x);",
+        "  vec3 F = F0 + (vec3(1.0) - F0) * pow(1.0 - max(dot(H, V), 0.0), 5.0);",
+        "  vec3 spec = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);",
+        "  vec3 kD = (vec3(1.0) - F) * (1.0 - vMR.x);",
+        "  vec3 col = vAlbedo * 0.14 + (kD * vAlbedo / 3.14159265 + spec) * uLightCol * NdotL;",
+        "  col = clamp((col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14), 0.0, 1.0);",
+        "  fragColor = vec4(pow(col, vec3(1.0 / 2.2)), 1.0);",
+        "}"
+    ], "\n");
+
+    return str_join([
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\"/>\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"/>\n",
+        "<title>" + title_s + "</title>\n",
+        "<style>html,body{margin:0;height:100%;background:#0b0f17;color:#e8f0f8;font-family:system-ui,sans-serif;overflow:hidden}#hud{position:fixed;top:12px;left:12px;background:rgba(14,20,30,0.86);border:1px solid #283a4e;padding:10px 14px;border-radius:8px;font-size:13px;z-index:10}canvas{width:100vw;height:100vh;display:block}</style>\n",
+        "</head>\n<body>\n",
+        "<div id=\"hud\"><b>" + title_s + "</b><br/><span id=\"apiTag\">Initializing WebGPU / WebGL2 Cook-Torrance PBR...</span><br/><small>Drag mouse to orbit • Scroll wheel to zoom</small></div>\n",
+        "<canvas id=\"gfxCanvas\"></canvas>\n",
+        "<script id=\"wgslSrc\" type=\"text/plain\">\n" + wgsl_shader + "\n</script>\n",
+        "<script id=\"glslVS\" type=\"text/plain\">\n" + glsl_vs + "\n</script>\n",
+        "<script id=\"glslFS\" type=\"text/plain\">\n" + glsl_fs + "\n</script>\n",
+        "<script>\nconst SCENE_DATA = " + payload + ";\n",
+        "const canvas = document.getElementById('gfxCanvas'); const apiTag = document.getElementById('apiTag');\n",
+        "let yaw = 0.45, pitch = 0.32, dist = 7.5, dragging = false, lx = 0, ly = 0;\n",
+        "canvas.addEventListener('pointerdown', e => { dragging = true; lx = e.clientX; ly = e.clientY; });\n",
+        "window.addEventListener('pointerup', () => dragging = false);\n",
+        "window.addEventListener('pointermove', e => { if(!dragging) return; yaw -= (e.clientX - lx)*0.008; pitch = Math.max(-1.4, Math.min(1.4, pitch + (e.clientY - ly)*0.008)); lx = e.clientX; ly = e.clientY; });\n",
+        "canvas.addEventListener('wheel', e => { dist = Math.max(2.0, Math.min(40.0, dist + e.deltaY * 0.005)); });\n",
+        "function matMul(a,b){const o=new Float32Array(16);for(let c=0;c<4;c++)for(let r=0;r<4;r++)o[c*4+r]=a[r]*b[c*4]+a[4+r]*b[c*4+1]+a[8+r]*b[c*4+2]+a[12+r]*b[c*4+3];return o;}\n",
+        "function persp(fovy,asp,n,f){const t=1/Math.tan(fovy/2),nf=1/(n-f);return new Float32Array([t/asp,0,0,0, 0,t,0,0, 0,0,(f+n)*nf,-1, 0,0,2*f*n*nf,0]);}\n",
+        "function lookAt(e,c,u){let fx=c[0]-e[0],fy=c[1]-e[1],fz=c[2]-e[2],fl=Math.hypot(fx,fy,fz)||1;fx/=fl;fy/=fl;fz/=fl;let sx=fy*u[2]-fz*u[1],sy=fz*u[0]-fx*u[2],sz=fx*u[1]-fy*u[0],sl=Math.hypot(sx,sy,sz)||1;sx/=sl;sy/=sl;sz/=sl;let ux=sy*fz-sz*fy,uy=sz*fx-sx*fz,uz=sx*fy-sy*fx;return new Float32Array([sx,ux,-fx,0, sy,uy,-fy,0, sz,uz,-fz,0, -(sx*e[0]+sy*e[1]+sz*e[2]),-(ux*e[0]+uy*e[1]+uz*e[2]),fx*e[0]+fy*e[1]+fz*e[2],1]);}\n",
+        "function initWebGL2(){const gl=canvas.getContext('webgl2');if(!gl){apiTag.textContent='Headless / No GPU context';return;}apiTag.textContent='Active Backend: WebGL2 (#version 300 es Cook-Torrance PBR)';const mk=(t,s)=>{const sh=gl.createShader(t);gl.shaderSource(sh,s);gl.compileShader(sh);return sh;};const prg=gl.createProgram();gl.attachShader(prg,mk(gl.VERTEX_SHADER,document.getElementById('glslVS').textContent.trim()));gl.attachShader(prg,mk(gl.FRAGMENT_SHADER,document.getElementById('glslFS').textContent.trim()));gl.linkProgram(prg);gl.useProgram(prg);const vbo=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vbo);const arr=new Float32Array(SCENE_DATA.vertices);gl.bufferData(gl.ARRAY_BUFFER,arr,gl.STATIC_DRAW);const st=44;gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,st,0);gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,st,12);gl.enableVertexAttribArray(2);gl.vertexAttribPointer(2,3,gl.FLOAT,false,st,24);gl.enableVertexAttribArray(3);gl.vertexAttribPointer(3,2,gl.FLOAT,false,st,36);gl.enable(gl.DEPTH_TEST);const cnt=arr.length/11;const lt=SCENE_DATA.lights[0]||{position:[4,6,4],color:[1,1,1],intensity:15};function frame(){canvas.width=innerWidth;canvas.height=innerHeight;gl.viewport(0,0,canvas.width,canvas.height);gl.clearColor(0.06,0.09,0.14,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);const tgt=SCENE_DATA.camera.target;const eye=[tgt[0]+dist*Math.cos(pitch)*Math.sin(yaw),tgt[1]+dist*Math.sin(pitch),tgt[2]+dist*Math.cos(pitch)*Math.cos(yaw)];const mvp=matMul(persp(0.87,canvas.width/Math.max(1,canvas.height),0.1,200),lookAt(eye,tgt,[0,1,0]));gl.uniformMatrix4fv(gl.getUniformLocation(prg,'uMVP'),false,mvp);gl.uniform3fv(gl.getUniformLocation(prg,'uEye'),eye);gl.uniform3fv(gl.getUniformLocation(prg,'uLightPos'),lt.position);gl.uniform3f(gl.getUniformLocation(prg,'uLightCol'),lt.color[0]*3.0,lt.color[1]*3.0,lt.color[2]*3.0);if(cnt>0)gl.drawArrays(gl.TRIANGLES,0,cnt);requestAnimationFrame(frame);}requestAnimationFrame(frame);}\n",
+        "async function boot(){if(navigator.gpu){try{const ad=await navigator.gpu.requestAdapter();if(ad){apiTag.textContent='Active Backend: WebGPU WGSL + WebGL2 Ready';}}catch(_e){}}initWebGL2();}\nboot();\n",
+        "</script>\n</body>\n</html>\n"
+    ], "");
+}
+
+// ============================================================================
+// 7. 3D Rigid-Body Physics Engine (`physics_world_new`, `physics_add_body`, `physics_step`)
+// ============================================================================
+
+fn physics_world_new(opts = nil) {
+    opts = _opts(opts);
+    return map{
+        format: "pblang.gfx3d.physics.v1",
+        gravity: _get(opts, "gravity", [0.0, -9.81, 0.0]),
+        ground_enabled: _get(opts, "ground_enabled", true),
+        ground_y: _get(opts, "ground_y", 0.0),
+        ground_restitution: _saturate(_get(opts, "ground_restitution", 0.75)),
+        ground_friction: _saturate(_get(opts, "ground_friction", 0.25)),
+        substeps: max(1, floor(_get(opts, "substeps", 4))),
+        time_elapsed: 0.0,
+        collision_events: 0,
+        bodies: []
+    };
+}
+
+fn physics_add_body(world, body_opts) {
+    body_opts = _opts(body_opts);
+    let mass = _get(body_opts, "mass", 1.0);
+    let is_static = _get(body_opts, "is_static", mass <= 0.0);
+    let inv_mass = 0.0;
+    if not is_static and mass > 0.0 {
+        inv_mass = 1.0 / mass;
+    }
+    let radius = max(0.001, _get(body_opts, "radius", 0.5));
+    // Solid sphere moment of inertia: I = (2/5) m r^2
+    let inv_inertia = 0.0;
+    if inv_mass > 0.0 {
+        inv_inertia = 1.0 / (0.4 * mass * radius * radius);
+    }
+
+    let body = map{
+        id: _get(body_opts, "id", "body_" + str(len(world.bodies))),
+        position: _get(body_opts, "position", [0.0, 2.0, 0.0]),
+        velocity: _get(body_opts, "velocity", [0.0, 0.0, 0.0]),
+        angular_velocity: _get(body_opts, "angular_velocity", [0.0, 0.0, 0.0]),
+        orientation: quat_normalize(_get(body_opts, "orientation", quat_identity())),
+        mass: mass,
+        inv_mass: inv_mass,
+        inv_inertia: inv_inertia,
+        radius: radius,
+        restitution: _saturate(_get(body_opts, "restitution", 0.8)),
+        friction: _saturate(_get(body_opts, "friction", 0.25)),
+        linear_damping: _saturate(_get(body_opts, "linear_damping", 0.0)),
+        is_static: is_static
+    };
+    array_push(world.bodies, body);
+    return body;
+}
+
+fn _step_world_once(world, h) {
+    let g = world.gravity;
+    let bodies = world.bodies;
+    let nb = len(bodies);
+
+    // 1. Symplectic / Semi-Implicit Euler integration
+    let i = 0;
+    while i < nb {
+        let b = bodies[i];
+        if not b.is_static and b.inv_mass > 0.0 {
+            b.velocity = vec3_add(b.velocity, vec3_scale(g, h));
+            if b.linear_damping > 0.0 {
+                let damp = max(0.0, 1.0 - b.linear_damping * h);
+                b.velocity = vec3_scale(b.velocity, damp);
+            }
+            b.position = vec3_add(b.position, vec3_scale(b.velocity, h));
+
+            let w = b.angular_velocity;
+            let w_len = vec3_len(w);
+            if w_len > 1e-8 {
+                let dq = quat_from_axis_angle(w, w_len * h);
+                b.orientation = quat_normalize(quat_mul(dq, b.orientation));
+            }
+        }
+        i = i + 1;
+    }
+
+    // 2. Sphere vs Ground Plane (y = ground_y, normal = [0, 1, 0]) impulse + Coulomb friction
+    if world.ground_enabled {
+        let gy = world.ground_y;
+        let k = 0;
+        while k < nb {
+            let b = bodies[k];
+            if not b.is_static and b.inv_mass > 0.0 {
+                let pen = (gy + b.radius) - b.position[1];
+                if pen > 0.0 {
+                    b.position = [b.position[0], gy + b.radius, b.position[2]];
+                    let vn = b.velocity[1];
+                    if vn < 0.0 {
+                        let e = min(b.restitution, world.ground_restitution);
+                        let jn = -(1.0 + e) * vn / b.inv_mass;
+                        b.velocity = [b.velocity[0], b.velocity[1] + jn * b.inv_mass, b.velocity[2]];
+
+                        // Tangential Coulomb friction impulse
+                        let vt = [b.velocity[0], 0.0, b.velocity[2]];
+                        let vt_len = vec3_len(vt);
+                        if vt_len > 1e-8 {
+                            let t_dir = vec3_scale(vt, 1.0 / vt_len);
+                            let mu = sqrt(b.friction * world.ground_friction);
+                            let jt_mag = min(vt_len / b.inv_mass, mu * jn);
+                            let jt = vec3_scale(t_dir, -jt_mag);
+                            b.velocity = vec3_add(b.velocity, vec3_scale(jt, b.inv_mass));
+                            let r_arm = [0.0, -b.radius, 0.0];
+                            let torque_imp = vec3_cross(r_arm, jt);
+                            b.angular_velocity = vec3_add(b.angular_velocity, vec3_scale(torque_imp, b.inv_inertia));
+                        }
+                        world.collision_events = world.collision_events + 1;
+                    }
+                }
+            }
+            k = k + 1;
+        }
+    }
+
+    // 3. Pairwise Sphere-Sphere Impulse + Coulomb Friction Resolution
+    let a = 0;
+    while a < nb {
+        let ba = bodies[a];
+        let b_idx = a + 1;
+        while b_idx < nb {
+            let bb = bodies[b_idx];
+            let inv_sum = ba.inv_mass + bb.inv_mass;
+            if inv_sum > 0.0 {
+                let delta = vec3_sub(bb.position, ba.position);
+                let dist_sq = vec3_len_sq(delta);
+                let r_sum = ba.radius + bb.radius;
+                if dist_sq < r_sum * r_sum {
+                    let dist = sqrt(max(dist_sq, 1e-12));
+                    let nrm = [0.0, 1.0, 0.0];
+                    if dist > 1e-6 {
+                        nrm = vec3_scale(delta, 1.0 / dist);
+                    }
+                    let pen = r_sum - dist;
+                    // Positional separation proportional to inverse mass
+                    let corr = pen / inv_sum;
+                    ba.position = vec3_sub(ba.position, vec3_scale(nrm, corr * ba.inv_mass));
+                    bb.position = vec3_add(bb.position, vec3_scale(nrm, corr * bb.inv_mass));
+
+                    let v_rel = vec3_sub(bb.velocity, ba.velocity);
+                    let vn_rel = vec3_dot(v_rel, nrm);
+                    if vn_rel < 0.0 {
+                        let e_pair = min(ba.restitution, bb.restitution);
+                        let jn = -(1.0 + e_pair) * vn_rel / inv_sum;
+                        let imp_n = vec3_scale(nrm, jn);
+                        ba.velocity = vec3_sub(ba.velocity, vec3_scale(imp_n, ba.inv_mass));
+                        bb.velocity = vec3_add(bb.velocity, vec3_scale(imp_n, bb.inv_mass));
+
+                        // Coulomb tangential friction
+                        let vt_vec = vec3_sub(v_rel, vec3_scale(nrm, vn_rel));
+                        let vt_len = vec3_len(vt_vec);
+                        if vt_len > 1e-8 {
+                            let t_hat = vec3_scale(vt_vec, 1.0 / vt_len);
+                            let mu_pair = sqrt(ba.friction * bb.friction);
+                            let jt_mag = min(vt_len / inv_sum, mu_pair * jn);
+                            let imp_t = vec3_scale(t_hat, -jt_mag);
+                            ba.velocity = vec3_sub(ba.velocity, vec3_scale(imp_t, ba.inv_mass));
+                            bb.velocity = vec3_add(bb.velocity, vec3_scale(imp_t, bb.inv_mass));
+                        }
+                        world.collision_events = world.collision_events + 1;
+                    }
+                }
+            }
+            b_idx = b_idx + 1;
+        }
+        a = a + 1;
+    }
+}
+
+fn physics_step(world, dt) {
+    let subs = max(1, world.substeps);
+    let h = dt / subs;
+    let s = 0;
+    while s < subs {
+        _step_world_once(world, h);
+        s = s + 1;
+    }
+    world.time_elapsed = world.time_elapsed + dt;
+    return world;
+}
+
+fn physics_total_energy(world) {
+    let ke = 0.0;
+    let pe = 0.0;
+    let g_mag = abs(world.gravity[1]);
+    let gy = world.ground_y;
+    let i = 0;
+    while i < len(world.bodies) {
+        let b = world.bodies[i];
+        if not b.is_static and b.inv_mass > 0.0 {
+            ke = ke + 0.5 * b.mass * vec3_len_sq(b.velocity);
+            pe = pe + b.mass * g_mag * max(0.0, (b.position[1] - b.radius) - gy);
+        }
+        i = i + 1;
+    }
+    return map{
+        kinetic: ke,
+        potential: pe,
+        total: ke + pe
+    };
+}
+
+export GFX3D_ENGINE_VERSION, PI, TWO_PI,
+       probe_gpu_3d_backends,
+       vec3, vec4, vec3_add, vec3_sub, vec3_scale, vec3_mul, vec3_neg,
+       vec3_dot, vec3_cross, vec3_len_sq, vec3_len, vec3_normalize,
+       vec3_lerp, vec3_reflect, vec3_min, vec3_max, vec4_dot,
+       quat, quat_identity, quat_normalize, quat_from_axis_angle, quat_from_euler,
+       quat_conjugate, quat_mul, quat_rotate_vec3, quat_slerp,
+       mat4_identity, mat4_transpose, mat4_mul, mat4_transform_vec4,
+       mat4_transform_point, mat4_transform_dir, trs_matrix, look_at, perspective_fov,
+       extract_frustum_planes, frustum_cull_aabb,
+       compute_mesh_bounds_and_normals, mesh_cube, mesh_plane, mesh_uv_sphere, mesh_torus,
+       parse_obj_mesh, export_obj_mesh,
+       pbr_material, scene3d_new, scene3d_set_camera, scene3d_add_mesh_node,
+       scene3d_add_sphere_node, scene3d_add_light, export_gltf2_json,
+       ndf_ggx, geometry_schlick_ggx, geometry_smith, fresnel_schlick,
+       eval_pbr_cook_torrance, tonemap_reinhard, tonemap_aces_filmic, linear_to_srgb_u8,
+       ray_intersect_aabb, ray_intersect_triangle, ray_intersect_sphere,
+       build_bvh, bvh_trace_ray, bvh_occluded, raytrace_scene,
+       render_scene_raster, encode_rgba_to_bmp, render_scene_svg, export_scene_webgpu_html,
+       physics_world_new, physics_add_body, physics_step, physics_total_energy;

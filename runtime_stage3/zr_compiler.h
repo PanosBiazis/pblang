@@ -208,6 +208,13 @@ static bool zr_preprocess_sapp(const char *raw,
             while (p < raw_len && (isalnum((unsigned char)buf[p]) || buf[p] == '_' ||
                                    buf[p] == '+' || buf[p] == '-' || buf[p] == '#' || buf[p] == '.')) p++;
             char *lang = zr_xstrndup(buf + i + 1, p - (i + 1));
+            if (strcmp(lang, "nogc") == 0 || strcmp(lang, "packed") == 0 ||
+                strcmp(lang, "inline") == 0 || strcmp(lang, "isr") == 0 ||
+                strcmp(lang, "interrupt") == 0 || strcmp(lang, "aligned") == 0) {
+                free(lang);
+                i = p;
+                continue;
+            }
 
             while (p < raw_len && (buf[p] == ' ' || buf[p] == '\t')) p++;
             char *bname = NULL;
@@ -341,7 +348,7 @@ typedef enum {
     TOK_EQ, TOK_EQEQ, TOK_BANGEQ, TOK_LT, TOK_LTEQ, TOK_GT, TOK_GTEQ,
     TOK_AMP, TOK_PIPE, TOK_CARET, TOK_TILDE, TOK_SHL, TOK_SHR,
     TOK_BANG, TOK_QMARK, TOK_QDOT, TOK_QLBRACK, TOK_QQ,
-    TOK_PIPEGT, TOK_ARROW, TOK_FATARROW
+    TOK_PIPEGT, TOK_ARROW, TOK_FATARROW, TOK_AT
 } ZrTokKind;
 
 typedef struct {
@@ -786,6 +793,7 @@ static bool zr_lex_all(ZrLexer *lx) {
             case '~': k1 = TOK_TILDE;   s1 = "~"; break;
             case '!': k1 = TOK_BANG;    s1 = "!"; break;
             case '?': k1 = TOK_QMARK;   s1 = "?"; break;
+            case '@': k1 = TOK_AT;      s1 = "@"; break;
             default:
                 snprintf(lx->err, sizeof(lx->err), "line %u: unexpected character '%c' (0x%02x)", tline, c, (unsigned char)c);
                 return false;
@@ -2799,6 +2807,17 @@ static ZrStmt *zp_parse_class_stmt(ZrParser *p, uint32_t line) {
     }
 
     while (!zp_check(p, TOK_RBRACE) && !zp_check(p, TOK_EOF)) {
+        while (zp_match(p, TOK_AT)) {
+            if (!zp_expect_any_name(p, "attribute name")) return NULL;
+            if (zp_match(p, TOK_LPAREN)) {
+                int ad = 1;
+                while (ad > 0 && !zp_check(p, TOK_EOF)) {
+                    if (zp_match(p, TOK_LPAREN)) ad++;
+                    else if (zp_match(p, TOK_RPAREN)) ad--;
+                    else zp_advance(p);
+                }
+            }
+        }
         zp_match(p, TOK_FN); /* optional `fn` keyword inside class body */
         const char *mname = zp_expect_any_name(p, "method name");
         if (!mname) return NULL;
@@ -3087,6 +3106,19 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
         }
     }
 
+    while (zp_match(p, TOK_AT)) {
+        if (!zp_expect_any_name(p, "attribute name")) { p->depth--; return NULL; }
+        if (zp_match(p, TOK_LPAREN)) {
+            int ad = 1;
+            while (ad > 0 && !zp_check(p, TOK_EOF)) {
+                if (zp_match(p, TOK_LPAREN)) ad++;
+                else if (zp_match(p, TOK_RPAREN)) ad--;
+                else zp_advance(p);
+            }
+        }
+        t = zp_peek(p);
+    }
+
     switch (t->kind) {
         case TOK_LET:
             zp_advance(p);
@@ -3160,6 +3192,54 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
         }
         case TOK_FOR: {
             zp_advance(p);
+            if (zp_match(p, TOK_LPAREN)) {
+                /* C-style `for (init; cond; step) { body }` -> `{ init; while (cond) { body...; step; } }` */
+                ZrStmt *init_st = NULL;
+                if (!zp_check(p, TOK_SEMI)) {
+                    init_st = zp_parse_stmt(p);
+                    if (!init_st) break;
+                }
+                zp_match(p, TOK_SEMI);
+                ZrExpr *cond_e = NULL;
+                if (!zp_check(p, TOK_SEMI)) {
+                    cond_e = zp_parse_expr(p);
+                    if (!cond_e) break;
+                } else {
+                    cond_e = zp_alloc_expr(p, EX_BOOL, ln);
+                    cond_e->u.b = true;
+                }
+                if (!zp_expect(p, TOK_SEMI, "';' in for header")) break;
+                ZrStmt *step_st = NULL;
+                if (!zp_check(p, TOK_RPAREN)) {
+                    step_st = zp_parse_stmt(p);
+                    if (!step_st) break;
+                }
+                if (!zp_expect(p, TOK_RPAREN, "')' after for header")) break;
+                ZrStmt **body = NULL; size_t bn = 0;
+                if (!zp_parse_block_stmts(p, &body, &bn)) break;
+                if (step_st) {
+                    ZrStmt **wbody = (ZrStmt **)zr_arena_alloc(p->arena, (bn + 1) * sizeof(ZrStmt *));
+                    if (bn > 0) memcpy(wbody, body, bn * sizeof(ZrStmt *));
+                    wbody[bn] = step_st;
+                    body = wbody;
+                    bn++;
+                }
+                ZrStmt *ws = zp_alloc_stmt(p, ST_WHILE, ln);
+                ws->u.while_s.cond = cond_e;
+                ws->u.while_s.body = body;
+                ws->u.while_s.body_n = bn;
+                if (init_st) {
+                    ZrStmt **bseq = (ZrStmt **)zr_arena_alloc(p->arena, 2 * sizeof(ZrStmt *));
+                    bseq[0] = init_st;
+                    bseq[1] = ws;
+                    res = zp_alloc_stmt(p, ST_BLOCK, ln);
+                    res->u.blk.stmts = bseq;
+                    res->u.blk.count = 2;
+                } else {
+                    res = ws;
+                }
+                break;
+            }
             const char *v1 = zp_expect_decl_name(p, "loop variable");
             if (!v1) break;
             if (zp_match(p, TOK_COMMA)) {
@@ -3270,8 +3350,8 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
         }
         case TOK_EXPORT: {
             zp_advance(p);
-            /* Support `export fn ...`, `export let ...`, `export const ...`, `export struct/class/enum ...`, AND `export a, b;` */
-            if (zp_check(p, TOK_FN) || zp_check(p, TOK_ASYNC) || zp_check(p, TOK_LET) ||
+            /* Support `export fn ...`, `export @nogc fn ...`, `export let ...`, `export const ...`, `export struct/class/enum ...`, AND `export a, b;` */
+            if (zp_check(p, TOK_AT) || zp_check(p, TOK_FN) || zp_check(p, TOK_ASYNC) || zp_check(p, TOK_LET) ||
                 zp_check(p, TOK_CONST) || zp_check(p, TOK_STRUCT) || zp_check(p, TOK_CLASS) ||
                 zp_check(p, TOK_ENUM) || zp_check(p, TOK_INTERFACE)) {
                 ZrStmt *decl = zp_parse_stmt(p);

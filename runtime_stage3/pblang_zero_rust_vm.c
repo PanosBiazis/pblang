@@ -1,17 +1,20 @@
 /* ============================================================================
- * pblang Sovereign Zero-Rust Native Runtime & Compiler — v3.0.0
+ * pblang Sovereign Zero-Rust Native Runtime & Compiler — v4.0.0
  *
  * 100% Rust-independent cross-platform & multi-device C99 implementation of:
  *   - Native `.sapp -> .pbck` v1 preprocessor, Unicode lexer, parser,
- *     SI unit annotations, `requires`/`ensures` contracts, sandboxed `comptime`,
- *     AST desugarer, bytecode compiler & `.pbck` serializer/deserializer
+ *     SI unit annotations, `requires`/`ensures` contracts, `@nogc`/`@packed`
+ *     attributes, sandboxed `comptime`, AST desugarer, bytecode compiler &
+ *     `.pbck` serializer/deserializer
  *   - Computed-Goto threaded VM, peephole superinstructions, monomorphic ICs,
  *     W^X `x86_64` SSE2 native JIT, two-generation nursery GC, zero-copy
- *     `OBJ_BYTES`/`OBJ_F64BUF` buffers, per-module call-stack capabilities,
- *     VM taint tracking, deterministic `.pbrec` flight-recorder/replay,
- *     unrestricted 10-arg FFI + C callbacks, and 300+ native host builtins
+ *     `OBJ_BYTES`/`OBJ_F64BUF` + unboxed `OBJ_STRUCT_BUF` tables, CSR graph
+ *     kernels, 3D PBR rasterizer, per-module call-stack capabilities, VM taint
+ *     tracking, deterministic `.pbrec` flight-recorder/replay, unrestricted
+ *     10-arg FFI + C callbacks, and 315+ native host builtins
  *   - Unified native CLI: `run`, `repl`, `test`, `check`, `fmt`, `doc`, `lsp`,
- *     `debug`, `prof`, `replay`, `build` (`--bundle-exe`, `--target web`, etc.)
+ *     `debug`, `prof`, `replay`, `build` (`--aot-native`, `--freestanding`,
+ *     `--target baremetal-x64|baremetal-x86`, `--bundle-exe`, `--target web`)
  *
  * Linux build:
  *   gcc -std=c99 -O3 -Wall -Wextra -Wno-unused-parameter \
@@ -32,7 +35,7 @@
 #include <dirent.h>
 #endif
 
-#define PBLANG_ZR_VERSION_STR "pblang 3.0.0 (sovereign zero-rust runtime; compat 1.5.0)"
+#define PBLANG_ZR_VERSION_STR "pblang 4.0.0 (sovereign zero-rust runtime; compat 1.5.0)"
 
 static void zr_print_version(void) {
     printf("%s\n", PBLANG_ZR_VERSION_STR);
@@ -47,15 +50,18 @@ static void zr_print_help(const char *prog) {
     printf("  %s -e <code_string> [args...]                       Evaluate inline pblang code\n", p);
     printf("  %s repl                                             Interactive native PBLang REPL\n", p);
     printf("  %s test [flags] [files_or_dirs...]                  Run test suites (`fn test_*` & scripts)\n", p);
-    printf("  %s check [--strict] [--syntax-only] <file.sapp>     Compile-check & verify `.sapp`\n", p);
+    printf("  %s check [--strict] [--syntax-only] <file.sapp>     Compile-check & verify `.sapp` (`@nogc`)\n", p);
     printf("  %s fmt [--write] [--check] <files...>               Format `.sapp` source files\n", p);
     printf("  %s doc [-o <out.md>] <file.sapp>                    Generate Markdown API documentation\n", p);
     printf("  %s lsp                                              Start stdio JSON-RPC 2.0 Language Server\n", p);
     printf("  %s debug <file.sapp> [args...]                      Interactive bytecode/source debugger\n", p);
     printf("  %s prof [--json] [--svg <out.svg>] <file.sapp>      Run hotspot profiler & flame-bar report\n", p);
     printf("  %s replay <trace.pbrec> <file.sapp> [args...]       Deterministic time-travel replay\n", p);
-    printf("  %s build <file.sapp> [-o <out>] [--target <t> | --bundle-exe]\n", p);
-    printf("      Targets: pbck | web | x64 | x64-dyn | pe64 | arm64 | wasm | x86 | pe32 | rv32 | dos16 | cpm80 | c64 | avr8\n");
+    printf("  %s build <file.sapp> [-o <out>] [--aot-native | --freestanding | --target <t> | --bundle-exe] [--free | --license <SPDX> | --stealth]\n", p);
+    printf("      Targets: pbck | web | aot-native | aot-pe64 | baremetal-x64 | baremetal-x86 | android-apk | android-dex | ios-macho | ios-app | x64 | x64-dyn | pe64 | arm64 | wasm | x86 | pe32 | rv32 | dos16 | cpm80 | c64 | avr8\n");
+    printf("  %s ip-seal <file> [-o <out>] [--free | --license <SPDX> | --copyright-holder <name> | --stealth]\n", p);
+    printf("  %s ip-inspect <file> | ip-verify <file> [--sign-env <ENV_VAR>]\n", p);
+    printf("  %s license | credits                                Show Apache-2.0 license, NOTICE & creator attribution\n", p);
     printf("  %s doctor | hardware                                Inspect runtime, JIT, stdlib & host caps\n", p);
     printf("  %s update [--check]                                 Show sovereign runtime version & update info\n", p);
     printf("  %s --version | -V                                   Print version\n", p);
@@ -636,7 +642,7 @@ static bool zr_emit_web_bundle(const char *input_path, const uint8_t *pbck_bytes
 
     /* 2. Emit `pblang_web_host.js` */
     static const char *js_code =
-        "// PBLang v3.0.0 WebAssembly Host Loader\n"
+        "// PBLang v4.0.0 WebAssembly Host Loader\n"
         "export async function loadPBLangWasm(wasmUrl = './app.wasm') {\n"
         "  const resp = await fetch(wasmUrl);\n"
         "  const bytes = await resp.arrayBuffer();\n"
@@ -659,9 +665,9 @@ static bool zr_emit_web_bundle(const char *input_path, const uint8_t *pbck_bytes
     fprintf(hf,
         "<!doctype html>\n"
         "<html lang=\"en\">\n"
-        "<head><meta charset=\"utf-8\"/><title>PBLang 3.0.0 Web App</title></head>\n"
+        "<head><meta charset=\"utf-8\"/><title>PBLang 4.0.0 Web App</title></head>\n"
         "<body style=\"background:#0f172a;color:#f8fafc;font-family:monospace;padding:24px\">\n"
-        "  <h2>PBLang v3.0.0 WebAssembly Target</h2>\n"
+        "  <h2>PBLang v4.0.0 WebAssembly Target</h2>\n"
         "  <pre id=\"out\">Loading app.wasm (%s)...</pre>\n"
         "  <script type=\"module\">\n"
         "    import { loadPBLangWasm } from './pblang_web_host.js';\n"
@@ -689,10 +695,47 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
     bool bundle_exe = false;
     bool safe_flag = false;
     bool overflow_flag = false;
+    bool aot_native_flag = false;
+    bool hybrid_flag = false;
+    bool freestanding_flag = false;
+    bool ip_explicit = false;
+    bool ip_disable = false;
+    const char *ip_mode_flag = NULL;
+    const char *ip_license = NULL;
+    const char *ip_holder = NULL;
+    const char *ip_sign_env = NULL;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--bundle-exe") == 0 || strcmp(argv[i], "--exe") == 0 || strcmp(argv[i], "--standalone") == 0) {
             bundle_exe = true;
+        } else if (strcmp(argv[i], "--aot-native") == 0) {
+            aot_native_flag = true;
+        } else if (strcmp(argv[i], "--hybrid") == 0) {
+            hybrid_flag = true;
+        } else if (strcmp(argv[i], "--freestanding") == 0 || strcmp(argv[i], "--baremetal") == 0) {
+            freestanding_flag = true;
+        } else if (strcmp(argv[i], "--ip-seal") == 0) {
+            ip_explicit = true;
+        } else if (strcmp(argv[i], "--no-ip-seal") == 0) {
+            ip_disable = true;
+        } else if (strcmp(argv[i], "--free") == 0) {
+            ip_mode_flag = "--free";
+            ip_explicit = true;
+        } else if (strcmp(argv[i], "--free-attribution") == 0) {
+            ip_mode_flag = "--free-attribution";
+            ip_explicit = true;
+        } else if (strcmp(argv[i], "--stealth") == 0 || strcmp(argv[i], "--stealth-ip") == 0) {
+            ip_mode_flag = "--stealth";
+            ip_explicit = true;
+        } else if (strcmp(argv[i], "--license") == 0 && i + 1 < argc) {
+            ip_license = argv[++i];
+            ip_explicit = true;
+        } else if (strcmp(argv[i], "--copyright-holder") == 0 && i + 1 < argc) {
+            ip_holder = argv[++i];
+            ip_explicit = true;
+        } else if (strcmp(argv[i], "--sign-env") == 0 && i + 1 < argc) {
+            ip_sign_env = argv[++i];
+            ip_explicit = true;
         } else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) {
             out_path = argv[++i];
         } else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
@@ -710,8 +753,19 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
         }
     }
     if (!input_path) {
-        fprintf(stderr, "Usage: pblang build <input.sapp> [-o <output>] [--target <arch> | --bundle-exe]\n");
+        fprintf(stderr, "Usage: pblang build <input.sapp> [-o <output>] [--aot-native | --freestanding | --target <arch> | --bundle-exe] [--free | --license <SPDX> | --stealth]\n");
         return 1;
+    }
+
+    if (aot_native_flag) {
+        if (!target_arch || strcmp(target_arch, "x64") == 0 || strcmp(target_arch, "elf64") == 0) {
+            target_arch = "aot-native";
+        } else if (strcmp(target_arch, "pe64") == 0 || strcmp(target_arch, "win64") == 0) {
+            target_arch = "aot-pe64";
+        }
+    }
+    if (freestanding_flag && !target_arch) {
+        target_arch = "baremetal-x64";
     }
 
     if (target_arch && strcmp(target_arch, "pbck") != 0 && strcmp(target_arch, "web") != 0) {
@@ -728,13 +782,56 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
             if (zr_file_exists_reg(cand)) snprintf(pbc_path, sizeof(pbc_path), "%.4090s", cand);
         }
         vm_free(&dvm);
+
+        ZrCaps pcaps;
+        zr_caps_allow_all(&pcaps);
+
+        if (!pbc_path[0] && (strcmp(target_arch, "aot-native") == 0 || strcmp(target_arch, "aot-pe64") == 0 ||
+                             strcmp(target_arch, "baremetal-x64") == 0 || strcmp(target_arch, "baremetal-x86") == 0)) {
+            char def_out[4096];
+            if (!out_path) {
+                const char *base = input_path;
+                for (const char *p = input_path; *p; p++) {
+                    if (*p == '/' || *p == '\\') base = p + 1;
+                }
+                size_t bl = strlen(base);
+                if (bl > 5 && zr_str_ends_ci(base, ".sapp")) bl -= 5;
+                if (strcmp(target_arch, "aot-pe64") == 0) {
+                    snprintf(def_out, sizeof(def_out), "%.*s.exe", (int)bl, base);
+                } else if (strncmp(target_arch, "baremetal-", 10) == 0) {
+                    snprintf(def_out, sizeof(def_out), "%.*s.elf", (int)bl, base);
+                } else {
+                    snprintf(def_out, sizeof(def_out), "%.*s", (int)bl, base);
+                }
+                out_path = def_out;
+            }
+            char *eargs[4];
+            eargs[0] = (char *)input_path;
+            eargs[1] = (char *)out_path;
+            eargs[2] = (char *)target_arch;
+            eargs[3] = (char *)(hybrid_flag ? "1" : "0");
+            const char *eval_code =
+                (strncmp(target_arch, "baremetal-", 10) == 0)
+                ? "let A = os_args(); let BM = import(\"stdlib:native/baremetal_kernel_x64.sapp\"); "
+                  "let src = fs_read(A[0]); "
+                  "let bin = if A[2] == \"baremetal-x86\" { BM.compile_baremetal_x86(src) } else { BM.compile_baremetal_x64(src) }; "
+                  "fs_write_bytes(A[1], bin); "
+                  "print(\"Built Ring-0 bare-metal kernel: \" + A[1] + \" (\" + str(len(bin)) + \" bytes, \" + A[2] + \")\");"
+                : "let A = os_args(); let AOT = import(\"stdlib:native/aot_unboxed_native.sapp\"); "
+                  "let r = AOT.build_aot_native(A[0], A[1], map{\"target\": A[2], \"hybrid\": A[3] == \"1\"}); "
+                  "print(\"Built pure-PBLang native AOT executable: \" + A[1] + \" (\" + str(r.bytes) + \" bytes, \" + r.mode + \")\");";
+            int rc = zr_cmd_eval(self_exe, eval_code, &pcaps, stdlib_override, 4, eargs);
+#ifndef _WIN32
+            if (rc == 0 && strcmp(target_arch, "aot-native") == 0) chmod(out_path, 0755);
+#endif
+            return rc;
+        }
+
         if (!pbc_path[0]) {
             fprintf(stderr, "build --target %s: tools/pbc.sapp not found\n", target_arch);
             return 1;
         }
-        ZrCaps pcaps;
-        zr_caps_allow_all(&pcaps);
-        char *pargs[10];
+        char *pargs[26];
         int pn = 0;
         pargs[pn++] = pbc_path;
         pargs[pn++] = (char *)input_path;
@@ -746,7 +843,21 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
         }
         if (safe_flag) pargs[pn++] = (char *)"--safe";
         if (overflow_flag) pargs[pn++] = (char *)"--overflow";
-        return zr_cmd_run_file(self_exe, pbc_path, &pcaps, stdlib_override, pn, pargs);
+        if (hybrid_flag) pargs[pn++] = (char *)"--hybrid";
+        if (ip_disable) pargs[pn++] = (char *)"--no-ip-seal";
+        else if (ip_explicit) pargs[pn++] = (char *)"--ip-seal";
+        if (ip_mode_flag) pargs[pn++] = (char *)ip_mode_flag;
+        if (ip_license) { pargs[pn++] = (char *)"--license"; pargs[pn++] = (char *)ip_license; }
+        if (ip_holder) { pargs[pn++] = (char *)"--copyright-holder"; pargs[pn++] = (char *)ip_holder; }
+        if (ip_sign_env) { pargs[pn++] = (char *)"--sign-env"; pargs[pn++] = (char *)ip_sign_env; }
+        int rc = zr_cmd_run_file(self_exe, pbc_path, &pcaps, stdlib_override, pn, pargs);
+#ifndef _WIN32
+        if (rc == 0 && out_path && (strcmp(target_arch, "aot-native") == 0 || strcmp(target_arch, "x64") == 0 ||
+                                    strcmp(target_arch, "x64-dyn") == 0 || strcmp(target_arch, "x86") == 0)) {
+            chmod(out_path, 0755);
+        }
+#endif
+        return rc;
     }
 
     uint8_t *raw = NULL;
@@ -853,6 +964,39 @@ static int zr_cmd_build(const char *self_exe, int argc, char **argv) {
             free(pbck_bytes);
             vm_free(&vm);
             return 1;
+        }
+        if (!ip_disable && vm.stdlib_root && *vm.stdlib_root) {
+            char ip_cand[4160];
+            snprintf(ip_cand, sizeof(ip_cand), "%.4060s/ip_rights_provenance.sapp", vm.stdlib_root);
+            if (zr_file_exists_reg(ip_cand)) {
+                ZrCaps icaps;
+                zr_caps_allow_all(&icaps);
+                const char *mode_val = "proprietary";
+                if (ip_mode_flag && strcmp(ip_mode_flag, "--free") == 0) mode_val = "free";
+                else if (ip_mode_flag && strcmp(ip_mode_flag, "--free-attribution") == 0) mode_val = "free-attribution";
+                else if (ip_mode_flag && strcmp(ip_mode_flag, "--stealth") == 0) mode_val = "stealth-private";
+                else if (ip_license) mode_val = "open-source";
+                char *iargs[5] = {
+                    (char *)out_path,
+                    (char *)mode_val,
+                    (char *)(ip_license ? ip_license : ""),
+                    (char *)(ip_holder ? ip_holder : ""),
+                    (char *)(ip_sign_env ? ip_sign_env : "")
+                };
+                const char *eval_seal =
+                    "let A = os_args(); let IP = import(\"stdlib:ip_rights_provenance.sapp\"); "
+                    "let opts = map{ \"mode\": A[1] }; "
+                    "if len(A[2]) > 0 { opts[\"license\"] = A[2]; } "
+                    "if len(A[3]) > 0 { opts[\"holder\"] = A[3]; } "
+                    "let pol = IP.build_ip_policy(opts); "
+                    "let sec = if len(A[4]) > 0 { env_get(A[4]) } else { nil }; "
+                    "let sealed = IP.seal_artifact_bytes(fs_read_bytes(A[0]), \"auto\", pol, sec); "
+                    "fs_write_bytes(A[0], sealed);";
+                (void)zr_cmd_eval(self_exe, eval_seal, &icaps, stdlib_override, 5, iargs);
+#ifndef _WIN32
+                chmod(out_path, 0755);
+#endif
+            }
         }
         printf("Built standalone executable: %s (%zu bytes bytecode embedded)\n", out_path, pbck_len);
     } else {
@@ -1963,6 +2107,90 @@ static int zr_cmd_doctor(const char *self_exe) {
 
 #include "zr_smart_updater.h"
 
+static int zr_cmd_license_credits(void) {
+    printf("%s\n", PBLANG_ZR_VERSION_STR);
+    printf("Creator & Original Author : Panagiotis (Panos) Biazis (@PanosBiazis)\n");
+    printf("Official Repository       : https://github.com/PanosBiazis/pblang\n");
+    printf("Engine & Stdlib License   : Apache License 2.0 (SPDX: Apache-2.0) + Binding NOTICE (Section 4(d))\n");
+    printf("Compiler Output Policy    : Sovereign Developer Choice (Apache-2.0 never infects user binaries)\n");
+    printf("  - Default binary policy : All Rights Reserved + Tamper-Evident SHA-256 PBIPSEAL\n");
+    printf("  - Open-Source choice    : --free / --license <SPDX> (MIT, Apache-2.0, GPL-3.0-only, BSD-3-Clause, MPL-2.0, CC0-1.0, ...)\n");
+    printf("  - Attribution-free/anon : --stealth (Redacted holder, SOURCE_DATE_EPOCH=0, zero OS/path/clock leaks)\n");
+    return 0;
+}
+
+static int zr_cmd_ip_tool(const char *self_exe, const char *action, int argc, char **argv) {
+    const char *target_file = NULL;
+    const char *out_file = NULL;
+    const char *stdlib_ov = NULL;
+    const char *mode_val = "proprietary";
+    const char *spdx_val = "";
+    const char *holder_val = "";
+    const char *sign_env = "";
+
+    for (int i = 0; i < argc; i++) {
+        if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) && i + 1 < argc) {
+            out_file = argv[++i];
+        } else if (strcmp(argv[i], "--stdlib") == 0 && i + 1 < argc) {
+            stdlib_ov = argv[++i];
+        } else if (strcmp(argv[i], "--free") == 0) {
+            mode_val = "free";
+        } else if (strcmp(argv[i], "--free-attribution") == 0) {
+            mode_val = "free-attribution";
+        } else if (strcmp(argv[i], "--stealth") == 0 || strcmp(argv[i], "--stealth-ip") == 0) {
+            mode_val = "stealth-private";
+        } else if (strcmp(argv[i], "--license") == 0 && i + 1 < argc) {
+            spdx_val = argv[++i];
+            if (strcmp(mode_val, "proprietary") == 0) mode_val = "open-source";
+        } else if (strcmp(argv[i], "--copyright-holder") == 0 && i + 1 < argc) {
+            holder_val = argv[++i];
+        } else if (strcmp(argv[i], "--sign-env") == 0 && i + 1 < argc) {
+            sign_env = argv[++i];
+        } else if (argv[i][0] != '-' && !target_file) {
+            target_file = argv[i];
+        }
+    }
+    if (!target_file) {
+        fprintf(stderr, "Usage: pblang %s <artifact_file> [-o <out>] [--free | --license <SPDX> | --copyright-holder <name> | --stealth] [--sign-env <ENV_VAR>]\n", action);
+        return 1;
+    }
+    if (!out_file) out_file = target_file;
+
+    ZrCaps icaps;
+    zr_caps_allow_all(&icaps);
+    char *eargs[7] = {
+        (char *)action,
+        (char *)target_file,
+        (char *)out_file,
+        (char *)mode_val,
+        (char *)spdx_val,
+        (char *)holder_val,
+        (char *)sign_env
+    };
+    const char *eval_code =
+        "let A = os_args(); let IP = import(\"stdlib:ip_rights_provenance.sapp\"); "
+        "let act = A[0]; let raw = fs_read_bytes(A[1]); "
+        "if act == \"ip-seal\" { "
+        "  let raw_clean = IP.strip_artifact_ip_seal(raw); "
+        "  let opts = map{ \"mode\": A[3] }; "
+        "  if len(A[4]) > 0 { opts[\"license\"] = A[4]; } "
+        "  if len(A[5]) > 0 { opts[\"holder\"] = A[5]; } "
+        "  let pol = IP.build_ip_policy(opts); "
+        "  let sec = if len(A[6]) > 0 { env_get(A[6]) } else { nil }; "
+        "  let sealed = IP.seal_artifact_bytes(raw_clean, \"auto\", pol, sec); "
+        "  fs_write_bytes(A[2], sealed); "
+        "  print json_stringify(IP.inspect_artifact_ip(sealed)); "
+        "} elif act == \"ip-inspect\" { "
+        "  print json_stringify(IP.inspect_artifact_ip(raw)); "
+        "} else { "
+        "  let sec = if len(A[6]) > 0 { env_get(A[6]) } else { nil }; "
+        "  let v = IP.verify_artifact_ip(raw, sec); "
+        "  print json_stringify(v); "
+        "  if not v.ok { os_exit(1); } "
+        "}";
+    return zr_cmd_eval(self_exe, eval_code, &icaps, stdlib_ov, 7, eargs);
+}
+
 int main(int argc, char **argv) {
     zr_net_subsystem_init();
 
@@ -1992,6 +2220,16 @@ int main(int argc, char **argv) {
         zr_print_version();
         free(self_exe);
         return 0;
+    }
+    if (strcmp(sub, "license") == 0 || strcmp(sub, "--license-info") == 0 || strcmp(sub, "credits") == 0 || strcmp(sub, "attribution") == 0) {
+        int rc = zr_cmd_license_credits();
+        free(self_exe);
+        return rc;
+    }
+    if (strcmp(sub, "ip-seal") == 0 || strcmp(sub, "ip-inspect") == 0 || strcmp(sub, "ip-verify") == 0) {
+        int rc = zr_cmd_ip_tool(self_exe, sub, argc - 2, argv + 2);
+        free(self_exe);
+        return rc;
     }
     if (strcmp(sub, "--help") == 0 || strcmp(sub, "-h") == 0 || strcmp(sub, "help") == 0) {
         zr_print_help(argv[0]);
