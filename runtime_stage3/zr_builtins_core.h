@@ -9,7 +9,11 @@
 
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC push_options
+#ifdef _WIN32
+#pragma GCC optimize("O2")
+#else
 #pragma GCC optimize("O3,omit-frame-pointer")
+#endif
 #endif
 
 #include "zr_vm_core.h"

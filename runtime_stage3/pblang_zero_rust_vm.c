@@ -298,60 +298,64 @@ static int zr_cmd_run_file_ex(const char *self_exe, const char *target_file, con
         fprintf(stderr, "Error: file not found: %s\n", target_file);
         return 1;
     }
-    PbVM vm;
-    vm_init(&vm);
-    vm.caps = *caps;
-    if (opts && opts->strict_taint) vm.taint_guard_enabled = true;
-    if (opts && opts->prof_enabled) vm.prof_enabled = true;
-    zr_configure_vm_paths(&vm, self_exe, target_file, stdlib_override);
-    vm.cli_argc = script_argc;
-    vm.cli_argv = script_argv;
+    PbVM *vmp = (PbVM *)zr_xcalloc(1, sizeof(PbVM));
+    vm_init(vmp);
+    vmp->caps = *caps;
+    if (opts && opts->strict_taint) vmp->taint_guard_enabled = true;
+    if (opts && opts->prof_enabled) vmp->prof_enabled = true;
+    zr_configure_vm_paths(vmp, self_exe, target_file, stdlib_override);
+    vmp->cli_argc = script_argc;
+    vmp->cli_argv = script_argv;
 
     if (opts && opts->record_path) {
-        if (!zr_flight_start_record_file(&vm, opts->record_path)) {
-            fprintf(stderr, "Runtime error: %s\n", vm.err_msg[0] ? vm.err_msg : "cannot open record file");
-            vm_free(&vm);
+        if (!zr_flight_start_record_file(vmp, opts->record_path)) {
+            fprintf(stderr, "Runtime error: %s\n", vmp->err_msg[0] ? vmp->err_msg : "cannot open record file");
+            vm_free(vmp);
+            free(vmp);
             return 1;
         }
     }
     if (opts && opts->replay_path) {
-        if (!zr_flight_start_replay_file(&vm, opts->replay_path)) {
-            fprintf(stderr, "Runtime error: %s\n", vm.err_msg[0] ? vm.err_msg : "cannot open replay file");
-            vm_free(&vm);
+        if (!zr_flight_start_replay_file(vmp, opts->replay_path)) {
+            fprintf(stderr, "Runtime error: %s\n", vmp->err_msg[0] ? vmp->err_msg : "cannot open replay file");
+            vm_free(vmp);
+            free(vmp);
             return 1;
         }
     }
 
     char lerr[512];
     lerr[0] = '\0';
-    PbFunc *fn = zr_load_or_compile_file(&vm, vm.current_file ? vm.current_file : target_file, lerr);
+    PbFunc *fn = zr_load_or_compile_file(vmp, vmp->current_file ? vmp->current_file : target_file, lerr);
     if (!fn) {
         fprintf(stderr, "%s\n", lerr[0] ? lerr : "Failed to load or compile script");
-        zr_flight_cleanup_vm(&vm);
-        vm_free(&vm);
+        zr_flight_cleanup_vm(vmp);
+        vm_free(vmp);
+        free(vmp);
         return 1;
     }
-    vm_push_root(&vm, val_obj(fn));
-    zr_populate_polyglot_globals(&vm, vm.globals, fn);
+    vm_push_root(vmp, val_obj(fn));
+    zr_populate_polyglot_globals(vmp, vmp->globals, fn);
     PbValue ret = val_nil();
-    bool ok = vm_run_root_func(&vm, fn, NULL, &ret);
-    vm_pop_roots(&vm, 1);
+    bool ok = vm_run_root_func(vmp, fn, NULL, &ret);
+    vm_pop_roots(vmp, 1);
     int rc = 0;
-    if (vm.exited) {
-        rc = vm.exit_code;
+    if (vmp->exited) {
+        rc = vmp->exit_code;
     } else if (!ok) {
-        fprintf(stderr, "Runtime error: %s\n", vm.err_msg[0] ? vm.err_msg : "execution failed");
+        fprintf(stderr, "Runtime error: %s\n", vmp->err_msg[0] ? vmp->err_msg : "execution failed");
         rc = 1;
     }
     if (opts && opts->prof_enabled) {
         ZrBuf pbuf;
         zr_buf_init(&pbuf);
-        zr_prof_collect_and_format(&vm, opts->prof_json, opts->prof_svg_path, &pbuf);
+        zr_prof_collect_and_format(vmp, opts->prof_json, opts->prof_svg_path, &pbuf);
         if (pbuf.data && pbuf.len > 0) fwrite(pbuf.data, 1, pbuf.len, stdout);
         zr_buf_free(&pbuf);
     }
-    zr_flight_cleanup_vm(&vm);
-    vm_free(&vm);
+    zr_flight_cleanup_vm(vmp);
+    vm_free(vmp);
+    free(vmp);
     return rc;
 }
 

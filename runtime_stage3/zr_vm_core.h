@@ -14,7 +14,11 @@
 
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC push_options
+#ifdef _WIN32
+#pragma GCC optimize("O2")
+#else
 #pragma GCC optimize("O3,omit-frame-pointer")
+#endif
 #endif
 
 /* ---- Exact .pbck v1 Wire Opcode Tags (0..=47) + In-Memory Superinstructions (48..=54) ---- */
@@ -2489,7 +2493,7 @@ static bool vm_execute_until(PbVM *vm, size_t stop_frame_depth, PbValue *out_ret
     fn = frame->closure->fn; \
 } while (0)
 
-#if defined(__GNUC__) || defined(__clang__)
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
     static const void *const disp_tab[256] = {
         /* 0..47: .pbck v1 wire opcodes */
         &&lbl_OP_CONSTANT,          /* 0 */
@@ -2613,7 +2617,7 @@ static bool vm_execute_until(PbVM *vm, size_t stop_frame_depth, PbValue *out_ret
     PbInstr *ins = NULL;
     uint8_t op = 0;
 
-#if defined(__GNUC__) || defined(__clang__)
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
     ZR_DISPATCH();
 #else
 next_iter:;
@@ -3615,10 +3619,12 @@ next_iter:;
             goto handle_exception;
         }
 
-#if !(defined(__GNUC__) || defined(__clang__))
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
+        ZR_CASE(OP_INVALID)
+#else
         default:
 #endif
-        ZR_CASE(OP_INVALID) {
+        {
             RUNTIME_ERR("unknown opcode %u at ip %u", op, frame->ip - 1);
         }
     }
