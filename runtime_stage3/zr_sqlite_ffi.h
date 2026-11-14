@@ -19,7 +19,7 @@ typedef struct sqlite3_stmt ZrSqliteStmt;
 #define ZR_SQLITE_TEXT       3
 #define ZR_SQLITE_BLOB       4
 #define ZR_SQLITE_NULL       5
-#define ZR_SQLITE_TRANSIENT  ((void (*)(void *))(-1))
+#define ZR_SQLITE_TRANSIENT  ((void (*)(void *))(intptr_t)(-1))
 
 typedef struct {
     bool       tried;
@@ -74,7 +74,7 @@ static bool zr_ensure_sqlite(char err_out[256]) {
     g_zr_sql.tried = true;
 
 #if defined(_WIN32)
-    const char *cands[] = { "sqlite3.dll", "winsqlite3.dll", "libsqlite3-0.dll", NULL };
+    const char *cands[] = { "winsqlite3.dll", "libsqlite3-0.dll", "sqlite3.dll", NULL };
 #elif defined(__APPLE__)
     const char *cands[] = { "libsqlite3.dylib", "/usr/lib/libsqlite3.dylib", NULL };
 #else
@@ -87,48 +87,57 @@ static bool zr_ensure_sqlite(char err_out[256]) {
         NULL
     };
 #endif
-    for (int i = 0; cands[i] && !g_zr_sql.lib; i++) g_zr_sql.lib = zr_dlopen(cands[i]);
-    if (!g_zr_sql.lib) {
-        zr_mutex_unlock(&g_zr_db_ffi_mtx);
-        snprintf(err_out, 256, "SQLite3 shared library not found");
-        return false;
+    for (int i = 0; cands[i]; i++) {
+        ZrDlHandle h = zr_dlopen(cands[i]);
+        if (!h) continue;
+        g_zr_sql.lib = h;
+        #define LOAD_SQL_SYM(fn) g_zr_sql.fn = (__typeof__(g_zr_sql.fn))zr_dlsym(h, #fn)
+        LOAD_SQL_SYM(sqlite3_open);
+        LOAD_SQL_SYM(sqlite3_close);
+        LOAD_SQL_SYM(sqlite3_errmsg);
+        LOAD_SQL_SYM(sqlite3_exec);
+        LOAD_SQL_SYM(sqlite3_free);
+        LOAD_SQL_SYM(sqlite3_changes);
+        LOAD_SQL_SYM(sqlite3_last_insert_rowid);
+        LOAD_SQL_SYM(sqlite3_prepare_v2);
+        LOAD_SQL_SYM(sqlite3_step);
+        LOAD_SQL_SYM(sqlite3_finalize);
+        LOAD_SQL_SYM(sqlite3_bind_null);
+        LOAD_SQL_SYM(sqlite3_bind_int64);
+        LOAD_SQL_SYM(sqlite3_bind_double);
+        LOAD_SQL_SYM(sqlite3_bind_text);
+        LOAD_SQL_SYM(sqlite3_bind_blob);
+        LOAD_SQL_SYM(sqlite3_column_count);
+        LOAD_SQL_SYM(sqlite3_column_name);
+        LOAD_SQL_SYM(sqlite3_column_type);
+        LOAD_SQL_SYM(sqlite3_column_int64);
+        LOAD_SQL_SYM(sqlite3_column_double);
+        LOAD_SQL_SYM(sqlite3_column_text);
+        LOAD_SQL_SYM(sqlite3_column_blob);
+        LOAD_SQL_SYM(sqlite3_column_bytes);
+        #undef LOAD_SQL_SYM
+
+        if (g_zr_sql.sqlite3_open && g_zr_sql.sqlite3_close && g_zr_sql.sqlite3_prepare_v2 &&
+            g_zr_sql.sqlite3_step && g_zr_sql.sqlite3_finalize &&
+            g_zr_sql.sqlite3_bind_null && g_zr_sql.sqlite3_bind_int64 &&
+            g_zr_sql.sqlite3_bind_double && g_zr_sql.sqlite3_bind_text &&
+            g_zr_sql.sqlite3_bind_blob && g_zr_sql.sqlite3_column_count &&
+            g_zr_sql.sqlite3_column_name && g_zr_sql.sqlite3_column_type &&
+            g_zr_sql.sqlite3_column_int64 && g_zr_sql.sqlite3_column_double &&
+            g_zr_sql.sqlite3_column_text && g_zr_sql.sqlite3_column_blob &&
+            g_zr_sql.sqlite3_column_bytes && g_zr_sql.sqlite3_last_insert_rowid) {
+            g_zr_sql.ready = true;
+            zr_mutex_unlock(&g_zr_db_ffi_mtx);
+            return true;
+        }
+        zr_dlclose(h);
+        memset(&g_zr_sql, 0, sizeof(g_zr_sql));
+        g_zr_sql.tried = true;
     }
 
-    #define LOAD_SQL_SYM(fn) g_zr_sql.fn = (__typeof__(g_zr_sql.fn))zr_dlsym(g_zr_sql.lib, #fn)
-    LOAD_SQL_SYM(sqlite3_open);
-    LOAD_SQL_SYM(sqlite3_close);
-    LOAD_SQL_SYM(sqlite3_errmsg);
-    LOAD_SQL_SYM(sqlite3_exec);
-    LOAD_SQL_SYM(sqlite3_free);
-    LOAD_SQL_SYM(sqlite3_changes);
-    LOAD_SQL_SYM(sqlite3_last_insert_rowid);
-    LOAD_SQL_SYM(sqlite3_prepare_v2);
-    LOAD_SQL_SYM(sqlite3_step);
-    LOAD_SQL_SYM(sqlite3_finalize);
-    LOAD_SQL_SYM(sqlite3_bind_null);
-    LOAD_SQL_SYM(sqlite3_bind_int64);
-    LOAD_SQL_SYM(sqlite3_bind_double);
-    LOAD_SQL_SYM(sqlite3_bind_text);
-    LOAD_SQL_SYM(sqlite3_bind_blob);
-    LOAD_SQL_SYM(sqlite3_column_count);
-    LOAD_SQL_SYM(sqlite3_column_name);
-    LOAD_SQL_SYM(sqlite3_column_type);
-    LOAD_SQL_SYM(sqlite3_column_int64);
-    LOAD_SQL_SYM(sqlite3_column_double);
-    LOAD_SQL_SYM(sqlite3_column_text);
-    LOAD_SQL_SYM(sqlite3_column_blob);
-    LOAD_SQL_SYM(sqlite3_column_bytes);
-    #undef LOAD_SQL_SYM
-
-    if (!g_zr_sql.sqlite3_open || !g_zr_sql.sqlite3_close || !g_zr_sql.sqlite3_prepare_v2 ||
-        !g_zr_sql.sqlite3_step || !g_zr_sql.sqlite3_finalize) {
-        zr_mutex_unlock(&g_zr_db_ffi_mtx);
-        snprintf(err_out, 256, "SQLite3 library missing required C symbols");
-        return false;
-    }
-    g_zr_sql.ready = true;
     zr_mutex_unlock(&g_zr_db_ffi_mtx);
-    return true;
+    snprintf(err_out, 256, "SQLite3 shared library not found or missing required C symbols");
+    return false;
 }
 
 typedef struct {
