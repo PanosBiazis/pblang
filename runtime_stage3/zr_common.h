@@ -1391,6 +1391,8 @@ static bool zr_rat_from_str(ZrRational *r, const char *s) {
     if (slash) {
         char *lhs = zr_xstrndup(s, (size_t)(slash - s));
         ZrBigInt n, d;
+        zr_bi_init(&n);
+        zr_bi_init(&d);
         bool ok = zr_bi_from_str(&n, lhs) && zr_bi_from_str(&d, slash + 1);
         free(lhs);
         if (!ok) { zr_bi_free(&n); zr_bi_free(&d); return false; }

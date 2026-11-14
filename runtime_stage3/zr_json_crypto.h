@@ -319,9 +319,26 @@ static void zj_append_escaped_str(ZrBuf *b, const char *s, size_t len) {
     zr_buf_push_u8(b, '"');
 }
 
+static void zr_sort_map_entries(PbMapEntry **ents, size_t n) {
+    if (n < 2) return;
+    size_t gap = n >> 1;
+    while (gap > 0) {
+        for (size_t i = gap; i < n; i++) {
+            PbMapEntry *tmp = ents[i];
+            size_t j = i;
+            while (j >= gap && zr_cmp_pbstr_ptr(&ents[j - gap]->key, &tmp->key) > 0) {
+                ents[j] = ents[j - gap];
+                j -= gap;
+            }
+            ents[j] = tmp;
+        }
+        gap >>= 1;
+    }
+}
+
 static bool zr_json_stringify_into(PbVM *vm, PbValue v, ZrBuf *b, int depth) {
-    if (depth > 64) {
-        vm_raise(vm, "json_stringify(): maximum nesting depth (64) exceeded (cyclic value?)");
+    if (depth > 256) {
+        vm_raise(vm, "json_stringify(): maximum nesting depth (256) exceeded (cyclic value?)");
         return false;
     }
     switch (v.tag) {
@@ -395,7 +412,7 @@ static bool zr_json_stringify_into(PbVM *vm, PbValue v, ZrBuf *b, int depth) {
                         for (size_t i = 0; i < m->used; i++) {
                             if (m->entries[i].active && m->entries[i].key) ents[k++] = &m->entries[i];
                         }
-                        qsort(ents, k, sizeof(PbMapEntry *), pb_map_entry_cmp);
+                        zr_sort_map_entries(ents, k);
                         for (size_t i = 0; i < k; i++) {
                             if (i > 0) zr_buf_push_u8(b, ',');
                             zj_append_escaped_str(b, ents[i]->key->chars, ents[i]->key->len);

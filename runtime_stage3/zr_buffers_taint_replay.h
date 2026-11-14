@@ -9,15 +9,6 @@
 
 #include "zr_vm_core.h"
 
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC push_options
-#ifdef _WIN32
-#pragma GCC optimize("O2")
-#else
-#pragma GCC optimize("O3,omit-frame-pointer")
-#endif
-#endif
-
 /* ============================================================================
  * 1. Zero-Copy Typed Shared Buffers (`OBJ_BYTES`, `OBJ_F64BUF`)
  * ============================================================================ */
@@ -981,9 +972,5 @@ static bool bi_vm_prof_stats(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     free(s);
     return true;
 }
-
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC pop_options
-#endif
 
 #endif /* PBLANG_ZR_BUFFERS_TAINT_REPLAY_H */

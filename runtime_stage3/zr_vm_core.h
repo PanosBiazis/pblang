@@ -12,15 +12,6 @@
 
 #include "zr_common.h"
 
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC push_options
-#ifdef _WIN32
-#pragma GCC optimize("O2")
-#else
-#pragma GCC optimize("O3,omit-frame-pointer")
-#endif
-#endif
-
 /* ---- Exact .pbck v1 Wire Opcode Tags (0..=47) + In-Memory Superinstructions (48..=54) ---- */
 enum {
     OP_CONSTANT            = 0,
@@ -2015,6 +2006,20 @@ static bool vm_prepare_closure_args(PbVM *vm, PbFunc *fn, uint32_t argc, size_t 
     return true;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void zr_maybe_tier2_jit(PbVM *vm, PbFunc *fn) {
+    size_t err_sz = sizeof(vm->err_msg);
+    char *saved_err = (char *)malloc(err_sz);
+    if (saved_err) memcpy(saved_err, vm->err_msg, err_sz);
+    (void)zr_jit_compile_func(vm, fn);
+    if (saved_err) {
+        memcpy(vm->err_msg, saved_err, err_sz);
+        free(saved_err);
+    }
+}
+
 static bool vm_call_top(PbVM *vm, uint32_t argc, bool is_tail, size_t min_tail_depth) {
     if (vm->sp < (size_t)argc + 1) return vm_error(vm, "stack underflow on call");
     size_t callee_slot = vm->sp - 1 - (size_t)argc;
@@ -2089,10 +2094,7 @@ retry_call:;
     PbFunc *fn = cl->fn;
     fn->call_count++;
     if (fn->call_count == 32 && !fn->jit_attempted) {
-        char saved_err[2048];
-        memcpy(saved_err, vm->err_msg, sizeof(saved_err));
-        (void)zr_jit_compile_func(vm, fn);
-        memcpy(vm->err_msg, saved_err, sizeof(saved_err));
+        zr_maybe_tier2_jit(vm, fn);
     }
     if (fn->jit_fn != NULL && !fn->is_vararg && fn->arity <= 8) {
         bool jit_ok = true;
@@ -3870,9 +3872,5 @@ static int pb_map_entry_cmp(const void *a, const void *b) {
     const PbMapEntry *eb = *(const PbMapEntry *const *)b;
     return zr_cmp_pbstr_ptr(&ea->key, &eb->key);
 }
-
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC pop_options
-#endif
 
 #endif /* PBLANG_ZR_VM_CORE_H */

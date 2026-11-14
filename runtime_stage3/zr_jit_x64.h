@@ -16,15 +16,6 @@
 
 #include "zr_vm_core.h"
 
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC push_options
-#ifdef _WIN32
-#pragma GCC optimize("O2")
-#else
-#pragma GCC optimize("O3,omit-frame-pointer")
-#endif
-#endif
-
 /* ============================================================================
  * 1. In-Memory Peephole Superinstruction Pass (All Architectures)
  * ============================================================================ */
@@ -1309,9 +1300,5 @@ static bool bi_jit_stats(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     *out = val_obj(res);
     return true;
 }
-
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC pop_options
-#endif
 
 #endif /* PBLANG_ZR_JIT_X64_H */

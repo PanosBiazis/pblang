@@ -7,15 +7,6 @@
 #ifndef PBLANG_ZR_BUILTINS_CORE_H
 #define PBLANG_ZR_BUILTINS_CORE_H
 
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC push_options
-#ifdef _WIN32
-#pragma GCC optimize("O2")
-#else
-#pragma GCC optimize("O3,omit-frame-pointer")
-#endif
-#endif
-
 #include "zr_vm_core.h"
 #include "zr_jit_x64.h"
 #include "zr_buffers_taint_replay.h"
@@ -5730,9 +5721,5 @@ static void zr_register_all_builtins(PbVM *vm) {
     pb_map_set_cstr(vm, vm->builtins, "json", val_obj(jm));
     vm_pop_roots(vm, 1);
 }
-
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC pop_options
-#endif
 
 #endif /* PBLANG_ZR_BUILTINS_CORE_H */

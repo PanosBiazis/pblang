@@ -24,12 +24,12 @@
 #ifndef PBLANG_ZR_HPC_COMPUTE_H
 #define PBLANG_ZR_HPC_COMPUTE_H
 
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(__GNUC__) && !defined(__clang__) && !defined(_WIN32)
 #pragma GCC push_options
 #pragma GCC optimize("O3,unroll-loops,tree-vectorize")
 #endif
 
-#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__)) && !defined(__wasm__) && !defined(__EMSCRIPTEN__)
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32) && !defined(__wasm__) && !defined(__EMSCRIPTEN__)
 #define ZR_HPC_X86_64_MV 1
 #define ZR_HPC_TARGET_AVX2   __attribute__((target("avx2,fma")))
 #define ZR_HPC_TARGET_AVX512 __attribute__((target("avx512f,avx512vl,avx2,fma")))
@@ -3418,7 +3418,7 @@ static bool bi_hpc_mlp_forward(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
     return true;
 }
 
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(__GNUC__) && !defined(__clang__) && !defined(_WIN32)
 #pragma GCC pop_options
 #endif
 
