@@ -1014,10 +1014,1584 @@ fn _s8(b) {
     return b;
 }
 
+fn _s16(bytes, offset) {
+    let u = _u16(bytes, offset, true);
+    if u >= 32768 { return u - 65536; }
+    return u;
+}
+
 fn _s32(bytes, offset) {
     let u = _u32(bytes, offset, true);
     if u >= 2147483648 { return u - 4294967296; }
     return u;
+}
+
+fn _bits(word, hi, lo) {
+    let width = hi - lo + 1;
+    let mask = bit_shl(1, width) - 1;
+    return bit_and(bit_shr(word, lo), mask);
+}
+
+fn _sext(val, width) {
+    let sign_bit = bit_shl(1, width - 1);
+    if val >= sign_bit {
+        return val - bit_shl(1, width);
+    }
+    return val;
+}
+
+fn _slice_hex(bytes, start_idx, count) {
+    let out = "";
+    let i = 0;
+    while i < count and start_idx + i < len(bytes) {
+        out = out + _hex_byte(bytes[start_idx + i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _coerce_code_bytes(bytes_or_hex) {
+    if type(bytes_or_hex) == "string" {
+        return _bytes_from_hex(bytes_or_hex, 65536);
+    }
+    if type(bytes_or_hex) == "array" {
+        return _validate_bytes(bytes_or_hex, 65536);
+    }
+    throw "rea_suite: expected byte array or hex string";
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 5A. Genuine x86-64 Instruction Decoder (REX, 0x66, ModR/M, SIB, RIP-rel, ALU, Jcc)
+// ══════════════════════════════════════════════════════════════════════════════
+
+let _X64_GPR64 = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+let _X64_GPR32 = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"];
+let _X64_GPR16 = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"];
+let _X64_GPR8_NOREX = ["al", "cl", "dl", "bl", "ah", "ch", "dh", "bh"];
+let _X64_GPR8_REX = ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"];
+let _X64_ALU_OPS = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"];
+let _X64_SHIFT_OPS = ["rol", "ror", "rcl", "rcr", "shl", "shr", "sal", "sar"];
+let _X64_CC_NAMES = ["o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g"];
+
+fn _x64_reg_name(idx, bits, has_rex) {
+    let r = bit_and(idx, 15);
+    if bits == 64 { return _X64_GPR64[r]; }
+    if bits == 32 { return _X64_GPR32[r]; }
+    if bits == 16 { return _X64_GPR16[r]; }
+    if _is_true(has_rex) { return _X64_GPR8_REX[r]; }
+    return _X64_GPR8_NOREX[bit_and(r, 7)];
+}
+
+fn _x64_ptr_prefix(bits) {
+    if bits == 64 { return "qword ptr "; }
+    if bits == 32 { return "dword ptr "; }
+    if bits == 16 { return "word ptr "; }
+    if bits == 8 { return "byte ptr "; }
+    return "";
+}
+
+fn _x64_fmt_disp(disp, has_base) {
+    if not _is_true(has_base) {
+        return str(disp);
+    }
+    if disp == 0 { return ""; }
+    if disp > 0 { return " + " + str(disp); }
+    return " - " + str(0 - disp);
+}
+
+fn _x64_decode_modrm(bytes, pos, op_bits, has_rex, rex_r, rex_x, rex_b, with_ptr) {
+    if pos >= len(bytes) {
+        return map{ ok: false, next_pos: pos, reg_idx: 0, reg_str: "eax", rm_str: "?", is_mem: false };
+    }
+    let modrm = bytes[pos];
+    let mod_bits = _bits(modrm, 7, 6);
+    let reg_low = _bits(modrm, 5, 3);
+    let rm_low = _bits(modrm, 2, 0);
+    let reg_idx = reg_low + (if _is_true(rex_r) { 8 } else { 0 });
+    let rm_idx = rm_low + (if _is_true(rex_b) { 8 } else { 0 });
+    let reg_str = _x64_reg_name(reg_idx, op_bits, has_rex);
+    let p = pos + 1;
+
+    if mod_bits == 3 {
+        let rm_reg = _x64_reg_name(rm_idx, op_bits, has_rex);
+        return map{
+            ok: true,
+            next_pos: p,
+            mod_bits: 3,
+            reg_low: reg_low,
+            reg_idx: reg_idx,
+            rm_idx: rm_idx,
+            reg_str: reg_str,
+            rm_str: rm_reg,
+            is_mem: false
+        };
+    }
+
+    let pfx = if _is_true(with_ptr) { _x64_ptr_prefix(op_bits) } else { "" };
+    let expr = "";
+    if mod_bits == 0 and rm_low == 5 {
+        if p + 4 > len(bytes) {
+            return map{ ok: false, next_pos: len(bytes), reg_idx: reg_idx, reg_str: reg_str, rm_str: "?", is_mem: true };
+        }
+        let disp_rip = _s32(bytes, p);
+        p = p + 4;
+        expr = "rip" + _x64_fmt_disp(disp_rip, true);
+    } elif rm_low == 4 {
+        if p >= len(bytes) {
+            return map{ ok: false, next_pos: len(bytes), reg_idx: reg_idx, reg_str: reg_str, rm_str: "?", is_mem: true };
+        }
+        let sib = bytes[p];
+        p = p + 1;
+        let scale_pow = _bits(sib, 7, 6);
+        let scale = bit_shl(1, scale_pow);
+        let idx_low = _bits(sib, 5, 3);
+        let base_low = _bits(sib, 2, 0);
+        let idx_reg = idx_low + (if _is_true(rex_x) { 8 } else { 0 });
+        let base_reg = base_low + (if _is_true(rex_b) { 8 } else { 0 });
+
+        let has_base = not (mod_bits == 0 and base_low == 5);
+        let has_index = not (idx_low == 4 and not _is_true(rex_x));
+        let disp_val = 0;
+        if mod_bits == 0 and base_low == 5 {
+            if p + 4 > len(bytes) { return map{ ok: false, next_pos: len(bytes), reg_idx: reg_idx, reg_str: reg_str, rm_str: "?", is_mem: true }; }
+            disp_val = _s32(bytes, p);
+            p = p + 4;
+        } elif mod_bits == 1 {
+            if p + 1 > len(bytes) { return map{ ok: false, next_pos: len(bytes), reg_idx: reg_idx, reg_str: reg_str, rm_str: "?", is_mem: true }; }
+            disp_val = _s8(bytes[p]);
+            p = p + 1;
+        } elif mod_bits == 2 {
+            if p + 4 > len(bytes) { return map{ ok: false, next_pos: len(bytes), reg_idx: reg_idx, reg_str: reg_str, rm_str: "?", is_mem: true }; }
+            disp_val = _s32(bytes, p);
+            p = p + 4;
+        }
+
+        let terms = [];
+        if _is_true(has_base) { push(terms, _X64_GPR64[base_reg]); }
+        if _is_true(has_index) {
+            let idx_term = _X64_GPR64[idx_reg];
+            if scale > 1 { idx_term = idx_term + "*" + str(scale); }
+            push(terms, idx_term);
+        }
+        if len(terms) == 0 {
+            expr = str(disp_val);
+        } else {
+            expr = str_join(terms, " + ") + _x64_fmt_disp(disp_val, true);
+        }
+    } else {
+        let disp2 = 0;
+        if mod_bits == 1 {
+            if p + 1 > len(bytes) { return map{ ok: false, next_pos: len(bytes), reg_idx: reg_idx, reg_str: reg_str, rm_str: "?", is_mem: true }; }
+            disp2 = _s8(bytes[p]);
+            p = p + 1;
+        } elif mod_bits == 2 {
+            if p + 4 > len(bytes) { return map{ ok: false, next_pos: len(bytes), reg_idx: reg_idx, reg_str: reg_str, rm_str: "?", is_mem: true }; }
+            disp2 = _s32(bytes, p);
+            p = p + 4;
+        }
+        expr = _X64_GPR64[rm_idx] + _x64_fmt_disp(disp2, true);
+    }
+
+    return map{
+        ok: true,
+        next_pos: p,
+        mod_bits: mod_bits,
+        reg_low: reg_low,
+        reg_idx: reg_idx,
+        rm_idx: rm_idx,
+        reg_str: reg_str,
+        rm_str: pfx + "[" + expr + "]",
+        raw_mem_str: "[" + expr + "]",
+        is_mem: true
+    };
+}
+
+fn decode_one_x86_64(bytes, pc, base_addr = 0) {
+    let addr = base_addr + pc;
+    let n = len(bytes);
+    if pc < 0 or pc >= n {
+        throw "decode_one_x86_64: pc out of bounds";
+    }
+
+    // Fast path for CET ENDBR64 (F3 0F 1E FA)
+    if _match_seq(bytes, pc, [243, 15, 30, 250]) {
+        return map{
+            offset: pc, address: addr, size: 4, bytes_hex: "f30f1efa",
+            mnemonic: "endbr64", operands: "", text: "endbr64",
+            flow: "sequential", target_offset: -1, target_address: -1,
+            is_prologue: true, stack_alloc: 0
+        };
+    }
+
+    let p = pc;
+    let has_66 = false;
+    let has_f2 = false;
+    let has_f3 = false;
+    let scanning_legacy = true;
+    while p < n and _is_true(scanning_legacy) {
+        let pb = bytes[p];
+        if pb == 102 { has_66 = true; p = p + 1; }
+        elif pb == 242 { has_f2 = true; p = p + 1; }
+        elif pb == 243 { has_f3 = true; p = p + 1; }
+        else { scanning_legacy = false; }
+    }
+
+    let has_rex = false;
+    let rex_w = false;
+    let rex_r = false;
+    let rex_x = false;
+    let rex_b = false;
+    if p < n and bytes[p] >= 64 and bytes[p] <= 79 {
+        let rex = bytes[p];
+        has_rex = true;
+        rex_w = _bits(rex, 3, 3) == 1;
+        rex_r = _bits(rex, 2, 2) == 1;
+        rex_x = _bits(rex, 1, 1) == 1;
+        rex_b = _bits(rex, 0, 0) == 1;
+        p = p + 1;
+    }
+
+    if p >= n {
+        let raw_b = bytes[pc];
+        return map{
+            offset: pc, address: addr, size: 1, bytes_hex: _hex_byte(raw_b),
+            mnemonic: "db", operands: "0x" + _hex_byte(raw_b), text: "db 0x" + _hex_byte(raw_b),
+            flow: "sequential", target_offset: -1, target_address: -1,
+            is_prologue: false, stack_alloc: 0
+        };
+    }
+
+    let op_bits = if _is_true(rex_w) { 64 } elif _is_true(has_66) { 16 } else { 32 };
+    let op = bytes[p];
+    p = p + 1;
+
+    let mnem = "db";
+    let ops = "0x" + _hex_byte(bytes[pc]);
+    let flow = "sequential";
+    let target_off = -1;
+    let is_prologue = false;
+    let stack_alloc = 0;
+    let decoded = false;
+
+    // 1. Two-byte 0x0F opcode map
+    if op == 15 and p < n {
+        let op2 = bytes[p];
+        p = p + 1;
+        if op2 == 5 {
+            mnem = "syscall"; ops = ""; flow = "syscall"; decoded = true;
+        } elif op2 == 11 {
+            mnem = "ud2"; ops = ""; flow = "trap"; decoded = true;
+        } elif op2 == 31 {
+            let m_nop = _x64_decode_modrm(bytes, p, op_bits, has_rex, rex_r, rex_x, rex_b, true);
+            if _is_true(m_nop.ok) { p = m_nop.next_pos; mnem = "nop"; ops = m_nop.rm_str; decoded = true; }
+        } elif op2 >= 128 and op2 <= 143 and p + 4 <= n {
+            let rel32_cc = _s32(bytes, p);
+            p = p + 4;
+            target_off = (p - pc) + pc + rel32_cc;
+            mnem = "j" + _X64_CC_NAMES[op2 - 128];
+            ops = "loc_" + str(base_addr + target_off);
+            flow = "cond_jump";
+            decoded = true;
+        } elif op2 >= 144 and op2 <= 159 {
+            let m_set = _x64_decode_modrm(bytes, p, 8, has_rex, rex_r, rex_x, rex_b, true);
+            if _is_true(m_set.ok) {
+                p = m_set.next_pos;
+                mnem = "set" + _X64_CC_NAMES[op2 - 144];
+                ops = m_set.rm_str;
+                decoded = true;
+            }
+        } elif op2 >= 64 and op2 <= 79 {
+            let m_cmov = _x64_decode_modrm(bytes, p, op_bits, has_rex, rex_r, rex_x, rex_b, true);
+            if _is_true(m_cmov.ok) {
+                p = m_cmov.next_pos;
+                mnem = "cmov" + _X64_CC_NAMES[op2 - 64];
+                ops = m_cmov.reg_str + ", " + m_cmov.rm_str;
+                decoded = true;
+            }
+        } elif op2 == 175 {
+            let m_imul = _x64_decode_modrm(bytes, p, op_bits, has_rex, rex_r, rex_x, rex_b, true);
+            if _is_true(m_imul.ok) {
+                p = m_imul.next_pos;
+                mnem = "imul";
+                ops = m_imul.reg_str + ", " + m_imul.rm_str;
+                decoded = true;
+            }
+        } elif op2 == 182 or op2 == 190 {
+            let m_zx8 = _x64_decode_modrm(bytes, p, 8, has_rex, rex_r, rex_x, rex_b, true);
+            if _is_true(m_zx8.ok) {
+                p = m_zx8.next_pos;
+                mnem = if op2 == 182 { "movzx" } else { "movsx" };
+                ops = _x64_reg_name(m_zx8.reg_idx, op_bits, has_rex) + ", " + m_zx8.rm_str;
+                decoded = true;
+            }
+        } elif op2 == 183 or op2 == 191 {
+            let m_zx16 = _x64_decode_modrm(bytes, p, 16, has_rex, rex_r, rex_x, rex_b, true);
+            if _is_true(m_zx16.ok) {
+                p = m_zx16.next_pos;
+                mnem = if op2 == 183 { "movzx" } else { "movsx" };
+                ops = _x64_reg_name(m_zx16.reg_idx, op_bits, has_rex) + ", " + m_zx16.rm_str;
+                decoded = true;
+            }
+        }
+    }
+    // 2. Standard ALU Matrix 0x00..0x3D (add, or, adc, sbb, and, sub, xor, cmp)
+    elif op < 64 and bit_and(op, 7) < 6 {
+        let alu_mnem = _X64_ALU_OPS[bit_shr(op, 3)];
+        let sub_kind = bit_and(op, 7);
+        if sub_kind == 0 {
+            let m0 = _x64_decode_modrm(bytes, p, 8, has_rex, rex_r, rex_x, rex_b, true);
+            if _is_true(m0.ok) { p = m0.next_pos; mnem = alu_mnem; ops = m0.rm_str + ", " + m0.reg_str; decoded = true; }
+        } elif sub_kind == 1 {
+            let m1 = _x64_decode_modrm(bytes, p, op_bits, has_rex, rex_r, rex_x, rex_b, true);
+            if _is_true(m1.ok) { p = m1.next_pos; mnem = alu_mnem; ops = m1.rm_str + ", " + m1.reg_str; decoded = true; }
+        } elif sub_kind == 2 {
+            let m2 = _x64_decode_modrm(bytes, p, 8, has_rex, rex_r, rex_x, rex_b, true);
+            if _is_true(m2.ok) { p = m2.next_pos; mnem = alu_mnem; ops = m2.reg_str + ", " + m2.rm_str; decoded = true; }
+        } elif sub_kind == 3 {
+            let m3 = _x64_decode_modrm(bytes, p, op_bits, has_rex, rex_r, rex_x, rex_b, true);
+            if _is_true(m3.ok) { p = m3.next_pos; mnem = alu_mnem; ops = m3.reg_str + ", " + m3.rm_str; decoded = true; }
+        } elif sub_kind == 4 and p + 1 <= n {
+            let imm8_a = bytes[p];
+            p = p + 1;
+            mnem = alu_mnem;
+            ops = "al, " + str(imm8_a);
+            decoded = true;
+        } elif sub_kind == 5 {
+            if op_bits == 16 and p + 2 <= n {
+                let imm16_a = _s16(bytes, p);
+                p = p + 2;
+                mnem = alu_mnem; ops = "ax, " + str(imm16_a); decoded = true;
+            } elif op_bits != 16 and p + 4 <= n {
+                let imm32_a = _s32(bytes, p);
+                p = p + 4;
+                mnem = alu_mnem;
+                ops = _x64_reg_name(0, op_bits, has_rex) + ", " + str(imm32_a);
+                decoded = true;
+            }
+        }
+    }
+    // 3. PUSH / POP r64 (0x50..0x5F)
+    elif op >= 80 and op <= 87 {
+        let preg = (op - 80) + (if _is_true(rex_b) { 8 } else { 0 });
+        let pbits = if _is_true(has_66) and not _is_true(rex_w) { 16 } else { 64 };
+        mnem = "push";
+        ops = _x64_reg_name(preg, pbits, has_rex);
+        if preg == 5 and pbits == 64 { is_prologue = true; }
+        decoded = true;
+    } elif op >= 88 and op <= 95 {
+        let popreg = (op - 88) + (if _is_true(rex_b) { 8 } else { 0 });
+        let popbits = if _is_true(has_66) and not _is_true(rex_w) { 16 } else { 64 };
+        mnem = "pop";
+        ops = _x64_reg_name(popreg, popbits, has_rex);
+        decoded = true;
+    }
+    // 4. MOVSXD (0x63), PUSH imm (0x68, 0x6A), IMUL imm (0x69, 0x6B)
+    elif op == 99 {
+        let m_sxd = _x64_decode_modrm(bytes, p, 32, has_rex, rex_r, rex_x, rex_b, true);
+        if _is_true(m_sxd.ok) {
+            p = m_sxd.next_pos;
+            mnem = "movsxd";
+            ops = _x64_reg_name(m_sxd.reg_idx, op_bits, has_rex) + ", " + m_sxd.rm_str;
+            decoded = true;
+        }
+    } elif op == 104 and p + 4 <= n {
+        let pimm32 = _s32(bytes, p);
+        p = p + 4;
+        mnem = "push"; ops = str(pimm32); decoded = true;
+    } elif op == 106 and p + 1 <= n {
+        let pimm8 = _s8(bytes[p]);
+        p = p + 1;
+        mnem = "push"; ops = str(pimm8); decoded = true;
+    } elif op == 105 {
+        let m_im32 = _x64_decode_modrm(bytes, p, op_bits, has_rex, rex_r, rex_x, rex_b, true);
+        if _is_true(m_im32.ok) and m_im32.next_pos + 4 <= n {
+            let imv32 = _s32(bytes, m_im32.next_pos);
+            p = m_im32.next_pos + 4;
+            mnem = "imul"; ops = m_im32.reg_str + ", " + m_im32.rm_str + ", " + str(imv32); decoded = true;
+        }
+    } elif op == 107 {
+        let m_im8 = _x64_decode_modrm(bytes, p, op_bits, has_rex, rex_r, rex_x, rex_b, true);
+        if _is_true(m_im8.ok) and m_im8.next_pos + 1 <= n {
+            let imv8 = _s8(bytes[m_im8.next_pos]);
+            p = m_im8.next_pos + 1;
+            mnem = "imul"; ops = m_im8.reg_str + ", " + m_im8.rm_str + ", " + str(imv8); decoded = true;
+        }
+    }
+    // 5. Short conditional jumps 0x70..0x7F
+    elif op >= 112 and op <= 127 and p + 1 <= n {
+        let rel8_cc = _s8(bytes[p]);
+        p = p + 1;
+        target_off = p + rel8_cc;
+        mnem = "j" + _X64_CC_NAMES[op - 112];
+        ops = "loc_" + str(base_addr + target_off);
+        flow = "cond_jump";
+        decoded = true;
+    }
+    // 6. Immediate ALU Group 1 (0x80, 0x81, 0x83)
+    elif op == 128 or op == 129 or op == 131 {
+        let g1_bits = if op == 128 { 8 } else { op_bits };
+        let m_g1 = _x64_decode_modrm(bytes, p, g1_bits, has_rex, rex_r, rex_x, rex_b, true);
+        if _is_true(m_g1.ok) {
+            let g1_op = _X64_ALU_OPS[m_g1.reg_low];
+            if op == 128 and m_g1.next_pos + 1 <= n {
+                let imm_g8 = bytes[m_g1.next_pos];
+                p = m_g1.next_pos + 1;
+                mnem = g1_op; ops = m_g1.rm_str + ", " + str(imm_g8); decoded = true;
+            } elif op == 131 and m_g1.next_pos + 1 <= n {
+                let imm_s8 = _s8(bytes[m_g1.next_pos]);
+                p = m_g1.next_pos + 1;
+                mnem = g1_op; ops = m_g1.rm_str + ", " + str(imm_s8); decoded = true;
+                if g1_op == "sub" and m_g1.mod_bits == 3 and m_g1.rm_idx == 4 and imm_s8 > 0 {
+                    stack_alloc = imm_s8;
+                }
+            } elif op == 129 {
+                if g1_bits == 16 and m_g1.next_pos + 2 <= n {
+                    let imm_g16 = _s16(bytes, m_g1.next_pos);
+                    p = m_g1.next_pos + 2;
+                    mnem = g1_op; ops = m_g1.rm_str + ", " + str(imm_g16); decoded = true;
+                } elif g1_bits != 16 and m_g1.next_pos + 4 <= n {
+                    let imm_g32 = _s32(bytes, m_g1.next_pos);
+                    p = m_g1.next_pos + 4;
+                    mnem = g1_op; ops = m_g1.rm_str + ", " + str(imm_g32); decoded = true;
+                    if g1_op == "sub" and m_g1.mod_bits == 3 and m_g1.rm_idx == 4 and imm_g32 > 0 {
+                        stack_alloc = imm_g32;
+                    }
+                }
+            }
+        }
+    }
+    // 7. TEST (0x84, 0x85), XCHG (0x86, 0x87), MOV (0x88..0x8B), LEA (0x8D)
+    elif op == 132 or op == 133 {
+        let tbits = if op == 132 { 8 } else { op_bits };
+        let m_tst = _x64_decode_modrm(bytes, p, tbits, has_rex, rex_r, rex_x, rex_b, true);
+        if _is_true(m_tst.ok) {
+            p = m_tst.next_pos;
+            mnem = "test"; ops = m_tst.rm_str + ", " + m_tst.reg_str; decoded = true;
+        }
+    } elif op == 134 or op == 135 {
+        let xbits = if op == 134 { 8 } else { op_bits };
+        let m_xch = _x64_decode_modrm(bytes, p, xbits, has_rex, rex_r, rex_x, rex_b, true);
+        if _is_true(m_xch.ok) {
+            p = m_xch.next_pos;
+            mnem = "xchg"; ops = m_xch.rm_str + ", " + m_xch.reg_str; decoded = true;
+        }
+    } elif op >= 136 and op <= 139 {
+        let mvbits = if op == 136 or op == 138 { 8 } else { op_bits };
+        let m_mv = _x64_decode_modrm(bytes, p, mvbits, has_rex, rex_r, rex_x, rex_b, true);
+        if _is_true(m_mv.ok) {
+            p = m_mv.next_pos;
+            mnem = "mov";
+            if op == 136 or op == 137 {
+                ops = m_mv.rm_str + ", " + m_mv.reg_str;
+                if op == 137 and _is_true(rex_w) and m_mv.mod_bits == 3 and m_mv.rm_idx == 5 and m_mv.reg_idx == 4 {
+                    is_prologue = true;
+                }
+            } else {
+                ops = m_mv.reg_str + ", " + m_mv.rm_str;
+            }
+            decoded = true;
+        }
+    } elif op == 141 {
+        let m_lea = _x64_decode_modrm(bytes, p, op_bits, has_rex, rex_r, rex_x, rex_b, false);
+        if _is_true(m_lea.ok) {
+            p = m_lea.next_pos;
+            mnem = "lea"; ops = m_lea.reg_str + ", " + m_lea.rm_str; decoded = true;
+        }
+    }
+    // 8. NOP (0x90), CDQ/CQO (0x99), TEST imm (0xA8, 0xA9)
+    elif op == 144 {
+        if _is_true(rex_b) {
+            mnem = "xchg";
+            ops = _x64_reg_name(0, op_bits, has_rex) + ", " + _x64_reg_name(8, op_bits, has_rex);
+        } else {
+            mnem = "nop"; ops = "";
+        }
+        decoded = true;
+    } elif op == 153 {
+        mnem = if _is_true(rex_w) { "cqo" } else { "cdq" };
+        ops = ""; decoded = true;
+    } elif op == 168 and p + 1 <= n {
+        mnem = "test"; ops = "al, " + str(bytes[p]); p = p + 1; decoded = true;
+    } elif op == 169 and p + 4 <= n {
+        mnem = "test"; ops = _x64_reg_name(0, op_bits, has_rex) + ", " + str(_s32(bytes, p)); p = p + 4; decoded = true;
+    }
+    // 9. MOV reg, imm (0xB0..0xBF) & MOV r/m, imm (0xC6, 0xC7)
+    elif op >= 176 and op <= 183 and p + 1 <= n {
+        let r8_i = (op - 176) + (if _is_true(rex_b) { 8 } else { 0 });
+        mnem = "mov"; ops = _x64_reg_name(r8_i, 8, has_rex) + ", " + str(bytes[p]);
+        p = p + 1; decoded = true;
+    } elif op >= 184 and op <= 191 {
+        let r_i = (op - 184) + (if _is_true(rex_b) { 8 } else { 0 });
+        if _is_true(rex_w) and p + 8 <= n {
+            let lo32 = _u32(bytes, p, true);
+            let hi32 = _u32(bytes, p + 4, true);
+            p = p + 8;
+            mnem = "movabs";
+            if hi32 == 0 {
+                ops = _X64_GPR64[r_i] + ", " + str(lo32);
+            } else {
+                ops = _X64_GPR64[r_i] + ", 0x" + _slice_hex([
+                    bit_and(bit_shr(hi32, 24), 255), bit_and(bit_shr(hi32, 16), 255),
+                    bit_and(bit_shr(hi32, 8), 255), bit_and(hi32, 255),
+                    bit_and(bit_shr(lo32, 24), 255), bit_and(bit_shr(lo32, 16), 255),
+                    bit_and(bit_shr(lo32, 8), 255), bit_and(lo32, 255)
+                ], 0, 8);
+            }
+            decoded = true;
+        } elif op_bits == 16 and p + 2 <= n {
+            mnem = "mov"; ops = _X64_GPR16[r_i] + ", " + str(_u16(bytes, p, true));
+            p = p + 2; decoded = true;
+        } elif op_bits == 32 and p + 4 <= n {
+            mnem = "mov"; ops = _X64_GPR32[r_i] + ", " + str(_u32(bytes, p, true));
+            p = p + 4; decoded = true;
+        }
+    } elif op == 198 or op == 199 {
+        let cbits = if op == 198 { 8 } else { op_bits };
+        let m_c = _x64_decode_modrm(bytes, p, cbits, has_rex, rex_r, rex_x, rex_b, true);
+        if _is_true(m_c.ok) and m_c.reg_low == 0 {
+            if op == 198 and m_c.next_pos + 1 <= n {
+                mnem = "mov"; ops = m_c.rm_str + ", " + str(bytes[m_c.next_pos]);
+                p = m_c.next_pos + 1; decoded = true;
+            } elif op == 199 and cbits == 16 and m_c.next_pos + 2 <= n {
+                mnem = "mov"; ops = m_c.rm_str + ", " + str(_s16(bytes, m_c.next_pos));
+                p = m_c.next_pos + 2; decoded = true;
+            } elif op == 199 and cbits != 16 and m_c.next_pos + 4 <= n {
+                mnem = "mov"; ops = m_c.rm_str + ", " + str(_s32(bytes, m_c.next_pos));
+                p = m_c.next_pos + 4; decoded = true;
+            }
+        }
+    }
+    // 10. Shifts Group 2 (0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3)
+    elif op == 192 or op == 193 or (op >= 208 and op <= 211) {
+        let sbits = if op == 192 or op == 208 or op == 210 { 8 } else { op_bits };
+        let m_sh = _x64_decode_modrm(bytes, p, sbits, has_rex, rex_r, rex_x, rex_b, true);
+        if _is_true(m_sh.ok) {
+            let sh_mnem = _X64_SHIFT_OPS[m_sh.reg_low];
+            if (op == 192 or op == 193) and m_sh.next_pos + 1 <= n {
+                mnem = sh_mnem; ops = m_sh.rm_str + ", " + str(bytes[m_sh.next_pos]);
+                p = m_sh.next_pos + 1; decoded = true;
+            } elif op == 208 or op == 209 {
+                mnem = sh_mnem; ops = m_sh.rm_str + ", 1";
+                p = m_sh.next_pos; decoded = true;
+            } elif op == 210 or op == 211 {
+                mnem = sh_mnem; ops = m_sh.rm_str + ", cl";
+                p = m_sh.next_pos; decoded = true;
+            }
+        }
+    }
+    // 11. RET / LEAVE / CALL / JMP
+    elif op == 194 and p + 2 <= n {
+        mnem = "ret"; ops = str(_u16(bytes, p, true)); p = p + 2; flow = "return"; decoded = true;
+    } elif op == 195 {
+        mnem = "ret"; ops = ""; flow = "return"; decoded = true;
+    } elif op == 201 {
+        mnem = "leave"; ops = ""; decoded = true;
+    } elif op == 232 and p + 4 <= n {
+        let rel_call = _s32(bytes, p);
+        p = p + 4;
+        target_off = p + rel_call;
+        mnem = "call"; ops = "sub_" + str(base_addr + target_off); flow = "call"; decoded = true;
+    } elif op == 233 and p + 4 <= n {
+        let rel_jmp = _s32(bytes, p);
+        p = p + 4;
+        target_off = p + rel_jmp;
+        mnem = "jmp"; ops = "loc_" + str(base_addr + target_off); flow = "jump"; decoded = true;
+    } elif op == 235 and p + 1 <= n {
+        let rel_j8 = _s8(bytes[p]);
+        p = p + 1;
+        target_off = p + rel_j8;
+        mnem = "jmp"; ops = "loc_" + str(base_addr + target_off); flow = "jump"; decoded = true;
+    }
+    // 12. Unary Group 3 (0xF6, 0xF7: test/not/neg/mul/imul/div/idiv) & Group 4/5 (0xFE, 0xFF)
+    elif op == 246 or op == 247 {
+        let g3bits = if op == 246 { 8 } else { op_bits };
+        let m_g3 = _x64_decode_modrm(bytes, p, g3bits, has_rex, rex_r, rex_x, rex_b, true);
+        if _is_true(m_g3.ok) {
+            let g3_sub = m_g3.reg_low;
+            if g3_sub == 0 or g3_sub == 1 {
+                if op == 246 and m_g3.next_pos + 1 <= n {
+                    mnem = "test"; ops = m_g3.rm_str + ", " + str(bytes[m_g3.next_pos]);
+                    p = m_g3.next_pos + 1; decoded = true;
+                } elif op == 247 and g3bits == 16 and m_g3.next_pos + 2 <= n {
+                    mnem = "test"; ops = m_g3.rm_str + ", " + str(_s16(bytes, m_g3.next_pos));
+                    p = m_g3.next_pos + 2; decoded = true;
+                } elif op == 247 and g3bits != 16 and m_g3.next_pos + 4 <= n {
+                    mnem = "test"; ops = m_g3.rm_str + ", " + str(_s32(bytes, m_g3.next_pos));
+                    p = m_g3.next_pos + 4; decoded = true;
+                }
+            } else {
+                let g3_names = ["test", "test", "not", "neg", "mul", "imul", "div", "idiv"];
+                mnem = g3_names[g3_sub];
+                ops = m_g3.rm_str;
+                p = m_g3.next_pos;
+                decoded = true;
+            }
+        }
+    } elif op == 254 or op == 255 {
+        let g5bits = if op == 254 { 8 } else { op_bits };
+        let m_g5 = _x64_decode_modrm(bytes, p, g5bits, has_rex, rex_r, rex_x, rex_b, true);
+        if _is_true(m_g5.ok) {
+            let g5_sub = m_g5.reg_low;
+            if g5_sub == 0 {
+                mnem = "inc"; ops = m_g5.rm_str; p = m_g5.next_pos; decoded = true;
+            } elif g5_sub == 1 {
+                mnem = "dec"; ops = m_g5.rm_str; p = m_g5.next_pos; decoded = true;
+            } elif op == 255 and g5_sub == 2 {
+                let m_indc = _x64_decode_modrm(bytes, p, 64, has_rex, rex_r, rex_x, rex_b, true);
+                mnem = "call"; ops = m_indc.rm_str; p = m_indc.next_pos; flow = "call"; decoded = true;
+            } elif op == 255 and g5_sub == 4 {
+                let m_indj = _x64_decode_modrm(bytes, p, 64, has_rex, rex_r, rex_x, rex_b, true);
+                mnem = "jmp"; ops = m_indj.rm_str; p = m_indj.next_pos; flow = "jump"; decoded = true;
+            } elif op == 255 and g5_sub == 6 {
+                let m_indp = _x64_decode_modrm(bytes, p, 64, has_rex, rex_r, rex_x, rex_b, true);
+                mnem = "push"; ops = m_indp.rm_str; p = m_indp.next_pos; decoded = true;
+            }
+        }
+    }
+
+    if not _is_true(decoded) {
+        p = pc + 1;
+        mnem = "db";
+        ops = "0x" + _hex_byte(bytes[pc]);
+    }
+
+    let sz = p - pc;
+    let tgt_addr = if target_off >= 0 { base_addr + target_off } else { -1 };
+    let text_str = if ops == "" { mnem } else { mnem + " " + ops };
+    return map{
+        offset: pc,
+        address: addr,
+        size: sz,
+        bytes_hex: _slice_hex(bytes, pc, sz),
+        mnemonic: mnem,
+        operands: ops,
+        text: text_str,
+        flow: flow,
+        target_offset: target_off,
+        target_address: tgt_addr,
+        is_prologue: is_prologue,
+        stack_alloc: stack_alloc
+    };
+}
+
+fn disassemble_x86_64(bytes_or_hex, base_addr = 0) {
+    let bytes = _coerce_code_bytes(bytes_or_hex);
+    let out = [];
+    let pc = 0;
+    while pc < len(bytes) and len(out) < 2048 {
+        let ins = decode_one_x86_64(bytes, pc, base_addr);
+        push(out, ins);
+        pc = pc + ins.size;
+    }
+    return out;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 5B. Genuine ARM64 / A64 32-Bit Little-Endian Instruction Decoder
+// ══════════════════════════════════════════════════════════════════════════════
+
+let _A64_COND_NAMES = ["eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv"];
+let _A64_SHIFT_NAMES = ["lsl", "lsr", "asr", "ror"];
+
+fn _a64_reg(idx, sf, allow_sp) {
+    let r = bit_and(idx, 31);
+    if r == 31 {
+        if _is_true(allow_sp) {
+            return if sf == 1 { "sp" } else { "wsp" };
+        }
+        return if sf == 1 { "xzr" } else { "wzr" };
+    }
+    return (if sf == 1 { "x" } else { "w" }) + str(r);
+}
+
+fn decode_one_arm64(bytes, pc, base_addr = 0) {
+    let addr = base_addr + pc;
+    if pc + 4 > len(bytes) {
+        let b0 = bytes[pc];
+        return map{
+            offset: pc, address: addr, size: 1, bytes_hex: _hex_byte(b0),
+            mnemonic: "db", operands: "0x" + _hex_byte(b0), text: "db 0x" + _hex_byte(b0),
+            flow: "sequential", target_offset: -1, target_address: -1,
+            is_prologue: false, stack_alloc: 0
+        };
+    }
+
+    let w = _u32(bytes, pc, true);
+    let mnem = ".word";
+    let ops = "0x" + _slice_hex(bytes, pc, 4);
+    let flow = "sequential";
+    let target_off = -1;
+    let is_prologue = false;
+    let stack_alloc = 0;
+
+    // 1. NOP, RET, BLR, BR, SVC
+    if w == 3573751839 { // 0xD503201F
+        mnem = "nop"; ops = "";
+    } elif bit_and(w, 4294966303) == 3596550144 { // (w & 0xFFFFFC1F) == 0xD65F0000
+        let rn_ret = _bits(w, 9, 5);
+        mnem = "ret";
+        ops = "x" + str(rn_ret);
+        flow = "return";
+    } elif bit_and(w, 4294966303) == 3594452992 { // 0xD63F0000 BLR
+        let rn_blr = _bits(w, 9, 5);
+        mnem = "blr"; ops = "x" + str(rn_blr); flow = "call";
+    } elif bit_and(w, 4294966303) == 3592355840 { // 0xD61F0000 BR
+        let rn_br = _bits(w, 9, 5);
+        mnem = "br"; ops = "x" + str(rn_br); flow = "jump";
+    } elif bit_and(w, 4292870175) == 3556769793 { // (w & 0xFFE0001F) == 0xD4000001 SVC
+        let svc_imm = _bits(w, 20, 5);
+        mnem = "svc"; ops = "#" + str(svc_imm); flow = "syscall";
+    }
+    // 2. B / BL (bits[30:26] == 0b00101 == 5)
+    elif _bits(w, 30, 26) == 5 {
+        let is_bl = _bits(w, 31, 31) == 1;
+        let imm26 = _sext(_bits(w, 25, 0), 26) * 4;
+        target_off = pc + imm26;
+        if _is_true(is_bl) {
+            mnem = "bl"; ops = "sub_" + str(base_addr + target_off); flow = "call";
+        } else {
+            mnem = "b"; ops = "loc_" + str(base_addr + target_off); flow = "jump";
+        }
+    }
+    // 3. B.cond (bits[31:24] == 0x54 == 84, bit[4] == 0)
+    elif _bits(w, 31, 24) == 84 and _bits(w, 4, 4) == 0 {
+        let cond_c = _bits(w, 3, 0);
+        let imm19_b = _sext(_bits(w, 23, 5), 19) * 4;
+        target_off = pc + imm19_b;
+        mnem = "b." + _A64_COND_NAMES[cond_c];
+        ops = "loc_" + str(base_addr + target_off);
+        flow = "cond_jump";
+    }
+    // 4. CBZ / CBNZ (bits[30:25] == 0b011010 == 26)
+    elif _bits(w, 30, 25) == 26 {
+        let sf_cb = _bits(w, 31, 31);
+        let op_cb = _bits(w, 24, 24);
+        let imm19_cb = _sext(_bits(w, 23, 5), 19) * 4;
+        let rt_cb = _bits(w, 4, 0);
+        target_off = pc + imm19_cb;
+        mnem = if op_cb == 0 { "cbz" } else { "cbnz" };
+        ops = _a64_reg(rt_cb, sf_cb, false) + ", loc_" + str(base_addr + target_off);
+        flow = "cond_jump";
+    }
+    // 5. MOVN / MOVZ / MOVK (bits[28:23] == 0b100101 == 37)
+    elif _bits(w, 28, 23) == 37 {
+        let sf_mw = _bits(w, 31, 31);
+        let opc_mw = _bits(w, 30, 29);
+        let hw_mw = _bits(w, 22, 21);
+        let imm16_mw = _bits(w, 20, 5);
+        let rd_mw = _bits(w, 4, 0);
+        if opc_mw == 0 { mnem = "movn"; }
+        elif opc_mw == 2 { mnem = "movz"; }
+        elif opc_mw == 3 { mnem = "movk"; }
+        if mnem != ".word" {
+            let sh_amt = hw_mw * 16;
+            ops = _a64_reg(rd_mw, sf_mw, false) + ", #" + str(imm16_mw);
+            if sh_amt > 0 { ops = ops + ", lsl #" + str(sh_amt); }
+        }
+    }
+    // 6. ADR / ADRP (bits[28:24] == 0b10000 == 16)
+    elif _bits(w, 28, 24) == 16 {
+        let is_adrp = _bits(w, 31, 31) == 1;
+        let immlo = _bits(w, 30, 29);
+        let immhi = _bits(w, 23, 5);
+        let imm21 = _sext(bit_shl(immhi, 2) + immlo, 21);
+        let rd_adr = _bits(w, 4, 0);
+        mnem = if _is_true(is_adrp) { "adrp" } else { "adr" };
+        let scale_adr = if _is_true(is_adrp) { imm21 * 4096 } else { imm21 };
+        ops = _a64_reg(rd_adr, 1, false) + ", #" + str(scale_adr);
+    }
+    // 7. ADD / ADDS / SUB / SUBS / CMP (Immediate: bits[28:23] == 0b100010 == 34)
+    elif _bits(w, 28, 23) == 34 {
+        let sf_ai = _bits(w, 31, 31);
+        let op_ai = _bits(w, 30, 30);
+        let s_ai = _bits(w, 29, 29);
+        let sh_ai = _bits(w, 22, 22);
+        let imm12_ai = _bits(w, 21, 10);
+        let rn_ai = _bits(w, 9, 5);
+        let rd_ai = _bits(w, 4, 0);
+        let val_ai = if sh_ai == 1 { imm12_ai * 4096 } else { imm12_ai };
+        if op_ai == 1 and s_ai == 1 and rd_ai == 31 {
+            mnem = "cmp";
+            ops = _a64_reg(rn_ai, sf_ai, true) + ", #" + str(val_ai);
+        } elif op_ai == 0 and s_ai == 1 and rd_ai == 31 {
+            mnem = "cmn";
+            ops = _a64_reg(rn_ai, sf_ai, true) + ", #" + str(val_ai);
+        } else {
+            let ai_names = ["add", "adds", "sub", "subs"];
+            mnem = ai_names[op_ai * 2 + s_ai];
+            let rd_allow_sp = (s_ai == 0);
+            ops = _a64_reg(rd_ai, sf_ai, rd_allow_sp) + ", " + _a64_reg(rn_ai, sf_ai, true) + ", #" + str(val_ai);
+            if mnem == "sub" and sf_ai == 1 and rd_ai == 31 and rn_ai == 31 and val_ai > 0 {
+                stack_alloc = val_ai;
+                is_prologue = true;
+            }
+        }
+    }
+    // 8. ADD / ADDS / SUB / SUBS / CMP (Shifted Register: bits[28:24] == 11, bit[21] == 0)
+    elif _bits(w, 28, 24) == 11 and _bits(w, 21, 21) == 0 {
+        let sf_ar = _bits(w, 31, 31);
+        let op_ar = _bits(w, 30, 30);
+        let s_ar = _bits(w, 29, 29);
+        let sh_type = _bits(w, 23, 22);
+        let rm_ar = _bits(w, 20, 16);
+        let imm6_ar = _bits(w, 15, 10);
+        let rn_ar = _bits(w, 9, 5);
+        let rd_ar = _bits(w, 4, 0);
+        let sh_suffix = if imm6_ar > 0 { ", " + _A64_SHIFT_NAMES[sh_type] + " #" + str(imm6_ar) } else { "" };
+        if op_ar == 1 and s_ar == 1 and rd_ar == 31 {
+            mnem = "cmp";
+            ops = _a64_reg(rn_ar, sf_ar, false) + ", " + _a64_reg(rm_ar, sf_ar, false) + sh_suffix;
+        } else {
+            let ar_names = ["add", "adds", "sub", "subs"];
+            mnem = ar_names[op_ar * 2 + s_ar];
+            ops = _a64_reg(rd_ar, sf_ar, false) + ", " + _a64_reg(rn_ar, sf_ar, false) + ", " + _a64_reg(rm_ar, sf_ar, false) + sh_suffix;
+        }
+    }
+    // 9. Logical Shifted Register (AND / ORR / MOV / EOR / ANDS / TST: bits[28:24] == 10)
+    elif _bits(w, 28, 24) == 10 {
+        let sf_lg = _bits(w, 31, 31);
+        let opc_lg = _bits(w, 30, 29);
+        let n_lg = _bits(w, 21, 21);
+        let rm_lg = _bits(w, 20, 16);
+        let imm6_lg = _bits(w, 15, 10);
+        let rn_lg = _bits(w, 9, 5);
+        let rd_lg = _bits(w, 4, 0);
+        if opc_lg == 1 and n_lg == 0 and rn_lg == 31 and imm6_lg == 0 {
+            mnem = "mov";
+            ops = _a64_reg(rd_lg, sf_lg, false) + ", " + _a64_reg(rm_lg, sf_lg, false);
+        } elif opc_lg == 3 and n_lg == 0 and rd_lg == 31 and imm6_lg == 0 {
+            mnem = "tst";
+            ops = _a64_reg(rn_lg, sf_lg, false) + ", " + _a64_reg(rm_lg, sf_lg, false);
+        } else {
+            let lg_names = ["and", "orr", "eor", "ands"];
+            mnem = lg_names[opc_lg];
+            ops = _a64_reg(rd_lg, sf_lg, false) + ", " + _a64_reg(rn_lg, sf_lg, false) + ", " + _a64_reg(rm_lg, sf_lg, false);
+        }
+    }
+    // 10. MADD / MSUB / MUL (bits[28:21] == 0b11011000 == 216)
+    elif _bits(w, 28, 21) == 216 {
+        let sf_m = _bits(w, 31, 31);
+        let rm_m = _bits(w, 20, 16);
+        let o0_m = _bits(w, 15, 15);
+        let ra_m = _bits(w, 14, 10);
+        let rn_m = _bits(w, 9, 5);
+        let rd_m = _bits(w, 4, 0);
+        if o0_m == 0 and ra_m == 31 {
+            mnem = "mul";
+            ops = _a64_reg(rd_m, sf_m, false) + ", " + _a64_reg(rn_m, sf_m, false) + ", " + _a64_reg(rm_m, sf_m, false);
+        } else {
+            mnem = if o0_m == 0 { "madd" } else { "msub" };
+            ops = _a64_reg(rd_m, sf_m, false) + ", " + _a64_reg(rn_m, sf_m, false) + ", " + _a64_reg(rm_m, sf_m, false) + ", " + _a64_reg(ra_m, sf_m, false);
+        }
+    }
+    // 11. STP / LDP (bits[29:27] == 5, bit[26] == 0)
+    elif _bits(w, 29, 27) == 5 and _bits(w, 26, 26) == 0 {
+        let opc_p = _bits(w, 31, 30);
+        let mode_p = _bits(w, 25, 23);
+        let l_p = _bits(w, 22, 22);
+        let imm7_p = _sext(_bits(w, 21, 15), 7);
+        let rt2_p = _bits(w, 14, 10);
+        let rn_p = _bits(w, 9, 5);
+        let rt1_p = _bits(w, 4, 0);
+        let sf_p = if opc_p >= 2 { 1 } else { 0 };
+        let scale_p = if sf_p == 1 { 8 } else { 4 };
+        let disp_p = imm7_p * scale_p;
+        mnem = if l_p == 0 { "stp" } else { "ldp" };
+        let r1s = _a64_reg(rt1_p, sf_p, false);
+        let r2s = _a64_reg(rt2_p, sf_p, false);
+        let bs = _a64_reg(rn_p, 1, true);
+        if mode_p == 3 {
+            ops = r1s + ", " + r2s + ", [" + bs + ", #" + str(disp_p) + "]!";
+            if l_p == 0 and rn_p == 31 and disp_p < 0 {
+                is_prologue = true;
+                stack_alloc = 0 - disp_p;
+            }
+        } elif mode_p == 1 {
+            ops = r1s + ", " + r2s + ", [" + bs + "], #" + str(disp_p);
+        } else {
+            if disp_p == 0 {
+                ops = r1s + ", " + r2s + ", [" + bs + "]";
+            } else {
+                ops = r1s + ", " + r2s + ", [" + bs + ", #" + str(disp_p) + "]";
+            }
+        }
+    }
+    // 12. LDR / STR / LDRB / STRB / LDRH / STRH (bits[29:27] == 7, bit[26] == 0)
+    elif _bits(w, 29, 27) == 7 and _bits(w, 26, 26) == 0 {
+        let sz_ls = _bits(w, 31, 30);
+        let mode_ls = _bits(w, 25, 24);
+        let opc_ls = _bits(w, 23, 22);
+        let rn_ls = _bits(w, 9, 5);
+        let rt_ls = _bits(w, 4, 0);
+        let sf_ls = if sz_ls == 3 { 1 } else { 0 };
+        let ls_mnem = "";
+        if opc_ls == 0 {
+            if sz_ls == 0 { ls_mnem = "strb"; }
+            elif sz_ls == 1 { ls_mnem = "strh"; }
+            else { ls_mnem = "str"; }
+        } elif opc_ls == 1 {
+            if sz_ls == 0 { ls_mnem = "ldrb"; }
+            elif sz_ls == 1 { ls_mnem = "ldrh"; }
+            else { ls_mnem = "ldr"; }
+        }
+        if ls_mnem != "" {
+            let base_ls = _a64_reg(rn_ls, 1, true);
+            let reg_ls = _a64_reg(rt_ls, sf_ls, false);
+            if mode_ls == 1 {
+                let imm12_ls = _bits(w, 21, 10) * bit_shl(1, sz_ls);
+                mnem = ls_mnem;
+                if imm12_ls == 0 {
+                    ops = reg_ls + ", [" + base_ls + "]";
+                } else {
+                    ops = reg_ls + ", [" + base_ls + ", #" + str(imm12_ls) + "]";
+                }
+            } elif mode_ls == 0 and _bits(w, 21, 21) == 0 {
+                let imm9_ls = _sext(_bits(w, 20, 12), 9);
+                let idx_ls = _bits(w, 11, 10);
+                mnem = ls_mnem;
+                if idx_ls == 3 {
+                    ops = reg_ls + ", [" + base_ls + ", #" + str(imm9_ls) + "]!";
+                } elif idx_ls == 1 {
+                    ops = reg_ls + ", [" + base_ls + "], #" + str(imm9_ls);
+                } else {
+                    if mnem == "ldr" and imm9_ls < 0 { mnem = "ldur"; }
+                    elif mnem == "str" and imm9_ls < 0 { mnem = "stur"; }
+                    ops = reg_ls + ", [" + base_ls + ", #" + str(imm9_ls) + "]";
+                }
+            }
+        }
+    }
+
+    let tgt_addr = if target_off >= 0 { base_addr + target_off } else { -1 };
+    let text_str = if ops == "" { mnem } else { mnem + " " + ops };
+    return map{
+        offset: pc,
+        address: addr,
+        size: 4,
+        bytes_hex: _slice_hex(bytes, pc, 4),
+        mnemonic: mnem,
+        operands: ops,
+        text: text_str,
+        flow: flow,
+        target_offset: target_off,
+        target_address: tgt_addr,
+        is_prologue: is_prologue,
+        stack_alloc: stack_alloc
+    };
+}
+
+fn disassemble_arm64(bytes_or_hex, base_addr = 0) {
+    let bytes = _coerce_code_bytes(bytes_or_hex);
+    let out = [];
+    let pc = 0;
+    while pc < len(bytes) and len(out) < 2048 {
+        let ins = decode_one_arm64(bytes, pc, base_addr);
+        push(out, ins);
+        pc = pc + ins.size;
+    }
+    return out;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 5C. Genuine RISC-V RV32IM 32-Bit Little-Endian Instruction Decoder
+// ══════════════════════════════════════════════════════════════════════════════
+
+let _RV_ABI_REGS = [
+    "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+    "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+    "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+    "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"
+];
+
+fn decode_one_rv32im(bytes, pc, base_addr = 0) {
+    let addr = base_addr + pc;
+    if pc + 4 > len(bytes) {
+        let b0 = bytes[pc];
+        return map{
+            offset: pc, address: addr, size: 1, bytes_hex: _hex_byte(b0),
+            mnemonic: "db", operands: "0x" + _hex_byte(b0), text: "db 0x" + _hex_byte(b0),
+            flow: "sequential", target_offset: -1, target_address: -1,
+            is_prologue: false, stack_alloc: 0
+        };
+    }
+
+    let w = _u32(bytes, pc, true);
+    let opcode = bit_and(w, 127);
+    let rd = _bits(w, 11, 7);
+    let funct3 = _bits(w, 14, 12);
+    let rs1 = _bits(w, 19, 15);
+    let rs2 = _bits(w, 24, 20);
+    let funct7 = _bits(w, 31, 25);
+
+    let mnem = ".word";
+    let ops = "0x" + _slice_hex(bytes, pc, 4);
+    let flow = "sequential";
+    let target_off = -1;
+    let is_prologue = false;
+    let stack_alloc = 0;
+
+    if opcode == 55 { // 0x37 LUI
+        let u_imm = _bits(w, 31, 12);
+        mnem = "lui";
+        ops = _RV_ABI_REGS[rd] + ", " + str(u_imm);
+    } elif opcode == 23 { // 0x17 AUIPC
+        let u_imm2 = _bits(w, 31, 12);
+        mnem = "auipc";
+        ops = _RV_ABI_REGS[rd] + ", " + str(u_imm2);
+    } elif opcode == 111 { // 0x6F JAL
+        let j20 = _bits(w, 31, 31);
+        let j10_1 = _bits(w, 30, 21);
+        let j11 = _bits(w, 20, 20);
+        let j19_12 = _bits(w, 19, 12);
+        let j_raw = bit_shl(j20, 20) + bit_shl(j19_12, 12) + bit_shl(j11, 11) + bit_shl(j10_1, 1);
+        let j_imm = _sext(j_raw, 21);
+        target_off = pc + j_imm;
+        mnem = "jal";
+        if rd == 0 {
+            ops = "zero, loc_" + str(base_addr + target_off);
+            flow = "jump";
+        } else {
+            ops = _RV_ABI_REGS[rd] + ", sub_" + str(base_addr + target_off);
+            flow = "call";
+        }
+    } elif opcode == 103 and funct3 == 0 { // 0x67 JALR
+        let i_imm_jr = _sext(_bits(w, 31, 20), 12);
+        mnem = "jalr";
+        ops = _RV_ABI_REGS[rd] + ", " + str(i_imm_jr) + "(" + _RV_ABI_REGS[rs1] + ")";
+        if rd == 0 and rs1 == 1 and i_imm_jr == 0 {
+            flow = "return";
+        } elif rd == 0 {
+            flow = "jump";
+        } else {
+            flow = "call";
+        }
+    } elif opcode == 99 { // 0x63 B-type (beq, bne, blt, bge, bltu, bgeu)
+        let b12 = _bits(w, 31, 31);
+        let b10_5 = _bits(w, 30, 25);
+        let b4_1 = _bits(w, 11, 8);
+        let b11 = _bits(w, 7, 7);
+        let b_raw = bit_shl(b12, 12) + bit_shl(b11, 11) + bit_shl(b10_5, 5) + bit_shl(b4_1, 1);
+        let b_imm = _sext(b_raw, 13);
+        let br_mnem = "";
+        if funct3 == 0 { br_mnem = "beq"; }
+        elif funct3 == 1 { br_mnem = "bne"; }
+        elif funct3 == 4 { br_mnem = "blt"; }
+        elif funct3 == 5 { br_mnem = "bge"; }
+        elif funct3 == 6 { br_mnem = "bltu"; }
+        elif funct3 == 7 { br_mnem = "bgeu"; }
+        if br_mnem != "" {
+            target_off = pc + b_imm;
+            mnem = br_mnem;
+            ops = _RV_ABI_REGS[rs1] + ", " + _RV_ABI_REGS[rs2] + ", loc_" + str(base_addr + target_off);
+            flow = "cond_jump";
+        }
+    } elif opcode == 3 { // 0x03 Loads
+        let l_imm = _sext(_bits(w, 31, 20), 12);
+        if funct3 == 0 { mnem = "lb"; }
+        elif funct3 == 1 { mnem = "lh"; }
+        elif funct3 == 2 { mnem = "lw"; }
+        elif funct3 == 4 { mnem = "lbu"; }
+        elif funct3 == 5 { mnem = "lhu"; }
+        if mnem != ".word" {
+            ops = _RV_ABI_REGS[rd] + ", " + str(l_imm) + "(" + _RV_ABI_REGS[rs1] + ")";
+        }
+    } elif opcode == 35 { // 0x23 Stores
+        let s_raw = bit_shl(funct7, 5) + rd;
+        let s_imm = _sext(s_raw, 12);
+        if funct3 == 0 { mnem = "sb"; }
+        elif funct3 == 1 { mnem = "sh"; }
+        elif funct3 == 2 { mnem = "sw"; }
+        if mnem != ".word" {
+            ops = _RV_ABI_REGS[rs2] + ", " + str(s_imm) + "(" + _RV_ABI_REGS[rs1] + ")";
+            if mnem == "sw" and rs1 == 2 and rs2 == 1 {
+                is_prologue = true;
+            }
+        }
+    } elif opcode == 19 { // 0x13 OP-IMM
+        let imm_i = _sext(_bits(w, 31, 20), 12);
+        if funct3 == 0 {
+            mnem = "addi";
+            ops = _RV_ABI_REGS[rd] + ", " + _RV_ABI_REGS[rs1] + ", " + str(imm_i);
+            if rd == 2 and rs1 == 2 and imm_i < 0 {
+                stack_alloc = 0 - imm_i;
+                is_prologue = true;
+            }
+        } elif funct3 == 2 { mnem = "slti"; ops = _RV_ABI_REGS[rd] + ", " + _RV_ABI_REGS[rs1] + ", " + str(imm_i); }
+        elif funct3 == 3 { mnem = "sltiu"; ops = _RV_ABI_REGS[rd] + ", " + _RV_ABI_REGS[rs1] + ", " + str(imm_i); }
+        elif funct3 == 4 { mnem = "xori"; ops = _RV_ABI_REGS[rd] + ", " + _RV_ABI_REGS[rs1] + ", " + str(imm_i); }
+        elif funct3 == 6 { mnem = "ori"; ops = _RV_ABI_REGS[rd] + ", " + _RV_ABI_REGS[rs1] + ", " + str(imm_i); }
+        elif funct3 == 7 { mnem = "andi"; ops = _RV_ABI_REGS[rd] + ", " + _RV_ABI_REGS[rs1] + ", " + str(imm_i); }
+        elif funct3 == 1 and funct7 == 0 { mnem = "slli"; ops = _RV_ABI_REGS[rd] + ", " + _RV_ABI_REGS[rs1] + ", " + str(rs2); }
+        elif funct3 == 5 and (funct7 == 0 or funct7 == 32) {
+            mnem = if funct7 == 32 { "srai" } else { "srli" };
+            ops = _RV_ABI_REGS[rd] + ", " + _RV_ABI_REGS[rs1] + ", " + str(rs2);
+        }
+    } elif opcode == 51 { // 0x33 OP (R-type + M-extension RV32M)
+        if funct7 == 1 {
+            let m_names = ["mul", "mulh", "mulhsu", "mulhu", "div", "divu", "rem", "remu"];
+            mnem = m_names[funct3];
+            ops = _RV_ABI_REGS[rd] + ", " + _RV_ABI_REGS[rs1] + ", " + _RV_ABI_REGS[rs2];
+        } elif funct7 == 0 or funct7 == 32 {
+            if funct3 == 0 { mnem = if funct7 == 32 { "sub" } else { "add" }; }
+            elif funct3 == 1 and funct7 == 0 { mnem = "sll"; }
+            elif funct3 == 2 and funct7 == 0 { mnem = "slt"; }
+            elif funct3 == 3 and funct7 == 0 { mnem = "sltu"; }
+            elif funct3 == 4 and funct7 == 0 { mnem = "xor"; }
+            elif funct3 == 5 { mnem = if funct7 == 32 { "sra" } else { "srl" }; }
+            elif funct3 == 6 and funct7 == 0 { mnem = "or"; }
+            elif funct3 == 7 and funct7 == 0 { mnem = "and"; }
+            if mnem != ".word" {
+                ops = _RV_ABI_REGS[rd] + ", " + _RV_ABI_REGS[rs1] + ", " + _RV_ABI_REGS[rs2];
+            }
+        }
+    } elif opcode == 115 and funct3 == 0 and rd == 0 and rs1 == 0 { // 0x73 SYSTEM
+        let sys_imm = _bits(w, 31, 20);
+        if sys_imm == 0 { mnem = "ecall"; ops = ""; flow = "syscall"; }
+        elif sys_imm == 1 { mnem = "ebreak"; ops = ""; flow = "trap"; }
+    }
+
+    let tgt_addr = if target_off >= 0 { base_addr + target_off } else { -1 };
+    let text_str = if ops == "" { mnem } else { mnem + " " + ops };
+    return map{
+        offset: pc,
+        address: addr,
+        size: 4,
+        bytes_hex: _slice_hex(bytes, pc, 4),
+        mnemonic: mnem,
+        operands: ops,
+        text: text_str,
+        flow: flow,
+        target_offset: target_off,
+        target_address: tgt_addr,
+        is_prologue: is_prologue,
+        stack_alloc: stack_alloc
+    };
+}
+
+fn disassemble_rv32im(bytes_or_hex, base_addr = 0) {
+    let bytes = _coerce_code_bytes(bytes_or_hex);
+    let out = [];
+    let pc = 0;
+    while pc < len(bytes) and len(out) < 2048 {
+        let ins = decode_one_rv32im(bytes, pc, base_addr);
+        push(out, ins);
+        pc = pc + ins.size;
+    }
+    return out;
+}
+
+fn _normalize_rea_arch(raw_arch) {
+    let a = str_lower(str_trim(raw_arch));
+    if a == "x86_64" or a == "x86-64" or a == "amd64" { return "x86_64"; }
+    if a == "aarch64" or a == "arm64" { return "aarch64"; }
+    if a == "rv32im" or a == "riscv32" or a == "riscv" { return "rv32im"; }
+    if a == "evm" { return "evm"; }
+    if a == "wasm" { return "wasm"; }
+    return "";
+}
+
+fn disassemble_stream(bytes_or_hex, arch = "x86_64", base_addr = 0) {
+    let norm = _normalize_rea_arch(arch);
+    if norm == "x86_64" { return disassemble_x86_64(bytes_or_hex, base_addr); }
+    if norm == "aarch64" { return disassemble_arm64(bytes_or_hex, base_addr); }
+    if norm == "rv32im" { return disassemble_rv32im(bytes_or_hex, base_addr); }
+    throw "disassemble_stream: unsupported architecture: " + str(arch);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 5D. Cooper-Harvey-Kennedy CFG Dominator Tree & Natural Loop Back-Edge Analyzer
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _sort_ints_asc(vals) {
+    let arr = [];
+    for v in vals { push(arr, v); }
+    let i = 1;
+    while i < len(arr) {
+        let key = arr[i];
+        let j = i - 1;
+        while j >= 0 and arr[j] > key {
+            arr[j + 1] = arr[j];
+            j = j - 1;
+        }
+        arr[j + 1] = key;
+        i = i + 1;
+    }
+    return arr;
+}
+
+fn _rpo_dfs_visit(u, succ_idx_list, visited, post_order) {
+    visited[u] = true;
+    let succs = succ_idx_list[u];
+    let i = 0;
+    while i < len(succs) {
+        let v = succs[i];
+        if not _is_true(visited[v]) {
+            _rpo_dfs_visit(v, succ_idx_list, visited, post_order);
+        }
+        i = i + 1;
+    }
+    push(post_order, u);
+}
+
+fn _dom_intersect(b1, b2, idom, rpo_num) {
+    let f1 = b1;
+    let f2 = b2;
+    while f1 != f2 {
+        while rpo_num[f1] > rpo_num[f2] {
+            f1 = idom[f1];
+        }
+        while rpo_num[f2] > rpo_num[f1] {
+            f2 = idom[f2];
+        }
+    }
+    return f1;
+}
+
+fn build_real_cfg(insns) {
+    if type(insns) != "array" or len(insns) == 0 {
+        return map{
+            basic_block_count: 0,
+            edge_count: 0,
+            cyclomatic_complexity: 1,
+            has_standard_prologue: false,
+            stack_frame_bytes: 0,
+            basic_blocks: [],
+            idom: map{},
+            dominators: map{},
+            dominance_frontier: map{},
+            back_edges: [],
+            natural_loops: [],
+            loop_count: 0
+        };
+    }
+
+    let first_ins = insns[0];
+    let last_ins = insns[len(insns) - 1];
+    let base_addr = first_ins.address - first_ins.offset;
+    let start_stream_off = first_ins.offset;
+    let end_stream_off = last_ins.offset + last_ins.size;
+
+    let leaders_raw = [start_stream_off];
+    let has_prologue = false;
+    let stack_frame_bytes = 0;
+
+    for inst in insns {
+        if map_has(inst, "is_prologue") and _is_true(inst.is_prologue) {
+            has_prologue = true;
+        }
+        if map_has(inst, "stack_alloc") and inst.stack_alloc > 0 and stack_frame_bytes == 0 {
+            stack_frame_bytes = inst.stack_alloc;
+        }
+        let fl = inst.flow;
+        let next_off = inst.offset + inst.size;
+        if fl == "jump" or fl == "cond_jump" {
+            if inst.target_offset >= start_stream_off and inst.target_offset < end_stream_off {
+                if not _has(leaders_raw, inst.target_offset) {
+                    push(leaders_raw, inst.target_offset);
+                }
+            }
+            if next_off < end_stream_off and not _has(leaders_raw, next_off) {
+                push(leaders_raw, next_off);
+            }
+        } elif fl == "return" or fl == "trap" {
+            if next_off < end_stream_off and not _has(leaders_raw, next_off) {
+                push(leaders_raw, next_off);
+            }
+        }
+    }
+
+    let leaders = _sort_ints_asc(leaders_raw);
+    let n_blocks = len(leaders);
+
+    // Map instruction/leader address -> containing block index
+    let addr_to_bb = map{};
+    let bi = 0;
+    while bi < n_blocks {
+        let s_off = leaders[bi];
+        let e_off = if bi + 1 < n_blocks { leaders[bi + 1] } else { end_stream_off };
+        addr_to_bb[str(base_addr + s_off)] = bi;
+        for inst in insns {
+            if inst.offset >= s_off and inst.offset < e_off {
+                addr_to_bb[str(inst.address)] = bi;
+            }
+        }
+        bi = bi + 1;
+    }
+
+    let basic_blocks = [];
+    let succ_idx_list = [];
+    let pred_idx_list = [];
+    bi = 0;
+    while bi < n_blocks {
+        push(succ_idx_list, []);
+        push(pred_idx_list, []);
+        bi = bi + 1;
+    }
+
+    let edge_count = 0;
+    bi = 0;
+    while bi < n_blocks {
+        let start_off = leaders[bi];
+        let next_off = if bi + 1 < n_blocks { leaders[bi + 1] } else { end_stream_off };
+        let bb_insts = [];
+        let term_flow = "fallthrough";
+        let last_bb_inst = nil;
+
+        for inst in insns {
+            if inst.offset >= start_off and inst.offset < next_off {
+                push(bb_insts, inst);
+                term_flow = inst.flow;
+                last_bb_inst = inst;
+            }
+        }
+
+        let out_edges = [];
+        if last_bb_inst != nil {
+            if term_flow == "cond_jump" {
+                if last_bb_inst.target_offset >= 0 {
+                    push(out_edges, base_addr + last_bb_inst.target_offset);
+                }
+                if next_off < end_stream_off {
+                    push(out_edges, base_addr + next_off);
+                }
+            } elif term_flow == "jump" {
+                if last_bb_inst.target_offset >= 0 {
+                    push(out_edges, base_addr + last_bb_inst.target_offset);
+                }
+            } elif term_flow != "return" and term_flow != "trap" {
+                if next_off < end_stream_off {
+                    push(out_edges, base_addr + next_off);
+                }
+            }
+        }
+
+        for edge_addr in out_edges {
+            let k_addr = str(edge_addr);
+            if map_has(addr_to_bb, k_addr) {
+                let dst_bi = addr_to_bb[k_addr];
+                if not _has(succ_idx_list[bi], dst_bi) {
+                    push(succ_idx_list[bi], dst_bi);
+                }
+                if not _has(pred_idx_list[dst_bi], bi) {
+                    push(pred_idx_list[dst_bi], bi);
+                }
+            }
+        }
+
+        edge_count = edge_count + len(out_edges);
+        push(basic_blocks, map{
+            block_id: "bb_" + str(bi),
+            index: bi,
+            start_address: base_addr + start_off,
+            end_address: base_addr + next_off,
+            instruction_count: len(bb_insts),
+            instructions: bb_insts,
+            terminator: term_flow,
+            out_edges: out_edges,
+            preds: [],
+            succs: [],
+            idom: nil,
+            loop_depth: 0
+        });
+        bi = bi + 1;
+    }
+
+    // Populate human-readable preds/succs IDs
+    bi = 0;
+    while bi < n_blocks {
+        let p_ids = [];
+        for pi in pred_idx_list[bi] { push(p_ids, "bb_" + str(pi)); }
+        let s_ids = [];
+        for si in succ_idx_list[bi] { push(s_ids, "bb_" + str(si)); }
+        basic_blocks[bi].preds = p_ids;
+        basic_blocks[bi].succs = s_ids;
+        bi = bi + 1;
+    }
+
+    // Reverse Post-Order traversal from entry block 0
+    let visited = [];
+    let rpo_num = [];
+    let idom = [];
+    bi = 0;
+    while bi < n_blocks {
+        push(visited, false);
+        push(rpo_num, 999999);
+        push(idom, -1);
+        bi = bi + 1;
+    }
+
+    let post_order = [];
+    _rpo_dfs_visit(0, succ_idx_list, visited, post_order);
+    let rpo_order = [];
+    let poi = len(post_order) - 1;
+    while poi >= 0 {
+        let node_i = post_order[poi];
+        rpo_num[node_i] = len(rpo_order);
+        push(rpo_order, node_i);
+        poi = poi - 1;
+    }
+
+    // Cooper-Harvey-Kennedy Iterative Dominator Solver
+    idom[0] = 0;
+    let changed = true;
+    while _is_true(changed) {
+        changed = false;
+        let ri = 1;
+        while ri < len(rpo_order) {
+            let b_node = rpo_order[ri];
+            let preds_b = pred_idx_list[b_node];
+            let new_idom = -1;
+            for p_cand in preds_b {
+                if idom[p_cand] != -1 {
+                    if new_idom == -1 {
+                        new_idom = p_cand;
+                    } else {
+                        new_idom = _dom_intersect(p_cand, new_idom, idom, rpo_num);
+                    }
+                }
+            }
+            if new_idom != -1 and idom[b_node] != new_idom {
+                idom[b_node] = new_idom;
+                changed = true;
+            }
+            ri = ri + 1;
+        }
+    }
+
+    // Build full Dominator sets & Dominance Frontiers
+    let dom_sets_idx = [];
+    let dom_frontier_idx = [];
+    bi = 0;
+    while bi < n_blocks {
+        let dset = [];
+        if idom[bi] != -1 {
+            let cur = bi;
+            let guard = 0;
+            while guard <= n_blocks {
+                if not _has(dset, cur) { push(dset, cur); }
+                if cur == idom[cur] { guard = n_blocks + 1; }
+                else { cur = idom[cur]; guard = guard + 1; }
+            }
+            dset = _sort_ints_asc(dset);
+        }
+        push(dom_sets_idx, dset);
+        push(dom_frontier_idx, []);
+        bi = bi + 1;
+    }
+
+    bi = 0;
+    while bi < n_blocks {
+        let preds_df = pred_idx_list[bi];
+        if idom[bi] != -1 and len(preds_df) >= 2 {
+            for p_df in preds_df {
+                if idom[p_df] != -1 {
+                    let runner = p_df;
+                    let guard_df = 0;
+                    while runner != idom[bi] and guard_df <= n_blocks {
+                        if not _has(dom_frontier_idx[runner], bi) {
+                            push(dom_frontier_idx[runner], bi);
+                        }
+                        runner = idom[runner];
+                        guard_df = guard_df + 1;
+                    }
+                }
+            }
+        }
+        bi = bi + 1;
+    }
+
+    // Detect Back-Edges (u -> h where h dominates u) & Natural Loop Bodies
+    let back_edges = [];
+    let natural_loops = [];
+    let u_bi = 0;
+    while u_bi < n_blocks {
+        if idom[u_bi] != -1 {
+            for h_bi in succ_idx_list[u_bi] {
+                if _has(dom_sets_idx[u_bi], h_bi) {
+                    push(back_edges, map{
+                        from_block: "bb_" + str(u_bi),
+                        to_block: "bb_" + str(h_bi),
+                        from_address: basic_blocks[u_bi].start_address,
+                        to_address: basic_blocks[h_bi].start_address
+                    });
+
+                    // Worklist natural loop body recovery
+                    let body_idx = [h_bi];
+                    let work = [];
+                    if u_bi != h_bi {
+                        push(body_idx, u_bi);
+                        push(work, u_bi);
+                    }
+                    while len(work) > 0 {
+                        let top_w = work[len(work) - 1];
+                        work = slice(work, 0, len(work) - 1);
+                        for pred_w in pred_idx_list[top_w] {
+                            if idom[pred_w] != -1 and not _has(body_idx, pred_w) {
+                                push(body_idx, pred_w);
+                                push(work, pred_w);
+                            }
+                        }
+                    }
+                    body_idx = _sort_ints_asc(body_idx);
+                    let body_ids = [];
+                    for lnode in body_idx {
+                        push(body_ids, "bb_" + str(lnode));
+                        basic_blocks[lnode].loop_depth = basic_blocks[lnode].loop_depth + 1;
+                    }
+                    push(natural_loops, map{
+                        header: "bb_" + str(h_bi),
+                        latch: "bb_" + str(u_bi),
+                        header_address: basic_blocks[h_bi].start_address,
+                        latch_address: basic_blocks[u_bi].start_address,
+                        body_blocks: body_ids,
+                        block_count: len(body_ids)
+                    });
+                }
+            }
+        }
+        u_bi = u_bi + 1;
+    }
+
+    let idom_map = map{};
+    let dom_map = map{};
+    let df_map = map{};
+    bi = 0;
+    while bi < n_blocks {
+        let bid = "bb_" + str(bi);
+        if idom[bi] != -1 {
+            let idom_str = "bb_" + str(idom[bi]);
+            idom_map[bid] = idom_str;
+            basic_blocks[bi].idom = idom_str;
+        } else {
+            idom_map[bid] = nil;
+        }
+        let d_ids = [];
+        for di in dom_sets_idx[bi] { push(d_ids, "bb_" + str(di)); }
+        dom_map[bid] = d_ids;
+
+        let df_ids = [];
+        for dfi in _sort_ints_asc(dom_frontier_idx[bi]) { push(df_ids, "bb_" + str(dfi)); }
+        df_map[bid] = df_ids;
+        bi = bi + 1;
+    }
+
+    let cyclomatic = edge_count - n_blocks + 2;
+    if cyclomatic < 1 { cyclomatic = 1; }
+
+    return map{
+        basic_block_count: n_blocks,
+        edge_count: edge_count,
+        cyclomatic_complexity: cyclomatic,
+        has_standard_prologue: has_prologue,
+        stack_frame_bytes: stack_frame_bytes,
+        basic_blocks: basic_blocks,
+        idom: idom_map,
+        dominators: dom_map,
+        dominance_frontier: df_map,
+        back_edges: back_edges,
+        natural_loops: natural_loops,
+        loop_count: len(natural_loops)
+    };
 }
 
 // 5. Sovereign Ghidra / IDA Pro Replacement: Native Multi-Arch Disassembler, CFG, Xrefs & Decompiler
@@ -1030,12 +2604,13 @@ fn decompile_and_cfg_artifact(spec) {
         }
         fn_name = spec.function_name;
     }
-    let arch = "x86_64";
+    let raw_arch = "x86_64";
     if map_has(spec, "arch") {
         if type(spec.arch) != "string" { throw "decompile_and_cfg_artifact: invalid arch"; }
-        arch = str_lower(str_trim(spec.arch));
+        raw_arch = str_lower(str_trim(spec.arch));
     }
-    if arch != "x86_64" and arch != "aarch64" and arch != "evm" and arch != "wasm" {
+    let norm_arch = _normalize_rea_arch(raw_arch);
+    if norm_arch == "" {
         throw "decompile_and_cfg_artifact: unsupported arch";
     }
     let base_addr = 4096;
@@ -1063,229 +2638,112 @@ fn decompile_and_cfg_artifact(spec) {
     let instructions = [];
     let xrefs = [];
     let pseudocode_lines = [];
-    let block_leaders = [0];
-    let stack_frame_bytes = 0;
-    let has_prologue = false;
-
     push(pseudocode_lines, "// Sovereign PBLang Decompiler (replaces Ghidra / IDA / Capstone)");
     push(pseudocode_lines, "fn " + fn_name + "(arg0, arg1) {");
 
-    let pc = 0;
-    while pc < len(bytes) and len(instructions) < 512 {
-        let addr = base_addr + pc;
-        let b0 = bytes[pc];
-        let mnem = "db";
-        let ops = "0x" + _hex_byte(b0);
-        let size = 1;
-        let flow = "sequential";
-        let target_off = -1;
-
-        if arch == "x86_64" {
-            if _match_seq(bytes, pc, [243, 15, 30, 250]) {
-                mnem = "endbr64";
-                ops = "";
-                size = 4;
-                has_prologue = true;
-            } elif b0 == 85 {
-                mnem = "push";
-                ops = "rbp";
-                size = 1;
-                has_prologue = true;
-            } elif _match_seq(bytes, pc, [72, 137, 229]) {
-                mnem = "mov";
-                ops = "rbp, rsp";
-                size = 3;
-                has_prologue = true;
-            } elif _match_seq(bytes, pc, [72, 131, 236]) and pc + 4 <= len(bytes) {
-                mnem = "sub";
-                stack_frame_bytes = bytes[pc + 3];
-                ops = "rsp, " + str(stack_frame_bytes);
-                size = 4;
-                push(pseudocode_lines, "    let stack_frame = reserve_bytes(" + str(stack_frame_bytes) + ");");
-            } elif _match_seq(bytes, pc, [49, 192]) {
-                mnem = "xor";
-                ops = "eax, eax";
-                size = 2;
-                push(pseudocode_lines, "    let ret_val = 0;");
-            } elif _match_seq(bytes, pc, [133, 255]) or _match_seq(bytes, pc, [72, 133, 255]) {
-                size = if b0 == 72 { 3 } else { 2 };
-                mnem = "test";
-                ops = "rdi, rdi";
-                push(pseudocode_lines, "    let cond_zero = (arg0 == 0);");
-            } elif b0 == 232 and pc + 5 <= len(bytes) {
-                let rel = _s32(bytes, pc + 1);
-                target_off = pc + 5 + rel;
-                let target_addr = base_addr + target_off;
-                mnem = "call";
-                ops = "sub_" + str(target_addr);
-                size = 5;
-                flow = "call";
-                push(xrefs, map{from_address: addr, to_address: target_addr, kind: "call"});
-                push(pseudocode_lines, "    let call_res = sub_" + str(target_addr) + "(arg0);");
-            } elif (b0 == 116 or b0 == 117 or b0 == 235) and pc + 2 <= len(bytes) {
-                let rel8 = _s8(bytes[pc + 1]);
-                target_off = pc + 2 + rel8;
-                let target_addr = base_addr + target_off;
-                if b0 == 116 { mnem = "je"; }
-                elif b0 == 117 { mnem = "jne"; }
-                else { mnem = "jmp"; }
-                ops = "loc_" + str(target_addr);
-                size = 2;
-                if b0 == 235 { flow = "jump"; } else { flow = "cond_jump"; }
-                if target_off >= 0 and target_off < len(bytes) and not _has(block_leaders, target_off) {
-                    push(block_leaders, target_off);
-                }
-                if pc + 2 < len(bytes) and not _has(block_leaders, pc + 2) {
-                    push(block_leaders, pc + 2);
-                }
-                push(xrefs, map{from_address: addr, to_address: target_addr, kind: flow});
-                if flow == "cond_jump" {
-                    push(pseudocode_lines, "    if (" + mnem + "_cond) { goto loc_" + str(target_addr) + "; }");
-                } else {
-                    push(pseudocode_lines, "    goto loc_" + str(target_addr) + ";");
-                }
-            } elif _match_seq(bytes, pc, [15, 5]) {
-                mnem = "syscall";
-                ops = "";
-                size = 2;
-                flow = "syscall";
-                push(xrefs, map{from_address: addr, to_address: 0, kind: "syscall"});
-                push(pseudocode_lines, "    syscall_invoke();");
-            } elif b0 == 93 {
-                mnem = "pop";
-                ops = "rbp";
-                size = 1;
-            } elif b0 == 201 {
-                mnem = "leave";
-                ops = "";
-                size = 1;
-            } elif b0 == 195 {
-                mnem = "ret";
-                ops = "";
-                size = 1;
-                flow = "return";
-                if pc + 1 < len(bytes) and not _has(block_leaders, pc + 1) {
-                    push(block_leaders, pc + 1);
-                }
-                push(pseudocode_lines, "    return ret_val;");
-            }
-        } elif arch == "aarch64" {
-            if _match_seq(bytes, pc, [192, 3, 95, 214]) {
-                mnem = "ret";
-                ops = "x30";
-                size = 4;
-                flow = "return";
-                push(pseudocode_lines, "    return x0;");
-            } elif pc + 4 <= len(bytes) {
-                mnem = "arm64_inst";
-                ops = "0x" + _hex_byte(bytes[pc]) + _hex_byte(bytes[pc + 1]) + _hex_byte(bytes[pc + 2]) + _hex_byte(bytes[pc + 3]);
-                size = 4;
-            }
-        } elif arch == "evm" {
-            if b0 >= 96 and b0 <= 127 {
-                let push_n = b0 - 95;
-                mnem = "PUSH" + str(push_n);
-                let imm = "0x";
-                let k = 1;
-                while k <= push_n and pc + k < len(bytes) {
-                    imm = imm + _hex_byte(bytes[pc + k]);
-                    k = k + 1;
-                }
-                ops = imm;
-                size = 1 + push_n;
-            } elif b0 == 84 {
-                mnem = "SLOAD";
-                ops = "";
-                size = 1;
-                push(pseudocode_lines, "    let word = storage_load(top);");
-            } elif b0 == 85 {
-                mnem = "SSTORE";
-                ops = "";
-                size = 1;
-                push(pseudocode_lines, "    storage_store(slot, val);");
-            } elif b0 == 87 {
-                mnem = "JUMPI";
-                ops = "";
-                size = 1;
-                flow = "cond_jump";
-                if pc + 1 < len(bytes) and not _has(block_leaders, pc + 1) {
-                    push(block_leaders, pc + 1);
-                }
-                push(pseudocode_lines, "    if (cond) { goto jumpi_target; }");
-            } elif b0 == 91 {
-                mnem = "JUMPDEST";
-                ops = "";
-                size = 1;
-                if not _has(block_leaders, pc) { push(block_leaders, pc); }
-            } elif b0 == 243 or b0 == 253 or b0 == 0 {
-                if b0 == 243 { mnem = "RETURN"; }
-                elif b0 == 253 { mnem = "REVERT"; }
-                else { mnem = "STOP"; }
-                ops = "";
-                size = 1;
-                flow = "return";
-                push(pseudocode_lines, "    evm_" + str_lower(mnem) + "();");
+    if norm_arch == "x86_64" or norm_arch == "aarch64" or norm_arch == "rv32im" {
+        instructions = disassemble_stream(bytes, norm_arch, base_addr);
+        let label_addrs = map{};
+        for ins0 in instructions {
+            if (ins0.flow == "jump" or ins0.flow == "cond_jump") and ins0.target_address >= base_addr {
+                label_addrs[str(ins0.target_address)] = true;
             }
         }
-
-        push(instructions, map{
-            offset: pc,
-            address: addr,
-            size: size,
-            mnemonic: mnem,
-            operands: ops,
-            flow: flow,
-            target_offset: target_off
-        });
-        pc = pc + size;
+        for inst in instructions {
+            if map_has(label_addrs, str(inst.address)) {
+                push(pseudocode_lines, "  loc_" + str(inst.address) + ":");
+            }
+            if map_has(inst, "stack_alloc") and inst.stack_alloc > 0 {
+                push(pseudocode_lines, "    let stack_frame = reserve_bytes(" + str(inst.stack_alloc) + ");");
+            } elif inst.mnemonic == "xor" and inst.operands == "eax, eax" {
+                push(pseudocode_lines, "    let ret_val = 0;");
+            } elif inst.mnemonic == "test" {
+                push(pseudocode_lines, "    let cond_zero = (" + inst.operands + ") == 0;");
+            } elif inst.mnemonic == "cmp" {
+                push(pseudocode_lines, "    let cmp_flags = compare(" + inst.operands + ");");
+            } elif inst.flow == "call" {
+                let to_call = if inst.target_address >= 0 { inst.target_address } else { 0 };
+                push(xrefs, map{from_address: inst.address, to_address: to_call, kind: "call"});
+                if inst.target_address >= 0 {
+                    push(pseudocode_lines, "    let call_res = sub_" + str(inst.target_address) + "(arg0);");
+                } else {
+                    push(pseudocode_lines, "    let call_res = indirect_call(" + inst.operands + ");");
+                }
+            } elif inst.flow == "cond_jump" {
+                let to_cj = if inst.target_address >= 0 { inst.target_address } else { 0 };
+                push(xrefs, map{from_address: inst.address, to_address: to_cj, kind: "cond_jump"});
+                push(pseudocode_lines, "    if (" + inst.mnemonic + "_cond) { goto loc_" + str(to_cj) + "; }");
+            } elif inst.flow == "jump" {
+                let to_j = if inst.target_address >= 0 { inst.target_address } else { 0 };
+                push(xrefs, map{from_address: inst.address, to_address: to_j, kind: "jump"});
+                if inst.target_address >= 0 {
+                    push(pseudocode_lines, "    goto loc_" + str(to_j) + ";");
+                } else {
+                    push(pseudocode_lines, "    goto_indirect(" + inst.operands + ");");
+                }
+            } elif inst.flow == "syscall" {
+                push(xrefs, map{from_address: inst.address, to_address: 0, kind: "syscall"});
+                push(pseudocode_lines, "    syscall_invoke();");
+            } elif inst.flow == "return" {
+                push(pseudocode_lines, "    return ret_val;");
+            } elif not _is_true(inst.is_prologue) and inst.mnemonic != "leave" and inst.mnemonic != "nop" {
+                push(pseudocode_lines, "    // " + inst.text);
+            }
+        }
+    } else {
+        // EVM & WASM bytecode streams
+        let pc = 0;
+        while pc < len(bytes) and len(instructions) < 512 {
+            let addr = base_addr + pc;
+            let b0 = bytes[pc];
+            let mnem = "db";
+            let ops = "0x" + _hex_byte(b0);
+            let size = 1;
+            let flow = "sequential";
+            let target_off = -1;
+            if norm_arch == "evm" {
+                if b0 >= 96 and b0 <= 127 {
+                    let push_n = b0 - 95;
+                    mnem = "PUSH" + str(push_n);
+                    let imm = "0x";
+                    let k = 1;
+                    while k <= push_n and pc + k < len(bytes) {
+                        imm = imm + _hex_byte(bytes[pc + k]);
+                        k = k + 1;
+                    }
+                    ops = imm;
+                    size = 1 + push_n;
+                } elif b0 == 84 {
+                    mnem = "SLOAD"; ops = ""; size = 1;
+                    push(pseudocode_lines, "    let word = storage_load(top);");
+                } elif b0 == 85 {
+                    mnem = "SSTORE"; ops = ""; size = 1;
+                    push(pseudocode_lines, "    storage_store(slot, val);");
+                } elif b0 == 87 {
+                    mnem = "JUMPI"; ops = ""; size = 1; flow = "cond_jump";
+                    push(pseudocode_lines, "    if (cond) { goto jumpi_target; }");
+                } elif b0 == 91 {
+                    mnem = "JUMPDEST"; ops = ""; size = 1;
+                } elif b0 == 243 or b0 == 253 or b0 == 0 {
+                    if b0 == 243 { mnem = "RETURN"; }
+                    elif b0 == 253 { mnem = "REVERT"; }
+                    else { mnem = "STOP"; }
+                    ops = ""; size = 1; flow = "return";
+                    push(pseudocode_lines, "    evm_" + str_lower(mnem) + "();");
+                }
+            }
+            push(instructions, map{
+                offset: pc, address: addr, size: size,
+                mnemonic: mnem, operands: ops, flow: flow,
+                target_offset: target_off, target_address: -1,
+                is_prologue: false, stack_alloc: 0
+            });
+            pc = pc + size;
+        }
     }
     push(pseudocode_lines, "}");
 
-    // Build Basic Blocks from sorted leaders
-    let basic_blocks = [];
-    let edge_count = 0;
-    let b_idx = 0;
-    while b_idx < len(block_leaders) {
-        let start_off = block_leaders[b_idx];
-        let next_off = len(bytes);
-        for cand in block_leaders {
-            if cand > start_off and cand < next_off {
-                next_off = cand;
-            }
-        }
-        let bb_insts = 0;
-        let term_flow = "fallthrough";
-        let out_edges = [];
-        for inst in instructions {
-            if inst.offset >= start_off and inst.offset < next_off {
-                bb_insts = bb_insts + 1;
-                term_flow = inst.flow;
-                if inst.flow == "cond_jump" {
-                    if inst.target_offset >= 0 { push(out_edges, base_addr + inst.target_offset); }
-                    if next_off < len(bytes) { push(out_edges, base_addr + next_off); }
-                } elif inst.flow == "jump" and inst.target_offset >= 0 {
-                    push(out_edges, base_addr + inst.target_offset);
-                }
-            }
-        }
-        if term_flow == "sequential" and next_off < len(bytes) {
-            push(out_edges, base_addr + next_off);
-        }
-        edge_count = edge_count + len(out_edges);
-        push(basic_blocks, map{
-            block_id: "bb_" + str(b_idx),
-            start_address: base_addr + start_off,
-            end_address: base_addr + next_off,
-            instruction_count: bb_insts,
-            terminator: term_flow,
-            out_edges: out_edges
-        });
-        b_idx = b_idx + 1;
-    }
-
-    let node_count = len(basic_blocks);
-    let cyclomatic = edge_count - node_count + 2;
-    if cyclomatic < 1 { cyclomatic = 1; }
+    let cfg = build_real_cfg(instructions);
     let pseudocode_text = str_join(pseudocode_lines, "\n");
     let sha_hex = SHA256.sha256_hex_bytes(bytes);
 
@@ -1294,19 +2752,12 @@ fn decompile_and_cfg_artifact(spec) {
         format: FORMAT_DECOMPILE,
         evidence_id: "ev_" + sha_hex,
         function_name: fn_name,
-        architecture: arch,
+        architecture: norm_arch,
         base_address: base_addr,
         byte_length: len(bytes),
         instruction_count: len(instructions),
         instructions: instructions,
-        cfg: map{
-            basic_block_count: node_count,
-            edge_count: edge_count,
-            cyclomatic_complexity: cyclomatic,
-            has_standard_prologue: has_prologue,
-            stack_frame_bytes: stack_frame_bytes,
-            basic_blocks: basic_blocks
-        },
+        cfg: cfg,
         xref_count: len(xrefs),
         xrefs: xrefs,
         decompiled_pseudocode: pseudocode_text,
@@ -1652,4 +3103,9 @@ export FORMAT_BINARY, FORMAT_APP_GRAPH, FORMAT_PROTOCOL, FORMAT_LEDGER,
        FORMAT_DECOMPILE, FORMAT_DOM_SCRAPE,
        inspect_binary_artifact, analyze_application_surface,
        reconstruct_protocol_surface, evaluate_evidence_ledger,
-       decompile_and_cfg_artifact, extract_structured_dom;
+       decompile_and_cfg_artifact, extract_structured_dom,
+       decode_one_x86_64, disassemble_x86_64,
+       decode_one_arm64, disassemble_arm64,
+       decode_one_rv32im, disassemble_rv32im,
+       disassemble_stream, build_real_cfg;
+

@@ -25,7 +25,7 @@
 #include <sys/stat.h>
 #endif
 
-#define ZR_SU_SEMVER "2.7.0"
+#define ZR_SU_SEMVER "3.0.0"
 #define ZR_SU_MAX_ENTRIES 10000
 #define ZR_SU_MAX_BYTES   (256ULL * 1024ULL * 1024ULL)
 
@@ -464,7 +464,7 @@ static bool zr_su_normalize_rel_path(const char *raw, char *out, size_t cap, cha
         return false;
     }
     if (raw[0] == '/' || raw[0] == '\\') {
-        snprintf(err, 256, "forbidden leading slash in archive entry '%s'", raw);
+        snprintf(err, 256, "forbidden leading slash in archive entry '%.180s'", raw);
         return false;
     }
     if (raw[0] && raw[1] == ':') {

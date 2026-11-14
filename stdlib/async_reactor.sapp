@@ -1,0 +1,1236 @@
+// stdlib/async_reactor.sapp -- Non-Blocking Cooperative Coroutine Scheduler, net_poll Reactor,
+// RFC 9113 HTTP/2 Binary 9-Byte Frame Codec + RFC 7541 HPACK Static Table, and
+// RFC 6455 WebSocket Frame Encoder/Decoder & Topic Multiplexer.
+
+let _SHA256 = import("stdlib:sha256_pb.sapp");
+
+// ── HTTP/2 Constants (RFC 9113) ───────────────────────────────────────────────
+let HTTP2_CLIENT_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+let H2_FRAME_DATA = 0;
+let H2_FRAME_HEADERS = 1;
+let H2_FRAME_PRIORITY = 2;
+let H2_FRAME_RST_STREAM = 3;
+let H2_FRAME_SETTINGS = 4;
+let H2_FRAME_PUSH_PROMISE = 5;
+let H2_FRAME_PING = 6;
+let H2_FRAME_GOAWAY = 7;
+let H2_FRAME_WINDOW_UPDATE = 8;
+let H2_FRAME_CONTINUATION = 9;
+
+let H2_FLAG_END_STREAM = 1;
+let H2_FLAG_ACK = 1;
+let H2_FLAG_END_HEADERS = 4;
+let H2_FLAG_PADDED = 8;
+let H2_FLAG_PRIORITY = 32;
+
+let H2_SETTINGS_HEADER_TABLE_SIZE = 1;
+let H2_SETTINGS_ENABLE_PUSH = 2;
+let H2_SETTINGS_MAX_CONCURRENT_STREAMS = 3;
+let H2_SETTINGS_INITIAL_WINDOW_SIZE = 4;
+let H2_SETTINGS_MAX_FRAME_SIZE = 5;
+let H2_SETTINGS_MAX_HEADER_LIST_SIZE = 6;
+
+// ── WebSocket Constants (RFC 6455) ────────────────────────────────────────────
+let WS_OP_CONT = 0;
+let WS_OP_TEXT = 1;
+let WS_OP_BINARY = 2;
+let WS_OP_CLOSE = 8;
+let WS_OP_PING = 9;
+let WS_OP_PONG = 10;
+
+// ── Default Event Loop Holder ─────────────────────────────────────────────────
+let _global_reactor_box = map{ current: nil };
+
+fn _fail(msg) {
+    throw "async_reactor: " + msg;
+}
+
+fn _to_byte_array(data) {
+    if type(data) == "string" { return str_to_bytes(data); }
+    if type(data) == "array" {
+        let out = [];
+        let i = 0;
+        while i < len(data) {
+            let b = data[i];
+            if type(b) != "number" or b < 0 or b > 255 or b != num_floor(b) {
+                _fail("byte array must contain integers 0..255");
+            }
+            array_push(out, b);
+            i = i + 1;
+        }
+        return out;
+    }
+    _fail("expected string or byte array");
+}
+
+fn _append_bytes(dst, src) {
+    let i = 0;
+    while i < len(src) {
+        array_push(dst, src[i]);
+        i = i + 1;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 1: Cooperative Coroutine Scheduler & net_poll I/O Reactor
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn async_done(val) {
+    return map{ __async_op: "done", done: true, value: val };
+}
+
+fn async_yield() {
+    return map{ __async_op: "yield", done: false };
+}
+
+fn sleep_async(ms) {
+    let d = if type(ms) == "number" and ms > 0 { ms } else { 0 };
+    return map{
+        __async_op: "sleep",
+        done: false,
+        delay_ms: d,
+        wake_at_ms: now_ms() + d
+    };
+}
+
+fn wait_io_async(fd, events = "read", timeout_ms = 25) {
+    return map{
+        __async_op: "poll_io",
+        done: false,
+        fd: fd,
+        events: events,
+        deadline_ms: now_ms() + timeout_ms,
+        timeout_ms: timeout_ms
+    };
+}
+
+fn await_task(task_handle) {
+    let tid = if is_map(task_handle) and map_has(task_handle, "id") { task_handle.id } else { task_handle };
+    return map{
+        __async_op: "await_task",
+        done: false,
+        target_id: tid
+    };
+}
+
+// Probe and invoke native `net_poll(descriptors, timeout_ms)` when available, with clean fallback.
+fn _poll_fds(io_waiters, wait_ms) {
+    if len(io_waiters) == 0 {
+        if wait_ms > 0 { sleep_ms(num_min(wait_ms, 5)); }
+        return map{ mode: "timer_only", ready_fds: map{} };
+    }
+    let fds = [];
+    let i = 0;
+    while i < len(io_waiters) {
+        array_push(fds, map{ fd: io_waiters[i].fd, events: io_waiters[i].events });
+        i = i + 1;
+    }
+    let polled = try net_poll(fds, wait_ms) catch "__NO_NET_POLL__";
+    let ready_map = map{};
+    if type(polled) == "string" and polled == "__NO_NET_POLL__" {
+        // Clean cooperative fallback when runtime lacks native epoll/kqueue net_poll builtin:
+        if wait_ms > 0 { sleep_ms(num_min(wait_ms, 2)); }
+        i = 0;
+        while i < len(io_waiters) {
+            ready_map[str(io_waiters[i].fd)] = map{ readable: true, writable: true, fallback: true };
+            i = i + 1;
+        }
+        return map{ mode: "cooperative_fallback", ready_fds: ready_map };
+    }
+    if is_array(polled) {
+        i = 0;
+        while i < len(polled) {
+            let ev = polled[i];
+            if is_map(ev) and map_has(ev, "fd") {
+                ready_map[str(ev.fd)] = ev;
+            } else {
+                ready_map[str(ev)] = map{ readable: true, writable: true, fallback: false };
+            }
+            i = i + 1;
+        }
+    }
+    return map{ mode: "native_net_poll", ready_fds: ready_map };
+}
+
+fn create_event_loop() {
+    let probe = try net_poll([], 0) catch "__NO_NET_POLL__";
+    let has_native_poll = not (type(probe) == "string" and probe == "__NO_NET_POLL__");
+    let reactor = map{
+        next_task_id: 1,
+        tasks: map{},
+        task_order: [],
+        ready_queue: [],
+        timers: [],
+        io_waiters: [],
+        task_waiters: map{},
+        ticks: 0,
+        has_native_net_poll: has_native_poll,
+        poll_backend: if has_native_poll { "native_net_poll" } else { "cooperative_fallback" }
+    };
+    _global_reactor_box.current = reactor;
+    return reactor;
+}
+
+fn _ensure_reactor(maybe_reactor) {
+    if is_map(maybe_reactor) and map_has(maybe_reactor, "ready_queue") {
+        return maybe_reactor;
+    }
+    if _global_reactor_box.current == nil {
+        return create_event_loop();
+    }
+    return _global_reactor_box.current;
+}
+
+fn _wake_task_waiters(reactor, finished_id, val) {
+    let key = str(finished_id);
+    if not map_has(reactor.task_waiters, key) { return nil; }
+    let waiters = reactor.task_waiters[key];
+    map_remove(reactor.task_waiters, key);
+    let i = 0;
+    while i < len(waiters) {
+        let wid = waiters[i];
+        let wtask = reactor.tasks[str(wid)];
+        if wtask != nil and wtask.status != "done" {
+            wtask.resume_value = val;
+            wtask.status = "ready";
+            array_push(reactor.ready_queue, wid);
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+// Supports both `spawn_task(step_fn)` and `spawn_task(reactor, step_fn)`.
+fn spawn_task(reactor_or_fn, maybe_fn = nil) {
+    let reactor = nil;
+    let step_fn = nil;
+    if maybe_fn != nil {
+        reactor = _ensure_reactor(reactor_or_fn);
+        step_fn = maybe_fn;
+    } else {
+        reactor = _ensure_reactor(nil);
+        step_fn = reactor_or_fn;
+    }
+    if not is_fn(step_fn) {
+        _fail("spawn_task requires a coroutine step function");
+    }
+    let tid = reactor.next_task_id;
+    reactor.next_task_id = tid + 1;
+    let t_rec = map{
+        id: tid,
+        step_fn: step_fn,
+        status: "ready",
+        step_count: 0,
+        resume_value: nil,
+        result: nil,
+        state: map{}
+    };
+    reactor.tasks[str(tid)] = t_rec;
+    array_push(reactor.task_order, tid);
+    array_push(reactor.ready_queue, tid);
+
+    return map{
+        id: tid,
+        reactor: reactor,
+        is_done: fn() { return reactor.tasks[str(tid)].status == "done"; },
+        result: fn() { return reactor.tasks[str(tid)].result; }
+    };
+}
+
+// Non-blocking MPMC async channel integrated with cooperative task parking/waking.
+fn channel_async(capacity = 64) {
+    let cap = if type(capacity) == "number" and capacity >= 1 { num_floor(capacity) } else { 64 };
+    let ch = map{
+        buf: [],
+        cap: cap,
+        closed: false,
+        recv_waiters: [],
+        send_waiters: []
+    };
+
+    let wake_one_receiver = fn() {
+        while len(ch.recv_waiters) > 0 and len(ch.buf) > 0 {
+            let rw = ch.recv_waiters[0];
+            ch.recv_waiters = array_drop(ch.recv_waiters, 1);
+            let item = ch.buf[0];
+            ch.buf = array_drop(ch.buf, 1);
+            let t = rw.reactor.tasks[str(rw.task_id)];
+            if t != nil and t.status != "done" {
+                t.resume_value = map{ ok: true, value: item, closed: false };
+                t.status = "ready";
+                array_push(rw.reactor.ready_queue, rw.task_id);
+                return nil;
+            }
+        }
+        return nil;
+    };
+
+    let wake_one_sender = fn() {
+        while len(ch.send_waiters) > 0 and len(ch.buf) < ch.cap {
+            let sw = ch.send_waiters[0];
+            ch.send_waiters = array_drop(ch.send_waiters, 1);
+            array_push(ch.buf, sw.item);
+            let t = sw.reactor.tasks[str(sw.task_id)];
+            if t != nil and t.status != "done" {
+                t.resume_value = true;
+                t.status = "ready";
+                array_push(sw.reactor.ready_queue, sw.task_id);
+                wake_one_receiver();
+                return nil;
+            }
+        }
+        return nil;
+    };
+
+    return map{
+        try_send: fn(val) {
+            if ch.closed { return false; }
+            if len(ch.buf) >= ch.cap { return false; }
+            array_push(ch.buf, val);
+            wake_one_receiver();
+            return true;
+        },
+        try_recv: fn() {
+            if len(ch.buf) > 0 {
+                let v = ch.buf[0];
+                ch.buf = array_drop(ch.buf, 1);
+                wake_one_sender();
+                return map{ ok: true, value: v, closed: false };
+            }
+            return map{ ok: false, value: nil, closed: ch.closed };
+        },
+        send_async: fn(val) {
+            return map{ __async_op: "chan_send", done: false, _chan: ch, item: val, _wake_rx: wake_one_receiver };
+        },
+        recv_async: fn() {
+            return map{ __async_op: "chan_recv", done: false, _chan: ch, _wake_tx: wake_one_sender };
+        },
+        close: fn() {
+            ch.closed = true;
+            while len(ch.recv_waiters) > 0 {
+                let rw = ch.recv_waiters[0];
+                ch.recv_waiters = array_drop(ch.recv_waiters, 1);
+                let t = rw.reactor.tasks[str(rw.task_id)];
+                if t != nil and t.status != "done" {
+                    t.resume_value = map{ ok: false, value: nil, closed: true };
+                    t.status = "ready";
+                    array_push(rw.reactor.ready_queue, rw.task_id);
+                }
+            }
+            return true;
+        },
+        size: fn() { return len(ch.buf); },
+        is_closed: fn() { return ch.closed; }
+    };
+}
+
+fn _step_reactor_once(reactor) {
+    reactor.ticks = reactor.ticks + 1;
+    let now = now_ms();
+
+    // 1. Promote expired sleep timers to ready_queue
+    if len(reactor.timers) > 0 {
+        let remaining_timers = [];
+        let ti = 0;
+        while ti < len(reactor.timers) {
+            let tm = reactor.timers[ti];
+            if now >= tm.wake_at_ms {
+                let t = reactor.tasks[str(tm.task_id)];
+                if t != nil and t.status != "done" {
+                    t.resume_value = now;
+                    t.status = "ready";
+                    array_push(reactor.ready_queue, tm.task_id);
+                }
+            } else {
+                array_push(remaining_timers, tm);
+            }
+            ti = ti + 1;
+        }
+        reactor.timers = remaining_timers;
+    }
+
+    // 2. Poll I/O waiters if any (or sleep briefly if ready_queue is empty and timers are pending)
+    if len(reactor.io_waiters) > 0 {
+        let poll_wait = if len(reactor.ready_queue) > 0 { 0 } else { 2 };
+        let poll_res = _poll_fds(reactor.io_waiters, poll_wait);
+        let next_io = [];
+        let ii = 0;
+        let now2 = now_ms();
+        while ii < len(reactor.io_waiters) {
+            let iw = reactor.io_waiters[ii];
+            let fkey = str(iw.fd);
+            if map_has(poll_res.ready_fds, fkey) or now2 >= iw.deadline_ms {
+                let t2 = reactor.tasks[str(iw.task_id)];
+                if t2 != nil and t2.status != "done" {
+                    t2.resume_value = map{
+                        ready: map_has(poll_res.ready_fds, fkey),
+                        timed_out: not map_has(poll_res.ready_fds, fkey),
+                        backend: poll_res.mode
+                    };
+                    t2.status = "ready";
+                    array_push(reactor.ready_queue, iw.task_id);
+                }
+            } else {
+                array_push(next_io, iw);
+            }
+            ii = ii + 1;
+        }
+        reactor.io_waiters = next_io;
+    } elif len(reactor.ready_queue) == 0 and len(reactor.timers) > 0 {
+        let earliest = reactor.timers[0].wake_at_ms;
+        let k = 1;
+        while k < len(reactor.timers) {
+            if reactor.timers[k].wake_at_ms < earliest { earliest = reactor.timers[k].wake_at_ms; }
+            k = k + 1;
+        }
+        let wait_delta = earliest - now_ms();
+        if wait_delta > 0 {
+            sleep_ms(num_min(wait_delta, 5));
+        }
+        return true;
+    }
+
+    // 3. Execute one batch of ready tasks cooperatively
+    let batch_len = len(reactor.ready_queue);
+    if batch_len == 0 {
+        return len(reactor.timers) > 0 or len(reactor.io_waiters) > 0;
+    }
+
+    let bi = 0;
+    while bi < batch_len and len(reactor.ready_queue) > 0 {
+        let tid = reactor.ready_queue[0];
+        reactor.ready_queue = array_drop(reactor.ready_queue, 1);
+        let task = reactor.tasks[str(tid)];
+        if task != nil and task.status != "done" {
+            let ctx = map{
+                task_id: tid,
+                step: task.step_count,
+                resume_value: task.resume_value,
+                state: task.state,
+                reactor: reactor
+            };
+            task.step_count = task.step_count + 1;
+            task.resume_value = nil;
+            let out = task.step_fn(ctx);
+
+            if is_map(out) and map_has(out, "__async_op") {
+                let op = out.__async_op;
+                if op == "done" {
+                    task.status = "done";
+                    task.result = out.value;
+                    _wake_task_waiters(reactor, tid, out.value);
+                } elif op == "yield" {
+                    task.status = "ready";
+                    array_push(reactor.ready_queue, tid);
+                } elif op == "sleep" {
+                    task.status = "sleeping";
+                    array_push(reactor.timers, map{ task_id: tid, wake_at_ms: out.wake_at_ms });
+                } elif op == "poll_io" {
+                    task.status = "waiting_io";
+                    array_push(reactor.io_waiters, map{
+                        task_id: tid,
+                        fd: out.fd,
+                        events: out.events,
+                        deadline_ms: out.deadline_ms
+                    });
+                } elif op == "await_task" {
+                    let dep_key = str(out.target_id);
+                    let dep = try reactor.tasks[dep_key] catch nil;
+                    if dep == nil { _fail("await_task references unknown task " + dep_key); }
+                    if dep.status == "done" {
+                        task.resume_value = dep.result;
+                        task.status = "ready";
+                        array_push(reactor.ready_queue, tid);
+                    } else {
+                        task.status = "awaiting";
+                        if not map_has(reactor.task_waiters, dep_key) {
+                            reactor.task_waiters[dep_key] = [];
+                        }
+                        array_push(reactor.task_waiters[dep_key], tid);
+                    }
+                } elif op == "chan_send" {
+                    let ch_s = out._chan;
+                    if ch_s.closed {
+                        task.resume_value = false;
+                        task.status = "ready";
+                        array_push(reactor.ready_queue, tid);
+                    } elif len(ch_s.buf) < ch_s.cap {
+                        array_push(ch_s.buf, out.item);
+                        out._wake_rx();
+                        task.resume_value = true;
+                        task.status = "ready";
+                        array_push(reactor.ready_queue, tid);
+                    } else {
+                        task.status = "chan_wait";
+                        array_push(ch_s.send_waiters, map{ reactor: reactor, task_id: tid, item: out.item });
+                    }
+                } elif op == "chan_recv" {
+                    let ch_r = out._chan;
+                    if len(ch_r.buf) > 0 {
+                        let v = ch_r.buf[0];
+                        ch_r.buf = array_drop(ch_r.buf, 1);
+                        out._wake_tx();
+                        task.resume_value = map{ ok: true, value: v, closed: false };
+                        task.status = "ready";
+                        array_push(reactor.ready_queue, tid);
+                    } elif ch_r.closed {
+                        task.resume_value = map{ ok: false, value: nil, closed: true };
+                        task.status = "ready";
+                        array_push(reactor.ready_queue, tid);
+                    } else {
+                        task.status = "chan_wait";
+                        array_push(ch_r.recv_waiters, map{ reactor: reactor, task_id: tid });
+                    }
+                }
+            } elif is_map(out) and map_has(out, "done") and out.done == false {
+                task.status = "ready";
+                array_push(reactor.ready_queue, tid);
+            } else {
+                let final_val = if is_map(out) and map_has(out, "done") and out.done == true and map_has(out, "value") { out.value } else { out };
+                task.status = "done";
+                task.result = final_val;
+                _wake_task_waiters(reactor, tid, final_val);
+            }
+        }
+        bi = bi + 1;
+    }
+    return true;
+}
+
+fn _all_tasks_done(reactor) {
+    let i = 0;
+    while i < len(reactor.task_order) {
+        let tid = reactor.task_order[i];
+        if reactor.tasks[str(tid)].status != "done" { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn run_until_complete(reactor_or_handle = nil, maybe_handle = nil, max_ticks = 100000) {
+    let reactor = nil;
+    let target_handle = nil;
+    if is_map(reactor_or_handle) and map_has(reactor_or_handle, "ready_queue") {
+        reactor = reactor_or_handle;
+        target_handle = maybe_handle;
+    } else {
+        reactor = _ensure_reactor(nil);
+        target_handle = reactor_or_handle;
+    }
+
+    let guard = 0;
+    while guard < max_ticks {
+        if target_handle != nil and is_map(target_handle) and map_has(target_handle, "id") {
+            let t = reactor.tasks[str(target_handle.id)];
+            if t != nil and t.status == "done" {
+                return t.result;
+            }
+        } elif _all_tasks_done(reactor) {
+            let results = [];
+            let i = 0;
+            while i < len(reactor.task_order) {
+                let tid = reactor.task_order[i];
+                array_push(results, reactor.tasks[str(tid)].result);
+                i = i + 1;
+            }
+            return results;
+        }
+
+        let progressed = _step_reactor_once(reactor);
+        if not progressed and not _all_tasks_done(reactor) {
+            _fail("deadlock detected: tasks remain suspended with no ready coroutines, timers, or I/O waiters");
+        }
+        guard = guard + 1;
+    }
+    _fail("run_until_complete exceeded max_ticks (" + str(max_ticks) + ")");
+}
+
+// Spawn/await a batch of coroutines or task handles concurrently and return results in input order.
+fn gather_all(reactor_or_tasks, maybe_tasks = nil) {
+    let reactor = nil;
+    let items = nil;
+    if maybe_tasks != nil {
+        reactor = _ensure_reactor(reactor_or_tasks);
+        items = maybe_tasks;
+    } else {
+        reactor = _ensure_reactor(nil);
+        items = reactor_or_tasks;
+    }
+    if type(items) != "array" {
+        _fail("gather_all expects an array of coroutine functions or task handles");
+    }
+    let handles = [];
+    let i = 0;
+    while i < len(items) {
+        let it = items[i];
+        if is_fn(it) {
+            array_push(handles, spawn_task(reactor, it));
+        } elif is_map(it) and map_has(it, "id") {
+            array_push(handles, it);
+        } else {
+            _fail("gather_all item at index " + str(i) + " is neither function nor task handle");
+        }
+        i = i + 1;
+    }
+    i = 0;
+    let out = [];
+    while i < len(handles) {
+        array_push(out, run_until_complete(reactor, handles[i]));
+        i = i + 1;
+    }
+    return out;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 2: RFC 7541 HPACK Static Header Table & Prefix-Integer Codec
+// ══════════════════════════════════════════════════════════════════════════════
+
+let _HPACK_STATIC = [
+    ["", ""],                                       // 0 (1-based indexing)
+    [":authority", ""],                             // 1
+    [":method", "GET"],                             // 2
+    [":method", "POST"],                            // 3
+    [":path", "/"],                                 // 4
+    [":path", "/index.html"],                       // 5
+    [":scheme", "http"],                            // 6
+    [":scheme", "https"],                           // 7
+    [":status", "200"],                             // 8
+    [":status", "204"],                             // 9
+    [":status", "206"],                             // 10
+    [":status", "304"],                             // 11
+    [":status", "400"],                             // 12
+    [":status", "404"],                             // 13
+    [":status", "500"],                             // 14
+    ["accept-charset", ""],                         // 15
+    ["accept-encoding", "gzip, deflate"],           // 16
+    ["accept-language", ""],                        // 17
+    ["accept-ranges", ""],                          // 18
+    ["accept", ""],                                 // 19
+    ["access-control-allow-origin", ""],            // 20
+    ["age", ""],                                    // 21
+    ["allow", ""],                                  // 22
+    ["authorization", ""],                          // 23
+    ["cache-control", ""],                          // 24
+    ["content-disposition", ""],                    // 25
+    ["content-encoding", ""],                       // 26
+    ["content-language", ""],                       // 27
+    ["content-length", ""],                         // 28
+    ["content-location", ""],                       // 29
+    ["content-range", ""],                          // 30
+    ["content-type", ""],                           // 31
+    ["cookie", ""],                                 // 32
+    ["date", ""],                                   // 33
+    ["etag", ""],                                   // 34
+    ["expect", ""],                                 // 35
+    ["expires", ""],                                // 36
+    ["from", ""],                                   // 37
+    ["host", ""],                                   // 38
+    ["if-match", ""],                               // 39
+    ["if-modified-since", ""],                      // 40
+    ["if-none-match", ""],                          // 41
+    ["if-range", ""],                               // 42
+    ["if-unmodified-since", ""],                    // 43
+    ["last-modified", ""],                          // 44
+    ["link", ""],                                   // 45
+    ["location", ""],                               // 46
+    ["max-forwards", ""],                           // 47
+    ["proxy-authenticate", ""],                     // 48
+    ["proxy-authorization", ""],                    // 49
+    ["range", ""],                                  // 50
+    ["referer", ""],                                // 51
+    ["refresh", ""],                                // 52
+    ["retry-after", ""],                            // 53
+    ["server", ""],                                 // 54
+    ["set-cookie", ""],                             // 55
+    ["strict-transport-security", ""],              // 56
+    ["transfer-encoding", ""],                      // 57
+    ["user-agent", ""],                             // 58
+    ["vary", ""],                                   // 59
+    ["via", ""],                                    // 60
+    ["www-authenticate", ""]                        // 61
+];
+
+fn hpack_static_lookup(idx) {
+    if type(idx) != "number" or idx < 1 or idx >= len(_HPACK_STATIC) or idx != num_floor(idx) {
+        return nil;
+    }
+    let pair = _HPACK_STATIC[idx];
+    return map{ index: idx, name: pair[0], value: pair[1] };
+}
+
+fn hpack_static_find(name, value = "") {
+    let lname = str_lower(name);
+    let exact_idx = 0;
+    let name_idx = 0;
+    let i = 1;
+    while i < len(_HPACK_STATIC) {
+        let p = _HPACK_STATIC[i];
+        if p[0] == lname {
+            if name_idx == 0 { name_idx = i; }
+            if p[1] == value and exact_idx == 0 { exact_idx = i; }
+        }
+        i = i + 1;
+    }
+    return map{ exact_index: exact_idx, name_index: name_idx };
+}
+
+fn _hpack_write_int(out, val, prefix_bits, high_bits_mask) {
+    let max_prefix = bit_shl(1, prefix_bits) - 1;
+    if val < max_prefix {
+        array_push(out, bit_or(high_bits_mask, val));
+        return nil;
+    }
+    array_push(out, bit_or(high_bits_mask, max_prefix));
+    let rem = val - max_prefix;
+    while rem >= 128 {
+        array_push(out, (rem % 128) + 128);
+        rem = num_floor(rem / 128);
+    }
+    array_push(out, rem);
+    return nil;
+}
+
+fn _hpack_read_int(bytes, pos, prefix_bits) {
+    if pos >= len(bytes) { _fail("HPACK integer truncated"); }
+    let max_prefix = bit_shl(1, prefix_bits) - 1;
+    let first = bit_and(bytes[pos], max_prefix);
+    pos = pos + 1;
+    if first < max_prefix {
+        return map{ value: first, next: pos };
+    }
+    let val = max_prefix;
+    let mult = 1;
+    while true {
+        if pos >= len(bytes) { _fail("HPACK continuation integer truncated"); }
+        let b = bytes[pos];
+        pos = pos + 1;
+        val = val + bit_and(b, 127) * mult;
+        mult = mult * 128;
+        if b < 128 { return map{ value: val, next: pos }; }
+    }
+}
+
+fn _hpack_write_str(out, text) {
+    let raw = str_to_bytes(text);
+    // H=0 (raw octet literal, bit 7 = 0)
+    _hpack_write_int(out, len(raw), 7, 0);
+    _append_bytes(out, raw);
+}
+
+fn _hpack_read_str(bytes, pos) {
+    if pos >= len(bytes) { _fail("HPACK string truncated"); }
+    let is_huffman = bit_and(bytes[pos], 128) != 0;
+    if is_huffman { _fail("HPACK Huffman literal unsupported in non-Huffman profile"); }
+    let len_dec = _hpack_read_int(bytes, pos, 7);
+    let slen = len_dec.value;
+    let start = len_dec.next;
+    if start + slen > len(bytes) { _fail("HPACK string payload truncated"); }
+    return map{
+        value: bytes_to_str(slice(bytes, start, start + slen)),
+        next: start + slen
+    };
+}
+
+// Encode array of `{ name, value }` or `[name, value]` headers using RFC 7541 static indexing + literals.
+fn hpack_encode_headers(headers) {
+    let out = [];
+    let i = 0;
+    while i < len(headers) {
+        let h = headers[i];
+        let hname = "";
+        let hval = "";
+        if is_array(h) {
+            hname = str_lower(str(h[0]));
+            hval = str(h[1]);
+        } elif is_map(h) {
+            hname = str_lower(str(h.name));
+            hval = str(h.value);
+        } else {
+            _fail("header entry must be {name, value} or [name, value]");
+        }
+        let lookup = hpack_static_find(hname, hval);
+        if lookup.exact_index > 0 {
+            // Section 6.1: Indexed Header Field Representation (bit 7 = 1, 7-bit prefix)
+            _hpack_write_int(out, lookup.exact_index, 7, 128);
+        } elif lookup.name_index > 0 {
+            // Section 6.2.2: Literal Header Field without Indexing — Indexed Name (0000xxxx, 4-bit prefix)
+            _hpack_write_int(out, lookup.name_index, 4, 0);
+            _hpack_write_str(out, hval);
+        } else {
+            // Section 6.2.2: Literal Header Field without Indexing — New Name (0x00)
+            array_push(out, 0);
+            _hpack_write_str(out, hname);
+            _hpack_write_str(out, hval);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn hpack_decode_headers(block_bytes) {
+    let bytes = _to_byte_array(block_bytes);
+    let headers = [];
+    let pos = 0;
+    while pos < len(bytes) {
+        let b0 = bytes[pos];
+        if bit_and(b0, 128) != 0 {
+            // Indexed Header Field (7-bit prefix)
+            let idx_dec = _hpack_read_int(bytes, pos, 7);
+            pos = idx_dec.next;
+            let entry = hpack_static_lookup(idx_dec.value);
+            if entry == nil { _fail("HPACK static index out of bounds: " + str(idx_dec.value)); }
+            array_push(headers, map{ name: entry.name, value: entry.value });
+        } elif bit_and(b0, 192) == 64 {
+            // Literal with Incremental Indexing (6-bit prefix)
+            let n_dec = _hpack_read_int(bytes, pos, 6);
+            pos = n_dec.next;
+            let nm = "";
+            if n_dec.value == 0 {
+                let ns = _hpack_read_str(bytes, pos);
+                nm = ns.value; pos = ns.next;
+            } else {
+                let st_e = hpack_static_lookup(n_dec.value);
+                if st_e == nil { _fail("HPACK name index out of bounds: " + str(n_dec.value)); }
+                nm = st_e.name;
+            }
+            let vs = _hpack_read_str(bytes, pos);
+            pos = vs.next;
+            array_push(headers, map{ name: nm, value: vs.value });
+        } elif bit_and(b0, 224) == 32 {
+            // Dynamic table size update (5-bit prefix)
+            let sz_dec = _hpack_read_int(bytes, pos, 5);
+            pos = sz_dec.next;
+        } else {
+            // Literal without Indexing / Never Indexed (4-bit prefix)
+            let n_dec2 = _hpack_read_int(bytes, pos, 4);
+            pos = n_dec2.next;
+            let nm2 = "";
+            if n_dec2.value == 0 {
+                let ns2 = _hpack_read_str(bytes, pos);
+                nm2 = ns2.value; pos = ns2.next;
+            } else {
+                let st_e2 = hpack_static_lookup(n_dec2.value);
+                if st_e2 == nil { _fail("HPACK name index out of bounds: " + str(n_dec2.value)); }
+                nm2 = st_e2.name;
+            }
+            let vs2 = _hpack_read_str(bytes, pos);
+            pos = vs2.next;
+            array_push(headers, map{ name: nm2, value: vs2.value });
+        }
+    }
+    return headers;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 3: RFC 9113 HTTP/2 Binary 9-Byte Frame Encoder & Decoder
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _h2_type_name(ft) {
+    if ft == 0 { return "DATA"; }
+    if ft == 1 { return "HEADERS"; }
+    if ft == 2 { return "PRIORITY"; }
+    if ft == 3 { return "RST_STREAM"; }
+    if ft == 4 { return "SETTINGS"; }
+    if ft == 5 { return "PUSH_PROMISE"; }
+    if ft == 6 { return "PING"; }
+    if ft == 7 { return "GOAWAY"; }
+    if ft == 8 { return "WINDOW_UPDATE"; }
+    if ft == 9 { return "CONTINUATION"; }
+    return "UNKNOWN_" + str(ft);
+}
+
+fn _push_u16_be(out, val) {
+    array_push(out, bit_and(bit_shr(val, 8), 255));
+    array_push(out, bit_and(val, 255));
+}
+
+fn _push_u32_be(out, val) {
+    array_push(out, bit_and(bit_shr(val, 24), 255));
+    array_push(out, bit_and(bit_shr(val, 16), 255));
+    array_push(out, bit_and(bit_shr(val, 8), 255));
+    array_push(out, bit_and(val, 255));
+}
+
+fn _read_u16_be(bytes, off) {
+    return bytes[off] * 256 + bytes[off + 1];
+}
+
+fn _read_u32_be(bytes, off) {
+    return bytes[off] * 16777216 + bytes[off + 1] * 65536 + bytes[off + 2] * 256 + bytes[off + 3];
+}
+
+fn h2_verify_preface(bytes_or_str) {
+    let raw = _to_byte_array(bytes_or_str);
+    let expected = str_to_bytes(HTTP2_CLIENT_PREFACE);
+    if len(raw) < len(expected) { return false; }
+    let i = 0;
+    while i < len(expected) {
+        if raw[i] != expected[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// RFC 9113 Section 4.1: 9-octet binary frame header [Length:24, Type:8, Flags:8, R:1, StreamID:31]
+fn h2_encode_frame(frame_type, flags, stream_id, payload = []) {
+    let body = _to_byte_array(payload);
+    let plen = len(body);
+    if plen > 16777215 { _fail("HTTP/2 frame payload exceeds 2^24-1 bytes"); }
+    if stream_id < 0 or stream_id > 2147483647 { _fail("HTTP/2 stream_id must be 0..2^31-1"); }
+    let out = [
+        bit_and(bit_shr(plen, 16), 255),
+        bit_and(bit_shr(plen, 8), 255),
+        bit_and(plen, 255),
+        bit_and(frame_type, 255),
+        bit_and(flags, 255),
+        bit_and(bit_shr(stream_id, 24), 127), // R bit cleared to 0
+        bit_and(bit_shr(stream_id, 16), 255),
+        bit_and(bit_shr(stream_id, 8), 255),
+        bit_and(stream_id, 255)
+    ];
+    _append_bytes(out, body);
+    return out;
+}
+
+fn h2_decode_frame(raw_bytes, offset = 0) {
+    let bytes = _to_byte_array(raw_bytes);
+    if offset < 0 or offset + 9 > len(bytes) {
+        return map{ ok: false, error: "HTTP/2 frame header requires at least 9 bytes" };
+    }
+    let plen = bytes[offset] * 65536 + bytes[offset + 1] * 256 + bytes[offset + 2];
+    let ftype = bytes[offset + 3];
+    let flags = bytes[offset + 4];
+    let sid = bit_and(bytes[offset + 5], 127) * 16777216 +
+              bytes[offset + 6] * 65536 +
+              bytes[offset + 7] * 256 +
+              bytes[offset + 8];
+    if offset + 9 + plen > len(bytes) {
+        return map{ ok: false, error: "HTTP/2 frame payload truncated (expected " + str(plen) + " bytes)" };
+    }
+    let payload = slice(bytes, offset + 9, offset + 9 + plen);
+    return map{
+        ok: true,
+        length: plen,
+        frame_type: ftype,
+        type_name: _h2_type_name(ftype),
+        flags: flags,
+        stream_id: sid,
+        payload: payload,
+        next_offset: offset + 9 + plen
+    };
+}
+
+fn h2_encode_settings(settings_pairs = [], ack = false) {
+    if ack {
+        return h2_encode_frame(H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, []);
+    }
+    let body = [];
+    let i = 0;
+    while i < len(settings_pairs) {
+        let item = settings_pairs[i];
+        let sid = if is_array(item) { item[0] } else { item.id };
+        let sval = if is_array(item) { item[1] } else { item.value };
+        _push_u16_be(body, sid);
+        _push_u32_be(body, sval);
+        i = i + 1;
+    }
+    return h2_encode_frame(H2_FRAME_SETTINGS, 0, 0, body);
+}
+
+fn h2_decode_settings(frame) {
+    if frame.frame_type != H2_FRAME_SETTINGS { _fail("expected SETTINGS frame"); }
+    if frame.stream_id != 0 { _fail("RFC 9113 FRAME_SIZE/PROTOCOL_ERROR: SETTINGS stream_id must be 0"); }
+    let is_ack = bit_and(frame.flags, H2_FLAG_ACK) != 0;
+    if is_ack and frame.length != 0 { _fail("RFC 9113 FRAME_SIZE_ERROR: SETTINGS ACK must have empty payload"); }
+    if frame.length % 6 != 0 { _fail("RFC 9113 FRAME_SIZE_ERROR: SETTINGS payload must be multiple of 6 bytes"); }
+    let entries = [];
+    let settings_map = map{};
+    let p = 0;
+    while p < len(frame.payload) {
+        let id = _read_u16_be(frame.payload, p);
+        let val = _read_u32_be(frame.payload, p + 2);
+        array_push(entries, map{ id: id, value: val });
+        settings_map[str(id)] = val;
+        p = p + 6;
+    }
+    return map{ ack: is_ack, entries: entries, values: settings_map };
+}
+
+fn h2_encode_headers(stream_id, headers, end_stream = false, end_headers = true) {
+    if stream_id <= 0 { _fail("RFC 9113 PROTOCOL_ERROR: HEADERS requires non-zero stream_id"); }
+    let flags = 0;
+    if end_stream { flags = bit_or(flags, H2_FLAG_END_STREAM); }
+    if end_headers { flags = bit_or(flags, H2_FLAG_END_HEADERS); }
+    let block = hpack_encode_headers(headers);
+    return h2_encode_frame(H2_FRAME_HEADERS, flags, stream_id, block);
+}
+
+fn h2_decode_headers(frame) {
+    if frame.frame_type != H2_FRAME_HEADERS { _fail("expected HEADERS frame"); }
+    if frame.stream_id <= 0 { _fail("RFC 9113 PROTOCOL_ERROR: HEADERS stream_id must be > 0"); }
+    let pos = 0;
+    let pad_len = 0;
+    if bit_and(frame.flags, H2_FLAG_PADDED) != 0 {
+        pad_len = frame.payload[0];
+        pos = 1;
+    }
+    if bit_and(frame.flags, H2_FLAG_PRIORITY) != 0 {
+        pos = pos + 5;
+    }
+    let end_pos = len(frame.payload) - pad_len;
+    let block = slice(frame.payload, pos, end_pos);
+    return map{
+        stream_id: frame.stream_id,
+        end_stream: bit_and(frame.flags, H2_FLAG_END_STREAM) != 0,
+        end_headers: bit_and(frame.flags, H2_FLAG_END_HEADERS) != 0,
+        headers: hpack_decode_headers(block)
+    };
+}
+
+fn h2_encode_data(stream_id, data, end_stream = false) {
+    if stream_id <= 0 { _fail("RFC 9113 PROTOCOL_ERROR: DATA requires non-zero stream_id"); }
+    let flags = if end_stream { H2_FLAG_END_STREAM } else { 0 };
+    return h2_encode_frame(H2_FRAME_DATA, flags, stream_id, _to_byte_array(data));
+}
+
+fn h2_encode_window_update(stream_id, window_size_increment) {
+    if window_size_increment <= 0 or window_size_increment > 2147483647 {
+        _fail("RFC 9113 PROTOCOL_ERROR: WINDOW_UPDATE increment must be 1..2^31-1");
+    }
+    let body = [];
+    _push_u32_be(body, bit_and(window_size_increment, 2147483647));
+    return h2_encode_frame(H2_FRAME_WINDOW_UPDATE, 0, stream_id, body);
+}
+
+fn h2_decode_window_update(frame) {
+    if frame.frame_type != H2_FRAME_WINDOW_UPDATE or frame.length != 4 {
+        _fail("RFC 9113 FRAME_SIZE_ERROR: WINDOW_UPDATE must be 4 bytes");
+    }
+    let inc = bit_and(_read_u32_be(frame.payload, 0), 2147483647);
+    if inc == 0 { _fail("RFC 9113 PROTOCOL_ERROR: WINDOW_UPDATE increment cannot be 0"); }
+    return map{ stream_id: frame.stream_id, increment: inc };
+}
+
+fn h2_encode_ping(opaque8, ack = false) {
+    let raw = _to_byte_array(opaque8);
+    if len(raw) != 8 { _fail("RFC 9113 FRAME_SIZE_ERROR: PING payload must be exactly 8 bytes"); }
+    return h2_encode_frame(H2_FRAME_PING, if ack { H2_FLAG_ACK } else { 0 }, 0, raw);
+}
+
+fn h2_decode_ping(frame) {
+    if frame.frame_type != H2_FRAME_PING or frame.stream_id != 0 or frame.length != 8 {
+        _fail("invalid HTTP/2 PING frame");
+    }
+    return map{ ack: bit_and(frame.flags, H2_FLAG_ACK) != 0, opaque_data: frame.payload };
+}
+
+fn h2_encode_goaway(last_stream_id, error_code, debug_data = "") {
+    let body = [];
+    _push_u32_be(body, bit_and(last_stream_id, 2147483647));
+    _push_u32_be(body, error_code);
+    _append_bytes(body, _to_byte_array(debug_data));
+    return h2_encode_frame(H2_FRAME_GOAWAY, 0, 0, body);
+}
+
+fn h2_decode_goaway(frame) {
+    if frame.frame_type != H2_FRAME_GOAWAY or frame.stream_id != 0 or frame.length < 8 {
+        _fail("invalid HTTP/2 GOAWAY frame");
+    }
+    let last_sid = bit_and(_read_u32_be(frame.payload, 0), 2147483647);
+    let err_code = _read_u32_be(frame.payload, 4);
+    let dbg = bytes_to_str(slice(frame.payload, 8, len(frame.payload)));
+    return map{ last_stream_id: last_sid, error_code: err_code, debug_data: dbg };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 4: RFC 6455 WebSocket Frame Codec & Topic Multiplexer
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn ws_encode_frame(opcode, payload_data = [], fin = true, mask_key = nil) {
+    if opcode < 0 or opcode > 15 { _fail("WebSocket opcode must be 0..15"); }
+    let payload = _to_byte_array(payload_data);
+    let plen = len(payload);
+    let masked = mask_key != nil;
+    if masked and (type(mask_key) != "array" or len(mask_key) != 4) {
+        _fail("WebSocket mask_key must be a 4-byte array");
+    }
+
+    //Control frames (opcode >= 8) MUST NOT be fragmented and MUST have payload <= 125 per RFC 6455 §5.5
+    if opcode >= 8 and (not fin or plen > 125) {
+        _fail("RFC 6455 control frames must have FIN=1 and payload <= 125 bytes");
+    }
+
+    let out = [];
+    let b0 = bit_or(if fin { 128 } else { 0 }, bit_and(opcode, 15));
+    array_push(out, b0);
+
+    let mask_bit = if masked { 128 } else { 0 };
+    if plen <= 125 {
+        array_push(out, bit_or(mask_bit, plen));
+    } elif plen <= 65535 {
+        array_push(out, bit_or(mask_bit, 126));
+        _push_u16_be(out, plen);
+    } else {
+        array_push(out, bit_or(mask_bit, 127));
+        let hi32 = num_floor(plen / 4294967296);
+        let lo32 = plen % 4294967296;
+        _push_u32_be(out, hi32);
+        _push_u32_be(out, lo32);
+    }
+
+    if masked {
+        _append_bytes(out, mask_key);
+        let i = 0;
+        while i < plen {
+            array_push(out, bit_xor(payload[i], mask_key[i % 4]));
+            i = i + 1;
+        }
+    } else {
+        _append_bytes(out, payload);
+    }
+    return out;
+}
+
+fn ws_encode_close(status_code = 1000, reason = "", mask_key = nil) {
+    let body = [];
+    _push_u16_be(body, status_code);
+    _append_bytes(body, str_to_bytes(reason));
+    return ws_encode_frame(WS_OP_CLOSE, body, true, mask_key);
+}
+
+fn ws_decode_frame(raw_bytes, offset = 0) {
+    let bytes = _to_byte_array(raw_bytes);
+    if offset < 0 or offset + 2 > len(bytes) {
+        return map{ ok: false, error: "WebSocket frame shorter than 2-byte header" };
+    }
+    let b0 = bytes[offset];
+    let b1 = bytes[offset + 1];
+    let fin = bit_and(b0, 128) != 0;
+    let rsv = bit_and(bit_shr(b0, 4), 7);
+    let opcode = bit_and(b0, 15);
+    let masked = bit_and(b1, 128) != 0;
+    let len7 = bit_and(b1, 127);
+
+    let pos = offset + 2;
+    let plen = len7;
+    if len7 == 126 {
+        if pos + 2 > len(bytes) { return map{ ok: false, error: "truncated 16-bit WebSocket length" }; }
+        plen = _read_u16_be(bytes, pos);
+        pos = pos + 2;
+    } elif len7 == 127 {
+        if pos + 8 > len(bytes) { return map{ ok: false, error: "truncated 64-bit WebSocket length" }; }
+        let hi32 = _read_u32_be(bytes, pos);
+        let lo32 = _read_u32_be(bytes, pos + 4);
+        plen = hi32 * 4294967296 + lo32;
+        pos = pos + 8;
+    }
+
+    let mask_key = nil;
+    if masked {
+        if pos + 4 > len(bytes) { return map{ ok: false, error: "truncated WebSocket mask key" }; }
+        mask_key = slice(bytes, pos, pos + 4);
+        pos = pos + 4;
+    }
+
+    if pos + plen > len(bytes) {
+        return map{ ok: false, error: "truncated WebSocket payload" };
+    }
+
+    let payload = [];
+    if masked {
+        let i = 0;
+        while i < plen {
+            array_push(payload, bit_xor(bytes[pos + i], mask_key[i % 4]));
+            i = i + 1;
+        }
+    } else {
+        payload = slice(bytes, pos, pos + plen);
+    }
+
+    let text = "";
+    if opcode == WS_OP_TEXT {
+        text = bytes_to_str(payload);
+    }
+    let close_code = 0;
+    let close_reason = "";
+    if opcode == WS_OP_CLOSE and len(payload) >= 2 {
+        close_code = _read_u16_be(payload, 0);
+        close_reason = bytes_to_str(slice(payload, 2, len(payload)));
+    }
+
+    return map{
+        ok: true,
+        fin: fin,
+        rsv: rsv,
+        opcode: opcode,
+        masked: masked,
+        mask_key: mask_key,
+        payload_length: plen,
+        payload: payload,
+        text: text,
+        close_code: close_code,
+        close_reason: close_reason,
+        next_offset: pos + plen
+    };
+}
+
+// Multiplex logical pub/sub channels over a single RFC 6455 WebSocket connection.
+fn ws_create_multiplexer() {
+    let subs = map{};
+    let next_seq = map{ n: 1 };
+
+    return map{
+        subscribe: fn(topic, handler_fn) {
+            if not map_has(subs, topic) { subs[topic] = []; }
+            array_push(subs[topic], handler_fn);
+            return len(subs[topic]);
+        },
+        encode_message: fn(topic, data, mask_key = nil) {
+            let seq = next_seq.n;
+            next_seq.n = seq + 1;
+            let env = json_stringify(map{ topic: topic, seq: seq, data: data });
+            return ws_encode_frame(WS_OP_TEXT, env, true, mask_key);
+        },
+        dispatch_frame: fn(raw_frame_bytes) {
+            let dec = ws_decode_frame(raw_frame_bytes, 0);
+            if not dec.ok { return dec; }
+            if dec.opcode == WS_OP_PING {
+                return map{ ok: true, control: "ping", pong_frame: ws_encode_frame(WS_OP_PONG, dec.payload, true, nil) };
+            }
+            if dec.opcode != WS_OP_TEXT {
+                return map{ ok: true, control: "non_text", opcode: dec.opcode };
+            }
+            let msg = json_parse(dec.text);
+            let topic = str(msg.topic);
+            let delivered = 0;
+            if map_has(subs, topic) {
+                let handlers = subs[topic];
+                let i = 0;
+                while i < len(handlers) {
+                    handlers[i](msg.data, msg.seq);
+                    delivered = delivered + 1;
+                    i = i + 1;
+                }
+            }
+            return map{ ok: true, topic: topic, seq: msg.seq, delivered: delivered, data: msg.data };
+        }
+    };
+}
+
+export HTTP2_CLIENT_PREFACE;
+export H2_FRAME_DATA, H2_FRAME_HEADERS, H2_FRAME_PRIORITY, H2_FRAME_RST_STREAM, H2_FRAME_SETTINGS;
+export H2_FRAME_PUSH_PROMISE, H2_FRAME_PING, H2_FRAME_GOAWAY, H2_FRAME_WINDOW_UPDATE, H2_FRAME_CONTINUATION;
+export H2_FLAG_END_STREAM, H2_FLAG_ACK, H2_FLAG_END_HEADERS, H2_FLAG_PADDED, H2_FLAG_PRIORITY;
+export H2_SETTINGS_HEADER_TABLE_SIZE, H2_SETTINGS_ENABLE_PUSH, H2_SETTINGS_MAX_CONCURRENT_STREAMS;
+export H2_SETTINGS_INITIAL_WINDOW_SIZE, H2_SETTINGS_MAX_FRAME_SIZE, H2_SETTINGS_MAX_HEADER_LIST_SIZE;
+export WS_OP_CONT, WS_OP_TEXT, WS_OP_BINARY, WS_OP_CLOSE, WS_OP_PING, WS_OP_PONG;
+
+export create_event_loop, spawn_task, sleep_async, wait_io_async, await_task;
+export async_done, async_yield, gather_all, channel_async, run_until_complete;
+export hpack_static_lookup, hpack_static_find, hpack_encode_headers, hpack_decode_headers;
+export h2_verify_preface, h2_encode_frame, h2_decode_frame;
+export h2_encode_settings, h2_decode_settings, h2_encode_headers, h2_decode_headers;
+export h2_encode_data, h2_encode_window_update, h2_decode_window_update;
+export h2_encode_ping, h2_decode_ping, h2_encode_goaway, h2_decode_goaway;
+export ws_encode_frame, ws_encode_close, ws_decode_frame, ws_create_multiplexer;

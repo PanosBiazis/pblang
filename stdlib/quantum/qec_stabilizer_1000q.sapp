@@ -1,0 +1,2385 @@
+// stdlib/quantum/qec_stabilizer_1000q.sapp — 1,000+ Qubit Bit-Packed Aaronson-Gottesman
+// Clifford Stabilizer Tableau Simulator (PRA 70, 052328, 2004) & Fault-Tolerant Quantum
+// Error Correction Suite: [[3,1,1]] Bit/Phase-Flip, Shor [[9,1,3]], Steane [[7,1,3]] CSS,
+// and Rotated Planar Surface Code (Surface-17 d=3 [[9,1,3]], d=5 [[25,1,5]], d=7 [[49,1,7]])
+// with Exact Minimum-Weight Manhattan Defect Matching Decoder (PBLang v3.0.0).
+
+let _WORD_BITS = 30;
+let _WORD_MASK = 1073741823; // (1 << 30) - 1
+let _INV_SQRT2 = 0.70710678118654752440;
+
+// ── Deterministic 32-bit Xorshift PRNG ──────────────────────────────────────
+fn _rng_init(seed) {
+    let s = bit_and(seed, 4294967295);
+    if s == 0 { s = 987654321; }
+    return map{ state: s };
+}
+
+fn _rng_next_u32(rng) {
+    let s = rng.state;
+    s = bit_and(bit_xor(s, bit_shl(s, 13)), 4294967295);
+    s = bit_and(bit_xor(s, bit_shr(s, 17)), 4294967295);
+    s = bit_and(bit_xor(s, bit_shl(s, 5)), 4294967295);
+    rng.state = s;
+    return s;
+}
+
+fn _rng_next_bit(rng) {
+    return bit_and(_rng_next_u32(rng), 1);
+}
+
+fn _rng_next_float(rng) {
+    return _rng_next_u32(rng) / 4294967296.0;
+}
+
+// ── O(1) SWAR Popcount for 30-Bit Packed Stabilizer Words ───────────────────
+fn _popcount30(v) {
+    let w = bit_and(v, _WORD_MASK);
+    let x = w - bit_and(bit_shr(w, 1), 357913941);
+    x = bit_and(x, 858993459) + bit_and(bit_shr(x, 2), 858993459);
+    x = bit_and(x + bit_shr(x, 4), 252645135);
+    x = x + bit_shr(x, 8);
+    x = x + bit_shr(x, 16);
+    return bit_and(x, 63);
+}
+
+fn _zero_words(n_words) {
+    let arr = [];
+    let i = 0;
+    while i < n_words {
+        push(arr, 0);
+        i = i + 1;
+    }
+    return arr;
+}
+
+fn _clone_words(src) {
+    let out = [];
+    let i = 0;
+    let n = len(src);
+    while i < n {
+        push(out, src[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _check_tab_qubit(tab, q, fn_label) {
+    if q < 0 or q >= tab.n_qubits {
+        throw fn_label + ": qubit index " + str(q) + " out of range 0.." + str(tab.n_qubits - 1);
+    }
+}
+
+// ── 1. Bit-Packed Aaronson-Gottesman Clifford Stabilizer Tableau ────────────
+// Rows 0 .. n-1     : Destabilizer generators R_0 .. R_{n-1} (initially +X_i)
+// Rows n .. 2*n-1   : Stabilizer generators   R_n .. R_{2n-1} (initially +Z_i)
+// Row  2*n          : Scratch row used during deterministic Z-measurement
+fn new_stabilizer_tableau(n_qubits, seed = 42) {
+    if n_qubits < 1 {
+        throw "new_stabilizer_tableau: n_qubits must be >= 1";
+    }
+    let words = num_floor((n_qubits + _WORD_BITS - 1) / _WORD_BITS);
+    let total_rows = 2 * n_qubits + 1;
+    let x_rows = [];
+    let z_rows = [];
+    let r_bits = [];
+
+    let r_idx = 0;
+    while r_idx < total_rows {
+        push(x_rows, _zero_words(words));
+        push(z_rows, _zero_words(words));
+        push(r_bits, 0);
+        r_idx = r_idx + 1;
+    }
+
+    let q = 0;
+    while q < n_qubits {
+        let w = num_floor(q / _WORD_BITS);
+        let b = q - w * _WORD_BITS;
+        let mask = bit_shl(1, b);
+        x_rows[q][w] = bit_or(x_rows[q][w], mask);
+        z_rows[n_qubits + q][w] = bit_or(z_rows[n_qubits + q][w], mask);
+        q = q + 1;
+    }
+
+    return map{
+        format: "pblang.quantum.stabilizer_tableau.v1",
+        n_qubits: n_qubits,
+        words: words,
+        total_rows: total_rows,
+        x: x_rows,
+        z: z_rows,
+        r: r_bits,
+        rng: _rng_init(seed)
+    };
+}
+
+fn clone_stabilizer_tableau(tab) {
+    let x_copy = [];
+    let z_copy = [];
+    let r_copy = [];
+    let i = 0;
+    let total_rows = tab.total_rows;
+    while i < total_rows {
+        push(x_copy, _clone_words(tab.x[i]));
+        push(z_copy, _clone_words(tab.z[i]));
+        push(r_copy, tab.r[i]);
+        i = i + 1;
+    }
+    return map{
+        format: tab.format,
+        n_qubits: tab.n_qubits,
+        words: tab.words,
+        total_rows: total_rows,
+        x: x_copy,
+        z: z_copy,
+        r: r_copy,
+        rng: map{ state: tab.rng.state }
+    };
+}
+
+// Hadamard H(q): r_i ^= x_{iq} & z_{iq}; swap(x_{iq}, z_{iq})
+fn tab_h(tab, q) {
+    _check_tab_qubit(tab, q, "tab_h");
+    let w = num_floor(q / _WORD_BITS);
+    let b = q - w * _WORD_BITS;
+    let mask = bit_shl(1, b);
+    let clear_mask = bit_xor(_WORD_MASK, mask);
+    let limit = 2 * tab.n_qubits;
+    let x_rows = tab.x;
+    let z_rows = tab.z;
+    let r_bits = tab.r;
+    let i = 0;
+    while i < limit {
+        let xw = x_rows[i][w];
+        let zw = z_rows[i][w];
+        let xq = if bit_and(xw, mask) != 0 { 1 } else { 0 };
+        let zq = if bit_and(zw, mask) != 0 { 1 } else { 0 };
+        if xq == 1 and zq == 1 {
+            r_bits[i] = bit_xor(r_bits[i], 1);
+        }
+        if xq != zq {
+            x_rows[i][w] = bit_xor(xw, mask);
+            z_rows[i][w] = bit_xor(zw, mask);
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+// Phase S(q) = diag(1, i): r_i ^= x_{iq} & z_{iq}; z_{iq} ^= x_{iq}
+fn tab_s(tab, q) {
+    _check_tab_qubit(tab, q, "tab_s");
+    let w = num_floor(q / _WORD_BITS);
+    let b = q - w * _WORD_BITS;
+    let mask = bit_shl(1, b);
+    let limit = 2 * tab.n_qubits;
+    let x_rows = tab.x;
+    let z_rows = tab.z;
+    let r_bits = tab.r;
+    let i = 0;
+    while i < limit {
+        let xw = x_rows[i][w];
+        if bit_and(xw, mask) != 0 {
+            let zw = z_rows[i][w];
+            if bit_and(zw, mask) != 0 {
+                r_bits[i] = bit_xor(r_bits[i], 1);
+            }
+            z_rows[i][w] = bit_xor(zw, mask);
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+// Inverse Phase Sdg(q) = diag(1, -i): r_i ^= x_{iq} & (1 ^ z_{iq}); z_{iq} ^= x_{iq}
+fn tab_sdg(tab, q) {
+    _check_tab_qubit(tab, q, "tab_sdg");
+    let w = num_floor(q / _WORD_BITS);
+    let b = q - w * _WORD_BITS;
+    let mask = bit_shl(1, b);
+    let limit = 2 * tab.n_qubits;
+    let x_rows = tab.x;
+    let z_rows = tab.z;
+    let r_bits = tab.r;
+    let i = 0;
+    while i < limit {
+        let xw = x_rows[i][w];
+        if bit_and(xw, mask) != 0 {
+            let zw = z_rows[i][w];
+            if bit_and(zw, mask) == 0 {
+                r_bits[i] = bit_xor(r_bits[i], 1);
+            }
+            z_rows[i][w] = bit_xor(zw, mask);
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+// Pauli X(q): r_i ^= z_{iq}
+fn tab_x(tab, q) {
+    _check_tab_qubit(tab, q, "tab_x");
+    let w = num_floor(q / _WORD_BITS);
+    let b = q - w * _WORD_BITS;
+    let mask = bit_shl(1, b);
+    let limit = 2 * tab.n_qubits;
+    let z_rows = tab.z;
+    let r_bits = tab.r;
+    let i = 0;
+    while i < limit {
+        if bit_and(z_rows[i][w], mask) != 0 {
+            r_bits[i] = bit_xor(r_bits[i], 1);
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+// Pauli Z(q): r_i ^= x_{iq}
+fn tab_z(tab, q) {
+    _check_tab_qubit(tab, q, "tab_z");
+    let w = num_floor(q / _WORD_BITS);
+    let b = q - w * _WORD_BITS;
+    let mask = bit_shl(1, b);
+    let limit = 2 * tab.n_qubits;
+    let x_rows = tab.x;
+    let r_bits = tab.r;
+    let i = 0;
+    while i < limit {
+        if bit_and(x_rows[i][w], mask) != 0 {
+            r_bits[i] = bit_xor(r_bits[i], 1);
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+// Pauli Y(q): r_i ^= x_{iq} ^ z_{iq}
+fn tab_y(tab, q) {
+    _check_tab_qubit(tab, q, "tab_y");
+    let w = num_floor(q / _WORD_BITS);
+    let b = q - w * _WORD_BITS;
+    let mask = bit_shl(1, b);
+    let limit = 2 * tab.n_qubits;
+    let x_rows = tab.x;
+    let z_rows = tab.z;
+    let r_bits = tab.r;
+    let i = 0;
+    while i < limit {
+        let xq = if bit_and(x_rows[i][w], mask) != 0 { 1 } else { 0 };
+        let zq = if bit_and(z_rows[i][w], mask) != 0 { 1 } else { 0 };
+        if xq != zq {
+            r_bits[i] = bit_xor(r_bits[i], 1);
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+// Sqrt(X) SX(q) = H S H = [[0.5+0.5i, 0.5-0.5i], [0.5-0.5i, 0.5+0.5i]]:
+// X -> +X, Z -> -Y, Y -> +Z  =>  r_i ^= z_{iq} & (1 ^ x_{iq}); x_{iq} ^= z_{iq}
+fn tab_sx(tab, q) {
+    _check_tab_qubit(tab, q, "tab_sx");
+    let w = num_floor(q / _WORD_BITS);
+    let b = q - w * _WORD_BITS;
+    let mask = bit_shl(1, b);
+    let limit = 2 * tab.n_qubits;
+    let x_rows = tab.x;
+    let z_rows = tab.z;
+    let r_bits = tab.r;
+    let i = 0;
+    while i < limit {
+        let zw = z_rows[i][w];
+        if bit_and(zw, mask) != 0 {
+            let xw = x_rows[i][w];
+            if bit_and(xw, mask) == 0 {
+                r_bits[i] = bit_xor(r_bits[i], 1);
+            }
+            x_rows[i][w] = bit_xor(xw, mask);
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+// CNOT(c, t): r_i ^= x_{ic} & z_{it} & (x_{it} ^ z_{ic} ^ 1); x_{it} ^= x_{ic}; z_{ic} ^= z_{it}
+fn tab_cnot(tab, c, t) {
+    _check_tab_qubit(tab, c, "tab_cnot");
+    _check_tab_qubit(tab, t, "tab_cnot");
+    if c == t {
+        throw "tab_cnot: control and target must be distinct";
+    }
+    let wc = num_floor(c / _WORD_BITS);
+    let bc = c - wc * _WORD_BITS;
+    let mc = bit_shl(1, bc);
+    let wt = num_floor(t / _WORD_BITS);
+    let bt = t - wt * _WORD_BITS;
+    let mt = bit_shl(1, bt);
+
+    let limit = 2 * tab.n_qubits;
+    let x_rows = tab.x;
+    let z_rows = tab.z;
+    let r_bits = tab.r;
+    let i = 0;
+    while i < limit {
+        let xr = x_rows[i];
+        let zr = z_rows[i];
+        let has_xc = bit_and(xr[wc], mc) != 0;
+        let has_zt = bit_and(zr[wt], mt) != 0;
+        if has_xc {
+            if has_zt {
+                let has_xt = bit_and(xr[wt], mt) != 0;
+                let has_zc = bit_and(zr[wc], mc) != 0;
+                if has_xt == has_zc {
+                    r_bits[i] = bit_xor(r_bits[i], 1);
+                }
+            }
+            xr[wt] = bit_xor(xr[wt], mt);
+        }
+        if has_zt {
+            zr[wc] = bit_xor(zr[wc], mc);
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+// CZ(q0, q1): r_i ^= x_{i,q0} & x_{i,q1} & (z_{i,q0} ^ z_{i,q1}); z_{i,q0} ^= x_{i,q1}; z_{i,q1} ^= x_{i,q0}
+fn tab_cz(tab, q0, q1) {
+    _check_tab_qubit(tab, q0, "tab_cz");
+    _check_tab_qubit(tab, q1, "tab_cz");
+    if q0 == q1 {
+        throw "tab_cz: q0 and q1 must be distinct";
+    }
+    let w0 = num_floor(q0 / _WORD_BITS);
+    let b0 = q0 - w0 * _WORD_BITS;
+    let m0 = bit_shl(1, b0);
+    let w1 = num_floor(q1 / _WORD_BITS);
+    let b1 = q1 - w1 * _WORD_BITS;
+    let m1 = bit_shl(1, b1);
+
+    let limit = 2 * tab.n_qubits;
+    let x_rows = tab.x;
+    let z_rows = tab.z;
+    let r_bits = tab.r;
+    let i = 0;
+    while i < limit {
+        let xr = x_rows[i];
+        let zr = z_rows[i];
+        let x0 = bit_and(xr[w0], m0) != 0;
+        let x1 = bit_and(xr[w1], m1) != 0;
+        if x0 and x1 {
+            let z0 = bit_and(zr[w0], m0) != 0;
+            let z1 = bit_and(zr[w1], m1) != 0;
+            if z0 != z1 {
+                r_bits[i] = bit_xor(r_bits[i], 1);
+            }
+        }
+        if x1 {
+            zr[w0] = bit_xor(zr[w0], m0);
+        }
+        if x0 {
+            zr[w1] = bit_xor(zr[w1], m1);
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+// SWAP(q0, q1): swaps (x_{i,q0}, z_{i,q0}) <-> (x_{i,q1}, z_{i,q1})
+fn tab_swap(tab, q0, q1) {
+    _check_tab_qubit(tab, q0, "tab_swap");
+    _check_tab_qubit(tab, q1, "tab_swap");
+    if q0 == q1 {
+        return tab;
+    }
+    let w0 = num_floor(q0 / _WORD_BITS);
+    let b0 = q0 - w0 * _WORD_BITS;
+    let m0 = bit_shl(1, b0);
+    let w1 = num_floor(q1 / _WORD_BITS);
+    let b1 = q1 - w1 * _WORD_BITS;
+    let m1 = bit_shl(1, b1);
+
+    let limit = 2 * tab.n_qubits;
+    let x_rows = tab.x;
+    let z_rows = tab.z;
+    let i = 0;
+    while i < limit {
+        let xr = x_rows[i];
+        let zr = z_rows[i];
+        let x0 = bit_and(xr[w0], m0) != 0;
+        let x1 = bit_and(xr[w1], m1) != 0;
+        if x0 != x1 {
+            xr[w0] = bit_xor(xr[w0], m0);
+            xr[w1] = bit_xor(xr[w1], m1);
+        }
+        let z0 = bit_and(zr[w0], m0) != 0;
+        let z1 = bit_and(zr[w1], m1) != 0;
+        if z0 != z1 {
+            zr[w0] = bit_xor(zr[w0], m0);
+            zr[w1] = bit_xor(zr[w1], m1);
+        }
+        i = i + 1;
+    }
+    return tab;
+}
+
+// Word-parallel Aaronson-Gottesman rowsum(tab, h_row, i_row):
+// Sets R_{h_row} <- R_{i_row} * R_{h_row}, accumulating exact g(x1, z1, x2, z2) mod 4
+// across 30 qubits at a time (only 35 word iterations for 1,024 qubits!).
+fn rowsum(tab, h_row, i_row) {
+    let words = tab.words;
+    let xh = tab.x[h_row];
+    let zh = tab.z[h_row];
+    let xi = tab.x[i_row];
+    let zi = tab.z[i_row];
+
+    let sum_plus = 0;
+    let sum_minus = 0;
+    let w = 0;
+    while w < words {
+        let x1 = xi[w];
+        let z1 = zi[w];
+        let x2 = xh[w];
+        let z2 = zh[w];
+
+        let nx1 = bit_xor(_WORD_MASK, x1);
+        let nz1 = bit_xor(_WORD_MASK, z1);
+        let nx2 = bit_xor(_WORD_MASK, x2);
+        let nz2 = bit_xor(_WORD_MASK, z2);
+
+        let x1_only = bit_and(x1, nz1);
+        let y1_both = bit_and(x1, z1);
+        let z1_only = bit_and(nx1, z1);
+
+        let x2_only = bit_and(x2, nz2);
+        let y2_both = bit_and(x2, z2);
+        let z2_only = bit_and(nx2, z2);
+
+        // Cyclic (+i): X*Y=+iZ, Y*Z=+iX, Z*X=+iY
+        let plus_mask = bit_or(
+            bit_and(x1_only, y2_both),
+            bit_or(bit_and(y1_both, z2_only), bit_and(z1_only, x2_only))
+        );
+        // Anti-cyclic (-i == +3 mod 4): Y*X=-iZ, Z*Y=-iX, X*Z=-iY
+        let minus_mask = bit_or(
+            bit_and(y1_both, x2_only),
+            bit_or(bit_and(z1_only, y2_both), bit_and(x1_only, z2_only))
+        );
+
+        if plus_mask != 0 {
+            sum_plus = sum_plus + _popcount30(plus_mask);
+        }
+        if minus_mask != 0 {
+            sum_minus = sum_minus + _popcount30(minus_mask);
+        }
+
+        xh[w] = bit_xor(x2, x1);
+        zh[w] = bit_xor(z2, z1);
+        w = w + 1;
+    }
+
+    let phase_mod4 = bit_and(2 * tab.r[h_row] + 2 * tab.r[i_row] + sum_plus + 3 * sum_minus, 3);
+    if phase_mod4 == 2 {
+        tab.r[h_row] = 1;
+    } else {
+        tab.r[h_row] = 0;
+    }
+    return phase_mod4;
+}
+
+// Projective Z-basis measurement tab_measure(tab, q, rand_bit = nil):
+// Returns map{ outcome: 0|1, deterministic: true|false }.
+fn tab_measure(tab, q, rand_bit = nil) {
+    _check_tab_qubit(tab, q, "tab_measure");
+    let n = tab.n_qubits;
+    let words = tab.words;
+    let w = num_floor(q / _WORD_BITS);
+    let b = q - w * _WORD_BITS;
+    let mask = bit_shl(1, b);
+    let x_rows = tab.x;
+    let z_rows = tab.z;
+    let r_bits = tab.r;
+
+    let p = n;
+    let limit = 2 * n;
+    while p < limit {
+        if bit_and(x_rows[p][w], mask) != 0 {
+            break;
+        }
+        p = p + 1;
+    }
+
+    if p < limit {
+        // Non-deterministic outcome: Z_q anticommutes with stabilizer generator R_p
+        let p_destab = p - n;
+        let i = 0;
+        while i < limit {
+            if i != p and i != p_destab and bit_and(x_rows[i][w], mask) != 0 {
+                rowsum(tab, i, p);
+            }
+            i = i + 1;
+        }
+        let kw = 0;
+        while kw < words {
+            x_rows[p_destab][kw] = x_rows[p][kw];
+            z_rows[p_destab][kw] = z_rows[p][kw];
+            x_rows[p][kw] = 0;
+            z_rows[p][kw] = 0;
+            kw = kw + 1;
+        }
+        r_bits[p_destab] = r_bits[p];
+        z_rows[p][w] = mask;
+
+        let outcome = if rand_bit != nil {
+            if rand_bit != 0 { 1 } else { 0 }
+        } else {
+            _rng_next_bit(tab.rng)
+        };
+        r_bits[p] = outcome;
+        return map{
+            outcome: outcome,
+            deterministic: false
+        };
+    }
+
+    // Deterministic outcome: +/- Z_q lies in the stabilizer group
+    let scratch = 2 * n;
+    let kw = 0;
+    while kw < words {
+        x_rows[scratch][kw] = 0;
+        z_rows[scratch][kw] = 0;
+        kw = kw + 1;
+    }
+    r_bits[scratch] = 0;
+
+    let i = 0;
+    while i < n {
+        if bit_and(x_rows[i][w], mask) != 0 {
+            rowsum(tab, scratch, i + n);
+        }
+        i = i + 1;
+    }
+    return map{
+        outcome: r_bits[scratch],
+        deterministic: true
+    };
+}
+
+fn tab_stabilizer_strings(tab) {
+    let n = tab.n_qubits;
+    let out = [];
+    let row = n;
+    while row < 2 * n {
+        let s = if tab.r[row] == 0 { "+" } else { "-" };
+        let q = 0;
+        while q < n {
+            let w = num_floor(q / _WORD_BITS);
+            let b = q - w * _WORD_BITS;
+            let mask = bit_shl(1, b);
+            let xq = bit_and(tab.x[row][w], mask) != 0;
+            let zq = bit_and(tab.z[row][w], mask) != 0;
+            if xq and zq {
+                s = s + "Y";
+            } else if xq {
+                s = s + "X";
+            } else if zq {
+                s = s + "Z";
+            } else {
+                s = s + "I";
+            }
+            q = q + 1;
+        }
+        push(out, s);
+        row = row + 1;
+    }
+    return out;
+}
+
+// ── Clifford Circuit Execution & Exact Affine-Coset Stabilizer Frame Sampler ─
+fn _extract_1q_arg(item) {
+    if is_array(item) { return item[1]; }
+    if map_has(item, "q") { return item.q; }
+    if map_has(item, "target") { return item.target; }
+    if map_has(item, "targets") and len(item.targets) > 0 { return item.targets[0]; }
+    if map_has(item, "q0") { return item.q0; }
+    throw "simulate_clifford_circuit: missing target qubit in 1-qubit gate";
+}
+
+fn _extract_2q_args(item) {
+    if is_array(item) { return [item[1], item[2]]; }
+    if map_has(item, "c") and map_has(item, "t") { return [item.c, item.t]; }
+    if map_has(item, "control") and map_has(item, "target") { return [item.control, item.target]; }
+    if map_has(item, "q0") and map_has(item, "q1") { return [item.q0, item.q1]; }
+    if map_has(item, "controls") and len(item.controls) > 0 and map_has(item, "targets") and len(item.targets) > 0 {
+        return [item.controls[0], item.targets[0]];
+    }
+    if map_has(item, "targets") and len(item.targets) >= 2 {
+        return [item.targets[0], item.targets[1]];
+    }
+    throw "simulate_clifford_circuit: missing qubit pair in 2-qubit gate";
+}
+
+fn _apply_clifford_op(tab, item, meas_record) {
+    let op = if is_array(item) { item[0] } else { item.op };
+    if op == "h" or op == "H" {
+        tab_h(tab, _extract_1q_arg(item));
+    } else if op == "s" or op == "S" {
+        tab_s(tab, _extract_1q_arg(item));
+    } else if op == "sdg" or op == "SDG" or op == "Sdg" {
+        tab_sdg(tab, _extract_1q_arg(item));
+    } else if op == "sx" or op == "SX" {
+        tab_sx(tab, _extract_1q_arg(item));
+    } else if op == "x" or op == "X" {
+        tab_x(tab, _extract_1q_arg(item));
+    } else if op == "y" or op == "Y" {
+        tab_y(tab, _extract_1q_arg(item));
+    } else if op == "z" or op == "Z" {
+        tab_z(tab, _extract_1q_arg(item));
+    } else if op == "cnot" or op == "CNOT" or op == "cx" or op == "CX" {
+        let pair = _extract_2q_args(item);
+        tab_cnot(tab, pair[0], pair[1]);
+    } else if op == "cz" or op == "CZ" {
+        let pair = _extract_2q_args(item);
+        tab_cz(tab, pair[0], pair[1]);
+    } else if op == "swap" or op == "SWAP" {
+        let pair = _extract_2q_args(item);
+        tab_swap(tab, pair[0], pair[1]);
+    } else if op == "measure" or op == "m" or op == "M" {
+        let q = _extract_1q_arg(item);
+        let rbit = if is_map(item) and map_has(item, "rand_bit") { item.rand_bit } else { nil };
+        let mres = tab_measure(tab, q, rbit);
+        if meas_record != nil {
+            push(meas_record, map{ q: q, outcome: mres.outcome, deterministic: mres.deterministic });
+        }
+    } else if op == "id" or op == "I" or op == "barrier" {
+        // no-op
+    } else {
+        throw "simulate_clifford_circuit: unsupported non-Clifford or unknown gate '" + str(op) + "'";
+    }
+}
+
+fn _words_to_bitstring(words_arr, n_qubits) {
+    let s = "";
+    let q = 0;
+    while q < n_qubits {
+        let w = num_floor(q / _WORD_BITS);
+        let b = q - w * _WORD_BITS;
+        if bit_and(words_arr[w], bit_shl(1, b)) != 0 {
+            s = s + "1";
+        } else {
+            s = s + "0";
+        }
+        q = q + 1;
+    }
+    return s;
+}
+
+fn _is_nonzero_words(words_arr, n_words) {
+    let w = 0;
+    while w < n_words {
+        if words_arr[w] != 0 { return true; }
+        w = w + 1;
+    }
+    return false;
+}
+
+// Reduces X-rows of stabilizer generators over GF(2) to an independent row basis.
+fn _gf2_row_basis(rows_list, n_qubits, n_words) {
+    let pool = [];
+    let i = 0;
+    while i < len(rows_list) {
+        if _is_nonzero_words(rows_list[i], n_words) {
+            push(pool, _clone_words(rows_list[i]));
+        }
+        i = i + 1;
+    }
+    let basis = [];
+    let pivot_col = 0;
+    let rank = 0;
+    while pivot_col < n_qubits and rank < len(pool) {
+        let w = num_floor(pivot_col / _WORD_BITS);
+        let b = pivot_col - w * _WORD_BITS;
+        let mask = bit_shl(1, b);
+        let found = -1;
+        let r = rank;
+        while r < len(pool) {
+            if bit_and(pool[r][w], mask) != 0 {
+                found = r;
+                break;
+            }
+            r = r + 1;
+        }
+        if found >= 0 {
+            if found != rank {
+                let tmp = pool[rank];
+                pool[rank] = pool[found];
+                pool[found] = tmp;
+            }
+            let r2 = 0;
+            while r2 < len(pool) {
+                if r2 != rank and bit_and(pool[r2][w], mask) != 0 {
+                    let kw = 0;
+                    while kw < n_words {
+                        pool[r2][kw] = bit_xor(pool[r2][kw], pool[rank][kw]);
+                        kw = kw + 1;
+                    }
+                }
+                r2 = r2 + 1;
+            }
+            push(basis, pool[rank]);
+            rank = rank + 1;
+        }
+        pivot_col = pivot_col + 1;
+    }
+    return basis;
+}
+
+fn simulate_clifford_circuit(n_qubits, ops_list, shots = 256, seed = 42) {
+    let gates = if is_map(ops_list) and map_has(ops_list, "gates") {
+        ops_list.gates
+    } else {
+        ops_list
+    };
+    let n = if is_map(ops_list) and map_has(ops_list, "n_qubits") and (n_qubits == nil or n_qubits <= 0) {
+        ops_list.n_qubits
+    } else {
+        n_qubits
+    };
+    if n < 1 {
+        throw "simulate_clifford_circuit: n_qubits must be >= 1";
+    }
+    if shots < 1 {
+        throw "simulate_clifford_circuit: shots must be >= 1";
+    }
+
+    let has_mid_measure = false;
+    let gi = 0;
+    while gi < len(gates) {
+        let g_item = gates[gi];
+        let op = if is_array(g_item) { g_item[0] } else { g_item.op };
+        if op == "measure" or op == "m" or op == "M" {
+            has_mid_measure = true;
+            break;
+        }
+        gi = gi + 1;
+    }
+
+    let rng = _rng_init(seed);
+    let counts = map{};
+
+    if has_mid_measure {
+        let s_idx = 0;
+        let last_mid_events = [];
+        while s_idx < shots {
+            let tab = new_stabilizer_tableau(n, _rng_next_u32(rng));
+            let events = [];
+            let k = 0;
+            while k < len(gates) {
+                _apply_clifford_op(tab, gates[k], events);
+                k = k + 1;
+            }
+            let bstr = "";
+            let q = 0;
+            while q < n {
+                let m = tab_measure(tab, q, _rng_next_bit(rng));
+                bstr = bstr + str(m.outcome);
+                q = q + 1;
+            }
+            if map_has(counts, bstr) {
+                counts[bstr] = counts[bstr] + 1;
+            } else {
+                counts[bstr] = 1;
+            }
+            last_mid_events = events;
+            s_idx = s_idx + 1;
+        }
+        let probs_emp = map{};
+        let ckeys = map_keys(counts);
+        let ci = 0;
+        while ci < len(ckeys) {
+            let kstr = ckeys[ci];
+            probs_emp[kstr] = counts[kstr] / (shots * 1.0);
+            ci = ci + 1;
+        }
+        return map{
+            ok: true,
+            n_qubits: n,
+            shots: shots,
+            counts: counts,
+            probabilities: probs_emp,
+            exact_probabilities: nil,
+            mid_circuit_measurements: last_mid_events
+        };
+    }
+
+    // Pure unitary Clifford circuit: compile stabilizer tableau ONCE and sample
+    // uniformly from the exact affine coset s_ref + rowspace(X_stab)!
+    let base_tab = new_stabilizer_tableau(n, _rng_next_u32(rng));
+    let k = 0;
+    while k < len(gates) {
+        _apply_clifford_op(base_tab, gates[k], nil);
+        k = k + 1;
+    }
+
+    let words = base_tab.words;
+    let raw_x_rows = [];
+    let r = n;
+    while r < 2 * n {
+        if _is_nonzero_words(base_tab.x[r], words) {
+            push(raw_x_rows, _clone_words(base_tab.x[r]));
+        }
+        r = r + 1;
+    }
+    let x_basis = _gf2_row_basis(raw_x_rows, n, words);
+    let rank = len(x_basis);
+
+    // Collapse ONLY the `rank` non-zero X-stabilizer generators via tab_measure(ref_tab, q, 0),
+    // then extract all n deterministic bits of s_ref in O(n * words) word-parallel XORs!
+    let ref_tab = clone_stabilizer_tableau(base_tab);
+    let stab_row = n;
+    while stab_row < 2 * n {
+        let xrow = ref_tab.x[stab_row];
+        let w_scan = 0;
+        while w_scan < words {
+            let word_val = xrow[w_scan];
+            if word_val != 0 {
+                let bit_pos = 0;
+                while bit_and(word_val, bit_shl(1, bit_pos)) == 0 {
+                    bit_pos = bit_pos + 1;
+                }
+                tab_measure(ref_tab, w_scan * _WORD_BITS + bit_pos, 0);
+                // Re-check current row in case another X bit remained? No: tab_measure sets row p >= stab_row to +Z_q;
+                // if p == stab_row, xrow is now 0; if an earlier row < stab_row wasn't possible since we scan stab_row upward!
+                word_val = xrow[w_scan];
+            } else {
+                w_scan = w_scan + 1;
+            }
+        }
+        stab_row = stab_row + 1;
+    }
+
+    // Now all stabilizer rows n .. 2*n-1 are pure Z-operators (x == 0), so Z_a*Z_b = +I has
+    // zero Pauli phase and s_ref[q] == XOR_{i: x_{i,q}==1} r[n + i] across all words!
+    let ref_words = _zero_words(words);
+    let di = 0;
+    while di < n {
+        if ref_tab.r[n + di] != 0 {
+            let dxrow = ref_tab.x[di];
+            let kw = 0;
+            while kw < words {
+                ref_words[kw] = bit_xor(ref_words[kw], dxrow[kw]);
+                kw = kw + 1;
+            }
+        }
+        di = di + 1;
+    }
+
+    // Sample `shots` bitstrings in O(rank * words) integer XORs per shot
+    let sample_buf = _zero_words(words);
+    let s_idx = 0;
+    while s_idx < shots {
+        let w = 0;
+        while w < words {
+            sample_buf[w] = ref_words[w];
+            w = w + 1;
+        }
+        let bi = 0;
+        while bi < rank {
+            if _rng_next_bit(rng) == 1 {
+                let brow = x_basis[bi];
+                let w2 = 0;
+                while w2 < words {
+                    sample_buf[w2] = bit_xor(sample_buf[w2], brow[w2]);
+                    w2 = w2 + 1;
+                }
+            }
+            bi = bi + 1;
+        }
+        let bstr = _words_to_bitstring(sample_buf, n);
+        if map_has(counts, bstr) {
+            counts[bstr] = counts[bstr] + 1;
+        } else {
+            counts[bstr] = 1;
+        }
+        s_idx = s_idx + 1;
+    }
+
+    let probs_emp = map{};
+    let ckeys = map_keys(counts);
+    let ci = 0;
+    while ci < len(ckeys) {
+        let kstr = ckeys[ci];
+        probs_emp[kstr] = counts[kstr] / (shots * 1.0);
+        ci = ci + 1;
+    }
+
+    // For n <= 12, also populate the exact analytical distribution over all 2^n bitstrings
+    let exact_probs = nil;
+    if n <= 12 {
+        exact_probs = map{};
+        let total_dim = bit_shl(1, n);
+        let idx = 0;
+        while idx < total_dim {
+            let bs = "";
+            let qb = 0;
+            while qb < n {
+                if bit_and(idx, bit_shl(1, n - 1 - qb)) != 0 {
+                    bs = bs + "1";
+                } else {
+                    bs = bs + "0";
+                }
+                qb = qb + 1;
+            }
+            exact_probs[bs] = 0.0;
+            idx = idx + 1;
+        }
+        let supp_size = bit_shl(1, rank);
+        let uniform_p = 1.0 / (supp_size * 1.0);
+        let mask_idx = 0;
+        while mask_idx < supp_size {
+            let cw = _clone_words(ref_words);
+            let bi = 0;
+            while bi < rank {
+                if bit_and(mask_idx, bit_shl(1, bi)) != 0 {
+                    let w2 = 0;
+                    while w2 < words {
+                        cw[w2] = bit_xor(cw[w2], x_basis[bi][w2]);
+                        w2 = w2 + 1;
+                    }
+                }
+                bi = bi + 1;
+            }
+            exact_probs[_words_to_bitstring(cw, n)] = uniform_p;
+            mask_idx = mask_idx + 1;
+        }
+    }
+
+    return map{
+        ok: true,
+        n_qubits: n,
+        words: words,
+        support_rank: rank,
+        shots: shots,
+        counts: counts,
+        probabilities: probs_emp,
+        exact_probabilities: exact_probs,
+        tableau: base_tab
+    };
+}
+
+// 1,000-qubit GHZ state builder, verifier & runtime benchmark
+fn benchmark_ghz_1000q(n_qubits = 1000, rand_bit = nil, seed = 42) {
+    if n_qubits < 3 {
+        throw "benchmark_ghz_1000q: n_qubits must be >= 3";
+    }
+    let t0 = now_ms();
+    let tab = new_stabilizer_tableau(n_qubits, seed);
+    tab_h(tab, 0);
+    let i = 0;
+    while i < n_qubits - 1 {
+        tab_cnot(tab, i, i + 1);
+        i = i + 1;
+    }
+    let mid_q = num_floor(n_qubits / 2) - 1;
+    let last_q = n_qubits - 1;
+    let m0 = tab_measure(tab, 0, rand_bit);
+    let m_mid = tab_measure(tab, mid_q, nil);
+    let m_last = tab_measure(tab, last_q, nil);
+    let elapsed_ms = now_ms() - t0;
+
+    return map{
+        ok: (not m0.deterministic) and m_mid.deterministic and m_last.deterministic and
+            (m0.outcome == m_mid.outcome) and (m0.outcome == m_last.outcome),
+        n_qubits: n_qubits,
+        words_per_row: tab.words,
+        elapsed_ms: elapsed_ms,
+        q0: m0,
+        q_mid_index: mid_q,
+        q_mid: m_mid,
+        q_last_index: last_q,
+        q_last: m_last
+    };
+}
+
+// ── Compact Exact Statevector Helpers for Small QEC Fidelity Proofs (<=11q) ──
+fn _sv_zero(n_qubits) {
+    let dim = bit_shl(1, n_qubits);
+    let sv = [];
+    let i = 0;
+    while i < dim {
+        push(sv, [0.0, 0.0]);
+        i = i + 1;
+    }
+    return sv;
+}
+
+fn _sv_h(sv, n_qubits, q) {
+    let dim = len(sv);
+    let mask = bit_shl(1, n_qubits - 1 - q);
+    let idx = 0;
+    while idx < dim {
+        if bit_and(idx, mask) == 0 {
+            let p = bit_or(idx, mask);
+            let a_re = sv[idx][0];
+            let a_im = sv[idx][1];
+            let b_re = sv[p][0];
+            let b_im = sv[p][1];
+            sv[idx][0] = (a_re + b_re) * _INV_SQRT2;
+            sv[idx][1] = (a_im + b_im) * _INV_SQRT2;
+            sv[p][0] = (a_re - b_re) * _INV_SQRT2;
+            sv[p][1] = (a_im - b_im) * _INV_SQRT2;
+        }
+        idx = idx + 1;
+    }
+}
+
+fn _sv_x(sv, n_qubits, q) {
+    let dim = len(sv);
+    let mask = bit_shl(1, n_qubits - 1 - q);
+    let idx = 0;
+    while idx < dim {
+        if bit_and(idx, mask) == 0 {
+            let p = bit_or(idx, mask);
+            let tmp = sv[idx];
+            sv[idx] = sv[p];
+            sv[p] = tmp;
+        }
+        idx = idx + 1;
+    }
+}
+
+fn _sv_z(sv, n_qubits, q) {
+    let dim = len(sv);
+    let mask = bit_shl(1, n_qubits - 1 - q);
+    let idx = 0;
+    while idx < dim {
+        if bit_and(idx, mask) != 0 {
+            sv[idx][0] = 0.0 - sv[idx][0];
+            sv[idx][1] = 0.0 - sv[idx][1];
+        }
+        idx = idx + 1;
+    }
+}
+
+fn _sv_y(sv, n_qubits, q) {
+    let dim = len(sv);
+    let mask = bit_shl(1, n_qubits - 1 - q);
+    let idx = 0;
+    while idx < dim {
+        if bit_and(idx, mask) == 0 {
+            let p = bit_or(idx, mask);
+            let a_re = sv[idx][0];
+            let a_im = sv[idx][1];
+            let b_re = sv[p][0];
+            let b_im = sv[p][1];
+            // Y|0> = i|1>, Y|1> = -i|0>
+            sv[idx][0] = b_im;
+            sv[idx][1] = 0.0 - b_re;
+            sv[p][0] = 0.0 - a_im;
+            sv[p][1] = a_re;
+        }
+        idx = idx + 1;
+    }
+}
+
+fn _sv_cnot(sv, n_qubits, ctrl, targ) {
+    let dim = len(sv);
+    let mc = bit_shl(1, n_qubits - 1 - ctrl);
+    let mt = bit_shl(1, n_qubits - 1 - targ);
+    let idx = 0;
+    while idx < dim {
+        if bit_and(idx, mc) != 0 and bit_and(idx, mt) == 0 {
+            let p = bit_xor(idx, mt);
+            let tmp = sv[idx];
+            sv[idx] = sv[p];
+            sv[p] = tmp;
+        }
+        idx = idx + 1;
+    }
+}
+
+// Projective Z-measurement & optional reset to |0> on ancilla qubit `q`
+fn _sv_measure_and_reset(sv, n_qubits, q) {
+    let dim = len(sv);
+    let mask = bit_shl(1, n_qubits - 1 - q);
+    let p1 = 0.0;
+    let idx = 0;
+    while idx < dim {
+        if bit_and(idx, mask) != 0 {
+            p1 = p1 + sv[idx][0] * sv[idx][0] + sv[idx][1] * sv[idx][1];
+        }
+        idx = idx + 1;
+    }
+    let outcome = if p1 >= 0.5 { 1 } else { 0 };
+    let norm_sq = if outcome == 1 { p1 } else { 1.0 - p1 };
+    let inv_norm = if norm_sq > 0.0 { 1.0 / num_sqrt(norm_sq) } else { 1.0 };
+
+    let idx2 = 0;
+    while idx2 < dim {
+        let is_one = bit_and(idx2, mask) != 0;
+        if (outcome == 1 and (not is_one)) or (outcome == 0 and is_one) {
+            sv[idx2][0] = 0.0;
+            sv[idx2][1] = 0.0;
+        } else {
+            sv[idx2][0] = sv[idx2][0] * inv_norm;
+            sv[idx2][1] = sv[idx2][1] * inv_norm;
+        }
+        idx2 = idx2 + 1;
+    }
+    if outcome == 1 {
+        _sv_x(sv, n_qubits, q);
+    }
+    return outcome;
+}
+
+fn _qubit_state_fidelity(a_re, a_im, b_re, b_im, rec0_re, rec0_im, rec1_re, rec1_im) {
+    // |<psi_ideal | psi_rec>|^2 = |a* rec0 + b* rec1|^2
+    let ov_re = (a_re * rec0_re + a_im * rec0_im) + (b_re * rec1_re + b_im * rec1_im);
+    let ov_im = (a_re * rec0_im - a_im * rec0_re) + (b_re * rec1_im - b_im * rec1_re);
+    return ov_re * ov_re + ov_im * ov_im;
+}
+
+// ── 2A. 3-Qubit Bit-Flip [[3, 1, 1]] & Phase-Flip [[3, 1, 1]] Codes ──────────
+fn qec_bitflip_3q_test(alpha_re, alpha_im, beta_re, beta_im, error_qubit = -1) {
+    let norm = num_sqrt(
+        alpha_re * alpha_re + alpha_im * alpha_im +
+        beta_re * beta_re + beta_im * beta_im
+    );
+    if norm <= 0.0 {
+        throw "qec_bitflip_3q_test: initial state norm must be > 0";
+    }
+    let ar = alpha_re / norm;
+    let ai = alpha_im / norm;
+    let br = beta_re / norm;
+    let bi = beta_im / norm;
+
+    // 5 qubits: 0,1,2 data qubits; 3,4 syndrome ancilla qubits
+    let n = 5;
+    let sv = _sv_zero(n);
+    sv[0] = [ar, ai];
+    sv[bit_shl(1, n - 1)] = [br, bi];
+
+    // Encode |psi> -> a|000> + b|111>
+    _sv_cnot(sv, n, 0, 1);
+    _sv_cnot(sv, n, 0, 2);
+
+    // Inject X bit-flip error on physical qubit 0, 1, or 2 (or none if < 0 / nil)
+    if error_qubit != nil and error_qubit >= 0 and error_qubit <= 2 {
+        _sv_x(sv, n, error_qubit);
+    }
+
+    // Extract Z0*Z1 onto q3 and Z1*Z2 onto q4
+    _sv_cnot(sv, n, 0, 3);
+    _sv_cnot(sv, n, 1, 3);
+    _sv_cnot(sv, n, 1, 4);
+    _sv_cnot(sv, n, 2, 4);
+
+    let s0 = _sv_measure_and_reset(sv, n, 3);
+    let s1 = _sv_measure_and_reset(sv, n, 4);
+
+    let corrected_qubit = -1;
+    if s0 == 1 and s1 == 0 {
+        _sv_x(sv, n, 0);
+        corrected_qubit = 0;
+    } else if s0 == 1 and s1 == 1 {
+        _sv_x(sv, n, 1);
+        corrected_qubit = 1;
+    } else if s0 == 0 and s1 == 1 {
+        _sv_x(sv, n, 2);
+        corrected_qubit = 2;
+    }
+
+    // Decode back onto q0
+    _sv_cnot(sv, n, 0, 2);
+    _sv_cnot(sv, n, 0, 1);
+
+    let rec0 = sv[0];
+    let rec1 = sv[bit_shl(1, n - 1)];
+    let fid = _qubit_state_fidelity(ar, ai, br, bi, rec0[0], rec0[1], rec1[0], rec1[1]);
+
+    return map{
+        ok: fid > 0.9999999999,
+        code: "[[3,1,1]]_bitflip",
+        error_qubit: error_qubit,
+        syndrome: [s0, s1],
+        corrected_qubit: corrected_qubit,
+        fidelity: fid,
+        recovered_alpha: rec0,
+        recovered_beta: rec1
+    };
+}
+
+fn qec_phaseflip_3q_test(alpha_re, alpha_im, beta_re, beta_im, error_qubit = -1) {
+    let norm = num_sqrt(
+        alpha_re * alpha_re + alpha_im * alpha_im +
+        beta_re * beta_re + beta_im * beta_im
+    );
+    if norm <= 0.0 {
+        throw "qec_phaseflip_3q_test: initial state norm must be > 0";
+    }
+    let ar = alpha_re / norm;
+    let ai = alpha_im / norm;
+    let br = beta_re / norm;
+    let bi = beta_im / norm;
+
+    let n = 5;
+    let sv = _sv_zero(n);
+    sv[0] = [ar, ai];
+    sv[bit_shl(1, n - 1)] = [br, bi];
+
+    // Encode |psi> -> a|+++> + b|--->
+    _sv_cnot(sv, n, 0, 1);
+    _sv_cnot(sv, n, 0, 2);
+    _sv_h(sv, n, 0);
+    _sv_h(sv, n, 1);
+    _sv_h(sv, n, 2);
+
+    // Inject Z phase-flip error on physical qubit 0, 1, or 2
+    if error_qubit != nil and error_qubit >= 0 and error_qubit <= 2 {
+        _sv_z(sv, n, error_qubit);
+    }
+
+    // Extract X0*X1 onto q3 and X1*X2 onto q4
+    _sv_h(sv, n, 3);
+    _sv_cnot(sv, n, 3, 0);
+    _sv_cnot(sv, n, 3, 1);
+    _sv_h(sv, n, 3);
+
+    _sv_h(sv, n, 4);
+    _sv_cnot(sv, n, 4, 1);
+    _sv_cnot(sv, n, 4, 2);
+    _sv_h(sv, n, 4);
+
+    let s0 = _sv_measure_and_reset(sv, n, 3);
+    let s1 = _sv_measure_and_reset(sv, n, 4);
+
+    let corrected_qubit = -1;
+    if s0 == 1 and s1 == 0 {
+        _sv_z(sv, n, 0);
+        corrected_qubit = 0;
+    } else if s0 == 1 and s1 == 1 {
+        _sv_z(sv, n, 1);
+        corrected_qubit = 1;
+    } else if s0 == 0 and s1 == 1 {
+        _sv_z(sv, n, 2);
+        corrected_qubit = 2;
+    }
+
+    // Decode back onto q0
+    _sv_h(sv, n, 0);
+    _sv_h(sv, n, 1);
+    _sv_h(sv, n, 2);
+    _sv_cnot(sv, n, 0, 2);
+    _sv_cnot(sv, n, 0, 1);
+
+    let rec0 = sv[0];
+    let rec1 = sv[bit_shl(1, n - 1)];
+    let fid = _qubit_state_fidelity(ar, ai, br, bi, rec0[0], rec0[1], rec1[0], rec1[1]);
+
+    return map{
+        ok: fid > 0.9999999999,
+        code: "[[3,1,1]]_phaseflip",
+        error_qubit: error_qubit,
+        syndrome: [s0, s1],
+        corrected_qubit: corrected_qubit,
+        fidelity: fid,
+        recovered_alpha: rec0,
+        recovered_beta: rec1
+    };
+}
+
+// ── 2B. Shor [[9, 1, 3]] Nine-Qubit Code (All 28 Single-Pauli Fault Cases) ───
+fn qec_shor_9q_protect(theta, phi, error_type = "none", error_qubit = 0) {
+    let half_t = 0.5 * theta;
+    let ar = num_cos(half_t);
+    let ai = 0.0;
+    let s_half = num_sin(half_t);
+    let br = s_half * num_cos(phi);
+    let bi = s_half * num_sin(phi);
+
+    // 11 qubits: 0..8 physical data qubits, 9..10 syndrome ancilla qubits
+    let n = 11;
+    let sv = _sv_zero(n);
+    sv[0] = [ar, ai];
+    sv[bit_shl(1, n - 1)] = [br, bi];
+
+    // Outer phase-flip repetition on block leaders 0, 3, 6
+    _sv_cnot(sv, n, 0, 3);
+    _sv_cnot(sv, n, 0, 6);
+    _sv_h(sv, n, 0);
+    _sv_h(sv, n, 3);
+    _sv_h(sv, n, 6);
+
+    // Inner bit-flip repetition within blocks {0,1,2}, {3,4,5}, {6,7,8}
+    _sv_cnot(sv, n, 0, 1);
+    _sv_cnot(sv, n, 0, 2);
+    _sv_cnot(sv, n, 3, 4);
+    _sv_cnot(sv, n, 3, 5);
+    _sv_cnot(sv, n, 6, 7);
+    _sv_cnot(sv, n, 6, 8);
+
+    // Fault injection: "none"/"I" or "X"/"Y"/"Z" on physical qubit 0..8
+    let applied_error = "none";
+    if error_type != nil and error_type != "none" and error_type != "I" and error_type != "" {
+        if error_qubit < 0 or error_qubit > 8 {
+            throw "qec_shor_9q_protect: error_qubit must be in 0..8";
+        }
+        if error_type == "X" or error_type == "x" {
+            _sv_x(sv, n, error_qubit);
+            applied_error = "X_" + str(error_qubit);
+        } else if error_type == "Y" or error_type == "y" {
+            _sv_y(sv, n, error_qubit);
+            applied_error = "Y_" + str(error_qubit);
+        } else if error_type == "Z" or error_type == "z" {
+            _sv_z(sv, n, error_qubit);
+            applied_error = "Z_" + str(error_qubit);
+        } else {
+            throw "qec_shor_9q_protect: unknown error_type '" + str(error_type) + "'";
+        }
+    }
+
+    // Extract 6 Z-type bit-flip syndromes across the 3 blocks using ancillas 9, 10
+    let z_syndromes = [];
+    let blk = 0;
+    while blk < 3 {
+        let base_q = 3 * blk;
+        _sv_cnot(sv, n, base_q, 9);
+        _sv_cnot(sv, n, base_q + 1, 9);
+        _sv_cnot(sv, n, base_q + 1, 10);
+        _sv_cnot(sv, n, base_q + 2, 10);
+        let s_a = _sv_measure_and_reset(sv, n, 9);
+        let s_b = _sv_measure_and_reset(sv, n, 10);
+        push(z_syndromes, [s_a, s_b]);
+        blk = blk + 1;
+    }
+
+    // Extract 2 weight-6 X-type phase-flip syndromes across blocks:
+    // S_X0 = X0 X1 X2 X3 X4 X5 on q9; S_X1 = X3 X4 X5 X6 X7 X8 on q10
+    _sv_h(sv, n, 9);
+    let q_i = 0;
+    while q_i <= 5 {
+        _sv_cnot(sv, n, 9, q_i);
+        q_i = q_i + 1;
+    }
+    _sv_h(sv, n, 9);
+
+    _sv_h(sv, n, 10);
+    let q_j = 3;
+    while q_j <= 8 {
+        _sv_cnot(sv, n, 10, q_j);
+        q_j = q_j + 1;
+    }
+    _sv_h(sv, n, 10);
+
+    let x_s0 = _sv_measure_and_reset(sv, n, 9);
+    let x_s1 = _sv_measure_and_reset(sv, n, 10);
+    let x_syndrome = [x_s0, x_s1];
+
+    // Apply Pauli X bit-flip recovery within each block
+    let corrected_x_qubits = [];
+    let blk2 = 0;
+    while blk2 < 3 {
+        let sa = z_syndromes[blk2][0];
+        let sb = z_syndromes[blk2][1];
+        let base_q = 3 * blk2;
+        if sa == 1 and sb == 0 {
+            _sv_x(sv, n, base_q);
+            push(corrected_x_qubits, base_q);
+        } else if sa == 1 and sb == 1 {
+            _sv_x(sv, n, base_q + 1);
+            push(corrected_x_qubits, base_q + 1);
+        } else if sa == 0 and sb == 1 {
+            _sv_x(sv, n, base_q + 2);
+            push(corrected_x_qubits, base_q + 2);
+        }
+        blk2 = blk2 + 1;
+    }
+
+    // Apply Pauli Z phase-flip recovery on the affected block leader
+    let corrected_z_block = -1;
+    if x_s0 == 1 and x_s1 == 0 {
+        _sv_z(sv, n, 0);
+        corrected_z_block = 0;
+    } else if x_s0 == 1 and x_s1 == 1 {
+        _sv_z(sv, n, 3);
+        corrected_z_block = 1;
+    } else if x_s0 == 0 and x_s1 == 1 {
+        _sv_z(sv, n, 6);
+        corrected_z_block = 2;
+    }
+
+    // Decode Shor [[9,1,3]] (inverse of encoder)
+    _sv_cnot(sv, n, 6, 8);
+    _sv_cnot(sv, n, 6, 7);
+    _sv_cnot(sv, n, 3, 5);
+    _sv_cnot(sv, n, 3, 4);
+    _sv_cnot(sv, n, 0, 2);
+    _sv_cnot(sv, n, 0, 1);
+    _sv_h(sv, n, 0);
+    _sv_h(sv, n, 3);
+    _sv_h(sv, n, 6);
+    _sv_cnot(sv, n, 0, 6);
+    _sv_cnot(sv, n, 0, 3);
+
+    let rec0 = sv[0];
+    let rec1 = sv[bit_shl(1, n - 1)];
+    let fid = _qubit_state_fidelity(ar, ai, br, bi, rec0[0], rec0[1], rec1[0], rec1[1]);
+
+    return map{
+        ok: fid > 0.9999999999,
+        code: "[[9,1,3]]_shor",
+        applied_error: applied_error,
+        z_syndromes: z_syndromes,
+        x_syndrome: x_syndrome,
+        corrected_x_qubits: corrected_x_qubits,
+        corrected_z_block: corrected_z_block,
+        fidelity: fid,
+        ideal_alpha: [ar, ai],
+        ideal_beta: [br, bi],
+        recovered_alpha: rec0,
+        recovered_beta: rec1
+    };
+}
+
+// ── 2C. Steane [[7, 1, 3]] CSS Hamming Color Code on Stabilizer Tableau ──────
+// Data qubits 0..6 (Hamming positions 1..7), Ancilla qubits 7..12:
+//   g1 (bit 2, weight 4): {3, 4, 5, 6} -> IIIXXXX & IIIZZZZ
+//   g2 (bit 1, weight 4): {1, 2, 5, 6} -> IXXIIXX & IZZIIZZ
+//   g3 (bit 0, weight 4): {0, 2, 4, 6} -> XIXIXIX & ZIZIZIZ
+fn _steane_encode_zero(tab) {
+    tab_h(tab, 0);
+    tab_h(tab, 1);
+    tab_h(tab, 3);
+    tab_cnot(tab, 0, 2);
+    tab_cnot(tab, 0, 4);
+    tab_cnot(tab, 0, 6);
+    tab_cnot(tab, 1, 2);
+    tab_cnot(tab, 1, 5);
+    tab_cnot(tab, 1, 6);
+    tab_cnot(tab, 3, 4);
+    tab_cnot(tab, 3, 5);
+    tab_cnot(tab, 3, 6);
+}
+
+fn _steane_unencode_zero(tab) {
+    tab_cnot(tab, 3, 6);
+    tab_cnot(tab, 3, 5);
+    tab_cnot(tab, 3, 4);
+    tab_cnot(tab, 1, 6);
+    tab_cnot(tab, 1, 5);
+    tab_cnot(tab, 1, 2);
+    tab_cnot(tab, 0, 6);
+    tab_cnot(tab, 0, 4);
+    tab_cnot(tab, 0, 2);
+    tab_h(tab, 0);
+    tab_h(tab, 1);
+    tab_h(tab, 3);
+}
+
+fn _steane_transversal(tab, op_kind) {
+    let q = 0;
+    while q < 7 {
+        if op_kind == "x" {
+            tab_x(tab, q);
+        } else if op_kind == "z" {
+            tab_z(tab, q);
+        } else if op_kind == "h" {
+            tab_h(tab, q);
+        } else if op_kind == "s" {
+            tab_s(tab, q);
+        } else if op_kind == "sdg" {
+            tab_sdg(tab, q);
+        }
+        q = q + 1;
+    }
+}
+
+fn qec_steane_7q_round(logical_state = "0", error_type = "none", error_qubit = 0) {
+    let state_tag = str(logical_state);
+    // 13 qubits: 0..6 Steane data qubits, 7..9 X-check ancillas, 10..12 Z-check ancillas
+    let tab = new_stabilizer_tableau(13, 2026);
+    _steane_encode_zero(tab);
+
+    if state_tag == "0" {
+        // already |0_L>
+    } else if state_tag == "1" {
+        _steane_transversal(tab, "x");
+    } else if state_tag == "+" {
+        _steane_transversal(tab, "h");
+    } else if state_tag == "-" {
+        _steane_transversal(tab, "x");
+        _steane_transversal(tab, "h");
+    } else if state_tag == "+i" {
+        _steane_transversal(tab, "h");
+        _steane_transversal(tab, "sdg"); // transversal Sdg implements +S_L on [[7,1,3]]
+    } else if state_tag == "-i" {
+        _steane_transversal(tab, "h");
+        _steane_transversal(tab, "s");
+    } else {
+        throw "qec_steane_7q_round: unsupported logical_state '" + state_tag + "'";
+    }
+
+    // Inject physical Pauli fault on qubit 0..6
+    let applied_error = "none";
+    if error_type != nil and error_type != "none" and error_type != "I" and error_type != "" {
+        if error_qubit < 0 or error_qubit > 6 {
+            throw "qec_steane_7q_round: error_qubit must be in 0..6";
+        }
+        if error_type == "X" or error_type == "x" {
+            tab_x(tab, error_qubit);
+            applied_error = "X_" + str(error_qubit);
+        } else if error_type == "Y" or error_type == "y" {
+            tab_y(tab, error_qubit);
+            applied_error = "Y_" + str(error_qubit);
+        } else if error_type == "Z" or error_type == "z" {
+            tab_z(tab, error_qubit);
+            applied_error = "Z_" + str(error_qubit);
+        } else {
+            throw "qec_steane_7q_round: unknown error_type '" + str(error_type) + "'";
+        }
+    }
+
+    let g1 = [3, 4, 5, 6];
+    let g2 = [1, 2, 5, 6];
+    let g3 = [0, 2, 4, 6];
+    let gens = [g1, g2, g3];
+
+    // Measure 3 X-stabilizer checks onto ancillas 7, 8, 9 (detects Z errors!)
+    let x_check_bits = [];
+    let gi = 0;
+    while gi < 3 {
+        let anc = 7 + gi;
+        let supp = gens[gi];
+        tab_h(tab, anc);
+        let k = 0;
+        while k < 4 {
+            tab_cnot(tab, anc, supp[k]);
+            k = k + 1;
+        }
+        tab_h(tab, anc);
+        let m = tab_measure(tab, anc, 0);
+        push(x_check_bits, m.outcome);
+        gi = gi + 1;
+    }
+
+    // Measure 3 Z-stabilizer checks onto ancillas 10, 11, 12 (detects X errors!)
+    let z_check_bits = [];
+    let gj = 0;
+    while gj < 3 {
+        let anc = 10 + gj;
+        let supp = gens[gj];
+        let k = 0;
+        while k < 4 {
+            tab_cnot(tab, supp[k], anc);
+            k = k + 1;
+        }
+        let m = tab_measure(tab, anc, 0);
+        push(z_check_bits, m.outcome);
+        gj = gj + 1;
+    }
+
+    // Decode via [7, 4, 3] Hamming syndrome indices (1..7 -> qubit index s - 1)
+    let s_x = 4 * x_check_bits[0] + 2 * x_check_bits[1] + x_check_bits[2];
+    let s_z = 4 * z_check_bits[0] + 2 * z_check_bits[1] + z_check_bits[2];
+
+    let corrected_z_qubit = -1;
+    let corrected_x_qubit = -1;
+    if s_x >= 1 and s_x <= 7 {
+        corrected_z_qubit = s_x - 1;
+        tab_z(tab, corrected_z_qubit);
+    }
+    if s_z >= 1 and s_z <= 7 {
+        corrected_x_qubit = s_z - 1;
+        tab_x(tab, corrected_x_qubit);
+    }
+
+    // Undo logical state preparation & unencode: exact recovery iff all 7 data qubits == |0> det!
+    if state_tag == "1" {
+        _steane_transversal(tab, "x");
+    } else if state_tag == "+" {
+        _steane_transversal(tab, "h");
+    } else if state_tag == "-" {
+        _steane_transversal(tab, "h");
+        _steane_transversal(tab, "x");
+    } else if state_tag == "+i" {
+        _steane_transversal(tab, "s");
+        _steane_transversal(tab, "h");
+    } else if state_tag == "-i" {
+        _steane_transversal(tab, "sdg");
+        _steane_transversal(tab, "h");
+    }
+    _steane_unencode_zero(tab);
+
+    let logical_error = false;
+    let unencoded_outcomes = [];
+    let q = 0;
+    while q < 7 {
+        let m = tab_measure(tab, q, 0);
+        push(unencoded_outcomes, m.outcome);
+        if (not m.deterministic) or (m.outcome != 0) {
+            logical_error = true;
+        }
+        q = q + 1;
+    }
+
+    return map{
+        ok: not logical_error,
+        code: "[[7,1,3]]_steane_css",
+        logical_state: state_tag,
+        applied_error: applied_error,
+        x_check_bits: x_check_bits,
+        z_check_bits: z_check_bits,
+        s_x: s_x,
+        s_z: s_z,
+        corrected_z_qubit: corrected_z_qubit,
+        corrected_x_qubit: corrected_x_qubit,
+        logical_error: logical_error,
+        unencoded_outcomes: unencoded_outcomes
+    };
+}
+
+// ── 2D. Rotated Planar Surface Code [[d^2, 1, d]] & Minimum-Weight Decoder ───
+fn _overlap_count(a, b) {
+    let cnt = 0;
+    let i = 0;
+    while i < len(a) {
+        let j = 0;
+        while j < len(b) {
+            if a[i] == b[j] {
+                cnt = cnt + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return cnt;
+}
+
+// Precomputes all-pairs shortest Manhattan / data-qubit paths between syndrome plaquettes
+// and exact shortest boundary chains (Top/Bottom for Z-checks, Left/Right for X-checks).
+fn _build_syndrome_decoding_table(n_data, data_coords, d, plaquettes, is_z_check) {
+    let n_plaq = len(plaquettes);
+    let b_neg = n_plaq;     // Top (r=0) for Z-checks, Left (c=0) for X-checks
+    let b_pos = n_plaq + 1; // Bottom (r=d-1) for Z-checks, Right (c=d-1) for X-checks
+    let n_verts = n_plaq + 2;
+
+    let adj = [];
+    let v = 0;
+    while v < n_verts {
+        push(adj, []);
+        v = v + 1;
+    }
+
+    // Map each physical data qubit to the 1 or 2 plaquettes containing it
+    let q = 0;
+    while q < n_data {
+        let hits = [];
+        let p = 0;
+        while p < n_plaq {
+            let supp = plaquettes[p].qubits;
+            let k = 0;
+            while k < len(supp) {
+                if supp[k] == q {
+                    push(hits, p);
+                }
+                k = k + 1;
+            }
+            p = p + 1;
+        }
+        if len(hits) == 2 {
+            let u0 = hits[0];
+            let u1 = hits[1];
+            push(adj[u0], map{ neighbor: u1, qubit: q });
+            push(adj[u1], map{ neighbor: u0, qubit: q });
+        } else if len(hits) == 1 {
+            let u0 = hits[0];
+            let coord = data_coords[q];
+            let b_node = if is_z_check {
+                if coord.r == 0 { b_neg } else { b_pos }
+            } else {
+                if coord.c == 0 { b_neg } else { b_pos }
+            };
+            push(adj[u0], map{ neighbor: b_node, qubit: q });
+            push(adj[b_node], map{ neighbor: u0, qubit: q });
+        }
+        q = q + 1;
+    }
+
+    // BFS from every plaquette u in 0 .. n_plaq - 1
+    let pair_dist = [];
+    let pair_chain = [];
+    let boundary_dist = [];
+    let boundary_chain = [];
+
+    let src = 0;
+    while src < n_plaq {
+        let dist = [];
+        let prev_v = [];
+        let prev_q = [];
+        let i = 0;
+        while i < n_verts {
+            push(dist, 999999);
+            push(prev_v, -1);
+            push(prev_q, -1);
+            i = i + 1;
+        }
+        dist[src] = 0;
+        let queue = [src];
+        let head = 0;
+        while head < len(queue) {
+            let cur = queue[head];
+            head = head + 1;
+            // Do not route plaquette-to-plaquette paths THROUGH virtual boundary nodes
+            if cur == b_neg or cur == b_pos {
+                continue;
+            }
+            let edges = adj[cur];
+            let ei = 0;
+            while ei < len(edges) {
+                let e = edges[ei];
+                let nxt = e.neighbor;
+                if dist[cur] + 1 < dist[nxt] {
+                    dist[nxt] = dist[cur] + 1;
+                    prev_v[nxt] = cur;
+                    prev_q[nxt] = e.qubit;
+                    push(queue, nxt);
+                }
+                ei = ei + 1;
+            }
+        }
+
+        let row_d = [];
+        let row_c = [];
+        let dst = 0;
+        while dst < n_plaq {
+            push(row_d, dist[dst]);
+            let chain = [];
+            if dst != src and dist[dst] < 999999 {
+                let walk = dst;
+                while walk != src {
+                    push(chain, prev_q[walk]);
+                    walk = prev_v[walk];
+                }
+            }
+            push(row_c, chain);
+            dst = dst + 1;
+        }
+        push(pair_dist, row_d);
+        push(pair_chain, row_c);
+
+        let b_target = if dist[b_neg] <= dist[b_pos] { b_neg } else { b_pos };
+        push(boundary_dist, dist[b_target]);
+        let b_chain = [];
+        let walk_b = b_target;
+        while walk_b != src and walk_b >= 0 {
+            push(b_chain, prev_q[walk_b]);
+            walk_b = prev_v[walk_b];
+        }
+        push(boundary_chain, b_chain);
+        src = src + 1;
+    }
+
+    return map{
+        pair_dist: pair_dist,
+        pair_chain: pair_chain,
+        boundary_dist: boundary_dist,
+        boundary_chain: boundary_chain
+    };
+}
+
+fn build_rotated_surface_code(d = 3) {
+    if d < 3 or bit_and(d, 1) == 0 {
+        throw "build_rotated_surface_code: distance d must be an odd integer >= 3";
+    }
+    let n_data = d * d;
+    let data_qubits = [];
+    let r = 0;
+    while r < d {
+        let c = 0;
+        while c < d {
+            push(data_qubits, map{
+                id: r * d + c,
+                r: r,
+                c: c
+            });
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+
+    let x_plaquettes = [];
+    let z_plaquettes = [];
+
+    // Top weight-2 X-plaquettes: pr = -1, pc odd in 1 .. d-2
+    let pc_top = 1;
+    while pc_top <= d - 2 {
+        push(x_plaquettes, map{
+            id: len(x_plaquettes),
+            kind: "X",
+            boundary: "top",
+            pr: -1,
+            pc: pc_top,
+            weight: 2,
+            qubits: [pc_top, pc_top + 1]
+        });
+        pc_top = pc_top + 2;
+    }
+
+    // Bulk weight-4 plaquettes: pr in 0..d-2, pc in 0..d-2
+    // Checkerboard: (pr + pc) even -> X-plaquette; (pr + pc) odd -> Z-plaquette
+    let pr = 0;
+    while pr <= d - 2 {
+        let pc = 0;
+        while pc <= d - 2 {
+            let q_tl = pr * d + pc;
+            let q_tr = pr * d + (pc + 1);
+            let q_bl = (pr + 1) * d + pc;
+            let q_br = (pr + 1) * d + (pc + 1);
+            let supp = [q_tl, q_tr, q_bl, q_br];
+            if bit_and(pr + pc, 1) == 0 {
+                push(x_plaquettes, map{
+                    id: len(x_plaquettes),
+                    kind: "X",
+                    boundary: "bulk",
+                    pr: pr,
+                    pc: pc,
+                    weight: 4,
+                    qubits: supp
+                });
+            } else {
+                push(z_plaquettes, map{
+                    id: len(z_plaquettes),
+                    kind: "Z",
+                    boundary: "bulk",
+                    pr: pr,
+                    pc: pc,
+                    weight: 4,
+                    qubits: supp
+                });
+            }
+            pc = pc + 1;
+        }
+        pr = pr + 1;
+    }
+
+    // Bottom weight-2 X-plaquettes: pr = d-1, pc even in 0 .. d-3
+    let pc_bot = 0;
+    while pc_bot <= d - 3 {
+        let row_off = (d - 1) * d;
+        push(x_plaquettes, map{
+            id: len(x_plaquettes),
+            kind: "X",
+            boundary: "bottom",
+            pr: d - 1,
+            pc: pc_bot,
+            weight: 2,
+            qubits: [row_off + pc_bot, row_off + pc_bot + 1]
+        });
+        pc_bot = pc_bot + 2;
+    }
+
+    // Left weight-2 Z-plaquettes: pc = -1, pr even in 0 .. d-3
+    let pr_left = 0;
+    while pr_left <= d - 3 {
+        push(z_plaquettes, map{
+            id: len(z_plaquettes),
+            kind: "Z",
+            boundary: "left",
+            pr: pr_left,
+            pc: -1,
+            weight: 2,
+            qubits: [pr_left * d, (pr_left + 1) * d]
+        });
+        pr_left = pr_left + 2;
+    }
+
+    // Right weight-2 Z-plaquettes: pc = d-1, pr odd in 1 .. d-2
+    let pr_right = 1;
+    while pr_right <= d - 2 {
+        push(z_plaquettes, map{
+            id: len(z_plaquettes),
+            kind: "Z",
+            boundary: "right",
+            pr: pr_right,
+            pc: d - 1,
+            weight: 2,
+            qubits: [pr_right * d + (d - 1), (pr_right + 1) * d + (d - 1)]
+        });
+        pr_right = pr_right + 2;
+    }
+
+    // Logical X_L: vertical chain down column c = 0; Logical Z_L: horizontal chain across row r = 0
+    let logical_x = [];
+    let logical_z = [];
+    let idx = 0;
+    while idx < d {
+        push(logical_x, idx * d);
+        push(logical_z, idx);
+        idx = idx + 1;
+    }
+
+    // Verify full CSS stabilizer commutation & logical anticommutation
+    let commutes = true;
+    let xi = 0;
+    while xi < len(x_plaquettes) {
+        let zi = 0;
+        while zi < len(z_plaquettes) {
+            if bit_and(_overlap_count(x_plaquettes[xi].qubits, z_plaquettes[zi].qubits), 1) != 0 {
+                commutes = false;
+            }
+            zi = zi + 1;
+        }
+        if bit_and(_overlap_count(x_plaquettes[xi].qubits, logical_z), 1) != 0 {
+            commutes = false;
+        }
+        xi = xi + 1;
+    }
+    let zi2 = 0;
+    while zi2 < len(z_plaquettes) {
+        if bit_and(_overlap_count(z_plaquettes[zi2].qubits, logical_x), 1) != 0 {
+            commutes = false;
+        }
+        zi2 = zi2 + 1;
+    }
+    let logical_anticommutes = bit_and(_overlap_count(logical_x, logical_z), 1) == 1;
+
+    let z_decoder_table = _build_syndrome_decoding_table(n_data, data_qubits, d, z_plaquettes, true);
+    let x_decoder_table = _build_syndrome_decoding_table(n_data, data_qubits, d, x_plaquettes, false);
+
+    let n_ancilla = len(x_plaquettes) + len(z_plaquettes);
+    return map{
+        format: "pblang.quantum.rotated_surface_code.v1",
+        name: "Surface-" + str(n_data + n_ancilla),
+        distance: d,
+        n_data: n_data,
+        n_ancilla: n_ancilla,
+        total_qubits: n_data + n_ancilla,
+        data_qubits: data_qubits,
+        x_plaquettes: x_plaquettes,
+        z_plaquettes: z_plaquettes,
+        logical_x: logical_x,
+        logical_z: logical_z,
+        commutes: commutes,
+        logical_anticommutes: logical_anticommutes,
+        z_decoder_table: z_decoder_table,
+        x_decoder_table: x_decoder_table
+    };
+}
+
+fn _normalize_error_vec(err_input, n_data) {
+    let vec = [];
+    let q = 0;
+    while q < n_data {
+        push(vec, 0);
+        q = q + 1;
+    }
+    if err_input == nil or len(err_input) == 0 {
+        return vec;
+    }
+    let is_binary_vec = (len(err_input) == n_data);
+    if is_binary_vec {
+        let i = 0;
+        while i < n_data {
+            if err_input[i] != 0 and err_input[i] != 1 {
+                is_binary_vec = false;
+                break;
+            }
+            i = i + 1;
+        }
+    }
+    if is_binary_vec {
+        let i = 0;
+        while i < n_data {
+            vec[i] = err_input[i];
+            i = i + 1;
+        }
+        return vec;
+    }
+    let k = 0;
+    while k < len(err_input) {
+        let qi = err_input[k];
+        if qi < 0 or qi >= n_data {
+            throw "surface_code_syndrome_and_decode: qubit index " + str(qi) + " out of range";
+        }
+        vec[qi] = bit_xor(vec[qi], 1);
+        k = k + 1;
+    }
+    return vec;
+}
+
+fn _compute_plaquette_syndrome(plaquettes, err_vec) {
+    let synd = [];
+    let i = 0;
+    while i < len(plaquettes) {
+        let supp = plaquettes[i].qubits;
+        let parity = 0;
+        let k = 0;
+        while k < len(supp) {
+            parity = bit_xor(parity, err_vec[supp[k]]);
+            k = k + 1;
+        }
+        push(synd, parity);
+        i = i + 1;
+    }
+    return synd;
+}
+
+// Exact Minimum-Weight Manhattan Defect Matching with Virtual Boundary Nodes:
+// Uses exact O(2^k * k) bitmask DP for k <= 12 active defects (covering 100% of weight <= 6
+// error chains!) and greedy minimum-delta matching fallback for extreme high-defect regimes.
+fn _decode_syndrome_mwpm(synd, dec_table, n_data) {
+    let defects = [];
+    let p = 0;
+    while p < len(synd) {
+        if synd[p] != 0 {
+            push(defects, p);
+        }
+        p = p + 1;
+    }
+
+    let corr = [];
+    let q = 0;
+    while q < n_data {
+        push(corr, 0);
+        q = q + 1;
+    }
+
+    let k = len(defects);
+    if k == 0 {
+        return map{ correction_vec: corr, correction_qubits: [], weight: 0 };
+    }
+
+    let pair_dist = dec_table.pair_dist;
+    let pair_chain = dec_table.pair_chain;
+    let b_dist = dec_table.boundary_dist;
+    let b_chain = dec_table.boundary_chain;
+
+    if k <= 12 {
+        let n_masks = bit_shl(1, k);
+        let dp = [];
+        let choice_partner = [];
+        let m = 0;
+        while m < n_masks {
+            push(dp, 999999);
+            push(choice_partner, -1);
+            m = m + 1;
+        }
+        dp[0] = 0;
+
+        let mask = 1;
+        while mask < n_masks {
+            // Find lowest active defect bit `first`
+            let first = 0;
+            while bit_and(mask, bit_shl(1, first)) == 0 {
+                first = first + 1;
+            }
+            let rest = bit_xor(mask, bit_shl(1, first));
+            let u = defects[first];
+
+            // Candidate 1: match defect u to its nearest boundary
+            let best_cost = b_dist[u] + dp[rest];
+            let best_partner = -1; // -1 denotes boundary match
+
+            // Candidate 2: pair defect u with another active defect v
+            let second = first + 1;
+            while second < k {
+                let bit2 = bit_shl(1, second);
+                if bit_and(rest, bit2) != 0 {
+                    let v = defects[second];
+                    let cand = pair_dist[u][v] + dp[bit_xor(rest, bit2)];
+                    if cand < best_cost {
+                        best_cost = cand;
+                        best_partner = second;
+                    }
+                }
+                second = second + 1;
+            }
+            dp[mask] = best_cost;
+            choice_partner[mask] = best_partner;
+            mask = mask + 1;
+        }
+
+        // Reconstruct minimum-weight recovery chains
+        let cur_mask = n_masks - 1;
+        while cur_mask > 0 {
+            let first = 0;
+            while bit_and(cur_mask, bit_shl(1, first)) == 0 {
+                first = first + 1;
+            }
+            let partner = choice_partner[cur_mask];
+            let u = defects[first];
+            if partner == -1 {
+                let ch = b_chain[u];
+                let ci = 0;
+                while ci < len(ch) {
+                    corr[ch[ci]] = bit_xor(corr[ch[ci]], 1);
+                    ci = ci + 1;
+                }
+                cur_mask = bit_xor(cur_mask, bit_shl(1, first));
+            } else {
+                let v = defects[partner];
+                let ch = pair_chain[u][v];
+                let ci = 0;
+                while ci < len(ch) {
+                    corr[ch[ci]] = bit_xor(corr[ch[ci]], 1);
+                    ci = ci + 1;
+                }
+                cur_mask = bit_xor(cur_mask, bit_or(bit_shl(1, first), bit_shl(1, partner)));
+            }
+        }
+
+        let corr_list = [];
+        let qi = 0;
+        while qi < n_data {
+            if corr[qi] != 0 { push(corr_list, qi); }
+            qi = qi + 1;
+        }
+        return map{
+            correction_vec: corr,
+            correction_qubits: corr_list,
+            weight: dp[n_masks - 1]
+        };
+    }
+
+    // Greedy minimum-saving matching fallback when k > 12
+    let matched = [];
+    let i = 0;
+    while i < k {
+        push(matched, false);
+        i = i + 1;
+    }
+    let total_w = 0;
+    while true {
+        let best_saving = 0;
+        let bi = -1;
+        let bj = -1;
+        let a = 0;
+        while a < k {
+            if not matched[a] {
+                let b = a + 1;
+                while b < k {
+                    if not matched[b] {
+                        let u = defects[a];
+                        let v = defects[b];
+                        let saving = (b_dist[u] + b_dist[v]) - pair_dist[u][v];
+                        if saving > best_saving {
+                            best_saving = saving;
+                            bi = a;
+                            bj = b;
+                        }
+                    }
+                    b = b + 1;
+                }
+            }
+            a = a + 1;
+        }
+        if bi < 0 { break; }
+        matched[bi] = true;
+        matched[bj] = true;
+        let u = defects[bi];
+        let v = defects[bj];
+        total_w = total_w + pair_dist[u][v];
+        let ch = pair_chain[u][v];
+        let ci = 0;
+        while ci < len(ch) {
+            corr[ch[ci]] = bit_xor(corr[ch[ci]], 1);
+            ci = ci + 1;
+        }
+    }
+    let a2 = 0;
+    while a2 < k {
+        if not matched[a2] {
+            let u = defects[a2];
+            total_w = total_w + b_dist[u];
+            let ch = b_chain[u];
+            let ci = 0;
+            while ci < len(ch) {
+                corr[ch[ci]] = bit_xor(corr[ch[ci]], 1);
+                ci = ci + 1;
+            }
+        }
+        a2 = a2 + 1;
+    }
+    let corr_list = [];
+    let qi = 0;
+    while qi < n_data {
+        if corr[qi] != 0 { push(corr_list, qi); }
+        qi = qi + 1;
+    }
+    return map{
+        correction_vec: corr,
+        correction_qubits: corr_list,
+        weight: total_w
+    };
+}
+
+fn _chain_parity_on_support(vec, supp) {
+    let parity = 0;
+    let i = 0;
+    while i < len(supp) {
+        parity = bit_xor(parity, vec[supp[i]]);
+        i = i + 1;
+    }
+    return parity;
+}
+
+fn surface_code_syndrome_and_decode(code, x_errors = [], z_errors = []) {
+    let n_data = code.n_data;
+    let x_err_vec = _normalize_error_vec(x_errors, n_data);
+    let z_err_vec = _normalize_error_vec(z_errors, n_data);
+
+    // Z-plaquettes detect X-errors; X-plaquettes detect Z-errors
+    let z_syndrome = _compute_plaquette_syndrome(code.z_plaquettes, x_err_vec);
+    let x_syndrome = _compute_plaquette_syndrome(code.x_plaquettes, z_err_vec);
+
+    let x_dec = _decode_syndrome_mwpm(z_syndrome, code.z_decoder_table, n_data);
+    let z_dec = _decode_syndrome_mwpm(x_syndrome, code.x_decoder_table, n_data);
+
+    let res_x = [];
+    let res_z = [];
+    let q = 0;
+    while q < n_data {
+        push(res_x, bit_xor(x_err_vec[q], x_dec.correction_vec[q]));
+        push(res_z, bit_xor(z_err_vec[q], z_dec.correction_vec[q]));
+        q = q + 1;
+    }
+
+    let res_z_synd = _compute_plaquette_syndrome(code.z_plaquettes, res_x);
+    let res_x_synd = _compute_plaquette_syndrome(code.x_plaquettes, res_z);
+    let synd_cleared = true;
+    let i = 0;
+    while i < len(res_z_synd) {
+        if res_z_synd[i] != 0 { synd_cleared = false; }
+        i = i + 1;
+    }
+    let j = 0;
+    while j < len(res_x_synd) {
+        if res_x_synd[j] != 0 { synd_cleared = false; }
+        j = j + 1;
+    }
+
+    // Residual X error flips logical state iff it anticommutes with logical Z_L;
+    // Residual Z error flips logical phase iff it anticommutes with logical X_L.
+    let logical_x_error = _chain_parity_on_support(res_x, code.logical_z) != 0;
+    let logical_z_error = _chain_parity_on_support(res_z, code.logical_x) != 0;
+    let logical_error = logical_x_error or logical_z_error or (not synd_cleared);
+
+    return map{
+        ok: not logical_error,
+        distance: code.distance,
+        z_syndrome: z_syndrome,
+        x_syndrome: x_syndrome,
+        x_correction: x_dec.correction_qubits,
+        z_correction: z_dec.correction_qubits,
+        matching_weight_x: x_dec.weight,
+        matching_weight_z: z_dec.weight,
+        syndrome_cleared: synd_cleared,
+        logical_x_error: logical_x_error,
+        logical_z_error: logical_z_error,
+        logical_error: logical_error
+    };
+}
+
+// Monte Carlo Below-Threshold Exponential Error Suppression Benchmark (Google Willow Milestone):
+// Injects depolarizing single-qubit Pauli noise (X, Y, Z each with p_phys / 3) across d=3 and d=5
+// rotated surface codes and verifies p_L(d=5) < p_L(d=3) < p_phys.
+fn simulate_surface_code_threshold(p_phys = 0.02, trials = 300, seed = 2026) {
+    if p_phys <= 0.0 or p_phys >= 0.75 {
+        throw "simulate_surface_code_threshold: p_phys must be in (0, 0.75)";
+    }
+    if trials < 1 {
+        throw "simulate_surface_code_threshold: trials must be >= 1";
+    }
+    let code_d3 = build_rotated_surface_code(3);
+    let code_d5 = build_rotated_surface_code(5);
+    let rng = _rng_init(seed);
+
+    let p_third = p_phys / 3.0;
+    let p_two_thirds = 2.0 * p_third;
+
+    let fails_d3 = 0;
+    let t3 = 0;
+    while t3 < trials {
+        let x_errs = [];
+        let z_errs = [];
+        let q = 0;
+        while q < code_d3.n_data {
+            let u = _rng_next_float(rng);
+            if u < p_third {
+                push(x_errs, q);
+            } else if u < p_two_thirds {
+                push(z_errs, q);
+            } else if u < p_phys {
+                push(x_errs, q);
+                push(z_errs, q);
+            }
+            q = q + 1;
+        }
+        let dec3 = surface_code_syndrome_and_decode(code_d3, x_errs, z_errs);
+        if dec3.logical_error {
+            fails_d3 = fails_d3 + 1;
+        }
+        t3 = t3 + 1;
+    }
+
+    let fails_d5 = 0;
+    let t5 = 0;
+    while t5 < trials {
+        let x_errs = [];
+        let z_errs = [];
+        let q = 0;
+        while q < code_d5.n_data {
+            let u = _rng_next_float(rng);
+            if u < p_third {
+                push(x_errs, q);
+            } else if u < p_two_thirds {
+                push(z_errs, q);
+            } else if u < p_phys {
+                push(x_errs, q);
+                push(z_errs, q);
+            }
+            q = q + 1;
+        }
+        let dec5 = surface_code_syndrome_and_decode(code_d5, x_errs, z_errs);
+        if dec5.logical_error {
+            fails_d5 = fails_d5 + 1;
+        }
+        t5 = t5 + 1;
+    }
+
+    let p_l_d3 = fails_d3 / (trials * 1.0);
+    let p_l_d5 = fails_d5 / (trials * 1.0);
+    let lambda_factor = if p_l_d5 > 0.0 {
+        p_l_d3 / p_l_d5
+    } else if p_l_d3 > 0.0 {
+        999.0
+    } else {
+        1.0
+    };
+
+    return map{
+        ok: (p_l_d5 < p_l_d3) and (p_l_d3 < p_phys),
+        p_phys: p_phys,
+        trials: trials,
+        seed: seed,
+        d3_total_qubits: code_d3.total_qubits,
+        d5_total_qubits: code_d5.total_qubits,
+        logical_failures_d3: fails_d3,
+        logical_failures_d5: fails_d5,
+        p_logical_d3: p_l_d3,
+        p_logical_d5: p_l_d5,
+        suppression_factor_lambda: lambda_factor,
+        below_threshold: (p_l_d5 < p_l_d3) and (p_l_d3 < p_phys)
+    };
+}
+
+export new_stabilizer_tableau, clone_stabilizer_tableau,
+       tab_h, tab_s, tab_sdg, tab_x, tab_y, tab_z, tab_sx, tab_cnot, tab_cz, tab_swap,
+       rowsum, tab_measure, tab_stabilizer_strings,
+       simulate_clifford_circuit, benchmark_ghz_1000q,
+       qec_bitflip_3q_test, qec_phaseflip_3q_test,
+       qec_shor_9q_protect, qec_steane_7q_round,
+       build_rotated_surface_code, surface_code_syndrome_and_decode,
+       simulate_surface_code_threshold;

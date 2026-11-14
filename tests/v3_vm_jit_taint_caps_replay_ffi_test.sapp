@@ -1,0 +1,191 @@
+// tests/v3_vm_jit_taint_caps_replay_ffi_test.sapp
+// Comprehensive regression & verification suite for PBLang v3.0.0 Sovereign Zero-Rust C99 VM:
+//   1. W^X x86_64 Native Function JIT (`jit_compile`, `jit_stats`) + Peephole Superinstructions + ICs
+//   2. Compact Native Binary (`OBJ_BYTES`) & Float64 (`OBJ_F64BUF`) Buffers + Zero-Copy Atomic `spawn()`
+//   3. Two-Generation Nursery + Full Mark-and-Sweep GC (`gc_stats_map`, `gc_collect`)
+//   4. Compile-Time Sandboxed Evaluation (`comptime(...)`)
+//   5. Optional Type / SI Dimensional Annotations & Runtime `requires` / `ensures` Contracts
+//   6. Per-Module Call-Stack Capabilities (`import_with_caps` / `import(..., caps_map)`)
+//   7. VM-Level Taint Tracking (`taint_secret`, `taint_pii`, `redact_secret`, `vm_set_taint_guard`)
+//   8. Deterministic Time-Travel Flight-Recorder & Bit-Exact Replay (`flight_record_start` / `flight_replay_start`)
+//   9. Unrestricted C ABI FFI + Binary Struct Pack/Unpack + Native C `qsort` Callback Trampolines
+
+let checks = 0;
+fn ok(cond, msg) {
+    if (!cond) {
+        error("V3_VM_TEST_FAIL: " + msg);
+    }
+    checks = checks + 1;
+}
+
+// 1. W^X Native Function JIT + Peephole Superinstructions
+fn hot_gauss_sum(n: num) -> num {
+    let i = 0;
+    let acc = 0;
+    while (i < n) {
+        acc = acc + i;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn hot_fib(n: num) -> num {
+    if (n < 2) { return n; }
+    return hot_fib(n - 1) + hot_fib(n - 2);
+}
+
+let jr1 = jit_compile(hot_gauss_sum);
+let jr2 = jit_compile(hot_fib);
+if (jr1.arch == "x86_64") {
+    ok(jr1.ok == true && jr1.jit_compiled == true && jr1.code_bytes > 0, "x86_64 W^X JIT compiled hot_gauss_sum");
+    ok(jr2.ok == true && jr2.jit_compiled == true && jr2.code_bytes > 0, "x86_64 W^X JIT compiled recursive hot_fib");
+}
+ok(hot_gauss_sum(100000) == 4999950000, "hot_gauss_sum(100000) exact");
+ok(hot_fib(24) == 46368, "hot_fib(24) exact");
+let jst = jit_stats();
+ok(is_map(jst) && jst.compiled_functions >= 0, "jit_stats() returns valid map");
+
+// 2. Native Compact `OBJ_BYTES` & `OBJ_F64BUF` + Zero-Copy Atomic Shared `spawn()`
+let b = bytes_new(16, true);
+ok(is_bytes(b) && type(b) == "bytes" && len(b) == 16, "OBJ_BYTES creation & type");
+b[0] = 0x50;
+b[1] = 0x42;
+bytes_set(b, 2, 0x33);
+ok(b[0] == 0x50 && bytes_get(b, 1) == 0x42 && b[2] == 0x33, "OBJ_BYTES indexing");
+let bs = bytes_slice(b, 0, 3);
+ok(bytes_to_str(bs) == "PB3", "bytes_slice -> bytes_to_str == PB3");
+
+let fb = f64buf_new(8, true);
+ok(is_f64buf(fb) && type(fb) == "f64buf" && len(fb) == 8, "OBJ_F64BUF shared creation");
+let idx = 0;
+while (idx < 8) {
+    fb[idx] = idx + 1;
+    idx = idx + 1;
+}
+ok(f64buf_sum(fb) == 36, "f64buf_sum([1..8]) == 36");
+ok(f64buf_dot(fb, fb) == 204, "f64buf_dot([1..8], [1..8]) == 204");
+
+// Mutate shared `OBJ_F64BUF` & `OBJ_BYTES` inside spawned OS thread with ZERO copying!
+let ptr_parent = ffi_bytes_ptr(b);
+let worker_fn = fn(shared_pair) {
+    let sbytes = shared_pair[0];
+    let sf64 = shared_pair[1];
+    sbytes[15] = 99;
+    sf64[7] = 108.5;
+    return ffi_bytes_ptr(sbytes);
+};
+let th = spawn(worker_fn, [b, fb]);
+let ptr_child = join(th);
+ok(ptr_parent == ptr_child && ptr_parent > 0, "Zero-copy shared backing pointer identical in parent & child OS threads");
+ok(b[15] == 99 && fb[7] == 108.5, "Zero-copy mutation visible immediately in parent VM");
+
+// 3. Generational Nursery GC + Full Mark-and-Sweep GC
+let alloc_i = 0;
+let keep = [];
+while (alloc_i < 4000) {
+    let tmp = "transient_nursery_str_" + str(alloc_i);
+    if (alloc_i % 500 == 0) {
+        push(keep, tmp);
+    }
+    alloc_i = alloc_i + 1;
+}
+let gmap = gc_stats_map();
+ok(is_map(gmap) && len(keep) == 8 && keep[7] == "transient_nursery_str_3500", "Nursery GC preserves live roots");
+gc_collect();
+ok(keep[0] == "transient_nursery_str_0" && keep[7] == "transient_nursery_str_3500", "Full GC preserves tenured roots");
+
+// 4. Compile-Time Sandboxed Evaluation (`comptime(...)`)
+fn ct_fact(k) {
+    if (k <= 1) { return 1; }
+    return k * ct_fact(k - 1);
+}
+let ct_val = comptime(ct_fact(7) + 40);
+ok(ct_val == 5080, "comptime(ct_fact(7) + 40) evaluated at compile time == 5080");
+
+// 5. Optional SI/Type Annotations & Runtime `requires` / `ensures` Contracts
+fn kinetic_energy(mass: num[kg], vel: num[m/s]) -> num[J]
+    requires mass > 0
+    requires vel >= 0
+    ensures result >= 0
+{
+    return 0.5 * mass * vel * vel;
+}
+ok(kinetic_energy(4, 5) == 50, "SI-annotated function with passing requires/ensures");
+let caught_req = false;
+try {
+    kinetic_energy(-2, 5);
+} catch (e) {
+    caught_req = str_contains(str(e), "requires");
+}
+ok(caught_req, "Runtime requires contract blocks negative mass");
+
+// 6. Per-Module Call-Stack Capabilities (`import_with_caps`)
+let tmp_cap_mod = ".pblang_v3_cap_probe_tmp.sapp";
+fs_write(tmp_cap_mod, "export fn try_read() { return fs_exists(\"pblang.toml\"); }\nexport fn pure_math(x) { return x * 7; }\n");
+let sandboxed = import_with_caps(tmp_cap_mod, map{ fs: false, net: false, http: false, exec: false });
+ok(sandboxed.pure_math(6) == 42, "Sandboxed module executes pure functions normally");
+let cap_denied = false;
+try {
+    sandboxed.try_read();
+} catch (e) {
+    cap_denied = str_contains(str(e), "permission denied");
+}
+fs_remove(tmp_cap_mod);
+ok(cap_denied, "Per-module call-stack capability blocks fs_exists inside untrusted module even when root VM has --allow-all");
+
+// 7. VM-Level Taint Tracking (`TAINT_SECRET` / `TAINT_PII`)
+let raw_tok = taint_secret("sk_test_super_secret_value_12345");
+let header_line = "Authorization: Bearer " + raw_tok;
+ok(is_tainted(raw_tok) && is_tainted(header_line), "Taint propagates across string concatenation");
+ok(taint_get(header_line) == "secret", "taint_get reports secret");
+vm_set_taint_guard(true);
+let taint_blocked = false;
+try {
+    fs_write(".pblang_should_never_exist.txt", header_line);
+} catch (e) {
+    taint_blocked = str_contains(str(e), "Taint") || str_contains(str(e), "taint");
+}
+vm_set_taint_guard(false);
+ok(taint_blocked && !fs_exists(".pblang_should_never_exist.txt"), "Strict taint guard blocks unredacted secret write");
+let safe_tok = redact_secret(raw_tok);
+ok(!is_tainted(safe_tok) && str_contains(safe_tok, "***") && !str_contains(safe_tok, "super_secret"), "redact_secret scrubs secret & clears taint");
+
+// 8. Deterministic Flight-Recorder & Bit-Exact Replay
+let rec_file = ".pblang_v3_flight_tmp.pbrec";
+flight_record_start(rec_file);
+let r1 = random();
+let t_rec = now_ms();
+let hex1 = csprng_hex(8);
+flight_record_stop();
+
+flight_replay_start(rec_file);
+let r1_rep = random();
+let t_rep = now_ms();
+let hex1_rep = csprng_hex(8);
+flight_replay_stop();
+fs_remove(rec_file);
+ok(r1 == r1_rep && t_rec == t_rep && hex1 == hex1_rep, "Deterministic Flight-Recorder replays identical random/time/CSPRNG sequence");
+
+// 9. Binary Struct Pack/Unpack & Native C `qsort` Callback Trampoline (Linux/POSIX)
+let packed = ffi_struct_pack("<iId", [-42, 4000000000, 3.25]);
+let unpacked = ffi_struct_unpack("<iId", packed);
+ok(len(unpacked) == 3 && unpacked[0] == -42 && unpacked[1] == 4000000000 && unpacked[2] == 3.25, "ffi_struct_pack / ffi_struct_unpack roundtrip");
+
+if (platform() == "linux") {
+    let libc = ffi_open("libc.so.6");
+    let arr_buf = ffi_struct_pack("<iiiiii", [42, -7, 19, 0, 105, 3]);
+    let cmp_cb = ffi_callback_new("ptr,ptr->i32", fn(pa, pb) {
+        let va = ffi_read_i32(pa);
+        let vb = ffi_read_i32(pb);
+        if (va < vb) { return -1; }
+        if (va > vb) { return 1; }
+        return 0;
+    });
+    ffi_call_typed(libc, "qsort", "ptr,u64,u64,ptr->void", [ffi_bytes_ptr(arr_buf), 6, 4, cmp_cb]);
+    ffi_callback_free(cmp_cb);
+    ffi_close(libc);
+    let sorted_ints = ffi_struct_unpack("<iiiiii", arr_buf);
+    ok(sorted_ints[0] == -7 && sorted_ints[1] == 0 && sorted_ints[2] == 3 && sorted_ints[5] == 105, "Native C libc qsort invoked PBLang closure via ffi_callback_new trampoline");
+}
+
+println("V3_VM_JIT_TAINT_CAPS_REPLAY_FFI_TEST_PASS checks=" + str(checks) + "/" + str(checks));

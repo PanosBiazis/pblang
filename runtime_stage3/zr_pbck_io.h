@@ -77,6 +77,7 @@ static bool zr_pbck_read_opcode(ZrPbckReader *r, PbInstr *ins) {
     uint8_t tag = 0;
     if (!zr_pr_u8(r, &tag)) return false;
     ins->op = tag;
+    ins->orig_op = tag;
     switch (tag) {
         case OP_CONSTANT:
         case OP_DEFINE_GLOBAL:
@@ -216,6 +217,7 @@ static bool zr_pbck_read_func(ZrPbckReader *r, PbVM *vm, PbFunc **out_fn, uint32
     if (!zr_pr_flag(r, "function-name", &has_name)) return false;
     if (has_name) {
         if (!zr_pr_str(r, vm, &fn->name)) return false;
+        vm_write_barrier_obj(vm, (PbObj *)fn, (PbObj *)fn->name);
     }
     if (!zr_pr_u32(r, &fn->arity) || !zr_pr_u32(r, &fn->min_arity)) return false;
     uint32_t n_def = 0;
@@ -228,6 +230,7 @@ static bool zr_pbck_read_func(ZrPbckReader *r, PbVM *vm, PbFunc **out_fn, uint32
     fn->defaults = n_def > 0 ? (PbValue *)zr_xcalloc(n_def, sizeof(PbValue)) : NULL;
     for (uint32_t i = 0; i < n_def; i++) {
         if (!zr_pbck_read_value(r, vm, &fn->defaults[i], depth + 1)) return false;
+        vm_write_barrier(vm, (PbObj *)fn, fn->defaults[i]);
     }
     if (!zr_pr_flag(r, "vararg", &fn->is_vararg)) return false;
     bool has_pt = false;
@@ -274,6 +277,7 @@ static bool zr_pbck_read_chunk_into(ZrPbckReader *r, PbVM *vm, PbFunc *fn, uint3
     fn->consts = n_const > 0 ? (PbValue *)zr_xcalloc(n_const, sizeof(PbValue)) : NULL;
     for (uint32_t i = 0; i < n_const; i++) {
         if (!zr_pbck_read_value(r, vm, &fn->consts[i], depth)) return false;
+        vm_write_barrier(vm, (PbObj *)fn, fn->consts[i]);
     }
 
     uint32_t n_spans = 0;
@@ -294,7 +298,9 @@ static bool zr_pbck_read_chunk_into(ZrPbckReader *r, PbVM *vm, PbFunc *fn, uint3
     if (!zr_pr_flag(r, "source-name", &has_src)) return false;
     if (has_src) {
         if (!zr_pr_str(r, vm, &fn->source_name)) return false;
+        vm_write_barrier_obj(vm, (PbObj *)fn, (PbObj *)fn->source_name);
     }
+    zr_peephole_optimize_func(fn);
     return true;
 }
 
@@ -320,6 +326,7 @@ static PbFunc *pbck_deserialize_script(PbVM *vm, const uint8_t *buf, size_t len,
     vm->gc_inhibit++;
     PbFunc *script_fn = pb_func_new(vm);
     script_fn->name = pb_str_c(vm, "<script>");
+    vm_write_barrier_obj(vm, (PbObj *)script_fn, (PbObj *)script_fn->name);
     bool ok = zr_pbck_read_chunk_into(&r, vm, script_fn, 0);
     vm->gc_inhibit--;
 
@@ -419,8 +426,9 @@ static void zr_pbck_write_value(ZrBuf *w, PbValue v) {
 }
 
 static void zr_pbck_write_opcode(ZrBuf *w, const PbInstr *ins) {
-    zr_pw_u8(w, ins->op);
-    switch (ins->op) {
+    uint8_t op = (ins->op <= OP_THROW) ? ins->op : ins->orig_op;
+    zr_pw_u8(w, op);
+    switch (op) {
         case OP_CONSTANT:
         case OP_DEFINE_GLOBAL:
         case OP_GET_GLOBAL:

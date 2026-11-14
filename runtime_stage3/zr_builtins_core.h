@@ -1,13 +1,20 @@
 /* ============================================================================
- * pblang Sovereign Zero-Rust Native Runtime v2.0.0 — zr_builtins_core.h
- * Math, BigNum, Bitwise, Strings, Collections, Type Predicates, GC, Regex,
- * OS Threads/Channels/Sync, Memory Arenas, Tensors, Quantum, AI & Polyglot,
- * plus Master Builtin Registration Table (`zr_register_all_builtins`).
+ * pblang Sovereign Zero-Rust Native Runtime v3.0.0 — zr_builtins_core.h
+ * Math, BigNum, Bitwise, Strings, Zero-Copy Buffers, Taint, Capabilities,
+ * Replay, JIT, Generational GC, Regex, GIL-Free Threads/Channels, Arenas,
+ * Tensors, Quantum, AI, Polyglot & Master Builtin Registration Table.
  * ============================================================================ */
 #ifndef PBLANG_ZR_BUILTINS_CORE_H
 #define PBLANG_ZR_BUILTINS_CORE_H
 
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC push_options
+#pragma GCC optimize("O3,omit-frame-pointer")
+#endif
+
 #include "zr_vm_core.h"
+#include "zr_jit_x64.h"
+#include "zr_buffers_taint_replay.h"
 #include "zr_pbck_io.h"
 #include "zr_compiler.h"
 #include "zr_loader.h"
@@ -487,7 +494,9 @@ static bool bi_num_from_le_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out
 static bool bi_str(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 1) return vm_error(vm, "str() expects 1 argument");
     if (is_obj_type(argv[0], OBJ_STR)) { *out = argv[0]; return true; }
-    *out = val_obj(vm_value_to_pbstr(vm, argv[0]));
+    PbValue r = val_obj(vm_value_to_pbstr(vm, argv[0]));
+    r.taint = argv[0].taint;
+    *out = r;
     return true;
 }
 
@@ -496,6 +505,14 @@ static bool bi_len(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     PbValue v = argv[0];
     if (is_obj_type(v, OBJ_STR)) {
         *out = val_num((double)zr_utf8_char_len(AS_STR(v)->chars, AS_STR(v)->len));
+        return true;
+    }
+    if (is_obj_type(v, OBJ_BYTES)) {
+        *out = val_num((double)AS_BYTES(v)->len);
+        return true;
+    }
+    if (is_obj_type(v, OBJ_F64BUF)) {
+        *out = val_num((double)AS_F64BUF(v)->len);
         return true;
     }
     if (is_obj_type(v, OBJ_ARRAY)) {
@@ -519,6 +536,9 @@ static bool bi_slice(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc == 3 && argv[2].tag != VAL_NUM && argv[2].tag != VAL_NIL) {
         return vm_error(vm, "slice(): end index must be a number");
     }
+    if (is_obj_type(argv[0], OBJ_BYTES)) {
+        return bi_bytes_slice(vm, argc, argv, out);
+    }
     if (is_obj_type(argv[0], OBJ_ARRAY)) {
         PbArray *src = AS_ARRAY(argv[0]);
         int64_t n = (int64_t)src->len;
@@ -535,7 +555,9 @@ static bool bi_slice(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         PbArray *dst = pb_array_new(vm, cnt);
         for (size_t i = 0; i < cnt; i++) pb_array_push(vm, dst, src->items[(size_t)st + i]);
         vm_pop_roots(vm, 1);
-        *out = val_obj(dst);
+        PbValue r = val_obj(dst);
+        r.taint = argv[0].taint;
+        *out = r;
         return true;
     }
     if (is_obj_type(argv[0], OBJ_STR)) {
@@ -555,10 +577,12 @@ static bool bi_slice(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         vm_push_root(vm, argv[0]);
         PbStr *sub = pb_str_new(vm, s->chars + b0, b1 - b0);
         vm_pop_roots(vm, 1);
-        *out = val_obj(sub);
+        PbValue r = val_obj(sub);
+        r.taint = argv[0].taint;
+        *out = r;
         return true;
     }
-    return vm_error(vm, "slice(): expected array or string, got %s", zr_val_type_name(argv[0]));
+    return vm_error(vm, "slice(): expected array, bytes, or string, got %s", zr_val_type_name(argv[0]));
 }
 
 static bool bi_str_slice(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
@@ -625,6 +649,7 @@ static bool bi_str_split(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 2 || !is_obj_type(argv[0], OBJ_STR) || !is_obj_type(argv[1], OBJ_STR)) {
         return vm_error(vm, "str_split(s, delim) expects 2 strings");
     }
+    uint8_t taint = argv[0].taint;
     vm_push_root(vm, argv[0]);
     vm_push_root(vm, argv[1]);
     PbStr *s = AS_STR(argv[0]), *delim = AS_STR(argv[1]);
@@ -636,8 +661,9 @@ static bool bi_str_split(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
             size_t adv = 1;
             (void)zr_utf8_decode(s->chars + pos, s->len - pos, &adv);
             if (adv == 0) adv = 1;
-            PbStr *ch = pb_str_new(vm, s->chars + pos, adv);
-            pb_array_push(vm, arr, val_obj(ch));
+            PbValue ch = val_obj(pb_str_new(vm, s->chars + pos, adv));
+            ch.taint = taint;
+            pb_array_push(vm, arr, ch);
             pos += adv;
         }
     } else {
@@ -651,18 +677,22 @@ static bool bi_str_split(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
                 }
             }
             if (!found) {
-                PbStr *part = pb_str_new(vm, s->chars + pos, s->len - pos);
-                pb_array_push(vm, arr, val_obj(part));
+                PbValue part = val_obj(pb_str_new(vm, s->chars + pos, s->len - pos));
+                part.taint = taint;
+                pb_array_push(vm, arr, part);
                 break;
             }
             size_t flen = (size_t)(found - (s->chars + pos));
-            PbStr *part = pb_str_new(vm, s->chars + pos, flen);
-            pb_array_push(vm, arr, val_obj(part));
+            PbValue part = val_obj(pb_str_new(vm, s->chars + pos, flen));
+            part.taint = taint;
+            pb_array_push(vm, arr, part);
             pos += flen + delim->len;
         }
     }
     vm_pop_roots(vm, 3);
-    *out = val_obj(arr);
+    PbValue r = val_obj(arr);
+    r.taint = taint;
+    *out = r;
     return true;
 }
 
@@ -672,17 +702,21 @@ static bool bi_str_join(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     }
     PbArray *arr = AS_ARRAY(argv[0]);
     PbStr *sep = AS_STR(argv[1]);
+    uint8_t taint = argv[0].taint | (arr->len > 1 ? argv[1].taint : 0);
     ZrBuf b;
     zr_buf_init(&b);
     for (size_t i = 0; i < arr->len; i++) {
         if (i > 0) zr_buf_append(&b, sep->chars, sep->len);
+        taint |= arr->items[i].taint;
         if (is_obj_type(arr->items[i], OBJ_STR)) {
             zr_buf_append(&b, AS_STR(arr->items[i])->chars, AS_STR(arr->items[i])->len);
         } else {
             vm_format_value_rec(vm, &b, arr->items[i], 0);
         }
     }
-    *out = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
+    PbValue r = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
+    r.taint = taint;
+    *out = r;
     zr_buf_free(&b);
     return true;
 }
@@ -713,7 +747,9 @@ static bool bi_str_trim(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     vm_push_root(vm, argv[0]);
     PbStr *res = pb_str_new(vm, s->chars + st, en - st);
     vm_pop_roots(vm, 1);
-    *out = val_obj(res);
+    PbValue r = val_obj(res);
+    r.taint = argv[0].taint;
+    *out = r;
     return true;
 }
 
@@ -731,7 +767,9 @@ static bool bi_str_upper(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         size_t ul = zr_utf8_encode(zr_cp_to_upper(cp), u8);
         zr_buf_append(&b, u8, ul);
     }
-    *out = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
+    PbValue r = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
+    r.taint = argv[0].taint;
+    *out = r;
     zr_buf_free(&b);
     return true;
 }
@@ -750,7 +788,9 @@ static bool bi_str_lower(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         size_t ul = zr_utf8_encode(zr_cp_to_lower(cp), u8);
         zr_buf_append(&b, u8, ul);
     }
-    *out = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
+    PbValue r = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
+    r.taint = argv[0].taint;
+    *out = r;
     zr_buf_free(&b);
     return true;
 }
@@ -764,15 +804,19 @@ static bool bi_str_replace_all(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
     ZrBuf b;
     zr_buf_init(&b);
     size_t i = 0;
+    bool replaced = false;
     while (i < s->len) {
         if (i + pat->len <= s->len && memcmp(s->chars + i, pat->chars, pat->len) == 0) {
             zr_buf_append(&b, rep->chars, rep->len);
             i += pat->len;
+            replaced = true;
         } else {
             zr_buf_push(&b, s->chars[i++]);
         }
     }
-    *out = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
+    PbValue r = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
+    r.taint = argv[0].taint | (replaced ? argv[2].taint : 0);
+    *out = r;
     zr_buf_free(&b);
     return true;
 }
@@ -795,7 +839,9 @@ static bool bi_str_repeat(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     res->hash = zr_fnv1a(res->chars, tot);
     vm->string_allocs++;
     vm_pop_roots(vm, 1);
-    *out = val_obj(res);
+    PbValue r = val_obj(res);
+    r.taint = argv[0].taint;
+    *out = r;
     return true;
 }
 
@@ -806,11 +852,13 @@ static bool zr_str_pad_impl(PbVM *vm, int argc, PbValue *argv, bool left, PbValu
     PbStr *s = AS_STR(argv[0]);
     const char *pad_s = " ";
     size_t pad_blen = 1;
+    uint8_t taint = argv[0].taint;
     if (argc == 3 && is_obj_type(argv[2], OBJ_STR) && AS_STR(argv[2])->len > 0) {
         size_t adv = 1;
         (void)zr_utf8_decode(AS_STR(argv[2])->chars, AS_STR(argv[2])->len, &adv);
         pad_s = AS_STR(argv[2])->chars;
         pad_blen = adv ? adv : 1;
+        taint |= argv[2].taint;
     }
     size_t cur_cp = zr_utf8_char_len(s->chars, s->len);
     size_t target = argv[1].as.num > 0.0 ? (size_t)argv[1].as.num : 0;
@@ -821,7 +869,9 @@ static bool zr_str_pad_impl(PbVM *vm, int argc, PbValue *argv, bool left, PbValu
     if (!left) zr_buf_append(&b, s->chars, s->len);
     for (size_t i = 0; i < needed; i++) zr_buf_append(&b, pad_s, pad_blen);
     if (left) zr_buf_append(&b, s->chars, s->len);
-    *out = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
+    PbValue r = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
+    r.taint = taint;
+    *out = r;
     zr_buf_free(&b);
     return true;
 }
@@ -832,6 +882,7 @@ static bool bi_str_pad_right(PbVM *vm, int argc, PbValue *argv, PbValue *out) { 
 static bool bi_str_format(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc < 1 || !is_obj_type(argv[0], OBJ_STR)) return vm_error(vm, "str_format() expects format string as first argument");
     PbStr *fmt = AS_STR(argv[0]);
+    uint8_t taint = argv[0].taint;
     ZrBuf b;
     zr_buf_init(&b);
     int arg_i = 1;
@@ -844,19 +895,23 @@ static bool bi_str_format(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
                 zr_buf_push(&b, '%');
             } else if (sp == 's' || sp == 'v') {
                 if (arg_i >= argc) { zr_buf_free(&b); return vm_error(vm, "str_format(): not enough arguments"); }
+                taint |= argv[arg_i].taint;
                 vm_format_value_rec(vm, &b, argv[arg_i++], 0);
             } else if (sp == 'd' || sp == 'i') {
                 if (arg_i >= argc) { zr_buf_free(&b); return vm_error(vm, "str_format(): not enough arguments"); }
+                taint |= argv[arg_i].taint;
                 if (argv[arg_i].tag == VAL_NUM) zr_buf_printf(&b, "%" PRId64, (int64_t)argv[arg_i].as.num);
                 else vm_format_value_rec(vm, &b, argv[arg_i], 0);
                 arg_i++;
             } else if (sp == 'f') {
                 if (arg_i >= argc) { zr_buf_free(&b); return vm_error(vm, "str_format(): not enough arguments"); }
+                taint |= argv[arg_i].taint;
                 if (argv[arg_i].tag == VAL_NUM) zr_buf_printf(&b, "%.6f", argv[arg_i].as.num);
                 else vm_format_value_rec(vm, &b, argv[arg_i], 0);
                 arg_i++;
             } else if (sp == 'x' || sp == 'X') {
                 if (arg_i >= argc) { zr_buf_free(&b); return vm_error(vm, "str_format(): not enough arguments"); }
+                taint |= argv[arg_i].taint;
                 if (argv[arg_i].tag == VAL_NUM) zr_buf_printf(&b, sp == 'x' ? "%" PRIx64 : "%" PRIX64, (uint64_t)(int64_t)argv[arg_i].as.num);
                 else vm_format_value_rec(vm, &b, argv[arg_i], 0);
                 arg_i++;
@@ -867,12 +922,15 @@ static bool bi_str_format(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         } else if (c == '{' && pos < fmt->len && fmt->chars[pos] == '}') {
             pos++;
             if (arg_i >= argc) { zr_buf_free(&b); return vm_error(vm, "str_format(): not enough arguments"); }
+            taint |= argv[arg_i].taint;
             vm_format_value_rec(vm, &b, argv[arg_i++], 0);
         } else {
             zr_buf_push(&b, c);
         }
     }
-    *out = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
+    PbValue r = val_obj(pb_str_new(vm, b.data ? b.data : "", b.len));
+    r.taint = taint;
+    *out = r;
     zr_buf_free(&b);
     return true;
 }
@@ -883,7 +941,9 @@ static bool bi_strfromcharcode(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
     if (cp < 0 || cp > 0x10FFFF) return vm_error(vm, "str_from_char_code(): invalid codepoint %" PRId64, cp);
     char u8[4];
     size_t n = zr_utf8_encode((uint32_t)cp, u8);
-    *out = val_obj(pb_str_new(vm, u8, n));
+    PbValue r = val_obj(pb_str_new(vm, u8, n));
+    r.taint = argv[0].taint;
+    *out = r;
     return true;
 }
 
@@ -898,37 +958,65 @@ static bool bi_strcharcodeat(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     size_t adv = 0;
     size_t off = zr_utf8_nth_offset(s->chars, s->len, (size_t)idx, &adv);
     uint32_t cp = zr_utf8_decode(s->chars + off, s->len - off, &adv);
-    *out = val_num((double)cp);
+    PbValue r = val_num((double)cp);
+    r.taint = argv[0].taint;
+    *out = r;
     return true;
 }
 
 static bool bi_str_to_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 1 || !is_obj_type(argv[0], OBJ_STR)) return vm_error(vm, "str_to_bytes() expects 1 string");
+    uint8_t taint = argv[0].taint;
     vm_push_root(vm, argv[0]);
     PbStr *s = AS_STR(argv[0]);
     PbArray *a = pb_array_new(vm, s->len);
     s = AS_STR(argv[0]);
-    for (size_t i = 0; i < s->len; i++) pb_array_push(vm, a, val_num((double)(uint8_t)s->chars[i]));
+    for (size_t i = 0; i < s->len; i++) {
+        PbValue bv = val_num((double)(uint8_t)s->chars[i]);
+        bv.taint = taint;
+        pb_array_push(vm, a, bv);
+    }
     vm_pop_roots(vm, 1);
-    *out = val_obj(a);
+    PbValue r = val_obj(a);
+    r.taint = taint;
+    *out = r;
     return true;
 }
 
 static bool bi_bytes_to_str(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 1 || !is_obj_type(argv[0], OBJ_ARRAY)) return vm_error(vm, "bytes_to_str() expects 1 byte array");
+    if (argc != 1) return vm_error(vm, "bytes_to_str() expects 1 bytes or byte-array argument");
+    if (is_obj_type(argv[0], OBJ_BYTES)) {
+        PbBytes *b = AS_BYTES(argv[0]);
+        vm_push_root(vm, argv[0]);
+        PbStr *s = pb_str_new(vm, b->data ? (const char *)b->data : "", b->len);
+        vm_pop_roots(vm, 1);
+        PbValue r = val_obj(s);
+        r.taint = argv[0].taint;
+        *out = r;
+        return true;
+    }
+    if (is_obj_type(argv[0], OBJ_STR)) {
+        *out = argv[0];
+        return true;
+    }
+    if (!is_obj_type(argv[0], OBJ_ARRAY)) return vm_error(vm, "bytes_to_str() expects bytes or byte array");
     PbArray *a = AS_ARRAY(argv[0]);
+    uint8_t taint = argv[0].taint;
     char *buf = (char *)zr_xmalloc(a->len + 1);
     for (size_t i = 0; i < a->len; i++) {
         if (a->items[i].tag != VAL_NUM || a->items[i].as.num < 0.0 || a->items[i].as.num > 255.0) {
             free(buf);
             return vm_error(vm, "bytes_to_str(): element %zu out of byte range 0..255", i);
         }
+        taint |= a->items[i].taint;
         buf[i] = (char)(uint8_t)a->items[i].as.num;
     }
     buf[a->len] = '\0';
     PbStr *s = pb_str_new(vm, buf, a->len);
     free(buf);
-    *out = val_obj(s);
+    PbValue r = val_obj(s);
+    r.taint = taint;
+    *out = r;
     return true;
 }
 
@@ -1032,9 +1120,11 @@ static bool bi_array_sort(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
                 bool greater = (cres.tag == VAL_NUM && cres.as.num > 0.0) || (cres.tag == VAL_BOOL && cres.as.b);
                 if (!greater) break;
                 dst->items[j] = dst->items[j - 1];
+                vm_write_barrier(vm, (PbObj *)dst, dst->items[j]);
                 j--;
             }
             dst->items[j] = key;
+            vm_write_barrier(vm, (PbObj *)dst, key);
             vm_pop_roots(vm, 1);
         }
         vm_pop_roots(vm, 1);
@@ -1373,11 +1463,29 @@ static bool bi_gc_collect(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 
 static bool bi_gc_stats(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     (void)argc; (void)argv;
-    char buf[256];
+    char buf[320];
     snprintf(buf, sizeof(buf),
-             "string_allocs=%zu array_allocs=%zu map_allocs=%zu module_allocs=%zu live_tracked=%zu collections=%zu",
-             vm->string_allocs, vm->array_allocs, vm->map_allocs, vm->module_allocs, vm->obj_count, vm->gc_collections);
+             "string_allocs=%zu array_allocs=%zu map_allocs=%zu module_allocs=%zu live_tracked=%zu collections=%zu nursery_collections=%zu full_collections=%zu",
+             vm->string_allocs, vm->array_allocs, vm->map_allocs, vm->module_allocs,
+             vm->obj_count, vm->gc_collections, vm->nursery_collections, vm->full_collections);
     *out = val_obj(pb_str_c(vm, buf));
+    return true;
+}
+
+static bool bi_gc_stats_map(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    (void)argc; (void)argv;
+    PbMap *m = pb_map_new_raw(vm, 12);
+    vm_push_root(vm, val_obj(m));
+    pb_map_set_cstr(vm, m, "string_allocs", val_num((double)vm->string_allocs));
+    pb_map_set_cstr(vm, m, "array_allocs", val_num((double)vm->array_allocs));
+    pb_map_set_cstr(vm, m, "map_allocs", val_num((double)vm->map_allocs));
+    pb_map_set_cstr(vm, m, "module_allocs", val_num((double)vm->module_allocs));
+    pb_map_set_cstr(vm, m, "live_tracked", val_num((double)vm->obj_count));
+    pb_map_set_cstr(vm, m, "collections", val_num((double)vm->gc_collections));
+    pb_map_set_cstr(vm, m, "nursery_collections", val_num((double)vm->nursery_collections));
+    pb_map_set_cstr(vm, m, "full_collections", val_num((double)vm->full_collections));
+    vm_pop_roots(vm, 1);
+    *out = val_obj(m);
     return true;
 }
 
@@ -2091,13 +2199,16 @@ typedef enum {
     XF_DECIMAL,
     XF_CLOSURE,
     XF_MODULE,
-    XF_BUILTIN
+    XF_BUILTIN,
+    XF_BYTES,
+    XF_F64BUF
 } ZrXferTag;
 
 typedef struct ZrXferVal ZrXferVal;
 
 struct ZrXferVal {
     ZrXferTag tag;
+    uint8_t   taint;
     union {
         bool     b;
         double   num;
@@ -2105,6 +2216,7 @@ struct ZrXferVal {
         struct { ZrXferVal *items; size_t len; } arr;
         struct { char **keys; size_t *klens; ZrXferVal *vals; size_t len; } map;
         struct { uint8_t *pbck; size_t pbck_len; ZrXferVal *upvals; size_t n_upvals; char *mod_path; } cl;
+        struct { ZrSharedBacking *backing; size_t len; } shared_buf;
         char    *builtin_name;
     } u;
 };
@@ -2137,6 +2249,10 @@ static void zr_xfer_free(ZrXferVal *x) {
         case XF_BUILTIN:
             free(x->u.builtin_name);
             break;
+        case XF_BYTES:
+        case XF_F64BUF:
+            zr_shared_release(x->u.shared_buf.backing);
+            break;
         default: break;
     }
     memset(x, 0, sizeof(*x));
@@ -2144,6 +2260,7 @@ static void zr_xfer_free(ZrXferVal *x) {
 
 static bool zr_xfer_pack(PbVM *vm, PbValue v, ZrXferVal *out, int depth) {
     memset(out, 0, sizeof(*out));
+    out->taint = v.taint;
     if (depth > 48) { out->tag = XF_NIL; return true; }
     switch (v.tag) {
         case VAL_NIL:  out->tag = XF_NIL; return true;
@@ -2160,6 +2277,35 @@ static bool zr_xfer_pack(PbVM *vm, PbValue v, ZrXferVal *out, int depth) {
                     out->u.str.len = AS_STR(v)->len;
                     out->u.str.s = zr_xstrndup(AS_STR(v)->chars, AS_STR(v)->len);
                     return true;
+                case OBJ_BYTES: {
+                    PbBytes *bb = AS_BYTES(v);
+                    out->tag = XF_BYTES;
+                    out->u.shared_buf.len = bb->len;
+                    if (bb->backing) {
+                        zr_shared_retain(bb->backing);
+                        out->u.shared_buf.backing = bb->backing;
+                    } else {
+                        ZrSharedBacking *bk = zr_shared_backing_new(1, bb->len ? bb->len : 1);
+                        if (bb->len > 0 && bb->data) memcpy(bk->raw, bb->data, bb->len);
+                        out->u.shared_buf.backing = bk;
+                    }
+                    return true;
+                }
+                case OBJ_F64BUF: {
+                    PbF64Buf *fb = AS_F64BUF(v);
+                    out->tag = XF_F64BUF;
+                    out->u.shared_buf.len = fb->len;
+                    if (fb->backing) {
+                        zr_shared_retain(fb->backing);
+                        out->u.shared_buf.backing = fb->backing;
+                    } else {
+                        size_t bl = (fb->len ? fb->len : 1) * sizeof(double);
+                        ZrSharedBacking *bk = zr_shared_backing_new(2, bl);
+                        if (fb->len > 0 && fb->data) memcpy(bk->raw, fb->data, fb->len * sizeof(double));
+                        out->u.shared_buf.backing = bk;
+                    }
+                    return true;
+                }
                 case OBJ_BIGINT:
                     out->tag = XF_BIGINT;
                     out->u.str.s = zr_bi_to_str(&AS_BIGINT(v)->v);
@@ -2253,35 +2399,43 @@ static bool zr_xfer_pack(PbVM *vm, PbValue v, ZrXferVal *out, int depth) {
 }
 
 static PbValue zr_xfer_unpack(PbVM *vm, const ZrXferVal *x) {
+    PbValue res = val_nil();
     switch (x->tag) {
-        case XF_NIL:  return val_nil();
-        case XF_BOOL: return val_bool(x->u.b);
-        case XF_NUM:  return val_num(x->u.num);
-        case XF_STR:  return val_obj(pb_str_new(vm, x->u.str.s, x->u.str.len));
+        case XF_NIL:  res = val_nil(); break;
+        case XF_BOOL: res = val_bool(x->u.b); break;
+        case XF_NUM:  res = val_num(x->u.num); break;
+        case XF_STR:  res = val_obj(pb_str_new(vm, x->u.str.s, x->u.str.len)); break;
+        case XF_BYTES:
+            res = val_obj(pb_bytes_from_backing(vm, x->u.shared_buf.backing, x->u.shared_buf.len));
+            break;
+        case XF_F64BUF:
+            res = val_obj(pb_f64buf_from_backing(vm, x->u.shared_buf.backing, x->u.shared_buf.len));
+            break;
         case XF_BIGINT: {
             ZrBigInt b; zr_bi_init(&b); zr_bi_from_str(&b, x->u.str.s);
-            return pb_bigint_new_take(vm, &b);
+            res = pb_bigint_new_take(vm, &b);
+            break;
         }
         case XF_RATIONAL: {
             PbValue sarg = val_obj(pb_str_c(vm, x->u.str.s));
-            PbValue r = val_nil();
-            (void)bi_rational(vm, 1, &sarg, &r);
-            return r;
+            (void)bi_rational(vm, 1, &sarg, &res);
+            break;
         }
         case XF_DECIMAL: {
             ZrDecimal d; zr_dec_init(&d); zr_dec_from_str(&d, x->u.str.s);
-            return pb_decimal_new_take(vm, &d);
+            res = pb_decimal_new_take(vm, &d);
+            break;
         }
         case XF_BUILTIN: {
             PbValue bv = val_nil();
-            if (pb_map_get_cstr(vm->builtins, x->u.builtin_name, &bv)) return bv;
-            return val_nil();
+            if (pb_map_get_cstr(vm->builtins, x->u.builtin_name, &bv)) res = bv;
+            break;
         }
         case XF_MODULE: {
             PbValue mv = val_nil();
-            if (x->u.str.s && zr_vm_import_module(vm, x->u.str.s, vm->current_file, &mv)) return mv;
-            vm->err_msg[0] = '\0';
-            return val_nil();
+            if (x->u.str.s && zr_vm_import_module(vm, x->u.str.s, vm->current_file, &mv)) res = mv;
+            else vm->err_msg[0] = '\0';
+            break;
         }
         case XF_ARR: {
             PbArray *a = pb_array_new(vm, x->u.arr.len);
@@ -2290,7 +2444,8 @@ static PbValue zr_xfer_unpack(PbVM *vm, const ZrXferVal *x) {
                 pb_array_push(vm, a, zr_xfer_unpack(vm, &x->u.arr.items[i]));
             }
             vm_pop_roots(vm, 1);
-            return val_obj(a);
+            res = val_obj(a);
+            break;
         }
         case XF_MAP: {
             PbMap *m = pb_map_new_raw(vm, x->u.map.len);
@@ -2303,10 +2458,11 @@ static PbValue zr_xfer_unpack(PbVM *vm, const ZrXferVal *x) {
                 vm_pop_roots(vm, 1);
             }
             vm_pop_roots(vm, 1);
-            return val_obj(m);
+            res = val_obj(m);
+            break;
         }
         case XF_CLOSURE: {
-            if (x->u.cl.pbck_len < 5) return val_nil();
+            if (x->u.cl.pbck_len < 5) break;
             PbModule *cl_mod = NULL;
             if (x->u.cl.mod_path && x->u.cl.mod_path[0]) {
                 PbValue mv = val_nil();
@@ -2328,7 +2484,7 @@ static PbValue zr_xfer_unpack(PbVM *vm, const ZrXferVal *x) {
             vm->gc_inhibit--;
             if (!ok || !fn) {
                 if (cl_mod) vm_pop_roots(vm, 1);
-                return val_nil();
+                break;
             }
             PbClosure *cl = pb_closure_new(vm, fn, (uint32_t)x->u.cl.n_upvals, cl_mod);
             if (cl_mod) vm_pop_roots(vm, 1);
@@ -2340,15 +2496,18 @@ static PbValue zr_xfer_unpack(PbVM *vm, const ZrXferVal *x) {
                 cl->upvalues[u] = uv;
             }
             vm_pop_roots(vm, 1);
-            return val_obj(cl);
+            res = val_obj(cl);
+            break;
         }
     }
-    return val_nil();
+    res.taint = x->taint;
+    return res;
 }
 
 static void zr_xfer_clone(const ZrXferVal *src, ZrXferVal *dst) {
     memset(dst, 0, sizeof(*dst));
     dst->tag = src->tag;
+    dst->taint = src->taint;
     switch (src->tag) {
         case XF_NIL: break;
         case XF_BOOL: dst->u.b = src->u.b; break;
@@ -2356,6 +2515,12 @@ static void zr_xfer_clone(const ZrXferVal *src, ZrXferVal *dst) {
         case XF_STR: case XF_BIGINT: case XF_RATIONAL: case XF_DECIMAL: case XF_MODULE:
             dst->u.str.len = src->u.str.len;
             dst->u.str.s = zr_xstrndup(src->u.str.s, src->u.str.len);
+            break;
+        case XF_BYTES:
+        case XF_F64BUF:
+            dst->u.shared_buf.len = src->u.shared_buf.len;
+            dst->u.shared_buf.backing = src->u.shared_buf.backing;
+            zr_shared_retain(dst->u.shared_buf.backing);
             break;
         case XF_BUILTIN:
             dst->u.builtin_name = zr_xstrdup(src->u.builtin_name);
@@ -2401,6 +2566,7 @@ typedef struct {
     bool      joined;
     bool      done;
     bool      ok;
+    bool      taint_guard;
     char      err[512];
     ZrThread  thr;
     ZrCaps    caps;
@@ -2453,56 +2619,58 @@ static void zr_sync_ensure_init(void) {
 
 static void *zr_spawn_worker_entry(void *raw) {
     ZrSpawnTask *t = (ZrSpawnTask *)raw;
-    PbVM cvm;
-    vm_init(&cvm);
-    cvm.caps = t->caps;
-    cvm.caps.ffi_allowed_libs = NULL;
-    cvm.caps.ffi_allowed_libs_len = 0;
-    cvm.caps.ffi_allowed_syms = NULL;
-    cvm.caps.ffi_allowed_syms_len = 0;
+    PbVM *cvm = (PbVM *)zr_xcalloc(1, sizeof(PbVM));
+    vm_init(cvm);
+    cvm->caps = t->caps;
+    cvm->taint_guard_enabled = t->taint_guard;
+    cvm->caps.ffi_allowed_libs = NULL;
+    cvm->caps.ffi_allowed_libs_len = 0;
+    cvm->caps.ffi_allowed_syms = NULL;
+    cvm->caps.ffi_allowed_syms_len = 0;
     if (t->caps.ffi_allowed_libs_len > 0 && t->caps.ffi_allowed_libs) {
-        cvm.caps.ffi_allowed_libs = (char **)zr_xmalloc(t->caps.ffi_allowed_libs_len * sizeof(char *));
-        cvm.caps.ffi_allowed_libs_len = t->caps.ffi_allowed_libs_len;
+        cvm->caps.ffi_allowed_libs = (char **)zr_xmalloc(t->caps.ffi_allowed_libs_len * sizeof(char *));
+        cvm->caps.ffi_allowed_libs_len = t->caps.ffi_allowed_libs_len;
         for (size_t i = 0; i < t->caps.ffi_allowed_libs_len; i++)
-            cvm.caps.ffi_allowed_libs[i] = zr_xstrdup(t->caps.ffi_allowed_libs[i]);
+            cvm->caps.ffi_allowed_libs[i] = zr_xstrdup(t->caps.ffi_allowed_libs[i]);
     }
     if (t->caps.ffi_allowed_syms_len > 0 && t->caps.ffi_allowed_syms) {
-        cvm.caps.ffi_allowed_syms = (char **)zr_xmalloc(t->caps.ffi_allowed_syms_len * sizeof(char *));
-        cvm.caps.ffi_allowed_syms_len = t->caps.ffi_allowed_syms_len;
+        cvm->caps.ffi_allowed_syms = (char **)zr_xmalloc(t->caps.ffi_allowed_syms_len * sizeof(char *));
+        cvm->caps.ffi_allowed_syms_len = t->caps.ffi_allowed_syms_len;
         for (size_t i = 0; i < t->caps.ffi_allowed_syms_len; i++)
-            cvm.caps.ffi_allowed_syms[i] = zr_xstrdup(t->caps.ffi_allowed_syms[i]);
+            cvm->caps.ffi_allowed_syms[i] = zr_xstrdup(t->caps.ffi_allowed_syms[i]);
     }
-    if (t->stdlib_root) cvm.stdlib_root = zr_xstrdup(t->stdlib_root);
-    if (t->current_file) cvm.current_file = zr_xstrdup(t->current_file);
+    if (t->stdlib_root) cvm->stdlib_root = zr_xstrdup(t->stdlib_root);
+    if (t->current_file) cvm->current_file = zr_xstrdup(t->current_file);
 
     /* Restore parent transferable globals */
     if (t->globals_xf.tag == XF_MAP) {
         for (size_t i = 0; i < t->globals_xf.u.map.len; i++) {
-            PbStr *ks = pb_str_new(&cvm, t->globals_xf.u.map.keys[i], t->globals_xf.u.map.klens[i]);
-            vm_push_root(&cvm, val_obj(ks));
-            PbValue gv = zr_xfer_unpack(&cvm, &t->globals_xf.u.map.vals[i]);
-            pb_map_set(&cvm, cvm.globals, ks, gv);
-            vm_pop_roots(&cvm, 1);
+            PbStr *ks = pb_str_new(cvm, t->globals_xf.u.map.keys[i], t->globals_xf.u.map.klens[i]);
+            vm_push_root(cvm, val_obj(ks));
+            PbValue gv = zr_xfer_unpack(cvm, &t->globals_xf.u.map.vals[i]);
+            pb_map_set(cvm, cvm->globals, ks, gv);
+            vm_pop_roots(cvm, 1);
         }
     }
 
-    PbValue callee = zr_xfer_unpack(&cvm, &t->fn_xf);
-    vm_push_root(&cvm, callee);
-    PbValue arg_v = t->has_arg ? zr_xfer_unpack(&cvm, &t->arg_xf) : val_nil();
-    if (t->has_arg) vm_push_root(&cvm, arg_v);
+    PbValue callee = zr_xfer_unpack(cvm, &t->fn_xf);
+    vm_push_root(cvm, callee);
+    PbValue arg_v = t->has_arg ? zr_xfer_unpack(cvm, &t->arg_xf) : val_nil();
+    if (t->has_arg) vm_push_root(cvm, arg_v);
 
     PbValue ret = val_nil();
-    bool ok = vm_call_value_sync(&cvm, callee, t->has_arg ? 1 : 0, t->has_arg ? &arg_v : NULL, &ret);
+    bool ok = vm_call_value_sync(cvm, callee, t->has_arg ? 1 : 0, t->has_arg ? &arg_v : NULL, &ret);
     if (ok) {
         t->ok = true;
-        zr_xfer_pack(&cvm, ret, &t->res_xf, 0);
+        zr_xfer_pack(cvm, ret, &t->res_xf, 0);
     } else {
         t->ok = false;
         snprintf(t->err, sizeof(t->err), "%.*s",
                  (int)(sizeof(t->err) - 1),
-                 cvm.err_msg[0] ? cvm.err_msg : "spawned thread runtime error");
+                 cvm->err_msg[0] ? cvm->err_msg : "spawned thread runtime error");
     }
-    vm_free(&cvm);
+    vm_free(cvm);
+    free(cvm);
     zr_mutex_lock(&g_zr_sync_mu);
     t->done = true;
     zr_mutex_unlock(&g_zr_sync_mu);
@@ -2510,7 +2678,7 @@ static void *zr_spawn_worker_entry(void *raw) {
 }
 
 static bool zr_spawn_one(PbVM *vm, PbValue fn_val, bool has_arg, PbValue arg_val, int *out_tid) {
-    if (!vm_check_cap(vm, vm->caps.allow_spawn, "spawn", "--allow-all")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_SPAWN), "spawn", "--allow-spawn")) return false;
     zr_sync_ensure_init();
     zr_mutex_lock(&g_zr_sync_mu);
     int slot = -1;
@@ -2527,6 +2695,16 @@ static bool zr_spawn_one(PbVM *vm, PbValue fn_val, bool has_arg, PbValue arg_val
 
     ZrSpawnTask *t = &g_zr_tasks[slot];
     t->caps = vm->caps;
+    t->caps.allow_fs     = vm_effective_cap(vm, CAP_FS);
+    t->caps.allow_net    = vm_effective_cap(vm, CAP_NET);
+    t->caps.allow_http   = vm_effective_cap(vm, CAP_HTTP);
+    t->caps.allow_sqlite = vm_effective_cap(vm, CAP_SQLITE);
+    t->caps.allow_ffi    = vm_effective_cap(vm, CAP_FFI);
+    t->caps.allow_exec   = vm_effective_cap(vm, CAP_EXEC);
+    t->caps.allow_gfx    = vm_effective_cap(vm, CAP_GFX);
+    t->caps.allow_spawn  = vm_effective_cap(vm, CAP_SPAWN);
+    t->caps.allow_env    = vm_effective_cap(vm, CAP_ENV);
+    t->taint_guard = vm->taint_guard_enabled;
     t->stdlib_root = vm->stdlib_root ? zr_xstrdup(vm->stdlib_root) : NULL;
     t->current_file = vm->current_file ? zr_xstrdup(vm->current_file) : NULL;
     zr_xfer_pack(vm, fn_val, &t->fn_xf, 0);
@@ -4455,7 +4633,7 @@ static bool bi_quantum_statevector(PbVM *vm, int argc, PbValue *argv, PbValue *o
 }
 
 static bool bi_quantum_run(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_exec, "quantum_run", "--allow-exec")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_EXEC), "quantum_run", "--allow-exec")) return false;
     if (argc < 1 || argc > 3 || !is_obj_type(argv[0], OBJ_STR)) {
         return vm_error(vm, "quantum_run(qasm[, backend, shots]) expects 1-3 arguments");
     }
@@ -4528,7 +4706,7 @@ static bool bi_ai_token_count(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_ai_chat(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_http, "ai_chat", "--allow-http")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_HTTP), "ai_chat", "--allow-http")) return false;
     if (argc < 1 || argc > 2 || !is_obj_type(argv[0], OBJ_STR)) {
         return vm_error(vm, "ai_chat(prompt[, options_json]) expects 1 or 2 arguments");
     }
@@ -4564,7 +4742,7 @@ static bool bi_ai_chat(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_ai_embed(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_http, "ai_embed", "--allow-http")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_HTTP), "ai_embed", "--allow-http")) return false;
     if (argc < 1 || argc > 2 || !is_obj_type(argv[0], OBJ_STR)) {
         return vm_error(vm, "ai_embed(text[, options_json]) expects 1 or 2 arguments");
     }
@@ -4606,7 +4784,7 @@ static bool bi_ai_embed(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_onnx_infer(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_exec, "onnx_infer", "--allow-exec")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_EXEC), "onnx_infer", "--allow-exec")) return false;
     if (argc < 1 || !is_obj_type(argv[0], OBJ_STR)) {
         return vm_error(vm, "onnx_infer(model_path[, input[, options]]) expects model_path string");
     }
@@ -4805,7 +4983,7 @@ static bool zr_polyglot_format_result(PbVM *vm, PbValue proc_map, PbValue *out) 
 }
 
 static bool bi_polyglot_exec(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_exec, "polyglot_exec", "--allow-exec")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_EXEC), "polyglot_exec", "--allow-exec")) return false;
     if (argc != 2 || !is_obj_type(argv[0], OBJ_STR) || !is_obj_type(argv[1], OBJ_STR)) {
         return vm_error(vm, "polyglot_exec(lang, code) expects 2 string arguments");
     }
@@ -4833,7 +5011,7 @@ static bool bi_polyglot_exec(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_polyglot_exec_with_input(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_exec, "polyglot_exec_with_input", "--allow-exec")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_EXEC), "polyglot_exec_with_input", "--allow-exec")) return false;
     if (argc != 3 || !is_obj_type(argv[0], OBJ_STR) || !is_obj_type(argv[1], OBJ_STR) || !is_obj_type(argv[2], OBJ_STR)) {
         return vm_error(vm, "polyglot_exec_with_input(lang, code, input) expects 3 string arguments");
     }
@@ -4865,7 +5043,7 @@ static bool bi_polyglot_exec_with_input(PbVM *vm, int argc, PbValue *argv, PbVal
 }
 
 static bool bi_polyglot_exec_compiled(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_exec, "polyglot_exec_compiled", "--allow-exec")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_EXEC), "polyglot_exec_compiled", "--allow-exec")) return false;
     if (argc != 2 || !is_obj_type(argv[0], OBJ_STR) || !is_obj_type(argv[1], OBJ_STR)) {
         return vm_error(vm, "polyglot_exec_compiled(lang, code) expects 2 string arguments");
     }
@@ -5002,7 +5180,7 @@ static bool bi_polyglot_exec_compiled(PbVM *vm, int argc, PbValue *argv, PbValue
 }
 
 static bool bi_polyglot_compile_cached(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_exec && vm->caps.allow_ffi, "polyglot_compile_cached", "--allow-exec --allow-ffi")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_EXEC | CAP_FFI), "polyglot_compile_cached", "--allow-exec --allow-ffi")) return false;
     if (argc != 2 || !is_obj_type(argv[0], OBJ_STR) || !is_obj_type(argv[1], OBJ_STR)) {
         return vm_error(vm, "polyglot_compile_cached(lang, code) expects 2 string arguments");
     }
@@ -5085,6 +5263,9 @@ static bool bi_polyglot_cache_clear(PbVM *vm, int argc, PbValue *argv, PbValue *
 
 static bool bi_print(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     for (int i = 0; i < argc; i++) {
+        if (!zr_check_taint_sink(vm, argv[i], "print")) return false;
+    }
+    for (int i = 0; i < argc; i++) {
         if (i > 0) fputc(' ', stdout);
         size_t slen = 0;
         char *s = vm_value_to_cstr(vm, argv[i], &slen);
@@ -5098,6 +5279,9 @@ static bool bi_print(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_eprint(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    for (int i = 0; i < argc; i++) {
+        if (!zr_check_taint_sink(vm, argv[i], "eprint")) return false;
+    }
     for (int i = 0; i < argc; i++) {
         if (i > 0) fputc(' ', stderr);
         size_t slen = 0;
@@ -5119,10 +5303,11 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"eprint", bi_eprint},
         {"eprintln", bi_eprint},
         {"import", bi_import},
+        {"import_with_caps", bi_import_with_caps},
         {"assert", bi_assert},
         {"error", bi_error},
 
-        /* Type Predicates, Freeze & GC */
+        /* Type Predicates, Freeze, GC, JIT & Profiler */
         {"type", bi_type},
         {"type_assert", bi_type_assert},
         {"require_type", bi_type_assert},
@@ -5135,8 +5320,40 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"is_array", bi_is_array},
         {"is_map", bi_is_map},
         {"is_fn", bi_is_fn},
+        {"is_bytes", bi_is_bytes},
+        {"is_f64buf", bi_is_f64buf},
         {"gc_collect", bi_gc_collect},
         {"gc_stats", bi_gc_stats},
+        {"gc_stats_map", bi_gc_stats_map},
+        {"jit_compile", bi_jit_compile},
+        {"jit_stats", bi_jit_stats},
+        {"vm_set_prof", bi_vm_set_prof},
+        {"vm_prof_stats", bi_vm_prof_stats},
+
+        /* Zero-Copy Shared Buffers (`OBJ_BYTES` & `OBJ_F64BUF`) */
+        {"bytes_new", bi_bytes_new},
+        {"bytes_from_str", bi_bytes_from_str},
+        {"bytes_get", bi_bytes_get},
+        {"bytes_set", bi_bytes_set},
+        {"bytes_slice", bi_bytes_slice},
+        {"f64buf_new", bi_f64buf_new},
+        {"f64buf_get", bi_f64buf_get},
+        {"f64buf_set", bi_f64buf_set},
+        {"f64buf_sum", bi_f64buf_sum},
+        {"f64buf_dot", bi_f64buf_dot},
+
+        /* VM-Level Taint Tracking & Deterministic Flight-Recorder */
+        {"taint_secret", bi_taint_secret},
+        {"taint_pii", bi_taint_pii},
+        {"taint_get", bi_taint_get},
+        {"is_tainted", bi_is_tainted},
+        {"sanitize_taint", bi_sanitize_taint},
+        {"redact_secret", bi_redact_secret},
+        {"vm_set_taint_guard", bi_vm_set_taint_guard},
+        {"flight_record_start", bi_flight_record_start},
+        {"flight_record_stop", bi_flight_record_stop},
+        {"flight_replay_start", bi_flight_replay_start},
+        {"flight_replay_stop", bi_flight_replay_stop},
 
         /* Math, BigNum, Checked Arithmetic, Bitwise & LE Bytes */
         {"bigint", bi_bigint},
@@ -5248,6 +5465,9 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"constant_time_eq", bi_constant_time_eq},
         {"random_bytes", bi_random_bytes},
         {"random_float", bi_random_float},
+        {"rand_float", bi_random_float},
+        {"random", bi_random_float},
+        {"csprng_hex", bi_csprng_hex},
         {"base64_encode", bi_base64_encode},
         {"base64_encode_bytes", bi_base64_encode_bytes},
         {"base64_decode", bi_base64_decode},
@@ -5297,6 +5517,7 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"clock", bi_clock},
         {"now_ms", bi_now_ms},
         {"time_ms", bi_now_ms},
+        {"time_now_ms", bi_now_ms},
         {"now_iso", bi_now_iso},
         {"sleep_ms", bi_sleep_ms},
         {"sleep", bi_sleep_ms},
@@ -5317,10 +5538,12 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"tcp_listen_tls", bi_tcp_listen_tls},
         {"tcp_connect_tls", bi_tcp_connect_tls},
         {"tcp_wrap_tls", bi_tcp_wrap_tls},
+        {"net_poll", bi_net_poll},
         {"http_get", bi_http_get},
         {"http_post", bi_http_post},
         {"http_get_auth", bi_http_get_auth},
         {"http_post_auth", bi_http_post_auth},
+        {"http_request", bi_http_request},
         {"http_parse_request", bi_http_parse_request},
         {"http_response", bi_http_response},
         {"http_response_ct", bi_http_response_ct},
@@ -5332,16 +5555,29 @@ static void zr_register_all_builtins(PbVM *vm) {
         {"websocket_write_frame", bi_ws_write_frame},
         {"ws_write_frame", bi_ws_write_frame},
 
-        /* SQLite & Dynamic FFI */
+        /* SQLite, Unrestricted Dynamic FFI, Struct Packing & C Callbacks */
         {"sqlite_open", bi_sqlite_open},
         {"sqlite_close", bi_sqlite_close},
         {"sqlite_exec", bi_sqlite_exec},
         {"sqlite_query", bi_sqlite_query},
         {"sqlite_last_insert_rowid", bi_sqlite_last_insert_rowid},
         {"ffi_load", bi_ffi_load},
+        {"ffi_open", bi_ffi_load},
+        {"ffi_dlopen", bi_ffi_load},
         {"ffi_close", bi_ffi_close},
         {"ffi_call", bi_ffi_call},
         {"ffi_call_typed", bi_ffi_call_typed},
+        {"ffi_struct_pack", bi_ffi_struct_pack},
+        {"ffi_struct_unpack", bi_ffi_struct_unpack},
+        {"ffi_bytes_ptr", bi_ffi_bytes_ptr},
+        {"ffi_ptr_read", bi_ffi_ptr_read},
+        {"ffi_ptr_write", bi_ffi_ptr_write},
+        {"ffi_read_i32", bi_ffi_read_i32},
+        {"ffi_read_i64", bi_ffi_read_i64},
+        {"ffi_read_f64", bi_ffi_read_f64},
+        {"ffi_read_cstr", bi_ffi_read_cstr},
+        {"ffi_callback_new", bi_ffi_callback_new},
+        {"ffi_callback_free", bi_ffi_callback_free},
 
         /* Native Graphics & Anti-Aliased Unicode Text */
         {"gfxcreatewindow", bi_gfxcreatewindow},
@@ -5490,5 +5726,9 @@ static void zr_register_all_builtins(PbVM *vm) {
     pb_map_set_cstr(vm, vm->builtins, "json", val_obj(jm));
     vm_pop_roots(vm, 1);
 }
+
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC pop_options
+#endif
 
 #endif /* PBLANG_ZR_BUILTINS_CORE_H */

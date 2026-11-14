@@ -1,5 +1,5 @@
 /* ============================================================================
- * pblang Sovereign Zero-Rust Native Runtime v2.7.0 — zr_hpc_compute.h
+ * pblang Sovereign Zero-Rust Native Runtime v3.0.0 — zr_hpc_compute.h
  *
  * Native C99 O3 + Multi-Versioned SIMD (AVX-512 / AVX2+FMA / SSE2 / NEON) +
  * Persistent Multi-Core Worker Pool + Zero-Dependency Dynamic OpenCL GPU Engine:

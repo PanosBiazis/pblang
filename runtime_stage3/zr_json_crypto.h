@@ -448,7 +448,8 @@ static bool bi_json_stringify(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     }
     PbStr *res = vm_new_str(vm, b.data ? b.data : "", b.len);
     zr_buf_free(&b);
-    *out = val_obj(res);
+    uint8_t taint = zr_collect_value_taint(argv[0], 0);
+    *out = val_with_taint(val_obj(res), taint);
     return true;
 }
 
@@ -525,11 +526,32 @@ static bool bi_random_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         return false;
     }
     size_t n = (size_t)argv[0].u.num;
+    if (vm->flight_replaying) {
+        const ZrFlightEvent *ev = NULL;
+        if (!zr_flight_replay_next(vm, "random_bytes", &ev)) return false;
+        const char *hx = ev->str_val ? ev->str_val : "";
+        size_t nb = ev->str_len / 2;
+        PbArray *arr = vm_new_array(vm, nb);
+        for (size_t i = 0; i < nb; i++) {
+            int hi = zr_hex_nibble(hx[i * 2]);
+            int lo = zr_hex_nibble(hx[i * 2 + 1]);
+            uint8_t b = (uint8_t)(((hi >= 0 ? hi : 0) << 4) | (lo >= 0 ? lo : 0));
+            arr_push(arr, val_num((double)b));
+        }
+        *out = val_obj(arr);
+        return true;
+    }
     uint8_t *raw = (uint8_t *)zr_xmalloc(n > 0 ? n : 1);
     if (n > 0 && !zr_csprng_bytes(raw, n)) {
         free(raw);
         vm_raise(vm, "random_bytes(): OS CSPRNG failed");
         return false;
+    }
+    if (vm->flight_recording) {
+        char *hex = (char *)zr_xmalloc(n * 2 + 1);
+        zr_hex_encode_raw(raw, n, hex);
+        zr_flight_record_str(vm, "random_bytes", "bytes", hex, n * 2);
+        free(hex);
     }
     PbArray *arr = vm_new_array(vm, n);
     for (size_t i = 0; i < n; i++) arr_push(arr, val_num((double)raw[i]));
@@ -541,12 +563,53 @@ static bool bi_random_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 static bool bi_random_float(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     (void)argv;
     if (argc != 0) { vm_raise(vm, "random_float() takes no arguments"); return false; }
+    if (vm->flight_replaying) {
+        const ZrFlightEvent *ev = NULL;
+        if (!zr_flight_replay_next(vm, "random_float", &ev)) return false;
+        *out = val_num(ev->num_val);
+        return true;
+    }
     uint8_t b[8];
     if (!zr_csprng_bytes(b, 8)) { vm_raise(vm, "random_float(): OS CSPRNG failed"); return false; }
     uint64_t u = 0;
     for (int i = 0; i < 8; i++) u = (u << 8) | b[i];
     double d = (double)(u >> 11) * (1.0 / 9007199254740992.0);
+    if (vm->flight_recording) {
+        zr_flight_record_num(vm, "random_float", d);
+    }
     *out = val_num(d);
+    return true;
+}
+
+static bool bi_csprng_hex(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    size_t n = 16;
+    if (argc >= 1) {
+        if (argc > 1 || argv[0].tag != VAL_NUM || !isfinite(argv[0].u.num) || argv[0].u.num < 0.0 || argv[0].u.num > 1048576.0) {
+            vm_raise(vm, "csprng_hex([n_bytes]) expects byte count 0..1048576");
+            return false;
+        }
+        n = (size_t)argv[0].u.num;
+    }
+    if (vm->flight_replaying) {
+        const ZrFlightEvent *ev = NULL;
+        if (!zr_flight_replay_next(vm, "csprng_hex", &ev)) return false;
+        *out = val_obj(vm_new_str(vm, ev->str_val ? ev->str_val : "", ev->str_len));
+        return true;
+    }
+    uint8_t *raw = (uint8_t *)zr_xmalloc(n > 0 ? n : 1);
+    if (n > 0 && !zr_csprng_bytes(raw, n)) {
+        free(raw);
+        vm_raise(vm, "csprng_hex(): OS CSPRNG failed");
+        return false;
+    }
+    char *hex = (char *)zr_xmalloc(n * 2 + 1);
+    zr_hex_encode_raw(raw, n, hex);
+    free(raw);
+    if (vm->flight_recording) {
+        zr_flight_record_str(vm, "csprng_hex", "str", hex, n * 2);
+    }
+    *out = val_obj(vm_new_str(vm, hex, n * 2));
+    free(hex);
     return true;
 }
 
@@ -555,18 +618,27 @@ static bool bi_base64_encode(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     PbStr *s = (PbStr *)val_as_obj(argv[0]);
     size_t elen = 0;
     char *enc = zr_base64_encode((const uint8_t *)s->chars, s->len, &elen);
-    *out = val_obj(vm_new_str(vm, enc, elen));
+    *out = val_with_taint(val_obj(vm_new_str(vm, enc, elen)), argv[0].taint);
     free(enc);
     return true;
 }
 
 static bool bi_base64_encode_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (argc == 1 && val_is_obj(argv[0], OBJ_BYTES)) {
+        PbBytes *b = (PbBytes *)val_as_obj(argv[0]);
+        size_t elen = 0;
+        char *enc = zr_base64_encode(b->data, b->len, &elen);
+        *out = val_with_taint(val_obj(vm_new_str(vm, enc, elen)), argv[0].taint);
+        free(enc);
+        return true;
+    }
     if (argc != 1 || !val_is_obj(argv[0], OBJ_ARRAY)) {
-        vm_raise(vm, "base64_encode_bytes() expects 1 byte-array argument");
+        vm_raise(vm, "base64_encode_bytes() expects 1 byte-array or bytes argument");
         return false;
     }
     PbArray *a = (PbArray *)val_as_obj(argv[0]);
     uint8_t *bytes = (uint8_t *)zr_xmalloc(a->len > 0 ? a->len : 1);
+    uint8_t taint = argv[0].taint;
     for (size_t i = 0; i < a->len; i++) {
         PbValue v = a->items[i];
         if (v.tag != VAL_NUM || !isfinite(v.u.num) || floor(v.u.num) != v.u.num || v.u.num < 0.0 || v.u.num > 255.0) {
@@ -574,12 +646,13 @@ static bool bi_base64_encode_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *o
             vm_raise(vm, "base64_encode_bytes(): expected byte numbers 0..255");
             return false;
         }
+        taint |= v.taint;
         bytes[i] = (uint8_t)v.u.num;
     }
     size_t elen = 0;
     char *enc = zr_base64_encode(bytes, a->len, &elen);
     free(bytes);
-    *out = val_obj(vm_new_str(vm, enc, elen));
+    *out = val_with_taint(val_obj(vm_new_str(vm, enc, elen)), taint);
     free(enc);
     return true;
 }
@@ -592,7 +665,7 @@ static bool bi_base64_decode(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         vm_raise(vm, "base64_decode(): invalid base64 payload");
         return false;
     }
-    *out = val_obj(vm_new_str(vm, (const char *)dec, dlen));
+    *out = val_with_taint(val_obj(vm_new_str(vm, (const char *)dec, dlen)), argv[0].taint);
     free(dec);
     return true;
 }
@@ -608,7 +681,7 @@ static bool bi_base64_decode_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *o
     PbArray *arr = vm_new_array(vm, dlen);
     for (size_t i = 0; i < dlen; i++) arr_push(arr, val_num((double)dec[i]));
     free(dec);
-    *out = val_obj(arr);
+    *out = val_with_taint(val_obj(arr), argv[0].taint);
     return true;
 }
 
@@ -618,13 +691,22 @@ static bool bi_hex_encode(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         PbStr *s = (PbStr *)val_as_obj(argv[0]);
         char *hex = (char *)zr_xmalloc(s->len * 2 + 1);
         zr_hex_encode_raw((const uint8_t *)s->chars, s->len, hex);
-        *out = val_obj(vm_new_str(vm, hex, s->len * 2));
+        *out = val_with_taint(val_obj(vm_new_str(vm, hex, s->len * 2)), argv[0].taint);
+        free(hex);
+        return true;
+    }
+    if (val_is_obj(argv[0], OBJ_BYTES)) {
+        PbBytes *b = (PbBytes *)val_as_obj(argv[0]);
+        char *hex = (char *)zr_xmalloc(b->len * 2 + 1);
+        zr_hex_encode_raw(b->data, b->len, hex);
+        *out = val_with_taint(val_obj(vm_new_str(vm, hex, b->len * 2)), argv[0].taint);
         free(hex);
         return true;
     }
     if (val_is_obj(argv[0], OBJ_ARRAY)) {
         PbArray *a = (PbArray *)val_as_obj(argv[0]);
         uint8_t *raw = (uint8_t *)zr_xmalloc(a->len > 0 ? a->len : 1);
+        uint8_t taint = argv[0].taint;
         for (size_t i = 0; i < a->len; i++) {
             PbValue v = a->items[i];
             if (v.tag != VAL_NUM || v.u.num < 0.0 || v.u.num > 255.0) {
@@ -632,16 +714,17 @@ static bool bi_hex_encode(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
                 vm_raise(vm, "hex_encode(): byte array elements must be 0..255");
                 return false;
             }
+            taint |= v.taint;
             raw[i] = (uint8_t)v.u.num;
         }
         char *hex = (char *)zr_xmalloc(a->len * 2 + 1);
         zr_hex_encode_raw(raw, a->len, hex);
         free(raw);
-        *out = val_obj(vm_new_str(vm, hex, a->len * 2));
+        *out = val_with_taint(val_obj(vm_new_str(vm, hex, a->len * 2)), taint);
         free(hex);
         return true;
     }
-    vm_raise(vm, "hex_encode() expects string or byte array");
+    vm_raise(vm, "hex_encode() expects string, bytes, or byte array");
     return false;
 }
 

@@ -1,0 +1,1227 @@
+// stdlib/lsp_server.sapp — PBLang v3.0.0 JSON-RPC 2.0 Language Server Protocol (LSP 3.17)
+//
+// Features:
+//   - Byte-accurate LSP 3.17 framing (`Content-Length: <N>\r\n\r\n<json>` using UTF-8 byte count)
+//   - Real-time 4-pass diagnostics (`textDocument/publishDiagnostics`) powered by `static_checker.sapp`:
+//       * Undefined symbols with Levenshtein/idiom quick-fix suggestions
+//       * Arity, `const` immutability, unreachable code, non-exhaustive `enum` `match`, strict types
+//       * Zero-cost compile-time 9D SI & Currency dimensional checking (`num[m/s]`, `num[EUR]`)
+//       * Mathematical contract verification (`requires`/`ensures` & division-by-zero) via Tarski CAD & Presburger
+//   - Rich Markdown `textDocument/hover` cards (Type + 9D SI Dimension + CAD/Presburger Proof Status + Docstring)
+//   - Context-aware `textDocument/completion` (SI/currency units, builtins, stdlib modules, scoped symbols)
+//   - `textDocument/definition`, `textDocument/documentSymbol`, `textDocument/codeAction` (quick-fixes),
+//     and `textDocument/formatting` (via `stdlib:compiler/formatter.sapp` + v3.0.0 token preservation).
+//
+// Compatible with PBLang 2.7.0 and 3.0.0 runtimes.
+
+let SC = import("stdlib:static_checker.sapp");
+let FMT = import("stdlib:compiler/formatter.sapp");
+let BUILTINS_MOD = import("stdlib:compiler/builtins_list.sapp");
+
+let LSP_SERVER_VERSION = "3.0.0";
+
+// ── String & UTF-8 Framing Utilities ──────────────────────────────────────────
+
+fn _lsp_char_at(s, idx) {
+    if s == nil or idx < 0 or idx >= len(s) { return ""; }
+    return str_slice(s, idx, idx + 1);
+}
+
+fn _lsp_is_ident_char(ch) {
+    if ch == "" { return false; }
+    if ch == "_" { return true; }
+    let c = strcharcodeat(ch, 0);
+    if (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) {
+        return true;
+    }
+    return c >= 160;
+}
+
+fn _lsp_clone_map(m) {
+    let out = map{};
+    if m == nil { return out; }
+    let ks = map_keys(m);
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        out[k] = m[k];
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _lsp_uri_to_path(uri) {
+    if uri == nil { return "<memory>"; }
+    let s = str(uri);
+    if str_starts_with(s, "file://") {
+        return str_slice(s, 7, len(s));
+    }
+    return s;
+}
+
+// Polish v3.0.0 multi-char tokens (`->`, `=>`, `::`) and `num[...]` unit annotations
+// after running `stdlib:compiler/formatter.sapp` (outside string literals & comments).
+fn _polish_v3_line(line) {
+    let n = len(line);
+    let out = "";
+    let i = 0;
+    let in_str = false;
+    let str_q = "";
+    let in_unit_brk = 0;
+
+    while i < n {
+        let ch = _lsp_char_at(line, i);
+        if in_str {
+            out = out + ch;
+            if ch == "\\" and i + 1 < n {
+                out = out + _lsp_char_at(line, i + 1);
+                i = i + 2;
+            } else {
+                if ch == str_q { in_str = false; }
+                i = i + 1;
+            }
+        } else {
+            if ch == "//" or (ch == "/" and _lsp_char_at(line, i + 1) == "/") {
+                out = out + str_slice(line, i, n);
+                return out;
+            }
+            if ch == "\"" or ch == "'" {
+                in_str = true;
+                str_q = ch;
+                out = out + ch;
+                i = i + 1;
+            } elif str_slice(line, i, i + 3) == "- >" {
+                out = out + "->";
+                i = i + 3;
+            } elif str_slice(line, i, i + 3) == "= >" {
+                out = out + "=>";
+                i = i + 3;
+            } elif str_slice(line, i, i + 3) == ": :" {
+                out = out + "::";
+                i = i + 3;
+            } elif (str_slice(line, i, i + 4) == "num[" or str_slice(line, i, i + 4) == "int[") {
+                in_unit_brk = 1;
+                out = out + str_slice(line, i, i + 4);
+                i = i + 4;
+            } elif in_unit_brk > 0 {
+                if ch == "[" {
+                    in_unit_brk = in_unit_brk + 1;
+                    out = out + ch;
+                } elif ch == "]" {
+                    in_unit_brk = in_unit_brk - 1;
+                    out = out + ch;
+                } elif ch != " " {
+                    out = out + ch;
+                }
+                i = i + 1;
+            } else {
+                out = out + ch;
+                i = i + 1;
+            }
+        }
+    }
+    return out;
+}
+
+fn _format_v3_document(src, max_line_length = nil) {
+    let base_fmt = FMT.format_source(src, max_line_length);
+    let raw_lines = str_split(base_fmt, "\n");
+    let out_lines = [];
+    let i = 0;
+    while i < len(raw_lines) {
+        push(out_lines, _polish_v3_line(raw_lines[i]));
+        i = i + 1;
+    }
+    return str_join(out_lines, "\n");
+}
+
+// Encode a JSON-RPC map as an exact LSP 3.17 frame (`Content-Length: <UTF-8 byte length>\r\n\r\n<body>`).
+fn encode_lsp_frame(msg_map) {
+    let body = json_stringify(msg_map);
+    let byte_buf = str_to_bytes(body);
+    let byte_len = len(byte_buf);
+    return "Content-Length: " + str(byte_len) + "\r\n\r\n" + body;
+}
+
+fn _parse_nonneg_int(s) {
+    let t = str_trim(s);
+    if t == "" { return -1; }
+    let v = 0;
+    let i = 0;
+    while i < len(t) {
+        let c = strcharcodeat(_lsp_char_at(t, i), 0);
+        if c < 48 or c > 57 { return -1; }
+        v = v * 10 + (c - 48);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn _find_header_sep_bytes(buf, start_off) {
+    let n = len(buf);
+    let i = start_off;
+    while i + 3 < n {
+        if buf[i] == 13 and buf[i + 1] == 10 and buf[i + 2] == 13 and buf[i + 3] == 10 {
+            return map{ idx: i, sep_len: 4 };
+        }
+        if buf[i] == 10 and buf[i + 1] == 10 {
+            return map{ idx: i, sep_len: 2 };
+        }
+        i = i + 1;
+    }
+    if i + 1 < n and buf[i] == 10 and buf[i + 1] == 10 {
+        return map{ idx: i, sep_len: 2 };
+    }
+    return nil;
+}
+
+// Decode 0 or more complete LSP frames from a UTF-8 string or byte array.
+// Returns `map{ messages: [...], remainder_str: "...", remainder_bytes: [...] }`.
+fn decode_lsp_frames(raw_input) {
+    let buf = if type(raw_input) == "array" { raw_input } else { str_to_bytes(str(raw_input)) };
+    let total = len(buf);
+    let pos = 0;
+    let messages = [];
+
+    while pos < total {
+        let sep = _find_header_sep_bytes(buf, pos);
+        if sep == nil { break; }
+        let hdr_bytes = slice(buf, pos, sep["idx"]);
+        let hdr_str = bytes_to_str(hdr_bytes);
+        let hdr_lines = str_split(hdr_str, "\n");
+        let content_len = -1;
+        let hi = 0;
+        while hi < len(hdr_lines) {
+            let hl = str_trim(hdr_lines[hi]);
+            let low = str_lower(hl);
+            if str_starts_with(low, "content-length:") {
+                content_len = _parse_nonneg_int(str_slice(hl, 15, len(hl)));
+            }
+            hi = hi + 1;
+        }
+        if content_len < 0 {
+            // Malformed frame header; advance past separator to avoid infinite loop
+            pos = sep["idx"] + sep["sep_len"];
+        } else {
+            let body_start = sep["idx"] + sep["sep_len"];
+            let body_end = body_start + content_len;
+            if body_end > total {
+                // Incomplete body — wait for more bytes
+                break;
+            }
+            let body_bytes = slice(buf, body_start, body_end);
+            let body_str = bytes_to_str(body_bytes);
+            let parsed = try json_parse(body_str) catch nil;
+            if parsed != nil and type(parsed) == "map" {
+                push(messages, parsed);
+            }
+            pos = body_end;
+        }
+    }
+
+    let rem_b = slice(buf, pos, total);
+    return map{
+        messages: messages,
+        remainder_bytes: rem_b,
+        remainder_str: bytes_to_str(rem_b)
+    };
+}
+
+// ── LSP Server State & Document Store ─────────────────────────────────────────
+
+let _STDLIB_MODULES = [
+    map{ label: "stdlib:math/universal_concept_cards.sapp", detail: "9D SI + Currency + Information Algebra & Concept Cards" },
+    map{ label: "stdlib:math/decidable_frontier.sapp", detail: "Tarski CAD & Cooper-Presburger Exact Theorem Provers" },
+    map{ label: "stdlib:math/symbolic_cas.sapp", detail: "Symbolic Computer Algebra System" },
+    map{ label: "stdlib:math/calculus_ode.sapp", detail: "Symbolic/Numeric Calculus & ODE Solvers" },
+    map{ label: "stdlib:math/linalg_geometry.sapp", detail: "Linear Algebra & Analytic Geometry" },
+    map{ label: "stdlib:math/stats_opt_applied.sapp", detail: "Statistics, Optimization & Applied Mathematics" },
+    map{ label: "stdlib:static_checker.sapp", detail: "v3.0 Static Checker, SI Units & Proof-Carrying Contracts" },
+    map{ label: "stdlib:lsp_server.sapp", detail: "v3.0 JSON-RPC 2.0 Language Server" },
+    map{ label: "stdlib:repl_interactive.sapp", detail: "v3.0 Stateful Interactive REPL" },
+    map{ label: "stdlib:profiler_debugger.sapp", detail: "v3.0 Time-Travel Debugger & SVG Flamegraph Profiler" },
+    map{ label: "stdlib:docgen_cli.sapp", detail: "v3.0 Markdown Doc Generator & Code Formatter" },
+    map{ label: "stdlib:compiler/formatter.sapp", detail: "PBLang Canonical Source Formatter" },
+    map{ label: "stdlib:quantum_computing.sapp", detail: "Quantum Circuit, Statevector & Noise Simulator" },
+    map{ label: "stdlib:rea_suite.sapp", detail: "Reverse Engineering & Binary Audit Suite" }
+];
+
+let _UNIT_COMPLETIONS = [
+    map{ label: "m", detail: "SI Base Length [L¹]" },
+    map{ label: "kg", detail: "SI Base Mass [M¹]" },
+    map{ label: "s", detail: "SI Base Time [T¹]" },
+    map{ label: "A", detail: "SI Base Electric Current [I¹]" },
+    map{ label: "K", detail: "SI Base Thermodynamic Temperature [Θ¹]" },
+    map{ label: "mol", detail: "SI Base Amount of Substance [N¹]" },
+    map{ label: "cd", detail: "SI Base Luminous Intensity [J¹]" },
+    map{ label: "m/s", detail: "Velocity / Speed [L·T⁻¹]" },
+    map{ label: "m/s^2", detail: "Acceleration [L·T⁻²]" },
+    map{ label: "N", detail: "Force — Newton [M·L·T⁻²]" },
+    map{ label: "J", detail: "Energy / Work — Joule [M·L²·T⁻²]" },
+    map{ label: "W", detail: "Power — Watt [M·L²·T⁻³]" },
+    map{ label: "Pa", detail: "Pressure — Pascal [M·L⁻¹·T⁻²]" },
+    map{ label: "Hz", detail: "Frequency — Hertz [T⁻¹]" },
+    map{ label: "C", detail: "Electric Charge — Coulomb [T·I]" },
+    map{ label: "V", detail: "Voltage — Volt [M·L²·T⁻³·I⁻¹]" },
+    map{ label: "Ohm", detail: "Electrical Resistance — Ohm [M·L²·T⁻³·I⁻²]" },
+    map{ label: "EUR", detail: "Euro Monetary Value [EUR¹]" },
+    map{ label: "USD", detail: "US Dollar Monetary Value [USD¹]" },
+    map{ label: "GBP", detail: "British Pound Monetary Value [GBP¹]" },
+    map{ label: "EUR/USD", detail: "FX Exchange Rate [EUR·USD⁻¹]" },
+    map{ label: "bit", detail: "Information — Shannon Bit [BIT¹]" },
+    map{ label: "B", detail: "Information — Byte (8 bits) [BIT¹]" }
+];
+
+let _BUILTIN_HOVER_DOCS = map{
+    "println": "Variadic console output with newline: `println(x1, x2, ...) -> nil`.",
+    "print": "Print statement / builtin output: `print expr;`.",
+    "str": "Convert any PBLang value to its canonical string representation: `str(x) -> string`.",
+    "len": "Length of string, array, map, or buffer: `len(collection) -> int`.",
+    "type": "Runtime type tag of value (`\"number\"`, `\"string\"`, `\"bool\"`, `\"nil\"`, `\"array\"`, `\"map\"`, `\"function\"`, `\"bytes\"`): `type(x) -> string`.",
+    "push": "Append item to array in place: `push(arr, item) -> nil`.",
+    "pop": "Remove and return last item of array: `pop(arr) -> any`.",
+    "slice": "Extract sub-array `[start, end)`: `slice(arr, start, end) -> array`.",
+    "json_parse": "Parse UTF-8 JSON text into PBLang value: `json_parse(text) -> any`.",
+    "json_stringify": "Serialize PBLang value into canonical JSON string: `json_stringify(val) -> string`.",
+    "sin": "Trigonometric sine (requires dimensionless radian argument `[1]`): `sin(x: num) -> num`.",
+    "cos": "Trigonometric cosine (requires dimensionless radian argument `[1]`): `cos(x: num) -> num`.",
+    "exp": "Natural exponential `e^x` (requires dimensionless argument `[1]`): `exp(x: num) -> num`.",
+    "sqrt": "Principal square root (halves rational SI exponents `dim / 2`): `sqrt(x: num[U^2]) -> num[U]`.",
+    "abs": "Magnitude / absolute value (preserves SI & currency dimensions): `abs(x: num[U]) -> num[U]`."
+};
+
+fn create_lsp_state(opts = nil) {
+    let strict_default = true;
+    let verify_contracts = true;
+    if opts != nil and type(opts) == "map" {
+        if map_has(opts, "strict") { strict_default = opts["strict"] == true; }
+        if map_has(opts, "verify_contracts") { verify_contracts = opts["verify_contracts"] == true; }
+    }
+    return map{
+        version: LSP_SERVER_VERSION,
+        initialized: false,
+        shutdown_requested: false,
+        exited: false,
+        exit_code: 0,
+        strict: strict_default,
+        verify_contracts: verify_contracts,
+        root_uri: nil,
+        documents: map{},
+        outgoing: []
+    };
+}
+
+fn _queue_outgoing(state, msg) {
+    if msg != nil {
+        push(state["outgoing"], msg);
+    }
+    return msg;
+}
+
+fn drain_lsp_outgoing(state) {
+    let items = state["outgoing"];
+    state["outgoing"] = [];
+    return items;
+}
+
+// ── Diagnostics Conversion (`static_checker` -> LSP 3.17) ─────────────────────
+
+fn _checker_diag_to_lsp(d) {
+    let sev = 1;
+    if d["severity"] == "warning" { sev = 2; }
+    elif d["severity"] == "info" { sev = 3; }
+    elif d["severity"] == "hint" { sev = 4; }
+
+    let start_line = if d["line"] > 0 { d["line"] - 1 } else { 0 };
+    let start_char = if d["col"] > 0 { d["col"] - 1 } else { 0 };
+    let end_line = if map_has(d, "end_line") and d["end_line"] > 0 { d["end_line"] - 1 } else { start_line };
+    let end_char = if map_has(d, "end_col") and d["end_col"] > 0 { d["end_col"] - 1 } else { start_char + 1 };
+    if end_line == start_line and end_char <= start_char {
+        end_char = start_char + 1;
+    }
+
+    let lsp_d = map{
+        range: map{
+            start: map{ line: start_line, character: start_char },
+            end: map{ line: end_line, character: end_char }
+        },
+        severity: sev,
+        code: d["code"],
+        source: "pblang-3.0",
+        message: d["message"]
+    };
+    if map_has(d, "suggestion") and d["suggestion"] != nil and d["suggestion"] != "" {
+        lsp_d["data"] = map{
+            suggestion: d["suggestion"],
+            code: d["code"]
+        };
+    }
+    return lsp_d;
+}
+
+fn _analyze_and_publish(state, uri, text, version) {
+    let file_path = _lsp_uri_to_path(uri);
+    let rep = SC.check_source(text, map{
+        file: file_path,
+        strict: state["strict"],
+        verify_contracts: state["verify_contracts"]
+    });
+    state["documents"][uri] = map{
+        uri: uri,
+        path: file_path,
+        version: version,
+        text: text,
+        lines: str_split(text, "\n"),
+        report: rep
+    };
+
+    let lsp_diags = [];
+    let diags = rep["diagnostics"];
+    let i = 0;
+    while i < len(diags) {
+        push(lsp_diags, _checker_diag_to_lsp(diags[i]));
+        i = i + 1;
+    }
+
+    let params = map{
+        uri: uri,
+        diagnostics: lsp_diags
+    };
+    if version != nil {
+        params["version"] = version;
+    }
+    let notif = map{
+        jsonrpc: "2.0",
+        method: "textDocument/publishDiagnostics",
+        params: params
+    };
+    return _queue_outgoing(state, notif);
+}
+
+// ── Cursor Word & Symbol Lookup Helpers ───────────────────────────────────────
+
+fn _extract_word_at(lines, line0, char0) {
+    if line0 < 0 or line0 >= len(lines) { return nil; }
+    let ln = lines[line0];
+    let n = len(ln);
+    if n == 0 { return nil; }
+    let idx = char0;
+    if idx >= n { idx = n - 1; }
+    if idx < 0 { idx = 0; }
+
+    if not _lsp_is_ident_char(_lsp_char_at(ln, idx)) {
+        if idx > 0 and _lsp_is_ident_char(_lsp_char_at(ln, idx - 1)) {
+            idx = idx - 1;
+        } else {
+            return nil;
+        }
+    }
+
+    let s = idx;
+    while s > 0 and _lsp_is_ident_char(_lsp_char_at(ln, s - 1)) {
+        s = s - 1;
+    }
+    let e = idx + 1;
+    while e < n and _lsp_is_ident_char(_lsp_char_at(ln, e)) {
+        e = e + 1;
+    }
+    return map{
+        word: str_slice(ln, s, e),
+        start_char: s,
+        end_char: e,
+        line0: line0
+    };
+}
+
+fn _find_hover_span(rep, line1, col1) {
+    let spans = rep["hover_spans"];
+    let best = nil;
+    let i = 0;
+    while i < len(spans) {
+        let sp = spans[i];
+        if sp["line"] == line1 and col1 >= sp["col"] and col1 <= sp["end_col"] {
+            best = sp;
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn _find_symbol_by_name(rep, name) {
+    let syms = rep["symbols"];
+    let i = 0;
+    while i < len(syms) {
+        if syms[i]["name"] == name {
+            return syms[i];
+        }
+        i = i + 1;
+    }
+    return nil;
+}
+
+fn _find_contracts_for_fn(rep, fn_name) {
+    let out = [];
+    let cs = rep["contracts"];
+    let i = 0;
+    while i < len(cs) {
+        if cs[i]["fn_name"] == fn_name {
+            push(out, cs[i]);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _format_hover_markdown(doc_entry, line0, char0) {
+    let rep = doc_entry["report"];
+    let line1 = line0 + 1;
+    let col1 = char0 + 1;
+
+    let word_info = _extract_word_at(doc_entry["lines"], line0, char0);
+    let span = _find_hover_span(rep, line1, col1);
+
+    if span == nil and word_info == nil {
+        return nil;
+    }
+
+    let sym_name = if span != nil { span["name"] } else { word_info["word"] };
+    let sym = _find_symbol_by_name(rep, sym_name);
+
+    let md_parts = [];
+    let type_str = "any";
+    let kind_str = "symbol";
+    let doc_text = "";
+    let unit_info = nil;
+
+    if span != nil {
+        type_str = span["type_str"];
+        kind_str = span["kind"];
+        doc_text = span["doc"];
+        unit_info = span["unit_info"];
+    } elif sym != nil {
+        type_str = sym["type_str"];
+        kind_str = sym["kind"];
+        doc_text = sym["doc"];
+        if map_has(sym, "has_unit") and sym["has_unit"] == true {
+            unit_info = map{
+                unit_str: sym["unit_str"],
+                dim_unicode: sym["dim_unicode"],
+                named_quantity: sym["named_quantity"]
+            };
+        }
+    } elif map_has(_BUILTIN_HOVER_DOCS, sym_name) {
+        kind_str = "builtin";
+        type_str = "builtin fn";
+        doc_text = _BUILTIN_HOVER_DOCS[sym_name];
+    } else {
+        return nil;
+    }
+
+    if unit_info == nil and map_has(rep["units_inferred"], sym_name) {
+        unit_info = rep["units_inferred"][sym_name];
+    }
+
+    // Header code block
+    let header_code = "";
+    if kind_str == "fn" {
+        header_code = "fn " + sym_name + ": " + type_str;
+    } elif kind_str == "const" {
+        header_code = "const " + sym_name + ": " + type_str;
+    } elif kind_str == "builtin" {
+        header_code = "(builtin) " + sym_name;
+    } else {
+        header_code = "let " + sym_name + ": " + type_str;
+    }
+    push(md_parts, "```pblang\n" + header_code + "\n```");
+
+    // 9D SI / Currency Dimensional Analysis section
+    if unit_info != nil and type(unit_info) == "map" {
+        let u_lbl = if map_has(unit_info, "unit_str") { unit_info["unit_str"] } else { "" };
+        let dim_u = if map_has(unit_info, "dim_unicode") { unit_info["dim_unicode"] } else { "" };
+        let named_q = if map_has(unit_info, "named_quantity") and unit_info["named_quantity"] != nil { unit_info["named_quantity"] } else { "" };
+        let dim_line = "**SI / Currency Dimension:** `" + dim_u + " = " + u_lbl + "`";
+        if named_q != "" {
+            dim_line = dim_line + " — *" + named_q + "*";
+        }
+        push(md_parts, dim_line);
+    }
+
+    // Mathematical Contract Proof Status section
+    let fn_contracts = _find_contracts_for_fn(rep, sym_name);
+    if len(fn_contracts) > 0 {
+        let c_lines = ["**Compile-Time Contract Verification:**"];
+        let ci = 0;
+        while ci < len(fn_contracts) {
+            let c = fn_contracts[ci];
+            let engine_lbl = if c["engine"] == "CAD" { "Tarski CAD" } else { "Cooper-Presburger" };
+            if c["proved"] {
+                push(c_lines, "- `✓ Proved by " + engine_lbl + "` (`" + c["kind"] + "` — `" + c["status"] + "`)");
+            } else {
+                let w = if c["witness_summary"] != "" { " — counterexample: `" + c["witness_summary"] + "`" } else { "" };
+                push(c_lines, "- `✗ Refuted by " + engine_lbl + "` (`" + c["kind"] + "` — `" + c["status"] + "`)" + w);
+            }
+            ci = ci + 1;
+        }
+        push(md_parts, str_join(c_lines, "\n"));
+    }
+
+    if doc_text != nil and str_trim(doc_text) != "" {
+        push(md_parts, "---\n" + str_trim(doc_text));
+    }
+
+    let hover_range = nil;
+    if span != nil {
+        hover_range = map{
+            start: map{ line: span["line"] - 1, character: span["col"] - 1 },
+            end: map{ line: span["line"] - 1, character: span["end_col"] - 1 }
+        };
+    } elif word_info != nil {
+        hover_range = map{
+            start: map{ line: word_info["line0"], character: word_info["start_char"] },
+            end: map{ line: word_info["line0"], character: word_info["end_char"] }
+        };
+    }
+
+    return map{
+        contents: map{
+            kind: "markdown",
+            value: str_join(md_parts, "\n\n")
+        },
+        range: hover_range
+    };
+}
+
+// ── Completion, Definition, DocumentSymbol, CodeAction & Formatting ───────────
+
+fn _is_inside_unit_bracket(lines, line0, char0) {
+    if line0 < 0 or line0 >= len(lines) { return false; }
+    let prefix = str_slice(lines[line0], 0, _min_int(char0, len(lines[line0])));
+    let open_idx = _last_index_of(prefix, "[");
+    let close_idx = _last_index_of(prefix, "]");
+    if open_idx < 0 or close_idx > open_idx { return false; }
+    let before = str_trim(str_slice(prefix, 0, open_idx));
+    return str_ends_with(before, "num") or str_ends_with(before, "int");
+}
+
+fn _min_int(a, b) { if a < b { return a; } return b; }
+
+fn _last_index_of(s, needle) {
+    let nl = len(needle);
+    let i = len(s) - nl;
+    while i >= 0 {
+        if str_slice(s, i, i + nl) == needle { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+fn _build_completions(doc_entry, line0, char0) {
+    let items = [];
+    let seen = map{};
+
+    if doc_entry != nil and _is_inside_unit_bracket(doc_entry["lines"], line0, char0) {
+        let ui = 0;
+        while ui < len(_UNIT_COMPLETIONS) {
+            let u = _UNIT_COMPLETIONS[ui];
+            push(items, map{
+                label: u["label"],
+                kind: 11, // Unit
+                detail: u["detail"]
+            });
+            ui = ui + 1;
+        }
+        return items;
+    }
+
+    // 1. In-scope document symbols
+    if doc_entry != nil {
+        let syms = doc_entry["report"]["symbols"];
+        let si = 0;
+        while si < len(syms) {
+            let sym = syms[si];
+            let nm = sym["name"];
+            if not map_has(seen, nm) {
+                seen[nm] = true;
+                let k_code = 6; // Variable
+                if sym["kind"] == "fn" { k_code = 3; }
+                elif sym["kind"] == "const" { k_code = 21; }
+                elif sym["kind"] == "struct" { k_code = 22; }
+                elif sym["kind"] == "class" { k_code = 7; }
+                elif sym["kind"] == "enum" { k_code = 13; }
+                push(items, map{
+                    label: nm,
+                    kind: k_code,
+                    detail: sym["type_str"],
+                    documentation: if sym["doc"] != "" { sym["doc"] } else { "Defined in current module" }
+                });
+            }
+            si = si + 1;
+        }
+    }
+
+    // 2. Stdlib modules
+    let mi = 0;
+    while mi < len(_STDLIB_MODULES) {
+        let m = _STDLIB_MODULES[mi];
+        push(items, map{
+            label: m["label"],
+            kind: 9, // Module
+            detail: m["detail"]
+        });
+        mi = mi + 1;
+    }
+
+    // 3. Language keywords (including v3.0 contract & type keywords)
+    let kws = ["fn", "let", "const", "return", "requires", "ensures", "match", "struct", "class", "enum", "import", "export", "if", "elif", "else", "while", "for", "try", "catch", "throw", "comptime"];
+    let ki = 0;
+    while ki < len(kws) {
+        let kw = kws[ki];
+        if not map_has(seen, kw) {
+            seen[kw] = true;
+            push(items, map{ label: kw, kind: 14, detail: "PBLang keyword" });
+        }
+        ki = ki + 1;
+    }
+
+    // 4. Builtin functions
+    let blist = array_sort(map_keys(BUILTINS_MOD.builtin_set()));
+    let bi = 0;
+    while bi < len(blist) {
+        let bn = blist[bi];
+        if not map_has(seen, bn) {
+            seen[bn] = true;
+            push(items, map{
+                label: bn,
+                kind: 3, // Function
+                detail: "PBLang builtin"
+            });
+        }
+        bi = bi + 1;
+    }
+
+    return items;
+}
+
+fn _find_definition_location(doc_entry, line0, char0) {
+    if doc_entry == nil { return nil; }
+    let rep = doc_entry["report"];
+    let line1 = line0 + 1;
+    let col1 = char0 + 1;
+    let span = _find_hover_span(rep, line1, col1);
+
+    let def_line1 = 0;
+    let def_col1 = 0;
+    let sym_name = "";
+
+    if span != nil and span["def_line"] > 0 {
+        def_line1 = span["def_line"];
+        def_col1 = span["def_col"];
+        sym_name = span["name"];
+    } else {
+        let wi = _extract_word_at(doc_entry["lines"], line0, char0);
+        if wi == nil { return nil; }
+        let sym = _find_symbol_by_name(rep, wi["word"]);
+        if sym == nil or sym["line"] <= 0 { return nil; }
+        def_line1 = sym["line"];
+        def_col1 = sym["col"];
+        sym_name = sym["name"];
+    }
+
+    let dl0 = def_line1 - 1;
+    let dc0 = if def_col1 > 0 { def_col1 - 1 } else { 0 };
+    return map{
+        uri: doc_entry["uri"],
+        range: map{
+            start: map{ line: dl0, character: dc0 },
+            end: map{ line: dl0, character: dc0 + len(sym_name) }
+        }
+    };
+}
+
+fn _build_document_symbols(doc_entry) {
+    if doc_entry == nil { return []; }
+    let syms = doc_entry["report"]["symbols"];
+    let out = [];
+    let i = 0;
+    while i < len(syms) {
+        let s = syms[i];
+        if s["line"] > 0 {
+            let sk = 13; // Variable
+            if s["kind"] == "fn" { sk = 12; }
+            elif s["kind"] == "const" { sk = 14; }
+            elif s["kind"] == "struct" { sk = 23; }
+            elif s["kind"] == "class" { sk = 5; }
+            elif s["kind"] == "enum" { sk = 10; }
+
+            let l0 = s["line"] - 1;
+            let c0 = if s["col"] > 0 { s["col"] - 1 } else { 0 };
+            let r = map{
+                start: map{ line: l0, character: c0 },
+                end: map{ line: l0, character: c0 + len(s["name"]) }
+            };
+            push(out, map{
+                name: s["name"],
+                detail: s["type_str"],
+                kind: sk,
+                range: r,
+                selectionRange: r
+            });
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _ranges_overlap(r1, r2) {
+    if r1 == nil or r2 == nil { return true; }
+    let s1 = r1["start"]["line"];
+    let e1 = r1["end"]["line"];
+    let s2 = r2["start"]["line"];
+    let e2 = r2["end"]["line"];
+    return not (e1 < s2 or e2 < s1);
+}
+
+fn _build_code_actions(doc_entry, uri, req_range, ctx_diags) {
+    let actions = [];
+    let seen_titles = map{};
+
+    // Check diagnostics supplied by client context first
+    if ctx_diags != nil and type(ctx_diags) == "array" {
+        let i = 0;
+        while i < len(ctx_diags) {
+            let cd = ctx_diags[i];
+            if map_has(cd, "data") and cd["data"] != nil and map_has(cd["data"], "suggestion") {
+                let sugg = cd["data"]["suggestion"];
+                if sugg != nil and sugg != "" {
+                    let title = "Replace with '" + sugg + "'";
+                    if not map_has(seen_titles, title) {
+                        seen_titles[title] = true;
+                        let changes_map = map{};
+                        changes_map[uri] = [map{ range: cd["range"], newText: sugg }];
+                        push(actions, map{
+                            title: title,
+                            kind: "quickfix",
+                            isPreferred: true,
+                            diagnostics: [cd],
+                            edit: map{ changes: changes_map }
+                        });
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    // Also check cached checker report diagnostics overlapping `req_range`
+    if doc_entry != nil {
+        let rdiags = doc_entry["report"]["diagnostics"];
+        let j = 0;
+        while j < len(rdiags) {
+            let rd = rdiags[j];
+            let lsp_d = _checker_diag_to_lsp(rd);
+            if _ranges_overlap(req_range, lsp_d["range"]) {
+                if map_has(rd, "suggestion") and rd["suggestion"] != nil and rd["suggestion"] != "" {
+                    let sugg2 = rd["suggestion"];
+                    let title2 = "Replace with '" + sugg2 + "'";
+                    if not map_has(seen_titles, title2) {
+                        seen_titles[title2] = true;
+                        let changes_map2 = map{};
+                        changes_map2[uri] = [map{ range: lsp_d["range"], newText: sugg2 }];
+                        push(actions, map{
+                            title: title2,
+                            kind: "quickfix",
+                            isPreferred: true,
+                            diagnostics: [lsp_d],
+                            edit: map{ changes: changes_map2 }
+                        });
+                    }
+                }
+            }
+            j = j + 1;
+        }
+    }
+
+    return actions;
+}
+
+fn _build_formatting_edits(doc_entry) {
+    if doc_entry == nil { return []; }
+    let orig = doc_entry["text"];
+    let formatted = _format_v3_document(orig, nil);
+    if formatted == orig { return []; }
+    let lines = doc_entry["lines"];
+    let end_line = if len(lines) > 0 { len(lines) - 1 } else { 0 };
+    let end_char = if len(lines) > 0 { len(lines[end_line]) } else { 0 };
+    return [map{
+        range: map{
+            start: map{ line: 0, character: 0 },
+            end: map{ line: end_line, character: end_char }
+        },
+        newText: formatted
+    }];
+}
+
+// ── Main Testable JSON-RPC Message Dispatcher (`handle_lsp_message`) ──────────
+
+fn handle_lsp_message(state, msg_map) {
+    if msg_map == nil or type(msg_map) != "map" {
+        return nil;
+    }
+
+    let method = if map_has(msg_map, "method") { msg_map["method"] } else { "" };
+    let has_id = map_has(msg_map, "id");
+    let req_id = if has_id { msg_map["id"] } else { nil };
+    let params = if map_has(msg_map, "params") and msg_map["params"] != nil { msg_map["params"] } else { map{} };
+
+    if method == "initialize" {
+        state["initialized"] = true;
+        if map_has(params, "rootUri") {
+            state["root_uri"] = params["rootUri"];
+        }
+        if map_has(params, "initializationOptions") and params["initializationOptions"] != nil and type(params["initializationOptions"]) == "map" {
+            let io = params["initializationOptions"];
+            if map_has(io, "strict") { state["strict"] = io["strict"] == true; }
+            if map_has(io, "verifyContracts") { state["verify_contracts"] = io["verifyContracts"] == true; }
+        }
+        let resp = map{
+            jsonrpc: "2.0",
+            id: req_id,
+            result: map{
+                capabilities: map{
+                    textDocumentSync: 1,
+                    hoverProvider: true,
+                    completionProvider: map{
+                        resolveProvider: false,
+                        triggerCharacters: [".", ":", "["]
+                    },
+                    definitionProvider: true,
+                    documentSymbolProvider: true,
+                    documentFormattingProvider: true,
+                    codeActionProvider: true
+                },
+                serverInfo: map{
+                    name: "pblang-lsp",
+                    version: LSP_SERVER_VERSION
+                }
+            }
+        };
+        return _queue_outgoing(state, resp);
+    }
+
+    if method == "initialized" {
+        state["initialized"] = true;
+        return nil;
+    }
+
+    if method == "shutdown" {
+        state["shutdown_requested"] = true;
+        let resp_sd = map{
+            jsonrpc: "2.0",
+            id: req_id,
+            result: nil
+        };
+        return _queue_outgoing(state, resp_sd);
+    }
+
+    if method == "exit" {
+        state["exited"] = true;
+        state["exit_code"] = if state["shutdown_requested"] { 0 } else { 1 };
+        return nil;
+    }
+
+    if method == "textDocument/didOpen" {
+        let td = params["textDocument"];
+        let uri = td["uri"];
+        let txt = td["text"];
+        let ver = if map_has(td, "version") { td["version"] } else { 1 };
+        return _analyze_and_publish(state, uri, txt, ver);
+    }
+
+    if method == "textDocument/didChange" {
+        let td2 = params["textDocument"];
+        let uri2 = td2["uri"];
+        let ver2 = if map_has(td2, "version") { td2["version"] } else { nil };
+        let changes = params["contentChanges"];
+        if changes != nil and len(changes) > 0 {
+            let newest = changes[len(changes) - 1]["text"];
+            return _analyze_and_publish(state, uri2, newest, ver2);
+        }
+        return nil;
+    }
+
+    if method == "textDocument/didSave" {
+        let td3 = params["textDocument"];
+        let uri3 = td3["uri"];
+        if map_has(params, "text") and params["text"] != nil {
+            return _analyze_and_publish(state, uri3, params["text"], nil);
+        }
+        if map_has(state["documents"], uri3) {
+            let existing = state["documents"][uri3];
+            return _analyze_and_publish(state, uri3, existing["text"], existing["version"]);
+        }
+        return nil;
+    }
+
+    if method == "textDocument/didClose" {
+        let td4 = params["textDocument"];
+        let uri4 = td4["uri"];
+        if map_has(state["documents"], uri4) {
+            map_remove(state["documents"], uri4);
+        }
+        let clear_notif = map{
+            jsonrpc: "2.0",
+            method: "textDocument/publishDiagnostics",
+            params: map{ uri: uri4, diagnostics: [] }
+        };
+        return _queue_outgoing(state, clear_notif);
+    }
+
+    if method == "textDocument/hover" {
+        let uri_h = params["textDocument"]["uri"];
+        let pos_h = params["position"];
+        let doc_h = if map_has(state["documents"], uri_h) { state["documents"][uri_h] } else { nil };
+        let hover_res = if doc_h != nil { _format_hover_markdown(doc_h, pos_h["line"], pos_h["character"]) } else { nil };
+        return _queue_outgoing(state, map{
+            jsonrpc: "2.0",
+            id: req_id,
+            result: hover_res
+        });
+    }
+
+    if method == "textDocument/completion" {
+        let uri_c = params["textDocument"]["uri"];
+        let pos_c = params["position"];
+        let doc_c = if map_has(state["documents"], uri_c) { state["documents"][uri_c] } else { nil };
+        let comp_items = _build_completions(doc_c, pos_c["line"], pos_c["character"]);
+        return _queue_outgoing(state, map{
+            jsonrpc: "2.0",
+            id: req_id,
+            result: map{
+                isIncomplete: false,
+                items: comp_items
+            }
+        });
+    }
+
+    if method == "textDocument/definition" {
+        let uri_d = params["textDocument"]["uri"];
+        let pos_d = params["position"];
+        let doc_d = if map_has(state["documents"], uri_d) { state["documents"][uri_d] } else { nil };
+        let loc_d = _find_definition_location(doc_d, pos_d["line"], pos_d["character"]);
+        return _queue_outgoing(state, map{
+            jsonrpc: "2.0",
+            id: req_id,
+            result: loc_d
+        });
+    }
+
+    if method == "textDocument/documentSymbol" {
+        let uri_s = params["textDocument"]["uri"];
+        let doc_s = if map_has(state["documents"], uri_s) { state["documents"][uri_s] } else { nil };
+        let syms_s = _build_document_symbols(doc_s);
+        return _queue_outgoing(state, map{
+            jsonrpc: "2.0",
+            id: req_id,
+            result: syms_s
+        });
+    }
+
+    if method == "textDocument/codeAction" {
+        let uri_a = params["textDocument"]["uri"];
+        let doc_a = if map_has(state["documents"], uri_a) { state["documents"][uri_a] } else { nil };
+        let range_a = if map_has(params, "range") { params["range"] } else { nil };
+        let ctx_diags = if map_has(params, "context") and params["context"] != nil and map_has(params["context"], "diagnostics") {
+            params["context"]["diagnostics"]
+        } else {
+            []
+        };
+        let acts = _build_code_actions(doc_a, uri_a, range_a, ctx_diags);
+        return _queue_outgoing(state, map{
+            jsonrpc: "2.0",
+            id: req_id,
+            result: acts
+        });
+    }
+
+    if method == "textDocument/formatting" {
+        let uri_f = params["textDocument"]["uri"];
+        let doc_f = if map_has(state["documents"], uri_f) { state["documents"][uri_f] } else { nil };
+        let edits = _build_formatting_edits(doc_f);
+        return _queue_outgoing(state, map{
+            jsonrpc: "2.0",
+            id: req_id,
+            result: edits
+        });
+    }
+
+    if has_id {
+        return _queue_outgoing(state, map{
+            jsonrpc: "2.0",
+            id: req_id,
+            error: map{
+                code: -32601,
+                message: "Method not found: " + method
+            }
+        });
+    }
+    return nil;
+}
+
+// Process raw wire chunk(s) and return encoded outgoing wire string + remaining partial bytes.
+fn process_lsp_wire_chunk(state, raw_chunk) {
+    drain_lsp_outgoing(state);
+    let dec = decode_lsp_frames(raw_chunk);
+    let msgs = dec["messages"];
+    let i = 0;
+    while i < len(msgs) {
+        handle_lsp_message(state, msgs[i]);
+        i = i + 1;
+    }
+    let out_msgs = drain_lsp_outgoing(state);
+    let encoded_parts = [];
+    let j = 0;
+    while j < len(out_msgs) {
+        push(encoded_parts, encode_lsp_frame(out_msgs[j]));
+        j = j + 1;
+    }
+    return map{
+        wire_out: str_join(encoded_parts, ""),
+        messages_out: out_msgs,
+        remainder_bytes: dec["remainder_bytes"],
+        remainder_str: dec["remainder_str"]
+    };
+}
+
+// ── Live Stdio Transport (`pblang lsp`) ───────────────────────────────────────
+
+fn _write_stdout_raw(frame_str, libc_handle) {
+    if frame_str == "" { return; }
+    if libc_handle != nil {
+        let b = str_to_bytes(frame_str);
+        let blen = len(b);
+        let ok_w = try ffi_call_typed(libc_handle, "write", "i32, str, i64 -> i64", [1, frame_str, blen]) catch -1;
+        if ok_w >= 0 { return; }
+    }
+    let ok_dev = try fs_append("/dev/stdout", frame_str) catch nil;
+    if ok_dev == nil {
+        print frame_str;
+    }
+}
+
+fn _read_exact_bytes_libc(libc_handle, count) {
+    let buf = [];
+    let i = 0;
+    while i < count {
+        let ch = ffi_call_typed(libc_handle, "getchar", "-> i32", []);
+        if ch < 0 {
+            return buf;
+        }
+        push(buf, ch);
+        i = i + 1;
+    }
+    return buf;
+}
+
+fn _read_header_line_libc(libc_handle) {
+    let tmp = [];
+    while true {
+        let ch = ffi_call_typed(libc_handle, "getchar", "-> i32", []);
+        if ch < 0 {
+            if len(tmp) == 0 { return nil; }
+            return bytes_to_str(tmp);
+        }
+        if ch == 10 {
+            return bytes_to_str(tmp);
+        }
+        if ch != 13 {
+            push(tmp, ch);
+        }
+    }
+    return nil;
+}
+
+fn run_lsp_stdio(opts = nil) {
+    let state = create_lsp_state(opts);
+    let libc = try ffi_load("libc.so.6") catch nil;
+    if libc == nil {
+        libc = try ffi_load("libc.dylib") catch nil;
+    }
+
+    while not state["exited"] {
+        let content_len = -1;
+        let eof = false;
+
+        if libc != nil {
+            while true {
+                let hline = _read_header_line_libc(libc);
+                if hline == nil { eof = true; break; }
+                let trimmed = str_trim(hline);
+                if trimmed == "" {
+                    if content_len >= 0 { break; }
+                } else {
+                    let low = str_lower(trimmed);
+                    if str_starts_with(low, "content-length:") {
+                        content_len = _parse_nonneg_int(str_slice(trimmed, 15, len(trimmed)));
+                    }
+                }
+            }
+            if eof { break; }
+            let body_bytes = _read_exact_bytes_libc(libc, content_len);
+            if len(body_bytes) < content_len { break; }
+            let body_str = bytes_to_str(body_bytes);
+            let msg = try json_parse(body_str) catch nil;
+            if msg != nil {
+                drain_lsp_outgoing(state);
+                handle_lsp_message(state, msg);
+                let out_q = drain_lsp_outgoing(state);
+                let oi = 0;
+                while oi < len(out_q) {
+                    _write_stdout_raw(encode_lsp_frame(out_q[oi]), libc);
+                    oi = oi + 1;
+                }
+            }
+        } else {
+            // Line-oriented fallback when FFI is unavailable
+            let ln = read_line();
+            if ln == nil { break; }
+            let tln = str_trim(ln);
+            if str_starts_with(tln, "{") {
+                let msg2 = try json_parse(tln) catch nil;
+                if msg2 != nil {
+                    drain_lsp_outgoing(state);
+                    handle_lsp_message(state, msg2);
+                    let out_q2 = drain_lsp_outgoing(state);
+                    let oj = 0;
+                    while oj < len(out_q2) {
+                        _write_stdout_raw(encode_lsp_frame(out_q2[oj]), nil);
+                        oj = oj + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    return state["exit_code"];
+}
+
+fn cli_lsp_entry(cli_args = nil) {
+    let raw_args = if cli_args != nil { cli_args } else { os_args() };
+    let strict_flag = true;
+    let i = 0;
+    while i < len(raw_args) {
+        if raw_args[i] == "--no-strict" { strict_flag = false; }
+        elif raw_args[i] == "--strict" { strict_flag = true; }
+        i = i + 1;
+    }
+    return run_lsp_stdio(map{ strict: strict_flag });
+}
+
+export LSP_SERVER_VERSION,
+       create_lsp_state,
+       encode_lsp_frame,
+       decode_lsp_frames,
+       drain_lsp_outgoing,
+       handle_lsp_message,
+       process_lsp_wire_chunk,
+       run_lsp_stdio,
+       cli_lsp_entry;

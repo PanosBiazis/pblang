@@ -1,0 +1,1474 @@
+// stdlib/native/aot_full_bundler.sapp -- Multi-Module DAG Linker, Namespace-Prefixed .sapp Bundler
+// & Standalone Optimized C99 / ELF64 / PE32+ Native AOT Compiler.
+//
+// Bridges Path A (VM multi-module + stdlib:... ecosystem) and Path B (Native AOT):
+//   1. resolve_import_dag(entry_path, options) -- Recursive topological DAG resolver with cycle detection.
+//   2. bundle_multi_module_sapp(entry_or_dag, options) -- Namespace-prefixed single-unit .sapp bundle
+//      for direct compilation by codegen_x64.sapp / codegen_pe64.sapp with zero symbol collisions.
+//   3. transpile_dag_to_c99(entry_or_dag, options) -- Standalone ISO C99 translation supporting
+//      IEEE-754 double, strings, dynamic arrays, hash/linear maps, lexical closures, and math/IO builtins.
+//   4. compile_multi_module_aot(entry_or_dag, target, options) -- End-to-end ELF64 / PE64 / C99 builder.
+
+let _SOURCE = import("stdlib:compiler/checked_source.sapp");
+let _BUILTINS = import("stdlib:compiler/builtins_list.sapp");
+let _SHA256 = import("stdlib:sha256_pb.sapp");
+
+let _lazy_backends = map{};
+
+fn _get_x64() {
+    if not map_has(_lazy_backends, "x64") {
+        _lazy_backends["x64"] = import("stdlib/native/codegen_x64.sapp");
+    }
+    return _lazy_backends["x64"];
+}
+
+fn _get_pe64() {
+    if not map_has(_lazy_backends, "pe64") {
+        _lazy_backends["pe64"] = import("stdlib/native/codegen_pe64.sapp");
+    }
+    return _lazy_backends["pe64"];
+}
+
+fn _stmts_of(b) {
+    if is_array(b) { return b; }
+    if is_map(b) and map_has(b, "stmts") { return b.stmts; }
+    return [];
+}
+
+fn _pname(p) {
+    if is_map(p) and map_has(p, "name") { return p.name; }
+    return str(p);
+}
+
+fn _has_str(arr, target) {
+    let i = 0;
+    while i < len(arr) {
+        if arr[i] == target { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Normalize POSIX/Windows path segments ("a/b/../c/./d.sapp" -> "a/c/d.sapp")
+fn _normalize_path(raw_path) {
+    let clean = str_replace_all(raw_path, "\\", "/");
+    let is_abs = str_starts_with(clean, "/");
+    let parts = str_split(clean, "/");
+    let stack = [];
+    let i = 0;
+    while i < len(parts) {
+        let seg = parts[i];
+        if seg == "" or seg == "." {
+            // skip
+        } elif seg == ".." {
+            if len(stack) > 0 and stack[len(stack) - 1] != ".." {
+                array_pop(stack);
+            } elif not is_abs {
+                array_push(stack, "..");
+            }
+        } else {
+            array_push(stack, seg);
+        }
+        i = i + 1;
+    }
+    let joined = str_join(stack, "/");
+    if is_abs { return "/" + joined; }
+    if joined == "" { return "."; }
+    return joined;
+}
+
+fn _resolve_specifier(spec, importer_path, stdlib_dir) {
+    let trimmed = str_trim(spec);
+    if str_starts_with(trimmed, "stdlib:") {
+        let rel = str_slice(trimmed, 7, len(trimmed));
+        while str_starts_with(rel, "/") { rel = str_slice(rel, 1, len(rel)); }
+        return _normalize_path(stdlib_dir + "/" + rel);
+    }
+    if str_starts_with(trimmed, "stdlib/") {
+        let rel2 = str_slice(trimmed, 7, len(trimmed));
+        return _normalize_path(stdlib_dir + "/" + rel2);
+    }
+    if str_starts_with(trimmed, "/") {
+        return _normalize_path(trimmed);
+    }
+    let base_dir = path_dirname(importer_path);
+    if base_dir == "" or base_dir == "." {
+        return _normalize_path(trimmed);
+    }
+    return _normalize_path(base_dir + "/" + trimmed);
+}
+
+fn _read_module_source(mod_path, vfs) {
+    if vfs != nil and is_map(vfs) and map_has(vfs, mod_path) {
+        return vfs[mod_path];
+    }
+    if fs_exists(mod_path) {
+        return fs_read(mod_path);
+    }
+    return nil;
+}
+
+fn _default_BindingFromPath(spec) {
+    let base = path_basename(spec);
+    let colon = str_index_of(base, ":");
+    if colon >= 0 { base = str_slice(base, colon + 1, len(base)); }
+    let dot = str_index_of(base, ".");
+    if dot > 0 { base = str_slice(base, 0, dot); }
+    if base == "" { return "module"; }
+    return base;
+}
+
+// Extract top-level imports, exports, and declared top-level names from parsed AST.
+fn _inspect_module_ast(ast) {
+    let imports_list = [];
+    let exports_list = [];
+    let top_decls = map{};
+    let top_fns = map{};
+
+    let i = 0;
+    while i < len(ast.stmts) {
+        let s = ast.stmts[i];
+        let k = s.kind;
+        if (k == "let" or k == "const") and s.value != nil and s.value.kind == "call" {
+            let fnm = try s.value.func.name catch "";
+            if fnm == "import" and len(s.value.args) >= 1 and s.value.args[0].kind == "string" {
+                array_push(imports_list, map{
+                    alias: s.name,
+                    specifier: s.value.args[0].value,
+                    stmt_index: i
+                });
+            } else {
+                top_decls[s.name] = k;
+            }
+        } elif k == "import" {
+            array_push(imports_list, map{
+                alias: _default_BindingFromPath(s.path),
+                specifier: s.path,
+                stmt_index: i
+            });
+        } elif k == "export" {
+            let ni = 0;
+            while ni < len(s.names) {
+                let enm = _pname(s.names[ni]);
+                if not _has_str(exports_list, enm) { array_push(exports_list, enm); }
+                ni = ni + 1;
+            }
+        } elif k == "fn" {
+            top_decls[s.name] = "fn";
+            top_fns[s.name] = len(s.params);
+        } elif k == "let" or k == "const" {
+            top_decls[s.name] = k;
+        }
+        i = i + 1;
+    }
+
+    // If module has no explicit `export ...;`, treat all top-level decls as exported.
+    if len(exports_list) == 0 {
+        let dk = map_keys(top_decls);
+        let di = 0;
+        while di < len(dk) {
+            array_push(exports_list, dk[di]);
+            di = di + 1;
+        }
+    }
+
+    return map{
+        imports: imports_list,
+        exports: exports_list,
+        top_decls: top_decls,
+        top_fns: top_fns
+    };
+}
+
+fn _dfs_resolve(mod_path, state) {
+    if map_has(state.state_map, mod_path) {
+        let st = state.state_map[mod_path];
+        if st == "visiting" {
+            let chain = [];
+            let started = false;
+            let ci = 0;
+            while ci < len(state.active_stack) {
+                if state.active_stack[ci] == mod_path { started = true; }
+                if started { array_push(chain, state.active_stack[ci]); }
+                ci = ci + 1;
+            }
+            array_push(chain, mod_path);
+            state.error = "circular import detected: " + str_join(chain, " -> ");
+            state.cycle_detected = true;
+            state.cycle_chain = chain;
+            return false;
+        }
+        if st == "visited" {
+            return true;
+        }
+    }
+
+    let raw_src = _read_module_source(mod_path, state.vfs);
+    if raw_src == nil {
+        state.error = "module not found: " + mod_path;
+        return false;
+    }
+
+    let ast = try _SOURCE.parse_local_source(raw_src) catch nil;
+    if ast == nil {
+        state.error = "syntax error parsing module: " + mod_path;
+        return false;
+    }
+
+    state.state_map[mod_path] = "visiting";
+    array_push(state.active_stack, mod_path);
+
+    let info = _inspect_module_ast(ast);
+    let resolved_imports = [];
+    let ii = 0;
+    while ii < len(info.imports) {
+        let imp = info.imports[ii];
+        let dep_path = _resolve_specifier(imp.specifier, mod_path, state.stdlib_dir);
+        if not _dfs_resolve(dep_path, state) {
+            return false;
+        }
+        array_push(resolved_imports, map{
+            alias: imp.alias,
+            specifier: imp.specifier,
+            resolved_path: dep_path,
+            stmt_index: imp.stmt_index
+        });
+        ii = ii + 1;
+    }
+
+    array_pop(state.active_stack);
+    state.state_map[mod_path] = "visited";
+
+    let mod_idx = len(state.ordered_modules);
+    state.index_by_path[mod_path] = mod_idx;
+    array_push(state.ordered_modules, map{
+        index: mod_idx,
+        path: mod_path,
+        prefix: "__m" + str(mod_idx) + "_",
+        source: raw_src,
+        sha256: _SHA256.sha256_hex(raw_src),
+        ast: ast,
+        imports: resolved_imports,
+        exports: info.exports,
+        top_decls: info.top_decls,
+        top_fns: info.top_fns
+    });
+    return true;
+}
+
+// 1. Recursive Topological Multi-Module DAG Resolver
+fn resolve_import_dag(entry_path, options = nil) {
+    if type(entry_path) != "string" or str_trim(entry_path) == "" {
+        return map{ ok: false, cycle_detected: false, error: "entry_path must be a non-empty string" };
+    }
+    let stdlib_dir = "stdlib";
+    let vfs = nil;
+    if options != nil and is_map(options) {
+        if map_has(options, "stdlib_dir") and type(options.stdlib_dir) == "string" {
+            stdlib_dir = options.stdlib_dir;
+        }
+        if map_has(options, "virtual_fs") and is_map(options.virtual_fs) {
+            vfs = options.virtual_fs;
+        }
+    }
+
+    let norm_entry = _normalize_path(entry_path);
+    let state = map{
+        stdlib_dir: _normalize_path(stdlib_dir),
+        vfs: vfs,
+        state_map: map{},
+        active_stack: [],
+        ordered_modules: [],
+        index_by_path: map{},
+        error: "",
+        cycle_detected: false,
+        cycle_chain: []
+    };
+
+    let ok = _dfs_resolve(norm_entry, state);
+    if not ok {
+        return map{
+            ok: false,
+            cycle_detected: state.cycle_detected,
+            cycle_chain: state.cycle_chain,
+            error: state.error
+        };
+    }
+
+    // Mark the entry module (always last in topological post-order!)
+    let n = len(state.ordered_modules);
+    let order_paths = [];
+    let edges = [];
+    let i = 0;
+    while i < n {
+        let m = state.ordered_modules[i];
+        m.is_entry = (i == n - 1);
+        array_push(order_paths, m.path);
+        let j = 0;
+        while j < len(m.imports) {
+            array_push(edges, map{
+                from: m.path,
+                target: m.imports[j].resolved_path,
+                alias: m.imports[j].alias
+            });
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    return map{
+        ok: true,
+        cycle_detected: false,
+        entry_path: norm_entry,
+        module_count: n,
+        topological_order: order_paths,
+        edges: edges,
+        modules: state.ordered_modules,
+        index_by_path: state.index_by_path
+    };
+}
+
+// ── Pretty-printer & Namespace Rewriter for .sapp Bundling ───────────────────
+
+fn _escape_sapp_str(s) {
+    let out = "";
+    let i = 0;
+    while i < len(s) {
+        let ch = str_slice(s, i, i + 1);
+        let code = strcharcodeat(s, i);
+        if ch == "\\" { out = out + "\\\\"; }
+        elif ch == "\"" { out = out + "\\\""; }
+        elif code == 10 { out = out + "\\n"; }
+        elif code == 13 { out = out + "\\r"; }
+        elif code == 9 { out = out + "\\t"; }
+        else { out = out + ch; }
+        i = i + 1;
+    }
+    return "\"" + out + "\"";
+}
+
+fn _clone_locals(locals) {
+    let out = map{};
+    let ks = map_keys(locals);
+    let i = 0;
+    while i < len(ks) {
+        out[ks[i]] = locals[ks[i]];
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _resolve_ident_name(nm, mod_ctx, locals) {
+    if map_has(locals, nm) { return nm; }
+    if not mod_ctx.is_entry and map_has(mod_ctx.top_decls, nm) {
+        return mod_ctx.prefix + nm;
+    }
+    return nm;
+}
+
+fn _emit_sapp_expr(node, mod_ctx, locals) {
+    if node == nil { return "nil"; }
+    let k = node.kind;
+    if k == "number" { return str(node.value); }
+    if k == "bool" { return if node.value { "true" } else { "false" }; }
+    if k == "nil" { return "nil"; }
+    if k == "string" { return _escape_sapp_str(node.value); }
+    if k == "ident" {
+        let nm = node.name;
+        if not map_has(locals, nm) and map_has(mod_ctx.alias_map, nm) {
+            return mod_ctx.alias_obj_map[nm];
+        }
+        return _resolve_ident_name(nm, mod_ctx, locals);
+    }
+    if k == "group" or k == "paren" {
+        return "(" + _emit_sapp_expr(node.expr, mod_ctx, locals) + ")";
+    }
+    if k == "member" {
+        if node.obj != nil and node.obj.kind == "ident" {
+            let base_nm = node.obj.name;
+            if not map_has(locals, base_nm) and map_has(mod_ctx.alias_map, base_nm) {
+                let target_mod = mod_ctx.alias_map[base_nm];
+                return target_mod.prefix + node.name;
+            }
+        }
+        return _emit_sapp_expr(node.obj, mod_ctx, locals) + "." + node.name;
+    }
+    if k == "index" {
+        return _emit_sapp_expr(node.obj, mod_ctx, locals) + "[" + _emit_sapp_expr(node.index, mod_ctx, locals) + "]";
+    }
+    if k == "unary" {
+        let opd = try node.operand catch nil;
+        if opd == nil { opd = node.expr; }
+        if node.op == "not" {
+            return "(not " + _emit_sapp_expr(opd, mod_ctx, locals) + ")";
+        }
+        return "(" + node.op + _emit_sapp_expr(opd, mod_ctx, locals) + ")";
+    }
+    if k == "binary" {
+        let lop = node.op;
+        if lop == "&&" { lop = "and"; }
+        if lop == "||" { lop = "or"; }
+        return "(" + _emit_sapp_expr(node.left, mod_ctx, locals) + " " + lop + " " + _emit_sapp_expr(node.right, mod_ctx, locals) + ")";
+    }
+    if k == "if_expr" {
+        return "(if " + _emit_sapp_expr(node.cond, mod_ctx, locals) + " { " + _emit_sapp_expr_or_block(node.then, mod_ctx, locals) + " } else { " + _emit_sapp_expr_or_block(node.else, mod_ctx, locals) + " })";
+    }
+    if k == "try" {
+        return "(try " + _emit_sapp_expr(node.body, mod_ctx, locals) + " catch " + _emit_sapp_expr(node.handler, mod_ctx, locals) + ")";
+    }
+    if k == "coalesce" {
+        return "(" + _emit_sapp_expr(node.left, mod_ctx, locals) + " ?? " + _emit_sapp_expr(node.right, mod_ctx, locals) + ")";
+    }
+    if k == "assign" {
+        let lhs = _resolve_ident_name(node.name, mod_ctx, locals);
+        return lhs + " = " + _emit_sapp_expr(node.value, mod_ctx, locals);
+    }
+    if k == "assign_to" {
+        return _emit_sapp_expr(node.target, mod_ctx, locals) + " = " + _emit_sapp_expr(node.value, mod_ctx, locals);
+    }
+    if k == "array" {
+        let parts = [];
+        let i = 0;
+        while i < len(node.items) {
+            array_push(parts, _emit_sapp_expr(node.items[i], mod_ctx, locals));
+            i = i + 1;
+        }
+        return "[" + str_join(parts, ", ") + "]";
+    }
+    if k == "map" {
+        let mparts = [];
+        let i2 = 0;
+        while i2 < len(node.entries) {
+            let ent = node.entries[i2];
+            array_push(mparts, _escape_sapp_str(ent.key) + ": " + _emit_sapp_expr(ent.value, mod_ctx, locals));
+            i2 = i2 + 1;
+        }
+        return "map{" + str_join(mparts, ", ") + "}";
+    }
+    if k == "fn_lit" {
+        let sub_locals = _clone_locals(locals);
+        let pnames = [];
+        let pi = 0;
+        while pi < len(node.params) {
+            let pnm = _pname(node.params[pi]);
+            sub_locals[pnm] = true;
+            array_push(pnames, pnm);
+            pi = pi + 1;
+        }
+        let body_txt = _emit_sapp_stmts(_stmts_of(node.body), mod_ctx, sub_locals, "    ", false);
+        return "fn(" + str_join(pnames, ", ") + ") {\n" + body_txt + "}";
+    }
+    if k == "call" {
+        let callee_txt = _emit_sapp_expr(node.func, mod_ctx, locals);
+        let aparts = [];
+        let ai = 0;
+        while ai < len(node.args) {
+            array_push(aparts, _emit_sapp_expr(node.args[ai], mod_ctx, locals));
+            ai = ai + 1;
+        }
+        return callee_txt + "(" + str_join(aparts, ", ") + ")";
+    }
+    return "nil";
+}
+
+fn _emit_sapp_expr_or_block(node, mod_ctx, locals) {
+    if node == nil { return "nil"; }
+    if node.kind == "block" {
+        let stmts = _stmts_of(node);
+        if len(stmts) == 1 and stmts[0].kind == "expr_stmt" {
+            return _emit_sapp_expr(stmts[0].expr, mod_ctx, locals);
+        }
+    }
+    return _emit_sapp_expr(node, mod_ctx, locals);
+}
+
+fn _is_import_stmt(s, idx, mod_ctx) {
+    let i = 0;
+    while i < len(mod_ctx.imports) {
+        if mod_ctx.imports[i].stmt_index == idx { return true; }
+        i = i + 1;
+    }
+    if s.kind == "import" { return true; }
+    return false;
+}
+
+fn _emit_sapp_stmts(stmts, mod_ctx, locals, indent, is_top) {
+    let lines = [];
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        let k = s.kind;
+        if is_top and (_is_import_stmt(s, i, mod_ctx) or k == "export") {
+            // Strip module boundary directives
+        } elif k == "let" or k == "const" {
+            let decl_kw = if k == "const" { "let" } else { "let" };
+            let vname = s.name;
+            if is_top and not mod_ctx.is_entry {
+                vname = mod_ctx.prefix + s.name;
+            } else {
+                locals[s.name] = true;
+            }
+            let rhs = if s.value != nil { _emit_sapp_expr(s.value, mod_ctx, locals) } else { "nil" };
+            array_push(lines, indent + decl_kw + " " + vname + " = " + rhs + ";");
+        } elif k == "fn" {
+            let fname = s.name;
+            if is_top and not mod_ctx.is_entry {
+                fname = mod_ctx.prefix + s.name;
+            } else {
+                locals[s.name] = true;
+            }
+            let fn_locals = _clone_locals(locals);
+            let p_str = [];
+            let pi = 0;
+            while pi < len(s.params) {
+                let pnm = _pname(s.params[pi]);
+                fn_locals[pnm] = true;
+                array_push(p_str, pnm);
+                pi = pi + 1;
+            }
+            let body_code = _emit_sapp_stmts(_stmts_of(s.body), mod_ctx, fn_locals, indent + "    ", false);
+            array_push(lines, indent + "fn " + fname + "(" + str_join(p_str, ", ") + ") {\n" + body_code + indent + "}");
+        } elif k == "return" {
+            if s.value != nil {
+                array_push(lines, indent + "return " + _emit_sapp_expr(s.value, mod_ctx, locals) + ";");
+            } else {
+                array_push(lines, indent + "return nil;");
+            }
+        } elif k == "print" {
+            array_push(lines, indent + "print " + _emit_sapp_expr(s.value, mod_ctx, locals) + ";");
+        } elif k == "throw" {
+            array_push(lines, indent + "throw " + _emit_sapp_expr(s.value, mod_ctx, locals) + ";");
+        } elif k == "break" {
+            array_push(lines, indent + "break;");
+        } elif k == "continue" {
+            array_push(lines, indent + "continue;");
+        } elif k == "assign" {
+            let target_nm = _resolve_ident_name(s.name, mod_ctx, locals);
+            array_push(lines, indent + target_nm + " = " + _emit_sapp_expr(s.value, mod_ctx, locals) + ";");
+        } elif k == "expr_stmt" {
+            array_push(lines, indent + _emit_sapp_expr(s.expr, mod_ctx, locals) + ";");
+        } elif k == "if" {
+            let sub_l = _clone_locals(locals);
+            let hdr = indent + "if " + _emit_sapp_expr(s.cond, mod_ctx, locals) + " {\n" +
+                      _emit_sapp_stmts(_stmts_of(s.then), mod_ctx, sub_l, indent + "    ", false) + indent + "}";
+            let elifs = try s.elifs catch nil;
+            if elifs != nil {
+                let ei = 0;
+                while ei < len(elifs) {
+                    let sub_el = _clone_locals(locals);
+                    hdr = hdr + " elif " + _emit_sapp_expr(elifs[ei].cond, mod_ctx, locals) + " {\n" +
+                          _emit_sapp_stmts(_stmts_of(elifs[ei].body), mod_ctx, sub_el, indent + "    ", false) + indent + "}";
+                    ei = ei + 1;
+                }
+            }
+            let el = try s.else catch nil;
+            if el != nil {
+                let sub_e2 = _clone_locals(locals);
+                hdr = hdr + " else {\n" +
+                      _emit_sapp_stmts(_stmts_of(el), mod_ctx, sub_e2, indent + "    ", false) + indent + "}";
+            }
+            array_push(lines, hdr);
+        } elif k == "while" {
+            let sub_w = _clone_locals(locals);
+            array_push(lines, indent + "while " + _emit_sapp_expr(s.cond, mod_ctx, locals) + " {\n" +
+                              _emit_sapp_stmts(_stmts_of(s.body), mod_ctx, sub_w, indent + "    ", false) + indent + "}");
+        } elif k == "for_in" {
+            let sub_fi = _clone_locals(locals);
+            sub_fi[s.name] = true;
+            array_push(lines, indent + "for " + s.name + " in " + _emit_sapp_expr(s.iter, mod_ctx, locals) + " {\n" +
+                              _emit_sapp_stmts(_stmts_of(s.body), mod_ctx, sub_fi, indent + "    ", false) + indent + "}");
+        } elif k == "for_range" {
+            let sub_fr = _clone_locals(locals);
+            sub_fr[s.name] = true;
+            array_push(lines, indent + "for " + s.name + " in " + _emit_sapp_expr(s.start, mod_ctx, locals) + " to " + _emit_sapp_expr(s.end, mod_ctx, locals) + " {\n" +
+                              _emit_sapp_stmts(_stmts_of(s.body), mod_ctx, sub_fr, indent + "    ", false) + indent + "}");
+        } elif k == "for" {
+            let sub_f = _clone_locals(locals);
+            sub_f[s.name] = true;
+            array_push(lines, indent + "for " + s.name + " " + _emit_sapp_expr(s.end, mod_ctx, locals) + " {\n" +
+                              _emit_sapp_stmts(_stmts_of(s.body), mod_ctx, sub_f, indent + "    ", false) + indent + "}");
+        } elif k == "block" {
+            let sub_b = _clone_locals(locals);
+            array_push(lines, indent + "{\n" + _emit_sapp_stmts(_stmts_of(s), mod_ctx, sub_b, indent + "    ", false) + indent + "}");
+        }
+        i = i + 1;
+    }
+    if len(lines) == 0 { return ""; }
+    return str_join(lines, "\n") + "\n";
+}
+
+// 2. Flatten Multi-Module DAG into a Single Collision-Free Namespace-Prefixed .sapp Unit
+fn bundle_multi_module_sapp(entry_or_dag, options = nil) {
+    let dag = entry_or_dag;
+    if type(entry_or_dag) == "string" {
+        dag = resolve_import_dag(entry_or_dag, options);
+    }
+    if not is_map(dag) or not (try dag.ok catch false) {
+        return dag;
+    }
+
+    let chunks = [];
+    let symbol_map = map{};
+    array_push(chunks, "// Bundled by stdlib/native/aot_full_bundler.sapp (" + str(dag.module_count) + " modules)");
+
+    let mi = 0;
+    while mi < len(dag.modules) {
+        let m = dag.modules[mi];
+        let alias_map = map{};
+        let alias_obj_map = map{};
+        let ii = 0;
+        while ii < len(m.imports) {
+            let imp = m.imports[ii];
+            let target_idx = dag.index_by_path[imp.resolved_path];
+            let target_mod = dag.modules[target_idx];
+            alias_map[imp.alias] = target_mod;
+            alias_obj_map[imp.alias] = target_mod.prefix + "_exports_obj";
+            ii = ii + 1;
+        }
+        let mod_ctx = map{
+            index: m.index,
+            path: m.path,
+            prefix: m.prefix,
+            is_entry: m.is_entry,
+            imports: m.imports,
+            top_decls: m.top_decls,
+            alias_map: alias_map,
+            alias_obj_map: alias_obj_map
+        };
+
+        let unit_code = _emit_sapp_stmts(m.ast.stmts, mod_ctx, map{}, "", true);
+        array_push(chunks, "// ── Module [" + str(m.index) + "]: " + m.path + " ──");
+        array_push(chunks, unit_code);
+
+        if not m.is_entry {
+            let exp_map = map{};
+            let ei = 0;
+            while ei < len(m.exports) {
+                let enm = m.exports[ei];
+                exp_map[enm] = m.prefix + enm;
+                ei = ei + 1;
+            }
+            symbol_map[m.path] = exp_map;
+        }
+        mi = mi + 1;
+    }
+
+    let bundled_src = str_join(chunks, "\n");
+    return map{
+        ok: true,
+        entry_path: dag.entry_path,
+        module_count: dag.module_count,
+        topological_order: dag.topological_order,
+        symbol_map: symbol_map,
+        source: bundled_src
+    };
+}
+
+// ── 3. Standalone Optimized ISO C99 Transpiler (double, str, arr, map, closures) ──
+
+fn _c_escape_str(s) {
+    let bytes = str_to_bytes(s);
+    let out = "\"";
+    let i = 0;
+    let hex = "0123456789abcdef";
+    while i < len(bytes) {
+        let b = bytes[i];
+        if b == 34 { out = out + "\\\""; }
+        elif b == 92 { out = out + "\\\\"; }
+        elif b == 10 { out = out + "\\n"; }
+        elif b == 13 { out = out + "\\r"; }
+        elif b == 9 { out = out + "\\t"; }
+        elif b >= 32 and b <= 126 { out = out + strfromcharcode(b); }
+        else {
+            let hi = num_floor(b / 16) % 16;
+            let lo = b % 16;
+            out = out + "\\x" + str_slice(hex, hi, hi + 1) + str_slice(hex, lo, lo + 1);
+        }
+        i = i + 1;
+    }
+    return out + "\"";
+}
+
+fn _c_ident(raw_name) {
+    return "pbv_" + raw_name;
+}
+
+fn _c99_runtime_header() {
+    return
+"/* Auto-generated by PBLang v3.0 Multi-Module C99 AOT Transpiler */\n" +
+"#include <stdio.h>\n" +
+"#include <stdlib.h>\n" +
+"#include <stdint.h>\n" +
+"#include <stdbool.h>\n" +
+"#include <string.h>\n" +
+"#include <math.h>\n\n" +
+"typedef enum { PB_T_NIL = 0, PB_T_BOOL = 1, PB_T_NUM = 2, PB_T_STR = 3, PB_T_ARR = 4, PB_T_MAP = 5, PB_T_CLOS = 6 } PbTag;\n" +
+"typedef struct PbVal PbVal;\n" +
+"typedef struct PbArr PbArr;\n" +
+"typedef struct PbMap PbMap;\n" +
+"typedef struct PbClos PbClos;\n" +
+"typedef PbVal (*PbClosFn)(PbVal env, int argc, const PbVal *argv);\n\n" +
+"struct PbVal {\n" +
+"    PbTag tag;\n" +
+"    union {\n" +
+"        int b;\n" +
+"        double num;\n" +
+"        const char *str;\n" +
+"        PbArr *arr;\n" +
+"        PbMap *mp;\n" +
+"        PbClos *clos;\n" +
+"    } u;\n" +
+"};\n\n" +
+"struct PbArr { PbVal *items; int len; int cap; };\n" +
+"struct PbMap { const char **keys; PbVal *vals; int len; int cap; };\n" +
+"struct PbClos { PbClosFn fn; PbVal env; };\n\n" +
+"static inline PbVal pb_nil(void) { PbVal v; v.tag = PB_T_NIL; v.u.num = 0.0; return v; }\n" +
+"static inline PbVal pb_bool(int b) { PbVal v; v.tag = PB_T_BOOL; v.u.b = b ? 1 : 0; return v; }\n" +
+"static inline PbVal pb_num(double d) { PbVal v; v.tag = PB_T_NUM; v.u.num = d; return v; }\n" +
+"static inline PbVal pb_str(const char *s) {\n" +
+"    PbVal v; v.tag = PB_T_STR;\n" +
+"    size_t n = s ? strlen(s) : 0;\n" +
+"    char *dup = (char *)malloc(n + 1);\n" +
+"    if (n > 0) memcpy(dup, s, n);\n" +
+"    dup[n] = '\\0';\n" +
+"    v.u.str = dup;\n" +
+"    return v;\n" +
+"}\n" +
+"static inline int pb_truthy(PbVal v) {\n" +
+"    if (v.tag == PB_T_NIL) return 0;\n" +
+"    if (v.tag == PB_T_BOOL) return v.u.b;\n" +
+"    if (v.tag == PB_T_NUM) return v.u.num != 0.0;\n" +
+"    if (v.tag == PB_T_STR) return v.u.str[0] != '\\0';\n" +
+"    return 1;\n" +
+"}\n" +
+"static PbVal pb_to_str(PbVal v) {\n" +
+"    char buf[64];\n" +
+"    if (v.tag == PB_T_STR) return v;\n" +
+"    if (v.tag == PB_T_NIL) return pb_str(\"nil\");\n" +
+"    if (v.tag == PB_T_BOOL) return pb_str(v.u.b ? \"true\" : \"false\");\n" +
+"    if (v.tag == PB_T_NUM) {\n" +
+"        double fl = floor(v.u.num);\n" +
+"        if (v.u.num == fl && fabs(v.u.num) < 9007199254740991.0) snprintf(buf, sizeof(buf), \"%.0f\", v.u.num);\n" +
+"        else snprintf(buf, sizeof(buf), \"%.15g\", v.u.num);\n" +
+"        return pb_str(buf);\n" +
+"    }\n" +
+"    if (v.tag == PB_T_ARR) return pb_str(\"[array]\");\n" +
+"    if (v.tag == PB_T_MAP) return pb_str(\"{map}\");\n" +
+"    return pb_str(\"<closure>\");\n" +
+"}\n" +
+"static PbVal pb_type(PbVal v) {\n" +
+"    switch (v.tag) {\n" +
+"        case PB_T_NIL: return pb_str(\"nil\");\n" +
+"        case PB_T_BOOL: return pb_str(\"bool\");\n" +
+"        case PB_T_NUM: return pb_str(\"number\");\n" +
+"        case PB_T_STR: return pb_str(\"string\");\n" +
+"        case PB_T_ARR: return pb_str(\"array\");\n" +
+"        case PB_T_MAP: return pb_str(\"map\");\n" +
+"        case PB_T_CLOS: return pb_str(\"function\");\n" +
+"    }\n" +
+"    return pb_str(\"nil\");\n" +
+"}\n" +
+"static int pb_eq(PbVal a, PbVal b) {\n" +
+"    if (a.tag != b.tag) return 0;\n" +
+"    if (a.tag == PB_T_NIL) return 1;\n" +
+"    if (a.tag == PB_T_BOOL) return a.u.b == b.u.b;\n" +
+"    if (a.tag == PB_T_NUM) return a.u.num == b.u.num;\n" +
+"    if (a.tag == PB_T_STR) return strcmp(a.u.str, b.u.str) == 0;\n" +
+"    return a.u.arr == b.u.arr;\n" +
+"}\n" +
+"static PbVal pb_add(PbVal a, PbVal b) {\n" +
+"    if (a.tag == PB_T_STR || b.tag == PB_T_STR) {\n" +
+"        PbVal sa = pb_to_str(a), sb = pb_to_str(b);\n" +
+"        size_t la = strlen(sa.u.str), lb = strlen(sb.u.str);\n" +
+"        char * acc = (char *)malloc(la + lb + 1);\n" +
+"        memcpy(acc, sa.u.str, la); memcpy(acc + la, sb.u.str, lb); acc[la + lb] = '\\0';\n" +
+"        PbVal r; r.tag = PB_T_STR; r.u.str = acc; return r;\n" +
+"    }\n" +
+"    return pb_num(a.u.num + b.u.num);\n" +
+"}\n" +
+"static PbVal pb_arr_new(int cap) {\n" +
+"    PbArr *a = (PbArr *)malloc(sizeof(PbArr));\n" +
+"    a->len = 0; a->cap = cap > 4 ? cap : 4;\n" +
+"    a->items = (PbVal *)malloc(sizeof(PbVal) * (size_t)a->cap);\n" +
+"    PbVal v; v.tag = PB_T_ARR; v.u.arr = a; return v;\n" +
+"}\n" +
+"static PbVal pb_arr_push(PbVal av, PbVal item) {\n" +
+"    PbArr *a = av.u.arr;\n" +
+"    if (a->len >= a->cap) { a->cap *= 2; a->items = (PbVal *)realloc(a->items, sizeof(PbVal) * (size_t)a->cap); }\n" +
+"    a->items[a->len++] = item;\n" +
+"    return pb_nil();\n" +
+"}\n" +
+"static PbVal pb_arr_pop(PbVal av) {\n" +
+"    PbArr *a = av.u.arr;\n" +
+"    if (a->len <= 0) return pb_nil();\n" +
+"    return a->items[--a->len];\n" +
+"}\n" +
+"static PbVal pb_map_new(void) {\n" +
+"    PbMap *m = (PbMap *)malloc(sizeof(PbMap));\n" +
+"    m->len = 0; m->cap = 8;\n" +
+"    m->keys = (const char **)malloc(sizeof(const char *) * (size_t)m->cap);\n" +
+"    m->vals = (PbVal *)malloc(sizeof(PbVal) * (size_t)m->cap);\n" +
+"    PbVal v; v.tag = PB_T_MAP; v.u.mp = m; return v;\n" +
+"}\n" +
+"static PbVal pb_map_set(PbVal mv, const char *key, PbVal val) {\n" +
+"    PbMap *m = mv.u.mp;\n" +
+"    for (int i = 0; i < m->len; i++) {\n" +
+"        if (strcmp(m->keys[i], key) == 0) { m->vals[i] = val; return val; }\n" +
+"    }\n" +
+"    if (m->len >= m->cap) {\n" +
+"        m->cap *= 2;\n" +
+"        m->keys = (const char **)realloc(m->keys, sizeof(const char *) * (size_t)m->cap);\n" +
+"        m->vals = (PbVal *)realloc(m->vals, sizeof(PbVal) * (size_t)m->cap);\n" +
+"    }\n" +
+"    size_t kl = strlen(key); char *kd = (char *)malloc(kl + 1); memcpy(kd, key, kl + 1);\n" +
+"    m->keys[m->len] = kd; m->vals[m->len] = val; m->len++;\n" +
+"    return val;\n" +
+"}\n" +
+"static PbVal pb_map_get(PbVal mv, const char *key) {\n" +
+"    PbMap *m = mv.u.mp;\n" +
+"    for (int i = 0; i < m->len; i++) if (strcmp(m->keys[i], key) == 0) return m->vals[i];\n" +
+"    return pb_nil();\n" +
+"}\n" +
+"static PbVal pb_map_has(PbVal mv, PbVal kv) {\n" +
+"    if (mv.tag != PB_T_MAP || kv.tag != PB_T_STR) return pb_bool(0);\n" +
+"    PbMap *m = mv.u.mp;\n" +
+"    for (int i = 0; i < m->len; i++) if (strcmp(m->keys[i], kv.u.str) == 0) return pb_bool(1);\n" +
+"    return pb_bool(0);\n" +
+"}\n" +
+"static PbVal pb_map_keys(PbVal mv) {\n" +
+"    PbMap *m = mv.u.mp;\n" +
+"    PbVal out = pb_arr_new(m->len);\n" +
+"    for (int i = 0; i < m->len; i++) pb_arr_push(out, pb_str(m->keys[i]));\n" +
+"    return out;\n" +
+"}\n" +
+"static PbVal pb_index_get(PbVal obj, PbVal idx) {\n" +
+"    if (obj.tag == PB_T_ARR) {\n" +
+"        int i = (int)idx.u.num;\n" +
+"        if (i < 0 || i >= obj.u.arr->len) { fprintf(stderr, \"C99 AOT index out of bounds\\n\"); exit(134); }\n" +
+"        return obj.u.arr->items[i];\n" +
+"    }\n" +
+"    if (obj.tag == PB_T_MAP) return pb_map_get(obj, pb_to_str(idx).u.str);\n" +
+"    return pb_nil();\n" +
+"}\n" +
+"static PbVal pb_index_set(PbVal obj, PbVal idx, PbVal val) {\n" +
+"    if (obj.tag == PB_T_ARR) {\n" +
+"        int i = (int)idx.u.num;\n" +
+"        if (i < 0 || i >= obj.u.arr->len) { fprintf(stderr, \"C99 AOT index out of bounds\\n\"); exit(134); }\n" +
+"        obj.u.arr->items[i] = val; return val;\n" +
+"    }\n" +
+"    if (obj.tag == PB_T_MAP) return pb_map_set(obj, pb_to_str(idx).u.str, val);\n" +
+"    return val;\n" +
+"}\n" +
+"static PbVal pb_len(PbVal v) {\n" +
+"    if (v.tag == PB_T_STR) return pb_num((double)strlen(v.u.str));\n" +
+"    if (v.tag == PB_T_ARR) return pb_num((double)v.u.arr->len);\n" +
+"    if (v.tag == PB_T_MAP) return pb_num((double)v.u.mp->len);\n" +
+"    return pb_num(0.0);\n" +
+"}\n" +
+"static PbVal pb_str_slice(PbVal sv, PbVal a, PbVal b) {\n" +
+"    const char *s = pb_to_str(sv).u.str;\n" +
+"    int n = (int)strlen(s), lo = (int)a.u.num, hi = (int)b.u.num;\n" +
+"    if (lo < 0) lo = 0; if (hi > n) hi = n; if (hi < lo) hi = lo;\n" +
+"    size_t sl = (size_t)(hi - lo);\n" +
+"    char *out = (char *)malloc(sl + 1);\n" +
+"    if (sl > 0) memcpy(out, s + lo, sl);\n" +
+"    out[sl] = '\\0';\n" +
+"    PbVal r; r.tag = PB_T_STR; r.u.str = out; return r;\n" +
+"}\n" +
+"static PbVal pb_str_contains(PbVal sv, PbVal sub) {\n" +
+"    return pb_bool(strstr(pb_to_str(sv).u.str, pb_to_str(sub).u.str) != NULL);\n" +
+"}\n" +
+"static PbVal pb_str_case(PbVal sv, int upper) {\n" +
+"    const char *s = pb_to_str(sv).u.str;\n" +
+"    size_t n = strlen(s); char *out = (char *)malloc(n + 1);\n" +
+"    for (size_t i = 0; i < n; i++) {\n" +
+"        unsigned char c = (unsigned char)s[i];\n" +
+"        if (upper && c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);\n" +
+"        else if (!upper && c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);\n" +
+"        out[i] = (char)c;\n" +
+"    }\n" +
+"    out[n] = '\\0'; PbVal r; r.tag = PB_T_STR; r.u.str = out; return r;\n" +
+"}\n" +
+"static PbVal pb_make_closure(PbClosFn fn, PbVal env) {\n" +
+"    PbClos *c = (PbClos *)malloc(sizeof(PbClos));\n" +
+"    c->fn = fn; c->env = env;\n" +
+"    PbVal v; v.tag = PB_T_CLOS; v.u.clos = c; return v;\n" +
+"}\n" +
+"static PbVal pb_call_closure(PbVal cv, int argc, const PbVal *argv) {\n" +
+"    if (cv.tag != PB_T_CLOS) { fprintf(stderr, \"C99 AOT attempted call on non-closure\\n\"); exit(1); }\n" +
+"    return cv.u.clos->fn(cv.u.clos->env, argc, argv);\n" +
+"}\n" +
+"static void pb_print(PbVal v) {\n" +
+"    printf(\"%s\\n\", pb_to_str(v).u.str);\n" +
+"}\n\n";
+}
+
+// Collect free lexical variables referenced inside a closure literal (`fn(params) { ... }`).
+fn _collect_free_vars(node, bound, scope_locals, globals_set, out_list) {
+    if node == nil { return nil; }
+    if is_array(node) {
+        let i = 0;
+        while i < len(node) {
+            _collect_free_vars(node[i], bound, scope_locals, globals_set, out_list);
+            i = i + 1;
+        }
+        return nil;
+    }
+    if not is_map(node) { return nil; }
+    let k = try node.kind catch "";
+    if k == "ident" {
+        let nm = node.name;
+        if not map_has(bound, nm) and map_has(scope_locals, nm) and not _has_str(out_list, nm) {
+            array_push(out_list, nm);
+        }
+        return nil;
+    }
+    if k == "assign" {
+        let anm = node.name;
+        if not map_has(bound, anm) and map_has(scope_locals, anm) and not _has_str(out_list, anm) {
+            array_push(out_list, anm);
+        }
+        _collect_free_vars(node.value, bound, scope_locals, globals_set, out_list);
+        return nil;
+    }
+    if k == "let" or k == "const" {
+        _collect_free_vars(node.value, bound, scope_locals, globals_set, out_list);
+        bound[node.name] = true;
+        return nil;
+    }
+    if k == "fn_lit" {
+        let sub_bound = _clone_locals(bound);
+        let pi = 0;
+        while pi < len(node.params) {
+            sub_bound[_pname(node.params[pi])] = true;
+            pi = pi + 1;
+        }
+        _collect_free_vars(_stmts_of(node.body), sub_bound, scope_locals, globals_set, out_list);
+        return nil;
+    }
+    let ks = map_keys(node);
+    let ki = 0;
+    while ki < len(ks) {
+        let key_nm = ks[ki];
+        if key_nm != "kind" and key_nm != "name" and key_nm != "op" {
+            let child = node[key_nm];
+            if is_map(child) or is_array(child) {
+                _collect_free_vars(child, bound, scope_locals, globals_set, out_list);
+            }
+        }
+        ki = ki + 1;
+    }
+    return nil;
+}
+
+fn _c99_expr(node, c_state, locals, env_map) {
+    if node == nil { return "pb_nil()"; }
+    let k = node.kind;
+    if k == "number" {
+        let s = str(node.value);
+        if not str_contains(s, ".") and not str_contains(s, "e") and not str_contains(s, "E") {
+            s = s + ".0";
+        }
+        return "pb_num(" + s + ")";
+    }
+    if k == "bool" { return "pb_bool(" + (if node.value { "1" } else { "0" }) + ")"; }
+    if k == "nil" { return "pb_nil()"; }
+    if k == "string" { return "pb_str(" + _c_escape_str(node.value) + ")"; }
+    if k == "ident" {
+        let nm = node.name;
+        if map_has(locals, nm) { return _c_ident(nm); }
+        if env_map != nil and map_has(env_map, nm) {
+            return "__env.u.arr->items[" + str(env_map[nm]) + "]";
+        }
+        if map_has(c_state.globals, nm) { return "pbg_" + nm; }
+        if map_has(c_state.fn_wrappers, nm) {
+            return "pb_make_closure(" + c_state.fn_wrappers[nm] + ", pb_nil())";
+        }
+        return _c_ident(nm);
+    }
+    if k == "group" or k == "paren" {
+        return "(" + _c99_expr(node.expr, c_state, locals, env_map) + ")";
+    }
+    if k == "unary" {
+        let opd = try node.operand catch nil;
+        if opd == nil { opd = node.expr; }
+        let sub = _c99_expr(opd, c_state, locals, env_map);
+        if node.op == "-" { return "pb_num(-(" + sub + ").u.num)"; }
+        if node.op == "not" or node.op == "!" { return "pb_bool(!pb_truthy(" + sub + "))"; }
+    }
+    if k == "binary" {
+        let op = node.op;
+        let l = _c99_expr(node.left, c_state, locals, env_map);
+        let r = _c99_expr(node.right, c_state, locals, env_map);
+        if op == "+" { return "pb_add(" + l + ", " + r + ")"; }
+        if op == "-" { return "pb_num((" + l + ").u.num - (" + r + ").u.num)"; }
+        if op == "*" { return "pb_num((" + l + ").u.num * (" + r + ").u.num)"; }
+        if op == "/" { return "pb_num((" + l + ").u.num / (" + r + ").u.num)"; }
+        if op == "%" { return "pb_num(fmod((" + l + ").u.num, (" + r + ").u.num))"; }
+        if op == "==" { return "pb_bool(pb_eq(" + l + ", " + r + "))"; }
+        if op == "!=" { return "pb_bool(!pb_eq(" + l + ", " + r + "))"; }
+        if op == "<"  { return "pb_bool((" + l + ").u.num < (" + r + ").u.num)"; }
+        if op == ">"  { return "pb_bool((" + l + ").u.num > (" + r + ").u.num)"; }
+        if op == "<=" { return "pb_bool((" + l + ").u.num <= (" + r + ").u.num)"; }
+        if op == ">=" { return "pb_bool((" + l + ").u.num >= (" + r + ").u.num)"; }
+        if op == "and" or op == "&&" { return "pb_bool(pb_truthy(" + l + ") && pb_truthy(" + r + "))"; }
+        if op == "or" or op == "||"  { return "pb_bool(pb_truthy(" + l + ") || pb_truthy(" + r + "))"; }
+    }
+    if k == "if_expr" {
+        return "(pb_truthy(" + _c99_expr(node.cond, c_state, locals, env_map) + ") ? " +
+               _c99_expr_or_block(node.then, c_state, locals, env_map) + " : " +
+               _c99_expr_or_block(node.else, c_state, locals, env_map) + ")";
+    }
+    if k == "member" {
+        return "pb_map_get(" + _c99_expr(node.obj, c_state, locals, env_map) + ", " + _c_escape_str(node.name) + ")";
+    }
+    if k == "index" {
+        return "pb_index_get(" + _c99_expr(node.obj, c_state, locals, env_map) + ", " + _c99_expr(node.index, c_state, locals, env_map) + ")";
+    }
+    if k == "assign" {
+        let rhs = _c99_expr(node.value, c_state, locals, env_map);
+        if map_has(locals, node.name) { return "(" + _c_ident(node.name) + " = " + rhs + ")"; }
+        if env_map != nil and map_has(env_map, node.name) {
+            return "(__env.u.arr->items[" + str(env_map[node.name]) + "] = " + rhs + ")";
+        }
+        return "(pbg_" + node.name + " = " + rhs + ")";
+    }
+    if k == "assign_to" {
+        let tgt = node.target;
+        let val_e = _c99_expr(node.value, c_state, locals, env_map);
+        if tgt.kind == "member" {
+            return "pb_map_set(" + _c99_expr(tgt.obj, c_state, locals, env_map) + ", " + _c_escape_str(tgt.name) + ", " + val_e + ")";
+        }
+        if tgt.kind == "index" {
+            return "pb_index_set(" + _c99_expr(tgt.obj, c_state, locals, env_map) + ", " + _c99_expr(tgt.index, c_state, locals, env_map) + ", " + val_e + ")";
+        }
+    }
+    if k == "array" {
+        let tmp_id = c_state.tmp_counter;
+        c_state.tmp_counter = tmp_id + 1;
+        let helper_nm = "__pb_arr_lit_" + str(tmp_id);
+        // Emit via inline helper function for strict ISO C99 compliance (no GNU statement-exprs!)
+        let hlines = [];
+        let pnames = [];
+        let cargs = [];
+        let i = 0;
+        while i < len(node.items) {
+            array_push(pnames, "PbVal e" + str(i));
+            array_push(cargs, _c99_expr(node.items[i], c_state, locals, env_map));
+            i = i + 1;
+        }
+        let sig_params = if len(pnames) == 0 { "void" } else { str_join(pnames, ", ") };
+        array_push(hlines, "static PbVal " + helper_nm + "(" + sig_params + ") {");
+        array_push(hlines, "    PbVal a = pb_arr_new(" + str(len(node.items) + 1) + ");");
+        i = 0;
+        while i < len(node.items) {
+            array_push(hlines, "    pb_arr_push(a, e" + str(i) + ");");
+            i = i + 1;
+        }
+        array_push(hlines, "    return a;\n}");
+        array_push(c_state.lifted_defs, str_join(hlines, "\n"));
+        return helper_nm + "(" + str_join(cargs, ", ") + ")";
+    }
+    if k == "map" {
+        let tmp_id2 = c_state.tmp_counter;
+        c_state.tmp_counter = tmp_id2 + 1;
+        let helper_nm2 = "__pb_map_lit_" + str(tmp_id2);
+        let hlines2 = [];
+        let pnames2 = [];
+        let cargs2 = [];
+        let j = 0;
+        while j < len(node.entries) {
+            array_push(pnames2, "PbVal v" + str(j));
+            array_push(cargs2, _c99_expr(node.entries[j].value, c_state, locals, env_map));
+            j = j + 1;
+        }
+        let sig_params2 = if len(pnames2) == 0 { "void" } else { str_join(pnames2, ", ") };
+        array_push(hlines2, "static PbVal " + helper_nm2 + "(" + sig_params2 + ") {");
+        array_push(hlines2, "    PbVal m = pb_map_new();");
+        j = 0;
+        while j < len(node.entries) {
+            array_push(hlines2, "    pb_map_set(m, " + _c_escape_str(node.entries[j].key) + ", v" + str(j) + ");");
+            j = j + 1;
+        }
+        array_push(hlines2, "    return m;\n}");
+        array_push(c_state.lifted_defs, str_join(hlines2, "\n"));
+        return helper_nm2 + "(" + str_join(cargs2, ", ") + ")";
+    }
+    if k == "fn_lit" {
+        let clos_id = c_state.closure_counter;
+        c_state.closure_counter = clos_id + 1;
+        let clos_fn_name = "__pb_clos_" + str(clos_id);
+
+        let bound = map{};
+        let pi = 0;
+        while pi < len(node.params) {
+            bound[_pname(node.params[pi])] = true;
+            pi = pi + 1;
+        }
+        let outer_scope = _clone_locals(locals);
+        if env_map != nil {
+            let eks = map_keys(env_map);
+            let ei = 0;
+            while ei < len(eks) { outer_scope[eks[ei]] = true; ei = ei + 1; }
+        }
+        let free_vars = [];
+        _collect_free_vars(_stmts_of(node.body), bound, outer_scope, c_state.globals, free_vars);
+
+        let child_env = map{};
+        let fi = 0;
+        while fi < len(free_vars) {
+            child_env[free_vars[fi]] = fi;
+            fi = fi + 1;
+        }
+        let child_locals = map{};
+        let clines = [];
+        array_push(clines, "static PbVal " + clos_fn_name + "(PbVal __env, int __argc, const PbVal *__argv) {");
+        array_push(clines, "    (void)__env; (void)__argc; (void)__argv;");
+        pi = 0;
+        while pi < len(node.params) {
+            let pnm = _pname(node.params[pi]);
+            child_locals[pnm] = true;
+            array_push(clines, "    PbVal " + _c_ident(pnm) + " = (" + str(pi) + " < __argc) ? __argv[" + str(pi) + "] : pb_nil();");
+            pi = pi + 1;
+        }
+        let body_c = _c99_stmts(_stmts_of(node.body), c_state, child_locals, child_env, "    ", false);
+        array_push(clines, body_c + "    return pb_nil();\n}");
+        array_push(c_state.lifted_defs, str_join(clines, "\n"));
+
+        if len(free_vars) == 0 {
+            return "pb_make_closure(" + clos_fn_name + ", pb_nil())";
+        }
+        let env_helper = "__pb_clos_env_" + str(clos_id);
+        let eh_params = [];
+        let eh_args = [];
+        fi = 0;
+        while fi < len(free_vars) {
+            array_push(eh_params, "PbVal c" + str(fi));
+            array_push(eh_args, _c99_expr(map{ kind: "ident", name: free_vars[fi] }, c_state, locals, env_map));
+            fi = fi + 1;
+        }
+        let eh_lines = [];
+        array_push(eh_lines, "static PbVal " + env_helper + "(" + str_join(eh_params, ", ") + ") {");
+        array_push(eh_lines, "    PbVal env = pb_arr_new(" + str(len(free_vars)) + ");");
+        fi = 0;
+        while fi < len(free_vars) {
+            array_push(eh_lines, "    pb_arr_push(env, c" + str(fi) + ");");
+            fi = fi + 1;
+        }
+        array_push(eh_lines, "    return pb_make_closure(" + clos_fn_name + ", env);\n}");
+        array_push(c_state.lifted_defs, str_join(eh_lines, "\n"));
+        return env_helper + "(" + str_join(eh_args, ", ") + ")";
+    }
+    if k == "call" {
+        let args = node.args;
+        let cargs = [];
+        let ai = 0;
+        while ai < len(args) {
+            array_push(cargs, _c99_expr(args[ai], c_state, locals, env_map));
+            ai = ai + 1;
+        }
+        let fname = if node.func.kind == "ident" { node.func.name } else { "" };
+        if fname != "" and not map_has(locals, fname) and (env_map == nil or not map_has(env_map, fname)) {
+            if fname == "len" and len(cargs) == 1 { return "pb_len(" + cargs[0] + ")"; }
+            if fname == "str" and len(cargs) == 1 { return "pb_to_str(" + cargs[0] + ")"; }
+            if fname == "type" and len(cargs) == 1 { return "pb_type(" + cargs[0] + ")"; }
+            if fname == "str_slice" and len(cargs) == 3 { return "pb_str_slice(" + cargs[0] + ", " + cargs[1] + ", " + cargs[2] + ")"; }
+            if fname == "str_contains" and len(cargs) == 2 { return "pb_str_contains(" + cargs[0] + ", " + cargs[1] + ")"; }
+            if fname == "str_upper" and len(cargs) == 1 { return "pb_str_case(" + cargs[0] + ", 1)"; }
+            if fname == "str_lower" and len(cargs) == 1 { return "pb_str_case(" + cargs[0] + ", 0)"; }
+            if (fname == "push" or fname == "array_push") and len(cargs) == 2 { return "pb_arr_push(" + cargs[0] + ", " + cargs[1] + ")"; }
+            if (fname == "pop" or fname == "array_pop") and len(cargs) == 1 { return "pb_arr_pop(" + cargs[0] + ")"; }
+            if fname == "map_has" and len(cargs) == 2 { return "pb_map_has(" + cargs[0] + ", " + cargs[1] + ")"; }
+            if fname == "map_keys" and len(cargs) == 1 { return "pb_map_keys(" + cargs[0] + ")"; }
+            if fname == "num_sqrt" and len(cargs) == 1 { return "pb_num(sqrt((" + cargs[0] + ").u.num))"; }
+            if fname == "num_floor" and len(cargs) == 1 { return "pb_num(floor((" + cargs[0] + ").u.num))"; }
+            if fname == "num_ceil" and len(cargs) == 1 { return "pb_num(ceil((" + cargs[0] + ").u.num))"; }
+            if fname == "num_abs" and len(cargs) == 1 { return "pb_num(fabs((" + cargs[0] + ").u.num))"; }
+            if fname == "num_ln" and len(cargs) == 1 { return "pb_num(log((" + cargs[0] + ").u.num))"; }
+            if fname == "num_exp" and len(cargs) == 1 { return "pb_num(exp((" + cargs[0] + ").u.num))"; }
+            if fname == "num_pow" and len(cargs) == 2 { return "pb_num(pow((" + cargs[0] + ").u.num, (" + cargs[1] + ").u.num))"; }
+            if fname == "num_min" and len(cargs) == 2 { return "pb_num(fmin((" + cargs[0] + ").u.num, (" + cargs[1] + ").u.num))"; }
+            if fname == "num_max" and len(cargs) == 2 { return "pb_num(fmax((" + cargs[0] + ").u.num, (" + cargs[1] + ").u.num))"; }
+            if fname == "bit_and" and len(cargs) == 2 { return "pb_num((double)(((int64_t)(" + cargs[0] + ").u.num) & ((int64_t)(" + cargs[1] + ").u.num)))"; }
+            if fname == "bit_or" and len(cargs) == 2 { return "pb_num((double)(((int64_t)(" + cargs[0] + ").u.num) | ((int64_t)(" + cargs[1] + ").u.num)))"; }
+            if fname == "bit_xor" and len(cargs) == 2 { return "pb_num((double)(((int64_t)(" + cargs[0] + ").u.num) ^ ((int64_t)(" + cargs[1] + ").u.num)))"; }
+            if fname == "bit_shl" and len(cargs) == 2 { return "pb_num((double)(((int64_t)(" + cargs[0] + ").u.num) << ((int)(" + cargs[1] + ").u.num)))"; }
+            if fname == "bit_shr" and len(cargs) == 2 { return "pb_num((double)(((int64_t)(" + cargs[0] + ").u.num) >> ((int)(" + cargs[1] + ").u.num)))"; }
+            if fname == "assert" and len(cargs) >= 1 {
+                return "(pb_truthy(" + cargs[0] + ") ? pb_bool(1) : (exit(2), pb_nil()))";
+            }
+            if map_has(c_state.known_fns, fname) {
+                return "pbfn_" + fname + "(" + str_join(cargs, ", ") + ")";
+            }
+        }
+        // Dynamic / closure call
+        let callee_e = _c99_expr(node.func, c_state, locals, env_map);
+        if len(cargs) == 0 {
+            return "pb_call_closure(" + callee_e + ", 0, NULL)";
+        }
+        return "pb_call_closure(" + callee_e + ", " + str(len(cargs)) + ", (const PbVal[]){" + str_join(cargs, ", ") + "})";
+    }
+    return "pb_nil()";
+}
+
+fn _c99_expr_or_block(node, c_state, locals, env_map) {
+    if node != nil and node.kind == "block" {
+        let st = _stmts_of(node);
+        if len(st) > 0 and st[len(st) - 1].kind == "expr_stmt" {
+            return _c99_expr(st[len(st) - 1].expr, c_state, locals, env_map);
+        }
+    }
+    return _c99_expr(node, c_state, locals, env_map);
+}
+
+fn _c99_stmts(stmts, c_state, locals, env_map, indent, is_top) {
+    let lines = [];
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        let k = s.kind;
+        if k == "fn" and is_top {
+            // Emitted separately at file scope
+        } elif k == "let" or k == "const" {
+            let rhs = if s.value != nil { _c99_expr(s.value, c_state, locals, env_map) } else { "pb_nil()" };
+            if is_top {
+                array_push(lines, indent + "pbg_" + s.name + " = " + rhs + ";");
+            } else {
+                locals[s.name] = true;
+                array_push(lines, indent + "PbVal " + _c_ident(s.name) + " = " + rhs + ";");
+            }
+        } elif k == "assign" {
+            let rhs2 = _c99_expr(s.value, c_state, locals, env_map);
+            if map_has(locals, s.name) {
+                array_push(lines, indent + _c_ident(s.name) + " = " + rhs2 + ";");
+            } elif env_map != nil and map_has(env_map, s.name) {
+                array_push(lines, indent + "__env.u.arr->items[" + str(env_map[s.name]) + "] = " + rhs2 + ";");
+            } else {
+                array_push(lines, indent + "pbg_" + s.name + " = " + rhs2 + ";");
+            }
+        } elif k == "print" {
+            array_push(lines, indent + "pb_print(" + _c99_expr(s.value, c_state, locals, env_map) + ");");
+        } elif k == "return" {
+            if is_top {
+                array_push(lines, indent + "return 0;");
+            } else {
+                let rv = if s.value != nil { _c99_expr(s.value, c_state, locals, env_map) } else { "pb_nil()" };
+                array_push(lines, indent + "return " + rv + ";");
+            }
+        } elif k == "break" {
+            array_push(lines, indent + "break;");
+        } elif k == "continue" {
+            array_push(lines, indent + "continue;");
+        } elif k == "expr_stmt" {
+            array_push(lines, indent + "(void)" + _c99_expr(s.expr, c_state, locals, env_map) + ";");
+        } elif k == "if" {
+            let sub_l = _clone_locals(locals);
+            let out_if = indent + "if (pb_truthy(" + _c99_expr(s.cond, c_state, locals, env_map) + ")) {\n" +
+                         _c99_stmts(_stmts_of(s.then), c_state, sub_l, env_map, indent + "    ", false) + indent + "}";
+            let elifs = try s.elifs catch nil;
+            if elifs != nil {
+                let ei = 0;
+                while ei < len(elifs) {
+                    let sub_el = _clone_locals(locals);
+                    out_if = out_if + " else if (pb_truthy(" + _c99_expr(elifs[ei].cond, c_state, locals, env_map) + ")) {\n" +
+                             _c99_stmts(_stmts_of(elifs[ei].body), c_state, sub_el, env_map, indent + "    ", false) + indent + "}";
+                    ei = ei + 1;
+                }
+            }
+            let el = try s.else catch nil;
+            if el != nil {
+                let sub_e2 = _clone_locals(locals);
+                out_if = out_if + " else {\n" +
+                         _c99_stmts(_stmts_of(el), c_state, sub_e2, env_map, indent + "    ", false) + indent + "}";
+            }
+            array_push(lines, out_if);
+        } elif k == "while" {
+            let sub_w = _clone_locals(locals);
+            array_push(lines, indent + "while (pb_truthy(" + _c99_expr(s.cond, c_state, locals, env_map) + ")) {\n" +
+                              _c99_stmts(_stmts_of(s.body), c_state, sub_w, env_map, indent + "    ", false) + indent + "}");
+        } elif k == "for_in" {
+            let lid = c_state.tmp_counter;
+            c_state.tmp_counter = lid + 1;
+            let iter_var = "__pb_it_" + str(lid);
+            let idx_var = "__pb_i_" + str(lid);
+            let sub_fi = _clone_locals(locals);
+            sub_fi[s.name] = true;
+            array_push(lines, indent + "{\n" +
+                              indent + "    PbVal " + iter_var + " = " + _c99_expr(s.iter, c_state, locals, env_map) + ";\n" +
+                              indent + "    for (int " + idx_var + " = 0; " + idx_var + " < " + iter_var + ".u.arr->len; " + idx_var + "++) {\n" +
+                              indent + "        PbVal " + _c_ident(s.name) + " = " + iter_var + ".u.arr->items[" + idx_var + "];\n" +
+                              _c99_stmts(_stmts_of(s.body), c_state, sub_fi, env_map, indent + "        ", false) +
+                              indent + "    }\n" + indent + "}");
+        } elif k == "for_range" or k == "for" {
+            let lid2 = c_state.tmp_counter;
+            c_state.tmp_counter = lid2 + 1;
+            let end_v = "__pb_end_" + str(lid2);
+            let start_c = if k == "for_range" { _c99_expr(s.start, c_state, locals, env_map) } else { "pb_num(0.0)" };
+            let cmp_op = if k == "for_range" { "<=" } else { "<" };
+            let sub_fr = _clone_locals(locals);
+            sub_fr[s.name] = true;
+            array_push(lines, indent + "{\n" +
+                              indent + "    PbVal " + _c_ident(s.name) + " = " + start_c + ";\n" +
+                              indent + "    double " + end_v + " = (" + _c99_expr(s.end, c_state, locals, env_map) + ").u.num;\n" +
+                              indent + "    while (" + _c_ident(s.name) + ".u.num " + cmp_op + " " + end_v + ") {\n" +
+                              _c99_stmts(_stmts_of(s.body), c_state, sub_fr, env_map, indent + "        ", false) +
+                              indent + "        " + _c_ident(s.name) + ".u.num += 1.0;\n" +
+                              indent + "    }\n" + indent + "}");
+        }
+        i = i + 1;
+    }
+    if len(lines) == 0 { return ""; }
+    return str_join(lines, "\n") + "\n";
+}
+
+fn transpile_dag_to_c99(entry_or_dag, options = nil) {
+    let bundled = bundle_multi_module_sapp(entry_or_dag, options);
+    if not is_map(bundled) or not (try bundled.ok catch false) {
+        return bundled;
+    }
+    let ast = _SOURCE.parse_local_source(bundled.source);
+
+    let c_state = map{
+        globals: map{},
+        known_fns: map{},
+        fn_wrappers: map{},
+        lifted_defs: [],
+        closure_counter: 0,
+        tmp_counter: 0
+    };
+
+    let top_fns = [];
+    let has_user_main = false;
+    let has_top_exec = false;
+    let i = 0;
+    while i < len(ast.stmts) {
+        let s = ast.stmts[i];
+        if s.kind == "fn" {
+            c_state.known_fns[s.name] = len(s.params);
+            c_state.fn_wrappers[s.name] = "__pb_wrap_" + s.name;
+            if s.name == "main" and len(s.params) == 0 { has_user_main = true; }
+            array_push(top_fns, s);
+        } elif s.kind == "let" or s.kind == "const" {
+            c_state.globals[s.name] = true;
+            has_top_exec = true;
+        } else {
+            has_top_exec = true;
+        }
+        i = i + 1;
+    }
+
+    let globals_decl = [];
+    let gkeys = map_keys(c_state.globals);
+    let gi = 0;
+    while gi < len(gkeys) {
+        array_push(globals_decl, "static PbVal pbg_" + gkeys[gi] + ";");
+        gi = gi + 1;
+    }
+
+    let protos = [];
+    let fi = 0;
+    while fi < len(top_fns) {
+        let fn_node = top_fns[fi];
+        let pdecls = [];
+        let pi = 0;
+        while pi < len(fn_node.params) {
+            array_push(pdecls, "PbVal " + _c_ident(_pname(fn_node.params[pi])));
+            pi = pi + 1;
+        }
+        let sig_p = if len(pdecls) == 0 { "void" } else { str_join(pdecls, ", ") };
+        array_push(protos, "static PbVal pbfn_" + fn_node.name + "(" + sig_p + ");");
+        array_push(protos, "static PbVal __pb_wrap_" + fn_node.name + "(PbVal __env, int __argc, const PbVal *__argv) { (void)__env;");
+        let wargs = [];
+        pi = 0;
+        while pi < len(fn_node.params) {
+            array_push(wargs, "(" + str(pi) + " < __argc) ? __argv[" + str(pi) + "] : pb_nil()");
+            pi = pi + 1;
+        }
+        array_push(protos, "    return pbfn_" + fn_node.name + "(" + str_join(wargs, ", ") + ");\n}");
+        fi = fi + 1;
+    }
+
+    let fn_defs = [];
+    fi = 0;
+    while fi < len(top_fns) {
+        let fn_node2 = top_fns[fi];
+        let fn_locals = map{};
+        let pdecls2 = [];
+        let pi2 = 0;
+        while pi2 < len(fn_node2.params) {
+            let pnm = _pname(fn_node2.params[pi2]);
+            fn_locals[pnm] = true;
+            array_push(pdecls2, "PbVal " + _c_ident(pnm));
+            pi2 = pi2 + 1;
+        }
+        let sig_p2 = if len(pdecls2) == 0 { "void" } else { str_join(pdecls2, ", ") };
+        let fbody = _c99_stmts(_stmts_of(fn_node2.body), c_state, fn_locals, nil, "    ", false);
+        array_push(fn_defs, "static PbVal pbfn_" + fn_node2.name + "(" + sig_p2 + ") {\n" + fbody + "    return pb_nil();\n}");
+        fi = fi + 1;
+    }
+
+    let main_body = _c99_stmts(ast.stmts, c_state, map{}, nil, "    ", true);
+    let call_user_main = "";
+    if has_user_main and not has_top_exec {
+        call_user_main = "    (void)pbfn_main();\n";
+    }
+
+    let c_src = _c99_runtime_header() +
+                str_join(globals_decl, "\n") + "\n\n" +
+                str_join(protos, "\n") + "\n\n" +
+                str_join(c_state.lifted_defs, "\n\n") + "\n\n" +
+                str_join(fn_defs, "\n\n") + "\n\n" +
+                "int main(int argc, char **argv) {\n    (void)argc; (void)argv;\n" +
+                main_body + call_user_main +
+                "    return 0;\n}\n";
+
+    return map{
+        ok: true,
+        entry_path: bundled.entry_path,
+        module_count: bundled.module_count,
+        topological_order: bundled.topological_order,
+        fn_count: len(top_fns),
+        closure_count: c_state.closure_counter,
+        bundled_sapp: bundled.source,
+        c_source: c_src
+    };
+}
+
+// 4. End-to-End Multi-Module Native AOT Builder (elf64 | pe64 | c99)
+fn compile_multi_module_aot(entry_or_dag, target = "elf64", options = nil) {
+    let tgt = str_lower(str_trim(target));
+    if tgt == "c99" or tgt == "c" {
+        return transpile_dag_to_c99(entry_or_dag, options);
+    }
+    let bundled = bundle_multi_module_sapp(entry_or_dag, options);
+    if not is_map(bundled) or not (try bundled.ok catch false) {
+        return bundled;
+    }
+    if tgt == "elf64" or tgt == "linux-x64" or tgt == "x86_64" {
+        let x64 = _get_x64();
+        let compiled = x64.compile_safe(bundled.source);
+        return map{
+            ok: true,
+            target: "elf64",
+            module_count: bundled.module_count,
+            bundled_sapp: bundled.source,
+            binary: compiled.binary,
+            byte_length: len(compiled.binary)
+        };
+    }
+    if tgt == "pe64" or tgt == "windows-x64" or tgt == "pe32+" {
+        let pe = _get_pe64();
+        let pe_bytes = pe.compile_pe64(bundled.source);
+        return map{
+            ok: true,
+            target: "pe64",
+            module_count: bundled.module_count,
+            bundled_sapp: bundled.source,
+            binary: pe_bytes,
+            byte_length: len(pe_bytes)
+        };
+    }
+    return map{ ok: false, error: "unsupported AOT target: " + target };
+}
+
+export resolve_import_dag, bundle_multi_module_sapp, transpile_dag_to_c99, compile_multi_module_aot;

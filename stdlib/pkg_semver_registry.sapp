@@ -1,0 +1,1002 @@
+// stdlib/pkg_semver_registry.sapp -- Sovereign SemVer 2.0.0 Parser, Backtracking Conflict-Driven
+// Dependency Solver & Ed25519 + SHA-256 Cryptographically Signed Package Manifest Registry.
+
+let _SHA256 = import("stdlib:sha256_pb.sapp");
+let _SHA512 = import("stdlib:sha512_pb.sapp");
+let _ED25519_VERIFY = import("stdlib:ed25519_verify.sapp");
+
+let MANIFEST_SCHEMA = "pblang.pkg.signed-manifest.v3";
+let _HEX = "0123456789abcdef";
+
+// RFC 8032 Curve25519 / Ed25519 domain parameters (matching stdlib:ed25519_verify.sapp)
+let _ZERO = bigint(0);
+let _ONE = bigint(1);
+let _TWO = bigint(2);
+let _P = bigint("57896044618658097711785492504343953926634992332820282019728792003956564819949");
+let _L = bigint("7237005577332262213973186563042994240857116359379907606001950938285454250989");
+let _D = bigint("37095705934669439343138083508754565189542113879843219016388785533085940283555");
+let _BASE_X = bigint("15112221349535400772501151409588531511454012693041857206046113283949847762202");
+let _BASE_Y = bigint("46316835694926478169428394003475163141307993866256225615783033603165251855960");
+
+fn _fail(msg) {
+    throw "pkg_semver_registry: " + msg;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 1: Full SemVer 2.0.0 Parser, Precedence Comparator & Range Matcher
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _is_digits(s) {
+    if type(s) != "string" or len(s) == 0 { return false; }
+    let i = 0;
+    while i < len(s) {
+        let c = strcharcodeat(s, i);
+        if c < 48 or c > 57 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _is_semver_ident(s) {
+    if type(s) != "string" or len(s) == 0 { return false; }
+    let i = 0;
+    while i < len(s) {
+        let c = strcharcodeat(s, i);
+        let ok = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 45;
+        if not ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _parse_nonneg_no_leading_zero(s) {
+    if not _is_digits(s) { return -1; }
+    if len(s) > 1 and str_starts_with(s, "0") { return -1; }
+    return num_floor(parse_number(s));
+}
+
+// Strict SemVer 2.0.0 parser: MAJOR.MINOR.PATCH[-prerelease][+build]
+fn parse_semver(ver_str) {
+    if is_map(ver_str) and (try ver_str.ok catch false) == true and map_has(ver_str, "major") {
+        return ver_str;
+    }
+    if type(ver_str) != "string" {
+        return map{ ok: false, error: "version must be string" };
+    }
+    let clean = str_trim(ver_str);
+    if clean == "" {
+        return map{ ok: false, error: "empty version string" };
+    }
+
+    let build = [];
+    let plus_pos = str_index_of(clean, "+");
+    if plus_pos >= 0 {
+        let build_raw = str_slice(clean, plus_pos + 1, len(clean));
+        clean = str_slice(clean, 0, plus_pos);
+        if build_raw == "" { return map{ ok: false, error: "empty build metadata after '+'" }; }
+        let bparts = str_split(build_raw, ".");
+        let bi = 0;
+        while bi < len(bparts) {
+            if not _is_semver_ident(bparts[bi]) {
+                return map{ ok: false, error: "invalid build identifier: " + bparts[bi] };
+            }
+            array_push(build, bparts[bi]);
+            bi = bi + 1;
+        }
+    }
+
+    let prerelease = [];
+    let dash_pos = str_index_of(clean, "-");
+    if dash_pos >= 0 {
+        let pre_raw = str_slice(clean, dash_pos + 1, len(clean));
+        clean = str_slice(clean, 0, dash_pos);
+        if pre_raw == "" { return map{ ok: false, error: "empty prerelease after '-'" }; }
+        let pparts = str_split(pre_raw, ".");
+        let pi = 0;
+        while pi < len(pparts) {
+            let pid = pparts[pi];
+            if not _is_semver_ident(pid) {
+                return map{ ok: false, error: "invalid prerelease identifier: " + pid };
+            }
+            if _is_digits(pid) and len(pid) > 1 and str_starts_with(pid, "0") {
+                return map{ ok: false, error: "numeric prerelease identifier cannot have leading zero: " + pid };
+            }
+            array_push(prerelease, pid);
+            pi = pi + 1;
+        }
+    }
+
+    let core = str_split(clean, ".");
+    if len(core) != 3 {
+        return map{ ok: false, error: "SemVer core must have exactly 3 numeric components: " + ver_str };
+    }
+    let maj = _parse_nonneg_no_leading_zero(core[0]);
+    let min_v = _parse_nonneg_no_leading_zero(core[1]);
+    let pat = _parse_nonneg_no_leading_zero(core[2]);
+    if maj < 0 or min_v < 0 or pat < 0 {
+        return map{ ok: false, error: "invalid numeric component in SemVer: " + ver_str };
+    }
+
+    let canon = str(maj) + "." + str(min_v) + "." + str(pat);
+    if len(prerelease) > 0 { canon = canon + "-" + str_join(prerelease, "."); }
+    if len(build) > 0 { canon = canon + "+" + str_join(build, "."); }
+
+    return map{
+        ok: true,
+        major: maj,
+        minor: min_v,
+        patch: pat,
+        prerelease: prerelease,
+        build: build,
+        canonical: canon
+    };
+}
+
+fn _ascii_cmp(a, b) {
+    let n = num_min(len(a), len(b));
+    let i = 0;
+    while i < n {
+        let ca = strcharcodeat(a, i);
+        let cb = strcharcodeat(b, i);
+        if ca < cb { return -1; }
+        if ca > cb { return 1; }
+        i = i + 1;
+    }
+    if len(a) < len(b) { return -1; }
+    if len(a) > len(b) { return 1; }
+    return 0;
+}
+
+// SemVer 2.0.0 §11 precedence comparison: returns -1, 0, or 1.
+fn semver_cmp(ver_a, ver_b) {
+    let a = parse_semver(ver_a);
+    let b = parse_semver(ver_b);
+    if not a.ok { _fail("semver_cmp invalid left version: " + a.error); }
+    if not b.ok { _fail("semver_cmp invalid right version: " + b.error); }
+
+    if a.major != b.major { return if a.major < b.major { -1 } else { 1 }; }
+    if a.minor != b.minor { return if a.minor < b.minor { -1 } else { 1 }; }
+    if a.patch != b.patch { return if a.patch < b.patch { -1 } else { 1 }; }
+
+    let pa = a.prerelease;
+    let pb = b.prerelease;
+    if len(pa) == 0 and len(pb) == 0 { return 0; }
+    if len(pa) == 0 and len(pb) > 0 { return 1; }   // normal > prerelease
+    if len(pa) > 0 and len(pb) == 0 { return -1; }
+
+    let n = num_min(len(pa), len(pb));
+    let i = 0;
+    while i < n {
+        let ia = pa[i];
+        let ib = pb[i];
+        let na = _is_digits(ia);
+        let nb = _is_digits(ib);
+        if na and nb {
+            let va = parse_number(ia);
+            let vb = parse_number(ib);
+            if va < vb { return -1; }
+            if va > vb { return 1; }
+        } elif na and not nb {
+            return -1; // numeric identifier has lower precedence than non-numeric
+        } elif not na and nb {
+            return 1;
+        } else {
+            let sc = _ascii_cmp(ia, ib);
+            if sc != 0 { return sc; }
+        }
+        i = i + 1;
+    }
+    if len(pa) < len(pb) { return -1; }
+    if len(pa) > len(pb) { return 1; }
+    return 0;
+}
+
+fn _make_ver(maj, min_v, pat) {
+    return map{
+        ok: true, major: maj, minor: min_v, patch: pat,
+        prerelease: [], build: [],
+        canonical: str(maj) + "." + str(min_v) + "." + str(pat)
+    };
+}
+
+fn _match_single_atom(v, atom) {
+    let tok = str_trim(atom);
+    if tok == "" or tok == "*" or tok == "x" or tok == "X" {
+        return true;
+    }
+    // Caret range ^M.m.p (Cargo / npm SemVer semantics)
+    if str_starts_with(tok, "^") {
+        let rest = str_trim(str_slice(tok, 1, len(tok)));
+        let parts = str_split(rest, ".");
+        let base_str = rest;
+        if len(parts) == 2 { base_str = rest + ".0"; }
+        elif len(parts) == 1 { base_str = rest + ".0.0"; }
+        let lo = parse_semver(base_str);
+        if not lo.ok { _fail("invalid caret range: " + tok); }
+        let hi = nil;
+        if lo.major > 0 {
+            hi = _make_ver(lo.major + 1, 0, 0);
+        } elif lo.minor > 0 {
+            hi = _make_ver(0, lo.minor + 1, 0);
+        } else {
+            hi = _make_ver(0, 0, lo.patch + 1);
+        }
+        if len(v.prerelease) > 0 and (v.major != lo.major or v.minor != lo.minor or v.patch != lo.patch or len(lo.prerelease) == 0) {
+            return false;
+        }
+        return semver_cmp(v, lo) >= 0 and semver_cmp(v, hi) < 0;
+    }
+    // Tilde range ~M.m.p or ~M.m
+    if str_starts_with(tok, "~") {
+        let rest2 = str_trim(str_slice(tok, 1, len(tok)));
+        let parts2 = str_split(rest2, ".");
+        if len(parts2) == 1 {
+            let m0 = _parse_nonneg_no_leading_zero(parts2[0]);
+            if m0 < 0 { _fail("invalid tilde range: " + tok); }
+            return len(v.prerelease) == 0 and semver_cmp(v, _make_ver(m0, 0, 0)) >= 0 and semver_cmp(v, _make_ver(m0 + 1, 0, 0)) < 0;
+        }
+        let base2 = if len(parts2) == 2 { rest2 + ".0" } else { rest2 };
+        let lo2 = parse_semver(base2);
+        if not lo2.ok { _fail("invalid tilde range: " + tok); }
+        let hi2 = _make_ver(lo2.major, lo2.minor + 1, 0);
+        if len(v.prerelease) > 0 and len(lo2.prerelease) == 0 { return false; }
+        return semver_cmp(v, lo2) >= 0 and semver_cmp(v, hi2) < 0;
+    }
+    // Comparator prefixes >=, <=, !=, >, <, =
+    if str_starts_with(tok, ">=") {
+        let rhs = parse_semver(str_slice(tok, 2, len(tok)));
+        if not rhs.ok { _fail("invalid >= range: " + tok); }
+        return semver_cmp(v, rhs) >= 0;
+    }
+    if str_starts_with(tok, "<=") {
+        let rhs2 = parse_semver(str_slice(tok, 2, len(tok)));
+        if not rhs2.ok { _fail("invalid <= range: " + tok); }
+        return semver_cmp(v, rhs2) <= 0;
+    }
+    if str_starts_with(tok, "!=") {
+        let rhs3 = parse_semver(str_slice(tok, 2, len(tok)));
+        if not rhs3.ok { _fail("invalid != range: " + tok); }
+        return semver_cmp(v, rhs3) != 0;
+    }
+    if str_starts_with(tok, ">") {
+        let rhs4 = parse_semver(str_slice(tok, 1, len(tok)));
+        if not rhs4.ok { _fail("invalid > range: " + tok); }
+        return semver_cmp(v, rhs4) > 0;
+    }
+    if str_starts_with(tok, "<") {
+        let rhs5 = parse_semver(str_slice(tok, 1, len(tok)));
+        if not rhs5.ok { _fail("invalid < range: " + tok); }
+        return semver_cmp(v, rhs5) < 0;
+    }
+    if str_starts_with(tok, "=") {
+        let rhs6 = parse_semver(str_slice(tok, 1, len(tok)));
+        if not rhs6.ok { _fail("invalid = range: " + tok); }
+        return semver_cmp(v, rhs6) == 0;
+    }
+    // Wildcards 1.x / 1.* / 1.2.x / 1.2.*
+    let wparts = str_split(tok, ".");
+    if len(wparts) == 2 and (wparts[1] == "x" or wparts[1] == "X" or wparts[1] == "*") {
+        let wm = _parse_nonneg_no_leading_zero(wparts[0]);
+        return wm >= 0 and v.major == wm and len(v.prerelease) == 0;
+    }
+    if len(wparts) == 3 and (wparts[2] == "x" or wparts[2] == "X" or wparts[2] == "*") {
+        let wm2 = _parse_nonneg_no_leading_zero(wparts[0]);
+        let wn2 = _parse_nonneg_no_leading_zero(wparts[1]);
+        return wm2 >= 0 and wn2 >= 0 and v.major == wm2 and v.minor == wn2 and len(v.prerelease) == 0;
+    }
+    // Exact version
+    let exact = parse_semver(tok);
+    if not exact.ok { _fail("invalid SemVer range token: " + tok); }
+    return semver_cmp(v, exact) == 0;
+}
+
+fn satisfies_range(version, range_expr) {
+    let v = parse_semver(version);
+    if not v.ok { return false; }
+    if type(range_expr) != "string" { return false; }
+    let trimmed = str_trim(range_expr);
+    if trimmed == "" or trimmed == "*" { return true; }
+
+    // Split OR branches (`||`)
+    let or_branches = str_split(trimmed, "||");
+    let oi = 0;
+    while oi < len(or_branches) {
+        let branch = str_trim(or_branches[oi]);
+        // Normalize hyphen ranges `A - B` -> `>=A <=B`
+        let hy = str_index_of(branch, " - ");
+        if hy > 0 {
+            let left_h = str_trim(str_slice(branch, 0, hy));
+            let right_h = str_trim(str_slice(branch, hy + 3, len(branch)));
+            branch = ">=" + left_h + " <=" + right_h;
+        }
+        // Normalize `,` as space
+        branch = str_replace_all(branch, ",", " ");
+        // Normalize operator spacing like `>= 1.0.0` -> `>=1.0.0`
+        branch = str_replace_all(branch, ">= ", ">=");
+        branch = str_replace_all(branch, "<= ", "<=");
+        branch = str_replace_all(branch, "!= ", "!=");
+        branch = str_replace_all(branch, "> ", ">");
+        branch = str_replace_all(branch, "< ", "<");
+        branch = str_replace_all(branch, "= ", "=");
+        branch = str_replace_all(branch, "^ ", "^");
+        branch = str_replace_all(branch, "~ ", "~");
+
+        let atoms = str_split(branch, " ");
+        let all_ok = true;
+        let ai = 0;
+        while ai < len(atoms) {
+            let at = str_trim(atoms[ai]);
+            if at != "" {
+                if not _match_single_atom(v, at) { all_ok = false; }
+            }
+            ai = ai + 1;
+        }
+        if all_ok { return true; }
+        oi = oi + 1;
+    }
+    return false;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 2: Backtracking Conflict-Driven Dependency Solver
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _sort_versions_desc(ver_list) {
+    let arr = [];
+    let i = 0;
+    while i < len(ver_list) { array_push(arr, ver_list[i]); i = i + 1; }
+    // Insertion sort descending by SemVer 2.0.0 precedence
+    let j = 1;
+    while j < len(arr) {
+        let cur = arr[j];
+        let k = j - 1;
+        while k >= 0 and semver_cmp(arr[k], cur) < 0 {
+            arr[k + 1] = arr[k];
+            k = k - 1;
+        }
+        arr[k + 1] = cur;
+        j = j + 1;
+    }
+    return arr;
+}
+
+fn _normalize_registry(registry_packages) {
+    if not is_map(registry_packages) {
+        _fail("registry_packages must be a map");
+    }
+    let norm = map{};
+    let pkg_names = map_keys(registry_packages);
+    let i = 0;
+    while i < len(pkg_names) {
+        let pkg = pkg_names[i];
+        let entry = registry_packages[pkg];
+        let ver_map = map{};
+        let ver_list = [];
+        if is_map(entry) {
+            let vkeys = map_keys(entry);
+            let vi = 0;
+            while vi < len(vkeys) {
+                let vstr = vkeys[vi];
+                let vval = entry[vstr];
+                let deps = map{};
+                if is_map(vval) and map_has(vval, "dependencies") and is_map(vval.dependencies) {
+                    deps = vval.dependencies;
+                } elif is_map(vval) and map_has(vval, "deps") and is_map(vval.deps) {
+                    deps = vval.deps;
+                } elif is_map(vval) {
+                    deps = vval;
+                }
+                ver_map[vstr] = deps;
+                array_push(ver_list, vstr);
+                vi = vi + 1;
+            }
+        } elif is_array(entry) {
+            let ai = 0;
+            while ai < len(entry) {
+                let rel = entry[ai];
+                let vstr2 = str(rel.version);
+                let deps2 = if map_has(rel, "dependencies") and is_map(rel.dependencies) {
+                    rel.dependencies
+                } elif map_has(rel, "deps") and is_map(rel.deps) {
+                    rel.deps
+                } else {
+                    map{}
+                };
+                ver_map[vstr2] = deps2;
+                array_push(ver_list, vstr2);
+                ai = ai + 1;
+            }
+        }
+        norm[pkg] = map{
+            versions: _sort_versions_desc(ver_list),
+            deps_by_version: ver_map
+        };
+        i = i + 1;
+    }
+    return norm;
+}
+
+fn _clone_map_shallow(m) {
+    let out = map{};
+    let ks = map_keys(m);
+    let i = 0;
+    while i < len(ks) { out[ks[i]] = m[ks[i]]; i = i + 1; }
+    return out;
+}
+
+fn _clone_arr_shallow(a) {
+    let out = [];
+    let i = 0;
+    while i < len(a) { array_push(out, a[i]); i = i + 1; }
+    return out;
+}
+
+fn _record_conflict(solver_ctx, trace_lines) {
+    if len(trace_lines) >= len(solver_ctx.best_conflict_chain) {
+        solver_ctx.best_conflict_chain = trace_lines;
+    }
+}
+
+fn _backtrack_solve(pending_reqs, selected, constraints, history, reg, solver_ctx) {
+    solver_ctx.steps = solver_ctx.steps + 1;
+    if solver_ctx.steps > 50000 {
+        _record_conflict(solver_ctx, ["solver budget exceeded (50000 steps)"]);
+        return nil;
+    }
+    if len(pending_reqs) == 0 {
+        return selected;
+    }
+
+    let req = pending_reqs[0];
+    let rest_reqs = array_drop(pending_reqs, 1);
+    let pkg = req.package;
+    let rng = req.range;
+    let requester = req.required_by;
+    let step_desc = requester + " requires " + pkg + " " + rng;
+
+    if not map_has(reg, pkg) {
+        let trace0 = _clone_arr_shallow(history);
+        array_push(trace0, step_desc);
+        array_push(trace0, "CONFLICT: package '" + pkg + "' does not exist in registry");
+        _record_conflict(solver_ctx, trace0);
+        return nil;
+    }
+
+    // If `pkg` is ALREADY selected, verify it satisfies the new range constraint!
+    if map_has(selected, pkg) {
+        let chosen = selected[pkg].version;
+        if satisfies_range(chosen, rng) {
+            let next_cons = _clone_arr_shallow(constraints);
+            array_push(next_cons, req);
+            let next_hist = _clone_arr_shallow(history);
+            array_push(next_hist, step_desc + " (satisfied by " + pkg + "@" + chosen + ")");
+            return _backtrack_solve(rest_reqs, selected, next_cons, next_hist, reg, solver_ctx);
+        } else {
+            let orig_by = selected[pkg].selected_by;
+            let orig_rng = selected[pkg].selected_range;
+            let trace1 = _clone_arr_shallow(history);
+            array_push(trace1, step_desc);
+            array_push(trace1, "CONFLICT: " + pkg + "@" + chosen + " (locked via " + orig_by + " requiring " + pkg + " " + orig_rng + ") violates " + pkg + " " + rng + " required by " + requester);
+            _record_conflict(solver_ctx, trace1);
+            return nil;
+        }
+    }
+
+    // Try every available version of `pkg` (newest SemVer first) that satisfies all active constraints for `pkg`.
+    let pkg_info = reg[pkg];
+    let candidates = pkg_info.versions;
+    let matched_any = false;
+    let ci = 0;
+    while ci < len(candidates) {
+        let cand_v = candidates[ci];
+        let ok_all = satisfies_range(cand_v, rng);
+        if ok_all {
+            let ki = 0;
+            while ki < len(constraints) {
+                if constraints[ki].package == pkg and not satisfies_range(cand_v, constraints[ki].range) {
+                    ok_all = false;
+                }
+                ki = ki + 1;
+            }
+        }
+        if ok_all {
+            matched_any = true;
+            let next_sel = _clone_map_shallow(selected);
+            next_sel[pkg] = map{
+                version: cand_v,
+                selected_by: requester,
+                selected_range: rng
+            };
+            let next_cons2 = _clone_arr_shallow(constraints);
+            array_push(next_cons2, req);
+
+            let next_reqs = _clone_arr_shallow(rest_reqs);
+            let sub_deps = pkg_info.deps_by_version[cand_v];
+            let dkeys = array_sort(map_keys(sub_deps));
+            let di = 0;
+            while di < len(dkeys) {
+                let dpkg = dkeys[di];
+                array_push(next_reqs, map{
+                    package: dpkg,
+                    range: str(sub_deps[dpkg]),
+                    required_by: pkg + "@" + cand_v
+                });
+                di = di + 1;
+            }
+
+            let next_hist2 = _clone_arr_shallow(history);
+            array_push(next_hist2, step_desc + " -> trying " + pkg + "@" + cand_v);
+
+            let solved = _backtrack_solve(next_reqs, next_sel, next_cons2, next_hist2, reg, solver_ctx);
+            if solved != nil {
+                return solved;
+            }
+        }
+        ci = ci + 1;
+    }
+
+    if not matched_any {
+        let avail_txt = if len(candidates) == 0 { "none" } else { str_join(candidates, ", ") };
+        let trace2 = _clone_arr_shallow(history);
+        array_push(trace2, step_desc);
+        array_push(trace2, "CONFLICT: no version of '" + pkg + "' matches '" + rng + "' (available: " + avail_txt + ")");
+        _record_conflict(solver_ctx, trace2);
+    }
+    return nil;
+}
+
+fn _topo_install_order(resolved_map, reg) {
+    let visited = map{};
+    let order = [];
+    let keys = array_sort(map_keys(resolved_map));
+
+    let visit = nil;
+    visit = fn(pkg) {
+        if map_has(visited, pkg) { return nil; }
+        visited[pkg] = true;
+        let ver = resolved_map[pkg];
+        let deps = reg[pkg].deps_by_version[ver];
+        let dks = array_sort(map_keys(deps));
+        let i = 0;
+        while i < len(dks) {
+            if map_has(resolved_map, dks[i]) { visit(dks[i]); }
+            i = i + 1;
+        }
+        array_push(order, pkg + "@" + ver);
+        return nil;
+    };
+
+    let ki = 0;
+    while ki < len(keys) {
+        visit(keys[ki]);
+        ki = ki + 1;
+    }
+    return order;
+}
+
+fn resolve_dependencies(root_reqs, registry_packages) {
+    if not is_map(root_reqs) {
+        _fail("root_reqs must be a map of { package_name: range_expr }");
+    }
+    let reg = _normalize_registry(registry_packages);
+    let initial_reqs = [];
+    let rkeys = array_sort(map_keys(root_reqs));
+    let i = 0;
+    while i < len(rkeys) {
+        let p = rkeys[i];
+        array_push(initial_reqs, map{
+            package: p,
+            range: str(root_reqs[p]),
+            required_by: "root"
+        });
+        i = i + 1;
+    }
+
+    let solver_ctx = map{
+        steps: 0,
+        best_conflict_chain: []
+    };
+
+    let raw_solution = _backtrack_solve(initial_reqs, map{}, [], [], reg, solver_ctx);
+    if raw_solution == nil {
+        let msg = str_join(solver_ctx.best_conflict_chain, " -> ");
+        return map{
+            ok: false,
+            conflict: true,
+            steps: solver_ctx.steps,
+            derivation_chain: solver_ctx.best_conflict_chain,
+            error: msg
+        };
+    }
+
+    let resolved = map{};
+    let skeys = array_sort(map_keys(raw_solution));
+    let lock_entries = [];
+    let si = 0;
+    while si < len(skeys) {
+        let k = skeys[si];
+        let v = raw_solution[k].version;
+        resolved[k] = v;
+        array_push(lock_entries, k + "=" + v);
+        si = si + 1;
+    }
+    let install_order = _topo_install_order(resolved, reg);
+    let lock_sha = _SHA256.sha256_hex(str_join(lock_entries, "\n"));
+
+    return map{
+        ok: true,
+        conflict: false,
+        steps: solver_ctx.steps,
+        resolved: resolved,
+        install_order: install_order,
+        lockfile_sha256: lock_sha
+    };
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 3: RFC 8032 Ed25519 Keypair, Signing & SHA-256 Package Manifest Verification
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _bytes_to_hex(bytes) {
+    let out = "";
+    let i = 0;
+    while i < len(bytes) {
+        let b = bytes[i];
+        let hi = num_floor(b / 16) % 16;
+        let lo = b % 16;
+        out = out + str_slice(_HEX, hi, hi + 1) + str_slice(_HEX, lo, lo + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _hex_to_bytes_strict(hex_or_bytes, expected_len) {
+    if is_array(hex_or_bytes) {
+        if expected_len > 0 and len(hex_or_bytes) != expected_len {
+            _fail("expected " + str(expected_len) + " bytes, got " + str(len(hex_or_bytes)));
+        }
+        return hex_or_bytes;
+    }
+    if type(hex_or_bytes) != "string" { _fail("key/signature must be hex string or byte array"); }
+    let s = str_lower(str_trim(hex_or_bytes));
+    if len(s) % 2 != 0 { _fail("hex string must have even length"); }
+    let out = [];
+    let i = 0;
+    while i < len(s) {
+        let hi = str_index_of(_HEX, str_slice(s, i, i + 1));
+        let lo = str_index_of(_HEX, str_slice(s, i + 1, i + 2));
+        if hi < 0 or lo < 0 { _fail("invalid hex digit in key/signature"); }
+        array_push(out, hi * 16 + lo);
+        i = i + 2;
+    }
+    if expected_len > 0 and len(out) != expected_len {
+        _fail("expected " + str(expected_len) + " bytes, got " + str(len(out)));
+    }
+    return out;
+}
+
+fn _mod_p(v) {
+    let r = v % _P;
+    if r < _ZERO { r = r + _P; }
+    return r;
+}
+
+fn _pow_mod_p(base, exp_val) {
+    let res = _ONE;
+    let fac = _mod_p(base);
+    let rem = exp_val;
+    while rem > _ZERO {
+        if rem % _TWO == _ONE { res = _mod_p(res * fac); }
+        fac = _mod_p(fac * fac);
+        rem = rem / _TWO;
+    }
+    return res;
+}
+
+fn _le_bytes_to_bigint(bytes) {
+    let acc = _ZERO;
+    let fac = _ONE;
+    let b256 = bigint(256);
+    let i = 0;
+    while i < len(bytes) {
+        acc = acc + bigint(bytes[i]) * fac;
+        fac = fac * b256;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn _bigint_to_le32(val) {
+    let out = [];
+    let cur = val;
+    let b256 = bigint(256);
+    let i = 0;
+    while i < 32 {
+        let limb = num_floor(parse_number(str(cur % b256)));
+        array_push(out, limb);
+        cur = cur / b256;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _ed_add(left, right) {
+    let a = _mod_p((left.y - left.x) * (right.y - right.x));
+    let b = _mod_p((left.y + left.x) * (right.y + right.x));
+    let c = _mod_p(_TWO * _D * left.t * right.t);
+    let d2 = _mod_p(_TWO * left.z * right.z);
+    let e = _mod_p(b - a);
+    let f = _mod_p(d2 - c);
+    let g = _mod_p(d2 + c);
+    let h = _mod_p(b + a);
+    return map{ x: _mod_p(e * f), y: _mod_p(g * h), z: _mod_p(f * g), t: _mod_p(e * h) };
+}
+
+fn _ed_double(pt) {
+    let a = _mod_p(pt.x * pt.x);
+    let b = _mod_p(pt.y * pt.y);
+    let c = _mod_p(_TWO * pt.z * pt.z);
+    let d2 = _mod_p(_ZERO - a);
+    let e = _mod_p((pt.x + pt.y) * (pt.x + pt.y) - a - b);
+    let g = _mod_p(d2 + b);
+    let f = _mod_p(g - c);
+    let h = _mod_p(d2 - b);
+    return map{ x: _mod_p(e * f), y: _mod_p(g * h), z: _mod_p(f * g), t: _mod_p(e * h) };
+}
+
+fn _ed_scalar_base(scalar) {
+    let res = map{ x: _ZERO, y: _ONE, z: _ONE, t: _ZERO };
+    let addend = map{ x: _BASE_X, y: _BASE_Y, z: _ONE, t: _mod_p(_BASE_X * _BASE_Y) };
+    let rem = scalar;
+    while rem > _ZERO {
+        if rem % _TWO == _ONE { res = _ed_add(res, addend); }
+        addend = _ed_double(addend);
+        rem = rem / _TWO;
+    }
+    return res;
+}
+
+fn _ed_encode_point(pt) {
+    let z_inv = _pow_mod_p(pt.z, _P - _TWO);
+    let x = _mod_p(pt.x * z_inv);
+    let y = _mod_p(pt.y * z_inv);
+    let enc = _bigint_to_le32(y);
+    if x % _TWO == _ONE {
+        enc[31] = enc[31] + 128;
+    }
+    return enc;
+}
+
+fn _expand_secret_seed(seed32) {
+    let h_hex = _SHA512.sha512_hex_bytes(seed32);
+    let h = _hex_to_bytes_strict(h_hex, 64);
+    let clamped = slice(h, 0, 32);
+    clamped[0] = bit_and(clamped[0], 248);
+    clamped[31] = bit_or(bit_and(clamped[31], 127), 64);
+    let prefix = slice(h, 32, 64);
+    let scalar_a = _le_bytes_to_bigint(clamped);
+    let pub_bytes = _ed_encode_point(_ed_scalar_base(scalar_a));
+    return map{
+        scalar_a: scalar_a,
+        prefix: prefix,
+        public_key_bytes: pub_bytes,
+        public_key_hex: _bytes_to_hex(pub_bytes)
+    };
+}
+
+// Derive RFC 8032 Ed25519 keypair from a 32-byte seed (or OS CSPRNG random_bytes(32) if nil).
+fn generate_publisher_keypair(seed = nil) {
+    let seed_bytes = if seed == nil { random_bytes(32) } else { _hex_to_bytes_strict(seed, 32) };
+    let expanded = _expand_secret_seed(seed_bytes);
+    return map{
+        algorithm: "ed25519",
+        secret_key_bytes: seed_bytes,
+        secret_key_hex: _bytes_to_hex(seed_bytes),
+        public_key_bytes: expanded.public_key_bytes,
+        public_key_hex: expanded.public_key_hex
+    };
+}
+
+fn _ed25519_sign_bytes(secret_seed32, msg_bytes) {
+    // 1. Try native `ed25519_sign` builtin first if present in v3.0 host
+    let native_sig = try ed25519_sign(secret_seed32, msg_bytes) catch nil;
+    if native_sig != nil {
+        return _hex_to_bytes_strict(native_sig, 64);
+    }
+    // 2. Exact RFC 8032 §5.1.6 deterministic Ed25519 signing
+    let exp_k = _expand_secret_seed(secret_seed32);
+    let r_in = [];
+    let i = 0;
+    while i < 32 { array_push(r_in, exp_k.prefix[i]); i = i + 1; }
+    i = 0;
+    while i < len(msg_bytes) { array_push(r_in, msg_bytes[i]); i = i + 1; }
+    let r_digest = _hex_to_bytes_strict(_SHA512.sha512_hex_bytes(r_in), 64);
+    let r_scalar = _le_bytes_to_bigint(r_digest) % _L;
+    let r_point_bytes = _ed_encode_point(_ed_scalar_base(r_scalar));
+
+    let k_in = [];
+    i = 0;
+    while i < 32 { array_push(k_in, r_point_bytes[i]); i = i + 1; }
+    i = 0;
+    while i < 32 { array_push(k_in, exp_k.public_key_bytes[i]); i = i + 1; }
+    i = 0;
+    while i < len(msg_bytes) { array_push(k_in, msg_bytes[i]); i = i + 1; }
+    let k_digest = _hex_to_bytes_strict(_SHA512.sha512_hex_bytes(k_in), 64);
+    let k_scalar = _le_bytes_to_bigint(k_digest) % _L;
+
+    let s_scalar = (r_scalar + k_scalar * exp_k.scalar_a) % _L;
+    let s_bytes = _bigint_to_le32(s_scalar);
+
+    let sig = [];
+    i = 0;
+    while i < 32 { array_push(sig, r_point_bytes[i]); i = i + 1; }
+    i = 0;
+    while i < 32 { array_push(sig, s_bytes[i]); i = i + 1; }
+    return sig;
+}
+
+fn _ed25519_verify_bytes(public_key32, msg_bytes, sig64) {
+    let native_ok = try ed25519_verify(public_key32, msg_bytes, sig64) catch nil;
+    if type(native_ok) == "bool" {
+        return native_ok;
+    }
+    return _ED25519_VERIFY.verify(public_key32, msg_bytes, sig64);
+}
+
+// Deterministic canonical serialization of package manifest + file SHA-256 content digests.
+fn _canonicalize_manifest(manifest) {
+    if not is_map(manifest) { _fail("manifest must be a map"); }
+    let name = str(try manifest.name catch "");
+    let version = str(try manifest.version catch "");
+    if name == "" { _fail("manifest.name required"); }
+    let parsed_v = parse_semver(version);
+    if not parsed_v.ok { _fail("manifest.version invalid SemVer: " + version); }
+
+    let deps = if map_has(manifest, "dependencies") and is_map(manifest.dependencies) { manifest.dependencies } else { map{} };
+    let dkeys = array_sort(map_keys(deps));
+    let dep_lines = [];
+    let i = 0;
+    while i < len(dkeys) {
+        let dk = dkeys[i];
+        array_push(dep_lines, dk + ":" + str(deps[dk]));
+        i = i + 1;
+    }
+
+    let file_digests = map{};
+    if map_has(manifest, "files") and is_map(manifest.files) {
+        let fkeys = array_sort(map_keys(manifest.files));
+        let fi = 0;
+        while fi < len(fkeys) {
+            let fp = fkeys[fi];
+            let content = manifest.files[fp];
+            if is_array(content) {
+                file_digests[fp] = _SHA256.sha256_hex_bytes(content);
+            } else {
+                file_digests[fp] = _SHA256.sha256_hex(str(content));
+            }
+            fi = fi + 1;
+        }
+    } elif map_has(manifest, "file_digests") and is_map(manifest.file_digests) {
+        file_digests = _clone_map_shallow(manifest.file_digests);
+    }
+
+    let fd_keys = array_sort(map_keys(file_digests));
+    let fd_lines = [];
+    i = 0;
+    while i < len(fd_keys) {
+        let fk = fd_keys[i];
+        array_push(fd_lines, fk + "=" + str(file_digests[fk]));
+        i = i + 1;
+    }
+
+    let canonical_payload = MANIFEST_SCHEMA + "\n" +
+                            "name=" + name + "\n" +
+                            "version=" + parsed_v.canonical + "\n" +
+                            "deps=" + str_join(dep_lines, ",") + "\n" +
+                            "files=" + str_join(fd_lines, ",");
+    let manifest_sha256 = _SHA256.sha256_hex(canonical_payload);
+
+    return map{
+        name: name,
+        version: parsed_v.canonical,
+        dependencies: _clone_map_shallow(deps),
+        file_digests: file_digests,
+        canonical_payload: canonical_payload,
+        manifest_sha256: manifest_sha256
+    };
+}
+
+fn sign_package_manifest(manifest, secret_key) {
+    let seed32 = _hex_to_bytes_strict(secret_key, 32);
+    let exp_k = _expand_secret_seed(seed32);
+    let canon = _canonicalize_manifest(manifest);
+    let msg_bytes = str_to_bytes(canon.canonical_payload);
+    let sig_bytes = _ed25519_sign_bytes(seed32, msg_bytes);
+
+    return map{
+        schema: MANIFEST_SCHEMA,
+        name: canon.name,
+        version: canon.version,
+        dependencies: canon.dependencies,
+        file_digests: canon.file_digests,
+        manifest_sha256: canon.manifest_sha256,
+        signature_algorithm: "ed25519",
+        publisher_public_key: exp_k.public_key_hex,
+        signature_hex: _bytes_to_hex(sig_bytes)
+    };
+}
+
+fn verify_package_manifest(signed_manifest, trusted_public_key = nil, actual_files = nil) {
+    if not is_map(signed_manifest) {
+        return map{ ok: false, reason: "signed_manifest must be a map" };
+    }
+    if (try signed_manifest.schema catch "") != MANIFEST_SCHEMA {
+        return map{ ok: false, reason: "unsupported manifest schema" };
+    }
+    if (try signed_manifest.signature_algorithm catch "") != "ed25519" {
+        return map{ ok: false, reason: "unsupported signature algorithm" };
+    }
+
+    let pub_hex = if trusted_public_key != nil { trusted_public_key } else { try signed_manifest.publisher_public_key catch "" };
+    let pub32 = try _hex_to_bytes_strict(pub_hex, 32) catch nil;
+    if pub32 == nil {
+        return map{ ok: false, reason: "invalid publisher Ed25519 public key" };
+    }
+    if trusted_public_key != nil and is_string(signed_manifest.publisher_public_key) {
+        let embedded32 = try _hex_to_bytes_strict(signed_manifest.publisher_public_key, 32) catch nil;
+        if embedded32 == nil or _bytes_to_hex(pub32) != _bytes_to_hex(embedded32) {
+            return map{ ok: false, reason: "publisher public key mismatch against trusted key" };
+        }
+    }
+
+    let sig64 = try _hex_to_bytes_strict(signed_manifest.signature_hex, 64) catch nil;
+    if sig64 == nil {
+        return map{ ok: false, reason: "invalid 64-byte Ed25519 signature encoding" };
+    }
+
+    // Recompute canonical digest from current fields (detects version/dependency/digest tampering!)
+    let canon = try _canonicalize_manifest(signed_manifest) catch nil;
+    if canon == nil {
+        return map{ ok: false, reason: "manifest canonicalization failed" };
+    }
+    let declared_sha = str(try signed_manifest.manifest_sha256 catch "");
+    if not constant_time_eq(canon.manifest_sha256, declared_sha) {
+        return map{ ok: false, reason: "manifest SHA-256 digest mismatch (tampered metadata)" };
+    }
+
+    // Optional live artifact content verification against signed file_digests
+    if actual_files != nil and is_map(actual_files) {
+        let fkeys = map_keys(canon.file_digests);
+        let fi = 0;
+        while fi < len(fkeys) {
+            let fp = fkeys[fi];
+            if not map_has(actual_files, fp) {
+                return map{ ok: false, reason: "missing signed artifact file: " + fp };
+            }
+            let raw_f = actual_files[fp];
+            let actual_sha = if is_array(raw_f) { _SHA256.sha256_hex_bytes(raw_f) } else { _SHA256.sha256_hex(str(raw_f)) };
+            if not constant_time_eq(actual_sha, canon.file_digests[fp]) {
+                return map{ ok: false, reason: "file content SHA-256 mismatch for " + fp };
+            }
+            fi = fi + 1;
+        }
+    }
+
+    let msg_bytes = str_to_bytes(canon.canonical_payload);
+    let sig_valid = _ed25519_verify_bytes(pub32, msg_bytes, sig64);
+    if not sig_valid {
+        return map{ ok: false, reason: "Ed25519 cryptographic signature verification failed" };
+    }
+
+    return map{
+        ok: true,
+        name: canon.name,
+        version: canon.version,
+        manifest_sha256: canon.manifest_sha256,
+        publisher_public_key: _bytes_to_hex(pub32)
+    };
+}
+
+export MANIFEST_SCHEMA;
+export parse_semver, semver_cmp, satisfies_range, resolve_dependencies;
+export generate_publisher_keypair, sign_package_manifest, verify_package_manifest;

@@ -8,7 +8,7 @@
 
 #include "zr_compiler.h"
 
-#define ZR_PBCK_CACHE_SALT "PBLANG-ZR-2.7.0-r1|"
+#define ZR_PBCK_CACHE_SALT "PBLANG-ZR-3.0.0-r2|"
 
 static bool zr_file_exists_reg(const char *path) {
     if (!path || !path[0]) return false;
@@ -140,7 +140,7 @@ static bool zr_read_entire_file(const char *path, uint8_t **out_buf, size_t *out
 static bool zr_is_valid_stdlib_dir(const char *dir) {
     if (!dir || !dir[0]) return false;
     char probe[4096];
-    snprintf(probe, sizeof(probe), "%s%cmath.sapp", dir, ZR_PATH_SEP);
+    snprintf(probe, sizeof(probe), "%.4080s%cmath.sapp", dir, ZR_PATH_SEP);
     return zr_file_exists_reg(probe);
 }
 
@@ -473,14 +473,15 @@ static bool zr_get_pbck_cache_path(const uint8_t *src, size_t src_len, char out_
 
 /* Populate `__polyglot_blocks` and `__polyglot` globals from compiled PbFunc metadata */
 static void zr_populate_polyglot_globals(PbVM *vm, PbMap *target_globals, const PbFunc *fn) {
-    PbArray *blocks_arr = vm_new_array(vm, fn->poly_count);
+    size_t pcount = fn ? fn->poly_count : 0;
+    PbArray *blocks_arr = vm_new_array(vm, pcount);
     vm_temp_push(vm, val_obj(blocks_arr));
     PbMap *by_name = vm_new_map(vm, 8);
     vm_temp_push(vm, val_obj(by_name));
     PbMap *by_lang = vm_new_map(vm, 8);
     vm_temp_push(vm, val_obj(by_lang));
 
-    for (size_t i = 0; i < fn->poly_count; i++) {
+    for (size_t i = 0; i < pcount; i++) {
         const PbPolyBlock *pb = &fn->poly_blocks[i];
         PbMap *bm = vm_new_map(vm, 8);
         vm_temp_push(vm, val_obj(bm));
@@ -540,7 +541,10 @@ static PbFunc *zr_load_or_compile_file(PbVM *vm, const char *path, char err_buf[
         derr[0] = '\0';
         PbFunc *fn = pbck_deserialize_script(vm, raw, raw_len, derr);
         if (!fn) snprintf(err_buf, 512, "%s", derr);
-        else if (!fn->source_name || fn->source_name->len == 0) fn->source_name = vm_new_cstr(vm, path);
+        else if (!fn->source_name || fn->source_name->len == 0) {
+            fn->source_name = vm_new_cstr(vm, path);
+            vm_write_barrier_obj(vm, (PbObj *)fn, (PbObj *)fn->source_name);
+        }
         free(raw);
         return fn;
     }
@@ -558,6 +562,7 @@ static PbFunc *zr_load_or_compile_file(PbVM *vm, const char *path, char err_buf[
             free(cbuf);
             if (cached_fn) {
                 cached_fn->source_name = vm_new_cstr(vm, path);
+                vm_write_barrier_obj(vm, (PbObj *)cached_fn, (PbObj *)cached_fn->source_name);
                 free(raw);
                 return cached_fn;
             }
@@ -598,23 +603,42 @@ static PbFunc *zr_load_or_compile_file(PbVM *vm, const char *path, char err_buf[
     return fn;
 }
 
-static bool zr_vm_import_module(PbVM *vm, const char *spec, const char *caller_file, PbValue *out_mod) {
+static bool zr_vm_import_module_caps(PbVM *vm, const char *spec, const char *caller_file,
+                                     uint32_t req_cap_mask, PbValue *out_mod) {
     char resolved[4096];
     if (!zr_resolve_import_path(vm, spec, caller_file, resolved)) return false;
 
-    PbStr *key = vm_new_cstr(vm, resolved);
-    vm_temp_push(vm, val_obj(key));
+    /* Intersect requested module capabilities with all active frames on call stack */
+    uint32_t eff_mask = req_cap_mask & CAP_ALL;
+    for (size_t i = 0; i < vm->frame_count; i++) {
+        eff_mask &= vm->frames[i].cap_mask;
+        if (vm->frames[i].closure && vm->frames[i].closure->module) {
+            eff_mask &= vm->frames[i].closure->module->cap_mask;
+        }
+    }
+
+    char cache_key_buf[4160];
+    if (eff_mask == CAP_ALL) {
+        snprintf(cache_key_buf, sizeof(cache_key_buf), "%s", resolved);
+    } else {
+        snprintf(cache_key_buf, sizeof(cache_key_buf), "%.4080s#caps=%08x", resolved, (unsigned)eff_mask);
+    }
+
+    PbStr *cache_key = vm_new_cstr(vm, cache_key_buf);
+    vm_temp_push(vm, val_obj(cache_key));
+    PbStr *path_str = vm_new_cstr(vm, resolved);
+    vm_temp_push(vm, val_obj(path_str));
 
     PbValue existing;
-    if (map_get(vm->modules, key, &existing) && val_is_obj(existing, OBJ_MODULE)) {
+    if (map_get(vm->modules, cache_key, &existing) && val_is_obj(existing, OBJ_MODULE)) {
         PbModule *m = (PbModule *)val_as_obj(existing);
         if (m->loading) {
-            vm_temp_pop(vm, 1);
+            vm_temp_pop(vm, 2);
             vm_raise(vm, "circular import detected while loading '%s'", resolved);
             return false;
         }
         if (m->loaded) {
-            vm_temp_pop(vm, 1);
+            vm_temp_pop(vm, 2);
             *out_mod = val_obj(m);
             return true;
         }
@@ -624,22 +648,23 @@ static bool zr_vm_import_module(PbVM *vm, const char *spec, const char *caller_f
     err_buf[0] = '\0';
     PbFunc *fn = zr_load_or_compile_file(vm, resolved, err_buf);
     if (!fn) {
-        vm_temp_pop(vm, 1);
+        vm_temp_pop(vm, 2);
         vm_raise(vm, "import('%s'): %s", spec, err_buf);
         return false;
     }
     vm_temp_push(vm, val_obj(fn));
 
-    PbModule *mod = vm_new_module(vm, key);
+    PbModule *mod = vm_new_module(vm, path_str);
+    mod->cap_mask = eff_mask;
     mod->loading = true;
-    map_set(vm->modules, key, val_obj(mod));
+    map_set(vm->modules, cache_key, val_obj(mod));
     zr_populate_polyglot_globals(vm, mod->globals, fn);
 
     bool ok = vm_run_root_func(vm, fn, mod, NULL);
-    vm_temp_pop(vm, 2); /* fn, key */
+    vm_temp_pop(vm, 3); /* fn, path_str, cache_key */
     if (!ok) {
         mod->loading = false;
-        map_delete(vm->modules, key);
+        map_delete(vm->modules, cache_key);
         return false;
     }
     mod->loading = false;
@@ -648,9 +673,28 @@ static bool zr_vm_import_module(PbVM *vm, const char *spec, const char *caller_f
     return true;
 }
 
+static bool zr_vm_import_module(PbVM *vm, const char *spec, const char *caller_file, PbValue *out_mod) {
+    uint32_t mask = CAP_ALL;
+    if (vm->has_pending_import_caps) {
+        mask = vm->pending_import_cap_mask;
+        vm->has_pending_import_caps = false;
+    }
+    return zr_vm_import_module_caps(vm, spec, caller_file, mask, out_mod);
+}
+
 static bool bi_import(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (argc != 1) { vm_raise(vm, "import() expects 1 argument, got %d", argc); return false; }
-    if (!val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "import(): expected module path string"); return false; }
+    if (argc < 1 || argc > 2) {
+        vm_raise(vm, "import(path[, caps_map]) expects 1 or 2 arguments, got %d", argc);
+        return false;
+    }
+    if (!val_is_obj(argv[0], OBJ_STR)) {
+        vm_raise(vm, "import(): expected module path string");
+        return false;
+    }
+    uint32_t req_mask = CAP_ALL;
+    if (argc == 2 && !IS_NIL(argv[1])) {
+        if (!zr_parse_caps_map(vm, argv[1], &req_mask)) return false;
+    }
     const char *spec = ((PbStr *)val_as_obj(argv[0]))->chars;
 
     const char *caller_file = NULL;
@@ -659,7 +703,15 @@ static bool bi_import(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         if (cf && cf->source_name) caller_file = cf->source_name->chars;
     }
     if (!caller_file) caller_file = vm->entry_script_path;
-    return zr_vm_import_module(vm, spec, caller_file, out);
+    return zr_vm_import_module_caps(vm, spec, caller_file, req_mask, out);
+}
+
+static bool bi_import_with_caps(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (argc != 2) {
+        vm_raise(vm, "import_with_caps(path, caps_map) expects 2 arguments");
+        return false;
+    }
+    return bi_import(vm, argc, argv, out);
 }
 
 #endif /* PBLANG_ZR_LOADER_H */

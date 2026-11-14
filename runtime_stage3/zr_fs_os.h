@@ -71,7 +71,7 @@ static int zr_resolve_signal_num(const char *raw_name, char canon_out[32]) {
 
 /* ---- Filesystem Builtins ---- */
 static bool bi_fs_read(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_fs, "fs_read", "fs")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "fs_read", "fs")) return false;
     if (argc != 1 || !val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "fs_read() expects 1 path string"); return false; }
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
     uint8_t *buf = NULL; size_t len = 0;
@@ -85,7 +85,7 @@ static bool bi_fs_read(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_fs_read_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_fs, "fs_read_bytes", "fs")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "fs_read_bytes", "fs")) return false;
     if (argc != 1 || !val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "fs_read_bytes() expects 1 path string"); return false; }
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
     uint8_t *buf = NULL; size_t len = 0;
@@ -101,11 +101,12 @@ static bool bi_fs_read_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_fs_write(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_fs, "fs_write", "fs")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "fs_write", "fs")) return false;
     if (argc != 2 || !val_is_obj(argv[0], OBJ_STR) || !val_is_obj(argv[1], OBJ_STR)) {
         vm_raise(vm, "fs_write(path, content) expects 2 string arguments");
         return false;
     }
+    if (!zr_check_taint_sink(vm, argv[1], "fs_write")) return false;
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
     PbStr *content = (PbStr *)val_as_obj(argv[1]);
     FILE *fp = fopen(path, "wb");
@@ -121,12 +122,27 @@ static bool bi_fs_write(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_fs_write_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_fs, "fs_write_bytes", "fs")) return false;
-    if (argc != 2 || !val_is_obj(argv[0], OBJ_STR) || !val_is_obj(argv[1], OBJ_ARRAY)) {
-        vm_raise(vm, "fs_write_bytes(path, byte_array) expects (string, array)");
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "fs_write_bytes", "fs")) return false;
+    if (argc != 2 || !val_is_obj(argv[0], OBJ_STR) ||
+        (!val_is_obj(argv[1], OBJ_ARRAY) && !val_is_obj(argv[1], OBJ_BYTES))) {
+        vm_raise(vm, "fs_write_bytes(path, byte_array_or_bytes) expects (string, array|bytes)");
         return false;
     }
+    if (!zr_check_taint_sink(vm, argv[1], "fs_write_bytes")) return false;
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
+    if (val_is_obj(argv[1], OBJ_BYTES)) {
+        PbBytes *b = (PbBytes *)val_as_obj(argv[1]);
+        FILE *fp = fopen(path, "wb");
+        if (!fp) { vm_raise(vm, "fs_write_bytes('%s'): %s", path, strerror(errno)); return false; }
+        if (b->len > 0 && fwrite(b->data, 1, b->len, fp) != b->len) {
+            fclose(fp);
+            vm_raise(vm, "fs_write_bytes('%s'): short write", path);
+            return false;
+        }
+        fclose(fp);
+        *out = val_nil();
+        return true;
+    }
     PbArray *arr = (PbArray *)val_as_obj(argv[1]);
     uint8_t *buf = (uint8_t *)zr_xmalloc(arr->len > 0 ? arr->len : 1);
     for (size_t i = 0; i < arr->len; i++) {
@@ -153,11 +169,12 @@ static bool bi_fs_write_bytes(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_fs_append(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_fs, "fs_append", "fs")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "fs_append", "fs")) return false;
     if (argc != 2 || !val_is_obj(argv[0], OBJ_STR) || !val_is_obj(argv[1], OBJ_STR)) {
         vm_raise(vm, "fs_append(path, content) expects 2 string arguments");
         return false;
     }
+    if (!zr_check_taint_sink(vm, argv[1], "fs_append")) return false;
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
     PbStr *content = (PbStr *)val_as_obj(argv[1]);
     FILE *fp = fopen(path, "ab");
@@ -173,7 +190,7 @@ static bool bi_fs_append(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_fs_exists(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_fs, "fs_exists", "fs")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "fs_exists", "fs")) return false;
     if (argc != 1 || !val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "fs_exists() expects 1 path string"); return false; }
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
 #if defined(_WIN32)
@@ -224,7 +241,7 @@ static bool zr_remove_recursive(const char *path) {
 }
 
 static bool bi_fs_remove(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_fs, "fs_remove", "fs")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "fs_remove", "fs")) return false;
     if (argc != 1 || !val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "fs_remove() expects 1 path string"); return false; }
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
     if (!zr_remove_recursive(path)) {
@@ -236,7 +253,7 @@ static bool bi_fs_remove(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_fs_rename(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_fs, "fs_rename", "fs")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "fs_rename", "fs")) return false;
     if (argc != 2 || !val_is_obj(argv[0], OBJ_STR) || !val_is_obj(argv[1], OBJ_STR)) {
         vm_raise(vm, "fs_rename(src, dst) expects 2 string arguments");
         return false;
@@ -259,7 +276,7 @@ static bool bi_fs_rename(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_fs_copy(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_fs, "fs_copy", "fs")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "fs_copy", "fs")) return false;
     if (argc != 2 || !val_is_obj(argv[0], OBJ_STR) || !val_is_obj(argv[1], OBJ_STR)) {
         vm_raise(vm, "fs_copy(src, dst) expects 2 string arguments");
         return false;
@@ -285,7 +302,7 @@ static bool bi_fs_copy(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_fs_mkdirs(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_fs, "fs_mkdirs", "fs")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "fs_mkdirs", "fs")) return false;
     if (argc != 1 || !val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "fs_mkdirs() expects 1 path string"); return false; }
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
     zr_mkdirs_path(path);
@@ -304,7 +321,7 @@ static int zr_cstr_ptr_cmp(const void *a, const void *b) {
 }
 
 static bool bi_fs_listdir(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_fs, "fs_listdir", "fs")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "fs_listdir", "fs")) return false;
     if (argc != 1 || !val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "fs_listdir() expects 1 path string"); return false; }
     const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
     PbArray *arr = vm_new_array(vm, 16);
@@ -392,7 +409,7 @@ static bool bi_path_basename(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 
 static bool bi_cwd(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     (void)argv;
-    if (!vm_check_cap(vm, vm->caps.allow_fs, "cwd", "fs")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_FS), "cwd", "fs")) return false;
     if (argc != 0) { vm_raise(vm, "cwd() takes no arguments"); return false; }
     char buf[4096];
 #if defined(_WIN32)
@@ -406,15 +423,29 @@ static bool bi_cwd(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 
 /* ---- Environment, CLI Args, Signals, Time & OS ---- */
 static bool bi_env_get(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_env, "env_get", "env")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_ENV), "env_get", "env")) return false;
     if (argc != 1 || !val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "env_get() expects 1 string"); return false; }
-    const char *v = getenv(((PbStr *)val_as_obj(argv[0]))->chars);
-    *out = v ? val_obj(vm_new_cstr(vm, v)) : val_nil();
+    const char *key = ((PbStr *)val_as_obj(argv[0]))->chars;
+    if (vm->flight_replaying) {
+        const ZrFlightEvent *ev = NULL;
+        if (!zr_flight_replay_next(vm, "env_get", &ev)) return false;
+        *out = ev->is_nil ? val_nil() : val_obj(vm_new_str(vm, ev->str_val ? ev->str_val : "", ev->str_len));
+    } else {
+        const char *v = getenv(key);
+        if (vm->flight_recording) {
+            if (v) zr_flight_record_str(vm, "env_get", "str", v, strlen(v));
+            else zr_flight_record_nil(vm, "env_get");
+        }
+        *out = v ? val_obj(vm_new_cstr(vm, v)) : val_nil();
+    }
+    if (out->tag == VAL_OBJ && vm->taint_guard_enabled && zr_env_name_is_sensitive(key)) {
+        *out = val_with_taint(*out, TAINT_SECRET);
+    }
     return true;
 }
 
 static bool bi_env_set(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_env, "env_set", "env")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_ENV), "env_set", "env")) return false;
     if (argc != 2 || !val_is_obj(argv[0], OBJ_STR) || !val_is_obj(argv[1], OBJ_STR)) {
         vm_raise(vm, "env_set(key, val) expects 2 strings");
         return false;
@@ -452,7 +483,7 @@ static bool bi_os_exit(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 }
 
 static bool bi_os_which(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_exec, "os_which", "exec")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_EXEC), "os_which", "exec")) return false;
     if (argc != 1 || !val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "os_which() expects 1 string"); return false; }
     const char *cmd = ((PbStr *)val_as_obj(argv[0]))->chars;
     if (!cmd[0]) { vm_raise(vm, "os_which(): empty command name"); return false; }
@@ -627,22 +658,45 @@ static bool bi_os_arch(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 static bool bi_clock(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     (void)argv;
     if (argc != 0) { vm_raise(vm, "clock() takes no arguments"); return false; }
-    *out = val_num(zr_monotonic_sec());
+    if (vm->flight_replaying) {
+        const ZrFlightEvent *ev = NULL;
+        if (!zr_flight_replay_next(vm, "clock", &ev)) return false;
+        *out = val_num(ev->num_val);
+        return true;
+    }
+    double t = zr_monotonic_sec();
+    if (vm->flight_recording) zr_flight_record_num(vm, "clock", t);
+    *out = val_num(t);
     return true;
 }
 
 static bool bi_now_ms(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     (void)argv;
     if (argc != 0) { vm_raise(vm, "now_ms() takes no arguments"); return false; }
-    *out = val_num((double)zr_now_ms());
+    if (vm->flight_replaying) {
+        const ZrFlightEvent *ev = NULL;
+        if (!zr_flight_replay_next(vm, "now_ms", &ev)) return false;
+        *out = val_num(ev->num_val);
+        return true;
+    }
+    double ms = (double)zr_now_ms();
+    if (vm->flight_recording) zr_flight_record_num(vm, "now_ms", ms);
+    *out = val_num(ms);
     return true;
 }
 
 static bool bi_now_iso(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     (void)argv;
     if (argc != 0) { vm_raise(vm, "now_iso() takes no arguments"); return false; }
+    if (vm->flight_replaying) {
+        const ZrFlightEvent *ev = NULL;
+        if (!zr_flight_replay_next(vm, "now_iso", &ev)) return false;
+        *out = val_obj(vm_new_str(vm, ev->str_val ? ev->str_val : "", ev->str_len));
+        return true;
+    }
     char iso[64];
     zr_now_iso(iso);
+    if (vm->flight_recording) zr_flight_record_str(vm, "now_iso", "str", iso, strlen(iso));
     *out = val_obj(vm_new_cstr(vm, iso));
     return true;
 }
@@ -652,7 +706,9 @@ static bool bi_sleep_ms(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         vm_raise(vm, "sleep_ms(ms) expects non-negative number");
         return false;
     }
-    zr_sleep_ms((uint64_t)argv[0].u.num);
+    if (!vm->flight_replaying) {
+        zr_sleep_ms((uint64_t)argv[0].u.num);
+    }
     *out = val_nil();
     return true;
 }
@@ -681,7 +737,7 @@ static bool bi_read_line(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
 
 /* ---- Subprocess Spawning (Zero Shell Injection) ---- */
 static bool bi_exec(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_exec, "exec", "exec")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_EXEC), "exec", "exec")) return false;
     if (argc != 1 || !val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "exec() expects 1 string"); return false; }
     const char *cmd = ((PbStr *)val_as_obj(argv[0]))->chars;
     if (!cmd[0]) { vm_raise(vm, "exec(): empty command"); return false; }
@@ -765,7 +821,7 @@ static unsigned __stdcall zr_win_pipe_reader(void *arg) {
 #endif
 
 static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
-    if (!vm_check_cap(vm, vm->caps.allow_exec, "proc_spawn_wait", "exec")) return false;
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_EXEC), "proc_spawn_wait", "exec")) return false;
     if ((argc != 2 && argc != 3) || !val_is_obj(argv[0], OBJ_STR) || !val_is_obj(argv[1], OBJ_ARRAY)) {
         vm_raise(vm, "proc_spawn_wait(cmd, args[, opts]) expects (string, array[, map])");
         return false;
@@ -804,8 +860,10 @@ static bool bi_proc_spawn_wait(PbVM *vm, int argc, PbValue *argv, PbValue *out) 
     HANDLE out_r = NULL, out_w = NULL, err_r = NULL, err_w = NULL, in_r = NULL, in_w = NULL;
     if (!CreatePipe(&out_r, &out_w, &sa, 0) || !CreatePipe(&err_r, &err_w, &sa, 0) ||
         (stdin_data && !CreatePipe(&in_r, &in_w, &sa, 0))) {
-        if (out_r) CloseHandle(out_r); if (out_w) CloseHandle(out_w);
-        if (err_r) CloseHandle(err_r); if (err_w) CloseHandle(err_w);
+        if (out_r) CloseHandle(out_r);
+        if (out_w) CloseHandle(out_w);
+        if (err_r) CloseHandle(err_r);
+        if (err_w) CloseHandle(err_w);
         zr_buf_free(&out_b); zr_buf_free(&err_b);
         vm_raise(vm, "proc_spawn_wait(): CreatePipe failed");
         return false;

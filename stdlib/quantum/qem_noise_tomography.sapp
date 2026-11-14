@@ -1,0 +1,2962 @@
+// stdlib/quantum/qem_noise_tomography.sapp — Open Quantum Systems (Density Matrix rho,
+// Kraus CPTP Channels, T1/T2 Thermal Relaxation, Partial Trace, Purity, Von Neumann Entropy,
+// Trace Distance), 1..3-Qubit Quantum State Tomography (Linear Inversion + Smolin-Gambetta
+// Physical PSD Simplex MLE), and Full Quantum Error Mitigation (Readout Confusion Inversion,
+// TREX, Zero-Noise Extrapolation, Pauli Twirling, XY4/CPMG Dynamical Decoupling) (v3.0.0).
+
+let QC = try import("stdlib:quantum_computing.sapp") catch import("../quantum_computing.sapp");
+
+let _PI = 3.14159265358979323846;
+let _HALF_PI = 1.57079632679489661923;
+let _QUARTER_PI = 0.78539816339744830962;
+let _INV_SQRT2 = 0.70710678118654752440;
+let _LN2 = 0.69314718055994530942;
+
+// ── Basic Helpers ────────────────────────────────────────────────────────────
+
+fn _bitstring(idx, n_qubits) {
+    let s_out = "";
+    let q = 0;
+    while q < n_qubits {
+        let mask = bit_shl(1, n_qubits - 1 - q);
+        if bit_and(idx, mask) != 0 {
+            s_out = s_out + "1";
+        } else {
+            s_out = s_out + "0";
+        }
+        q = q + 1;
+    }
+    return s_out;
+}
+
+fn _parse_bitstring(bstr) {
+    let slen = len(bstr);
+    let val = 0;
+    let i = 0;
+    while i < slen {
+        let ch = str_slice(bstr, i, i + 1);
+        val = bit_shl(val, 1);
+        if ch == "1" {
+            val = bit_or(val, 1);
+        } else if ch != "0" {
+            throw "qem_noise_tomography: invalid character '" + ch + "' in bitstring '" + bstr + "'";
+        }
+        i = i + 1;
+    }
+    return val;
+}
+
+fn _zeros(count) {
+    let arr = [];
+    let i = 0;
+    while i < count {
+        push(arr, 0.0);
+        i = i + 1;
+    }
+    return arr;
+}
+
+fn _clone_num_array(src) {
+    let dst = [];
+    let i = 0;
+    while i < len(src) {
+        push(dst, src[i] * 1.0);
+        i = i + 1;
+    }
+    return dst;
+}
+
+fn _clone_int_array(src) {
+    let dst = [];
+    let i = 0;
+    while i < len(src) {
+        push(dst, src[i]);
+        i = i + 1;
+    }
+    return dst;
+}
+
+fn _clone_gate(g) {
+    let targs = if map_has(g, "targets") and is_array(g.targets) { _clone_int_array(g.targets) } else { [] };
+    let ctrls = if map_has(g, "controls") and is_array(g.controls) { _clone_int_array(g.controls) } else { [] };
+    let prms = if map_has(g, "params") and is_array(g.params) { _clone_num_array(g.params) } else { [] };
+    return map{
+        op: g.op,
+        targets: targs,
+        controls: ctrls,
+        params: prms
+    };
+}
+
+fn _clone_circuit(circuit) {
+    let gs = [];
+    let i = 0;
+    while i < len(circuit.gates) {
+        push(gs, _clone_gate(circuit.gates[i]));
+        i = i + 1;
+    }
+    return map{
+        format: "pblang.quantum.circuit.v1",
+        n_qubits: circuit.n_qubits,
+        gates: gs
+    };
+}
+
+fn _log2_int(dim) {
+    let n = 0;
+    let v = dim;
+    while v > 1 {
+        if bit_and(v, 1) != 0 {
+            throw "qem_noise_tomography: dimension " + str(dim) + " is not a power of 2";
+        }
+        v = bit_shr(v, 1);
+        n = n + 1;
+    }
+    return n;
+}
+
+fn _prng_next(state) {
+    let s1 = bit_and(bit_xor(state, bit_shl(state, 13)), 4294967295);
+    let s2 = bit_and(bit_xor(s1, bit_shr(s1, 17)), 4294967295);
+    let s3 = bit_and(bit_xor(s2, bit_shl(s2, 5)), 4294967295);
+    return s3;
+}
+
+// ── 1. Exact Density-Matrix Open Quantum System Simulator (1..7 Qubits) ─────
+
+fn new_density_matrix(n_qubits) {
+    if type(n_qubits) != "number" or n_qubits < 1 or n_qubits > 7 or num_floor(n_qubits) != n_qubits {
+        throw "qem_noise_tomography.new_density_matrix: n_qubits must be an integer in 1..7";
+    }
+    let d = bit_shl(1, n_qubits);
+    let n2 = d * d;
+    let re = _zeros(n2);
+    let im = _zeros(n2);
+    re[0] = 1.0;
+    return map{
+        format: "pblang.quantum.density_matrix.v1",
+        n_qubits: n_qubits,
+        dim: d,
+        re: re,
+        im: im
+    };
+}
+
+fn _clone_density(rho) {
+    return map{
+        format: "pblang.quantum.density_matrix.v1",
+        n_qubits: rho.n_qubits,
+        dim: rho.dim,
+        re: _clone_num_array(rho.re),
+        im: _clone_num_array(rho.im)
+    };
+}
+
+fn _extract_amplitudes(sv_or_circuit) {
+    if is_array(sv_or_circuit) {
+        let d = len(sv_or_circuit);
+        let n = _log2_int(d);
+        return map{ n_qubits: n, dim: d, amplitudes: sv_or_circuit };
+    }
+    if is_map(sv_or_circuit) and map_has(sv_or_circuit, "amplitudes") {
+        let amps = sv_or_circuit.amplitudes;
+        let d = len(amps);
+        let n = if map_has(sv_or_circuit, "n_qubits") { sv_or_circuit.n_qubits } else { _log2_int(d) };
+        return map{ n_qubits: n, dim: d, amplitudes: amps };
+    }
+    if is_map(sv_or_circuit) and map_has(sv_or_circuit, "gates") {
+        let sv_res = QC.run_statevector(sv_or_circuit);
+        return map{ n_qubits: sv_res.n_qubits, dim: sv_res.dimension, amplitudes: sv_res.amplitudes };
+    }
+    throw "qem_noise_tomography: expected statevector map, circuit map, or amplitudes array";
+}
+
+fn density_from_statevector(sv_or_circuit) {
+    let info = _extract_amplitudes(sv_or_circuit);
+    let n = info.n_qubits;
+    if n < 1 or n > 7 {
+        throw "qem_noise_tomography.density_from_statevector: n_qubits must be in 1..7, got " + str(n);
+    }
+    let d = info.dim;
+    let amps = info.amplitudes;
+    let re = _zeros(d * d);
+    let im = _zeros(d * d);
+    let r = 0;
+    while r < d {
+        let ar = amps[r][0];
+        let ai = amps[r][1];
+        let row_off = r * d;
+        let c = 0;
+        while c < d {
+            let br = amps[c][0];
+            let bi = amps[c][1];
+            // psi[r] * conj(psi[c]) = (ar + i*ai) * (br - i*bi)
+            re[row_off + c] = ar * br + ai * bi;
+            im[row_off + c] = ai * br - ar * bi;
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return map{
+        format: "pblang.quantum.density_matrix.v1",
+        n_qubits: n,
+        dim: d,
+        re: re,
+        im: im
+    };
+}
+
+// Accumulates (E * rho * E^dagger) into (out_re, out_im) in O(d^2) for a 2x2 operator E on qubit q.
+fn _accumulate_1q_sandwich(rho_re, rho_im, out_re, out_im, n_qubits, d, q,
+    e00_re, e00_im, e01_re, e01_im, e10_re, e10_im, e11_re, e11_im) {
+    let mask = bit_shl(1, n_qubits - 1 - q);
+    let n2 = d * d;
+    let tmp_re = _zeros(n2);
+    let tmp_im = _zeros(n2);
+
+    // Step 1: Left multiply T = E * rho along row pairs (r0, r1)
+    let r0 = 0;
+    while r0 < d {
+        if bit_and(r0, mask) == 0 {
+            let r1 = bit_or(r0, mask);
+            let off0 = r0 * d;
+            let off1 = r1 * d;
+            let c = 0;
+            while c < d {
+                let a0r = rho_re[off0 + c];
+                let a0i = rho_im[off0 + c];
+                let a1r = rho_re[off1 + c];
+                let a1i = rho_im[off1 + c];
+
+                tmp_re[off0 + c] = (e00_re * a0r - e00_im * a0i) + (e01_re * a1r - e01_im * a1i);
+                tmp_im[off0 + c] = (e00_re * a0i + e00_im * a0r) + (e01_re * a1i + e01_im * a1r);
+                tmp_re[off1 + c] = (e10_re * a0r - e10_im * a0i) + (e11_re * a1r - e11_im * a1i);
+                tmp_im[off1 + c] = (e10_re * a0i + e10_im * a0r) + (e11_re * a1i + e11_im * a1r);
+                c = c + 1;
+            }
+        }
+        r0 = r0 + 1;
+    }
+
+    // Step 2: Right multiply T * E^dagger along column pairs (c0, c1):
+    // (T * E^dagger)[r, c0] = T[r, c0]*conj(e00) + T[r, c1]*conj(e01)
+    // (T * E^dagger)[r, c1] = T[r, c0]*conj(e10) + T[r, c1]*conj(e11)
+    let r = 0;
+    while r < d {
+        let roff = r * d;
+        let c0 = 0;
+        while c0 < d {
+            if bit_and(c0, mask) == 0 {
+                let c1 = bit_or(c0, mask);
+                let t0r = tmp_re[roff + c0];
+                let t0i = tmp_im[roff + c0];
+                let t1r = tmp_re[roff + c1];
+                let t1i = tmp_im[roff + c1];
+
+                let v0r = (t0r * e00_re + t0i * e00_im) + (t1r * e01_re + t1i * e01_im);
+                let v0i = (t0i * e00_re - t0r * e00_im) + (t1i * e01_re - t1r * e01_im);
+                let v1r = (t0r * e10_re + t0i * e10_im) + (t1r * e11_re + t1i * e11_im);
+                let v1i = (t0i * e10_re - t0r * e10_im) + (t1i * e11_re - t1r * e11_im);
+
+                out_re[roff + c0] = out_re[roff + c0] + v0r;
+                out_im[roff + c0] = out_im[roff + c0] + v0i;
+                out_re[roff + c1] = out_re[roff + c1] + v1r;
+                out_im[roff + c1] = out_im[roff + c1] + v1i;
+            }
+            c0 = c0 + 1;
+        }
+        r = r + 1;
+    }
+}
+
+fn _apply_1q_unitary_rho(rho, q, u00_re, u00_im, u01_re, u01_im, u10_re, u10_im, u11_re, u11_im) {
+    let d = rho.dim;
+    let out_re = _zeros(d * d);
+    let out_im = _zeros(d * d);
+    _accumulate_1q_sandwich(rho.re, rho.im, out_re, out_im, rho.n_qubits, d, q,
+        u00_re, u00_im, u01_re, u01_im, u10_re, u10_im, u11_re, u11_im);
+    rho.re = out_re;
+    rho.im = out_im;
+    return rho;
+}
+
+fn _swap_rho_rows_and_cols_cx(rho, mc, mt) {
+    let d = rho.dim;
+    let re = rho.re;
+    let im = rho.im;
+
+    // Row swaps: when (r & mc) != 0 and (r & mt) == 0, swap row r and row (r ^ mt)
+    let r = 0;
+    while r < d {
+        if bit_and(r, mc) == mc and bit_and(r, mt) == 0 {
+            let rp = bit_xor(r, mt);
+            let off_a = r * d;
+            let off_b = rp * d;
+            let c = 0;
+            while c < d {
+                let tr = re[off_a + c];
+                let ti = im[off_a + c];
+                re[off_a + c] = re[off_b + c];
+                im[off_a + c] = im[off_b + c];
+                re[off_b + c] = tr;
+                im[off_b + c] = ti;
+                c = c + 1;
+            }
+        }
+        r = r + 1;
+    }
+
+    // Column swaps: for each row, when (c & mc) == mc and (c & mt) == 0, swap col c and col (c ^ mt)
+    r = 0;
+    while r < d {
+        let roff = r * d;
+        let c = 0;
+        while c < d {
+            if bit_and(c, mc) == mc and bit_and(c, mt) == 0 {
+                let cp = bit_xor(c, mt);
+                let tr = re[roff + c];
+                let ti = im[roff + c];
+                re[roff + c] = re[roff + cp];
+                im[roff + c] = im[roff + cp];
+                re[roff + cp] = tr;
+                im[roff + cp] = ti;
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return rho;
+}
+
+fn _apply_phase_mask_rho(rho, mask_all) {
+    let d = rho.dim;
+    let re = rho.re;
+    let im = rho.im;
+    let r = 0;
+    while r < d {
+        let r_hit = (bit_and(r, mask_all) == mask_all);
+        let roff = r * d;
+        let c = 0;
+        while c < d {
+            let c_hit = (bit_and(c, mask_all) == mask_all);
+            if r_hit != c_hit {
+                re[roff + c] = 0.0 - re[roff + c];
+                im[roff + c] = 0.0 - im[roff + c];
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return rho;
+}
+
+fn density_apply_unitary_gate(rho, gate) {
+    let n = rho.n_qubits;
+    let op = gate.op;
+    if op == "i" or op == "id" {
+        return rho;
+    } else if op == "h" {
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            _INV_SQRT2, 0.0, _INV_SQRT2, 0.0,
+            _INV_SQRT2, 0.0, 0.0 - _INV_SQRT2, 0.0);
+    } else if op == "x" {
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            0.0, 0.0, 1.0, 0.0,
+            1.0, 0.0, 0.0, 0.0);
+    } else if op == "sx" {
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            0.5, 0.5, 0.5, -0.5,
+            0.5, -0.5, 0.5, 0.5);
+    } else if op == "sxdg" {
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            0.5, -0.5, 0.5, 0.5,
+            0.5, 0.5, 0.5, -0.5);
+    } else if op == "y" {
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            0.0, 0.0, 0.0, -1.0,
+            0.0, 1.0, 0.0, 0.0);
+    } else if op == "z" {
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, -1.0, 0.0);
+    } else if op == "s" {
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 1.0);
+    } else if op == "sdg" {
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, -1.0);
+    } else if op == "t" {
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, _INV_SQRT2, _INV_SQRT2);
+    } else if op == "tdg" {
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, _INV_SQRT2, 0.0 - _INV_SQRT2);
+    } else if op == "rx" {
+        let half = gate.params[0] * 0.5;
+        let cv = num_cos(half);
+        let sv = num_sin(half);
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            cv, 0.0, 0.0, 0.0 - sv,
+            0.0, 0.0 - sv, cv, 0.0);
+    } else if op == "ry" {
+        let half = gate.params[0] * 0.5;
+        let cv = num_cos(half);
+        let sv = num_sin(half);
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            cv, 0.0, 0.0 - sv, 0.0,
+            sv, 0.0, cv, 0.0);
+    } else if op == "rz" {
+        let half = gate.params[0] * 0.5;
+        let cv = num_cos(half);
+        let sv = num_sin(half);
+        return _apply_1q_unitary_rho(rho, gate.targets[0],
+            cv, 0.0 - sv, 0.0, 0.0,
+            0.0, 0.0, cv, sv);
+    } else if op == "cx" or op == "cnot" {
+        let mc = bit_shl(1, n - 1 - gate.controls[0]);
+        let mt = bit_shl(1, n - 1 - gate.targets[0]);
+        return _swap_rho_rows_and_cols_cx(rho, mc, mt);
+    } else if op == "cz" {
+        let mc = bit_shl(1, n - 1 - gate.controls[0]);
+        let mt = bit_shl(1, n - 1 - gate.targets[0]);
+        return _apply_phase_mask_rho(rho, bit_or(mc, mt));
+    } else if op == "swap" {
+        let d = rho.dim;
+        let re = rho.re;
+        let im = rho.im;
+        let m0 = bit_shl(1, n - 1 - gate.targets[0]);
+        let m1 = bit_shl(1, n - 1 - gate.targets[1]);
+        let mpair = bit_or(m0, m1);
+        let r = 0;
+        while r < d {
+            if bit_and(r, m0) == 0 and bit_and(r, m1) != 0 {
+                let rp = bit_xor(r, mpair);
+                let off_a = r * d;
+                let off_b = rp * d;
+                let c = 0;
+                while c < d {
+                    let tr = re[off_a + c];
+                    let ti = im[off_a + c];
+                    re[off_a + c] = re[off_b + c];
+                    im[off_a + c] = im[off_b + c];
+                    re[off_b + c] = tr;
+                    im[off_b + c] = ti;
+                    c = c + 1;
+                }
+            }
+            r = r + 1;
+        }
+        r = 0;
+        while r < d {
+            let roff = r * d;
+            let c = 0;
+            while c < d {
+                if bit_and(c, m0) == 0 and bit_and(c, m1) != 0 {
+                    let cp = bit_xor(c, mpair);
+                    let tr = re[roff + c];
+                    let ti = im[roff + c];
+                    re[roff + c] = re[roff + cp];
+                    im[roff + c] = im[roff + cp];
+                    re[roff + cp] = tr;
+                    im[roff + cp] = ti;
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        return rho;
+    } else if op == "ccx" or op == "toffoli" {
+        let mc1 = bit_shl(1, n - 1 - gate.controls[0]);
+        let mc2 = bit_shl(1, n - 1 - gate.controls[1]);
+        let mt = bit_shl(1, n - 1 - gate.targets[0]);
+        return _swap_rho_rows_and_cols_cx(rho, bit_or(mc1, mc2), mt);
+    } else if op == "mcz" {
+        let mask_all = bit_shl(1, n - 1 - gate.targets[0]);
+        let k = 0;
+        while k < len(gate.controls) {
+            mask_all = bit_or(mask_all, bit_shl(1, n - 1 - gate.controls[k]));
+            k = k + 1;
+        }
+        return _apply_phase_mask_rho(rho, mask_all);
+    }
+    throw "qem_noise_tomography.density_apply_unitary_gate: unsupported gate op '" + op + "'";
+}
+
+// ── Kraus Operators & Physical Noise Channels ────────────────────────────────
+
+fn _make_kraus_op(dim, re, im) {
+    return map{
+        dim: dim,
+        re: re,
+        im: im
+    };
+}
+
+fn _normalize_kraus_op(kop) {
+    if is_map(kop) and map_has(kop, "re") and map_has(kop, "im") {
+        let d = if map_has(kop, "dim") { kop.dim } else { num_floor(num_sqrt(len(kop.re) * 1.0) + 0.5) };
+        return map{ dim: d, re: kop.re, im: kop.im };
+    }
+    if is_array(kop) and len(kop) > 0 and is_array(kop[0]) {
+        // 2D matrix of [re, im] pairs or real numbers
+        let d = len(kop);
+        let re = [];
+        let im = [];
+        let r = 0;
+        while r < d {
+            let c = 0;
+            while c < d {
+                let cell = kop[r][c];
+                if is_array(cell) {
+                    push(re, cell[0] * 1.0);
+                    push(im, cell[1] * 1.0);
+                } else {
+                    push(re, cell * 1.0);
+                    push(im, 0.0);
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        return map{ dim: d, re: re, im: im };
+    }
+    throw "qem_noise_tomography: invalid Kraus operator format";
+}
+
+fn verify_cptp_kraus(kraus_list) {
+    if not is_array(kraus_list) or len(kraus_list) == 0 {
+        throw "qem_noise_tomography.verify_cptp_kraus: kraus_list must be non-empty";
+    }
+    let first = _normalize_kraus_op(kraus_list[0]);
+    let m = first.dim;
+    let sum_re = _zeros(m * m);
+    let sum_im = _zeros(m * m);
+
+    let k = 0;
+    while k < len(kraus_list) {
+        let ek = _normalize_kraus_op(kraus_list[k]);
+        if ek.dim != m {
+            throw "qem_noise_tomography.verify_cptp_kraus: inconsistent Kraus dimensions";
+        }
+        let a = 0;
+        while a < m {
+            let b = 0;
+            while b < m {
+                let acc_r = 0.0;
+                let acc_i = 0.0;
+                let r = 0;
+                while r < m {
+                    // conj(E[r, a]) * E[r, b]
+                    let xr = ek.re[r * m + a];
+                    let xi = ek.im[r * m + a];
+                    let yr = ek.re[r * m + b];
+                    let yi = ek.im[r * m + b];
+                    acc_r = acc_r + (xr * yr + xi * yi);
+                    acc_i = acc_i + (xr * yi - xi * yr);
+                    r = r + 1;
+                }
+                sum_re[a * m + b] = sum_re[a * m + b] + acc_r;
+                sum_im[a * m + b] = sum_im[a * m + b] + acc_i;
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+        k = k + 1;
+    }
+
+    let max_dev = 0.0;
+    let a = 0;
+    while a < m {
+        let b = 0;
+        while b < m {
+            let target = if a == b { 1.0 } else { 0.0 };
+            let dr = sum_re[a * m + b] - target;
+            let di = sum_im[a * m + b];
+            let dev = num_sqrt(dr * dr + di * di);
+            if dev > max_dev {
+                max_dev = dev;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+
+    return map{
+        ok: max_dev < 0.0000000001,
+        dim: m,
+        n_operators: len(kraus_list),
+        max_deviation: max_dev
+    };
+}
+
+fn apply_kraus_1q(rho, target_q, kraus_list) {
+    let n = rho.n_qubits;
+    if target_q < 0 or target_q >= n {
+        throw "qem_noise_tomography.apply_kraus_1q: target_q out of range";
+    }
+    let d = rho.dim;
+    let out_re = _zeros(d * d);
+    let out_im = _zeros(d * d);
+
+    let k = 0;
+    while k < len(kraus_list) {
+        let ek = _normalize_kraus_op(kraus_list[k]);
+        if ek.dim != 2 {
+            throw "qem_noise_tomography.apply_kraus_1q: expected 2x2 Kraus operator";
+        }
+        _accumulate_1q_sandwich(rho.re, rho.im, out_re, out_im, n, d, target_q,
+            ek.re[0], ek.im[0], ek.re[1], ek.im[1],
+            ek.re[2], ek.im[2], ek.re[3], ek.im[3]);
+        k = k + 1;
+    }
+    rho.re = out_re;
+    rho.im = out_im;
+    return rho;
+}
+
+fn apply_kraus_2q(rho, q0, q1, kraus_list) {
+    let n = rho.n_qubits;
+    if q0 < 0 or q0 >= n or q1 < 0 or q1 >= n or q0 == q1 {
+        throw "qem_noise_tomography.apply_kraus_2q: q0 and q1 must be distinct qubits in 0..n-1";
+    }
+    let d = rho.dim;
+    let n2 = d * d;
+    let m0 = bit_shl(1, n - 1 - q0);
+    let m1 = bit_shl(1, n - 1 - q1);
+    let m_both = bit_or(m0, m1);
+
+    let out_re = _zeros(n2);
+    let out_im = _zeros(n2);
+
+    // Precompute base indices where both q0 and q1 bits are 0
+    let bases = [];
+    let idx = 0;
+    while idx < d {
+        if bit_and(idx, m_both) == 0 {
+            push(bases, idx);
+        }
+        idx = idx + 1;
+    }
+
+    let k = 0;
+    while k < len(kraus_list) {
+        let ek = _normalize_kraus_op(kraus_list[k]);
+        if ek.dim != 4 {
+            throw "qem_noise_tomography.apply_kraus_2q: expected 4x4 Kraus operator";
+        }
+        let ere = ek.re;
+        let eim = ek.im;
+
+        let tmp_re = _zeros(n2);
+        let tmp_im = _zeros(n2);
+
+        // Step 1: T = E_k * rho
+        let bi = 0;
+        while bi < len(bases) {
+            let rb = bases[bi];
+            let r_idx = [rb, bit_or(rb, m1), bit_or(rb, m0), bit_or(rb, m_both)];
+            let a = 0;
+            while a < 4 {
+                let b = 0;
+                while b < 4 {
+                    let er = ere[a * 4 + b];
+                    let ei = eim[a * 4 + b];
+                    if er != 0.0 or ei != 0.0 {
+                        let dst_off = r_idx[a] * d;
+                        let src_off = r_idx[b] * d;
+                        let c = 0;
+                        while c < d {
+                            let xr = rho.re[src_off + c];
+                            let xi = rho.im[src_off + c];
+                            tmp_re[dst_off + c] = tmp_re[dst_off + c] + (er * xr - ei * xi);
+                            tmp_im[dst_off + c] = tmp_im[dst_off + c] + (er * xi + ei * xr);
+                            c = c + 1;
+                        }
+                    }
+                    b = b + 1;
+                }
+                a = a + 1;
+            }
+            bi = bi + 1;
+        }
+
+        // Step 2: out += T * E_k^dagger -> (T * E_k^dagger)[r, c_b] = sum_a T[r, c_a] * conj(E_k[b, a])
+        let b = 0;
+        while b < 4 {
+            let a = 0;
+            while a < 4 {
+                let er = ere[b * 4 + a];
+                let ei = eim[b * 4 + a];
+                if er != 0.0 or ei != 0.0 {
+                    let cj = 0;
+                    while cj < len(bases) {
+                        let cb = bases[cj];
+                        let c_a = if a == 0 { cb } else if a == 1 { bit_or(cb, m1) } else if a == 2 { bit_or(cb, m0) } else { bit_or(cb, m_both) };
+                        let c_b = if b == 0 { cb } else if b == 1 { bit_or(cb, m1) } else if b == 2 { bit_or(cb, m0) } else { bit_or(cb, m_both) };
+                        let r = 0;
+                        while r < d {
+                            let roff = r * d;
+                            let tr = tmp_re[roff + c_a];
+                            let ti = tmp_im[roff + c_a];
+                            // (tr + i*ti) * (er - i*ei)
+                            out_re[roff + c_b] = out_re[roff + c_b] + (tr * er + ti * ei);
+                            out_im[roff + c_b] = out_im[roff + c_b] + (ti * er - tr * ei);
+                            r = r + 1;
+                        }
+                        cj = cj + 1;
+                    }
+                }
+                a = a + 1;
+            }
+            b = b + 1;
+        }
+
+        k = k + 1;
+    }
+
+    rho.re = out_re;
+    rho.im = out_im;
+    return rho;
+}
+
+fn _pauli_1q_mats() {
+    return [
+        // I
+        map{ name: "I", re: [1.0, 0.0, 0.0, 1.0], im: [0.0, 0.0, 0.0, 0.0] },
+        // X
+        map{ name: "X", re: [0.0, 1.0, 1.0, 0.0], im: [0.0, 0.0, 0.0, 0.0] },
+        // Y
+        map{ name: "Y", re: [0.0, 0.0, 0.0, 0.0], im: [0.0, -1.0, 1.0, 0.0] },
+        // Z
+        map{ name: "Z", re: [1.0, 0.0, 0.0, -1.0], im: [0.0, 0.0, 0.0, 0.0] }
+    ];
+}
+
+fn kraus_depolarizing_1q(p) {
+    if p < 0.0 or p > (4.0 / 3.0) + 0.000000000001 {
+        throw "qem_noise_tomography.kraus_depolarizing_1q: p must be in [0, 4/3]";
+    }
+    let w0 = num_sqrt(num_max(0.0, 1.0 - 0.75 * p));
+    let wk = num_sqrt(num_max(0.0, 0.25 * p));
+    let pmats = _pauli_1q_mats();
+    let ops = [];
+    let idx = 0;
+    while idx < 4 {
+        let w = if idx == 0 { w0 } else { wk };
+        let re = [];
+        let im = [];
+        let j = 0;
+        while j < 4 {
+            push(re, w * pmats[idx].re[j]);
+            push(im, w * pmats[idx].im[j]);
+            j = j + 1;
+        }
+        push(ops, _make_kraus_op(2, re, im));
+        idx = idx + 1;
+    }
+    return ops;
+}
+
+fn kraus_depolarizing_2q(p) {
+    if p < 0.0 or p > (16.0 / 15.0) + 0.000000000001 {
+        throw "qem_noise_tomography.kraus_depolarizing_2q: p must be in [0, 16/15]";
+    }
+    let w0 = num_sqrt(num_max(0.0, 1.0 - p));
+    let wk = num_sqrt(num_max(0.0, p / 15.0));
+    let pmats = _pauli_1q_mats();
+    let ops = [];
+
+    let p0 = 0;
+    while p0 < 4 {
+        let p1 = 0;
+        while p1 < 4 {
+            let w = if p0 == 0 and p1 == 0 { w0 } else { wk };
+            let re = _zeros(16);
+            let im = _zeros(16);
+            let r0 = 0;
+            while r0 < 2 {
+                let c0 = 0;
+                while c0 < 2 {
+                    let ar = pmats[p0].re[r0 * 2 + c0];
+                    let ai = pmats[p0].im[r0 * 2 + c0];
+                    let r1 = 0;
+                    while r1 < 2 {
+                        let c1 = 0;
+                        while c1 < 2 {
+                            let br = pmats[p1].re[r1 * 2 + c1];
+                            let bi = pmats[p1].im[r1 * 2 + c1];
+                            let row = r0 * 2 + r1;
+                            let col = c0 * 2 + c1;
+                            re[row * 4 + col] = w * (ar * br - ai * bi);
+                            im[row * 4 + col] = w * (ar * bi + ai * br);
+                            c1 = c1 + 1;
+                        }
+                        r1 = r1 + 1;
+                    }
+                    c0 = c0 + 1;
+                }
+                r0 = r0 + 1;
+            }
+            push(ops, _make_kraus_op(4, re, im));
+            p1 = p1 + 1;
+        }
+        p0 = p0 + 1;
+    }
+    return ops;
+}
+
+fn kraus_amplitude_damping(gamma) {
+    if gamma < 0.0 or gamma > 1.0 + 0.000000000001 {
+        throw "qem_noise_tomography.kraus_amplitude_damping: gamma must be in [0, 1]";
+    }
+    let g = num_min(1.0, num_max(0.0, gamma));
+    let s1mg = num_sqrt(1.0 - g);
+    let sg = num_sqrt(g);
+    let e0 = _make_kraus_op(2, [1.0, 0.0, 0.0, s1mg], [0.0, 0.0, 0.0, 0.0]);
+    let e1 = _make_kraus_op(2, [0.0, sg, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]);
+    return [e0, e1];
+}
+
+fn kraus_phase_damping(lam) {
+    if lam < 0.0 or lam > 1.0 + 0.000000000001 {
+        throw "qem_noise_tomography.kraus_phase_damping: lam must be in [0, 1]";
+    }
+    let lv = num_min(1.0, num_max(0.0, lam));
+    let s1ml = num_sqrt(1.0 - lv);
+    let sl = num_sqrt(lv);
+    let e0 = _make_kraus_op(2, [1.0, 0.0, 0.0, s1ml], [0.0, 0.0, 0.0, 0.0]);
+    let e1 = _make_kraus_op(2, [0.0, 0.0, 0.0, sl], [0.0, 0.0, 0.0, 0.0]);
+    return [e0, e1];
+}
+
+fn kraus_thermal_t1_t2(gate_ns, t1_ns, t2_ns) {
+    if gate_ns < 0.0 {
+        throw "qem_noise_tomography.kraus_thermal_t1_t2: gate_ns must be >= 0";
+    }
+    if t1_ns <= 0.0 or t2_ns <= 0.0 {
+        throw "qem_noise_tomography.kraus_thermal_t1_t2: t1_ns and t2_ns must be > 0";
+    }
+    // Enforce physical Markovian bound T2 <= 2*T1 via pure dephasing rate:
+    // 1/T_phi = max(0, 1/T2 - 1/(2*T1))
+    let gamma1 = 1.0 - num_exp(0.0 - (gate_ns / t1_ns));
+    let rate_phi = num_max(0.0, (1.0 / t2_ns) - (1.0 / (2.0 * t1_ns)));
+    // Off-diagonal coherence scales as sqrt(1 - gamma1) * sqrt(1 - lam_phi) = exp(-t/(2*T1)) * exp(-t/T_phi) = exp(-t/T2_eff)
+    let lam_phi = 1.0 - num_exp(0.0 - 2.0 * gate_ns * rate_phi);
+
+    let k00 = num_sqrt(num_max(0.0, (1.0 - gamma1) * (1.0 - lam_phi)));
+    let k1 = num_sqrt(num_max(0.0, gamma1));
+    let k2 = num_sqrt(num_max(0.0, (1.0 - gamma1) * lam_phi));
+
+    let op0 = _make_kraus_op(2, [1.0, 0.0, 0.0, k00], [0.0, 0.0, 0.0, 0.0]);
+    let op1 = _make_kraus_op(2, [0.0, k1, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]);
+    let op2 = _make_kraus_op(2, [0.0, 0.0, 0.0, k2], [0.0, 0.0, 0.0, 0.0]);
+    return [op0, op1, op2];
+}
+
+// ── Hermitian Eigensolver (2d x 2d Real Symmetric Jacobi) & Entropy ──────────
+
+fn _sort_desc_pairs(vals, vecs, n_dim, has_vecs) {
+    let i = 0;
+    while i < n_dim - 1 {
+        let best = i;
+        let j = i + 1;
+        while j < n_dim {
+            if vals[j] > vals[best] {
+                best = j;
+            }
+            j = j + 1;
+        }
+        if best != i {
+            let tv = vals[i];
+            vals[i] = vals[best];
+            vals[best] = tv;
+            if has_vecs {
+                let r = 0;
+                while r < n_dim {
+                    let tq = vecs[r * n_dim + i];
+                    vecs[r * n_dim + i] = vecs[r * n_dim + best];
+                    vecs[r * n_dim + best] = tq;
+                    r = r + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn _hermitian_eigensystem(re_mat, im_mat, d, need_vectors) {
+    // Fast diagonal check (O(d^2)) for diagonal / computational states
+    let off_norm2 = 0.0;
+    let r = 0;
+    while r < d {
+        let c = 0;
+        while c < d {
+            if r != c {
+                let vr = re_mat[r * d + c];
+                let vi = im_mat[r * d + c];
+                off_norm2 = off_norm2 + vr * vr + vi * vi;
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+
+    if not need_vectors and off_norm2 < 1.0e-28 {
+        let evals = [];
+        let i = 0;
+        while i < d {
+            push(evals, re_mat[i * d + i]);
+            i = i + 1;
+        }
+        _sort_desc_pairs(evals, [], d, false);
+        return map{ eigenvalues: evals, q_real: [], dim2: 2 * d };
+    }
+
+    // Build 2d x 2d real symmetric block matrix:
+    // M = [  Re(H)   -Im(H) ]
+    //     [  Im(H)    Re(H) ]
+    let n2 = 2 * d;
+    let a_mat = _zeros(n2 * n2);
+    r = 0;
+    while r < d {
+        let c = 0;
+        while c < d {
+            // Symmetrize Re and skew-symmetrize Im to guard against 1e-16 numeric drift
+            let h_re = 0.5 * (re_mat[r * d + c] + re_mat[c * d + r]);
+            let h_im = 0.5 * (im_mat[r * d + c] - im_mat[c * d + r]);
+            a_mat[r * n2 + c] = h_re;
+            a_mat[(r + d) * n2 + (c + d)] = h_re;
+            a_mat[r * n2 + (c + d)] = 0.0 - h_im;
+            a_mat[(r + d) * n2 + c] = h_im;
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+
+    let q_mat = [];
+    if need_vectors {
+        q_mat = _zeros(n2 * n2);
+        let i = 0;
+        while i < n2 {
+            q_mat[i * n2 + i] = 1.0;
+            i = i + 1;
+        }
+    }
+
+    let max_sweeps = 60;
+    let sweep = 0;
+    let eps = 1.0e-13;
+    while sweep < max_sweeps {
+        let max_off = 0.0;
+        let p = 0;
+        while p < n2 - 1 {
+            let q = p + 1;
+            while q < n2 {
+                let apq = a_mat[p * n2 + q];
+                let abs_apq = num_abs(apq);
+                if abs_apq > max_off {
+                    max_off = abs_apq;
+                }
+                if abs_apq > eps {
+                    let app = a_mat[p * n2 + p];
+                    let aqq = a_mat[q * n2 + q];
+                    let tau = (aqq - app) / (2.0 * apq);
+                    let t_val = if tau >= 0.0 {
+                        1.0 / (tau + num_sqrt(1.0 + tau * tau))
+                    } else {
+                        -1.0 / ((0.0 - tau) + num_sqrt(1.0 + tau * tau))
+                    };
+                    let cv = 1.0 / num_sqrt(1.0 + t_val * t_val);
+                    let sv = t_val * cv;
+
+                    a_mat[p * n2 + p] = app - t_val * apq;
+                    a_mat[q * n2 + q] = aqq + t_val * apq;
+                    a_mat[p * n2 + q] = 0.0;
+                    a_mat[q * n2 + p] = 0.0;
+
+                    let k = 0;
+                    while k < n2 {
+                        if k != p and k != q {
+                            let akp = a_mat[k * n2 + p];
+                            let akq = a_mat[k * n2 + q];
+                            let nkp = cv * akp - sv * akq;
+                            let nkq = sv * akp + cv * akq;
+                            a_mat[k * n2 + p] = nkp;
+                            a_mat[p * n2 + k] = nkp;
+                            a_mat[k * n2 + q] = nkq;
+                            a_mat[q * n2 + k] = nkq;
+                        }
+                        k = k + 1;
+                    }
+
+                    if need_vectors {
+                        let k2 = 0;
+                        while k2 < n2 {
+                            let qkp = q_mat[k2 * n2 + p];
+                            let qkq = q_mat[k2 * n2 + q];
+                            q_mat[k2 * n2 + p] = cv * qkp - sv * qkq;
+                            q_mat[k2 * n2 + q] = sv * qkp + cv * qkq;
+                            k2 = k2 + 1;
+                        }
+                    }
+                }
+                q = q + 1;
+            }
+            p = p + 1;
+        }
+        if max_off <= eps {
+            break;
+        }
+        sweep = sweep + 1;
+    }
+
+    let raw_eigs = [];
+    let idx = 0;
+    while idx < n2 {
+        push(raw_eigs, a_mat[idx * n2 + idx]);
+        idx = idx + 1;
+    }
+    _sort_desc_pairs(raw_eigs, q_mat, n2, need_vectors);
+
+    // Every complex Hermitian eigenvalue appears as a Kramers-like real pair (e_{2k}, e_{2k+1}) in M
+    let evals = [];
+    let k = 0;
+    while k < d {
+        push(evals, 0.5 * (raw_eigs[2 * k] + raw_eigs[2 * k + 1]));
+        k = k + 1;
+    }
+    return map{
+        eigenvalues: evals,
+        q_real: q_mat,
+        dim2: n2
+    };
+}
+
+fn purity(rho) {
+    let d = rho.dim;
+    let re = rho.re;
+    let im = rho.im;
+    let acc = 0.0;
+    let r = 0;
+    while r < d {
+        let c = 0;
+        while c < d {
+            // Re(rho[r, c] * rho[c, r])
+            acc = acc + (re[r * d + c] * re[c * d + r] - im[r * d + c] * im[c * d + r]);
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return acc;
+}
+
+fn von_neumann_entropy(rho) {
+    let eig = _hermitian_eigensystem(rho.re, rho.im, rho.dim, false);
+    let evals = eig.eigenvalues;
+    let ent = 0.0;
+    let i = 0;
+    while i < len(evals) {
+        let lam = evals[i];
+        if lam > 1.0e-14 {
+            ent = ent - lam * (num_ln(lam) / _LN2);
+        }
+        i = i + 1;
+    }
+    if ent < 0.0 and ent > -1.0e-12 {
+        return 0.0;
+    }
+    return ent;
+}
+
+fn partial_trace(rho, keep_qubits) {
+    let n = rho.n_qubits;
+    if not is_array(keep_qubits) or len(keep_qubits) < 1 or len(keep_qubits) > n {
+        throw "qem_noise_tomography.partial_trace: keep_qubits must have 1..n_qubits distinct indices";
+    }
+    let k_len = len(keep_qubits);
+    let kept_flags = [];
+    let q = 0;
+    while q < n {
+        push(kept_flags, false);
+        q = q + 1;
+    }
+    let j = 0;
+    while j < k_len {
+        let kq = keep_qubits[j];
+        if kq < 0 or kq >= n or kept_flags[kq] {
+            throw "qem_noise_tomography.partial_trace: invalid or duplicate qubit in keep_qubits";
+        }
+        kept_flags[kq] = true;
+        j = j + 1;
+    }
+
+    let trace_qubits = [];
+    q = 0;
+    while q < n {
+        if not kept_flags[q] {
+            push(trace_qubits, q);
+        }
+        q = q + 1;
+    }
+
+    let d_keep = bit_shl(1, k_len);
+    let m_len = len(trace_qubits);
+    let d_env = bit_shl(1, m_len);
+    let d_full = rho.dim;
+
+    // Precompute bit embeddings for kept subsystem A and traced-out subsystem B
+    let keep_embed = [];
+    let a_idx = 0;
+    while a_idx < d_keep {
+        let emb = 0;
+        let bit_pos = 0;
+        while bit_pos < k_len {
+            if bit_and(a_idx, bit_shl(1, k_len - 1 - bit_pos)) != 0 {
+                emb = bit_or(emb, bit_shl(1, n - 1 - keep_qubits[bit_pos]));
+            }
+            bit_pos = bit_pos + 1;
+        }
+        push(keep_embed, emb);
+        a_idx = a_idx + 1;
+    }
+
+    let env_embed = [];
+    let e_idx = 0;
+    while e_idx < d_env {
+        let emb = 0;
+        let bit_pos = 0;
+        while bit_pos < m_len {
+            if bit_and(e_idx, bit_shl(1, m_len - 1 - bit_pos)) != 0 {
+                emb = bit_or(emb, bit_shl(1, n - 1 - trace_qubits[bit_pos]));
+            }
+            bit_pos = bit_pos + 1;
+        }
+        push(env_embed, emb);
+        e_idx = e_idx + 1;
+    }
+
+    let out_re = _zeros(d_keep * d_keep);
+    let out_im = _zeros(d_keep * d_keep);
+
+    let ra = 0;
+    while ra < d_keep {
+        let r_base = keep_embed[ra];
+        let ca = 0;
+        while ca < d_keep {
+            let c_base = keep_embed[ca];
+            let sum_r = 0.0;
+            let sum_i = 0.0;
+            let ev = 0;
+            while ev < d_env {
+                let e_bits = env_embed[ev];
+                let r_full = bit_or(r_base, e_bits);
+                let c_full = bit_or(c_base, e_bits);
+                let flat = r_full * d_full + c_full;
+                sum_r = sum_r + rho.re[flat];
+                sum_i = sum_i + rho.im[flat];
+                ev = ev + 1;
+            }
+            out_re[ra * d_keep + ca] = sum_r;
+            out_im[ra * d_keep + ca] = sum_i;
+            ca = ca + 1;
+        }
+        ra = ra + 1;
+    }
+
+    return map{
+        format: "pblang.quantum.density_matrix.v1",
+        n_qubits: k_len,
+        dim: d_keep,
+        re: out_re,
+        im: out_im
+    };
+}
+
+fn density_state_fidelity(pure_circuit_or_sv, rho) {
+    let info = _extract_amplitudes(pure_circuit_or_sv);
+    if info.dim != rho.dim {
+        throw "qem_noise_tomography.density_state_fidelity: dimension mismatch";
+    }
+    let d = rho.dim;
+    let amps = info.amplitudes;
+    let re = rho.re;
+    let im = rho.im;
+
+    // <psi | rho | psi> = sum_{r, c} conj(psi[r]) * rho[r, c] * psi[c]
+    let total_re = 0.0;
+    let r = 0;
+    while r < d {
+        let wr = 0.0;
+        let wi = 0.0;
+        let roff = r * d;
+        let c = 0;
+        while c < d {
+            let pr = amps[c][0];
+            let pi = amps[c][1];
+            let r_re = re[roff + c];
+            let r_im = im[roff + c];
+            wr = wr + (r_re * pr - r_im * pi);
+            wi = wi + (r_re * pi + r_im * pr);
+            c = c + 1;
+        }
+        // conj(amps[r]) * (wr + i*wi) -> real part = amps[r][0]*wr + amps[r][1]*wi
+        total_re = total_re + (amps[r][0] * wr + amps[r][1] * wi);
+        r = r + 1;
+    }
+    return total_re;
+}
+
+fn trace_distance(rho1, rho2) {
+    if rho1.dim != rho2.dim {
+        throw "qem_noise_tomography.trace_distance: dimension mismatch";
+    }
+    let d = rho1.dim;
+    let n2 = d * d;
+    let diff_re = _zeros(n2);
+    let diff_im = _zeros(n2);
+    let i = 0;
+    while i < n2 {
+        diff_re[i] = rho1.re[i] - rho2.re[i];
+        diff_im[i] = rho1.im[i] - rho2.im[i];
+        i = i + 1;
+    }
+    let eig = _hermitian_eigensystem(diff_re, diff_im, d, false);
+    let evals = eig.eigenvalues;
+    let sum_abs = 0.0;
+    let k = 0;
+    while k < len(evals) {
+        sum_abs = sum_abs + num_abs(evals[k]);
+        k = k + 1;
+    }
+    return 0.5 * sum_abs;
+}
+
+// Exact O(2^n) expectation value Tr(rho * P) for an n-qubit Pauli string P in {I, X, Y, Z}^n
+// or weighted Pauli map { "ZZI": 1.0, ... }
+fn density_pauli_expectation(rho, pauli_or_obs) {
+    if is_map(pauli_or_obs) {
+        let keys = map_keys(pauli_or_obs);
+        let acc = 0.0;
+        let i = 0;
+        while i < len(keys) {
+            let pstr = keys[i];
+            acc = acc + pauli_or_obs[pstr] * density_pauli_expectation(rho, pstr);
+            i = i + 1;
+        }
+        return acc;
+    }
+    let pstr = str_upper(str_trim(str(pauli_or_obs)));
+    let n = rho.n_qubits;
+    if len(pstr) != n {
+        throw "qem_noise_tomography.density_pauli_expectation: Pauli string length " + str(len(pstr)) + " != n_qubits " + str(n);
+    }
+    let flip_mask = 0;
+    let y_mask = 0;
+    let z_mask = 0;
+    let n_y = 0;
+    let q = 0;
+    while q < n {
+        let ch = str_slice(pstr, q, q + 1);
+        let bit_m = bit_shl(1, n - 1 - q);
+        if ch == "X" {
+            flip_mask = bit_or(flip_mask, bit_m);
+        } else if ch == "Y" {
+            flip_mask = bit_or(flip_mask, bit_m);
+            y_mask = bit_or(y_mask, bit_m);
+            n_y = n_y + 1;
+        } else if ch == "Z" {
+            z_mask = bit_or(z_mask, bit_m);
+        } else if ch != "I" {
+            throw "qem_noise_tomography.density_pauli_expectation: unknown Pauli char '" + ch + "'";
+        }
+        q = q + 1;
+    }
+
+    // i^(n_y) = (1, i, -1, -i) for n_y mod 4 = (0, 1, 2, 3)
+    let ny_mod = n_y - 4 * num_floor(n_y / 4.0);
+    let base_re = if ny_mod == 0 { 1.0 } else if ny_mod == 2 { -1.0 } else { 0.0 };
+    let base_im = if ny_mod == 1 { 1.0 } else if ny_mod == 3 { -1.0 } else { 0.0 };
+
+    let d = rho.dim;
+    let yz_mask = bit_or(y_mask, z_mask);
+    let total_re = 0.0;
+    let c = 0;
+    while c < d {
+        let r = bit_xor(c, flip_mask);
+        // Count set bits in (c & yz_mask)
+        let v = bit_and(c, yz_mask);
+        let parity = 0;
+        while v != 0 {
+            parity = bit_xor(parity, bit_and(v, 1));
+            v = bit_shr(v, 1);
+        }
+        let sgn = if parity == 0 { 1.0 } else { -1.0 };
+        let ar = sgn * base_re;
+        let ai = sgn * base_im;
+        let r_re = rho.re[c * d + r];
+        let r_im = rho.im[c * d + r];
+        total_re = total_re + (ar * r_re - ai * r_im);
+        c = c + 1;
+    }
+    return total_re;
+}
+
+// ── Probability Simplex Projection & Readout Confusion Matrix Helpers ────────
+
+// Michelot / Duchi / Smolin-Gambetta exact Euclidean projection onto { p_i >= 0, sum_i p_i = 1 }
+fn project_probability_simplex(vec) {
+    let m = len(vec);
+    if m == 0 {
+        return [];
+    }
+    let sorted = _clone_num_array(vec);
+    _sort_desc_pairs(sorted, [], m, false);
+
+    let prefix_sum = 0.0;
+    let best_k = 0;
+    let i = 0;
+    while i < m {
+        prefix_sum = prefix_sum + sorted[i];
+        let candidate = sorted[i] + (1.0 - prefix_sum) / ((i + 1) * 1.0);
+        if candidate > 0.0 {
+            best_k = i;
+        }
+        i = i + 1;
+    }
+
+    let sum_k = 0.0;
+    i = 0;
+    while i <= best_k {
+        sum_k = sum_k + sorted[i];
+        i = i + 1;
+    }
+    let theta = (1.0 - sum_k) / ((best_k + 1) * 1.0);
+
+    let out = [];
+    let norm = 0.0;
+    i = 0;
+    while i < m {
+        let v = num_max(0.0, vec[i] + theta);
+        push(out, v);
+        norm = norm + v;
+        i = i + 1;
+    }
+    if norm > 0.0 {
+        i = 0;
+        while i < m {
+            out[i] = out[i] / norm;
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn _kron_real_matrices(a_mat, b_mat) {
+    let ra = len(a_mat);
+    let ca = len(a_mat[0]);
+    let rb = len(b_mat);
+    let cb = len(b_mat[0]);
+    let out = [];
+    let i = 0;
+    while i < ra * rb {
+        push(out, _zeros(ca * cb));
+        i = i + 1;
+    }
+    let ia = 0;
+    while ia < ra {
+        let ja = 0;
+        while ja < ca {
+            let v = a_mat[ia][ja];
+            let ib = 0;
+            while ib < rb {
+                let jb = 0;
+                while jb < cb {
+                    out[ia * rb + ib][ja * cb + jb] = v * b_mat[ib][jb];
+                    jb = jb + 1;
+                }
+                ib = ib + 1;
+            }
+            ja = ja + 1;
+        }
+        ia = ia + 1;
+    }
+    return out;
+}
+
+fn build_readout_confusion_matrix(spec, n_qubits = nil) {
+    if is_map(spec) and map_has(spec, "format") and spec.format == "pblang.quantum.confusion_matrix.v1" {
+        return spec;
+    }
+
+    // Case 1: Uniform error map { p01, p10 } or { eps01, eps10 } + n_qubits
+    if is_map(spec) and (map_has(spec, "p01") or map_has(spec, "eps01") or map_has(spec, "e01")) {
+        if n_qubits == nil or n_qubits < 1 {
+            throw "qem_noise_tomography.build_readout_confusion_matrix: n_qubits required for uniform readout error map";
+        }
+        let e01 = if map_has(spec, "p01") { spec.p01 } else if map_has(spec, "eps01") { spec.eps01 } else { spec.e01 };
+        let e10 = if map_has(spec, "p10") { spec.p10 } else if map_has(spec, "eps10") { spec.eps10 } else { spec.e10 };
+        let per_q = [];
+        let q = 0;
+        while q < n_qubits {
+            push(per_q, [e01 * 1.0, e10 * 1.0]);
+            q = q + 1;
+        }
+        return build_readout_confusion_matrix(per_q, n_qubits);
+    }
+
+    // Case 2: Calibration counts map keyed by prepared bitstring { "00": {"00": 990, "01": 10}, ... }
+    if is_map(spec) {
+        let keys = map_keys(spec);
+        if len(keys) > 0 {
+            let n = if n_qubits != nil { n_qubits } else { len(keys[0]) };
+            let d = bit_shl(1, n);
+            let mat = [];
+            let r = 0;
+            while r < d {
+                push(mat, _zeros(d));
+                r = r + 1;
+            }
+            let col = 0;
+            while col < d {
+                let b_prep = _bitstring(col, n);
+                if map_has(spec, b_prep) {
+                    let cmap = spec[b_prep];
+                    let ckeys = map_keys(cmap);
+                    let tot = 0.0;
+                    let ki = 0;
+                    while ki < len(ckeys) {
+                        tot = tot + cmap[ckeys[ki]];
+                        ki = ki + 1;
+                    }
+                    if tot > 0.0 {
+                        ki = 0;
+                        while ki < len(ckeys) {
+                            let row = _parse_bitstring(ckeys[ki]);
+                            mat[row][col] = cmap[ckeys[ki]] / tot;
+                            ki = ki + 1;
+                        }
+                    } else {
+                        mat[col][col] = 1.0;
+                    }
+                } else {
+                    mat[col][col] = 1.0;
+                }
+                col = col + 1;
+            }
+            return map{
+                format: "pblang.quantum.confusion_matrix.v1",
+                n_qubits: n,
+                dim: d,
+                matrix: mat,
+                per_qubit: nil
+            };
+        }
+    }
+
+    if is_array(spec) and len(spec) > 0 {
+        // Distinguish per-qubit error rates [[eps01, eps10], ...] (or [{p01, p10}, ...])
+        // from full 2^n x 2^n calibration matrix (when len(spec) == len(spec[0]) and not 2x2 unless explicitly full).
+        let is_per_qubit = false;
+        if is_map(spec[0]) {
+            is_per_qubit = true;
+        } else if is_array(spec[0]) and len(spec[0]) == 2 {
+            // Note: for n_qubits == 1, a 2x2 matrix has column sums == 1.0, whereas [eps01, eps10] is a 1-element list [[e01, e10]] (len 1 != 2)
+            // For len(spec) == 2 and len(spec[0]) == 2: if n_qubits == 1, it is a full 2x2 matrix; if n_qubits == 2 (or col sum != 1), it is 2 qubits of [e01, e10]!
+            if len(spec) != 2 {
+                is_per_qubit = true;
+            } else if n_qubits == 2 {
+                is_per_qubit = true;
+            } else if n_qubits == 1 {
+                is_per_qubit = false;
+            } else {
+                let col0_sum = spec[0][0] + spec[1][0];
+                let col1_sum = spec[0][1] + spec[1][1];
+                if num_abs(col0_sum - 1.0) > 0.000001 or num_abs(col1_sum - 1.0) > 0.000001 {
+                    is_per_qubit = true;
+                }
+            }
+        }
+
+        if is_per_qubit {
+            let n = len(spec);
+            let cur_mat = [[1.0]];
+            let per_q = [];
+            let q = 0;
+            while q < n {
+                let item = spec[q];
+                let e01 = if is_map(item) {
+                    if map_has(item, "p01") { item.p01 } else if map_has(item, "eps01") { item.eps01 } else { item.e01 }
+                } else {
+                    item[0]
+                };
+                let e10 = if is_map(item) {
+                    if map_has(item, "p10") { item.p10 } else if map_has(item, "eps10") { item.eps10 } else { item.e10 }
+                } else {
+                    item[1]
+                };
+                if e01 < 0.0 or e01 > 1.0 or e10 < 0.0 or e10 > 1.0 {
+                    throw "qem_noise_tomography.build_readout_confusion_matrix: error rates must be in [0, 1]";
+                }
+                push(per_q, [e01 * 1.0, e10 * 1.0]);
+                let mq = [
+                    [1.0 - e01, e10 * 1.0],
+                    [e01 * 1.0, 1.0 - e10]
+                ];
+                cur_mat = _kron_real_matrices(cur_mat, mq);
+                q = q + 1;
+            }
+            return map{
+                format: "pblang.quantum.confusion_matrix.v1",
+                n_qubits: n,
+                dim: bit_shl(1, n),
+                matrix: cur_mat,
+                per_qubit: per_q
+            };
+        }
+
+        // Full 2^n x 2^n matrix
+        let d = len(spec);
+        let n = _log2_int(d);
+        let mat = [];
+        let r = 0;
+        while r < d {
+            if not is_array(spec[r]) or len(spec[r]) != d {
+                throw "qem_noise_tomography.build_readout_confusion_matrix: matrix must be square 2^n x 2^n";
+            }
+            push(mat, _clone_num_array(spec[r]));
+            r = r + 1;
+        }
+        return map{
+            format: "pblang.quantum.confusion_matrix.v1",
+            n_qubits: n,
+            dim: d,
+            matrix: mat,
+            per_qubit: nil
+        };
+    }
+
+    throw "qem_noise_tomography.build_readout_confusion_matrix: unsupported confusion specification";
+}
+
+// ── Noisy Open-System Circuit Simulator ──────────────────────────────────────
+
+fn _gate_involved_qubits(gate) {
+    let qs = [];
+    if map_has(gate, "controls") and is_array(gate.controls) {
+        let i = 0;
+        while i < len(gate.controls) {
+            push(qs, gate.controls[i]);
+            i = i + 1;
+        }
+    }
+    if map_has(gate, "targets") and is_array(gate.targets) {
+        let j = 0;
+        while j < len(gate.targets) {
+            push(qs, gate.targets[j]);
+            j = j + 1;
+        }
+    }
+    return qs;
+}
+
+fn simulate_noisy_circuit(circuit, noise_spec = nil) {
+    let n = circuit.n_qubits;
+    if n < 1 or n > 7 {
+        throw "qem_noise_tomography.simulate_noisy_circuit: n_qubits must be in 1..7, got " + str(n);
+    }
+    let rho = new_density_matrix(n);
+    let has_noise = is_map(noise_spec);
+
+    let dep1 = if has_noise and map_has(noise_spec, "depol_1q") { noise_spec.depol_1q }
+               else if has_noise and map_has(noise_spec, "p1") { noise_spec.p1 } else { 0.0 };
+    let dep2 = if has_noise and map_has(noise_spec, "depol_2q") { noise_spec.depol_2q }
+               else if has_noise and map_has(noise_spec, "p2") { noise_spec.p2 } else { 0.0 };
+    let amp_g = if has_noise and map_has(noise_spec, "amplitude_damping") { noise_spec.amplitude_damping }
+                else if has_noise and map_has(noise_spec, "gamma") { noise_spec.gamma } else { 0.0 };
+    let ph_l = if has_noise and map_has(noise_spec, "phase_damping") { noise_spec.phase_damping }
+               else if has_noise and map_has(noise_spec, "lam") { noise_spec.lam } else { 0.0 };
+
+    let has_t1t2 = has_noise and map_has(noise_spec, "t1_ns") and map_has(noise_spec, "t2_ns") and
+                   noise_spec.t1_ns != nil and noise_spec.t2_ns != nil;
+    let g1_ns = if has_noise and map_has(noise_spec, "gate_1q_ns") { noise_spec.gate_1q_ns }
+                else if has_noise and map_has(noise_spec, "gate_ns") { noise_spec.gate_ns } else { 32.0 };
+    let g2_ns = if has_noise and map_has(noise_spec, "gate_2q_ns") { noise_spec.gate_2q_ns }
+                else if has_noise and map_has(noise_spec, "gate_ns") { noise_spec.gate_ns } else { 68.0 };
+
+    let k_dep1 = if dep1 > 0.0 { kraus_depolarizing_1q(dep1) } else { nil };
+    let k_dep2 = if dep2 > 0.0 { kraus_depolarizing_2q(dep2) } else { nil };
+    let k_amp = if amp_g > 0.0 { kraus_amplitude_damping(amp_g) } else { nil };
+    let k_ph = if ph_l > 0.0 { kraus_phase_damping(ph_l) } else { nil };
+    let k_th1 = if has_t1t2 and g1_ns > 0.0 { kraus_thermal_t1_t2(g1_ns, noise_spec.t1_ns, noise_spec.t2_ns) } else { nil };
+    let k_th2 = if has_t1t2 and g2_ns > 0.0 { kraus_thermal_t1_t2(g2_ns, noise_spec.t1_ns, noise_spec.t2_ns) } else { nil };
+    let custom_k1 = if has_noise and map_has(noise_spec, "kraus_1q") and noise_spec.kraus_1q != nil { noise_spec.kraus_1q } else { nil };
+    let custom_k2 = if has_noise and map_has(noise_spec, "kraus_2q") and noise_spec.kraus_2q != nil { noise_spec.kraus_2q } else { nil };
+
+    let gi = 0;
+    while gi < len(circuit.gates) {
+        let gate = circuit.gates[gi];
+        density_apply_unitary_gate(rho, gate);
+
+        if has_noise {
+            let qs = _gate_involved_qubits(gate);
+            if len(qs) == 1 {
+                let q = qs[0];
+                if k_dep1 != nil { apply_kraus_1q(rho, q, k_dep1); }
+                if k_amp != nil { apply_kraus_1q(rho, q, k_amp); }
+                if k_ph != nil { apply_kraus_1q(rho, q, k_ph); }
+                if k_th1 != nil { apply_kraus_1q(rho, q, k_th1); }
+                if custom_k1 != nil { apply_kraus_1q(rho, q, custom_k1); }
+            } else if len(qs) == 2 {
+                let q0 = qs[0];
+                let q1 = qs[1];
+                if k_dep2 != nil { apply_kraus_2q(rho, q0, q1, k_dep2); }
+                if custom_k2 != nil { apply_kraus_2q(rho, q0, q1, custom_k2); }
+                if k_amp != nil {
+                    apply_kraus_1q(rho, q0, k_amp);
+                    apply_kraus_1q(rho, q1, k_amp);
+                }
+                if k_ph != nil {
+                    apply_kraus_1q(rho, q0, k_ph);
+                    apply_kraus_1q(rho, q1, k_ph);
+                }
+                if k_th2 != nil {
+                    apply_kraus_1q(rho, q0, k_th2);
+                    apply_kraus_1q(rho, q1, k_th2);
+                }
+            } else if len(qs) >= 3 {
+                let tgt = gate.targets[0];
+                let ci = 0;
+                while ci < len(gate.controls) {
+                    let cq = gate.controls[ci];
+                    if k_dep2 != nil { apply_kraus_2q(rho, cq, tgt, k_dep2); }
+                    ci = ci + 1;
+                }
+                let qi = 0;
+                while qi < len(qs) {
+                    let qv = qs[qi];
+                    if k_amp != nil { apply_kraus_1q(rho, qv, k_amp); }
+                    if k_ph != nil { apply_kraus_1q(rho, qv, k_ph); }
+                    if k_th2 != nil { apply_kraus_1q(rho, qv, k_th2); }
+                    qi = qi + 1;
+                }
+            }
+        }
+        gi = gi + 1;
+    }
+
+    let d = rho.dim;
+    let pre_vec = [];
+    let pre_sum = 0.0;
+    let i = 0;
+    while i < d {
+        let p = num_max(0.0, rho.re[i * d + i]);
+        push(pre_vec, p);
+        pre_sum = pre_sum + p;
+        i = i + 1;
+    }
+    if pre_sum > 0.0 {
+        i = 0;
+        while i < d {
+            pre_vec[i] = pre_vec[i] / pre_sum;
+            i = i + 1;
+        }
+    }
+
+    let pre_by_bits = map{};
+    i = 0;
+    while i < d {
+        pre_by_bits[_bitstring(i, n)] = pre_vec[i];
+        i = i + 1;
+    }
+
+    let final_vec = _clone_num_array(pre_vec);
+    if has_noise {
+        let ro_spec = if map_has(noise_spec, "readout_confusion") and noise_spec.readout_confusion != nil {
+            noise_spec.readout_confusion
+        } else if map_has(noise_spec, "readout_errors") and noise_spec.readout_errors != nil {
+            noise_spec.readout_errors
+        } else {
+            nil
+        };
+        if ro_spec != nil {
+            let cm = build_readout_confusion_matrix(ro_spec, n);
+            let mat = cm.matrix;
+            let noisy_v = _zeros(d);
+            let r = 0;
+            while r < d {
+                let s = 0.0;
+                let c = 0;
+                while c < d {
+                    s = s + mat[r][c] * pre_vec[c];
+                    c = c + 1;
+                }
+                noisy_v[r] = num_max(0.0, s);
+                r = r + 1;
+            }
+            final_vec = project_probability_simplex(noisy_v);
+        }
+    }
+
+    let by_bits = map{};
+    i = 0;
+    while i < d {
+        by_bits[_bitstring(i, n)] = final_vec[i];
+        i = i + 1;
+    }
+
+    return map{
+        ok: true,
+        n_qubits: n,
+        rho: rho,
+        probabilities: by_bits,
+        probability_vector: final_vec,
+        pre_readout_probabilities: pre_by_bits,
+        purity: purity(rho),
+        von_neumann_entropy_bits: von_neumann_entropy(rho)
+    };
+}
+
+// ── 2. Quantum State Tomography (1..3 Qubits + Smolin-Gambetta PSD MLE) ──────
+
+fn _basis_strings_3n(n_qubits) {
+    let axes = ["X", "Y", "Z"];
+    let cur = [""];
+    let q = 0;
+    while q < n_qubits {
+        let nxt = [];
+        let i = 0;
+        while i < len(cur) {
+            let a = 0;
+            while a < 3 {
+                push(nxt, cur[i] + axes[a]);
+                a = a + 1;
+            }
+            i = i + 1;
+        }
+        cur = nxt;
+        q = q + 1;
+    }
+    return cur;
+}
+
+fn _pauli_strings_4n(n_qubits) {
+    let axes = ["I", "X", "Y", "Z"];
+    let cur = [""];
+    let q = 0;
+    while q < n_qubits {
+        let nxt = [];
+        let i = 0;
+        while i < len(cur) {
+            let a = 0;
+            while a < 4 {
+                push(nxt, cur[i] + axes[a]);
+                a = a + 1;
+            }
+            i = i + 1;
+        }
+        cur = nxt;
+        q = q + 1;
+    }
+    return cur;
+}
+
+fn generate_tomography_circuits(base_circuit) {
+    let n = base_circuit.n_qubits;
+    if n < 1 or n > 3 {
+        throw "qem_noise_tomography.generate_tomography_circuits: n_qubits must be in 1..3";
+    }
+    let bases = _basis_strings_3n(n);
+    let circuits_by_basis = map{};
+    let items = [];
+
+    let bi = 0;
+    while bi < len(bases) {
+        let bstr = bases[bi];
+        let circ = _clone_circuit(base_circuit);
+        let q = 0;
+        while q < n {
+            let axis = str_slice(bstr, q, q + 1);
+            if axis == "X" {
+                QC.h(circ, q);
+            } else if axis == "Y" {
+                QC.sdg(circ, q);
+                QC.h(circ, q);
+            }
+            // "Z" is computational basis identity
+            q = q + 1;
+        }
+        circuits_by_basis[bstr] = circ;
+        push(items, map{ basis: bstr, circuit: circ });
+        bi = bi + 1;
+    }
+
+    return map{
+        ok: true,
+        n_qubits: n,
+        n_circuits: len(bases),
+        bases: bases,
+        circuits: circuits_by_basis,
+        items: items
+    };
+}
+
+fn _extract_prob_vector(probs_or_counts, n_qubits) {
+    let d = bit_shl(1, n_qubits);
+    if is_array(probs_or_counts) {
+        if len(probs_or_counts) != d {
+            throw "qem_noise_tomography: probability vector length mismatch";
+        }
+        let tot = 0.0;
+        let i = 0;
+        while i < d {
+            tot = tot + probs_or_counts[i];
+            i = i + 1;
+        }
+        let out = _zeros(d);
+        if tot > 0.0 {
+            i = 0;
+            while i < d {
+                out[i] = probs_or_counts[i] / tot;
+                i = i + 1;
+            }
+        }
+        return map{ probs: out, total_weight: tot };
+    }
+    if is_map(probs_or_counts) {
+        let src = if map_has(probs_or_counts, "counts") and is_map(probs_or_counts.counts) {
+            probs_or_counts.counts
+        } else if map_has(probs_or_counts, "by_bitstring") and is_map(probs_or_counts.by_bitstring) {
+            probs_or_counts.by_bitstring
+        } else if map_has(probs_or_counts, "probabilities") and is_map(probs_or_counts.probabilities) {
+            probs_or_counts.probabilities
+        } else if map_has(probs_or_counts, "vector") and is_array(probs_or_counts.vector) {
+            return _extract_prob_vector(probs_or_counts.vector, n_qubits);
+        } else {
+            probs_or_counts
+        };
+
+        let out = _zeros(d);
+        let keys = map_keys(src);
+        let tot = 0.0;
+        let i = 0;
+        while i < len(keys) {
+            let k = keys[i];
+            let idx = _parse_bitstring(k);
+            if idx < 0 or idx >= d {
+                throw "qem_noise_tomography: bitstring '" + k + "' out of range for n_qubits=" + str(n_qubits);
+            }
+            let v = src[k] * 1.0;
+            out[idx] = out[idx] + v;
+            tot = tot + v;
+            i = i + 1;
+        }
+        if tot > 0.0 {
+            i = 0;
+            while i < d {
+                out[i] = out[i] / tot;
+                i = i + 1;
+            }
+        }
+        return map{ probs: out, total_weight: tot };
+    }
+    throw "qem_noise_tomography: expected counts map, probability map, or probability vector";
+}
+
+fn reconstruct_state_tomography(pauli_probs_or_counts_map, n_qubits) {
+    if n_qubits < 1 or n_qubits > 3 {
+        throw "qem_noise_tomography.reconstruct_state_tomography: n_qubits must be in 1..3";
+    }
+    let d = bit_shl(1, n_qubits);
+    let bases = _basis_strings_3n(n_qubits);
+    let basis_probs = map{};
+
+    let bi = 0;
+    while bi < len(bases) {
+        let bstr = bases[bi];
+        if not map_has(pauli_probs_or_counts_map, bstr) {
+            throw "qem_noise_tomography.reconstruct_state_tomography: missing measurement basis '" + bstr + "'";
+        }
+        basis_probs[bstr] = _extract_prob_vector(pauli_probs_or_counts_map[bstr], n_qubits).probs;
+        bi = bi + 1;
+    }
+
+    // 1. Estimate <P> for all 4^n Pauli operators by averaging across all compatible 3^(n - w(P)) bases
+    let paulis = _pauli_strings_4n(n_qubits);
+    let pauli_exp = map{};
+    let raw_re = _zeros(d * d);
+    let raw_im = _zeros(d * d);
+    let inv_d = 1.0 / (d * 1.0);
+
+    let pi_idx = 0;
+    while pi_idx < len(paulis) {
+        let pstr = paulis[pi_idx];
+        let exp_val = 1.0;
+        // Find active non-I qubits and compatible measurement bases
+        let active_mask = 0;
+        let flip_mask = 0;
+        let y_mask = 0;
+        let z_mask = 0;
+        let n_y = 0;
+        let q = 0;
+        while q < n_qubits {
+            let pch = str_slice(pstr, q, q + 1);
+            let bm = bit_shl(1, n_qubits - 1 - q);
+            if pch != "I" {
+                active_mask = bit_or(active_mask, bm);
+            }
+            if pch == "X" {
+                flip_mask = bit_or(flip_mask, bm);
+            } else if pch == "Y" {
+                flip_mask = bit_or(flip_mask, bm);
+                y_mask = bit_or(y_mask, bm);
+                n_y = n_y + 1;
+            } else if pch == "Z" {
+                z_mask = bit_or(z_mask, bm);
+            }
+            q = q + 1;
+        }
+
+        if active_mask == 0 {
+            exp_val = 1.0;
+        } else {
+            let sum_exp = 0.0;
+            let n_compat = 0;
+            let b_j = 0;
+            while b_j < len(bases) {
+                let bstr = bases[b_j];
+                let compat = true;
+                let q2 = 0;
+                while q2 < n_qubits {
+                    let pch = str_slice(pstr, q2, q2 + 1);
+                    let bch = str_slice(bstr, q2, q2 + 1);
+                    if pch != "I" and pch != bch {
+                        compat = false;
+                        break;
+                    }
+                    q2 = q2 + 1;
+                }
+                if compat {
+                    let pvec = basis_probs[bstr];
+                    let e_b = 0.0;
+                    let x_idx = 0;
+                    while x_idx < d {
+                        let v = bit_and(x_idx, active_mask);
+                        let par = 0;
+                        while v != 0 {
+                            par = bit_xor(par, bit_and(v, 1));
+                            v = bit_shr(v, 1);
+                        }
+                        let sgn = if par == 0 { 1.0 } else { -1.0 };
+                        e_b = e_b + sgn * pvec[x_idx];
+                        x_idx = x_idx + 1;
+                    }
+                    sum_exp = sum_exp + e_b;
+                    n_compat = n_compat + 1;
+                }
+                b_j = b_j + 1;
+            }
+            exp_val = sum_exp / (n_compat * 1.0);
+        }
+
+        // Accumulate (exp_val / 2^n) * P into rho_raw using exact sparse Pauli column action P|c> = alpha_c |c ^ flip_mask>
+        let ny_mod = n_y - 4 * num_floor(n_y / 4.0);
+        let base_re = if ny_mod == 0 { 1.0 } else if ny_mod == 2 { -1.0 } else { 0.0 };
+        let base_im = if ny_mod == 1 { 1.0 } else if ny_mod == 3 { -1.0 } else { 0.0 };
+        let yz_mask = bit_or(y_mask, z_mask);
+        let coeff = exp_val * inv_d;
+
+        let col = 0;
+        while col < d {
+            let row = bit_xor(col, flip_mask);
+            let v = bit_and(col, yz_mask);
+            let par = 0;
+            while v != 0 {
+                par = bit_xor(par, bit_and(v, 1));
+                v = bit_shr(v, 1);
+            }
+            let sgn = if par == 0 { 1.0 } else { -1.0 };
+            raw_re[row * d + col] = raw_re[row * d + col] + coeff * sgn * base_re;
+            raw_im[row * d + col] = raw_im[row * d + col] + coeff * sgn * base_im;
+            col = col + 1;
+        }
+        pauli_exp[pstr] = exp_val;
+        pi_idx = pi_idx + 1;
+    }
+
+    let rho_raw = map{
+        format: "pblang.quantum.density_matrix.v1",
+        n_qubits: n_qubits,
+        dim: d,
+        re: raw_re,
+        im: raw_im
+    };
+
+    // 2. Smolin-Gambetta Maximum-Likelihood Physical PSD Simplex Projection:
+    // Diagonalize Hermitian rho_raw = V * diag(mu) * V^dagger, project mu onto probability simplex
+    // { lambda_i >= 0, sum_i lambda_i = 1 }, and reconstruct rho_phys = V * diag(lambda) * V^dagger.
+    let eig = _hermitian_eigensystem(raw_re, raw_im, d, true);
+    let raw_eigs = eig.eigenvalues;
+    let phys_eigs = project_probability_simplex(raw_eigs);
+
+    let n2 = eig.dim2;
+    let q_mat = eig.q_real;
+    let weights_2d = _zeros(n2);
+    let k = 0;
+    while k < d {
+        weights_2d[2 * k] = phys_eigs[k];
+        weights_2d[2 * k + 1] = phys_eigs[k];
+        k = k + 1;
+    }
+
+    // Reconstruct M_phys = Q * diag(weights_2d) * Q^T and extract Re(rho_phys), Im(rho_phys)
+    let phys_re = _zeros(d * d);
+    let phys_im = _zeros(d * d);
+    let r = 0;
+    while r < d {
+        let c = 0;
+        while c < d {
+            let tl = 0.0;
+            let br = 0.0;
+            let bl = 0.0;
+            let tr = 0.0;
+            let m = 0;
+            while m < n2 {
+                let w = weights_2d[m];
+                if w > 0.0 {
+                    let qr0 = q_mat[r * n2 + m];
+                    let qr1 = q_mat[(r + d) * n2 + m];
+                    let qc0 = q_mat[c * n2 + m];
+                    let qc1 = q_mat[(c + d) * n2 + m];
+                    tl = tl + w * qr0 * qc0;
+                    br = br + w * qr1 * qc1;
+                    bl = bl + w * qr1 * qc0;
+                    tr = tr + w * qr0 * qc1;
+                }
+                m = m + 1;
+            }
+            phys_re[r * d + c] = 0.5 * (tl + br);
+            phys_im[r * d + c] = 0.5 * (bl - tr);
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+
+    // Symmetrize Hermitian structure and unit trace explicitly
+    let tr_sum = 0.0;
+    r = 0;
+    while r < d {
+        phys_im[r * d + r] = 0.0;
+        tr_sum = tr_sum + phys_re[r * d + r];
+        let c = r + 1;
+        while c < d {
+            let sr = 0.5 * (phys_re[r * d + c] + phys_re[c * d + r]);
+            let si = 0.5 * (phys_im[r * d + c] - phys_im[c * d + r]);
+            phys_re[r * d + c] = sr;
+            phys_re[c * d + r] = sr;
+            phys_im[r * d + c] = si;
+            phys_im[c * d + r] = 0.0 - si;
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    if tr_sum > 0.0 {
+        let i = 0;
+        while i < d * d {
+            phys_re[i] = phys_re[i] / tr_sum;
+            phys_im[i] = phys_im[i] / tr_sum;
+            i = i + 1;
+        }
+    }
+
+    let rho_phys = map{
+        format: "pblang.quantum.density_matrix.v1",
+        n_qubits: n_qubits,
+        dim: d,
+        re: phys_re,
+        im: phys_im
+    };
+
+    let min_eig = phys_eigs[len(phys_eigs) - 1];
+    return map{
+        ok: true,
+        n_qubits: n_qubits,
+        rho: rho_phys,
+        raw_rho: rho_raw,
+        eigenvalues: phys_eigs,
+        raw_eigenvalues: raw_eigs,
+        min_eigenvalue: min_eig,
+        pauli_expectations: pauli_exp,
+        purity: purity(rho_phys),
+        von_neumann_entropy_bits: von_neumann_entropy(rho_phys)
+    };
+}
+
+// ── 3A. QEM: Readout Confusion-Matrix Inversion & TREX ───────────────────────
+
+fn _solve_linear_system_gauss(a_in, b_in) {
+    let m = len(b_in);
+    let aug = [];
+    let r = 0;
+    while r < m {
+        let row = _clone_num_array(a_in[r]);
+        push(row, b_in[r] * 1.0);
+        push(aug, row);
+        r = r + 1;
+    }
+
+    let col = 0;
+    while col < m {
+        // Partial pivoting
+        let best_r = col;
+        let best_val = num_abs(aug[col][col]);
+        let cand = col + 1;
+        while cand < m {
+            let v = num_abs(aug[cand][col]);
+            if v > best_val {
+                best_val = v;
+                best_r = cand;
+            }
+            cand = cand + 1;
+        }
+        if best_r != col {
+            let tmp = aug[col];
+            aug[col] = aug[best_r];
+            aug[best_r] = tmp;
+        }
+        let piv = aug[col][col];
+        if num_abs(piv) < 1.0e-12 {
+            piv = if piv >= 0.0 { 1.0e-12 } else { -1.0e-12 };
+            aug[col][col] = piv;
+        }
+        let r2 = col + 1;
+        while r2 < m {
+            let factor = aug[r2][col] / piv;
+            if factor != 0.0 {
+                aug[r2][col] = 0.0;
+                let c2 = col + 1;
+                while c2 <= m {
+                    aug[r2][c2] = aug[r2][c2] - factor * aug[col][c2];
+                    c2 = c2 + 1;
+                }
+            }
+            r2 = r2 + 1;
+        }
+        col = col + 1;
+    }
+
+    let x_out = _zeros(m);
+    let i = m - 1;
+    while i >= 0 {
+        let rhs = aug[i][m];
+        let j = i + 1;
+        while j < m {
+            rhs = rhs - aug[i][j] * x_out[j];
+            j = j + 1;
+        }
+        x_out[i] = rhs / aug[i][i];
+        i = i - 1;
+    }
+    return x_out;
+}
+
+fn _infer_n_qubits_from_data(counts_or_probs, confusion_or_spec) {
+    if is_map(confusion_or_spec) and map_has(confusion_or_spec, "n_qubits") {
+        return confusion_or_spec.n_qubits;
+    }
+    if is_array(counts_or_probs) {
+        return _log2_int(len(counts_or_probs));
+    }
+    if is_map(counts_or_probs) {
+        let src = if map_has(counts_or_probs, "counts") and is_map(counts_or_probs.counts) {
+            counts_or_probs.counts
+        } else if map_has(counts_or_probs, "by_bitstring") and is_map(counts_or_probs.by_bitstring) {
+            counts_or_probs.by_bitstring
+        } else {
+            counts_or_probs
+        };
+        let keys = map_keys(src);
+        if len(keys) > 0 {
+            return len(keys[0]);
+        }
+    }
+    if is_array(confusion_or_spec) and len(confusion_or_spec) > 0 {
+        if is_map(confusion_or_spec[0]) or (is_array(confusion_or_spec[0]) and len(confusion_or_spec[0]) == 2 and len(confusion_or_spec) != 2) {
+            return len(confusion_or_spec);
+        }
+        return _log2_int(len(confusion_or_spec));
+    }
+    throw "qem_noise_tomography: unable to infer n_qubits";
+}
+
+fn mitigate_readout_counts(counts_or_probs, confusion_or_spec) {
+    let n = _infer_n_qubits_from_data(counts_or_probs, confusion_or_spec);
+    let cm = build_readout_confusion_matrix(confusion_or_spec, n);
+    let d = cm.dim;
+    let extracted = _extract_prob_vector(counts_or_probs, n);
+    let p_raw = extracted.probs;
+    let total_shots = if extracted.total_weight > 1.5 { num_floor(extracted.total_weight + 0.5) } else { 1024 };
+
+    let x_unproj = _solve_linear_system_gauss(cm.matrix, p_raw);
+    let p_mit = project_probability_simplex(x_unproj);
+
+    let raw_by_bits = map{};
+    let mit_by_bits = map{};
+    let mit_counts = map{};
+    let i = 0;
+    while i < d {
+        let bstr = _bitstring(i, n);
+        raw_by_bits[bstr] = p_raw[i];
+        mit_by_bits[bstr] = p_mit[i];
+        let scaled_c = p_mit[i] * total_shots;
+        if scaled_c > 0.000001 {
+            mit_counts[bstr] = scaled_c;
+        }
+        i = i + 1;
+    }
+
+    return map{
+        ok: true,
+        n_qubits: n,
+        shots: total_shots,
+        raw_probabilities: raw_by_bits,
+        raw_vector: p_raw,
+        unprojected_vector: x_unproj,
+        mitigated_probabilities: mit_by_bits,
+        mitigated_vector: p_mit,
+        mitigated_counts: mit_counts,
+        confusion_matrix: cm
+    };
+}
+
+fn _parse_z_mask(z_observable, n_qubits) {
+    if type(z_observable) == "string" {
+        let zs = str_upper(str_trim(z_observable));
+        if len(zs) != n_qubits {
+            throw "qem_noise_tomography: Z observable string length mismatch";
+        }
+        let mask = 0;
+        let q = 0;
+        while q < n_qubits {
+            let ch = str_slice(zs, q, q + 1);
+            if ch == "Z" {
+                mask = bit_or(mask, bit_shl(1, n_qubits - 1 - q));
+            } else if ch != "I" {
+                throw "qem_noise_tomography.mitigate_trex_expectation: TREX observable must contain only I and Z, got '" + ch + "'";
+            }
+            q = q + 1;
+        }
+        return mask;
+    }
+    if is_array(z_observable) {
+        let mask = 0;
+        let i = 0;
+        while i < len(z_observable) {
+            let q = z_observable[i];
+            if q < 0 or q >= n_qubits {
+                throw "qem_noise_tomography.mitigate_trex_expectation: qubit index out of range";
+            }
+            mask = bit_or(mask, bit_shl(1, n_qubits - 1 - q));
+            i = i + 1;
+        }
+        return mask;
+    }
+    throw "qem_noise_tomography.mitigate_trex_expectation: expected Z Pauli string or qubit index array";
+}
+
+fn _z_mask_expectation_from_probs(prob_vec, z_mask) {
+    let d = len(prob_vec);
+    let acc = 0.0;
+    let idx = 0;
+    while idx < d {
+        let v = bit_and(idx, z_mask);
+        let par = 0;
+        while v != 0 {
+            par = bit_xor(par, bit_and(v, 1));
+            v = bit_shr(v, 1);
+        }
+        let sgn = if par == 0 { 1.0 } else { -1.0 };
+        acc = acc + sgn * prob_vec[idx];
+        idx = idx + 1;
+    }
+    return acc;
+}
+
+// Twirled Readout Error eXtinction (TREX): divides noisy <Z_S> by twirled |0...0> calibration factor lambda_S
+fn mitigate_trex_expectation(raw_data, z_observable, calibration_or_confusion) {
+    let n = if type(z_observable) == "string" {
+        len(str_trim(z_observable))
+    } else {
+        _infer_n_qubits_from_data(raw_data, calibration_or_confusion)
+    };
+    let d = bit_shl(1, n);
+    let z_mask = _parse_z_mask(z_observable, n);
+
+    let raw_exp = if type(raw_data) == "number" {
+        raw_data * 1.0
+    } else {
+        let p_raw = _extract_prob_vector(raw_data, n).probs;
+        _z_mask_expectation_from_probs(p_raw, z_mask)
+    };
+
+    let lambda_s = 1.0;
+    if type(calibration_or_confusion) == "number" {
+        lambda_s = calibration_or_confusion * 1.0;
+    } else if is_map(calibration_or_confusion) and map_has(calibration_or_confusion, "twirled_calibration_probs") {
+        let p_cal = _extract_prob_vector(calibration_or_confusion.twirled_calibration_probs, n).probs;
+        lambda_s = _z_mask_expectation_from_probs(p_cal, z_mask);
+    } else {
+        // Compute exact Pauli-X twirled transfer eigenvalue from confusion matrix M:
+        // p_twirl(y) = (1 / 2^n) * sum_{x=0}^{2^n - 1} M[y ^ x][x]
+        let cm = build_readout_confusion_matrix(calibration_or_confusion, n);
+        let mat = cm.matrix;
+        let p_twirl = _zeros(d);
+        let inv_d = 1.0 / (d * 1.0);
+        let x_mask = 0;
+        while x_mask < d {
+            let meas = 0;
+            while meas < d {
+                let eff_y = bit_xor(meas, x_mask);
+                p_twirl[eff_y] = p_twirl[eff_y] + inv_d * mat[meas][x_mask];
+                meas = meas + 1;
+            }
+            x_mask = x_mask + 1;
+        }
+        lambda_s = _z_mask_expectation_from_probs(p_twirl, z_mask);
+    }
+
+    if num_abs(lambda_s) < 1.0e-12 {
+        throw "qem_noise_tomography.mitigate_trex_expectation: singular readout calibration factor (0)";
+    }
+
+    let unclamped = raw_exp / lambda_s;
+    let clamped = num_min(1.0, num_max(-1.0, unclamped));
+    return map{
+        ok: true,
+        n_qubits: n,
+        z_mask: z_mask,
+        raw_expectation: raw_exp,
+        calibration_factor: lambda_s,
+        unclamped_expectation: unclamped,
+        mitigated_expectation: clamped
+    };
+}
+
+// End-to-end TREX experiment runner with explicit random Pauli-X readout twirling & classical XOR untwirling
+fn run_trex_twirled_circuit(circuit, z_observable, noise_spec, n_twirls = 16, seed = 2026) {
+    let n = circuit.n_qubits;
+    let d = bit_shl(1, n);
+    let z_mask = _parse_z_mask(z_observable, n);
+
+    let state = bit_and(seed, 4294967295);
+    if state == 0 { state = 135792468; }
+
+    let avg_sig_probs = _zeros(d);
+    let avg_cal_probs = _zeros(d);
+    let inv_tw = 1.0 / (n_twirls * 1.0);
+
+    let ti = 0;
+    while ti < n_twirls {
+        state = _prng_next(state);
+        let x_bits = bit_and(state, d - 1);
+
+        let sig_c = _clone_circuit(circuit);
+        let cal_c = QC.new_circuit(n);
+        let q = 0;
+        while q < n {
+            if bit_and(x_bits, bit_shl(1, n - 1 - q)) != 0 {
+                QC.x(sig_c, q);
+                QC.x(cal_c, q);
+            }
+            q = q + 1;
+        }
+
+        let sig_sim = simulate_noisy_circuit(sig_c, noise_spec);
+        let cal_sim = simulate_noisy_circuit(cal_c, noise_spec);
+        let m_idx = 0;
+        while m_idx < d {
+            let untwirled = bit_xor(m_idx, x_bits);
+            avg_sig_probs[untwirled] = avg_sig_probs[untwirled] + inv_tw * sig_sim.probability_vector[m_idx];
+            avg_cal_probs[untwirled] = avg_cal_probs[untwirled] + inv_tw * cal_sim.probability_vector[m_idx];
+            m_idx = m_idx + 1;
+        }
+        ti = ti + 1;
+    }
+
+    let trex = mitigate_trex_expectation(
+        avg_sig_probs,
+        z_observable,
+        map{ twirled_calibration_probs: avg_cal_probs }
+    );
+    return map{
+        ok: true,
+        n_qubits: n,
+        n_twirls: n_twirls,
+        z_mask: z_mask,
+        raw_expectation: trex.raw_expectation,
+        calibration_factor: trex.calibration_factor,
+        mitigated_expectation: trex.mitigated_expectation,
+        unclamped_expectation: trex.unclamped_expectation
+    };
+}
+
+// ── 3B. QEM: Zero-Noise Extrapolation (Gate Folding & Richardson / Exp) ──────
+
+fn invert_gate(g) {
+    let op = g.op;
+    let inv = _clone_gate(g);
+    if op == "h" or op == "x" or op == "y" or op == "z" or
+       op == "cx" or op == "cnot" or op == "cz" or op == "swap" or
+       op == "ccx" or op == "toffoli" or op == "mcz" or op == "i" or op == "id" {
+        return inv;
+    } else if op == "s" {
+        inv.op = "sdg";
+        return inv;
+    } else if op == "sdg" {
+        inv.op = "s";
+        return inv;
+    } else if op == "t" {
+        inv.op = "tdg";
+        return inv;
+    } else if op == "tdg" {
+        inv.op = "t";
+        return inv;
+    } else if op == "sx" {
+        // SX = exp(i*pi/4) * Rx(pi/2) -> SX^dagger = exp(-i*pi/4) * Rx(-pi/2)
+        // Using standard rx(-pi/2) preserves exact 1-gate noise weight andQC.run_statevector compatibility!
+        inv.op = "rx";
+        inv.params = [0.0 - _HALF_PI];
+        return inv;
+    } else if op == "sxdg" {
+        inv.op = "sx";
+        return inv;
+    } else if op == "rx" or op == "ry" or op == "rz" {
+        inv.params = [0.0 - g.params[0]];
+        return inv;
+    }
+    throw "qem_noise_tomography.invert_gate: unsupported gate op '" + op + "'";
+}
+
+fn fold_circuit_per_gate(circuit, scale) {
+    if scale < 1.0 {
+        throw "qem_noise_tomography.fold_circuit_per_gate: scale must be >= 1";
+    }
+    let m = len(circuit.gates);
+    let base_pairs = num_floor((scale - 1.0) * 0.5 + 1.0e-9);
+    let rem = scale - (1.0 + 2.0 * base_pairs);
+    let extra_gates = if m > 0 { num_floor(rem * m * 0.5 + 0.5) } else { 0 };
+
+    let out_gates = [];
+    let i = 0;
+    while i < m {
+        let g = circuit.gates[i];
+        let gdg = invert_gate(g);
+        push(out_gates, _clone_gate(g));
+        let pairs = base_pairs + (if i < extra_gates { 1 } else { 0 });
+        let p = 0;
+        while p < pairs {
+            push(out_gates, _clone_gate(gdg));
+            push(out_gates, _clone_gate(g));
+            p = p + 1;
+        }
+        i = i + 1;
+    }
+
+    return map{
+        format: "pblang.quantum.circuit.v1",
+        n_qubits: circuit.n_qubits,
+        gates: out_gates,
+        folding_mode: "per_gate",
+        scale_factor: scale * 1.0,
+        original_gate_count: m,
+        folded_gate_count: len(out_gates)
+    };
+}
+
+fn fold_circuit_global(circuit, scale) {
+    if scale < 1.0 {
+        throw "qem_noise_tomography.fold_circuit_global: scale must be >= 1";
+    }
+    let m = len(circuit.gates);
+    let full_folds = num_floor((scale - 1.0) * 0.5 + 1.0e-9);
+    let rem = scale - (1.0 + 2.0 * full_folds);
+    let tail_count = if m > 0 { num_floor(rem * m * 0.5 + 0.5) } else { 0 };
+
+    let out_gates = [];
+    let i = 0;
+    while i < m {
+        push(out_gates, _clone_gate(circuit.gates[i]));
+        i = i + 1;
+    }
+
+    let f = 0;
+    while f < full_folds {
+        // Append U^dagger (reverse order of inverted gates)
+        let k = m - 1;
+        while k >= 0 {
+            push(out_gates, invert_gate(circuit.gates[k]));
+            k = k - 1;
+        }
+        // Append U
+        let j = 0;
+        while j < m {
+            push(out_gates, _clone_gate(circuit.gates[j]));
+            j = j + 1;
+        }
+        f = f + 1;
+    }
+
+    if tail_count > 0 {
+        let k2 = m - 1;
+        while k2 >= m - tail_count {
+            push(out_gates, invert_gate(circuit.gates[k2]));
+            k2 = k2 - 1;
+        }
+        let j2 = m - tail_count;
+        while j2 < m {
+            push(out_gates, _clone_gate(circuit.gates[j2]));
+            j2 = j2 + 1;
+        }
+    }
+
+    return map{
+        format: "pblang.quantum.circuit.v1",
+        n_qubits: circuit.n_qubits,
+        gates: out_gates,
+        folding_mode: "global",
+        scale_factor: scale * 1.0,
+        original_gate_count: m,
+        folded_gate_count: len(out_gates)
+    };
+}
+
+fn _richardson_zero_extrapolate(scales, values) {
+    let m = len(scales);
+    let weights = [];
+    let est = 0.0;
+    let j = 0;
+    while j < m {
+        let w = 1.0;
+        let k = 0;
+        while k < m {
+            if k != j {
+                let denom = scales[k] - scales[j];
+                if num_abs(denom) < 1.0e-12 {
+                    throw "qem_noise_tomography.zne_extrapolate: duplicate scale factors";
+                }
+                w = w * (scales[k] / denom);
+            }
+            k = k + 1;
+        }
+        push(weights, w);
+        est = est + w * values[j];
+        j = j + 1;
+    }
+    return map{ value: est, weights: weights };
+}
+
+fn zne_extrapolate(scales, values, method = "richardson") {
+    if not is_array(scales) or not is_array(values) or len(scales) != len(values) or len(scales) < 2 {
+        throw "qem_noise_tomography.zne_extrapolate: scales and values must be equal-length arrays of length >= 2";
+    }
+    let m = len(scales);
+    let mode = str_upper(str_trim(method));
+
+    if mode == "RICHARDSON" or mode == "POLYNOMIAL" {
+        let r = _richardson_zero_extrapolate(scales, values);
+        return map{
+            ok: true,
+            method: "richardson",
+            zero_noise_value: r.value,
+            weights: r.weights,
+            scales: _clone_num_array(scales),
+            values: _clone_num_array(values)
+        };
+    }
+
+    if mode == "LINEAR" {
+        let sx = 0.0;
+        let sy = 0.0;
+        let sxx = 0.0;
+        let sxy = 0.0;
+        let i = 0;
+        while i < m {
+            let xv = scales[i];
+            let yv = values[i];
+            sx = sx + xv;
+            sy = sy + yv;
+            sxx = sxx + xv * xv;
+            sxy = sxy + xv * yv;
+            i = i + 1;
+        }
+        let denom = m * sxx - sx * sx;
+        let intercept = (sy * sxx - sx * sxy) / denom;
+        let slope = (m * sxy - sx * sy) / denom;
+        return map{
+            ok: true,
+            method: "linear",
+            zero_noise_value: intercept,
+            slope: slope,
+            scales: _clone_num_array(scales),
+            values: _clone_num_array(values)
+        };
+    }
+
+    if mode == "EXPONENTIAL" or mode == "EXPONENTIAL_2PT" or mode == "EXPONENTIAL_3PT" {
+        // 3-point asymptotic exponential y(s) = C + A * exp(-B * s) when m >= 3 and equally spaced
+        if m >= 3 and mode != "EXPONENTIAL_2PT" {
+            let ds1 = scales[1] - scales[0];
+            let ds2 = scales[2] - scales[1];
+            if num_abs(ds1 - ds2) < 1.0e-9 and ds1 > 0.0 {
+                let y0 = values[0];
+                let y1 = values[1];
+                let y2 = values[2];
+                let d1 = y1 - y0;
+                let d2 = y2 - y1;
+                let curvature = y0 - 2.0 * y1 + y2;
+                if num_abs(d1) > 1.0e-12 and num_abs(curvature) > 1.0e-12 {
+                    let ratio = d2 / d1;
+                    if ratio > 1.0e-9 and ratio < 1.0 - 1.0e-9 {
+                        let asymp_c = (y0 * y2 - y1 * y1) / curvature;
+                        let decay_b = (0.0 - num_ln(ratio)) / ds1;
+                        let amp_a = (y0 - asymp_c) * num_exp(decay_b * scales[0]);
+                        let z0 = asymp_c + amp_a;
+                        return map{
+                            ok: true,
+                            method: "exponential_3pt",
+                            zero_noise_value: z0,
+                            asymptote: asymp_c,
+                            amplitude: amp_a,
+                            decay_rate: decay_b,
+                            scales: _clone_num_array(scales),
+                            values: _clone_num_array(values)
+                        };
+                    }
+                }
+            }
+        }
+
+        // 2-point pure exponential y(s) = A * exp(-B * s)
+        let s0 = scales[0];
+        let s1 = scales[1];
+        let y0 = values[0];
+        let y1 = values[1];
+        if y0 * y1 > 0.0 and num_abs(y0) > num_abs(y1) and num_abs(s1 - s0) > 1.0e-12 {
+            let ratio01 = y0 / y1;
+            let decay_b = num_ln(ratio01) / (s1 - s0);
+            let z0 = y0 * num_exp(decay_b * s0);
+            return map{
+                ok: true,
+                method: "exponential_2pt",
+                zero_noise_value: z0,
+                asymptote: 0.0,
+                amplitude: z0,
+                decay_rate: decay_b,
+                scales: _clone_num_array(scales),
+                values: _clone_num_array(values)
+            };
+        }
+
+        // Fallback to Richardson if non-monotonic noisy data prevents exponential fit
+        let rf = _richardson_zero_extrapolate(scales, values);
+        return map{
+            ok: true,
+            method: "richardson_fallback",
+            zero_noise_value: rf.value,
+            weights: rf.weights,
+            scales: _clone_num_array(scales),
+            values: _clone_num_array(values)
+        };
+    }
+
+    throw "qem_noise_tomography.zne_extrapolate: unknown extrapolation method '" + method + "'";
+}
+
+fn run_zne(circuit, observable, noise_spec, opts = nil) {
+    let scales = if is_map(opts) and map_has(opts, "scales") and is_array(opts.scales) {
+        opts.scales
+    } else {
+        [1, 3, 5]
+    };
+    let folding = if is_map(opts) and map_has(opts, "folding") {
+        str_upper(str_trim(str(opts.folding)))
+    } else {
+        "PER_GATE"
+    };
+    let method = if is_map(opts) and map_has(opts, "method") {
+        str(opts.method)
+    } else {
+        "richardson"
+    };
+
+    let ideal_rho = density_from_statevector(circuit);
+    let ideal_val = density_pauli_expectation(ideal_rho, observable);
+
+    let vals = [];
+    let purities = [];
+    let i = 0;
+    while i < len(scales) {
+        let sc = scales[i];
+        let folded = if folding == "GLOBAL" {
+            fold_circuit_global(circuit, sc)
+        } else {
+            fold_circuit_per_gate(circuit, sc)
+        };
+        let sim = simulate_noisy_circuit(folded, noise_spec);
+        let ev = density_pauli_expectation(sim.rho, observable);
+        push(vals, ev);
+        push(purities, sim.purity);
+        i = i + 1;
+    }
+
+    let extrap = zne_extrapolate(scales, vals, method);
+    let unmit_err = num_abs(vals[0] - ideal_val);
+    let mit_err = num_abs(extrap.zero_noise_value - ideal_val);
+    let improvement = if mit_err > 1.0e-15 { unmit_err / mit_err } else { 1.0e12 };
+
+    return map{
+        ok: true,
+        method: extrap.method,
+        folding: if folding == "GLOBAL" { "global" } else { "per_gate" },
+        scales: _clone_num_array(scales),
+        noisy_values: vals,
+        purities: purities,
+        unmitigated_value: vals[0],
+        mitigated_value: extrap.zero_noise_value,
+        ideal_value: ideal_val,
+        unmitigated_error: unmit_err,
+        mitigated_error: mit_err,
+        error_reduction_factor: improvement
+    };
+}
+
+// ── 3C. QEM: Pauli Twirling (Exact Symplectic Clifford Conjugation) ──────────
+
+fn _symplectic_to_pauli_op(x_bit, z_bit) {
+    if x_bit == 0 and z_bit == 0 { return "i"; }
+    if x_bit == 1 and z_bit == 0 { return "x"; }
+    if x_bit == 0 and z_bit == 1 { return "z"; }
+    return "y";
+}
+
+fn _push_1q_pauli_if_nonid(gates_out, pauli_op, q) {
+    if pauli_op != "i" {
+        push(gates_out, map{ op: pauli_op, targets: [q], controls: [], params: [] });
+    }
+}
+
+fn pauli_twirl_circuit(circuit, seed = 2026) {
+    let state = bit_and(seed, 4294967295);
+    if state == 0 { state = 246813579; }
+
+    let out_gates = [];
+    let twirled_count = 0;
+
+    let i = 0;
+    while i < len(circuit.gates) {
+        let g = circuit.gates[i];
+        let op = g.op;
+        if op == "cx" or op == "cnot" or op == "cz" {
+            let cq = g.controls[0];
+            let tq = g.targets[0];
+
+            state = _prng_next(state);
+            let r4 = bit_and(state, 15);
+            let xc = bit_and(r4, 1);
+            let zc = bit_and(bit_shr(r4, 1), 1);
+            let xt = bit_and(bit_shr(r4, 2), 1);
+            let zt = bit_and(bit_shr(r4, 3), 1);
+
+            let pre_c = _symplectic_to_pauli_op(xc, zc);
+            let pre_t = _symplectic_to_pauli_op(xt, zt);
+
+            // Exact Clifford conjugation G * (P_c (x) P_t) * G^dagger = +/- (Q_c (x) Q_t):
+            // Applying Q_c (x) Q_t after G satisfies (Q_c (x) Q_t) * G * (P_c (x) P_t) = +/- G (exact up to global +/-1 phase)
+            let nxc = xc;
+            let nzc = zc;
+            let nxt = xt;
+            let nzt = zt;
+            if op == "cz" {
+                nzc = bit_xor(zc, xt);
+                nzt = bit_xor(zt, xc);
+            } else {
+                // cx / cnot
+                nxt = bit_xor(xt, xc);
+                nzc = bit_xor(zc, zt);
+            }
+
+            let post_c = _symplectic_to_pauli_op(nxc, nzc);
+            let post_t = _symplectic_to_pauli_op(nxt, nzt);
+
+            _push_1q_pauli_if_nonid(out_gates, pre_c, cq);
+            _push_1q_pauli_if_nonid(out_gates, pre_t, tq);
+            push(out_gates, _clone_gate(g));
+            _push_1q_pauli_if_nonid(out_gates, post_c, cq);
+            _push_1q_pauli_if_nonid(out_gates, post_t, tq);
+            twirled_count = twirled_count + 1;
+        } else {
+            push(out_gates, _clone_gate(g));
+        }
+        i = i + 1;
+    }
+
+    return map{
+        format: "pblang.quantum.circuit.v1",
+        n_qubits: circuit.n_qubits,
+        gates: out_gates,
+        twirl_seed: seed,
+        twirled_2q_count: twirled_count
+    };
+}
+
+// ── 3D. QEM: Dynamical Decoupling (XY4 / CPMG / XY8 Idle-Qubit Echoes) ───────
+
+fn _dd_pulse_ops(sequence) {
+    let seq = str_upper(str_trim(str(sequence)));
+    if seq == "XY4" {
+        return ["x", "y", "x", "y"];
+    }
+    if seq == "CPMG" or seq == "XX" {
+        return ["x", "x"];
+    }
+    if seq == "XY8" {
+        return ["x", "y", "x", "y", "y", "x", "y", "x"];
+    }
+    throw "qem_noise_tomography.insert_dynamical_decoupling: unsupported sequence '" + str(sequence) + "' (expected XY4, CPMG, or XY8)";
+}
+
+fn insert_dynamical_decoupling(circuit, sequence = "XY4") {
+    let pulses = _dd_pulse_ops(sequence);
+    let n = circuit.n_qubits;
+
+    // Partition circuit into causal parallel layers of pairwise qubit-disjoint gates
+    let layers = [];
+    let cur_gates = [];
+    let cur_used = [];
+    let q = 0;
+    while q < n {
+        push(cur_used, false);
+        q = q + 1;
+    }
+    let cur_has_multi = false;
+
+    let gi = 0;
+    while gi < len(circuit.gates) {
+        let g = circuit.gates[gi];
+        let gqs = _gate_involved_qubits(g);
+        let conflict = false;
+        let k = 0;
+        while k < len(gqs) {
+            if cur_used[gqs[k]] {
+                conflict = true;
+                break;
+            }
+            k = k + 1;
+        }
+
+        if conflict and len(cur_gates) > 0 {
+            push(layers, map{
+                gates: cur_gates,
+                used: cur_used,
+                has_multi: cur_has_multi
+            });
+            cur_gates = [];
+            cur_used = [];
+            let q2 = 0;
+            while q2 < n {
+                push(cur_used, false);
+                q2 = q2 + 1;
+            }
+            cur_has_multi = false;
+        }
+
+        push(cur_gates, _clone_gate(g));
+        if len(gqs) >= 2 {
+            cur_has_multi = true;
+        }
+        k = 0;
+        while k < len(gqs) {
+            cur_used[gqs[k]] = true;
+            k = k + 1;
+        }
+        gi = gi + 1;
+    }
+
+    if len(cur_gates) > 0 {
+        push(layers, map{
+            gates: cur_gates,
+            used: cur_used,
+            has_multi: cur_has_multi
+        });
+    }
+
+    let out_gates = [];
+    let dd_layers = 0;
+    let dd_idle_slots = 0;
+    let dd_pulses_inserted = 0;
+
+    let li = 0;
+    while li < len(layers) {
+        let lay = layers[li];
+        let j = 0;
+        while j < len(lay.gates) {
+            push(out_gates, lay.gates[j]);
+            j = j + 1;
+        }
+
+        if lay.has_multi {
+            let any_idle = false;
+            let iq = 0;
+            while iq < n {
+                if not lay.used[iq] {
+                    any_idle = true;
+                    dd_idle_slots = dd_idle_slots + 1;
+                    let pi = 0;
+                    while pi < len(pulses) {
+                        push(out_gates, map{
+                            op: pulses[pi],
+                            targets: [iq],
+                            controls: [],
+                            params: []
+                        });
+                        dd_pulses_inserted = dd_pulses_inserted + 1;
+                        pi = pi + 1;
+                    }
+                }
+                iq = iq + 1;
+            }
+            if any_idle {
+                dd_layers = dd_layers + 1;
+            }
+        }
+        li = li + 1;
+    }
+
+    return map{
+        format: "pblang.quantum.circuit.v1",
+        n_qubits: n,
+        gates: out_gates,
+        dd_sequence: str_upper(str_trim(str(sequence))),
+        dd_layers_decoupled: dd_layers,
+        dd_idle_slots: dd_idle_slots,
+        dd_pulses_inserted: dd_pulses_inserted
+    };
+}
+
+export new_density_matrix, density_from_statevector, density_apply_unitary_gate,
+       apply_kraus_1q, apply_kraus_2q, verify_cptp_kraus,
+       kraus_depolarizing_1q, kraus_depolarizing_2q,
+       kraus_amplitude_damping, kraus_phase_damping, kraus_thermal_t1_t2,
+       simulate_noisy_circuit,
+       partial_trace, purity, von_neumann_entropy,
+       density_state_fidelity, trace_distance, density_pauli_expectation,
+       project_probability_simplex,
+       generate_tomography_circuits, reconstruct_state_tomography,
+       build_readout_confusion_matrix, mitigate_readout_counts,
+       mitigate_trex_expectation, run_trex_twirled_circuit,
+       invert_gate, fold_circuit_global, fold_circuit_per_gate,
+       zne_extrapolate, run_zne,
+       pauli_twirl_circuit, insert_dynamical_decoupling;

@@ -1,0 +1,4635 @@
+// stdlib/static_checker.sapp — PBLang v3.0.0 Static Symbol/Arity/Type Checker,
+// Zero-Cost Compile-Time 9D SI/Currency Dimensional Type System &
+// Tarski-CAD / Cooper-Presburger Proof-Carrying Contract Verifier.
+//
+// Compatible with PBLang 2.7.0 and 3.0.0 runtimes. Zero external dependencies.
+
+let UCC = import("stdlib:math/universal_concept_cards.sapp");
+let DF = import("stdlib:math/decidable_frontier.sapp");
+let BUILTINS_MOD = import("stdlib:compiler/builtins_list.sapp");
+
+let STATIC_CHECKER_VERSION = "3.0.0";
+
+// ── String, Character & Collection Helpers ────────────────────────────────────
+
+fn _sc_char_at(s, idx) {
+    if s == nil or idx < 0 or idx >= len(s) { return ""; }
+    return str_slice(s, idx, idx + 1);
+}
+
+fn _sc_is_ws(ch) {
+    return ch == " " or ch == "\t" or ch == "\r" or ch == "\n";
+}
+
+fn _sc_is_digit(ch) {
+    if ch == "" { return false; }
+    let code = strcharcodeat(ch, 0);
+    return code >= 48 and code <= 57;
+}
+
+fn _sc_is_hex(ch) {
+    if ch == "" { return false; }
+    let code = strcharcodeat(ch, 0);
+    return (code >= 48 and code <= 57)
+        or (code >= 65 and code <= 70)
+        or (code >= 97 and code <= 102);
+}
+
+fn _sc_is_ident_start(ch) {
+    if ch == "" { return false; }
+    if ch == "_" { return true; }
+    let code = strcharcodeat(ch, 0);
+    if (code >= 65 and code <= 90) or (code >= 97 and code <= 122) { return true; }
+    // Allow Unicode Greek/extended letters (code >= 128) except math punctuation
+    if code >= 160 { return true; }
+    return false;
+}
+
+fn _sc_is_ident_cont(ch) {
+    return _sc_is_ident_start(ch) or _sc_is_digit(ch);
+}
+
+fn _sc_arr_contains(arr, item) {
+    let i = 0;
+    while i < len(arr) {
+        if arr[i] == item { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _sc_arr_push_unique(arr, item) {
+    if not _sc_arr_contains(arr, item) {
+        push(arr, item);
+    }
+}
+
+fn _sc_clone_map(m) {
+    let out = map{};
+    if m == nil { return out; }
+    let ks = map_keys(m);
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        out[k] = m[k];
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── Levenshtein Edit Distance & Smart Symbol Suggestion ───────────────────────
+
+let _COMMON_IDIOMS = map{
+    "to_string": "str",
+    "tostring": "str",
+    "toString": "str",
+    "typeof": "type",
+    "type_of": "type",
+    "length": "len",
+    "size": "len",
+    "substr": "str_slice",
+    "substring": "str_slice",
+    "indexOf": "str_index_of",
+    "contains": "str_contains",
+    "startsWith": "str_starts_with",
+    "endsWith": "str_ends_with",
+    "replace": "str_replace_all",
+    "split": "str_split",
+    "trim": "str_trim",
+    "upper": "str_upper",
+    "lower": "str_lower",
+    "append": "push",
+    "push_back": "push",
+    "parseInt": "parse_number",
+    "parse_int": "parse_number",
+    "parseFloat": "parse_number",
+    "parse_float": "parse_number",
+    "readFile": "fs_read",
+    "read_file": "fs_read",
+    "writeFile": "fs_write",
+    "write_file": "fs_write",
+    "jsonEncode": "json_stringify",
+    "json_encode": "json_stringify",
+    "jsonDecode": "json_parse",
+    "json_decode": "json_parse"
+};
+
+fn levenshtein_distance(a, b) {
+    if a == b { return 0; }
+    let la = len(a);
+    let lb = len(b);
+    if la == 0 { return lb; }
+    if lb == 0 { return la; }
+    if la > 96 or lb > 96 { return 99; }
+
+    let prev = [];
+    let j = 0;
+    while j <= lb {
+        push(prev, j);
+        j = j + 1;
+    }
+    let i = 1;
+    while i <= la {
+        let cur = [i];
+        let ca = _sc_char_at(a, i - 1);
+        j = 1;
+        while j <= lb {
+            let cb = _sc_char_at(b, j - 1);
+            let cost = if ca == cb { 0 } else { 1 };
+            let del_c = prev[j] + 1;
+            let ins_c = cur[j - 1] + 1;
+            let sub_c = prev[j - 1] + cost;
+            let best = del_c;
+            if ins_c < best { best = ins_c; }
+            if sub_c < best { best = sub_c; }
+            push(cur, best);
+            j = j + 1;
+        }
+        prev = cur;
+        i = i + 1;
+    }
+    return prev[lb];
+}
+
+fn suggest_symbol(name, candidates) {
+    if name == nil or name == "" { return nil; }
+    if map_has(_COMMON_IDIOMS, name) {
+        let target = _COMMON_IDIOMS[name];
+        if _sc_arr_contains(candidates, target) {
+            return target;
+        }
+    }
+    let lower_nm = str_lower(name);
+    let max_dist = 2;
+    if len(name) >= 5 { max_dist = 3; }
+    if len(name) <= 2 { max_dist = 1; }
+
+    let best = nil;
+    let best_d = max_dist + 1;
+    let i = 0;
+    while i < len(candidates) {
+        let cand = candidates[i];
+        if cand != name and cand != "" {
+            if str_lower(cand) == lower_nm {
+                return cand;
+            }
+            if num_abs(len(cand) - len(name)) <= max_dist {
+                let d = levenshtein_distance(name, cand);
+                if d > 0 and d <= max_dist {
+                    if best == nil or d < best_d or (d == best_d and cand < best) {
+                        best = cand;
+                        best_d = d;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+// ── Type & 9D SI + Currency Representation ────────────────────────────────────
+
+let _ISO_CURRENCIES = map{
+    "EUR": true, "€": true,
+    "USD": true, "$": true,
+    "GBP": true, "CHF": true, "JPY": true, "CAD": true, "AUD": true,
+    "SEK": true, "NOK": true, "DKK": true, "PLN": true, "CNY": true
+};
+
+fn _canon_ccy_code(sym) {
+    if sym == "€" or sym == "EUR_cent" or sym == "kEUR" or sym == "MEUR" { return "EUR"; }
+    if sym == "$" or sym == "USD_cent" or sym == "kUSD" or sym == "MUSD" { return "USD"; }
+    if map_has(_ISO_CURRENCIES, sym) { return sym; }
+    return nil;
+}
+
+fn _ccy_clean(cm) {
+    let out = map{};
+    if cm == nil { return out; }
+    let ks = array_sort(map_keys(cm));
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        let r = cm[k];
+        if r != nil and r[0] != 0 {
+            out[k] = UCC.rat_make(r[0], r[1]);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _ccy_is_empty(cm) {
+    if cm == nil { return true; }
+    return len(map_keys(_ccy_clean(cm))) == 0;
+}
+
+fn _ccy_mul(a, b) {
+    let out = _sc_clone_map(a);
+    if b != nil {
+        let ks = map_keys(b);
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            let cur = if map_has(out, k) { out[k] } else { [0, 1] };
+            out[k] = UCC.rat_add(cur, b[k]);
+            i = i + 1;
+        }
+    }
+    return _ccy_clean(out);
+}
+
+fn _ccy_div(a, b) {
+    let out = _sc_clone_map(a);
+    if b != nil {
+        let ks = map_keys(b);
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            let cur = if map_has(out, k) { out[k] } else { [0, 1] };
+            out[k] = UCC.rat_sub(cur, b[k]);
+            i = i + 1;
+        }
+    }
+    return _ccy_clean(out);
+}
+
+fn _ccy_pow(a, p, q) {
+    let out = map{};
+    if a == nil { return out; }
+    let factor = UCC.rat_make(p, q);
+    let ks = map_keys(a);
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        out[k] = UCC.rat_mul(a[k], factor);
+        i = i + 1;
+    }
+    return _ccy_clean(out);
+}
+
+fn _ccy_eq(a, b) {
+    let ca = _ccy_clean(a);
+    let cb = _ccy_clean(b);
+    let ka = array_sort(map_keys(ca));
+    let kb = array_sort(map_keys(cb));
+    if len(ka) != len(kb) { return false; }
+    let i = 0;
+    while i < len(ka) {
+        if ka[i] != kb[i] { return false; }
+        if not UCC.rat_eq(ca[ka[i]], cb[kb[i]]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _ccy_to_unit_str(cm) {
+    let c = _ccy_clean(cm);
+    let ks = array_sort(map_keys(c));
+    if len(ks) == 0 { return ""; }
+    let num_p = [];
+    let den_p = [];
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        let r = c[k];
+        if r[0] > 0 {
+            if r[0] == 1 and r[1] == 1 { push(num_p, k); }
+            else { push(num_p, k + "^" + UCC.rat_to_ascii(r)); }
+        } elif r[0] < 0 {
+            let pr = [0 - r[0], r[1]];
+            if pr[0] == 1 and pr[1] == 1 { push(den_p, k); }
+            else { push(den_p, k + "^" + UCC.rat_to_ascii(pr)); }
+        }
+        i = i + 1;
+    }
+    let ns = if len(num_p) == 0 { "1" } else { str_join(num_p, "*") };
+    if len(den_p) == 0 { return ns; }
+    if len(den_p) == 1 { return ns + "/" + den_p[0]; }
+    return ns + "/(" + str_join(den_p, "*") + ")";
+}
+
+// Extract currency exponents while normalizing foreign ISO currencies to EUR for UCC's 9D SI parser
+fn _extract_ccy_and_ucc_unit(unit_raw) {
+    let s = str_trim(unit_raw);
+    if s == "" or s == "1" or s == "dimensionless" {
+        let pu0 = UCC.parse_unit("1");
+        return map{ ok: true, unit_str: "1", dim: pu0["dim"], ccy: map{}, pu: pu0, error: nil };
+    }
+
+    // Scan unit tokens to record explicit currency symbols (EUR, USD, GBP, CHF, ...)
+    let ccy = map{};
+    let rewritten = "";
+    let n = len(s);
+    let i = 0;
+    let cur_sign = 1; // +1 numerator, -1 after '/'
+    let group_stack = [];
+
+    while i < n {
+        let ch = _sc_char_at(s, i);
+        if ch == "(" {
+            push(group_stack, cur_sign);
+            rewritten = rewritten + ch;
+            i = i + 1;
+        } elif ch == ")" {
+            if len(group_stack) > 0 {
+                cur_sign = pop(group_stack);
+            } else {
+                cur_sign = 1;
+            }
+            rewritten = rewritten + ch;
+            i = i + 1;
+        } elif ch == "/" {
+            let base_sg = if len(group_stack) > 0 { group_stack[len(group_stack) - 1] } else { 1 };
+            cur_sign = 0 - base_sg;
+            rewritten = rewritten + ch;
+            i = i + 1;
+        } elif ch == "*" {
+            let base_sg2 = if len(group_stack) > 0 { group_stack[len(group_stack) - 1] } else { 1 };
+            cur_sign = base_sg2;
+            rewritten = rewritten + ch;
+            i = i + 1;
+        } elif _sc_is_ident_start(ch) or ch == "€" or ch == "$" {
+            let j = i + 1;
+            if ch != "€" and ch != "$" {
+                while j < n and _sc_is_ident_cont(_sc_char_at(s, j)) {
+                    j = j + 1;
+                }
+            }
+            let sym = str_slice(s, i, j);
+            // Check optional ^exp after symbol
+            let k = j;
+            while k < n and (_sc_char_at(s, k) == " " or _sc_char_at(s, k) == "\t") { k = k + 1; }
+            let exp_num = 1;
+            if k < n and _sc_char_at(s, k) == "^" {
+                let m = k + 1;
+                let esg = 1;
+                if m < n and _sc_char_at(s, m) == "-" { esg = -1; m = m + 1; }
+                elif m < n and _sc_char_at(s, m) == "+" { m = m + 1; }
+                let d_start = m;
+                while m < n and _sc_is_digit(_sc_char_at(s, m)) { m = m + 1; }
+                if m > d_start {
+                    exp_num = num_floor(parse_number(str_slice(s, d_start, m))) * esg;
+                }
+            }
+            let cc = _canon_ccy_code(sym);
+            if cc != nil {
+                let prev_r = if map_has(ccy, cc) { ccy[cc] } else { [0, 1] };
+                ccy[cc] = UCC.rat_add(prev_r, [cur_sign * exp_num, 1]);
+                rewritten = rewritten + "EUR";
+            } else {
+                rewritten = rewritten + sym;
+            }
+            i = j;
+        } else {
+            rewritten = rewritten + ch;
+            i = i + 1;
+        }
+    }
+
+    let pu = UCC.parse_unit(rewritten);
+    if not pu["ok"] {
+        return map{ ok: false, unit_str: s, dim: UCC.dim_zero(), ccy: map{}, pu: pu, error: pu["error"] };
+    }
+    return map{
+        ok: true,
+        unit_str: s,
+        dim: pu["dim"],
+        ccy: _ccy_clean(ccy),
+        pu: pu,
+        error: nil
+    };
+}
+
+fn _dim_unicode_rich(dim, ccy) {
+    if dim == nil { return "[invalid]"; }
+    let cc = _ccy_clean(ccy);
+    if UCC.dim_is_dimensionless(dim) and _ccy_is_empty(cc) {
+        return "[1]";
+    }
+    // Check single base dimension with exponent 1 -> show explicit superscript ¹ alongside canonical
+    let non_zero_cnt = 0;
+    let single_sym = "";
+    let i = 0;
+    let syms = ["L", "M", "T", "I", "Θ", "N", "J", "EUR", "BIT"];
+    while i < 9 {
+        if dim[i][0] != 0 {
+            non_zero_cnt = non_zero_cnt + 1;
+            if dim[i][0] == 1 and dim[i][1] == 1 {
+                single_sym = syms[i];
+            }
+        }
+        i = i + 1;
+    }
+    if not _ccy_is_empty(cc) and UCC.dim_is_dimensionless(dim) {
+        return "[" + _ccy_to_unit_str(cc) + "]";
+    }
+    if non_zero_cnt == 1 and single_sym != "" {
+        if single_sym == "EUR" and not _ccy_is_empty(cc) {
+            return "[" + _ccy_to_unit_str(cc) + "¹]";
+        }
+        return "[" + single_sym + "¹]";
+    }
+    let u_str = UCC.dim_to_unicode(dim);
+    if not _ccy_is_empty(cc) {
+        let cu = _ccy_to_unit_str(cc);
+        if cu != "EUR" {
+            u_str = str_replace_all(u_str, "EUR", cu);
+        }
+    }
+    return u_str;
+}
+
+fn _canonical_unit_label(dim, ccy) {
+    let cc = _ccy_clean(ccy);
+    if UCC.dim_is_dimensionless(dim) {
+        if _ccy_is_empty(cc) { return "1"; }
+        return _ccy_to_unit_str(cc);
+    }
+    let base_u = UCC.dim_canonical_si_unit(dim);
+    if not _ccy_is_empty(cc) {
+        let cu = _ccy_to_unit_str(cc);
+        if cu != "" and cu != "EUR" {
+            base_u = str_replace_all(base_u, "EUR", cu);
+        }
+    }
+    return base_u;
+}
+
+fn _make_type(base_name) {
+    return map{
+        base: base_name,
+        has_unit: false,
+        is_zero_lit: false,
+        const_val: nil,
+        unit_str: "",
+        dim: UCC.dim_zero(),
+        ccy: map{},
+        elem_type: nil,
+        ok_type: nil,
+        err_type: nil,
+        params: nil,
+        ret_type: nil,
+        type_name: "",
+        is_quantum_circuit: false,
+        quantum_n_qubits: nil
+    };
+}
+
+fn _make_unit_type(base_num, dim, ccy, preferred_unit_str = "") {
+    let clean_c = _ccy_clean(ccy);
+    let canon = _canonical_unit_label(dim, clean_c);
+    let u_label = if preferred_unit_str != "" { preferred_unit_str } else { canon };
+    let is_dimless = UCC.dim_is_dimensionless(dim) and _ccy_is_empty(clean_c);
+    let t = _make_type(base_num);
+    t["has_unit"] = not is_dimless;
+    t["unit_str"] = if is_dimless { "" } else { u_label };
+    t["dim"] = dim;
+    t["ccy"] = clean_c;
+    return t;
+}
+
+fn _type_to_str(t) {
+    if t == nil { return "any"; }
+    let b = t["base"];
+    if (b == "num" or b == "int") and t["has_unit"] {
+        let u = _canonical_unit_label(t["dim"], t["ccy"]);
+        return b + "[" + u + "]";
+    }
+    if b == "Option" {
+        let inner = if t["elem_type"] != nil { _type_to_str(t["elem_type"]) } else { "any" };
+        return "Option<" + inner + ">";
+    }
+    if b == "Result" {
+        let ok_s = if t["ok_type"] != nil { _type_to_str(t["ok_type"]) } else { "any" };
+        let err_s = if t["err_type"] != nil { _type_to_str(t["err_type"]) } else { "string" };
+        return "Result<" + ok_s + ", " + err_s + ">";
+    }
+    if b == "fn" {
+        let ps = [];
+        if t["params"] != nil {
+            let i = 0;
+            while i < len(t["params"]) {
+                push(ps, _type_to_str(t["params"][i]));
+                i = i + 1;
+            }
+        }
+        let rs = if t["ret_type"] != nil { _type_to_str(t["ret_type"]) } else { "any" };
+        return "fn(" + str_join(ps, ", ") + ") -> " + rs;
+    }
+    if (b == "enum" or b == "struct" or b == "class") and t["type_name"] != "" {
+        return t["type_name"];
+    }
+    return b;
+}
+
+fn _is_numeric_type(t) {
+    if t == nil { return false; }
+    return t["base"] == "num" or t["base"] == "int";
+}
+
+fn _units_compatible(t1, t2) {
+    let d1 = if t1 != nil and t1["dim"] != nil { t1["dim"] } else { UCC.dim_zero() };
+    let d2 = if t2 != nil and t2["dim"] != nil { t2["dim"] } else { UCC.dim_zero() };
+    let c1 = if t1 != nil { t1["ccy"] } else { map{} };
+    let c2 = if t2 != nil { t2["ccy"] } else { map{} };
+    return UCC.dim_eq(d1, d2) and _ccy_eq(c1, c2);
+}
+
+// ── Lexer (`tokenize_sapp`) ───────────────────────────────────────────────────
+
+let _KEYWORDS = map{
+    "let": true, "const": true, "fn": true, "async": true, "await": true,
+    "return": true, "if": true, "elif": true, "else": true,
+    "while": true, "loop": true, "for": true, "in": true, "to": true,
+    "break": true, "continue": true, "match": true, "switch": true, "case": true, "default": true,
+    "try": true, "catch": true, "throw": true, "defer": true,
+    "struct": true, "class": true, "extends": true, "interface": true, "enum": true,
+    "import": true, "export": true, "map": true, "print": true,
+    "and": true, "or": true, "not": true, "true": true, "false": true, "nil": true,
+    "requires": true, "ensures": true, "comptime": true, "pub": true
+};
+
+fn tokenize_sapp(src_code) {
+    let src = if src_code == nil { "" } else { str(src_code) };
+    let n = len(src);
+    let toks = [];
+    let lex_errors = [];
+    let i = 0;
+    let line = 1;
+    let col = 1;
+    let pending_docs = [];
+
+    // Strip line-1 shebang
+    if n >= 2 and str_slice(src, 0, 2) == "#!" {
+        while i < n and _sc_char_at(src, i) != "\n" {
+            i = i + 1;
+            col = col + 1;
+        }
+    }
+
+    while i < n {
+        let ch = _sc_char_at(src, i);
+        let nx = _sc_char_at(src, i + 1);
+
+        if ch == "\n" {
+            line = line + 1;
+            col = 1;
+            i = i + 1;
+            continue;
+        }
+        if ch == " " or ch == "\t" or ch == "\r" {
+            if ch != "\r" { col = col + 1; }
+            i = i + 1;
+            continue;
+        }
+
+        // Line comments (including /// and //! doc comments)
+        if ch == "/" and nx == "/" {
+            let c_start = i;
+            let c_line = line;
+            while i < n and _sc_char_at(src, i) != "\n" {
+                i = i + 1;
+            }
+            let raw_c = str_slice(src, c_start, i);
+            if str_starts_with(raw_c, "///") or str_starts_with(raw_c, "//!") {
+                push(pending_docs, map{ line: c_line, text: str_trim(str_slice(raw_c, 3, len(raw_c))), is_triple: true });
+            } else {
+                push(pending_docs, map{ line: c_line, text: str_trim(str_slice(raw_c, 2, len(raw_c))), is_triple: false });
+            }
+            continue;
+        }
+
+        // Nested block comments /* ... */
+        if ch == "/" and nx == "*" {
+            let bdepth = 1;
+            i = i + 2;
+            col = col + 2;
+            while i < n and bdepth > 0 {
+                let bc = _sc_char_at(src, i);
+                let bn = _sc_char_at(src, i + 1);
+                if bc == "\n" {
+                    line = line + 1;
+                    col = 1;
+                    i = i + 1;
+                } elif bc == "/" and bn == "*" {
+                    bdepth = bdepth + 1;
+                    i = i + 2;
+                    col = col + 2;
+                } elif bc == "*" and bn == "/" {
+                    bdepth = bdepth - 1;
+                    i = i + 2;
+                    col = col + 2;
+                } else {
+                    i = i + 1;
+                    col = col + 1;
+                }
+            }
+            continue;
+        }
+
+        let t_line = line;
+        let t_col = col;
+
+        // @lang polyglot blocks: @python(...) { ... }
+        if ch == "@" and _sc_is_ident_start(nx) {
+            let j = i + 1;
+            while j < n and _sc_is_ident_cont(_sc_char_at(src, j)) { j = j + 1; }
+            col = col + (j - i);
+            i = j;
+            while i < n and _sc_is_ws(_sc_char_at(src, i)) {
+                if _sc_char_at(src, i) == "\n" { line = line + 1; col = 1; } else { col = col + 1; }
+                i = i + 1;
+            }
+            if _sc_char_at(src, i) == "(" {
+                let pdepth = 1;
+                i = i + 1; col = col + 1;
+                while i < n and pdepth > 0 {
+                    let pc = _sc_char_at(src, i);
+                    if pc == "\n" { line = line + 1; col = 1; }
+                    else {
+                        col = col + 1;
+                        if pc == "(" { pdepth = pdepth + 1; }
+                        elif pc == ")" { pdepth = pdepth - 1; }
+                    }
+                    i = i + 1;
+                }
+            }
+            while i < n and _sc_is_ws(_sc_char_at(src, i)) {
+                if _sc_char_at(src, i) == "\n" { line = line + 1; col = 1; } else { col = col + 1; }
+                i = i + 1;
+            }
+            if _sc_char_at(src, i) == "{" {
+                let cdepth = 1;
+                i = i + 1; col = col + 1;
+                while i < n and cdepth > 0 {
+                    let cc = _sc_char_at(src, i);
+                    if cc == "\n" { line = line + 1; col = 1; }
+                    else {
+                        col = col + 1;
+                        if cc == "{" { cdepth = cdepth + 1; }
+                        elif cc == "}" { cdepth = cdepth - 1; }
+                    }
+                    i = i + 1;
+                }
+            }
+            push(toks, map{ kind: "POLYGLOT", val: "@polyglot", line: t_line, col: t_col, end_col: col, doc: "" });
+            pending_docs = [];
+            continue;
+        }
+
+        // String literals (including f"..." interpolated strings)
+        if ch == "\"" or ch == "'" or (ch == "f" and (nx == "\"" or nx == "'")) {
+            let is_f = ch == "f";
+            let q = if is_f { nx } else { ch };
+            i = i + (if is_f { 2 } else { 1 });
+            col = col + (if is_f { 2 } else { 1 });
+            let buf = "";
+            let interp_exprs = [];
+            while i < n {
+                let sc = _sc_char_at(src, i);
+                if sc == "\\" and i + 1 < n {
+                    let esc = _sc_char_at(src, i + 1);
+                    buf = buf + esc;
+                    if esc == "\n" { line = line + 1; col = 1; } else { col = col + 2; }
+                    i = i + 2;
+                    continue;
+                }
+                if is_f and sc == "{" {
+                    let expr_line = line;
+                    let expr_col = col + 1;
+                    i = i + 1;
+                    col = col + 1;
+                    let edepth = 1;
+                    let ebuf = "";
+                    while i < n and edepth > 0 {
+                        let ec = _sc_char_at(src, i);
+                        if ec == "{" { edepth = edepth + 1; ebuf = ebuf + ec; col = col + 1; i = i + 1; }
+                        elif ec == "}" {
+                            edepth = edepth - 1;
+                            if edepth > 0 { ebuf = ebuf + ec; }
+                            col = col + 1;
+                            i = i + 1;
+                        } else {
+                            if ec == "\n" { line = line + 1; col = 1; } else { col = col + 1; }
+                            ebuf = ebuf + ec;
+                            i = i + 1;
+                        }
+                    }
+                    push(interp_exprs, map{ code: ebuf, line: expr_line, col: expr_col });
+                    continue;
+                }
+                if sc == q {
+                    i = i + 1;
+                    col = col + 1;
+                    break;
+                }
+                if sc == "\n" { line = line + 1; col = 1; } else { col = col + 1; }
+                buf = buf + sc;
+                i = i + 1;
+            }
+            push(toks, map{
+                kind: if is_f { "FSTR" } else { "STR" },
+                val: buf,
+                interps: interp_exprs,
+                line: t_line,
+                col: t_col,
+                end_col: col,
+                doc: ""
+            });
+            pending_docs = [];
+            continue;
+        }
+
+        // Numbers (dec, hex, bin, oct, scientific)
+        if _sc_is_digit(ch) {
+            let j = i;
+            if ch == "0" and (nx == "x" or nx == "X") {
+                j = j + 2;
+                while j < n and (_sc_is_hex(_sc_char_at(src, j)) or _sc_char_at(src, j) == "_") { j = j + 1; }
+            } elif ch == "0" and (nx == "b" or nx == "B" or nx == "o" or nx == "O") {
+                j = j + 2;
+                while j < n and (_sc_is_digit(_sc_char_at(src, j)) or _sc_char_at(src, j) == "_") { j = j + 1; }
+            } else {
+                while j < n and (_sc_is_digit(_sc_char_at(src, j)) or _sc_char_at(src, j) == "_") { j = j + 1; }
+                if j < n and _sc_char_at(src, j) == "." and _sc_char_at(src, j + 1) != "." and _sc_is_digit(_sc_char_at(src, j + 1)) {
+                    j = j + 1;
+                    while j < n and (_sc_is_digit(_sc_char_at(src, j)) or _sc_char_at(src, j) == "_") { j = j + 1; }
+                }
+                if j < n and (_sc_char_at(src, j) == "e" or _sc_char_at(src, j) == "E") {
+                    let ej = j + 1;
+                    if _sc_char_at(src, ej) == "+" or _sc_char_at(src, ej) == "-" { ej = ej + 1; }
+                    if _sc_is_digit(_sc_char_at(src, ej)) {
+                        j = ej;
+                        while j < n and (_sc_is_digit(_sc_char_at(src, j)) or _sc_char_at(src, j) == "_") { j = j + 1; }
+                    }
+                }
+            }
+            let raw_num = str_replace_all(str_slice(src, i, j), "_", "");
+            col = col + (j - i);
+            i = j;
+            push(toks, map{ kind: "NUM", val: raw_num, line: t_line, col: t_col, end_col: col, doc: "" });
+            pending_docs = [];
+            continue;
+        }
+
+        // Identifiers & Keywords (with attached doc comments!)
+        if _sc_is_ident_start(ch) or ch == "€" or ch == "$" {
+            let j = i + 1;
+            if ch != "€" and ch != "$" {
+                while j < n and _sc_is_ident_cont(_sc_char_at(src, j)) { j = j + 1; }
+            }
+            let word = str_slice(src, i, j);
+            col = col + (j - i);
+            i = j;
+
+            // Attach contiguous preceding doc comments
+            let doc_txt = "";
+            if len(pending_docs) > 0 {
+                let last_doc_line = pending_docs[len(pending_docs) - 1]["line"];
+                if t_line - last_doc_line <= 2 {
+                    let dparts = [];
+                    let di = 0;
+                    while di < len(pending_docs) {
+                        if pending_docs[di]["text"] != "" {
+                            push(dparts, pending_docs[di]["text"]);
+                        }
+                        di = di + 1;
+                    }
+                    doc_txt = str_join(dparts, "\n");
+                }
+            }
+            let tk_kind = if map_has(_KEYWORDS, word) { "KW" } else { "ID" };
+            push(toks, map{ kind: tk_kind, val: word, line: t_line, col: t_col, end_col: col, doc: doc_txt });
+            if word != "pub" and word != "export" and word != "async" {
+                pending_docs = [];
+            }
+            continue;
+        }
+
+        // 3-char operators
+        let c3 = if i + 3 <= n { str_slice(src, i, i + 3) } else { "" };
+        if c3 == "..." or c3 == "**=" {
+            push(toks, map{ kind: "OP", val: c3, line: t_line, col: t_col, end_col: t_col + 3, doc: "" });
+            i = i + 3;
+            col = col + 3;
+            pending_docs = [];
+            continue;
+        }
+
+        // 2-char operators
+        let c2 = if i + 2 <= n { str_slice(src, i, i + 2) } else { "" };
+        if c2 == "==" or c2 == "!=" or c2 == "<=" or c2 == ">=" or c2 == "->" or c2 == "=>"
+           or c2 == "+=" or c2 == "-=" or c2 == "*=" or c2 == "/=" or c2 == "%=" or c2 == "**"
+           or c2 == ".." or c2 == "?." or c2 == "?[" or c2 == "??" or c2 == "|>" or c2 == "<<"
+           or c2 == ">>" or c2 == "&&" or c2 == "||" or c2 == "::" {
+            push(toks, map{ kind: "OP", val: c2, line: t_line, col: t_col, end_col: t_col + 2, doc: "" });
+            i = i + 2;
+            col = col + 2;
+            pending_docs = [];
+            continue;
+        }
+
+        // 1-char punctuation & operators
+        if str_index_of("()[]{},;:.+-*/%^~&|<>=!?", ch) >= 0 {
+            let pk = if str_index_of("()[]{},;:.", ch) >= 0 { "PUNC" } else { "OP" };
+            push(toks, map{ kind: pk, val: ch, line: t_line, col: t_col, end_col: t_col + 1, doc: "" });
+            i = i + 1;
+            col = col + 1;
+            pending_docs = [];
+            continue;
+        }
+
+        push(lex_errors, map{ line: t_line, col: t_col, message: "Unexpected character '" + ch + "'" });
+        i = i + 1;
+        col = col + 1;
+    }
+
+    push(toks, map{ kind: "EOF", val: "", line: line, col: col, end_col: col, doc: "" });
+    return map{ tokens: toks, errors: lex_errors };
+}
+
+// ── Recursive-Descent AST Parser (`parse_sapp_ast`) ──────────────────────────
+
+fn _p_cur(st) {
+    let pos = st["pos"];
+    let toks = st["tokens"];
+    if pos >= len(toks) { return toks[len(toks) - 1]; }
+    return toks[pos];
+}
+
+fn _p_peek(st, offset) {
+    let idx = st["pos"] + offset;
+    let toks = st["tokens"];
+    if idx < 0 or idx >= len(toks) { return toks[len(toks) - 1]; }
+    return toks[idx];
+}
+
+fn _p_adv(st) {
+    let t = _p_cur(st);
+    if t["kind"] != "EOF" {
+        st["pos"] = st["pos"] + 1;
+    }
+    return t;
+}
+
+fn _p_is(st, kind, val) {
+    let t = _p_cur(st);
+    return t["kind"] == kind and (val == nil or t["val"] == val);
+}
+
+fn _p_eat(st, kind, val) {
+    if _p_is(st, kind, val) {
+        _p_adv(st);
+        return true;
+    }
+    return false;
+}
+
+fn _p_err(st, msg, tok) {
+    let tk = if tok != nil { tok } else { _p_cur(st) };
+    push(st["errors"], map{
+        severity: "error",
+        code: "SYNTAX_ERROR",
+        message: msg,
+        message_el: "Συντακτικό σφάλμα: " + msg,
+        line: tk["line"],
+        col: tk["col"],
+        end_line: tk["line"],
+        end_col: tk["end_col"],
+        suggestion: nil
+    });
+}
+
+fn _p_expect(st, kind, val, desc) {
+    if _p_is(st, kind, val) {
+        return _p_adv(st);
+    }
+    let cur = _p_cur(st);
+    _p_err(st, "Expected " + desc + ", got '" + cur["val"] + "'", cur);
+    return cur;
+}
+
+// Reconstruct unit string inside `[...]` of `: num[m/s]`
+fn _parse_unit_brackets(st) {
+    let open_t = _p_expect(st, "PUNC", "[", "'['");
+    let parts = [];
+    let depth = 1;
+    while not _p_is(st, "EOF", nil) and depth > 0 {
+        let t = _p_adv(st);
+        if t["kind"] == "PUNC" and t["val"] == "[" {
+            depth = depth + 1;
+            push(parts, "[");
+        } elif t["kind"] == "PUNC" and t["val"] == "]" {
+            depth = depth - 1;
+            if depth > 0 { push(parts, "]"); }
+        } else {
+            push(parts, t["val"]);
+        }
+    }
+    return map{ unit_raw: str_join(parts, ""), line: open_t["line"], col: open_t["col"] };
+}
+
+fn _parse_type_annot(st) {
+    let t = _p_cur(st);
+    if t["kind"] == "KW" and t["val"] == "fn" {
+        _p_adv(st);
+        let ptypes = [];
+        if _p_eat(st, "PUNC", "(") {
+            while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", ")") {
+                // Allow optional `name: Type` or just `Type`
+                if (_p_cur(st)["kind"] == "ID" or _p_cur(st)["kind"] == "KW") and _p_peek(st, 1)["val"] == ":" {
+                    _p_adv(st);
+                    _p_adv(st);
+                }
+                push(ptypes, _parse_type_annot(st));
+                if not _p_eat(st, "PUNC", ",") { break; }
+            }
+            _p_expect(st, "PUNC", ")", "')'");
+        }
+        let rtype = map{ raw: "any", unit_raw: "", params: nil, ret: nil, args: [], line: t["line"], col: t["col"] };
+        if _p_eat(st, "OP", "->") {
+            rtype = _parse_type_annot(st);
+        }
+        return map{ raw: "fn", unit_raw: "", params: ptypes, ret: rtype, args: [], line: t["line"], col: t["col"] };
+    }
+
+    if t["kind"] == "ID" or t["kind"] == "KW" {
+        let base_t = _p_adv(st);
+        let bname = base_t["val"];
+        let unit_raw = "";
+        let unit_loc = nil;
+        let gen_args = [];
+
+        if _p_is(st, "PUNC", "[") {
+            let ub = _parse_unit_brackets(st);
+            unit_raw = ub["unit_raw"];
+            unit_loc = ub;
+        } elif _p_is(st, "OP", "<") {
+            _p_adv(st);
+            while not _p_is(st, "EOF", nil) and not _p_is(st, "OP", ">") {
+                push(gen_args, _parse_type_annot(st));
+                if not _p_eat(st, "PUNC", ",") { break; }
+            }
+            _p_eat(st, "OP", ">");
+        }
+        return map{
+            raw: bname,
+            unit_raw: unit_raw,
+            unit_loc: unit_loc,
+            params: nil,
+            ret: nil,
+            args: gen_args,
+            line: base_t["line"],
+            col: base_t["col"]
+        };
+    }
+
+    _p_err(st, "Expected type annotation", t);
+    return map{ raw: "any", unit_raw: "", params: nil, ret: nil, args: [], line: t["line"], col: t["col"] };
+}
+
+fn _parse_ident_like(st, desc) {
+    let t = _p_cur(st);
+    if t["kind"] == "ID" or t["kind"] == "KW" {
+        return _p_adv(st);
+    }
+    return _p_expect(st, "ID", nil, desc);
+}
+
+// Forward declarations via mutual functions in PBLang (top-level fns are hoisted!)
+
+fn _parse_primary(st) {
+    let t = _p_cur(st);
+
+    if t["kind"] == "NUM" {
+        _p_adv(st);
+        return map{ kind: "num", val: t["val"], line: t["line"], col: t["col"], end_col: t["end_col"] };
+    }
+    if t["kind"] == "STR" or t["kind"] == "FSTR" {
+        _p_adv(st);
+        let sub_asts = [];
+        if t["kind"] == "FSTR" and t["interps"] != nil {
+            let ii = 0;
+            while ii < len(t["interps"]) {
+                let ip = t["interps"][ii];
+                let sub_p = parse_sapp_ast(ip["code"] + ";");
+                push(sub_asts, sub_p["ast"]);
+                ii = ii + 1;
+            }
+        }
+        return map{ kind: "str", val: t["val"], is_fstr: t["kind"] == "FSTR", interps: sub_asts, line: t["line"], col: t["col"], end_col: t["end_col"] };
+    }
+    if t["kind"] == "POLYGLOT" {
+        _p_adv(st);
+        return map{ kind: "polyglot", line: t["line"], col: t["col"], end_col: t["end_col"] };
+    }
+    if t["kind"] == "KW" {
+        let kv = t["val"];
+        if kv == "true" or kv == "false" {
+            _p_adv(st);
+            return map{ kind: "bool", val: kv == "true", line: t["line"], col: t["col"], end_col: t["end_col"] };
+        }
+        if kv == "nil" {
+            _p_adv(st);
+            return map{ kind: "nil", line: t["line"], col: t["col"], end_col: t["end_col"] };
+        }
+        if kv == "import" {
+            _p_adv(st);
+            _p_expect(st, "PUNC", "(", "'(' after import");
+            let arg_e = _parse_expr(st);
+            _p_expect(st, "PUNC", ")", "')' after import path");
+            return map{ kind: "import_expr", arg: arg_e, line: t["line"], col: t["col"], end_col: _p_cur(st)["col"] };
+        }
+        if kv == "comptime" {
+            _p_adv(st);
+            if _p_eat(st, "PUNC", "(") {
+                let ce = _parse_expr(st);
+                _p_expect(st, "PUNC", ")", "')' after comptime");
+                return map{ kind: "comptime_expr", expr: ce, block: nil, line: t["line"], col: t["col"] };
+            }
+            let cb = _parse_block(st);
+            return map{ kind: "comptime_expr", expr: nil, block: cb, line: t["line"], col: t["col"] };
+        }
+        if kv == "map" and _p_peek(st, 1)["val"] == "{" {
+            _p_adv(st);
+            _p_adv(st);
+            let entries = [];
+            while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", "}") {
+                let kt = _p_cur(st);
+                let key_expr = nil;
+                if (kt["kind"] == "ID" or kt["kind"] == "KW" or kt["kind"] == "STR") and _p_peek(st, 1)["val"] == ":" {
+                    _p_adv(st);
+                    _p_adv(st);
+                    key_expr = map{ kind: "str", val: kt["val"], is_fstr: false, interps: [], line: kt["line"], col: kt["col"], end_col: kt["end_col"] };
+                } elif _p_eat(st, "PUNC", "[") {
+                    key_expr = _parse_expr(st);
+                    _p_expect(st, "PUNC", "]", "']'");
+                    _p_expect(st, "PUNC", ":", "':'");
+                } else {
+                    key_expr = _parse_expr(st);
+                    _p_expect(st, "PUNC", ":", "':' in map literal");
+                }
+                let val_expr = _parse_expr(st);
+                push(entries, map{ key: key_expr, val: val_expr });
+                if not _p_eat(st, "PUNC", ",") { break; }
+            }
+            _p_expect(st, "PUNC", "}", "'}'");
+            return map{ kind: "map_lit", entries: entries, line: t["line"], col: t["col"] };
+        }
+        if kv == "fn" or (kv == "async" and _p_peek(st, 1)["val"] == "fn") {
+            let is_as = false;
+            if kv == "async" { _p_adv(st); is_as = true; }
+            return _parse_fn_expr_or_decl(st, false, is_as, "");
+        }
+        if kv == "if" {
+            return _parse_if_expr(st);
+        }
+        if kv == "match" {
+            return _parse_match_node(st);
+        }
+        if kv == "try" {
+            _p_adv(st);
+            if _p_is(st, "PUNC", "{") {
+                let tb = _parse_block(st);
+                let cname = "";
+                let cb = nil;
+                if _p_eat(st, "KW", "catch") {
+                    if _p_cur(st)["kind"] == "ID" and _p_peek(st, 1)["val"] == "{" {
+                        cname = _p_adv(st)["val"];
+                    }
+                    cb = _parse_block(st);
+                }
+                return map{ kind: "try_block_expr", try_block: tb, catch_var: cname, catch_block: cb, line: t["line"], col: t["col"] };
+            }
+            let te = _parse_expr(st);
+            let fe = nil;
+            let cv = "";
+            if _p_eat(st, "KW", "catch") {
+                fe = _parse_expr(st);
+            }
+            return map{ kind: "try_expr", expr: te, catch_var: cv, fallback: fe, line: t["line"], col: t["col"] };
+        }
+        if kv == "await" {
+            _p_adv(st);
+            return map{ kind: "unary", op: "await", arg: _parse_unary(st), line: t["line"], col: t["col"] };
+        }
+        // Note: `map` can also be used as a variable/module name when not followed by `{`
+        if kv == "map" {
+            _p_adv(st);
+            return map{ kind: "ident", name: "map", line: t["line"], col: t["col"], end_col: t["end_col"] };
+        }
+    }
+
+    if t["kind"] == "ID" {
+        _p_adv(st);
+        return map{ kind: "ident", name: t["val"], line: t["line"], col: t["col"], end_col: t["end_col"] };
+    }
+
+    if t["kind"] == "PUNC" and t["val"] == "(" {
+        _p_adv(st);
+        let inner = _parse_expr(st);
+        _p_expect(st, "PUNC", ")", "')'");
+        return inner;
+    }
+
+    if t["kind"] == "PUNC" and t["val"] == "[" {
+        _p_adv(st);
+        let items = [];
+        while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", "]") {
+            if _p_eat(st, "OP", "...") {
+                push(items, map{ kind: "spread", arg: _parse_expr(st), line: _p_cur(st)["line"], col: _p_cur(st)["col"] });
+            } else {
+                push(items, _parse_expr(st));
+            }
+            if not _p_eat(st, "PUNC", ",") { break; }
+        }
+        _p_expect(st, "PUNC", "]", "']'");
+        return map{ kind: "array_lit", items: items, line: t["line"], col: t["col"] };
+    }
+
+    _p_err(st, "Unexpected token '" + t["val"] + "' in expression", t);
+    _p_adv(st);
+    return map{ kind: "nil", line: t["line"], col: t["col"], end_col: t["end_col"] };
+}
+
+fn _parse_postfix(st) {
+    let expr = _parse_primary(st);
+    while not _p_is(st, "EOF", nil) {
+        let t = _p_cur(st);
+        if t["kind"] == "PUNC" and t["val"] == "(" {
+            _p_adv(st);
+            let cargs = [];
+            while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", ")") {
+                if _p_eat(st, "OP", "...") {
+                    push(cargs, map{ kind: "spread", arg: _parse_expr(st), line: _p_cur(st)["line"], col: _p_cur(st)["col"] });
+                } else {
+                    push(cargs, _parse_expr(st));
+                }
+                if not _p_eat(st, "PUNC", ",") { break; }
+            }
+            _p_expect(st, "PUNC", ")", "')'");
+            expr = map{ kind: "call", callee: expr, args: cargs, line: expr["line"], col: expr["col"] };
+        } elif (t["kind"] == "PUNC" and t["val"] == ".") or (t["kind"] == "OP" and (t["val"] == "?." or t["val"] == "::")) {
+            let acc_op = _p_adv(st)["val"];
+            let mtok = _parse_ident_like(st, "member name");
+            expr = map{ kind: "member", obj: expr, field: mtok["val"], op: acc_op, line: mtok["line"], col: mtok["col"], end_col: mtok["end_col"] };
+        } elif t["kind"] == "PUNC" and t["val"] == ":" and _p_peek(st, 1)["kind"] == "ID" and _p_peek(st, 2)["val"] == "(" {
+            // Colon method call `obj:method(args...)`
+            _p_adv(st);
+            let mtok2 = _p_adv(st);
+            _p_adv(st); // '('
+            let margs = [];
+            while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", ")") {
+                push(margs, _parse_expr(st));
+                if not _p_eat(st, "PUNC", ",") { break; }
+            }
+            _p_expect(st, "PUNC", ")", "')'");
+            expr = map{ kind: "method_call", obj: expr, method: mtok2["val"], args: margs, line: mtok2["line"], col: mtok2["col"] };
+        } elif (t["kind"] == "PUNC" and t["val"] == "[") or (t["kind"] == "OP" and t["val"] == "?[") {
+            _p_adv(st);
+            let idx_e = nil;
+            if not _p_is(st, "OP", "..") {
+                idx_e = _parse_expr(st);
+            }
+            if _p_eat(st, "OP", "..") {
+                let end_e = nil;
+                if not _p_is(st, "PUNC", "]") {
+                    end_e = _parse_expr(st);
+                }
+                _p_expect(st, "PUNC", "]", "']'");
+                expr = map{ kind: "slice_expr", obj: expr, start: idx_e, stop: end_e, line: t["line"], col: t["col"] };
+            } else {
+                _p_expect(st, "PUNC", "]", "']'");
+                expr = map{ kind: "index", obj: expr, index: idx_e, line: t["line"], col: t["col"] };
+            }
+        } elif t["kind"] == "OP" and t["val"] == "?" and _p_peek(st, 1)["val"] == ";" {
+            _p_adv(st);
+            expr = map{ kind: "try_prop", arg: expr, line: t["line"], col: t["col"] };
+        } else {
+            break;
+        }
+    }
+    return expr;
+}
+
+fn _parse_power(st) {
+    let base = _parse_postfix(st);
+    let t = _p_cur(st);
+    if t["kind"] == "OP" and (t["val"] == "**" or t["val"] == "^") {
+        let op = _p_adv(st)["val"];
+        let rhs = _parse_unary(st);
+        return map{ kind: "binary", op: op, left: base, right: rhs, line: t["line"], col: t["col"] };
+    }
+    return base;
+}
+
+fn _parse_unary(st) {
+    let t = _p_cur(st);
+    if (t["kind"] == "OP" and (t["val"] == "-" or t["val"] == "+" or t["val"] == "!" or t["val"] == "~"))
+       or (t["kind"] == "KW" and t["val"] == "not") {
+        let op = _p_adv(st)["val"];
+        return map{ kind: "unary", op: op, arg: _parse_unary(st), line: t["line"], col: t["col"] };
+    }
+    return _parse_power(st);
+}
+
+fn _parse_mul(st) {
+    let left = _parse_unary(st);
+    while _p_cur(st)["kind"] == "OP" and (_p_cur(st)["val"] == "*" or _p_cur(st)["val"] == "/" or _p_cur(st)["val"] == "%") {
+        let op_t = _p_adv(st);
+        let right = _parse_unary(st);
+        left = map{ kind: "binary", op: op_t["val"], left: left, right: right, line: op_t["line"], col: op_t["col"] };
+    }
+    return left;
+}
+
+fn _parse_add(st) {
+    let left = _parse_mul(st);
+    while _p_cur(st)["kind"] == "OP" and (_p_cur(st)["val"] == "+" or _p_cur(st)["val"] == "-") {
+        let op_t = _p_adv(st);
+        let right = _parse_mul(st);
+        left = map{ kind: "binary", op: op_t["val"], left: left, right: right, line: op_t["line"], col: op_t["col"] };
+    }
+    return left;
+}
+
+fn _parse_shift_bit(st) {
+    let left = _parse_add(st);
+    while _p_cur(st)["kind"] == "OP" and (_p_cur(st)["val"] == "<<" or _p_cur(st)["val"] == ">>" or _p_cur(st)["val"] == "&" or _p_cur(st)["val"] == "|") {
+        let op_t = _p_adv(st);
+        let right = _parse_add(st);
+        left = map{ kind: "binary", op: op_t["val"], left: left, right: right, line: op_t["line"], col: op_t["col"] };
+    }
+    return left;
+}
+
+fn _parse_cmp(st) {
+    let left = _parse_shift_bit(st);
+    while _p_cur(st)["kind"] == "OP" and (_p_cur(st)["val"] == "<" or _p_cur(st)["val"] == "<=" or _p_cur(st)["val"] == ">" or _p_cur(st)["val"] == ">=") {
+        let op_t = _p_adv(st);
+        let right = _parse_shift_bit(st);
+        left = map{ kind: "binary", op: op_t["val"], left: left, right: right, line: op_t["line"], col: op_t["col"] };
+    }
+    return left;
+}
+
+fn _parse_eq(st) {
+    let left = _parse_cmp(st);
+    while _p_cur(st)["kind"] == "OP" and (_p_cur(st)["val"] == "==" or _p_cur(st)["val"] == "!=") {
+        let op_t = _p_adv(st);
+        let right = _parse_cmp(st);
+        left = map{ kind: "binary", op: op_t["val"], left: left, right: right, line: op_t["line"], col: op_t["col"] };
+    }
+    return left;
+}
+
+fn _parse_and(st) {
+    let left = _parse_eq(st);
+    while (_p_cur(st)["kind"] == "KW" and _p_cur(st)["val"] == "and") or (_p_cur(st)["kind"] == "OP" and _p_cur(st)["val"] == "&&") {
+        let op_t = _p_adv(st);
+        let right = _parse_eq(st);
+        left = map{ kind: "binary", op: "and", left: left, right: right, line: op_t["line"], col: op_t["col"] };
+    }
+    return left;
+}
+
+fn _parse_or(st) {
+    let left = _parse_and(st);
+    while (_p_cur(st)["kind"] == "KW" and _p_cur(st)["val"] == "or") or (_p_cur(st)["kind"] == "OP" and _p_cur(st)["val"] == "||") {
+        let op_t = _p_adv(st);
+        let right = _parse_and(st);
+        left = map{ kind: "binary", op: "or", left: left, right: right, line: op_t["line"], col: op_t["col"] };
+    }
+    return left;
+}
+
+fn _parse_nullish_pipe(st) {
+    let left = _parse_or(st);
+    while _p_cur(st)["kind"] == "OP" and (_p_cur(st)["val"] == "??" or _p_cur(st)["val"] == "|>") {
+        let op_t = _p_adv(st);
+        let right = _parse_or(st);
+        left = map{ kind: "binary", op: op_t["val"], left: left, right: right, line: op_t["line"], col: op_t["col"] };
+    }
+    // Ternary `cond ? a : b`
+    if _p_is(st, "OP", "?") and _p_peek(st, 1)["val"] != ";" {
+        let qt = _p_adv(st);
+        let t_branch = _parse_expr(st);
+        _p_expect(st, "PUNC", ":", "':' in ternary expression");
+        let f_branch = _parse_expr(st);
+        return map{ kind: "if_expr", cond: left, then_expr: t_branch, else_expr: f_branch, line: qt["line"], col: qt["col"] };
+    }
+    return left;
+}
+
+fn _parse_expr(st) {
+    return _parse_nullish_pipe(st);
+}
+
+fn _parse_block_expr_or_stmts(st) {
+    let bt = _p_expect(st, "PUNC", "{", "'{'");
+    let stmts = [];
+    let tail_expr = nil;
+    while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", "}") {
+        // Check if this could be a trailing expression without semicolon before `}`
+        let cur = _p_cur(st);
+        let is_stmt_kw = cur["kind"] == "KW" and (
+            cur["val"] == "let" or cur["val"] == "const" or cur["val"] == "return"
+            or cur["val"] == "while" or cur["val"] == "loop" or cur["val"] == "for"
+            or cur["val"] == "break" or cur["val"] == "continue" or cur["val"] == "throw"
+            or cur["val"] == "defer" or cur["val"] == "struct" or cur["val"] == "class"
+            or cur["val"] == "enum" or cur["val"] == "export" or cur["val"] == "print"
+        );
+        if is_stmt_kw or (cur["kind"] == "KW" and cur["val"] == "fn" and _p_peek(st, 1)["kind"] == "ID") {
+            push(stmts, _parse_stmt(st));
+        } else {
+            let s_or_e = _parse_stmt_or_tail_expr(st);
+            if s_or_e["is_tail_expr"] == true and _p_is(st, "PUNC", "}") {
+                tail_expr = s_or_e["node"];
+            } else {
+                push(stmts, s_or_e["node"]);
+            }
+        }
+    }
+    let end_t = _p_expect(st, "PUNC", "}", "'}'");
+    return map{ kind: "block", stmts: stmts, tail_expr: tail_expr, line: bt["line"], col: bt["col"], end_line: end_t["line"], end_col: end_t["end_col"] };
+}
+
+fn _parse_block(st) {
+    return _parse_block_expr_or_stmts(st);
+}
+
+fn _parse_if_expr(st) {
+    let it = _p_expect(st, "KW", "if", "'if'");
+    let cond = _parse_expr(st);
+    let then_b = _parse_block_expr_or_stmts(st);
+    let else_b = nil;
+    if _p_eat(st, "KW", "elif") {
+        // Rewind 1 token and treat `elif` like `if`
+        let elif_t = st["tokens"][st["pos"] - 1];
+        let sub_cond = _parse_expr(st);
+        let sub_then = _parse_block_expr_or_stmts(st);
+        let sub_else = nil;
+        while _p_eat(st, "KW", "elif") {
+            // handled recursively below if chained
+            let c2 = _parse_expr(st);
+            let t2 = _parse_block_expr_or_stmts(st);
+            sub_else = map{ kind: "if_stmt", cond: c2, then_block: t2, else_block: nil, line: elif_t["line"], col: elif_t["col"] };
+        }
+        if _p_eat(st, "KW", "else") {
+            if _p_is(st, "KW", "if") {
+                let nested = _parse_if_expr(st);
+                if sub_else == nil { sub_else = nested; } else { sub_else["else_block"] = nested; }
+            } else {
+                let eb = _parse_block_expr_or_stmts(st);
+                if sub_else == nil { sub_else = eb; } else { sub_else["else_block"] = eb; }
+            }
+        }
+        else_b = map{ kind: "if_stmt", cond: sub_cond, then_block: sub_then, else_block: sub_else, line: elif_t["line"], col: elif_t["col"] };
+    } elif _p_eat(st, "KW", "else") {
+        if _p_is(st, "KW", "if") {
+            else_b = _parse_if_expr(st);
+        } else {
+            else_b = _parse_block_expr_or_stmts(st);
+        }
+    }
+    return map{ kind: "if_stmt", cond: cond, then_block: then_b, else_block: else_b, line: it["line"], col: it["col"] };
+}
+
+fn _parse_match_pattern(st) {
+    let t = _p_cur(st);
+    if t["kind"] == "KW" and t["val"] == "else" {
+        _p_adv(st);
+        return map{ kind: "wildcard", line: t["line"], col: t["col"] };
+    }
+    if t["kind"] == "ID" and t["val"] == "_" {
+        _p_adv(st);
+        return map{ kind: "wildcard", line: t["line"], col: t["col"] };
+    }
+    if t["kind"] == "ID" {
+        let id1 = _p_adv(st);
+        if _p_eat(st, "PUNC", ".") or _p_eat(st, "OP", "::") {
+            let vtok = _parse_ident_like(st, "enum variant");
+            let pbinds = [];
+            if _p_eat(st, "PUNC", "(") {
+                while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", ")") {
+                    let bt = _parse_ident_like(st, "pattern binding");
+                    push(pbinds, bt["val"]);
+                    if not _p_eat(st, "PUNC", ",") { break; }
+                }
+                _p_expect(st, "PUNC", ")", "')'");
+            }
+            return map{ kind: "enum_pat", enum_name: id1["val"], variant: vtok["val"], bindings: pbinds, line: id1["line"], col: id1["col"] };
+        }
+        if _p_eat(st, "PUNC", "(") {
+            let pbinds2 = [];
+            while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", ")") {
+                let bt2 = _parse_ident_like(st, "pattern binding");
+                push(pbinds2, bt2["val"]);
+                if not _p_eat(st, "PUNC", ",") { break; }
+            }
+            _p_expect(st, "PUNC", ")", "')'");
+            return map{ kind: "ctor_pat", ctor: id1["val"], bindings: pbinds2, line: id1["line"], col: id1["col"] };
+        }
+        return map{ kind: "ident_pat", name: id1["val"], line: id1["line"], col: id1["col"] };
+    }
+    // Literal or general pattern expression
+    let pe = _parse_add(st);
+    return map{ kind: "lit_pat", expr: pe, line: t["line"], col: t["col"] };
+}
+
+fn _parse_match_node(st) {
+    let mt = _p_expect(st, "KW", "match", "'match'");
+    let target = _parse_expr(st);
+    _p_expect(st, "PUNC", "{", "'{' after match target");
+    let arms = [];
+    while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", "}") {
+        let pats = [_parse_match_pattern(st)];
+        while _p_eat(st, "OP", "|") {
+            push(pats, _parse_match_pattern(st));
+        }
+        let guard_e = nil;
+        if _p_eat(st, "KW", "if") {
+            guard_e = _parse_expr(st);
+        }
+        if not _p_eat(st, "OP", "=>") {
+            _p_eat(st, "PUNC", ":");
+        }
+        let arm_body = nil;
+        if _p_is(st, "PUNC", "{") {
+            arm_body = _parse_block_expr_or_stmts(st);
+        } else {
+            arm_body = _parse_expr(st);
+        }
+        _p_eat(st, "PUNC", ",");
+        _p_eat(st, "PUNC", ";");
+        push(arms, map{ patterns: pats, guard: guard_e, body: arm_body });
+    }
+    _p_expect(st, "PUNC", "}", "'}'");
+    return map{ kind: "match_stmt", target: target, arms: arms, line: mt["line"], col: mt["col"] };
+}
+
+fn _parse_fn_expr_or_decl(st, require_name, is_async, outer_doc) {
+    let ft = _p_expect(st, "KW", "fn", "'fn'");
+    let doc_str = if outer_doc != "" { outer_doc } else { ft["doc"] };
+    let fn_name = "";
+    let name_line = ft["line"];
+    let name_col = ft["col"];
+    let name_end_col = ft["end_col"];
+
+    if _p_cur(st)["kind"] == "ID" or (require_name and _p_cur(st)["kind"] == "KW") {
+        let nt = _p_adv(st);
+        fn_name = nt["val"];
+        name_line = nt["line"];
+        name_col = nt["col"];
+        name_end_col = nt["end_col"];
+    } elif require_name {
+        _p_err(st, "Expected function name after 'fn'", _p_cur(st));
+    }
+
+    _p_expect(st, "PUNC", "(", "'(' in function signature");
+    let params = [];
+    let has_rest = false;
+    while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", ")") {
+        let is_rest_p = _p_eat(st, "OP", "...");
+        if is_rest_p { has_rest = true; }
+        let pt = _parse_ident_like(st, "parameter name");
+        let p_annot = nil;
+        if _p_eat(st, "PUNC", ":") {
+            p_annot = _parse_type_annot(st);
+        }
+        let p_def = nil;
+        if _p_eat(st, "OP", "=") {
+            p_def = _parse_expr(st);
+        }
+        push(params, map{
+            name: pt["val"],
+            annot: p_annot,
+            default_expr: p_def,
+            is_rest: is_rest_p,
+            line: pt["line"],
+            col: pt["col"],
+            end_col: pt["end_col"]
+        });
+        if not _p_eat(st, "PUNC", ",") { break; }
+    }
+    _p_expect(st, "PUNC", ")", "')'");
+
+    let ret_annot = nil;
+    if _p_eat(st, "OP", "->") {
+        ret_annot = _parse_type_annot(st);
+    }
+
+    let req_clauses = [];
+    let ens_clauses = [];
+    while _p_is(st, "KW", "requires") or _p_is(st, "KW", "ensures") {
+        let ct = _p_adv(st);
+        let ce = _parse_expr(st);
+        if ct["val"] == "requires" {
+            push(req_clauses, map{ expr: ce, line: ct["line"], col: ct["col"] });
+        } else {
+            push(ens_clauses, map{ expr: ce, line: ct["line"], col: ct["col"] });
+        }
+    }
+
+    let body = _parse_block(st);
+    return map{
+        kind: if fn_name != "" and require_name { "fn_decl" } else { "fn_expr" },
+        name: fn_name,
+        is_async: is_async,
+        params: params,
+        has_rest: has_rest,
+        ret_annot: ret_annot,
+        requires_list: req_clauses,
+        ensures_list: ens_clauses,
+        body: body,
+        doc: doc_str,
+        line: name_line,
+        col: name_col,
+        end_col: name_end_col,
+        end_line: body["end_line"]
+    };
+}
+
+fn _parse_var_decl(st, is_const_decl, outer_doc) {
+    let kt = _p_adv(st); // 'let' or 'const'
+    let doc_str = if outer_doc != "" { outer_doc } else { kt["doc"] };
+
+    // Support array `[a, b] = ...` or map `{a, b} = ...` destructuring
+    if _p_is(st, "PUNC", "[") or _p_is(st, "PUNC", "{") {
+        let open_ch = _p_adv(st)["val"];
+        let close_ch = if open_ch == "[" { "]" } else { "}" };
+        let names = [];
+        while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", close_ch) {
+            _p_eat(st, "OP", "...");
+            let bt = _parse_ident_like(st, "destructuring binding");
+            if _p_eat(st, "PUNC", ":") {
+                let alias_t = _parse_ident_like(st, "destructuring target");
+                push(names, alias_t);
+            } else {
+                push(names, bt);
+            }
+            if not _p_eat(st, "PUNC", ",") { break; }
+        }
+        _p_expect(st, "PUNC", close_ch, "'" + close_ch + "'");
+        let init_e = nil;
+        if _p_eat(st, "OP", "=") {
+            init_e = _parse_expr(st);
+        }
+        _p_eat(st, "PUNC", ";");
+        return map{ kind: "destruct_decl", is_const: is_const_decl, names: names, init: init_e, line: kt["line"], col: kt["col"] };
+    }
+
+    let nt = _parse_ident_like(st, "variable name");
+    let annot = nil;
+    if _p_eat(st, "PUNC", ":") {
+        annot = _parse_type_annot(st);
+    }
+    let init_expr = nil;
+    if _p_eat(st, "OP", "=") {
+        init_expr = _parse_expr(st);
+    }
+    _p_eat(st, "PUNC", ";");
+    return map{
+        kind: "var_decl",
+        is_const: is_const_decl,
+        name: nt["val"],
+        annot: annot,
+        init: init_expr,
+        doc: doc_str,
+        line: nt["line"],
+        col: nt["col"],
+        end_col: nt["end_col"]
+    };
+}
+
+fn _parse_stmt_or_tail_expr(st) {
+    let e = _parse_expr(st);
+    let nxt = _p_cur(st);
+    if nxt["kind"] == "OP" and (nxt["val"] == "=" or nxt["val"] == "+=" or nxt["val"] == "-=" or nxt["val"] == "*=" or nxt["val"] == "/=" or nxt["val"] == "%=" or nxt["val"] == "**=") {
+        let op_t = _p_adv(st);
+        let rhs = _parse_expr(st);
+        _p_eat(st, "PUNC", ";");
+        return map{ is_tail_expr: false, node: map{ kind: "assign", op: op_t["val"], target: e, val: rhs, line: e["line"], col: e["col"] } };
+    }
+    let had_semi = _p_eat(st, "PUNC", ";");
+    if not had_semi and (e["kind"] == "if_stmt" or e["kind"] == "match_stmt" or e["kind"] == "try_block_expr") {
+        return map{ is_tail_expr: _p_is(st, "PUNC", "}"), node: e };
+    }
+    if not had_semi and _p_is(st, "PUNC", "}") {
+        return map{ is_tail_expr: true, node: e };
+    }
+    return map{ is_tail_expr: false, node: map{ kind: "expr_stmt", expr: e, line: e["line"], col: e["col"] } };
+}
+
+fn _parse_stmt(st) {
+    let t = _p_cur(st);
+    let doc_str = t["doc"];
+
+    if _p_eat(st, "PUNC", ";") {
+        return map{ kind: "empty", line: t["line"], col: t["col"] };
+    }
+    if _p_is(st, "PUNC", "{") {
+        return _parse_block(st);
+    }
+
+    // Handle `pub` or `export` prefixes on declarations
+    let is_exported = false;
+    if t["kind"] == "KW" and t["val"] == "pub" {
+        _p_adv(st);
+        is_exported = true;
+        t = _p_cur(st);
+        if doc_str == "" { doc_str = t["doc"]; }
+    }
+    if t["kind"] == "KW" and t["val"] == "export" {
+        let exp_t = _p_adv(st);
+        if doc_str == "" { doc_str = exp_t["doc"]; }
+        let nxt = _p_cur(st);
+        if nxt["kind"] == "KW" and (nxt["val"] == "fn" or nxt["val"] == "async" or nxt["val"] == "let" or nxt["val"] == "const" or nxt["val"] == "struct" or nxt["val"] == "class" or nxt["val"] == "enum") {
+            is_exported = true;
+            t = nxt;
+        } else {
+            let names = [];
+            while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", ";") {
+                let id_t = _parse_ident_like(st, "exported identifier");
+                push(names, id_t);
+                if not _p_eat(st, "PUNC", ",") { break; }
+            }
+            _p_eat(st, "PUNC", ";");
+            return map{ kind: "export_stmt", names: names, line: exp_t["line"], col: exp_t["col"] };
+        }
+    }
+
+    if t["kind"] == "KW" {
+        let kv = t["val"];
+        if kv == "let" {
+            let vd = _parse_var_decl(st, false, doc_str);
+            vd["exported"] = is_exported;
+            return vd;
+        }
+        if kv == "const" {
+            let cd = _parse_var_decl(st, true, doc_str);
+            cd["exported"] = is_exported;
+            return cd;
+        }
+        if kv == "fn" or (kv == "async" and _p_peek(st, 1)["val"] == "fn") {
+            let is_as = false;
+            if kv == "async" { _p_adv(st); is_as = true; }
+            if _p_peek(st, 1)["kind"] == "ID" or _p_peek(st, 1)["kind"] == "KW" {
+                let fd = _parse_fn_expr_or_decl(st, true, is_as, doc_str);
+                fd["exported"] = is_exported;
+                return fd;
+            }
+        }
+        if kv == "return" {
+            let rt = _p_adv(st);
+            let rv = nil;
+            if not _p_is(st, "PUNC", ";") and not _p_is(st, "PUNC", "}") and not _p_is(st, "EOF", nil) {
+                rv = _parse_expr(st);
+            }
+            _p_eat(st, "PUNC", ";");
+            return map{ kind: "return_stmt", val: rv, line: rt["line"], col: rt["col"] };
+        }
+        if kv == "throw" {
+            let tht = _p_adv(st);
+            let tv = _parse_expr(st);
+            _p_eat(st, "PUNC", ";");
+            return map{ kind: "throw_stmt", val: tv, line: tht["line"], col: tht["col"] };
+        }
+        if kv == "break" or kv == "continue" {
+            let bct = _p_adv(st);
+            _p_eat(st, "PUNC", ";");
+            return map{ kind: bct["val"] + "_stmt", line: bct["line"], col: bct["col"] };
+        }
+        if kv == "print" {
+            let pt = _p_adv(st);
+            if _p_is(st, "PUNC", "(") {
+                // Could be `print(x)` call or `print (x)` statement — parse args cleanly
+                _p_adv(st);
+                let pargs = [];
+                while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", ")") {
+                    push(pargs, _parse_expr(st));
+                    if not _p_eat(st, "PUNC", ",") { break; }
+                }
+                _p_expect(st, "PUNC", ")", "')'");
+                _p_eat(st, "PUNC", ";");
+                return map{ kind: "print_stmt", args: pargs, line: pt["line"], col: pt["col"] };
+            }
+            let pv = _parse_expr(st);
+            _p_eat(st, "PUNC", ";");
+            return map{ kind: "print_stmt", args: [pv], line: pt["line"], col: pt["col"] };
+        }
+        if kv == "if" {
+            return _parse_if_expr(st);
+        }
+        if kv == "while" {
+            let wt = _p_adv(st);
+            let wc = _parse_expr(st);
+            let wb = _parse_block(st);
+            return map{ kind: "while_stmt", cond: wc, body: wb, line: wt["line"], col: wt["col"] };
+        }
+        if kv == "loop" {
+            let lt = _p_adv(st);
+            let lb = _parse_block(st);
+            return map{ kind: "loop_stmt", body: lb, line: lt["line"], col: lt["col"] };
+        }
+        if kv == "for" {
+            let fort = _p_adv(st);
+            let v1 = _parse_ident_like(st, "loop variable");
+            let v2 = nil;
+            if _p_eat(st, "PUNC", ",") {
+                v2 = _parse_ident_like(st, "second loop variable");
+            }
+            let iter_e = nil;
+            let end_e = nil;
+            if _p_eat(st, "KW", "in") {
+                iter_e = _parse_expr(st);
+                if _p_eat(st, "KW", "to") {
+                    end_e = _parse_expr(st);
+                }
+            } else {
+                iter_e = _parse_expr(st);
+            }
+            let fb = _parse_block(st);
+            return map{ kind: "for_stmt", var1: v1, var2: v2, iter: iter_e, range_end: end_e, body: fb, line: fort["line"], col: fort["col"] };
+        }
+        if kv == "defer" {
+            let dt = _p_adv(st);
+            let db = if _p_is(st, "PUNC", "{") { _parse_block(st) } else { _parse_stmt(st) };
+            return map{ kind: "defer_stmt", body: db, line: dt["line"], col: dt["col"] };
+        }
+        if kv == "try" and _p_peek(st, 1)["val"] == "{" {
+            return _parse_primary(st);
+        }
+        if kv == "match" {
+            return _parse_match_node(st);
+        }
+        if kv == "switch" {
+            let swt = _p_adv(st);
+            let target_e = _parse_expr(st);
+            _p_expect(st, "PUNC", "{", "'{' after switch");
+            let cases = [];
+            while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", "}") {
+                if _p_eat(st, "KW", "case") {
+                    let ce = _parse_expr(st);
+                    _p_eat(st, "PUNC", ":");
+                    let cstmts = [];
+                    while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", "}") and not _p_is(st, "KW", "case") and not _p_is(st, "KW", "default") {
+                        push(cstmts, _parse_stmt(st));
+                    }
+                    push(cases, map{ val: ce, stmts: cstmts });
+                } elif _p_eat(st, "KW", "default") {
+                    _p_eat(st, "PUNC", ":");
+                    let dstmts = [];
+                    while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", "}") and not _p_is(st, "KW", "case") {
+                        push(dstmts, _parse_stmt(st));
+                    }
+                    push(cases, map{ val: nil, stmts: dstmts });
+                } else {
+                    _p_adv(st);
+                }
+            }
+            _p_expect(st, "PUNC", "}", "'}'");
+            return map{ kind: "switch_stmt", target: target_e, cases: cases, line: swt["line"], col: swt["col"] };
+        }
+        if kv == "enum" {
+            let et = _p_adv(st);
+            let nt = _parse_ident_like(st, "enum name");
+            _p_expect(st, "PUNC", "{", "'{' in enum declaration");
+            let variants = [];
+            while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", "}") {
+                let vt = _parse_ident_like(st, "enum variant");
+                if _p_eat(st, "PUNC", "(") {
+                    while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", ")") { _p_adv(st); }
+                    _p_eat(st, "PUNC", ")");
+                }
+                if _p_eat(st, "OP", "=") {
+                    _parse_expr(st);
+                }
+                push(variants, vt["val"]);
+                if not _p_eat(st, "PUNC", ",") { _p_eat(st, "PUNC", ";"); }
+            }
+            let end_e = _p_expect(st, "PUNC", "}", "'}'");
+            return map{ kind: "enum_decl", name: nt["val"], variants: variants, exported: is_exported, doc: doc_str, line: nt["line"], col: nt["col"], end_col: nt["end_col"], end_line: end_e["line"] };
+        }
+        if kv == "struct" {
+            let st_t = _p_adv(st);
+            let nt = _parse_ident_like(st, "struct name");
+            _p_expect(st, "PUNC", "{", "'{' in struct declaration");
+            let fields = [];
+            while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", "}") {
+                let ft = _parse_ident_like(st, "field name");
+                let fa = nil;
+                if _p_eat(st, "PUNC", ":") { fa = _parse_type_annot(st); }
+                if _p_eat(st, "OP", "=") { _parse_expr(st); }
+                push(fields, map{ name: ft["val"], annot: fa, line: ft["line"], col: ft["col"] });
+                if not _p_eat(st, "PUNC", ",") { _p_eat(st, "PUNC", ";"); }
+            }
+            let end_s = _p_expect(st, "PUNC", "}", "'}'");
+            return map{ kind: "struct_decl", name: nt["val"], fields: fields, exported: is_exported, doc: doc_str, line: nt["line"], col: nt["col"], end_col: nt["end_col"], end_line: end_s["line"] };
+        }
+        if kv == "class" or kv == "interface" {
+            let cl_t = _p_adv(st);
+            let nt = _parse_ident_like(st, "class name");
+            let base_nm = "";
+            if _p_eat(st, "KW", "extends") {
+                base_nm = _parse_ident_like(st, "base class")["val"];
+            }
+            _p_expect(st, "PUNC", "{", "'{' in class declaration");
+            let methods = [];
+            while not _p_is(st, "EOF", nil) and not _p_is(st, "PUNC", "}") {
+                if _p_is(st, "KW", "fn") or (_p_is(st, "KW", "async") and _p_peek(st, 1)["val"] == "fn") {
+                    let is_as2 = _p_eat(st, "KW", "async");
+                    push(methods, _parse_fn_expr_or_decl(st, true, is_as2, ""));
+                } else {
+                    push(methods, _parse_stmt(st));
+                }
+            }
+            let end_c = _p_expect(st, "PUNC", "}", "'}'");
+            return map{ kind: "class_decl", name: nt["val"], base_name: base_nm, members: methods, exported: is_exported, doc: doc_str, line: nt["line"], col: nt["col"], end_col: nt["end_col"], end_line: end_c["line"] };
+        }
+    }
+
+    let r = _parse_stmt_or_tail_expr(st);
+    return r["node"];
+}
+
+fn parse_sapp_ast(src_code) {
+    let lex = tokenize_sapp(src_code);
+    let st = map{
+        tokens: lex["tokens"],
+        pos: 0,
+        errors: []
+    };
+    let li = 0;
+    while li < len(lex["errors"]) {
+        let le = lex["errors"][li];
+        push(st["errors"], map{
+            severity: "error",
+            code: "LEX_ERROR",
+            message: le["message"],
+            message_el: "Λεκτικό σφάλμα: " + le["message"],
+            line: le["line"],
+            col: le["col"],
+            end_line: le["line"],
+            end_col: le["col"] + 1,
+            suggestion: nil
+        });
+        li = li + 1;
+    }
+
+    let stmts = [];
+    while not _p_is(st, "EOF", nil) {
+        let before = st["pos"];
+        push(stmts, _parse_stmt(st));
+        if st["pos"] == before and not _p_is(st, "EOF", nil) {
+            _p_adv(st);
+        }
+    }
+    return map{
+        ast: map{ kind: "program", stmts: stmts },
+        errors: st["errors"],
+        tokens: lex["tokens"]
+    };
+}
+
+// ── Builtin Symbol Catalog (Arities, Return Types & Transcendental Flags) ─────
+
+let _BUILTIN_SPECS = nil;
+
+fn _b_spec(min_a, max_a, ret_base, is_trans = false) {
+    return map{ min_args: min_a, max_args: max_a, has_rest: max_a < 0, ret_base: ret_base, is_transcendental: is_trans };
+}
+
+fn _get_builtin_specs() {
+    if _BUILTIN_SPECS != nil { return _BUILTIN_SPECS; }
+    let m = map{};
+    let base_map = BUILTINS_MOD.builtin_set();
+    let bks = map_keys(base_map);
+    let i = 0;
+    while i < len(bks) {
+        m[bks[i]] = _b_spec(0, -1, "any", false);
+        i = i + 1;
+    }
+
+    // Core & Console
+    m["print"] = _b_spec(0, -1, "nil");
+    m["println"] = _b_spec(0, -1, "nil");
+    m["eprint"] = _b_spec(0, -1, "nil");
+    m["eprintln"] = _b_spec(0, -1, "nil");
+    m["str"] = _b_spec(1, 1, "string");
+    m["len"] = _b_spec(1, 1, "int");
+    m["type"] = _b_spec(1, 1, "string");
+    m["type_assert"] = _b_spec(2, 3, "any");
+    m["require_type"] = _b_spec(2, 3, "any");
+    m["assert"] = _b_spec(1, 2, "nil");
+    m["error"] = _b_spec(1, 1, "nil");
+    m["exit"] = _b_spec(0, 1, "nil");
+    m["os_exit"] = _b_spec(0, 1, "nil");
+    m["import"] = _b_spec(1, 1, "any");
+    m["comptime"] = _b_spec(1, 1, "any");
+
+    // Option & Result constructors
+    m["Some"] = _b_spec(1, 1, "Option");
+    m["None"] = _b_spec(0, 0, "Option");
+    m["Ok"] = _b_spec(1, 1, "Result");
+    m["Err"] = _b_spec(1, 1, "Result");
+
+    // Collections & Strings
+    m["push"] = _b_spec(2, 2, "nil");
+    m["array_push"] = _b_spec(2, 2, "nil");
+    m["pop"] = _b_spec(1, 1, "any");
+    m["array_pop"] = _b_spec(1, 1, "any");
+    m["slice"] = _b_spec(2, 3, "array");
+    m["array_sort"] = _b_spec(1, 2, "array");
+    m["array_unique"] = _b_spec(1, 1, "array");
+    m["array_flatten"] = _b_spec(1, 1, "array");
+    m["range"] = _b_spec(1, 3, "array");
+    m["map_has"] = _b_spec(2, 2, "bool");
+    m["has"] = _b_spec(2, 2, "bool");
+    m["map_keys"] = _b_spec(1, 1, "array");
+    m["keys"] = _b_spec(1, 1, "array");
+    m["map_remove"] = _b_spec(2, 2, "any");
+
+    m["str_slice"] = _b_spec(3, 3, "string");
+    m["str_contains"] = _b_spec(2, 2, "bool");
+    m["str_starts_with"] = _b_spec(2, 2, "bool");
+    m["str_ends_with"] = _b_spec(2, 2, "bool");
+    m["str_index_of"] = _b_spec(2, 2, "int");
+    m["str_split"] = _b_spec(2, 2, "array");
+    m["str_join"] = _b_spec(2, 2, "string");
+    m["str_trim"] = _b_spec(1, 1, "string");
+    m["str_upper"] = _b_spec(1, 1, "string");
+    m["str_lower"] = _b_spec(1, 1, "string");
+    m["str_replace_all"] = _b_spec(3, 3, "string");
+    m["str_repeat"] = _b_spec(2, 2, "string");
+    m["str_pad_left"] = _b_spec(2, 3, "string");
+    m["str_pad_right"] = _b_spec(2, 3, "string");
+    m["str_format"] = _b_spec(1, -1, "string");
+    m["strcharcodeat"] = _b_spec(2, 2, "int");
+    m["strfromcharcode"] = _b_spec(1, 1, "string");
+    m["str_from_char_code"] = _b_spec(1, 1, "string");
+    m["parse_number"] = _b_spec(1, 1, "num");
+    m["parse_bool"] = _b_spec(1, 1, "bool");
+
+    // Math & Transcendentals (flagged for SI dimensionless enforcement!)
+    m["abs"] = _b_spec(1, 1, "num");
+    m["num_abs"] = _b_spec(1, 1, "num");
+    m["floor"] = _b_spec(1, 1, "int");
+    m["num_floor"] = _b_spec(1, 1, "int");
+    m["ceil"] = _b_spec(1, 1, "int");
+    m["num_ceil"] = _b_spec(1, 1, "int");
+    m["round"] = _b_spec(1, 1, "int");
+    m["num_round"] = _b_spec(1, 1, "int");
+    m["sqrt"] = _b_spec(1, 1, "num");
+    m["num_sqrt"] = _b_spec(1, 1, "num");
+    m["pow"] = _b_spec(2, 2, "num");
+    m["num_pow"] = _b_spec(2, 2, "num");
+    m["min"] = _b_spec(2, 2, "num");
+    m["num_min"] = _b_spec(2, 2, "num");
+    m["max"] = _b_spec(2, 2, "num");
+    m["num_max"] = _b_spec(2, 2, "num");
+    m["clamp"] = _b_spec(3, 3, "num");
+
+    m["sin"] = _b_spec(1, 1, "num", true);
+    m["num_sin"] = _b_spec(1, 1, "num", true);
+    m["cos"] = _b_spec(1, 1, "num", true);
+    m["num_cos"] = _b_spec(1, 1, "num", true);
+    m["tan"] = _b_spec(1, 1, "num", true);
+    m["num_tan"] = _b_spec(1, 1, "num", true);
+    m["exp"] = _b_spec(1, 1, "num", true);
+    m["num_exp"] = _b_spec(1, 1, "num", true);
+    m["ln"] = _b_spec(1, 1, "num", true);
+    m["num_ln"] = _b_spec(1, 1, "num", true);
+    m["log"] = _b_spec(1, 1, "num", true);
+    m["num_log2"] = _b_spec(1, 1, "num", true);
+    m["num_log10"] = _b_spec(1, 1, "num", true);
+    m["atan2"] = _b_spec(2, 2, "num", false);
+    m["num_atan2"] = _b_spec(2, 2, "num", false);
+    m["divides"] = _b_spec(2, 2, "bool", false);
+    m["ndivides"] = _b_spec(2, 2, "bool", false);
+
+    // FS, JSON, HTTP, SQLite, OS
+    m["fs_read"] = _b_spec(1, 1, "string");
+    m["fs_write"] = _b_spec(2, 2, "nil");
+    m["fs_append"] = _b_spec(2, 2, "nil");
+    m["fs_exists"] = _b_spec(1, 1, "bool");
+    m["fs_listdir"] = _b_spec(1, 1, "array");
+    m["json_parse"] = _b_spec(1, 1, "any");
+    m["json_stringify"] = _b_spec(1, 2, "string");
+    m["http_get"] = _b_spec(1, 2, "map");
+    m["http_post"] = _b_spec(2, 3, "map");
+    m["http_request"] = _b_spec(1, 4, "map");
+    m["sqlite_open"] = _b_spec(1, 1, "int");
+    m["sqlite_close"] = _b_spec(1, 1, "nil");
+    m["sqlite_exec"] = _b_spec(2, 3, "int");
+    m["sqlite_query"] = _b_spec(2, 3, "array");
+    m["read_line"] = _b_spec(0, 0, "string");
+    m["os_args"] = _b_spec(0, 0, "array");
+    m["args"] = _b_spec(0, 0, "array");
+    m["now_ms"] = _b_spec(0, 0, "num");
+    m["time_ms"] = _b_spec(0, 0, "num");
+    m["now_iso"] = _b_spec(0, 0, "string");
+    m["sha1"] = _b_spec(1, 1, "string");
+    m["sha256"] = _b_spec(1, 1, "string");
+    m["sha512"] = _b_spec(1, 1, "string");
+    m["hardware_probe"] = _b_spec(0, 0, "map");
+    m["os_arch"] = _b_spec(0, 0, "string");
+
+    // HPC, Bytes, f64buf, JIT, Replay, Caps & Taint v3 builtins
+    m["hpc_probe"] = _b_spec(0, 0, "map");
+    m["hpc_gemm"] = _b_spec(5, 6, "any");
+    m["hpc_csr_spmv"] = _b_spec(4, 5, "array");
+    m["hpc_csr_cg_solve"] = _b_spec(4, 7, "map");
+    m["hpc_cg_poisson_solve"] = _b_spec(2, 6, "map");
+    m["hpc_fft_1d"] = _b_spec(1, 3, "map");
+    m["hpc_mlp_train_batch"] = _b_spec(5, 8, "map");
+    m["hpc_mlp_forward"] = _b_spec(3, 4, "array");
+
+    m["bytes_new"] = _b_spec(1, 2, "bytes");
+    m["bytes_len"] = _b_spec(1, 1, "int");
+    m["bytes_get"] = _b_spec(2, 2, "int");
+    m["bytes_set"] = _b_spec(3, 3, "nil");
+    m["bytes_slice"] = _b_spec(2, 3, "bytes");
+    m["bytes_concat"] = _b_spec(2, 2, "bytes");
+    m["bytes_from_str"] = _b_spec(1, 1, "bytes");
+    m["bytes_to_str"] = _b_spec(1, 1, "string");
+    m["bytes_to_hex"] = _b_spec(1, 1, "string");
+    m["is_bytes"] = _b_spec(1, 1, "bool");
+
+    m["f64buf_new"] = _b_spec(1, 2, "f64buf");
+    m["f64buf_len"] = _b_spec(1, 1, "int");
+    m["f64buf_get"] = _b_spec(2, 2, "num");
+    m["f64buf_set"] = _b_spec(3, 3, "nil");
+    m["f64buf_dot"] = _b_spec(2, 2, "num");
+    m["f64buf_sum"] = _b_spec(1, 1, "num");
+    m["f64buf_scale"] = _b_spec(2, 2, "f64buf");
+    m["f64buf_add"] = _b_spec(2, 2, "f64buf");
+    m["is_f64buf"] = _b_spec(1, 1, "bool");
+
+    m["jit_compile"] = _b_spec(1, 1, "map");
+    m["jit_stats"] = _b_spec(0, 0, "map");
+    m["gc_stats"] = _b_spec(0, 0, "map");
+    m["import_with_caps"] = _b_spec(2, 2, "any");
+    m["flight_record_start"] = _b_spec(1, 1, "bool");
+    m["flight_record_stop"] = _b_spec(0, 0, "map");
+    m["flight_replay_start"] = _b_spec(1, 1, "bool");
+    m["flight_replay_stop"] = _b_spec(0, 0, "map");
+
+    m["taint_secret"] = _b_spec(1, 1, "any");
+    m["taint_pii"] = _b_spec(1, 1, "any");
+    m["taint_get"] = _b_spec(1, 1, "string");
+    m["is_tainted"] = _b_spec(1, 1, "bool");
+    m["sanitize_taint"] = _b_spec(1, 1, "any");
+    m["redact_secret"] = _b_spec(1, 1, "string");
+    m["vm_set_taint_guard"] = _b_spec(1, 1, "bool");
+    m["taint_mark"] = _b_spec(1, 2, "any");
+    m["taint_check"] = _b_spec(1, 2, "bool");
+    m["taint_sanitize"] = _b_spec(1, 2, "string");
+    m["taint_is_tainted"] = _b_spec(1, 1, "bool");
+    m["taint_sources"] = _b_spec(1, 1, "array");
+
+    // Pre-bound namespaces
+    m["json"] = _b_spec(0, 0, "map");
+
+    _BUILTIN_SPECS = m;
+    return m;
+}
+
+// ── Module Export Resolution Cache ────────────────────────────────────────────
+
+let _MOD_EXPORT_CACHE = map{};
+
+fn _resolve_import_path(imp_str, base_dir) {
+    if str_starts_with(imp_str, "stdlib:") {
+        let rel = str_slice(imp_str, 7, len(imp_str));
+        let p1 = path_join("stdlib", rel);
+        if fs_exists(p1) { return p1; }
+        if base_dir != "" {
+            let p2 = path_join(base_dir, rel);
+            if fs_exists(p2) { return p2; }
+        }
+        return p1;
+    }
+    if base_dir != "" and not str_starts_with(imp_str, "/") {
+        let p3 = path_join(base_dir, imp_str);
+        if fs_exists(p3) { return p3; }
+    }
+    return imp_str;
+}
+
+fn _inspect_module_exports(imp_str, base_dir) {
+    let resolved = _resolve_import_path(imp_str, base_dir);
+    if map_has(_MOD_EXPORT_CACHE, resolved) {
+        return _MOD_EXPORT_CACHE[resolved];
+    }
+    // Guard against cyclic imports
+    let placeholder = map{ ok: false, path: resolved, exports: map{} };
+    _MOD_EXPORT_CACHE[resolved] = placeholder;
+
+    if not fs_exists(resolved) {
+        return placeholder;
+    }
+    let src = try fs_read(resolved) catch nil;
+    if src == nil { return placeholder; }
+
+    if len(src) > 20000 {
+        let fast_exports = map{};
+        let raw_lns = str_split(src, "\n");
+        let in_exp_list = false;
+        let li = 0;
+        while li < len(raw_lns) {
+            let tln = str_trim(raw_lns[li]);
+            if in_exp_list {
+                let cleaned = str_replace_all(tln, ";", "");
+                let parts = str_split(cleaned, ",");
+                let pi = 0;
+                while pi < len(parts) {
+                    let nm = str_trim(parts[pi]);
+                    if nm != "" and not str_starts_with(nm, "//") {
+                        fast_exports[nm] = map{ kind: "any", min_args: 0, max_args: -1, has_rest: true, line: li + 1, col: 1, doc: "" };
+                    }
+                    pi = pi + 1;
+                }
+                if str_contains(tln, ";") { in_exp_list = false; }
+            } elif str_starts_with(tln, "export fn ") or str_starts_with(tln, "pub fn ") {
+                let after = if str_starts_with(tln, "export fn ") { str_slice(tln, 10, len(tln)) } else { str_slice(tln, 7, len(tln)) };
+                let p_idx = str_index_of(after, "(");
+                if p_idx > 0 {
+                    let fnm = str_trim(str_slice(after, 0, p_idx));
+                    fast_exports[fnm] = map{ kind: "fn", min_args: 0, max_args: -1, has_rest: true, line: li + 1, col: 1, doc: "" };
+                }
+            } elif str_starts_with(tln, "export ") {
+                let body = str_slice(tln, 7, len(tln));
+                let cleaned2 = str_replace_all(body, ";", "");
+                let parts2 = str_split(cleaned2, ",");
+                let pj = 0;
+                while pj < len(parts2) {
+                    let nm2 = str_trim(parts2[pj]);
+                    if nm2 != "" and not str_starts_with(nm2, "//") {
+                        fast_exports[nm2] = map{ kind: "any", min_args: 0, max_args: -1, has_rest: true, line: li + 1, col: 1, doc: "" };
+                    }
+                    pj = pj + 1;
+                }
+                if not str_contains(tln, ";") { in_exp_list = true; }
+            }
+            li = li + 1;
+        }
+        let fast_res = map{ ok: true, path: resolved, exports: fast_exports };
+        _MOD_EXPORT_CACHE[resolved] = fast_res;
+        return fast_res;
+    }
+
+    // Lightweight fast scan of top-level fn declarations and export lists
+    let parsed = parse_sapp_ast(src);
+    let stmts = parsed["ast"]["stmts"];
+    let decls = map{};
+    let exports_map = map{};
+
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        let sk = s["kind"];
+        if sk == "fn_decl" {
+            let req_c = 0;
+            let pi = 0;
+            while pi < len(s["params"]) {
+                if s["params"][pi]["default_expr"] == nil and not s["params"][pi]["is_rest"] {
+                    req_c = req_c + 1;
+                }
+                pi = pi + 1;
+            }
+            let info = map{
+                kind: "fn",
+                min_args: req_c,
+                max_args: if s["has_rest"] { -1 } else { len(s["params"]) },
+                has_rest: s["has_rest"],
+                line: s["line"],
+                col: s["col"],
+                doc: s["doc"]
+            };
+            decls[s["name"]] = info;
+            if s["exported"] == true {
+                exports_map[s["name"]] = info;
+            }
+        } elif sk == "var_decl" {
+            let vinfo = map{ kind: "var", min_args: 0, max_args: -1, has_rest: true, line: s["line"], col: s["col"], doc: s["doc"] };
+            decls[s["name"]] = vinfo;
+            if s["exported"] == true {
+                exports_map[s["name"]] = vinfo;
+            }
+        } elif sk == "export_stmt" {
+            let j = 0;
+            while j < len(s["names"]) {
+                let enm = s["names"][j]["val"];
+                if map_has(decls, enm) {
+                    exports_map[enm] = decls[enm];
+                } else {
+                    exports_map[enm] = map{ kind: "any", min_args: 0, max_args: -1, has_rest: true, line: s["line"], col: s["col"], doc: "" };
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    let res = map{ ok: true, path: resolved, exports: exports_map };
+    _MOD_EXPORT_CACHE[resolved] = res;
+    return res;
+}
+
+// ── Pass 4 Helpers: AST -> First-Order Formula & Symbolic Path Extractor ──────
+
+fn _ast_expr_to_fol(node, subst_map, is_int_mode) {
+    if node == nil { return "0"; }
+    let k = node["kind"];
+    if k == "num" { return node["val"]; }
+    if k == "bool" { return if node["val"] { "true" } else { "false" }; }
+    if k == "ident" {
+        let nm = node["name"];
+        if subst_map != nil and map_has(subst_map, nm) {
+            return "(" + subst_map[nm] + ")";
+        }
+        return nm;
+    }
+    if k == "unary" {
+        let op = node["op"];
+        let sub = _ast_expr_to_fol(node["arg"], subst_map, is_int_mode);
+        if op == "not" or op == "!" { return "(not (" + sub + "))"; }
+        if op == "-" { return "(-(" + sub + "))"; }
+        if op == "+" { return sub; }
+        return sub;
+    }
+    if k == "call" {
+        if node["callee"]["kind"] == "ident" {
+            let fnm = node["callee"]["name"];
+            if (fnm == "divides" or fnm == "ndivides") and len(node["args"]) == 2 {
+                return fnm + "(" + _ast_expr_to_fol(node["args"][0], subst_map, is_int_mode)
+                    + ", " + _ast_expr_to_fol(node["args"][1], subst_map, is_int_mode) + ")";
+            }
+            if (fnm == "pow" or fnm == "num_pow") and len(node["args"]) == 2 {
+                return "((" + _ast_expr_to_fol(node["args"][0], subst_map, is_int_mode) + ") ^ "
+                    + _ast_expr_to_fol(node["args"][1], subst_map, is_int_mode) + ")";
+            }
+        }
+    }
+    if k == "binary" {
+        let bop = node["op"];
+        // Translate `E % m == r` or `E % m != r` into Presburger `divides(m, E - r)`!
+        if is_int_mode and (bop == "==" or bop == "!=") {
+            if node["left"]["kind"] == "binary" and node["left"]["op"] == "%" {
+                let mod_m = _ast_expr_to_fol(node["left"]["right"], subst_map, is_int_mode);
+                let dividend = _ast_expr_to_fol(node["left"]["left"], subst_map, is_int_mode);
+                let rem_s = _ast_expr_to_fol(node["right"], subst_map, is_int_mode);
+                let pred = if bop == "==" { "divides" } else { "ndivides" };
+                return pred + "(" + mod_m + ", (" + dividend + ") - (" + rem_s + "))";
+            }
+        }
+        let l_s = _ast_expr_to_fol(node["left"], subst_map, is_int_mode);
+        let r_s = _ast_expr_to_fol(node["right"], subst_map, is_int_mode);
+        if bop == "**" { bop = "^"; }
+        if bop == "&&" { bop = "and"; }
+        if bop == "||" { bop = "or"; }
+        return "((" + l_s + ") " + bop + " (" + r_s + "))";
+    }
+    return "0";
+}
+
+// Collect non-constant division denominators `A / B` in an expression
+fn _collect_expr_divisions(node, subst_map, is_int_mode, out_divs) {
+    if node == nil { return; }
+    let k = node["kind"];
+    if k == "unary" {
+        _collect_expr_divisions(node["arg"], subst_map, is_int_mode, out_divs);
+        return;
+    }
+    if k == "binary" {
+        _collect_expr_divisions(node["left"], subst_map, is_int_mode, out_divs);
+        _collect_expr_divisions(node["right"], subst_map, is_int_mode, out_divs);
+        if node["op"] == "/" {
+            let rk = node["right"]["kind"];
+            if rk == "num" {
+                let nv = parse_number(node["right"]["val"]);
+                if nv != nil and nv != 0 { return; }
+            }
+            push(out_divs, map{
+                num_fol: _ast_expr_to_fol(node["left"], subst_map, is_int_mode),
+                den_fol: _ast_expr_to_fol(node["right"], subst_map, is_int_mode),
+                line: node["line"],
+                col: node["col"]
+            });
+        }
+        return;
+    }
+    if k == "call" {
+        let i = 0;
+        while i < len(node["args"]) {
+            _collect_expr_divisions(node["args"][i], subst_map, is_int_mode, out_divs);
+            i = i + 1;
+        }
+    }
+}
+
+// Extract symbolic return paths & division obligations from function body
+fn _extract_symbolic_paths(stmts, idx, cur_subst, path_conds, is_int_mode, out_returns, out_divs) {
+    let env = _sc_clone_map(cur_subst);
+    let i = idx;
+    while i < len(stmts) {
+        let s = stmts[i];
+        let sk = s["kind"];
+        if sk == "var_decl" {
+            if s["init"] != nil {
+                _collect_expr_divisions(s["init"], env, is_int_mode, out_divs);
+                env[s["name"]] = _ast_expr_to_fol(s["init"], env, is_int_mode);
+            }
+        } elif sk == "assign" and s["op"] == "=" and s["target"]["kind"] == "ident" {
+            _collect_expr_divisions(s["val"], env, is_int_mode, out_divs);
+            env[s["target"]["name"]] = _ast_expr_to_fol(s["val"], env, is_int_mode);
+        } elif sk == "return_stmt" {
+            if s["val"] != nil {
+                _collect_expr_divisions(s["val"], env, is_int_mode, out_divs);
+                push(out_returns, map{
+                    conds: path_conds,
+                    ret_node: s["val"],
+                    ret_fol: _ast_expr_to_fol(s["val"], env, is_int_mode),
+                    subst: _sc_clone_map(env),
+                    line: s["line"],
+                    col: s["col"]
+                });
+            }
+            return;
+        } elif sk == "if_stmt" {
+            _collect_expr_divisions(s["cond"], env, is_int_mode, out_divs);
+            let c_fol = _ast_expr_to_fol(s["cond"], env, is_int_mode);
+            let p_then = [];
+            let pi = 0;
+            while pi < len(path_conds) { push(p_then, path_conds[pi]); pi = pi + 1; }
+            push(p_then, c_fol);
+
+            let p_else = [];
+            pi = 0;
+            while pi < len(path_conds) { push(p_else, path_conds[pi]); pi = pi + 1; }
+            push(p_else, "(not (" + c_fol + "))");
+
+            let then_stmts = [];
+            let k1 = 0;
+            while k1 < len(s["then_block"]["stmts"]) { push(then_stmts, s["then_block"]["stmts"][k1]); k1 = k1 + 1; }
+            if s["then_block"]["tail_expr"] != nil {
+                push(then_stmts, map{ kind: "return_stmt", val: s["then_block"]["tail_expr"], line: s["line"], col: s["col"] });
+            }
+            let rem_idx = i + 1;
+            while rem_idx < len(stmts) { push(then_stmts, stmts[rem_idx]); rem_idx = rem_idx + 1; }
+            _extract_symbolic_paths(then_stmts, 0, env, p_then, is_int_mode, out_returns, out_divs);
+
+            let else_stmts = [];
+            if s["else_block"] != nil {
+                if s["else_block"]["kind"] == "block" {
+                    let k2 = 0;
+                    while k2 < len(s["else_block"]["stmts"]) { push(else_stmts, s["else_block"]["stmts"][k2]); k2 = k2 + 1; }
+                    if s["else_block"]["tail_expr"] != nil {
+                        push(else_stmts, map{ kind: "return_stmt", val: s["else_block"]["tail_expr"], line: s["line"], col: s["col"] });
+                    }
+                } else {
+                    push(else_stmts, s["else_block"]);
+                }
+            }
+            rem_idx = i + 1;
+            while rem_idx < len(stmts) { push(else_stmts, stmts[rem_idx]); rem_idx = rem_idx + 1; }
+            _extract_symbolic_paths(else_stmts, 0, env, p_else, is_int_mode, out_returns, out_divs);
+            return;
+        } elif sk == "expr_stmt" {
+            _collect_expr_divisions(s["expr"], env, is_int_mode, out_divs);
+        }
+        i = i + 1;
+    }
+}
+
+fn _format_witness_summary(wit_obj) {
+    if wit_obj == nil or type(wit_obj) != "map" { return ""; }
+    let vals = if map_has(wit_obj, "values") and type(wit_obj["values"]) == "map" { wit_obj["values"] } else { wit_obj };
+    let ks = array_sort(map_keys(vals));
+    let parts = [];
+    let i = 0;
+    while i < len(ks) {
+        let k = ks[i];
+        if k != "kind" and k != "values" and k != "exact" {
+            push(parts, k + " = " + str(vals[k]));
+        }
+        i = i + 1;
+    }
+    return str_join(parts, ", ");
+}
+
+fn prove_formula_auto(formula_str, use_presburger = false) {
+    if use_presburger {
+        let pr = try DF.presburger_decide(formula_str) catch nil;
+        if pr != nil and pr["truth"] != nil {
+            let tv = pr["truth"] == true;
+            let cex = if tv { nil } else { pr["witness_or_counterexample"] };
+            return map{
+                ok: true,
+                engine: "Presburger",
+                formula: formula_str,
+                truth_value: tv,
+                proved: tv,
+                status: if tv { "PROVED_MATHEMATICALLY" } else { "REFUTED_COUNTEREXAMPLE" },
+                counterexample: cex,
+                witness_summary: _format_witness_summary(cex),
+                certificate: pr["proof_certificate_en"],
+                certificate_el: pr["proof_certificate_el"]
+            };
+        }
+    }
+    let cr = try DF.cad_decide(formula_str) catch nil;
+    if cr != nil and cr["truth"] != nil {
+        let tv2 = cr["truth"] == true;
+        let cex2 = if tv2 { nil } else { cr["witness_or_counterexample"] };
+        return map{
+            ok: true,
+            engine: "CAD",
+            formula: formula_str,
+            truth_value: tv2,
+            proved: tv2,
+            status: if tv2 { "PROVED_MATHEMATICALLY" } else { "REFUTED_COUNTEREXAMPLE" },
+            counterexample: cex2,
+            witness_summary: _format_witness_summary(cex2),
+            certificate: cr["proof_certificate_en"],
+            certificate_el: cr["proof_certificate_el"]
+        };
+    }
+    return map{
+        ok: false,
+        engine: if use_presburger { "Presburger" } else { "CAD" },
+        formula: formula_str,
+        truth_value: nil,
+        proved: false,
+        status: "UNDECIDED",
+        counterexample: nil,
+        witness_summary: "",
+        certificate: "Formula outside decidable polynomial/linear fragment",
+        certificate_el: "Ο τύπος εκφεύγει από το αποφασίσιμο πολυωνυμικό/γραμμικό τμήμα"
+    };
+}
+
+// ── Main 4-Pass Static Analyzer (`check_source`) ──────────────────────────────
+
+fn _new_scope(parent_scope) {
+    return map{
+        parent: parent_scope,
+        vars: map{}
+    };
+}
+
+fn _scope_lookup(scope, name) {
+    let cur = scope;
+    while cur != nil {
+        if map_has(cur["vars"], name) {
+            return cur["vars"][name];
+        }
+        cur = cur["parent"];
+    }
+    return nil;
+}
+
+fn _scope_all_names(scope, builtins_map) {
+    let out = [];
+    let cur = scope;
+    while cur != nil {
+        let ks = map_keys(cur["vars"]);
+        let i = 0;
+        while i < len(ks) {
+            _sc_arr_push_unique(out, ks[i]);
+            i = i + 1;
+        }
+        cur = cur["parent"];
+    }
+    let bks = map_keys(builtins_map);
+    let j = 0;
+    while j < len(bks) {
+        _sc_arr_push_unique(out, bks[j]);
+        j = j + 1;
+    }
+    return out;
+}
+
+fn _resolve_annot_to_type(ctx, annot) {
+    if annot == nil { return _make_type("any"); }
+    let raw = annot["raw"];
+    let base = raw;
+    if raw == "number" or raw == "float" or raw == "f64" { base = "num"; }
+    elif raw == "integer" or raw == "i64" or raw == "i32" { base = "int"; }
+    elif raw == "str" { base = "string"; }
+    elif raw == "boolean" { base = "bool"; }
+
+    if annot["unit_raw"] != "" {
+        let ures = _extract_ccy_and_ucc_unit(annot["unit_raw"]);
+        if not ures["ok"] {
+            let loc = if annot["unit_loc"] != nil { annot["unit_loc"] } else { annot };
+            _emit_diag(ctx, "error", "INVALID_UNIT",
+                "Unknown or malformed SI/currency unit '" + annot["unit_raw"] + "': " + str(ures["error"]),
+                "Άγνωστη ή μη έγκυρη μονάδα SI/νομίσματος '" + annot["unit_raw"] + "'",
+                loc["line"], loc["col"], loc["col"] + len(annot["unit_raw"]) + 2, nil);
+            return _make_type(if base == "int" { "int" } else { "num" });
+        }
+        let num_b = if base == "int" { "int" } else { "num" };
+        return _make_unit_type(num_b, ures["dim"], ures["ccy"], annot["unit_raw"]);
+    }
+
+    if base == "Option" {
+        let t = _make_type("Option");
+        if len(annot["args"]) >= 1 {
+            t["elem_type"] = _resolve_annot_to_type(ctx, annot["args"][0]);
+        }
+        return t;
+    }
+    if base == "Result" {
+        let t2 = _make_type("Result");
+        if len(annot["args"]) >= 1 {
+            t2["ok_type"] = _resolve_annot_to_type(ctx, annot["args"][0]);
+        }
+        if len(annot["args"]) >= 2 {
+            t2["err_type"] = _resolve_annot_to_type(ctx, annot["args"][1]);
+        }
+        return t2;
+    }
+    if base == "fn" {
+        let tf = _make_type("fn");
+        let pts = [];
+        if annot["params"] != nil {
+            let i = 0;
+            while i < len(annot["params"]) {
+                push(pts, _resolve_annot_to_type(ctx, annot["params"][i]));
+                i = i + 1;
+            }
+        }
+        tf["params"] = pts;
+        tf["ret_type"] = if annot["ret"] != nil { _resolve_annot_to_type(ctx, annot["ret"]) } else { _make_type("any") };
+        return tf;
+    }
+    if map_has(ctx["enums"], base) {
+        let te = _make_type("enum");
+        te["type_name"] = base;
+        return te;
+    }
+    if map_has(ctx["structs"], base) {
+        let ts = _make_type("struct");
+        ts["type_name"] = base;
+        return ts;
+    }
+    if map_has(ctx["classes"], base) {
+        let tc = _make_type("class");
+        tc["type_name"] = base;
+        return tc;
+    }
+    if base == "num" or base == "int" or base == "string" or base == "bool" or base == "nil" or base == "array" or base == "map" or base == "bytes" or base == "f64buf" or base == "any" {
+        return _make_type(base);
+    }
+    return _make_type("any");
+}
+
+fn _emit_diag(ctx, sev, code, msg_en, msg_el, line, col, end_col, sugg) {
+    let ec = if end_col != nil and end_col > col { end_col } else { col + 1 };
+    push(ctx["diagnostics"], map{
+        severity: sev,
+        code: code,
+        message: msg_en,
+        message_el: msg_el,
+        line: line,
+        col: col,
+        end_line: line,
+        end_col: ec,
+        suggestion: sugg
+    });
+}
+
+fn _record_hover_span(ctx, name, line, col, end_col, sym_entry) {
+    if sym_entry == nil { return; }
+    let t = sym_entry["type"];
+    let unit_inf = nil;
+    if t != nil and t["has_unit"] {
+        unit_inf = map{
+            unit_str: _canonical_unit_label(t["dim"], t["ccy"]),
+            dim_unicode: _dim_unicode_rich(t["dim"], t["ccy"]),
+            dim_ascii: UCC.dim_to_ascii(t["dim"]),
+            named_quantity: UCC.dim_named_quantity(t["dim"])
+        };
+    }
+    push(ctx["hover_spans"], map{
+        name: name,
+        kind: sym_entry["kind"],
+        line: line,
+        col: col,
+        end_col: if end_col != nil and end_col > col { end_col } else { col + len(name) },
+        type_str: _type_to_str(t),
+        unit_info: unit_inf,
+        doc: if map_has(sym_entry, "doc") { sym_entry["doc"] } else { "" },
+        def_line: sym_entry["line"],
+        def_col: sym_entry["col"],
+        sym_ref: sym_entry
+    });
+}
+
+fn _types_compatible_assign(expected_t, actual_t, strict_mode) {
+    if expected_t == nil or actual_t == nil { return true; }
+    let eb = expected_t["base"];
+    let ab = actual_t["base"];
+    if eb == "any" { return true; }
+    if ab == "any" {
+        // In gradual mode, `any` flows cleanly; in strict mode concrete return/var expects typed value unless nil-allowed
+        return true;
+    }
+    if eb == "Option" {
+        if ab == "nil" or ab == "Option" { return true; }
+        if expected_t["elem_type"] != nil {
+            return _types_compatible_assign(expected_t["elem_type"], actual_t, strict_mode);
+        }
+        return true;
+    }
+    if eb == "Result" and (ab == "Result" or ab == "map") { return true; }
+    if (eb == "num" and ab == "int") or (eb == "int" and ab == "int") or (eb == "num" and ab == "num") {
+        return true;
+    }
+    if strict_mode and eb == "int" and ab == "num" and actual_t["const_val"] == nil {
+        return false;
+    }
+    return eb == ab;
+}
+
+fn _check_unit_match_pair(ctx, lt, rt, op_str, line, col) {
+    // Allow comparison or addition with literal 0 (`0`, `0.0`) as additive identity of any dimensional vector space
+    if lt["is_zero_lit"] == true and (rt["has_unit"] or not lt["has_unit"]) {
+        return rt;
+    }
+    if rt["is_zero_lit"] == true and (lt["has_unit"] or not rt["has_unit"]) {
+        return lt;
+    }
+    if not lt["has_unit"] and not rt["has_unit"] {
+        return lt;
+    }
+    if not _units_compatible(lt, rt) {
+        let u1 = if lt["has_unit"] { _canonical_unit_label(lt["dim"], lt["ccy"]) } else { "1 (dimensionless)" };
+        let u2 = if rt["has_unit"] { _canonical_unit_label(rt["dim"], rt["ccy"]) } else { "1 (dimensionless)" };
+        let d1 = _dim_unicode_rich(lt["dim"], lt["ccy"]);
+        let d2 = _dim_unicode_rich(rt["dim"], rt["ccy"]);
+
+        let ccy_hint_en = "";
+        let ccy_hint_el = "";
+        if UCC.dim_eq(lt["dim"], rt["dim"]) and not _ccy_eq(lt["ccy"], rt["ccy"]) {
+            ccy_hint_en = " — explicit currency mismatch (" + u1 + " vs " + u2 + "); multiply by an explicit exchange rate num[" + u1 + "/" + u2 + "] first!";
+            ccy_hint_el = " — ασυμβατότητα νομισμάτων (" + u1 + " έναντι " + u2 + ")· πολλαπλασιάστε πρώτα με ρητή ισοτιμία num[" + u1 + "/" + u2 + "]!";
+        }
+        let msg_en = "DIMENSIONAL_MISMATCH in '" + op_str + "': cannot combine " + _type_to_str(lt) + " " + d1 + " with " + _type_to_str(rt) + " " + d2 + ccy_hint_en
+            + " | Ασυμβατότητα διαστάσεων SI/νομίσματος: αδύνατος ο συνδυασμός " + u1 + " " + d1 + " με " + u2 + " " + d2 + ccy_hint_el;
+        let msg_el = "Ασυμβατότητα διαστάσεων SI/νομίσματος στον τελεστή '" + op_str + "': " + u1 + " " + d1 + " έναντι " + u2 + " " + d2 + ccy_hint_el;
+        _emit_diag(ctx, "error", "DIMENSIONAL_MISMATCH", msg_en, msg_el, line, col, col + len(op_str), nil);
+        return lt;
+    }
+    return lt;
+}
+
+fn _eval_const_rational_exp(node) {
+    if node == nil { return nil; }
+    if node["kind"] == "num" {
+        let nv = parse_number(node["val"]);
+        if nv == nil { return nil; }
+        let fl = num_floor(nv);
+        if nv == fl { return [fl, 1]; }
+        if num_abs(nv - 0.5) < 1e-12 { return [1, 2]; }
+        if num_abs(nv + 0.5) < 1e-12 { return [-1, 2]; }
+        return nil;
+    }
+    if node["kind"] == "unary" and node["op"] == "-" {
+        let sub = _eval_const_rational_exp(node["arg"]);
+        if sub == nil { return nil; }
+        return [0 - sub[0], sub[1]];
+    }
+    if node["kind"] == "binary" and node["op"] == "/" {
+        let a = _eval_const_rational_exp(node["left"]);
+        let b = _eval_const_rational_exp(node["right"]);
+        if a != nil and b != nil and a[1] == 1 and b[1] == 1 and b[0] != 0 {
+            return UCC.rat_make(a[0], b[0]);
+        }
+    }
+    return nil;
+}
+
+// ── Pass 5: Compile-Time Quantum Wire / No-Cloning & Register Bounds Verification ──
+
+fn _collect_mutated_idents_expr(node, out_map) {
+    if node == nil { return; }
+    let k = node["kind"];
+    if k == "try_block_expr" {
+        if node["try_block"] != nil { _collect_mutated_idents_stmts(node["try_block"]["stmts"], out_map); }
+        if node["catch_block"] != nil { _collect_mutated_idents_stmts(node["catch_block"]["stmts"], out_map); }
+        return;
+    }
+    if k == "if_stmt" {
+        _collect_mutated_idents_expr(node["cond"], out_map);
+        if node["then_block"] != nil { _collect_mutated_idents_stmts(node["then_block"]["stmts"], out_map); }
+        if node["else_block"] != nil {
+            if node["else_block"]["kind"] == "block" {
+                _collect_mutated_idents_stmts(node["else_block"]["stmts"], out_map);
+            } else {
+                _collect_mutated_idents_expr(node["else_block"], out_map);
+            }
+        }
+        return;
+    }
+    if k == "match_stmt" {
+        _collect_mutated_idents_expr(node["target"], out_map);
+        let i = 0;
+        while i < len(node["arms"]) {
+            let arm = node["arms"][i];
+            if arm["body"] != nil and arm["body"]["kind"] == "block" {
+                _collect_mutated_idents_stmts(arm["body"]["stmts"], out_map);
+            } else {
+                _collect_mutated_idents_expr(arm["body"], out_map);
+            }
+            i = i + 1;
+        }
+        return;
+    }
+    if k == "comptime_expr" {
+        if node["expr"] != nil { _collect_mutated_idents_expr(node["expr"], out_map); }
+        if node["block"] != nil { _collect_mutated_idents_stmts(node["block"]["stmts"], out_map); }
+        return;
+    }
+    if k == "str" and node["is_fstr"] and node["interps"] != nil {
+        let i = 0;
+        while i < len(node["interps"]) {
+            _collect_mutated_idents_stmts(node["interps"][i]["stmts"], out_map);
+            i = i + 1;
+        }
+    }
+}
+
+fn _collect_mutated_idents_stmts(stmts, out_map) {
+    if stmts == nil { return; }
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        let sk = s["kind"];
+        if sk == "assign" {
+            let tgt = s["target"];
+            if tgt != nil and tgt["kind"] == "ident" {
+                out_map[tgt["name"]] = true;
+            }
+            _collect_mutated_idents_expr(s["val"], out_map);
+        } elif sk == "var_decl" or sk == "destruct_decl" {
+            if s["init"] != nil { _collect_mutated_idents_expr(s["init"], out_map); }
+        } elif sk == "if_stmt" or sk == "match_stmt" or sk == "try_block_expr" {
+            _collect_mutated_idents_expr(s, out_map);
+        } elif sk == "while_stmt" {
+            _collect_mutated_idents_expr(s["cond"], out_map);
+            if s["body"] != nil { _collect_mutated_idents_stmts(s["body"]["stmts"], out_map); }
+        } elif sk == "loop_stmt" {
+            if s["body"] != nil { _collect_mutated_idents_stmts(s["body"]["stmts"], out_map); }
+        } elif sk == "for_stmt" {
+            if s["var1"] != nil { out_map[s["var1"]["val"]] = true; }
+            if s["var2"] != nil { out_map[s["var2"]["val"]] = true; }
+            if s["body"] != nil { _collect_mutated_idents_stmts(s["body"]["stmts"], out_map); }
+        } elif sk == "switch_stmt" {
+            let ci = 0;
+            while ci < len(s["cases"]) {
+                _collect_mutated_idents_stmts(s["cases"][ci]["stmts"], out_map);
+                ci = ci + 1;
+            }
+        } elif sk == "defer_stmt" {
+            if s["body"] != nil {
+                if s["body"]["kind"] == "block" {
+                    _collect_mutated_idents_stmts(s["body"]["stmts"], out_map);
+                } else {
+                    _collect_mutated_idents_stmts([s["body"]], out_map);
+                }
+            }
+        } elif sk == "block" {
+            _collect_mutated_idents_stmts(s["stmts"], out_map);
+        } elif sk == "expr_stmt" {
+            _collect_mutated_idents_expr(s["expr"], out_map);
+        } elif sk == "return_stmt" or sk == "throw_stmt" {
+            if s["val"] != nil { _collect_mutated_idents_expr(s["val"], out_map); }
+        }
+        i = i + 1;
+    }
+}
+
+fn _is_ident_ssa_immutable(scope, nm, sym) {
+    if sym == nil { return false; }
+    if sym["is_const"] == true { return true; }
+    if sym["kind"] == "param" { return false; }
+    let cur = scope;
+    while cur != nil {
+        if map_has(cur, "mutated_vars") and cur["mutated_vars"] != nil {
+            return not map_has(cur["mutated_vars"], nm);
+        }
+        cur = cur["parent"];
+    }
+    return false;
+}
+
+fn _eval_quantum_const_num(scope, node) {
+    if node == nil { return map{ known: false, val: 0, is_int: false }; }
+    let k = node["kind"];
+    if k == "num" {
+        let nv = parse_number(node["val"]);
+        if nv == nil { return map{ known: false, val: 0, is_int: false }; }
+        let is_i = str_index_of(node["val"], ".") < 0 and str_index_of(node["val"], "e") < 0 and str_index_of(node["val"], "E") < 0 and nv == num_floor(nv);
+        return map{ known: true, val: nv, is_int: is_i };
+    }
+    if k == "ident" {
+        let nm = node["name"];
+        let sym = _scope_lookup(scope, nm);
+        if sym != nil and sym["type"] != nil and sym["type"]["const_val"] != nil and _is_ident_ssa_immutable(scope, nm, sym) {
+            let cv = sym["type"]["const_val"];
+            let is_i2 = sym["type"]["base"] == "int" and cv == num_floor(cv);
+            return map{ known: true, val: cv, is_int: is_i2 };
+        }
+        return map{ known: false, val: 0, is_int: false };
+    }
+    if k == "unary" and (node["op"] == "-" or node["op"] == "+") {
+        let sub = _eval_quantum_const_num(scope, node["arg"]);
+        if not sub["known"] { return sub; }
+        let v = if node["op"] == "-" { 0 - sub["val"] } else { sub["val"] };
+        return map{ known: true, val: v, is_int: sub["is_int"] };
+    }
+    if k == "binary" and (node["op"] == "+" or node["op"] == "-" or node["op"] == "*") {
+        let lv = _eval_quantum_const_num(scope, node["left"]);
+        let rv = _eval_quantum_const_num(scope, node["right"]);
+        if lv["known"] and rv["known"] {
+            let bop = node["op"];
+            let out_v = if bop == "+" { lv["val"] + rv["val"] } elif bop == "-" { lv["val"] - rv["val"] } else { lv["val"] * rv["val"] };
+            return map{ known: true, val: out_v, is_int: lv["is_int"] and rv["is_int"] };
+        }
+    }
+    return map{ known: false, val: 0, is_int: false };
+}
+
+fn _quantum_wire_key(scope, node) {
+    if node == nil { return ""; }
+    let cinfo = _eval_quantum_const_num(scope, node);
+    if cinfo["known"] and cinfo["is_int"] {
+        return "const:" + str(num_floor(cinfo["val"]));
+    }
+    let k = node["kind"];
+    if k == "ident" {
+        return "id:" + node["name"];
+    }
+    if k == "unary" and (node["op"] == "-" or node["op"] == "+") {
+        let sk = _quantum_wire_key(scope, node["arg"]);
+        if sk == "" { return ""; }
+        return if node["op"] == "+" { sk } else { "un:-(" + sk + ")" };
+    }
+    if k == "binary" and (node["op"] == "+" or node["op"] == "-" or node["op"] == "*" or node["op"] == "/" or node["op"] == "%") {
+        let lk = _quantum_wire_key(scope, node["left"]);
+        let rk = _quantum_wire_key(scope, node["right"]);
+        if lk == "" or rk == "" { return ""; }
+        let bop = node["op"];
+        if (bop == "+" or bop == "*") and rk < lk {
+            return "bin:" + bop + "(" + rk + "," + lk + ")";
+        }
+        return "bin:" + bop + "(" + lk + "," + rk + ")";
+    }
+    if k == "member" {
+        let ok = _quantum_wire_key(scope, node["obj"]);
+        if ok == "" { return ""; }
+        return "mem:" + ok + "." + node["field"];
+    }
+    if k == "index" {
+        let ok2 = _quantum_wire_key(scope, node["obj"]);
+        let ik = _quantum_wire_key(scope, node["index"]);
+        if ok2 == "" or ik == "" { return ""; }
+        return "idx:" + ok2 + "[" + ik + "]";
+    }
+    return "";
+}
+
+fn _quantum_wire_display(node) {
+    if node == nil { return "?"; }
+    let k = node["kind"];
+    if k == "num" { return node["val"]; }
+    if k == "ident" { return node["name"]; }
+    if k == "unary" { return node["op"] + _quantum_wire_display(node["arg"]); }
+    if k == "binary" { return _quantum_wire_display(node["left"]) + " " + node["op"] + " " + _quantum_wire_display(node["right"]); }
+    if k == "member" { return _quantum_wire_display(node["obj"]) + "." + node["field"]; }
+    if k == "index" { return _quantum_wire_display(node["obj"]) + "[" + _quantum_wire_display(node["index"]) + "]"; }
+    return "<expr>";
+}
+
+fn _quantum_gate_wire_mode(fn_name) {
+    if fn_name == "h" or fn_name == "x" or fn_name == "sx" or fn_name == "y" or fn_name == "z"
+        or fn_name == "s" or fn_name == "sdg" or fn_name == "t" or fn_name == "tdg"
+        or fn_name == "rx" or fn_name == "ry" or fn_name == "rz"
+        or fn_name == "u1" or fn_name == "u2" or fn_name == "u3" or fn_name == "p" or fn_name == "phase"
+        or fn_name == "gpi" or fn_name == "gpi2" or fn_name == "phased_xz" or fn_name == "measure_qubit" {
+        return "1q";
+    }
+    if fn_name == "cnot" or fn_name == "cx" or fn_name == "cz" or fn_name == "swap" or fn_name == "iswap"
+        or fn_name == "cp" or fn_name == "cphase" or fn_name == "crx" or fn_name == "cry" or fn_name == "crz"
+        or fn_name == "rxx" or fn_name == "ryy" or fn_name == "rzz" or fn_name == "ms" {
+        return "2q";
+    }
+    if fn_name == "toffoli" or fn_name == "ccx" or fn_name == "cswap" or fn_name == "fredkin" or fn_name == "ccz" {
+        return "3q";
+    }
+    if fn_name == "mcz" or fn_name == "mcx" or fn_name == "mcp" {
+        return "mc";
+    }
+    return "";
+}
+
+fn _check_quantum_call_pass5(ctx, scope, call_node, callee_node, callee_t, recv_type_override, raw_args, arg_types) {
+    let fn_name = "";
+    let is_q_mod = false;
+    let full_raw = raw_args;
+    let full_types = arg_types;
+
+    if recv_type_override != nil {
+        fn_name = call_node["method"];
+        full_raw = [call_node["obj"]];
+        let mi = 0;
+        while mi < len(raw_args) { push(full_raw, raw_args[mi]); mi = mi + 1; }
+        full_types = [recv_type_override];
+        let ti = 0;
+        while ti < len(arg_types) { push(full_types, arg_types[ti]); ti = ti + 1; }
+    } elif callee_node != nil {
+        if callee_node["kind"] == "ident" {
+            fn_name = callee_node["name"];
+        } elif callee_node["kind"] == "member" {
+            fn_name = callee_node["field"];
+            if callee_t != nil and map_has(callee_t, "owner_module_name") and callee_t["owner_module_name"] != nil {
+                if str_contains(str_lower(callee_t["owner_module_name"]), "quantum") {
+                    is_q_mod = true;
+                }
+            }
+        }
+    }
+
+    if fn_name == "" { return nil; }
+
+    // 1. Quantum circuit allocation: `new_circuit(N)` or `*.new_circuit(N)`
+    if fn_name == "new_circuit" and len(full_raw) >= 1 {
+        let n_arg = full_raw[0];
+        let n_info = _eval_quantum_const_num(scope, n_arg);
+        let valid_n = nil;
+        if n_info["known"] {
+            if (not n_info["is_int"]) or n_info["val"] < 1 or n_info["val"] > 156 {
+                let n_lbl = str(n_info["val"]);
+                _emit_diag(ctx, "error", "QUANTUM_INVALID_REGISTER_SIZE",
+                    "QUANTUM_INVALID_REGISTER_SIZE: new_circuit(" + n_lbl + ") requires an integer qubit register size N in 1..156",
+                    "Μη έγκυρο μέγεθος κβαντικού καταχωρητή στη new_circuit(" + n_lbl + "): απαιτείται ακέραιος αριθμός qubits N στο διάστημα 1..156",
+                    n_arg["line"], n_arg["col"], n_arg["col"] + len(n_lbl), nil);
+            } else {
+                valid_n = num_floor(n_info["val"]);
+            }
+        }
+        let qt = _make_type("map");
+        qt["is_quantum_circuit"] = true;
+        qt["quantum_n_qubits"] = valid_n;
+        if map_has(ctx, "quantum_registers") {
+            push(ctx["quantum_registers"], map{ line: call_node["line"], col: call_node["col"], n_qubits: valid_n });
+        }
+        return qt;
+    }
+
+    // 2. Quantum gate operations on a tracked circuit or quantum module
+    let gmode = _quantum_gate_wire_mode(fn_name);
+    if gmode == "" or len(full_types) < 2 {
+        return nil;
+    }
+    let circ_t = full_types[0];
+    let is_q_circ = circ_t != nil and map_has(circ_t, "is_quantum_circuit") and circ_t["is_quantum_circuit"] == true;
+    if (not is_q_circ) and (not is_q_mod) {
+        return nil;
+    }
+
+    let reg_n = if is_q_circ { circ_t["quantum_n_qubits"] } else { nil };
+    let wire_nodes = [];
+    if gmode == "1q" and len(full_raw) >= 2 {
+        push(wire_nodes, full_raw[1]);
+    } elif gmode == "2q" and len(full_raw) >= 3 {
+        push(wire_nodes, full_raw[1]);
+        push(wire_nodes, full_raw[2]);
+    } elif gmode == "3q" and len(full_raw) >= 4 {
+        push(wire_nodes, full_raw[1]);
+        push(wire_nodes, full_raw[2]);
+        push(wire_nodes, full_raw[3]);
+    } elif gmode == "mc" and len(full_raw) >= 3 {
+        let ctrl_arg = full_raw[1];
+        if ctrl_arg["kind"] == "array_lit" {
+            let ci = 0;
+            while ci < len(ctrl_arg["items"]) {
+                let it = ctrl_arg["items"][ci];
+                if it["kind"] != "spread" {
+                    push(wire_nodes, it);
+                }
+                ci = ci + 1;
+            }
+        }
+        push(wire_nodes, full_raw[2]);
+    }
+
+    // 2a. Register wire bounds verification (`0 <= wire < N`)
+    let wi = 0;
+    while wi < len(wire_nodes) {
+        let wn = wire_nodes[wi];
+        if wn["kind"] != "spread" {
+            let cval = _eval_quantum_const_num(scope, wn);
+            if cval["known"] {
+                let v = cval["val"];
+                let bad_bounds = (not cval["is_int"]) or v < 0 or (reg_n != nil and v >= reg_n);
+                if bad_bounds {
+                    let w_lbl = str(v);
+                    let rng_msg = if reg_n != nil {
+                        " is out of bounds for " + str(reg_n) + "-qubit register (valid wires: 0.." + str(reg_n - 1) + ")"
+                    } else {
+                        " is invalid (qubit wire index must be a non-negative integer)"
+                    };
+                    let rng_el = if reg_n != nil {
+                        " είναι εκτός ορίων για καταχωρητή " + str(reg_n) + " qubits (έγκυρα σύρματα: 0.." + str(reg_n - 1) + ")"
+                    } else {
+                        " δεν είναι έγκυρος μη-αρνητικός ακέραιος δείκτης qubit"
+                    };
+                    _emit_diag(ctx, "error", "QUANTUM_WIRE_OUT_OF_BOUNDS",
+                        "QUANTUM_WIRE_OUT_OF_BOUNDS: gate '" + fn_name + "' wire index " + w_lbl + rng_msg,
+                        "Εκτός ορίων κβαντικού καταχωρητή στην πύλη '" + fn_name + "': το σύρμα " + w_lbl + rng_el,
+                        wn["line"], wn["col"], wn["col"] + len(w_lbl), nil);
+                }
+            }
+        }
+        wi = wi + 1;
+    }
+
+    // 2b. Linearity / No-Cloning Theorem verification (all multi-qubit gate wires must be distinct!)
+    if gmode != "1q" and len(wire_nodes) >= 2 {
+        let seen_wires = map{};
+        let di = 0;
+        while di < len(wire_nodes) {
+            let dn = wire_nodes[di];
+            if dn["kind"] != "spread" {
+                let wkey = _quantum_wire_key(scope, dn);
+                if wkey != "" {
+                    let disp = _quantum_wire_display(dn);
+                    if map_has(seen_wires, wkey) {
+                        _emit_diag(ctx, "error", "QUANTUM_NO_CLONING_DUPLICATE_WIRE",
+                            "QUANTUM_NO_CLONING_DUPLICATE_WIRE: multi-qubit gate '" + fn_name + "' uses duplicate quantum wire '" + disp + "' (violates quantum linearity / No-Cloning theorem)",
+                            "Παραβίαση κβαντικής γραμμικότητας / θεωρήματος Μη-Κλωνοποίησης (No-Cloning): η πύλη '" + fn_name + "' χρησιμοποιεί διπλότυπο σύρμα qubit '" + disp + "'",
+                            dn["line"], dn["col"], dn["col"] + len(disp), nil);
+                    } else {
+                        seen_wires[wkey] = disp;
+                    }
+                }
+            }
+            di = di + 1;
+        }
+    }
+
+    if is_q_circ {
+        return circ_t;
+    }
+    let q_ret = _make_type("map");
+    q_ret["is_quantum_circuit"] = true;
+    q_ret["quantum_n_qubits"] = reg_n;
+    return q_ret;
+}
+
+fn _analyze_expr(ctx, scope, node) {
+    if node == nil { return _make_type("nil"); }
+    let k = node["kind"];
+
+    if k == "num" {
+        let nv = parse_number(node["val"]);
+        let is_int_lit = str_index_of(node["val"], ".") < 0 and str_index_of(node["val"], "e") < 0 and str_index_of(node["val"], "E") < 0;
+        let t = _make_type(if is_int_lit { "int" } else { "num" });
+        t["const_val"] = nv;
+        t["is_zero_lit"] = nv != nil and nv == 0;
+        return t;
+    }
+    if k == "str" {
+        if node["is_fstr"] and node["interps"] != nil {
+            let i = 0;
+            while i < len(node["interps"]) {
+                _analyze_block_stmts(ctx, scope, node["interps"][i]["stmts"], nil);
+                i = i + 1;
+            }
+        }
+        return _make_type("string");
+    }
+    if k == "bool" { return _make_type("bool"); }
+    if k == "nil" { return _make_type("nil"); }
+    if k == "polyglot" { return _make_type("any"); }
+
+    if k == "ident" {
+        let nm = node["name"];
+        let sym = _scope_lookup(scope, nm);
+        if sym != nil {
+            _record_hover_span(ctx, nm, node["line"], node["col"], node["end_col"], sym);
+            return sym["type"];
+        }
+        let bspecs = _get_builtin_specs();
+        if map_has(bspecs, nm) {
+            let bs = bspecs[nm];
+            let bt = _make_type("fn");
+            bt["ret_type"] = _make_type(bs["ret_base"]);
+            return bt;
+        }
+        let cands = _scope_all_names(scope, bspecs);
+        let sugg = suggest_symbol(nm, cands);
+        let msg_en = if sugg != nil {
+            "Undefined symbol '" + nm + "' — did you mean '" + sugg + "'?"
+        } else {
+            "Undefined symbol '" + nm + "'"
+        };
+        let msg_el = if sugg != nil {
+            "Μη ορισμένο σύμβολο '" + nm + "' — μήπως εννοούσατε '" + sugg + "';"
+        } else {
+            "Μη ορισμένο σύμβολο '" + nm + "'"
+        };
+        _emit_diag(ctx, "error", "UNDEFINED_SYMBOL", msg_en, msg_el, node["line"], node["col"], node["end_col"], sugg);
+        return _make_type("any");
+    }
+
+    if k == "import_expr" {
+        let arg_t = _analyze_expr(ctx, scope, node["arg"]);
+        if node["arg"]["kind"] == "str" {
+            let mod_info = _inspect_module_exports(node["arg"]["val"], ctx["base_dir"]);
+            let mt = _make_type("module");
+            mt["module_info"] = mod_info;
+            mt["type_name"] = node["arg"]["val"];
+            return mt;
+        }
+        return _make_type("module");
+    }
+
+    if k == "comptime_expr" {
+        if node["expr"] != nil { return _analyze_expr(ctx, scope, node["expr"]); }
+        if node["block"] != nil { return _analyze_block(ctx, scope, node["block"], nil); }
+        return _make_type("any");
+    }
+
+    if k == "array_lit" {
+        let elem_t = nil;
+        let i = 0;
+        while i < len(node["items"]) {
+            let it = node["items"][i];
+            let sub_t = if it["kind"] == "spread" { _analyze_expr(ctx, scope, it["arg"]) } else { _analyze_expr(ctx, scope, it) };
+            if elem_t == nil { elem_t = sub_t; }
+            i = i + 1;
+        }
+        let at = _make_type("array");
+        at["elem_type"] = elem_t;
+        return at;
+    }
+
+    if k == "map_lit" {
+        let i = 0;
+        while i < len(node["entries"]) {
+            _analyze_expr(ctx, scope, node["entries"][i]["key"]);
+            _analyze_expr(ctx, scope, node["entries"][i]["val"]);
+            i = i + 1;
+        }
+        return _make_type("map");
+    }
+
+    if k == "member" {
+        let obj_t = _analyze_expr(ctx, scope, node["obj"]);
+        let fld = node["field"];
+        if obj_t["base"] == "enum" and map_has(ctx["enums"], obj_t["type_name"]) {
+            let vars = ctx["enums"][obj_t["type_name"]];
+            if not _sc_arr_contains(vars, fld) {
+                let vsugg = suggest_symbol(fld, vars);
+                _emit_diag(ctx, "error", "UNKNOWN_ENUM_VARIANT",
+                    "Enum '" + obj_t["type_name"] + "' has no variant '" + fld + "'" + (if vsugg != nil { " — did you mean '" + vsugg + "'?" } else { "" }),
+                    "Το enum '" + obj_t["type_name"] + "' δεν διαθέτει παραλλαγή '" + fld + "'",
+                    node["line"], node["col"], node["end_col"], vsugg);
+            }
+            return obj_t;
+        }
+        if obj_t["base"] == "module" and map_has(obj_t, "module_info") and obj_t["module_info"] != nil and obj_t["module_info"]["ok"] {
+            let exps = obj_t["module_info"]["exports"];
+            if len(map_keys(exps)) > 0 and not map_has(exps, fld) {
+                let msugg = suggest_symbol(fld, map_keys(exps));
+                _emit_diag(ctx, "error", "UNKNOWN_MODULE_EXPORT",
+                    "Module '" + obj_t["type_name"] + "' does not export '" + fld + "'" + (if msugg != nil { " — did you mean '" + msugg + "'?" } else { "" }),
+                    "Η μονάδα '" + obj_t["type_name"] + "' δεν εξάγει το '" + fld + "'",
+                    node["line"], node["col"], node["end_col"], msugg);
+                return _make_type("any");
+            }
+            if map_has(exps, fld) {
+                let ei = exps[fld];
+                if ei["kind"] == "fn" {
+                    let ft = _make_type("fn");
+                    ft["min_args"] = ei["min_args"];
+                    ft["max_args"] = ei["max_args"];
+                    ft["has_rest"] = ei["has_rest"];
+                    ft["ret_type"] = _make_type("any");
+                    ft["owner_module_name"] = obj_t["type_name"];
+                    return ft;
+                }
+            }
+        }
+        if obj_t["base"] == "module" {
+            let m_any = _make_type("any");
+            m_any["owner_module_name"] = obj_t["type_name"];
+            return m_any;
+        }
+        return _make_type("any");
+    }
+
+    if k == "index" {
+        let obj_t = _analyze_expr(ctx, scope, node["obj"]);
+        let idx_t = _analyze_expr(ctx, scope, node["index"]);
+        if obj_t["base"] == "array" and obj_t["elem_type"] != nil {
+            return obj_t["elem_type"];
+        }
+        if obj_t["base"] == "string" { return _make_type("string"); }
+        if obj_t["base"] == "f64buf" { return _make_type("num"); }
+        if obj_t["base"] == "bytes" { return _make_type("int"); }
+        return _make_type("any");
+    }
+
+    if k == "slice_expr" {
+        let obj_t = _analyze_expr(ctx, scope, node["obj"]);
+        if node["start"] != nil { _analyze_expr(ctx, scope, node["start"]); }
+        if node["stop"] != nil { _analyze_expr(ctx, scope, node["stop"]); }
+        return obj_t;
+    }
+
+    if k == "method_call" {
+        let recv_t = _analyze_expr(ctx, scope, node["obj"]);
+        let m_arg_types = [];
+        let i = 0;
+        while i < len(node["args"]) {
+            push(m_arg_types, _analyze_expr(ctx, scope, node["args"][i]));
+            i = i + 1;
+        }
+        let q_mret = _check_quantum_call_pass5(ctx, scope, node, nil, nil, recv_t, node["args"], m_arg_types);
+        if q_mret != nil { return q_mret; }
+        return _make_type("any");
+    }
+
+    if k == "call" {
+        let callee_node = node["callee"];
+        let callee_t = _analyze_expr(ctx, scope, callee_node);
+        let arg_types = [];
+        let has_spread_arg = false;
+        let i = 0;
+        while i < len(node["args"]) {
+            let an = node["args"][i];
+            if an["kind"] == "spread" {
+                has_spread_arg = true;
+                push(arg_types, _analyze_expr(ctx, scope, an["arg"]));
+            } else {
+                push(arg_types, _analyze_expr(ctx, scope, an));
+            }
+            i = i + 1;
+        }
+        let argc = len(arg_types);
+
+        // Pass 2: Check calling a concrete non-function value!
+        let cb = callee_t["base"];
+        if cb != "fn" and cb != "any" and cb != "class" and cb != "struct" and cb != "module" {
+            _emit_diag(ctx, "error", "NOT_CALLABLE",
+                "Cannot call value of non-function type '" + _type_to_str(callee_t) + "'",
+                "Αδύνατη η κλήση τιμής μη-συναρτησιακού τύπου '" + _type_to_str(callee_t) + "'",
+                node["line"], node["col"], node["col"] + 1, nil);
+            return _make_type("any");
+        }
+
+        // Check builtin arity + transcendental SI unit rules!
+        if callee_node["kind"] == "ident" {
+            let fnm = callee_node["name"];
+            let bspecs = _get_builtin_specs();
+            if _scope_lookup(scope, fnm) == nil and map_has(bspecs, fnm) {
+                let bs = bspecs[fnm];
+                if not has_spread_arg {
+                    if argc < bs["min_args"] or (not bs["has_rest"] and bs["max_args"] >= 0 and argc > bs["max_args"]) {
+                        _emit_diag(ctx, "error", "ARITY_MISMATCH",
+                            "Builtin '" + fnm + "' expects " + str(bs["min_args"]) + (if bs["max_args"] > bs["min_args"] { ".." + str(bs["max_args"]) } else { "" }) + " argument(s), got " + str(argc),
+                            "Η ενσωματωμένη συνάρτηση '" + fnm + "' αναμένει " + str(bs["min_args"]) + " όρισμα(τα), δόθηκαν " + str(argc),
+                            node["line"], node["col"], node["col"] + len(fnm), nil);
+                    }
+                }
+                // Pass 3: Transcendental dimensionless guard (`sin(t)`, `exp(t)`, `ln(x)`)!
+                if bs["is_transcendental"] and argc >= 1 and arg_types[0]["has_unit"] {
+                    let at0 = arg_types[0];
+                    let u_str = _canonical_unit_label(at0["dim"], at0["ccy"]);
+                    let d_str = _dim_unicode_rich(at0["dim"], at0["ccy"]);
+                    _emit_diag(ctx, "error", "TRANSCENDENTAL_NON_DIMENSIONLESS",
+                        "TRANSCENDENTAL_NON_DIMENSIONLESS: '" + fnm + "(...)' requires a dimensionless argument [1], but got " + _type_to_str(at0) + " " + d_str
+                            + " | Η υπερβατική συνάρτηση '" + fnm + "' απαιτεί αδιάστατο όρισμα [1], αλλά δόθηκε μέγεθος με μονάδα " + u_str + " " + d_str,
+                        "Η υπερβατική συνάρτηση '" + fnm + "' απαιτεί αδιάστατο όρισμα [1], αλλά δόθηκε " + u_str + " " + d_str,
+                        node["line"], node["col"], node["col"] + len(fnm), nil);
+                }
+                // Unit propagation through `sqrt`, `abs`, `pow`, `min`, `max`, `clamp`, `Some`, `Ok`, `Err`
+                if (fnm == "sqrt" or fnm == "num_sqrt") and argc == 1 and arg_types[0]["has_unit"] {
+                    return _make_unit_type("num", UCC.dim_pow(arg_types[0]["dim"], 1, 2), _ccy_pow(arg_types[0]["ccy"], 1, 2), "");
+                }
+                if (fnm == "abs" or fnm == "num_abs") and argc == 1 and arg_types[0]["has_unit"] {
+                    return arg_types[0];
+                }
+                if (fnm == "min" or fnm == "num_min" or fnm == "max" or fnm == "num_max") and argc == 2 {
+                    return _check_unit_match_pair(ctx, arg_types[0], arg_types[1], fnm, node["line"], node["col"]);
+                }
+                if (fnm == "pow" or fnm == "num_pow") and argc == 2 {
+                    if arg_types[1]["has_unit"] {
+                        _emit_diag(ctx, "error", "TRANSCENDENTAL_NON_DIMENSIONLESS",
+                            "Exponent in '" + fnm + "' must be dimensionless [1], got " + _type_to_str(arg_types[1]),
+                            "Ο εκθέτης στη '" + fnm + "' πρέπει να είναι αδιάστατος [1]",
+                            node["line"], node["col"], node["col"] + len(fnm), nil);
+                    }
+                    if arg_types[0]["has_unit"] {
+                        let rexp = _eval_const_rational_exp(node["args"][1]);
+                        if rexp != nil {
+                            return _make_unit_type("num", UCC.dim_pow(arg_types[0]["dim"], rexp[0], rexp[1]), _ccy_pow(arg_types[0]["ccy"], rexp[0], rexp[1]), "");
+                        }
+                    }
+                }
+                if fnm == "Some" and argc == 1 {
+                    let ot = _make_type("Option");
+                    ot["elem_type"] = arg_types[0];
+                    return ot;
+                }
+                if fnm == "Ok" and argc == 1 {
+                    let rt_ok = _make_type("Result");
+                    rt_ok["ok_type"] = arg_types[0];
+                    return rt_ok;
+                }
+                if fnm == "Err" and argc == 1 {
+                    let rt_err = _make_type("Result");
+                    rt_err["err_type"] = arg_types[0];
+                    return rt_err;
+                }
+                return _make_type(bs["ret_base"]);
+            }
+        }
+
+        // User-defined or imported function arity & parameter type/unit checking
+        if cb == "fn" {
+            let min_a = if map_has(callee_t, "min_args") and callee_t["min_args"] != nil { callee_t["min_args"] } else {
+                if callee_t["params"] != nil { len(callee_t["params"]) } else { 0 }
+            };
+            let max_a = if map_has(callee_t, "max_args") and callee_t["max_args"] != nil { callee_t["max_args"] } else {
+                if callee_t["params"] != nil { len(callee_t["params"]) } else { -1 }
+            };
+            let h_rest = if map_has(callee_t, "has_rest") and callee_t["has_rest"] == true { true } else { max_a < 0 };
+            if not has_spread_arg {
+                if argc < min_a or (not h_rest and max_a >= 0 and argc > max_a) {
+                    let cname = if callee_node["kind"] == "ident" { callee_node["name"] } else { "function" };
+                    _emit_diag(ctx, "error", "ARITY_MISMATCH",
+                        "Function '" + cname + "' expects " + str(min_a) + (if max_a > min_a { ".." + str(max_a) } else { "" }) + " argument(s), got " + str(argc),
+                        "Η συνάρτηση '" + cname + "' αναμένει " + str(min_a) + " όρισμα(τα), δόθηκαν " + str(argc),
+                        node["line"], node["col"], node["col"] + 1, nil);
+                }
+            }
+            if callee_t["params"] != nil {
+                let pi = 0;
+                while pi < argc and pi < len(callee_t["params"]) {
+                    let p_exp = callee_t["params"][pi];
+                    let p_act = arg_types[pi];
+                    if not _types_compatible_assign(p_exp, p_act, ctx["strict"]) {
+                        _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                            "Argument " + str(pi + 1) + " type mismatch: expected " + _type_to_str(p_exp) + ", got " + _type_to_str(p_act),
+                            "Ασυμφωνία τύπου στο όρισμα " + str(pi + 1) + ": αναμενόταν " + _type_to_str(p_exp) + ", δόθηκε " + _type_to_str(p_act),
+                            node["args"][pi]["line"], node["args"][pi]["col"], node["args"][pi]["col"] + 1, nil);
+                    } elif _is_numeric_type(p_exp) and _is_numeric_type(p_act) and (p_exp["has_unit"] or p_act["has_unit"]) {
+                        if not (p_act["is_zero_lit"] == true and p_exp["has_unit"]) and not _units_compatible(p_exp, p_act) {
+                            _check_unit_match_pair(ctx, p_exp, p_act, "call arg " + str(pi + 1), node["args"][pi]["line"], node["args"][pi]["col"]);
+                        }
+                    }
+                    pi = pi + 1;
+                }
+            }
+        }
+
+        // Pass 5: Compile-Time Quantum Wire / No-Cloning & Register Bounds Verification!
+        let q_ret = _check_quantum_call_pass5(ctx, scope, node, callee_node, callee_t, nil, node["args"], arg_types);
+        if q_ret != nil { return q_ret; }
+
+        if cb == "fn" and callee_t["ret_type"] != nil { return callee_t["ret_type"]; }
+        return _make_type("any");
+    }
+
+    if k == "unary" {
+        let op = node["op"];
+        let at = _analyze_expr(ctx, scope, node["arg"]);
+        if op == "-" or op == "+" {
+            if at["base"] != "any" and not _is_numeric_type(at) {
+                _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                    "Unary operator '" + op + "' requires numeric operand, got '" + _type_to_str(at) + "'",
+                    "Ο μοναδιαίος τελεστής '" + op + "' απαιτεί αριθμητικό τελεστέο, δόθηκε '" + _type_to_str(at) + "'",
+                    node["line"], node["col"], node["col"] + 1, nil);
+                return _make_type("num");
+            }
+            if op == "-" and at["const_val"] != nil {
+                let nt = _sc_clone_map(at);
+                nt["const_val"] = 0 - at["const_val"];
+                return nt;
+            }
+            return at;
+        }
+        if op == "not" or op == "!" {
+            return _make_type("bool");
+        }
+        return at;
+    }
+
+    if k == "binary" {
+        let op = node["op"];
+        let lt = _analyze_expr(ctx, scope, node["left"]);
+        let rt = _analyze_expr(ctx, scope, node["right"]);
+        let lb = lt["base"];
+        let rb = rt["base"];
+
+        if op == "and" or op == "or" {
+            return _make_type("bool");
+        }
+        if op == "??" {
+            return if lb != "nil" { lt } else { rt };
+        }
+        if op == "|>" {
+            return _make_type("any");
+        }
+
+        // Relational & equality operators
+        if op == "<" or op == "<=" or op == ">" or op == ">=" or op == "==" or op == "!=" {
+            if op != "==" and op != "!=" {
+                if lb != "any" and rb != "any" and not (_is_numeric_type(lt) and _is_numeric_type(rt)) and not (lb == "string" and rb == "string") {
+                    _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                        "Cannot compare '" + _type_to_str(lt) + "' and '" + _type_to_str(rt) + "' with '" + op + "'",
+                        "Αδύνατη η σύγκριση '" + _type_to_str(lt) + "' με '" + _type_to_str(rt) + "'",
+                        node["line"], node["col"], node["col"] + len(op), nil);
+                }
+            }
+            if _is_numeric_type(lt) and _is_numeric_type(rt) and (lt["has_unit"] or rt["has_unit"]) {
+                _check_unit_match_pair(ctx, lt, rt, op, node["line"], node["col"]);
+            }
+            return _make_type("bool");
+        }
+
+        // Addition `+`
+        if op == "+" {
+            if lb == "string" or rb == "string" {
+                if ctx["strict"] and lb != rb and lb != "any" and rb != "any" {
+                    _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                        "Strict mode: implicit string concatenation '" + _type_to_str(lt) + " + " + _type_to_str(rt) + "' — wrap non-string in str(...)",
+                        "Αυστηρή λειτουργία: έμμεση συνένωση συμβολοσειράς — χρησιμοποιήστε str(...)",
+                        node["line"], node["col"], node["col"] + 1, "str");
+                }
+                return _make_type("string");
+            }
+            if lb == "any" or rb == "any" { return _make_type("any"); }
+            if not _is_numeric_type(lt) or not _is_numeric_type(rt) {
+                _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                    "Invalid operand types for '+': '" + _type_to_str(lt) + "' and '" + _type_to_str(rt) + "'",
+                    "Μη έγκυροι τύποι τελεστέων για '+': '" + _type_to_str(lt) + "' και '" + _type_to_str(rt) + "'",
+                    node["line"], node["col"], node["col"] + 1, nil);
+                return _make_type("num");
+            }
+            let res_u = _check_unit_match_pair(ctx, lt, rt, "+", node["line"], node["col"]);
+            let res_b = if lb == "int" and rb == "int" { "int" } else { "num" };
+            if res_u["has_unit"] {
+                return _make_unit_type(res_b, res_u["dim"], res_u["ccy"], res_u["unit_str"]);
+            }
+            return _make_type(res_b);
+        }
+
+        // Subtraction `-`
+        if op == "-" {
+            if lb == "any" or rb == "any" { return _make_type("num"); }
+            if not _is_numeric_type(lt) or not _is_numeric_type(rt) {
+                _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                    "Invalid operand types for '-': '" + _type_to_str(lt) + "' and '" + _type_to_str(rt) + "'",
+                    "Μη έγκυροι τύποι τελεστέων για '-': '" + _type_to_str(lt) + "' και '" + _type_to_str(rt) + "'",
+                    node["line"], node["col"], node["col"] + 1, nil);
+                return _make_type("num");
+            }
+            let res_u2 = _check_unit_match_pair(ctx, lt, rt, "-", node["line"], node["col"]);
+            let res_b2 = if lb == "int" and rb == "int" { "int" } else { "num" };
+            if res_u2["has_unit"] {
+                return _make_unit_type(res_b2, res_u2["dim"], res_u2["ccy"], res_u2["unit_str"]);
+            }
+            return _make_type(res_b2);
+        }
+
+        // Multiplication `*` & Division `/` & Modulo `%`
+        if op == "*" or op == "/" or op == "%" {
+            if lb != "any" and not _is_numeric_type(lt) {
+                _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                    "Invalid left operand for '" + op + "': expected numeric type, got '" + _type_to_str(lt) + "'",
+                    "Μη έγκυρος αριστερός τελεστέος για '" + op + "': δόθηκε '" + _type_to_str(lt) + "'",
+                    node["line"], node["col"], node["col"] + 1, nil);
+                return _make_type("num");
+            }
+            if rb != "any" and not _is_numeric_type(rt) {
+                _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                    "Invalid right operand for '" + op + "': expected numeric type, got '" + _type_to_str(rt) + "'",
+                    "Μη έγκυρος δεξιός τελεστέος για '" + op + "': δόθηκε '" + _type_to_str(rt) + "'",
+                    node["line"], node["col"], node["col"] + 1, nil);
+                return _make_type("num");
+            }
+            if op == "/" and rt["is_zero_lit"] == true {
+                _emit_diag(ctx, "error", "DIVISION_BY_ZERO_REFUTED",
+                    "Compile-time division by literal zero",
+                    "Διαίρεση με το μηδέν κατά τη μεταγλώττιση",
+                    node["line"], node["col"], node["col"] + 1, nil);
+            }
+            let res_b3 = if op != "/" and lb == "int" and rb == "int" { "int" } else { "num" };
+            if lt["has_unit"] or rt["has_unit"] {
+                if op == "*" {
+                    let dm = UCC.dim_mul(lt["dim"], rt["dim"]);
+                    let cm = _ccy_mul(lt["ccy"], rt["ccy"]);
+                    return _make_unit_type(res_b3, dm, cm, "");
+                }
+                if op == "/" {
+                    let dd = UCC.dim_div(lt["dim"], rt["dim"]);
+                    let cd = _ccy_div(lt["ccy"], rt["ccy"]);
+                    return _make_unit_type("num", dd, cd, "");
+                }
+                if op == "%" {
+                    return lt;
+                }
+            }
+            if lb == "any" or rb == "any" { return _make_type("num"); }
+            return _make_type(res_b3);
+        }
+
+        // Power `**` or `^`
+        if op == "**" or op == "^" {
+            if (lb != "any" and not _is_numeric_type(lt)) or (rb != "any" and not _is_numeric_type(rt)) {
+                _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                    "Invalid operand types for '" + op + "': '" + _type_to_str(lt) + "' and '" + _type_to_str(rt) + "'",
+                    "Μη έγκυροι τύποι τελεστέων για '" + op + "'",
+                    node["line"], node["col"], node["col"] + len(op), nil);
+                return _make_type("num");
+            }
+            if rt["has_unit"] {
+                _emit_diag(ctx, "error", "TRANSCENDENTAL_NON_DIMENSIONLESS",
+                    "TRANSCENDENTAL_NON_DIMENSIONLESS: exponent in '" + op + "' must be dimensionless [1], got " + _type_to_str(rt),
+                    "Ο εκθέτης στον τελεστή '" + op + "' πρέπει να είναι αδιάστατος [1]",
+                    node["line"], node["col"], node["col"] + len(op), nil);
+                return _make_type("num");
+            }
+            if lt["has_unit"] {
+                let rexp = _eval_const_rational_exp(node["right"]);
+                if rexp == nil {
+                    _emit_diag(ctx, "error", "DIMENSIONAL_MISMATCH",
+                        "Dimensional quantity " + _type_to_str(lt) + " can only be raised to a compile-time rational constant exponent",
+                        "Διαστατικό μέγεθος " + _type_to_str(lt) + " απαιτεί σταθερό ρητό εκθέτη κατά τη μεταγλώττιση",
+                        node["line"], node["col"], node["col"] + len(op), nil);
+                    return _make_type("num");
+                }
+                let dp = UCC.dim_pow(lt["dim"], rexp[0], rexp[1]);
+                let cp = _ccy_pow(lt["ccy"], rexp[0], rexp[1]);
+                return _make_unit_type("num", dp, cp, "");
+            }
+            let res_b4 = if lb == "int" and rb == "int" and op == "^" { "int" } else { "num" };
+            return _make_type(res_b4);
+        }
+
+        return _make_type("num");
+    }
+
+    if k == "fn_expr" {
+        return _analyze_fn_node(ctx, scope, node);
+    }
+
+    if k == "if_expr" {
+        _analyze_expr(ctx, scope, node["cond"]);
+        let tt = _analyze_expr(ctx, scope, node["then_expr"]);
+        let et = _analyze_expr(ctx, scope, node["else_expr"]);
+        if _is_numeric_type(tt) and _is_numeric_type(et) and (tt["has_unit"] or et["has_unit"]) {
+            return _check_unit_match_pair(ctx, tt, et, "if/else", node["line"], node["col"]);
+        }
+        return tt;
+    }
+
+    if k == "if_stmt" {
+        return _analyze_if_stmt(ctx, scope, node, nil)["expr_type"];
+    }
+
+    if k == "match_stmt" {
+        return _analyze_match(ctx, scope, node, nil)["expr_type"];
+    }
+
+    if k == "try_expr" {
+        let tt2 = _analyze_expr(ctx, scope, node["expr"]);
+        if node["fallback"] != nil { _analyze_expr(ctx, scope, node["fallback"]); }
+        return tt2;
+    }
+
+    if k == "try_block_expr" {
+        let tr_t = _analyze_block(ctx, scope, node["try_block"], nil);
+        if node["catch_block"] != nil {
+            let cscope = _new_scope(scope);
+            if node["catch_var"] != "" {
+                cscope["vars"][node["catch_var"]] = map{ name: node["catch_var"], kind: "var", is_const: false, type: _make_type("string"), line: node["line"], col: node["col"], doc: "" };
+            }
+            _analyze_block(ctx, cscope, node["catch_block"], nil);
+        }
+        return tr_t;
+    }
+
+    if k == "try_prop" {
+        return _analyze_expr(ctx, scope, node["arg"]);
+    }
+
+    return _make_type("any");
+}
+
+fn _analyze_if_stmt(ctx, scope, node, expected_ret) {
+    _analyze_expr(ctx, scope, node["cond"]);
+    let tb_info = _analyze_block_full(ctx, scope, node["then_block"], expected_ret);
+    let eb_term = false;
+    let eb_type = _make_type("nil");
+    if node["else_block"] != nil {
+        if node["else_block"]["kind"] == "block" {
+            let eb_info = _analyze_block_full(ctx, scope, node["else_block"], expected_ret);
+            eb_term = eb_info["terminates"];
+            eb_type = eb_info["expr_type"];
+        } else {
+            let sub_if = _analyze_if_stmt(ctx, scope, node["else_block"], expected_ret);
+            eb_term = sub_if["terminates"];
+            eb_type = sub_if["expr_type"];
+        }
+    }
+    return map{
+        terminates: tb_info["terminates"] and eb_term,
+        expr_type: tb_info["expr_type"]
+    };
+}
+
+fn _analyze_match(ctx, scope, node, expected_ret) {
+    let target_t = _analyze_expr(ctx, scope, node["target"]);
+    let has_wildcard = false;
+    let covered_variants = [];
+    let inferred_enum = if target_t["base"] == "enum" { target_t["type_name"] } else { "" };
+
+    let all_term = len(node["arms"]) > 0;
+    let first_arm_t = _make_type("any");
+
+    let i = 0;
+    while i < len(node["arms"]) {
+        let arm = node["arms"][i];
+        let ascope = _new_scope(scope);
+        let pi = 0;
+        while pi < len(arm["patterns"]) {
+            let pat = arm["patterns"][pi];
+            let pk = pat["kind"];
+            if pk == "wildcard" {
+                if arm["guard"] == nil { has_wildcard = true; }
+            } elif pk == "enum_pat" {
+                if inferred_enum == "" and map_has(ctx["enums"], pat["enum_name"]) {
+                    inferred_enum = pat["enum_name"];
+                }
+                if arm["guard"] == nil {
+                    _sc_arr_push_unique(covered_variants, pat["variant"]);
+                }
+                let bi = 0;
+                while bi < len(pat["bindings"]) {
+                    let bnm = pat["bindings"][bi];
+                    ascope["vars"][bnm] = map{ name: bnm, kind: "var", is_const: false, type: _make_type("any"), line: pat["line"], col: pat["col"], doc: "" };
+                    bi = bi + 1;
+                }
+            } elif pk == "ctor_pat" {
+                let bi2 = 0;
+                while bi2 < len(pat["bindings"]) {
+                    let bnm2 = pat["bindings"][bi2];
+                    ascope["vars"][bnm2] = map{ name: bnm2, kind: "var", is_const: false, type: _make_type("any"), line: pat["line"], col: pat["col"], doc: "" };
+                    bi2 = bi2 + 1;
+                }
+            } elif pk == "ident_pat" {
+                let nm = pat["name"];
+                if inferred_enum != "" and map_has(ctx["enums"], inferred_enum) and _sc_arr_contains(ctx["enums"][inferred_enum], nm) {
+                    if arm["guard"] == nil { _sc_arr_push_unique(covered_variants, nm); }
+                } else {
+                    if arm["guard"] == nil { has_wildcard = true; }
+                    ascope["vars"][nm] = map{ name: nm, kind: "var", is_const: false, type: target_t, line: pat["line"], col: pat["col"], doc: "" };
+                }
+            } elif pk == "lit_pat" {
+                _analyze_expr(ctx, ascope, pat["expr"]);
+            }
+            pi = pi + 1;
+        }
+        if arm["guard"] != nil {
+            _analyze_expr(ctx, ascope, arm["guard"]);
+        }
+        let arm_t = nil;
+        let arm_term = false;
+        if arm["body"]["kind"] == "block" {
+            let b_inf = _analyze_block_full(ctx, ascope, arm["body"], expected_ret);
+            arm_t = b_inf["expr_type"];
+            arm_term = b_inf["terminates"];
+        } else {
+            arm_t = _analyze_expr(ctx, ascope, arm["body"]);
+        }
+        if i == 0 and arm_t != nil { first_arm_t = arm_t; }
+        if not arm_term { all_term = false; }
+        i = i + 1;
+    }
+
+    // Pass 1: Non-exhaustive enum match check!
+    if inferred_enum != "" and map_has(ctx["enums"], inferred_enum) and not has_wildcard {
+        let all_vars = ctx["enums"][inferred_enum];
+        let missing = [];
+        let vi = 0;
+        while vi < len(all_vars) {
+            if not _sc_arr_contains(covered_variants, all_vars[vi]) {
+                push(missing, all_vars[vi]);
+            }
+            vi = vi + 1;
+        }
+        if len(missing) > 0 {
+            _emit_diag(ctx, "error", "NON_EXHAUSTIVE_MATCH",
+                "Non-exhaustive match on enum '" + inferred_enum + "': missing variant(s) " + str_join(missing, ", ") + " (or '_' / 'else' arm)",
+                "Μη εξαντλητικό match στο enum '" + inferred_enum + "': λείπουν οι παραλλαγές " + str_join(missing, ", "),
+                node["line"], node["col"], node["col"] + 5, "_");
+        }
+    }
+
+    return map{ terminates: all_term and has_wildcard, expr_type: first_arm_t };
+}
+
+fn _predeclare_block_hoisted(ctx, scope, stmts, is_top) {
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        let sk = s["kind"];
+        if sk == "enum_decl" {
+            ctx["enums"][s["name"]] = s["variants"];
+            let et = _make_type("enum");
+            et["type_name"] = s["name"];
+            let entry = map{
+                name: s["name"], kind: "enum", is_const: true, type: et,
+                variants: s["variants"], line: s["line"], col: s["col"], end_line: s["end_line"], doc: s["doc"]
+            };
+            scope["vars"][s["name"]] = entry;
+            if is_top { push(ctx["symbols"], entry); ctx["symbol_map"][s["name"]] = entry; }
+        } elif sk == "struct_decl" {
+            ctx["structs"][s["name"]] = s["fields"];
+            let st_t = _make_type("struct");
+            st_t["type_name"] = s["name"];
+            let entry2 = map{
+                name: s["name"], kind: "struct", is_const: true, type: st_t,
+                line: s["line"], col: s["col"], end_line: s["end_line"], doc: s["doc"]
+            };
+            scope["vars"][s["name"]] = entry2;
+            if is_top { push(ctx["symbols"], entry2); ctx["symbol_map"][s["name"]] = entry2; }
+        } elif sk == "class_decl" {
+            ctx["classes"][s["name"]] = s["members"];
+            let cl_t = _make_type("class");
+            cl_t["type_name"] = s["name"];
+            let entry3 = map{
+                name: s["name"], kind: "class", is_const: true, type: cl_t,
+                line: s["line"], col: s["col"], end_line: s["end_line"], doc: s["doc"]
+            };
+            scope["vars"][s["name"]] = entry3;
+            if is_top { push(ctx["symbols"], entry3); ctx["symbol_map"][s["name"]] = entry3; }
+        }
+        i = i + 1;
+    }
+
+    // Second pass in same block: predeclare `fn` signatures (after enums/structs are registered!)
+    i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        if s["kind"] == "fn_decl" {
+            let ptypes = [];
+            let req_cnt = 0;
+            let pi = 0;
+            while pi < len(s["params"]) {
+                let p = s["params"][pi];
+                push(ptypes, _resolve_annot_to_type(ctx, p["annot"]));
+                if p["default_expr"] == nil and not p["is_rest"] {
+                    req_cnt = req_cnt + 1;
+                }
+                pi = pi + 1;
+            }
+            let rt = if s["ret_annot"] != nil { _resolve_annot_to_type(ctx, s["ret_annot"]) } else { _make_type("any") };
+            let ft = _make_type("fn");
+            ft["params"] = ptypes;
+            ft["ret_type"] = rt;
+            ft["min_args"] = req_cnt;
+            ft["max_args"] = if s["has_rest"] { -1 } else { len(s["params"]) };
+            ft["has_rest"] = s["has_rest"];
+
+            let fentry = map{
+                name: s["name"],
+                kind: "fn",
+                is_const: true,
+                type: ft,
+                params: s["params"],
+                min_args: req_cnt,
+                max_args: ft["max_args"],
+                has_rest: s["has_rest"],
+                line: s["line"],
+                col: s["col"],
+                end_col: s["end_col"],
+                end_line: s["end_line"],
+                doc: s["doc"],
+                contract_status: "NONE",
+                contract_proofs: []
+            };
+            scope["vars"][s["name"]] = fentry;
+            if is_top {
+                push(ctx["symbols"], fentry);
+                ctx["symbol_map"][s["name"]] = fentry;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn _verify_fn_contracts_and_divisions(ctx, fn_node, fentry, ptypes, ret_t) {
+    let has_contracts = len(fn_node["requires_list"]) > 0 or len(fn_node["ensures_list"]) > 0;
+    // Also check division-by-zero inside numeric-annotated functions!
+    let all_params_annotated_num = len(ptypes) > 0;
+    let all_int = len(ptypes) > 0 and (ret_t["base"] == "int" or ret_t["base"] == "any");
+    let param_names = [];
+    let pi = 0;
+    while pi < len(fn_node["params"]) {
+        let p = fn_node["params"][pi];
+        push(param_names, p["name"]);
+        if not _is_numeric_type(ptypes[pi]) {
+            all_params_annotated_num = false;
+            all_int = false;
+        } elif ptypes[pi]["base"] != "int" {
+            all_int = false;
+        }
+        pi = pi + 1;
+    }
+    if not has_contracts and not all_params_annotated_num {
+        return;
+    }
+
+    // Build combined precondition FOL string
+    let pre_parts = [];
+    let ri = 0;
+    while ri < len(fn_node["requires_list"]) {
+        push(pre_parts, _ast_expr_to_fol(fn_node["requires_list"][ri]["expr"], nil, all_int));
+        ri = ri + 1;
+    }
+    let pre_fol = if len(pre_parts) == 0 { "true" } else { "(" + str_join(pre_parts, " and ") + ")" };
+
+    // Extract symbolic return paths & division denominators from body
+    let body_stmts = [];
+    let bi = 0;
+    while bi < len(fn_node["body"]["stmts"]) {
+        push(body_stmts, fn_node["body"]["stmts"][bi]);
+        bi = bi + 1;
+    }
+    if fn_node["body"]["tail_expr"] != nil {
+        push(body_stmts, map{ kind: "return_stmt", val: fn_node["body"]["tail_expr"], line: fn_node["line"], col: fn_node["col"] });
+    }
+
+    let ret_paths = [];
+    let divs = [];
+    _extract_symbolic_paths(body_stmts, 0, map{}, [], all_int, ret_paths, divs);
+
+    let q_prefix = if len(param_names) > 0 { "forall " + str_join(param_names, ", ") + ": " } else { "" };
+    let proofs_for_fn = [];
+    let any_refuted = false;
+    let any_proved = false;
+
+    // 1. Verify division-by-zero safety obligations (`pre -> den != 0`)
+    let di = 0;
+    while di < len(divs) {
+        let dv = divs[di];
+        let div_formula = q_prefix + "(" + pre_fol + " -> ((" + dv["den_fol"] + ") != 0))";
+        let prf_d = prove_formula_auto(div_formula, all_int);
+        prf_d["fn_name"] = fn_node["name"];
+        prf_d["kind"] = "division_safety";
+        prf_d["line"] = dv["line"];
+        prf_d["col"] = dv["col"];
+        push(ctx["contracts"], prf_d);
+        push(proofs_for_fn, prf_d);
+
+        if prf_d["status"] == "REFUTED_COUNTEREXAMPLE" {
+            any_refuted = true;
+            let wsum = prf_d["witness_summary"];
+            _emit_diag(ctx, "error", "DIVISION_BY_ZERO_REFUTED",
+                "Compile-time division-by-zero safety refuted by " + prf_d["engine"] + " in '" + fn_node["name"] + "': denominator (" + dv["den_fol"] + ") can be 0"
+                    + (if wsum != "" { " [counterexample: " + wsum + "]" } else { "" }),
+                "Η ασφάλεια διαίρεσης με το μηδέν διαψεύστηκε από το " + prf_d["engine"] + " στη '" + fn_node["name"] + "'"
+                    + (if wsum != "" { " [αντιπαράδειγμα: " + wsum + "]" } else { "" }),
+                dv["line"], dv["col"], dv["col"] + 1, nil);
+        } elif prf_d["status"] == "PROVED_MATHEMATICALLY" {
+            any_proved = true;
+        }
+        di = di + 1;
+    }
+
+    // 2. Verify `ensures <post>` obligations across all extracted return paths
+    if len(fn_node["ensures_list"]) > 0 and len(ret_paths) > 0 {
+        let ei = 0;
+        while ei < len(fn_node["ensures_list"]) {
+            let ens = fn_node["ensures_list"][ei];
+            let path_obligations = [];
+            let extra_res_vars = [];
+            let rpi = 0;
+            while rpi < len(ret_paths) {
+                let rp = ret_paths[rpi];
+                let hyp = pre_fol;
+                if len(rp["conds"]) > 0 {
+                    hyp = "(" + pre_fol + " and " + str_join(rp["conds"], " and ") + ")";
+                }
+
+                // Check if return expression is a variable-denominator quotient `A / B`
+                if rp["ret_node"]["kind"] == "binary" and rp["ret_node"]["op"] == "/" and rp["ret_node"]["right"]["kind"] != "num" {
+                    let res_var = "__res_" + str(rpi);
+                    push(extra_res_vars, res_var);
+                    let num_f = _ast_expr_to_fol(rp["ret_node"]["left"], rp["subst"], false);
+                    let den_f = _ast_expr_to_fol(rp["ret_node"]["right"], rp["subst"], false);
+                    let sm = map{ "result": res_var };
+                    let post_f = _ast_expr_to_fol(ens["expr"], sm, false);
+                    push(path_obligations, "((" + hyp + " and ((" + den_f + ") != 0) and ((" + res_var + " * (" + den_f + ")) == (" + num_f + "))) -> (" + post_f + "))");
+                } else {
+                    let sm2 = map{ "result": rp["ret_fol"] };
+                    let post_f2 = _ast_expr_to_fol(ens["expr"], sm2, all_int);
+                    push(path_obligations, "(" + hyp + " -> (" + post_f2 + "))");
+                }
+                rpi = rpi + 1;
+            }
+
+            let all_qvars = [];
+            let qi = 0;
+            while qi < len(param_names) { push(all_qvars, param_names[qi]); qi = qi + 1; }
+            qi = 0;
+            while qi < len(extra_res_vars) { push(all_qvars, extra_res_vars[qi]); qi = qi + 1; }
+            let full_q = if len(all_qvars) > 0 { "forall " + str_join(all_qvars, ", ") + ": " } else { "" };
+            let full_formula = full_q + "(" + str_join(path_obligations, " and ") + ")";
+
+            let use_pres = all_int and len(extra_res_vars) == 0;
+            let prf = prove_formula_auto(full_formula, use_pres);
+            prf["fn_name"] = fn_node["name"];
+            prf["kind"] = "ensures";
+            prf["line"] = ens["line"];
+            prf["col"] = ens["col"];
+            push(ctx["contracts"], prf);
+            push(proofs_for_fn, prf);
+
+            if prf["status"] == "REFUTED_COUNTEREXAMPLE" {
+                any_refuted = true;
+                let wsum2 = prf["witness_summary"];
+                _emit_diag(ctx, "error", "CONTRACT_REFUTED",
+                    "Contract 'ensures' in '" + fn_node["name"] + "' REFUTED mathematically by " + prf["engine"]
+                        + (if wsum2 != "" { " — counterexample: " + wsum2 } else { "" }),
+                    "Το συμβόλαιο 'ensures' στη '" + fn_node["name"] + "' διαψεύστηκε μαθηματικά από το " + prf["engine"]
+                        + (if wsum2 != "" { " — αντιπαράδειγμα: " + wsum2 } else { "" }),
+                    ens["line"], ens["col"], ens["col"] + 7, nil);
+            } elif prf["status"] == "PROVED_MATHEMATICALLY" {
+                any_proved = true;
+            }
+            ei = ei + 1;
+        }
+    }
+
+    if fentry != nil {
+        fentry["contract_proofs"] = proofs_for_fn;
+        if any_refuted {
+            fentry["contract_status"] = "REFUTED_COUNTEREXAMPLE";
+        } elif any_proved {
+            fentry["contract_status"] = "PROVED_MATHEMATICALLY";
+        }
+    }
+}
+
+fn _analyze_fn_node(ctx, parent_scope, fn_node) {
+    let fscope = _new_scope(parent_scope);
+    let fmut = map{};
+    if fn_node["body"] != nil and fn_node["body"]["kind"] == "block" {
+        _collect_mutated_idents_stmts(fn_node["body"]["stmts"], fmut);
+    }
+    fscope["mutated_vars"] = fmut;
+    let ptypes = [];
+    let req_cnt = 0;
+    let pi = 0;
+    while pi < len(fn_node["params"]) {
+        let p = fn_node["params"][pi];
+        let pt = _resolve_annot_to_type(ctx, p["annot"]);
+        if p["default_expr"] != nil {
+            let dt = _analyze_expr(ctx, fscope, p["default_expr"]);
+            if p["annot"] == nil { pt = dt; }
+        } else {
+            if not p["is_rest"] { req_cnt = req_cnt + 1; }
+        }
+        if p["is_rest"] { pt = _make_type("array"); }
+        push(ptypes, pt);
+        let p_sym = map{
+            name: p["name"], kind: "param", is_const: false, type: pt,
+            line: p["line"], col: p["col"], end_col: p["end_col"], doc: ""
+        };
+        fscope["vars"][p["name"]] = p_sym;
+        _record_hover_span(ctx, p["name"], p["line"], p["col"], p["end_col"], p_sym);
+        if pt["has_unit"] {
+            ctx["units_inferred"][fn_node["name"] + "." + p["name"]] = map{
+                type_str: _type_to_str(pt),
+                unit_str: _canonical_unit_label(pt["dim"], pt["ccy"]),
+                dim: pt["dim"],
+                dim_ascii: UCC.dim_to_ascii(pt["dim"]),
+                dim_unicode: _dim_unicode_rich(pt["dim"], pt["ccy"]),
+                canonical_si_unit: UCC.dim_canonical_si_unit(pt["dim"]),
+                named_quantity: UCC.dim_named_quantity(pt["dim"]),
+                currency_map: pt["ccy"]
+            };
+        }
+        pi = pi + 1;
+    }
+
+    let ret_t = if fn_node["ret_annot"] != nil { _resolve_annot_to_type(ctx, fn_node["ret_annot"]) } else { _make_type("any") };
+
+    // Analyze `requires` and `ensures` expressions for symbol/type/unit validity!
+    let ri = 0;
+    while ri < len(fn_node["requires_list"]) {
+        let req_t = _analyze_expr(ctx, fscope, fn_node["requires_list"][ri]["expr"]);
+        if req_t["base"] != "bool" and req_t["base"] != "any" {
+            _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                "'requires' clause must evaluate to bool, got " + _type_to_str(req_t),
+                "Η συνθήκη 'requires' πρέπει να αποτιμάται σε bool",
+                fn_node["requires_list"][ri]["line"], fn_node["requires_list"][ri]["col"], fn_node["requires_list"][ri]["col"] + 8, nil);
+        }
+        ri = ri + 1;
+    }
+
+    if len(fn_node["ensures_list"]) > 0 {
+        let ens_scope = _new_scope(fscope);
+        ens_scope["vars"]["result"] = map{ name: "result", kind: "var", is_const: true, type: ret_t, line: fn_node["line"], col: fn_node["col"], doc: "Function return value" };
+        let ei = 0;
+        while ei < len(fn_node["ensures_list"]) {
+            let ens_t = _analyze_expr(ctx, ens_scope, fn_node["ensures_list"][ei]["expr"]);
+            if ens_t["base"] != "bool" and ens_t["base"] != "any" {
+                _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                    "'ensures' clause must evaluate to bool, got " + _type_to_str(ens_t),
+                    "Η συνθήκη 'ensures' πρέπει να αποτιμάται σε bool",
+                    fn_node["ensures_list"][ei]["line"], fn_node["ensures_list"][ei]["col"], fn_node["ensures_list"][ei]["col"] + 7, nil);
+            }
+            ei = ei + 1;
+        }
+    }
+
+    // Analyze function body with expected return type `ret_t`
+    _analyze_block_full(ctx, fscope, fn_node["body"], ret_t);
+
+    let fentry = if fn_node["name"] != "" { _scope_lookup(parent_scope, fn_node["name"]) } else { nil };
+    if fentry != nil {
+        _record_hover_span(ctx, fn_node["name"], fn_node["line"], fn_node["col"], fn_node["end_col"], fentry);
+    }
+
+    // Pass 4: Tarski CAD & Cooper Presburger Proof-Carrying Contract Verification!
+    if fn_node["name"] != "" {
+        _verify_fn_contracts_and_divisions(ctx, fn_node, fentry, ptypes, ret_t);
+        if ret_t["has_unit"] {
+            ctx["units_inferred"][fn_node["name"]] = map{
+                type_str: _type_to_str(ret_t),
+                unit_str: _canonical_unit_label(ret_t["dim"], ret_t["ccy"]),
+                dim: ret_t["dim"],
+                dim_ascii: UCC.dim_to_ascii(ret_t["dim"]),
+                dim_unicode: _dim_unicode_rich(ret_t["dim"], ret_t["ccy"]),
+                canonical_si_unit: UCC.dim_canonical_si_unit(ret_t["dim"]),
+                named_quantity: UCC.dim_named_quantity(ret_t["dim"]),
+                currency_map: ret_t["ccy"]
+            };
+        }
+    }
+
+    let ft = _make_type("fn");
+    ft["params"] = ptypes;
+    ft["ret_type"] = ret_t;
+    ft["min_args"] = req_cnt;
+    ft["max_args"] = if fn_node["has_rest"] { -1 } else { len(fn_node["params"]) };
+    ft["has_rest"] = fn_node["has_rest"];
+    return ft;
+}
+
+fn _check_return_value(ctx, val_t, expected_ret, line, col) {
+    if expected_ret == nil or expected_ret["base"] == "any" { return; }
+    if not _types_compatible_assign(expected_ret, val_t, ctx["strict"]) {
+        _emit_diag(ctx, "error", "RETURN_TYPE_MISMATCH",
+            "Return type mismatch: function returns '" + _type_to_str(expected_ret) + "', but got '" + _type_to_str(val_t) + "'",
+            "Ασυμφωνία τύπου επιστροφής: αναμενόταν '" + _type_to_str(expected_ret) + "', αλλά επιστράφηκε '" + _type_to_str(val_t) + "'",
+            line, col, col + 6, nil);
+        return;
+    }
+    if _is_numeric_type(expected_ret) and _is_numeric_type(val_t) and (expected_ret["has_unit"] or val_t["has_unit"]) {
+        if not (val_t["is_zero_lit"] == true and expected_ret["has_unit"]) {
+            _check_unit_match_pair(ctx, expected_ret, val_t, "return", line, col);
+        }
+    }
+}
+
+fn _is_pure_scalar_literal(node) {
+    if node == nil { return false; }
+    let k = node["kind"];
+    if k == "num" { return true; }
+    if k == "unary" and (node["op"] == "-" or node["op"] == "+") {
+        return _is_pure_scalar_literal(node["arg"]);
+    }
+    if k == "binary" and (node["op"] == "+" or node["op"] == "-" or node["op"] == "*" or node["op"] == "/" or node["op"] == "**" or node["op"] == "^") {
+        return _is_pure_scalar_literal(node["left"]) and _is_pure_scalar_literal(node["right"]);
+    }
+    return false;
+}
+
+fn _analyze_block_stmts(ctx, bscope, stmts, expected_ret) {
+    let terminated = false;
+    let warned_unreachable = false;
+
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        let sk = s["kind"];
+
+        // Pass 1: Unreachable code detection after return/throw/break/continue!
+        if terminated and not warned_unreachable and sk != "empty" and sk != "fn_decl" and sk != "enum_decl" and sk != "struct_decl" and sk != "class_decl" {
+            warned_unreachable = true;
+            _emit_diag(ctx, "error", "UNREACHABLE_CODE",
+                "Unreachable statement after control-flow transfer (return/throw/break/continue)",
+                "Μη προσβάσιμη εντολή μετά από τερματισμό ροής (return/throw/break/continue)",
+                s["line"], s["col"], s["col"] + 6, nil);
+        }
+
+        if sk == "var_decl" {
+            let init_t = if s["init"] != nil { _analyze_expr(ctx, bscope, s["init"]) } else { _make_type("nil") };
+            let decl_t = init_t;
+            if s["annot"] != nil {
+                let ann_t = _resolve_annot_to_type(ctx, s["annot"]);
+                if s["init"] != nil {
+                    if not _types_compatible_assign(ann_t, init_t, ctx["strict"]) {
+                        _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                            "Cannot initialize '" + s["name"] + ": " + _type_to_str(ann_t) + "' with value of type '" + _type_to_str(init_t) + "'",
+                            "Ασυμφωνία τύπου κατά την αρχικοποίηση του '" + s["name"] + "'",
+                            s["line"], s["col"], s["end_col"], nil);
+                    } elif _is_numeric_type(ann_t) and _is_numeric_type(init_t) and (ann_t["has_unit"] or init_t["has_unit"]) {
+                        let is_unit_ctor = ann_t["has_unit"] and (not init_t["has_unit"]) and _is_pure_scalar_literal(s["init"]);
+                        if not is_unit_ctor and not (init_t["is_zero_lit"] == true and ann_t["has_unit"]) {
+                            _check_unit_match_pair(ctx, ann_t, init_t, "=", s["line"], s["col"]);
+                        }
+                    }
+                }
+                decl_t = ann_t;
+                if init_t != nil and map_has(init_t, "is_quantum_circuit") and init_t["is_quantum_circuit"] == true {
+                    decl_t = _sc_clone_map(decl_t);
+                    decl_t["is_quantum_circuit"] = true;
+                    decl_t["quantum_n_qubits"] = init_t["quantum_n_qubits"];
+                }
+            }
+            if s["annot"] == nil and (not s["is_const"]) and (not ctx["strict"]) and decl_t["base"] == "nil" {
+                decl_t = _make_type("any");
+            }
+            // Strip zero-literal polymorphism once stored into a mutable `let` variable (keep for `const 0`!)
+            if not s["is_const"] and decl_t["is_zero_lit"] == true {
+                decl_t = _sc_clone_map(decl_t);
+                decl_t["is_zero_lit"] = false;
+            }
+            let ventry = map{
+                name: s["name"],
+                kind: if s["is_const"] { "const" } else { "var" },
+                is_const: s["is_const"],
+                explicit_annot: (s["annot"] != nil),
+                type: decl_t,
+                line: s["line"],
+                col: s["col"],
+                end_col: s["end_col"],
+                doc: s["doc"]
+            };
+            bscope["vars"][s["name"]] = ventry;
+            if bscope["parent"] == nil {
+                push(ctx["symbols"], ventry);
+                ctx["symbol_map"][s["name"]] = ventry;
+            }
+            _record_hover_span(ctx, s["name"], s["line"], s["col"], s["end_col"], ventry);
+            if decl_t["has_unit"] {
+                ctx["units_inferred"][s["name"]] = map{
+                    type_str: _type_to_str(decl_t),
+                    unit_str: _canonical_unit_label(decl_t["dim"], decl_t["ccy"]),
+                    dim: decl_t["dim"],
+                    dim_ascii: UCC.dim_to_ascii(decl_t["dim"]),
+                    dim_unicode: _dim_unicode_rich(decl_t["dim"], decl_t["ccy"]),
+                    canonical_si_unit: UCC.dim_canonical_si_unit(decl_t["dim"]),
+                    named_quantity: UCC.dim_named_quantity(decl_t["dim"]),
+                    currency_map: decl_t["ccy"]
+                };
+            }
+        } elif sk == "destruct_decl" {
+            if s["init"] != nil { _analyze_expr(ctx, bscope, s["init"]); }
+            let di = 0;
+            while di < len(s["names"]) {
+                let nt = s["names"][di];
+                bscope["vars"][nt["val"]] = map{
+                    name: nt["val"], kind: if s["is_const"] { "const" } else { "var" },
+                    is_const: s["is_const"], explicit_annot: false, type: _make_type("any"), line: nt["line"], col: nt["col"], doc: ""
+                };
+                di = di + 1;
+            }
+        } elif sk == "assign" {
+            let tgt = s["target"];
+            let val_t = _analyze_expr(ctx, bscope, s["val"]);
+            if tgt["kind"] == "ident" {
+                let sym = _scope_lookup(bscope, tgt["name"]);
+                if sym == nil {
+                    let cands = _scope_all_names(bscope, _get_builtin_specs());
+                    let sugg = suggest_symbol(tgt["name"], cands);
+                    let msg_en = if sugg != nil {
+                        "Undefined symbol '" + tgt["name"] + "' — did you mean '" + sugg + "'?"
+                    } else {
+                        "Undefined symbol '" + tgt["name"] + "'"
+                    };
+                    _emit_diag(ctx, "error", "UNDEFINED_SYMBOL", msg_en, "Μη ορισμένο σύμβολο '" + tgt["name"] + "'", tgt["line"], tgt["col"], tgt["end_col"], sugg);
+                } else {
+                    _record_hover_span(ctx, tgt["name"], tgt["line"], tgt["col"], tgt["end_col"], sym);
+                    // Pass 1: Assignment to `const`!
+                    if sym["is_const"] {
+                        _emit_diag(ctx, "error", "CONST_REASSIGNMENT",
+                            "Cannot reassign immutable constant '" + tgt["name"] + "'",
+                            "Αδύνατη η επανεκχώρηση στη σταθερά (const) '" + tgt["name"] + "'",
+                            s["line"], s["col"], tgt["end_col"], nil);
+                    }
+                    let cur_t = sym["type"];
+                    let has_exp = map_has(sym, "explicit_annot") and sym["explicit_annot"] == true;
+                    let enforce_assign_type = has_exp or ctx["strict"] or (cur_t != nil and cur_t["has_unit"]) or (val_t != nil and val_t["has_unit"]);
+                    if cur_t != nil and cur_t["base"] != "any" and cur_t["base"] != "nil" {
+                        if not _types_compatible_assign(cur_t, val_t, ctx["strict"]) {
+                            if enforce_assign_type {
+                                _emit_diag(ctx, "error", "TYPE_MISMATCH",
+                                    "Cannot assign '" + _type_to_str(val_t) + "' to variable '" + tgt["name"] + "' of type '" + _type_to_str(cur_t) + "'",
+                                    "Ασυμφωνία τύπου στην εκχώρηση του '" + tgt["name"] + "'",
+                                    s["line"], s["col"], tgt["end_col"], nil);
+                            } else {
+                                sym["type"] = if _is_numeric_type(cur_t) and _is_numeric_type(val_t) { _make_type("num") } else { _make_type("any") };
+                            }
+                        } elif _is_numeric_type(cur_t) and _is_numeric_type(val_t) and (cur_t["has_unit"] or val_t["has_unit"]) {
+                            if s["op"] == "=" or s["op"] == "+=" or s["op"] == "-=" {
+                                if not (val_t["is_zero_lit"] == true and cur_t["has_unit"]) {
+                                    _check_unit_match_pair(ctx, cur_t, val_t, s["op"], s["line"], s["col"]);
+                                }
+                            }
+                        }
+                        if s["op"] == "=" and val_t != nil and map_has(val_t, "is_quantum_circuit") and val_t["is_quantum_circuit"] == true {
+                            let updated_qt = _sc_clone_map(sym["type"]);
+                            updated_qt["is_quantum_circuit"] = true;
+                            updated_qt["quantum_n_qubits"] = val_t["quantum_n_qubits"];
+                            sym["type"] = updated_qt;
+                        }
+                    } else {
+                        if (not has_exp) and (not ctx["strict"]) and cur_t != nil and cur_t["base"] == "any" and (val_t == nil or not (map_has(val_t, "is_quantum_circuit") and val_t["is_quantum_circuit"] == true)) {
+                            sym["type"] = _make_type("any");
+                        } else {
+                            sym["type"] = val_t;
+                        }
+                    }
+                }
+            } else {
+                _analyze_expr(ctx, bscope, tgt);
+            }
+        } elif sk == "fn_decl" {
+            _analyze_fn_node(ctx, bscope, s);
+        } elif sk == "return_stmt" {
+            let rv_t = if s["val"] != nil { _analyze_expr(ctx, bscope, s["val"]) } else { _make_type("nil") };
+            _check_return_value(ctx, rv_t, expected_ret, s["line"], s["col"]);
+            terminated = true;
+        } elif sk == "throw_stmt" {
+            _analyze_expr(ctx, bscope, s["val"]);
+            terminated = true;
+        } elif sk == "break_stmt" or sk == "continue_stmt" {
+            terminated = true;
+        } elif sk == "print_stmt" {
+            let pi = 0;
+            while pi < len(s["args"]) {
+                _analyze_expr(ctx, bscope, s["args"][pi]);
+                pi = pi + 1;
+            }
+        } elif sk == "if_stmt" {
+            let if_inf = _analyze_if_stmt(ctx, bscope, s, expected_ret);
+            if if_inf["terminates"] { terminated = true; }
+        } elif sk == "while_stmt" {
+            _analyze_expr(ctx, bscope, s["cond"]);
+            _analyze_block_full(ctx, bscope, s["body"], expected_ret);
+        } elif sk == "loop_stmt" {
+            _analyze_block_full(ctx, bscope, s["body"], expected_ret);
+        } elif sk == "for_stmt" {
+            let fscope = _new_scope(bscope);
+            let it_t = _analyze_expr(ctx, bscope, s["iter"]);
+            if s["range_end"] != nil { _analyze_expr(ctx, bscope, s["range_end"]); }
+            let v1_t = if s["range_end"] != nil { _make_type("int") } elif it_t["base"] == "array" and it_t["elem_type"] != nil { it_t["elem_type"] } else { _make_type("any") };
+            fscope["vars"][s["var1"]["val"]] = map{ name: s["var1"]["val"], kind: "var", is_const: false, type: v1_t, line: s["var1"]["line"], col: s["var1"]["col"], doc: "" };
+            if s["var2"] != nil {
+                fscope["vars"][s["var2"]["val"]] = map{ name: s["var2"]["val"], kind: "var", is_const: false, type: _make_type("any"), line: s["var2"]["line"], col: s["var2"]["col"], doc: "" };
+            }
+            _analyze_block_full(ctx, fscope, s["body"], expected_ret);
+        } elif sk == "match_stmt" {
+            let m_inf = _analyze_match(ctx, bscope, s, expected_ret);
+            if m_inf["terminates"] { terminated = true; }
+        } elif sk == "switch_stmt" {
+            _analyze_expr(ctx, bscope, s["target"]);
+            let ci = 0;
+            while ci < len(s["cases"]) {
+                let cs = s["cases"][ci];
+                if cs["val"] != nil { _analyze_expr(ctx, bscope, cs["val"]); }
+                let cscope = _new_scope(bscope);
+                _analyze_block_stmts(ctx, cscope, cs["stmts"], expected_ret);
+                ci = ci + 1;
+            }
+        } elif sk == "try_block_expr" {
+            _analyze_expr(ctx, bscope, s);
+        } elif sk == "defer_stmt" {
+            if s["body"]["kind"] == "block" {
+                _analyze_block_full(ctx, bscope, s["body"], nil);
+            } else {
+                _analyze_block_stmts(ctx, bscope, [s["body"]], nil);
+            }
+        } elif sk == "block" {
+            let sub_inf = _analyze_block_full(ctx, bscope, s, expected_ret);
+            if sub_inf["terminates"] { terminated = true; }
+        } elif sk == "export_stmt" {
+            let ei = 0;
+            while ei < len(s["names"]) {
+                let etok = s["names"][ei];
+                let esym = _scope_lookup(bscope, etok["val"]);
+                if esym == nil {
+                    let sugg = suggest_symbol(etok["val"], _scope_all_names(bscope, _get_builtin_specs()));
+                    _emit_diag(ctx, "error", "UNDEFINED_SYMBOL",
+                        "Cannot export undefined symbol '" + etok["val"] + "'" + (if sugg != nil { " — did you mean '" + sugg + "'?" } else { "" }),
+                        "Αδύνατη η εξαγωγή μη ορισμένου συμβόλου '" + etok["val"] + "'",
+                        etok["line"], etok["col"], etok["end_col"], sugg);
+                } else {
+                    _sc_arr_push_unique(ctx["exports"], etok["val"]);
+                }
+                ei = ei + 1;
+            }
+        } elif sk == "class_decl" {
+            let cscope = _new_scope(bscope);
+            cscope["vars"]["self"] = map{ name: "self", kind: "var", is_const: true, type: _make_type("class"), line: s["line"], col: s["col"], doc: "" };
+            _predeclare_block_hoisted(ctx, cscope, s["members"], false);
+            _analyze_block_stmts(ctx, cscope, s["members"], nil);
+        } elif sk == "expr_stmt" {
+            _analyze_expr(ctx, bscope, s["expr"]);
+        }
+        if map_has(s, "exported") and s["exported"] == true and map_has(s, "name") and s["name"] != "" {
+            _sc_arr_push_unique(ctx["exports"], s["name"]);
+        }
+        i = i + 1;
+    }
+    return terminated;
+}
+
+fn _analyze_block_full(ctx, parent_scope, block_node, expected_ret) {
+    let bscope = _new_scope(parent_scope);
+    _predeclare_block_hoisted(ctx, bscope, block_node["stmts"], false);
+    let term = _analyze_block_stmts(ctx, bscope, block_node["stmts"], expected_ret);
+    let tail_t = _make_type("nil");
+    if block_node["tail_expr"] != nil {
+        tail_t = _analyze_expr(ctx, bscope, block_node["tail_expr"]);
+        if expected_ret != nil {
+            _check_return_value(ctx, tail_t, expected_ret, block_node["tail_expr"]["line"], block_node["tail_expr"]["col"]);
+        }
+    }
+    return map{ terminates: term, expr_type: tail_t };
+}
+
+fn _analyze_block(ctx, parent_scope, block_node, expected_ret) {
+    return _analyze_block_full(ctx, parent_scope, block_node, expected_ret)["expr_type"];
+}
+
+// ── Public Entrypoints: `check_source`, `check_file`, `infer_expr_unit`, `cli_check_entry` ──
+
+fn check_source(src_code, opts = nil) {
+    let o = if opts != nil and type(opts) == "map" { opts } else { map{} };
+    let is_strict = if map_has(o, "strict") { o["strict"] == true } else { false };
+    let file_lbl = if map_has(o, "file") and o["file"] != nil { str(o["file"]) } else { "<memory>" };
+    let base_d = if map_has(o, "base_dir") and o["base_dir"] != nil { str(o["base_dir"]) } else { "" };
+
+    let parsed = parse_sapp_ast(src_code);
+    let ctx = map{
+        strict: is_strict,
+        file: file_lbl,
+        base_dir: base_d,
+        diagnostics: [],
+        symbols: [],
+        symbol_map: map{},
+        hover_spans: [],
+        contracts: [],
+        units_inferred: map{},
+        exports: [],
+        enums: map{},
+        structs: map{},
+        classes: map{},
+        quantum_registers: []
+    };
+
+    let pi = 0;
+    while pi < len(parsed["errors"]) {
+        push(ctx["diagnostics"], parsed["errors"][pi]);
+        pi = pi + 1;
+    }
+
+    let root_scope = _new_scope(nil);
+    // Optional pre-populated environment symbols (used by interactive REPL!)
+    if map_has(o, "predefined_vars") and type(o["predefined_vars"]) == "map" {
+        let pks = map_keys(o["predefined_vars"]);
+        let k = 0;
+        while k < len(pks) {
+            let vnm = pks[k];
+            let vspec = o["predefined_vars"][vnm];
+            let vt = if type(vspec) == "map" and map_has(vspec, "type") { vspec["type"] } else { _make_type("any") };
+            root_scope["vars"][vnm] = map{ name: vnm, kind: "var", is_const: false, type: vt, line: 0, col: 0, doc: "" };
+            k = k + 1;
+        }
+    }
+
+    let prog_stmts = parsed["ast"]["stmts"];
+    let rmut = map{};
+    _collect_mutated_idents_stmts(prog_stmts, rmut);
+    root_scope["mutated_vars"] = rmut;
+    _predeclare_block_hoisted(ctx, root_scope, prog_stmts, true);
+    _analyze_block_stmts(ctx, root_scope, prog_stmts, nil);
+
+    let err_cnt = 0;
+    let warn_cnt = 0;
+    let di = 0;
+    while di < len(ctx["diagnostics"]) {
+        if ctx["diagnostics"][di]["severity"] == "error" { err_cnt = err_cnt + 1; }
+        else { warn_cnt = warn_cnt + 1; }
+        di = di + 1;
+    }
+
+    // Enrich symbol records with stringified types & SI unit summaries
+    let si = 0;
+    let symbols_summary = [];
+    while si < len(ctx["symbols"]) {
+        let sym = ctx["symbols"][si];
+        let stype = sym["type"];
+        push(symbols_summary, map{
+            name: sym["name"],
+            kind: sym["kind"],
+            type_str: _type_to_str(stype),
+            has_unit: stype["has_unit"],
+            unit_str: if stype["has_unit"] { _canonical_unit_label(stype["dim"], stype["ccy"]) } else { "" },
+            dim_unicode: if stype["has_unit"] { _dim_unicode_rich(stype["dim"], stype["ccy"]) } else { "" },
+            canonical_si: if stype["has_unit"] { UCC.dim_canonical_si_unit(stype["dim"]) } else { "" },
+            named_quantity: if stype["has_unit"] { UCC.dim_named_quantity(stype["dim"]) } else { "" },
+            line: sym["line"],
+            col: sym["col"],
+            end_line: if map_has(sym, "end_line") { sym["end_line"] } else { sym["line"] },
+            doc: sym["doc"],
+            contract_status: if map_has(sym, "contract_status") { sym["contract_status"] } else { "NONE" },
+            contract_proofs: if map_has(sym, "contract_proofs") { sym["contract_proofs"] } else { [] }
+        });
+        si = si + 1;
+    }
+
+    return map{
+        ok: err_cnt == 0,
+        version: STATIC_CHECKER_VERSION,
+        file: file_lbl,
+        strict: is_strict,
+        error_count: err_cnt,
+        warning_count: warn_cnt,
+        diagnostics: ctx["diagnostics"],
+        symbols: symbols_summary,
+        hover_spans: ctx["hover_spans"],
+        contracts: ctx["contracts"],
+        units_inferred: ctx["units_inferred"],
+        exports: ctx["exports"],
+        ast: parsed["ast"]
+    };
+}
+
+fn check_file(path, opts = nil) {
+    let o = if opts != nil and type(opts) == "map" { _sc_clone_map(opts) } else { map{} };
+    o["file"] = path;
+    o["base_dir"] = path_dirname(path);
+    let src = try fs_read(path) catch nil;
+    if src == nil {
+        return map{
+            ok: false,
+            version: STATIC_CHECKER_VERSION,
+            file: path,
+            strict: map_has(o, "strict") and o["strict"] == true,
+            error_count: 1,
+            warning_count: 0,
+            diagnostics: [map{
+                severity: "error",
+                code: "FILE_READ_ERROR",
+                message: "Cannot read source file '" + path + "'",
+                message_el: "Αδυναμία ανάγνωσης αρχείου '" + path + "'",
+                line: 1, col: 1, end_line: 1, end_col: 2, suggestion: nil
+            }],
+            symbols: [],
+            hover_spans: [],
+            contracts: [],
+            units_inferred: map{},
+            exports: [],
+            ast: nil
+        };
+    }
+    return check_source(src, o);
+}
+
+fn infer_expr_unit(expr_str, env_units = nil) {
+    let preamble = [];
+    if env_units != nil and type(env_units) == "map" {
+        let ks = map_keys(env_units);
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            let u = env_units[k];
+            if u != "" and u != "1" {
+                push(preamble, "let " + k + ": num[" + u + "] = 1.0;");
+            } else {
+                push(preamble, "let " + k + ": num = 1.0;");
+            }
+            i = i + 1;
+        }
+    }
+    push(preamble, "let __probe = " + expr_str + ";");
+    let rep = check_source(str_join(preamble, "\n"));
+    let ui = if map_has(rep["units_inferred"], "__probe") { rep["units_inferred"]["__probe"] } else { nil };
+    let probe_sym = nil;
+    let si = 0;
+    while si < len(rep["symbols"]) {
+        if rep["symbols"][si]["name"] == "__probe" { probe_sym = rep["symbols"][si]; }
+        si = si + 1;
+    }
+    return map{
+        ok: rep["ok"],
+        type_str: if probe_sym != nil { probe_sym["type_str"] } else { "any" },
+        unit_info: ui,
+        diagnostics: rep["diagnostics"]
+    };
+}
+
+fn format_diagnostics_text(report) {
+    let lines = [];
+    let f = report["file"];
+    let diags = report["diagnostics"];
+    let i = 0;
+    while i < len(diags) {
+        let d = diags[i];
+        push(lines, f + ":" + str(d["line"]) + ":" + str(d["col"]) + ": " + d["severity"] + "[" + d["code"] + "]: " + d["message"]);
+        i = i + 1;
+    }
+    let ci = 0;
+    let contracts = report["contracts"];
+    while ci < len(contracts) {
+        let c = contracts[ci];
+        let mark = if c["proved"] { "✓ PROVED" } else { "✗ REFUTED" };
+        push(lines, "  contract[" + c["engine"] + "] " + c["fn_name"] + " (" + c["kind"] + "): " + mark + " (" + c["status"] + ")");
+        ci = ci + 1;
+    }
+    push(lines, "summary: " + str(report["error_count"]) + " error(s), " + str(report["warning_count"]) + " warning(s), " + str(len(contracts)) + " contract obligation(s)");
+    return str_join(lines, "\n");
+}
+
+fn cli_check_entry(cli_args = nil) {
+    let raw_args = if cli_args != nil { cli_args } else { os_args() };
+    let strict_flag = false;
+    let json_flag = false;
+    let no_exit = false;
+    let files = [];
+
+    let i = 0;
+    while i < len(raw_args) {
+        let a = raw_args[i];
+        if a == "--strict" { strict_flag = true; }
+        elif a == "--json" { json_flag = true; }
+        elif a == "--no-exit" { no_exit = true; }
+        elif a == "--" or a == "check" or a == "--check" or str_ends_with(a, "static_checker.sapp") or str_ends_with(a, "pblang") {
+            // skip driver tokens
+        } else {
+            push(files, a);
+        }
+        i = i + 1;
+    }
+
+    let total_errors = 0;
+    let reports = [];
+    let fi = 0;
+    while fi < len(files) {
+        let rep = check_file(files[fi], map{ strict: strict_flag });
+        total_errors = total_errors + rep["error_count"];
+        push(reports, rep);
+        if not json_flag {
+            println(format_diagnostics_text(rep));
+        }
+        fi = fi + 1;
+    }
+
+    if json_flag {
+        println(json_stringify(map{
+            ok: total_errors == 0,
+            total_errors: total_errors,
+            reports: reports
+        }));
+    }
+
+    if total_errors > 0 and not no_exit {
+        os_exit(1);
+    }
+    return map{ ok: total_errors == 0, total_errors: total_errors, reports: reports };
+}
+
+export STATIC_CHECKER_VERSION,
+       levenshtein_distance, suggest_symbol,
+       tokenize_sapp, parse_sapp_ast,
+       prove_formula_auto, infer_expr_unit,
+       check_source, check_file, format_diagnostics_text, cli_check_entry;

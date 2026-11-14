@@ -1,15 +1,11 @@
 /*
- * zr_common.h — Sovereign Zero-Rust Runtime v2.0.0 Common OS, Crypto, UTF-8 & BigNum Kernel
+ * zr_common.h — Sovereign Zero-Rust Runtime v3.0.0 Common OS, Crypto, UTF-8 & BigNum Kernel
  *
  * Strictly portable C99 (POSIX Linux/macOS + Windows Win32/MinGW-w64).
  * Public-safe: zero personal paths, zero host-specific identifiers, zero external deps.
  */
 #ifndef PBLANG_ZR_COMMON_H
 #define PBLANG_ZR_COMMON_H
-
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC optimize("Os")
-#endif
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -67,6 +63,7 @@ typedef int zr_sock_t;
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -100,8 +97,8 @@ typedef int zr_sock_t;
 #include <string.h>
 #include <time.h>
 
-#define PBLANG_ZR_VERSION "2.7.0"
-#define PBLANG_ZR_BANNER  "pblang 2.7.0 (sovereign zero-rust runtime)"
+#define PBLANG_ZR_VERSION "3.0.0"
+#define PBLANG_ZR_BANNER  "pblang 3.0.0 (sovereign zero-rust runtime)"
 
 /* ---- Memory Helpers ---- */
 
@@ -1578,6 +1575,90 @@ static inline void zr_sha256_update(ZrSha256Ctx *ctx, const void *data, size_t l
 static inline void zr_sha256_final(ZrSha256Ctx *ctx, uint8_t out[32]) {
     zr_sha256((const uint8_t *)(ctx->buf.data ? ctx->buf.data : ""), ctx->buf.len, out);
     zr_buf_free(&ctx->buf);
+}
+
+/* ---- v3.0.0 Atomic Refcount, Nanosecond Timer & Case-Insensitive Helpers ---- */
+
+static inline int32_t zr_atomic_inc32(volatile int32_t *p) {
+#if defined(_WIN32)
+    return (int32_t)InterlockedIncrement((volatile LONG *)p);
+#elif defined(__GNUC__) || defined(__clang__)
+    return __sync_add_and_fetch(p, 1);
+#else
+    return ++(*p);
+#endif
+}
+
+static inline int32_t zr_atomic_dec32(volatile int32_t *p) {
+#if defined(_WIN32)
+    return (int32_t)InterlockedDecrement((volatile LONG *)p);
+#elif defined(__GNUC__) || defined(__clang__)
+    return __sync_sub_and_fetch(p, 1);
+#else
+    return --(*p);
+#endif
+}
+
+static inline uint64_t zr_mono_ns(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq = {0};
+    if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (uint64_t)(((double)now.QuadPart * 1000000000.0) / (double)freq.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static inline bool zr_str_contains_ci_ascii(const char *hay, const char *needle) {
+    if (!hay || !needle) return false;
+    size_t nlen = strlen(needle);
+    if (nlen == 0) return true;
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nlen && p[i]) {
+            char a = p[i], b = needle[i];
+            if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+            if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+            if (a != b) break;
+            i++;
+        }
+        if (i == nlen) return true;
+    }
+    return false;
+}
+
+static inline int zr_strcasecmp_ascii(const char *a, const char *b) {
+    if (!a) a = "";
+    if (!b) b = "";
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++;
+        unsigned char cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + 32);
+        if (ca != cb) return (int)ca - (int)cb;
+    }
+    unsigned char ca = (unsigned char)*a;
+    unsigned char cb = (unsigned char)*b;
+    if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + 32);
+    if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + 32);
+    return (int)ca - (int)cb;
+}
+
+static inline int zr_strncasecmp_ascii(const char *a, const char *b, size_t n) {
+    if (!a) a = "";
+    if (!b) b = "";
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = (unsigned char)a[i];
+        unsigned char cb = (unsigned char)b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca + 32);
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + 32);
+        if (ca != cb || ca == 0) return (int)ca - (int)cb;
+    }
+    return 0;
 }
 
 #endif /* PBLANG_ZR_COMMON_H */

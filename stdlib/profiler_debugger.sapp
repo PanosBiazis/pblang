@@ -1,0 +1,1060 @@
+// stdlib/profiler_debugger.sapp — PBLang v3.0.0 Deterministic Time-Travel Step Debugger
+// & AST-Instrumented CPU Profiler + Interactive Dark-Mode SVG Flamegraph Generator
+//
+// Features:
+//   1. AST-Instrumented Deterministic Time-Travel Debugger:
+//      - `create_debugger(src_code, opts = nil)`
+//      - `set_breakpoint(dbg, line)` / `dbg.set_breakpoint(line)`
+//      - `clear_breakpoint(dbg, line)` / `dbg.clear_breakpoint(line)`
+//      - `step_forward(dbg)` / `dbg.step_forward()`
+//      - `step_backward(dbg)` / `dbg.step_backward()` (restores exact deep-cloned prior state!)
+//      - `continue_run(dbg)` / `dbg.continue_run()` (runs until next breakpoint or completion)
+//      - `inspect_locals(dbg)` / `dbg.inspect_locals()`
+//      - `inspect_call_stack(dbg)` / `dbg.inspect_call_stack()`
+//      - `cli_debug_entry(args)`
+//   2. AST-Instrumented Call-Stack Profiler & Dark-Mode SVG Flamegraph Renderer:
+//      - `profile_source(src_code, opts = nil)`
+//      - `render_flamegraph_svg(profile_entries, title = "PBLang v3.0 CPU Flamegraph")`
+//      - `cli_prof_entry(args)`
+//
+// Compatible with PBLang 2.7.0 and 3.0.0 runtimes. Zero personal paths, strict XML/SVG escaping.
+
+let SC = import("stdlib:static_checker.sapp");
+
+let PROFILER_DEBUGGER_VERSION = "3.0.0";
+
+// ── Deep Clone & Formatting Utilities ─────────────────────────────────────────
+
+fn _pd_deep_clone(val) {
+    let tv = type(val);
+    if tv == "nil" or tv == "number" or tv == "bool" or tv == "string" {
+        return val;
+    }
+    if tv == "array" {
+        let out = [];
+        let i = 0;
+        while i < len(val) {
+            push(out, _pd_deep_clone(val[i]));
+            i = i + 1;
+        }
+        return out;
+    }
+    if tv == "map" {
+        if map_has(val, "__dbg_fn") {
+            // Represent function value cleanly in snapshots without cyclic env blowup
+            return "<fn " + val["name"] + ">";
+        }
+        let m = map{};
+        let ks = map_keys(val);
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            m[k] = _pd_deep_clone(val[k]);
+            i = i + 1;
+        }
+        return m;
+    }
+    return str(val);
+}
+
+fn _pd_xml_escape(s) {
+    if s == nil { return ""; }
+    let t = str(s);
+    t = str_replace_all(t, "&", "&amp;");
+    t = str_replace_all(t, "<", "&lt;");
+    t = str_replace_all(t, ">", "&gt;");
+    t = str_replace_all(t, "\"", "&quot;");
+    t = str_replace_all(t, "'", "&apos;");
+    return t;
+}
+
+fn _pd_fmt_ms(v) {
+    let r100 = num_floor(v * 100.0 + 0.5);
+    let whole = num_floor(r100 / 100.0);
+    let frac = r100 - whole * 100;
+    let fs = if frac < 10 { "0" + str(frac) } else { str(frac) };
+    return str(whole) + "." + fs;
+}
+
+fn _pd_parse_num(raw_s) {
+    let pn = try parse_number(str_trim(raw_s)) catch nil;
+    if pn != nil { return pn; }
+    return 0;
+}
+
+fn _pd_truthy(v) {
+    return v != nil and v != false;
+}
+
+// ── Scope Chain & Snapshot Extraction ─────────────────────────────────────────
+
+fn _dbg_env_new(parent_env, fn_name) {
+    return map{
+        parent: parent_env,
+        fn_name: fn_name,
+        vars: map{},
+        consts: map{}
+    };
+}
+
+fn _dbg_env_define(env, name, val, is_const_flag) {
+    env["vars"][name] = val;
+    if is_const_flag { env["consts"][name] = true; }
+}
+
+fn _dbg_env_lookup(env, name) {
+    let cur = env;
+    while cur != nil {
+        if map_has(cur["vars"], name) {
+            return map{ found: true, val: cur["vars"][name] };
+        }
+        cur = cur["parent"];
+    }
+    return map{ found: false, val: nil };
+}
+
+fn _dbg_env_assign(env, name, val) {
+    let cur = env;
+    while cur != nil {
+        if map_has(cur["vars"], name) {
+            if map_has(cur["consts"], name) and cur["consts"][name] == true {
+                throw "Cannot reassign constant '" + name + "'";
+            }
+            cur["vars"][name] = val;
+            return;
+        }
+        cur = cur["parent"];
+    }
+    throw "Undefined variable '" + name + "'";
+}
+
+// Flatten visible variables from innermost scope outward (excluding internal `<fn ...>` descriptors unless requested)
+fn _extract_visible_locals(env, include_fns) {
+    let chain = [];
+    let cur = env;
+    while cur != nil {
+        push(chain, cur);
+        cur = cur["parent"];
+    }
+    // Apply from outermost to innermost so inner bindings shadow outer bindings accurately
+    let snap = map{};
+    let ci = len(chain) - 1;
+    while ci >= 0 {
+        let vars_m = chain[ci]["vars"];
+        let ks = map_keys(vars_m);
+        let ki = 0;
+        while ki < len(ks) {
+            let k = ks[ki];
+            let v = vars_m[k];
+            if type(v) == "map" and map_has(v, "__dbg_fn") {
+                if include_fns {
+                    snap[k] = "<fn " + v["name"] + ">";
+                }
+            } else {
+                snap[k] = _pd_deep_clone(v);
+            }
+            ki = ki + 1;
+        }
+        ci = ci - 1;
+    }
+    return snap;
+}
+
+// ── Instrumented AST Recorder (Shared by Debugger & Profiler) ─────────────────
+
+fn _call_dbg_builtin(rec, name, args) {
+    if name == "println" or name == "print" {
+        let parts = [];
+        let i = 0;
+        while i < len(args) { push(parts, str(args[i])); i = i + 1; }
+        push(rec["output"], str_join(parts, " "));
+        return nil;
+    }
+    if name == "str" { return str(args[0]); }
+    if name == "len" { return len(args[0]); }
+    if name == "type" {
+        if type(args[0]) == "map" and map_has(args[0], "__dbg_fn") { return "function"; }
+        return type(args[0]);
+    }
+    if name == "push" { push(args[0], args[1]); return nil; }
+    if name == "pop" { return pop(args[0]); }
+    if name == "slice" { return slice(args[0], args[1], args[2]); }
+    if name == "abs" or name == "num_abs" { return num_abs(args[0]); }
+    if name == "sqrt" or name == "num_sqrt" { return num_sqrt(args[0]); }
+    if name == "floor" or name == "num_floor" { return num_floor(args[0]); }
+    if name == "ceil" or name == "num_ceil" { return num_ceil(args[0]); }
+    if name == "pow" or name == "num_pow" { return num_pow(args[0], args[1]); }
+    if name == "exp" or name == "num_exp" { return num_exp(args[0]); }
+    if name == "ln" or name == "num_ln" { return num_ln(args[0]); }
+    if name == "min_of" or name == "num_min" { return if args[0] < args[1] { args[0] } else { args[1] }; }
+    if name == "max_of" or name == "num_max" { return if args[0] > args[1] { args[0] } else { args[1] }; }
+    if name == "range" { return range(args[0]); }
+    if name == "sum" { return sum(args[0]); }
+    if name == "array_sort" { return array_sort(args[0]); }
+    if name == "map_keys" { return map_keys(args[0]); }
+    if name == "map_has" { return map_has(args[0], args[1]); }
+    if name == "json_stringify" { return json_stringify(args[0]); }
+    if name == "json_parse" { return json_parse(args[0]); }
+    if name == "str_join" { return str_join(args[0], args[1]); }
+    if name == "str_split" { return str_split(args[0], args[1]); }
+    if name == "str_trim" { return str_trim(args[0]); }
+    if name == "str_slice" { return str_slice(args[0], args[1], args[2]); }
+    throw "Unknown builtin '" + name + "'";
+}
+
+fn _record_snapshot(rec, env, completed_line, next_line, event_kind, finished_flag) {
+    if not rec["record_snapshots"] { return; }
+    let src_ln = "";
+    if next_line >= 1 and next_line <= len(rec["src_lines"]) {
+        src_ln = str_trim(rec["src_lines"][next_line - 1]);
+    }
+    let cur_fn = "<main>";
+    if len(rec["call_stack"]) > 0 {
+        cur_fn = rec["call_stack"][len(rec["call_stack"]) - 1]["fn_name"];
+    }
+    push(rec["snapshots"], map{
+        step_index: len(rec["snapshots"]),
+        event: event_kind,
+        executed_line: completed_line,
+        line: next_line,
+        source_line: src_ln,
+        fn_name: cur_fn,
+        locals: _extract_visible_locals(env, false),
+        call_stack: _pd_deep_clone(rec["call_stack"]),
+        output: _pd_deep_clone(rec["output"]),
+        finished: finished_flag
+    });
+}
+
+fn _rec_eval_expr(rec, env, node) {
+    if node == nil { return nil; }
+    rec["ops"] = rec["ops"] + 1;
+    if rec["ops"] > rec["max_ops"] {
+        throw "Debugger/profiler step budget exceeded (" + str(rec["max_ops"]) + " ops)";
+    }
+
+    let k = node["kind"];
+    if k == "num" { return _pd_parse_num(node["val"]); }
+    if k == "str" { return node["val"]; }
+    if k == "bool" { return node["val"]; }
+    if k == "nil" { return nil; }
+
+    if k == "ident" {
+        let lk = _dbg_env_lookup(env, node["name"]);
+        if lk["found"] { return lk["val"]; }
+        throw "Undefined variable '" + node["name"] + "'";
+    }
+
+    if k == "array_lit" {
+        let out = [];
+        let i = 0;
+        while i < len(node["items"]) {
+            push(out, _rec_eval_expr(rec, env, node["items"][i]));
+            i = i + 1;
+        }
+        return out;
+    }
+
+    if k == "map_lit" {
+        let m = map{};
+        let i = 0;
+        while i < len(node["entries"]) {
+            let ek = str(_rec_eval_expr(rec, env, node["entries"][i]["key"]));
+            m[ek] = _rec_eval_expr(rec, env, node["entries"][i]["val"]);
+            i = i + 1;
+        }
+        return m;
+    }
+
+    if k == "fn_expr" {
+        return map{
+            __dbg_fn: true,
+            name: if node["name"] != "" { node["name"] } else { "<anon>" },
+            params: node["params"],
+            body: node["body"],
+            line: node["line"],
+            closure_env: env
+        };
+    }
+
+    if k == "unary" {
+        let v = _rec_eval_expr(rec, env, node["arg"]);
+        if node["op"] == "-" { return 0 - v; }
+        if node["op"] == "not" or node["op"] == "!" { return not _pd_truthy(v); }
+        return v;
+    }
+
+    if k == "binary" {
+        let op = node["op"];
+        if op == "and" {
+            if not _pd_truthy(_rec_eval_expr(rec, env, node["left"])) { return false; }
+            return _pd_truthy(_rec_eval_expr(rec, env, node["right"]));
+        }
+        if op == "or" {
+            if _pd_truthy(_rec_eval_expr(rec, env, node["left"])) { return true; }
+            return _pd_truthy(_rec_eval_expr(rec, env, node["right"]));
+        }
+        let l = _rec_eval_expr(rec, env, node["left"]);
+        let r = _rec_eval_expr(rec, env, node["right"]);
+        if op == "+" { return l + r; }
+        if op == "-" { return l - r; }
+        if op == "*" { return l * r; }
+        if op == "/" { return l / r; }
+        if op == "%" { return num_mod(l, r); }
+        if op == "^" or op == "**" { return num_pow(l, r); }
+        if op == "==" { return l == r; }
+        if op == "!=" { return l != r; }
+        if op == "<" { return l < r; }
+        if op == "<=" { return l <= r; }
+        if op == ">" { return l > r; }
+        if op == ">=" { return l >= r; }
+    }
+
+    if k == "index" {
+        let o = _rec_eval_expr(rec, env, node["obj"]);
+        let ix = _rec_eval_expr(rec, env, node["index"]);
+        return o[ix];
+    }
+
+    if k == "member" {
+        let om = _rec_eval_expr(rec, env, node["obj"]);
+        return om[node["field"]];
+    }
+
+    if k == "if_expr" {
+        if _pd_truthy(_rec_eval_expr(rec, env, node["cond"])) {
+            return _rec_eval_expr(rec, env, node["then_expr"]);
+        }
+        return _rec_eval_expr(rec, env, node["else_expr"]);
+    }
+
+    if k == "call" {
+        let args = [];
+        let i = 0;
+        while i < len(node["args"]) {
+            push(args, _rec_eval_expr(rec, env, node["args"][i]));
+            i = i + 1;
+        }
+        if node["callee"]["kind"] == "ident" {
+            let fn_nm = node["callee"]["name"];
+            let lk2 = _dbg_env_lookup(env, fn_nm);
+            if lk2["found"] {
+                return _rec_invoke_fn(rec, lk2["val"], args, node["line"]);
+            }
+            return _call_dbg_builtin(rec, fn_nm, args);
+        }
+        let fn_v = _rec_eval_expr(rec, env, node["callee"]);
+        return _rec_invoke_fn(rec, fn_v, args, node["line"]);
+    }
+
+    return nil;
+}
+
+fn _rec_invoke_fn(rec, fn_obj, args, call_line) {
+    let fn_name = fn_obj["name"];
+    let call_env = _dbg_env_new(fn_obj["closure_env"], fn_name);
+    let params = fn_obj["params"];
+    let pi = 0;
+    while pi < len(params) {
+        let p = params[pi];
+        if pi < len(args) {
+            _dbg_env_define(call_env, p["name"], args[pi], false);
+        } elif p["default_expr"] != nil {
+            _dbg_env_define(call_env, p["name"], _rec_eval_expr(rec, call_env, p["default_expr"]), false);
+        } else {
+            _dbg_env_define(call_env, p["name"], nil, false);
+        }
+        pi = pi + 1;
+    }
+
+    push(rec["call_stack"], map{
+        fn_name: fn_name,
+        call_line: call_line,
+        fn_line: fn_obj["line"]
+    });
+
+    // Profiler stack key `main;foo;bar`
+    let stack_names = ["main"];
+    let si = 0;
+    while si < len(rec["call_stack"]) {
+        push(stack_names, rec["call_stack"][si]["fn_name"]);
+        si = si + 1;
+    }
+    let stack_key = str_join(stack_names, ";");
+
+    let ops_before = rec["ops"];
+    let t0 = now_ms();
+    let child_ms_before = rec["child_accum_ms"];
+    let child_ops_before = rec["child_accum_ops"];
+    rec["child_accum_ms"] = 0.0;
+    rec["child_accum_ops"] = 0;
+
+    let body_sig = _rec_exec_block(rec, call_env, fn_obj["body"]);
+    let ret_val = body_sig["val"];
+
+    let elapsed_wall = now_ms() - t0;
+    let ops_total = rec["ops"] - ops_before;
+    // Deterministic hybrid timing: use wall ms + min synthetic 0.02ms/op floor so sub-millisecond stacks remain visible
+    let total_ms = elapsed_wall + (ops_total * 0.02);
+    let children_ms = rec["child_accum_ms"];
+    let self_ms = if total_ms > children_ms { total_ms - children_ms } else { 0.01 };
+
+    // Restore parent's child accumulator and add our total_ms to parent's child_accum_ms
+    rec["child_accum_ms"] = child_ms_before + total_ms;
+    rec["child_accum_ops"] = child_ops_before + ops_total;
+
+    if not map_has(rec["prof_stacks"], stack_key) {
+        rec["prof_stacks"][stack_key] = map{
+            stack: stack_names,
+            stack_key: stack_key,
+            fn_name: fn_name,
+            calls: 0,
+            total_ms: 0.0,
+            self_ms: 0.0
+        };
+    }
+    let ps = rec["prof_stacks"][stack_key];
+    ps["calls"] = ps["calls"] + 1;
+    ps["total_ms"] = ps["total_ms"] + total_ms;
+    ps["self_ms"] = ps["self_ms"] + self_ms;
+
+    pop(rec["call_stack"]);
+    return ret_val;
+}
+
+fn _first_stmt_line(stmts, idx, fallback_line) {
+    if idx < len(stmts) {
+        return stmts[idx]["line"];
+    }
+    return fallback_line;
+}
+
+fn _rec_exec_block(rec, block_env, block_node) {
+    let stmts = block_node["stmts"];
+    let last_val = nil;
+    let i = 0;
+    while i < len(stmts) {
+        let st = stmts[i];
+        let next_ln = _first_stmt_line(stmts, i + 1, block_node["end_line"]);
+        let sig = _rec_exec_stmt(rec, block_env, st, next_ln);
+        if sig["signal"] != "none" {
+            return sig;
+        }
+        last_val = sig["val"];
+        i = i + 1;
+    }
+    if block_node["tail_expr"] != nil {
+        last_val = _rec_eval_expr(rec, block_env, block_node["tail_expr"]);
+    }
+    return map{ signal: "none", val: last_val };
+}
+
+fn _rec_exec_stmt(rec, env, stmt, following_line) {
+    let k = stmt["kind"];
+    let ln = stmt["line"];
+
+    if k == "empty" or k == "export_stmt" {
+        return map{ signal: "none", val: nil };
+    }
+
+    if k == "fn_decl" {
+        let fn_v = map{
+            __dbg_fn: true,
+            name: stmt["name"],
+            params: stmt["params"],
+            body: stmt["body"],
+            line: ln,
+            closure_env: env
+        };
+        _dbg_env_define(env, stmt["name"], fn_v, false);
+        return map{ signal: "none", val: fn_v };
+    }
+
+    if k == "var_decl" {
+        let v = if stmt["init"] != nil { _rec_eval_expr(rec, env, stmt["init"]) } else { nil };
+        _dbg_env_define(env, stmt["name"], v, stmt["is_const"] == true);
+        _record_snapshot(rec, env, ln, following_line, "step", false);
+        return map{ signal: "none", val: v };
+    }
+
+    if k == "assign" {
+        let rhs = _rec_eval_expr(rec, env, stmt["val"]);
+        let tgt = stmt["target"];
+        let op = stmt["op"];
+        if tgt["kind"] == "ident" {
+            let cur = if op == "=" { nil } else { _rec_eval_expr(rec, env, tgt) };
+            let nv = rhs;
+            if op == "+=" { nv = cur + rhs; }
+            elif op == "-=" { nv = cur - rhs; }
+            elif op == "*=" { nv = cur * rhs; }
+            elif op == "/=" { nv = cur / rhs; }
+            _dbg_env_assign(env, tgt["name"], nv);
+            _record_snapshot(rec, env, ln, following_line, "step", false);
+            return map{ signal: "none", val: nv };
+        }
+        if tgt["kind"] == "index" {
+            let arr = _rec_eval_expr(rec, env, tgt["obj"]);
+            let ix = _rec_eval_expr(rec, env, tgt["index"]);
+            arr[ix] = rhs;
+            _record_snapshot(rec, env, ln, following_line, "step", false);
+            return map{ signal: "none", val: rhs };
+        }
+        if tgt["kind"] == "member" {
+            let mp = _rec_eval_expr(rec, env, tgt["obj"]);
+            mp[tgt["field"]] = rhs;
+            _record_snapshot(rec, env, ln, following_line, "step", false);
+            return map{ signal: "none", val: rhs };
+        }
+    }
+
+    if k == "print_stmt" {
+        let pargs = [];
+        let i = 0;
+        while i < len(stmt["args"]) {
+            push(pargs, _rec_eval_expr(rec, env, stmt["args"][i]));
+            i = i + 1;
+        }
+        _call_dbg_builtin(rec, "println", pargs);
+        _record_snapshot(rec, env, ln, following_line, "print", false);
+        return map{ signal: "none", val: nil };
+    }
+
+    if k == "return_stmt" {
+        let rv = if stmt["val"] != nil { _rec_eval_expr(rec, env, stmt["val"]) } else { nil };
+        _record_snapshot(rec, env, ln, following_line, "return", false);
+        return map{ signal: "return", val: rv };
+    }
+
+    if k == "break_stmt" {
+        _record_snapshot(rec, env, ln, following_line, "break", false);
+        return map{ signal: "break", val: nil };
+    }
+
+    if k == "continue_stmt" {
+        _record_snapshot(rec, env, ln, following_line, "continue", false);
+        return map{ signal: "continue", val: nil };
+    }
+
+    if k == "if_stmt" {
+        let cval = _pd_truthy(_rec_eval_expr(rec, env, stmt["cond"]));
+        _record_snapshot(rec, env, ln, if cval { _first_stmt_line(stmt["then_block"]["stmts"], 0, following_line) } else { following_line }, "branch", false);
+        if cval {
+            return _rec_exec_block(rec, _dbg_env_new(env, ""), stmt["then_block"]);
+        }
+        if stmt["else_block"] != nil {
+            if stmt["else_block"]["kind"] == "block" {
+                return _rec_exec_block(rec, _dbg_env_new(env, ""), stmt["else_block"]);
+            }
+            return _rec_exec_stmt(rec, env, stmt["else_block"], following_line);
+        }
+        return map{ signal: "none", val: nil };
+    }
+
+    if k == "while_stmt" {
+        let last_w = nil;
+        while _pd_truthy(_rec_eval_expr(rec, env, stmt["cond"])) {
+            let first_b = _first_stmt_line(stmt["body"]["stmts"], 0, ln);
+            _record_snapshot(rec, env, ln, first_b, "loop_cond", false);
+            let sig_w = _rec_exec_block(rec, _dbg_env_new(env, ""), stmt["body"]);
+            if sig_w["signal"] == "return" { return sig_w; }
+            if sig_w["signal"] == "break" { break; }
+            last_w = sig_w["val"];
+        }
+        return map{ signal: "none", val: last_w };
+    }
+
+    if k == "expr_stmt" {
+        let ev = _rec_eval_expr(rec, env, stmt["expr"]);
+        _record_snapshot(rec, env, ln, following_line, "expr", false);
+        return map{ signal: "none", val: ev };
+    }
+
+    let fv = _rec_eval_expr(rec, env, stmt);
+    _record_snapshot(rec, env, ln, following_line, "expr", false);
+    return map{ signal: "none", val: fv };
+}
+
+fn _run_instrumented(src_code, record_snapshots, max_ops) {
+    let parsed = SC.parse_sapp_ast(src_code);
+    let src_lines = str_split(src_code, "\n");
+    let root_env = _dbg_env_new(nil, "<main>");
+    let rec = map{
+        record_snapshots: record_snapshots,
+        src_lines: src_lines,
+        snapshots: [],
+        call_stack: [],
+        output: [],
+        prof_stacks: map{},
+        child_accum_ms: 0.0,
+        child_accum_ops: 0,
+        ops: 0,
+        max_ops: max_ops
+    };
+
+    let stmts = parsed["ast"]["stmts"];
+    // Determine first executable non-fn-decl line
+    let first_line = 1;
+    let si = 0;
+    while si < len(stmts) {
+        if stmts[si]["kind"] != "fn_decl" and stmts[si]["kind"] != "empty" {
+            first_line = stmts[si]["line"];
+            break;
+        }
+        si = si + 1;
+    }
+
+    // Record initial pre-execution snapshot at cursor = 0
+    _record_snapshot(rec, root_env, 0, first_line, "init", len(stmts) == 0);
+
+    let t_root0 = now_ms();
+    let i = 0;
+    while i < len(stmts) {
+        let next_ln = _first_stmt_line(stmts, i + 1, len(src_lines));
+        let sig = _rec_exec_stmt(rec, root_env, stmts[i], next_ln);
+        if sig["signal"] == "return" { break; }
+        i = i + 1;
+    }
+    let root_elapsed = (now_ms() - t_root0) + (rec["ops"] * 0.02);
+    let root_self = if root_elapsed > rec["child_accum_ms"] { root_elapsed - rec["child_accum_ms"] } else { 0.02 };
+
+    rec["prof_stacks"]["main"] = map{
+        stack: ["main"],
+        stack_key: "main",
+        fn_name: "main",
+        calls: 1,
+        total_ms: root_elapsed,
+        self_ms: root_self
+    };
+
+    // Mark final snapshot as finished
+    if len(rec["snapshots"]) > 0 {
+        rec["snapshots"][len(rec["snapshots"]) - 1]["finished"] = true;
+    }
+
+    return rec;
+}
+
+// ── Time-Travel Debugger API ──────────────────────────────────────────────────
+
+fn set_breakpoint(dbg, line) {
+    dbg["breakpoints"][str(line)] = true;
+    return true;
+}
+
+fn clear_breakpoint(dbg, line) {
+    let k = str(line);
+    if map_has(dbg["breakpoints"], k) {
+        map_remove(dbg["breakpoints"], k);
+    }
+    return true;
+}
+
+fn _current_snapshot_view(dbg) {
+    let snaps = dbg["snapshots"];
+    let cur = dbg["cursor"];
+    let snap = snaps[cur];
+    return map{
+        cursor: cur,
+        total_steps: len(snaps) - 1,
+        event: snap["event"],
+        executed_line: snap["executed_line"],
+        line: snap["line"],
+        source_line: snap["source_line"],
+        fn_name: snap["fn_name"],
+        locals: _pd_deep_clone(snap["locals"]),
+        call_stack: _pd_deep_clone(snap["call_stack"]),
+        output: _pd_deep_clone(snap["output"]),
+        finished: snap["finished"],
+        can_step_forward: cur + 1 < len(snaps),
+        can_step_backward: cur > 0
+    };
+}
+
+fn step_forward(dbg) {
+    let snaps = dbg["snapshots"];
+    if dbg["cursor"] + 1 < len(snaps) {
+        dbg["cursor"] = dbg["cursor"] + 1;
+    }
+    return _current_snapshot_view(dbg);
+}
+
+fn step_backward(dbg) {
+    if dbg["cursor"] > 0 {
+        dbg["cursor"] = dbg["cursor"] - 1;
+    }
+    return _current_snapshot_view(dbg);
+}
+
+fn continue_run(dbg) {
+    let snaps = dbg["snapshots"];
+    while dbg["cursor"] + 1 < len(snaps) {
+        dbg["cursor"] = dbg["cursor"] + 1;
+        let cur_snap = snaps[dbg["cursor"]];
+        let next_ln_key = str(cur_snap["line"]);
+        if not cur_snap["finished"] and map_has(dbg["breakpoints"], next_ln_key) {
+            let v = _current_snapshot_view(dbg);
+            v["paused_at_breakpoint"] = true;
+            return v;
+        }
+    }
+    let vf = _current_snapshot_view(dbg);
+    vf["paused_at_breakpoint"] = false;
+    return vf;
+}
+
+fn inspect_locals(dbg) {
+    let snap = dbg["snapshots"][dbg["cursor"]];
+    return _pd_deep_clone(snap["locals"]);
+}
+
+fn inspect_call_stack(dbg) {
+    let snap = dbg["snapshots"][dbg["cursor"]];
+    return _pd_deep_clone(snap["call_stack"]);
+}
+
+fn reset_debugger(dbg) {
+    dbg["cursor"] = 0;
+    return _current_snapshot_view(dbg);
+}
+
+fn create_debugger(src_code, opts = nil) {
+    let max_ops = 250000;
+    if opts != nil and type(opts) == "map" and map_has(opts, "max_ops") {
+        max_ops = opts["max_ops"];
+    }
+    let rec = _run_instrumented(src_code, true, max_ops);
+    let dbg = map{
+        version: PROFILER_DEBUGGER_VERSION,
+        source: src_code,
+        snapshots: rec["snapshots"],
+        cursor: 0,
+        breakpoints: map{}
+    };
+
+    // Attach ergonomic closure methods so both `step_forward(dbg)` and `dbg.step_forward()` work!
+    dbg["set_breakpoint"] = fn(line) { return set_breakpoint(dbg, line); };
+    dbg["clear_breakpoint"] = fn(line) { return clear_breakpoint(dbg, line); };
+    dbg["step_forward"] = fn() { return step_forward(dbg); };
+    dbg["step_backward"] = fn() { return step_backward(dbg); };
+    dbg["continue_run"] = fn() { return continue_run(dbg); };
+    dbg["inspect_locals"] = fn() { return inspect_locals(dbg); };
+    dbg["inspect_call_stack"] = fn() { return inspect_call_stack(dbg); };
+    dbg["reset"] = fn() { return reset_debugger(dbg); };
+    dbg["state"] = fn() { return _current_snapshot_view(dbg); };
+
+    return dbg;
+}
+
+// ── CPU Call-Stack Profiler & Interactive Dark-Mode SVG Flamegraph ────────────
+
+fn profile_source(src_code, opts = nil) {
+    let max_ops = 500000;
+    if opts != nil and type(opts) == "map" and map_has(opts, "max_ops") {
+        max_ops = opts["max_ops"];
+    }
+    let rec = _run_instrumented(src_code, false, max_ops);
+    let ks = array_sort(map_keys(rec["prof_stacks"]));
+    let entries = [];
+    let i = 0;
+    while i < len(ks) {
+        push(entries, rec["prof_stacks"][ks[i]]);
+        i = i + 1;
+    }
+    return map{
+        ok: true,
+        total_ops: rec["ops"],
+        entries: entries,
+        output: rec["output"]
+    };
+}
+
+let _FLAME_PALETTE = [
+    "#f97316", "#ef4444", "#f59e0b", "#fb7185",
+    "#ea580c", "#dc2626", "#eab308", "#e11d48"
+];
+
+fn _hash_fn_color(name) {
+    let h = 0;
+    let i = 0;
+    while i < len(name) {
+        h = (h * 31 + strcharcodeat(str_slice(name, i, i + 1), 0)) % 997;
+        i = i + 1;
+    }
+    return _FLAME_PALETTE[h % len(_FLAME_PALETTE)];
+}
+
+fn _normalize_profile_entries(profile_entries) {
+    let raw_list = profile_entries;
+    if type(profile_entries) == "map" and map_has(profile_entries, "entries") {
+        raw_list = profile_entries["entries"];
+    }
+    if raw_list == nil or len(raw_list) == 0 {
+        return [map{
+            stack: ["main"],
+            fn_name: "main",
+            total_ms: 1.0,
+            self_ms: 1.0,
+            calls: 1
+        }];
+    }
+
+    let norm = [];
+    let i = 0;
+    while i < len(raw_list) {
+        let e = raw_list[i];
+        let stk = ["main"];
+        if map_has(e, "stack") {
+            if type(e["stack"]) == "array" {
+                stk = e["stack"];
+            } elif type(e["stack"]) == "string" {
+                stk = str_split(e["stack"], ";");
+            }
+        } elif map_has(e, "name") {
+            stk = if e["name"] == "main" { ["main"] } else { ["main", str(e["name"])] };
+        } elif map_has(e, "fn_name") {
+            stk = if e["fn_name"] == "main" { ["main"] } else { ["main", str(e["fn_name"])] };
+        }
+
+        let fn_nm = stk[len(stk) - 1];
+        let tot = if map_has(e, "total_ms") { e["total_ms"] * 1.0 }
+                  elif map_has(e, "ms") { e["ms"] * 1.0 }
+                  else { 1.0 };
+        if tot <= 0.0 { tot = 0.05; }
+        let slf = if map_has(e, "self_ms") { e["self_ms"] * 1.0 } else { tot };
+        let cls = if map_has(e, "calls") { e["calls"] } else { 1 };
+
+        push(norm, map{
+            stack: stk,
+            stack_key: str_join(stk, ";"),
+            fn_name: fn_nm,
+            depth: len(stk) - 1,
+            total_ms: tot,
+            self_ms: slf,
+            calls: cls
+        });
+        i = i + 1;
+    }
+    return norm;
+}
+
+fn render_flamegraph_svg(profile_entries, title = "PBLang v3.0 CPU Flamegraph") {
+    let entries = _normalize_profile_entries(profile_entries);
+
+    // Find max depth and root total_ms
+    let max_depth = 0;
+    let root_ms = 0.0;
+    let sum_self = 0.0;
+    let i = 0;
+    while i < len(entries) {
+        let e = entries[i];
+        if e["depth"] > max_depth { max_depth = e["depth"]; }
+        if e["depth"] == 0 and e["total_ms"] > root_ms {
+            root_ms = e["total_ms"];
+        }
+        sum_self = sum_self + e["self_ms"];
+        i = i + 1;
+    }
+    if root_ms <= 0.0 {
+        root_ms = if sum_self > 0.0 { sum_self } else { 1.0 };
+        // Synthesize root frame if caller supplied only child stacks
+        push(entries, map{
+            stack: ["main"],
+            stack_key: "main",
+            fn_name: "main",
+            depth: 0,
+            total_ms: root_ms,
+            self_ms: 0.0,
+            calls: 1
+        });
+    }
+
+    let svg_w = 960;
+    let pad_x = 24;
+    let plot_w = svg_w - 2 * pad_x;
+    let row_h = 28;
+    let row_gap = 4;
+    let header_h = 64;
+    let footer_h = 36;
+    let svg_h = header_h + (max_depth + 1) * (row_h + row_gap) + footer_h;
+
+    // Group frames by depth level and lay out left-to-right deterministically
+    let level_cursors = map{};
+    let rects_svg = [];
+
+    let di = 0;
+    while di <= max_depth {
+        level_cursors[str(di)] = 0.0;
+        di = di + 1;
+    }
+
+    let ei = 0;
+    while ei < len(entries) {
+        let fr = entries[ei];
+        let d = fr["depth"];
+        let dk = str(d);
+        let cur_x_frac = level_cursors[dk];
+        let frac_w = fr["total_ms"] / root_ms;
+        if frac_w > 1.0 - cur_x_frac { frac_w = 1.0 - cur_x_frac; }
+        if frac_w < 0.02 { frac_w = 0.02; }
+
+        let rx = num_floor(pad_x + cur_x_frac * plot_w);
+        let rw = num_floor(frac_w * plot_w);
+        if rw < 18 { rw = 18; }
+        if rx + rw > pad_x + plot_w {
+            rw = (pad_x + plot_w) - rx;
+        }
+        if rw >= 4 {
+            // Flamegraph convention: root `main` at bottom, deeper callees stacked upward!
+            let ry = header_h + (max_depth - d) * (row_h + row_gap);
+            let fill_c = _hash_fn_color(fr["fn_name"]);
+            let pct = _pd_fmt_ms((fr["total_ms"] / root_ms) * 100.0);
+            let tip = _pd_xml_escape(
+                fr["stack_key"] + " — total: " + _pd_fmt_ms(fr["total_ms"]) + " ms (" + pct + "%), self: " + _pd_fmt_ms(fr["self_ms"]) + " ms, calls: " + str(fr["calls"])
+            );
+            let lbl = fr["fn_name"] + " (" + _pd_fmt_ms(fr["total_ms"]) + "ms)";
+            let max_chars = num_floor((rw - 10) / 7.0);
+            let shown_lbl = if max_chars <= 0 {
+                ""
+            } elif len(lbl) > max_chars {
+                str_slice(lbl, 0, max_chars)
+            } else {
+                lbl
+            };
+
+            let g_part = "  <g class=\"fg-frame\">\n"
+                + "    <title>" + tip + "</title>\n"
+                + "    <rect x=\"" + str(rx) + "\" y=\"" + str(ry) + "\" width=\"" + str(rw) + "\" height=\"" + str(row_h) + "\" rx=\"4\" fill=\"" + fill_c + "\" stroke=\"#0f172a\" stroke-width=\"1\"/>\n";
+            if shown_lbl != "" {
+                g_part = g_part + "    <text x=\"" + str(rx + 6) + "\" y=\"" + str(ry + 18) + "\" fill=\"#fffbeb\" font-family=\"ui-monospace, SFMono-Regular, Menlo, monospace\" font-size=\"12\" font-weight=\"600\">" + _pd_xml_escape(shown_lbl) + "</text>\n";
+            }
+            g_part = g_part + "  </g>";
+            push(rects_svg, g_part);
+        }
+
+        level_cursors[dk] = cur_x_frac + frac_w;
+        ei = ei + 1;
+    }
+
+    let safe_title = _pd_xml_escape(title);
+    let subtitle = "Total profile window: " + _pd_fmt_ms(root_ms) + " ms | Frames: " + str(len(entries)) + " | Hover any bar for self/total ms";
+
+    let svg_lines = [
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 " + str(svg_w) + " " + str(svg_h) + "\" width=\"" + str(svg_w) + "\" height=\"" + str(svg_h) + "\">",
+        "  <style>",
+        "    .fg-frame rect { transition: opacity 0.12s ease, stroke 0.12s ease; cursor: pointer; }",
+        "    .fg-frame:hover rect { opacity: 0.90; stroke: #38bdf8; stroke-width: 2; }",
+        "  </style>",
+        "  <rect x=\"0\" y=\"0\" width=\"" + str(svg_w) + "\" height=\"" + str(svg_h) + "\" fill=\"#0b1020\" rx=\"10\"/>",
+        "  <text x=\"" + str(pad_x) + "\" y=\"30\" fill=\"#f8fafc\" font-family=\"system-ui, -apple-system, sans-serif\" font-size=\"18\" font-weight=\"700\">" + safe_title + "</text>",
+        "  <text x=\"" + str(pad_x) + "\" y=\"49\" fill=\"#94a3b8\" font-family=\"ui-monospace, monospace\" font-size=\"12\">" + _pd_xml_escape(subtitle) + "</text>",
+        str_join(rects_svg, "\n"),
+        "  <text x=\"" + str(pad_x) + "\" y=\"" + str(svg_h - 12) + "\" fill=\"#64748b\" font-family=\"ui-monospace, monospace\" font-size=\"11\">PBLang v3.0 Deterministic Call-Stack Profiler</text>",
+        "</svg>"
+    ];
+    return str_join(svg_lines, "\n");
+}
+
+// ── CLI Entrypoints (`pblang debug` & `pblang prof`) ──────────────────────────
+
+fn cli_debug_entry(cli_args = nil) {
+    let raw_args = if cli_args != nil { cli_args } else { os_args() };
+    let target_file = "";
+    let batch_mode = false;
+    let i = 0;
+    while i < len(raw_args) {
+        let a = raw_args[i];
+        if a == "--batch" { batch_mode = true; }
+        elif a != "debug" and a != "--debug" and not str_ends_with(a, "profiler_debugger.sapp") and not str_ends_with(a, "pblang") {
+            target_file = a;
+        }
+        i = i + 1;
+    }
+    if target_file == "" {
+        println("Usage: pblang debug <file.sapp> [--batch]");
+        return map{ ok: false };
+    }
+    let src = fs_read(target_file);
+    let dbg = create_debugger(src);
+    if batch_mode {
+        let final_st = continue_run(dbg);
+        println(json_stringify(final_st));
+        return map{ ok: true, state: final_st };
+    }
+
+    println("PBLang v3.0 Time-Travel Debugger — loaded " + target_file + " (" + str(len(dbg["snapshots"]) - 1) + " recorded steps)");
+    println("Commands: s (step_forward), b (step_backward), c (continue), break <line>, locals, stack, q (quit)");
+    while true {
+        let ln = read_line();
+        if ln == nil { break; }
+        let cmd = str_trim(ln);
+        if cmd == "q" or cmd == "quit" { break; }
+        elif cmd == "s" or cmd == "step" {
+            let st = step_forward(dbg);
+            println("[step " + str(st["cursor"]) + "/" + str(st["total_steps"]) + "] line " + str(st["line"]) + " | locals=" + json_stringify(st["locals"]));
+        } elif cmd == "b" or cmd == "back" {
+            let stb = step_backward(dbg);
+            println("[rewind " + str(stb["cursor"]) + "/" + str(stb["total_steps"]) + "] line " + str(stb["line"]) + " | locals=" + json_stringify(stb["locals"]));
+        } elif cmd == "c" or cmd == "continue" {
+            let stc = continue_run(dbg);
+            println("[continue -> step " + str(stc["cursor"]) + "] line " + str(stc["line"]) + " | locals=" + json_stringify(stc["locals"]));
+        } elif cmd == "locals" {
+            println(json_stringify(inspect_locals(dbg)));
+        } elif cmd == "stack" {
+            println(json_stringify(inspect_call_stack(dbg)));
+        } elif str_starts_with(cmd, "break ") {
+            let bl = _pd_parse_num(str_slice(cmd, 6, len(cmd)));
+            set_breakpoint(dbg, bl);
+            println("Breakpoint set at line " + str(bl));
+        }
+    }
+    return map{ ok: true };
+}
+
+fn cli_prof_entry(cli_args = nil) {
+    let raw_args = if cli_args != nil { cli_args } else { os_args() };
+    let target_file = "";
+    let out_svg = "";
+    let i = 0;
+    while i < len(raw_args) {
+        let a = raw_args[i];
+        if a == "-o" or a == "--svg" {
+            if i + 1 < len(raw_args) {
+                out_svg = raw_args[i + 1];
+                i = i + 2;
+                continue;
+            }
+        } elif a != "prof" and a != "--prof" and not str_ends_with(a, "profiler_debugger.sapp") and not str_ends_with(a, "pblang") {
+            target_file = a;
+        }
+        i = i + 1;
+    }
+    if target_file == "" {
+        println("Usage: pblang prof <file.sapp> [-o flamegraph.svg]");
+        return map{ ok: false };
+    }
+    let src = fs_read(target_file);
+    let prof = profile_source(src);
+    let svg = render_flamegraph_svg(prof["entries"], "PBLang CPU Flamegraph — " + path_basename(target_file));
+    if out_svg != "" {
+        fs_write(out_svg, svg);
+        println("Wrote SVG flamegraph to " + out_svg);
+    } else {
+        println(svg);
+    }
+    return map{ ok: true, profile: prof, svg: svg };
+}
+
+export PROFILER_DEBUGGER_VERSION,
+       create_debugger,
+       set_breakpoint,
+       clear_breakpoint,
+       step_forward,
+       step_backward,
+       continue_run,
+       inspect_locals,
+       inspect_call_stack,
+       reset_debugger,
+       profile_source,
+       render_flamegraph_svg,
+       cli_debug_entry,
+       cli_prof_entry;

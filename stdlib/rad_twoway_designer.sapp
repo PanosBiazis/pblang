@@ -1,0 +1,726 @@
+// stdlib/rad_twoway_designer.sapp -- Delphi / C# WinForms-Class Two-Way Visual RAD Designer
+// & Live SQLite Data-Aware Synchronizer for PBLang v3.0.
+//
+// Supported Visual Control Palette:
+//   Form, Label, Edit, Button, CheckBox, ComboBox, DataGrid, Chart
+//
+// Core Capabilities:
+//   1. form_to_sapp_code(form_spec) -- Generates clean, human-editable, syntactically valid
+//      .sapp GUI + SQLite CRUD + event-handler source code.
+//   2. sapp_code_to_form(sapp_src) -- Parses modified .sapp source code BACK into the visual
+//      form_spec AST while preserving custom user code inside on_click / on_change / on_save!
+//   3. bind_sqlite_live(db_handle_or_path, form_spec) -- Auto-creates missing SQLite tables,
+//      binds DataGrid/Chart/Edit controls to live rows, and exposes parameterized CRUD methods.
+
+let _SOURCE = import("stdlib:compiler/checked_source.sapp");
+
+let SUPPORTED_CONTROLS = [
+    "Form", "Label", "Edit", "Button", "CheckBox", "ComboBox", "DataGrid", "Chart"
+];
+
+fn _fail(msg) {
+    throw "rad_twoway_designer: " + msg;
+}
+
+fn _has_str(arr, item) {
+    let i = 0;
+    while i < len(arr) {
+        if arr[i] == item { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn _is_safe_sql_ident(name) {
+    if type(name) != "string" or len(name) == 0 or len(name) > 64 { return false; }
+    let i = 0;
+    while i < len(name) {
+        let c = strcharcodeat(name, i);
+        let alpha = (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95;
+        let digit = (c >= 48 and c <= 57);
+        if i == 0 and not alpha { return false; }
+        if not alpha and not digit { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _escape_sapp_str(s) {
+    let out = "";
+    let i = 0;
+    while i < len(s) {
+        let ch = str_slice(s, i, i + 1);
+        let code = strcharcodeat(s, i);
+        if ch == "\\" { out = out + "\\\\"; }
+        elif ch == "\"" { out = out + "\\\""; }
+        elif code == 10 { out = out + "\\n"; }
+        elif code == 13 { out = out + "\\r"; }
+        elif code == 9 { out = out + "\\t"; }
+        else { out = out + ch; }
+        i = i + 1;
+    }
+    return "\"" + out + "\"";
+}
+
+// Normalize a column descriptor ("amount REAL" or { name: "amount", sql_type: "REAL", primary_key: false })
+fn _normalize_column(col) {
+    if type(col) == "string" {
+        let trimmed = str_trim(col);
+        let parts = str_split(trimmed, " ");
+        let cname = str_trim(parts[0]);
+        if not _is_safe_sql_ident(cname) { _fail("invalid SQL column identifier: " + cname); }
+        let rest = if len(parts) > 1 { str_trim(str_slice(trimmed, len(cname), len(trimmed))) } else { "TEXT" };
+        let upper_r = str_upper(rest);
+        let is_pk = str_contains(upper_r, "PRIMARY KEY");
+        return map{
+            name: cname,
+            ddl: cname + " " + rest,
+            sql_type: rest,
+            primary_key: is_pk
+        };
+    }
+    if is_map(col) {
+        let cname2 = str(try col.name catch "");
+        if not _is_safe_sql_ident(cname2) { _fail("invalid SQL column identifier: " + cname2); }
+        let stype = str(try col.sql_type catch try col.type catch "TEXT");
+        let is_pk2 = (try col.primary_key catch false) == true or str_contains(str_upper(stype), "PRIMARY KEY");
+        let ddl2 = cname2 + " " + stype;
+        if is_pk2 and not str_contains(str_upper(stype), "PRIMARY KEY") {
+            ddl2 = ddl2 + " PRIMARY KEY";
+        }
+        return map{
+            name: cname2,
+            ddl: ddl2,
+            sql_type: stype,
+            primary_key: is_pk2
+        };
+    }
+    _fail("column descriptor must be a string or map");
+}
+
+// Validate and normalize a Form AST specification.
+fn normalize_form_spec(raw_spec) {
+    if not is_map(raw_spec) { _fail("form_spec must be a map"); }
+    let form_id = str(try raw_spec.id catch try raw_spec.name catch "frm_main");
+    if not _is_safe_sql_ident(form_id) { _fail("invalid form id: " + form_id); }
+    let title = str(try raw_spec.title catch try raw_spec.caption catch "Application Form");
+    let width = if map_has(raw_spec, "width") { num_floor(raw_spec.width) } else { 960 };
+    let height = if map_has(raw_spec, "height") { num_floor(raw_spec.height) } else { 640 };
+
+    let ds_out = nil;
+    if map_has(raw_spec, "data_source") and raw_spec.data_source != nil {
+        let ds = raw_spec.data_source;
+        if not is_map(ds) { _fail("data_source must be a map"); }
+        let tbl = str(try ds.table catch "");
+        if not _is_safe_sql_ident(tbl) { _fail("invalid data_source.table identifier: " + tbl); }
+        let raw_cols = if map_has(ds, "columns") and is_array(ds.columns) { ds.columns } else { ["id INTEGER PRIMARY KEY"] };
+        let norm_cols = [];
+        let pk_col = "";
+        let ci = 0;
+        while ci < len(raw_cols) {
+            let nc = _normalize_column(raw_cols[ci]);
+            if nc.primary_key and pk_col == "" { pk_col = nc.name; }
+            array_push(norm_cols, nc);
+            ci = ci + 1;
+        }
+        if pk_col == "" and len(norm_cols) > 0 { pk_col = norm_cols[0].name; }
+        ds_out = map{
+            table: tbl,
+            columns: norm_cols,
+            primary_key: pk_col,
+            filter_sql: str(try ds.filter_sql catch "")
+        };
+    }
+
+    let form_events = map{
+        on_load: "",
+        on_save: ""
+    };
+    if map_has(raw_spec, "events") and is_map(raw_spec.events) {
+        if map_has(raw_spec.events, "on_load") { form_events.on_load = str(raw_spec.events.on_load); }
+        if map_has(raw_spec.events, "on_save") { form_events.on_save = str(raw_spec.events.on_save); }
+    }
+    if map_has(raw_spec, "on_save") { form_events.on_save = str(raw_spec.on_save); }
+
+    let raw_ctrls = if map_has(raw_spec, "controls") and is_array(raw_spec.controls) { raw_spec.controls } else { [] };
+    let norm_ctrls = [];
+    let seen_ids = map{};
+    let i = 0;
+    while i < len(raw_ctrls) {
+        let c = raw_ctrls[i];
+        if not is_map(c) { _fail("control entry must be a map"); }
+        let ckind = str(try c.kind catch try c.type catch "");
+        if not _has_str(SUPPORTED_CONTROLS, ckind) or ckind == "Form" {
+            _fail("unsupported control kind: " + ckind);
+        }
+        let cid = str(try c.id catch try c.name catch ("ctrl_" + str(i)));
+        if not _is_safe_sql_ident(cid) { _fail("invalid control id: " + cid); }
+        if map_has(seen_ids, cid) { _fail("duplicate control id: " + cid); }
+        seen_ids[cid] = true;
+
+        let cevents = map{ on_click: "", on_change: "" };
+        if map_has(c, "events") and is_map(c.events) {
+            if map_has(c.events, "on_click") { cevents.on_click = str(c.events.on_click); }
+            if map_has(c.events, "on_change") { cevents.on_change = str(c.events.on_change); }
+        }
+        if map_has(c, "on_click") { cevents.on_click = str(c.on_click); }
+        if map_has(c, "on_change") { cevents.on_change = str(c.on_change); }
+
+        let c_items = [];
+        if map_has(c, "items") and is_array(c.items) {
+            let ii = 0;
+            while ii < len(c.items) { array_push(c_items, str(c.items[ii])); ii = ii + 1; }
+        }
+
+        array_push(norm_ctrls, map{
+            id: cid,
+            kind: ckind,
+            x: if map_has(c, "x") { num_floor(c.x) } else { 16 },
+            y: if map_has(c, "y") { num_floor(c.y) } else { 16 + i * 40 },
+            width: if map_has(c, "width") { num_floor(c.width) } else { 180 },
+            height: if map_has(c, "height") { num_floor(c.height) } else { 32 },
+            caption: str(try c.caption catch try c.text catch cid),
+            field: str(try c.field catch ""),
+            value: try c.value catch nil,
+            items: c_items,
+            series_field: str(try c.series_field catch ""),
+            rows: if map_has(c, "rows") and is_array(c.rows) { c.rows } else { [] },
+            points: if map_has(c, "points") and is_array(c.points) { c.points } else { [] },
+            events: cevents
+        });
+        i = i + 1;
+    }
+
+    return map{
+        kind: "Form",
+        id: form_id,
+        title: title,
+        width: width,
+        height: height,
+        data_source: ds_out,
+        events: form_events,
+        controls: norm_ctrls
+    };
+}
+
+// Helper constructors for programmatic RAD form building
+fn create_form(id, title, width = 960, height = 640, data_source = nil) {
+    return normalize_form_spec(map{
+        id: id,
+        title: title,
+        width: width,
+        height: height,
+        data_source: data_source,
+        controls: []
+    });
+}
+
+fn add_control(form_spec, control_spec) {
+    let f = normalize_form_spec(form_spec);
+    array_push(f.controls, control_spec);
+    return normalize_form_spec(f);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 1: Forward Synchronizer: Visual Form AST -> Clean Human-Editable .sapp Code
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _indent_handler_body(raw_body) {
+    let trimmed = str_trim(raw_body);
+    if trimmed == "" {
+        return "    return true;";
+    }
+    let lines = str_split(trimmed, "\n");
+    let out = [];
+    let i = 0;
+    while i < len(lines) {
+        array_push(out, "    " + str_trim(lines[i]));
+        i = i + 1;
+    }
+    return str_join(out, "\n");
+}
+
+fn _format_str_array(items) {
+    let parts = [];
+    let i = 0;
+    while i < len(items) {
+        array_push(parts, _escape_sapp_str(str(items[i])));
+        i = i + 1;
+    }
+    return "[" + str_join(parts, ", ") + "]";
+}
+
+fn form_to_sapp_code(form_spec) {
+    let f = normalize_form_spec(form_spec);
+    let lines = [];
+
+    array_push(lines, "// @pblang-rad-form v3.0 — Two-Way Visual Designer Synchronized Unit");
+    array_push(lines, "// Edit control geometry/captions in build_form_model() or custom logic in event handlers.");
+    array_push(lines, "");
+
+    // 1. Visual Form & Data-Source Model Declaration
+    array_push(lines, "fn build_form_model() {");
+    if f.data_source != nil {
+        let col_ddls = [];
+        let ci = 0;
+        while ci < len(f.data_source.columns) {
+            array_push(col_ddls, f.data_source.columns[ci].ddl);
+            ci = ci + 1;
+        }
+        array_push(lines, "    let data_source = map{");
+        array_push(lines, "        table: " + _escape_sapp_str(f.data_source.table) + ",");
+        array_push(lines, "        columns: " + _format_str_array(col_ddls) + ",");
+        array_push(lines, "        filter_sql: " + _escape_sapp_str(f.data_source.filter_sql));
+        array_push(lines, "    };");
+    } else {
+        array_push(lines, "    let data_source = nil;");
+    }
+
+    array_push(lines, "    let controls = [");
+    let i = 0;
+    while i < len(f.controls) {
+        let c = f.controls[i];
+        let comma = if i + 1 < len(f.controls) { "," } else { "" };
+        array_push(lines, "        map{");
+        array_push(lines, "            id: " + _escape_sapp_str(c.id) + ",");
+        array_push(lines, "            kind: " + _escape_sapp_str(c.kind) + ",");
+        array_push(lines, "            x: " + str(c.x) + ",");
+        array_push(lines, "            y: " + str(c.y) + ",");
+        array_push(lines, "            width: " + str(c.width) + ",");
+        array_push(lines, "            height: " + str(c.height) + ",");
+        array_push(lines, "            caption: " + _escape_sapp_str(c.caption) + ",");
+        array_push(lines, "            field: " + _escape_sapp_str(c.field) + ",");
+        array_push(lines, "            series_field: " + _escape_sapp_str(c.series_field) + ",");
+        array_push(lines, "            items: " + _format_str_array(c.items));
+        array_push(lines, "        }" + comma);
+        i = i + 1;
+    }
+    array_push(lines, "    ];");
+
+    array_push(lines, "    return map{");
+    array_push(lines, "        kind: \"Form\",");
+    array_push(lines, "        id: " + _escape_sapp_str(f.id) + ",");
+    array_push(lines, "        title: " + _escape_sapp_str(f.title) + ",");
+    array_push(lines, "        width: " + str(f.width) + ",");
+    array_push(lines, "        height: " + str(f.height) + ",");
+    array_push(lines, "        data_source: data_source,");
+    array_push(lines, "        controls: controls");
+    array_push(lines, "    };");
+    array_push(lines, "}");
+    array_push(lines, "");
+
+    // 2. Data-Aware SQLite Schema & Query Helpers
+    if f.data_source != nil {
+        let ddl_parts = [];
+        let ci2 = 0;
+        while ci2 < len(f.data_source.columns) {
+            array_push(ddl_parts, f.data_source.columns[ci2].ddl);
+            ci2 = ci2 + 1;
+        }
+        let create_sql = "CREATE TABLE IF NOT EXISTS " + f.data_source.table + " (" + str_join(ddl_parts, ", ") + ")";
+        let select_sql = "SELECT * FROM " + f.data_source.table;
+        if str_trim(f.data_source.filter_sql) != "" {
+            select_sql = select_sql + " WHERE " + f.data_source.filter_sql;
+        }
+        array_push(lines, "fn init_form_schema(db) {");
+        array_push(lines, "    return sqlite_exec(db, " + _escape_sapp_str(create_sql) + ", nil);");
+        array_push(lines, "}");
+        array_push(lines, "");
+        array_push(lines, "fn load_form_rows(db) {");
+        array_push(lines, "    return sqlite_query(db, " + _escape_sapp_str(select_sql) + ", nil);");
+        array_push(lines, "}");
+        array_push(lines, "");
+    }
+
+    // 3. Form-Level & Control-Level Event Handlers (Two-Way Preserved Blocks!)
+    array_push(lines, "fn on_save(form_state, db) {");
+    array_push(lines, "    // @rad_handler: form.on_save");
+    array_push(lines, _indent_handler_body(f.events.on_save));
+    array_push(lines, "}");
+    array_push(lines, "");
+
+    if str_trim(f.events.on_load) != "" {
+        array_push(lines, "fn on_load(form_state, db) {");
+        array_push(lines, "    // @rad_handler: form.on_load");
+        array_push(lines, _indent_handler_body(f.events.on_load));
+        array_push(lines, "}");
+        array_push(lines, "");
+    }
+
+    i = 0;
+    while i < len(f.controls) {
+        let ctrl = f.controls[i];
+        if ctrl.kind == "Button" or str_trim(ctrl.events.on_click) != "" {
+            array_push(lines, "fn on_" + ctrl.id + "_click(form_state, db) {");
+            array_push(lines, "    // @rad_handler: " + ctrl.id + ".on_click");
+            array_push(lines, _indent_handler_body(ctrl.events.on_click));
+            array_push(lines, "}");
+            array_push(lines, "");
+        }
+        if str_trim(ctrl.events.on_change) != "" {
+            array_push(lines, "fn on_" + ctrl.id + "_change(form_state, new_val, db) {");
+            array_push(lines, "    // @rad_handler: " + ctrl.id + ".on_change");
+            array_push(lines, _indent_handler_body(ctrl.events.on_change));
+            array_push(lines, "}");
+            array_push(lines, "");
+        }
+        i = i + 1;
+    }
+
+    array_push(lines, "export build_form_model, on_save;");
+    return str_join(lines, "\n") + "\n";
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 2: Reverse Synchronizer: Modified .sapp Code -> Visual Form AST
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _eval_const_ast(node, env) {
+    if node == nil { return nil; }
+    let k = node.kind;
+    if k == "number" { return parse_number(str(node.value)); }
+    if k == "string" { return node.value; }
+    if k == "bool" { return node.value; }
+    if k == "nil" { return nil; }
+    if k == "ident" {
+        if map_has(env, node.name) { return env[node.name]; }
+        return nil;
+    }
+    if k == "unary" and node.op == "-" {
+        let opd = try node.operand catch node.expr;
+        return 0 - _eval_const_ast(opd, env);
+    }
+    if k == "binary" {
+        let lv = _eval_const_ast(node.left, env);
+        let rv = _eval_const_ast(node.right, env);
+        if node.op == "+" { return lv + rv; }
+        if node.op == "-" { return lv - rv; }
+        if node.op == "*" { return lv * rv; }
+        if node.op == "/" { return lv / rv; }
+    }
+    if k == "array" {
+        let out = [];
+        let i = 0;
+        while i < len(node.items) {
+            array_push(out, _eval_const_ast(node.items[i], env));
+            i = i + 1;
+        }
+        return out;
+    }
+    if k == "map" {
+        let m = map{};
+        let j = 0;
+        while j < len(node.entries) {
+            let ent = node.entries[j];
+            m[ent.key] = _eval_const_ast(ent.value, env);
+            j = j + 1;
+        }
+        return m;
+    }
+    return nil;
+}
+
+// Extract raw source text inside `fn <fn_name>(...) { ... }` with string/comment-aware brace matching.
+fn _extract_fn_body_source(sapp_src, fn_name) {
+    let needle = "fn " + fn_name + "(";
+    let start_idx = str_index_of(sapp_src, needle);
+    if start_idx < 0 { return nil; }
+
+    let bytes = str_to_bytes(sapp_src);
+    let n = len(bytes);
+    // Convert char index to byte index (ASCII header prefix before `fn `)
+    let pos = len(str_to_bytes(str_slice(sapp_src, 0, start_idx))) + len(str_to_bytes(needle));
+
+    // Advance past parameter list `)` to opening `{`
+    let open_brace = -1;
+    while pos < n {
+        if bytes[pos] == 123 { // '{'
+            open_brace = pos;
+            break;
+        }
+        pos = pos + 1;
+    }
+    if open_brace < 0 { return nil; }
+
+    let depth = 1;
+    let p = open_brace + 1;
+    let close_brace = -1;
+    while p < n and depth > 0 {
+        let b = bytes[p];
+        let b2 = if p + 1 < n { bytes[p + 1] } else { -1 };
+        if b == 34 {
+            // String literal
+            p = p + 1;
+            while p < n {
+                if bytes[p] == 92 and p + 1 < n { p = p + 2; }
+                elif bytes[p] == 34 { p = p + 1; break; }
+                else { p = p + 1; }
+            }
+        } elif b == 47 and b2 == 47 {
+            // Line comment
+            while p < n and bytes[p] != 10 { p = p + 1; }
+        } elif b == 47 and b2 == 42 {
+            // Block comment
+            p = p + 2;
+            while p + 1 < n {
+                if bytes[p] == 42 and bytes[p + 1] == 47 { p = p + 2; break; }
+                p = p + 1;
+            }
+        } else {
+            if b == 123 { depth = depth + 1; }
+            elif b == 125 {
+                depth = depth - 1;
+                if depth == 0 {
+                    close_brace = p;
+                    break;
+                }
+            }
+            p = p + 1;
+        }
+    }
+    if close_brace < 0 { return nil; }
+
+    let raw_inner = bytes_to_str(slice(bytes, open_brace + 1, close_brace));
+    let raw_lines = str_split(raw_inner, "\n");
+    let kept = [];
+    let li = 0;
+    while li < len(raw_lines) {
+        let trimmed = str_trim(raw_lines[li]);
+        if not str_starts_with(trimmed, "// @rad_handler:") {
+            if trimmed != "" { array_push(kept, trimmed); }
+        }
+        li = li + 1;
+    }
+    let joined = str_join(kept, "\n");
+    if joined == "return true;" { return ""; }
+    return joined;
+}
+
+fn sapp_code_to_form(sapp_src) {
+    if type(sapp_src) != "string" or str_trim(sapp_src) == "" {
+        _fail("sapp_src must be a non-empty .sapp source string");
+    }
+    let ast = _SOURCE.parse_source(sapp_src);
+
+    let build_fn = nil;
+    let i = 0;
+    while i < len(ast.stmts) {
+        let s = ast.stmts[i];
+        if s.kind == "fn" and s.name == "build_form_model" {
+            build_fn = s;
+        }
+        i = i + 1;
+    }
+    if build_fn == nil {
+        _fail("missing fn build_form_model() in RAD .sapp source");
+    }
+
+    let env = map{};
+    let model_raw = nil;
+    let bstmts = if is_map(build_fn.body) and map_has(build_fn.body, "stmts") { build_fn.body.stmts } else { build_fn.body };
+    let bi = 0;
+    while bi < len(bstmts) {
+        let st = bstmts[bi];
+        if st.kind == "let" or st.kind == "const" {
+            env[st.name] = _eval_const_ast(st.value, env);
+        } elif st.kind == "expr_stmt" and st.expr != nil and st.expr.kind == "call" {
+            // Also support imperative `array_push(controls, map{...})` edits made by hand!
+            let cname = try st.expr.func.name catch "";
+            if (cname == "push" or cname == "array_push") and len(st.expr.args) == 2 and st.expr.args[0].kind == "ident" {
+                let arr_nm = st.expr.args[0].name;
+                if map_has(env, arr_nm) and is_array(env[arr_nm]) {
+                    array_push(env[arr_nm], _eval_const_ast(st.expr.args[1], env));
+                }
+            }
+        } elif st.kind == "return" {
+            model_raw = _eval_const_ast(st.value, env);
+        }
+        bi = bi + 1;
+    }
+
+    if not is_map(model_raw) {
+        _fail("build_form_model() did not return a valid form map");
+    }
+
+    let form_spec = normalize_form_spec(model_raw);
+
+    // Recover user-edited event handler bodies from top-level functions in `sapp_src`!
+    let save_code = _extract_fn_body_source(sapp_src, "on_save");
+    if save_code != nil { form_spec.events.on_save = save_code; }
+
+    let load_code = _extract_fn_body_source(sapp_src, "on_load");
+    if load_code != nil { form_spec.events.on_load = load_code; }
+
+    let ci = 0;
+    while ci < len(form_spec.controls) {
+        let ctrl = form_spec.controls[ci];
+        let click_code = _extract_fn_body_source(sapp_src, "on_" + ctrl.id + "_click");
+        if click_code != nil { ctrl.events.on_click = click_code; }
+        let change_code = _extract_fn_body_source(sapp_src, "on_" + ctrl.id + "_change");
+        if change_code != nil { ctrl.events.on_change = change_code; }
+        ci = ci + 1;
+    }
+
+    return form_spec;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PART 3: Live SQLite Data-Aware Synchronizer & Parameterized CRUD Controller
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn _sync_rows_into_form(form_spec, rows) {
+    let f = normalize_form_spec(form_spec);
+    let first_row = if len(rows) > 0 { rows[0] } else { nil };
+    let i = 0;
+    while i < len(f.controls) {
+        let c = f.controls[i];
+        if c.kind == "DataGrid" {
+            c.rows = rows;
+            c.row_count = len(rows);
+        } elif c.kind == "Chart" {
+            let pts = [];
+            let sfield = if c.series_field != "" { c.series_field } else { c.field };
+            if sfield != "" {
+                let ri = 0;
+                while ri < len(rows) {
+                    if map_has(rows[ri], sfield) {
+                        array_push(pts, rows[ri][sfield]);
+                    }
+                    ri = ri + 1;
+                }
+            }
+            c.points = pts;
+        } elif c.field != "" and first_row != nil and map_has(first_row, c.field) {
+            c.value = first_row[c.field];
+        }
+        i = i + 1;
+    }
+    return f;
+}
+
+fn bind_sqlite_live(db_handle_or_path, form_spec) {
+    let f = normalize_form_spec(form_spec);
+    if f.data_source == nil {
+        _fail("bind_sqlite_live requires form_spec.data_source ({ table, columns, filter_sql })");
+    }
+
+    let db = nil;
+    let owns_db = false;
+    if type(db_handle_or_path) == "string" {
+        db = sqlite_open(db_handle_or_path);
+        owns_db = true;
+    } elif type(db_handle_or_path) == "number" {
+        db = db_handle_or_path;
+    } else {
+        _fail("db_handle_or_path must be a SQLite handle number or path string");
+    }
+
+    let ds = f.data_source;
+    let col_ddls = [];
+    let col_names = [];
+    let i = 0;
+    while i < len(ds.columns) {
+        array_push(col_ddls, ds.columns[i].ddl);
+        array_push(col_names, ds.columns[i].name);
+        i = i + 1;
+    }
+
+    // 1. Auto-create missing SQLite schema
+    let create_sql = "CREATE TABLE IF NOT EXISTS " + ds.table + " (" + str_join(col_ddls, ", ") + ")";
+    sqlite_exec(db, create_sql, nil);
+
+    // 2. Query live rows
+    let select_sql = "SELECT * FROM " + ds.table;
+    if str_trim(ds.filter_sql) != "" {
+        select_sql = select_sql + " WHERE " + ds.filter_sql;
+    }
+
+    let state = map{
+        rows: [],
+        form: f
+    };
+
+    let refresh_fn = fn() {
+        let live_rows = sqlite_query(db, select_sql, nil);
+        state.rows = live_rows;
+        state.form = _sync_rows_into_form(state.form, live_rows);
+        return live_rows;
+    };
+
+    refresh_fn();
+
+    let insert_fn = fn(record_map) {
+        let ins_cols = [];
+        let placeholders = [];
+        let params = [];
+        let ci = 0;
+        while ci < len(col_names) {
+            let cn = col_names[ci];
+            if map_has(record_map, cn) {
+                array_push(ins_cols, cn);
+                array_push(placeholders, "?");
+                array_push(params, record_map[cn]);
+            }
+            ci = ci + 1;
+        }
+        if len(ins_cols) == 0 { _fail("insert_row: record_map matches zero table columns"); }
+        let sql = "INSERT INTO " + ds.table + " (" + str_join(ins_cols, ", ") + ") VALUES (" + str_join(placeholders, ", ") + ")";
+        sqlite_exec(db, sql, params);
+        let rowid = sqlite_last_insert_rowid(db);
+        refresh_fn();
+        return rowid;
+    };
+
+    let update_fn = fn(pk_val, updates_map) {
+        let sets = [];
+        let params = [];
+        let ci = 0;
+        while ci < len(col_names) {
+            let cn = col_names[ci];
+            if cn != ds.primary_key and map_has(updates_map, cn) {
+                array_push(sets, cn + " = ?");
+                array_push(params, updates_map[cn]);
+            }
+            ci = ci + 1;
+        }
+        if len(sets) == 0 { return 0; }
+        array_push(params, pk_val);
+        let sql = "UPDATE " + ds.table + " SET " + str_join(sets, ", ") + " WHERE " + ds.primary_key + " = ?";
+        let changed = sqlite_exec(db, sql, params);
+        refresh_fn();
+        return changed;
+    };
+
+    let delete_fn = fn(pk_val) {
+        let sql = "DELETE FROM " + ds.table + " WHERE " + ds.primary_key + " = ?";
+        let changed = sqlite_exec(db, sql, [pk_val]);
+        refresh_fn();
+        return changed;
+    };
+
+    return map{
+        ok: true,
+        db: db,
+        owns_db: owns_db,
+        table: ds.table,
+        primary_key: ds.primary_key,
+        column_names: col_names,
+        get_rows: fn() { return state.rows; },
+        get_form: fn() { return state.form; },
+        rows: state.rows,
+        row_count: len(state.rows),
+        form: state.form,
+        refresh: refresh_fn,
+        insert_row: insert_fn,
+        update_row: update_fn,
+        delete_row: delete_fn,
+        close: fn() {
+            if owns_db { sqlite_close(db); }
+            return true;
+        }
+    };
+}
+
+export SUPPORTED_CONTROLS;
+export normalize_form_spec, create_form, add_control;
+export form_to_sapp_code, sapp_code_to_form, bind_sqlite_live;

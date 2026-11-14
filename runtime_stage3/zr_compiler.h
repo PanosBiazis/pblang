@@ -861,7 +861,8 @@ typedef enum {
     EX_IF,
     EX_TRY,
     EX_BLOCK,
-    EX_MATCH
+    EX_MATCH,
+    EX_COMPTIME
 } ZrExprKind;
 
 struct ZrExpr {
@@ -886,6 +887,10 @@ struct ZrExpr {
             ZrParam    *params;
             size_t      param_count;
             bool        is_async;
+            ZrExpr    **req_exprs;
+            size_t      req_count;
+            ZrExpr    **ens_exprs;
+            size_t      ens_count;
             ZrStmt    **body;
             size_t      body_count;
         } fn;
@@ -944,6 +949,10 @@ struct ZrStmt {
             ZrParam    *params;
             size_t      param_count;
             bool        is_async;
+            ZrExpr    **req_exprs;
+            size_t      req_count;
+            ZrExpr    **ens_exprs;
+            size_t      ens_count;
             ZrStmt    **body;
             size_t      body_count;
         } fn_s;
@@ -1176,9 +1185,13 @@ static bool zp_skip_type_expr(ZrParser *p) {
                     else zp_advance(p);
                 }
             }
-            while (zp_check(p, TOK_LBRACK) && zp_peek_n(p, 1)->kind == TOK_RBRACK) {
-                zp_advance(p);
-                zp_advance(p);
+            while (zp_match(p, TOK_LBRACK)) {
+                int d = 1;
+                while (d > 0 && !zp_check(p, TOK_EOF)) {
+                    if (zp_match(p, TOK_LBRACK)) d++;
+                    else if (zp_match(p, TOK_RBRACK)) d--;
+                    else zp_advance(p);
+                }
             }
         }
         if (!zp_match(p, TOK_PIPE)) break;
@@ -1220,6 +1233,49 @@ static bool zp_parse_param_list(ZrParser *p, ZrParam **out_params, size_t *out_c
     }
     *out_params = arr;
     *out_count = n;
+    return true;
+}
+
+static bool zp_parse_fn_contracts(ZrParser *p,
+                                  ZrExpr ***out_reqs, size_t *out_req_n,
+                                  ZrExpr ***out_ens,  size_t *out_ens_n) {
+    ZrExpr **reqs = NULL, **ens = NULL;
+    size_t rn = 0, rcap = 0, en = 0, ecap = 0;
+    bool saved_nb = p->no_struct_brace;
+    p->no_struct_brace = true;
+    while (zp_check_ident_str(p, "requires") || zp_check_ident_str(p, "ensures")) {
+        bool is_req = zp_check_ident_str(p, "requires");
+        zp_advance(p);
+        ZrExpr *ce = zp_parse_expr(p);
+        if (!ce) {
+            p->no_struct_brace = saved_nb;
+            return false;
+        }
+        zp_match(p, TOK_COMMA);
+        zp_match(p, TOK_SEMI);
+        if (is_req) {
+            if (rn >= rcap) {
+                rcap = rcap ? rcap * 2 : 2;
+                ZrExpr **nr = (ZrExpr **)zr_arena_alloc(p->arena, rcap * sizeof(ZrExpr *));
+                if (rn > 0) memcpy(nr, reqs, rn * sizeof(ZrExpr *));
+                reqs = nr;
+            }
+            reqs[rn++] = ce;
+        } else {
+            if (en >= ecap) {
+                ecap = ecap ? ecap * 2 : 2;
+                ZrExpr **ne = (ZrExpr **)zr_arena_alloc(p->arena, ecap * sizeof(ZrExpr *));
+                if (en > 0) memcpy(ne, ens, en * sizeof(ZrExpr *));
+                ens = ne;
+            }
+            ens[en++] = ce;
+        }
+    }
+    p->no_struct_brace = saved_nb;
+    *out_reqs = reqs;
+    *out_req_n = rn;
+    *out_ens = ens;
+    *out_ens_n = en;
     return true;
 }
 
@@ -1782,6 +1838,9 @@ static ZrExpr *zp_parse_primary(ZrParser *p) {
             }
             ZrParam *params = NULL; size_t pcount = 0;
             if (!zp_parse_param_list(p, &params, &pcount)) { p->depth--; return NULL; }
+            ZrExpr **reqs = NULL, **ens = NULL;
+            size_t req_n = 0, ens_n = 0;
+            if (!zp_parse_fn_contracts(p, &reqs, &req_n, &ens, &ens_n)) { p->depth--; return NULL; }
             ZrStmt **body = NULL; size_t bcount = 0;
             bool saved_nb = p->no_struct_brace;
             p->no_struct_brace = false;
@@ -1793,6 +1852,10 @@ static ZrExpr *zp_parse_primary(ZrParser *p) {
             res->u.fn.params = params;
             res->u.fn.param_count = pcount;
             res->u.fn.is_async = is_async;
+            res->u.fn.req_exprs = reqs;
+            res->u.fn.req_count = req_n;
+            res->u.fn.ens_exprs = ens;
+            res->u.fn.ens_count = ens_n;
             res->u.fn.body = body;
             res->u.fn.body_count = bcount;
             break;
@@ -1831,6 +1894,7 @@ static ZrExpr *zp_parse_primary(ZrParser *p) {
                 } else if ((try_was_block || !p->no_struct_brace) &&
                            zp_check(p, TOK_IDENT) &&
                            strcmp(zp_peek(p)->lexeme, "map") != 0 &&
+                           strcmp(zp_peek(p)->lexeme, "caps") != 0 &&
                            zp_peek_n(p, 1)->kind == TOK_LBRACE) {
                     err_var = zp_advance(p)->lexeme;
                     zp_advance(p);
@@ -1852,11 +1916,32 @@ static ZrExpr *zp_parse_primary(ZrParser *p) {
             break;
         }
         default: {
-            /* Contextual `map{ ... }` */
-            if (t->kind == TOK_IDENT && strcmp(t->lexeme, "map") == 0 && zp_peek_n(p, 1)->kind == TOK_LBRACE) {
+            /* Contextual `map{ ... }` and `caps{ ... }` */
+            if (t->kind == TOK_IDENT &&
+                (strcmp(t->lexeme, "map") == 0 || strcmp(t->lexeme, "caps") == 0) &&
+                zp_peek_n(p, 1)->kind == TOK_LBRACE) {
                 zp_advance(p);
                 zp_advance(p);
                 res = zp_parse_map_body(p, ln);
+                break;
+            }
+            /* Contextual `comptime(expr)` and `comptime { stmts }` */
+            if (t->kind == TOK_IDENT && strcmp(t->lexeme, "comptime") == 0 &&
+                (zp_peek_n(p, 1)->kind == TOK_LPAREN || zp_peek_n(p, 1)->kind == TOK_LBRACE)) {
+                zp_advance(p);
+                ZrExpr *inner = NULL;
+                bool saved_nb = p->no_struct_brace;
+                p->no_struct_brace = false;
+                if (zp_match(p, TOK_LPAREN)) {
+                    inner = zp_parse_expr(p);
+                    if (inner && !zp_expect(p, TOK_RPAREN, "')' after comptime expression")) inner = NULL;
+                } else if (zp_match(p, TOK_LBRACE)) {
+                    inner = zp_parse_block_expr(p, zp_peek(p)->line);
+                }
+                p->no_struct_brace = saved_nb;
+                if (!inner) { p->depth--; return NULL; }
+                res = zp_alloc_expr(p, EX_COMPTIME, ln);
+                res->u.unary.rhs = inner;
                 break;
             }
             /* Contextual `match <scrut> { ... }` / `switch <scrut> { ... }` (preserve variables & calls named `match`/`switch`!) */
@@ -1963,7 +2048,15 @@ static ZrExpr *zp_parse_postfix(ZrParser *p) {
             ce->u.call.callee = cur;
             ce->u.call.args = args;
             ce->u.call.argc = argc;
-            cur = ce;
+            if (cur->kind == EX_VAR && strcmp(cur->u.var, "import") == 0 && argc == 1 &&
+                zp_check_ident_str(p, "with")) {
+                zp_advance(p);
+                ZrExpr *caps_e = zp_parse_postfix(p);
+                if (!caps_e) return NULL;
+                cur = zp_mk_call2(p, "import_with_caps", args[0], caps_e, ln);
+            } else {
+                cur = ce;
+            }
         } else if (zp_match(p, TOK_DOT)) {
             const char *attr = zp_expect_any_name(p, "attribute name");
             if (!attr) return NULL;
@@ -2711,6 +2804,9 @@ static ZrStmt *zp_parse_class_stmt(ZrParser *p, uint32_t line) {
         if (!mname) return NULL;
         ZrParam *params = NULL; size_t pcount = 0;
         if (!zp_parse_param_list(p, &params, &pcount)) return NULL;
+        ZrExpr **reqs = NULL, **ens = NULL;
+        size_t req_n = 0, ens_n = 0;
+        if (!zp_parse_fn_contracts(p, &reqs, &req_n, &ens, &ens_n)) return NULL;
         ZrStmt **body = NULL; size_t bcount = 0;
         if (!zp_parse_block_stmts(p, &body, &bcount)) return NULL;
         zp_match(p, TOK_SEMI);
@@ -2722,6 +2818,10 @@ static ZrStmt *zp_parse_class_stmt(ZrParser *p, uint32_t line) {
         fe->u.fn.name = mname;
         fe->u.fn.params = params;
         fe->u.fn.param_count = pcount;
+        fe->u.fn.req_exprs = reqs;
+        fe->u.fn.req_count = req_n;
+        fe->u.fn.ens_exprs = ens;
+        fe->u.fn.ens_count = ens_n;
         fe->u.fn.body = body;
         fe->u.fn.body_count = bcount;
 
@@ -3007,6 +3107,9 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
                 if (!fname) break;
                 ZrParam *params = NULL; size_t pcount = 0;
                 if (!zp_parse_param_list(p, &params, &pcount)) break;
+                ZrExpr **reqs = NULL, **ens = NULL;
+                size_t req_n = 0, ens_n = 0;
+                if (!zp_parse_fn_contracts(p, &reqs, &req_n, &ens, &ens_n)) break;
                 ZrStmt **body = NULL; size_t bcount = 0;
                 if (!zp_parse_block_stmts(p, &body, &bcount)) break;
                 res = zp_alloc_stmt(p, ST_FN, ln);
@@ -3014,6 +3117,10 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
                 res->u.fn_s.params = params;
                 res->u.fn_s.param_count = pcount;
                 res->u.fn_s.is_async = is_async;
+                res->u.fn_s.req_exprs = reqs;
+                res->u.fn_s.req_count = req_n;
+                res->u.fn_s.ens_exprs = ens;
+                res->u.fn_s.ens_count = ens_n;
                 res->u.fn_s.body = body;
                 res->u.fn_s.body_count = bcount;
                 break;
@@ -3255,11 +3362,20 @@ static ZrStmt *zp_parse_stmt(ZrParser *p) {
                 res = zp_parse_goto_block(p, ln);
                 break;
             }
-            /* Contextual `import "path"` statement form */
+            /* Contextual `import "path" [with caps{...}]` statement form */
             if (zp_check_ident_str(p, "import") && zp_peek_n(p, 1)->kind == TOK_STR) {
                 zp_advance(p);
                 ZrToken *st = zp_advance(p);
-                ZrExpr *call = zp_mk_call1(p, "import", zp_mk_str(p, st->lexeme, st->lex_len, ln), ln);
+                ZrExpr *path_e = zp_mk_str(p, st->lexeme, st->lex_len, ln);
+                ZrExpr *call = NULL;
+                if (zp_check_ident_str(p, "with")) {
+                    zp_advance(p);
+                    ZrExpr *caps_e = zp_parse_postfix(p);
+                    if (!caps_e) break;
+                    call = zp_mk_call2(p, "import_with_caps", path_e, caps_e, ln);
+                } else {
+                    call = zp_mk_call1(p, "import", path_e, ln);
+                }
                 res = zp_alloc_stmt(p, ST_EXPR, ln);
                 res->u.expr = call;
                 break;
@@ -3375,6 +3491,11 @@ typedef struct ZrCompiler {
     uint32_t           upvalue_count;
     uint32_t           upvalue_cap;
     ZrLoopCtx         *loop;
+    ZrExpr *const     *ens_exprs;
+    size_t             ens_count;
+    const char        *fn_contract_name;
+    ZrStmt *const     *script_top_stmts;
+    size_t             script_top_len;
     char              *err_buf;
 } ZrCompiler;
 
@@ -3398,6 +3519,7 @@ static uint32_t zc_emit(ZrCompiler *c, uint8_t op, uint32_t arg, uint32_t line) 
     uint32_t idx = fn->code_len++;
     memset(&fn->code[idx], 0, sizeof(PbInstr));
     fn->code[idx].op = op;
+    fn->code[idx].orig_op = op;
     fn->code[idx].arg = arg;
     fn->code[idx].line = line;
     return idx;
@@ -3429,6 +3551,7 @@ static uint32_t zc_add_const(ZrCompiler *c, PbValue v) {
     }
     uint32_t idx = fn->const_len++;
     fn->consts[idx] = v;
+    vm_write_barrier(c->vm, (PbObj *)fn, v);
     return idx;
 }
 
@@ -3518,12 +3641,17 @@ static void zc_emit_pop_to_depth(ZrCompiler *c, int target_depth, uint32_t line)
 }
 
 static bool zc_compile_expr(ZrCompiler *c, const ZrExpr *e);
+static bool zc_compile_comptime_expr(ZrCompiler *c, const ZrExpr *e, uint32_t ln);
 static bool zc_compile_stmt(ZrCompiler *c, const ZrStmt *s);
 static PbFunc *zc_compile_fn_node(ZrCompiler *enclosing,
                                   const char *name,
                                   const ZrParam *params,
                                   size_t param_count,
                                   bool is_async,
+                                  ZrExpr *const *req_exprs,
+                                  size_t req_count,
+                                  ZrExpr *const *ens_exprs,
+                                  size_t ens_count,
                                   ZrStmt *const *body,
                                   size_t body_count,
                                   uint32_t line,
@@ -3934,7 +4062,10 @@ static bool zc_compile_expr(ZrCompiler *c, const ZrExpr *e) {
             PbCaptureSpec *caps = NULL;
             uint32_t ncaps = 0;
             PbFunc *sub = zc_compile_fn_node(c, e->u.fn.name, e->u.fn.params, e->u.fn.param_count,
-                                             e->u.fn.is_async, e->u.fn.body, e->u.fn.body_count,
+                                             e->u.fn.is_async,
+                                             e->u.fn.req_exprs, e->u.fn.req_count,
+                                             e->u.fn.ens_exprs, e->u.fn.ens_count,
+                                             e->u.fn.body, e->u.fn.body_count,
                                              ln, &caps, &ncaps);
             if (!sub) return false;
             uint32_t fidx = zc_add_const(c, val_obj(sub));
@@ -4049,6 +4180,177 @@ static bool zc_compile_expr(ZrCompiler *c, const ZrExpr *e) {
             c->local_count--;    /* leaves res_slot on stack */
             return true;
         }
+
+        case EX_COMPTIME:
+            return zc_compile_comptime_expr(c, e, ln);
+    }
+    return true;
+}
+
+static bool zc_compile_comptime_expr(ZrCompiler *c, const ZrExpr *e, uint32_t ln) {
+    ZrCompiler *rc = c;
+    while (rc->enclosing) rc = rc->enclosing;
+
+    PbVM *ct_vm = (PbVM *)zr_xcalloc(1, sizeof(PbVM));
+    vm_init(ct_vm);
+    memset(&ct_vm->caps, 0, sizeof(ct_vm->caps)); /* strictly sandboxed: zero host I/O */
+    ct_vm->gc_inhibit++;
+
+    PbFunc *ct_fn = pb_func_new(ct_vm);
+    ct_fn->name = pb_str_c(ct_vm, "<comptime>");
+    ct_fn->source_name = pb_str_c(ct_vm, "<comptime>");
+
+    char ct_err[512];
+    ct_err[0] = '\0';
+    ZrCompiler ct_c;
+    memset(&ct_c, 0, sizeof(ct_c));
+    ct_c.vm = ct_vm;
+    ct_c.fn = ct_fn;
+    ct_c.is_script = true;
+    ct_c.scope_depth = 0;
+    ct_c.err_buf = ct_err;
+
+    bool ct_ok = true;
+    if (rc->script_top_stmts) {
+        for (size_t i = 0; i < rc->script_top_len && ct_ok; i++) {
+            const ZrStmt *ts = rc->script_top_stmts[i];
+            if (ts->kind == ST_FN) {
+                ct_ok = zc_compile_stmt(&ct_c, ts);
+            } else if (ts->kind == ST_SEQ && ts->u.blk.count == 2 &&
+                       ts->u.blk.stmts[0]->kind == ST_FN &&
+                       ts->u.blk.stmts[1]->kind == ST_EXPORT) {
+                ct_ok = zc_compile_stmt(&ct_c, ts->u.blk.stmts[0]);
+            }
+        }
+    }
+    if (ct_ok) ct_ok = zc_compile_expr(&ct_c, e->u.unary.rhs);
+    if (ct_ok) zc_emit(&ct_c, OP_RETURN, 0, ln);
+    free(ct_c.locals);
+    free(ct_c.upvalues);
+    ct_vm->gc_inhibit--;
+
+    if (!ct_ok) {
+        vm_free(ct_vm);
+        free(ct_vm);
+        return zc_err(c, ln, "comptime compile failed: %s", ct_err[0] ? ct_err : "invalid expression");
+    }
+
+    PbValue ct_res = val_nil();
+    if (!vm_run_root_func(ct_vm, ct_fn, NULL, &ct_res)) {
+        char msg[512];
+        snprintf(msg, sizeof(msg), "%.480s", ct_vm->err_msg[0] ? ct_vm->err_msg : "runtime error");
+        vm_free(ct_vm);
+        free(ct_vm);
+        return zc_err(c, ln, "comptime evaluation failed: %s", msg);
+    }
+
+    /* Emit evaluated PbValue into c->fn using heap-allocated stack */
+    typedef struct { PbValue v; int stage; size_t idx; uint32_t count; } ZrCtEmitFrame;
+    ZrCtEmitFrame *stk = (ZrCtEmitFrame *)zr_xcalloc(64, sizeof(ZrCtEmitFrame));
+    int sp = 0;
+    stk[0].v = ct_res;
+    stk[0].stage = 0;
+    stk[0].idx = 0;
+    stk[0].count = 0;
+    bool emit_ok = true;
+
+    while (sp >= 0 && emit_ok) {
+        PbValue v = stk[sp].v;
+        if (stk[sp].stage == 0) {
+            switch (v.tag) {
+                case VAL_NIL:
+                    zc_emit(c, OP_CONSTANT, zc_add_const(c, val_nil()), ln);
+                    sp--;
+                    break;
+                case VAL_BOOL:
+                    zc_emit(c, OP_CONSTANT, zc_add_const(c, val_bool(v.as.b)), ln);
+                    sp--;
+                    break;
+                case VAL_NUM:
+                    zc_emit(c, OP_CONSTANT, zc_add_const(c, val_num(v.as.num)), ln);
+                    sp--;
+                    break;
+                case VAL_OBJ:
+                    if (v.as.obj->type == OBJ_STR) {
+                        PbStr *s = AS_STR(v);
+                        zc_emit(c, OP_CONSTANT, zc_str_const(c, s->chars, s->len), ln);
+                        sp--;
+                    } else if (v.as.obj->type == OBJ_BIGINT) {
+                        char *bs = zr_bi_to_str(&AS_BIGINT(v)->v);
+                        ZrBigInt bi;
+                        zr_bi_from_str(&bi, bs);
+                        free(bs);
+                        zc_emit(c, OP_CONSTANT, zc_add_const(c, pb_bigint_new_take(c->vm, &bi)), ln);
+                        sp--;
+                    } else if (v.as.obj->type == OBJ_RATIONAL) {
+                        char *rs = zr_rat_to_str(&AS_RATIONAL(v)->v);
+                        ZrRational rat;
+                        zr_rat_from_str(&rat, rs);
+                        free(rs);
+                        zc_emit(c, OP_CONSTANT, zc_add_const(c, pb_rational_new_take(c->vm, &rat)), ln);
+                        sp--;
+                    } else if (v.as.obj->type == OBJ_DECIMAL) {
+                        char *ds = zr_dec_to_str(&AS_DECIMAL(v)->v);
+                        ZrDecimal dec;
+                        zr_dec_from_str(&dec, ds);
+                        free(ds);
+                        zc_emit(c, OP_CONSTANT, zc_add_const(c, pb_decimal_new_take(c->vm, &dec)), ln);
+                        sp--;
+                    } else if (v.as.obj->type == OBJ_ARRAY) {
+                        stk[sp].stage = 1;
+                        stk[sp].idx = 0;
+                        stk[sp].count = (uint32_t)AS_ARRAY(v)->len;
+                    } else if (v.as.obj->type == OBJ_MAP) {
+                        stk[sp].stage = 2;
+                        stk[sp].idx = 0;
+                        stk[sp].count = 0;
+                    } else {
+                        emit_ok = false;
+                    }
+                    break;
+                default:
+                    emit_ok = false;
+                    break;
+            }
+        } else if (stk[sp].stage == 1) {
+            PbArray *arr = AS_ARRAY(v);
+            if (stk[sp].idx < arr->len) {
+                if (sp + 1 >= 64) { emit_ok = false; break; }
+                PbValue child = arr->items[stk[sp].idx++];
+                stk[sp + 1].v = child;
+                stk[sp + 1].stage = 0;
+                sp++;
+            } else {
+                zc_emit(c, OP_MAKE_ARRAY, stk[sp].count, ln);
+                sp--;
+            }
+        } else {
+            PbMap *m = AS_MAP(v);
+            while (stk[sp].idx < m->used && !m->entries[stk[sp].idx].active) {
+                stk[sp].idx++;
+            }
+            if (stk[sp].idx < m->used) {
+                if (sp + 1 >= 64) { emit_ok = false; break; }
+                PbStr *k = m->entries[stk[sp].idx].key;
+                PbValue mv = m->entries[stk[sp].idx].val;
+                stk[sp].idx++;
+                stk[sp].count++;
+                zc_emit(c, OP_CONSTANT, zc_str_const(c, k->chars, k->len), ln);
+                stk[sp + 1].v = mv;
+                stk[sp + 1].stage = 0;
+                sp++;
+            } else {
+                zc_emit(c, OP_MAKE_MAP, stk[sp].count, ln);
+                sp--;
+            }
+        }
+    }
+
+    free(stk);
+    vm_free(ct_vm);
+    free(ct_vm);
+    if (!emit_ok) {
+        return zc_err(c, ln, "comptime expression produced non-constant runtime object");
     }
     return true;
 }
@@ -4390,8 +4692,8 @@ static bool zc_compile_stmt(ZrCompiler *c, const ZrStmt *s) {
         }
 
         case ST_RETURN: {
-            /* Tail-call optimization if returning a direct call `return f(args);` */
-            if (s->u.expr && s->u.expr->kind == EX_CALL) {
+            /* Tail-call optimization if returning a direct call `return f(args);` (when no ensures contract is active) */
+            if (c->ens_count == 0 && s->u.expr && s->u.expr->kind == EX_CALL) {
                 const ZrExpr *ce = s->u.expr;
                 if (!zc_compile_expr(c, ce->u.call.callee)) return false;
                 zc_push_temp(c);
@@ -4405,6 +4707,25 @@ static bool zc_compile_stmt(ZrCompiler *c, const ZrStmt *s) {
                 return true;
             }
             if (!zc_compile_expr(c, s->u.expr)) return false;
+            if (c->ens_count > 0) {
+                zc_begin_scope(c);
+                uint32_t res_slot = zc_add_local(c, "result", true);
+                for (size_t k = 0; k < c->ens_count; k++) {
+                    uint32_t eln = c->ens_exprs[k]->line;
+                    if (!zc_compile_expr(c, c->ens_exprs[k])) return false;
+                    uint32_t j_ok = zc_emit(c, OP_JUMP_IF_TRUE, 0, eln);
+                    zc_emit(c, OP_POP, 0, eln);
+                    char msg[256];
+                    snprintf(msg, sizeof(msg), "Contract ensures failed in %s",
+                             c->fn_contract_name ? c->fn_contract_name : "<anon>");
+                    zc_emit(c, OP_CONSTANT, zc_cstr_const(c, msg), eln);
+                    zc_emit(c, OP_THROW, 0, eln);
+                    zc_patch_jump(c, j_ok, c->fn->code_len);
+                    zc_emit(c, OP_POP, 0, eln);
+                }
+                c->local_count = res_slot;
+                c->scope_depth--;
+            }
             zc_emit(c, OP_RETURN, 0, ln);
             return true;
         }
@@ -4444,7 +4765,9 @@ static bool zc_compile_stmt(ZrCompiler *c, const ZrStmt *s) {
 
             PbCaptureSpec *caps = NULL;
             uint32_t ncaps = 0;
-            PbFunc *thunk = zc_compile_fn_node(c, "<defer>", NULL, 0, false, &body_ptr, 1, ln, &caps, &ncaps);
+            PbFunc *thunk = zc_compile_fn_node(c, "<defer>", NULL, 0, false,
+                                               NULL, 0, NULL, 0,
+                                               &body_ptr, 1, ln, &caps, &ncaps);
             if (!thunk) return false;
             uint32_t fidx = zc_add_const(c, val_obj(thunk));
             uint32_t ins_i = zc_emit(c, OP_CLOSURE, fidx, ln);
@@ -4469,7 +4792,10 @@ static bool zc_compile_stmt(ZrCompiler *c, const ZrStmt *s) {
                 uint32_t fslot = zc_add_local(c, s->u.fn_s.name, false);
                 PbCaptureSpec *caps = NULL; uint32_t ncaps = 0;
                 PbFunc *sub = zc_compile_fn_node(c, s->u.fn_s.name, s->u.fn_s.params, s->u.fn_s.param_count,
-                                                 s->u.fn_s.is_async, s->u.fn_s.body, s->u.fn_s.body_count,
+                                                 s->u.fn_s.is_async,
+                                                 s->u.fn_s.req_exprs, s->u.fn_s.req_count,
+                                                 s->u.fn_s.ens_exprs, s->u.fn_s.ens_count,
+                                                 s->u.fn_s.body, s->u.fn_s.body_count,
                                                  ln, &caps, &ncaps);
                 if (!sub) return false;
                 uint32_t fidx = zc_add_const(c, val_obj(sub));
@@ -4480,7 +4806,10 @@ static bool zc_compile_stmt(ZrCompiler *c, const ZrStmt *s) {
             } else {
                 PbCaptureSpec *caps = NULL; uint32_t ncaps = 0;
                 PbFunc *sub = zc_compile_fn_node(c, s->u.fn_s.name, s->u.fn_s.params, s->u.fn_s.param_count,
-                                                 s->u.fn_s.is_async, s->u.fn_s.body, s->u.fn_s.body_count,
+                                                 s->u.fn_s.is_async,
+                                                 s->u.fn_s.req_exprs, s->u.fn_s.req_count,
+                                                 s->u.fn_s.ens_exprs, s->u.fn_s.ens_count,
+                                                 s->u.fn_s.body, s->u.fn_s.body_count,
                                                  ln, &caps, &ncaps);
                 if (!sub) return false;
                 uint32_t fidx = zc_add_const(c, val_obj(sub));
@@ -4500,6 +4829,10 @@ static PbFunc *zc_compile_fn_node(ZrCompiler *enclosing,
                                   const ZrParam *params,
                                   size_t param_count,
                                   bool is_async,
+                                  ZrExpr *const *req_exprs,
+                                  size_t req_count,
+                                  ZrExpr *const *ens_exprs,
+                                  size_t ens_count,
                                   ZrStmt *const *body,
                                   size_t body_count,
                                   uint32_t line,
@@ -4507,8 +4840,12 @@ static PbFunc *zc_compile_fn_node(ZrCompiler *enclosing,
                                   uint32_t *out_ncaps) {
     PbVM *vm = enclosing->vm;
     PbFunc *fn = pb_func_new(vm);
-    if (name) fn->name = pb_str_c(vm, name);
+    if (name) {
+        fn->name = pb_str_c(vm, name);
+        vm_write_barrier_obj(vm, (PbObj *)fn, (PbObj *)fn->name);
+    }
     fn->source_name = enclosing->fn->source_name;
+    if (fn->source_name) vm_write_barrier_obj(vm, (PbObj *)fn, (PbObj *)fn->source_name);
     fn->is_async = is_async;
 
     ZrCompiler sub;
@@ -4518,6 +4855,9 @@ static PbFunc *zc_compile_fn_node(ZrCompiler *enclosing,
     sub.fn = fn;
     sub.is_script = false;
     sub.scope_depth = 1;
+    sub.ens_exprs = ens_exprs;
+    sub.ens_count = ens_count;
+    sub.fn_contract_name = name ? name : "<anon>";
     sub.err_buf = enclosing->err_buf;
 
     bool has_vararg = (param_count > 0 && params[param_count - 1].is_vararg);
@@ -4537,6 +4877,7 @@ static PbFunc *zc_compile_fn_node(ZrCompiler *enclosing,
         fn->defaults = (PbValue *)zr_xcalloc(fn->n_defaults, sizeof(PbValue));
         for (uint32_t i = 0; i < fn->n_defaults; i++) {
             zc_eval_default_const(&sub, params[min_ar + i].def_expr, &fn->defaults[i]);
+            vm_write_barrier(vm, (PbObj *)fn, fn->defaults[i]);
         }
     }
 
@@ -4564,6 +4905,23 @@ static PbFunc *zc_compile_fn_node(ZrCompiler *enclosing,
         }
     }
 
+    /* Emit precondition (`requires`) contract checks at function entry */
+    for (size_t r = 0; r < req_count; r++) {
+        uint32_t rln = req_exprs[r]->line;
+        if (!zc_compile_expr(&sub, req_exprs[r])) {
+            free(sub.locals); free(sub.upvalues);
+            return NULL;
+        }
+        uint32_t j_ok = zc_emit(&sub, OP_JUMP_IF_TRUE, 0, rln);
+        zc_emit(&sub, OP_POP, 0, rln);
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Contract requires failed in %s", sub.fn_contract_name);
+        zc_emit(&sub, OP_CONSTANT, zc_cstr_const(&sub, msg), rln);
+        zc_emit(&sub, OP_THROW, 0, rln);
+        zc_patch_jump(&sub, j_ok, fn->code_len);
+        zc_emit(&sub, OP_POP, 0, rln);
+    }
+
     if (!zc_compile_stmt_list(&sub, body, body_count)) {
         free(sub.locals);
         free(sub.upvalues);
@@ -4571,6 +4929,27 @@ static PbFunc *zc_compile_fn_node(ZrCompiler *enclosing,
     }
 
     zc_emit(&sub, OP_CONSTANT, zc_add_const(&sub, val_nil()), line);
+    if (ens_count > 0 && !(body_count > 0 && body[body_count - 1]->kind == ST_RETURN)) {
+        zc_begin_scope(&sub);
+        uint32_t res_slot = zc_add_local(&sub, "result", true);
+        for (size_t k = 0; k < ens_count; k++) {
+            uint32_t eln = ens_exprs[k]->line;
+            if (!zc_compile_expr(&sub, ens_exprs[k])) {
+                free(sub.locals); free(sub.upvalues);
+                return NULL;
+            }
+            uint32_t j_ok = zc_emit(&sub, OP_JUMP_IF_TRUE, 0, eln);
+            zc_emit(&sub, OP_POP, 0, eln);
+            char msg[256];
+            snprintf(msg, sizeof(msg), "Contract ensures failed in %s", sub.fn_contract_name);
+            zc_emit(&sub, OP_CONSTANT, zc_cstr_const(&sub, msg), eln);
+            zc_emit(&sub, OP_THROW, 0, eln);
+            zc_patch_jump(&sub, j_ok, fn->code_len);
+            zc_emit(&sub, OP_POP, 0, eln);
+        }
+        sub.local_count = res_slot;
+        sub.scope_depth--;
+    }
     zc_emit(&sub, OP_RETURN, 0, line);
 
     free(sub.locals);
@@ -4581,6 +4960,11 @@ static PbFunc *zc_compile_fn_node(ZrCompiler *enclosing,
 
 /* Jump Threading Peephole Pass: collapse jump -> OP_JUMP chains */
 static void zr_peephole_jump_thread(PbFunc *fn) {
+    for (uint32_t c = 0; c < fn->const_len; c++) {
+        if (is_obj_type(fn->consts[c], OBJ_FUNC)) {
+            zr_peephole_jump_thread(AS_FUNC(fn->consts[c]));
+        }
+    }
     for (uint32_t i = 0; i < fn->code_len; i++) {
         uint8_t op = fn->code[i].op;
         if (op == OP_JUMP || op == OP_JUMP_IF_FALSE || op == OP_JUMP_IF_TRUE) {
@@ -4593,10 +4977,6 @@ static void zr_peephole_jump_thread(PbFunc *fn) {
                 hops++;
             }
             fn->code[i].arg = tgt;
-        }
-        if (op == OP_CONSTANT && fn->code[i].arg < fn->const_len &&
-            is_obj_type(fn->consts[fn->code[i].arg], OBJ_FUNC)) {
-            zr_peephole_jump_thread(AS_FUNC(fn->consts[fn->code[i].arg]));
         }
     }
 }
@@ -4724,6 +5104,8 @@ static PbFunc *zr_compile_sapp(PbVM *vm,
     comp.fn = root_fn;
     comp.is_script = true;
     comp.scope_depth = 0;
+    comp.script_top_stmts = top_stmts;
+    comp.script_top_len = top_len;
     comp.err_buf = err_out;
 
     /* Hoist top-level `fn` definitions first so mutual/forward top-level calls always resolve! */
@@ -4749,6 +5131,7 @@ static PbFunc *zr_compile_sapp(PbVM *vm,
         zc_emit(&comp, OP_CONSTANT, zc_add_const(&comp, val_nil()), 0);
         zc_emit(&comp, OP_RETURN, 0, 0);
         zr_peephole_jump_thread(root_fn);
+        zr_peephole_optimize_func(root_fn);
     }
 
     free(comp.locals);

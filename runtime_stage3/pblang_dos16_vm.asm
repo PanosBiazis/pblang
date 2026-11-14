@@ -1,6 +1,6 @@
 ; =============================================================================
 ; pblang_dos16_vm.asm — Sovereign 16-bit Real-Mode x86 (8086/286) MS-DOS/FreeDOS
-; Bytecode VM & Standalone Runner (`PBLANG16.COM`, ORG 0x0100) — v2.7.0
+; Bytecode VM & Standalone Runner (`PBLANG16.COM`, ORG 0x0100) — v3.0.0
 ;
 ; Assemble:
 ;   nasm -f bin runtime_stage3/pblang_dos16_vm.asm -o pblang16.com
@@ -333,7 +333,7 @@ print_ax_crlf:
     ret
 
 msg_banner:
-    db "pblang 2.7.0 (16-bit Real-Mode 8086 DOS Sovereign Micro-VM)", 13, 10, "$"
+    db "pblang 3.0.0 (16-bit Real-Mode 8086 DOS Sovereign Micro-VM)", 13, 10, "$"
 msg_file_err:
     db "pblang16: cannot open bytecode file", 13, 10, "$"
 msg_magic_err:

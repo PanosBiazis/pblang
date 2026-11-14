@@ -1,0 +1,1243 @@
+// stdlib/native/wasm_web_pwa.sapp -- Sovereign .sapp -> WASM32 + HTML5 <canvas> Web-PWA Compiler.
+// Compiles .sapp programs (functions, i32/f64 IEEE-754 math, loops, conditionals, linear memory
+// RGBA framebuffer at rgba_base = 65536, and hardware-independent 2D raster primitives
+// gfxclear, gfxrect, gfxcircle, gfxline) into a genuine standalone WebAssembly 1.0 binary module
+// (\0asm\x01\x00\x00\x00) paired with zero-CDN index.html, manifest.webmanifest, and offline sw.js.
+
+let _SOURCE = import("stdlib:compiler/checked_source.sapp");
+let _BASE_WASM = import("stdlib:codegen_wasm.sapp");
+let _SHA256 = import("stdlib:sha256_pb.sapp");
+
+let RGBA_BASE = 65536;
+let WASM_PAGE_BYTES = 65536;
+let VAL_I32 = 127;   // 0x7F
+let VAL_I64 = 126;   // 0x7E
+let VAL_F32 = 125;   // 0x7D
+let VAL_F64 = 124;   // 0x7C
+let BLK_VOID = 64;   // 0x40
+
+fn _fail(msg) {
+    throw "wasm_web_pwa: " + msg;
+}
+
+fn _stmts_of(b) {
+    if is_array(b) { return b; }
+    if is_map(b) and map_has(b, "stmts") { return b.stmts; }
+    return [];
+}
+
+fn _pname(p) {
+    if is_map(p) and map_has(p, "name") { return p.name; }
+    return str(p);
+}
+
+fn _append(dst, src) {
+    let i = 0;
+    while i < len(src) {
+        array_push(dst, src[i]);
+        i = i + 1;
+    }
+}
+
+fn _uleb(out, val) {
+    if val < 0 { _fail("uleb128 negative value: " + str(val)); }
+    let v = num_floor(val);
+    while true {
+        let b = v % 128;
+        v = num_floor(v / 128);
+        if v == 0 {
+            array_push(out, b);
+            return nil;
+        }
+        array_push(out, b + 128);
+    }
+}
+
+fn _sleb(out, val) {
+    let v = num_floor(val);
+    while true {
+        let b = v % 128;
+        if b < 0 { b = b + 128; }
+        v = num_floor(v / 128);
+        if (v == 0 and b < 64) or (v == -1 and b >= 64) {
+            array_push(out, b);
+            return nil;
+        }
+        array_push(out, b + 128);
+    }
+}
+
+fn _emit_f64_const(out, num_val) {
+    array_push(out, 68); // 0x44: f64.const
+    let le = num_to_le_bytes(num_val + 0.0);
+    let i = 0;
+    while i < 8 {
+        array_push(out, le[i]);
+        i = i + 1;
+    }
+}
+
+fn _emit_i32_const(out, int_val) {
+    array_push(out, 65); // 0x41: i32.const
+    _sleb(out, num_floor(int_val));
+}
+
+fn _emit_name(out, text) {
+    let raw = str_to_bytes(text);
+    _uleb(out, len(raw));
+    _append(out, raw);
+}
+
+fn _intern_sig(types, typekey, params, rets) {
+    let k = "";
+    let i = 0;
+    while i < len(params) {
+        k = k + str(params[i]) + ",";
+        i = i + 1;
+    }
+    k = k + "->";
+    i = 0;
+    while i < len(rets) {
+        k = k + str(rets[i]) + ",";
+        i = i + 1;
+    }
+    if map_has(typekey, k) { return typekey[k]; }
+    let idx = len(types);
+    array_push(types, map{ p: params, r: rets });
+    typekey[k] = idx;
+    return idx;
+}
+
+// Collect all local variable slots inside a function body (including for/while/if blocks).
+fn _collect_locals(stmts, slots, slot_order) {
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        let k = s.kind;
+        if k == "let" or k == "const" {
+            if not map_has(slots, s.name) {
+                slots[s.name] = len(slot_order);
+                array_push(slot_order, s.name);
+            }
+        } elif k == "for" or k == "for_range" or k == "for_in" {
+            if not map_has(slots, s.name) {
+                slots[s.name] = len(slot_order);
+                array_push(slot_order, s.name);
+            }
+            let end_tmp = "__for_end_" + str(len(slot_order)) + "_" + s.name;
+            if not map_has(slots, end_tmp) {
+                slots[end_tmp] = len(slot_order);
+                array_push(slot_order, end_tmp);
+                s["@end_slot"] = slots[end_tmp];
+            }
+            _collect_locals(_stmts_of(s.body), slots, slot_order);
+        } elif k == "if" {
+            _collect_locals(_stmts_of(s.then), slots, slot_order);
+            let elifs = try s.elifs catch nil;
+            if elifs != nil {
+                let j = 0;
+                while j < len(elifs) {
+                    _collect_locals(_stmts_of(elifs[j].body), slots, slot_order);
+                    j = j + 1;
+                }
+            }
+            let el = try s.else catch nil;
+            if el != nil { _collect_locals(_stmts_of(el), slots, slot_order); }
+        } elif k == "while" {
+            _collect_locals(_stmts_of(s.body), slots, slot_order);
+        } elif k == "block" {
+            _collect_locals(_stmts_of(s), slots, slot_order);
+        }
+        i = i + 1;
+    }
+}
+
+// Stack value is f64 -> convert truthiness (v != 0.0) into i32 (0 or 1).
+fn _emit_cond_i32(c) {
+    _emit_f64_const(c, 0.0);
+    array_push(c, 98); // 0x62: f64.ne
+}
+
+// Convert f64 on stack -> i32 via i32.trunc_f64_s (0xAA).
+fn _emit_f64_to_i32(c) {
+    array_push(c, 170); // 0xAA: i32.trunc_f64_s
+}
+
+// Convert i32 on stack -> f64 via f64.convert_i32_s (0xB7) or _u (0xB8).
+fn _emit_i32_to_f64_s(c) {
+    array_push(c, 183); // 0xB7: f64.convert_i32_s
+}
+
+fn _emit_i32_to_f64_u(c) {
+    array_push(c, 184); // 0xB8: f64.convert_i32_u
+}
+
+// Compile expression -> leaves exactly one f64 on the WASM operand stack.
+fn _emit_expr(node, c, ctx) {
+    if node == nil {
+        _emit_f64_const(c, 0.0);
+        return nil;
+    }
+    let k = node.kind;
+    if k == "number" {
+        let nv = parse_number(str(node.value));
+        _emit_f64_const(c, nv);
+        return nil;
+    }
+    if k == "bool" {
+        _emit_f64_const(c, if node.value { 1.0 } else { 0.0 });
+        return nil;
+    }
+    if k == "nil" {
+        _emit_f64_const(c, 0.0);
+        return nil;
+    }
+    if k == "ident" {
+        let nm = node.name;
+        if map_has(ctx.slots, nm) {
+            array_push(c, 32); // local.get
+            _uleb(c, ctx.slots[nm]);
+            return nil;
+        }
+        if map_has(ctx.consts, nm) {
+            _emit_f64_const(c, ctx.consts[nm]);
+            return nil;
+        }
+        if nm == "rgba_base" or nm == "RGBA_BASE" {
+            _emit_f64_const(c, RGBA_BASE);
+            return nil;
+        }
+        if nm == "canvas_width" or nm == "WIDTH" {
+            _emit_f64_const(c, ctx.width);
+            return nil;
+        }
+        if nm == "canvas_height" or nm == "HEIGHT" {
+            _emit_f64_const(c, ctx.height);
+            return nil;
+        }
+        _fail("unknown identifier '" + nm + "'");
+    }
+    if k == "group" or k == "paren" {
+        return _emit_expr(node.expr, c, ctx);
+    }
+    if k == "block" {
+        let bstmts = _stmts_of(node);
+        if len(bstmts) == 0 {
+            _emit_f64_const(c, 0.0);
+            return nil;
+        }
+        let bi = 0;
+        while bi + 1 < len(bstmts) {
+            _emit_stmt(bstmts[bi], c, ctx, []);
+            bi = bi + 1;
+        }
+        let tail = bstmts[len(bstmts) - 1];
+        if tail.kind == "expr_stmt" {
+            return _emit_expr(tail.expr, c, ctx);
+        }
+        if tail.kind == "return" {
+            return _emit_expr(tail.value, c, ctx);
+        }
+        _emit_stmt(tail, c, ctx, []);
+        _emit_f64_const(c, 0.0);
+        return nil;
+    }
+    if k == "if_expr" {
+        _emit_expr(node.cond, c, ctx);
+        _emit_cond_i32(c);
+        array_push(c, 4); array_push(c, VAL_F64); // if (result f64)
+        _emit_expr(node.then, c, ctx);
+        array_push(c, 5); // else
+        _emit_expr(node.else, c, ctx);
+        array_push(c, 11); // end
+        return nil;
+    }
+    if k == "unary" {
+        let opd = try node.operand catch nil;
+        if opd == nil { opd = node.expr; }
+        if node.op == "-" {
+            _emit_expr(opd, c, ctx);
+            array_push(c, 154); // 0x9A: f64.neg
+            return nil;
+        }
+        if node.op == "not" or node.op == "!" {
+            _emit_expr(opd, c, ctx);
+            _emit_f64_const(c, 0.0);
+            array_push(c, 97); // 0x61: f64.eq -> i32 0/1
+            _emit_i32_to_f64_u(c);
+            return nil;
+        }
+        _fail("unsupported unary operator: " + str(node.op));
+    }
+    if k == "assign" {
+        if not map_has(ctx.slots, node.name) {
+            _fail("assignment to unknown local '" + node.name + "'");
+        }
+        _emit_expr(node.value, c, ctx);
+        array_push(c, 34); // local.tee
+        _uleb(c, ctx.slots[node.name]);
+        return nil;
+    }
+    if k == "binary" {
+        let op = node.op;
+        if op == "and" or op == "&&" {
+            _emit_expr(node.left, c, ctx);
+            _emit_cond_i32(c);
+            array_push(c, 4); array_push(c, VAL_F64);
+            _emit_expr(node.right, c, ctx);
+            _emit_cond_i32(c);
+            _emit_i32_to_f64_u(c);
+            array_push(c, 5);
+            _emit_f64_const(c, 0.0);
+            array_push(c, 11);
+            return nil;
+        }
+        if op == "or" or op == "||" {
+            _emit_expr(node.left, c, ctx);
+            _emit_cond_i32(c);
+            array_push(c, 4); array_push(c, VAL_F64);
+            _emit_f64_const(c, 1.0);
+            array_push(c, 5);
+            _emit_expr(node.right, c, ctx);
+            _emit_cond_i32(c);
+            _emit_i32_to_f64_u(c);
+            array_push(c, 11);
+            return nil;
+        }
+        if op == "%" {
+            _emit_expr(node.left, c, ctx);
+            _emit_f64_to_i32(c);
+            _emit_expr(node.right, c, ctx);
+            _emit_f64_to_i32(c);
+            array_push(c, 111); // 0x6F: i32.rem_s
+            _emit_i32_to_f64_s(c);
+            return nil;
+        }
+        _emit_expr(node.left, c, ctx);
+        _emit_expr(node.right, c, ctx);
+        if op == "+" { array_push(c, 160); return nil; } // f64.add
+        if op == "-" { array_push(c, 161); return nil; } // f64.sub
+        if op == "*" { array_push(c, 162); return nil; } // f64.mul
+        if op == "/" { array_push(c, 163); return nil; } // f64.div
+        if op == "==" { array_push(c, 97); _emit_i32_to_f64_u(c); return nil; }
+        if op == "!=" { array_push(c, 98); _emit_i32_to_f64_u(c); return nil; }
+        if op == "<"  { array_push(c, 99); _emit_i32_to_f64_u(c); return nil; }
+        if op == ">"  { array_push(c, 100); _emit_i32_to_f64_u(c); return nil; }
+        if op == "<=" { array_push(c, 101); _emit_i32_to_f64_u(c); return nil; }
+        if op == ">=" { array_push(c, 102); _emit_i32_to_f64_u(c); return nil; }
+        _fail("unsupported binary operator: " + str(op));
+    }
+    if k == "call" {
+        let fname = try node.func.name catch nil;
+        if fname == nil { _fail("indirect call target unsupported in WASM target"); }
+        let args = node.args;
+        // IEEE-754 f64 math intrinsics
+        if fname == "num_abs" and len(args) == 1 {
+            _emit_expr(args[0], c, ctx); array_push(c, 153); return nil;
+        }
+        if fname == "num_ceil" and len(args) == 1 {
+            _emit_expr(args[0], c, ctx); array_push(c, 155); return nil;
+        }
+        if fname == "num_floor" and len(args) == 1 {
+            _emit_expr(args[0], c, ctx); array_push(c, 156); return nil;
+        }
+        if fname == "num_sqrt" and len(args) == 1 {
+            _emit_expr(args[0], c, ctx); array_push(c, 159); return nil;
+        }
+        if fname == "num_min" and len(args) == 2 {
+            _emit_expr(args[0], c, ctx); _emit_expr(args[1], c, ctx); array_push(c, 164); return nil;
+        }
+        if fname == "num_max" and len(args) == 2 {
+            _emit_expr(args[0], c, ctx); _emit_expr(args[1], c, ctx); array_push(c, 165); return nil;
+        }
+        if fname == "clamp" and len(args) == 3 {
+            _emit_expr(args[0], c, ctx); _emit_expr(args[1], c, ctx); array_push(c, 165); // max(v, lo)
+            _emit_expr(args[2], c, ctx); array_push(c, 164); // min(..., hi)
+            return nil;
+        }
+        // i32 bitwise intrinsics
+        if (fname == "bit_and" or fname == "bit_or" or fname == "bit_xor" or fname == "bit_shl" or fname == "bit_shr") and len(args) == 2 {
+            _emit_expr(args[0], c, ctx); _emit_f64_to_i32(c);
+            _emit_expr(args[1], c, ctx); _emit_f64_to_i32(c);
+            if fname == "bit_and" { array_push(c, 113); }
+            elif fname == "bit_or" { array_push(c, 114); }
+            elif fname == "bit_xor" { array_push(c, 115); }
+            elif fname == "bit_shl" { array_push(c, 116); }
+            else { array_push(c, 117); }
+            _emit_i32_to_f64_s(c);
+            return nil;
+        }
+        // Linear memory load/store intrinsics
+        if (fname == "mem_write_u8" or fname == "i32_store8") and len(args) == 2 {
+            _emit_expr(args[0], c, ctx); _emit_f64_to_i32(c);
+            _emit_expr(args[1], c, ctx); _emit_f64_to_i32(c);
+            array_push(c, 58); array_push(c, 0); array_push(c, 0); // i32.store8 align=0 off=0
+            _emit_f64_const(c, 0.0);
+            return nil;
+        }
+        if (fname == "mem_read_u8" or fname == "i32_load8_u") and len(args) == 1 {
+            _emit_expr(args[0], c, ctx); _emit_f64_to_i32(c);
+            array_push(c, 45); array_push(c, 0); array_push(c, 0); // i32.load8_u align=0 off=0
+            _emit_i32_to_f64_u(c);
+            return nil;
+        }
+        if (fname == "mem_write_i32" or fname == "i32_store") and len(args) == 2 {
+            _emit_expr(args[0], c, ctx); _emit_f64_to_i32(c);
+            _emit_expr(args[1], c, ctx); _emit_f64_to_i32(c);
+            array_push(c, 54); array_push(c, 0); array_push(c, 0); // i32.store align=0 off=0
+            _emit_f64_const(c, 0.0);
+            return nil;
+        }
+        if (fname == "mem_read_i32" or fname == "i32_load") and len(args) == 1 {
+            _emit_expr(args[0], c, ctx); _emit_f64_to_i32(c);
+            array_push(c, 40); array_push(c, 0); array_push(c, 0); // i32.load align=0 off=0
+            _emit_i32_to_f64_s(c);
+            return nil;
+        }
+        if not map_has(ctx.fnidx, fname) {
+            _fail("unknown function '" + fname + "'");
+        }
+        let expected_arity = ctx.fnarity[fname];
+        if len(args) != expected_arity {
+            _fail("arity mismatch calling '" + fname + "': expected " + str(expected_arity) + ", got " + str(len(args)));
+        }
+        let ai = 0;
+        while ai < len(args) {
+            _emit_expr(args[ai], c, ctx);
+            ai = ai + 1;
+        }
+        array_push(c, 16); // 0x10: call
+        _uleb(c, ctx.fnidx[fname]);
+        return nil;
+    }
+    _fail("unsupported expression kind: " + str(k));
+}
+
+fn _emit_stmt(node, c, ctx, loop_depth_stack) {
+    let k = node.kind;
+    if k == "expr_stmt" {
+        _emit_expr(node.expr, c, ctx);
+        array_push(c, 26); // 0x1A: drop
+        return nil;
+    }
+    if k == "let" or k == "const" or k == "assign" {
+        if node.value != nil { _emit_expr(node.value, c, ctx); }
+        else { _emit_f64_const(c, 0.0); }
+        array_push(c, 33); // local.set
+        _uleb(c, ctx.slots[node.name]);
+        return nil;
+    }
+    if k == "return" {
+        if node.value != nil { _emit_expr(node.value, c, ctx); }
+        else { _emit_f64_const(c, 0.0); }
+        array_push(c, 15); // 0x0F: return
+        return nil;
+    }
+    if k == "break" {
+        if len(loop_depth_stack) == 0 { _fail("break outside loop"); }
+        let top = loop_depth_stack[len(loop_depth_stack) - 1];
+        let br_depth = ctx.ctrl_depth - top.break_target_depth;
+        array_push(c, 12); _uleb(c, br_depth);
+        return nil;
+    }
+    if k == "continue" {
+        if len(loop_depth_stack) == 0 { _fail("continue outside loop"); }
+        let top2 = loop_depth_stack[len(loop_depth_stack) - 1];
+        let cont_depth = ctx.ctrl_depth - top2.cont_target_depth;
+        array_push(c, 12); _uleb(c, cont_depth);
+        return nil;
+    }
+    if k == "if" {
+        _emit_expr(node.cond, c, ctx);
+        _emit_cond_i32(c);
+        array_push(c, 4); array_push(c, BLK_VOID);
+        ctx.ctrl_depth = ctx.ctrl_depth + 1;
+        _emit_block(_stmts_of(node.then), c, ctx, loop_depth_stack);
+        let elifs = try node.elifs catch nil;
+        let el = try node.else catch nil;
+        let arms = if elifs != nil { elifs } else { [] };
+        let opened = 0;
+        let ei = 0;
+        while ei < len(arms) {
+            array_push(c, 5); // else
+            _emit_expr(arms[ei].cond, c, ctx);
+            _emit_cond_i32(c);
+            array_push(c, 4); array_push(c, BLK_VOID);
+            ctx.ctrl_depth = ctx.ctrl_depth + 1;
+            opened = opened + 1;
+            _emit_block(_stmts_of(arms[ei].body), c, ctx, loop_depth_stack);
+            ei = ei + 1;
+        }
+        if el != nil {
+            array_push(c, 5);
+            _emit_block(_stmts_of(el), c, ctx, loop_depth_stack);
+        }
+        while opened > 0 {
+            array_push(c, 11);
+            ctx.ctrl_depth = ctx.ctrl_depth - 1;
+            opened = opened - 1;
+        }
+        array_push(c, 11);
+        ctx.ctrl_depth = ctx.ctrl_depth - 1;
+        return nil;
+    }
+    if k == "while" {
+        array_push(c, 2); array_push(c, BLK_VOID); // outer block (break target)
+        ctx.ctrl_depth = ctx.ctrl_depth + 1;
+        let brk_d = ctx.ctrl_depth;
+        array_push(c, 3); array_push(c, BLK_VOID); // inner loop (continue target)
+        ctx.ctrl_depth = ctx.ctrl_depth + 1;
+        let cnt_d = ctx.ctrl_depth;
+        _emit_expr(node.cond, c, ctx);
+        _emit_f64_const(c, 0.0);
+        array_push(c, 97); // f64.eq -> 1 when cond == 0.0
+        array_push(c, 13); _uleb(c, 1); // br_if 1 -> exit outer block
+        array_push(loop_depth_stack, map{ break_target_depth: brk_d, cont_target_depth: cnt_d });
+        _emit_block(_stmts_of(node.body), c, ctx, loop_depth_stack);
+        array_pop(loop_depth_stack);
+        array_push(c, 12); _uleb(c, 0); // br 0 -> loop header
+        array_push(c, 11); // end loop
+        array_push(c, 11); // end block
+        ctx.ctrl_depth = ctx.ctrl_depth - 2;
+        return nil;
+    }
+    if k == "for" or k == "for_range" or k == "for_in" {
+        let var_slot = ctx.slots[node.name];
+        let end_slot = node["@end_slot"];
+        let inclusive = (k == "for_range");
+        if k == "for" {
+            _emit_f64_const(c, 0.0);
+            array_push(c, 33); _uleb(c, var_slot);
+            _emit_expr(node.end, c, ctx);
+            array_push(c, 33); _uleb(c, end_slot);
+        } elif k == "for_range" {
+            _emit_expr(node.start, c, ctx);
+            array_push(c, 33); _uleb(c, var_slot);
+            _emit_expr(node.end, c, ctx);
+            array_push(c, 33); _uleb(c, end_slot);
+        } else {
+            // for x in range(lo, hi) or range(hi)
+            let iter = node.iter;
+            let fnm = try iter.func.name catch "";
+            if fnm != "range" { _fail("for_in in WASM requires range(...)"); }
+            if len(iter.args) == 1 {
+                _emit_f64_const(c, 0.0);
+                array_push(c, 33); _uleb(c, var_slot);
+                _emit_expr(iter.args[0], c, ctx);
+                array_push(c, 33); _uleb(c, end_slot);
+            } elif len(iter.args) >= 2 {
+                _emit_expr(iter.args[0], c, ctx);
+                array_push(c, 33); _uleb(c, var_slot);
+                _emit_expr(iter.args[1], c, ctx);
+                array_push(c, 33); _uleb(c, end_slot);
+            } else {
+                _fail("range() expects 1 or 2 args");
+            }
+        }
+        array_push(c, 2); array_push(c, BLK_VOID);
+        ctx.ctrl_depth = ctx.ctrl_depth + 1;
+        let brk_d2 = ctx.ctrl_depth;
+        array_push(c, 3); array_push(c, BLK_VOID);
+        ctx.ctrl_depth = ctx.ctrl_depth + 1;
+        let cnt_d2 = ctx.ctrl_depth;
+        array_push(c, 32); _uleb(c, var_slot);
+        array_push(c, 32); _uleb(c, end_slot);
+        if inclusive { array_push(c, 100); } // f64.gt -> break if i > end
+        else { array_push(c, 102); }         // f64.ge -> break if i >= end
+        array_push(c, 13); _uleb(c, 1);      // br_if 1
+        array_push(loop_depth_stack, map{ break_target_depth: brk_d2, cont_target_depth: cnt_d2 });
+        _emit_block(_stmts_of(node.body), c, ctx, loop_depth_stack);
+        array_pop(loop_depth_stack);
+        array_push(c, 32); _uleb(c, var_slot);
+        _emit_f64_const(c, 1.0);
+        array_push(c, 160); // i + 1.0
+        array_push(c, 33); _uleb(c, var_slot);
+        array_push(c, 12); _uleb(c, 0);
+        array_push(c, 11);
+        array_push(c, 11);
+        ctx.ctrl_depth = ctx.ctrl_depth - 2;
+        return nil;
+    }
+    if k == "block" {
+        _emit_block(_stmts_of(node), c, ctx, loop_depth_stack);
+        return nil;
+    }
+    if k == "print" {
+        // Evaluate expression for side effects, drop result (standalone browser module has zero host imports).
+        _emit_expr(node.value, c, ctx);
+        array_push(c, 26);
+        return nil;
+    }
+    _fail("unsupported statement kind: " + str(k));
+}
+
+fn _emit_block(stmts, c, ctx, loop_depth_stack) {
+    let i = 0;
+    while i < len(stmts) {
+        _emit_stmt(stmts[i], c, ctx, loop_depth_stack);
+        i = i + 1;
+    }
+}
+
+fn _compile_fn_body(fn_node, fnidx, fnarity, consts, width, height) {
+    let slots = map{};
+    let slot_order = [];
+    let params = fn_node.params;
+    let pi = 0;
+    while pi < len(params) {
+        let pnm = _pname(params[pi]);
+        slots[pnm] = len(slot_order);
+        array_push(slot_order, pnm);
+        pi = pi + 1;
+    }
+    let stmts = _stmts_of(fn_node.body);
+    _collect_locals(stmts, slots, slot_order);
+    let nlocals = len(slot_order) - len(params);
+
+    let body = [];
+    if nlocals > 0 {
+        _uleb(body, 1);
+        _uleb(body, nlocals);
+        array_push(body, VAL_F64);
+    } else {
+        _uleb(body, 0);
+    }
+    let ctx = map{
+        slots: slots,
+        fnidx: fnidx,
+        fnarity: fnarity,
+        consts: consts,
+        width: width,
+        height: height,
+        ctrl_depth: 0
+    };
+    _emit_block(stmts, body, ctx, []);
+    _emit_f64_const(body, 0.0);
+    array_push(body, 15); // return 0.0 fallthrough
+    array_push(body, 11); // end function
+
+    let entry = [];
+    _uleb(entry, len(body));
+    _append(entry, body);
+    return entry;
+}
+
+// Built-in sovereign 2D RGBA rasterizer functions written in .sapp and compiled directly into WASM32!
+fn _builtin_gfx_sapp(width, height) {
+    let w = str(width);
+    let h = str(height);
+    let base = str(RGBA_BASE);
+    return
+        "fn get_rgba_base() { return " + base + "; }\n" +
+        "fn get_width() { return " + w + "; }\n" +
+        "fn get_height() { return " + h + "; }\n" +
+        "fn gfxpixel(px, py, r, g, b) {\n" +
+        "    let ix = num_floor(px);\n" +
+        "    let iy = num_floor(py);\n" +
+        "    if ix < 0 or ix >= " + w + " or iy < 0 or iy >= " + h + " { return 0; }\n" +
+        "    let off = " + base + " + (iy * " + w + " + ix) * 4;\n" +
+        "    mem_write_u8(off, clamp(num_floor(r), 0, 255));\n" +
+        "    mem_write_u8(off + 1, clamp(num_floor(g), 0, 255));\n" +
+        "    mem_write_u8(off + 2, clamp(num_floor(b), 0, 255));\n" +
+        "    mem_write_u8(off + 3, 255);\n" +
+        "    return 1;\n" +
+        "}\n" +
+        "fn gfxclear(r, g, b) {\n" +
+        "    let cr = clamp(num_floor(r), 0, 255);\n" +
+        "    let cg = clamp(num_floor(g), 0, 255);\n" +
+        "    let cb = clamp(num_floor(b), 0, 255);\n" +
+        "    let total = " + str(width * height) + ";\n" +
+        "    let i = 0;\n" +
+        "    while i < total {\n" +
+        "        let off = " + base + " + i * 4;\n" +
+        "        mem_write_u8(off, cr);\n" +
+        "        mem_write_u8(off + 1, cg);\n" +
+        "        mem_write_u8(off + 2, cb);\n" +
+        "        mem_write_u8(off + 3, 255);\n" +
+        "        i = i + 1;\n" +
+        "    }\n" +
+        "    return total;\n" +
+        "}\n" +
+        "fn gfxrect(x, y, rw, rh, r, g, b) {\n" +
+        "    let x0 = num_max(0, num_floor(x));\n" +
+        "    let y0 = num_max(0, num_floor(y));\n" +
+        "    let x1 = num_min(" + w + ", num_floor(x + rw));\n" +
+        "    let y1 = num_min(" + h + ", num_floor(y + rh));\n" +
+        "    let cr = clamp(num_floor(r), 0, 255);\n" +
+        "    let cg = clamp(num_floor(g), 0, 255);\n" +
+        "    let cb = clamp(num_floor(b), 0, 255);\n" +
+        "    let py = y0;\n" +
+        "    while py < y1 {\n" +
+        "        let px = x0;\n" +
+        "        while px < x1 {\n" +
+        "            let off = " + base + " + (py * " + w + " + px) * 4;\n" +
+        "            mem_write_u8(off, cr);\n" +
+        "            mem_write_u8(off + 1, cg);\n" +
+        "            mem_write_u8(off + 2, cb);\n" +
+        "            mem_write_u8(off + 3, 255);\n" +
+        "            px = px + 1;\n" +
+        "        }\n" +
+        "        py = py + 1;\n" +
+        "    }\n" +
+        "    return 1;\n" +
+        "}\n" +
+        "fn gfxcircle(cx, cy, rad, cr, cg, cb) {\n" +
+        "    let r_sq = rad * rad;\n" +
+        "    let x0 = num_max(0, num_floor(cx - rad));\n" +
+        "    let y0 = num_max(0, num_floor(cy - rad));\n" +
+        "    let x1 = num_min(" + w + " - 1, num_ceil(cx + rad));\n" +
+        "    let y1 = num_min(" + h + " - 1, num_ceil(cy + rad));\n" +
+        "    let py = y0;\n" +
+        "    while py <= y1 {\n" +
+        "        let dy = py - cy;\n" +
+        "        let px = x0;\n" +
+        "        while px <= x1 {\n" +
+        "            let dx = px - cx;\n" +
+        "            if dx * dx + dy * dy <= r_sq {\n" +
+        "                gfxpixel(px, py, cr, cg, cb);\n" +
+        "            }\n" +
+        "            px = px + 1;\n" +
+        "        }\n" +
+        "        py = py + 1;\n" +
+        "    }\n" +
+        "    return 1;\n" +
+        "}\n" +
+        "fn gfxline(x1, y1, x2, y2, r, g, b) {\n" +
+        "    let ix0 = num_floor(x1);\n" +
+        "    let iy0 = num_floor(y1);\n" +
+        "    let ix1 = num_floor(x2);\n" +
+        "    let iy1 = num_floor(y2);\n" +
+        "    let dx = num_abs(ix1 - ix0);\n" +
+        "    let sx = if ix0 < ix1 { 1 } else { -1 };\n" +
+        "    let dy = 0 - num_abs(iy1 - iy0);\n" +
+        "    let sy = if iy0 < iy1 { 1 } else { -1 };\n" +
+        "    let err = dx + dy;\n" +
+        "    let guard = 0;\n" +
+        "    while guard < 8192 {\n" +
+        "        gfxpixel(ix0, iy0, r, g, b);\n" +
+        "        if ix0 == ix1 and iy0 == iy1 { return 1; }\n" +
+        "        let e2 = 2 * err;\n" +
+        "        if e2 >= dy { err = err + dy; ix0 = ix0 + sx; }\n" +
+        "        if e2 <= dx { err = err + dx; iy0 = iy0 + sy; }\n" +
+        "        guard = guard + 1;\n" +
+        "    }\n" +
+        "    return 1;\n" +
+        "}\n";
+}
+
+// Structural WebAssembly 1.0 binary validator & section parser.
+fn inspect_wasm_sections(wasm_bytes) {
+    if type(wasm_bytes) != "array" or len(wasm_bytes) < 8 {
+        return map{ ok: false, error: "wasm binary shorter than 8-byte header" };
+    }
+    let expected_magic = [0, 97, 115, 109, 1, 0, 0, 0];
+    let mi = 0;
+    while mi < 8 {
+        if wasm_bytes[mi] != expected_magic[mi] {
+            return map{ ok: false, error: "invalid wasm magic/version at byte " + str(mi) };
+        }
+        mi = mi + 1;
+    }
+    let pos = 8;
+    let last_sec_id = -1;
+    let sections = [];
+    let export_names = [];
+    let has_type = false;
+    let has_func = false;
+    let has_memory = false;
+    let has_export = false;
+    let has_code = false;
+
+    while pos < len(wasm_bytes) {
+        let sec_id = wasm_bytes[pos];
+        pos = pos + 1;
+        if sec_id != 0 and sec_id <= last_sec_id {
+            return map{ ok: false, error: "sections out of canonical order at id " + str(sec_id) };
+        }
+        if sec_id != 0 { last_sec_id = sec_id; }
+
+        // Decode ULEB128 section payload length
+        let sec_len = 0;
+        let shift = 1;
+        let cnt = 0;
+        let done_leb = false;
+        while not done_leb {
+            if pos >= len(wasm_bytes) or cnt >= 5 {
+                return map{ ok: false, error: "malformed section length ULEB128" };
+            }
+            let b = wasm_bytes[pos];
+            pos = pos + 1;
+            cnt = cnt + 1;
+            sec_len = sec_len + (b % 128) * shift;
+            shift = shift * 128;
+            if b < 128 { done_leb = true; }
+        }
+        if pos + sec_len > len(wasm_bytes) {
+            return map{ ok: false, error: "section " + str(sec_id) + " truncated" };
+        }
+        if sec_id == 1 { has_type = true; }
+        if sec_id == 3 { has_func = true; }
+        if sec_id == 5 { has_memory = true; }
+        if sec_id == 7 {
+            has_export = true;
+            // Parse export names using full ULEB128 decoding
+            let ep = pos;
+            let n_exp = 0; let sh_e = 1;
+            while ep < pos + sec_len {
+                let be = wasm_bytes[ep]; ep = ep + 1;
+                n_exp = n_exp + (be % 128) * sh_e; sh_e = sh_e * 128;
+                if be < 128 { break; }
+            }
+            let ei = 0;
+            while ei < n_exp and ep < pos + sec_len {
+                let nlen = 0; let sh_n = 1;
+                while ep < pos + sec_len {
+                    let bn = wasm_bytes[ep]; ep = ep + 1;
+                    nlen = nlen + (bn % 128) * sh_n; sh_n = sh_n * 128;
+                    if bn < 128 { break; }
+                }
+                let nm_bytes = slice(wasm_bytes, ep, ep + nlen);
+                array_push(export_names, bytes_to_str(nm_bytes));
+                ep = ep + nlen;
+                ep = ep + 1; // export kind
+                while ep < pos + sec_len and wasm_bytes[ep] >= 128 { ep = ep + 1; }
+                ep = ep + 1; // final index byte
+                ei = ei + 1;
+            }
+        }
+        if sec_id == 10 { has_code = true; }
+        array_push(sections, map{ id: sec_id, offset: pos, byte_length: sec_len });
+        pos = pos + sec_len;
+    }
+
+    let structural_ok = has_type and has_func and has_memory and has_export and has_code;
+    return map{
+        ok: structural_ok,
+        magic_valid: true,
+        byte_length: len(wasm_bytes),
+        has_type_section: has_type,
+        has_function_section: has_func,
+        has_memory_section: has_memory,
+        has_export_section: has_export,
+        has_code_section: has_code,
+        section_count: len(sections),
+        sections: sections,
+        exports: export_names
+    };
+}
+
+// Compile .sapp source into a standalone RGBA WebAssembly 1.0 module.
+fn compile_sapp_to_wasm_rgba(src_code, width = 800, height = 500) {
+    if type(src_code) != "string" { _fail("src_code must be a string"); }
+    if is_map(width) {
+        let opts_w = width;
+        height = if map_has(opts_w, "height") { opts_w.height } else { 500 };
+        width = if map_has(opts_w, "width") { opts_w.width } else { 800 };
+    }
+    if type(width) != "number" or width < 1 or width > 4096 or width != num_floor(width) {
+        _fail("width must be integer 1..4096");
+    }
+    if type(height) != "number" or height < 1 or height > 4096 or height != num_floor(height) {
+        _fail("height must be integer 1..4096");
+    }
+
+    // Touch _BASE_WASM so both integer-only and RGBA f64 pipelines remain linked cleanly.
+    let _base_ref = _BASE_WASM.compile_wasm;
+
+    let gfx_ast = _SOURCE.parse_local_source(_builtin_gfx_sapp(width, height));
+    let user_ast = _SOURCE.parse_local_source(src_code);
+
+    let all_fns = [];
+    let fn_names = map{};
+    let consts = map{
+        rgba_base: RGBA_BASE,
+        RGBA_BASE: RGBA_BASE,
+        canvas_width: width,
+        canvas_height: height
+    };
+
+    let gi = 0;
+    while gi < len(gfx_ast.stmts) {
+        let gs = gfx_ast.stmts[gi];
+        if gs.kind == "fn" {
+            array_push(all_fns, gs);
+            fn_names[gs.name] = true;
+        }
+        gi = gi + 1;
+    }
+
+    let top_stmts = [];
+    let has_render_frame = false;
+    let has_main = false;
+    let ui = 0;
+    while ui < len(user_ast.stmts) {
+        let us = user_ast.stmts[ui];
+        if us.kind == "fn" {
+            if map_has(fn_names, us.name) {
+                _fail("cannot redefine reserved builtin function '" + us.name + "'");
+            }
+            if us.name == "render_frame" { has_render_frame = true; }
+            if us.name == "main" { has_main = true; }
+            array_push(all_fns, us);
+            fn_names[us.name] = true;
+        } elif (us.kind == "let" or us.kind == "const") and us.value != nil and us.value.kind == "number" {
+            consts[us.name] = parse_number(str(us.value.value));
+            array_push(top_stmts, us);
+        } elif us.kind == "export" {
+            // Exports handled automatically for all user functions
+        } else {
+            array_push(top_stmts, us);
+        }
+        ui = ui + 1;
+    }
+
+    if not has_main {
+        array_push(all_fns, map{
+            kind: "fn",
+            name: "main",
+            params: [],
+            body: map{ kind: "block", stmts: top_stmts }
+        });
+    }
+    if not has_render_frame {
+        let rf_call = map{
+            kind: "return",
+            value: map{
+                kind: "call",
+                func: map{ kind: "ident", name: "main" },
+                args: []
+            }
+        };
+        array_push(all_fns, map{
+            kind: "fn",
+            name: "render_frame",
+            params: ["t_ms", "mouse_x", "mouse_y", "mouse_down"],
+            body: map{ kind: "block", stmts: [rf_call] }
+        });
+    }
+
+    let fnidx = map{};
+    let fnarity = map{};
+    let fi = 0;
+    while fi < len(all_fns) {
+        fnidx[all_fns[fi].name] = fi;
+        fnarity[all_fns[fi].name] = len(all_fns[fi].params);
+        fi = fi + 1;
+    }
+
+    // Section 1: Type section
+    let types = [];
+    let typekey = map{};
+    let fn_sig_indices = [];
+    fi = 0;
+    while fi < len(all_fns) {
+        let ar = len(all_fns[fi].params);
+        let ps = [];
+        let pi = 0;
+        while pi < ar {
+            array_push(ps, VAL_F64);
+            pi = pi + 1;
+        }
+        array_push(fn_sig_indices, _intern_sig(types, typekey, ps, [VAL_F64]));
+        fi = fi + 1;
+    }
+
+    let tsec = [];
+    _uleb(tsec, len(types));
+    let ti = 0;
+    while ti < len(types) {
+        array_push(tsec, 96); // 0x60: func type
+        _uleb(tsec, len(types[ti].p));
+        _append(tsec, types[ti].p);
+        _uleb(tsec, len(types[ti].r));
+        _append(tsec, types[ti].r);
+        ti = ti + 1;
+    }
+
+    // Section 3: Function section
+    let fsec = [];
+    _uleb(fsec, len(all_fns));
+    fi = 0;
+    while fi < len(all_fns) {
+        _uleb(fsec, fn_sig_indices[fi]);
+        fi = fi + 1;
+    }
+
+    // Section 5: Memory section (rgba_base + width*height*4 + 64KiB scratch)
+    let total_bytes_needed = RGBA_BASE + width * height * 4 + WASM_PAGE_BYTES;
+    let min_pages = num_ceil(total_bytes_needed / WASM_PAGE_BYTES);
+    if min_pages < 4 { min_pages = 4; }
+    let msec = [];
+    _uleb(msec, 1);         // 1 linear memory
+    array_push(msec, 0);    // limits flags = 0 (min only)
+    _uleb(msec, min_pages);
+
+    // Section 7: Export section ("memory" + all functions including render_frame, main, numeric fns)
+    let esec = [];
+    _uleb(esec, 1 + len(all_fns));
+    _emit_name(esec, "memory");
+    array_push(esec, 2); // kind = memory
+    _uleb(esec, 0);
+    fi = 0;
+    while fi < len(all_fns) {
+        _emit_name(esec, all_fns[fi].name);
+        array_push(esec, 0); // kind = func
+        _uleb(esec, fi);
+        fi = fi + 1;
+    }
+
+    // Section 10: Code section
+    let csec = [];
+    _uleb(csec, len(all_fns));
+    fi = 0;
+    while fi < len(all_fns) {
+        let code_entry = _compile_fn_body(all_fns[fi], fnidx, fnarity, consts, width, height);
+        _append(csec, code_entry);
+        fi = fi + 1;
+    }
+
+    // Assemble complete WASM binary (\0asm v1)
+    let wasm = [0, 97, 115, 109, 1, 0, 0, 0];
+    array_push(wasm, 1); _uleb(wasm, len(tsec)); _append(wasm, tsec);
+    array_push(wasm, 3); _uleb(wasm, len(fsec)); _append(wasm, fsec);
+    array_push(wasm, 5); _uleb(wasm, len(msec)); _append(wasm, msec);
+    array_push(wasm, 7); _uleb(wasm, len(esec)); _append(wasm, esec);
+    array_push(wasm, 10); _uleb(wasm, len(csec)); _append(wasm, csec);
+
+    let audit = inspect_wasm_sections(wasm);
+    if not audit.ok {
+        _fail("internal WASM validation failed: " + try audit.error catch "invalid sections");
+    }
+
+    return map{
+        ok: true,
+        wasm_bytes: wasm,
+        byte_length: len(wasm),
+        sha256: _SHA256.sha256_hex_bytes(wasm),
+        rgba_base: RGBA_BASE,
+        framebuffer_byte_length: width * height * 4,
+        memory_pages: min_pages,
+        width: width,
+        height: height,
+        exports: audit.exports,
+        sections: audit
+    };
+}
+
+fn _generate_index_html(app_title, width, height, wasm_b64) {
+    let w = str(width);
+    let h = str(height);
+    let fb_len = str(width * height * 4);
+    let base = str(RGBA_BASE);
+    return "<!DOCTYPE html>\n" +
+"<html lang=\"en\">\n" +
+"<head>\n" +
+"  <meta charset=\"utf-8\">\n" +
+"  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n" +
+"  <meta name=\"theme-color\" content=\"#0b1020\">\n" +
+"  <title>" + app_title + " — Sovereign PBLang Web-PWA</title>\n" +
+"  <link rel=\"manifest\" href=\"./manifest.webmanifest\">\n" +
+"  <style>\n" +
+"    html, body { margin: 0; padding: 0; background: #0b1020; color: #e5ecff; font-family: system-ui, sans-serif; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; }\n" +
+"    canvas { border: 1px solid #263459; box-shadow: 0 12px 36px rgba(0,0,0,0.55); image-rendering: pixelated; max-width: 98vw; max-height: 88vh; touch-action: none; }\n" +
+"    .hud { margin-top: 8px; font-size: 12px; color: #8da2d6; letter-spacing: 0.04em; }\n" +
+"  </style>\n" +
+"</head>\n" +
+"<body>\n" +
+"  <canvas id=\"pb-canvas\" width=\"" + w + "\" height=\"" + h + "\"></canvas>\n" +
+"  <div class=\"hud\" id=\"pb-hud\">PBLang WASM32 Sovereign Runtime · " + w + "x" + h + " RGBA @ 60 FPS</div>\n" +
+"  <script>\n" +
+"  (function() {\n" +
+"    'use strict';\n" +
+"    const WIDTH = " + w + ", HEIGHT = " + h + ", RGBA_BASE = " + base + ", FB_BYTES = " + fb_len + ";\n" +
+"    const FALLBACK_WASM_B64 = \"" + wasm_b64 + "\";\n" +
+"    const canvas = document.getElementById('pb-canvas');\n" +
+"    const ctx = canvas.getContext('2d', { alpha: false });\n" +
+"    let mouseX = 0, mouseY = 0, mouseDown = 0, lastKey = 0;\n" +
+"    function updatePointer(ev) {\n" +
+"      const r = canvas.getBoundingClientRect();\n" +
+"      mouseX = Math.max(0, Math.min(WIDTH - 1, Math.floor((ev.clientX - r.left) * (WIDTH / r.width))));\n" +
+"      mouseY = Math.max(0, Math.min(HEIGHT - 1, Math.floor((ev.clientY - r.top) * (HEIGHT / r.height))));\n" +
+"    }\n" +
+"    canvas.addEventListener('pointermove', updatePointer);\n" +
+"    canvas.addEventListener('pointerdown', (ev) => { updatePointer(ev); mouseDown = 1; });\n" +
+"    window.addEventListener('pointerup', () => { mouseDown = 0; });\n" +
+"    window.addEventListener('keydown', (ev) => { lastKey = ev.keyCode || 0; });\n" +
+"    window.addEventListener('keyup', () => { lastKey = 0; });\n" +
+"    async function loadWasmBytes() {\n" +
+"      try {\n" +
+"        const res = await fetch('./app.wasm');\n" +
+"        if (res.ok) return await res.arrayBuffer();\n" +
+"      } catch (_) {}\n" +
+"      const bin = atob(FALLBACK_WASM_B64);\n" +
+"      const u8 = new Uint8Array(bin.length);\n" +
+"      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);\n" +
+"      return u8.buffer;\n" +
+"    }\n" +
+"    loadWasmBytes().then((buf) => WebAssembly.instantiate(buf, {})).then(({ instance }) => {\n" +
+"      const exports = instance.exports;\n" +
+"      const mem = exports.memory;\n" +
+"      const startTs = performance.now();\n" +
+"      function frame(now) {\n" +
+"        exports.render_frame(now - startTs, mouseX, mouseY, mouseDown);\n" +
+"        const view = new Uint8ClampedArray(mem.buffer, RGBA_BASE, FB_BYTES);\n" +
+"        ctx.putImageData(new ImageData(view, WIDTH, HEIGHT), 0, 0);\n" +
+"        requestAnimationFrame(frame);\n" +
+"      }\n" +
+"      requestAnimationFrame(frame);\n" +
+"    });\n" +
+"    if ('serviceWorker' in navigator) {\n" +
+"      navigator.serviceWorker.register('./sw.js').catch(() => {});\n" +
+"    }\n" +
+"  })();\n" +
+"  </script>\n" +
+"</body>\n" +
+"</html>\n";
+}
+
+fn _generate_manifest_json(app_title) {
+    return json_stringify(map{
+        name: app_title,
+        short_name: app_title,
+        start_url: "./index.html",
+        display: "standalone",
+        background_color: "#0b1020",
+        theme_color: "#0b1020",
+        description: "Sovereign PBLang WASM32 + HTML5 Canvas Offline Web-PWA",
+        icons: [
+            map{
+                src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'%3E%3Crect width='128' height='128' rx='24' fill='%230b1020'/%3E%3Ctext x='64' y='80' font-size='52' text-anchor='middle' fill='%234fe3c1' font-family='monospace'%3EPB%3C/text%3E%3C/svg%3E",
+                sizes: "128x128",
+                type: "image/svg+xml"
+            }
+        ]
+    });
+}
+
+fn _generate_service_worker_js(cache_tag) {
+    return "// Sovereign Offline Service Worker — Zero CDN / Zero External Dependencies\n" +
+"const CACHE_NAME = 'pblang-pwa-" + cache_tag + "';\n" +
+"const ASSETS = ['./', './index.html', './app.wasm', './manifest.webmanifest'];\n" +
+"self.addEventListener('install', (event) => {\n" +
+"  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(ASSETS)).then(() => self.skipWaiting()));\n" +
+"});\n" +
+"self.addEventListener('activate', (event) => {\n" +
+"  event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))).then(() => self.clients.claim()));\n" +
+"});\n" +
+"self.addEventListener('fetch', (event) => {\n" +
+"  event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request)));\n" +
+"});\n";
+}
+
+fn build_web_pwa(input_path, out_dir = nil, width = 800, height = 500) {
+    if type(input_path) != "string" or input_path == "" {
+        _fail("input_path must be a non-empty file path");
+    }
+    if not fs_exists(input_path) {
+        _fail("input source file not found: " + input_path);
+    }
+    let custom_title = "";
+    if is_map(width) {
+        let opts_b = width;
+        if map_has(opts_b, "title") { custom_title = str(opts_b.title); }
+        height = if map_has(opts_b, "height") { opts_b.height } else { 500 };
+        width = if map_has(opts_b, "width") { opts_b.width } else { 800 };
+    }
+    let src_code = fs_read(input_path);
+    let compiled = compile_sapp_to_wasm_rgba(src_code, width, height);
+
+    let target_dir = out_dir;
+    if target_dir == nil or target_dir == "" {
+        let parent = path_dirname(input_path);
+        if parent == "" { parent = "."; }
+        target_dir = path_join(parent, "dist_web");
+    }
+    fs_mkdirs(target_dir);
+
+    let base_name = path_basename(input_path);
+    let dot_idx = str_index_of(base_name, ".");
+    let app_title = if custom_title != "" { custom_title } elif dot_idx > 0 { str_slice(base_name, 0, dot_idx) } else { base_name };
+
+    let wasm_path = path_join(target_dir, "app.wasm");
+    let html_path = path_join(target_dir, "index.html");
+    let manifest_path = path_join(target_dir, "manifest.webmanifest");
+    let sw_path = path_join(target_dir, "sw.js");
+
+    let wasm_b64 = base64_encode_bytes(compiled.wasm_bytes);
+    let html_text = _generate_index_html(app_title, width, height, wasm_b64);
+    let manifest_text = _generate_manifest_json(app_title);
+    let sw_text = _generate_service_worker_js(str_slice(compiled.sha256, 0, 12));
+
+    fs_write_bytes(wasm_path, compiled.wasm_bytes);
+    fs_write(html_path, html_text);
+    fs_write(manifest_path, manifest_text);
+    fs_write(sw_path, sw_text);
+
+    return map{
+        ok: true,
+        app_title: app_title,
+        out_dir: target_dir,
+        wasm_path: wasm_path,
+        html_path: html_path,
+        manifest_path: manifest_path,
+        sw_path: sw_path,
+        wasm_bytes: compiled.wasm_bytes,
+        wasm_byte_length: compiled.byte_length,
+        wasm_sha256: compiled.sha256,
+        rgba_base: RGBA_BASE,
+        width: width,
+        height: height,
+        exports: compiled.exports,
+        sections: compiled.sections
+    };
+}
+
+// CLI entry point for `pblang build <app.sapp> --target web [--out <dir>] [--width W] [--height H]`
+fn cli_build_web_entry(args) {
+    if type(args) != "array" or len(args) == 0 {
+        return map{ ok: false, error: "usage: pblang build <app.sapp> --target web [--out <dir>] [--width <w>] [--height <h>]" };
+    }
+    let input_path = "";
+    let out_dir = nil;
+    let target = "web";
+    let width = 800;
+    let height = 500;
+    let i = 0;
+    while i < len(args) {
+        let a = str(args[i]);
+        if a == "--out" or a == "-o" {
+            if i + 1 >= len(args) { return map{ ok: false, error: "missing value after " + a }; }
+            out_dir = str(args[i + 1]);
+            i = i + 2;
+        } elif a == "--target" {
+            if i + 1 >= len(args) { return map{ ok: false, error: "missing value after --target" }; }
+            target = str_lower(str(args[i + 1]));
+            i = i + 2;
+        } elif a == "--width" {
+            if i + 1 >= len(args) { return map{ ok: false, error: "missing value after --width" }; }
+            width = num_floor(parse_number(str(args[i + 1])));
+            i = i + 2;
+        } elif a == "--height" {
+            if i + 1 >= len(args) { return map{ ok: false, error: "missing value after --height" }; }
+            height = num_floor(parse_number(str(args[i + 1])));
+            i = i + 2;
+        } elif a == "build" {
+            i = i + 1;
+        } elif not str_starts_with(a, "-") and input_path == "" {
+            input_path = a;
+            i = i + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+    if target != "web" and target != "wasm" and target != "pwa" {
+        return map{ ok: false, error: "unsupported web target: " + target };
+    }
+    if input_path == "" {
+        return map{ ok: false, error: "missing input .sapp path" };
+    }
+    return build_web_pwa(input_path, out_dir, width, height);
+}
+
+export RGBA_BASE, WASM_PAGE_BYTES;
+export inspect_wasm_sections, compile_sapp_to_wasm_rgba, build_web_pwa, cli_build_web_entry;

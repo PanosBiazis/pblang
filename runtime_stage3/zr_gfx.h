@@ -1,5 +1,5 @@
 /* ============================================================================
- * pblang Sovereign Zero-Rust Native Runtime v2.0.0 — zr_gfx.h
+ * pblang Sovereign Zero-Rust Native Runtime v3.0.0 — zr_gfx.h
  * Native Cross-Platform Framebuffer GUI + Anti-Aliased Greek & Latin Text:
  *   - Headless Virtual ARGB8888 Framebuffer (`PBLANG_GFX_HEADLESS=1`)
  *   - Linux: Lazy-dlopen X11 (`libX11.so.6`) + FreeType2 (`libfreetype.so.6`)
@@ -551,6 +551,7 @@ static void zr_draw_line(uint32_t *buf, size_t w, size_t h, int64_t ix0, int64_t
 
 /* ---- Builtins ---- */
 static bool bi_gfxcreatewindow(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_GFX), "gfxcreatewindow", "gfx")) return false;
     if (argc != 3 || !val_is_obj(argv[0], OBJ_STR) || argv[1].tag != VAL_NUM || argv[2].tag != VAL_NUM) {
         vm_raise(vm, "gfxcreatewindow(title, width, height) expects (string, number, number)");
         return false;

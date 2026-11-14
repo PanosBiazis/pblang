@@ -1,0 +1,1074 @@
+// stdlib/repl_interactive.sapp — PBLang v3.0.0 Stateful Interactive REPL
+//
+// Features:
+//   - Persistent multi-line AST session evaluator (`create_repl_session`, `eval_repl_line`, `run_repl`)
+//     preserving variables, constants, closures, recursive functions, imported modules, and
+//     compile-time 9D SI/Currency unit bindings (`: num[m/s]`, `: num[EUR]`) across inputs!
+//   - Live static unit/contract guardrails on every line (flags `DIMENSIONAL_MISMATCH` and refuted
+//     `requires`/`ensures` contracts before side effects execute)
+//   - Interactive meta-commands:
+//       `:help`            Show command reference
+//       `:vars`            Inspect all bound variables, functions, values & SI units
+//       `:type <expr>`     Infer static type & SI unit of `<expr>` in session context
+//       `:si <expr>`       Inspect full 9D SI + Currency dimensional vector of `<expr>`
+//       `:prove <formula>` Prove or refute `<formula>` via Tarski CAD / Cooper-Presburger
+//       `:check <code>`    Run full 4-pass static + SI + contract checker on `<code>`
+//       `:reset`           Clear session state
+//       `:quit`            Exit REPL
+//
+// Compatible with PBLang 2.7.0 and 3.0.0 runtimes.
+
+let SC = import("stdlib:static_checker.sapp");
+let UCC = import("stdlib:math/universal_concept_cards.sapp");
+
+let REPL_VERSION = "3.0.0";
+let _REPL_PI = 3.14159265358979323846;
+
+// ── Numeric & Formatting Helpers ──────────────────────────────────────────────
+
+fn _repl_round(x) {
+    if x >= 0.0 { return num_floor(x + 0.5); }
+    return 0 - num_floor((0.0 - x) + 0.5);
+}
+
+fn _repl_sin(x) {
+    let two_pi = 2.0 * _REPL_PI;
+    let r = x - num_floor(x / two_pi) * two_pi;
+    if r > _REPL_PI { r = r - two_pi; }
+    let term = r;
+    let acc = r;
+    let k = 1;
+    while k <= 12 {
+        term = (0.0 - term) * r * r / ((2 * k) * (2 * k + 1) * 1.0);
+        acc = acc + term;
+        k = k + 1;
+    }
+    return acc;
+}
+
+fn _repl_cos(x) {
+    return _repl_sin(x + 0.5 * _REPL_PI);
+}
+
+fn _parse_num_lit(raw_s) {
+    let s = str_trim(raw_s);
+    if str_starts_with(s, "0x") or str_starts_with(s, "0X") {
+        let v = 0;
+        let i = 2;
+        while i < len(s) {
+            let c = strcharcodeat(str_slice(s, i, i + 1), 0);
+            let d = 0;
+            if c >= 48 and c <= 57 { d = c - 48; }
+            elif c >= 65 and c <= 70 { d = c - 55; }
+            elif c >= 97 and c <= 102 { d = c - 87; }
+            v = v * 16 + d;
+            i = i + 1;
+        }
+        return v;
+    }
+    let pn = try parse_number(s) catch nil;
+    if pn != nil { return pn; }
+    return 0;
+}
+
+fn _format_repl_value(v) {
+    let tv = type(v);
+    if tv == "nil" { return "nil"; }
+    if tv == "string" { return "\"" + v + "\""; }
+    if tv == "bool" or tv == "number" { return str(v); }
+    if tv == "map" and map_has(v, "__repl_fn") {
+        return "<fn " + v["name"] + ">";
+    }
+    if tv == "array" or tv == "map" {
+        let js = try json_stringify(v) catch nil;
+        if js != nil { return js; }
+    }
+    return str(v);
+}
+
+// ── Lexical Scope Chain ───────────────────────────────────────────────────────
+
+fn _env_make(parent_env) {
+    return map{
+        parent: parent_env,
+        values: map{},
+        consts: map{}
+    };
+}
+
+fn _env_define(env, name, val, is_const_flag) {
+    env["values"][name] = val;
+    if is_const_flag {
+        env["consts"][name] = true;
+    } elif map_has(env["consts"], name) {
+        map_remove(env["consts"], name);
+    }
+}
+
+fn _env_lookup(env, name) {
+    let cur = env;
+    while cur != nil {
+        if map_has(cur["values"], name) {
+            return map{ found: true, val: cur["values"][name] };
+        }
+        cur = cur["parent"];
+    }
+    return map{ found: false, val: nil };
+}
+
+fn _env_assign(env, name, val) {
+    let cur = env;
+    while cur != nil {
+        if map_has(cur["values"], name) {
+            if map_has(cur["consts"], name) and cur["consts"][name] == true {
+                throw "Cannot reassign constant '" + name + "'";
+            }
+            cur["values"][name] = val;
+            return;
+        }
+        cur = cur["parent"];
+    }
+    throw "Undefined variable '" + name + "'";
+}
+
+// ── Session Construction ──────────────────────────────────────────────────────
+
+fn create_repl_session(opts = nil) {
+    let check_units = true;
+    let strict_mode = false;
+    if opts != nil and type(opts) == "map" {
+        if map_has(opts, "check_units") { check_units = opts["check_units"] == true; }
+        if map_has(opts, "strict") { strict_mode = opts["strict"] == true; }
+    }
+    return map{
+        version: REPL_VERSION,
+        env: _env_make(nil),
+        unit_decls: map{},      // var_name -> unit_str (e.g. "m/s", "EUR")
+        fn_sources: map{},      // fn_name -> original declaration source for static checks
+        var_Order: [],
+        history: [],
+        check_units: check_units,
+        strict: strict_mode,
+        step_budget: 200000,
+        steps_used: 0,
+        quit: false,
+        last_output: []
+    };
+}
+
+fn _reset_repl_session(sess) {
+    sess["env"] = _env_make(nil);
+    sess["unit_decls"] = map{};
+    sess["fn_sources"] = map{};
+    sess["var_Order"] = [];
+    sess["history"] = [];
+    sess["quit"] = false;
+    sess["last_output"] = [];
+}
+
+fn _build_session_static_preamble(sess) {
+    let lines = [];
+    let fks = map_keys(sess["fn_sources"]);
+    let fi = 0;
+    while fi < len(fks) {
+        push(lines, sess["fn_sources"][fks[fi]]);
+        fi = fi + 1;
+    }
+    let env_vals = sess["env"]["values"];
+    let vks = map_keys(env_vals);
+    let vi = 0;
+    while vi < len(vks) {
+        let nm = vks[vi];
+        let val = env_vals[nm];
+        let tv = type(val);
+        if not (tv == "map" and map_has(val, "__repl_fn")) {
+            let is_c = map_has(sess["env"]["consts"], nm) and sess["env"]["consts"][nm] == true;
+            let kw = if is_c { "const " } else { "let " };
+            if map_has(sess["unit_decls"], nm) and sess["unit_decls"][nm] != "" {
+                push(lines, kw + nm + ": num[" + sess["unit_decls"][nm] + "] = 1.0;");
+            } elif tv == "number" {
+                push(lines, kw + nm + ": num = 1.0;");
+            } elif tv == "string" {
+                push(lines, kw + nm + ": string = \"\";");
+            } elif tv == "bool" {
+                push(lines, kw + nm + ": bool = true;");
+            } elif tv == "array" {
+                push(lines, kw + nm + ": array = [];");
+            } elif tv == "map" {
+                push(lines, kw + nm + ": map = map{};");
+            } else {
+                push(lines, kw + nm + " = nil;");
+            }
+        }
+        vi = vi + 1;
+    }
+    return str_join(lines, "\n");
+}
+
+// ── Host Builtin Dispatcher for REPL Evaluator ────────────────────────────────
+
+fn _is_repl_builtin(name) {
+    return name == "println" or name == "print" or name == "str" or name == "len"
+        or name == "type" or name == "push" or name == "pop" or name == "slice"
+        or name == "abs" or name == "num_abs" or name == "sqrt" or name == "num_sqrt"
+        or name == "sin" or name == "cos" or name == "tan"
+        or name == "exp" or name == "num_exp" or name == "ln" or name == "num_ln"
+        or name == "pow" or name == "num_pow" or name == "floor" or name == "num_floor"
+        or name == "ceil" or name == "num_ceil" or name == "round" or name == "num_round"
+        or name == "min_of" or name == "max_of" or name == "num_min" or name == "num_max"
+        or name == "range" or name == "sum" or name == "array_sort"
+        or name == "map_keys" or name == "map_has" or name == "map_remove"
+        or name == "json_parse" or name == "json_stringify"
+        or name == "str_split" or name == "str_join" or name == "str_trim"
+        or name == "str_slice" or name == "str_contains" or name == "str_starts_with"
+        or name == "str_ends_with" or name == "str_replace_all" or name == "str_upper"
+        or name == "str_lower" or name == "parse_number" or name == "assert";
+}
+
+fn _call_repl_builtin(sess, name, args) {
+    let n = len(args);
+    if name == "println" or name == "print" {
+        let parts = [];
+        let i = 0;
+        while i < n {
+            push(parts, str(args[i]));
+            i = i + 1;
+        }
+        let line_out = str_join(parts, " ");
+        push(sess["last_output"], line_out);
+        return nil;
+    }
+    if name == "str" { return str(args[0]); }
+    if name == "len" { return len(args[0]); }
+    if name == "type" {
+        let v = args[0];
+        if type(v) == "map" and map_has(v, "__repl_fn") { return "function"; }
+        return type(v);
+    }
+    if name == "push" { push(args[0], args[1]); return nil; }
+    if name == "pop" { return pop(args[0]); }
+    if name == "slice" { return slice(args[0], args[1], args[2]); }
+    if name == "abs" or name == "num_abs" { return num_abs(args[0]); }
+    if name == "sqrt" or name == "num_sqrt" { return num_sqrt(args[0]); }
+    if name == "sin" { return _repl_sin(args[0]); }
+    if name == "cos" { return _repl_cos(args[0]); }
+    if name == "tan" { return _repl_sin(args[0]) / _repl_cos(args[0]); }
+    if name == "exp" or name == "num_exp" { return num_exp(args[0]); }
+    if name == "ln" or name == "num_ln" { return num_ln(args[0]); }
+    if name == "pow" or name == "num_pow" { return num_pow(args[0], args[1]); }
+    if name == "floor" or name == "num_floor" { return num_floor(args[0]); }
+    if name == "ceil" or name == "num_ceil" { return num_ceil(args[0]); }
+    if name == "round" or name == "num_round" { return _repl_round(args[0]); }
+    if name == "min_of" or name == "num_min" { return if args[0] < args[1] { args[0] } else { args[1] }; }
+    if name == "max_of" or name == "num_max" { return if args[0] > args[1] { args[0] } else { args[1] }; }
+    if name == "range" {
+        if n == 1 { return range(args[0]); }
+        let out_r = [];
+        let cur = args[0];
+        let step = if n >= 3 { args[2] } else { 1 };
+        while (step > 0 and cur < args[1]) or (step < 0 and cur > args[1]) {
+            push(out_r, cur);
+            cur = cur + step;
+        }
+        return out_r;
+    }
+    if name == "sum" { return sum(args[0]); }
+    if name == "array_sort" { return array_sort(args[0]); }
+    if name == "map_keys" { return map_keys(args[0]); }
+    if name == "map_has" { return map_has(args[0], args[1]); }
+    if name == "map_remove" { map_remove(args[0], args[1]); return nil; }
+    if name == "json_parse" { return json_parse(args[0]); }
+    if name == "json_stringify" { return json_stringify(args[0]); }
+    if name == "str_split" { return str_split(args[0], args[1]); }
+    if name == "str_join" { return str_join(args[0], args[1]); }
+    if name == "str_trim" { return str_trim(args[0]); }
+    if name == "str_slice" { return str_slice(args[0], args[1], args[2]); }
+    if name == "str_contains" { return str_contains(args[0], args[1]); }
+    if name == "str_starts_with" { return str_starts_with(args[0], args[1]); }
+    if name == "str_ends_with" { return str_ends_with(args[0], args[1]); }
+    if name == "str_replace_all" { return str_replace_all(args[0], args[1], args[2]); }
+    if name == "str_upper" { return str_upper(args[0]); }
+    if name == "str_lower" { return str_lower(args[0]); }
+    if name == "parse_number" { return parse_number(args[0]); }
+    if name == "assert" {
+        if not args[0] {
+            let msg = if n >= 2 { str(args[1]) } else { "Assertion failed" };
+            throw msg;
+        }
+        return true;
+    }
+    throw "Unsupported builtin '" + name + "'";
+}
+
+// ── Tree-Walking Session AST Evaluator ────────────────────────────────────────
+
+fn _tick_budget(sess) {
+    sess["steps_used"] = sess["steps_used"] + 1;
+    if sess["steps_used"] > sess["step_budget"] {
+        throw "Execution step budget exceeded (" + str(sess["step_budget"]) + " steps)";
+    }
+}
+
+fn _truthy(v) {
+    return v != nil and v != false;
+}
+
+fn _invoke_callable(sess, fn_val, arg_vals) {
+    if type(fn_val) == "function" {
+        let n = len(arg_vals);
+        if n == 0 { return fn_val(); }
+        if n == 1 { return fn_val(arg_vals[0]); }
+        if n == 2 { return fn_val(arg_vals[0], arg_vals[1]); }
+        if n == 3 { return fn_val(arg_vals[0], arg_vals[1], arg_vals[2]); }
+        if n == 4 { return fn_val(arg_vals[0], arg_vals[1], arg_vals[2], arg_vals[3]); }
+        return fn_val(arg_vals[0], arg_vals[1], arg_vals[2], arg_vals[3], arg_vals[4]);
+    }
+    if type(fn_val) == "map" and map_has(fn_val, "__repl_fn") {
+        let call_env = _env_make(fn_val["closure_env"]);
+        let params = fn_val["params"];
+        let pi = 0;
+        while pi < len(params) {
+            let p = params[pi];
+            if p["is_rest"] == true {
+                let rest_arr = [];
+                let ri = pi;
+                while ri < len(arg_vals) {
+                    push(rest_arr, arg_vals[ri]);
+                    ri = ri + 1;
+                }
+                _env_define(call_env, p["name"], rest_arr, false);
+                break;
+            } elif pi < len(arg_vals) {
+                _env_define(call_env, p["name"], arg_vals[pi], false);
+            } elif p["default_expr"] != nil {
+                _env_define(call_env, p["name"], _eval_expr_ast(sess, call_env, p["default_expr"]), false);
+            } else {
+                _env_define(call_env, p["name"], nil, false);
+            }
+            pi = pi + 1;
+        }
+
+        // Runtime precondition check (`requires`)
+        let reqs = fn_val["requires_list"];
+        let qi = 0;
+        while qi < len(reqs) {
+            let ok_pre = _eval_expr_ast(sess, call_env, reqs[qi]["expr"]);
+            if not _truthy(ok_pre) {
+                throw "Precondition ('requires') violated in call to '" + fn_val["name"] + "'";
+            }
+            qi = qi + 1;
+        }
+
+        let sig = _eval_block_ast(sess, call_env, fn_val["body"]);
+        let ret_val = if sig["signal"] == "return" { sig["val"] } else { sig["val"] };
+
+        // Runtime postcondition check (`ensures`)
+        let enss = fn_val["ensures_list"];
+        if len(enss) > 0 {
+            _env_define(call_env, "result", ret_val, true);
+            let ei = 0;
+            while ei < len(enss) {
+                let ok_post = _eval_expr_ast(sess, call_env, enss[ei]["expr"]);
+                if not _truthy(ok_post) {
+                    throw "Postcondition ('ensures') violated in '" + fn_val["name"] + "'";
+                }
+                ei = ei + 1;
+            }
+        }
+        return ret_val;
+    }
+    throw "Attempted to call non-function value of type '" + type(fn_val) + "'";
+}
+
+fn _eval_expr_ast(sess, env, node) {
+    if node == nil { return nil; }
+    _tick_budget(sess);
+    let k = node["kind"];
+
+    if k == "num" { return _parse_num_lit(node["val"]); }
+    if k == "str" { return node["val"]; }
+    if k == "bool" { return node["val"]; }
+    if k == "nil" { return nil; }
+
+    if k == "ident" {
+        let nm = node["name"];
+        let lk = _env_lookup(env, nm);
+        if lk["found"] { return lk["val"]; }
+        if _is_repl_builtin(nm) {
+            return map{ __repl_builtin: nm };
+        }
+        throw "Undefined symbol '" + nm + "'";
+    }
+
+    if k == "array_lit" {
+        let out = [];
+        let items = node["items"];
+        let i = 0;
+        while i < len(items) {
+            if items[i]["kind"] == "spread" {
+                let sp = _eval_expr_ast(sess, env, items[i]["arg"]);
+                let j = 0;
+                while j < len(sp) { push(out, sp[j]); j = j + 1; }
+            } else {
+                push(out, _eval_expr_ast(sess, env, items[i]));
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    if k == "map_lit" {
+        let m = map{};
+        let entries = node["entries"];
+        let i = 0;
+        while i < len(entries) {
+            let ke = entries[i]["key"];
+            let kv = str(_eval_expr_ast(sess, env, ke));
+            m[kv] = _eval_expr_ast(sess, env, entries[i]["val"]);
+            i = i + 1;
+        }
+        return m;
+    }
+
+    if k == "fn_expr" {
+        return map{
+            __repl_fn: true,
+            name: if node["name"] != "" { node["name"] } else { "<anon>" },
+            params: node["params"],
+            requires_list: node["requires_list"],
+            ensures_list: node["ensures_list"],
+            body: node["body"],
+            closure_env: env
+        };
+    }
+
+    if k == "import_expr" {
+        let p = str(_eval_expr_ast(sess, env, node["arg"]));
+        return import(p);
+    }
+
+    if k == "comptime_expr" {
+        if node["expr"] != nil { return _eval_expr_ast(sess, env, node["expr"]); }
+        return _eval_block_ast(sess, _env_make(env), node["block"])["val"];
+    }
+
+    if k == "unary" {
+        let op = node["op"];
+        let v = _eval_expr_ast(sess, env, node["arg"]);
+        if op == "-" { return 0 - v; }
+        if op == "+" { return v; }
+        if op == "not" or op == "!" { return not _truthy(v); }
+        return v;
+    }
+
+    if k == "binary" {
+        let op = node["op"];
+        if op == "and" {
+            let lv = _eval_expr_ast(sess, env, node["left"]);
+            if not _truthy(lv) { return false; }
+            return _truthy(_eval_expr_ast(sess, env, node["right"]));
+        }
+        if op == "or" {
+            let lv2 = _eval_expr_ast(sess, env, node["left"]);
+            if _truthy(lv2) { return true; }
+            return _truthy(_eval_expr_ast(sess, env, node["right"]));
+        }
+        if op == "??" {
+            let lv3 = _eval_expr_ast(sess, env, node["left"]);
+            if lv3 != nil { return lv3; }
+            return _eval_expr_ast(sess, env, node["right"]);
+        }
+        let l = _eval_expr_ast(sess, env, node["left"]);
+        let r = _eval_expr_ast(sess, env, node["right"]);
+        if op == "+" { return l + r; }
+        if op == "-" { return l - r; }
+        if op == "*" { return l * r; }
+        if op == "/" {
+            if r == 0 { throw "Division by zero"; }
+            return l / r;
+        }
+        if op == "%" { return num_mod(l, r); }
+        if op == "^" or op == "**" { return num_pow(l, r); }
+        if op == "==" { return l == r; }
+        if op == "!=" { return l != r; }
+        if op == "<" { return l < r; }
+        if op == "<=" { return l <= r; }
+        if op == ">" { return l > r; }
+        if op == ">=" { return l >= r; }
+        throw "Unsupported operator '" + op + "'";
+    }
+
+    if k == "if_expr" {
+        if _truthy(_eval_expr_ast(sess, env, node["cond"])) {
+            return _eval_expr_ast(sess, env, node["then_expr"]);
+        }
+        return _eval_expr_ast(sess, env, node["else_expr"]);
+    }
+
+    if k == "if_stmt" {
+        let sig_if = _eval_stmt_ast(sess, env, node);
+        return sig_if["val"];
+    }
+
+    if k == "try_expr" {
+        let res_t = try map{ ok: true, v: _eval_expr_ast(sess, env, node["expr"]) } catch map{ ok: false, v: nil };
+        if res_t["ok"] { return res_t["v"]; }
+        if node["fallback"] != nil { return _eval_expr_ast(sess, env, node["fallback"]); }
+        return nil;
+    }
+
+    if k == "member" {
+        let obj = _eval_expr_ast(sess, env, node["obj"]);
+        if obj == nil and node["op"] == "?." { return nil; }
+        return obj[node["field"]];
+    }
+
+    if k == "index" {
+        let obj2 = _eval_expr_ast(sess, env, node["obj"]);
+        let idx = _eval_expr_ast(sess, env, node["index"]);
+        return obj2[idx];
+    }
+
+    if k == "slice_expr" {
+        let obj3 = _eval_expr_ast(sess, env, node["obj"]);
+        let st_i = if node["start"] != nil { _eval_expr_ast(sess, env, node["start"]) } else { 0 };
+        let en_i = if node["stop"] != nil { _eval_expr_ast(sess, env, node["stop"]) } else { len(obj3) };
+        if type(obj3) == "string" { return str_slice(obj3, st_i, en_i); }
+        return slice(obj3, st_i, en_i);
+    }
+
+    if k == "call" {
+        let arg_vals = [];
+        let cargs = node["args"];
+        let i = 0;
+        while i < len(cargs) {
+            if cargs[i]["kind"] == "spread" {
+                let sp2 = _eval_expr_ast(sess, env, cargs[i]["arg"]);
+                let j = 0;
+                while j < len(sp2) { push(arg_vals, sp2[j]); j = j + 1; }
+            } else {
+                push(arg_vals, _eval_expr_ast(sess, env, cargs[i]));
+            }
+            i = i + 1;
+        }
+        if node["callee"]["kind"] == "ident" {
+            let fn_nm = node["callee"]["name"];
+            let lk_fn = _env_lookup(env, fn_nm);
+            if lk_fn["found"] {
+                return _invoke_callable(sess, lk_fn["val"], arg_vals);
+            }
+            if _is_repl_builtin(fn_nm) {
+                return _call_repl_builtin(sess, fn_nm, arg_vals);
+            }
+        }
+        let callee_val = _eval_expr_ast(sess, env, node["callee"]);
+        if type(callee_val) == "map" and map_has(callee_val, "__repl_builtin") {
+            return _call_repl_builtin(sess, callee_val["__repl_builtin"], arg_vals);
+        }
+        return _invoke_callable(sess, callee_val, arg_vals);
+    }
+
+    return nil;
+}
+
+fn _eval_block_ast(sess, block_env, block_node) {
+    let stmts = block_node["stmts"];
+    let last_val = nil;
+    let i = 0;
+    while i < len(stmts) {
+        let sig = _eval_stmt_ast(sess, block_env, stmts[i]);
+        if sig["signal"] != "none" {
+            return sig;
+        }
+        last_val = sig["val"];
+        i = i + 1;
+    }
+    if block_node["tail_expr"] != nil {
+        last_val = _eval_expr_ast(sess, block_env, block_node["tail_expr"]);
+    }
+    return map{ signal: "none", val: last_val };
+}
+
+fn _eval_stmt_ast(sess, env, stmt) {
+    _tick_budget(sess);
+    let k = stmt["kind"];
+
+    if k == "empty" or k == "export_stmt" {
+        return map{ signal: "none", val: nil };
+    }
+
+    if k == "block" {
+        return _eval_block_ast(sess, _env_make(env), stmt);
+    }
+
+    if k == "var_decl" {
+        let v = if stmt["init"] != nil { _eval_expr_ast(sess, env, stmt["init"]) } else { nil };
+        _env_define(env, stmt["name"], v, stmt["is_const"] == true);
+        if env == sess["env"] {
+            if stmt["annot"] != nil and stmt["annot"]["unit_raw"] != "" {
+                sess["unit_decls"][stmt["name"]] = stmt["annot"]["unit_raw"];
+            }
+        }
+        return map{ signal: "none", val: v };
+    }
+
+    if k == "fn_decl" {
+        let fn_obj = map{
+            __repl_fn: true,
+            name: stmt["name"],
+            params: stmt["params"],
+            requires_list: stmt["requires_list"],
+            ensures_list: stmt["ensures_list"],
+            body: stmt["body"],
+            closure_env: env
+        };
+        _env_define(env, stmt["name"], fn_obj, false);
+        return map{ signal: "none", val: fn_obj };
+    }
+
+    if k == "assign" {
+        let rhs = _eval_expr_ast(sess, env, stmt["val"]);
+        let tgt = stmt["target"];
+        let op = stmt["op"];
+        if tgt["kind"] == "ident" {
+            let cur = if op == "=" { nil } else { _eval_expr_ast(sess, env, tgt) };
+            let nv = rhs;
+            if op == "+=" { nv = cur + rhs; }
+            elif op == "-=" { nv = cur - rhs; }
+            elif op == "*=" { nv = cur * rhs; }
+            elif op == "/=" { nv = cur / rhs; }
+            _env_assign(env, tgt["name"], nv);
+            return map{ signal: "none", val: nv };
+        }
+        if tgt["kind"] == "index" {
+            let box = _eval_expr_ast(sess, env, tgt["obj"]);
+            let idx = _eval_expr_ast(sess, env, tgt["index"]);
+            box[idx] = rhs;
+            return map{ signal: "none", val: rhs };
+        }
+        if tgt["kind"] == "member" {
+            let box2 = _eval_expr_ast(sess, env, tgt["obj"]);
+            box2[tgt["field"]] = rhs;
+            return map{ signal: "none", val: rhs };
+        }
+        throw "Invalid assignment target";
+    }
+
+    if k == "print_stmt" {
+        let pargs = [];
+        let i = 0;
+        while i < len(stmt["args"]) {
+            push(pargs, _eval_expr_ast(sess, env, stmt["args"][i]));
+            i = i + 1;
+        }
+        _call_repl_builtin(sess, "println", pargs);
+        return map{ signal: "none", val: nil };
+    }
+
+    if k == "return_stmt" {
+        let rv = if stmt["val"] != nil { _eval_expr_ast(sess, env, stmt["val"]) } else { nil };
+        return map{ signal: "return", val: rv };
+    }
+
+    if k == "break_stmt" { return map{ signal: "break", val: nil }; }
+    if k == "continue_stmt" { return map{ signal: "continue", val: nil }; }
+
+    if k == "throw_stmt" {
+        throw str(_eval_expr_ast(sess, env, stmt["val"]));
+    }
+
+    if k == "if_stmt" {
+        if _truthy(_eval_expr_ast(sess, env, stmt["cond"])) {
+            return _eval_block_ast(sess, _env_make(env), stmt["then_block"]);
+        }
+        if stmt["else_block"] != nil {
+            if stmt["else_block"]["kind"] == "block" {
+                return _eval_block_ast(sess, _env_make(env), stmt["else_block"]);
+            }
+            return _eval_stmt_ast(sess, env, stmt["else_block"]);
+        }
+        return map{ signal: "none", val: nil };
+    }
+
+    if k == "while_stmt" {
+        let last_w = nil;
+        while _truthy(_eval_expr_ast(sess, env, stmt["cond"])) {
+            let sig_w = _eval_block_ast(sess, _env_make(env), stmt["body"]);
+            if sig_w["signal"] == "return" { return sig_w; }
+            if sig_w["signal"] == "break" { break; }
+            last_w = sig_w["val"];
+        }
+        return map{ signal: "none", val: last_w };
+    }
+
+    if k == "expr_stmt" {
+        return map{ signal: "none", val: _eval_expr_ast(sess, env, stmt["expr"]) };
+    }
+
+    return map{ signal: "none", val: _eval_expr_ast(sess, env, stmt) };
+}
+
+// ── Meta-Command Processor ────────────────────────────────────────────────────
+
+fn _handle_meta_command(sess, trimmed) {
+    if trimmed == ":quit" or trimmed == ":q" or trimmed == ":exit" {
+        sess["quit"] = true;
+        return map{
+            ok: true,
+            kind: "quit",
+            quit: true,
+            value: nil,
+            formatted: "Session closed.",
+            output: "Session closed."
+        };
+    }
+
+    if trimmed == ":help" or trimmed == ":h" {
+        let h = str_join([
+            "PBLang v3.0.0 Interactive REPL Commands:",
+            "  :help              Show this help summary",
+            "  :vars              List all bound variables, functions, values & SI units",
+            "  :type <expr>       Infer static type & SI unit of <expr>",
+            "  :si <expr>         Inspect 9D SI + Currency dimensional vector of <expr>",
+            "  :prove <formula>   Prove/refute <formula> via Tarski CAD / Cooper-Presburger",
+            "  :check <code>      Run 4-pass static + SI + contract checker on <code>",
+            "  :reset             Clear session state",
+            "  :quit              Exit interactive REPL"
+        ], "\n");
+        return map{ ok: true, kind: "meta", quit: false, value: h, formatted: h, output: h };
+    }
+
+    if trimmed == ":reset" {
+        _reset_repl_session(sess);
+        return map{
+            ok: true,
+            kind: "meta",
+            quit: false,
+            value: "Session reset.",
+            formatted: "Session reset.",
+            output: "Session reset."
+        };
+    }
+
+    if trimmed == ":vars" {
+        let vals = sess["env"]["values"];
+        let ks = array_sort(map_keys(vals));
+        if len(ks) == 0 {
+            return map{ ok: true, kind: "meta", quit: false, value: "(no bindings)", formatted: "(no bindings)", output: "(no bindings)" };
+        }
+        let rows = [];
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            let u_tag = if map_has(sess["unit_decls"], k) and sess["unit_decls"][k] != "" {
+                ": num[" + sess["unit_decls"][k] + "]"
+            } else {
+                ""
+            };
+            push(rows, k + u_tag + " = " + _format_repl_value(vals[k]));
+            i = i + 1;
+        }
+        let txt = str_join(rows, "\n");
+        return map{ ok: true, kind: "meta", quit: false, value: rows, formatted: txt, output: txt };
+    }
+
+    if str_starts_with(trimmed, ":type ") {
+        let expr_s = str_trim(str_slice(trimmed, 6, len(trimmed)));
+        let pre = _build_session_static_preamble(sess);
+        let probe_src = pre + "\nlet __repl_probe = " + expr_s + ";";
+        let rep = SC.check_source(probe_src, map{ strict: sess["strict"] });
+        let t_str = "any";
+        let si = 0;
+        while si < len(rep["symbols"]) {
+            if rep["symbols"][si]["name"] == "__repl_probe" {
+                t_str = rep["symbols"][si]["type_str"];
+            }
+            si = si + 1;
+        }
+        let ui = if map_has(rep["units_inferred"], "__repl_probe") { rep["units_inferred"]["__repl_probe"] } else { nil };
+        return map{
+            ok: rep["ok"],
+            kind: "meta",
+            quit: false,
+            value: t_str,
+            type_str: t_str,
+            unit_info: ui,
+            diagnostics: rep["diagnostics"],
+            formatted: t_str,
+            output: t_str
+        };
+    }
+
+    if str_starts_with(trimmed, ":si ") {
+        let expr_si = str_trim(str_slice(trimmed, 4, len(trimmed)));
+        let ures = SC.infer_expr_unit(expr_si, sess["unit_decls"]);
+        let ui2 = ures["unit_info"];
+        if not ures["ok"] {
+            let emsg = ures["diagnostics"][0]["message"];
+            return map{ ok: false, kind: "error", quit: false, value: nil, formatted: emsg, output: emsg, diagnostics: ures["diagnostics"] };
+        }
+        let desc = "dimensionless [1] (num)";
+        if ui2 != nil {
+            desc = ui2["type_str"] + " " + ui2["dim_unicode"] + " (" + str(ui2["named_quantity"]) + ")";
+        } else {
+            // Also support bare unit strings like `:si kg*m^2/s^2`
+            let direct_u = try UCC.parse_unit(expr_si) catch nil;
+            if direct_u != nil and direct_u["ok"] == true {
+                let dvec = direct_u["dim"];
+                desc = "num[" + UCC.dim_canonical_si_unit(dvec) + "] " + UCC.dim_to_unicode(dvec) + " (" + str(UCC.dim_named_quantity(dvec)) + ")";
+            }
+        }
+        return map{
+            ok: true,
+            kind: "meta",
+            quit: false,
+            value: desc,
+            unit_info: ui2,
+            formatted: desc,
+            output: desc
+        };
+    }
+
+    if str_starts_with(trimmed, ":prove ") {
+        let f_str = str_trim(str_slice(trimmed, 7, len(trimmed)));
+        let use_pres = str_contains(f_str, "divides(") or str_contains(f_str, "ndivides(");
+        let pr = SC.prove_formula_auto(f_str, use_pres);
+        let badge = if pr["proved"] {
+            "✓ PROVED_MATHEMATICALLY (" + pr["engine"] + ")"
+        } else {
+            "✗ " + pr["status"] + " (" + pr["engine"] + ")" + (if pr["witness_summary"] != "" { " — counterexample: " + pr["witness_summary"] } else { "" })
+        };
+        return map{
+            ok: pr["ok"],
+            kind: "meta",
+            quit: false,
+            value: pr,
+            proof: pr,
+            formatted: badge,
+            output: badge
+        };
+    }
+
+    if str_starts_with(trimmed, ":check ") {
+        let code_s = str_trim(str_slice(trimmed, 7, len(trimmed)));
+        let pre2 = _build_session_static_preamble(sess);
+        let rep2 = SC.check_source(pre2 + "\n" + code_s, map{ strict: true });
+        let txt2 = SC.format_diagnostics_text(rep2);
+        return map{
+            ok: rep2["ok"],
+            kind: "meta",
+            quit: false,
+            value: rep2,
+            diagnostics: rep2["diagnostics"],
+            contracts: rep2["contracts"],
+            formatted: txt2,
+            output: txt2
+        };
+    }
+
+    let unk = "Unknown REPL command '" + trimmed + "'. Type :help for available commands.";
+    return map{ ok: false, kind: "error", quit: false, value: nil, formatted: unk, output: unk };
+}
+
+// ── Main Line Evaluator (`eval_repl_line`) ────────────────────────────────────
+
+fn eval_repl_line(sess, line) {
+    sess["last_output"] = [];
+    sess["steps_used"] = 0;
+    let trimmed = str_trim(line);
+    if trimmed == "" {
+        return map{ ok: true, kind: "empty", quit: false, value: nil, formatted: "", output: "" };
+    }
+
+    push(sess["history"], line);
+
+    if str_starts_with(trimmed, ":") {
+        return _handle_meta_command(sess, trimmed);
+    }
+
+    // Parse input
+    let parsed = SC.parse_sapp_ast(line);
+    if len(parsed["errors"]) > 0 {
+        let perr = parsed["errors"][0]["message"];
+        return map{
+            ok: false,
+            kind: "error",
+            quit: false,
+            value: nil,
+            diagnostics: parsed["errors"],
+            formatted: "ParseError: " + perr,
+            output: "ParseError: " + perr
+        };
+    }
+
+    // Static SI unit & contract check against session context
+    let inferred_units = map{};
+    let static_rep = nil;
+    if sess["check_units"] {
+        let pre = _build_session_static_preamble(sess);
+        let full_src = if pre != "" { pre + "\n" + line } else { line };
+        static_rep = SC.check_source(full_src, map{ strict: sess["strict"] });
+        inferred_units = static_rep["units_inferred"];
+
+        // Block execution on SI dimensional errors or refuted contracts
+        let diags = static_rep["diagnostics"];
+        let di = 0;
+        while di < len(diags) {
+            let d = diags[di];
+            let dc = d["code"];
+            if dc == "DIMENSIONAL_MISMATCH" or dc == "TRANSCENDENTAL_NON_DIMENSIONLESS"
+               or dc == "CONTRACT_REFUTED" or dc == "DIVISION_BY_ZERO_REFUTED"
+               or dc == "CONST_REASSIGNMENT" or dc == "TYPE_MISMATCH" or dc == "RETURN_TYPE_MISMATCH"
+               or dc == "ARITY_MISMATCH" {
+                return map{
+                    ok: false,
+                    kind: "error",
+                    quit: false,
+                    value: nil,
+                    diagnostics: diags,
+                    formatted: d["code"] + ": " + d["message"],
+                    output: d["code"] + ": " + d["message"]
+                };
+            }
+            di = di + 1;
+        }
+    }
+
+    // Execute statements in persistent session scope
+    let stmts = parsed["ast"]["stmts"];
+    let last_val = nil;
+    let last_var_name = "";
+
+    let exec_res = try (fn() {
+        let i = 0;
+        while i < len(stmts) {
+            let st = stmts[i];
+            if st["kind"] == "fn_decl" {
+                sess["fn_sources"][st["name"]] = line;
+            }
+            if st["kind"] == "var_decl" {
+                last_var_name = st["name"];
+            }
+            let sig = _eval_stmt_ast(sess, sess["env"], st);
+            last_val = sig["val"];
+            i = i + 1;
+        }
+        return map{ ok: true, err: "" };
+    })() catch (fn() {
+        return nil;
+    })();
+
+    if exec_res == nil {
+        // Re-run single step to capture exact thrown message cleanly
+        let err_msg = "Runtime evaluation error";
+        let stmts2 = parsed["ast"]["stmts"];
+        let ri = 0;
+        while ri < len(stmts2) {
+            let ok_step = try (fn() {
+                _eval_stmt_ast(sess, sess["env"], stmts2[ri]);
+                return true;
+            })() catch false;
+            if not ok_step { break; }
+            ri = ri + 1;
+        }
+        return map{
+            ok: false,
+            kind: "error",
+            quit: false,
+            value: nil,
+            formatted: err_msg,
+            output: err_msg
+        };
+    }
+
+    // Persist newly inferred SI units on `let x = v * t;` declarations!
+    let si_tag = "";
+    if last_var_name != "" and map_has(inferred_units, last_var_name) {
+        let ui = inferred_units[last_var_name];
+        if ui != nil and map_has(ui, "unit_str") and ui["unit_str"] != "" {
+            sess["unit_decls"][last_var_name] = ui["unit_str"];
+            si_tag = " : " + ui["type_str"] + " " + ui["dim_unicode"];
+        }
+    }
+
+    let fmt_v = _format_repl_value(last_val) + si_tag;
+    let printed = str_join(sess["last_output"], "\n");
+    let combined_out = if printed != "" and last_val != nil {
+        printed + "\n" + fmt_v
+    } elif printed != "" {
+        printed
+    } else {
+        fmt_v
+    };
+
+    return map{
+        ok: true,
+        kind: "value",
+        quit: false,
+        value: last_val,
+        formatted: fmt_v,
+        output: combined_out,
+        contracts: if static_rep != nil { static_rep["contracts"] } else { [] }
+    };
+}
+
+// ── Interactive CLI Loop (`run_repl`) ─────────────────────────────────────────
+
+fn _brace_delta(s) {
+    let d = 0;
+    let in_s = false;
+    let q = "";
+    let i = 0;
+    while i < len(s) {
+        let ch = str_slice(s, i, i + 1);
+        if in_s {
+            if ch == "\\" { i = i + 2; continue; }
+            if ch == q { in_s = false; }
+        } else {
+            if ch == "\"" or ch == "'" { in_s = true; q = ch; }
+            elif ch == "{" or ch == "(" or ch == "[" { d = d + 1; }
+            elif ch == "}" or ch == ")" or ch == "]" { d = d - 1; }
+        }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn run_repl(args = nil) {
+    let sess = create_repl_session();
+    println("PBLang v" + REPL_VERSION + " Interactive REPL (9D SI Units + CAD/Presburger Prover)");
+    println("Type :help for commands, :quit to exit.");
+
+    let buf = "";
+    let depth = 0;
+    while not sess["quit"] {
+        let ln = read_line();
+        if ln == nil { break; }
+        if buf == "" and str_starts_with(str_trim(ln), ":") {
+            let mres = eval_repl_line(sess, ln);
+            if mres["output"] != "" { println(mres["output"]); }
+            continue;
+        }
+        buf = if buf == "" { ln } else { buf + "\n" + ln };
+        depth = depth + _brace_delta(ln);
+        if depth <= 0 {
+            depth = 0;
+            let res = eval_repl_line(sess, buf);
+            buf = "";
+            if res["output"] != "" and res["kind"] != "empty" {
+                println(res["output"]);
+            }
+        }
+    }
+    return sess;
+}
+
+fn cli_repl_entry(cli_args = nil) {
+    return run_repl(cli_args);
+}
+
+export REPL_VERSION,
+       create_repl_session,
+       eval_repl_line,
+       run_repl,
+       cli_repl_entry;
