@@ -97,8 +97,8 @@ typedef int zr_sock_t;
 #include <string.h>
 #include <time.h>
 
-#define PBLANG_ZR_VERSION "5.1.0"
-#define PBLANG_ZR_BANNER  "pblang 5.1.0 (sovereign zero-rust runtime)"
+#define PBLANG_ZR_VERSION "5.2.0"
+#define PBLANG_ZR_BANNER  "pblang 5.2.0 (sovereign zero-rust runtime)"
 
 #if defined(__GNUC__) || defined(__clang__)
 #define ZR_LIKELY(x)   __builtin_expect(!!(x), 1)
