@@ -1,0 +1,2403 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+// stdlib/compression/deflate_gzip_zstd_lz4_archive.sapp — Sovereign 100% Pure-PBLang
+// Bomb-Proof Streaming Compression & Archive Suite (RFC 1951 DEFLATE, RFC 1952 gzip,
+// RFC 1950 zlib, LZ4 Frame + xxHash32, RFC 8878 Zstandard, PKWARE ZIP, POSIX USTAR TAR).
+
+let MODULE_VERSION = "5.0.0";
+let DEFAULT_MAX_OUTPUT_BYTES = 67108864; // 64 MiB default anti-bomb ceiling
+
+// Magic numbers & protocol constants
+let GZIP_ID1 = 31;                  // 0x1F
+let GZIP_ID2 = 139;                 // 0x8B
+let GZIP_CM_DEFLATE = 8;            // 0x08
+let ZLIB_CMF_DEFAULT = 120;         // 0x78 (CM=8, CINFO=7 -> 32 KiB window)
+let ZLIB_FLG_DEFAULT = 156;         // 0x9C ((0x78*256 + 0x9C) % 31 == 0)
+let LZ4_FRAME_MAGIC = 407708164;    // 0x184D2204
+let ZSTD_FRAME_MAGIC = 4247762216;  // 0xFD2FB528
+
+// ── Byte Buffer Conversion & Bounded Output Writer ───────────────────────────
+
+fn _input_to_bytes(src) {
+    if src == nil { return bytes_new(0); }
+    let t = type(src);
+    if t == "bytes" { return src; }
+    if t == "string" {
+        let arr = str_to_bytes(src);
+        let n = len(arr);
+        let out = bytes_new(n);
+        let i = 0;
+        while i < n {
+            bytes_set(out, i, arr[i]);
+            i = i + 1;
+        }
+        return out;
+    }
+    if is_map(src) {
+        if map_has(src, "bytes") and type(src.bytes) == "bytes" { return src.bytes; }
+        if map_has(src, "data") and type(src.data) == "bytes" { return src.data; }
+    }
+    if is_array(src) {
+        let n = len(src);
+        let out = bytes_new(n);
+        let i = 0;
+        while i < n {
+            let v = src[i];
+            if type(v) != "number" or v < 0 or v > 255 {
+                throw "compression: byte array element out of 0..255 range";
+            }
+            bytes_set(out, i, num_floor(v));
+            i = i + 1;
+        }
+        return out;
+    }
+    throw "compression: unsupported input type " + t;
+}
+
+fn _bw_new(init_cap, max_cap) {
+    let cap = init_cap;
+    if cap < 64 { cap = 64; }
+    if max_cap >= 0 and cap > max_cap { cap = max_cap; }
+    return map{
+        buf: bytes_new(cap),
+        size: 0,
+        cap: cap,
+        max_cap: max_cap,
+        overflow: false
+    };
+}
+
+fn _bw_ensure(bw, add_count) {
+    let needed = bw.size + add_count;
+    if bw.max_cap >= 0 and needed > bw.max_cap {
+        bw.overflow = true;
+        return false;
+    }
+    if needed <= bw.cap { return true; }
+    let next_cap = bw.cap * 2;
+    if next_cap < 64 { next_cap = 64; }
+    while next_cap < needed {
+        next_cap = next_cap * 2;
+    }
+    if bw.max_cap >= 0 and next_cap > bw.max_cap {
+        next_cap = bw.max_cap;
+    }
+    let nb = bytes_new(next_cap);
+    let old = bw.buf;
+    let n = bw.size;
+    let i = 0;
+    while i < n {
+        bytes_set(nb, i, old[i]);
+        i = i + 1;
+    }
+    bw.buf = nb;
+    bw.cap = next_cap;
+    return true;
+}
+
+fn _bw_push_u8(bw, byte_val) {
+    if not _bw_ensure(bw, 1) { return false; }
+    bytes_set(bw.buf, bw.size, bit_and(byte_val, 255));
+    bw.size = bw.size + 1;
+    return true;
+}
+
+fn _bw_push_u16_le(bw, val) {
+    if not _bw_ensure(bw, 2) { return false; }
+    bytes_set(bw.buf, bw.size, bit_and(val, 255));
+    bytes_set(bw.buf, bw.size + 1, bit_and(bit_shr(val, 8), 255));
+    bw.size = bw.size + 2;
+    return true;
+}
+
+fn _bw_push_u24_le(bw, val) {
+    if not _bw_ensure(bw, 3) { return false; }
+    bytes_set(bw.buf, bw.size, bit_and(val, 255));
+    bytes_set(bw.buf, bw.size + 1, bit_and(bit_shr(val, 8), 255));
+    bytes_set(bw.buf, bw.size + 2, bit_and(bit_shr(val, 16), 255));
+    bw.size = bw.size + 3;
+    return true;
+}
+
+fn _bw_push_u32_le(bw, val) {
+    if not _bw_ensure(bw, 4) { return false; }
+    bytes_set(bw.buf, bw.size, bit_and(val, 255));
+    bytes_set(bw.buf, bw.size + 1, bit_and(bit_shr(val, 8), 255));
+    bytes_set(bw.buf, bw.size + 2, bit_and(bit_shr(val, 16), 255));
+    bytes_set(bw.buf, bw.size + 3, bit_and(bit_shr(val, 24), 255));
+    bw.size = bw.size + 4;
+    return true;
+}
+
+fn _bw_push_u32_be(bw, val) {
+    if not _bw_ensure(bw, 4) { return false; }
+    bytes_set(bw.buf, bw.size, bit_and(bit_shr(val, 24), 255));
+    bytes_set(bw.buf, bw.size + 1, bit_and(bit_shr(val, 16), 255));
+    bytes_set(bw.buf, bw.size + 2, bit_and(bit_shr(val, 8), 255));
+    bytes_set(bw.buf, bw.size + 3, bit_and(val, 255));
+    bw.size = bw.size + 4;
+    return true;
+}
+
+fn _bw_push_slice(bw, src, start_idx, count) {
+    if count <= 0 { return true; }
+    if not _bw_ensure(bw, count) { return false; }
+    let dst = bw.buf;
+    let base = bw.size;
+    let i = 0;
+    while i < count {
+        bytes_set(dst, base + i, src[start_idx + i]);
+        i = i + 1;
+    }
+    bw.size = base + count;
+    return true;
+}
+
+fn _bw_push_repeat(bw, byte_val, count) {
+    if count <= 0 { return true; }
+    if not _bw_ensure(bw, count) { return false; }
+    let v = bit_and(byte_val, 255);
+    let dst = bw.buf;
+    let base = bw.size;
+    let i = 0;
+    while i < count {
+        bytes_set(dst, base + i, v);
+        i = i + 1;
+    }
+    bw.size = base + count;
+    return true;
+}
+
+fn _bw_copy_backref(bw, dist, copy_len) {
+    if dist <= 0 or dist > bw.size { return false; }
+    if not _bw_ensure(bw, copy_len) { return false; }
+    let dst = bw.buf;
+    let base = bw.size;
+    if dist == 1 {
+        let rep = dst[base - 1];
+        let i = 0;
+        while i < copy_len {
+            bytes_set(dst, base + i, rep);
+            i = i + 1;
+        }
+    } else {
+        let src_idx = base - dist;
+        let i = 0;
+        while i < copy_len {
+            bytes_set(dst, base + i, dst[src_idx + i]);
+            i = i + 1;
+        }
+    }
+    bw.size = base + copy_len;
+    return true;
+}
+
+fn _bw_finish(bw) {
+    if bw.size == bw.cap { return bw.buf; }
+    return bytes_slice(bw.buf, 0, bw.size);
+}
+
+fn _read_u16_le(b, p) {
+    return b[p] + b[p + 1] * 256;
+}
+
+fn _read_u24_le(b, p) {
+    return b[p] + b[p + 1] * 256 + b[p + 2] * 65536;
+}
+
+fn _read_u32_le(b, p) {
+    return b[p] + b[p + 1] * 256 + b[p + 2] * 65536 + b[p + 3] * 16777216;
+}
+
+fn _read_u32_be(b, p) {
+    return b[p] * 16777216 + b[p + 1] * 65536 + b[p + 2] * 256 + b[p + 3];
+}
+
+fn _ok_bytes_result(out_bytes, fmt_name, extra_crc = nil) {
+    return map{
+        ok: true,
+        format: fmt_name,
+        data: out_bytes,
+        bytes: out_bytes,
+        size: len(out_bytes),
+        checksum: extra_crc
+    };
+}
+
+fn _err_result(code_str, detail_msg = "") {
+    return map{
+        ok: false,
+        error: code_str,
+        detail: detail_msg
+    };
+}
+
+// ── Integrity Checksums: IEEE CRC-32, RFC 1950 Adler-32, & LZ4 xxHash32 ──────
+
+fn _build_crc32_table() {
+    let tbl = [];
+    let n = 0;
+    while n < 256 {
+        let c = n;
+        let k = 0;
+        while k < 8 {
+            if bit_and(c, 1) == 1 {
+                c = bit_xor(bit_shr(c, 1), 3988292384); // 0xEDB88320
+            } else {
+                c = bit_shr(c, 1);
+            }
+            k = k + 1;
+        }
+        array_push(tbl, c);
+        n = n + 1;
+    }
+    return tbl;
+}
+
+let _CRC32_TABLE = _build_crc32_table();
+
+fn crc32_compute(data_in) {
+    let b = _input_to_bytes(data_in);
+    let n = len(b);
+    let c = 4294967295;
+    let i = 0;
+    while i < n {
+        let idx = bit_and(bit_xor(c, b[i]), 255);
+        c = bit_xor(bit_shr(c, 8), _CRC32_TABLE[idx]);
+        i = i + 1;
+    }
+    return bit_xor(c, 4294967295);
+}
+
+fn adler32_compute(data_in) {
+    let b = _input_to_bytes(data_in);
+    let n = len(b);
+    let s1 = 1;
+    let s2 = 0;
+    let i = 0;
+    while i < n {
+        let chunk_end = i + 5552;
+        if chunk_end > n { chunk_end = n; }
+        while i < chunk_end {
+            s1 = s1 + b[i];
+            s2 = s2 + s1;
+            i = i + 1;
+        }
+        s1 = s1 % 65521;
+        s2 = s2 % 65521;
+    }
+    return s2 * 65536 + s1;
+}
+
+fn _u32_mul(a, b) {
+    // Exact 32-bit unsigned modular multiplication without 53-bit float overflow:
+    // (a_hi*65536 + a_lo) * b mod 2^32
+    let a_lo = bit_and(a, 65535);
+    let a_hi = bit_and(bit_shr(a, 16), 65535);
+    let b_u = bit_and(b, 4294967295);
+    let lo_prod = a_lo * b_u;
+    let hi_prod = bit_and(a_hi * b_u, 65535) * 65536;
+    return bit_and(lo_prod + hi_prod, 4294967295);
+}
+
+fn _u32_rotl(v, r) {
+    let x = bit_and(v, 4294967295);
+    return bit_and(bit_or(bit_shl(x, r), bit_shr(x, 32 - r)), 4294967295);
+}
+
+fn xxhash32_compute(data_in, seed = 0) {
+    let b = _input_to_bytes(data_in);
+    let n = len(b);
+    let p1 = 2654435761; // 0x9E3779B1
+    let p2 = 2246822519; // 0x85EBCA77
+    let p3 = 3266489917; // 0xC2B2AE3D
+    let p4 = 668265263;  // 0x27D4EB2F
+    let p5 = 374761393;  // 0x165667B1
+
+    let h = 0;
+    let p = 0;
+    if n >= 16 {
+        let v1 = bit_and(seed + p1 + p2, 4294967295);
+        let v2 = bit_and(seed + p2, 4294967295);
+        let v3 = bit_and(seed, 4294967295);
+        let v4 = bit_and(seed + 4294967296 - p1, 4294967295);
+        let lim = n - 16;
+        while p <= lim {
+            v1 = _u32_mul(_u32_rotl(bit_and(v1 + _u32_mul(_read_u32_le(b, p), p2), 4294967295), 13), p1);
+            v2 = _u32_mul(_u32_rotl(bit_and(v2 + _u32_mul(_read_u32_le(b, p + 4), p2), 4294967295), 13), p1);
+            v3 = _u32_mul(_u32_rotl(bit_and(v3 + _u32_mul(_read_u32_le(b, p + 8), p2), 4294967295), 13), p1);
+            v4 = _u32_mul(_u32_rotl(bit_and(v4 + _u32_mul(_read_u32_le(b, p + 12), p2), 4294967295), 13), p1);
+            p = p + 16;
+        }
+        h = bit_and(_u32_rotl(v1, 1) + _u32_rotl(v2, 7) + _u32_rotl(v3, 12) + _u32_rotl(v4, 18), 4294967295);
+    } else {
+        h = bit_and(seed + p5, 4294967295);
+    }
+    h = bit_and(h + n, 4294967295);
+    while p + 4 <= n {
+        h = bit_and(h + _u32_mul(_read_u32_le(b, p), p3), 4294967295);
+        h = _u32_mul(_u32_rotl(h, 17), p4);
+        p = p + 4;
+    }
+    while p < n {
+        h = bit_and(h + _u32_mul(b[p], p5), 4294967295);
+        h = _u32_mul(_u32_rotl(h, 11), p1);
+        p = p + 1;
+    }
+    h = _u32_mul(bit_xor(h, bit_shr(h, 15)), p2);
+    h = _u32_mul(bit_xor(h, bit_shr(h, 13)), p3);
+    h = bit_xor(h, bit_shr(h, 16));
+    return bit_and(h, 4294967295);
+}
+
+// ── RFC 1951 DEFLATE Tables (Length, Distance, Fixed & Canonical Huffman) ────
+
+let _LEN_BASE = [
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
+];
+let _LEN_EXTRA = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0
+];
+let _DIST_BASE = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577
+];
+let _DIST_EXTRA = [
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13
+];
+let _CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+fn _rev_bits(code, nbits) {
+    let r = 0;
+    let v = code;
+    let i = 0;
+    while i < nbits {
+        r = bit_or(bit_shl(r, 1), bit_and(v, 1));
+        v = bit_shr(v, 1);
+        i = i + 1;
+    }
+    return r;
+}
+
+fn _build_len_lookup() {
+    // Maps length 3..258 -> [sym_offset_0..28, extra_bits_count, extra_val]
+    let codes = [];
+    let eb = [];
+    let ev = [];
+    let k = 0;
+    while k <= 258 {
+        array_push(codes, 0);
+        array_push(eb, 0);
+        array_push(ev, 0);
+        k = k + 1;
+    }
+    let idx = 0;
+    while idx < 28 {
+        let base = _LEN_BASE[idx];
+        let next_b = _LEN_BASE[idx + 1];
+        let x = base;
+        while x < next_b {
+            codes[x] = idx;
+            eb[x] = _LEN_EXTRA[idx];
+            ev[x] = x - base;
+            x = x + 1;
+        }
+        idx = idx + 1;
+    }
+    codes[258] = 28;
+    eb[258] = 0;
+    ev[258] = 0;
+    return map{ idx: codes, extra_bits: eb, extra_val: ev };
+}
+
+let _LEN_ENC = _build_len_lookup();
+
+fn _dist_slot(dist) {
+    // Binary search over _DIST_BASE[0..29] for dist in 1..32768
+    let lo = 0;
+    let hi = 29;
+    while lo < hi {
+        let mid = bit_shr(lo + hi + 1, 1);
+        if _DIST_BASE[mid] <= dist {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+fn _build_canonical_encoder(code_lengths) {
+    let n = len(code_lengths);
+    let bl_count = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let i = 0;
+    while i < n {
+        let l = code_lengths[i];
+        if l > 0 { bl_count[l] = bl_count[l] + 1; }
+        i = i + 1;
+    }
+    let next_code = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let code = 0;
+    let bits = 1;
+    while bits <= 15 {
+        code = bit_shl(code + bl_count[bits - 1], 1);
+        next_code[bits] = code;
+        bits = bits + 1;
+    }
+    let rev_codes = [];
+    i = 0;
+    while i < n {
+        let l = code_lengths[i];
+        if l > 0 {
+            array_push(rev_codes, _rev_bits(next_code[l], l));
+            next_code[l] = next_code[l] + 1;
+        } else {
+            array_push(rev_codes, 0);
+        }
+        i = i + 1;
+    }
+    return map{ codes: rev_codes, lengths: code_lengths };
+}
+
+fn _build_canonical_decoder(code_lengths) {
+    // Fast 9-bit primary lookup table + overflow canonical tree table for up to 15 bits!
+    let n = len(code_lengths);
+    let bl_count = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let max_bits = 0;
+    let i = 0;
+    while i < n {
+        let l = code_lengths[i];
+        if l < 0 or l > 15 { return nil; }
+        if l > 0 {
+            bl_count[l] = bl_count[l] + 1;
+            if l > max_bits { max_bits = l; }
+        }
+        i = i + 1;
+    }
+    if max_bits == 0 {
+        return map{ empty: true, max_bits: 0, fast: [], counts: bl_count, first_code: [], first_sym: [], syms: [] };
+    }
+    let first_code = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let first_sym = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let code = 0;
+    let sym_idx = 0;
+    let bits = 1;
+    while bits <= 15 {
+        code = bit_shl(code + bl_count[bits - 1], 1);
+        if code + bl_count[bits] > bit_shl(1, bits) {
+            return nil; // Over-subscribed Huffman tree!
+        }
+        first_code[bits] = code;
+        first_sym[bits] = sym_idx;
+        sym_idx = sym_idx + bl_count[bits];
+        bits = bits + 1;
+    }
+    let syms = [];
+    i = 0;
+    while i < sym_idx { array_push(syms, 0); i = i + 1; }
+    let next_slot = slice(first_sym, 0, 16);
+    let next_code = slice(first_code, 0, 16);
+
+    // 9-bit fast LSB table: entry = (len << 16) | sym, or 0 if len > 9 / unmapped
+    let fast = [];
+    i = 0;
+    while i < 512 { array_push(fast, 0); i = i + 1; }
+
+    i = 0;
+    while i < n {
+        let l = code_lengths[i];
+        if l > 0 {
+            let pos = next_slot[l];
+            syms[pos] = i;
+            next_slot[l] = pos + 1;
+            let c = next_code[l];
+            next_code[l] = c + 1;
+            if l <= 9 {
+                let rev = _rev_bits(c, l);
+                let step = bit_shl(1, l);
+                let packed = bit_or(bit_shl(l, 16), i);
+                let fill = rev;
+                while fill < 512 {
+                    fast[fill] = packed;
+                    fill = fill + step;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return map{
+        empty: false,
+        max_bits: max_bits,
+        fast: fast,
+        counts: bl_count,
+        first_code: first_code,
+        first_sym: first_sym,
+        syms: syms
+    };
+}
+
+fn _build_fixed_trees() {
+    let lit_lens = [];
+    let i = 0;
+    while i <= 143 { array_push(lit_lens, 8); i = i + 1; }
+    while i <= 255 { array_push(lit_lens, 9); i = i + 1; }
+    while i <= 279 { array_push(lit_lens, 7); i = i + 1; }
+    while i <= 287 { array_push(lit_lens, 8); i = i + 1; }
+    let dist_lens = [];
+    i = 0;
+    while i < 32 { array_push(dist_lens, 5); i = i + 1; }
+    return map{
+        lit_enc: _build_canonical_encoder(lit_lens),
+        dist_enc: _build_canonical_encoder(dist_lens),
+        lit_dec: _build_canonical_decoder(lit_lens),
+        dist_dec: _build_canonical_decoder(dist_lens)
+    };
+}
+
+let _FIXED_HUFF = _build_fixed_trees();
+
+// ── DEFLATE Bit Writer & LZ77 Sliding-Window Compressor ──────────────────────
+
+fn _bitw_new(init_cap) {
+    return map{
+        bw: _bw_new(init_cap, -1),
+        bit_buf: 0,
+        bit_cnt: 0
+    };
+}
+
+fn _bitw_put(st, val, nbits) {
+    st.bit_buf = bit_or(st.bit_buf, bit_shl(val, st.bit_cnt));
+    st.bit_cnt = st.bit_cnt + nbits;
+    while st.bit_cnt >= 8 {
+        _bw_push_u8(st.bw, bit_and(st.bit_buf, 255));
+        st.bit_buf = bit_shr(st.bit_buf, 8);
+        st.bit_cnt = st.bit_cnt - 8;
+    }
+}
+
+fn _bitw_align_byte(st) {
+    if st.bit_cnt > 0 {
+        _bw_push_u8(st.bw, bit_and(st.bit_buf, 255));
+        st.bit_buf = 0;
+        st.bit_cnt = 0;
+    }
+}
+
+fn _deflate_stored_blocks(b) {
+    let n = len(b);
+    let bw = _bw_new(n + 16 + num_floor(n / 65535) * 5, -1);
+    if n == 0 {
+        // Single final empty stored block: BFINAL=1, BTYPE=00 -> byte 0x01, LEN=0, NLEN=0xFFFF
+        _bw_push_u8(bw, 1);
+        _bw_push_u16_le(bw, 0);
+        _bw_push_u16_le(bw, 65535);
+        return _bw_finish(bw);
+    }
+    let pos = 0;
+    while pos < n {
+        let chunk = n - pos;
+        if chunk > 65535 { chunk = 65535; }
+        let is_last = 0;
+        if pos + chunk >= n { is_last = 1; }
+        _bw_push_u8(bw, is_last); // BFINAL | (BTYPE=00 << 1)
+        _bw_push_u16_le(bw, chunk);
+        _bw_push_u16_le(bw, bit_xor(chunk, 65535));
+        _bw_push_slice(bw, b, pos, chunk);
+        pos = pos + chunk;
+    }
+    return _bw_finish(bw);
+}
+
+fn _emit_tokens_huffman(st, tokens, lit_enc, dist_enc) {
+    let lit_codes = lit_enc.codes;
+    let lit_lens = lit_enc.lengths;
+    let dst_codes = dist_enc.codes;
+    let dst_lens = dist_enc.lengths;
+    let len_idx_tbl = _LEN_ENC.idx;
+    let len_eb_tbl = _LEN_ENC.extra_bits;
+    let len_ev_tbl = _LEN_ENC.extra_val;
+
+    let n = len(tokens);
+    let i = 0;
+    while i < n {
+        let tok = tokens[i];
+        if tok < 256 {
+            _bitw_put(st, lit_codes[tok], lit_lens[tok]);
+        } else {
+            // Packed match token: 256 + m_len * 65536 + dist
+            let rem = tok - 256;
+            let dist = bit_and(rem, 65535);
+            let m_len = bit_shr(rem, 16);
+            let l_slot = len_idx_tbl[m_len];
+            let l_sym = 257 + l_slot;
+            _bitw_put(st, lit_codes[l_sym], lit_lens[l_sym]);
+            let leb = len_eb_tbl[m_len];
+            if leb > 0 {
+                _bitw_put(st, len_ev_tbl[m_len], leb);
+            }
+            let d_slot = _dist_slot(dist);
+            _bitw_put(st, dst_codes[d_slot], dst_lens[d_slot]);
+            let deb = _DIST_EXTRA[d_slot];
+            if deb > 0 {
+                _bitw_put(st, dist - _DIST_BASE[d_slot], deb);
+            }
+        }
+        i = i + 1;
+    }
+    _bitw_put(st, lit_codes[256], lit_lens[256]);
+}
+
+fn _assign_bounded_lengths(freqs, max_sym, max_bits) {
+    // Builds canonical Huffman bit-lengths (1..max_bits) from symbol frequencies
+    let active = [];
+    let i = 0;
+    while i <= max_sym {
+        if freqs[i] > 0 {
+            array_push(active, map{ sym: i, freq: freqs[i] });
+        }
+        i = i + 1;
+    }
+    let lens = [];
+    i = 0;
+    while i <= max_sym { array_push(lens, 0); i = i + 1; }
+    let cnt = len(active);
+    if cnt == 0 {
+        lens[0] = 1;
+        return lens;
+    }
+    if cnt == 1 {
+        lens[active[0].sym] = 1;
+        return lens;
+    }
+    // Insertion sort descending by freq
+    let a = 1;
+    while a < cnt {
+        let cur = active[a];
+        let j = a - 1;
+        while j >= 0 and active[j].freq < cur.freq {
+            active[j + 1] = active[j];
+            j = j - 1;
+        }
+        active[j + 1] = cur;
+        a = a + 1;
+    }
+    // Kraft-sum length assignment bounded strictly by max_bits (<= 15 or <= 7)
+    // Choose flat Kraft ceiling L = ceil(log2(cnt)), refined by frequency tiers when safe
+    let base_bits = 1;
+    while bit_shl(1, base_bits) < cnt {
+        base_bits = base_bits + 1;
+    }
+    if base_bits > max_bits { base_bits = max_bits; }
+    // With cnt <= 2^base_bits, assign base_bits to all, then promote top symbols where Kraft slack allows!
+    let kraft_total = bit_shl(1, base_bits);
+    let slack = kraft_total - cnt;
+    let assigned = [];
+    i = 0;
+    while i < cnt { array_push(assigned, base_bits); i = i + 1; }
+    i = 0;
+    while i < cnt and slack > 0 {
+        while assigned[i] > 1 {
+            let cur_l = assigned[i];
+            let cost = bit_shl(1, base_bits - (cur_l - 1)) - bit_shl(1, base_bits - cur_l);
+            if cost <= slack {
+                assigned[i] = cur_l - 1;
+                slack = slack - cost;
+            } else {
+                break;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < cnt {
+        lens[active[i].sym] = assigned[i];
+        i = i + 1;
+    }
+    return lens;
+}
+
+fn _emit_dynamic_block(st, tokens, is_final) {
+    let lit_freq = [];
+    let i = 0;
+    while i < 286 { array_push(lit_freq, 0); i = i + 1; }
+    let dist_freq = [];
+    i = 0;
+    while i < 30 { array_push(dist_freq, 0); i = i + 1; }
+    lit_freq[256] = 1;
+
+    let len_idx_tbl = _LEN_ENC.idx;
+    let n = len(tokens);
+    i = 0;
+    while i < n {
+        let tok = tokens[i];
+        if tok < 256 {
+            lit_freq[tok] = lit_freq[tok] + 1;
+        } else {
+            let rem = tok - 256;
+            let dist = bit_and(rem, 65535);
+            let m_len = bit_shr(rem, 16);
+            lit_freq[257 + len_idx_tbl[m_len]] = lit_freq[257 + len_idx_tbl[m_len]] + 1;
+            let d_slot = _dist_slot(dist);
+            dist_freq[d_slot] = dist_freq[d_slot] + 1;
+        }
+        i = i + 1;
+    }
+
+    let lit_lens = _assign_bounded_lengths(lit_freq, 285, 14);
+    let dist_lens = _assign_bounded_lengths(dist_freq, 29, 14);
+
+    let hlit = 286;
+    while hlit > 257 and lit_lens[hlit - 1] == 0 { hlit = hlit - 1; }
+    let hdist = 30;
+    while hdist > 1 and dist_lens[hdist - 1] == 0 { hdist = hdist - 1; }
+
+    let combined = [];
+    i = 0;
+    while i < hlit { array_push(combined, lit_lens[i]); i = i + 1; }
+    i = 0;
+    while i < hdist { array_push(combined, dist_lens[i]); i = i + 1; }
+
+    // Compress code lengths with RLE 17/18 for zero runs
+    let cl_syms = [];
+    let cl_extra = [];
+    let cl_eb = [];
+    let cl_freq = [];
+    i = 0;
+    while i < 19 { array_push(cl_freq, 0); i = i + 1; }
+
+    i = 0;
+    let cn = len(combined);
+    while i < cn {
+        let v = combined[i];
+        if v == 0 {
+            let run = 1;
+            while i + run < cn and combined[i + run] == 0 and run < 138 {
+                run = run + 1;
+            }
+            if run >= 11 {
+                array_push(cl_syms, 18);
+                array_push(cl_extra, run - 11);
+                array_push(cl_eb, 7);
+                cl_freq[18] = cl_freq[18] + 1;
+                i = i + run;
+            } elif run >= 3 {
+                array_push(cl_syms, 17);
+                array_push(cl_extra, run - 3);
+                array_push(cl_eb, 3);
+                cl_freq[17] = cl_freq[17] + 1;
+                i = i + run;
+            } else {
+                array_push(cl_syms, 0);
+                array_push(cl_extra, 0);
+                array_push(cl_eb, 0);
+                cl_freq[0] = cl_freq[0] + 1;
+                i = i + 1;
+            }
+        } else {
+            array_push(cl_syms, v);
+            array_push(cl_extra, 0);
+            array_push(cl_eb, 0);
+            cl_freq[v] = cl_freq[v] + 1;
+            i = i + 1;
+        }
+    }
+
+    let cl_lens = _assign_bounded_lengths(cl_freq, 18, 7);
+    let cl_enc = _build_canonical_encoder(cl_lens);
+    let hclen = 19;
+    while hclen > 4 and cl_lens[_CL_ORDER[hclen - 1]] == 0 {
+        hclen = hclen - 1;
+    }
+
+    // Header: BFINAL + BTYPE=10 (2)
+    _bitw_put(st, is_final, 1);
+    _bitw_put(st, 2, 2);
+    _bitw_put(st, hlit - 257, 5);
+    _bitw_put(st, hdist - 1, 5);
+    _bitw_put(st, hclen - 4, 4);
+    i = 0;
+    while i < hclen {
+        _bitw_put(st, cl_lens[_CL_ORDER[i]], 3);
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(cl_syms) {
+        let s = cl_syms[i];
+        _bitw_put(st, cl_enc.codes[s], cl_enc.lengths[s]);
+        if cl_eb[i] > 0 {
+            _bitw_put(st, cl_extra[i], cl_eb[i]);
+        }
+        i = i + 1;
+    }
+
+    let lit_enc = _build_canonical_encoder(lit_lens);
+    let dist_enc = _build_canonical_encoder(dist_lens);
+    _emit_tokens_huffman(st, tokens, lit_enc, dist_enc);
+}
+
+fn _lz77_tokenize(b, level) {
+    let n = len(b);
+    let tokens = [];
+    if n == 0 { return tokens; }
+
+    let max_chain = 16;
+    if level <= 2 { max_chain = 4; }
+    elif level <= 5 { max_chain = 12; }
+    elif level >= 8 { max_chain = 48; }
+
+    // 8192-slot hash head + 32768-slot circular chain for 32 KiB RFC 1951 window
+    let head = [];
+    let k = 0;
+    while k < 8192 { array_push(head, -1); k = k + 1; }
+    let prev = [];
+    k = 0;
+    while k < 32768 { array_push(prev, -1); k = k + 1; }
+
+    let pos = 0;
+    while pos < n {
+        // Ultra-fast RLE dist=1 accelerator (compresses multi-MiB uniform runs rapidly!)
+        if pos > 0 and pos + 3 <= n {
+            let prev_byte = b[pos - 1];
+            if b[pos] == prev_byte and b[pos + 1] == prev_byte and b[pos + 2] == prev_byte {
+                let max_r = n - pos;
+                let r_len = 3;
+                while r_len < max_r and r_len < 258 and b[pos + r_len] == prev_byte {
+                    r_len = r_len + 1;
+                }
+                // If huge identical run continues beyond 258, emit consecutive 258-byte dist=1 tokens!
+                array_push(tokens, 256 + bit_shl(r_len, 16) + 1);
+                pos = pos + r_len;
+                while pos + 258 <= n and b[pos] == prev_byte and b[pos + 257] == prev_byte {
+                    let ok_full = true;
+                    let chk = 1;
+                    while chk < 257 {
+                        if b[pos + chk] != prev_byte {
+                            ok_full = false;
+                            break;
+                        }
+                        chk = chk + 1;
+                    }
+                    if not ok_full { break; }
+                    array_push(tokens, 256 + bit_shl(258, 16) + 1);
+                    pos = pos + 258;
+                }
+                continue;
+            }
+        }
+
+        if pos + 3 > n {
+            array_push(tokens, b[pos]);
+            pos = pos + 1;
+            continue;
+        }
+
+        let h = bit_and(bit_xor(bit_xor(bit_shl(b[pos], 6), bit_shl(b[pos + 1], 3)), b[pos + 2]), 8191);
+        let cand = head[h];
+        prev[bit_and(pos, 32767)] = cand;
+        head[h] = pos;
+
+        let best_len = 2;
+        let best_dist = 0;
+        let max_len = n - pos;
+        if max_len > 258 { max_len = 258; }
+        let steps = 0;
+        let b0 = b[pos];
+        let b1 = b[pos + 1];
+
+        while cand >= 0 and (pos - cand) <= 32768 and steps < max_chain {
+            if (pos + best_len) < n and b[cand] == b0 and b[cand + 1] == b1 and b[cand + best_len] == b[pos + best_len] {
+                let ml = 2;
+                while ml < max_len and b[cand + ml] == b[pos + ml] {
+                    ml = ml + 1;
+                }
+                if ml > best_len {
+                    best_len = ml;
+                    best_dist = pos - cand;
+                    if best_len >= max_len { break; }
+                }
+            }
+            cand = prev[bit_and(cand, 32767)];
+            steps = steps + 1;
+        }
+
+        if best_len >= 3 {
+            array_push(tokens, 256 + bit_shl(best_len, 16) + best_dist);
+            let adv = 1;
+            let ins_lim = best_len;
+            if ins_lim > 16 { ins_lim = 16; } // bounded hash insertion for speed on long matches
+            while adv < ins_lim and (pos + adv + 3) <= n {
+                let p2 = pos + adv;
+                let h2 = bit_and(bit_xor(bit_xor(bit_shl(b[p2], 6), bit_shl(b[p2 + 1], 3)), b[p2 + 2]), 8191);
+                prev[bit_and(p2, 32767)] = head[h2];
+                head[h2] = p2;
+                adv = adv + 1;
+            }
+            pos = pos + best_len;
+        } else {
+            array_push(tokens, b0);
+            pos = pos + 1;
+        }
+    }
+    return tokens;
+}
+
+fn deflate_compress(data_bytes, level = 6) {
+    let b = _input_to_bytes(data_bytes);
+    if level <= 0 {
+        return _deflate_stored_blocks(b);
+    }
+    let tokens = _lz77_tokenize(b, level);
+    let init_cap = 64 + num_floor(len(tokens) * 2);
+    let st = _bitw_new(init_cap);
+    if level >= 9 and len(tokens) >= 32 {
+        // BTYPE=10 Dynamic Canonical Huffman block
+        _emit_dynamic_block(st, tokens, 1);
+    } else {
+        // BFINAL=1, BTYPE=01 Fixed Huffman block
+        _bitw_put(st, 1, 1);
+        _bitw_put(st, 1, 2);
+        _emit_tokens_huffman(st, tokens, _FIXED_HUFF.lit_enc, _FIXED_HUFF.dist_enc);
+    }
+    _bitw_align_byte(st);
+    return _bw_finish(st.bw);
+}
+
+// ── RFC 1951 DEFLATE Bit-Stream Decoder (Stored, Fixed & Dynamic Huffman) ────
+
+fn _bitr_new(b, start_pos, end_pos) {
+    return map{
+        b: b,
+        pos: start_pos,
+        end_pos: end_pos,
+        bit_buf: 0,
+        bit_cnt: 0,
+        eof_err: false
+    };
+}
+
+fn _bitr_fill(br, min_bits) {
+    while br.bit_cnt < min_bits {
+        if br.pos >= br.end_pos { return false; }
+        br.bit_buf = bit_or(br.bit_buf, bit_shl(br.b[br.pos], br.bit_cnt));
+        br.pos = br.pos + 1;
+        br.bit_cnt = br.bit_cnt + 8;
+    }
+    return true;
+}
+
+fn _bitr_read(br, nbits) {
+    if nbits == 0 { return 0; }
+    if not _bitr_fill(br, nbits) {
+        br.eof_err = true;
+        return -1;
+    }
+    let mask = bit_shl(1, nbits) - 1;
+    let out = bit_and(br.bit_buf, mask);
+    br.bit_buf = bit_shr(br.bit_buf, nbits);
+    br.bit_cnt = br.bit_cnt - nbits;
+    return out;
+}
+
+fn _bitr_align_byte(br) {
+    let drop = bit_and(br.bit_cnt, 7);
+    if drop > 0 {
+        br.bit_buf = bit_shr(br.bit_buf, drop);
+        br.bit_cnt = br.bit_cnt - drop;
+    }
+}
+
+fn _huff_decode_sym(br, dec) {
+    if dec == nil or dec.empty { return -1; }
+    // Ensure at least 9 bits when available for O(1) table hit
+    while br.bit_cnt < 15 and br.pos < br.end_pos {
+        br.bit_buf = bit_or(br.bit_buf, bit_shl(br.b[br.pos], br.bit_cnt));
+        br.pos = br.pos + 1;
+        br.bit_cnt = br.bit_cnt + 8;
+    }
+    if br.bit_cnt >= 9 {
+        let fast_entry = dec.fast[bit_and(br.bit_buf, 511)];
+        if fast_entry != 0 {
+            let flen = bit_shr(fast_entry, 16);
+            let fsym = bit_and(fast_entry, 65535);
+            br.bit_buf = bit_shr(br.bit_buf, flen);
+            br.bit_cnt = br.bit_cnt - flen;
+            return fsym;
+        }
+    }
+    // Slow canonical fallback for lengths 10..15 or near end-of-stream (< 9 bits left)
+    let code = 0;
+    let bits = 1;
+    let max_b = dec.max_bits;
+    while bits <= max_b {
+        if br.bit_cnt == 0 {
+            if br.pos >= br.end_pos {
+                br.eof_err = true;
+                return -1;
+            }
+            br.bit_buf = br.b[br.pos];
+            br.pos = br.pos + 1;
+            br.bit_cnt = 8;
+        }
+        code = bit_or(bit_shl(code, 1), bit_and(br.bit_buf, 1));
+        br.bit_buf = bit_shr(br.bit_buf, 1);
+        br.bit_cnt = br.bit_cnt - 1;
+        let cnt = dec.counts[bits];
+        let fc = dec.first_code[bits];
+        if cnt > 0 and code >= fc and code < fc + cnt {
+            return dec.syms[dec.first_sym[bits] + (code - fc)];
+        }
+        bits = bits + 1;
+    }
+    return -1;
+}
+
+fn _decode_dynamic_trees(br) {
+    let hlit_raw = _bitr_read(br, 5);
+    let hdist_raw = _bitr_read(br, 5);
+    let hclen_raw = _bitr_read(br, 4);
+    if br.eof_err { return nil; }
+    let hlit = hlit_raw + 257;
+    let hdist = hdist_raw + 1;
+    let hclen = hclen_raw + 4;
+    if hlit > 286 or hdist > 30 { return nil; }
+
+    let cl_lens = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let i = 0;
+    while i < hclen {
+        let v = _bitr_read(br, 3);
+        if br.eof_err { return nil; }
+        cl_lens[_CL_ORDER[i]] = v;
+        i = i + 1;
+    }
+    let cl_dec = _build_canonical_decoder(cl_lens);
+    if cl_dec == nil or cl_dec.empty { return nil; }
+
+    let total_syms = hlit + hdist;
+    let unpacked = [];
+    while len(unpacked) < total_syms {
+        let s = _huff_decode_sym(br, cl_dec);
+        if s < 0 { return nil; }
+        if s <= 15 {
+            array_push(unpacked, s);
+        } elif s == 16 {
+            if len(unpacked) == 0 { return nil; }
+            let rep_extra = _bitr_read(br, 2);
+            if br.eof_err { return nil; }
+            let rep_cnt = 3 + rep_extra;
+            let prev_l = unpacked[len(unpacked) - 1];
+            if len(unpacked) + rep_cnt > total_syms { return nil; }
+            let r = 0;
+            while r < rep_cnt { array_push(unpacked, prev_l); r = r + 1; }
+        } elif s == 17 {
+            let z_extra = _bitr_read(br, 3);
+            if br.eof_err { return nil; }
+            let z_cnt = 3 + z_extra;
+            if len(unpacked) + z_cnt > total_syms { return nil; }
+            let r = 0;
+            while r < z_cnt { array_push(unpacked, 0); r = r + 1; }
+        } elif s == 18 {
+            let z_extra2 = _bitr_read(br, 7);
+            if br.eof_err { return nil; }
+            let z_cnt2 = 11 + z_extra2;
+            if len(unpacked) + z_cnt2 > total_syms { return nil; }
+            let r = 0;
+            while r < z_cnt2 { array_push(unpacked, 0); r = r + 1; }
+        } else {
+            return nil;
+        }
+    }
+
+    let lit_lens = slice(unpacked, 0, hlit);
+    if lit_lens[256] == 0 { return nil; } // RFC 1951 requires end-of-block 256 symbol!
+    let dist_lens = slice(unpacked, hlit, total_syms);
+    let lit_dec = _build_canonical_decoder(lit_lens);
+    let dist_dec = _build_canonical_decoder(dist_lens);
+    if lit_dec == nil or dist_dec == nil { return nil; }
+    return map{ lit_dec: lit_dec, dist_dec: dist_dec };
+}
+
+fn _inflate_stream(b, start_pos, end_pos, max_output_bytes) {
+    if max_output_bytes < 0 {
+        return _err_result("invalid_max_output_bytes", "max_output_bytes must be >= 0");
+    }
+    let init_guess = (end_pos - start_pos) * 2;
+    if init_guess < 64 { init_guess = 64; }
+    if init_guess > 4096 { init_guess = 4096; }
+    if init_guess > max_output_bytes { init_guess = max_output_bytes; }
+
+    let bw = _bw_new(init_guess, max_output_bytes);
+    let br = _bitr_new(b, start_pos, end_pos);
+
+    let is_final = 0;
+    while is_final == 0 {
+        is_final = _bitr_read(br, 1);
+        let btype = _bitr_read(br, 2);
+        if br.eof_err {
+            return _err_result("truncated_deflate_stream", "unexpected EOF in block header");
+        }
+        if btype == 0 {
+            _bitr_align_byte(br);
+            let stored_len = _bitr_read(br, 16);
+            let stored_nlen = _bitr_read(br, 16);
+            if br.eof_err {
+                return _err_result("truncated_stored_header", "missing LEN/NLEN in stored block");
+            }
+            if bit_xor(stored_len, 65535) != stored_nlen {
+                return _err_result("corrupt_stored_nlen", "stored block LEN/NLEN complement mismatch");
+            }
+            // Check bomb cap BEFORE copying or allocating!
+            if bw.size + stored_len > max_output_bytes {
+                return _err_result("decompression_bomb_limit_exceeded", "stored block exceeds max_output_bytes");
+            }
+            let s_idx = 0;
+            while s_idx < stored_len {
+                let v = _bitr_read(br, 8);
+                if br.eof_err {
+                    return _err_result("truncated_stored_payload", "unexpected EOF in stored block");
+                }
+                if not _bw_push_u8(bw, v) {
+                    return _err_result("decompression_bomb_limit_exceeded", "output limit exceeded");
+                }
+                s_idx = s_idx + 1;
+            }
+        } elif btype == 1 or btype == 2 {
+            let lit_dec = _FIXED_HUFF.lit_dec;
+            let dist_dec = _FIXED_HUFF.dist_dec;
+            if btype == 2 {
+                let dyn = _decode_dynamic_trees(br);
+                if dyn == nil {
+                    return _err_result("corrupt_dynamic_huffman", "invalid RFC 1951 BTYPE=10 tree");
+                }
+                lit_dec = dyn.lit_dec;
+                dist_dec = dyn.dist_dec;
+            }
+            while true {
+                let sym = _huff_decode_sym(br, lit_dec);
+                if sym < 0 {
+                    return _err_result("corrupt_huffman_symbol", "invalid or truncated Huffman symbol");
+                }
+                if sym < 256 {
+                    if not _bw_push_u8(bw, sym) {
+                        return _err_result("decompression_bomb_limit_exceeded", "literal exceeds max_output_bytes");
+                    }
+                } elif sym == 256 {
+                    break;
+                } elif sym <= 285 {
+                    let l_idx = sym - 257;
+                    let copy_len = _LEN_BASE[l_idx];
+                    let leb = _LEN_EXTRA[l_idx];
+                    if leb > 0 {
+                        let lex = _bitr_read(br, leb);
+                        if br.eof_err {
+                            return _err_result("truncated_length_extra", "EOF reading length extra bits");
+                        }
+                        copy_len = copy_len + lex;
+                    }
+                    let d_sym = _huff_decode_sym(br, dist_dec);
+                    if d_sym < 0 or d_sym > 29 {
+                        return _err_result("corrupt_distance_symbol", "invalid distance code");
+                    }
+                    let dist = _DIST_BASE[d_sym];
+                    let deb = _DIST_EXTRA[d_sym];
+                    if deb > 0 {
+                        let dex = _bitr_read(br, deb);
+                        if br.eof_err {
+                            return _err_result("truncated_distance_extra", "EOF reading distance extra bits");
+                        }
+                        dist = dist + dex;
+                    }
+                    if bw.size + copy_len > max_output_bytes {
+                        return _err_result("decompression_bomb_limit_exceeded", "LZ77 match exceeds max_output_bytes");
+                    }
+                    if dist > bw.size {
+                        return _err_result("invalid_lz77_backref", "distance exceeds decoded window");
+                    }
+                    if not _bw_copy_backref(bw, dist, copy_len) {
+                        return _err_result("decompression_bomb_limit_exceeded", "backref exceeds max_output_bytes");
+                    }
+                } else {
+                    return _err_result("reserved_deflate_symbol", "symbol 286/287 illegal in stream");
+                }
+            }
+        } else {
+            return _err_result("invalid_deflate_btype", "BTYPE=11 is reserved in RFC 1951");
+        }
+    }
+
+    _bitr_align_byte(br);
+    let consumed_end = br.pos - num_floor(br.bit_cnt / 8);
+    let final_bytes = _bw_finish(bw);
+    return map{
+        ok: true,
+        format: "deflate",
+        data: final_bytes,
+        bytes: final_bytes,
+        size: len(final_bytes),
+        next_pos: consumed_end
+    };
+}
+
+fn deflate_decompress(comp_bytes, max_output_bytes = 67108864) {
+    let b = _input_to_bytes(comp_bytes);
+    return _inflate_stream(b, 0, len(b), max_output_bytes);
+}
+
+// ── RFC 1952 GZIP & RFC 1950 ZLIB Codecs ─────────────────────────────────────
+
+fn gzip_compress(data_bytes, level = 6) {
+    let raw = _input_to_bytes(data_bytes);
+    let def_b = deflate_compress(raw, level);
+    let crc = crc32_compute(raw);
+    let isize = bit_and(len(raw), 4294967295);
+    let xfl = 0;
+    if level >= 9 { xfl = 2; }
+    elif level <= 2 and level > 0 { xfl = 4; }
+
+    let bw = _bw_new(10 + len(def_b) + 8, -1);
+    _bw_push_u8(bw, GZIP_ID1);
+    _bw_push_u8(bw, GZIP_ID2);
+    _bw_push_u8(bw, GZIP_CM_DEFLATE);
+    _bw_push_u8(bw, 0);     // FLG = 0
+    _bw_push_u32_le(bw, 0); // MTIME = 0 (reproducible deterministic builds!)
+    _bw_push_u8(bw, xfl);
+    _bw_push_u8(bw, 255);   // OS = 255 (unknown/portable)
+    _bw_push_slice(bw, def_b, 0, len(def_b));
+    _bw_push_u32_le(bw, crc);
+    _bw_push_u32_le(bw, isize);
+    return _bw_finish(bw);
+}
+
+fn gzip_decompress(gz_bytes, max_output_bytes = 67108864) {
+    let b = _input_to_bytes(gz_bytes);
+    let n = len(b);
+    if n < 18 {
+        return _err_result("truncated_gzip_frame", "gzip frame shorter than 18-byte minimum");
+    }
+    if b[0] != GZIP_ID1 or b[1] != GZIP_ID2 or b[2] != GZIP_CM_DEFLATE {
+        return _err_result("invalid_gzip_header", "expected 0x1F 0x8B 0x08 header");
+    }
+    let flg = b[3];
+    if bit_and(flg, 224) != 0 {
+        return _err_result("reserved_gzip_flags", "reserved gzip FLG bits 5..7 set");
+    }
+    let p = 10;
+    if bit_and(flg, 4) != 0 { // FEXTRA
+        if p + 2 > n - 8 { return _err_result("truncated_gzip_fextra", "EOF in FEXTRA"); }
+        let xlen = _read_u16_le(b, p);
+        p = p + 2 + xlen;
+    }
+    if bit_and(flg, 8) != 0 { // FNAME
+        while p < n - 8 and b[p] != 0 { p = p + 1; }
+        p = p + 1;
+    }
+    if bit_and(flg, 16) != 0 { // FCOMMENT
+        while p < n - 8 and b[p] != 0 { p = p + 1; }
+        p = p + 1;
+    }
+    if bit_and(flg, 2) != 0 { // FHCRC
+        p = p + 2;
+    }
+    if p > n - 8 {
+        return _err_result("truncated_gzip_headers", "optional gzip headers exceed buffer");
+    }
+
+    let inf = _inflate_stream(b, p, n - 8, max_output_bytes);
+    if not inf.ok { return inf; }
+    let t_pos = inf.next_pos;
+    if t_pos + 8 > n {
+        return _err_result("truncated_gzip_trailer", "missing 8-byte CRC32+ISIZE trailer");
+    }
+    let expected_crc = _read_u32_le(b, t_pos);
+    let expected_isize = _read_u32_le(b, t_pos + 4);
+    let actual_crc = crc32_compute(inf.data);
+    let actual_isize = bit_and(len(inf.data), 4294967295);
+    if actual_crc != expected_crc {
+        return _err_result("gzip_crc32_mismatch", "CRC-32 trailer check failed");
+    }
+    if actual_isize != expected_isize {
+        return _err_result("gzip_isize_mismatch", "ISIZE modulo-2^32 length check failed");
+    }
+    return _ok_bytes_result(inf.data, "gzip", actual_crc);
+}
+
+fn zlib_compress(data_bytes, level = 6) {
+    let raw = _input_to_bytes(data_bytes);
+    let def_b = deflate_compress(raw, level);
+    let adler = adler32_compute(raw);
+    let bw = _bw_new(2 + len(def_b) + 4, -1);
+    _bw_push_u8(bw, ZLIB_CMF_DEFAULT); // 0x78
+    _bw_push_u8(bw, ZLIB_FLG_DEFAULT); // 0x9C
+    _bw_push_slice(bw, def_b, 0, len(def_b));
+    _bw_push_u32_be(bw, adler);
+    return _bw_finish(bw);
+}
+
+fn zlib_decompress(zlib_bytes, max_output_bytes = 67108864) {
+    let b = _input_to_bytes(zlib_bytes);
+    let n = len(b);
+    if n < 6 {
+        return _err_result("truncated_zlib_stream", "zlib stream shorter than 6 bytes");
+    }
+    let cmf = b[0];
+    let flg = b[1];
+    if bit_and(cmf, 15) != 8 or bit_shr(cmf, 4) > 7 {
+        return _err_result("invalid_zlib_cmf", "unsupported CM or window CINFO > 7");
+    }
+    if (cmf * 256 + flg) % 31 != 0 {
+        return _err_result("invalid_zlib_fcheck", "RFC 1950 FCHECK modulo-31 check failed");
+    }
+    if bit_and(flg, 32) != 0 {
+        return _err_result("unsupported_zlib_fdict", "preset dictionary FDICT unsupported");
+    }
+    let inf = _inflate_stream(b, 2, n - 4, max_output_bytes);
+    if not inf.ok { return inf; }
+    let t_pos = inf.next_pos;
+    if t_pos + 4 > n {
+        return _err_result("truncated_zlib_trailer", "missing 4-byte Adler-32 trailer");
+    }
+    let expected_adler = _read_u32_be(b, t_pos);
+    let actual_adler = adler32_compute(inf.data);
+    if actual_adler != expected_adler {
+        return _err_result("zlib_adler32_mismatch", "Adler-32 trailer check failed");
+    }
+    return _ok_bytes_result(inf.data, "zlib", actual_adler);
+}
+
+// ── Pure-PBLang LZ4 Frame (0x184D2204 + Sequence Blocks + xxHash32) ──────────
+
+fn _lz4_compress_block(src, start_off, blk_len) {
+    // Encodes a single LZ4 raw block [0..blk_len)
+    let bw = _bw_new(blk_len + 32, -1);
+    if blk_len == 0 { return _bw_finish(bw); }
+    let end_off = start_off + blk_len;
+    if blk_len < 13 {
+        // Too short for LZ4 match + 5-byte trailing literals rule
+        let tok = bit_shl(blk_len, 4);
+        _bw_push_u8(bw, tok);
+        _bw_push_slice(bw, src, start_off, blk_len);
+        return _bw_finish(bw);
+    }
+
+    let htab = [];
+    let k = 0;
+    while k < 4096 { array_push(htab, -1); k = k + 1; }
+
+    let anchor = start_off;
+    let pos = start_off;
+    let match_limit = end_off - 5; // last 5 bytes MUST be literals per LZ4 spec
+    let mflimit = end_off - 12;
+
+    while pos <= mflimit {
+        // Fast dist=1 RLE check
+        let found_pos = -1;
+        if pos > anchor and src[pos] == src[pos - 1] and src[pos + 1] == src[pos - 1] and
+           src[pos + 2] == src[pos - 1] and src[pos + 3] == src[pos - 1] {
+            found_pos = pos - 1;
+        } else {
+            let seq4 = _read_u32_le(src, pos);
+            let h = bit_and(bit_shr(_u32_mul(seq4, 2654435761), 20), 4095);
+            let ref_p = htab[h];
+            htab[h] = pos;
+            if ref_p >= start_off and (pos - ref_p) <= 65535 {
+                if src[ref_p] == src[pos] and src[ref_p + 1] == src[pos + 1] and
+                   src[ref_p + 2] == src[pos + 2] and src[ref_p + 3] == src[pos + 3] {
+                    found_pos = ref_p;
+                }
+            }
+        }
+
+        if found_pos < 0 {
+            pos = pos + 1;
+            continue;
+        }
+
+        let lit_len = pos - anchor;
+        let offset = pos - found_pos;
+        let m_len = 4;
+        while pos + m_len < match_limit and src[found_pos + m_len] == src[pos + m_len] {
+            m_len = m_len + 1;
+        }
+
+        let lit_nibble = lit_len;
+        if lit_nibble >= 15 { lit_nibble = 15; }
+        let m_minus_4 = m_len - 4;
+        let m_nibble = m_minus_4;
+        if m_nibble >= 15 { m_nibble = 15; }
+        _bw_push_u8(bw, bit_or(bit_shl(lit_nibble, 4), m_nibble));
+
+        if lit_len >= 15 {
+            let rem_l = lit_len - 15;
+            while rem_l >= 255 {
+                _bw_push_u8(bw, 255);
+                rem_l = rem_l - 255;
+            }
+            _bw_push_u8(bw, rem_l);
+        }
+        _bw_push_slice(bw, src, anchor, lit_len);
+        _bw_push_u16_le(bw, offset);
+
+        if m_minus_4 >= 15 {
+            let rem_m = m_minus_4 - 15;
+            while rem_m >= 255 {
+                _bw_push_u8(bw, 255);
+                rem_m = rem_m - 255;
+            }
+            _bw_push_u8(bw, rem_m);
+        }
+
+        pos = pos + m_len;
+        anchor = pos;
+    }
+
+    // Emit final literals sequence
+    let tail_lits = end_off - anchor;
+    let tail_nib = tail_lits;
+    if tail_nib >= 15 { tail_nib = 15; }
+    _bw_push_u8(bw, bit_shl(tail_nib, 4));
+    if tail_lits >= 15 {
+        let rem_t = tail_lits - 15;
+        while rem_t >= 255 {
+            _bw_push_u8(bw, 255);
+            rem_t = rem_t - 255;
+        }
+        _bw_push_u8(bw, rem_t);
+    }
+    _bw_push_slice(bw, src, anchor, tail_lits);
+    return _bw_finish(bw);
+}
+
+fn lz4_compress(data_bytes) {
+    let raw = _input_to_bytes(data_bytes);
+    let total = len(raw);
+    // LZ4 Frame descriptor: Magic(4) + FLG(1) + BD(1) + ContentSize(8) + HC(1)
+    // FLG = 0x6C (Version=01, B.Indep=1, C.Size=1, C.Checksum=1)
+    // BD  = 0x70 (BlockMaxSize = 4 MiB)
+    let desc = _bw_new(10, -1);
+    _bw_push_u8(desc, 108); // 0x6C
+    _bw_push_u8(desc, 112); // 0x70
+    // 64-bit LE Content Size
+    let lo32 = bit_and(total, 4294967295);
+    let hi32 = num_floor(total / 4294967296);
+    _bw_push_u32_le(desc, lo32);
+    _bw_push_u32_le(desc, hi32);
+    let desc_bytes = _bw_finish(desc);
+    let hc = bit_and(bit_shr(xxhash32_compute(desc_bytes, 0), 8), 255);
+
+    let out = _bw_new(64 + num_floor(total / 4), -1);
+    _bw_push_u32_le(out, LZ4_FRAME_MAGIC);
+    _bw_push_slice(out, desc_bytes, 0, len(desc_bytes));
+    _bw_push_u8(out, hc);
+
+    // Emit independent blocks of up to 262144 bytes (256 KiB)
+    let pos = 0;
+    while pos < total {
+        let blk_len = total - pos;
+        if blk_len > 262144 { blk_len = 262144; }
+        let comp_blk = _lz4_compress_block(raw, pos, blk_len);
+        if len(comp_blk) < blk_len {
+            _bw_push_u32_le(out, len(comp_blk));
+            _bw_push_slice(out, comp_blk, 0, len(comp_blk));
+        } else {
+            // Uncompressed block flag: bit 31 (0x80000000 = 2147483648)
+            _bw_push_u32_le(out, bit_or(blk_len, 2147483648));
+            _bw_push_slice(out, raw, pos, blk_len);
+        }
+        pos = pos + blk_len;
+    }
+
+    _bw_push_u32_le(out, 0); // EndMark = 0x00000000
+    _bw_push_u32_le(out, xxhash32_compute(raw, 0)); // Content Checksum
+    return _bw_finish(out);
+}
+
+fn lz4_decompress(lz4_bytes, max_output_bytes = 67108864) {
+    let b = _input_to_bytes(lz4_bytes);
+    let n = len(b);
+    if n < 11 {
+        return _err_result("truncated_lz4_frame", "LZ4 frame shorter than minimum header");
+    }
+    if _read_u32_le(b, 0) != LZ4_FRAME_MAGIC {
+        return _err_result("invalid_lz4_magic", "expected 0x184D2204 LZ4 frame magic");
+    }
+    let flg = b[4];
+    let bd = b[5];
+    if bit_shr(flg, 6) != 1 {
+        return _err_result("unsupported_lz4_version", "expected LZ4 frame version 01");
+    }
+    let has_b_checksum = bit_and(flg, 16) != 0;
+    let has_c_size = bit_and(flg, 8) != 0;
+    let has_c_checksum = bit_and(flg, 4) != 0;
+    let has_dict_id = bit_and(flg, 1) != 0;
+
+    let p = 6;
+    let declared_size = -1;
+    if has_c_size {
+        if p + 8 > n { return _err_result("truncated_lz4_csize", "EOF reading content size"); }
+        let lo = _read_u32_le(b, p);
+        let hi = _read_u32_le(b, p + 4);
+        declared_size = hi * 4294967296 + lo;
+        // Immediate O(1) anti-bomb check BEFORE allocating output buffer!
+        if declared_size > max_output_bytes {
+            return _err_result("decompression_bomb_limit_exceeded", "LZ4 Content_Size exceeds max_output_bytes");
+        }
+        p = p + 8;
+    }
+    if has_dict_id {
+        p = p + 4;
+    }
+    if p >= n {
+        return _err_result("truncated_lz4_hc", "missing LZ4 header checksum byte");
+    }
+    let desc_slice = bytes_slice(b, 4, p);
+    let expected_hc = b[p];
+    let actual_hc = bit_and(bit_shr(xxhash32_compute(desc_slice, 0), 8), 255);
+    if expected_hc != actual_hc {
+        return _err_result("lz4_header_checksum_mismatch", "LZ4 header xxHash32 byte mismatch");
+    }
+    p = p + 1;
+
+    let init_cap = 256;
+    if declared_size >= 0 and declared_size <= 4096 { init_cap = declared_size; }
+    if init_cap > max_output_bytes { init_cap = max_output_bytes; }
+    let bw = _bw_new(init_cap, max_output_bytes);
+    let _unused_bd = bd;
+
+    while true {
+        if p + 4 > n {
+            return _err_result("truncated_lz4_block_header", "EOF reading LZ4 block size");
+        }
+        let blk_hdr = _read_u32_le(b, p);
+        p = p + 4;
+        if blk_hdr == 0 {
+            break; // EndMark reached
+        }
+        let is_uncompressed = bit_and(blk_hdr, 2147483648) != 0;
+        let blk_sz = bit_and(blk_hdr, 2147483647);
+        if p + blk_sz > n {
+            return _err_result("truncated_lz4_block_data", "LZ4 block extends past EOF");
+        }
+        if is_uncompressed {
+            if bw.size + blk_sz > max_output_bytes {
+                return _err_result("decompression_bomb_limit_exceeded", "uncompressed LZ4 block exceeds max_output_bytes");
+            }
+            if not _bw_push_slice(bw, b, p, blk_sz) {
+                return _err_result("decompression_bomb_limit_exceeded", "LZ4 output exceeded limit");
+            }
+        } else {
+            let bp = p;
+            let b_end = p + blk_sz;
+            while bp < b_end {
+                let tok = b[bp];
+                bp = bp + 1;
+                let lit_len = bit_shr(tok, 4);
+                if lit_len == 15 {
+                    while true {
+                        if bp >= b_end {
+                            return _err_result("corrupt_lz4_lit_len", "truncated literal length extension");
+                        }
+                        let ext = b[bp];
+                        bp = bp + 1;
+                        lit_len = lit_len + ext;
+                        if ext != 255 { break; }
+                    }
+                }
+                if bp + lit_len > b_end {
+                    return _err_result("corrupt_lz4_literals", "literals exceed block boundary");
+                }
+                if bw.size + lit_len > max_output_bytes {
+                    return _err_result("decompression_bomb_limit_exceeded", "LZ4 literals exceed max_output_bytes");
+                }
+                if not _bw_push_slice(bw, b, bp, lit_len) {
+                    return _err_result("decompression_bomb_limit_exceeded", "LZ4 output exceeded limit");
+                }
+                bp = bp + lit_len;
+
+                if bp >= b_end {
+                    break; // Last sequence in block ends right after literals!
+                }
+                if bp + 2 > b_end {
+                    return _err_result("corrupt_lz4_offset", "truncated 16-bit match offset");
+                }
+                let offset = _read_u16_le(b, bp);
+                bp = bp + 2;
+                if offset == 0 or offset > bw.size {
+                    return _err_result("invalid_lz4_offset", "match offset 0 or beyond window");
+                }
+                let m_len = bit_and(tok, 15);
+                if m_len == 15 {
+                    while true {
+                        if bp >= b_end {
+                            return _err_result("corrupt_lz4_match_len", "truncated match length extension");
+                        }
+                        let mext = b[bp];
+                        bp = bp + 1;
+                        m_len = m_len + mext;
+                        if mext != 255 { break; }
+                    }
+                }
+                let full_match = m_len + 4;
+                if bw.size + full_match > max_output_bytes {
+                    return _err_result("decompression_bomb_limit_exceeded", "LZ4 match exceeds max_output_bytes");
+                }
+                if not _bw_copy_backref(bw, offset, full_match) {
+                    return _err_result("decompression_bomb_limit_exceeded", "LZ4 backref exceeded limit");
+                }
+            }
+        }
+        p = p + blk_sz;
+        if has_b_checksum {
+            if p + 4 > n { return _err_result("truncated_lz4_bchecksum", "missing block checksum"); }
+            p = p + 4;
+        }
+    }
+
+    let out_bytes = _bw_finish(bw);
+    if declared_size >= 0 and len(out_bytes) != declared_size {
+        return _err_result("lz4_content_size_mismatch", "decoded length != Content_Size");
+    }
+    let csum = nil;
+    if has_c_checksum {
+        if p + 4 > n {
+            return _err_result("truncated_lz4_cchecksum", "missing 4-byte content checksum");
+        }
+        let expected_cc = _read_u32_le(b, p);
+        csum = xxhash32_compute(out_bytes, 0);
+        if csum != expected_cc {
+            return _err_result("lz4_content_checksum_mismatch", "LZ4 content xxHash32 mismatch");
+        }
+    }
+    return _ok_bytes_result(out_bytes, "lz4", csum);
+}
+
+// ── RFC 8878 Zstandard (0xFD2FB528 + Frame_Content_Size + Raw & RLE Blocks) ──
+
+fn _zstd_find_uniform_run(b, pos, limit_end) {
+    // Returns length of uniform single-byte run starting at pos (capped at 131072 = 128 KiB)
+    let first = b[pos];
+    let max_blk = limit_end - pos;
+    if max_blk > 131072 { max_blk = 131072; }
+    let r = 1;
+    while r < max_blk and b[pos + r] == first {
+        r = r + 1;
+    }
+    return r;
+}
+
+fn zstd_compress(data_bytes, level = 3) {
+    let raw = _input_to_bytes(data_bytes);
+    let total = len(raw);
+    let _unused_lvl = level;
+
+    // RFC 8878 Section 3.1.1:
+    // Magic_Number: 0xFD2FB528 (4 bytes LE)
+    // Frame_Header_Descriptor:
+    //   Single_Segment_Flag = 1 (bit 5 = 32)
+    //   Content_Checksum_Flag = 0 (bit 2 = 0)
+    //   Frame_Content_Size_Flag (bits 7..6):
+    //     0 -> 1 byte FCS (when Single_Segment_Flag=1, 0..255)
+    //     1 -> 2 bytes FCS + 256 (256..65791)
+    //     2 -> 4 bytes FCS (up to 4 GiB - 1)
+    let bw = _bw_new(32 + num_floor(total / 8), -1);
+    _bw_push_u32_le(bw, ZSTD_FRAME_MAGIC);
+
+    if total <= 255 {
+        _bw_push_u8(bw, 32); // FCS_Flag=0, Single_Segment=1 -> 1-byte FCS
+        _bw_push_u8(bw, total);
+    } elif total <= 65791 {
+        _bw_push_u8(bw, 96); // FCS_Flag=1 (64) | Single_Segment=1 (32) -> 2-byte (FCS - 256)
+        _bw_push_u16_le(bw, total - 256);
+    } else {
+        _bw_push_u8(bw, 160); // FCS_Flag=2 (128) | Single_Segment=1 (32) -> 4-byte FCS
+        _bw_push_u32_le(bw, total);
+    }
+
+    if total == 0 {
+        // Single empty Raw_Block with Last_Block=1, Block_Type=0, Block_Size=0 -> 24-bit 0x000001
+        _bw_push_u24_le(bw, 1);
+        return _bw_finish(bw);
+    }
+
+    // Partition input into RFC 8878 RLE_Blocks (for runs >= 8 bytes) and Raw_Blocks (<= 131072 bytes)
+    let pos = 0;
+    while pos < total {
+        // Check if current position begins an RLE run >= 8 bytes
+        let run = _zstd_find_uniform_run(raw, pos, total);
+        if run >= 8 {
+            let is_last = 0;
+            if pos + run >= total { is_last = 1; }
+            // Block_Header = is_last | (Block_Type=1 << 1) | (Regenerated_Size << 3)
+            let hdr = bit_or(is_last, bit_or(2, bit_shl(run, 3)));
+            _bw_push_u24_le(bw, hdr);
+            _bw_push_u8(bw, raw[pos]);
+            pos = pos + run;
+        } else {
+            // Collect non-RLE span up to 131072 bytes or until an RLE run >= 16 starts
+            let raw_start = pos;
+            let raw_end = pos + 1;
+            while raw_end < total and (raw_end - raw_start) < 131072 {
+                if raw_end + 15 < total and raw[raw_end] == raw[raw_end + 1] and
+                   raw[raw_end] == raw[raw_end + 7] and raw[raw_end] == raw[raw_end + 15] {
+                    let probe = _zstd_find_uniform_run(raw, raw_end, raw_end + 16);
+                    if probe >= 16 { break; }
+                }
+                raw_end = raw_end + 1;
+            }
+            let raw_len = raw_end - raw_start;
+            let is_last2 = 0;
+            if raw_end >= total { is_last2 = 1; }
+            // Block_Header = is_last2 | (Block_Type=0 << 1) | (Block_Size << 3)
+            let hdr2 = bit_or(is_last2, bit_shl(raw_len, 3));
+            _bw_push_u24_le(bw, hdr2);
+            _bw_push_slice(bw, raw, raw_start, raw_len);
+            pos = raw_end;
+        }
+    }
+
+    return _bw_finish(bw);
+}
+
+fn zstd_decompress(zstd_bytes, max_output_bytes = 67108864) {
+    let b = _input_to_bytes(zstd_bytes);
+    let n = len(b);
+    if n < 6 {
+        return _err_result("truncated_zstd_frame", "Zstandard frame shorter than 6 bytes");
+    }
+    if _read_u32_le(b, 0) != ZSTD_FRAME_MAGIC {
+        return _err_result("invalid_zstd_magic", "expected 0xFD2FB528 RFC 8878 magic");
+    }
+    let fhd = b[4];
+    if bit_and(fhd, 8) != 0 {
+        return _err_result("reserved_zstd_fhd_bit", "RFC 8878 reserved bit 3 must be zero");
+    }
+    let fcs_flag = bit_shr(fhd, 6);
+    let single_seg = bit_and(fhd, 32) != 0;
+    let has_checksum = bit_and(fhd, 4) != 0;
+    let dict_id_flag = bit_and(fhd, 3);
+
+    let p = 5;
+    if not single_seg {
+        if p >= n { return _err_result("truncated_zstd_window_desc", "missing Window_Descriptor"); }
+        p = p + 1;
+    }
+    let dict_bytes_map = [0, 1, 2, 4];
+    p = p + dict_bytes_map[dict_id_flag];
+
+    let declared_fcs = -1;
+    if fcs_flag == 0 {
+        if single_seg {
+            if p + 1 > n { return _err_result("truncated_zstd_fcs", "missing 1-byte FCS"); }
+            declared_fcs = b[p];
+            p = p + 1;
+        }
+    } elif fcs_flag == 1 {
+        if p + 2 > n { return _err_result("truncated_zstd_fcs", "missing 2-byte FCS"); }
+        declared_fcs = _read_u16_le(b, p) + 256;
+        p = p + 2;
+    } elif fcs_flag == 2 {
+        if p + 4 > n { return _err_result("truncated_zstd_fcs", "missing 4-byte FCS"); }
+        declared_fcs = _read_u32_le(b, p);
+        p = p + 4;
+    } else {
+        if p + 8 > n { return _err_result("truncated_zstd_fcs", "missing 8-byte FCS"); }
+        let lo = _read_u32_le(b, p);
+        let hi = _read_u32_le(b, p + 4);
+        declared_fcs = hi * 4294967296 + lo;
+        p = p + 8;
+    }
+
+    // Immediate O(1) anti-decompression-bomb check BEFORE allocating output buffer!
+    if declared_fcs >= 0 and declared_fcs > max_output_bytes {
+        return _err_result("decompression_bomb_limit_exceeded", "Zstandard Frame_Content_Size exceeds max_output_bytes");
+    }
+
+    let init_cap = 256;
+    if declared_fcs >= 0 and declared_fcs <= 4096 { init_cap = declared_fcs; }
+    if init_cap > max_output_bytes { init_cap = max_output_bytes; }
+    let bw = _bw_new(init_cap, max_output_bytes);
+
+    let last_blk = 0;
+    while last_blk == 0 {
+        if p + 3 > n {
+            return _err_result("truncated_zstd_block_header", "EOF reading 3-byte block header");
+        }
+        let bh = _read_u24_le(b, p);
+        p = p + 3;
+        last_blk = bit_and(bh, 1);
+        let btype = bit_and(bit_shr(bh, 1), 3);
+        let bsize = bit_shr(bh, 3);
+        if bsize > 131072 {
+            return _err_result("zstd_block_size_exceeded", "RFC 8878 max block size is 128 KiB");
+        }
+
+        if btype == 0 {
+            // Raw_Block
+            if p + bsize > n {
+                return _err_result("truncated_zstd_raw_block", "Raw_Block extends past EOF");
+            }
+            if bw.size + bsize > max_output_bytes {
+                return _err_result("decompression_bomb_limit_exceeded", "Zstandard Raw_Block exceeds max_output_bytes");
+            }
+            if not _bw_push_slice(bw, b, p, bsize) {
+                return _err_result("decompression_bomb_limit_exceeded", "Zstandard output limit exceeded");
+            }
+            p = p + bsize;
+        } elif btype == 1 {
+            // RLE_Block: 1 byte repeated bsize times
+            if p + 1 > n {
+                return _err_result("truncated_zstd_rle_block", "missing RLE_Block byte");
+            }
+            let rle_byte = b[p];
+            p = p + 1;
+            if bw.size + bsize > max_output_bytes {
+                return _err_result("decompression_bomb_limit_exceeded", "Zstandard RLE_Block exceeds max_output_bytes");
+            }
+            if not _bw_push_repeat(bw, rle_byte, bsize) {
+                return _err_result("decompression_bomb_limit_exceeded", "Zstandard RLE output limit exceeded");
+            }
+        } elif btype == 2 {
+            // Compressed_Block: supports RFC 8878 Raw/RLE Literals_Section with 0 sequences (pure literals block)
+            if p + bsize > n or bsize < 2 {
+                return _err_result("truncated_zstd_compressed_block", "Compressed_Block truncated");
+            }
+            let b_end = p + bsize;
+            let lit_hdr0 = b[p];
+            let lit_type = bit_and(lit_hdr0, 3);
+            let sz_fmt = bit_and(bit_shr(lit_hdr0, 2), 3);
+            let regen_sz = 0;
+            let lp = p;
+            if lit_type == 0 or lit_type == 1 {
+                if sz_fmt == 0 or sz_fmt == 2 {
+                    regen_sz = bit_shr(lit_hdr0, 3);
+                    lp = p + 1;
+                } elif sz_fmt == 1 {
+                    if p + 2 > b_end { return _err_result("truncated_zstd_lit_hdr", "EOF in 2B lit header"); }
+                    regen_sz = bit_shr(_read_u16_le(b, p), 4);
+                    lp = p + 2;
+                } else {
+                    if p + 3 > b_end { return _err_result("truncated_zstd_lit_hdr", "EOF in 3B lit header"); }
+                    regen_sz = bit_shr(_read_u24_le(b, p), 4);
+                    lp = p + 3;
+                }
+                if bw.size + regen_sz > max_output_bytes {
+                    return _err_result("decompression_bomb_limit_exceeded", "Zstandard literals exceed max_output_bytes");
+                }
+                if lit_type == 0 {
+                    if lp + regen_sz + 1 > b_end { return _err_result("corrupt_zstd_literals", "lit overrun"); }
+                    let num_seq = b[lp + regen_sz];
+                    if num_seq != 0 {
+                        return _err_result("unsupported_zstd_fse_sequences", "non-zero FSE sequences unsupported");
+                    }
+                    _bw_push_slice(bw, b, lp, regen_sz);
+                } else {
+                    if lp + 2 > b_end { return _err_result("corrupt_zstd_rle_lit", "RLE lit overrun"); }
+                    let rbyte = b[lp];
+                    let num_seq2 = b[lp + 1];
+                    if num_seq2 != 0 {
+                        return _err_result("unsupported_zstd_fse_sequences", "non-zero FSE sequences unsupported");
+                    }
+                    _bw_push_repeat(bw, rbyte, regen_sz);
+                }
+                p = b_end;
+            } else {
+                return _err_result("unsupported_zstd_huff_literals", "Treeless/Huffman Zstd literals unsupported");
+            }
+        } else {
+            return _err_result("invalid_zstd_block_type", "RFC 8878 Block_Type=3 is reserved");
+        }
+    }
+
+    if has_checksum {
+        if p + 4 > n {
+            return _err_result("truncated_zstd_checksum", "missing 4-byte Zstd content checksum");
+        }
+        p = p + 4;
+    }
+
+    let out_bytes = _bw_finish(bw);
+    if declared_fcs >= 0 and len(out_bytes) != declared_fcs {
+        return _err_result("zstd_fcs_mismatch", "decoded size != Frame_Content_Size");
+    }
+    return _ok_bytes_result(out_bytes, "zstd", nil);
+}
+
+// ── Path Security Validator (Zip-Slip / Tar-Slip Traversal Guard) ────────────
+
+fn _is_safe_archive_path(entry_name) {
+    if type(entry_name) != "string" or len(entry_name) == 0 or len(entry_name) > 1024 {
+        return false;
+    }
+    // Reject leading slash, backslash anywhere, NUL/control chars, Windows drive colons, and ".." segments!
+    let n = len(entry_name);
+    if strcharcodeat(entry_name, 0) == 47 or strcharcodeat(entry_name, 0) == 92 {
+        return false;
+    }
+    if n >= 2 and strcharcodeat(entry_name, 1) == 58 { // e.g. drive letter ':'
+        return false;
+    }
+    let seg_len = 0;
+    let dot_cnt = 0;
+    let i = 0;
+    while i < n {
+        let cp = strcharcodeat(entry_name, i);
+        if cp < 32 or cp == 127 or cp == 92 {
+            return false; // NUL, control char, or backslash '\'
+        }
+        if cp == 47 { // '/'
+            if seg_len == 2 and dot_cnt == 2 {
+                return false; // "../" segment!
+            }
+            seg_len = 0;
+            dot_cnt = 0;
+        } else {
+            seg_len = seg_len + 1;
+            if cp == 46 { dot_cnt = dot_cnt + 1; }
+        }
+        i = i + 1;
+    }
+    if seg_len == 2 and dot_cnt == 2 {
+        return false; // trailing ".." segment!
+    }
+    return true;
+}
+
+// ── Pure-PBLang PKWARE ZIP Pack & Bomb/Slip-Safe Unpack ──────────────────────
+
+fn zip_pack_entries(entries, level = 6) {
+    if not is_array(entries) {
+        throw "zip_pack_entries: entries must be an array";
+    }
+    let count = len(entries);
+    if count > 65535 {
+        throw "zip_pack_entries: entry count exceeds 65535";
+    }
+    let out = _bw_new(256, -1);
+    let cd = _bw_new(256, -1);
+
+    let idx = 0;
+    while idx < count {
+        let ent = entries[idx];
+        let name = ent.name;
+        if not _is_safe_archive_path(name) {
+            throw "zip_pack_entries: unsafe archive entry path rejected: " + str(name);
+        }
+        let name_b = _input_to_bytes(name);
+        let raw_b = _input_to_bytes(ent.data);
+        let raw_sz = len(raw_b);
+        let crc = crc32_compute(raw_b);
+
+        let method = 0;
+        let payload = raw_b;
+        if level > 0 and raw_sz > 0 {
+            let def_b = deflate_compress(raw_b, level);
+            if len(def_b) < raw_sz {
+                method = 8;
+                payload = def_b;
+            }
+        }
+        let comp_sz = len(payload);
+        let local_off = out.size;
+
+        // Local File Header: PK\x03\x04 (0x04034B50 = 67324752)
+        _bw_push_u32_le(out, 67324752);
+        _bw_push_u16_le(out, 20);      // version needed 2.0
+        _bw_push_u16_le(out, 2048);    // GP flag bit 11 (UTF-8 filename)
+        _bw_push_u16_le(out, method);
+        _bw_push_u32_le(out, 0);       // mod time/date
+        _bw_push_u32_le(out, crc);
+        _bw_push_u32_le(out, comp_sz);
+        _bw_push_u32_le(out, raw_sz);
+        _bw_push_u16_le(out, len(name_b));
+        _bw_push_u16_le(out, 0);       // extra len
+        _bw_push_slice(out, name_b, 0, len(name_b));
+        _bw_push_slice(out, payload, 0, comp_sz);
+
+        // Central Directory Header: PK\x01\x02 (0x02014B50 = 33639248)
+        _bw_push_u32_le(cd, 33639248);
+        _bw_push_u16_le(cd, 788);      // version made by Unix 2.0
+        _bw_push_u16_le(cd, 20);       // version needed 2.0
+        _bw_push_u16_le(cd, 2048);     // UTF-8 flag
+        _bw_push_u16_le(cd, method);
+        _bw_push_u32_le(cd, 0);        // mod time/date
+        _bw_push_u32_le(cd, crc);
+        _bw_push_u32_le(cd, comp_sz);
+        _bw_push_u32_le(cd, raw_sz);
+        _bw_push_u16_le(cd, len(name_b));
+        _bw_push_u16_le(cd, 0);        // extra len
+        _bw_push_u16_le(cd, 0);        // comment len
+        _bw_push_u16_le(cd, 0);        // disk start
+        _bw_push_u16_le(cd, 0);        // internal attrs
+        _bw_push_u32_le(cd, 2175008768); // 0100644 << 16
+        _bw_push_u32_le(cd, local_off);
+        _bw_push_slice(cd, name_b, 0, len(name_b));
+
+        idx = idx + 1;
+    }
+
+    let cd_bytes = _bw_finish(cd);
+    let cd_off = out.size;
+    let cd_sz = len(cd_bytes);
+    _bw_push_slice(out, cd_bytes, 0, cd_sz);
+
+    // End of Central Directory: PK\x05\x06 (0x06054B50 = 101010256)
+    _bw_push_u32_le(out, 101010256);
+    _bw_push_u16_le(out, 0);
+    _bw_push_u16_le(out, 0);
+    _bw_push_u16_le(out, count);
+    _bw_push_u16_le(out, count);
+    _bw_push_u32_le(out, cd_sz);
+    _bw_push_u32_le(out, cd_off);
+    _bw_push_u16_le(out, 0);
+    return _bw_finish(out);
+}
+
+fn zip_unpack_bytes(zip_bytes, max_output_bytes = 67108864) {
+    let b = _input_to_bytes(zip_bytes);
+    let n = len(b);
+    if n < 22 {
+        return _err_result("truncated_zip_archive", "ZIP shorter than 22-byte EOCD");
+    }
+    // Locate EOCD PK\x05\x06 scanning backwards from end
+    let eocd = -1;
+    let scan = n - 22;
+    let min_scan = n - 22 - 65535;
+    if min_scan < 0 { min_scan = 0; }
+    while scan >= min_scan {
+        if b[scan] == 80 and b[scan + 1] == 75 and b[scan + 2] == 5 and b[scan + 3] == 6 {
+            let cmt_len = _read_u16_le(b, scan + 20);
+            if scan + 22 + cmt_len == n {
+                eocd = scan;
+                break;
+            }
+        }
+        scan = scan - 1;
+    }
+    if eocd < 0 {
+        return _err_result("invalid_zip_eocd", "PK\\x05\\x06 EOCD record not found");
+    }
+
+    let total_entries = _read_u16_le(b, eocd + 10);
+    let cd_size = _read_u32_le(b, eocd + 12);
+    let cd_off = _read_u32_le(b, eocd + 16);
+    if cd_off + cd_size != eocd {
+        return _err_result("corrupt_zip_central_dir", "Central Directory bounds mismatch");
+    }
+
+    let unpacked = [];
+    let total_out = 0;
+    let cp = cd_off;
+    let idx = 0;
+    while idx < total_entries {
+        if cp + 46 > eocd {
+            return _err_result("truncated_zip_cd_entry", "Central Directory entry truncated");
+        }
+        if _read_u32_le(b, cp) != 33639248 {
+            return _err_result("invalid_zip_cd_sig", "expected PK\\x01\\x02 signature");
+        }
+        let method = _read_u16_le(b, cp + 10);
+        let crc_exp = _read_u32_le(b, cp + 16);
+        let comp_sz = _read_u32_le(b, cp + 20);
+        let uncomp_sz = _read_u32_le(b, cp + 24);
+        let name_len = _read_u16_le(b, cp + 28);
+        let extra_len = _read_u16_le(b, cp + 30);
+        let cmt_len = _read_u16_le(b, cp + 32);
+        let lhdr_off = _read_u32_le(b, cp + 42);
+
+        if cp + 46 + name_len + extra_len + cmt_len > eocd {
+            return _err_result("truncated_zip_cd_name", "CD variable fields exceed EOCD");
+        }
+        let name_str = bytes_to_str(bytes_slice(b, cp + 46, cp + 46 + name_len));
+
+        // Zip-Slip path traversal check BEFORE touching entry payload!
+        if not _is_safe_archive_path(name_str) {
+            return map{
+                ok: false,
+                error: "zip_slip_path_traversal_detected",
+                path: name_str
+            };
+        }
+
+        // Cumulative anti-bomb budget check BEFORE allocating/inflating!
+        let remaining_budget = max_output_bytes - total_out;
+        if uncomp_sz > remaining_budget {
+            return _err_result("decompression_bomb_limit_exceeded", "ZIP entry exceeds remaining max_output_bytes");
+        }
+
+        if lhdr_off + 30 > cd_off or _read_u32_le(b, lhdr_off) != 67324752 {
+            return _err_result("invalid_zip_local_header", "missing PK\\x03\\x04 local header");
+        }
+        let ln_len = _read_u16_le(b, lhdr_off + 26);
+        let le_len = _read_u16_le(b, lhdr_off + 28);
+        let data_pos = lhdr_off + 30 + ln_len + le_len;
+        if data_pos + comp_sz > cd_off {
+            return _err_result("truncated_zip_entry_data", "compressed entry data truncated");
+        }
+
+        let entry_bytes = nil;
+        if method == 0 {
+            if comp_sz != uncomp_sz {
+                return _err_result("zip_stored_size_mismatch", "STORED comp_sz != uncomp_sz");
+            }
+            entry_bytes = bytes_slice(b, data_pos, data_pos + comp_sz);
+        } elif method == 8 {
+            let inf = _inflate_stream(b, data_pos, data_pos + comp_sz, remaining_budget);
+            if not inf.ok { return inf; }
+            entry_bytes = inf.data;
+        } else {
+            return _err_result("unsupported_zip_method", "only STORED(0) and DEFLATE(8) supported");
+        }
+
+        if len(entry_bytes) != uncomp_sz {
+            return _err_result("zip_uncompressed_size_mismatch", "inflated size != header size");
+        }
+        if crc32_compute(entry_bytes) != crc_exp {
+            return _err_result("zip_crc32_mismatch", "entry CRC-32 verification failed");
+        }
+
+        total_out = total_out + len(entry_bytes);
+        array_push(unpacked, map{
+            name: name_str,
+            data: entry_bytes,
+            bytes: entry_bytes,
+            size: len(entry_bytes),
+            method: method,
+            crc32: crc_exp
+        });
+
+        cp = cp + 46 + name_len + extra_len + cmt_len;
+        idx = idx + 1;
+    }
+
+    return map{
+        ok: true,
+        format: "zip",
+        entries: unpacked,
+        entry_count: len(unpacked),
+        total_bytes: total_out
+    };
+}
+
+// ── POSIX USTAR TAR (512-byte blocks + octal header checksum) ────────────────
+
+fn _write_tar_str(blk, off, max_w, text) {
+    let sb = str_to_bytes(text);
+    let lim = len(sb);
+    if lim > max_w { lim = max_w; }
+    let i = 0;
+    while i < lim {
+        bytes_set(blk, off + i, sb[i]);
+        i = i + 1;
+    }
+}
+
+fn _write_tar_octal(blk, off, width, val) {
+    // Writes (width - 1) ASCII octal digits padded with '0', terminated by NUL (0)
+    let digits = width - 1;
+    let v = num_floor(val);
+    let i = digits - 1;
+    while i >= 0 {
+        bytes_set(blk, off + i, 48 + bit_and(v, 7));
+        v = num_floor(v / 8);
+        i = i - 1;
+    }
+    bytes_set(blk, off + digits, 0);
+}
+
+fn _parse_tar_octal(b, off, width) {
+    let i = 0;
+    while i < width and (b[off + i] == 32 or b[off + i] == 0) {
+        i = i + 1;
+    }
+    let val = 0;
+    let saw_digit = false;
+    while i < width {
+        let ch = b[off + i];
+        if ch == 0 or ch == 32 { break; }
+        if ch < 48 or ch > 55 { return -1; }
+        val = val * 8 + (ch - 48);
+        saw_digit = true;
+        i = i + 1;
+    }
+    if not saw_digit { return 0; }
+    return val;
+}
+
+fn _tar_header_checksum(b, blk_off) {
+    let sum = 0;
+    let i = 0;
+    while i < 512 {
+        if i >= 148 and i < 156 {
+            sum = sum + 32; // chksum field treated as 8 ASCII spaces (0x20)
+        } else {
+            sum = sum + b[blk_off + i];
+        }
+        i = i + 1;
+    }
+    return sum;
+}
+
+fn tar_pack_entries(entries) {
+    if not is_array(entries) {
+        throw "tar_pack_entries: entries must be an array";
+    }
+    let bw = _bw_new(1024 + len(entries) * 1024, -1);
+    let idx = 0;
+    while idx < len(entries) {
+        let ent = entries[idx];
+        let name = ent.name;
+        if not _is_safe_archive_path(name) {
+            throw "tar_pack_entries: unsafe archive entry path rejected: " + str(name);
+        }
+        let name_utf8 = str_to_bytes(name);
+        let prefix_str = "";
+        let base_str = name;
+        if len(name_utf8) > 100 {
+            // Split into POSIX USTAR prefix (<= 155) + name (<= 100) at '/'
+            let split_at = -1;
+            let k = 0;
+            while k < len(name) {
+                if strcharcodeat(name, k) == 47 and k <= 155 and (len(name) - k - 1) <= 100 {
+                    split_at = k;
+                    break;
+                }
+                k = k + 1;
+            }
+            if split_at < 0 {
+                throw "tar_pack_entries: path exceeds POSIX USTAR 100+155 byte limit";
+            }
+            prefix_str = str_slice(name, 0, split_at);
+            base_str = str_slice(name, split_at + 1, len(name));
+        }
+
+        let payload = _input_to_bytes(ent.data);
+        let sz = len(payload);
+        let hdr = bytes_new(512);
+        _write_tar_str(hdr, 0, 100, base_str);
+        _write_tar_octal(hdr, 100, 8, 420); // 0644 mode
+        _write_tar_octal(hdr, 108, 8, 0);   // uid 0
+        _write_tar_octal(hdr, 116, 8, 0);   // gid 0
+        _write_tar_octal(hdr, 124, 12, sz); // size
+        _write_tar_octal(hdr, 136, 12, 0);  // mtime 0
+        bytes_set(hdr, 156, 48);            // typeflag '0' (regular file)
+        _write_tar_str(hdr, 257, 6, "ustar");
+        bytes_set(hdr, 263, 48);            // version "00"
+        bytes_set(hdr, 264, 48);
+        if len(prefix_str) > 0 {
+            _write_tar_str(hdr, 345, 155, prefix_str);
+        }
+
+        let csum = _tar_header_checksum(hdr, 0);
+        _write_tar_octal(hdr, 148, 7, csum);
+        bytes_set(hdr, 155, 32); // trailing space per POSIX ustar convention
+
+        _bw_push_slice(bw, hdr, 0, 512);
+        _bw_push_slice(bw, payload, 0, sz);
+        let rem = sz % 512;
+        if rem != 0 {
+            _bw_push_repeat(bw, 0, 512 - rem);
+        }
+        idx = idx + 1;
+    }
+
+    // Two 512-byte zero blocks marking end-of-archive
+    _bw_push_repeat(bw, 0, 1024);
+    return _bw_finish(bw);
+}
+
+fn _read_tar_cstring(b, off, max_w) {
+    let end_i = 0;
+    while end_i < max_w and b[off + end_i] != 0 {
+        end_i = end_i + 1;
+    }
+    return bytes_to_str(bytes_slice(b, off, off + end_i));
+}
+
+fn _is_zero_512(b, off) {
+    let i = 0;
+    while i < 512 {
+        if b[off + i] != 0 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn tar_unpack_bytes(tar_bytes, max_output_bytes = 67108864) {
+    let b = _input_to_bytes(tar_bytes);
+    let n = len(b);
+    if n < 512 or (n % 512) != 0 {
+        return _err_result("invalid_tar_alignment", "TAR archive size must be a positive multiple of 512 bytes");
+    }
+    let entries = [];
+    let total_out = 0;
+    let p = 0;
+    while p + 512 <= n {
+        if _is_zero_512(b, p) {
+            break;
+        }
+        let expected_sum = _parse_tar_octal(b, p + 148, 8);
+        let actual_sum = _tar_header_checksum(b, p);
+        if expected_sum < 0 or expected_sum != actual_sum {
+            return _err_result("tar_header_checksum_mismatch", "USTAR octal header checksum failed");
+        }
+        let base_name = _read_tar_cstring(b, p, 100);
+        let prefix_name = _read_tar_cstring(b, p + 345, 155);
+        let full_name = base_name;
+        if len(prefix_name) > 0 {
+            full_name = prefix_name + "/" + base_name;
+        }
+        if not _is_safe_archive_path(full_name) {
+            return map{
+                ok: false,
+                error: "tar_slip_path_traversal_detected",
+                path: full_name
+            };
+        }
+
+        let sz = _parse_tar_octal(b, p + 124, 12);
+        if sz < 0 {
+            return _err_result("invalid_tar_octal_size", "invalid octal size field");
+        }
+        if total_out + sz > max_output_bytes {
+            return _err_result("decompression_bomb_limit_exceeded", "TAR entry exceeds max_output_bytes");
+        }
+        let typeflag = b[p + 156];
+        p = p + 512;
+        if p + sz > n {
+            return _err_result("truncated_tar_entry", "TAR entry payload extends past archive EOF");
+        }
+        if typeflag == 0 or typeflag == 48 { // '\0' or '0' regular file
+            let data_b = bytes_slice(b, p, p + sz);
+            total_out = total_out + sz;
+            array_push(entries, map{
+                name: full_name,
+                data: data_b,
+                bytes: data_b,
+                size: sz
+            });
+        }
+        let padded = sz;
+        let rem = sz % 512;
+        if rem != 0 { padded = sz + (512 - rem); }
+        p = p + padded;
+    }
+
+    return map{
+        ok: true,
+        format: "tar",
+        entries: entries,
+        entry_count: len(entries),
+        total_bytes: total_out
+    };
+}
+
+export MODULE_VERSION, DEFAULT_MAX_OUTPUT_BYTES;
+export crc32_compute, adler32_compute, xxhash32_compute;
+export deflate_compress, deflate_decompress;
+export gzip_compress, gzip_decompress;
+export zlib_compress, zlib_decompress;
+export lz4_compress, lz4_decompress;
+export zstd_compress, zstd_decompress;
+export zip_pack_entries, zip_unpack_bytes;
+export tar_pack_entries, tar_unpack_bytes;

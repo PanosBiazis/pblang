@@ -1,0 +1,499 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+//
+// tools/vm_lab_hosted_report.sapp — Pure-PBLang Content-Bound Hosted VM Lab Reporter & Lane Rollup
+// Drop-in replacement for tools/vm_lab_hosted_report.py (record, verify, and multi-lane rollup).
+
+let OS = import("stdlib:os.sapp");
+let Sha256 = import("stdlib:sha256_pb.sapp");
+
+let FORMAT = "pblang.vm-lab.hosted-report.v2";
+let ROLLUP_FORMAT = "pblang.vm-lab.hosted-rollup.v2";
+
+fn _is_name(s) {
+    return type(s) == "string" and len(s) > 0 and regex_match(s, "^[a-z0-9_-]+$");
+}
+
+fn is_digest(val, allow_sha1 = false) {
+    if type(val) != "string" { return false; }
+    let n = len(val);
+    if n != 64 and not (allow_sha1 and n == 40) { return false; }
+    return regex_match(val, "^[0-9a-f]+$");
+}
+
+fn is_safe_relative_path(val) {
+    if type(val) != "string" or len(val) == 0 or str_contains(val, "\\") { return false; }
+    if str_starts_with(val, "/") or (len(val) >= 2 and str_slice(val, 1, 2) == ":") { return false; }
+    let parts = str_split(val, "/");
+    let i = 0;
+    while i < len(parts) {
+        if parts[i] == ".." { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn _sort_strs(arr) {
+    let out = [];
+    let i = 0;
+    while i < len(arr) { array_push(out, str(arr[i])); i = i + 1; }
+    let a = 0;
+    while a < len(out) {
+        let b = a + 1;
+        while b < len(out) {
+            if out[b] < out[a] { let t = out[a]; out[a] = out[b]; out[b] = t; }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    return out;
+}
+
+fn _json_str(s) {
+    let raw = str(s);
+    let out = "\"";
+    let hex = "0123456789abcdef";
+    let i = 0;
+    while i < len(raw) {
+        let ch = str_slice(raw, i, i + 1);
+        let c = strcharcodeat(raw, i);
+        if ch == "\"" { out = out + "\\\""; }
+        elif ch == "\\" { out = out + "\\\\"; }
+        elif c == 8 { out = out + "\\b"; }
+        elif c == 9 { out = out + "\\t"; }
+        elif c == 10 { out = out + "\\n"; }
+        elif c == 12 { out = out + "\\f"; }
+        elif c == 13 { out = out + "\\r"; }
+        elif c < 32 {
+            out = out + "\\u00" + str_slice(hex, bit_shr(c, 4), bit_shr(c, 4) + 1) + str_slice(hex, bit_and(c, 15), bit_and(c, 15) + 1);
+        } else { out = out + ch; }
+        i = i + 1;
+    }
+    return out + "\"";
+}
+
+fn canonical_json_stringify(val) {
+    if val == nil { return "null"; }
+    let t = type(val);
+    if t == "bool" { return if val { "true" } else { "false" }; }
+    if t == "number" { return str(val); }
+    if t == "string" { return _json_str(val); }
+    if t == "array" {
+        let out = "[";
+        let i = 0;
+        while i < len(val) {
+            if i > 0 { out = out + ","; }
+            out = out + canonical_json_stringify(val[i]);
+            i = i + 1;
+        }
+        return out + "]";
+    }
+    if t == "map" {
+        let ks = _sort_strs(map_keys(val));
+        let out = "{";
+        let i = 0;
+        while i < len(ks) {
+            if i > 0 { out = out + ","; }
+            out = out + _json_str(ks[i]) + ":" + canonical_json_stringify(val[ks[i]]);
+            i = i + 1;
+        }
+        return out + "}";
+    }
+    return _json_str(str(val));
+}
+
+fn canonical_sha256(payload) {
+    return sha256(canonical_json_stringify(payload));
+}
+
+fn sha256_file(path) {
+    let b = fs_read_bytes(path);
+    return sha256(bytes_to_str(b));
+}
+
+fn _is_regular_file(path) {
+    if (try fs_exists(path) catch false) != true { return false; }
+    let dir_probe = try fs_listdir(path) catch nil;
+    if type(dir_probe) == "array" { return false; }
+    let bytes = try fs_read_bytes(path) catch nil;
+    return type(bytes) == "array";
+}
+
+fn source_tree_sha256() {
+    let res = proc_spawn_wait("git", ["ls-files", "-s", "-z"]);
+    if res.exit_code != 0 { throw "git ls-files failed"; }
+    return sha256(res.stdout);
+}
+
+fn source_revision_head() {
+    let res = proc_spawn_wait("git", ["rev-parse", "HEAD"]);
+    if res.exit_code != 0 { throw "git rev-parse HEAD failed"; }
+    return str_trim(res.stdout);
+}
+
+fn _parse_named(val, sep = "=") {
+    let idx = str_index_of(val, sep);
+    if idx <= 0 { throw "invalid named value: " + val; }
+    let nm = str_slice(val, 0, idx);
+    if not _is_name(nm) { throw "invalid named value: " + val; }
+    return [nm, str_slice(val, idx + len(sep), len(val))];
+}
+
+fn _parse_bool_strict(val) {
+    if val == "true" or val == true { return true; }
+    if val == "false" or val == false { return false; }
+    throw "expected true or false";
+}
+
+fn _exact_keys(m, expected) {
+    if type(m) != "map" { return false; }
+    let ks = map_keys(m);
+    if len(ks) != len(expected) { return false; }
+    let i = 0;
+    while i < len(expected) {
+        if not map_has(m, expected[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn valid_payload(payload) {
+    let req = ["format", "target", "evidence", "source_revision", "source_tree_sha256",
+               "runner", "checks", "artifacts", "metadata", "cleanup_required", "cleanup_verified", "ok"];
+    if not _exact_keys(payload, req) or payload.format != FORMAT { return false; }
+    if not _is_name(payload.target) or not _is_name(payload.evidence) { return false; }
+    if not is_digest(payload.source_revision, true) or not is_digest(payload.source_tree_sha256, false) { return false; }
+
+    let r = payload.runner;
+    if not _exact_keys(r, ["os", "arch", "image"]) { return false; }
+    if type(r.os) != "string" or r.os == "" or type(r.arch) != "string" or r.arch == "" or type(r.image) != "string" or r.image == "" {
+        return false;
+    }
+
+    let checks = payload.checks;
+    if type(checks) != "array" or len(checks) == 0 { return false; }
+    let seen_c = map{};
+    let ci = 0;
+    while ci < len(checks) {
+        let it = checks[ci];
+        if not _exact_keys(it, ["name", "status", "ok", "log_bytes", "log_sha256"]) { return false; }
+        if not _is_name(it.name) or map_has(seen_c, it.name) { return false; }
+        seen_c[it.name] = true;
+        if type(it.status) != "number" or num_floor(it.status) != it.status { return false; }
+        if type(it.ok) != "bool" or it.ok != (it.status == 0) { return false; }
+        if type(it.log_bytes) != "number" or num_floor(it.log_bytes) != it.log_bytes or it.log_bytes < 0 { return false; }
+        if not is_digest(it.log_sha256, false) { return false; }
+        ci = ci + 1;
+    }
+
+    let arts = payload.artifacts;
+    if type(arts) != "array" or len(arts) == 0 { return false; }
+    let seen_a = map{};
+    let ai = 0;
+    while ai < len(arts) {
+        let it = arts[ai];
+        if not _exact_keys(it, ["name", "path", "present", "bytes", "sha256"]) { return false; }
+        if not _is_name(it.name) or map_has(seen_a, it.name) { return false; }
+        seen_a[it.name] = true;
+        if type(it.present) != "bool" or it.present != true or not is_safe_relative_path(it.path) { return false; }
+        if type(it.bytes) != "number" or num_floor(it.bytes) != it.bytes or it.bytes < 0 { return false; }
+        if not is_digest(it.sha256, false) { return false; }
+        ai = ai + 1;
+    }
+
+    let meta = payload.metadata;
+    if type(meta) != "map" { return false; }
+    let mks = map_keys(meta);
+    let mi = 0;
+    while mi < len(mks) {
+        if not _is_name(mks[mi]) or type(meta[mks[mi]]) != "string" { return false; }
+        mi = mi + 1;
+    }
+    if type(payload.cleanup_required) != "bool" or type(payload.cleanup_verified) != "bool" or type(payload.ok) != "bool" {
+        return false;
+    }
+    let all_checks_ok = true;
+    ci = 0;
+    while ci < len(checks) { if checks[ci].ok != true { all_checks_ok = false; } ci = ci + 1; }
+    let computed_ok = all_checks_ok and (not payload.cleanup_required or payload.cleanup_verified);
+    return payload.ok == true and computed_ok;
+}
+
+fn record_report(spec) {
+    let checks = [];
+    let raw_checks = if map_has(spec, "checks") { spec.checks } else { [] };
+    let i = 0;
+    while i < len(raw_checks) {
+        let pair = _parse_named(str(raw_checks[i]), "=");
+        let rest = pair[1];
+        let cidx = str_index_of(rest, ":");
+        if cidx < 0 { throw "check must be NAME=STATUS:LOG: " + str(raw_checks[i]); }
+        let st_num = parse_number(str_slice(rest, 0, cidx));
+        if st_num == nil or num_floor(st_num) != st_num { throw "invalid check status integer"; }
+        let log_p = str_slice(rest, cidx + 1, len(rest));
+        let has_log = _is_regular_file(log_p);
+        let lbytes = if has_log { fs_read_bytes(log_p) } else { nil };
+        array_push(checks, map{
+            name: pair[0], status: st_num, ok: st_num == 0,
+            log_bytes: if has_log { len(lbytes) } else { nil },
+            log_sha256: if has_log { sha256(bytes_to_str(lbytes)) } else { nil }
+        });
+        i = i + 1;
+    }
+
+    let artifacts = [];
+    let raw_arts = if map_has(spec, "artifacts") { spec.artifacts } else { [] };
+    i = 0;
+    while i < len(raw_arts) {
+        let pair = _parse_named(str(raw_arts[i]), "=");
+        let norm_p = str_replace_all(pair[1], "\\", "/");
+        if str_starts_with(norm_p, "./") { norm_p = str_slice(norm_p, 2, len(norm_p)); }
+        let exists = _is_regular_file(pair[1]);
+        let abytes = if exists { fs_read_bytes(pair[1]) } else { nil };
+        array_push(artifacts, map{
+            name: pair[0], path: norm_p, present: exists,
+            bytes: if exists { len(abytes) } else { nil },
+            sha256: if exists { sha256(bytes_to_str(abytes)) } else { nil }
+        });
+        i = i + 1;
+    }
+
+    let metadata = map{};
+    let raw_meta = if map_has(spec, "metadata") { spec.metadata } else { [] };
+    i = 0;
+    while i < len(raw_meta) {
+        let pair = _parse_named(str(raw_meta[i]), "=");
+        metadata[pair[0]] = pair[1];
+        i = i + 1;
+    }
+
+    let c_req = _parse_bool_strict(if map_has(spec, "cleanup_required") { spec.cleanup_required } else { "false" });
+    let c_ver = _parse_bool_strict(if map_has(spec, "cleanup_verified") { spec.cleanup_verified } else { "true" });
+
+    let ok_flag = len(checks) > 0 and len(artifacts) > 0 and (not c_req or c_ver);
+    i = 0;
+    while i < len(checks) {
+        if not checks[i].ok or checks[i].log_sha256 == nil { ok_flag = false; }
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(artifacts) {
+        if not artifacts[i].present { ok_flag = false; }
+        i = i + 1;
+    }
+
+    let rev = if map_has(spec, "source_revision") and spec.source_revision != nil { spec.source_revision } else { source_revision_head() };
+    let tree = if map_has(spec, "source_tree_sha256") and spec.source_tree_sha256 != nil { spec.source_tree_sha256 } else { source_tree_sha256() };
+    let r_os = env_get("RUNNER_OS"); if r_os == nil or r_os == "" { r_os = platform(); }
+    let r_arch = env_get("RUNNER_ARCH"); if r_arch == nil or r_arch == "" { r_arch = "unknown"; }
+    let r_img = env_get("ImageOS"); if r_img == nil or r_img == "" { r_img = "unknown"; }
+
+    let payload = map{
+        format: FORMAT, target: str(spec.target), evidence: str(spec.evidence),
+        source_revision: rev, source_tree_sha256: tree,
+        runner: map{ os: r_os, arch: r_arch, image: r_img },
+        checks: checks, artifacts: artifacts, metadata: metadata,
+        cleanup_required: c_req, cleanup_verified: c_ver, ok: ok_flag
+    };
+    payload.report_sha256 = canonical_sha256(payload);
+    if map_has(spec, "output") and spec.output != nil and str(spec.output) != "" {
+        let out_p = str(spec.output);
+        let parent_d = path_dirname(out_p);
+        if parent_d != "" and parent_d != "." { fs_mkdirs(parent_d); }
+        fs_write(out_p, canonical_json_stringify(payload) + "\n");
+    }
+    return payload;
+}
+
+fn verify_report_file(report_path) {
+    let raw = fs_read(report_path);
+    let payload = json_parse(raw);
+    if type(payload) != "map" or not map_has(payload, "report_sha256") { return false; }
+    let expected = payload.report_sha256;
+    map_remove(payload, "report_sha256");
+    let actual = canonical_sha256(payload);
+    return is_digest(expected, false) and constant_time_eq(expected, actual) and valid_payload(payload);
+}
+
+fn _collect_json_files(dir_path, acc) {
+    let entries = try fs_listdir(dir_path) catch nil;
+    if type(entries) != "array" { return; }
+    let sorted = _sort_strs(entries);
+    let i = 0;
+    while i < len(sorted) {
+        let full = dir_path + "/" + sorted[i];
+        let sub = try fs_listdir(full) catch nil;
+        if type(sub) == "array" { _collect_json_files(full, acc); }
+        elif str_ends_with(sorted[i], ".json") { array_push(acc, full); }
+        i = i + 1;
+    }
+}
+
+fn render_rollup_markdown(summary) {
+    let md = "# Hosted VM Lab Evidence Rollup\n\n"
+        + "- **Status**: `" + str_upper(summary.status) + "`\n"
+        + "- **Lanes Verified**: `" + str(summary.passed_lanes) + " / " + str(summary.total_lanes) + "`\n"
+        + "- **Revision Consistent**: `" + str(summary.revision_consistent) + "`\n"
+        + "- **Rollup SHA-256**: `" + summary.rollup_sha256 + "`\n\n"
+        + "| Target | Runner | Evidence | Checks | Artifacts | Digest Valid | Status |\n"
+        + "| :--- | :--- | :--- | :---: | :---: | :---: | :---: |\n";
+    let i = 0;
+    while i < len(summary.lanes) {
+        let ln = summary.lanes[i];
+        md = md + "| `" + ln.target + "` | `" + ln.runner_os + "/" + ln.runner_arch + "` | `"
+            + ln.evidence + "` | " + str(ln.passed_checks) + "/" + str(ln.total_checks)
+            + " | " + str(ln.total_artifacts) + " | " + (if ln.verified { "YES" } else { "NO" })
+            + " | " + (if ln.verified { "PASS" } else { "FAIL" }) + " |\n";
+        i = i + 1;
+    }
+    return md;
+}
+
+fn aggregate_lanes_dir(lanes_dir, out_json = nil, out_md = nil) {
+    let files = [];
+    _collect_json_files(lanes_dir, files);
+    let lanes = [];
+    let passed = 0;
+    let first_rev = "";
+    let rev_consistent = true;
+    let i = 0;
+    while i < len(files) {
+        let fp = files[i];
+        if out_json == nil or fp != out_json {
+            let valid = try verify_report_file(fp) catch false;
+            let obj = try json_parse(fs_read(fp)) catch map{};
+            let rev = if type(obj) == "map" and map_has(obj, "source_revision") { str(obj.source_revision) } else { "unknown" };
+            if first_rev == "" { first_rev = rev; } elif rev != first_rev { rev_consistent = false; }
+            let c_arr = if type(obj) == "map" and map_has(obj, "checks") and type(obj.checks) == "array" { obj.checks } else { [] };
+            let a_arr = if type(obj) == "map" and map_has(obj, "artifacts") and type(obj.artifacts) == "array" { obj.artifacts } else { [] };
+            let c_pass = 0;
+            let ci = 0;
+            while ci < len(c_arr) { if type(c_arr[ci]) == "map" and c_arr[ci].ok == true { c_pass = c_pass + 1; } ci = ci + 1; }
+            let r_map = if type(obj) == "map" and map_has(obj, "runner") and type(obj.runner) == "map" { obj.runner } else { map{ os: "unknown", arch: "unknown" } };
+            if valid { passed = passed + 1; }
+            array_push(lanes, map{
+                file: path_basename(fp),
+                target: if type(obj) == "map" and map_has(obj, "target") { str(obj.target) } else { path_basename(fp) },
+                evidence: if type(obj) == "map" and map_has(obj, "evidence") { str(obj.evidence) } else { "unknown" },
+                runner_os: str(r_map.os), runner_arch: str(r_map.arch),
+                source_revision: rev, total_checks: len(c_arr), passed_checks: c_pass,
+                total_artifacts: len(a_arr), verified: valid
+            });
+        }
+        i = i + 1;
+    }
+    let all_ok = len(lanes) > 0 and passed == len(lanes) and rev_consistent;
+    let summary = map{
+        format: ROLLUP_FORMAT, ok: all_ok,
+        status: if len(lanes) == 0 { "empty" } elif all_ok { "pass" } else { "fail" },
+        total_lanes: len(lanes), passed_lanes: passed, failed_lanes: len(lanes) - passed,
+        revision_consistent: rev_consistent, source_revision: first_rev, lanes: lanes
+    };
+    summary.rollup_sha256 = canonical_sha256(summary);
+    let md_text = render_rollup_markdown(summary);
+    if out_json != nil and out_json != "" {
+        let jd = path_dirname(out_json); if jd != "" and jd != "." { fs_mkdirs(jd); }
+        fs_write(out_json, canonical_json_stringify(summary) + "\n");
+    }
+    if out_md != nil and out_md != "" {
+        let mdd = path_dirname(out_md); if mdd != "" and mdd != "." { fs_mkdirs(mdd); }
+        fs_write(out_md, md_text);
+    }
+    summary.markdown = md_text;
+    return summary;
+}
+
+fn run_cli(argv) {
+    try {
+        if len(argv) == 0 { throw "missing command (record | verify | rollup)"; }
+        let cmd = str(argv[0]);
+        let idx = 1;
+        if str_starts_with(cmd, "--") { cmd = "rollup"; idx = 0; }
+        if cmd == "verify" {
+            if len(argv) != 2 { throw "verify expects exactly 1 report path"; }
+            return if verify_report_file(str(argv[1])) { 0 } else { 1 };
+        }
+        let target = ""; let evidence = ""; let output = "";
+        let checks = []; let artifacts = []; let metadata = [];
+        let c_req = "false"; let c_ver = "true";
+        let lanes_dir = ""; let out_json = ""; let out_md = "";
+        while idx < len(argv) {
+            let tok = str(argv[idx]);
+            let eq = str_index_of(tok, "=");
+            let k = if eq > 0 { str_slice(tok, 0, eq) } else { tok };
+            let v = "";
+            if eq > 0 { v = str_slice(tok, eq + 1, len(tok)); idx = idx + 1; }
+            else {
+                if idx + 1 >= len(argv) { throw "missing value for " + k; }
+                v = str(argv[idx + 1]); idx = idx + 2;
+            }
+            if k == "--target" { target = v; }
+            elif k == "--evidence" { evidence = v; }
+            elif k == "--output" { output = v; }
+            elif k == "--check" { array_push(checks, v); }
+            elif k == "--artifact" { array_push(artifacts, v); }
+            elif k == "--metadata" { array_push(metadata, v); }
+            elif k == "--cleanup-required" { c_req = v; }
+            elif k == "--cleanup-verified" { c_ver = v; }
+            elif k == "--lanes-dir" { lanes_dir = v; }
+            elif k == "--out-json" { out_json = v; }
+            elif k == "--out-md" { out_md = v; }
+            else { throw "unknown argument: " + k; }
+        }
+        if cmd == "record" {
+            if target == "" or evidence == "" or output == "" { throw "--target, --evidence, and --output are required"; }
+            record_report(map{ target: target, evidence: evidence, output: output, checks: checks, artifacts: artifacts, metadata: metadata, cleanup_required: c_req, cleanup_verified: c_ver });
+            return 0;
+        }
+        if cmd == "rollup" or cmd == "aggregate" or cmd == "summary" {
+            if lanes_dir == "" { throw "--lanes-dir is required for rollup"; }
+            let res = aggregate_lanes_dir(lanes_dir, out_json, out_md);
+            return if res.ok { 0 } else { 1 };
+        }
+        throw "unknown command: " + cmd;
+    } catch err {
+        eprintln("vm-lab-report: " + str(err));
+        return 2;
+    }
+}
+
+fn _script_cli_args(raw) {
+    let n = len(raw); let i = 0; let seen = false;
+    while i < n {
+        let a = str(raw[i]); i = i + 1;
+        if str_ends_with(a, ".sapp") or str_ends_with(a, ".pbck") { seen = true; break; }
+    }
+    if not seen { return raw; }
+    while i < n {
+        let a = str(raw[i]);
+        if a == "--" { i = i + 1; break; }
+        if str_starts_with(a, "--allow") or str_starts_with(a, "--deny") { i = i + 1; continue; }
+        break;
+    }
+    let out = [];
+    while i < n { array_push(out, raw[i]); i = i + 1; }
+    return out;
+}
+
+fn _maybe_auto_cli() {
+    let raw = args();
+    if len(raw) == 0 { return; }
+    let i = 0; let script = "";
+    while i < len(raw) {
+        let a = str(raw[i]);
+        if str_ends_with(a, ".sapp") or str_ends_with(a, ".pbck") { script = a; break; }
+        i = i + 1;
+    }
+    if script != "" {
+        if str_ends_with(script, "vm_lab_hosted_report.sapp") or str_ends_with(script, "vm_lab_hosted_report.pbck") {
+            os_exit(run_cli(_script_cli_args(raw)));
+        }
+        return;
+    }
+    os_exit(run_cli(raw));
+}
+
+_maybe_auto_cli();
+
+export FORMAT, ROLLUP_FORMAT, is_digest, is_safe_relative_path;
+export canonical_json_stringify, canonical_sha256, sha256_file, valid_payload;
+export record_report, verify_report_file, aggregate_lanes_dir, render_rollup_markdown, run_cli;

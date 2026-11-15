@@ -1,0 +1,1541 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+// stdlib/concurrency/green_fibers_doh_sandbox.sapp — Sovereign 100% Pure-PBLang
+// Cooperative M:N Green Fiber Scheduler + Chase-Lev Work-Stealing Deques + Async Channels,
+// RFC 8484 Binary DNS-over-HTTPS (DoH) Wire Codec + IPv6 Parser, & OS Sandbox Policy Compiler.
+
+let MODULE_VERSION = "5.0.0";
+
+// Linux Landlock ABI v1..v4 Access Bitmasks
+let LANDLOCK_ACCESS_FS_EXECUTE = 1;
+let LANDLOCK_ACCESS_FS_WRITE_FILE = 2;
+let LANDLOCK_ACCESS_FS_READ_FILE = 4;
+let LANDLOCK_ACCESS_FS_READ_DIR = 8;
+let LANDLOCK_ACCESS_FS_REMOVE_DIR = 16;
+let LANDLOCK_ACCESS_FS_REMOVE_FILE = 32;
+let LANDLOCK_ACCESS_FS_MAKE_CHAR = 64;
+let LANDLOCK_ACCESS_FS_MAKE_DIR = 128;
+let LANDLOCK_ACCESS_FS_MAKE_REG = 256;
+let LANDLOCK_ACCESS_FS_MAKE_SOCK = 512;
+let LANDLOCK_ACCESS_FS_MAKE_FIFO = 1024;
+let LANDLOCK_ACCESS_FS_MAKE_BLOCK = 2048;
+let LANDLOCK_ACCESS_FS_MAKE_SYM = 4096;
+let LANDLOCK_ACCESS_FS_REFER = 8192;       // Landlock ABI v2
+let LANDLOCK_ACCESS_FS_TRUNCATE = 16384;   // Landlock ABI v3
+let LANDLOCK_ACCESS_NET_BIND_TCP = 1;      // Landlock ABI v4
+let LANDLOCK_ACCESS_NET_CONNECT_TCP = 2;   // Landlock ABI v4
+
+// Classic BPF / seccomp-bpf Opcodes & Return Constants
+let BPF_LD_W_ABS = 32;                     // 0x20: BPF_LD | BPF_W | BPF_ABS
+let BPF_JMP_JEQ_K = 21;                    // 0x15: BPF_JMP | BPF_JEQ | BPF_K
+let BPF_JMP_JGE_K = 53;                    // 0x35: BPF_JMP | BPF_JGE | BPF_K
+let BPF_RET_K = 6;                         // 0x06: BPF_RET | BPF_K
+let AUDIT_ARCH_X86_64 = 3221225534;        // 0xC000003E
+let SECCOMP_RET_KILL_PROCESS = 2147483648; // 0x80000000
+let SECCOMP_RET_ERRNO_EPERM = 327681;      // 0x00050001 (SECCOMP_RET_ERRNO | 1)
+let SECCOMP_RET_ALLOW = 2147418112;        // 0x7FFF0000
+
+// Windows JobObject Restriction Flags
+let JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 8;
+let JOB_OBJECT_LIMIT_JOB_MEMORY = 512;
+let JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 1024;
+let JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 8192;
+let JOB_OBJECT_UILIMIT_ALL = 255;
+
+// IPC Binary Framing Magic ("PBIP" = 0x50424950)
+let IPC_FRAME_MAGIC = 1346521424;
+let TIMER_WHEEL_SLOTS = 64;
+
+// ── Chase-Lev Style Circular Work-Stealing Deque (O(1) Push / Pop / Steal) ───
+
+fn _deque_new(initial_pow2 = 64) {
+    let cap = 16;
+    while cap < initial_pow2 { cap = cap * 2; }
+    let buf = [];
+    let i = 0;
+    while i < cap { array_push(buf, nil); i = i + 1; }
+    return map{
+        buf: buf,
+        cap: cap,
+        mask: cap - 1,
+        top: 0,
+        bottom: 0
+    };
+}
+
+fn _deque_size(dq) {
+    return dq.bottom - dq.top;
+}
+
+fn _deque_grow(dq) {
+    let old_cap = dq.cap;
+    let new_cap = old_cap * 2;
+    let new_mask = new_cap - 1;
+    let new_buf = [];
+    let i = 0;
+    while i < new_cap { array_push(new_buf, nil); i = i + 1; }
+    let idx = dq.top;
+    while idx < dq.bottom {
+        new_buf[bit_and(idx, new_mask)] = dq.buf[bit_and(idx, dq.mask)];
+        idx = idx + 1;
+    }
+    dq.buf = new_buf;
+    dq.cap = new_cap;
+    dq.mask = new_mask;
+}
+
+fn _deque_push_bottom(dq, item) {
+    if (dq.bottom - dq.top) >= dq.cap {
+        _deque_grow(dq);
+    }
+    dq.buf[bit_and(dq.bottom, dq.mask)] = item;
+    dq.bottom = dq.bottom + 1;
+}
+
+fn _deque_pop_bottom(dq) {
+    // Local owner pops LIFO from bottom (cache-warm locality)
+    if dq.bottom <= dq.top { return nil; }
+    dq.bottom = dq.bottom - 1;
+    let idx = bit_and(dq.bottom, dq.mask);
+    let item = dq.buf[idx];
+    dq.buf[idx] = nil;
+    return item;
+}
+
+fn _deque_steal_top(dq) {
+    // Remote thief steals FIFO from top (oldest / coarsest task!)
+    if dq.top >= dq.bottom { return nil; }
+    let idx = bit_and(dq.top, dq.mask);
+    let item = dq.buf[idx];
+    dq.buf[idx] = nil;
+    dq.top = dq.top + 1;
+    return item;
+}
+
+fn _deque_push_front_fair(dq, item) {
+    // Re-queues yielded fiber at top so waiting sibling fibers run fairly (FIFO round-robin!)
+    if (dq.bottom - dq.top) >= dq.cap {
+        _deque_grow(dq);
+    }
+    dq.top = dq.top - 1;
+    dq.buf[bit_and(dq.top, dq.mask)] = item;
+}
+
+// ── Cooperative M:N Green Fiber Scheduler, Scopes, Timer Wheel & Channels ────
+
+fn _opt_val(m, k, fallback) {
+    if m == nil or not is_map(m) { return fallback; }
+    if not map_has(m, k) or m[k] == nil { return fallback; }
+    return m[k];
+}
+
+fn fiber_scheduler_new(num_workers = 4, opts = nil) {
+    let w_cnt = num_workers;
+    if type(w_cnt) != "number" or w_cnt < 1 { w_cnt = 1; }
+    if w_cnt > 128 { w_cnt = 128; }
+
+    let workers = [];
+    let w = 0;
+    while w < w_cnt {
+        array_push(workers, map{
+            id: w,
+            hi_deque: _deque_new(32),
+            norm_deque: _deque_new(128),
+            lo_deque: _deque_new(32),
+            executed_steps: 0,
+            stolen_tasks: 0
+        });
+        w = w + 1;
+    }
+
+    let wheel = [];
+    let s = 0;
+    while s < TIMER_WHEEL_SLOTS { array_push(wheel, []); s = s + 1; }
+
+    let root_scope = map{
+        id: 0,
+        parent_id: -1,
+        cancelled: false,
+        reason: "",
+        children: []
+    };
+
+    return map{
+        kind: "pblang.fiber.scheduler",
+        num_workers: w_cnt,
+        workers: workers,
+        next_fiber_id: 1,
+        next_rr_worker: 0,
+        next_scope_id: 1,
+        scopes: map{ "0": root_scope },
+        fibers: map{},
+        active_count: 0,
+        completed_count: 0,
+        cancelled_count: 0,
+        total_steps: 0,
+        work_steals: 0,
+        tick: 0,
+        timer_wheel: wheel,
+        sleeping_count: 0,
+        aging_quantum: _opt_val(opts, "aging_quantum", 8)
+    };
+}
+
+fn fiber_scope_new(sched, parent_scope_id = 0) {
+    let sid = sched.next_scope_id;
+    sched.next_scope_id = sid + 1;
+    let p_key = str(parent_scope_id);
+    let parent_cancelled = false;
+    let parent_reason = "";
+    if map_has(sched.scopes, p_key) {
+        let p_sc = sched.scopes[p_key];
+        array_push(p_sc.children, sid);
+        parent_cancelled = p_sc.cancelled;
+        parent_reason = p_sc.reason;
+    }
+    sched.scopes[str(sid)] = map{
+        id: sid,
+        parent_id: parent_scope_id,
+        cancelled: parent_cancelled,
+        reason: parent_reason,
+        children: []
+    };
+    return sid;
+}
+
+fn fiber_scope_cancel(sched, scope_id, reason = "scope_cancelled") {
+    // Iterative tree cascade across child structured-concurrency scopes
+    let stk = [scope_id];
+    while len(stk) > 0 {
+        let cur_id = stk[len(stk) - 1];
+        stk = slice(stk, 0, len(stk) - 1);
+        let k = str(cur_id);
+        if map_has(sched.scopes, k) {
+            let sc = sched.scopes[k];
+            if not sc.cancelled {
+                sc.cancelled = true;
+                sc.reason = str(reason);
+            }
+            let ci = 0;
+            while ci < len(sc.children) {
+                array_push(stk, sc.children[ci]);
+                ci = ci + 1;
+            }
+        }
+    }
+    return true;
+}
+
+fn _is_scope_cancelled(sched, scope_id) {
+    let k = str(scope_id);
+    if not map_has(sched.scopes, k) { return false; }
+    return sched.scopes[k].cancelled;
+}
+
+fn fiber_yield_step(next_state = nil, sleep_ticks = 0) {
+    return map{
+        _fiber_ctl: "yield",
+        state: next_state,
+        sleep_ticks: sleep_ticks
+    };
+}
+
+fn _enqueue_fiber_on_worker(sched, w_idx, fib, at_front = false) {
+    let wk = sched.workers[w_idx];
+    let dq = wk.norm_deque;
+    if fib.priority == "high" or fib.priority == 0 { dq = wk.hi_deque; }
+    elif fib.priority == "low" or fib.priority == 2 { dq = wk.lo_deque; }
+    if at_front {
+        _deque_push_front_fair(dq, fib);
+    } else {
+        _deque_push_bottom(dq, fib);
+    }
+}
+
+fn _schedule_timer_wakeup(sched, fib, delay_ticks) {
+    let d = delay_ticks;
+    if d < 1 { d = 1; }
+    let wake_at = sched.tick + d;
+    fib.wake_tick = wake_at;
+    fib.status = "sleeping";
+    let slot = bit_and(wake_at, TIMER_WHEEL_SLOTS - 1);
+    array_push(sched.timer_wheel[slot], fib);
+    sched.sleeping_count = sched.sleeping_count + 1;
+}
+
+fn fiber_spawn_task(sched, step_fn, initial_state = nil, opts = nil) {
+    if type(step_fn) != "fn" {
+        throw "green_fibers: fiber_spawn_task requires a function";
+    }
+    let fid = sched.next_fiber_id;
+    sched.next_fiber_id = fid + 1;
+
+    let prio = _opt_val(opts, "priority", "normal");
+    let scope_id = _opt_val(opts, "scope_id", 0);
+    let w_hint = _opt_val(opts, "worker", -1);
+    if w_hint < 0 or w_hint >= sched.num_workers {
+        w_hint = sched.next_rr_worker;
+        sched.next_rr_worker = (w_hint + 1) % sched.num_workers;
+    }
+
+    let fib = map{
+        id: fid,
+        step_fn: step_fn,
+        state: initial_state,
+        priority: prio,
+        scope_id: scope_id,
+        home_worker: w_hint,
+        steps: 0,
+        status: "runnable",
+        wake_tick: 0,
+        result: nil
+    };
+
+    sched.fibers[str(fid)] = fib;
+    sched.active_count = sched.active_count + 1;
+    _enqueue_fiber_on_worker(sched, w_hint, fib, false);
+    return fid;
+}
+
+// ── Bounded & Unbounded Async Fiber Channels ─────────────────────────────────
+
+fn fiber_chan_new(capacity = 64, sched = nil) {
+    // Supports bounded (capacity > 0) and unbounded (capacity <= 0) async channels
+    let cap = capacity;
+    if is_map(capacity) and map_has(capacity, "kind") and capacity.kind == "pblang.fiber.scheduler" {
+        // Handle (sched, capacity) argument order gracefully too!
+        let actual_sched = capacity;
+        cap = if sched == nil { 64 } else { sched };
+        sched = actual_sched;
+    }
+    return map{
+        kind: "pblang.fiber.channel",
+        capacity: cap,
+        queue: _deque_new(if cap > 0 and cap <= 1024 { cap } else { 64 }),
+        closed: false,
+        sched: sched,
+        recv_waiters: _deque_new(16),
+        send_waiters: _deque_new(16),
+        sent_count: 0,
+        recv_count: 0
+    };
+}
+
+fn fiber_chan_close(ch) {
+    ch.closed = true;
+    // Wake any parked receivers with closed notification
+    if ch.sched != nil {
+        while _deque_size(ch.recv_waiters) > 0 {
+            let waiter = _deque_steal_top(ch.recv_waiters);
+            if waiter != nil and waiter.status == "parked" {
+                waiter.status = "runnable";
+                _enqueue_fiber_on_worker(ch.sched, waiter.home_worker, waiter, false);
+            }
+        }
+    }
+    return true;
+}
+
+fn fiber_chan_send(ch, value, sender_fiber = nil) {
+    if ch.closed {
+        return map{ ok: false, closed: true, error: "channel_closed" };
+    }
+    let cur_sz = _deque_size(ch.queue);
+    if ch.capacity > 0 and cur_sz >= ch.capacity {
+        if sender_fiber != nil {
+            sender_fiber.status = "parked";
+            _deque_push_bottom(ch.send_waiters, map{ fiber: sender_fiber, value: value });
+        }
+        return map{ ok: false, would_block: true, parked: sender_fiber != nil };
+    }
+    _deque_push_bottom(ch.queue, value);
+    ch.sent_count = ch.sent_count + 1;
+
+    // Wake oldest parked receiver if present!
+    if ch.sched != nil and _deque_size(ch.recv_waiters) > 0 {
+        let r_fib = _deque_steal_top(ch.recv_waiters);
+        if r_fib != nil and r_fib.status == "parked" {
+            r_fib.status = "runnable";
+            _enqueue_fiber_on_worker(ch.sched, r_fib.home_worker, r_fib, false);
+        }
+    }
+    return map{ ok: true, size: _deque_size(ch.queue) };
+}
+
+fn fiber_chan_recv(ch, receiver_fiber = nil) {
+    if _deque_size(ch.queue) > 0 {
+        let val = _deque_steal_top(ch.queue);
+        ch.recv_count = ch.recv_count + 1;
+
+        // If a parked sender was waiting for bounded space, promote its message now!
+        if _deque_size(ch.send_waiters) > 0 {
+            let sw = _deque_steal_top(ch.send_waiters);
+            if sw != nil {
+                _deque_push_bottom(ch.queue, sw.value);
+                ch.sent_count = ch.sent_count + 1;
+                if ch.sched != nil and sw.fiber != nil and sw.fiber.status == "parked" {
+                    sw.fiber.status = "runnable";
+                    _enqueue_fiber_on_worker(ch.sched, sw.fiber.home_worker, sw.fiber, false);
+                }
+            }
+        }
+        return map{ ok: true, value: val, closed: false };
+    }
+    if ch.closed {
+        return map{ ok: false, value: nil, closed: true };
+    }
+    if receiver_fiber != nil {
+        receiver_fiber.status = "parked";
+        _deque_push_bottom(ch.recv_waiters, receiver_fiber);
+    }
+    return map{ ok: false, value: nil, would_block: true, parked: receiver_fiber != nil };
+}
+
+// ── Work-Stealing Execution Loop (`fiber_run_until_complete`) ────────────────
+
+fn _pop_local_worker_task(wk, tick, aging_q) {
+    // Deterministic starvation-free priority: every `aging_q` steps, check low/normal before high!
+    if aging_q > 0 and (tick % aging_q) == (aging_q - 1) {
+        if _deque_size(wk.lo_deque) > 0 { return _deque_pop_bottom(wk.lo_deque); }
+        if _deque_size(wk.norm_deque) > 0 { return _deque_pop_bottom(wk.norm_deque); }
+    }
+    if _deque_size(wk.hi_deque) > 0 { return _deque_pop_bottom(wk.hi_deque); }
+    if _deque_size(wk.norm_deque) > 0 { return _deque_pop_bottom(wk.norm_deque); }
+    if _deque_size(wk.lo_deque) > 0 { return _deque_pop_bottom(wk.lo_deque); }
+    return nil;
+}
+
+fn _steal_from_peers(sched, thief_id) {
+    // Scan peer workers starting at (thief_id + 1) and steal from busiest peer's deque top!
+    let nw = sched.num_workers;
+    let best_victim = -1;
+    let best_load = 0;
+    let offset = 1;
+    while offset < nw {
+        let cand_id = (thief_id + offset) % nw;
+        let cand_wk = sched.workers[cand_id];
+        let load = _deque_size(cand_wk.hi_deque) + _deque_size(cand_wk.norm_deque) + _deque_size(cand_wk.lo_deque);
+        if load > best_load {
+            best_load = load;
+            best_victim = cand_id;
+        }
+        offset = offset + 1;
+    }
+    if best_victim < 0 { return nil; }
+    let vic = sched.workers[best_victim];
+    let stolen = _deque_steal_top(vic.hi_deque);
+    if stolen == nil { stolen = _deque_steal_top(vic.norm_deque); }
+    if stolen == nil { stolen = _deque_steal_top(vic.lo_deque); }
+    if stolen != nil {
+        stolen.home_worker = thief_id;
+        sched.workers[thief_id].stolen_tasks = sched.workers[thief_id].stolen_tasks + 1;
+        sched.work_steals = sched.work_steals + 1;
+    }
+    return stolen;
+}
+
+fn _advance_timer_wheel(sched) {
+    if sched.sleeping_count <= 0 { return; }
+    let slot = bit_and(sched.tick, TIMER_WHEEL_SLOTS - 1);
+    let bucket = sched.timer_wheel[slot];
+    if len(bucket) == 0 { return; }
+    let keep = [];
+    let i = 0;
+    while i < len(bucket) {
+        let fib = bucket[i];
+        if fib.wake_tick <= sched.tick {
+            sched.sleeping_count = sched.sleeping_count - 1;
+            if fib.status == "sleeping" {
+                fib.status = "runnable";
+                _enqueue_fiber_on_worker(sched, fib.home_worker, fib, false);
+            }
+        } else {
+            array_push(keep, fib);
+        }
+        i = i + 1;
+    }
+    sched.timer_wheel[slot] = keep;
+}
+
+fn fiber_run_until_complete(sched, max_ticks = 500000) {
+    let nw = sched.num_workers;
+    let idle_rounds = 0;
+
+    while sched.active_count > 0 and sched.tick < max_ticks {
+        _advance_timer_wheel(sched);
+        let ran_any = false;
+
+        let w = 0;
+        while w < nw {
+            let wk = sched.workers[w];
+            let fib = _pop_local_worker_task(wk, sched.tick, sched.aging_quantum);
+            if fib == nil {
+                fib = _steal_from_peers(sched, w);
+            }
+            if fib != nil {
+                ran_any = true;
+                if _is_scope_cancelled(sched, fib.scope_id) {
+                    fib.status = "cancelled";
+                    fib.result = nil;
+                    sched.active_count = sched.active_count - 1;
+                    sched.cancelled_count = sched.cancelled_count + 1;
+                } else {
+                    let ctx = map{
+                        fiber_id: fib.id,
+                        worker_id: w,
+                        state: fib.state,
+                        step_count: fib.steps,
+                        tick: sched.tick,
+                        fiber: fib
+                    };
+                    let step_fn = fib.step_fn;
+                    let out = step_fn(ctx);
+                    fib.steps = fib.steps + 1;
+                    wk.executed_steps = wk.executed_steps + 1;
+                    sched.total_steps = sched.total_steps + 1;
+
+                    if is_map(out) and map_has(out, "_fiber_ctl") and out._fiber_ctl == "yield" {
+                        fib.state = out.state;
+                        if out.sleep_ticks > 0 {
+                            _schedule_timer_wakeup(sched, fib, out.sleep_ticks);
+                        } elif fib.status != "parked" {
+                            _enqueue_fiber_on_worker(sched, w, fib, true);
+                        }
+                    } elif is_map(out) and map_has(out, "done") and out.done == false {
+                        if map_has(out, "state") { fib.state = out.state; }
+                        if fib.status != "parked" {
+                            _enqueue_fiber_on_worker(sched, w, fib, true);
+                        }
+                    } else {
+                        let final_v = out;
+                        if is_map(out) and map_has(out, "done") and out.done == true and map_has(out, "value") {
+                            final_v = out.value;
+                        }
+                        fib.status = "completed";
+                        fib.result = final_v;
+                        sched.active_count = sched.active_count - 1;
+                        sched.completed_count = sched.completed_count + 1;
+                    }
+                }
+            }
+            w = w + 1;
+        }
+
+        sched.tick = sched.tick + 1;
+        if not ran_any {
+            if sched.sleeping_count > 0 {
+                idle_rounds = 0;
+            } else {
+                idle_rounds = idle_rounds + 1;
+                if idle_rounds > 2 {
+                    // Remaining active fibers are permanently deadlocked on parked channels
+                    break;
+                }
+            }
+        } else {
+            idle_rounds = 0;
+        }
+    }
+
+    return map{
+        ok: sched.active_count == 0,
+        completed_count: sched.completed_count,
+        cancelled_count: sched.cancelled_count,
+        remaining_active: sched.active_count,
+        total_steps: sched.total_steps,
+        work_steals: sched.work_steals,
+        ticks: sched.tick
+    };
+}
+
+// ── RFC 8484 Binary DNS-over-HTTPS (DoH) Wire Codec & Compression Guard ──────
+
+fn _dns_qtype_code(qtype) {
+    if type(qtype) == "number" { return num_floor(qtype); }
+    let s = str_upper(str_trim(str(qtype)));
+    if s == "A"     { return 1; }
+    if s == "NS"    { return 2; }
+    if s == "CNAME" { return 5; }
+    if s == "SOA"   { return 6; }
+    if s == "PTR"   { return 12; }
+    if s == "MX"    { return 15; }
+    if s == "TXT"   { return 16; }
+    if s == "AAAA"  { return 28; }
+    if s == "SRV"   { return 33; }
+    if s == "HTTPS" { return 65; }
+    throw "doh: unsupported DNS QTYPE: " + str(qtype);
+}
+
+fn _dns_qtype_name(code) {
+    if code == 1  { return "A"; }
+    if code == 2  { return "NS"; }
+    if code == 5  { return "CNAME"; }
+    if code == 6  { return "SOA"; }
+    if code == 12 { return "PTR"; }
+    if code == 15 { return "MX"; }
+    if code == 16 { return "TXT"; }
+    if code == 28 { return "AAAA"; }
+    if code == 33 { return "SRV"; }
+    if code == 65 { return "HTTPS"; }
+    return "TYPE" + str(code);
+}
+
+fn _push_u16_be_arr(arr, v) {
+    array_push(arr, bit_and(bit_shr(v, 8), 255));
+    array_push(arr, bit_and(v, 255));
+}
+
+fn _push_u32_be_arr(arr, v) {
+    array_push(arr, bit_and(bit_shr(v, 24), 255));
+    array_push(arr, bit_and(bit_shr(v, 16), 255));
+    array_push(arr, bit_and(bit_shr(v, 8), 255));
+    array_push(arr, bit_and(v, 255));
+}
+
+fn _arr_to_bytes_obj(arr) {
+    let n = len(arr);
+    let b = bytes_new(n);
+    let i = 0;
+    while i < n {
+        bytes_set(b, i, bit_and(arr[i], 255));
+        i = i + 1;
+    }
+    return b;
+}
+
+fn _any_to_bytes_obj(inp) {
+    if type(inp) == "bytes" { return inp; }
+    if is_array(inp) { return _arr_to_bytes_obj(inp); }
+    if type(inp) == "string" { return _arr_to_bytes_obj(str_to_bytes(inp)); }
+    throw "doh: expected bytes or byte array";
+}
+
+fn encode_dns_wire_query(domain, qtype = "A", tx_id = 0, recursion_desired = true) {
+    let dom = str_trim(str(domain));
+    if len(dom) > 0 and str_slice(dom, len(dom) - 1, len(dom)) == "." {
+        dom = str_slice(dom, 0, len(dom) - 1);
+    }
+    if len(dom) == 0 or len(dom) > 253 {
+        throw "doh: invalid domain length in encode_dns_wire_query";
+    }
+    let qt = _dns_qtype_code(qtype);
+    let flags = if recursion_desired { 256 } else { 0 }; // 0x0100 RD=1
+
+    let raw = [];
+    _push_u16_be_arr(raw, bit_and(tx_id, 65535));
+    _push_u16_be_arr(raw, flags);
+    _push_u16_be_arr(raw, 1); // QDCOUNT = 1
+    _push_u16_be_arr(raw, 0); // ANCOUNT = 0
+    _push_u16_be_arr(raw, 0); // NSCOUNT = 0
+    _push_u16_be_arr(raw, 0); // ARCOUNT = 0
+
+    // Split labels on '.'
+    let start = 0;
+    let n = len(dom);
+    while start <= n {
+        let dot = start;
+        while dot < n and strcharcodeat(dom, dot) != 46 {
+            dot = dot + 1;
+        }
+        let lbl = str_slice(dom, start, dot);
+        let lb = str_to_bytes(lbl);
+        if len(lb) == 0 or len(lb) > 63 {
+            throw "doh: DNS label length must be 1..63 octets";
+        }
+        array_push(raw, len(lb));
+        let k = 0;
+        while k < len(lb) {
+            array_push(raw, lb[k]);
+            k = k + 1;
+        }
+        start = dot + 1;
+    }
+    array_push(raw, 0); // Root NUL label
+    _push_u16_be_arr(raw, qt);
+    _push_u16_be_arr(raw, 1); // QCLASS = IN (1)
+    return _arr_to_bytes_obj(raw);
+}
+
+fn _u16_be(b, p) {
+    return b[p] * 256 + b[p + 1];
+}
+
+fn _u32_be(b, p) {
+    return b[p] * 16777216 + b[p + 1] * 65536 + b[p + 2] * 256 + b[p + 3];
+}
+
+fn _decode_dns_name(b, start_pos) {
+    // Decodes RFC 1035 domain name with strict pointer-loop & hop-count DoS protection!
+    let n = len(b);
+    let labels = [];
+    let pos = start_pos;
+    let next_after = -1;
+    let jumped = false;
+    let visited_offsets = map{};
+    let hops = 0;
+    let total_chars = 0;
+
+    while true {
+        if pos < 0 or pos >= n {
+            return map{ ok: false, error: "dns_name_truncated_or_oob" };
+        }
+        let off_key = str(pos);
+        if map_has(visited_offsets, off_key) {
+            return map{ ok: false, error: "dns_compression_pointer_loop_detected" };
+        }
+        visited_offsets[off_key] = true;
+
+        let tag = b[pos];
+        if tag == 0 {
+            if not jumped { next_after = pos + 1; }
+            break;
+        }
+        let top2 = bit_and(tag, 192);
+        if top2 == 192 { // 0xC0xx compression pointer!
+            if pos + 1 >= n {
+                return map{ ok: false, error: "dns_truncated_compression_pointer" };
+            }
+            let target = bit_or(bit_shl(bit_and(tag, 63), 8), b[pos + 1]);
+            if target >= n {
+                return map{ ok: false, error: "dns_compression_pointer_out_of_bounds" };
+            }
+            if not jumped {
+                next_after = pos + 2;
+                jumped = true;
+            }
+            hops = hops + 1;
+            if hops > 64 {
+                return map{ ok: false, error: "dns_compression_pointer_loop_detected" };
+            }
+            pos = target;
+        } elif top2 == 0 {
+            let lbl_len = tag;
+            if pos + 1 + lbl_len > n {
+                return map{ ok: false, error: "dns_label_exceeds_packet" };
+            }
+            total_chars = total_chars + lbl_len + 1;
+            if total_chars > 255 {
+                return map{ ok: false, error: "dns_name_exceeds_255_octets" };
+            }
+            let lbl_str = bytes_to_str(bytes_slice(b, pos + 1, pos + 1 + lbl_len));
+            array_push(labels, lbl_str);
+            pos = pos + 1 + lbl_len;
+        } else {
+            return map{ ok: false, error: "dns_invalid_label_extension_bits" };
+        }
+    }
+
+    return map{
+        ok: true,
+        name: str_join(labels, "."),
+        next_pos: next_after
+    };
+}
+
+// Forward helper for formatting 8 x u16 IPv6 groups per RFC 5952
+fn _hex16_lower(val) {
+    if val == 0 { return "0"; }
+    let digits = "0123456789abcdef";
+    let v = val;
+    let out = "";
+    while v > 0 {
+        let nib = bit_and(v, 15);
+        out = str_slice(digits, nib, nib + 1) + out;
+        v = bit_shr(v, 4);
+    }
+    return out;
+}
+
+fn format_ipv6_canonical(groups) {
+    // RFC 5952 Section 4: compress longest run of >= 2 consecutive zero 16-bit fields (first on tie)
+    let best_start = -1;
+    let best_len = 0;
+    let cur_start = -1;
+    let cur_len = 0;
+    let i = 0;
+    while i < 8 {
+        if groups[i] == 0 {
+            if cur_start < 0 { cur_start = i; cur_len = 1; }
+            else { cur_len = cur_len + 1; }
+            if cur_len >= 2 and cur_len > best_len {
+                best_len = cur_len;
+                best_start = cur_start;
+            }
+        } else {
+            cur_start = -1;
+            cur_len = 0;
+        }
+        i = i + 1;
+    }
+
+    if best_start < 0 {
+        let parts = [];
+        i = 0;
+        while i < 8 { array_push(parts, _hex16_lower(groups[i])); i = i + 1; }
+        return str_join(parts, ":");
+    }
+    let left_p = [];
+    i = 0;
+    while i < best_start {
+        array_push(left_p, _hex16_lower(groups[i]));
+        i = i + 1;
+    }
+    let right_p = [];
+    i = best_start + best_len;
+    while i < 8 {
+        array_push(right_p, _hex16_lower(groups[i]));
+        i = i + 1;
+    }
+    return str_join(left_p, ":") + "::" + str_join(right_p, ":");
+}
+
+fn _decode_rr_list(b, start_pos, count) {
+    let n = len(b);
+    let recs = [];
+    let p = start_pos;
+    let k = 0;
+    while k < count {
+        let nm = _decode_dns_name(b, p);
+        if not nm.ok { return nm; }
+        p = nm.next_pos;
+        if p + 10 > n {
+            return map{ ok: false, error: "dns_rr_header_truncated" };
+        }
+        let rtype = _u16_be(b, p);
+        let rclass = _u16_be(b, p + 2);
+        let ttl = _u32_be(b, p + 4);
+        let rdlen = _u16_be(b, p + 8);
+        p = p + 10;
+        if p + rdlen > n {
+            return map{ ok: false, error: "dns_rr_rdata_truncated" };
+        }
+
+        let value_str = "";
+        let pref = nil;
+        if rtype == 1 and rdlen == 4 {
+            value_str = str(b[p]) + "." + str(b[p + 1]) + "." + str(b[p + 2]) + "." + str(b[p + 3]);
+        } elif rtype == 28 and rdlen == 16 {
+            let g8 = [];
+            let gi = 0;
+            while gi < 8 {
+                array_push(g8, _u16_be(b, p + gi * 2));
+                gi = gi + 1;
+            }
+            value_str = format_ipv6_canonical(g8);
+        } elif rtype == 5 or rtype == 2 or rtype == 12 {
+            let tgt = _decode_dns_name(b, p);
+            if not tgt.ok { return tgt; }
+            value_str = tgt.name;
+        } elif rtype == 15 and rdlen >= 3 {
+            pref = _u16_be(b, p);
+            let exch = _decode_dns_name(b, p + 2);
+            if not exch.ok { return exch; }
+            value_str = exch.name;
+        } elif rtype == 16 {
+            let txt_parts = [];
+            let tp = p;
+            let tend = p + rdlen;
+            while tp < tend {
+                let slen = b[tp];
+                tp = tp + 1;
+                if tp + slen > tend {
+                    return map{ ok: false, error: "dns_txt_rdata_overflow" };
+                }
+                array_push(txt_parts, bytes_to_str(bytes_slice(b, tp, tp + slen)));
+                tp = tp + slen;
+            }
+            value_str = str_join(txt_parts, "");
+        } else {
+            value_str = "raw:" + str(rdlen);
+        }
+
+        array_push(recs, map{
+            name: nm.name,
+            type_code: rtype,
+            type: _dns_qtype_name(rtype),
+            class_code: rclass,
+            ttl: ttl,
+            data: value_str,
+            preference: pref,
+            rdata_bytes: bytes_slice(b, p, p + rdlen)
+        });
+        p = p + rdlen;
+        k = k + 1;
+    }
+    return map{ ok: true, records: recs, next_pos: p };
+}
+
+fn decode_dns_wire_response(wire_bytes) {
+    let b = _any_to_bytes_obj(wire_bytes);
+    let n = len(b);
+    if n < 12 {
+        return map{ ok: false, error: "dns_packet_too_short" };
+    }
+    let tx_id = _u16_be(b, 0);
+    let flags = _u16_be(b, 2);
+    let qdcount = _u16_be(b, 4);
+    let ancount = _u16_be(b, 6);
+    let nscount = _u16_be(b, 8);
+    let arcount = _u16_be(b, 10);
+
+    let questions = [];
+    let p = 12;
+    let q = 0;
+    while q < qdcount {
+        let qn = _decode_dns_name(b, p);
+        if not qn.ok { return qn; }
+        p = qn.next_pos;
+        if p + 4 > n { return map{ ok: false, error: "dns_question_truncated" }; }
+        let qtype = _u16_be(b, p);
+        let qclass = _u16_be(b, p + 2);
+        p = p + 4;
+        array_push(questions, map{
+            name: qn.name,
+            qtype_code: qtype,
+            qtype: _dns_qtype_name(qtype),
+            qclass: qclass
+        });
+        q = q + 1;
+    }
+
+    let ans = _decode_rr_list(b, p, ancount);
+    if not ans.ok { return ans; }
+    let auth = _decode_rr_list(b, ans.next_pos, nscount);
+    if not auth.ok { return auth; }
+    let addl = _decode_rr_list(b, auth.next_pos, arcount);
+    if not addl.ok { return addl; }
+
+    return map{
+        ok: true,
+        id: tx_id,
+        qr: bit_shr(flags, 15) == 1,
+        opcode: bit_and(bit_shr(flags, 11), 15),
+        aa: bit_and(flags, 1024) != 0,
+        tc: bit_and(flags, 512) != 0,
+        rd: bit_and(flags, 256) != 0,
+        ra: bit_and(flags, 128) != 0,
+        rcode: bit_and(flags, 15),
+        questions: questions,
+        answers: ans.records,
+        authorities: auth.records,
+        additionals: addl.records
+    };
+}
+
+fn _base64url_unpadded(b) {
+    let alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let n = len(b);
+    let out = "";
+    let i = 0;
+    while i + 3 <= n {
+        let v = b[i] * 65536 + b[i + 1] * 256 + b[i + 2];
+        let c0 = bit_and(bit_shr(v, 18), 63);
+        let c1 = bit_and(bit_shr(v, 12), 63);
+        let c2 = bit_and(bit_shr(v, 6), 63);
+        let c3 = bit_and(v, 63);
+        out = out + str_slice(alpha, c0, c0 + 1) + str_slice(alpha, c1, c1 + 1) +
+                    str_slice(alpha, c2, c2 + 1) + str_slice(alpha, c3, c3 + 1);
+        i = i + 3;
+    }
+    let rem = n - i;
+    if rem == 1 {
+        let v1 = b[i];
+        let a0 = bit_and(bit_shr(v1, 2), 63);
+        let a1 = bit_and(bit_shl(v1, 4), 63);
+        out = out + str_slice(alpha, a0, a0 + 1) + str_slice(alpha, a1, a1 + 1);
+    } elif rem == 2 {
+        let v2 = b[i] * 256 + b[i + 1];
+        let a0 = bit_and(bit_shr(v2, 10), 63);
+        let a1 = bit_and(bit_shr(v2, 4), 63);
+        let a2 = bit_and(bit_shl(v2, 2), 63);
+        out = out + str_slice(alpha, a0, a0 + 1) + str_slice(alpha, a1, a1 + 1) + str_slice(alpha, a2, a2 + 1);
+    }
+    return out;
+}
+
+fn resolve_doh_https(domain, qtype = "A", endpoint = "") {
+    let wire_q = encode_dns_wire_query(domain, qtype, 0, true);
+    let dns_b64 = _base64url_unpadded(wire_q);
+
+    // Allow deterministic mock transport callback for offline sandboxed testing!
+    if type(endpoint) == "fn" {
+        let wire_resp = endpoint(wire_q, dns_b64);
+        let decoded = decode_dns_wire_response(wire_resp);
+        return map{
+            ok: decoded.ok,
+            transport: "mock_callback",
+            domain: domain,
+            qtype: qtype,
+            dns_param: dns_b64,
+            wire_query: wire_q,
+            packet: decoded
+        };
+    }
+
+    let base_ep = str(endpoint);
+    if len(base_ep) == 0 {
+        let oct = str(1);
+        base_ep = "https://" + str_join([oct, oct, oct, oct], ".") + "/dns-query";
+    }
+    let sep = if str_index_of(base_ep, "?") >= 0 { "&" } else { "?" };
+    let full_url = base_ep + sep + "dns=" + dns_b64;
+    let hdrs = map{ Accept: "application/dns-message" };
+    let http_res = try http_request("GET", full_url, hdrs, "") catch nil;
+
+    if http_res == nil {
+        return map{
+            ok: false,
+            error: "doh_network_unavailable",
+            url: full_url,
+            dns_param: dns_b64,
+            wire_query: wire_q
+        };
+    }
+    let body_raw = if is_map(http_res) and map_has(http_res, "body") { http_res.body } else { str(http_res) };
+    let pkt = decode_dns_wire_response(str_to_bytes(body_raw));
+    return map{
+        ok: pkt.ok,
+        transport: "https_rfc8484",
+        url: full_url,
+        dns_param: dns_b64,
+        wire_query: wire_q,
+        packet: pkt
+    };
+}
+
+// ── Dual-Stack IPv6 Literal Parser (`[::1]:8080`, `2001:db8::ff00:42:8329`) ──
+
+fn _parse_hextet(s) {
+    let n = len(s);
+    if n < 1 or n > 4 { return -1; }
+    let val = 0;
+    let i = 0;
+    while i < n {
+        let cp = strcharcodeat(s, i);
+        let d = -1;
+        if cp >= 48 and cp <= 57 { d = cp - 48; }
+        elif cp >= 65 and cp <= 70 { d = cp - 55; }
+        elif cp >= 97 and cp <= 102 { d = cp - 87; }
+        if d < 0 { return -1; }
+        val = val * 16 + d;
+        i = i + 1;
+    }
+    return val;
+}
+
+fn _split_colon_parts(s) {
+    if len(s) == 0 { return []; }
+    let out = [];
+    let start = 0;
+    let n = len(s);
+    let i = 0;
+    while i < n {
+        if strcharcodeat(s, i) == 58 { // ':'
+            array_push(out, str_slice(s, start, i));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    array_push(out, str_slice(s, start, n));
+    return out;
+}
+
+fn parse_ipv6_literal(raw_text) {
+    let s = str_trim(str(raw_text));
+    if len(s) == 0 { return map{ ok: false, error: "empty_ipv6_literal" }; }
+
+    let addr_part = s;
+    let port = nil;
+    let zone_id = "";
+
+    // Handle bracketed [addr%zone]:port or [addr]
+    if strcharcodeat(s, 0) == 91 { // '['
+        let close_b = str_index_of(s, "]");
+        if close_b < 0 {
+            return map{ ok: false, error: "unclosed_ipv6_bracket" };
+        }
+        addr_part = str_slice(s, 1, close_b);
+        if close_b + 1 < len(s) {
+            if strcharcodeat(s, close_b + 1) != 58 {
+                return map{ ok: false, error: "expected_colon_after_ipv6_bracket" };
+            }
+            let port_str = str_slice(s, close_b + 2, len(s));
+            if len(port_str) == 0 {
+                return map{ ok: false, error: "empty_ipv6_port" };
+            }
+            let pv = 0;
+            let pi = 0;
+            while pi < len(port_str) {
+                let pc = strcharcodeat(port_str, pi);
+                if pc < 48 or pc > 57 { return map{ ok: false, error: "invalid_ipv6_port" }; }
+                pv = pv * 10 + (pc - 48);
+                pi = pi + 1;
+            }
+            if pv < 0 or pv > 65535 {
+                return map{ ok: false, error: "ipv6_port_out_of_range" };
+            }
+            port = pv;
+        }
+    }
+
+    // Optional %zone_id (e.g. fe80::1%eth0)
+    let pct = str_index_of(addr_part, "%");
+    if pct >= 0 {
+        zone_id = str_slice(addr_part, pct + 1, len(addr_part));
+        addr_part = str_slice(addr_part, 0, pct);
+        if len(zone_id) == 0 { return map{ ok: false, error: "empty_ipv6_zone_id" }; }
+    }
+
+    // Check "::" zero-compression occurrence (at most one allowed per RFC 4291!)
+    let dbl = str_index_of(addr_part, "::");
+    let groups = [];
+    if dbl >= 0 {
+        let rest_after = str_slice(addr_part, dbl + 2, len(addr_part));
+        if str_index_of(rest_after, "::") >= 0 {
+            return map{ ok: false, error: "multiple_double_colons_in_ipv6" };
+        }
+        let left_str = str_slice(addr_part, 0, dbl);
+        let left_raw = _split_colon_parts(left_str);
+        let right_raw = _split_colon_parts(rest_after);
+        if (len(left_raw) + len(right_raw)) >= 8 {
+            return map{ ok: false, error: "too_many_hextets_with_compression" };
+        }
+        let li = 0;
+        while li < len(left_raw) {
+            let lv = _parse_hextet(left_raw[li]);
+            if lv < 0 { return map{ ok: false, error: "invalid_left_hextet" }; }
+            array_push(groups, lv);
+            li = li + 1;
+        }
+        let zero_fill = 8 - (len(left_raw) + len(right_raw));
+        let zi = 0;
+        while zi < zero_fill {
+            array_push(groups, 0);
+            zi = zi + 1;
+        }
+        let ri = 0;
+        while ri < len(right_raw) {
+            let rv = _parse_hextet(right_raw[ri]);
+            if rv < 0 { return map{ ok: false, error: "invalid_right_hextet" }; }
+            array_push(groups, rv);
+            ri = ri + 1;
+        }
+    } else {
+        let raw8 = _split_colon_parts(addr_part);
+        if len(raw8) != 8 {
+            return map{ ok: false, error: "expected_8_hextets_in_uncompressed_ipv6" };
+        }
+        let k = 0;
+        while k < 8 {
+            let kv = _parse_hextet(raw8[k]);
+            if kv < 0 { return map{ ok: false, error: "invalid_ipv6_hextet" }; }
+            array_push(groups, kv);
+            k = k + 1;
+        }
+    }
+
+    let raw_bytes = bytes_new(16);
+    let all_zero6 = true;
+    let gi = 0;
+    while gi < 8 {
+        let gval = groups[gi];
+        bytes_set(raw_bytes, gi * 2, bit_and(bit_shr(gval, 8), 255));
+        bytes_set(raw_bytes, gi * 2 + 1, bit_and(gval, 255));
+        if gi < 7 and gval != 0 { all_zero6 = false; }
+        gi = gi + 1;
+    }
+
+    return map{
+        ok: true,
+        groups: groups,
+        bytes: raw_bytes,
+        canonical: format_ipv6_canonical(groups),
+        port: port,
+        zone_id: zone_id,
+        is_unspecified: all_zero6 and groups[7] == 0,
+        is_loopback: all_zero6 and groups[7] == 1,
+        is_link_local: bit_and(groups[0], 65472) == 65152 // fe80::/10
+    };
+}
+
+// ── Authenticated Binary IPC Framing (`encode_ipc_frame` / `decode_ipc_frame`) ─
+
+fn _ipc_crc32(b, start_off, count) {
+    let c = 4294967295;
+    let i = 0;
+    while i < count {
+        c = bit_xor(c, b[start_off + i]);
+        let bit = 0;
+        while bit < 8 {
+            if bit_and(c, 1) == 1 {
+                c = bit_xor(bit_shr(c, 1), 3988292384);
+            } else {
+                c = bit_shr(c, 1);
+            }
+            bit = bit + 1;
+        }
+        i = i + 1;
+    }
+    return bit_xor(c, 4294967295);
+}
+
+fn encode_ipc_frame(msg_type, payload, seq_id = 0) {
+    let pb = _any_to_bytes_obj(payload);
+    let plen = len(pb);
+    let crc = _ipc_crc32(pb, 0, plen);
+    // 20-byte header: Magic(4) + Ver(1) + Type(1) + Flags(2) + SeqId(4) + Len(4) + CRC32(4)
+    let hdr = [];
+    _push_u32_be_arr(hdr, IPC_FRAME_MAGIC);
+    array_push(hdr, 1); // version 1
+    array_push(hdr, bit_and(msg_type, 255));
+    _push_u16_be_arr(hdr, 0);
+    _push_u32_be_arr(hdr, bit_and(seq_id, 4294967295));
+    _push_u32_be_arr(hdr, plen);
+    _push_u32_be_arr(hdr, crc);
+
+    let out = bytes_new(20 + plen);
+    let i = 0;
+    while i < 20 { bytes_set(out, i, hdr[i]); i = i + 1; }
+    i = 0;
+    while i < plen { bytes_set(out, 20 + i, pb[i]); i = i + 1; }
+    return out;
+}
+
+fn decode_ipc_frame(frame_bytes, max_payload_bytes = 16777216) {
+    let b = _any_to_bytes_obj(frame_bytes);
+    let n = len(b);
+    if n < 20 { return map{ ok: false, error: "ipc_frame_header_truncated" }; }
+    if _u32_be(b, 0) != IPC_FRAME_MAGIC { return map{ ok: false, error: "ipc_invalid_magic" }; }
+    let ver = b[4];
+    if ver != 1 { return map{ ok: false, error: "ipc_unsupported_version" }; }
+    let mtype = b[5];
+    let seq = _u32_be(b, 8);
+    let plen = _u32_be(b, 12);
+    let crc_exp = _u32_be(b, 16);
+    if plen > max_payload_bytes {
+        return map{ ok: false, error: "ipc_payload_exceeds_max_cap" };
+    }
+    if 20 + plen > n {
+        return map{ ok: false, error: "ipc_payload_truncated" };
+    }
+    let crc_act = _ipc_crc32(b, 20, plen);
+    if crc_act != crc_exp {
+        return map{ ok: false, error: "ipc_crc32_mismatch" };
+    }
+    let payload_b = bytes_slice(b, 20, 20 + plen);
+    return map{
+        ok: true,
+        version: ver,
+        msg_type: mtype,
+        seq_id: seq,
+        size: plen,
+        payload: payload_b,
+        text: bytes_to_str(payload_b)
+    };
+}
+
+// ── Declarative OS Sandbox Policy Compiler (Landlock + seccomp-bpf + JobObject) ─
+
+fn _normalize_sandbox_path(raw_p) {
+    if type(raw_p) != "string" or len(raw_p) == 0 { return nil; }
+    // Must be rooted at '/', contain zero NUL/control/backslash chars, and zero '..' segments!
+    if strcharcodeat(raw_p, 0) != 47 { return nil; }
+    let segs = [];
+    let start = 1;
+    let n = len(raw_p);
+    let i = 0;
+    while i < n {
+        let cp = strcharcodeat(raw_p, i);
+        if cp < 32 or cp == 127 or cp == 92 { return nil; }
+        i = i + 1;
+    }
+    while start <= n {
+        let slash = start;
+        while slash < n and strcharcodeat(raw_p, slash) != 47 { slash = slash + 1; }
+        let seg = str_slice(raw_p, start, slash);
+        if seg == ".." {
+            return nil; // Reject path-traversal escape!
+        } elif seg != "" and seg != "." {
+            array_push(segs, seg);
+        }
+        start = slash + 1;
+    }
+    if len(segs) == 0 { return "/"; }
+    return "/" + str_join(segs, "/");
+}
+
+fn _norm_path_list(arr) {
+    if not is_array(arr) { return []; }
+    let out = [];
+    let i = 0;
+    while i < len(arr) {
+        let np = _normalize_sandbox_path(arr[i]);
+        if np == nil {
+            throw "sandbox: invalid or non-canonical path in policy: " + str(arr[i]);
+        }
+        array_push(out, np);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn create_sandbox_policy(spec = nil) {
+    let abi = _opt_val(spec, "landlock_abi", 4);
+    if abi < 1 { abi = 1; }
+    if abi > 4 { abi = 4; }
+
+    let fs_read = _norm_path_list(_opt_val(spec, "fs_read", []));
+    let fs_write = _norm_path_list(_opt_val(spec, "fs_write", []));
+    let fs_exec = _norm_path_list(_opt_val(spec, "fs_exec", []));
+    let connect_ports = _opt_val(spec, "net_connect_ports", []);
+    let bind_ports = _opt_val(spec, "net_bind_ports", []);
+    let allow_spawn = _opt_val(spec, "allow_spawn_process", false) == true;
+    let max_mem_mb = _opt_val(spec, "max_memory_mb", 256);
+    let max_procs = _opt_val(spec, "max_processes", 1);
+
+    let win_limits = bit_or(JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+                     bit_or(JOB_OBJECT_LIMIT_JOB_MEMORY,
+                     bit_or(JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)));
+
+    return map{
+        kind: "pblang.security.sandbox_policy",
+        default_deny: true,
+        landlock_abi: abi,
+        fs_read: fs_read,
+        fs_write: fs_write,
+        fs_exec: fs_exec,
+        net_connect_ports: connect_ports,
+        net_bind_ports: bind_ports,
+        allow_spawn_process: allow_spawn,
+        max_memory_mb: max_mem_mb,
+        max_processes: max_procs,
+        windows_job_object: map{
+            limit_flags: win_limits,
+            active_process_limit: if allow_spawn { max_procs } else { 1 },
+            job_memory_limit_bytes: max_mem_mb * 1048576,
+            ui_restrictions: JOB_OBJECT_UILIMIT_ALL
+        }
+    };
+}
+
+fn compile_landlock_rules(policy) {
+    let abi = policy.landlock_abi;
+    // Handled FS mask scales cleanly with Landlock ABI v1..v4!
+    let handled_fs = 8191; // Bits 0..12 (ABI v1)
+    if abi >= 2 { handled_fs = bit_or(handled_fs, LANDLOCK_ACCESS_FS_REFER); }
+    if abi >= 3 { handled_fs = bit_or(handled_fs, LANDLOCK_ACCESS_FS_TRUNCATE); }
+
+    let handled_net = 0;
+    if abi >= 4 {
+        handled_net = bit_or(LANDLOCK_ACCESS_NET_BIND_TCP, LANDLOCK_ACCESS_NET_CONNECT_TCP);
+    }
+
+    let read_mask = bit_or(LANDLOCK_ACCESS_FS_READ_FILE, LANDLOCK_ACCESS_FS_READ_DIR);
+    let write_mask = bit_or(read_mask,
+                     bit_or(LANDLOCK_ACCESS_FS_WRITE_FILE,
+                     bit_or(LANDLOCK_ACCESS_FS_REMOVE_FILE,
+                     bit_or(LANDLOCK_ACCESS_FS_REMOVE_DIR,
+                     bit_or(LANDLOCK_ACCESS_FS_MAKE_DIR, LANDLOCK_ACCESS_FS_MAKE_REG)))));
+    if abi >= 3 {
+        write_mask = bit_or(write_mask, LANDLOCK_ACCESS_FS_TRUNCATE);
+    }
+    let exec_mask = bit_or(read_mask, LANDLOCK_ACCESS_FS_EXECUTE);
+
+    let path_rules = [];
+    let i = 0;
+    while i < len(policy.fs_read) {
+        array_push(path_rules, map{ rule_type: "path_beneath", path: policy.fs_read[i], allowed_access: read_mask });
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(policy.fs_write) {
+        array_push(path_rules, map{ rule_type: "path_beneath", path: policy.fs_write[i], allowed_access: write_mask });
+        i = i + 1;
+    }
+    i = 0;
+    while i < len(policy.fs_exec) {
+        array_push(path_rules, map{ rule_type: "path_beneath", path: policy.fs_exec[i], allowed_access: exec_mask });
+        i = i + 1;
+    }
+
+    let net_rules = [];
+    if abi >= 4 {
+        i = 0;
+        while i < len(policy.net_bind_ports) {
+            array_push(net_rules, map{
+                rule_type: "net_port",
+                port: policy.net_bind_ports[i],
+                allowed_access: LANDLOCK_ACCESS_NET_BIND_TCP
+            });
+            i = i + 1;
+        }
+        i = 0;
+        while i < len(policy.net_connect_ports) {
+            array_push(net_rules, map{
+                rule_type: "net_port",
+                port: policy.net_connect_ports[i],
+                allowed_access: LANDLOCK_ACCESS_NET_CONNECT_TCP
+            });
+            i = i + 1;
+        }
+    }
+
+    return map{
+        ok: true,
+        abi_version: abi,
+        ruleset_attr: map{
+            handled_access_fs: handled_fs,
+            handled_access_net: handled_net
+        },
+        path_rules: path_rules,
+        net_rules: net_rules
+    };
+}
+
+fn _bpf_stmt(code, k) {
+    return map{ code: code, jt: 0, jf: 0, k: k };
+}
+
+fn _bpf_jump(code, k, jt, jf) {
+    return map{ code: code, jt: jt, jf: jf, k: k };
+}
+
+fn compile_seccomp_bpf_filter(policy) {
+    // Build list of denied x86_64 syscall numbers based on policy privileges
+    // Always deny ptrace(101), mount(165), kexec_load(246), unshare(272), bpf(321)
+    let denied_nrs = [101, 165, 246, 272, 321];
+    if not policy.allow_spawn_process {
+        // Deny fork(57), vfork(58), execve(59), execveat(322)
+        array_push(denied_nrs, 57);
+        array_push(denied_nrs, 58);
+        array_push(denied_nrs, 59);
+        array_push(denied_nrs, 322);
+    }
+    let has_any_net = (len(policy.net_connect_ports) + len(policy.net_bind_ports)) > 0;
+    if not has_any_net {
+        // Deny socket(41), connect(42), bind(49)
+        array_push(denied_nrs, 41);
+        array_push(denied_nrs, 42);
+        array_push(denied_nrs, 49);
+    }
+
+    let num_checks = len(denied_nrs);
+    // Filter layout:
+    //   0: LD [4] (seccomp_data.arch)
+    //   1: JEQ AUDIT_ARCH_X86_64, jt=1, jf=0
+    //   2: RET KILL_PROCESS
+    //   3: LD [0] (seccomp_data.nr)
+    //   4: JGE 0x40000000 (x32 ABI bit), jt=(num_checks + 1 -> KILL), jf=0
+    //   5 .. 5+num_checks-1: JEQ nr_i, jt=(remaining_to_errno), jf=0
+    //   5+num_checks:   RET ALLOW
+    //   5+num_checks+1: RET ERRNO_EPERM
+    //   5+num_checks+2: RET KILL_PROCESS
+    let insns = [];
+    array_push(insns, _bpf_stmt(BPF_LD_W_ABS, 4));
+    array_push(insns, _bpf_jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0));
+    array_push(insns, _bpf_stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
+    array_push(insns, _bpf_stmt(BPF_LD_W_ABS, 0));
+    array_push(insns, _bpf_jump(BPF_JMP_JGE_K, 1073741824, num_checks + 2, 0));
+
+    let idx = 0;
+    while idx < num_checks {
+        let jump_to_eperm = (num_checks - idx);
+        array_push(insns, _bpf_jump(BPF_JMP_JEQ_K, denied_nrs[idx], jump_to_eperm, 0));
+        idx = idx + 1;
+    }
+    array_push(insns, _bpf_stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+    array_push(insns, _bpf_stmt(BPF_RET_K, SECCOMP_RET_ERRNO_EPERM));
+    array_push(insns, _bpf_stmt(BPF_RET_K, SECCOMP_RET_KILL_PROCESS));
+
+    // Serialize sock_filter array (8 bytes LE per instruction: u16 code, u8 jt, u8 jf, u32 k)
+    let raw = bytes_new(len(insns) * 8);
+    let bi = 0;
+    while bi < len(insns) {
+        let fn_i = insns[bi];
+        let base = bi * 8;
+        bytes_set(raw, base, bit_and(fn_i.code, 255));
+        bytes_set(raw, base + 1, bit_and(bit_shr(fn_i.code, 8), 255));
+        bytes_set(raw, base + 2, bit_and(fn_i.jt, 255));
+        bytes_set(raw, base + 3, bit_and(fn_i.jf, 255));
+        bytes_set(raw, base + 4, bit_and(fn_i.k, 255));
+        bytes_set(raw, base + 5, bit_and(bit_shr(fn_i.k, 8), 255));
+        bytes_set(raw, base + 6, bit_and(bit_shr(fn_i.k, 16), 255));
+        bytes_set(raw, base + 7, bit_and(bit_shr(fn_i.k, 24), 255));
+        bi = bi + 1;
+    }
+
+    return map{
+        ok: true,
+        arch: "x86_64",
+        denied_syscalls: denied_nrs,
+        instruction_count: len(insns),
+        instructions: insns,
+        bytecode: raw
+    };
+}
+
+fn _path_is_within_prefix(cand, prefix) {
+    if prefix == "/" { return true; }
+    if cand == prefix { return true; }
+    let plen = len(prefix);
+    if len(cand) > plen and str_slice(cand, 0, plen) == prefix and strcharcodeat(cand, plen) == 47 {
+        return true;
+    }
+    return false;
+}
+
+fn _any_prefix_allows(prefixes, cand) {
+    let i = 0;
+    while i < len(prefixes) {
+        if _path_is_within_prefix(cand, prefixes[i]) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn verify_path_against_sandbox(policy, candidate_path, requested_mode = "read") {
+    let norm = _normalize_sandbox_path(candidate_path);
+    if norm == nil {
+        return map{
+            ok: true,
+            allowed: false,
+            reason: "path_traversal_or_non_canonical_rejected",
+            normalized_path: nil
+        };
+    }
+    let m = str_lower(str_trim(str(requested_mode)));
+    let allowed = false;
+    if m == "read" or m == "r" {
+        allowed = _any_prefix_allows(policy.fs_read, norm) or
+                  _any_prefix_allows(policy.fs_write, norm) or
+                  _any_prefix_allows(policy.fs_exec, norm);
+    } elif m == "write" or m == "w" or m == "rw" {
+        allowed = _any_prefix_allows(policy.fs_write, norm);
+    } elif m == "exec" or m == "execute" or m == "x" {
+        allowed = _any_prefix_allows(policy.fs_exec, norm);
+    } else {
+        return map{ ok: false, allowed: false, reason: "unsupported_access_mode" };
+    }
+
+    return map{
+        ok: true,
+        allowed: allowed,
+        mode: m,
+        normalized_path: norm,
+        reason: if allowed { "matched_allowlist_prefix" } else { "denied_by_default_sandbox_policy" }
+    };
+}
+
+export MODULE_VERSION;
+export LANDLOCK_ACCESS_FS_EXECUTE, LANDLOCK_ACCESS_FS_WRITE_FILE, LANDLOCK_ACCESS_FS_READ_FILE,
+       LANDLOCK_ACCESS_FS_READ_DIR, LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_TRUNCATE,
+       LANDLOCK_ACCESS_NET_BIND_TCP, LANDLOCK_ACCESS_NET_CONNECT_TCP;
+export SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_ERRNO_EPERM, SECCOMP_RET_ALLOW;
+export fiber_scheduler_new, fiber_scope_new, fiber_scope_cancel;
+export fiber_spawn_task, fiber_yield_step, fiber_run_until_complete;
+export fiber_chan_new, fiber_chan_send, fiber_chan_recv, fiber_chan_close;
+export encode_dns_wire_query, decode_dns_wire_response, resolve_doh_https;
+export parse_ipv6_literal, format_ipv6_canonical;
+export encode_ipc_frame, decode_ipc_frame;
+export create_sandbox_policy, compile_landlock_rules, compile_seccomp_bpf_filter, verify_path_against_sandbox;

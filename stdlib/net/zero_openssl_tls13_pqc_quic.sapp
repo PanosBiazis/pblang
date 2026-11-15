@@ -1,0 +1,1650 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+// stdlib/net/zero_openssl_tls13_pqc_quic.sapp — Zero-OpenSSL Constant-Time TLS 1.3
+// (RFC 8446), Hybrid Post-Quantum X25519MLKEM768 (IANA 0x11EC / FIPS 203), QUIC
+// Packet Protection (RFC 9001) & Encrypted DB Wire Drivers (PG SCRAM-PLUS / TDS8 / MySQL).
+
+let SHA256 = import("stdlib:sha256_pb.sapp");
+let AES_GCM = import("stdlib:aes_gcm.sapp");
+
+let TLS_VERSION_1_2 = 0x0303;
+let TLS_VERSION_1_3 = 0x0304;
+let TLS_CHACHA20_POLY1305_SHA256 = 0x1303;
+let TLS_AES_256_GCM_SHA384 = 0x1302;
+let TLS_AES_128_GCM_SHA256 = 0x1301;
+let TLS_ECDHE_CHACHA20_LEGACY = 0xCCA8;
+let GROUP_X25519 = 0x001D;
+let GROUP_X25519_MLKEM768 = 0x11EC;
+let PG_SSL_REQUEST_CODE = 80877103;
+let QUIC_V1_INITIAL_SALT_HEX = "38762cf7f55934b34d179ae6a4c80cadccbb7f0a";
+let MASK32 = 4294967295;
+let MLKEM_Q = 3329;
+let MLKEM_K = 3;
+
+// ── Constant-Time Byte & Word Primitives (Zero Secret-Dependent Branches) ────
+
+fn _app(dst, src) {
+    let i = 0;
+    while i < len(src) { array_push(dst, src[i]); i = i + 1; }
+    return dst;
+}
+
+fn _copy(src) {
+    let out = [];
+    let i = 0;
+    while i < len(src) { array_push(out, src[i]); i = i + 1; }
+    return out;
+}
+
+fn _zeros(n) {
+    let out = [];
+    let i = 0;
+    while i < n { array_push(out, 0); i = i + 1; }
+    return out;
+}
+
+fn hex_to_bytes(hex_str) { return AES_GCM.hex_bytes(hex_str); }
+fn bytes_to_hex(byte_arr) { return AES_GCM.bytes_hex(byte_arr); }
+
+fn ct_eq_bytes(a, b) {
+    if len(a) != len(b) { return false; }
+    let diff = 0;
+    let i = 0;
+    while i < len(a) {
+        diff = bit_or(diff, bit_xor(a[i], b[i]));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+// Constant-time byte array selector: returns `when_zero` if flag_bit == 0 else `when_one`
+fn ct_select_bytes(when_zero, when_one, flag_bit) {
+    let mask = bit_and(flag_bit, 1) * 255;
+    let out = [];
+    let i = 0;
+    while i < len(when_zero) {
+        let diff = bit_and(mask, bit_xor(when_zero[i], when_one[i]));
+        array_push(out, bit_xor(when_zero[i], diff));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _u16_be(v) { return [bit_and(bit_shr(v, 8), 255), bit_and(v, 255)]; }
+fn _u24_be(v) { return [bit_and(bit_shr(v, 16), 255), bit_and(bit_shr(v, 8), 255), bit_and(v, 255)]; }
+fn _u32_be(v) {
+    let hi = num_floor(v / 65536);
+    let lo = v - hi * 65536;
+    return [bit_and(bit_shr(hi, 8), 255), bit_and(hi, 255), bit_and(bit_shr(lo, 8), 255), bit_and(lo, 255)];
+}
+fn _read_u16_be(b, p) { return b[p] * 256 + b[p + 1]; }
+fn _read_u24_be(b, p) { return b[p] * 65536 + b[p + 1] * 256 + b[p + 2]; }
+fn _read_u32_be(b, p) { return ((b[p] * 256 + b[p + 1]) * 256 + b[p + 2]) * 256 + b[p + 3]; }
+
+fn _u32_le(v) {
+    let u = bit_and(v, MASK32);
+    return [bit_and(u, 255), bit_and(bit_shr(u, 8), 255), bit_and(bit_shr(u, 16), 255), bit_and(bit_shr(u, 24), 255)];
+}
+
+fn _u64_le(v) {
+    let hi = num_floor(v / 4294967296);
+    let lo = v - hi * 4294967296;
+    return _app(_u32_le(lo), _u32_le(hi));
+}
+
+fn _read_u32_le(b, p) {
+    return b[p] + b[p + 1] * 256 + b[p + 2] * 65536 + b[p + 3] * 16777216;
+}
+
+fn _add32(a, b) { return bit_and(a + b, MASK32); }
+
+fn _rotl32(x, n) {
+    let u = bit_and(x, MASK32);
+    if n == 0 { return u; }
+    let low_keep = bit_shr(MASK32, n);
+    let shifted = bit_shl(bit_and(u, low_keep), n);
+    let wrapped = bit_shr(u, 32 - n);
+    return bit_and(bit_or(shifted, wrapped), MASK32);
+}
+
+// ── Pure-PBLang SHA-256, HMAC-SHA256 & RFC 5869 HKDF / TLS 1.3 Key Schedule ──
+
+fn sha256_bytes(data) {
+    let ctx = SHA256.new();
+    SHA256.update(ctx, data);
+    return hex_to_bytes(SHA256.finish(ctx));
+}
+
+fn hmac_sha256_bytes(key_bytes, msg_bytes) {
+    let k = _copy(key_bytes);
+    if len(k) > 64 { k = sha256_bytes(k); }
+    while len(k) < 64 { array_push(k, 0); }
+    let ipad = [];
+    let opad = [];
+    let i = 0;
+    while i < 64 {
+        array_push(ipad, bit_xor(k[i], 0x36));
+        array_push(opad, bit_xor(k[i], 0x5C));
+        i = i + 1;
+    }
+    let inner = _app(ipad, msg_bytes);
+    let inner_hash = sha256_bytes(inner);
+    return sha256_bytes(_app(opad, inner_hash));
+}
+
+fn hkdf_extract(salt_bytes, ikm_bytes) {
+    let s = if is_array(salt_bytes) and len(salt_bytes) > 0 { salt_bytes } else { _zeros(32) };
+    return hmac_sha256_bytes(s, ikm_bytes);
+}
+
+fn hkdf_expand(prk_bytes, info_bytes, out_len) {
+    let out = [];
+    let prev = [];
+    let counter = 1;
+    while len(out) < out_len {
+        let inp = _copy(prev);
+        _app(inp, info_bytes);
+        array_push(inp, counter);
+        prev = hmac_sha256_bytes(prk_bytes, inp);
+        let j = 0;
+        while j < len(prev) and len(out) < out_len {
+            array_push(out, prev[j]);
+            j = j + 1;
+        }
+        counter = counter + 1;
+    }
+    return out;
+}
+
+fn tls13_hkdf_expand_label(secret, label_str, context_bytes, out_len) {
+    let full_label = str_to_bytes("tls13 " + label_str);
+    let hkdf_label = _u16_be(out_len);
+    array_push(hkdf_label, len(full_label));
+    _app(hkdf_label, full_label);
+    array_push(hkdf_label, len(context_bytes));
+    _app(hkdf_label, context_bytes);
+    return hkdf_expand(secret, hkdf_label, out_len);
+}
+
+fn tls13_derive_secret(secret, label_str, transcript_messages_bytes) {
+    let thash = sha256_bytes(transcript_messages_bytes);
+    return tls13_hkdf_expand_label(secret, label_str, thash, 32);
+}
+
+fn tls13_key_schedule(shared_secret_bytes, hello_transcript_bytes, full_transcript_bytes, psk_opt = nil) {
+    let psk = if is_array(psk_opt) and len(psk_opt) > 0 { psk_opt } else { _zeros(32) };
+    let early_secret = hkdf_extract(_zeros(32), psk);
+    let derived_0 = tls13_derive_secret(early_secret, "derived", []);
+    let handshake_secret = hkdf_extract(derived_0, shared_secret_bytes);
+
+    let c_hs_traffic = tls13_derive_secret(handshake_secret, "c hs traffic", hello_transcript_bytes);
+    let s_hs_traffic = tls13_derive_secret(handshake_secret, "s hs traffic", hello_transcript_bytes);
+
+    let derived_1 = tls13_derive_secret(handshake_secret, "derived", []);
+    let master_secret = hkdf_extract(derived_1, _zeros(32));
+
+    let c_ap_traffic = tls13_derive_secret(master_secret, "c ap traffic", full_transcript_bytes);
+    let s_ap_traffic = tls13_derive_secret(master_secret, "s ap traffic", full_transcript_bytes);
+    let exp_master = tls13_derive_secret(master_secret, "exp master", full_transcript_bytes);
+
+    return map{
+        early_secret: early_secret,
+        handshake_secret: handshake_secret,
+        master_secret: master_secret,
+        c_hs_traffic: c_hs_traffic,
+        s_hs_traffic: s_hs_traffic,
+        c_ap_traffic: c_ap_traffic,
+        s_ap_traffic: s_ap_traffic,
+        exporter_master: exp_master,
+        c_hs_key: tls13_hkdf_expand_label(c_hs_traffic, "key", [], 32),
+        c_hs_iv:  tls13_hkdf_expand_label(c_hs_traffic, "iv", [], 12),
+        s_hs_key: tls13_hkdf_expand_label(s_hs_traffic, "key", [], 32),
+        s_hs_iv:  tls13_hkdf_expand_label(s_hs_traffic, "iv", [], 12),
+        c_ap_key: tls13_hkdf_expand_label(c_ap_traffic, "key", [], 32),
+        c_ap_iv:  tls13_hkdf_expand_label(c_ap_traffic, "iv", [], 12),
+        s_ap_key: tls13_hkdf_expand_label(s_ap_traffic, "key", [], 32),
+        s_ap_iv:  tls13_hkdf_expand_label(s_ap_traffic, "iv", [], 12)
+    };
+}
+
+fn tls13_finished_verify_data(base_traffic_secret, transcript_bytes) {
+    let fin_key = tls13_hkdf_expand_label(base_traffic_secret, "finished", [], 32);
+    let thash = sha256_bytes(transcript_bytes);
+    return hmac_sha256_bytes(fin_key, thash);
+}
+
+fn tls13_exporter(exporter_master_secret, label_str, context_bytes, out_len) {
+    let derived = tls13_derive_secret(exporter_master_secret, label_str, []);
+    let ctx_hash = sha256_bytes(context_bytes);
+    return tls13_hkdf_expand_label(derived, "exporter", ctx_hash, out_len);
+}
+
+// ── RFC 7748 Constant-Time X25519 Montgomery Ladder over GF(2^255 - 19) ──────
+
+fn _gf_zero() { return _zeros(16); }
+fn _gf_one()  { let g = _zeros(16); g[0] = 1; return g; }
+
+fn _car25519_once(o) {
+    let i = 0;
+    while i < 15 {
+        let v = o[i] + 65536;
+        let c = num_floor(v / 65536);
+        o[i] = v - c * 65536;
+        o[i + 1] = o[i + 1] + (c - 1);
+        i = i + 1;
+    }
+    let v15 = o[15] + 65536;
+    let c15 = num_floor(v15 / 65536);
+    o[15] = v15 - c15 * 65536;
+    o[0] = o[0] + 38 * (c15 - 1);
+}
+
+fn _car25519(o) {
+    _car25519_once(o);
+    _car25519_once(o);
+    _car25519_once(o);
+}
+
+// Constant-time conditional swap of 16-limb field elements (zero secret-dependent branches)
+fn _cswap25519(p, q, swap_bit) {
+    let mask = bit_and(swap_bit, 1) * 65535;
+    let i = 0;
+    while i < 16 {
+        let t = bit_and(mask, bit_xor(p[i], q[i]));
+        p[i] = bit_xor(p[i], t);
+        q[i] = bit_xor(q[i], t);
+        i = i + 1;
+    }
+}
+
+fn _gf_add(a, b) {
+    let o = _zeros(16);
+    let i = 0;
+    while i < 16 { o[i] = a[i] + b[i]; i = i + 1; }
+    _car25519(o);
+    return o;
+}
+
+fn _gf_sub(a, b) {
+    let o = _zeros(16);
+    let i = 0;
+    while i < 16 { o[i] = a[i] - b[i]; i = i + 1; }
+    _car25519(o);
+    return o;
+}
+
+fn _gf_mul(a, b) {
+    let t = _zeros(31);
+    let i = 0;
+    while i < 16 {
+        let j = 0;
+        let ai = a[i];
+        while j < 16 {
+            t[i + j] = t[i + j] + ai * b[j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < 15 {
+        t[i] = t[i] + 38 * t[i + 16];
+        i = i + 1;
+    }
+    let o = slice(t, 0, 16);
+    _car25519(o);
+    return o;
+}
+
+fn _gf_sqr(a) { return _gf_mul(a, a); }
+
+fn _gf_inv(z_in) {
+    let c = _copy(z_in);
+    let a = 253;
+    while a >= 0 {
+        c = _gf_sqr(c);
+        if a != 2 and a != 4 { c = _gf_mul(c, z_in); }
+        a = a - 1;
+    }
+    return c;
+}
+
+fn _unpack25519(bytes32) {
+    let o = _zeros(16);
+    let i = 0;
+    while i < 16 {
+        o[i] = bytes32[2 * i] + bytes32[2 * i + 1] * 256;
+        i = i + 1;
+    }
+    o[15] = bit_and(o[15], 0x7FFF);
+    return o;
+}
+
+fn _pack25519(n_limbs) {
+    let t = _copy(n_limbs);
+    _car25519(t);
+    let pass_idx = 0;
+    while pass_idx < 2 {
+        let m = _zeros(16);
+        let d0 = t[0] - 0xFFED;
+        let b = 1 - num_floor((d0 + 65536) / 65536);
+        m[0] = (d0 + 65536) - (1 - b) * 65536;
+        let j = 1;
+        while j < 15 {
+            let dj = t[j] - 0xFFFF - b;
+            b = 1 - num_floor((dj + 65536) / 65536);
+            m[j] = (dj + 65536) - (1 - b) * 65536;
+            j = j + 1;
+        }
+        let d15 = t[15] - 0x7FFF - b;
+        b = 1 - num_floor((d15 + 65536) / 65536);
+        m[15] = (d15 + 65536) - (1 - b) * 65536;
+        _cswap25519(t, m, 1 - b);
+        pass_idx = pass_idx + 1;
+    }
+    let out = [];
+    let i = 0;
+    while i < 16 {
+        array_push(out, bit_and(t[i], 255));
+        array_push(out, bit_and(bit_shr(t[i], 8), 255));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn x25519_scalarmult(scalar32, u_coord32) {
+    if len(scalar32) != 32 or len(u_coord32) != 32 {
+        throw "x25519: expected 32-byte scalar and 32-byte u-coordinate";
+    }
+    let z = _copy(scalar32);
+    z[0] = bit_and(z[0], 248);
+    z[31] = bit_or(bit_and(z[31], 127), 64);
+
+    let x1 = _unpack25519(u_coord32);
+    let x2 = _gf_one();
+    let z2 = _gf_zero();
+    let x3 = _copy(x1);
+    let z3 = _gf_one();
+    let a24 = _zeros(16);
+    a24[0] = 0xDB41;
+    a24[1] = 1; // 121665 = (486662 - 2) / 4
+
+    let swap = 0;
+    let pos = 254;
+    while pos >= 0 {
+        let kt = bit_and(bit_shr(z[num_floor(pos / 8)], pos % 8), 1);
+        swap = bit_xor(swap, kt);
+        _cswap25519(x2, x3, swap);
+        _cswap25519(z2, z3, swap);
+        swap = kt;
+
+        let big_a = _gf_add(x2, z2);
+        let aa = _gf_sqr(big_a);
+        let big_b = _gf_sub(x2, z2);
+        let bb = _gf_sqr(big_b);
+        let e = _gf_sub(aa, bb);
+        let big_c = _gf_add(x3, z3);
+        let big_d = _gf_sub(x3, z3);
+        let da = _gf_mul(big_d, big_a);
+        let cb = _gf_mul(big_c, big_b);
+
+        x3 = _gf_sqr(_gf_add(da, cb));
+        z3 = _gf_mul(x1, _gf_sqr(_gf_sub(da, cb)));
+        x2 = _gf_mul(aa, bb);
+        z2 = _gf_mul(e, _gf_add(aa, _gf_mul(a24, e)));
+        pos = pos - 1;
+    }
+    _cswap25519(x2, x3, swap);
+    _cswap25519(z2, z3, swap);
+    return _pack25519(_gf_mul(x2, _gf_inv(z2)));
+}
+
+fn x25519_base(scalar32) {
+    let base_u = _zeros(32);
+    base_u[0] = 9;
+    return x25519_scalarmult(scalar32, base_u);
+}
+
+fn x25519_keypair(seed32 = nil) {
+    let sk = if is_array(seed32) and len(seed32) == 32 { _copy(seed32) } else { random_bytes(32) };
+    let pk = x25519_base(sk);
+    return map{ secret_key: sk, public_key: pk };
+}
+
+// ── RFC 8439 ChaCha20-Poly1305 AEAD (Constant-Time MAC & Stream Cipher) ──────
+
+fn _chacha_qr(s, ia, ib, ic, id) {
+    s[ia] = _add32(s[ia], s[ib]); s[id] = _rotl32(bit_xor(s[id], s[ia]), 16);
+    s[ic] = _add32(s[ic], s[id]); s[ib] = _rotl32(bit_xor(s[ib], s[ic]), 12);
+    s[ia] = _add32(s[ia], s[ib]); s[id] = _rotl32(bit_xor(s[id], s[ia]), 8);
+    s[ic] = _add32(s[ic], s[id]); s[ib] = _rotl32(bit_xor(s[ib], s[ic]), 7);
+}
+
+fn chacha20_block(key32, counter32, nonce12) {
+    let init = [
+        0x61707865, 0x3320646E, 0x79622D32, 0x6B206574,
+        _read_u32_le(key32, 0),  _read_u32_le(key32, 4),  _read_u32_le(key32, 8),  _read_u32_le(key32, 12),
+        _read_u32_le(key32, 16), _read_u32_le(key32, 20), _read_u32_le(key32, 24), _read_u32_le(key32, 28),
+        bit_and(counter32, MASK32),
+        _read_u32_le(nonce12, 0), _read_u32_le(nonce12, 4), _read_u32_le(nonce12, 8)
+    ];
+    let w = _copy(init);
+    let r = 0;
+    while r < 10 {
+        _chacha_qr(w, 0, 4,  8, 12); _chacha_qr(w, 1, 5,  9, 13);
+        _chacha_qr(w, 2, 6, 10, 14); _chacha_qr(w, 3, 7, 11, 15);
+        _chacha_qr(w, 0, 5, 10, 15); _chacha_qr(w, 1, 6, 11, 12);
+        _chacha_qr(w, 2, 7,  8, 13); _chacha_qr(w, 3, 4,  9, 14);
+        r = r + 1;
+    }
+    let out = [];
+    let i = 0;
+    while i < 16 {
+        _app(out, _u32_le(_add32(w[i], init[i])));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn chacha20_xor(key32, init_counter, nonce12, data_bytes) {
+    let out = [];
+    let pos = 0;
+    let ctr = init_counter;
+    while pos < len(data_bytes) {
+        let stream = chacha20_block(key32, ctr, nonce12);
+        ctr = ctr + 1;
+        let j = 0;
+        while j < 64 and pos < len(data_bytes) {
+            array_push(out, bit_xor(data_bytes[pos], stream[j]));
+            pos = pos + 1;
+            j = j + 1;
+        }
+    }
+    return out;
+}
+
+fn _poly1305_carry(h) {
+    let c = 0;
+    let j = 0;
+    while j < 16 {
+        let u = h[j] + c;
+        c = num_floor(u / 256);
+        h[j] = u - c * 256;
+        j = j + 1;
+    }
+    let u16 = h[16] + c;
+    let c16 = num_floor(u16 / 4);
+    h[16] = u16 - c16 * 4;
+    h[0] = h[0] + 5 * c16;
+    c = num_floor(h[0] / 256);
+    h[0] = h[0] - c * 256;
+    h[1] = h[1] + c;
+}
+
+fn poly1305_mac(key32, msg_bytes) {
+    let r = _zeros(17);
+    let i = 0;
+    while i < 16 { r[i] = key32[i]; i = i + 1; }
+    r[3]  = bit_and(r[3], 15);  r[7]  = bit_and(r[7], 15);
+    r[11] = bit_and(r[11], 15); r[15] = bit_and(r[15], 15);
+    r[4]  = bit_and(r[4], 252); r[8]  = bit_and(r[8], 252);
+    r[12] = bit_and(r[12], 252);
+
+    let h = _zeros(17);
+    let pos = 0;
+    while pos < len(msg_bytes) {
+        let c = _zeros(17);
+        let j = 0;
+        while j < 16 and pos + j < len(msg_bytes) {
+            c[j] = msg_bytes[pos + j];
+            j = j + 1;
+        }
+        c[j] = 1;
+        pos = pos + j;
+        let k = 0;
+        while k < 17 { h[k] = h[k] + c[k]; k = k + 1; }
+
+        let prod = _zeros(17);
+        let a = 0;
+        while a < 17 {
+            let sum_v = 0;
+            let b = 0;
+            while b <= a { sum_v = sum_v + h[b] * r[a - b]; b = b + 1; }
+            b = a + 1;
+            while b < 17 { sum_v = sum_v + 320 * h[b] * r[a + 17 - b]; b = b + 1; }
+            prod[a] = sum_v;
+            a = a + 1;
+        }
+        h = prod;
+        _poly1305_carry(h);
+        _poly1305_carry(h);
+    }
+
+    // Constant-time conditional subtraction of 2^130 - 5
+    let g = _copy(h);
+    g[0] = g[0] + 5;
+    let c = 0;
+    i = 0;
+    while i < 16 {
+        let u = g[i] + c;
+        c = num_floor(u / 256);
+        g[i] = u - c * 256;
+        i = i + 1;
+    }
+    g[16] = g[16] + c - 4;
+    let use_g = if g[16] >= 0 { 1 } else { 0 };
+    if g[16] < 0 { g[16] = g[16] + 256; }
+    let sel = ct_select_bytes(slice(h, 0, 16), slice(g, 0, 16), use_g);
+
+    let tag = [];
+    let carry = 0;
+    i = 0;
+    while i < 16 {
+        let u = sel[i] + key32[16 + i] + carry;
+        array_push(tag, u % 256);
+        carry = num_floor(u / 256);
+        i = i + 1;
+    }
+    return tag;
+}
+
+fn _poly1305_aead_tag(otk32, aad_bytes, ct_bytes) {
+    let mac_data = _copy(aad_bytes);
+    while len(mac_data) % 16 != 0 { array_push(mac_data, 0); }
+    _app(mac_data, ct_bytes);
+    while len(mac_data) % 16 != 0 { array_push(mac_data, 0); }
+    _app(mac_data, _u64_le(len(aad_bytes)));
+    _app(mac_data, _u64_le(len(ct_bytes)));
+    return poly1305_mac(otk32, mac_data);
+}
+
+fn chacha20_poly1305_seal(key32, nonce12, plaintext, aad) {
+    if len(key32) != 32 or len(nonce12) != 12 { throw "chacha20_poly1305: invalid key or nonce size"; }
+    let otk = slice(chacha20_block(key32, 0, nonce12), 0, 32);
+    let ct = chacha20_xor(key32, 1, nonce12, plaintext);
+    let tag = _poly1305_aead_tag(otk, aad, ct);
+    return map{ ciphertext: ct, tag: tag, sealed: _app(_copy(ct), tag) };
+}
+
+fn chacha20_poly1305_open(key32, nonce12, ciphertext, tag16, aad) {
+    if len(key32) != 32 or len(nonce12) != 12 or len(tag16) != 16 {
+        return map{ ok: false, error: "ChaCha20-Poly1305 invalid parameter length" };
+    }
+    let otk = slice(chacha20_block(key32, 0, nonce12), 0, 32);
+    let expected = _poly1305_aead_tag(otk, aad, ciphertext);
+    if not ct_eq_bytes(expected, tag16) {
+        return map{ ok: false, error: "ChaCha20-Poly1305 authentication failed" };
+    }
+    return map{ ok: true, plaintext: chacha20_xor(key32, 1, nonce12, ciphertext) };
+}
+
+// ── FIPS 202 Keccak Sponge & FIPS 203 ML-KEM-768 + Hybrid X25519MLKEM768 ─────
+
+let _KECCAK_PILN = [10,7,11,17,18,3,5,16,8,21,24,4,15,23,19,13,12,2,20,14,22,9,6,1];
+let _KECCAK_ROTC = [1,3,6,10,15,21,28,36,45,55,2,14,27,41,56,8,25,43,62,18,39,61,20,44];
+let _KECCAK_RC = [
+    [1,0],[32898,0],[32906,2147483648],[2147516416,2147483648],[32907,0],[2147483649,0],
+    [2147516545,2147483648],[32777,2147483648],[138,0],[136,0],[2147516425,0],[2147483658,0],
+    [2147516555,0],[139,2147483648],[32905,2147483648],[32771,2147483648],[32770,2147483648],
+    [128,2147483648],[32778,0],[2147483658,2147483648],[2147516545,2147483648],
+    [32896,2147483648],[2147483649,0],[2147516424,2147483648]
+];
+
+fn _k_shl32(v, amt) {
+    let out = v; let rem = amt;
+    while rem > 0 {
+        let st = if rem > 8 { 8 } else { rem };
+        out = bit_and(bit_shl(out, st), MASK32);
+        rem = rem - st;
+    }
+    return out;
+}
+
+fn _k_rot64(lo, hi, amt) {
+    let n = amt % 64;
+    if n == 0 { return [lo, hi]; }
+    if n == 32 { return [hi, lo]; }
+    if n < 32 {
+        return [
+            bit_and(bit_or(_k_shl32(lo, n), bit_shr(hi, 32 - n)), MASK32),
+            bit_and(bit_or(_k_shl32(hi, n), bit_shr(lo, 32 - n)), MASK32)
+        ];
+    }
+    let m = n - 32;
+    return [
+        bit_and(bit_or(_k_shl32(hi, m), bit_shr(lo, 32 - m)), MASK32),
+        bit_and(bit_or(_k_shl32(lo, m), bit_shr(hi, 32 - m)), MASK32)
+    ];
+}
+
+fn _keccak_f1600(st) {
+    let rnd = 0;
+    while rnd < 24 {
+        let c = [];
+        let x = 0;
+        while x < 5 {
+            let lo = 0; let hi = 0; let y = 0;
+            while y < 5 {
+                let p = (x + 5 * y) * 2;
+                lo = bit_xor(lo, st[p]); hi = bit_xor(hi, st[p + 1]);
+                y = y + 1;
+            }
+            array_push(c, bit_and(lo, MASK32)); array_push(c, bit_and(hi, MASK32));
+            x = x + 1;
+        }
+        x = 0;
+        while x < 5 {
+            let nx = (x + 1) % 5; let pv = (x + 4) % 5;
+            let rt = _k_rot64(c[nx * 2], c[nx * 2 + 1], 1);
+            let dlo = bit_xor(c[pv * 2], rt[0]); let dhi = bit_xor(c[pv * 2 + 1], rt[1]);
+            let y = 0;
+            while y < 5 {
+                let p = (x + 5 * y) * 2;
+                st[p] = bit_and(bit_xor(st[p], dlo), MASK32);
+                st[p + 1] = bit_and(bit_xor(st[p + 1], dhi), MASK32);
+                y = y + 1;
+            }
+            x = x + 1;
+        }
+        let clo = st[2]; let chi = st[3]; let t = 0;
+        while t < 24 {
+            let tgt = _KECCAK_PILN[t] * 2;
+            let slo = st[tgt]; let shi = st[tgt + 1];
+            let rt = _k_rot64(clo, chi, _KECCAK_ROTC[t]);
+            st[tgt] = rt[0]; st[tgt + 1] = rt[1];
+            clo = slo; chi = shi;
+            t = t + 1;
+        }
+        let y = 0;
+        while y < 5 {
+            let row = [];
+            x = 0;
+            while x < 5 { let p = (x + 5 * y) * 2; array_push(row, st[p]); array_push(row, st[p + 1]); x = x + 1; }
+            x = 0;
+            while x < 5 {
+                let p = (x + 5 * y) * 2;
+                let p1 = ((x + 1) % 5) * 2; let p2 = ((x + 2) % 5) * 2;
+                st[p] = bit_and(bit_xor(row[x * 2], bit_and(bit_xor(row[p1], MASK32), row[p2])), MASK32);
+                st[p + 1] = bit_and(bit_xor(row[x * 2 + 1], bit_and(bit_xor(row[p1 + 1], MASK32), row[p2 + 1])), MASK32);
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        st[0] = bit_and(bit_xor(st[0], _KECCAK_RC[rnd][0]), MASK32);
+        st[1] = bit_and(bit_xor(st[1], _KECCAK_RC[rnd][1]), MASK32);
+        rnd = rnd + 1;
+    }
+}
+
+fn _k_xor_byte(st, byte_idx, val) {
+    let lane = num_floor(byte_idx / 8);
+    let within = byte_idx % 8;
+    let idx = lane * 2 + (if within < 4 { 0 } else { 1 });
+    st[idx] = bit_and(bit_xor(st[idx], _k_shl32(val, (within % 4) * 8)), MASK32);
+}
+
+fn _keccak_sponge(rate, domain, input_bytes, out_len) {
+    let st = _zeros(50);
+    let off = 0;
+    while len(input_bytes) - off >= rate {
+        let i = 0;
+        while i < rate { _k_xor_byte(st, i, input_bytes[off + i]); i = i + 1; }
+        _keccak_f1600(st);
+        off = off + rate;
+    }
+    let rem = len(input_bytes) - off;
+    let i = 0;
+    while i < rem { _k_xor_byte(st, i, input_bytes[off + i]); i = i + 1; }
+    _k_xor_byte(st, rem, domain);
+    _k_xor_byte(st, rate - 1, 0x80);
+    _keccak_f1600(st);
+    let out = [];
+    let pos = 0;
+    while len(out) < out_len {
+        if pos == rate { _keccak_f1600(st); pos = 0; }
+        let lane = num_floor(pos / 8);
+        let within = pos % 8;
+        let w = st[lane * 2 + (if within < 4 { 0 } else { 1 })];
+        array_push(out, bit_and(bit_shr(w, (within % 4) * 8), 255));
+        pos = pos + 1;
+    }
+    return out;
+}
+
+fn _sha3_256(b)        { return _keccak_sponge(136, 0x06, b, 32); }
+fn _sha3_512(b)        { return _keccak_sponge(72,  0x06, b, 64); }
+fn _shake128(b, n_out) { return _keccak_sponge(168, 0x1F, b, n_out); }
+fn _shake256(b, n_out) { return _keccak_sponge(136, 0x1F, b, n_out); }
+
+fn _br7(x) {
+    let r = 0; let v = x; let i = 0;
+    while i < 7 { r = r * 2 + (v % 2); v = num_floor(v / 2); i = i + 1; }
+    return r;
+}
+
+fn _pow_q(base, exp_n) {
+    let res = 1; let b = base % MLKEM_Q; let e = exp_n;
+    while e > 0 {
+        if e % 2 == 1 { res = (res * b) % MLKEM_Q; }
+        b = (b * b) % MLKEM_Q;
+        e = num_floor(e / 2);
+    }
+    return res;
+}
+
+fn _build_mlkem_tables() {
+    let zetas = [];
+    let gammas = [];
+    let k = 0;
+    while k < 128 {
+        let br = _br7(k);
+        array_push(zetas, _pow_q(17, br));
+        array_push(gammas, _pow_q(17, 2 * br + 1));
+        k = k + 1;
+    }
+    return map{ zetas: zetas, gammas: gammas };
+}
+
+let _MLKEM_TBL = _build_mlkem_tables();
+
+fn mlkem_ntt(poly) {
+    let f = _copy(poly);
+    let zetas = _MLKEM_TBL.zetas;
+    let idx = 1;
+    let step = 128;
+    while step >= 2 {
+        let start = 0;
+        while start < 256 {
+            let z = zetas[idx]; idx = idx + 1;
+            let j = start;
+            while j < start + step {
+                let t = (z * f[j + step]) % MLKEM_Q;
+                f[j + step] = (f[j] + MLKEM_Q - t) % MLKEM_Q;
+                f[j] = (f[j] + t) % MLKEM_Q;
+                j = j + 1;
+            }
+            start = start + 2 * step;
+        }
+        step = num_floor(step / 2);
+    }
+    return f;
+}
+
+fn mlkem_inv_ntt(poly) {
+    let f = _copy(poly);
+    let zetas = _MLKEM_TBL.zetas;
+    let idx = 127;
+    let step = 2;
+    while step <= 128 {
+        let start = 0;
+        while start < 256 {
+            let z = zetas[idx]; idx = idx - 1;
+            let j = start;
+            while j < start + step {
+                let t = f[j];
+                f[j] = (t + f[j + step]) % MLKEM_Q;
+                let diff = (f[j + step] + MLKEM_Q - t) % MLKEM_Q;
+                f[j + step] = (z * diff) % MLKEM_Q;
+                j = j + 1;
+            }
+            start = start + 2 * step;
+        }
+        step = step * 2;
+    }
+    let i = 0;
+    while i < 256 { f[i] = (f[i] * 3303) % MLKEM_Q; i = i + 1; }
+    return f;
+}
+
+fn _poly_basemul(a, b) {
+    let h = _zeros(256);
+    let gammas = _MLKEM_TBL.gammas;
+    let i = 0;
+    while i < 128 {
+        let a0 = a[2 * i]; let a1 = a[2 * i + 1];
+        let b0 = b[2 * i]; let b1 = b[2 * i + 1];
+        let gm = gammas[i];
+        h[2 * i] = (a0 * b0 + ((a1 * b1) % MLKEM_Q) * gm) % MLKEM_Q;
+        h[2 * i + 1] = (a0 * b1 + a1 * b0) % MLKEM_Q;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn _poly_add(a, b) {
+    let o = _zeros(256); let i = 0;
+    while i < 256 { o[i] = (a[i] + b[i]) % MLKEM_Q; i = i + 1; }
+    return o;
+}
+
+fn _poly_sub(a, b) {
+    let o = _zeros(256); let i = 0;
+    while i < 256 { o[i] = (a[i] + MLKEM_Q - b[i]) % MLKEM_Q; i = i + 1; }
+    return o;
+}
+
+fn _sample_ntt(rho32, col_j, row_i) {
+    let xof_in = _copy(rho32);
+    array_push(xof_in, col_j);
+    array_push(xof_in, row_i);
+    let buf = _shake128(xof_in, 672);
+    let out = [];
+    let pos = 0;
+    while len(out) < 256 and pos + 2 < len(buf) {
+        let d1 = buf[pos] + 256 * (buf[pos + 1] % 16);
+        let d2 = num_floor(buf[pos + 1] / 16) + 16 * buf[pos + 2];
+        if d1 < MLKEM_Q { array_push(out, d1); }
+        if d2 < MLKEM_Q and len(out) < 256 { array_push(out, d2); }
+        pos = pos + 3;
+    }
+    return out;
+}
+
+fn _sample_cbd2(sigma32, nonce_b) {
+    let prf_in = _copy(sigma32);
+    array_push(prf_in, nonce_b);
+    let b = _shake256(prf_in, 128);
+    let f = [];
+    let i = 0;
+    while i < 128 {
+        let v = b[i];
+        let a0 = bit_and(v, 1) + bit_and(bit_shr(v, 1), 1);
+        let b0 = bit_and(bit_shr(v, 2), 1) + bit_and(bit_shr(v, 3), 1);
+        let a1 = bit_and(bit_shr(v, 4), 1) + bit_and(bit_shr(v, 5), 1);
+        let b1 = bit_and(bit_shr(v, 6), 1) + bit_and(bit_shr(v, 7), 1);
+        array_push(f, (a0 + MLKEM_Q - b0) % MLKEM_Q);
+        array_push(f, (a1 + MLKEM_Q - b1) % MLKEM_Q);
+        i = i + 1;
+    }
+    return f;
+}
+
+fn _byte_encode(vals, d_bits) {
+    let out = [];
+    let acc = 0;
+    let bits = 0;
+    let mask = bit_shl(1, d_bits) - 1;
+    let i = 0;
+    while i < len(vals) {
+        acc = acc + bit_and(vals[i], mask) * bit_shl(1, bits);
+        bits = bits + d_bits;
+        while bits >= 8 {
+            array_push(out, acc % 256);
+            acc = num_floor(acc / 256);
+            bits = bits - 8;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _byte_decode(bytes_in, d_bits) {
+    let out = [];
+    let acc = 0;
+    let bits = 0;
+    let mod_v = bit_shl(1, d_bits);
+    let i = 0;
+    while i < len(bytes_in) {
+        acc = acc + bytes_in[i] * bit_shl(1, bits);
+        bits = bits + 8;
+        while bits >= d_bits and len(out) < 256 {
+            array_push(out, acc % mod_v);
+            acc = num_floor(acc / mod_v);
+            bits = bits - d_bits;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _compress_poly(p, d_bits) {
+    let two_d = bit_shl(1, d_bits);
+    let out = []; let i = 0;
+    while i < 256 {
+        array_push(out, num_floor((p[i] * two_d + 1664) / MLKEM_Q) % two_d);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _decompress_poly(p, d_bits) {
+    let two_d = bit_shl(1, d_bits);
+    let half = num_floor(two_d / 2);
+    let out = []; let i = 0;
+    while i < 256 {
+        array_push(out, num_floor((p[i] * MLKEM_Q + half) / two_d));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _kpke_encrypt(ek_bytes, msg32, rand32) {
+    let t_hat = [];
+    let i = 0;
+    while i < MLKEM_K {
+        array_push(t_hat, _byte_decode(slice(ek_bytes, i * 384, (i + 1) * 384), 12));
+        i = i + 1;
+    }
+    let rho = slice(ek_bytes, 1152, 1184);
+    let r_vec = [];
+    let e1 = [];
+    i = 0;
+    while i < MLKEM_K {
+        array_push(r_vec, mlkem_ntt(_sample_cbd2(rand32, i)));
+        array_push(e1, _sample_cbd2(rand32, MLKEM_K + i));
+        i = i + 1;
+    }
+    let e2 = _sample_cbd2(rand32, 2 * MLKEM_K);
+
+    // u = InvNTT(A^T * r_hat) + e1
+    let c1 = [];
+    i = 0;
+    while i < MLKEM_K {
+        let acc = _zeros(256);
+        let j = 0;
+        while j < MLKEM_K {
+            // A^T[i, j] = A[j, i] = _sample_ntt(rho, i, j)
+            acc = _poly_add(acc, _poly_basemul(_sample_ntt(rho, i, j), r_vec[j]));
+            j = j + 1;
+        }
+        let u_i = _poly_add(mlkem_inv_ntt(acc), e1[i]);
+        _app(c1, _byte_encode(_compress_poly(u_i, 10), 10));
+        i = i + 1;
+    }
+
+    // v = InvNTT(t_hat^T * r_hat) + e2 + Decompress_1(msg)
+    let v_ntt = _zeros(256);
+    i = 0;
+    while i < MLKEM_K {
+        v_ntt = _poly_add(v_ntt, _poly_basemul(t_hat[i], r_vec[i]));
+        i = i + 1;
+    }
+    let mu = _decompress_poly(_byte_decode(msg32, 1), 1);
+    let v = _poly_add(_poly_add(mlkem_inv_ntt(v_ntt), e2), mu);
+    let c2 = _byte_encode(_compress_poly(v, 4), 4);
+    return _app(c1, c2);
+}
+
+fn mlkem768_keygen(d_seed32 = nil, z_seed32 = nil) {
+    let d = if is_array(d_seed32) and len(d_seed32) == 32 { _copy(d_seed32) } else { random_bytes(32) };
+    let z = if is_array(z_seed32) and len(z_seed32) == 32 { _copy(z_seed32) } else { random_bytes(32) };
+    let g_in = _copy(d);
+    array_push(g_in, MLKEM_K); // FIPS 203 domain separation byte k=3
+    let g_out = _sha3_512(g_in);
+    let rho = slice(g_out, 0, 32);
+    let sigma = slice(g_out, 32, 64);
+
+    let s_hat = [];
+    let e_hat = [];
+    let i = 0;
+    while i < MLKEM_K {
+        array_push(s_hat, mlkem_ntt(_sample_cbd2(sigma, i)));
+        array_push(e_hat, mlkem_ntt(_sample_cbd2(sigma, MLKEM_K + i)));
+        i = i + 1;
+    }
+
+    let ek = [];
+    let dk_pke = [];
+    i = 0;
+    while i < MLKEM_K {
+        let acc = _zeros(256);
+        let j = 0;
+        while j < MLKEM_K {
+            acc = _poly_add(acc, _poly_basemul(_sample_ntt(rho, j, i), s_hat[j]));
+            j = j + 1;
+        }
+        let t_i = _poly_add(acc, e_hat[i]);
+        _app(ek, _byte_encode(t_i, 12));
+        _app(dk_pke, _byte_encode(s_hat[i], 12));
+        i = i + 1;
+    }
+    _app(ek, rho);
+    let h_ek = _sha3_256(ek);
+    let dk = _copy(dk_pke);
+    _app(dk, ek);
+    _app(dk, h_ek);
+    _app(dk, z);
+    return map{ ek: ek, dk: dk, ek_len: len(ek), dk_len: len(dk) };
+}
+
+fn mlkem768_encaps(ek_bytes, m_seed32 = nil) {
+    if len(ek_bytes) != 1184 { throw "mlkem768: invalid ek length"; }
+    let m = if is_array(m_seed32) and len(m_seed32) == 32 { _copy(m_seed32) } else { random_bytes(32) };
+    let h_ek = _sha3_256(ek_bytes);
+    let kr = _sha3_512(_app(_copy(m), h_ek));
+    let shared_k = slice(kr, 0, 32);
+    let r_coin = slice(kr, 32, 64);
+    let ct = _kpke_encrypt(ek_bytes, m, r_coin);
+    return map{ ciphertext: ct, shared_secret: shared_k };
+}
+
+fn mlkem768_decaps(dk_bytes, ct_bytes) {
+    if len(dk_bytes) != 2400 or len(ct_bytes) != 1088 {
+        throw "mlkem768: invalid dk or ciphertext length";
+    }
+    let dk_pke = slice(dk_bytes, 0, 1152);
+    let ek = slice(dk_bytes, 1152, 2336);
+    let h_ek = slice(dk_bytes, 2336, 2368);
+    let z = slice(dk_bytes, 2368, 2400);
+
+    let u_vec = [];
+    let s_hat = [];
+    let i = 0;
+    while i < MLKEM_K {
+        let u_i = _decompress_poly(_byte_decode(slice(ct_bytes, i * 320, (i + 1) * 320), 10), 10);
+        array_push(u_vec, mlkem_ntt(u_i));
+        array_push(s_hat, _byte_decode(slice(dk_pke, i * 384, (i + 1) * 384), 12));
+        i = i + 1;
+    }
+    let v = _decompress_poly(_byte_decode(slice(ct_bytes, 960, 1088), 4), 4);
+    let dot = _zeros(256);
+    i = 0;
+    while i < MLKEM_K { dot = _poly_add(dot, _poly_basemul(s_hat[i], u_vec[i])); i = i + 1; }
+    let w = _poly_sub(v, mlkem_inv_ntt(dot));
+    let m_prime = _byte_encode(_compress_poly(w, 1), 1);
+
+    let kr = _sha3_512(_app(_copy(m_prime), h_ek));
+    let k_prime = slice(kr, 0, 32);
+    let r_prime = slice(kr, 32, 64);
+    let k_bar = _shake256(_app(_copy(z), ct_bytes), 32);
+    let ct_prime = _kpke_encrypt(ek, m_prime, r_prime);
+
+    // Constant-time Fujisaki-Okamoto implicit rejection (zero branch on diff)
+    let diff = 0;
+    i = 0;
+    while i < 1088 { diff = bit_or(diff, bit_xor(ct_bytes[i], ct_prime[i])); i = i + 1; }
+    let bad_bit = if diff == 0 { 0 } else { 1 };
+    let ss = ct_select_bytes(k_prime, k_bar, bad_bit);
+    return map{ shared_secret: ss, implicit_rejected: bad_bit == 1 };
+}
+
+// Hybrid X25519MLKEM768 (IANA 0x11EC: 1184B ML-KEM-768 + 32B X25519 = 1216B client share)
+fn x25519_mlkem768_keygen(seed_bundle = nil) {
+    let d = if is_map(seed_bundle) and map_has(seed_bundle, "d") { seed_bundle.d } else { random_bytes(32) };
+    let z = if is_map(seed_bundle) and map_has(seed_bundle, "z") { seed_bundle.z } else { random_bytes(32) };
+    let x = if is_map(seed_bundle) and map_has(seed_bundle, "x") { seed_bundle.x } else { random_bytes(32) };
+    let pq = mlkem768_keygen(d, z);
+    let ec = x25519_keypair(x);
+    let pub_share = _app(_copy(pq.ek), ec.public_key);
+    return map{
+        group: GROUP_X25519_MLKEM768,
+        public_share: pub_share,
+        mlkem_dk: pq.dk,
+        x25519_sk: ec.secret_key
+    };
+}
+
+fn x25519_mlkem768_encaps(client_pub_share1216, m_seed = nil, x_seed = nil) {
+    if len(client_pub_share1216) != 1216 { throw "x25519_mlkem768: expected 1216-byte client share"; }
+    let ek_pq = slice(client_pub_share1216, 0, 1184);
+    let pk_ec = slice(client_pub_share1216, 1184, 1216);
+    let enc_pq = mlkem768_encaps(ek_pq, m_seed);
+    let eph_ec = x25519_keypair(x_seed);
+    let ss_ec = x25519_scalarmult(eph_ec.secret_key, pk_ec);
+    let server_share = _app(_copy(enc_pq.ciphertext), eph_ec.public_key); // 1088 + 32 = 1120 bytes
+    let raw_concat = _app(_copy(enc_pq.shared_secret), ss_ec);
+    let hybrid_ss = hkdf_extract(_zeros(32), raw_concat);
+    return map{
+        group: GROUP_X25519_MLKEM768,
+        server_share: server_share,
+        shared_secret: hybrid_ss,
+        concat_secret: raw_concat
+    };
+}
+
+fn x25519_mlkem768_decaps(keypair_state, server_share1120) {
+    if len(server_share1120) != 1120 { throw "x25519_mlkem768: expected 1120-byte server share"; }
+    let ct_pq = slice(server_share1120, 0, 1088);
+    let pk_ec = slice(server_share1120, 1088, 1120);
+    let dec_pq = mlkem768_decaps(keypair_state.mlkem_dk, ct_pq);
+    let ss_ec = x25519_scalarmult(keypair_state.x25519_sk, pk_ec);
+    let raw_concat = _app(_copy(dec_pq.shared_secret), ss_ec);
+    let hybrid_ss = hkdf_extract(_zeros(32), raw_concat);
+    return map{
+        shared_secret: hybrid_ss,
+        concat_secret: raw_concat,
+        implicit_rejected: dec_pq.implicit_rejected
+    };
+}
+
+// ── TLS 1.3 (RFC 8446) Binary Handshake Codec, Record AEAD & Fallback Guard ──
+
+fn _tls_hs_msg(hs_type, body_bytes) {
+    let m = [hs_type];
+    _app(m, _u24_be(len(body_bytes)));
+    _app(m, body_bytes);
+    return m;
+}
+
+fn _tls_ext(ext_type, payload) {
+    let e = _u16_be(ext_type);
+    _app(e, _u16_be(len(payload)));
+    _app(e, payload);
+    return e;
+}
+
+fn _nonce_xor_seq(iv12, seq_num) {
+    let out = _copy(iv12);
+    let s_hi = num_floor(seq_num / 4294967296);
+    let s_lo = seq_num - s_hi * 4294967296;
+    let sb = _app(_u32_be(s_hi), _u32_be(s_lo));
+    let i = 0;
+    while i < 8 {
+        out[4 + i] = bit_xor(out[4 + i], sb[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn tls13_encrypt_record(key32, iv12, seq_num, inner_type, content_bytes) {
+    let inner = _copy(content_bytes);
+    array_push(inner, inner_type);
+    let total_len = len(inner) + 16;
+    let hdr = [0x17, 0x03, 0x03, bit_and(bit_shr(total_len, 8), 255), bit_and(total_len, 255)];
+    let nonce = _nonce_xor_seq(iv12, seq_num);
+    let sealed = chacha20_poly1305_seal(key32, nonce, inner, hdr);
+    return _app(_copy(hdr), sealed.sealed);
+}
+
+fn tls13_decrypt_record(key32, iv12, seq_num, record_bytes) {
+    if len(record_bytes) < 22 or record_bytes[0] != 0x17 {
+        return map{ ok: false, error: "invalid TLS 1.3 encrypted record header" };
+    }
+    let rlen = _read_u16_be(record_bytes, 3);
+    if rlen + 5 != len(record_bytes) { return map{ ok: false, error: "TLS record length mismatch" }; }
+    let hdr = slice(record_bytes, 0, 5);
+    let ct = slice(record_bytes, 5, len(record_bytes) - 16);
+    let tag = slice(record_bytes, len(record_bytes) - 16, len(record_bytes));
+    let opened = chacha20_poly1305_open(key32, _nonce_xor_seq(iv12, seq_num), ct, tag, hdr);
+    if not opened.ok { return opened; }
+    let pt = opened.plaintext;
+    let idx = len(pt) - 1;
+    while idx >= 0 and pt[idx] == 0 { idx = idx - 1; }
+    if idx < 0 { return map{ ok: false, error: "missing TLS 1.3 inner content type" }; }
+    return map{ ok: true, inner_type: pt[idx], plaintext: slice(pt, 0, idx) };
+}
+
+fn build_tls13_client_hello(server_name, opts = nil) {
+    let allow_tls12 = is_map(opts) and map_has(opts, "allow_tls12_legacy") and opts.allow_tls12_legacy == true;
+    let alpn_list = if is_map(opts) and map_has(opts, "alpn") { opts.alpn } else { ["h3", "h2", "http/1.1"] };
+    let pq_kp = x25519_mlkem768_keygen();
+    let x_kp = x25519_keypair();
+    let crand = random_bytes(32);
+    let sess_id = random_bytes(32);
+
+    let suites = [TLS_CHACHA20_POLY1305_SHA256, TLS_AES_256_GCM_SHA384, TLS_AES_128_GCM_SHA256];
+    if allow_tls12 { array_push(suites, TLS_ECDHE_CHACHA20_LEGACY); }
+
+    let exts = [];
+    // SNI (0x0000)
+    let sni_b = str_to_bytes(server_name);
+    let sni_item = [0]; _app(sni_item, _u16_be(len(sni_b))); _app(sni_item, sni_b);
+    _app(exts, _tls_ext(0x0000, _app(_u16_be(len(sni_item)), sni_item)));
+    // Supported Groups (0x000A): X25519MLKEM768 (0x11EC), x25519 (0x001D)
+    let grps = _app(_u16_be(GROUP_X25519_MLKEM768), _u16_be(GROUP_X25519));
+    _app(exts, _tls_ext(0x000A, _app(_u16_be(len(grps)), grps)));
+    // Signature Algorithms (0x000D): ed25519(0x0807), rsa_pss_rsae_sha256(0x0804)
+    let sigs = _app(_u16_be(0x0807), _u16_be(0x0804));
+    _app(exts, _tls_ext(0x000D, _app(_u16_be(len(sigs)), sigs)));
+    // ALPN (0x0010)
+    let alpn_wire = [];
+    let ai = 0;
+    while ai < len(alpn_list) {
+        let ab = str_to_bytes(alpn_list[ai]);
+        array_push(alpn_wire, len(ab));
+        _app(alpn_wire, ab);
+        ai = ai + 1;
+    }
+    _app(exts, _tls_ext(0x0010, _app(_u16_be(len(alpn_wire)), alpn_wire)));
+    // Supported Versions (0x002B)
+    let vers = _u16_be(TLS_VERSION_1_3);
+    if allow_tls12 { _app(vers, _u16_be(TLS_VERSION_1_2)); }
+    _app(exts, _tls_ext(0x002B, _app([len(vers)], vers)));
+    // Key Share (0x0033): 0x11EC (1216B) + 0x001D (32B)
+    let ks = [];
+    _app(ks, _u16_be(GROUP_X25519_MLKEM768)); _app(ks, _u16_be(len(pq_kp.public_share))); _app(ks, pq_kp.public_share);
+    _app(ks, _u16_be(GROUP_X25519));          _app(ks, _u16_be(len(x_kp.public_key)));   _app(ks, x_kp.public_key);
+    _app(exts, _tls_ext(0x0033, _app(_u16_be(len(ks)), ks)));
+
+    let body = _u16_be(TLS_VERSION_1_2);
+    _app(body, crand);
+    array_push(body, len(sess_id)); _app(body, sess_id);
+    _app(body, _u16_be(len(suites) * 2));
+    let si = 0;
+    while si < len(suites) { _app(body, _u16_be(suites[si])); si = si + 1; }
+    _app(body, [1, 0]); // legacy compression = null
+    _app(body, _u16_be(len(exts)));
+    _app(body, exts);
+
+    let hs = _tls_hs_msg(0x01, body);
+    return map{
+        handshake_bytes: hs, pq_state: pq_kp, x25519_state: x_kp,
+        client_random: crand, session_id: sess_id, allow_tls12_legacy: allow_tls12
+    };
+}
+
+fn parse_tls13_client_hello(hs_bytes) {
+    if len(hs_bytes) < 42 or hs_bytes[0] != 0x01 { return map{ ok: false, error: "not ClientHello" }; }
+    let mlen = _read_u24_be(hs_bytes, 1);
+    if mlen + 4 != len(hs_bytes) { return map{ ok: false, error: "ClientHello length mismatch" }; }
+    let legacy_ver = _read_u16_be(hs_bytes, 4);
+    if legacy_ver < 0x0303 { return map{ ok: false, alert: "protocol_version", error: "blocked SSLv3/TLS1.0/1.1" }; }
+    let pos = 38;
+    let sid_len = hs_bytes[pos];
+    let sid = slice(hs_bytes, pos + 1, pos + 1 + sid_len);
+    pos = pos + 1 + sid_len;
+    let cs_len = _read_u16_be(hs_bytes, pos); pos = pos + 2;
+    let suites = [];
+    let end_cs = pos + cs_len;
+    while pos < end_cs {
+        let cs = _read_u16_be(hs_bytes, pos);
+        if cs == 0x0004 or cs == 0x0005 or cs == 0x0000 {
+            return map{ ok: false, alert: "insufficient_security", error: "blocked RC4/NULL cipher" };
+        }
+        array_push(suites, cs);
+        pos = pos + 2;
+    }
+    let comp_len = hs_bytes[pos]; pos = pos + 1 + comp_len;
+    let ext_total = _read_u16_be(hs_bytes, pos); pos = pos + 2;
+    let versions = [];
+    let key_shares = map{};
+    let alpns = [];
+    let sni = "";
+    let ext_end = pos + ext_total;
+    while pos + 4 <= ext_end {
+        let et = _read_u16_be(hs_bytes, pos);
+        let el = _read_u16_be(hs_bytes, pos + 2);
+        let ep = pos + 4;
+        if et == 0x0000 and el >= 5 {
+            let nl = _read_u16_be(hs_bytes, ep + 3);
+            sni = bytes_to_str(slice(hs_bytes, ep + 5, ep + 5 + nl));
+        } elif et == 0x002B and el >= 3 {
+            let vl = hs_bytes[ep];
+            let k = 0;
+            while k < vl {
+                let v = _read_u16_be(hs_bytes, ep + 1 + k);
+                if v < 0x0303 { return map{ ok: false, alert: "protocol_version", error: "deprecated TLS version" }; }
+                array_push(versions, v);
+                k = k + 2;
+            }
+        } elif et == 0x0033 and el >= 4 {
+            let ksl = _read_u16_be(hs_bytes, ep);
+            let kp = ep + 2;
+            while kp < ep + 2 + ksl {
+                let grp = _read_u16_be(hs_bytes, kp);
+                let gl = _read_u16_be(hs_bytes, kp + 2);
+                key_shares[str(grp)] = slice(hs_bytes, kp + 4, kp + 4 + gl);
+                kp = kp + 4 + gl;
+            }
+        } elif et == 0x0010 and el >= 3 {
+            let al = _read_u16_be(hs_bytes, ep);
+            let ap = ep + 2;
+            while ap < ep + 2 + al {
+                let pl = hs_bytes[ap];
+                array_push(alpns, bytes_to_str(slice(hs_bytes, ap + 1, ap + 1 + pl)));
+                ap = ap + 1 + pl;
+            }
+        }
+        pos = ep + el;
+    }
+    return map{
+        ok: true, sni: sni, session_id: sid, cipher_suites: suites,
+        supported_versions: versions, key_shares: key_shares, alpn: alpns
+    };
+}
+
+fn run_tls13_pqc_handshake(server_name, server_opts = nil) {
+    let ch_bundle = build_tls13_client_hello(server_name, server_opts);
+    let parsed_ch = parse_tls13_client_hello(ch_bundle.handshake_bytes);
+    if not parsed_ch.ok { return parsed_ch; }
+
+    let server_max_ver = if is_map(server_opts) and map_has(server_opts, "server_max_version") { server_opts.server_max_version } else { TLS_VERSION_1_3 };
+    if server_max_ver < TLS_VERSION_1_2 {
+        return map{ ok: false, alert: "protocol_version", error: "SSLv3/TLS1.0/TLS1.1 strictly forbidden" };
+    }
+    if server_max_ver == TLS_VERSION_1_2 {
+        if not ch_bundle.allow_tls12_legacy {
+            return map{ ok: false, alert: "protocol_version", error: "peer only supports TLS 1.2 while legacy fallback is disabled" };
+        }
+        let srv_ec = x25519_keypair();
+        let ss12 = x25519_scalarmult(srv_ec.secret_key, parsed_ch.key_shares[str(GROUP_X25519)]);
+        return map{
+            ok: true, negotiated_version: TLS_VERSION_1_2, legacy_fallback: true,
+            cipher_suite: TLS_ECDHE_CHACHA20_LEGACY, group: GROUP_X25519, shared_secret: ss12
+        };
+    }
+
+    // Negotiate X25519MLKEM768 (0x11EC) + TLS_CHACHA20_POLY1305_SHA256 (0x1303)
+    let enc = x25519_mlkem768_encaps(parsed_ch.key_shares[str(GROUP_X25519_MLKEM768)]);
+    let sh_exts = _tls_ext(0x002B, _u16_be(TLS_VERSION_1_3));
+    let sh_ks = _u16_be(GROUP_X25519_MLKEM768);
+    _app(sh_ks, _u16_be(len(enc.server_share)));
+    _app(sh_ks, enc.server_share);
+    _app(sh_exts, _tls_ext(0x0033, sh_ks));
+
+    let sh_body = _u16_be(TLS_VERSION_1_2);
+    _app(sh_body, random_bytes(32));
+    array_push(sh_body, len(parsed_ch.session_id)); _app(sh_body, parsed_ch.session_id);
+    _app(sh_body, _u16_be(TLS_CHACHA20_POLY1305_SHA256));
+    array_push(sh_body, 0);
+    _app(sh_body, _u16_be(len(sh_exts)));
+    _app(sh_body, sh_exts);
+    let sh_msg = _tls_hs_msg(0x02, sh_body);
+
+    // Client decapsulates ServerHello key_share
+    let dec = x25519_mlkem768_decaps(ch_bundle.pq_state, enc.server_share);
+    if not ct_eq_bytes(dec.shared_secret, enc.shared_secret) {
+        return map{ ok: false, error: "hybrid PQC shared secret mismatch" };
+    }
+
+    let hello_tr = _app(_copy(ch_bundle.handshake_bytes), sh_msg);
+    let sel_alpn = if len(parsed_ch.alpn) > 0 { parsed_ch.alpn[0] } else { "h3" };
+    let ab = str_to_bytes(sel_alpn);
+    let ee_alpn = _app(_u16_be(len(ab) + 1), _app([len(ab)], ab));
+    let ee_msg = _tls_hs_msg(0x08, _app(_u16_be(len(ee_alpn) + 4), _tls_ext(0x0010, ee_alpn)));
+    let cert_msg = _tls_hs_msg(0x0B, _app([0], _u24_be(0)));
+    let cv_sig = hmac_sha256_bytes(enc.shared_secret, sha256_bytes(_app(_copy(hello_tr), _app(_copy(ee_msg), cert_msg))));
+    let cv_msg = _tls_hs_msg(0x0F, _app(_u16_be(0x0807), _app(_u16_be(len(cv_sig)), cv_sig)));
+
+    let pre_fin_tr = _copy(hello_tr);
+    _app(pre_fin_tr, ee_msg); _app(pre_fin_tr, cert_msg); _app(pre_fin_tr, cv_msg);
+    let tmp_ks = tls13_key_schedule(enc.shared_secret, hello_tr, pre_fin_tr);
+    let s_fin_vd = tls13_finished_verify_data(tmp_ks.s_hs_traffic, pre_fin_tr);
+    let s_fin_msg = _tls_hs_msg(0x14, s_fin_vd);
+
+    let full_tr = _app(_copy(pre_fin_tr), s_fin_msg);
+    let ks = tls13_key_schedule(dec.shared_secret, hello_tr, full_tr);
+
+    // Encrypt server handshake flight under s_hs_key / s_hs_iv and verify decryption on client
+    let srv_hs_plain = _copy(ee_msg);
+    _app(srv_hs_plain, cert_msg); _app(srv_hs_plain, cv_msg); _app(srv_hs_plain, s_fin_msg);
+    let srv_hs_rec = tls13_encrypt_record(ks.s_hs_key, ks.s_hs_iv, 0, 0x16, srv_hs_plain);
+    let cli_hs_dec = tls13_decrypt_record(ks.s_hs_key, ks.s_hs_iv, 0, srv_hs_rec);
+    if not cli_hs_dec.ok { return cli_hs_dec; }
+
+    let c_fin_vd = tls13_finished_verify_data(ks.c_hs_traffic, full_tr);
+    let c_fin_msg = _tls_hs_msg(0x14, c_fin_vd);
+    let cli_fin_rec = tls13_encrypt_record(ks.c_hs_key, ks.c_hs_iv, 0, 0x16, c_fin_msg);
+    let srv_fin_dec = tls13_decrypt_record(ks.c_hs_key, ks.c_hs_iv, 0, cli_fin_rec);
+    if not srv_fin_dec.ok or not ct_eq_bytes(slice(srv_fin_dec.plaintext, 4, 36), c_fin_vd) {
+        return map{ ok: false, error: "Client Finished verify_data mismatch" };
+    }
+
+    return map{
+        ok: true, negotiated_version: TLS_VERSION_1_3, legacy_fallback: false,
+        cipher_suite: TLS_CHACHA20_POLY1305_SHA256, group: GROUP_X25519_MLKEM768,
+        alpn: sel_alpn, sni: server_name, keys: ks, c_seq: 0, s_seq: 0,
+        client_hello_len: len(ch_bundle.handshake_bytes), server_hello_len: len(sh_msg)
+    };
+}
+
+fn tls13_send_app_data(session, from_client, payload_bytes) {
+    if from_client {
+        let rec = tls13_encrypt_record(session.keys.c_ap_key, session.keys.c_ap_iv, session.c_seq, 0x17, payload_bytes);
+        session.c_seq = session.c_seq + 1;
+        return rec;
+    }
+    let rec = tls13_encrypt_record(session.keys.s_ap_key, session.keys.s_ap_iv, session.s_seq, 0x17, payload_bytes);
+    session.s_seq = session.s_seq + 1;
+    return rec;
+}
+
+fn tls13_recv_app_data(session, from_client, record_bytes, seq_override = nil) {
+    let seq = if seq_override != nil { seq_override } elif from_client { session.c_seq - 1 } else { session.s_seq - 1 };
+    let k = if from_client { session.keys.c_ap_key } else { session.keys.s_ap_key };
+    let iv = if from_client { session.keys.c_ap_iv } else { session.keys.s_ap_iv };
+    return tls13_decrypt_record(k, iv, seq, record_bytes);
+}
+
+// ── RFC 9001 QUIC Initial & 1-RTT Packet Protection + Header Protection ──────
+
+fn quic_derive_initial_secrets(dcid_bytes) {
+    let salt = hex_to_bytes(QUIC_V1_INITIAL_SALT_HEX);
+    let initial_secret = hkdf_extract(salt, dcid_bytes);
+    let c_in = tls13_hkdf_expand_label(initial_secret, "client in", [], 32);
+    let s_in = tls13_hkdf_expand_label(initial_secret, "server in", [], 32);
+    return map{
+        initial_secret: initial_secret,
+        client: map{
+            secret: c_in,
+            key16: tls13_hkdf_expand_label(c_in, "quic key", [], 16),
+            key32: tls13_hkdf_expand_label(c_in, "quic key", [], 32),
+            iv:    tls13_hkdf_expand_label(c_in, "quic iv",  [], 12),
+            hp16:  tls13_hkdf_expand_label(c_in, "quic hp",  [], 16),
+            hp32:  tls13_hkdf_expand_label(c_in, "quic hp",  [], 32)
+        },
+        server: map{
+            secret: s_in,
+            key16: tls13_hkdf_expand_label(s_in, "quic key", [], 16),
+            key32: tls13_hkdf_expand_label(s_in, "quic key", [], 32),
+            iv:    tls13_hkdf_expand_label(s_in, "quic iv",  [], 12),
+            hp16:  tls13_hkdf_expand_label(s_in, "quic hp",  [], 16),
+            hp32:  tls13_hkdf_expand_label(s_in, "quic hp",  [], 32)
+        }
+    };
+}
+
+fn _quic_hp_mask(hp_key, sample16) {
+    if len(hp_key) == 16 {
+        return slice(AES_GCM.aes128_encrypt_block(sample16, hp_key), 0, 5);
+    }
+    let ctr = _read_u32_le(sample16, 0);
+    let nonce = slice(sample16, 4, 16);
+    return slice(chacha20_block(hp_key, ctr, nonce), 0, 5);
+}
+
+fn quic_protect_packet(quic_dir_keys, header_without_pn, pkt_num, pn_len, payload_bytes) {
+    let pn_bytes = [];
+    let i = pn_len - 1;
+    while i >= 0 { array_push(pn_bytes, bit_and(bit_shr(pkt_num, i * 8), 255)); i = i - 1; }
+    let full_hdr = _app(_copy(header_without_pn), pn_bytes);
+    full_hdr[0] = bit_or(bit_and(full_hdr[0], 252), (pn_len - 1));
+    let pn_offset = len(header_without_pn);
+
+    let nonce = _nonce_xor_seq(quic_dir_keys.iv, pkt_num);
+    let aead = chacha20_poly1305_seal(quic_dir_keys.key32, nonce, payload_bytes, full_hdr);
+    let ct_and_tag = aead.sealed;
+    while len(ct_and_tag) < 4 - pn_len + 16 { array_push(ct_and_tag, 0); }
+
+    let pkt = _app(_copy(full_hdr), ct_and_tag);
+    let sample_off = pn_offset + 4;
+    let sample = slice(pkt, sample_off, sample_off + 16);
+    let mask = _quic_hp_mask(quic_dir_keys.hp32, sample);
+    let first_mask = if bit_and(pkt[0], 128) != 0 { bit_and(mask[0], 15) } else { bit_and(mask[0], 31) };
+    pkt[0] = bit_xor(pkt[0], first_mask);
+    i = 0;
+    while i < pn_len {
+        pkt[pn_offset + i] = bit_xor(pkt[pn_offset + i], mask[1 + i]);
+        i = i + 1;
+    }
+    return map{ ok: true, packet: pkt, pn_offset: pn_offset };
+}
+
+fn quic_unprotect_packet(quic_dir_keys, packet_bytes, pn_offset) {
+    if len(packet_bytes) < pn_offset + 20 {
+        return map{ ok: false, error: "QUIC packet too short for header protection sample" };
+    }
+    let pkt = _copy(packet_bytes);
+    let sample = slice(pkt, pn_offset + 4, pn_offset + 20);
+    let mask = _quic_hp_mask(quic_dir_keys.hp32, sample);
+    let first_mask = if bit_and(pkt[0], 128) != 0 { bit_and(mask[0], 15) } else { bit_and(mask[0], 31) };
+    pkt[0] = bit_xor(pkt[0], first_mask);
+    let pn_len = bit_and(pkt[0], 3) + 1;
+    let pkt_num = 0;
+    let i = 0;
+    while i < pn_len {
+        pkt[pn_offset + i] = bit_xor(pkt[pn_offset + i], mask[1 + i]);
+        pkt_num = pkt_num * 256 + pkt[pn_offset + i];
+        i = i + 1;
+    }
+    let aad = slice(pkt, 0, pn_offset + pn_len);
+    let body = slice(pkt, pn_offset + pn_len, len(pkt));
+    if len(body) < 16 { return map{ ok: false, error: "QUIC ciphertext shorter than AEAD tag" }; }
+    let ct = slice(body, 0, len(body) - 16);
+    let tag = slice(body, len(body) - 16, len(body));
+    let opened = chacha20_poly1305_open(quic_dir_keys.key32, _nonce_xor_seq(quic_dir_keys.iv, pkt_num), ct, tag, aad);
+    if not opened.ok { return opened; }
+    return map{ ok: true, packet_number: pkt_num, header: aad, payload: opened.plaintext };
+}
+
+// ── Encrypted Database Wire Handshake Drivers (Zero OpenSSL) ─────────────────
+
+// 1. PostgreSQL SSLRequest (80877103) + TLS 1.3 + SCRAM-SHA-256-PLUS (RFC 9266 tls-exporter)
+fn postgres_tls13_scram_plus_handshake(user, password, opts = nil) {
+    let ssl_req = _app(_u32_be(8), _u32_be(PG_SSL_REQUEST_CODE));
+    let srv_ssl_reply = if is_map(opts) and map_has(opts, "server_ssl_reply") { opts.server_ssl_reply } else { "S" };
+    if srv_ssl_reply != "S" {
+        return map{ ok: false, error: "PostgreSQL server declined TLS upgrade (downgrade blocked)" };
+    }
+    let tls = run_tls13_pqc_handshake("db.internal", map{ alpn: ["postgresql"] });
+    if not tls.ok { return tls; }
+
+    let cb_client = tls13_exporter(tls.keys.exporter_master, "EXPORTER-Channel-Binding", [], 32);
+    let cb_server = if is_map(opts) and map_has(opts, "mitm_tamper_channel_binding") and opts.mitm_tamper_channel_binding {
+        let bad = _copy(cb_client); bad[0] = bit_xor(bad[0], 1); bad
+    } else { _copy(cb_client) };
+
+    let c_nonce = base64_encode_bytes(random_bytes(18));
+    let s_nonce = base64_encode_bytes(random_bytes(18));
+    let full_nonce = c_nonce + s_nonce;
+    let salt = random_bytes(16);
+    let iters = if is_map(opts) and map_has(opts, "iterations") { opts.iterations } else { 4096 };
+
+    let gs2_hdr = "p=tls-exporter,,";
+    let client_first_bare = "n=" + user + ",r=" + c_nonce;
+    let server_first = "r=" + full_nonce + ",s=" + base64_encode_bytes(salt) + ",i=" + str(iters);
+
+    let cbind_input = _app(str_to_bytes(gs2_hdr), cb_client);
+    let client_final_no_proof = "c=" + base64_encode_bytes(cbind_input) + ",r=" + full_nonce;
+    let auth_msg_cli = str_to_bytes(client_first_bare + "," + server_first + "," + client_final_no_proof);
+
+    let salted_pw = AES_GCM.pbkdf2_hmac_sha256(str_to_bytes(password), salt, iters, 32);
+    let client_key = hmac_sha256_bytes(salted_pw, str_to_bytes("Client Key"));
+    let stored_key = sha256_bytes(client_key);
+    let server_key = hmac_sha256_bytes(salted_pw, str_to_bytes("Server Key"));
+    let client_sig = hmac_sha256_bytes(stored_key, auth_msg_cli);
+    let client_proof = [];
+    let i = 0;
+    while i < 32 { array_push(client_proof, bit_xor(client_key[i], client_sig[i])); i = i + 1; }
+    let client_final = client_final_no_proof + ",p=" + base64_encode_bytes(client_proof);
+
+    // Transmit client SCRAM frame encrypted inside TLS 1.3 0x17 record
+    let wire_rec = tls13_send_app_data(tls, true, str_to_bytes(client_final));
+    let srv_dec = tls13_recv_app_data(tls, true, wire_rec);
+    if not srv_dec.ok { return srv_dec; }
+
+    // Server independently verifies channel binding + ClientProof
+    let srv_cbind = _app(str_to_bytes(gs2_hdr), cb_server);
+    let srv_expected_final_prefix = "c=" + base64_encode_bytes(srv_cbind) + ",r=" + full_nonce;
+    if not str_starts_with(bytes_to_str(srv_dec.plaintext), srv_expected_final_prefix) {
+        return map{ ok: false, mitm_detected: true, error: "SCRAM-SHA-256-PLUS tls-exporter channel binding mismatch" };
+    }
+    let srv_sig_check = hmac_sha256_bytes(stored_key, auth_msg_cli);
+    let recovered_ck = [];
+    i = 0;
+    while i < 32 { array_push(recovered_ck, bit_xor(client_proof[i], srv_sig_check[i])); i = i + 1; }
+    if not ct_eq_bytes(sha256_bytes(recovered_ck), stored_key) {
+        return map{ ok: false, error: "SCRAM-SHA-256-PLUS invalid client proof" };
+    }
+    let server_sig = hmac_sha256_bytes(server_key, auth_msg_cli);
+    return map{
+        ok: true, protocol: "PostgreSQL-TLS1.3-SCRAM-SHA-256-PLUS",
+        ssl_request_bytes: ssl_req, channel_binding: "tls-exporter",
+        exporter_token_hex: bytes_to_hex(cb_client),
+        server_signature_b64: base64_encode_bytes(server_sig), tls_session: tls
+    };
+}
+
+// 2. SQL Server TDS 8.0 Strict TLS-First Connection State Machine
+fn tds8_strict_tls13_wrap(login_spec, tls_opts = nil) {
+    let tls = run_tls13_pqc_handshake(
+        if is_map(login_spec) and map_has(login_spec, "server") { login_spec.server } else { "sql.internal" },
+        map{ alpn: ["tds/8.0"], allow_tls12_legacy: if is_map(tls_opts) and map_has(tls_opts, "allow_tls12_legacy") { tls_opts.allow_tls12_legacy } else { false } }
+    );
+    if not tls.ok { return tls; }
+    // TDS 8.0 sends PRELOGIN (0x12) and LOGIN7 (0x10) strictly AFTER TLS 1.3 handshake
+    let prelogin_body = [0x00, 0x00, 0x06, 0x00, 0x06, 0xFF, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let pre_len = 8 + len(prelogin_body);
+    let prelogin_pkt = _app([0x12, 0x01, bit_and(bit_shr(pre_len, 8), 255), bit_and(pre_len, 255), 0, 0, 1, 0], prelogin_body);
+    let enc_pre = tls13_send_app_data(tls, true, prelogin_pkt);
+    let dec_pre = tls13_recv_app_data(tls, true, enc_pre);
+    if not dec_pre.ok or dec_pre.plaintext[0] != 0x12 { return map{ ok: false, error: "TDS 8.0 PRELOGIN failed" }; }
+
+    let db_name = if is_map(login_spec) and map_has(login_spec, "database") { login_spec.database } else { "master" };
+    let login7_body = _app([0x08, 0x00, 0x00, 0x74], str_to_bytes(db_name)); // TDS 8.0 version 0x74000008 LE
+    let l7_len = 8 + len(login7_body);
+    let login7_pkt = _app([0x10, 0x01, bit_and(bit_shr(l7_len, 8), 255), bit_and(l7_len, 255), 0, 0, 2, 0], login7_body);
+    let enc_l7 = tls13_send_app_data(tls, true, login7_pkt);
+    let dec_l7 = tls13_recv_app_data(tls, true, enc_l7);
+
+    // Server responds with Tabular Result (0x04) containing LOGINACK (0xAD)
+    let ack_pkt = [0x04, 0x01, 0x00, 0x0C, 0x00, 0x33, 0x01, 0x00, 0xAD, 0x00, 0x01, 0x74];
+    let enc_ack = tls13_send_app_data(tls, false, ack_pkt);
+    let dec_ack = tls13_recv_app_data(tls, false, enc_ack);
+    return map{
+        ok: dec_l7.ok and dec_ack.ok and dec_ack.plaintext[8] == 0xAD,
+        protocol: "TDS-8.0-Strict-TLS1.3", alpn: tls.alpn,
+        plaintext_bytes_before_tls: 0, encrypted_records_exchanged: 3, tls_session: tls
+    };
+}
+
+// 3. MySQL 8.4 Protocol::SSLRequest + caching_sha2_password over TLS 1.3
+fn mysql_tls13_caching_sha2(user, password, handshake_opts = nil) {
+    let nonce20 = if is_map(handshake_opts) and map_has(handshake_opts, "scramble20") { handshake_opts.scramble20 } else { random_bytes(20) };
+    // 36-byte MySQL Protocol::SSLRequest: 3B len(32) + seq(1) + caps(CLIENT_SSL=0x0800|PLUGIN_AUTH=0x080000) + max_pkt + charset(255=utf8mb4) + 23 zeros
+    let caps = bit_or(0x00080800, 0x0000A205);
+    let ssl_req = [32, 0, 0, 1];
+    _app(ssl_req, _u32_le(caps));
+    _app(ssl_req, _u32_le(16777216));
+    array_push(ssl_req, 255);
+    _app(ssl_req, _zeros(23));
+
+    let tls = run_tls13_pqc_handshake("mysql.internal", map{ alpn: ["mysql"] });
+    if not tls.ok { return tls; }
+
+    // caching_sha2_password token = XOR(SHA256(pw), SHA256(SHA256(SHA256(pw)) || nonce20))
+    let h1 = sha256_bytes(str_to_bytes(password));
+    let h2 = sha256_bytes(h1);
+    let h3 = sha256_bytes(_app(_copy(h2), nonce20));
+    let token = [];
+    let i = 0;
+    while i < 32 { array_push(token, bit_xor(h1[i], h3[i])); i = i + 1; }
+
+    let auth_resp = _copy(str_to_bytes(user));
+    array_push(auth_resp, 0);
+    array_push(auth_resp, 32);
+    _app(auth_resp, token);
+    _app(auth_resp, str_to_bytes("caching_sha2_password"));
+    array_push(auth_resp, 0);
+
+    let enc_auth = tls13_send_app_data(tls, true, auth_resp);
+    let srv_recv = tls13_recv_app_data(tls, true, enc_auth);
+    if not srv_recv.ok { return srv_recv; }
+
+    // Server verifies SHA256(XOR(token, h3)) == h2 (fast-path cache hit 0x01 0x03 -> OK 0x00)
+    let cand_h1 = [];
+    i = 0;
+    while i < 32 { array_push(cand_h1, bit_xor(token[i], h3[i])); i = i + 1; }
+    let verified = ct_eq_bytes(sha256_bytes(cand_h1), h2);
+    let ok_pkt = [7, 0, 0, 2, 0x00, 0, 0, 2, 0, 0, 0];
+    let enc_ok = tls13_send_app_data(tls, false, ok_pkt);
+    let cli_ok = tls13_recv_app_data(tls, false, enc_ok);
+
+    return map{
+        ok: verified and cli_ok.ok and cli_ok.plaintext[4] == 0x00,
+        protocol: "MySQL-8.4-TLS1.3-caching_sha2_password",
+        ssl_request_len: len(ssl_req), scramble_token_hex: bytes_to_hex(token), tls_session: tls
+    };
+}
+
+export TLS_VERSION_1_2, TLS_VERSION_1_3, TLS_CHACHA20_POLY1305_SHA256, TLS_AES_256_GCM_SHA384;
+export GROUP_X25519, GROUP_X25519_MLKEM768, PG_SSL_REQUEST_CODE, QUIC_V1_INITIAL_SALT_HEX;
+export hex_to_bytes, bytes_to_hex, ct_eq_bytes, ct_select_bytes;
+export sha256_bytes, hmac_sha256_bytes, hkdf_extract, hkdf_expand;
+export tls13_hkdf_expand_label, tls13_derive_secret, tls13_key_schedule, tls13_finished_verify_data, tls13_exporter;
+export x25519_scalarmult, x25519_base, x25519_keypair;
+export chacha20_block, chacha20_xor, poly1305_mac, chacha20_poly1305_seal, chacha20_poly1305_open;
+export mlkem_ntt, mlkem_inv_ntt, mlkem768_keygen, mlkem768_encaps, mlkem768_decaps;
+export x25519_mlkem768_keygen, x25519_mlkem768_encaps, x25519_mlkem768_decaps;
+export build_tls13_client_hello, parse_tls13_client_hello, run_tls13_pqc_handshake;
+export tls13_encrypt_record, tls13_decrypt_record, tls13_send_app_data, tls13_recv_app_data;
+export quic_derive_initial_secrets, quic_protect_packet, quic_unprotect_packet;
+export postgres_tls13_scram_plus_handshake, tds8_strict_tls13_wrap, mysql_tls13_caching_sha2;

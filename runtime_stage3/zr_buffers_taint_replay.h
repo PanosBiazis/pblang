@@ -16,13 +16,15 @@
 #ifndef IS_NIL
 #define IS_NIL(v)    ((v).tag == VAL_NIL)
 #define IS_BOOL(v)   ((v).tag == VAL_BOOL)
-#define IS_NUM(v)    ((v).tag == VAL_NUM)
+#define IS_NUM(v)    ((v).tag == VAL_NUM || (v).tag == VAL_I64)
 #define IS_STR(v)    is_obj_type((v), OBJ_STR)
 #define IS_ARRAY(v)  is_obj_type((v), OBJ_ARRAY)
 #define IS_MAP(v)    is_obj_type((v), OBJ_MAP)
 #define IS_BYTES(v)  is_obj_type((v), OBJ_BYTES)
 #define IS_F64BUF(v) is_obj_type((v), OBJ_F64BUF)
 #endif
+#define ZR_BUF_I64(v) (((v).tag == VAL_I64) ? (v).as.i64 : (int64_t)(v).as.num)
+#define ZR_BUF_F64(v) (((v).tag == VAL_I64) ? (double)(v).as.i64 : (v).as.num)
 
 static bool bi_bytes_new(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc < 1 || argc > 2) {
@@ -30,7 +32,7 @@ static bool bi_bytes_new(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     }
     bool shared = (argc >= 2) ? val_truthy(argv[1]) : true;
     if (IS_NUM(argv[0])) {
-        int64_t n = (int64_t)argv[0].as.num;
+        int64_t n = ZR_BUF_I64(argv[0]);
         if (n < 0 || (uint64_t)n > (uint64_t)536870912u) {
             return vm_error(vm, "bytes_new(): length %lld out of range", (long long)n);
         }
@@ -48,7 +50,7 @@ static bool bi_bytes_new(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
                 return vm_error(vm, "bytes_new(): array element %zu is not a number", i);
             }
             taint |= el.taint;
-            b->data[i] = (uint8_t)(((int64_t)el.as.num) & 0xFF);
+            b->data[i] = (uint8_t)(ZR_BUF_I64(el) & 0xFF);
         }
         *out = val_with_taint(val_obj(b), taint);
         return true;
@@ -85,7 +87,7 @@ static bool bi_bytes_get(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 2 || !IS_NUM(argv[1])) {
         return vm_error(vm, "bytes_get(buf, idx) expects (bytes, number)");
     }
-    int64_t idx = (int64_t)argv[1].as.num;
+    int64_t idx = ZR_BUF_I64(argv[1]);
     if (IS_BYTES(argv[0])) {
         PbBytes *b = AS_BYTES(argv[0]);
         if (idx < 0 || (size_t)idx >= b->len) {
@@ -101,7 +103,7 @@ static bool bi_bytes_get(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         }
         PbValue el = a->items[(size_t)idx];
         if (!IS_NUM(el)) return vm_error(vm, "bytes_get(): array element is not numeric");
-        *out = val_num((double)(((int64_t)el.as.num) & 0xFF));
+        *out = val_num((double)(ZR_BUF_I64(el) & 0xFF));
         return true;
     }
     return vm_error(vm, "bytes_get() expects bytes buffer as argument 1");
@@ -111,8 +113,8 @@ static bool bi_bytes_set(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     if (argc != 3 || !IS_NUM(argv[1]) || !IS_NUM(argv[2])) {
         return vm_error(vm, "bytes_set(buf, idx, byte) expects (bytes, number, number)");
     }
-    int64_t idx = (int64_t)argv[1].as.num;
-    uint8_t byte_val = (uint8_t)(((int64_t)argv[2].as.num) & 0xFF);
+    int64_t idx = ZR_BUF_I64(argv[1]);
+    uint8_t byte_val = (uint8_t)(ZR_BUF_I64(argv[2]) & 0xFF);
     if (IS_BYTES(argv[0])) {
         PbBytes *b = AS_BYTES(argv[0]);
         if (idx < 0 || (size_t)idx >= b->len) {
@@ -140,8 +142,8 @@ static bool bi_bytes_slice(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     }
     PbBytes *b = AS_BYTES(argv[0]);
     int64_t len = (int64_t)b->len;
-    int64_t s = (int64_t)argv[1].as.num;
-    int64_t e = (argc == 3) ? (int64_t)argv[2].as.num : len;
+    int64_t s = ZR_BUF_I64(argv[1]);
+    int64_t e = (argc == 3) ? ZR_BUF_I64(argv[2]) : len;
     if (s < 0) s += len;
     if (e < 0) e += len;
     if (s < 0) s = 0;
@@ -161,7 +163,7 @@ static bool bi_f64buf_new(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     }
     bool shared = (argc >= 2) ? val_truthy(argv[1]) : true;
     if (IS_NUM(argv[0])) {
-        int64_t n = (int64_t)argv[0].as.num;
+        int64_t n = ZR_BUF_I64(argv[0]);
         if (n < 0 || (uint64_t)n > (uint64_t)134217728u) {
             return vm_error(vm, "f64buf_new(): length %lld out of range", (long long)n);
         }
@@ -177,7 +179,7 @@ static bool bi_f64buf_new(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
             if (!IS_NUM(el)) {
                 return vm_error(vm, "f64buf_new(): array element %zu is not a number", i);
             }
-            b->data[i] = el.as.num;
+            b->data[i] = ZR_BUF_F64(el);
         }
         *out = val_obj(b);
         return true;
@@ -197,7 +199,7 @@ static bool bi_f64buf_get(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         return vm_error(vm, "f64buf_get(buf, idx) expects (f64buf, number)");
     }
     PbF64Buf *b = AS_F64BUF(argv[0]);
-    int64_t idx = (int64_t)argv[1].as.num;
+    int64_t idx = ZR_BUF_I64(argv[1]);
     if (idx < 0 || (size_t)idx >= b->len) {
         return vm_error(vm, "f64buf_get(): index %lld out of bounds (len %zu)", (long long)idx, b->len);
     }
@@ -210,11 +212,11 @@ static bool bi_f64buf_set(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
         return vm_error(vm, "f64buf_set(buf, idx, val) expects (f64buf, number, number)");
     }
     PbF64Buf *b = AS_F64BUF(argv[0]);
-    int64_t idx = (int64_t)argv[1].as.num;
+    int64_t idx = ZR_BUF_I64(argv[1]);
     if (idx < 0 || (size_t)idx >= b->len) {
         return vm_error(vm, "f64buf_set(): index %lld out of bounds (len %zu)", (long long)idx, b->len);
     }
-    b->data[(size_t)idx] = argv[2].as.num;
+    b->data[(size_t)idx] = ZR_BUF_F64(argv[2]);
     *out = argv[0];
     return true;
 }

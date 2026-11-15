@@ -1,0 +1,1224 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+// stdlib/text/pikevm_linear_regex.sapp — Sovereign 100% Pure-PBLang Linear-Time O(M * N)
+// Zero-ReDoS Thompson NFA / Russ Cox PikeVM Regular Expression Engine + 64-Slot LRU Cache.
+
+let MODULE_VERSION = "5.0.0";
+let LRU_CACHE_CAPACITY = 64;
+let MAX_QUANTIFIER_EXPANSION = 256;
+
+// PikeVM Bytecode Opcodes
+let OP_CHAR = 1;
+let OP_ANY = 2;
+let OP_CLASS = 3;
+let OP_PROP = 4;
+let OP_SPLIT = 5;
+let OP_JMP = 6;
+let OP_SAVE = 7;
+let OP_ANCHOR = 8;
+let OP_MATCH = 9;
+
+// Anchor Kinds
+let ANCHOR_BOL = 1;       // ^
+let ANCHOR_EOL = 2;       // $
+let ANCHOR_WORD = 3;      // \b
+let ANCHOR_NON_WORD = 4;  // \B
+let ANCHOR_START_TXT = 5; // \A
+let ANCHOR_END_TXT = 6;   // \z
+
+// Builtin Character Property IDs (\d, \w, \s, \p{Greek}, \p{Latin}, \p{L}, \p{N}, ...)
+let PROP_DIGIT = 1;
+let PROP_WORD = 2;
+let PROP_SPACE = 3;
+let PROP_GREEK = 4;
+let PROP_LATIN = 5;
+let PROP_CYRILLIC = 6;
+let PROP_LETTER = 7;
+let PROP_UPPER = 8;
+let PROP_LOWER = 9;
+let PROP_NUMBER = 10;
+let PROP_ASCII = 11;
+
+// ── Unicode & Case-Folding Predicates for Regex Execution ────────────────────
+
+fn _fold_cp(cp) {
+    if cp >= 65 and cp <= 90 { return cp + 32; }
+    if cp == 962 { return 963; } // fold final sigma ς -> σ for case-insensitive matching!
+    if cp >= 913 and cp <= 937 and cp != 930 { return cp + 32; }
+    if cp == 902 or cp == 940 { return 945; } // Ά / ά -> α
+    if cp == 904 or cp == 941 { return 949; } // Έ / έ -> ε
+    if cp == 905 or cp == 942 { return 951; } // Ή / ή -> η
+    if cp == 906 or cp == 943 or cp == 912 or cp == 938 or cp == 970 { return 953; } // Ί/ί/ΐ/Ϊ/ϊ -> ι
+    if cp == 908 or cp == 972 { return 959; } // Ό / ό -> ο
+    if cp == 910 or cp == 973 or cp == 944 or cp == 939 or cp == 971 { return 965; } // Ύ/ύ/ΰ/Ϋ/ϋ -> υ
+    if cp == 911 or cp == 974 { return 969; } // Ώ / ώ -> ω
+    if cp >= 192 and cp <= 222 and cp != 215 { return cp + 32; }
+    return cp;
+}
+
+fn _is_greek_cp(cp) {
+    return (cp >= 880 and cp <= 1023) or (cp >= 7936 and cp <= 8191);
+}
+
+fn _is_latin_cp(cp) {
+    return (cp >= 65 and cp <= 90) or (cp >= 97 and cp <= 122)
+        or (cp >= 192 and cp <= 591 and cp != 215 and cp != 247)
+        or (cp >= 7680 and cp <= 7935);
+}
+
+fn _is_cyrillic_cp(cp) {
+    return cp >= 1024 and cp <= 1327;
+}
+
+fn _is_unicode_letter_cp(cp) {
+    if _is_latin_cp(cp) or _is_greek_cp(cp) or _is_cyrillic_cp(cp) {
+        if cp == 894 or cp == 900 or cp == 901 or cp == 903 { return false; }
+        return true;
+    }
+    if (cp >= 1424 and cp <= 1791) or (cp >= 2304 and cp <= 3583) { return true; }
+    if (cp >= 4352 and cp <= 4607) or (cp >= 44032 and cp <= 55203) { return true; } // Hangul
+    if (cp >= 12352 and cp <= 12543) or (cp >= 19968 and cp <= 40959) { return true; } // Kana & CJK
+    return false;
+}
+
+fn _is_unicode_upper_cp(cp) {
+    if cp >= 65 and cp <= 90 { return true; }
+    if cp >= 913 and cp <= 939 and cp != 930 { return true; }
+    if cp == 902 or cp == 904 or cp == 905 or cp == 906 or cp == 908 or cp == 910 or cp == 911 { return true; }
+    if cp >= 192 and cp <= 222 and cp != 215 { return true; }
+    if cp >= 1040 and cp <= 1071 { return true; }
+    return false;
+}
+
+fn _is_unicode_lower_cp(cp) {
+    if cp >= 97 and cp <= 122 { return true; }
+    if cp >= 940 and cp <= 974 { return true; }
+    if cp >= 223 and cp <= 255 and cp != 247 { return true; }
+    if cp >= 1072 and cp <= 1103 { return true; }
+    return false;
+}
+
+fn _is_unicode_number_cp(cp) {
+    if cp >= 48 and cp <= 57 { return true; }
+    if cp == 178 or cp == 179 or cp == 185 or (cp >= 188 and cp <= 190) { return true; }
+    if (cp >= 1632 and cp <= 1641) or (cp >= 1776 and cp <= 1785) or (cp >= 2406 and cp <= 2415) { return true; }
+    if cp >= 65296 and cp <= 65305 { return true; } // Fullwidth digits
+    return false;
+}
+
+fn _is_space_cp(cp) {
+    return cp == 32 or (cp >= 9 and cp <= 13) or cp == 160 or cp == 5760
+        or (cp >= 8192 and cp <= 8202) or cp == 8232 or cp == 8233 or cp == 8239 or cp == 12288;
+}
+
+fn _is_word_cp(cp) {
+    if cp == 95 or (cp >= 48 and cp <= 57) { return true; }
+    return _is_unicode_letter_cp(cp);
+}
+
+fn _eval_prop(prop_id, cp) {
+    if prop_id == PROP_DIGIT { return cp >= 48 and cp <= 57; }
+    if prop_id == PROP_WORD { return _is_word_cp(cp); }
+    if prop_id == PROP_SPACE { return _is_space_cp(cp); }
+    if prop_id == PROP_GREEK { return _is_greek_cp(cp); }
+    if prop_id == PROP_LATIN { return _is_latin_cp(cp); }
+    if prop_id == PROP_CYRILLIC { return _is_cyrillic_cp(cp); }
+    if prop_id == PROP_LETTER { return _is_unicode_letter_cp(cp); }
+    if prop_id == PROP_UPPER { return _is_unicode_upper_cp(cp); }
+    if prop_id == PROP_LOWER { return _is_unicode_lower_cp(cp); }
+    if prop_id == PROP_NUMBER { return _is_unicode_number_cp(cp); }
+    if prop_id == PROP_ASCII { return cp >= 0 and cp <= 127; }
+    return false;
+}
+
+fn _resolve_unicode_prop_name(raw_name) {
+    let clean = str_lower(str_trim(raw_name));
+    if str_slice(clean, 0, 7) == "script=" {
+        clean = str_slice(clean, 7, len(clean));
+    } elif str_slice(clean, 0, 3) == "sc=" {
+        clean = str_slice(clean, 3, len(clean));
+    }
+    if clean == "greek" or clean == "grek" { return PROP_GREEK; }
+    if clean == "latin" or clean == "latn" { return PROP_LATIN; }
+    if clean == "cyrillic" or clean == "cyrl" { return PROP_CYRILLIC; }
+    if clean == "l" or clean == "letter" { return PROP_LETTER; }
+    if clean == "lu" or clean == "uppercase_letter" { return PROP_UPPER; }
+    if clean == "ll" or clean == "lowercase_letter" { return PROP_LOWER; }
+    if clean == "n" or clean == "nd" or clean == "number" or clean == "decimal_number" { return PROP_NUMBER; }
+    if clean == "z" or clean == "space" or clean == "white_space" { return PROP_SPACE; }
+    if clean == "ascii" { return PROP_ASCII; }
+    throw "pikevm: unsupported Unicode property \\p{" + raw_name + "}";
+}
+
+// ── Regex Parser (Recursive-Descent AST Builder) ─────────────────────────────
+
+fn _hex_val(cp) {
+    if cp >= 48 and cp <= 57 { return cp - 48; }
+    if cp >= 65 and cp <= 70 { return cp - 55; }
+    if cp >= 97 and cp <= 102 { return cp - 87; }
+    return -1;
+}
+
+fn _parse_hex_escape(st, exact_digits) {
+    if st.pos < st.n and st.cps[st.pos] == 123 { // \u{1F1EC}
+        st.pos = st.pos + 1;
+        let v = 0;
+        let cnt = 0;
+        while st.pos < st.n and st.cps[st.pos] != 125 {
+            let d = _hex_val(st.cps[st.pos]);
+            if d < 0 { throw "pikevm: invalid hex digit inside \\u{...}"; }
+            v = v * 16 + d;
+            cnt = cnt + 1;
+            st.pos = st.pos + 1;
+        }
+        if cnt == 0 or st.pos >= st.n or st.cps[st.pos] != 125 {
+            throw "pikevm: unterminated \\u{...} escape";
+        }
+        st.pos = st.pos + 1;
+        return v;
+    }
+    let acc = 0;
+    let k = 0;
+    while k < exact_digits {
+        if st.pos >= st.n { throw "pikevm: truncated hex escape"; }
+        let d2 = _hex_val(st.cps[st.pos]);
+        if d2 < 0 { throw "pikevm: invalid hex escape digit"; }
+        acc = acc * 16 + d2;
+        st.pos = st.pos + 1;
+        k = k + 1;
+    }
+    return acc;
+}
+
+fn _parse_prop_braces(st) {
+    if st.pos >= st.n or st.cps[st.pos] != 123 {
+        throw "pikevm: expected '{' after \\p or \\P";
+    }
+    st.pos = st.pos + 1;
+    let buf = "";
+    while st.pos < st.n and st.cps[st.pos] != 125 {
+        buf = buf + strfromcharcode(st.cps[st.pos]);
+        st.pos = st.pos + 1;
+    }
+    if st.pos >= st.n or st.cps[st.pos] != 125 {
+        throw "pikevm: unterminated \\p{...} property";
+    }
+    st.pos = st.pos + 1;
+    return _resolve_unicode_prop_name(buf);
+}
+
+fn _parse_class_atom(st) {
+    let ch = st.cps[st.pos];
+    st.pos = st.pos + 1;
+    if ch != 92 { // not '\'
+        return map{ is_prop: false, cp: ch, neg: false };
+    }
+    if st.pos >= st.n { throw "pikevm: trailing backslash in character class"; }
+    let esc = st.cps[st.pos];
+    st.pos = st.pos + 1;
+    if esc == 100 { return map{ is_prop: true, prop: PROP_DIGIT, neg: false }; } // \d
+    if esc == 68  { return map{ is_prop: true, prop: PROP_DIGIT, neg: true }; }  // \D
+    if esc == 119 { return map{ is_prop: true, prop: PROP_WORD, neg: false }; }  // \w
+    if esc == 87  { return map{ is_prop: true, prop: PROP_WORD, neg: true }; }   // \W
+    if esc == 115 { return map{ is_prop: true, prop: PROP_SPACE, neg: false }; } // \s
+    if esc == 83  { return map{ is_prop: true, prop: PROP_SPACE, neg: true }; }  // \S
+    if esc == 112 { return map{ is_prop: true, prop: _parse_prop_braces(st), neg: false }; } // \p{...}
+    if esc == 80  { return map{ is_prop: true, prop: _parse_prop_braces(st), neg: true }; }  // \P{...}
+    if esc == 110 { return map{ is_prop: false, cp: 10, neg: false }; }
+    if esc == 114 { return map{ is_prop: false, cp: 13, neg: false }; }
+    if esc == 116 { return map{ is_prop: false, cp: 9, neg: false }; }
+    if esc == 102 { return map{ is_prop: false, cp: 12, neg: false }; }
+    if esc == 118 { return map{ is_prop: false, cp: 11, neg: false }; }
+    if esc == 120 { return map{ is_prop: false, cp: _parse_hex_escape(st, 2), neg: false }; }
+    if esc == 117 { return map{ is_prop: false, cp: _parse_hex_escape(st, 4), neg: false }; }
+    return map{ is_prop: false, cp: esc, neg: false };
+}
+
+fn _parse_char_class(st) {
+    let negated = false;
+    if st.pos < st.n and st.cps[st.pos] == 94 { // '^'
+        negated = true;
+        st.pos = st.pos + 1;
+    }
+    let ranges = []; // pairs [lo, hi]
+    let props = [];  // maps { prop, neg }
+    let first = true;
+
+    while st.pos < st.n {
+        if st.cps[st.pos] == 93 and not first { // ']'
+            st.pos = st.pos + 1;
+            let cls_id = len(st.classes);
+            array_push(st.classes, map{
+                ranges: ranges,
+                props: props,
+                fold: st.flag_i
+            });
+            return map{ kind: "class", cls_id: cls_id, negated: negated };
+        }
+        first = false;
+        let a1 = _parse_class_atom(st);
+        if a1.is_prop {
+            array_push(props, map{ prop: a1.prop, neg: a1.neg });
+        } else {
+            // Check for range 'a-z' (where '-' is not immediately before ']')
+            if st.pos + 1 < st.n and st.cps[st.pos] == 45 and st.cps[st.pos + 1] != 93 {
+                st.pos = st.pos + 1; // consume '-'
+                let a2 = _parse_class_atom(st);
+                if a2.is_prop {
+                    throw "pikevm: invalid character class range into property escape";
+                }
+                if a2.cp < a1.cp {
+                    throw "pikevm: reversed character class range";
+                }
+                if st.flag_i {
+                    let k = a1.cp;
+                    if (a2.cp - a1.cp) <= 128 {
+                        while k <= a2.cp {
+                            let fk = _fold_cp(k);
+                            array_push(ranges, [fk, fk]);
+                            k = k + 1;
+                        }
+                    } else {
+                        array_push(ranges, [_fold_cp(a1.cp), _fold_cp(a2.cp)]);
+                    }
+                } else {
+                    array_push(ranges, [a1.cp, a2.cp]);
+                }
+            } else {
+                let c_val = if st.flag_i { _fold_cp(a1.cp) } else { a1.cp };
+                array_push(ranges, [c_val, c_val]);
+            }
+        }
+    }
+    throw "pikevm: unterminated character class '['";
+}
+
+fn _parse_int_until(st) {
+    let val = 0;
+    let digits = 0;
+    while st.pos < st.n and st.cps[st.pos] >= 48 and st.cps[st.pos] <= 57 {
+        val = val * 10 + (st.cps[st.pos] - 48);
+        digits = digits + 1;
+        st.pos = st.pos + 1;
+    }
+    if digits == 0 { return -1; }
+    return val;
+}
+
+// Forward declaration via recursive parser router
+fn _parse_alt(st) {
+    let branches = [_parse_seq(st)];
+    while st.pos < st.n and st.cps[st.pos] == 124 { // '|'
+        st.pos = st.pos + 1;
+        array_push(branches, _parse_seq(st));
+    }
+    if len(branches) == 1 { return branches[0]; }
+    return map{ kind: "alt", branches: branches };
+}
+
+fn _parse_seq(st) {
+    let items = [];
+    while st.pos < st.n {
+        let peek = st.cps[st.pos];
+        if peek == 124 or peek == 41 { // '|' or ')'
+            break;
+        }
+        // Check inline flag modifier (?i), (?m), (?s), (?ims) with no ':'
+        if peek == 40 and st.pos + 2 < st.n and st.cps[st.pos + 1] == 63 {
+            let scan = st.pos + 2;
+            let saw_flag = false;
+            while scan < st.n and (st.cps[scan] == 105 or st.cps[scan] == 109 or st.cps[scan] == 115) {
+                saw_flag = true;
+                scan = scan + 1;
+            }
+            if saw_flag and scan < st.n and st.cps[scan] == 41 {
+                let f_i = st.pos + 2;
+                while f_i < scan {
+                    if st.cps[f_i] == 105 { st.flag_i = true; }
+                    if st.cps[f_i] == 109 { st.flag_m = true; }
+                    if st.cps[f_i] == 115 { st.flag_s = true; }
+                    f_i = f_i + 1;
+                }
+                st.pos = scan + 1;
+                continue;
+            }
+        }
+        array_push(items, _parse_quantified(st));
+    }
+    if len(items) == 0 { return map{ kind: "empty" }; }
+    if len(items) == 1 { return items[0]; }
+    return map{ kind: "seq", items: items };
+}
+
+fn _parse_quantified(st) {
+    let atom = _parse_atom(st);
+    if st.pos >= st.n { return atom; }
+    let q = st.cps[st.pos];
+    let min_r = -1;
+    let max_r = -1;
+
+    if q == 42 { // '*'
+        min_r = 0; max_r = -1; st.pos = st.pos + 1;
+    } elif q == 43 { // '+'
+        min_r = 1; max_r = -1; st.pos = st.pos + 1;
+    } elif q == 63 { // '?'
+        min_r = 0; max_r = 1; st.pos = st.pos + 1;
+    } elif q == 123 { // '{m,n}'
+        let saved = st.pos;
+        st.pos = st.pos + 1;
+        let m_val = _parse_int_until(st);
+        if m_val >= 0 and st.pos < st.n {
+            if st.cps[st.pos] == 125 { // '{m}'
+                st.pos = st.pos + 1;
+                min_r = m_val;
+                max_r = m_val;
+            } elif st.cps[st.pos] == 44 { // '{m,'
+                st.pos = st.pos + 1;
+                if st.pos < st.n and st.cps[st.pos] == 125 { // '{m,}'
+                    st.pos = st.pos + 1;
+                    min_r = m_val;
+                    max_r = -1;
+                } else {
+                    let n_val = _parse_int_until(st);
+                    if n_val >= 0 and st.pos < st.n and st.cps[st.pos] == 125 {
+                        if n_val < m_val {
+                            throw "pikevm: quantifier {m,n} has n < m";
+                        }
+                        st.pos = st.pos + 1;
+                        min_r = m_val;
+                        max_r = n_val;
+                    } else {
+                        st.pos = saved;
+                    }
+                }
+            } else {
+                st.pos = saved;
+            }
+        } else {
+            st.pos = saved;
+        }
+    }
+
+    if min_r < 0 { return atom; }
+    if atom.kind == "anchor" {
+        throw "pikevm: quantifier cannot be applied to zero-width anchor";
+    }
+    if min_r > MAX_QUANTIFIER_EXPANSION or max_r > MAX_QUANTIFIER_EXPANSION {
+        throw "pikevm: bounded quantifier exceeds MAX_QUANTIFIER_EXPANSION (256)";
+    }
+
+    let greedy = true;
+    if st.pos < st.n and st.cps[st.pos] == 63 { // lazy '*?', '+?', '??', '{m,n}?'
+        greedy = false;
+        st.pos = st.pos + 1;
+    }
+    return map{ kind: "rep", child: atom, min_r: min_r, max_r: max_r, greedy: greedy };
+}
+
+fn _parse_atom(st) {
+    let ch = st.cps[st.pos];
+    if ch == 42 or ch == 43 or ch == 63 {
+        throw "pikevm: unescaped quantifier at start of expression";
+    }
+    st.pos = st.pos + 1;
+
+    if ch == 94 { return map{ kind: "anchor", akind: ANCHOR_BOL }; }
+    if ch == 36 { return map{ kind: "anchor", akind: ANCHOR_EOL }; }
+    if ch == 46 { return map{ kind: "any", dotall: st.flag_s }; }
+    if ch == 91 { return _parse_char_class(st); }
+
+    if ch == 40 { // '('
+        let non_cap = false;
+        let saved_i = st.flag_i;
+        let saved_m = st.flag_m;
+        let saved_s = st.flag_s;
+        if st.pos < st.n and st.cps[st.pos] == 63 { // '(?'
+            st.pos = st.pos + 1;
+            while st.pos < st.n and (st.cps[st.pos] == 105 or st.cps[st.pos] == 109 or st.cps[st.pos] == 115) {
+                if st.cps[st.pos] == 105 { st.flag_i = true; }
+                if st.cps[st.pos] == 109 { st.flag_m = true; }
+                if st.cps[st.pos] == 115 { st.flag_s = true; }
+                st.pos = st.pos + 1;
+            }
+            if st.pos >= st.n or st.cps[st.pos] != 58 { // ':'
+                throw "pikevm: unsupported '(?...' group syntax (expected '(?:...)')";
+            }
+            st.pos = st.pos + 1;
+            non_cap = true;
+        }
+        let g_idx = 0;
+        if not non_cap {
+            st.num_groups = st.num_groups + 1;
+            g_idx = st.num_groups;
+        }
+        let inner = _parse_alt(st);
+        if st.pos >= st.n or st.cps[st.pos] != 41 {
+            throw "pikevm: missing closing ')'";
+        }
+        st.pos = st.pos + 1;
+        st.flag_i = saved_i;
+        st.flag_m = saved_m;
+        st.flag_s = saved_s;
+        if non_cap { return inner; }
+        return map{ kind: "group", group_idx: g_idx, child: inner };
+    }
+
+    if ch == 92 { // '\'
+        if st.pos >= st.n { throw "pikevm: trailing backslash in pattern"; }
+        let esc = st.cps[st.pos];
+        st.pos = st.pos + 1;
+        if esc == 98  { return map{ kind: "anchor", akind: ANCHOR_WORD }; }      // \b
+        if esc == 66  { return map{ kind: "anchor", akind: ANCHOR_NON_WORD }; }  // \B
+        if esc == 65  { return map{ kind: "anchor", akind: ANCHOR_START_TXT }; } // \A
+        if esc == 122 { return map{ kind: "anchor", akind: ANCHOR_END_TXT }; }   // \z
+        if esc == 100 { return map{ kind: "prop", prop: PROP_DIGIT, neg: 0 }; }  // \d
+        if esc == 68  { return map{ kind: "prop", prop: PROP_DIGIT, neg: 1 }; }  // \D
+        if esc == 119 { return map{ kind: "prop", prop: PROP_WORD, neg: 0 }; }   // \w
+        if esc == 87  { return map{ kind: "prop", prop: PROP_WORD, neg: 1 }; }   // \W
+        if esc == 115 { return map{ kind: "prop", prop: PROP_SPACE, neg: 0 }; }  // \s
+        if esc == 83  { return map{ kind: "prop", prop: PROP_SPACE, neg: 1 }; }  // \S
+        if esc == 112 { return map{ kind: "prop", prop: _parse_prop_braces(st), neg: 0 }; }
+        if esc == 80  { return map{ kind: "prop", prop: _parse_prop_braces(st), neg: 1 }; }
+        let lit_cp = esc;
+        if esc == 110 { lit_cp = 10; }
+        elif esc == 114 { lit_cp = 13; }
+        elif esc == 116 { lit_cp = 9; }
+        elif esc == 102 { lit_cp = 12; }
+        elif esc == 118 { lit_cp = 11; }
+        elif esc == 120 { lit_cp = _parse_hex_escape(st, 2); }
+        elif esc == 117 { lit_cp = _parse_hex_escape(st, 4); }
+        if st.flag_i { lit_cp = _fold_cp(lit_cp); }
+        return map{ kind: "lit", cp: lit_cp, fold: st.flag_i };
+    }
+
+    let c = if st.flag_i { _fold_cp(ch) } else { ch };
+    return map{ kind: "lit", cp: c, fold: st.flag_i };
+}
+
+// ── Thompson NFA Bytecode Emitter + 64-Slot LRU Cache ────────────────────────
+
+fn _emit_inst(em, op, a1, a2) {
+    let pc = len(em.ops);
+    array_push(em.ops, op);
+    array_push(em.a1, a1);
+    array_push(em.a2, a2);
+    return pc;
+}
+
+fn _compile_ast(em, node) {
+    let k = node.kind;
+    if k == "empty" { return; }
+    if k == "lit" {
+        _emit_inst(em, OP_CHAR, node.cp, if node.fold { 1 } else { 0 });
+        return;
+    }
+    if k == "any" {
+        _emit_inst(em, OP_ANY, if node.dotall { 1 } else { 0 }, 0);
+        return;
+    }
+    if k == "class" {
+        _emit_inst(em, OP_CLASS, node.cls_id, if node.negated { 1 } else { 0 });
+        return;
+    }
+    if k == "prop" {
+        _emit_inst(em, OP_PROP, node.prop, node.neg);
+        return;
+    }
+    if k == "anchor" {
+        _emit_inst(em, OP_ANCHOR, node.akind, 0);
+        return;
+    }
+    if k == "group" {
+        let g = node.group_idx;
+        _emit_inst(em, OP_SAVE, g * 2, 0);
+        _compile_ast(em, node.child);
+        _emit_inst(em, OP_SAVE, g * 2 + 1, 0);
+        return;
+    }
+    if k == "seq" {
+        let i = 0;
+        while i < len(node.items) {
+            _compile_ast(em, node.items[i]);
+            i = i + 1;
+        }
+        return;
+    }
+    if k == "alt" {
+        let brs = node.branches;
+        let end_jmps = [];
+        let b = 0;
+        let nb = len(brs);
+        while b < nb - 1 {
+            let sp = _emit_inst(em, OP_SPLIT, len(em.ops) + 1, -1);
+            _compile_ast(em, brs[b]);
+            let jp = _emit_inst(em, OP_JMP, -1, 0);
+            array_push(end_jmps, jp);
+            em.a2[sp] = len(em.ops);
+            b = b + 1;
+        }
+        _compile_ast(em, brs[nb - 1]);
+        let after_alt = len(em.ops);
+        let j = 0;
+        while j < len(end_jmps) {
+            em.a1[end_jmps[j]] = after_alt;
+            j = j + 1;
+        }
+        return;
+    }
+    if k == "rep" {
+        let min_r = node.min_r;
+        let max_r = node.max_r;
+        let gr = node.greedy;
+        let ch = node.child;
+
+        if min_r == 0 and max_r == -1 { // * or *?
+            let sp = _emit_inst(em, OP_SPLIT, -1, -1);
+            let body_pc = len(em.ops);
+            _compile_ast(em, ch);
+            _emit_inst(em, OP_JMP, sp, 0);
+            let out_pc = len(em.ops);
+            if gr { em.a1[sp] = body_pc; em.a2[sp] = out_pc; }
+            else  { em.a1[sp] = out_pc;  em.a2[sp] = body_pc; }
+            return;
+        }
+        if min_r == 1 and max_r == -1 { // + or +?
+            let body_pc = len(em.ops);
+            _compile_ast(em, ch);
+            let sp = _emit_inst(em, OP_SPLIT, -1, -1);
+            let out_pc = len(em.ops);
+            if gr { em.a1[sp] = body_pc; em.a2[sp] = out_pc; }
+            else  { em.a1[sp] = out_pc;  em.a2[sp] = body_pc; }
+            return;
+        }
+        if min_r == 0 and max_r == 1 { // ? or ??
+            let sp = _emit_inst(em, OP_SPLIT, -1, -1);
+            let body_pc = len(em.ops);
+            _compile_ast(em, ch);
+            let out_pc = len(em.ops);
+            if gr { em.a1[sp] = body_pc; em.a2[sp] = out_pc; }
+            else  { em.a1[sp] = out_pc;  em.a2[sp] = body_pc; }
+            return;
+        }
+        // General {m,n} or {m,}
+        if max_r == -1 {
+            // min_r >= 2 here: emit (min_r - 1) mandatory copies, then +/+?
+            let r = 0;
+            while r < min_r - 1 {
+                _compile_ast(em, ch);
+                r = r + 1;
+            }
+            let body_pc2 = len(em.ops);
+            _compile_ast(em, ch);
+            let sp2 = _emit_inst(em, OP_SPLIT, -1, -1);
+            let out_pc2 = len(em.ops);
+            if gr { em.a1[sp2] = body_pc2; em.a2[sp2] = out_pc2; }
+            else  { em.a1[sp2] = out_pc2;  em.a2[sp2] = body_pc2; }
+            return;
+        }
+        let r = 0;
+        while r < min_r {
+            _compile_ast(em, ch);
+            r = r + 1;
+        }
+        let opt_cnt = max_r - min_r;
+        let o = 0;
+        while o < opt_cnt {
+            let sp3 = _emit_inst(em, OP_SPLIT, -1, -1);
+            let b_pc3 = len(em.ops);
+            _compile_ast(em, ch);
+            let o_pc3 = len(em.ops);
+            if gr { em.a1[sp3] = b_pc3; em.a2[sp3] = o_pc3; }
+            else  { em.a1[sp3] = o_pc3; em.a2[sp3] = b_pc3; }
+            o = o + 1;
+        }
+    }
+}
+
+let _REGEX_LRU = map{
+    keys: [],
+    map_store: map{},
+    hits: 0,
+    misses: 0
+};
+
+fn pikevm_cache_stats() {
+    return map{
+        size: len(_REGEX_LRU.keys),
+        capacity: LRU_CACHE_CAPACITY,
+        hits: _REGEX_LRU.hits,
+        misses: _REGEX_LRU.misses
+    };
+}
+
+fn pikevm_clear_cache() {
+    _REGEX_LRU.keys = [];
+    _REGEX_LRU.map_store = map{};
+    _REGEX_LRU.hits = 0;
+    _REGEX_LRU.misses = 0;
+}
+
+fn pikevm_compile(pattern, flags = "") {
+    if is_map(pattern) and map_has(pattern, "kind") and pattern.kind == "pikevm.program" {
+        return pattern;
+    }
+    let pat_str = str(pattern);
+    let flg_str = str(flags);
+    let cache_key = flg_str + "::" + pat_str;
+
+    if map_has(_REGEX_LRU.map_store, cache_key) {
+        _REGEX_LRU.hits = _REGEX_LRU.hits + 1;
+        // Promote key to MRU tail
+        let nkeys = [];
+        let ki = 0;
+        while ki < len(_REGEX_LRU.keys) {
+            if _REGEX_LRU.keys[ki] != cache_key {
+                array_push(nkeys, _REGEX_LRU.keys[ki]);
+            }
+            ki = ki + 1;
+        }
+        array_push(nkeys, cache_key);
+        _REGEX_LRU.keys = nkeys;
+        return _REGEX_LRU.map_store[cache_key];
+    }
+
+    _REGEX_LRU.misses = _REGEX_LRU.misses + 1;
+    let cps = [];
+    let i = 0;
+    while i < len(pat_str) {
+        array_push(cps, strcharcodeat(pat_str, i));
+        i = i + 1;
+    }
+
+    let fi = false;
+    let fm = false;
+    let fs = false;
+    i = 0;
+    while i < len(flg_str) {
+        let fc = strcharcodeat(flg_str, i);
+        if fc == 105 { fi = true; }
+        elif fc == 109 { fm = true; }
+        elif fc == 115 { fs = true; }
+        i = i + 1;
+    }
+
+    let st = map{
+        cps: cps,
+        n: len(cps),
+        pos: 0,
+        num_groups: 0,
+        classes: [],
+        flag_i: fi,
+        flag_m: fm,
+        flag_s: fs
+    };
+    let ast = _parse_alt(st);
+    if st.pos != st.n {
+        throw "pikevm: unexpected ')' or trailing token at index " + str(st.pos);
+    }
+
+    // Program layout:
+    //   PC 0..2: Russ Cox unanchored prefix `L0: SPLIT(3, 1); L1: ANY_DOTALL; JMP(0)`
+    //   PC 3:    SAVE(0) (group 0 match start)
+    //   PC 4..K: compiled AST
+    //   PC K+1:  SAVE(1) (group 0 match end)
+    //   PC K+2:  MATCH
+    // Note: `anchored_start_pc = 3` lets anchored or `start_pos`-bounded runs skip prefix cleanly,
+    // while `unanchored_start_pc = 0` runs full unanchored search in ONE single linear pass!
+    let em = map{ ops: [], a1: [], a2: [] };
+    _emit_inst(em, OP_SPLIT, 3, 1); // PC 0: try pattern (PC 3) with higher priority than skipping a char (PC 1)!
+    _emit_inst(em, OP_ANY, 1, 0);   // PC 1: consume 1 arbitrary scalar
+    _emit_inst(em, OP_JMP, 0, 0);   // PC 2: loop prefix
+    _emit_inst(em, OP_SAVE, 0, 0);  // PC 3: SAVE slot 0
+    _compile_ast(em, ast);
+    _emit_inst(em, OP_SAVE, 1, 0);
+    _emit_inst(em, OP_MATCH, 0, 0);
+
+    let prog = map{
+        kind: "pikevm.program",
+        ok: true,
+        pattern: pat_str,
+        flags: flg_str,
+        flag_i: st.flag_i,
+        flag_m: st.flag_m,
+        flag_s: st.flag_s,
+        num_inst: len(em.ops),
+        num_groups: st.num_groups,
+        unanchored_pc: 0,
+        anchored_pc: 3,
+        ops: em.ops,
+        a1: em.a1,
+        a2: em.a2,
+        classes: st.classes
+    };
+
+    if len(_REGEX_LRU.keys) >= LRU_CACHE_CAPACITY {
+        _REGEX_LRU.keys = slice(_REGEX_LRU.keys, 1, len(_REGEX_LRU.keys));
+        let fresh_store = map{};
+        let rk = 0;
+        while rk < len(_REGEX_LRU.keys) {
+            let kk = _REGEX_LRU.keys[rk];
+            fresh_store[kk] = _REGEX_LRU.map_store[kk];
+            rk = rk + 1;
+        }
+        _REGEX_LRU.map_store = fresh_store;
+    }
+    array_push(_REGEX_LRU.keys, cache_key);
+    _REGEX_LRU.map_store[cache_key] = prog;
+    return prog;
+}
+
+// ── Character & Anchor Steppers ──────────────────────────────────────────────
+
+fn _match_char_class(cls, negated, cp) {
+    let check_cp = if cls.fold { _fold_cp(cp) } else { cp };
+    let hit = false;
+    let rngs = cls.ranges;
+    let i = 0;
+    let nr = len(rngs);
+    while i < nr {
+        let r = rngs[i];
+        if check_cp >= r[0] and check_cp <= r[1] {
+            hit = true;
+            break;
+        }
+        i = i + 1;
+    }
+    if not hit {
+        let prps = cls.props;
+        let j = 0;
+        while j < len(prps) {
+            let p = prps[j];
+            let ph = _eval_prop(p.prop, cp);
+            if p.neg { ph = not ph; }
+            if ph {
+                hit = true;
+                break;
+            }
+            j = j + 1;
+        }
+    }
+    if negated == 1 { return not hit; }
+    return hit;
+}
+
+fn _eval_anchor(akind, cps, pos, n, flag_m) {
+    if akind == ANCHOR_BOL {
+        if pos == 0 { return true; }
+        if flag_m and cps[pos - 1] == 10 { return true; }
+        return false;
+    }
+    if akind == ANCHOR_EOL {
+        if pos == n { return true; }
+        if flag_m and cps[pos] == 10 { return true; }
+        return false;
+    }
+    if akind == ANCHOR_START_TXT { return pos == 0; }
+    if akind == ANCHOR_END_TXT { return pos == n; }
+    let prev_w = (pos > 0 and _is_word_cp(cps[pos - 1]));
+    let cur_w = (pos < n and _is_word_cp(cps[pos]));
+    if akind == ANCHOR_WORD { return prev_w != cur_w; }
+    if akind == ANCHOR_NON_WORD { return prev_w == cur_w; }
+    return false;
+}
+
+fn _inst_matches_cp(prog, pc, cp) {
+    let op = prog.ops[pc];
+    let x = prog.a1[pc];
+    let y = prog.a2[pc];
+    if op == OP_CHAR {
+        let c = if y == 1 { _fold_cp(cp) } else { cp };
+        return c == x;
+    }
+    if op == OP_ANY {
+        if x == 1 { return true; }
+        return cp != 10;
+    }
+    if op == OP_CLASS {
+        return _match_char_class(prog.classes[x], y, cp);
+    }
+    if op == OP_PROP {
+        let r = _eval_prop(x, cp);
+        if y == 1 { return not r; }
+        return r;
+    }
+    return false;
+}
+
+// ── Ultra-Fast Lockstep Boolean Matcher (`pikevm_is_match`, Zero Allocations!) ─
+
+fn _add_bool_state(prog, root_pc, list_arr, list_len, visited_gen, gen, stack_arr, cps, pos, n) {
+    let ops = prog.ops;
+    let a1 = prog.a1;
+    let a2 = prog.a2;
+    let fm = prog.flag_m;
+
+    let sp = 1;
+    stack_arr[0] = root_pc;
+    while sp > 0 {
+        sp = sp - 1;
+        let pc = stack_arr[sp];
+        if visited_gen[pc] != gen {
+            visited_gen[pc] = gen;
+            let op = ops[pc];
+            if op == OP_JMP {
+                stack_arr[sp] = a1[pc];
+                sp = sp + 1;
+            } elif op == OP_SPLIT {
+                // Push second priority first so higher priority pops first (LIFO)!
+                stack_arr[sp] = a2[pc];
+                stack_arr[sp + 1] = a1[pc];
+                sp = sp + 2;
+            } elif op == OP_SAVE {
+                stack_arr[sp] = pc + 1;
+                sp = sp + 1;
+            } elif op == OP_ANCHOR {
+                if _eval_anchor(a1[pc], cps, pos, n, fm) {
+                    stack_arr[sp] = pc + 1;
+                    sp = sp + 1;
+                }
+            } else {
+                list_arr[list_len] = pc;
+                list_len = list_len + 1;
+            }
+        }
+    }
+    return list_len;
+}
+
+fn pikevm_is_match(pattern_or_prog, text, flags = "") {
+    let prog = pikevm_compile(pattern_or_prog, flags);
+    let s = str(text);
+    let n = len(s);
+    let cps = [];
+    let k = 0;
+    while k < n {
+        array_push(cps, strcharcodeat(s, k));
+        k = k + 1;
+    }
+
+    let m = prog.num_inst;
+    let clist = [];
+    let nlist = [];
+    let visited = [];
+    let stack = [];
+    let idx = 0;
+    while idx < m * 2 + 4 {
+        array_push(stack, 0);
+        if idx < m {
+            array_push(clist, 0);
+            array_push(nlist, 0);
+            array_push(visited, 0);
+        }
+        idx = idx + 1;
+    }
+
+    let ops = prog.ops;
+    let gen = 1;
+    let clen = _add_bool_state(prog, prog.unanchored_pc, clist, 0, visited, gen, stack, cps, 0, n);
+
+    // Check immediate match at position 0
+    let ci = 0;
+    while ci < clen {
+        if ops[clist[ci]] == OP_MATCH { return true; }
+        ci = ci + 1;
+    }
+
+    let pos = 0;
+    while pos < n and clen > 0 {
+        let cp = cps[pos];
+        gen = gen + 1;
+        let nlen = 0;
+        ci = 0;
+        while ci < clen {
+            let pc = clist[ci];
+            if _inst_matches_cp(prog, pc, cp) {
+                nlen = _add_bool_state(prog, pc + 1, nlist, nlen, visited, gen, stack, cps, pos + 1, n);
+            }
+            ci = ci + 1;
+        }
+        // Check match in nlist
+        let ni = 0;
+        while ni < nlen {
+            if ops[nlist[ni]] == OP_MATCH { return true; }
+            ni = ni + 1;
+        }
+        let tmp = clist;
+        clist = nlist;
+        nlist = tmp;
+        clen = nlen;
+        pos = pos + 1;
+    }
+    return false;
+}
+
+// ── Ordered-Thread Capturing PikeVM (`pikevm_find`, `captures`, `replace_all`) ─
+
+fn _clone_set_slot(slots, slot_idx, val) {
+    let ns = slice(slots, 0, len(slots));
+    ns[slot_idx] = val;
+    return ns;
+}
+
+fn _add_cap_thread(prog, root_pc, init_slots, tlist, visited_gen, gen, cps, pos, n) {
+    // Explicit iterative stack of { pc, slots } frames (ZERO recursion!)
+    let ops = prog.ops;
+    let a1 = prog.a1;
+    let a2 = prog.a2;
+    let fm = prog.flag_m;
+
+    let stk = [map{ pc: root_pc, slots: init_slots }];
+    while len(stk) > 0 {
+        let top_i = len(stk) - 1;
+        let fr = stk[top_i];
+        stk = slice(stk, 0, top_i);
+        let pc = fr.pc;
+        if visited_gen[pc] != gen {
+            visited_gen[pc] = gen;
+            let op = ops[pc];
+            if op == OP_JMP {
+                array_push(stk, map{ pc: a1[pc], slots: fr.slots });
+            } elif op == OP_SPLIT {
+                array_push(stk, map{ pc: a2[pc], slots: fr.slots });
+                array_push(stk, map{ pc: a1[pc], slots: fr.slots });
+            } elif op == OP_SAVE {
+                let updated = _clone_set_slot(fr.slots, a1[pc], pos);
+                array_push(stk, map{ pc: pc + 1, slots: updated });
+            } elif op == OP_ANCHOR {
+                if _eval_anchor(a1[pc], cps, pos, n, fm) {
+                    array_push(stk, map{ pc: pc + 1, slots: fr.slots });
+                }
+            } else {
+                array_push(tlist, map{ pc: pc, slots: fr.slots });
+            }
+        }
+    }
+}
+
+fn _run_pikevm_search(prog, cps, start_idx, anchored_only) {
+    let n = len(cps);
+    let m = prog.num_inst;
+    let num_slots = (prog.num_groups + 1) * 2;
+    let empty_slots = [];
+    let s_i = 0;
+    while s_i < num_slots {
+        array_push(empty_slots, -1);
+        s_i = s_i + 1;
+    }
+    let visited = [];
+    let v_i = 0;
+    while v_i < m {
+        array_push(visited, 0);
+        v_i = v_i + 1;
+    }
+
+    let entry_pc = if anchored_only { prog.anchored_pc } else { prog.unanchored_pc };
+    let gen = 1;
+    let clist = [];
+    _add_cap_thread(prog, entry_pc, empty_slots, clist, visited, gen, cps, start_idx, n);
+
+    let best_slots = nil;
+    let ops = prog.ops;
+
+    let pos = start_idx;
+    while true {
+        // Inspect clist in priority order; if OP_MATCH reached, record best_slots & prune lower-priority threads!
+        let next_clist = [];
+        let ci = 0;
+        while ci < len(clist) {
+            let th = clist[ci];
+            if ops[th.pc] == OP_MATCH {
+                best_slots = th.slots;
+                break; // All remaining threads in clist have strictly lower priority!
+            }
+            // Once we have found at least one match, stop spawning new unanchored prefix starts (PC 1)!
+            if best_slots != nil and th.pc == 1 {
+                ci = ci + 1;
+                continue;
+            }
+            array_push(next_clist, th);
+            ci = ci + 1;
+        }
+        clist = next_clist;
+
+        if pos >= n or len(clist) == 0 {
+            break;
+        }
+
+        let cp = cps[pos];
+        gen = gen + 1;
+        let nlist = [];
+        ci = 0;
+        while ci < len(clist) {
+            let th2 = clist[ci];
+            if _inst_matches_cp(prog, th2.pc, cp) {
+                _add_cap_thread(prog, th2.pc + 1, th2.slots, nlist, visited, gen, cps, pos + 1, n);
+            }
+            ci = ci + 1;
+        }
+        clist = nlist;
+        pos = pos + 1;
+    }
+
+    return best_slots;
+}
+
+fn _str_to_cps(s) {
+    let cps = [];
+    let i = 0;
+    let n = len(s);
+    while i < n {
+        array_push(cps, strcharcodeat(s, i));
+        i = i + 1;
+    }
+    return cps;
+}
+
+fn pikevm_find(pattern_or_prog, text, flags = "") {
+    let prog = pikevm_compile(pattern_or_prog, flags);
+    let s = str(text);
+    let cps = _str_to_cps(s);
+    let slots = _run_pikevm_search(prog, cps, 0, false);
+    if slots == nil {
+        return map{ matched: false, ok: false, start: -1, end: -1, text: "" };
+    }
+    let st = slots[0];
+    let en = slots[1];
+    return map{
+        matched: true,
+        ok: true,
+        start: st,
+        end: en,
+        text: str_slice(s, st, en)
+    };
+}
+
+fn pikevm_captures(pattern_or_prog, text, flags = "") {
+    let prog = pikevm_compile(pattern_or_prog, flags);
+    let s = str(text);
+    let cps = _str_to_cps(s);
+    let slots = _run_pikevm_search(prog, cps, 0, false);
+    if slots == nil {
+        return map{ matched: false, ok: false, start: -1, end: -1, text: "", groups: [], spans: [] };
+    }
+    let groups = [];
+    let spans = [];
+    let g = 0;
+    while g <= prog.num_groups {
+        let gs = slots[g * 2];
+        let ge = slots[g * 2 + 1];
+        if gs >= 0 and ge >= gs {
+            array_push(groups, str_slice(s, gs, ge));
+            array_push(spans, [gs, ge]);
+        } else {
+            array_push(groups, nil);
+            array_push(spans, [-1, -1]);
+        }
+        g = g + 1;
+    }
+    return map{
+        matched: true,
+        ok: true,
+        start: slots[0],
+        end: slots[1],
+        text: groups[0],
+        groups: groups,
+        spans: spans
+    };
+}
+
+fn pikevm_find_all(pattern_or_prog, text, flags = "") {
+    let prog = pikevm_compile(pattern_or_prog, flags);
+    let s = str(text);
+    let cps = _str_to_cps(s);
+    let n = len(cps);
+    let results = [];
+    let cursor = 0;
+
+    while cursor <= n {
+        let slots = _run_pikevm_search(prog, cps, cursor, false);
+        if slots == nil { break; }
+        let st = slots[0];
+        let en = slots[1];
+        let groups = [];
+        let g = 0;
+        while g <= prog.num_groups {
+            let gs = slots[g * 2];
+            let ge = slots[g * 2 + 1];
+            if gs >= 0 and ge >= gs {
+                array_push(groups, str_slice(s, gs, ge));
+            } else {
+                array_push(groups, nil);
+            }
+            g = g + 1;
+        }
+        array_push(results, map{
+            matched: true,
+            start: st,
+            end: en,
+            text: groups[0],
+            groups: groups
+        });
+        if en > st {
+            cursor = en;
+        } else {
+            // Zero-length match: advance cursor by 1 codepoint to prevent infinite stall!
+            cursor = en + 1;
+        }
+    }
+    return results;
+}
+
+fn _expand_replacement_template(tmpl, groups) {
+    let out = "";
+    let n = len(tmpl);
+    let i = 0;
+    while i < n {
+        let ch = strcharcodeat(tmpl, i);
+        if ch == 36 and i + 1 < n { // '$'
+            let nx = strcharcodeat(tmpl, i + 1);
+            if nx == 36 { // '$$' -> literal '$'
+                out = out + "$";
+                i = i + 2;
+                continue;
+            }
+            if nx >= 48 and nx <= 57 { // '$0'..'$9'
+                let gidx = nx - 48;
+                if gidx < len(groups) and groups[gidx] != nil {
+                    out = out + groups[gidx];
+                }
+                i = i + 2;
+                continue;
+            }
+        }
+        out = out + str_slice(tmpl, i, i + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn pikevm_replace_all(pattern_or_prog, text, replacement, flags = "") {
+    let s = str(text);
+    let rep_tmpl = str(replacement);
+    let hits = pikevm_find_all(pattern_or_prog, s, flags);
+    if len(hits) == 0 { return s; }
+
+    let out = "";
+    let prev_end = 0;
+    let i = 0;
+    while i < len(hits) {
+        let h = hits[i];
+        if h.start > prev_end {
+            out = out + str_slice(s, prev_end, h.start);
+        }
+        out = out + _expand_replacement_template(rep_tmpl, h.groups);
+        prev_end = h.end;
+        i = i + 1;
+    }
+    if prev_end < len(s) {
+        out = out + str_slice(s, prev_end, len(s));
+    }
+    return out;
+}
+
+export MODULE_VERSION, LRU_CACHE_CAPACITY;
+export pikevm_compile, pikevm_cache_stats, pikevm_clear_cache;
+export pikevm_is_match, pikevm_find, pikevm_find_all, pikevm_captures, pikevm_replace_all;

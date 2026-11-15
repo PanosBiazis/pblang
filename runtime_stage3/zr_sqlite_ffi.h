@@ -186,6 +186,8 @@ static bool zr_sqlite_bind_params(PbVM *vm, ZrSqliteStmt *stmt, PbValue params_v
             rc = g_zr_sql.sqlite3_bind_null(stmt, idx);
         } else if (v.tag == VAL_BOOL) {
             rc = g_zr_sql.sqlite3_bind_int64(stmt, idx, v.u.b ? 1 : 0);
+        } else if (v.tag == VAL_I64) {
+            rc = g_zr_sql.sqlite3_bind_int64(stmt, idx, v.as.i64);
         } else if (v.tag == VAL_NUM) {
             double n = v.u.num;
             if (isfinite(n) && floor(n) == n && n >= -9007199254740991.0 && n <= 9007199254740991.0) {
@@ -1615,6 +1617,44 @@ static void zr_ffi_cleanup_vm(PbVM *vm) {
         }
     }
     zr_mutex_unlock(&g_zr_db_ffi_mtx);
+}
+
+/* ---- Thin Lossless 64-bit OBJ_PTR Wrappers (#15a) ---- */
+
+static bool bi_ffi_ptr_new(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (argc < 1 || argc > 2) { vm_raise(vm, "ffi_ptr_new(addr[, tag]) expects 1 or 2 args"); return false; }
+    uintptr_t addr = 0;
+    if (argv[0].tag == VAL_I64) addr = (uintptr_t)(uint64_t)argv[0].as.i64;
+    else if (argv[0].tag == VAL_NUM) addr = (uintptr_t)(uint64_t)argv[0].u.num;
+    else if (val_is_obj(argv[0], OBJ_PTR)) addr = AS_PTR(argv[0])->ptr;
+    else if (val_is_obj(argv[0], OBJ_STR)) {
+        const char *s = ((PbStr *)val_as_obj(argv[0]))->chars;
+        addr = (uintptr_t)strtoull(s, NULL, 0);
+    } else if (argv[0].tag == VAL_NIL) addr = 0;
+    else { vm_raise(vm, "ffi_ptr_new(): expected i64/number/hex-string/ptr"); return false; }
+    const char *tag = (argc == 2 && val_is_obj(argv[1], OBJ_STR)) ? ((PbStr *)val_as_obj(argv[1]))->chars : "void*";
+    *out = val_obj(pb_ptr_new(vm, addr, 0, false, tag));
+    return true;
+}
+
+static bool bi_ffi_ptr_addr(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (argc != 1) { vm_raise(vm, "ffi_ptr_addr(ptr) expects 1 arg"); return false; }
+    if (val_is_obj(argv[0], OBJ_PTR)) { *out = val_i64((int64_t)(uint64_t)AS_PTR(argv[0])->ptr); return true; }
+    if (argv[0].tag == VAL_I64) { *out = argv[0]; return true; }
+    if (argv[0].tag == VAL_NUM) { *out = val_i64((int64_t)(uint64_t)argv[0].u.num); return true; }
+    if (argv[0].tag == VAL_NIL) { *out = val_i64(0); return true; }
+    vm_raise(vm, "ffi_ptr_addr(): expected ptr");
+    return false;
+}
+
+static bool bi_ffi_ptr_is_null(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (argc != 1) { vm_raise(vm, "ffi_ptr_is_null(ptr) expects 1 arg"); return false; }
+    if (argv[0].tag == VAL_NIL) { *out = val_bool(true); return true; }
+    if (val_is_obj(argv[0], OBJ_PTR)) { *out = val_bool(AS_PTR(argv[0])->ptr == 0); return true; }
+    if (argv[0].tag == VAL_I64) { *out = val_bool(argv[0].as.i64 == 0); return true; }
+    if (argv[0].tag == VAL_NUM) { *out = val_bool(argv[0].u.num == 0.0); return true; }
+    *out = val_bool(false);
+    return true;
 }
 
 #endif /* PBLANG_ZR_SQLITE_FFI_H */

@@ -1,0 +1,1090 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+//
+// stdlib/compiler/hermetic_cross_bundler.sapp — PBLang v5.0.0 Pure-PBLang
+// Zero-Toolchain Hermetic Multi-OS & Legacy Cross-Bundler (`ELF64` x86_64/arm64/riscv64,
+// `PE32+` Windows x64, `Mach-O 64` macOS Apple Silicon + SHA-256 CodeDirectory,
+// `WASM32` v1 + `pblang.pbck` custom section, and retro 16-bit `MS-DOS MZ`).
+//
+// Zero GCC/Clang/MinGW/Xcode/ld invocation; zero host path or timestamp leaks.
+
+let Sha256 = import("stdlib:sha256_pb.sapp");
+
+let BUNDLER_ENGINE_VERSION = "5.0.0";
+let TRAILER_MAGIC_START = "PBLANG_BUNDLE_V1"; // 16 bytes
+let TRAILER_MAGIC_END = "PBLG_END";           // 8 bytes
+let TRAILER_BYTE_SIZE = 96;
+let DEFAULT_HERMETIC_EPOCH = 1762905600;
+
+let SUPPORTED_TARGETS = [
+    "linux-x64",
+    "linux-arm64",
+    "linux-riscv64",
+    "windows-x64",
+    "macos-arm64",
+    "wasm32",
+    "dos16"
+];
+
+fn _opt(m, key, fallback) {
+    if m == nil or type(m) != "map" { return fallback; }
+    if not map_has(m, key) { return fallback; }
+    let v = m[key];
+    if v == nil { return fallback; }
+    return v;
+}
+
+// ============================================================================
+// Exact Endianness, Alignment, LEB128 & Hex Byte Primitives
+// ============================================================================
+
+fn _zeros(count) {
+    let out = [];
+    let i = 0;
+    while i < count {
+        array_push(out, 0);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _append_bytes(dst, src) {
+    let i = 0;
+    while i < len(src) {
+        array_push(dst, src[i]);
+        i = i + 1;
+    }
+    return dst;
+}
+
+fn _put_bytes(buf, offset, patch) {
+    let i = 0;
+    while i < len(patch) {
+        buf[offset + i] = patch[i];
+        i = i + 1;
+    }
+}
+
+fn _slice_bytes(buf, start_idx, end_idx) {
+    let out = [];
+    let i = num_max(0, start_idx);
+    let lim = num_min(len(buf), end_idx);
+    while i < lim {
+        array_push(out, buf[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _align_up(val, align) {
+    let r = num_mod(val, align);
+    if r == 0 { return val; }
+    return val + (align - r);
+}
+
+fn _pad_to_alignment(buf, align) {
+    let target = _align_up(len(buf), align);
+    while len(buf) < target {
+        array_push(buf, 0);
+    }
+    return buf;
+}
+
+fn _fixed_ascii(text, width) {
+    let raw = str_to_bytes(str(text));
+    let out = [];
+    let i = 0;
+    while i < width {
+        if i < len(raw) { array_push(out, raw[i]); }
+        else { array_push(out, 0); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _trim_nul_ascii(byte_arr) {
+    let clean = [];
+    let i = 0;
+    while i < len(byte_arr) and byte_arr[i] != 0 {
+        array_push(clean, byte_arr[i]);
+        i = i + 1;
+    }
+    return bytes_to_str(clean);
+}
+
+fn _u16_le(v) {
+    let x = num_floor(v);
+    if x < 0 { x = x + 65536; }
+    return [num_mod(x, 256), num_mod(num_floor(x / 256), 256)];
+}
+
+fn _u32_le(v) {
+    let x = num_floor(v);
+    if x < 0 { x = x + 4294967296; }
+    let b0 = num_mod(x, 256);
+    let x1 = num_floor(x / 256);
+    let b1 = num_mod(x1, 256);
+    let x2 = num_floor(x1 / 256);
+    let b2 = num_mod(x2, 256);
+    let b3 = num_mod(num_floor(x2 / 256), 256);
+    return [b0, b1, b2, b3];
+}
+
+fn _u32_be(v) {
+    let le = _u32_le(v);
+    return [le[3], le[2], le[1], le[0]];
+}
+
+fn _u64_le(v) {
+    let x = num_floor(v);
+    let lo = num_mod(x, 4294967296);
+    let hi = num_floor(x / 4294967296);
+    let out = _u32_le(lo);
+    return _append_bytes(out, _u32_le(hi));
+}
+
+fn _u64_be(v) {
+    let x = num_floor(v);
+    let lo = num_mod(x, 4294967296);
+    let hi = num_floor(x / 4294967296);
+    let out = _u32_be(hi);
+    return _append_bytes(out, _u32_be(lo));
+}
+
+fn _read_u16_le(b, off) {
+    return b[off] + b[off + 1] * 256;
+}
+
+fn _read_u32_le(b, off) {
+    return b[off] + b[off + 1] * 256 + b[off + 2] * 65536 + b[off + 3] * 16777216;
+}
+
+fn _read_u32_be(b, off) {
+    return b[off] * 16777216 + b[off + 1] * 65536 + b[off + 2] * 256 + b[off + 3];
+}
+
+fn _read_u64_le(b, off) {
+    let lo = _read_u32_le(b, off);
+    let hi = _read_u32_le(b, off + 4);
+    return lo + hi * 4294967296;
+}
+
+fn _uleb128_encode(val) {
+    let x = num_max(0, num_floor(val));
+    let out = [];
+    while true {
+        let low7 = num_mod(x, 128);
+        x = num_floor(x / 128);
+        if x != 0 {
+            array_push(out, low7 + 128);
+        } else {
+            array_push(out, low7);
+            break;
+        }
+    }
+    return out;
+}
+
+fn _uleb128_decode(buf, start_off) {
+    let result = 0;
+    let mul = 1;
+    let pos = start_off;
+    while pos < len(buf) {
+        let byte = buf[pos];
+        pos = pos + 1;
+        let low7 = num_mod(byte, 128);
+        result = result + low7 * mul;
+        if byte < 128 {
+            return map{ "ok": true, "value": result, "next_offset": pos };
+        }
+        mul = mul * 128;
+    }
+    return map{ "ok": false, "value": 0, "next_offset": pos };
+}
+
+fn _hex_to_raw_bytes(hex_str) {
+    let s = str_lower(str(hex_str));
+    let out = [];
+    let i = 0;
+    while i + 1 < len(s) {
+        let c1 = strcharcodeat(s, i);
+        let c2 = strcharcodeat(s, i + 1);
+        let n1 = if c1 >= 48 and c1 <= 57 { c1 - 48 } else { c1 - 87 };
+        let n2 = if c2 >= 48 and c2 <= 57 { c2 - 48 } else { c2 - 87 };
+        array_push(out, n1 * 16 + n2);
+        i = i + 2;
+    }
+    return out;
+}
+
+fn _raw_bytes_to_hex(byte_arr) {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while i < len(byte_arr) {
+        let b = byte_arr[i];
+        let hi = num_floor(b / 16);
+        let lo = num_mod(b, 16);
+        out = out + str_slice(digits, hi, hi + 1) + str_slice(digits, lo, lo + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _normalize_payload_bytes(payload) {
+    if type(payload) == "array" {
+        let copy = [];
+        let i = 0;
+        while i < len(payload) {
+            array_push(copy, num_mod(num_floor(payload[i]), 256));
+            i = i + 1;
+        }
+        return copy;
+    }
+    return str_to_bytes(str(payload));
+}
+
+fn _detect_payload_tag(payload_bytes, opts) {
+    let explicit = _opt(opts, "payload_kind", nil);
+    if explicit != nil and len(str(explicit)) == 4 { return str_upper(str(explicit)); }
+    if len(payload_bytes) >= 4 {
+        let head = bytes_to_str(_slice_bytes(payload_bytes, 0, 4));
+        if head == "PBCK" or head == "PBSH" { return head; }
+    }
+    return "PBCK";
+}
+
+// ============================================================================
+// Universal 96-Byte `PBLANG_BUNDLE_V1` Hermetic Trailer
+// ============================================================================
+// Layout (96 bytes):
+//   [0..16)   : "PBLANG_BUNDLE_V1" (16B)
+//   [16..32)  : target id NUL-padded (16B)
+//   [32..36)  : payload tag ("PBCK" / "PBSH" / "SAPP", 4B)
+//   [36..40)  : deterministic epoch u32 LE (4B)
+//   [40..48)  : payload_offset u64 LE (8B)
+//   [48..56)  : payload_size u64 LE (8B)
+//   [56..88)  : payload SHA-256 digest raw bytes (32B)
+//   [88..96)  : "PBLG_END" (8B)
+
+fn _build_trailer_bytes(target_id, payload_tag, epoch, payload_offset, payload_size, payload_sha_hex) {
+    let tr = [];
+    _append_bytes(tr, _fixed_ascii(TRAILER_MAGIC_START, 16));
+    _append_bytes(tr, _fixed_ascii(target_id, 16));
+    _append_bytes(tr, _fixed_ascii(payload_tag, 4));
+    _append_bytes(tr, _u32_le(epoch));
+    _append_bytes(tr, _u64_le(payload_offset));
+    _append_bytes(tr, _u64_le(payload_size));
+    _append_bytes(tr, _hex_to_raw_bytes(payload_sha_hex));
+    _append_bytes(tr, _fixed_ascii(TRAILER_MAGIC_END, 8));
+    return tr;
+}
+
+fn _parse_trailer_at(bin_bytes, trailer_off) {
+    if trailer_off < 0 or trailer_off + TRAILER_BYTE_SIZE > len(bin_bytes) {
+        return nil;
+    }
+    let start_magic = bytes_to_str(_slice_bytes(bin_bytes, trailer_off, trailer_off + 16));
+    let end_magic = bytes_to_str(_slice_bytes(bin_bytes, trailer_off + 88, trailer_off + 96));
+    if start_magic != TRAILER_MAGIC_START or end_magic != TRAILER_MAGIC_END {
+        return nil;
+    }
+    let target_id = _trim_nul_ascii(_slice_bytes(bin_bytes, trailer_off + 16, trailer_off + 32));
+    let payload_tag = _trim_nul_ascii(_slice_bytes(bin_bytes, trailer_off + 32, trailer_off + 36));
+    let epoch = _read_u32_le(bin_bytes, trailer_off + 36);
+    let p_off = _read_u64_le(bin_bytes, trailer_off + 40);
+    let p_size = _read_u64_le(bin_bytes, trailer_off + 48);
+    let expected_sha = _raw_bytes_to_hex(_slice_bytes(bin_bytes, trailer_off + 56, trailer_off + 88));
+
+    let bounds_ok = p_off >= 0 and (p_off + p_size) <= trailer_off;
+    let actual_sha = if bounds_ok {
+        Sha256.sha256_hex_bytes(_slice_bytes(bin_bytes, p_off, p_off + p_size))
+    } else {
+        ""
+    };
+    return map{
+        "trailer_offset": trailer_off,
+        "target": target_id,
+        "payload_kind": payload_tag,
+        "source_date_epoch": epoch,
+        "payload_offset": p_off,
+        "payload_size": p_size,
+        "expected_sha256": expected_sha,
+        "actual_sha256": actual_sha,
+        "bounds_valid": bounds_ok,
+        "sha256_verified": bounds_ok and (expected_sha == actual_sha)
+    };
+}
+
+// ============================================================================
+// Target 1, 2, 3: Linux `ELF64` (`linux-x64`, `linux-arm64`, `linux-riscv64`)
+// ============================================================================
+
+fn _build_elf64_bundle(target_id, payload_bytes, payload_tag, epoch, payload_sha) {
+    let e_machine = 62;
+    let e_flags = 0;
+    let base_vaddr = 0x400000;
+    let stub_code = [];
+
+    if target_id == "linux-x64" {
+        e_machine = 62; // EM_X86_64
+        // mov eax, 60 ; xor edi, edi ; syscall
+        stub_code = [0xB8, 0x3C, 0x00, 0x00, 0x00, 0x31, 0xFF, 0x0F, 0x05, 0x90, 0x90, 0x90];
+    } elif target_id == "linux-arm64" {
+        e_machine = 183; // EM_AARCH64
+        // mov x0, #0 ; mov x8, #93 ; svc #0
+        stub_code = [
+            0x00, 0x00, 0x80, 0xD2,
+            0xA8, 0x0B, 0x80, 0xD2,
+            0x01, 0x00, 0x00, 0xD4
+        ];
+    } else {
+        e_machine = 243; // EM_RISCV
+        e_flags = 0x0005; // EF_RISCV_RVC (0x1) | EF_RISCV_FLOAT_ABI_DOUBLE (0x4)
+        base_vaddr = 0x10000;
+        // addi a0, zero, 0 ; addi a7, zero, 93 ; ecall
+        stub_code = [
+            0x13, 0x05, 0x00, 0x00,
+            0x93, 0x08, 0xD0, 0x05,
+            0x73, 0x00, 0x00, 0x00
+        ];
+    }
+
+    let ehdr_size = 64;
+    let phdr_size = 56;
+    let entry_off = ehdr_size + phdr_size; // 120 (0x78), 4-byte & 8-byte aligned
+    let load_filesz = entry_off + len(stub_code);
+
+    let bin = [];
+    // Elf64_Ehdr (64 bytes)
+    _append_bytes(bin, [0x7F, 0x45, 0x4C, 0x46, 2, 1, 1, 0]);
+    _append_bytes(bin, _zeros(8));
+    _append_bytes(bin, _u16_le(2));                        // ET_EXEC
+    _append_bytes(bin, _u16_le(e_machine));                // e_machine
+    _append_bytes(bin, _u32_le(1));                        // EV_CURRENT
+    _append_bytes(bin, _u64_le(base_vaddr + entry_off));   // e_entry
+    _append_bytes(bin, _u64_le(ehdr_size));                // e_phoff = 64
+    _append_bytes(bin, _u64_le(0));                        // e_shoff = 0
+    _append_bytes(bin, _u32_le(e_flags));                  // e_flags
+    _append_bytes(bin, _u16_le(ehdr_size));                // e_ehsize = 64
+    _append_bytes(bin, _u16_le(phdr_size));                // e_phentsize = 56
+    _append_bytes(bin, _u16_le(1));                        // e_phnum = 1
+    _append_bytes(bin, _u16_le(64));                       // e_shentsize = 64
+    _append_bytes(bin, _u16_le(0));                        // e_shnum = 0
+    _append_bytes(bin, _u16_le(0));                        // e_shstrndx = 0
+
+    // Elf64_Phdr (56 bytes): PT_LOAD RX
+    _append_bytes(bin, _u32_le(1));                        // PT_LOAD
+    _append_bytes(bin, _u32_le(5));                        // PF_R | PF_X
+    _append_bytes(bin, _u64_le(0));                        // p_offset
+    _append_bytes(bin, _u64_le(base_vaddr));               // p_vaddr
+    _append_bytes(bin, _u64_le(base_vaddr));               // p_paddr
+    _append_bytes(bin, _u64_le(load_filesz));              // p_filesz
+    _append_bytes(bin, _u64_le(load_filesz));              // p_memsz
+    _append_bytes(bin, _u64_le(0x1000));                   // p_align
+
+    // Launcher machine code + alignment + payload + trailer
+    _append_bytes(bin, stub_code);
+    _pad_to_alignment(bin, 16);
+    let payload_offset = len(bin);
+    _append_bytes(bin, payload_bytes);
+    let tr = _build_trailer_bytes(target_id, payload_tag, epoch, payload_offset, len(payload_bytes), payload_sha);
+    _append_bytes(bin, tr);
+    return map{ "bytes": bin, "payload_offset": payload_offset };
+}
+
+// ============================================================================
+// Target 4: Windows x64 `PE32+` (`windows-x64`)
+// ============================================================================
+
+fn _build_pe64_bundle(payload_bytes, payload_tag, epoch, payload_sha, opts) {
+    let subsys_name = str_upper(str(_opt(opts, "subsystem", "CONSOLE")));
+    let subsystem_id = if subsys_name == "WINDOWS" or subsys_name == "GUI" { 2 } else { 3 };
+
+    let headers = _zeros(0x200);
+    // IMAGE_DOS_HEADER ('MZ' + e_lfanew = 0x80)
+    headers[0] = 0x4D; headers[1] = 0x5A;
+    _put_bytes(headers, 0x02, _u16_le(0x0080));
+    _put_bytes(headers, 0x04, _u16_le(1));
+    _put_bytes(headers, 0x08, _u16_le(4));
+    _put_bytes(headers, 0x10, _u16_le(0x00B8));
+    _put_bytes(headers, 0x18, _u16_le(0x0040));
+    _put_bytes(headers, 0x3C, _u32_le(0x00000080));
+
+    // Minimal DOS stub at 0x40
+    let dos_stub = [0x0E, 0x1F, 0xBA, 0x0E, 0x00, 0xB4, 0x09, 0xCD, 0x21, 0xB8, 0x01, 0x4C, 0xCD, 0x21];
+    _put_bytes(headers, 0x40, dos_stub);
+    _put_bytes(headers, 0x4E, _fixed_ascii("PBLang PE32+ Win64.\r\n$", 24));
+
+    // PE\0\0 Signature at 0x80
+    _put_bytes(headers, 0x80, [0x50, 0x45, 0x00, 0x00]);
+
+    // COFF File Header (20 bytes at 0x84)
+    _put_bytes(headers, 0x84, _u16_le(0x8664)); // IMAGE_FILE_MACHINE_AMD64
+    _put_bytes(headers, 0x86, _u16_le(2));      // 2 sections: .text and .rdata
+    _put_bytes(headers, 0x88, _u32_le(epoch));  // Deterministic TimeDateStamp
+    _put_bytes(headers, 0x94, _u16_le(240));    // SizeOfOptionalHeader = 0xF0
+    _put_bytes(headers, 0x96, _u16_le(0x0022)); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+
+    let rdata_vsize = num_max(16, len(payload_bytes));
+    let rdata_raw_size = _align_up(rdata_vsize, 0x200);
+    let image_size = 0x2000 + _align_up(rdata_vsize, 0x1000);
+
+    // OptionalHeader64 (240 bytes at 0x98..0x188)
+    let opt_off = 0x98;
+    _put_bytes(headers, opt_off + 0, _u16_le(0x020B));          // PE32+ magic
+    headers[opt_off + 2] = 14; headers[opt_off + 3] = 0;        // Linker version
+    _put_bytes(headers, opt_off + 4, _u32_le(0x200));           // SizeOfCode
+    _put_bytes(headers, opt_off + 8, _u32_le(rdata_raw_size));  // SizeOfInitializedData
+    _put_bytes(headers, opt_off + 16, _u32_le(0x1000));         // AddressOfEntryPoint
+    _put_bytes(headers, opt_off + 20, _u32_le(0x1000));         // BaseOfCode
+    _put_bytes(headers, opt_off + 24, _u64_le(5368709120));     // ImageBase = 0x140000000
+    _put_bytes(headers, opt_off + 32, _u32_le(0x1000));         // SectionAlignment
+    _put_bytes(headers, opt_off + 36, _u32_le(0x0200));         // FileAlignment
+    _put_bytes(headers, opt_off + 40, _u16_le(6));              // MajorOSVersion
+    _put_bytes(headers, opt_off + 48, _u16_le(6));              // MajorSubsystemVersion
+    _put_bytes(headers, opt_off + 56, _u32_le(image_size));     // SizeOfImage
+    _put_bytes(headers, opt_off + 60, _u32_le(0x0200));         // SizeOfHeaders
+    _put_bytes(headers, opt_off + 68, _u16_le(subsystem_id));   // Subsystem (CONSOLE=3 / WINDOWS=2)
+    _put_bytes(headers, opt_off + 70, _u16_le(0x8160));         // HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT
+    _put_bytes(headers, opt_off + 72, _u64_le(0x100000));       // SizeOfStackReserve
+    _put_bytes(headers, opt_off + 80, _u64_le(0x1000));         // SizeOfStackCommit
+    _put_bytes(headers, opt_off + 88, _u64_le(0x100000));       // SizeOfHeapReserve
+    _put_bytes(headers, opt_off + 96, _u64_le(0x1000));         // SizeOfHeapCommit
+    _put_bytes(headers, opt_off + 108, _u32_le(16));            // NumberOfRvaAndSizes
+
+    // Section Header 1: .text at 0x188 (40 bytes)
+    let s1 = 0x188;
+    _put_bytes(headers, s1 + 0, _fixed_ascii(".text", 8));
+    _put_bytes(headers, s1 + 8, _u32_le(16));
+    _put_bytes(headers, s1 + 12, _u32_le(0x1000));
+    _put_bytes(headers, s1 + 16, _u32_le(0x0200));
+    _put_bytes(headers, s1 + 20, _u32_le(0x0200));
+    _put_bytes(headers, s1 + 36, _u32_le(0x60000020)); // CNT_CODE | MEM_EXECUTE | MEM_READ
+
+    // Section Header 2: .rdata at 0x1B0 (40 bytes)
+    let s2 = 0x1B0;
+    _put_bytes(headers, s2 + 0, _fixed_ascii(".rdata", 8));
+    _put_bytes(headers, s2 + 8, _u32_le(rdata_vsize));
+    _put_bytes(headers, s2 + 12, _u32_le(0x2000));
+    _put_bytes(headers, s2 + 16, _u32_le(rdata_raw_size));
+    _put_bytes(headers, s2 + 20, _u32_le(0x0400));
+    _put_bytes(headers, s2 + 36, _u32_le(0x40000040)); // CNT_INITIALIZED_DATA | MEM_READ
+
+    let bin = headers;
+    // .text raw data at 0x200..0x400: sub rsp, 40 ; xor eax, eax ; add rsp, 40 ; ret
+    let text_sec = _zeros(0x200);
+    _put_bytes(text_sec, 0, [0x48, 0x83, 0xEC, 0x28, 0x31, 0xC0, 0x48, 0x83, 0xC4, 0x28, 0xC3]);
+    _append_bytes(bin, text_sec);
+
+    // .rdata raw data at 0x400: embedded payload padded to FileAlignment (0x200), then trailer
+    let payload_offset = len(bin); // 0x400
+    let rdata_sec = _zeros(rdata_raw_size);
+    _put_bytes(rdata_sec, 0, payload_bytes);
+    _append_bytes(bin, rdata_sec);
+
+    let tr = _build_trailer_bytes("windows-x64", payload_tag, epoch, payload_offset, len(payload_bytes), payload_sha);
+    _append_bytes(bin, tr);
+    return map{ "bytes": bin, "payload_offset": payload_offset };
+}
+
+// ============================================================================
+// Target 5: macOS Apple Silicon `Mach-O 64` + Ad-Hoc `LC_CODE_SIGNATURE` (`macos-arm64`)
+// ============================================================================
+
+fn _build_macho_arm64_bundle(payload_bytes, payload_tag, epoch, payload_sha) {
+    let text_page_size = 0x1000; // 4096 bytes
+    let entry_off = 0x0200;
+
+    // Place payload + 96B PBLANG_BUNDLE_V1 trailer at start of __LINKEDIT (0x1000),
+    // padded up to 4096B page boundary `code_limit`, so Apple Silicon CodeDirectory
+    // SHA-256 page hashes authenticate the entire image [0 .. code_limit)!
+    let payload_offset = text_page_size;
+    let pre_sig_len = payload_offset + len(payload_bytes) + TRAILER_BYTE_SIZE;
+    let code_limit = _align_up(pre_sig_len, 4096);
+    let n_code_slots = num_floor(code_limit / 4096);
+
+    let ident_bytes = _append_bytes(str_to_bytes("pblang.hermetic.bundle"), [0]);
+    let cd_fixed_hdr_len = 88; // CodeDirectory v0x20400 header with execSeg fields
+    let ident_off = cd_fixed_hdr_len;
+    let hash_off = _align_up(ident_off + len(ident_bytes), 4);
+    let cd_len = hash_off + n_code_slots * 32;
+    let superblob_len = 20 + cd_len; // 12B SuperBlob hdr + 8B BlobIndex + CodeDirectory
+    let linkedit_filesz = (code_limit - text_page_size) + superblob_len;
+    let linkedit_vmsize = _align_up(linkedit_filesz, 0x1000);
+
+    // Load command sizes: __PAGEZERO(72) + __TEXT(152) + __LINKEDIT(72) + LC_MAIN(24) + LC_CODE_SIGNATURE(16) = 336
+    let sizeofcmds = 336;
+    let bin = _zeros(text_page_size);
+
+    // mach_header_64 (32 bytes at 0x00)
+    _put_bytes(bin, 0, _u32_le(0xFEEDFACF));  // MH_MAGIC_64
+    _put_bytes(bin, 4, _u32_le(0x0100000C));  // CPU_TYPE_ARM64
+    _put_bytes(bin, 8, _u32_le(0x00000000));  // CPU_SUBTYPE_ARM64_ALL
+    _put_bytes(bin, 12, _u32_le(2));          // MH_EXECUTE
+    _put_bytes(bin, 16, _u32_le(5));          // ncmds = 5
+    _put_bytes(bin, 20, _u32_le(sizeofcmds)); // sizeofcmds = 336
+    _put_bytes(bin, 24, _u32_le(0x00200085)); // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
+    _put_bytes(bin, 28, _u32_le(0));
+
+    let cur = 32;
+    // 1. LC_SEGMENT_64 __PAGEZERO (72B)
+    _put_bytes(bin, cur + 0, _u32_le(0x19));
+    _put_bytes(bin, cur + 4, _u32_le(72));
+    _put_bytes(bin, cur + 8, _fixed_ascii("__PAGEZERO", 16));
+    _put_bytes(bin, cur + 24, _u64_le(0));
+    _put_bytes(bin, cur + 32, _u64_le(4294967296)); // 0x100000000
+    cur = cur + 72;
+
+    // 2. LC_SEGMENT_64 __TEXT + __text section_64 (152B)
+    let vm_base = 4294967296; // 0x100000000
+    _put_bytes(bin, cur + 0, _u32_le(0x19));
+    _put_bytes(bin, cur + 4, _u32_le(152));
+    _put_bytes(bin, cur + 8, _fixed_ascii("__TEXT", 16));
+    _put_bytes(bin, cur + 24, _u64_le(vm_base));
+    _put_bytes(bin, cur + 32, _u64_le(text_page_size));
+    _put_bytes(bin, cur + 40, _u64_le(0));
+    _put_bytes(bin, cur + 48, _u64_le(text_page_size));
+    _put_bytes(bin, cur + 56, _u32_le(5)); // VM_PROT_READ | VM_PROT_EXECUTE
+    _put_bytes(bin, cur + 60, _u32_le(5));
+    _put_bytes(bin, cur + 64, _u32_le(1)); // nsects = 1
+    let sec = cur + 72;
+    _put_bytes(bin, sec + 0, _fixed_ascii("__text", 16));
+    _put_bytes(bin, sec + 16, _fixed_ascii("__TEXT", 16));
+    _put_bytes(bin, sec + 32, _u64_le(vm_base + entry_off));
+    _put_bytes(bin, sec + 40, _u64_le(12));
+    _put_bytes(bin, sec + 48, _u32_le(entry_off));
+    _put_bytes(bin, sec + 52, _u32_le(2)); // align 2^2 = 4
+    _put_bytes(bin, sec + 64, _u32_le(0x80000400)); // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+    cur = cur + 152;
+
+    // 3. LC_SEGMENT_64 __LINKEDIT (72B)
+    _put_bytes(bin, cur + 0, _u32_le(0x19));
+    _put_bytes(bin, cur + 4, _u32_le(72));
+    _put_bytes(bin, cur + 8, _fixed_ascii("__LINKEDIT", 16));
+    _put_bytes(bin, cur + 24, _u64_le(vm_base + text_page_size));
+    _put_bytes(bin, cur + 32, _u64_le(linkedit_vmsize));
+    _put_bytes(bin, cur + 40, _u64_le(text_page_size));
+    _put_bytes(bin, cur + 48, _u64_le(linkedit_filesz));
+    _put_bytes(bin, cur + 56, _u32_le(1)); // VM_PROT_READ
+    _put_bytes(bin, cur + 60, _u32_le(1));
+    cur = cur + 72;
+
+    // 4. LC_MAIN (0x80000028, 24B)
+    _put_bytes(bin, cur + 0, _u32_le(0x80000028));
+    _put_bytes(bin, cur + 4, _u32_le(24));
+    _put_bytes(bin, cur + 8, _u64_le(entry_off));
+    _put_bytes(bin, cur + 16, _u64_le(0));
+    cur = cur + 24;
+
+    // 5. LC_CODE_SIGNATURE (0x1D, 16B)
+    _put_bytes(bin, cur + 0, _u32_le(0x1D));
+    _put_bytes(bin, cur + 4, _u32_le(16));
+    _put_bytes(bin, cur + 8, _u32_le(code_limit));
+    _put_bytes(bin, cur + 12, _u32_le(superblob_len));
+
+    // ARM64 Darwin exit(0) launcher stub at 0x200: mov x0, #0 ; mov x16, #1 ; svc #0x80
+    _put_bytes(bin, entry_off, [
+        0x00, 0x00, 0x80, 0xD2,
+        0x30, 0x00, 0x80, 0xD2,
+        0x01, 0x10, 0x00, 0xD4
+    ]);
+
+    // Append payload + 96B PBLANG_BUNDLE_V1 trailer at 0x1000, pad up to `code_limit`
+    _append_bytes(bin, payload_bytes);
+    let tr = _build_trailer_bytes("macos-arm64", payload_tag, epoch, payload_offset, len(payload_bytes), payload_sha);
+    _append_bytes(bin, tr);
+    _pad_to_alignment(bin, 4096);
+
+    // Build Big-Endian CS_SuperBlob + CS_CodeDirectory with SHA-256 page hashes
+    let sig = _zeros(superblob_len);
+    _put_bytes(sig, 0, _u32_be(0xFADE0CC0));  // CSMAGIC_EMBEDDED_SIGNATURE
+    _put_bytes(sig, 4, _u32_be(superblob_len));
+    _put_bytes(sig, 8, _u32_be(1));           // count = 1 blob
+    _put_bytes(sig, 12, _u32_be(0));          // CSSLOT_CODEDIRECTORY
+    _put_bytes(sig, 16, _u32_be(20));         // offset = 20
+
+    let cd = 20;
+    _put_bytes(sig, cd + 0, _u32_be(0xFADE0C02));   // CSMAGIC_CODEDIRECTORY
+    _put_bytes(sig, cd + 4, _u32_be(cd_len));
+    _put_bytes(sig, cd + 8, _u32_be(0x00020400));   // version 2.4 (execSeg support)
+    _put_bytes(sig, cd + 12, _u32_be(0x00020002));  // CS_ADHOC | CS_LINKER_SIGNED
+    _put_bytes(sig, cd + 16, _u32_be(hash_off));    // hashOffset
+    _put_bytes(sig, cd + 20, _u32_be(ident_off));   // identOffset
+    _put_bytes(sig, cd + 24, _u32_be(0));           // nSpecialSlots
+    _put_bytes(sig, cd + 28, _u32_be(n_code_slots));// nCodeSlots
+    _put_bytes(sig, cd + 32, _u32_be(code_limit));  // codeLimit
+    sig[cd + 36] = 32;                              // hashSize = 32 (SHA-256)
+    sig[cd + 37] = 2;                               // CS_HASHTYPE_SHA256 = 2
+    sig[cd + 38] = 0;                               // platform
+    sig[cd + 39] = 12;                              // pageSize = 2^12 = 4096
+    _put_bytes(sig, cd + 64, _u64_be(0));           // execSegBase
+    _put_bytes(sig, cd + 72, _u64_be(text_page_size)); // execSegLimit
+    _put_bytes(sig, cd + 80, _u64_be(1));           // CS_EXECSEG_MAIN_BINARY
+
+    _put_bytes(sig, cd + ident_off, ident_bytes);
+
+    let p = 0;
+    while p < n_code_slots {
+        let page_bytes = _slice_bytes(bin, p * 4096, (p + 1) * 4096);
+        let page_digest = _hex_to_raw_bytes(Sha256.sha256_hex_bytes(page_bytes));
+        _put_bytes(sig, cd + hash_off + p * 32, page_digest);
+        p = p + 1;
+    }
+
+    _append_bytes(bin, sig);
+    return map{
+        "bytes": bin,
+        "payload_offset": payload_offset,
+        "trailer_offset": payload_offset + len(payload_bytes),
+        "codesign_offset": code_limit
+    };
+}
+
+// ============================================================================
+// Target 6: WebAssembly Binary Module v1 (`wasm32`)
+// ============================================================================
+
+fn _wasm_section(sec_id, sec_payload) {
+    let out = [sec_id];
+    _append_bytes(out, _uleb128_encode(len(sec_payload)));
+    _append_bytes(out, sec_payload);
+    return out;
+}
+
+fn _wasm_name_bytes(name_str) {
+    let raw = str_to_bytes(name_str);
+    let out = _uleb128_encode(len(raw));
+    return _append_bytes(out, raw);
+}
+
+fn _build_wasm32_bundle(payload_bytes, payload_tag, epoch, payload_sha) {
+    let bin = [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]; // \0asm v1
+
+    // Section 1: Type — 1 signature () -> i32
+    _append_bytes(bin, _wasm_section(1, [0x01, 0x60, 0x00, 0x01, 0x7F]));
+
+    // Section 3: Function — 1 function of type 0
+    _append_bytes(bin, _wasm_section(3, [0x01, 0x00]));
+
+    // Section 5: Memory — 1 linear memory, min 1 page (64 KiB)
+    _append_bytes(bin, _wasm_section(5, [0x01, 0x00, 0x01]));
+
+    // Section 7: Export — "memory" (mem 0) and "_start" (func 0)
+    let exp = [0x02];
+    _append_bytes(exp, _wasm_name_bytes("memory"));
+    _append_bytes(exp, [0x02, 0x00]);
+    _append_bytes(exp, _wasm_name_bytes("_start"));
+    _append_bytes(exp, [0x00, 0x00]);
+    _append_bytes(bin, _wasm_section(7, exp));
+
+    // Section 10: Code — body returning payload length via i32.const
+    let fn_body = [0x00, 0x41]; // 0 locals, i32.const
+    // Unsigned small positive LEB128 (< 64 fits in 1 byte; encode positive safely)
+    let p_len = len(payload_bytes);
+    if p_len < 64 {
+        array_push(fn_body, p_len);
+    } else {
+        array_push(fn_body, 0x01);
+    }
+    array_push(fn_body, 0x0B); // end
+    let code_sec = [0x01];
+    _append_bytes(code_sec, _uleb128_encode(len(fn_body)));
+    _append_bytes(code_sec, fn_body);
+    _append_bytes(bin, _wasm_section(10, code_sec));
+
+    // Section 11: Data — active segment at offset 0 with "PBLANG_WASM_V1"
+    let tag_bytes = str_to_bytes("PBLANG_WASM_V1");
+    let data_sec = [0x01, 0x00, 0x41, 0x00, 0x0B];
+    _append_bytes(data_sec, _uleb128_encode(len(tag_bytes)));
+    _append_bytes(data_sec, tag_bytes);
+    _append_bytes(bin, _wasm_section(11, data_sec));
+
+    // Custom Section (id = 0): name "pblang.pbck" + payload_bytes + 96B PBLANG_BUNDLE_V1 trailer!
+    // Pre-calculate exact file offset where payload_bytes will land!
+    let custom_name = _wasm_name_bytes("pblang.pbck");
+    let custom_body_len = len(custom_name) + len(payload_bytes) + TRAILER_BYTE_SIZE;
+    let custom_hdr_len = 1 + len(_uleb128_encode(custom_body_len)) + len(custom_name);
+    let payload_offset = len(bin) + custom_hdr_len;
+
+    let tr = _build_trailer_bytes("wasm32", payload_tag, epoch, payload_offset, len(payload_bytes), payload_sha);
+    let custom_sec = [];
+    _append_bytes(custom_sec, custom_name);
+    _append_bytes(custom_sec, payload_bytes);
+    _append_bytes(custom_sec, tr);
+    _append_bytes(bin, _wasm_section(0, custom_sec));
+
+    return map{ "bytes": bin, "payload_offset": payload_offset };
+}
+
+// ============================================================================
+// Target 7: Retro 16-bit `MS-DOS MZ` (`dos16`)
+// ============================================================================
+
+fn _build_dos16_bundle(payload_bytes, payload_tag, epoch, payload_sha) {
+    // 32-byte MZ header (e_cparhdr = 2 paragraphs = 32 bytes)
+    // Real-mode x86 stub at 0x20:
+    //   0E          push cs
+    //   1F          pop  ds
+    //   BA 0E 00    mov  dx, 0x000E (banner offset relative to CS:0000)
+    //   B4 09       mov  ah, 0x09   (DOS print '$'-terminated string)
+    //   CD 21       int  0x21
+    //   B8 00 4C    mov  ax, 0x4C00 (DOS terminate with exit code 0)
+    //   CD 21       int  0x21
+    let stub = [
+        0x0E, 0x1F,
+        0xBA, 0x0E, 0x00,
+        0xB4, 0x09,
+        0xCD, 0x21,
+        0xB8, 0x00, 0x4C,
+        0xCD, 0x21
+    ];
+    let banner = str_to_bytes("PBLang DOS16 Hermetic Bundle\r\n$");
+    let code_image_len = 32 + len(stub) + len(banner);
+    let pages = num_floor((code_image_len + 511) / 512);
+    let last_page_bytes = num_mod(code_image_len, 512);
+
+    let hdr = _zeros(32);
+    hdr[0] = 0x4D; hdr[1] = 0x5A;              // 'M', 'Z'
+    _put_bytes(hdr, 0x02, _u16_le(last_page_bytes));
+    _put_bytes(hdr, 0x04, _u16_le(pages));
+    _put_bytes(hdr, 0x06, _u16_le(0));         // 0 relocations
+    _put_bytes(hdr, 0x08, _u16_le(2));         // e_cparhdr = 2 (32B header)
+    _put_bytes(hdr, 0x0A, _u16_le(16));        // e_minalloc
+    _put_bytes(hdr, 0x0C, _u16_le(0xFFFF));    // e_maxalloc
+    _put_bytes(hdr, 0x0E, _u16_le(0));         // e_ss
+    _put_bytes(hdr, 0x10, _u16_le(0x0200));    // e_sp
+    _put_bytes(hdr, 0x14, _u16_le(0));         // e_ip = 0
+    _put_bytes(hdr, 0x16, _u16_le(0));         // e_cs = 0
+    _put_bytes(hdr, 0x18, _u16_le(0x001C));    // e_lfarlc = 28 (< 0x40 => pure 16-bit DOS MZ)
+
+    let bin = hdr;
+    _append_bytes(bin, stub);
+    _append_bytes(bin, banner);
+    _pad_to_alignment(bin, 16);
+
+    let payload_offset = len(bin);
+    _append_bytes(bin, payload_bytes);
+    let tr = _build_trailer_bytes("dos16", payload_tag, epoch, payload_offset, len(payload_bytes), payload_sha);
+    _append_bytes(bin, tr);
+    return map{ "bytes": bin, "payload_offset": payload_offset };
+}
+
+// ============================================================================
+// Binary Format & Apple Silicon CodeDirectory Inspector (`inspect_bundled_binary`)
+// ============================================================================
+
+fn _verify_macho_codesign(bin_bytes) {
+    if len(bin_bytes) < 64 { return map{ "present": false, "valid": false }; }
+    let ncmds = _read_u32_le(bin_bytes, 16);
+    let cur = 32;
+    let sig_off = -1;
+    let sig_size = 0;
+    let has_lc_main = false;
+    let has_text_seg = false;
+
+    let i = 0;
+    while i < ncmds and cur + 8 <= len(bin_bytes) {
+        let cmd = _read_u32_le(bin_bytes, cur);
+        let cmdsize = _read_u32_le(bin_bytes, cur + 4);
+        if cmd == 0x19 and cur + 24 <= len(bin_bytes) {
+            let segname = _trim_nul_ascii(_slice_bytes(bin_bytes, cur + 8, cur + 24));
+            if segname == "__TEXT" { has_text_seg = true; }
+        } elif cmd == 0x80000028 {
+            has_lc_main = true;
+        } elif cmd == 0x1D and cur + 16 <= len(bin_bytes) {
+            sig_off = _read_u32_le(bin_bytes, cur + 8);
+            sig_size = _read_u32_le(bin_bytes, cur + 12);
+        }
+        if cmdsize < 8 { break; }
+        cur = cur + cmdsize;
+        i = i + 1;
+    }
+
+    if sig_off < 0 or sig_off + sig_size > len(bin_bytes) or sig_size < 40 {
+        return map{ "present": false, "valid": false, "has_lc_main": has_lc_main, "has_text_seg": has_text_seg };
+    }
+
+    let sb_magic = _read_u32_be(bin_bytes, sig_off);
+    let sb_len = _read_u32_be(bin_bytes, sig_off + 4);
+    let sb_count = _read_u32_be(bin_bytes, sig_off + 8);
+    if sb_magic != 0xFADE0CC0 or sb_len != sig_size or sb_count < 1 {
+        return map{ "present": true, "valid": false, "reason": "invalid CS_SuperBlob header" };
+    }
+
+    let cd_rel = _read_u32_be(bin_bytes, sig_off + 16);
+    let cd = sig_off + cd_rel;
+    let cd_magic = _read_u32_be(bin_bytes, cd);
+    let hash_off = _read_u32_be(bin_bytes, cd + 16);
+    let n_slots = _read_u32_be(bin_bytes, cd + 28);
+    let code_limit = _read_u32_be(bin_bytes, cd + 32);
+    let hash_size = bin_bytes[cd + 36];
+    let hash_type = bin_bytes[cd + 37];
+    let page_shift = bin_bytes[cd + 39];
+
+    if cd_magic != 0xFADE0C02 or hash_size != 32 or hash_type != 2 or page_shift != 12 or code_limit != sig_off {
+        return map{ "present": true, "valid": false, "reason": "invalid CS_CodeDirectory metadata" };
+    }
+
+    let p = 0;
+    while p < n_slots {
+        let p_start = p * 4096;
+        let p_end = num_min(code_limit, (p + 1) * 4096);
+        let calc_hex = Sha256.sha256_hex_bytes(_slice_bytes(bin_bytes, p_start, p_end));
+        let stored_hex = _raw_bytes_to_hex(_slice_bytes(bin_bytes, cd + hash_off + p * 32, cd + hash_off + (p + 1) * 32));
+        if calc_hex != stored_hex {
+            return map{ "present": true, "valid": false, "failed_page": p };
+        }
+        p = p + 1;
+    }
+
+    return map{
+        "present": true,
+        "valid": true,
+        "superblob_magic": "0xFADE0CC0",
+        "codedirectory_magic": "0xFADE0C02",
+        "hash_type": "SHA-256",
+        "page_bytes": 4096,
+        "verified_pages": n_slots,
+        "has_lc_main": has_lc_main,
+        "has_text_seg": has_text_seg,
+        "code_limit": code_limit
+    };
+}
+
+fn _find_trailer_in_binary(bin_bytes) {
+    // 1. Fast path: check exact final 96 bytes (ELF64, PE32+, WASM32, DOS16)
+    if len(bin_bytes) >= TRAILER_BYTE_SIZE {
+        let direct = _parse_trailer_at(bin_bytes, len(bin_bytes) - TRAILER_BYTE_SIZE);
+        if direct != nil { return direct; }
+    }
+    // 2. Mach-O path: trailer sits inside __LINKEDIT before 4KB-aligned LC_CODE_SIGNATURE
+    let magic = str_to_bytes(TRAILER_MAGIC_START);
+    let limit = len(bin_bytes) - TRAILER_BYTE_SIZE;
+    let i = limit;
+    while i >= 0 {
+        if bin_bytes[i] == magic[0] and bin_bytes[i + 1] == magic[1] and
+           bin_bytes[i + 2] == magic[2] and bin_bytes[i + 7] == magic[7] {
+            let cand = _parse_trailer_at(bin_bytes, i);
+            if cand != nil { return cand; }
+        }
+        i = i - 1;
+    }
+    return nil;
+}
+
+fn inspect_bundled_binary(bin_bytes) {
+    if type(bin_bytes) != "array" or len(bin_bytes) < 32 {
+        return map{ "valid": false, "error": "binary buffer too small" };
+    }
+
+    let container = "unknown";
+    let os_name = "unknown";
+    let arch = "unknown";
+    let target = "unknown";
+    let header_ok = false;
+    let details = map{};
+
+    // 1. ELF64 check
+    if bin_bytes[0] == 0x7F and bin_bytes[1] == 0x45 and bin_bytes[2] == 0x4C and bin_bytes[3] == 0x46 {
+        container = "ELF64";
+        os_name = "linux";
+        let cls = bin_bytes[4];
+        let endian = bin_bytes[5];
+        let e_type = _read_u16_le(bin_bytes, 16);
+        let e_machine = _read_u16_le(bin_bytes, 18);
+        let e_flags = _read_u32_le(bin_bytes, 48);
+        let phoff = _read_u64_le(bin_bytes, 32);
+        let p_type = if phoff + 4 <= len(bin_bytes) { _read_u32_le(bin_bytes, phoff) } else { 0 };
+        if e_machine == 62 { arch = "x86_64"; target = "linux-x64"; }
+        elif e_machine == 183 { arch = "aarch64"; target = "linux-arm64"; }
+        elif e_machine == 243 { arch = "riscv64"; target = "linux-riscv64"; }
+        header_ok = (cls == 2 and endian == 1 and e_type == 2 and p_type == 1 and target != "unknown");
+        details = map{ "e_machine": e_machine, "e_flags": e_flags, "pt_load": p_type == 1 };
+    } elif _read_u32_le(bin_bytes, 0) == 0xFEEDFACF {
+        // 2. Mach-O 64-bit check
+        container = "Mach-O-64";
+        os_name = "macos";
+        let cputype = _read_u32_le(bin_bytes, 4);
+        let filetype = _read_u32_le(bin_bytes, 12);
+        if cputype == 0x0100000C { arch = "arm64"; target = "macos-arm64"; }
+        let cs = _verify_macho_codesign(bin_bytes);
+        header_ok = (cputype == 0x0100000C and filetype == 2 and cs["valid"] == true and
+                     cs["has_lc_main"] == true and cs["has_text_seg"] == true);
+        details = cs;
+    } elif bin_bytes[0] == 0x00 and bin_bytes[1] == 0x61 and bin_bytes[2] == 0x73 and bin_bytes[3] == 0x6D {
+        // 3. WebAssembly v1 check
+        container = "WASM32";
+        os_name = "wasi";
+        arch = "wasm32";
+        target = "wasm32";
+        let wasm_ver = _read_u32_le(bin_bytes, 4);
+        let pos = 8;
+        let sec_count = 0;
+        let has_pbck_custom = false;
+        let bounds_ok = true;
+        while pos < len(bin_bytes) {
+            let sid = bin_bytes[pos];
+            let dec = _uleb128_decode(bin_bytes, pos + 1);
+            if not dec["ok"] { bounds_ok = false; break; }
+            let slen = dec["value"];
+            let sstart = dec["next_offset"];
+            if sstart + slen > len(bin_bytes) { bounds_ok = false; break; }
+            if sid == 0 {
+                let ndec = _uleb128_decode(bin_bytes, sstart);
+                if ndec["ok"] and ndec["next_offset"] + ndec["value"] <= sstart + slen {
+                    let cname = bytes_to_str(_slice_bytes(bin_bytes, ndec["next_offset"], ndec["next_offset"] + ndec["value"]));
+                    if cname == "pblang.pbck" { has_pbck_custom = true; }
+                }
+            }
+            pos = sstart + slen;
+            sec_count = sec_count + 1;
+        }
+        header_ok = (wasm_ver == 1 and bounds_ok and pos == len(bin_bytes) and sec_count >= 6 and has_pbck_custom);
+        details = map{ "wasm_version": wasm_ver, "sections": sec_count, "has_pblang_pbck_section": has_pbck_custom };
+    } elif bin_bytes[0] == 0x4D and bin_bytes[1] == 0x5A {
+        // 4. Distinguish PE32+ (`windows-x64`) vs pure 16-bit MS-DOS `MZ` (`dos16`)
+        let lfarlc = _read_u16_le(bin_bytes, 0x18);
+        let pe_off = if len(bin_bytes) >= 0x40 { _read_u32_le(bin_bytes, 0x3C) } else { 0 };
+        let is_pe = lfarlc >= 0x40 and pe_off >= 0x40 and (pe_off + 264) <= len(bin_bytes) and
+                    bin_bytes[pe_off] == 0x50 and bin_bytes[pe_off + 1] == 0x45 and
+                    bin_bytes[pe_off + 2] == 0x00 and bin_bytes[pe_off + 3] == 0x00;
+        if is_pe {
+            container = "PE32+";
+            os_name = "windows";
+            let machine = _read_u16_le(bin_bytes, pe_off + 4);
+            let nsects = _read_u16_le(bin_bytes, pe_off + 6);
+            let opt_magic = _read_u16_le(bin_bytes, pe_off + 24);
+            let subsys = _read_u16_le(bin_bytes, pe_off + 24 + 68);
+            if machine == 0x8664 and opt_magic == 0x020B {
+                arch = "x86_64";
+                target = "windows-x64";
+                header_ok = nsects >= 2 and (subsys == 2 or subsys == 3);
+            }
+            details = map{ "machine": machine, "optional_magic": opt_magic, "sections": nsects, "subsystem": subsys };
+        } else {
+            container = "MZ-DOS16";
+            os_name = "dos";
+            arch = "i8086-16";
+            target = "dos16";
+            let cparhdr = _read_u16_le(bin_bytes, 0x08);
+            let code_off = cparhdr * 16;
+            let has_int21 = code_off + 14 <= len(bin_bytes) and
+                            bin_bytes[code_off + 7] == 0xCD and bin_bytes[code_off + 8] == 0x21;
+            header_ok = cparhdr >= 2 and has_int21;
+            details = map{ "header_paragraphs": cparhdr, "has_int21_stub": has_int21 };
+        }
+    }
+
+    let tr = _find_trailer_in_binary(bin_bytes);
+    let trailer_ok = tr != nil and tr["sha256_verified"] == true and tr["target"] == target;
+
+    return map{
+        "valid": header_ok and trailer_ok,
+        "header_valid": header_ok,
+        "trailer_valid": trailer_ok,
+        "target": target,
+        "os": os_name,
+        "arch": arch,
+        "container": container,
+        "size_bytes": len(bin_bytes),
+        "binary_sha256": Sha256.sha256_hex_bytes(bin_bytes),
+        "trailer": tr,
+        "details": details
+    };
+}
+
+fn extract_bundled_payload(bin_bytes) {
+    let info = inspect_bundled_binary(bin_bytes);
+    if not info["valid"] {
+        throw "hermetic_cross_bundler: binary verification failed for payload extraction";
+    }
+    let tr = info["trailer"];
+    let p_bytes = _slice_bytes(bin_bytes, tr["payload_offset"], tr["payload_offset"] + tr["payload_size"]);
+    return map{
+        "ok": true,
+        "target": info["target"],
+        "payload_kind": tr["payload_kind"],
+        "payload_bytes": p_bytes,
+        "payload_text": bytes_to_str(p_bytes),
+        "payload_sha256": tr["actual_sha256"]
+    };
+}
+
+// ============================================================================
+// Public Cross-Bundler API (`cross_bundle_executable` & `cross_bundle_matrix`)
+// ============================================================================
+
+fn cross_bundle_executable(payload, target, opts = nil) {
+    let tid = str_lower(str_trim(str(target)));
+    let payload_bytes = _normalize_payload_bytes(payload);
+    let payload_tag = _detect_payload_tag(payload_bytes, opts);
+    let epoch = num_floor(_opt(opts, "source_date_epoch", DEFAULT_HERMETIC_EPOCH));
+    let payload_sha = Sha256.sha256_hex_bytes(payload_bytes);
+
+    let built = nil;
+    if tid == "linux-x64" or tid == "linux-arm64" or tid == "linux-riscv64" {
+        built = _build_elf64_bundle(tid, payload_bytes, payload_tag, epoch, payload_sha);
+    } elif tid == "windows-x64" {
+        built = _build_pe64_bundle(payload_bytes, payload_tag, epoch, payload_sha, opts);
+    } elif tid == "macos-arm64" {
+        built = _build_macho_arm64_bundle(payload_bytes, payload_tag, epoch, payload_sha);
+    } elif tid == "wasm32" {
+        built = _build_wasm32_bundle(payload_bytes, payload_tag, epoch, payload_sha);
+    } elif tid == "dos16" {
+        built = _build_dos16_bundle(payload_bytes, payload_tag, epoch, payload_sha);
+    } else {
+        throw "hermetic_cross_bundler: unsupported target '" + tid + "'";
+    }
+
+    let bin = built["bytes"];
+    let out_path = _opt(opts, "output_path", nil);
+    if out_path != nil and len(str(out_path)) > 0 {
+        fs_write_bytes(str(out_path), bin);
+    }
+
+    let inspection = inspect_bundled_binary(bin);
+    return map{
+        "ok": inspection["valid"],
+        "target": tid,
+        "os": inspection["os"],
+        "arch": inspection["arch"],
+        "container": inspection["container"],
+        "bytes": bin,
+        "size_bytes": len(bin),
+        "payload_offset": built["payload_offset"],
+        "payload_size": len(payload_bytes),
+        "payload_sha256": payload_sha,
+        "binary_sha256": inspection["binary_sha256"],
+        "inspection": inspection
+    };
+}
+
+fn cross_bundle_matrix(payload, targets = nil, opts = nil) {
+    let req_targets = if type(targets) == "array" and len(targets) > 0 {
+        targets
+    } else {
+        SUPPORTED_TARGETS
+    };
+    let artifacts = [];
+    let by_target = map{};
+    let all_ok = true;
+    let i = 0;
+    while i < len(req_targets) {
+        let tid = req_targets[i];
+        let art = cross_bundle_executable(payload, tid, opts);
+        if not art["ok"] { all_ok = false; }
+        array_push(artifacts, art);
+        by_target[art["target"]] = art;
+        i = i + 1;
+    }
+    return map{
+        "ok": all_ok,
+        "version": BUNDLER_ENGINE_VERSION,
+        "target_count": len(artifacts),
+        "artifacts": artifacts,
+        "by_target": by_target
+    };
+}
+
+export BUNDLER_ENGINE_VERSION, SUPPORTED_TARGETS, TRAILER_MAGIC_START, TRAILER_MAGIC_END, TRAILER_BYTE_SIZE;
+export cross_bundle_executable, cross_bundle_matrix, inspect_bundled_binary, extract_bundled_payload;

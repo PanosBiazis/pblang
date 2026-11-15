@@ -1,0 +1,774 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+//
+// stdlib/compiler/rich_diagnostics_bilingual.sapp — PBLang v5.0.0 Pure-PBLang
+// Multi-Span UTF-8 Source Caret Renderer, Damerau-Levenshtein Fix-It Suggester,
+// and Bilingual (`Ελληνικά` + `English`) Diagnostic Catalog (`E0001`..`E0010`).
+
+let Builtins = import("stdlib:compiler/builtins_list.sapp");
+
+let DIAGNOSTICS_ENGINE_VERSION = "5.0.0";
+
+let PBLANG_KEYWORDS = [
+    "fn", "let", "const", "return", "if", "elif", "else", "while", "for", "in",
+    "match", "enum", "struct", "import", "export", "defer", "try", "catch",
+    "throw", "true", "false", "nil", "and", "or", "not", "spawn", "select", "break"
+];
+
+let EXTRA_STDLIB_SYMBOLS = [
+    "println", "print", "eprintln", "format", "assert_eq", "bytes_new",
+    "bytes_get", "bytes_set", "bytes_len", "bytes_slice", "str_to_bytes", "bytes_to_str"
+];
+
+fn _opt(m, key, fallback) {
+    if m == nil or type(m) != "map" { return fallback; }
+    if not map_has(m, key) { return fallback; }
+    let v = m[key];
+    if v == nil { return fallback; }
+    return v;
+}
+
+fn _esc() { return str_from_char_code(27); }
+
+fn _should_use_color(opts) {
+    if opts != nil and type(opts) == "map" {
+        if map_has(opts, "no_color") and opts["no_color"] == true { return false; }
+        if map_has(opts, "color") and type(opts["color"]) == "bool" { return opts["color"]; }
+    }
+    let nc = try env_get("NO_COLOR") catch nil;
+    if nc != nil and len(str(nc)) > 0 { return false; }
+    return true;
+}
+
+fn _paint(text, ansi_code, use_color) {
+    if not use_color { return str(text); }
+    return _esc() + "[" + ansi_code + "m" + str(text) + _esc() + "[0m";
+}
+
+// ============================================================================
+// UTF-8 Visual Column Width & Tab-Aware Alignment Engine
+// ============================================================================
+
+fn _codepoint_display_width(cp) {
+    if cp == 9 { return 4; }
+    if cp < 32 or cp == 127 { return 0; }
+    // Combining diacritical marks (Greek/Latin accents when decomposed)
+    if (cp >= 0x0300 and cp <= 0x036F) or (cp >= 0x1AB0 and cp <= 0x1AFF) or
+       (cp >= 0x1DC0 and cp <= 0x1DFF) or (cp >= 0x20D0 and cp <= 0x20FF) or
+       (cp >= 0xFE20 and cp <= 0xFE2F) {
+        return 0;
+    }
+    // East Asian Wide / Fullwidth ranges
+    if (cp >= 0x1100 and cp <= 0x115F) or (cp >= 0x2E80 and cp <= 0xA4CF) or
+       (cp >= 0xAC00 and cp <= 0xD7A3) or (cp >= 0xF900 and cp <= 0xFAFF) or
+       (cp >= 0xFE10 and cp <= 0xFE6F) or (cp >= 0xFF00 and cp <= 0xFF60) or
+       (cp >= 0x1F300 and cp <= 0x1FAFF) {
+        return 2;
+    }
+    return 1;
+}
+
+fn expand_tabs_for_display(line_text, tab_width = 4) {
+    let s = str(line_text);
+    let out = "";
+    let vis_col = 0;
+    let i = 0;
+    while i < len(s) {
+        let cp = strcharcodeat(s, i);
+        if cp == 9 {
+            let spaces = tab_width - num_mod(vis_col, tab_width);
+            out = out + str_repeat(" ", spaces);
+            vis_col = vis_col + spaces;
+        } elif cp != 13 {
+            out = out + str_slice(s, i, i + 1);
+            vis_col = vis_col + _codepoint_display_width(cp);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Converts a 1-based UTF-8 byte column into a 1-based Unicode character column.
+fn byte_col_to_char_col(line_text, byte_col_1based) {
+    if byte_col_1based <= 1 { return 1; }
+    let s = str(line_text);
+    let acc_bytes = 0;
+    let i = 0;
+    while i < len(s) {
+        if acc_bytes + 1 >= byte_col_1based {
+            return i + 1;
+        }
+        let ch_bytes = len(str_to_bytes(str_slice(s, i, i + 1)));
+        acc_bytes = acc_bytes + ch_bytes;
+        i = i + 1;
+    }
+    return len(s) + 1;
+}
+
+// Computes exact 0-based visual terminal column for a 1-based character index.
+fn visual_column_offset(line_text, char_col_1based, tab_width = 4) {
+    let s = str(line_text);
+    let target = num_max(0, num_min(len(s), num_floor(char_col_1based) - 1));
+    let vis = 0;
+    let i = 0;
+    while i < target {
+        let cp = strcharcodeat(s, i);
+        if cp == 9 {
+            vis = vis + (tab_width - num_mod(vis, tab_width));
+        } else {
+            vis = vis + _codepoint_display_width(cp);
+        }
+        i = i + 1;
+    }
+    return vis;
+}
+
+fn visual_span_width(line_text, start_char_col_1based, char_len, tab_width = 4) {
+    let s = str(line_text);
+    let st = num_max(0, num_min(len(s), num_floor(start_char_col_1based) - 1));
+    let en = num_max(st, num_min(len(s), st + num_max(1, num_floor(char_len))));
+    if st >= len(s) { return num_max(1, num_floor(char_len)); }
+    let vis_start = visual_column_offset(s, st + 1, tab_width);
+    let vis = vis_start;
+    let i = st;
+    while i < en {
+        let cp = strcharcodeat(s, i);
+        if cp == 9 {
+            vis = vis + (tab_width - num_mod(vis, tab_width));
+        } else {
+            vis = vis + _codepoint_display_width(cp);
+        }
+        i = i + 1;
+    }
+    return num_max(1, vis - vis_start);
+}
+
+// ============================================================================
+// Damerau-Levenshtein Suggester ("Did you mean '...'?" / "Μήπως εννοούσατε '...' ;")
+// ============================================================================
+
+fn damerau_levenshtein_distance(a_raw, b_raw, max_dist = 3) {
+    let a = str(a_raw);
+    let b = str(b_raw);
+    let la = len(a);
+    let lb = len(b);
+    if a == b { return 0; }
+    if num_abs(la - lb) > max_dist { return max_dist + 1; }
+    if la == 0 { return if lb <= max_dist { lb } else { max_dist + 1 }; }
+    if lb == 0 { return if la <= max_dist { la } else { max_dist + 1 }; }
+
+    let prev2 = [];
+    let prev1 = [];
+    let j = 0;
+    while j <= lb {
+        array_push(prev2, 0);
+        array_push(prev1, j);
+        j = j + 1;
+    }
+
+    let i = 1;
+    while i <= la {
+        let cur = [i];
+        let row_min = i;
+        let ai_cp = strcharcodeat(a, i - 1);
+        j = 1;
+        while j <= lb {
+            let bj_cp = strcharcodeat(b, j - 1);
+            let cost = if ai_cp == bj_cp { 0 } else { 1 };
+            let del_c = prev1[j] + 1;
+            let ins_c = cur[j - 1] + 1;
+            let sub_c = prev1[j - 1] + cost;
+            let best = num_min(del_c, num_min(ins_c, sub_c));
+            // Adjacent transposition (e.g. "prnitln" <-> "println")
+            if i > 1 and j > 1 {
+                let ai_prev = strcharcodeat(a, i - 2);
+                let bj_prev = strcharcodeat(b, j - 2);
+                if ai_cp == bj_prev and ai_prev == bj_cp {
+                    best = num_min(best, prev2[j - 2] + 1);
+                }
+            }
+            array_push(cur, best);
+            if best < row_min { row_min = best; }
+            j = j + 1;
+        }
+        if row_min > max_dist { return max_dist + 1; }
+        prev2 = prev1;
+        prev1 = cur;
+        i = i + 1;
+    }
+    return prev1[lb];
+}
+
+fn _default_symbol_universe(extra_candidates) {
+    let seen = map{};
+    let out = [];
+    let add_list = fn(arr) {
+        if type(arr) != "array" { return nil; }
+        let idx = 0;
+        while idx < len(arr) {
+            let w = str(arr[idx]);
+            if len(w) > 0 and not map_has(seen, w) {
+                seen[w] = true;
+                array_push(out, w);
+            }
+            idx = idx + 1;
+        }
+    };
+    add_list(extra_candidates);
+    add_list(PBLANG_KEYWORDS);
+    add_list(EXTRA_STDLIB_SYMBOLS);
+    add_list(map_keys(Builtins.builtin_set()));
+    return out;
+}
+
+fn suggest_closest_symbol(typo, candidates = nil, max_dist = 2) {
+    if typo == nil { return nil; }
+    let target = str_trim(str(typo));
+    if len(target) == 0 { return nil; }
+    let limit = if len(target) <= 2 { 1 } else { num_max(1, num_floor(max_dist)) };
+    let pool = _default_symbol_universe(candidates);
+    let target_lo = str_lower(target);
+
+    let best_sym = nil;
+    let best_score = (limit + 1) * 100;
+    let i = 0;
+    while i < len(pool) {
+        let cand = pool[i];
+        if cand != target and num_abs(len(cand) - len(target)) <= limit {
+            let d = damerau_levenshtein_distance(target, cand, limit);
+            let d_ci = damerau_levenshtein_distance(target_lo, str_lower(cand), limit);
+            let eff_d = num_min(d, d_ci);
+            if eff_d <= limit {
+                let score = eff_d * 10;
+                if d > d_ci { score = score + 2; }
+                if str_slice(cand, 0, 1) != str_slice(target, 0, 1) { score = score + 1; }
+                if best_sym == nil or score < best_score or (score == best_score and cand < best_sym) {
+                    best_sym = cand;
+                    best_score = score;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return best_sym;
+}
+
+fn format_did_you_mean(suggestion, lang = "el") {
+    if suggestion == nil or len(str(suggestion)) == 0 { return nil; }
+    if str_lower(str(lang)) == "en" {
+        return "Did you mean '" + str(suggestion) + "'?";
+    }
+    return "Μήπως εννοούσατε '" + str(suggestion) + "';";
+}
+
+// ============================================================================
+// Bilingual Error Catalog (`E0001` .. `E0010`) in Greek (`el`) & English (`en`)
+// ============================================================================
+
+fn _build_catalog() {
+    return map{
+        "E0001": map{
+            "severity": "error",
+            "title_el": "Μη ορισμένο αναγνωριστικό",
+            "title_en": "Undefined identifier",
+            "explain_el": "Χρησιμοποιήθηκε όνομα μεταβλητής ή συνάρτησης που δεν έχει δηλωθεί στην τρέχουσα εμβέλεια ούτε ανήκει στις ενσωματωμένες συναρτήσεις της PBLang.",
+            "explain_en": "A variable or function identifier was referenced without being declared in lexical scope or registered in PBLang builtins.",
+            "bad_example": "fn main() {\n    prnitln(\"Γεια σου Κόσμε\");\n}",
+            "good_example": "fn main() {\n    println(\"Γεια σου Κόσμε\");\n}"
+        },
+        "E0002": map{
+            "severity": "error",
+            "title_el": "Ασυμφωνία τύπων",
+            "title_en": "Type mismatch",
+            "explain_el": "Μια πράξη ή κλήση συνάρτησης έλαβε τιμή διαφορετικού τύπου από αυτόν που απαιτείται (π.χ. αφαίρεση αλφαριθμητικού από αριθμό).",
+            "explain_en": "An operator or function call received a value whose type is incompatible with the expected parameter or operand type.",
+            "bad_example": "let σύνολο = 100 - \"είκοσι\";",
+            "good_example": "let σύνολο = 100 - 20;"
+        },
+        "E0003": map{
+            "severity": "error",
+            "title_el": "Λανθασμένος αριθμός ορισμάτων",
+            "title_en": "Arity mismatch",
+            "explain_el": "Η συνάρτηση κλήθηκε με λιγότερα ή περισσότερα ορίσματα από όσα ορίζει η υπογραφή της.",
+            "explain_en": "The function was invoked with fewer or more arguments than declared in its parameter signature.",
+            "bad_example": "fn άθροισμα(a, b) { return a + b; }\nlet x = άθροισμα(10);",
+            "good_example": "fn άθροισμα(a, b) { return a + b; }\nlet x = άθροισμα(10, 20);"
+        },
+        "E0004": map{
+            "severity": "error",
+            "title_el": "Μη κλεισμένο σύμβολο οριοθέτησης",
+            "title_en": "Unclosed delimiter",
+            "explain_el": "Ένα άγκιστρο '{', παρένθεση '(', αγκύλη '[' ή εισαγωγικό '\"' άνοιξε χωρίς αντίστοιχο σύμβολο κλεισίματος πριν το τέλος του μπλοκ ή αρχείου.",
+            "explain_en": "An opening delimiter ('{', '(', '[', or string quote '\"') reached the end of a block or file without a matching closing delimiter.",
+            "bad_example": "let στοιχεία = [10, 20, 30;",
+            "good_example": "let στοιχεία = [10, 20, 30];"
+        },
+        "E0005": map{
+            "severity": "error",
+            "title_el": "Άρνηση δικαιώματος ασφαλείας (Capability Denied)",
+            "title_en": "Capability denied",
+            "explain_el": "Το πρόγραμμα επιχείρησε πρόσβαση σε προστατευμένο πόρο (αρχεία, δίκτυο, διεργασίες ή FFI) χωρίς ρητή εξουσιοδότηση sandbox.",
+            "explain_en": "The program attempted a privileged operation (filesystem, network, subprocess, or FFI) not granted by the active capability policy.",
+            "bad_example": "// Χωρίς --allow-write:\nfs_write(\"out.txt\", \"δεδομένα\");",
+            "good_example": "// Εκτέλεση με ρητό δικαίωμα --allow-write:\nfs_write(\"out.txt\", \"δεδομένα\");"
+        },
+        "E0006": map{
+            "severity": "error",
+            "title_el": "Διαίρεση με το μηδέν ή αριθμητική υπερχείλιση",
+            "title_en": "Division by zero or arithmetic overflow",
+            "explain_el": "Εντοπίστηκε διαίρεση/υπόλοιπο με μηδενικό διαιρέτη ή υπέρβαση ορίων ελεγχόμενης ακέραιας αριθμητικής (checked_add / checked_mul).",
+            "explain_en": "Division or modulo by zero was attempted, or a checked integer arithmetic operation overflowed 64-bit bounds.",
+            "bad_example": "let λόγος = checked_div(50, 0);",
+            "good_example": "let διαιρέτης = 5;\nlet λόγος = if διαιρέτης != 0 { checked_div(50, διαιρέτης) } else { 0 };"
+        },
+        "E0007": map{
+            "severity": "error",
+            "title_el": "Παραβίαση συμβολαίου (requires / ensures)",
+            "title_en": "Contract requires/ensures violation",
+            "explain_el": "Απέτυχε είτε η προϋπόθεση εισόδου (requires) είτε η εγγύηση εξόδου (ensures) μιας επαληθευμένης συνάρτησης PBLang.",
+            "explain_en": "A formal function precondition (`requires`) or postcondition (`ensures`) evaluated to false at compile-time or runtime check.",
+            "bad_example": "fn ανάληψη(υπόλοιπο, ποσό) {\n    // requires ποσό > 0 and ποσό <= υπόλοιπο\n    return υπόλοιπο - ποσό;\n}\nανάληψη(100, 250);",
+            "good_example": "fn ανάληψη(υπόλοιπο, ποσό) {\n    if ποσό <= 0 or ποσό > υπόλοιπο { throw \"E0007\"; }\n    return υπόλοιπο - ποσό;\n}\nανάληψη(100, 40);"
+        },
+        "E0008": map{
+            "severity": "error",
+            "title_el": "Παραβίαση περιορισμού @nogc ή @constant_time",
+            "title_en": "@nogc or @constant_time constraint violation",
+            "explain_el": "Συνάρτηση με @nogc επιχείρησε δυναμική δέσμευση σωρού ή συνάρτηση κρυπτογραφίας @constant_time περιέχει διακλάδωση εξαρτώμενη από μυστικά δεδομένα.",
+            "explain_en": "A `@nogc` function performed a heap allocation, or a `@constant_time` cryptographic routine executed secret-dependent branching or indexing.",
+            "bad_example": "@constant_time\nfn έλεγχος_κλειδιού(a, b) {\n    if a == b { return true; }\n    return false;\n}",
+            "good_example": "@constant_time\nfn έλεγχος_κλειδιού(a, b) {\n    return constant_time_eq(a, b);\n}"
+        },
+        "E0009": map{
+            "severity": "error",
+            "title_el": "Παραβίαση ασφαλείας μολυσμένων δεδομένων (Taint Sink)",
+            "title_en": "Taint security sink violation",
+            "explain_el": "Μη επικυρωμένη είσοδος χρήστη κατέληξε απευθείας σε ευαίσθητο αποδέκτη (SQL query, κέλυφος συστήματος ή HTML) χωρίς απολύμανση ή παραμετροποίηση.",
+            "explain_en": "Untrusted/tainted input flowed directly into a security-sensitive sink (SQL query, OS command, or HTML template) without sanitization or parameterization.",
+            "bad_example": "let q = \"SELECT * FROM users WHERE name = '\" + user_input + \"'\";",
+            "good_example": "let rows = sqlite_query(db, \"SELECT * FROM users WHERE name = ?\", [user_input]);"
+        },
+        "E0010": map{
+            "severity": "error",
+            "title_el": "Μη εξαντλητικό ταίριασμα προτύπων (match)",
+            "title_en": "Non-exhaustive pattern match",
+            "explain_el": "Η έκφραση match δεν καλύπτει όλες τις πιθανές περιπτώσεις του enum ή λείπει ο προεπιλεγμένος κλάδος '_'.",
+            "explain_en": "A `match` expression does not cover all enum variants or lacks a wildcard `_` fallback arm.",
+            "bad_example": "// Λείπει η περίπτωση Κατάσταση.Σφάλμα ή '_':\n// match κατάσταση { Κατάσταση.Ενεργό => 1 }",
+            "good_example": "// Πλήρης κάλυψη περιπτώσεων:\n// match κατάσταση { Κατάσταση.Ενεργό => 1, _ => 0 }"
+        }
+    };
+}
+
+let _CATALOG = _build_catalog();
+
+fn explain_diagnostic_code(code, lang = "el") {
+    let norm_code = str_upper(str_trim(str(code)));
+    let is_en = str_lower(str_trim(str(lang))) == "en";
+    if not map_has(_CATALOG, norm_code) {
+        let unknown_msg = if is_en {
+            "Unknown diagnostic code '" + norm_code + "'."
+        } else {
+            "Άγνωστος κωδικός διαγνωστικού '" + norm_code + "'."
+        };
+        return map{
+            "ok": false,
+            "code": norm_code,
+            "lang": if is_en { "en" } else { "el" },
+            "title": unknown_msg,
+            "explanation": unknown_msg,
+            "bad_example": "",
+            "good_example": "",
+            "formatted": unknown_msg
+        };
+    }
+
+    let entry = _CATALOG[norm_code];
+    let title = if is_en { entry["title_en"] } else { entry["title_el"] };
+    let explanation = if is_en { entry["explain_en"] } else { entry["explain_el"] };
+    let bad_hdr = if is_en { "Incorrect example:" } else { "Παράδειγμα σφάλματος:" };
+    let good_hdr = if is_en { "Corrected example:" } else { "Διορθωμένο παράδειγμα:" };
+
+    let formatted = "[" + norm_code + "] " + title + "\n\n" +
+                    explanation + "\n\n" +
+                    bad_hdr + "\n```pblang\n" + entry["bad_example"] + "\n```\n\n" +
+                    good_hdr + "\n```pblang\n" + entry["good_example"] + "\n```";
+
+    return map{
+        "ok": true,
+        "code": norm_code,
+        "lang": if is_en { "en" } else { "el" },
+        "severity": entry["severity"],
+        "title": title,
+        "explanation": explanation,
+        "bad_example": entry["bad_example"],
+        "good_example": entry["good_example"],
+        "formatted": formatted
+    };
+}
+
+// ============================================================================
+// Multi-Span Source Caret & Fix-It Diff Renderer
+// ============================================================================
+
+fn _localized_severity(sev, is_en) {
+    let s = str_lower(str(sev));
+    if s == "warning" or s == "warn" { return if is_en { "warning" } else { "προειδοποίηση" }; }
+    if s == "note" { return if is_en { "note" } else { "σημείωση" }; }
+    if s == "help" { return if is_en { "help" } else { "βοήθεια" }; }
+    return if is_en { "error" } else { "σφάλμα" };
+}
+
+fn render_diagnostic(diag, opts = nil) {
+    let lang = str(_opt(opts, "lang", _opt(diag, "lang", "el")));
+    let is_en = str_lower(lang) == "en";
+    let use_color = _should_use_color(opts);
+
+    let sev_raw = str(_opt(diag, "severity", "error"));
+    let sev_word = _localized_severity(sev_raw, is_en);
+    let code = str(_opt(diag, "code", ""));
+    let msg = str(_opt(diag, if is_en { "message_en" } else { "message_el" }, _opt(diag, "message", "")));
+    let file_path = str(_opt(diag, "file", "<input>"));
+    let src_text = str(_opt(diag, "source", ""));
+    let src_lines = str_split(str_replace_all(src_text, "\r\n", "\n"), "\n");
+
+    let sev_ansi = if sev_raw == "warning" { "1;33" } elif sev_raw == "note" { "1;36" } else { "1;31" };
+    let code_tag = if len(code) > 0 { "[" + code + "]" } else { "" };
+    let out_lines = [];
+
+    let header_left = _paint(sev_word + code_tag, sev_ansi, use_color);
+    let header_right = _paint(": " + msg, "1", use_color);
+    array_push(out_lines, header_left + header_right);
+
+    let spans = _opt(diag, "spans", []);
+    if len(spans) == 0 and map_has(diag, "line") {
+        array_push(spans, map{
+            "line": diag["line"],
+            "col": _opt(diag, "col", 1),
+            "len": _opt(diag, "len", 1),
+            "primary": true,
+            "label": _opt(diag, "label", "")
+        });
+    }
+
+    let primary_line = if len(spans) > 0 { num_floor(_opt(spans[0], "line", 1)) } else { 1 };
+    let primary_col = if len(spans) > 0 { num_floor(_opt(spans[0], "col", 1)) } else { 1 };
+
+    let max_line_no = primary_line;
+    let si = 0;
+    while si < len(spans) {
+        let sln = num_floor(_opt(spans[si], "line", 1));
+        if sln > max_line_no { max_line_no = sln; }
+        si = si + 1;
+    }
+    let gutter_w = num_max(2, len(str(max_line_no)));
+    let pad_empty = str_repeat(" ", gutter_w);
+    let pipe = _paint("|", "1;34", use_color);
+    let arrow = _paint("-->", "1;34", use_color);
+
+    array_push(out_lines, pad_empty + " " + arrow + " " + file_path + ":" + str(primary_line) + ":" + str(primary_col));
+    array_push(out_lines, pad_empty + " " + pipe);
+
+    // Group spans in source order
+    let rendered_any = false;
+    let prev_line_rendered = -1;
+    si = 0;
+    while si < len(spans) {
+        let sp = spans[si];
+        let ln = num_floor(_opt(sp, "line", 1));
+        if ln >= 1 and ln <= len(src_lines) {
+            let raw_line = src_lines[ln - 1];
+            let disp_line = expand_tabs_for_display(raw_line, 4);
+            let raw_col = num_floor(_opt(sp, "col", 1));
+            let char_col = if _opt(sp, "col_is_bytes", false) == true {
+                byte_col_to_char_col(raw_line, raw_col)
+            } else {
+                raw_col
+            };
+            let span_chars = num_max(1, num_floor(_opt(sp, "len", 1)));
+            let vis_off = visual_column_offset(raw_line, char_col, 4);
+            let vis_w = visual_span_width(raw_line, char_col, span_chars, 4);
+            let is_prim = _opt(sp, "primary", si == 0) == true;
+            let mark_ch = if is_prim { "^" } else { "-" };
+            let mark_color = if is_prim { "1;31" } else { "1;36" };
+
+            if prev_line_rendered > 0 and ln > prev_line_rendered + 1 {
+                array_push(out_lines, _paint(str_pad_left("...", gutter_w, " "), "1;34", use_color) + " " + pipe);
+            }
+            if ln != prev_line_rendered {
+                let ln_str = _paint(str_pad_left(str(ln), gutter_w, " "), "1;34", use_color);
+                array_push(out_lines, ln_str + " " + pipe + " " + disp_line);
+                prev_line_rendered = ln;
+            }
+
+            let label_txt = str(_opt(sp, if is_en { "label_en" } else { "label_el" }, _opt(sp, "label", "")));
+            let underline = str_repeat(mark_ch, vis_w);
+            let tail = if len(label_txt) > 0 { " " + label_txt } else { "" };
+            let painted_mark = _paint(underline + tail, mark_color, use_color);
+            array_push(out_lines, pad_empty + " " + pipe + " " + str_repeat(" ", vis_off) + painted_mark);
+            rendered_any = true;
+        }
+        si = si + 1;
+    }
+
+    if rendered_any {
+        array_push(out_lines, pad_empty + " " + pipe);
+    }
+
+    // Help / Did-you-mean & Fix-It Diff Preview
+    let help_msg = _opt(diag, if is_en { "help_en" } else { "help_el" }, _opt(diag, "help", nil));
+    if help_msg != nil and len(str(help_msg)) > 0 {
+        let h_lbl = _localized_severity("help", is_en);
+        array_push(out_lines, pad_empty + " = " + _paint(h_lbl, "1;32", use_color) + ": " + str(help_msg));
+    }
+
+    let fixit = _opt(diag, "fixit", nil);
+    if fixit != nil and type(fixit) == "map" {
+        let fln = num_floor(_opt(fixit, "line", primary_line));
+        let fcol = num_floor(_opt(fixit, "col", primary_col));
+        let flen = num_max(1, num_floor(_opt(fixit, "len", 1)));
+        let rep = str(_opt(fixit, "replacement", ""));
+        if fln >= 1 and fln <= len(src_lines) {
+            let orig_ln = src_lines[fln - 1];
+            let c_start = num_max(0, num_min(len(orig_ln), fcol - 1));
+            let c_end = num_max(c_start, num_min(len(orig_ln), c_start + flen));
+            let fixed_ln = str_slice(orig_ln, 0, c_start) + rep + str_slice(orig_ln, c_end, len(orig_ln));
+            let fix_hdr = if is_en { "suggested fix:" } else { "προτεινόμενη διόρθωση:" };
+            array_push(out_lines, pad_empty + " = " + _paint(fix_hdr, "1;32", use_color));
+            array_push(out_lines, pad_empty + "   " + _paint("- " + expand_tabs_for_display(orig_ln, 4), "31", use_color));
+            array_push(out_lines, pad_empty + "   " + _paint("+ " + expand_tabs_for_display(fixed_ln, 4), "32", use_color));
+        }
+    }
+
+    let note_msg = _opt(diag, if is_en { "note_en" } else { "note_el" }, _opt(diag, "note", nil));
+    if note_msg != nil and len(str(note_msg)) > 0 {
+        let n_lbl = _localized_severity("note", is_en);
+        array_push(out_lines, pad_empty + " = " + _paint(n_lbl, "1;36", use_color) + ": " + str(note_msg));
+    }
+
+    return str_join(out_lines, "\n");
+}
+
+fn render_diagnostic_bundle(diags, opts = nil) {
+    let lang = str(_opt(opts, "lang", "el"));
+    let is_en = str_lower(lang) == "en";
+    let use_color = _should_use_color(opts);
+    let blocks = [];
+    let err_count = 0;
+    let warn_count = 0;
+    let i = 0;
+    while i < len(diags) {
+        let d = diags[i];
+        let sev = str_lower(str(_opt(d, "severity", "error")));
+        if sev == "warning" or sev == "warn" { warn_count = warn_count + 1; }
+        else { err_count = err_count + 1; }
+        array_push(blocks, render_diagnostic(d, opts));
+        i = i + 1;
+    }
+    let summary = if is_en {
+        "aborting due to " + str(err_count) + " error(s) and " + str(warn_count) + " warning(s)"
+    } else {
+        "τερματισμός λόγω " + str(err_count) + " σφαλμάτων και " + str(warn_count) + " προειδοποιήσεων"
+    };
+    if err_count > 0 or warn_count > 0 {
+        array_push(blocks, _paint(summary, if err_count > 0 { "1;31" } else { "1;33" }, use_color));
+    }
+    return str_join(blocks, "\n\n");
+}
+
+// ============================================================================
+// Raw VM / Compiler Error Parser -> Rich Bilingual Diagnostic Builder
+// ============================================================================
+
+fn _is_ident_cp(cp) {
+    return (cp >= 65 and cp <= 90) or (cp >= 97 and cp <= 122) or
+           (cp >= 48 and cp <= 57) or cp == 95 or cp >= 128;
+}
+
+fn _extract_source_identifiers(source_code) {
+    let s = str(source_code);
+    let out = [];
+    let seen = map{};
+    let i = 0;
+    while i < len(s) {
+        let cp = strcharcodeat(s, i);
+        if ((cp >= 65 and cp <= 90) or (cp >= 97 and cp <= 122) or cp == 95 or cp >= 128) {
+            let st = i;
+            while i < len(s) and _is_ident_cp(strcharcodeat(s, i)) {
+                i = i + 1;
+            }
+            let word = str_slice(s, st, i);
+            if not map_has(seen, word) {
+                seen[word] = true;
+                array_push(out, word);
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn _extract_quoted_token(msg) {
+    let s = str(msg);
+    let q1 = str_index_of(s, "'");
+    if q1 >= 0 {
+        let rest = str_slice(s, q1 + 1, len(s));
+        let q2 = str_index_of(rest, "'");
+        if q2 > 0 { return str_slice(rest, 0, q2); }
+    }
+    let dq1 = str_index_of(s, "`");
+    if dq1 >= 0 {
+        let rest = str_slice(s, dq1 + 1, len(s));
+        let dq2 = str_index_of(rest, "`");
+        if dq2 > 0 { return str_slice(rest, 0, dq2); }
+    }
+    let u_idx = str_index_of(str_lower(s), "undefined variable: ");
+    if u_idx >= 0 {
+        return str_trim(str_slice(s, u_idx + 20, len(s)));
+    }
+    return nil;
+}
+
+fn _extract_line_col(raw_err, source_code, sym) {
+    let s = str(raw_err);
+    let found_line = 1;
+    let found_col = 1;
+    let cap = regex_capture(s, "([0-9]+):([0-9]+)");
+    if cap != nil and type(cap) == "array" and len(cap) >= 3 {
+        let pl = parse_number(cap[1]);
+        let pc = parse_number(cap[2]);
+        if pl != nil { found_line = num_floor(pl); }
+        if pc != nil { found_col = num_floor(pc); }
+        return map{ "line": found_line, "col": found_col };
+    }
+    let cap_ln = regex_capture(str_lower(s), "line\\s+([0-9]+)");
+    if cap_ln != nil and type(cap_ln) == "array" and len(cap_ln) >= 2 {
+        let pl = parse_number(cap_ln[1]);
+        if pl != nil { found_line = num_floor(pl); }
+    }
+    // Locate `sym` inside `source_code` to get exact character column
+    if sym != nil and len(sym) > 0 {
+        let lines = str_split(str_replace_all(str(source_code), "\r\n", "\n"), "\n");
+        if found_line >= 1 and found_line <= len(lines) {
+            let pos = str_index_of(lines[found_line - 1], sym);
+            if pos >= 0 { return map{ "line": found_line, "col": pos + 1 }; }
+        }
+        let li = 0;
+        while li < len(lines) {
+            let pos = str_index_of(lines[li], sym);
+            if pos >= 0 { return map{ "line": li + 1, "col": pos + 1 }; }
+            li = li + 1;
+        }
+    }
+    return map{ "line": found_line, "col": found_col };
+}
+
+fn _classify_error_code(raw_err) {
+    let lo = str_lower(str(raw_err));
+    if str_contains(lo, "undefined") or str_contains(lo, "unknown identifier") or str_contains(lo, "unresolved") {
+        return "E0001";
+    }
+    if str_contains(lo, "arity") or str_contains(lo, "arguments") or str_contains(lo, "expected ") and str_contains(lo, "got ") and str_contains(lo, "arg") {
+        return "E0003";
+    }
+    if str_contains(lo, "unclosed") or str_contains(lo, "unterminated") or str_contains(lo, "expected ')'") or str_contains(lo, "expected '}'") {
+        return "E0004";
+    }
+    if str_contains(lo, "capability") or str_contains(lo, "permission denied") or str_contains(lo, "sandbox") {
+        return "E0005";
+    }
+    if str_contains(lo, "division by zero") or str_contains(lo, "divide by zero") or str_contains(lo, "overflow") {
+        return "E0006";
+    }
+    if str_contains(lo, "requires") or str_contains(lo, "ensures") or str_contains(lo, "contract") {
+        return "E0007";
+    }
+    if str_contains(lo, "@nogc") or str_contains(lo, "@constant_time") or str_contains(lo, "constant_time") {
+        return "E0008";
+    }
+    if str_contains(lo, "taint") or str_contains(lo, "injection") or str_contains(lo, "sink") {
+        return "E0009";
+    }
+    if str_contains(lo, "exhaustive") or str_contains(lo, "non-exhaustive") or str_contains(lo, "missing match arm") {
+        return "E0010";
+    }
+    return "E0002";
+}
+
+fn parse_vm_error_to_rich_diagnostic(raw_err, source_code, file_path = "<input>", lang = "el", opts = nil) {
+    let code = _classify_error_code(raw_err);
+    let sym = _extract_quoted_token(raw_err);
+    let loc = _extract_line_col(raw_err, source_code, sym);
+    let span_len = if sym != nil and len(sym) > 0 { len(sym) } else { 1 };
+
+    let cat_el = explain_diagnostic_code(code, "el");
+    let cat_en = explain_diagnostic_code(code, "en");
+
+    let msg_el = cat_el["title"] + (if sym != nil { ": '" + sym + "'" } else { " (" + str_trim(str(raw_err)) + ")" });
+    let msg_en = cat_en["title"] + (if sym != nil { ": '" + sym + "'" } else { " (" + str_trim(str(raw_err)) + ")" });
+
+    let suggestion = nil;
+    if code == "E0001" and sym != nil {
+        let scope_cands = [];
+        let raw_cands = _extract_source_identifiers(source_code);
+        let ci = 0;
+        while ci < len(raw_cands) {
+            if raw_cands[ci] != sym { array_push(scope_cands, raw_cands[ci]); }
+            ci = ci + 1;
+        }
+        suggestion = suggest_closest_symbol(sym, scope_cands, 2);
+    }
+
+    let help_el = if suggestion != nil { format_did_you_mean(suggestion, "el") } else { nil };
+    let help_en = if suggestion != nil { format_did_you_mean(suggestion, "en") } else { nil };
+    let fixit = if suggestion != nil {
+        map{
+            "line": loc["line"],
+            "col": loc["col"],
+            "len": span_len,
+            "replacement": suggestion
+        }
+    } else {
+        nil
+    };
+
+    let diag = map{
+        "code": code,
+        "severity": "error",
+        "file": file_path,
+        "source": source_code,
+        "line": loc["line"],
+        "col": loc["col"],
+        "len": span_len,
+        "symbol": sym,
+        "suggestion": suggestion,
+        "message_el": msg_el,
+        "message_en": msg_en,
+        "spans": [
+            map{
+                "line": loc["line"],
+                "col": loc["col"],
+                "len": span_len,
+                "primary": true,
+                "label_el": if sym != nil { "δεν βρέθηκε στην τρέχουσα εμβέλεια" } else { cat_el["title"] },
+                "label_en": if sym != nil { "not found in this scope" } else { cat_en["title"] }
+            }
+        ],
+        "help_el": help_el,
+        "help_en": help_en,
+        "note_el": cat_el["explanation"],
+        "note_en": cat_en["explanation"],
+        "fixit": fixit
+    };
+
+    let render_opts = if opts != nil and type(opts) == "map" { opts } else { map{} };
+    render_opts["lang"] = lang;
+    diag["rendered"] = render_diagnostic(diag, render_opts);
+    return diag;
+}
+
+export DIAGNOSTICS_ENGINE_VERSION, PBLANG_KEYWORDS;
+export expand_tabs_for_display, byte_col_to_char_col, visual_column_offset, visual_span_width;
+export damerau_levenshtein_distance, suggest_closest_symbol, format_did_you_mean;
+export explain_diagnostic_code, render_diagnostic, render_diagnostic_bundle;
+export parse_vm_error_to_rich_diagnostic;

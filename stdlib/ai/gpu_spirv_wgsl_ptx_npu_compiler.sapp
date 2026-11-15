@@ -1,0 +1,2232 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+// stdlib/ai/gpu_spirv_wgsl_ptx_npu_compiler.sapp — Single-Source @gpu fn Multi-Target Compiler
+// (Vulkan SPIR-V 1.5 Binary + WebGPU WGSL + NVIDIA CUDA PTX 8.0 + Hardware NPU / Quantized SIMD Runtime)
+// 100% Pure PBLang (Zero C, Zero Python, Zero external shader/CUDA toolchains required).
+
+let COMPILER_VERSION = "5.0.0";
+let _MASK32 = 4294967295;
+
+// Khronos SPIR-V 1.5 Binary Specification Constants & Opcodes
+let SPIRV_MAGIC = 119734787;          // 0x07230203
+let SPIRV_VERSION_1_5 = 66816;        // 0x00010500
+let SPIRV_GENERATOR_ID = 1346522165;  // 0x50424C35 ("PBL5")
+
+let OP_NAME = 5;
+let OP_EXT_INST_IMPORT = 11;
+let OP_EXT_INST = 12;
+let OP_MEMORY_MODEL = 14;
+let OP_ENTRY_POINT = 15;
+let OP_EXECUTION_MODE = 16;
+let OP_CAPABILITY = 17;
+let OP_TYPE_VOID = 19;
+let OP_TYPE_BOOL = 20;
+let OP_TYPE_INT = 21;
+let OP_TYPE_FLOAT = 22;
+let OP_TYPE_VECTOR = 23;
+let OP_TYPE_RUNTIME_ARRAY = 29;
+let OP_TYPE_STRUCT = 30;
+let OP_TYPE_POINTER = 32;
+let OP_TYPE_FUNCTION = 33;
+let OP_CONSTANT = 43;
+let OP_FUNCTION = 54;
+let OP_FUNCTION_END = 56;
+let OP_VARIABLE = 59;
+let OP_LOAD = 61;
+let OP_STORE = 62;
+let OP_ACCESS_CHAIN = 65;
+let OP_DECORATE = 71;
+let OP_MEMBER_DECORATE = 72;
+let OP_CONVERT_F_TO_U = 109;
+let OP_CONVERT_F_TO_S = 110;
+let OP_CONVERT_S_TO_F = 111;
+let OP_CONVERT_U_TO_F = 112;
+let OP_IADD = 128;
+let OP_FADD = 129;
+let OP_ISUB = 130;
+let OP_FSUB = 131;
+let OP_IMUL = 132;
+let OP_FMUL = 133;
+let OP_UDIV = 134;
+let OP_FDIV = 136;
+let OP_UMOD = 137;
+let OP_LOGICAL_OR = 166;
+let OP_LOGICAL_AND = 167;
+let OP_IEQUAL = 170;
+let OP_INOT_EQUAL = 171;
+let OP_UGREATER_THAN = 172;
+let OP_UGREATER_EQUAL = 174;
+let OP_ULESS_THAN = 176;
+let OP_ULESS_EQUAL = 178;
+let OP_FORD_EQUAL = 180;
+let OP_FORD_NOT_EQUAL = 182;
+let OP_FORD_LESS_THAN = 184;
+let OP_FORD_GREATER_THAN = 186;
+let OP_FORD_LESS_EQUAL = 188;
+let OP_FORD_GREATER_EQUAL = 190;
+let OP_SHIFT_RIGHT_LOGICAL = 194;
+let OP_SHIFT_LEFT_LOGICAL = 196;
+let OP_BITWISE_OR = 197;
+let OP_BITWISE_XOR = 198;
+let OP_BITWISE_AND = 199;
+let OP_CONTROL_BARRIER = 224;
+let OP_LOOP_MERGE = 246;
+let OP_SELECTION_MERGE = 247;
+let OP_LABEL = 248;
+let OP_BRANCH = 249;
+let OP_BRANCH_CONDITIONAL = 250;
+let OP_RETURN = 253;
+
+// ── Precision & Binary Word Helpers ──────────────────────────────────────────
+
+fn _opt(m, k, fb) {
+    if m == nil or not is_map(m) { return fb; }
+    if not map_has(m, k) { return fb; }
+    let v = m[k];
+    if v == nil { return fb; }
+    return v;
+}
+
+fn _u32(x) {
+    return bit_and(num_floor(x), _MASK32);
+}
+
+fn _spv_op(word_count, opcode) {
+    return _u32(bit_or(bit_shl(word_count, 16), bit_and(opcode, 65535)));
+}
+
+fn _push_inst(words, opcode, operands) {
+    let wc = 1 + len(operands);
+    array_push(words, _spv_op(wc, opcode));
+    let i = 0;
+    while i < len(operands) {
+        array_push(words, _u32(operands[i]));
+        i = i + 1;
+    }
+}
+
+fn _encode_spv_string_words(text) {
+    let bs = str_to_bytes(str(text));
+    let padded = [];
+    let i = 0;
+    while i < len(bs) {
+        array_push(padded, bit_and(bs[i], 255));
+        i = i + 1;
+    }
+    array_push(padded, 0);
+    while (len(padded) % 4) != 0 {
+        array_push(padded, 0);
+    }
+    let words = [];
+    let j = 0;
+    while j < len(padded) {
+        let w = bit_or(
+            bit_or(padded[j], bit_shl(padded[j + 1], 8)),
+            bit_or(bit_shl(padded[j + 2], 16), bit_shl(padded[j + 3], 24))
+        );
+        array_push(words, _u32(w));
+        j = j + 4;
+    }
+    return words;
+}
+
+// IEEE-754 binary32 exact bit-pattern encoder for SPIR-V OpConstant & PTX hex floats
+fn _f32_to_u32_bits(val) {
+    if val == 0 or val == 0.0 { return 0; }
+    let sign = 0;
+    let av = val * 1.0;
+    if av < 0.0 {
+        sign = 1;
+        av = 0.0 - av;
+    }
+    let e2 = num_floor(num_ln(av) / 0.6931471805599453);
+    let scaled = av / num_pow(2.0, e2 * 1.0);
+    while scaled >= 2.0 {
+        scaled = scaled * 0.5;
+        e2 = e2 + 1;
+    }
+    while scaled < 1.0 and e2 > -150 {
+        scaled = scaled * 2.0;
+        e2 = e2 - 1;
+    }
+    if e2 > 127 {
+        return _u32(bit_or(bit_shl(sign, 31), 2139095040));
+    }
+    if e2 < -126 {
+        let sub_m = num_floor(av * num_pow(2.0, 149.0) + 0.5);
+        return _u32(bit_or(bit_shl(sign, 31), bit_and(sub_m, 8388607)));
+    }
+    let biased = e2 + 127;
+    let mant = num_floor((scaled - 1.0) * 8388608.0 + 0.5);
+    if mant >= 8388608 {
+        mant = 0;
+        biased = biased + 1;
+    }
+    if biased >= 255 {
+        return _u32(bit_or(bit_shl(sign, 31), 2139095040));
+    }
+    return _u32(bit_or(bit_shl(sign, 31), bit_or(bit_shl(biased, 23), bit_and(mant, 8388607))));
+}
+
+fn _u32_to_hex8(w) {
+    let digits = "0123456789ABCDEF";
+    let v = _u32(w);
+    let chars = [];
+    let s = 28;
+    while s >= 0 {
+        let nib = bit_and(bit_shr(v, s), 15);
+        array_push(chars, str_slice(digits, nib, nib + 1));
+        s = s - 4;
+    }
+    return str_join(chars, "");
+}
+
+// ── 1. Pure-PBLang @gpu fn Lexer & Recursive-Descent AST/IR Parser ──────────
+
+fn _is_ident_start(c) {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95;
+}
+
+fn _is_ident_char(c) {
+    return _is_ident_start(c) or (c >= 48 and c <= 57);
+}
+
+fn _is_digit(c) {
+    return c >= 48 and c <= 57;
+}
+
+fn tokenize_gpu_kernel(src) {
+    let s = str(src);
+    let n = len(s);
+    let toks = [];
+    let i = 0;
+    while i < n {
+        let c = strcharcodeat(s, i);
+        if c == 32 or c == 9 or c == 10 or c == 13 {
+            i = i + 1;
+        } elif c == 47 and i + 1 < n and strcharcodeat(s, i + 1) == 47 {
+            while i < n and strcharcodeat(s, i) != 10 { i = i + 1; }
+        } elif _is_ident_start(c) {
+            let st = i;
+            while i < n and _is_ident_char(strcharcodeat(s, i)) { i = i + 1; }
+            array_push(toks, map{ kind: "id", text: str_slice(s, st, i) });
+        } elif _is_digit(c) {
+            let st = i;
+            let is_flt = false;
+            while i < n and _is_digit(strcharcodeat(s, i)) { i = i + 1; }
+            if i < n and strcharcodeat(s, i) == 46 {
+                is_flt = true;
+                i = i + 1;
+                while i < n and _is_digit(strcharcodeat(s, i)) { i = i + 1; }
+            }
+            let num_txt = str_slice(s, st, i);
+            if i < n and (strcharcodeat(s, i) == 117 or strcharcodeat(s, i) == 102) {
+                if strcharcodeat(s, i) == 102 { is_flt = true; }
+                i = i + 1;
+            }
+            array_push(toks, map{ kind: "num", text: num_txt, val: parse_number(num_txt), is_float: is_flt });
+        } else {
+            let two = if i + 1 < n { str_slice(s, i, i + 2) } else { "" };
+            if two == "==" or two == "!=" or two == "<=" or two == ">=" or two == "&&" or two == "||" or two == "->" {
+                array_push(toks, map{ kind: "sym", text: two });
+                i = i + 2;
+            } else {
+                array_push(toks, map{ kind: "sym", text: str_slice(s, i, i + 1) });
+                i = i + 1;
+            }
+        }
+    }
+    array_push(toks, map{ kind: "eof", text: "" });
+    return toks;
+}
+
+fn _normalize_scalar_ty(t) {
+    let low = str_lower(str(t));
+    if low == "f32" or low == "float" or low == "f16" or low == "fp8" { return "f32"; }
+    if low == "i32" or low == "int" or low == "i8" or low == "int4" { return "i32"; }
+    if low == "bool" { return "bool"; }
+    return "u32";
+}
+
+fn parse_gpu_kernel_ir(kernel_src) {
+    let toks = tokenize_gpu_kernel(kernel_src);
+    let st = map{ pos: 0, toks: toks, intrinsics: map{}, locals: [], local_types: map{}, param_types: map{}, buf_params: [] };
+
+    let peek = fn() { return st.toks[st.pos]; };
+    let adv = fn() {
+        let cur = st.toks[st.pos];
+        if st.pos + 1 < len(st.toks) { st.pos = st.pos + 1; }
+        return cur;
+    };
+    let eat = fn(txt) {
+        if peek().text == txt { adv(); return true; }
+        return false;
+    };
+    let req = fn(txt) {
+        let cur = peek();
+        if cur.text != txt {
+            throw "gpu_compiler: expected '" + txt + "' but got '" + cur.text + "'";
+        }
+        return adv();
+    };
+
+    let wg_x = 256;
+    let wg_y = 1;
+    let wg_z = 1;
+    if eat("@") {
+        let attr = adv().text;
+        if attr != "gpu" { throw "gpu_compiler: expected @gpu attribute, got @" + attr; }
+        if eat("(") {
+            while peek().kind != "eof" and peek().text != ")" {
+                let k = adv().text;
+                eat("=");
+                if eat("[") {
+                    if peek().kind == "num" { wg_x = num_floor(adv().val); }
+                    eat(",");
+                    if peek().kind == "num" { wg_y = num_floor(adv().val); }
+                    eat(",");
+                    if peek().kind == "num" { wg_z = num_floor(adv().val); }
+                    eat("]");
+                } elif peek().kind == "num" {
+                    let nv = num_floor(adv().val);
+                    if k == "workgroup_size" or k == "workgroup_size_x" { wg_x = nv; }
+                    elif k == "workgroup_size_y" { wg_y = nv; }
+                    elif k == "workgroup_size_z" { wg_z = nv; }
+                } else {
+                    adv();
+                }
+                eat(",");
+            }
+            req(")");
+        }
+    }
+    if peek().text == "pub" { adv(); }
+    req("fn");
+    let fn_name = adv().text;
+    req("(");
+
+    let params = [];
+    let bind_idx = 0;
+    while peek().kind != "eof" and peek().text != ")" {
+        let pname = adv().text;
+        let is_buf = false;
+        let elem_raw = "f32";
+        if eat(":") {
+            let ty_head = adv().text;
+            if (ty_head == "buf" or ty_head == "buffer" or ty_head == "ptr") and eat("<") {
+                is_buf = true;
+                elem_raw = adv().text;
+                req(">");
+            } else {
+                elem_raw = ty_head;
+            }
+        }
+        let norm_elem = _normalize_scalar_ty(elem_raw);
+        let p_entry = map{
+            name: pname,
+            is_buffer: is_buf,
+            raw_type: elem_raw,
+            elem_type: norm_elem,
+            binding: bind_idx
+        };
+        array_push(params, p_entry);
+        if is_buf {
+            array_push(st.buf_params, pname);
+            st.param_types[pname] = "buf_" + norm_elem;
+        } else {
+            st.param_types[pname] = norm_elem;
+        }
+        bind_idx = bind_idx + 1;
+        eat(",");
+    }
+    req(")");
+    if eat(":") or eat("->") { adv(); }
+
+    let infer_ty = nil;
+    infer_ty = fn(node) {
+        if node == nil { return "f32"; }
+        let nk = node.kind;
+        if nk == "lit" { return node.ty; }
+        if nk == "var" {
+            if map_has(st.local_types, node.name) { return st.local_types[node.name]; }
+            if map_has(st.param_types, node.name) { return st.param_types[node.name]; }
+            return "u32";
+        }
+        if nk == "index" {
+            if map_has(st.param_types, node.buf) {
+                let bt = st.param_types[node.buf];
+                if str_starts_with(bt, "buf_") { return str_slice(bt, 4, len(bt)); }
+            }
+            return "f32";
+        }
+        if nk == "call" {
+            let fn_id = node.name;
+            if fn_id == "global_id_x" or fn_id == "global_id_y" or fn_id == "global_id_z" or
+               fn_id == "local_id_x" or fn_id == "local_id_y" or fn_id == "local_id_z" or
+               fn_id == "group_id_x" or fn_id == "workgroup_size_x" or fn_id == "u32" or
+               fn_id == "bit_and" or fn_id == "bit_or" or fn_id == "bit_xor" or fn_id == "bit_shl" or fn_id == "bit_shr" {
+                return "u32";
+            }
+            if fn_id == "i32" { return "i32"; }
+            return "f32";
+        }
+        if nk == "unary" {
+            if node.op == "!" or node.op == "not" { return "bool"; }
+            return infer_ty(node.expr);
+        }
+        if nk == "bin" {
+            let bop = node.op;
+            if bop == "<" or bop == "<=" or bop == ">" or bop == ">=" or bop == "==" or bop == "!=" or bop == "&&" or bop == "||" or bop == "and" or bop == "or" {
+                return "bool";
+            }
+            let lt = infer_ty(node.left);
+            let rt = infer_ty(node.right);
+            if lt == "f32" or rt == "f32" { return "f32"; }
+            if lt == "i32" or rt == "i32" { return "i32"; }
+            return "u32";
+        }
+        return "f32";
+    };
+
+    let parse_expr = nil;
+    let parse_primary = fn() {
+        let tk = peek();
+        if tk.kind == "num" {
+            adv();
+            let lty = if tk.is_float { "f32" } else { "u32" };
+            return map{ kind: "lit", val: tk.val, text: tk.text, ty: lty };
+        }
+        if tk.text == "(" {
+            adv();
+            let inner = parse_expr();
+            req(")");
+            return inner;
+        }
+        if tk.kind == "id" {
+            let id_name = adv().text;
+            if id_name == "true" or id_name == "false" {
+                return map{ kind: "lit", val: if id_name == "true" { 1 } else { 0 }, text: id_name, ty: "bool" };
+            }
+            if eat("(") {
+                let args = [];
+                while peek().kind != "eof" and peek().text != ")" {
+                    array_push(args, parse_expr());
+                    eat(",");
+                }
+                req(")");
+                st.intrinsics[id_name] = true;
+                let cnode = map{ kind: "call", name: id_name, args: args };
+                cnode.ty = infer_ty(cnode);
+                return cnode;
+            }
+            if eat("[") {
+                let idx_e = parse_expr();
+                req("]");
+                let inode = map{ kind: "index", buf: id_name, idx: idx_e };
+                inode.ty = infer_ty(inode);
+                return inode;
+            }
+            let vnode = map{ kind: "var", name: id_name };
+            vnode.ty = infer_ty(vnode);
+            return vnode;
+        }
+        throw "gpu_compiler: unexpected token '" + tk.text + "'";
+    };
+
+    let parse_unary = nil;
+    parse_unary = fn() {
+        if peek().text == "-" or peek().text == "!" or peek().text == "not" {
+            let uop = adv().text;
+            let sub = parse_unary();
+            let un = map{ kind: "unary", op: uop, expr: sub };
+            un.ty = infer_ty(un);
+            return un;
+        }
+        return parse_primary();
+    };
+
+    let parse_mul = fn() {
+        let lhs = parse_unary();
+        while peek().text == "*" or peek().text == "/" or peek().text == "%" {
+            let mop = adv().text;
+            let rhs = parse_unary();
+            lhs = map{ kind: "bin", op: mop, left: lhs, right: rhs };
+            lhs.ty = infer_ty(lhs);
+        }
+        return lhs;
+    };
+
+    let parse_add = fn() {
+        let lhs = parse_mul();
+        while peek().text == "+" or peek().text == "-" {
+            let aop = adv().text;
+            let rhs = parse_mul();
+            lhs = map{ kind: "bin", op: aop, left: lhs, right: rhs };
+            lhs.ty = infer_ty(lhs);
+        }
+        return lhs;
+    };
+
+    let parse_cmp = fn() {
+        let lhs = parse_add();
+        while peek().text == "<" or peek().text == "<=" or peek().text == ">" or peek().text == ">=" or peek().text == "==" or peek().text == "!=" {
+            let cop = adv().text;
+            let rhs = parse_add();
+            lhs = map{ kind: "bin", op: cop, left: lhs, right: rhs, ty: "bool" };
+        }
+        return lhs;
+    };
+
+    parse_expr = fn() {
+        let lhs = parse_cmp();
+        while peek().text == "&&" or peek().text == "||" or peek().text == "and" or peek().text == "or" {
+            let lop = adv().text;
+            let rhs = parse_cmp();
+            lhs = map{ kind: "bin", op: lop, left: lhs, right: rhs, ty: "bool" };
+        }
+        return lhs;
+    };
+
+    let parse_block = nil;
+    let parse_stmt = fn() {
+        let tk = peek();
+        if tk.text == "let" or tk.text == "var" {
+            adv();
+            let vname = adv().text;
+            let decl_ty = nil;
+            if eat(":") { decl_ty = _normalize_scalar_ty(adv().text); }
+            req("=");
+            let rhs = parse_expr();
+            eat(";");
+            let vty = if decl_ty != nil { decl_ty } else { infer_ty(rhs) };
+            if not map_has(st.local_types, vname) {
+                array_push(st.locals, map{ name: vname, ty: vty });
+            }
+            st.local_types[vname] = vty;
+            return map{ kind: "let", name: vname, ty: vty, expr: rhs };
+        }
+        if tk.text == "if" {
+            adv();
+            let has_p = eat("(");
+            let cond = parse_expr();
+            if has_p { eat(")"); }
+            let then_b = parse_block();
+            let else_b = [];
+            if eat("else") {
+                else_b = parse_block();
+            }
+            return map{ kind: "if", cond: cond, then_body: then_b, else_body: else_b };
+        }
+        if tk.text == "while" {
+            adv();
+            let has_p = eat("(");
+            let cond = parse_expr();
+            if has_p { eat(")"); }
+            let wbody = parse_block();
+            return map{ kind: "while", cond: cond, body: wbody };
+        }
+        if tk.text == "return" {
+            adv();
+            eat(";");
+            return map{ kind: "return" };
+        }
+        if tk.text == "workgroup_barrier" {
+            adv();
+            req("(");
+            req(")");
+            eat(";");
+            st.intrinsics["workgroup_barrier"] = true;
+            return map{ kind: "barrier" };
+        }
+        let target = adv().text;
+        if eat("[") {
+            let idx_e = parse_expr();
+            req("]");
+            req("=");
+            let val_e = parse_expr();
+            eat(";");
+            return map{ kind: "store_buf", buf: target, idx: idx_e, expr: val_e };
+        }
+        if eat("=") {
+            let rhs = parse_expr();
+            eat(";");
+            if not map_has(st.local_types, target) {
+                let ity = infer_ty(rhs);
+                array_push(st.locals, map{ name: target, ty: ity });
+                st.local_types[target] = ity;
+            }
+            return map{ kind: "assign", name: target, expr: rhs };
+        }
+        let args = [];
+        if eat("(") {
+            while peek().kind != "eof" and peek().text != ")" {
+                array_push(args, parse_expr());
+                eat(",");
+            }
+            req(")");
+        }
+        eat(";");
+        return map{ kind: "expr_call", name: target, args: args };
+    };
+
+    parse_block = fn() {
+        req("{");
+        let stmts = [];
+        while peek().kind != "eof" and peek().text != "}" {
+            array_push(stmts, parse_stmt());
+        }
+        req("}");
+        return stmts;
+    };
+
+    let body = parse_block();
+    return map{
+        name: fn_name,
+        workgroup_size: [wg_x, wg_y, wg_z],
+        params: params,
+        locals: st.locals,
+        local_types: st.local_types,
+        param_types: st.param_types,
+        intrinsics: map_keys(st.intrinsics),
+        body: body
+    };
+}
+
+// ── 2. Target A: Khronos Vulkan SPIR-V 1.5 Binary Code Generator & Validator ─
+
+fn _collect_ir_constants(stmts, f32_map, u32_map, i32_map) {
+    let visit_e = nil;
+    visit_e = fn(e) {
+        if e == nil { return nil; }
+        if e.kind == "lit" {
+            if e.ty == "f32" {
+                let bits = _f32_to_u32_bits(e.val);
+                f32_map[str(bits)] = bits;
+            } elif e.ty == "i32" {
+                let iv = _u32(e.val);
+                i32_map[str(iv)] = iv;
+            } elif e.ty == "u32" {
+                let uv = _u32(e.val);
+                u32_map[str(uv)] = uv;
+            }
+        } elif e.kind == "unary" {
+            if e.op == "-" {
+                if e.ty == "f32" { f32_map["0"] = 0; } else { i32_map["0"] = 0; u32_map["0"] = 0; }
+            }
+            visit_e(e.expr);
+        } elif e.kind == "bin" {
+            visit_e(e.left);
+            visit_e(e.right);
+        } elif e.kind == "index" {
+            visit_e(e.idx);
+        } elif e.kind == "call" {
+            let k = 0;
+            while k < len(e.args) { visit_e(e.args[k]); k = k + 1; }
+        }
+    };
+    let i = 0;
+    while i < len(stmts) {
+        let s = stmts[i];
+        if s.kind == "let" or s.kind == "assign" {
+            visit_e(s.expr);
+        } elif s.kind == "store_buf" {
+            visit_e(s.idx);
+            visit_e(s.expr);
+        } elif s.kind == "if" {
+            visit_e(s.cond);
+            _collect_ir_constants(s.then_body, f32_map, u32_map, i32_map);
+            _collect_ir_constants(s.else_body, f32_map, u32_map, i32_map);
+        } elif s.kind == "while" {
+            visit_e(s.cond);
+            _collect_ir_constants(s.body, f32_map, u32_map, i32_map);
+        }
+        i = i + 1;
+    }
+}
+
+fn emit_vulkan_spirv_words(ir) {
+    // Monotonic SSA ID allocator: every result-producing SPIR-V instruction is
+    // emitted in exact sequential SSA order %1 .. %(bound - 1).
+    let next_ssa = map{ v: 1 };
+    let alloc_id = fn() {
+        let cur = next_ssa.v;
+        next_ssa.v = cur + 1;
+        return cur;
+    };
+
+    let sec_cap = [];
+    let sec_ext = [];
+    let sec_mem = [];
+    let sec_decor = [];
+    let sec_types = [];
+    let sec_fn = [];
+
+    _push_inst(sec_cap, OP_CAPABILITY, [1]); // Capability Shader = 1
+    let id_glsl = alloc_id();
+    let glsl_words = _encode_spv_string_words("GLSL.std.450");
+    let ext_ops = [id_glsl];
+    let gi = 0;
+    while gi < len(glsl_words) { array_push(ext_ops, glsl_words[gi]); gi = gi + 1; }
+    _push_inst(sec_ext, OP_EXT_INST_IMPORT, ext_ops);
+    _push_inst(sec_mem, OP_MEMORY_MODEL, [0, 1]); // Logical=0, GLSL450=1
+
+    // Core scalar & vector types
+    let id_void = alloc_id();
+    _push_inst(sec_types, OP_TYPE_VOID, [id_void]);
+    let id_fn_void = alloc_id();
+    _push_inst(sec_types, OP_TYPE_FUNCTION, [id_fn_void, id_void]);
+    let id_bool = alloc_id();
+    _push_inst(sec_types, OP_TYPE_BOOL, [id_bool]);
+    let id_u32 = alloc_id();
+    _push_inst(sec_types, OP_TYPE_INT, [id_u32, 32, 0]);
+    let id_i32 = alloc_id();
+    _push_inst(sec_types, OP_TYPE_INT, [id_i32, 32, 1]);
+    let id_f32 = alloc_id();
+    _push_inst(sec_types, OP_TYPE_FLOAT, [id_f32, 32]);
+    let id_v3u = alloc_id();
+    _push_inst(sec_types, OP_TYPE_VECTOR, [id_v3u, id_u32, 3]);
+
+    let id_ptr_in_v3u = alloc_id();
+    _push_inst(sec_types, OP_TYPE_POINTER, [id_ptr_in_v3u, 1, id_v3u]); // Input=1
+    let id_ptr_in_u32 = alloc_id();
+    _push_inst(sec_types, OP_TYPE_POINTER, [id_ptr_in_u32, 1, id_u32]);
+
+    let id_var_gid = alloc_id();
+    _push_inst(sec_types, OP_VARIABLE, [id_ptr_in_v3u, id_var_gid, 1]);
+    _push_inst(sec_decor, OP_DECORATE, [id_var_gid, 11, 28]); // BuiltIn=11, GlobalInvocationId=28
+
+    let id_var_lid = alloc_id();
+    _push_inst(sec_types, OP_VARIABLE, [id_ptr_in_v3u, id_var_lid, 1]);
+    _push_inst(sec_decor, OP_DECORATE, [id_var_lid, 11, 27]); // BuiltIn=11, LocalInvocationId=27
+
+    let id_var_wid = alloc_id();
+    _push_inst(sec_types, OP_VARIABLE, [id_ptr_in_v3u, id_var_wid, 1]);
+    _push_inst(sec_decor, OP_DECORATE, [id_var_wid, 11, 26]); // BuiltIn=11, WorkgroupId=26
+
+    let id_ptr_fn_f32 = alloc_id();
+    _push_inst(sec_types, OP_TYPE_POINTER, [id_ptr_fn_f32, 7, id_f32]); // Function=7
+    let id_ptr_fn_u32 = alloc_id();
+    _push_inst(sec_types, OP_TYPE_POINTER, [id_ptr_fn_u32, 7, id_u32]);
+    let id_ptr_fn_i32 = alloc_id();
+    _push_inst(sec_types, OP_TYPE_POINTER, [id_ptr_fn_i32, 7, id_i32]);
+    let id_ptr_fn_bool = alloc_id();
+    _push_inst(sec_types, OP_TYPE_POINTER, [id_ptr_fn_bool, 7, id_bool]);
+
+    let id_ptr_sb_f32 = alloc_id();
+    _push_inst(sec_types, OP_TYPE_POINTER, [id_ptr_sb_f32, 12, id_f32]); // StorageBuffer=12
+    let id_ptr_sb_u32 = alloc_id();
+    _push_inst(sec_types, OP_TYPE_POINTER, [id_ptr_sb_u32, 12, id_u32]);
+    let id_ptr_sb_i32 = alloc_id();
+    _push_inst(sec_types, OP_TYPE_POINTER, [id_ptr_sb_i32, 12, id_i32]);
+
+    let ty_id_for = fn(t) {
+        if t == "f32" { return id_f32; }
+        if t == "i32" { return id_i32; }
+        if t == "bool" { return id_bool; }
+        return id_u32;
+    };
+    let sb_ptr_for = fn(t) {
+        if t == "f32" { return id_ptr_sb_f32; }
+        if t == "i32" { return id_ptr_sb_i32; }
+        return id_ptr_sb_u32;
+    };
+    let fn_ptr_for = fn(t) {
+        if t == "f32" { return id_ptr_fn_f32; }
+        if t == "i32" { return id_ptr_fn_i32; }
+        if t == "bool" { return id_ptr_fn_bool; }
+        return id_ptr_fn_u32;
+    };
+
+    // Descriptor bindings (StorageBuffer=12 for buffers and uniform-compatible scalar blocks)
+    let iface_ids = [id_var_gid, id_var_lid, id_var_wid];
+    let param_meta = map{};
+    let pi = 0;
+    while pi < len(ir.params) {
+        let p = ir.params[pi];
+        let elem_tid = ty_id_for(p.elem_type);
+        let member_tid = elem_tid;
+        if p.is_buffer {
+            let rt_arr = alloc_id();
+            _push_inst(sec_types, OP_TYPE_RUNTIME_ARRAY, [rt_arr, elem_tid]);
+            _push_inst(sec_decor, OP_DECORATE, [rt_arr, 6, 4]); // ArrayStride = 4
+            member_tid = rt_arr;
+        }
+        let st_id = alloc_id();
+        _push_inst(sec_types, OP_TYPE_STRUCT, [st_id, member_tid]);
+        _push_inst(sec_decor, OP_DECORATE, [st_id, 2]); // Block = 2
+        _push_inst(sec_decor, OP_MEMBER_DECORATE, [st_id, 0, 35, 0]); // Offset 0 = 0
+        let ptr_st = alloc_id();
+        _push_inst(sec_types, OP_TYPE_POINTER, [ptr_st, 12, st_id]);
+        let var_id = alloc_id();
+        _push_inst(sec_types, OP_VARIABLE, [ptr_st, var_id, 12]);
+        _push_inst(sec_decor, OP_DECORATE, [var_id, 34, 0]);         // DescriptorSet 0
+        _push_inst(sec_decor, OP_DECORATE, [var_id, 33, p.binding]); // Binding k
+        array_push(iface_ids, var_id);
+        param_meta[p.name] = map{
+            var_id: var_id,
+            is_buffer: p.is_buffer,
+            elem_type: p.elem_type,
+            elem_tid: elem_tid,
+            sb_ptr_tid: sb_ptr_for(p.elem_type)
+        };
+        pi = pi + 1;
+    }
+
+    // Pre-collect constants so all OpConstant SSA IDs sit monotonically before OpFunction
+    let f32_consts = map{};
+    let u32_consts = map{ "0": 0, "1": 1, "2": 2, "264": 264, "wgx": ir.workgroup_size[0] };
+    let i32_consts = map{};
+    u32_consts[str(ir.workgroup_size[0])] = ir.workgroup_size[0];
+    _collect_ir_constants(ir.body, f32_consts, u32_consts, i32_consts);
+
+    let f32_cid = map{};
+    let u32_cid = map{};
+    let i32_cid = map{};
+    let uk = map_keys(u32_consts);
+    let ui = 0;
+    while ui < len(uk) {
+        let key_s = uk[ui];
+        if key_s != "wgx" {
+            let cid = alloc_id();
+            _push_inst(sec_types, OP_CONSTANT, [id_u32, cid, u32_consts[key_s]]);
+            u32_cid[key_s] = cid;
+        }
+        ui = ui + 1;
+    }
+    let fk = map_keys(f32_consts);
+    let fi = 0;
+    while fi < len(fk) {
+        let key_f = fk[fi];
+        let cid = alloc_id();
+        _push_inst(sec_types, OP_CONSTANT, [id_f32, cid, f32_consts[key_f]]);
+        f32_cid[key_f] = cid;
+        fi = fi + 1;
+    }
+    let ik = map_keys(i32_consts);
+    let ii = 0;
+    while ii < len(ik) {
+        let key_i = ik[ii];
+        let cid = alloc_id();
+        _push_inst(sec_types, OP_CONSTANT, [id_i32, cid, i32_consts[key_i]]);
+        i32_cid[key_i] = cid;
+        ii = ii + 1;
+    }
+
+    let c_u32_0 = u32_cid["0"];
+    let c_u32_1 = u32_cid["1"];
+    let c_u32_2 = u32_cid["2"];
+    let c_u32_sem = u32_cid["264"];
+
+    // Emit GLCompute Entry Function with monotonic SSA IDs
+    let id_main = alloc_id();
+    _push_inst(sec_fn, OP_FUNCTION, [id_void, id_main, 0, id_fn_void]);
+    let id_entry_lbl = alloc_id();
+    _push_inst(sec_fn, OP_LABEL, [id_entry_lbl]);
+
+    // Function-scope OpVariable declarations (must appear in entry block)
+    let local_var_id = map{};
+    let li = 0;
+    while li < len(ir.locals) {
+        let loc = ir.locals[li];
+        let lv_id = alloc_id();
+        _push_inst(sec_fn, OP_VARIABLE, [fn_ptr_for(loc.ty), lv_id, 7]);
+        local_var_id[loc.name] = lv_id;
+        li = li + 1;
+    }
+
+    let coerce_ty = fn(val_pair, dst_ty) {
+        if val_pair.ty == dst_ty { return val_pair.id; }
+        let conv_id = alloc_id();
+        if dst_ty == "f32" and val_pair.ty == "u32" {
+            _push_inst(sec_fn, OP_CONVERT_U_TO_F, [id_f32, conv_id, val_pair.id]);
+            return conv_id;
+        }
+        if dst_ty == "f32" and val_pair.ty == "i32" {
+            _push_inst(sec_fn, OP_CONVERT_S_TO_F, [id_f32, conv_id, val_pair.id]);
+            return conv_id;
+        }
+        if dst_ty == "u32" and val_pair.ty == "f32" {
+            _push_inst(sec_fn, OP_CONVERT_F_TO_U, [id_u32, conv_id, val_pair.id]);
+            return conv_id;
+        }
+        if dst_ty == "i32" and val_pair.ty == "f32" {
+            _push_inst(sec_fn, OP_CONVERT_F_TO_S, [id_i32, conv_id, val_pair.id]);
+            return conv_id;
+        }
+        // u32 <-> i32 bit-preserving arithmetic add 0
+        _push_inst(sec_fn, OP_IADD, [ty_id_for(dst_ty), conv_id, val_pair.id, c_u32_0]);
+        return conv_id;
+    };
+
+    let emit_expr = nil;
+    emit_expr = fn(e) {
+        let ek = e.kind;
+        if ek == "lit" {
+            if e.ty == "f32" {
+                let b = _f32_to_u32_bits(e.val);
+                return map{ id: f32_cid[str(b)], ty: "f32" };
+            }
+            if e.ty == "i32" {
+                return map{ id: i32_cid[str(_u32(e.val))], ty: "i32" };
+            }
+            return map{ id: u32_cid[str(_u32(e.val))], ty: "u32" };
+        }
+        if ek == "var" {
+            if map_has(local_var_id, e.name) {
+                let lty = ir.local_types[e.name];
+                let rid = alloc_id();
+                _push_inst(sec_fn, OP_LOAD, [ty_id_for(lty), rid, local_var_id[e.name]]);
+                return map{ id: rid, ty: lty };
+            }
+            if map_has(param_meta, e.name) {
+                let pm = param_meta[e.name];
+                let ac_id = alloc_id();
+                _push_inst(sec_fn, OP_ACCESS_CHAIN, [pm.sb_ptr_tid, ac_id, pm.var_id, c_u32_0]);
+                let rid = alloc_id();
+                _push_inst(sec_fn, OP_LOAD, [pm.elem_tid, rid, ac_id]);
+                return map{ id: rid, ty: pm.elem_type };
+            }
+            return map{ id: c_u32_0, ty: "u32" };
+        }
+        if ek == "index" {
+            let pm = param_meta[e.buf];
+            let idx_v = emit_expr(e.idx);
+            let idx_u = coerce_ty(idx_v, "u32");
+            let ac_id = alloc_id();
+            _push_inst(sec_fn, OP_ACCESS_CHAIN, [pm.sb_ptr_tid, ac_id, pm.var_id, c_u32_0, idx_u]);
+            let rid = alloc_id();
+            _push_inst(sec_fn, OP_LOAD, [pm.elem_tid, rid, ac_id]);
+            return map{ id: rid, ty: pm.elem_type };
+        }
+        if ek == "call" {
+            let fn_nm = e.name;
+            if fn_nm == "global_id_x" or fn_nm == "global_id_y" or fn_nm == "global_id_z" {
+                let comp = if fn_nm == "global_id_x" { c_u32_0 } elif fn_nm == "global_id_y" { c_u32_1 } else { c_u32_2 };
+                let p_id = alloc_id();
+                _push_inst(sec_fn, OP_ACCESS_CHAIN, [id_ptr_in_u32, p_id, id_var_gid, comp]);
+                let r_id = alloc_id();
+                _push_inst(sec_fn, OP_LOAD, [id_u32, r_id, p_id]);
+                return map{ id: r_id, ty: "u32" };
+            }
+            if fn_nm == "local_id_x" or fn_nm == "local_id_y" or fn_nm == "local_id_z" {
+                let comp = if fn_nm == "local_id_x" { c_u32_0 } elif fn_nm == "local_id_y" { c_u32_1 } else { c_u32_2 };
+                let p_id = alloc_id();
+                _push_inst(sec_fn, OP_ACCESS_CHAIN, [id_ptr_in_u32, p_id, id_var_lid, comp]);
+                let r_id = alloc_id();
+                _push_inst(sec_fn, OP_LOAD, [id_u32, r_id, p_id]);
+                return map{ id: r_id, ty: "u32" };
+            }
+            if fn_nm == "group_id_x" {
+                let p_id = alloc_id();
+                _push_inst(sec_fn, OP_ACCESS_CHAIN, [id_ptr_in_u32, p_id, id_var_wid, c_u32_0]);
+                let r_id = alloc_id();
+                _push_inst(sec_fn, OP_LOAD, [id_u32, r_id, p_id]);
+                return map{ id: r_id, ty: "u32" };
+            }
+            if fn_nm == "workgroup_size_x" {
+                return map{ id: u32_cid[str(ir.workgroup_size[0])], ty: "u32" };
+            }
+            if fn_nm == "f32" or fn_nm == "u32" or fn_nm == "i32" {
+                let a0 = emit_expr(e.args[0]);
+                return map{ id: coerce_ty(a0, fn_nm), ty: fn_nm };
+            }
+            if fn_nm == "fma" {
+                let a0 = coerce_ty(emit_expr(e.args[0]), "f32");
+                let a1 = coerce_ty(emit_expr(e.args[1]), "f32");
+                let a2 = coerce_ty(emit_expr(e.args[2]), "f32");
+                let rid = alloc_id();
+                _push_inst(sec_fn, OP_EXT_INST, [id_f32, rid, id_glsl, 50, a0, a1, a2]); // GLSL.std.450 Fma = 50
+                return map{ id: rid, ty: "f32" };
+            }
+            if fn_nm == "exp" or fn_nm == "sqrt" or fn_nm == "rsqrt" or fn_nm == "sin" or fn_nm == "cos" or fn_nm == "abs" {
+                let a0 = coerce_ty(emit_expr(e.args[0]), "f32");
+                let ext_op = 27; // Exp
+                if fn_nm == "sqrt" { ext_op = 31; }
+                elif fn_nm == "rsqrt" { ext_op = 32; }
+                elif fn_nm == "sin" { ext_op = 13; }
+                elif fn_nm == "cos" { ext_op = 14; }
+                elif fn_nm == "abs" { ext_op = 4; }
+                let rid = alloc_id();
+                _push_inst(sec_fn, OP_EXT_INST, [id_f32, rid, id_glsl, ext_op, a0]);
+                return map{ id: rid, ty: "f32" };
+            }
+            if fn_nm == "max" or fn_nm == "min" {
+                let a0 = coerce_ty(emit_expr(e.args[0]), "f32");
+                let a1 = coerce_ty(emit_expr(e.args[1]), "f32");
+                let ext_op = if fn_nm == "max" { 40 } else { 37 };
+                let rid = alloc_id();
+                _push_inst(sec_fn, OP_EXT_INST, [id_f32, rid, id_glsl, ext_op, a0, a1]);
+                return map{ id: rid, ty: "f32" };
+            }
+            if fn_nm == "bit_and" or fn_nm == "bit_or" or fn_nm == "bit_xor" or fn_nm == "bit_shl" or fn_nm == "bit_shr" {
+                let a0 = coerce_ty(emit_expr(e.args[0]), "u32");
+                let a1 = coerce_ty(emit_expr(e.args[1]), "u32");
+                let bop = OP_BITWISE_AND;
+                if fn_nm == "bit_or" { bop = OP_BITWISE_OR; }
+                elif fn_nm == "bit_xor" { bop = OP_BITWISE_XOR; }
+                elif fn_nm == "bit_shl" { bop = OP_SHIFT_LEFT_LOGICAL; }
+                elif fn_nm == "bit_shr" { bop = OP_SHIFT_RIGHT_LOGICAL; }
+                let rid = alloc_id();
+                _push_inst(sec_fn, bop, [id_u32, rid, a0, a1]);
+                return map{ id: rid, ty: "u32" };
+            }
+        }
+        if ek == "unary" {
+            let sub = emit_expr(e.expr);
+            let rid = alloc_id();
+            if sub.ty == "f32" {
+                _push_inst(sec_fn, OP_FSUB, [id_f32, rid, f32_cid["0"], sub.id]);
+                return map{ id: rid, ty: "f32" };
+            }
+            _push_inst(sec_fn, OP_ISUB, [id_u32, rid, c_u32_0, coerce_ty(sub, "u32")]);
+            return map{ id: rid, ty: "u32" };
+        }
+        if ek == "bin" {
+            let lv = emit_expr(e.left);
+            let rv = emit_expr(e.right);
+            let op = e.op;
+            if op == "&&" or op == "and" or op == "||" or op == "or" {
+                let rid = alloc_id();
+                let lop = if op == "&&" or op == "and" { OP_LOGICAL_AND } else { OP_LOGICAL_OR };
+                _push_inst(sec_fn, lop, [id_bool, rid, lv.id, rv.id]);
+                return map{ id: rid, ty: "bool" };
+            }
+            let use_f = lv.ty == "f32" or rv.ty == "f32";
+            let work_ty = if use_f { "f32" } elif lv.ty == "i32" or rv.ty == "i32" { "i32" } else { "u32" };
+            let lid = coerce_ty(lv, work_ty);
+            let rid_in = coerce_ty(rv, work_ty);
+            let res_id = alloc_id();
+            if op == "+" or op == "-" or op == "*" or op == "/" or op == "%" {
+                let wtid = ty_id_for(work_ty);
+                let spv_op = OP_IADD;
+                if use_f {
+                    if op == "+" { spv_op = OP_FADD; }
+                    elif op == "-" { spv_op = OP_FSUB; }
+                    elif op == "*" { spv_op = OP_FMUL; }
+                    else { spv_op = OP_FDIV; }
+                } else {
+                    if op == "+" { spv_op = OP_IADD; }
+                    elif op == "-" { spv_op = OP_ISUB; }
+                    elif op == "*" { spv_op = OP_IMUL; }
+                    elif op == "/" { spv_op = OP_UDIV; }
+                    else { spv_op = OP_UMOD; }
+                }
+                _push_inst(sec_fn, spv_op, [wtid, res_id, lid, rid_in]);
+                return map{ id: res_id, ty: work_ty };
+            }
+            let cmp_op = OP_ULESS_THAN;
+            if use_f {
+                if op == "<" { cmp_op = OP_FORD_LESS_THAN; }
+                elif op == "<=" { cmp_op = OP_FORD_LESS_EQUAL; }
+                elif op == ">" { cmp_op = OP_FORD_GREATER_THAN; }
+                elif op == ">=" { cmp_op = OP_FORD_GREATER_EQUAL; }
+                elif op == "==" { cmp_op = OP_FORD_EQUAL; }
+                else { cmp_op = OP_FORD_NOT_EQUAL; }
+            } else {
+                if op == "<" { cmp_op = OP_ULESS_THAN; }
+                elif op == "<=" { cmp_op = OP_ULESS_EQUAL; }
+                elif op == ">" { cmp_op = OP_UGREATER_THAN; }
+                elif op == ">=" { cmp_op = OP_UGREATER_EQUAL; }
+                elif op == "==" { cmp_op = OP_IEQUAL; }
+                else { cmp_op = OP_INOT_EQUAL; }
+            }
+            _push_inst(sec_fn, cmp_op, [id_bool, res_id, lid, rid_in]);
+            return map{ id: res_id, ty: "bool" };
+        }
+        return map{ id: c_u32_0, ty: "u32" };
+    };
+
+    let emit_stmts = nil;
+    emit_stmts = fn(stmts) {
+        let si = 0;
+        while si < len(stmts) {
+            let s = stmts[si];
+            let sk = s.kind;
+            if sk == "let" or sk == "assign" {
+                let rv = emit_expr(s.expr);
+                let vty = ir.local_types[s.name];
+                let cid = coerce_ty(rv, vty);
+                _push_inst(sec_fn, OP_STORE, [local_var_id[s.name], cid]);
+            } elif sk == "store_buf" {
+                let pm = param_meta[s.buf];
+                let iv = coerce_ty(emit_expr(s.idx), "u32");
+                let vv = coerce_ty(emit_expr(s.expr), pm.elem_type);
+                let ptr_id = alloc_id();
+                _push_inst(sec_fn, OP_ACCESS_CHAIN, [pm.sb_ptr_tid, ptr_id, pm.var_id, c_u32_0, iv]);
+                _push_inst(sec_fn, OP_STORE, [ptr_id, vv]);
+            } elif sk == "barrier" {
+                _push_inst(sec_fn, OP_CONTROL_BARRIER, [c_u32_2, c_u32_2, c_u32_sem]);
+            } elif sk == "if" {
+                let cv = emit_expr(s.cond);
+                let has_else = len(s.else_body) > 0;
+                let lbl_then = alloc_id();
+                let merge_patch_idx = len(sec_fn) + 1;
+                _push_inst(sec_fn, OP_SELECTION_MERGE, [0, 0]);
+                let bcond_false_idx = len(sec_fn) + 3;
+                _push_inst(sec_fn, OP_BRANCH_CONDITIONAL, [cv.id, lbl_then, 0]);
+                _push_inst(sec_fn, OP_LABEL, [lbl_then]);
+                emit_stmts(s.then_body);
+                let then_br_idx = len(sec_fn) + 1;
+                _push_inst(sec_fn, OP_BRANCH, [0]);
+                let else_br_idx = -1;
+                if has_else {
+                    let lbl_else = alloc_id();
+                    sec_fn[bcond_false_idx] = lbl_else;
+                    _push_inst(sec_fn, OP_LABEL, [lbl_else]);
+                    emit_stmts(s.else_body);
+                    else_br_idx = len(sec_fn) + 1;
+                    _push_inst(sec_fn, OP_BRANCH, [0]);
+                }
+                let lbl_merge = alloc_id();
+                sec_fn[merge_patch_idx] = lbl_merge;
+                sec_fn[then_br_idx] = lbl_merge;
+                if has_else {
+                    sec_fn[else_br_idx] = lbl_merge;
+                } else {
+                    sec_fn[bcond_false_idx] = lbl_merge;
+                }
+                _push_inst(sec_fn, OP_LABEL, [lbl_merge]);
+            } elif sk == "while" {
+                let lbl_hdr = alloc_id();
+                _push_inst(sec_fn, OP_BRANCH, [lbl_hdr]);
+                _push_inst(sec_fn, OP_LABEL, [lbl_hdr]);
+                let lmerge_after_idx = len(sec_fn) + 1;
+                let lmerge_cont_idx = len(sec_fn) + 2;
+                _push_inst(sec_fn, OP_LOOP_MERGE, [0, 0, 0]);
+                let cv = emit_expr(s.cond);
+                let lbl_body = alloc_id();
+                let lbr_after_idx = len(sec_fn) + 3;
+                _push_inst(sec_fn, OP_BRANCH_CONDITIONAL, [cv.id, lbl_body, 0]);
+                _push_inst(sec_fn, OP_LABEL, [lbl_body]);
+                emit_stmts(s.body);
+                let lbl_cont = alloc_id();
+                sec_fn[lmerge_cont_idx] = lbl_cont;
+                _push_inst(sec_fn, OP_BRANCH, [lbl_cont]);
+                _push_inst(sec_fn, OP_LABEL, [lbl_cont]);
+                _push_inst(sec_fn, OP_BRANCH, [lbl_hdr]);
+                let lbl_after = alloc_id();
+                sec_fn[lmerge_after_idx] = lbl_after;
+                sec_fn[lbr_after_idx] = lbl_after;
+                _push_inst(sec_fn, OP_LABEL, [lbl_after]);
+            }
+            si = si + 1;
+        }
+    };
+
+    emit_stmts(ir.body);
+    _push_inst(sec_fn, OP_RETURN, []);
+    _push_inst(sec_fn, OP_FUNCTION_END, []);
+
+    // Assemble OpEntryPoint & OpExecutionMode now that id_main is finalized
+    let sec_entry = [];
+    let main_words = _encode_spv_string_words("main");
+    let ep_ops = [5, id_main]; // ExecutionModel GLCompute = 5
+    let mi = 0;
+    while mi < len(main_words) { array_push(ep_ops, main_words[mi]); mi = mi + 1; }
+    let ifi = 0;
+    while ifi < len(iface_ids) { array_push(ep_ops, iface_ids[ifi]); ifi = ifi + 1; }
+    _push_inst(sec_entry, OP_ENTRY_POINT, ep_ops);
+    _push_inst(sec_entry, OP_EXECUTION_MODE, [
+        id_main, 17, ir.workgroup_size[0], ir.workgroup_size[1], ir.workgroup_size[2]
+    ]); // LocalSize = 17
+
+    let name_words = _encode_spv_string_words(ir.name);
+    let nm_ops = [id_main];
+    let ni = 0;
+    while ni < len(name_words) { array_push(nm_ops, name_words[ni]); ni = ni + 1; }
+    let sec_debug = [];
+    _push_inst(sec_debug, OP_NAME, nm_ops);
+
+    let bound = next_ssa.v;
+    let out_words = [SPIRV_MAGIC, SPIRV_VERSION_1_5, SPIRV_GENERATOR_ID, bound, 0];
+    let sections = [sec_cap, sec_ext, sec_mem, sec_entry, sec_debug, sec_decor, sec_types, sec_fn];
+    let s_idx = 0;
+    while s_idx < len(sections) {
+        let sec = sections[s_idx];
+        let wi = 0;
+        while wi < len(sec) {
+            array_push(out_words, _u32(sec[wi]));
+            wi = wi + 1;
+        }
+        s_idx = s_idx + 1;
+    }
+    return out_words;
+}
+
+fn emit_vulkan_spirv_bytes(ir) {
+    let words = if is_array(ir) { ir } else { emit_vulkan_spirv_words(ir) };
+    let bs = [];
+    let i = 0;
+    while i < len(words) {
+        let w = _u32(words[i]);
+        array_push(bs, bit_and(w, 255));
+        array_push(bs, bit_and(bit_shr(w, 8), 255));
+        array_push(bs, bit_and(bit_shr(w, 16), 255));
+        array_push(bs, bit_and(bit_shr(w, 24), 255));
+        i = i + 1;
+    }
+    return bs;
+}
+
+fn _spirv_result_id_slot(opcode) {
+    // Returns 1-based word offset of Result <id> within instruction, or 0 if none.
+    if opcode == OP_EXT_INST_IMPORT or opcode == OP_TYPE_VOID or opcode == OP_TYPE_BOOL or
+       opcode == OP_TYPE_INT or opcode == OP_TYPE_FLOAT or opcode == OP_TYPE_VECTOR or
+       opcode == OP_TYPE_RUNTIME_ARRAY or opcode == OP_TYPE_STRUCT or opcode == OP_TYPE_POINTER or
+       opcode == OP_TYPE_FUNCTION or opcode == OP_LABEL {
+        return 1;
+    }
+    if opcode == OP_EXT_INST or opcode == OP_CONSTANT or opcode == OP_FUNCTION or
+       opcode == OP_VARIABLE or opcode == OP_LOAD or opcode == OP_ACCESS_CHAIN or
+       (opcode >= 109 and opcode <= 112) or (opcode >= 128 and opcode <= 199) {
+        return 2;
+    }
+    return 0;
+}
+
+fn validate_spirv_binary(bytes) {
+    let errs = [];
+    if not is_array(bytes) {
+        return map{ ok: false, errors: ["spirv_bytes must be a byte array"] };
+    }
+    if len(bytes) < 20 {
+        return map{ ok: false, errors: ["spirv binary shorter than 20-byte Khronos header"] };
+    }
+    if (len(bytes) % 4) != 0 {
+        return map{ ok: false, errors: ["spirv binary byte length is not 32-bit word aligned"] };
+    }
+    let words = [];
+    let bi = 0;
+    while bi < len(bytes) {
+        let w = _u32(bit_or(
+            bit_or(bit_and(bytes[bi], 255), bit_shl(bit_and(bytes[bi + 1], 255), 8)),
+            bit_or(bit_shl(bit_and(bytes[bi + 2], 255), 16), bit_shl(bit_and(bytes[bi + 3], 255), 24))
+        ));
+        array_push(words, w);
+        bi = bi + 4;
+    }
+
+    let magic = words[0];
+    let ver = words[1];
+    let gen = words[2];
+    let bound = words[3];
+    let schema = words[4];
+    if magic != SPIRV_MAGIC { array_push(errs, "invalid SPIR-V magic word"); }
+    if ver < 65536 or ver > 67072 { array_push(errs, "unsupported SPIR-V version word"); }
+    if bound <= 1 { array_push(errs, "invalid SPIR-V SSA bound <= 1"); }
+    if schema != 0 { array_push(errs, "non-zero SPIR-V header schema"); }
+
+    let has_shader_cap = false;
+    let has_mem_model = false;
+    let has_glcompute_ep = false;
+    let has_local_size = false;
+    let entry_fn_target = 0;
+    let fn_depth = 0;
+    let fn_count = 0;
+    let seen_ids = map{};
+    let last_ssa_id = 0;
+    let inst_count = 0;
+    let pc = 5;
+
+    while pc < len(words) {
+        let w0 = words[pc];
+        let wc = bit_and(bit_shr(w0, 16), 65535);
+        let op = bit_and(w0, 65535);
+        if wc == 0 or pc + wc > len(words) {
+            array_push(errs, "malformed instruction word_count at word " + str(pc));
+            pc = len(words);
+        } else {
+            inst_count = inst_count + 1;
+            if op == OP_CAPABILITY and wc >= 2 and words[pc + 1] == 1 { has_shader_cap = true; }
+            if op == OP_MEMORY_MODEL and wc == 3 and words[pc + 1] == 0 and words[pc + 2] == 1 { has_mem_model = true; }
+            if op == OP_ENTRY_POINT and wc >= 4 and words[pc + 1] == 5 {
+                has_glcompute_ep = true;
+                entry_fn_target = words[pc + 2];
+            }
+            if op == OP_EXECUTION_MODE and wc == 6 and words[pc + 2] == 17 { has_local_size = true; }
+            if op == OP_FUNCTION {
+                if fn_depth != 0 { array_push(errs, "nested OpFunction without OpFunctionEnd"); }
+                fn_depth = fn_depth + 1;
+                fn_count = fn_count + 1;
+            }
+            if op == OP_FUNCTION_END {
+                if fn_depth <= 0 { array_push(errs, "unmatched OpFunctionEnd"); }
+                fn_depth = fn_depth - 1;
+            }
+            let slot = _spirv_result_id_slot(op);
+            if slot > 0 and slot < wc {
+                let rid = words[pc + slot];
+                if rid <= 0 or rid >= bound {
+                    array_push(errs, "SSA result id " + str(rid) + " violates 0 < id < bound(" + str(bound) + ")");
+                }
+                if map_has(seen_ids, str(rid)) {
+                    array_push(errs, "duplicate SSA result id " + str(rid));
+                }
+                if rid <= last_ssa_id {
+                    array_push(errs, "non-monotonic SSA result id " + str(rid) + " after " + str(last_ssa_id));
+                }
+                seen_ids[str(rid)] = true;
+                last_ssa_id = rid;
+            }
+            pc = pc + wc;
+        }
+    }
+
+    if fn_depth != 0 { array_push(errs, "unbalanced OpFunction..OpFunctionEnd at EOF"); }
+    if fn_count == 0 { array_push(errs, "module contains zero OpFunction definitions"); }
+    if not has_shader_cap { array_push(errs, "missing OpCapability Shader"); }
+    if not has_mem_model { array_push(errs, "missing OpMemoryModel Logical GLSL450"); }
+    if not has_glcompute_ep { array_push(errs, "missing GLCompute OpEntryPoint"); }
+    if not has_local_size { array_push(errs, "missing OpExecutionMode LocalSize"); }
+    if entry_fn_target > 0 and not map_has(seen_ids, str(entry_fn_target)) {
+        array_push(errs, "OpEntryPoint target function SSA id is undefined");
+    }
+
+    return map{
+        ok: len(errs) == 0,
+        errors: errs,
+        word_count: len(words),
+        byte_length: len(bytes),
+        generator_id: gen,
+        version: ver,
+        bound: bound,
+        max_ssa_id: last_ssa_id,
+        instruction_count: inst_count
+    };
+}
+
+// ── 3. Target B: W3C WebGPU WGSL Compute Shader Code Generator ───────────────
+
+fn emit_webgpu_wgsl(ir) {
+    let lines = ["// Generated by PBLang v5.0.0 @gpu -> W3C WebGPU WGSL Compiler"];
+    let scalar_params = [];
+    let pi = 0;
+    while pi < len(ir.params) {
+        let p = ir.params[pi];
+        if p.is_buffer {
+            array_push(lines, "@group(0) @binding(" + str(p.binding) + ") var<storage, read_write> " + p.name + ": array<" + p.elem_type + ">;");
+        } else {
+            array_push(scalar_params, p);
+            array_push(lines, "struct _Uniform_" + p.name + " { val: " + p.elem_type + ", _pad0: u32, _pad1: u32, _pad2: u32 }");
+            array_push(lines, "@group(0) @binding(" + str(p.binding) + ") var<uniform> _u_" + p.name + ": _Uniform_" + p.name + ";");
+        }
+        pi = pi + 1;
+    }
+
+    let scalar_set = map{};
+    let si = 0;
+    while si < len(scalar_params) { scalar_set[scalar_params[si].name] = true; si = si + 1; }
+
+    let wg_e = nil;
+    wg_e = fn(e) {
+        let ek = e.kind;
+        if ek == "lit" {
+            if e.ty == "f32" {
+                let stxt = str(e.val);
+                if not str_contains(stxt, ".") { stxt = stxt + ".0"; }
+                return stxt + "f";
+            }
+            if e.ty == "u32" { return str(num_floor(e.val)) + "u"; }
+            return str(num_floor(e.val));
+        }
+        if ek == "var" {
+            if map_has(scalar_set, e.name) { return "_u_" + e.name + ".val"; }
+            return e.name;
+        }
+        if ek == "index" {
+            return e.buf + "[min(u32(" + wg_e(e.idx) + "), arrayLength(&" + e.buf + ") - 1u)]";
+        }
+        if ek == "call" {
+            let nm = e.name;
+            if nm == "global_id_x" { return "gid.x"; }
+            if nm == "global_id_y" { return "gid.y"; }
+            if nm == "global_id_z" { return "gid.z"; }
+            if nm == "local_id_x" { return "lid.x"; }
+            if nm == "local_id_y" { return "lid.y"; }
+            if nm == "local_id_z" { return "lid.z"; }
+            if nm == "group_id_x" { return "wid.x"; }
+            if nm == "workgroup_size_x" { return str(ir.workgroup_size[0]) + "u"; }
+            if nm == "rsqrt" { return "inverseSqrt(" + wg_e(e.args[0]) + ")"; }
+            if nm == "bit_and" { return "(" + wg_e(e.args[0]) + " & " + wg_e(e.args[1]) + ")"; }
+            if nm == "bit_or" { return "(" + wg_e(e.args[0]) + " | " + wg_e(e.args[1]) + ")"; }
+            if nm == "bit_xor" { return "(" + wg_e(e.args[0]) + " ^ " + wg_e(e.args[1]) + ")"; }
+            if nm == "bit_shl" { return "(" + wg_e(e.args[0]) + " << " + wg_e(e.args[1]) + ")"; }
+            if nm == "bit_shr" { return "(" + wg_e(e.args[0]) + " >> " + wg_e(e.args[1]) + ")"; }
+            let a_parts = [];
+            let ai = 0;
+            while ai < len(e.args) { array_push(a_parts, wg_e(e.args[ai])); ai = ai + 1; }
+            return nm + "(" + str_join(a_parts, ", ") + ")";
+        }
+        if ek == "unary" {
+            let uop = if e.op == "not" { "!" } else { e.op };
+            return "(" + uop + wg_e(e.expr) + ")";
+        }
+        if ek == "bin" {
+            let bop = e.op;
+            if bop == "and" { bop = "&&"; }
+            if bop == "or" { bop = "||"; }
+            return "(" + wg_e(e.left) + " " + bop + " " + wg_e(e.right) + ")";
+        }
+        return "0u";
+    };
+
+    let wg_stmts = nil;
+    wg_stmts = fn(stmts, pad) {
+        let k = 0;
+        while k < len(stmts) {
+            let s = stmts[k];
+            if s.kind == "let" {
+                array_push(lines, pad + "var " + s.name + ": " + s.ty + " = " + wg_e(s.expr) + ";");
+            } elif s.kind == "assign" {
+                array_push(lines, pad + s.name + " = " + wg_e(s.expr) + ";");
+            } elif s.kind == "store_buf" {
+                let idx_s = wg_e(s.idx);
+                array_push(lines, pad + "if (u32(" + idx_s + ") < arrayLength(&" + s.buf + ")) { " + s.buf + "[u32(" + idx_s + ")] = " + wg_e(s.expr) + "; }");
+            } elif s.kind == "barrier" {
+                array_push(lines, pad + "workgroupBarrier();");
+            } elif s.kind == "return" {
+                array_push(lines, pad + "return;");
+            } elif s.kind == "if" {
+                array_push(lines, pad + "if " + wg_e(s.cond) + " {");
+                wg_stmts(s.then_body, pad + "    ");
+                if len(s.else_body) > 0 {
+                    array_push(lines, pad + "} else {");
+                    wg_stmts(s.else_body, pad + "    ");
+                }
+                array_push(lines, pad + "}");
+            } elif s.kind == "while" {
+                array_push(lines, pad + "while " + wg_e(s.cond) + " {");
+                wg_stmts(s.body, pad + "    ");
+                array_push(lines, pad + "}");
+            }
+            k = k + 1;
+        }
+    };
+
+    let wgs = ir.workgroup_size;
+    array_push(lines, "@compute @workgroup_size(" + str(wgs[0]) + ", " + str(wgs[1]) + ", " + str(wgs[2]) + ")");
+    array_push(lines, "fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {");
+    wg_stmts(ir.body, "    ");
+    array_push(lines, "}");
+    return str_join(lines, "\n") + "\n";
+}
+
+// ── 4. Target C: NVIDIA CUDA PTX 8.0 (`sm_75`/`sm_80`/`sm_90`) Code Generator ─
+
+fn emit_cuda_ptx(ir, opts = nil) {
+    let sm_arch = str(_opt(opts, "sm_arch", "sm_80"));
+    if sm_arch != "sm_75" and sm_arch != "sm_80" and sm_arch != "sm_90" {
+        sm_arch = "sm_80";
+    }
+    let out = [
+        "// Generated by PBLang v5.0.0 @gpu -> NVIDIA CUDA PTX 8.0 Compiler",
+        ".version 8.0",
+        ".target " + sm_arch,
+        ".address_size 64",
+        ""
+    ];
+    let p_decls = [];
+    let pi = 0;
+    while pi < len(ir.params) {
+        let p = ir.params[pi];
+        if p.is_buffer {
+            array_push(p_decls, "    .param .u64 _param_" + p.name);
+        } elif p.elem_type == "f32" {
+            array_push(p_decls, "    .param .f32 _param_" + p.name);
+        } else {
+            array_push(p_decls, "    .param .u32 _param_" + p.name);
+        }
+        pi = pi + 1;
+    }
+    array_push(out, ".visible .entry " + ir.name + "(");
+    array_push(out, str_join(p_decls, ",\n"));
+    array_push(out, ")");
+    let wgs = ir.workgroup_size;
+    array_push(out, ".maxntid " + str(wgs[0]) + ", " + str(wgs[1]) + ", " + str(wgs[2]));
+    array_push(out, "{");
+
+    let reg_cnt = map{ r: 4, rd: 1, f: 1, p: 1, lbl: 1 };
+    let new_r = fn() { let k = reg_cnt.r; reg_cnt.r = k + 1; return "%r" + str(k); };
+    let new_rd = fn() { let k = reg_cnt.rd; reg_cnt.rd = k + 1; return "%rd" + str(k); };
+    let new_f = fn() { let k = reg_cnt.f; reg_cnt.f = k + 1; return "%f" + str(k); };
+    let new_p = fn() { let k = reg_cnt.p; reg_cnt.p = k + 1; return "%p" + str(k); };
+    let new_lbl = fn(tag) { let k = reg_cnt.lbl; reg_cnt.lbl = k + 1; return "$L_" + tag + "_" + str(k); };
+
+    let body_asm = [];
+    let buf_rd = map{};
+    let var_reg = map{};
+    let var_ty = map{};
+
+    // Compute built-in thread coordinates upfront (%r1 = global_id_x, %r2 = local_id_x, %r3 = group_id_x)
+    array_push(body_asm, "    mov.u32 %r2, %tid.x;");
+    array_push(body_asm, "    mov.u32 %r3, %ctaid.x;");
+    array_push(body_asm, "    mov.u32 %r0, %ntid.x;");
+    array_push(body_asm, "    mad.lo.u32 %r1, %r3, %r0, %r2;");
+
+    let pj = 0;
+    while pj < len(ir.params) {
+        let p = ir.params[pj];
+        if p.is_buffer {
+            let rd_raw = new_rd();
+            let rd_g = new_rd();
+            array_push(body_asm, "    ld.param.u64 " + rd_raw + ", [_param_" + p.name + "];");
+            array_push(body_asm, "    cvta.to.global.u64 " + rd_g + ", " + rd_raw + ";");
+            buf_rd[p.name] = rd_g;
+        } elif p.elem_type == "f32" {
+            let rf = new_f();
+            array_push(body_asm, "    ld.param.f32 " + rf + ", [_param_" + p.name + "];");
+            var_reg[p.name] = rf;
+            var_ty[p.name] = "f32";
+        } else {
+            let ru = new_r();
+            array_push(body_asm, "    ld.param.u32 " + ru + ", [_param_" + p.name + "];");
+            var_reg[p.name] = ru;
+            var_ty[p.name] = p.elem_type;
+        }
+        pj = pj + 1;
+    }
+
+    let lk = 0;
+    while lk < len(ir.locals) {
+        let loc = ir.locals[lk];
+        var_reg[loc.name] = if loc.ty == "f32" { new_f() } else { new_r() };
+        var_ty[loc.name] = loc.ty;
+        lk = lk + 1;
+    }
+
+    let ptx_coerce = fn(vp, dst_ty) {
+        if vp.ty == dst_ty { return vp.reg; }
+        if dst_ty == "f32" {
+            let rf = new_f();
+            array_push(body_asm, "    cvt.rn.f32.u32 " + rf + ", " + vp.reg + ";");
+            return rf;
+        }
+        if vp.ty == "f32" {
+            let rr = new_r();
+            array_push(body_asm, "    cvt.rzi.u32.f32 " + rr + ", " + vp.reg + ";");
+            return rr;
+        }
+        return vp.reg;
+    };
+
+    let ptx_expr = nil;
+    ptx_expr = fn(e) {
+        let ek = e.kind;
+        if ek == "lit" {
+            if e.ty == "f32" {
+                let rf = new_f();
+                array_push(body_asm, "    mov.f32 " + rf + ", 0f" + _u32_to_hex8(_f32_to_u32_bits(e.val)) + ";");
+                return map{ reg: rf, ty: "f32" };
+            }
+            let rr = new_r();
+            array_push(body_asm, "    mov.u32 " + rr + ", " + str(num_floor(e.val)) + ";");
+            return map{ reg: rr, ty: "u32" };
+        }
+        if ek == "var" {
+            return map{ reg: var_reg[e.name], ty: var_ty[e.name] };
+        }
+        if ek == "index" {
+            let iv = ptx_coerce(ptx_expr(e.idx), "u32");
+            let rd_off = new_rd();
+            let rd_ptr = new_rd();
+            array_push(body_asm, "    mul.wide.u32 " + rd_off + ", " + iv + ", 4;");
+            array_push(body_asm, "    add.s64 " + rd_ptr + ", " + buf_rd[e.buf] + ", " + rd_off + ";");
+            let ety = e.ty;
+            if ety == "f32" {
+                let rf = new_f();
+                array_push(body_asm, "    ld.global.f32 " + rf + ", [" + rd_ptr + "];");
+                return map{ reg: rf, ty: "f32" };
+            }
+            let rr = new_r();
+            array_push(body_asm, "    ld.global.u32 " + rr + ", [" + rd_ptr + "];");
+            return map{ reg: rr, ty: ety };
+        }
+        if ek == "call" {
+            let nm = e.name;
+            if nm == "global_id_x" { return map{ reg: "%r1", ty: "u32" }; }
+            if nm == "local_id_x" { return map{ reg: "%r2", ty: "u32" }; }
+            if nm == "group_id_x" { return map{ reg: "%r3", ty: "u32" }; }
+            if nm == "workgroup_size_x" { return map{ reg: "%r0", ty: "u32" }; }
+            if nm == "f32" or nm == "u32" or nm == "i32" {
+                let a0 = ptx_expr(e.args[0]);
+                return map{ reg: ptx_coerce(a0, nm), ty: nm };
+            }
+            if nm == "fma" {
+                let a0 = ptx_coerce(ptx_expr(e.args[0]), "f32");
+                let a1 = ptx_coerce(ptx_expr(e.args[1]), "f32");
+                let a2 = ptx_coerce(ptx_expr(e.args[2]), "f32");
+                let rf = new_f();
+                array_push(body_asm, "    mad.rn.f32 " + rf + ", " + a0 + ", " + a1 + ", " + a2 + ";");
+                return map{ reg: rf, ty: "f32" };
+            }
+            if nm == "sqrt" or nm == "rsqrt" or nm == "exp" or nm == "sin" or nm == "cos" or nm == "abs" {
+                let a0 = ptx_coerce(ptx_expr(e.args[0]), "f32");
+                let rf = new_f();
+                if nm == "sqrt" { array_push(body_asm, "    sqrt.rn.f32 " + rf + ", " + a0 + ";"); }
+                elif nm == "rsqrt" { array_push(body_asm, "    rsqrt.approx.f32 " + rf + ", " + a0 + ";"); }
+                elif nm == "sin" { array_push(body_asm, "    sin.approx.f32 " + rf + ", " + a0 + ";"); }
+                elif nm == "cos" { array_push(body_asm, "    cos.approx.f32 " + rf + ", " + a0 + ";"); }
+                elif nm == "abs" { array_push(body_asm, "    abs.f32 " + rf + ", " + a0 + ";"); }
+                else {
+                    let rt = new_f();
+                    array_push(body_asm, "    mul.f32 " + rt + ", " + a0 + ", 0f3FB8AA3B;");
+                    array_push(body_asm, "    ex2.approx.f32 " + rf + ", " + rt + ";");
+                }
+                return map{ reg: rf, ty: "f32" };
+            }
+            if nm == "max" or nm == "min" {
+                let a0 = ptx_coerce(ptx_expr(e.args[0]), "f32");
+                let a1 = ptx_coerce(ptx_expr(e.args[1]), "f32");
+                let rf = new_f();
+                array_push(body_asm, "    " + nm + ".f32 " + rf + ", " + a0 + ", " + a1 + ";");
+                return map{ reg: rf, ty: "f32" };
+            }
+            if nm == "bit_and" or nm == "bit_or" or nm == "bit_xor" or nm == "bit_shl" or nm == "bit_shr" {
+                let a0 = ptx_coerce(ptx_expr(e.args[0]), "u32");
+                let a1 = ptx_coerce(ptx_expr(e.args[1]), "u32");
+                let rr = new_r();
+                let pop = "and.b32";
+                if nm == "bit_or" { pop = "or.b32"; }
+                elif nm == "bit_xor" { pop = "xor.b32"; }
+                elif nm == "bit_shl" { pop = "shl.b32"; }
+                elif nm == "bit_shr" { pop = "shr.u32"; }
+                array_push(body_asm, "    " + pop + " " + rr + ", " + a0 + ", " + a1 + ";");
+                return map{ reg: rr, ty: "u32" };
+            }
+        }
+        if ek == "unary" {
+            let sv = ptx_expr(e.expr);
+            if sv.ty == "f32" {
+                let rf = new_f();
+                array_push(body_asm, "    neg.f32 " + rf + ", " + sv.reg + ";");
+                return map{ reg: rf, ty: "f32" };
+            }
+            let rr = new_r();
+            array_push(body_asm, "    neg.s32 " + rr + ", " + sv.reg + ";");
+            return map{ reg: rr, ty: "i32" };
+        }
+        if ek == "bin" {
+            let op = e.op;
+            // Fuse (x * y + z) directly into PTX mad.rn.f32!
+            if op == "+" and e.left.kind == "bin" and e.left.op == "*" and (e.ty == "f32") {
+                let m0 = ptx_coerce(ptx_expr(e.left.left), "f32");
+                let m1 = ptx_coerce(ptx_expr(e.left.right), "f32");
+                let addend = ptx_coerce(ptx_expr(e.right), "f32");
+                let rf = new_f();
+                array_push(body_asm, "    mad.rn.f32 " + rf + ", " + m0 + ", " + m1 + ", " + addend + ";");
+                return map{ reg: rf, ty: "f32" };
+            }
+            let lv = ptx_expr(e.left);
+            let rv = ptx_expr(e.right);
+            if op == "&&" or op == "and" or op == "||" or op == "or" {
+                let rp = new_p();
+                let lop = if op == "&&" or op == "and" { "and.pred" } else { "or.pred" };
+                array_push(body_asm, "    " + lop + " " + rp + ", " + lv.reg + ", " + rv.reg + ";");
+                return map{ reg: rp, ty: "bool" };
+            }
+            let use_f = lv.ty == "f32" or rv.ty == "f32";
+            let wty = if use_f { "f32" } else { "u32" };
+            let lr = ptx_coerce(lv, wty);
+            let rr = ptx_coerce(rv, wty);
+            if op == "+" or op == "-" or op == "*" or op == "/" or op == "%" {
+                if use_f {
+                    let rf = new_f();
+                    let fop = if op == "+" { "add.f32" } elif op == "-" { "sub.f32" } elif op == "*" { "mul.f32" } else { "div.rn.f32" };
+                    array_push(body_asm, "    " + fop + " " + rf + ", " + lr + ", " + rr + ";");
+                    return map{ reg: rf, ty: "f32" };
+                }
+                let ro = new_r();
+                let uop = if op == "+" { "add.u32" } elif op == "-" { "sub.u32" } elif op == "*" { "mul.lo.u32" } elif op == "/" { "div.u32" } else { "rem.u32" };
+                array_push(body_asm, "    " + uop + " " + ro + ", " + lr + ", " + rr + ";");
+                return map{ reg: ro, ty: "u32" };
+            }
+            let rp = new_p();
+            let cmp = if op == "<" { "lt" } elif op == "<=" { "le" } elif op == ">" { "gt" } elif op == ">=" { "ge" } elif op == "==" { "eq" } else { "ne" };
+            let cty = if use_f { cmp + ".f32" } else { cmp + ".u32" };
+            array_push(body_asm, "    setp." + cty + " " + rp + ", " + lr + ", " + rr + ";");
+            return map{ reg: rp, ty: "bool" };
+        }
+        return map{ reg: "%r1", ty: "u32" };
+    };
+
+    let ptx_stmts = nil;
+    ptx_stmts = fn(stmts) {
+        let si = 0;
+        while si < len(stmts) {
+            let s = stmts[si];
+            if s.kind == "let" or s.kind == "assign" {
+                let rv = ptx_expr(s.expr);
+                let dty = var_ty[s.name];
+                let creg = ptx_coerce(rv, dty);
+                let mty = if dty == "f32" { "mov.f32" } else { "mov.u32" };
+                array_push(body_asm, "    " + mty + " " + var_reg[s.name] + ", " + creg + ";");
+            } elif s.kind == "store_buf" {
+                let iv = ptx_coerce(ptx_expr(s.idx), "u32");
+                let vv = ptx_expr(s.expr);
+                let rd_off = new_rd();
+                let rd_ptr = new_rd();
+                array_push(body_asm, "    mul.wide.u32 " + rd_off + ", " + iv + ", 4;");
+                array_push(body_asm, "    add.s64 " + rd_ptr + ", " + buf_rd[s.buf] + ", " + rd_off + ";");
+                if vv.ty == "f32" or str_ends_with(ir.param_types[s.buf], "f32") {
+                    let vf = ptx_coerce(vv, "f32");
+                    array_push(body_asm, "    st.global.f32 [" + rd_ptr + "], " + vf + ";");
+                } else {
+                    let vu = ptx_coerce(vv, "u32");
+                    array_push(body_asm, "    st.global.u32 [" + rd_ptr + "], " + vu + ";");
+                }
+            } elif s.kind == "barrier" {
+                array_push(body_asm, "    bar.sync 0;");
+            } elif s.kind == "return" {
+                array_push(body_asm, "    ret;");
+            } elif s.kind == "if" {
+                let cv = ptx_expr(s.cond);
+                let lbl_else = new_lbl("else");
+                let lbl_end = new_lbl("endif");
+                array_push(body_asm, "    @!" + cv.reg + " bra " + lbl_else + ";");
+                ptx_stmts(s.then_body);
+                if len(s.else_body) > 0 { array_push(body_asm, "    bra " + lbl_end + ";"); }
+                array_push(body_asm, lbl_else + ":");
+                if len(s.else_body) > 0 {
+                    ptx_stmts(s.else_body);
+                    array_push(body_asm, lbl_end + ":");
+                }
+            } elif s.kind == "while" {
+                let lbl_top = new_lbl("loop");
+                let lbl_done = new_lbl("done");
+                array_push(body_asm, lbl_top + ":");
+                let cv = ptx_expr(s.cond);
+                array_push(body_asm, "    @!" + cv.reg + " bra " + lbl_done + ";");
+                ptx_stmts(s.body);
+                array_push(body_asm, "    bra " + lbl_top + ";");
+                array_push(body_asm, lbl_done + ":");
+            }
+            si = si + 1;
+        }
+    };
+
+    ptx_stmts(ir.body);
+    array_push(body_asm, "    ret;");
+    array_push(out, "    .reg .pred %p<" + str(reg_cnt.p + 1) + ">;");
+    array_push(out, "    .reg .b32  %r<" + str(reg_cnt.r + 1) + ">;");
+    array_push(out, "    .reg .b64  %rd<" + str(reg_cnt.rd + 1) + ">;");
+    array_push(out, "    .reg .f32  %f<" + str(reg_cnt.f + 1) + ">;");
+    array_push(out, "");
+    let bi = 0;
+    while bi < len(body_asm) { array_push(out, body_asm[bi]); bi = bi + 1; }
+    array_push(out, "}");
+    return str_join(out, "\n") + "\n";
+}
+
+// ── 5. Unified Single-Source Compiler Entry & Canonical @gpu Kernel Library ──
+
+fn compile_gpu_kernel(kernel_src, opts = nil) {
+    let ir = parse_gpu_kernel_ir(kernel_src);
+    let spv_words = emit_vulkan_spirv_words(ir);
+    let spv_bytes = emit_vulkan_spirv_bytes(spv_words);
+    let spv_check = validate_spirv_binary(spv_bytes);
+    let wgsl_src = emit_webgpu_wgsl(ir);
+    let ptx_src = emit_cuda_ptx(ir, opts);
+    return map{
+        ok: spv_check.ok,
+        version: COMPILER_VERSION,
+        name: ir.name,
+        workgroup_size: ir.workgroup_size,
+        ir: ir,
+        spirv_words: spv_words,
+        spirv_bytes: spv_bytes,
+        spirv_validation: spv_check,
+        wgsl: wgsl_src,
+        ptx: ptx_src,
+        npu_descriptor: map{
+            kernel_name: ir.name,
+            quant_formats_supported: ["fp32", "fp8_e4m3", "int4_grouped"],
+            deterministic_simd_fallback: true
+        }
+    };
+}
+
+fn standard_gpu_kernel_library() {
+    return map{
+        saxpy: "@gpu(workgroup_size = 256) fn saxpy(a: buf<f32>, b: buf<f32>, out: buf<f32>, alpha: f32, n: u32) { let i: u32 = global_id_x(); if i < n { out[i] = fma(alpha, a[i], b[i]); } }",
+        matmul_tiled: "@gpu(workgroup_size = 64) fn matmul_tiled(a: buf<f32>, b: buf<f32>, out: buf<f32>, m: u32, n: u32, kdim: u32) { let idx: u32 = global_id_x(); let total: u32 = m * n; if idx < total { let row: u32 = idx / n; let col: u32 = idx % n; let acc: f32 = 0.0; let p: u32 = 0; while p < kdim { acc = fma(a[row * kdim + p], b[p * n + col], acc); p = p + 1; } workgroup_barrier(); out[idx] = acc; } }",
+        rmsnorm: "@gpu(workgroup_size = 128) fn rmsnorm(x: buf<f32>, weight: buf<f32>, out: buf<f32>, eps: f32, dim: u32) { let row: u32 = global_id_x(); let base: u32 = row * dim; let ss: f32 = 0.0; let j: u32 = 0; while j < dim { let v: f32 = x[base + j]; ss = fma(v, v, ss); j = j + 1; } let inv: f32 = 1.0 / sqrt(ss / f32(dim) + eps); let t: u32 = 0; while t < dim { out[base + t] = x[base + t] * inv * weight[t]; t = t + 1; } }",
+        rope_rotate: "@gpu(workgroup_size = 128) fn rope_rotate(q: buf<f32>, cos_tab: buf<f32>, sin_tab: buf<f32>, out: buf<f32>, pairs: u32) { let i: u32 = global_id_x(); if i < pairs { let i0: u32 = i * 2; let i1: u32 = i0 + 1; let x0: f32 = q[i0]; let x1: f32 = q[i1]; let cv: f32 = cos_tab[i]; let sv: f32 = sin_tab[i]; out[i0] = x0 * cv - x1 * sv; out[i1] = x0 * sv + x1 * cv; } }",
+        flash_attention_tile: "@gpu(workgroup_size = 64) fn flash_attention_tile(q: buf<f32>, k: buf<f32>, v: buf<f32>, out: buf<f32>, scale: f32, seq_len: u32, d: u32) { let qi: u32 = global_id_x(); if qi < seq_len { let m_prev: f32 = -10000.0; let l_prev: f32 = 0.0; let col: u32 = 0; while col < d { out[qi * d + col] = 0.0; col = col + 1; } let kj: u32 = 0; while kj < seq_len { let dot: f32 = 0.0; let h: u32 = 0; while h < d { dot = fma(q[qi * d + h], k[kj * d + h], dot); h = h + 1; } let s: f32 = dot * scale; let m_new: f32 = max(m_prev, s); let alpha: f32 = exp(m_prev - m_new); let beta: f32 = exp(s - m_new); l_prev = l_prev * alpha + beta; let c2: u32 = 0; while c2 < d { out[qi * d + c2] = out[qi * d + c2] * alpha + beta * v[kj * d + c2]; c2 = c2 + 1; } m_prev = m_new; kj = kj + 1; } let c3: u32 = 0; while c3 < d { out[qi * d + c3] = out[qi * d + c3] / l_prev; c3 = c3 + 1; } } }",
+        quant_int4_dequant_gemv: "@gpu(workgroup_size = 128) fn quant_int4_dequant_gemv(packed_w: buf<u32>, scales: buf<f32>, x: buf<f32>, out: buf<f32>, rows: u32, cols: u32, group_sz: u32) { let r: u32 = global_id_x(); if r < rows { let acc: f32 = 0.0; let c: u32 = 0; while c < cols { let byte_idx: u32 = (r * cols + c) / 2; let shift_n: u32 = ((r * cols + c) % 2) * 4; let nib: u32 = bit_and(bit_shr(packed_w[byte_idx], shift_n), 15); let qv: f32 = f32(nib) - 8.0; let sc: f32 = scales[(r * cols + c) / group_sz]; acc = fma(qv * sc, x[c], acc); c = c + 1; } out[r] = acc; } }"
+    };
+}
+
+// ── 6. Target D: Hardware NPU/GPU Device Prober & Deterministic SIMD Runtime ─
+
+fn probe_npu_and_gpu_devices() {
+    let os_name = str_lower(str(platform()));
+    let accel_nodes = [];
+    let accel_ls = try fs_listdir("/dev/accel") catch nil;
+    if is_array(accel_ls) {
+        let i = 0;
+        while i < len(accel_ls) {
+            if str_starts_with(accel_ls[i], "accel") { array_push(accel_nodes, "/dev/accel/" + accel_ls[i]); }
+            i = i + 1;
+        }
+    }
+    let dri_nodes = [];
+    let dri_ls = try fs_listdir("/dev/dri") catch nil;
+    if is_array(dri_ls) {
+        let j = 0;
+        while j < len(dri_ls) {
+            if str_starts_with(dri_ls[j], "renderD") { array_push(dri_nodes, "/dev/dri/" + dri_ls[j]); }
+            j = j + 1;
+        }
+    }
+    let has_cuda = (try fs_exists("/dev/nvidiactl") catch false) == true or (try fs_exists("/proc/driver/nvidia/version") catch false) == true;
+    let has_apple_ane = str_contains(os_name, "macos") or str_contains(os_name, "darwin");
+
+    let selected = "cpu_simd_deterministic";
+    if len(accel_nodes) > 0 { selected = "linux_npu_accel"; }
+    elif has_apple_ane { selected = "apple_ane_metal"; }
+    elif has_cuda { selected = "nvidia_cuda_ptx"; }
+    elif len(dri_nodes) > 0 { selected = "vulkan_drm_render"; }
+
+    return map{
+        platform: os_name,
+        npu_accel_nodes: accel_nodes,
+        vulkan_render_nodes: dri_nodes,
+        cuda_present: has_cuda,
+        apple_ane_present: has_apple_ane,
+        cpu_simd_fallback_ready: true,
+        preferred_device_tier: selected,
+        execution_backend: "deterministic_simd_universal"
+    };
+}
+
+fn execute_kernel_universal(compiled_or_src, bindings, dispatch_cfg = nil) {
+    let compiled = if is_map(compiled_or_src) and map_has(compiled_or_src, "ir") {
+        compiled_or_src
+    } else {
+        compile_gpu_kernel(str(compiled_or_src), nil)
+    };
+    let ir = compiled.ir;
+    let wg_x = ir.workgroup_size[0];
+    let total_threads = _opt(dispatch_cfg, "total_threads", 0);
+    let grid_x = _opt(dispatch_cfg, "grid_x", 0);
+    if grid_x <= 0 {
+        if total_threads > 0 {
+            grid_x = num_floor((total_threads + wg_x - 1) / wg_x);
+        } else {
+            grid_x = 1;
+        }
+    }
+
+    let eval_e = nil;
+    eval_e = fn(e, env) {
+        let ek = e.kind;
+        if ek == "lit" { return e.val; }
+        if ek == "var" {
+            if map_has(env, e.name) { return env[e.name]; }
+            if map_has(bindings, e.name) { return bindings[e.name]; }
+            return 0;
+        }
+        if ek == "index" {
+            let arr = bindings[e.buf];
+            let ix = num_floor(eval_e(e.idx, env));
+            if ix < 0 or ix >= len(arr) { return 0.0; }
+            return arr[ix];
+        }
+        if ek == "call" {
+            let nm = e.name;
+            if nm == "global_id_x" { return env.__gid_x; }
+            if nm == "global_id_y" { return 0; }
+            if nm == "global_id_z" { return 0; }
+            if nm == "local_id_x" { return env.__lid_x; }
+            if nm == "group_id_x" { return env.__wid_x; }
+            if nm == "workgroup_size_x" { return wg_x; }
+            if nm == "f32" { return eval_e(e.args[0], env) * 1.0; }
+            if nm == "u32" or nm == "i32" { return num_floor(eval_e(e.args[0], env)); }
+            if nm == "fma" { return eval_e(e.args[0], env) * eval_e(e.args[1], env) + eval_e(e.args[2], env); }
+            if nm == "exp" { return num_exp(eval_e(e.args[0], env)); }
+            if nm == "sqrt" { return num_sqrt(eval_e(e.args[0], env)); }
+            if nm == "rsqrt" { return 1.0 / num_sqrt(eval_e(e.args[0], env)); }
+            if nm == "abs" { return num_abs(eval_e(e.args[0], env)); }
+            if nm == "max" { return num_max(eval_e(e.args[0], env), eval_e(e.args[1], env)); }
+            if nm == "min" { return num_min(eval_e(e.args[0], env), eval_e(e.args[1], env)); }
+            if nm == "bit_and" { return _u32(bit_and(num_floor(eval_e(e.args[0], env)), num_floor(eval_e(e.args[1], env)))); }
+            if nm == "bit_or" { return _u32(bit_or(num_floor(eval_e(e.args[0], env)), num_floor(eval_e(e.args[1], env)))); }
+            if nm == "bit_xor" { return _u32(bit_xor(num_floor(eval_e(e.args[0], env)), num_floor(eval_e(e.args[1], env)))); }
+            if nm == "bit_shl" { return _u32(bit_shl(num_floor(eval_e(e.args[0], env)), num_floor(eval_e(e.args[1], env)))); }
+            if nm == "bit_shr" { return _u32(bit_shr(_u32(eval_e(e.args[0], env)), num_floor(eval_e(e.args[1], env)))); }
+            return 0;
+        }
+        if ek == "unary" {
+            let sv = eval_e(e.expr, env);
+            if e.op == "-" { return 0 - sv; }
+            return if sv == 0 or sv == false { 1 } else { 0 };
+        }
+        if ek == "bin" {
+            let lv = eval_e(e.left, env);
+            let op = e.op;
+            if op == "&&" or op == "and" {
+                if lv == 0 or lv == false { return false; }
+                let rv0 = eval_e(e.right, env);
+                return rv0 != 0 and rv0 != false;
+            }
+            if op == "||" or op == "or" {
+                if lv != 0 and lv != false { return true; }
+                let rv1 = eval_e(e.right, env);
+                return rv1 != 0 and rv1 != false;
+            }
+            let rv = eval_e(e.right, env);
+            if op == "+" { return lv + rv; }
+            if op == "-" { return lv - rv; }
+            if op == "*" { return lv * rv; }
+            if op == "/" {
+                if e.ty == "u32" or e.ty == "i32" { return num_floor(lv / rv); }
+                return lv / rv;
+            }
+            if op == "%" { return num_floor(lv) % num_floor(rv); }
+            if op == "<" { return lv < rv; }
+            if op == "<=" { return lv <= rv; }
+            if op == ">" { return lv > rv; }
+            if op == ">=" { return lv >= rv; }
+            if op == "==" { return lv == rv; }
+            if op == "!=" { return lv != rv; }
+        }
+        return 0;
+    };
+
+    let run_stmts = nil;
+    run_stmts = fn(stmts, env) {
+        let k = 0;
+        while k < len(stmts) {
+            if env.__returned { return nil; }
+            let s = stmts[k];
+            if s.kind == "let" or s.kind == "assign" {
+                env[s.name] = eval_e(s.expr, env);
+            } elif s.kind == "store_buf" {
+                let arr = bindings[s.buf];
+                let ix = num_floor(eval_e(s.idx, env));
+                if ix >= 0 and ix < len(arr) {
+                    arr[ix] = eval_e(s.expr, env);
+                }
+            } elif s.kind == "return" {
+                env.__returned = true;
+                return nil;
+            } elif s.kind == "if" {
+                let cv = eval_e(s.cond, env);
+                if cv != 0 and cv != false {
+                    run_stmts(s.then_body, env);
+                } elif len(s.else_body) > 0 {
+                    run_stmts(s.else_body, env);
+                }
+            } elif s.kind == "while" {
+                while not env.__returned {
+                    let cv = eval_e(s.cond, env);
+                    if cv == 0 or cv == false { break; }
+                    run_stmts(s.body, env);
+                }
+            }
+            k = k + 1;
+        }
+    };
+
+    let active_limit = if total_threads > 0 { total_threads } else { grid_x * wg_x };
+    let invoked = 0;
+    let g = 0;
+    while g < grid_x {
+        let lid = 0;
+        while lid < wg_x {
+            let gid = g * wg_x + lid;
+            if gid < active_limit {
+                let env = map{ __gid_x: gid, __lid_x: lid, __wid_x: g, __returned: false };
+                run_stmts(ir.body, env);
+                invoked = invoked + 1;
+            }
+            lid = lid + 1;
+        }
+        g = g + 1;
+    }
+
+    return map{
+        ok: true,
+        kernel: ir.name,
+        grid_x: grid_x,
+        workgroup_size_x: wg_x,
+        threads_executed: invoked,
+        bindings: bindings
+    };
+}
+
+// ── 7. Quantized FP8 (E4M3) + INT4 Codecs & Tiled FlashAttention-3 Runtime ──
+
+// OCP FP8 E4M3 byte codec (1 sign, 4 exp bias=7, 3 mantissa, max finite = 448.0)
+fn _encode_e4m3_byte(x) {
+    if x == 0.0 { return 0; }
+    let sign = 0;
+    let ax = x * 1.0;
+    if ax < 0.0 { sign = 128; ax = 0.0 - ax; }
+    if ax > 448.0 { ax = 448.0; }
+    if ax < 0.001953125 { return sign; }
+    let e = num_floor(num_ln(ax) / 0.6931471805599453);
+    let m_norm = ax / num_pow(2.0, e * 1.0);
+    while m_norm >= 2.0 { m_norm = m_norm * 0.5; e = e + 1; }
+    while m_norm < 1.0 and e > -6 { m_norm = m_norm * 2.0; e = e - 1; }
+    if e < -6 {
+        let sub = num_floor(ax / 0.001953125 + 0.5);
+        if sub > 7 { sub = 7; }
+        return bit_or(sign, sub);
+    }
+    let eb = e + 7;
+    let mb = num_floor((m_norm - 1.0) * 8.0 + 0.5);
+    if mb >= 8 { mb = 0; eb = eb + 1; }
+    if eb >= 15 { eb = 15; if mb > 6 { mb = 6; } }
+    return bit_or(sign, bit_or(bit_shl(eb, 3), bit_and(mb, 7)));
+}
+
+fn _decode_e4m3_byte(b) {
+    let s = if bit_and(b, 128) != 0 { -1.0 } else { 1.0 };
+    let eb = bit_and(bit_shr(b, 3), 15);
+    let mb = bit_and(b, 7);
+    if eb == 0 {
+        if mb == 0 { return 0.0; }
+        return s * (mb * 0.001953125);
+    }
+    return s * (1.0 + mb * 0.125) * num_pow(2.0, (eb - 7) * 1.0);
+}
+
+fn quantize_fp8_e4m3(vec_f32) {
+    let max_abs = 0.0;
+    let i = 0;
+    while i < len(vec_f32) {
+        let a = num_abs(vec_f32[i]);
+        if a > max_abs { max_abs = a; }
+        i = i + 1;
+    }
+    let scale = if max_abs > 0.0 { max_abs / 240.0 } else { 1.0 };
+    let inv_s = 1.0 / scale;
+    let bytes = [];
+    let j = 0;
+    while j < len(vec_f32) {
+        array_push(bytes, _encode_e4m3_byte(vec_f32[j] * inv_s));
+        j = j + 1;
+    }
+    return map{ format: "fp8_e4m3", scale: scale, length: len(vec_f32), bytes: bytes };
+}
+
+fn dequantize_fp8_e4m3(q_fp8) {
+    let out = [];
+    let sc = q_fp8.scale;
+    let bs = q_fp8.bytes;
+    let i = 0;
+    while i < len(bs) {
+        array_push(out, _decode_e4m3_byte(bs[i]) * sc);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn quantize_int4_grouped(vec_f32, group_size = 32) {
+    let gsz = if group_size == nil or group_size <= 0 { 32 } else { group_size };
+    let n = len(vec_f32);
+    let scales = [];
+    let q_nibs = [];
+    let base = 0;
+    while base < n {
+        let end_i = num_min(base + gsz, n);
+        let m_abs = 0.0;
+        let k = base;
+        while k < end_i {
+            let av = num_abs(vec_f32[k]);
+            if av > m_abs { m_abs = av; }
+            k = k + 1;
+        }
+        let sc = if m_abs > 0.0 { m_abs / 7.0 } else { 1.0 };
+        array_push(scales, sc);
+        let t = base;
+        while t < end_i {
+            let q = num_floor(vec_f32[t] / sc + (if vec_f32[t] >= 0.0 { 0.5 } else { -0.5 }));
+            if q < -8 { q = -8; }
+            if q > 7 { q = 7; }
+            array_push(q_nibs, q + 8); // unsigned [0..15]
+            t = t + 1;
+        }
+        base = end_i;
+    }
+    if (len(q_nibs) % 2) != 0 { array_push(q_nibs, 8); }
+    let packed = [];
+    let p = 0;
+    while p < len(q_nibs) {
+        array_push(packed, bit_or(bit_and(q_nibs[p], 15), bit_shl(bit_and(q_nibs[p + 1], 15), 4)));
+        p = p + 2;
+    }
+    return map{ format: "int4_grouped", group_size: gsz, length: n, scales: scales, packed_bytes: packed };
+}
+
+fn dequantize_int4_grouped(q4) {
+    let out = [];
+    let gsz = q4.group_size;
+    let n = q4.length;
+    let pbs = q4.packed_bytes;
+    let i = 0;
+    while i < n {
+        let b = pbs[num_floor(i / 2)];
+        let nib = if (i % 2) == 0 { bit_and(b, 15) } else { bit_and(bit_shr(b, 4), 15) };
+        let sc = q4.scales[num_floor(i / gsz)];
+        array_push(out, (nib - 8) * sc);
+        i = i + 1;
+    }
+    return out;
+}
+
+// FlashAttention-3 Tiled Online-Softmax (supports fp32, fp8_e4m3, int4)
+fn flash_attention3_tiled_online_softmax(q, k, v, seq_len, head_dim, opts = nil) {
+    let prec = str(_opt(opts, "precision", "fp32"));
+    let tile_q = _opt(opts, "tile_q", 4);
+    let tile_kv = _opt(opts, "tile_kv", 4);
+    let causal = _opt(opts, "causal", false) == true;
+    let scale = 1.0 / num_sqrt(head_dim * 1.0);
+
+    let q_work = q;
+    let k_work = k;
+    let v_work = v;
+    if prec == "fp8_e4m3" or prec == "fp8" {
+        q_work = dequantize_fp8_e4m3(quantize_fp8_e4m3(q));
+        k_work = dequantize_fp8_e4m3(quantize_fp8_e4m3(k));
+        v_work = dequantize_fp8_e4m3(quantize_fp8_e4m3(v));
+    } elif prec == "int4" or prec == "int4_grouped" {
+        let gsz = num_max(4, head_dim);
+        q_work = dequantize_int4_grouped(quantize_int4_grouped(q, gsz));
+        k_work = dequantize_int4_grouped(quantize_int4_grouped(k, gsz));
+        v_work = dequantize_int4_grouped(quantize_int4_grouped(v, gsz));
+    }
+
+    let out = [];
+    let z = 0;
+    while z < seq_len * head_dim { array_push(out, 0.0); z = z + 1; }
+
+    let q_start = 0;
+    while q_start < seq_len {
+        let q_end = num_min(q_start + tile_q, seq_len);
+        let row_m = [];
+        let row_l = [];
+        let r = q_start;
+        while r < q_end {
+            array_push(row_m, -1000000000.0);
+            array_push(row_l, 0.0);
+            r = r + 1;
+        }
+
+        let kv_start = 0;
+        while kv_start < seq_len {
+            let kv_end = num_min(kv_start + tile_kv, seq_len);
+            let qi = q_start;
+            while qi < q_end {
+                let loc_r = qi - q_start;
+                let kj = kv_start;
+                while kj < kv_end {
+                    if not (causal and kj > qi) {
+                        let dot = 0.0;
+                        let d = 0;
+                        while d < head_dim {
+                            dot = dot + q_work[qi * head_dim + d] * k_work[kj * head_dim + d];
+                            d = d + 1;
+                        }
+                        let score = dot * scale;
+                        let m_old = row_m[loc_r];
+                        let m_new = num_max(m_old, score);
+                        let alpha = num_exp(m_old - m_new);
+                        let beta = num_exp(score - m_new);
+                        row_l[loc_r] = row_l[loc_r] * alpha + beta;
+                        row_m[loc_r] = m_new;
+                        let d2 = 0;
+                        while d2 < head_dim {
+                            let o_idx = qi * head_dim + d2;
+                            out[o_idx] = out[o_idx] * alpha + beta * v_work[kj * head_dim + d2];
+                            d2 = d2 + 1;
+                        }
+                    }
+                    kj = kj + 1;
+                }
+                qi = qi + 1;
+            }
+            kv_start = kv_end;
+        }
+
+        let qi_f = q_start;
+        while qi_f < q_end {
+            let denom = row_l[qi_f - q_start];
+            let inv_l = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+            let d3 = 0;
+            while d3 < head_dim {
+                let o_idx = qi_f * head_dim + d3;
+                out[o_idx] = out[o_idx] * inv_l;
+                d3 = d3 + 1;
+            }
+            qi_f = qi_f + 1;
+        }
+        q_start = q_end;
+    }
+
+    return map{
+        output: out,
+        precision: prec,
+        seq_len: seq_len,
+        head_dim: head_dim,
+        tile_q: tile_q,
+        tile_kv: tile_kv
+    };
+}
+
+fn flash_attention_fp64_reference(q, k, v, seq_len, head_dim, causal = false) {
+    let scale = 1.0 / num_sqrt(head_dim * 1.0);
+    let out = [];
+    let qi = 0;
+    while qi < seq_len {
+        let scores = [];
+        let max_s = -1000000000.0;
+        let kj = 0;
+        while kj < seq_len {
+            if causal and kj > qi {
+                array_push(scores, -1000000000.0);
+            } else {
+                let dot = 0.0;
+                let d = 0;
+                while d < head_dim {
+                    dot = dot + q[qi * head_dim + d] * k[kj * head_dim + d];
+                    d = d + 1;
+                }
+                let sc = dot * scale;
+                if sc > max_s { max_s = sc; }
+                array_push(scores, sc);
+            }
+            kj = kj + 1;
+        }
+        let probs = [];
+        let p_sum = 0.0;
+        let j2 = 0;
+        while j2 < seq_len {
+            let w = if causal and j2 > qi { 0.0 } else { num_exp(scores[j2] - max_s) };
+            array_push(probs, w);
+            p_sum = p_sum + w;
+            j2 = j2 + 1;
+        }
+        let d2 = 0;
+        while d2 < head_dim {
+            let acc = 0.0;
+            let j3 = 0;
+            while j3 < seq_len {
+                acc = acc + (probs[j3] / p_sum) * v[j3 * head_dim + d2];
+                j3 = j3 + 1;
+            }
+            array_push(out, acc);
+            d2 = d2 + 1;
+        }
+        qi = qi + 1;
+    }
+    return out;
+}
+
+export COMPILER_VERSION, SPIRV_MAGIC, SPIRV_VERSION_1_5;
+export tokenize_gpu_kernel, parse_gpu_kernel_ir, compile_gpu_kernel, standard_gpu_kernel_library;
+export emit_vulkan_spirv_words, emit_vulkan_spirv_bytes, validate_spirv_binary;
+export emit_webgpu_wgsl, emit_cuda_ptx;
+export probe_npu_and_gpu_devices, execute_kernel_universal;
+export quantize_fp8_e4m3, dequantize_fp8_e4m3, quantize_int4_grouped, dequantize_int4_grouped;
+export flash_attention3_tiled_online_softmax, flash_attention_fp64_reference;

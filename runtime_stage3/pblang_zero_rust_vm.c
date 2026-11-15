@@ -39,7 +39,7 @@
 #include <sys/resource.h>
 #endif
 
-#define PBLANG_ZR_VERSION_STR "pblang 4.2.0 (sovereign zero-rust runtime; compat 1.5.0)"
+#define PBLANG_ZR_VERSION_STR "pblang 5.0.0 (sovereign zero-rust runtime; compat 1.5.0)"
 
 static void zr_print_version(void) {
     printf("%s\n", PBLANG_ZR_VERSION_STR);
@@ -2784,6 +2784,10 @@ static void zr_apply_host_oom_protection(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+#endif
     zr_apply_host_oom_protection(argc, argv);
     zr_net_subsystem_init();
 
@@ -2840,11 +2844,47 @@ int main(int argc, char **argv) {
         return rc;
     }
     if (strcmp(sub, "repl") == 0) {
+        bool legacy_c = false;
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--micro") == 0) legacy_c = true;
+        }
+        if (!legacy_c && zr_file_exists_reg("stdlib/devtools/repl_and_ast_formatter.sapp")) {
+            ZrCaps rcaps; zr_caps_allow_all(&rcaps);
+            const char *code = "let R = import(\"stdlib:devtools/repl_and_ast_formatter.sapp\"); R.repl_run_interactive(R.repl_session_new(map{}), nil);";
+            int rc = zr_cmd_eval(self_exe, code, &rcaps, NULL, argc - 2, argv + 2);
+            free(self_exe);
+            return rc;
+        }
         int rc = zr_cmd_repl(self_exe, argc - 2, argv + 2);
         free(self_exe);
         return rc;
     }
     if (strcmp(sub, "fmt") == 0) {
+        if (zr_file_exists_reg("stdlib/devtools/repl_and_ast_formatter.sapp")) {
+            ZrCaps fcaps; zr_caps_allow_all(&fcaps);
+            const char *code =
+                "let F = import(\"stdlib:devtools/repl_and_ast_formatter.sapp\"); "
+                "let a = os_args(); let wr = false; let chk = false; let files = []; let bad = 0; "
+                "let i = 0; while i < len(a) { "
+                "  if a[i] == \"--write\" or a[i] == \"-w\" { wr = true; } "
+                "  elif a[i] == \"--check\" { chk = true; } "
+                "  elif not str_starts_with(a[i], \"-\") { array_push(files, a[i]); } "
+                "  i = i + 1; "
+                "} "
+                "if len(files) == 0 { eprintln(\"Usage: pblang fmt [--write] [--check] <file.sapp...>\"); os_exit(1); } "
+                "let j = 0; while j < len(files) { "
+                "  let p = files[j]; let raw = fs_read(p); let res = F.format_sapp_source(raw, map{}); "
+                "  let fmt_txt = if type(res) == \"map\" { res[\"formatted\"] } else { str(res) }; "
+                "  if chk { if fmt_txt != raw { eprintln(\"fmt --check: '\" + p + \"' needs formatting\"); bad = bad + 1; } } "
+                "  elif wr { if fmt_txt != raw { fs_write(p, fmt_txt); } println(\"Formatted \" + p); } "
+                "  else { print(fmt_txt); } "
+                "  j = j + 1; "
+                "} "
+                "if bad > 0 { os_exit(1); }";
+            int rc = zr_cmd_eval(self_exe, code, &fcaps, NULL, argc - 2, argv + 2);
+            free(self_exe);
+            return rc;
+        }
         int rc = zr_cmd_fmt(argc - 2, argv + 2);
         free(self_exe);
         return rc;
@@ -2861,6 +2901,37 @@ int main(int argc, char **argv) {
     }
     if (strcmp(sub, "debug") == 0) {
         int rc = zr_cmd_debug(self_exe, argc - 2, argv + 2);
+        free(self_exe);
+        return rc;
+    }
+    if (strcmp(sub, "dap") == 0) {
+        ZrCaps dcaps; zr_caps_allow_all(&dcaps);
+        const char *code = "let D = import(\"stdlib:devtools/debugger_timetravel_dap.sapp\"); D.dap_run_stdio_loop();";
+        int rc = zr_cmd_eval(self_exe, code, &dcaps, NULL, argc - 2, argv + 2);
+        free(self_exe);
+        return rc;
+    }
+    if (strcmp(sub, "init") == 0 || strcmp(sub, "pkg") == 0 || strcmp(sub, "bench") == 0) {
+        ZrCaps tcaps; zr_caps_allow_all(&tcaps);
+        char code[256];
+        snprintf(code, sizeof(code),
+                 "let T = import(\"stdlib:devtools/pkg_init_bench_sbom.sapp\"); print json_stringify(T.run_cli_subcommand(\"%s\", os_args()));",
+                 sub);
+        int rc = zr_cmd_eval(self_exe, code, &tcaps, NULL, argc - 2, argv + 2);
+        free(self_exe);
+        return rc;
+    }
+    if (strcmp(sub, "cross-bundle") == 0) {
+        ZrCaps bcaps; zr_caps_allow_all(&bcaps);
+        const char *code =
+            "let B = import(\"stdlib:compiler/hermetic_cross_bundler.sapp\"); "
+            "let a = os_args(); "
+            "if len(a) < 2 { eprintln(\"Usage: pblang cross-bundle <input.sapp|input.pbck> <target> [output_file]\"); os_exit(1); } "
+            "let raw = fs_read_bytes(a[0]); "
+            "let r = B.cross_bundle_executable(raw, a[1], map{}); "
+            "if len(a) >= 3 and r[\"ok\"] { fs_write_bytes(a[2], r[\"bytes\"]); } "
+            "print json_stringify(map{ ok: r[\"ok\"], target: r[\"target\"], format: r[\"format\"], byte_len: r[\"byte_len\"], payload_sha256: r[\"payload_sha256\"] });";
+        int rc = zr_cmd_eval(self_exe, code, &bcaps, NULL, argc - 2, argv + 2);
         free(self_exe);
         return rc;
     }

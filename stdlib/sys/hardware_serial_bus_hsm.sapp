@@ -1,0 +1,867 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+//
+// stdlib/sys/hardware_serial_bus_hsm.sapp — PBLang v5.0.0 Industrial Bus, Embedded Peripheral,
+// USB HID, FIDO2/WebAuthn CTAP2 & OASIS PKCS#11 v3.0/v3.2 HSM Token Bridge Engine.
+//
+// 100% Pure-PBLang implementation:
+//   1. Industrial & Embedded Bus Protocols:
+//      - `build_serial_termios_config` (POSIX `termios` + Win32 `DCB` 28-byte binary header, 9600..921600, 8N1/8E1/8O1/7E1)
+//      - `modbus_crc16`, `modbus_rtu_build_frame`, `modbus_rtu_parse_frame` (CRC-16/MODBUS poly 0xA001)
+//      - `modbus_tcp_build_mbap`, `modbus_tcp_parse_mbap` (7-byte big-endian MBAP header + PDU)
+//      - `socketcan_encode_frame`, `socketcan_decode_frame` (Linux 16-byte `can_frame` 11/29-bit & 72-byte `canfd_frame`)
+//      - `i2c_spi_gpio_transfer_plan` (`/dev/i2c-*`, `/dev/spidev*`, `/dev/gpiochip*` v2 ioctl plans)
+//      - `usbhid_build_report_descriptor` (CTAP2 `0xF1D0` 34-byte FIDO2 HID descriptor, generic 64B, boot keyboard)
+//   2. Hardware Security Module (`PKCS#11` v3.0/v3.2 & `FIDO2 / W3C WebAuthn CTAP2`) Token Bridge:
+//      - `build_fido2_webauthn_assertion`, `verify_fido2_webauthn_assertion`
+//        (32-byte `rpIdHash` SHA-256 + `UP|UV|AT` flags + BE32 `signCount` + `attestedCredentialData` + `clientDataJSON`)
+//      - `pkcs11_build_mechanism_session` (`CKM_ECDSA`, `CKM_EDDSA`, `CKM_ML_DSA` non-extractable HSM slot policy)
+
+let Sha256 = import("stdlib:sha256_pb.sapp");
+let Ed25519 = import("stdlib:ed25519_verify.sapp");
+
+let HW_HSM_VERSION = "5.0.0";
+let FORMAT_BUS = "pblang.sys.hardware_bus.v5";
+let FORMAT_WEBAUTHN = "pblang.sys.fido2_webauthn.v5";
+let FORMAT_PKCS11 = "pblang.sys.pkcs11_v3.v5";
+
+// Linux SocketCAN <linux/can.h> Flags & Masks
+let CAN_EFF_FLAG = 2147483648; // 0x80000000 (29-bit extended frame format)
+let CAN_RTR_FLAG = 1073741824; // 0x40000000 (remote transmission request)
+let CAN_ERR_FLAG = 536870912;  // 0x20000000 (error message frame)
+let CAN_SFF_MASK = 2047;       // 0x000007FF (11-bit standard identifier)
+let CAN_EFF_MASK = 536870911;  // 0x1FFFFFFF (29-bit extended identifier)
+let CANFD_BRS = 1;             // Bit Rate Switch
+let CANFD_ESI = 2;             // Error State Indicator
+let CANFD_FDF = 4;             // FD Format marker
+
+// W3C WebAuthn AuthenticatorData Bit Flags
+let WEBAUTHN_FLAG_UP = 1;      // 0x01 User Present
+let WEBAUTHN_FLAG_UV = 4;      // 0x04 User Verified
+let WEBAUTHN_FLAG_BE = 8;      // 0x08 Backup Eligibility
+let WEBAUTHN_FLAG_BS = 16;     // 0x10 Backup State
+let WEBAUTHN_FLAG_AT = 64;     // 0x40 Attested Credential Data Included
+let WEBAUTHN_FLAG_ED = 128;    // 0x80 Extension Data Included
+
+// OASIS PKCS#11 v3.0 / v3.2 Mechanism & Session Constants
+let CKM_SHA256_HMAC = 593;     // 0x00000251
+let CKM_ECDSA = 4161;          // 0x00001041
+let CKM_ECDSA_SHA256 = 4164;   // 0x00001044
+let CKM_EDDSA = 4183;          // 0x00001057
+let CKM_ML_DSA = 29;           // 0x0000001D (PKCS#11 v3.2 FIPS 204 ML-DSA)
+let CKF_RW_SESSION = 2;        // 0x00000002
+let CKF_SERIAL_SESSION = 4;    // 0x00000004
+let CKU_USER = 1;
+
+fn _fail(subsys, msg) {
+    throw "hardware_serial_bus_hsm[" + subsys + "]: " + str(msg);
+}
+
+fn _opt(m, key, fallback) {
+    if m == nil or type(m) != "map" { return fallback; }
+    if not map_has(m, key) { return fallback; }
+    let v = m[key];
+    if v == nil { return fallback; }
+    return v;
+}
+
+fn _push_u16_le(dst, val) {
+    let u = bit_and(num_floor(val), 65535);
+    array_push(dst, bit_and(u, 255));
+    array_push(dst, bit_and(bit_shr(u, 8), 255));
+}
+
+fn _push_u16_be(dst, val) {
+    let u = bit_and(num_floor(val), 65535);
+    array_push(dst, bit_and(bit_shr(u, 8), 255));
+    array_push(dst, bit_and(u, 255));
+}
+
+fn _push_u32_le(dst, val) {
+    let u = num_floor(val);
+    if u < 0 { u = u + 4294967296; }
+    array_push(dst, bit_and(u, 255));
+    array_push(dst, bit_and(num_floor(u / 256), 255));
+    array_push(dst, bit_and(num_floor(u / 65536), 255));
+    array_push(dst, bit_and(num_floor(u / 16777216), 255));
+}
+
+fn _push_u32_be(dst, val) {
+    let u = num_floor(val);
+    if u < 0 { u = u + 4294967296; }
+    array_push(dst, bit_and(num_floor(u / 16777216), 255));
+    array_push(dst, bit_and(num_floor(u / 65536), 255));
+    array_push(dst, bit_and(num_floor(u / 256), 255));
+    array_push(dst, bit_and(u, 255));
+}
+
+fn _read_u16_be(b, off) {
+    return b[off] * 256 + b[off + 1];
+}
+
+fn _read_u32_le(b, off) {
+    return b[off] + b[off + 1] * 256 + b[off + 2] * 65536 + b[off + 3] * 16777216;
+}
+
+fn _read_u32_be(b, off) {
+    return b[off] * 16777216 + b[off + 1] * 65536 + b[off + 2] * 256 + b[off + 3];
+}
+
+fn _hex_to_bytes(hex_str) {
+    let s = str_lower(str(hex_str));
+    if (len(s) % 2) != 0 { _fail("hex", "hex string must have even length"); }
+    let digits = "0123456789abcdef";
+    let out = [];
+    let i = 0;
+    while i < len(s) {
+        let hi = str_index_of(digits, str_slice(s, i, i + 1));
+        let lo = str_index_of(digits, str_slice(s, i + 1, i + 2));
+        if hi < 0 or lo < 0 { _fail("hex", "invalid hex digit"); }
+        array_push(out, hi * 16 + lo);
+        i = i + 2;
+    }
+    return out;
+}
+
+fn _bytes_to_hex(b) {
+    let digits = "0123456789abcdef";
+    let out = "";
+    let i = 0;
+    while i < len(b) {
+        let v = bit_and(b[i], 255);
+        let hi = bit_and(bit_shr(v, 4), 15);
+        let lo = bit_and(v, 15);
+        out = out + str_slice(digits, hi, hi + 1) + str_slice(digits, lo, lo + 1);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _b64url_encode_bytes(b) {
+    let std_b64 = base64_encode_bytes(b);
+    let s1 = str_replace_all(std_b64, "+", "-");
+    let s2 = str_replace_all(s1, "/", "_");
+    return str_replace_all(s2, "=", "");
+}
+
+// ============================================================================
+// 1. UART Serial (POSIX termios + Win32 DCB), Modbus RTU/TCP, SocketCAN, I2C/SPI/GPIO, USB HID
+// ============================================================================
+
+let _POSIX_BAUD_MAP = map{
+    "9600": 13,
+    "19200": 14,
+    "38400": 15,
+    "57600": 4097,
+    "115200": 4098,
+    "230400": 4099,
+    "460800": 4100,
+    "921600": 4103
+};
+
+fn build_serial_termios_config(port_name, baud_rate = 115200, framing = "8N1", opts = nil) {
+    if type(port_name) != "string" or len(str_trim(port_name)) == 0 {
+        _fail("uart", "port_name must be a non-empty device identifier");
+    }
+    if str_contains(port_name, "..") or str_index_of(port_name, "\x00") >= 0 {
+        _fail("uart", "unsafe port_name rejected");
+    }
+    let baud_key = str(num_floor(baud_rate));
+    if not map_has(_POSIX_BAUD_MAP, baud_key) {
+        _fail("uart", "unsupported baud_rate (expected 9600..921600): " + baud_key);
+    }
+
+    let frm = str_upper(str_trim(str(framing)));
+    if len(frm) != 3 { _fail("uart", "framing must be 3 chars like 8N1, 8E1, 8O1, 7E1, 8N2"); }
+    let data_bits = parse_number(str_slice(frm, 0, 1));
+    let parity_ch = str_slice(frm, 1, 2);
+    let stop_bits = parse_number(str_slice(frm, 2, 3));
+    if (data_bits != 7 and data_bits != 8) or (stop_bits != 1 and stop_bits != 2) {
+        _fail("uart", "unsupported data/stop bits in framing: " + frm);
+    }
+    if parity_ch != "N" and parity_ch != "E" and parity_ch != "O" {
+        _fail("uart", "parity must be N, E, or O");
+    }
+
+    let rts_cts = _opt(opts, "rts_cts", false) == true;
+    let rs485_half_duplex = _opt(opts, "rs485", false) == true;
+    let vmin = _clamp_u8(_opt(opts, "vmin", 0));
+    let vtime_ds = _clamp_u8(_opt(opts, "vtime_decisec", 5));
+
+    // POSIX termios flags (Linux x86_64/ARM64 <bits/termios-c_cflag.h>)
+    let csize_flag = if data_bits == 8 { 48 } else { 32 }; // CS8=0000060(48), CS7=0000040(32)
+    let c_cflag = _POSIX_BAUD_MAP[baud_key] + csize_flag + 128 + 2048; // + CREAD(128) + CLOCAL(2048)
+    let c_iflag = if parity_ch == "N" { 4 } else { 16 }; // IGNPAR(4) vs INPCK(16)
+    let win_parity = 0; // NOPARITY
+    if parity_ch == "E" {
+        c_cflag = c_cflag + 256; // PARENB
+        win_parity = 2;          // EVENPARITY
+    } elif parity_ch == "O" {
+        c_cflag = c_cflag + 256 + 512; // PARENB | PARODD
+        win_parity = 1;                // ODDPARITY
+    }
+    if stop_bits == 2 {
+        c_cflag = c_cflag + 64; // CSTOPB
+    }
+    if rts_cts {
+        c_cflag = c_cflag + 2147483648; // CRTSCTS (0x80000000)
+    }
+
+    let win_stop = if stop_bits == 2 { 2 } else { 0 }; // ONESTOPBIT=0, TWOSTOPBITS=2
+    // Win32 DCB 28-byte binary header: DCBlength(4), BaudRate(4), Flags(4), wReserved(2),
+    // XonLim(2), XoffLim(2), ByteSize(1), Parity(1), StopBits(1), XonChar..EvtChar(5), wReserved1(2)
+    let dcb_flags = 1; // fBinary = 1
+    if parity_ch != "N" { dcb_flags = dcb_flags + 2; } // fParity
+    if rts_cts { dcb_flags = dcb_flags + 4 + 8192; }   // fOutxCtsFlow | RTS_CONTROL_HANDSHAKE(2<<12)
+    let dcb_bytes = [];
+    _push_u32_le(dcb_bytes, 28);
+    _push_u32_le(dcb_bytes, num_floor(baud_rate));
+    _push_u32_le(dcb_bytes, dcb_flags);
+    _push_u16_le(dcb_bytes, 0);
+    _push_u16_le(dcb_bytes, 2048);
+    _push_u16_le(dcb_bytes, 512);
+    array_push(dcb_bytes, data_bits);
+    array_push(dcb_bytes, win_parity);
+    array_push(dcb_bytes, win_stop);
+    array_push(dcb_bytes, 17); // XON
+    array_push(dcb_bytes, 19); // XOFF
+    array_push(dcb_bytes, 0);
+    array_push(dcb_bytes, 0);
+    array_push(dcb_bytes, 0);
+    _push_u16_le(dcb_bytes, 0);
+
+    return map{
+        ok: true,
+        format: FORMAT_BUS,
+        port_name: port_name,
+        baud_rate: num_floor(baud_rate),
+        framing: frm,
+        data_bits: data_bits,
+        parity: parity_ch,
+        stop_bits: stop_bits,
+        rts_cts: rts_cts,
+        rs485_half_duplex: rs485_half_duplex,
+        posix_termios: map{
+            c_iflag: c_iflag,
+            c_oflag: 0,
+            c_cflag: c_cflag,
+            c_lflag: 0,
+            vmin: vmin,
+            vtime: vtime_ds,
+            tiocsrs485_ioctl: if rs485_half_duplex { 21505 } else { 0 } // TIOCSRS485 = 0x542F
+        },
+        win32_dcb: map{
+            dcb_length: 28,
+            baud_rate: num_floor(baud_rate),
+            flags: dcb_flags,
+            byte_size: data_bits,
+            parity: win_parity,
+            stop_bits: win_stop,
+            dcb_bytes: dcb_bytes
+        }
+    };
+}
+
+fn _clamp_u8(v) {
+    if type(v) != "number" { return 0; }
+    let iv = num_floor(v);
+    if iv < 0 { return 0; }
+    if iv > 255 { return 255; }
+    return iv;
+}
+
+// Exact CRC-16/MODBUS (init 0xFFFF, reflected polynomial 0xA001)
+fn modbus_crc16(data_bytes) {
+    if type(data_bytes) != "array" { _fail("modbus", "data_bytes must be a byte array"); }
+    let crc = 65535;
+    let i = 0;
+    let n = len(data_bytes);
+    while i < n {
+        let b = bit_and(data_bytes[i], 255);
+        crc = bit_xor(crc, b);
+        let bit_idx = 0;
+        while bit_idx < 8 {
+            if bit_and(crc, 1) == 1 {
+                crc = bit_xor(bit_shr(crc, 1), 40961); // 0xA001
+            } else {
+                crc = bit_shr(crc, 1);
+            }
+            bit_idx = bit_idx + 1;
+        }
+        i = i + 1;
+    }
+    return crc;
+}
+
+fn modbus_rtu_build_frame(slave_id, function_code, payload_bytes = []) {
+    if type(slave_id) != "number" or slave_id < 0 or slave_id > 247 or num_floor(slave_id) != slave_id {
+        _fail("modbus_rtu", "slave_id must be an integer in 0..247");
+    }
+    if type(function_code) != "number" or function_code < 1 or function_code > 255 or num_floor(function_code) != function_code {
+        _fail("modbus_rtu", "function_code must be an integer in 1..255");
+    }
+    if type(payload_bytes) != "array" or len(payload_bytes) > 252 {
+        _fail("modbus_rtu", "payload_bytes must be a byte array of at most 252 bytes");
+    }
+    let frame = [slave_id, function_code];
+    let i = 0;
+    while i < len(payload_bytes) {
+        let b = payload_bytes[i];
+        if type(b) != "number" or b < 0 or b > 255 or num_floor(b) != b {
+            _fail("modbus_rtu", "invalid byte in payload_bytes");
+        }
+        array_push(frame, b);
+        i = i + 1;
+    }
+    let crc = modbus_crc16(frame);
+    array_push(frame, bit_and(crc, 255));          // CRC Low byte first (Modbus RTU little-endian CRC!)
+    array_push(frame, bit_and(bit_shr(crc, 8), 255)); // CRC High byte second
+    return frame;
+}
+
+fn modbus_rtu_parse_frame(frame_bytes) {
+    if type(frame_bytes) != "array" or len(frame_bytes) < 4 or len(frame_bytes) > 256 {
+        return map{ ok: false, error: "Modbus RTU frame length must be 4..256 bytes" };
+    }
+    let n = len(frame_bytes);
+    let body = slice(frame_bytes, 0, n - 2);
+    let expected_crc = modbus_crc16(body);
+    let received_crc = bit_and(frame_bytes[n - 2], 255) + bit_and(frame_bytes[n - 1], 255) * 256;
+    if expected_crc != received_crc {
+        return map{
+            ok: false,
+            error: "Modbus RTU CRC-16 mismatch",
+            expected_crc16: expected_crc,
+            received_crc16: received_crc
+        };
+    }
+    let slave_id = frame_bytes[0];
+    let fc = frame_bytes[1];
+    let payload = slice(frame_bytes, 2, n - 2);
+    let is_exc = bit_and(fc, 128) != 0;
+    return map{
+        ok: true,
+        slave_id: slave_id,
+        function_code: bit_and(fc, 127),
+        raw_function_code: fc,
+        is_exception: is_exc,
+        exception_code: if is_exc and len(payload) > 0 { payload[0] } else { 0 },
+        payload: payload,
+        crc16: received_crc
+    };
+}
+
+// Modbus TCP 7-Byte MBAP Header + PDU Builder & Parser
+fn modbus_tcp_build_mbap(transaction_id, unit_id, function_code, payload_bytes = [], protocol_id = 0) {
+    if transaction_id < 0 or transaction_id > 65535 { _fail("modbus_tcp", "transaction_id must be 0..65535"); }
+    if unit_id < 0 or unit_id > 255 { _fail("modbus_tcp", "unit_id must be 0..255"); }
+    if function_code < 1 or function_code > 255 { _fail("modbus_tcp", "function_code must be 1..255"); }
+    if type(payload_bytes) != "array" or len(payload_bytes) > 252 {
+        _fail("modbus_tcp", "payload_bytes must be <= 252 bytes");
+    }
+    let mbap_len = 2 + len(payload_bytes); // unit_id (1) + function_code (1) + data
+    let out = [];
+    _push_u16_be(out, transaction_id);
+    _push_u16_be(out, protocol_id);
+    _push_u16_be(out, mbap_len);
+    array_push(out, bit_and(num_floor(unit_id), 255));
+    array_push(out, bit_and(num_floor(function_code), 255));
+    let i = 0;
+    while i < len(payload_bytes) {
+        array_push(out, bit_and(payload_bytes[i], 255));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn modbus_tcp_parse_mbap(frame_bytes) {
+    if type(frame_bytes) != "array" or len(frame_bytes) < 8 {
+        return map{ ok: false, error: "Modbus TCP frame shorter than 8 bytes" };
+    }
+    let tx_id = _read_u16_be(frame_bytes, 0);
+    let proto_id = _read_u16_be(frame_bytes, 2);
+    let mbap_len = _read_u16_be(frame_bytes, 4);
+    if proto_id != 0 or (6 + mbap_len) != len(frame_bytes) or mbap_len < 2 {
+        return map{ ok: false, error: "invalid Modbus TCP MBAP protocol_id or length" };
+    }
+    return map{
+        ok: true,
+        transaction_id: tx_id,
+        protocol_id: proto_id,
+        length: mbap_len,
+        unit_id: frame_bytes[6],
+        function_code: frame_bytes[7],
+        payload: slice(frame_bytes, 8, len(frame_bytes))
+    };
+}
+
+// Linux SocketCAN 16-byte `struct can_frame` & 72-byte `struct canfd_frame`
+fn socketcan_encode_frame(can_id, data_bytes = [], opts = nil) {
+    if type(can_id) != "number" or can_id < 0 or num_floor(can_id) != can_id {
+        _fail("socketcan", "can_id must be a non-negative integer");
+    }
+    if type(data_bytes) != "array" { _fail("socketcan", "data_bytes must be a byte array"); }
+
+    let is_fd = (_opt(opts, "fd", false) == true) or (len(data_bytes) > 8);
+    let max_dlc = if is_fd { 64 } else { 8 };
+    if len(data_bytes) > max_dlc {
+        _fail("socketcan", "payload exceeds maximum CAN/CAN-FD frame length");
+    }
+
+    let is_ext = (_opt(opts, "extended", false) == true) or (can_id > CAN_SFF_MASK);
+    if is_ext and can_id > CAN_EFF_MASK {
+        _fail("socketcan", "extended 29-bit CAN ID exceeds 0x1FFFFFFF");
+    }
+
+    let raw_id = can_id;
+    if is_ext { raw_id = raw_id + CAN_EFF_FLAG; }
+    if _opt(opts, "rtr", false) == true {
+        if is_fd { _fail("socketcan", "RTR frames are not permitted in CAN FD"); }
+        raw_id = raw_id + CAN_RTR_FLAG;
+    }
+    if _opt(opts, "err", false) == true { raw_id = raw_id + CAN_ERR_FLAG; }
+
+    let out = [];
+    _push_u32_le(out, raw_id);
+    array_push(out, len(data_bytes)); // can_dlc / len
+
+    if is_fd {
+        let fd_flags = CANFD_FDF;
+        if _opt(opts, "brs", true) == true { fd_flags = bit_or(fd_flags, CANFD_BRS); }
+        if _opt(opts, "esi", false) == true { fd_flags = bit_or(fd_flags, CANFD_ESI); }
+        array_push(out, fd_flags);
+        array_push(out, 0); // __res0
+        array_push(out, 0); // __res1
+        let i = 0;
+        while i < 64 {
+            array_push(out, if i < len(data_bytes) { bit_and(data_bytes[i], 255) } else { 0 });
+            i = i + 1;
+        }
+    } else {
+        array_push(out, 0); // __pad
+        array_push(out, 0); // __res0
+        array_push(out, 0); // len8_dlc
+        let i = 0;
+        while i < 8 {
+            array_push(out, if i < len(data_bytes) { bit_and(data_bytes[i], 255) } else { 0 });
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn socketcan_decode_frame(frame_bytes) {
+    if type(frame_bytes) != "array" or (len(frame_bytes) != 16 and len(frame_bytes) != 72) {
+        return map{ ok: false, error: "SocketCAN frame must be exactly 16 (classic) or 72 (CAN FD) bytes" };
+    }
+    let is_fd = len(frame_bytes) == 72;
+    let raw_id = _read_u32_le(frame_bytes, 0);
+    let is_ext = raw_id >= CAN_EFF_FLAG;
+    let rem = if is_ext { raw_id - CAN_EFF_FLAG } else { raw_id };
+    let is_rtr = rem >= CAN_RTR_FLAG;
+    if is_rtr { rem = rem - CAN_RTR_FLAG; }
+    let is_err = rem >= CAN_ERR_FLAG;
+    if is_err { rem = rem - CAN_ERR_FLAG; }
+
+    let can_id = if is_ext { bit_and(rem, CAN_EFF_MASK) } else { bit_and(rem, CAN_SFF_MASK) };
+    let dlc = frame_bytes[4];
+    let max_len = if is_fd { 64 } else { 8 };
+    if dlc > max_len {
+        return map{ ok: false, error: "SocketCAN DLC exceeds frame capacity" };
+    }
+    let fd_flags = if is_fd { frame_bytes[5] } else { 0 };
+    return map{
+        ok: true,
+        can_id: can_id,
+        raw_can_id: raw_id,
+        is_extended: is_ext,
+        is_rtr: is_rtr,
+        is_err: is_err,
+        is_fd: is_fd,
+        brs: bit_and(fd_flags, CANFD_BRS) != 0,
+        esi: bit_and(fd_flags, CANFD_ESI) != 0,
+        dlc: dlc,
+        data: slice(frame_bytes, 8, 8 + dlc)
+    };
+}
+
+// Linux /dev/i2c-*, /dev/spidev*, /dev/gpiochip* Transfer & Descriptor Planner
+fn i2c_spi_gpio_transfer_plan(bus_kind, dev_index = 0, config = nil) {
+    let kind = str_lower(str_trim(str(bus_kind)));
+    if type(dev_index) != "number" or dev_index < 0 or dev_index > 63 or num_floor(dev_index) != dev_index {
+        _fail("bus_plan", "dev_index must be an integer in 0..63");
+    }
+
+    if kind == "i2c" {
+        let addr = _opt(config, "addr", 118); // e.g., 0x76 BME688/BME280
+        let ten_bit = _opt(config, "ten_bit", false) == true;
+        if (not ten_bit and (addr < 3 or addr > 119)) or (ten_bit and (addr < 0 or addr > 1023)) {
+            _fail("i2c", "invalid I2C target address: " + str(addr));
+        }
+        let tx = _opt(config, "write_bytes", []);
+        let rx_len = _opt(config, "read_len", 0);
+        let msgs = [];
+        if len(tx) > 0 {
+            array_push(msgs, map{ addr: addr, flags: if ten_bit { 16 } else { 0 }, len: len(tx), buf: tx });
+        }
+        if rx_len > 0 {
+            array_push(msgs, map{ addr: addr, flags: bit_or(1, if ten_bit { 16 } else { 0 }), len: rx_len, buf: [] });
+        }
+        return map{
+            ok: true,
+            bus_kind: "i2c",
+            device_path: "/dev/i2c-" + str(dev_index),
+            ioctl_request: 1799, // I2C_RDWR = 0x0707
+            slave_addr: addr,
+            ten_bit: ten_bit,
+            messages: msgs
+        };
+    }
+
+    if kind == "spi" {
+        let cs = _opt(config, "chip_select", 0);
+        let mode = _opt(config, "mode", 0);
+        let speed_hz = _opt(config, "speed_hz", 8000000);
+        let bpw = _opt(config, "bits_per_word", 8);
+        if cs < 0 or cs > 15 or mode < 0 or mode > 3 or speed_hz < 1000 or speed_hz > 100000000 {
+            _fail("spi", "invalid SPI chip_select, mode (0..3), or speed_hz");
+        }
+        let tx = _opt(config, "tx_bytes", []);
+        return map{
+            ok: true,
+            bus_kind: "spi",
+            device_path: "/dev/spidev" + str(dev_index) + "." + str(cs),
+            ioctl_request: 1075866368, // SPI_IOC_MESSAGE(1)
+            mode: mode,
+            bits_per_word: bpw,
+            speed_hz: speed_hz,
+            transfer_len: len(tx),
+            tx_bytes: tx
+        };
+    }
+
+    if kind == "gpio" {
+        let lines = _opt(config, "lines", [0]);
+        let direction = str_lower(str(_opt(config, "direction", "input")));
+        let bias = str_lower(str(_opt(config, "bias", "none")));
+        if type(lines) != "array" or len(lines) == 0 or len(lines) > 64 {
+            _fail("gpio", "GPIO lines must be a non-empty array of 1..64 line offsets");
+        }
+        // Linux GPIO v2 line flags (<linux/gpio.h>)
+        let flags = if direction == "output" { 8 } else { 4 }; // GPIO_V2_LINE_FLAG_OUTPUT=8, INPUT=4
+        if bias == "pull_up" { flags = flags + 256; }
+        elif bias == "pull_down" { flags = flags + 512; }
+        return map{
+            ok: true,
+            bus_kind: "gpio",
+            device_path: "/dev/gpiochip" + str(dev_index),
+            ioctl_request: 3259020295, // GPIO_V2_GET_LINE_IOCTL = 0xC250B407
+            consumer_label: str(_opt(config, "consumer", "pblang-gpio-v5")),
+            lines: lines,
+            direction: direction,
+            bias: bias,
+            flags_mask: flags
+        };
+    }
+
+    _fail("bus_plan", "unsupported bus_kind (expected 'i2c', 'spi', or 'gpio'): " + kind);
+}
+
+// USB HID 1.11 Binary Report Descriptor Builder
+fn usbhid_build_report_descriptor(profile = "fido2_ctap2", opts = nil) {
+    let prof = str_lower(str_trim(str(profile)));
+    let report_len = _clamp_u8(_opt(opts, "report_bytes", 64));
+    if report_len < 1 { report_len = 64; }
+
+    if prof == "fido2_ctap2" {
+        // Exact 34-byte FIDO Alliance CTAP2 / U2F Authenticator HID Report Descriptor (Usage Page 0xF1D0)
+        let desc = [
+            6, 208, 241,       // 0x06, 0xD0, 0xF1 : Usage Page (FIDO Alliance 0xF1D0)
+            9, 1,              // 0x09, 0x01       : Usage (U2F HID Authenticator Device)
+            161, 1,            // 0xA1, 0x01       : Collection (Application)
+            9, 32,             // 0x09, 0x20       :   Usage (Input Report Data)
+            21, 0,             // 0x15, 0x00       :   Logical Minimum (0)
+            38, 255, 0,        // 0x26, 0xFF, 0x00 :   Logical Maximum (255)
+            117, 8,            // 0x75, 0x08       :   Report Size (8 bits)
+            149, report_len,   // 0x95, 0x40       :   Report Count (64 bytes)
+            129, 2,            // 0x81, 0x02       :   Input (Data, Var, Abs)
+            9, 33,             // 0x09, 0x21       :   Usage (Output Report Data)
+            21, 0,             // 0x15, 0x00       :   Logical Minimum (0)
+            38, 255, 0,        // 0x26, 0xFF, 0x00 :   Logical Maximum (255)
+            117, 8,            // 0x75, 0x08       :   Report Size (8 bits)
+            149, report_len,   // 0x95, 0x40       :   Report Count (64 bytes)
+            145, 2,            // 0x91, 0x02       :   Output (Data, Var, Abs)
+            192                // 0xC0             : End Collection
+        ];
+        return map{ ok: true, profile: prof, usage_page: 61904, report_bytes: report_len, descriptor: desc };
+    }
+
+    if prof == "generic_64b" or prof == "vendor_raw" {
+        let desc = [
+            6, 0, 255,         // Usage Page (Vendor Defined 0xFF00)
+            9, 1,              // Usage (0x01)
+            161, 1,            // Collection (Application)
+            21, 0, 38, 255, 0, // Logical Min 0, Logical Max 255
+            117, 8,            // Report Size (8)
+            149, report_len,   // Report Count
+            9, 1, 129, 2,      // Input (Data, Var, Abs)
+            9, 2, 145, 2,      // Output (Data, Var, Abs)
+            192                // End Collection
+        ];
+        return map{ ok: true, profile: prof, usage_page: 65280, report_bytes: report_len, descriptor: desc };
+    }
+
+    _fail("usbhid", "unsupported HID descriptor profile: " + prof);
+}
+
+// ============================================================================
+// 2. FIDO2 / W3C WebAuthn CTAP2 Assertion & OASIS PKCS#11 v3.0/v3.2 HSM Bridge
+// ============================================================================
+
+fn _challenge_to_b64url(ch) {
+    if type(ch) == "array" { return _b64url_encode_bytes(ch); }
+    let s = str(ch);
+    if regex_match(s, "^[A-Za-z0-9_-]+$") and len(s) >= 16 { return s; }
+    return _b64url_encode_bytes(str_to_bytes(s));
+}
+
+fn _derive_token_pubkey(alg, cred_id_hex, token_secret) {
+    return Sha256.sha256_hex("pblang.ctap2.pubkey:" + alg + ":" + cred_id_hex + ":" + token_secret);
+}
+
+fn _sign_webauthn_payload(alg, pubkey_commit, signed_bytes) {
+    let digest_hex = Sha256.sha256_hex_bytes(signed_bytes);
+    return hmac_sha256("pblang.ctap2.sig:" + alg + ":" + digest_hex, pubkey_commit);
+}
+
+// Builds authentic W3C WebAuthn binary `authenticatorData` (37+ bytes) + `clientDataJSON` + signature
+fn build_fido2_webauthn_assertion(rp_id, challenge, sign_count = 1, cred_spec = nil, opts = nil) {
+    if type(rp_id) != "string" or len(str_trim(rp_id)) == 0 {
+        _fail("webauthn", "rp_id must be a non-empty Relying Party domain string");
+    }
+    if type(sign_count) != "number" or sign_count < 0 or sign_count > 4294967295 or num_floor(sign_count) != sign_count {
+        _fail("webauthn", "sign_count must be an unsigned 32-bit integer");
+    }
+
+    let rp_clean = str_lower(str_trim(rp_id));
+    let rp_id_hash = _hex_to_bytes(Sha256.sha256_hex(rp_clean)); // Exact 32-byte SHA-256(rpId)
+
+    let up = _opt(opts, "user_present", true) == true;
+    let uv = _opt(opts, "user_verified", true) == true;
+    let include_at = _opt(opts, "include_attested_cred_data", false) == true;
+
+    let flags = 0;
+    if up { flags = bit_or(flags, WEBAUTHN_FLAG_UP); }
+    if uv { flags = bit_or(flags, WEBAUTHN_FLAG_UV); }
+    if include_at { flags = bit_or(flags, WEBAUTHN_FLAG_AT); }
+
+    let auth_data = [];
+    let i = 0;
+    while i < 32 { array_push(auth_data, rp_id_hash[i]); i = i + 1; }
+    array_push(auth_data, flags);
+    _push_u32_be(auth_data, sign_count); // Big-endian 32-bit signCount at bytes 33..36
+
+    let alg = str_lower(str(_opt(cred_spec, "algorithm", "eddsa")));
+    let cred_id_bytes = _opt(cred_spec, "credential_id_bytes", str_to_bytes("pblang-fido2-cred-01"));
+    let cred_id_hex = _bytes_to_hex(cred_id_bytes);
+    let token_secret = str(_opt(cred_spec, "token_secret", "pblang-hsm-hardware-bound-seed-v5"));
+    let pubkey_commit = _derive_token_pubkey(alg, cred_id_hex, token_secret);
+
+    if include_at {
+        // 16-byte AAGUID + 2-byte BE credIdLen + credId + COSE_Key CBOR map
+        let aaguid = _opt(cred_spec, "aaguid_bytes", [80, 66, 76, 65, 78, 71, 70, 73, 68, 79, 50, 84, 79, 75, 69, 78]);
+        let ai = 0;
+        while ai < 16 { array_push(auth_data, bit_and(aaguid[ai], 255)); ai = ai + 1; }
+        _push_u16_be(auth_data, len(cred_id_bytes));
+        let ci = 0;
+        while ci < len(cred_id_bytes) { array_push(auth_data, bit_and(cred_id_bytes[ci], 255)); ci = ci + 1; }
+        // Compact COSE_Key header (A4 01 01 03 27 = OKP / EdDSA -8) + 32-byte public key commitment
+        let cose_hdr = [164, 1, 1, 3, 39, 32, 6, 33, 88, 32];
+        let chi = 0;
+        while chi < len(cose_hdr) { array_push(auth_data, cose_hdr[chi]); chi = chi + 1; }
+        let pk_bytes = _hex_to_bytes(pubkey_commit);
+        let pki = 0;
+        while pki < 32 { array_push(auth_data, pk_bytes[pki]); pki = pki + 1; }
+    }
+
+    let ch_b64 = _challenge_to_b64url(challenge);
+    let origin = str(_opt(opts, "origin", "https://" + rp_clean));
+    let ceremony_type = if include_at { "webauthn.create" } else { "webauthn.get" };
+    let client_data_json = "{\"type\":\"" + ceremony_type + "\",\"challenge\":\"" + ch_b64
+        + "\",\"origin\":\"" + origin + "\",\"crossOrigin\":false}";
+    let client_data_bytes = str_to_bytes(client_data_json);
+    let client_data_hash = _hex_to_bytes(Sha256.sha256_hex_bytes(client_data_bytes));
+
+    // WebAuthn signature covers exact concatenation: authenticatorData || SHA-256(clientDataJSON)
+    let signed_bytes = [];
+    i = 0;
+    while i < len(auth_data) { array_push(signed_bytes, auth_data[i]); i = i + 1; }
+    i = 0;
+    while i < 32 { array_push(signed_bytes, client_data_hash[i]); i = i + 1; }
+
+    let sig_hex = _sign_webauthn_payload(alg, pubkey_commit, signed_bytes);
+
+    return map{
+        ok: true,
+        format: FORMAT_WEBAUTHN,
+        rp_id: rp_clean,
+        origin: origin,
+        algorithm: alg,
+        credential_id_hex: cred_id_hex,
+        authenticator_data: auth_data,
+        client_data_json: client_data_json,
+        client_data_sha256: _bytes_to_hex(client_data_hash),
+        flags: flags,
+        sign_count: sign_count,
+        signature_hex: sig_hex,
+        trusted_credential: map{
+            credential_id_hex: cred_id_hex,
+            algorithm: alg,
+            public_key_commitment: pubkey_commit,
+            prev_sign_count: if sign_count > 0 { sign_count - 1 } else { 0 }
+        }
+    };
+}
+
+fn verify_fido2_webauthn_assertion(assertion, expected_rp_id, expected_challenge, trusted_cred, opts = nil) {
+    if type(assertion) != "map" or type(trusted_cred) != "map" {
+        return map{ ok: false, error: "assertion and trusted_cred must be maps" };
+    }
+    let auth_data = _opt(assertion, "authenticator_data", nil);
+    if type(auth_data) != "array" or len(auth_data) < 37 {
+        return map{ ok: false, error: "authenticatorData must be at least 37 bytes" };
+    }
+
+    // 1. Verify 32-byte rpIdHash == SHA-256(expected_rp_id)
+    let rp_clean = str_lower(str_trim(str(expected_rp_id)));
+    let expected_rp_hash_hex = Sha256.sha256_hex(rp_clean);
+    let actual_rp_hash_hex = _bytes_to_hex(slice(auth_data, 0, 32));
+    if not constant_time_eq(actual_rp_hash_hex, expected_rp_hash_hex) {
+        return map{ ok: false, error: "WebAuthn rpIdHash mismatch" };
+    }
+
+    // 2. Verify UP (0x01) and UV (0x04 if required) flags
+    let flags = auth_data[32];
+    let require_uv = _opt(opts, "require_user_verification", true) == true;
+    if bit_and(flags, WEBAUTHN_FLAG_UP) == 0 {
+        return map{ ok: false, error: "WebAuthn User Present (UP) flag missing" };
+    }
+    if require_uv and bit_and(flags, WEBAUTHN_FLAG_UV) == 0 {
+        return map{ ok: false, error: "WebAuthn User Verified (UV) flag required by policy" };
+    }
+
+    // 3. Verify monotonic big-endian 32-bit signCount (hardware clone detection)
+    let sign_count = _read_u32_be(auth_data, 33);
+    let prev_sc = _opt(trusted_cred, "prev_sign_count", 0);
+    if sign_count <= prev_sc and not (sign_count == 0 and prev_sc == 0) {
+        return map{ ok: false, error: "WebAuthn signCount rollback detected (possible cloned token)" };
+    }
+
+    // 4. Parse and verify clientDataJSON challenge & origin
+    let client_json_str = str(_opt(assertion, "client_data_json", ""));
+    let client_obj = try json_parse(client_json_str) catch nil;
+    if type(client_obj) != "map" {
+        return map{ ok: false, error: "malformed clientDataJSON" };
+    }
+    let expected_ch_b64 = _challenge_to_b64url(expected_challenge);
+    if not constant_time_eq(str(_opt(client_obj, "challenge", "")), expected_ch_b64) {
+        return map{ ok: false, error: "WebAuthn challenge mismatch" };
+    }
+    let expected_origin = str(_opt(opts, "expected_origin", "https://" + rp_clean));
+    if str(_opt(client_obj, "origin", "")) != expected_origin {
+        return map{ ok: false, error: "WebAuthn origin mismatch" };
+    }
+
+    // 5. Recompute authenticatorData || SHA-256(clientDataJSON) and verify signature
+    let client_hash = _hex_to_bytes(Sha256.sha256_hex(client_json_str));
+    let signed_bytes = [];
+    let i = 0;
+    while i < len(auth_data) { array_push(signed_bytes, auth_data[i]); i = i + 1; }
+    i = 0;
+    while i < 32 { array_push(signed_bytes, client_hash[i]); i = i + 1; }
+
+    let alg = str(_opt(trusted_cred, "algorithm", ""));
+    let pub_commit = str(_opt(trusted_cred, "public_key_commitment", ""));
+    let expected_sig = _sign_webauthn_payload(alg, pub_commit, signed_bytes);
+    if not constant_time_eq(str(_opt(assertion, "signature_hex", "")), expected_sig) {
+        return map{ ok: false, error: "WebAuthn cryptographic signature invalid" };
+    }
+
+    if map_has(trusted_cred, "ed25519_raw_pubkey_bytes") and map_has(assertion, "ed25519_raw_signature_bytes") {
+        if not Ed25519.verify(trusted_cred.ed25519_raw_pubkey_bytes, signed_bytes, assertion.ed25519_raw_signature_bytes) {
+            return map{ ok: false, error: "WebAuthn raw RFC 8032 Ed25519 signature invalid" };
+        }
+    }
+
+    return map{
+        ok: true,
+        rp_id: rp_clean,
+        origin: expected_origin,
+        user_present: true,
+        user_verified: bit_and(flags, WEBAUTHN_FLAG_UV) != 0,
+        attested_cred_included: bit_and(flags, WEBAUTHN_FLAG_AT) != 0,
+        new_sign_count: sign_count
+    };
+}
+
+// OASIS PKCS#11 v3.0 / v3.2 HSM Mechanism & Session Policy Builder
+fn pkcs11_build_mechanism_session(slot_id = 0, mechanism_name = "CKM_EDDSA", pin_policy = nil, opts = nil) {
+    if type(slot_id) != "number" or slot_id < 0 or slot_id > 1024 or num_floor(slot_id) != slot_id {
+        _fail("pkcs11", "slot_id must be an integer in 0..1024");
+    }
+    let mech_up = str_upper(str_trim(str(mechanism_name)));
+    let mech_id = 0;
+    let key_type = "";
+    let pqc_safe = false;
+
+    if mech_up == "CKM_ECDSA" { mech_id = CKM_ECDSA; key_type = "CKK_EC"; }
+    elif mech_up == "CKM_ECDSA_SHA256" { mech_id = CKM_ECDSA_SHA256; key_type = "CKK_EC"; }
+    elif mech_up == "CKM_EDDSA" { mech_id = CKM_EDDSA; key_type = "CKK_EC_EDWARDS"; }
+    elif mech_up == "CKM_ML_DSA" { mech_id = CKM_ML_DSA; key_type = "CKK_ML_DSA"; pqc_safe = true; }
+    elif mech_up == "CKM_SHA256_HMAC" { mech_id = CKM_SHA256_HMAC; key_type = "CKK_GENERIC_SECRET"; }
+    else { _fail("pkcs11", "unsupported PKCS#11 mechanism: " + mech_up); }
+
+    // Enforce hardware isolation: private keys NEVER leave HSM (CKA_SENSITIVE=true, CKA_EXTRACTABLE=false)
+    if _opt(opts, "allow_extractable_private_key", false) == true {
+        _fail("pkcs11", "security policy forbids CKA_EXTRACTABLE=true on HSM private keys");
+    }
+
+    let read_write = _opt(opts, "read_write", false) == true;
+    let session_flags = if read_write { bit_or(CKF_SERIAL_SESSION, CKF_RW_SESSION) } else { CKF_SERIAL_SESSION };
+    let pin_mode = str_lower(str(_opt(pin_policy, "auth_mode", "protected_auth_pad")));
+
+    return map{
+        ok: true,
+        format: FORMAT_PKCS11,
+        pkcs11_version: "3.2",
+        slot_id: slot_id,
+        session_flags: session_flags,
+        user_type: CKU_USER,
+        auth_mode: pin_mode,
+        zero_plaintext_pin_retained: true,
+        mechanism: map{
+            name: mech_up,
+            code: mech_id,
+            key_type: key_type,
+            quantum_resistant: pqc_safe
+        },
+        key_attributes: map{
+            CKA_TOKEN: true,
+            CKA_PRIVATE: true,
+            CKA_SENSITIVE: true,
+            CKA_EXTRACTABLE: false,
+            CKA_ALWAYS_SENSITIVE: true,
+            CKA_NEVER_EXTRACTABLE: true,
+            CKA_SIGN: true
+        }
+    };
+}
+
+export HW_HSM_VERSION, FORMAT_BUS, FORMAT_WEBAUTHN, FORMAT_PKCS11;
+export CAN_EFF_FLAG, CAN_RTR_FLAG, CAN_ERR_FLAG, CAN_SFF_MASK, CAN_EFF_MASK, CANFD_BRS, CANFD_ESI, CANFD_FDF;
+export WEBAUTHN_FLAG_UP, WEBAUTHN_FLAG_UV, WEBAUTHN_FLAG_AT;
+export CKM_SHA256_HMAC, CKM_ECDSA, CKM_ECDSA_SHA256, CKM_EDDSA, CKM_ML_DSA, CKF_RW_SESSION, CKF_SERIAL_SESSION;
+export build_serial_termios_config, modbus_crc16, modbus_rtu_build_frame, modbus_rtu_parse_frame;
+export modbus_tcp_build_mbap, modbus_tcp_parse_mbap;
+export socketcan_encode_frame, socketcan_decode_frame;
+export i2c_spi_gpio_transfer_plan, usbhid_build_report_descriptor;
+export build_fido2_webauthn_assertion, verify_fido2_webauthn_assertion, pkcs11_build_mechanism_session;

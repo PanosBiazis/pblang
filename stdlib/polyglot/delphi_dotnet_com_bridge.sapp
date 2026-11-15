@@ -1,0 +1,1408 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+// stdlib/polyglot/delphi_dotnet_com_bridge.sapp — Sovereign Pure-PBLang Delphi / Object Pascal,
+// Windows COM (`IUnknown` / `IDispatch` / `BSTR` / `SAFEARRAY`), `.NET CoreCLR` (`hostfxr`),
+// & Multi-ABI C Header Struct/Bitfield/Prototype Importer (PBLang v5.0.0)
+
+let U = import("stdlib:unicode.sapp");
+
+let MODULE_VERSION = "5.0.0";
+
+// Canonical COM Interface Identifiers (RFC 4122 / Win32 Mixed-Endian GUIDs)
+let IID_IUnknown = "00000000-0000-0000-C000-000000000046";
+let IID_IDispatch = "00020400-0000-0000-C000-000000000046";
+let IID_IClassFactory = "00000001-0000-0000-C000-000000000046";
+
+// COM / Delphi Variant Type Codes (VARENUM / TVarType)
+let VT_EMPTY = 0;
+let VT_NULL = 1;
+let VT_I2 = 2;
+let VT_I4 = 3;
+let VT_R4 = 4;
+let VT_R8 = 5;
+let VT_CY = 6;
+let VT_DATE = 7;
+let VT_BSTR = 8;
+let VT_DISPATCH = 9;
+let VT_BOOL = 11;
+let VT_VARIANT = 12;
+let VT_UNKNOWN = 13;
+let VT_I8 = 20;
+let VT_UI8 = 21;
+let VAR_USTRING = 258; // 0x0102 Delphi UnicodeString TVarData tag
+
+// Standard COM HRESULTs & DISPIDs
+let S_OK = 0;
+let E_NOINTERFACE = 2147500034; // 0x80004002
+let E_POINTER = 2147500035;     // 0x80004003
+let E_FAIL = 2147500037;        // 0x80004005
+let DISPID_PROPERTYPUT = -3;
+let DISPATCH_METHOD = 1;
+let DISPATCH_PROPERTYGET = 2;
+let DISPATCH_PROPERTYPUT = 4;
+
+fn _opt(m, k, fb) {
+    if m == nil or not is_map(m) { return fb; }
+    if not map_has(m, k) { return fb; }
+    let v = m[k];
+    if v == nil { return fb; }
+    return v;
+}
+
+fn _clamp(v, lo, hi) {
+    if v < lo { return lo; }
+    if v > hi { return hi; }
+    return v;
+}
+
+fn _append_bytes(dst, src) {
+    let i = 0;
+    while i < len(src) { array_push(dst, src[i]); i = i + 1; }
+    return dst;
+}
+
+fn _align_up(val, align) {
+    if align <= 1 { return val; }
+    let rem = num_mod(val, align);
+    if rem == 0 { return val; }
+    return val + (align - rem);
+}
+
+fn _push_u16_le(buf, val) {
+    let v = num_mod(num_floor(val), 65536);
+    if v < 0 { v = v + 65536; }
+    array_push(buf, bit_and(v, 255));
+    array_push(buf, bit_and(num_floor(v / 256), 255));
+    return buf;
+}
+
+fn _push_u32_le(buf, val) {
+    let v = num_mod(num_floor(val), 4294967296);
+    if v < 0 { v = v + 4294967296; }
+    array_push(buf, bit_and(v, 255));
+    array_push(buf, bit_and(num_floor(v / 256), 255));
+    array_push(buf, bit_and(num_floor(v / 65536), 255));
+    array_push(buf, bit_and(num_floor(v / 16777216), 255));
+    return buf;
+}
+
+fn _push_i32_le(buf, val) {
+    let v = num_floor(val);
+    if v < 0 { v = 4294967296 + v; }
+    return _push_u32_le(buf, v);
+}
+
+fn _push_i64_le(buf, val) {
+    let v = num_floor(val);
+    if v >= 0 {
+        let hi = num_floor(v / 4294967296);
+        let lo = v - hi * 4294967296;
+        _push_u32_le(buf, lo);
+        _push_u32_le(buf, hi);
+    } else {
+        let pos = (0 - v) - 1;
+        let hi_inv = num_floor(pos / 4294967296);
+        let lo_inv = pos - hi_inv * 4294967296;
+        _push_u32_le(buf, bit_xor(lo_inv, 4294967295));
+        _push_u32_le(buf, bit_xor(hi_inv, 4294967295));
+    }
+    return buf;
+}
+
+fn _u16_le(b, off) { return b[off] + b[off + 1] * 256; }
+fn _u32_le(b, off) { return b[off] + b[off + 1] * 256 + b[off + 2] * 65536 + b[off + 3] * 16777216; }
+fn _i32_le(b, off) {
+    let u = _u32_le(b, off);
+    if u >= 2147483648 { return u - 4294967296; }
+    return u;
+}
+fn _i64_le(b, off) {
+    let lo = _u32_le(b, off);
+    let hi = _u32_le(b, off + 4);
+    if hi < 2147483648 {
+        return hi * 4294967296 + lo;
+    }
+    let inv_lo = bit_xor(lo, 4294967295);
+    let inv_hi = bit_xor(hi, 4294967295);
+    return 0 - (inv_hi * 4294967296 + inv_lo + 1);
+}
+
+fn _utf8_to_utf16le_units(text) {
+    let cps = U.codepoints(str(text));
+    let units = [];
+    let i = 0;
+    while i < len(cps) {
+        let cp = cps[i];
+        if cp <= 65535 {
+            array_push(units, cp);
+        } else {
+            let adj = cp - 65536;
+            array_push(units, 55296 + num_floor(adj / 1024));
+            array_push(units, 56320 + num_mod(adj, 1024));
+        }
+        i = i + 1;
+    }
+    return units;
+}
+
+fn _utf16le_bytes_to_utf8(b, start_off, byte_len) {
+    if num_mod(byte_len, 2) != 0 or start_off + byte_len > len(b) {
+        throw "delphi_com_bridge: invalid UTF-16LE byte slice";
+    }
+    let out = "";
+    let pos = start_off;
+    let lim = start_off + byte_len;
+    while pos < lim {
+        let w1 = _u16_le(b, pos);
+        pos = pos + 2;
+        if w1 >= 55296 and w1 <= 56319 and pos + 2 <= lim {
+            let w2 = _u16_le(b, pos);
+            if w2 >= 56320 and w2 <= 57343 {
+                pos = pos + 2;
+                let cp = 65536 + (w1 - 55296) * 1024 + (w2 - 56320);
+                out = out + U.from_codepoint(cp);
+                continue;
+            }
+        }
+        out = out + U.from_codepoint(w1);
+    }
+    return out;
+}
+
+// ============================================================================
+// 1. Multi-ABI C Header Struct / Bitfield / Enum / Function Prototype Importer
+// ============================================================================
+
+fn _abi_descriptor(target_abi) {
+    let a = str_lower(str(target_abi));
+    if a == "win64" or a == "win64_x64" or a == "x64_windows" {
+        return map{
+            name: "win64_x64",
+            ptr_size: 8,
+            long_size: 4,
+            double_align: 8,
+            shadow_space: 32,
+            default_cc: "win64",
+            gp_regs: ["rcx", "rdx", "r8", "r9"],
+            fp_regs: ["xmm0", "xmm1", "xmm2", "xmm3"]
+        };
+    }
+    if a == "arm64" or a == "arm64_aapcs64" or a == "aarch64" {
+        return map{
+            name: "arm64_aapcs64",
+            ptr_size: 8,
+            long_size: 8,
+            double_align: 8,
+            shadow_space: 0,
+            default_cc: "aapcs64",
+            gp_regs: ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+            fp_regs: ["v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"]
+        };
+    }
+    if a == "i386_stdcall" or a == "win32_stdcall" or a == "stdcall" {
+        return map{
+            name: "i386_stdcall",
+            ptr_size: 4,
+            long_size: 4,
+            double_align: 8,
+            shadow_space: 0,
+            default_cc: "stdcall",
+            gp_regs: [],
+            fp_regs: []
+        };
+    }
+    if a == "i386_cdecl" or a == "i386" or a == "x86" {
+        return map{
+            name: "i386_cdecl",
+            ptr_size: 4,
+            long_size: 4,
+            double_align: 4,
+            shadow_space: 0,
+            default_cc: "cdecl",
+            gp_regs: [],
+            fp_regs: []
+        };
+    }
+    return map{
+        name: "sysv_x64",
+        ptr_size: 8,
+        long_size: 8,
+        double_align: 8,
+        shadow_space: 0,
+        default_cc: "sysv_x64",
+        gp_regs: ["rdi", "rsi", "rdx", "rcx", "r8", "r9"],
+        fp_regs: ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"]
+    };
+}
+
+fn _strip_c_comments(src) {
+    let s = str(src);
+    let n = len(s);
+    let out = "";
+    let i = 0;
+    while i < n {
+        let ch = str_slice(s, i, i + 1);
+        if ch == "/" and i + 1 < n and str_slice(s, i + 1, i + 2) == "/" {
+            while i < n and str_slice(s, i, i + 1) != "\n" { i = i + 1; }
+            continue;
+        }
+        if ch == "/" and i + 1 < n and str_slice(s, i + 1, i + 2) == "*" {
+            i = i + 2;
+            while i + 1 < n {
+                if str_slice(s, i, i + 1) == "*" and str_slice(s, i + 1, i + 2) == "/" {
+                    i = i + 2;
+                    break;
+                }
+                i = i + 1;
+            }
+            out = out + " ";
+            continue;
+        }
+        out = out + ch;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn _normalize_ws(s) {
+    let t = str_replace_all(str_replace_all(str_replace_all(str(s), "\r", " "), "\n", " "), "\t", " ");
+    while str_contains(t, "  ") {
+        t = str_replace_all(t, "  ", " ");
+    }
+    return str_trim(t);
+}
+
+fn _parse_int_lit(raw_txt, fallback) {
+    let t = str_trim(str(raw_txt));
+    if str_starts_with(str_lower(t), "0x") {
+        let hex_part = str_slice(t, 2, len(t));
+        let acc = 0;
+        let i = 0;
+        while i < len(hex_part) {
+            let c = strcharcodeat(hex_part, i);
+            let nib = if c >= 48 and c <= 57 { c - 48 }
+                elif c >= 65 and c <= 70 { c - 55 }
+                elif c >= 97 and c <= 102 { c - 87 }
+                else { -1 };
+            if nib < 0 { break; }
+            acc = acc * 16 + nib;
+            i = i + 1;
+        }
+        return acc;
+    }
+    let n = try parse_number(t) catch nil;
+    if n == nil { return fallback; }
+    return num_floor(n);
+}
+
+fn _resolve_c_type_metrics(raw_type, abi, structs_map, typedefs_map, enums_map) {
+    let t = _normalize_ws(raw_type);
+    t = str_replace_all(t, "const ", "");
+    t = str_replace_all(t, "volatile ", "");
+    t = str_replace_all(t, "register ", "");
+    t = str_trim(t);
+
+    if str_ends_with(t, "*") {
+        return map{ canonical: t, size: abi.ptr_size, align: abi.ptr_size, kind: "pointer", is_float: false };
+    }
+    if map_has(typedefs_map, t) {
+        return _resolve_c_type_metrics(typedefs_map[t], abi, structs_map, typedefs_map, enums_map);
+    }
+    let clean_struct = if str_starts_with(t, "struct ") { str_trim(str_slice(t, 7, len(t))) } else { t };
+    if map_has(structs_map, clean_struct) {
+        let st = structs_map[clean_struct];
+        return map{ canonical: "struct " + clean_struct, struct_name: clean_struct, size: st.sizeof, align: st.alignment, kind: "struct", is_float: false };
+    }
+    let clean_enum = if str_starts_with(t, "enum ") { str_trim(str_slice(t, 5, len(t))) } else { t };
+    if map_has(enums_map, clean_enum) or str_starts_with(t, "enum ") {
+        return map{ canonical: "enum " + clean_enum, size: 4, align: 4, kind: "enum", is_float: false };
+    }
+
+    if t == "void" { return map{ canonical: "void", size: 0, align: 1, kind: "void", is_float: false }; }
+    if t == "bool" or t == "_Bool" or t == "char" or t == "signed char" or t == "unsigned char"
+        or t == "int8_t" or t == "uint8_t" or t == "BYTE" or t == "BOOLEAN" {
+        return map{ canonical: t, size: 1, align: 1, kind: "integer", is_float: false };
+    }
+    if t == "short" or t == "short int" or t == "unsigned short" or t == "int16_t"
+        or t == "uint16_t" or t == "WORD" or t == "wchar_t" or t == "WCHAR" or t == "VARIANT_BOOL" {
+        return map{ canonical: t, size: 2, align: 2, kind: "integer", is_float: false };
+    }
+    if t == "int" or t == "signed int" or t == "unsigned int" or t == "unsigned"
+        or t == "int32_t" or t == "uint32_t" or t == "DWORD" or t == "LONG" or t == "HRESULT" or t == "BOOL" {
+        return map{ canonical: t, size: 4, align: 4, kind: "integer", is_float: false };
+    }
+    if t == "long" or t == "unsigned long" {
+        return map{ canonical: t, size: abi.long_size, align: abi.long_size, kind: "integer", is_float: false };
+    }
+    if t == "long long" or t == "unsigned long long" or t == "int64_t" or t == "uint64_t" {
+        return map{ canonical: t, size: 8, align: abi.double_align, kind: "integer", is_float: false };
+    }
+    if t == "size_t" or t == "ssize_t" or t == "intptr_t" or t == "uintptr_t"
+        or t == "HANDLE" or t == "HWND" or t == "LPVOID" or t == "BSTR" {
+        return map{ canonical: t, size: abi.ptr_size, align: abi.ptr_size, kind: "pointer_sized_int", is_float: false };
+    }
+    if t == "float" {
+        return map{ canonical: "float", size: 4, align: 4, kind: "float", is_float: true };
+    }
+    if t == "double" or t == "DATE" {
+        return map{ canonical: "double", size: 8, align: abi.double_align, kind: "float", is_float: true };
+    }
+    return map{ canonical: t, size: 4, align: 4, kind: "integer", is_float: false };
+}
+
+fn _split_type_and_decl_name(decl_str) {
+    let s = _normalize_ws(decl_str);
+    // Separate trailing array `[N]` if present
+    let arr_len = 0;
+    let lb = str_index_of(s, "[");
+    let rb = str_index_of(s, "]");
+    if lb >= 0 and rb > lb {
+        arr_len = _parse_int_lit(str_slice(s, lb + 1, rb), 1);
+        s = _normalize_ws(str_slice(s, 0, lb));
+    }
+    // Separate bitfield `: W` if present
+    let bit_w = -1;
+    let colon = str_index_of(s, ":");
+    if colon >= 0 {
+        bit_w = _parse_int_lit(str_slice(s, colon + 1, len(s)), 0);
+        s = _normalize_ws(str_slice(s, 0, colon));
+    }
+    // Move `*` attached to identifier onto type side (`int *ptr` -> `int *`, `ptr`)
+    let ptr_stars = "";
+    let last_sp = -1;
+    let i = 0;
+    while i < len(s) {
+        let ch = str_slice(s, i, i + 1);
+        if ch == " " or ch == "*" { last_sp = i; }
+        i = i + 1;
+    }
+    if last_sp < 0 {
+        return map{ c_type: s, name: "anon", array_len: arr_len, bit_width: bit_w };
+    }
+    let fname = str_trim(str_slice(s, last_sp + 1, len(s)));
+    let ftype = str_trim(str_slice(s, 0, last_sp + 1));
+    // Handle `: 0` unnamed bitfield barrier (`uint32_t : 0`)
+    if fname == "" and bit_w == 0 {
+        fname = "__bitfield_align_barrier";
+    }
+    return map{ c_type: ftype, name: fname, array_len: arr_len, bit_width: bit_w };
+}
+
+fn _layout_struct_fields(struct_name, body_src, pack_align, abi, structs_map, typedefs_map, enums_map) {
+    let raw_decls = str_split(body_src, ";");
+    let fields = [];
+    let cur_offset = 0;
+    let max_align = 1;
+    let bf_unit_offset = -1;
+    let bf_unit_size = 0;
+    let bf_bits_used = 0;
+
+    let i = 0;
+    while i < len(raw_decls) {
+        let d = _normalize_ws(raw_decls[i]);
+        if d == "" { i = i + 1; continue; }
+        let sp = _split_type_and_decl_name(d);
+        let tm = _resolve_c_type_metrics(sp.c_type, abi, structs_map, typedefs_map, enums_map);
+        let eff_align = if pack_align > 0 { num_min(tm.align, pack_align) } else { tm.align };
+        if eff_align < 1 { eff_align = 1; }
+        if eff_align > max_align { max_align = eff_align; }
+
+        if sp.bit_width >= 0 {
+            let unit_bits = tm.size * 8;
+            if sp.bit_width == 0 {
+                bf_unit_offset = -1;
+                bf_bits_used = 0;
+                cur_offset = _align_up(cur_offset, eff_align);
+                i = i + 1;
+                continue;
+            }
+            if bf_unit_offset >= 0 and bf_unit_size == tm.size and (bf_bits_used + sp.bit_width) <= unit_bits {
+                array_push(fields, map{
+                    name: sp.name,
+                    c_type: sp.c_type,
+                    offset: bf_unit_offset,
+                    size: tm.size,
+                    align: eff_align,
+                    array_len: 0,
+                    bit_width: sp.bit_width,
+                    bit_offset: bf_bits_used
+                });
+                bf_bits_used = bf_bits_used + sp.bit_width;
+            } else {
+                cur_offset = _align_up(cur_offset, eff_align);
+                bf_unit_offset = cur_offset;
+                bf_unit_size = tm.size;
+                array_push(fields, map{
+                    name: sp.name,
+                    c_type: sp.c_type,
+                    offset: bf_unit_offset,
+                    size: tm.size,
+                    align: eff_align,
+                    array_len: 0,
+                    bit_width: sp.bit_width,
+                    bit_offset: 0
+                });
+                bf_bits_used = sp.bit_width;
+                cur_offset = cur_offset + tm.size;
+            }
+        } else {
+            bf_unit_offset = -1;
+            bf_bits_used = 0;
+            cur_offset = _align_up(cur_offset, eff_align);
+            let total_sz = if sp.array_len > 0 { tm.size * sp.array_len } else { tm.size };
+            array_push(fields, map{
+                name: sp.name,
+                c_type: sp.c_type,
+                offset: cur_offset,
+                size: total_sz,
+                element_size: tm.size,
+                align: eff_align,
+                array_len: sp.array_len,
+                bit_width: -1,
+                bit_offset: -1
+            });
+            cur_offset = cur_offset + total_sz;
+        }
+        i = i + 1;
+    }
+
+    let final_size = _align_up(cur_offset, max_align);
+    return map{
+        name: struct_name,
+        packed: pack_align > 0 and pack_align < 8,
+        pack_value: pack_align,
+        alignment: max_align,
+        sizeof: final_size,
+        tail_padding: final_size - cur_offset,
+        fields: fields
+    };
+}
+
+fn _classify_function_abi(fn_name, ret_type_str, cc_override, param_decls, abi, structs_map, typedefs_map, enums_map) {
+    let cc = if cc_override != "" { cc_override } else { abi.default_cc };
+    let ret_m = _resolve_c_type_metrics(ret_type_str, abi, structs_map, typedefs_map, enums_map);
+
+    let gp_idx = 0;
+    let fp_idx = 0;
+    let stack_off = if abi.name == "win64_x64" { 32 } elif str_starts_with(abi.name, "i386") { 4 } else { 0 };
+    let ret_loc = "rax";
+    if ret_m.kind == "void" {
+        ret_loc = "void";
+    } elif ret_m.is_float {
+        ret_loc = if abi.name == "arm64_aapcs64" { "v0" } elif str_starts_with(abi.name, "i386") { "st0" } else { "xmm0" };
+    } elif ret_m.kind == "struct" {
+        if abi.name == "win64_x64" {
+            if ret_m.size == 1 or ret_m.size == 2 or ret_m.size == 4 or ret_m.size == 8 {
+                ret_loc = "rax";
+            } else {
+                ret_loc = "sret_hidden_rcx";
+                gp_idx = 1; // hidden return pointer consumes slot 0 (rcx)!
+            }
+        } elif abi.name == "sysv_x64" {
+            ret_loc = if ret_m.size <= 16 { "rax:rdx" } else { "sret_hidden_rdi" };
+            if ret_m.size > 16 { gp_idx = 1; }
+        } elif abi.name == "arm64_aapcs64" {
+            ret_loc = if ret_m.size <= 16 { "x0:x1" } else { "sret_x8" };
+        } else {
+            ret_loc = "sret_stack_ptr";
+            stack_off = stack_off + 4;
+        }
+    } elif str_starts_with(abi.name, "i386") {
+        ret_loc = if ret_m.size == 8 { "edx:eax" } else { "eax" };
+    } elif abi.name == "arm64_aapcs64" {
+        ret_loc = "x0";
+    }
+
+    let classified_params = [];
+    let i386_param_bytes = 0;
+    let i = 0;
+    while i < len(param_decls) {
+        let p_raw = _normalize_ws(param_decls[i]);
+        if p_raw == "" or p_raw == "void" { i = i + 1; continue; }
+        let sp = _split_type_and_decl_name(p_raw);
+        let pm = _resolve_c_type_metrics(sp.c_type, abi, structs_map, typedefs_map, enums_map);
+        let loc_kind = "register";
+        let reg_name = "";
+        let p_stack_off = -1;
+
+        if abi.name == "win64_x64" {
+            // Win64 positional slot sharing between GP and XMM!
+            let slot = gp_idx;
+            gp_idx = gp_idx + 1;
+            if slot < 4 {
+                if pm.is_float {
+                    reg_name = abi.fp_regs[slot];
+                } elif pm.kind == "struct" and pm.size != 1 and pm.size != 2 and pm.size != 4 and pm.size != 8 {
+                    loc_kind = "indirect_register_ptr";
+                    reg_name = abi.gp_regs[slot];
+                } else {
+                    reg_name = abi.gp_regs[slot];
+                }
+            } else {
+                loc_kind = if pm.kind == "struct" and pm.size > 8 { "indirect_stack_ptr" } else { "stack" };
+                p_stack_off = stack_off;
+                stack_off = stack_off + 8;
+            }
+        } elif abi.name == "sysv_x64" {
+            if pm.is_float {
+                if fp_idx < len(abi.fp_regs) {
+                    reg_name = abi.fp_regs[fp_idx];
+                    fp_idx = fp_idx + 1;
+                } else {
+                    loc_kind = "stack"; p_stack_off = stack_off; stack_off = stack_off + 8;
+                }
+            } elif pm.kind == "struct" {
+                let eightbytes = num_ceil((pm.size * 1.0) / 8.0);
+                if pm.size <= 16 and (gp_idx + eightbytes) <= len(abi.gp_regs) {
+                    reg_name = if eightbytes == 2 { abi.gp_regs[gp_idx] + ":" + abi.gp_regs[gp_idx + 1] } else { abi.gp_regs[gp_idx] };
+                    gp_idx = gp_idx + eightbytes;
+                } else {
+                    loc_kind = "memory_stack";
+                    stack_off = _align_up(stack_off, num_max(8, pm.align));
+                    p_stack_off = stack_off;
+                    stack_off = stack_off + _align_up(pm.size, 8);
+                }
+            } else {
+                if gp_idx < len(abi.gp_regs) {
+                    reg_name = abi.gp_regs[gp_idx];
+                    gp_idx = gp_idx + 1;
+                } else {
+                    loc_kind = "stack"; p_stack_off = stack_off; stack_off = stack_off + 8;
+                }
+            }
+        } elif abi.name == "arm64_aapcs64" {
+            if pm.is_float and fp_idx < len(abi.fp_regs) {
+                reg_name = abi.fp_regs[fp_idx];
+                fp_idx = fp_idx + 1;
+            } elif pm.kind == "struct" and pm.size > 16 {
+                if gp_idx < len(abi.gp_regs) {
+                    loc_kind = "indirect_register_ptr";
+                    reg_name = abi.gp_regs[gp_idx];
+                    gp_idx = gp_idx + 1;
+                } else {
+                    loc_kind = "indirect_stack_ptr"; p_stack_off = stack_off; stack_off = stack_off + 8;
+                }
+            } elif gp_idx < len(abi.gp_regs) {
+                let regs_needed = if pm.size > 8 { 2 } else { 1 };
+                reg_name = if regs_needed == 2 and gp_idx + 1 < len(abi.gp_regs) {
+                    abi.gp_regs[gp_idx] + ":" + abi.gp_regs[gp_idx + 1]
+                } else {
+                    abi.gp_regs[gp_idx]
+                };
+                gp_idx = gp_idx + regs_needed;
+            } else {
+                loc_kind = "stack"; p_stack_off = stack_off; stack_off = stack_off + 8;
+            }
+        } else {
+            // i386_stdcall / i386_cdecl: all arguments pushed onto 32-bit aligned stack
+            loc_kind = "stack";
+            p_stack_off = stack_off;
+            let slot_sz = _align_up(num_max(4, pm.size), 4);
+            stack_off = stack_off + slot_sz;
+            i386_param_bytes = i386_param_bytes + slot_sz;
+        }
+
+        array_push(classified_params, map{
+            name: sp.name,
+            c_type: sp.c_type,
+            size: pm.size,
+            align: pm.align,
+            location: loc_kind,
+            register_name: reg_name,
+            stack_offset: p_stack_off
+        });
+        i = i + 1;
+    }
+
+    let cleanup = if cc == "stdcall" and str_starts_with(abi.name, "i386") { i386_param_bytes } else { 0 };
+    let decorated = if cc == "stdcall" and str_starts_with(abi.name, "i386") {
+        "_" + fn_name + "@" + str(i386_param_bytes)
+    } else {
+        fn_name
+    };
+
+    return map{
+        name: fn_name,
+        return_type: ret_type_str,
+        return_size: ret_m.size,
+        return_location: ret_loc,
+        calling_convention: cc,
+        decorated_symbol: decorated,
+        shadow_space_bytes: abi.shadow_space,
+        stack_cleanup_bytes: cleanup,
+        params: classified_params
+    };
+}
+
+fn parse_c_header_abi(header_src, target_abi = "sysv_x64") {
+    let abi = _abi_descriptor(target_abi);
+    let clean = _strip_c_comments(header_src);
+    let lines = str_split(clean, "\n");
+
+    let pack_stack = [];
+    let cur_pack = 0;
+    let structs_map = map{};
+    let struct_order = [];
+    let enums_map = map{};
+    let typedefs_map = map{};
+    let functions = [];
+
+    // Reassemble top-level statements while tracking `#pragma pack(...)` directives
+    let cur_stmt = "";
+    let brace_depth = 0;
+    let li = 0;
+    while li < len(lines) {
+        let ln = str_trim(lines[li]);
+        if str_starts_with(ln, "#pragma") and str_contains(ln, "pack") {
+            let lp = str_index_of(ln, "(");
+            let rp = str_index_of(ln, ")");
+            if lp >= 0 and rp > lp {
+                let inside = str_trim(str_slice(ln, lp + 1, rp));
+                if inside == "" or inside == "pop" {
+                    cur_pack = if len(pack_stack) > 0 { array_pop(pack_stack) } else { 0 };
+                } elif str_starts_with(inside, "push") {
+                    array_push(pack_stack, cur_pack);
+                    let comma = str_index_of(inside, ",");
+                    if comma >= 0 {
+                        cur_pack = _parse_int_lit(str_slice(inside, comma + 1, len(inside)), cur_pack);
+                    }
+                } else {
+                    cur_pack = _parse_int_lit(inside, 0);
+                }
+            }
+            li = li + 1;
+            continue;
+        }
+        if str_starts_with(ln, "#") {
+            li = li + 1;
+            continue;
+        }
+
+        let ci = 0;
+        while ci < len(ln) {
+            let ch = str_slice(ln, ci, ci + 1);
+            if ch == "{" { brace_depth = brace_depth + 1; }
+            if ch == "}" { brace_depth = num_max(0, brace_depth - 1); }
+            cur_stmt = cur_stmt + ch;
+            if ch == ";" and brace_depth == 0 {
+                let stmt = _normalize_ws(cur_stmt);
+                cur_stmt = "";
+                stmt = str_slice(stmt, 0, len(stmt) - 1); // strip trailing ';'
+                stmt = str_trim(stmt);
+
+                if str_contains(stmt, "enum") and str_contains(stmt, "{") {
+                    let ob = str_index_of(stmt, "{");
+                    let cb = str_index_of(stmt, "}");
+                    let prefix = _normalize_ws(str_slice(stmt, 0, ob));
+                    let suffix = _normalize_ws(str_slice(stmt, cb + 1, len(stmt)));
+                    let ename = suffix;
+                    if ename == "" {
+                        let p_parts = str_split(prefix, " ");
+                        ename = p_parts[len(p_parts) - 1];
+                    }
+                    let e_items = str_split(str_slice(stmt, ob + 1, cb), ",");
+                    let ev_map = map{};
+                    let next_v = 0;
+                    let ei = 0;
+                    while ei < len(e_items) {
+                        let item = str_trim(e_items[ei]);
+                        if item != "" {
+                            let eq = str_index_of(item, "=");
+                            if eq >= 0 {
+                                let kname = str_trim(str_slice(item, 0, eq));
+                                next_v = _parse_int_lit(str_slice(item, eq + 1, len(item)), next_v);
+                                ev_map[kname] = next_v;
+                            } else {
+                                ev_map[item] = next_v;
+                            }
+                            next_v = next_v + 1;
+                        }
+                        ei = ei + 1;
+                    }
+                    enums_map[ename] = ev_map;
+                } elif str_contains(stmt, "struct") and str_contains(stmt, "{") {
+                    let ob = str_index_of(stmt, "{");
+                    let cb = str_index_of(stmt, "}");
+                    let prefix = _normalize_ws(str_slice(stmt, 0, ob));
+                    let suffix = _normalize_ws(str_slice(stmt, cb + 1, len(stmt)));
+                    let p_words = str_split(prefix, " ");
+                    let tag_name = "";
+                    if len(p_words) >= 2 and p_words[len(p_words) - 2] == "struct" {
+                        tag_name = p_words[len(p_words) - 1];
+                    }
+                    let primary_name = if suffix != "" { suffix } else { tag_name };
+                    let laid = _layout_struct_fields(primary_name, str_slice(stmt, ob + 1, cb), cur_pack, abi, structs_map, typedefs_map, enums_map);
+                    structs_map[primary_name] = laid;
+                    if tag_name != "" and tag_name != primary_name {
+                        structs_map[tag_name] = laid;
+                    }
+                    array_push(struct_order, primary_name);
+                } elif str_starts_with(stmt, "typedef ") {
+                    let rest = _normalize_ws(str_slice(stmt, 8, len(stmt)));
+                    let sp = _split_type_and_decl_name(rest);
+                    typedefs_map[sp.name] = sp.c_type;
+                } elif str_contains(stmt, "(") and str_ends_with(stmt, ")") {
+                    let lp2 = str_index_of(stmt, "(");
+                    let head = _normalize_ws(str_slice(stmt, 0, lp2));
+                    let p_body = str_slice(stmt, lp2 + 1, len(stmt) - 1);
+                    let cc_ov = "";
+                    if str_contains(head, "__stdcall") or str_contains(head, "WINAPI") or str_contains(head, "STDCALL") {
+                        cc_ov = "stdcall";
+                        head = _normalize_ws(str_replace_all(str_replace_all(str_replace_all(head, "__stdcall", ""), "WINAPI", ""), "STDCALL", ""));
+                    } elif str_contains(head, "__cdecl") {
+                        cc_ov = "cdecl";
+                        head = _normalize_ws(str_replace_all(head, "__cdecl", ""));
+                    }
+                    head = _normalize_ws(str_replace_all(head, "extern ", ""));
+                    let fn_sp = _split_type_and_decl_name(head);
+                    let fn_info = _classify_function_abi(fn_sp.name, fn_sp.c_type, cc_ov, str_split(p_body, ","), abi, structs_map, typedefs_map, enums_map);
+                    array_push(functions, fn_info);
+                }
+            }
+            ci = ci + 1;
+        }
+        cur_stmt = cur_stmt + " ";
+        li = li + 1;
+    }
+
+    let struct_list = [];
+    let si = 0;
+    while si < len(struct_order) {
+        array_push(struct_list, structs_map[struct_order[si]]);
+        si = si + 1;
+    }
+
+    return map{
+        ok: true,
+        target_abi: abi.name,
+        pointer_size: abi.ptr_size,
+        structs: structs_map,
+        struct_list: struct_list,
+        enums: enums_map,
+        typedefs: typedefs_map,
+        functions: functions
+    };
+}
+
+// ============================================================================
+// 2. Delphi / Object Pascal Native ABI (`UnicodeString`, `Currency`, `TDateTime`, `.pas`)
+// ============================================================================
+
+// Embarcadero Delphi 2009..12 Athens `System.TStrRec` binary layout:
+//   x64 / ARM64 (16-byte header preceding UTF-16LE data):
+//     [0..3]   _Padding  : Int32 = 0
+//     [4..5]   codePage  : Word  = 1200 (UTF-16LE)
+//     [6..7]   elemSize  : Word  = 2
+//     [8..11]  refCnt    : Int32 (-1 = constant literal, >= 1 = heap reference count)
+//     [12..15] length    : Int32 (UTF-16 code units)
+//     [16..]   UTF-16LE code units + [0x00, 0x00] NUL terminator
+//   x86 32-bit (12-byte header without _Padding):
+//     [0..1] codePage=1200, [2..3] elemSize=2, [4..7] refCnt, [8..11] length, [12..] payload + NUL
+fn build_delphi_unicode_string_record(text, opts_or_arch = nil) {
+    let arch = "x64";
+    let ref_cnt = 1;
+    if is_string(opts_or_arch) {
+        arch = str_lower(opts_or_arch);
+    } elif is_map(opts_or_arch) {
+        arch = str_lower(str(_opt(opts_or_arch, "arch", "x64")));
+        ref_cnt = num_floor(_opt(opts_or_arch, "ref_cnt", 1));
+    }
+    let is_64 = arch != "x86" and arch != "i386" and arch != "win32";
+    let units = _utf8_to_utf16le_units(text);
+    let u_len = len(units);
+
+    let buf = [];
+    if is_64 {
+        _push_i32_le(buf, 0); // _Padding (4B)
+    }
+    _push_u16_le(buf, 1200);  // codePage = 1200 (UTF-16LE)
+    _push_u16_le(buf, 2);     // elemSize = 2 bytes
+    _push_i32_le(buf, ref_cnt);
+    _push_i32_le(buf, u_len);
+    let data_offset = len(buf);
+    let i = 0;
+    while i < u_len {
+        _push_u16_le(buf, units[i]);
+        i = i + 1;
+    }
+    _push_u16_le(buf, 0);     // trailing UTF-16 NUL (#0)
+
+    return map{
+        ok: true,
+        arch: if is_64 { "x64" } else { "x86" },
+        header_size: data_offset,
+        data_ptr_offset: data_offset,
+        code_page: 1200,
+        elem_size: 2,
+        ref_cnt: ref_cnt,
+        length: u_len,
+        bytes: buf
+    };
+}
+
+fn parse_delphi_unicode_string_record(record_bytes, arch = "x64") {
+    let is_64 = str_lower(str(arch)) != "x86" and str_lower(str(arch)) != "i386";
+    let hdr = if is_64 { 16 } else { 12 };
+    if not is_array(record_bytes) or len(record_bytes) < hdr + 2 {
+        throw "delphi_com_bridge: UnicodeString record buffer too short";
+    }
+    let base = if is_64 { 4 } else { 0 };
+    let cp = _u16_le(record_bytes, base);
+    let esz = _u16_le(record_bytes, base + 2);
+    let rcnt = _i32_le(record_bytes, base + 4);
+    let ulen = _i32_le(record_bytes, base + 8);
+    if cp != 1200 or esz != 2 or ulen < 0 or (hdr + ulen * 2 + 2) > len(record_bytes) {
+        throw "delphi_com_bridge: malformed Delphi UnicodeString StrRec header";
+    }
+    return map{
+        ok: true,
+        code_page: cp,
+        elem_size: esz,
+        ref_cnt: rcnt,
+        length: ulen,
+        text: _utf16le_bytes_to_utf8(record_bytes, hdr, ulen * 2)
+    };
+}
+
+fn build_delphi_shortstring_bytes(text, max_len = 255) {
+    let cap = _clamp(num_floor(max_len), 1, 255);
+    let raw = str_to_bytes(str(text));
+    let actual = num_min(len(raw), cap);
+    let out = [actual];
+    let i = 0;
+    while i < actual { array_push(out, raw[i]); i = i + 1; }
+    return out;
+}
+
+fn build_delphi_ansistring_record(text, code_page = 65001, arch = "x64") {
+    let is_64 = str_lower(str(arch)) != "x86";
+    let utf8 = str_to_bytes(str(text));
+    let buf = [];
+    if is_64 { _push_i32_le(buf, 0); }
+    _push_u16_le(buf, code_page);
+    _push_u16_le(buf, 1);
+    _push_i32_le(buf, 1);
+    _push_i32_le(buf, len(utf8));
+    _append_bytes(buf, utf8);
+    array_push(buf, 0);
+    return map{ ok: true, code_page: code_page, elem_size: 1, length: len(utf8), data_ptr_offset: if is_64 { 16 } else { 12 }, bytes: buf };
+}
+
+// Delphi `Currency`: exact scaled Int64 * 10000 (4 decimal places)
+fn encode_delphi_currency(amount) {
+    let scaled = num_round((amount * 1.0) * 10000.0);
+    let bytes = [];
+    _push_i64_le(bytes, scaled);
+    return map{ scaled_int64: scaled, value: scaled / 10000.0, bytes: bytes };
+}
+
+fn decode_delphi_currency(bytes8) {
+    if not is_array(bytes8) or len(bytes8) < 8 {
+        throw "delphi_com_bridge: Currency requires 8 bytes";
+    }
+    let scaled = _i64_le(bytes8, 0);
+    return scaled / 10000.0;
+}
+
+// Civil calendar <-> Rata Die / Julian Day -> OLE Automation & Delphi TDateTime (epoch 1899-12-30 = 0.0)
+fn _days_from_civil(y, m, d) {
+    let yr = if m <= 2 { y - 1 } else { y };
+    let era = if yr >= 0 { num_floor(yr / 400) } else { num_floor((yr - 399) / 400) };
+    let yoe = yr - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = num_floor((153 * mp + 2) / 5) + d - 1;
+    let doe = yoe * 365 + num_floor(yoe / 4) - num_floor(yoe / 100) + doy;
+    // 1970-01-01 is 0 in Howard Hinnant civil algorithm; 1899-12-30 is -25569 days before 1970-01-01!
+    let unix_days = era * 146097 + doe - 719468;
+    return unix_days + 25569;
+}
+
+fn encode_delphi_tdatetime(year, month, day, hour = 0, minute = 0, second = 0, msec = 0) {
+    let whole_days = _days_from_civil(num_floor(year), num_floor(month), num_floor(day));
+    let frac = ((hour * 3600000.0) + (minute * 60000.0) + (second * 1000.0) + (msec * 1.0)) / 86400000.0;
+    let dt = if whole_days >= 0 { whole_days + frac } else { whole_days - frac };
+    return map{
+        ole_days: dt,
+        epoch: "1899-12-30T00:00:00Z",
+        whole_days: whole_days,
+        time_fraction: frac
+    };
+}
+
+fn decode_delphi_tdatetime(ole_days) {
+    let whole = if ole_days >= 0 { num_floor(ole_days) } else { num_ceil(ole_days) };
+    let frac = num_abs(ole_days - whole);
+    let z = whole - 25569 + 719468;
+    let era = if z >= 0 { num_floor(z / 146097) } else { num_floor((z - 146096) / 146097) };
+    let doe = z - era * 146097;
+    let yoe = num_floor((doe - num_floor(doe / 1460) + num_floor(doe / 36524) - num_floor(doe / 146096)) / 365);
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + num_floor(yoe / 4) - num_floor(yoe / 100));
+    let mp = num_floor((5 * doy + 2) / 153);
+    let d = doy - num_floor((153 * mp + 2) / 5) + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 { y = y + 1; }
+    let total_ms = num_round(frac * 86400000.0);
+    let hr = num_floor(total_ms / 3600000);
+    let rem1 = num_mod(total_ms, 3600000);
+    let mn = num_floor(rem1 / 60000);
+    let rem2 = num_mod(rem1, 60000);
+    let sc = num_floor(rem2 / 1000);
+    let ms = num_mod(rem2, 1000);
+    return map{ year: y, month: m, day: d, hour: hr, minute: mn, second: sc, msec: ms };
+}
+
+fn marshal_delphi_variant(value, explicit_vt = nil) {
+    let buf = [];
+    let vt = explicit_vt;
+    if vt == nil {
+        if value == nil { vt = VT_NULL; }
+        elif type(value) == "bool" { vt = VT_BOOL; }
+        elif type(value) == "string" { vt = VAR_USTRING; }
+        elif type(value) == "number" {
+            if value == num_floor(value) and value >= -2147483648 and value <= 2147483647 {
+                vt = VT_I4;
+            } elif value == num_floor(value) {
+                vt = VT_I8;
+            } else {
+                vt = VT_R8;
+            }
+        } else {
+            vt = VT_EMPTY;
+        }
+    }
+    // 24-byte x64 TVarData / VARIANT header: [VType:u16][Reserved1..3:6B][Payload:16B]
+    _push_u16_le(buf, vt);
+    _push_u16_le(buf, 0); _push_u16_le(buf, 0); _push_u16_le(buf, 0);
+
+    let aux = nil;
+    if vt == VT_BOOL {
+        // OLE / Delphi Variant Boolean: VARIANT_TRUE = -1 (0xFFFF), VARIANT_FALSE = 0
+        _push_u16_le(buf, if value == true { 65535 } else { 0 });
+    } elif vt == VT_I4 {
+        _push_i32_le(buf, value);
+    } elif vt == VT_I8 or vt == VT_CY {
+        let raw_i64 = if vt == VT_CY { num_round(value * 10000.0) } else { num_floor(value) };
+        _push_i64_le(buf, raw_i64);
+    } elif vt == VT_BSTR {
+        aux = build_com_bstr_bytes(str(value));
+        _push_i64_le(buf, aux.data_ptr_offset);
+    } elif vt == VAR_USTRING {
+        aux = build_delphi_unicode_string_record(str(value), "x64");
+        _push_i64_le(buf, aux.data_ptr_offset);
+    }
+    while len(buf) < 24 { array_push(buf, 0); }
+
+    return map{
+        ok: true,
+        vt: vt,
+        sizeof_x64: 24,
+        sizeof_x86: 16,
+        value: value,
+        out_of_line_payload: aux,
+        bytes: buf
+    };
+}
+
+fn _validate_pas_ident(ident) {
+    let s = str(ident);
+    if len(s) == 0 { throw "delphi_com_bridge: empty Object Pascal identifier"; }
+    let i = 0;
+    while i < len(s) {
+        let c = strcharcodeat(s, i);
+        let ok = (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 or (i > 0 and c >= 48 and c <= 57);
+        if not ok {
+            throw "delphi_com_bridge: unsafe character in Pascal identifier '" + s + "'";
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+fn _c_to_pascal_type(c_type_raw) {
+    let t = _normalize_ws(str_replace_all(c_type_raw, "const ", ""));
+    if t == "char *" or t == "char*" { return "PAnsiChar"; }
+    if t == "wchar_t *" or t == "wchar_t*" or t == "WCHAR *" { return "PWideChar"; }
+    if str_ends_with(t, "*") { return "Pointer"; }
+    if t == "void" { return ""; }
+    if t == "int8_t" or t == "signed char" { return "ShortInt"; }
+    if t == "uint8_t" or t == "unsigned char" or t == "BYTE" { return "Byte"; }
+    if t == "bool" or t == "_Bool" { return " ByteBool"; }
+    if t == "int16_t" or t == "short" { return "SmallInt"; }
+    if t == "uint16_t" or t == "unsigned short" or t == "WORD" { return "Word"; }
+    if t == "int32_t" or t == "int" or t == "LONG" { return "Integer"; }
+    if t == "uint32_t" or t == "unsigned int" or t == "DWORD" { return "Cardinal"; }
+    if t == "int64_t" or t == "long long" { return "Int64"; }
+    if t == "uint64_t" or t == "unsigned long long" { return "UInt64"; }
+    if t == "size_t" or t == "uintptr_t" { return "NativeUInt"; }
+    if t == "ssize_t" or t == "intptr_t" { return "NativeInt"; }
+    if t == "float" { return "Single"; }
+    if t == "double" { return "Double"; }
+    if t == "HRESULT" { return "HResult"; }
+    if str_starts_with(t, "struct ") { return "T" + _validate_pas_ident(str_trim(str_slice(t, 7, len(t)))); }
+    return "T" + _validate_pas_ident(t);
+}
+
+fn generate_delphi_pas_unit(unit_name, parsed_abi, dll_name, opts = nil) {
+    let uname = _validate_pas_ident(unit_name);
+    let clean_dll = str_replace_all(str(dll_name), "'", "");
+    let lines = [
+        "unit " + uname + ";",
+        "",
+        "{$IFDEF FPC}{$MODE DELPHI}{$ENDIF}",
+        "{$ALIGN ON}",
+        "{$MINENUMSIZE 4}",
+        "",
+        "// Auto-generated Sovereign PBLang Wrapper Unit (Delphi 7 .. Delphi 12 Athens compatible)",
+        "interface",
+        "",
+        "{$IF not declared(NativeInt)}",
+        "type",
+        "  NativeInt = Integer;",
+        "  NativeUInt = Cardinal;",
+        "  UInt64 = Int64;",
+        "{$IFEND}",
+        "",
+        "const",
+        "  PBLANG_LIB_NAME = '" + clean_dll + "';"
+    ];
+
+    let has_types = len(parsed_abi.struct_list) > 0 or len(map_keys(parsed_abi.enums)) > 0;
+    if has_types {
+        array_push(lines, "");
+        array_push(lines, "type");
+    }
+
+    let ek = map_keys(parsed_abi.enums);
+    let ei = 0;
+    while ei < len(ek) {
+        let en = _validate_pas_ident(ek[ei]);
+        let evs = parsed_abi.enums[ek[ei]];
+        let ev_keys = map_keys(evs);
+        let items_str = [];
+        let j = 0;
+        while j < len(ev_keys) {
+            let k = _validate_pas_ident(ev_keys[j]);
+            array_push(items_str, k + " = " + str(evs[ev_keys[j]]));
+            j = j + 1;
+        }
+        array_push(lines, "  T" + en + " = (" + str_join(items_str, ", ") + ");");
+        ei = ei + 1;
+    }
+
+    let si = 0;
+    while si < len(parsed_abi.struct_list) {
+        let st = parsed_abi.struct_list[si];
+        let sname = _validate_pas_ident(st.name);
+        let rec_kw = if st.packed { "packed record" } else { "record" };
+        array_push(lines, "  P" + sname + " = ^T" + sname + ";");
+        array_push(lines, "  T" + sname + " = " + rec_kw);
+        let fi = 0;
+        while fi < len(st.fields) {
+            let fld = st.fields[fi];
+            let fnm = _validate_pas_ident(fld.name);
+            let ptype = str_trim(_c_to_pascal_type(fld.c_type));
+            if fld.array_len > 0 {
+                array_push(lines, "    " + fnm + ": array[0.." + str(fld.array_len - 1) + "] of " + ptype + ";");
+            } else {
+                array_push(lines, "    " + fnm + ": " + ptype + ";");
+            }
+            fi = fi + 1;
+        }
+        array_push(lines, "  end;");
+        si = si + 1;
+    }
+
+    if len(parsed_abi.functions) > 0 {
+        array_push(lines, "");
+    }
+    let fni = 0;
+    while fni < len(parsed_abi.functions) {
+        let fn_info = parsed_abi.functions[fni];
+        let fn_id = _validate_pas_ident(fn_info.name);
+        let ret_pas = str_trim(_c_to_pascal_type(fn_info.return_type));
+        let p_strs = [];
+        let pi = 0;
+        while pi < len(fn_info.params) {
+            let prm = fn_info.params[pi];
+            array_push(p_strs, _validate_pas_ident(prm.name) + ": " + str_trim(_c_to_pascal_type(prm.c_type)));
+            pi = pi + 1;
+        }
+        let cc_pas = if fn_info.calling_convention == "stdcall" { "stdcall" } else { "cdecl" };
+        let sig_head = if ret_pas == "" {
+            "procedure " + fn_id + "(" + str_join(p_strs, "; ") + "); " + cc_pas
+        } else {
+            "function " + fn_id + "(" + str_join(p_strs, "; ") + "): " + ret_pas + "; " + cc_pas
+        };
+        array_push(lines, sig_head + "; external PBLANG_LIB_NAME name '" + fn_id + "';");
+        fni = fni + 1;
+    }
+
+    array_push(lines, "");
+    array_push(lines, "implementation");
+    array_push(lines, "");
+    array_push(lines, "end.");
+    return str_join(lines, "\n");
+}
+
+// ============================================================================
+// 3. COM `IUnknown`/`IDispatch`, `GUID`/`BSTR`/`SAFEARRAY`, & `.NET hostfxr`
+// ============================================================================
+
+fn _hex_byte_val(s, pos) {
+    let hi = _parse_int_lit("0x" + str_slice(s, pos, pos + 1), -1);
+    let lo = _parse_int_lit("0x" + str_slice(s, pos + 1, pos + 2), -1);
+    if hi < 0 or lo < 0 { throw "delphi_com_bridge: invalid hex digit in GUID"; }
+    return hi * 16 + lo;
+}
+
+fn _byte_to_hex_upper(b) {
+    let digits = "0123456789ABCDEF";
+    let hi = bit_and(num_floor(b / 16), 15);
+    let lo = bit_and(b, 15);
+    return str_slice(digits, hi, hi + 1) + str_slice(digits, lo, lo + 1);
+}
+
+// Encodes canonical GUID string "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" into 16-byte Win32 mixed-endian layout
+fn encode_com_guid_bytes(guid_str) {
+    let g = str_trim(str(guid_str));
+    if str_starts_with(g, "{") and str_ends_with(g, "}") {
+        g = str_slice(g, 1, len(g) - 1);
+    }
+    let clean = str_replace_all(g, "-", "");
+    if len(clean) != 32 {
+        throw "delphi_com_bridge: GUID must contain exactly 32 hex nibbles";
+    }
+    let raw = [];
+    let i = 0;
+    while i < 16 {
+        array_push(raw, _hex_byte_val(clean, i * 2));
+        i = i + 1;
+    }
+    // Data1 (4B LE), Data2 (2B LE), Data3 (2B LE), Data4 (8B BE unchanged)
+    return [
+        raw[3], raw[2], raw[1], raw[0],
+        raw[5], raw[4],
+        raw[7], raw[6],
+        raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]
+    ];
+}
+
+fn decode_com_guid_bytes(bytes16) {
+    if not is_array(bytes16) or len(bytes16) != 16 {
+        throw "delphi_com_bridge: binary GUID must be 16 bytes";
+    }
+    let b = bytes16;
+    return _byte_to_hex_upper(b[3]) + _byte_to_hex_upper(b[2]) + _byte_to_hex_upper(b[1]) + _byte_to_hex_upper(b[0])
+        + "-" + _byte_to_hex_upper(b[5]) + _byte_to_hex_upper(b[4])
+        + "-" + _byte_to_hex_upper(b[7]) + _byte_to_hex_upper(b[6])
+        + "-" + _byte_to_hex_upper(b[8]) + _byte_to_hex_upper(b[9])
+        + "-" + _byte_to_hex_upper(b[10]) + _byte_to_hex_upper(b[11])
+        + _byte_to_hex_upper(b[12]) + _byte_to_hex_upper(b[13])
+        + _byte_to_hex_upper(b[14]) + _byte_to_hex_upper(b[15]);
+}
+
+// Win32 SysAllocStringLen BSTR: [4B LE byte_length (excluding NUL)][UTF-16LE units][2B 0x00,0x00]
+fn build_com_bstr_bytes(text) {
+    let units = _utf8_to_utf16le_units(text);
+    let byte_len = len(units) * 2;
+    let buf = [];
+    _push_u32_le(buf, byte_len);
+    let i = 0;
+    while i < len(units) {
+        _push_u16_le(buf, units[i]);
+        i = i + 1;
+    }
+    _push_u16_le(buf, 0);
+    return map{
+        ok: true,
+        byte_length: byte_len,
+        char_length: len(units),
+        data_ptr_offset: 4,
+        bytes: buf
+    };
+}
+
+fn parse_com_bstr_bytes(alloc_bytes) {
+    if not is_array(alloc_bytes) or len(alloc_bytes) < 6 {
+        throw "delphi_com_bridge: BSTR allocation buffer too short";
+    }
+    let blen = _u32_le(alloc_bytes, 0);
+    if num_mod(blen, 2) != 0 or 4 + blen + 2 > len(alloc_bytes) {
+        throw "delphi_com_bridge: invalid BSTR length prefix";
+    }
+    return map{
+        ok: true,
+        byte_length: blen,
+        text: _utf16le_bytes_to_utf8(alloc_bytes, 4, blen)
+    };
+}
+
+fn build_com_safearray_descriptor(elements, vt_code = 3, arch = "x64") {
+    let list = if is_array(elements) { elements } else { [] };
+    let ptr_sz = if str_lower(str(arch)) == "x86" { 4 } else { 8 };
+    let cb_elem = if vt_code == VT_I2 or vt_code == VT_BOOL { 2 }
+        elif vt_code == VT_I8 or vt_code == VT_R8 or vt_code == VT_CY { 8 }
+        elif vt_code == VT_VARIANT { if ptr_sz == 8 { 24 } else { 16 } }
+        else { 4 };
+    let payload = [];
+    let i = 0;
+    while i < len(list) {
+        if cb_elem == 2 { _push_u16_le(payload, list[i]); }
+        elif cb_elem == 4 { _push_i32_le(payload, list[i]); }
+        elif cb_elem == 8 { _push_i64_le(payload, list[i]); }
+        i = i + 1;
+    }
+    return map{
+        ok: true,
+        cDims: 1,
+        fFeatures: 128, // FADF_HAVEVARTYPE (0x0080)
+        vt: vt_code,
+        cbElements: cb_elem,
+        cLocks: 0,
+        header_sizeof: if ptr_sz == 8 { 32 } else { 24 },
+        rgsabound: [map{ cElements: len(list), lLbound: 0 }],
+        data_bytes: payload
+    };
+}
+
+fn build_com_vtable_layout(interface_name, custom_methods = nil, opts = nil) {
+    let o = if is_map(opts) { opts } else { map{} };
+    let inherits_idispatch = _opt(o, "inherits_idispatch", true) == true;
+    let ptr_sz = if str_lower(str(_opt(o, "arch", "x64"))) == "x86" { 4 } else { 8 };
+    let iid_str = str(_opt(o, "iid", if inherits_idispatch { IID_IDispatch } else { IID_IUnknown }));
+
+    let slots = [
+        map{ slot: 0, offset: 0, name: "QueryInterface", origin: "IUnknown" },
+        map{ slot: 1, offset: ptr_sz, name: "AddRef", origin: "IUnknown" },
+        map{ slot: 2, offset: ptr_sz * 2, name: "Release", origin: "IUnknown" }
+    ];
+    if inherits_idispatch {
+        array_push(slots, map{ slot: 3, offset: ptr_sz * 3, name: "GetTypeInfoCount", origin: "IDispatch" });
+        array_push(slots, map{ slot: 4, offset: ptr_sz * 4, name: "GetTypeInfo", origin: "IDispatch" });
+        array_push(slots, map{ slot: 5, offset: ptr_sz * 5, name: "GetIDsOfNames", origin: "IDispatch" });
+        array_push(slots, map{ slot: 6, offset: ptr_sz * 6, name: "Invoke", origin: "IDispatch" });
+    }
+    if is_array(custom_methods) {
+        let m = 0;
+        while m < len(custom_methods) {
+            let idx = len(slots);
+            array_push(slots, map{
+                slot: idx,
+                offset: idx * ptr_sz,
+                name: str(custom_methods[m]),
+                origin: str(interface_name)
+            });
+            m = m + 1;
+        }
+    }
+    return map{
+        ok: true,
+        interface_name: str(interface_name),
+        iid: iid_str,
+        iid_bytes: encode_com_guid_bytes(iid_str),
+        pointer_size: ptr_sz,
+        vtable_byte_size: len(slots) * ptr_sz,
+        slots: slots
+    };
+}
+
+// COM Automation IDispatch::Invoke DISPPARAMS: positional arguments MUST be reversed (right-to-left)!
+fn build_idispatch_dispparams(positional_args, named_put_value = nil, arch = "x64") {
+    let pos = if is_array(positional_args) { positional_args } else { [] };
+    let ptr_sz = if str_lower(str(arch)) == "x86" { 4 } else { 8 };
+    let rgvarg = [];
+    let named_dispids = [];
+
+    if named_put_value != nil {
+        array_push(rgvarg, marshal_delphi_variant(named_put_value));
+        array_push(named_dispids, DISPID_PROPERTYPUT);
+    }
+    // Push positional arguments in reverse order (last logical arg at lowest memory index after named args)
+    let i = len(pos) - 1;
+    while i >= 0 {
+        array_push(rgvarg, marshal_delphi_variant(pos[i]));
+        i = i - 1;
+    }
+
+    return map{
+        ok: true,
+        cArgs: len(rgvarg),
+        cNamedArgs: len(named_dispids),
+        rgvarg: rgvarg,
+        rgdispidNamedArgs: named_dispids,
+        dispatch_flags: if named_put_value != nil { DISPATCH_PROPERTYPUT } else { DISPATCH_METHOD },
+        struct_sizeof: if ptr_sz == 8 { 24 } else { 16 }
+    };
+}
+
+fn build_dotnet_hostfxr_config(opts = nil) {
+    let o = if is_map(opts) { opts } else { map{} };
+    let tfm = str(_opt(o, "tfm", "net9.0"));
+    let fw_version = str(_opt(o, "framework_version", if tfm == "net8.0" { "8.0.0" } else { "9.0.0" }));
+    let asm_name = _validate_pas_ident(_opt(o, "assembly_name", "PBLangManagedBridge"));
+    let ns_name = _validate_pas_ident(_opt(o, "namespace_name", "PBLangInterop"));
+    let cls_name = _validate_pas_ident(_opt(o, "class_name", "NativeExports"));
+    let method_name = _validate_pas_ident(_opt(o, "method_name", "InvokeEntry"));
+    let server_gc = _opt(o, "server_gc", true) == true;
+
+    let runtimeconfig_obj = map{
+        runtimeOptions: map{
+            tfm: tfm,
+            rollForward: "LatestMinor",
+            framework: map{
+                name: "Microsoft.NETCore.App",
+                version: fw_version
+            },
+            configProperties: map{
+                "System.GC.Server": server_gc,
+                "System.Runtime.TieredCompilation": true
+            }
+        }
+    };
+
+    let csharp_stub = str_join([
+        "using System;",
+        "using System.Runtime.CompilerServices;",
+        "using System.Runtime.InteropServices;",
+        "",
+        "namespace " + ns_name + ";",
+        "public static class " + cls_name,
+        "{",
+        "    [UnmanagedCallersOnly(EntryPoint = \"" + method_name + "\", CallConvs = new[] { typeof(CallConvCdecl) })]",
+        "    public static int " + method_name + "(IntPtr payloadPtr, int payloadLength)",
+        "    {",
+        "        return payloadLength >= 0 ? 0 : -1;",
+        "    }",
+        "}"
+    ], "\n");
+
+    return map{
+        ok: true,
+        tfm: tfm,
+        framework_version: fw_version,
+        runtimeconfig_json: json_stringify(runtimeconfig_obj),
+        hostfxr_delegate_type: "hdt_load_assembly_and_get_function_pointer",
+        hostfxr_delegate_enum_id: 5,
+        assembly_qualified_type: ns_name + "." + cls_name + ", " + asm_name,
+        method_name: method_name,
+        delegate_type_marker: "UNMANAGEDCALLERSONLY_METHOD (-1)",
+        csharp_unmanaged_callers_only_stub: csharp_stub
+    };
+}
+
+export MODULE_VERSION;
+export IID_IUnknown, IID_IDispatch, IID_IClassFactory;
+export VT_EMPTY, VT_NULL, VT_I2, VT_I4, VT_R4, VT_R8, VT_CY, VT_DATE, VT_BSTR,
+       VT_DISPATCH, VT_BOOL, VT_VARIANT, VT_UNKNOWN, VT_I8, VT_UI8, VAR_USTRING;
+export S_OK, E_NOINTERFACE, E_POINTER, E_FAIL, DISPID_PROPERTYPUT,
+       DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPATCH_PROPERTYPUT;
+export parse_c_header_abi;
+export build_delphi_unicode_string_record, parse_delphi_unicode_string_record,
+       build_delphi_shortstring_bytes, build_delphi_ansistring_record,
+       encode_delphi_currency, decode_delphi_currency,
+       encode_delphi_tdatetime, decode_delphi_tdatetime,
+       marshal_delphi_variant, generate_delphi_pas_unit;
+export encode_com_guid_bytes, decode_com_guid_bytes,
+       build_com_bstr_bytes, parse_com_bstr_bytes,
+       build_com_safearray_descriptor, build_com_vtable_layout,
+       build_idispatch_dispparams, build_dotnet_hostfxr_config;

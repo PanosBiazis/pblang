@@ -1,0 +1,1609 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+//
+// stdlib/devtools/debugger_timetravel_dap.sapp — PBLang v5.0.0 Pure-PBLang
+// Interactive Step-Debugger, Deterministic Time-Travel (`step-back`) Ring-Buffer Engine,
+// Conditional Breakpoint & Data Watchpoint Evaluator, and VS Code / pbIDE
+// Debug Adapter Protocol (DAP) Wire Server.
+
+let DEBUGGER_ENGINE_VERSION = "5.0.0";
+let DEFAULT_MAX_SNAPSHOTS = 4096;
+
+fn _opt(m, key, fallback) {
+    if m == nil or type(m) != "map" { return fallback; }
+    if not map_has(m, key) { return fallback; }
+    let v = m[key];
+    if v == nil { return fallback; }
+    return v;
+}
+
+fn _deep_clone(val) {
+    let t = type(val);
+    if val == nil or t == "bool" or t == "number" or t == "string" {
+        return val;
+    }
+    if t == "array" {
+        let out = [];
+        let i = 0;
+        while i < len(val) {
+            array_push(out, _deep_clone(val[i]));
+            i = i + 1;
+        }
+        return out;
+    }
+    if t == "map" {
+        let out = map{};
+        let ks = map_keys(val);
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            out[k] = _deep_clone(val[k]);
+            i = i + 1;
+        }
+        return out;
+    }
+    return str(val);
+}
+
+fn _sort_strings(arr) {
+    let out = [];
+    let i = 0;
+    while i < len(arr) {
+        array_push(out, str(arr[i]));
+        i = i + 1;
+    }
+    let n = len(out);
+    let a = 0;
+    while a < n {
+        let b = a + 1;
+        while b < n {
+            if out[b] < out[a] {
+                let tmp = out[a];
+                out[a] = out[b];
+                out[b] = tmp;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    return out;
+}
+
+fn _canonical_repr(val) {
+    let t = type(val);
+    if val == nil { return "nil"; }
+    if t == "bool" { return if val { "true" } else { "false" }; }
+    if t == "number" { return str(val); }
+    if t == "string" { return "\"" + str_replace_all(str_replace_all(val, "\\", "\\\\"), "\"", "\\\"") + "\""; }
+    if t == "array" {
+        let parts = [];
+        let i = 0;
+        while i < len(val) {
+            array_push(parts, _canonical_repr(val[i]));
+            i = i + 1;
+        }
+        return "[" + str_join(parts, ", ") + "]";
+    }
+    if t == "map" {
+        let ks = _sort_strings(map_keys(val));
+        let parts = [];
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            array_push(parts, k + ": " + _canonical_repr(val[k]));
+            i = i + 1;
+        }
+        return "{" + str_join(parts, ", ") + "}";
+    }
+    return str(val);
+}
+
+fn _normalize_file_key(file_path) {
+    if file_path == nil { return "<anonymous>"; }
+    let clean = str_trim(str_replace_all(str(file_path), "\\", "/"));
+    if len(clean) == 0 { return "<anonymous>"; }
+    return clean;
+}
+
+fn _files_match(bp_file, ev_file) {
+    let a = _normalize_file_key(bp_file);
+    let b = _normalize_file_key(ev_file);
+    if a == b { return true; }
+    if path_basename(a) == path_basename(b) and (not str_contains(a, "/") or not str_contains(b, "/")) {
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// Pure-PBLang Conditional Breakpoint & Hover Expression Evaluator
+// ============================================================================
+
+fn _is_space_code(c) {
+    return c == 32 or c == 9 or c == 10 or c == 13;
+}
+
+fn _is_digit_code(c) {
+    return c >= 48 and c <= 57;
+}
+
+fn _is_ident_start_code(c) {
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 or c >= 128;
+}
+
+fn _is_ident_part_code(c) {
+    return _is_ident_start_code(c) or _is_digit_code(c);
+}
+
+fn _tokenize_expr(expr_text) {
+    let s = str(expr_text);
+    let n = len(s);
+    let toks = [];
+    let i = 0;
+    while i < n {
+        let c = strcharcodeat(s, i);
+        if _is_space_code(c) {
+            i = i + 1;
+        } elif c == 34 or c == 39 {
+            let quote = c;
+            i = i + 1;
+            let buf = "";
+            while i < n and strcharcodeat(s, i) != quote {
+                let ch_code = strcharcodeat(s, i);
+                if ch_code == 92 and i + 1 < n {
+                    let nxt = str_slice(s, i + 1, i + 2);
+                    if nxt == "n" { buf = buf + "\n"; }
+                    elif nxt == "t" { buf = buf + "\t"; }
+                    elif nxt == "r" { buf = buf + "\r"; }
+                    elif nxt == "\"" { buf = buf + "\""; }
+                    elif nxt == "'" { buf = buf + "'"; }
+                    elif nxt == "\\" { buf = buf + "\\"; }
+                    else { buf = buf + nxt; }
+                    i = i + 2;
+                } else {
+                    buf = buf + str_slice(s, i, i + 1);
+                    i = i + 1;
+                }
+            }
+            if i < n and strcharcodeat(s, i) == quote { i = i + 1; }
+            array_push(toks, map{ "kind": "str", "val": buf });
+        } elif _is_digit_code(c) {
+            let start = i;
+            let seen_dot = false;
+            while i < n {
+                let dc = strcharcodeat(s, i);
+                if _is_digit_code(dc) {
+                    i = i + 1;
+                } elif dc == 46 and not seen_dot {
+                    seen_dot = true;
+                    i = i + 1;
+                } else {
+                    dc = 0;
+                    break;
+                }
+            }
+            let num_txt = str_slice(s, start, i);
+            let parsed = parse_number(num_txt);
+            array_push(toks, map{ "kind": "num", "val": if parsed == nil { 0 } else { parsed } });
+        } elif _is_ident_start_code(c) {
+            let start = i;
+            while i < n and _is_ident_part_code(strcharcodeat(s, i)) {
+                i = i + 1;
+            }
+            let word = str_slice(s, start, i);
+            if word == "true" {
+                array_push(toks, map{ "kind": "bool", "val": true });
+            } elif word == "false" {
+                array_push(toks, map{ "kind": "bool", "val": false });
+            } elif word == "nil" or word == "null" {
+                array_push(toks, map{ "kind": "nil", "val": nil });
+            } elif word == "and" {
+                array_push(toks, map{ "kind": "op", "val": "&&" });
+            } elif word == "or" {
+                array_push(toks, map{ "kind": "op", "val": "||" });
+            } elif word == "not" {
+                array_push(toks, map{ "kind": "op", "val": "!" });
+            } else {
+                array_push(toks, map{ "kind": "ident", "val": word });
+            }
+        } else {
+            let two = if i + 2 <= n { str_slice(s, i, i + 2) } else { "" };
+            if two == "&&" or two == "||" or two == "==" or two == "!=" or two == "<=" or two == ">=" {
+                array_push(toks, map{ "kind": "op", "val": two });
+                i = i + 2;
+            } else {
+                let one = str_slice(s, i, i + 1);
+                if one == "(" or one == ")" or one == "[" or one == "]" or one == "," or one == "." {
+                    array_push(toks, map{ "kind": "punct", "val": one });
+                } else {
+                    array_push(toks, map{ "kind": "op", "val": one });
+                }
+                i = i + 1;
+            }
+        }
+    }
+    array_push(toks, map{ "kind": "eof", "val": "" });
+    return toks;
+}
+
+fn _truthy(v) {
+    if v == nil { return false; }
+    if type(v) == "bool" { return v; }
+    if type(v) == "number" { return v != 0; }
+    if type(v) == "string" { return len(v) > 0; }
+    return true;
+}
+
+fn _peek_tok(st) {
+    return st.toks[st.pos];
+}
+
+fn _next_tok(st) {
+    let t = st.toks[st.pos];
+    if st.pos + 1 < len(st.toks) { st.pos = st.pos + 1; }
+    return t;
+}
+
+fn _eval_expr_or(st) {
+    let left = _eval_expr_and(st);
+    while _peek_tok(st)["kind"] == "op" and _peek_tok(st)["val"] == "||" {
+        _next_tok(st);
+        let right = _eval_expr_and(st);
+        left = _truthy(left) or _truthy(right);
+    }
+    return left;
+}
+
+fn _eval_expr_and(st) {
+    let left = _eval_expr_eq(st);
+    while _peek_tok(st)["kind"] == "op" and _peek_tok(st)["val"] == "&&" {
+        _next_tok(st);
+        let right = _eval_expr_eq(st);
+        left = _truthy(left) and _truthy(right);
+    }
+    return left;
+}
+
+fn _eval_expr_eq(st) {
+    let left = _eval_expr_rel(st);
+    while _peek_tok(st)["kind"] == "op" and (_peek_tok(st)["val"] == "==" or _peek_tok(st)["val"] == "!=") {
+        let op = _next_tok(st)["val"];
+        let right = _eval_expr_rel(st);
+        if op == "==" { left = (left == right); }
+        else { left = (left != right); }
+    }
+    return left;
+}
+
+fn _eval_expr_rel(st) {
+    let left = _eval_expr_add(st);
+    while _peek_tok(st)["kind"] == "op" and (
+        _peek_tok(st)["val"] == "<" or _peek_tok(st)["val"] == "<=" or
+        _peek_tok(st)["val"] == ">" or _peek_tok(st)["val"] == ">="
+    ) {
+        let op = _next_tok(st)["val"];
+        let right = _eval_expr_add(st);
+        if type(left) == "number" and type(right) == "number" {
+            if op == "<" { left = left < right; }
+            elif op == "<=" { left = left <= right; }
+            elif op == ">" { left = left > right; }
+            else { left = left >= right; }
+        } elif type(left) == "string" and type(right) == "string" {
+            if op == "<" { left = left < right; }
+            elif op == "<=" { left = left <= right; }
+            elif op == ">" { left = left > right; }
+            else { left = left >= right; }
+        } else {
+            left = false;
+        }
+    }
+    return left;
+}
+
+fn _eval_expr_add(st) {
+    let left = _eval_expr_mul(st);
+    while _peek_tok(st)["kind"] == "op" and (_peek_tok(st)["val"] == "+" or _peek_tok(st)["val"] == "-") {
+        let op = _next_tok(st)["val"];
+        let right = _eval_expr_mul(st);
+        if op == "+" {
+            if type(left) == "string" or type(right) == "string" {
+                left = str(left) + str(right);
+            } elif type(left) == "number" and type(right) == "number" {
+                left = left + right;
+            } else {
+                throw "type error in '+'";
+            }
+        } else {
+            if type(left) == "number" and type(right) == "number" {
+                left = left - right;
+            } else {
+                throw "type error in '-'";
+            }
+        }
+    }
+    return left;
+}
+
+fn _eval_expr_mul(st) {
+    let left = _eval_expr_unary(st);
+    while _peek_tok(st)["kind"] == "op" and (
+        _peek_tok(st)["val"] == "*" or _peek_tok(st)["val"] == "/" or _peek_tok(st)["val"] == "%"
+    ) {
+        let op = _next_tok(st)["val"];
+        let right = _eval_expr_unary(st);
+        if type(left) != "number" or type(right) != "number" {
+            throw "type error in multiplicative op";
+        }
+        if op == "*" { left = left * right; }
+        elif op == "/" {
+            if right == 0 { throw "division by zero"; }
+            left = left / right;
+        } else {
+            if right == 0 { throw "modulo by zero"; }
+            left = num_mod(left, right);
+        }
+    }
+    return left;
+}
+
+fn _eval_expr_unary(st) {
+    let pk = _peek_tok(st);
+    if pk["kind"] == "op" and pk["val"] == "!" {
+        _next_tok(st);
+        return not _truthy(_eval_expr_unary(st));
+    }
+    if pk["kind"] == "op" and pk["val"] == "-" {
+        _next_tok(st);
+        let v = _eval_expr_unary(st);
+        if type(v) != "number" { throw "unary '-' expects number"; }
+        return 0 - v;
+    }
+    return _eval_expr_postfix(st);
+}
+
+fn _eval_builtin_call(name, args) {
+    if name == "len" and len(args) == 1 { return len(args[0]); }
+    if name == "str" and len(args) == 1 { return str(args[0]); }
+    if name == "type" and len(args) == 1 { return type(args[0]); }
+    if name == "abs" or name == "num_abs" { return num_abs(args[0]); }
+    if name == "floor" or name == "num_floor" { return num_floor(args[0]); }
+    if name == "upper" or name == "str_upper" { return str_upper(str(args[0])); }
+    if name == "lower" or name == "str_lower" { return str_lower(str(args[0])); }
+    if name == "contains" or name == "str_contains" { return str_contains(str(args[0]), str(args[1])); }
+    if name == "map_has" and len(args) == 2 and type(args[0]) == "map" { return map_has(args[0], str(args[1])); }
+    throw "unknown debugger helper function '" + name + "'";
+}
+
+fn _eval_expr_postfix(st) {
+    let pk = _peek_tok(st);
+    let val = nil;
+    if pk["kind"] == "num" or pk["kind"] == "str" or pk["kind"] == "bool" or pk["kind"] == "nil" {
+        val = _next_tok(st)["val"];
+    } elif pk["kind"] == "punct" and pk["val"] == "(" {
+        _next_tok(st);
+        val = _eval_expr_or(st);
+        if _peek_tok(st)["kind"] == "punct" and _peek_tok(st)["val"] == ")" {
+            _next_tok(st);
+        }
+    } elif pk["kind"] == "ident" {
+        let ident = _next_tok(st)["val"];
+        if _peek_tok(st)["kind"] == "punct" and _peek_tok(st)["val"] == "(" {
+            _next_tok(st);
+            let args = [];
+            if not (_peek_tok(st)["kind"] == "punct" and _peek_tok(st)["val"] == ")") {
+                array_push(args, _eval_expr_or(st));
+                while _peek_tok(st)["kind"] == "punct" and _peek_tok(st)["val"] == "," {
+                    _next_tok(st);
+                    array_push(args, _eval_expr_or(st));
+                }
+            }
+            if _peek_tok(st)["kind"] == "punct" and _peek_tok(st)["val"] == ")" {
+                _next_tok(st);
+            }
+            val = _eval_builtin_call(ident, args);
+        } elif st.locals != nil and type(st.locals) == "map" and map_has(st.locals, ident) {
+            val = st.locals[ident];
+        } elif st.globals != nil and type(st.globals) == "map" and map_has(st.globals, ident) {
+            val = st.globals[ident];
+        } else {
+            throw "undefined symbol '" + ident + "'";
+        }
+    } else {
+        throw "unexpected token '" + str(pk["val"]) + "'";
+    }
+
+    while true {
+        let nxt = _peek_tok(st);
+        if nxt["kind"] == "punct" and nxt["val"] == "." {
+            _next_tok(st);
+            let fld = _next_tok(st);
+            if type(val) == "map" and map_has(val, str(fld["val"])) {
+                val = val[str(fld["val"])];
+            } else {
+                val = nil;
+            }
+        } elif nxt["kind"] == "punct" and nxt["val"] == "[" {
+            _next_tok(st);
+            let idx = _eval_expr_or(st);
+            if _peek_tok(st)["kind"] == "punct" and _peek_tok(st)["val"] == "]" {
+                _next_tok(st);
+            }
+            if type(val) == "array" and type(idx) == "number" and idx >= 0 and idx < len(val) {
+                val = val[idx];
+            } elif type(val) == "map" and map_has(val, str(idx)) {
+                val = val[str(idx)];
+            } else {
+                val = nil;
+            }
+        } else {
+            break;
+        }
+    }
+    return val;
+}
+
+fn debugger_eval_expression(expr_text, locals = nil, globals = nil) {
+    let trimmed = str_trim(str(expr_text));
+    if len(trimmed) == 0 {
+        return map{ "ok": false, "value": nil, "repr": "nil", "val_type": "nil", "error": "empty expression" };
+    }
+    let st = map{
+        "toks": _tokenize_expr(trimmed),
+        "pos": 0,
+        "locals": if locals == nil { map{} } else { locals },
+        "globals": if globals == nil { map{} } else { globals }
+    };
+    return try {
+        let v = _eval_expr_or(st);
+        map{
+            "ok": true,
+            "value": v,
+            "repr": _canonical_repr(v),
+            "val_type": type(v),
+            "error": nil
+        }
+    } catch err {
+        map{
+            "ok": false,
+            "value": nil,
+            "repr": "<error: " + str(err) + ">",
+            "val_type": "error",
+            "error": str(err)
+        }
+    };
+}
+
+fn _check_hit_condition(hit_cond, hits) {
+    if hit_cond == nil { return true; }
+    let raw = str_trim(str(hit_cond));
+    if len(raw) == 0 { return true; }
+    let direct_num = parse_number(raw);
+    if direct_num != nil {
+        return hits == direct_num;
+    }
+    let expr = if str_starts_with(raw, "%") or str_starts_with(raw, "==") or
+                  str_starts_with(raw, ">=") or str_starts_with(raw, "<=") or
+                  str_starts_with(raw, ">") or str_starts_with(raw, "<") {
+        "hits " + raw
+    } else {
+        raw
+    };
+    let ev = debugger_eval_expression(expr, map{ "hits": hits }, nil);
+    return ev["ok"] and _truthy(ev["value"]);
+}
+
+// ============================================================================
+// Session, Breakpoints, Data Watchpoints & Time-Travel Circular Ring Buffer
+// ============================================================================
+
+fn debugger_session_new(opts = nil) {
+    let max_snaps = _opt(opts, "max_snapshots", DEFAULT_MAX_SNAPSHOTS);
+    if type(max_snaps) != "number" or max_snaps < 8 { max_snaps = DEFAULT_MAX_SNAPSHOTS; }
+    let ring_slots = [];
+    return map{
+        "format": "pblang.debugger.session.v5",
+        "version": DEBUGGER_ENGINE_VERSION,
+        "max_snapshots": num_floor(max_snaps),
+        "ring_slots": ring_slots,
+        "ring_write_pos": 0,
+        "ring_count": 0,
+        "cursor_offset_from_latest": 0,
+        "seq_counter": 0,
+        "next_bp_id": 1,
+        "next_watch_id": 1,
+        "breakpoints": [],
+        "watches": [],
+        "watch_last_values": map{},
+        "sources": map{},
+        "globals": _deep_clone(_opt(opts, "globals", map{})),
+        "mode": "continue",
+        "step_target_depth": 0,
+        "step_start_file": "",
+        "step_start_line": 0,
+        "stop_on_entry": _opt(opts, "stop_on_entry", false),
+        "entry_seen": false,
+        "stopped": false,
+        "stop_reason": "",
+        "stop_description": "",
+        "hit_breakpoint_ids": [],
+        "time_travel_active": false,
+        "current_snapshot": nil,
+        "stdout_log": "",
+        "queued_trace_events": [],
+        "queued_trace_index": 0,
+        "dap_seq": 1,
+        "dap_initialized": false,
+        "dap_configured": false,
+        "disconnected": false,
+        "dap_outbox": [],
+        "var_handles": map{},
+        "next_var_ref": 3000,
+        "vm_hook_bound": false
+    };
+}
+
+fn debugger_bind_vm_hook(sess) {
+    let available = try is_fn(debug_set_hook) catch false;
+    sess.vm_hook_bound = available;
+    return map{
+        "bound": available,
+        "mode": if available { "native_vm_hook" } else { "deterministic_trace_driver" }
+    };
+}
+
+fn debugger_load_source(sess, file_path, source_text) {
+    let clean = _normalize_file_key(file_path);
+    let normalized = str_replace_all(str(source_text), "\r\n", "\n");
+    sess.sources[clean] = str_split(normalized, "\n");
+    return len(sess.sources[clean]);
+}
+
+fn debugger_instrument_sapp_source(file_path, source_text) {
+    let clean = _normalize_file_key(file_path);
+    let lines = str_split(str_replace_all(str(source_text), "\r\n", "\n"), "\n");
+    let out = [];
+    let i = 0;
+    while i < len(lines) {
+        let ln = lines[i];
+        let trimmed = str_trim(ln);
+        let line_no = i + 1;
+        if len(trimmed) > 0 and not str_starts_with(trimmed, "//") and
+           not str_starts_with(trimmed, "}") and not str_starts_with(trimmed, "elif ") and
+           not str_starts_with(trimmed, "else") and not str_starts_with(trimmed, "export ") {
+            array_push(out, "__pb_dbg_trace(\"" + clean + "\", " + str(line_no) + "); " + ln);
+        } else {
+            array_push(out, ln);
+        }
+        i = i + 1;
+    }
+    return str_join(out, "\n");
+}
+
+fn debugger_add_breakpoint(sess, file_path, line_no, condition = nil, hit_condition = nil) {
+    let bp = map{
+        "id": sess.next_bp_id,
+        "file": _normalize_file_key(file_path),
+        "line": num_floor(line_no),
+        "condition": if condition == nil or len(str_trim(str(condition))) == 0 { nil } else { str_trim(str(condition)) },
+        "hit_condition": if hit_condition == nil or len(str_trim(str(hit_condition))) == 0 { nil } else { str_trim(str(hit_condition)) },
+        "enabled": true,
+        "verified": true,
+        "hits": 0
+    };
+    sess.next_bp_id = sess.next_bp_id + 1;
+    array_push(sess.breakpoints, bp);
+    return bp;
+}
+
+fn debugger_remove_breakpoint(sess, target_id_or_loc) {
+    let kept = [];
+    let removed = 0;
+    let i = 0;
+    while i < len(sess.breakpoints) {
+        let bp = sess.breakpoints[i];
+        let match_id = (type(target_id_or_loc) == "number" and bp["id"] == target_id_or_loc);
+        let match_loc = (type(target_id_or_loc) == "string" and (bp["file"] + ":" + str(bp["line"])) == target_id_or_loc);
+        if match_id or match_loc {
+            removed = removed + 1;
+        } else {
+            array_push(kept, bp);
+        }
+        i = i + 1;
+    }
+    sess.breakpoints = kept;
+    return removed > 0;
+}
+
+fn debugger_clear_breakpoints_for_file(sess, file_path) {
+    let kept = [];
+    let i = 0;
+    while i < len(sess.breakpoints) {
+        let bp = sess.breakpoints[i];
+        if not _files_match(bp["file"], file_path) {
+            array_push(kept, bp);
+        }
+        i = i + 1;
+    }
+    sess.breakpoints = kept;
+}
+
+fn debugger_add_watch(sess, expr_or_var, break_on_change = true) {
+    let w = map{
+        "id": sess.next_watch_id,
+        "expr": str_trim(str(expr_or_var)),
+        "break_on_change": break_on_change,
+        "enabled": true,
+        "hits": 0
+    };
+    sess.next_watch_id = sess.next_watch_id + 1;
+    array_push(sess.watches, w);
+    return w;
+}
+
+fn debugger_remove_watch(sess, watch_id) {
+    let kept = [];
+    let removed = false;
+    let i = 0;
+    while i < len(sess.watches) {
+        if sess.watches[i]["id"] == watch_id {
+            removed = true;
+        } else {
+            array_push(kept, sess.watches[i]);
+        }
+        i = i + 1;
+    }
+    sess.watches = kept;
+    return removed;
+}
+
+fn _ring_push_snapshot(sess, snap) {
+    let cap = sess.max_snapshots;
+    if len(sess.ring_slots) < cap {
+        array_push(sess.ring_slots, snap);
+        sess.ring_write_pos = num_mod(len(sess.ring_slots), cap);
+        sess.ring_count = len(sess.ring_slots);
+    } else {
+        sess.ring_slots[sess.ring_write_pos] = snap;
+        sess.ring_write_pos = num_mod(sess.ring_write_pos + 1, cap);
+        sess.ring_count = cap;
+    }
+    sess.cursor_offset_from_latest = 0;
+}
+
+fn _ring_get_by_offset_from_latest(sess, offset_back) {
+    if sess.ring_count == 0 { return nil; }
+    if offset_back < 0 or offset_back >= sess.ring_count { return nil; }
+    let cap = sess.max_snapshots;
+    let latest_idx = if len(sess.ring_slots) < cap {
+        sess.ring_count - 1
+    } else {
+        num_mod(sess.ring_write_pos + cap - 1, cap)
+    };
+    let target_idx = if len(sess.ring_slots) < cap {
+        latest_idx - offset_back
+    } else {
+        num_mod(latest_idx + cap - offset_back, cap)
+    };
+    return _deep_clone(sess.ring_slots[target_idx]);
+}
+
+fn debugger_on_trace_event(sess, event) {
+    let ev_file = _normalize_file_key(_opt(event, "file", "app.sapp"));
+    let ev_func = str(_opt(event, "func", "main"));
+    let ev_line = num_floor(_opt(event, "line", 1));
+    let ev_depth = num_floor(_opt(event, "depth", 1));
+    let ev_locals = _deep_clone(_opt(event, "locals", map{}));
+    let out_chunk = str(_opt(event, "stdout", ""));
+    if len(out_chunk) > 0 {
+        sess.stdout_log = sess.stdout_log + out_chunk;
+    }
+
+    let raw_stack = _opt(event, "stack", nil);
+    let ev_stack = if type(raw_stack) == "array" and len(raw_stack) > 0 {
+        _deep_clone(raw_stack)
+    } else {
+        [map{ "func": ev_func, "file": ev_file, "line": ev_line, "column": 1 }]
+    };
+
+    // Evaluate all watches and check data watchpoint transitions
+    let watch_snapshot = map{};
+    let watch_triggered = false;
+    let watch_desc = "";
+    let wi = 0;
+    while wi < len(sess.watches) {
+        let w = sess.watches[wi];
+        if w["enabled"] {
+            let expr = w["expr"];
+            let res = debugger_eval_expression(expr, ev_locals, sess.globals);
+            let cur_repr = if res["ok"] { res["repr"] } else { "<undef>" };
+            watch_snapshot[expr] = cur_repr;
+            if map_has(sess.watch_last_values, expr) {
+                let prev_repr = sess.watch_last_values[expr];
+                if prev_repr != cur_repr and cur_repr != "<undef>" and w["break_on_change"] {
+                    w["hits"] = w["hits"] + 1;
+                    watch_triggered = true;
+                    watch_desc = "watch '" + expr + "' changed: " + prev_repr + " -> " + cur_repr;
+                }
+            }
+            if cur_repr != "<undef>" {
+                sess.watch_last_values[expr] = cur_repr;
+            }
+        }
+        wi = wi + 1;
+    }
+
+    sess.seq_counter = sess.seq_counter + 1;
+    let snap = map{
+        "seq": sess.seq_counter,
+        "file": ev_file,
+        "func": ev_func,
+        "line": ev_line,
+        "depth": ev_depth,
+        "locals": ev_locals,
+        "watches": watch_snapshot,
+        "stack": ev_stack,
+        "stdout_pos": len(sess.stdout_log)
+    };
+    _ring_push_snapshot(sess, snap);
+    sess.current_snapshot = _deep_clone(snap);
+    sess.time_travel_active = false;
+    sess.hit_breakpoint_ids = [];
+
+    let should_stop = false;
+    let reason = "";
+    let desc = "";
+
+    if not sess.entry_seen {
+        sess.entry_seen = true;
+        if sess.stop_on_entry {
+            should_stop = true;
+            reason = "entry";
+            desc = "Paused on program entry";
+        }
+    }
+
+    // Check file:line + conditional + hit-count breakpoints
+    let bi = 0;
+    while bi < len(sess.breakpoints) {
+        let bp = sess.breakpoints[bi];
+        if bp["enabled"] and bp["line"] == ev_line and _files_match(bp["file"], ev_file) {
+            let cond_ok = true;
+            if bp["condition"] != nil {
+                let cev = debugger_eval_expression(bp["condition"], ev_locals, sess.globals);
+                cond_ok = cev["ok"] and _truthy(cev["value"]);
+            }
+            if cond_ok {
+                bp["hits"] = bp["hits"] + 1;
+                if _check_hit_condition(bp["hit_condition"], bp["hits"]) {
+                    should_stop = true;
+                    reason = "breakpoint";
+                    desc = "Breakpoint #" + str(bp["id"]) + " at " + ev_file + ":" + str(ev_line);
+                    array_push(sess.hit_breakpoint_ids, bp["id"]);
+                }
+            }
+        }
+        bi = bi + 1;
+    }
+
+    if not should_stop and watch_triggered {
+        should_stop = true;
+        reason = "data breakpoint";
+        desc = watch_desc;
+    }
+
+    if not should_stop {
+        if sess.mode == "pause" {
+            should_stop = true;
+            reason = "pause";
+            desc = "Paused";
+        } elif sess.mode == "step_in" {
+            should_stop = true;
+            reason = "step";
+            desc = "Stepped into " + ev_func + " at " + ev_file + ":" + str(ev_line);
+        } elif sess.mode == "step_over" {
+            if ev_depth < sess.step_target_depth or
+               (ev_depth == sess.step_target_depth and (ev_line != sess.step_start_line or ev_file != sess.step_start_file)) {
+                should_stop = true;
+                reason = "step";
+                desc = "Stepped over to " + ev_file + ":" + str(ev_line);
+            }
+        } elif sess.mode == "step_out" {
+            if ev_depth < sess.step_target_depth {
+                should_stop = true;
+                reason = "step";
+                desc = "Stepped out to " + ev_func + " at " + ev_file + ":" + str(ev_line);
+            }
+        }
+    }
+
+    sess.stopped = should_stop;
+    sess.stop_reason = reason;
+    sess.stop_description = desc;
+    if should_stop {
+        sess.mode = "paused";
+    }
+    return map{
+        "stopped": should_stop,
+        "reason": reason,
+        "description": desc,
+        "hit_breakpoint_ids": _deep_clone(sess.hit_breakpoint_ids),
+        "snapshot": _deep_clone(snap)
+    };
+}
+
+fn _set_stepping_mode(sess, new_mode) {
+    sess.stopped = false;
+    sess.stop_reason = "";
+    sess.mode = new_mode;
+    if sess.current_snapshot != nil {
+        sess.step_target_depth = sess.current_snapshot["depth"];
+        sess.step_start_file = sess.current_snapshot["file"];
+        sess.step_start_line = sess.current_snapshot["line"];
+    } else {
+        sess.step_target_depth = 1;
+        sess.step_start_file = "";
+        sess.step_start_line = 0;
+    }
+}
+
+fn debugger_load_trace_script(sess, events) {
+    sess.queued_trace_events = _deep_clone(events);
+    sess.queued_trace_index = 0;
+    return len(sess.queued_trace_events);
+}
+
+fn debugger_advance_until_stop(sess) {
+    // If we are rewound in history and asked to step forward or continue, replay history first!
+    while sess.cursor_offset_from_latest > 0 {
+        sess.cursor_offset_from_latest = sess.cursor_offset_from_latest - 1;
+        let hist = _ring_get_by_offset_from_latest(sess, sess.cursor_offset_from_latest);
+        sess.current_snapshot = hist;
+        sess.time_travel_active = sess.cursor_offset_from_latest > 0;
+        if sess.mode == "step_in" {
+            sess.stopped = true;
+            sess.stop_reason = "step";
+            sess.mode = "paused";
+            return map{ "stopped": true, "terminated": false, "reason": "step", "snapshot": hist };
+        }
+        if sess.mode == "step_over" and hist["depth"] <= sess.step_target_depth {
+            sess.stopped = true;
+            sess.stop_reason = "step";
+            sess.mode = "paused";
+            return map{ "stopped": true, "terminated": false, "reason": "step", "snapshot": hist };
+        }
+        if sess.mode == "step_out" and hist["depth"] < sess.step_target_depth {
+            sess.stopped = true;
+            sess.stop_reason = "step";
+            sess.mode = "paused";
+            return map{ "stopped": true, "terminated": false, "reason": "step", "snapshot": hist };
+        }
+        // Check breakpoints during history replay
+        let bi = 0;
+        while bi < len(sess.breakpoints) {
+            let bp = sess.breakpoints[bi];
+            if bp["enabled"] and bp["line"] == hist["line"] and _files_match(bp["file"], hist["file"]) {
+                let cond_ok = if bp["condition"] == nil { true } else {
+                    let cev = debugger_eval_expression(bp["condition"], hist["locals"], sess.globals);
+                    cev["ok"] and _truthy(cev["value"])
+                };
+                if cond_ok {
+                    sess.stopped = true;
+                    sess.stop_reason = "breakpoint";
+                    sess.mode = "paused";
+                    return map{ "stopped": true, "terminated": false, "reason": "breakpoint", "snapshot": hist };
+                }
+            }
+            bi = bi + 1;
+        }
+    }
+
+    while sess.queued_trace_index < len(sess.queued_trace_events) {
+        let ev = sess.queued_trace_events[sess.queued_trace_index];
+        sess.queued_trace_index = sess.queued_trace_index + 1;
+        let res = debugger_on_trace_event(sess, ev);
+        if res["stopped"] {
+            return map{
+                "stopped": true,
+                "terminated": false,
+                "reason": res["reason"],
+                "snapshot": res["snapshot"]
+            };
+        }
+    }
+    return map{
+        "stopped": false,
+        "terminated": len(sess.queued_trace_events) > 0 and sess.queued_trace_index >= len(sess.queued_trace_events),
+        "reason": "exited",
+        "snapshot": sess.current_snapshot
+    };
+}
+
+// ============================================================================
+// Time-Travel Debugging (`step-back` & `reverse-continue`)
+// ============================================================================
+
+fn debugger_step_back(sess, steps = 1) {
+    if sess.ring_count == 0 {
+        return map{ "ok": false, "reason": "empty_history", "snapshot": nil };
+    }
+    let req_steps = if steps == nil or steps < 1 { 1 } else { num_floor(steps) };
+    let max_offset = sess.ring_count - 1;
+    let target_offset = sess.cursor_offset_from_latest + req_steps;
+    let clamped = false;
+    if target_offset > max_offset {
+        target_offset = max_offset;
+        clamped = true;
+    }
+    sess.cursor_offset_from_latest = target_offset;
+    let snap = _ring_get_by_offset_from_latest(sess, target_offset);
+    sess.current_snapshot = snap;
+    sess.stopped = true;
+    sess.mode = "paused";
+    sess.stop_reason = "step";
+    sess.stop_description = "Time-travel step-back to seq #" + str(snap["seq"]) + " (" + snap["file"] + ":" + str(snap["line"]) + ")";
+    sess.time_travel_active = true;
+    return map{
+        "ok": true,
+        "clamped_at_start": clamped,
+        "reason": "step",
+        "cursor_offset_from_latest": target_offset,
+        "snapshot": snap
+    };
+}
+
+fn debugger_reverse_to_breakpoint(sess) {
+    if sess.ring_count <= 1 {
+        return debugger_step_back(sess, 1);
+    }
+    let max_offset = sess.ring_count - 1;
+    let probe = sess.cursor_offset_from_latest + 1;
+    while probe <= max_offset {
+        let snap = _ring_get_by_offset_from_latest(sess, probe);
+        let hit_bp = nil;
+        let bi = 0;
+        while bi < len(sess.breakpoints) {
+            let bp = sess.breakpoints[bi];
+            if bp["enabled"] and bp["line"] == snap["line"] and _files_match(bp["file"], snap["file"]) {
+                let cond_ok = true;
+                if bp["condition"] != nil {
+                    let cev = debugger_eval_expression(bp["condition"], snap["locals"], sess.globals);
+                    cond_ok = cev["ok"] and _truthy(cev["value"]);
+                }
+                if cond_ok {
+                    hit_bp = bp;
+                    break;
+                }
+            }
+            bi = bi + 1;
+        }
+        if hit_bp != nil {
+            sess.cursor_offset_from_latest = probe;
+            sess.current_snapshot = snap;
+            sess.stopped = true;
+            sess.mode = "paused";
+            sess.stop_reason = "breakpoint";
+            sess.hit_breakpoint_ids = [hit_bp["id"]];
+            sess.stop_description = "Reverse-continue hit breakpoint #" + str(hit_bp["id"]) + " at seq #" + str(snap["seq"]);
+            sess.time_travel_active = true;
+            return map{
+                "ok": true,
+                "reason": "breakpoint",
+                "breakpoint_id": hit_bp["id"],
+                "snapshot": snap
+            };
+        }
+        probe = probe + 1;
+    }
+    return debugger_step_back(sess, max_offset - sess.cursor_offset_from_latest);
+}
+
+// ============================================================================
+// Interactive CLI Command Executor (`b`, `d`, `s`, `n`, `f`, `c`, `sb`, `bt`, `locals`, `p`, `list`)
+// ============================================================================
+
+fn _format_source_listing(sess, center_file, center_line) {
+    let fkey = _normalize_file_key(center_file);
+    if not map_has(sess.sources, fkey) {
+        return "No source loaded for " + fkey + " (at line " + str(center_line) + ")";
+    }
+    let lines = sess.sources[fkey];
+    let start_ln = num_max(1, center_line - 3);
+    let end_ln = num_min(len(lines), center_line + 3);
+    let out = [];
+    let ln = start_ln;
+    while ln <= end_ln {
+        let marker = if ln == center_line { "=> " } else { "   " };
+        let gutter = str_pad_left(str(ln), 4, " ");
+        array_push(out, marker + gutter + " | " + lines[ln - 1]);
+        ln = ln + 1;
+    }
+    return str_join(out, "\n");
+}
+
+fn debugger_exec_cli_command(sess, cmd_line) {
+    let raw = str_trim(str(cmd_line));
+    if len(raw) == 0 {
+        return map{ "ok": true, "output": "", "session_stopped": sess.stopped };
+    }
+    let space_idx = str_index_of(raw, " ");
+    let verb = if space_idx < 0 { raw } else { str_slice(raw, 0, space_idx) };
+    let rest = if space_idx < 0 { "" } else { str_trim(str_slice(raw, space_idx + 1, len(raw))) };
+
+    if verb == "b" or verb == "break" {
+        let if_pos = str_index_of(rest, " if ");
+        let loc_part = if if_pos < 0 { rest } else { str_trim(str_slice(rest, 0, if_pos)) };
+        let cond_part = if if_pos < 0 { nil } else { str_trim(str_slice(rest, if_pos + 4, len(rest))) };
+        let colon_pos = str_index_of(loc_part, ":");
+        let bp_file = if colon_pos < 0 {
+            if sess.current_snapshot != nil { sess.current_snapshot["file"] } else { "app.sapp" }
+        } else {
+            str_slice(loc_part, 0, colon_pos)
+        };
+        let ln_txt = if colon_pos < 0 { loc_part } else { str_slice(loc_part, colon_pos + 1, len(loc_part)) };
+        let ln_num = parse_number(str_trim(ln_txt));
+        if ln_num == nil {
+            return map{ "ok": false, "output": "Invalid breakpoint line: " + loc_part };
+        }
+        let bp = debugger_add_breakpoint(sess, bp_file, ln_num, cond_part, nil);
+        let cmsg = if bp["condition"] == nil { "" } else { " (if " + bp["condition"] + ")" };
+        return map{
+            "ok": true,
+            "breakpoint": bp,
+            "output": "Breakpoint #" + str(bp["id"]) + " set at " + bp["file"] + ":" + str(bp["line"]) + cmsg
+        };
+    }
+
+    if verb == "d" or verb == "delete" {
+        let id_num = parse_number(rest);
+        let removed = debugger_remove_breakpoint(sess, if id_num != nil { id_num } else { rest });
+        return map{
+            "ok": removed,
+            "output": if removed { "Deleted breakpoint " + rest } else { "Breakpoint not found: " + rest }
+        };
+    }
+
+    if verb == "watch" {
+        let w = debugger_add_watch(sess, rest, true);
+        return map{ "ok": true, "watch": w, "output": "Watchpoint #" + str(w["id"]) + " set on '" + w["expr"] + "'" };
+    }
+
+    if verb == "s" or verb == "step" {
+        _set_stepping_mode(sess, "step_in");
+        let adv = debugger_advance_until_stop(sess);
+        return map{ "ok": true, "mode": "step_in", "advance": adv, "output": "step_in -> " + _canonical_repr(adv["reason"]) };
+    }
+
+    if verb == "n" or verb == "next" {
+        _set_stepping_mode(sess, "step_over");
+        let adv = debugger_advance_until_stop(sess);
+        return map{ "ok": true, "mode": "step_over", "advance": adv, "output": "step_over -> " + _canonical_repr(adv["reason"]) };
+    }
+
+    if verb == "f" or verb == "finish" {
+        _set_stepping_mode(sess, "step_out");
+        let adv = debugger_advance_until_stop(sess);
+        return map{ "ok": true, "mode": "step_out", "advance": adv, "output": "step_out -> " + _canonical_repr(adv["reason"]) };
+    }
+
+    if verb == "c" or verb == "continue" {
+        _set_stepping_mode(sess, "continue");
+        let adv = debugger_advance_until_stop(sess);
+        return map{ "ok": true, "mode": "continue", "advance": adv, "output": "continue -> " + _canonical_repr(adv["reason"]) };
+    }
+
+    if verb == "sb" or verb == "step-back" {
+        let cnt = if len(rest) == 0 { 1 } else { parse_number(rest) };
+        let sb = debugger_step_back(sess, if cnt == nil { 1 } else { cnt });
+        if not sb["ok"] { return map{ "ok": false, "output": "No snapshots recorded yet." }; }
+        let sn = sb["snapshot"];
+        return map{
+            "ok": true,
+            "snapshot": sn,
+            "output": "Rewound to seq #" + str(sn["seq"]) + " at " + sn["file"] + ":" + str(sn["line"])
+        };
+    }
+
+    if verb == "rc" or verb == "reverse-continue" {
+        let rc = debugger_reverse_to_breakpoint(sess);
+        if not rc["ok"] { return map{ "ok": false, "output": "No history to reverse." }; }
+        let sn = rc["snapshot"];
+        return map{
+            "ok": true,
+            "snapshot": sn,
+            "output": "Reversed (" + rc["reason"] + ") to seq #" + str(sn["seq"]) + " at " + sn["file"] + ":" + str(sn["line"])
+        };
+    }
+
+    if verb == "bt" or verb == "backtrace" {
+        if sess.current_snapshot == nil {
+            return map{ "ok": true, "output": "(no active stack)" };
+        }
+        let stk = sess.current_snapshot["stack"];
+        let lines = [];
+        let i = 0;
+        while i < len(stk) {
+            let fr = stk[i];
+            array_push(lines, "#" + str(i) + " " + str(fr["func"]) + " at " + str(fr["file"]) + ":" + str(fr["line"]));
+            i = i + 1;
+        }
+        return map{ "ok": true, "output": str_join(lines, "\n") };
+    }
+
+    if verb == "locals" {
+        if sess.current_snapshot == nil {
+            return map{ "ok": true, "output": "(no active frame)" };
+        }
+        let locs = sess.current_snapshot["locals"];
+        let ks = _sort_strings(map_keys(locs));
+        if len(ks) == 0 { return map{ "ok": true, "output": "(no locals)" }; }
+        let lines = [];
+        let i = 0;
+        while i < len(ks) {
+            let k = ks[i];
+            array_push(lines, k + " = " + _canonical_repr(locs[k]));
+            i = i + 1;
+        }
+        return map{ "ok": true, "output": str_join(lines, "\n") };
+    }
+
+    if verb == "p" or verb == "print" {
+        let locs = if sess.current_snapshot != nil { sess.current_snapshot["locals"] } else { map{} };
+        let ev = debugger_eval_expression(rest, locs, sess.globals);
+        return map{ "ok": ev["ok"], "value": ev["value"], "output": ev["repr"] };
+    }
+
+    if verb == "list" {
+        if sess.current_snapshot == nil {
+            return map{ "ok": false, "output": "(no current location)" };
+        }
+        let req_ln = if len(rest) > 0 { parse_number(rest) } else { nil };
+        let center_ln = if req_ln != nil { num_floor(req_ln) } else { sess.current_snapshot["line"] };
+        return map{
+            "ok": true,
+            "output": _format_source_listing(sess, sess.current_snapshot["file"], center_ln)
+        };
+    }
+
+    if verb == "help" {
+        return map{
+            "ok": true,
+            "output": "Commands: break <file:line> [if <cond>], delete <id>, watch <expr>, step, next, finish, continue, step-back [n], reverse-continue, backtrace, locals, print <expr>, list"
+        };
+    }
+
+    return map{ "ok": false, "output": "Unknown debugger command: " + verb };
+}
+
+// ============================================================================
+// Microsoft / VS Code / pbIDE Debug Adapter Protocol (DAP) Wire Server
+// ============================================================================
+
+fn dap_encode_message(msg_map) {
+    let payload_json = json_stringify(msg_map);
+    let byte_len = len(str_to_bytes(payload_json));
+    return "Content-Length: " + str(byte_len) + "\r\n\r\n" + payload_json;
+}
+
+fn _find_subbytes_crlfcrlf(buf, start_idx) {
+    let n = len(buf);
+    let i = start_idx;
+    while i + 3 < n {
+        if buf[i] == 13 and buf[i + 1] == 10 and buf[i + 2] == 13 and buf[i + 3] == 10 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn _slice_bytes(arr, s, e) {
+    let out = [];
+    let i = s;
+    while i < e and i < len(arr) {
+        array_push(out, arr[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn dap_decode_stream(raw_stream) {
+    let buf = if type(raw_stream) == "array" { raw_stream } else { str_to_bytes(str(raw_stream)) };
+    let messages = [];
+    let cursor = 0;
+    let total = len(buf);
+
+    while cursor < total {
+        let sep = _find_subbytes_crlfcrlf(buf, cursor);
+        if sep < 0 {
+            break;
+        }
+        let header_str = bytes_to_str(_slice_bytes(buf, cursor, sep));
+        let header_lines = str_split(header_str, "\r\n");
+        let content_len = -1;
+        let hi = 0;
+        while hi < len(header_lines) {
+            let hl = str_trim(header_lines[hi]);
+            if str_starts_with(str_lower(hl), "content-length:") {
+                let num_part = str_trim(str_slice(hl, 15, len(hl)));
+                let parsed = parse_number(num_part);
+                if parsed != nil { content_len = num_floor(parsed); }
+            }
+            hi = hi + 1;
+        }
+        if content_len < 0 {
+            throw "DAP framing error: missing Content-Length header";
+        }
+        let body_start = sep + 4;
+        let body_end = body_start + content_len;
+        if body_end > total {
+            break;
+        }
+        let json_str = bytes_to_str(_slice_bytes(buf, body_start, body_end));
+        let msg = json_parse(json_str);
+        array_push(messages, msg);
+        cursor = body_end;
+    }
+
+    let rem_bytes = _slice_bytes(buf, cursor, total);
+    return map{
+        "messages": messages,
+        "remaining_bytes": rem_bytes,
+        "remaining": bytes_to_str(rem_bytes)
+    };
+}
+
+fn _dap_next_seq(sess) {
+    let s = sess.dap_seq;
+    sess.dap_seq = s + 1;
+    return s;
+}
+
+fn _dap_make_response(sess, req, ok, body = nil, err_msg = nil) {
+    let resp = map{
+        "seq": _dap_next_seq(sess),
+        "type": "response",
+        "request_seq": _opt(req, "seq", 0),
+        "success": ok,
+        "command": str(_opt(req, "command", ""))
+    };
+    if body != nil { resp["body"] = body; }
+    if not ok and err_msg != nil { resp["message"] = str(err_msg); }
+    return resp;
+}
+
+fn _dap_make_event(sess, event_name, body = nil) {
+    let ev = map{
+        "seq": _dap_next_seq(sess),
+        "type": "event",
+        "event": event_name
+    };
+    if body != nil { ev["body"] = body; }
+    return ev;
+}
+
+fn _dap_alloc_var_ref(sess, container_val) {
+    let t = type(container_val);
+    if t != "map" and t != "array" { return 0; }
+    let ref_id = sess.next_var_ref;
+    sess.next_var_ref = ref_id + 1;
+    sess.var_handles[str(ref_id)] = container_val;
+    return ref_id;
+}
+
+fn _dap_stopped_event(sess, reason_override = nil) {
+    let r = if reason_override != nil { reason_override }
+            elif len(sess.stop_reason) > 0 { sess.stop_reason }
+            else { "step" };
+    let body = map{
+        "reason": r,
+        "threadId": 1,
+        "allThreadsStopped": true
+    };
+    if len(sess.hit_breakpoint_ids) > 0 {
+        body["hitBreakpointIds"] = _deep_clone(sess.hit_breakpoint_ids);
+    }
+    if len(sess.stop_description) > 0 {
+        body["description"] = sess.stop_description;
+    }
+    return _dap_make_event(sess, "stopped", body);
+}
+
+fn dap_handle_request(sess, req) {
+    let cmd = str(_opt(req, "command", ""));
+    let args = _opt(req, "arguments", map{});
+    let events = [];
+    let resp = nil;
+
+    if cmd == "initialize" {
+        sess.dap_initialized = true;
+        let caps = map{
+            "supportsConfigurationDoneRequest": true,
+            "supportsConditionalBreakpoints": true,
+            "supportsHitConditionalBreakpoints": true,
+            "supportsDataBreakpoints": true,
+            "supportsStepBack": true,
+            "supportsEvaluateForHovers": true,
+            "supportsSingleThreadExecutionRequests": true
+        };
+        resp = _dap_make_response(sess, req, true, caps, nil);
+        array_push(events, _dap_make_event(sess, "initialized", map{}));
+    } elif cmd == "launch" {
+        let prog = str(_opt(args, "program", "app.sapp"));
+        sess.stop_on_entry = _opt(args, "stopOnEntry", false);
+        if map_has(args, "sourceText") and args["sourceText"] != nil {
+            debugger_load_source(sess, prog, args["sourceText"]);
+        }
+        if map_has(args, "traceEvents") and type(args["traceEvents"]) == "array" {
+            debugger_load_trace_script(sess, args["traceEvents"]);
+        }
+        resp = _dap_make_response(sess, req, true, map{}, nil);
+        array_push(events, _dap_make_event(sess, "process", map{
+            "name": prog,
+            "isLocalProcess": true,
+            "startMethod": "launch"
+        }));
+        if sess.stop_on_entry and len(sess.queued_trace_events) > 0 and sess.queued_trace_index == 0 {
+            let adv = debugger_advance_until_stop(sess);
+            if adv["stopped"] {
+                array_push(events, _dap_stopped_event(sess, adv["reason"]));
+            }
+        }
+    } elif cmd == "setBreakpoints" {
+        let src_obj = _opt(args, "source", map{});
+        let fpath = _normalize_file_key(_opt(src_obj, "path", _opt(src_obj, "name", "app.sapp")));
+        debugger_clear_breakpoints_for_file(sess, fpath);
+        let req_bps = _opt(args, "breakpoints", []);
+        let out_bps = [];
+        let i = 0;
+        while i < len(req_bps) {
+            let item = req_bps[i];
+            let ln = _opt(item, "line", 1);
+            let cond = _opt(item, "condition", nil);
+            let hcond = _opt(item, "hitCondition", nil);
+            let created = debugger_add_breakpoint(sess, fpath, ln, cond, hcond);
+            array_push(out_bps, map{
+                "id": created["id"],
+                "verified": true,
+                "line": created["line"],
+                "source": map{ "name": path_basename(fpath), "path": fpath }
+            });
+            i = i + 1;
+        }
+        resp = _dap_make_response(sess, req, true, map{ "breakpoints": out_bps }, nil);
+    } elif cmd == "configurationDone" {
+        sess.dap_configured = true;
+        resp = _dap_make_response(sess, req, true, map{}, nil);
+        if not sess.stopped and len(sess.queued_trace_events) > sess.queued_trace_index {
+            _set_stepping_mode(sess, "continue");
+            let adv = debugger_advance_until_stop(sess);
+            if adv["stopped"] {
+                array_push(events, _dap_stopped_event(sess, adv["reason"]));
+            } elif adv["terminated"] {
+                array_push(events, _dap_make_event(sess, "terminated", map{}));
+            }
+        }
+    } elif cmd == "threads" {
+        resp = _dap_make_response(sess, req, true, map{
+            "threads": [map{ "id": 1, "name": "pblang-main" }]
+        }, nil);
+    } elif cmd == "stackTrace" {
+        let frames_out = [];
+        if sess.current_snapshot != nil {
+            let stk = sess.current_snapshot["stack"];
+            let i = 0;
+            while i < len(stk) {
+                let fr = stk[i];
+                let fp = _normalize_file_key(_opt(fr, "file", sess.current_snapshot["file"]));
+                array_push(frames_out, map{
+                    "id": i + 1,
+                    "name": str(_opt(fr, "func", "main")),
+                    "source": map{ "name": path_basename(fp), "path": fp },
+                    "line": num_floor(_opt(fr, "line", 1)),
+                    "column": num_floor(_opt(fr, "column", 1))
+                });
+                i = i + 1;
+            }
+        }
+        resp = _dap_make_response(sess, req, true, map{
+            "stackFrames": frames_out,
+            "totalFrames": len(frames_out)
+        }, nil);
+    } elif cmd == "scopes" {
+        let frame_id = num_floor(_opt(args, "frameId", 1));
+        let scopes_arr = [
+            map{
+                "name": "Locals",
+                "presentationHint": "locals",
+                "variablesReference": 1000 + frame_id,
+                "expensive": false
+            },
+            map{
+                "name": "Watches",
+                "presentationHint": "registers",
+                "variablesReference": 2000,
+                "expensive": false
+            }
+        ];
+        resp = _dap_make_response(sess, req, true, map{ "scopes": scopes_arr }, nil);
+    } elif cmd == "variables" {
+        let vref = num_floor(_opt(args, "variablesReference", 0));
+        let vars_out = [];
+        if vref >= 1000 and vref < 2000 and sess.current_snapshot != nil {
+            let locs = sess.current_snapshot["locals"];
+            let ks = _sort_strings(map_keys(locs));
+            let i = 0;
+            while i < len(ks) {
+                let k = ks[i];
+                let v = locs[k];
+                array_push(vars_out, map{
+                    "name": k,
+                    "value": _canonical_repr(v),
+                    "type": type(v),
+                    "variablesReference": _dap_alloc_var_ref(sess, v)
+                });
+                i = i + 1;
+            }
+        } elif vref == 2000 and sess.current_snapshot != nil {
+            let ws = sess.current_snapshot["watches"];
+            let ks = _sort_strings(map_keys(ws));
+            let i = 0;
+            while i < len(ks) {
+                let k = ks[i];
+                array_push(vars_out, map{
+                    "name": k,
+                    "value": str(ws[k]),
+                    "type": "watch",
+                    "variablesReference": 0
+                });
+                i = i + 1;
+            }
+        } elif map_has(sess.var_handles, str(vref)) {
+            let box = sess.var_handles[str(vref)];
+            if type(box) == "map" {
+                let ks = _sort_strings(map_keys(box));
+                let i = 0;
+                while i < len(ks) {
+                    let k = ks[i];
+                    let v = box[k];
+                    array_push(vars_out, map{
+                        "name": k,
+                        "value": _canonical_repr(v),
+                        "type": type(v),
+                        "variablesReference": _dap_alloc_var_ref(sess, v)
+                    });
+                    i = i + 1;
+                }
+            } elif type(box) == "array" {
+                let i = 0;
+                while i < len(box) {
+                    let v = box[i];
+                    array_push(vars_out, map{
+                        "name": "[" + str(i) + "]",
+                        "value": _canonical_repr(v),
+                        "type": type(v),
+                        "variablesReference": _dap_alloc_var_ref(sess, v)
+                    });
+                    i = i + 1;
+                }
+            }
+        }
+        resp = _dap_make_response(sess, req, true, map{ "variables": vars_out }, nil);
+    } elif cmd == "next" or cmd == "stepIn" or cmd == "stepOut" or cmd == "continue" {
+        let mode_map = if cmd == "next" { "step_over" }
+                       elif cmd == "stepIn" { "step_in" }
+                       elif cmd == "stepOut" { "step_out" }
+                       else { "continue" };
+        _set_stepping_mode(sess, mode_map);
+        let body = if cmd == "continue" { map{ "allThreadsContinued": true } } else { map{} };
+        resp = _dap_make_response(sess, req, true, body, nil);
+        let adv = debugger_advance_until_stop(sess);
+        if adv["stopped"] {
+            array_push(events, _dap_stopped_event(sess, adv["reason"]));
+        } elif adv["terminated"] {
+            array_push(events, _dap_make_event(sess, "terminated", map{}));
+        }
+    } elif cmd == "stepBack" {
+        let sb = debugger_step_back(sess, 1);
+        if sb["ok"] {
+            resp = _dap_make_response(sess, req, true, map{}, nil);
+            array_push(events, _dap_stopped_event(sess, "step"));
+        } else {
+            resp = _dap_make_response(sess, req, false, nil, "No historical snapshot available for stepBack");
+        }
+    } elif cmd == "reverseContinue" {
+        let rc = debugger_reverse_to_breakpoint(sess);
+        if rc["ok"] {
+            resp = _dap_make_response(sess, req, true, map{}, nil);
+            array_push(events, _dap_stopped_event(sess, rc["reason"]));
+        } else {
+            resp = _dap_make_response(sess, req, false, nil, "No historical snapshot available for reverseContinue");
+        }
+    } elif cmd == "evaluate" {
+        let expr = str(_opt(args, "expression", ""));
+        let locs = if sess.current_snapshot != nil { sess.current_snapshot["locals"] } else { map{} };
+        let ev = debugger_eval_expression(expr, locs, sess.globals);
+        if ev["ok"] {
+            resp = _dap_make_response(sess, req, true, map{
+                "result": ev["repr"],
+                "type": ev["val_type"],
+                "variablesReference": _dap_alloc_var_ref(sess, ev["value"])
+            }, nil);
+        } else {
+            resp = _dap_make_response(sess, req, false, nil, ev["error"]);
+        }
+    } elif cmd == "disconnect" {
+        sess.disconnected = true;
+        sess.stopped = false;
+        resp = _dap_make_response(sess, req, true, map{}, nil);
+        array_push(events, _dap_make_event(sess, "terminated", map{}));
+        array_push(events, _dap_make_event(sess, "exited", map{ "exitCode": 0 }));
+    } else {
+        resp = _dap_make_response(sess, req, false, nil, "Unsupported DAP command: " + cmd);
+    }
+
+    let wire = dap_encode_message(resp);
+    array_push(sess.dap_outbox, resp);
+    let ei = 0;
+    while ei < len(events) {
+        wire = wire + dap_encode_message(events[ei]);
+        array_push(sess.dap_outbox, events[ei]);
+        ei = ei + 1;
+    }
+
+    return map{
+        "response": resp,
+        "events": events,
+        "wire": wire
+    };
+}
+
+fn dap_run_stdio_loop(sess, input_stream_text = nil, max_messages = 1024) {
+    if input_stream_text != nil {
+        let decoded = dap_decode_stream(input_stream_text);
+        let msgs = decoded["messages"];
+        let out_wire = "";
+        let processed = 0;
+        let i = 0;
+        while i < len(msgs) and processed < max_messages {
+            let res = dap_handle_request(sess, msgs[i]);
+            out_wire = out_wire + res["wire"];
+            processed = processed + 1;
+            if sess.disconnected { break; }
+            i = i + 1;
+        }
+        return map{
+            "ok": true,
+            "processed": processed,
+            "disconnected": sess.disconnected,
+            "wire_output": out_wire,
+            "remaining": decoded["remaining"]
+        };
+    }
+
+    // Live stdio framing loop
+    let processed = 0;
+    while processed < max_messages and not sess.disconnected {
+        let hdr_line = read_line();
+        if hdr_line == nil { break; }
+        let trimmed = str_trim(hdr_line);
+        if len(trimmed) == 0 {
+            // keep scanning headers
+        } elif str_starts_with(str_lower(trimmed), "content-length:") {
+            let blank_sep = read_line();
+            let body_line = read_line();
+            if body_line == nil { break; }
+            let req = json_parse(body_line);
+            let res = dap_handle_request(sess, req);
+            print(res["wire"]);
+            processed = processed + 1;
+        }
+    }
+    return map{ "ok": true, "processed": processed, "disconnected": sess.disconnected };
+}
+
+export DEBUGGER_ENGINE_VERSION, DEFAULT_MAX_SNAPSHOTS;
+export debugger_session_new, debugger_bind_vm_hook, debugger_load_source, debugger_instrument_sapp_source;
+export debugger_add_breakpoint, debugger_remove_breakpoint, debugger_clear_breakpoints_for_file;
+export debugger_add_watch, debugger_remove_watch, debugger_eval_expression;
+export debugger_on_trace_event, debugger_load_trace_script, debugger_advance_until_stop;
+export debugger_step_back, debugger_reverse_to_breakpoint, debugger_exec_cli_command;
+export dap_encode_message, dap_decode_stream, dap_handle_request, dap_run_stdio_loop;

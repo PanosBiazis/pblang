@@ -1,12 +1,15 @@
 # PBLang Verification & Safety Test Suite (`tests/`)
 
-This directory contains the automated verification tests for **PBLang `2.7.0`**, covering the Sovereign Zero-Rust Host VM & `.sapp` compiler, Complete `MSC2020 (00–97)` & Risch–Liouville Universal Mathematics + Decidable `CAD`/`Presburger`/`LLL`, `Lean 4`-Class `CIC` Proof Kernel, Offline Neural Handwriting 2D OCR, Native `SIMD+OpenCL` HPC (`1M+` DOF), Universal Concept Cards & Symbolic SI/Buckingham $\Pi$ (`750+` assertions across 7 suites), universal `64/32/16/8-bit` native machine-code compilers, Hardware Governor & Sovereign Studio UI, smart polymorphic `pblang update`, 24 algorithms / Quantum / DNA / FIPS 203 `ML-KEM-768`, memory safety, and public release hygiene.
+This directory contains the automated verification tests for **PBLang `5.0.0`**, covering all **24 Sovereign Pure-PBLang (`.sapp`) Pillars** (`28,585+` pure `.sapp` LOC across `19` stdlib/tools modules + minimal VM microkernel), Complete `MSC2020 (00–97)` & Risch–Liouville Universal Mathematics + Decidable `CAD`/`Presburger`/`LLL`, `Lean 4`-Class `CIC` Proof Kernel, Offline Neural Handwriting 2D OCR, Native `SIMD+OpenCL` HPC (`1M+` DOF), Universal Concept Cards & Symbolic SI/Buckingham $\Pi$ (`750+` assertions across 7 suites), universal `64/32/16/8-bit` native machine-code compilers, Hardware Governor & Sovereign Studio UI, smart polymorphic `pblang update`, 24 algorithms / Quantum / DNA / FIPS 203 `ML-KEM-768`, memory safety, and public release hygiene.
 
 ---
 
 ## Key Verification Suites
 
 ```bash
+# 0. PBLang v5.0.0 Sovereign 24-Pillar 100% Pure-PBLang (.sapp) Suite (81/81 checks across all 24 pillars):
+pblang run tests/pblang_v500_all_24_pillars_test.sapp --allow-all
+
 # 1. Sovereign Zero-Rust Host VM, C99 .sapp Compiler, SQLite, HTTP/TLS & Bundle (34/34 checks):
 pblang run tests/zero_rust_vm_test.sapp --allow-all
 
@@ -41,7 +44,8 @@ pblang run tests/public_release_readiness_test.sapp --allow-all
 
 | Path | Description |
 | :--- | :--- |
-| [zero_rust_vm_test.sapp](zero_rust_vm_test.sapp) | Verifies the `~450 KiB` Zero-Rust Host VM (`runtime_stage3/`), `.sapp -> .pbck` compilation, closures, GC, SQLite, HTTP, `PBLZREXE` bundling, and `--sandbox` (`34/34 PASS`). |
+| [pblang_v500_all_24_pillars_test.sapp](pblang_v500_all_24_pillars_test.sapp) | Verifies all **24 Sovereign Pure-PBLang (`.sapp`) Pillars** of `PBLang v5.0.0` (`VAL_I64`, `64 KiB` slab GC/`@region`/interning, green fibers, Stage-4 SSA/SIMD/DWARF5/RV64, Zero-OpenSSL TLS 1.3 + PQC `X25519MLKEM768` + QUIC, `@gpu` SPIR-V/WGSL/PTX + FlashAttention-3, `@constant_time`/`@zeroize` + `PBIDXv01`, OpenType/Wayland/AT-SPI2/UIA, `SipHash-1-3`, linear PikeVM regex, Landlock/Seccomp, DoH/`AF_UNIX`, Unicode 16.0/Greek, `OBJ_PTR` + Delphi/.NET/COM, ACID `PBDB`, DEFLATE/Zstd/LZ4/ZIP/TAR, WAV/PNG/QOI/`PDF/A-3b`/myDATA/PAdES, time-travel `DAP` debugger, bilingual diagnostics, REPL/formatter, `init`/`pkg` SBOM/`bench`, Modbus/CAN/FIDO2/PKCS#11, pure-`.sapp` CI reporter & 7-target cross-bundler — `81/81 PASS`). |
+| [zero_rust_vm_test.sapp](zero_rust_vm_test.sapp) | Verifies the Zero-Rust Host VM (`runtime_stage3/`), `.sapp -> .pbck` compilation, closures, GC, SQLite, HTTP, `PBLZREXE` bundling, and `--sandbox` (`24/24 PASS`). |
 | [mathematics_omni_suite_test.sapp](mathematics_omni_suite_test.sapp) | Verifies the unified `stdlib/mathematics.sapp` (`v2.7.0`) facade, Risch–Liouville integration, parametric & limit indeterminacies, `AdaptiveMathGovernor`, and `@math`/`@wolfram` polyglot (`61/61 PASS`). |
 | [math_interactive_omni_studio_test.sapp](math_interactive_omni_studio_test.sapp) | Verifies custom functions (`piecewise`, recursion, Lagrange `f'(x)`), autonomous real-time slider stepping, Greek statistical & unit-invariance explorers, pure-PBLang PhotoMath 2D OCR & 3-method tutor, GeoGebra/Desmos, MATLAB/Simulink, Mathematica term-rewriting, `0D–ND` Omni-Dimensional Grapher (`SVG` + `BMP` + `play_live`), and 8-tab Native `gfx*` Math Studio (`55/55 PASS`). |
 | [universal_concept_cards_and_si_test.sapp](universal_concept_cards_and_si_test.sapp) | Verifies Universal 10-Domain Interactive Concept Cards (`SVG` & `BMP`), Symbolic 9D SI + Currency + Information Algebra (`130+` units, affine `degC`/`degF`/`K`), AST dimensional rescaling proofs, exact $\mathbb{Q}$ Buckingham $\Pi$ dimensionless solver, 8-tab Math Studio, and PBIDE `--si-check` CLI (`103/103 PASS`). |

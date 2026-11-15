@@ -1,0 +1,1548 @@
+// Copyright (c) 2026 Panagiotis (Panos) Biazis (@PanosBiazis). Licensed under Apache-2.0.
+//
+// stdlib/devtools/repl_and_ast_formatter.sapp — PBLang v5.0.0 Pure-PBLang
+// Interactive ANSI/VT100 REPL Engine (Syntax Highlighting, Prefix Tab-Completion,
+// Multi-Line Delimiter Balancer, Meta-Commands, Stateful Evaluator) &
+// Comment-Preserving Deterministic Idempotent `.sapp` Source Formatter.
+
+let Builtins = import("stdlib:compiler/builtins_list.sapp");
+
+let REPL_FMT_VERSION = "5.0.0";
+
+let _KEYWORDS = map{
+    "fn": true, "let": true, "const": true, "return": true, "if": true,
+    "elif": true, "else": true, "while": true, "for": true, "in": true,
+    "match": true, "enum": true, "struct": true, "import": true, "export": true,
+    "defer": true, "try": true, "catch": true, "throw": true, "true": true,
+    "false": true, "nil": true, "and": true, "or": true, "not": true,
+    "spawn": true, "select": true, "break": true
+};
+
+let _ATTRIBUTES = [
+    "@gpu", "@constant_time", "@zeroize", "@region", "@polyglot",
+    "@nogc", "@simd", "@inline", "@pure", "@verified"
+];
+
+let _META_COMMANDS = [
+    ":help", ":vars", ":type", ":time", ":fmt", ":gc", ":reset", ":quit"
+];
+
+fn _opt(m, key, fallback) {
+    if m == nil or type(m) != "map" { return fallback; }
+    if not map_has(m, key) { return fallback; }
+    let v = m[key];
+    if v == nil { return fallback; }
+    return v;
+}
+
+fn _esc() { return str_from_char_code(27); }
+
+fn _sort_strings(arr) {
+    let out = [];
+    let i = 0;
+    while i < len(arr) { array_push(out, str(arr[i])); i = i + 1; }
+    let n = len(out);
+    let a = 0;
+    while a < n {
+        let b = a + 1;
+        while b < n {
+            if out[b] < out[a] {
+                let tmp = out[a];
+                out[a] = out[b];
+                out[b] = tmp;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    return out;
+}
+
+fn _is_digit(cp) { return cp >= 48 and cp <= 57; }
+fn _is_hex(cp) {
+    return (cp >= 48 and cp <= 57) or (cp >= 65 and cp <= 70) or (cp >= 97 and cp <= 102);
+}
+fn _is_ident_start(cp) {
+    return (cp >= 65 and cp <= 90) or (cp >= 97 and cp <= 122) or cp == 95 or cp >= 128;
+}
+fn _is_ident_part(cp) {
+    return _is_ident_start(cp) or _is_digit(cp);
+}
+
+// ============================================================================
+// Lossless `.sapp` Lexical Scanner (Comments, Attributes, Escapes, UTF-8)
+// ============================================================================
+
+fn tokenize_sapp_lossless(src_raw) {
+    let s = str_replace_all(str(src_raw), "\r\n", "\n");
+    s = str_replace_all(s, "\r", "\n");
+    let n = len(s);
+    let toks = [];
+    let i = 0;
+    let newlines_before = 0;
+
+    while i < n {
+        let cp = strcharcodeat(s, i);
+        if cp == 32 or cp == 9 {
+            i = i + 1;
+        } elif cp == 10 {
+            newlines_before = newlines_before + 1;
+            i = i + 1;
+        } elif cp == 47 and i + 1 < n and strcharcodeat(s, i + 1) == 47 {
+            let st = i;
+            let is_doc = (i + 2 < n and (strcharcodeat(s, i + 2) == 47 or strcharcodeat(s, i + 2) == 33));
+            while i < n and strcharcodeat(s, i) != 10 {
+                i = i + 1;
+            }
+            let txt = str_slice(s, st, i);
+            array_push(toks, map{
+                "kind": if is_doc { "doc_comment" } else { "line_comment" },
+                "text": txt,
+                "nl_before": newlines_before
+            });
+            newlines_before = 0;
+        } elif cp == 47 and i + 1 < n and strcharcodeat(s, i + 1) == 42 {
+            let st = i;
+            i = i + 2;
+            while i < n {
+                if strcharcodeat(s, i) == 42 and i + 1 < n and strcharcodeat(s, i + 1) == 47 {
+                    i = i + 2;
+                    break;
+                }
+                i = i + 1;
+            }
+            array_push(toks, map{
+                "kind": "block_comment",
+                "text": str_slice(s, st, i),
+                "nl_before": newlines_before
+            });
+            newlines_before = 0;
+        } elif cp == 64 and i + 1 < n and _is_ident_start(strcharcodeat(s, i + 1)) {
+            let st = i;
+            i = i + 1;
+            while i < n and _is_ident_part(strcharcodeat(s, i)) {
+                i = i + 1;
+            }
+            array_push(toks, map{
+                "kind": "attr",
+                "text": str_slice(s, st, i),
+                "nl_before": newlines_before
+            });
+            newlines_before = 0;
+        } elif cp == 114 and i + 1 < n and strcharcodeat(s, i + 1) == 34 {
+            // Raw string literal r"..."
+            let st = i;
+            i = i + 2;
+            while i < n and strcharcodeat(s, i) != 34 {
+                i = i + 1;
+            }
+            if i < n { i = i + 1; }
+            array_push(toks, map{
+                "kind": "string",
+                "text": str_slice(s, st, i),
+                "nl_before": newlines_before
+            });
+            newlines_before = 0;
+        } elif cp == 96 {
+            // Backtick raw string literal `...`
+            let st = i;
+            i = i + 1;
+            while i < n and strcharcodeat(s, i) != 96 {
+                i = i + 1;
+            }
+            if i < n { i = i + 1; }
+            array_push(toks, map{
+                "kind": "string",
+                "text": str_slice(s, st, i),
+                "nl_before": newlines_before
+            });
+            newlines_before = 0;
+        } elif cp == 34 or cp == 39 {
+            let quote = cp;
+            let st = i;
+            i = i + 1;
+            while i < n {
+                let c2 = strcharcodeat(s, i);
+                if c2 == 92 and i + 1 < n {
+                    i = i + 2;
+                } elif c2 == quote {
+                    i = i + 1;
+                    break;
+                } else {
+                    i = i + 1;
+                }
+            }
+            array_push(toks, map{
+                "kind": "string",
+                "text": str_slice(s, st, i),
+                "nl_before": newlines_before
+            });
+            newlines_before = 0;
+        } elif _is_digit(cp) {
+            let st = i;
+            if cp == 48 and i + 1 < n and (strcharcodeat(s, i + 1) == 120 or strcharcodeat(s, i + 1) == 88) {
+                i = i + 2;
+                while i < n and (_is_hex(strcharcodeat(s, i)) or strcharcodeat(s, i) == 95) {
+                    i = i + 1;
+                }
+            } else {
+                while i < n and (_is_digit(strcharcodeat(s, i)) or strcharcodeat(s, i) == 95) {
+                    i = i + 1;
+                }
+                if i + 1 < n and strcharcodeat(s, i) == 46 and _is_digit(strcharcodeat(s, i + 1)) {
+                    i = i + 1;
+                    while i < n and _is_digit(strcharcodeat(s, i)) { i = i + 1; }
+                }
+                if i < n and (strcharcodeat(s, i) == 101 or strcharcodeat(s, i) == 69) {
+                    i = i + 1;
+                    if i < n and (strcharcodeat(s, i) == 43 or strcharcodeat(s, i) == 45) { i = i + 1; }
+                    while i < n and _is_digit(strcharcodeat(s, i)) { i = i + 1; }
+                }
+            }
+            // Optional integer width suffix like i64, u64, i32, f64
+            if i < n and _is_ident_start(strcharcodeat(s, i)) {
+                while i < n and _is_ident_part(strcharcodeat(s, i)) { i = i + 1; }
+            }
+            array_push(toks, map{
+                "kind": "number",
+                "text": str_slice(s, st, i),
+                "nl_before": newlines_before
+            });
+            newlines_before = 0;
+        } elif _is_ident_start(cp) {
+            let st = i;
+            while i < n and _is_ident_part(strcharcodeat(s, i)) {
+                i = i + 1;
+            }
+            let word = str_slice(s, st, i);
+            let knd = if map_has(_KEYWORDS, word) { "keyword" } else { "ident" };
+            array_push(toks, map{
+                "kind": knd,
+                "text": word,
+                "nl_before": newlines_before
+            });
+            newlines_before = 0;
+        } else {
+            let two = if i + 2 <= n { str_slice(s, i, i + 2) } else { "" };
+            if two == "==" or two == "!=" or two == "<=" or two == ">=" or
+               two == "->" or two == "=>" or two == "&&" or two == "||" or
+               two == "+=" or two == "-=" or two == "*=" or two == "/=" or
+               two == ".." or two == "::" {
+                array_push(toks, map{
+                    "kind": "op",
+                    "text": two,
+                    "nl_before": newlines_before
+                });
+                i = i + 2;
+            } else {
+                let one = str_slice(s, i, i + 1);
+                let is_p = (one == "{" or one == "}" or one == "(" or one == ")" or
+                            one == "[" or one == "]" or one == "," or one == ";" or one == ".");
+                array_push(toks, map{
+                    "kind": if is_p { "punct" } else { "op" },
+                    "text": one,
+                    "nl_before": newlines_before
+                });
+                i = i + 1;
+            }
+            newlines_before = 0;
+        }
+    }
+    return toks;
+}
+
+// ============================================================================
+// Comment-Preserving Deterministic Idempotent `.sapp` Code Formatter
+// ============================================================================
+
+fn _is_unary_context(prev_tok) {
+    if prev_tok == nil { return true; }
+    let pk = prev_tok["kind"];
+    let pt = prev_tok["text"];
+    if pk == "op" { return true; }
+    if pk == "punct" {
+        return pt == "{" or pt == "(" or pt == "[" or pt == "," or pt == ";";
+    }
+    if pk == "keyword" {
+        return pt != "true" and pt != "false" and pt != "nil";
+    }
+    return false;
+}
+
+fn _is_keyword_with_space_before_paren(word) {
+    return word == "if" or word == "elif" or word == "while" or word == "for" or
+           word == "return" or word == "throw" or word == "match" or word == "catch" or
+           word == "and" or word == "or" or word == "not" or word == "in";
+}
+
+fn _trim_trailing_spaces_per_line(text) {
+    let lines = str_split(text, "\n");
+    let out = [];
+    let blank_run = 0;
+    let i = 0;
+    while i < len(lines) {
+        let ln = lines[i];
+        let end_idx = len(ln);
+        while end_idx > 0 {
+            let c = strcharcodeat(ln, end_idx - 1);
+            if c == 32 or c == 9 { end_idx = end_idx - 1; }
+            else { break; }
+        }
+        let clean = str_slice(ln, 0, end_idx);
+        if len(clean) == 0 {
+            blank_run = blank_run + 1;
+            if blank_run <= 1 and len(out) > 0 {
+                array_push(out, "");
+            }
+        } else {
+            blank_run = 0;
+            array_push(out, clean);
+        }
+        i = i + 1;
+    }
+    while len(out) > 0 and len(out[len(out) - 1]) == 0 {
+        array_pop(out);
+    }
+    if len(out) == 0 { return ""; }
+    return str_join(out, "\n") + "\n";
+}
+
+fn format_sapp_source(src, opts = nil) {
+    let indent_w = num_max(1, num_floor(_opt(opts, "indent_width", 4)));
+    let toks = tokenize_sapp_lossless(src);
+    if len(toks) == 0 { return ""; }
+
+    let out = "";
+    let indent = 0;
+    let at_line_start = true;
+    let prev_code_tok = nil;
+    let prev_any_tok = nil;
+    let brace_stack = []; // "block" or "map_inline" or "map_multi"
+    let i = 0;
+    let n = len(toks);
+
+    while i < n {
+        let tok = toks[i];
+        let kind = tok["kind"];
+        let text = tok["text"];
+        let nlb = tok["nl_before"];
+        let next_tok = if i + 1 < n { toks[i + 1] } else { nil };
+
+        // Closing delimiter dedent before emitting line indent
+        if kind == "punct" and (text == "}" or text == "]" or text == ")") {
+            indent = num_max(0, indent - 1);
+        }
+
+        // Decide line break before current token
+        if i > 0 {
+            let prev_was_line_comment = (prev_any_tok != nil and
+                (prev_any_tok["kind"] == "line_comment" or prev_any_tok["kind"] == "doc_comment"));
+            let prev_was_attr_before_decl = (prev_any_tok != nil and prev_any_tok["kind"] == "attr" and
+                not (kind == "punct" and text == "("));
+
+            if prev_was_line_comment {
+                out = out + "\n";
+                if nlb >= 2 { out = out + "\n"; }
+                at_line_start = true;
+            } elif kind == "line_comment" or kind == "doc_comment" {
+                if nlb >= 1 {
+                    out = out + "\n";
+                    if nlb >= 2 { out = out + "\n"; }
+                    at_line_start = true;
+                }
+            } elif prev_was_attr_before_decl {
+                out = out + "\n";
+                at_line_start = true;
+            } elif kind == "punct" and text == "}" {
+                let top_mode = if len(brace_stack) > 0 { brace_stack[len(brace_stack) - 1] } else { "block" };
+                if top_mode != "inline" or nlb >= 1 {
+                    out = out + "\n";
+                    at_line_start = true;
+                }
+            } elif prev_any_tok != nil and prev_any_tok["kind"] == "punct" and prev_any_tok["text"] == ";" {
+                let next_is_trailing_comment = (kind == "line_comment" or kind == "doc_comment") and nlb == 0;
+                let in_inline = len(brace_stack) > 0 and brace_stack[len(brace_stack) - 1] == "inline" and nlb == 0;
+                if not next_is_trailing_comment and not in_inline {
+                    out = out + "\n";
+                    if nlb >= 2 { out = out + "\n"; }
+                    at_line_start = true;
+                }
+            } elif prev_any_tok != nil and prev_any_tok["kind"] == "punct" and prev_any_tok["text"] == "{" {
+                let top_mode = if len(brace_stack) > 0 { brace_stack[len(brace_stack) - 1] } else { "block" };
+                let next_is_close = (kind == "punct" and text == "}");
+                let next_is_trailing_comment = (kind == "line_comment" or kind == "doc_comment") and nlb == 0;
+                if not next_is_close and not next_is_trailing_comment and top_mode == "block" {
+                    out = out + "\n";
+                    at_line_start = true;
+                } elif nlb >= 1 {
+                    out = out + "\n";
+                    at_line_start = true;
+                }
+            } elif prev_any_tok != nil and prev_any_tok["kind"] == "punct" and prev_any_tok["text"] == "}" {
+                let joins_same_line = (kind == "keyword" and (text == "else" or text == "elif" or text == "catch")) or
+                                      (kind == "punct" and (text == ";" or text == "," or text == ")" or text == "]"));
+                if not joins_same_line {
+                    out = out + "\n";
+                    if nlb >= 2 { out = out + "\n"; }
+                    at_line_start = true;
+                }
+            } elif nlb >= 1 {
+                out = out + "\n";
+                if nlb >= 2 { out = out + "\n"; }
+                at_line_start = true;
+            }
+        }
+
+        // Emit horizontal spacing or indentation
+        if at_line_start {
+            out = out + str_repeat(" ", indent * indent_w);
+            at_line_start = false;
+        } else {
+            let need_space = false;
+            if kind == "line_comment" or kind == "doc_comment" or kind == "block_comment" {
+                need_space = true;
+            } elif prev_any_tok != nil and prev_any_tok["kind"] == "block_comment" {
+                need_space = not (kind == "punct" and (text == "," or text == ";" or text == ")" or text == "]"));
+            } elif kind == "punct" {
+                if text == "{" {
+                    let prev_is_map = prev_code_tok != nil and prev_code_tok["text"] == "map";
+                    need_space = not prev_is_map;
+                } elif text == "}" {
+                    need_space = not (prev_code_tok != nil and prev_code_tok["kind"] == "punct" and prev_code_tok["text"] == "{");
+                } elif text == "(" {
+                    if prev_code_tok == nil { need_space = false; }
+                    elif prev_code_tok["kind"] == "attr" { need_space = false; }
+                    elif prev_code_tok["kind"] == "keyword" and _is_keyword_with_space_before_paren(prev_code_tok["text"]) { need_space = true; }
+                    elif prev_code_tok["kind"] == "op" { need_space = true; }
+                    elif prev_code_tok["kind"] == "punct" and (prev_code_tok["text"] == "," or prev_code_tok["text"] == ";") { need_space = true; }
+                    else { need_space = false; }
+                } elif text == "[" {
+                    if prev_code_tok == nil { need_space = false; }
+                    elif prev_code_tok["kind"] == "ident" or
+                         (prev_code_tok["kind"] == "punct" and (prev_code_tok["text"] == "]" or prev_code_tok["text"] == ")")) {
+                        need_space = false;
+                    } else {
+                        need_space = not (prev_code_tok["kind"] == "punct" and (prev_code_tok["text"] == "(" or prev_code_tok["text"] == "["));
+                    }
+                } else {
+                    need_space = false;
+                }
+            } elif kind == "op" {
+                if text == "::" {
+                    need_space = false;
+                } elif text == ":" {
+                    need_space = false;
+                } elif (text == "-" or text == "!") and _is_unary_context(prev_code_tok) {
+                    need_space = not (prev_code_tok != nil and prev_code_tok["kind"] == "punct" and
+                                      (prev_code_tok["text"] == "(" or prev_code_tok["text"] == "["));
+                } else {
+                    need_space = true;
+                }
+            } else {
+                // Current token is ident, keyword, number, string, or attr
+                if prev_code_tok == nil {
+                    need_space = false;
+                } elif prev_code_tok["kind"] == "punct" {
+                    let pt = prev_code_tok["text"];
+                    if pt == "(" or pt == "[" or pt == "." { need_space = false; }
+                    else { need_space = true; }
+                } elif prev_code_tok["kind"] == "op" {
+                    let pt = prev_code_tok["text"];
+                    if pt == "::" { need_space = false; }
+                    elif (pt == "-" or pt == "!") and prev_code_tok["was_unary"] == true { need_space = false; }
+                    else { need_space = true; }
+                } else {
+                    need_space = true;
+                }
+            }
+            if need_space { out = out + " "; }
+        }
+
+        // Record unary flag on current token before emitting
+        if kind == "op" and (text == "-" or text == "!") and _is_unary_context(prev_code_tok) {
+            tok["was_unary"] = true;
+        } else {
+            tok["was_unary"] = false;
+        }
+
+        out = out + text;
+
+        // Manage brace mode & indentation after opening/closing delimiters
+        if kind == "punct" {
+            if text == "{" {
+                let is_map_lit = prev_code_tok != nil and prev_code_tok["text"] == "map";
+                let next_has_nl = next_tok != nil and (next_tok["nl_before"] >= 1 or
+                                  next_tok["kind"] == "line_comment" or next_tok["kind"] == "doc_comment");
+                let mode = if is_map_lit and not next_has_nl { "inline" } else { "block" };
+                array_push(brace_stack, mode);
+                indent = indent + 1;
+            } elif text == "}" {
+                if len(brace_stack) > 0 { array_pop(brace_stack); }
+            } elif text == "[" or text == "(" {
+                indent = indent + 1;
+            }
+        }
+
+        prev_any_tok = tok;
+        if kind != "line_comment" and kind != "doc_comment" and kind != "block_comment" {
+            prev_code_tok = tok;
+        }
+        i = i + 1;
+    }
+
+    return _trim_trailing_spaces_per_line(out);
+}
+
+fn check_sapp_formatted(src, opts = nil) {
+    return format_sapp_source(src, opts) == str(src);
+}
+
+// ============================================================================
+// Interactive ANSI REPL: Highlighter, Tab-Completer & Delimiter Balancer
+// ============================================================================
+
+fn repl_highlight_ansi(src_line, color = true) {
+    let raw = str(src_line);
+    if not color { return raw; }
+    let builtin_map = Builtins.builtin_set();
+    let n = len(raw);
+    let out = "";
+    let i = 0;
+
+    while i < n {
+        let cp = strcharcodeat(raw, i);
+        if cp == 47 and i + 1 < n and strcharcodeat(raw, i + 1) == 47 {
+            let st = i;
+            while i < n and strcharcodeat(raw, i) != 10 { i = i + 1; }
+            out = out + _esc() + "[90m" + str_slice(raw, st, i) + _esc() + "[0m";
+        } elif cp == 47 and i + 1 < n and strcharcodeat(raw, i + 1) == 42 {
+            let st = i;
+            i = i + 2;
+            while i < n {
+                if strcharcodeat(raw, i) == 42 and i + 1 < n and strcharcodeat(raw, i + 1) == 47 {
+                    i = i + 2;
+                    break;
+                }
+                i = i + 1;
+            }
+            out = out + _esc() + "[90m" + str_slice(raw, st, i) + _esc() + "[0m";
+        } elif cp == 64 and i + 1 < n and _is_ident_start(strcharcodeat(raw, i + 1)) {
+            let st = i;
+            i = i + 1;
+            while i < n and _is_ident_part(strcharcodeat(raw, i)) { i = i + 1; }
+            out = out + _esc() + "[1;33m" + str_slice(raw, st, i) + _esc() + "[0m";
+        } elif cp == 34 or cp == 39 or cp == 96 {
+            let q = cp;
+            let st = i;
+            i = i + 1;
+            while i < n {
+                let c2 = strcharcodeat(raw, i);
+                if c2 == 92 and q != 96 and i + 1 < n { i = i + 2; }
+                elif c2 == q { i = i + 1; break; }
+                else { i = i + 1; }
+            }
+            out = out + _esc() + "[32m" + str_slice(raw, st, i) + _esc() + "[0m";
+        } elif _is_digit(cp) {
+            let st = i;
+            while i < n and (_is_ident_part(strcharcodeat(raw, i)) or strcharcodeat(raw, i) == 46) {
+                i = i + 1;
+            }
+            out = out + _esc() + "[36m" + str_slice(raw, st, i) + _esc() + "[0m";
+        } elif _is_ident_start(cp) {
+            let st = i;
+            while i < n and _is_ident_part(strcharcodeat(raw, i)) { i = i + 1; }
+            let word = str_slice(raw, st, i);
+            if map_has(_KEYWORDS, word) {
+                out = out + _esc() + "[1;35m" + word + _esc() + "[0m";
+            } elif map_has(builtin_map, word) or word == "println" {
+                out = out + _esc() + "[1;34m" + word + _esc() + "[0m";
+            } else {
+                out = out + _esc() + "[1;37m" + word + _esc() + "[0m";
+            }
+        } else {
+            out = out + str_slice(raw, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn repl_inspect_input_state(src_text) {
+    let s = str(src_text);
+    let n = len(s);
+    let braces = 0;
+    let parens = 0;
+    let brackets = 0;
+    let open_str = 0;
+    let open_block_comment = false;
+    let i = 0;
+
+    while i < n {
+        let cp = strcharcodeat(s, i);
+        if open_block_comment {
+            if cp == 42 and i + 1 < n and strcharcodeat(s, i + 1) == 47 {
+                open_block_comment = false;
+                i = i + 2;
+            } else {
+                i = i + 1;
+            }
+        } elif open_str != 0 {
+            if cp == 92 and open_str != 96 and i + 1 < n {
+                i = i + 2;
+            } elif cp == open_str {
+                open_str = 0;
+                i = i + 1;
+            } else {
+                i = i + 1;
+            }
+        } else {
+            if cp == 47 and i + 1 < n and strcharcodeat(s, i + 1) == 47 {
+                while i < n and strcharcodeat(s, i) != 10 { i = i + 1; }
+            } elif cp == 47 and i + 1 < n and strcharcodeat(s, i + 1) == 42 {
+                open_block_comment = true;
+                i = i + 2;
+            } elif cp == 34 or cp == 39 or cp == 96 {
+                open_str = cp;
+                i = i + 1;
+            } elif cp == 123 { braces = braces + 1; i = i + 1; }
+            elif cp == 125 { braces = braces - 1; i = i + 1; }
+            elif cp == 40 { parens = parens + 1; i = i + 1; }
+            elif cp == 41 { parens = parens - 1; i = i + 1; }
+            elif cp == 91 { brackets = brackets + 1; i = i + 1; }
+            elif cp == 93 { brackets = brackets - 1; i = i + 1; }
+            else { i = i + 1; }
+        }
+    }
+
+    let complete = (not open_block_comment) and (open_str == 0) and
+                   (braces <= 0) and (parens <= 0) and (brackets <= 0);
+    return map{
+        "complete": complete,
+        "prompt": if complete { "pblang> " } else { "... " },
+        "brace_depth": braces,
+        "paren_depth": parens,
+        "bracket_depth": brackets,
+        "in_string": open_str != 0,
+        "in_block_comment": open_block_comment
+    };
+}
+
+fn repl_is_input_complete(src_text) {
+    return repl_inspect_input_state(src_text)["complete"];
+}
+
+fn repl_session_new(opts = nil) {
+    return map{
+        "format": "pblang.repl.session.v5",
+        "version": REPL_FMT_VERSION,
+        "vars": map{},
+        "fns": map{},
+        "history": [],
+        "multiline_buf": "",
+        "turn": 0,
+        "color": _opt(opts, "color", true),
+        "prompt_primary": "pblang> ",
+        "prompt_cont": "... ",
+        "should_quit": false,
+        "stdout_capture": ""
+    };
+}
+
+fn repl_complete_prefix(sess, prefix) {
+    let pref = str(prefix);
+    let seen = map{};
+    let hits = [];
+    let push_if = fn(cand) {
+        if str_starts_with(cand, pref) and not map_has(seen, cand) {
+            seen[cand] = true;
+            array_push(hits, cand);
+        }
+    };
+
+    if str_starts_with(pref, ":") {
+        let mi = 0;
+        while mi < len(_META_COMMANDS) { push_if(_META_COMMANDS[mi]); mi = mi + 1; }
+        return _sort_strings(hits);
+    }
+    if str_starts_with(pref, "@") {
+        let ai = 0;
+        while ai < len(_ATTRIBUTES) { push_if(_ATTRIBUTES[ai]); ai = ai + 1; }
+        return _sort_strings(hits);
+    }
+
+    if sess != nil and type(sess) == "map" {
+        if map_has(sess, "vars") {
+            let vks = map_keys(sess["vars"]);
+            let vi = 0;
+            while vi < len(vks) { push_if(vks[vi]); vi = vi + 1; }
+        }
+        if map_has(sess, "fns") {
+            let fks = map_keys(sess["fns"]);
+            let fi = 0;
+            while fi < len(fks) { push_if(fks[fi]); fi = fi + 1; }
+        }
+    }
+
+    let kws = map_keys(_KEYWORDS);
+    let ki = 0;
+    while ki < len(kws) { push_if(kws[ki]); ki = ki + 1; }
+
+    push_if("println");
+    push_if("bytes_new");
+    push_if("bytes_get");
+    push_if("bytes_set");
+    let bks = map_keys(Builtins.builtin_set());
+    let bi = 0;
+    while bi < len(bks) { push_if(bks[bi]); bi = bi + 1; }
+
+    return _sort_strings(hits);
+}
+
+// ============================================================================
+// Pure-PBLang Stateful REPL Parser & Tree-Walking Evaluator
+// ============================================================================
+
+fn _repl_repr(val) {
+    let t = type(val);
+    if val == nil { return "nil"; }
+    if t == "bool" { return if val { "true" } else { "false" }; }
+    if t == "number" { return str(val); }
+    if t == "string" { return "\"" + str_replace_all(val, "\"", "\\\"") + "\""; }
+    if t == "array" {
+        let ps = [];
+        let i = 0;
+        while i < len(val) { array_push(ps, _repl_repr(val[i])); i = i + 1; }
+        return "[" + str_join(ps, ", ") + "]";
+    }
+    if t == "map" {
+        if map_has(val, "__repl_fn_name") { return "<fn " + str(val["__repl_fn_name"]) + ">"; }
+        let ks = _sort_strings(map_keys(val));
+        let ps = [];
+        let i = 0;
+        while i < len(ks) { array_push(ps, ks[i] + ": " + _repl_repr(val[ks[i]])); i = i + 1; }
+        return "map{ " + str_join(ps, ", ") + " }";
+    }
+    return str(val);
+}
+
+fn _repl_tokens_clean(src) {
+    let raw = tokenize_sapp_lossless(src);
+    let out = [];
+    let i = 0;
+    while i < len(raw) {
+        let k = raw[i]["kind"];
+        if k != "line_comment" and k != "doc_comment" and k != "block_comment" and k != "attr" {
+            array_push(out, raw[i]);
+        }
+        i = i + 1;
+    }
+    array_push(out, map{ "kind": "eof", "text": "" });
+    return out;
+}
+
+fn _pk(p) { return p.toks[p.pos]; }
+fn _adv(p) {
+    let t = p.toks[p.pos];
+    if p.pos + 1 < len(p.toks) { p.pos = p.pos + 1; }
+    return t;
+}
+fn _eat(p, txt) {
+    if _pk(p)["text"] == txt and _pk(p)["kind"] != "eof" {
+        _adv(p);
+        return true;
+    }
+    return false;
+}
+fn _expect(p, txt) {
+    if not _eat(p, txt) {
+        throw "expected '" + txt + "', got '" + _pk(p)["text"] + "'";
+    }
+}
+
+fn _unescape_str_tok(raw_txt) {
+    if len(raw_txt) < 2 { return raw_txt; }
+    if str_starts_with(raw_txt, "r\"") { return str_slice(raw_txt, 2, len(raw_txt) - 1); }
+    if str_starts_with(raw_txt, "`") { return str_slice(raw_txt, 1, len(raw_txt) - 1); }
+    let inner = str_slice(raw_txt, 1, len(raw_txt) - 1);
+    let out = "";
+    let i = 0;
+    while i < len(inner) {
+        let c = strcharcodeat(inner, i);
+        if c == 92 and i + 1 < len(inner) {
+            let nx = str_slice(inner, i + 1, i + 2);
+            if nx == "n" { out = out + "\n"; }
+            elif nx == "t" { out = out + "\t"; }
+            elif nx == "r" { out = out + "\r"; }
+            elif nx == "\"" { out = out + "\""; }
+            elif nx == "'" { out = out + "'"; }
+            elif nx == "\\" { out = out + "\\"; }
+            else { out = out + nx; }
+            i = i + 2;
+        } else {
+            out = out + str_slice(inner, i, i + 1);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+fn _parse_number_tok(txt) {
+    let clean = str_replace_all(txt, "_", "");
+    if str_ends_with(clean, "i64") or str_ends_with(clean, "u64") or str_ends_with(clean, "f64") {
+        clean = str_slice(clean, 0, len(clean) - 3);
+    }
+    if str_starts_with(str_lower(clean), "0x") {
+        let hex = str_lower(str_slice(clean, 2, len(clean)));
+        let acc = 0;
+        let i = 0;
+        while i < len(hex) {
+            let cp = strcharcodeat(hex, i);
+            let d = if cp >= 48 and cp <= 57 { cp - 48 } else { cp - 87 };
+            acc = acc * 16 + d;
+            i = i + 1;
+        }
+        return acc;
+    }
+    let v = parse_number(clean);
+    return if v == nil { 0 } else { v };
+}
+
+fn _parse_repl_block(p) {
+    _expect(p, "{");
+    let stmts = [];
+    while _pk(p)["kind"] != "eof" and _pk(p)["text"] != "}" {
+        array_push(stmts, _parse_repl_stmt(p));
+    }
+    _expect(p, "}");
+    return stmts;
+}
+
+fn _parse_repl_expr(p) {
+    return _parse_repl_assign(p);
+}
+
+fn _parse_repl_assign(p) {
+    let lhs = _parse_repl_or(p);
+    if _pk(p)["kind"] == "op" and _pk(p)["text"] == "=" {
+        _adv(p);
+        let rhs = _parse_repl_assign(p);
+        return map{ "tag": "assign", "lhs": lhs, "rhs": rhs };
+    }
+    return lhs;
+}
+
+fn _parse_repl_or(p) {
+    let left = _parse_repl_and(p);
+    while _pk(p)["text"] == "or" or _pk(p)["text"] == "||" {
+        _adv(p);
+        left = map{ "tag": "bin", "op": "or", "l": left, "r": _parse_repl_and(p) };
+    }
+    return left;
+}
+
+fn _parse_repl_and(p) {
+    let left = _parse_repl_eq(p);
+    while _pk(p)["text"] == "and" or _pk(p)["text"] == "&&" {
+        _adv(p);
+        left = map{ "tag": "bin", "op": "and", "l": left, "r": _parse_repl_eq(p) };
+    }
+    return left;
+}
+
+fn _parse_repl_eq(p) {
+    let left = _parse_repl_rel(p);
+    while _pk(p)["text"] == "==" or _pk(p)["text"] == "!=" {
+        let op = _adv(p)["text"];
+        left = map{ "tag": "bin", "op": op, "l": left, "r": _parse_repl_rel(p) };
+    }
+    return left;
+}
+
+fn _parse_repl_rel(p) {
+    let left = _parse_repl_add(p);
+    while _pk(p)["text"] == "<" or _pk(p)["text"] == "<=" or _pk(p)["text"] == ">" or _pk(p)["text"] == ">=" {
+        let op = _adv(p)["text"];
+        left = map{ "tag": "bin", "op": op, "l": left, "r": _parse_repl_add(p) };
+    }
+    return left;
+}
+
+fn _parse_repl_add(p) {
+    let left = _parse_repl_mul(p);
+    while _pk(p)["text"] == "+" or _pk(p)["text"] == "-" {
+        let op = _adv(p)["text"];
+        left = map{ "tag": "bin", "op": op, "l": left, "r": _parse_repl_mul(p) };
+    }
+    return left;
+}
+
+fn _parse_repl_mul(p) {
+    let left = _parse_repl_unary(p);
+    while _pk(p)["text"] == "*" or _pk(p)["text"] == "/" or _pk(p)["text"] == "%" {
+        let op = _adv(p)["text"];
+        left = map{ "tag": "bin", "op": op, "l": left, "r": _parse_repl_unary(p) };
+    }
+    return left;
+}
+
+fn _parse_repl_unary(p) {
+    let t = _pk(p)["text"];
+    if t == "-" or t == "!" or t == "not" {
+        _adv(p);
+        return map{ "tag": "un", "op": t, "e": _parse_repl_unary(p) };
+    }
+    return _parse_repl_postfix(p);
+}
+
+fn _parse_repl_postfix(p) {
+    let tk = _pk(p);
+    let node = nil;
+    if tk["kind"] == "number" {
+        _adv(p);
+        node = map{ "tag": "lit", "v": _parse_number_tok(tk["text"]) };
+    } elif tk["kind"] == "string" {
+        _adv(p);
+        node = map{ "tag": "lit", "v": _unescape_str_tok(tk["text"]) };
+    } elif tk["text"] == "true" {
+        _adv(p);
+        node = map{ "tag": "lit", "v": true };
+    } elif tk["text"] == "false" {
+        _adv(p);
+        node = map{ "tag": "lit", "v": false };
+    } elif tk["text"] == "nil" {
+        _adv(p);
+        node = map{ "tag": "lit", "v": nil };
+    } elif tk["text"] == "(" {
+        _adv(p);
+        node = _parse_repl_expr(p);
+        _expect(p, ")");
+    } elif tk["text"] == "[" {
+        _adv(p);
+        let items = [];
+        while _pk(p)["kind"] != "eof" and _pk(p)["text"] != "]" {
+            array_push(items, _parse_repl_expr(p));
+            if not _eat(p, ",") { break; }
+        }
+        _expect(p, "]");
+        node = map{ "tag": "arr", "items": items };
+    } elif tk["text"] == "map" and p.pos + 1 < len(p.toks) and p.toks[p.pos + 1]["text"] == "{" {
+        _adv(p);
+        _adv(p);
+        let pairs = [];
+        while _pk(p)["kind"] != "eof" and _pk(p)["text"] != "}" {
+            let kt = _adv(p);
+            let kstr = if kt["kind"] == "string" { _unescape_str_tok(kt["text"]) } else { kt["text"] };
+            _expect(p, ":");
+            let vexpr = _parse_repl_expr(p);
+            array_push(pairs, map{ "k": kstr, "v": vexpr });
+            if not _eat(p, ",") { break; }
+        }
+        _expect(p, "}");
+        node = map{ "tag": "map", "pairs": pairs };
+    } elif tk["text"] == "if" {
+        _adv(p);
+        let cond = _parse_repl_expr(p);
+        let then_b = _parse_repl_block(p);
+        let else_b = [];
+        if _eat(p, "elif") {
+            p.pos = p.pos - 1;
+            p.toks[p.pos] = map{ "kind": "keyword", "text": "if" };
+            else_b = [map{ "tag": "expr_stmt", "e": _parse_repl_postfix(p) }];
+        } elif _eat(p, "else") {
+            else_b = _parse_repl_block(p);
+        }
+        node = map{ "tag": "if", "cond": cond, "then_b": then_b, "else_b": else_b };
+    } elif tk["text"] == "fn" {
+        _adv(p);
+        _expect(p, "(");
+        let params = [];
+        while _pk(p)["kind"] != "eof" and _pk(p)["text"] != ")" {
+            array_push(params, _adv(p)["text"]);
+            if not _eat(p, ",") { break; }
+        }
+        _expect(p, ")");
+        let body = _parse_repl_block(p);
+        node = map{ "tag": "fn_lit", "params": params, "body": body };
+    } elif tk["kind"] == "ident" {
+        _adv(p);
+        node = map{ "tag": "var", "name": tk["text"] };
+    } else {
+        throw "unexpected token '" + tk["text"] + "'";
+    }
+
+    while true {
+        if _eat(p, "(") {
+            let args = [];
+            while _pk(p)["kind"] != "eof" and _pk(p)["text"] != ")" {
+                array_push(args, _parse_repl_expr(p));
+                if not _eat(p, ",") { break; }
+            }
+            _expect(p, ")");
+            node = map{ "tag": "call", "callee": node, "args": args };
+        } elif _eat(p, "[") {
+            let idx = _parse_repl_expr(p);
+            _expect(p, "]");
+            node = map{ "tag": "idx", "obj": node, "idx": idx };
+        } elif _eat(p, ".") {
+            let fld = _adv(p)["text"];
+            node = map{ "tag": " idx_dot", "obj": node, "fld": fld };
+            node["tag"] = "dot";
+        } else {
+            break;
+        }
+    }
+    return node;
+}
+
+fn _parse_repl_stmt(p) {
+    let tk = _pk(p);
+    if tk["text"] == "let" or tk["text"] == "const" {
+        _adv(p);
+        let vname = _adv(p)["text"];
+        let init_e = map{ "tag": "lit", "v": nil };
+        if _eat(p, "=") {
+            init_e = _parse_repl_expr(p);
+        }
+        _eat(p, ";");
+        return map{ "tag": "let", "name": vname, "e": init_e };
+    }
+    if tk["text"] == "fn" and p.pos + 1 < len(p.toks) and p.toks[p.pos + 1]["kind"] == "ident" {
+        _adv(p);
+        let fname = _adv(p)["text"];
+        _expect(p, "(");
+        let params = [];
+        while _pk(p)["kind"] != "eof" and _pk(p)["text"] != ")" {
+            array_push(params, _adv(p)["text"]);
+            if not _eat(p, ",") { break; }
+        }
+        _expect(p, ")");
+        let body = _parse_repl_block(p);
+        _eat(p, ";");
+        return map{ "tag": "fn_def", "name": fname, "params": params, "body": body };
+    }
+    if tk["text"] == "return" {
+        _adv(p);
+        let re = if _pk(p)["text"] == ";" or _pk(p)["text"] == "}" or _pk(p)["kind"] == "eof" {
+            map{ "tag": "lit", "v": nil }
+        } else {
+            _parse_repl_expr(p)
+        };
+        _eat(p, ";");
+        return map{ "tag": "return", "e": re };
+    }
+    if tk["text"] == "while" {
+        _adv(p);
+        let cond = _parse_repl_expr(p);
+        let body = _parse_repl_block(p);
+        return map{ "tag": "while", "cond": cond, "body": body };
+    }
+    if tk["text"] == "for" {
+        _adv(p);
+        let vname = _adv(p)["text"];
+        _expect(p, "in");
+        let iter_e = _parse_repl_expr(p);
+        let body = _parse_repl_block(p);
+        return map{ "tag": "for", "var": vname, "iter": iter_e, "body": body };
+    }
+    let expr = _parse_repl_expr(p);
+    _eat(p, ";");
+    return map{ "tag": "expr_stmt", "e": expr };
+}
+
+fn _scope_lookup(scopes, name) {
+    let i = len(scopes) - 1;
+    while i >= 0 {
+        if map_has(scopes[i], name) { return map{ "found": true, "val": scopes[i][name] }; }
+        i = i - 1;
+    }
+    return map{ "found": false, "val": nil };
+}
+
+fn _scope_assign(scopes, name, val) {
+    let i = len(scopes) - 1;
+    while i >= 0 {
+        if map_has(scopes[i], name) {
+            scopes[i][name] = val;
+            return true;
+        }
+        i = i - 1;
+    }
+    return false;
+}
+
+fn _repl_truthy(v) {
+    if v == nil { return false; }
+    if type(v) == "bool" { return v; }
+    if type(v) == "number" { return v != 0; }
+    if type(v) == "string" { return len(v) > 0; }
+    return true;
+}
+
+fn _call_host_builtin(sess, bname, args) {
+    if bname == "print" or bname == "println" {
+        let msg = if len(args) > 0 { str(args[0]) } else { "" };
+        sess.stdout_capture = sess.stdout_capture + msg + "\n";
+        return nil;
+    }
+    if bname == "len" { return len(args[0]); }
+    if bname == "str" { return str(args[0]); }
+    if bname == "type" { return type(args[0]); }
+    if bname == "array_push" or bname == "push" { array_push(args[0], args[1]); return args[0]; }
+    if bname == "array_pop" or bname == "pop" { return array_pop(args[0]); }
+    if bname == "map_has" { return map_has(args[0], str(args[1])); }
+    if bname == "map_keys" { return map_keys(args[0]); }
+    if bname == "str_slice" { return str_slice(str(args[0]), args[1], args[2]); }
+    if bname == "str_split" { return str_split(str(args[0]), str(args[1])); }
+    if bname == "str_join" { return str_join(args[0], str(args[1])); }
+    if bname == "str_trim" { return str_trim(str(args[0])); }
+    if bname == "str_upper" { return str_upper(str(args[0])); }
+    if bname == "str_lower" { return str_lower(str(args[0])); }
+    if bname == "str_contains" { return str_contains(str(args[0]), str(args[1])); }
+    if bname == "str_replace_all" { return str_replace_all(str(args[0]), str(args[1]), str(args[2])); }
+    if bname == "str_to_bytes" { return str_to_bytes(str(args[0])); }
+    if bname == "bytes_to_str" { return bytes_to_str(args[0]); }
+    if bname == "json_parse" { return json_parse(str(args[0])); }
+    if bname == "json_stringify" { return json_stringify(args[0]); }
+    if bname == "sha256" { return sha256(str(args[0])); }
+    if bname == "num_abs" { return num_abs(args[0]); }
+    if bname == "num_floor" { return num_floor(args[0]); }
+    if bname == "num_ceil" { return num_ceil(args[0]); }
+    if bname == "num_sqrt" { return num_sqrt(args[0]); }
+    if bname == "num_pow" { return num_pow(args[0], args[1]); }
+    if bname == "num_min" { return num_min(args[0], args[1]); }
+    if bname == "num_max" { return num_max(args[0], args[1]); }
+    if bname == "num_mod" { return num_mod(args[0], args[1]); }
+    if bname == "bit_and" { return bit_and(args[0], args[1]); }
+    if bname == "bit_or" { return bit_or(args[0], args[1]); }
+    if bname == "bit_xor" { return bit_xor(args[0], args[1]); }
+    if bname == "bit_shl" { return bit_shl(args[0], args[1]); }
+    if bname == "bit_shr" { return bit_shr(args[0], args[1]); }
+    if bname == "parse_number" { return parse_number(str(args[0])); }
+    if bname == "range" {
+        if len(args) == 1 { return range(args[0]); }
+        return range(args[0], args[1]);
+    }
+    throw "undefined function '" + bname + "'";
+}
+
+fn _eval_repl_stmts(sess, stmts, scopes) {
+    let last_val = nil;
+    let i = 0;
+    while i < len(stmts) {
+        let r = _eval_repl_stmt(sess, stmts[i], scopes);
+        if r["returned"] { return r; }
+        last_val = r["val"];
+        i = i + 1;
+    }
+    return map{ "returned": false, "val": last_val };
+}
+
+fn _eval_repl_stmt(sess, st, scopes) {
+    let tg = st["tag"];
+    if tg == "let" {
+        let v = _eval_repl_node(sess, st["e"], scopes);
+        scopes[len(scopes) - 1][st["name"]] = v;
+        return map{ "returned": false, "val": v };
+    }
+    if tg == "fn_def" {
+        let fn_obj = map{
+            "__repl_fn_name": st["name"],
+            "params": st["params"],
+            "body": st["body"]
+        };
+        scopes[len(scopes) - 1][st["name"]] = fn_obj;
+        sess.fns[st["name"]] = fn_obj;
+        return map{ "returned": false, "val": fn_obj };
+    }
+    if tg == "return" {
+        let v = _eval_repl_node(sess, st["e"], scopes);
+        return map{ "returned": true, "val": v };
+    }
+    if tg == "while" {
+        let last_v = nil;
+        let guard = 0;
+        while _repl_truthy(_eval_repl_node(sess, st["cond"], scopes)) {
+            guard = guard + 1;
+            if guard > 100000 { throw "REPL loop iteration limit exceeded"; }
+            array_push(scopes, map{});
+            let br = _eval_repl_stmts(sess, st["body"], scopes);
+            array_pop(scopes);
+            if br["returned"] { return br; }
+            last_v = br["val"];
+        }
+        return map{ "returned": false, "val": last_v };
+    }
+    if tg == "for" {
+        let seq = _eval_repl_node(sess, st["iter"], scopes);
+        let last_v = nil;
+        let idx = 0;
+        while idx < len(seq) {
+            let sub = map{};
+            sub[st["var"]] = seq[idx];
+            array_push(scopes, sub);
+            let br = _eval_repl_stmts(sess, st["body"], scopes);
+            array_pop(scopes);
+            if br["returned"] { return br; }
+            last_v = br["val"];
+            idx = idx + 1;
+        }
+        return map{ "returned": false, "val": last_v };
+    }
+    if tg == "expr_stmt" and st["e"]["tag"] == "if" {
+        let nd = st["e"];
+        if _repl_truthy(_eval_repl_node(sess, nd["cond"], scopes)) {
+            array_push(scopes, map{});
+            let r = _eval_repl_stmts(sess, nd["then_b"], scopes);
+            array_pop(scopes);
+            return r;
+        }
+        if len(nd["else_b"]) > 0 {
+            array_push(scopes, map{});
+            let r = _eval_repl_stmts(sess, nd["else_b"], scopes);
+            array_pop(scopes);
+            return r;
+        }
+        return map{ "returned": false, "val": nil };
+    }
+    return map{ "returned": false, "val": _eval_repl_node(sess, st["e"], scopes) };
+}
+
+fn _eval_repl_node(sess, nd, scopes) {
+    let tg = nd["tag"];
+    if tg == "lit" { return nd["v"]; }
+    if tg == "var" {
+        let lk = _scope_lookup(scopes, nd["name"]);
+        if lk["found"] { return lk["val"]; }
+        if map_has(sess.fns, nd["name"]) { return sess.fns[nd["name"]]; }
+        throw "undefined variable '" + nd["name"] + "'";
+    }
+    if tg == "arr" {
+        let out = [];
+        let i = 0;
+        while i < len(nd["items"]) {
+            array_push(out, _eval_repl_node(sess, nd["items"][i], scopes));
+            i = i + 1;
+        }
+        return out;
+    }
+    if tg == "map" {
+        let out = map{};
+        let ps = nd["pairs"];
+        let i = 0;
+        while i < len(ps) {
+            out[ps[i]["k"]] = _eval_repl_node(sess, ps[i]["v"], scopes);
+            i = i + 1;
+        }
+        return out;
+    }
+    if tg == "fn_lit" {
+        return map{ "__repl_fn_name": "<lambda>", "params": nd["params"], "body": nd["body"] };
+    }
+    if tg == "if" {
+        if _repl_truthy(_eval_repl_node(sess, nd["cond"], scopes)) {
+            array_push(scopes, map{});
+            let r = _eval_repl_stmts(sess, nd["then_b"], scopes);
+            array_pop(scopes);
+            return r["val"];
+        }
+        if len(nd["else_b"]) > 0 {
+            array_push(scopes, map{});
+            let r = _eval_repl_stmts(sess, nd["else_b"], scopes);
+            array_pop(scopes);
+            return r["val"];
+        }
+        return nil;
+    }
+    if tg == "assign" {
+        let rhs = _eval_repl_node(sess, nd["rhs"], scopes);
+        let lhs = nd["lhs"];
+        if lhs["tag"] == "var" {
+            if not _scope_assign(scopes, lhs["name"], rhs) {
+                throw "cannot assign to undeclared variable '" + lhs["name"] + "'";
+            }
+            return rhs;
+        }
+        if lhs["tag"] == "idx" {
+            let obj = _eval_repl_node(sess, lhs["obj"], scopes);
+            let k = _eval_repl_node(sess, lhs["idx"], scopes);
+            obj[k] = rhs;
+            return rhs;
+        }
+        if lhs["tag"] == "dot" {
+            let obj = _eval_repl_node(sess, lhs["obj"], scopes);
+            obj[lhs["fld"]] = rhs;
+            return rhs;
+        }
+        throw "invalid assignment target";
+    }
+    if tg == "un" {
+        let v = _eval_repl_node(sess, nd["e"], scopes);
+        if nd["op"] == "-" { return 0 - v; }
+        return not _repl_truthy(v);
+    }
+    if tg == "bin" {
+        let op = nd["op"];
+        if op == "and" {
+            let lv = _eval_repl_node(sess, nd["l"], scopes);
+            if not _repl_truthy(lv) { return false; }
+            return _repl_truthy(_eval_repl_node(sess, nd["r"], scopes));
+        }
+        if op == "or" {
+            let lv = _eval_repl_node(sess, nd["l"], scopes);
+            if _repl_truthy(lv) { return true; }
+            return _repl_truthy(_eval_repl_node(sess, nd["r"], scopes));
+        }
+        let l = _eval_repl_node(sess, nd["l"], scopes);
+        let r = _eval_repl_node(sess, nd["r"], scopes);
+        if op == "+" {
+            if type(l) == "string" or type(r) == "string" { return str(l) + str(r); }
+            return l + r;
+        }
+        if op == "-" { return l - r; }
+        if op == "*" { return l * r; }
+        if op == "/" { if r == 0 { throw "division by zero"; } return l / r; }
+        if op == "%" { if r == 0 { throw "modulo by zero"; } return num_mod(l, r); }
+        if op == "==" { return l == r; }
+        if op == "!=" { return l != r; }
+        if op == "<" { return l < r; }
+        if op == "<=" { return l <= r; }
+        if op == ">" { return l > r; }
+        if op == ">=" { return l >= r; }
+    }
+    if tg == "idx" {
+        let obj = _eval_repl_node(sess, nd["obj"], scopes);
+        let k = _eval_repl_node(sess, nd["idx"], scopes);
+        return obj[k];
+    }
+    if tg == "dot" {
+        let obj = _eval_repl_node(sess, nd["obj"], scopes);
+        return obj[nd["fld"]];
+    }
+    if tg == "call" {
+        let args = [];
+        let i = 0;
+        while i < len(nd["args"]) {
+            array_push(args, _eval_repl_node(sess, nd["args"][i], scopes));
+            i = i + 1;
+        }
+        let callee_node = nd["callee"];
+        if callee_node["tag"] == "var" {
+            let fname = callee_node["name"];
+            let lk = _scope_lookup(scopes, fname);
+            let fn_val = if lk["found"] { lk["val"] } elif map_has(sess.fns, fname) { sess.fns[fname] } else { nil };
+            if type(fn_val) == "map" and map_has(fn_val, "__repl_fn_name") {
+                let ps = fn_val["params"];
+                if len(args) != len(ps) {
+                    throw "arity mismatch calling '" + fname + "': expected " + str(len(ps)) + ", got " + str(len(args));
+                }
+                let call_scope = map{};
+                let pi = 0;
+                while pi < len(ps) { call_scope[ps[pi]] = args[pi]; pi = pi + 1; }
+                let sub_scopes = [sess.vars, call_scope];
+                let res = _eval_repl_stmts(sess, fn_val["body"], sub_scopes);
+                return res["val"];
+            }
+            return _call_host_builtin(sess, fname, args);
+        }
+        let fn_val = _eval_repl_node(sess, callee_node, scopes);
+        if type(fn_val) == "map" and map_has(fn_val, "__repl_fn_name") {
+            let ps = fn_val["params"];
+            let call_scope = map{};
+            let pi = 0;
+            while pi < len(ps) and pi < len(args) { call_scope[ps[pi]] = args[pi]; pi = pi + 1; }
+            let sub_scopes = [sess.vars, call_scope];
+            let res = _eval_repl_stmts(sess, fn_val["body"], sub_scopes);
+            return res["val"];
+        }
+        throw "target is not callable";
+    }
+    throw "unsupported AST node '" + tg + "'";
+}
+
+fn _eval_repl_source(sess, code_src) {
+    sess.stdout_capture = "";
+    let p = map{ "toks": _repl_tokens_clean(code_src), "pos": 0 };
+    let stmts = [];
+    while _pk(p)["kind"] != "eof" {
+        array_push(stmts, _parse_repl_stmt(p));
+    }
+    let scopes = [sess.vars];
+    let res = _eval_repl_stmts(sess, stmts, scopes);
+    let val = res["val"];
+    let val_type = if type(val) == "map" and map_has(val, "__repl_fn_name") { "fn" } else { type(val) };
+    return map{
+        "ok": true,
+        "status": "ok",
+        "value": val,
+        "val_type": val_type,
+        "repr": _repl_repr(val),
+        "stdout": sess.stdout_capture,
+        "output": sess.stdout_capture + _repl_repr(val)
+    };
+}
+
+// ============================================================================
+// REPL Line Dispatcher (Multi-Line Buffer + Meta-Commands + Evaluation)
+// ============================================================================
+
+fn repl_eval_line(sess, line_text) {
+    let raw_line = str(line_text);
+
+    // Handle meta-commands when not in the middle of a multi-line block
+    if len(sess.multiline_buf) == 0 and str_starts_with(str_trim(raw_line), ":") {
+        let cmd_str = str_trim(raw_line);
+        array_push(sess.history, cmd_str);
+        let sp = str_index_of(cmd_str, " ");
+        let verb = if sp < 0 { cmd_str } else { str_slice(cmd_str, 0, sp) };
+        let arg = if sp < 0 { "" } else { str_trim(str_slice(cmd_str, sp + 1, len(cmd_str))) };
+
+        if verb == ":quit" or verb == ":exit" or verb == ":q" {
+            sess.should_quit = true;
+            return map{ "ok": true, "status": "quit", "prompt": "", "output": "Bye." };
+        }
+        if verb == ":help" {
+            let h = "REPL Commands: :help, :vars, :type <expr>, :time <expr>, :fmt <code>, :gc, :reset, :quit";
+            return map{ "ok": true, "status": "meta", "prompt": sess.prompt_primary, "output": h };
+        }
+        if verb == ":reset" {
+            sess.vars = map{};
+            sess.fns = map{};
+            sess.multiline_buf = "";
+            return map{ "ok": true, "status": "meta", "prompt": sess.prompt_primary, "output": "Session state reset." };
+        }
+        if verb == ":vars" {
+            let ks = _sort_strings(map_keys(sess.vars));
+            if len(ks) == 0 {
+                return map{ "ok": true, "status": "meta", "prompt": sess.prompt_primary, "output": "(no variables defined)" };
+            }
+            let lines = [];
+            let i = 0;
+            while i < len(ks) {
+                let k = ks[i];
+                let v = sess.vars[k];
+                let vt = if type(v) == "map" and map_has(v, "__repl_fn_name") { "fn" } else { type(v) };
+                array_push(lines, k + " : " + vt + " = " + _repl_repr(v));
+                i = i + 1;
+            }
+            return map{ "ok": true, "status": "meta", "prompt": sess.prompt_primary, "output": str_join(lines, "\n") };
+        }
+        if verb == ":type" {
+            return try {
+                let ev = _eval_repl_source(sess, arg);
+                map{
+                    "ok": true,
+                    "status": "meta",
+                    "val_type": ev["val_type"],
+                    "prompt": sess.prompt_primary,
+                    "output": arg + " : " + ev["val_type"]
+                }
+            } catch err {
+                map{ "ok": false, "status": "error", "prompt": sess.prompt_primary, "output": "Error: " + str(err) }
+            };
+        }
+        if verb == ":time" {
+            let t0 = now_ms();
+            return try {
+                let ev = _eval_repl_source(sess, arg);
+                let elapsed = num_max(0, now_ms() - t0);
+                map{
+                    "ok": true,
+                    "status": "meta",
+                    "elapsed_ms": elapsed,
+                    "value": ev["value"],
+                    "prompt": sess.prompt_primary,
+                    "output": ev["repr"] + " (" + str(elapsed) + " ms)"
+                }
+            } catch err {
+                map{ "ok": false, "status": "error", "prompt": sess.prompt_primary, "output": "Error: " + str(err) }
+            };
+        }
+        if verb == ":fmt" {
+            let formatted = str_trim(format_sapp_source(arg));
+            return map{ "ok": true, "status": "meta", "formatted": formatted, "prompt": sess.prompt_primary, "output": formatted };
+        }
+        if verb == ":gc" {
+            try gc_collect() catch nil;
+            let st = try gc_stats() catch map{ "status": "collected" };
+            return map{ "ok": true, "status": "meta", "gc_stats": st, "prompt": sess.prompt_primary, "output": "GC: " + json_stringify(st) };
+        }
+        return map{ "ok": false, "status": "error", "prompt": sess.prompt_primary, "output": "Unknown REPL command: " + verb };
+    }
+
+    let combined = if len(sess.multiline_buf) == 0 { raw_line } else { sess.multiline_buf + "\n" + raw_line };
+    if len(str_trim(combined)) == 0 {
+        sess.multiline_buf = "";
+        return map{ "ok": true, "status": "empty", "prompt": sess.prompt_primary, "output": "" };
+    }
+
+    let state = repl_inspect_input_state(combined);
+    if not state["complete"] {
+        sess.multiline_buf = combined;
+        return map{
+            "ok": true,
+            "status": "incomplete",
+            "prompt": sess.prompt_cont,
+            "highlighted": repl_highlight_ansi(raw_line, sess.color),
+            "output": ""
+        };
+    }
+
+    sess.multiline_buf = "";
+    sess.turn = sess.turn + 1;
+    array_push(sess.history, combined);
+
+    return try {
+        let ev = _eval_repl_source(sess, combined);
+        ev["prompt"] = sess.prompt_primary;
+        ev["highlighted"] = repl_highlight_ansi(combined, sess.color);
+        ev
+    } catch err {
+        map{
+            "ok": false,
+            "status": "error",
+            "error": str(err),
+            "prompt": sess.prompt_primary,
+            "output": "Error: " + str(err)
+        }
+    };
+}
+
+fn repl_run_interactive(sess = nil, scripted_lines = nil) {
+    let active = if sess != nil { sess } else { repl_session_new() };
+    let transcript = [];
+
+    if scripted_lines != nil and type(scripted_lines) == "array" {
+        let i = 0;
+        while i < len(scripted_lines) and not active.should_quit {
+            let r = repl_eval_line(active, scripted_lines[i]);
+            array_push(transcript, r);
+            i = i + 1;
+        }
+        return map{
+            "ok": true,
+            "turns": active.turn,
+            "quit": active.should_quit,
+            "transcript": transcript,
+            "session": active
+        };
+    }
+
+    let cur_prompt = active.prompt_primary;
+    while not active.should_quit {
+        print(cur_prompt);
+        let ln = read_line();
+        if ln == nil { break; }
+        let r = repl_eval_line(active, ln);
+        array_push(transcript, r);
+        if len(str(_opt(r, "output", ""))) > 0 {
+            print(r["output"]);
+        }
+        cur_prompt = str(_opt(r, "prompt", active.prompt_primary));
+    }
+    return map{ "ok": true, "turns": active.turn, "quit": active.should_quit, "transcript": transcript };
+}
+
+export REPL_FMT_VERSION;
+export tokenize_sapp_lossless, format_sapp_source, check_sapp_formatted;
+export repl_session_new, repl_highlight_ansi, repl_complete_prefix;
+export repl_inspect_input_state, repl_is_input_complete, repl_eval_line, repl_run_interactive;

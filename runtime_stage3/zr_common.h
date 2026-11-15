@@ -97,8 +97,8 @@ typedef int zr_sock_t;
 #include <string.h>
 #include <time.h>
 
-#define PBLANG_ZR_VERSION "4.2.0"
-#define PBLANG_ZR_BANNER  "pblang 4.2.0 (sovereign zero-rust runtime)"
+#define PBLANG_ZR_VERSION "5.0.0"
+#define PBLANG_ZR_BANNER  "pblang 5.0.0 (sovereign zero-rust runtime)"
 
 #if defined(__GNUC__) || defined(__clang__)
 #define ZR_LIKELY(x)   __builtin_expect(!!(x), 1)
@@ -151,6 +151,67 @@ static inline char *zr_xstrndup(const char *s, size_t n) {
     out[n] = '\0';
     return out;
 }
+
+/* ---- Portable UTF-8 / Windows Wide UTF-16LE + Long-Path (>260) Layer (Item #13) ---- */
+
+#ifdef _WIN32
+static inline wchar_t *zr_win_utf8_to_wide(const char *u8, bool is_fs_path) {
+    if (!u8) u8 = "";
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, u8, -1, NULL, 0);
+    if (wlen <= 0) {
+        wlen = MultiByteToWideChar(CP_ACP, 0, u8, -1, NULL, 0);
+        if (wlen <= 0) {
+            wchar_t *z = (wchar_t *)zr_xcalloc(1, sizeof(wchar_t));
+            return z;
+        }
+        wchar_t *wb = (wchar_t *)zr_xmalloc((size_t)wlen * sizeof(wchar_t));
+        MultiByteToWideChar(CP_ACP, 0, u8, -1, wb, wlen);
+        return wb;
+    }
+    wchar_t *wb = (wchar_t *)zr_xmalloc((size_t)(wlen + 8) * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, u8, -1, wb, wlen);
+    /* Automatic Win32 \\?\ Long-Path promotion for paths >= 245 chars */
+    if (is_fs_path && wlen >= 245 && !(wb[0] == L'\\' && wb[1] == L'\\' && wb[2] == L'?')) {
+        DWORD full_n = GetFullPathNameW(wb, 0, NULL, NULL);
+        if (full_n > 0) {
+            wchar_t *lp = (wchar_t *)zr_xmalloc(((size_t)full_n + 12u) * sizeof(wchar_t));
+            wcscpy(lp, L"\\\\?\\");
+            DWORD got = GetFullPathNameW(wb, full_n + 2, lp + 4, NULL);
+            if (got > 0) {
+                for (wchar_t *q = lp + 4; *q; q++) {
+                    if (*q == L'/') *q = L'\\';
+                }
+                free(wb);
+                return lp;
+            }
+            free(lp);
+        }
+    }
+    return wb;
+}
+
+static inline char *zr_win_wide_to_utf8(const wchar_t *w) {
+    if (!w) return zr_xstrdup("");
+    int ulen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (ulen <= 0) return zr_xstrdup("");
+    char *out = (char *)zr_xmalloc((size_t)ulen);
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, out, ulen, NULL, NULL);
+    return out;
+}
+
+static inline FILE *zr_fopen(const char *path, const char *mode) {
+    wchar_t *wp = zr_win_utf8_to_wide(path, true);
+    wchar_t *wm = zr_win_utf8_to_wide(mode ? mode : "rb", false);
+    FILE *fp = _wfopen(wp, wm);
+    free(wp);
+    free(wm);
+    return fp;
+}
+#else
+static inline FILE *zr_fopen(const char *path, const char *mode) {
+    return fopen(path, mode);
+}
+#endif
 
 /* ---- Dynamic Byte / String Buffer ---- */
 
@@ -573,26 +634,45 @@ static inline bool zr_is_ident_continue_cp(uint32_t cp) {
     return !zr_is_unicode_non_ident(cp);
 }
 
-/* Basic Unicode case conversion for ASCII + Greek */
+/* ---- Unicode 16.0 Case-Folding, Greek Polytonic/Tonos & Script Helpers (Item #14) ---- */
+
 static inline uint32_t zr_cp_to_upper(uint32_t cp) {
     if (cp >= 'a' && cp <= 'z') return cp - 32;
-    if (cp >= 0x03B1 && cp <= 0x03C1) return cp - 0x20; /* α..ρ -> Α..Ρ */
-    if (cp == 0x03C2) return 0x03A3;                     /* ς -> Σ */
-    if (cp >= 0x03C3 && cp <= 0x03CB) return cp - 0x20; /* σ..ϋ -> Σ..Ϋ */
-    if (cp == 0x03AC) return 0x0386;                     /* ά -> Ά */
-    if (cp == 0x03AD) return 0x0388;                     /* έ -> Έ */
-    if (cp == 0x03AE) return 0x0389;                     /* ή -> Ή */
-    if (cp == 0x03AF) return 0x038A;                     /* ί -> Ί */
-    if (cp == 0x03CC) return 0x038C;                     /* ό -> Ό */
-    if (cp == 0x03CD) return 0x038E;                     /* ύ -> Ύ */
-    if (cp == 0x03CE) return 0x038F;                     /* ώ -> Ώ */
+    if (cp >= 0x00E0 && cp <= 0x00F6) return cp - 32;     /* à..ö -> À..Ö */
+    if (cp >= 0x00F8 && cp <= 0x00FE) return cp - 32;     /* ø..þ -> Ø..Þ */
+    if (cp == 0x00FF) return 0x0178;                      /* ÿ -> Ÿ */
+    if (cp >= 0x0430 && cp <= 0x044F) return cp - 0x20;   /* Cyrillic а..я -> А..Я */
+    if (cp == 0x0451) return 0x0401;                      /* ё -> Ё */
+    if (cp >= 0x03B1 && cp <= 0x03C1) return cp - 0x20;   /* α..ρ -> Α..Ρ */
+    if (cp == 0x03C2) return 0x03A3;                      /* ς -> Σ */
+    if (cp >= 0x03C3 && cp <= 0x03CB) return cp - 0x20;   /* σ..ϋ -> Σ..Ϋ */
+    if (cp == 0x03AC) return 0x0386;                      /* ά -> Ά */
+    if (cp == 0x03AD) return 0x0388;                      /* έ -> Έ */
+    if (cp == 0x03AE) return 0x0389;                      /* ή -> Ή */
+    if (cp == 0x03AF) return 0x038A;                      /* ί -> Ί */
+    if (cp == 0x03CC) return 0x038C;                      /* ό -> Ό */
+    if (cp == 0x03CD) return 0x038E;                      /* ύ -> Ύ */
+    if (cp == 0x03CE) return 0x038F;                      /* ώ -> Ώ */
+    if (cp == 0x0390) return 0x03AA;                      /* ΐ -> Ϊ */
+    if (cp == 0x03B0) return 0x03AB;                      /* ΰ -> Ϋ */
+    /* Greek Extended Polytonic lowercase -> Title/Upper blocks */
+    if ((cp >= 0x1F00 && cp <= 0x1F07) || (cp >= 0x1F10 && cp <= 0x1F15) ||
+        (cp >= 0x1F20 && cp <= 0x1F27) || (cp >= 0x1F30 && cp <= 0x1F37) ||
+        (cp >= 0x1F40 && cp <= 0x1F45) || (cp >= 0x1F60 && cp <= 0x1F67)) {
+        return cp + 8;
+    }
     return cp;
 }
 
 static inline uint32_t zr_cp_to_lower(uint32_t cp) {
     if (cp >= 'A' && cp <= 'Z') return cp + 32;
-    if (cp >= 0x0391 && cp <= 0x03A1) return cp + 0x20; /* Α..Ρ -> α..ρ */
-    if (cp >= 0x03A3 && cp <= 0x03AB) return cp + 0x20; /* Σ..Ϋ -> σ..ϋ */
+    if (cp >= 0x00C0 && cp <= 0x00D6) return cp + 32;     /* À..Ö -> à..ö */
+    if (cp >= 0x00D8 && cp <= 0x00DE) return cp + 32;     /* Ø..Þ -> ø..þ */
+    if (cp == 0x0178) return 0x00FF;
+    if (cp >= 0x0410 && cp <= 0x042F) return cp + 0x20;   /* Cyrillic А..Я -> а..я */
+    if (cp == 0x0401) return 0x0451;
+    if (cp >= 0x0391 && cp <= 0x03A1) return cp + 0x20;   /* Α..Ρ -> α..ρ */
+    if (cp >= 0x03A3 && cp <= 0x03AB) return cp + 0x20;   /* Σ..Ϋ -> σ..ϋ */
     if (cp == 0x0386) return 0x03AC;
     if (cp == 0x0388) return 0x03AD;
     if (cp == 0x0389) return 0x03AE;
@@ -600,12 +680,88 @@ static inline uint32_t zr_cp_to_lower(uint32_t cp) {
     if (cp == 0x038C) return 0x03CC;
     if (cp == 0x038E) return 0x03CD;
     if (cp == 0x038F) return 0x03CE;
+    if ((cp >= 0x1F08 && cp <= 0x1F0F) || (cp >= 0x1F18 && cp <= 0x1F1D) ||
+        (cp >= 0x1F28 && cp <= 0x1F2F) || (cp >= 0x1F38 && cp <= 0x1F3F) ||
+        (cp >= 0x1F48 && cp <= 0x1F4D) || (cp >= 0x1F68 && cp <= 0x1F6F)) {
+        return cp - 8;
+    }
     return cp;
 }
 
-/* ---- FNV-1a 64-bit ---- */
+static inline bool zr_is_unicode_case_ignorable(uint32_t cp) {
+    if (cp == '\'' || cp == 0x2019 || cp == 0x02BC || cp == 0x00AD) return true;
+    if (cp >= 0x0300 && cp <= 0x036F) return true; /* Combining Diacritical Marks */
+    if (cp >= 0x1AB0 && cp <= 0x1AFF) return true;
+    if (cp >= 0x20D0 && cp <= 0x20FF) return true;
+    return false;
+}
 
-static inline uint64_t zr_fnv1a(const void *data, size_t len) {
+static inline bool zr_is_unicode_cased_letter(uint32_t cp) {
+    if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z')) return true;
+    if (cp >= 0x00C0 && cp <= 0x02AF && cp != 0x00D7 && cp != 0x00F7) return true;
+    if (cp >= 0x0370 && cp <= 0x03FF) return true;
+    if (cp >= 0x1F00 && cp <= 0x1FFF) return true;
+    if (cp >= 0x0400 && cp <= 0x052F) return true;
+    return zr_cp_to_lower(cp) != cp || zr_cp_to_upper(cp) != cp;
+}
+
+/* Script ID: 0=Common, 1=Latin, 2=Greek, 3=Cyrillic, 4=CJK/Han, 5=Arabic/Hebrew, 6=Other */
+static inline int zr_cp_unicode_script(uint32_t cp) {
+    if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') ||
+        (cp >= 0x00C0 && cp <= 0x024F && cp != 0x00D7 && cp != 0x00F7) ||
+        (cp >= 0x1E00 && cp <= 0x1EFF)) return 1; /* Latin */
+    if ((cp >= 0x0370 && cp <= 0x03FF) || (cp >= 0x1F00 && cp <= 0x1FFF)) return 2; /* Greek */
+    if (cp >= 0x0400 && cp <= 0x052F) return 3; /* Cyrillic */
+    if ((cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0x3040 && cp <= 0x30FF) ||
+        (cp >= 0xAC00 && cp <= 0xD7AF)) return 4; /* CJK */
+    if (cp >= 0x0590 && cp <= 0x06FF) return 5; /* Hebrew / Arabic */
+    if (cp <= 0x007F || (cp >= 0x2000 && cp <= 0x2BFF) || zr_is_unicode_case_ignorable(cp)) return 0; /* Common */
+    return 6;
+}
+
+/* Strip monotonic & polytonic Greek accents/breathing marks to base Greek vowel */
+static inline uint32_t zr_cp_greek_strip_accent(uint32_t cp) {
+    switch (cp) {
+        case 0x0386: return 0x0391; /* Ά -> Α */
+        case 0x0388: return 0x0395; /* Έ -> Ε */
+        case 0x0389: return 0x0397; /* Ή -> Η */
+        case 0x038A: case 0x03AA: return 0x0399; /* Ί, Ϊ -> Ι */
+        case 0x038C: return 0x039F; /* Ό -> Ο */
+        case 0x038E: case 0x03AB: return 0x03A5; /* Ύ, Ϋ -> Υ */
+        case 0x038F: return 0x03A9; /* Ώ -> Ω */
+        case 0x03AC: return 0x03B1; /* ά -> α */
+        case 0x03AD: return 0x03B5; /* έ -> ε */
+        case 0x03AE: return 0x03B7; /* ή -> η */
+        case 0x03AF: case 0x03CA: case 0x0390: return 0x03B9; /* ί, ϊ, ΐ -> ι */
+        case 0x03CC: return 0x03BF; /* ό -> ο */
+        case 0x03CD: case 0x03CB: case 0x03B0: return 0x03C5; /* ύ, ϋ, ΰ -> υ */
+        case 0x03CE: return 0x03C9; /* ώ -> ω */
+        default: break;
+    }
+    if ((cp >= 0x1F00 && cp <= 0x1F07) || (cp >= 0x1F70 && cp <= 0x1F71) || (cp >= 0x1FB0 && cp <= 0x1FB7)) return 0x03B1;
+    if ((cp >= 0x1F08 && cp <= 0x1F0F) || (cp >= 0x1FB8 && cp <= 0x1FBC)) return 0x0391;
+    if ((cp >= 0x1F10 && cp <= 0x1F15) || (cp >= 0x1F72 && cp <= 0x1F73)) return 0x03B5;
+    if ((cp >= 0x1F18 && cp <= 0x1F1D) || (cp >= 0x1FC8 && cp <= 0x1FC9)) return 0x0395;
+    if ((cp >= 0x1F20 && cp <= 0x1F27) || (cp >= 0x1F74 && cp <= 0x1F75) || (cp >= 0x1FC2 && cp <= 0x1FC7)) return 0x03B7;
+    if ((cp >= 0x1F28 && cp <= 0x1F2F) || (cp >= 0x1FCA && cp <= 0x1FCC)) return 0x0397;
+    if ((cp >= 0x1F30 && cp <= 0x1F37) || (cp >= 0x1F76 && cp <= 0x1F77) || (cp >= 0x1FD0 && cp <= 0x1FD7)) return 0x03B9;
+    if ((cp >= 0x1F38 && cp <= 0x1F3F) || (cp >= 0x1FD8 && cp <= 0x1FDB)) return 0x0399;
+    if ((cp >= 0x1F40 && cp <= 0x1F45) || (cp >= 0x1F78 && cp <= 0x1F79)) return 0x03BF;
+    if ((cp >= 0x1F48 && cp <= 0x1F4D) || (cp >= 0x1FF8 && cp <= 0x1FF9)) return 0x039F;
+    if ((cp >= 0x1F50 && cp <= 0x1F57) || (cp >= 0x1F7A && cp <= 0x1F7B) || (cp >= 0x1FE0 && cp <= 0x1FE7)) return 0x03C5;
+    if ((cp >= 0x1F59 && cp <= 0x1F5F) || (cp >= 0x1FE8 && cp <= 0x1FEB)) return 0x03A5;
+    if ((cp >= 0x1F60 && cp <= 0x1F67) || (cp >= 0x1F7C && cp <= 0x1F7D) || (cp >= 0x1FF2 && cp <= 0x1FF7)) return 0x03C9;
+    if ((cp >= 0x1F68 && cp <= 0x1F6F) || (cp >= 0x1FFA && cp <= 0x1FFC)) return 0x03A9;
+    if (cp == 0x1FE4 || cp == 0x1FE5) return 0x03C1;
+    if (cp == 0x1FEC) return 0x03A1;
+    return cp;
+}
+
+/* ---- Deterministic FNV-1a & CSPRNG-Seeded SipHash-1-3 Anti-HashDoS (Item #9) ---- */
+
+static bool zr_csprng_fill(uint8_t *buf, size_t len);
+
+static inline uint64_t zr_fnv1a_det(const void *data, size_t len) {
     const uint8_t *p = (const uint8_t *)data;
     uint64_t h = 14695981039346656037ULL;
     for (size_t i = 0; i < len; i++) {
@@ -613,6 +769,103 @@ static inline uint64_t zr_fnv1a(const void *data, size_t len) {
         h *= 1099511628211ULL;
     }
     return h ? h : 1;
+}
+
+static inline uint64_t zr_rotl64(uint64_t x, int b) {
+    return (x << b) | (x >> (64 - b));
+}
+
+#define ZR_SIPROUND(v0, v1, v2, v3) do { \
+    (v0) += (v1); (v1) = zr_rotl64((v1), 13); (v1) ^= (v0); (v0) = zr_rotl64((v0), 32); \
+    (v2) += (v3); (v3) = zr_rotl64((v3), 16); (v3) ^= (v2); \
+    (v0) += (v3); (v3) = zr_rotl64((v3), 21); (v3) ^= (v0); \
+    (v2) += (v1); (v1) = zr_rotl64((v1), 17); (v1) ^= (v2); (v2) = zr_rotl64((v2), 32); \
+} while (0)
+
+static inline uint64_t zr_siphash13_keyed(const void *data, size_t len, uint64_t k0, uint64_t k1) {
+    const uint8_t *in = (const uint8_t *)data;
+    uint64_t v0 = 0x736f6d6570736575ULL ^ k0;
+    uint64_t v1 = 0x646f72616e646f6dULL ^ k1;
+    uint64_t v2 = 0x6c7967656e657261ULL ^ k0;
+    uint64_t v3 = 0x7465646279746573ULL ^ k1;
+    uint64_t b = ((uint64_t)len) << 56;
+    const uint8_t *end = in + (len - (len & 7u));
+    for (; in != end; in += 8) {
+        uint64_t m = ((uint64_t)in[0])       | ((uint64_t)in[1] << 8)  |
+                     ((uint64_t)in[2] << 16) | ((uint64_t)in[3] << 24) |
+                     ((uint64_t)in[4] << 32) | ((uint64_t)in[5] << 40) |
+                     ((uint64_t)in[6] << 48) | ((uint64_t)in[7] << 56);
+        v3 ^= m;
+        ZR_SIPROUND(v0, v1, v2, v3);
+        v0 ^= m;
+    }
+    switch (len & 7u) {
+        case 7: b |= ((uint64_t)in[6]) << 48; /* fallthrough */
+        case 6: b |= ((uint64_t)in[5]) << 40; /* fallthrough */
+        case 5: b |= ((uint64_t)in[4]) << 32; /* fallthrough */
+        case 4: b |= ((uint64_t)in[3]) << 24; /* fallthrough */
+        case 3: b |= ((uint64_t)in[2]) << 16; /* fallthrough */
+        case 2: b |= ((uint64_t)in[1]) << 8;  /* fallthrough */
+        case 1: b |= ((uint64_t)in[0]); break;
+        case 0: break;
+    }
+    v3 ^= b;
+    ZR_SIPROUND(v0, v1, v2, v3);
+    v0 ^= b;
+    v2 ^= 0xffULL;
+    ZR_SIPROUND(v0, v1, v2, v3);
+    ZR_SIPROUND(v0, v1, v2, v3);
+    ZR_SIPROUND(v0, v1, v2, v3);
+    uint64_t out = v0 ^ v1 ^ v2 ^ v3;
+    return out ? out : 1ULL;
+}
+
+static inline bool zr_cp_is_greek(uint32_t cp) {
+    return (cp >= 0x0370 && cp <= 0x03FF) || (cp >= 0x1F00 && cp <= 0x1FFF);
+}
+static inline int zr_cp_script(uint32_t cp) {
+    return zr_cp_unicode_script(cp);
+}
+#if defined(_MSC_VER)
+static inline bool zr_atomic_cas32(volatile int32_t *p, int32_t exp_v, int32_t new_v) {
+    return _InterlockedCompareExchange((volatile long *)p, (long)new_v, (long)exp_v) == (long)exp_v;
+}
+#else
+static inline bool zr_atomic_cas32(volatile int32_t *p, int32_t exp_v, int32_t new_v) {
+    return __sync_bool_compare_and_swap(p, exp_v, new_v);
+}
+#endif
+
+static uint64_t g_zr_sip_k0 = 0;
+static uint64_t g_zr_sip_k1 = 0;
+static volatile int32_t g_zr_sip_ready = 0;
+
+static void zr_siphash_ensure_seed(void) {
+    if (ZR_LIKELY(g_zr_sip_ready == 2)) return;
+    if (zr_atomic_cas32(&g_zr_sip_ready, 0, 1)) {
+        uint8_t raw[16];
+        if (!zr_csprng_fill(raw, sizeof(raw))) {
+            uint64_t t = (uint64_t)zr_now_ms() ^ (uint64_t)(uintptr_t)&raw;
+            memcpy(raw, &t, 8);
+            t ^= 0x9e3779b97f4a7c15ULL;
+            memcpy(raw + 8, &t, 8);
+        }
+        memcpy(&g_zr_sip_k0, raw, 8);
+        memcpy(&g_zr_sip_k1, raw + 8, 8);
+        g_zr_sip_ready = 2;
+    } else {
+        while (g_zr_sip_ready != 2) { zr_sleep_ms(0.05); }
+    }
+}
+
+static inline uint64_t zr_siphash13(const void *data, size_t len) {
+    if (ZR_UNLIKELY(g_zr_sip_ready != 2)) zr_siphash_ensure_seed();
+    return zr_siphash13_keyed(data, len, g_zr_sip_k0, g_zr_sip_k1);
+}
+
+/* Runtime string & PbMap hashing automatically uses CSPRNG-seeded SipHash-1-3 (Zero HashDoS!) */
+static inline uint64_t zr_fnv1a(const void *data, size_t len) {
+    return zr_siphash13(data, len);
 }
 
 /* ---- SHA-1 (RFC 3174 / RFC 6455 WebSocket Accept Key) ---- */

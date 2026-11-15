@@ -3306,4 +3306,130 @@ static bool bi_ws_write_frame(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
     return true;
 }
 
+/* ---- Thin AF_UNIX Domain Socket OS Syscall Wrappers (#12) ---- */
+#if !defined(_WIN32) && !defined(__wasi__)
+#include <sys/un.h>
+#endif
+#if defined(_WIN32)
+typedef struct { unsigned short sun_family; char sun_path[108]; } ZrWinSockAddrUn;
+#endif
+
+static bool bi_unix_listen(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_NET), "unix_listen", "net")) return false;
+    if (argc != 1 || !val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "unix_listen(path) expects 1 string"); return false; }
+    const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
+#if defined(__wasi__)
+    (void)path; (void)out;
+    vm_raise(vm, "unix_listen(): unavailable in WASI sandbox");
+    return false;
+#elif defined(_WIN32)
+    zr_net_ensure_init();
+    ZrWinSockAddrUn su;
+    memset(&su, 0, sizeof(su));
+    su.sun_family = 1; /* AF_UNIX */
+    if (strlen(path) >= sizeof(su.sun_path)) { vm_raise(vm, "unix_listen(): socket path too long"); return false; }
+    memcpy(su.sun_path, path, strlen(path));
+    wchar_t *wp = zr_win_utf8_to_wide(path, true);
+    if (wp) { DeleteFileW(wp); free(wp); }
+    ZrSock s = socket(1, SOCK_STREAM, 0);
+    if (s == ZR_INVALID_SOCK || bind(s, (const struct sockaddr *)&su, (int)sizeof(su)) != 0 || listen(s, 64) != 0) {
+        if (s != ZR_INVALID_SOCK) zr_close_raw_sock(s);
+        vm_raise(vm, "unix_listen('%s'): AF_UNIX bind/listen failed", path);
+        return false;
+    }
+    size_t id = zr_net_insert(ZR_NET_LISTENER, s, NULL, NULL);
+    *out = val_num((double)id);
+    return true;
+#else
+    struct sockaddr_un su;
+    memset(&su, 0, sizeof(su));
+    su.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(su.sun_path)) { vm_raise(vm, "unix_listen(): socket path too long"); return false; }
+    memcpy(su.sun_path, path, strlen(path));
+    if (path[0] != '@') (void)unlink(path);
+    else su.sun_path[0] = '\0'; /* Linux abstract namespace */
+    ZrSock s = socket(AF_UNIX, SOCK_STREAM, 0);
+    socklen_t slen = (path[0] == '@') ? (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(path)) : (socklen_t)sizeof(su);
+    if (s == ZR_INVALID_SOCK || bind(s, (const struct sockaddr *)&su, slen) != 0 || listen(s, 64) != 0) {
+        if (s != ZR_INVALID_SOCK) zr_close_raw_sock(s);
+        vm_raise(vm, "unix_listen('%s'): %s", path, strerror(errno));
+        return false;
+    }
+    size_t id = zr_net_insert(ZR_NET_LISTENER, s, NULL, NULL);
+    *out = val_num((double)id);
+    return true;
+#endif
+}
+
+static bool bi_unix_connect(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (!vm_check_cap(vm, vm_effective_cap(vm, CAP_NET), "unix_connect", "net")) return false;
+    if (argc != 1 || !val_is_obj(argv[0], OBJ_STR)) { vm_raise(vm, "unix_connect(path) expects 1 string"); return false; }
+    const char *path = ((PbStr *)val_as_obj(argv[0]))->chars;
+#if defined(__wasi__)
+    (void)path; (void)out;
+    vm_raise(vm, "unix_connect(): unavailable in WASI sandbox");
+    return false;
+#elif defined(_WIN32)
+    zr_net_ensure_init();
+    ZrWinSockAddrUn su;
+    memset(&su, 0, sizeof(su));
+    su.sun_family = 1;
+    if (strlen(path) >= sizeof(su.sun_path)) { vm_raise(vm, "unix_connect(): socket path too long"); return false; }
+    memcpy(su.sun_path, path, strlen(path));
+    ZrSock s = socket(1, SOCK_STREAM, 0);
+    if (s == ZR_INVALID_SOCK || connect(s, (const struct sockaddr *)&su, (int)sizeof(su)) != 0) {
+        if (s != ZR_INVALID_SOCK) zr_close_raw_sock(s);
+        vm_raise(vm, "unix_connect('%s'): connect failed", path);
+        return false;
+    }
+    size_t id = zr_net_insert(ZR_NET_STREAM, s, NULL, NULL);
+    *out = val_num((double)id);
+    return true;
+#else
+    struct sockaddr_un su;
+    memset(&su, 0, sizeof(su));
+    su.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof(su.sun_path)) { vm_raise(vm, "unix_connect(): socket path too long"); return false; }
+    memcpy(su.sun_path, path, strlen(path));
+    if (path[0] == '@') su.sun_path[0] = '\0';
+    ZrSock s = socket(AF_UNIX, SOCK_STREAM, 0);
+    socklen_t slen = (path[0] == '@') ? (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(path)) : (socklen_t)sizeof(su);
+    if (s == ZR_INVALID_SOCK || connect(s, (const struct sockaddr *)&su, slen) != 0) {
+        if (s != ZR_INVALID_SOCK) zr_close_raw_sock(s);
+        vm_raise(vm, "unix_connect('%s'): %s", path, strerror(errno));
+        return false;
+    }
+    size_t id = zr_net_insert(ZR_NET_STREAM, s, NULL, NULL);
+    *out = val_num((double)id);
+    return true;
+#endif
+}
+
+static bool bi_unix_peer_cred(PbVM *vm, int argc, PbValue *argv, PbValue *out) {
+    if (argc != 1 || (argv[0].tag != VAL_NUM && argv[0].tag != VAL_I64)) {
+        vm_raise(vm, "unix_peer_cred(sock_id) expects 1 handle");
+        return false;
+    }
+    size_t id = (argv[0].tag == VAL_I64) ? (size_t)argv[0].as.i64 : (size_t)argv[0].u.num;
+    ZrNetEntry *e = zr_net_checkout(id);
+    if (!e) { vm_raise(vm, "unix_peer_cred(): invalid socket handle"); return false; }
+    PbMap *m = pb_map_new_raw(vm, 8);
+    vm_temp_push(vm, val_obj(m));
+#if defined(__linux__) && defined(SO_PEERCRED)
+    struct { int32_t pid; uint32_t uid; uint32_t gid; } cr = {0, 0, 0};
+    socklen_t clen = (socklen_t)sizeof(cr);
+    bool ok = (getsockopt(e->sock, SOL_SOCKET, SO_PEERCRED, &cr, &clen) == 0);
+    pb_map_set_cstr(vm, m, "ok", val_bool(ok));
+    pb_map_set_cstr(vm, m, "pid", val_i64((int64_t)cr.pid));
+    pb_map_set_cstr(vm, m, "uid", val_i64((int64_t)cr.uid));
+    pb_map_set_cstr(vm, m, "gid", val_i64((int64_t)cr.gid));
+#else
+    pb_map_set_cstr(vm, m, "ok", val_bool(false));
+#endif
+    zr_net_checkin(e);
+    vm_temp_pop(vm, 1);
+    *out = val_obj(m);
+    return true;
+}
+
 #endif /* PBLANG_ZR_NET_HTTP_TLS_H */
